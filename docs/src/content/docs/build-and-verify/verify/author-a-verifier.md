@@ -5,7 +5,6 @@ pillar: wyrd
 section: Build and verify
 topic: Verify
 order: 0
-status: runnable
 ---
 
 Build the Verifiers for a support desk: one assertion, one Python check, and one model judge. Each step adds a check, binds it, and shows the verdict your code gets back.
@@ -119,7 +118,7 @@ Some rules need judgment. `follows-policy` asks a model whether a refund decisio
 </Tab>
 </Tabs>
 
-The judge calls its model through your server's [LLM gateway](/connect/set-up-the-llm-gateway/), on the deployment named in `execution_route`. Its `response_format` must be the same verdict schema, or declaring the Verifier fails. Bind `follows-policy` beside `ticket-complete` on the agent.
+The judge calls its model through your server's [LLM gateway](/connect/set-up-the-llm-gateway/), on the deployment named in `execution_route`. Its Prompt sets `response_format: verdict`, so the model answers with an outcome, a reason, and citations. Declaring a Verifier whose check Agent has no verdict format fails. Bind `follows-policy` beside `ticket-complete` on the agent.
 
 A model call takes seconds, so submit the letter and collect the verdict later instead of waiting in the request:
 

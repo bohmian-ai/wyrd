@@ -78,9 +78,9 @@ def self_check() -> None:
                  "uv run python scripts/check_links.py", "uv run scripts/x.py", "uv run --project sdks/wyrd-sdk-python pytest",
                  "pnpm test", "pnpm check", "pnpm install --frozen-lockfile", "pnpm -C docs build"]:
         assert FORBIDDEN.match(line), line
-    for line in ["cargo new quickstart && cd quickstart", "cargo add wyrd-ai@0.3.0 serde_json", "cargo run", "cargo install wyrd-cli --version 0.3.0 --locked",
+    for line in ["cargo new quickstart && cd quickstart", "cargo add wyrd-ai@0.4.0 serde_json", "cargo run", "cargo install wyrd-cli --version 0.4.0 --locked",
                  "uv run quickstart.py", "uv run wyrd init",
-                 "pnpm init && pnpm pkg set type=module", "pnpm add wyrd-ai@0.3.0", "pnpm wyrd init"]:
+                 "pnpm init && pnpm pkg set type=module", "pnpm add wyrd-ai@0.4.0", "pnpm wyrd init"]:
         assert not FORBIDDEN.match(line), line
 
 

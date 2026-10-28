@@ -4,7 +4,6 @@ description: Every stable Wyrd error code with its HTTP status, title, and fix.
 pillar: wyrd
 section: Reference
 order: 21
-status: runnable
 ---
 
 Every Wyrd error carries a stable `code`, such as `WYRD_SPEC_400_VALIDATION`: the area, the HTTP status, and the cause. Branch on `code`, never on the message. The same code reaches you over HTTP, MCP, the CLI, and every SDK.

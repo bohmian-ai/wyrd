@@ -6,7 +6,6 @@ section: Build and verify
 topic: Verify
 order: 3
 draft: true
-status: runnable
 ---
 
 `submit` queues a Verifier and returns an execution ID right away. This guide follows that ID to a result: is it still running, did it settle without a verdict, what did each requirement find, and what evidence was it judged on. It also covers what a `202` does and does not promise.
@@ -172,14 +171,15 @@ for (const requirement of result.outcome.requirements) {
 | `outcome.evidence` | The exact inputs judged, by slot, with file digests |
 | `outcome.steps[]` | Whether each step `succeeded`, `failed`, or was `skipped`, how many attempts it took, and every tool it called with argument and output digests |
 | `outcome.requirements[]` | Each verdict, its reason, the actual value, citations into the original files, and the check's provenance: code hash, extraction version, Agent and Prompt versions, effective model route, drift window and baseline |
+| `outcome.requirements[].data` | The custom data an `agent` or `code` check returned, when it declares a [custom data](/reference/verifier-card/#custom-data) schema; absent otherwise, or when the data failed its schema |
 
 An `inconclusive` requirement whose step `failed` means the evidence could not be prepared; read the step `reason`. One with a citation reason means a judge passed without valid evidence.
 
-The same result is stored in `vala.verification.results`, and the pinned inputs in `vala.verification.execution_inputs`; query them with `bifrost.query` over MCP or the SDK's `Bifrost`:
+The same result is stored in `bifrost.verification.results`, and the pinned inputs in `bifrost.verification.execution_inputs`; query them with `bifrost.query` over MCP or the SDK's `Bifrost`:
 
 ```sql
 SELECT verdict, verifier_version, run_id, binding_id
-FROM vala.verification.results
+FROM bifrost.verification.results
 WHERE execution_id = $1
 ```
 

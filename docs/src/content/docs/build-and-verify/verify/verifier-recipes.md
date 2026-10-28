@@ -5,23 +5,22 @@ pillar: wyrd
 section: Build and verify
 topic: Verify
 order: 1
-status: runnable
 ---
 
 Pick the check you need, bind its Verifier under `verified_by` to what it checks (a Service, one of its Agents, Models, or Data, or a standalone Agent), and call it from your code. Each recipe's Python declares `support-reply.yaml`, a Service that binds the recipe's Verifier, as in [Run your first verification](/get-started/quickstart/).
 
-| To check | Use |
-| --- | --- |
-| Fields of an answer | [Assertions](#assertions) |
-| That your code took the right steps | [Trace](#trace) |
-| Logic an operator cannot express | [Python check](#python-check) |
-| Meaning, tone, or policy | [Model judge](#model-judge) |
-| An answer against a document | [Multi-step](#multi-step) |
-| An answer against files you upload once | [Uploaded files](#uploaded-files) |
-| A whole conversation, not one reply | [Grouped session](#grouped-session) |
-| Inputs or outputs shifting over time | [Drift](#drift) |
+| To check | Use | Kind |
+| --- | --- | --- |
+| Fields of an answer | [Assertions](#assertions) | `assert` |
+| That your code took the right steps | [Trace](#trace) | `trace` |
+| Logic an operator cannot express | [Python check](#python-check) | `code` |
+| Meaning, tone, or policy | [Model judge](#model-judge) | `agent` |
+| An answer against a document | [Multi-step](#multi-step) | `extract` and `code` steps, then `assert` |
+| An answer against files you upload once | [Uploaded files](#uploaded-files) | `agent` with a workspace |
+| A whole conversation, not one reply | [Grouped session](#grouped-session) | `assert` over a group |
+| Inputs or outputs shifting over time | [Drift](#drift) | `drift` |
 
-Start with the cheapest check that catches the failure. A model judge costs a model call per requirement; an assertion costs nothing.
+[Steps and checks](/understand/how-verification-works/#steps-and-checks) explains each kind. Start with the cheapest check that catches the failure. A model judge costs a model call per requirement; an assertion costs nothing.
 
 ## Assertions
 
@@ -400,6 +399,19 @@ The SDKs run the same upload:
 
 `metadata` takes `labels` and `annotations` too, and `spec` defaults to `{artifact_kind: file}`.
 
+A refused upload declares no Card. A `WYRD_SPEC_400_VALIDATION` refusal names its `rule` in `details`:
+
+| You see | Fix |
+| --- | --- |
+| Rule `artifact_source_regular` | The source, or an entry under it, is a symbolic link or another non-regular file. Replace or remove the entry `details.source` names |
+| Rule `artifact_source_empty` | The directory holds no regular files. Upload a directory with at least one file |
+| Rule `extraction_refused` | With `--extract`, a supported document is malformed or over the extraction limits; `details.reason` says which. Fix or remove it, or upload without `--extract` |
+| Rule `extraction_output_collision` | With `--extract`, an uploaded file sits at or around `extracted/P.json`. Rename or remove the file `details.collides_with` names |
+| Rule `extraction_report` | With `--extract`, `spec` already sets `metadata.extraction`. Remove it; the upload writes the report |
+| `WYRD_LOADER_400_INVALID_ENVELOPE` | The source is missing or unreadable, or a file changed during the upload. Check the path and run the upload again |
+
+Upload is not atomic. Interrupted after it starts sending, it can leave the version declared but not yet Active; run the same upload again, which follows the version rules above.
+
 Mount the uploaded files by exact reference in an Agent's `workspace`, here the extraction of one handbook:
 
 <Tabs>
@@ -477,7 +489,7 @@ for reply in replies:
 </Tab>
 </Tabs>
 
-New replies in the group push the session check back. Its verdict is stored in `vala.verification.results` with the `group_id`.
+New replies in the group push the session check back. Its verdict is stored in `bifrost.verification.results` with the `group_id`.
 
 ## Drift
 

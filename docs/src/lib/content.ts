@@ -5,8 +5,6 @@ export type Pillar = 'wyrd' | 'fathom' | 'shared';
 // Availability of a task journey: `runnable` steps are backed by shipped
 // artifacts, `partial` pages lead with the supported portion and name the gap,
 // and `planned` pages stay out of primary navigation.
-export type JourneyStatus = 'runnable' | 'partial' | 'planned';
-const JOURNEY_STATUSES: readonly JourneyStatus[] = ['runnable', 'partial', 'planned'];
 
 // The approved reader-facing sections, in sidebar order. Only Build and verify
 // has topics; every other section lists its pages directly, so navigation is
@@ -32,7 +30,6 @@ export type DocMetadata = {
   topic?: string;
   order?: number;
   draft?: boolean;
-  status?: JourneyStatus;
   // Date (YYYY-MM-DD) of the last commit that changed the page source. Injected
   // at build time by the `remarkUpdated` plugin; absent for uncommitted pages.
   updated?: string;
@@ -108,15 +105,6 @@ export function validateFrontmatter(contentPath: string, raw: unknown): DocMetad
   if (typeof meta?.description === 'string') result.description = meta.description;
   if (typeof meta?.order === 'number') result.order = meta.order;
   if (typeof meta?.draft === 'boolean') result.draft = meta.draft;
-  if (meta?.status !== undefined) {
-    if (!JOURNEY_STATUSES.includes(meta.status as JourneyStatus)) {
-      throw new Error(
-        `Content file "${contentPath}" has an invalid "status" in its frontmatter. ` +
-          `Expected one of: ${JOURNEY_STATUSES.join(', ')}.`
-      );
-    }
-    result.status = meta.status as JourneyStatus;
-  }
   if (typeof meta?.updated === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(meta.updated)) {
     result.updated = meta.updated;
   }

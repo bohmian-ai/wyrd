@@ -104,12 +104,8 @@ def _order(value: str | None) -> float:
 
 
 def in_sidebar(fm: dict[str, str]) -> bool:
-    """Mirror derived-nav.ts inPrimaryNav(): no drafts, Fathom, or planned pages."""
-    return (
-        fm.get("draft") != "true"
-        and fm.get("pillar") != "fathom"
-        and fm.get("status") != "planned"
-    )
+    """Mirror derived-nav.ts inPrimaryNav(): no drafts or Fathom pages."""
+    return fm.get("draft") != "true" and fm.get("pillar") != "fathom"
 
 
 def sidebar_pages() -> list[Page]:

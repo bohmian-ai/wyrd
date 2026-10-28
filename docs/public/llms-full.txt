@@ -173,7 +173,7 @@ Wyrd verifies your system; your code runs it. Your app owns its code, models, an
 
 Page: /wyrd/get-started/setup/
 
-> Install the Wyrd 0.3.0 CLI and SDK for Python, Rust, or TypeScript, then let your coding agent start a local server and run a first verification, or do it by hand.
+> Install the Wyrd 0.4.0 CLI and SDK for Python, Rust, or TypeScript, then let your coding agent start a local server and run a first verification, or do it by hand.
 
 Install Wyrd, then set up the rest with your coding agent or by hand. Either way you end with a local server running and your code connected to it.
 
@@ -191,7 +191,7 @@ Install Wyrd, then set up the rest with your coding agent or by hand. Either way
 
 ```bash
 uv init quickstart && cd quickstart
-uv add "wyrd-ai==0.3.0"
+uv add "wyrd-ai==0.4.0"
 ```
 
 Run the CLI as `uv run wyrd`.
@@ -199,9 +199,9 @@ Run the CLI as `uv run wyrd`.
 **Rust**
 
 ```bash
-cargo install wyrd-cli --version 0.3.0 --locked
+cargo install wyrd-cli --version 0.4.0 --locked
 cargo new quickstart && cd quickstart
-cargo add wyrd-ai@0.3.0 tokio --features tokio/full
+cargo add wyrd-ai@0.4.0 tokio --features tokio/full
 ```
 
 **TypeScript**
@@ -209,7 +209,7 @@ cargo add wyrd-ai@0.3.0 tokio --features tokio/full
 ```bash
 mkdir quickstart && cd quickstart
 pnpm init && pnpm pkg set type=module
-pnpm add wyrd-ai@0.3.0
+pnpm add wyrd-ai@0.4.0
 ```
 
 Run the CLI as `pnpm wyrd`.
@@ -654,7 +654,7 @@ metadata:
 spec:
   service_type: agent
   tables:
-    - name: tickets  # becomes vala.datasets.tickets
+    - name: tickets  # becomes bifrost.datasets.tickets
       schema:
         type: object
         properties:  # in column order
@@ -932,7 +932,7 @@ Wrap each request your app handles in a Run. Everything inside it (the model cal
 You need the support-desk Service from [Write a Verifier](/wyrd/build-and-verify/verify/author-a-verifier/) and a running server from [Set up Wyrd](/wyrd/get-started/setup/). Install the SDK with its telemetry and gateway extras, and the OpenAI client:
 
 ```bash
-uv add "wyrd-ai[otel,gateway]==0.3.0" openai
+uv add "wyrd-ai[otel,gateway]==0.4.0" openai
 ```
 
 ## 1. Connect at startup
@@ -974,7 +974,7 @@ def answer(question: str):
         text = reply.choices[0].message.content
 
         # A row in the Service's tickets table, tagged with this Run.
-        run.observe.record("vala.datasets.tickets", {"question": question, "answer": text})
+        run.observe.record("bifrost.datasets.tickets", {"question": question, "answer": text})
         return run, agent, text
 ```
 
@@ -1028,9 +1028,9 @@ Every row the Run produced carries its `run_id`, so one query joins the ticket, 
 
 ```sql title="run.sql"
 SELECT t.question, t.answer, g.call_id, r.verdict
-FROM vala.datasets.tickets t
-JOIN vala.gateway.calls g ON g.run_id = t.run_id
-JOIN vala.verification.results r ON r.run_id = t.run_id
+FROM bifrost.datasets.tickets t
+JOIN bifrost.gateway.calls g ON g.run_id = t.run_id
+JOIN bifrost.verification.results r ON r.run_id = t.run_id
 WHERE t.run_id = $1
 ```
 
@@ -1273,7 +1273,7 @@ spec:
 
 ```
 
-The judge calls its model through your server's [LLM gateway](/wyrd/connect/set-up-the-llm-gateway/), on the deployment named in `execution_route`. Its `response_format` must be the same verdict schema, or declaring the Verifier fails. Bind `follows-policy` beside `ticket-complete` on the agent.
+The judge calls its model through your server's [LLM gateway](/wyrd/connect/set-up-the-llm-gateway/), on the deployment named in `execution_route`. Its Prompt sets `response_format: verdict`, so the model answers with an outcome, a reason, and citations. Declaring a Verifier whose check Agent has no verdict format fails. Bind `follows-policy` beside `ticket-complete` on the agent.
 
 A model call takes seconds, so submit the letter and collect the verdict later instead of waiting in the request:
 
@@ -1307,18 +1307,18 @@ Page: /wyrd/build-and-verify/verify/verifier-recipes/
 
 Pick the check you need, bind its Verifier under `verified_by` to what it checks (a Service, one of its Agents, Models, or Data, or a standalone Agent), and call it from your code. Each recipe's Python declares `support-reply.yaml`, a Service that binds the recipe's Verifier, as in [Run your first verification](/wyrd/get-started/quickstart/).
 
-| To check | Use |
-| --- | --- |
-| Fields of an answer | [Assertions](#assertions) |
-| That your code took the right steps | [Trace](#trace) |
-| Logic an operator cannot express | [Python check](#python-check) |
-| Meaning, tone, or policy | [Model judge](#model-judge) |
-| An answer against a document | [Multi-step](#multi-step) |
-| An answer against files you upload once | [Uploaded files](#uploaded-files) |
-| A whole conversation, not one reply | [Grouped session](#grouped-session) |
-| Inputs or outputs shifting over time | [Drift](#drift) |
+| To check | Use | Kind |
+| --- | --- | --- |
+| Fields of an answer | [Assertions](#assertions) | `assert` |
+| That your code took the right steps | [Trace](#trace) | `trace` |
+| Logic an operator cannot express | [Python check](#python-check) | `code` |
+| Meaning, tone, or policy | [Model judge](#model-judge) | `agent` |
+| An answer against a document | [Multi-step](#multi-step) | `extract` and `code` steps, then `assert` |
+| An answer against files you upload once | [Uploaded files](#uploaded-files) | `agent` with a workspace |
+| A whole conversation, not one reply | [Grouped session](#grouped-session) | `assert` over a group |
+| Inputs or outputs shifting over time | [Drift](#drift) | `drift` |
 
-Start with the cheapest check that catches the failure. A model judge costs a model call per requirement; an assertion costs nothing.
+[Steps and checks](/wyrd/understand/how-verification-works/#steps-and-checks) explains each kind. Start with the cheapest check that catches the failure. A model judge costs a model call per requirement; an assertion costs nothing.
 
 ## Assertions
 
@@ -1666,6 +1666,19 @@ The SDKs run the same upload:
 
 `metadata` takes `labels` and `annotations` too, and `spec` defaults to `{artifact_kind: file}`.
 
+A refused upload declares no Card. A `WYRD_SPEC_400_VALIDATION` refusal names its `rule` in `details`:
+
+| You see | Fix |
+| --- | --- |
+| Rule `artifact_source_regular` | The source, or an entry under it, is a symbolic link or another non-regular file. Replace or remove the entry `details.source` names |
+| Rule `artifact_source_empty` | The directory holds no regular files. Upload a directory with at least one file |
+| Rule `extraction_refused` | With `--extract`, a supported document is malformed or over the extraction limits; `details.reason` says which. Fix or remove it, or upload without `--extract` |
+| Rule `extraction_output_collision` | With `--extract`, an uploaded file sits at or around `extracted/P.json`. Rename or remove the file `details.collides_with` names |
+| Rule `extraction_report` | With `--extract`, `spec` already sets `metadata.extraction`. Remove it; the upload writes the report |
+| `WYRD_LOADER_400_INVALID_ENVELOPE` | The source is missing or unreadable, or a file changed during the upload. Check the path and run the upload again |
+
+Upload is not atomic. Interrupted after it starts sending, it can leave the version declared but not yet Active; run the same upload again, which follows the version rules above.
+
 Mount the uploaded files by exact reference in an Agent's `workspace`, here the extraction of one handbook:
 
 **handbook-review.yaml**
@@ -1776,7 +1789,7 @@ for reply in replies:
 # whole-conversation runs on its own, 10 minutes after the last reply.
 ```
 
-New replies in the group push the session check back. Its verdict is stored in `vala.verification.results` with the `group_id`.
+New replies in the group push the session check back. Its verdict is stored in `bifrost.verification.results` with the `group_id`.
 
 ## Drift
 
@@ -1889,7 +1902,7 @@ Calls made before this step are never recorded.
 ## 4. Make a request
 
 ```bash
-uv add "wyrd-ai[gateway]==0.3.0" openai
+uv add "wyrd-ai[gateway]==0.4.0" openai
 ```
 
 ```python title="call.py"
@@ -1922,7 +1935,7 @@ It prints the model's reply. OpenAI received `gpt-4o` with your stored key and n
 from wyrd.bifrost import Bifrost
 
 rows = Bifrost().sql(
-    "SELECT requested_model, outcome FROM vala.gateway.calls ORDER BY started_at DESC LIMIT 1"
+    "SELECT requested_model, outcome FROM bifrost.gateway.calls ORDER BY started_at DESC LIMIT 1"
 ).to_arrow().to_pylist()
 print(rows)
 ```
@@ -1981,7 +1994,7 @@ Add `WyrdMiddleware` to any ASGI app, such as FastAPI, Starlette, Django, or Lit
 ## Install
 
 ```bash
-uv add "wyrd-ai[otel]==0.3.0" uvicorn
+uv add "wyrd-ai[otel]==0.4.0" uvicorn
 ```
 
 Add your framework too, such as `uv add fastapi`. Then pull the Service into the app's directory, at build or deploy time rather than when the app starts:
@@ -2215,6 +2228,449 @@ A graceful stop (`SIGTERM`) drains every worker. A worker killed with `SIGKILL`,
 
 [Runs and evidence](/wyrd/understand/runs-observations-and-evidence/) explains what a Run records and how long it is kept.
 
+# Deploy for a team
+
+Page: /wyrd/operate/deploy-wyrd-for-a-team/
+
+> Prepare PostgreSQL with one login, migrate it, start the server, and create the first tenant.
+
+A Wyrd server needs one PostgreSQL login, set as `WYRD_DATABASE_URL`. For a self-hosted team that login is enough, because Wyrd keeps tenants apart inside PostgreSQL rather than with separate logins. A second login is optional hardening; step 1 explains when it is worth it.
+
+Treat the database URL as a secret: anyone who can read the server's environment has platform access.
+
+This page covers the database, the server's persistent settings, and the first tenant.
+[Configure the verification runtime](/wyrd/operate/configure-verification-runtime/)
+covers the Python worker and the limits on Verifier execution.
+TLS termination and multi-replica topology are not documented yet.
+
+## Prerequisites
+
+- PostgreSQL 16, and an administrator login that can create logins and databases.
+- The `wyrd-server` binary for the release you are deploying, or the `bohmian/wyrd` container image from Docker Hub.
+- An object store every server replica can reach: S3, Google Cloud Storage, or Azure Blob Storage.
+
+## 1. Create the login and the database
+
+As the administrator, create an ordinary login and a database it owns:
+
+```sql
+CREATE ROLE wyrd LOGIN PASSWORD '<password>';
+CREATE DATABASE wyrd OWNER wyrd;
+```
+
+The name is yours to choose. The login must not be a superuser or have `BYPASSRLS`. PostgreSQL skips row-level security for both, so the server refuses to start with either.
+
+### Why one login is enough
+
+Every Wyrd table has row-level security forced on, which makes PostgreSQL apply its policies even to the login that owns the table. Each tenant request runs in a transaction bound to one tenant, and the policies return only that tenant's rows. A query that forgets its tenant filter still sees one tenant.
+
+Platform work, such as migrations and creating tenants, uses the same login on separate connections marked as operator sessions. Only those connections can read across tenants.
+
+### When to add a tenant login
+
+With one login, tenant requests run as the owner of the tables. An owner can turn row-level security off, or mark its own session as an operator session. A server bug that let a request run arbitrary SQL could use either to read other tenants.
+
+A separate tenant login removes that path. It owns no table and holds only read and write access, so it cannot change a policy. The operator policies admit only the owner, so marking its session as an operator session gives it nothing. Add one when tenants must not be able to reach each other even through a server bug, such as one server shared by separate customers. Most self-hosted deployments do not need it: they run a single tenant, so there is no other tenant to reach.
+
+To add one, do this before [step 2](#2-migrate). As the administrator, create the tenant login, then, connected to the `wyrd` database, run:
+
+```sql
+CREATE ROLE wyrd_tenant LOGIN PASSWORD '<tenant-password>';
+CREATE SCHEMA IF NOT EXISTS platform AUTHORIZATION wyrd;
+CREATE SCHEMA IF NOT EXISTS wyrd AUTHORIZATION wyrd;
+CREATE SCHEMA IF NOT EXISTS vala AUTHORIZATION wyrd;
+GRANT USAGE ON SCHEMA platform, wyrd, vala TO wyrd_tenant;
+ALTER DEFAULT PRIVILEGES FOR ROLE wyrd IN SCHEMA wyrd, vala
+    GRANT SELECT, INSERT, UPDATE, DELETE ON TABLES TO wyrd_tenant;
+ALTER DEFAULT PRIVILEGES FOR ROLE wyrd IN SCHEMA wyrd, vala
+    GRANT USAGE, SELECT ON SEQUENCES TO wyrd_tenant;
+```
+
+The schemas exist early only so the tenant login can be granted on them; `migrate` still creates every table, and each one it creates is granted to `wyrd_tenant` automatically. Then set two URLs wherever the steps below set one: `WYRD_DATABASE_URL` for `wyrd_tenant`, and `WYRD_PLATFORM_DATABASE_URL` for `wyrd`, which `migrate` uses. Grant `wyrd_tenant` nothing else: the server refuses to start if it owns a Wyrd table or holds `TRUNCATE`, `REFERENCES`, or `TRIGGER` on one.
+
+## 2. Migrate
+
+```bash
+export WYRD_DATABASE_URL="postgresql://wyrd:<password>@<db-host>:5432/wyrd"
+wyrd-server migrate
+```
+
+`migrate` creates Wyrd's schemas and tables, then prints `Wyrd and Vala schemas are migrated and valid.` Run it once per release, before you start or upgrade servers.
+
+## 3. Start the server and check readiness
+
+The server needs two keys of its own. Create them once, store them in your secret manager, and mount the same two files on every replica:
+
+```bash
+openssl genpkey -algorithm ed25519 -out signing.pem
+openssl rand -base64 32 | tr -d '\n' > sealing.key
+chmod 0600 signing.pem sealing.key
+```
+
+The server reads only regular files that the user running it owns and nobody else can read, so mount them with that owner and mode `0600`.
+
+The signing key signs the access tokens Wyrd issues. Every request carries one, and a replica accepts it only if this key signed it. With one shared key, a token issued by any replica works on all of them and still works after a restart. With `APP_ENV=production` and no signing key, the server refuses to start.
+
+The sealing key encrypts the secrets Wyrd stores in PostgreSQL, such as LLM provider keys stored as `managed_secret` and identity provider client secrets, so a copy of the database does not expose them. Back it up separately from the database. If it is lost, those secrets cannot be decrypted, and the server refuses to start while any are stored.
+
+Set these variables, then start `wyrd-server` with the same `WYRD_DATABASE_URL`:
+
+| Variable | Value | If unset |
+| --- | --- | --- |
+| `WYRD_STORAGE_URL` | `s3://bucket`, `gs://bucket`, or `az://account/container`; bucket only, no path. S3 reads its region from `AWS_REGION` | Data goes to a local directory that only this process sees |
+| `WYRD_SIGNING_KEY_FILE` | Path to `signing.pem` | Startup fails when `APP_ENV=production`; otherwise each process makes a temporary key, and tokens stop working after a restart and on other replicas |
+| `WYRD_SEALING_KEY_FILE` | Path to `sealing.key` | Storing a `managed_secret` fails with `gateway credential protection is unavailable` |
+
+```bash
+curl -s -o /dev/null -w '%{http_code}\n' http://<server-host>:8080/readyz
+```
+
+`200` means the server checked the schema and the login and is serving. If the server exits instead, its last log line says why; see [Troubleshoot a deployment](/wyrd/operate/troubleshoot-a-deployment/).
+
+## 4. Create the first tenant
+
+With the server running, from a machine that has the same two database URLs exported:
+
+```bash
+wyrd-server setup --tenant acme --server http://<server-host>:8080
+```
+
+On a fresh database this creates the platform root and prints its `wyrd_global_...` credential, then creates the tenant and prints:
+
+```text
+tenant_id: <uuid>
+slug: acme
+admin_principal_id: <uuid>
+admin_credential: <key>
+This is the only time the tenant credential is shown. Store it now.
+```
+
+Store both credentials in your secret manager. The platform credential creates and recovers tenants; the tenant `admin_credential` is the tenant's first administrator. Rerunning `setup` for an active tenant prints `is already set up; nothing to do.` To add another tenant later, set `WYRD_PLATFORM_CREDENTIAL` and rerun `setup` with the new slug.
+
+Give the administrator credential to the first person who will manage the tenant. They save it as `[default].api_key` in their `credentials.toml`, [connect an agent](/wyrd/get-started/use-with-your-coding-agent/), and grant roles to others; [Identity and access](/wyrd/understand/identity-and-authorization/) explains the model.
+
+## Next
+
+- [Add people](/wyrd/operate/add-people/) connects your identity provider so your team can sign in.
+- [Deploy a Service from CI](/wyrd/operate/deploy-a-service-from-ci/) creates the CI and Service accounts and ships your first Service.
+
+# Deploy a Service from CI
+
+Page: /wyrd/operate/deploy-a-service-from-ci/
+
+> Give CI and each Service its own key, declare and pull the Service in CI, and start the application from the bundle.
+
+Ship a Service with two keys: one for CI, which declares the Service and pulls its bundle, and one for the running application, which loads that bundle. The bundle names the exact release, so the application needs nothing but its key.
+
+| Who | Account | Role | Does |
+| --- | --- | --- | --- |
+| CI | `ci-deploy` | `editor` | Declares the Service and pulls its bundle |
+| The application | `checkout-runtime` | `workload` | Loads the bundle, records Runs and observations, runs Verifiers |
+
+## Before you start
+
+- A Wyrd server, and a key with the `admin` role, such as the tenant administrator key.
+- A Service declaration, such as the `service/` directory from [Define a Service](/wyrd/build-and-verify/declare/define-a-service/). Its Service is named `checkout` here, with an exact `version` such as `1.2.0` in its `metadata`.
+
+## 1. Create the CI account
+
+Once per tenant, as an administrator:
+
+```bash
+wyrd principal credential create-principal --name ci-deploy --role editor
+```
+
+```text
+principal_id: <uuid>
+credential: <key>
+This is the only time the credential is shown. Store it now.
+```
+
+Save the credential as the CI secret `WYRD_API_KEY`, and the server URL as `WYRD_SERVER_URL`. `editor` can declare Cards for every Service in the tenant, so one CI account covers all your repositories.
+
+## 2. Create the Service's account
+
+Once per Service, not once per release:
+
+```bash
+wyrd principal credential create-principal --name checkout-runtime --role workload --workload-name checkout
+```
+
+Store this credential where your deployment reads secrets. `workload` records evidence and runs Verifiers, but cannot change a Card, so a leaked runtime key cannot change what your Service is verified against. `--workload-name checkout` limits the key to releases of `checkout`, and makes it the account that scheduled Verifiers for `checkout` run as.
+
+## 3. Declare and pull in CI
+
+```bash
+wyrd declare service/
+wyrd pull --kind Service --name checkout --version 1.2.0 --output-dir bundle
+```
+
+`pull` downloads that release with every Card and file it uses. The version in your YAML is the release: declaring the same files again returns the same Card, and changed files under an unchanged version are refused with `WYRD_REGISTRY_409_SPEC_DRIFT`, so bump the version with every change you ship.
+
+Copy `bundle/` into the application image.
+
+## 4. Start the application from the bundle
+
+Give the container the runtime key as `WYRD_API_KEY`, and `WYRD_SERVER_URL`. The application loads the bundle at startup:
+
+**Python**
+
+```python title="desk.py"
+self.client = client or WyrdClient()
+self.state = WyrdState.from_path(BUNDLE, self.client)
+# The Service name, version, and environment every span, gateway call, and
+# verification carries. Name and version come from the bundle.
+self.state.configure(deployment_environment="development")
+self.state.start_bifrost()
+# Spans export to Wyrd through the SDK's OTLP exporter; the Agents SDK's
+# own traces become spans too, under the request's Run.
+self.state.start_telemetry()
+set_trace_processors([WyrdAgentsTraceProcessor()])
+```
+
+**Rust**
+
+```rust title="lib.rs"
+let state = WyrdState::from_path_with(bundle, client.clone())?;
+// The Service name, version, and environment every span, gateway call, and
+// verification carries. Name and version come from the bundle.
+state.configure(ConfigureOptions {
+    deployment_environment: Some("development".to_owned()),
+    ..ConfigureOptions::default()
+})?;
+// Starts the buffered writer the ticket rows go through.
+state.start_bifrost().await?;
+```
+
+**TypeScript**
+
+```typescript title="server.ts"
+// WYRD_SERVER_URL and WYRD_API_KEY, else the settings `wyrd init` saved, say which server to use and who the app is.
+const client = WyrdClient.connect();
+// The declared Service, pulled by `pnpm run deploy`.
+const state = WyrdState.fromPath(BUNDLE_DIR, { client });
+// The Service name, version, and environment every span, gateway call, and verification carries. Name and version come from the bundle.
+state.configure({ deploymentEnvironment: "development" });
+await state.startBifrost(); // writes tickets to Bifrost
+await state.startTelemetry(); // exports spans to Wyrd
+```
+
+Loading is offline. From then on, every call sends the runtime key with the release named in the bundle, and the server records both on each row. You never set a release ID yourself.
+
+`configure` fixes the Service name, version, and deployment environment that every span, log, metric, gateway call, and verification carries. Name and version come from the bundle; pass the environment your deployment runs in, such as `production`. Call it once, before the state's first use: a second call fails with `WYRD_SDK_409_STATE_CONFIG_FROZEN`. The environment is a label and grants nothing.
+
+## 5. Rotate a key
+
+Issue a second key on the same account, deploy it, then revoke the old one. Both keys work in between.
+
+```bash
+wyrd principal credential issue --principal <principal-id>
+wyrd principal credential revoke --principal <principal-id> --credential-id <old-credential-id>
+```
+
+`wyrd principal credential list --principal <principal-id>` shows each key's ID and when it was last used.
+
+## If it fails
+
+| You see | Fix |
+| --- | --- |
+| `WYRD_AUTH_409_WORKLOAD_BINDING_CONFLICT` in step 2 | `checkout` already has an account. Issue another key on it instead of creating a second account |
+| `WYRD_REGISTRY_409_SPEC_DRIFT` from `wyrd declare` | The files changed but `version` did not. Bump `version` in the Service YAML |
+| `WYRD_PERMISSION_403_DENIED_RBAC` from `wyrd declare` | CI is using a key without `editor`, such as the runtime key |
+| `WYRD_AUTH_403_WORKLOAD_CONTEXT_REQUIRED` from the application | It is not using `WyrdState` from the bundle. Load the bundle, or set `WYRD_WORKLOAD_UID` to the release UID |
+| `WYRD_AUTH_401_WORKLOAD_UID_REFUSED` from the application | The bundle is from another Service than the key's `--workload-name`. Pair each Service's bundle with its own key |
+
+## Next
+
+[Identity and access](/wyrd/understand/identity-and-authorization/) explains accounts, roles, and how a key and a bundle together identify a release.
+
+# Add people
+
+Page: /wyrd/operate/add-people/
+
+> Connect your identity provider, such as Okta or Keycloak, so people sign in to Wyrd, then grant them roles.
+
+People sign in to Wyrd through your organization's identity provider, such as Okta or Keycloak. Wyrd stores no passwords and has no invite step: a person's account is created the first time they sign in. A new account holds no role until you grant one.
+
+You connect the provider once per tenant. Wyrd only trusts a connection after a real test sign-in succeeds, so a typo in the issuer or client ID cannot lock your team out.
+
+## Before you start
+
+- A tenant and its `admin_credential`, from [Deploy for a team](/wyrd/operate/deploy-wyrd-for-a-team/#4-create-the-first-tenant).
+- The server's sealing key, from [step 3 of that guide](/wyrd/operate/deploy-wyrd-for-a-team/#3-start-the-server-and-check-readiness). Wyrd encrypts the provider's client secret with it and refuses to test a connection without it.
+- Administrator access to your identity provider.
+- The `wyrd` CLI and `curl`.
+
+## 1. Get the callback URL
+
+Use the address people will open Wyrd at, not an internal one. Wyrd builds the callback URL from the address the request arrives at.
+
+```bash
+export WYRD_SERVER_URL=https://wyrd.example.com
+export WYRD_API_KEY=<admin_credential>
+TOKEN="$(wyrd auth access-token)"
+curl -s -H "Authorization: Bearer $TOKEN" "$WYRD_SERVER_URL/v1/identity/oidc/connections"
+```
+
+```json
+{"active":null,"candidate":null,"callback_url":"https://wyrd.example.com/auth/callback"}
+```
+
+The token lasts 5 minutes. If a later call returns `401`, run the `TOKEN=` line again.
+
+## 2. Register Wyrd with your provider
+
+Create an OpenID Connect application for Wyrd that uses the authorization code flow with PKCE, with the `callback_url` from step 1 as its only redirect URI. Wyrd requests the `openid`, `profile`, and `email` scopes.
+
+**Keycloak**
+
+1. In your realm, open **Clients**, then **Create client**. Choose **OpenID Connect** and set the client ID to `wyrd`.
+2. Turn **Client authentication** off and leave **Standard flow** on. Wyrd then signs in as a public client with PKCE, so there is no secret to store.
+3. Set **Valid redirect URIs** to the `callback_url`.
+4. On the client's **Advanced** tab, set **Proof Key for Code Exchange Code Challenge Method** to `S256`.
+
+The issuer is `https://<keycloak-host>/realms/<realm>`.
+
+**Okta**
+
+1. Open **Applications**, then **Create App Integration**. Choose **OIDC - OpenID Connect** and **Web Application**.
+2. Leave **Authorization Code** as the grant type, and set **Sign-in redirect URIs** to the `callback_url`.
+3. Assign the app to the people or groups who should sign in to Wyrd, and copy the client ID and client secret.
+
+The issuer is `https://<your-org>.okta.com`.
+
+## 3. Stage the connection
+
+Save the connection as `connection.json`:
+
+**Keycloak**
+
+```json
+{
+  "issuer": "https://keycloak.example.com/realms/acme",
+  "client_id": "wyrd",
+  "client_auth": "Public",
+  "claim_mapping": { "subject": "sub", "email": "email" }
+}
+```
+
+**Okta**
+
+```json
+{
+  "issuer": "https://acme.okta.com",
+  "client_id": "<client-id>",
+  "client_auth": "SecretBasic",
+  "client_secret": "<client-secret>",
+  "claim_mapping": { "subject": "sub", "email": "email" }
+}
+```
+
+`subject` must be `sub`: Wyrd identifies a person by the provider's permanent ID, never by an email that can change. `email` is what `wyrd principal list --email` searches.
+
+Stage it:
+
+```bash
+curl -s -X PUT -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" \
+  --data @connection.json "$WYRD_SERVER_URL/v1/identity/oidc/candidate"
+```
+
+The response shows the connection with `"state":"Candidate"` and a `revision`, such as `1`. Wyrd encrypts the client secret and never returns it. Delete `connection.json` once it is staged if it holds a secret.
+
+## 4. Test it with a real sign-in
+
+```bash
+curl -s -X POST -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" \
+  -d '{"expected_revision": 1}' "$WYRD_SERVER_URL/v1/identity/oidc/candidate/test"
+```
+
+```json
+{"authorization_url":"https://keycloak.example.com/realms/acme/protocol/openid-connect/auth?..."}
+```
+
+Wyrd has already checked that the issuer answers and publishes signing keys. Open the `authorization_url` in a browser and sign in at your provider. The page ends with `Connection test complete.` The test creates no account.
+
+## 5. Activate it
+
+Within 15 minutes of the test:
+
+```bash
+curl -s -X POST -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" \
+  -d "{\"expected_revision\": 1, \"recovery_api_key\": \"$WYRD_API_KEY\"}" \
+  "$WYRD_SERVER_URL/v1/identity/oidc/candidate/activate"
+```
+
+The response shows `"state":"Active"`. The recovery key proves an administrator can still get in with a key if the provider ever breaks; Wyrd checks it and does not store it. Keep the `admin_credential` in your secret manager for that reason.
+
+## 6. Sign in and grant roles
+
+Each person signs in once from a terminal:
+
+```bash
+wyrd auth login --server https://wyrd.example.com --tenant acme
+```
+
+The browser opens at your provider. After sign-in, the CLI and every SDK on that machine use the saved login. That first sign-in creates their account, which holds no role yet. As the administrator, find it and grant a role:
+
+```bash
+wyrd principal list --kind user --email alice@example.com
+wyrd principal role grant --principal <principal-id> --role editor
+```
+
+The role takes effect within 5 minutes, when their access token next renews. [Roles](/wyrd/understand/identity-and-authorization/#roles) lists what each role allows.
+
+## Map provider groups to roles
+
+If your team already manages access with groups in the provider, Wyrd can take roles from them instead, so adding someone to a group is all it takes.
+
+Wyrd reads the groups from a `groups` claim in the ID token. Add it at the provider:
+
+**Keycloak**
+
+Open **Client scopes**, then `wyrd-dedicated`, and add a **Group Membership** mapper. Set **Token Claim Name** to `groups`, turn **Full group path** off, and turn **Add to ID token** on.
+
+**Okta**
+
+On the app's **Sign On** tab, edit **OpenID Connect ID Token**. Set **Groups claim type** to **Filter**, the claim name to `groups`, and a filter such as **Starts with** `wyrd-`.
+
+Then add `groups` to `claim_mapping` and a `group_role_map` to `connection.json`:
+
+```json
+"claim_mapping": { "subject": "sub", "email": "email", "groups": "groups" },
+"group_role_map": {
+  "wyrd-admins": ["admin"],
+  "wyrd-editors": ["editor"],
+  "wyrd-viewers": ["viewer"]
+}
+```
+
+Repeat steps 3 to 5 with the new `revision` the stage call returns. Only a connection that passes its own test replaces the active one, so sign-in keeps working until then.
+
+Wyrd recomputes a person's group roles at every sign-in. Remove someone from `wyrd-editors` and they lose `editor` the next time they sign in. Groups not in the map grant nothing, and a role name that does not exist in the tenant is ignored. Roles you grant with `wyrd principal role grant` are separate: sign-in never adds or removes them.
+
+## Without an identity provider
+
+Until you connect a provider, give each person a key on their own account:
+
+```bash
+wyrd principal credential create-principal --name alice --role editor
+```
+
+They set it as `WYRD_API_KEY`. Each call is audited under that account. The account is a Service account, not a user, and has no browser sign-in. Revoke it with `wyrd principal revoke` when they leave.
+
+## If it fails
+
+| You see | Fix |
+| --- | --- |
+| The provider says the redirect URI is invalid | Register the exact `callback_url` from step 1. Call the API at the public address, not an internal one |
+| `WYRD_AUTH_409_CONNECTION_NOT_TESTED` from activate | The test expired after 15 minutes, or you staged a new revision since. Rerun step 4 |
+| `WYRD_AUTH_409_CONNECTION_CONFLICT` | `expected_revision` is stale, or the recovery key is not an admin key of this tenant. Read the current revision with the step 1 call |
+| A person signs in but every call returns `WYRD_PERMISSION_403_DENIED_RBAC` | They hold no role yet. Grant one as in step 6, or check the `groups` claim and `group_role_map` if you map groups |
+
+## Next
+
+[Permissions](/wyrd/operate/grant-and-inspect-permissions/) shows how to grant, revoke, and audit roles.
+
 # Verification runtime
 
 Page: /wyrd/operate/configure-verification-runtime/
@@ -2250,6 +2706,189 @@ Settings are read at startup; restart to apply a change.
 
 [Verification runtime limits](/wyrd/reference/verification-runtime-limits/) lists every setting, its default, and what happens when a limit is reached.
 
+# Permissions
+
+Page: /wyrd/operate/grant-and-inspect-permissions/
+
+> See which roles a principal holds, grant or revoke a role, cut a principal off, and confirm the result in the audit log.
+
+Grant a role to give a principal more access, revoke it to take access away, and read the audit log to confirm what the server decided. Every command here changes access for the whole tenant.
+
+## Prerequisites
+
+- A credential with the `admin` role, such as the tenant `admin_credential` from [Deploy Wyrd for a team](/wyrd/operate/deploy-wyrd-for-a-team/#4-create-the-first-tenant), or the key `wyrd init` saved.
+- The principal's ID. `wyrd principal list` shows it.
+
+If you are not sure which role you need, [Identity and access](/wyrd/understand/identity-and-authorization/#roles) lists what each built-in role allows.
+
+## 1. Find the principal and its roles
+
+The CLI uses your saved endpoint, or `--server` / `WYRD_SERVER_URL`:
+
+```bash
+wyrd principal list --kind service
+wyrd principal role list --principal <principal-id>
+```
+
+A Service account holds the roles it was created with; [Deploy a Service from CI](/wyrd/operate/deploy-a-service-from-ci/) creates one with `editor` and one with `workload`. A tenant administrator holds `admin`.
+
+## 2. Grant or revoke a role
+
+```bash
+wyrd principal role grant --principal <principal-id> --role editor
+wyrd principal role revoke --principal <principal-id> --role editor
+```
+
+The same call from an SDK:
+
+**Python**
+
+```python
+from wyrd.auth import Principals
+
+principals = Principals()
+result = principals.grant_role(principal_id, "editor")
+print(result["changed"], result["roles"])
+```
+
+**Rust**
+
+```rust
+use wyrd_ai::auth::Principals;
+
+let principals = Principals::connect().await?;
+let result = principals.grant_role(&principal_id, "editor").await?;
+println!("{} {:?}", result.changed, result.roles);
+```
+
+**TypeScript**
+
+```typescript
+import { Principals } from "wyrd-ai";
+
+const principals = await Principals.connect();
+const result = await principals.grantRole(principalId, "editor");
+console.log(result.changed, result.roles);
+```
+
+A grant is idempotent: granting a role the principal already holds returns `changed: false` and the unchanged role list.
+
+The change reaches a running service within 5 minutes, when its access token is next renewed. Revoking a role that a person also gets from an identity-provider group does not remove it; change the group mapping instead.
+
+## 3. Cut a principal off
+
+To stop a principal entirely, suspend it:
+
+```bash
+wyrd principal revoke <principal-id> --kind service --reason "credential leaked in CI logs"
+```
+
+New tokens are refused at once, and tokens already issued expire within 5 minutes. To stop one key but keep the account, revoke just that key with `wyrd principal credential revoke`, or the `principals.revoke_credential` [MCP tool](/wyrd/reference/mcp-tools/#principal-credentials).
+
+## 4. Confirm the decision
+
+Every permission check is recorded in the audit log. To see what was refused recently:
+
+```sql
+SELECT created_at, sub_principal_id, permission, outcome
+FROM bifrost.system.audit_log
+WHERE outcome = 'denied'
+ORDER BY created_at DESC
+LIMIT 20
+```
+
+Run it with any SDK's `Bifrost.sql`, or the `bifrost.query` MCP tool. A refused call returns `WYRD_PERMISSION_403_DENIED_RBAC`, and the error names the permission the principal lacked.
+
+## What can go wrong
+
+| Error code | Cause | Fix |
+| --- | --- | --- |
+| `WYRD_PERMISSION_403_DENIED_RBAC` on `grant` or `revoke` | Your credential does not hold `admin` | Use the tenant administrator's credential |
+| `WYRD_AUTH_401_CREDENTIAL_REVOKED` | The principal or its tenant is suspended | Ask a tenant or platform administrator to restore it |
+| The service still has the old access | Its token was issued before the change | Wait up to 5 minutes for the next renewal |
+
+# Troubleshooting
+
+Page: /wyrd/operate/troubleshoot-a-deployment/
+
+> Find the cause of a Wyrd server that refuses to migrate or start, from the message it prints.
+
+Match the code or message you see below. This page covers server installation, local setup recovery, and database failures.
+
+## Server installation
+
+`wyrd server install` prints a stable code. None of these failures changes the server you already have installed: it stays under the existing Wyrd config directory's `server/current` and keeps running.
+
+| Code | Cause | Fix |
+| --- | --- | --- |
+| `WYRD_CLI_400_SERVER_HOST_UNSUPPORTED` | Wyrd publishes servers only for macOS on arm64 and glibc Linux on x86_64 or arm64 | Run the server on a supported host, or use the `bohmian/wyrd` container image |
+| `WYRD_CLI_503_SERVER_RELEASE_UNAVAILABLE` | GitHub could not be reached, a download broke off, no stable release is published, or the newest release has no bundle for this machine | Check access to `github.com` and retry. The message says which one |
+| `WYRD_CLI_422_SERVER_RELEASE_UNVERIFIED` | The signature on `checksums.txt` is missing or wrong, the download does not match its signed SHA-256, or the bundle did not unpack into a runnable server | Retry once. If it fails again, do not work around it: report the release |
+| `WYRD_CLI_409_SERVER_INSTALL_INCOMPLETE` | The newest version is already unpacked on this machine but part of it, such as the UI or its dependencies, is missing | Delete the directory the message names, then rerun `wyrd server install` to download it again. Nothing was activated |
+| `WYRD_CLI_409_SERVER_VERSION_INCOMPATIBLE` | The newest server is on a different version line than your `wyrd` CLI | Upgrade the CLI (`uv add --upgrade wyrd-ai` or `pnpm add wyrd-ai@latest`), then rerun |
+
+## Local startup
+
+`WYRD_CLI_503_SERVER_DEV` identifies the failed stage and a redacted recovery action. The CLI stops its serving child on failure. Committed migrations or tenant provisioning remain.
+
+| Failed stage | Recovery |
+| --- | --- |
+| Input or listener | Supply every input the message lists (an unattended run lists all of them before doing anything), or choose an available loopback address, then rerun. |
+| Migration | Check connectivity and that the migration login owns the database objects. Rerun with the same database. |
+| Readiness | Read the server's diagnostics, correct its configuration, and rerun. Production hardening still applies when `APP_ENV=production`. |
+| Local persistence | Restore safe directory/file permissions and rerun. Settings are saved before the tenant is created, so a failure there issues no key; a key already saved before an endpoint-write failure is retained. |
+| Saved credential | Restore the requested tenant's original key. Rerunning never issues a replacement for an active tenant on its own. If the one-time key was lost, rerun on a terminal with `WYRD_PLATFORM_CREDENTIAL` set and confirm rotation, or follow the steps below. |
+| Gateway | Gateway setup did not complete; tenant setup remains. A refused document applies nothing, but if the response was lost the changes may have committed. Inspect with `wyrd gateway deployment list`, then rerun; reapplying the same named document is safe. Or pass `--skip-gateway`. |
+
+If the platform root exists but tenant creation failed, rerun `wyrd init` with the stored `WYRD_PLATFORM_CREDENTIAL` set. Retries never recover or reissue a credential on their own.
+
+### Recover a lost tenant credential
+
+On a terminal, `wyrd init` does this for you: with `WYRD_PLATFORM_CREDENTIAL` set, it asks before rotating the tenant administrator's key through the platform and saves the new one. Unattended runs never rotate a key; they stop with this guidance.
+
+To recover by hand: a failed `wyrd init` stops its server, so recovery starts the installed server directly.
+
+1. Start the installed server with the same database URL.
+
+   ```bash
+   ~/.config/wyrd/server/current/wyrd-server
+   ```
+
+   With `WYRD_CONFIG_HOME` or `XDG_CONFIG_HOME` set, use that directory's `server/current/wyrd-server`.
+
+2. In a second terminal, export the same database URL. If the platform credential is also lost, run the installed server's `recover-root` command and store its one-time output securely.
+3. Set `WYRD_PLATFORM_CREDENTIAL` in the environment (not on the command line), then issue a replacement administrator credential for the tenant UUID printed before the failure:
+
+   ```bash
+   wyrd platform tenant recover-admin --tenant YOUR_TENANT_UUID --server http://127.0.0.1:8080
+   ```
+
+   The new credential prints once.
+4. Under `umask 077`, write it to `[default].api_key` in `credentials.toml`, and delete any old `access_token` and `access_expires_at` values. Confirm the file mode is `0600`.
+5. Stop the directly started server, then rerun `wyrd init`.
+
+## Database
+
+When the server refuses its database, it exits and its last log line says why.
+
+| Message contains | Cause | Fix |
+| --- | --- | --- |
+| `wyrd._sqlx_migrations is unreadable` | The database was never migrated | Run `wyrd-server migrate` |
+| `migration <version> … is not applied` | The database was migrated by an older release | Run `wyrd-server migrate` with this release |
+| `is a superuser` or `BYPASSRLS` | A database URL names an administrator login | Use an ordinary login, as in [Deploy Wyrd for a team](/wyrd/operate/deploy-wyrd-for-a-team/) |
+| `platform login <name> does not own <table>` | With two logins, the URLs are swapped | Swap them back |
+| `holds TRUNCATE, REFERENCES, or TRIGGER` | The tenant login was granted too much | `REVOKE TRUNCATE, REFERENCES, TRIGGER ON ALL TABLES IN SCHEMA wyrd, vala FROM wyrd_tenant` |
+| `permission denied for schema vala` | The tenant login has no grants | Run the grants in [When to add a tenant login](/wyrd/operate/deploy-wyrd-for-a-team/#when-to-add-a-tenant-login) |
+| `permission denied for database` during `migrate` | The platform login does not own the database | `ALTER DATABASE wyrd OWNER TO wyrd` as the administrator |
+
+## Stored secrets
+
+| Message contains | Cause | Fix |
+| --- | --- | --- |
+| `gateway credential protection is unavailable` | The server has no sealing key, so it cannot encrypt a `managed_secret` provider key | Set `WYRD_SEALING_KEY_FILE` as in [Deploy Wyrd for a team](/wyrd/operate/deploy-wyrd-for-a-team/#3-start-the-server-and-check-readiness) and restart. `wyrd init` creates one for you |
+| `exist but no sealing key is configured` at startup | Encrypted secrets are stored, and the server started without the key they were sealed under | Start with the same `WYRD_SEALING_KEY_FILE` as before |
+| A gateway call fails with an upstream-unavailable error after a key change | The provider key was sealed under a key the server no longer holds | List the old key in `WYRD_SEALING_RETAINED_KEYS_FILE` and restart, or put the credential again |
+
 # Architecture
 
 Page: /wyrd/understand/architecture/
@@ -2274,7 +2913,7 @@ Postgres holds declarations and their versions, principals and roles, and the co
 
 ## Identity
 
-People sign in through your OIDC identity provider. Apps, CI, and agents use API keys or workload identity. [Identity and authorization](/wyrd/understand/identity-and-authorization/) explains principals, roles, and tenants.
+People sign in through your OIDC identity provider. Apps, CI, and agents use Service account keys. [Identity and authorization](/wyrd/understand/identity-and-authorization/) explains principals, roles, and tenants.
 
 ## Model calls
 
@@ -2288,7 +2927,7 @@ The server calls model providers with keys you configure, for model-judged check
 
 Page: /wyrd/understand/how-verification-works/
 
-> Inputs, steps, requirements, and decide; verify versus submit; executions, verdicts, results, and Operators.
+> Inputs, steps, requirements, and decide; Agent workspaces; verify versus submit; executions, verdicts, results, and Operators.
 
 A Verifier checks declared requirements against evidence and returns a verdict: `passed`, `failed`, or `inconclusive`. A binding attaches the Verifier to the Card it checks, and the server records every verdict with the exact versions it judged.
 
@@ -2328,7 +2967,30 @@ A Verifier never names what it checks. A binding supplies the subject, so one Ve
 
 _Diagram `verification-parts`: see the web page._
 
-`assert`, `trace`, `drift`, and `extract` run in the server's check engine. `code` runs sandboxed Python in the Monty pool, a fresh worker per call that the server starts from its own binary. `agent` runs an Agent whose model calls go through the LLM gateway; a step Agent can call [built-in tools](/wyrd/reference/agent-tools-and-authorization/), and a check Agent only `bifrost.query`.
+## Steps and checks
+
+A step prepares evidence, such as the text of a PDF, and its output feeds later steps and checks. A check decides one requirement. Each has a `kind`, and some kinds only make sense in one role:
+
+| Kind | Used as | Produces or decides | Use it when | Runs in |
+| --- | --- | --- | --- | --- |
+| `assert` | check | Compares one value from an input or step output with an operator | The rule is a field comparison: a status equals `approved`, a reply does not contain "guaranteed" | Check engine |
+| `trace` | check | Compares values selected from the spans of a trace | The rule is about what your code did, such as calling the order lookup before replying | Check engine |
+| `drift` | check | Compares a window of samples with a baseline | You care whether inputs or outputs shift over time, not whether one answer is right | Check engine, on a schedule |
+| `extract` | step | The text and structure of a file | A later check or Agent needs to read a PDF, DOCX, XLSX, or other document | Check engine |
+| `code` | step or check | As a step, JSON; as a check, a verdict | The rule is deterministic, but no operator expresses it | Monty pool |
+| `agent` | step or check | As a step, the Agent's response; as a check, a verdict | The rule needs judgment: meaning, tone, or policy | LLM gateway |
+
+Start with the cheapest kind that catches the failure. The check engine needs no model and no Python; an `agent` check costs a model call each time it runs.
+
+The Monty pool is sandboxed Python: a fresh worker per call that the server starts from its own binary. An `agent` step or check runs an Agent whose model calls go through the LLM gateway. Step and check Agents follow the same rules: each can call the [built-in tools](/wyrd/reference/agent-tools-and-authorization/) it declares, and every call still needs its own grants. [Recipes](/wyrd/build-and-verify/verify/verifier-recipes/) has a working Verifier for each kind.
+
+## Workspaces
+
+An Agent that reads files works in a workspace. The Verifier maps paths under `/inputs` to evidence: an input slot such as `inputs.policy`, or files of an uploaded Artifact Card. The Agent explores them with `fs.list`, `fs.read`, and `fs.search`, and can run `code.run` over them.
+
+An Artifact selection is part of the Verifier version. Uploading a newer version of that Artifact does not change what the Verifier reads, and a caller cannot replace the files at run time. To judge new files, publish a new Verifier version that names them. A selection that matches no file fails before any model call.
+
+Files are mounted unchanged and unparsed. `fs.read` and `fs.search` serve raw text, so they refuse or skip a PDF until the Agent calls `fs.extract`, which writes its extraction JSON under `/work`. `/work` is scratch for one call and is never evidence: a citation names the `/inputs` file's `attachment_<n>` slot, not a `/work` path. [Uploaded files](/wyrd/build-and-verify/verify/verifier-recipes/#uploaded-files) shows the upload and the mount.
 
 ## Bindings
 
@@ -2359,13 +3021,28 @@ With `all`, any failed requirement fails the Verifier. Otherwise any inconclusiv
 
 `inconclusive` means no judgment was possible, such as missing evidence or an error inside a check. It is never a pass, and never a claim that the subject failed.
 
+An `agent` or `code` check can also return a `data` object beside its verdict, such as a score or labels, when its `response_format` declares a schema for it. The server checks the whole response against that schema. A response that does not match makes the requirement `inconclusive` and keeps no data, so a requirement's `data` is either valid or absent. [Custom data](/wyrd/reference/verifier-card/#custom-data) has the schema rules and size limits.
+
 _Diagram `run-lifecycle`: see the web page._
 
 A queued execution has a status before it has a verdict. `completed` means it produced a result; `timed_out` and `errored` mean no check finished, so there is no verdict and no Operator runs.
 
+## Trace evidence
+
+A `trace` check judges the whole trace. It reads every retained span with that trace ID from `bifrost.traces.spans`, whatever Service, Card, or time each span carries, ordered by start time and then span ID. The read is an ordinary query by the account the execution runs as, so the same permissions, tenant boundary, and audit apply. Each attempt reads a trace once, and every check in the Verifier that names that trace judges the same spans.
+
+The check is `inconclusive`, never judged on part of a trace, when the trace has more than 10,000 spans, the query is refused or fails, the read times out, a span cannot be decoded, or the input supplied no trace. A selector that matches no span compares `null`.
+
+Spans can land after the call that verifies them. A trace with no visible span has not landed yet, and the outcome depends on the path:
+
+- `verify` judges the check `inconclusive` at once.
+- A queued execution, from `submit` or a schedule, stops the attempt with error code `evidence_unavailable` and status `retrying`, and records no result. It tries 3 times, waiting 30 seconds and then 60 seconds. The last attempt judges the check `inconclusive` and completes under the Verifier's `decide` rule.
+
+A completed result is final. Spans that land after it are judged only by a new execution.
+
 ## Results
 
-Every result is stored in Bifrost, in `vala.verification.results`, with the exact Verifier and subject versions it judged. The inputs go to `vala.verification.execution_inputs`. Both are queryable with SQL.
+Every result is stored in Bifrost, in `bifrost.verification.results`, with the exact Verifier and subject versions it judged. The inputs go to `bifrost.verification.execution_inputs`. Both are queryable with SQL.
 
 ## Operators
 
@@ -2392,7 +3069,7 @@ A run is one execution of a service, such as answering one question. Every obser
 ```python
 with state.run("agent") as run:
     answer = answer_question(question)
-    run.observe.record("vala.datasets.tickets", {"question": question, "answer": answer})
+    run.observe.record("bifrost.datasets.tickets", {"question": question, "answer": answer})
 ```
 
 **Rust**
@@ -2401,7 +3078,7 @@ with state.run("agent") as run:
 let run = state.run_for_card("agent")?;
 let answer = answer_question(question).await?;
 run.observe()
-    .record("vala.datasets.tickets", &json!({ "question": question, "answer": answer }))
+    .record("bifrost.datasets.tickets", &json!({ "question": question, "answer": answer }))
     .await?;
 ```
 
@@ -2410,7 +3087,7 @@ run.observe()
 ```typescript
 const run = state.run("agent");
 const answer = await answerQuestion(question);
-await run.observe.record("vala.datasets.tickets", { question, answer });
+await run.observe.record("bifrost.datasets.tickets", { question, answer });
 ```
 
 `state` holds the exact Card versions the service runs. `state.run("agent")` scopes the run to the Card behind the `agent` alias, and `run.for_card(alias)` scopes the same run to another one. Opening a run makes no network call.
@@ -2421,10 +3098,10 @@ Observations go to Bifrost, the Wyrd data plane:
 
 | Recorded with | Lands in |
 | --- | --- |
-| `observe.record(table, row)` | A caller-owned `vala.datasets.<name>` table |
-| `observe.verify` and `observe.submit` | `vala.verification.execution_inputs` and `vala.verification.results` |
-| Drift samples, with `observe.submit` | `vala.drift.observations` |
-| OpenTelemetry spans, metrics, and logs | `vala.traces.spans`, `vala.metrics.points`, and `vala.logs.records` |
+| `observe.record(table, row)` | A caller-owned `bifrost.datasets.<name>` table |
+| `observe.verify` and `observe.submit` | `bifrost.verification.execution_inputs` and `bifrost.verification.results` |
+| Drift samples, with `observe.submit` | `bifrost.drift.observations` |
+| OpenTelemetry spans, metrics, and logs | `bifrost.traces.spans`, `bifrost.metrics.points`, and `bifrost.logs.records` |
 
 Every row carries its `subject_card_uid`, its `run_id`, and the principal that wrote it. A service may write only about Cards in its own graph. Anything else fails with `WYRD_VALA_403_BIFROST_CARD_SCOPE` ([Errors](/wyrd/api/errors/)).
 
@@ -2440,8 +3117,8 @@ Observations and verdicts share `run_id`, so one SQL query joins what a run saw 
 
 ```sql
 SELECT t.question, t.answer, r.verdict, r.verifier_version
-FROM vala.datasets.tickets AS t
-JOIN vala.verification.results AS r ON r.run_id = t.run_id
+FROM bifrost.datasets.tickets AS t
+JOIN bifrost.verification.results AS r ON r.run_id = t.run_id
 ```
 
 ## Next
@@ -2540,7 +3217,7 @@ Bifrost is the analytical warehouse inside every Wyrd server. Observations, verd
 
 ```sql
 SELECT verdict, count(*) AS executions
-FROM vala.verification.results
+FROM bifrost.verification.results
 GROUP BY verdict
 ```
 
@@ -2585,42 +3262,60 @@ Every query ends with a status: `success`; `degraded` when a Scribe could not be
 
 Page: /wyrd/understand/identity-and-authorization/
 
-> Every call to Wyrd is made as a principal whose roles decide what it may do, and every decision is audited.
+> Every call to Wyrd is made as an account whose roles decide what it may do; a running Service also names its exact release, from its bundle.
 
-Every call to the Wyrd server is made as a principal, and the principal's roles decide what it may do. Wyrd checks the permission before the operation proceeds and records the decision.
+Every call to the Wyrd server is made as an account, and the account's roles decide what it may do. A running Service adds one fact the key cannot carry: which exact release it is, which comes from its bundle.
 
 ## Tenants
 
-Every person, Service, Agent, and automation acting on Cards and evidence belongs to exactly one tenant. A tenant is a hard isolation boundary: PostgreSQL row-level security keeps every query inside its tenant. Platform administrators create and suspend tenants but are never implicitly authorized over a tenant's resources.
+Every account belongs to exactly one tenant. A tenant is a hard isolation boundary: PostgreSQL row-level security keeps every query inside its tenant. Platform administrators create and suspend tenants but are never implicitly authorized over a tenant's resources.
 
-## Principals
+## Accounts
 
-| Principal | Created |
-| --- | --- |
-| A person | On first sign-in through the tenant's identity provider |
-| A deployed Service or Agent | When its Card is declared, with the `workload` role |
-| An automation, such as a CI job | By an administrator |
+| Account | Used by | Created |
+| --- | --- | --- |
+| User | A person | On first sign-in through the tenant's identity provider |
+| Tenant administrator | The first administrator | When the tenant is set up |
+| Service account | CI, a running Service, any automation | By an administrator, with `wyrd principal credential create-principal` |
 
-## Credentials
+Declaring a Card creates no account. One Service account serves every release of its Service, so a new release needs no new account and no new key. [Deploy a Service from CI](/wyrd/operate/deploy-a-service-from-ci/) sets up the usual pair: one account for CI, one per running Service.
 
-A caller presents a long-lived credential, such as an API key in `WYRD_API_KEY`, and the server exchanges it for an access token that lasts 5 minutes. The SDKs and CLI renew the token automatically. A role change reaches a running service when its token is next renewed.
+## The key and the release
+
+A Service account's key says who is calling. The release is the exact Service Card version, which the server knows by its UID.
+
+A running application gets the UID from its bundle. `WyrdState` sends it with the key on every call, and the server limits that call to the release's own Cards: an observation about a Model the release does not use is refused. Each row then records both, the account in `sub_principal_id` and `act_principal_id`, the release in `workload_card_uid`, and the Card observed in `subject_card_uid`.
+
+Two releases can run at once with the same key. Each bundle names its own UID, so their evidence never mixes.
+
+A User, or a Service account created without `--workload-name`, needs no release. It can record and verify evidence for any registered Card its roles allow; that evidence has no release.
+
+## One account per Service
+
+`--workload-name checkout` restricts an account to releases of the `checkout` Service. A restricted account must name a release to record or verify Card evidence, and only a `checkout` release.
+
+Each Service has at most one restricted account, and its scheduled Verifiers run as that account. A schedule runs only while that account has used the release in the last 24 hours, so a retired release stops being checked on its own. A Service with no restricted account has no scheduled verification.
+
+## Keys and tokens
+
+The client exchanges a key for an access token that lasts 5 minutes, and renews it automatically. A role change reaches a running Service at its next renewal. An account can hold several keys, which is how keys rotate: issue a new key, deploy it, then revoke the old one.
 
 ## Roles
 
 A permission is written `resource:action`, such as `cards:write`. A role is a set of permissions. Every tenant has four built-in roles, each including everything in the one above it:
 
-| Role | Typical holder |
-| --- | --- |
-| `viewer` | A person who inspects results |
-| `workload` | A deployed Service or Agent |
-| `editor` | A person or CI job that changes declarations |
-| `admin` | The tenant administrator |
+| Role | Adds | Typical holder |
+| --- | --- | --- |
+| `viewer` | Reading Cards, results, the audit log, and Bifrost tables | A person who inspects results |
+| `workload` | Recording Runs and observations, running Verifiers, calling the LLM gateway | A running Service |
+| `editor` | Declaring and deleting Cards, uploading artifacts | CI, or a person who changes declarations |
+| `admin` | Everything, including accounts, keys, and gateway settings | The tenant administrator |
 
-The built-in roles apply to the whole tenant. A space groups Cards; it is not an access boundary.
+Roles apply to the whole tenant. `workload` cannot change a Card, so a running Service cannot change what it is verified against.
 
 ## Every decision is audited
 
-Wyrd checks the permission before the operation proceeds. Each `allowed` or `denied` decision is recorded in the background in `vala.system.audit_log`, a Bifrost table a `viewer` can query.
+Wyrd checks the permission before the operation proceeds. Each `allowed` or `denied` decision is recorded in the background in `bifrost.system.audit_log`, a Bifrost table a `viewer` can query.
 
 # Verifier Card
 
@@ -2686,6 +3381,8 @@ A step's result is `steps.<id>.output`.
 
 ### Actions
 
+When to use each kind is in [Steps and checks](/wyrd/understand/how-verification-works/#steps-and-checks).
+
 | `kind` | Fields | Output |
 | --- | --- | --- |
 | `extract` | `from`: a `media` slot | The file's text and structure, in the shape [Extraction output](/wyrd/reference/extraction-output/) gives for its format |
@@ -2708,6 +3405,8 @@ A requirement ends `passed`, `failed`, `inconclusive`, or `not_applicable`.
 
 ### Checks
 
+When to use each kind is in [Steps and checks](/wyrd/understand/how-verification-works/#steps-and-checks).
+
 | `kind` | Fields | Decides by |
 | --- | --- | --- |
 | `assert` | `path` or `each`, `operator`, `expected` | Comparing a value; `each` with `[*]` requires every item to pass |
@@ -2715,6 +3414,8 @@ A requirement ends `passed`, `failed`, `inconclusive`, or `not_applicable`.
 | `agent` | `agent`, `inputs`, `workspace` | An Agent, with its declared tools and optional workspace as in a step, whose Prompt `response_format` is `verdict` or a closed [verdict](#verdicts-and-citations) schema |
 | `code` | `runtime`, `source`, `entrypoint`, `inputs`, optional `response_format` | A Python function that returns a verdict |
 | `drift` | `on`, `method`, `signal`, `condition`, `profile` | Comparing a window of samples with a baseline |
+
+A `trace` check reads every retained span with the trace ID from `bifrost.traces.spans`, as the executing account, ordered by start time then span ID, up to 10,000 spans. A larger trace, a refused or failed query, a timed-out read, an undecodable span, or an input with no trace makes it `inconclusive`. A trace with no visible span is `inconclusive` under `verify`; in a queued execution, each attempt before the last ends with error code `evidence_unavailable` and status `retrying` (3 attempts, 30 s then 60 s apart), and the last is `inconclusive`. [Trace evidence](/wyrd/understand/how-verification-works/#trace-evidence) explains the behavior.
 
 ## Comparison operators
 
@@ -2996,6 +3697,26 @@ Every call needs both a `tool:invoke` grant and the tool's resource permission. 
 ```
 
 The scope is `all` or one exact tool name, never a pattern. A call runs as the principal that started the verification, or the binding owner for a scheduled one; delegation can narrow that authority but never widen it. `verifier:run` and declaring a tool grant nothing.
+
+## Failed tool calls
+
+A failed call does not end the step. The model receives `code`, `error`, and, for a call it can repair, `details`, then may call again; the step's `tool_calls` record keeps the `error`. An `fs.*` call that breaks one of the rules below returns `WYRD_SPEC_400_VALIDATION` with `details` naming the `rule`, the argument `field`, its `value`, and what was `expected`. A local IO failure returns `SKALD_TOOL_500_CALL` without `details`.
+
+| Rule | Cause |
+| --- | --- |
+| `workspace_path` | A path is not under `/inputs` or `/work`, or has an empty, `.`, or `..` segment |
+| `workspace_missing` | No file or directory exists at the path |
+| `regular_file` | A file argument names a directory or a non-regular file |
+| `utf8_text` | `fs.read` names a file that is not UTF-8 text |
+| `result_limit` | The `fs.read` path is too long for any line to fit within the tool result limit |
+| `search_query` | `fs.search` has an empty `query` |
+| `search_pattern` | A `regex` query is not valid Rust regex syntax |
+| `search_glob` | `glob` is not a relative glob without `..` segments |
+| `extractable_document` | `fs.extract` names a file that is not an extractable document |
+| `extraction_refused` | `fs.extract` names a malformed document or one over the extraction limits |
+| `output_path` | `output_path` is not a new file path under `/work` |
+| `output_exists` | `output_path` already exists |
+| `work_budget` | The file or the extraction exceeds the `/work` write budget |
 
 ## Errors
 

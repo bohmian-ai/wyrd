@@ -771,3 +771,94 @@ No material decision is delegated to measurement by an open-ended tuning loop:
 the experiments above have fixed candidates, retain/revert rules and an honest
 no-change outcome. Private helper shapes, byte-layout mechanics preserving the
 v9 contract and ordinary fixture organization remain implementation-owned.
+
+## Task 9 implementation evidence
+
+Branch `item9-shared-wal` from 0aa09ae05. Commits: 5f9415dbc (skip covered
+segment syncs, refuse syncs after a fault), 69fd5d360 (one v9 process stream),
+cd02f330e (S9A), cefd5610d (S9B), d56cff07d (authority docs).
+
+What landed:
+
+- WAL v9 (`scribe/wal.rs`). Record magic `WYRDWAL9`, 80-byte record header;
+  byte 72 is the writing shard, bytes 73..80 must be zero, all covered by the
+  record CRC. The v9 segment header names no shard (nonzero is refused). The
+  decoder dispatches on the segment header version and requires each record's
+  version to equal it; v8 records take their shard from the segment header.
+  Segments live in `shard-00` under the v8 naming, so a v8 binary discovers
+  them. Its header check (`version != WAL_VERSION` → `UnsupportedWalVersion`,
+  base wal.rs:361) refuses them at startup without deleting anything. New
+  writes are only v9; v8 files are read in place and never rewritten.
+- One writer state replaces the 256 per-shard states: one append position,
+  plus one `ShardGeneration` per shard (own bytes and records for rotation,
+  and the segments it touched). A generation's first append to a segment
+  takes one retirement reference. Rotation hands the generation's segments to
+  the cohort (`retain_segments`), then drops the generation's references
+  (`retire_segments`). Selective members treat active-generation segments as
+  referenced. Deferred deletion skips the current segment and any path that
+  was retained again.
+- Replay keys accumulators by (stream, record shard). Fences use the
+  segment-header lane (`ReplayedSealKey.wal_lane`: the shard in v8, 0 in v9).
+  Each shard's watermark manifest is chosen by the record's shard. A shared
+  segment is retirement-safe only when every shard reading it is.
+
+Deviation, to be decided by review: there is no central round-robin cycle
+scheduler (decision 1 / point 4 wording). Shard actors stay serial, which
+keeps at most one unresolved cycle per shard and the existing completion
+order (append → sync touched segments → fence → insert/publish → ack).
+Cross-shard sharing comes from sync coalescing instead: an append marks its
+segment unsynced; a sync of a segment with nothing unsynced records no
+fdatasync (span outcome `covered`); a faulted writer refuses every sync. So
+concurrent shards whose appends one fdatasync already covered do not issue
+another. No cycle credits or overlap pipeline were added. Within one segment,
+an append waits on the segment mutex while a sync holds it.
+
+Removed: `close_segments_if_unowned` (writer, handle and its shards.rs call
+site). With a shared current segment, one shard detaching it would end every
+other shard's appends, so the behavior no longer exists. Its test
+`low_volume_current_segment_closes_when_last_bucket_detaches` was deleted with
+the behavior; the retirement it protected is covered by S9B. Also removed:
+`WalWriter::new_with_shard_id`, which had no non-test caller.
+
+Tests (RED was reasoned, not run, for both: on 0aa09ae05 two shards write to
+separate `shard-NN` streams, and records carry no shard):
+
+- S9A `scribe::shards::tests::shared_wal_cycle_preserves_fair_durable_completion`.
+  Shards 0 and 7 append and then sync, and get exactly one fdatasync per
+  touched segment: one, or two after a forced rollover. The records carry
+  shards [0, 7] in `shard-00`. Two real owners joined concurrently ack, and
+  their visible rows equal the acked rows. After an injected sync failure,
+  neither group acks, the WAL is faulted, no rows become visible, and
+  Raw/Decode/Prepared/Queued bytes return to 0.
+- S9B `scribe::wal::tests::v8_recovery_and_v9_shared_retirement_are_exact`.
+  Starts with v8 per-shard fixtures at epoch 1 and an interleaved v9 shared
+  segment at epoch 2, where only one shard has a watermark. Restart replay
+  (with no rebuilt references) yields exactly
+  {(1,a,a),(1,b,b),(2,b,0)}: the watermark suppresses only its own shard.
+  The v8 files and the shared segment survive. A flipped shard byte fails
+  the CRC. Live retirement keeps the shared segment through: one shard's
+  release, the current-segment deferral, and a re-retained deferred path.
+  The last release deletes it.
+- Commands (all PASS):
+  `mise exec -- scripts/postgres/with-test-postgres.sh -- cargo nextest run --locked -p vala-bifrost-redux --lib`
+  (896/896), the same with `--features test-support --test integration`
+  (51 passed, 23 skipped by the profile), each focused selector above,
+  `mise run fmt`,
+  `cargo clippy --locked -p vala-bifrost-redux --lib --tests --features test-support,bench-support -- -D warnings`,
+  and `cargo check --locked -p wyrd-server --all-targets`.
+
+Not done:
+
+- The native-write-c64 1/16-shard benchmark comparison (no bench runs in this
+  task; it belongs to the integration step).
+- A crash matrix at each append/sync/fence/visibility boundary beyond the
+  existing crash-injection and closeout suites.
+- Running the saved pre-upgrade binary against a v9 copy. The downgrade
+  refusal is shown from base code, not executed.
+- The cycle scheduler and overlap credits described above.
+
+Authority: `architecture/bifrost-design.md` (shared stream, generation
+references, per-record-shard manifests, v8 upgrade and unsupported
+downgrade), `operations/deployment-and-release.md` (v9 rollback boundary),
+and `operations/reliability-and-recovery.md` (restart routing, shared
+retirement).

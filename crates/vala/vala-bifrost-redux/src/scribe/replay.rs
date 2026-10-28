@@ -127,9 +127,9 @@ pub(crate) struct ReplayChunkResponse {
 pub struct ReplayedAppendMeta {
     /// Batch ID for dedup.
     pub batch_id: [u8; 16],
-    /// SHA-256 digest of the exact WAL-v7 slice payload.
+    /// SHA-256 digest of the exact WAL-v8 slice payload.
     pub payload_digest: [u8; 32],
-    /// Exact WAL-v7 slice payload length.
+    /// Exact WAL-v8 slice payload length.
     pub payload_len: u32,
     /// Complete committed batch slice count.
     pub slice_count: u32,
@@ -144,7 +144,7 @@ pub struct ReplayedAppendMeta {
 }
 
 /// Replay the WAL directory and reconstruct per-seal-key state from complete
-/// self-describing v7 slice sets.
+/// self-describing v8 slice sets.
 ///
 /// Reads the manifest (if present), scans all segments, skips sealed LSNs,
 /// truncates torn tails, dedupes by `AppendSliceId`, and groups records by
@@ -325,13 +325,12 @@ pub(crate) fn replay_wal_directory_stream_accounted(
             }) {
                 return Ok(false);
             }
-            let sealed_lsn_map = sealed_lsn_map(&stream_directory(wal_dir, stream))?;
             let key = (stream, shard_id);
             if let std::collections::hash_map::Entry::Vacant(entry) = accumulators.entry(key) {
                 entry.insert(ReplayAccumulator::new(
                     stream,
                     shard_id,
-                    sealed_lsn_map,
+                    sealed_lsn_map(&shard_manifest_path(wal_dir, stream, shard_id))?,
                     governor,
                 )?);
             }
@@ -346,7 +345,7 @@ pub(crate) fn replay_wal_directory_stream_accounted(
                         .ok_or_else(|| ScribeError::Internal {
                             detail: "replay accumulator disappeared at segment boundary".to_owned(),
                         })?;
-                // WAL v7 may roll between a SLICE and its terminal COMMIT. Keep
+                // WAL v8 may roll between a SLICE and its terminal COMMIT. Keep
                 // that incomplete batch and its segment refs together, then emit
                 // at the first later boundary where no batch crosses the cut.
                 if accumulator.pending_batches.is_empty()
@@ -411,8 +410,31 @@ pub(crate) fn stream_directory(wal_dir: &Path, stream: StreamIdentity) -> std::p
         .join(stream.writer_epoch.as_i64().to_string())
 }
 
-fn sealed_lsn_map(wal_dir: &Path) -> Result<HashMap<String, WalLsn>, ScribeError> {
-    let manifest = read_manifest(wal_dir.join("manifest"))?;
+/// Returns the manifest holding one recorded shard lane's replay watermarks.
+///
+/// Every shard draws LSNs from the stream's one shared counter but stages its
+/// own generations, so a seal key's watermark is only meaningful for the shard
+/// that staged it: one watermark per stream would let a shard that staged a
+/// later generation hide another shard's unstaged, acknowledged records from
+/// replay. The manifest therefore lives beside that shard's WAL segments.
+#[must_use]
+pub(crate) fn shard_manifest_path(
+    wal_dir: &Path,
+    stream: StreamIdentity,
+    shard: u8,
+) -> std::path::PathBuf {
+    stream_directory(wal_dir, stream)
+        .join(format!("shard-{shard:02}"))
+        .join("manifest")
+}
+
+/// Reads one shard manifest's per-seal-key watermarks, empty when absent.
+///
+/// # Errors
+///
+/// Returns [`ScribeError`] when an existing manifest cannot be read or parsed.
+fn sealed_lsn_map(manifest_path: &Path) -> Result<HashMap<String, WalLsn>, ScribeError> {
+    let manifest = read_manifest(manifest_path)?;
     Ok(manifest
         .as_ref()
         .map(|manifest| {
@@ -439,7 +461,7 @@ struct ReplayAccumulator<'a> {
     shard_id: u8,
     /// Per-seal-key manifest watermarks below which records are skipped.
     sealed_lsn_map: HashMap<String, WalLsn>,
-    /// Incomplete v7 batches retained until their terminal COMMIT is read.
+    /// Incomplete v8 batches retained until their terminal COMMIT is read.
     pending_batches: HashMap<[u8; 16], PendingBatch>,
     /// Decode ownership retained exclusively by incomplete slice sets.
     pending_memory: Option<ScribeMemoryLease>,
@@ -528,7 +550,7 @@ impl<'a> ReplayAccumulator<'a> {
         }
         if !record.is_slice() {
             return Err(ScribeError::Internal {
-                detail: "WAL v7 contains an unknown record flag".to_owned(),
+                detail: "WAL v8 contains an unknown record flag".to_owned(),
             });
         }
         if self.validate_pending_slice_header(record)? {
@@ -586,7 +608,7 @@ impl<'a> ReplayAccumulator<'a> {
         let seal_key_path = seal_key.canonical_key();
         if record.tenant_id != *seal_key.tenant.as_uuid().as_bytes() {
             return Err(ScribeError::Internal {
-                detail: "WAL v7 slice tenant does not match its self-describing seal key"
+                detail: "WAL v8 slice tenant does not match its self-describing seal key"
                     .to_owned(),
             });
         }
@@ -596,7 +618,7 @@ impl<'a> ReplayAccumulator<'a> {
             .or_insert_with(|| PendingBatch::new(record.tenant_id, record.slice_count));
         if pending.tenant_id != record.tenant_id || pending.slice_count != record.slice_count {
             return Err(ScribeError::Internal {
-                detail: "WAL v7 batch has contradictory slice-set identity".to_owned(),
+                detail: "WAL v8 batch has contradictory slice-set identity".to_owned(),
             });
         }
         pending.slices.insert(
@@ -627,7 +649,7 @@ impl<'a> ReplayAccumulator<'a> {
         };
         if pending.tenant_id != record.tenant_id || pending.slice_count != record.slice_count {
             return Err(ScribeError::Internal {
-                detail: "WAL v7 batch has contradictory slice-set identity".to_owned(),
+                detail: "WAL v8 batch has contradictory slice-set identity".to_owned(),
             });
         }
         let Some(existing) = pending.slices.get(&record.slice_index) else {
@@ -635,7 +657,7 @@ impl<'a> ReplayAccumulator<'a> {
         };
         if !same_slice_retry_facts(&existing.record, record) {
             return Err(ScribeError::Internal {
-                detail: "WAL v7 batch has a contradictory duplicate slice".to_owned(),
+                detail: "WAL v8 batch has a contradictory duplicate slice".to_owned(),
             });
         }
         Ok(true)
@@ -676,7 +698,7 @@ impl<'a> ReplayAccumulator<'a> {
             .pending_batches
             .remove(&record.batch_id)
             .ok_or_else(|| ScribeError::Internal {
-                detail: "WAL v7 COMMIT has no preceding complete slice set".to_owned(),
+                detail: "WAL v8 COMMIT has no preceding complete slice set".to_owned(),
             })?;
         validate_pending_batch(&pending, record, &identity)?;
         let pending_bytes = pending.memory_bytes()?;
@@ -890,7 +912,7 @@ fn replay_record_memory_bytes(record: &WalRecord) -> Result<usize, ScribeError> 
         })
 }
 
-/// A v7 slice set held until its terminal WAL COMMIT proves it complete.
+/// A v8 slice set held until its terminal WAL COMMIT proves it complete.
 #[derive(Debug)]
 struct PendingBatch {
     /// Tenant copied from every slice and checked against the COMMIT header.
@@ -930,7 +952,7 @@ struct CommittedBatchIdentity {
 struct CommittedBatchEntry {
     /// Stable logical batch key within this WAL stream and shard.
     batch_id: [u8; 16],
-    /// Canonical terminal identity authenticated by WAL v7.
+    /// Canonical terminal identity authenticated by WAL v8.
     identity: CommittedBatchIdentity,
 }
 
@@ -1022,7 +1044,7 @@ struct PendingSlice {
     seal_key_path: String,
 }
 
-/// Computes the v7 COMMIT `wal_digest` over one ordered slice set.
+/// Computes the v8 COMMIT `wal_digest` over one ordered slice set.
 ///
 /// The write path and replay both bind the ordinal, exact payload length, and
 /// SHA-256 payload digest, so a reordered or substituted slice cannot be
@@ -1059,7 +1081,7 @@ fn replayed_commit_identity(
         .values()
         .next()
         .ok_or_else(|| ScribeError::Internal {
-            detail: "WAL v7 COMMIT has no first slice identity".to_owned(),
+            detail: "WAL v8 COMMIT has no first slice identity".to_owned(),
         })?;
     let request_id = uuid::Uuid::from_bytes(commit.commit_identity()?.request_id);
     let segment_sequence = segment_path
@@ -1095,7 +1117,7 @@ fn validate_pending_batch(
 ) -> Result<(), ScribeError> {
     if pending.tenant_id != commit.tenant_id || pending.slice_count != commit.slice_count {
         return Err(ScribeError::Internal {
-            detail: "WAL v7 COMMIT identity does not match its slice set".to_owned(),
+            detail: "WAL v8 COMMIT identity does not match its slice set".to_owned(),
         });
     }
     if usize::try_from(pending.slice_count).ok() != Some(pending.slices.len())
@@ -1106,12 +1128,12 @@ fn validate_pending_batch(
             .any(|(index, slice_index)| usize::try_from(*slice_index).ok() != Some(index))
     {
         return Err(ScribeError::Internal {
-            detail: "WAL v7 COMMIT closes an incomplete or unordered slice set".to_owned(),
+            detail: "WAL v8 COMMIT closes an incomplete or unordered slice set".to_owned(),
         });
     }
     if slice_set_digest(pending.slices.values()) != identity.wal_digest {
         return Err(ScribeError::Internal {
-            detail: "WAL v7 COMMIT digest does not match its slice set".to_owned(),
+            detail: "WAL v8 COMMIT digest does not match its slice set".to_owned(),
         });
     }
     Ok(())
@@ -1369,7 +1391,7 @@ mod tests {
         let mut manifest = crate::scribe::manifest::Manifest::new(stream);
         manifest.update_sealed_lsn(&first_key, crate::scribe::wal::WalLsn::new(0));
         crate::scribe::manifest::write_atomic(
-            stream_directory(temp_dir.path(), stream).join("manifest"),
+            shard_manifest_path(temp_dir.path(), stream, test_shard(&first_key, [1; 16])),
             &manifest,
         )
         .expect("manifest");
@@ -1383,7 +1405,77 @@ mod tests {
         );
     }
 
-    /// Existing v7 headers, slice/commit identities, and the manifest cursor
+    /// Returns the test-routing shard lane `batch_id` of `key` is written to.
+    fn test_shard(key: &SealKey, batch_id: [u8; 16]) -> u8 {
+        u8::try_from(crate::scribe::routing::shard_for(
+            key.tenant,
+            &key.table,
+            uuid::Uuid::from_bytes(batch_id),
+            crate::scribe::routing::TEST_SHARD_COUNT,
+        ))
+        .expect("test shard lane fits the WAL header")
+    }
+
+    /// One lane's watermark never hides another lane's records of the same key.
+    ///
+    /// Every lane draws LSNs from the stream's shared counter, so a second
+    /// lane's earlier record of the key sits below the first lane's staged
+    /// watermark; replay must still restore it.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the fixture cannot route two batches to distinct lanes, or
+    /// when replay drops the unstaged lane's record or restores the staged one.
+    #[test]
+    fn replay_watermark_covers_only_its_own_shard() {
+        let temp_dir = TempDir::new().expect("temp dir");
+        let node_id = NodeId::generate();
+        let key = replay_key(crate::test_support::tenant());
+        let wal = WalWriter::new(
+            temp_dir.path(),
+            *node_id.as_bytes(),
+            1,
+            WalConfig::default(),
+        )
+        .expect("writer");
+        let unstaged = [1_u8; 16];
+        let unstaged_shard = test_shard(&key, unstaged);
+        let staged = (2_u8..=u8::MAX)
+            .map(|byte| [byte; 16])
+            .find(|batch| test_shard(&key, *batch) != unstaged_shard)
+            .expect("a batch on another lane");
+        wal.append_and_commit_for_replay_test(&key, unstaged, b"unstaged")
+            .expect("unstaged lane append");
+        let staged_lsn = wal
+            .append_and_commit_for_replay_test(&key, staged, b"staged")
+            .expect("staged lane append");
+        let stream = crate::scribe::stream_identity::StreamIdentity::new(
+            node_id,
+            crate::scribe::stream_identity::WriterEpoch::new(1),
+        );
+        let mut manifest = crate::scribe::manifest::Manifest::new(stream);
+        manifest.update_sealed_lsn(&key, staged_lsn);
+        crate::scribe::manifest::write_atomic(
+            shard_manifest_path(temp_dir.path(), stream, test_shard(&key, staged)),
+            &manifest,
+        )
+        .expect("staged lane manifest");
+
+        let mut restored = Vec::new();
+        replay_wal_directory_stream(temp_dir.path(), |chunk| {
+            restored.extend(
+                chunk
+                    .states
+                    .into_values()
+                    .map(|state| (state.shard_id, state.data_records.len())),
+            );
+            Ok(())
+        })
+        .expect("replay");
+        assert_eq!(restored, [(unstaged_shard, 1)]);
+    }
+
+    /// Existing v8 headers, slice/commit identities, and the manifest cursor
     /// reconstruct one stable remaining cohort without a new WAL marker.
     #[test]
     fn replay_reconstructs_cohort_from_v6_segment_without_new_format() {
@@ -1443,7 +1535,11 @@ mod tests {
         let mut manifest = crate::scribe::manifest::Manifest::new(stream);
         manifest.update_sealed_lsn(&keys[0], first_lsn);
         crate::scribe::manifest::write_atomic(
-            stream_directory(temp_dir.path(), stream).join("manifest"),
+            shard_manifest_path(
+                temp_dir.path(),
+                stream,
+                u8::try_from(target_shard).expect("test shard lane fits the WAL header"),
+            ),
             &manifest,
         )
         .expect("committed A cursor");
@@ -1707,6 +1803,7 @@ mod tests {
             .expect("append");
         let budget = crate::scribe::embedded_scribe_resources(crate::scribe::AdmissionConfig {
             memory_limit_bytes: 1,
+            ..crate::scribe::AdmissionConfig::default()
         });
         let occupied = budget
             .try_reserve_maintenance(
@@ -1880,7 +1977,7 @@ mod tests {
         assert!(matches!(
             error,
             ScribeError::Internal { detail }
-                if detail == "WAL v7 batch has a contradictory duplicate slice"
+                if detail == "WAL v8 batch has a contradictory duplicate slice"
         ));
     }
 

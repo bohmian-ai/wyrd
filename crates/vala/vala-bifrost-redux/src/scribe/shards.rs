@@ -52,6 +52,10 @@ struct PendingGeneration {
     >,
     /// Whether this generation belongs to the shard's synchronous replay owner.
     replay_owned: bool,
+    /// Ordering link the key's next generation waits on before its staged
+    /// record; held while this generation is in flight until a later
+    /// submission takes it (see [`crate::scribe::persistence::StagingOrder`]).
+    successor: Option<tokio::sync::oneshot::Receiver<()>>,
 }
 
 /// One reconstructed generation waiting behind the sole replay identity owner.
@@ -1799,9 +1803,10 @@ impl ShardOwner {
                 retry_scheduled: false,
                 replay_response: None,
                 replay_owned: true,
+                successor: None,
             });
         self.replay_chunk = Some(owner);
-        self.submit_front(&seal_key);
+        self.submit_ready(&seal_key);
         Ok(())
     }
 
@@ -2039,9 +2044,8 @@ impl ShardOwner {
     ///
     /// Generations a failed stage attempt left retryable are resubmitted first,
     /// so an explicit flush or shutdown drain re-drives them rather than
-    /// waiting for the next age tick; `submit_front` only ever submits an
-    /// unsubmitted queue front, which keeps FIFO order and never double-submits
-    /// an in-flight generation.
+    /// waiting for the next age tick; `submit_ready` submits unsubmitted
+    /// generations in FIFO order and never double-submits an in-flight one.
     ///
     /// # Errors
     ///
@@ -2233,7 +2237,6 @@ impl ShardOwner {
             .pending_generations
             .entry(seal_key.clone())
             .or_default();
-        let should_submit = queue.is_empty();
         queue.push_back(PendingGeneration {
             generation,
             binding,
@@ -2241,91 +2244,160 @@ impl ShardOwner {
             retry_scheduled: false,
             replay_response: None,
             replay_owned: false,
+            successor: None,
         });
-        if should_submit {
-            self.submit_front(seal_key);
-        }
+        self.submit_ready(seal_key);
         Ok(())
     }
 
-    /// Attempts to submit the oldest pending generation for one seal key.
-    /// Attempts a non-blocking submission of the oldest generation for one key.
+    /// Submits every generation of one seal key that can stage now, oldest first.
     ///
-    /// A full persistence queue leaves the generation unsubmitted so a later
-    /// flush or completion event can retry it without changing FIFO order.
-    fn submit_front(&mut self, seal_key: &crate::scribe::seal_key::SealKey) {
+    /// A key's live generations stage concurrently: each submission behind an
+    /// in-flight generation takes that generation's ordering link, so the
+    /// encodes and fsyncs overlap while staged records and manifest advances
+    /// still land in FIFO order (see
+    /// [`crate::scribe::persistence::StagingOrder`]). The walk stops at a full
+    /// persistence queue, so no generation is submitted ahead of an older
+    /// unsubmitted one, and at an in-flight generation whose link a failed
+    /// submission already consumed; that generation's completion re-drives the
+    /// key. Replay generations stage alone: one is submitted only as the queue
+    /// front, and nothing is submitted behind it.
+    fn submit_ready(&mut self, seal_key: &crate::scribe::seal_key::SealKey) {
+        let mut index = 0;
+        loop {
+            let Some(queue) = self.pending_generations.get_mut(seal_key) else {
+                return;
+            };
+            let Some(entry) = queue.get(index) else {
+                return;
+            };
+            let replay = entry.replay_owned || entry.replay_response.is_some();
+            if replay && index > 0 {
+                return;
+            }
+            if entry.submitted {
+                if replay {
+                    return;
+                }
+                index += 1;
+                continue;
+            }
+            let predecessor = match index.checked_sub(1) {
+                None => None,
+                Some(previous) => {
+                    let Some(link) = queue
+                        .get_mut(previous)
+                        .and_then(|previous| previous.successor.take())
+                    else {
+                        return;
+                    };
+                    Some(link)
+                }
+            };
+            if !self.submit_at(seal_key, index, predecessor) || replay {
+                return;
+            }
+            index += 1;
+        }
+    }
+
+    /// Attempts a non-blocking submission of one queued generation.
+    ///
+    /// Returns whether the generation entered the persistence queue. A full
+    /// queue hands `predecessor` back to the previous generation and leaves
+    /// this one unsubmitted, so a later flush or completion event retries it
+    /// without changing FIFO order.
+    fn submit_at(
+        &mut self,
+        seal_key: &crate::scribe::seal_key::SealKey,
+        index: usize,
+        predecessor: Option<tokio::sync::oneshot::Receiver<()>>,
+    ) -> bool {
         let Some(persistence) = &self.persistence else {
-            return;
+            return false;
         };
         let Some(queue) = self.pending_generations.get_mut(seal_key) else {
-            return;
+            return false;
         };
-        let Some(front) = queue.front_mut() else {
-            return;
+        let Some(front) = queue.get_mut(index) else {
+            return false;
         };
-        if front.submitted {
-            return;
-        }
         let generation = Arc::clone(&front.generation);
         let binding = front.binding.clone();
+        let (successor_tx, successor_rx) = tokio::sync::oneshot::channel();
         let result = persistence.try_submit(PersistenceJob {
             generation: Arc::clone(&generation),
             binding,
             completion_tx: self.completion_tx.clone(),
             completion_waiter: None,
-            defer_manifest_advance: front.replay_response.is_some() || front.replay_owned,
+            order: crate::scribe::persistence::StagingOrder {
+                predecessor,
+                successor: Some(successor_tx),
+            },
         });
-        match result {
-            Ok(()) => front.submitted = true,
-            Err(PersistenceSubmitError::Full(job)) if front.replay_owned => {
-                drop(job);
-                if !front.retry_scheduled {
-                    front.retry_scheduled = true;
-                    let persistence = Arc::clone(persistence);
-                    let completion_tx = self.completion_tx.clone();
-                    let seal_key = seal_key.clone();
-                    let generation_id = generation.generation_id.0;
-                    Handle::current().spawn(async move {
-                        let progress = persistence.wait_for_submission_progress().await;
-                        let _ = completion_tx
-                            .send(ShardCommand::RetryReplayPersistence {
-                                seal_key: Box::new(seal_key),
-                                generation_id,
-                                progress,
-                            })
-                            .await;
-                    });
-                }
-                return;
+        let refused = match result {
+            Ok(()) => {
+                front.submitted = true;
+                front.successor = Some(successor_rx);
+                None
             }
-            Err(PersistenceSubmitError::Closed(job)) if front.replay_owned => {
-                drop(job);
-                let generation_id = generation.generation_id.0;
-                self.fail_active_replay_submission(
-                    seal_key,
-                    generation_id,
-                    ScribeError::Internal {
-                        detail: "Scribe persistence queue closed during replay".to_owned(),
-                    },
-                );
-                return;
+            Err(PersistenceSubmitError::Full(job)) => Some((job, false)),
+            Err(PersistenceSubmitError::Closed(job)) => Some((job, true)),
+        };
+        let Some((mut job, closed)) = refused else {
+            let active_paths = self
+                .wal_segments
+                .values()
+                .flat_map(|segments| segments.keys().cloned())
+                .collect::<HashSet<_>>();
+            if let Err(error) = self
+                .wal_handle
+                .close_segments_if_unowned(&generation.wal_segments, &active_paths)
+            {
+                tracing::warn!(error = %error, "closed WAL segment could not be detached after bucket rotation");
             }
-            Err(PersistenceSubmitError::Full(job) | PersistenceSubmitError::Closed(job)) => {
-                drop(job);
-                return;
-            }
-        }
-        let active_paths = self
-            .wal_segments
-            .values()
-            .flat_map(|segments| segments.keys().cloned())
-            .collect::<HashSet<_>>();
-        if let Err(error) = self
-            .wal_handle
-            .close_segments_if_unowned(&generation.wal_segments, &active_paths)
+            return true;
+        };
+        if let Some(previous) = index
+            .checked_sub(1)
+            .and_then(|previous| queue.get_mut(previous))
         {
-            tracing::warn!(error = %error, "closed WAL segment could not be detached after bucket rotation");
+            previous.successor = job.order.predecessor.take();
         }
+        let Some(front) = queue.get_mut(index) else {
+            return false;
+        };
+        if !front.replay_owned {
+            return false;
+        }
+        let generation_id = generation.generation_id.0;
+        if closed {
+            self.fail_active_replay_submission(
+                seal_key,
+                generation_id,
+                ScribeError::Internal {
+                    detail: "Scribe persistence queue closed during replay".to_owned(),
+                },
+            );
+            return false;
+        }
+        if !front.retry_scheduled {
+            front.retry_scheduled = true;
+            let persistence = Arc::clone(persistence);
+            let completion_tx = self.completion_tx.clone();
+            let seal_key = seal_key.clone();
+            Handle::current().spawn(async move {
+                let progress = persistence.wait_for_submission_progress().await;
+                let _ = completion_tx
+                    .send(ShardCommand::RetryReplayPersistence {
+                        seal_key: Box::new(seal_key),
+                        generation_id,
+                        progress,
+                    })
+                    .await;
+            });
+        }
+        false
     }
 
     /// Re-drives the active replay generation after bounded queue progress.
@@ -2350,7 +2422,7 @@ impl ShardOwner {
             self.fail_active_replay_submission(seal_key, generation_id, error);
             return;
         }
-        self.submit_front(seal_key);
+        self.submit_ready(seal_key);
     }
 
     /// Rolls back a replay generation that could not enter persistence.
@@ -2394,15 +2466,16 @@ impl ShardOwner {
     fn retry_pending(&mut self) {
         let keys = self.pending_generations.keys().cloned().collect::<Vec<_>>();
         for key in keys {
-            self.submit_front(&key);
+            self.submit_ready(&key);
         }
     }
 
     /// Retires all committed generations on the current lifecycle sweep.
     ///
     /// A generation is eligible the moment its state is
-    /// `ImmutableState::Committed`, which is only reached after the fenced
-    /// `vala.file_list` transaction commits. Retirement ordering is
+    /// `ImmutableState::Durable`, which is reached once its rows are a staged
+    /// member; the staged record is the replay watermark for its WAL range.
+    /// Retirement ordering is
     /// preserved: the generation's memory ownership is settled before `ScribeWalIoOp::RetireWal` is submitted, so WAL
     /// segment refcounts are released last.
     ///
@@ -2587,9 +2660,10 @@ impl ShardOwner {
 
     /// Reconciles one persistence result with this owner's FIFO generation queue.
     ///
-    /// Successful publication moves the generation to retained state and
-    /// submits the next generation for the same key. Failures mark only the
-    /// front generation retryable and deliver the error to its waiter.
+    /// Successful publication moves the generation, wherever it sits in its
+    /// key's queue, to retained state and submits the key's ready
+    /// generations. Failures mark only that generation retryable and deliver
+    /// the error to its waiter.
     ///
     /// # Errors
     ///
@@ -2602,22 +2676,24 @@ impl ShardOwner {
     ) -> Result<(), String> {
         let mut replay_identity = completion.replay_identity.take();
         let generation_id = completion.generation_id.0;
-        let seal_key = self.pending_generations.iter().find_map(|(key, queue)| {
+        let owner = self.pending_generations.iter().find_map(|(key, queue)| {
             queue
-                .front()
-                .filter(|front| front.generation.generation_id.0 == generation_id)
-                .map(|_| key.clone())
+                .iter()
+                .find(|pending| {
+                    pending.submitted && pending.generation.generation_id.0 == generation_id
+                })
+                .map(|pending| (key.clone(), pending.replay_owned))
         });
-        let Some(seal_key) = seal_key else {
+        let Some((seal_key, replay_owned)) = owner else {
             return self.handle_unowned_completion(completion, waiter);
         };
         self.trace_persistence_settlement(&seal_key, generation_id, completion.error.is_some());
-        let replay_owned = self.front_is_replay_owned(&seal_key);
         if let Some(error) = completion.error.as_ref() {
             let detail = error.clone();
             tracing::warn!(error = %error, generation_id, "shard persistence failed; retaining immutable generation");
             return self.fail_persistence_completion(
                 &seal_key,
+                generation_id,
                 replay_owned,
                 &mut replay_identity,
                 detail,
@@ -2628,6 +2704,7 @@ impl ShardOwner {
             let detail = "persistence completion omitted its staged member".to_owned();
             return self.fail_persistence_completion(
                 &seal_key,
+                generation_id,
                 replay_owned,
                 &mut replay_identity,
                 detail,
@@ -2639,6 +2716,7 @@ impl ShardOwner {
             tracing::warn!(error = %error, generation_id, "shard persistence completion could not publish generation");
             return self.fail_persistence_completion(
                 &seal_key,
+                generation_id,
                 replay_owned,
                 &mut replay_identity,
                 detail,
@@ -2648,13 +2726,13 @@ impl ShardOwner {
         let Some(queue) = self.pending_generations.get_mut(&seal_key) else {
             return Err("persistence completion queue disappeared".to_owned());
         };
-        let Some(mut front) = queue.pop_front() else {
-            return Err("persistence completion queue is empty".to_owned());
+        let Some(mut front) = queue
+            .iter()
+            .position(|pending| pending.generation.generation_id.0 == generation_id)
+            .and_then(|position| queue.remove(position))
+        else {
+            return Err("persistence completion generation left its queue".to_owned());
         };
-        if front.generation.generation_id.0 != generation_id {
-            queue.push_front(front);
-            return Err("persistence completion generation is not queue front".to_owned());
-        }
         self.retained_generations.insert(
             generation_id,
             RetainedGeneration {
@@ -2681,12 +2759,12 @@ impl ShardOwner {
         }
         Self::send_waiter_success(waiter);
         if self.persistence.is_some() {
-            self.submit_front(&seal_key);
+            self.submit_ready(&seal_key);
         }
         Ok(())
     }
 
-    /// Retains one failed FIFO front and propagates its terminal replay result.
+    /// Retains one failed generation and propagates its terminal replay result.
     ///
     /// Replay identity returns to the active chunk before failure settlement so
     /// its sole root lease remains owned until the replay waiter observes the error.
@@ -2698,12 +2776,13 @@ impl ShardOwner {
     fn fail_persistence_completion(
         &mut self,
         seal_key: &crate::scribe::seal_key::SealKey,
+        generation_id: u64,
         replay_owned: bool,
         replay_identity: &mut Option<crate::scribe::memory::ReplayIdentityOwnership>,
         detail: String,
         waiter: Option<tokio::sync::oneshot::Sender<Result<(), String>>>,
     ) -> Result<(), String> {
-        self.mark_front_retryable(seal_key);
+        self.mark_retryable(seal_key, generation_id);
         if replay_owned {
             if let Some(owner) = self.replay_chunk.as_mut() {
                 owner.identity = replay_identity.take();
@@ -2712,7 +2791,7 @@ impl ShardOwner {
                 detail: detail.clone(),
             });
         }
-        self.send_replay_error(seal_key, &detail);
+        self.send_replay_error(seal_key, generation_id, &detail);
         Self::send_waiter_error(waiter, detail.clone());
         Err(detail)
     }
@@ -2745,14 +2824,6 @@ impl ShardOwner {
             outcome = if failed { "failed" } else { "committed" },
             "Scribe shard persistence settlement received"
         );
-    }
-
-    /// Reports whether one key's FIFO front belongs to the active replay chunk.
-    fn front_is_replay_owned(&self, seal_key: &crate::scribe::seal_key::SealKey) -> bool {
-        self.pending_generations
-            .get(seal_key)
-            .and_then(|queue| queue.front())
-            .is_some_and(|front| front.replay_owned)
     }
 
     /// Delivers a successful completion to an optional persistence waiter.
@@ -2897,24 +2968,39 @@ impl ShardOwner {
         detail.map_or(Ok(()), Err)
     }
 
-    /// Marks a key's front generation for a later persistence retry.
-    fn mark_front_retryable(&mut self, seal_key: &crate::scribe::seal_key::SealKey) {
-        if let Some(front) = self
-            .pending_generations
-            .get_mut(seal_key)
-            .and_then(VecDeque::front_mut)
-        {
-            front.submitted = false;
+    /// Returns one queued generation of a seal key by generation id.
+    fn pending_mut(
+        &mut self,
+        seal_key: &crate::scribe::seal_key::SealKey,
+        generation_id: u64,
+    ) -> Option<&mut PendingGeneration> {
+        self.pending_generations
+            .get_mut(seal_key)?
+            .iter_mut()
+            .find(|pending| pending.generation.generation_id.0 == generation_id)
+    }
+
+    /// Marks one queued generation for a later persistence retry.
+    ///
+    /// Its ordering link is dropped with the failed attempt, so the key's
+    /// later in-flight generations fail and are retried behind it.
+    fn mark_retryable(&mut self, seal_key: &crate::scribe::seal_key::SealKey, generation_id: u64) {
+        if let Some(pending) = self.pending_mut(seal_key, generation_id) {
+            pending.submitted = false;
+            pending.successor = None;
         }
     }
 
-    /// Fails and detaches the replay waiter owned by one retryable FIFO front.
-    fn send_replay_error(&mut self, seal_key: &crate::scribe::seal_key::SealKey, detail: &str) {
+    /// Fails and detaches the replay waiter owned by one retryable generation.
+    fn send_replay_error(
+        &mut self,
+        seal_key: &crate::scribe::seal_key::SealKey,
+        generation_id: u64,
+        detail: &str,
+    ) {
         let response = self
-            .pending_generations
-            .get_mut(seal_key)
-            .and_then(VecDeque::front_mut)
-            .and_then(|front| front.replay_response.take());
+            .pending_mut(seal_key, generation_id)
+            .and_then(|pending| pending.replay_response.take());
         if let Some(response) = response {
             let _ = response.send(Err(ScribeError::Internal {
                 detail: detail.to_owned(),
@@ -3036,7 +3122,7 @@ struct BatchCommitIdentity {
     first_index: usize,
     /// Validated cardinality of the closed slice set.
     slice_count: u32,
-    /// Digest over exact WAL payload bytes, carried by the v7 COMMIT record.
+    /// Digest over exact WAL payload bytes, carried by the v8 COMMIT record.
     ///
     /// This is a WAL integrity fact: it authorizes exactly the slices that were
     /// fsynced, so a substituted or reordered slice cannot be closed by a valid
@@ -3404,7 +3490,7 @@ impl ShardOwner {
             // Once WAL close begins, retrying as a normal active generation
             // could duplicate cohort ownership. Preserve every durable file
             // and frozen member, fail-stop admission, and let startup replay
-            // reconstruct the sole owner from WAL v7.
+            // reconstruct the sole owner from WAL v8.
             self.memory_ownership.poison();
         }
         result
@@ -3533,7 +3619,6 @@ impl ShardOwner {
             .pending_generations
             .entry(seal_key.clone())
             .or_default();
-        let should_submit = queue.is_empty();
         queue.push_back(PendingGeneration {
             generation,
             binding,
@@ -3541,10 +3626,9 @@ impl ShardOwner {
             retry_scheduled: false,
             replay_response: None,
             replay_owned: false,
+            successor: None,
         });
-        if should_submit {
-            self.submit_front(seal_key);
-        }
+        self.submit_ready(seal_key);
         Ok(())
     }
 
@@ -3626,7 +3710,7 @@ impl ShardOwner {
         }))
     }
 
-    /// Appends one v7 COMMIT record per complete batch, syncs once, then fences.
+    /// Appends one v8 COMMIT record per complete batch, syncs once, then fences.
     ///
     /// The group's SLICE records are written but not yet synced when this
     /// method starts. Every complete batch's COMMIT is appended after them; one
@@ -3698,7 +3782,7 @@ impl ShardOwner {
                     .touched_segments
                     .first()
                     .ok_or_else(|| ScribeError::Internal {
-                        detail: "WAL v7 batch commit did not retain its segment identity"
+                        detail: "WAL v8 batch commit did not retain its segment identity"
                             .to_owned(),
                     })?
                     .header()
@@ -3882,7 +3966,7 @@ impl ShardOwner {
             slice_set_digest: identity.logical_digest,
             slice_count: i32::try_from(identity.slice_count).map_err(|_| {
                 ScribeError::Internal {
-                    detail: "WAL v7 slice count exceeds SQL integer range".to_owned(),
+                    detail: "WAL v8 slice count exceeds SQL integer range".to_owned(),
                 }
             })?,
             wal_node_id: uuid::Uuid::from_bytes(header.node_id),
@@ -5334,7 +5418,7 @@ mod tests {
     /// Drives one replay generation through queue backpressure and back.
     ///
     /// The one-slot persistence runtime is deliberately full at entry, so
-    /// `submit_front` must record a scheduled retry rather than a submission.
+    /// `submit_ready` must record a scheduled retry rather than a submission.
     /// Completing the blocker then has to wake the replay waiter with the exact
     /// generation-keyed retry command — not an age tick — which flips the front
     /// entry to submitted. The sequence is then re-armed by refilling the slot
@@ -5354,7 +5438,7 @@ mod tests {
         completion_rx: &mut mpsc::Receiver<ShardCommand>,
         generation: &Arc<ImmutableGeneration>,
     ) {
-        owner.submit_front(key);
+        owner.submit_ready(key);
         assert!(
             owner
                 .pending_generations
@@ -5395,10 +5479,10 @@ mod tests {
                 .expect("blocker binding"),
                 completion_tx: owner.completion_tx.clone(),
                 completion_waiter: None,
-                defer_manifest_advance: true,
+                order: crate::scribe::persistence::StagingOrder::default(),
             })
             .expect("refill one-slot queue");
-        owner.submit_front(key);
+        owner.submit_ready(key);
         assert!(
             owner
                 .pending_generations
@@ -5501,7 +5585,7 @@ mod tests {
         let wal_handle = wal.handle_for_shard(0).expect("WAL handle");
         let generation = owner_generation(&key, &frozen, stream, wal_handle.clone());
         let mut owner = owner_for_completion_test(memtable, &wal, wal_handle, stream);
-        let (persistence, mut persistence_rx) = PersistenceRuntime::bounded_for_test();
+        let (persistence, mut persistence_rx) = PersistenceRuntime::bounded_for_test(1);
         owner.persistence = Some(Arc::new(persistence));
         let binding = crate::catalog::TenantTableBinding::resolve((key.tenant, key.table.clone()))
             .expect("test binding");
@@ -5514,6 +5598,7 @@ mod tests {
                 retry_scheduled: false,
                 replay_response: None,
                 replay_owned: false,
+                successor: None,
             }]),
         );
 
@@ -5527,6 +5612,141 @@ mod tests {
         assert!(front.submitted, "the flush resubmits the retained front");
         let job = persistence_rx.recv().await.expect("resubmitted job");
         assert_eq!(job.generation.generation_id, generation.generation_id);
+    }
+
+    /// A seal key's generations stage concurrently but publish in order.
+    ///
+    /// Three queued generations of one key are all submitted at once, each
+    /// behind the previous one's ordering link. A dropped link (a failed
+    /// generation) fails the generation behind it instead of letting it publish
+    /// its staged record first, and a later generation's completion settles
+    /// while an earlier one is still in flight.
+    ///
+    /// # Panics
+    ///
+    /// Panics if any generation is not submitted, a link does not chain to the
+    /// previous submission, or the out-of-order completion is refused or
+    /// removes the wrong generation.
+    #[tokio::test]
+    async fn one_seal_key_pipelines_generations_in_order() {
+        let key = owner_key();
+        let memtable = Memtable::new();
+        let frozen = (0..3)
+            .map(|_| {
+                memtable
+                    .insert(&key, owner_meta(&key), owner_batch())
+                    .expect("owner insert");
+                memtable.freeze(&key).expect("owner freeze")
+            })
+            .collect::<Vec<_>>();
+        let wal_root = tempfile::tempdir().expect("WAL directory");
+        let node = crate::scribe::stream_identity::NodeId::generate();
+        let stream = StreamIdentity::new(node, crate::scribe::stream_identity::WriterEpoch::new(1));
+        let wal = Arc::new(
+            WalWriter::new(
+                wal_root.path(),
+                *node.as_bytes(),
+                1,
+                crate::scribe::wal::WalConfig::default(),
+            )
+            .expect("WAL writer"),
+        );
+        let wal_handle = wal.handle_for_shard(0).expect("WAL handle");
+        let generations = frozen
+            .iter()
+            .map(|frozen| owner_generation(&key, frozen, stream, wal_handle.clone()))
+            .collect::<Vec<_>>();
+        let mut owner = owner_for_completion_test(memtable, &wal, wal_handle, stream);
+        let (persistence, mut persistence_rx) = PersistenceRuntime::bounded_for_test(3);
+        owner.persistence = Some(Arc::new(persistence));
+        let binding = crate::catalog::TenantTableBinding::resolve((key.tenant, key.table.clone()))
+            .expect("test binding");
+        owner.pending_generations.insert(
+            key.clone(),
+            generations
+                .iter()
+                .map(|generation| PendingGeneration {
+                    generation: Arc::clone(generation),
+                    binding: binding.clone(),
+                    submitted: false,
+                    retry_scheduled: false,
+                    replay_response: None,
+                    replay_owned: false,
+                    successor: None,
+                })
+                .collect(),
+        );
+
+        owner.submit_ready(&key);
+
+        let mut jobs = Vec::new();
+        for _ in 0..3 {
+            jobs.push(persistence_rx.recv().await.expect("pipelined job"));
+        }
+        assert_eq!(
+            jobs.iter()
+                .map(|job| job.generation.generation_id)
+                .collect::<Vec<_>>(),
+            generations
+                .iter()
+                .map(|generation| generation.generation_id)
+                .collect::<Vec<_>>(),
+            "every generation of the key is submitted, oldest first"
+        );
+        assert!(
+            jobs[0].order.predecessor.is_none(),
+            "the front waits on nothing"
+        );
+        jobs[0]
+            .order
+            .successor
+            .take()
+            .expect("first link")
+            .send(())
+            .expect("second generation holds the first link");
+        jobs[1]
+            .order
+            .predecessor
+            .take()
+            .expect("second waits on the first")
+            .await
+            .expect("first published its staged record");
+        drop(jobs[1].order.successor.take());
+        assert!(
+            jobs[2]
+                .order
+                .predecessor
+                .take()
+                .expect("third waits on the second")
+                .await
+                .is_err(),
+            "a failed generation fails the one behind it"
+        );
+
+        owner
+            .handle_persistence_completion(
+                PersistenceCompletion {
+                    generation_id: generations[1].generation_id,
+                    staged: Some(owner_staged_member(2)),
+                    wal_segments: Vec::new(),
+                    wal: generations[1].wal.clone(),
+                    arrow_bytes: generations[1].arrow_bytes,
+                    replay_identity: None,
+                    error: None,
+                },
+                None,
+            )
+            .expect("a later generation settles before an earlier one");
+        assert_eq!(
+            owner
+                .pending_generations
+                .get(&key)
+                .expect("earlier and later generations stay queued")
+                .iter()
+                .map(|pending| pending.generation.generation_id)
+                .collect::<Vec<_>>(),
+            vec![generations[0].generation_id, generations[2].generation_id]
+        );
     }
 
     /// Replay owns its own retries across persistence-queue backpressure.
@@ -5572,7 +5792,7 @@ mod tests {
             .expect("replay immutable ownership");
         let (completion_tx, mut completion_rx) = mpsc::channel(1);
         owner.completion_tx = completion_tx.clone();
-        let (persistence, mut persistence_rx) = PersistenceRuntime::bounded_for_test();
+        let (persistence, mut persistence_rx) = PersistenceRuntime::bounded_for_test(1);
         let persistence = Arc::new(persistence);
         let binding = crate::catalog::TenantTableBinding::resolve((key.tenant, key.table.clone()))
             .expect("test binding");
@@ -5582,7 +5802,7 @@ mod tests {
                 binding: binding.clone(),
                 completion_tx,
                 completion_waiter: None,
-                defer_manifest_advance: true,
+                order: crate::scribe::persistence::StagingOrder::default(),
             })
             .expect("fill one-slot queue");
         owner.persistence = Some(Arc::clone(&persistence));
@@ -5595,6 +5815,7 @@ mod tests {
                 retry_scheduled: false,
                 replay_response: None,
                 replay_owned: true,
+                successor: None,
             }]),
         );
         let (response, response_rx) = tokio::sync::oneshot::channel();
@@ -5685,6 +5906,7 @@ mod tests {
                 retry_scheduled: false,
                 replay_response: None,
                 replay_owned: true,
+                successor: None,
             }]),
         );
         let (response, response_rx) = tokio::sync::oneshot::channel();
@@ -6104,6 +6326,7 @@ mod tests {
                 retry_scheduled: false,
                 replay_response: None,
                 replay_owned: true,
+                successor: None,
             }]),
         );
         let (retirement_response, retirement_rx) = tokio::sync::oneshot::channel();
@@ -7234,6 +7457,7 @@ mod tests {
                 retry_scheduled: false,
                 replay_response: None,
                 replay_owned: false,
+                successor: None,
             }]),
         );
         let (waiter_tx, waiter_rx) = tokio::sync::oneshot::channel();
@@ -7905,7 +8129,7 @@ mod tests {
             .memory_ownership
             .reserve_active(active_bytes)
             .expect("active memory ownership");
-        let (persistence, mut persistence_rx) = PersistenceRuntime::bounded_for_test();
+        let (persistence, mut persistence_rx) = PersistenceRuntime::bounded_for_test(1);
         owner.persistence = Some(Arc::new(persistence.clone()));
         owner.generation_started_at = std::time::Instant::now()
             .checked_sub(owner.generation_max_age)

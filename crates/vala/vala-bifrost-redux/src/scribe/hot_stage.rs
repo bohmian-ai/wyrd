@@ -169,8 +169,9 @@ pub enum StagedMemberState {
         /// Fenced publication operation reconciled against `file_list`.
         operation_id: Uuid,
     },
-    /// The claim committed; a published hot object now serves these rows.
-    Published {
+    /// The claim committed: a published hot object now serves these rows, and
+    /// the member awaits the last staged-reader lease before deletion.
+    CleanupPending {
         /// Deterministic identity of the Scribe claim that committed the rows.
         claim_id: String,
         /// Commit key of the fenced `file_list` transaction.
@@ -179,17 +180,6 @@ pub enum StagedMemberState {
         published_object_identities: Vec<String>,
         /// WAL ranges the published objects now own, used only to subtract
         /// this member's rows from a pinned cut that already includes them.
-        persisted_lsn_ranges: Vec<StagedLsnRange>,
-    },
-    /// Published and awaiting the last staged-reader lease before deletion.
-    CleanupPending {
-        /// Deterministic identity of the Scribe claim that committed the rows.
-        claim_id: String,
-        /// Commit key of the fenced `file_list` transaction.
-        file_list_commit_key: String,
-        /// Object identities the claim published, in artifact-ordinal order.
-        published_object_identities: Vec<String>,
-        /// WAL ranges already represented by the published objects.
         persisted_lsn_ranges: Vec<StagedLsnRange>,
     },
 }
@@ -202,7 +192,6 @@ impl StagedMemberState {
             Self::Ready => None,
             Self::Claimed { claim_id }
             | Self::Publishing { claim_id, .. }
-            | Self::Published { claim_id, .. }
             | Self::CleanupPending { claim_id, .. } => Some(claim_id),
         }
     }
@@ -213,8 +202,7 @@ impl StagedMemberState {
             Self::Ready => 0,
             Self::Claimed { .. } => 1,
             Self::Publishing { .. } => 2,
-            Self::Published { .. } => 3,
-            Self::CleanupPending { .. } => 4,
+            Self::CleanupPending { .. } => 3,
         }
     }
 
@@ -227,7 +215,6 @@ impl StagedMemberState {
             Self::Ready => "ready",
             Self::Claimed { .. } => "claimed",
             Self::Publishing { .. } => "publishing",
-            Self::Published { .. } => "published",
             Self::CleanupPending { .. } => "cleanup_pending",
         }
     }
@@ -520,9 +507,7 @@ impl StagedMember {
             StagedMemberState::Ready => return Ok(Some(RecoveredMember::Ready(member))),
             StagedMemberState::Claimed { claim_id }
             | StagedMemberState::Publishing { claim_id, .. } => claim_id,
-            StagedMemberState::Published { .. } | StagedMemberState::CleanupPending { .. } => {
-                return Ok(None);
-            }
+            StagedMemberState::CleanupPending { .. } => return Ok(None),
         };
         let claim = StagingClaimId::from_hex(claim_id).ok_or_else(|| HotStageError::Invalid {
             name: name.to_owned(),
@@ -562,6 +547,9 @@ pub struct ScribeHotStage {
     /// per key makes every later record under it reachable after a crash.
     /// Clones share the set because they share the root.
     synced_keys: Arc<Mutex<HashSet<[u8; 32]>>>,
+    /// WAL root whose shard manifests receive a staged record's WAL range
+    /// before the record is removed and at startup; `None` folds nothing.
+    wal_root: Option<PathBuf>,
 }
 
 impl ScribeHotStage {
@@ -571,7 +559,73 @@ impl ScribeHotStage {
         Self {
             root,
             synced_keys: Arc::default(),
+            wal_root: None,
         }
+    }
+
+    /// Folds every staged record's WAL range into the shard manifests under
+    /// `wal_root` (see [`crate::scribe::manifest`]).
+    ///
+    /// Staging writes no manifest: a live record is itself the evidence that
+    /// its WAL range is durable. A production stage must fold, or replay
+    /// would restore the rows of a published member whose WAL outlived it.
+    #[must_use]
+    pub fn with_wal_root(mut self, wal_root: PathBuf) -> Self {
+        self.wal_root = Some(wal_root);
+        self
+    }
+
+    /// Raises each record's shard manifest to cover the record's WAL range.
+    ///
+    /// A record's shard staged its key's generations in order, so its range
+    /// maximum covers every earlier record of that key on that shard; the
+    /// watermark never reaches another shard's records, which keep their own
+    /// manifest.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`HotStageError::Io`] when a shard does not fit the WAL header
+    /// or a manifest cannot be advanced.
+    async fn fold_into_manifests<'a>(
+        &self,
+        records: impl IntoIterator<Item = (&'a ScribeAssemblyKey, &'a StagedHotSourceRecordV1)>,
+    ) -> Result<(), HotStageError> {
+        let Some(wal_root) = &self.wal_root else {
+            return Ok(());
+        };
+        let fold_io = |detail: String| HotStageError::Io {
+            operation: "fold a staged WAL range into its manifest",
+            detail,
+        };
+        let mut manifests: HashMap<PathBuf, (StreamIdentity, Vec<_>)> = HashMap::new();
+        for (key, record) in records {
+            let stream = StreamIdentity::new(key.node_id(), key.writer_epoch());
+            let shard = u8::try_from(record.member().shard())
+                .map_err(|_| fold_io("staged shard exceeds the WAL header width".to_owned()))?;
+            manifests
+                .entry(crate::scribe::replay::shard_manifest_path(
+                    wal_root, stream, shard,
+                ))
+                .or_insert_with(|| (stream, Vec::new()))
+                .1
+                .push((
+                    key.seal_key(),
+                    crate::scribe::wal::WalLsn::new(record.wal_range().max),
+                ));
+        }
+        if manifests.is_empty() {
+            return Ok(());
+        }
+        tokio::task::spawn_blocking(move || {
+            manifests
+                .into_iter()
+                .try_for_each(|(path, (stream, watermarks))| {
+                    crate::scribe::manifest::advance(&path, stream, watermarks)
+                })
+        })
+        .await
+        .map_err(|error| fold_io(error.to_string()))?
+        .map_err(|error| fold_io(error.to_string()))
     }
 
     /// Returns the governed root every staged file lives under.
@@ -737,6 +791,10 @@ impl ScribeHotStage {
     /// the last one. Members already gone are skipped; when none was removed
     /// nothing is synced.
     ///
+    /// Every surviving member's WAL range is first folded into its shard
+    /// manifest, because the record is the last evidence that range is durable
+    /// and its WAL can outlive it.
+    ///
     /// Each member's record is unlinked before the rest of its directory, so
     /// an interrupted removal normally leaves a record-less directory, which
     /// [`Self::recover`] deletes. A file system that persists the run unlinks
@@ -745,8 +803,9 @@ impl ScribeHotStage {
     ///
     /// # Errors
     ///
-    /// Returns [`HotStageError::Io`] when a record or directory cannot be
-    /// removed or the key directory cannot be synced.
+    /// Returns [`HotStageError::Io`] when a record cannot be read, a manifest
+    /// cannot be advanced, a record or directory cannot be removed, or the key
+    /// directory cannot be synced.
     ///
     /// # Cancellation
     ///
@@ -759,6 +818,14 @@ impl ScribeHotStage {
         key: &ScribeAssemblyKey,
         members: &[StagedMemberId],
     ) -> Result<(), HotStageError> {
+        let mut records = Vec::with_capacity(members.len());
+        for member in members {
+            if let Some(record) = self.surviving_record(key, *member).await? {
+                records.push(record);
+            }
+        }
+        self.fold_into_manifests(records.iter().map(|record| (key, record)))
+            .await?;
         let mut removed = false;
         for member in members {
             let directory = self.member_directory(key, *member);
@@ -846,6 +913,10 @@ impl ScribeHotStage {
     /// This is a startup scan: run while a member is being staged, it would
     /// remove that member's runs before its record lands.
     ///
+    /// Every recovered record's WAL range is folded into its shard manifest
+    /// before this returns, so WAL replay, which runs after it, skips the rows
+    /// staged members already hold.
+    ///
     /// Members are returned grouped by assembly key so the caller can rebuild
     /// the ready index in one pass.
     ///
@@ -908,6 +979,13 @@ impl ScribeHotStage {
                     .push(member);
             }
         }
+        self.fold_into_manifests(
+            recovered
+                .values()
+                .flatten()
+                .map(|member| (&member.key, &member.record)),
+        )
+        .await?;
         Ok(recovered)
     }
 
@@ -1279,6 +1357,78 @@ mod tests {
         assert_eq!(ready.raw_bytes(), 64);
         assert_eq!(ready.encoded_bytes(), 16);
         assert_eq!(ready.ready_at(), ready_at());
+    }
+
+    /// A staged record's WAL range reaches its own shard's manifest at startup
+    /// and before retirement removes the record, and a shard without WAL folds
+    /// nothing.
+    ///
+    /// # Panics
+    ///
+    /// Panics when a fixture write, recovery, retirement, or manifest read is
+    /// refused, or a manifest does not hold the expected watermark.
+    #[tokio::test]
+    async fn staged_wal_ranges_fold_into_their_shard_manifest() {
+        let directory = tempfile::tempdir().expect("staging root");
+        let wal_root = directory.path().join("wal");
+        let stage =
+            ScribeHotStage::new(directory.path().join("hot-stage")).with_wal_root(wal_root.clone());
+        let key = fixture_key();
+        let stream = StreamIdentity::new(key.node_id(), key.writer_epoch());
+        let manifest =
+            |shard: u8| crate::scribe::replay::shard_manifest_path(&wal_root, stream, shard);
+        std::fs::create_dir_all(manifest(4).parent().expect("shard directory"))
+            .expect("shard 4 WAL directory");
+        let stage_member = |member: StagedMemberId, max: u64| {
+            let stage = &stage;
+            let key = &key;
+            async move {
+                let run = write_run(
+                    &stage.member_directory(key, member),
+                    "run-0.parquet",
+                    b"sorted-run-bytes",
+                )
+                .await;
+                let record = StagedHotSourceRecordV1::ready(
+                    key,
+                    member,
+                    StagedLsnRange { min: 1, max },
+                    vec![run],
+                    64,
+                    ready_at(),
+                );
+                stage
+                    .publish_record(key, &record)
+                    .await
+                    .expect("the record publishes");
+            }
+        };
+        let sealed = |shard: u8| {
+            crate::scribe::manifest::read_manifest(manifest(shard))
+                .expect("manifest read")
+                .and_then(|manifest| manifest.get_sealed_lsn(&key.seal_key()))
+                .map(crate::scribe::wal::WalLsn::as_u64)
+        };
+
+        stage_member(StagedMemberId::new(4, 12), 42).await;
+        assert_eq!(sealed(4), None, "staging writes no manifest");
+        stage.recover().await.expect("recovery");
+        assert_eq!(sealed(4), Some(42), "startup folds a live record");
+
+        stage_member(StagedMemberId::new(4, 13), 90).await;
+        stage
+            .retire_all(&key, &[StagedMemberId::new(4, 13)])
+            .await
+            .expect("retirement");
+        assert_eq!(sealed(4), Some(90), "retirement folds before removal");
+
+        stage_member(StagedMemberId::new(5, 1), 7).await;
+        stage
+            .retire_all(&key, &[StagedMemberId::new(5, 1)])
+            .await
+            .expect("retirement without WAL");
+        assert!(!manifest(5).exists(), "a shard without WAL folds nothing");
+        assert_eq!(sealed(4), Some(90), "another shard's manifest is untouched");
     }
 
     /// A system-owner record decodes again, but only the audit log may use it.
@@ -1732,7 +1882,7 @@ mod tests {
             .transition(
                 &key,
                 member,
-                StagedMemberState::Published {
+                StagedMemberState::CleanupPending {
                     claim_id: "0011".to_owned(),
                     file_list_commit_key: "commit-1".to_owned(),
                     published_object_identities: vec!["objects/hot-0.parquet".to_owned()],
@@ -1740,8 +1890,8 @@ mod tests {
                 },
             )
             .await
-            .expect("claimed moves forward to published");
-        assert_eq!(published.state().label(), "published");
+            .expect("claimed moves forward to cleanup pending");
+        assert_eq!(published.state().label(), "cleanup_pending");
 
         let recovered = stage
             .recover()
@@ -1754,7 +1904,7 @@ mod tests {
                 .record()
                 .state()
                 .label(),
-            "published"
+            "cleanup_pending"
         );
 
         stage
@@ -1888,7 +2038,7 @@ mod tests {
             .transition(
                 &key,
                 member,
-                StagedMemberState::Published {
+                StagedMemberState::CleanupPending {
                     claim_id,
                     file_list_commit_key: "commit-1".to_owned(),
                     published_object_identities: vec!["objects/hot-0.parquet".to_owned()],
@@ -1896,7 +2046,7 @@ mod tests {
                 },
             )
             .await
-            .expect("publishing moves to published");
+            .expect("publishing moves to cleanup pending");
         let recovered = stage
             .recover()
             .await

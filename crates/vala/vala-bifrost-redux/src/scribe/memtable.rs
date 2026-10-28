@@ -1026,9 +1026,10 @@ impl Memtable {
     /// Retire all committed immutable generations at the current sweep.
     ///
     /// A generation is retirement-eligible the moment its state is
-    /// [`ImmutableState::Durable`]. `Committed` is only reached after the
-    /// fenced `vala.file_list` transaction commits, so retired data is
-    /// always readable from published parquet. The returned WAL ranges are the
+    /// [`ImmutableState::Durable`], which is reached once its rows are a staged
+    /// member on the staging volume, so retired data is always readable from
+    /// that member or, after publication, from published Parquet. The
+    /// returned WAL ranges are the
     /// only ranges eligible for WAL retirement on this sweep.
     ///
     /// # Errors

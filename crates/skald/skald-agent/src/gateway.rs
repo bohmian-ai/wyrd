@@ -96,10 +96,10 @@ pub fn wyrd_gateway_registry(
 /// Return whether an Agent failure is eligible for another attempt.
 ///
 /// Provider connection, timeout, decode, and 408/429/5xx failures, response
-/// decode failures, Agent timeouts, and structured-output decode failures are
-/// retryable; gateway problems retry only for the three capacity/upstream/
-/// deadline codes. Everything else — auth, permission, tool, callback,
-/// session, journal, max-iteration, and invariant failures — is terminal.
+/// decode failures, and Agent timeouts are retryable; gateway problems retry
+/// only for the three capacity/upstream/deadline codes. Everything else —
+/// auth, permission, tool, callback, session, journal, max-iteration,
+/// structured-output exhaustion, and invariant failures — is terminal.
 #[must_use]
 pub fn agent_error_retryable(error: &AgentError) -> bool {
     match error {
@@ -107,8 +107,7 @@ pub fn agent_error_retryable(error: &AgentError) -> bool {
             provider_error_retryable(source)
         }
         AgentError::Provider(SkaldRuntimeError::ResponseDecode { .. })
-        | AgentError::Timeout { .. }
-        | AgentError::StructuredOutputDecode { .. } => true,
+        | AgentError::Timeout { .. } => true,
         _ => false,
     }
 }

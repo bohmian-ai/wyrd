@@ -74,7 +74,7 @@ fn responses_request(input: Vec<OpenAiResponseItem>, tools: bool) -> ProviderReq
 }
 
 /// Responses answer carrying `output` items.
-fn responses_answer(output: Vec<OpenAiResponseItem>) -> ProviderResponse {
+pub(crate) fn responses_answer(output: Vec<OpenAiResponseItem>) -> ProviderResponse {
     ProviderResponse::OpenAiResponses(OpenAiResponsesResponse {
         id: "resp".to_owned(),
         object: "response".to_owned(),
@@ -88,7 +88,7 @@ fn responses_answer(output: Vec<OpenAiResponseItem>) -> ProviderResponse {
 }
 
 /// Message item with one text part.
-fn message(role: &str, part: OpenAiResponseContentPart) -> OpenAiResponseItem {
+pub(crate) fn message(role: &str, part: OpenAiResponseContentPart) -> OpenAiResponseItem {
     OpenAiResponseItem::Message {
         role: role.to_owned(),
         content: vec![part],

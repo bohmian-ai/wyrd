@@ -24,6 +24,7 @@ use crate::request_builder::{
 };
 use crate::run::{AgentRun, FinishReason};
 use crate::session::{Role, SessionId, SessionTurn, session_turn_to_conversation_turn};
+use crate::structured::StructuredOutput;
 
 #[derive(Debug, Clone)]
 struct ToolCall {
@@ -58,8 +59,9 @@ impl Agent {
     /// `wyrd_gateway` route has no gateway caller or a non-gateway model,
     /// [`AgentError::JournalAppendFailed`] when a non-terminal journal
     /// append fails, session read or append failures, callback panics, Prompt
-    /// rendering and loop-shape errors, provider and tool failures, structured
-    /// output decode failures, an exhausted iteration budget, or
+    /// rendering and loop-shape errors, provider and tool failures, an
+    /// answer still violating the response schema at the last iteration, an
+    /// exhausted iteration budget, or
     /// [`AgentError::Timeout`].
     pub async fn run_with(
         &self,
@@ -147,6 +149,7 @@ impl Agent {
                         conversation,
                         session_id: session_id.as_ref(),
                         model: &self.prompt.native().model,
+                        response_type: &self.prompt.native().response_type,
                     },
                 )
                 .await
@@ -248,6 +251,7 @@ impl Agent {
                         conversation: Conversation::new(),
                         session_id: None,
                         model: &prompt.native().model,
+                        response_type: &prompt.native().response_type,
                     },
                 )
                 .await
@@ -338,11 +342,17 @@ impl Agent {
     /// Each iteration dispatches under a `chat` span, journals the call and
     /// result, and runs requested tools concurrently under `execute_tool` spans
     /// until the model stops calling tools or the iteration budget is spent.
+    /// A structured-output run validates every final answer against the
+    /// run Prompt's exact response schema; an invalid answer stays in the
+    /// conversation, followed by a bounded correction turn, and the next
+    /// iteration asks again, so repairs spend the same budget as tool turns.
     ///
     /// # Errors
     ///
     /// Returns `AgentError` for a zero or exhausted iteration budget, a provider,
-    /// tool, journal, session, or structured-output failure.
+    /// tool, journal, or session failure, and
+    /// [`AgentError::StructuredOutputInvalid`] when the last iteration's answer
+    /// still violates the response schema.
     async fn run_loop(
         &self,
         providers: &ProviderRegistry,
@@ -354,6 +364,7 @@ impl Agent {
             mut conversation,
             session_id,
             model,
+            response_type,
         } = inputs;
         if self.run_config.max_iterations == 0 {
             return Err(AgentError::max_iterations(
@@ -364,6 +375,12 @@ impl Agent {
 
         let concurrency_cap = self.run_config.tool_concurrency_cap.unwrap_or(8).max(1);
         let max_iterations = self.run_config.max_iterations;
+        let structured = match response_type {
+            ResponseType::Text => None,
+            ResponseType::JsonSchema { schema, .. } => {
+                Some(StructuredOutput::new(&self.id, schema)?)
+            }
+        };
 
         for iteration in 0..max_iterations {
             self.journal
@@ -476,7 +493,29 @@ impl Agent {
                     .text()
                     .map(std::borrow::Cow::into_owned)
                     .unwrap_or_default();
-                let structured_output = self.parse_structured_output(&output)?;
+                let structured_output = match structured.as_ref().map(|s| s.check(&output)) {
+                    None => None,
+                    Some(Ok(map)) => Some(map),
+                    Some(Err(rejection)) if iteration + 1 == max_iterations => {
+                        return Err(AgentError::StructuredOutputInvalid {
+                            agent: self.id.clone(),
+                            violations: rejection.violations,
+                        });
+                    }
+                    Some(Err(rejection)) => {
+                        conversation.append_user(rejection.correction.as_str());
+                        self.append_session_turn(
+                            session_id,
+                            SessionTurn {
+                                role: Role::User,
+                                content: rejection.correction,
+                                call_id: None,
+                            },
+                        )
+                        .await?;
+                        continue;
+                    }
+                };
                 let run = AgentRun {
                     output,
                     final_response: Some(std::sync::Arc::new(response)),
@@ -863,38 +902,6 @@ impl Agent {
             conversation: Arc::new(conversation.clone()),
         }
     }
-
-    /// Decode the final `output` text as the structured object a JSON-schema
-    /// Prompt declares; a text Prompt yields `None`.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`AgentError::StructuredOutputDecode`] when the text is not
-    /// JSON or not a JSON object.
-    fn parse_structured_output(
-        &self,
-        output: &str,
-    ) -> AgentResult<Option<serde_json::Map<String, serde_json::Value>>> {
-        match &self.prompt.native().response_type {
-            ResponseType::Text => Ok(None),
-            ResponseType::JsonSchema { .. } => {
-                let value: serde_json::Value =
-                    serde_json::from_str(output.trim()).map_err(|error| {
-                        AgentError::StructuredOutputDecode {
-                            agent: self.id.clone(),
-                            detail: error.to_string(),
-                        }
-                    })?;
-                let serde_json::Value::Object(map) = value else {
-                    return Err(AgentError::StructuredOutputDecode {
-                        agent: self.id.clone(),
-                        detail: "structured output must be a JSON object".to_owned(),
-                    });
-                };
-                Ok(Some(map))
-            }
-        }
-    }
 }
 
 /// Prepared per-run state handed from `run_prompt` into the bounded loop.
@@ -913,6 +920,9 @@ struct RunLoopInputs<'a> {
     /// Resolved model of the Prompt driving the run; the `chat` span fallback
     /// for request wire shapes that carry no model.
     model: &'a str,
+    /// Response type of the Prompt driving the run, whose schema every
+    /// final answer must satisfy.
+    response_type: &'a ResponseType,
 }
 
 /// Open the `chat` span for one dispatch of the effective `request` to `provider`.

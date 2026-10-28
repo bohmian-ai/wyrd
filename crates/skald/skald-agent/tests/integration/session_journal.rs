@@ -614,16 +614,16 @@ impl SessionMemory for RecordingSession {
 }
 
 #[derive(Clone, Default)]
-struct RecordingJournal {
+pub(crate) struct RecordingJournal {
     events: Arc<Mutex<Vec<JournalEvent>>>,
 }
 
 impl RecordingJournal {
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self::default()
     }
 
-    fn events(&self) -> Vec<JournalEvent> {
+    pub(crate) fn events(&self) -> Vec<JournalEvent> {
         match self.events.lock() {
             Ok(guard) => guard.clone(),
             Err(poisoned) => poisoned.into_inner().clone(),

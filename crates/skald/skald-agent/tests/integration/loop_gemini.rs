@@ -47,7 +47,7 @@ fn gemini_request(contents: Vec<GoogleContent>) -> ProviderRequest {
     })
 }
 
-fn gemini_text_response(text: &str) -> ProviderResponse {
+pub(crate) fn gemini_text_response(text: &str) -> ProviderResponse {
     ProviderResponse::GeminiGenerateContent(GoogleGenerateContentResponse {
         candidates: vec![GoogleCandidate {
             content: google_answer(text),

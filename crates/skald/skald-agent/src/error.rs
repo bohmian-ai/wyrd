@@ -124,13 +124,18 @@ pub enum AgentError {
         /// Configured timeout duration.
         duration: Duration,
     },
-    /// Provider returned non-object JSON for a structured-output prompt.
-    #[error("agent '{agent}' returned a non-JSON structured response: {detail}")]
-    StructuredOutputDecode {
+    /// The final answer of a structured-output run still violated the
+    /// Prompt's response schema when the iteration budget ran out.
+    #[error(
+        "agent '{agent}' structured output violates its response schema at {}",
+        violations.join(", ")
+    )]
+    StructuredOutputInvalid {
         /// Agent id.
         agent: String,
-        /// Parser detail.
-        detail: String,
+        /// At most ten schema locations or fixed diagnostics, never reply
+        /// content.
+        violations: Vec<String>,
     },
     /// A constructor or method argument was invalid.
     #[error("invalid argument '{name}': {detail}")]
@@ -169,7 +174,7 @@ impl AgentError {
             Self::SessionAppendFailed { .. } => "SKALD_SESSION_500_APPEND",
             Self::JournalAppendFailed { .. } => "SKALD_AGENT_500_JOURNAL",
             Self::Timeout { .. } => "SKALD_AGENT_504_TIMEOUT",
-            Self::StructuredOutputDecode { .. } => "SKALD_AGENT_422_STRUCTURED_DECODE",
+            Self::StructuredOutputInvalid { .. } => "SKALD_AGENT_422_STRUCTURED_INVALID",
             Self::InvalidArgument { .. } => "SKALD_AGENT_422_INVALID_ARGUMENT",
         }
     }
@@ -264,10 +269,12 @@ impl From<&AgentError> for WyrdError {
                 message,
                 details: serde_json::json!({ "timeout_ms": duration.as_millis() }),
             },
-            AgentError::StructuredOutputDecode { agent, detail } => Self::AgentStructuredDecode {
-                message,
-                details: serde_json::json!({ "agent": agent, "reason": detail }),
-            },
+            AgentError::StructuredOutputInvalid { agent, violations } => {
+                Self::AgentStructuredInvalid {
+                    message,
+                    details: serde_json::json!({ "agent": agent, "violations": violations }),
+                }
+            }
             AgentError::InvalidArgument { name, detail } => Self::AgentInvalidArgument {
                 message,
                 details: serde_json::json!({ "argument": name, "reason": detail }),

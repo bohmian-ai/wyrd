@@ -75,7 +75,7 @@ fn openai_text_response(text: &str) -> ProviderResponse {
     })
 }
 
-fn openai_tool_call_response(name: &str, args: serde_json::Value) -> ProviderResponse {
+pub(crate) fn openai_tool_call_response(name: &str, args: serde_json::Value) -> ProviderResponse {
     ProviderResponse::OpenAiChatCompletion(OpenAiChatResponse {
         id: "resp_call".to_owned(),
         object: "chat.completion".to_owned(),

@@ -343,20 +343,28 @@ async fn agent_run_callback_panic_maps_to_agent_error() {
 }
 
 #[derive(Clone)]
-struct RecordingProvider {
+pub(crate) struct RecordingProvider {
+    name: ProviderName,
     responses: Arc<Mutex<VecDeque<ProviderResponse>>>,
     requests: Arc<Mutex<Vec<ProviderRequest>>>,
 }
 
 impl RecordingProvider {
     fn new(responses: Vec<ProviderResponse>) -> Self {
+        Self::named(ProviderName::OpenAi, responses)
+    }
+
+    /// A provider registered as `name` answering `responses` in order.
+    pub(crate) fn named(name: ProviderName, responses: Vec<ProviderResponse>) -> Self {
         Self {
+            name,
             responses: Arc::new(Mutex::new(responses.into())),
             requests: Arc::new(Mutex::new(Vec::new())),
         }
     }
 
-    fn requests(&self) -> Vec<ProviderRequest> {
+    /// Every request sent so far, in order.
+    pub(crate) fn requests(&self) -> Vec<ProviderRequest> {
         self.requests_lock().clone()
     }
 
@@ -392,7 +400,7 @@ impl Provider for RecordingProvider {
     }
 
     fn name(&self) -> ProviderName {
-        ProviderName::OpenAi
+        self.name.clone()
     }
 }
 

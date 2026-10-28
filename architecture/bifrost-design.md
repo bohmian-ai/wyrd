@@ -67,9 +67,9 @@ The request ID is the existing request/batch-fence correlator. The ingestion
 instant is taken once at admission from the PostgreSQL-anchored clock and
 retained across retry. Callers never supply managed identity as user fields.
 
-The nine system tables (spans, logs, metrics, gateway calls, drift
-observations, verification results, execution inputs, drift result features
-and audit) additionally share six nullable Utf8 dimensions:
+The ten system tables (spans, logs, metrics, gateway calls, drift
+observations, verification results, execution inputs, drift result features,
+storage objects and audit) additionally share six nullable Utf8 dimensions:
 service_name, service_version, deployment_environment, subject_kind,
 subject_name and subject_version. Registered UIDs determine identity labels;
 accepted workload context determines environment. Existing signal columns occur
@@ -1275,7 +1275,8 @@ and `bifrost.verification.results` — also partition by UTC day on each table's
 time column — `created_at` for observations, `recorded_at` for execution
 inputs, and `ended_at` for execution outputs and results —
 never by Verifier, subject, binding, or tenant ID. A Drift schedule window does
-not determine partition size.
+not determine partition size. `bifrost.storage.objects` partitions by UTC day
+on `recorded_at`.
 
 ## Maintenance: Forge
 
@@ -1743,10 +1744,11 @@ the namespace does not create another storage or authorization model.
 
 Permissions are scoped through `BifrostTable`, `BifrostRecord`, and
 `BifrostQuery`. Generic writes cannot target reserved or system-managed tables;
-`bifrost.gateway.calls` and the three verification tables
+`bifrost.gateway.calls`, the three verification tables
 (`bifrost.verification.results`, `bifrost.verification.execution_inputs`, and
-`bifrost.verification.execution_outputs`) accept no public write at all: Gate refuses every
-principal. Only the server-internal capture writer writes them, together with
+`bifrost.verification.execution_outputs`), and the `bifrost.storage.objects`
+inventory accept no public write at all: Gate refuses every principal. Only
+the server-internal capture writer writes them, together with
 the capture spans in `bifrost.traces.spans`, and the tenant copies of server
 spans join them there through the same outbox; result rows carry the verified
 Card as `card_uid` and the exact Verifier Card as `verifier_card_uid`. Each
@@ -1764,10 +1766,21 @@ values: the runner resolves them, and the accepted routes, from that input
 record. A group or schedule execution's selector record is staged on a slot
 reserved before its PostgreSQL commit and is staged right after it; a runner
 claiming the execution before the record is readable retries it as evidence
-unavailable. A pod without
+unavailable. `bifrost.storage.objects` is the one completed-object inventory:
+each Card file completion, Card envelope write, and Card deletion stages one
+row, keyed by `storage_path` and bound to its Card through `subject_card_uid`
+and `relative_path`, and a deletion row dominates every completion of that
+Card, earlier or later. A completion returns only after Scribe acknowledges
+its own inventory row, waiting at most half the query deadline and otherwise
+answering `WYRD_VALA_503_BIFROST_WRITER_UNAVAILABLE`; no other producer waits
+on it. Card reads, after the caller's Card authorization, read the inventory
+as the tenant `System` principal granted only that table, so no Bifrost query
+permission is needed. A manifest entry PostgreSQL holds complete but the
+inventory does not yet show answers `WYRD_VALA_503_QUERY_VISIBILITY_UNAVAILABLE`;
+an absent row is never evidence of deletion. A pod without
 Scribe submits through `ScribeCapturePeerService.IngestCapture` on the peer
 listener, which the same `wyrd-peer` mTLS admits; the request names its
-tenant and one of those five tables or `bifrost.system.audit_log` explicitly,
+tenant and one of those six tables or `bifrost.system.audit_log` explicitly,
 carries no token, and its rows carry their own subject and actor pairs. Audit
 rows carry their own identities as row content, so an audit batch submits the
 no-verified-caller sentinel pair. Every outbox frame names that

@@ -22,10 +22,10 @@ use wyrd_spec::vala::api::PhysicalLayoutWire;
 /// none; it is the declared digest, not an independently certified one.
 /// `size_bytes`, `content_type`, and `sse_marker` are the completion's
 /// existing metadata. `origin` is a [`ObjectOrigin`] spelling and grants
-/// nothing. `card_uid` and `relative_path` are the exact Card binding, null
-/// for an object no Card owns. `state` is a [`ObjectState`] spelling: a
-/// `deleted` row records the existing lifecycle's deletion of every object of
-/// its `card_uid` and dominates any completion row, earlier or replayed
+/// nothing. The shared `subject_card_uid` and `relative_path` are the exact
+/// Card binding, null for an object no Card owns. `state` is a
+/// [`ObjectState`] spelling: a `deleted` row records the existing lifecycle's
+/// deletion of every object of its subject Card and dominates any completion row, earlier or replayed
 /// later. `recorded_at` is the server's recording instant. Only the server
 /// writes the table; Gate refuses public appends.
 pub struct ObjectsTable;
@@ -107,7 +107,6 @@ impl DomainTable for ObjectsTable {
             utf8("content_type", true),
             utf8("sse_marker", true),
             utf8("origin", false),
-            utf8("card_uid", true),
             utf8("relative_path", true),
             utf8("state", false),
             ts_us_utc("recorded_at", false),
@@ -115,13 +114,14 @@ impl DomainTable for ObjectsTable {
     }
 
     /// Daily partitions on `recorded_at`, attribution-sorted, Bloom-pruned on
-    /// the shared attribution set and the storage identity, declared digest,
-    /// and Card binding a lookup selects by.
+    /// the shared attribution set, whose `subject_card_uid` is the Card
+    /// binding, and the storage identity and declared digest a lookup selects
+    /// by.
     fn physical_layout() -> PhysicalLayoutWire {
         attributed_layout(
             daily_layout,
             "recorded_at",
-            &["storage_path", "sha256", "card_uid"],
+            &["storage_path", "sha256"],
         )
     }
 }

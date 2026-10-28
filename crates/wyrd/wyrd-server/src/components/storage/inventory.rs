@@ -79,7 +79,7 @@ pub struct ObjectFact {
     pub sse_marker: Option<String>,
     /// Where the object came from.
     pub origin: ObjectOrigin,
-    /// Owning Card, which Scribe also stamps as the row's subject.
+    /// Owning Card, stored as the row's `subject_card_uid`.
     pub card_uid: Option<CardUid>,
     /// Card-relative path; `None` for an envelope or deletion.
     pub relative_path: Option<String>,
@@ -135,7 +135,7 @@ impl ObjectFact {
                 "content_type" => Cell::text(self.content_type.as_deref()),
                 "sse_marker" => Cell::text(self.sse_marker.as_deref()),
                 "origin" => Cell::text(Some(self.origin.as_str())),
-                "card_uid" | SUBJECT_CARD_UID => Cell::text(card_uid.as_deref()),
+                SUBJECT_CARD_UID => Cell::text(card_uid.as_deref()),
                 "relative_path" => Cell::text(self.relative_path.as_deref()),
                 "state" => Cell::text(Some(self.state.as_str())),
                 "recorded_at" => Cell::Micros(Some(Utc::now().timestamp_micros())),
@@ -265,7 +265,7 @@ impl<'s> ObjectInventory<'s> {
         let mut batches = Vec::new();
         let sql = format!(
             "SELECT storage_path, sha256, size_bytes, content_type, origin, relative_path, state \
-             FROM {OBJECTS} WHERE card_uid = {}",
+             FROM {OBJECTS} WHERE {SUBJECT_CARD_UID} = {}",
             ObservationWindow::text(card_uid.as_str())
         );
         let run = query.run_with(

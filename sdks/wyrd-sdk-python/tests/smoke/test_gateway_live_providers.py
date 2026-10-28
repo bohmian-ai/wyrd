@@ -13,6 +13,7 @@ Run with ``mise run test:gateway:smoke:live``; the credential-free
 from __future__ import annotations
 
 import json
+from pathlib import Path
 from typing import Any, Literal
 
 import anthropic
@@ -23,6 +24,7 @@ from anthropic.types import RawContentBlockDeltaEvent, TextBlock, TextDelta, Too
 from google import genai
 from openai.types.chat import ChatCompletionMessageFunctionToolCall
 from openai.types.responses import ResponseCompletedEvent
+from wyrd.prompt import Prompt
 
 from .conftest import (
     JEV_QUESTIONS,
@@ -73,6 +75,42 @@ OPEN_ANSWER_SCHEMA: dict[str, Any] = {
     key: value for key, value in ANSWER_SCHEMA.items() if key != "additionalProperties"
 }
 STRUCTURED_PROMPT = "Reply with JSON whose answer is the single word: ready"
+
+VERDICT_PROMPT = (
+    "Judge whether the answer `ready` is one word. Cite the input slot `answer` "
+    "at JSON pointer `/text`."
+)
+
+
+def verdict_format(tmp_path: Path) -> dict[str, Any]:
+    """The ``response_format`` an OpenAI Chat Prompt declaring ``verdict`` lowers to.
+
+    ``Prompt.load`` compiles the body the way a stored Prompt Card is
+    compiled, so the schema is the server's runtime-generated plain Verdict,
+    never a copied payload.
+    """
+    path = tmp_path / "verdict-prompt.json"
+    authored = {
+        "provider": "openai",
+        "model": model("openai"),
+        "messages": [{"role": "user", "content": VERDICT_PROMPT}],
+        "response_format": "verdict",
+    }
+    path.write_text(json.dumps(authored))
+    return Prompt.load(path).render().model_dump()["body"]["response_format"]
+
+
+def assert_verdict(text: str | None) -> None:
+    """Assert ``text`` is a plain Verdict: the closed envelope and cited slot shape."""
+    assert text, "the provider returned no Verdict text"
+    verdict = json.loads(text)
+    assert set(verdict) == {"outcome", "reason", "citations"}, verdict
+    assert verdict["outcome"] in ("passed", "failed", "inconclusive"), verdict
+    assert isinstance(verdict["reason"], str), verdict
+    for citation in verdict["citations"]:
+        assert set(citation) == {"slot", "locator"} and isinstance(citation["slot"], str), verdict
+        [(kind, _)] = citation["locator"].items()
+        assert kind in ("page", "slide", "lines", "json_pointer", "region"), verdict
 
 
 def openai_compatible(live: LiveGateway) -> openai.OpenAI:
@@ -368,6 +406,76 @@ def test_gemini_generate_content_relays_structured_output(gemini_client: genai.C
     )
     assert answer.text is not None, "gemini returned no text"
     assert isinstance(json.loads(answer.text)["answer"], str)
+
+
+@pytest.mark.smoke
+def test_openai_chat_accepts_the_named_verdict_format(
+    openai_client: openai.OpenAI, tmp_path: Path
+) -> None:
+    """The named ``verdict`` format lowers to non-strict output OpenAI accepts and answers."""
+    response_format = verdict_format(tmp_path)
+    assert response_format["json_schema"]["strict"] is False
+    completion = openai_client.chat.completions.create(
+        model=f"openai/{model('openai')}",
+        messages=[{"role": "user", "content": VERDICT_PROMPT}],
+        response_format=response_format,
+        max_completion_tokens=MAX_OUTPUT_TOKENS,
+    )
+    assert_verdict(completion.choices[0].message.content)
+
+
+@pytest.mark.smoke
+@pytest.mark.parametrize("provider", ["openai", "anthropic", "gemini"])
+def test_live_providers_accept_the_generated_verdict_schema(
+    provider: Literal["openai", "anthropic", "gemini"],
+    live_gateway: LiveGateway,
+    tmp_path: Path,
+) -> None:
+    """The generated plain Verdict schema is accepted as each provider's strictest output schema.
+
+    OpenAI receives it in strict mode, Anthropic as ``output_config``, and
+    Gemini as ``response_json_schema``; each answers a Verdict.
+    """
+    credential(provider)
+    schema = verdict_format(tmp_path)["json_schema"]["schema"]
+    if provider == "openai":
+        completion = openai_compatible(live_gateway).chat.completions.create(
+            model=f"openai/{model('openai')}",
+            messages=[{"role": "user", "content": VERDICT_PROMPT}],
+            response_format={
+                "type": "json_schema",
+                "json_schema": {"name": "verdict", "schema": schema, "strict": True},
+            },
+            max_completion_tokens=MAX_OUTPUT_TOKENS,
+        )
+        text = completion.choices[0].message.content
+    elif provider == "anthropic":
+        message = anthropic.Anthropic(
+            base_url=live_gateway.base_url, api_key=live_gateway.token, max_retries=0
+        ).messages.create(
+            model=f"anthropic/{model('anthropic')}",
+            max_tokens=MAX_OUTPUT_TOKENS,
+            messages=[{"role": "user", "content": VERDICT_PROMPT}],
+            output_config={"format": {"type": "json_schema", "schema": schema}},
+        )
+        text = "".join(block.text for block in message.content if isinstance(block, TextBlock))
+    else:
+        client = genai.Client(
+            api_key=live_gateway.token,
+            http_options=genai.types.HttpOptions(
+                base_url=live_gateway.base_url, retry_options=None
+            ),
+        )
+        text = client.models.generate_content(
+            model=f"gemini/{model('gemini')}",
+            contents=VERDICT_PROMPT,
+            config=genai.types.GenerateContentConfig(
+                response_mime_type="application/json",
+                response_json_schema=schema,
+                max_output_tokens=MAX_OUTPUT_TOKENS,
+            ),
+        ).text
+    assert_verdict(text)
 
 
 @pytest.mark.smoke

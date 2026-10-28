@@ -275,6 +275,10 @@ journeys against the published registry digest named in its manifest.
 - Automatic rollback stops when the new release has emitted an irreversible
   durable format or contract. The incident commander then chooses roll-forward
   remediation or verified restore; deployment automation does not guess.
+- Scribe WAL v9 is such a boundary. A v9 release reads and retires v8 WAL in
+  place but writes only v9, which a v8 release refuses at startup. Roll a
+  Scribe volume back to a v8 release only after every v9 segment on it has
+  retired, or restore it.
 
 ## Local server bundles
 

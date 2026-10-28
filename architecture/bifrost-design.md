@@ -564,19 +564,34 @@ hash(data_tenant_id, canonical_table, wyrd_batch_id)
 ```
 
 reduced modulo the shard count. Distinct batches for one table use all shards;
-retries use the recorded shard. Each shard owns a bounded mailbox, its own WAL
-stream, memtable buckets, and cohort state. Shards are a pod-local concurrency
+retries use the recorded shard. Each shard owns a bounded mailbox, memtable
+buckets, and cohort state, and appends to the process's one WAL stream. Shards are a pod-local concurrency
 topology, not tenant partitions or table reservations. Replay maps a recorded
 shard onto the running count, so the count may change across restarts.
 
-Each shard rotates its WAL and memtable together when the WAL reaches
-`WYRD_MAX_FILE_SIZE_ON_DISK` (MiB), the memtable reaches
+Each shard rotates its WAL generation and memtable together when the WAL bytes
+it appended since its last rotation reach `WYRD_MAX_FILE_SIZE_ON_DISK` (MiB), the memtable reaches
 `WYRD_MAX_FILE_SIZE_IN_MEMORY` (MiB), or the generation reaches
 `WYRD_MAX_FILE_RETENTION_TIME` (seconds). Each trigger reads its own counter;
 no byte is charged to two triggers. WAL disk is provisioned rather than
 tracked: there is no global disk ledger, and an out-of-space write surfaces as
 retryable `507` pressure. Memory stays under the global admission governor
 because it competes with queries.
+
+The process writes one v9 WAL stream that every shard appends to. Each record
+names its writing shard in a header byte the record CRC covers, and replay
+routes by that byte. The stream's segments live in `shard-00` under the v8
+segment naming. One segment sync makes every append before it durable, so a
+shard whose appends another shard's sync already covered skips its own
+fdatasync. Each shard still completes its commands in order (append, sync the
+touched segments, fence, insert and publish, acknowledge) with at most one
+unresolved cycle; a failed shared sync faults the WAL and acknowledges no shard
+that waited on it. Each shard's active generation holds one retirement
+reference on every segment it appended to. Rotation hands those segments to
+the rotated cohort and then drops the generation's references. A segment is
+deleted only when it is no longer current and no generation, cohort, or replay
+pin holds it; a released segment retained again before its deferred deletion
+runs is kept.
 
 Shard owners, reconciliation, staging, assembly, and persistence run on one
 dedicated Scribe Tokio runtime separated from request serving. One non-cloneable
@@ -607,7 +622,7 @@ The principal size boundaries are independent:
 
 | Boundary | Rule |
 |---|---|
-| WAL segment | `WYRD_MAX_FILE_SIZE_ON_DISK`, 512 MiB default per shard WAL file |
+| WAL segment | `WYRD_MAX_FILE_SIZE_ON_DISK`, 512 MiB default per WAL segment and per shard generation's own appended bytes |
 | Active shard generation | `WYRD_MAX_FILE_SIZE_IN_MEMORY`, 512 MiB default per shard, plus age and pressure |
 | Ingest request | one `scribe.ingest_request_bytes` wire ceiling, 16 MiB default |
 | Ingest expanded data | derived 4x the wire ceiling (64 MiB default), enforced before WAL; no row cap |
@@ -788,12 +803,15 @@ fence authority never permits speculative suppression. Preserve genuinely
 unfenced complete-commit recovery under its recorded version. No abort record,
 truncation workaround or second replay ledger is introduced.
 
-A shard keeps up to two retired WAL files and overwrites them as its next
+The stream keeps up to two retired WAL files and overwrites them as its next
 segments, so appends reuse allocated blocks rather than growing a file. Every
 record carries its segment's sequence tag; a record left from a file's earlier
 use therefore reads as the end of the segment, and an acknowledged COMMIT
-beyond it fails replay closed. Each shard's WAL directory holds a manifest of
-per-seal-key watermarks at or below which replay skips that shard's records.
+beyond it fails replay closed. Each shard's `shard-NN` directory holds a
+manifest of per-seal-key watermarks at or below which replay skips that shard's
+records, keyed by the record's shard even though v9 segments of every shard
+live in `shard-00`; one shard's watermark never suppresses another shard's
+records in a shared segment.
 Staging does not write it, because a live staged record is itself the evidence
 for its WAL range: the range is folded into its own shard's manifest before
 retirement removes the record and once at startup before replay, and a replay
@@ -801,11 +819,21 @@ retirement folds its watermark before its segments retire. A watermark never
 spans shards: every shard draws LSNs from the stream's one counter and
 `file_list` rows carry no shard.
 Because SLICE and COMMIT records share one sync, a crash may leave a complete
-but invalid record in a shard's unsynced tail. Replay ends that shard's chain
-at the first such record in its last segment, as it does a torn tail, only
-when the shard stream's newest durable batch fence lies before it; a bad
+but invalid record in the stream's unsynced tail. Replay ends the stream's
+chain at the first such record in its last segment, as it does a torn tail,
+only when the stream's newest durable batch fence lies before it; a bad
 record preceding an acknowledged COMMIT, in an earlier segment, or with no
 fence authority available fails closed.
+
+Upgrading from WAL v8 is in place. A v8 stream wrote one stream per shard in
+`shard-NN`, each segment header naming its shard. Startup reads each segment
+with the decoder for its header version, routes v8 records by the header shard,
+and retires v8 segments only through the same watermark and publication path
+as v9; an upgrade never rewrites or deletes a v8 file. A record's version must
+equal its segment's, and new segments are written only as v9. Downgrading
+across this boundary is unsupported: a v8 binary discovers v9 segments in
+`shard-00` and refuses them as an unsupported WAL version, so rolling back
+requires every v9 segment to have retired first, or a verified restore.
 
 Shutdown closes admission and mailboxes, rotates nonempty generations, stages
 immutable ownership, and drains admitted work within the server deadline. It

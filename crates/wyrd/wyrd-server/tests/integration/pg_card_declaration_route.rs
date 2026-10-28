@@ -5463,3 +5463,225 @@ async fn hydration_requires_recorded_envelope() {
 
     server.shutdown().await.expect("test server shuts down");
 }
+
+/// Read `card_uid`'s lifecycle status, reconciliation kind, and
+/// reconciliation status.
+///
+/// # Panics
+/// Panics when the tenant connection, read, or commit fails.
+async fn cleanup_state(server: &WyrdTestServer, card_uid: &CardUid) -> (String, String, String) {
+    let mut conn = server
+        .tenant_conn_for(server.data_tenant_id())
+        .await
+        .expect("tenant connection opens");
+    let state = sqlx::query_as(
+        "SELECT status, reconcile_kind, reconcile_status FROM wyrd.cards WHERE card_uid = $1",
+    )
+    .bind(card_uid.as_uuid())
+    .fetch_one(&mut **conn.transaction())
+    .await
+    .expect("cleanup state reads");
+    conn.commit().await.expect("cleanup read commits");
+    state
+}
+
+/// Poll `card_uid` until `done` accepts its cleanup state, returning it.
+///
+/// # Panics
+/// Panics when the state is not reached within ten seconds.
+async fn wait_for_cleanup_state(
+    server: &WyrdTestServer,
+    card_uid: &CardUid,
+    done: impl Fn(&(String, String, String)) -> bool,
+) -> (String, String, String) {
+    for _ in 0..100 {
+        let state = cleanup_state(server, card_uid).await;
+        if done(&state) {
+            return state;
+        }
+        sleep(Duration::from_millis(100)).await;
+    }
+    panic!(
+        "cleanup did not reach the expected state; got {:?}",
+        cleanup_state(server, card_uid).await
+    );
+}
+
+#[tokio::test(flavor = "current_thread")]
+/// Failed-declaration cleanup records its deletion before it finishes.
+///
+/// A pending two-file Card completes `a.txt` while `b.txt`'s upload
+/// expires. The reconciler's first cleanup removes `a.txt`'s bytes and
+/// fails the Card while the inventory refuses writes, so neither that
+/// attempt nor the claimed cleanup retry acknowledges the deletion and the
+/// Card stays Failed with cleanup pending; once writes are admitted again a
+/// claimed retry records the deletion and only then clears, and a replayed
+/// `a.txt` completion cannot restore the file.
+///
+/// # Panics
+/// Panics when setup, a request, a lifecycle read, or an inventory call
+/// fails, or when cleanup finishes before recording the deletion, the bytes
+/// survive, or the replayed completion revives the file.
+async fn compensation_records_inventory_deletion() {
+    let storage_root = tempfile::tempdir().expect("storage root creates");
+    let server = WyrdTestServer::builder()
+        .with_storage_settings(StorageSettings {
+            backend: BackendConfig::Local {
+                root: storage_root.path().to_path_buf(),
+            },
+            require_encryption: false,
+            presign_ttl: Duration::from_mins(10),
+            part_size_bytes: 16 * 1024 * 1024,
+            multipart_threshold_bytes: 100 * 1024 * 1024,
+        })
+        .with_limits_for_test(wyrd_server::state::LimitsConfig {
+            timeout: Duration::from_secs(4),
+            ..wyrd_server::state::LimitsConfig::default()
+        })
+        .start_bound()
+        .await
+        .expect("bound test server starts");
+    let Bootstrap::User { jwt, .. } = server
+        .bootstrap_user("compensation-writer", &["editor"])
+        .await
+        .expect("writer bootstraps")
+    else {
+        panic!("user bootstrap returned a non-user principal");
+    };
+    let artifact = |path: &str, bytes: &[u8]| {
+        json!({
+            "relative_path": path,
+            "sha256": base64::engine::general_purpose::STANDARD.encode(sha2::Sha256::digest(bytes)),
+            "size_bytes": bytes.len(),
+            "content_type": "text/plain"
+        })
+    };
+    let (status, body) = send_json(
+        &server,
+        &jwt,
+        request_with_body(
+            "compensation-cleanup",
+            json!({ "submissions": [{
+                "apiVersion": "wyrd/v1", "kind": "Prompt",
+                "metadata": { "name": "compensation-cleanup", "version": "1.0.0" },
+                "spec": { "provider": "openai", "model": "gpt-4o", "messages": [{"role": "user", "content": "hello"}] },
+                "artifacts": [artifact("a.txt", b"a"), artifact("b.txt", b"b")]
+            }] }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    let card_uid: CardUid = serde_json::from_value(body["outcomes"][0]["card_ref"]["uid"].clone())
+        .expect("response contains card UID");
+    let entries = body["upload_plans"][0]["entries"]
+        .as_array()
+        .expect("upload plan lists entries");
+    let entry = |path: &str| {
+        entries
+            .iter()
+            .find(|entry| entry["relative_path"] == path)
+            .expect("upload plan names the file")
+    };
+    let upload_a: Uuid = entry("a.txt")["upload_id"]
+        .as_str()
+        .and_then(|id| id.parse::<UploadId>().ok())
+        .and_then(|id| id.as_uuid().ok())
+        .expect("a.txt names its upload");
+    let upload_b: Uuid = entry("b.txt")["upload_id"]
+        .as_str()
+        .and_then(|id| id.parse::<UploadId>().ok())
+        .and_then(|id| id.as_uuid().ok())
+        .expect("b.txt names its upload");
+    let put = Request::builder()
+        .method(Method::PUT)
+        .uri(
+            entry("a.txt")["plan"]["data"]["put_url"]
+                .as_str()
+                .expect("local plan names its URL"),
+        )
+        .body(Body::from("a"))
+        .expect("upload request builds");
+    let (status, body) = send_json(&server, &jwt, put).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let (status, body) = send_json(&server, &jwt, complete_request(upload_a)).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let (_, path_a) = completed_upload(&server, &card_uid).await;
+    let mut conn = server
+        .tenant_conn_for(server.data_tenant_id())
+        .await
+        .expect("tenant connection opens");
+    sqlx::query(
+        "UPDATE wyrd.storage_multipart_uploads \
+         SET expires_at = statement_timestamp() - interval '1 second' WHERE id = $1",
+    )
+    .bind(upload_b)
+    .execute(&mut **conn.transaction())
+    .await
+    .expect("b.txt upload expires");
+    conn.commit().await.expect("expiry commits");
+    assert!(storage_root.path().join(&path_a).exists());
+
+    server
+        .trip_bifrost_wal_disk_full_for_test()
+        .expect("the WAL breaker is reachable");
+    make_reconciliation_due(&server, &card_uid).await;
+    let refused = wait_for_cleanup_state(&server, &card_uid, |state| state.0 == "failed").await;
+    assert_eq!(refused.1, "cleanup");
+    assert_ne!(
+        refused.2, "idle",
+        "cleanup finished before its deletion was recorded"
+    );
+    assert!(!storage_root.path().join(&path_a).exists());
+    wait_for_reconciliation_state(&server, &card_uid, 1, "pending").await;
+    assert_eq!(
+        cleanup_state(&server, &card_uid).await,
+        (
+            "failed".to_owned(),
+            "cleanup".to_owned(),
+            "pending".to_owned()
+        ),
+        "a refused claimed retry keeps the Card Failed with cleanup pending"
+    );
+
+    server
+        .clear_bifrost_wal_disk_full_injection_for_test()
+        .expect("the WAL breaker is reachable");
+    server.flush_bifrost().await.expect("staged rows publish");
+    let mut finished = cleanup_state(&server, &card_uid).await;
+    for _ in 0..100 {
+        if finished.2 != "pending" && finished.2 != "leased" {
+            break;
+        }
+        make_reconciliation_due(&server, &card_uid).await;
+        sleep(Duration::from_millis(100)).await;
+        finished = cleanup_state(&server, &card_uid).await;
+    }
+    assert_eq!(finished.0, "failed");
+    assert_eq!(finished.2, "idle");
+
+    let stale = ObjectFact {
+        storage_path: path_a,
+        upload_id: Some(UploadId::from_uuid(upload_a).to_string()),
+        backend: server.state().storage.backend().to_string(),
+        sha256: Some(base64::engine::general_purpose::STANDARD.encode(sha2::Sha256::digest(b"a"))),
+        size_bytes: 1,
+        content_type: Some("text/plain".to_owned()),
+        sse_marker: None,
+        origin: ObjectOrigin::CardFile,
+        card_uid: Some(card_uid.clone()),
+        relative_path: Some("a.txt".to_owned()),
+        state: ObjectState::Completed,
+    };
+    ObjectInventory::new(server.state())
+        .record(server.data_tenant_id(), Attribution::unresolved(), &[stale])
+        .await
+        .expect("a replayed completion records");
+    let objects = ObjectInventory::new(server.state())
+        .card_objects(server.data_tenant_id(), &card_uid)
+        .await
+        .expect("inventory reads");
+    assert!(objects.deleted);
+    assert!(objects.files.is_empty());
+
+    server.shutdown().await.expect("test server shuts down");
+}

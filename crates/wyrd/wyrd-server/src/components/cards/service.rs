@@ -1960,7 +1960,13 @@ pub(crate) async fn reconcile_card_claim(
             &completion_state.manifests,
         )
         .await;
-        commit_card_failure(state, caller, &card_uid, cleanup_failures.is_empty()).await?;
+        commit_card_failure(
+            state,
+            caller,
+            &completion_state.card,
+            cleanup_failures.is_empty(),
+        )
+        .await?;
         if !cleanup_failures.is_empty() {
             return Err(WyrdError::RegistryArtifactVerifyFailed {
                 message: "card registration cleanup remains incomplete".to_owned(),
@@ -2303,7 +2309,13 @@ async fn abort_card(
         &completion_state.manifests,
     )
     .await;
-    commit_card_failure(state, caller, card_uid, cleanup_failures.is_empty()).await?;
+    commit_card_failure(
+        state,
+        caller,
+        &completion_state.card,
+        cleanup_failures.is_empty(),
+    )
+    .await?;
     if !cleanup_failures.is_empty() {
         return Err(WyrdError::RegistryArtifactVerifyFailed {
             message: "card registration cleanup was incomplete".to_owned(),
@@ -2665,26 +2677,43 @@ async fn cleanup_manifest_artifact(
     Ok(())
 }
 
-/// Persist the Pending→Failed lifecycle transition in one tenant transaction.
+/// Persist the Pending→Failed lifecycle transition, then finish cleanup once
+/// its deletion is recorded.
+///
+/// The Failed row commits with cleanup reconciliation pending before the
+/// object inventory records `card`'s deletion; only after both physical
+/// cleanup succeeded and that deletion was acknowledged is cleanup marked
+/// finished. A failed, refused, or cancelled deletion write leaves the Card
+/// durably Failed with cleanup pending, so the claimed cleanup retry
+/// re-runs physical cleanup and records the deletion.
 ///
 /// Cleanup evaluates no principal permission — the caller's `card:write`
 /// decision was already audited when declaration was received — so the durable
 /// record it owes is the failed card row plus structured diagnostics.
+///
+/// # Errors
+/// Returns the registry unavailable error of either transaction and the
+/// inventory's retryable write failure; the Failed transition has already
+/// committed when the latter two occur.
 async fn commit_card_failure(
     state: &AppState,
     caller: &Caller,
-    card_uid: &CardUid,
+    card: &ParsedCardRow,
     cleanup_succeeded: bool,
 ) -> Result<bool, WyrdError> {
+    let card_uid = &card.card_uid;
     let mut conn = state.registry_tenant_conn(caller.data_tenant_id).await?;
     let failed = fail_card(&mut conn, card_uid).await?;
-    if failed {
-        if cleanup_succeeded {
-            mark_card_reconciliation_succeeded(&mut conn, card_uid, None).await?;
-        }
-        tracing::warn!(%card_uid, cleanup_succeeded, "card registration failed and was cleaned up");
-    }
     conn.commit().await.map_err(registry_db_error)?;
+    if failed {
+        tracing::warn!(%card_uid, cleanup_succeeded, "card registration failed and was cleaned up");
+        if cleanup_succeeded {
+            record_card_deletion(state, caller, card).await?;
+            let mut conn = state.registry_tenant_conn(caller.data_tenant_id).await?;
+            mark_card_reconciliation_succeeded(&mut conn, card_uid, None).await?;
+            conn.commit().await.map_err(registry_db_error)?;
+        }
+    }
     Ok(failed)
 }
 

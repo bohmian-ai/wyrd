@@ -65,6 +65,8 @@ A step's result is `steps.<id>.output`.
 
 ### Actions
 
+When to use each kind is in [Steps and checks](/understand/how-verification-works/#steps-and-checks).
+
 | `kind` | Fields | Output |
 | --- | --- | --- |
 | `extract` | `from`: a `media` slot | The file's text and structure, in the shape [Extraction output](/reference/extraction-output/) gives for its format |
@@ -86,6 +88,8 @@ A requirement ends `passed`, `failed`, `inconclusive`, or `not_applicable`.
 | `check` | [check](#checks) | How the claim is decided |
 
 ### Checks
+
+When to use each kind is in [Steps and checks](/understand/how-verification-works/#steps-and-checks).
 
 | `kind` | Fields | Decides by |
 | --- | --- | --- |

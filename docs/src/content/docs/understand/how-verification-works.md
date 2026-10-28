@@ -1,6 +1,6 @@
 ---
 title: How verification works
-description: Inputs, steps, requirements, and decide; verify versus submit; executions, verdicts, results, and Operators.
+description: Inputs, steps, requirements, and decide; Agent workspaces; verify versus submit; executions, verdicts, results, and Operators.
 pillar: wyrd
 section: Understand
 order: 2
@@ -25,7 +25,30 @@ A Verifier never names what it checks. A binding supplies the subject, so one Ve
 
 <WyrdDiagram name="verification-parts" />
 
-`assert`, `trace`, `drift`, and `extract` run in the server's check engine. `code` runs sandboxed Python in the Monty pool, a fresh worker per call that the server starts from its own binary. `agent` runs an Agent whose model calls go through the LLM gateway; a step Agent can call [built-in tools](/reference/agent-tools-and-authorization/), and a check Agent only `bifrost.query`.
+## Steps and checks
+
+A step prepares evidence, such as the text of a PDF, and its output feeds later steps and checks. A check decides one requirement. Each has a `kind`, and some kinds only make sense in one role:
+
+| Kind | Used as | Produces or decides | Use it when | Runs in |
+| --- | --- | --- | --- | --- |
+| `assert` | check | Compares one value from an input or step output with an operator | The rule is a field comparison: a status equals `approved`, a reply does not contain "guaranteed" | Check engine |
+| `trace` | check | Compares values selected from the spans of a trace | The rule is about what your code did, such as calling the order lookup before replying | Check engine |
+| `drift` | check | Compares a window of samples with a baseline | You care whether inputs or outputs shift over time, not whether one answer is right | Check engine, on a schedule |
+| `extract` | step | The text and structure of a file | A later check or Agent needs to read a PDF, DOCX, XLSX, or other document | Check engine |
+| `code` | step or check | As a step, JSON; as a check, a verdict | The rule is deterministic, but no operator expresses it | Monty pool |
+| `agent` | step or check | As a step, the Agent's response; as a check, a verdict | The rule needs judgment: meaning, tone, or policy | LLM gateway |
+
+Start with the cheapest kind that catches the failure. The check engine needs no model and no Python; an `agent` check costs a model call each time it runs.
+
+The Monty pool is sandboxed Python: a fresh worker per call that the server starts from its own binary. An `agent` step or check runs an Agent whose model calls go through the LLM gateway. Step and check Agents follow the same rules: each can call the [built-in tools](/reference/agent-tools-and-authorization/) it declares, and every call still needs its own grants. [Recipes](/build-and-verify/verify/verifier-recipes/) has a working Verifier for each kind.
+
+## Workspaces
+
+An Agent that reads files works in a workspace. The Verifier maps paths under `/inputs` to evidence: an input slot such as `inputs.policy`, or files of an uploaded Artifact Card. The Agent explores them with `fs.list`, `fs.read`, and `fs.search`, and can run `code.run` over them.
+
+An Artifact selection is part of the Verifier version. Uploading a newer version of that Artifact does not change what the Verifier reads, and a caller cannot replace the files at run time. To judge new files, publish a new Verifier version that names them. A selection that matches no file fails before any model call.
+
+Files are mounted unchanged and unparsed. `fs.read` and `fs.search` serve raw text, so they refuse or skip a PDF until the Agent calls `fs.extract`, which writes its extraction JSON under `/work`. `/work` is scratch for one call and is never evidence: a citation names the `/inputs` file's `attachment_<n>` slot, not a `/work` path. [Uploaded files](/build-and-verify/verify/verifier-recipes/#uploaded-files) shows the upload and the mount.
 
 ## Bindings
 
@@ -55,6 +78,8 @@ Drift Verifiers judge samples over a time window, so they refuse `verify`. Their
 With `all`, any failed requirement fails the Verifier. Otherwise any inconclusive requirement makes it inconclusive. Otherwise it passes. Requirements that are `not_applicable` do not count, and a Verifier with no applicable requirement is inconclusive.
 
 `inconclusive` means no judgment was possible, such as missing evidence or an error inside a check. It is never a pass, and never a claim that the subject failed.
+
+An `agent` or `code` check can also return a `data` object beside its verdict, such as a score or labels, when its `response_format` declares a schema for it. The server checks the whole response against that schema. A response that does not match makes the requirement `inconclusive` and keeps no data, so a requirement's `data` is either valid or absent. [Custom data](/reference/verifier-card/#custom-data) has the schema rules and size limits.
 
 <WyrdDiagram name="run-lifecycle" />
 

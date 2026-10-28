@@ -328,7 +328,7 @@ export const verificationParts: DiagramSpec = {
       nodes: ['steps', 'reqs', 'agent', 'tools', 'monty', 'gateway', 'model'],
       edges: ['xa', 'at', 'tm', 'ag', 'gm'],
       caption:
-        'An <code>agent</code> step or check runs an Agent whose model calls go through the LLM gateway with your provider key. A step Agent can call built-in tools: <code>cards.*</code>, <code>bifrost.*</code>, <code>fs.*</code> over a scratch copy of the inputs, and <code>code.run</code> in the Monty pool. A check Agent may use only <code>bifrost.query</code>, and its pass must cite the evidence.'
+        'An <code>agent</code> step or check runs an Agent whose model calls go through the LLM gateway with your provider key. Step and check Agents can call the built-in tools they declare: <code>cards.*</code>, <code>bifrost.*</code>, <code>fs.*</code> over the files mounted in their workspace, and <code>code.run</code> in the Monty pool. A check Agent’s pass must cite the evidence.'
     },
     {
       label: 'Verdict',

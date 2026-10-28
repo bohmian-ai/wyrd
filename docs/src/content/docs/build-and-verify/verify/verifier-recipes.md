@@ -10,18 +10,18 @@ status: runnable
 
 Pick the check you need, bind its Verifier under `verified_by` to what it checks (a Service, one of its Agents, Models, or Data, or a standalone Agent), and call it from your code. Each recipe's Python declares `support-reply.yaml`, a Service that binds the recipe's Verifier, as in [Run your first verification](/get-started/quickstart/).
 
-| To check | Use |
-| --- | --- |
-| Fields of an answer | [Assertions](#assertions) |
-| That your code took the right steps | [Trace](#trace) |
-| Logic an operator cannot express | [Python check](#python-check) |
-| Meaning, tone, or policy | [Model judge](#model-judge) |
-| An answer against a document | [Multi-step](#multi-step) |
-| An answer against files you upload once | [Uploaded files](#uploaded-files) |
-| A whole conversation, not one reply | [Grouped session](#grouped-session) |
-| Inputs or outputs shifting over time | [Drift](#drift) |
+| To check | Use | Kind |
+| --- | --- | --- |
+| Fields of an answer | [Assertions](#assertions) | `assert` |
+| That your code took the right steps | [Trace](#trace) | `trace` |
+| Logic an operator cannot express | [Python check](#python-check) | `code` |
+| Meaning, tone, or policy | [Model judge](#model-judge) | `agent` |
+| An answer against a document | [Multi-step](#multi-step) | `extract` and `code` steps, then `assert` |
+| An answer against files you upload once | [Uploaded files](#uploaded-files) | `agent` with a workspace |
+| A whole conversation, not one reply | [Grouped session](#grouped-session) | `assert` over a group |
+| Inputs or outputs shifting over time | [Drift](#drift) | `drift` |
 
-Start with the cheapest check that catches the failure. A model judge costs a model call per requirement; an assertion costs nothing.
+[Steps and checks](/understand/how-verification-works/#steps-and-checks) explains each kind. Start with the cheapest check that catches the failure. A model judge costs a model call per requirement; an assertion costs nothing.
 
 ## Assertions
 

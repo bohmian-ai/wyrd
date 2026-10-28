@@ -37,6 +37,9 @@ class Desk:
         # ANCHOR: init
         self.client = client or WyrdClient()
         self.state = WyrdState.from_path(BUNDLE, self.client)
+        # The Service name, version, and environment every span, gateway call, and
+        # verification carries. Name and version come from the bundle.
+        self.state.configure(deployment_environment="development")
         self.state.start_bifrost()
         # Spans export to Wyrd through the SDK's OTLP exporter; the Agents SDK's
         # own traces become spans too, under the request's Run.

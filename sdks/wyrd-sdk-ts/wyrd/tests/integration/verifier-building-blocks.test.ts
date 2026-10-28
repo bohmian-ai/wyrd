@@ -15,8 +15,8 @@
 // and check; scoped and delegated principals exercise every tool grant.
 // `handbook-desk`'s judges mount an uploaded, extracted Artifact and cite the
 // line `fs.read` returned.
-import { randomBytes } from "node:crypto";
-import { mkdtempSync, writeFileSync } from "node:fs";
+import { createHash, randomBytes } from "node:crypto";
+import { mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 
@@ -601,6 +601,44 @@ test("every format extracts its locked output", async ({ desk }) => {
   }
 });
 
+test("file inputs use shared uploads", async ({ server, desk }) => {
+  const path = fixture("cards/verifier_building_blocks/samples/sample.csv");
+  const inMemory = new TextEncoder().encode("a,b\n3,4");
+  const files: ReadonlyArray<readonly [ReturnType<typeof verify.File.path>, unknown]> = [
+    [
+      verify.File.path(path),
+      [
+        ["a", "b"],
+        ["1", "2"],
+      ],
+    ],
+    [
+      verify.File.bytes(inMemory, { format: "csv" }),
+      [
+        ["a", "b"],
+        ["3", "4"],
+      ],
+    ],
+  ];
+  for (const [document, rows] of files) {
+    const result = await desk.state.run().observe.verify("document-formats", { document });
+    expect(step(result, "read").output).toEqual({ format: "csv", rows });
+  }
+
+  const token = await WyrdClient.connect().accessToken();
+  for (const content of [readFileSync(path), inMemory]) {
+    const response = await fetch(`${server.baseUrl}/v1/verification/evidence`, {
+      method: "POST",
+      headers: { "x-wyrd-access-token": `Bearer ${token}`, "content-type": "application/json" },
+      body: JSON.stringify({
+        files: [{ sha256: createHash("sha256").update(content).digest("hex"), size_bytes: content.length }],
+      }),
+    });
+    expect(response.status).toBe(200);
+    expect(((await response.json()) as { uploads: unknown[] }).uploads).toEqual([]);
+  }
+});
+
 test("document passed positionally fills the only slot", async ({ desk }) => {
   const result = await desk.state
     .run()
@@ -792,7 +830,9 @@ test("custom_verdict_data_survives_readback", async ({ server, desk }) => {
     expect(rows).toHaveLength(1);
     return JSON.parse(rows[0]?.output ?? "null").requirements;
   };
-  expect(await retained(waited.execution_id), "the retained output keeps its data").toEqual(waited.outcome.requirements);
+  expect(await retained(waited.execution_id), "the retained output keeps its data").toEqual(
+    waited.outcome.requirements,
+  );
 
   for (const [marker, data] of Object.entries(EXACT_DATA)) {
     const text = `${marker} refunds`;

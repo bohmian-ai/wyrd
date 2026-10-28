@@ -129,6 +129,38 @@ pub fn evidence(
     }
 }
 
+/// Validate a stored verification File object path.
+///
+/// Accepts exactly `<tenant>/evidence/sha256/<digest>` for
+/// `caller_data_tenant_id`, the path [`evidence`] builds. Card paths are
+/// refused, so a File upload never names a Card object.
+///
+/// # Errors
+/// Returns [`TenantPathError::TenantMismatch`] for another tenant's path and
+/// [`TenantPathError::ShapeMismatch`] for any other shape.
+pub fn validate_evidence(
+    path: &str,
+    caller_data_tenant_id: DataTenantId,
+) -> Result<ValidatedPath, TenantPathError> {
+    let shape = || TenantPathError::ShapeMismatch(path.to_owned());
+    let (tenant, digest) = path
+        .split_once("/evidence/sha256/")
+        .ok_or_else(shape)?;
+    let tenant = parse_prefix(tenant)?;
+    if tenant != caller_data_tenant_id {
+        return Err(TenantPathError::TenantMismatch {
+            prefix: tenant,
+            caller: caller_data_tenant_id,
+        });
+    }
+    let sha256 = wyrd_spec::auth::Sha256Hex::new(digest).map_err(|_| shape())?;
+    let validated = evidence(tenant, &sha256);
+    if validated.full != path {
+        return Err(shape());
+    }
+    Ok(validated)
+}
+
 /// Validate a full tenant-scoped object path.
 ///
 /// `caller_data_tenant_id` must come from a verified identity claim.
@@ -200,6 +232,22 @@ mod tests {
         assert_eq!(validated.data_tenant_id, tenant);
         assert_eq!(validated.card_uid, card_uid);
         assert_eq!(validated.relative_path, "models/model.bin");
+    }
+
+    /// Only the exact evidence shape of the caller's tenant validates as a
+    /// File object path.
+    #[test]
+    fn validate_evidence_accepts_only_own_tenant_digest_paths() {
+        let tenant = DataTenantId::new_v7();
+        let sha256 = wyrd_spec::auth::Sha256Hex::digest(b"evidence");
+        let path = super::evidence(tenant, &sha256);
+
+        assert_eq!(super::validate_evidence(&path.full, tenant).ok(), Some(path.clone()));
+        assert!(super::validate_evidence(&path.full, DataTenantId::new_v7()).is_err());
+        assert!(super::validate_evidence(&path.full.to_uppercase(), tenant).is_err());
+        let card = build(tenant, &uuid::Uuid::now_v7().to_string(), "evidence/sha256/x");
+        assert!(super::validate_evidence(&card, tenant).is_err());
+        assert!(super::validate_evidence(&format!("{}/x", path.full), tenant).is_err());
     }
 
     #[test]

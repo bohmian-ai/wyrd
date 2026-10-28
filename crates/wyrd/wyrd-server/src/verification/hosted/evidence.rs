@@ -2,10 +2,10 @@
 //!
 //! [`TenantEvidence`] is the one byte reader for file evidence, registered
 //! Artifact files, and Artifact code, and the one citation validator over an
-//! execution's pinned input slots. A file is read from
-//! `<tenant>/evidence/sha256/<digest>`; an Artifact file is resolved through
-//! the registry's authorized, audited Card read and its server-owned
-//! inventory. Either read is bounded by the expected length and the file
+//! execution's pinned input slots. A file is read from the location its
+//! completed File upload recorded in the object inventory; an Artifact file
+//! is resolved through the registry's authorized, audited Card read and its
+//! server-owned inventory. Either read is bounded by the expected length and the file
 //! limit and returns bytes only when their length and SHA-256 match, and
 //! evidence also only when its sniffed format matches, so a mismatched file
 //! can never feed a pass. Extraction, workspaces, citations, and native media all read through
@@ -37,6 +37,7 @@ use super::{HostedLimits, extract_refused};
 use crate::components::auth::Caller;
 use crate::components::cards::routes::get_card_by_ref_for;
 use crate::components::cards::service::list_card_artifacts;
+use crate::components::storage::inventory::ObjectInventory;
 use crate::state::AppState;
 
 /// Reads one execution's pinned evidence from its tenant's storage.
@@ -157,7 +158,7 @@ impl TenantEvidence {
                 format,
                 ..
             } => {
-                let path = tenant_path::evidence(self.caller.data_tenant_id, sha256);
+                let path = self.file_object(sha256, *size_bytes).await?;
                 (self.stored(&path, *size_bytes, sha256).await?, *format)
             }
             InputDeclaration::Artifact { artifact, path } => {
@@ -179,6 +180,33 @@ impl TenantEvidence {
             });
         }
         Ok((bytes, format))
+    }
+
+    /// The recorded location of the completed File upload of `sha256` and
+    /// `size`.
+    ///
+    /// The location comes only from the tenant's object inventory; a File
+    /// with no visible completed record is not ready, never a path guess.
+    ///
+    /// # Errors
+    /// Returns [`BlockError::Retryable`] when the inventory holds no such
+    /// completed File upload yet or cannot be read now.
+    async fn file_object(&self, sha256: &Sha256Hex, size: u64) -> Result<ValidatedPath, BlockError> {
+        match ObjectInventory::new(&self.state)
+            .file_object(self.caller.data_tenant_id, sha256, size)
+            .await
+        {
+            Ok(Some(path)) => Ok(path),
+            Ok(None) => Err(BlockError::Retryable {
+                reason: "the evidence file has no completed upload record yet".to_owned(),
+            }),
+            Err(error) => {
+                tracing::warn!(code = error.code(), "the evidence inventory cannot be read");
+                Err(BlockError::Retryable {
+                    reason: "the evidence inventory cannot be read now".to_owned(),
+                })
+            }
+        }
     }
 
     /// The verified bytes of one file of exact Artifact `card`, and the

@@ -5,9 +5,10 @@
 //! JSON value fills a `json` slot, a trace-ID string a `trace` slot, a
 //! [`File`] or [`ArtifactRef`] a `media` slot, and a feature object a
 //! `samples` slot. Files are hashed and uploaded only here, during the call:
-//! the evidence route plans uploads for missing digests and the storage
-//! client sends the bytes straight to tenant object storage, so file contents
-//! never travel in the execution request. Run evidence executes now
+//! the evidence route opens shared upload sessions for digests the tenant
+//! holds no completed File upload of, and the storage client transfers and
+//! completes each one exactly like an Artifact file, so file contents never
+//! travel in the execution request. Run evidence executes now
 //! (`verify`) or is queued (`submit`); Window samples are recorded through
 //! the existing Drift observation path and judged later by the schedule.
 
@@ -531,15 +532,17 @@ impl RunEvidence {
             let Some(source) = sources.get(&upload.sha256) else {
                 continue;
             };
-            let key = format!("verification-evidence-{}", upload.sha256);
+            let key = format!("verification-evidence-{}", upload.upload_id);
             match source {
                 Upload::Path(path) => {
                     let source = FileSource::open(path).await?;
-                    storage.upload_evidence(&upload.plan, source, &key).await?;
+                    storage
+                        .upload_artifact(&upload.upload_id, &upload.plan, source, &key)
+                        .await?;
                 }
                 Upload::Memory(bytes) => {
                     storage
-                        .upload_evidence(&upload.plan, bytes.clone(), &key)
+                        .upload_artifact(&upload.upload_id, &upload.plan, bytes.clone(), &key)
                         .await?;
                 }
             }

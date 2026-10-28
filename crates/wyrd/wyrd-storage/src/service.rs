@@ -72,7 +72,7 @@ struct InitReplay {
 }
 
 struct PriorAbort {
-    storage_path: String,
+    validated: Result<ValidatedPath, WyrdError>,
     backend_upload_id: Option<String>,
 }
 
@@ -90,7 +90,66 @@ struct PersistUploadInit<'a> {
     wire_protocol: WireProtocol,
     backend_upload_id: &'a str,
     idempotency_key: Option<&'a IdempotencyKey>,
-    body_sha: &'a [u8; 32],
+    body_sha: Option<&'a [u8; 32]>,
+}
+
+/// Who owns one upload session, read from its persisted row.
+///
+/// Routes select the permission a follow-up operation needs from this
+/// ownership rather than from anything the request names.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum UploadOwner {
+    /// A declared file of this Card.
+    Card(CardUid),
+    /// A verification File upload, owned by no Card.
+    File,
+}
+
+/// Read the owner of `upload_id` in the caller's tenant.
+///
+/// The read runs under the caller's tenant, so another tenant's upload is
+/// indistinguishable from an absent one.
+///
+/// # Errors
+/// Returns `WYRD_STORAGE_400_INVALID_UPLOAD_ID` for an identifier this
+/// server never minted, `WYRD_STORAGE_404_UPLOAD_NOT_FOUND` for an upload
+/// absent from the caller's tenant, an internal error for a stored Card UID
+/// that does not parse, and the mapped SQL error of a failed read.
+#[instrument(skip(postgres, caller), fields(tenant = %caller.data_tenant_id, upload_id = %upload_id))]
+pub async fn upload_owner(
+    postgres: &WyrdPostgres,
+    caller: &StorageCaller,
+    upload_id: &UploadId,
+) -> Result<UploadOwner, WyrdError> {
+    let mut conn = postgres
+        .tenant_conn(caller.data_tenant_id)
+        .await
+        .map_err(|error| map_sql_error(&error))?;
+    let row = load_upload(&mut conn, upload_id_uuid(upload_id)?).await?;
+    conn.commit().await.map_err(|error| map_sql_error(&error))?;
+    row.card_uid.map_or(Ok(UploadOwner::File), |uid| {
+        CardUid::new(&uid).map(UploadOwner::Card).map_err(|error| {
+            internal_error(
+                "stored upload Card UID is invalid",
+                serde_json::json!({ "upload_id": upload_id, "error": error.to_string() }),
+            )
+        })
+    })
+}
+
+/// What one upload session stores: its owner, object path, and declared
+/// digest, size, and content type.
+struct UploadSubject<'a> {
+    /// Owning Card; `None` for a verification File upload.
+    card_uid: Option<&'a str>,
+    /// Object path below the owner's namespace.
+    relative_path: &'a str,
+    /// Declared base64 SHA-256 digest.
+    expected_sha256: &'a str,
+    /// Declared byte length.
+    expected_size_bytes: u64,
+    /// Declared content type, when known.
+    content_type: Option<&'a str>,
 }
 
 /// Initialize an artifact upload.
@@ -102,50 +161,114 @@ pub async fn upload_init(
     idempotency_key: Option<IdempotencyKey>,
     body: UploadInitRequest,
 ) -> Result<UploadInitResponse, WyrdError> {
-    let state = StorageServiceState { storage, postgres };
     let body_sha = sha256_canonical_json(&body);
-    let backend = state.storage.backend();
     let validated = validated_tenant_path(caller, &body)?;
+    let subject = UploadSubject {
+        card_uid: Some(body.card_uid.as_str()),
+        relative_path: &body.relative_path,
+        expected_sha256: &body.expected_sha256,
+        expected_size_bytes: body.expected_size_bytes,
+        content_type: body.content_type.as_deref(),
+    };
+    init_upload(
+        &StorageServiceState { storage, postgres },
+        caller,
+        idempotency_key.as_ref().map(|key| (key, &body_sha)),
+        &subject,
+        validated,
+    )
+    .await
+}
+
+/// Initialize the upload of one verification File of `sha256` and
+/// `size_bytes`.
+///
+/// The File is stored at `<tenant>/evidence/sha256/<digest>`, outside every
+/// Card, and planned, transferred, and completed exactly like a Card file:
+/// the same size limit, planner, and backend protocols apply, and its
+/// session is owned by no Card. A re-initialized File aborts its prior
+/// pending session.
+///
+/// # Errors
+/// Returns the errors of [`upload_init`].
+#[instrument(skip(storage, postgres, caller), fields(tenant = %caller.data_tenant_id, %sha256))]
+pub async fn file_upload_init(
+    storage: &StorageHandle,
+    postgres: &WyrdPostgres,
+    caller: &StorageCaller,
+    sha256: &wyrd_spec::auth::Sha256Hex,
+    size_bytes: u64,
+) -> Result<UploadInitResponse, WyrdError> {
+    let validated = tenant_path::evidence(caller.data_tenant_id, sha256);
+    let expected_sha256 = base64::engine::general_purpose::STANDARD.encode(sha256.as_bytes());
+    let relative_path = validated.relative_path.clone();
+    let subject = UploadSubject {
+        card_uid: None,
+        relative_path: &relative_path,
+        expected_sha256: &expected_sha256,
+        expected_size_bytes: size_bytes,
+        content_type: None,
+    };
+    init_upload(
+        &StorageServiceState { storage, postgres },
+        caller,
+        None,
+        &subject,
+        validated,
+    )
+    .await
+}
+
+/// Plan, record, and back one upload session for `subject` at `validated`.
+///
+/// `idempotency` is a supplied key and the canonical body digest it replays
+/// against.
+///
+/// # Errors
+/// Returns the size-limit refusal, an idempotency conflict, the backend
+/// initialization failure, and the mapped SQL errors.
+async fn init_upload(
+    state: &StorageServiceState<'_>,
+    caller: &StorageCaller,
+    idempotency: Option<(&IdempotencyKey, &[u8; 32])>,
+    subject: &UploadSubject<'_>,
+    validated: ValidatedPath,
+) -> Result<UploadInitResponse, WyrdError> {
+    let backend = state.storage.backend();
     let planned = plan_upload(
-        body.expected_size_bytes,
+        subject.expected_size_bytes,
         backend,
         state.storage.multipart_threshold_bytes(),
     )
     .map_err(|_| {
         map_storage_error(StorageError::ArtifactTooLarge {
-            actual: body.expected_size_bytes,
+            actual: subject.expected_size_bytes,
             limit: MAX_OBJECT_SIZE_BYTES,
         })
     })?;
     let wire_protocol = derive_wire_protocol(backend, planned);
 
-    let (claim_conn, replay) = claim_upload_init(
-        state.postgres,
-        caller,
-        idempotency_key.as_ref(),
-        &body,
-        &body_sha,
-    )
-    .await?;
+    let (claim_conn, replay) =
+        claim_upload_init(state.postgres, caller, idempotency, subject).await?;
     if let Some(response) = replay {
         claim_conn
             .commit()
             .await
             .map_err(|error| map_sql_error(&error))?;
-        return remint_replayed_upload_init(&state, response).await;
+        return remint_replayed_upload_init(state, response).await;
     }
 
     let mut conn = state.storage_tenant_conn(caller.data_tenant_id).await?;
-    let prior_abort = find_and_mark_prior_pending(&mut conn, &body).await?;
+    let prior_abort = find_and_mark_prior_pending(&mut conn, caller, subject).await?;
 
     let upload_id = UploadId::new();
     let upload_uuid = upload_id_uuid(&upload_id)?;
-    let counts = upload_row_counts(planned, body.expected_size_bytes, wire_protocol);
+    let counts = upload_row_counts(planned, subject.expected_size_bytes, wire_protocol);
     insert_initiating_upload(
         &mut conn,
         upload_uuid,
         &validated,
-        &body,
+        subject,
         backend,
         wire_protocol,
         counts,
@@ -154,17 +277,17 @@ pub async fn upload_init(
     conn.commit().await.map_err(|error| map_sql_error(&error))?;
 
     if let Some(prior) = prior_abort {
-        abort_prior_best_effort(&state, caller, prior).await;
+        abort_prior_best_effort(state, prior).await;
     }
 
     let init = drive_backend_init_or_mark_failed(
-        &state,
+        state,
         caller,
         upload_uuid,
         &validated,
         &upload_id,
         planned,
-        body.expected_size_bytes,
+        subject.expected_size_bytes,
     )
     .await?;
 
@@ -178,8 +301,8 @@ pub async fn upload_init(
             backend,
             wire_protocol,
             backend_upload_id: &init.backend_upload_id,
-            idempotency_key: idempotency_key.as_ref(),
-            body_sha: &body_sha,
+            idempotency_key: idempotency.map(|(key, _)| key),
+            body_sha: idempotency.map(|(_, sha)| sha),
         },
     )
     .await?;
@@ -212,11 +335,11 @@ async fn persist_upload_init(
         input.backend_upload_id,
     )
     .await?;
-    if let Some(key) = input.idempotency_key {
+    if let (Some(key), Some(body_sha)) = (input.idempotency_key, input.body_sha) {
         cache_init_seed(
             &mut conn,
             key,
-            input.body_sha,
+            body_sha,
             input.upload_id,
             input.validated,
             input.backend,
@@ -231,19 +354,17 @@ async fn persist_upload_init(
 async fn claim_upload_init<'a>(
     postgres: &'a WyrdPostgres,
     caller: &StorageCaller,
-    idempotency_key: Option<&IdempotencyKey>,
-    body: &UploadInitRequest,
-    body_sha: &[u8; 32],
+    idempotency: Option<(&IdempotencyKey, &[u8; 32])>,
+    subject: &UploadSubject<'_>,
 ) -> Result<(TenantConn<'a>, Option<InitReplay>), WyrdError> {
-    let lock_identity = idempotency_key.map_or_else(
-        || {
-            format!(
-                "artifact:{}:{}:{}",
-                body.card_uid, body.relative_path, body.expected_sha256
-            )
-        },
-        |key| format!("idempotency:{key}"),
-    );
+    let lock_identity = match (idempotency, subject.card_uid) {
+        (Some((key, _)), _) => format!("idempotency:{key}"),
+        (None, Some(card_uid)) => format!(
+            "artifact:{card_uid}:{}:{}",
+            subject.relative_path, subject.expected_sha256
+        ),
+        (None, None) => format!("file:{}:{}", subject.relative_path, subject.expected_sha256),
+    };
     let mut conn = postgres
         .tenant_conn(caller.data_tenant_id)
         .await
@@ -251,8 +372,8 @@ async fn claim_upload_init<'a>(
     wyrd_sql::queries::storage::idempotency::lock_init(&mut conn, &lock_identity)
         .await
         .map_err(|error| map_sql_error(&error))?;
-    let replay = match idempotency_key {
-        Some(key) => try_replay_idempotent_init(caller, &mut conn, key, body_sha).await?,
+    let replay = match idempotency {
+        Some((key, body_sha)) => try_replay_idempotent_init(caller, &mut conn, key, body_sha).await?,
         None => None,
     };
     Ok((conn, replay))
@@ -294,8 +415,7 @@ pub async fn upload_part_url(
             serde_json::json!({ "part_number": part_number, "max_part": max_part }),
         ));
     }
-    let validated =
-        tenant_path::validate(&row.storage_path, caller.data_tenant_id).map_err(map_tenant_path)?;
+    let validated = row_path(&row, caller.data_tenant_id)?;
     let backend_upload_id = row.backend_upload_id.ok_or_else(|| {
         internal_error(
             "pending multipart upload is missing backend_upload_id",
@@ -363,8 +483,7 @@ pub async fn upload_complete(
             return Err(WyrdStorageError::UploadNotPending.into());
         }
     };
-    let validated =
-        tenant_path::validate(&row.storage_path, caller.data_tenant_id).map_err(map_tenant_path)?;
+    let validated = row_path(&row, caller.data_tenant_id)?;
     let payload = build_complete_payload(
         &body,
         row.wire_protocol,
@@ -408,8 +527,7 @@ pub async fn reconcile_upload(
         }
         _ => return Err(WyrdStorageError::UploadNotPending.into()),
     };
-    let validated =
-        tenant_path::validate(&row.storage_path, caller.data_tenant_id).map_err(map_tenant_path)?;
+    let validated = row_path(&row, caller.data_tenant_id)?;
     finish_upload(&state, caller, upload_uuid, validated, row, replay, payload).await
 }
 
@@ -481,8 +599,7 @@ pub async fn upload_abort(
         conn.commit().await.map_err(|error| map_sql_error(&error))?;
         return Ok(AbortResponse { aborted: false });
     }
-    let validated =
-        tenant_path::validate(&row.storage_path, caller.data_tenant_id).map_err(map_tenant_path)?;
+    let validated = row_path(&row, caller.data_tenant_id)?;
     conn.commit().await.map_err(|error| map_sql_error(&error))?;
 
     if let Some(backend_upload_id) = row.backend_upload_id.as_deref()
@@ -528,8 +645,7 @@ pub async fn upload_local_blob(
             op: "local_upload",
         }));
     }
-    let validated =
-        tenant_path::validate(&row.storage_path, caller.data_tenant_id).map_err(map_tenant_path)?;
+    let validated = row_path(&row, caller.data_tenant_id)?;
     conn.commit().await.map_err(|error| map_sql_error(&error))?;
 
     let expected_size = u64::try_from(row.expected_size_bytes).map_err(|_| {
@@ -572,79 +688,6 @@ pub async fn upload_local_blob(
     };
     local
         .write_atomically(Path::new(&validated.full), body)
-        .await
-        .map_err(map_storage_error)
-}
-
-/// Mint the single-PUT plan for one content-addressed evidence object.
-///
-/// Cloud backends presign `path` directly. The local backend has no URL a
-/// client can PUT to, so it returns the root-relative authenticated route
-/// served by [`upload_local_evidence`], keyed by the digest alone: content
-/// addressing replaces the upload-session row a Card upload keeps.
-///
-/// # Errors
-/// Returns the storage error when a cloud signature fails.
-pub async fn evidence_upload_plan(
-    storage: &StorageHandle,
-    path: &ValidatedPath,
-    sha256: &wyrd_spec::auth::Sha256Hex,
-    size_bytes: u64,
-    ttl: Duration,
-) -> Result<UploadPlan, StorageError> {
-    if storage.backend() == StorageBackendKind::Local {
-        return Ok(UploadPlan::LocalFs {
-            put_url: format!("/v1/verification/evidence/local/{sha256}"),
-            ttl_secs: u32::try_from(ttl.as_secs()).unwrap_or(u32::MAX),
-        });
-    }
-    storage
-        .signer()
-        .presign_single_put(path, size_bytes, ttl)
-        .await
-}
-
-/// Write one evidence body to `<tenant>/evidence/sha256/<digest>` on the
-/// local backend.
-///
-/// The body must hash to `sha256`, so a caller can only ever write the bytes
-/// the path names; a repeated upload rewrites identical content. Writes no
-/// Postgres row.
-///
-/// # Errors
-/// Returns the storage `Sha256Mismatch` error when the body does not hash to
-/// `sha256`, an internal error when the backend is not local, and the
-/// storage error when the write fails.
-#[instrument(skip(storage, body), fields(tenant = %data_tenant_id, sha256 = %sha256))]
-pub async fn upload_local_evidence(
-    storage: &StorageHandle,
-    data_tenant_id: DataTenantId,
-    sha256: &wyrd_spec::auth::Sha256Hex,
-    body: &[u8],
-) -> Result<(), WyrdError> {
-    let actual = wyrd_spec::auth::Sha256Hex::digest(body);
-    if actual != *sha256 {
-        return Err(map_storage_error(StorageError::Sha256Mismatch {
-            expected: base64::engine::general_purpose::STANDARD.encode(sha256.as_bytes()),
-            actual: base64::engine::general_purpose::STANDARD.encode(actual.as_bytes()),
-        }));
-    }
-    #[cfg_attr(
-        not(feature = "cloud"),
-        expect(
-            irrefutable_let_patterns,
-            reason = "without `cloud` the local signer is the only backend"
-        )
-    )]
-    let crate::BackendSigner::Local(local) = storage.signer() else {
-        return Err(internal_error(
-            "local evidence route mounted for non-local backend",
-            serde_json::json!({ "backend": storage.backend() }),
-        ));
-    };
-    let path = tenant_path::evidence(data_tenant_id, sha256);
-    local
-        .write_atomically(Path::new(&path.full), body)
         .await
         .map_err(map_storage_error)
 }
@@ -737,8 +780,7 @@ async fn try_replay_idempotent_init(
         .parse()
         .map_err(|error| invalid_upload_id(&error))?;
     let row = load_upload(conn, upload_id_uuid(&upload_id)?).await?;
-    let validated = tenant_path::validate(&cached.seed.storage_path, caller.data_tenant_id)
-        .map_err(map_tenant_path)?;
+    let validated = row_path(&row, caller.data_tenant_id)?;
     let replay = UploadPlanReplayInput {
         wire_protocol: row.wire_protocol,
         backend_upload_id: row.backend_upload_id,
@@ -760,20 +802,21 @@ async fn try_replay_idempotent_init(
 
 async fn find_and_mark_prior_pending(
     conn: &mut TenantConn<'_>,
-    body: &UploadInitRequest,
+    caller: &StorageCaller,
+    subject: &UploadSubject<'_>,
 ) -> Result<Option<PriorAbort>, WyrdError> {
     let prior = multipart_uploads::find_pending_for_dedupe(
         conn,
-        body.card_uid.as_str(),
-        body.relative_path.as_str(),
-        &body.expected_sha256,
+        subject.card_uid,
+        subject.relative_path,
+        subject.expected_sha256,
     )
     .await
     .map_err(|error| map_sql_error(&error))?;
 
     if let Some(prior) = prior {
         let abort = PriorAbort {
-            storage_path: prior.storage_path,
+            validated: row_path(&prior, caller.data_tenant_id),
             backend_upload_id: prior.backend_upload_id,
         };
         multipart_uploads::mark_aborted(conn, prior.id, Some("re-init"))
@@ -785,17 +828,16 @@ async fn find_and_mark_prior_pending(
     Ok(None)
 }
 
-async fn abort_prior_best_effort(
-    state: &StorageServiceState<'_>,
-    caller: &StorageCaller,
-    prior: PriorAbort,
-) {
+async fn abort_prior_best_effort(state: &StorageServiceState<'_>, prior: PriorAbort) {
     let Some(backend_upload_id) = prior.backend_upload_id else {
         return;
     };
-    let Ok(validated) = tenant_path::validate(&prior.storage_path, caller.data_tenant_id) else {
-        tracing::warn!(storage_path = %prior.storage_path, "re-init prior upload path failed validation");
-        return;
+    let validated = match prior.validated {
+        Ok(validated) => validated,
+        Err(error) => {
+            tracing::warn!(%error, "re-init prior upload path failed validation");
+            return;
+        }
     };
     if let Err(error) = state
         .storage
@@ -963,7 +1005,7 @@ async fn insert_initiating_upload(
     conn: &mut TenantConn<'_>,
     upload_uuid: Uuid,
     validated: &ValidatedPath,
-    body: &UploadInitRequest,
+    subject: &UploadSubject<'_>,
     backend: StorageBackendKind,
     wire_protocol: WireProtocol,
     counts: UploadRowCounts,
@@ -972,19 +1014,19 @@ async fn insert_initiating_upload(
         conn,
         multipart_uploads::NewMultipartUpload {
             id: upload_uuid,
-            card_uid: body.card_uid.as_str(),
-            relative_path: &body.relative_path,
+            card_uid: subject.card_uid,
+            relative_path: subject.relative_path,
             storage_path: &validated.full,
             backend,
             wire_protocol,
-            expected_sha256: &body.expected_sha256,
-            expected_size_bytes: i64::try_from(body.expected_size_bytes).map_err(|_| {
+            expected_sha256: subject.expected_sha256,
+            expected_size_bytes: i64::try_from(subject.expected_size_bytes).map_err(|_| {
                 validation_error(
                     "expected_size_bytes exceeds signed storage metadata range",
-                    serde_json::json!({ "expected_size_bytes": body.expected_size_bytes }),
+                    serde_json::json!({ "expected_size_bytes": subject.expected_size_bytes }),
                 )
             })?,
-            content_type: body.content_type.as_deref(),
+            content_type: subject.content_type,
             part_count_planned: i32::try_from(counts.part_count).map_err(|_| {
                 internal_error(
                     "planned part count exceeds storage metadata range",
@@ -1316,7 +1358,7 @@ async fn persist_completed_upload(
     multipart_uploads::mark_completed(conn, upload_uuid)
         .await
         .map_err(|error| map_sql_error(&error))?;
-    if let Ok(card_uid) = CardUid::new(&row.card_uid) {
+    if let Some(Ok(card_uid)) = row.card_uid.as_deref().map(CardUid::new) {
         // Registration manifests are an optional owner of a storage upload.
         // Generic storage callers still succeed when no manifest row exists;
         // registered Card completion gets the durable verification marker.
@@ -1409,6 +1451,20 @@ async fn mark_failed(
         "upload failed"
     );
     conn.commit().await.map_err(|error| map_sql_error(&error))
+}
+
+/// Validate the stored object path of `row` by its ownership: a Card file
+/// path for a Card upload, the evidence path for a File upload.
+///
+/// # Errors
+/// Returns the mapped tenant-path refusal when the path does not have its
+/// owner's shape in `tenant`.
+fn row_path(row: &MultipartUploadRow, tenant: DataTenantId) -> Result<ValidatedPath, WyrdError> {
+    match row.card_uid {
+        Some(_) => tenant_path::validate(&row.storage_path, tenant),
+        None => tenant_path::validate_evidence(&row.storage_path, tenant),
+    }
+    .map_err(map_tenant_path)
 }
 
 fn upload_id_uuid(upload_id: &UploadId) -> Result<Uuid, WyrdError> {
@@ -1643,57 +1699,6 @@ mod tests {
             "/v1/cards/upload/local/wyu_018f0000-0000-7000-8000-000000000001"
         );
         assert_eq!(ttl_secs, 600);
-    }
-
-    /// On the local backend evidence plans target the digest-keyed route,
-    /// and that route writes only a body that hashes to its digest.
-    ///
-    /// # Panics
-    /// Panics when the plan, the refusal, or the stored bytes differ.
-    #[tokio::test]
-    async fn local_evidence_plans_the_digest_route_and_writes_only_matching_bytes() {
-        let root = tempfile::tempdir().expect("temp dir");
-        let storage = StorageHandle::from_settings(StorageSettings {
-            backend: BackendConfig::Local {
-                root: root.path().to_path_buf(),
-            },
-            require_encryption: false,
-            presign_ttl: Duration::from_mins(10),
-            part_size_bytes: 16 * 1024 * 1024,
-            multipart_threshold_bytes: 100 * 1024 * 1024,
-        })
-        .await
-        .expect("local storage handle");
-        let tenant = DataTenantId::new_v7();
-        let body = b"evidence";
-        let sha256 = wyrd_spec::auth::Sha256Hex::digest(body);
-        let path = tenant_path::evidence(tenant, &sha256);
-
-        let plan = evidence_upload_plan(&storage, &path, &sha256, 8, Duration::from_mins(10))
-            .await
-            .expect("local plan");
-        assert_eq!(
-            plan,
-            UploadPlan::LocalFs {
-                put_url: format!("/v1/verification/evidence/local/{sha256}"),
-                ttl_secs: 600,
-            }
-        );
-
-        let refused = upload_local_evidence(&storage, tenant, &sha256, b"tampered")
-            .await
-            .expect_err("a body of another digest is refused");
-        assert_eq!(refused.code(), "WYRD_STORAGE_400_SHA256_MISMATCH");
-        assert_eq!(
-            storage.object_len(&path).await.ok(),
-            None,
-            "nothing is written"
-        );
-
-        upload_local_evidence(&storage, tenant, &sha256, body)
-            .await
-            .expect("matching body is written");
-        assert_eq!(storage.object_len(&path).await.expect("stored"), 8);
     }
 
     #[test]

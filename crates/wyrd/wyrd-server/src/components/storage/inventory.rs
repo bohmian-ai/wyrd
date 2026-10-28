@@ -6,11 +6,12 @@
 //! Scribe outbox and waits, within half the request timeout, for that row's
 //! own acknowledgement; no other producer waits on it. Card deletion records
 //! one `deleted` row the same way. Readers resolve one Card's objects through
-//! [`ObjectInventory::card_objects`] under a SYSTEM principal granted only
-//! this table, after the caller's Card authorization; an absent row is
+//! [`ObjectInventory::card_objects`], and one completed verification File
+//! through [`ObjectInventory::file_object`], under a SYSTEM principal granted
+//! only this table, after the caller's domain authorization; an absent row is
 //! retryable readiness, never proof of deletion.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, LazyLock, Mutex};
 use std::time::Duration;
 
@@ -28,7 +29,7 @@ use vala_bifrost_redux::tables::storage::ObjectsTable;
 pub use vala_bifrost_redux::tables::storage::{ObjectOrigin, ObjectState};
 use wyrd_runtime::principal::PrincipalId;
 use wyrd_spec::DataTenantId;
-use wyrd_spec::auth::Attribution;
+use wyrd_spec::auth::{Attribution, Sha256Hex};
 use wyrd_spec::error::WyrdError;
 use wyrd_spec::ids::CardUid;
 use wyrd_spec::registry::{RelativeArtifactPath, StoredArtifactEntry};
@@ -36,7 +37,7 @@ use wyrd_spec::vala::BifrostError;
 use wyrd_spec::vala::api::BifrostQueryRequest;
 use wyrd_spec::vala::managed_columns::{RUN_ID, SUBJECT_CARD_UID, WORKLOAD_CARD_UID};
 use wyrd_sql::queries::auth::service_accounts::system_principal_id;
-use wyrd_storage::tenant_path;
+use wyrd_storage::tenant_path::{self, ValidatedPath};
 
 use crate::query::scheduled::ScheduledQueryCaller;
 use crate::scribe_outbox::ScribeWrite;
@@ -226,21 +227,79 @@ impl<'s> ObjectInventory<'s> {
     /// Read `card_uid`'s recorded objects in `tenant`, after the caller's
     /// Card authorization.
     ///
-    /// The read runs under the tenant's SYSTEM principal granted only this
-    /// table. A table the tenant never wrote reads as no rows; callers treat
-    /// a missing expected object as retryable readiness.
+    /// A table the tenant never wrote reads as no rows; callers treat a
+    /// missing expected object as retryable readiness.
     ///
     /// # Errors
-    /// Returns `WYRD_VALA_503_QUERY_VISIBILITY_UNAVAILABLE` when the SYSTEM
-    /// principal or read authority is unavailable, the query's own error
-    /// when it fails, and `WYRD_REGISTRY_400_INVALID_CARD_SPEC` when a stored
-    /// row is malformed or not bound to `card_uid` in `tenant`.
+    /// Returns the errors of [`Self::rows`], and
+    /// `WYRD_REGISTRY_400_INVALID_CARD_SPEC` when a stored row is malformed
+    /// or not bound to `card_uid` in `tenant`.
     #[tracing::instrument(skip_all, fields(%tenant, %card_uid))]
     pub async fn card_objects(
         &self,
         tenant: DataTenantId,
         card_uid: &CardUid,
     ) -> Result<CardObjects, WyrdError> {
+        let batches = self
+            .rows(
+                tenant,
+                &format!(
+                    "{SUBJECT_CARD_UID} = {}",
+                    ObservationWindow::text(card_uid.as_str())
+                ),
+            )
+            .await?;
+        Self::fold(tenant, card_uid, &batches)
+    }
+
+    /// The completed verification File upload of `sha256` and `size_bytes`
+    /// in `tenant`, after the caller's domain authorization; `None` when
+    /// the inventory holds none.
+    ///
+    /// Only a `file_upload` record qualifies: a Card file or envelope of
+    /// identical content never does, nor does a record of another size or
+    /// one whose path a deletion names. The returned path is the recorded
+    /// location, validated as this tenant's File object. A missing record
+    /// does not prove the File was never uploaded.
+    ///
+    /// # Errors
+    /// Returns the errors of [`Self::rows`], and
+    /// `WYRD_VALA_503_QUERY_VISIBILITY_UNAVAILABLE` when a matching record is
+    /// malformed or its path is not this tenant's File object.
+    #[tracing::instrument(skip_all, fields(%tenant, %sha256))]
+    pub async fn file_object(
+        &self,
+        tenant: DataTenantId,
+        sha256: &Sha256Hex,
+        size_bytes: u64,
+    ) -> Result<Option<ValidatedPath>, WyrdError> {
+        let batches = self
+            .rows(
+                tenant,
+                &format!(
+                    "origin = {} AND sha256 = {}",
+                    ObservationWindow::text(ObjectOrigin::FileUpload.as_str()),
+                    ObservationWindow::text(&sha256.to_string())
+                ),
+            )
+            .await?;
+        Self::file_fold(tenant, size_bytes, &batches)
+    }
+
+    /// Read every inventory row of `tenant` matching SQL `predicate`.
+    ///
+    /// The read runs under the tenant's SYSTEM principal granted only this
+    /// table. A table the tenant never wrote reads as no rows.
+    ///
+    /// # Errors
+    /// Returns `WYRD_VALA_503_QUERY_VISIBILITY_UNAVAILABLE` when the SYSTEM
+    /// principal or read authority is unavailable, and the query's own error
+    /// when it fails.
+    async fn rows(
+        &self,
+        tenant: DataTenantId,
+        predicate: &str,
+    ) -> Result<Vec<RecordBatch>, WyrdError> {
         let unavailable = |error: &dyn std::fmt::Display| {
             tracing::warn!(%error, "the object inventory cannot be read");
             WyrdError::from(BifrostError::QueryVisibilityUnavailable)
@@ -265,8 +324,7 @@ impl<'s> ObjectInventory<'s> {
         let mut batches = Vec::new();
         let sql = format!(
             "SELECT storage_path, sha256, size_bytes, content_type, origin, relative_path, state \
-             FROM {OBJECTS} WHERE {SUBJECT_CARD_UID} = {}",
-            ObservationWindow::text(card_uid.as_str())
+             FROM {OBJECTS} WHERE {predicate}"
         );
         let run = query.run_with(
             BifrostQueryRequest {
@@ -284,7 +342,55 @@ impl<'s> ObjectInventory<'s> {
             Err(error) => return Err(error),
             Ok(_) => {}
         }
-        Self::fold(tenant, card_uid, &batches)
+        Ok(batches)
+    }
+
+    /// Select one available File object of `size_bytes` from matching rows:
+    /// a completed row whose path no deletion names.
+    ///
+    /// # Errors
+    /// Returns `WYRD_VALA_503_QUERY_VISIBILITY_UNAVAILABLE` when a row is
+    /// malformed or its path is not `tenant`'s File object.
+    fn file_fold(
+        tenant: DataTenantId,
+        size_bytes: u64,
+        batches: &[RecordBatch],
+    ) -> Result<Option<ValidatedPath>, WyrdError> {
+        let invalid = |what: &str| {
+            tracing::warn!(column = what, "a File inventory row is malformed");
+            WyrdError::from(BifrostError::QueryVisibilityUnavailable)
+        };
+        let mut completed = Vec::new();
+        let mut deleted = BTreeSet::new();
+        for batch in batches {
+            let text = |name: &str| {
+                batch
+                    .column_by_name(name)
+                    .and_then(|column| column.as_string_opt::<i32>())
+                    .ok_or_else(|| invalid(name))
+            };
+            let (paths, states) = (text("storage_path")?, text("state")?);
+            let sizes = batch
+                .column_by_name("size_bytes")
+                .and_then(|column| column.as_primitive_opt::<Int64Type>())
+                .ok_or_else(|| invalid("size_bytes"))?;
+            for row in 0..batch.num_rows() {
+                let path = paths.value(row).to_owned();
+                if states.value(row) == ObjectState::Deleted.as_str() {
+                    deleted.insert(path);
+                } else if u64::try_from(sizes.value(row)).ok() == Some(size_bytes) {
+                    completed.push(path);
+                }
+            }
+        }
+        completed
+            .into_iter()
+            .find(|path| !deleted.contains(path))
+            .map(|path| {
+                tenant_path::validate_evidence(&path, tenant)
+                    .map_err(|_| invalid("storage_path"))
+            })
+            .transpose()
     }
 
     /// Fold `card_uid`'s inventory rows into one object per path, a deletion

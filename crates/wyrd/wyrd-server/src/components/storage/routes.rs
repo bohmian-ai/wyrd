@@ -4,6 +4,9 @@
 //! middleware. These handlers add the operation-specific `card_read` or
 //! `card_write` permission before calling storage services; keeping that check
 //! beside the route makes the capability required by each operation explicit.
+//! Operations on an existing upload select the permission from its persisted
+//! owner: `card_write` for a Card file, any `verifier:run` grant for a
+//! verification File upload opened by `POST /v1/verification/evidence`.
 
 use std::str::FromStr;
 
@@ -17,17 +20,18 @@ use serde::Deserialize;
 use wyrd_runtime::Permission;
 use wyrd_spec::error::storage::WyrdStorageError;
 use wyrd_spec::error::{WyrdError, WyrdProblem};
-use wyrd_spec::ids::{CardUid, IdempotencyKey};
+use wyrd_spec::ids::IdempotencyKey;
 use wyrd_spec::storage::{
     AbortResponse, DownloadInitRequest, IDEMPOTENCY_KEY_HEADER, LocalBlobUploadResponse,
     PartUrlResponse, UploadCompleteRequest, UploadId, UploadInitRequest,
 };
 use wyrd_storage::BackendConfig;
-use wyrd_storage::service::{self, StorageCaller};
+use wyrd_storage::service::{self, StorageCaller, UploadOwner};
 
 use crate::audit;
 use crate::components::auth::Caller;
 use crate::components::cards::service::card_file;
+use crate::components::verification::service::VerificationControl;
 use crate::components::storage::inventory::{
     ObjectFact, ObjectInventory, ObjectOrigin, ObjectState,
 };
@@ -153,12 +157,7 @@ async fn part_url(
     Query(query): Query<PartUrlQuery>,
 ) -> Result<Json<PartUrlResponse>, WyrdErrorResponse> {
     let upload_id = parse_upload_id(&id)?;
-    authorize_card_write(
-        &state,
-        &caller,
-        "storage.upload.part_url",
-        &format!("upload:{upload_id}"),
-    )?;
+    authorize_upload(&state, &caller, "storage.upload.part_url", &upload_id).await?;
     let storage_caller = storage_caller(&caller);
     service::upload_part_url(
         &state.storage,
@@ -239,12 +238,7 @@ async fn complete(
 ) -> Result<Json<wyrd_spec::storage::UploadCompleteResponse>, WyrdErrorResponse> {
     let idempotency_key = extract_idempotency_key(&headers)?;
     let upload_id = parse_upload_id(&id)?;
-    authorize_card_write(
-        &state,
-        &caller,
-        "storage.upload.complete",
-        &format!("upload:{upload_id}"),
-    )?;
+    let owner = authorize_upload(&state, &caller, "storage.upload.complete", &upload_id).await?;
     let storage_caller = storage_caller(&caller);
     let response = service::upload_complete(
         &state.storage,
@@ -256,8 +250,17 @@ async fn complete(
     )
     .await?;
     let stored = &response.stored;
-    let path = wyrd_storage::tenant_path::validate(&stored.storage_path, caller.data_tenant_id)
-        .map_err(|error| WyrdError::internal(format!("completed object path: {error}")))?;
+    let (origin, card_uid, relative_path) = match owner {
+        UploadOwner::Card(card_uid) => {
+            let path =
+                wyrd_storage::tenant_path::validate(&stored.storage_path, caller.data_tenant_id)
+                    .map_err(|error| {
+                        WyrdError::internal(format!("completed object path: {error}"))
+                    })?;
+            (ObjectOrigin::CardFile, Some(card_uid), Some(path.relative_path))
+        }
+        UploadOwner::File => (ObjectOrigin::FileUpload, None, None),
+    };
     let fact = ObjectFact {
         storage_path: stored.storage_path.clone(),
         upload_id: Some(upload_id.to_string()),
@@ -267,9 +270,9 @@ async fn complete(
             .map_err(|_| WyrdError::internal("completed object size overflows"))?,
         content_type: stored.content_type.clone(),
         sse_marker: stored.sse_marker.clone(),
-        origin: ObjectOrigin::CardFile,
-        card_uid: Some(CardUid::new(&path.card_uid).map_err(WyrdError::from_card_uid_error)?),
-        relative_path: Some(path.relative_path),
+        origin,
+        card_uid,
+        relative_path,
         state: ObjectState::Completed,
     };
     ObjectInventory::new(&state)
@@ -322,12 +325,7 @@ async fn abort(
 ) -> Result<Json<AbortResponse>, WyrdErrorResponse> {
     let idempotency_key = extract_idempotency_key(&headers)?;
     let upload_id = parse_upload_id(&id)?;
-    authorize_card_write(
-        &state,
-        &caller,
-        "storage.upload.abort",
-        &format!("upload:{upload_id}"),
-    )?;
+    authorize_upload(&state, &caller, "storage.upload.abort", &upload_id).await?;
     let storage_caller = storage_caller(&caller);
     service::upload_abort(
         &state.storage,
@@ -394,12 +392,7 @@ async fn local_blob(
         }))
     })?;
     let upload_id = parse_upload_id(&id)?;
-    authorize_card_write(
-        &state,
-        &caller,
-        "storage.upload.local_blob",
-        &format!("upload:{upload_id}"),
-    )?;
+    authorize_upload(&state, &caller, "storage.upload.local_blob", &upload_id).await?;
     let storage_caller = storage_caller(&caller);
     service::upload_local_blob(
         &state.storage,
@@ -591,6 +584,35 @@ pub(crate) fn extract_idempotency_key(
         })
         .transpose()
         .map_err(WyrdErrorResponse::from)
+}
+
+/// Authorize one follow-up operation on `upload_id` by its persisted owner.
+///
+/// The owner is read under the caller's tenant before any decision, so a
+/// foreign or unknown upload is refused as not found. A Card upload needs
+/// `card:write`; a verification File upload needs any `verifier:run` grant,
+/// the permission that admitted its planning. Either decision is staged on
+/// the audit outbox without waiting for its commit.
+///
+/// # Errors
+/// Returns the owner lookup's not-found or SQL error, and the public
+/// permission error for the owner's missing permission.
+async fn authorize_upload(
+    state: &AppState,
+    caller: &Caller,
+    operation: &str,
+    upload_id: &UploadId,
+) -> Result<UploadOwner, WyrdErrorResponse> {
+    let owner = service::upload_owner(state.postgres.wyrd(), &storage_caller(caller), upload_id)
+        .await?;
+    let resource = format!("upload:{upload_id}");
+    match owner {
+        UploadOwner::Card(_) => authorize_card_write(state, caller, operation, &resource)?,
+        UploadOwner::File => {
+            VerificationControl::new(state).authorize_evidence(caller, operation, &resource)?;
+        }
+    }
+    Ok(owner)
 }
 
 /// Evaluate and audit the card-write permission for one storage mutation.

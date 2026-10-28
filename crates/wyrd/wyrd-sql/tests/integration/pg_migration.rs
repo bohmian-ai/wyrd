@@ -1400,7 +1400,7 @@ mod pg_tests {
                 &mut conn,
                 storage::multipart_uploads::NewMultipartUpload {
                     id: upload_id,
-                    card_uid: &card_uid,
+                    card_uid: Some(&card_uid),
                     relative_path: "model.bin",
                     storage_path: &storage_path,
                     backend: StorageBackendKind::S3,
@@ -1427,7 +1427,7 @@ mod pg_tests {
 
             let pending = storage::multipart_uploads::find_pending_for_dedupe(
                 &mut conn,
-                &card_uid,
+                Some(&card_uid),
                 "model.bin",
                 &sha,
             )

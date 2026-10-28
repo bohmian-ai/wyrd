@@ -59,8 +59,8 @@ impl FromStr for UploadStatus {
 pub struct NewMultipartUpload<'a> {
     /// Upload row identifier.
     pub id: Uuid,
-    /// Artifact card UID.
-    pub card_uid: &'a str,
+    /// Owning Card UID; `None` for a verification File upload.
+    pub card_uid: Option<&'a str>,
     /// Object path below the card namespace.
     pub relative_path: &'a str,
     /// Full tenant-scoped storage path.
@@ -92,8 +92,8 @@ pub struct MultipartUploadRow {
     pub id: Uuid,
     /// Tenant isolation key.
     pub data_tenant_id: Uuid,
-    /// Artifact card UID.
-    pub card_uid: String,
+    /// Owning Card UID; `None` for a verification File upload.
+    pub card_uid: Option<String>,
     /// Object path below the card namespace.
     pub relative_path: String,
     /// Full tenant-scoped storage path.
@@ -134,7 +134,7 @@ pub struct MultipartUploadRow {
 struct MultipartUploadRowDb {
     id: Uuid,
     data_tenant_id: Uuid,
-    card_uid: String,
+    card_uid: Option<String>,
     relative_path: String,
     storage_path: String,
     backend: String,
@@ -384,11 +384,14 @@ pub async fn find_open_for_card(
 
 /// Find a pending upload for crash-recovery dedupe.
 ///
+/// `card_uid` is `None` for a verification File upload, which matches only
+/// another File upload of the same path and digest.
+///
 /// # Errors
 /// Returns [`SqlError`] when the query fails or persisted enum values are invalid.
 pub async fn find_pending_for_dedupe(
     conn: &mut TenantConn<'_>,
-    card_uid: &str,
+    card_uid: Option<&str>,
     relative_path: &str,
     expected_sha256: &str,
 ) -> Result<Option<MultipartUploadRow>, SqlError> {
@@ -416,7 +419,7 @@ pub async fn find_pending_for_dedupe(
             terminal_at,
             expires_at
         FROM wyrd.storage_multipart_uploads
-        WHERE card_uid = $1
+        WHERE card_uid IS NOT DISTINCT FROM $1
           AND relative_path = $2
           AND expected_sha256 = $3
           AND status = 'pending'

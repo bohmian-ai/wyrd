@@ -289,22 +289,42 @@ the system tables, partitioning, write reservation and inventory contract in
 `bifrost-design.md`; and the peer destinations and scoped read in
 `wyrd-security-posture.md`. No unrelated files changed.
 
-Open, out of scope:
-`pg_verification_runtime::attempts_record_queue_wait_phases_terminal_latency_and_one_trace`
-fails deterministically (4/4 runs) and does not depend on this diff.
-Diagnosis:
+Unexpected failures, diagnosed and fixed (`pg_verification_runtime`
+module: 51/51 passed after both fixes):
 
-- **Symptom:** the test expects one schedule queue wait but gets
-  `left: 2, right: 1` at `pg_verification_runtime.rs:795`.
-- **Evidence:** the trace shows `attempt=1 origin=schedule` deferred with
-  `evidence_unavailable`, then re-claimed with the same attempt number.
-- **Cause:** `scheduler.rs:404-407` commits the execution before staging its
-  input record. The runner's deferred claim still emits the queue-wait,
-  attempt and phase series and the attempt span (`runner.rs` `attempt`,
-  `telemetry.rs:153`).
-- **Fix site:** `VerifierRunner::attempt` / `ExecutionTelemetry`. A
-  `Transition::Defer` should spend no attempt telemetry.
-- **Callers checked:** schedule and group handoffs (`scheduler.rs:407`,
-  `:533`).
-- **Diagnostician:** an independent read-only diagnostician reached the same
-  cause and fix site.
+1. `attempts_record_queue_wait_phases_terminal_latency_and_one_trace`
+   failed in 4 of 4 runs.
+   - **Symptom:** the test expects one schedule queue wait but gets
+     `left: 2, right: 1` at `pg_verification_runtime.rs:795`.
+   - **Evidence:** the trace shows `attempt=1 origin=schedule` deferred with
+     `evidence_unavailable`, then re-claimed with the same attempt number.
+   - **Cause:** `scheduler.rs:404-407` commits the execution before staging
+     its input record. The runner's deferred claim still emitted the
+     queue-wait, attempt and phase series and the attempt span.
+   - **Fix site:** `VerifierRunner::attempt` / `ExecutionTelemetry`. Commit
+     `489f73c16` makes a `Transition::Defer` spend no attempt telemetry. The
+     attempt counter moves from `start` to `emit`, and `attempt` returns
+     before the queue-wait, trigger-to-terminal and `finish` series.
+   - **Callers checked:** schedule and group handoffs (`scheduler.rs:407`,
+     `:533`).
+   - **Diagnostician:** an independent read-only diagnostician reached the
+     same cause and fix site.
+2. `two_replicas_claim_each_queued_run_exactly_once` failed in 1 module run
+   and 3 of 8 solo runs.
+   - **Symptom:** `results` held 17, 73 or 73 rows against 100 at `:1511`,
+     while inputs and outputs held 100.
+   - **Evidence:** the flush rotation froze one results WAL frame, and later
+     results frames still arrived at Scribe after it. The memtable stayed
+     unflushed and no outbox loss was recorded.
+   - **Cause:** the harness runtime writes results through the
+     `PublicationFault` outbox. `Harness::durable_rows` flushed only the
+     server outbox, so results still in flight missed the flush.
+   - **Fix site:** `Harness::durable_rows` now settles the fault outbox
+     through `PublicationFault::sent` before `flush_bifrost`. The server
+     flush cannot see that test-only outbox.
+   - **Callers checked:** `:1280`, `:1847`, `:1510` and `:4946`
+     (`configured_service_context_survives_acceptance_and_restart` had the
+     same latent race).
+   - **Verification:** 10 of 10 solo runs passed after the fix.
+   - **Diagnostician:** an independent read-only diagnostician supplied the
+     cause, fix site and callers.

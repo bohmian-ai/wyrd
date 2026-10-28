@@ -284,15 +284,19 @@ impl Harness {
             .split_off(self.audit_floor)
     }
 
-    /// Flush the server's Scribe and count the tenant's durable rows per
-    /// `namespace.table`.
+    /// Settle the runtime's result outbox, flush the server's Scribe, and
+    /// count the tenant's durable rows per `namespace.table`.
     ///
-    /// Counts come from the published file list, so a replay Scribe
-    /// deduplicated contributes no rows while a fresh batch does.
+    /// The runtime writes results through the fault outbox, which the
+    /// server flush does not settle, so it settles first. Counts come from
+    /// the published file list, so a replay Scribe deduplicated contributes
+    /// no rows while a fresh batch does.
     ///
     /// # Panics
-    /// Panics when the flush or the file-list read fails.
+    /// Panics when staged results stay unwritten, or the flush or the
+    /// file-list read fails.
     async fn durable_rows(&self) -> BTreeMap<String, i64> {
+        self.fault.sent().await;
         self.server
             .flush_bifrost()
             .await

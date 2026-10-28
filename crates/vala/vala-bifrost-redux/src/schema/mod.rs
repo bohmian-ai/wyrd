@@ -59,6 +59,48 @@ pub fn logical_batch(batch: &RecordBatch, logical: &Schema) -> Result<RecordBatc
     .map_err(|error| format!("assemble the logical batch: {error}"))
 }
 
+/// Returns the logical schema of rows held in `physical`, a possibly shredded layout.
+///
+/// Recovery reads a staged run's schema from its file, which is the physical
+/// layout its generation pinned; the claim and its identity need the logical
+/// schema. Each field holding a shredded Variant, at any Struct or List depth,
+/// takes the type the recursive `unshred_variants` reconstructs, stored as the
+/// canonical Wyrd Variant storage; every name, nullability, and metadata entry
+/// is kept, so an unshredded schema returns unchanged.
+///
+/// # Errors
+///
+/// Returns a refusal naming the column when its Variant storage cannot be
+/// unshredded.
+pub fn logical_schema(physical: &Schema) -> Result<Schema, String> {
+    let canonical = wyrd_types::variant::variant_storage_type();
+    let fields = physical
+        .fields()
+        .iter()
+        .map(|field| {
+            let empty = arrow::array::new_empty_array(field.data_type());
+            let (_, restored) = iceberg::arrow::unshred_variants(field, &empty)
+                .and_then(|(field, column)| {
+                    iceberg::arrow::map_variant_fields(&field, &column, &mut |variant| {
+                        if variant.data_type() == &canonical {
+                            return Ok(Arc::clone(variant));
+                        }
+                        Ok(arrow::compute::cast(variant, &canonical)?)
+                    })
+                })
+                .map_err(|error| format!("unshred column `{}`: {error}", field.name()))?;
+            Ok(field
+                .as_ref()
+                .clone()
+                .with_data_type(restored.data_type().clone()))
+        })
+        .collect::<Result<Vec<_>, String>>()?;
+    Ok(Schema::new_with_metadata(
+        fields,
+        physical.metadata().clone(),
+    ))
+}
+
 /// Restores one physical column to the type of its `logical` field.
 ///
 /// Only Variant storage is rewritten: each shredded Variant in `column`, at

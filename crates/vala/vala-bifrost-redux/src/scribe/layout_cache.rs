@@ -171,6 +171,23 @@ impl VariantLayoutCache {
             .map(|(_, layout)| Arc::clone(layout))
     }
 
+    /// Returns the physical schema of the newest layout learned for `tenant`'s `table` at any version.
+    #[cfg(any(test, feature = "test-support"))]
+    pub(crate) fn physical_for_test(
+        &self,
+        tenant: DataTenantId,
+        table: &TableRef,
+    ) -> Option<SchemaRef> {
+        let entries = self.entries.lock().ok()?;
+        entries
+            .iter()
+            .rev()
+            .find(|((entry_tenant, entry_table, _), _)| {
+                *entry_tenant == tenant && entry_table == table
+            })
+            .map(|(_, layout)| Arc::clone(&layout.physical))
+    }
+
     /// Replaces the hint for one table definition with the layout a claim just learned.
     ///
     /// Called on successful claim assembly, in completion order, so the most

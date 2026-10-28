@@ -390,6 +390,26 @@ impl Memtable {
         Ok(buckets.get(seal_key).map(|bucket| bucket.layout.clone()))
     }
 
+    /// Reports, per writable bucket of `tenant`'s `table`, whether it pinned a learned layout.
+    ///
+    /// # Errors
+    /// Returns [`ScribeError::Internal`] if the bucket lock is poisoned.
+    #[cfg(any(test, feature = "test-support"))]
+    pub(crate) fn writable_layouts_for_test(
+        &self,
+        tenant: DataTenantId,
+        table: &crate::catalog::TableRef,
+    ) -> Result<Vec<bool>, ScribeError> {
+        let buckets = self.writable.read().map_err(|e| ScribeError::Internal {
+            detail: format!("memtable bucket lock poisoned: {e}"),
+        })?;
+        Ok(buckets
+            .iter()
+            .filter(|(key, _)| key.tenant == tenant && &key.table == table)
+            .map(|(_, bucket)| bucket.layout.is_some())
+            .collect())
+    }
+
     /// Return the row count for a batch that is still retained in the active
     /// or immutable grace state for this exact seal key.
     ///

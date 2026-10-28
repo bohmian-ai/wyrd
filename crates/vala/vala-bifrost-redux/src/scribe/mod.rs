@@ -1594,6 +1594,38 @@ impl ScribeImpl {
         self.shards.flush_all().await
     }
 
+    /// Returns the physical schema of the Variant layout this process learned
+    /// for `tenant`'s `table` at any version, or `None` while it stays cold.
+    #[must_use]
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn learned_variant_layout_for_test(
+        &self,
+        tenant: wyrd_spec::DataTenantId,
+        table: &crate::catalog::TableRef,
+    ) -> Option<arrow::datatypes::SchemaRef> {
+        self.memory
+            .variant_layouts()
+            .physical_for_test(tenant, table)
+    }
+
+    /// Reports, per writable generation of `tenant`'s `table`, whether it pinned a learned layout.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ScribeError`] when the runtime is closed or a bucket lock is poisoned.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn writable_variant_layouts_for_test(
+        &self,
+        tenant: wyrd_spec::DataTenantId,
+        table: &crate::catalog::TableRef,
+    ) -> Result<Vec<bool>, ScribeError> {
+        let mut pinned = Vec::new();
+        for memtable in self.shards.memtables()? {
+            pinned.extend(memtable.writable_layouts_for_test(tenant, table)?);
+        }
+        Ok(pinned)
+    }
+
     /// Return the bounded persistence queue depth for test-tier drain checks.
     #[must_use]
     #[cfg(any(test, feature = "test-support"))]

@@ -782,8 +782,9 @@ impl ScribeStagingRuntime {
     /// Reconstructs one recovered key's encoding context, or fails closed.
     ///
     /// The layout is re-resolved from the recipe the members' rows were
-    /// accepted under, which their record carries, against the runs' own
-    /// schema, so a later Bloom or layout alteration never strands them.
+    /// accepted under, which their record carries, against the logical schema
+    /// reconstructed from the runs' own (possibly shredded) layout, so a later
+    /// Bloom or layout alteration never strands them.
     ///
     /// `members` are the members restore keeps. The schema is read from their
     /// runs only: a key can also hold the leftovers of a claim that already
@@ -809,7 +810,12 @@ impl ScribeStagingRuntime {
             .ok_or_else(|| ScribeError::Internal {
                 detail: "a recovered staged key names no run to read its schema from".to_owned(),
             })?;
-        let schema = Arc::clone(crate::scribe::member_stager::preflight_run(&run)?.schema());
+        let physical = Arc::clone(crate::scribe::member_stager::preflight_run(&run)?.schema());
+        let schema = Arc::new(crate::schema::logical_schema(&physical).map_err(|detail| {
+            ScribeError::Internal {
+                detail: format!("reconstruct a recovered staged run's logical schema: {detail}"),
+            }
+        })?);
         if crate::parquet::footer::schema_fingerprint(schema.as_ref()) != key.schema_fingerprint() {
             return Err(ScribeError::Internal {
                 detail: "a recovered staged run's schema is not the schema its key names"

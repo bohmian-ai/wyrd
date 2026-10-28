@@ -20,8 +20,8 @@ use wyrd_testing::bifrost::{
 };
 
 use super::support::{
-    append_values, await_persistence_drained, endpoint_client, published_rows, register_table,
-    sorted_values, tenant_client, tenant_key, unique_table,
+    append_batch, append_values, await_persistence_drained, endpoint_client, published_rows,
+    register_table, sorted_values, tenant_client, tenant_key, unique_table,
 };
 
 /// Longest a settled pod may take to retire the members its publication replaced.
@@ -844,5 +844,191 @@ async fn scribe_hot_path_telemetry_reconciles() {
     }
 
     print_family_inventory(&telemetry);
+    server.shutdown().await.expect("the server drains cleanly");
+}
+
+/// One acknowledged Variant batch of `(value, document)` rows.
+///
+/// # Panics
+///
+/// Panics when the append is refused.
+async fn append_documents(client: &wyrd_client::WyrdClient, table: &str, rows: &[(i64, String)]) {
+    let borrowed: Vec<(i64, &str)> = rows
+        .iter()
+        .map(|(value, json)| (*value, json.as_str()))
+        .collect();
+    append_batch(
+        client,
+        table,
+        uuid::Uuid::now_v7(),
+        &super::recovery::variant_batch(&borrowed),
+    )
+    .await
+    .expect("the Variant append is acknowledged");
+}
+
+/// Forty `(value, document)` rows from `first` mixing typed, mistyped, null,
+/// list, nested, and missing Variant keys.
+fn variant_cohort(first: i64) -> Vec<(i64, String)> {
+    (first..first + 40)
+        .map(|value| {
+            let document = match value % 4 {
+                0 => format!(r#"{{"a":{value},"b":"s{value}"}}"#),
+                1 => format!(r#"{{"a":{value},"c":[1,{value}]}}"#),
+                2 => format!(r#"{{"a":"text{value}","b":null}}"#),
+                _ => format!(r#"{{"a":{value},"d":{{"e":{value}}}}}"#),
+            };
+            (value, document)
+        })
+        .collect()
+}
+
+/// Learned Variant layouts keep every value exact from memory through
+/// staging, publication, and a cold restart.
+///
+/// The cold process publishes a first cohort canonically, and its claim
+/// teaches the process a layout for the table. A second cohort then opens a
+/// generation that pins that layout, so its rows are retained shredded, and
+/// they read back exactly from memory, from their native staged runs, and —
+/// after a restart that empties the advisory cache — from the restored staged
+/// runs and their publication. A cohort written after the restart opens a
+/// canonical generation: a cold cache never blocks writes or recovery. Every
+/// read returns each row once.
+///
+/// # Panics
+///
+/// Panics when the server cannot start or restart, an append, freeze, read, or
+/// publication fails, the layout evidence disagrees, or any read differs from
+/// the acknowledged documents.
+#[tokio::test]
+#[ignore = "requires Postgres and object storage"]
+async fn variant_layouts_survive_memory_stage_publication_and_restart() {
+    use super::recovery::read_documents;
+    use arrow::datatypes::{DataType, Field};
+    use vala_bifrost_redux::catalog::{CreateTableRequest, TableRef};
+
+    let data_root = tempfile::tempdir().expect("durable Bifrost data root");
+    let builder =
+        || WyrdTestServer::builder().with_durable_bifrost_data_root(data_root.path().to_path_buf());
+    let server = builder()
+        .start_bound()
+        .await
+        .expect("the pod starts on a durable data root");
+    let tenant = server.data_tenant_id();
+    let name = unique_table("variant_layouts");
+    let table_ref = TableRef::new(BifrostNamespace::Datasets, &name);
+    server
+        .create_bifrost_table_for_test(CreateTableRequest {
+            table: table_ref.clone(),
+            user_fields: vec![
+                Field::new("value", DataType::Int64, false),
+                wyrd_types::variant::variant_field("v", true),
+            ],
+            tenant,
+            attribution: wyrd_spec::auth::Attribution::unresolved(),
+            physical_layout: None,
+        })
+        .await
+        .expect("the catalog registers the Variant table");
+    let table = format!("{}.{name}", BifrostNamespace::Datasets.as_str());
+    let client = tenant_client(&server, tenant).await;
+    let scribe = server.bifrost_scribe().expect("the pod owns a Scribe");
+    let layouts = |scribe: &vala_bifrost_redux::scribe::ScribeImpl| {
+        scribe
+            .writable_variant_layouts_for_test(tenant, &table_ref)
+            .expect("writable layouts are inspectable")
+    };
+
+    let mut expected = variant_cohort(0);
+    append_documents(&client, &table, &expected).await;
+    assert_eq!(
+        layouts(&scribe),
+        [false],
+        "a cold process opens a canonical generation"
+    );
+    assert_eq!(
+        read_documents(&client, &table).await,
+        expected,
+        "cold memory"
+    );
+    server
+        .flush_bifrost()
+        .await
+        .expect("the cold cohort publishes");
+    let learned = scribe
+        .learned_variant_layout_for_test(tenant, &table_ref)
+        .expect("the published claim teaches the process a layout");
+    let shredded = learned.field_with_name("v").expect("v").data_type().clone();
+    eprintln!("evidence variant_layouts learned_v={shredded:?}");
+    assert_ne!(
+        shredded,
+        wyrd_types::variant::variant_storage_type(),
+        "the learned layout shreds `v`"
+    );
+
+    let learned_rows = variant_cohort(40);
+    append_documents(&client, &table, &learned_rows).await;
+    expected.extend(learned_rows);
+    assert_eq!(
+        layouts(&scribe),
+        [true],
+        "a generation opened after learning pins the learned layout"
+    );
+    assert_eq!(
+        read_documents(&client, &table).await,
+        expected,
+        "learned memory unions with the published cohort"
+    );
+    scribe
+        .flush_writable_for_test()
+        .await
+        .expect("every writable bucket freezes");
+    await_persistence_drained(&scribe).await;
+    assert_eq!(
+        read_documents(&client, &table).await,
+        expected,
+        "native staged runs read exactly"
+    );
+    drop(scribe);
+
+    let server = Box::pin(server.restart_bound(builder()))
+        .await
+        .expect("the pod restarts on its retained data root");
+    let client = tenant_client(&server, tenant).await;
+    let scribe = server.bifrost_scribe().expect("the pod owns a Scribe");
+    assert!(
+        scribe
+            .learned_variant_layout_for_test(tenant, &table_ref)
+            .is_none(),
+        "a restart empties the advisory cache"
+    );
+    assert_eq!(
+        read_documents(&client, &table).await,
+        expected,
+        "restored shredded staging reads exactly"
+    );
+    let cold_rows = variant_cohort(80);
+    append_documents(&client, &table, &cold_rows).await;
+    expected.extend(cold_rows);
+    assert_eq!(
+        layouts(&scribe),
+        [false],
+        "a cold cache opens a canonical generation"
+    );
+    server
+        .flush_bifrost()
+        .await
+        .expect("the restored and cold rows publish");
+    assert_eq!(
+        published_rows(&server, tenant, &name).await,
+        expected.len() as u64,
+        "every row publishes exactly once"
+    );
+    assert_eq!(
+        read_documents(&client, &table).await,
+        expected,
+        "published rows read exactly"
+    );
+    drop(scribe);
     server.shutdown().await.expect("the server drains cleanly");
 }

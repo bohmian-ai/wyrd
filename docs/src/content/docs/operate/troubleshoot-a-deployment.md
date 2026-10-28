@@ -4,8 +4,6 @@ description: Find the cause of a Wyrd server that refuses to migrate or start, f
 pillar: wyrd
 section: Operate
 order: 5
-draft: true
-status: partial
 ---
 
 Match the code or message you see below. This page covers server installation, local setup recovery, and database failures.

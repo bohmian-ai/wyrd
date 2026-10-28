@@ -85,9 +85,22 @@ An `agent` or `code` check can also return a `data` object beside its verdict, s
 
 A queued execution has a status before it has a verdict. `completed` means it produced a result; `timed_out` and `errored` mean no check finished, so there is no verdict and no Operator runs.
 
+## Trace evidence
+
+A `trace` check judges the whole trace. It reads every retained span with that trace ID from `bifrost.traces.spans`, whatever Service, Card, or time each span carries, ordered by start time and then span ID. The read is an ordinary query by the account the execution runs as, so the same permissions, tenant boundary, and audit apply. Each attempt reads a trace once, and every check in the Verifier that names that trace judges the same spans.
+
+The check is `inconclusive`, never judged on part of a trace, when the trace has more than 10,000 spans, the query is refused or fails, the read times out, a span cannot be decoded, or the input supplied no trace. A selector that matches no span compares `null`.
+
+Spans can land after the call that verifies them. A trace with no visible span has not landed yet, and the outcome depends on the path:
+
+- `verify` judges the check `inconclusive` at once.
+- A queued execution, from `submit` or a schedule, stops the attempt with error code `evidence_unavailable` and status `retrying`, and records no result. It tries 3 times, waiting 30 seconds and then 60 seconds. The last attempt judges the check `inconclusive` and completes under the Verifier's `decide` rule.
+
+A completed result is final. Spans that land after it are judged only by a new execution.
+
 ## Results
 
-Every result is stored in Bifrost, in `vala.verification.results`, with the exact Verifier and subject versions it judged. The inputs go to `vala.verification.execution_inputs`. Both are queryable with SQL.
+Every result is stored in Bifrost, in `bifrost.verification.results`, with the exact Verifier and subject versions it judged. The inputs go to `bifrost.verification.execution_inputs`. Both are queryable with SQL.
 
 ## Operators
 

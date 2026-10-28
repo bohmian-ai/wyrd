@@ -1,6 +1,6 @@
 {
   "name": "wyrd-ai",
-  "version": "0.3.0",
+  "version": "0.4.0",
   "description": "TypeScript SDK for Wyrd: verification and assurance for AI systems.",
   "keywords": [
     "wyrd",
@@ -53,9 +53,9 @@
     ]
   },
   "optionalDependencies": {
-    "wyrd-ai-darwin-arm64": "0.3.0",
-    "wyrd-ai-linux-arm64-gnu": "0.3.0",
-    "wyrd-ai-linux-x64-gnu": "0.3.0"
+    "wyrd-ai-darwin-arm64": "0.4.0",
+    "wyrd-ai-linux-arm64-gnu": "0.4.0",
+    "wyrd-ai-linux-x64-gnu": "0.4.0"
   },
   "dependencies": {
     "apache-arrow": "21.1.0"

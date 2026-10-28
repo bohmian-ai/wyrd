@@ -5,7 +5,6 @@ pillar: wyrd
 section: Build and verify
 topic: Verify
 order: 1
-status: runnable
 ---
 
 Pick the check you need, bind its Verifier under `verified_by` to what it checks (a Service, one of its Agents, Models, or Data, or a standalone Agent), and call it from your code. Each recipe's Python declares `support-reply.yaml`, a Service that binds the recipe's Verifier, as in [Run your first verification](/get-started/quickstart/).
@@ -400,6 +399,19 @@ The SDKs run the same upload:
 
 `metadata` takes `labels` and `annotations` too, and `spec` defaults to `{artifact_kind: file}`.
 
+A refused upload declares no Card. A `WYRD_SPEC_400_VALIDATION` refusal names its `rule` in `details`:
+
+| You see | Fix |
+| --- | --- |
+| Rule `artifact_source_regular` | The source, or an entry under it, is a symbolic link or another non-regular file. Replace or remove the entry `details.source` names |
+| Rule `artifact_source_empty` | The directory holds no regular files. Upload a directory with at least one file |
+| Rule `extraction_refused` | With `--extract`, a supported document is malformed or over the extraction limits; `details.reason` says which. Fix or remove it, or upload without `--extract` |
+| Rule `extraction_output_collision` | With `--extract`, an uploaded file sits at or around `extracted/P.json`. Rename or remove the file `details.collides_with` names |
+| Rule `extraction_report` | With `--extract`, `spec` already sets `metadata.extraction`. Remove it; the upload writes the report |
+| `WYRD_LOADER_400_INVALID_ENVELOPE` | The source is missing or unreadable, or a file changed during the upload. Check the path and run the upload again |
+
+Upload is not atomic. Interrupted after it starts sending, it can leave the version declared but not yet Active; run the same upload again, which follows the version rules above.
+
 Mount the uploaded files by exact reference in an Agent's `workspace`, here the extraction of one handbook:
 
 <Tabs>
@@ -477,7 +489,7 @@ for reply in replies:
 </Tab>
 </Tabs>
 
-New replies in the group push the session check back. Its verdict is stored in `vala.verification.results` with the `group_id`.
+New replies in the group push the session check back. Its verdict is stored in `bifrost.verification.results` with the `group_id`.
 
 ## Drift
 

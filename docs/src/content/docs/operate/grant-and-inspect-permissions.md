@@ -4,8 +4,6 @@ description: See which roles a principal holds, grant or revoke a role, cut a pr
 pillar: wyrd
 section: Operate
 order: 4
-draft: true
-status: partial
 ---
 
 Grant a role to give a principal more access, revoke it to take access away, and read the audit log to confirm what the server decided. Every command here changes access for the whole tenant.

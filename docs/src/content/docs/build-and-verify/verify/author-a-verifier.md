@@ -5,7 +5,6 @@ pillar: wyrd
 section: Build and verify
 topic: Verify
 order: 0
-status: runnable
 ---
 
 Build the Verifiers for a support desk: one assertion, one Python check, and one model judge. Each step adds a check, binds it, and shows the verdict your code gets back.

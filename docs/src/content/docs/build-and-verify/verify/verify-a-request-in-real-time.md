@@ -6,7 +6,6 @@ section: Build and verify
 topic: Verify
 order: 2
 draft: true
-status: runnable
 ---
 
 Call `run.observe.verify` inside a request, get the verdict back before you reply, and decide what to send.
@@ -165,7 +164,7 @@ Each citation names an original input slot and a location in it, such as `{ "slo
 
 ## 4. Confirm the result was stored
 
-After it answers, the server stores the pinned inputs and the result in `vala.verification.results`, tied to your run, with `binding_id` null. A `verify` call never starts queued work and never runs Operators.
+After it answers, the server stores the pinned inputs and the result in `bifrost.verification.results`, tied to your run, with `binding_id` null. A `verify` call never starts queued work and never runs Operators.
 
 <LangTabs langs={['python', 'rust', 'typescript']}>
 <LangTab lang="python">
@@ -174,7 +173,7 @@ After it answers, the server stores the pinned inputs and the result in `vala.ve
 from wyrd.bifrost import Bifrost
 
 rows = Bifrost().sql(
-    "SELECT result_id, verdict, verifier_version FROM vala.verification.results "
+    "SELECT result_id, verdict, verifier_version FROM bifrost.verification.results "
     "WHERE run_id = $1 AND binding_id IS NULL",
     [run.run_id],
 )
@@ -190,7 +189,7 @@ use wyrd_ai::{Bifrost, bifrost::{BifrostOptions, QueryParam}};
 let rows = Bifrost::connect(BifrostOptions::default())
     .await?
     .sql(
-        "SELECT result_id, verdict, verifier_version FROM vala.verification.results \
+        "SELECT result_id, verdict, verifier_version FROM bifrost.verification.results \
          WHERE run_id = $1 AND binding_id IS NULL",
         &[QueryParam::String(run.run_id().to_string())],
     )
@@ -205,7 +204,7 @@ import { Bifrost } from "wyrd-ai";
 
 const bifrost = await Bifrost.connect();
 const rows = await bifrost.sql(
-  `SELECT result_id, verdict, verifier_version FROM vala.verification.results
+  `SELECT result_id, verdict, verifier_version FROM bifrost.verification.results
     WHERE run_id = $1 AND binding_id IS NULL`,
   [run.runId],
 );

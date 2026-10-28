@@ -4,7 +4,6 @@ description: Connect your identity provider, such as Okta or Keycloak, so people
 pillar: wyrd
 section: Operate
 order: 3
-draft: true
 ---
 
 People sign in to Wyrd through your organization's identity provider, such as Okta or Keycloak. Wyrd stores no passwords and has no invite step: a person's account is created the first time they sign in. A new account holds no role until you grant one.

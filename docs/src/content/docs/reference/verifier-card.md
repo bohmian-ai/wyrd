@@ -4,7 +4,6 @@ description: Fields, input slots, steps, checks, operators, references, citation
 pillar: wyrd
 section: Reference
 order: 1
-status: runnable
 ---
 
 A Verifier spec declares the evidence a caller sends, the steps that prepare it, and the requirements that judge it. Every object refuses keys it does not define.
@@ -98,6 +97,8 @@ When to use each kind is in [Steps and checks](/understand/how-verification-work
 | `agent` | `agent`, `inputs`, `workspace` | An Agent, with its declared tools and optional workspace as in a step, whose Prompt `response_format` is `verdict` or a closed [verdict](#verdicts-and-citations) schema |
 | `code` | `runtime`, `source`, `entrypoint`, `inputs`, optional `response_format` | A Python function that returns a verdict |
 | `drift` | `on`, `method`, `signal`, `condition`, `profile` | Comparing a window of samples with a baseline |
+
+A `trace` check reads every retained span with the trace ID from `bifrost.traces.spans`, as the executing account, ordered by start time then span ID, up to 10,000 spans. A larger trace, a refused or failed query, a timed-out read, an undecodable span, or an input with no trace makes it `inconclusive`. A trace with no visible span is `inconclusive` under `verify`; in a queued execution, each attempt before the last ends with error code `evidence_unavailable` and status `retrying` (3 attempts, 30 s then 60 s apart), and the last is `inconclusive`. [Trace evidence](/understand/how-verification-works/#trace-evidence) explains the behavior.
 
 ## Comparison operators
 

@@ -4,7 +4,6 @@ description: The JSON an extract step returns for each media format.
 pillar: wyrd
 section: Reference
 order: 2
-status: runnable
 ---
 
 An `extract` step returns JSON whose shape depends on the file's format. Every field is always present: an empty list is `[]`, empty text is `""`, and `null` appears only where the type allows it. Types are TypeScript notation for the wire JSON.

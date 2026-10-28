@@ -4,8 +4,6 @@ description: Prepare PostgreSQL with one login, migrate it, start the server, an
 pillar: wyrd
 section: Operate
 order: 1
-draft: true
-status: partial
 ---
 
 A Wyrd server needs one PostgreSQL login, set as `WYRD_DATABASE_URL`. For a self-hosted team that login is enough, because Wyrd keeps tenants apart inside PostgreSQL rather than with separate logins. A second login is optional hardening; step 1 explains when it is worth it.

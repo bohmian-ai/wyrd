@@ -5,7 +5,6 @@ pillar: wyrd
 section: Connect
 order: 2
 draft: true
-status: runnable
 ---
 
 You don't need a Wyrd adapter to call the gateway from a provider SDK. Point the SDK's base URL at your Wyrd server, give it Wyrd's HTTP transport, and address the model as `<deployment>/<model>`. Each example on this page runs one real inference and prints the reply.
@@ -182,14 +181,14 @@ print(result.output)
 
 ## Check that the call was recorded
 
-With the capture policy applied, each call lands in `vala.gateway.calls`, attributed to the Wyrd principal that made it:
+With the capture policy applied, each call lands in `bifrost.gateway.calls`, attributed to the Wyrd principal that made it:
 
 ```python
 from wyrd.bifrost import Bifrost
 
 rows = Bifrost().sql(
     "SELECT requested_model, outcome, started_at "
-    "FROM vala.gateway.calls ORDER BY started_at DESC LIMIT 5"
+    "FROM bifrost.gateway.calls ORDER BY started_at DESC LIMIT 5"
 ).to_arrow().to_pylist()
 print(rows)
 ```

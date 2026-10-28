@@ -1749,8 +1749,8 @@ mod tests {
 
     use crate::components::gateway::CallCapture;
     use crate::components::gateway::capture_tests::{facts, policy};
-    use crate::components::storage::inventory::{ObjectFact, ObjectOrigin, ObjectState};
     use crate::components::gateway::recording::{Received, RecordingScribe};
+    use crate::components::storage::inventory::{ObjectFact, ObjectOrigin, ObjectState};
     use crate::grpc::capture_peer::ScribeCapturePeerGrpc;
     use crate::verification::results::{InputRecord, ResultPayloadBuilder, ResultRun};
 
@@ -2595,7 +2595,10 @@ mod tests {
             .await
             .expect("the object frame reaches Scribe");
 
-        outbox.stage(tenant, elsewhere(&|| decision("bifrost.record.write").into()));
+        outbox.stage(
+            tenant,
+            elsewhere(&|| decision("bifrost.record.write").into()),
+        );
         outbox.stage(tenant, elsewhere(&|| capture(tenant).into()));
         let (route, span) = span_copy(tenant);
         ServerSpanSink::new(Arc::clone(&outbox)).stage(route, span);
@@ -2604,7 +2607,10 @@ mod tests {
             .find(|execution| lane(&direct_inputs(*execution, background())) != held_lane)
             .expect("some execution takes another lane");
         outbox.stage(tenant, direct_inputs(execution, background()));
-        outbox.stage(tenant, execution_result(execution, &uid(), background(), 0, 0));
+        outbox.stage(
+            tenant,
+            execution_result(execution, &uid(), background(), 0, 0),
+        );
         let deadline = Instant::now() + Duration::from_secs(10);
         loop {
             let tables: HashSet<_> = scribe
@@ -2624,7 +2630,10 @@ mod tests {
             if written && !scribe.inner.audit_frames().is_empty() {
                 break;
             }
-            assert!(Instant::now() < deadline, "other producers wait: {tables:?}");
+            assert!(
+                Instant::now() < deadline,
+                "other producers wait: {tables:?}"
+            );
             tokio::task::yield_now().await;
         }
         assert!(

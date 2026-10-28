@@ -9,8 +9,7 @@
 use std::sync::Arc;
 
 use arrow::array::{
-    ArrayRef, BooleanBuilder, Int64Builder, RecordBatch, StringBuilder,
-    TimestampMicrosecondBuilder,
+    ArrayRef, BooleanBuilder, Int64Builder, RecordBatch, StringBuilder, TimestampMicrosecondBuilder,
 };
 use arrow::datatypes::{DataType, SchemaRef, TimeUnit};
 use arrow::error::ArrowError;

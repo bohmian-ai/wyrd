@@ -28,7 +28,9 @@ use wyrd_storage::service::{self, StorageCaller};
 use crate::audit;
 use crate::components::auth::Caller;
 use crate::components::cards::service::card_file;
-use crate::components::storage::inventory::{ObjectFact, ObjectInventory, ObjectOrigin, ObjectState};
+use crate::components::storage::inventory::{
+    ObjectFact, ObjectInventory, ObjectOrigin, ObjectState,
+};
 use crate::http::error::WyrdErrorResponse;
 use crate::state::AppState;
 use utoipa_axum::router::OpenApiRouter;

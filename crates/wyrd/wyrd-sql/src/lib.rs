@@ -590,10 +590,7 @@ mod tests {
     #[test]
     fn storage_query_boundaries_are_explicit() {
         let crate_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
-        let tenant_modules = [
-            "multipart_uploads.rs",
-            "idempotency.rs",
-        ];
+        let tenant_modules = ["multipart_uploads.rs", "idempotency.rs"];
 
         for file_name in tenant_modules {
             let path = crate_dir.join("src/queries/storage").join(file_name);

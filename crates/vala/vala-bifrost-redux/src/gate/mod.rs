@@ -42,8 +42,8 @@ use crate::oracle::{AuthorizedQueryContext, OracleQueryStream, QueryStreamLifecy
 pub use crate::otlp_contract::{IngestOutcome, LogsOutcome, MetricsOutcome};
 use crate::scribe::preprocess::logical_data_identity;
 use crate::tables::{
-    CallsTable, DomainTable, ExecutionInputsTable, ExecutionOutputsTable, ObjectsTable, ResultsTable,
-    TableError,
+    CallsTable, DomainTable, ExecutionInputsTable, ExecutionOutputsTable, ObjectsTable,
+    ResultsTable, TableError,
 };
 use wyrd_runtime::principal::CardAttribution;
 use wyrd_spec::auth::Attribution;
@@ -2074,52 +2074,53 @@ mod tests {
         );
     }
 
-    /// No public principal can write the gateway call table through Gate.
-    ///
-    /// Capture is a server-internal write that never passes Gate, so even a
-    /// wildcard holder is refused before Scribe resolves anything, and the
-    /// refusal is recorded against the table it targeted.
+    /// Proves the server-written gateway call and storage object tables are
+    /// reserved to server capture: a public write by even a wildcard holder
+    /// is refused before Scribe resolves anything, and each refusal is
+    /// recorded against the table it targeted.
     ///
     /// # Panics
     ///
-    /// Panics when the write is admitted, reaches Scribe, or is not recorded
+    /// Panics when a write is admitted, reaches Scribe, or is not recorded
     /// as denied.
     #[tokio::test]
-    async fn gate_reserves_the_gateway_call_table_to_server_capture() {
-        let scribe = ResolvingScribe::new(random_uid());
-        let audit = RecordingAudit::new();
-        let gate = Gate::<RecordingAudit>::with_test_scribe(
-            Arc::clone(&scribe) as Arc<dyn crate::contracts::Scribe>,
-            test_interceptor(),
-            IngestLimits::default(),
-        )
-        .with_audit(Arc::clone(&audit));
-        let limits = IngestLimits::default();
-        let wildcard = [Permission {
-            resource: Resource::Wildcard,
-            action: Action::Wildcard,
-            scope: PermissionScope::All,
-        }];
+    async fn gate_reserves_server_capture_tables() {
+        for table in ["bifrost.gateway.calls", "bifrost.storage.objects"] {
+            let scribe = ResolvingScribe::new(random_uid());
+            let audit = RecordingAudit::new();
+            let gate = Gate::<RecordingAudit>::with_test_scribe(
+                Arc::clone(&scribe) as Arc<dyn crate::contracts::Scribe>,
+                test_interceptor(),
+                IngestLimits::default(),
+            )
+            .with_audit(Arc::clone(&audit));
+            let limits = IngestLimits::default();
+            let wildcard = [Permission {
+                resource: Resource::Wildcard,
+                action: Action::Wildcard,
+                scope: PermissionScope::All,
+            }];
 
-        let context = context_with(
-            PrincipalId::new(uuid::Uuid::now_v7()),
-            PrincipalKind::User,
-            wildcard,
-        );
-        let error = gate
-            .dispatch_native_frame(&limits, &context, native_frame("bifrost.gateway.calls"))
-            .await
-            .expect_err("no public principal writes the reserved call table");
-        assert!(matches!(
-            error,
-            IngestError::ReservedBuiltinWriteDenied { .. }
-        ));
-        assert_eq!(scribe.resolved.load(Ordering::Relaxed), 0);
-        assert_eq!(scribe.ingested.load(Ordering::Relaxed), 0);
-        assert_eq!(
-            audit.decisions(),
-            vec![("bifrost.gateway.calls".to_owned(), AuditOutcome::Denied)]
-        );
+            let context = context_with(
+                PrincipalId::new(uuid::Uuid::now_v7()),
+                PrincipalKind::User,
+                wildcard,
+            );
+            let error = gate
+                .dispatch_native_frame(&limits, &context, native_frame(table))
+                .await
+                .expect_err("no public principal writes a reserved table");
+            assert!(matches!(
+                error,
+                IngestError::ReservedBuiltinWriteDenied { .. }
+            ));
+            assert_eq!(scribe.resolved.load(Ordering::Relaxed), 0);
+            assert_eq!(scribe.ingested.load(Ordering::Relaxed), 0);
+            assert_eq!(
+                audit.decisions(),
+                vec![(table.to_owned(), AuditOutcome::Denied)]
+            );
+        }
     }
 
     /// A table-scoped record write is authorized against the resolved UID.

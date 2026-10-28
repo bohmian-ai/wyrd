@@ -36,11 +36,11 @@ use wyrd_storage::tenant_path;
 
 #[cfg(feature = "test-support")]
 use super::CapabilityCrash;
-use crate::components::cards::service::{card_file, reconciliation_caller};
-use crate::state::AppState;
 use super::RuntimeLimits;
 #[cfg(feature = "test-support")]
 use super::health::RuntimeCapability;
+use crate::components::cards::service::{card_file, reconciliation_caller};
+use crate::state::AppState;
 
 /// Stable error code when the pinned Verifier or Data Card cannot be used.
 pub const BASELINE_DATA_UNAVAILABLE: &str = "baseline_data_unavailable";

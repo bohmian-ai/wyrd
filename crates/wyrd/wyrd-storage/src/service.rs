@@ -372,7 +372,15 @@ pub async fn upload_complete(
         row.block_count_planned,
     )?;
     conn.commit().await.map_err(|error| map_sql_error(&error))?;
-    finish_upload(&state, caller, upload_uuid, validated, row, (!replay).then_some(payload)).await
+    finish_upload(
+        &state,
+        caller,
+        upload_uuid,
+        validated,
+        row,
+        (!replay).then_some(payload),
+    )
+    .await
 }
 
 /// Complete an upload on the server's behalf, without a client payload.

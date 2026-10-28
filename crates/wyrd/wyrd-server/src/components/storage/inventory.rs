@@ -24,8 +24,8 @@ use vala_bifrost_redux::catalog::TableRef;
 use vala_bifrost_redux::namespaces::BifrostNamespace;
 use vala_bifrost_redux::tables::DomainTable as _;
 use vala_bifrost_redux::tables::staged::{Cell, StagedRow};
-pub use vala_bifrost_redux::tables::storage::{ObjectOrigin, ObjectState};
 use vala_bifrost_redux::tables::storage::ObjectsTable;
+pub use vala_bifrost_redux::tables::storage::{ObjectOrigin, ObjectState};
 use wyrd_runtime::principal::PrincipalId;
 use wyrd_spec::DataTenantId;
 use wyrd_spec::auth::Attribution;
@@ -154,6 +154,8 @@ pub struct CardObjects {
     /// Completed files by Card-relative path, one per stored object;
     /// envelopes are excluded, and nothing remains once deleted.
     pub files: BTreeMap<String, StoredArtifactEntry>,
+    /// The recorded envelope's storage path and size, kept apart from files.
+    pub envelope: Option<(String, i64)>,
     /// Whether a deletion was recorded, which dominates every completion.
     pub deleted: bool,
 }
@@ -209,7 +211,10 @@ impl<'s> ObjectInventory<'s> {
         match acked.await {
             Ok(Ok(_)) => Ok(()),
             outcome => {
-                tracing::warn!(timed_out = outcome.is_err(), "an object inventory write was not acknowledged");
+                tracing::warn!(
+                    timed_out = outcome.is_err(),
+                    "an object inventory write was not acknowledged"
+                );
                 Err(BifrostError::WriterUnavailable {
                     table: OBJECTS.to_owned(),
                 }
@@ -228,7 +233,8 @@ impl<'s> ObjectInventory<'s> {
     /// # Errors
     /// Returns `WYRD_VALA_503_QUERY_VISIBILITY_UNAVAILABLE` when the SYSTEM
     /// principal or read authority is unavailable, the query's own error
-    /// when it fails, and an internal error when a stored row is malformed.
+    /// when it fails, and `WYRD_REGISTRY_400_INVALID_CARD_SPEC` when a stored
+    /// row is malformed or not bound to `card_uid` in `tenant`.
     #[tracing::instrument(skip_all, fields(%tenant, %card_uid))]
     pub async fn card_objects(
         &self,
@@ -308,7 +314,8 @@ impl<'s> ObjectInventory<'s> {
                 text("sha256")?,
                 text("content_type")?,
             );
-            let (origins, relatives, states) = (text("origin")?, text("relative_path")?, text("state")?);
+            let (origins, relatives, states) =
+                (text("origin")?, text("relative_path")?, text("state")?);
             let sizes = batch
                 .column_by_name("size_bytes")
                 .and_then(|column| column.as_primitive_opt::<Int64Type>())
@@ -322,6 +329,7 @@ impl<'s> ObjectInventory<'s> {
                     continue;
                 }
                 if ObjectOrigin::parse(origins.value(row)) == Some(ObjectOrigin::CardEnvelope) {
+                    objects.envelope = Some((paths.value(row).to_owned(), sizes.value(row)));
                     continue;
                 }
                 let relative = cell(relatives).ok_or_else(|| invalid("relative_path"))?;
@@ -347,6 +355,7 @@ impl<'s> ObjectInventory<'s> {
         }
         if objects.deleted {
             objects.files.clear();
+            objects.envelope = None;
         }
         Ok(objects)
     }

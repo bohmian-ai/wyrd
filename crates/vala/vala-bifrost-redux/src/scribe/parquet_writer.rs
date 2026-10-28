@@ -370,7 +370,6 @@ impl<'a> ParquetBatchEncoder<'a> {
             self.plan(),
             VariantPlan::Staged {
                 logical: Arc::clone(&self.frozen.schema),
-                layout: VariantLayout::default(),
             },
         );
         for candidate in &self.candidates {
@@ -619,34 +618,25 @@ struct RollingArtifactWriter<'a> {
 /// The Variant layout a rolling writer opens every artifact with.
 ///
 /// Both kinds preserve native input: a batch that already carries the
-/// artifact's physical schema is written as is, and only a logical batch is
-/// shredded, so rows are never re-shredded.
+/// artifact's physical schema is written as is and is never shredded again.
 enum VariantPlan {
-    /// A staged run in its frozen generation's layout.
+    /// A staged run in its frozen generation's own layout.
     ///
-    /// The generation's rows are already in that layout, so `logical` — the
-    /// generation's logical schema — names the footer identity. Staged runs
-    /// are not measured by the residual-share metric.
+    /// Every batch of a generation already carries the one physical schema
+    /// the generation pinned when it opened — canonical, or shredded — so the
+    /// artifact opens on the first batch's schema and writes each batch
+    /// natively. `logical`, the generation's logical schema, names the footer
+    /// identity. Staged runs are not measured by the residual-share metric.
     Staged {
         /// Logical schema of the generation being staged.
         logical: Arc<Schema>,
-        /// Layout the generation's rows were shredded with at admission.
-        layout: VariantLayout,
     },
     /// A final object shredded with the claim's freshly sampled layout.
     ///
     /// The claim merge emits logical rows, so the first batch's schema is the
-    /// logical schema. Final objects are measured by the residual-share metric.
+    /// logical schema and each batch is shredded. Final objects are measured
+    /// by the residual-share metric.
     Final(VariantLayout),
-}
-
-impl VariantPlan {
-    /// Returns the layout every artifact is opened with.
-    const fn layout(&self) -> &VariantLayout {
-        match self {
-            Self::Staged { layout, .. } | Self::Final(layout) => layout,
-        }
-    }
 }
 
 impl<'a> RollingArtifactWriter<'a> {
@@ -715,8 +705,8 @@ impl<'a> RollingArtifactWriter<'a> {
     /// Hands one batch to the encoder in the open artifact's physical schema.
     ///
     /// A batch already in that schema — native input from a shredded
-    /// generation — is written as is; any other batch is shredded with the
-    /// writer's layout.
+    /// generation — is written as is; any other batch of a final object is
+    /// shredded with the claim's layout, and any other staged batch is refused.
     ///
     /// # Errors
     ///
@@ -740,9 +730,12 @@ impl<'a> RollingArtifactWriter<'a> {
         {
             ordered_batch
         } else {
-            shredded = self
-                .variants
-                .layout()
+            let VariantPlan::Final(layout) = &self.variants else {
+                return Err(ScribeError::Internal {
+                    detail: "a staged generation's batches changed physical layout".to_owned(),
+                });
+            };
+            shredded = layout
                 .shred(ordered_batch)
                 .map_err(|error| variant_error(&error))?;
             &shredded
@@ -778,8 +771,8 @@ impl<'a> RollingArtifactWriter<'a> {
     /// Opens the next artifact for the batch that is about to be written.
     ///
     /// The artifact keeps the logical schema — the staged generation's, or
-    /// the claim batch's own — and its encoder is opened on the writer's
-    /// Variant layout's physical schema for it.
+    /// the claim batch's own. A staged run's encoder opens on the batch's own
+    /// physical schema; a final object's on its layout's physical schema.
     ///
     /// # Errors
     ///
@@ -799,15 +792,16 @@ impl<'a> RollingArtifactWriter<'a> {
         let file = std::fs::File::create(&scratch_path).map_err(|error| ScribeError::Internal {
             detail: format!("create Scribe Parquet scratch artifact: {error}"),
         })?;
-        let schema = match &self.variants {
-            VariantPlan::Staged { logical, .. } => Arc::clone(logical),
-            VariantPlan::Final(_) => group.schema(),
+        let (schema, physical) = match &self.variants {
+            VariantPlan::Staged { logical } => (Arc::clone(logical), group.schema()),
+            VariantPlan::Final(layout) => {
+                let schema = group.schema();
+                let physical = layout
+                    .physical_schema(&schema)
+                    .map_err(|error| variant_error(&error))?;
+                (schema, physical)
+            }
         };
-        let physical = self
-            .variants
-            .layout()
-            .physical_schema(&schema)
-            .map_err(|error| variant_error(&error))?;
         let physical_fingerprint =
             crate::schema::SchemaFingerprint::from_arrow_schema_exact(&physical);
         let writer = ArrowWriter::try_new(
@@ -3237,7 +3231,7 @@ mod tests {
             .expect("native input in the run's layout");
         let mut writer = RollingArtifactWriter::new(
             claim_plan(scratch, &physical_layout, tenant),
-            VariantPlan::Staged { logical, layout },
+            VariantPlan::Staged { logical },
         );
         writer
             .append_ordered_batch(&native)

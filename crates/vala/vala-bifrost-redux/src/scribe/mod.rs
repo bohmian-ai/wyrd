@@ -14,6 +14,7 @@ pub mod geometry;
 pub mod hot_source;
 pub mod hot_stage;
 mod ingress;
+pub(crate) mod layout_cache;
 pub mod manifest;
 pub(crate) mod material_plan;
 pub mod member_stager;
@@ -1199,6 +1200,8 @@ impl ScribeImpl {
                 seal_max_age,
                 wal: Arc::clone(&wal),
                 persistence_cpu: persistence_cpu.clone(),
+                ingress_cpu: ingress_cpu.clone(),
+                variant_layouts: Arc::clone(memory.variant_layouts()),
                 wal_io: wal_io.clone(),
                 persistence: persistence.clone(),
                 control_postgres: control_postgres.clone(),

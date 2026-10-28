@@ -5,7 +5,7 @@ pub mod fingerprint;
 use std::sync::Arc;
 
 use arrow::array::{ArrayRef, RecordBatch};
-use arrow::datatypes::{FieldRef, Schema};
+use arrow::datatypes::{Field, FieldRef, Schema};
 
 pub use fingerprint::SchemaFingerprint;
 
@@ -36,7 +36,6 @@ pub fn logical_batch(batch: &RecordBatch, logical: &Schema) -> Result<RecordBatc
     let mut fields: Vec<FieldRef> = Vec::with_capacity(schema.fields().len());
     let mut columns: Vec<ArrayRef> = Vec::with_capacity(fields.capacity());
     let mut changed = false;
-    let canonical = wyrd_types::variant::variant_storage_type();
     for (field, column) in schema.fields().iter().zip(batch.columns()) {
         let target = logical
             .field_with_name(field.name())
@@ -46,26 +45,8 @@ pub fn logical_batch(batch: &RecordBatch, logical: &Schema) -> Result<RecordBatc
             columns.push(Arc::clone(column));
             continue;
         }
-        let (_, restored) = iceberg::arrow::unshred_variants(field, column)
-            .and_then(|(field, column)| {
-                iceberg::arrow::map_variant_fields(&field, &column, &mut |variant| {
-                    if variant.data_type() == &canonical {
-                        return Ok(Arc::clone(variant));
-                    }
-                    Ok(arrow::compute::cast(variant, &canonical)?)
-                })
-            })
-            .map_err(|error| format!("unshred column `{}`: {error}", field.name()))?;
-        if restored.data_type() != target.data_type() {
-            return Err(format!(
-                "column `{}` is {} but the logical schema declares {}",
-                field.name(),
-                restored.data_type(),
-                target.data_type()
-            ));
-        }
+        columns.push(logical_column(field, column, target)?);
         fields.push(Arc::new(target.clone()));
-        columns.push(restored);
         changed = true;
     }
     if !changed {
@@ -76,4 +57,47 @@ pub fn logical_batch(batch: &RecordBatch, logical: &Schema) -> Result<RecordBatc
         columns,
     )
     .map_err(|error| format!("assemble the logical batch: {error}"))
+}
+
+/// Restores one physical column to the type of its `logical` field.
+///
+/// Only Variant storage is rewritten: each shredded Variant in `column`, at
+/// any Struct or List depth, is reconstructed from its typed leaves and
+/// residual by the recursive `unshred_variants` and stored as the canonical
+/// Wyrd Variant storage. A column already of the logical type is returned as
+/// is. `field` is the column's physical field, which still carries every
+/// Variant marker.
+///
+/// # Errors
+///
+/// Returns a refusal naming the column when it cannot be unshredded or its
+/// reconstruction is not exactly the logical type.
+pub fn logical_column(
+    field: &FieldRef,
+    column: &ArrayRef,
+    logical: &Field,
+) -> Result<ArrayRef, String> {
+    if column.data_type() == logical.data_type() {
+        return Ok(Arc::clone(column));
+    }
+    let canonical = wyrd_types::variant::variant_storage_type();
+    let (_, restored) = iceberg::arrow::unshred_variants(field, column)
+        .and_then(|(field, column)| {
+            iceberg::arrow::map_variant_fields(&field, &column, &mut |variant| {
+                if variant.data_type() == &canonical {
+                    return Ok(Arc::clone(variant));
+                }
+                Ok(arrow::compute::cast(variant, &canonical)?)
+            })
+        })
+        .map_err(|error| format!("unshred column `{}`: {error}", field.name()))?;
+    if restored.data_type() != logical.data_type() {
+        return Err(format!(
+            "column `{}` is {} but the logical schema declares {}",
+            field.name(),
+            restored.data_type(),
+            logical.data_type()
+        ));
+    }
+    Ok(restored)
 }

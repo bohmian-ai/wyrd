@@ -867,7 +867,10 @@ impl ScribeStagingRuntime {
     ///
     /// This is the blocking half of assembly and belongs on the persistence CPU
     /// lane. Objects roll at the configured target, so a claim that overshoots
-    /// its target publishes several objects rather than one oversized one.
+    /// its target publishes several objects rather than one oversized one. A
+    /// successful assembly refreshes the process's advisory Variant layout for
+    /// the claim's exact tenant, table, and version, so generations opened
+    /// later retain their rows in the layout this claim learned.
     ///
     /// # Errors
     ///
@@ -881,7 +884,8 @@ impl ScribeStagingRuntime {
     ) -> Result<AssembledClaim, ScribeError> {
         let context = self.context_for(claim.key())?;
         let object_base = claim_object_base(claim, request.runs, &context)?;
-        self.claims.encode(AssembleClaimRequest {
+        let resources = request.memory.clone();
+        let assembled = self.claims.encode(AssembleClaimRequest {
             runs: request.runs,
             schema: Arc::clone(&context.schema),
             layout: &context.layout,
@@ -890,7 +894,15 @@ impl ScribeStagingRuntime {
             target_object_bytes: self.target_object_bytes,
             memory: request.memory,
             tenant: context.binding.tenant,
-        })
+        })?;
+        let key = claim.key();
+        resources.variant_layouts().install(
+            &resources,
+            (key.tenant(), key.table().clone(), key.table_version()),
+            Arc::clone(&context.schema),
+            assembled.variant_layout.clone(),
+        );
+        Ok(assembled)
     }
 
     /// Publishes one assembled claim, retires its members, and settles it.

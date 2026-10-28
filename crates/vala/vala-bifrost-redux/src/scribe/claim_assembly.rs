@@ -101,6 +101,11 @@ pub struct AssembledClaim {
     pub row_group_stats: Vec<RowGroupStats>,
     /// Rows written across the objects, equal to the claim's promised rows.
     pub rows: u64,
+    /// Variant layout the claim's sample chose and every object was shredded with.
+    ///
+    /// Returned so the caller can refresh the process's advisory layout hint
+    /// for the claim's table definition.
+    pub variant_layout: iceberg::writer::file_writer::variant_shredding::VariantLayout,
 }
 
 /// Merges and encodes the members of one claim.
@@ -272,7 +277,7 @@ impl ClaimAssembler {
                 tenant: request.tenant,
             },
             &request.memory,
-            variant_layout,
+            variant_layout.clone(),
             merge,
         )?;
         let rows = artifacts.iter().try_fold(0_u64, |sum, artifact| {
@@ -296,6 +301,7 @@ impl ClaimAssembler {
             artifacts,
             row_group_stats,
             rows,
+            variant_layout,
         })
     }
 }

@@ -21,15 +21,17 @@ use wyrd_client::transport::config::HttpConfig;
 use wyrd_client::transport::credential::ResolvedCredential;
 use wyrd_server::config::BifrostTarget;
 use wyrd_spec::DataTenantId;
+use wyrd_spec::auth::Sha256Hex;
 use wyrd_spec::ids::CardUid;
 use wyrd_spec::storage::{
     DownloadInitRequest, DownloadInitResponse, DownloadPlan, StorageBackendKind, UploadInitRequest,
     UploadInitResponse, UploadPlan,
 };
+use wyrd_spec::verification::execution::{EvidenceFile, EvidencePlanRequest, EvidencePlanResponse};
 use wyrd_storage::{BackendConfig, StorageSettings, settings};
 use wyrd_testing::WyrdTestServer;
 
-/// Card identity every journey plans against; storage paths are scoped by tenant, so reuse is safe.
+/// Card identity the refusal journey names; it is refused before the Card is resolved.
 const FIXED_CARD_UID: &str = "018f0000-0000-7000-8000-000000000001";
 /// Payload size below [`LOW_THRESHOLD_BYTES`], so plans are a single PUT.
 const SINGLE_PUT_PAYLOAD_BYTES: usize = 512 * 1024;
@@ -92,6 +94,32 @@ async fn bootstrap_service_jwt(srv: &WyrdTestServer, name: &str) -> String {
     srv.exchange_api_key(service.api_key().expect("service API key"))
         .await
         .expect("exchange API key")
+}
+
+/// Registers the Service Card a journey uploads for and returns its UID.
+///
+/// Completion records a card-scoped inventory fact, which Scribe refuses for
+/// a Card the tenant never registered.
+///
+/// # Panics
+/// Panics when registration is refused or returns no UID.
+async fn register_card(client: &WyrdClient) -> CardUid {
+    let registered: serde_json::Value = client
+        .submit_with_idempotency_key(
+            reqwest::Method::POST,
+            "/v1/cards",
+            &serde_json::json!({ "submissions": [{
+                "apiVersion": "wyrd/v1", "kind": "Service",
+                "metadata": { "name": "storage-journey", "version": "1.0.0" },
+                "spec": {},
+                "artifacts": []
+            }] }),
+            "storage-journey-card",
+        )
+        .await
+        .expect("register the journey Card");
+    serde_json::from_value(registered["outcomes"][0]["card_ref"]["uid"].clone())
+        .expect("registration returns the Card UID")
 }
 
 /// Starts a bound artifact-storage server over `settings`.
@@ -194,7 +222,8 @@ async fn purge_journey_objects(settings: &StorageSettings, tenant: DataTenantId)
 ///
 /// Starts a bound server over `settings`, initializes an upload for
 /// `relative_path` with `content_size` patterned bytes (which selects the
-/// single-PUT or multipart plan against [`LOW_THRESHOLD_BYTES`]), uploads and completes it through `WyrdStorageClient`, plans a download, and
+/// single-PUT or multipart plan against [`LOW_THRESHOLD_BYTES`]), uploads and completes it through `WyrdStorageClient`, uploads and
+/// completes the same bytes as a verification File on the same protocol, plans a download, and
 /// streams it back with digest and size verification. The server is shut down
 /// and every object the run could produce is purged *before* the download
 /// outcome is asserted, so a failed transfer still cleans shared cloud buckets.
@@ -217,7 +246,7 @@ async fn run_client_server_journey(
     let client = client_for(&srv, &token);
     let storage = WyrdStorageClient::new(&client);
     let content = patterned_payload(content_size);
-    let card_uid = CardUid::new(FIXED_CARD_UID).expect("card UID");
+    let card_uid = register_card(&client).await;
     let idempotency_key = "storage-client-journey-001";
     let init: UploadInitResponse = client
         .submit_with_idempotency_key(
@@ -244,6 +273,50 @@ async fn run_client_server_journey(
         )
         .await
         .expect("storage client uploads and completes artifact");
+
+    // The same bytes as a verification File: a Card file never supplies one,
+    // so it is planned on the same protocol and completed through the same
+    // client, after which the next plan reuses its completed record.
+    let files = EvidencePlanRequest {
+        files: vec![EvidenceFile {
+            sha256: Sha256Hex::digest(&content),
+            size_bytes: content.len() as u64,
+        }],
+    };
+    let planned: EvidencePlanResponse = client
+        .request_json(
+            reqwest::Method::POST,
+            "/v1/verification/evidence",
+            Some(&files),
+        )
+        .await
+        .expect("File evidence plans");
+    let [file] = planned.uploads.as_slice() else {
+        panic!("one File upload is planned: {planned:?}");
+    };
+    assert_eq!(
+        std::mem::discriminant(&file.plan),
+        std::mem::discriminant(&upload_plan),
+        "a File follows the Card file's planner policy"
+    );
+    storage
+        .upload_artifact(
+            &file.upload_id,
+            &file.plan,
+            content.clone(),
+            "storage-file-journey-001",
+        )
+        .await
+        .expect("storage client uploads and completes the File");
+    let reused: EvidencePlanResponse = client
+        .request_json(
+            reqwest::Method::POST,
+            "/v1/verification/evidence",
+            Some(&files),
+        )
+        .await
+        .expect("File evidence replans");
+    assert!(reused.uploads.is_empty(), "the completed File is reused");
 
     let download: DownloadInitResponse = client
         .request_json(
@@ -411,7 +484,7 @@ async fn local_upload_capability_rejects_raw_paths_and_bad_bytes() {
     let token = bootstrap_service_jwt(&srv, "storage-local-negative").await;
     let client = client_for(&srv, &token);
     let content = b"good";
-    let card_uid = CardUid::new(FIXED_CARD_UID).expect("card UID");
+    let card_uid = register_card(&client).await;
     let init: UploadInitResponse = client
         .submit_with_idempotency_key(
             reqwest::Method::POST,

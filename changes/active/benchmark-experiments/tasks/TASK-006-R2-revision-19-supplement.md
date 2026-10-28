@@ -719,3 +719,21 @@ Median rows/s across 3 repetitions at 64 clients, with `WYRD_SCRIBE_SHARD_COUNT`
 The flush rate barely grows with shard count, and each flush is slower. A `write(256 KiB)` + `fdatasync` loop on this volume reaches 71, 135 and 155 MiB/s with 1, 4 and 16 files. Over zero-filled, preallocated files, which leave ext4 no metadata to journal, it reaches 74, 125 and 181 MiB/s. Journal commits are therefore not the cost; the device flush is. The limit on this host is the flush rate of the drive. The server uses 4–14 of 32 cores. The PostgreSQL fence (`visibility`) p50 is 2–8 ms and falls as shards are added.
 
 **Variance.** The same configuration ranges widely between repetitions. For native at 16 shards with `wal_io_threads = 16`, rows/s is 4.25–6.47M, and 1-shard native `wal_sync` p50 is 61 ms in `211631Z` and 93 ms in `220635Z`. The disk's latency moves between runs, so a single before/after native comparison needs a gap larger than this spread before it can be called an improvement.
+
+### Item 9(b) change 1: one WAL IO operation per group for slices and COMMITs
+
+`ffee347ee` makes `write_group` stage every SLICE record and send them as one `ScribeWalIoOp::WriteIngressSlices`. `append_and_sync_batch_commits` sends every COMMIT record as one `WritePrepared`. A group now makes three WAL IO submissions (slices, COMMITs, sync) instead of one per slice plus one per COMMIT plus one sync. `scribe::shards::tests::group_commit_writes_and_syncs_once` pins the three. All 383 `scribe::` lib tests pass under the test Postgres.
+
+Median rows/s at 64 clients, before (`1b4f52795` sweep) and after (`20261028T010252Z`, `010501Z`, `010709Z`, `011548Z`, `011803Z`, all VALID, `wal_io_threads` = 4):
+
+| Shards | spans | 1 KiB spans | logs | native |
+|---|---|---|---|---|
+| 1 | 494k → 503k | 185k → 187k | 220k → 237k | 4.59M → 4.96M |
+| 2 | 506k → 497k | 192k → 194k | 257k → 254k | 5.24M → 4.88M |
+| 4 | 515k → 518k | 199k → 198k | 269k → 272k | 5.01M → 4.70M |
+| 8 | 463k → 395k | 199k → 192k | 266k → 220k | 4.96M → 3.81M |
+| 16 | 332k → 403k | 195k → 196k | 230k → 232k | 3.48M → 3.48M |
+
+No measurable improvement; every change is within the run-to-run spread recorded under 9(a). At 16 shards `wal_append` p50 is still 23–87 ms with one submission per group, so the queueing is not per submission. A group's single write still waits behind the syncs that hold the pool's 4 threads (`wal_sync` p50 20–72 ms). Change 2, which takes the sync off the write path, addresses that.
+
+Peak server memory grows with shard count: native 37.3 GB at 4 shards, 47.2 GB at 8 and 56.2 GB at 16, with a 26.8, 31.4 and 38.6 GB memtable backlog. The server's managed memory is the host limit minus the 1 GiB minimum. On this shared 91 GiB host, the first 8-shard run was stopped by the session's memory-pressure guard. That was not a kernel OOM: no OOM appears in the journal.

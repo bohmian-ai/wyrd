@@ -5049,6 +5049,206 @@ mod tests {
         );
     }
 
+    /// Upgrading recovers v8 shard segments through their own decoder and
+    /// keeps them, routes v9 records by their checked shard so one shard's
+    /// watermark suppresses only its own records, and retires a shared
+    /// segment only once every shard generation and cohort released it.
+    #[test]
+    fn v8_recovery_and_v9_shared_retirement_are_exact() {
+        use crate::scribe::stream_identity::{StreamIdentity, WriterEpoch};
+        let temp_dir = TempDir::new().expect("WAL root");
+        let node = crate::scribe::stream_identity::NodeId::generate();
+        let seal_key = test_seal_key(crate::test_support::tenant());
+        let shard_of = |batch_id: [u8; 16]| {
+            u8::try_from(crate::scribe::routing::shard_for(
+                seal_key.tenant,
+                &seal_key.table,
+                uuid::Uuid::from_bytes(batch_id),
+                crate::scribe::routing::TEST_SHARD_COUNT,
+            ))
+            .expect("fixed shard count fits in u8")
+        };
+        let first_batch = [1_u8; 16];
+        let second_batch = (2..=u8::MAX)
+            .map(|value| [value; 16])
+            .find(|batch_id| shard_of(*batch_id) != shard_of(first_batch))
+            .expect("a batch on another shard");
+        let (first, second) = (shard_of(first_batch), shard_of(second_batch));
+        let stream_dir = |epoch: i64| {
+            temp_dir
+                .path()
+                .join(node.as_uuid().simple().to_string())
+                .join(epoch.to_string())
+        };
+        let config = || WalConfig::new(16 * 1024 * 1024).expect("single-segment config");
+
+        // Epoch 1 is a v8 stream: each shard's records in its own segment.
+        let v8_writer =
+            WalWriter::new(temp_dir.path(), *node.as_bytes(), 1, config()).expect("epoch 1");
+        for batch_id in [first_batch, second_batch] {
+            v8_writer
+                .append_and_commit_for_replay_test(&seal_key, batch_id, b"v8")
+                .expect("epoch 1 group");
+        }
+        v8_writer.close_all_streams().expect("close epoch 1");
+        drop(v8_writer);
+        let records = WalReader::open_directory_unfiltered(temp_dir.path())
+            .expect("epoch 1 reader")
+            .read_all_records()
+            .expect("epoch 1 records");
+        std::fs::remove_dir_all(stream_dir(1)).expect("drop v9 fixture source");
+        let mut v8_paths = Vec::new();
+        for shard in [first, second] {
+            let shard_dir = stream_dir(1).join(format!("shard-{shard:02}"));
+            std::fs::create_dir_all(&shard_dir).expect("v8 shard directory");
+            let path = shard_dir.join("0.wal");
+            let segment =
+                WalSegment::create(&path, SegmentHeader::new_v8(*node.as_bytes(), 1, 0, shard))
+                    .expect("v8 segment");
+            for record in records.iter().filter(|record| record.shard_id == shard) {
+                segment.append_and_fsync(record).expect("v8 record");
+            }
+            v8_paths.push(path);
+        }
+
+        // Epoch 2 is v9: both shards interleave in one shared segment, and
+        // only the first shard's group is watermarked.
+        let v9_writer =
+            WalWriter::new(temp_dir.path(), *node.as_bytes(), 2, config()).expect("epoch 2");
+        for batch_id in [first_batch, second_batch] {
+            v9_writer
+                .append_and_commit_for_replay_test(&seal_key, batch_id, b"v9")
+                .expect("epoch 2 group");
+        }
+        v9_writer.close_all_streams().expect("close epoch 2");
+        drop(v9_writer);
+        let epoch_two = StreamIdentity::new(node, WriterEpoch::new(2));
+        let shared_segments = std::fs::read_dir(stream_dir(2).join("shard-00"))
+            .expect("shared segment directory")
+            .map(|entry| entry.expect("shared segment entry").path())
+            .filter(|path| path.extension().is_some_and(|extension| extension == "wal"))
+            .collect::<Vec<_>>();
+        assert_eq!(shared_segments.len(), 1, "v9 shards share one segment");
+        let epoch_two_records = WalReader::open_directory_unfiltered(stream_dir(2))
+            .expect("epoch 2 reader")
+            .read_all_records()
+            .expect("epoch 2 records");
+        let first_sealed = epoch_two_records
+            .iter()
+            .filter(|record| record.shard_id == first)
+            .map(|record| record.lsn)
+            .max()
+            .expect("first shard records");
+        let mut manifest = crate::scribe::manifest::Manifest::new(epoch_two);
+        manifest.update_sealed_lsn(&seal_key, first_sealed);
+        crate::scribe::manifest::write_atomic(
+            crate::scribe::replay::shard_manifest_path(temp_dir.path(), epoch_two, first),
+            &manifest,
+        )
+        .expect("first shard watermark");
+
+        // A corrupted shard byte fails the record CRC instead of rerouting it.
+        let header = SegmentHeader::new(*node.as_bytes(), 2, 0);
+        let mut corrupted = epoch_two_records[0].encode(&header);
+        corrupted[RECORD_HEADER_SIZE_V8] ^= 1;
+        assert!(WalRecord::decode_from(&mut corrupted.as_slice(), &header).is_err());
+
+        // Restart replays both formats with no retirement references rebuilt.
+        let restarted =
+            WalWriter::new(temp_dir.path(), *node.as_bytes(), 3, config()).expect("epoch 3");
+        let mut replayed = Vec::new();
+        crate::scribe::replay::replay_wal_directory_stream_accounted(
+            temp_dir.path(),
+            Some(StreamIdentity::new(node, WriterEpoch::new(3))),
+            None,
+            Some(&restarted),
+            None,
+            None,
+            |mut chunk| {
+                // The shard owner retains replayed segments until it publishes.
+                for state in chunk.states.values() {
+                    restarted.retain_segments(&state.wal_segments)?;
+                }
+                replayed.extend(chunk.states.values().map(|state| {
+                    (
+                        state.stream.writer_epoch.as_i64(),
+                        state.shard_id,
+                        state.wal_lane,
+                        state.append_metas.len(),
+                    )
+                }));
+                Ok(crate::scribe::replay::ReplayChunkSettlement {
+                    identity_memory: chunk.identity_memory.take(),
+                })
+            },
+        )
+        .expect("mixed-format replay");
+        replayed.sort_unstable();
+        let mut expected = vec![
+            (1, first, first, 1),
+            (1, second, second, 1),
+            (2, second, 0, 1),
+        ];
+        expected.sort_unstable();
+        assert_eq!(
+            replayed, expected,
+            "the watermark suppresses only its shard"
+        );
+        for path in &v8_paths {
+            assert!(path.exists(), "upgrading never deletes v8 segments");
+        }
+        assert!(
+            shared_segments[0].exists(),
+            "one safe shard never retires a segment another shard still reads"
+        );
+
+        // Live shared retirement: two shard generations, then their cohorts.
+        let live = WalWriter::new(stream_dir(9), [43_u8; 16], 1, config()).expect("live writer");
+        let (zero, seven) = (
+            live.handle_for_shard(0).expect("shard zero"),
+            live.handle_for_shard(7).expect("shard seven"),
+        );
+        let append = |handle: &WalHandle, batch: u8| {
+            let prepared =
+                PreparedWalAppend::new(WalLsn::ZERO, [batch; 16], Bytes::from_static(b"live"))
+                    .for_slice(seal_key.clone(), [7_u8; 32]);
+            let result = handle.append_prepared(prepared).expect("live append");
+            handle
+                .sync_segments(&result.touched_segments)
+                .expect("live sync");
+        };
+        let rotate = |handle: &WalHandle| {
+            let closed = handle.close_active_generation().expect("close generation");
+            handle.retain_segments(&closed).expect("cohort retains");
+            handle
+                .retire_segments(&closed)
+                .expect("generation releases");
+            closed
+        };
+        append(&zero, 1);
+        append(&seven, 2);
+        let zero_cohort = rotate(&zero);
+        assert_eq!(zero_cohort.len(), 1);
+        let shared = zero_cohort[0].path.clone();
+        zero.retire_segments(&zero_cohort)
+            .expect("zero cohort publishes");
+        assert!(shared.exists(), "shard seven's generation still holds it");
+        let seven_cohort = rotate(&seven);
+        assert_eq!(seven_cohort[0].path, shared);
+        seven
+            .retire_segments(&seven_cohort)
+            .expect("seven cohort publishes");
+        assert!(shared.exists(), "a released current segment is deferred");
+        append(&zero, 3);
+        live.close_all_streams().expect("detach shared segment");
+        live.retire_segments(&[]).expect("deferred pass");
+        assert!(shared.exists(), "a re-retained deferred segment is kept");
+        let last_cohort = rotate(&zero);
+        zero.retire_segments(&last_cohort)
+            .expect("last cohort publishes");
+        assert!(!shared.exists(), "the last release retires the segment");
+    }
+
     /// A filesystem retirement failure preserves the source path for a later retry.
     #[test]
     fn segment_retirement_failure_preserves_retryable_source() {

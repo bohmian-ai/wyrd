@@ -321,6 +321,17 @@ impl PolicyDesk {
         answer(&upstream, "REFUSE-POLICY", BREAKS, 3).await;
         answer(&upstream, "UNCITED", UNCITED, 3).await;
         answer(&upstream, "JUDGE-MALFORMED", "not a verdict", 3).await;
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .and(body_string_contains("JUDGE-REPAIRED"))
+            .and(body_string_contains("was not accepted"))
+            .respond_with(completion(
+                json!({ "role": "assistant", "content": FOLLOWS }),
+            ))
+            .with_priority(2)
+            .mount(&upstream)
+            .await;
+        answer(&upstream, "JUDGE-REPAIRED", "not a verdict", 3).await;
         answer(&upstream, "JUDGE-FOREIGN-CITE", FOREIGN_CITE, 3).await;
         script_investigator(&upstream).await;
         answer(&upstream, "Claim:", FOLLOWS, 4).await;
@@ -1127,6 +1138,52 @@ async fn invalid_judge_verdicts_are_inconclusive() {
             "{marker}"
         );
     }
+    let result = desk.review(review("JUDGE-MALFORMED", 50, None)).await;
+    let malformed = requirement(&result, "follows-policy");
+    assert!(
+        malformed
+            .reason
+            .contains("WYRD_AGENT_422_STRUCTURED_INVALID")
+            && !malformed.reason.contains("not a verdict"),
+        "{malformed:?}"
+    );
+    desk.deployment.shutdown().await;
+}
+
+/// A judge answering outside its response schema is asked to correct its
+/// reply within its iteration budget, and the corrected Verdict judges
+/// `follows-policy`.
+///
+/// # Panics
+/// Panics when the review is refused, the repair turn is missing, or the
+/// corrected Verdict does not pass citing the answer.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires the repository-managed Postgres journey lifecycle"]
+async fn judge_repairs_an_invalid_verdict() {
+    let desk = PolicyDesk::start().await;
+
+    let result = desk
+        .review(review(
+            "JUDGE-REPAIRED: refunds follow our policy.",
+            50,
+            None,
+        ))
+        .await;
+
+    let judged = requirement(&result, "follows-policy");
+    assert_eq!(judged.outcome, RequirementOutcome::Passed, "{judged:?}");
+    assert_eq!(judged.citations, answer_text());
+    let asked: Vec<String> = desk
+        .upstream
+        .received_requests()
+        .await
+        .expect("the upstream records requests")
+        .iter()
+        .map(|request| String::from_utf8_lossy(&request.body).into_owned())
+        .filter(|body| body.contains("JUDGE-REPAIRED") && body.contains("Rules:"))
+        .collect();
+    assert_eq!(asked.len(), 2, "one repair");
+    assert!(asked[1].contains("was not accepted"), "{}", asked[1]);
     desk.deployment.shutdown().await;
 }
 

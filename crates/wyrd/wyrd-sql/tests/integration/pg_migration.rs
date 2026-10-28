@@ -1488,13 +1488,12 @@ mod pg_tests {
     /// `bifrost.storage.objects`.
     ///
     /// # Panics
-    /// Panics when migrations fail, the removed inventory table exists, or a
-    /// coordination table is missing.
+    /// Panics when the database DSNs are absent or invalid, migrations fail,
+    /// the removed inventory table exists, or a coordination table is
+    /// missing.
     #[tokio::test]
     async fn fresh_install_has_no_postgres_object_inventory() {
-        let Some(url) = database_url() else {
-            return;
-        };
+        let url = database_url().expect("the fresh-install proof requires database DSNs");
         let store = owner_pool(&url).await.expect("migrator connects");
         migrate_under_lease(store.pool())
             .await

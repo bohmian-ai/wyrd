@@ -334,7 +334,7 @@ impl Memtable {
     /// A new generation pins `layout` for its whole life and keeps the
     /// layout's logical schema as its table schema, while its batches hold the
     /// physical rows. Every later append to that generation must carry the
-    /// same layout; the shard chose it from [`Self::pinned_layout`] before
+    /// same layout; the shard chose it from [`Self::generation_layout`] before
     /// converting, so a difference is an ownership bug and is refused.
     ///
     /// # Errors
@@ -372,22 +372,28 @@ impl Memtable {
         Ok(())
     }
 
-    /// Returns the Variant layout the open generation of `seal_key` pinned, if one is open.
+    /// Returns the Variant layout rows of `seal_key` must take; `None` is canonical.
     ///
-    /// The outer `None` means no generation is open, so the caller may choose
-    /// a layout for the one its rows will open; `Some(None)` is an open
-    /// canonical generation.
+    /// An open generation keeps the layout it pinned. With none open, the
+    /// generation the rows will open takes `fresh()`, which is called with
+    /// the bucket lock released.
     ///
     /// # Errors
     /// Returns [`ScribeError::Internal`] if the bucket lock is poisoned.
-    pub(crate) fn pinned_layout(
+    pub(crate) fn generation_layout(
         &self,
         seal_key: &SealKey,
-    ) -> Result<Option<Option<Arc<crate::scribe::layout_cache::LearnedLayout>>>, ScribeError> {
-        let buckets = self.writable.read().map_err(|e| ScribeError::Internal {
-            detail: format!("memtable bucket lock poisoned: {e}"),
-        })?;
-        Ok(buckets.get(seal_key).map(|bucket| bucket.layout.clone()))
+        fresh: impl FnOnce() -> Option<Arc<crate::scribe::layout_cache::LearnedLayout>>,
+    ) -> Result<Option<Arc<crate::scribe::layout_cache::LearnedLayout>>, ScribeError> {
+        let pinned = self
+            .writable
+            .read()
+            .map_err(|e| ScribeError::Internal {
+                detail: format!("memtable bucket lock poisoned: {e}"),
+            })?
+            .get(seal_key)
+            .map(|bucket| bucket.layout.clone());
+        Ok(pinned.unwrap_or_else(fresh))
     }
 
     /// Reports, per writable bucket of `tenant`'s `table`, whether it pinned a learned layout.

@@ -4298,13 +4298,11 @@ impl ShardOwner {
             layout.clone()
         } else {
             let key = &slice.seal_key;
-            let layout = match self.memtable.pinned_layout(key)? {
-                Some(pinned) => pinned,
-                None => self
-                    .variant_layouts
+            let layout = self.memtable.generation_layout(key, || {
+                self.variant_layouts
                     .get(key.tenant, &key.table, key.table_version)
-                    .filter(|layout| layout.applies_to(slice.rows.schema_ref())),
-            };
+                    .filter(|layout| layout.applies_to(slice.rows.schema_ref()))
+            })?;
             chosen.insert(key.clone(), layout.clone());
             layout
         };
@@ -7745,10 +7743,15 @@ mod tests {
         let append =
             prepared_append_with_rows(&budget, cold.clone(), uuid::Uuid::now_v7(), rows.clone());
         owner.process_group(vec![append]).await.expect("cold group");
-        assert!(matches!(
-            owner.memtable.pinned_layout(&cold),
-            Ok(Some(None))
-        ));
+        let open = || unreachable!("the cold generation is open");
+        assert!(
+            owner
+                .memtable
+                .generation_layout(&cold, open)
+                .expect("bucket lookup")
+                .is_none(),
+            "a cold process opens a canonical generation"
+        );
         settle(&owner, &budget);
 
         let mut sampler = iceberg::writer::file_writer::variant_shredding::VariantSampler::new(
@@ -7772,7 +7775,11 @@ mod tests {
         let late_wal = wal_identity(&late);
         owner.process_group(vec![late]).await.expect("late group");
         assert!(
-            matches!(owner.memtable.pinned_layout(&cold), Ok(Some(None))),
+            owner
+                .memtable
+                .generation_layout(&cold, open)
+                .expect("bucket lookup")
+                .is_none(),
             "a refresh never changes an open generation"
         );
         settle(&owner, &budget);
@@ -7806,10 +7813,9 @@ mod tests {
             .expect("learned group");
         let pinned = owner
             .memtable
-            .pinned_layout(&fresh)
+            .generation_layout(&fresh, || None)
             .expect("bucket lookup")
-            .expect("the new generation is open")
-            .expect("the new generation pins the learned layout");
+            .expect("the open new generation pins the learned layout");
         let cached = budget
             .variant_layouts()
             .get(fresh.tenant, &fresh.table, fresh.table_version)

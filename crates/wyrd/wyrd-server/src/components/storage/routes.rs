@@ -121,6 +121,14 @@ struct PartUrlQuery {
 }
 
 /// Mint a URL or equivalent protocol data for one upload part.
+///
+/// The permission is selected by the upload's persisted owner. Minting is
+/// read-only, so a retry mints a fresh URL for the same part.
+///
+/// # Errors
+/// Returns the upload-id and owner-selected authorization refusals,
+/// `WYRD_STORAGE_404_UPLOAD_NOT_FOUND` for an unknown or foreign upload, and
+/// the storage service's part-URL errors.
 #[utoipa::path(
     post,
     path = "/cards/upload/{id}/part-url",
@@ -291,6 +299,11 @@ async fn complete(
 /// Aborts are safe to retry: the server treats an already completed or
 /// already aborted upload as a no-op, while the idempotency key remains
 /// available to the service for request correlation.
+///
+/// # Errors
+/// Returns the idempotency, upload-id, and owner-selected authorization
+/// refusals, `WYRD_STORAGE_404_UPLOAD_NOT_FOUND` for an unknown or foreign
+/// upload, and the storage service's abort errors.
 #[utoipa::path(
     post,
     path = "/cards/upload/{id}/abort",

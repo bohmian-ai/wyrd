@@ -480,6 +480,13 @@ impl RunEvidence {
     /// `WYRD_VERIFICATION_413_INPUT_TOO_LARGE` for a file above its slot's
     /// `max_bytes`, and the server's or storage's refusal of the plan or
     /// upload.
+    ///
+    /// # Cancellation
+    /// Uploads run one at a time, so a failure or cancellation leaves every
+    /// earlier File completed and reusable, the failing File's session open
+    /// until the storage sweeper reclaims it, and later Files unplanned.
+    /// Retrying replans: completed Files are skipped and each remaining one
+    /// gets a new, independent session.
     async fn pin(
         mut self,
         client: &WyrdClient,

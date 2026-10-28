@@ -130,10 +130,15 @@ pub struct MultipartUploadRow {
     pub expires_at: chrono::DateTime<chrono::Utc>,
 }
 
+/// One `wyrd.storage_multipart_uploads` row as Postgres returns it, before
+/// its text enums are parsed into [`MultipartUploadRow`].
 #[derive(Debug, Clone, sqlx::FromRow)]
 struct MultipartUploadRowDb {
     id: Uuid,
     data_tenant_id: Uuid,
+    /// Owning Card UID; NULL marks a verification File upload. Carried
+    /// through unchanged so callers select the path shape and permission
+    /// from the persisted owner.
     card_uid: Option<String>,
     relative_path: String,
     storage_path: String,

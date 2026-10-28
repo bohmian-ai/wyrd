@@ -342,6 +342,12 @@ impl<'a> VerificationControl<'a> {
     /// blocks, `WYRD_VALA_503_QUERY_VISIBILITY_UNAVAILABLE` when the
     /// inventory cannot be read now, and the storage error when an upload
     /// cannot be initialized.
+    ///
+    /// # Cancellation
+    /// Sessions are opened one file at a time and each commits as it opens,
+    /// so a later failure or cancellation leaves the earlier sessions open
+    /// without returning them; the storage sweeper reclaims them on expiry.
+    /// A retry opens new, independent sessions and never revokes them.
     pub(crate) async fn evidence(
         &self,
         caller: &Caller,

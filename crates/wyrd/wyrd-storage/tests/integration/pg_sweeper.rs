@@ -70,8 +70,14 @@ mod pg_tests {
             -300,
         )
         .await;
-        let live_pending =
-            insert_upload(fixture.app_pool(), card(tenant, "live.bin"), "pending", 3600, -60).await;
+        let live_pending = insert_upload(
+            fixture.app_pool(),
+            card(tenant, "live.bin"),
+            "pending",
+            3600,
+            -60,
+        )
+        .await;
         insert_idempotency_key(fixture.app_pool(), tenant, "expired-key", -3600).await;
         insert_idempotency_key(fixture.app_pool(), tenant, "live-key", 3600).await;
 
@@ -168,7 +174,8 @@ mod pg_tests {
         let pool = fixture.app_pool();
         let expired_file = insert_upload(pool, file(tenant, b"doc"), "pending", -7200, -7260).await;
         let orphan_file = insert_upload(pool, file(tenant, b"doc"), "initiating", 3600, -600).await;
-        let expired_card = insert_upload(pool, card(tenant, "card.bin"), "pending", -60, -120).await;
+        let expired_card =
+            insert_upload(pool, card(tenant, "card.bin"), "pending", -60, -120).await;
         let bounded = sweeper(1);
         for _ in 0..3 {
             bounded.tick().await.expect("bounded tick sweeps");
@@ -229,7 +236,12 @@ mod pg_tests {
     fn card(tenant: wyrd_spec::DataTenantId, relative_path: &str) -> Owner {
         let card_uid = sqlx::types::Uuid::now_v7().to_string();
         let storage_path = tenant_path::build(tenant, &card_uid, relative_path);
-        (tenant, Some(card_uid), relative_path.to_owned(), storage_path)
+        (
+            tenant,
+            Some(card_uid),
+            relative_path.to_owned(),
+            storage_path,
+        )
     }
 
     /// A verification File upload session of `bytes`, owned by no Card.

@@ -93,6 +93,15 @@ where
         self.inner.poll_ready(cx).map_err(Into::into)
     }
 
+    /// Apply the global request-body limit, or pass the request through
+    /// unbounded to a route that owns its own bound.
+    ///
+    /// Audio, verification request and evidence-planning routes, and the
+    /// local upload route (`/v1/cards/upload/local/{id}`) bound their bodies
+    /// in their handlers — the local upload against its upload's declared
+    /// size — so this layer never caps them below the storage object limit.
+    /// Every other body is capped, with OTLP routes using their own limit
+    /// and admission.
     fn call(&mut self, request: Request<Body>) -> Self::Future {
         let path = request.uri().path();
         if matches!(

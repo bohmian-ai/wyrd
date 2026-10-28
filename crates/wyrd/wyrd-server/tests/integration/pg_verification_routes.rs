@@ -1046,12 +1046,20 @@ async fn file_sessions_are_independent() {
         )
         .await;
         assert_eq!(status, StatusCode::OK, "{planned}");
-        card_uploads.push(planned["upload_id"].as_str().expect("an upload id").to_owned());
+        card_uploads.push(
+            planned["upload_id"]
+                .as_str()
+                .expect("an upload id")
+                .to_owned(),
+        );
     }
     let (status, replaced) = put_local(&server, &jwt, &card_uploads[0], DOCUMENT).await;
     assert_eq!(
         (status, &replaced["code"]),
-        (StatusCode::CONFLICT, &json!("WYRD_STORAGE_409_UPLOAD_NOT_PENDING")),
+        (
+            StatusCode::CONFLICT,
+            &json!("WYRD_STORAGE_409_UPLOAD_NOT_PENDING")
+        ),
         "{replaced}"
     );
     server.shutdown().await.expect("test server shuts down");

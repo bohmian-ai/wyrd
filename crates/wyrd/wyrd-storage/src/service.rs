@@ -71,8 +71,16 @@ struct InitReplay {
     replay_input: UploadPlanReplayInput,
 }
 
+/// A prior pending Card upload already marked aborted in SQL whose backend
+/// upload still needs a best-effort abort after the replacing transaction
+/// commits.
 struct PriorAbort {
+    /// The prior row's owner-validated path. A validation failure is kept
+    /// rather than returned so it only skips the best-effort backend abort and
+    /// never fails the replacing initialization.
     validated: Result<ValidatedPath, WyrdError>,
+    /// The prior row's backend multipart upload id; `None` when the protocol
+    /// has no backend upload to abort.
     backend_upload_id: Option<String>,
 }
 
@@ -82,6 +90,8 @@ struct FailureContext<'a> {
     error_code: Option<&'a str>,
 }
 
+/// What an initialized upload records once its backend upload exists: the
+/// row's pending transition and, for a keyed request, its idempotency seed.
 struct PersistUploadInit<'a> {
     upload_uuid: Uuid,
     upload_id: &'a UploadId,
@@ -90,6 +100,8 @@ struct PersistUploadInit<'a> {
     wire_protocol: WireProtocol,
     backend_upload_id: &'a str,
     idempotency_key: Option<&'a IdempotencyKey>,
+    /// Canonical body digest the idempotency seed replays against; present
+    /// exactly when `idempotency_key` is.
     body_sha: Option<&'a [u8; 32]>,
 }
 
@@ -159,7 +171,23 @@ struct UploadSubject<'a> {
     content_type: Option<&'a str>,
 }
 
-/// Initialize an artifact upload.
+/// Initialize the upload of one Card file and return its upload id and plan.
+///
+/// A supplied `idempotency_key` replays the same upload and a re-minted plan
+/// for the same body. Re-initializing the same Card file and digest replaces
+/// its prior pending session, which is marked aborted.
+///
+/// # Errors
+/// Returns `WYRD_STORAGE_400_SHA256_INVALID` or a tenant-path refusal for an
+/// invalid body, the size-limit refusal, an idempotency conflict, the backend
+/// initialization failure, and mapped SQL errors.
+///
+/// # Cancellation
+/// The initiating row commits before the backend upload is created, so a
+/// failure or cancellation after that point leaves an initiating row (or a
+/// row marked failed) that the storage sweeper reclaims after its grace
+/// period; a retry with the same idempotency key replays a completed
+/// initialization, and any other retry starts a new session.
 #[instrument(skip(storage, postgres, caller, body), fields(tenant = %caller.data_tenant_id))]
 pub async fn upload_init(
     storage: &StorageHandle,
@@ -198,7 +226,13 @@ pub async fn upload_init(
 /// another; only a Card re-initialization replaces a prior pending session.
 ///
 /// # Errors
-/// Returns the errors of [`upload_init`].
+/// Returns the size-limit refusal, the backend initialization failure, and
+/// mapped SQL errors.
+///
+/// # Cancellation
+/// A failure or cancellation after the initiating row commits leaves that
+/// session for the storage sweeper to reclaim; a retry initializes a new,
+/// independent session and never resumes or revokes the abandoned one.
 #[instrument(skip(storage, postgres, caller), fields(tenant = %caller.data_tenant_id, %sha256))]
 pub async fn file_upload_init(
     storage: &StorageHandle,
@@ -231,11 +265,24 @@ pub async fn file_upload_init(
 /// Plan, record, and back one upload session for `subject` at `validated`.
 ///
 /// `idempotency` is a supplied key and the canonical body digest it replays
-/// against.
+/// against; `upload_id` is the new session's identity, already part of a
+/// File's `validated` location.
+///
+/// The steps commit separately: the initiating row (with any prior pending
+/// Card session marked aborted), then the backend upload, then the pending
+/// transition and idempotency seed. The idempotency lock is held until the
+/// last commit.
 ///
 /// # Errors
 /// Returns the size-limit refusal, an idempotency conflict, the backend
 /// initialization failure, and the mapped SQL errors.
+///
+/// # Cancellation
+/// Stopping after the initiating commit leaves an initiating row that the
+/// sweeper reclaims after its grace period. A prior Card session already
+/// marked aborted stays aborted, and its best-effort backend abort may not
+/// have run; a backend upload created before a failed pending transition is
+/// left to the provider's own expiry.
 async fn init_upload(
     state: &StorageServiceState<'_>,
     caller: &StorageCaller,
@@ -327,6 +374,13 @@ async fn init_upload(
     })
 }
 
+/// Record a backend-initialized upload as pending and, for a keyed request,
+/// cache its idempotency seed, in one tenant transaction.
+///
+/// # Errors
+/// Returns the mapped SQL error when the transition or seed cannot be
+/// written or committed; nothing of this step is then recorded and the row
+/// stays initiating for the sweeper.
 async fn persist_upload_init(
     postgres: &WyrdPostgres,
     caller: &StorageCaller,
@@ -359,6 +413,15 @@ async fn persist_upload_init(
     Ok(())
 }
 
+/// Take the initialization lock of `subject` (its idempotency key, else its
+/// owner, path, and digest) and look up a replayable keyed initialization.
+///
+/// The returned transaction holds the lock; the caller commits it only after
+/// the new session is fully recorded, so concurrent keyed requests serialize.
+///
+/// # Errors
+/// Returns the mapped SQL error when the connection or lock fails, and the
+/// errors of [`try_replay_idempotent_init`].
 async fn claim_upload_init<'a>(
     postgres: &'a WyrdPostgres,
     caller: &StorageCaller,
@@ -389,7 +452,17 @@ async fn claim_upload_init<'a>(
     Ok((conn, replay))
 }
 
-/// Return one multipart part URL.
+/// Return one presigned part URL of a pending multipart upload.
+///
+/// Minting is read-only and repeatable: a retry mints a fresh URL for the
+/// same part.
+///
+/// # Errors
+/// Returns `WYRD_STORAGE_404_UPLOAD_NOT_FOUND` for an unknown upload, a
+/// conflict for a non-pending one, a validation error for a non-multipart
+/// upload or a part number outside the plan, the owner-path validation
+/// refusal, an internal error for a pending multipart row without a backend
+/// upload id, and the presign or SQL failure.
 #[instrument(skip(storage, postgres, caller), fields(tenant = %caller.data_tenant_id, upload_id = %upload_id))]
 pub async fn upload_part_url(
     storage: &StorageHandle,
@@ -581,7 +654,17 @@ async fn finish_upload(
     })
 }
 
-/// Abort an in-flight upload.
+/// Abort an in-flight upload; an already terminal upload answers
+/// `aborted: false`.
+///
+/// The backend abort runs first and is best effort: its failure is logged
+/// and the row is still marked aborted. A completion that wins the race
+/// leaves the row completed and answers `aborted: false`.
+///
+/// # Errors
+/// Returns `WYRD_STORAGE_404_UPLOAD_NOT_FOUND` for an unknown upload, the
+/// owner-path validation refusal, and mapped SQL errors. A SQL failure after the
+/// backend abort leaves the row open; a retry repeats the idempotent abort.
 #[instrument(
     skip(storage, postgres, caller, idempotency_key),
     fields(
@@ -635,6 +718,16 @@ pub async fn upload_abort(
 }
 
 /// Write a bounded body through an opaque, tenant-scoped local upload capability.
+///
+/// The body must match the pending upload's declared length and digest; it
+/// is written atomically to the upload's recorded path and is not completed
+/// until its completion call. A retry rewrites the same bytes.
+///
+/// # Errors
+/// Returns `WYRD_STORAGE_409_UPLOAD_NOT_PENDING` for an upload that is not
+/// pending, a capability mismatch for a non-local upload, a size or digest
+/// mismatch, the owner-path validation refusal, and the local write or SQL
+/// failure.
 #[instrument(skip(storage, postgres, caller, body), fields(tenant = %caller.data_tenant_id, upload_id = %upload_id))]
 pub async fn upload_local_blob(
     storage: &StorageHandle,
@@ -771,6 +864,13 @@ pub async fn download_local_blob(
         .map_err(map_storage_error)
 }
 
+/// Rebuild the initialization a cached idempotency seed of `key` and
+/// `body_sha` recorded, or `None` when no seed matches.
+///
+/// # Errors
+/// Returns an idempotency conflict for a key reused with another body, an
+/// invalid-upload-id error for a corrupt seed, and the row-load or
+/// owner-path validation failure of the seeded upload.
 async fn try_replay_idempotent_init(
     caller: &StorageCaller,
     conn: &mut TenantConn<'_>,
@@ -810,6 +910,14 @@ async fn try_replay_idempotent_init(
     }))
 }
 
+/// Mark the prior pending session of `subject`'s owner, path, and digest
+/// aborted in `conn`'s transaction and return what its backend abort needs.
+///
+/// Only a Card file can match: each File session has its own path. The
+/// returned abort runs after the caller commits.
+///
+/// # Errors
+/// Returns the mapped SQL error of the lookup or transition.
 async fn find_and_mark_prior_pending(
     conn: &mut TenantConn<'_>,
     caller: &StorageCaller,
@@ -838,6 +946,11 @@ async fn find_and_mark_prior_pending(
     Ok(None)
 }
 
+/// Abort a replaced session's backend upload after its SQL abort committed.
+///
+/// Best effort: a path-validation or provider failure is logged and never
+/// fails the replacing initialization; the provider's own expiry reclaims
+/// what is left.
 async fn abort_prior_best_effort(state: &StorageServiceState<'_>, prior: PriorAbort) {
     let Some(backend_upload_id) = prior.backend_upload_id else {
         return;
@@ -1011,6 +1124,13 @@ fn upload_row_counts(
     }
 }
 
+/// Insert the initiating row of a new session at `validated` in `conn`'s
+/// transaction; the caller commits.
+///
+/// # Errors
+/// Returns a validation error for a size beyond the signed storage range, an
+/// internal error for planned counts beyond it, and the mapped SQL error,
+/// including the conflict of another open session at the same path.
 async fn insert_initiating_upload(
     conn: &mut TenantConn<'_>,
     upload_uuid: Uuid,

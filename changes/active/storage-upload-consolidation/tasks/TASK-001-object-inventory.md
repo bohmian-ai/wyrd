@@ -230,3 +230,81 @@ approved contract. Do not invent compatibility aliases or waive a red check.
 - [Bifrost authority](../../../../architecture/bifrost-design.md).
 - [Security posture](../../../../architecture/wyrd-security-posture.md).
 
+
+## Execution Evidence
+
+Commits: `1e5686e67`, `451eb8321`, `6b3653acc`, `8719795f0`, `1bf6b0388`.
+Selected mode: **ACK** (isolation proven; no staged fallback).
+
+| Acceptance criterion | Implementation evidence | Verification evidence | Result |
+|---|---|---|---|
+| V1: files/envelopes served only from Bifrost; SQL inventory, callers and seeds removed | `tables/storage/objects.rs`; `components/storage/inventory.rs`; `cards/service.rs` (`card_files`, `card_file`, envelope in `write_card_blob`); `storage/routes.rs`; `verification/fitter.rs`; drop migration `20261028000000`; CLI and fitter seeds via `ObjectInventory::record` | `pg_card_declaration_route::completed_objects_use_one_inventory`; `pg_migration::*` (22); `card_lifecycle::*` (23); `pg_verification_runtime` baseline tests | PASS |
+| V2: replay is one logical file; deletion dominates stale completion; cleanup still works | `ObjectInventory::fold` (deleted dominates); `record_card_deletion` in `finish_card_delete` and `reconcile_cleanup_claim` | `pg_card_declaration_route::deleted_objects_survive_completion_replay` | PASS |
+| V3: typed readiness and refusal, bounded failure, no fallback, no public append, no tenant widening | `card_objects` under a table-scoped SYSTEM read; `card_files` readiness → `WYRD_VALA_503_QUERY_VISIBILITY_UNAVAILABLE`; Gate reserves `bifrost.storage.objects` | `pg_card_declaration_route::inventory_reads_are_scoped_and_retryable` (502 `QUERY_STREAM_INCOMPLETE`, then retry 200; 503 visibility; foreign tenant empty; public `write_batch` → `WYRD_VALA_403_BIFROST_RESERVED_BUILTIN_WRITE`); `gate::tests::gate_reserves_server_capture_tables` | PASS |
+| V4 plus V1's real API: genuine and isolated ACK | `ScribeWrite::Object` notified in `ScribeSink::tally` only on its own stream's Ok; `ObjectInventory::record` waits for half the deadline, else `WRITER_UNAVAILABLE` | `scribe_outbox::tests::inventory_ack_is_isolated`; V1 reads the file from the inventory right after `declare` returns | PASS |
+
+RED: none of the V1–V4 selectors compiled before the change (`ObjectInventory`,
+`ScribeWrite::Object` and `bifrost.storage.objects` did not exist), and the
+removed table existed. GREEN: the commands below.
+
+Commands (each was run with `WYRD_LOG=info,wyrd_server=debug` where Postgres was involved):
+
+```bash
+# V1–V3 (V3 needs test-support; one run covered all three)
+mise exec -- scripts/postgres/with-test-postgres.sh -- bash -lc "mise run db:migrate:all:inner && cargo nextest run --locked -p wyrd-server --features test-support --test integration --test-threads=1 -E 'test(/^(storage_e2e|pg_hosted_artifacts|pg_card_declaration_route)::/)'"   # 43 passed
+mise exec -- cargo nextest run --locked -p wyrd-server --lib -E 'test(=scribe_outbox::tests::inventory_ack_is_isolated)'   # V4 PASS
+mise exec -- cargo nextest run --locked -p vala-bifrost-redux --lib -E 'test(=gate::tests::gate_reserves_server_capture_tables)'
+cargo nextest run -p vala-bifrost-redux --lib -E 'test(/^catalog::/)'                 # 53 passed (Postgres)
+cargo nextest run -p wyrd-sql --test integration -E 'test(/^pg_migration::/)'         # 22 passed
+cargo nextest run -p wyrd-cli --test cli --run-ignored=all -E 'test(/^card_lifecycle::/)'  # 23 passed
+cargo nextest run -p wyrd-testing --test server -P journey --run-ignored=all -E 'test(=verification_runtime::system_and_dynamic_tables_share_attribution)'  # PASS
+# storage, tables, gate, outbox, cards, verification libs: 247 fast + 12 pg_tests passed
+mise run fmt && mise run lints && mise run check:storage:drift && mise run check:tenant-isolation && mise run check:deps && mise run codegen:check && git diff --check   # all exit 0
+```
+
+Removed-inventory audit (`git grep storage_artifact_metadata`, excluding
+`changes/`): only the immutable original migration, the drop migration, and
+the two absence assertions remain.
+
+Bounded corrections and limits:
+
+- Migrations are immutable, so the removal is the new drop migration
+  `20261028000000_drop_storage_artifact_metadata.sql`, plus a new migration
+  widening the Forge namespace CHECK. No data migration is involved.
+- The Card binding uses the managed `subject_card_uid` rather than a
+  `card_uid` user field. The attribution journey refuses that retired name on
+  every built-in, and the verification tables bind the same way.
+- Activation re-HEADs each declared upload through `reconcile_upload`; this is
+  marked with a `ponytail:` comment in the code.
+- V4 does not exercise queued input handoffs, because they need a Postgres
+  `SubmissionOutbox`. The evidence is structural instead: `tally` notifies
+  only `Object` positions, and submissions stage unchanged.
+- Public append refusal is proven by a real journey through the gRPC client,
+  in addition to the unit test.
+
+Non-goals excluded: no deployment migration, serving copy, repair scan, queue,
+new hashing, permission change, or operations documentation. Authority changes
+are limited to the owning slices: the registry lifecycle in `wyrd-design.md`;
+the system tables, partitioning, write reservation and inventory contract in
+`bifrost-design.md`; and the peer destinations and scoped read in
+`wyrd-security-posture.md`. No unrelated files changed.
+
+Open, out of scope:
+`pg_verification_runtime::attempts_record_queue_wait_phases_terminal_latency_and_one_trace`
+fails deterministically (4/4 runs) and does not depend on this diff.
+Diagnosis:
+
+- **Symptom:** the test expects one schedule queue wait but gets
+  `left: 2, right: 1` at `pg_verification_runtime.rs:795`.
+- **Evidence:** the trace shows `attempt=1 origin=schedule` deferred with
+  `evidence_unavailable`, then re-claimed with the same attempt number.
+- **Cause:** `scheduler.rs:404-407` commits the execution before staging its
+  input record. The runner's deferred claim still emits the queue-wait,
+  attempt and phase series and the attempt span (`runner.rs` `attempt`,
+  `telemetry.rs:153`).
+- **Fix site:** `VerifierRunner::attempt` / `ExecutionTelemetry`. A
+  `Transition::Defer` should spend no attempt telemetry.
+- **Callers checked:** schedule and group handoffs (`scheduler.rs:407`,
+  `:533`).
+- **Diagnostician:** an independent read-only diagnostician reached the same
+  cause and fix site.

@@ -10771,6 +10771,7 @@ dependencies = [
  "blake3",
  "chrono",
  "hex",
+ "jsonschema",
  "petgraph 0.6.5",
  "pretty_assertions",
  "proptest",

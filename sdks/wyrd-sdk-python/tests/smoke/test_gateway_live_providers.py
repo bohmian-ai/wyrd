@@ -413,7 +413,7 @@ def test_openai_chat_accepts_the_named_verdict_format(
     openai_client: openai.OpenAI, tmp_path: Path
 ) -> None:
     """The named ``verdict`` format lowers to non-strict output OpenAI accepts and answers."""
-    response_format = verdict_format(tmp_path)
+    response_format: Any = verdict_format(tmp_path)
     assert response_format["json_schema"]["strict"] is False
     completion = openai_client.chat.completions.create(
         model=f"openai/{model('openai')}",

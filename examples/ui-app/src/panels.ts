@@ -1,4 +1,4 @@
-/** The panels both pages show: the support desk Service and its spans per hour. */
+/** The panels both pages show: the support desk Service and every span the reader may see, per hour. */
 import type { CardHeaderInput, ChartInput, Range } from 'wyrd-ai-ui/loaders';
 
 export const range: Range = { last: '24h' };
@@ -11,7 +11,7 @@ export const spans: ChartInput = {
   type: 'timeseries',
   title: 'Spans per hour',
   sql: `SELECT date_bin(INTERVAL '1 hour', start_time_unix_nano) AS hour, count(*) AS spans
-FROM vala.traces.spans
+FROM bifrost.traces.spans
 WHERE start_time_unix_nano >= $1 AND start_time_unix_nano < $2
 GROUP BY 1 ORDER BY 1`,
   x: 'hour',

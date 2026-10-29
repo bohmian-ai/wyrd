@@ -66,13 +66,16 @@ export interface TableListing {
   readonly tables: readonly { readonly namespace: string; readonly name: string; readonly status: string }[];
 }
 
+/** A table description as JSON carries it: the exact table version stays the server's decimal string. */
+export type TableDescriptionWire = Omit<TableDescription, 'table_version'> & { readonly table_version: string };
+
 /** The response each read produces, keyed by its operation. */
 export interface WireResponses {
   'cards.get_by_ref': RegisteredCard;
   'cards.list': ListCardsResponse;
   'bifrost.query': QueryResult;
   'bifrost.list_tables': TableListing;
-  'bifrost.describe_table': TableDescription;
+  'bifrost.describe_table': TableDescriptionWire;
   'verification.get_execution': VerificationExecutionState;
 }
 

@@ -52,8 +52,11 @@ export function nodeExecutor(client: WyrdClient): Executor {
       }
       case 'bifrost.list_tables':
         return { tables: (await (await bifrost()).listTables()).map(({ namespace, name, status }) => ({ namespace, name, status })) };
-      case 'bifrost.describe_table':
-        return (await bifrost()).describeTable(request.namespace, request.name);
+      case 'bifrost.describe_table': {
+        // The SDK widens the version to a bigint; the wire keeps the JSON-safe decimal string.
+        const { table_version, ...table } = await (await bifrost()).describeTable(request.namespace, request.name);
+        return { ...table, table_version: String(table_version) };
+      }
       case 'verification.get_execution':
         return (await verify.Execution.connect(request.execution_id, { client })).status();
     }

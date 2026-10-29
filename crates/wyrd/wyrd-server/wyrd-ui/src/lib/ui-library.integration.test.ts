@@ -68,7 +68,7 @@ async function appBridgeView(doc: unknown, answer: (name: string, args: Record<s
 }
 
 /** The seeded latency table every live chart reads. */
-const LATENCY = { namespace: 'vala.datasets', name: 'ui_latency' } as const;
+const LATENCY = { namespace: 'bifrost.datasets', name: 'ui_latency' } as const;
 /** The window the seeded rows fall in, and an earlier one holding none. */
 const RANGE = { from: '2026-10-19T00:00:00Z', to: '2026-10-19T12:00:00Z' };
 const BEFORE = { from: '2026-10-18T00:00:00Z', to: '2026-10-18T12:00:00Z' };

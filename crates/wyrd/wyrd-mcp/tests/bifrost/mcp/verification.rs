@@ -1366,6 +1366,86 @@ mod pg_tests {
         Ok(())
     }
 
+    /// A judge answering outside its response schema is asked to correct its
+    /// reply within the Agent's iteration budget: once corrected, the
+    /// execution passes; never corrected, the requirement is inconclusive
+    /// with the stable code and without the rejected reply.
+    ///
+    /// # Errors
+    ///
+    /// Returns provider, server, fixture, MCP transport, or tool-call
+    /// failures.
+    ///
+    /// # Panics
+    ///
+    /// Panics when a verdict, reason, or repair request differs from the
+    /// expectation.
+    #[tokio::test(flavor = "multi_thread")]
+    #[ignore = "requires the Postgres-backed Bifrost journey lane"]
+    async fn invalid_judge_answers_are_repaired_or_inconclusive() -> Result<(), McpJourneyError> {
+        let (server, judge, agent, request) = judging_server().await?;
+        let reply = |content: &str| {
+            wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "id": "chatcmpl-judge", "object": "chat.completion", "created": 1,
+                "model": "gpt-4o",
+                "choices": [{ "index": 0, "finish_reason": "stop",
+                    "message": { "role": "assistant", "content": content } }],
+            }))
+        };
+        for (marker, times) in [("REPAIR-ONCE", Some(1)), ("NEVER-A-VERDICT", None)] {
+            let mock = wiremock::Mock::given(wiremock::matchers::method("POST"))
+                .and(wiremock::matchers::body_string_contains(marker))
+                .respond_with(reply("not a verdict"))
+                .with_priority(1);
+            match times {
+                Some(times) => mock.up_to_n_times(times).mount(&judge).await,
+                None => mock.mount(&judge).await,
+            }
+        }
+        let caller = connect_rooted(&server, &agent).await?;
+        let answered = |value: &str| {
+            let mut request = request.clone();
+            request["inputs"]["answer"]["value"] = JsonValue::from(value);
+            request
+        };
+
+        let repaired = structured(
+            caller
+                .call_tool(call(EXECUTE, answered("REPAIR-ONCE"))?)
+                .await?,
+        )?;
+        assert_eq!(repaired["outcome"]["verdict"], "passed", "{repaired}");
+        let asked: Vec<String> = judge
+            .received_requests()
+            .await
+            .ok_or("the judge records requests")?
+            .iter()
+            .map(|request| String::from_utf8_lossy(&request.body).into_owned())
+            .filter(|body| body.contains("REPAIR-ONCE"))
+            .collect();
+        assert_eq!(asked.len(), 2, "one repair: {asked:?}");
+        assert!(asked[1].contains("was not accepted"), "{}", asked[1]);
+
+        let exhausted = structured(
+            caller
+                .call_tool(call(EXECUTE, answered("NEVER-A-VERDICT"))?)
+                .await?,
+        )?;
+        assert_eq!(
+            exhausted["outcome"]["verdict"], "inconclusive",
+            "{exhausted}"
+        );
+        let reason = text(&exhausted, "/outcome/requirements/0/reason")?;
+        assert!(
+            reason.contains("WYRD_AGENT_422_STRUCTURED_INVALID")
+                && !reason.contains("not a verdict"),
+            "{reason}"
+        );
+        caller.cancel().await?;
+        server.shutdown().await?;
+        Ok(())
+    }
+
     /// A tool call carrying the caller's sampled `traceparent` continues the
     /// caller's trace: its SERVER request span is a child of the caller's
     /// span, and the execution, judge, and gateway spans it opens descend from

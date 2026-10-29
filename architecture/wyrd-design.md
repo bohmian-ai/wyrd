@@ -527,8 +527,14 @@ spec:
 ```
 
 `response_format: verdict` (or `{kind: verdict}`) compiles the closed
-Verdict schema generated from Wyrd's canonical `Verdict` type; `data` adds a
-required custom object with that schema. A `data` schema is JSON Schema
+Verdict schema generated from Wyrd's canonical `Verdict` type, projected onto
+the subset OpenAI strict mode, Anthropic, and Gemini all accept: `oneOf`
+becomes `anyOf`, a `const` alternation one `enum`, and `$ref` siblings,
+`format`, and `minimum` are dropped, while typed decoding still enforces the
+numeric ranges. `data` adds a required custom object with that schema, kept
+exactly as authored. A named format lowers to non-strict OpenAI structured
+output, because an authored `data` schema need not satisfy strict mode;
+validation is Wyrd's either way. A `data` schema is JSON Schema
 2020-12 (no other `$schema`) without a root `$id`; it is embedded as its own
 resource so its local references resolve as they do standalone. The card keeps and hashes the
 authored form, never the expanded provider settings. On a native body the
@@ -574,6 +580,19 @@ through the caller's tenant gateway, with ordinary authorization, capture,
 and audit; the deployment is never derived from the Prompt provider. An
 invocation may supply a whole replacement route for that invocation only;
 it never changes the Card, its hash, or a concurrent invocation.
+
+A structured-output Agent validates every proposed final answer against the
+exact response schema its outgoing request sent, after rendering and
+`before_model` hooks. An invalid answer (malformed JSON, a non-object, or a
+schema violation) is answered with one bounded correction turn citing the
+violated rules and schema fragments, and the loop continues: a repair spends
+one iteration of `max_iterations`, shared with tool turns. An answer still
+invalid on the last iteration ends the run with
+`WYRD_AGENT_422_STRUCTURED_INVALID`, which is terminal and never retried; its
+message and details carry at most ten schema locations, never reply values,
+reply keys, or parser text. A provider refusal without an answer is never
+repaired: it ends the run at once with the same code and a fixed diagnostic. The correction is conversation content, captured
+under the run's sensitive capture policy, not error or log content.
 
 ### Mcp
 MCP server registration. The server enumerates its own tools at runtime; we do
@@ -1504,8 +1523,14 @@ A citation names an original input slot, or a fixed workspace file's
 `attachment_<n>` slot as the `fs.*` tools report it in `sources`, and a typed
 locator (`page`, `slide`, `lines`, `json_pointer`, or page `region`);
 workspace paths map back to their slots, and `/work` scratch is never a
-source. The server validates every citation against the pinned evidence, and a
-passed Agent check without a valid citation becomes inconclusive.
+source. Before an Agent check runs, a `verdict`-format Prompt's citation
+slots are narrowed on that invocation's copy to the bare slots its bound
+inputs and workspace reach, so the provider request and the Agent's
+validation admit the same slots and a wrong or `inputs.`-prefixed slot is
+repaired; with no reachable source the slots are left open. The Card and
+concurrent invocations are unchanged. The server validates every citation
+against the pinned evidence, and a passed Agent check without a valid
+citation becomes inconclusive.
 
 Verifiers judge one of two evidence modes, fixed at declaration; mixing them
 is refused.

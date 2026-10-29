@@ -125,7 +125,7 @@ id_type!(
 );
 id_type!(
     SlotName,
-    "Name of one Verifier input slot, addressed as `inputs.<slot>`.",
+    "Bare name of one Verifier input slot, such as `order`, never prefixed with `inputs.`; expressions address it as `inputs.<slot>`.",
     validate_identifier
 );
 id_type!(

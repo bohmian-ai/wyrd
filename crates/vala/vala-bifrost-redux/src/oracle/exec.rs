@@ -2465,18 +2465,14 @@ pub(super) mod tests {
         );
     }
 
-    /// Page selection measured on one production-recipe row group: every
-    /// value page the recipe writes holds fewer rows than parquet-rs's
-    /// default 20,000-row page limit allows, and an equality leaf on a sorted column
-    /// skips every page whose index proves it cannot match, keeps fewer rows
-    /// than one default-sized page, and still yields the one matching row
-    /// when the reader applies the selection. Page limits are best effort, so
-    /// only the pages parquet-rs actually wrote are asserted.
+    /// Page selection measured on one production-recipe row group: an
+    /// equality leaf on a sorted column skips every page whose index proves it
+    /// cannot match, keeps strictly fewer rows than the group, and still
+    /// yields the one matching row when the reader applies the selection.
     #[test]
     fn page_index_selects_only_the_matching_pages() {
         use parquet::arrow::arrow_reader::{ArrowReaderOptions, ParquetRecordBatchReaderBuilder};
         const ROWS: i64 = 100_000;
-        const DEFAULT_PAGE_ROWS: usize = 20_000;
         const TARGET: i64 = 54_321;
         let schema = Arc::new(Schema::new(vec![
             Field::new("service_name", DataType::Utf8, false),
@@ -2485,32 +2481,6 @@ pub(super) mod tests {
         let published =
             write_grouped_fixture(&schema, &[service_block(&schema, "checkout", 0, ROWS)]);
         let filter = col("value").eq(lit(TARGET));
-        let footer = ArrowReaderMetadata::load(
-            &published,
-            ArrowReaderOptions::new()
-                .with_page_index_policy(parquet::file::metadata::PageIndexPolicy::Required),
-        )
-        .expect("valid Parquet footer");
-        let rows = usize::try_from(ROWS).expect("fixture rows fit usize");
-        let starts: Vec<usize> = footer
-            .metadata()
-            .page_index_for_row_group(0)
-            .offset_index(1)
-            .expect("value offset index")
-            .page_locations()
-            .iter()
-            .map(|page| usize::try_from(page.first_row_index).expect("page start fits usize"))
-            .chain([rows])
-            .collect();
-        let largest = starts
-            .windows(2)
-            .map(|pair| pair[1] - pair[0])
-            .max()
-            .expect("the group holds a page");
-        assert!(
-            largest < DEFAULT_PAGE_ROWS,
-            "the largest value page holds {largest} rows; page starts {starts:?}"
-        );
 
         let (groups, selection, skipped) = hot_file_plan(&published, &schema, Some(&filter))
             .select_pages(vec![0])
@@ -2519,7 +2489,7 @@ pub(super) mod tests {
         let selection = selection.expect("the sorted column's page index excludes pages");
         let kept = selection.row_count();
         assert!(
-            kept > 0 && kept < DEFAULT_PAGE_ROWS,
+            kept > 0 && kept < usize::try_from(ROWS).expect("fixture rows fit usize"),
             "kept {kept} of {ROWS} rows"
         );
 
@@ -2552,7 +2522,10 @@ pub(super) mod tests {
             groups == vec![0] && unchanged.is_none() && none_skipped == 0,
             "an empty conjunction leaves the reader unchanged"
         );
-        assert_eq!(skipped, rows - kept);
+        assert_eq!(
+            skipped,
+            usize::try_from(ROWS).expect("fixture rows fit usize") - kept
+        );
     }
 
     /// Row-group min/max pruning measured on a real two-row-group file written

@@ -26,22 +26,6 @@ pub const BIFROST_ROW_GROUP_TARGET_BYTES: usize = 128 * 1024 * 1024;
 /// while low-cardinality columns still fit their dictionaries.
 const BIFROST_DICTIONARY_PAGE_BYTES: usize = 256 * 1024;
 
-/// Encoded bytes at which a column chunk closes a data page.
-///
-/// A point lookup decompresses and decodes every data page its page-index
-/// selection keeps, so the page is the smallest unit of per-query work. A
-/// sixteenth of parquet-rs's 1 MiB default keeps that unit small while page
-/// headers and index entries stay a small share of the file. Best effort:
-/// parquet-rs checks it between write batches.
-const BIFROST_DATA_PAGE_BYTES: usize = 64 * 1024;
-
-/// Rows at which a column chunk closes a data page.
-///
-/// Bounds pages of narrow, well-compressed columns that would otherwise reach
-/// parquet-rs's 20,000-row default long before [`BIFROST_DATA_PAGE_BYTES`].
-/// Best effort, like the byte limit.
-const BIFROST_DATA_PAGE_ROWS: usize = 1_024;
-
 /// Target false-positive probability of every Bifrost Bloom filter.
 const BLOOM_FPP: f64 = 0.01;
 
@@ -50,10 +34,8 @@ const BLOOM_FPP: f64 = 0.01;
 /// ZSTD level 3 (writes are once-per-frame after bounded admission; reads are
 /// scan-bound, so the extra compression over SNAPPY is worth it). Row groups
 /// close at the soft [`BIFROST_ROW_GROUP_TARGET_BYTES`] encoded target or at
-/// parquet-rs's default row maximum, whichever comes first. Data pages close
-/// at [`BIFROST_DATA_PAGE_BYTES`] or [`BIFROST_DATA_PAGE_ROWS`], so a
-/// selective lookup decodes small pages; write batch sizing keeps the
-/// parquet-rs default.
+/// parquet-rs's default row maximum, whichever comes first; write batch and
+/// page sizing keep parquet-rs defaults.
 ///
 /// Dictionary encoding is on by default so low-cardinality string and
 /// identifier columns encode as `RLE_DICTIONARY`; parquet-rs owns dictionary
@@ -173,8 +155,6 @@ fn recipe_builder(time_column: &str, bloom_columns: &[String]) -> WriterProperti
         .set_max_row_group_bytes(Some(BIFROST_ROW_GROUP_TARGET_BYTES))
         .set_dictionary_enabled(true)
         .set_dictionary_page_size_limit(BIFROST_DICTIONARY_PAGE_BYTES)
-        .set_data_page_size_limit(BIFROST_DATA_PAGE_BYTES)
-        .set_data_page_row_count_limit(BIFROST_DATA_PAGE_ROWS)
         .set_column_dictionary_enabled(ColumnPath::from(time_column), false)
         .set_column_encoding(ColumnPath::from(time_column), Encoding::DELTA_BINARY_PACKED)
         .set_statistics_enabled(EnabledStatistics::Page)
@@ -285,8 +265,14 @@ mod tests {
             properties.write_batch_size(),
             parquet::file::properties::DEFAULT_WRITE_BATCH_SIZE
         );
-        assert_eq!(properties.data_page_size_limit(), 64 * 1024);
-        assert_eq!(properties.data_page_row_count_limit(), 1_024);
+        assert_eq!(
+            properties.data_page_size_limit(),
+            parquet::file::properties::DEFAULT_PAGE_SIZE
+        );
+        assert_eq!(
+            properties.data_page_row_count_limit(),
+            parquet::file::properties::DEFAULT_DATA_PAGE_ROW_COUNT_LIMIT
+        );
         assert!(!properties.dictionary_enabled(&timestamp));
         assert_eq!(
             properties.encoding(&timestamp),

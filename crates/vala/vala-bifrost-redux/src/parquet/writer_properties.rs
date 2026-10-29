@@ -30,17 +30,17 @@ const BIFROST_DICTIONARY_PAGE_BYTES: usize = 256 * 1024;
 ///
 /// A point lookup decompresses and decodes every data page its page-index
 /// selection keeps, so the page is the smallest unit of per-query work. A
-/// quarter of parquet-rs's 1 MiB default keeps that unit small while page
+/// sixteenth of parquet-rs's 1 MiB default keeps that unit small while page
 /// headers and index entries stay a small share of the file. Best effort:
 /// parquet-rs checks it between write batches.
-const BIFROST_DATA_PAGE_BYTES: usize = 256 * 1024;
+const BIFROST_DATA_PAGE_BYTES: usize = 64 * 1024;
 
 /// Rows at which a column chunk closes a data page.
 ///
 /// Bounds pages of narrow, well-compressed columns that would otherwise reach
 /// parquet-rs's 20,000-row default long before [`BIFROST_DATA_PAGE_BYTES`].
 /// Best effort, like the byte limit.
-const BIFROST_DATA_PAGE_ROWS: usize = 4_096;
+const BIFROST_DATA_PAGE_ROWS: usize = 1_024;
 
 /// Target false-positive probability of every Bifrost Bloom filter.
 const BLOOM_FPP: f64 = 0.01;
@@ -285,8 +285,8 @@ mod tests {
             properties.write_batch_size(),
             parquet::file::properties::DEFAULT_WRITE_BATCH_SIZE
         );
-        assert_eq!(properties.data_page_size_limit(), 256 * 1024);
-        assert_eq!(properties.data_page_row_count_limit(), 4_096);
+        assert_eq!(properties.data_page_size_limit(), 64 * 1024);
+        assert_eq!(properties.data_page_row_count_limit(), 1_024);
         assert!(!properties.dictionary_enabled(&timestamp));
         assert_eq!(
             properties.encoding(&timestamp),

@@ -53,8 +53,13 @@ import {
   Drawer,
   DurationBar,
   EmptyState,
+  FacetRail,
   fmtCardRef,
+  RecordDetail,
+  RecordTable,
   Sparkline,
+  StatStrip,
+  TraceWaterfall,
   StatusPill,
   VerdictPill,
   type CardRef,
@@ -63,7 +68,22 @@ import {
   type WireRequest,
   type WireResult
 } from 'wyrd-ai-ui';
-import { chartParams, loadCardHeader, loadChart, shapeChart, validateIntent, validatePanel, type ChartInput } from 'wyrd-ai-ui/loaders';
+import {
+  chartParams,
+  facetQuery,
+  loadCardHeader,
+  loadChart,
+  loadRecordDetail,
+  loadRecordTable,
+  loadTraceWaterfall,
+  parseNanos,
+  shapeChart,
+  spanTree,
+  statQueries,
+  validateIntent,
+  validatePanel,
+  type ChartInput
+} from 'wyrd-ai-ui/loaders';
 import { mountView, remoteLoader, validateView, WyrdView } from 'wyrd-ai-ui/view';
 import examples from '../../../../../wyrd-spec/schemas/ui_problem_examples.json';
 import { POST as bffLoad } from '../routes/t/[tenantKey]/ui/load/+server';
@@ -73,7 +93,29 @@ import { nodeExecutor } from 'wyrd-ai-ui/node';
 import { Bifrost, WyrdError, type WyrdClient } from 'wyrd-ai';
 import catalog from 'wyrd-ai-ui/catalog.json';
 import { place as placeAll, rowsHeight } from '../../packages/ui/src/lib/layout';
-import { card, denied, fixtureExecutor, RANGE, registered, series, summary, terminal, timeseries } from '$lib/ui-fixtures';
+import {
+  buckets,
+  card,
+  costs,
+  denied,
+  facet,
+  fixtureExecutor,
+  LOG,
+  logRow,
+  observeAnswer,
+  RANGE,
+  registered,
+  series,
+  spanRow,
+  summary,
+  terminal,
+  timeseries,
+  total,
+  trace,
+  TRACE,
+  traceCounts,
+  traces
+} from '$lib/ui-fixtures';
 import { reactive } from '$lib/ui-fixtures.svelte';
 
 /** An executor answering each read with `answer` and recording every request and signal. */
@@ -88,7 +130,7 @@ function recording(answer: (request: WireRequest) => WireResult | Promise<WireRe
 
 test('TASK-003: Validated portable rendering', async () => {
   // Every catalog component and its declared states are generated, with view-document shape.
-  expect(Object.keys(catalog.components)).toEqual(['Chart', 'CardHeader']);
+  expect(Object.keys(catalog.components)).toEqual(expect.arrayContaining(['Chart', 'CardHeader']));
   expect(catalog.components.Chart.emits.map((action) => action.name)).toEqual(['chart.range', 'chart.open_in_query']);
   expect(catalog.view.required).toEqual(['version', 'catalogId', 'range', 'panels']);
 
@@ -663,8 +705,8 @@ test('Canonical UI problem projections', async () => {
   }
 
   // Browser exports load no native SDK at runtime.
-  const browser = import.meta.glob('/packages/ui/src/lib/{index,contract,loaders,view,plot,format,schemas,layout,mcp}.ts', { query: '?raw', import: 'default', eager: true }) as Record<string, string>;
-  expect(Object.keys(browser)).toHaveLength(9);
+  const browser = import.meta.glob('/packages/ui/src/lib/{index,contract,loaders,observe,view,plot,format,schemas,layout,mcp}.ts', { query: '?raw', import: 'default', eager: true }) as Record<string, string>;
+  expect(Object.keys(browser)).toHaveLength(10);
   for (const [path, source] of Object.entries(browser)) expect(source, path).not.toMatch(/^(import|export) (?!type )[^;]*from 'wyrd-ai'/m);
 });
 
@@ -1119,5 +1161,222 @@ test('TASK-027: Narrow views', async () => {
     host.unmount();
   } finally {
     width.mockRestore();
+  }
+});
+
+test('TASK-004: Canonical signal interactions', async () => {
+  // The catalog generates every Observe component with its states and typed actions.
+  expect(Object.keys(catalog.components)).toEqual(['Chart', 'CardHeader', 'StatStrip', 'FacetRail', 'RecordTable', 'TraceWaterfall', 'RecordDetail']);
+  expect(catalog.components.RecordTable.states).toContain('live');
+  expect(catalog.components.RecordDetail.emits.map((action) => action.name)).toEqual(['record.filter', 'record.logs', 'record.open']);
+
+  // Inputs only name allowlisted columns; payload columns are never listable or filterable.
+  expect(validatePanel('RecordTable', { signal: 'traces', columns: ['attributes'] })).toMatchObject({ code: 'WYRD_SPEC_400_VALIDATION' });
+  expect(validatePanel('RecordTable', { signal: 'logs', where: [{ column: 'body', value: 'x' }] })).toMatchObject({ code: 'WYRD_SPEC_400_VALIDATION' });
+  expect(validatePanel('FacetRail', { signal: 'metrics', facets: ['events'] })).toMatchObject({ code: 'WYRD_SPEC_400_VALIDATION' });
+  expect(validatePanel('TraceWaterfall', { traceId: "x' OR 1=1" })).toMatchObject({ code: 'WYRD_SPEC_400_VALIDATION' });
+  expect(validatePanel('StatStrip', { stats: ['cost'], where: [{ column: 'name', value: 'x' }] })).toMatchObject({ code: 'WYRD_SPEC_400_VALIDATION' });
+
+  // Traces: root spans under bound WHERE clauses, then counts for exactly the visible traces.
+  const where = [{ column: 'service_name', value: 'agent-api' }, { column: 'http_route', value: null, not: true }];
+  const listed = recording((request) => ({ ok: true, value: observeAnswer((request as { sql: string }).sql)! }));
+  const table = await loadRecordTable({ signal: 'traces', where }, { executor: listed.executor, range: RANGE });
+  expect(listed.calls.map((call) => call.request)).toEqual([
+    {
+      op: 'bifrost.query',
+      sql:
+        "SELECT start_time_unix_nano, name, service_name, duration_nano, status_code, encode(trace_id, 'hex') AS trace_id, encode(span_id, 'hex') AS span_id " +
+        'FROM bifrost.traces.spans WHERE start_time_unix_nano >= $1::timestamptz AND start_time_unix_nano < $2::timestamptz AND parent_span_id IS NULL ' +
+        'AND service_name = $3 AND http_route IS NOT NULL ORDER BY start_time_unix_nano DESC LIMIT 50',
+      params: [RANGE.from, RANGE.to, 'agent-api']
+    },
+    {
+      op: 'bifrost.query',
+      sql:
+        "SELECT encode(trace_id, 'hex') AS trace_id, count(*) AS spans, count(*) FILTER (WHERE status_code = 2) AS errors FROM bifrost.traces.spans " +
+        "WHERE trace_id IN (decode($1, 'hex'), decode($2, 'hex'), decode($3, 'hex')) GROUP BY trace_id",
+      params: traces.rows.map((row) => row[5])
+    }
+  ]);
+  expect(table.result).toMatchObject({ state: 'populated', data: { counts: { state: 'populated' } } });
+  // A refused list issues no dependent read; a failed count read keeps the list.
+  const refused = recording(() => ({ ok: false, problem: denied }));
+  expect((await loadRecordTable({ signal: 'traces' }, { executor: refused.executor, range: RANGE })).result.state).toBe('denied');
+  expect(refused.calls).toHaveLength(1);
+  const countless = recording((request) => ((request as { sql: string }).sql.includes('AS spans') ? { ok: false, problem: denied } : { ok: true, value: traces }));
+  expect((await loadRecordTable({ signal: 'traces' }, { executor: countless.executor, range: RANGE })).result).toMatchObject({ state: 'populated', data: { counts: { state: 'denied' } } });
+  // A signal read needs a range; authored SQL runs unchanged with only its referenced binds.
+  expect((await loadRecordTable({ signal: 'spans' }, { executor: refused.executor })).result).toMatchObject({ state: 'error', problem: { code: 'WYRD_SPEC_400_VALIDATION' } });
+  const authored = recording(() => ({ ok: true, value: traces }));
+  await loadRecordTable({ sql: 'SELECT * FROM t WHERE at >= $1::timestamptz' }, { executor: authored.executor, range: RANGE });
+  expect(authored.calls[0].request).toEqual({ op: 'bifrost.query', sql: 'SELECT * FROM t WHERE at >= $1::timestamptz', params: [RANGE.from], max_rows: 500 });
+
+  // An exact trace ignores the range and refuses rather than truncates an oversize trace.
+  const exact = recording(() => ({ ok: true, value: trace }));
+  await loadTraceWaterfall({ traceId: TRACE, range: RANGE }, { executor: exact.executor, range: RANGE });
+  expect(exact.calls[0].request).toMatchObject({ params: [TRACE], max_rows: 10_000 });
+  expect((exact.calls[0].request as { sql: string }).sql).not.toContain('$2');
+  // Log detail binds its full key; facets bind the list's WHERE and read one value past the shown ten.
+  const detail = recording(() => ({ ok: true, value: logRow }));
+  await loadRecordDetail({ log: LOG }, { executor: detail.executor });
+  expect(detail.calls[0].request).toMatchObject({ params: [LOG.time_unix_nano, LOG.observed_time_unix_nano, LOG.wyrd_request_id] });
+  expect(facetQuery({ signal: 'logs', facets: ['severity_text'], where: [{ column: 'service_name', value: 'search' }] }, 'severity_text', RANGE)).toEqual({
+    sql:
+      'SELECT severity_text AS value, count(*) AS n FROM bifrost.logs.records WHERE time_unix_nano >= $1::timestamptz AND time_unix_nano < $2::timestamptz ' +
+      'AND service_name = $3 GROUP BY severity_text ORDER BY n DESC, value LIMIT 11',
+    params: [RANGE.from, RANGE.to, 'search']
+  });
+  // Cost is summed per recorded currency, scoped by a bound Card uid.
+  expect(statQueries('cost', { stats: ['cost'], scope: { column: 'workload_card_uid', uid: 'card_01HX' } }, RANGE, '5 minutes')[0]).toEqual({
+    sql:
+      'SELECT sum(CAST(cost AS DECIMAL(38, 12))) AS value, currency FROM bifrost.gateway.calls WHERE started_at >= $1::timestamptz AND started_at < $2::timestamptz ' +
+      'AND cost IS NOT NULL AND workload_card_uid = $3 GROUP BY currency ORDER BY currency',
+    params: [RANGE.from, RANGE.to, 'card_01HX']
+  });
+
+  // Nanosecond offsets stay exact; an unretained parent or a parent cycle still places every span.
+  expect(parseNanos('2026-10-20T11:58:02.450000001+00:00')! - parseNanos('2026-10-20T11:58:02.45Z')!).toBe(1n);
+  expect(spanTree(trace).map((span) => [span.name, span.depth])).toEqual([
+    ['invoke_agent support', 0],
+    ['chat gpt-5', 1],
+    ['execute_tool search', 1],
+    ['GET /search', 2],
+    ['late span', 0]
+  ]);
+  const cyclic = { ...trace, rows: [['aa', 'bb', 'a', null, '2026-10-20T00:00:00Z', 1, 0], ['bb', 'aa', 'b', null, '2026-10-20T00:00:00Z', 1, 0]] };
+  expect(spanTree(cyclic)).toHaveLength(2);
+
+  // Every component renders each non-data state with its state word.
+  const empty = { state: 'empty', reason: 'Nothing here.' } as const;
+  const shells = [
+    [StatStrip, { stats: ['traces'] }, { stats: [] }],
+    [FacetRail, { signal: 'traces', facets: ['service_name'] }, { facets: [] }],
+    [RecordTable, { signal: 'traces' }, { rows: { ...traces, rows: [] } }],
+    [TraceWaterfall, { traceId: TRACE }, { ...trace, rows: [] }],
+    [RecordDetail, { traceId: TRACE, spanId: 'b9c7c989f97918e1' }, { ...spanRow, rows: [] }]
+  ] as const;
+  for (const [component, input, data] of shells) {
+    for (const [result, word] of [
+      [{ state: 'loading' }, 'Loading'],
+      [{ ...empty, data }, 'Nothing here.'],
+      [{ state: 'denied', problem: denied }, 'Not authorized'],
+      [{ state: 'error', problem: { code: 'WYRD_SPEC_500_INTERNAL', title: 'Internal error' } }, 'Error']
+    ] as const) {
+      const shell = render(component as never, { input, result } as never);
+      expect(shell.container, `${component.name} ${result.state}`).toHaveTextContent(word);
+      shell.unmount();
+    }
+  }
+
+  // StatStrip: nothing recorded is "—", never 0; currencies never add up.
+  const strip = render(StatStrip, {
+    input: { stats: ['tokens', 'cost'] },
+    result: { state: 'populated', data: { stats: [{ stat: 'tokens', total: total(null), series: buckets }, { stat: 'cost', total: costs, series: buckets }] } }
+  });
+  expect(strip.container.querySelectorAll('.value')[0]).toHaveTextContent('—');
+  expect([...strip.container.querySelectorAll('.value')].slice(1).map((value) => value.textContent)).toEqual(['1.250000000000 EUR', '0.420000000000 USD']);
+  strip.unmount();
+
+  // FacetRail: a null value is "not set" and filters by null; values in the WHERE are pressed.
+  const facetAction = vi.fn();
+  const rail = render(FacetRail, {
+    input: { signal: 'traces', facets: ['service_name'], where: [{ column: 'service_name', value: 'agent-api' }] },
+    result: { state: 'populated', data: { facets: [{ column: 'service_name', values: facet }] } },
+    onaction: facetAction
+  });
+  expect(rail.getByRole('button', { name: /agent-api/ })).toHaveAttribute('aria-pressed', 'true');
+  await fireEvent.click(rail.getByRole('button', { name: /not set/ }));
+  expect(facetAction).toHaveBeenCalledWith({ name: 'facet.filter', input: { signal: 'traces', column: 'service_name', value: null } });
+  rail.unmount();
+
+  // RecordTable: typed cells, counts per trace, row open; a held live list offers new rows instead of moving.
+  const openAction = vi.fn();
+  const populated = { state: 'populated', data: { rows: traces, counts: { state: 'populated', data: traceCounts } } } as const;
+  const list = render(RecordTable, { input: { signal: 'traces', live: true }, result: populated, onaction: openAction });
+  const firstRow = list.getAllByRole('row')[1];
+  expect(firstRow).toHaveTextContent('2.84s');
+  expect(firstRow).toHaveTextContent('error');
+  expect(list.getAllByRole('row')[3]).toHaveTextContent('∅');
+  await fireEvent.click(firstRow);
+  expect(openAction).toHaveBeenCalledWith({ name: 'record.open', input: { trace_id: TRACE, span_id: '00f067aa0ba902b7' } });
+  await fireEvent.mouseEnter(list.getByRole('region'));
+  const newer = { ...traces, rows: [['2026-10-20T11:59:00.000000000+00:00', 'new root', 'agent-api', 1_000_000, 0, 'ffffffffffffffffffffffffffffffff', '1111111111111111'], ...traces.rows] };
+  await list.rerender({ input: { signal: 'traces', live: true }, result: { state: 'populated', data: { rows: newer } }, onaction: openAction });
+  expect(list.queryByText('new root')).toBeNull();
+  await fireEvent.click(list.getByRole('button', { name: '↑ 1 new traces' }));
+  expect(list.getByText('new root')).toBeInTheDocument();
+  list.unmount();
+
+  // TraceWaterfall: levels below the second start collapsed; expand, errors only, and select.
+  const selectAction = vi.fn();
+  const fall = render(TraceWaterfall, { input: { traceId: TRACE }, result: { state: 'populated', data: trace }, onaction: selectAction });
+  expect(fall.queryByText('GET /search')).toBeNull();
+  await fireEvent.click(fall.getByRole('button', { name: 'Expand all' }));
+  expect(fall.getByText('GET /search')).toBeInTheDocument();
+  await fireEvent.click(fall.getByRole('button', { name: 'Errors only' }));
+  expect(fall.queryByText('chat gpt-5')).toBeNull();
+  expect(fall.queryByText('late span')).toBeNull();
+  await fireEvent.click(fall.getByRole('button', { name: /GET \/search/ }));
+  expect(selectAction).toHaveBeenCalledWith({ name: 'trace.select', input: { trace_id: TRACE, span_id: 'c1d2e3f405060708' } });
+  fall.unmount();
+
+  // RecordDetail: recorded messages show; an absent section names what would fill it; filter, exclude and logs intents.
+  const detailAction = vi.fn();
+  const span = render(RecordDetail, { input: { traceId: TRACE, spanId: 'b9c7c989f97918e1' }, result: { state: 'populated', data: spanRow }, onaction: detailAction });
+  expect(span.getByRole('tabpanel')).toHaveTextContent('refund?');
+  await fireEvent.click(span.getByRole('tab', { name: 'Exception' }));
+  expect(span.getByRole('tabpanel')).toHaveTextContent('TimeoutError');
+  await fireEvent.click(span.getByRole('button', { name: 'Exclude' }));
+  await fireEvent.click(span.getByRole('button', { name: 'Logs for this span' }));
+  expect(detailAction.mock.calls.map(([intent]) => intent)).toEqual([
+    { name: 'record.filter', input: { signal: 'spans', column: 'name', value: 'execute_tool search', not: true } },
+    { name: 'record.logs', input: { trace_id: TRACE, span_id: 'b9c7c989f97918e1' } }
+  ]);
+  await span.rerender({ input: { traceId: TRACE, spanId: 'b9c7c989f97918e1' }, result: { state: 'populated', data: { ...spanRow, rows: [[...spanRow.rows[0].slice(0, 4), {}, [], null, null, null]] } }, onaction: detailAction });
+  await fireEvent.click(span.getByRole('tab', { name: 'Messages' }));
+  expect(span.getByRole('tabpanel')).toHaveTextContent('gen_ai.input.messages');
+  span.unmount();
+  for (const [name, input] of [
+    ['facet.filter', { signal: 'traces', column: 'service_name', value: null }],
+    ['trace.select', { trace_id: TRACE, span_id: 'c1d2e3f405060708' }]
+  ] as const)
+    expect(validateIntent(name === 'facet.filter' ? 'FacetRail' : 'TraceWaterfall', { name, input })).toEqual({ name, input });
+  expect(validateIntent('TraceWaterfall', { name: 'trace.select', input: { trace_id: TRACE } })).toMatchObject({ code: 'WYRD_SPEC_400_VALIDATION' });
+
+  // A view renders every Observe panel, and a live panel re-reads on its interval until the view leaves.
+  vi.useFakeTimers({ toFake: ['setInterval', 'clearInterval'] });
+  try {
+    let counted = () => {};
+    const served = recording((request) => {
+      if ((request as { sql?: string }).sql?.includes('AS spans')) counted();
+      return fixtureExecutor.run([request]).then(([result]) => result);
+    });
+    const observe = render(WyrdView, {
+      doc: {
+        version: 'wyrd.view/v1',
+        catalogId: 'wyrd.ui/v1',
+        range: RANGE,
+        panels: [
+          { id: 'stats', component: 'StatStrip', input: { stats: ['traces', 'errors', 'cost'] } },
+          { id: 'facets', component: 'FacetRail', input: { signal: 'traces', facets: ['service_name'] } },
+          { id: 'list', component: 'RecordTable', input: { signal: 'traces', live: true } },
+          { id: 'trace', component: 'TraceWaterfall', input: { traceId: TRACE } },
+          { id: 'span', component: 'RecordDetail', input: { traceId: TRACE, spanId: 'b9c7c989f97918e1' } }
+        ]
+      },
+      executor: served.executor
+    });
+    await waitFor(() => expect(observe.container.querySelector('[data-panel="list"]')).toHaveTextContent('invoke_agent support'));
+    for (const id of ['stats', 'facets', 'trace', 'span']) expect(observe.container.querySelector(`[data-panel="${id}"] [data-state]`), id).toBeNull();
+    const before = served.calls.length;
+    const refreshed = new Promise<void>((resolve) => (counted = resolve));
+    vi.advanceTimersByTime(5_000);
+    await refreshed;
+    expect(served.calls.length).toBe(before + 2);
+    observe.unmount();
+    vi.advanceTimersByTime(5_000);
+    expect(served.calls.length).toBe(before + 2);
+  } finally {
+    vi.useRealTimers();
   }
 });

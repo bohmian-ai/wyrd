@@ -3,7 +3,7 @@ id: TASK-007
 kind: implementation
 status: proposed
 spec: SPEC-benchmark-experiments
-spec_revision: 19
+spec_revision: 20
 parent_task: TASK-006
 depends_on: [TASK-006]
 ---
@@ -38,7 +38,9 @@ be shredded; item 10 no longer waits for item 9. Public Variant wire format,
 tenant boundaries and durability guarantees do not change.
 
 No new database, dependency family, Cargo feature, public data API, decoded-page
-cache, query-plan cache or alternative query planner is authorized.
+cache, query-plan cache or alternative query planner is authorized, except the
+`wyrd-server` `bench` feature that revision 20 approves for the hot benchmark
+control (§Revision 20 closeout).
 
 The maintainer approved a limited benchmark extension for item 10 only: a
 learned-layout setup in the existing hot workflow and its missing c64 shredded
@@ -1228,3 +1230,37 @@ query-type-specific path, and it contradicted the design's capture boundary
 | Shredded memory rows filter before reconstruction, by any predicate | `scribe/memtable.rs` `ReadableSource::project`, `physical_projection` | `scribe::shards::tests::generation_layout_binding_keeps_canonical_wal_and_bounded_memory`: RED with the capture filter disabled (all rows returned), GREEN with it on | PASS |
 | Capture output stays logical; memory/stage/publish/restart unchanged | same | journey `telemetry::variant_layouts_survive_memory_stage_publication_and_restart` | PASS |
 | No regression on live reads | same | `vala-bifrost-redux` lib (898 passed), clippy `-D warnings`, `wyrd-testing --test oracle -P journey --run-ignored=only` (59 passed) | PASS |
+
+## Revision 20 closeout: deterministic `hot`
+
+Approved 2026-10-29 (spec revision 20, D-20-1 option A); delivered here, not
+through a new plan. It replaces the item 10 learned-layout extension above:
+the 150-second retention lifecycle, its 480-second budget, `left_memtable`
+and `learned_residence` are withdrawn. The per-namespace learned-layout gauge
+stays.
+
+Owners and steps, in order, each committed on its own:
+
+1. **Scribe** (`vala-bifrost-redux` `scribe/mod.rs`): `stage_writable` becomes
+   public and returns the rows it staged; publish is the existing
+   `flush_staged`.
+2. **Server** (`wyrd-server`, feature `bench`): `POST
+   /v1/platform/benchmark/scribe/stage` → `{"rows_staged": n}` and `POST
+   /v1/platform/benchmark/scribe/publish` → `{"claims_published": n}`,
+   authorized through `PlatformAuthorization` with the existing
+   `tenant_suspend` permission and audited as `platform.authz`; one stable
+   code for a replica without Scribe. Requests are serialized.
+3. **Client** (`wyrd-client` `Platform`): two methods calling those routes.
+4. **Harness** (`wyrd-testing` capacity): `bench:build` enables `bench`;
+   `LocalServer` keeps the platform credential `setup` prints as a
+   `SecretString` and the driver exchanges it through `Platform::connect_with`.
+   Tenant credentials still do every write and query. `hot` runs REQ-029's
+   flow with 16,384 MB rotation sizes and 24 h retention, measures REQ-030's
+   nine cases plus point scaling, and keeps the 300-second budget.
+5. **Tests**: a `WyrdTestServer` journey for placement after stage, a learned
+   `region` layout after publish, 401/403 refusals and audit rows; a test that
+   the routes are absent without `bench`.
+6. **Closeout**: one exclusive `mise run bench:l1:bifrost:hot`, item 10
+   evidence below, `bifrost-design.md` and benchmark README updates, `mise run
+   verify:bifrost`.
+

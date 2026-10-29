@@ -1,10 +1,22 @@
 ---
 id: SPEC-benchmark-experiments
-revision: 19
+revision: 20
 status: approved
 ---
 
 # Benchmarks as experiments
+
+Revision 20 makes `hot` measure everything hot. Hot data is every
+accepted row not yet published: memtable batches and staged Parquet runs.
+Today `hot` reads only the memtable, so staged reads have never been measured,
+and the learned Variant layout has never been measured validly. The new `hot` moves its fixture deliberately: it loads,
+stages, loads again, and reads the memtable and staged copies of the same
+queries. It then publishes, which teaches the server its span layout, and
+repeats the cycle in that layout. Rows move only when the benchmark asks,
+through a benchmark control compiled into the benchmarked server by its
+`bench` cargo feature and authorized by the platform administrator credential, so the run needs
+no timing assumptions and no residence guards. See the Revision
+20 supplement.
 
 Revision 19 makes a run VALID or INVALID and nothing else: a VALID run
 measured what it claims, and its targets are reported, never failed. Each
@@ -447,7 +459,7 @@ and Bifrost `hot` and `parquet` each complete within 300 seconds. Bifrost
 L1 measures 1 and 64 clients only on every engine. Measured windows are
 3 × 5 seconds after a 5-second warmup; a case keeps 3 × 10 seconds only when
 5 seconds cannot meet its declared sample floor, and the record names which
-cases did. The 20 Bifrost cases need about 7 minutes of warmup/repetition
+cases did. The 25 Bifrost cases need about 9 minutes of warmup/repetition
 windows in total, split across their three commands. Individual cases
 and experiments remain available for fast optimization feedback. Build binaries and prepare external prerequisites before
 starting the experiment clock; the clock includes quiet-host checking, server
@@ -461,7 +473,7 @@ one fixed fixture configuration per experiment, and isolated operations:
 | Engine | Required L1 coverage |
 |---|---|
 | Bifrost `writes-parquet` | Native Arrow, small OTLP spans, approximately 1 KiB OTLP spans and OTLP logs at 1 and 64 clients: 8 measured cases. Reuse the 2M-row generators and fresh identities. The server uses production default rotation sizes and a 30 s retention; no write experiment overrides rotation. Measure durable acknowledgement, not publication. Include actual staging/publication CPU in Parquet-configured windows, record its activity and backlog, and do not claim storage-maintenance cost if none occurred. |
-| Bifrost `hot` | Reads while every row stays in the memtable: the server runs with memtable and on-disk rotation sizes of 16,384 MB and a 24-hour retention, the earlier hot tier's declared settings, so nothing stages or publishes; a staged or published row makes the experiment untrusted. Fixtures: the standard 10M-row events fixture and 1M telemetry spans. Events point lookup at 1 and 64 clients; events small aggregate at 1; span filter on a shredded attribute key at 1. |
+| Bifrost `hot` | Reads over hot data, memtable and staged, in the canonical layout and then in a learned one, as REQ-029 and REQ-030 define. The server runs with memtable and on-disk rotation sizes of 16,384 MB and a 24-hour retention, and every cohort stays below pressure sealing and the claim target, so rows move only through the REQ-031 benchmark control. Fixtures: the standard 10M-row events fixture, half staged and half in the memtable, and 2M telemetry spans in four cohorts. Events point lookup in the memtable at 1 and 64 clients and staged at 1; events small aggregate in each source at 1; the `region` span filter in each source and layout at 1: 9 measured cases. |
 | Bifrost `parquet` | Reads after every row is published as Parquet: default rotation sizes and a declared 30 s retention, then one settlement until nothing remains in a memtable, staging or claim. Fixtures: the standard 10M-row events fixture, 1M telemetry spans, and one 200,000-row sample per write path, all settled together. This record holds each write path's storage ratio; both write records report it as inapplicable with that reason. Events point lookup at 1 and 64 clients; events small aggregate and full scan at 1; span lookup by `trace_id`, a declared Bloom column, at 1 and 64; span filters on a shredded attribute key and on a long-tail key below the shredding threshold at 1. Two correctness checks run once after settlement, outside every measured window: the published span files shred exactly the expected attribute keys and none below the threshold, and a span-time window scans fewer files than the whole table. |
 | Verification `direct-verify` | Two direct-verify cases at 1 and 64 clients: existing four assertion checks over 2 KiB JSON, alternating expected pass/fail judgments. Expected failing judgments are correct completed verifications, not transport errors. Record elapsed, Verifier wait and server overhead, CPU/verification and scaling. |
 | Gateway `overhead` | Six cases: buffered chat with metadata capture, streamed chat with metadata capture, and buffered chat with payload capture, each at 1 and 64 clients. Reuse the local controlled provider, 1 KiB metadata shapes/32 stream events and 64 KiB request/response payload-capture shape. Record header/final overhead where applicable, calls/s, CPU/call, capture bytes and memory. |
@@ -984,7 +996,7 @@ MCP API that would require a new product-surface projection.
 
 | ID / situation and actor | Expected observable result / credible evidence | Obligations |
 |---|---|---|
-| AC-001 — Engineer runs one engine's L1 | Each engine command is exercised separately, and each Bifrost experiment (`writes-parquet`, `hot`, `parquet`) within its declared 300- or 480-second budget, without running a smoke first; `hot` reads show no staged or published rows and `parquet` reads show nothing left in a memtable, staging or claim. Within its budget the full matrix runs with discarded warmup and three repetitions. Engineer reads question, controls, units, per-step criteria and verdict; opens the printed JSON path and regenerates an identical report. Real Linux x86_64 release-process journey, record and report comparison. Recompute server latency bounds from retained interval histograms; changing client network delay, polling cadence or scheduled-time latency cannot change server latency judgment (driver send lateness still checks validity); verify exact values just below, equal to and above strict SLO limits, and reject missing/overflowed timing evidence and report ambiguous target bounds as unsettled without invalidation; coarse monitoring buckets cannot judge latency. Operator export disabled or lossy cannot erase complete benchmark timing. | REQ-001, REQ-003, REQ-007, REQ-008, REQ-010, REQ-013, REQ-014 |
+| AC-001 — Engineer runs one engine's L1 | Each engine command is exercised separately, and each Bifrost experiment (`writes-parquet`, `hot`, `parquet`) within its declared 300- or 480-second budget, without running a smoke first; `hot` reads each source its step names, and `parquet` reads show nothing left in a memtable, staging or claim. Within its budget the full matrix runs with discarded warmup and three repetitions. Engineer reads question, controls, units, per-step criteria and verdict; opens the printed JSON path and regenerates an identical report. Real Linux x86_64 release-process journey, record and report comparison. Recompute server latency bounds from retained interval histograms; changing client network delay, polling cadence or scheduled-time latency cannot change server latency judgment (driver send lateness still checks validity); verify exact values just below, equal to and above strict SLO limits, and reject missing/overflowed timing evidence and report ambiguous target bounds as unsettled without invalidation; coarse monitoring buckets cannot judge latency. Operator export disabled or lossy cannot erase complete benchmark timing. | REQ-001, REQ-003, REQ-007, REQ-008, REQ-010, REQ-013, REQ-014 |
 | AC-002 — Engineer reads a run on its own | One VALID full record, read with no other record, file or run present: its report shows every metric's median, minimum, maximum and spread, absolute and per server core, per provisioned vCPU, per second and per row or query. No report, exit or validity reads another record. | REQ-011, REQ-012 |
 | AC-003 — Engineer encounters noisy results | Repetitions 70/85/100: the report shows median 85 and spread 30; an absolute target miss reports missed and retains VALID/exit 0. Censored or straddling target readings report unsettled without invalidation. Integrity failure in any repetition gives INVALID/exit 2 regardless of median or spread. | REQ-004, REQ-012 |
 | AC-004 — Engineer cannot obtain valid evidence | Independently exercise busy preflight/post-run host (10-second samples, >10% non-benchmark CPU), any missed arrival or p99 send lateness >5 ms, insufficient samples (<1,000 p99 / <200 p95), dirty source with or without override, missing/reset CPU and budget overrun: untrusted, exit 2, reasons and partial record, no fabricated successful step. Declared dirty override is visible. Combine an invalid step and target miss: overall INVALID retains both. Dirty overrides remain INVALID. Injected resource/clock observations and runner integration; no synthetic host load. | REQ-002, REQ-004, REQ-006, INV-005, INV-007 |
@@ -1326,6 +1338,186 @@ cache landed in f96c23fa2, path-only Variant validation in 432d186bb, and
 Kafka-style Scribe lane linger with a byte-bounded outbox in edc1f2eac. Preserve
 these changes and measure subsequent work separately.
 
+## Revision 20 supplement
+
+Drafted on 2026-10-29 from the maintainer's direction: `hot` must read
+memtable and staged data, the benchmark stays L1-fast, and residence guards
+are a smell. Existing requirements own unchanged behavior; REQ-029 to REQ-032
+are new.
+
+### Problem and evidence
+
+Hot data has two read paths. A memtable batch is read as Arrow in memory. A
+staged run is an immutable local Parquet file that `ScribeHotStage` wrote,
+fsynced and registered as live-tail authority, and the follower opens it
+through its staged Parquet scan. Staged runs carry no event-time statistics
+for file pruning. No benchmark measures that second path: `hot` forbids
+staged rows, `parquet` reads only published files, `writes-parquet` asks no
+query, and L2 `competing` mixes all sources without saying which one
+answered.
+
+The learned layout has no valid measurement. A claim samples staged values, writes
+final objects, and installs the layout that later generations pin, so a
+benchmark must publish before it can read learned hot data. The release server
+the harness drives cannot be told to stage or publish. Only the in-process test
+server reaches `Scribe::flush_staged`. An attempt to publish through a short
+retention (commits 22a0e3d76 and 12fc33f08) failed: a shard rotates its whole
+generation on its own clock, which other writers such as audit keep running,
+so a cohort's age does not predict when it rotates. That run,
+`20261029T154823Z-12fc33f08`, needed a residence guard and still could not tell
+which source its queries read. Deterministic placement removes the guard
+instead of fixing it.
+
+### Proposed `hot`
+
+**REQ-029 — Hot data flow.** `hot` places each fixture cohort through Scribe's
+own transitions, always memtable → staged → published. Ranges are half-open.
+The server starts empty, with no learned layout. Its settings keep every
+cohort below the ingress pressure seal and below the claim target (the smaller
+of the on-disk size and Forge's target), with a 24-hour retention and dwell, so
+no cohort moves except when the control moves it; the record states those
+settings.
+
+| # | Action | A1 | A2 | B1 | B2 |
+|---|---|---|---|---|---|
+| 1 | Load A1: events ids 0–5M; spans day 1 hours 0–6 (indices 0–500k) | memtable | | | |
+| 2 | Stage | staged | | | |
+| 3 | Load A2: events ids 5M–10M; spans day 1 hours 6–12 (500k–1M) | staged | memtable | | |
+| | Phase A windows (canonical layout) | | | | |
+| 4 | Publish; the run is INVALID unless the server then holds a learned `bifrost.traces` layout | published | published | | |
+| 5 | Load B1: spans day 2 hours 0–6 (2M–2.5M) | | | memtable, learned | |
+| 6 | Stage | | | staged, learned | |
+| 7 | Load B2: spans day 2 hours 6–12 (2.5M–3M) | | | staged, learned | memtable, learned |
+| | Phase B windows (learned layout) | | | | |
+
+Steps 1–3 run before the first window, and steps 4–7 run before the first
+phase-B warmup, so a selected run of only phase-B steps still places its data.
+A failed load, stage or publish makes the run INVALID, and so does a stage
+response that staged fewer rows than its cohort loaded. The learned-layout
+check reads `bifrost_scribe_variant_layouts_learned{namespace="bifrost.traces"}`.
+That gauge counts every table in the namespace. It identifies the fixture's
+layout here only because the benchmark tenant writes no other `bifrost.traces`
+table, and the record states that limit.
+
+**REQ-030 — Hot steps.** Each step's id names its query, the source holding
+its matching rows and, for spans, the layout. Every answer is exact-checked
+against its generator.
+
+| Step | Case label | Matching rows |
+|---|---|---|
+| `point-memtable-c1`, `point-memtable-c64` | `point-lookup` | A2, memtable |
+| `point-staged-c1` | `point-lookup` | A1, staged |
+| `small-aggregate-memtable-c1` | `small-aggregate` | 100k ids of A2 |
+| `small-aggregate-staged-c1` | `small-aggregate` | 100k ids of A1 |
+| `span-region-memtable-canonical-c1` | `shredded-filter` | A2 spans |
+| `span-region-staged-canonical-c1` | `shredded-filter` | A1 spans |
+| `span-region-memtable-learned-c1` | `shredded-filter` | B2 spans |
+| `span-region-staged-learned-c1` | `shredded-filter` | B1 spans |
+| `point-memtable-scaling` | derived | c64 rate over c1 rate |
+
+The span query is `attributes ->> 'region' = 'eu-west'`, bounded to its
+cohort's six hours; `region` is a key the sampler shreds. An id or time range
+decides where the matching rows sit. The other source is still visited and
+pruned, as in any hot query. Each step records the existing read metrics.
+The two comparisons a record answers are memtable against staged for one
+query and layout, and canonical against learned for one query and source.
+Criteria: `no-errors` and `exact-answers` on every read step, and
+`point-p99-slo` (p99 below 5 ms) on `point-memtable-c64`. Staged steps carry no
+SLO. The memtable-residence check and the learned-window guard are removed.
+The run fits the 300-second L1 budget, about 225 seconds. The retention
+lifecycle and its 480-second budget are withdrawn. The first run is a new
+`hot` baseline; earlier `hot` records answer a different question.
+
+### The benchmark control
+
+**REQ-031 — Stage and publish on request.** A server built with the `bench`
+cargo feature serves two requests on its API listener,
+`POST /v1/platform/benchmark/scribe/stage` and
+`POST /v1/platform/benchmark/scribe/publish`:
+
+- **stage** returns only once every row acknowledged before the request
+  arrived is in a durable, query-registered staged run. It publishes nothing.
+  Its body is `{"rows_staged": <n>}`, the rows it moved.
+- **publish** returns only once every such row is published, through the
+  production stage, claim and publish path. Each claim installs its learned
+  layout as it does today. Its body is `{"claims_published": <n>}`.
+
+Both are this process's existing Scribe transitions, `stage_writable` and
+`flush_staged`, for every tenant this process holds.
+
+- **Cutoff.** Shards stage one after another. A row acknowledged during a
+  request may be moved or left; only rows acknowledged before it are
+  guaranteed.
+- **Failure.** It is a stable `WyrdError` problem response. Work already done
+  stays done: shards that staged and claims that published are not rolled
+  back. No acknowledged row is lost, and every unmoved row stays
+  WAL-authoritative. A retry completes the rest.
+- **Unavailable.** A process with no Scribe or no staging volume refuses with
+  its own stable code and never answers success with zero.
+- **Concurrency.** Control requests run one at a time; a second waits for the
+  first. The age scanner and pressure seals keep running and coordinate
+  through Scribe's existing ownership, as they do today. A dropped connection
+  does not cancel a transition already started.
+
+**REQ-032 — The control is a benchmark instrument, not a product
+contract.** It exists only in a server built with the `wyrd-server` `bench`
+cargo feature, which only `bench:build` enables. Without the feature its paths
+do not exist (404). It has no OpenAPI, SDK, CLI
+or MCP projection and no compatibility promise. It acts on the replica that
+receives it. It changes no rotation, retention, dwell, shutdown or recovery
+rule. It never alters an acknowledged row's durability, the WAL, or any
+persisted format. Its authentication and audit are D-20-1.
+
+**Invariants kept.** INV-001 holds because every measured query still runs the
+production path, authenticated and tenant-bound; the control runs only
+outside windows. INV-002 holds because staging and publishing early are the
+same transitions retention would cause, never a weaker one. The transitions
+themselves record lineage, as engine transitions do. INV-003 holds under
+D-20-1: the control is authenticated, authorized and audited.
+
+### Expensive decisions
+
+**D-20-1 — How the control is reached and authorized (decided: A).** The security
+posture requires every request to be authenticated and authorized at its
+receiving boundary, and says network location is not identity
+(`architecture/wyrd-security-posture.md`, Principles). The benchmark timing
+snapshot is an unauthenticated loopback readout. A control mutates every
+tenant's data placement, so the snapshot's precedent does not cover it.
+
+| Option | Boundary | Cost |
+|---|---|---|
+| **A. Authenticated benchmark control (chosen)** | Two `POST` routes on the API listener, compiled only with the `bench` feature. Each requires the existing `tenant_suspend` platform permission, which only the platform administrator grant holds; stage and publish reach every tenant on the replica, as suspension does. Each decision is audited through platform authorization like any other. | The harness keeps the platform credential `setup` already prints, as a secret in driver memory, and exchanges it for a platform session. No new permission, role or credential. The benchmarked binary carries two routes the shipped one lacks. |
+| B. Unauthenticated loopback control | The same routes on the loopback metrics listener, like the snapshot. | It needs an explicit amendment to the security posture naming this exception. It makes no permission decision and audits nothing. |
+| C. Product platform-admin routes | `/v1/platform/...` with HTTP, MCP and CLI projections and journeys. | It is a public operator contract. It must define pod-local behavior behind a load balancer. That is more than the benchmark needs. |
+
+The generation and shutdown coordinators stay the production owners under
+every option. The maintainer chose A on 2026-10-29 with the `bench` cargo
+feature in place of a server setting. A `bench`-built server is still built in
+its own cargo invocation without test support, so revision 18's separation
+from test support holds; only the shipped and measured binaries now differ by
+these two routes.
+
+### Acceptance
+
+| Situation | Expected observation | IDs |
+|---|---|---|
+| `bench`-built server; load, stage, query | `rows_staged` covers the cohort; server-side inspection shows the cohort's rows in staged runs and none in the memtable; answers are exact | REQ-031 |
+| Then publish | Every earlier row is published, nothing is staged or claimed, and the server holds a learned layout for the fixture table that shreds `region` | REQ-031 |
+| Appends during a stage request | The request completes; every row acknowledged during it is still answered exactly from wherever it now sits | REQ-031 |
+| Two control requests at once | The second starts after the first returns; both succeed | REQ-031 |
+| Stage or publish fault, then retry | Problem response with its stable code; no acknowledged row lost; the retry moves the rest | REQ-031 |
+| No Scribe or no staging volume | The unavailable code, never success with zero | REQ-031 |
+| Built without `bench` | 404 for both paths | REQ-032 |
+| No credential; tenant administrator credential; platform administrator | 401; 403; success, each decision audited as `platform.authz` | REQ-032, D-20-1 |
+| `mise run bench:l1:bifrost:hot` | One VALID record within 300 s; the nine REQ-030 cases are measured and exact, and each stage response covered its cohort | REQ-029, REQ-030 |
+| `--steps span-region-staged-learned-c1` | The data flow still runs and the step measures | REQ-029 |
+
+Evidence classes: a server journey against `WyrdTestServer` and repository
+Postgres for the control's behavior, including the placement inspection a
+benchmark cannot do; unit tests for the absent routes; and one full `hot`
+record. A benchmark answer alone cannot prove which source served it, so the
+journey owns placement and the record owns cost.
+
 ## Delivery and supersession
 
 The maintainer requested this revision and task packet after aligning on the
@@ -1377,6 +1569,11 @@ reports remain evidence under their recorded authority, not current instructions
 
 ## Open material decisions
 
+Revision 20 has no open decision. The maintainer approved it on 2026-10-29,
+deciding D-20-1 as option A behind the `bench` cargo feature and the existing
+platform administrator permission, and directed delivery inside TASK-007's
+closeout rather than a new plan.
+
 Revision 19 execution is approved, including items 1, 3 and 10 explicitly.
 Item 10's design is written in its section and shown to the maintainer before
 its code. Cross-query plan reuse remains parked under item 12.
@@ -1390,6 +1587,13 @@ Historical clean-source gaps remain recorded as exclusions/advisory evidence,
 not a reason to weaken coverage.
 
 ## Revision history and authority
+
+- Revision 20 — 2026-10-29 (approved): `hot` reads memtable and staged data in
+  the canonical and learned layouts through deterministic placement (REQ-029,
+  REQ-030); a `bench`-feature benchmark control, authorized by the platform
+  administrator, stages and publishes on request (REQ-031, REQ-032, D-20-1
+  option A); the retention lifecycle, its 480-second budget and the residence
+  guards are withdrawn. Delivered in TASK-007.
 
 - Revision 19 — 2026-10-27: Approved validity-only judgment, self-contained
   records with their own relative metrics (comparison between records is a

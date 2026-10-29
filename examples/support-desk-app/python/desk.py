@@ -46,12 +46,13 @@ class Desk:
         self.state.start_telemetry()
         set_trace_processors([WyrdAgentsTraceProcessor()])
         # ANCHOR_END: init
-        # The gateway speaks the OpenAI API. `http_auth` swaps the placeholder
-        # key for a fresh Wyrd access token on every request.
+        # The gateway speaks the OpenAI API. `state.http_auth` swaps the
+        # placeholder key for a fresh Wyrd access token and tags each call with
+        # the active Run, so the gateway records it under that Run.
         self.gateway = AsyncOpenAI(
             base_url=f"{self.client.server_url}/v1",
             api_key="wyrd",
-            http_client=DefaultAsyncHttpxClient(auth=self.client.http_auth),
+            http_client=DefaultAsyncHttpxClient(auth=self.state.http_auth),
         )
         prompt = self.state.card("prompt").spec
         deployment = self.state.card("agent").spec["execution_route"]["deployment"]
@@ -62,15 +63,10 @@ class Desk:
         """Answer ``question`` in a new Run of the Service and record the ticket under it."""
         # ANCHOR: answer
         run = self.state.run()
-        with run, tracer.start_as_current_span("support-desk.ask"):
-            # These headers tie the gateway's record of the call to this Run.
-            headers = {
-                "wyrd-run-id": run.run_id,
-                "wyrd-card-uid": str(self.state.card_ref("agent").uid),
-            }
-            model = OpenAIChatCompletionsModel(
-                self.model, self.gateway.with_options(default_headers=headers)
-            )
+        # The agent view is the innermost active Run, so the model call is
+        # recorded for the agent under this Run's `run_id`.
+        with run, run.for_card("agent"), tracer.start_as_current_span("support-desk.ask"):
+            model = OpenAIChatCompletionsModel(self.model, self.gateway)
             agent = Agent(name="support-agent", model=model)
             result = await Runner.run(agent, self.template.replace("{{question}}", question))
             answer = str(result.final_output)

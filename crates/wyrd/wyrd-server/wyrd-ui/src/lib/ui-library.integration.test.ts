@@ -10,7 +10,7 @@ import { AppBridge, PostMessageTransport } from '@modelcontextprotocol/ext-apps/
 import type { Cookies } from '@sveltejs/kit';
 import { expect, vi } from 'vitest';
 import { z } from 'zod';
-import { Bifrost, Cards, TableConfig, WyrdClient, type CardRef } from 'wyrd-ai';
+import { Bifrost, Cards, TableConfig, WyrdClient } from 'wyrd-ai';
 import {
   loadCardHeader,
   loadChart,
@@ -30,7 +30,7 @@ import { env } from '$env/dynamic/private';
 import { browserSessions } from '$lib/server/auth/browser-sessions';
 import { card, observeAnswer, registered, series, summary, timeseries } from '$lib/ui-fixtures';
 import { POST as loadPanel } from '../routes/t/[tenantKey]/ui/load/+server';
-import { declared, fixture, serverTest } from '../../../../../../sdks/wyrd-sdk-ts/wyrd/tests/support/server';
+import { declared, fixture, serverTest, type DeclaredRef } from '../../../../../../sdks/wyrd-sdk-ts/wyrd/tests/support/server';
 import { load as loadExamplePage } from '../../../../../../examples/ui-app/src/routes/+page.server';
 import { POST as loadExamplePanel } from '../../../../../../examples/ui-app/src/routes/view/load/+server';
 import { dashboard } from '../../../../../../examples/ui-app/src/panels';
@@ -131,7 +131,7 @@ function jar(): Cookies {
 }
 
 /** The fixture tenant's Cards and latency table, seeded once per file. */
-const test = serverTest().extend<{ seeded: { model: CardRef; foreign: CardRef } }>({
+const test = serverTest().extend<{ seeded: { model: DeclaredRef; foreign: DeclaredRef } }>({
   seeded: [
     async ({ server }, use) => {
       await seedLatency(server);
@@ -334,7 +334,7 @@ const nanos = (iso: string, extra = 0n) => String(BigInt(Date.parse(iso)) * 1_00
  * on the grandchild, and an integer sum and a double gauge, as `apiKey`, over
  * the stock OTLP/HTTP JSON endpoints, then publish them.
  */
-async function seedSignals(server: { baseUrl: string; flushBifrost(): void }, apiKey: string, ids: { trace: string; service: string }) {
+async function seedSignals(server: { baseUrl: string; flushBifrost(): void }, apiKey: string, ids: { trace: string; service: string; subject?: string }) {
   const resource = { attributes: attrs({ 'service.name': ids.service }) };
   const scope = { name: 'wyrd-ui-journey' };
   const span = (spanId: string, parentSpanId: string, name: string, start: string, ms: number, code: number, attributes: Record<string, string> = {}) => ({
@@ -359,7 +359,7 @@ async function seedSignals(server: { baseUrl: string; flushBifrost(): void }, ap
               spans: [
                 span('00f067aa0ba902b7', '', 'invoke_agent support', '2026-10-19T03:00:00Z', 900, 0, { 'gen_ai.operation.name': 'invoke_agent' }),
                 span('53995c3f42cd8ad8', '00f067aa0ba902b7', 'chat ranker', '2026-10-19T03:00:00.100Z', 400, 1, { 'gen_ai.input.messages': '[{"role":"user","parts":[{"type":"text","content":"refund?"}]}]' }),
-                span('b9c7c989f97918e1', '53995c3f42cd8ad8', 'execute_tool search', '2026-10-19T03:00:00.200Z', 100, 2)
+                span('b9c7c989f97918e1', '53995c3f42cd8ad8', 'execute_tool search', '2026-10-19T03:00:00.200Z', 100, 2, ids.subject ? { 'wyrd.card_uid': ids.subject } : {})
               ]
             }
           ]
@@ -417,10 +417,10 @@ async function seedSignals(server: { baseUrl: string; flushBifrost(): void }, ap
   server.flushBifrost();
 }
 
-test('TASK-004: Authorized Observe across hosts', async ({ server }) => {
+test('TASK-004: Authorized Observe across hosts', async ({ server, seeded }) => {
   const TRACE = '4bf92f3577b34da6a3ce929d0e0e4736';
   const FOREIGN = 'a3ce929d0e0e47364bf92f3577b34da6';
-  await seedSignals(server, server.apiKey, { trace: TRACE, service: 'ui-agent' });
+  await seedSignals(server, server.apiKey, { trace: TRACE, service: 'ui-agent', subject: seeded.model.uid });
   const acme = server.bootstrapServiceInTenant(server.seedTenant('ui-observe-foreign'), ['admin'], 'ui-observe-admin');
   await seedSignals(server, acme, { trace: FOREIGN, service: 'foreign-agent' });
 
@@ -474,7 +474,9 @@ test('TASK-004: Authorized Observe across hosts', async ({ server }) => {
       expect(stats.result.state !== 'loading' && stats.result.state !== 'denied' && stats.result.state !== 'error' && stats.result.data.stats.map(({ total }) => total.rows)).toEqual([[[1]], [[3]], [[1]], [[1]], [[null]]]);
       const cost = await loadStatStrip({ stats: ['cost'] }, context);
       expect(cost.result.state !== 'loading' && cost.result.state !== 'denied' && cost.result.state !== 'error' && cost.result.data.stats[0].total.rows).toEqual([]);
-      // Unattributed evidence never counts toward a Card scope.
+      // A subject scope counts only the span attributed to that Card; unattributed evidence never counts.
+      const scoped = await loadStatStrip({ stats: ['spans', 'errors'], scope: { column: 'subject_card_uid', uid: seeded.model.uid } }, context);
+      expect(scoped.result.state === 'populated' && scoped.result.data.stats.map(({ total }) => total.rows)).toEqual([[[1]], [[1]]]);
       expect((await loadStatStrip({ stats: ['spans'], scope: { column: 'subject_card_uid', uid: 'card_unrecorded' } }, context)).result.state).toBe('empty');
       // An earlier range holds nothing.
       expect((await loadRecordTable({ signal: 'traces' }, { executor, range: BEFORE })).result).toMatchObject({ state: 'empty', reason: 'No root spans in bifrost.traces.spans with start_time_unix_nano in this range.' });

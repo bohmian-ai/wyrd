@@ -331,3 +331,17 @@ Reuse map. The capture already owns the memory read (`ReadableSource::project`).
 Lanes:
 - `cargo nextest run -p vala-bifrost-redux -p wyrd-tonic -p wyrd-spec --lib` under test Postgres: 1697 of 1698 pass. The one failure is the step-4 V-TIME test, which waits on the fork pin.
 - Five journeys pass: remote shredded projection, the two shredded and layout telemetry journeys, staged footer refusal, and native ingest bounds.
+
+### Step 4: V-TIME
+
+| Acceptance criterion | Implementation evidence | Verification evidence | Result |
+|---|---|---|---|
+| Unknown and inexact containers keep min/max pruning of nanosecond UTC bounds, with no "Failed to convert min values" warning | Fork `datafusion/common/src/pruning.rs`, commit `8d6d6bf58`: `PrunableStatistics::get_exact_column_statistics` fills unknown containers with a null typed by the schema, replacing the untyped `ScalarValue::Null` that `iter_to_array` rejected | fork `pruning::tests::mixed_timestamp_bounds_preserve_unknown_containers` fails before the fix and passes after it; `scan_sizing::tests::nanosecond_pruning_preserves_unknown_container_bounds` fails on `19796a13e` and passes on `8d6d6bf58` | PASS |
+| One conversion rule at the demonstrated owner | The fix is at the fork owner. Wyrd's statistics types were already consistent, so there was no workaround to remove. The 11 pins, `Cargo.lock` and `ORACLE_DATAFUSION_REVISION` now point to `8d6d6bf58` | `oracle::codec::tests::plan_fingerprint_binds_the_pinned_datafusion_revision`; lib suite 1698/1698 under test Postgres; `mise run lints` | PASS |
+
+Cache validation (step 1) is confirmed:
+- `CachedFileMetadataEntry::is_valid_for` compares `ObjectMeta` size and `last_modified`.
+- Staged run paths are unique per assembly key, shard and generation, and a lane's generations only move forward.
+- The caches are process-local.
+
+Path keys therefore never alias a different run. The limit is that a run rewritten in place at its recorded size would be served from a stale cache entry; that is outside the staging contract.

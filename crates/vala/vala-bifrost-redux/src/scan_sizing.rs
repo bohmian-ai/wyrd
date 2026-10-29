@@ -846,4 +846,98 @@ mod tests {
             "a plan's table-qualified filter prunes as the scan's own does"
         );
     }
+
+    /// A nanosecond time predicate over the hot path's mixed container
+    /// statistics prunes the known-disjoint containers and keeps the
+    /// unknown ones.
+    ///
+    /// The containers are what live and staged reads hand pruning: exact
+    /// `batch_statistics` bounds of a memory batch on either side of the
+    /// window, an unknown batch, a batch whose bounds a capture filter made
+    /// inexact, and a staged run's widened `set_time_bounds` bounds. The
+    /// unknown and inexact containers must reach pruning as typed nulls, so
+    /// the exact minima still form a typed array — the conversion that,
+    /// when it fails, warns and discards every bound.
+    ///
+    /// # Panics
+    /// Panics when the predicate does not plan, the minima are not a typed
+    /// nanosecond array, or the keep mask differs.
+    #[test]
+    fn nanosecond_pruning_preserves_unknown_container_bounds() {
+        use arrow::array::{Array as _, RecordBatch, TimestampNanosecondArray};
+        use arrow::datatypes::{Field, Schema};
+        use datafusion::common::pruning::{PrunableStatistics, PruningStatistics as _};
+
+        let instant = arrow::datatypes::DataType::Timestamp(
+            arrow::datatypes::TimeUnit::Nanosecond,
+            Some(iceberg::arrow::UTC_TIME_ZONE.into()),
+        );
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "start_time_unix_nano",
+            instant.clone(),
+            false,
+        )]));
+        let batch = |nanos: Vec<i64>| {
+            crate::scribe::memtable::batch_statistics(
+                &RecordBatch::try_new(
+                    Arc::clone(&schema),
+                    vec![Arc::new(
+                        TimestampNanosecondArray::from(nanos)
+                            .with_timezone(iceberg::arrow::UTC_TIME_ZONE),
+                    )],
+                )
+                .expect("time batch"),
+            )
+        };
+        let mut staged = datafusion::common::Statistics::new_unknown(&schema);
+        crate::oracle::exec::set_time_bounds(&mut staged, &schema, "start_time_unix_nano", 10, 20);
+        let statistics = vec![
+            batch(vec![1_000, 2_000]),
+            Arc::new(datafusion::common::Statistics::new_unknown(&schema)),
+            Arc::new(batch(vec![5_000, 6_000]).as_ref().clone().to_inexact()),
+            batch(vec![5_000, 6_000]),
+            Arc::new(staged),
+            batch(vec![90_000]),
+        ];
+        let context = datafusion::prelude::SessionContext::new();
+        let df_schema =
+            datafusion::common::DFSchema::try_from(Arc::clone(&schema)).expect("time schema");
+        let predicate = context
+            .create_physical_expr(
+                context
+                    .parse_sql_expr(
+                        "start_time_unix_nano >= to_timestamp_nanos(4000) \
+                         AND start_time_unix_nano < to_timestamp_nanos(8000)",
+                        &df_schema,
+                    )
+                    .expect("window parses"),
+                &df_schema,
+            )
+            .expect("window plans");
+
+        let minima = PrunableStatistics::new(statistics.clone(), Arc::clone(&schema))
+            .min_values(&datafusion::common::Column::from_name(
+                "start_time_unix_nano",
+            ))
+            .expect("exact minima convert to one array");
+        assert_eq!(
+            minima.data_type(),
+            &instant,
+            "the minima keep the column type"
+        );
+        assert_eq!(
+            (0..minima.len())
+                .map(|container| minima.is_valid(container))
+                .collect::<Vec<_>>(),
+            [true, false, false, true, true, true],
+            "only exact bounds are known"
+        );
+        assert_eq!(
+            BatchPruning::try_new(&schema, predicate)
+                .expect("the window is a pruning predicate")
+                .keep(&statistics, statistics.len()),
+            [false, true, true, true, false, false],
+            "disjoint exact containers are pruned and unknown ones kept"
+        );
+    }
 }

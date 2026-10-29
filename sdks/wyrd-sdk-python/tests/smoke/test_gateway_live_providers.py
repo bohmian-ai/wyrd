@@ -18,6 +18,7 @@ from typing import Any, Literal
 
 import anthropic
 import httpx
+import jsonschema
 import openai
 import pytest
 from anthropic.types import RawContentBlockDeltaEvent, TextBlock, TextDelta, ToolUseBlock
@@ -100,17 +101,22 @@ def verdict_format(tmp_path: Path) -> dict[str, Any]:
     return Prompt.load(path).render().model_dump()["body"]["response_format"]
 
 
-def assert_verdict(text: str | None) -> None:
-    """Assert ``text`` is a plain Verdict: the closed envelope and cited slot shape."""
+def assert_verdict(text: str | None, schema: dict[str, Any]) -> None:
+    """Assert ``text`` is a JSON object satisfying ``schema``, the exact schema sent."""
     assert text, "the provider returned no Verdict text"
-    verdict = json.loads(text)
-    assert set(verdict) == {"outcome", "reason", "citations"}, verdict
-    assert verdict["outcome"] in ("passed", "failed", "inconclusive"), verdict
-    assert isinstance(verdict["reason"], str), verdict
-    for citation in verdict["citations"]:
-        assert set(citation) == {"slot", "locator"} and isinstance(citation["slot"], str), verdict
-        [(kind, _)] = citation["locator"].items()
-        assert kind in ("page", "slide", "lines", "json_pointer", "region"), verdict
+    jsonschema.Draft202012Validator(schema).validate(json.loads(text))
+
+
+def test_assert_verdict_validates_against_the_sent_schema(tmp_path: Path) -> None:
+    """The Verdict assertion accepts a valid Verdict and rejects replies the schema forbids."""
+    schema = verdict_format(tmp_path)["json_schema"]["schema"]
+    cited = {"slot": "answer", "locator": {"json_pointer": "/text"}}
+    assert_verdict(json.dumps({"outcome": "passed", "reason": "r", "citations": [cited]}), schema)
+    for citations in ({}, [{"slot": "answer", "locator": {"page": "not-an-integer"}}]):
+        with pytest.raises(jsonschema.ValidationError):
+            assert_verdict(
+                json.dumps({"outcome": "passed", "reason": "r", "citations": citations}), schema
+            )
 
 
 def openai_compatible(live: LiveGateway) -> openai.OpenAI:
@@ -421,7 +427,7 @@ def test_openai_chat_accepts_the_named_verdict_format(
         response_format=response_format,
         max_completion_tokens=MAX_OUTPUT_TOKENS,
     )
-    assert_verdict(completion.choices[0].message.content)
+    assert_verdict(completion.choices[0].message.content, response_format["json_schema"]["schema"])
 
 
 @pytest.mark.smoke
@@ -475,7 +481,7 @@ def test_live_providers_accept_the_generated_verdict_schema(
                 max_output_tokens=MAX_OUTPUT_TOKENS,
             ),
         ).text
-    assert_verdict(text)
+    assert_verdict(text, schema)
 
 
 @pytest.mark.smoke

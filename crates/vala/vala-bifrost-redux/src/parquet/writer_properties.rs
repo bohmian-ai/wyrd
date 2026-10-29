@@ -1,7 +1,7 @@
 //! Uniform Parquet writer properties for Bifrost data files.
 
 use iceberg::writer::file_writer::variant_shredding::VariantShreddingPolicy;
-use parquet::basic::{Compression, Encoding};
+use parquet::basic::{Compression, Encoding, ZstdLevel};
 use parquet::file::metadata::KeyValue;
 use parquet::file::properties::{EnabledStatistics, WriterProperties, WriterPropertiesBuilder};
 use parquet::schema::types::ColumnPath;
@@ -31,10 +31,8 @@ const BLOOM_FPP: f64 = 0.01;
 
 /// Parquet [`WriterProperties`] for every Bifrost data file.
 ///
-/// `LZ4_RAW` pages: every query decompresses each page it touches, and LZ4
-/// decompresses several times faster than Zstandard, at the cost of larger
-/// files; Forge
-/// compaction writes the same recipe. Row groups
+/// ZSTD level 3 (writes are once-per-frame after bounded admission; reads are
+/// scan-bound, so the extra compression over SNAPPY is worth it). Row groups
 /// close at the soft [`BIFROST_ROW_GROUP_TARGET_BYTES`] encoded target or at
 /// parquet-rs's default row maximum, whichever comes first; write batch and
 /// page sizing keep parquet-rs defaults.
@@ -51,6 +49,9 @@ const BLOOM_FPP: f64 = 0.01;
 /// registered physical layout resolved from the managed floor and the table's
 /// declarations. Every other column stays unallowlisted so payload and message
 /// columns cannot inflate a file's footer.
+///
+/// # Panics
+/// Never panics — ZSTD level 3 is always valid.
 pub fn bifrost_writer_properties(time_column: &str, bloom_columns: &[String]) -> WriterProperties {
     bifrost_writer_properties_with_metadata(Vec::new(), time_column, bloom_columns)
 }
@@ -67,6 +68,10 @@ pub fn bifrost_writer_properties(time_column: &str, bloom_columns: &[String]) ->
 /// [`crate::parquet::footer`] so producer paths cannot invent alternate field
 /// spellings, and must pass the canonical Bloom column union resolved from the table's registered
 /// physical layout so every producer writes one identical footer recipe.
+///
+/// # Panics
+///
+/// Panics only if the compile-time constant Zstandard level `3` becomes invalid.
 #[must_use]
 pub fn bifrost_writer_properties_with_metadata(
     metadata: Vec<KeyValue>,
@@ -110,6 +115,10 @@ pub const BIFROST_VARIANT_SHREDDING: VariantShreddingPolicy = VariantShreddingPo
 /// table binding the rewrite executes under and is carried forward into every
 /// output footer, so a rewritten file proves its tenant exactly as the staged
 /// file it replaces did.
+///
+/// # Panics
+///
+/// Panics only if the compile-time constant Zstandard level `3` becomes invalid.
 #[must_use]
 pub fn bifrost_rewrite_writer_properties(
     row_group_target_bytes: u64,
@@ -134,9 +143,15 @@ pub fn bifrost_rewrite_writer_properties(
 /// Bloom columns set only enablement and [`BLOOM_FPP`]; parquet-rs sizes each
 /// filter's distinct-value capacity from the writer's row-group row maximum
 /// and folds it down to the values a group actually holds when it writes it.
+///
+/// # Panics
+///
+/// Panics only if the compile-time constant Zstandard level `3` becomes invalid.
 fn recipe_builder(time_column: &str, bloom_columns: &[String]) -> WriterPropertiesBuilder {
     let mut builder = WriterProperties::builder()
-        .set_compression(Compression::LZ4_RAW)
+        .set_compression(Compression::ZSTD(
+            ZstdLevel::try_new(3).expect("zstd level 3 is valid"),
+        ))
         .set_max_row_group_bytes(Some(BIFROST_ROW_GROUP_TARGET_BYTES))
         .set_dictionary_enabled(true)
         .set_dictionary_page_size_limit(BIFROST_DICTIONARY_PAGE_BYTES)
@@ -233,7 +248,10 @@ mod tests {
         let properties = bifrost_writer_properties(TIME_COLUMN, &bloom_columns);
         let timestamp = ColumnPath::from(TIME_COLUMN);
 
-        assert_eq!(properties.compression(&timestamp), Compression::LZ4_RAW);
+        assert_eq!(
+            properties.compression(&timestamp),
+            Compression::ZSTD(ZstdLevel::try_new(3).expect("zstd level 3 is valid"))
+        );
         assert_eq!(
             properties.max_row_group_row_count(),
             Some(DEFAULT_MAX_ROW_GROUP_ROW_COUNT)

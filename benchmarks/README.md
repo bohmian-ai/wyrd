@@ -35,9 +35,9 @@ or counter, a mismatched population, zero CPU, a failed record); a busy
 driver does not invalidate a smoke. A full command never runs a smoke first:
 run `--smoke` on the same command, or `bench:smoke` for every default plan's
 smoke. Every L1 experiment takes up to 5 minutes (Verification, Gateway,
-Bifrost `hot` and `parquet`) except Bifrost `writes-parquet`, which takes up
-to 8 (480 s), so `bench:l1:bifrost` takes up to 18 minutes (1,080 s) and
-`bench:l1` up to 28 in all. An L2 engine takes 20 to 30 minutes.
+Bifrost `parquet`) except Bifrost `writes-parquet` and `hot`, which take up
+to 8 (480 s), so `bench:l1:bifrost` takes up to 21 minutes (1,260 s) and
+`bench:l1` up to 31 in all. An L2 engine takes 20 to 30 minutes.
 
 ## Prerequisites
 
@@ -121,9 +121,15 @@ What each engine covers:
       protobuf decode, which is labelled unavailable for native writes.
       Group stages are shared by every append of a group, so phases overlap
       and are never summed.
-    - `hot`: 10M events rows and 1M spans held in memtables (a staged or
-      published row is INVALID); point lookups at 1/64, with p99 below 5 ms
-      at 64, a small aggregate and a shredded-attribute span filter at 1.
+    - `hot`: 10M events rows and 1M day-1 spans held in canonical
+      memtables (a staged or published row is INVALID); point lookups at
+      1/64, with p99 below 5 ms at 64, a small aggregate and a
+      shredded-attribute span filter at 1. Then, outside every window, day 1
+      rotates by its 150 s retention and publishes through a claim that must
+      teach the server a span Variant layout, and 1M day-2 spans load into
+      memtables in that layout; `span-learned-shredded` asks the same filter
+      bounded to day 2 at 1/64, reading no file and ending within 150 s of
+      the first day-2 row.
     - `parquet`: the same fixtures and a 200,000-row native and logs
       storage sample, settled once as Parquet; point lookups at 1/64, a
       small aggregate and a full scan at 1 (scans report p95), span

@@ -2204,7 +2204,14 @@ impl ReadableSource {
     /// logical schema: each projected shredded Variant column is reconstructed
     /// from its typed leaves and residual, so a capture never exposes a
     /// physical layout and memory unions with staged and published rows value
-    /// for value.
+    /// for value. Before reconstruction such a batch is filtered by `pruning`'s
+    /// predicate, adapted to the physical layout by DataFusion's
+    /// [`DefaultPhysicalExprAdapterFactory`], so only matching rows are
+    /// reconstructed and Variant functions can read typed leaves. A filtered
+    /// batch's bounds become inexact. A predicate that does not adapt or
+    /// evaluate filters nothing here; the query's own filter still runs.
+    ///
+    /// [`DefaultPhysicalExprAdapterFactory`]: datafusion::physical_expr_adapter::DefaultPhysicalExprAdapterFactory
     ///
     /// # Errors
     ///
@@ -2262,7 +2269,10 @@ impl ReadableSource {
             })
             .collect();
         let keep = pruning.map(|pruning| pruning.keep(&statistics, statistics.len()));
-        for (index, ((batch, wal_lsn_max), statistics)) in self
+        // One generation pins one layout, so the predicate adapts once to the
+        // first physical batch and serves them all.
+        let mut adapted: Option<Option<Arc<dyn datafusion::physical_expr::PhysicalExpr>>> = None;
+        for (index, ((batch, wal_lsn_max), mut statistics)) in self
             .runs
             .iter()
             .flat_map(|run| run.batches.iter().zip(run.wal_lsns.iter().copied()))
@@ -2272,15 +2282,44 @@ impl ReadableSource {
             if keep.as_ref().is_some_and(|keep| !keep[index]) {
                 continue;
             }
-            let rows = batch.num_rows();
+            let shredded = projection.iter().any(|(_, source)| {
+                source.is_some_and(|column| {
+                    batch.column(column).data_type() != self.schema.field(column).data_type()
+                })
+            });
+            let mut physical = physical_projection(batch, &schema, &projection);
+            if let Some(pruning) = pruning.filter(|_| shredded) {
+                let predicate = adapted.get_or_insert_with(|| {
+                    use datafusion::physical_expr_adapter::PhysicalExprAdapterFactory as _;
+                    datafusion::physical_expr_adapter::DefaultPhysicalExprAdapterFactory
+                        .create(Arc::clone(&schema), physical.schema())
+                        .ok()?
+                        .rewrite(Arc::clone(pruning.predicate().orig_expr()))
+                        .ok()
+                });
+                if let Some(kept) = predicate.as_ref().and_then(|predicate| {
+                    datafusion::physical_plan::filter::batch_filter(&physical, predicate).ok()
+                }) {
+                    if kept.num_rows() == 0 {
+                        continue;
+                    }
+                    if kept.num_rows() != physical.num_rows() {
+                        statistics = Arc::new(statistics.as_ref().clone().to_inexact());
+                    }
+                    physical = kept;
+                }
+            }
+            let rows = physical.num_rows();
             let columns = projection
                 .iter()
-                .map(|(field, source)| match source {
-                    Some(column) => {
+                .zip(physical.schema_ref().fields())
+                .zip(physical.columns())
+                .map(|(((field, source), stored), column)| match source {
+                    Some(source) => {
                         let logical = crate::schema::logical_column(
-                            &batch.schema_ref().fields()[*column],
-                            batch.column(*column),
-                            self.schema.field(*column),
+                            stored,
+                            column,
+                            self.schema.field(*source),
                         )
                         .map_err(|detail| ScribeError::Internal {
                             detail: format!("live-tail Variant reconstruction failed: {detail}"),
@@ -2291,7 +2330,7 @@ impl ReadableSource {
                             arrow::compute::cast(&logical, field.data_type()).map_err(internal)
                         }
                     }
-                    None => Ok(arrow::array::new_null_array(field.data_type(), rows)),
+                    None => Ok(Arc::clone(column)),
                 })
                 .collect::<Result<Vec<_>, _>>()?;
             let batch = RecordBatch::try_new_with_options(
@@ -2310,6 +2349,47 @@ impl ReadableSource {
         }
         Ok(())
     }
+}
+
+/// Returns `batch`'s columns `projection` reads, unconverted, under the names
+/// of `schema`, with a projected field the batch predates filled with nulls:
+/// the stored layout a capture filters before reconstructing it in `schema`.
+///
+/// # Panics
+///
+/// Never in practice: every column comes from `batch` or is built at its row
+/// count, under its own field.
+fn physical_projection(
+    batch: &RecordBatch,
+    schema: &SchemaRef,
+    projection: &[(FieldRef, Option<usize>)],
+) -> RecordBatch {
+    let (fields, columns): (Vec<_>, Vec<_>) = projection
+        .iter()
+        .zip(schema.fields())
+        .map(|((field, source), named)| match source {
+            Some(column) => (
+                Arc::new(
+                    batch
+                        .schema_ref()
+                        .field(*column)
+                        .clone()
+                        .with_name(named.name()),
+                ),
+                Arc::clone(batch.column(*column)),
+            ),
+            None => (
+                Arc::clone(named),
+                arrow::array::new_null_array(field.data_type(), batch.num_rows()),
+            ),
+        })
+        .unzip();
+    RecordBatch::try_new_with_options(
+        Arc::new(Schema::new(fields)),
+        columns,
+        &arrow::array::RecordBatchOptions::new().with_row_count(Some(batch.num_rows())),
+    )
+    .expect("columns taken from one batch share its row count and their own fields")
 }
 
 /// Computes one append batch's exact row count, every column's byte size,

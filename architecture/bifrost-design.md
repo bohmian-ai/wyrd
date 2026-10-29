@@ -442,7 +442,10 @@ at any depth before rows leave the scan.
   WAL. Staging writes the frozen generation's rows as is; recovery
   reconstructs the run's logical schema from its layout. Memory reads
   reconstruct logical Variant storage before rows leave the capture, so unions
-  and remote output never expose a physical layout. A restart or eviction only
+  and remote output never expose a physical layout. A capture first filters a
+  physical generation by the query predicate, adapted to that layout by
+  DataFusion's expression adapter, so only matching rows are reconstructed;
+  Wyrd classifies no query shape. A restart or eviction only
   returns new generations to canonical until a claim teaches the process
   again; no hint crosses processes, tenants, or table versions.
 - **Forge** samples nothing. It sums each source footer's shredded-leaf

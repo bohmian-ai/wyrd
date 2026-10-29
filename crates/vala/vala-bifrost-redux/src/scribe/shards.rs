@@ -7687,6 +7687,50 @@ mod tests {
         values
     }
 
+    /// The `attrs` values, as JSON, of the rows a capture of `key`'s partition
+    /// returns under the SQL `filter`, planned over `logical`; each batch must
+    /// come back in the logical Variant storage.
+    fn filtered_attrs(
+        memtable: &Memtable,
+        key: &SealKey,
+        logical: &arrow::datatypes::SchemaRef,
+        filter: &str,
+    ) -> Vec<String> {
+        let context = datafusion::prelude::SessionContext::new();
+        let df_schema =
+            datafusion::common::DFSchema::try_from(Arc::clone(logical)).expect("logical schema");
+        let predicate = context
+            .create_physical_expr(
+                context
+                    .parse_sql_expr(filter, &df_schema)
+                    .expect("filter parses"),
+                &df_schema,
+            )
+            .expect("filter plans");
+        let pruning =
+            crate::scan_sizing::BatchPruning::try_new(logical, predicate).expect("pruning plans");
+        let capture =
+            crate::scribe::memtable::LiveCapture::take([memtable], key.tenant, &key.table, None)
+                .expect("locks")
+                .expect("no registry to wait on");
+        let day = key.partition.time();
+        let read = capture
+            .read(&(day..=day), logical.fields(), Some(&pruning))
+            .expect("capture reads");
+        let mut values = Vec::new();
+        for readable in read.batches {
+            let attrs = readable.batch.column_by_name("attrs").expect("attrs");
+            assert_eq!(
+                attrs.data_type(),
+                &wyrd_types::variant::variant_storage_type(),
+                "a filtered capture reads the logical Variant storage"
+            );
+            let json = parquet_variant_compute::variant_to_json(attrs).expect("Variant JSON");
+            values.extend(json.iter().map(|value| value.expect("non-null").to_owned()));
+        }
+        values
+    }
+
     /// A generation keeps the layout it opened with; only a later generation
     /// is shredded, while the WAL keeps canonical identity and memory settles.
     ///
@@ -7697,7 +7741,9 @@ mod tests {
     /// slice keeps the canonical fingerprint and digest preprocessing
     /// computed. Capture reads exact logical values from both generations,
     /// and once each group settles the only Scribe memory left is the active
-    /// rows the memtable retains.
+    /// rows the memtable retains. A capture filtered by a Variant path or by a
+    /// plain Variant predicate returns exactly the matching shredded rows,
+    /// reconstructed.
     #[tokio::test]
     async fn generation_layout_binding_keeps_canonical_wal_and_bounded_memory() {
         let wal_root = tempfile::tempdir().expect("WAL directory");
@@ -7824,6 +7870,21 @@ mod tests {
         settle(&owner, &budget);
 
         assert_eq!(readable_attrs(&owner.memtable, &fresh), json);
+        assert_eq!(
+            filtered_attrs(&owner.memtable, &fresh, &logical, "attrs ->> 'b' = 'x'"),
+            [json[1]]
+        );
+        assert_eq!(
+            filtered_attrs(&owner.memtable, &fresh, &logical, "attrs ->> 'a' = '1'"),
+            [json[0]]
+        );
+        assert_eq!(
+            filtered_attrs(&owner.memtable, &fresh, &logical, "attrs IS NOT NULL"),
+            json
+        );
+        assert!(
+            filtered_attrs(&owner.memtable, &fresh, &logical, "attrs ->> 'b' = 'y'").is_empty()
+        );
         assert_eq!(
             readable_attrs(&owner.memtable, &cold),
             [json.as_slice(), json.as_slice()].concat()

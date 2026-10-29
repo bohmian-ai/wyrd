@@ -302,10 +302,13 @@ not published hot files and not an additional sample of current memory.
    A generation with no learned layout remains canonical throughout its life.
 3. Separate logical table schema from physical retained schema. The logical
    fingerprint identifies assembly/retry/table compatibility; physical changes
-   must not split one claim or change digest. Preserve typed fields through both
-   memory projections until Variant-aware predicates run. Separate physical
-   sources when layouts differ; reconstruct canonical projected results before
-   their union or authenticated remote output. No custom SQL Variant semantics.
+   must not split one claim or change digest. Preserve physical layouts
+   through capture-local projection and predicate evaluation; adapt
+   expressions per layout; reconstruct canonical projected results before
+   capture output, union, or authenticated remote output. Expression
+   adaptation is DataFusion's (`DefaultPhysicalExprAdapterFactory`); Wyrd
+   classifies no query shape, and any optimization the adapter lacks belongs
+   in the DataFusion or Iceberg fork. No custom SQL Variant semantics.
 4. Extend the existing rolling Parquet writer with native-input preservation.
    If input already matches the selected physical file schema, write it directly
    with ArrowWriter; never call layout.shred on it. Staging copies the frozen
@@ -1190,3 +1193,38 @@ diagnosed), iceberg-rust `scan::` tests (63 passed, new
 Records: `benchmarks/history/bifrost/parquet/20261029T132713Z-122ff3a0a.json`
 (all three), `20261029T134546Z-459617bae.json` (kept two). Span-trace
 profile with the hand-off: `target/benchmarks/bifrost/parquet/20261029T133235Z/profiles/`.
+
+## Item 10: capture-local Variant-aware memory filtering
+
+Owner: `ReadableSource::project` (`scribe/memtable.rs`). The follower already
+decodes the signed filter over the closure and sends it to the capture as
+`BatchPruning`. For a generation whose projected columns are in a learned
+physical layout, the capture now:
+1. projects the stored columns without converting them;
+2. rewrites the predicate with DataFusion's `DefaultPhysicalExprAdapterFactory`,
+   once per generation;
+3. keeps only the rows that match;
+4. reconstructs those rows exactly as before.
+
+Rows still leave the capture in the logical schema
+(`bifrost-design.md` §Variant shredding). Expression adaptation is the
+DataFusion fork's:
+- a function that accepts any layout reads typed leaves;
+- any other read of a shredded column gets the adapter's by-value Variant
+  cast.
+
+Wyrd classifies no query shape. A predicate that does not adapt or evaluate
+filters nothing in the capture, because the plan's own filter still runs. A
+filtered batch's bounds become inexact. Canonical generations take the path
+they took before. Decision 3 was reworded to match (approved).
+
+Rejected first attempt: keeping physical columns past the capture and
+choosing filter order by Variant function name in `MemtableSource`. It was a
+query-type-specific path, and it contradicted the design's capture boundary
+(independent read-only Codex review).
+
+| Acceptance criterion | Implementation evidence | Verification evidence | Result |
+|---|---|---|---|
+| Shredded memory rows filter before reconstruction, by any predicate | `scribe/memtable.rs` `ReadableSource::project`, `physical_projection` | `scribe::shards::tests::generation_layout_binding_keeps_canonical_wal_and_bounded_memory`: RED with the capture filter disabled (all rows returned), GREEN with it on | PASS |
+| Capture output stays logical; memory/stage/publish/restart unchanged | same | journey `telemetry::variant_layouts_survive_memory_stage_publication_and_restart` | PASS |
+| No regression on live reads | same | `vala-bifrost-redux` lib (898 passed), clippy `-D warnings`, `wyrd-testing --test oracle -P journey --run-ignored=only` (59 passed) | PASS |

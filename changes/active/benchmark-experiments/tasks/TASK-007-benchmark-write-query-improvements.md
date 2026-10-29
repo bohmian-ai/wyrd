@@ -1060,3 +1060,78 @@ behavior; no assertion changed.
 
 Verification: `cargo nextest run --locked -p wyrd-testing --test scribe -P
 journey --run-ignored=only` under the test Postgres: 41 passed.
+
+## Task 11 outcome: no page recipe retained
+
+Result: NEGATIVE. Neither candidate met the predeclared retention rules, so
+the production recipe was restored to parquet-rs's default data pages
+(`d9b06b5f5` reverts `5c0991a50` and `71cbf1932`). No GREEN or performance
+claim is made.
+
+**Profile premise (held).** Samply on HEAD `0bd122d6d`, point-c64 and
+span-trace-c64, symbolized against the profiled `wyrd-server`, CPU-weighted
+on the query worker threads (`tokio-rt-worker`): Parquet frames are 29.9%
+inclusive, page decode 15.3%, zstd page decompression 12.1%. Opening the
+object file on every query (`File::open` plus `statx`) is another ~11%; that
+is outside this task and is recorded, not acted on.
+
+**Recipe version.** The task asks to bump the writer recipe's "existing
+recipe version". None exists: `scribe/write_recipe.rs` versions a table's
+physical recipe, and rewrite selection compares sizes, not page settings. No
+version was invented. Every producer (Scribe staging, Forge compaction and
+rewrite) builds from `parquet/writer_properties.rs::recipe_builder`, so the
+candidates were two setters there.
+
+**Runs.** Each column is one full `bench:l1:bifrost:parquet` plus one full
+`bench:l1:bifrost:writes` run (each step: warmup and 3 measured repetitions,
+medians), all VALID, run back to back on the same host.
+
+| Metric (median) | Baseline `0bd122d6d` | 256 KiB / 4,096 `5c0991a50` | 64 KiB / 1,024 `71cbf1932` |
+|---|---:|---:|---:|
+| point-c64 CPU/query | 3.846 ms | 2.529 ms (−34.2%) | 2.595 ms (−32.5%) |
+| point-c64 server / client p99 | 11.31 / 15.53 ms | 7.28 / 10.38 ms | 7.54 / 10.81 ms |
+| point-c64 scanned bytes/query | 183 KB | 74 KB | 64 KB |
+| span-trace-c64 CPU/query | 7.155 ms | 6.795 ms (−5.0%) | 6.592 ms (−7.9%) |
+| span-trace-c64 server / client p99 | 22.30 / 25.98 ms | 21.96 / 25.54 ms | 20.86 / 24.42 ms |
+| span-trace-c64 scanned bytes/query | 689 KB | 988 KB | 1,037 KB |
+| full-scan-c1 server p95 (no p99: too few samples) | 52.2 ms | 59.4 ms (+13.8%) | 45.4 ms (−12.9%) |
+| native-write-c64 rate | 128.5 req/s | +14.5% | +1.8% |
+| native-write peak rows/s | 2.10M | 2.14M (+1.8%) | 2.41M (+14.5%) |
+| otlp-spans-c64 rate | 556.1 req/s | +1.3% | −6.7% |
+| storage ratio native / logs / spans | 0.080 / 0.118 / 0.071 | 0.085 / 0.119 / 0.079 | 0.082 / 0.125 / 0.091 |
+
+| Rule | 256 KiB / 4,096 | 64 KiB / 1,024 |
+|---|---|---|
+| point-c64 and span-trace-c64 CPU/query each ≥10% lower | FAIL (span-trace −5.0%) | FAIL (span-trace −7.9%) |
+| neither c64 server p99 >5% worse; one ≥5% better | PASS | PASS |
+| full-scan/aggregate server latency ≤5% worse | FAIL (+13.8%) | PASS |
+| writes rows/s ≤5% lower | PASS | FAIL (otlp-spans −6.7%) |
+| persisted bytes ≤10% higher | FAIL (spans +11%) | FAIL (spans +28%) |
+
+**Why span-trace does not benefit.** Point lookups filter a sorted column,
+so one small page holds the match and scanned bytes fall 60–65%. A
+`trace_id` lookup's 8 rows are spread across the group, so smaller pages
+mean more pages, headers and index entries to touch: scanned bytes rise
+43–51% and the decode saving is mostly cancelled. The full-scan swing
+(+13.8% then −12.9%) is larger than any plausible recipe effect and is
+treated as run-to-run noise. Both candidates fail on span-trace CPU and span
+storage, which do not depend on it.
+
+**S11A.** The page-selection test (`oracle::exec::tests::page_index_selects_only_the_matching_pages`)
+was extended to assert the pages actually written (largest value page below
+the 20,000-row default) and the rows kept (fewer than one default page). It
+was RED on the baseline (kept 20,480 rows; baseline page starts 0, 20480,
+32768, 53248, 73728, 94208) and GREEN under both candidates with all 898
+`vala-bifrost-redux` lib tests and clippy passing. It was reverted with the
+recipe, because it asserts the candidate's behavior.
+
+Records: `benchmarks/history/bifrost/parquet/20261029T020424Z-0bd122d6d.json`,
+`20261029T022644Z-5c0991a50.json`, `20261029T024612Z-71cbf1932.json`;
+`benchmarks/history/bifrost/writes-parquet/20261029T020913Z-0bd122d6d.json`,
+`20261029T023134Z-5c0991a50.json`, `20261029T025100Z-71cbf1932.json`.
+Profile: `target/benchmarks/bifrost/parquet/20261029T015852Z/profiles/`.
+
+Not tried, because the task forbids it as a fallback: per-column page sizes
+(small pages only on sorted point-lookup columns), codec changes, and
+decoded-page caching. Per-column page sizing is the evidence-backed
+follow-up if point-lookup CPU becomes the goal again.

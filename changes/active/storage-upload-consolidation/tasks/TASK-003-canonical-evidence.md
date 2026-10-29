@@ -263,3 +263,52 @@ or weaken correctness.
 - [Security posture](../../../../architecture/wyrd-security-posture.md).
 - [Benchmark measurement rules](../../../../benchmarks/README.md).
 
+
+## Implementation Evidence
+
+Commits `a90fbe5a4`, `8a5a0785e`, `47ba4087c` on `canonical-evidence`.
+
+| Acceptance criterion | Implementation evidence | Verification evidence | Result |
+|---|---|---|---|
+| REQ-010–011, REQ-014–015; INV-002, INV-004; AC-004, AC-007 | `verification/hosted/evidence.rs::TenantEvidence` keeps per-execution `files` and `artifacts` memos filled at `admit` and reused by `read`, `artifact_file`, `select`, workspace staging, and citations; each Artifact use still calls `cards/routes.rs::authorize_card_ref` (one audited `card:read` per use); `cards/service.rs::get_card_objects_by_ref` returns the hydrated Card with its inventory so hydration and selection share one read; `storage/inventory.rs::ObjectInventory::executed_by` takes the SYSTEM principal from `Caller.executed_by`, so File resolution makes no application Postgres lookup | V1 `pg_hosted_artifacts::evidence_metadata_is_resolved_once`: RED on the pre-change source (16 inventory reads), GREEN 2 reads, both audited under the executing principal (a fresh ID no registry names); no-grant and foreign-tenant Artifact reads terminal, foreign File not ready; regressions `pg_hosted_files::*`, `pg_hosted_artifacts::*`, `pg_verification_routes::*` (TASK-002 `file_reuse_requires_completed_file_inventory` included) | PASS |
+| REQ-013; AC-006 | `TenantEvidence::admit` resolves every File through the inventory; no record or unreadable inventory is `BlockError::Retryable` → `EngineError::EvidenceUnavailable` via `admission`; existing mappings make it 503 (`run_direct`) or a bounded `Retry` (`runner.rs::engine_failure`) | V2 `pg_verification_runtime::inventory_readiness_preserves_execution_bounds`: RED on the pre-change source (completed after 1 attempt with no record); GREEN queued `retrying`/`evidence_unavailable` ×2 → `errored` after 3 attempts; a second run completes once the upload completes; direct `fail_next_query_after_schema` → 503 "input doc: the evidence inventory cannot be read now", then passes. Terminal digest, length, format: `pg_hosted_files::{evidence_refuses_tampered_body, evidence_reads_only_matching_files}`; wrong Artifact UID or path and stored bytes that no longer match the inventory stay terminal: `pg_hosted_artifacts::artifact_reads_refuse_before_use`; a deleted File record is planned again: `file_reuse_requires_completed_file_inventory` | PASS |
+| REQ-009, REQ-012, REQ-016; INV-001, INV-005; AC-005 | No production change: `InputResolver` already reads only Bifrost tables (verification-only evidence) | V3 `pg_verification_routes::canonical_readback_does_not_read_payload_bytes` (stored bytes deleted; a new judgment cannot pass; status still returns the verdict and the original File declaration; passes on the pre-change source); V4 `wyrd-ai verifier_building_blocks::stored_evidence_readback_uses_canonical_records`; V5 Python `test_stored_evidence_readback_uses_canonical_records`; V6 TypeScript "stored evidence readback uses canonical records"; V7 `wyrd-mcp verification::pg_tests::stored_evidence_readback_uses_canonical_records`; group and schedule: `pg_verification_groups::*`, `pg_verification_runtime::verification_records_have_one_payload_owner` | PASS |
+| Spec costs and performance paragraph | See Measurement | `bench:l1:verification`, candidate `47ba4087c` and baseline `3a99eb05f` | NOT MEASURED |
+
+Measurement: both runs exited INVALID with `host.busy` before admitting any
+workload. Non-benchmark processes (`mediaanalysisd`, a virtual machine) used
+14.3% of 11 CPUs, above the 10% limit. No reading exists, so no cost claim is
+made. The existing `direct-verify` workload uses inline JSON and cannot show
+File or ArtifactRef inventory cost even on a quiet host. Change review must
+rerun the comparison on a quiet host.
+
+Checks: `fmt`, `lints`, `check:tenant-isolation`, `check:deps`,
+`py:typecheck`, `ts:typecheck`, `ts:format:check`, `ts:lints`, ruff
+format/check on the changed Python test, `git diff --check`. Server
+integration: 37 passed across `pg_hosted_*`, `pg_verification_routes::*`,
+`pg_verification_groups::*`, V2 and `verification_records_have_one_payload_owner`.
+
+Selector adaptations: V1 lives in `pg_hosted_artifacts`, which owns the
+registered-Artifact setup. V2 lives in `pg_verification_runtime`, because
+`pg_verification_routes` claims no queue.
+
+Known deletion of a File stays retryable, as TASK-002 left it. No production
+path deletes a File, and REQ-013 forbids treating a missing row as deletion.
+Queued exhaustion ends `errored`, as Artifact readiness already did. The
+trace-only rule that the last attempt judges inconclusive is unchanged.
+
+Architecture: `architecture/wyrd-design.md` Verifier evidence paragraph now
+states per-execution metadata reuse and File readiness semantics. No wire
+contract changed, so codegen does not apply.
+
+Non-goals stayed excluded: no queue redesign, global cache, durable repair,
+new outbox dependency, retention work, migration, or persisted evidence copy.
+
+Diagnosis (first GREEN run of V1 reported 16 reads):
+- **Symptom:** V1 failed with the RED count after the source was restored.
+- **Evidence:** the restored files carried their pre-RED mtimes, which are
+  older than the RED build's.
+- **Cause:** `tar x` keeps the archived mtimes, so cargo's fingerprint kept the
+  RED binary.
+- **Fix site:** the source was touched and the run repeated (37/37 passed). No
+  code change.

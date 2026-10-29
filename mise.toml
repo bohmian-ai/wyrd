@@ -535,10 +535,10 @@ run = "cargo nextest run --locked -p wyrd-testing --test oracle -P journey --run
 
 [tasks."bench:build"]
 hide = true
-description = "Builds the release wyrd-server and the capacity benchmark driver with frame pointers into target/profiling for the bench:l1 and bench:l2 experiments. The server builds alone, so the driver's test-support features never unify into the measured binary."
+description = "Builds the release wyrd-server and the capacity benchmark driver with frame pointers into target/profiling for the bench:l1 and bench:l2 experiments. The server builds alone with only its `bench` Scribe control, so the driver's test-support features never unify into the measured binary."
 env = { CARGO_PROFILE_RELEASE_DEBUG = "line-tables-only", RUSTFLAGS = "-C force-frame-pointers=yes" }
 run = [
-  "cargo build --locked --release -p wyrd-server --bin wyrd-server --target-dir target/profiling",
+  "cargo build --locked --release -p wyrd-server --bin wyrd-server --features bench --target-dir target/profiling",
   "cargo build --locked --release -p wyrd-testing --bin capacity --target-dir target/profiling",
 ]
 

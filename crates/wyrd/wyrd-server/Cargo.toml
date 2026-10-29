@@ -8,6 +8,8 @@ repository = { workspace = true }
 authors = { workspace = true }
 
 [features]
+# The benchmark Scribe stage/publish control; only `bench:build` enables it.
+bench = []
 cloud = ["wyrd-storage/cloud", "vala-bifrost-redux/cloud"]
 storage-emulator = ["cloud", "wyrd-storage/emulator"]
 test-support = [

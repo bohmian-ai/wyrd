@@ -5348,3 +5348,47 @@ async fn new_and_existing_tenants_receive_every_builtin() {
         "reconciliation keeps each built-in's first creator"
     );
 }
+
+/// The benchmark Scribe control exists only in a `bench` build.
+///
+/// A shipped server routes neither path: even the platform administrator gets
+/// exactly what an unrouted path answers, so nothing outside a benchmark can
+/// stage or publish on request. A `bench` build answers the administrator with
+/// what it moved.
+#[tokio::test]
+async fn the_benchmark_control_exists_only_in_a_bench_build() {
+    let srv = WyrdTestServer::start_in_process()
+        .await
+        .expect("server starts");
+    let root = initialize_platform_root(&srv)
+        .await
+        .expect("deployment initializes");
+    let session = platform_session(&srv, secrecy::ExposeSecret::expose_secret(&root)).await;
+    let unrouted = srv
+        .oneshot(platform_post(
+            "/platform/benchmark/unrouted",
+            &session,
+            json!({}),
+        ))
+        .await
+        .expect("the router responds")
+        .status();
+    for (path, field) in [
+        ("/platform/benchmark/scribe/stage", "rows_staged"),
+        ("/platform/benchmark/scribe/publish", "claims_published"),
+    ] {
+        let resp = srv
+            .oneshot(platform_post(path, &session, json!({})))
+            .await
+            .expect("the router responds");
+        if cfg!(feature = "bench") {
+            assert_eq!(resp.status(), StatusCode::OK, "{path}");
+            assert!(
+                body_json(resp).await[field].is_u64(),
+                "{path} reports {field}"
+            );
+        } else {
+            assert_eq!(resp.status(), unrouted, "{path} is unrouted");
+        }
+    }
+}

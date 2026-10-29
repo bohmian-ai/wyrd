@@ -1377,7 +1377,7 @@ impl ScribeImpl {
                     self.shards.flush_all(),
                 )
                 .await,
-                Ok(Ok(()))
+                Ok(Ok(_))
             )
         } else {
             false
@@ -1591,7 +1591,7 @@ impl ScribeImpl {
     /// behavior without bypassing the shard command boundary.
     #[cfg(any(test, feature = "test-support"))]
     pub async fn flush_writable_for_test(&self) -> Result<(), ScribeError> {
-        self.shards.flush_all().await
+        self.shards.flush_all().await.map(|_| ())
     }
 
     /// Returns the physical schema of the Variant layout this process learned
@@ -2487,32 +2487,23 @@ impl ScribeImpl {
 
     /// Freezes every active bucket and waits until each is a durable staged member.
     ///
-    /// This is the first half of [`Self::flush_staged`] taken on its own, so a
-    /// harness can query rows served by staged runs before anything publishes
-    /// them.
+    /// This is the first half of [`Self::flush_staged`] taken on its own: it
+    /// publishes nothing, so a caller can read rows served by staged runs
+    /// before anything publishes them. Shards freeze one after another, so only
+    /// rows acknowledged before the call are guaranteed to move. Returns the
+    /// writable rows it froze.
     ///
     /// # Errors
     ///
     /// Returns [`ScribeError`] when a shard cannot freeze its writable
     /// generations; those rows stay appendable and WAL-authoritative.
-    #[cfg(any(test, feature = "test-support"))]
-    pub async fn stage_writable_for_test(&self) -> Result<(), ScribeError> {
-        self.stage_writable().await
-    }
-
-    /// Freezes every active bucket and waits for the persistence queue to stage it.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`ScribeError`] when a shard cannot freeze its writable
-    /// generations.
-    async fn stage_writable(&self) -> Result<(), ScribeError> {
-        self.shards.flush_all().await?;
+    pub async fn stage_writable(&self) -> Result<usize, ScribeError> {
+        let rows = self.shards.flush_all().await?;
         self.shards.drain().await;
         if let Some(persistence) = &self.persistence {
             persistence.drain().await;
         }
-        Ok(())
+        Ok(rows)
     }
 
     /// Flushes every active bucket through the staged and claim lifecycle.

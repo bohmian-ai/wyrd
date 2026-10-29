@@ -1312,8 +1312,9 @@ impl WyrdTestServer {
     pub async fn stage_bifrost_writable_for_test(&self) -> Result<(), WyrdTestServerError> {
         self.bifrost_scribe()
             .ok_or_else(|| WyrdTestServerError::Start("server owns no Scribe".to_owned()))?
-            .stage_writable_for_test()
+            .stage_writable()
             .await
+            .map(|_| ())
             .map_err(|error| WyrdTestServerError::Start(error.to_string()))
     }
 

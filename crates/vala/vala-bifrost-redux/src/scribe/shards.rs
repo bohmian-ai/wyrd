@@ -744,7 +744,7 @@ pub(crate) enum ShardCommand {
         progress: Result<(), ScribeError>,
     },
     FlushAll {
-        response: tokio::sync::oneshot::Sender<Result<(), ScribeError>>,
+        response: tokio::sync::oneshot::Sender<Result<usize, ScribeError>>,
     },
     Shutdown,
 }
@@ -1270,8 +1270,17 @@ impl ScribeShardRuntime {
         }
     }
 
-    /// Flush every active bucket through its owning shard before shutdown.
-    pub(crate) async fn flush_all(&self) -> Result<(), ScribeError> {
+    /// Flush every active bucket through its owning shard.
+    ///
+    /// Shards flush one after another. Returns the writable rows the shards
+    /// froze, summed across shards.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ScribeError`] when a shard mailbox is closed or a shard
+    /// cannot freeze its writable generations.
+    pub(crate) async fn flush_all(&self) -> Result<usize, ScribeError> {
+        let mut rows = 0;
         for sender in &self.senders {
             let (response, result) = tokio::sync::oneshot::channel();
             sender
@@ -1279,14 +1288,14 @@ impl ScribeShardRuntime {
                 .send(ShardCommand::FlushAll { response })
                 .await
                 .map_err(|_| ScribeError::IngressClosed)?;
-            result.await.map_err(|_| ScribeError::Internal {
+            rows += result.await.map_err(|_| ScribeError::Internal {
                 detail: "shard dropped shutdown flush response".to_owned(),
             })??;
             #[cfg(any(test, feature = "test-support"))]
             self.shutdown_flush_completions
                 .fetch_add(1, Ordering::AcqRel);
         }
-        Ok(())
+        Ok(rows)
     }
 
     /// Wait until all accepted shard commands have completed.
@@ -2059,15 +2068,21 @@ impl ShardOwner {
     /// so an explicit flush or shutdown drain re-drives them rather than
     /// waiting for the next age tick; `submit_ready` submits unsubmitted
     /// generations in FIFO order and never double-submits an in-flight one.
+    /// Returns the writable rows the selected buckets held when they froze.
     ///
     /// # Errors
     ///
     /// Returns [`ScribeError`] when active bucket selection or generation
     /// preparation fails.
-    fn flush_all(&mut self) -> Result<(), ScribeError> {
+    fn flush_all(&mut self) -> Result<usize, ScribeError> {
         self.retry_pending();
         let keys = self.memtable.active_seal_keys_for_shard(self.id)?;
-        self.flush_keys(keys, None)
+        let mut rows = 0;
+        for key in &keys {
+            rows += self.memtable.row_count(key)?;
+        }
+        self.flush_keys(keys, None)?;
+        Ok(rows)
     }
 
     /// Freezes selected writable buckets and queues immutable generations.

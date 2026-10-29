@@ -1431,9 +1431,9 @@ lifecycle and its 480-second budget are withdrawn. The first run is a new
 ### The benchmark control
 
 **REQ-031 — Stage and publish on request.** A server built with the `bench`
-cargo feature serves two requests on its API listener,
-`POST /v1/platform/benchmark/scribe/stage` and
-`POST /v1/platform/benchmark/scribe/publish`:
+cargo feature serves two platform-plane requests on its API listener,
+`POST /platform/benchmark/scribe/stage` and
+`POST /platform/benchmark/scribe/publish`:
 
 - **stage** returns only once every row acknowledged before the request
   arrived is in a durable, query-registered staged run. It publishes nothing.
@@ -1452,8 +1452,9 @@ Both are this process's existing Scribe transitions, `stage_writable` and
   stays done: shards that staged and claims that published are not rolled
   back. No acknowledged row is lost, and every unmoved row stays
   WAL-authoritative. A retry completes the rest.
-- **Unavailable.** A process with no Scribe or no staging volume refuses with
-  its own stable code and never answers success with zero.
+- **Unavailable.** A process with no Scribe refuses with the stable internal
+  code, as an unconfigured platform plane does, and never answers success
+  with zero.
 - **Concurrency.** Control requests run one at a time; a second waits for the
   first. The age scanner and pressure seals keep running and coordinate
   through Scribe's existing ownership, as they do today. A dropped connection
@@ -1462,7 +1463,8 @@ Both are this process's existing Scribe transitions, `stage_writable` and
 **REQ-032 — The control is a benchmark instrument, not a product
 contract.** It exists only in a server built with the `wyrd-server` `bench`
 cargo feature, which only `bench:build` enables. Without the feature its paths
-do not exist (404). It has no OpenAPI, SDK, CLI
+are unrouted: every caller, the platform administrator included, gets what an
+unrouted path answers. It has no OpenAPI, SDK, CLI
 or MCP projection and no compatibility promise. It acts on the replica that
 receives it. It changes no rotation, retention, dwell, shutdown or recovery
 rule. It never alters an acknowledged row's durability, the WAL, or any
@@ -1506,9 +1508,9 @@ these two routes.
 | Appends during a stage request | The request completes; every row acknowledged during it is still answered exactly from wherever it now sits | REQ-031 |
 | Two control requests at once | The second starts after the first returns; both succeed | REQ-031 |
 | Stage or publish fault, then retry | Problem response with its stable code; no acknowledged row lost; the retry moves the rest | REQ-031 |
-| No Scribe or no staging volume | The unavailable code, never success with zero | REQ-031 |
-| Built without `bench` | 404 for both paths | REQ-032 |
-| No credential; tenant administrator credential; platform administrator | 401; 403; success, each decision audited as `platform.authz` | REQ-032, D-20-1 |
+| No Scribe | `WYRD_SPEC_500_INTERNAL`, never success with zero | REQ-031 |
+| Built without `bench` | Both paths answer the platform administrator as an unrouted path does | REQ-032 |
+| No credential; a tenant credential; the platform administrator | 401; 401, since the platform plane accepts only platform sessions; success, each request audited as a `platform.authz` decision on `platform:tenants` | REQ-032, D-20-1 |
 | `mise run bench:l1:bifrost:hot` | One VALID record within 300 s; the nine REQ-030 cases are measured and exact, and each stage response covered its cohort | REQ-029, REQ-030 |
 | `--steps span-region-staged-learned-c1` | The data flow still runs and the step measures | REQ-029 |
 

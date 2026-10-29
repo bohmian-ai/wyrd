@@ -99,6 +99,152 @@ export const CardHeaderInputSchema = z
 /** A bind value: JSON null, boolean, number, or string. */
 const queryParam = z.union([z.null(), z.boolean(), z.number(), z.string()]);
 
+/** Wyrd ownership columns every canonical signal table carries. */
+const OWNERSHIP = ['workload_card_uid', 'subject_card_uid', 'run_id'] as const;
+/** Resource labels the signal tables promote; kept apart from Wyrd ownership. */
+const RESOURCE = ['service_name', 'service_version', 'service_namespace', 'deployment_environment', 'scope_name'] as const;
+
+/** Span columns a filter may name. */
+const SPAN_FILTERS = [
+  'name', 'kind', 'status_code', ...RESOURCE, 'gen_ai_operation_name', 'gen_ai_provider_name', 'gen_ai_request_model',
+  'gen_ai_conversation_id', 'http_request_method', 'http_route', 'http_response_status_code', 'url_path', 'exception_type',
+  'is_exception', ...OWNERSHIP
+] as const;
+
+/**
+ * The Observe signals and their canonical tables. `traces` lists root spans,
+ * one row per trace; `spans` lists every span. `filters` are the scalar,
+ * non-payload columns a WHERE clause or facet may name; `columns` are those a
+ * list may show, defaults first. Every name is a current canonical column.
+ */
+export const SIGNALS = {
+  traces: {
+    table: 'bifrost.traces.spans',
+    time: 'start_time_unix_nano',
+    columns: ['start_time_unix_nano', 'name', 'service_name', 'duration_nano', 'status_code'],
+    filters: SPAN_FILTERS
+  },
+  spans: {
+    table: 'bifrost.traces.spans',
+    time: 'start_time_unix_nano',
+    columns: ['start_time_unix_nano', 'name', 'service_name', 'duration_nano', 'status_code', 'kind'],
+    filters: SPAN_FILTERS
+  },
+  logs: {
+    table: 'bifrost.logs.records',
+    time: 'time_unix_nano',
+    columns: ['time_unix_nano', 'severity_text', 'service_name', 'body_text', 'exception_type'],
+    filters: ['severity_number', 'severity_text', 'event_name', ...RESOURCE, 'exception_type', 'is_exception', ...OWNERSHIP]
+  },
+  metrics: {
+    table: 'bifrost.metrics.points',
+    time: 'time_unix_nano',
+    columns: [
+      'time_unix_nano', 'metric_name', 'metric_type', 'unit', 'int_value', 'double_value', 'aggregation_temporality', 'is_monotonic',
+      'histogram_count', 'histogram_sum', 'histogram_min', 'histogram_max', 'summary_count', 'summary_sum', 'quantile_values'
+    ],
+    filters: ['metric_name', 'metric_type', 'unit', 'aggregation_temporality', 'is_monotonic', ...RESOURCE, ...OWNERSHIP]
+  }
+} as const;
+
+/** An Observe signal. */
+export type Signal = keyof typeof SIGNALS;
+const SignalSchema = z.enum(['traces', 'spans', 'logs', 'metrics']);
+
+/** Columns a list of `signal` may show: its defaults, then every filter column. */
+export function signalColumns(signal: Signal): readonly string[] {
+  return [...new Set([...SIGNALS[signal].columns, ...SIGNALS[signal].filters])];
+}
+
+/** One WHERE clause: a column equal to a bound value, or with `not`, distinct from it. A null value matches an unset column. */
+export const FilterSchema = z.object({ column: z.string().min(1), value: queryParam, not: z.boolean().optional() }).strict();
+
+/** Clauses ANDed into every read of one signal. */
+const where = z.array(FilterSchema).max(32);
+
+/** Refuse a column the signal does not offer, naming the field. */
+function knownColumns(signal: Signal, names: readonly string[], allowed: readonly string[], path: PropertyKey[], context: z.RefinementCtx) {
+  names.forEach((name, index) => {
+    if (!allowed.includes(name)) context.addIssue({ code: 'custom', path: [...path, index], message: `${name} is not a ${signal} column` });
+  });
+}
+
+/** Lowercase hex trace and span identities, as the signal tables' binary ids read. */
+const traceId = z.string().regex(/^[0-9a-f]{32}$/, '32 lowercase hex digits');
+const spanId = z.string().regex(/^[0-9a-f]{16}$/, '16 lowercase hex digits');
+
+/** The input of `FacetRail`: value counts of `facets` under the list's own WHERE and range. */
+export const FacetRailInputSchema = z
+  .object({ signal: SignalSchema, where: where.optional(), facets: z.array(z.string().min(1)).min(1).max(12), range: RangeSchema.optional() })
+  .strict()
+  .superRefine((input, context) => {
+    knownColumns(input.signal, input.facets, SIGNALS[input.signal].filters, ['facets'], context);
+    knownColumns(input.signal, (input.where ?? []).map((each) => each.column), SIGNALS[input.signal].filters, ['where'], context);
+  });
+
+/** List fields shared by both `RecordTable` sources. */
+const listFields = {
+  range: RangeSchema.optional(),
+  groupBy: z.string().min(1).optional(),
+  live: z.boolean().optional(),
+  limit: z.number().int().min(1).max(500).optional()
+};
+
+/**
+ * The input of `RecordTable`: one signal under WHERE and range, or authored
+ * read-only SQL run unchanged with `$1`/`$2` bound to the range.
+ */
+export const RecordTableInputSchema = z.union([
+  z
+    .object({ signal: SignalSchema, where: where.optional(), columns: z.array(z.string().min(1)).min(1).max(24).optional(), ...listFields })
+    .strict()
+    .superRefine((input, context) => {
+      const columns = signalColumns(input.signal);
+      knownColumns(input.signal, input.columns ?? [], columns, ['columns'], context);
+      knownColumns(input.signal, (input.where ?? []).map((each) => each.column), SIGNALS[input.signal].filters, ['where'], context);
+      if (input.groupBy !== undefined) knownColumns(input.signal, [input.groupBy], input.columns ?? SIGNALS[input.signal].columns, ['groupBy'], context);
+    }),
+  z.object({ sql: z.string().min(1).max(65_536), ...listFields }).strict()
+]);
+
+/** The input of `TraceWaterfall`: one exact trace; `spanId` marks the selected span. Range is navigation context only. */
+export const TraceWaterfallInputSchema = z.object({ traceId, spanId: spanId.optional(), range: RangeSchema.optional() }).strict();
+
+/** One log record's exact identity: its event and observed instants and the request that wrote it. */
+export const LogKeySchema = z
+  .object({ time_unix_nano: z.string().min(1), observed_time_unix_nano: z.string().min(1), wyrd_request_id: z.string().min(1) })
+  .strict();
+
+/** The input of `RecordDetail`: one exact span, or one log record. */
+export const RecordDetailInputSchema = z.union([z.object({ traceId, spanId }).strict(), z.object({ log: LogKeySchema }).strict()]);
+
+/**
+ * Built-in stats over the canonical tables. Span stats honour `where`;
+ * `invocations` counts `invoke_agent` operations, `tokens` sums recorded
+ * GenAI usage, and `calls`/`cost` read `bifrost.gateway.calls`.
+ */
+export const STATS = ['traces', 'spans', 'errors', 'duration_p95', 'invocations', 'tokens', 'calls', 'cost'] as const;
+
+/** The input of `StatStrip`: up to five stats under one range and an optional Wyrd ownership scope. */
+export const StatStripInputSchema = z
+  .object({
+    stats: z.array(z.enum(STATS)).min(1).max(5),
+    scope: z.object({ column: z.enum(['workload_card_uid', 'subject_card_uid']), uid: z.string().min(1) }).strict().optional(),
+    where: where.optional(),
+    range: RangeSchema.optional()
+  })
+  .strict()
+  .superRefine((input, context) => {
+    knownColumns('spans', (input.where ?? []).map((each) => each.column), SIGNALS.spans.filters, ['where'], context);
+    if (input.where?.length && input.stats.some((stat) => stat === 'calls' || stat === 'cost'))
+      context.addIssue({ code: 'custom', path: ['where'], message: 'span filters do not apply to gateway calls or cost' });
+  });
+
+/** A filter a facet or detail field asks the host to apply. */
+const filterIntent = z.object({ signal: SignalSchema, column: z.string().min(1), value: queryParam, not: z.boolean().optional() }).strict();
+/** One exact span, as a navigation target. */
+const spanRef = z.object({ trace_id: traceId, span_id: spanId.optional() }).strict();
+
 /** How an action's completion becomes observable. */
 type Completion = 'host-navigation' | 'view-range';
 
@@ -160,6 +306,58 @@ export const components = {
         completion: 'host-navigation'
       }
     }
+  },
+  StatStrip: {
+    description:
+      'One to five recorded numbers with a sparkline each, from built-in reads of bifrost.traces.spans and ' +
+      'bifrost.gateway.calls, optionally scoped to one workload_card_uid or subject_card_uid.',
+    input: StatStripInputSchema,
+    states: ['populated', 'empty', 'denied', 'error', 'loading'],
+    emits: {}
+  },
+  FacetRail: {
+    description: "Value counts of a signal's columns under the list's own WHERE and range; a value asks the host to filter by it.",
+    input: FacetRailInputSchema,
+    states: ['populated', 'empty', 'denied', 'error', 'loading'],
+    emits: {
+      'facet.filter': {
+        description: 'Add this column and value to the WHERE clause; a null value means unset.',
+        input: filterIntent,
+        completion: 'host-navigation'
+      }
+    }
+  },
+  RecordTable: {
+    description:
+      'Typed rows of one signal (traces as root spans with span and error counts, spans, logs or metric points) ' +
+      'or of authored SQL, newest first, with optional grouping and live mode that pauses while inspected.',
+    input: RecordTableInputSchema,
+    states: ['populated', 'empty', 'denied', 'error', 'loading', 'live'],
+    emits: {
+      'record.open': {
+        description: 'Open one trace or span, or one log record by its exact identity.',
+        input: z.union([spanRef, z.object({ log: LogKeySchema }).strict()]),
+        completion: 'host-navigation'
+      }
+    }
+  },
+  TraceWaterfall: {
+    description: 'Every retained span of one exact trace as a timed tree, collapsed below two levels; a span asks the host to select it.',
+    input: TraceWaterfallInputSchema,
+    states: ['populated', 'empty', 'denied', 'error', 'loading'],
+    emits: {
+      'trace.select': { description: 'Select this span of the trace.', input: spanRef.required(), completion: 'host-navigation' }
+    }
+  },
+  RecordDetail: {
+    description: 'One exact span or log record: messages, attributes, events, exception and the raw row.',
+    input: RecordDetailInputSchema,
+    states: ['populated', 'empty', 'denied', 'error', 'loading'],
+    emits: {
+      'record.filter': { description: 'Filter the list by this field, or with not, exclude it.', input: filterIntent, completion: 'host-navigation' },
+      'record.logs': { description: 'Show the log records of this span.', input: spanRef.required(), completion: 'host-navigation' },
+      'record.open': { description: "Open this log record's trace and span.", input: spanRef, completion: 'host-navigation' }
+    }
   }
 } as const satisfies Record<string, ComponentSpec>;
 
@@ -172,6 +370,22 @@ export type ChartInput = z.infer<typeof ChartInputSchema>;
 export type CardHeaderInput = z.infer<typeof CardHeaderInputSchema>;
 /** A view or panel range. */
 export type Range = z.infer<typeof RangeSchema>;
+/** One WHERE clause. */
+export type Filter = z.infer<typeof FilterSchema>;
+/** One log record's exact identity. */
+export type LogKey = z.infer<typeof LogKeySchema>;
+/** A validated `StatStrip` input. */
+export type StatStripInput = z.infer<typeof StatStripInputSchema>;
+/** A validated `FacetRail` input. */
+export type FacetRailInput = z.infer<typeof FacetRailInputSchema>;
+/** A validated `RecordTable` input. */
+export type RecordTableInput = z.infer<typeof RecordTableInputSchema>;
+/** A validated `TraceWaterfall` input. */
+export type TraceWaterfallInput = z.infer<typeof TraceWaterfallInputSchema>;
+/** A validated `RecordDetail` input. */
+export type RecordDetailInput = z.infer<typeof RecordDetailInputSchema>;
+/** A built-in stat. */
+export type Stat = (typeof STATS)[number];
 /** An absolute range with RFC 3339 bounds. */
 export type AbsoluteRange = z.infer<typeof AbsoluteRangeSchema>;
 

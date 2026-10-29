@@ -19,6 +19,18 @@ import {
 import type { ZodType } from 'zod';
 import { columnIndex } from './plot.js';
 import {
+  loadFacetRail,
+  loadRecordDetail,
+  loadRecordTable,
+  loadStatStrip,
+  loadTraceWaterfall,
+  type FacetRailProps,
+  type RecordDetailProps,
+  type RecordTableProps,
+  type StatStripProps,
+  type TraceWaterfallProps
+} from './observe.js';
+import {
   components,
   type AbsoluteRange,
   type CardHeaderInput,
@@ -29,6 +41,7 @@ import {
 
 export * from './contract.js';
 export * from './schemas.js';
+export * from './observe.js';
 
 /** What every loader receives from its host. */
 export interface LoadContext {
@@ -64,6 +77,11 @@ export interface CardHeaderProps {
 export interface ComponentProps {
   Chart: ChartProps;
   CardHeader: CardHeaderProps;
+  StatStrip: StatStripProps;
+  FacetRail: FacetRailProps;
+  RecordTable: RecordTableProps;
+  TraceWaterfall: TraceWaterfallProps;
+  RecordDetail: RecordDetailProps;
 }
 
 const UNIT_MS = { m: 60_000, h: 3_600_000, d: 86_400_000 } as const;
@@ -233,7 +251,15 @@ export function inputProblem(component: string, issue: { path: readonly Property
 /** A component's loader, typed by its validated input. */
 const LOADERS: {
   [Name in ComponentName]: (input: never, context: LoadContext) => Promise<ComponentProps[Name]>;
-} = { Chart: loadChart, CardHeader: loadCardHeader };
+} = {
+  Chart: loadChart,
+  CardHeader: loadCardHeader,
+  StatStrip: loadStatStrip,
+  FacetRail: loadFacetRail,
+  RecordTable: loadRecordTable,
+  TraceWaterfall: loadTraceWaterfall,
+  RecordDetail: loadRecordDetail
+};
 
 /** A panel whose component is in the catalog and whose input passed its schema. */
 export interface ValidPanel {

@@ -733,6 +733,771 @@
           "completion": "host-navigation"
         }
       ]
+    },
+    "StatStrip": {
+      "description": "One to five recorded numbers with a sparkline each, from built-in reads of bifrost.traces.spans and bifrost.gateway.calls, optionally scoped to one workload_card_uid or subject_card_uid.",
+      "input": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "type": "object",
+        "properties": {
+          "stats": {
+            "minItems": 1,
+            "maxItems": 5,
+            "type": "array",
+            "items": {
+              "type": "string",
+              "enum": [
+                "traces",
+                "spans",
+                "errors",
+                "duration_p95",
+                "invocations",
+                "tokens",
+                "calls",
+                "cost"
+              ]
+            }
+          },
+          "scope": {
+            "type": "object",
+            "properties": {
+              "column": {
+                "type": "string",
+                "enum": [
+                  "workload_card_uid",
+                  "subject_card_uid"
+                ]
+              },
+              "uid": {
+                "type": "string",
+                "minLength": 1
+              }
+            },
+            "required": [
+              "column",
+              "uid"
+            ],
+            "additionalProperties": false
+          },
+          "where": {
+            "maxItems": 32,
+            "type": "array",
+            "items": {
+              "type": "object",
+              "properties": {
+                "column": {
+                  "type": "string",
+                  "minLength": 1
+                },
+                "value": {
+                  "type": [
+                    "null",
+                    "boolean",
+                    "number",
+                    "string"
+                  ]
+                },
+                "not": {
+                  "type": "boolean"
+                }
+              },
+              "required": [
+                "column",
+                "value"
+              ],
+              "additionalProperties": false
+            }
+          },
+          "range": {
+            "anyOf": [
+              {
+                "type": "object",
+                "properties": {
+                  "from": {
+                    "type": "string",
+                    "format": "date-time",
+                    "pattern": "^(?:(?:\\d\\d[2468][048]|\\d\\d[13579][26]|\\d\\d0[48]|[02468][048]00|[13579][26]00)-02-29|\\d{4}-(?:(?:0[13578]|1[02])-(?:0[1-9]|[12]\\d|3[01])|(?:0[469]|11)-(?:0[1-9]|[12]\\d|30)|(?:02)-(?:0[1-9]|1\\d|2[0-8])))T(?:(?:[01]\\d|2[0-3]):[0-5]\\d:[0-5]\\d(?:\\.\\d+)?(?:Z|([+-](?:[01]\\d|2[0-3]):[0-5]\\d)))$"
+                  },
+                  "to": {
+                    "type": "string",
+                    "format": "date-time",
+                    "pattern": "^(?:(?:\\d\\d[2468][048]|\\d\\d[13579][26]|\\d\\d0[48]|[02468][048]00|[13579][26]00)-02-29|\\d{4}-(?:(?:0[13578]|1[02])-(?:0[1-9]|[12]\\d|3[01])|(?:0[469]|11)-(?:0[1-9]|[12]\\d|30)|(?:02)-(?:0[1-9]|1\\d|2[0-8])))T(?:(?:[01]\\d|2[0-3]):[0-5]\\d:[0-5]\\d(?:\\.\\d+)?(?:Z|([+-](?:[01]\\d|2[0-3]):[0-5]\\d)))$"
+                  }
+                },
+                "required": [
+                  "from",
+                  "to"
+                ],
+                "additionalProperties": false
+              },
+              {
+                "type": "object",
+                "properties": {
+                  "last": {
+                    "type": "string",
+                    "pattern": "^[1-9]\\d{0,4}[mhd]$"
+                  }
+                },
+                "required": [
+                  "last"
+                ],
+                "additionalProperties": false
+              }
+            ]
+          }
+        },
+        "required": [
+          "stats"
+        ],
+        "additionalProperties": false
+      },
+      "states": [
+        "populated",
+        "empty",
+        "denied",
+        "error",
+        "loading"
+      ],
+      "emits": []
+    },
+    "FacetRail": {
+      "description": "Value counts of a signal's columns under the list's own WHERE and range; a value asks the host to filter by it.",
+      "input": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "type": "object",
+        "properties": {
+          "signal": {
+            "type": "string",
+            "enum": [
+              "traces",
+              "spans",
+              "logs",
+              "metrics"
+            ]
+          },
+          "where": {
+            "maxItems": 32,
+            "type": "array",
+            "items": {
+              "type": "object",
+              "properties": {
+                "column": {
+                  "type": "string",
+                  "minLength": 1
+                },
+                "value": {
+                  "type": [
+                    "null",
+                    "boolean",
+                    "number",
+                    "string"
+                  ]
+                },
+                "not": {
+                  "type": "boolean"
+                }
+              },
+              "required": [
+                "column",
+                "value"
+              ],
+              "additionalProperties": false
+            }
+          },
+          "facets": {
+            "minItems": 1,
+            "maxItems": 12,
+            "type": "array",
+            "items": {
+              "type": "string",
+              "minLength": 1
+            }
+          },
+          "range": {
+            "anyOf": [
+              {
+                "type": "object",
+                "properties": {
+                  "from": {
+                    "type": "string",
+                    "format": "date-time",
+                    "pattern": "^(?:(?:\\d\\d[2468][048]|\\d\\d[13579][26]|\\d\\d0[48]|[02468][048]00|[13579][26]00)-02-29|\\d{4}-(?:(?:0[13578]|1[02])-(?:0[1-9]|[12]\\d|3[01])|(?:0[469]|11)-(?:0[1-9]|[12]\\d|30)|(?:02)-(?:0[1-9]|1\\d|2[0-8])))T(?:(?:[01]\\d|2[0-3]):[0-5]\\d:[0-5]\\d(?:\\.\\d+)?(?:Z|([+-](?:[01]\\d|2[0-3]):[0-5]\\d)))$"
+                  },
+                  "to": {
+                    "type": "string",
+                    "format": "date-time",
+                    "pattern": "^(?:(?:\\d\\d[2468][048]|\\d\\d[13579][26]|\\d\\d0[48]|[02468][048]00|[13579][26]00)-02-29|\\d{4}-(?:(?:0[13578]|1[02])-(?:0[1-9]|[12]\\d|3[01])|(?:0[469]|11)-(?:0[1-9]|[12]\\d|30)|(?:02)-(?:0[1-9]|1\\d|2[0-8])))T(?:(?:[01]\\d|2[0-3]):[0-5]\\d:[0-5]\\d(?:\\.\\d+)?(?:Z|([+-](?:[01]\\d|2[0-3]):[0-5]\\d)))$"
+                  }
+                },
+                "required": [
+                  "from",
+                  "to"
+                ],
+                "additionalProperties": false
+              },
+              {
+                "type": "object",
+                "properties": {
+                  "last": {
+                    "type": "string",
+                    "pattern": "^[1-9]\\d{0,4}[mhd]$"
+                  }
+                },
+                "required": [
+                  "last"
+                ],
+                "additionalProperties": false
+              }
+            ]
+          }
+        },
+        "required": [
+          "signal",
+          "facets"
+        ],
+        "additionalProperties": false
+      },
+      "states": [
+        "populated",
+        "empty",
+        "denied",
+        "error",
+        "loading"
+      ],
+      "emits": [
+        {
+          "name": "facet.filter",
+          "description": "Add this column and value to the WHERE clause; a null value means unset.",
+          "input": {
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "type": "object",
+            "properties": {
+              "signal": {
+                "type": "string",
+                "enum": [
+                  "traces",
+                  "spans",
+                  "logs",
+                  "metrics"
+                ]
+              },
+              "column": {
+                "type": "string",
+                "minLength": 1
+              },
+              "value": {
+                "type": [
+                  "null",
+                  "boolean",
+                  "number",
+                  "string"
+                ]
+              },
+              "not": {
+                "type": "boolean"
+              }
+            },
+            "required": [
+              "signal",
+              "column",
+              "value"
+            ],
+            "additionalProperties": false
+          },
+          "completion": "host-navigation"
+        }
+      ]
+    },
+    "RecordTable": {
+      "description": "Typed rows of one signal (traces as root spans with span and error counts, spans, logs or metric points) or of authored SQL, newest first, with optional grouping and live mode that pauses while inspected.",
+      "input": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "anyOf": [
+          {
+            "type": "object",
+            "properties": {
+              "signal": {
+                "type": "string",
+                "enum": [
+                  "traces",
+                  "spans",
+                  "logs",
+                  "metrics"
+                ]
+              },
+              "where": {
+                "maxItems": 32,
+                "type": "array",
+                "items": {
+                  "type": "object",
+                  "properties": {
+                    "column": {
+                      "type": "string",
+                      "minLength": 1
+                    },
+                    "value": {
+                      "type": [
+                        "null",
+                        "boolean",
+                        "number",
+                        "string"
+                      ]
+                    },
+                    "not": {
+                      "type": "boolean"
+                    }
+                  },
+                  "required": [
+                    "column",
+                    "value"
+                  ],
+                  "additionalProperties": false
+                }
+              },
+              "columns": {
+                "minItems": 1,
+                "maxItems": 24,
+                "type": "array",
+                "items": {
+                  "type": "string",
+                  "minLength": 1
+                }
+              },
+              "range": {
+                "anyOf": [
+                  {
+                    "type": "object",
+                    "properties": {
+                      "from": {
+                        "type": "string",
+                        "format": "date-time",
+                        "pattern": "^(?:(?:\\d\\d[2468][048]|\\d\\d[13579][26]|\\d\\d0[48]|[02468][048]00|[13579][26]00)-02-29|\\d{4}-(?:(?:0[13578]|1[02])-(?:0[1-9]|[12]\\d|3[01])|(?:0[469]|11)-(?:0[1-9]|[12]\\d|30)|(?:02)-(?:0[1-9]|1\\d|2[0-8])))T(?:(?:[01]\\d|2[0-3]):[0-5]\\d:[0-5]\\d(?:\\.\\d+)?(?:Z|([+-](?:[01]\\d|2[0-3]):[0-5]\\d)))$"
+                      },
+                      "to": {
+                        "type": "string",
+                        "format": "date-time",
+                        "pattern": "^(?:(?:\\d\\d[2468][048]|\\d\\d[13579][26]|\\d\\d0[48]|[02468][048]00|[13579][26]00)-02-29|\\d{4}-(?:(?:0[13578]|1[02])-(?:0[1-9]|[12]\\d|3[01])|(?:0[469]|11)-(?:0[1-9]|[12]\\d|30)|(?:02)-(?:0[1-9]|1\\d|2[0-8])))T(?:(?:[01]\\d|2[0-3]):[0-5]\\d:[0-5]\\d(?:\\.\\d+)?(?:Z|([+-](?:[01]\\d|2[0-3]):[0-5]\\d)))$"
+                      }
+                    },
+                    "required": [
+                      "from",
+                      "to"
+                    ],
+                    "additionalProperties": false
+                  },
+                  {
+                    "type": "object",
+                    "properties": {
+                      "last": {
+                        "type": "string",
+                        "pattern": "^[1-9]\\d{0,4}[mhd]$"
+                      }
+                    },
+                    "required": [
+                      "last"
+                    ],
+                    "additionalProperties": false
+                  }
+                ]
+              },
+              "groupBy": {
+                "type": "string",
+                "minLength": 1
+              },
+              "live": {
+                "type": "boolean"
+              },
+              "limit": {
+                "type": "integer",
+                "minimum": 1,
+                "maximum": 500
+              }
+            },
+            "required": [
+              "signal"
+            ],
+            "additionalProperties": false
+          },
+          {
+            "type": "object",
+            "properties": {
+              "sql": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 65536
+              },
+              "range": {
+                "anyOf": [
+                  {
+                    "type": "object",
+                    "properties": {
+                      "from": {
+                        "type": "string",
+                        "format": "date-time",
+                        "pattern": "^(?:(?:\\d\\d[2468][048]|\\d\\d[13579][26]|\\d\\d0[48]|[02468][048]00|[13579][26]00)-02-29|\\d{4}-(?:(?:0[13578]|1[02])-(?:0[1-9]|[12]\\d|3[01])|(?:0[469]|11)-(?:0[1-9]|[12]\\d|30)|(?:02)-(?:0[1-9]|1\\d|2[0-8])))T(?:(?:[01]\\d|2[0-3]):[0-5]\\d:[0-5]\\d(?:\\.\\d+)?(?:Z|([+-](?:[01]\\d|2[0-3]):[0-5]\\d)))$"
+                      },
+                      "to": {
+                        "type": "string",
+                        "format": "date-time",
+                        "pattern": "^(?:(?:\\d\\d[2468][048]|\\d\\d[13579][26]|\\d\\d0[48]|[02468][048]00|[13579][26]00)-02-29|\\d{4}-(?:(?:0[13578]|1[02])-(?:0[1-9]|[12]\\d|3[01])|(?:0[469]|11)-(?:0[1-9]|[12]\\d|30)|(?:02)-(?:0[1-9]|1\\d|2[0-8])))T(?:(?:[01]\\d|2[0-3]):[0-5]\\d:[0-5]\\d(?:\\.\\d+)?(?:Z|([+-](?:[01]\\d|2[0-3]):[0-5]\\d)))$"
+                      }
+                    },
+                    "required": [
+                      "from",
+                      "to"
+                    ],
+                    "additionalProperties": false
+                  },
+                  {
+                    "type": "object",
+                    "properties": {
+                      "last": {
+                        "type": "string",
+                        "pattern": "^[1-9]\\d{0,4}[mhd]$"
+                      }
+                    },
+                    "required": [
+                      "last"
+                    ],
+                    "additionalProperties": false
+                  }
+                ]
+              },
+              "groupBy": {
+                "type": "string",
+                "minLength": 1
+              },
+              "live": {
+                "type": "boolean"
+              },
+              "limit": {
+                "type": "integer",
+                "minimum": 1,
+                "maximum": 500
+              }
+            },
+            "required": [
+              "sql"
+            ],
+            "additionalProperties": false
+          }
+        ]
+      },
+      "states": [
+        "populated",
+        "empty",
+        "denied",
+        "error",
+        "loading",
+        "live"
+      ],
+      "emits": [
+        {
+          "name": "record.open",
+          "description": "Open one trace or span, or one log record by its exact identity.",
+          "input": {
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "anyOf": [
+              {
+                "type": "object",
+                "properties": {
+                  "trace_id": {
+                    "type": "string",
+                    "pattern": "^[0-9a-f]{32}$"
+                  },
+                  "span_id": {
+                    "type": "string",
+                    "pattern": "^[0-9a-f]{16}$"
+                  }
+                },
+                "required": [
+                  "trace_id"
+                ],
+                "additionalProperties": false
+              },
+              {
+                "type": "object",
+                "properties": {
+                  "log": {
+                    "type": "object",
+                    "properties": {
+                      "time_unix_nano": {
+                        "type": "string",
+                        "minLength": 1
+                      },
+                      "observed_time_unix_nano": {
+                        "type": "string",
+                        "minLength": 1
+                      },
+                      "wyrd_request_id": {
+                        "type": "string",
+                        "minLength": 1
+                      }
+                    },
+                    "required": [
+                      "time_unix_nano",
+                      "observed_time_unix_nano",
+                      "wyrd_request_id"
+                    ],
+                    "additionalProperties": false
+                  }
+                },
+                "required": [
+                  "log"
+                ],
+                "additionalProperties": false
+              }
+            ]
+          },
+          "completion": "host-navigation"
+        }
+      ]
+    },
+    "TraceWaterfall": {
+      "description": "Every retained span of one exact trace as a timed tree, collapsed below two levels; a span asks the host to select it.",
+      "input": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "type": "object",
+        "properties": {
+          "traceId": {
+            "type": "string",
+            "pattern": "^[0-9a-f]{32}$"
+          },
+          "spanId": {
+            "type": "string",
+            "pattern": "^[0-9a-f]{16}$"
+          },
+          "range": {
+            "anyOf": [
+              {
+                "type": "object",
+                "properties": {
+                  "from": {
+                    "type": "string",
+                    "format": "date-time",
+                    "pattern": "^(?:(?:\\d\\d[2468][048]|\\d\\d[13579][26]|\\d\\d0[48]|[02468][048]00|[13579][26]00)-02-29|\\d{4}-(?:(?:0[13578]|1[02])-(?:0[1-9]|[12]\\d|3[01])|(?:0[469]|11)-(?:0[1-9]|[12]\\d|30)|(?:02)-(?:0[1-9]|1\\d|2[0-8])))T(?:(?:[01]\\d|2[0-3]):[0-5]\\d:[0-5]\\d(?:\\.\\d+)?(?:Z|([+-](?:[01]\\d|2[0-3]):[0-5]\\d)))$"
+                  },
+                  "to": {
+                    "type": "string",
+                    "format": "date-time",
+                    "pattern": "^(?:(?:\\d\\d[2468][048]|\\d\\d[13579][26]|\\d\\d0[48]|[02468][048]00|[13579][26]00)-02-29|\\d{4}-(?:(?:0[13578]|1[02])-(?:0[1-9]|[12]\\d|3[01])|(?:0[469]|11)-(?:0[1-9]|[12]\\d|30)|(?:02)-(?:0[1-9]|1\\d|2[0-8])))T(?:(?:[01]\\d|2[0-3]):[0-5]\\d:[0-5]\\d(?:\\.\\d+)?(?:Z|([+-](?:[01]\\d|2[0-3]):[0-5]\\d)))$"
+                  }
+                },
+                "required": [
+                  "from",
+                  "to"
+                ],
+                "additionalProperties": false
+              },
+              {
+                "type": "object",
+                "properties": {
+                  "last": {
+                    "type": "string",
+                    "pattern": "^[1-9]\\d{0,4}[mhd]$"
+                  }
+                },
+                "required": [
+                  "last"
+                ],
+                "additionalProperties": false
+              }
+            ]
+          }
+        },
+        "required": [
+          "traceId"
+        ],
+        "additionalProperties": false
+      },
+      "states": [
+        "populated",
+        "empty",
+        "denied",
+        "error",
+        "loading"
+      ],
+      "emits": [
+        {
+          "name": "trace.select",
+          "description": "Select this span of the trace.",
+          "input": {
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "type": "object",
+            "properties": {
+              "trace_id": {
+                "type": "string",
+                "pattern": "^[0-9a-f]{32}$"
+              },
+              "span_id": {
+                "type": "string",
+                "pattern": "^[0-9a-f]{16}$"
+              }
+            },
+            "required": [
+              "trace_id",
+              "span_id"
+            ],
+            "additionalProperties": false
+          },
+          "completion": "host-navigation"
+        }
+      ]
+    },
+    "RecordDetail": {
+      "description": "One exact span or log record: messages, attributes, events, exception and the raw row.",
+      "input": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "anyOf": [
+          {
+            "type": "object",
+            "properties": {
+              "traceId": {
+                "type": "string",
+                "pattern": "^[0-9a-f]{32}$"
+              },
+              "spanId": {
+                "type": "string",
+                "pattern": "^[0-9a-f]{16}$"
+              }
+            },
+            "required": [
+              "traceId",
+              "spanId"
+            ],
+            "additionalProperties": false
+          },
+          {
+            "type": "object",
+            "properties": {
+              "log": {
+                "type": "object",
+                "properties": {
+                  "time_unix_nano": {
+                    "type": "string",
+                    "minLength": 1
+                  },
+                  "observed_time_unix_nano": {
+                    "type": "string",
+                    "minLength": 1
+                  },
+                  "wyrd_request_id": {
+                    "type": "string",
+                    "minLength": 1
+                  }
+                },
+                "required": [
+                  "time_unix_nano",
+                  "observed_time_unix_nano",
+                  "wyrd_request_id"
+                ],
+                "additionalProperties": false
+              }
+            },
+            "required": [
+              "log"
+            ],
+            "additionalProperties": false
+          }
+        ]
+      },
+      "states": [
+        "populated",
+        "empty",
+        "denied",
+        "error",
+        "loading"
+      ],
+      "emits": [
+        {
+          "name": "record.filter",
+          "description": "Filter the list by this field, or with not, exclude it.",
+          "input": {
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "type": "object",
+            "properties": {
+              "signal": {
+                "type": "string",
+                "enum": [
+                  "traces",
+                  "spans",
+                  "logs",
+                  "metrics"
+                ]
+              },
+              "column": {
+                "type": "string",
+                "minLength": 1
+              },
+              "value": {
+                "type": [
+                  "null",
+                  "boolean",
+                  "number",
+                  "string"
+                ]
+              },
+              "not": {
+                "type": "boolean"
+              }
+            },
+            "required": [
+              "signal",
+              "column",
+              "value"
+            ],
+            "additionalProperties": false
+          },
+          "completion": "host-navigation"
+        },
+        {
+          "name": "record.logs",
+          "description": "Show the log records of this span.",
+          "input": {
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "type": "object",
+            "properties": {
+              "trace_id": {
+                "type": "string",
+                "pattern": "^[0-9a-f]{32}$"
+              },
+              "span_id": {
+                "type": "string",
+                "pattern": "^[0-9a-f]{16}$"
+              }
+            },
+            "required": [
+              "trace_id",
+              "span_id"
+            ],
+            "additionalProperties": false
+          },
+          "completion": "host-navigation"
+        },
+        {
+          "name": "record.open",
+          "description": "Open this log record's trace and span.",
+          "input": {
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "type": "object",
+            "properties": {
+              "trace_id": {
+                "type": "string",
+                "pattern": "^[0-9a-f]{32}$"
+              },
+              "span_id": {
+                "type": "string",
+                "pattern": "^[0-9a-f]{16}$"
+              }
+            },
+            "required": [
+              "trace_id"
+            ],
+            "additionalProperties": false
+          },
+          "completion": "host-navigation"
+        }
+      ]
     }
   }
 }

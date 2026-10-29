@@ -58,10 +58,13 @@ pub struct TenantEvidence {
     /// once for this execution.
     files: Mutex<HashMap<(Sha256Hex, u64), ValidatedPath>>,
     /// Each exact Artifact's UID and files, resolved once for this execution.
-    artifacts: Mutex<BTreeMap<(CardRefIdentity, Option<CardUid>), Arc<ArtifactInventory>>>,
+    artifacts: Mutex<BTreeMap<ArtifactKey, Arc<ArtifactInventory>>>,
     /// File limits in force.
     limits: HostedLimits,
 }
+
+/// An exact Artifact reference: its identity and optional pinned UID.
+type ArtifactKey = (CardRefIdentity, Option<CardUid>);
 
 impl TenantEvidence {
     /// A reader of `caller`'s tenant evidence whose citable sources are the

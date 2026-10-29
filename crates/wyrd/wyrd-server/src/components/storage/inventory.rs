@@ -326,16 +326,15 @@ impl<'s> ObjectInventory<'s> {
             tracing::warn!(%error, "the object inventory cannot be read");
             WyrdError::from(BifrostError::QueryVisibilityUnavailable)
         };
-        let system = match self.system {
-            Some(system) => Some(system),
-            None => {
-                let mut conn = self.state.registry_tenant_conn(tenant).await?;
-                let system = system_principal_id(&mut conn)
-                    .await
-                    .map_err(|error| unavailable(&error))?;
-                conn.commit().await.map_err(|error| unavailable(&error))?;
-                system.map(PrincipalId::new)
-            }
+        let system = if self.system.is_some() {
+            self.system
+        } else {
+            let mut conn = self.state.registry_tenant_conn(tenant).await?;
+            let system = system_principal_id(&mut conn)
+                .await
+                .map_err(|error| unavailable(&error))?;
+            conn.commit().await.map_err(|error| unavailable(&error))?;
+            system.map(PrincipalId::new)
         };
         let table = [TableRef::new(BifrostNamespace::Storage, ObjectsTable::NAME)];
         let read = SystemReadAuthority::resolve(self.state, tenant, system, &table)

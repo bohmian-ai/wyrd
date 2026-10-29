@@ -1,0 +1,80 @@
+/**
+ * The Node executor: runs each read through the `wyrd-ai` SDK as the client's
+ * principal or forwarded browser session. Server-only; the client holds the credential.
+ */
+import { Bifrost, Cards, WyrdError, verify, type WyrdClient } from 'wyrd-ai';
+import type { Executor, Problem, WireRequest, WireResult } from './contract.js';
+
+/** Project an SDK failure onto a stable problem; anything else is rethrown. */
+function problem(error: unknown): Problem {
+  if (error instanceof WyrdError) return { code: error.code, title: error.title, status: error.status, detail: error.detail };
+  throw error;
+}
+
+/** Share one in-flight or successful connection; a failed one is dropped so the next read connects again. */
+function retained<T>(connect: () => Promise<T>): () => Promise<T> {
+  let handle: Promise<T> | undefined;
+  return () =>
+    (handle ??= connect().catch((error) => {
+      handle = undefined;
+      throw error;
+    }));
+}
+
+/** Build an executor over one SDK client. */
+export function nodeExecutor(client: WyrdClient): Executor {
+  const cards = retained(() => Cards.connect({ client }));
+  const bifrost = retained(() => Bifrost.connect({ client }));
+
+  async function read(request: WireRequest, signal?: AbortSignal): Promise<unknown> {
+    switch (request.op) {
+      case 'cards.get_by_ref':
+        return (await cards()).get(request.card_ref);
+      case 'cards.list': {
+        const { op: _, ...query } = request;
+        return (await cards()).list(query);
+      }
+      case 'bifrost.query': {
+        const stream = await (await bifrost()).stream(request.sql, request.params ?? [], { deadlineMs: request.deadline_ms });
+        const abort = () => void stream.return();
+        // Cancelled while the stream started: close it before reading anything.
+        if (signal?.aborted) abort();
+        signal?.throwIfAborted();
+        signal?.addEventListener('abort', abort, { once: true });
+        try {
+          const result = await stream.collect({ maxRows: request.max_rows, maxBytes: request.max_bytes });
+          // Rows that arrive after cancellation are never a result.
+          signal?.throwIfAborted();
+          return result;
+        } finally {
+          signal?.removeEventListener('abort', abort);
+        }
+      }
+      case 'bifrost.list_tables':
+        return { tables: (await (await bifrost()).listTables()).map(({ namespace, name, status }) => ({ namespace, name, status })) };
+      case 'bifrost.describe_table': {
+        // The SDK widens the version to a bigint; the wire keeps the JSON-safe decimal string.
+        const { table_version, ...table } = await (await bifrost()).describeTable(request.namespace, request.name);
+        return { ...table, table_version: String(table_version) };
+      }
+      case 'verification.get_execution':
+        return (await verify.Execution.connect(request.execution_id, { client })).status();
+    }
+  }
+
+  return {
+    async run(requests, signal) {
+      return Promise.all(
+        requests.map(async (request) => {
+          signal?.throwIfAborted();
+          try {
+            return { ok: true, value: await read(request, signal) } as WireResult;
+          } catch (error) {
+            signal?.throwIfAborted();
+            return { ok: false, problem: problem(error) } as WireResult;
+          }
+        })
+      ) as never;
+    }
+  };
+}

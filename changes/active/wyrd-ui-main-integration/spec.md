@@ -1,6 +1,6 @@
 ---
 id: SPEC-wyrd-ui-main-integration
-revision: 10
+revision: 14
 status: approved
 ---
 
@@ -14,6 +14,49 @@ production UI installable and reachable, with browser sessions owned by the Rust
 server. Then migrate the implemented domain screens, reconciling their data
 against current contracts.
 
+Revision 14 aligns the remaining UI work with approved
+[service-identity-and-telemetry revision 12](../service-identity-and-telemetry/spec.md).
+The earlier UI contract attributed Service telemetry through resource labels;
+the approved replacement separates the exact executing workload, observed Card,
+and accountable accounts. It also replaces the public SQL catalog and table
+schemas. Without alignment, filters can combine different releases or exclude
+valid evidence, and existing authored queries stop resolving.
+
+For example, two Service releases can use the same Model and stable account.
+Selecting one release must show rows whose `workload_card_uid` identifies that
+release, while its component breakdown uses the Model's `subject_card_uid`.
+The shared Model, account, or `service_name` cannot identify the release.
+
+The cost is coordinated SQL, field-mapping, example and fixture updates, plus
+renewed proof for affected consumers, including completed foundation consumers.
+Dynamic result handling, layouts, browser sessions, flat Card identity, and the
+existing read/transport owners remain. No new table-administration page,
+account-management UI, retry controller, migration or old/new schema
+compatibility layer is added.
+
+### Dependency and authority for revision 14
+
+The service packet's [telemetry schemas](../service-identity-and-telemetry/supplements/telemetry-schemas.md)
+and [table/correlation contracts](../service-identity-and-telemetry/supplements/table-storage-and-correlation.md)
+define the target data this UI consumes. Their owning design/security/Bifrost
+amendments and matching server, SDK and MCP contracts must land before affected
+live UI acceptance; they shipped on main before this revision's approval.
+Current architecture remains authoritative; this revision does not amend
+their owners.
+
+Service TASK-003 owns catalog/schema/attribution and existing example/fixture
+consumer closure, TASK-004/005 supply resolved table descriptions, and TASK-006
+supplies whole-trace verification semantics. UI loaders and pages own their
+consumption and visible behavior. Planning must map affected consumers and
+proof to these dependencies once, without duplicating upstream work. Preserve
+prior completion records; renew verification only where the cutover affects
+behavior or evidence. Affected live work waits for delivered contracts rather
+than inferring fields or falling back to the previous catalog. Service chart
+persistence, non-sensitive requirement-outcome readback, and Change Request/
+repository APIs remain separate prerequisites.
+
+The caller approved revision 14 on 2026-10-29. The following paragraphs retain earlier approval history.
+
 This revision replaces an invalid draft that claimed revision 1 approval. That
 claim is not carried forward. The caller approved revision 5 on 2026-10-19;
 revision 9 incorporates the subsequent main update, full-library completion
@@ -25,6 +68,14 @@ with Rust-owned opaque browser sessions and write the remediation task after
 rejecting additional UI deployment secrets and environment variables. This is
 approval of that decision and its necessary implementation/task scope; it is
 not a claim that revision-9 implementation or visual acceptance passed.
+
+Revision 11 records the caller's explicit approval of the two primary deployed
+journeys and request for `$wyrd-plan` on 2026-10-20. Conventional UI and
+agent-harness MCP App investigations are required; AskPanel/Ask service are
+deferred, and saved views are an independent deferred capability. This revision
+changes scope, acceptance and ordering only. TASK-003's foundation obligations,
+existing session remediation, and prior immutable review subjects remain intact.
+No implementation, browser-host compatibility or journey PASS is implied.
 
 Original baseline: `d3ce50626a8e380475c0561d8d53144c212e8603`. On the caller's
 instruction, destination branch `wyrd-ui-main-integration` was fast-forwarded
@@ -246,7 +297,8 @@ implementor never sees two versions of anything.
 
 - **REQ-007 — Shell.** The shipped UI shell is the canvas shell (REQ-021):
   left rail, top bar with breadcrumb, time picker, Live toggle, drawer, and
-  the rail's "Find or ask" entry that opens the Ask panel. It is built new
+  no Ask entry or embedded conversation in this delivery. AskPanel is deferred
+  by revision 11. It is built new
   from the canvas `Main` board; nothing from the old shell is kept.
 - **REQ-008 — Card inventory.** The Cards page, built from `CardInventory`
   (REQ-030) to the canvas: search, filter, and navigation over current
@@ -293,9 +345,10 @@ implementor never sees two versions of anything.
   `Verifier`) built from the REQ-030 Verify components on main's generic
   Verifier, binding, execution, requirement, verdict, and evidence
   contracts. Retained
-  results come from `vala.verification.results`; `card_uid` is the subject,
-  `verifier_card_uid` is the Verifier, and `execution_id` is not application
-  `run_id`. Drift is a check with detail; Agent judging is a check. Mock-only
+  results come from `bifrost.verification.results`; `subject_card_uid` is the subject,
+  `verifier_card_uid` is the Verifier, `workload_card_uid` is the binding's
+  exact root, and `execution_id` is not application `run_id`. Drift is a check
+  with detail; Agent judging is a check. Mock-only
   historical evaluation/drift functions are not a reusable live implementation.
 - **REQ-019 — Summaries.** The Home page (canvas `Home`) built from
   `AttentionList`, `SignalBreakdownTable`, `CardInventorySummary`, and
@@ -313,7 +366,7 @@ implementor never sees two versions of anything.
   together. A gallery checkpoint must cover keyboard/focus behavior, touch
   interaction, long content, and narrow-container overflow where applicable.
   Pause before beginning the next dependent slice until the human has inspected
-  the current slice. Every inventory component must be fully implemented, tested,
+  the current slice. Every in-scope inventory component must be fully implemented, tested,
   and visually accepted on desktop and mobile before the library ships or
   conventional pages begin. Fixture-only progress cannot satisfy that gate.
 
@@ -330,51 +383,63 @@ not protocol authority.
   chart offers "Open in Query" with its exact SQL. Without data, the panel shows
   an empty state naming the attribute or binding that would produce it. Wyrd
   emits no `agent.invoke`, `prompt.render`, `model.predict`, or Service-request
-  span; the UI must not assume them. Automatic sources on main are: Skald
+  span; the UI must not assume them. Available automatic sources are Skald
   `invoke_agent`/`chat`/`execute_tool` spans (server/CLI Agents), the opt-in
   SDK `WyrdAgentsTraceProcessor` (same names), one Gateway span per attempt, and
-  `vala.gateway.calls` (latency `terminal_at - started_at`, usage, cost,
-  outcome, keyed by `card_uid` when supplied). Spans gain `card_uid`/`run_id`
-  inside an SDK Run scope; logs and metrics only when the record carries
-  `wyrd.card_uid`. The UI never decides pass, fail, or drift: it renders
-  recorded results (`vala.verification.results.verdict`, requirement outcomes,
-  `vala.drift.result_features.verdict`); aggregates such as failure rate only
-  count recorded results.
-- **REQ-023 — Service telemetry correlation (platform prerequisite).** Every
-  deployed Service must have one standard way to correlate its spans, logs,
-  metrics, and gateway calls. `card_uid` stays the innermost producing Card
-  (the record attribute `wyrd.card_uid` projected and scope-checked by
-  `RecordCorrelation::extract`). A separate `service_card_uid` column is added
-  to `vala.traces.spans`, `vala.logs.records`, `vala.metrics.points`,
-  `vala.gateway.calls`, and `vala.verification.results` (written from the
-  binding's Service when the result is recorded):
-  - source: the OTel resource attribute `wyrd.service.card_uid`
-    (`wyrd_spec::vala::trace::attributes::SERVICE_CARD_UID`, declared but not
-    yet projected), set once per deployment, e.g.
-    `OTEL_RESOURCE_ATTRIBUTES=wyrd.service.card_uid=<uid>`; works in any
-    language, with or without the SDK, and through a multi-Service collector;
-  - check: the UID must name a Service Card within the principal's Card scope,
-    rejected per record exactly as an unauthorized `card_uid` is;
-  - default: when absent and the credential is bound to exactly one Service
-    Card, Bifrost derives it from that credential.
-  Service pages filter on `service_card_uid` and break down by `card_uid`.
-  Matching on `service_name` or on a component UID list is not acceptable: a
-  shared component would merge two Services' telemetry. This is a Bifrost
-  ingest and schema change owned outside the UI tasks; UI tasks depending on it
-  wait for it.
+  `bifrost.gateway.calls` (latency `terminal_at - started_at`, usage, cost,
+  outcome, attributed under REQ-023). Generic telemetry need not identify a
+  workload, subject or application Run. The UI never decides pass, fail, or
+  drift: it renders
+  recorded results (`bifrost.verification.results.verdict`, requirement outcomes,
+  `bifrost.drift.result_features.verdict`); aggregates such as failure rate only
+  count recorded results, not pending executions or presumed missing observations.
+- **REQ-023 — Workload, subject and account correlation (platform prerequisite).**
+  Consume the approved service packet's shared managed envelope on system and
+  dynamic tables. `workload_card_uid` is the validated exact Service
+  execution/binding root; `subject_card_uid` is the exact observed or judged
+  Card; `run_id` is optional application Run correlation. These three values
+  may be null independently where the server contract permits. Required
+  `sub_principal_id` and `act_principal_id` identify the original action's
+  accounts; `wyrd_request_id` correlates the request; `wyrd_ingested_at` is UTC
+  microsecond admission time. Preserve returned nulls and original attribution,
+  including on internally delivered verification results.
+  - The server derives workload attribution from validated execution or
+    binding context. Resource labels, stable accounts, shared components, trace
+    membership and latest-version lookup cannot establish it. The source OTLP
+    subject attribute remains `wyrd.card_uid`; stored schemas and SQL use
+    `subject_card_uid`. The UI does not rename that source attribute or invent
+    managed values.
+  - Exact Service pages filter by the selected release's `workload_card_uid`
+    and break down by `subject_card_uid`. A family-wide scope, wherever already
+    required, resolves registered version UIDs through Cards and filters those
+    UIDs; it cannot match only a name or resource label. This revision adds no
+    family-selection control. Generic Observe/Verify ownership labels use
+    Workload and identify the exact Service root. Account IDs and
+    resource-service/environment labels remain separate query dimensions; this
+    revision does not add dedicated account-filter controls.
+  - A workload alone is not an execution join key. Use the applicable Run,
+    trace, span, execution or workload-scoped group identity for the question.
+    Trace/span/execution/group fields remain domain-specific, not mandatory
+    columns on every metric or custom row.
+  - Existing Bifrost table permissions authorize reads; a correlation key or
+    observation graph grants no additional read access or implicit row policy.
+  This replaces resource-derived Service attribution and the result/input/drift
+  owner-column spelling with the upstream canonical fields; no duplicate root
+  column is added. Upstream owns ingest, schema, authorization and durable
+  origin production; dependent UI work waits for it.
 - **REQ-024 — Kind-specific Card pages.** Each kind has its own layout and
   only real sources:
-  - Agent: `invoke_agent` spans with `card_uid` = the Agent (count, latency,
+  - Agent: `invoke_agent` spans with `subject_card_uid` = the Agent (count, latency,
     `status_code` errors, recent invocations linking to traces); gateway calls
-    with `card_uid` = the Agent (tokens, cost); composition from the spec.
+    with `subject_card_uid` = the Agent (tokens, cost); composition from the spec.
   - Prompt: spec only — messages, derived variables, response format, using
     Agents, version diff. No telemetry strip.
   - Model: interface, signature, artifacts; spans/metrics attributed to the
     Card grouped by name, shown only when present; drift from bound Verifiers.
   - Data: schema, `stats`, `splits`, `target_columns`, `sql`; per-feature drift
-    from `vala.drift.result_features` where a drift check names it as
+    from `bifrost.drift.result_features` where a drift check names it as
     `baseline_ref`.
-  - Service: Overview (signals by `service_card_uid`, broken down by component),
+  - Service: Overview (signals by `workload_card_uid`, broken down by component),
     Charts, Versions, YAML.
   - Verifier: the Verifier graph (REQ-027); results live in Verify (REQ-026).
 - **REQ-025 — Service charts (platform prerequisite).** `ServiceSpec` gains
@@ -398,13 +463,23 @@ not protocol authority.
     shows the error in the chart, never a blank chart.
 - **REQ-026 — Verify: the results workbench, shaped like Traces.** One list
   of recorded results answers "what is failing"; a result opens in a drawer
-  over the list so filters and position survive. No duration, hash, retry,
-  provenance, or table-name detail anywhere.
+  over the list so filters and position survive. No duration, hash, retry
+  internals, provenance, or table-name detail anywhere. For an execution already
+  addressed by its existing execution ID, readback distinguishes a pending/
+  running/retrying execution with no selected result from an empty result list
+  or a completed judgment. Do not add queued executions to the recorded-results
+  list or introduce an execution-list API. Show the addressed execution
+  as waiting/in progress without inventing a verdict or intermediate result.
+  The server alone owns evidence-availability retries; the UI neither resubmits
+  verification nor exposes attempt counters or backoff controls. Direct missing
+  evidence and exhausted queued evidence render the recorded trace-requirement
+  inconclusive reason; other requirements retain their recorded outcomes and
+  the Verifier's recorded aggregate decision.
   - List: WHERE bar, time picker and Live; two brushable charts (results
     stacked by recorded verdict; results by Verifier); left filter rail with
-    counts (verdict, Verifier, failed requirement, Service, Card, session);
-    table Time, Verifier, Card, Service, Run, Session, Failed requirements,
-    Verdict. Group by none | run | Card | Service | session. A session group
+    counts (verdict, Verifier, failed requirement, Workload, Card, session);
+    table Time, Verifier, Card, Workload, Run, Session, Failed requirements,
+    Verdict. Group by none | run | Card | Workload | session. A session group
     header identifies the owner-scoped group and its recorded reviews. Opening
     a review shows that execution's selected recorded result and pinned member
     executions, never every historical row sharing the caller's `group_id`.
@@ -412,7 +487,7 @@ not protocol authority.
     - Run result: the Verifier graph (REQ-027) coloured by this result's
       recorded outcomes, first failed requirement selected; under it the
       selected requirement's reason, actual, citations (jump to input or
-      trace span), and judge; header verdict, Card, Service, run, session,
+      trace span), and judge; header verdict, Card, Workload, run, session,
       time; Inputs collapsed.
     - Session result: the same graph with that execution's pinned member
       executions as the input column, each opening its own result. Later group
@@ -420,7 +495,16 @@ not protocol authority.
     - Drift result: one row per feature (recorded score sparkline with the
       recorded threshold dashed, score, threshold, verdict), every feature
       shown, drifted first; window header with previous/next.
-  - The Verifier name opens the Verifier Card; a trace citation opens Traces.
+  - The Verifier name opens the Verifier Card; a trace citation opens Traces
+    at its exact trace/span identity under the viewer's table permissions. Do
+    not apply the originating result list's time/workload/subject filters to
+    the evidence read: a trace may cross workloads and include untagged spans.
+    Keep those list filters when returning to the list. Bounded-read failures
+    remain visible rather than presenting a truncated trace as complete.
+    Inspection shows currently retained authorized spans; it does not claim to
+    reconstruct the exact span collection seen by a past verification attempt.
+    Late-arriving spans never recompute or revise the recorded result; a new
+    judgment requires a new server verification execution.
 - **REQ-027 — Verifier Card: the Verifier graph.** One component built only
   from `VerifierSpec`: inputs, then steps layered by the outputs they read
   and `depends_on` (edges labelled by the output read), step requirements
@@ -429,7 +513,8 @@ not protocol authority.
   (Verify filtered to this Verifier; the Card has no Results tab), and a
   YAML toggle. The result drawer reuses it coloured by recorded outcomes.
   - Sessions use current main's optional `group_id`, scoped to the tenant and
-    authenticated owner Service. `group_end {after}` is a quiet-period trigger,
+    validated exact workload root, not the stable account. `group_end {after}`
+    is a quiet-period trigger,
     not a once-per-session close or permanent finality rule. Later acknowledged
     activity can schedule another review; continuous activity can postpone it.
     The UI uses current `VerifierSpec` source declarations and binding settings.
@@ -447,7 +532,7 @@ not protocol authority.
     does not invent new group lifecycle or grant semantics. Pass/fail for every
     requirement, including a drift requirement over
     many features, is the server's recorded verdict in
-    `vala.verification.results`; the UI never computes it. The drift view
+    `bifrost.verification.results`; the UI never computes it. The drift view
     stops at recorded scores; no baseline distribution is drawn until one is
     recorded.
 - **REQ-028 — Observe pages.** Observe and Verify stay separate: no verdict or
@@ -457,8 +542,28 @@ not protocol authority.
   hovers, or has a trace open, and shows "↑ N new". A trace opens in a drawer
   over the list with a waterfall collapsed below two levels and span detail
   beneath (messages for LLM spans). Filters are open by default and writable
-  into WHERE, and include Service (`service_card_uid`) and Card (`card_uid`).
+  into WHERE, and include Workload (`workload_card_uid`) and Card
+  (`subject_card_uid`), with nullable attribution preserved. These filter the
+  list; opening an exact trace follows REQ-026's evidence-navigation rules.
   There is no trace-summary table.
+  - Signal fields follow the upstream telemetry supplement and returned table
+    descriptions. Keep resource-service/environment labels separate from Wyrd
+    ownership, expose the new resource/URL/exception fields through applicable
+    facets or record details, and preserve typed raw attributes and nested data.
+    The shared envelope does not imply that all tables have every signal field.
+  - Use signal event time for event charts and time filters:
+    `start_time_unix_nano` on spans and `time_unix_nano` on logs/metrics remain
+    UTC nanosecond timestamps; `duration_nano` remains integer nanoseconds.
+    `wyrd_ingested_at` is admission time, not a replacement event-time axis.
+  - Span `is_exception` reflects an exact-name exception event; log
+    `is_exception` reflects a non-null promoted exception string, including an
+    empty string. Error status/severity alone does not imply an exception. The
+    UI consumes the server projection rather than recalculating these fields.
+  - Metrics retain point kind, integer versus double values, temporality,
+    monotonicity, histogram/summary structures and exemplars. Preserve absent
+    versus zero and integer precision through supported encodings; do not
+    coerce every point to a generic float, invent percentiles, or manufacture
+    trace correlation for a metric aggregating many executions.
 - **REQ-029 — Change Requests (design ahead of contract).** A Change Request
   is defined as: repositories connect to a Wyrd GitHub webhook; a repository
   `wyrd.toml` points to a folder of Verifiers (with requirements) to run; a CR
@@ -476,18 +581,20 @@ not protocol authority.
   Verifiers, not Claims. A Repos page manages webhook connections and the
   `wyrd.toml` path. No CR server contract exists on main; live CR pages wait
   for that separately specified server contract and the UI never owns CR state.
-- **REQ-030 — The component library and the four UI use cases.** The
-  component library is the most important deliverable of this change. Every
-  component works in all four UI use cases. "The four UI use cases" means
-  exactly these four, wherever this packet uses the phrase; they are not Card
-  kinds, workspaces, or personas:
+- **REQ-030 — The component library and its UI hosts.** The
+  component library is the most important deliverable of this change. Every in-scope component works in use cases 1–3 below. The fourth host is
+  retained as future context, not a delivery or acceptance dependency. References
+  in unchanged TASK-003 material to four-host foundation proof retain their
+  existing renderer/BFF checks; they do not require an Ask service. The two
+  primary deployed journeys are conventional UI and agent-harness MCP Apps
+  (REQ-034/035); custom-app portability remains required.
 
   | # | Use case | Who produces the view | How it is drawn | Who supplies the data |
   |---|---|---|---|---|
   | 1 | Shipped UI (conventional) | Wyrd writes the page | SvelteKit page; data loads run in the BFF | BFF, with the signed-in browser session's credential |
   | 2 | A user builds their own UI with an agent (e.g. Claude) | The agent writes Svelte code using `wyrd-ai-ui`, or writes a view document | The user's own app | The user's server, with the user's own Wyrd credential |
   | 3 | MCP App ("why did this fail? show me") | A Wyrd MCP tool returns a view document | The MCP client hosting the chat (Claude, VS Code, ChatGPT, …) draws `wyrd-ai-ui` inside its sandboxed iframe | The MCP App calls Wyrd's existing read tools as the same MCP caller |
-  | 4 | Runtime UI in Wyrd (A2UI-style) | An agent answers a question in the Ask panel | The same view-document renderer, inside the shipped UI | BFF, with the signed-in browser session's credential |
+  | 4 (deferred) | Runtime UI in Wyrd (A2UI-style) | An agent answers a question in the Ask panel | The same view-document renderer, inside the shipped UI | BFF, with the signed-in browser session's credential |
 
   **Package.** One new npm package, `wyrd-ai-ui`, in
   `crates/wyrd/wyrd-server/wyrd-ui/packages/ui/`, built with
@@ -517,7 +624,7 @@ not protocol authority.
   there. A loader is therefore split in two:
   - shared request planning, dependent-read sequencing, and result shaping are
     plain TypeScript with no imports from `wyrd-ai`, live in
-    `wyrd-ai-ui/loaders`, and run in all four use cases;
+    `wyrd-ai-ui/loaders`, and run in all in-scope hosts;
   - the part that actually fetches is an executor, one per place the code
     runs: Node.js uses `wyrd-ai` (`wyrd-ai-ui/node`); the MCP App uses MCP
     `tools/call` (`wyrd-ai-ui/mcp`); the shipped UI's browser calls the BFF.
@@ -576,7 +683,7 @@ not protocol authority.
 
   | WireRequest | MCP tool | `wyrd-ai` call |
   |---|---|---|
-  | `cards.get_by_ref {card_ref: CardRef}` | `cards.get_by_ref` with the exact, space-resolved reference | `Cards.get(card_ref)` |
+  | `cards.get_by_ref {card_ref: CardRef}` | `cards.get_by_ref` with the exact flat reference | `Cards.get(card_ref)` |
   | `cards.list ListCardsRequest` | `cards.list` with the flat generated request, including filters, limit and cursor | `Cards.list(request)` |
   | `bifrost.query {sql, params?, deadline_ms?, max_rows?, max_bytes?}` | existing `bifrost.query`, extended with optional typed parameters | `Bifrost.stream(sql, params, options)` with bounded result collection |
   | `bifrost.list_tables {}` | `bifrost.list_tables` | `Bifrost.listTables()` |
@@ -634,6 +741,22 @@ not protocol authority.
   supported value encoding, degraded results, failure, denial, and cancellation.
   Loader result shaping consumes only this shared shape.
 
+  **Schema and catalog adoption.** Built-in, dynamic-dataset and operational
+  SQL references use the delivered public `bifrost` catalog. Table discovery and
+  description consume the same delivered contract on Node/MCP/BFF, including
+  resolved schemas, layout and revisions; they do not impose a local fixed
+  signal-row schema. Query remains a read-only workbench: layout configuration,
+  schema alteration and revision-based PATCH administration are not added.
+  Adopt changed generated contracts from their existing source owners. Added
+  signal columns do not justify replacing Chart, executors or normalization.
+
+  Built-in SQL, domain loaders, authored examples and recorded/live fixtures
+  must agree with this catalog and the canonical stored fields. Regeneration
+  alone does not update SQL strings. Preserve authored SQL verbatim and show
+  the existing structured query error for an obsolete reference; do not rewrite
+  it, fall back to an old catalog, or support both schemas. Dependency fixtures
+  remain explicitly non-live until the upstream contract and real proof land.
+
   **SQL inputs.** Built-in component reads use constant SQL templates with
   typed `$n` bind values. Explicitly authored Chart and Query inputs may supply
   read-only SQL at runtime; that SQL is not required to be a source constant.
@@ -666,7 +789,7 @@ not protocol authority.
   - MCP executor (`wyrd-ai-ui/mcp`): calls the MCP tools above through the
     ext-apps `App.callServerTool`, so reads run as the MCP caller with that
     caller's scopes. It makes no network request of its own.
-  - In the shipped UI's browser (Ask panel, gallery), the renderer uses a BFF
+  - In the shipped UI's browser (gallery and view-document consumers), the renderer uses a BFF
     endpoint `POST /t/[tenantKey]/ui/load` that takes `{component, input}`,
     runs the loader with the Node executor, and returns props. Credentials
     never reach the browser.
@@ -715,19 +838,19 @@ not protocol authority.
     "title": "Why refund answers failed on Tuesday",
     "range": {"from": "2026-10-14T00:00:00Z", "to": "2026-10-15T00:00:00Z"},
     "panels": [
-      {"id": "p1", "component": "Chart", "width": "full",
+      {"id": "p1", "component": "Chart", "layout": {"x": 0, "y": 0, "w": 8, "h": 6},
        "input": {"type": "timeseries", "sql": "SELECT …", "x": "t", "y": ["failed"]}},
-      {"id": "p2", "component": "VerificationResult", "width": "full",
+      {"id": "p2", "component": "VerificationResult", "layout": {"x": 8, "y": 0, "w": 4, "h": 6},
        "input": {"resultId": "…"}}
     ]
   }
   ```
   - `range` is either absolute `{from, to}` or relative `{last: "6h"}`
     (REQ-031). Panels inherit it unless their input sets one.
-  - `width` is `full` or `half`. Panels render in order. There is no other
-    layout language.
+  - Layout (REQ-036): a panel's optional `layout` places it on the view grid.
+    It is the only layout language; there is no `width` field.
   - A view document never contains query results, props, credentials, or
-    tokens. It is re-run as whoever views it (REQ-031).
+    tokens. It is re-run as whoever views it, including an unsaved view.
   - Validation: `version` and `catalogId` match; every `component` exists in
     the catalog; every `input` validates against that component's schema.
     An invalid panel renders an error naming the component and the failed
@@ -776,14 +899,13 @@ not protocol authority.
     `connectDomains`. Display modes: inline and fullscreen.
   - spec: MCP Apps 2026-01-26 (`modelcontextprotocol/ext-apps`).
 
-  **Use case 4 — Ask panel.** The rail's "Find or ask" opens the Ask panel on
-  every page. The user's question goes to the BFF, which calls a server Ask
-  endpoint that returns a text answer plus a view document; `WyrdView`
-  renders it through the BFF load endpoint; "Save" stores it as a saved view
-  (REQ-031). No Ask/agent endpoint exists on main (the Gateway's
-  `/v1/chat/completions` is model access, not an agent); the Ask endpoint is
-  a platform prerequisite specified separately. Until it ships, the Ask panel
-  is built and tested against fixture answers.
+  **Use case 4 — Ask panel (deferred).** A future AskPanel would send a
+  question to a separately approved agent-backed server endpoint and render its
+  text-plus-view answer. This change does not implement that endpoint, an
+  embedded agent runtime, conversation UI, or fixture AskPanel. The user's
+  existing harness owns conversation and model execution for use case 3.
+  Neither Ask nor saving is needed to generate, inspect, update or discard an
+  unsaved MCP App view.
 
   **Component inventory.** These are the components the approved canvas
   needs. "Prereq" means the data source is a platform prerequisite not yet
@@ -792,11 +914,11 @@ not protocol authority.
 
   | Component | Canvas boards | Input | Data source | Prereq |
   |---|---|---|---|---|
-  | `Chart` (timeseries, bar, stat, table; title, source caption, Open in Query, in-chart error) | Main, Spans, Logs, Metrics, Verify*, ServiceCharts, QueryChart, Model, Data | chart definition (REQ-025 fields) + range + bucket | its own SQL on `vala.*` tables | Service charts: REQ-025 |
-  | `StatStrip` (1–5 numbers with sparkline) | Agent, Service, Home, Main, Spans | stat definitions + range + scope (`card_uid` or `service_card_uid`) | `vala.traces.spans` (`invoke_agent`, `duration_nano`, `status_code`), `vala.gateway.calls` (`usage`, `cost`) | `service_card_uid`: REQ-023 |
+  | `Chart` (timeseries, bar, stat, table; title, source caption, Open in Query, in-chart error) | Main, Spans, Logs, Metrics, Verify*, ServiceCharts, QueryChart, Model, Data | chart definition (REQ-025 fields) + range + bucket | its own SQL on `bifrost.*` tables | Service charts: REQ-025 |
+  | `StatStrip` (1–5 numbers with sparkline) | Agent, Service, Home, Main, Spans | stat definitions + range + scope (`subject_card_uid` or `workload_card_uid`) | `bifrost.traces.spans` (`invoke_agent`, `duration_nano`, `status_code`), `bifrost.gateway.calls` (`usage`, `cost`) | `workload_card_uid`: REQ-023 |
   | `FacetRail` (value counts, click to add to WHERE) | Main, Spans, Logs, Verify* | `{signal, where, range, facets}` | GROUP BY counts on the list's table under the same WHERE | session facet: `group_id` |
-  | `RecordTable` (typed cells, live mode, group by) | Main, Spans, Logs, Verify*, Agent, Query | `{signal \| sql, where, range, columns, groupBy, live, limit}` | spans (one row per root span), `vala.logs.records`, `vala.verification.results`, or SQL | session grouping: `group_id` |
-  | `TraceWaterfall` | TraceDrawer | `{traceId, range}` | `vala.traces.spans` by `trace_id` | — |
+  | `RecordTable` (typed cells, live mode, group by) | Main, Spans, Logs, Verify*, Agent, Query | `{signal \| sql, where, range, columns, groupBy, live, limit}` | spans (one row per root span), `bifrost.logs.records`, `bifrost.verification.results`, or SQL | session grouping: `group_id` |
+  | `TraceWaterfall` | TraceDrawer | `{traceId, range?}` | `bifrost.traces.spans` by exact `trace_id`; range is navigation context, not an implicit evidence predicate | — |
   | `RecordDetail` (span or log: Messages, Attributes, Events, Exception, Raw) | TraceDrawer, Logs | `{traceId, spanId}` or log key | span `attributes`, `events`, `exception_*`, `gen_ai_*`; log `body`, `attributes` | — |
   | `CardHeader` (name, kind, version select, status, uid copy, tabs, primary action) | all Card boards | `{cardRef}` | Card envelope + registry version list | — |
   | `RelationshipList` | Agent, Prompt, Model, Data, Service | `{cardRef}` | server-derived `relationships` | — |
@@ -804,19 +926,19 @@ not protocol authority.
   | `CompositionGraph` | Agent, Service | `{cardRef}` | `AgentSpec` / `ServiceSpec`; node badge = latest recorded verdict | — |
   | `PromptMessages`, `PromptVariables`, `UsedBy`, `VersionDiff` | Prompt | `{cardRef, otherVersion?}` | `PromptSpec`; relationships | — |
   | `ModelInterface`, `ArtifactTable` | Model | `{cardRef}` | `ModelSpec` interface/signature; artifacts | — |
-  | `VerificationBindings` | Agent, Service, Home | `{cardRef, range}` | bindings + `vala.verification.results` | — |
-  | `AttentionList` | Home, Service | `{scope, range}` | failed `vala.verification.results` by `owner_card_uid` | CR rows: REQ-029 |
-  | `SignalBreakdownTable` | Home, Service | `{groupBy: service_card_uid \| card_uid, scope, range}` | root spans + `vala.gateway.calls` | REQ-023 |
+  | `VerificationBindings` | Agent, Service, Home | `{cardRef, range}` | bindings + `bifrost.verification.results` | — |
+  | `AttentionList` | Home, Service | `{scope, range}` | failed `bifrost.verification.results` by `workload_card_uid` | CR rows: REQ-029 |
+  | `SignalBreakdownTable` | Home, Service | `{groupBy: workload_card_uid \| subject_card_uid, scope, range}` | root spans + `bifrost.gateway.calls` | REQ-023 |
   | `CardInventory` (list, filters, kinds) and `CardInventorySummary` | Cards, Home | `{filters, page}` / `{}` | `cards.list` | — |
-  | `VerifierGraph` (plain or coloured by one result) | Verifier, Verify, VerifySession, VerifyDrift | `{cardRef}` or `{resultId}` | `VerifierSpec`; `outcome` of `vala.verification.results` | — |
-  | `VerificationResult` (drawer body: header, `VerifierGraph`, `RequirementDetail`, Inputs) | Verify, VerifySession, VerifyDrift | `{resultId}` | `vala.verification.results`; drift adds `vala.drift.result_features`; existing execution readback supplies pinned group membership | main already supplies `group_id`/`group_end`; non-sensitive requirement outcomes remain a prerequisite |
+  | `VerifierGraph` (plain or coloured by one result) | Verifier, Verify, VerifySession, VerifyDrift | `{cardRef}` or `{resultId}` | `VerifierSpec`; `outcome` of `bifrost.verification.results` | — |
+  | `VerificationResult` (drawer body: header, `VerifierGraph`, `RequirementDetail`, Inputs) | Verify, VerifySession, VerifyDrift | `{resultId}` | `bifrost.verification.results`; drift adds `bifrost.drift.result_features`; existing execution readback supplies pinned group membership | main already supplies `group_id`/`group_end`; non-sensitive requirement outcomes remain a prerequisite |
   | `RequirementDetail` | Verify*, ChangeVerification | `{resultId, requirementId}` | requirement outcome in `outcome` | — |
-  | `DriftFeatureTable` | VerifyDrift, Data | `{resultId}` or `{cardRef}` | `vala.drift.result_features` | — |
-  | `QueryEditor`, `TableCatalog`, `QueryDetails` | Query, QueryChart | `{sql, range, limit}` / `{}` | `bifrost.*` | — |
+  | `DriftFeatureTable` | VerifyDrift, Data | `{resultId}` or `{cardRef}` | `bifrost.drift.result_features` | — |
+  | `QueryEditor`, `TableCatalog`, `QueryDetails` | Query, QueryChart | `{sql, range, limit}` / `{}` | existing Bifrost list/describe/query contracts; resolved schema, layout and revisions | schema/description cutover |
   | `ChartEditor` | ServiceCharts | `{cardRef, chartId?}` | `ServiceSpec.charts` | REQ-025 |
   | `ChangeRequestList`, `ChangeHeader`, `SubjectsTable`, `RevisionList`, `ActivityFeed`, `ChangeVerifierList`, `RequestVerificationForm`, `ReviewSubmission`, `Participants` | Changes, ChangeDetail, ChangeVerification | `{crId, revision?}` | none on main | REQ-029 |
   | `RepositoryList`, `WyrdTomlView`, `VerifierFolderTable` | Repos | `{repo}` | none on main | REQ-029 |
-  | `AskPanel` | rail entry (all pages) | `{question}` | Ask endpoint | Ask endpoint |
+  | `AskPanel` (deferred; excluded from shipping inventory) | future rail entry | future contract | none required in this change | separate future scope |
 
   (*Verify means Verify, VerifySession, VerifyDrift.) Primitives used inside
   these, also in `wyrd-ai-ui` but not in the catalog: `EmptyState`,
@@ -852,10 +974,16 @@ not protocol authority.
     data. Prereq components defer T5 until their prerequisite ships; they remain
     fixture-ready, not production-complete, and hold the full-library shipping
     gate until their real loading/actions and applicable T5 proof pass.
-  - T6 page journey: added when the page is assembled.
+  - T6 page journey: added when the page is assembled; REQ-034 requires a real
+    browser navigating the deployed page, not only imported handlers or jsdom.
   Fixtures for `populated` and `empty` are recorded from T5 runs by a script
   and checked in; `error` and prereq fixtures are hand-written and labeled.
-  No test calls a live model.
+  T1–T6 and deterministic MCP/browser regressions call no live model. REQ-035
+  adds a separate, explicitly invoked live-agent journey using existing local
+  readiness configuration. It is outside default tests, `gate` and unattended
+  CI; absence of credentials, a compatible host or browser is BLOCKED, not PASS.
+  Integrated change acceptance requires its recorded evidence. One successful
+  stochastic run establishes that run only, not a reliability claim.
 
   **Gallery (visualized).** A dev-only route `/_gallery` in the shipped app
   renders every catalog component in every state, light and dark, through
@@ -882,12 +1010,15 @@ not protocol authority.
      `CompositionGraph`, Prompt, Model, `CardInventory`); Query; Verify
      (`VerifierGraph`, `VerificationResult`, `RequirementDetail`,
      `DriftFeatureTable`, `VerificationBindings`, `AttentionList`); Service
-     (`SignalBreakdownTable`, `ChartEditor`); Changes and Repos; `AskPanel`.
+     (`SignalBreakdownTable`, `ChartEditor`); Changes and Repos. AskPanel
+     and saved-view controls are deferred and excluded from this shipping gate.
   4. MCP App: resources capability, `ui://wyrd/view`, `ui.show_view`,
-     `ui.catalog`.
+     `ui.catalog`, and the complete REQ-035 agent investigation journey.
   5. Only then the conventional pages (REQ-007 to REQ-019, REQ-021,
      REQ-024 to REQ-029), each assembled from finished components with its
-     T6 journey. A page whose prerequisite has not shipped waits for it.
+     real-browser T6 journey (REQ-034). A page whose prerequisite has not
+     shipped waits for it. Other platform prerequisites remain blocking; only
+     Ask/saved views are removed from this delivery gate.
 
   The complete self-contained browser artifact needed for T4 is built during
   foundation/library verification against the fixture host. Step 4 registers
@@ -902,18 +1033,60 @@ not protocol authority.
     draw a view document into any DOM element, so React or Vue apps render
     view documents without writing Svelte. Using individual components
     directly is Svelte-only. No Web Components build.
-  - Verify's Service filter and column read `service_card_uid` from
-    `vala.verification.results`, written by the server when the result is
-    recorded (the binding's Service). This adds `vala.verification.results`
-    to REQ-023's column list. Service is never derived at read time from
-    relationships.
+  - Verify's Workload filter and column read `workload_card_uid` from
+    `bifrost.verification.results`, written by the server from the exact binding
+    root (always a Service). Subject, workload and account stay separate per
+    REQ-023. Ownership is never derived at read time from relationships or
+    resource labels.
   - Data per-column drift: the loader reads the Verifier specs whose drift
     check's `baseline_ref` names this Data Card, collecting each Verifier and
-    requirement id, then queries `vala.drift.result_features` filtered by
+    requirement id, then queries `bifrost.drift.result_features` filtered by
     that Verifier and requirement id. No schema change.
 
-- **REQ-031 — Saved views (platform prerequisite).** A saved view is a view
-  document (REQ-030), never stored data. It is a tenant-scoped server resource,
+- **REQ-036 — View layout: placed, resizable panels.** A view document
+  lays its panels out on a grid the way a dashboard does, and a reader can
+  resize and move them. The layout lives in the document; the components do
+  not know their size.
+  - Grid: 12 columns spanning the view's width; rows are 40 CSS px. A panel's
+    `layout` is `{x, y, w, h}` in whole grid units: `0 ≤ x ≤ 11`,
+    `1 ≤ w ≤ 12`, `x + w ≤ 12`, `y ≥ 0`, `1 ≤ h ≤ 48`. A value outside these
+    bounds fails document validation.
+  - A panel without `layout` spans all 12 columns at its content height and
+    is placed below every panel before it in document order. Documents may
+    mix placed and unplaced panels.
+  - Panels never overlap on screen: where two layouts collide, the later
+    panel in document order moves down until it is clear. The document is
+    not rewritten by rendering.
+  - Components fill the box they are given. Content taller than its panel
+    scrolls inside the panel; it never draws over a neighbour. No catalog
+    component entry gains a size input; only the catalog's published
+    view-document schema gains `layout`.
+  - Narrow views: when the view is narrower than 720 CSS px, panels render as
+    one full-width column in `(y, x)` order and keep their `h`; resize and
+    move are off.
+  - Editing: `WyrdView` makes layout editable only when its host passes a
+    layout handler. Then a reader resizes a panel from its lower-right corner
+    and moves it by its drag handle; both snap to the grid, both have
+    keyboard equivalents (move with arrow keys, resize with Shift+arrow keys
+    on the focused handle, Escape cancels), and each completed change calls
+    the handler with the whole updated document. Without a handler, layout is
+    read-only. Hosts decide what to keep; reloading a document shows its
+    written layout.
+  - Persistence: none in this revision. Saving an edited layout arrives with
+    saved views (REQ-031); `ServiceSpec.charts` (REQ-025) gains no layout
+    field. In an MCP App, edits last for that render only.
+  - A2UI export (REQ-030) emits panels in `(y, x)` order and may drop
+    `layout`; layout never blocks that mapping.
+  - Non-goals: adding, removing or duplicating panels from the view;
+    collapsible rows; per-viewer layout memory; layout in the shipped pages
+    (use case 1), whose pages own their own layout.
+
+- **REQ-031 — Saved views (deferred, independent future capability).** A saved view is a view
+  document (REQ-030), never stored data. The remaining paragraph preserves
+  future product intent only: no saved-view backend, controls, sharing action or
+  SDK/MCP projection is required by this revision. Saving is independent of Ask
+  and does not block either primary journey. A future approved change must
+  define its server contracts before implementation. It is a tenant-scoped server resource,
   not a Card kind, readable and writable through HTTP and MCP so agents and every
   UI host share it. Each has an owner principal and visibility `private` or
   `tenant`; it is neither versioned nor reviewed. Opening it re-runs every panel
@@ -924,6 +1097,61 @@ not protocol authority.
   chart that must be governed with its Service is promoted into
   `ServiceSpec.charts` (REQ-025), where it is versioned and reviewed in Change
   Requests.
+
+- **REQ-034 — Primary conventional UI journey.** TASK-012 establishes real
+  browser automation of the deployed production BFF and Rust server using
+  repository-managed Postgres, public login and session boundaries. Each
+  assembled page extends it with its actual user workflow: sign in, navigate,
+  inspect real data, interact, and verify the resulting visible state and server
+  reads. Time-aware pages exercise range changes and no stale overwrite;
+  identity-aware pages preserve exact Card versions and links. Cover populated,
+  empty, denied/error and cross-tenant refusal without fabricated domain data.
+  Browser navigation, JavaScript, focus/keyboard and applicable mobile behavior
+  must execute in a real engine, which may run headlessly. HTTP-client cookie
+  simulation, jsdom, imported handlers and screenshots alone are supporting
+  proof, not completion. Preserve per-page human inspection. TASK-013–026 own
+  page-specific closure; TASK-012 does not manufacture pages to test them early.
+
+- **REQ-035 — Primary agent-harness MCP App investigation journey.** A user
+  completes an unsaved investigation in an MCP App-capable agent harness with
+  no visit to the conventional Wyrd UI and no application-building step:
+
+  1. Ask a natural-language question. The real agent discovers `ui.catalog` and
+     valid component inputs and calls `ui.show_view` with its generated document.
+  2. The actual returned resource/document renders in the harness's sandboxed
+     browser app; its reads reach the real server as that viewer.
+  3. Send a follow-up in the same conversation. The agent uses that context to
+     refine the investigation and return an updated view; inspect its rendering.
+  4. Change the time range in the app (including chart brushing where applicable).
+     Inspect the new bounds in actual reads and visible results, consistent
+     bounds across affected panels and no acceptance of superseded results.
+  5. Exercise empty results, permission denials, query errors and malformed panel
+     inputs with honest visible outcomes, sibling isolation, tenant separation
+     and no credential exposure. Deterministic deployed-host companion tests may
+     force these failures; natural-language discovery/follow-up remain live-agent
+     proof. Do not require a model to reproduce every injected negative case.
+
+  TASK-011 owns this outcome. Reuse the existing coding-agent readiness owner
+  for local configuration, checkout docs, owned `wyrd server dev`, agent process
+  deadlines/cancellation, credential isolation and sanitized reports. Extend it
+  for actual conversation turns and connect its actual MCP results to a real
+  browser-capable App host using the existing ext-apps bridge. Do not implement
+  a production chat service or agent runtime in Wyrd. Browser and agent drivers
+  must belong to the same connected test session; manually copied documents,
+  hardcoded model outputs, fixture AppBridge answers, or independent CLI and
+  browser runs cannot satisfy this journey.
+
+  Record the exercised host/agent versions, source identity, conversation turns,
+  actual tool requests/results, browser interactions, visible outcomes and
+  authorized server evidence with secrets removed. Claim only exercised hosts.
+  Do not assume Claude Code/Codex CLI execution implies MCP App rendering. An
+  external host may be used only through its supported automation/extension
+  boundary. A minimal repository test host is acceptable only when it connects
+  the real agent conversation and real MCP connection to the actual AppBridge
+  lifecycle in a browser; it proves that host, not compatibility with an
+  untested commercial client. Host wiring/runner layout are reversible test
+  choices; missing supported integration blocks the live journey rather than
+  authorizing a replacement production harness or security bypass.
 
 ## Invariants, constraints, and non-goals
 
@@ -955,6 +1183,10 @@ not protocol authority.
   to select tests. No new environment variable solely for tests, including
   `WYRD_IDENTITY_TARGET`, `WYRD_IDENTITY_FILTER`, or `WYRD_STARTUP_FILTER`.
   Existing legitimate settings may be reused only for demonstrated consumers.
+  REQ-034/035 authorize the minimal test-only real-browser dependency and host
+  automation needed for those journeys, not a new test framework, production
+  setting or environment selector. Reuse the existing readiness CLI/local
+  configuration and ordinary runner selectors; provider credentials remain local.
 - **INV-005 — TASK-001 exclusions.** TASK-001 ends at packaged/installed/launched
   UI, official container routing, lifecycle, REQ-033 server-owned browser
   sessions, and real login proof. Revision 10 authorizes the necessary auth,
@@ -1002,10 +1234,12 @@ not protocol authority.
 4. Main's existing production identity journey is reused and extended where its
    synthetic `/auth/*` routing currently bypasses production routing. Native
    installation/lifecycle and Linux image routing have separate proof owners.
-5. UI domain reads remain BFF-side against current public server contracts.
+5. UI domain reads remain BFF-side against delivered public server contracts.
    The first actual consumer owns the smallest necessary client integration and
-   its consumer closure; later pages reuse it. Historical SQL/projections must
-   be revalidated against current table schemas and query terminal semantics.
+   its consumer closure; later pages reuse it. Revision 14 adopts the approved
+   upstream catalog, envelope and signal schemas only with their owning
+   architecture/SDK/MCP closure. Revalidate affected SQL, examples, fixtures and
+   proof across in-scope hosts without introducing parallel schema support.
 6. Plan real dependency edges and one observable outcome per task. TASK-001 is
    the caller-required plumbing/login closure. Later domain work is not a
    dependency of it. Visual approval governs dependent execution, not a new
@@ -1025,8 +1259,15 @@ not protocol authority.
 | AC-008 | Query, traces, logs, and metrics each read current canonical data, respect authorization/time bounds, and do not present failed/partial reads as success | Existing Bifrost/identity fixtures and narrow UI consumer journeys, terminal/cancellation regressions, separate page inspections |
 | AC-009 | Verification screens show generic requirements/verdicts/evidence and correct subject/Verifier/execution identities; summaries agree with those retained facts | Real generic verification-to-UI journey and focused projection tests; separate verification and summary checkpoints |
 | AC-010 | All original draft/reference bytes remain available with provenance; every task is self-contained, source-backed, narrowly verified, and visually inspectable; independent task readiness findings are resolved or surfaced | Preservation hashes, evidence inventory, obligation/task map and independent plan-readiness-reviewer findings/dispositions |
-| AC-011 | Every inventory component is fully implemented, tested, and individually accepted on desktop/mobile in light/dark before library shipment and conventional page work; unmet platform prerequisites block completion rather than disappear behind fixtures | Per-component interaction/accessibility/state evidence, applicable live authorization journeys, and recorded human gallery acceptance |
+| AC-011 | Every in-scope inventory component (excluding deferred Ask/saved views) is fully implemented, tested, and individually accepted on desktop/mobile in light/dark before library shipment and conventional page work; unmet platform prerequisites block completion rather than disappear behind fixtures | Per-component interaction/accessibility/state evidence, applicable live authorization journeys, and recorded human gallery acceptance |
 | AC-012 | Rust-owned opaque sessions support SSO and recovery, reject tampering/expiry/revocation/tenant mismatch and CSRF, preserve safe metadata/settings/chooser/logout, continue across two replicas/restarts, and require no additional deploy secret/env/service; old credential cookies require re-login | Real two-replica native and nginx browser journey, SQL/session negative tests, served cookie-auth contract, source/config audit and unchanged bearer/device/platform regressions |
+| AC-013 | Conventional UI users complete each page's real workflow in a browser against deployed BFF/server, with truthful range/identity, failure and tenant behavior | REQ-034; TASK-012 browser foundation and TASK-013–026 focused real-browser journeys, plus per-page human acceptance |
+| AC-014 | A real agent conversation produces an MCP App view, refines it on follow-up, and supports in-app range reloads under the viewer's permissions without opening Wyrd UI or building an app | REQ-035; TASK-011 gated live agent plus real-browser host evidence and deterministic deployed-host negatives; missing credentials/host are BLOCKED |
+| AC-015 | A view document places panels on the 12-column grid; with a host layout handler a reader resizes and moves panels by pointer and keyboard with grid snapping and no overlap, the handler receives the whole updated document, charts fill their resized panels, narrow views stack, and a document without `layout` renders as before; out-of-range layouts fail validation | REQ-036; unit tests for schema bounds, collision resolution and handler output; real-browser gallery and AppBridge artifact evidence at desktop and mobile in light and dark; recorded human gallery acceptance |
+| AC-016 | After the upstream cutover, discovery, descriptions, built-in SQL and shipped examples/fixtures agree on the `bifrost` catalog and canonical fields in each in-scope host; obsolete authored SQL fails visibly without rewriting or fallback | REQ-014/030; focused SDK/MCP/BFF query and description journeys, example smoke and affected foundation proof, including denied and obsolete-reference cases |
+| AC-017 | Two releases sharing a component and stable account remain distinct by workload; component and account queries select their own dimensions; rootless/subjectless rows keep truthful nulls and correlations grant no read access | REQ-023/024/028; real accepted telemetry/results with different workload, subject and account identities, exact-release queries, null cases and existing tenant/table-denial proof |
+| AC-018 | Observe preserves signal-specific types, event/admission time, integer precision, missing values and returned exception semantics after schema adoption | REQ-022/028/030; recorded typed signal fixtures and live reads covering distinct timestamp units, integer/double points, histogram/summary/exemplar data, nullable promotions and exception-versus-error cases |
+| AC-019 | Verification renders waiting separately from recorded outcomes, keeps selected results and workload-scoped membership exact, opens authorized cross-workload/untagged trace citations beyond originating list filters, and preserves completed judgments after late spans arrive | REQ-018/026/027; real queued-arrival, direct-absence and late-arrival consumer journeys plus focused citation/read-denial and pinned-membership checks; no client-owned retry or presumed trace snapshot |
 
 Task planning must choose exact focused commands from inspected current owners;
 the evidence document identifies known commands and coverage gaps. No build,
@@ -1034,6 +1275,18 @@ test, or runtime success is claimed by this specification. Final integrated revi
 combined proof and cross-task seams; task gates remain bounded to their owners.
 
 ## Open material decisions and approval
+
+Revision 14 approves the catalog/schema consumer alignment,
+managed attribution and Workload labels, signal fidelity, and verification
+waiting/evidence behavior described above. The service packet's approved
+contracts supply the upstream decisions and are delivered on main; this UI
+revision adds no new server API or durable authority.
+
+The caller approved this bounded revision on 2026-10-29. Task instructions use
+the delivered `workload_card_uid`/`subject_card_uid` columns and `bifrost`
+catalog. Earlier approvals, completed-task records and review subjects retain
+their original meaning and are not retroactively rewritten. The foundation's
+renewed real-server proof passes on main.
 
 The independent [readiness review](review/plan-readiness/review.md) assessed
 revision 5 against refreshed main and returned `Revise`. Its exact reviewed
@@ -1079,6 +1332,15 @@ implementation-owned. Revision-9 readiness and task-review reports retain their
 original subject and verdict, not an inferred approval of revision 10. The new
 remediation and its independent review are still required; no implementation,
 platform/runtime pass or human visual acceptance is claimed by this edit.
+
+Revision 11 records the caller's explicit acceptance of the proposal and
+`$wyrd-plan` request on 2026-10-20. REQ-034/035 and AC-013/014 define the two
+primary automated journeys; deferred AskPanel/REQ-031 no longer hold the library,
+MCP or conventional-page gate. All other in-scope prerequisites and human visual
+checkpoints remain. TASK-003 production scope and existing tests are preserved;
+new deployed-browser/conversation acceptance belongs downstream. Existing
+review verdicts are not rewritten. A host lacking supported integration is a
+reported live-proof blocker, never an assumed capability or silent pass.
 
 ## Revision history and authorities
 
@@ -1142,8 +1404,45 @@ platform/runtime pass or human visual acceptance is claimed by this edit.
   caller's explicit instruction to revise the spec and write that task; no
   implementation or review PASS is claimed.
 
-Authorities: `AGENTS.md`; `AGENTS.md`;
-`architecture/wyrd-design.md`; `architecture/wyrd-design.md`;
+- Revision 11 (2026-10-20): caller explicitly accepts the two primary journey
+  proposal and requests task planning. Defers AskPanel/Ask service and independent
+  saved views, removes their shipping dependencies, adds real-browser page and
+  multi-turn agent/MCP App acceptance, and permits the isolated opt-in live-model
+  lane through existing readiness ownership. TASK-003 remains unchanged in
+  scope. This approval concerns the stated outcomes, not implementation success
+  or compatibility with an untested host.
+
+- Revision 12 (2026-10-20): caller asks for Grafana-style panel
+  layout after inspecting the chart foundation. Replaces the view document's
+  `width: full | half` ordering with REQ-036: a per-panel grid `layout`,
+  reader resize/move inside `WyrdView` behind a host layout handler, and no
+  persistence until saved views (REQ-031). Components stay size-agnostic and
+  no catalog component entry changes. Adds AC-015. Builds on uncommitted revision 11
+  without changing it. Approved by the caller's explicit "yes" to the
+  revision as written; no implementation is claimed.
+
+- Revision 13 (2026-10-22): the UI work is rebased onto the flat Card identity
+  change (service-identity-and-telemetry TASK-001), which removes `space` from
+  `CardRef`, Card metadata and the SDK list requests. The exact reference above
+  is the flat `kind`/`name`/`version` reference with optional `uid`, and UI Card
+  identity renders as `Kind/name@version`. No other requirement changes.
+  Approved by the caller's instruction to carry out the proposed rebase steps,
+  which named this revision; no implementation is claimed.
+
+- Revision 14 (2026-10-23): draft aligning the UI with approved
+  service-identity-and-telemetry revision 12. Replaces resource-derived Service
+  attribution with managed workload/subject/account dimensions, adopts the
+  single `bifrost` catalog and canonical envelope/signal fields, and updates
+  generic ownership labels and component data sources. Specifies signal/time
+  fidelity, queued verification waiting and exact trace citation behavior,
+  retains separate platform prerequisites, and adds AC-016–019 for affected
+  consumer closure. Flat Card identity, transport/session/layout boundaries,
+  deferred capabilities, prior completion records and immutable reviews remain.
+  Approved by the caller on 2026-10-29, after main shipped the service
+  packet's schemas and `workload_card_uid` was confirmed to name a Service only.
+
+Authorities: `AGENTS.md`; `agent_docs/index.md`;
+`architecture/wyrd-design.md`;
 `architecture/bifrost-design.md`; `architecture/wyrd-security-posture.md`;
 `architecture/operations/deployment-and-release.md`;
 `changes/spec-driven-development.md`;

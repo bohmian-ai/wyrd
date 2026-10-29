@@ -694,6 +694,16 @@ impl Debug for AuthMiddleware {
     }
 }
 
+/// The refusal of a bearer for a browser session, which authenticates the
+/// tenant `/v1` HTTP surface by cookie and never as a token.
+fn browser_session_has_no_bearer() -> AuthError {
+    AuthError::Client(WyrdClientError::Config {
+        field: "credential".to_owned(),
+        reason: "a browser session authenticates tenant /v1 HTTP requests only and has no bearer"
+            .to_owned(),
+    })
+}
+
 impl AuthMiddleware {
     /// Build the middleware from a [`ClientConfig`] and a resolved credential.
     ///
@@ -963,8 +973,9 @@ impl AuthMiddleware {
     /// until the refresh skew.
     ///
     /// # Errors
-    /// Returns [`AuthError::Client`] on transport failure or an invalid tenant
-    /// slug, or [`AuthError::Server`] when the server rejects the credential.
+    /// Returns [`AuthError::Client`] on transport failure, an invalid tenant
+    /// slug, or a [`ResolvedCredential::BrowserSession`], which has no bearer;
+    /// or [`AuthError::Server`] when the server rejects the credential.
     pub async fn bearer(&self) -> Result<SecretBearer, AuthError> {
         match &self.credential {
             ResolvedCredential::Renewable(source) => {
@@ -1014,6 +1025,7 @@ impl AuthMiddleware {
                     .await?;
                 Ok(self.store(entry, &mut cache))
             }
+            ResolvedCredential::BrowserSession(_) => Err(browser_session_has_no_bearer()),
         }
     }
 
@@ -1027,7 +1039,8 @@ impl AuthMiddleware {
     ///
     /// # Errors
     /// Returns [`AuthError::Client`] on transport failure or an unsupported
-    /// credential, or [`AuthError::Server`] when the server rejects the key.
+    /// credential, including a browser session, or [`AuthError::Server`] when
+    /// the server rejects the key.
     pub async fn force_refresh(&self) -> Result<SecretBearer, AuthError> {
         match &self.credential {
             ResolvedCredential::Renewable(source) => {
@@ -1057,6 +1070,7 @@ impl AuthMiddleware {
                     .await?;
                 Ok(self.store(entry, &mut cache))
             }
+            ResolvedCredential::BrowserSession(_) => Err(browser_session_has_no_bearer()),
         }
     }
 

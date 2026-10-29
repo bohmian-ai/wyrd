@@ -1,8 +1,8 @@
 # TASK-014 — Agent workspace
 
-Spec: [revision 9, approved](../spec.md). Status: Proposed.  
-Dependencies: [TASK-012](TASK-012-canvas-shell.md), [TASK-013](TASK-013-card-browsing.md), [TASK-004](TASK-004-observe-components.md), [TASK-005](TASK-005-card-components.md), [TASK-007](TASK-007-verify-components.md).  
-Mapped obligations: REQ-010, REQ-024, REQ-020, AC-007, AC-010; all INV-001–INV-007 apply, with TASK-001-specific exclusions only in TASK-001.
+Spec: [revision 11, approved](../spec.md). Status: Proposed.
+Dependencies: [TASK-012](TASK-012-canvas-shell.md), [TASK-013](TASK-013-card-browsing.md), [TASK-004](TASK-004-observe-components.md), [TASK-005](TASK-005-card-components.md), [TASK-007](TASK-007-verify-components.md).
+Mapped obligations: REQ-010, REQ-024, REQ-020, AC-007, AC-010, REQ-034, AC-013; all INV-001–INV-007 apply, with TASK-001-specific exclusions only in TASK-001.
 
 ## Outcome and Value
 
@@ -10,7 +10,7 @@ The exact Agent version shows its registered Prompt, execution route, runtime to
 
 ## Owners, Scope, Consumers, and Prohibited Changes
 
-Assemble only this outcome from completed CardHeader, CardFacts, CompositionGraph, RelationshipList, VerificationBindings, StatStrip, Chart and RecordTable. Page/server load functions invoke shared loaders; no SQL, joins, dependent-read sequencing or domain shaping in pages. Reuse session-bound Node executor and shell. Use current AgentSpec.prompt/execution_route/tool_names/verified_by. Activity uses invoke_agent spans and gateway calls attributed to this card_uid; absence explains attribution instead of synthesizing activity. No historical components/layouts/types or fixture production fallback.
+Assemble only this outcome from completed CardHeader, CardFacts, CompositionGraph, RelationshipList, VerificationBindings, StatStrip, Chart and RecordTable. Page/server load functions invoke shared loaders; no SQL, joins, dependent-read sequencing or domain shaping in pages. Reuse session-bound Node executor and shell. Use current AgentSpec.prompt/execution_route/tool_names/verified_by. Activity uses invoke_agent spans and gateway calls attributed to this Agent's `subject_card_uid`; absence explains attribution instead of synthesizing activity. No historical components/layouts/types or fixture production fallback.
 
 Use committed main `8651b96fd`, the approved spec and current canvas. Historical `wyrd-server-ui` at `7bfc3a8a` supplies read/state/test evidence only. Current uncommitted trace changes are unrelated and must be preserved. Package components render typed props; portable loaders plan/shape; executor/host boundaries own credentials, authorized IO and action execution. Preserve tenant isolation, stable errors and server audit behavior. No speculative framework, test-only configuration or replacement selectors.
 
@@ -26,14 +26,14 @@ Paths under `src/mcp`, `src/query` or `tests/integration` described as server ow
 
 1. Compose finished components to the named canvas with only host/layout state in the app.
 2. Connect session-bound loaders and declared navigation/actions; preserve exact identities, range and URL/drawer state.
-3. Prove focused T6 through real production BFF/SDK/server, including empty, denied/error and cross-tenant cases.
+3. Prove focused T6 through a real browser and production BFF/SDK/server, including empty, denied/error and cross-tenant cases.
 4. Run the page visual checkpoint and wait for human acceptance before its dependent slice.
 
 ## Ordered Implementation Scenarios
 
 ### Scenario 1 — Page interaction and composition
 
-**Behavior.** The exact Agent version shows its registered Prompt, execution route, runtime tools, composition, bindings and attributable activity. Use current AgentSpec.prompt/execution_route/tool_names/verified_by. Activity uses invoke_agent spans and gateway calls attributed to this card_uid; absence explains attribution instead of synthesizing activity.
+**Behavior.** The exact Agent version shows its registered Prompt, execution route, runtime tools, composition, bindings and attributable activity. Use current AgentSpec.prompt/execution_route/tool_names/verified_by. Activity uses invoke_agent spans and gateway calls attributed to this Agent's `subject_card_uid`; absence explains attribution instead of synthesizing activity.
 
 **RED.** Add the task-focused page interaction regression; approved route composition is absent after REQ-032 deletion. Run this exact focused command (new Vitest title where applicable):
 
@@ -47,21 +47,21 @@ mise exec -- pnpm --dir crates/wyrd/wyrd-server/wyrd-ui test src/lib/ui-pages.te
 
 ### Scenario 2 — Real authenticated page journey
 
-**Behavior.** T6 drives sign-in/session-bound production BFF loads to real SDK/server data and back to the page; populated, empty, denied/error and cross-tenant cases remain truthful. Required actions and links preserve exact identity.
+**Behavior.** T6 launches a real browser against the running production BFF and Rust server, signs in through public auth, navigates to this task's route, performs its page workflow and inspects visible results backed by actual SDK/server reads. Cover populated, empty, denied/error and cross-tenant cases; required actions and links preserve exact identity. On time-aware pages, change the range and verify requested bounds, updated results and no stale overwrite; other pages exercise their actual filters/version/navigation controls. Imported handlers, jsdom, fixture page props and HTTP-client cookie simulation alone cannot satisfy REQ-034.
 
-**RED.** Add the focused page live journey against existing @wyrd/testing/Postgres and production BFF; fixture page props are insufficient. Run this exact focused command (new Vitest title where applicable):
+**RED.** Extend the focused page journey with TASK-011/012 real-browser support over repository-managed server/Postgres and the production BFF. The absent browser/page workflow must fail; fixture props or imported handlers cannot supply GREEN. Run this exact focused command (new Vitest title where applicable):
 
 ```bash
 mise exec -- scripts/postgres/with-test-postgres.sh -- bash -lc 'mise run db:migrate:inner && WYRD_UI_INTEGRATION=1 pnpm --dir crates/wyrd/wyrd-server/wyrd-ui test src/lib/ui-pages.integration.test.ts -t "^TASK-014: Real authenticated page journey$"'
 ```
 
-**GREEN.** Use existing auth and public server workflows, retaining structured errors and no credential serialization. Rerun this scenario and all earlier changed scenarios in this task. A missing prerequisite is a dependency, not permission to weaken the test.
+**GREEN.** Use existing auth and public server workflows plus the shared deployed-browser test support; navigate and interact through the actual app rather than importing its handlers. Keep real session/tenant boundaries, structured errors and no credential serialization. Rerun this scenario and all earlier changed scenarios in this task. A missing prerequisite is a dependency, not permission to weaken the test.
 
 **REFACTOR.** Simplify within the existing owner while these scenarios stay green. Private helpers, fixture structure and module layout remain implementation-owned; do not add an alternate transport, lifecycle or orchestration owner.
 
 ## Acceptance Criteria
 
-- Both focused scenarios pass and all page-specific requirements above are covered.
+- Both focused scenarios pass; scenario 2 records actual browser navigation, page interactions and resulting authorized server reads for REQ-034/AC-013. All page-specific requirements above are covered.
 - No page-level query/shaping code, mock fallback or tenant/credential leak; existing login/settings remain valid.
 - Human accepts this page on desktop/mobile in light/dark, including populated/empty/error, keyboard/focus, touch, long content and overflow.
 
@@ -73,7 +73,7 @@ Only relevant app route/layout/server load, host action/navigation adapters and 
 
 Run the exact scenario commands above. [Verification setup](../references/verification.md) defines the current test owners and repository-managed prerequisites. New Vitest titles are planned additions to the existing runner, not claims of existing tests. Select actual running tests; skipped/no-selected cases are not proof. Do not add dependencies or environment settings to make selection convenient.
 
-Run `mise exec -- pnpm --dir crates/wyrd/wyrd-server/wyrd-ui check` and `mise exec -- pnpm --dir crates/wyrd/wyrd-server/wyrd-ui build` after focused tests. Run `mise run codegen:check` when catalog/generated inputs change. Record T1 states, T2 actual requests/shape, T3 view validation/render, T4 actual built AppBridge HTML, T5 real authorized Node/server data and T6 only for assembled pages. Data-free primitives have no invented loader/live proof. Preserve per-component fixture provenance and interaction/action-host evidence.
+Run `mise exec -- pnpm --dir crates/wyrd/wyrd-server/wyrd-ui check` and `mise exec -- pnpm --dir crates/wyrd/wyrd-server/wyrd-ui build` after focused tests. Run `mise run codegen:check` when catalog/generated inputs change. Record T1 states, T2 actual requests/shape, T3 view validation/render, T4 actual built AppBridge HTML, T5 real authorized Node/server data and real-browser T6 for this assembled page. Reuse TASK-011/012 browser and deployed-process support; retain source/browser identity, sanitized screenshots/traces, actual requests and visible results. A skipped browser case is not a pass. Data-free primitives have no invented loader/live proof. Preserve per-component fixture provenance and interaction/action-host evidence.
 
 ### Human visual checkpoint
 

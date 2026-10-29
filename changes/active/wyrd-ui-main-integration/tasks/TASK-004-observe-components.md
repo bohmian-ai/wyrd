@@ -1,10 +1,10 @@
 # TASK-004 — Observe component family
 
-Spec: [revision 9, approved](../spec.md). Status: Proposed; platform prerequisite holds completion.  
-Dependencies: [TASK-003](TASK-003-shared-ui-foundation.md).  
+Spec: [revision 11, approved](../spec.md). Status: Proposed; platform prerequisite holds completion.
+Dependencies: [TASK-003](TASK-003-shared-ui-foundation.md).
 Mapped obligations: REQ-030, REQ-022, REQ-028, REQ-020, AC-008, AC-011, AC-010; all INV-001–INV-007 apply, with TASK-001-specific exclusions only in TASK-001.
 
-External dependency: REQ-023 service_card_uid ingest/schema/auth prerequisite for Service filters and Service-scoped variants. This task does not authorize implementation of that platform prerequisite. Contract-independent work may proceed, but fixtures/unavailable controls cannot close it.
+REQ-023 is delivered on main: Service filters use `workload_card_uid` and component breakdowns use `subject_card_uid` on `bifrost.*` tables.
 
 ## Outcome and Value
 
@@ -12,7 +12,7 @@ All reusable Observe components are complete and independently inspectable in th
 
 ## Owners, Scope, Consumers, and Prohibited Changes
 
-Own StatStrip, FacetRail, RecordTable, TraceWaterfall and RecordDetail. Reuse the completed Chart and primitives. Trace/list/detail/log/metric variants belong to these component contracts; shell controls and conventional pages do not. Service correlation variants wait for REQ-023.
+Own StatStrip, FacetRail, RecordTable, TraceWaterfall and RecordDetail. Reuse the completed Chart and primitives. Trace/list/detail/log/metric variants belong to these component contracts; shell controls and conventional pages do not. Service correlation variants use main's `workload_card_uid`.
 
 Use committed main `8651b96fd`, the approved spec and current canvas. Historical `wyrd-server-ui` at `7bfc3a8a` supplies read/state/test evidence only. Current uncommitted trace changes are unrelated and must be preserved. Package components render typed props; portable loaders plan/shape; executor/host boundaries own credentials, authorized IO and action execution. Preserve tenant isolation, stable errors and server audit behavior. No speculative framework, test-only configuration or replacement selectors.
 

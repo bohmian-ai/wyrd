@@ -250,7 +250,28 @@ export declare class NativeBifrostQueryStream {
    * incomplete, malformed, or transport-terminated streams.
    */
   next(): Promise<NativeQueryStep>
-  /** Drops the response stream so Rust transport cancellation propagates. */
+  /**
+   * Drains the whole stream into one bounded `{columns, rows, terminal}` JSON text.
+   *
+   * An omitted ceiling takes the bounded-result default, 1000 rows or 4 MiB.
+   * The projection is [`JsonResultBuilder`], the same owner the server's MCP
+   * `bifrost.query` tool builds through, so both surfaces return the same
+   * value for the same result. The stream is released when this returns.
+   *
+   * # Errors
+   *
+   * Returns a step carrying the stable Wyrd error for a failed, incomplete,
+   * or malformed stream and for a result past `max_rows` or `max_bytes`, and
+   * a napi error when the stream is already closed or [`Self::close`] stops
+   * the drain.
+   */
+  collect(maxRows?: number | undefined | null, maxBytes?: number | undefined | null): Promise<NativeQueryStep>
+  /**
+   * Drops the response stream so Rust transport cancellation propagates.
+   *
+   * A running [`Self::collect`] is signalled first, so it releases the
+   * stream lock instead of draining the rest of the result.
+   */
   close(): Promise<void>
   /**
    * Returns the result's authoritative schema as a schema-only IPC stream.
@@ -1093,6 +1114,17 @@ export declare class NativeWyrdState {
 }
 
 /**
+ * Builds one client that acts as a forwarded Rust-owned browser session.
+ *
+ * For a server-side web host only: `cookie` is the browser's single
+ * `wyrd_session_<tenant>=<value>` cookie pair and `origin` the public origin
+ * it was issued at. Construction performs no IO and consults no ambient
+ * credential; a malformed session or server URL is returned as catalog
+ * metadata.
+ */
+export declare function connectBrowserSessionClient(serverUrl: string, cookie: string, origin: string): NativeWyrdClientResult
+
+/**
  * Builds one client without performing IO.
  *
  * Omitted arguments resolve through `client_from_options`: the environment,
@@ -1256,7 +1288,10 @@ export interface NativeQueryRequest {
 export interface NativeQueryStep {
   /** Complete Arrow IPC stream containing exactly one record batch. */
   ipc?: Buffer
-  /** Serialized validated terminal, present only on the final step. */
+  /**
+   * Serialized validated terminal, present only on the final step; from
+   * `collect`, the whole bounded `{columns, rows, terminal}` result.
+   */
   terminalJson?: string
   /** Stable SDK error code for a failed native step. */
   errorCode?: string

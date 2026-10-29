@@ -29,7 +29,6 @@ use tokio::sync::Mutex as AsyncMutex;
 use tokio::sync::watch;
 use wyrd_queue::QueueConfig;
 use wyrd_queue::variant::WyrdJsonEncoderFactory;
-#[cfg(feature = "internal")]
 use wyrd_queue::{BatchSink, ClientByteGuard, DurableBatchAck, SealedBatch, SinkError};
 use wyrd_spec::error::WyrdError;
 use wyrd_spec::request_id::RequestId;
@@ -150,7 +149,9 @@ impl Bifrost {
     /// Completes any credential exchange `client` requires, then dials the
     /// ingest channel; both planes share `client`'s credential, connection
     /// pools, and token cache. No authentication probe is added, so a later
-    /// operation may still be refused.
+    /// operation may still be refused. A forwarded browser session reaches
+    /// only the `/v1` HTTP surface, so its client is query-only: it dials no
+    /// ingest channel and refuses every write.
     ///
     /// # Arguments
     /// * `client` - The client both planes act as, such as a delegated client
@@ -175,6 +176,9 @@ impl Bifrost {
         let BifrostOptions { table, queue } = options;
         queue.validate().map_err(BifrostClientError::Queue)?;
         let client = client.connected().await?;
+        if client.is_browser_session() {
+            return Ok(Self::read_only(&client));
+        }
         let bifrost = Self::assemble(&client, None, queue).await?;
         if let Some(table) = table {
             bifrost.bind_table(table).await?;
@@ -202,18 +206,7 @@ impl Bifrost {
         sink: Arc<dyn BatchSink<ClientByteGuard>>,
         config: QueueConfig,
     ) -> Self {
-        Self {
-            query: QueryClient::new(client),
-            writer: Arc::new(WriterPool::new(
-                ClientScope::from_client(client),
-                sink,
-                config,
-            )),
-            active: Mutex::new(table),
-            described: Mutex::new(HashMap::new()),
-            describe_gate: AsyncMutex::new(()),
-            pending_records: Arc::new(watch::Sender::new(0)),
-        }
+        Self::from_sink(client, table, sink, config)
     }
 
     /// Build a read-only client that never dials the ingest channel.
@@ -228,12 +221,44 @@ impl Bifrost {
     #[must_use]
     #[cfg(feature = "internal")]
     pub fn query_only(client: &WyrdClient) -> Self {
-        Self::with_sink(
+        Self::read_only(client)
+    }
+
+    /// Assemble a client whose writes reach [`QueryOnlySink`]; no IO.
+    ///
+    /// The one query-only shape, shared by [`Self::query_only`] and the
+    /// browser-session branch of [`Self::connect_with`].
+    fn read_only(client: &WyrdClient) -> Self {
+        Self::from_sink(
             client,
             None,
             Arc::new(QueryOnlySink),
             QueueConfig::default(),
         )
+    }
+
+    /// Assemble both planes over `client` with `sink` behind the producer.
+    ///
+    /// The single constructor every connect path uses; it performs no IO and
+    /// does not validate `config`.
+    fn from_sink(
+        client: &WyrdClient,
+        table: Option<TableConfig>,
+        sink: Arc<dyn BatchSink<ClientByteGuard>>,
+        config: QueueConfig,
+    ) -> Self {
+        Self {
+            query: QueryClient::new(client),
+            writer: Arc::new(WriterPool::new(
+                ClientScope::from_client(client),
+                sink,
+                config,
+            )),
+            active: Mutex::new(table),
+            described: Mutex::new(HashMap::new()),
+            describe_gate: AsyncMutex::new(()),
+            pending_records: Arc::new(watch::Sender::new(0)),
+        }
     }
 
     /// Dial the ingest channel and assemble both planes over one client.
@@ -257,20 +282,14 @@ impl Bifrost {
             .map_err(BifrostClientError::from)?;
         let deadline_ms = u64::try_from(transport.send_deadline().as_millis()).unwrap_or(u64::MAX);
         config.flush_timeout_ms = config.flush_timeout_ms.max(deadline_ms);
-        Ok(Self {
-            query: QueryClient::new(client),
-            writer: Arc::new(WriterPool::new(
-                ClientScope::from_client(client),
-                Arc::new(BifrostIngestSink {
-                    transport: Arc::new(transport),
-                }),
-                config,
-            )),
-            active: Mutex::new(table),
-            described: Mutex::new(HashMap::new()),
-            describe_gate: AsyncMutex::new(()),
-            pending_records: Arc::new(watch::Sender::new(0)),
-        })
+        Ok(Self::from_sink(
+            client,
+            table,
+            Arc::new(BifrostIngestSink {
+                transport: Arc::new(transport),
+            }),
+            config,
+        ))
     }
 
     // ── table lifecycle ────────────────────────────────────────────────────
@@ -1529,15 +1548,14 @@ fn client_from_options_in(
     WyrdClient::with_config(config).map_err(BifrostClientError::from)
 }
 
-/// Ingest sink behind [`Bifrost::query_only`]: refuses every batch.
+/// Ingest sink behind a query-only client: refuses every batch.
 ///
-/// A read-only client has no ingest channel, so a write that reaches the sink
-/// settles terminally with a stable validation error rather than dialling a
-/// transport or reporting success.
-#[cfg(feature = "internal")]
+/// A read-only client, from [`Bifrost::query_only`] or a browser session, has
+/// no ingest channel, so a write that reaches the sink settles terminally with
+/// a stable validation error rather than dialling a transport or reporting
+/// success.
 struct QueryOnlySink;
 
-#[cfg(feature = "internal")]
 #[async_trait::async_trait]
 impl BatchSink<ClientByteGuard> for QueryOnlySink {
     /// Refuse `batch` without sending it.
@@ -1551,8 +1569,7 @@ impl BatchSink<ClientByteGuard> for QueryOnlySink {
     ) -> Result<DurableBatchAck, SinkError> {
         Err(wyrd_queue::SinkError::Terminal(
             wyrd_spec::error::WyrdError::Validation {
-                message: "this Bifrost client was built with Bifrost::query_only and cannot write"
-                    .to_owned(),
+                message: "this Bifrost client is query-only and cannot write".to_owned(),
                 details: serde_json::json!({ "table": batch.table }),
             },
         ))

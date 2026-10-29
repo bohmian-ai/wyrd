@@ -165,12 +165,27 @@ pub struct CardObjects {
 pub struct ObjectInventory<'s> {
     /// The server whose outbox and query plane the inventory uses.
     state: &'s AppState,
+    /// The tenant SYSTEM principal reads run as, when the caller already
+    /// holds it; `None` reads it from the tenant's registry per read.
+    system: Option<PrincipalId>,
 }
 
 impl<'s> ObjectInventory<'s> {
     /// The inventory of `state`.
     pub const fn new(state: &'s AppState) -> Self {
-        Self { state }
+        Self {
+            state,
+            system: None,
+        }
+    }
+
+    /// Read as `system`, the tenant SYSTEM principal work Wyrd executes
+    /// already carries, so a read adds no registry lookup; `None` keeps the
+    /// per-read lookup.
+    #[must_use]
+    pub const fn executed_by(mut self, system: Option<PrincipalId>) -> Self {
+        self.system = system;
+        self
     }
 
     /// Longest an inventory write or read waits: half the request timeout,
@@ -294,7 +309,9 @@ impl<'s> ObjectInventory<'s> {
     /// Read every inventory row of `tenant` matching SQL `predicate`.
     ///
     /// The read runs under the tenant's SYSTEM principal granted only this
-    /// table. A table the tenant never wrote reads as no rows.
+    /// table: the one [`Self::executed_by`] supplied, else the one the
+    /// tenant's registry names. A table the tenant never wrote reads as no
+    /// rows.
     ///
     /// # Errors
     /// Returns `WYRD_VALA_503_QUERY_VISIBILITY_UNAVAILABLE` when the SYSTEM
@@ -309,13 +326,16 @@ impl<'s> ObjectInventory<'s> {
             tracing::warn!(%error, "the object inventory cannot be read");
             WyrdError::from(BifrostError::QueryVisibilityUnavailable)
         };
-        let system = {
-            let mut conn = self.state.registry_tenant_conn(tenant).await?;
-            let system = system_principal_id(&mut conn)
-                .await
-                .map_err(|error| unavailable(&error))?;
-            conn.commit().await.map_err(|error| unavailable(&error))?;
-            system.map(PrincipalId::new)
+        let system = match self.system {
+            Some(system) => Some(system),
+            None => {
+                let mut conn = self.state.registry_tenant_conn(tenant).await?;
+                let system = system_principal_id(&mut conn)
+                    .await
+                    .map_err(|error| unavailable(&error))?;
+                conn.commit().await.map_err(|error| unavailable(&error))?;
+                system.map(PrincipalId::new)
+            }
         };
         let table = [TableRef::new(BifrostNamespace::Storage, ObjectsTable::NAME)];
         let read = SystemReadAuthority::resolve(self.state, tenant, system, &table)

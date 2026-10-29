@@ -1037,6 +1037,175 @@ async fn variant_layouts_survive_memory_stage_publication_and_restart() {
     server.shutdown().await.expect("the server drains cleanly");
 }
 
+/// Reads `value` and `v ->> 'a'` of every row of `table`, ordered by value.
+///
+/// # Errors
+///
+/// Returns the refusal when the query does not start, stream, or end in
+/// success.
+async fn read_scalars(
+    client: &wyrd_client::WyrdClient,
+    table: &str,
+) -> Result<Vec<(i64, Option<String>)>, String> {
+    use arrow::array::{Array as _, AsArray as _};
+
+    let sql = format!("SELECT value, v ->> 'a' AS a FROM {table} ORDER BY value");
+    let mut stream = wyrd_client::Bifrost::query_only(client)
+        .query(&wyrd_spec::vala::api::BifrostQueryRequest {
+            sql,
+            deadline_ms: Some(120_000),
+            params: Vec::new(),
+        })
+        .await
+        .map_err(|error| error.to_string())?;
+    let mut rows = Vec::new();
+    while let Some(batch) = stream
+        .next_batch()
+        .await
+        .map_err(|error| error.to_string())?
+    {
+        let values = batch
+            .column(0)
+            .as_primitive::<arrow::datatypes::Int64Type>();
+        let text = arrow::compute::cast(batch.column(1), &arrow::datatypes::DataType::Utf8)
+            .map_err(|error| error.to_string())?;
+        let text = text.as_string::<i32>();
+        rows.extend((0..batch.num_rows()).map(|row| {
+            (
+                values.value(row),
+                text.is_valid(row).then(|| text.value(row).to_owned()),
+            )
+        }));
+    }
+    match stream.terminal().map(|terminal| terminal.outcome) {
+        Some(wyrd_spec::vala::api::QueryTerminalOutcome::Success) => Ok(rows),
+        outcome => Err(format!("the read ended {outcome:?}")),
+    }
+}
+
+/// The `v ->> 'a'` text of each acknowledged `(value, document)` row.
+fn scalars_of(rows: &[(i64, String)]) -> Vec<(i64, Option<String>)> {
+    rows.iter()
+        .map(|(value, document)| {
+            let document: serde_json::Value =
+                serde_json::from_str(document).expect("the cohort is JSON");
+            let a = match &document["a"] {
+                serde_json::Value::Null => None,
+                serde_json::Value::String(text) => Some(text.clone()),
+                other => Some(other.to_string()),
+            };
+            (*value, a)
+        })
+        .collect()
+}
+
+/// A scalar Variant read answers the same from shredded memory, staged runs,
+/// and publication, and only for the tenant that owns the table.
+///
+/// A first cohort publishes canonically and teaches the process a layout,
+/// so a second cohort is retained shredded. `v ->> 'a'`, which the leader
+/// pushes to the Scribe scan as its projection, returns each acknowledged
+/// row's `a` exactly while the second cohort is in memory, after it stages,
+/// and after it publishes. A neighbouring tenant reading the same table name
+/// is refused rather than served another tenant's rows.
+///
+/// # Panics
+///
+/// Panics when the server cannot start, an append, freeze, read, or
+/// publication fails, a read differs from the acknowledged documents, or the
+/// neighbour is answered.
+#[tokio::test]
+#[ignore = "requires Postgres and object storage"]
+async fn shredded_scalar_reads_match_in_memory_staged_and_published() {
+    use arrow::datatypes::{DataType, Field};
+    use vala_bifrost_redux::catalog::{CreateTableRequest, TableRef};
+
+    let data_root = tempfile::tempdir().expect("durable Bifrost data root");
+    let server = WyrdTestServer::builder()
+        .with_durable_bifrost_data_root(data_root.path().to_path_buf())
+        .start_bound()
+        .await
+        .expect("the pod starts on a durable data root");
+    let tenant = server.data_tenant_id();
+    let name = unique_table("shredded_scalars");
+    let table_ref = TableRef::new(BifrostNamespace::Datasets, &name);
+    server
+        .create_bifrost_table_for_test(CreateTableRequest {
+            table: table_ref.clone(),
+            user_fields: vec![
+                Field::new("value", DataType::Int64, false),
+                wyrd_types::variant::variant_field("v", true),
+            ],
+            tenant,
+            attribution: wyrd_spec::auth::Attribution::unresolved(),
+            physical_layout: None,
+        })
+        .await
+        .expect("the catalog registers the Variant table");
+    let table = format!("{}.{name}", BifrostNamespace::Datasets.as_str());
+    let client = tenant_client(&server, tenant).await;
+    let scribe = server.bifrost_scribe().expect("the pod owns a Scribe");
+
+    let mut expected = variant_cohort(0);
+    append_documents(&client, &table, &expected).await;
+    server
+        .flush_bifrost()
+        .await
+        .expect("the cold cohort publishes");
+    let shredded = variant_cohort(40);
+    append_documents(&client, &table, &shredded).await;
+    expected.extend(shredded);
+    assert_eq!(
+        scribe
+            .writable_variant_layouts_for_test(tenant, &table_ref)
+            .expect("writable layouts are inspectable"),
+        [true],
+        "the second cohort is retained shredded"
+    );
+    let answer = scalars_of(&expected);
+    assert_eq!(
+        read_scalars(&client, &table).await.expect("memory reads"),
+        answer,
+        "shredded memory"
+    );
+    scribe
+        .flush_writable_for_test()
+        .await
+        .expect("every writable bucket freezes");
+    await_persistence_drained(&scribe).await;
+    assert_eq!(
+        read_scalars(&client, &table)
+            .await
+            .expect("staged runs read"),
+        answer,
+        "staged runs"
+    );
+    server
+        .flush_bifrost()
+        .await
+        .expect("the staged cohort publishes");
+    assert_eq!(
+        read_scalars(&client, &table)
+            .await
+            .expect("publication reads"),
+        answer,
+        "publication"
+    );
+
+    let neighbour_tenant = server
+        .seed_tenant("shredded-scalars-neighbour")
+        .await
+        .expect("the neighbouring tenant is seeded");
+    let neighbour = tenant_client(&server, neighbour_tenant).await;
+    let refused = read_scalars(&neighbour, &table).await;
+    assert!(
+        refused.is_err(),
+        "another tenant's table is refused, got {refused:?}"
+    );
+    drop(scribe);
+    server.shutdown().await.expect("the server drains cleanly");
+}
+
 /// The benchmark control moves rows only when the platform administrator asks.
 ///
 /// A cohort stays in the memtable until a stage request moves it into staged

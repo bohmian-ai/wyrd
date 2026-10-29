@@ -820,8 +820,7 @@ impl LiveUnionBoundary {
 }
 
 impl datafusion::physical_optimizer::PhysicalOptimizerRule for LiveUnionBoundary {
-    /// Pushes a projection above a union holding a live leaf into each of
-    /// its children, then wraps every non-live sibling of each such union,
+    /// Wraps every non-live sibling of each union holding a live leaf,
     /// preserving the sibling's output ordering.
     ///
     /// # Errors
@@ -836,43 +835,6 @@ impl datafusion::physical_optimizer::PhysicalOptimizerRule for LiveUnionBoundary
         let holds_live = |plan: &Arc<dyn ExecutionPlan>| {
             plan.exists(|node| Ok(node.downcast_ref::<LiveScribeExec>().is_some()))
         };
-        // `UnionExec` passes a projection down only when it narrows the
-        // schema, so the expressions of a projection that reads every closure
-        // column would stay on the leader and every Scribe would return whole
-        // columns. Pushed into each child, a published scan and a live leaf
-        // absorb it as each would without the union.
-        let plan = plan
-            .transform_up(|node| {
-                let Some(projection) = node.downcast_ref::<ProjectionExec>() else {
-                    return Ok(Transformed::no(node));
-                };
-                let Some(union) = projection
-                    .input()
-                    .downcast_ref::<datafusion::physical_plan::union::UnionExec>()
-                else {
-                    return Ok(Transformed::no(node));
-                };
-                if !holds_live(projection.input())? {
-                    return Ok(Transformed::no(node));
-                }
-                let children = union
-                    .children()
-                    .into_iter()
-                    .map(|child| {
-                        let projected = ProjectionExec::try_new(
-                            projection.expr().iter().cloned(),
-                            Arc::clone(child),
-                        )?;
-                        Ok(child
-                            .try_swapping_with_projection(&projected)?
-                            .unwrap_or_else(|| Arc::new(projected)))
-                    })
-                    .collect::<DataFusionResult<Vec<_>>>()?;
-                Ok(Transformed::yes(
-                    datafusion::physical_plan::union::UnionExec::try_new(children)?,
-                ))
-            })?
-            .data;
         plan.transform_up(|node| {
             if node
                 .downcast_ref::<datafusion::physical_plan::union::UnionExec>()
@@ -918,6 +880,87 @@ impl datafusion::physical_optimizer::PhysicalOptimizerRule for LiveUnionBoundary
     /// Names the rule in `DataFusion` optimizer traces.
     fn name(&self) -> &'static str {
         "bifrost_live_union_boundary"
+    }
+
+    /// Asks `DataFusion` to verify the rewrite preserved the plan schema.
+    fn schema_check(&self) -> bool {
+        true
+    }
+}
+
+/// Physical optimizer rule that pushes a projection above a union holding a
+/// live leaf into each of the union's children.
+///
+/// `UnionExec` passes a projection down only when it narrows the schema, so
+/// a projection that reads every closure column — `SELECT value, v ->> 'a'`
+/// over a `[value, v]` closure — would stay on the leader and every Scribe
+/// would return whole columns. Pushed into each child, a published scan and
+/// a live leaf absorb it as each would without the union, so the live
+/// fragment carries the expressions and Scribe evaluates them over physical
+/// leaves. Every Oracle session starts from
+/// [`super::session::OracleSessionTemplate`], which installs it, so local and
+/// distributed plans bind the same fragment; it is a no-op for plans without
+/// a live leaf.
+#[derive(Debug)]
+pub(super) struct LiveUnionProjection;
+
+impl datafusion::physical_optimizer::PhysicalOptimizerRule for LiveUnionProjection {
+    /// Replaces each projection over a union holding a live leaf with the
+    /// union of that projection over each child.
+    ///
+    /// # Errors
+    ///
+    /// Returns a `DataFusion` error when a child or the union cannot be
+    /// rebuilt under the projection.
+    fn optimize(
+        &self,
+        plan: Arc<dyn ExecutionPlan>,
+        _config: &datafusion::config::ConfigOptions,
+    ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
+        let holds_live = |plan: &Arc<dyn ExecutionPlan>| {
+            plan.exists(|node| Ok(node.downcast_ref::<LiveScribeExec>().is_some()))
+        };
+        // `UnionExec` passes a projection down only when it narrows the
+        // schema, so the expressions of a projection that reads every closure
+        // column would stay on the leader and every Scribe would return whole
+        // columns. Pushed into each child, a published scan and a live leaf
+        // absorb it as each would without the union.
+        plan.transform_up(|node| {
+            let Some(projection) = node.downcast_ref::<ProjectionExec>() else {
+                return Ok(Transformed::no(node));
+            };
+            let Some(union) = projection
+                .input()
+                .downcast_ref::<datafusion::physical_plan::union::UnionExec>()
+            else {
+                return Ok(Transformed::no(node));
+            };
+            if !holds_live(projection.input())? {
+                return Ok(Transformed::no(node));
+            }
+            let children = union
+                .children()
+                .into_iter()
+                .map(|child| {
+                    let projected = ProjectionExec::try_new(
+                        projection.expr().iter().cloned(),
+                        Arc::clone(child),
+                    )?;
+                    Ok(child
+                        .try_swapping_with_projection(&projected)?
+                        .unwrap_or_else(|| Arc::new(projected)))
+                })
+                .collect::<DataFusionResult<Vec<_>>>()?;
+            Ok(Transformed::yes(
+                datafusion::physical_plan::union::UnionExec::try_new(children)?,
+            ))
+        })
+        .map(|transformed| transformed.data)
+    }
+
+    /// Names the rule in `DataFusion` optimizer traces.
+    fn name(&self) -> &'static str {
+        "bifrost_live_union_projection"
     }
 
     /// Asks `DataFusion` to verify the rewrite preserved the plan schema.
@@ -1323,6 +1366,84 @@ mod tests {
                 Some(PhysicalPlanType::Filter(_))
             ),
             "the fragment ships the filter above its placeholder"
+        );
+    }
+
+    /// A projection above a union that does not narrow its schema still
+    /// reaches the live leaf, and every Oracle session carries the rule.
+    ///
+    /// `v + 1 AS w` over `[published, live]` keeps one column, so the
+    /// union's own pushdown would leave it on the leader. The rule replaces
+    /// it with the union of the projection over each child: the live leaf
+    /// absorbs it and its fragment signs `w`.
+    ///
+    /// # Panics
+    /// Panics when a fixture cannot be built, the rule leaves the projection
+    /// above the union, the live leaf does not absorb it, or the session
+    /// template lacks the rule.
+    #[test]
+    fn union_projection_reaches_the_live_fragment() {
+        use datafusion::datasource::memory::MemorySourceConfig;
+        use datafusion::physical_expr::expressions::{BinaryExpr, Column, Literal};
+        use datafusion::physical_optimizer::PhysicalOptimizerRule as _;
+        use datafusion::physical_plan::union::UnionExec;
+
+        let schema = Arc::new(Schema::new(vec![Field::new("v", DataType::Int64, false)]));
+        let published = MemorySourceConfig::try_new_exec(&[vec![]], Arc::clone(&schema), None)
+            .expect("the published scan builds");
+        let live = Arc::new(LiveScribeExec::new(
+            crate::oracle::exec::tests::one_live_route(wyrd_spec::DataTenantId::new_v7()),
+            crate::catalog::TimeAxis::new(
+                crate::oracle::exec::tests::FIXTURE_TIME_COLUMN,
+                crate::catalog::TimeGranularity::Hour,
+            ),
+            "f".repeat(64),
+            vec!["v".to_owned()],
+            Arc::clone(&schema),
+            1,
+        ));
+        let plus_one: Arc<dyn PhysicalExpr> = Arc::new(BinaryExpr::new(
+            Arc::new(Column::new("v", 0)),
+            datafusion::logical_expr::Operator::Plus,
+            Arc::new(Literal::new(1_i64.into())),
+        ));
+        let plan: Arc<dyn ExecutionPlan> = Arc::new(
+            ProjectionExec::try_new(
+                [datafusion::physical_expr::projection::ProjectionExpr::new(
+                    plus_one,
+                    "w".to_owned(),
+                )],
+                UnionExec::try_new(vec![published, live]).expect("the union plans"),
+            )
+            .expect("the projection plans"),
+        );
+
+        let rewritten = LiveUnionProjection
+            .optimize(plan, &ConfigOptions::default())
+            .expect("the rule applies");
+        assert!(
+            rewritten.downcast_ref::<UnionExec>().is_some(),
+            "the projection moved below the union"
+        );
+        let live = rewritten.children()[1]
+            .downcast_ref::<LiveScribeExec>()
+            .expect("the live leaf absorbed the projection");
+        let (fragment, _) = live
+            .fragment(&live.routes.routes[0], 0)
+            .expect("the fragment encodes");
+        let aliases = fragment.assignments[0]
+            .projection
+            .iter()
+            .map(|projected| projected.alias.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(aliases, ["w"], "the fragment signs the pushed expression");
+        assert!(
+            super::super::session::OracleSessionTemplate::shared()
+                .session(datafusion::execution::context::SessionConfig::new())
+                .physical_optimizers()
+                .iter()
+                .any(|rule| rule.name() == "bifrost_live_union_projection"),
+            "every Oracle session pushes projections to live leaves"
         );
     }
 

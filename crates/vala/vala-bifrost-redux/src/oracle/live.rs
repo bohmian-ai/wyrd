@@ -1119,7 +1119,7 @@ fn live_error(stage: &str, error: &DispatchError) -> DataFusionError {
 
 /// Closed reason one live frame sequence failed validation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
-enum LiveFrameError {
+pub(super) enum LiveFrameError {
     /// A frame arrived after the footer or in-process completion.
     #[error("frame after footer")]
     AfterFooter,
@@ -1147,7 +1147,7 @@ enum LiveFrameError {
 /// already Arrow: their rows and native bytes are counted and they are
 /// released as they are, and the in-process completion closes the fragment
 /// only when its fingerprint and totals match, as a footer does.
-struct LiveFrameDecoder {
+pub(super) struct LiveFrameDecoder {
     /// Fingerprint the ticket was minted over and the footer must name.
     plan_fingerprint: String,
     /// Whether the leading schema frame arrived.
@@ -1168,7 +1168,7 @@ struct LiveFrameDecoder {
 impl LiveFrameDecoder {
     /// Starts validating one fragment signed under `plan_fingerprint`, folding
     /// its validated scan evidence into `scan_metrics`.
-    fn new(plan_fingerprint: String, scan_metrics: Arc<RemoteScanMetrics>) -> Self {
+    pub(super) fn new(plan_fingerprint: String, scan_metrics: Arc<RemoteScanMetrics>) -> Self {
         Self {
             plan_fingerprint,
             schema_seen: false,
@@ -1204,7 +1204,10 @@ impl LiveFrameDecoder {
     /// late schema, a batch that is not one Arrow IPC batch, counter overflow,
     /// or a footer or in-process completion whose fragment, digest, byte
     /// count, row count, or completion flag contradicts what was delivered.
-    fn accept(&mut self, frame: LiveFrame) -> Result<Option<RecordBatch>, LiveFrameError> {
+    pub(super) fn accept(
+        &mut self,
+        frame: LiveFrame,
+    ) -> Result<Option<RecordBatch>, LiveFrameError> {
         if self.completed {
             return Err(LiveFrameError::AfterFooter);
         }
@@ -2023,13 +2026,14 @@ mod tests {
 
     /// A live read over a staged run reports its staged bytes to the query's
     /// scan stats, over both the remote footer and the in-process completion,
-    /// while a memtable-only read reports none.
+    /// with their scanned rows; a measured memory read reports its own bytes
+    /// and rows, and an unmeasured one reports none.
     ///
     /// The Scribe scans staged runs through its own hot-Parquet leaf and
     /// reports the bytes on the fragment's completion. The leader's collector
     /// walks the plan holding the live leaf, so each validated completion must
-    /// reach it exactly once; a read whose Scribe scanned no Parquet leaves
-    /// physical bytes absent rather than zero.
+    /// reach it exactly once; a read whose Scribe measured nothing leaves
+    /// bytes and rows absent rather than zero.
     ///
     /// # Panics
     /// Panics when a fixture batch or frame cannot be built, a valid frame is
@@ -2067,6 +2071,7 @@ mod tests {
         };
         let staged = |bytes| WorkerScanStats {
             bytes_scanned: Some(bytes),
+            rows_scanned: Some(3),
             files_scanned: 1,
             partitions_scanned: 1,
             ..WorkerScanStats::default()
@@ -2100,9 +2105,34 @@ mod tests {
         let mut stats = crate::oracle::exec::OracleQueryScanStats::from_plan(&live);
         stats.finalize();
         assert_eq!(
-            (stats.physical_bytes_scanned, stats.files_scanned),
-            (Some(5120), 2),
-            "each staged fragment's bytes and file reach the query once"
+            (
+                stats.physical_bytes_scanned,
+                stats.physical_rows_scanned,
+                stats.files_scanned
+            ),
+            (Some(5120), Some(6), 2),
+            "each staged fragment's bytes, rows and file reach the query once"
+        );
+
+        let measured = leaf();
+        let mut decoder =
+            LiveFrameDecoder::new(fingerprint.clone(), Arc::clone(measured.scan_metrics()));
+        decoder
+            .accept(NativeOutputTally::default().complete(
+                fingerprint.clone(),
+                WorkerScanStats {
+                    bytes_scanned: Some(48),
+                    rows_scanned: Some(6),
+                    ..WorkerScanStats::default()
+                },
+            ))
+            .expect("measured memory completion validates");
+        let mut stats = crate::oracle::exec::OracleQueryScanStats::from_plan(&measured);
+        stats.finalize();
+        assert_eq!(
+            (stats.physical_bytes_scanned, stats.physical_rows_scanned),
+            (Some(48), Some(6)),
+            "a measured memory read reports its scan work"
         );
 
         let memtable = leaf();
@@ -2114,8 +2144,9 @@ mod tests {
         let mut stats = crate::oracle::exec::OracleQueryScanStats::from_plan(&memtable);
         stats.finalize();
         assert_eq!(
-            stats.physical_bytes_scanned, None,
-            "a memtable read scans no Parquet"
+            (stats.physical_bytes_scanned, stats.physical_rows_scanned),
+            (None, None),
+            "an unmeasured memtable read reports no scan facts"
         );
     }
 }

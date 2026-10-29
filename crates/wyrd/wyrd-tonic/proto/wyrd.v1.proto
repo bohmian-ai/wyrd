@@ -234,8 +234,9 @@ message WorkerFooter {
   WorkerScanStats scan_stats = 7;
 }
 message WorkerScanStats {
-  // Absent when the follower's sources report no physical IO; absent is not
-  // the same as zero, so the leader must not substitute one for the other.
+  // Parquet bytes read plus Scribe memory scan bytes (distinct Arrow buffers
+  // a memory read accessed). Absent when no source measured them; absent is
+  // not the same as zero, so the leader must not substitute one for the other.
   optional uint64 bytes_scanned = 1;
   uint64 files_scanned = 2; uint64 partitions_scanned = 3;
   // Row groups retained and excluded by closed-predicate pruning on the
@@ -245,6 +246,8 @@ message WorkerScanStats {
   // so these can only be observed where the physical read happened.
   uint64 row_groups_scanned = 4; uint64 row_groups_pruned = 5;
   uint64 row_groups_pruned_bloom = 6; uint64 rows_pruned_page_index = 7;
+  // Input rows the follower's scans examined; absent when unmeasured.
+  optional uint64 rows_scanned = 8;
 }
 
 message InsertBatchRequest {

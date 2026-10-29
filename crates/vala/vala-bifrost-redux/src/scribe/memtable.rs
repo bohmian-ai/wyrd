@@ -974,7 +974,13 @@ impl Memtable {
     ) -> Result<Vec<ReadableBatch>, ScribeError> {
         let mut batches = Vec::new();
         for source in self.readable_sources(tenant, table, partitions)? {
-            source.project(required, None, None, &mut batches)?;
+            source.project(
+                required,
+                None,
+                None,
+                &mut batches,
+                &mut MemoryScan::default(),
+            )?;
         }
         Ok(batches)
     }
@@ -1998,8 +2004,9 @@ impl LiveCapture {
         let mut batches =
             Vec::with_capacity(in_range.iter().map(|source| source.batch_count()).sum());
         let mut charges = Vec::with_capacity(in_range.len());
+        let mut scanned = MemoryScan::default();
         for source in in_range {
-            source.project(required, pruning, live, &mut batches)?;
+            source.project(required, pruning, live, &mut batches, &mut scanned)?;
             charges.push(Arc::clone(&source.charge));
         }
         let runs = self
@@ -2012,6 +2019,7 @@ impl LiveCapture {
         Ok(CapturedRead {
             batches,
             charges,
+            scanned,
             runs,
             lease: self.staged.clone(),
         })
@@ -2087,10 +2095,130 @@ pub(crate) struct CapturedRead {
     /// Accounting owners of `batches`, which keep their bytes charged to the
     /// Scribe root while the read holds them.
     pub(crate) charges: Vec<Arc<crate::scribe::memory::RetainedArrowCharge>>,
+    /// The memory scan work producing `batches`, including batches the
+    /// read's filter emptied.
+    pub(crate) scanned: MemoryScan,
     /// Staged runs with their recorded size and footer, in merge order.
     pub(crate) runs: Vec<crate::scribe::hot_source::StagedRunRead>,
     /// Lease keeping `runs` on disk while the read holds it.
     pub(crate) lease: Option<Arc<crate::scribe::hot_source::StagedSourceLease>>,
+}
+
+/// Memory scan work of one live read: the rows its kept memory batches held
+/// and the distinct Arrow buffer bytes its filter and expressions read.
+///
+/// Counted per batch after bounds pruning and before row filtering, so a
+/// batch the bounds exclude contributes nothing and a batch the filter
+/// empties still counts. A shredded scalar read counts only the leaves its
+/// functions declare (see [`BufferTally`]). This is in-memory scan work, not
+/// Parquet IO, retained heap, a sizing estimate, returned rows or transport
+/// bytes.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct MemoryScan {
+    /// Rows of the kept batches, before the read's filter.
+    pub rows: u64,
+    /// Distinct Arrow buffer bytes the read's expressions access.
+    pub bytes: u64,
+}
+
+/// Distinct Arrow buffer bytes one batch's read touches.
+///
+/// Buffers are deduplicated by address within the batch, so two expressions
+/// over one column count it once. A column is counted whole unless a scalar
+/// function declares, through `required_input_fields`, the struct paths it
+/// reads; then only those subtrees and their ancestors' validity count, so a
+/// Variant path read excludes unused shredded siblings.
+#[derive(Default)]
+struct BufferTally {
+    /// Addresses of the buffers already counted.
+    seen: std::collections::HashSet<usize>,
+    /// Bytes of the counted buffers.
+    bytes: u64,
+}
+
+impl BufferTally {
+    /// Counts `buffer` once.
+    fn buffer(&mut self, buffer: &arrow::buffer::Buffer) {
+        if self.seen.insert(buffer.as_ptr() as usize) {
+            self.bytes = self.bytes.saturating_add(buffer.len() as u64);
+        }
+    }
+
+    /// Counts every buffer of `data` and its children.
+    fn data(&mut self, data: &arrow::array::ArrayData) {
+        for buffer in data.buffers() {
+            self.buffer(buffer);
+        }
+        if let Some(nulls) = data.nulls() {
+            self.buffer(nulls.buffer());
+        }
+        for child in data.child_data() {
+            self.data(child);
+        }
+    }
+
+    /// Counts the subtree `path` selects in `data`, with each struct
+    /// ancestor's validity; a path through a non-struct counts it whole.
+    fn path(&mut self, data: &arrow::array::ArrayData, path: &[String]) {
+        let Some((name, rest)) = path.split_first() else {
+            return self.data(data);
+        };
+        let arrow::datatypes::DataType::Struct(fields) = data.data_type() else {
+            return self.data(data);
+        };
+        if let Some(nulls) = data.nulls() {
+            self.buffer(nulls.buffer());
+        }
+        if let Some(child) = fields
+            .iter()
+            .position(|field| field.name() == name)
+            .and_then(|at| data.child_data().get(at))
+        {
+            self.path(child, rest);
+        }
+    }
+
+    /// Counts the columns of `batch` that `expr` reads.
+    fn expr(
+        &mut self,
+        expr: &Arc<dyn datafusion::physical_expr::PhysicalExpr>,
+        batch: &RecordBatch,
+    ) {
+        use datafusion::physical_expr::ScalarFunctionExpr;
+        use datafusion::physical_expr::expressions::Column;
+        let column = |expr: &Arc<dyn datafusion::physical_expr::PhysicalExpr>| {
+            expr.downcast_ref::<Column>()
+                .and_then(|column| batch.columns().get(column.index()))
+                .map(arrow::array::Array::to_data)
+        };
+        if expr.downcast_ref::<Column>().is_some() {
+            if let Some(data) = column(expr) {
+                self.data(&data);
+            }
+            return;
+        }
+        if let Some(function) = expr.downcast_ref::<ScalarFunctionExpr>()
+            && let Some(required) = function.required_input_fields(batch.schema_ref())
+        {
+            for (index, arg) in function.args().iter().enumerate() {
+                match (
+                    required.iter().find(|required| required.arg_index == index),
+                    column(arg),
+                ) {
+                    (Some(required), Some(data)) => {
+                        for path in &required.field_paths {
+                            self.path(&data, path);
+                        }
+                    }
+                    _ => self.expr(arg, batch),
+                }
+            }
+            return;
+        }
+        for child in expr.children() {
+            self.expr(child, batch);
+        }
+    }
 }
 
 /// Most appends a writable bucket's tail holds before it seals into a shared
@@ -2276,6 +2404,7 @@ impl ReadableSource {
         pruning: Option<&crate::scan_sizing::BatchPruning>,
         live: Option<&LiveProjection>,
         output: &mut Vec<ReadableBatch>,
+        scanned: &mut MemoryScan,
     ) -> Result<(), ScribeError> {
         let internal = |error: arrow::error::ArrowError| ScribeError::Internal {
             detail: format!("live-tail Arrow projection failed: {error}"),
@@ -2349,11 +2478,21 @@ impl ReadableSource {
                 })
             });
             let mut physical = physical_projection(batch, &schema, &projection);
+            scanned.rows = scanned.rows.saturating_add(physical.num_rows() as u64);
+            let mut tally = BufferTally::default();
             if let (Some(live), Some(live_schema)) = (live, &live_schema) {
                 let adapted = match &live_adapted {
                     Some(adapted) => adapted,
                     None => live_adapted.insert(live.adapted(&schema, physical.schema())?),
                 };
+                for expr in adapted
+                    .filter
+                    .iter()
+                    .chain(adapted.exprs.iter().map(|expr| &expr.expr))
+                {
+                    tally.expr(expr, &physical);
+                }
+                scanned.bytes = scanned.bytes.saturating_add(tally.bytes);
                 if let Some(filter) = &adapted.filter {
                     physical = datafusion::physical_plan::filter::batch_filter(&physical, filter)
                         .map_err(|error| ScribeError::Internal {
@@ -2422,6 +2561,10 @@ impl ReadableSource {
                 });
                 continue;
             }
+            for column in physical.columns() {
+                tally.data(&column.to_data());
+            }
+            scanned.bytes = scanned.bytes.saturating_add(tally.bytes);
             if let Some(pruning) = pruning.filter(|_| shredded) {
                 let predicate = adapted.get_or_insert_with(|| {
                     use datafusion::physical_expr_adapter::PhysicalExprAdapterFactory as _;

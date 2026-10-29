@@ -187,6 +187,10 @@ pub(crate) struct RemoteScanMetrics {
     bytes_scanned: AtomicU64,
     /// Whether at least one participant reported physical bytes at all.
     bytes_available: AtomicBool,
+    /// Summed scanned rows across every participant that reported them.
+    rows_scanned: AtomicU64,
+    /// Whether at least one participant reported scanned rows at all.
+    rows_available: AtomicBool,
     /// Summed file count across every completed participant.
     files_scanned: AtomicU64,
     /// Summed file-partition count across every completed participant.
@@ -218,6 +222,10 @@ impl RemoteScanMetrics {
             self.bytes_scanned.fetch_add(bytes, Ordering::Relaxed);
             self.bytes_available.store(true, Ordering::Release);
         }
+        if let Some(rows) = stats.rows_scanned {
+            self.rows_scanned.fetch_add(rows, Ordering::Relaxed);
+            self.rows_available.store(true, Ordering::Release);
+        }
         self.files_scanned
             .fetch_add(stats.files_scanned, Ordering::Relaxed);
         self.partitions_scanned
@@ -237,14 +245,20 @@ impl RemoteScanMetrics {
         self.files_pruned.fetch_add(files, Ordering::Relaxed);
     }
 
-    /// Returns the aggregated totals, preserving absent-versus-zero bytes.
-    fn terminal_values(&self) -> (Option<u64>, u64, u64) {
+    /// Returns the aggregated bytes, rows, files and partitions, preserving
+    /// absent-versus-zero bytes and rows.
+    fn terminal_values(&self) -> (Option<u64>, Option<u64>, u64, u64) {
         let bytes = self
             .bytes_available
             .load(Ordering::Acquire)
             .then(|| self.bytes_scanned.load(Ordering::Acquire));
+        let rows = self
+            .rows_available
+            .load(Ordering::Acquire)
+            .then(|| self.rows_scanned.load(Ordering::Acquire));
         (
             bytes,
+            rows,
             self.files_scanned.load(Ordering::Acquire),
             self.partitions_scanned.load(Ordering::Acquire),
         )
@@ -269,16 +283,22 @@ impl RemoteScanMetrics {
 /// Terminal physical scan evidence collected from the executed `DataFusion` plan.
 ///
 /// The collector reads the pinned Parquet `bytes_scanned` metric once after
-/// execution has reached a terminal frame. It never substitutes Arrow batch
-/// memory for physical IO; non-file sources leave physical bytes unavailable.
+/// execution has reached a terminal frame, and adds the memory scan work a
+/// Scribe capture measured (see [`crate::scribe::memtable::MemoryScan`]). It
+/// never substitutes retained or transported Arrow memory for either; other
+/// non-file sources leave bytes and rows unavailable.
 #[derive(Debug, Clone, Default)]
 pub(crate) struct OracleQueryScanStats {
-    /// Physical bytes reported by `DataFusion`'s Parquet scan metric.
+    /// Bytes reported by `DataFusion`'s Parquet scan metric, Scribe memory
+    /// captures and remote participants.
     pub(crate) physical_bytes_scanned: Option<u64>,
     /// Rows the executed local file scans produced, from their `output_rows`
-    /// metric; `None` when no local scan reported it or a remote scan, whose
-    /// participants report no rows, also ran.
+    /// metric, plus the rows Scribe memory captures and remote participants
+    /// examined; `None` when nothing reported rows or a remote participant
+    /// reported none.
     pub(crate) physical_rows_scanned: Option<u64>,
+    /// Memory scan work of the plan's measured Scribe memory leaves.
+    memory_scanned: Option<crate::scribe::memtable::MemoryScan>,
     /// Number of distinct files executed file scan nodes were planned to read,
     /// less what `DataFusion`'s `FilePruner` skipped when opening them.
     pub(crate) files_scanned: u64,
@@ -344,12 +364,21 @@ impl OracleQueryScanStats {
             available = true;
             total = total.saturating_add(count.value() as u64);
         }
+        if let Some(memory) = self.memory_scanned {
+            available = true;
+            total = total.saturating_add(memory.bytes);
+            rows = Some(rows.unwrap_or(0).saturating_add(memory.rows));
+        }
         if available {
             self.physical_bytes_scanned = Some(total);
         }
-        self.physical_rows_scanned = rows.filter(|_| self.remote_handles.is_empty());
+        let mut rows_complete = true;
         for handle in &self.remote_handles {
-            let (bytes, files, partitions) = handle.terminal_values();
+            let (bytes, remote_rows, files, partitions) = handle.terminal_values();
+            match remote_rows {
+                Some(remote) => rows = Some(rows.unwrap_or(0).saturating_add(remote)),
+                None => rows_complete = false,
+            }
             self.files_scanned = self.files_scanned.saturating_add(files);
             self.partitions_scanned = self.partitions_scanned.saturating_add(partitions);
             self.pruning.add(handle.terminal_pruning());
@@ -361,6 +390,7 @@ impl OracleQueryScanStats {
         if available {
             self.physical_bytes_scanned = Some(total);
         }
+        self.physical_rows_scanned = rows.filter(|_| rows_complete);
         self.files_scanned = self.files_scanned.saturating_sub(self.pruning.files_pruned);
     }
 
@@ -391,6 +421,19 @@ impl OracleQueryScanStats {
                     .physical_metrics
                     .push(config.file_source.metrics().clone());
             }
+        }
+        if let Some(scanned) = plan
+            .downcast_ref::<DataSourceExec>()
+            .and_then(|source| {
+                source
+                    .data_source()
+                    .downcast_ref::<super::memtable_source::MemtableSource>()
+            })
+            .and_then(super::memtable_source::MemtableSource::scanned)
+        {
+            let memory = stats.memory_scanned.get_or_insert_default();
+            memory.rows = memory.rows.saturating_add(scanned.rows);
+            memory.bytes = memory.bytes.saturating_add(scanned.bytes);
         }
         if let Some(source) = plan.downcast_ref::<LiveScribeExec>() {
             stats.remote_handles.push(Arc::clone(source.scan_metrics()));
@@ -1422,7 +1465,7 @@ impl HotFileSource {
 /// contain every stored value. A `schema` whose `time_column` is absent or not
 /// a time-column type, or an interval not representable at its precision,
 /// leaves `statistics` unchanged, so the container is kept.
-pub(super) fn set_time_bounds(
+pub(crate) fn set_time_bounds(
     statistics: &mut Statistics,
     schema: &Schema,
     time_column: &str,
@@ -2327,8 +2370,13 @@ pub(super) mod tests {
         )
     }
 
-    /// In-memory sources remain unavailable while scan accumulators aggregate
-    /// actual bytes.
+    /// Generic in-memory sources remain unavailable, measured Scribe memory
+    /// reports numeric facts even when empty, and scan accumulators aggregate
+    /// bytes and rows once with rows unavailable when a participant lacks them.
+    ///
+    /// # Panics
+    ///
+    /// Panics when a fixture source cannot be built or an aggregate is wrong.
     #[test]
     fn scan_stats_preserve_non_file_absence_and_scan_aggregation() {
         let batch = RecordBatch::new_empty(Arc::new(Schema::new(vec![Field::new(
@@ -2348,23 +2396,74 @@ pub(super) mod tests {
         .expect("memory source is valid");
         let mut memory_only = OracleQueryScanStats::from_plan(source.as_ref());
         memory_only.finalize();
-        assert_eq!(memory_only.physical_bytes_scanned, None);
+        assert_eq!(
+            (
+                memory_only.physical_bytes_scanned,
+                memory_only.physical_rows_scanned
+            ),
+            (None, None),
+            "a generic memory source stays unmeasured"
+        );
+
+        let measured = |scanned| {
+            let schema = Arc::new(Schema::new(vec![Field::new(
+                "value",
+                DataType::Int64,
+                false,
+            )]));
+            let source = super::super::memtable_source::MemtableSource::try_new(
+                Vec::new(),
+                Vec::new().into(),
+                crate::scan_sizing::OraclePartitioning::new(
+                    4,
+                    crate::scan_sizing::ORACLE_PARTITION_SCAN_BYTES,
+                ),
+                4,
+                schema,
+            )
+            .expect("memtable source")
+            .with_scanned(Some(scanned));
+            let mut stats = OracleQueryScanStats::from_plan(&DataSourceExec::new(Arc::new(source)));
+            stats.finalize();
+            (stats.physical_bytes_scanned, stats.physical_rows_scanned)
+        };
+        let facts = |rows, bytes| crate::scribe::memtable::MemoryScan { rows, bytes };
+        assert_eq!(
+            measured(facts(0, 0)),
+            (Some(0), Some(0)),
+            "an instrumented empty scan is a numeric zero"
+        );
+        assert_eq!(measured(facts(5, 40)), (Some(40), Some(5)));
 
         let scans = Arc::new(RemoteScanMetrics::default());
-        for bytes in [11, 7] {
+        for (bytes, rows) in [(11, 2), (7, 4)] {
             scans.record_footer(WorkerScanStats {
                 bytes_scanned: Some(bytes),
+                rows_scanned: Some(rows),
                 files_scanned: 1,
                 ..WorkerScanStats::default()
             });
         }
         let mut stats = OracleQueryScanStats {
-            remote_handles: vec![scans],
+            remote_handles: vec![Arc::clone(&scans)],
             ..OracleQueryScanStats::default()
         };
         stats.finalize();
         assert_eq!(stats.physical_bytes_scanned, Some(18));
+        assert_eq!(stats.physical_rows_scanned, Some(6));
         assert_eq!(stats.files_scanned, 2);
+
+        let mut mixed = OracleQueryScanStats {
+            memory_scanned: Some(facts(3, 24)),
+            remote_handles: vec![scans, Arc::new(RemoteScanMetrics::default())],
+            ..OracleQueryScanStats::default()
+        };
+        mixed.finalize();
+        assert_eq!(
+            (mixed.physical_bytes_scanned, mixed.physical_rows_scanned),
+            (Some(42), None),
+            "memory and remote bytes sum once; a participant without rows leaves rows unavailable"
+        );
     }
 
     /// Local file scans' output rows sum across partitions and scans, and

@@ -2197,11 +2197,17 @@ pub struct ExecuteFragmentRequest {
 )]
 #[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
 pub struct WorkerScanStats {
-    /// Physical bytes the follower's executed scans read, when its sources
-    /// report physical IO at all. `None` means unavailable, not zero: a
-    /// memory-backed source reads no storage and must not be reported as a
-    /// zero-byte scan of one that does.
+    /// Bytes the follower's executed scans read: Parquet bytes read from
+    /// storage plus the distinct Arrow buffer bytes a Scribe memory read
+    /// accessed after bounds pruning. Memory bytes are scan work, not storage
+    /// IO, retained heap, or transport size. `None` means unavailable, not
+    /// zero: a source that measures neither must not be reported as a
+    /// zero-byte scan.
     pub bytes_scanned: Option<u64>,
+    /// Input rows the follower's executed scans examined: Parquet scan output
+    /// rows plus the rows of the Scribe memory batches kept after bounds
+    /// pruning, before row filtering. `None` means unavailable, not zero.
+    pub rows_scanned: Option<u64>,
     /// Number of files represented by the follower's executed scan nodes.
     pub files_scanned: u64,
     /// Number of file partitions represented by the follower's executed scans.

@@ -415,6 +415,9 @@ pub struct LiveTailBatches {
     /// retained capture so retirement cannot uncharge them while this read
     /// holds them.
     charges: Vec<Arc<crate::scribe::memory::RetainedArrowCharge>>,
+    /// The capture's memory scan work, or `None` for a snapshot no capture
+    /// measured.
+    scanned: Option<crate::scribe::memtable::MemoryScan>,
     /// Staged runs with their recorded size and footer, in merge order.
     runs: Vec<crate::scribe::hot_source::StagedRunRead>,
     /// Lease keeping `runs` on disk, shared with the retained capture.
@@ -439,9 +442,16 @@ impl LiveTailBatches {
         Self {
             memtable,
             charges: Vec::new(),
+            scanned: None,
             runs: Vec::new(),
             staged: None,
         }
+    }
+
+    /// Returns the capture's memory scan work, or `None` when no capture
+    /// measured these batches.
+    pub(crate) const fn scanned(&self) -> Option<crate::scribe::memtable::MemoryScan> {
+        self.scanned
     }
 
     /// Splits the read into its memory batches, their accounting owners, its
@@ -981,6 +991,7 @@ impl FetchLiveTailService {
                 })
                 .collect(),
             charges: read.charges,
+            scanned: Some(read.scanned),
             runs: read.runs,
             staged: read.lease,
         })

@@ -1705,7 +1705,10 @@ across a restart; durable batch, file, and task rows answer that question.
   client-facing stream through terminal or drop, with `bifrost.gate.query`
   dispatch as its child; `bifrost.oracle.stream` spans Oracle execution through
   terminal cleanup and records the executed plan's final integer
-  `rows_scanned` and `bytes_scanned` when its scans report them, and
+  `rows_scanned` and `bytes_scanned` when its scans report them (Parquet
+  scan rows and bytes plus a Scribe memory read's examined rows and accessed
+  Arrow buffer bytes, counted once per validated live completion; memory
+  bytes are scan work, not storage IO, retained heap or transport size), and
   `bifrost.oracle.peer.fragment{role,outcome}` spans each remote fragment. Work `DataFusion` spawns inherits the query span, so remote
   fragments are child work of the query that dispatched them. Each operation
   span records exactly one `outcome`. A request that continues a sampled

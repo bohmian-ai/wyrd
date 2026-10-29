@@ -474,9 +474,12 @@ impl<T> ScribeTailResolver<T> {
         session: &SessionState,
     ) -> Result<Arc<dyn ExecutionPlan>, FollowerResolutionError> {
         let fault = |detail: &str| FollowerResolutionError::Fault(detail.to_owned());
+        let scanned = read.scanned();
         let (rows, charges, runs, lease) = read.into_parts();
         let mut leaves: Vec<Arc<dyn ExecutionPlan>> = Vec::with_capacity(2);
-        if !rows.is_empty() || runs.is_empty() {
+        // A capture whose filter emptied every batch still did that scan
+        // work, so its empty leaf carries the facts.
+        if !rows.is_empty() || runs.is_empty() || scanned.is_some_and(|scanned| scanned.rows > 0) {
             let projected = rows
                 .iter()
                 .map(|batch| {
@@ -496,7 +499,8 @@ impl<T> ScribeTailResolver<T> {
                 session.config().target_partitions(),
                 Arc::clone(output_schema),
             )
-            .map_err(|_| fault("Scribe memtable source construction failed"))?;
+            .map_err(|_| fault("Scribe memtable source construction failed"))?
+            .with_scanned(scanned);
             leaves.push(Arc::new(DataSourceExec::new(Arc::new(source))));
         }
         if !runs.is_empty() {
@@ -588,6 +592,7 @@ impl FollowerScanEvidence {
         self.0.finalize();
         wyrd_spec::vala::api::WorkerScanStats {
             bytes_scanned: self.0.physical_bytes_scanned,
+            rows_scanned: self.0.physical_rows_scanned,
             files_scanned: self.0.files_scanned,
             partitions_scanned: self.0.partitions_scanned,
             row_groups_scanned: self.0.pruning.row_groups_scanned,
@@ -2800,26 +2805,177 @@ pub(crate) mod tests {
         );
     }
 
-    /// A scalar Variant read reads only its shredded leaves from a staged
-    /// run and rebuilds no whole Variant from memory.
+    /// A Scribe memory read reports the rows it examined and the bytes of
+    /// only the leaves its expressions read, and those facts reach the
+    /// leader once over both the native completion and the remote footer.
     ///
-    /// The generation `{"a": .., "b": ..}` is staged in the layout a sample
-    /// learns, which shreds `a` and `b`, and a later generation holds the same
-    /// rows shredded in memory. `attrs ->> 'a'`, signed as the assignment's
-    /// projection, decodes only `attrs.metadata` and the `a` subtree of the
-    /// run, never `b` or the residual, and evaluates over the memory rows'
-    /// physical leaves with no reconstruction; both return each row's `a`.
+    /// `attrs ->> 'a'` over shredded memory rows counts their three rows and
+    /// fewer bytes than the whole `attrs` read of the same rows, since the
+    /// unused `b` subtree is excluded. The follower's finalized evidence adds
+    /// the staged run's rows and bytes; finalizing again reports the same.
+    /// The leader collects identical facts from an in-process completion and
+    /// a wire footer, and a completion with another plan fingerprint is
+    /// refused and records nothing.
     ///
     /// # Panics
-    /// Panics when resolution or execution fails, the run decodes other
-    /// leaves, memory reconstructs a Variant, or a value differs.
+    /// Panics when resolution, execution or a valid frame fails, a refused
+    /// frame is accepted, or any fact differs.
     #[tokio::test]
-    async fn live_projection_reads_shredded_leaves_without_whole_variants() {
+    async fn live_memory_scan_facts_survive_native_and_remote_completion() {
         use datafusion::common::tree_node::{TreeNode as _, TreeNodeRecursion};
-        use datafusion::datasource::physical_plan::{
-            FileScanConfig, FileSource as _, ParquetSource,
+
+        let session = SessionContext::new_with_config(
+            crate::resources::OracleSessionShape::for_test().session_config(),
+        )
+        .state();
+        let memory_facts = |plan: &Arc<dyn ExecutionPlan>| {
+            let mut facts = Vec::new();
+            plan.apply(|node| {
+                if let Some(source) = node.downcast_ref::<DataSourceExec>().and_then(|exec| {
+                    exec.data_source()
+                        .downcast_ref::<super::super::memtable_source::MemtableSource>()
+                }) {
+                    facts.push(source.scanned());
+                }
+                Ok(TreeNodeRecursion::Continue)
+            })
+            .expect("plan walks");
+            facts
+        };
+        let (whole, _) = {
+            let (fixture, schema, closure, closure_schema, _) = shredded_variant_fixture();
+            let projection = signed_projection(projected(Arc::new(
+                datafusion::physical_plan::empty::EmptyExec::new(closure_schema),
+            )));
+            resolve_staged_projection(
+                &fixture,
+                Arc::clone(&fixture.service),
+                &session,
+                schema,
+                closure,
+                projection,
+            )
+            .await
+        };
+        let [Some(whole)] = memory_facts(&whole)[..] else {
+            panic!("the whole read has one measured memory leaf");
         };
 
+        let (fixture, schema, closure, _, projection) = shredded_variant_fixture();
+        let (plan, _) = resolve_staged_projection(
+            &fixture,
+            Arc::clone(&fixture.service),
+            &session,
+            schema,
+            closure,
+            projection,
+        )
+        .await;
+        let [Some(memory)] = memory_facts(&plan)[..] else {
+            panic!("the scalar read has one measured memory leaf");
+        };
+        assert_eq!(memory.rows, 3, "every kept memory row is examined");
+        assert!(
+            memory.bytes > 0 && memory.bytes < whole.bytes,
+            "the scalar read counts only its leaves: {} of {}",
+            memory.bytes,
+            whole.bytes
+        );
+
+        let evidence = FollowerScanEvidence(super::super::exec::OracleQueryScanStats::from_plan(
+            plan.as_ref(),
+        ));
+        let batches = collect(plan, Arc::new(TaskContext::default()))
+            .await
+            .expect("the live read executes");
+        let output = batches.iter().map(RecordBatch::num_rows).sum::<usize>();
+        assert_eq!(output, 6, "memory and staged rows are returned");
+        let FollowerScanEvidence(mut collected) = evidence;
+        collected.finalize();
+        collected.finalize();
+        let stats = FollowerScanEvidence(collected).finalize();
+        assert_eq!(
+            stats.rows_scanned,
+            Some(6),
+            "memory and staged rows are each counted once"
+        );
+        assert!(
+            stats
+                .bytes_scanned
+                .is_some_and(|bytes| bytes > memory.bytes),
+            "staged bytes add to the memory bytes"
+        );
+
+        let fingerprint = "c".repeat(64);
+        let collect_on_leader = |frames: Vec<super::super::dispatcher::LiveFrame>| {
+            let mut leader = super::super::exec::OracleQueryScanStats::default();
+            let mut decoder = super::super::live::LiveFrameDecoder::new(
+                fingerprint.clone(),
+                leader.open_distributed_scan(),
+            );
+            for frame in frames {
+                decoder.accept(frame).expect("valid frame");
+            }
+            leader.finalize();
+            (leader.physical_bytes_scanned, leader.physical_rows_scanned)
+        };
+        let native = collect_on_leader(vec![
+            super::super::dispatcher::NativeOutputTally::default()
+                .complete(fingerprint.clone(), stats),
+        ]);
+        let mut encoder = super::super::dispatcher::AttemptEncoder::default();
+        let remote = collect_on_leader(vec![
+            super::super::dispatcher::LiveFrame::Wire(
+                encoder
+                    .start(Arc::new(Schema::empty()))
+                    .expect("schema frame"),
+            ),
+            super::super::dispatcher::LiveFrame::Wire(
+                encoder
+                    .finish_physical(&fingerprint, stats)
+                    .expect("footer frame"),
+            ),
+        ]);
+        assert_eq!(native, (stats.bytes_scanned, stats.rows_scanned));
+        assert_eq!(remote, native, "both completions carry the same facts");
+
+        let mut leader = super::super::exec::OracleQueryScanStats::default();
+        let mut decoder =
+            super::super::live::LiveFrameDecoder::new(fingerprint, leader.open_distributed_scan());
+        assert!(
+            decoder
+                .accept(
+                    super::super::dispatcher::NativeOutputTally::default()
+                        .complete("d".repeat(64), stats)
+                )
+                .is_err(),
+            "a completion for another plan is refused"
+        );
+        leader.finalize();
+        assert_eq!(
+            (leader.physical_bytes_scanned, leader.physical_rows_scanned),
+            (None, None),
+            "a refused completion claims no facts"
+        );
+    }
+
+    /// A staged generation of `{"a": .., "b": ..}` Variant rows in the
+    /// layout a sample learns, which shreds `a` and `b`, with the same rows
+    /// shredded in a later memory generation, and `attrs ->> 'a'` signed as
+    /// the assignment's projection.
+    ///
+    /// Returns the fixture, the table schema, the closure, the closure's
+    /// schema and the signed projection.
+    ///
+    /// # Panics
+    /// Panics when a fixture row, layout, insert or projection cannot be built.
+    fn shredded_variant_fixture() -> (
+        StagedGenerationFixture,
+        SchemaRef,
+        Vec<String>,
+        SchemaRef,
+        Vec<ProjectedExpression>,
+    ) {
         let text: arrow::array::ArrayRef = Arc::new(StringArray::from(vec![
             r#"{"a":"x","b":1}"#,
             r#"{"a":"y","b":2}"#,
@@ -2925,6 +3081,30 @@ pub(crate) mod tests {
             )
             .expect("projection plans"),
         ));
+        (fixture, schema, closure, closure_schema, projection)
+    }
+
+    /// A scalar Variant read reads only its shredded leaves from a staged
+    /// run and rebuilds no whole Variant from memory.
+    ///
+    /// The generation `{"a": .., "b": ..}` is staged in the layout a sample
+    /// learns, which shreds `a` and `b`, and a later generation holds the same
+    /// rows shredded in memory. `attrs ->> 'a'`, signed as the assignment's
+    /// projection, decodes only `attrs.metadata` and the `a` subtree of the
+    /// run, never `b` or the residual, and evaluates over the memory rows'
+    /// physical leaves with no reconstruction; both return each row's `a`.
+    ///
+    /// # Panics
+    /// Panics when resolution or execution fails, the run decodes other
+    /// leaves, memory reconstructs a Variant, or a value differs.
+    #[tokio::test]
+    async fn live_projection_reads_shredded_leaves_without_whole_variants() {
+        use datafusion::common::tree_node::{TreeNode as _, TreeNodeRecursion};
+        use datafusion::datasource::physical_plan::{
+            FileScanConfig, FileSource as _, ParquetSource,
+        };
+
+        let (fixture, schema, closure, closure_schema, projection) = shredded_variant_fixture();
         let session = SessionContext::new_with_config(
             crate::resources::OracleSessionShape::for_test().session_config(),
         )

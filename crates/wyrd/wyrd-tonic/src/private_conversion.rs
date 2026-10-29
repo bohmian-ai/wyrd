@@ -726,6 +726,7 @@ impl From<proto::WorkerScanStats> for domain::WorkerScanStats {
     fn from(value: proto::WorkerScanStats) -> Self {
         Self {
             bytes_scanned: value.bytes_scanned,
+            rows_scanned: value.rows_scanned,
             files_scanned: value.files_scanned,
             partitions_scanned: value.partitions_scanned,
             row_groups_scanned: value.row_groups_scanned,
@@ -741,6 +742,7 @@ impl From<domain::WorkerScanStats> for proto::WorkerScanStats {
     fn from(value: domain::WorkerScanStats) -> Self {
         Self {
             bytes_scanned: value.bytes_scanned,
+            rows_scanned: value.rows_scanned,
             files_scanned: value.files_scanned,
             partitions_scanned: value.partitions_scanned,
             row_groups_scanned: value.row_groups_scanned,
@@ -1240,6 +1242,7 @@ mod tests {
             completed: true,
             scan_stats: domain::WorkerScanStats {
                 bytes_scanned: Some(4_096),
+                rows_scanned: Some(9),
                 files_scanned: 3,
                 partitions_scanned: 2,
                 row_groups_scanned: 5,

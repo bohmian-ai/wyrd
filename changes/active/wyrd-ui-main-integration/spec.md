@@ -1,7 +1,7 @@
 ---
 id: SPEC-wyrd-ui-main-integration
 revision: 14
-status: draft
+status: approved
 ---
 
 # Migrate the Wyrd UI onto current main
@@ -40,9 +40,9 @@ The service packet's [telemetry schemas](../service-identity-and-telemetry/suppl
 and [table/correlation contracts](../service-identity-and-telemetry/supplements/table-storage-and-correlation.md)
 define the target data this UI consumes. Their owning design/security/Bifrost
 amendments and matching server, SDK and MCP contracts must land before affected
-live UI acceptance. Current architecture remains authoritative for current
-behavior; this draft does not declare those schemas shipped or independently
-amend their owners.
+live UI acceptance; they shipped on main before this revision's approval.
+Current architecture remains authoritative; this revision does not amend
+their owners.
 
 Service TASK-003 owns catalog/schema/attribution and existing example/fixture
 consumer closure, TASK-004/005 supply resolved table descriptions, and TASK-006
@@ -55,8 +55,7 @@ than inferring fields or falling back to the previous catalog. Service chart
 persistence, non-sensitive requirement-outcome readback, and Change Request/
 repository APIs remain separate prerequisites.
 
-The following paragraphs retain earlier approval history; revision 14 itself
-remains a draft pending explicit approval.
+The caller approved revision 14 on 2026-10-29. The following paragraphs retain earlier approval history.
 
 This revision replaces an invalid draft that claimed revision 1 approval. That
 claim is not carried forward. The caller approved revision 5 on 2026-10-19;
@@ -1277,19 +1276,17 @@ combined proof and cross-task seams; task gates remain bounded to their owners.
 
 ## Open material decisions and approval
 
-Revision 14 is a draft for approval of the catalog/schema consumer alignment,
+Revision 14 approves the catalog/schema consumer alignment,
 managed attribution and Workload labels, signal fidelity, and verification
 waiting/evidence behavior described above. The service packet's approved
-contracts supply the upstream decisions; this UI revision adds no new server
-API or durable authority. Their delivery and architecture amendments remain
-explicit dependencies, not claims of current availability.
+contracts supply the upstream decisions and are delivered on main; this UI
+revision adds no new server API or durable authority.
 
-The approval requested is this bounded revision. Existing UI task instructions
-still reflect earlier revisions and have not been regenerated; affected work
-waits for approval and task alignment through `$wyrd-plan`. Earlier approvals,
-completed-task records and review subjects retain their original meaning and
-are not retroactively rewritten. No approval, implementation readiness, or new
-runtime/browser proof is claimed by this draft.
+The caller approved this bounded revision on 2026-10-29. Task instructions use
+the delivered `workload_card_uid`/`subject_card_uid` columns and `bifrost`
+catalog. Earlier approvals, completed-task records and review subjects retain
+their original meaning and are not retroactively rewritten. The foundation's
+renewed real-server proof passes on main.
 
 The independent [readiness review](review/plan-readiness/review.md) assessed
 revision 5 against refreshed main and returned `Revise`. Its exact reviewed
@@ -1441,8 +1438,8 @@ reported live-proof blocker, never an assumed capability or silent pass.
   retains separate platform prerequisites, and adds AC-016–019 for affected
   consumer closure. Flat Card identity, transport/session/layout boundaries,
   deferred capabilities, prior completion records and immutable reviews remain.
-  Pending explicit human approval; task changes and implementation are not
-  authorized by this draft.
+  Approved by the caller on 2026-10-29, after main shipped the service
+  packet's schemas and `workload_card_uid` was confirmed to name a Service only.
 
 Authorities: `AGENTS.md`; `agent_docs/index.md`;
 `architecture/wyrd-design.md`;

@@ -12,7 +12,7 @@ All reusable Observe components are complete and independently inspectable in th
 
 ## Owners, Scope, Consumers, and Prohibited Changes
 
-Own StatStrip, FacetRail, RecordTable, TraceWaterfall and RecordDetail. Reuse the completed Chart and primitives. Trace/list/detail/log/metric variants belong to these component contracts; shell controls and conventional pages do not. Service correlation variants wait for REQ-023.
+Own StatStrip, FacetRail, RecordTable, TraceWaterfall and RecordDetail. Reuse the completed Chart and primitives. Trace/list/detail/log/metric variants belong to these component contracts; shell controls and conventional pages do not. Service correlation variants use main's `workload_card_uid`.
 
 Use committed main `8651b96fd`, the approved spec and current canvas. Historical `wyrd-server-ui` at `7bfc3a8a` supplies read/state/test evidence only. Current uncommitted trace changes are unrelated and must be preserved. Package components render typed props; portable loaders plan/shape; executor/host boundaries own credentials, authorized IO and action execution. Preserve tenant isolation, stable errors and server audit behavior. No speculative framework, test-only configuration or replacement selectors.
 

@@ -1088,6 +1088,10 @@ mod tests {
     #[test]
     fn plain_verdict_schema_is_portable() {
         /// Refuses a non-portable keyword or a `$ref` sibling anywhere.
+        ///
+        /// # Panics
+        /// Panics at the first node holding `oneOf`, `const`, `minimum`,
+        /// `format`, or a `$ref` with siblings.
         fn portable(value: &Value) {
             match value {
                 Value::Object(map) => {

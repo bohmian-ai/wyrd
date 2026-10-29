@@ -2190,6 +2190,9 @@ mod prompt_render {
 
 #[cfg(test)]
 mod response_schema_edit {
+    //! Response-schema edits reach every structured request kind and keep
+    //! the derived response type in step.
+
     use serde_json::json;
 
     use crate::wire::openai_chat::{OpenAiJsonSchema, OpenAiResponseFormat};

@@ -855,6 +855,9 @@ impl Provider for Recording {
     ///
     /// # Errors
     /// Returns the mock's error for an empty queue.
+    ///
+    /// # Panics
+    /// Panics when the request log's lock is poisoned.
     async fn send(&self, request: ProviderRequest) -> Result<ProviderResponse, ProviderError> {
         self.requests
             .lock()

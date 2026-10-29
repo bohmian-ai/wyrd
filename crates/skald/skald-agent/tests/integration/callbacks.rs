@@ -342,14 +342,20 @@ async fn agent_run_callback_panic_maps_to_agent_error() {
     }
 }
 
+/// A provider answering scripted responses in order and recording every
+/// request; clones share both queues, so a test inspects what the Agent sent.
 #[derive(Clone)]
 pub(crate) struct RecordingProvider {
+    /// The provider name the registry dispatches to.
     name: ProviderName,
+    /// Scripted answers, consumed front first.
     responses: Arc<Mutex<VecDeque<ProviderResponse>>>,
+    /// Requests received, in send order.
     requests: Arc<Mutex<Vec<ProviderRequest>>>,
 }
 
 impl RecordingProvider {
+    /// An OpenAI provider answering `responses` in order.
     fn new(responses: Vec<ProviderResponse>) -> Self {
         Self::named(ProviderName::OpenAi, responses)
     }
@@ -399,6 +405,7 @@ impl Provider for RecordingProvider {
         ))
     }
 
+    /// The name this provider was registered under.
     fn name(&self) -> ProviderName {
         self.name.clone()
     }

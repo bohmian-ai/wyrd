@@ -30,6 +30,7 @@ const CORRECTION: &str = "Your previous reply was not accepted";
 /// Most UTF-8 bytes one correction turn may take.
 const CORRECTION_LIMIT: usize = 16 * 1024;
 
+/// A registry whose OpenAI mock answers one Chat reply holding `text`.
 fn registry_returning_text(text: &str) -> ProviderRegistry {
     let mock = MockProvider::new(ProviderName::OpenAi);
     mock.push_response(ProviderResponse::text(text));
@@ -82,10 +83,18 @@ fn verdict_like() -> Value {
     })
 }
 
+/// A named JSON-schema output format for `schema`.
+///
+/// # Panics
+/// Panics when `schema` is not a JSON object.
 fn format(schema: Value) -> ResponseFormat {
     ResponseFormat::json_schema("test", schema).expect("schema is an object")
 }
 
+/// An OpenAI Chat Prompt asking for output satisfying `schema`.
+///
+/// # Panics
+/// Panics when `schema` is not an object or the Prompt does not build.
 fn chat_prompt(schema: Value) -> skald_prompt::Prompt {
     openai_chat(
         "gpt-test",
@@ -136,6 +145,9 @@ type Encoding = (
 );
 
 /// A structured Prompt and an answer builder for each conversation encoding.
+///
+/// # Panics
+/// Panics when a Prompt does not build.
 fn encodings() -> Vec<Encoding> {
     vec![
         (
@@ -190,11 +202,18 @@ fn encodings() -> Vec<Encoding> {
 }
 
 /// The request serialized as JSON text, for content assertions.
+///
+/// # Panics
+/// Panics when the request does not serialize.
 fn text_of(request: &ProviderRequest) -> String {
     serde_json::to_string(request).expect("request serializes")
 }
 
 /// The last user text of an OpenAI Chat request.
+///
+/// # Panics
+/// Panics when the request is not Chat, has no user turn, or that turn is
+/// not plain text.
 fn last_user(request: &ProviderRequest) -> String {
     let ProviderRequest::OpenAiChatCompletion(request) = request else {
         panic!("an OpenAI Chat request");
@@ -221,6 +240,11 @@ fn agent(prompt: skald_prompt::Prompt, cap: u32, journal: &RecordingJournal) -> 
         })
 }
 
+/// A valid first answer is accepted after one iteration and parsed into
+/// the structured output map.
+///
+/// # Panics
+/// Panics when the run fails, takes more iterations, or the map differs.
 #[tokio::test(flavor = "multi_thread")]
 async fn structured_output_parses_when_schema_declared() {
     let prompt = chat_prompt(foo_bar());

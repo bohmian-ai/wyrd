@@ -114,36 +114,43 @@ const SPAN_FILTERS = [
 /**
  * The Observe signals and their canonical tables. `traces` lists root spans,
  * one row per trace; `spans` lists every span. `filters` are the scalar,
- * non-payload columns a WHERE clause or facet may name; `columns` are those a
- * list may show, defaults first. Every name is a current canonical column.
+ * non-payload columns a WHERE clause or facet may name; `columns` are a
+ * list's defaults and `more` the other columns it may show, such as metric
+ * histogram, summary and exemplar structures. Every name is a current
+ * canonical column.
  */
 export const SIGNALS = {
   traces: {
     table: 'bifrost.traces.spans',
     time: 'start_time_unix_nano',
     columns: ['start_time_unix_nano', 'name', 'service_name', 'duration_nano', 'status_code'],
-    filters: SPAN_FILTERS
+    filters: SPAN_FILTERS,
+    more: []
   },
   spans: {
     table: 'bifrost.traces.spans',
     time: 'start_time_unix_nano',
     columns: ['start_time_unix_nano', 'name', 'service_name', 'duration_nano', 'status_code', 'kind'],
-    filters: SPAN_FILTERS
+    filters: SPAN_FILTERS,
+    more: []
   },
   logs: {
     table: 'bifrost.logs.records',
     time: 'time_unix_nano',
     columns: ['time_unix_nano', 'severity_text', 'service_name', 'body_text', 'exception_type'],
-    filters: ['severity_number', 'severity_text', 'event_name', ...RESOURCE, 'exception_type', 'is_exception', ...OWNERSHIP]
+    filters: ['severity_number', 'severity_text', 'event_name', ...RESOURCE, 'exception_type', 'is_exception', ...OWNERSHIP],
+    more: []
   },
   metrics: {
     table: 'bifrost.metrics.points',
     time: 'time_unix_nano',
-    columns: [
-      'time_unix_nano', 'metric_name', 'metric_type', 'unit', 'int_value', 'double_value', 'aggregation_temporality', 'is_monotonic',
-      'histogram_count', 'histogram_sum', 'histogram_min', 'histogram_max', 'summary_count', 'summary_sum', 'quantile_values'
-    ],
-    filters: ['metric_name', 'metric_type', 'unit', 'aggregation_temporality', 'is_monotonic', ...RESOURCE, ...OWNERSHIP]
+    columns: ['time_unix_nano', 'metric_name', 'metric_type', 'unit', 'int_value', 'double_value'],
+    filters: ['metric_name', 'metric_type', 'unit', 'aggregation_temporality', 'is_monotonic', ...RESOURCE, ...OWNERSHIP],
+    more: [
+      'start_time_unix_nano', 'histogram_count', 'histogram_sum', 'histogram_min', 'histogram_max', 'bucket_counts', 'explicit_bounds',
+      'exponential_scale', 'exponential_zero_count', 'exponential_zero_threshold', 'positive_buckets', 'negative_buckets',
+      'summary_count', 'summary_sum', 'quantile_values', 'exemplars'
+    ]
   }
 } as const;
 
@@ -151,9 +158,9 @@ export const SIGNALS = {
 export type Signal = keyof typeof SIGNALS;
 const SignalSchema = z.enum(['traces', 'spans', 'logs', 'metrics']);
 
-/** Columns a list of `signal` may show: its defaults, then every filter column. */
+/** Columns a list of `signal` may show: its defaults, every filter column, then its other columns. */
 export function signalColumns(signal: Signal): readonly string[] {
-  return [...new Set([...SIGNALS[signal].columns, ...SIGNALS[signal].filters])];
+  return [...new Set([...SIGNALS[signal].columns, ...SIGNALS[signal].filters, ...SIGNALS[signal].more])];
 }
 
 /** One WHERE clause: a column equal to a bound value, or with `not`, distinct from it. A null value matches an unset column. */
@@ -220,8 +227,8 @@ export const RecordDetailInputSchema = z.union([z.object({ traceId, spanId }).st
 
 /**
  * Built-in stats over the canonical tables. Span stats honour `where`;
- * `invocations` counts `invoke_agent` operations, `tokens` sums recorded
- * GenAI usage, and `calls`/`cost` read `bifrost.gateway.calls`.
+ * `invocations` counts `invoke_agent` operations; `tokens` (token-unit
+ * usage), `calls` and `cost` read `bifrost.gateway.calls`.
  */
 export const STATS = ['traces', 'spans', 'errors', 'duration_p95', 'invocations', 'tokens', 'calls', 'cost'] as const;
 
@@ -236,8 +243,8 @@ export const StatStripInputSchema = z
   .strict()
   .superRefine((input, context) => {
     knownColumns('spans', (input.where ?? []).map((each) => each.column), SIGNALS.spans.filters, ['where'], context);
-    if (input.where?.length && input.stats.some((stat) => stat === 'calls' || stat === 'cost'))
-      context.addIssue({ code: 'custom', path: ['where'], message: 'span filters do not apply to gateway calls or cost' });
+    if (input.where?.length && input.stats.some((stat) => stat === 'tokens' || stat === 'calls' || stat === 'cost'))
+      context.addIssue({ code: 'custom', path: ['where'], message: 'span filters do not apply to gateway tokens, calls or cost' });
   });
 
 /** A filter a facet or detail field asks the host to apply. */

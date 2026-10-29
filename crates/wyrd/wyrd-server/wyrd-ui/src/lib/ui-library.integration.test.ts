@@ -438,6 +438,10 @@ test('TASK-004: Authorized Observe across hosts', async ({ server }) => {
           counts: { state: 'populated', data: { rows: [[TRACE, 3, 1]] } }
         }
       });
+      // A traces WHERE matching a child span lists that span's root; facets count each trace once.
+      const byChild = await loadRecordTable({ signal: 'traces', where: [{ column: 'name', value: 'execute_tool search' }] }, context);
+      expect(byChild.result).toMatchObject({ state: 'populated', data: { rows: { rows: [[expect.any(String), 'invoke_agent support', 'ui-agent', 900_000_000, 0, TRACE, '00f067aa0ba902b7']] } } });
+      expect((await loadFacetRail({ signal: 'traces', facets: ['service_name'] }, context)).result).toMatchObject({ state: 'populated', data: { facets: [{ values: { rows: [['ui-agent', 1]] } }] } });
       // Spans filter by a bound WHERE; the waterfall reads the exact trace with nanosecond starts.
       const errors = await loadRecordTable({ signal: 'spans', where: [{ column: 'status_code', value: 2 }] }, context);
       expect(errors.result).toMatchObject({ state: 'populated', data: { rows: { rows: [[expect.any(String), 'execute_tool search', 'ui-agent', 100_000_000, 2, 1, TRACE, 'b9c7c989f97918e1']] } } });
@@ -465,10 +469,15 @@ test('TASK-004: Authorized Observe across hosts', async ({ server }) => {
       ]);
       // Facets and stats count this tenant's evidence only.
       expect((await loadFacetRail({ signal: 'spans', facets: ['service_name'] }, context)).result).toMatchObject({ state: 'populated', data: { facets: [{ values: { rows: [['ui-agent', 3]] } }] } });
-      const stats = await loadStatStrip({ stats: ['traces', 'spans', 'errors', 'invocations', 'cost'] }, context);
-      expect(stats.result.state !== 'loading' && stats.result.state !== 'denied' && stats.result.state !== 'error' && stats.result.data.stats.map(({ total }) => total.rows)).toEqual([[[1]], [[3]], [[1]], [[1]], []]);
+      // No gateway call was recorded: tokens total null ("—"), cost has no currency.
+      const stats = await loadStatStrip({ stats: ['traces', 'spans', 'errors', 'invocations', 'tokens'] }, context);
+      expect(stats.result.state !== 'loading' && stats.result.state !== 'denied' && stats.result.state !== 'error' && stats.result.data.stats.map(({ total }) => total.rows)).toEqual([[[1]], [[3]], [[1]], [[1]], [[null]]]);
+      const cost = await loadStatStrip({ stats: ['cost'] }, context);
+      expect(cost.result.state !== 'loading' && cost.result.state !== 'denied' && cost.result.state !== 'error' && cost.result.data.stats[0].total.rows).toEqual([]);
+      // Unattributed evidence never counts toward a Card scope.
+      expect((await loadStatStrip({ stats: ['spans'], scope: { column: 'subject_card_uid', uid: 'card_unrecorded' } }, context)).result.state).toBe('empty');
       // An earlier range holds nothing.
-      expect((await loadRecordTable({ signal: 'traces' }, { executor, range: BEFORE })).result).toMatchObject({ state: 'empty', reason: 'No traces match this WHERE in this range.' });
+      expect((await loadRecordTable({ signal: 'traces' }, { executor, range: BEFORE })).result).toMatchObject({ state: 'empty', reason: 'No root spans in bifrost.traces.spans with start_time_unix_nano in this range.' });
       expect((await loadStatStrip({ stats: ['spans'] }, { executor, range: BEFORE })).result.state).toBe('empty');
     }
   } finally {

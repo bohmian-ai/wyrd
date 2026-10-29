@@ -31,23 +31,33 @@
     if (stat === 'cost') return `${String(cell).replace(/(\.\d*?)0+$/, '$1').replace(/\.$/, '')} ${String(currency)}`;
     return fmtNumber(numeric(cell));
   }
+
+  /** Per-bucket values in order, of one currency when given; null buckets are skipped, never zero. */
+  function trend(rows: readonly (readonly unknown[])[], currency?: unknown): number[] {
+    return rows.filter((row) => row[1] !== null && (currency === undefined || row[2] === currency)).map((row) => numeric(row[1]));
+  }
 </script>
 
 {#if result.state === 'populated' || result.state === 'empty'}
   <div class="stats">
   <dl class="strip" aria-label="Totals over the range">
     {#each result.data.stats as { stat, total, series } (stat)}
-      {@const values = total.rows.map((row) => value(stat, row[0], row[1])).filter((text) => text !== undefined)}
-      {@const points = series.rows.filter((row) => row[1] !== null).map((row) => numeric(row[1]))}
+      <!-- Cost has one total and one trend per recorded currency. -->
+      {@const values = total.rows
+        .map((row) => ({ text: value(stat, row[0], row[1]), currency: stat === 'cost' ? String(row[1]) : '', points: trend(series.rows, stat === 'cost' ? row[1] : undefined) }))
+        .filter((each) => each.text !== undefined)}
       <div class="stat">
         <dt>{LABELS[stat]}</dt>
         <dd>
           {#if values.length === 0}
             <span class="value" title="Nothing recorded in this range">—</span>
+            <Sparkline points={[]} label="{LABELS[stat]} per bucket" />
           {:else}
-            {#each values as text, index (index)}<span class="value">{text}</span>{/each}
+            {#each values as { text, currency, points }, index (index)}
+              <span class="value">{text}</span>
+              <Sparkline {points} label="{LABELS[stat]}{currency ? ` in ${currency}` : ''} per bucket" />
+            {/each}
           {/if}
-          {#if stat !== 'cost'}<Sparkline {points} label="{LABELS[stat]} per bucket" />{/if}
         </dd>
       </div>
     {/each}

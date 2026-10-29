@@ -102,6 +102,10 @@ export const facet = result([col('value'), col('n', 'Int64')], [['agent-api', 42
 /** One stat total and its buckets. */
 export const total = (value: unknown) => result([col('value', 'Int64')], [[value]]);
 export const buckets = result([col('at', NS), col('value', 'Int64')], [['2026-10-20T10:00:00Z', 4], ['2026-10-20T11:00:00Z', 9], ['2026-10-20T12:00:00Z', 6]]);
+export const costBuckets = result(
+  [col('at', NS), col('value', 'Decimal128(38, 12)'), col('currency')],
+  [['2026-10-20T10:00:00Z', '0.400000000000', 'EUR'], ['2026-10-20T10:00:00Z', '0.100000000000', 'USD'], ['2026-10-20T11:00:00Z', '0.850000000000', 'EUR'], ['2026-10-20T11:00:00Z', '0.320000000000', 'USD']]
+);
 export const costs = result([col('value', 'Decimal128(38, 12)'), col('currency')], [['1.250000000000', 'EUR'], ['0.420000000000', 'USD']]);
 
 /** The fixture answering one Observe read, chosen by its fixed SQL shape. */
@@ -112,7 +116,7 @@ export function observeAnswer(sql: string): QueryResult | undefined {
   if (sql.startsWith('SELECT * FROM bifrost.logs.records')) return logRow;
   if (sql.startsWith('SELECT * FROM bifrost.traces.spans')) return spanRow;
   if (sql.includes(' AS n FROM')) return facet;
-  if (sql.includes('AS at,')) return buckets;
+  if (sql.includes('AS at,')) return sql.includes(', currency FROM') ? costBuckets : buckets;
   if (sql.includes(', currency FROM')) return costs;
   if (sql.startsWith('SELECT') && sql.includes(' AS value FROM')) return total(128);
   return undefined;

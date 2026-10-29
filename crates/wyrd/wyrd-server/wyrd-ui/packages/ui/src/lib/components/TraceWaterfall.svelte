@@ -1,6 +1,7 @@
 <!--
   Every retained span of one trace as a tree against the trace's timeline.
-  Levels below the second start collapsed; "Expand all" opens every level and
+  Levels below the second start collapsed, except the path to the selected
+  span; "Expand all" opens every level and
   "Errors only" keeps error spans and their ancestors. Names come from data.
 -->
 <script lang="ts">
@@ -17,7 +18,14 @@
   /** Spans whose children show; `undefined` until the reader toggles one, meaning the first level only. */
   let opened = $state.raw<ReadonlySet<string> | undefined>();
   let errorsOnly = $state(false);
-  const open = (span: (typeof spans)[number]) => (opened ? opened.has(span.spanId) : span.depth === 0);
+  /** The selected span's ancestors: open by default so a deep selection is never hidden. */
+  const path = $derived.by(() => {
+    const parents = new Map(spans.map((span) => [span.spanId, span.depth === 0 ? null : span.parentId]));
+    const ancestors = new Set<string>();
+    for (let id = parents.get(input.spanId ?? ''); id && !ancestors.has(id); id = parents.get(id)) ancestors.add(id);
+    return ancestors;
+  });
+  const open = (span: (typeof spans)[number]) => (opened ? opened.has(span.spanId) : span.depth === 0 || path.has(span.spanId));
   const allOpen = $derived(spans.every((span) => span.children === 0 || open(span)));
 
   /** Error spans and every ancestor of one. */
@@ -42,7 +50,7 @@
   });
 
   function toggle(spanId: string) {
-    const next = new Set(opened ?? spans.filter((span) => span.depth === 0).map((span) => span.spanId));
+    const next = new Set(opened ?? spans.filter(open).map((span) => span.spanId));
     if (!next.delete(spanId)) next.add(spanId);
     opened = next;
   }

@@ -26,6 +26,7 @@
   import {
     buckets,
     card,
+    costBuckets,
     costs,
     day,
     denied,
@@ -64,7 +65,7 @@
     { stat: 'errors', total: total(3), series: buckets },
     { stat: 'duration_p95', total: total(2_840_000_000), series: buckets },
     { stat: 'tokens', total: total(null), series: { ...buckets, rows: [] } },
-    { stat: 'cost', total: costs, series: buckets }
+    { stat: 'cost', total: costs, series: costBuckets }
   ] as const;
   const facets = [
     { column: 'service_name', values: facet },
@@ -154,9 +155,9 @@
         <RecordDetail input={{ traceId: TRACE, spanId: SPAN }} result={{ state: 'populated', data: { ...spanRow, rows: [[...spanRow.rows[0].slice(0, 4), {}, [], null, null, null]] } }} />
       </div>
       <div class="grid">
-        <StatStrip input={{ stats: ['spans'] }} result={{ state: 'empty', data: { stats: [{ stat: 'spans', total: total(0), series: { ...buckets, rows: [] } }] }, reason: 'Nothing recorded in this range.' }} />
+        <StatStrip input={{ stats: ['spans'] }} result={{ state: 'empty', data: { stats: [{ stat: 'spans', total: total(0), series: { ...buckets, rows: [] } }] }, reason: 'Nothing recorded in bifrost.traces.spans in this range.' }} />
         <FacetRail input={{ signal: 'logs', facets: ['severity_text'] }} result={{ state: 'loading' }} />
-        <RecordTable input={{ signal: 'logs' }} result={{ state: 'empty', data: { rows: { ...traces, rows: [] } }, reason: 'No logs match this WHERE in this range.' }} />
+        <RecordTable input={{ signal: 'logs' }} result={{ state: 'empty', data: { rows: { ...traces, rows: [] } }, reason: 'No rows in bifrost.logs.records with time_unix_nano in this range matching severity_text.' }} />
         <TraceWaterfall input={{ traceId: TRACE }} result={{ state: 'empty', data: { ...trace, rows: [] }, reason: `No retained span you may read has trace_id ${TRACE}.` }} />
         <RecordDetail input={{ traceId: TRACE, spanId: SPAN }} result={{ state: 'denied', problem: denied }} />
         <TraceWaterfall input={{ traceId: TRACE }} result={{ state: 'error', problem: { code: 'WYRD_VALA_413_QUERY_RESULT_TOO_LARGE', title: 'Query result too large' } }} />

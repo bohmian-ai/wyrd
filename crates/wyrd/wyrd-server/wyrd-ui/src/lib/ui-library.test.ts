@@ -1177,7 +1177,7 @@ test('TASK-004: Canonical signal interactions', async () => {
   expect(validatePanel('TraceWaterfall', { traceId: "x' OR 1=1" })).toMatchObject({ code: 'WYRD_SPEC_400_VALIDATION' });
   expect(validatePanel('StatStrip', { stats: ['cost'], where: [{ column: 'name', value: 'x' }] })).toMatchObject({ code: 'WYRD_SPEC_400_VALIDATION' });
 
-  // Traces: root spans under bound WHERE clauses, then counts for exactly the visible traces.
+  // Traces: root spans of traces with any span matching the bound WHERE, then counts for exactly the visible traces.
   const where = [{ column: 'service_name', value: 'agent-api' }, { column: 'http_route', value: null, not: true }];
   const listed = recording((request) => ({ ok: true, value: observeAnswer((request as { sql: string }).sql)! }));
   const table = await loadRecordTable({ signal: 'traces', where }, { executor: listed.executor, range: RANGE });
@@ -1187,7 +1187,8 @@ test('TASK-004: Canonical signal interactions', async () => {
       sql:
         "SELECT start_time_unix_nano, name, service_name, duration_nano, status_code, encode(trace_id, 'hex') AS trace_id, encode(span_id, 'hex') AS span_id " +
         'FROM bifrost.traces.spans WHERE start_time_unix_nano >= $1::timestamptz AND start_time_unix_nano < $2::timestamptz AND parent_span_id IS NULL ' +
-        'AND service_name = $3 AND http_route IS NOT NULL ORDER BY start_time_unix_nano DESC LIMIT 50',
+        'AND trace_id IN (SELECT trace_id FROM bifrost.traces.spans WHERE start_time_unix_nano >= $1::timestamptz AND start_time_unix_nano < $2::timestamptz ' +
+        'AND service_name = $3 AND http_route IS NOT NULL) ORDER BY start_time_unix_nano DESC LIMIT 50',
       params: [RANGE.from, RANGE.to, 'agent-api']
     },
     {
@@ -1233,6 +1234,16 @@ test('TASK-004: Canonical signal interactions', async () => {
       'AND cost IS NOT NULL AND workload_card_uid = $3 GROUP BY currency ORDER BY currency',
     params: [RANGE.from, RANGE.to, 'card_01HX']
   });
+
+  // Tokens are summed from gateway usage entries whose unit is tokens.
+  expect(statQueries('tokens', { stats: ['tokens'] }, RANGE, '5 minutes')[0]).toEqual({
+    sql:
+      "SELECT sum(CAST(u['quantity'] AS DECIMAL(38, 12))) AS value FROM (SELECT started_at, workload_card_uid, subject_card_uid, unnest(usage) AS u FROM bifrost.gateway.calls) AS usage " +
+      "WHERE started_at >= $1::timestamptz AND started_at < $2::timestamptz AND u['unit'] = 'tokens'",
+    params: [RANGE.from, RANGE.to]
+  });
+  // Metric structure columns are listable beyond the defaults.
+  expect(validatePanel('RecordTable', { signal: 'metrics', columns: ['metric_name', 'bucket_counts', 'explicit_bounds'] })).toMatchObject({ component: 'RecordTable' });
 
   // Nanosecond offsets stay exact; an unretained parent or a parent cycle still places every span.
   expect(parseNanos('2026-10-20T11:58:02.450000001+00:00')! - parseNanos('2026-10-20T11:58:02.45Z')!).toBe(1n);
@@ -1308,7 +1319,24 @@ test('TASK-004: Canonical signal interactions', async () => {
   expect(list.queryByText('new root')).toBeNull();
   await fireEvent.click(list.getByRole('button', { name: '↑ 1 new traces' }));
   expect(list.getByText('new root')).toBeInTheDocument();
+  // Opening a record holds the list, counts included, until the reader resumes.
+  await fireEvent.mouseLeave(list.getByRole('region'));
+  await list.rerender({ input: { signal: 'traces', live: true }, result: populated, onaction: openAction });
+  await fireEvent.click(list.getAllByRole('row')[1]);
+  expect(list.getByRole('status')).toHaveTextContent('Live paused while a record is open');
+  await list.rerender({ input: { signal: 'traces', live: true }, result: { state: 'populated', data: { rows: newer } }, onaction: openAction });
+  expect(list.queryByText('new root')).toBeNull();
+  expect(list.getAllByRole('row')[1]).not.toHaveTextContent('…');
+  await fireEvent.click(list.getByRole('button', { name: '↑ 1 new traces' }));
+  expect(list.getByRole('status')).toHaveTextContent('Live');
+  expect(list.getByText('new root')).toBeInTheDocument();
   list.unmount();
+  // Refused counts say why and never read as still loading.
+  const refusedCounts = render(RecordTable, { input: { signal: 'traces' }, result: { state: 'populated', data: { rows: traces, counts: { state: 'denied', problem: denied } } } });
+  expect(refusedCounts.getByRole('note')).toHaveTextContent('Span and error counts unavailable');
+  expect(refusedCounts.getAllByRole('row')[1]).toHaveTextContent('— —');
+  expect(refusedCounts.getAllByRole('row')[1]).not.toHaveTextContent('…');
+  refusedCounts.unmount();
 
   // TraceWaterfall: levels below the second start collapsed; expand, errors only, and select.
   const selectAction = vi.fn();
@@ -1322,6 +1350,10 @@ test('TASK-004: Canonical signal interactions', async () => {
   await fireEvent.click(fall.getByRole('button', { name: /GET \/search/ }));
   expect(selectAction).toHaveBeenCalledWith({ name: 'trace.select', input: { trace_id: TRACE, span_id: 'c1d2e3f405060708' } });
   fall.unmount();
+  // A selected deep span opens its ancestors without Expand all.
+  const deep = render(TraceWaterfall, { input: { traceId: TRACE, spanId: 'c1d2e3f405060708' }, result: { state: 'populated', data: trace } });
+  expect(deep.getByText('GET /search')).toBeInTheDocument();
+  deep.unmount();
 
   // RecordDetail: recorded messages show; an absent section names what would fill it; filter, exclude and logs intents.
   const detailAction = vi.fn();

@@ -25,7 +25,7 @@
       <section>
         <h3 title={column}>{columnLabel(column)}</h3>
         {#if values.rows.length === 0}
-          <p class="none">No values in this range.</p>
+          <p class="none">No {column} recorded in this range.</p>
         {:else}
           <ul>
             {#each values.rows.slice(0, FACET_VALUES) as [value, n], index (index)}

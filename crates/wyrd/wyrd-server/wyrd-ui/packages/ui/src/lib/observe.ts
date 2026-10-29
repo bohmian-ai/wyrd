@@ -102,6 +102,18 @@ class Binds {
     return this;
   }
 
+  /**
+   * Keep root spans in the range whose trace has a span matching every
+   * predicate so far, so a filter on a child span's column, such as the
+   * Card on a model call, finds its trace. The first clause is the range.
+   */
+  roots(table: string): this {
+    const [window, ...rest] = this.clauses;
+    const matching = rest.length ? [`trace_id IN (SELECT trace_id FROM ${table} WHERE ${this.sql})`] : [];
+    this.clauses.splice(0, this.clauses.length, window, ROOT, ...matching);
+    return this;
+  }
+
   get sql(): string {
     return this.clauses.join(' AND ');
   }
@@ -124,19 +136,19 @@ function firstFailure(results: readonly { ok: boolean; problem?: Problem }[]): L
 }
 
 /** The value column and table of each built-in stat. */
-const STAT_SOURCES: Record<Stat, { table: string; time: string; value: string; filter?: string; byCurrency?: true }> = {
-  traces: { table: SIGNALS.spans.table, time: SIGNALS.spans.time, value: 'count(*)', filter: ROOT },
+const STAT_SOURCES: Record<Stat, { table: string; time: string; value: string; filter?: string; roots?: true; byCurrency?: true }> = {
+  traces: { table: SIGNALS.spans.table, time: SIGNALS.spans.time, value: 'count(*)', roots: true },
   spans: { table: SIGNALS.spans.table, time: SIGNALS.spans.time, value: 'count(*)' },
   errors: { table: SIGNALS.spans.table, time: SIGNALS.spans.time, value: 'count(*)', filter: `status_code = ${STATUS_ERROR}` },
-  duration_p95: { table: SIGNALS.spans.table, time: SIGNALS.spans.time, value: 'approx_percentile_cont(duration_nano, 0.95)', filter: ROOT },
+  duration_p95: { table: SIGNALS.spans.table, time: SIGNALS.spans.time, value: 'approx_percentile_cont(duration_nano, 0.95)', roots: true },
   invocations: { table: SIGNALS.spans.table, time: SIGNALS.spans.time, value: 'count(*)', filter: "gen_ai_operation_name = 'invoke_agent'" },
-  // Null, never zero, when no span recorded any usage.
+  // The gateway's metered usage: one row per call and usage entry, counting only token units, so
+  // nested spans never count one call twice. Null, never zero, when no call recorded any.
   tokens: {
-    table: SIGNALS.spans.table,
-    time: SIGNALS.spans.time,
-    value:
-      'CASE WHEN count(gen_ai_usage_input_tokens) + count(gen_ai_usage_output_tokens) = 0 THEN NULL ' +
-      'ELSE coalesce(sum(gen_ai_usage_input_tokens), 0) + coalesce(sum(gen_ai_usage_output_tokens), 0) END'
+    table: '(SELECT started_at, workload_card_uid, subject_card_uid, unnest(usage) AS u FROM bifrost.gateway.calls) AS usage',
+    time: 'started_at',
+    value: "sum(CAST(u['quantity'] AS DECIMAL(38, 12)))",
+    filter: "u['unit'] = 'tokens'"
   },
   calls: { table: 'bifrost.gateway.calls', time: 'started_at', value: 'count(*)' },
   // Amounts in different currencies never add up: one row per recorded currency.
@@ -153,6 +165,7 @@ export function statQueries(stat: Stat, input: StatStripInput, range: AbsoluteRa
     if (source.filter) binds.clauses.push(source.filter);
     if (input.scope) binds.clauses.push(`${input.scope.column} = ${binds.bind(input.scope.uid)}`);
     if (span) binds.where(input.where);
+    if (source.roots) binds.roots(source.table);
     const currency = source.byCurrency ? ', currency' : '';
     const sql = series
       ? `SELECT ${bin} AS at, ${source.value} AS value${currency} FROM ${source.table} WHERE ${binds.sql} GROUP BY ${bin}${currency} ORDER BY at`
@@ -176,7 +189,10 @@ export async function loadStatStrip(input: StatStripInput, context: LoadContext)
     series: (results[index * 2 + 1] as { value: QueryResult }).value
   }));
   const recorded = stats.some(({ total }) => total.rows.some((row) => row[0] !== null && Number(row[0]) !== 0));
-  if (!recorded) return { input, result: { state: 'empty', data: { stats }, reason: `Nothing recorded in this range${scopeText(input)}.` } };
+  if (!recorded) {
+    const tables = [...new Set(input.stats.map((stat) => (stat === 'tokens' ? 'bifrost.gateway.calls usage' : STAT_SOURCES[stat].table)))].join(' or ');
+    return { input, result: { state: 'empty', data: { stats }, reason: `Nothing recorded in ${tables} in this range${scopeText(input)}.` } };
+  }
   return { input, result: { state: 'populated', data: { stats } } };
 }
 
@@ -185,14 +201,22 @@ function scopeText(input: StatStripInput): string {
   return input.scope ? ` for ${input.scope.column} = ${input.scope.uid}` : '';
 }
 
+/** Why a signal list is empty, naming the table, its event-time column and the WHERE that would have to match. */
+function emptyList(signal: Signal, where: readonly Filter[] = []): string {
+  const what = signal === 'traces' ? 'root spans' : 'rows';
+  const matching = where.length ? ` matching ${where.map((filter) => filter.column).join(', ')}` : '';
+  return `No ${what} in ${SIGNALS[signal].table} with ${SIGNALS[signal].time} in this range${matching}.`;
+}
+
 /** Facet counts of one column under the list's own WHERE and range. */
 export function facetQuery(input: FacetRailInput, column: string, range: AbsoluteRange): Executed {
   const signal = SIGNALS[input.signal];
   const binds = Binds.over(signal.time, range);
-  if (input.signal === 'traces') binds.clauses.push(ROOT);
   binds.where(input.where);
+  // A trace facet counts the traces with a span of each value, under the same span-level WHERE.
+  const n = input.signal === 'traces' ? 'count(DISTINCT trace_id)' : 'count(*)';
   return {
-    sql: `SELECT ${column} AS value, count(*) AS n FROM ${signal.table} WHERE ${binds.sql} GROUP BY ${column} ORDER BY n DESC, value LIMIT ${FACET_VALUES + 1}`,
+    sql: `SELECT ${column} AS value, ${n} AS n FROM ${signal.table} WHERE ${binds.sql} GROUP BY ${column} ORDER BY n DESC, value LIMIT ${FACET_VALUES + 1}`,
     params: binds.params
   };
 }
@@ -207,7 +231,7 @@ export async function loadFacetRail(input: FacetRailInput, context: LoadContext)
   if (failure) return { input, result: failure };
   const facets = input.facets.map((column, index) => ({ column, values: (results[index] as { value: QueryResult }).value }));
   if (facets.every(({ values }) => values.rows.length === 0))
-    return { input, result: { state: 'empty', data: { facets }, reason: `No ${input.signal} match this WHERE in this range.` } };
+    return { input, result: { state: 'empty', data: { facets }, reason: emptyList(input.signal, input.where) } };
   return { input, result: { state: 'populated', data: { facets } } };
 }
 
@@ -228,8 +252,8 @@ export function shownColumns(input: Extract<RecordTableInput, { signal: Signal }
 export function listQuery(input: Extract<RecordTableInput, { signal: Signal }>, range: AbsoluteRange): Executed {
   const signal = SIGNALS[input.signal];
   const binds = Binds.over(signal.time, range);
-  if (input.signal === 'traces') binds.clauses.push(ROOT);
   binds.where(input.where);
+  if (input.signal === 'traces') binds.roots(signal.table);
   const keys = KEY_COLUMNS[input.signal].map((key) => (key.endsWith('_id') && key !== 'wyrd_request_id' ? `encode(${key}, 'hex') AS ${key}` : key));
   return {
     sql: `SELECT ${[...shownColumns(input), ...keys].join(', ')} FROM ${signal.table} WHERE ${binds.sql} ORDER BY ${signal.time} DESC LIMIT ${input.limit ?? LIST_LIMIT}`,
@@ -270,7 +294,7 @@ export async function loadRecordTable(input: RecordTableInput, context: LoadCont
   if (!read.ok) return { input, executed, result: failed(read.problem) };
   const rows = read.value;
   if (rows.rows.length === 0) {
-    const reason = 'sql' in input ? 'The SQL returned no rows in this range.' : `No ${input.signal} match this WHERE in this range.`;
+    const reason = 'sql' in input ? 'The SQL returned no rows in this range.' : emptyList(input.signal, input.where);
     return { input, executed, result: { state: 'empty', data: { rows }, reason } };
   }
   if (!('signal' in input) || input.signal !== 'traces') return { input, executed, result: { state: 'populated', data: { rows } } };

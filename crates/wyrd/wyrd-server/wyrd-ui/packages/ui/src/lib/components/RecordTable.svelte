@@ -3,9 +3,10 @@
   log record or metric point otherwise, or the rows of authored SQL. Trace
   rows carry span and error counts read for the visible traces only.
 
-  A live list holds what is on screen while the reader hovers, focuses or
-  scrolls it, or the host pauses it, and offers "↑ N new" instead of moving
-  rows under the pointer.
+  A live list holds what is on screen, rows and counts together, while the
+  reader hovers, focuses or scrolls it, after it opens a record until the
+  reader resumes, or while the host pauses it; it offers "↑ N new" instead of
+  moving rows under the pointer.
 -->
 <script lang="ts">
   import type { ActionProps, QueryResult } from '../contract.js';
@@ -21,17 +22,26 @@
 
   const TONES: Record<number, Tone> = { 0: 'neutral', 1: 'ok', 2: 'danger' };
   const signal = $derived('signal' in input ? input.signal : undefined);
-  const latest = $derived(result.state === 'populated' || result.state === 'empty' ? result.data.rows : undefined);
+  const loaded = $derived(result.state === 'populated' ? result.data : result.state === 'empty' ? { rows: result.data.rows } : undefined);
+  const latest = $derived(loaded?.rows);
 
-  /** Rows on screen while the reader holds a live list. */
-  let held = $state.raw<QueryResult | undefined>();
+  /** Rows and counts on screen while the reader holds a live list. */
+  let held = $state.raw<typeof loaded>();
   let reading = $state(false);
-  const holding = $derived(input.live === true && (paused || reading));
+  /** A record opened from this list, until the reader resumes. */
+  let opened = $state(false);
+  const holding = $derived(input.live === true && (paused || reading || opened));
   $effect.pre(() => {
     if (!holding) held = undefined;
-    else if (!held) held = latest;
+    else if (!held) held = loaded;
   });
-  const rows = $derived(held ?? latest);
+  const shown = $derived(held ?? loaded);
+  const rows = $derived(shown?.rows);
+  function resume() {
+    held = undefined;
+    reading = false;
+    opened = false;
+  }
 
   const columns = $derived(rows ? ('signal' in input ? shownColumns(input) : rows.columns.map((column) => column.name)) : []);
   const keyOf = (data: QueryResult, row: readonly unknown[]) => {
@@ -39,12 +49,15 @@
     return JSON.stringify(keys.length ? keys : row);
   };
   const fresh = $derived.by(() => {
-    if (!held || !latest || held === latest) return 0;
-    const seen = new Set(held.rows.map((row) => keyOf(held!, row)));
+    const before = held?.rows;
+    if (!before || !latest || before === latest) return 0;
+    const seen = new Set(before.rows.map((row) => keyOf(before, row)));
     return latest.rows.filter((row) => !seen.has(keyOf(latest, row))).length;
   });
 
-  const counts = $derived(result.state === 'populated' ? result.data.counts : undefined);
+  const counts = $derived(shown?.counts);
+  /** A count cell before its read lands, or after it was refused. */
+  const pending = $derived(counts?.state === 'denied' || counts?.state === 'error' ? '—' : '…');
   const byTrace = $derived(
     new Map(counts?.state === 'populated' ? counts.data.rows.map((row) => [String(row[0]), [numeric(row[1]), numeric(row[2])]]) : [])
   );
@@ -73,6 +86,7 @@
       signal === 'logs'
         ? { log: { time_unix_nano: at('time_unix_nano'), observed_time_unix_nano: at('observed_time_unix_nano'), wyrd_request_id: at('wyrd_request_id') } }
         : { trace_id: at('trace_id'), span_id: at('span_id') };
+    opened = input.live === true;
     onaction?.({ name: 'record.open', input: target });
   }
 
@@ -86,10 +100,8 @@
     {#if input.live}
       <p class="live" role="status">
         {#if holding}
-          Live paused{fresh > 0 ? '' : ' while you read'}
-          {#if fresh > 0}
-            · <button type="button" onclick={() => ((held = undefined), (reading = false))}>↑ {fresh} new {signal ?? 'rows'}</button>
-          {/if}
+          Live paused{opened ? ' while a record is open' : fresh > 0 ? '' : ' while you read'} ·
+          <button type="button" onclick={resume}>{fresh > 0 ? `↑ ${fresh} new ${signal ?? 'rows'}` : 'Resume'}</button>
         {:else}
           <span aria-hidden="true">●</span> Live
         {/if}
@@ -105,6 +117,8 @@
       {onscroll}
       onmouseenter={() => (reading = true)}
       onmouseleave={(event) => (reading = event.currentTarget.scrollTop > 0)}
+      onfocusin={() => (reading = true)}
+      onfocusout={(event) => (reading = event.currentTarget.contains(event.relatedTarget as Node) || event.currentTarget.scrollTop > 0)}
     >
       <table>
         <thead>
@@ -141,8 +155,8 @@
                   </td>
                 {/each}
                 {#if signal === 'traces'}
-                  <td>{traceCounts ? fmtCount(traceCounts[0]) : '…'}</td>
-                  <td class:errors={(traceCounts?.[1] ?? 0) > 0}>{traceCounts ? fmtCount(traceCounts[1]) : '…'}</td>
+                  <td>{traceCounts ? fmtCount(traceCounts[0]) : pending}</td>
+                  <td class:errors={(traceCounts?.[1] ?? 0) > 0}>{traceCounts ? fmtCount(traceCounts[1]) : pending}</td>
                 {/if}
               </tr>
             {/each}

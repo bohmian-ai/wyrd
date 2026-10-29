@@ -481,7 +481,6 @@ impl<T> ScribeTailResolver<T> {
                     event_time: crate::catalog::event_time::EventTimeStatistics::Unusable(
                         crate::catalog::event_time::EventTimeBoundsDefect::Missing,
                     ),
-                    row_groups: None,
                 });
             }
             // A staged run's footer is never cached, so its row groups are

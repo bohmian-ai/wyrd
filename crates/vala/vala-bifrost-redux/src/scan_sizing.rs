@@ -19,8 +19,6 @@ use std::sync::Arc;
 
 use num_traits::ToPrimitive;
 
-use datafusion::datasource::physical_plan::parquet::{ParquetAccessPlan, RowGroupAccessPlanFilter};
-
 use crate::resources::BifrostResourceError;
 
 /// Fewest execution partitions any admitted Oracle query receives.
@@ -298,42 +296,26 @@ impl<'scope> ScanSizer<'scope> {
     /// groups of `footer` the filters cannot rule out, and how many row
     /// groups those are.
     ///
-    /// Every row group starts kept; see [`Self::row_groups`] for how the
-    /// filters prune them and [`Self::plan_size`] for what counts.
+    /// The filters prune against the footer's memoized Arrow schema
+    /// ([`parquet::file::metadata::ParquetMetaData::arrow_schema`]), the same
+    /// one the scan's reader opens the file with, so it is derived once per
+    /// footer rather than once per sizing. A footer whose schema does not
+    /// convert to Arrow, or a scope with no plannable filter, keeps every row
+    /// group. A footer written under another
+    /// schema revision has the filters planned against its own columns, so a
+    /// filter on a column it lacks drops out instead of misreading another. A column chunk counts when
+    /// its top-level column is covered, so a Variant column counts every
+    /// shredded child.
     #[must_use]
     pub(crate) fn footer_size(
         &self,
         footer: &parquet::file::metadata::ParquetMetaData,
     ) -> ScanSize {
-        self.plan_size(
-            footer,
-            &self.row_groups(footer, ParquetAccessPlan::new_all(footer.num_row_groups())),
-        )
-    }
-
-    /// Narrows `start`, a plan over `footer`'s row groups, to those the
-    /// scope's filters cannot rule out by their statistics.
-    ///
-    /// Only the row groups `start` still scans are evaluated, so a plan an
-    /// earlier pruning made is not pruned again. The scan's Parquet opener
-    /// takes the result as the file's initial plan, as [`ParquetAccessPlan`]
-    /// documents, and likewise evaluates only what remains.
-    ///
-    /// The filters prune against the footer's memoized Arrow schema
-    /// ([`parquet::file::metadata::ParquetMetaData::arrow_schema`]), the same
-    /// one the scan's reader opens the file with, so it is derived once per
-    /// footer rather than once per sizing. A footer whose schema does not
-    /// convert to Arrow, or a scope with no plannable filter, keeps `start`.
-    /// A footer written under another schema revision has the filters
-    /// planned against its own columns, so a filter on a column it lacks
-    /// drops out instead of misreading another.
-    #[must_use]
-    pub(crate) fn row_groups(
-        &self,
-        footer: &parquet::file::metadata::ParquetMetaData,
-        start: ParquetAccessPlan,
-    ) -> ParquetAccessPlan {
-        let mut access = RowGroupAccessPlanFilter::new(start);
+        use datafusion::datasource::physical_plan::parquet::{
+            ParquetAccessPlan, RowGroupAccessPlanFilter,
+        };
+        let mut access =
+            RowGroupAccessPlanFilter::new(ParquetAccessPlan::new_all(footer.num_row_groups()));
         if let Ok(file_schema) = footer.arrow_schema() {
             let revised;
             let pruning = if file_schema
@@ -356,22 +338,7 @@ impl<'scope> ScanSizer<'scope> {
                 );
             }
         }
-        access.build()
-    }
-
-    /// Returns the uncompressed bytes of the scope's columns in the row
-    /// groups of `footer` that `plan` scans, and how many row groups those
-    /// are.
-    ///
-    /// A column chunk counts when its top-level column is covered, so a
-    /// Variant column counts every shredded child.
-    #[must_use]
-    fn plan_size(
-        &self,
-        footer: &parquet::file::metadata::ParquetMetaData,
-        plan: &ParquetAccessPlan,
-    ) -> ScanSize {
-        let kept = plan.row_group_indexes();
+        let kept: Vec<usize> = access.row_group_indexes().collect();
         let bytes = kept
             .iter()
             .flat_map(|index| footer.row_group(*index).columns())
@@ -408,19 +375,17 @@ impl<'scope> ScanSizer<'scope> {
         )
     }
 
-    /// Returns the size of one Parquet file: the row groups of `planned`,
-    /// the plan the scan reads its footer with, that [`Self::row_groups`]
-    /// keeps, or `on_disk` bytes and no known row group when its footer could
-    /// not be read, recorded as [`SizingFallback::UnreadFooter`].
+    /// Returns the size of one Parquet file: its footer's
+    /// [`Self::footer_size`], or `on_disk` bytes and no known row group when
+    /// its footer could not be read, recorded as
+    /// [`SizingFallback::UnreadFooter`].
     ///
-    /// A file without a plan starts from every row group. The scan reports
-    /// an unreadable file itself; sizing it by its whole size only keeps more
-    /// bytes.
+    /// The scan reports an unreadable file itself; sizing it by its whole
+    /// size only keeps more bytes.
     #[must_use]
     pub(crate) fn file_size(
         &self,
         footer: Option<&parquet::file::metadata::ParquetMetaData>,
-        planned: Option<&ParquetAccessPlan>,
         on_disk: u64,
     ) -> ScanSize {
         footer.map_or_else(
@@ -431,12 +396,7 @@ impl<'scope> ScanSizer<'scope> {
                     row_groups: 0,
                 }
             },
-            |footer| {
-                let start = planned
-                    .cloned()
-                    .unwrap_or_else(|| ParquetAccessPlan::new_all(footer.num_row_groups()));
-                self.plan_size(footer, &self.row_groups(footer, start))
-            },
+            |footer| self.footer_size(footer),
         )
     }
 

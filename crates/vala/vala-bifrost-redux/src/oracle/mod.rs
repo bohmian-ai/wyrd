@@ -2815,7 +2815,6 @@ impl Oracle {
                             file.min_event_time,
                             file.max_event_time,
                         ),
-                    row_groups: None,
                 })
             })
             .collect()

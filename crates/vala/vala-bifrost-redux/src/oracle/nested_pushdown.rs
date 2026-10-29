@@ -552,7 +552,6 @@ pub(super) mod tests {
                     event_time: crate::catalog::event_time::EventTimeStatistics::Unusable(
                         crate::catalog::event_time::EventTimeBoundsDefect::Missing,
                     ),
-                    row_groups: None,
                 }],
                 HotObjects::Warehouse(warehouse_objects(self.root.path())),
                 *FIXTURE_TENANT,

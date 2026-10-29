@@ -31,8 +31,7 @@ use datafusion::config::ConfigOptions;
 use datafusion::datasource::listing::PartitionedFile;
 use datafusion::datasource::physical_plan::parquet::metadata::DFParquetMetadata;
 use datafusion::datasource::physical_plan::parquet::{
-    CachedParquetFileReaderFactory, DefaultParquetFileReaderFactory, ParquetAccessPlan,
-    ParquetFileReaderFactory,
+    CachedParquetFileReaderFactory, DefaultParquetFileReaderFactory, ParquetFileReaderFactory,
 };
 use datafusion::datasource::physical_plan::{
     FileGroup, FileScanConfig, FileScanConfigBuilder, ParquetSource,
@@ -50,7 +49,6 @@ use datafusion::physical_plan::aggregates::AggregateExec;
 use datafusion::physical_plan::joins::{HashJoinExec, SortMergeJoinExec};
 use datafusion::physical_plan::metrics::{
     Count, ExecutionPlanMetricsSet, MetricBuilder, MetricType, MetricValue, MetricsSet,
-    PruningMetrics,
 };
 use datafusion::physical_plan::projection::ProjectionExec;
 use datafusion::physical_plan::sorts::sort::SortExec;
@@ -814,24 +812,12 @@ impl ParquetFileReaderFactory for TenantParquetReaderFactory {
                 .bytes_counter("bytes_scanned", partition_index),
             present: false,
         });
-        let planned = file
-            .extension::<ParquetAccessPlan>()
-            .filter(|plan| plan.row_group_index_iter().count() < plan.len())
-            .map(|plan| PlannedSkips {
-                plan: plan.clone(),
-                range: file.range.as_ref().map(|range| range.start..range.end),
-                pruned: MetricBuilder::new(metrics)
-                    .with_new_label("filename", file.object_meta.location.to_string())
-                    .with_type(MetricType::Summary)
-                    .pruning_metrics("row_groups_pruned_statistics", partition_index),
-            });
         Ok(Box::new(TenantParquetReader {
             inner: self
                 .inner
                 .create_reader(partition_index, file, metadata_size_hint, metrics)?,
             tenant: self.tenant,
             ranges,
-            planned,
         }))
     }
 }
@@ -845,51 +831,6 @@ struct TenantParquetReader {
     /// This object's view of the node's byte-range cache, when the object is
     /// a warehouse object on a node with the cache.
     ranges: Option<CachedRanges>,
-    /// The row groups planning pruned from this object, counted once its
-    /// footer loads; `None` when planning pruned none.
-    planned: Option<PlannedSkips>,
-}
-
-/// The row groups planning pruned from one opened object or byte range of it,
-/// which the Parquet opener never evaluates and so never counts.
-///
-/// They are counted as `row_groups_pruned_statistics`, the opener's own
-/// metric for the same statistics pruning, so the scan's pruning evidence is
-/// the same whether planning or the opener pruned a row group. A byte range
-/// counts only the row groups it reads, as the opener assigns them.
-struct PlannedSkips {
-    /// The plan the object was opened with.
-    plan: ParquetAccessPlan,
-    /// The byte range this open reads, `None` for the whole object.
-    range: Option<Range<i64>>,
-    /// The scan's statistics-pruning metric for this object.
-    pruned: PruningMetrics,
-}
-
-impl PlannedSkips {
-    /// Counts the row groups of `metadata` in this open's range that the
-    /// plan skips.
-    fn record(&self, metadata: &ParquetMetaData) {
-        let skipped = metadata
-            .row_groups()
-            .iter()
-            .enumerate()
-            .filter(|(index, group)| {
-                !self.plan.should_scan(*index)
-                    && self.range.as_ref().is_none_or(|range| {
-                        // The opener's own assignment: the byte range holding
-                        // a row group's first page reads it.
-                        let column = group.column(0);
-                        range.contains(
-                            &column
-                                .dictionary_page_offset()
-                                .unwrap_or_else(|| column.data_page_offset()),
-                        )
-                    })
-            })
-            .count();
-        self.pruned.add_pruned(skipped);
-    }
 }
 
 /// One warehouse object's reads through the node's byte-range cache.
@@ -1029,8 +970,7 @@ impl AsyncFileReader for TenantParquetReader {
         .boxed()
     }
 
-    /// Loads the footer through the inner reader, proves its tenant, and
-    /// counts the row groups planning pruned ([`PlannedSkips`]).
+    /// Loads the footer through the inner reader and proves its tenant.
     ///
     /// # Errors
     ///
@@ -1048,9 +988,6 @@ impl AsyncFileReader for TenantParquetReader {
             verify_scanned_footer_tenant(&metadata, self.tenant).map_err(|error| {
                 ParquetError::External(Box::new(super::QueryCatalogError(error)))
             })?;
-            if let Some(planned) = self.planned.take() {
-                planned.record(&metadata);
-            }
             Ok(metadata)
         }
         .boxed()
@@ -1261,9 +1198,6 @@ pub(super) fn hot_parquet_scan(
             if let Some(lease) = &lease {
                 partitioned = partitioned.with_extension(Arc::clone(lease));
             }
-            if let Some(row_groups) = file.row_groups {
-                partitioned = partitioned.with_extension(row_groups);
-            }
             Ok(partitioned)
         })
         .collect::<DataFusionResult<Vec<_>>>()?;
@@ -1368,7 +1302,6 @@ pub(super) async fn published_files(
             event_time: crate::catalog::event_time::EventTimeStatistics::Unusable(
                 crate::catalog::event_time::EventTimeBoundsDefect::Missing,
             ),
-            row_groups: None,
         })
         .collect())
 }
@@ -1394,12 +1327,6 @@ pub(crate) struct HotFileSource {
     /// Carried from the durable `vala.file_list` row so a scan can decide the
     /// file before it is opened. Unusable statistics retain the file.
     pub(crate) event_time: crate::catalog::event_time::EventTimeStatistics,
-    /// The row groups of this file the scan's pushed filters leave, pruned
-    /// once when planning loaded its footer; `None` scans every row group.
-    ///
-    /// [`hot_parquet_scan`] hands it to the Parquet opener as the file's
-    /// initial plan, so the opener evaluates only these row groups.
-    pub(crate) row_groups: Option<ParquetAccessPlan>,
 }
 
 impl HotFileSource {
@@ -1691,11 +1618,9 @@ impl OracleTableProvider {
     ///
     /// Lists the pinned snapshot's published files Iceberg keeps under
     /// `filters` and appends the hot files, keeps those [`Self::keep`] cannot
-    /// rule out under `filters`, loads the kept files' footers through
-    /// [`Self::cache_footers`], and records on each the row groups `filters`
-    /// leave in its footer ([`HotFileSource::row_groups`]). Sizing and the
-    /// physical scan both call this, so one query lists, prunes, and looks
-    /// its footers up once.
+    /// rule out under `filters`, and loads the kept files' footers through
+    /// [`Self::cache_footers`]. Sizing and the physical scan both call this,
+    /// so one query lists, prunes, and looks its footers up once.
     ///
     /// # Errors
     ///
@@ -1724,26 +1649,17 @@ impl OracleTableProvider {
             columns: Vec::new(),
             filters: filters.to_vec(),
         };
-        let sizer = crate::scan_sizing::ScanSizer::new(&pushed, &self.physical_schema);
-        let keep = self.keep(&files, &sizer);
-        let mut kept: Vec<HotFileSource> = files
+        let keep = self.keep(
+            &files,
+            &crate::scan_sizing::ScanSizer::new(&pushed, &self.physical_schema),
+        );
+        let kept: Vec<HotFileSource> = files
             .iter()
-            .zip(&keep)
-            .filter(|(_, keep)| **keep)
+            .zip(keep)
+            .filter(|(_, keep)| *keep)
             .map(|(file, _)| file.clone())
             .collect();
         let footers = self.cache_footers(&kept, state.config().options()).await;
-        // Each loaded footer's row groups are pruned once here; sizing and
-        // the scan's opener both start from the result.
-        for (file, footer) in kept.iter_mut().zip(&footers) {
-            file.row_groups = footer.as_ref().map(|footer| {
-                sizer.row_groups(footer, ParquetAccessPlan::new_all(footer.num_row_groups()))
-            });
-        }
-        let mut planned_kept = kept.iter();
-        for (file, _) in files.iter_mut().zip(&keep).filter(|(_, keep)| **keep) {
-            file.row_groups = planned_kept.next().and_then(|kept| kept.row_groups.clone());
-        }
         let planned = Arc::new(PlannedFiles {
             files,
             kept,
@@ -1798,7 +1714,6 @@ impl OracleTableProvider {
             .map(|((file, footer), _)| {
                 sizer.file_size(
                     footer.as_deref(),
-                    file.row_groups.as_ref(),
                     u64::try_from(file.size_bytes).unwrap_or(u64::MAX),
                 )
             })
@@ -2869,7 +2784,6 @@ pub(super) mod tests {
             size_bytes,
             row_count: None,
             event_time: unusable_event_time(),
-            row_groups: None,
         }
     }
 
@@ -2978,62 +2892,6 @@ pub(super) mod tests {
 
         assert_eq!(partitions, 6);
         assert_eq!(actual, values);
-    }
-
-    /// A hot file's planned row groups are the opener's initial plan, so a
-    /// row group planning pruned is never read.
-    ///
-    /// Three two-row groups are scanned with no predicate and the middle one
-    /// planned out; only the outer groups' rows come back, and the skipped
-    /// group counts as pruned by statistics.
-    ///
-    /// # Panics
-    /// Panics when the scan cannot plan or execute, reads the pruned rows, or
-    /// does not count the skipped group.
-    #[tokio::test]
-    async fn hot_parquet_scan_reads_only_planned_row_groups() {
-        use datafusion::datasource::physical_plan::parquet::RowGroupAccess;
-        let root = tempfile::tempdir().expect("planned fixture directory");
-        let schema = Arc::new(Schema::new(vec![Field::new(
-            "value",
-            DataType::Int64,
-            false,
-        )]));
-        let size = write_split_fixture(
-            &root.path().join("planned.parquet"),
-            &schema,
-            &[0, 1, 2, 3, 4, 5],
-        );
-        let file = HotFileSource {
-            row_groups: Some(ParquetAccessPlan::new(vec![
-                RowGroupAccess::Scan,
-                RowGroupAccess::Skip,
-                RowGroupAccess::Scan,
-            ])),
-            ..split_file("planned.parquet", size)
-        };
-        let options = crate::resources::OracleSessionShape::for_test().config_options();
-        let scan = hot_parquet_scan(
-            vec![file],
-            HotObjects::Warehouse(warehouse_objects(root.path())),
-            *FIXTURE_TENANT,
-            &schema,
-            Some(FIXTURE_TIME_COLUMN),
-            &Arc::new(options),
-            Some(1),
-        )
-        .expect("planned hot scan plans");
-        let stream = scan
-            .execute(0, Arc::new(TaskContext::default()))
-            .expect("planned partition stream");
-
-        assert_eq!(collect_int64(stream).await, vec![0, 1, 4, 5]);
-        let metrics = scan.metrics().expect("the scan records metrics");
-        assert_eq!(
-            parquet_pruning(&metrics).row_groups_pruned,
-            1,
-            "the planned skip counts as statistics pruning"
-        );
     }
 
     /// A hot object whose footer is missing or names a foreign tenant fails
@@ -4586,7 +4444,6 @@ pub(super) mod tests {
                 scanned: scanned.clone(),
                 present: false,
             }),
-            planned: None,
         };
         let scanned = Count::new();
         let mut first = reader(&scanned);

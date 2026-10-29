@@ -532,7 +532,7 @@ mod tests {
         let writes = experiment(query::Experiment::WritesParquet, &[], HOST);
         let hot = experiment(query::Experiment::Hot, &[], HOST);
         let parquet = experiment(query::Experiment::Parquet, &[], HOST);
-        for (bifrost, budget) in [(&writes, 480), (&hot, 480), (&parquet, 300)] {
+        for (bifrost, budget) in [(&writes, 480), (&hot, 300), (&parquet, 300)] {
             assert!(bifrost.refusals().is_empty(), "{:?}", bifrost.refusals());
             assert_eq!(
                 bifrost.timing,
@@ -540,7 +540,7 @@ mod tests {
                     budget_seconds: budget,
                     ..timing
                 },
-                "writes-parquet and hot fit 480 s and parquet 300 s"
+                "writes-parquet fits 480 s and every other L1 experiment 300 s"
             );
             for control in ["fixture", "limits", "workload", "timing"] {
                 assert!(bifrost.controls.contains_key(control), "{control}");
@@ -621,26 +621,23 @@ mod tests {
         assert_eq!(
             steps(&hot, true),
             [
-                "point-c1",
-                "point-c64",
-                "small-aggregate-c1",
-                "span-shredded-c1",
-                "span-learned-shredded-c1",
-                "span-learned-shredded-c64"
+                "point-memtable-c1",
+                "point-memtable-c64",
+                "point-staged-c1",
+                "small-aggregate-memtable-c1",
+                "small-aggregate-staged-c1",
+                "span-region-memtable-canonical-c1",
+                "span-region-staged-canonical-c1",
+                "span-region-memtable-learned-c1",
+                "span-region-staged-learned-c1"
             ]
         );
-        assert_eq!(
-            steps(&hot, false),
-            ["point-scaling", "span-learned-shredded-scaling"]
-        );
+        assert_eq!(steps(&hot, false), ["point-memtable-scaling"]);
         assert!(
             hot.controls["limits"]
                 .as_str()
-                .is_some_and(|limits| limits.contains(&format!(
-                    "WYRD_MAX_FILE_RETENTION_TIME={}",
-                    query::HOT_RETENTION.as_secs()
-                ))),
-            "hot rotates by the retention its day-2 windows are judged against"
+                .is_some_and(|limits| limits.contains("WYRD_MAX_FILE_RETENTION_TIME=86400")),
+            "under the hot settings nothing ages out; only the benchmark control moves rows"
         );
         let reads = [
             "point-c1",
@@ -679,8 +676,8 @@ mod tests {
             "writes-parquet runs the production rotation with a 30 s retention"
         );
         assert!(applies(&writes, "point-p99-slo").is_empty());
-        for bifrost in [&hot, &parquet] {
-            assert_eq!(applies(bifrost, "point-p99-slo"), ["point-c64"]);
+        for (bifrost, point) in [(&hot, "point-memtable-c64"), (&parquet, "point-c64")] {
+            assert_eq!(applies(bifrost, "point-p99-slo"), [point]);
             let slo = bifrost
                 .criteria
                 .iter()
@@ -987,7 +984,7 @@ mod tests {
             ),
             (
                 bifrost(query::Experiment::Hot),
-                "small-aggregate-c1",
+                "small-aggregate-memtable-c1",
                 "queries",
                 vec![
                     "queries_per_s_per_vcpu",

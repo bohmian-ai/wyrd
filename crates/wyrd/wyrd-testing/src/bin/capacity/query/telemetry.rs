@@ -753,13 +753,12 @@ impl Telemetry {
     }
 
     /// Counts spans `first..last` whose shredded `region` key is `eu-west`,
-    /// bounded on `start_time_unix_nano` to the fixture day holding span
-    /// `first`, so one day's cohort is read and counted alone.
+    /// bounded on `start_time_unix_nano` to those spans' start times, so one
+    /// cohort is read and counted alone. `first` and `last` are whole
+    /// traces: multiples of [`SPANS_PER_TRACE`].
     #[must_use]
-    pub fn day_shredded_filter(self, first: i64, last: i64) -> (String, Rows) {
-        let day = DAY_HOURS * HOUR_MS * 1_000_000;
-        let lower = DAY_START_NANOS + first / self.spans * day;
-        let upper = lower + day;
+    pub fn region_filter(self, first: i64, last: i64) -> (String, Rows) {
+        let (lower, upper) = (self.start_nanos(first), self.start_nanos(last));
         let count = (first..last)
             .filter(|index| {
                 region(*index) == Some("eu-west")

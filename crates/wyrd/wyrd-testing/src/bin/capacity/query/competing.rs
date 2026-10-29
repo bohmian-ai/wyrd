@@ -999,6 +999,7 @@ impl Competing {
             })?;
         }
         let fixture = Fixture {
+            first: 0,
             rows: self.scale.heavy,
         };
         let loaded = Sender::native(&client, TABLE, fixture)

@@ -1313,6 +1313,7 @@ mod pg_tests {
     #[ignore = "requires the Postgres-backed Bifrost journey lane"]
     async fn stored_evidence_readback_uses_canonical_records() -> Result<(), McpJourneyError> {
         use sha2::Digest as _;
+        /// The uploaded JSON document; the `DOCUMENT_VERIFIER` fixture passes it.
         const DOCUMENT: &[u8] = br#"{"answer":1}"#;
         let server = Box::pin(
             WyrdTestServer::builder()

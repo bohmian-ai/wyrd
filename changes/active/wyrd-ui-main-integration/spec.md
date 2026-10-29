@@ -1,7 +1,7 @@
 ---
 id: SPEC-wyrd-ui-main-integration
-revision: 13
-status: approved
+revision: 14
+status: draft
 ---
 
 # Migrate the Wyrd UI onto current main
@@ -13,6 +13,50 @@ run and inspect before the next dependent increment. First make the existing
 production UI installable and reachable, with browser sessions owned by the Rust
 server. Then migrate the implemented domain screens, reconciling their data
 against current contracts.
+
+Revision 14 aligns the remaining UI work with approved
+[service-identity-and-telemetry revision 12](../service-identity-and-telemetry/spec.md).
+The earlier UI contract attributed Service telemetry through resource labels;
+the approved replacement separates the exact executing workload, observed Card,
+and accountable accounts. It also replaces the public SQL catalog and table
+schemas. Without alignment, filters can combine different releases or exclude
+valid evidence, and existing authored queries stop resolving.
+
+For example, two Service releases can use the same Model and stable account.
+Selecting one release must show rows whose `workload_card_uid` identifies that
+release, while its component breakdown uses the Model's `subject_card_uid`.
+The shared Model, account, or `service_name` cannot identify the release.
+
+The cost is coordinated SQL, field-mapping, example and fixture updates, plus
+renewed proof for affected consumers, including completed foundation consumers.
+Dynamic result handling, layouts, browser sessions, flat Card identity, and the
+existing read/transport owners remain. No new table-administration page,
+account-management UI, retry controller, migration or old/new schema
+compatibility layer is added.
+
+### Dependency and authority for revision 14
+
+The service packet's [telemetry schemas](../service-identity-and-telemetry/supplements/telemetry-schemas.md)
+and [table/correlation contracts](../service-identity-and-telemetry/supplements/table-storage-and-correlation.md)
+define the target data this UI consumes. Their owning design/security/Bifrost
+amendments and matching server, SDK and MCP contracts must land before affected
+live UI acceptance. Current architecture remains authoritative for current
+behavior; this draft does not declare those schemas shipped or independently
+amend their owners.
+
+Service TASK-003 owns catalog/schema/attribution and existing example/fixture
+consumer closure, TASK-004/005 supply resolved table descriptions, and TASK-006
+supplies whole-trace verification semantics. UI loaders and pages own their
+consumption and visible behavior. Planning must map affected consumers and
+proof to these dependencies once, without duplicating upstream work. Preserve
+prior completion records; renew verification only where the cutover affects
+behavior or evidence. Affected live work waits for delivered contracts rather
+than inferring fields or falling back to the previous catalog. Service chart
+persistence, non-sensitive requirement-outcome readback, and Change Request/
+repository APIs remain separate prerequisites.
+
+The following paragraphs retain earlier approval history; revision 14 itself
+remains a draft pending explicit approval.
 
 This revision replaces an invalid draft that claimed revision 1 approval. That
 claim is not carried forward. The caller approved revision 5 on 2026-10-19;
@@ -302,9 +346,10 @@ implementor never sees two versions of anything.
   `Verifier`) built from the REQ-030 Verify components on main's generic
   Verifier, binding, execution, requirement, verdict, and evidence
   contracts. Retained
-  results come from `vala.verification.results`; `card_uid` is the subject,
-  `verifier_card_uid` is the Verifier, and `execution_id` is not application
-  `run_id`. Drift is a check with detail; Agent judging is a check. Mock-only
+  results come from `bifrost.verification.results`; `subject_card_uid` is the subject,
+  `verifier_card_uid` is the Verifier, `workload_card_uid` is the binding's
+  exact root, and `execution_id` is not application `run_id`. Drift is a check
+  with detail; Agent judging is a check. Mock-only
   historical evaluation/drift functions are not a reusable live implementation.
 - **REQ-019 — Summaries.** The Home page (canvas `Home`) built from
   `AttentionList`, `SignalBreakdownTable`, `CardInventorySummary`, and
@@ -339,51 +384,63 @@ not protocol authority.
   chart offers "Open in Query" with its exact SQL. Without data, the panel shows
   an empty state naming the attribute or binding that would produce it. Wyrd
   emits no `agent.invoke`, `prompt.render`, `model.predict`, or Service-request
-  span; the UI must not assume them. Automatic sources on main are: Skald
+  span; the UI must not assume them. Available automatic sources are Skald
   `invoke_agent`/`chat`/`execute_tool` spans (server/CLI Agents), the opt-in
   SDK `WyrdAgentsTraceProcessor` (same names), one Gateway span per attempt, and
-  `vala.gateway.calls` (latency `terminal_at - started_at`, usage, cost,
-  outcome, keyed by `card_uid` when supplied). Spans gain `card_uid`/`run_id`
-  inside an SDK Run scope; logs and metrics only when the record carries
-  `wyrd.card_uid`. The UI never decides pass, fail, or drift: it renders
-  recorded results (`vala.verification.results.verdict`, requirement outcomes,
-  `vala.drift.result_features.verdict`); aggregates such as failure rate only
-  count recorded results.
-- **REQ-023 — Service telemetry correlation (platform prerequisite).** Every
-  deployed Service must have one standard way to correlate its spans, logs,
-  metrics, and gateway calls. `card_uid` stays the innermost producing Card
-  (the record attribute `wyrd.card_uid` projected and scope-checked by
-  `RecordCorrelation::extract`). A separate `service_card_uid` column is added
-  to `vala.traces.spans`, `vala.logs.records`, `vala.metrics.points`,
-  `vala.gateway.calls`, and `vala.verification.results` (written from the
-  binding's Service when the result is recorded):
-  - source: the OTel resource attribute `wyrd.service.card_uid`
-    (`wyrd_spec::vala::trace::attributes::SERVICE_CARD_UID`, declared but not
-    yet projected), set once per deployment, e.g.
-    `OTEL_RESOURCE_ATTRIBUTES=wyrd.service.card_uid=<uid>`; works in any
-    language, with or without the SDK, and through a multi-Service collector;
-  - check: the UID must name a Service Card within the principal's Card scope,
-    rejected per record exactly as an unauthorized `card_uid` is;
-  - default: when absent and the credential is bound to exactly one Service
-    Card, Bifrost derives it from that credential.
-  Service pages filter on `service_card_uid` and break down by `card_uid`.
-  Matching on `service_name` or on a component UID list is not acceptable: a
-  shared component would merge two Services' telemetry. This is a Bifrost
-  ingest and schema change owned outside the UI tasks; UI tasks depending on it
-  wait for it.
+  `bifrost.gateway.calls` (latency `terminal_at - started_at`, usage, cost,
+  outcome, attributed under REQ-023). Generic telemetry need not identify a
+  workload, subject or application Run. The UI never decides pass, fail, or
+  drift: it renders
+  recorded results (`bifrost.verification.results.verdict`, requirement outcomes,
+  `bifrost.drift.result_features.verdict`); aggregates such as failure rate only
+  count recorded results, not pending executions or presumed missing observations.
+- **REQ-023 — Workload, subject and account correlation (platform prerequisite).**
+  Consume the approved service packet's shared managed envelope on system and
+  dynamic tables. `workload_card_uid` is the validated exact Service
+  execution/binding root; `subject_card_uid` is the exact observed or judged
+  Card; `run_id` is optional application Run correlation. These three values
+  may be null independently where the server contract permits. Required
+  `sub_principal_id` and `act_principal_id` identify the original action's
+  accounts; `wyrd_request_id` correlates the request; `wyrd_ingested_at` is UTC
+  microsecond admission time. Preserve returned nulls and original attribution,
+  including on internally delivered verification results.
+  - The server derives workload attribution from validated execution or
+    binding context. Resource labels, stable accounts, shared components, trace
+    membership and latest-version lookup cannot establish it. The source OTLP
+    subject attribute remains `wyrd.card_uid`; stored schemas and SQL use
+    `subject_card_uid`. The UI does not rename that source attribute or invent
+    managed values.
+  - Exact Service pages filter by the selected release's `workload_card_uid`
+    and break down by `subject_card_uid`. A family-wide scope, wherever already
+    required, resolves registered version UIDs through Cards and filters those
+    UIDs; it cannot match only a name or resource label. This revision adds no
+    family-selection control. Generic Observe/Verify ownership labels use
+    Workload and identify the exact Service root. Account IDs and
+    resource-service/environment labels remain separate query dimensions; this
+    revision does not add dedicated account-filter controls.
+  - A workload alone is not an execution join key. Use the applicable Run,
+    trace, span, execution or workload-scoped group identity for the question.
+    Trace/span/execution/group fields remain domain-specific, not mandatory
+    columns on every metric or custom row.
+  - Existing Bifrost table permissions authorize reads; a correlation key or
+    observation graph grants no additional read access or implicit row policy.
+  This replaces resource-derived Service attribution and the result/input/drift
+  owner-column spelling with the upstream canonical fields; no duplicate root
+  column is added. Upstream owns ingest, schema, authorization and durable
+  origin production; dependent UI work waits for it.
 - **REQ-024 — Kind-specific Card pages.** Each kind has its own layout and
   only real sources:
-  - Agent: `invoke_agent` spans with `card_uid` = the Agent (count, latency,
+  - Agent: `invoke_agent` spans with `subject_card_uid` = the Agent (count, latency,
     `status_code` errors, recent invocations linking to traces); gateway calls
-    with `card_uid` = the Agent (tokens, cost); composition from the spec.
+    with `subject_card_uid` = the Agent (tokens, cost); composition from the spec.
   - Prompt: spec only — messages, derived variables, response format, using
     Agents, version diff. No telemetry strip.
   - Model: interface, signature, artifacts; spans/metrics attributed to the
     Card grouped by name, shown only when present; drift from bound Verifiers.
   - Data: schema, `stats`, `splits`, `target_columns`, `sql`; per-feature drift
-    from `vala.drift.result_features` where a drift check names it as
+    from `bifrost.drift.result_features` where a drift check names it as
     `baseline_ref`.
-  - Service: Overview (signals by `service_card_uid`, broken down by component),
+  - Service: Overview (signals by `workload_card_uid`, broken down by component),
     Charts, Versions, YAML.
   - Verifier: the Verifier graph (REQ-027); results live in Verify (REQ-026).
 - **REQ-025 — Service charts (platform prerequisite).** `ServiceSpec` gains
@@ -407,13 +464,23 @@ not protocol authority.
     shows the error in the chart, never a blank chart.
 - **REQ-026 — Verify: the results workbench, shaped like Traces.** One list
   of recorded results answers "what is failing"; a result opens in a drawer
-  over the list so filters and position survive. No duration, hash, retry,
-  provenance, or table-name detail anywhere.
+  over the list so filters and position survive. No duration, hash, retry
+  internals, provenance, or table-name detail anywhere. For an execution already
+  addressed by its existing execution ID, readback distinguishes a pending/
+  running/retrying execution with no selected result from an empty result list
+  or a completed judgment. Do not add queued executions to the recorded-results
+  list or introduce an execution-list API. Show the addressed execution
+  as waiting/in progress without inventing a verdict or intermediate result.
+  The server alone owns evidence-availability retries; the UI neither resubmits
+  verification nor exposes attempt counters or backoff controls. Direct missing
+  evidence and exhausted queued evidence render the recorded trace-requirement
+  inconclusive reason; other requirements retain their recorded outcomes and
+  the Verifier's recorded aggregate decision.
   - List: WHERE bar, time picker and Live; two brushable charts (results
     stacked by recorded verdict; results by Verifier); left filter rail with
-    counts (verdict, Verifier, failed requirement, Service, Card, session);
-    table Time, Verifier, Card, Service, Run, Session, Failed requirements,
-    Verdict. Group by none | run | Card | Service | session. A session group
+    counts (verdict, Verifier, failed requirement, Workload, Card, session);
+    table Time, Verifier, Card, Workload, Run, Session, Failed requirements,
+    Verdict. Group by none | run | Card | Workload | session. A session group
     header identifies the owner-scoped group and its recorded reviews. Opening
     a review shows that execution's selected recorded result and pinned member
     executions, never every historical row sharing the caller's `group_id`.
@@ -421,7 +488,7 @@ not protocol authority.
     - Run result: the Verifier graph (REQ-027) coloured by this result's
       recorded outcomes, first failed requirement selected; under it the
       selected requirement's reason, actual, citations (jump to input or
-      trace span), and judge; header verdict, Card, Service, run, session,
+      trace span), and judge; header verdict, Card, Workload, run, session,
       time; Inputs collapsed.
     - Session result: the same graph with that execution's pinned member
       executions as the input column, each opening its own result. Later group
@@ -429,7 +496,16 @@ not protocol authority.
     - Drift result: one row per feature (recorded score sparkline with the
       recorded threshold dashed, score, threshold, verdict), every feature
       shown, drifted first; window header with previous/next.
-  - The Verifier name opens the Verifier Card; a trace citation opens Traces.
+  - The Verifier name opens the Verifier Card; a trace citation opens Traces
+    at its exact trace/span identity under the viewer's table permissions. Do
+    not apply the originating result list's time/workload/subject filters to
+    the evidence read: a trace may cross workloads and include untagged spans.
+    Keep those list filters when returning to the list. Bounded-read failures
+    remain visible rather than presenting a truncated trace as complete.
+    Inspection shows currently retained authorized spans; it does not claim to
+    reconstruct the exact span collection seen by a past verification attempt.
+    Late-arriving spans never recompute or revise the recorded result; a new
+    judgment requires a new server verification execution.
 - **REQ-027 — Verifier Card: the Verifier graph.** One component built only
   from `VerifierSpec`: inputs, then steps layered by the outputs they read
   and `depends_on` (edges labelled by the output read), step requirements
@@ -438,7 +514,8 @@ not protocol authority.
   (Verify filtered to this Verifier; the Card has no Results tab), and a
   YAML toggle. The result drawer reuses it coloured by recorded outcomes.
   - Sessions use current main's optional `group_id`, scoped to the tenant and
-    authenticated owner Service. `group_end {after}` is a quiet-period trigger,
+    validated exact workload root, not the stable account. `group_end {after}`
+    is a quiet-period trigger,
     not a once-per-session close or permanent finality rule. Later acknowledged
     activity can schedule another review; continuous activity can postpone it.
     The UI uses current `VerifierSpec` source declarations and binding settings.
@@ -456,7 +533,7 @@ not protocol authority.
     does not invent new group lifecycle or grant semantics. Pass/fail for every
     requirement, including a drift requirement over
     many features, is the server's recorded verdict in
-    `vala.verification.results`; the UI never computes it. The drift view
+    `bifrost.verification.results`; the UI never computes it. The drift view
     stops at recorded scores; no baseline distribution is drawn until one is
     recorded.
 - **REQ-028 — Observe pages.** Observe and Verify stay separate: no verdict or
@@ -466,8 +543,28 @@ not protocol authority.
   hovers, or has a trace open, and shows "↑ N new". A trace opens in a drawer
   over the list with a waterfall collapsed below two levels and span detail
   beneath (messages for LLM spans). Filters are open by default and writable
-  into WHERE, and include Service (`service_card_uid`) and Card (`card_uid`).
+  into WHERE, and include Workload (`workload_card_uid`) and Card
+  (`subject_card_uid`), with nullable attribution preserved. These filter the
+  list; opening an exact trace follows REQ-026's evidence-navigation rules.
   There is no trace-summary table.
+  - Signal fields follow the upstream telemetry supplement and returned table
+    descriptions. Keep resource-service/environment labels separate from Wyrd
+    ownership, expose the new resource/URL/exception fields through applicable
+    facets or record details, and preserve typed raw attributes and nested data.
+    The shared envelope does not imply that all tables have every signal field.
+  - Use signal event time for event charts and time filters:
+    `start_time_unix_nano` on spans and `time_unix_nano` on logs/metrics remain
+    UTC nanosecond timestamps; `duration_nano` remains integer nanoseconds.
+    `wyrd_ingested_at` is admission time, not a replacement event-time axis.
+  - Span `is_exception` reflects an exact-name exception event; log
+    `is_exception` reflects a non-null promoted exception string, including an
+    empty string. Error status/severity alone does not imply an exception. The
+    UI consumes the server projection rather than recalculating these fields.
+  - Metrics retain point kind, integer versus double values, temporality,
+    monotonicity, histogram/summary structures and exemplars. Preserve absent
+    versus zero and integer precision through supported encodings; do not
+    coerce every point to a generic float, invent percentiles, or manufacture
+    trace correlation for a metric aggregating many executions.
 - **REQ-029 — Change Requests (design ahead of contract).** A Change Request
   is defined as: repositories connect to a Wyrd GitHub webhook; a repository
   `wyrd.toml` points to a folder of Verifiers (with requirements) to run; a CR
@@ -645,6 +742,22 @@ not protocol authority.
   supported value encoding, degraded results, failure, denial, and cancellation.
   Loader result shaping consumes only this shared shape.
 
+  **Schema and catalog adoption.** Built-in, dynamic-dataset and operational
+  SQL references use the delivered public `bifrost` catalog. Table discovery and
+  description consume the same delivered contract on Node/MCP/BFF, including
+  resolved schemas, layout and revisions; they do not impose a local fixed
+  signal-row schema. Query remains a read-only workbench: layout configuration,
+  schema alteration and revision-based PATCH administration are not added.
+  Adopt changed generated contracts from their existing source owners. Added
+  signal columns do not justify replacing Chart, executors or normalization.
+
+  Built-in SQL, domain loaders, authored examples and recorded/live fixtures
+  must agree with this catalog and the canonical stored fields. Regeneration
+  alone does not update SQL strings. Preserve authored SQL verbatim and show
+  the existing structured query error for an obsolete reference; do not rewrite
+  it, fall back to an old catalog, or support both schemas. Dependency fixtures
+  remain explicitly non-live until the upstream contract and real proof land.
+
   **SQL inputs.** Built-in component reads use constant SQL templates with
   typed `$n` bind values. Explicitly authored Chart and Query inputs may supply
   read-only SQL at runtime; that SQL is not required to be a source constant.
@@ -802,11 +915,11 @@ not protocol authority.
 
   | Component | Canvas boards | Input | Data source | Prereq |
   |---|---|---|---|---|
-  | `Chart` (timeseries, bar, stat, table; title, source caption, Open in Query, in-chart error) | Main, Spans, Logs, Metrics, Verify*, ServiceCharts, QueryChart, Model, Data | chart definition (REQ-025 fields) + range + bucket | its own SQL on `vala.*` tables | Service charts: REQ-025 |
-  | `StatStrip` (1–5 numbers with sparkline) | Agent, Service, Home, Main, Spans | stat definitions + range + scope (`card_uid` or `service_card_uid`) | `vala.traces.spans` (`invoke_agent`, `duration_nano`, `status_code`), `vala.gateway.calls` (`usage`, `cost`) | `service_card_uid`: REQ-023 |
+  | `Chart` (timeseries, bar, stat, table; title, source caption, Open in Query, in-chart error) | Main, Spans, Logs, Metrics, Verify*, ServiceCharts, QueryChart, Model, Data | chart definition (REQ-025 fields) + range + bucket | its own SQL on `bifrost.*` tables | Service charts: REQ-025 |
+  | `StatStrip` (1–5 numbers with sparkline) | Agent, Service, Home, Main, Spans | stat definitions + range + scope (`subject_card_uid` or `workload_card_uid`) | `bifrost.traces.spans` (`invoke_agent`, `duration_nano`, `status_code`), `bifrost.gateway.calls` (`usage`, `cost`) | `workload_card_uid`: REQ-023 |
   | `FacetRail` (value counts, click to add to WHERE) | Main, Spans, Logs, Verify* | `{signal, where, range, facets}` | GROUP BY counts on the list's table under the same WHERE | session facet: `group_id` |
-  | `RecordTable` (typed cells, live mode, group by) | Main, Spans, Logs, Verify*, Agent, Query | `{signal \| sql, where, range, columns, groupBy, live, limit}` | spans (one row per root span), `vala.logs.records`, `vala.verification.results`, or SQL | session grouping: `group_id` |
-  | `TraceWaterfall` | TraceDrawer | `{traceId, range}` | `vala.traces.spans` by `trace_id` | — |
+  | `RecordTable` (typed cells, live mode, group by) | Main, Spans, Logs, Verify*, Agent, Query | `{signal \| sql, where, range, columns, groupBy, live, limit}` | spans (one row per root span), `bifrost.logs.records`, `bifrost.verification.results`, or SQL | session grouping: `group_id` |
+  | `TraceWaterfall` | TraceDrawer | `{traceId, range?}` | `bifrost.traces.spans` by exact `trace_id`; range is navigation context, not an implicit evidence predicate | — |
   | `RecordDetail` (span or log: Messages, Attributes, Events, Exception, Raw) | TraceDrawer, Logs | `{traceId, spanId}` or log key | span `attributes`, `events`, `exception_*`, `gen_ai_*`; log `body`, `attributes` | — |
   | `CardHeader` (name, kind, version select, status, uid copy, tabs, primary action) | all Card boards | `{cardRef}` | Card envelope + registry version list | — |
   | `RelationshipList` | Agent, Prompt, Model, Data, Service | `{cardRef}` | server-derived `relationships` | — |
@@ -814,15 +927,15 @@ not protocol authority.
   | `CompositionGraph` | Agent, Service | `{cardRef}` | `AgentSpec` / `ServiceSpec`; node badge = latest recorded verdict | — |
   | `PromptMessages`, `PromptVariables`, `UsedBy`, `VersionDiff` | Prompt | `{cardRef, otherVersion?}` | `PromptSpec`; relationships | — |
   | `ModelInterface`, `ArtifactTable` | Model | `{cardRef}` | `ModelSpec` interface/signature; artifacts | — |
-  | `VerificationBindings` | Agent, Service, Home | `{cardRef, range}` | bindings + `vala.verification.results` | — |
-  | `AttentionList` | Home, Service | `{scope, range}` | failed `vala.verification.results` by `owner_card_uid` | CR rows: REQ-029 |
-  | `SignalBreakdownTable` | Home, Service | `{groupBy: service_card_uid \| card_uid, scope, range}` | root spans + `vala.gateway.calls` | REQ-023 |
+  | `VerificationBindings` | Agent, Service, Home | `{cardRef, range}` | bindings + `bifrost.verification.results` | — |
+  | `AttentionList` | Home, Service | `{scope, range}` | failed `bifrost.verification.results` by `workload_card_uid` | CR rows: REQ-029 |
+  | `SignalBreakdownTable` | Home, Service | `{groupBy: workload_card_uid \| subject_card_uid, scope, range}` | root spans + `bifrost.gateway.calls` | REQ-023 |
   | `CardInventory` (list, filters, kinds) and `CardInventorySummary` | Cards, Home | `{filters, page}` / `{}` | `cards.list` | — |
-  | `VerifierGraph` (plain or coloured by one result) | Verifier, Verify, VerifySession, VerifyDrift | `{cardRef}` or `{resultId}` | `VerifierSpec`; `outcome` of `vala.verification.results` | — |
-  | `VerificationResult` (drawer body: header, `VerifierGraph`, `RequirementDetail`, Inputs) | Verify, VerifySession, VerifyDrift | `{resultId}` | `vala.verification.results`; drift adds `vala.drift.result_features`; existing execution readback supplies pinned group membership | main already supplies `group_id`/`group_end`; non-sensitive requirement outcomes remain a prerequisite |
+  | `VerifierGraph` (plain or coloured by one result) | Verifier, Verify, VerifySession, VerifyDrift | `{cardRef}` or `{resultId}` | `VerifierSpec`; `outcome` of `bifrost.verification.results` | — |
+  | `VerificationResult` (drawer body: header, `VerifierGraph`, `RequirementDetail`, Inputs) | Verify, VerifySession, VerifyDrift | `{resultId}` | `bifrost.verification.results`; drift adds `bifrost.drift.result_features`; existing execution readback supplies pinned group membership | main already supplies `group_id`/`group_end`; non-sensitive requirement outcomes remain a prerequisite |
   | `RequirementDetail` | Verify*, ChangeVerification | `{resultId, requirementId}` | requirement outcome in `outcome` | — |
-  | `DriftFeatureTable` | VerifyDrift, Data | `{resultId}` or `{cardRef}` | `vala.drift.result_features` | — |
-  | `QueryEditor`, `TableCatalog`, `QueryDetails` | Query, QueryChart | `{sql, range, limit}` / `{}` | `bifrost.*` | — |
+  | `DriftFeatureTable` | VerifyDrift, Data | `{resultId}` or `{cardRef}` | `bifrost.drift.result_features` | — |
+  | `QueryEditor`, `TableCatalog`, `QueryDetails` | Query, QueryChart | `{sql, range, limit}` / `{}` | existing Bifrost list/describe/query contracts; resolved schema, layout and revisions | schema/description cutover |
   | `ChartEditor` | ServiceCharts | `{cardRef, chartId?}` | `ServiceSpec.charts` | REQ-025 |
   | `ChangeRequestList`, `ChangeHeader`, `SubjectsTable`, `RevisionList`, `ActivityFeed`, `ChangeVerifierList`, `RequestVerificationForm`, `ReviewSubmission`, `Participants` | Changes, ChangeDetail, ChangeVerification | `{crId, revision?}` | none on main | REQ-029 |
   | `RepositoryList`, `WyrdTomlView`, `VerifierFolderTable` | Repos | `{repo}` | none on main | REQ-029 |
@@ -921,14 +1034,14 @@ not protocol authority.
     draw a view document into any DOM element, so React or Vue apps render
     view documents without writing Svelte. Using individual components
     directly is Svelte-only. No Web Components build.
-  - Verify's Service filter and column read `service_card_uid` from
-    `vala.verification.results`, written by the server when the result is
-    recorded (the binding's Service). This adds `vala.verification.results`
-    to REQ-023's column list. Service is never derived at read time from
-    relationships.
+  - Verify's Workload filter and column read `workload_card_uid` from
+    `bifrost.verification.results`, written by the server from the exact binding
+    root (always a Service). Subject, workload and account stay separate per
+    REQ-023. Ownership is never derived at read time from relationships or
+    resource labels.
   - Data per-column drift: the loader reads the Verifier specs whose drift
     check's `baseline_ref` names this Data Card, collecting each Verifier and
-    requirement id, then queries `vala.drift.result_features` filtered by
+    requirement id, then queries `bifrost.drift.result_features` filtered by
     that Verifier and requirement id. No schema change.
 
 - **REQ-036 — View layout: placed, resizable panels.** A view document
@@ -1122,10 +1235,12 @@ not protocol authority.
 4. Main's existing production identity journey is reused and extended where its
    synthetic `/auth/*` routing currently bypasses production routing. Native
    installation/lifecycle and Linux image routing have separate proof owners.
-5. UI domain reads remain BFF-side against current public server contracts.
+5. UI domain reads remain BFF-side against delivered public server contracts.
    The first actual consumer owns the smallest necessary client integration and
-   its consumer closure; later pages reuse it. Historical SQL/projections must
-   be revalidated against current table schemas and query terminal semantics.
+   its consumer closure; later pages reuse it. Revision 14 adopts the approved
+   upstream catalog, envelope and signal schemas only with their owning
+   architecture/SDK/MCP closure. Revalidate affected SQL, examples, fixtures and
+   proof across in-scope hosts without introducing parallel schema support.
 6. Plan real dependency edges and one observable outcome per task. TASK-001 is
    the caller-required plumbing/login closure. Later domain work is not a
    dependency of it. Visual approval governs dependent execution, not a new
@@ -1150,6 +1265,10 @@ not protocol authority.
 | AC-013 | Conventional UI users complete each page's real workflow in a browser against deployed BFF/server, with truthful range/identity, failure and tenant behavior | REQ-034; TASK-012 browser foundation and TASK-013–026 focused real-browser journeys, plus per-page human acceptance |
 | AC-014 | A real agent conversation produces an MCP App view, refines it on follow-up, and supports in-app range reloads under the viewer's permissions without opening Wyrd UI or building an app | REQ-035; TASK-011 gated live agent plus real-browser host evidence and deterministic deployed-host negatives; missing credentials/host are BLOCKED |
 | AC-015 | A view document places panels on the 12-column grid; with a host layout handler a reader resizes and moves panels by pointer and keyboard with grid snapping and no overlap, the handler receives the whole updated document, charts fill their resized panels, narrow views stack, and a document without `layout` renders as before; out-of-range layouts fail validation | REQ-036; unit tests for schema bounds, collision resolution and handler output; real-browser gallery and AppBridge artifact evidence at desktop and mobile in light and dark; recorded human gallery acceptance |
+| AC-016 | After the upstream cutover, discovery, descriptions, built-in SQL and shipped examples/fixtures agree on the `bifrost` catalog and canonical fields in each in-scope host; obsolete authored SQL fails visibly without rewriting or fallback | REQ-014/030; focused SDK/MCP/BFF query and description journeys, example smoke and affected foundation proof, including denied and obsolete-reference cases |
+| AC-017 | Two releases sharing a component and stable account remain distinct by workload; component and account queries select their own dimensions; rootless/subjectless rows keep truthful nulls and correlations grant no read access | REQ-023/024/028; real accepted telemetry/results with different workload, subject and account identities, exact-release queries, null cases and existing tenant/table-denial proof |
+| AC-018 | Observe preserves signal-specific types, event/admission time, integer precision, missing values and returned exception semantics after schema adoption | REQ-022/028/030; recorded typed signal fixtures and live reads covering distinct timestamp units, integer/double points, histogram/summary/exemplar data, nullable promotions and exception-versus-error cases |
+| AC-019 | Verification renders waiting separately from recorded outcomes, keeps selected results and workload-scoped membership exact, opens authorized cross-workload/untagged trace citations beyond originating list filters, and preserves completed judgments after late spans arrive | REQ-018/026/027; real queued-arrival, direct-absence and late-arrival consumer journeys plus focused citation/read-denial and pinned-membership checks; no client-owned retry or presumed trace snapshot |
 
 Task planning must choose exact focused commands from inspected current owners;
 the evidence document identifies known commands and coverage gaps. No build,
@@ -1157,6 +1276,20 @@ test, or runtime success is claimed by this specification. Final integrated revi
 combined proof and cross-task seams; task gates remain bounded to their owners.
 
 ## Open material decisions and approval
+
+Revision 14 is a draft for approval of the catalog/schema consumer alignment,
+managed attribution and Workload labels, signal fidelity, and verification
+waiting/evidence behavior described above. The service packet's approved
+contracts supply the upstream decisions; this UI revision adds no new server
+API or durable authority. Their delivery and architecture amendments remain
+explicit dependencies, not claims of current availability.
+
+The approval requested is this bounded revision. Existing UI task instructions
+still reflect earlier revisions and have not been regenerated; affected work
+waits for approval and task alignment through `$wyrd-plan`. Earlier approvals,
+completed-task records and review subjects retain their original meaning and
+are not retroactively rewritten. No approval, implementation readiness, or new
+runtime/browser proof is claimed by this draft.
 
 The independent [readiness review](review/plan-readiness/review.md) assessed
 revision 5 against refreshed main and returned `Revise`. Its exact reviewed
@@ -1298,6 +1431,18 @@ reported live-proof blocker, never an assumed capability or silent pass.
   identity renders as `Kind/name@version`. No other requirement changes.
   Approved by the caller's instruction to carry out the proposed rebase steps,
   which named this revision; no implementation is claimed.
+
+- Revision 14 (2026-10-23): draft aligning the UI with approved
+  service-identity-and-telemetry revision 12. Replaces resource-derived Service
+  attribution with managed workload/subject/account dimensions, adopts the
+  single `bifrost` catalog and canonical envelope/signal fields, and updates
+  generic ownership labels and component data sources. Specifies signal/time
+  fidelity, queued verification waiting and exact trace citation behavior,
+  retains separate platform prerequisites, and adds AC-016–019 for affected
+  consumer closure. Flat Card identity, transport/session/layout boundaries,
+  deferred capabilities, prior completion records and immutable reviews remain.
+  Pending explicit human approval; task changes and implementation are not
+  authorized by this draft.
 
 Authorities: `AGENTS.md`; `agent_docs/index.md`;
 `architecture/wyrd-design.md`;

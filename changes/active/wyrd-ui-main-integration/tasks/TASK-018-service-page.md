@@ -4,7 +4,7 @@ Spec: [revision 11, approved](../spec.md). Status: Proposed; platform prerequisi
 Dependencies: [TASK-012](TASK-012-canvas-shell.md), [TASK-013](TASK-013-card-browsing.md), [TASK-008](TASK-008-service-components.md), [TASK-007](TASK-007-verify-components.md).
 Mapped obligations: REQ-013, REQ-024, REQ-025, REQ-020, AC-007, AC-010, REQ-034, AC-013; all INV-001–INV-007 apply, with TASK-001-specific exclusions only in TASK-001.
 
-External dependency: REQ-023 and REQ-025 delivered and TASK-008 production-complete; no Service inference from component lists. This task does not authorize implementation of that platform prerequisite. Contract-independent work may proceed, but fixtures/unavailable controls cannot close it.
+External dependency: REQ-025 delivered and TASK-008 production-complete; no Service inference from component lists. This task does not authorize implementation of that platform prerequisite. Contract-independent work may proceed, but fixtures/unavailable controls cannot close it.
 
 ## Outcome and Value
 
@@ -12,7 +12,7 @@ An exact Service version has its component Overview, isolated signals, versioned
 
 ## Owners, Scope, Consumers, and Prohibited Changes
 
-Assemble only this outcome from completed CardHeader, CompositionGraph, VerificationBindings, AttentionList, StatStrip, SignalBreakdownTable, Chart and ChartEditor. Page/server load functions invoke shared loaders; no SQL, joins, dependent-read sequencing or domain shaping in pages. Reuse session-bound Node executor and shell. Service filters use service_card_uid, breakdown uses card_uid. Chart saves create a new exact Service version through authorized host action; Overview and Charts each receive an explicit visual checkpoint. Do not broaden this into Service deployment management. No historical components/layouts/types or fixture production fallback.
+Assemble only this outcome from completed CardHeader, CompositionGraph, VerificationBindings, AttentionList, StatStrip, SignalBreakdownTable, Chart and ChartEditor. Page/server load functions invoke shared loaders; no SQL, joins, dependent-read sequencing or domain shaping in pages. Reuse session-bound Node executor and shell. Service filters use `workload_card_uid`, breakdown uses `subject_card_uid`. Chart saves create a new exact Service version through authorized host action; Overview and Charts each receive an explicit visual checkpoint. Do not broaden this into Service deployment management. No historical components/layouts/types or fixture production fallback.
 
 Use committed main `8651b96fd`, the approved spec and current canvas. Historical `wyrd-server-ui` at `7bfc3a8a` supplies read/state/test evidence only. Current uncommitted trace changes are unrelated and must be preserved. Package components render typed props; portable loaders plan/shape; executor/host boundaries own credentials, authorized IO and action execution. Preserve tenant isolation, stable errors and server audit behavior. No speculative framework, test-only configuration or replacement selectors.
 
@@ -34,7 +34,7 @@ Paths under `src/mcp`, `src/query` or `tests/integration` described as server ow
 
 ### Scenario 1 — Page interaction and composition
 
-**Behavior.** An exact Service version has its component Overview, isolated signals, versioned Charts, Versions and YAML. Service filters use service_card_uid, breakdown uses card_uid. Chart saves create a new exact Service version through authorized host action; Overview and Charts each receive an explicit visual checkpoint. Do not broaden this into Service deployment management.
+**Behavior.** An exact Service version has its component Overview, isolated signals, versioned Charts, Versions and YAML. Service filters use `workload_card_uid`, breakdown uses `subject_card_uid`. Chart saves create a new exact Service version through authorized host action; Overview and Charts each receive an explicit visual checkpoint. Do not broaden this into Service deployment management.
 
 **RED.** Add the task-focused page interaction regression; approved route composition is absent after REQ-032 deletion. Run this exact focused command (new Vitest title where applicable):
 

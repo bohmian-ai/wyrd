@@ -4,7 +4,7 @@ Spec: [revision 11, approved](../spec.md). Status: Proposed; platform prerequisi
 Dependencies: [TASK-012](TASK-012-canvas-shell.md), [TASK-007](TASK-007-verify-components.md), [TASK-004](TASK-004-observe-components.md).
 Mapped obligations: REQ-018, REQ-026, REQ-027, REQ-020, AC-009, AC-010, REQ-034, AC-013; all INV-001–INV-007 apply, with TASK-001-specific exclusions only in TASK-001.
 
-External dependency: Non-sensitive per-requirement outcome contract and REQ-023 Service result column are shipped; TASK-007 is production-complete. This task does not authorize implementation of that platform prerequisite. Contract-independent work may proceed, but fixtures/unavailable controls cannot close it.
+External dependency: Non-sensitive per-requirement outcome contract is shipped; TASK-007 is production-complete. This task does not authorize implementation of that platform prerequisite. Contract-independent work may proceed, but fixtures/unavailable controls cannot close it.
 
 ## Outcome and Value
 

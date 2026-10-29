@@ -10,7 +10,7 @@ The exact Agent version shows its registered Prompt, execution route, runtime to
 
 ## Owners, Scope, Consumers, and Prohibited Changes
 
-Assemble only this outcome from completed CardHeader, CardFacts, CompositionGraph, RelationshipList, VerificationBindings, StatStrip, Chart and RecordTable. Page/server load functions invoke shared loaders; no SQL, joins, dependent-read sequencing or domain shaping in pages. Reuse session-bound Node executor and shell. Use current AgentSpec.prompt/execution_route/tool_names/verified_by. Activity uses invoke_agent spans and gateway calls attributed to this card_uid; absence explains attribution instead of synthesizing activity. No historical components/layouts/types or fixture production fallback.
+Assemble only this outcome from completed CardHeader, CardFacts, CompositionGraph, RelationshipList, VerificationBindings, StatStrip, Chart and RecordTable. Page/server load functions invoke shared loaders; no SQL, joins, dependent-read sequencing or domain shaping in pages. Reuse session-bound Node executor and shell. Use current AgentSpec.prompt/execution_route/tool_names/verified_by. Activity uses invoke_agent spans and gateway calls attributed to this Agent's `subject_card_uid`; absence explains attribution instead of synthesizing activity. No historical components/layouts/types or fixture production fallback.
 
 Use committed main `8651b96fd`, the approved spec and current canvas. Historical `wyrd-server-ui` at `7bfc3a8a` supplies read/state/test evidence only. Current uncommitted trace changes are unrelated and must be preserved. Package components render typed props; portable loaders plan/shape; executor/host boundaries own credentials, authorized IO and action execution. Preserve tenant isolation, stable errors and server audit behavior. No speculative framework, test-only configuration or replacement selectors.
 
@@ -33,7 +33,7 @@ Paths under `src/mcp`, `src/query` or `tests/integration` described as server ow
 
 ### Scenario 1 — Page interaction and composition
 
-**Behavior.** The exact Agent version shows its registered Prompt, execution route, runtime tools, composition, bindings and attributable activity. Use current AgentSpec.prompt/execution_route/tool_names/verified_by. Activity uses invoke_agent spans and gateway calls attributed to this card_uid; absence explains attribution instead of synthesizing activity.
+**Behavior.** The exact Agent version shows its registered Prompt, execution route, runtime tools, composition, bindings and attributable activity. Use current AgentSpec.prompt/execution_route/tool_names/verified_by. Activity uses invoke_agent spans and gateway calls attributed to this Agent's `subject_card_uid`; absence explains attribution instead of synthesizing activity.
 
 **RED.** Add the task-focused page interaction regression; approved route composition is absent after REQ-032 deletion. Run this exact focused command (new Vitest title where applicable):
 

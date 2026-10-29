@@ -4,7 +4,7 @@ Spec: [revision 11, approved](../spec.md). Status: Proposed; platform prerequisi
 Dependencies: [TASK-003](TASK-003-shared-ui-foundation.md).
 Mapped obligations: REQ-030, REQ-022, REQ-028, REQ-020, AC-008, AC-011, AC-010; all INV-001–INV-007 apply, with TASK-001-specific exclusions only in TASK-001.
 
-External dependency: REQ-023 service_card_uid ingest/schema/auth prerequisite for Service filters and Service-scoped variants. This task does not authorize implementation of that platform prerequisite. Contract-independent work may proceed, but fixtures/unavailable controls cannot close it.
+REQ-023 is delivered on main: Service filters use `workload_card_uid` and component breakdowns use `subject_card_uid` on `bifrost.*` tables.
 
 ## Outcome and Value
 

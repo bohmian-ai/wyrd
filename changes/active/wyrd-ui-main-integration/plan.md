@@ -20,11 +20,11 @@ Conventional pages start after that gate and retain their own visual checkpoints
 | [TASK-001-R1](review/tasks-001-002-843484f6c/TASK-001-R1-installation-browser-sessions.md) | Correct installation eligibility, implement Rust-owned opaque browser sessions and prove official nginx login | TASK-001 and TASK-002 integrated at `843484f6c`; approved revision 10 | Supported native/Linux image runtime and human inspection remain required acceptance evidence |
 | [TASK-002](tasks/TASK-002-remove-old-ui.md) | Remove obsolete UI while retaining login — **complete** | None | None |
 | [TASK-003](tasks/TASK-003-shared-ui-foundation.md) | Reusable UI foundation across the four hosts — **complete** | TASK-002 | None |
-| [TASK-004](tasks/TASK-004-observe-components.md) | Observe component family | TASK-003 | REQ-023 service_card_uid ingest/schema/auth prerequisite for Service filters and Service-scoped variants. |
+| [TASK-004](tasks/TASK-004-observe-components.md) | Observe component family | TASK-003 | None; REQ-023 `workload_card_uid` correlation is delivered on main. |
 | [TASK-005](tasks/TASK-005-card-components.md) | Card browsing and definition component family | TASK-003 | Only if required ArtifactTable actions lack a current SDK/MCP projection: obtain approved platform action contract before calling that action complete. |
 | [TASK-006](tasks/TASK-006-query-components.md) | Query component family | TASK-003, TASK-004 | None |
-| [TASK-007](tasks/TASK-007-verify-components.md) | Generic verification component family | TASK-003, TASK-004, TASK-005 | Separately specified non-sensitive requirement-outcome read contract; REQ-023 for Service-filter variants; REQ-029 for AttentionList CR rows. Current sensitive outcome is not reclassified here. |
-| [TASK-008](tasks/TASK-008-service-components.md) | Service signal and chart authoring component family | TASK-003, TASK-004, TASK-005, TASK-006 | REQ-023 correlation (including verification results) and REQ-025 Service charts, with separately approved platform implementation and actual SDK/MCP read/action projections. |
+| [TASK-007](tasks/TASK-007-verify-components.md) | Generic verification component family | TASK-003, TASK-004, TASK-005 | Separately specified non-sensitive requirement-outcome read contract; REQ-029 for AttentionList CR rows. Current sensitive outcome is not reclassified here. |
+| [TASK-008](tasks/TASK-008-service-components.md) | Service signal and chart authoring component family | TASK-003, TASK-004, TASK-005, TASK-006 | REQ-025 Service charts, with separately approved platform implementation and actual SDK/MCP read/action projections. |
 | [TASK-009](tasks/TASK-009-change-repository-components.md) | Change Request and repository component family | TASK-003, TASK-005, TASK-007 | REQ-029 separately approved and shipped CR/repository/webhook/verifier-folder read/write contracts with SDK/MCP projections. |
 | [TASK-010](tasks/TASK-010-ask-component.md) | Deferred: Ask and saved-view interaction | None; superseded from active execution | Separate future approved scope; blocks no task here. |
 | [TASK-011](tasks/TASK-011-mcp-app.md) | Production MCP App, catalog discovery and connected multi-turn agent/browser journey | TASK-003, TASK-004, TASK-005, TASK-006, TASK-007, TASK-008, TASK-009, TASK-027 | Actual supported session/App-host integration and local live credentials; scenario 3 is blocked if absent |
@@ -34,13 +34,13 @@ Conventional pages start after that gate and retain their own visual checkpoints
 | [TASK-015](tasks/TASK-015-prompt-page.md) | Prompt workspace | TASK-012, TASK-013, TASK-005 | None |
 | [TASK-016](tasks/TASK-016-model-page.md) | Model workspace | TASK-012, TASK-013, TASK-004, TASK-005, TASK-007 | None |
 | [TASK-017](tasks/TASK-017-data-page.md) | Data workspace | TASK-012, TASK-013, TASK-005, TASK-007 | None |
-| [TASK-018](tasks/TASK-018-service-page.md) | Service workspace and charts | TASK-012, TASK-013, TASK-008, TASK-007 | REQ-023 and REQ-025 delivered and TASK-008 production-complete; no Service inference from component lists. |
+| [TASK-018](tasks/TASK-018-service-page.md) | Service workspace and charts | TASK-012, TASK-013, TASK-008, TASK-007 | REQ-025 delivered and TASK-008 production-complete; no Service inference from component lists. |
 | [TASK-019](tasks/TASK-019-query-page.md) | Query workbench page | TASK-012, TASK-006 | None |
-| [TASK-020](tasks/TASK-020-traces-page.md) | Traces and span investigation page | TASK-012, TASK-004 | REQ-023 for actual Service filter; no service_name stand-in. |
-| [TASK-021](tasks/TASK-021-logs-page.md) | Logs investigation page | TASK-012, TASK-004 | REQ-023 for actual Service filter; no inferred Service identity. |
-| [TASK-022](tasks/TASK-022-metrics-page.md) | Metrics page | TASK-012, TASK-004 | REQ-023 for actual Service scope/filter where exposed. |
-| [TASK-023](tasks/TASK-023-verify-pages.md) | Verify results workbench and Verifier definition | TASK-012, TASK-007, TASK-004 | Non-sensitive per-requirement outcome contract and REQ-023 Service result column are shipped; TASK-007 is production-complete. |
-| [TASK-024](tasks/TASK-024-home-page.md) | Home summary page | TASK-012, TASK-005, TASK-007, TASK-008, TASK-004 | REQ-023 and applicable REQ-029 attention contracts; all supporting library tasks complete. |
+| [TASK-020](tasks/TASK-020-traces-page.md) | Traces and span investigation page | TASK-012, TASK-004 | None; filter Services by `workload_card_uid`, never `service_name`. |
+| [TASK-021](tasks/TASK-021-logs-page.md) | Logs investigation page | TASK-012, TASK-004 | None; filter Services by `workload_card_uid`, never inferred identity. |
+| [TASK-022](tasks/TASK-022-metrics-page.md) | Metrics page | TASK-012, TASK-004 | None; scope Services by `workload_card_uid` where exposed. |
+| [TASK-023](tasks/TASK-023-verify-pages.md) | Verify results workbench and Verifier definition | TASK-012, TASK-007, TASK-004 | Non-sensitive per-requirement outcome contract is shipped; TASK-007 is production-complete. |
+| [TASK-024](tasks/TASK-024-home-page.md) | Home summary page | TASK-012, TASK-005, TASK-007, TASK-008, TASK-004 | Applicable REQ-029 attention contracts; all supporting library tasks complete. |
 | [TASK-025](tasks/TASK-025-change-pages.md) | Change Request collaboration pages | TASK-012, TASK-009 | REQ-029 platform contract and TASK-009 production-complete, including actual read/write host projections. |
 | [TASK-026](tasks/TASK-026-repositories-page.md) | Repository connections page | TASK-012, TASK-009 | REQ-029 repository/webhook/configuration platform contract and TASK-009 production-complete. |
 | [TASK-027](tasks/TASK-027-view-layout.md) | Placed, resizable view panels (revision 12) — **complete** | TASK-003 | None |
@@ -78,7 +78,7 @@ BFF/test edits when integrated. No component-family task duplicates foundation's
 Chart/CardHeader/primitives ownership. Page tasks compose completed components;
 they do not reopen loader/executor ownership or copy historical workspaces.
 
-REQ-023, REQ-025, REQ-029 and non-sensitive requirement-outcome reads are **separate platform prerequisites**. REQ-031 and Ask are deferred, not active prerequisites. This plan identifies their
+REQ-023 (workload/subject correlation) is delivered on main. REQ-025, REQ-029 and non-sensitive requirement-outcome reads are **separate platform prerequisites**. REQ-031 and Ask are deferred, not active prerequisites. This plan identifies their
 UI consumers; it does not create underspecified backend implementation tasks.
 Affected tasks are conditional, not ready to complete from main alone. Use actual
 approved/generated contracts when delivered, and do not guess fixture payloads
@@ -106,7 +106,7 @@ TASK-012–026 cannot start simply because one family has finished.
 | REQ-014–017/028; AC-008 | TASK-019 Query, TASK-020 Traces, TASK-021 Logs, TASK-022 Metrics; TASK-003/004/006 component and read parity proof |
 | REQ-018/026/027; AC-009 | TASK-007 components; TASK-023 run/session/drift/definition workflow; TASK-024 summaries of same recorded facts |
 | REQ-019 | TASK-024 Home, no bundled extra summary pages |
-| REQ-023/025 | External platform delivery; TASK-004/008/018/020–024 consume real Service correlation; TASK-008/018 consume real versioned chart contract |
+| REQ-023/025 | REQ-023 is delivered on main and TASK-004/008/018/020–024 consume its `workload_card_uid`/`subject_card_uid`; REQ-025 is external, consumed by TASK-008/018 |
 | REQ-029 | External platform delivery; TASK-009 components, TASK-025 Change Requests and TASK-026 Repos; TASK-007/024 consume attention rows |
 | REQ-031 and Ask | Deferred from this change; TASK-010 superseded; no shell controls or shipping dependency |
 | REQ-034; AC-013 | TASK-012 establishes real-browser page proof; TASK-013–026 each own their route/workflow, applicable range changes and negative flows |

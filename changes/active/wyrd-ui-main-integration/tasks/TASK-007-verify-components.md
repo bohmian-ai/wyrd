@@ -4,7 +4,7 @@ Spec: [revision 11, approved](../spec.md). Status: Proposed; platform prerequisi
 Dependencies: [TASK-003](TASK-003-shared-ui-foundation.md), [TASK-004](TASK-004-observe-components.md), [TASK-005](TASK-005-card-components.md).
 Mapped obligations: REQ-030, REQ-018, REQ-026, REQ-027, REQ-020, AC-009, AC-011, AC-010; all INV-001–INV-007 apply, with TASK-001-specific exclusions only in TASK-001.
 
-External dependency: Separately specified non-sensitive requirement-outcome read contract; REQ-023 for Service-filter variants; REQ-029 for AttentionList CR rows. Current sensitive outcome is not reclassified here. This task does not authorize implementation of that platform prerequisite. Contract-independent work may proceed, but fixtures/unavailable controls cannot close it.
+External dependency: Separately specified non-sensitive requirement-outcome read contract; REQ-029 for AttentionList CR rows. Current sensitive outcome is not reclassified here. This task does not authorize implementation of that platform prerequisite. Contract-independent work may proceed, but fixtures/unavailable controls cannot close it.
 
 ## Outcome and Value
 
@@ -12,7 +12,7 @@ Generic Verifier definitions and authoritative recorded run/session/drift result
 
 ## Owners, Scope, Consumers, and Prohibited Changes
 
-Own VerifierGraph, VerificationResult, RequirementDetail, DriftFeatureTable, VerificationBindings and AttentionList. Resolve selected result through execution readback before coloring its exact Verifier definition. Separate subject card_uid, verifier_card_uid, execution_id, application run_id and binding owner. No new session model, evidence upload read or frontend judgment calculation.
+Own VerifierGraph, VerificationResult, RequirementDetail, DriftFeatureTable, VerificationBindings and AttentionList. Resolve selected result through execution readback before coloring its exact Verifier definition. Separate `subject_card_uid`, `verifier_card_uid`, `execution_id`, application `run_id` and binding root `workload_card_uid`. No new session model, evidence upload read or frontend judgment calculation.
 
 Use committed main `8651b96fd`, the approved spec and current canvas. Historical `wyrd-server-ui` at `7bfc3a8a` supplies read/state/test evidence only. Current uncommitted trace changes are unrelated and must be preserved. Package components render typed props; portable loaders plan/shape; executor/host boundaries own credentials, authorized IO and action execution. Preserve tenant isolation, stable errors and server audit behavior. No speculative framework, test-only configuration or replacement selectors.
 

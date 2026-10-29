@@ -4,7 +4,7 @@ Spec: [revision 11, approved](../spec.md). Status: Proposed; platform prerequisi
 Dependencies: [TASK-003](TASK-003-shared-ui-foundation.md), [TASK-004](TASK-004-observe-components.md), [TASK-005](TASK-005-card-components.md), [TASK-006](TASK-006-query-components.md).
 Mapped obligations: REQ-030, REQ-023, REQ-025, REQ-020, AC-011, AC-010; all INV-001–INV-007 apply, with TASK-001-specific exclusions only in TASK-001.
 
-External dependency: REQ-023 correlation (including verification results) and REQ-025 Service charts, with separately approved platform implementation and actual SDK/MCP read/action projections. This task does not authorize implementation of that platform prerequisite. Contract-independent work may proceed, but fixtures/unavailable controls cannot close it.
+External dependency: REQ-025 Service charts, with separately approved platform implementation and actual SDK/MCP read/action projections. This task does not authorize implementation of that platform prerequisite. Contract-independent work may proceed, but fixtures/unavailable controls cannot close it.
 
 ## Outcome and Value
 
@@ -12,7 +12,7 @@ Service signal breakdown and versioned chart editing work from real Service iden
 
 ## Owners, Scope, Consumers, and Prohibited Changes
 
-Own SignalBreakdownTable and ChartEditor. Use service_card_uid for deployment scope and card_uid for producer breakdown; never relabel owner_card_uid or use service_name/component UID lists. Save chart emits an intent whose authorized host registers a new Service version. REQ-023 and REQ-025 are external platform work, not UI schema invention.
+Own SignalBreakdownTable and ChartEditor. Use `workload_card_uid` for release scope and `subject_card_uid` for component breakdown; never use service_name or component UID lists. Save chart emits an intent whose authorized host registers a new Service version. REQ-023 is delivered on main; REQ-025 is external platform work, not UI schema invention.
 
 Use committed main `8651b96fd`, the approved spec and current canvas. Historical `wyrd-server-ui` at `7bfc3a8a` supplies read/state/test evidence only. Current uncommitted trace changes are unrelated and must be preserved. Package components render typed props; portable loaders plan/shape; executor/host boundaries own credentials, authorized IO and action execution. Preserve tenant isolation, stable errors and server audit behavior. No speculative framework, test-only configuration or replacement selectors.
 
@@ -41,7 +41,7 @@ Paths under `src/mcp`, `src/query` or `tests/integration` described as server ow
 mise exec -- pnpm --dir crates/wyrd/wyrd-server/wyrd-ui test src/lib/ui-library.test.ts -t '^TASK-008: Isolated Service signals and chart preview$'
 ```
 
-**GREEN.** Use real service_card_uid and chart schema; no inferred cross-Service membership. Rerun this scenario and all earlier changed scenarios in this task. A missing prerequisite is a dependency, not permission to weaken the test.
+**GREEN.** Use real `workload_card_uid` and chart schema; no inferred cross-Service membership. Rerun this scenario and all earlier changed scenarios in this task. A missing prerequisite is a dependency, not permission to weaken the test.
 
 **REFACTOR.** Simplify within the existing owner while these scenarios stay green. Private helpers, fixture structure and module layout remain implementation-owned; do not add an alternate transport, lifecycle or orchestration owner.
 

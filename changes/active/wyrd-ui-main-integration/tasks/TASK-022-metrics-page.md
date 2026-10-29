@@ -4,7 +4,7 @@ Spec: [revision 11, approved](../spec.md). Status: Proposed; platform prerequisi
 Dependencies: [TASK-012](TASK-012-canvas-shell.md), [TASK-004](TASK-004-observe-components.md).
 Mapped obligations: REQ-017, REQ-028, REQ-020, AC-008, AC-010, REQ-034, AC-013; all INV-001–INV-007 apply, with TASK-001-specific exclusions only in TASK-001.
 
-External dependency: REQ-023 for actual Service scope/filter where exposed. This task does not authorize implementation of that platform prerequisite. Contract-independent work may proceed, but fixtures/unavailable controls cannot close it.
+External dependency: none. Scope Services by `workload_card_uid` where exposed.
 
 ## Outcome and Value
 

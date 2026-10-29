@@ -184,7 +184,7 @@ The server validates the whole verdict against the declared schema. Data must fi
 | Size | 65,536 bytes of compact UTF-8 JSON |
 | Depth | 16 containers; the root object is one, each nested object or array adds one |
 
-An Agent answer that fails its schema is returned to the model with a correction, and each correction spends one of the Agent's `max_iterations`. An answer still invalid on the last iteration makes the requirement `inconclusive` with `WYRD_AGENT_422_STRUCTURED_INVALID` in its reason. A `code` check's verdict is never corrected. A verdict that fails its schema or a limit makes the requirement `inconclusive` with no `data`; the reason names the location or limit, never the content. Accepted data is the requirement result's `data`, on step and Verifier requirements alike, and is kept with the rest of the result.
+An Agent answer that fails its schema is returned to the model with a correction, and each correction spends one of the Agent's `max_iterations`. An answer still invalid on the last iteration, or a provider refusal, which is never corrected, makes the requirement `inconclusive` with `WYRD_AGENT_422_STRUCTURED_INVALID` in its reason. A `code` check's verdict is never corrected. A verdict that fails its schema or a limit makes the requirement `inconclusive` with no `data`; the reason names the location or limit, never the content. Accepted data is the requirement result's `data`, on step and Verifier requirements alike, and is kept with the rest of the result.
 
 ## Decide
 

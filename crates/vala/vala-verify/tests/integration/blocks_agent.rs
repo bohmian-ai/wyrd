@@ -805,6 +805,40 @@ async fn check_agent_rejects_non_verdict() {
     assert!(!reason.contains("s3cr3t"), "{reason}");
 }
 
+/// A check Agent whose provider refuses without an answer is terminal with
+/// the stable code after one call, though budget and a valid Verdict remain.
+///
+/// # Panics
+/// Panics when the refusal is repaired, accepted, or echoed.
+#[tokio::test(flavor = "multi_thread")]
+async fn check_agent_refusal_is_not_repaired() {
+    let mut refusal = openai_text_response("");
+    if let ProviderResponse::OpenAiChatCompletion(response) = &mut refusal {
+        response.choices[0].message.content = None;
+        response.choices[0].message.refusal = Some("s3cr3t".to_owned());
+    }
+    let valid = openai_text_response(
+        &json!({"outcome": "passed", "reason": "r", "citations": []}).to_string(),
+    );
+    let (executor, provider) = recording(vec![refusal, valid]);
+    let error = check(
+        &executor,
+        &named_judge(json!("verdict")),
+        input("response", json!("ok")),
+    )
+    .await
+    .expect_err("a refusal is inconclusive");
+    let BlockError::Terminal { reason } = &error else {
+        panic!("expected terminal, got {error}");
+    };
+    assert!(
+        reason.starts_with("WYRD_AGENT_422_STRUCTURED_INVALID: "),
+        "{reason}"
+    );
+    assert!(!reason.contains("s3cr3t"), "{reason}");
+    assert_eq!(provider.requests.lock().expect("unpoisoned").len(), 1);
+}
+
 /// A provider that records each native request before answering from a
 /// [`MockProvider`] queue.
 #[derive(Clone)]

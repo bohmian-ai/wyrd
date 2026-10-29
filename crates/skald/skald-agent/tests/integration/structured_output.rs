@@ -4,7 +4,7 @@
 use std::sync::Arc;
 
 use serde_json::{Value, json};
-use skald_agent::{Agent, AgentError, JournalEvent, RunConfig};
+use skald_agent::{Agent, AgentError, CallbackOutcome, JournalEvent, RunConfig};
 use skald_prompt::{
     AnthropicOptions, GeminiOptions, OpenAiChatOptions, OpenAiResponsesOptions, ResponseFormat,
     anthropic, gemini, openai_chat, openai_responses,
@@ -13,6 +13,7 @@ use skald_runtime::{MockProvider, ProviderRegistry};
 use skald_spec::wire::anthropic_messages::{
     AnthropicContentBlock, AnthropicMessagesResponse, AnthropicStopReason, AnthropicUsage,
 };
+use skald_spec::wire::openai_chat::OpenAiResponseFormat;
 use skald_spec::wire::openai_responses::OpenAiResponseContentPart;
 use skald_spec::{ProviderName, ProviderRequest, ProviderResponse};
 use wyrd_spec::error::WyrdError;
@@ -541,4 +542,171 @@ async fn text_prompt_leaves_structured_output_none() {
 
     assert!(run.structured_output.is_none());
     assert_eq!(run.output, "hello");
+}
+
+/// The JSON schema an OpenAI Chat request sends.
+///
+/// # Panics
+/// Panics when the request is not Chat or sends no JSON schema.
+fn sent_schema(request: &ProviderRequest) -> Value {
+    let body = serde_json::to_value(request).expect("request serializes");
+    let schema = body["body"]["response_format"]["json_schema"]["schema"].clone();
+    assert!(schema.is_object(), "a JSON schema: {body}");
+    schema
+}
+
+/// A schema whose enum value is bound from a Prompt variable is validated
+/// as sent: the bound value succeeds first time, and the literal
+/// placeholder is repaired.
+///
+/// # Panics
+/// Panics when the sent schema keeps the placeholder, the bound value is
+/// refused, or the placeholder is accepted.
+#[tokio::test(flavor = "multi_thread")]
+async fn structured_output_validates_the_bound_schema() {
+    let schema = json!({
+        "type": "object",
+        "properties": {"answer": {"enum": ["${expected}"]}},
+        "required": ["answer"],
+        "additionalProperties": false
+    });
+    let ready = r#"{"answer": "ready"}"#;
+    for (replies, calls) in [
+        (vec![ready], 1),
+        (vec![r#"{"answer": "${expected}"}"#, ready], 2),
+    ] {
+        let provider = RecordingProvider::named(
+            ProviderName::OpenAi,
+            replies.into_iter().map(ProviderResponse::text).collect(),
+        );
+        let journal = RecordingJournal::new();
+        let agent = agent(chat_prompt(schema.clone()), 2, &journal);
+        let run = agent
+            .run_prompt(
+                &registry(&provider),
+                &agent.prompt,
+                &[("expected", "ready")],
+            )
+            .await
+            .unwrap_or_else(|error| panic!("{calls} calls: {error}"));
+        assert_eq!(
+            run.structured_output.expect("structured")["answer"],
+            "ready"
+        );
+        let requests = provider.requests();
+        assert_eq!(requests.len(), calls);
+        assert_eq!(
+            sent_schema(&requests[0])["properties"]["answer"]["enum"],
+            json!(["ready"])
+        );
+    }
+}
+
+/// A `before_model` hook that replaces the response schema moves validation
+/// to the replacement: an answer satisfying only the Prompt's schema is
+/// repaired, and the Prompt itself is unchanged.
+///
+/// # Panics
+/// Panics when the stale answer is accepted, the replacement answer is
+/// refused, or the Prompt changes.
+#[tokio::test(flavor = "multi_thread")]
+async fn structured_output_validates_a_replaced_schema() {
+    let replacement = json!({
+        "type": "object",
+        "properties": {"baz": {"type": "string"}},
+        "required": ["baz"],
+        "additionalProperties": false
+    });
+    let swapped = replacement.clone();
+    let provider = RecordingProvider::named(
+        ProviderName::OpenAi,
+        vec![
+            ProviderResponse::text(r#"{"foo": "a", "bar": "b"}"#),
+            ProviderResponse::text(r#"{"baz": "z"}"#),
+        ],
+    );
+    let journal = RecordingJournal::new();
+    let agent =
+        agent(chat_prompt(foo_bar()), 2, &journal).before_model(Arc::new(move |_ctx, request| {
+            let mut request = request.clone();
+            let ProviderRequest::OpenAiChatCompletion(chat) = &mut request else {
+                panic!("an OpenAI Chat request");
+            };
+            if let Some(OpenAiResponseFormat::JsonSchema { json_schema }) =
+                &mut chat.response_format
+            {
+                json_schema.schema = swapped.as_object().cloned();
+            }
+            CallbackOutcome::ReplaceWith(request)
+        }));
+    let card = format!("{:?}", agent.prompt.native().response_type);
+
+    let run = agent
+        .run_with(&registry(&provider), None, "hello")
+        .await
+        .expect("the replacement answer is accepted");
+
+    assert_eq!(run.structured_output.expect("structured")["baz"], "z");
+    let requests = provider.requests();
+    assert_eq!(requests.len(), 2);
+    assert_eq!(sent_schema(&requests[0]), replacement);
+    assert!(text_of(&requests[1]).contains(CORRECTION));
+    assert_eq!(format!("{:?}", agent.prompt.native().response_type), card);
+}
+
+/// A native refusal without an answer ends a structured run after one call
+/// with the structured-invalid code and a fixed diagnostic, though budget
+/// and a valid answer remain.
+///
+/// # Panics
+/// Panics when a refusal is repaired, succeeds, or yields another error.
+#[tokio::test(flavor = "multi_thread")]
+async fn structured_output_does_not_repair_refusals() {
+    let mut chat = ProviderResponse::text("");
+    if let ProviderResponse::OpenAiChatCompletion(response) = &mut chat {
+        response.choices[0].message.content = None;
+        response.choices[0].message.refusal = Some("s3cr3t refusal".to_owned());
+    }
+    let ProviderResponse::AnthropicMessage(mut refused) = anthropic_text("") else {
+        unreachable!("an Anthropic answer");
+    };
+    refused.content.clear();
+    refused.stop_reason = Some(AnthropicStopReason::Refusal);
+    let anthropic_prompt = encodings()
+        .into_iter()
+        .find(|(name, ..)| *name == "anthropic")
+        .expect("anthropic encoding");
+    for (prompt, name, refusal, valid) in [
+        (
+            chat_prompt(foo_bar()),
+            ProviderName::OpenAi,
+            chat,
+            ProviderResponse::text(r#"{"foo": "a", "bar": "b"}"#),
+        ),
+        (
+            anthropic_prompt.1,
+            ProviderName::Anthropic,
+            ProviderResponse::AnthropicMessage(refused),
+            anthropic_text(r#"{"foo": "a", "bar": "b"}"#),
+        ),
+    ] {
+        let provider = RecordingProvider::named(name.clone(), vec![refusal, valid]);
+        let journal = RecordingJournal::new();
+        let agent = agent(prompt, 3, &journal);
+        let error = agent
+            .run_prompt(&registry(&provider), &agent.prompt, &[])
+            .await
+            .expect_err("a refusal is terminal");
+        assert_eq!(provider.requests().len(), 1, "{name:?}");
+        assert_eq!(
+            error.code(),
+            "SKALD_AGENT_422_STRUCTURED_INVALID",
+            "{name:?}"
+        );
+        let AgentError::StructuredOutputInvalid { violations, .. } = &error else {
+            panic!("structured-invalid, got {error:?}");
+        };
+        assert_eq!(violations, &["provider refused without an answer"]);
+        assert!(!error.to_string().contains("s3cr3t"), "{error}");
+    }
 }

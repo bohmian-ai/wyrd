@@ -581,15 +581,17 @@ and audit; the deployment is never derived from the Prompt provider. An
 invocation may supply a whole replacement route for that invocation only;
 it never changes the Card, its hash, or a concurrent invocation.
 
-A structured-output Agent validates every proposed final answer against its
-run's response schema. An invalid answer (malformed JSON, a non-object, or a
+A structured-output Agent validates every proposed final answer against the
+exact response schema its outgoing request sent, after rendering and
+`before_model` hooks. An invalid answer (malformed JSON, a non-object, or a
 schema violation) is answered with one bounded correction turn citing the
 violated rules and schema fragments, and the loop continues: a repair spends
 one iteration of `max_iterations`, shared with tool turns. An answer still
 invalid on the last iteration ends the run with
 `WYRD_AGENT_422_STRUCTURED_INVALID`, which is terminal and never retried; its
 message and details carry at most ten schema locations, never reply values,
-reply keys, or parser text. The correction is conversation content, captured
+reply keys, or parser text. A provider refusal without an answer is never
+repaired: it ends the run at once with the same code and a fixed diagnostic. The correction is conversation content, captured
 under the run's sensitive capture policy, not error or log content.
 
 ### Mcp

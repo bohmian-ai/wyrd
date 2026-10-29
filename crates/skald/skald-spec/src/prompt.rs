@@ -273,7 +273,7 @@ pub fn check_output_schema(schema: &Value, field: &str, object_root: bool) -> Sk
 /// Native body path of a request's output schema, and whether its
 /// destination requires an object root (OpenAI with `strict: true`).
 ///
-/// Only the four kinds [`response_type_of`] derives schemas from reach here.
+/// Only the four kinds [`ResponseType::of`] derives schemas from reach here.
 fn output_schema_field(request: &ProviderRequest) -> (&'static str, bool) {
     use crate::wire::openai_chat::OpenAiResponseFormat;
     use crate::wire::openai_responses::OpenAiTextResponseFormat;
@@ -367,7 +367,7 @@ impl Prompt {
                 "the request body model must equal the Prompt's literal model",
             ));
         }
-        let response_type = response_type_of(&request);
+        let response_type = ResponseType::of(&request);
         if let ResponseType::JsonSchema { schema, .. } = &response_type {
             let (field, object_root) = output_schema_field(&request);
             check_output_schema(schema, field, object_root)?;
@@ -696,7 +696,7 @@ impl Prompt {
             }
             _ => {}
         }
-        self.response_type = response_type_of(&self.request);
+        self.response_type = ResponseType::of(&self.request);
         if let ResponseType::JsonSchema { schema, .. } = &self.response_type {
             let (field, object_root) = output_schema_field(&self.request);
             check_output_schema(schema, field, object_root)?;
@@ -727,57 +727,63 @@ fn replace_string_leaves(value: &mut Value, vars: &[(&str, &str)]) {
     }
 }
 
-/// Derives the expected response shape from a request's structured-output field.
-///
-/// Portable schemas carry the name `response`; Anthropic and GenerateContent
-/// declare no schema name, so they use the same one.
-fn response_type_of(request: &ProviderRequest) -> ResponseType {
-    use crate::wire::anthropic_messages::AnthropicOutputFormat;
-    use crate::wire::openai_chat::OpenAiResponseFormat;
-    use crate::wire::openai_responses::OpenAiTextResponseFormat;
+impl ResponseType {
+    /// The response shape `request` asks for, read from its structured-output
+    /// field: the authority for validating that request's answer, since
+    /// rendering and request hooks may change the schema a Prompt declared.
+    ///
+    /// Portable schemas carry the name `response`; Anthropic and
+    /// GenerateContent declare no schema name, so they use the same one.
+    pub fn of(request: &ProviderRequest) -> Self {
+        use crate::wire::anthropic_messages::AnthropicOutputFormat;
+        use crate::wire::openai_chat::OpenAiResponseFormat;
+        use crate::wire::openai_responses::OpenAiTextResponseFormat;
 
-    let named = |name: &str, schema: Value| ResponseType::JsonSchema {
-        name: name.to_owned(),
-        schema,
-    };
-    match request {
-        ProviderRequest::OpenAiChatCompletion(request) => match &request.response_format {
-            Some(OpenAiResponseFormat::JsonSchema { json_schema }) => json_schema
-                .schema
-                .clone()
-                .map_or(ResponseType::Text, |schema| {
-                    named(&json_schema.name, Value::Object(schema))
-                }),
-            _ => ResponseType::Text,
-        },
-        ProviderRequest::OpenAiResponses(request) => {
-            match request.text.as_ref().and_then(|text| text.format.as_ref()) {
-                Some(OpenAiTextResponseFormat::JsonSchema {
-                    name,
-                    schema: Some(schema),
-                    ..
-                }) => named(name, Value::Object(schema.clone())),
-                _ => ResponseType::Text,
-            }
-        }
-        ProviderRequest::AnthropicMessage(request) => match &request.output_config {
-            Some(config) => match &config.format {
-                AnthropicOutputFormat::JsonSchema { schema } => named("response", schema.clone()),
-            },
-            None => ResponseType::Text,
-        },
-        ProviderRequest::GeminiGenerateContent(request) => request
-            .settings
-            .generation_config
-            .as_ref()
-            .and_then(|config| {
-                config
-                    .response_json_schema
+        let named = |name: &str, schema: Value| ResponseType::JsonSchema {
+            name: name.to_owned(),
+            schema,
+        };
+        match request {
+            ProviderRequest::OpenAiChatCompletion(request) => match &request.response_format {
+                Some(OpenAiResponseFormat::JsonSchema { json_schema }) => json_schema
+                    .schema
                     .clone()
-                    .or_else(|| config.response_schema.clone())
-            })
-            .map_or(ResponseType::Text, |schema| named("response", schema)),
-        _ => ResponseType::Text,
+                    .map_or(ResponseType::Text, |schema| {
+                        named(&json_schema.name, Value::Object(schema))
+                    }),
+                _ => ResponseType::Text,
+            },
+            ProviderRequest::OpenAiResponses(request) => {
+                match request.text.as_ref().and_then(|text| text.format.as_ref()) {
+                    Some(OpenAiTextResponseFormat::JsonSchema {
+                        name,
+                        schema: Some(schema),
+                        ..
+                    }) => named(name, Value::Object(schema.clone())),
+                    _ => ResponseType::Text,
+                }
+            }
+            ProviderRequest::AnthropicMessage(request) => match &request.output_config {
+                Some(config) => match &config.format {
+                    AnthropicOutputFormat::JsonSchema { schema } => {
+                        named("response", schema.clone())
+                    }
+                },
+                None => ResponseType::Text,
+            },
+            ProviderRequest::GeminiGenerateContent(request) => request
+                .settings
+                .generation_config
+                .as_ref()
+                .and_then(|config| {
+                    config
+                        .response_json_schema
+                        .clone()
+                        .or_else(|| config.response_schema.clone())
+                })
+                .map_or(ResponseType::Text, |schema| named("response", schema)),
+            _ => ResponseType::Text,
+        }
     }
 }
 

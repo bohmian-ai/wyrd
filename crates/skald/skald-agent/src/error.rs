@@ -124,10 +124,11 @@ pub enum AgentError {
         /// Configured timeout duration.
         duration: Duration,
     },
-    /// The final answer of a structured-output run still violated the
-    /// Prompt's response schema when the iteration budget ran out.
+    /// A structured-output run ended without an accepted answer: the
+    /// provider refused, or the last answer the iteration budget allowed
+    /// still violated the response schema its request sent.
     #[error(
-        "agent '{agent}' structured output violates its response schema at {}",
+        "agent '{agent}' structured output was not accepted: {}",
         violations.join(", ")
     )]
     StructuredOutputInvalid {

@@ -24,8 +24,8 @@ const MAX_FRAGMENT_BYTES: usize = 900;
 /// Opening of every correction turn.
 const CORRECTION_OPENING: &str = "Your previous reply was not accepted because it does not satisfy the required JSON schema. Reply again with only a JSON object that satisfies the schema; do not repeat the rejected reply.";
 
-/// The exact response schema of one structured-output run, compiled once
-/// and checked against every proposed final answer.
+/// The exact response schema an outgoing request sent, compiled once and
+/// checked against every proposed final answer while that schema is sent.
 pub(crate) struct StructuredOutput {
     /// The schema sent with the run's requests.
     schema: Value,
@@ -44,12 +44,12 @@ pub(crate) struct Rejection {
 }
 
 impl StructuredOutput {
-    /// Compiles `schema`, the response schema a run's Prompt declares.
+    /// Compiles `schema`, the response schema an outgoing request sends.
     ///
     /// # Errors
     ///
-    /// Returns [`AgentError::Prompt`] when `schema` does not compile; Prompt
-    /// construction validates it, so this is a broken invariant.
+    /// Returns [`AgentError::Prompt`] when `schema` does not compile, which a
+    /// binding or `before_model` hook can cause.
     pub(crate) fn new(agent: &str, schema: &Value) -> AgentResult<Self> {
         let validator = jsonschema::validator_for(schema).map_err(|_| AgentError::Prompt {
             agent: agent.to_owned(),
@@ -59,6 +59,11 @@ impl StructuredOutput {
             schema: schema.clone(),
             validator,
         })
+    }
+
+    /// The schema this validator was compiled from.
+    pub(crate) const fn schema(&self) -> &Value {
+        &self.schema
     }
 
     /// Accepts `output` when it is a JSON object satisfying the schema.

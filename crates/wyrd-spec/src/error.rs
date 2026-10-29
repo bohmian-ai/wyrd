@@ -3199,14 +3199,15 @@ pub enum WyrdError {
         /// Structured detail payload.
         details: serde_json::Value,
     },
-    /// A structured-output agent run's final answer still violated its
-    /// response schema when the iteration budget ran out.
+    /// A structured-output agent run ended without an accepted answer: the
+    /// provider refused, or the final answer still violated its response
+    /// schema when the iteration budget ran out.
     #[error("[WYRD_AGENT_422_STRUCTURED_INVALID] {message}")]
     #[wyrd_error(
         code = "WYRD_AGENT_422_STRUCTURED_INVALID",
         status = 422,
         title = "Structured response invalid",
-        remediation = "The model did not correct its answer within the Agent's iteration budget; simplify the response schema, clarify the Prompt, choose a model that follows structured output, or raise max_iterations."
+        remediation = "The model refused, or did not correct its answer within the Agent's iteration budget; simplify the response schema, clarify the Prompt, choose a model that follows structured output, or raise max_iterations."
     )]
     AgentStructuredInvalid {
         /// Human-readable error message.

@@ -149,7 +149,6 @@ impl Agent {
                         conversation,
                         session_id: session_id.as_ref(),
                         model: &self.prompt.native().model,
-                        response_type: &self.prompt.native().response_type,
                     },
                 )
                 .await
@@ -251,7 +250,6 @@ impl Agent {
                         conversation: Conversation::new(),
                         session_id: None,
                         model: &prompt.native().model,
-                        response_type: &prompt.native().response_type,
                     },
                 )
                 .await
@@ -343,16 +341,18 @@ impl Agent {
     /// result, and runs requested tools concurrently under `execute_tool` spans
     /// until the model stops calling tools or the iteration budget is spent.
     /// A structured-output run validates every final answer against the
-    /// run Prompt's exact response schema; an invalid answer stays in the
-    /// conversation, followed by a bounded correction turn, and the next
-    /// iteration asks again, so repairs spend the same budget as tool turns.
+    /// exact response schema its outgoing request sent, after rendering and
+    /// `before_model` hooks; an invalid answer stays in the conversation,
+    /// followed by a bounded correction turn, and the next iteration asks
+    /// again, so repairs spend the same budget as tool turns. A provider
+    /// refusal without an answer is never repaired.
     ///
     /// # Errors
     ///
     /// Returns `AgentError` for a zero or exhausted iteration budget, a provider,
     /// tool, journal, or session failure, and
     /// [`AgentError::StructuredOutputInvalid`] when the last iteration's answer
-    /// still violates the response schema.
+    /// still violates the response schema or the provider refuses to answer.
     async fn run_loop(
         &self,
         providers: &ProviderRegistry,
@@ -364,7 +364,6 @@ impl Agent {
             mut conversation,
             session_id,
             model,
-            response_type,
         } = inputs;
         if self.run_config.max_iterations == 0 {
             return Err(AgentError::max_iterations(
@@ -375,12 +374,7 @@ impl Agent {
 
         let concurrency_cap = self.run_config.tool_concurrency_cap.unwrap_or(8).max(1);
         let max_iterations = self.run_config.max_iterations;
-        let structured = match response_type {
-            ResponseType::Text => None,
-            ResponseType::JsonSchema { schema, .. } => {
-                Some(StructuredOutput::new(&self.id, schema)?)
-            }
-        };
+        let mut structured: Option<StructuredOutput> = None;
 
         for iteration in 0..max_iterations {
             self.journal
@@ -427,6 +421,15 @@ impl Agent {
                 ChainResult::Replaced(replacement) => replacement,
             };
 
+            // The outgoing request, after rendering and hooks, owns the
+            // schema its answer must satisfy.
+            structured = match ResponseType::of(&request) {
+                ResponseType::Text => None,
+                ResponseType::JsonSchema { schema, .. } => match structured.take() {
+                    Some(current) if current.schema() == &schema => Some(current),
+                    _ => Some(StructuredOutput::new(&self.id, &schema)?),
+                },
+            };
             self.append_model_journal_call(iteration, &request).await?;
             let provider = self.prompt.native().provider();
             let chat = chat_span(&provider, &request, model);
@@ -493,6 +496,13 @@ impl Agent {
                     .text()
                     .map(std::borrow::Cow::into_owned)
                     .unwrap_or_default();
+                if structured.is_some() && output.trim().is_empty() && response.adapter().refused()
+                {
+                    return Err(AgentError::StructuredOutputInvalid {
+                        agent: self.id.clone(),
+                        violations: vec!["provider refused without an answer".to_owned()],
+                    });
+                }
                 let structured_output = match structured.as_ref().map(|s| s.check(&output)) {
                     None => None,
                     Some(Ok(map)) => Some(map),
@@ -920,9 +930,6 @@ struct RunLoopInputs<'a> {
     /// Resolved model of the Prompt driving the run; the `chat` span fallback
     /// for request wire shapes that carry no model.
     model: &'a str,
-    /// Response type of the Prompt driving the run, whose schema every
-    /// final answer must satisfy.
-    response_type: &'a ResponseType,
 }
 
 /// Open the `chat` span for one dispatch of the effective `request` to `provider`.

@@ -944,3 +944,83 @@ Open risks:
 - The conversion bound is conservative. For large list-heavy batches it can
   exceed the ingress sublimit and refuse appends (backpressure) for as long
   as a learned generation stays open.
+
+## Task 9 outcome: reverted, with measured write-path findings
+
+The shared process WAL was reverted in 1e9680f3c. Scribe again writes one WAL
+stream per shard. Kept per segment: the covered-sync skip (5f9415dbc) and
+appends that proceed while a sync runs (8461ff6a5, by the maintainer's
+decision; this replaces the task's "no append during sync" line). Added:
+write steps report `wal_bytes_per_row`, `staged_bytes_per_row`,
+`published_bytes_per_row`, `wal_syncs` and `stage_syncs` (87efb8d8f), and boot
+runs at least one WAL IO worker per shard (70dad7c6b).
+
+`native-write-c64`, medians of 3 repetitions, all VALID. Logs are in the
+session scratchpad, named as in the first column.
+
+| Run | Code | Shards | rows/s (min–max) | requests/s | WAL append p50 | WAL sync p50 |
+|---|---|---|---|---|---|---|
+| base | db29ee915 | 1 | 1.18M (0.57–1.60M) | 72 | 52 ms | 180 ms |
+| base | db29ee915 | 16 | 1.96M (1.95–2.90M) | 120 | 81 ms | 67 ms |
+| cand | b8b55fda2, shared WAL | 16 | 1.20M (1.07–1.56M) | 73 | 138 ms | 49 ms |
+| opt1 | 8461ff6a5, shared WAL | 16 | 1.39M (0.35–1.94M) | 85 | 98 ms | 93 ms |
+| rev | 87efb8d8f, per-shard WAL | 1 | 1.79M (1.13–2.41M) | 109 | 48 ms | 104 ms |
+| rev | 87efb8d8f, per-shard WAL | 16 | 2.88M (1.80–3.02M) | 176 | 73 ms | 56 ms |
+| io16 | rev with 16 WAL IO workers | 16 | 2.96M (2.32–3.28M) | — | 3 ms | 60 ms |
+| ev | 70dad7c6b | 16 | 2.43M (1.93–3.90M) | — | 2.8 ms | 111 ms |
+
+Bytes written per row at 16 shards (`rev`): WAL 38.7, staged 31.4, published
+18.1. WAL syncs per window: 40 at 1 shard and 733 at 16 shards, which is 23.6
+and 2.1 acknowledged requests per WAL sync.
+
+- **Symptom:** at 16 shards the shared WAL measured below per-shard streams,
+  and per-shard throughput stays well below the CPU's capacity: the server
+  uses 4–7 of 32 cores.
+- **Evidence:** during the `ev` run, a sampler read every server thread's state
+  and kernel wait channel every 20 ms, and `/sys/block/nvme1n1/stat`,
+  `/proc/vmstat` and `/proc/pressure/io` every 100 ms. Over the 36 loaded
+  seconds:
+  - WAL IO threads were blocked in the kernel 73% of the time: 32% waiting on
+    page writeback, 17% on ext4 journal commits, 11% on block IO, and 10%
+    appending behind a journal commit. They were idle 25% and running 1.5%.
+  - The device was 96% busy at the median, writing 300 MiB/s, at 58 cache
+    flushes per second taking 25 ms each (p90: 254 flushes/s, 81 ms each).
+  - IO pressure (`some`) was 85%.
+  - Dirty-page throttling took 0.8% of WAL thread time, and dirty pages
+    peaked at about 208 MiB, under the 256 MiB limit.
+- **Cause:** durable filesystem and device IO. The WAL IO pool's four workers
+  also queued one shard's append behind other shards' syncs (append p50
+  73 ms → 3 ms with one worker per shard). The shared-WAL experiment
+  serialized appends on one file, and it recorded no sync counts, so it did
+  not test whether shared syncs reduce syncs per request.
+- **Fix site:** WAL IO lane sizing at boot (`ScribeRuntimeConfig::wal_io_workers`).
+  No further write-path change is justified by this evidence. The cost of a
+  sync is specific to the host's device and filesystem; the portable property
+  is syncs per acknowledged request, which grows with shard count. An
+  independent read-only diagnostician (Codex) reviewed the same raw data and
+  reached the same conclusion.
+
+Run-to-run spread on this host is wide: the `rev` and `ev` 16-shard runs
+differ by up to 2×, while device flush time ranges from 25 to 163 ms. Every
+10-second window ended with a staged backlog of up to about 1.4 GB, so these
+are short-window figures, not steady state. A future shared-sync change needs
+an A/B that counts completed syncs per request, holds staging constant, and
+runs to steady state.
+
+## Task 12 implementation evidence
+
+91dc80e93 parses a query's SQL once in `OraclePlanner::validate_statement`
+and plans the stored `DfStatement` with `statement_to_plan` and fresh
+parameter bindings for each attempt. Test:
+`oracle::tests::validated_statement_is_parsed_once_with_fresh_bindings`.
+
+`mise run bench:l1:bifrost:parquet -- --steps point-c64,span-trace-c64`, VALID
+before (db29ee915) and after (b8b55fda2):
+
+| Step | CPU per query | server p99 | client p99 |
+|---|---|---|---|
+| point-c64 | 3.633 → 3.733 ms (+2.8%) | 11.30 → 11.01 ms | 15.22 → 15.12 ms |
+| span-trace-c64 | 6.937 → 7.001 ms (+0.9%) | 22.18 → 22.88 ms | 25.89 → 26.24 ms |
+
+Within the 5% retain rule; no measurable gain. Kept because it removes a
+second parse from every attempt.

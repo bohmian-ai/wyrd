@@ -346,7 +346,9 @@ pub struct ScribeRuntimeConfig {
     pub outbox_bytes: usize,
     /// Number of Scribe shards, each with its own WAL and memtable.
     ///
-    /// `WYRD_SCRIBE_SHARD_COUNT` overrides the file value. Default 1.
+    /// Each shard syncs its own WAL, so more shards mean more syncs per
+    /// acknowledged request. `WYRD_SCRIBE_SHARD_COUNT` overrides the file
+    /// value. Default 1.
     #[serde(default = "default_scribe_shard_count")]
     pub shard_count: usize,
     /// Megabytes one shard's WAL segment holds before the shard rotates.

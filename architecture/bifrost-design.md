@@ -590,6 +590,15 @@ stream, memtable buckets, and cohort state. Shards are a pod-local concurrency
 topology, not tenant partitions or table reservations. Replay maps a recorded
 shard onto the running count, so the count may change across restarts.
 
+Each shard syncs only its own WAL, so one group's sync covers only that
+shard's requests. More shards therefore mean more syncs per acknowledged
+request, which lowers throughput wherever a durable sync is expensive; the
+default of one shard maximizes sync coverage. A WAL sync covers every append
+that finished before it began, appends continue while it runs, and a sync
+whose appends an earlier sync already covered issues no `fdatasync`. A shard
+holds one WAL IO worker for each blocking append and sync, so boot runs at
+least one WAL IO worker per shard.
+
 Each shard rotates its WAL and memtable together when the WAL reaches
 `WYRD_MAX_FILE_SIZE_ON_DISK` (MiB), the memtable reaches
 `WYRD_MAX_FILE_SIZE_IN_MEMORY` (MiB), or the generation reaches

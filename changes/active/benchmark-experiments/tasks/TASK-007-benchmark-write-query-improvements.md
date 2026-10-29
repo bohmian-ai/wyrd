@@ -1135,3 +1135,58 @@ Not tried, because the task forbids it as a fallback: per-column page sizes
 (small pages only on sorted point-lookup columns), codec changes, and
 decoded-page caching. Per-column page sizing is the evidence-backed
 follow-up if point-lookup CPU becomes the goal again.
+
+## Per-query planning costs: two kept, one reverted
+
+Profile of steady point-c64 and span-trace-c64 load (one sample weighs one)
+named three costs that every filtered query pays on the one planning path.
+Each was changed, measured with the full parquet experiment, and kept only
+if it helped every query shape.
+
+| Change | Commit | Outcome |
+|---|---|---|
+| Probe host parallelism once per Iceberg scan build, and only for an unset limit (iceberg-rust `wyrd-production` 469cf4aff, iceberg-compaction `wyrd-production` 41662c251); Oracle sets its listing limit to the session's target partitions | 45391226d | kept |
+| Share one never-reported pruner metric set across scan sizers | 122ff3a0a | kept |
+| Prune each planned footer once and hand the plan to the Parquet opener as its initial access plan | 8f8265f8a | reverted (459617bae) |
+
+Same host, full plan, all VALID:
+
+| Step | Baseline (fe6ef51a9) | Kept changes (459617bae) | Change |
+|---|---:|---:|---:|
+| point-c64 requests/s | 7,469 | 8,226 | +10.1% |
+| point-c64 queries/CPU-s | 260.0 | 285.6 | +9.8% |
+| point-c64 server p50 / p99 ms | 5.38 / 11.31 | 4.99 / 10.79 | −7% / −4.6% |
+| point-c1 requests/s | 477.9 | 497.1 | +4.0% |
+| span-trace-c64 requests/s | 4,064 | 4,166 | +2.5% |
+| span-trace-c64 queries/CPU-s | 139.8 | 144.4 | +3.3% |
+| span-trace-c64 server p99 ms | 22.3 | 23.6 | +6% |
+| span-trace-c1, small-aggregate, full-scan, shredded, long-tail | — | — | within ±2% |
+| storage ratio native / logs / spans | 0.08 / 0.118 / 0.071 | unchanged | — |
+
+The point-c64 p99 goal (< 5 ms) is still missed.
+
+**Why the access-plan hand-off was reverted.** With it, span-trace lost
+5–9% throughput (c64 p99 25.7 ms). Its profile showed row-group pruning
+rising from 9.8% to 14.8% of CPU: the planning pass cost 6.3%, sizing 3.7%,
+and the opener still 4.8% of its former 5.2%. Pruning cost is per call,
+not per row group, because each call rebuilds the pruning predicate
+(`build_inverted_predicate` 4.3% → 6.3%), so skipping row groups saved
+almost nothing. The opener's metric contract it had to preserve (planned
+skips counted as `row_groups_pruned_statistics`) went with it.
+
+**Left alone.** DataFusion's `CachedParquetFileReaderFactory` builds a full
+`ParquetFileMetrics` on every file open (2.7% of span-trace CPU) beside the
+opener's own; removing it changes a public `ParquetFileReader` API in the
+DataFusion fork. Logical optimization (~15% of each lookup) is DataFusion's
+one planner doing its normal work.
+
+Verification: `vala-bifrost-redux` lib (898 passed), clippy `-D warnings`,
+`wyrd-testing --test oracle -P journey --run-ignored=only` (59 passed with
+the hand-off in place; `remote_live_window_blocked_scribe_stops_cleanly`
+failed once at 46 s in the first full run and passed in both reruns, not
+diagnosed), iceberg-rust `scan::` tests (63 passed, new
+`test_table_scan_concurrency_limits`).
+
+Records: `benchmarks/history/bifrost/parquet/20261029T132713Z-122ff3a0a.json`
+(all three), `20261029T134546Z-459617bae.json` (kept two). Span-trace
+profile with the hand-off: `target/benchmarks/bifrost/parquet/20261029T133235Z/profiles/`.

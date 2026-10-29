@@ -248,17 +248,17 @@ parquet = "60.0"
 parquet-variant = { package = "bohmian-parquet-variant", version = "60.0.0" }
 parquet-variant-compute = { package = "bohmian-parquet-variant-compute", version = "60.0.0" }
 parquet-variant-json = { package = "bohmian-parquet-variant-json", version = "60.0.0" }
-iceberg = { git = "https://github.com/bohmian-ai/iceberg-rust", rev = "850d308a8c50cdd7890ecfdf5bfd9825efebb241" }
+iceberg = { git = "https://github.com/bohmian-ai/iceberg-rust", rev = "469cf4aff3aaee824f2ec3ce685c61411a08640e" }
 # The fork's SQL catalog is on the workspace's sqlx 0.9, so one sqlx is linked.
-iceberg-catalog-sql = { git = "https://github.com/bohmian-ai/iceberg-rust", rev = "850d308a8c50cdd7890ecfdf5bfd9825efebb241" }
-iceberg-datafusion = { git = "https://github.com/bohmian-ai/iceberg-rust", rev = "850d308a8c50cdd7890ecfdf5bfd9825efebb241" }
+iceberg-catalog-sql = { git = "https://github.com/bohmian-ai/iceberg-rust", rev = "469cf4aff3aaee824f2ec3ce685c61411a08640e" }
+iceberg-datafusion = { git = "https://github.com/bohmian-ai/iceberg-rust", rev = "469cf4aff3aaee824f2ec3ce685c61411a08640e" }
 # FINAL_CORE_SHA. The managed compaction core Forge plans and rewrites through.
 # It resolves the same SCRIBE_ICEBERG_SHA iceberg crates and the same DataFusion
 # 55 / Arrow 60 line as the workspace, so embedding it adds no second native
 # universe. The revision is literal and must never be a branch: the branch it was
 # published on can move, and a moved core would silently change selection,
 # grouping, delete application, and output identity underneath Forge.
-iceberg-compaction-core = { git = "https://github.com/bohmian-ai/iceberg-compaction", rev = "c213af00eac40377d800e24f3ed68945034e7de4" }
+iceberg-compaction-core = { git = "https://github.com/bohmian-ai/iceberg-compaction", rev = "41662c25186808c5b6dd0f1e031dbb61d08ab0c0" }
 # Oracle's distributed query planner and worker runtime. Pinned to an immutable
 # revision over the one shared native DataFusion 55 universe. The Wyrd fork carries the Arrow 60 port; upstream is still on Arrow 59.
 datafusion-distributed = { git = "https://github.com/bohmian-ai/datafusion-distributed", rev = "bbbd1d9af4633499b736a98da62868ce32bc3d16" }

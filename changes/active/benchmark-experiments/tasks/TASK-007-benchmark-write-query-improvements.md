@@ -3,7 +3,7 @@ id: TASK-007
 kind: implementation
 status: proposed
 spec: SPEC-benchmark-experiments
-spec_revision: 20
+spec_revision: 21
 parent_task: TASK-006
 depends_on: [TASK-006]
 ---
@@ -1245,8 +1245,8 @@ Owners and steps, in order, each committed on its own:
    public and returns the rows it staged; publish is the existing
    `flush_staged`.
 2. **Server** (`wyrd-server`, feature `bench`): `POST
-   /v1/platform/benchmark/scribe/stage` → `{"rows_staged": n}` and `POST
-   /v1/platform/benchmark/scribe/publish` → `{"claims_published": n}`,
+   /platform/benchmark/scribe/stage` → `{"rows_staged": n}` and `POST
+   /platform/benchmark/scribe/publish` → `{"claims_published": n}`,
    authorized through `PlatformAuthorization` with the existing
    `tenant_suspend` permission and audited as `platform.authz`; one stable
    code for a replica without Scribe. Requests are serialized.
@@ -1255,8 +1255,11 @@ Owners and steps, in order, each committed on its own:
    `LocalServer` keeps the platform credential `setup` prints as a
    `SecretString` and the driver exchanges it through `Platform::connect_with`.
    Tenant credentials still do every write and query. `hot` runs REQ-029's
-   flow with 16,384 MB rotation sizes and 24 h retention, measures REQ-030's
-   nine cases plus point scaling, and keeps the 300-second budget.
+   flow entirely in `prepare` (revision 21: learn the span layout from a
+   published day-2 sample, then stage one half and keep the other in
+   memtables), so its measured steps only read through the shared lifecycle;
+   16,384 MB rotation sizes and 24 h retention; REQ-030's nine cases plus
+   point scaling; the 300-second budget.
 5. **Tests**: a `WyrdTestServer` journey for placement after stage, a learned
    `region` layout after publish, 401/403 refusals and audit rows; a test that
    the routes are absent without `bench`.

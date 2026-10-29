@@ -3,8 +3,9 @@
 //!
 //! `writes-parquet` loads no fixture: every write window
 //! takes its rows from a cursor that only grows, so each repetition writes
-//! fresh identities instead of retrying earlier ones. `hot` loads its
-//! [`Cohort`]s and places each through the benchmark control; `parquet` also
+//! fresh identities instead of retrying earlier ones. `hot` teaches the
+//! server its span layout, then loads its two [`Half`]s and stages the
+//! first through the benchmark control; `parquet` also
 //! loads each write path's storage sample, settles everything once, and
 //! reads the settled-state facts before any window.
 
@@ -24,11 +25,10 @@ use crate::query::run::{Admission, Bench, Outcome, Sender, WRONG_RESULT, ask};
 use crate::query::telemetry::{self, Telemetry};
 use crate::query::workload::{Case, Fixture, Rows, TABLE};
 use crate::query::{
-    Cohort, Experiment, Lane, OTLP_DECODE_PHASE, PAIR, PHASE_STATISTICS, Read, Residence, SETTLED,
+    Experiment, Half, Lane, OTLP_DECODE_PHASE, PAIR, PHASE_STATISTICS, Read, Residence, SETTLED,
     SPLIT, Scale, WRITE_FIXTURE_ROWS, WRITE_PHASES, WriteOp, client, lanes, parquet_bytes,
     platform, read_op, start, table_files,
 };
-use wyrd_client::Platform;
 
 /// Concurrent writers loading the read fixture.
 const LOADERS: usize = 16;
@@ -57,10 +57,8 @@ pub struct Isolated {
     server: Option<LocalServer>,
     /// The query handle and exact answers, once prepared.
     bench: Option<Arc<Bench>>,
-    /// Each loaded `hot` cohort's events questions and exact answers.
-    cohorts: Vec<(Cohort, Arc<Bench>)>,
-    /// The platform session that stages and publishes `hot`, once prepared.
-    platform: Option<Platform>,
+    /// Each loaded `hot` half's events questions and exact answers.
+    halves: Vec<(Half, Arc<Bench>)>,
     /// Each write path's sender, in [`WriteOp::ALL`] order, once prepared.
     senders: Vec<Lane>,
     /// The statement sequence every read window continues.
@@ -85,8 +83,7 @@ impl Isolated {
             scale,
             server: None,
             bench: None,
-            cohorts: Vec::new(),
-            platform: None,
+            halves: Vec::new(),
             senders: Vec::new(),
             sequence: Arc::new(AtomicU64::new(0)),
             spans: 0,
@@ -95,33 +92,85 @@ impl Isolated {
         }
     }
 
-    /// Loads one `hot` `cohort`, its events rows and then its spans, and
-    /// stages it when it is a staged cohort, so its rows sit where its
-    /// windows read them.
-    ///
-    /// Each load and stage completes before the next cohort loads, and
-    /// nothing else moves rows under the `hot` settings, so placement needs
-    /// no check beyond the stage's own count.
+    /// Loads spans `first..last` of the spans lane's generator.
     ///
     /// # Errors
     ///
-    /// Returns a workload error for an unprepared workload, a load that ran
-    /// short or with errors, a stage request that failed, or a stage that
-    /// moved fewer rows than the cohort holds.
-    async fn load(&mut self, cohort: Cohort) -> Result<(), ExperimentError> {
-        let (Some(server), Some(platform)) = (&self.server, &self.platform) else {
+    /// Returns a workload error when the spans lane did not open or the load
+    /// ran short or with errors.
+    async fn load_spans(&self, first: i64, last: i64) -> Result<(), ExperimentError> {
+        let (_, sender, cursor) = self
+            .senders
+            .iter()
+            .find(|(op, ..)| *op == WriteOp::Spans)
+            .ok_or_else(|| ExperimentError::workload("the spans lane did not open"))?;
+        cursor.store(first, Ordering::Relaxed);
+        let loaded = sender
+            .closed_loop(cursor, last, LOADERS, Admission::default())
+            .await;
+        if loaded.error_count() > 0 || loaded.rows != (last - first).cast_unsigned() {
+            return Err(ExperimentError::workload(format!(
+                "spans {first}..{last} loaded {} spans with errors {:?}",
+                loaded.rows, loaded.errors
+            )));
+        }
+        Ok(())
+    }
+
+    /// Prepares `hot`: publishes a day-2 span sample through the production
+    /// claim path and requires it to have taught the server a
+    /// `bifrost.traces` Variant layout, then loads each [`Half`], events
+    /// then spans, staging the staged half before the memtable half loads.
+    ///
+    /// Nothing else moves rows under the `hot` settings, so placement needs
+    /// no check beyond the publish and stage counts.
+    ///
+    /// # Errors
+    ///
+    /// Returns a workload error for an unprepared workload, a failed
+    /// platform sign-in, a load that ran short or with errors, a failed or
+    /// empty publish, no learned layout, or a stage that moved fewer rows
+    /// than the half holds.
+    async fn prepare_hot(&mut self) -> Result<(), ExperimentError> {
+        let Some(server) = &self.server else {
             return Err(ExperimentError::workload("the workload was not prepared"));
         };
         let client = client(server).map_err(ExperimentError::workload)?;
-        let fixture = Fixture {
+        let platform = platform(server).await.map_err(ExperimentError::workload)?;
+        let events = self.scale.standard;
+        self.load_spans(
+            WRITE_FIXTURE_ROWS,
+            WRITE_FIXTURE_ROWS + self.scale.spans / 2,
+        )
+        .await?;
+        let claims = platform
+            .publish_scribe()
+            .await
+            .map_err(ExperimentError::workload)?;
+        let learned = server
+            .metrics()
+            .await
+            .map_err(ExperimentError::workload)?
+            .sum(LAYOUTS_LEARNED, &["namespace=\"bifrost.traces\""]);
+        if claims == 0 || learned < 1.0 {
+            return Err(ExperimentError::workload(format!(
+                "publishing the span sample published {claims} claims and taught {learned} bifrost.traces Variant layouts"
+            )));
+        }
+        let whole = Fixture {
             first: 0,
-            rows: self.scale.standard,
+            rows: events,
         };
-        let (first, last) = cohort.events(fixture.rows);
-        if first < last {
-            let loaded = Sender::native(&client, TABLE, fixture)
-                .await
-                .map_err(ExperimentError::workload)?
+        let loader = Sender::native(&client, TABLE, whole)
+            .await
+            .map_err(ExperimentError::workload)?;
+        let generator = Telemetry {
+            spans: WRITE_FIXTURE_ROWS,
+            wide: false,
+        };
+        for half in Half::ALL {
+            let (first, last) = half.range(events);
+            let loaded = loader
                 .closed_loop(
                     &Arc::new(AtomicI64::new(first)),
                     last,
@@ -131,7 +180,7 @@ impl Isolated {
                 .await;
             if loaded.error_count() > 0 || loaded.rows != (last - first).cast_unsigned() {
                 return Err(ExperimentError::workload(format!(
-                    "the {cohort:?} events loaded {} of {} rows with errors {:?}",
+                    "the {half:?} events loaded {} of {} rows with errors {:?}",
                     loaded.rows,
                     last - first,
                     loaded.errors
@@ -142,106 +191,42 @@ impl Isolated {
                 .reads()
                 .iter()
                 .filter_map(|(_, read, _)| match read {
-                    Read::CohortEvents(case, of) if *of == cohort => Some(*case),
+                    Read::HalfEvents(case, of) if *of == half => Some(*case),
                     _ => None,
                 })
                 .collect();
-            self.cohorts.push((
-                cohort,
-                Arc::new(Bench::new(
-                    &client,
-                    Fixture {
-                        first,
-                        rows: last - first,
-                    },
-                    &cases,
-                )),
-            ));
-        }
-        let (first, last) = cohort.spans(self.scale.spans);
-        let (_, sender, cursor) = self
-            .senders
-            .iter()
-            .find(|(op, ..)| *op == WriteOp::Spans)
-            .ok_or_else(|| ExperimentError::workload("the spans lane did not open"))?;
-        cursor.store(first, Ordering::Relaxed);
-        let sample = sender
-            .closed_loop(cursor, last, LOADERS, Admission::default())
-            .await;
-        if sample.error_count() > 0 || sample.rows != (last - first).cast_unsigned() {
-            return Err(ExperimentError::workload(format!(
-                "the {cohort:?} spans loaded {} of {} spans with errors {:?}",
-                sample.rows,
-                last - first,
-                sample.errors
-            )));
-        }
-        self.filters.push((
-            Read::Region(cohort),
-            Telemetry {
-                spans: WRITE_FIXTURE_ROWS,
-                wide: false,
-            }
-            .region_filter(first, last),
-        ));
-        if cohort.staged() {
-            let rows =
-                (cohort.events(fixture.rows).1 - cohort.events(fixture.rows).0) + last - first;
-            let staged = platform
-                .stage_scribe()
-                .await
-                .map_err(ExperimentError::workload)?;
-            if staged < rows.cast_unsigned() {
-                return Err(ExperimentError::workload(format!(
-                    "staging the {cohort:?} cohort moved {staged} of its {rows} rows"
-                )));
+            let fixture = Fixture {
+                first,
+                rows: last - first,
+            };
+            self.halves
+                .push((half, Arc::new(Bench::new(&client, fixture, &cases))));
+            let (spans_first, spans_last) = half.range(self.scale.spans);
+            self.load_spans(spans_first, spans_last).await?;
+            self.filters.extend([
+                (
+                    Read::HalfShredded(half),
+                    generator.bounded_filter(true, spans_first, spans_last),
+                ),
+                (
+                    Read::HalfLongTail(half),
+                    generator.bounded_filter(false, spans_first, spans_last),
+                ),
+            ]);
+            if half == Half::Staged {
+                let rows = (last - first) + (spans_last - spans_first);
+                let staged = platform
+                    .stage_scribe()
+                    .await
+                    .map_err(ExperimentError::workload)?;
+                if staged < rows.cast_unsigned() {
+                    return Err(ExperimentError::workload(format!(
+                        "staging the {half:?} half moved {staged} of its {rows} rows"
+                    )));
+                }
             }
         }
-        Ok(())
-    }
-
-    /// Whether `cohort` has loaded: its region filter is held.
-    fn cohorts_loaded(&self, cohort: Cohort) -> bool {
-        self.filters
-            .iter()
-            .any(|(read, _)| *read == Read::Region(cohort))
-    }
-
-    /// Publishes every canonical `hot` row through the production claim
-    /// path, requires the claims to have taught the server a
-    /// `bifrost.traces` Variant layout, then loads the learned cohorts.
-    ///
-    /// # Errors
-    ///
-    /// Returns a workload error for an unprepared workload, a failed or
-    /// empty publish, a scrape failure, no learned layout, or a failed
-    /// learned-cohort load.
-    async fn learn(&mut self) -> Result<(), ExperimentError> {
-        let (Some(server), Some(platform)) = (&self.server, &self.platform) else {
-            return Err(ExperimentError::workload("the workload was not prepared"));
-        };
-        let claims = platform
-            .publish_scribe()
-            .await
-            .map_err(ExperimentError::workload)?;
-        if claims == 0 {
-            return Err(ExperimentError::workload(
-                "publishing the canonical cohorts published no claim",
-            ));
-        }
-        let learned = server
-            .metrics()
-            .await
-            .map_err(ExperimentError::workload)?
-            .sum(LAYOUTS_LEARNED, &["namespace=\"bifrost.traces\""]);
-        if learned < 1.0 {
-            return Err(ExperimentError::workload(
-                "the published canonical spans taught the server no bifrost.traces Variant layout",
-            ));
-        }
-        for cohort in Cohort::ALL.into_iter().filter(|cohort| cohort.learned()) {
-            self.load(cohort).await?;
-        }
+        self.bench = Some(Arc::new(Bench::new(&client, whole, &[])));
         Ok(())
     }
 
@@ -319,14 +304,14 @@ impl Isolated {
                         Read::Events(case) => {
                             bench.drive(case, clients, admission, &self.sequence).await
                         }
-                        Read::CohortEvents(case, cohort) => {
+                        Read::HalfEvents(case, half) => {
                             let (_, bench) = self
-                                .cohorts
+                                .halves
                                 .iter()
-                                .find(|(loaded, _)| *loaded == cohort)
+                                .find(|(loaded, _)| *loaded == half)
                                 .ok_or_else(|| {
                                     ExperimentError::workload(format!(
-                                        "the {cohort:?} cohort was not loaded"
+                                        "the {half:?} half was not loaded"
                                     ))
                                 })?;
                             bench.drive(case, clients, admission, &self.sequence).await
@@ -339,7 +324,10 @@ impl Isolated {
                                 })
                                 .await
                         }
-                        Read::Shredded | Read::LongTail | Read::Region(_) => {
+                        Read::Shredded
+                        | Read::LongTail
+                        | Read::HalfShredded(_)
+                        | Read::HalfLongTail(_) => {
                             let (_, question) = self
                                 .filters
                                 .iter()
@@ -694,8 +682,7 @@ impl Workload for Isolated {
     /// experiment's fixtures and computes the exact answers; a write
     /// experiment loads nothing more.
     ///
-    /// `hot` signs in to the benchmark control and loads its canonical
-    /// [`Cohort`]s, staging the first. `parquet` loads [`Scale::spans`]
+    /// `hot` runs [`Isolated::prepare_hot`]. `parquet` loads [`Scale::spans`]
     /// spans, then the standard events fixture of [`Scale::standard`] rows;
     /// it first loads [`Scale::storage`]
     /// fresh native and logs rows, each alone, settles everything once, and
@@ -727,24 +714,7 @@ impl Workload for Isolated {
             return Ok(());
         }
         if self.experiment == Experiment::Hot {
-            let server = self
-                .server
-                .as_ref()
-                .ok_or_else(|| ExperimentError::workload("the server did not start"))?;
-            let client = client(server).map_err(ExperimentError::workload)?;
-            self.platform = Some(platform(server).await.map_err(ExperimentError::workload)?);
-            self.bench = Some(Arc::new(Bench::new(
-                &client,
-                Fixture {
-                    first: 0,
-                    rows: self.scale.standard,
-                },
-                &[],
-            )));
-            for cohort in Cohort::ALL.into_iter().filter(|cohort| !cohort.learned()) {
-                self.load(cohort).await?;
-            }
-            return Ok(());
+            return self.prepare_hot().await;
         }
         let server = self
             .server
@@ -832,30 +802,22 @@ impl Workload for Isolated {
     }
 
     /// Runs one closed-loop window of `step`; a warmup runs the same work.
-    /// The first window over a learned [`Cohort`] first publishes `hot` and
-    /// loads the learned cohorts.
     ///
     /// # Errors
     ///
     /// Returns a workload error for an unprepared workload, an undeclared
-    /// step, a scrape failure, or a failed publish or learned load. A cancelled window
-    /// aborts its client tasks and their requests.
+    /// step, or a scrape failure. A cancelled window aborts its client tasks
+    /// and their requests.
     async fn measure(
         &mut self,
         step: &Step,
         phase: Phase,
         window: Duration,
     ) -> Result<Repetition, ExperimentError> {
-        if let Some(Read::Region(cohort)) = read_op(step.text("op").unwrap_or_default())
-            && cohort.learned()
-            && !self.cohorts_loaded(cohort)
-        {
-            self.learn().await?;
-        }
         self.closed(step, phase, window).await
     }
 
-    /// Drops the senders, queries, and platform session, then stops the server and keeps its
+    /// Drops the senders and queries, then stops the server and keeps its
     /// log. The stop runs inside this future: `SIGTERM`, a bounded
     /// wait that yields while the server drains, and the log copy.
     ///
@@ -867,8 +829,7 @@ impl Workload for Isolated {
     async fn finish(&mut self) -> Result<(), ExperimentError> {
         self.senders.clear();
         self.bench = None;
-        self.cohorts.clear();
-        self.platform = None;
+        self.halves.clear();
         let Some(server) = self.server.take() else {
             return Ok(());
         };

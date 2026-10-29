@@ -626,10 +626,10 @@ mod tests {
                 "point-staged-c1",
                 "small-aggregate-memtable-c1",
                 "small-aggregate-staged-c1",
-                "span-region-memtable-canonical-c1",
-                "span-region-staged-canonical-c1",
-                "span-region-memtable-learned-c1",
-                "span-region-staged-learned-c1"
+                "span-shredded-memtable-c1",
+                "span-shredded-staged-c1",
+                "span-long-tail-memtable-c1",
+                "span-long-tail-staged-c1"
             ]
         );
         assert_eq!(steps(&hot, false), ["point-memtable-scaling"]);

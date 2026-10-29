@@ -1,6 +1,6 @@
 ---
 id: SPEC-benchmark-experiments
-revision: 20
+revision: 21
 status: approved
 ---
 
@@ -9,14 +9,16 @@ status: approved
 Revision 20 makes `hot` measure everything hot. Hot data is every
 accepted row not yet published: memtable batches and staged Parquet runs.
 Today `hot` reads only the memtable, so staged reads have never been measured,
-and the learned Variant layout has never been measured validly. The new `hot` moves its fixture deliberately: it loads,
-stages, loads again, and reads the memtable and staged copies of the same
-queries. It then publishes, which teaches the server its span layout, and
-repeats the cycle in that layout. Rows move only when the benchmark asks,
-through a benchmark control compiled into the benchmarked server by its
-`bench` cargo feature and authorized by the platform administrator credential, so the run needs
-no timing assumptions and no residence guards. See the Revision
-20 supplement.
+and the learned Variant layout has never been measured validly. The new `hot`
+places its whole fixture before any window, as every experiment prepares its
+own: it publishes a span sample so the server learns its span layout, loads and
+stages half of the fixture, then loads the other half into memtables. Its
+measured steps only read, so it runs through the shared experiment lifecycle
+like every other experiment. Rows move only when the benchmark asks, through a
+benchmark control compiled into the benchmarked server by its `bench` cargo
+feature and authorized by the platform administrator credential, so the run
+needs no timing assumptions and no residence guards. Revision 21 removes
+revision 20's second, mid-run placement phase. See the Revision 20 supplement.
 
 Revision 19 makes a run VALID or INVALID and nothing else: a VALID run
 measured what it claims, and its targets are reported, never failed. Each
@@ -473,7 +475,7 @@ one fixed fixture configuration per experiment, and isolated operations:
 | Engine | Required L1 coverage |
 |---|---|
 | Bifrost `writes-parquet` | Native Arrow, small OTLP spans, approximately 1 KiB OTLP spans and OTLP logs at 1 and 64 clients: 8 measured cases. Reuse the 2M-row generators and fresh identities. The server uses production default rotation sizes and a 30 s retention; no write experiment overrides rotation. Measure durable acknowledgement, not publication. Include actual staging/publication CPU in Parquet-configured windows, record its activity and backlog, and do not claim storage-maintenance cost if none occurred. |
-| Bifrost `hot` | Reads over hot data, memtable and staged, in the canonical layout and then in a learned one, as REQ-029 and REQ-030 define. The server runs with memtable and on-disk rotation sizes of 16,384 MB and a 24-hour retention, and every cohort stays below pressure sealing and the claim target, so rows move only through the REQ-031 benchmark control. Fixtures: the standard 10M-row events fixture, half staged and half in the memtable, and 2M telemetry spans in four cohorts. Events point lookup in the memtable at 1 and 64 clients and staged at 1; events small aggregate in each source at 1; the `region` span filter in each source and layout at 1: 9 measured cases. |
+| Bifrost `hot` | Reads over hot data, memtable and staged, in the learned span layout, as REQ-029 and REQ-030 define. The server runs with memtable and on-disk rotation sizes of 16,384 MB and a 24-hour retention, and each half stays below pressure sealing and the claim target, so rows move only through the REQ-031 benchmark control. Fixtures: a 500k-span learning sample published first, then the standard 10M-row events fixture and 1M telemetry spans, each half staged and half in the memtable, in the learned layout. Events point lookup in the memtable at 1 and 64 clients and staged at 1; events small aggregate in each source at 1; the shredded and long-tail span filters in each source at 1: 9 measured cases. |
 | Bifrost `parquet` | Reads after every row is published as Parquet: default rotation sizes and a declared 30 s retention, then one settlement until nothing remains in a memtable, staging or claim. Fixtures: the standard 10M-row events fixture, 1M telemetry spans, and one 200,000-row sample per write path, all settled together. This record holds each write path's storage ratio; both write records report it as inapplicable with that reason. Events point lookup at 1 and 64 clients; events small aggregate and full scan at 1; span lookup by `trace_id`, a declared Bloom column, at 1 and 64; span filters on a shredded attribute key and on a long-tail key below the shredding threshold at 1. Two correctness checks run once after settlement, outside every measured window: the published span files shred exactly the expected attribute keys and none below the threshold, and a span-time window scans fewer files than the whole table. |
 | Verification `direct-verify` | Two direct-verify cases at 1 and 64 clients: existing four assertion checks over 2 KiB JSON, alternating expected pass/fail judgments. Expected failing judgments are correct completed verifications, not transport errors. Record elapsed, Verifier wait and server overhead, CPU/verification and scaling. |
 | Gateway `overhead` | Six cases: buffered chat with metadata capture, streamed chat with metadata capture, and buffered chat with payload capture, each at 1 and 64 clients. Reuse the local controlled provider, 1 KiB metadata shapes/32 stream events and 64 KiB request/response payload-capture shape. Record header/final overhead where applicable, calls/s, CPU/call, capture bytes and memory. |
@@ -1370,61 +1372,59 @@ instead of fixing it.
 
 ### Proposed `hot`
 
-**REQ-029 — Hot data flow.** `hot` places each fixture cohort through Scribe's
-own transitions, always memtable → staged → published. Ranges are half-open.
-The server starts empty, with no learned layout. Its settings keep every
-cohort below the ingress pressure seal and below the claim target (the smaller
-of the on-disk size and Forge's target), with a 24-hour retention and dwell, so
-no cohort moves except when the control moves it; the record states those
-settings.
+**REQ-029 — Hot data flow.** `hot` places its fixture through Scribe's own
+transitions, always memtable → staged → published, entirely in its
+preparation, before the first window. Its measured steps only read and never
+move rows, so every selected step reads the same placement. Ranges are
+half-open. The server starts empty, with no learned layout. Its settings keep
+each half below the ingress pressure seal and below the claim target (the
+smaller of the on-disk size and Forge's target), with a 24-hour retention and
+dwell, so no row moves except when the control moves it; the record states
+those settings.
 
-| # | Action | A1 | A2 | B1 | B2 |
-|---|---|---|---|---|---|
-| 1 | Load A1: events ids 0–5M; spans day 1 hours 0–6 (indices 0–500k) | memtable | | | |
-| 2 | Stage | staged | | | |
-| 3 | Load A2: events ids 5M–10M; spans day 1 hours 6–12 (500k–1M) | staged | memtable | | |
-| | Phase A windows (canonical layout) | | | | |
-| 4 | Publish; the run is INVALID unless the server then holds a learned `bifrost.traces` layout | published | published | | |
-| 5 | Load B1: spans day 2 hours 0–6 (2M–2.5M) | | | memtable, learned | |
-| 6 | Stage | | | staged, learned | |
-| 7 | Load B2: spans day 2 hours 6–12 (2.5M–3M) | | | staged, learned | memtable, learned |
-| | Phase B windows (learned layout) | | | | |
+| # | Preparation | Learning sample | Staged half | Memtable half |
+|---|---|---|---|---|
+| 1 | Load spans day 2, indices 2M–2.5M | memtable | | |
+| 2 | Publish; the run is INVALID unless the server then holds a learned `bifrost.traces` layout | published | | |
+| 3 | Load events ids 0–5M; spans day 1, indices 0–500k | published | memtable, learned | |
+| 4 | Stage | published | staged, learned | |
+| 5 | Load events ids 5M–10M; spans day 1, indices 500k–1M | published | staged, learned | memtable, learned |
 
-Steps 1–3 run before the first window, and steps 4–7 run before the first
-phase-B warmup, so a selected run of only phase-B steps still places its data.
 A failed load, stage or publish makes the run INVALID, and so does a stage
-response that staged fewer rows than its cohort loaded. The learned-layout
+response that staged fewer rows than the half loaded. The learned-layout
 check reads `bifrost_scribe_variant_layouts_learned{namespace="bifrost.traces"}`.
 That gauge counts every table in the namespace. It identifies the fixture's
 layout here only because the benchmark tenant writes no other `bifrost.traces`
-table, and the record states that limit.
+table, and the record states that limit. The learning sample's day-2 start
+times lie outside every measured half's bounds, so no read counts it.
 
-**REQ-030 — Hot steps.** Each step's id names its query, the source holding
-its matching rows and, for spans, the layout. Every answer is exact-checked
-against its generator.
+**REQ-030 — Hot steps.** Each step's id names its query and the source holding
+its matching rows. Every answer is exact-checked against its generator.
 
 | Step | Case label | Matching rows |
 |---|---|---|
-| `point-memtable-c1`, `point-memtable-c64` | `point-lookup` | A2, memtable |
-| `point-staged-c1` | `point-lookup` | A1, staged |
-| `small-aggregate-memtable-c1` | `small-aggregate` | 100k ids of A2 |
-| `small-aggregate-staged-c1` | `small-aggregate` | 100k ids of A1 |
-| `span-region-memtable-canonical-c1` | `shredded-filter` | A2 spans |
-| `span-region-staged-canonical-c1` | `shredded-filter` | A1 spans |
-| `span-region-memtable-learned-c1` | `shredded-filter` | B2 spans |
-| `span-region-staged-learned-c1` | `shredded-filter` | B1 spans |
+| `point-memtable-c1`, `point-memtable-c64` | `point-lookup` | memtable half |
+| `point-staged-c1` | `point-lookup` | staged half |
+| `small-aggregate-memtable-c1` | `small-aggregate` | 78,125 ids of the memtable half |
+| `small-aggregate-staged-c1` | `small-aggregate` | 78,125 ids of the staged half |
+| `span-shredded-memtable-c1` | `shredded-filter` | memtable-half spans |
+| `span-shredded-staged-c1` | `shredded-filter` | staged-half spans |
+| `span-long-tail-memtable-c1` | `long-tail-filter` | memtable-half spans |
+| `span-long-tail-staged-c1` | `long-tail-filter` | staged-half spans |
 | `point-memtable-scaling` | derived | c64 rate over c1 rate |
 
-The span query is `attributes ->> 'region' = 'eu-west'`, bounded to its
-cohort's six hours; `region` is a key the sampler shreds. An id or time range
-decides where the matching rows sit. The other source is still visited and
-pruned, as in any hot query. Each step records the existing read metrics.
+The span filters are `parquet`'s: `attributes ->> 'region' = 'eu-west'`, a key
+the sampler shreds, and a long-tail `custom.*` key it never shreds, read from
+the Variant residue. Each is bounded to its half's start times. An id or time
+range decides where the matching rows sit. The other source is still visited
+and pruned, as in any hot query. Each step records the existing read metrics.
 The two comparisons a record answers are memtable against staged for one
-query and layout, and canonical against learned for one query and source.
+query, and shredded against residue for one source. Canonical against learned
+is not measured: a serving server holds learned layouts.
 Criteria: `no-errors` and `exact-answers` on every read step, and
 `point-p99-slo` (p99 below 5 ms) on `point-memtable-c64`. Staged steps carry no
 SLO. The memtable-residence check and the learned-window guard are removed.
-The run fits the 300-second L1 budget, about 225 seconds. The retention
+The run fits the 300-second L1 budget. The retention
 lifecycle and its 480-second budget are withdrawn. The first run is a new
 `hot` baseline; earlier `hot` records answer a different question.
 
@@ -1503,7 +1503,7 @@ these two routes.
 
 | Situation | Expected observation | IDs |
 |---|---|---|
-| `bench`-built server; load, stage, query | `rows_staged` covers the cohort; server-side inspection shows the cohort's rows in staged runs and none in the memtable; answers are exact | REQ-031 |
+| `bench`-built server; load, stage, query | `rows_staged` covers the loaded rows; server-side inspection shows those rows in staged runs and none in the memtable; answers are exact | REQ-031 |
 | Then publish | Every earlier row is published, nothing is staged or claimed, and the server holds a learned layout for the fixture table that shreds `region` | REQ-031 |
 | Appends during a stage request | The request completes; every row acknowledged during it is still answered exactly from wherever it now sits | REQ-031 |
 | Two control requests at once | The second starts after the first returns; both succeed | REQ-031 |
@@ -1511,8 +1511,8 @@ these two routes.
 | No Scribe | `WYRD_SPEC_500_INTERNAL`, never success with zero | REQ-031 |
 | Built without `bench` | Both paths answer the platform administrator as an unrouted path does | REQ-032 |
 | No credential; a tenant credential; the platform administrator | 401; 401, since the platform plane accepts only platform sessions; success, each request audited as a `platform.authz` decision on `platform:tenants` | REQ-032, D-20-1 |
-| `mise run bench:l1:bifrost:hot` | One VALID record within 300 s; the nine REQ-030 cases are measured and exact, and each stage response covered its cohort | REQ-029, REQ-030 |
-| `--steps span-region-staged-learned-c1` | The data flow still runs and the step measures | REQ-029 |
+| `mise run bench:l1:bifrost:hot` | One VALID record within 300 s; the nine REQ-030 cases are measured and exact, and the stage response covered the staged half | REQ-029, REQ-030 |
+| `--steps span-long-tail-staged-c1` | Preparation still places the whole fixture and the step measures | REQ-029 |
 
 Evidence classes: a server journey against `WyrdTestServer` and repository
 Postgres for the control's behavior, including the placement inspection a
@@ -1589,6 +1589,13 @@ Historical clean-source gaps remain recorded as exclusions/advisory evidence,
 not a reason to weaken coverage.
 
 ## Revision history and authority
+
+- Revision 21 — 2026-10-29 (approved): `hot` places its whole fixture in
+  preparation, learning the span layout from a published sample first, so its
+  measured steps only read like every experiment's; the mid-run publish, the
+  four cohorts and the canonical-against-learned comparison are withdrawn, and
+  the span steps compare the shredded and long-tail filters in each source
+  (REQ-029, REQ-030). Delivered in TASK-007.
 
 - Revision 20 — 2026-10-29 (approved): `hot` reads memtable and staged data in
   the canonical and learned layouts through deterministic placement (REQ-029,

@@ -142,7 +142,7 @@ const PARQUET_ENV: [(&str, &str); 1] = [("WYRD_MAX_FILE_RETENTION_TIME", "30")];
 /// Scribe's operator settings under which no `hot` row moves by itself:
 /// 16,384 MB memtable and on-disk rotation sizes and a 24-hour retention,
 /// so rows stage and publish only when the benchmark control asks. Only the
-/// `hot` reads use them, over a fixture that grows only by its cohorts; a
+/// `hot` reads use them, over a fixture loaded once before any window; a
 /// write workload under them would hold every row it writes in memory.
 const HOT_ENV: [(&str, &str); 3] = [
     ("WYRD_MAX_FILE_SIZE_IN_MEMORY", "16384"),
@@ -159,8 +159,8 @@ pub enum Experiment {
     /// pay for the staging and publication they cause; nothing waits for
     /// publication inside a window.
     WritesParquet,
-    /// Reads over hot rows, memtable and staged, in the canonical and then
-    /// the learned Variant layout.
+    /// Reads over unpublished rows, half staged and half in memtables, in
+    /// the span Variant layout the server learned first.
     Hot,
     /// Reads after every row is published as Parquet.
     Parquet,
@@ -223,11 +223,12 @@ pub enum Read {
     Shredded,
     /// A span filter on a long-tail key below the shredding threshold.
     LongTail,
-    /// An events case over one `hot` cohort's rows alone.
-    CohortEvents(workload::Case, Cohort),
-    /// The shredded `region` span filter over one `hot` cohort's spans
-    /// alone, bounded to their start times.
-    Region(Cohort),
+    /// An events case over one `hot` [`Half`]'s rows alone.
+    HalfEvents(workload::Case, Half),
+    /// The [`Read::Shredded`] filter over one `hot` [`Half`]'s spans alone.
+    HalfShredded(Half),
+    /// The [`Read::LongTail`] filter over one `hot` [`Half`]'s spans alone.
+    HalfLongTail(Half),
 }
 
 impl Read {
@@ -235,124 +236,82 @@ impl Read {
     #[must_use]
     pub const fn case(self) -> &'static str {
         match self {
-            Self::Events(case) | Self::CohortEvents(case, _) => case.label(),
+            Self::Events(case) | Self::HalfEvents(case, _) => case.label(),
             Self::Trace => "trace-lookup",
-            Self::Shredded | Self::Region(_) => "shredded-filter",
-            Self::LongTail => "long-tail-filter",
+            Self::Shredded | Self::HalfShredded(_) => "shredded-filter",
+            Self::LongTail | Self::HalfLongTail(_) => "long-tail-filter",
         }
     }
 }
 
-/// Where one `hot` cohort's rows sit while its windows run, and in which
-/// Variant layout.
+/// Where one half of the `hot` fixture sits while every window runs.
 ///
-/// The canonical cohorts are the events fixture's halves and the first
-/// half-day of spans of fixture day 1; the learned cohorts are the same
-/// span hours of day 2, loaded once the canonical cohorts published and
-/// taught the server its span layout. Each staged cohort loads and stages
-/// before its memtable twin loads, so every row stays where it was put.
+/// The staged half loads and stages before the memtable half loads, and
+/// nothing else moves rows under [`HOT_ENV`], so each half stays put.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Cohort {
-    /// Events `0..E/2` and spans `0..S/2` of day 1, staged canonically.
-    CanonicalStaged,
-    /// Events `E/2..E` and spans `S/2..S` of day 1, in canonical memtables.
-    CanonicalMemtable,
-    /// The same span hours of day 2, staged in the learned layout.
-    LearnedStaged,
-    /// The next span hours of day 2, in learned-layout memtables.
-    LearnedMemtable,
+pub enum Half {
+    /// Events `0..E/2` and spans `0..S/2`, in staged runs.
+    Staged,
+    /// Events `E/2..E` and spans `S/2..S`, in memtables.
+    Memtable,
 }
 
-impl Cohort {
-    /// Every cohort, in load order.
-    pub const ALL: [Self; 4] = [
-        Self::CanonicalStaged,
-        Self::CanonicalMemtable,
-        Self::LearnedStaged,
-        Self::LearnedMemtable,
-    ];
+impl Half {
+    /// Both halves, in load order.
+    pub const ALL: [Self; 2] = [Self::Staged, Self::Memtable];
 
-    /// Whether the cohort is staged before its windows; otherwise it is in
-    /// memtables.
+    /// The half-open range the half holds of a fixture of `rows` rows or
+    /// spans; `rows / 2` is a whole number of traces at every scale.
     #[must_use]
-    pub const fn staged(self) -> bool {
-        matches!(self, Self::CanonicalStaged | Self::LearnedStaged)
-    }
-
-    /// Whether the cohort loads after the canonical cohorts published.
-    #[must_use]
-    pub const fn learned(self) -> bool {
-        matches!(self, Self::LearnedStaged | Self::LearnedMemtable)
-    }
-
-    /// The half-open `event_id` range the cohort holds of an `events`-row
-    /// fixture; the learned cohorts hold none.
-    #[must_use]
-    pub const fn events(self, events: i64) -> (i64, i64) {
+    pub const fn range(self, rows: i64) -> (i64, i64) {
         match self {
-            Self::CanonicalStaged => (0, events / 2),
-            Self::CanonicalMemtable => (events / 2, events),
-            Self::LearnedStaged | Self::LearnedMemtable => (0, 0),
+            Self::Staged => (0, rows / 2),
+            Self::Memtable => (rows / 2, rows),
         }
     }
-
-    /// The half-open span-index range the cohort holds when `spans` spans
-    /// make up the canonical cohorts; the spans lane writes
-    /// [`WRITE_FIXTURE_ROWS`] spans per fixture day, so day 2 starts there.
-    #[must_use]
-    pub const fn spans(self, spans: i64) -> (i64, i64) {
-        let (day, half) = match self {
-            Self::CanonicalStaged => (0, 0),
-            Self::CanonicalMemtable => (0, 1),
-            Self::LearnedStaged => (WRITE_FIXTURE_ROWS, 0),
-            Self::LearnedMemtable => (WRITE_FIXTURE_ROWS, 1),
-        };
-        let first = day + half * (spans / 2);
-        (first, first + spans / 2)
-    }
 }
 
-/// The `hot` read steps, in run order: the canonical cohorts, memtable then
-/// staged, then the learned cohorts.
+/// The `hot` read steps: each question against the memtable half, then the
+/// staged half.
 const HOT_READS: [(&str, Read, &[u64]); 8] = [
     (
         "point-memtable",
-        Read::CohortEvents(workload::Case::Selective, Cohort::CanonicalMemtable),
+        Read::HalfEvents(workload::Case::Selective, Half::Memtable),
         &PAIR,
     ),
     (
         "point-staged",
-        Read::CohortEvents(workload::Case::Selective, Cohort::CanonicalStaged),
+        Read::HalfEvents(workload::Case::Selective, Half::Staged),
         &ONE,
     ),
     (
         "small-aggregate-memtable",
-        Read::CohortEvents(workload::Case::SmallAggregate, Cohort::CanonicalMemtable),
+        Read::HalfEvents(workload::Case::SmallAggregate, Half::Memtable),
         &ONE,
     ),
     (
         "small-aggregate-staged",
-        Read::CohortEvents(workload::Case::SmallAggregate, Cohort::CanonicalStaged),
+        Read::HalfEvents(workload::Case::SmallAggregate, Half::Staged),
         &ONE,
     ),
     (
-        "span-region-memtable-canonical",
-        Read::Region(Cohort::CanonicalMemtable),
+        "span-shredded-memtable",
+        Read::HalfShredded(Half::Memtable),
         &ONE,
     ),
     (
-        "span-region-staged-canonical",
-        Read::Region(Cohort::CanonicalStaged),
+        "span-shredded-staged",
+        Read::HalfShredded(Half::Staged),
         &ONE,
     ),
     (
-        "span-region-memtable-learned",
-        Read::Region(Cohort::LearnedMemtable),
+        "span-long-tail-memtable",
+        Read::HalfLongTail(Half::Memtable),
         &ONE,
     ),
     (
-        "span-region-staged-learned",
-        Read::Region(Cohort::LearnedStaged),
+        "span-long-tail-staged",
+        Read::HalfLongTail(Half::Staged),
         &ONE,
     ),
 ];
@@ -626,13 +585,13 @@ fn write_fixture() -> Value {
     })
 }
 
-/// The `hot` fixture control: its four cohorts, how each is placed, and the
-/// settings under which nothing else moves them.
+/// The `hot` fixture control: the learning sample, the two halves, and
+/// how each is placed before any read step.
 fn hot_fixture() -> Value {
     json!({
-        "read": "standard-10m-hot: 10,000,000 events rows in bifrost.datasets.events; event_id 0..5,000,000 load and stage, then 5,000,000..10,000,000 load and stay in memtables, before any read step",
-        "spans": format!("spans-1m-hot: {} day-1 spans of the spans-2m generator into bifrost.traces.spans, the first half staged with the events' first half and the second half in memtables", Scale::FULL.spans),
-        "learned_spans": format!("spans-1m-learned: once every canonical row published and the server learned a bifrost.traces Variant layout, {} day-2 spans at the same hours, the first half loaded and staged, then the second half in memtables, before the first learned step", Scale::FULL.spans),
+        "layout": format!("spans-learn: {} day-2 spans of the spans-2m generator, published first so the server learns its bifrost.traces Variant layout", Scale::FULL.spans / 2),
+        "read": "standard-10m-hot: 10,000,000 events rows in bifrost.datasets.events; event_id 0..5,000,000 load and stage, then 5,000,000..10,000,000 load and stay in memtables",
+        "spans": format!("spans-1m-hot: {} day-1 spans of the spans-2m generator into bifrost.traces.spans in the learned layout, the first half staged with the events' first half and the second half in memtables", Scale::FULL.spans),
         "placement": "the bench-built server's platform stage and publish requests move rows; nothing rotates, ages, or publishes by itself under the limits",
     })
 }
@@ -976,7 +935,7 @@ fn l1_declaration(experiment: Experiment, mut base: Declaration) -> Declaration 
             "Under the Parquet Scribe settings, whose windows pay for the staging and publication they cause, what does each native, OTLP spans, and OTLP logs write cost the server per CPU-second and per provisioned vCPU at 1 and 64 closed-loop clients up to its durable acknowledgement, with no error, how much publication ran and what backlog remained, and do the native and OTLP write peaks clear their sanity floors?"
         }
         Experiment::Hot => {
-            "With 10M events rows and 1M spans hot, half staged and half in memtables, and 1M more spans hot in the Variant layout their publication taught, does a memtable point lookup keep p99 strictly under 5 ms at 64 closed-loop clients with every answer exact, and what does each read cost the server per CPU-second from each source and layout?"
+            "With 10M events rows and 1M spans hot in the span Variant layout the server learned, half staged and half in memtables, does a memtable point lookup keep p99 strictly under 5 ms at 64 closed-loop clients with every answer exact, and what does each read cost the server per CPU-second from each source, for a shredded and a long-tail span key?"
         }
         Experiment::Parquet => {
             "With 10M events rows and 1M spans published as Parquet, does a point lookup keep p99 strictly under 5 ms at 64 closed-loop clients with every answer exact, what does each read cost per CPU-second and scan per query, do the span files shred exactly the keys over the threshold, does a span-time window prune, and what does each write path store per retained byte?"
@@ -999,7 +958,7 @@ fn l1_declaration(experiment: Experiment, mut base: Declaration) -> Declaration 
         "workload".to_owned(),
         json!(match experiment {
             Experiment::WritesParquet => "closed-loop public-client clients, each sending its next request once the last is acknowledged: native `write_batch` of 16,384 rows; OTLP exports of 512 spans or log records with the client's exchanged bearer",
-            Experiment::Hot => "closed-loop public-client clients, each sending its next query once the last answers, every answer checked exactly and bounded to one cohort: Bifrost SQL events point lookups and 78k-row aggregates; span `attributes ->> 'region'` filters bounded to the cohort's start times",
+            Experiment::Hot => "closed-loop public-client clients, each sending its next query once the last answers, every answer checked exactly and bounded to one half: Bifrost SQL events point lookups and 78k-row aggregates; span `attributes ->>` filters on a shredded and a long-tail key, bounded to the half's start times",
             Experiment::Parquet => "closed-loop public-client clients, each sending its next query once the last answers, every answer checked exactly: Bifrost SQL events point lookups, 100k-row aggregates, and full scans; span `trace_id` lookups and `attributes ->>` filters on a shredded and a long-tail key",
         }),
     );
@@ -1795,58 +1754,44 @@ mod tests {
         assert_ne!(sharded, limits(&PARQUET_ENV, None));
     }
 
-    /// The four hot cohorts hold disjoint whole-trace span ranges and halve
-    /// the event fixture, so each region read and point read selects exactly
-    /// one placement.
+    /// The two hot halves split each fixture into whole traces whose start
+    /// times do not overlap each other or the day-2 learning sample, so
+    /// each bounded read counts one half alone.
     ///
     /// # Panics
     ///
-    /// Panics when two cohorts overlap or a cohort splits a trace.
+    /// Panics when a half splits a trace or two start-time ranges overlap.
     #[test]
-    fn hot_cohorts_hold_disjoint_whole_trace_ranges() {
+    fn hot_halves_hold_disjoint_whole_trace_ranges() {
+        let generator = telemetry::Telemetry {
+            spans: WRITE_FIXTURE_ROWS,
+            wide: false,
+        };
         for scale in [Scale::FULL, Scale::SMOKE] {
-            let spans: Vec<(i64, i64)> = Cohort::ALL
-                .iter()
-                .map(|cohort| cohort.spans(scale.spans))
-                .collect();
-            for pair in spans.windows(2) {
-                assert!(pair[0].1 <= pair[1].0, "{spans:?} overlap");
-            }
+            let [staged, memtable] = Half::ALL.map(|half| half.range(scale.spans));
             assert!(
-                spans
+                [staged, memtable]
                     .iter()
                     .all(|(first, last)| first % telemetry::SPANS_PER_TRACE == 0
                         && last % telemetry::SPANS_PER_TRACE == 0
                         && first < last),
-                "{spans:?} split a trace"
+                "{staged:?} {memtable:?} split a trace"
             );
-            let generator = telemetry::Telemetry {
-                spans: WRITE_FIXTURE_ROWS,
-                wide: false,
-            };
-            let (staged, memtable) = (
-                Cohort::CanonicalStaged.spans(scale.spans),
-                Cohort::CanonicalMemtable.spans(scale.spans),
-            );
+            assert_eq!((staged.1, memtable.1), (memtable.0, scale.spans));
             assert!(
-                generator.start_nanos(staged.1 - 1) < generator.start_nanos(memtable.0),
-                "the region filters' start-time bounds split the cohorts"
+                generator.start_nanos(staged.1 - 1) < generator.start_nanos(memtable.0)
+                    && generator.start_nanos(memtable.1)
+                        <= generator.start_nanos(WRITE_FIXTURE_ROWS),
+                "the halves' start-time bounds overlap"
             );
             assert_eq!(
-                Cohort::CanonicalStaged.events(scale.standard).1,
-                Cohort::CanonicalMemtable.events(scale.standard).0
-            );
-            assert_eq!(
-                Cohort::CanonicalMemtable.events(scale.standard).1,
-                scale.standard
+                Half::ALL.map(|half| half.range(scale.standard)),
+                [
+                    (0, scale.standard / 2),
+                    (scale.standard / 2, scale.standard)
+                ]
             );
         }
-        assert!(
-            Cohort::ALL
-                .chunks(2)
-                .all(|pair| pair[0].staged() && !pair[1].staged()),
-            "each staged cohort loads and stages before its memtable twin"
-        );
     }
 
     /// Every write path and read the experiments label is a benchmark case

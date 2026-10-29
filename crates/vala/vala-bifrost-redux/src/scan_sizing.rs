@@ -357,6 +357,13 @@ impl<'scope> ScanSizer<'scope> {
         }
     }
 
+    /// Returns the scope's filters planned against the sized schema, or
+    /// `None` when none plans as a pruning predicate.
+    #[must_use]
+    pub(crate) const fn pruning(&self) -> Option<&BatchPruning> {
+        self.pruning.as_ref()
+    }
+
     /// Returns, per unit of `units` many, whether its recorded `statistics`
     /// leave it possibly matching the scope's filters.
     ///

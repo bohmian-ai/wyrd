@@ -342,7 +342,13 @@ pub struct ScribeTailResolver<T = FetchLiveTailService> {
     /// The pod's Oracle partition sizing, the one the leader sized the query
     /// with; memtable batches are dealt by it.
     partitioning: crate::scan_sizing::OraclePartitioning,
+    /// The node's storage owner, whose footer and byte-range caches staged
+    /// runs are read through, as published files are.
+    storage: Arc<crate::storage::BifrostStorage>,
 }
+
+/// One table's authenticated schema and the time axis its files prune by.
+type ResolvedSchema = (SchemaRef, crate::catalog::TimeAxis);
 
 /// Closed Scribe schema source separating production catalog IO from unit fixtures.
 enum ScribeSchemaSource {
@@ -358,12 +364,12 @@ enum ScribeSchemaSource {
     Catalog {
         /// Shared tenant-qualified production catalog.
         catalog: Arc<BifrostCatalog>,
-        /// Last catalog schema of each tenant's table.
-        schemas: std::sync::RwLock<HashMap<(DataTenantId, TableRef), SchemaRef>>,
+        /// Last catalog schema and time axis of each tenant's table.
+        schemas: std::sync::RwLock<HashMap<(DataTenantId, TableRef), ResolvedSchema>>,
     },
-    /// Focused unit-test schema with no external catalog.
+    /// Focused unit-test schema and time axis with no external catalog.
     #[cfg(test)]
-    Fixed(arrow::datatypes::SchemaRef),
+    Fixed(ResolvedSchema),
 }
 
 impl<T> std::fmt::Debug for ScribeTailResolver<T> {
@@ -384,6 +390,7 @@ impl ScribeTailResolver<FetchLiveTailService> {
     ) -> Self {
         Self {
             tail,
+            storage: Arc::clone(catalog.storage()),
             schema_source: ScribeSchemaSource::Catalog {
                 catalog,
                 schemas: std::sync::RwLock::default(),
@@ -395,15 +402,24 @@ impl ScribeTailResolver<FetchLiveTailService> {
 
 #[cfg(test)]
 impl<T> ScribeTailResolver<T> {
-    /// Creates one catalog-free resolver for focused role-local provider tests.
+    /// Creates one catalog-free resolver for focused role-local provider
+    /// tests, over a node with footer and byte-range caches, whose time axis
+    /// is `event_time`.
     pub(crate) fn with_schema(tail: Arc<T>, schema: SchemaRef) -> Self {
         Self {
             tail,
-            schema_source: ScribeSchemaSource::Fixed(schema),
+            schema_source: ScribeSchemaSource::Fixed((
+                schema,
+                crate::catalog::TimeAxis::new(
+                    "event_time",
+                    crate::catalog::layout::TimeGranularity::Day,
+                ),
+            )),
             partitioning: crate::scan_sizing::OraclePartitioning::new(
                 4,
                 crate::scan_sizing::ORACLE_PARTITION_SCAN_BYTES,
             ),
+            storage: crate::storage::BifrostStorage::for_test(&std::env::temp_dir(), true),
         }
     }
 }
@@ -417,22 +433,27 @@ impl<T> ScribeTailResolver<T> {
     /// in-memory source. Each batch keeps the exact bounds Scribe recorded at
     /// append, so the query's pushed predicate drops batches it cannot match,
     /// and the kept batches are dealt again over the partitions their own
-    /// bytes earn. The unserved staged runs are read by
-    /// `DataFusion`'s Parquet scan, so they get the row-group and page pruning
-    /// every Oracle hot read gets, with no footer caching because a staged run
-    /// is rewritable; the scan's files hold the staged lease until the plan
-    /// drops. A read with neither
-    /// rows nor runs is an in-memory source of empty partitions at the
-    /// closure schema.
+    /// bytes earn. The unserved staged runs are planned as the leader plans
+    /// published files, through [`super::exec::PlannedFiles`]: each run carries
+    /// the size, rows and `time_column` bounds staging recorded, `pruning`
+    /// keeps those whose bounds may match, and the scan splits at most into
+    /// the kept runs' row groups. `DataFusion`'s Parquet scan reads them
+    /// through the node's footer and byte-range caches, so a run the pushed
+    /// predicate excludes is never opened and a repeated query rereads no
+    /// footer; the scan's files hold the staged lease until the plan drops.
+    /// A read with neither rows nor runs is an in-memory source of empty
+    /// partitions at the closure schema.
     ///
     /// # Errors
     /// Returns [`FollowerResolutionError::Fault`] when a memtable batch does
-    /// not project to the closure, a staged run's size cannot be read or its
-    /// path is not UTF-8, or a plan node cannot be built.
-    async fn live_leaf(
+    /// not project to the closure, a staged run's path is not UTF-8, or a
+    /// plan node cannot be built.
+    fn live_leaf(
         &self,
         read: LiveTailBatches,
         required_schema: &SchemaRef,
+        time_column: &str,
+        pruning: Option<&crate::scan_sizing::BatchPruning>,
         assignment: &FollowerScanAssignment,
         session: &SessionState,
     ) -> Result<Arc<dyn ExecutionPlan>, FollowerResolutionError> {
@@ -463,41 +484,22 @@ impl<T> ScribeTailResolver<T> {
             leaves.push(Arc::new(DataSourceExec::new(Arc::new(source))));
         }
         if !runs.is_empty() {
-            let mut files = Vec::with_capacity(runs.len());
-            for run in runs {
-                let size = tokio::fs::metadata(&run)
-                    .await
-                    .map_err(|_| fault("Scribe staged run is unreadable"))?
-                    .len();
-                let location = run
-                    .into_os_string()
-                    .into_string()
-                    .map_err(|_| fault("Scribe staged run path is not UTF-8"))?;
-                files.push(super::exec::HotFileSource {
-                    size_bytes: usize::try_from(size)
-                        .map_err(|_| fault("Scribe staged run size does not fit"))?,
-                    row_count: None,
-                    location,
-                    event_time: crate::catalog::event_time::EventTimeStatistics::Unusable(
-                        crate::catalog::event_time::EventTimeBoundsDefect::Missing,
-                    ),
-                });
-            }
-            // A staged run's footer is never cached, so its row groups are
-            // unknown; one partition per run is the split a decoded follower
-            // plan has always had.
-            let runs = files.len();
+            let planned =
+                super::exec::PlannedFiles::staged(&runs, required_schema, time_column, pruning)
+                    .ok_or_else(|| fault("Scribe staged run path is not UTF-8"))?;
             leaves.push(
-                super::exec::hot_parquet_scan(
-                    files,
-                    super::exec::HotObjects::Staged(lease),
-                    assignment.binding.tenant_id,
-                    required_schema,
-                    None,
-                    session.config().options(),
-                    Some(runs),
-                )
-                .map_err(|_| fault("Scribe staged scan construction failed"))?,
+                planned
+                    .scan(
+                        super::exec::HotObjects::Staged {
+                            storage: Arc::clone(&self.storage),
+                            lease,
+                        },
+                        assignment.binding.tenant_id,
+                        required_schema,
+                        time_column,
+                        session.config().options(),
+                    )
+                    .map_err(|_| fault("Scribe staged scan construction failed"))?,
             );
         }
         match leaves.len() {
@@ -612,7 +614,7 @@ where
             assignment_table(&assignment.binding)?,
         ))
         .map_err(|_| "Scribe tenant/table binding is invalid".to_owned())?;
-        let full_schema = match &self.schema_source {
+        let (full_schema, time_axis) = match &self.schema_source {
             ScribeSchemaSource::Catalog { catalog, schemas } => {
                 let key = (
                     assignment.binding.tenant_id,
@@ -622,25 +624,25 @@ where
                     .read()
                     .ok()
                     .and_then(|schemas| schemas.get(&key).cloned())
-                    .filter(|schema| {
+                    .filter(|(schema, _)| {
                         super::assignment_schema_fingerprint(schema.as_ref())
                             == assignment.schema_fingerprint
                     });
-                if let Some(schema) = cached {
-                    schema
+                if let Some(resolved) = cached {
+                    resolved
                 } else {
-                    let schema = catalog
+                    let resolved = catalog
                         .assignment_schema(&key.1, key.0)
                         .await
                         .map_err(|_| "authenticated Scribe schema resolution failed".to_owned())?;
                     if let Ok(mut schemas) = schemas.write() {
-                        schemas.insert(key, Arc::clone(&schema));
+                        schemas.insert(key, resolved.clone());
                     }
-                    schema
+                    resolved
                 }
             }
             #[cfg(test)]
-            ScribeSchemaSource::Fixed(schema) => Arc::clone(schema),
+            ScribeSchemaSource::Fixed(resolved) => resolved.clone(),
         };
         // Both checks run before the live-tail snapshot, not only in `decode`
         // after it: a mismatched assignment must never reach the tail source.
@@ -697,12 +699,17 @@ where
                 // leaf schema below is the same closure — the serialized
                 // plan's `Column` indices are closure indices.
                 required_fields: required_schema.fields().clone(),
-                pruning,
+                pruning: pruning.clone(),
             })
             .await?;
-        let plan = self
-            .live_leaf(read, &required_schema, assignment, session)
-            .await?;
+        let plan = self.live_leaf(
+            read,
+            &required_schema,
+            time_axis.column(),
+            pruning.as_ref(),
+            assignment,
+            session,
+        )?;
         Ok(ResolvedFollowerSource { plan, full_schema })
     }
 }

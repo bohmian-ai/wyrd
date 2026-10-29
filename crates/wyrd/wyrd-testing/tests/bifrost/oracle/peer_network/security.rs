@@ -688,7 +688,7 @@ impl ScribeFragment {
             .next()
             .ok_or("the Scribe reports no live partition")?;
         let (partition, stream) = (listed.time_partition, listed.stream);
-        let schema = catalog.assignment_schema(&table_ref, tenant).await?;
+        let (schema, _) = catalog.assignment_schema(&table_ref, tenant).await?;
         let schema_fingerprint = assignment_schema_fingerprint(&schema);
         let indices = columns
             .iter()

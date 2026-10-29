@@ -736,7 +736,11 @@ impl ScribeStagingRuntime {
                     let runs = member.run_paths();
                     let footers = runs
                         .iter()
-                        .map(|run| crate::scribe::member_stager::preflight_run(run))
+                        .zip(member.record().runs())
+                        .map(|(path, run)| {
+                            crate::scribe::member_stager::preflight_run(path)
+                                .map(|footer| (run.encoded_bytes(), footer))
+                        })
                         .collect::<Result<Vec<_>, _>>()?;
                     crate::scribe::hot_source::HotAuthority::StagedRun {
                         member: id,

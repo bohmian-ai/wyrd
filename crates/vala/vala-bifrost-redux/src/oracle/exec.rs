@@ -783,9 +783,8 @@ struct TenantParquetReaderFactory {
     inner: Arc<dyn ParquetFileReaderFactory>,
     /// Authenticated tenant every footer must name.
     tenant: DataTenantId,
-    /// The node's byte-range cache and the warehouse store it caches, for
-    /// warehouse objects only: a staged scratch path can be reused, so staged
-    /// scans read uncached.
+    /// The node's byte-range cache and the store it caches, when the node
+    /// has the cache.
     ranges: Option<(Arc<RangeCache>, Arc<dyn ObjectStore>)>,
 }
 
@@ -828,12 +827,12 @@ struct TenantParquetReader {
     inner: Box<dyn AsyncFileReader + Send>,
     /// Authenticated tenant the footer must name.
     tenant: DataTenantId,
-    /// This object's view of the node's byte-range cache, when the object is
-    /// a warehouse object on a node with the cache.
+    /// This object's view of the node's byte-range cache, when the node has
+    /// the cache.
     ranges: Option<CachedRanges>,
 }
 
-/// One warehouse object's reads through the node's byte-range cache.
+/// One object's reads through the node's byte-range cache.
 ///
 /// A cache hit reads no store, so this keeps the two things a store read
 /// would have done: it counts the hit's bytes in the scan's `bytes_scanned`,
@@ -843,7 +842,7 @@ struct TenantParquetReader {
 struct CachedRanges {
     /// The node's byte-range cache.
     cache: Arc<RangeCache>,
-    /// The warehouse store the object lives in.
+    /// The store the object lives in.
     store: Arc<dyn ObjectStore>,
     /// The object's path in `store` and in `cache`.
     path: object_store::path::Path,
@@ -1017,29 +1016,14 @@ impl TenantWarehouseReads {
         Self { objects, tenant }
     }
 
-    /// Builds `DataFusion`'s warehouse reader factory — footer-cached when the
-    /// node has a footer cache — behind the tenant proof and the node's
-    /// byte-range cache, when it has one.
+    /// Builds the tenant's warehouse reader factory through
+    /// [`tenant_parquet_reads`].
     fn reader_factory(&self) -> Arc<dyn ParquetFileReaderFactory> {
-        let store = Arc::clone(self.objects.storage().objects());
-        let inner: Arc<dyn ParquetFileReaderFactory> = match self.objects.storage().metadata_cache()
-        {
-            Some(cache) => Arc::new(CachedParquetFileReaderFactory::new(
-                store,
-                Arc::clone(cache),
-            )),
-            None => Arc::new(DefaultParquetFileReaderFactory::new(store)),
-        };
-        Arc::new(TenantParquetReaderFactory {
-            inner,
-            tenant: self.tenant,
-            ranges: self.objects.storage().data_cache().map(|cache| {
-                (
-                    Arc::clone(cache),
-                    Arc::clone(self.objects.storage().objects()),
-                )
-            }),
-        })
+        tenant_parquet_reads(
+            Arc::clone(self.objects.storage().objects()),
+            self.objects.storage(),
+            self.tenant,
+        )
     }
 
     /// Rebinds every file scan in a decoded stage plan to this tenant's
@@ -1095,15 +1079,50 @@ impl WorkerPlanRewriteHandler for TenantWarehouseReads {
     }
 }
 
+/// Builds `DataFusion`'s reader factory over `store` — footer-cached when
+/// `storage` has the node's footer cache — behind the tenant proof and the
+/// node's byte-range cache, when it has one.
+///
+/// Published files and Scribe staged runs are read through this one factory;
+/// only `store` differs. Both caches key an object by its path and the footer
+/// cache also checks its exact size. A warehouse object is immutable, and a
+/// staged run is immutable once it is a query source: its path names the
+/// tenant, table, partition, writer epoch, shard and generation, and a
+/// generation is never staged twice in one process, so a path key never
+/// names other bytes.
+fn tenant_parquet_reads(
+    store: Arc<dyn ObjectStore>,
+    storage: &crate::storage::BifrostStorage,
+    tenant: DataTenantId,
+) -> Arc<dyn ParquetFileReaderFactory> {
+    let inner: Arc<dyn ParquetFileReaderFactory> = match storage.metadata_cache() {
+        Some(cache) => Arc::new(CachedParquetFileReaderFactory::new(
+            Arc::clone(&store),
+            Arc::clone(cache),
+        )),
+        None => Arc::new(DefaultParquetFileReaderFactory::new(Arc::clone(&store))),
+    };
+    Arc::new(TenantParquetReaderFactory {
+        inner,
+        tenant,
+        ranges: storage.data_cache().map(|cache| (Arc::clone(cache), store)),
+    })
+}
+
 /// Where a hot leaf's Parquet objects live.
 pub(crate) enum HotObjects {
     /// Immutable objects under the warehouse, read through the node's storage
-    /// owner and footer cache.
+    /// owner and its caches.
     Warehouse(Arc<BifrostIcebergStorage>),
-    /// Scribe staged runs on this node's disk. They are rewritable, so their
-    /// footers are never cached; the lease, when present, keeps them on disk
-    /// for as long as the plan holds its files.
-    Staged(Option<Arc<StagedSourceLease>>),
+    /// Scribe staged runs on this node's disk, read through the same caches
+    /// of the node's storage owner; the lease, when present, keeps them on
+    /// disk for as long as the plan holds its files.
+    Staged {
+        /// The node's storage owner, whose caches the runs are read through.
+        storage: Arc<crate::storage::BifrostStorage>,
+        /// Lease keeping the runs on disk.
+        lease: Option<Arc<StagedSourceLease>>,
+    },
 }
 
 /// Builds one hot leaf: a plain `DataFusion` Parquet scan of `files`.
@@ -1129,8 +1148,7 @@ pub(crate) enum HotObjects {
 /// The scan carries no predicate; `DataFusion`'s `FilterPushdown` places the
 /// query's predicate in it, and the file pruner then skips a file whose
 /// `time_column` bounds (see [`HotFileSource::statistics`]) exclude it.
-/// `time_column` is `None` when no file in `files` declares bounds, as for a
-/// Scribe follower's staged runs.
+/// `time_column` is `None` only when no file in `files` declares bounds.
 ///
 /// The scan's `ObjectStoreUrl` is the always-registered local one; it is never
 /// resolved to a store, because the reader factory carries the real store.
@@ -1162,14 +1180,8 @@ pub(super) fn hot_parquet_scan(
             Some(store),
             None,
         ),
-        HotObjects::Staged(lease) => (
-            Arc::new(TenantParquetReaderFactory {
-                inner: Arc::new(DefaultParquetFileReaderFactory::new(Arc::new(
-                    LocalFileSystem::new(),
-                ))),
-                tenant,
-                ranges: None,
-            }),
+        HotObjects::Staged { storage, lease } => (
+            tenant_parquet_reads(Arc::new(LocalFileSystem::new()), &storage, tenant),
             None,
             lease,
         ),
@@ -1312,10 +1324,11 @@ pub(crate) struct HotFileSource {
     /// Absolute warehouse location of a hot object, or the local filesystem
     /// path of a Scribe staged run.
     pub(crate) location: String,
-    /// The object's exact size, from the manifest or the staged run's file.
+    /// The object's exact size, from the manifest or the size staging
+    /// recorded for the run.
     pub(crate) size_bytes: usize,
-    /// Exact row count the manifest records, or `None` for a staged run
-    /// whose count is not known before its footer is read.
+    /// Exact row count the manifest or the staged run's footer records, or
+    /// `None` when the manifest records none.
     ///
     /// Reported as inexact statistics, so `DataFusion` decides whether to
     /// split a hot scan as it does for a listing table, and `count(*)` still
@@ -1330,6 +1343,49 @@ pub(crate) struct HotFileSource {
 }
 
 impl HotFileSource {
+    /// Describes one Scribe staged run from the size and footer staging
+    /// recorded: its exact row count, and its `time_column` interval under
+    /// `schema` from the footer's row-group statistics.
+    ///
+    /// A run whose footer lacks a row group's time-column bounds, or a
+    /// `schema` without a time-column `time_column`, declares no interval,
+    /// so the run is kept.
+    ///
+    /// Returns `None` when the run's path is not UTF-8.
+    pub(super) fn staged(
+        run: &crate::scribe::hot_source::StagedRunRead,
+        schema: &Schema,
+        time_column: &str,
+    ) -> Option<Self> {
+        let interval = || {
+            let field = schema.field_with_name(time_column).ok()?;
+            let precision = TimePrecision::of(field.data_type())?;
+            let (mut low, mut high) = (None::<i64>, None::<i64>);
+            for group in run.footer.row_groups() {
+                let stats = crate::scribe::parquet_writer::extract_row_group_time_range(
+                    group,
+                    time_column,
+                    precision,
+                )
+                .ok()?;
+                let (min, max) = (stats.min_event_time?, stats.max_event_time?);
+                low = Some(low.map_or(min, |low| low.min(min)));
+                high = Some(high.map_or(max, |high| high.max(max)));
+            }
+            Some((low?, high?))
+        };
+        let interval = interval();
+        Some(Self {
+            location: run.path.to_str()?.to_owned(),
+            size_bytes: usize::try_from(run.bytes).unwrap_or(usize::MAX),
+            row_count: u64::try_from(run.footer.file_metadata().num_rows()).ok(),
+            event_time: crate::catalog::event_time::EventTimeStatistics::normalize(
+                interval.map(|(min, _)| min),
+                interval.map(|(_, max)| max),
+            ),
+        })
+    }
+
     /// `DataFusion` statistics for this file under the scan's `schema`, or
     /// `None` when the file declares neither a row count nor usable bounds.
     ///
@@ -1453,15 +1509,110 @@ pub(crate) struct OracleTableProvider {
 /// Each kept file's statistics are built and its footer looked up once per
 /// query here rather than once per caller.
 #[derive(Debug)]
-struct PlannedFiles {
-    /// Every file the scan reads: the published files Iceberg keeps under the
-    /// pushed filters, then the hot files.
+pub(super) struct PlannedFiles {
+    /// Every file the scan reads: for a published table, the published files
+    /// Iceberg keeps under the pushed filters, then the hot files; for a
+    /// Scribe follower, its staged runs.
     files: Vec<HotFileSource>,
     /// The files whose declared bounds leave them possibly matching the
-    /// pushed filters; a footer is read only for these.
+    /// pushed filters, by [`keep_files`]; a footer is read only for these.
     kept: Vec<HotFileSource>,
     /// Each kept file's footer in `kept` order, `None` for one not read.
     footers: Vec<Option<Arc<ParquetMetaData>>>,
+}
+
+impl PlannedFiles {
+    /// Plans a Scribe follower's staged `runs` as published files are
+    /// planned: each run is a [`HotFileSource::staged`] candidate, those
+    /// [`keep_files`] keeps under `pruning` are kept, and each kept run's
+    /// footer is the one staging read, so planning reads no file.
+    ///
+    /// Returns `None` when a run's path is not UTF-8.
+    pub(super) fn staged(
+        runs: &[crate::scribe::hot_source::StagedRunRead],
+        schema: &SchemaRef,
+        time_column: &str,
+        pruning: Option<&crate::scan_sizing::BatchPruning>,
+    ) -> Option<Self> {
+        let files = runs
+            .iter()
+            .map(|run| HotFileSource::staged(run, schema, time_column))
+            .collect::<Option<Vec<_>>>()?;
+        let (kept, footers) = files
+            .iter()
+            .zip(runs)
+            .zip(keep_files(&files, schema, time_column, pruning))
+            .filter(|(_, keep)| *keep)
+            .map(|((file, run), _)| (file.clone(), Some(Arc::clone(&run.footer))))
+            .unzip();
+        Some(Self {
+            files,
+            kept,
+            footers,
+        })
+    }
+
+    /// Builds the one Parquet scan of [`Self::files`] through
+    /// [`hot_parquet_scan`], split at most into the kept files' row groups.
+    ///
+    /// A kept file whose footer was not read leaves the row groups unknown
+    /// and the scan every partition. The file pruner then skips each file
+    /// whose `time_column` bounds the pushed predicate excludes before its
+    /// footer is opened.
+    ///
+    /// # Errors
+    ///
+    /// Returns the [`hot_parquet_scan`] error.
+    pub(super) fn scan(
+        &self,
+        objects: HotObjects,
+        tenant: DataTenantId,
+        required_schema: &SchemaRef,
+        time_column: &str,
+        options: &Arc<ConfigOptions>,
+    ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
+        let max_partitions = self
+            .footers
+            .iter()
+            .map(|footer| footer.as_ref().map(|footer| footer.num_row_groups()))
+            .sum();
+        hot_parquet_scan(
+            self.files.clone(),
+            objects,
+            tenant,
+            required_schema,
+            Some(time_column),
+            options,
+            max_partitions,
+        )
+    }
+}
+
+/// Returns, in `files` order, whether each file's declared `time_column`
+/// bounds under `schema` leave it possibly matching `pruning`.
+///
+/// These are the bounds the scan's file pruner excludes a file by before its
+/// footer is opened, so a footer is fetched only for a file the scan may
+/// read. A file without usable bounds, or no plannable predicate, is kept.
+fn keep_files(
+    files: &[HotFileSource],
+    schema: &SchemaRef,
+    time_column: &str,
+    pruning: Option<&crate::scan_sizing::BatchPruning>,
+) -> Vec<bool> {
+    let Some(pruning) = pruning else {
+        return vec![true; files.len()];
+    };
+    let statistics: Vec<_> = files
+        .iter()
+        .map(|file| {
+            Arc::new(
+                file.statistics(schema, Some(time_column))
+                    .unwrap_or_else(|| Statistics::new_unknown(schema)),
+            )
+        })
+        .collect();
+    pruning.keep(&statistics, files.len())
 }
 
 impl fmt::Debug for OracleTableProvider {
@@ -1733,27 +1884,18 @@ impl OracleTableProvider {
     }
 
     /// Returns, in `files` order, whether each file's declared bounds leave
-    /// it possibly matching `sizer`'s filters, by
-    /// [`crate::scan_sizing::ScanSizer::keep`].
-    ///
-    /// These are the bounds the scan's file pruner excludes a file by before
-    /// its footer is opened, so a footer is fetched only for a file the scan
-    /// may read.
+    /// it possibly matching `sizer`'s filters, by [`keep_files`].
     fn keep(
         &self,
         files: &[HotFileSource],
         sizer: &crate::scan_sizing::ScanSizer<'_>,
     ) -> Vec<bool> {
-        let statistics: Vec<_> = files
-            .iter()
-            .map(|file| {
-                Arc::new(
-                    file.statistics(&self.physical_schema, Some(self.time_axis.column()))
-                        .unwrap_or_else(|| Statistics::new_unknown(&self.physical_schema)),
-                )
-            })
-            .collect();
-        sizer.keep(&statistics, files.len())
+        keep_files(
+            files,
+            &self.physical_schema,
+            self.time_axis.column(),
+            sizer.pruning(),
+        )
     }
 
     /// Builds this cut's persisted leaf: one `DataFusion` Parquet scan over
@@ -1774,24 +1916,13 @@ impl OracleTableProvider {
         required_schema: &SchemaRef,
         filters: &[Expr],
     ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
-        let options = state.config().options();
         let planned = self.planned_files(state, filters).await?;
-        // The row groups of the files the pushed filters keep, whose footers
-        // were loaded when the scan was sized; one not read leaves the row
-        // groups unknown and the scan every partition.
-        let max_partitions = planned
-            .footers
-            .iter()
-            .map(|footer| footer.as_ref().map(|footer| footer.num_row_groups()))
-            .sum();
-        hot_parquet_scan(
-            planned.files.clone(),
+        planned.scan(
             HotObjects::Warehouse(Arc::clone(&self.objects)),
             self.context.data_tenant_id,
             required_schema,
-            Some(self.time_axis.column()),
-            options,
-            max_partitions,
+            self.time_axis.column(),
+            state.config().options(),
         )
     }
 }
@@ -3389,6 +3520,231 @@ pub(super) mod tests {
             );
         }
         values
+    }
+
+    /// Writes one tenant-proved run of `event_time` microseconds and `value`
+    /// rows, returning the run as a live read hands it to the follower.
+    ///
+    /// # Panics
+    /// Panics when the run cannot be written or its footer read.
+    fn write_timed_run(
+        path: &std::path::Path,
+        schema: &SchemaRef,
+        times: &[i64],
+    ) -> crate::scribe::hot_source::StagedRunRead {
+        let batch = RecordBatch::try_new(
+            Arc::clone(schema),
+            vec![
+                Arc::new(
+                    arrow::array::TimestampMicrosecondArray::from(times.to_vec())
+                        .with_timezone("+00:00"),
+                ),
+                Arc::new(Int64Array::from(times.to_vec())),
+            ],
+        )
+        .expect("timed run batch");
+        let mut writer = parquet::arrow::ArrowWriter::try_new(
+            File::create(path).expect("timed run file"),
+            Arc::clone(schema),
+            Some(fixture_writer_properties(&[])),
+        )
+        .expect("timed run writer");
+        writer.write(&batch).expect("timed run rows");
+        writer.close().expect("timed run footer");
+        let file = File::open(path).expect("timed run opens");
+        crate::scribe::hot_source::StagedRunRead {
+            path: path.to_path_buf(),
+            bytes: file.metadata().expect("timed run size").len(),
+            footer: Arc::clone(
+                parquet::arrow::arrow_reader::ArrowReaderMetadata::load(
+                    &file,
+                    ArrowReaderOptions::new(),
+                )
+                .expect("timed run footer reads")
+                .metadata(),
+            ),
+        }
+    }
+
+    /// Plans, executes and measures one `event_time >= 1_000` query of
+    /// `planned` over `objects`: its values, the files it opened and pruned,
+    /// and its footer-cache misses (footers read) and hits.
+    ///
+    /// # Panics
+    /// Panics when the scan fails to plan or execute.
+    async fn timed_query(
+        planned: &PlannedFiles,
+        objects: HotObjects,
+        schema: &SchemaRef,
+    ) -> (Vec<i64>, u64, u64, u64, u64) {
+        use datafusion::physical_optimizer::PhysicalOptimizerRule as _;
+
+        let options = Arc::new(crate::resources::OracleSessionShape::for_test().config_options());
+        let scan = planned
+            .scan(
+                objects,
+                *FIXTURE_TENANT,
+                schema,
+                FIXTURE_TIME_COLUMN,
+                &options,
+            )
+            .expect("timed scan plans");
+        let plan = datafusion::physical_optimizer::filter_pushdown::FilterPushdown::new()
+            .optimize(
+                Arc::new(
+                    datafusion::physical_plan::filter::FilterExec::try_new(
+                        timed_predicate(schema),
+                        scan,
+                    )
+                    .expect("timed filter plans"),
+                ),
+                &options,
+            )
+            .expect("timed filter pushes down");
+        let mut stats = OracleQueryScanStats::from_plan(plan.as_ref());
+        let recorder = wyrd_bench::BenchmarkRecorder::new();
+        let rows = {
+            let _recording = metrics::set_default_local_recorder(&recorder);
+            datafusion::physical_plan::collect(plan, Arc::new(TaskContext::default()))
+                .await
+                .expect("timed scan executes")
+        };
+        stats.finalize();
+        let mut values: Vec<i64> = rows
+            .iter()
+            .flat_map(|batch| {
+                batch
+                    .column(1)
+                    .as_any()
+                    .downcast_ref::<Int64Array>()
+                    .expect("Int64 values")
+                    .values()
+                    .to_vec()
+            })
+            .collect();
+        values.sort_unstable();
+        let counters = recorder.snapshot().counters;
+        let count = |name: &str| counters.get(name).copied().unwrap_or(0);
+        (
+            values,
+            stats.files_scanned,
+            stats.pruning.files_pruned,
+            count("bifrost_footer_cache_misses_total"),
+            count("bifrost_footer_cache_hits_total"),
+        )
+    }
+
+    /// `event_time >= 1_000` microseconds over the timed-run `schema`.
+    fn timed_predicate(schema: &SchemaRef) -> Arc<dyn datafusion::physical_expr::PhysicalExpr> {
+        datafusion::physical_expr::expressions::binary(
+            Arc::new(Column::new(FIXTURE_TIME_COLUMN, 0)),
+            datafusion::logical_expr::Operator::GtEq,
+            datafusion::physical_expr::expressions::lit(
+                datafusion::scalar::ScalarValue::TimestampMicrosecond(
+                    Some(1_000),
+                    Some("+00:00".into()),
+                ),
+            ),
+            schema,
+        )
+        .expect("event_time >= 1000")
+    }
+
+    /// Staged runs plan, prune and reuse footers exactly as published files.
+    ///
+    /// Two runs hold disjoint `event_time` ranges, and a predicate matches only
+    /// the later one. Planned as staged runs, the earlier run's footer bounds
+    /// rule it out of the kept set; executed, the file pruner skips it before
+    /// its footer is read, and a repeated query reads no footer at all, because
+    /// staged runs go through the node's footer cache. The same files under the
+    /// warehouse, planned from the same declared bounds, give the same rows,
+    /// the same opened and pruned files and the same footer reuse.
+    ///
+    /// # Panics
+    /// Panics when a run excluded by its bounds is opened, a repeated query
+    /// rereads a footer, or the staged and published scans differ.
+    #[tokio::test]
+    async fn staged_and_published_share_planning_pushdown_and_footer_reuse() {
+        let root = tempfile::tempdir().expect("timed run directory");
+        let schema = Arc::new(Schema::new(vec![
+            Field::new(
+                FIXTURE_TIME_COLUMN,
+                DataType::Timestamp(
+                    arrow::datatypes::TimeUnit::Microsecond,
+                    Some("+00:00".into()),
+                ),
+                false,
+            ),
+            Field::new("value", DataType::Int64, false),
+        ]));
+        let runs = [
+            write_timed_run(&root.path().join("early.parquet"), &schema, &[1, 2, 3]),
+            write_timed_run(&root.path().join("late.parquet"), &schema, &[1_000, 2_000]),
+        ];
+        let pruning = crate::scan_sizing::BatchPruning::try_new(&schema, timed_predicate(&schema));
+        let staged = PlannedFiles::staged(&runs, &schema, FIXTURE_TIME_COLUMN, pruning.as_ref())
+            .expect("staged runs plan");
+        assert_eq!(staged.files.len(), 2, "every run is a scan candidate");
+        assert_eq!(
+            staged
+                .kept
+                .iter()
+                .map(|file| file.location.as_str())
+                .collect::<Vec<_>>(),
+            vec![runs[1].path.to_str().expect("UTF-8 run path")],
+            "only the run whose bounds may match is kept"
+        );
+        assert_eq!(staged.files[0].row_count, Some(3), "the footer's row count");
+        // One storage owner, as one node has, across both staged queries.
+        let storage = crate::storage::BifrostStorage::for_test(root.path(), true);
+        let node = || HotObjects::Staged {
+            storage: Arc::clone(&storage),
+            lease: None,
+        };
+        let first = timed_query(&staged, node(), &schema).await;
+        assert_eq!(
+            first,
+            (vec![1_000, 2_000], 1, 1, 1, 0),
+            "first staged query"
+        );
+        let again = timed_query(&staged, node(), &schema).await;
+        assert_eq!(
+            again,
+            (vec![1_000, 2_000], 1, 1, 0, 1),
+            "a repeated staged query reads no footer"
+        );
+
+        let in_warehouse = |file: &HotFileSource| HotFileSource {
+            location: std::path::Path::new(&file.location)
+                .file_name()
+                .and_then(|name| name.to_str())
+                .expect("run file name")
+                .to_owned(),
+            ..file.clone()
+        };
+        let published = PlannedFiles {
+            files: staged.files.iter().map(in_warehouse).collect(),
+            kept: staged.kept.iter().map(in_warehouse).collect(),
+            footers: staged.footers.clone(),
+        };
+        let warehouse = warehouse_objects(root.path());
+        let first = timed_query(
+            &published,
+            HotObjects::Warehouse(Arc::clone(&warehouse)),
+            &schema,
+        )
+        .await;
+        assert_eq!(
+            first,
+            (vec![1_000, 2_000], 1, 1, 1, 0),
+            "first published query"
+        );
+        let again = timed_query(&published, HotObjects::Warehouse(warehouse), &schema).await;
+        assert_eq!(
+            again,
+            (vec![1_000, 2_000], 1, 1, 0, 1),
+            "a repeated published query reads no footer"
+        );
     }
 
     /// Owns deterministic Parquet bytes used by the terminal-owner hot test.

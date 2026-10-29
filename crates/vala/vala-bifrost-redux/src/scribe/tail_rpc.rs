@@ -5,7 +5,6 @@
 //! `ListActiveStreams` RPC, reads every fragment of that query from the
 //! retained capture, and releases it through `ReleaseCapture`.
 
-use std::path::PathBuf;
 use std::sync::Arc;
 
 #[cfg(feature = "test-support")]
@@ -412,18 +411,18 @@ pub struct LiveTailBatches {
     /// retained capture so retirement cannot uncharge them while this read
     /// holds them.
     charges: Vec<Arc<crate::scribe::memory::RetainedArrowCharge>>,
-    /// Staged run paths in merge order.
-    runs: Vec<PathBuf>,
+    /// Staged runs with their recorded size and footer, in merge order.
+    runs: Vec<crate::scribe::hot_source::StagedRunRead>,
     /// Lease keeping `runs` on disk, shared with the retained capture.
     staged: Option<Arc<StagedSourceLease>>,
 }
 
 /// The parts of one [`LiveTailBatches`]: memory batches, their accounting
-/// owners, staged run paths, and the lease keeping those runs on disk.
+/// owners, staged runs, and the lease keeping those runs on disk.
 pub(crate) type LiveTailParts = (
     Vec<HotBatch>,
     Vec<Arc<crate::scribe::memory::RetainedArrowCharge>>,
-    Vec<PathBuf>,
+    Vec<crate::scribe::hot_source::StagedRunRead>,
     Option<Arc<StagedSourceLease>>,
 );
 
@@ -442,8 +441,7 @@ impl LiveTailBatches {
     }
 
     /// Splits the read into its memory batches, their accounting owners, its
-    /// staged run paths in merge order, and the lease keeping those runs on
-    /// disk.
+    /// staged runs in merge order, and the lease keeping those runs on disk.
     ///
     /// The caller must hold the charges for as long as any memory batch or a
     /// projection of one lives, and the lease for as long as it reads any run
@@ -1270,7 +1268,7 @@ pub(crate) mod tests {
             .collect::<Vec<_>>();
         for run in runs {
             let reader = parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder::try_new(
-                std::fs::File::open(run).expect("leased staged run opens"),
+                std::fs::File::open(run.path).expect("leased staged run opens"),
             )
             .expect("staged run footer")
             .build()
@@ -1444,8 +1442,9 @@ pub(crate) mod tests {
                 std::fs::copy(&run, &copy).expect("fixture staged run copies");
                 copy
             })
-            .collect();
+            .collect::<Vec<_>>();
         let member = StagedMemberId::new(0, generation.get());
+        let footers = crate::scribe::hot_source::RunFooters::read_for_test(&runs);
         registry
             .advance(
                 &key,
@@ -1454,7 +1453,7 @@ pub(crate) mod tests {
                     member,
                     runs,
                     bytes: 4_096,
-                    footers: crate::scribe::hot_source::RunFooters::default(),
+                    footers,
                     wal: (WalLsn::new(1), WalLsn::new(1)),
                 },
             )
@@ -1618,9 +1617,9 @@ pub(crate) mod tests {
                         GenerationOrdinal::new(0, frozen.seal_id),
                         HotAuthority::StagedRun {
                             member: crate::scribe::assembly::StagedMemberId::new(0, frozen.seal_id),
+                            footers: RunFooters::read_for_test(std::slice::from_ref(&run)),
                             runs: vec![run],
                             bytes: 4_096,
-                            footers: RunFooters::default(),
                             wal: (WalLsn::new(1), WalLsn::new(1)),
                         },
                     )
@@ -1687,7 +1686,7 @@ pub(crate) mod tests {
         assert!(rows.is_empty(), "a durable staged generation leaves memory");
         assert_eq!(runs.len(), 1, "the leased run is still named");
         assert!(
-            runs[0].exists(),
+            runs[0].path.exists(),
             "a leased staged run stays on disk after publication"
         );
         drop(lease);
@@ -1828,7 +1827,7 @@ pub(crate) mod tests {
         assert_eq!(service.retained_captures_for_test(), 1);
         assert!(service.open_capture(&request).is_err());
         let (_rows, _charges, runs, lease) = opened.into_parts();
-        assert!(lease.is_some() && runs.iter().all(|run| run.exists()));
+        assert!(lease.is_some() && runs.iter().all(|run| run.path.exists()));
     }
 
     /// An unreleased capture expires at its query deadline and is never

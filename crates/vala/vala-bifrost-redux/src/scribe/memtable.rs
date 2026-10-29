@@ -1962,8 +1962,8 @@ impl LiveCapture {
 
     /// Reads one partition range of the capture: its memory batches `pruning`
     /// keeps, projected to `required`, the accounting owners of those
-    /// batches, its staged run paths in merge order, and the lease that keeps
-    /// those runs on disk.
+    /// batches, its staged runs in merge order with the size and footer
+    /// staging recorded for each, and the lease that keeps those runs on disk.
     ///
     /// The batch list is sized once from the in-range sources, so a read
     /// never regrows it.
@@ -2005,7 +2005,7 @@ impl LiveCapture {
             .iter()
             .flat_map(|lease| lease.sources())
             .filter(|source| partitions.contains(&source.key.partition.time()))
-            .flat_map(|source| source.runs.iter().cloned())
+            .flat_map(|source| source.footers.reads(&source.runs))
             .collect();
         Ok(CapturedRead {
             batches,
@@ -2039,8 +2039,8 @@ pub(crate) struct CapturedRead {
     /// Accounting owners of `batches`, which keep their bytes charged to the
     /// Scribe root while the read holds them.
     pub(crate) charges: Vec<Arc<crate::scribe::memory::RetainedArrowCharge>>,
-    /// Staged run paths, in merge order.
-    pub(crate) runs: Vec<std::path::PathBuf>,
+    /// Staged runs with their recorded size and footer, in merge order.
+    pub(crate) runs: Vec<crate::scribe::hot_source::StagedRunRead>,
     /// Lease keeping `runs` on disk while the read holds it.
     pub(crate) lease: Option<Arc<crate::scribe::hot_source::StagedSourceLease>>,
 }

@@ -67,19 +67,21 @@ impl GenerationOrdinal {
     }
 }
 
-/// The footers of one staged member's runs, in run order.
+/// The footers of one staged member's runs, each with the run's exact encoded
+/// size, in run order.
 ///
 /// Read once, by [`crate::scribe::member_stager::preflight_run`] when the
 /// runs are staged or recovered, so the Scribe listing sizes a scan of them
-/// through [`ScanSizer`] without touching the disk.
+/// through [`ScanSizer`] and a live read hands each run to Oracle's Parquet
+/// scan with its size, rows and bounds, without touching the disk.
 #[derive(Debug, Clone, Default)]
-pub struct RunFooters(Arc<[ArrowReaderMetadata]>);
+pub struct RunFooters(Arc<[(u64, ArrowReaderMetadata)]>);
 
 impl RunFooters {
-    /// Wraps the footers of a member's runs, in run order.
+    /// Wraps each run's exact encoded size and footer, in run order.
     #[must_use]
-    pub fn new(footers: Vec<ArrowReaderMetadata>) -> Self {
-        Self(footers.into())
+    pub fn new(runs: Vec<(u64, ArrowReaderMetadata)>) -> Self {
+        Self(runs.into())
     }
 
     /// Returns the bytes `scope` reads from the runs, each sized by
@@ -87,15 +89,65 @@ impl RunFooters {
     /// every run of one member shares; no runs read no bytes.
     #[must_use]
     pub fn scoped_bytes(&self, scope: &ScanScope) -> u64 {
-        let Some(first) = self.0.first() else {
+        let Some((_, first)) = self.0.first() else {
             return 0;
         };
         let sizer = ScanSizer::new(scope, first.schema());
         self.0
             .iter()
-            .map(|run| sizer.footer_size(run.metadata()).bytes)
+            .map(|(_, run)| sizer.footer_size(run.metadata()).bytes)
             .fold(0_u64, u64::saturating_add)
     }
+
+    /// Reads the size and footer of each run in `paths`, as staging records
+    /// them.
+    ///
+    /// # Panics
+    ///
+    /// Panics when a run cannot be read or preflighted.
+    #[cfg(test)]
+    pub(crate) fn read_for_test(paths: &[PathBuf]) -> Self {
+        Self::new(
+            paths
+                .iter()
+                .map(|path| {
+                    (
+                        std::fs::metadata(path).expect("staged run size").len(),
+                        crate::scribe::member_stager::preflight_run(path)
+                            .expect("staged run footer"),
+                    )
+                })
+                .collect(),
+        )
+    }
+
+    /// Pairs each of `paths`, the member's runs in the same run order, with
+    /// its recorded size and footer.
+    pub(crate) fn reads<'a>(
+        &'a self,
+        paths: &'a [PathBuf],
+    ) -> impl Iterator<Item = StagedRunRead> + 'a {
+        paths
+            .iter()
+            .zip(self.0.iter())
+            .map(|(path, (bytes, footer))| StagedRunRead {
+                path: path.clone(),
+                bytes: *bytes,
+                footer: Arc::clone(footer.metadata()),
+            })
+    }
+}
+
+/// One staged run a live read opens: its path and the exact facts staging
+/// recorded for it.
+#[derive(Debug, Clone)]
+pub struct StagedRunRead {
+    /// Fsynced local path of the run.
+    pub path: PathBuf,
+    /// Exact encoded bytes of the run.
+    pub bytes: u64,
+    /// The run's footer, which carries its row count and row-group bounds.
+    pub footer: Arc<parquet::file::metadata::ParquetMetaData>,
 }
 
 /// Footers are derived from the runs, which already decide identity, so they

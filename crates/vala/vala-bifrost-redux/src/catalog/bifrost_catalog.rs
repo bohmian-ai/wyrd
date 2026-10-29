@@ -1802,21 +1802,25 @@ impl BifrostCatalog {
     }
 
     /// Return the physical Arrow schema a follower scan assignment must be
-    /// built against for one tenant-qualified table.
+    /// built against for one tenant-qualified table, with the table's time
+    /// axis.
     ///
     /// This is the provider's schema including managed columns, not the
     /// registered user schema. Both the assignment's projection closure and its
     /// fingerprint are derived from it, and the follower re-derives the same
     /// schema after resolution, so a caller that guesses either one is rejected.
+    /// The time axis is the one the leader prunes files by, read from the same
+    /// table metadata, so a follower prunes its staged runs by the same column.
     ///
     /// # Errors
-    /// Returns a catalog error when the tenant does not own the registration or
-    /// the physical provider cannot be built.
+    /// Returns a catalog error when the tenant does not own the registration,
+    /// the physical provider cannot be built, or the table's partition spec has
+    /// no time field.
     pub async fn assignment_schema(
         &self,
         table: &TableRef,
         tenant: DataTenantId,
-    ) -> Result<SchemaRef, BifrostCatalogError> {
+    ) -> Result<(SchemaRef, crate::catalog::TimeAxis), BifrostCatalogError> {
         // Schema only: the provider is built from the loaded metadata document
         // and dropped here, so this path opens no snapshot object.
         let fqn = table.fqn();
@@ -1826,10 +1830,19 @@ impl BifrostCatalog {
         let binding = TenantTableBinding::resolve((tenant, table.clone()))
             .map_err(|error| BifrostCatalogError::InvalidBinding(error.to_string()))?;
         let iceberg_table = self.catalog.load_table(&binding.table_ident()).await?;
+        let time_axis =
+            crate::catalog::TimeAxis::of_iceberg(iceberg_table.metadata()).ok_or_else(|| {
+                BifrostCatalogError::MetadataMismatch(format!(
+                    "table {fqn} has no time partition field in its partition spec"
+                ))
+            })?;
         let provider = IcebergStaticTableProvider::try_new_from_table(iceberg_table)
             .await
             .map_err(provider_error)?;
-        Ok(datafusion::datasource::TableProvider::schema(&provider))
+        Ok((
+            datafusion::datasource::TableProvider::schema(&provider),
+            time_axis,
+        ))
     }
 
     /// List registrations visible under the exact tenant RLS bind.

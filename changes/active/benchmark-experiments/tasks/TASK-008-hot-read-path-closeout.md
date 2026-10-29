@@ -345,3 +345,19 @@ Cache validation (step 1) is confirmed:
 - The caches are process-local.
 
 Path keys therefore never alias a different run. The limit is that a run rewritten in place at its recorded size would be served from a stale cache entry; that is outside the staging contract.
+
+### Closeout gate
+
+`mise run verify:bifrost` on `3b7f9d5af` is **red with seven failures. All seven predate this task.** Each one was rerun alone on HEAD and on the pre-task base `471f69ff9`, with the same result on both:
+
+| Test | HEAD | Base | Read |
+|---|---|---|---|
+| `wyrd-testing` lib `bifrost::cluster::tests::cluster_restart_rederives_same_plan_from_retained_snapshot` | FAIL 322122546 vs 161061273 | FAIL, same | Stale assertion. It expects only the footer-cache charge; `storage/mod.rs:163` also charges the byte-range budget |
+| `pg_verification_runtime::attempts_record_queue_wait_phases_terminal_latency_and_one_trace` | FAIL (2 queue waits vs 1) | FAIL | Deferred attempt at `verification/runner.rs:573` |
+| `pg_verification_runtime::two_replicas_claim_each_queued_run_exactly_once` | fails only in the full lane; passes alone | same | Ordering within the lane |
+| `verifier_building_blocks::custom_verdict_data_survives_readback` | FAIL "No field named outcome" | FAIL | Stale query; `bifrost.verification.results` has no `outcome` column |
+| `verify_in_real_time::verification_staging_refuses_and_recovers` | FAIL `[6]` vs `[5]` | FAIL | One extra `execution_inputs` row |
+| `server` `query::generated_grpc_and_scheduled_queries_share_audit_terminal_and_cleanup` | FAIL 0 vs 1 (`query.rs:877`) | FAIL | Predates this task |
+| `server` `owner_inspection::failed_wal_replay_is_role_local` | FAIL (`owner_inspection.rs:365`) | FAIL | Predates this task |
+
+Every Bifrost read lane this task touches is green: oracle 62/62, scribe 42/42, forge 24/24. The seven failures are in the verification runtime, WAL replay, the audit journey and stale SDK/cluster tests, all outside TASK-008's write set, and are left for their owners.

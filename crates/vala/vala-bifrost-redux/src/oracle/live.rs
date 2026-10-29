@@ -622,6 +622,8 @@ impl ExecutionPlan for LiveScribeExec {
     ///
     /// The absorbed expressions are rewritten over the closure, so a Scribe
     /// reads them against the same placeholder columns the predicate uses.
+    /// A projection of no columns, as `count(*)` plans, stays on the leader:
+    /// a live assignment always carries at least one expression.
     ///
     /// # Errors
     /// Returns the `DataFusion` error raised when an expression cannot be
@@ -630,6 +632,9 @@ impl ExecutionPlan for LiveScribeExec {
         &self,
         projection: &ProjectionExec,
     ) -> DataFusionResult<Option<Arc<dyn ExecutionPlan>>> {
+        if projection.expr().is_empty() {
+            return Ok(None);
+        }
         let mut leaf = self.clone();
         leaf.projection = self.projection.try_merge(projection.projection_expr())?;
         leaf.properties = Self::properties_of(

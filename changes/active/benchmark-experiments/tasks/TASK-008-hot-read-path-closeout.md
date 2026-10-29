@@ -305,3 +305,13 @@ Stop if implementation requires weakening tenant proof, logical results,
 fail-closed decoding, leases, durability or a non-goal. If cache validation
 cannot be confirmed, stop before relying on path keys. If B cannot reproduce
 the warning, retain it as open and collect real inputs rather than guess a fix.
+
+## Evidence
+
+### Diagnoses
+
+| Failure | Symptom | Evidence | Cause | Fix site |
+|---|---|---|---|---|
+| `ingest_bounds::native_ingest_bounds_expanded_bytes_not_rows` | `SELECT count(*)` failed with query execution failed | the live fragment carried an empty projection; the projection wire rejects an empty list | `LiveUnionProjection`, now on every Oracle session, let the live leaf absorb the zero-column `count(*)` projection | `LiveScribeExec::try_swapping_with_projection` refuses empty projections, so they stay on the leader; checked against every swap caller in `oracle/live.rs` |
+| `distributed::remote_staged_footer_refusal_fails_closed` | `QUERY_EXECUTION_FAILED` where `QueryTenantInvariant` was expected | `peer_service` WARN `ParquetError(... "Corrupt footer")`; `HotFileSource::staged` sizes from `run.bytes` (`oracle/exec.rs:1380`) | the fixture re-encoded the run at a new length; step 2 plans with the recorded size, so the footer read fell inside the file before the tenant proof ran. Independent read-only diagnosis agreed: the fixture is at fault, and production matches step 2 | `rewrite_footer_tenant` now overwrites the owner id with an equal-length foreign id inside the footer, so only the tenant proof can fail. No other fixture rewrites a staged run |
+| `published::source_transitions_preserve_exact_rows` | 2 cut reads where 1 was expected; 2 of 6 runs failed | trace: Forge's case-1 promotion commit at 39.602; warm query served a stale cached cut at 39.604; NOTIFY eviction; held query read twice | a latent test race, not caused by this diff. The warm-up exited on a cache hit while Forge's promotion NOTIFY was still in flight (independent read-only diagnosis) | the warm-up first waits until `file_tier_counts` reports no hot file left to promote; 8 of 8 runs pass |

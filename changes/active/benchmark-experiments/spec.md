@@ -1,6 +1,6 @@
 ---
 id: SPEC-benchmark-experiments
-revision: 21
+revision: 22
 status: approved
 ---
 
@@ -1588,7 +1588,52 @@ scaling choices remain implementation-owned.
 Historical clean-source gaps remain recorded as exclusions/advisory evidence,
 not a reason to weaken coverage.
 
+## Revision 22 supplement — hot read-path closeout
+
+**REQ-033 — Live expression projection.** Oracle carries the plan's ordered
+projection expressions in the private Oracle-to-Scribe live assignment for
+staged and memtable reads alike. The follower runs projection pushdown as well
+as filter pushdown so projection reaches the shared staged `ParquetSource`;
+`ReadableSource::project` evaluates expressions on physical arrays without
+unused whole-Variant reconstruction. Preserve logical results, hidden tenant
+proof, full schema-fingerprint validation, assignment authority, capture/lease
+lifetime and fail-closed decoding. This internal cross-service change does not
+change public SDK or HTTP contracts.
+
+**REQ-034 — One Parquet planning and cached reader.** Staged runs and
+published files use the same planning owner and cached reader on the node that
+holds them. `LiveCapture::read` / `CapturedRead` retain each staged run's size,
+row count and time bounds from existing `RunFooters`, rather than bare paths.
+The owning Scribe's `ScribeTailResolver::live_leaf` uses the same `keep` pruning
+and footer row-group partition cap as `OracleTableProvider::persisted_input`,
+passes the table time column to `hot_parquet_scan`, and does not stat paths or
+invent unknown metadata. Both readers use `CachedParquetFileReaderFactory`
+with the node's `FileMetadataCache` and `RangeCache` through
+`TenantParquetReaderFactory`; only the store differs: `LocalFileSystem` for
+staged runs, warehouse storage for published files. Confirm cache validation
+against `ObjectMeta` before relying on path keys.
+
+Discovery, listing and routing remain unchanged. The leader never plans another
+node's files; no footer crosses the network. Preserve tenant proof, assignment
+authority, publication cut, exactly-once generation selection and query-bound
+leases. Remove avoidable costs without retained staged Arrow or decoded caches.
+TASK-008 fixes the demonstrated time warning, completes memtable scan facts and
+compares exclusive hot/parquet records by step ID using existing metrics and
+targets. Benchmarks measure; correctness stays in owning unit and journey tests.
+Keep the `prepare_hot` gauge check unchanged.
+
 ## Revision history and authority
+
+- Revision 22 — 2026-10-29 (approved): live assignments carry the plan's
+  projection expressions for staged and memtable reads; follower projection
+  and filter pushdown reach staged Parquet, and memtable expressions evaluate
+  physical arrays without unused whole-Variant reconstruction (REQ-033).
+  Staged runs retain real file facts and use the same planning owner and cached
+  reader as published files, on the node that holds them. Discovery, listing
+  and routing stay unchanged; the leader never plans peer files and no footer
+  crosses the network (REQ-034). TASK-008 proceeds through the same reader,
+  real file facts, projection, the time-warning fix, memtable scan facts and
+  exclusive hot/parquet measurement, with correctness in owning tests.
 
 - Revision 21 — 2026-10-29 (approved): `hot` places its whole fixture in
   preparation, learning the span layout from a published sample first, so its

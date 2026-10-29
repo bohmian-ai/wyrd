@@ -342,11 +342,49 @@ export function parseNanos(value: unknown): bigint | undefined {
   return BigInt(ms) * 1_000_000n + BigInt((match[2] ?? '').padEnd(9, '0'));
 }
 
-/** A row cell as text: null is `∅`, a nanosecond duration reads as time, nested values as JSON. */
+/** Column headings for the canonical columns; any other column is headed by its name. */
+const LABELS: Readonly<Record<string, string>> = {
+  start_time_unix_nano: 'Start',
+  time_unix_nano: 'Time',
+  observed_time_unix_nano: 'Observed',
+  name: 'Name',
+  service_name: 'Service',
+  duration_nano: 'Duration',
+  status_code: 'Status',
+  kind: 'Kind',
+  severity_text: 'Severity',
+  severity_number: 'Severity number',
+  body_text: 'Message',
+  exception_type: 'Exception',
+  metric_name: 'Metric',
+  metric_type: 'Type',
+  unit: 'Unit',
+  int_value: 'Integer value',
+  double_value: 'Double value',
+  workload_card_uid: 'Workload',
+  subject_card_uid: 'Card',
+  gen_ai_request_model: 'Model',
+  gen_ai_operation_name: 'Operation'
+};
+
+/** A column's heading; the column name itself stays available as its title for writing WHERE. */
+export function columnLabel(column: string): string {
+  return LABELS[column] ?? column;
+}
+
+/** OTLP span status codes by name. */
+export const STATUS_NAMES: Readonly<Record<number, string>> = { 0: 'unset', 1: 'ok', 2: 'error' };
+
+/**
+ * A row cell as text: null is `∅`, a nanosecond duration reads as time, a
+ * timestamp as month-day and time to the millisecond (the exact value is the
+ * caller's title), nested values as JSON.
+ */
 export function cellText(column: string, value: unknown): string {
   if (value === null || value === undefined) return '∅';
   if (column === 'duration_nano') return fmtDuration(Math.round(Number(value) / 1e6));
-  if (column.endsWith('_unix_nano') && typeof value === 'string') return value.replace('T', ' ').replace(/(\+00:00|Z)$/, 'Z');
+  const instant = column.endsWith('_unix_nano') && typeof value === 'string' && /^\d{4}-(\d\d-\d\d)T(\d\d:\d\d:\d\d)(\.\d{1,3})?/.exec(value);
+  if (instant) return `${instant[1]} ${instant[2]}${instant[3] ?? ''}`;
   return typeof value === 'object' ? JSON.stringify(value) : String(value);
 }
 

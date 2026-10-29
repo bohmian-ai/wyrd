@@ -9,7 +9,7 @@
 -->
 <script lang="ts">
   import type { ActionProps, QueryResult } from '../contract.js';
-  import { KEY_COLUMNS, cellText, shownColumns, type RecordTableProps } from '../loaders.js';
+  import { KEY_COLUMNS, STATUS_NAMES, cellText, columnLabel, shownColumns, type RecordTableProps } from '../loaders.js';
   import { fmtCount } from '../format.js';
   import { columnIndex, numeric } from '../plot.js';
   import ActionNote from './ActionNote.svelte';
@@ -19,7 +19,7 @@
 
   let { input, result, actions = {}, onaction, paused = false }: RecordTableProps & ActionProps & { paused?: boolean } = $props();
 
-  const STATUS: Record<number, [Tone, string]> = { 0: ['neutral', 'unset'], 1: ['ok', 'ok'], 2: ['danger', 'error'] };
+  const TONES: Record<number, Tone> = { 0: 'neutral', 1: 'ok', 2: 'danger' };
   const signal = $derived('signal' in input ? input.signal : undefined);
   const latest = $derived(result.state === 'populated' || result.state === 'empty' ? result.data.rows : undefined);
 
@@ -109,14 +109,14 @@
       <table>
         <thead>
           <tr>
-            {#each columns as column (column)}<th scope="col">{column}</th>{/each}
+            {#each columns as column (column)}<th scope="col" title={column}>{columnLabel(column)}</th>{/each}
             {#if signal === 'traces'}<th scope="col">spans</th><th scope="col">errors</th>{/if}
           </tr>
         </thead>
         <tbody>
           {#each groups as [group, members] (group)}
             {#if input.groupBy}
-              <tr class="group"><th scope="rowgroup" colspan={columns.length + (signal === 'traces' ? 2 : 0)}>{input.groupBy} = {group} · {members.length}</th></tr>
+              <tr class="group"><th scope="rowgroup" colspan={columns.length + (signal === 'traces' ? 2 : 0)}>{columnLabel(input.groupBy)} = {group} · {members.length}</th></tr>
             {/if}
             {#each members as row, index (index)}
               {@const traceCounts = byTrace.get(String(row[columnIndex(rows, 'trace_id')]))}
@@ -131,10 +131,12 @@
                   <td>
                     {#if column === 'duration_nano' && value !== null}
                       <DurationBar ms={Math.round(numeric(value) / 1e6)} max={longest} />
-                    {:else if column === 'status_code' && value !== null && STATUS[numeric(value)]}
-                      <StatusPill tone={STATUS[numeric(value)][0]} label={STATUS[numeric(value)][1]} />
+                    {:else if column === 'status_code' && value !== null && STATUS_NAMES[numeric(value)]}
+                      <StatusPill tone={TONES[numeric(value)]} label={STATUS_NAMES[numeric(value)]} />
+                    {:else if column.endsWith('_unix_nano') && value !== null}
+                      <time datetime={String(value)} title={String(value)}>{cellText(column, value)}</time>
                     {:else}
-                      <span class:null={value === null}>{cellText(column, value)}</span>
+                      <span class:null={value === null} title={typeof value === 'string' && value.length > 40 ? value : undefined}>{cellText(column, value)}</span>
                     {/if}
                   </td>
                 {/each}

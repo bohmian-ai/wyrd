@@ -5,7 +5,7 @@
   let { ms, max, label }: { ms: number; max: number; label?: string } = $props();
 </script>
 
-<span class="duration">
+<span class="duration" class:unlabeled={!label}>
   {#if label}<span class="label">{label}</span>{/if}
   <span class="track" aria-hidden="true"><span class="bar" style:width="{max > 0 ? Math.min(100, (ms / max) * 100) : 0}%"></span></span>
   <span class="value">{fmtDuration(ms)}</span>
@@ -20,6 +20,9 @@
     min-width: 0;
     font: 11px var(--font-mono);
     color: var(--text);
+  }
+  .unlabeled {
+    grid-template-columns: 1fr auto;
   }
   .label {
     color: var(--muted);

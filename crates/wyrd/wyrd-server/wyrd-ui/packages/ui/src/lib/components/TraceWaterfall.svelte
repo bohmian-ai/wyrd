@@ -81,6 +81,7 @@
             <button
               type="button"
               class="select"
+              title={span.name}
               disabled={blocked}
               onclick={() => onaction?.({ name: 'trace.select', input: { trace_id: input.traceId, span_id: span.spanId } })}
             >
@@ -111,6 +112,7 @@
 
 <style>
   .waterfall {
+    container-type: inline-size;
     display: flex;
     flex-direction: column;
     gap: 8px;
@@ -156,7 +158,7 @@
   }
   li {
     display: grid;
-    grid-template-columns: minmax(140px, 2fr) minmax(70px, 1fr) minmax(80px, 3fr) 64px;
+    grid-template-columns: minmax(160px, 3fr) minmax(60px, 1fr) minmax(80px, 3fr) 56px;
     align-items: center;
     gap: 10px;
     padding: 4px 10px;
@@ -231,11 +233,19 @@
     outline: 2px solid var(--declare);
     outline-offset: 1px;
   }
-  @media (max-width: 560px) {
+  /* A narrow panel keeps the tree and timeline and drops the service; a phone keeps the tree. */
+  @container (max-width: 560px) {
     li {
-      grid-template-columns: minmax(0, 1fr) 64px;
+      grid-template-columns: minmax(110px, 3fr) minmax(50px, 2fr) 56px;
     }
-    .service,
+    .service {
+      display: none;
+    }
+  }
+  @container (max-width: 280px) {
+    li {
+      grid-template-columns: minmax(0, 1fr) 56px;
+    }
     .track {
       display: none;
     }

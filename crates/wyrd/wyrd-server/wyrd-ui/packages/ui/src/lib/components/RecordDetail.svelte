@@ -28,7 +28,6 @@
   let chosen = $state<string>();
   const tab = $derived(chosen && (TABS as readonly string[]).includes(chosen) ? chosen : TABS[0]);
 
-  const unavailable = $derived(onaction ? undefined : ({ state: 'unavailable', reason: 'This host offers no navigation' } as const));
   const traceId = $derived(at('trace_id') as string | null | undefined);
   const spanId = $derived(at('span_id') as string | null | undefined);
   const filterValue = $derived((isLog ? at('severity_text') : at('name')) as string | null | undefined);
@@ -43,19 +42,20 @@
       <p class="meta">
         {#if traceId}<span>trace {traceId}</span>{/if}
         {#if spanId}<span>span {spanId}</span>{/if}
-        <span>{cellText(isLog ? 'time_unix_nano' : 'start_time_unix_nano', at(isLog ? 'time_unix_nano' : 'start_time_unix_nano'))}</span>
+        <time datetime={String(at(isLog ? 'time_unix_nano' : 'start_time_unix_nano'))}>{String(at(isLog ? 'time_unix_nano' : 'start_time_unix_nano'))}</time>
         {#if data.rows.length > 1}<span class="warn" role="note">{data.rows.length} records share this key; showing the first</span>{/if}
       </p>
+      {#if onaction}
       <div class="actions">
         {#if filterValue !== undefined}
           <ActionButton
             label="Filter = {filterColumn}"
-            state={unavailable ?? actions['record.filter']}
+            state={actions['record.filter']}
             onclick={() => onaction?.({ name: 'record.filter', input: { signal: isLog ? 'logs' : 'spans', column: filterColumn, value: filterValue } })}
           />
           <ActionButton
             label="Exclude"
-            state={unavailable ?? actions['record.filter']}
+            state={actions['record.filter']}
             onclick={() =>
               onaction?.({ name: 'record.filter', input: { signal: isLog ? 'logs' : 'spans', column: filterColumn, value: filterValue, not: true } })}
           />
@@ -64,18 +64,19 @@
           <ActionButton
             label="Logs for this span"
             icon="↗"
-            state={unavailable ?? actions['record.logs']}
+            state={actions['record.logs']}
             onclick={() => onaction?.({ name: 'record.logs', input: { trace_id: traceId, span_id: spanId } })}
           />
         {:else if isLog && traceId}
           <ActionButton
             label="Open trace"
             icon="↗"
-            state={unavailable ?? actions['record.open']}
+            state={actions['record.open']}
             onclick={() => onaction?.({ name: 'record.open', input: { trace_id: traceId, ...(spanId ? { span_id: spanId } : {}) } })}
           />
         {/if}
       </div>
+      {/if}
     </header>
 
     <div class="tabs" role="tablist" aria-label="Record sections">
@@ -117,7 +118,7 @@
         {/if}
       {:else}
         <dl>
-          {#each data.columns as column, index (column.name)}<dt>{column.name}</dt><dd>{cellText(column.name, row[index])}</dd>{/each}
+          {#each data.columns as column, index (column.name)}<dt>{column.name}</dt><dd>{row[index] === null ? '∅' : json(row[index])}</dd>{/each}
         </dl>
       {/if}
     </div>
@@ -207,6 +208,7 @@
   }
   pre {
     margin: 0;
+    border: 1px solid var(--border);
     padding: 10px;
     border-radius: var(--r);
     background: var(--code-bg);
@@ -216,6 +218,7 @@
     overflow-wrap: anywhere;
   }
   dd pre {
+    border: 0;
     padding: 0;
     background: none;
     color: inherit;

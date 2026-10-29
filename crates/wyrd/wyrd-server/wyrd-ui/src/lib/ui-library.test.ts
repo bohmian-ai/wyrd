@@ -1274,7 +1274,7 @@ test('TASK-004: Canonical signal interactions', async () => {
     result: { state: 'populated', data: { stats: [{ stat: 'tokens', total: total(null), series: buckets }, { stat: 'cost', total: costs, series: buckets }] } }
   });
   expect(strip.container.querySelectorAll('.value')[0]).toHaveTextContent('—');
-  expect([...strip.container.querySelectorAll('.value')].slice(1).map((value) => value.textContent)).toEqual(['1.250000000000 EUR', '0.420000000000 USD']);
+  expect([...strip.container.querySelectorAll('.value')].slice(1).map((value) => value.textContent)).toEqual(['1.25 EUR', '0.42 USD']);
   strip.unmount();
 
   // FacetRail: a null value is "not set" and filters by null; values in the WHERE are pressed.
@@ -1293,7 +1293,10 @@ test('TASK-004: Canonical signal interactions', async () => {
   const openAction = vi.fn();
   const populated = { state: 'populated', data: { rows: traces, counts: { state: 'populated', data: traceCounts } } } as const;
   const list = render(RecordTable, { input: { signal: 'traces', live: true }, result: populated, onaction: openAction });
+  // Headings read as words and keep the column name, which WHERE takes, as their title.
+  expect(list.getByRole('columnheader', { name: 'Start' })).toHaveAttribute('title', 'start_time_unix_nano');
   const firstRow = list.getAllByRole('row')[1];
+  expect(firstRow.querySelector('time')).toHaveAttribute('datetime', traces.rows[0][0]);
   expect(firstRow).toHaveTextContent('2.84s');
   expect(firstRow).toHaveTextContent('error');
   expect(list.getAllByRole('row')[3]).toHaveTextContent('∅');
@@ -1336,6 +1339,10 @@ test('TASK-004: Canonical signal interactions', async () => {
   await fireEvent.click(span.getByRole('tab', { name: 'Messages' }));
   expect(span.getByRole('tabpanel')).toHaveTextContent('gen_ai.input.messages');
   span.unmount();
+  // Without a host to act, the detail offers no dead controls.
+  const passive = render(RecordDetail, { input: { traceId: TRACE, spanId: 'b9c7c989f97918e1' }, result: { state: 'populated', data: spanRow } });
+  expect(passive.queryByRole('button', { name: 'Exclude' })).toBeNull();
+  passive.unmount();
   for (const [name, input] of [
     ['facet.filter', { signal: 'traces', column: 'service_name', value: null }],
     ['trace.select', { trace_id: TRACE, span_id: 'c1d2e3f405060708' }]

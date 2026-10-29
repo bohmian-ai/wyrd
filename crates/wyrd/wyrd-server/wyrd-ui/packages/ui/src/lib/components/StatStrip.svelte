@@ -27,12 +27,14 @@
   function value(stat: Stat, cell: unknown, currency?: unknown): string | undefined {
     if (cell === null || cell === undefined) return undefined;
     if (stat === 'duration_p95') return fmtDuration(Math.round(numeric(cell) / 1e6));
-    if (stat === 'cost') return `${String(cell)} ${String(currency)}`;
+    // Decimal text, trimmed of trailing zeros but never rounded.
+    if (stat === 'cost') return `${String(cell).replace(/(\.\d*?)0+$/, '$1').replace(/\.$/, '')} ${String(currency)}`;
     return fmtNumber(numeric(cell));
   }
 </script>
 
 {#if result.state === 'populated' || result.state === 'empty'}
+  <div class="stats">
   <dl class="strip" aria-label="Totals over the range">
     {#each result.data.stats as { stat, total, series } (stat)}
       {@const values = total.rows.map((row) => value(stat, row[0], row[1])).filter((text) => text !== undefined)}
@@ -51,6 +53,7 @@
     {/each}
   </dl>
   {#if result.state === 'empty'}<p class="reason">{result.reason}</p>{/if}
+  </div>
 {:else if result.state === 'loading'}
   <EmptyState state="loading" title="Loading {input.stats.map((stat) => LABELS[stat]).join(', ')}" />
 {:else}

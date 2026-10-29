@@ -11,14 +11,40 @@
     Drawer,
     DurationBar,
     EmptyState,
+    FacetRail,
+    RecordDetail,
+    RecordTable,
     Sparkline,
+    StatStrip,
+    TraceWaterfall,
     StatusPill,
     VerdictPill,
     type ActionIntent,
     type ActionState
   } from 'wyrd-ai-ui';
   import { WyrdView } from 'wyrd-ai-ui/view';
-  import { card, day, denied, fixtureExecutor, registered, series, summary, terminal, timeseries } from '$lib/ui-fixtures';
+  import {
+    buckets,
+    card,
+    costs,
+    day,
+    denied,
+    facet,
+    fixtureExecutor,
+    LOG,
+    logRow,
+    registered,
+    series,
+    spanRow,
+    summary,
+    terminal,
+    timeseries,
+    total,
+    trace,
+    TRACE,
+    traceCounts,
+    traces
+  } from '$lib/ui-fixtures';
 
   let drawer = $state(false);
   let actions = $state<Record<string, ActionState>>({});
@@ -32,6 +58,27 @@
     }, 800);
   }
 
+  const SPAN = 'b9c7c989f97918e1';
+  const stats = [
+    { stat: 'traces', total: total(128), series: buckets },
+    { stat: 'errors', total: total(3), series: buckets },
+    { stat: 'duration_p95', total: total(2_840_000_000), series: buckets },
+    { stat: 'tokens', total: total(null), series: { ...buckets, rows: [] } },
+    { stat: 'cost', total: costs, series: buckets }
+  ] as const;
+  const facets = [
+    { column: 'service_name', values: facet },
+    { column: 'status_code', values: { ...facet, rows: [[0, 120], [2, 8]] } },
+    { column: 'gen_ai_request_model', values: { ...facet, rows: [] } }
+  ];
+  const where = [{ column: 'service_name', value: 'agent-api' }];
+  /** Holds the live list, as an open trace or a scrolled reader would. */
+  let held = $state(false);
+  let newest = $state(false);
+  const latest = $derived({
+    ...traces,
+    rows: newest ? [['2026-10-20T11:59:30.000000000+00:00', 'invoke_agent billing', 'agent-api', 1_310_000_000, 1, 'ffffffffffffffffffffffffffffffff', '1111111111111111'], ...traces.rows] : traces.rows
+  });
   const table = { ...series, terminal: terminal(4, 'degraded') };
   const versions = { state: 'populated', data: { items: [summary('1.4.2'), summary('1.4.1', 'deprecated')], truncated: true } } as const;
   /** Placed panels; edits replace the document for this visit only. */
@@ -78,6 +125,41 @@
         <Chart input={timeseries} result={{ state: 'loading' }} {actions} {onaction} />
         <Chart input={timeseries} result={{ state: 'denied', problem: denied }} {actions} {onaction} />
         <Chart input={timeseries} result={{ state: 'error', problem: { code: 'WYRD_VALA_413_QUERY_RESULT_TOO_LARGE', title: 'Query result too large' } }} {actions} {onaction} />
+      </div>
+
+      <h2>Observe</h2>
+      <div class="observe">
+        <FacetRail input={{ signal: 'traces', facets: facets.map((each) => each.column), where }} result={{ state: 'populated', data: { facets } }} {actions} {onaction} />
+        <div class="stack">
+          <StatStrip input={{ stats: stats.map((each) => each.stat) }} result={{ state: 'populated', data: { stats } }} />
+          <div class="row">
+            <label><input type="checkbox" bind:checked={held} /> Hold (trace open)</label>
+            <button type="button" class="open" onclick={() => (newest = !newest)}>{newest ? 'Drop' : 'Deliver'} a new trace</button>
+          </div>
+          <RecordTable
+            input={{ signal: 'traces', live: true }}
+            result={{ state: 'populated', data: { rows: latest, counts: { state: 'populated', data: traceCounts } } }}
+            paused={held}
+            {actions}
+            {onaction}
+          />
+          <RecordTable input={{ signal: 'spans', groupBy: 'service_name', columns: ['start_time_unix_nano', 'name', 'service_name', 'duration_nano', 'status_code'] }} result={{ state: 'populated', data: { rows: traces } }} {actions} {onaction} />
+          <RecordTable input={{ signal: 'traces' }} result={{ state: 'populated', data: { rows: traces, counts: { state: 'denied', problem: denied } } }} />
+        </div>
+      </div>
+      <div class="grid">
+        <TraceWaterfall input={{ traceId: TRACE, spanId: SPAN }} result={{ state: 'populated', data: trace }} {actions} {onaction} />
+        <RecordDetail input={{ traceId: TRACE, spanId: SPAN }} result={{ state: 'populated', data: spanRow }} {actions} {onaction} />
+        <RecordDetail input={{ log: LOG }} result={{ state: 'populated', data: logRow }} {actions} {onaction} />
+        <RecordDetail input={{ traceId: TRACE, spanId: SPAN }} result={{ state: 'populated', data: { ...spanRow, rows: [[...spanRow.rows[0].slice(0, 4), {}, [], null, null, null]] } }} />
+      </div>
+      <div class="grid">
+        <StatStrip input={{ stats: ['spans'] }} result={{ state: 'empty', data: { stats: [{ stat: 'spans', total: total(0), series: { ...buckets, rows: [] } }] }, reason: 'Nothing recorded in this range.' }} />
+        <FacetRail input={{ signal: 'logs', facets: ['severity_text'] }} result={{ state: 'loading' }} />
+        <RecordTable input={{ signal: 'logs' }} result={{ state: 'empty', data: { rows: { ...traces, rows: [] } }, reason: 'No logs match this WHERE in this range.' }} />
+        <TraceWaterfall input={{ traceId: TRACE }} result={{ state: 'empty', data: { ...trace, rows: [] }, reason: `No retained span you may read has trace_id ${TRACE}.` }} />
+        <RecordDetail input={{ traceId: TRACE, spanId: SPAN }} result={{ state: 'denied', problem: denied }} />
+        <TraceWaterfall input={{ traceId: TRACE }} result={{ state: 'error', problem: { code: 'WYRD_VALA_413_QUERY_RESULT_TOO_LARGE', title: 'Query result too large' } }} />
       </div>
 
       <h2>Primitives</h2>
@@ -142,6 +224,21 @@
   }
   .open:hover {
     background: var(--surface-hover);
+  }
+  .observe {
+    display: grid;
+    grid-template-columns: minmax(180px, 240px) minmax(0, 1fr);
+    gap: 16px;
+  }
+  .stack {
+    display: grid;
+    gap: 12px;
+    min-width: 0;
+  }
+  @media (max-width: 720px) {
+    .observe {
+      grid-template-columns: minmax(0, 1fr);
+    }
   }
   .row {
     display: flex;

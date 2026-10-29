@@ -5,7 +5,7 @@
 -->
 <script lang="ts">
   import type { ActionProps } from '../contract.js';
-  import { FACET_VALUES, type FacetRailProps } from '../loaders.js';
+  import { FACET_VALUES, STATUS_NAMES, columnLabel, type FacetRailProps } from '../loaders.js';
   import { fmtCount } from '../format.js';
   import { numeric } from '../plot.js';
   import ActionNote from './ActionNote.svelte';
@@ -23,7 +23,7 @@
   <nav class="rail" aria-label="Filter {input.signal}">
     {#each result.data.facets as { column, values } (column)}
       <section>
-        <h3>{column}</h3>
+        <h3 title={column}>{columnLabel(column)}</h3>
         {#if values.rows.length === 0}
           <p class="none">No values in this range.</p>
         {:else}
@@ -37,7 +37,7 @@
                   onclick={() =>
                     onaction?.({ name: 'facet.filter', input: { signal: input.signal, column, value: value as string | number | boolean | null } })}
                 >
-                  <span class="value" class:unset={value === null}>{value === null ? 'not set' : String(value)}</span>
+                  <span class="value" class:unset={value === null}>{value === null ? 'not set' : column === 'status_code' ? (STATUS_NAMES[Number(value)] ?? String(value)) : String(value)}</span>
                   <span class="count">{fmtCount(numeric(n))}</span>
                 </button>
               </li>
@@ -112,6 +112,7 @@
     white-space: nowrap;
   }
   .unset {
+    padding-right: 2px;
     color: var(--muted);
     font-style: italic;
   }

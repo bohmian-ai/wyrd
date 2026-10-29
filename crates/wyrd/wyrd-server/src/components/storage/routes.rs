@@ -158,6 +158,7 @@ struct PartUrlQuery {
     ),
     tag = "Storage"
 )]
+#[tracing::instrument(skip(state, caller), fields(operation = "storage.upload.part_url"))]
 async fn part_url(
     State(state): State<AppState>,
     caller: Caller,
@@ -335,6 +336,10 @@ async fn complete(
     ),
     tag = "Storage"
 )]
+#[tracing::instrument(
+    skip(state, caller, headers),
+    fields(operation = "storage.upload.abort")
+)]
 async fn abort(
     State(state): State<AppState>,
     caller: Caller,
@@ -399,6 +404,10 @@ async fn abort(
           WYRD_STORAGE_503_BACKEND_UNAVAILABLE)", body = WyrdProblem)
     ),
     tag = "Storage"
+)]
+#[tracing::instrument(
+    skip(state, caller, body),
+    fields(operation = "storage.upload.local_blob")
 )]
 async fn local_blob(
     State(state): State<AppState>,

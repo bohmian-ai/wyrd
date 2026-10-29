@@ -1221,6 +1221,7 @@ mod pg_tests {
     #[ignore = "requires the Postgres-backed Bifrost journey lane"]
     async fn file_inputs_use_shared_uploads() -> Result<(), McpJourneyError> {
         use sha2::Digest as _;
+        /// The uploaded JSON document; the `DOCUMENT_VERIFIER` fixture passes it.
         const DOCUMENT: &[u8] = br#"{"answer":1}"#;
         let server = Box::pin(WyrdTestServer::start_bound()).await?;
         let admin = server
@@ -2440,9 +2441,9 @@ mod pg_tests {
     /// retryable staging-pressure problem when the Scribe outbox has no
     /// reservable room, and nothing of either call is staged.
     ///
-    /// A one-item outbox reserves nothing, so every reserved verification
-    /// write is refused deterministically; recovery after pressure clears is
-    /// proven by the SDK journeys.
+    /// Once setup settles, the test holds the outbox's whole reservable share,
+    /// so every reserved verification write is refused deterministically;
+    /// recovery after pressure clears is proven by the HTTP journey.
     ///
     /// # Errors
     ///
@@ -2456,12 +2457,7 @@ mod pg_tests {
     #[tokio::test(flavor = "multi_thread")]
     #[ignore = "requires the Postgres-backed Bifrost journey lane"]
     async fn staging_pressure_is_retryable() -> Result<(), McpJourneyError> {
-        let server = Box::pin(
-            WyrdTestServer::builder()
-                .with_scribe_outbox_capacity_for_test(1)
-                .start_bound(),
-        )
-        .await?;
+        let server = Box::pin(WyrdTestServer::start_bound()).await?;
         let admin = server
             .bootstrap_service("mcp-pressure-admin", &["admin"])
             .await?;
@@ -2474,6 +2470,18 @@ mod pg_tests {
             .await?;
         let agent_client = connect_rooted(&server, &agent).await?;
         let offered = agent_client.list_all_tools().await?;
+        server.flush_bifrost().await?;
+        let (numerator, denominator) = wyrd_runtime::outbox::RESERVED_SHARE;
+        let capacity = wyrd_server::WyrdServerConfig::default()
+            .bifrost
+            .scribe
+            .outbox_capacity;
+        let share = server
+            .state()
+            .bifrost
+            .scribe_outbox()
+            .reserve(capacity * numerator / denominator)
+            .expect("the settled outbox admits its whole reservable share");
         for tool in [EXECUTE, ENQUEUE] {
             assert!(
                 offered.iter().any(|offered| offered.name == tool),
@@ -2490,6 +2498,7 @@ mod pg_tests {
                 "{tool} is refused as retryable staging pressure: {refused}"
             );
         }
+        drop(share);
 
         server.flush_bifrost().await?;
         let staged = rows(

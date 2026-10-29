@@ -12,6 +12,7 @@ use datafusion::execution::TaskContext;
 use datafusion::execution::session_state::SessionState;
 use datafusion::physical_optimizer::PhysicalOptimizerRule as _;
 use datafusion::physical_optimizer::filter_pushdown::FilterPushdown;
+use datafusion::physical_optimizer::projection_pushdown::ProjectionPushdown;
 use datafusion::physical_plan::{ExecutionPlan, SendableRecordBatchStream, execute_stream};
 use datafusion_proto::bytes::physical_plan_from_bytes_with_extension_codec;
 use datafusion_proto::protobuf::{
@@ -21,11 +22,13 @@ use prost::Message;
 use thiserror::Error;
 use wyrd_spec::DataTenantId;
 use wyrd_spec::vala::api::{
-    ClusterRole, ExecuteFragmentRequest, FollowerScanAssignment, OracleRoleFence, ReservationId,
-    TenantTableBinding,
+    ClusterRole, ExecuteFragmentRequest, FollowerScanAssignment, OracleRoleFence,
+    ProjectedExpression, ReservationId, TenantTableBinding,
 };
 
-use super::codec::{OraclePhysicalExtensionCodec, physical_plan_fingerprint};
+use super::codec::{
+    OraclePhysicalExtensionCodec, RemoteSourcePlaceholderExec, physical_plan_fingerprint,
+};
 use crate::catalog::layout::TimePartition;
 use crate::catalog::{BifrostCatalog, TableRef};
 use crate::contracts::ScribeError;
@@ -80,12 +83,13 @@ impl From<String> for FollowerResolutionError {
 /// A follower has to keep two schemas distinct, and returning only the plan
 /// would collapse them. `full_schema` is the authenticated catalog schema whose
 /// fingerprint must equal `assignment.schema_fingerprint`; `plan` exposes the
-/// projection of that schema by the signed ordered `assignment.required_columns`
-/// and nothing wider. Pairing them makes it impossible for a resolver to
-/// publish a narrowed plan without also naming the schema its narrowing was
-/// derived from.
+/// signed `assignment.projection` evaluated over that schema's projection by
+/// the signed ordered `assignment.required_columns`, filtered by the
+/// fragment's filter, and nothing wider. Pairing them makes it impossible for
+/// a resolver to publish a narrowed plan without also naming the schema its
+/// narrowing was derived from.
 pub struct ResolvedFollowerSource {
-    /// Role-local leaf exposing exactly the signed closure schema.
+    /// Role-local leaf exposing exactly the fragment's projection output.
     pub plan: Arc<dyn ExecutionPlan>,
     /// Complete authenticated schema the closure was projected out of.
     pub full_schema: SchemaRef,
@@ -133,13 +137,15 @@ pub trait FollowerSourceResolver: Send + Sync {
     /// and the authenticated query it belongs to.
     ///
     /// `filter` is the encoded predicate of the `FilterExec` the signed plan
-    /// places directly above this assignment's placeholder, if any. A
-    /// resolver may narrow its source by it before reading; the decoded plan
-    /// still applies the filter, so ignoring it is always correct.
+    /// places directly above this assignment's placeholder, if any. The
+    /// returned plan replaces that filter, the placeholder and the projection
+    /// above them, so it must return exactly the rows `filter` keeps,
+    /// evaluated as `assignment.projection`.
     ///
-    /// The returned plan must expose exactly the signed closure, and the
-    /// returned `full_schema` must be the authenticated schema that closure was
-    /// projected out of; `decode` revalidates both. Cancellation may discard a
+    /// The returned plan must expose exactly the projection's output over the
+    /// signed closure, and the returned `full_schema` must be the
+    /// authenticated schema that closure was projected out of; `decode`
+    /// revalidates both. Cancellation may discard a
     /// locally acquired provider; no provider is published to decode until this
     /// future returns successfully. Callers may retry only by restarting the
     /// complete authenticated follower request.
@@ -251,18 +257,18 @@ pub struct AuthenticatedFollowerContext<'a> {
 ///
 /// A signed closure can legitimately select nothing once the leader has pruned
 /// it, and that is a correct empty result rather than an error: the follower
-/// still returns a plan at the closure schema so the union above it sees the
-/// same columns every other fragment produces. A Scribe follower uses it for a
+/// still returns a plan at the fragment's output schema so the union above it
+/// sees the same columns every other fragment produces. A Scribe follower uses it for a
 /// sibling Scribe's placeholder, which this node must not read.
 ///
 /// # Errors
 /// Returns a scrubbed message when the empty in-memory source cannot be built.
 fn empty_assignment_leaf(
-    required_schema: &SchemaRef,
+    output_schema: &SchemaRef,
     full_schema: SchemaRef,
 ) -> Result<ResolvedFollowerSource, FollowerResolutionError> {
-    let batch = arrow::record_batch::RecordBatch::new_empty(Arc::clone(required_schema));
-    MemorySourceConfig::try_new_exec(&[vec![batch]], Arc::clone(required_schema), None)
+    let batch = arrow::record_batch::RecordBatch::new_empty(Arc::clone(output_schema));
+    MemorySourceConfig::try_new_exec(&[vec![batch]], Arc::clone(output_schema), None)
         .map(|plan| ResolvedFollowerSource {
             plan: plan as Arc<dyn ExecutionPlan>,
             full_schema,
@@ -425,9 +431,11 @@ impl<T> ScribeTailResolver<T> {
 }
 
 impl<T> ScribeTailResolver<T> {
-    /// Builds the Scribe follower's leaf over one opened live read.
+    /// Builds the Scribe follower's leaf over one opened live read, returning
+    /// the rows `live`'s filter keeps as its expressions, at `output_schema`.
     ///
-    /// Memtable rows are projected to the signed closure and dealt round-robin
+    /// Memtable rows arrive filtered and projected by Scribe (see
+    /// [`crate::scribe::memtable::LiveProjection`]) and are dealt round-robin
     /// across the partitions their bytes earn, at most the session's target
     /// partitions (see [`crate::scan_sizing::OraclePartitioning::scan_partitions`]), of one
     /// in-memory source. Each batch keeps the exact bounds Scribe recorded at
@@ -437,21 +445,29 @@ impl<T> ScribeTailResolver<T> {
     /// published files, through [`super::exec::PlannedFiles`]: each run carries
     /// the size, rows and `time_column` bounds staging recorded, `pruning`
     /// keeps those whose bounds may match, and the scan splits at most into
-    /// the kept runs' row groups. `DataFusion`'s Parquet scan reads them
-    /// through the node's footer and byte-range caches, so a run the pushed
+    /// the kept runs' row groups. `DataFusion`'s filter and projection
+    /// pushdown place the filter and the expressions in that scan, so it
+    /// decodes only the leaves they read. It reads the runs through the
+    /// node's footer and byte-range caches, so a run the pushed
     /// predicate excludes is never opened and a repeated query rereads no
     /// footer; the scan's files hold the staged lease until the plan drops.
     /// A read with neither rows nor runs is an in-memory source of empty
-    /// partitions at the closure schema.
+    /// partitions at the output schema.
     ///
     /// # Errors
     /// Returns [`FollowerResolutionError::Fault`] when a memtable batch does
-    /// not project to the closure, a staged run's path is not UTF-8, or a
+    /// not match the output schema, a staged run's path is not UTF-8, or a
     /// plan node cannot be built.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "one live read's closure, output and pruning, all owned by the caller"
+    )]
     fn live_leaf(
         &self,
         read: LiveTailBatches,
         required_schema: &SchemaRef,
+        live: &crate::scribe::memtable::LiveProjection,
+        output_schema: &SchemaRef,
         time_column: &str,
         pruning: Option<&crate::scan_sizing::BatchPruning>,
         assignment: &FollowerScanAssignment,
@@ -465,8 +481,8 @@ impl<T> ScribeTailResolver<T> {
                 .iter()
                 .map(|batch| {
                     Ok((
-                        super::exec::project_batch(&batch.rows, Arc::clone(required_schema))
-                            .map_err(|_| fault("Scribe memtable rows do not match the closure"))?,
+                        super::exec::project_batch(&batch.rows, Arc::clone(output_schema))
+                            .map_err(|_| fault("Scribe memtable rows do not match the output"))?,
                         Arc::clone(&batch.statistics),
                     ))
                 })
@@ -478,7 +494,7 @@ impl<T> ScribeTailResolver<T> {
                 charges.into(),
                 self.partitioning,
                 session.config().target_partitions(),
-                Arc::clone(required_schema),
+                Arc::clone(output_schema),
             )
             .map_err(|_| fault("Scribe memtable source construction failed"))?;
             leaves.push(Arc::new(DataSourceExec::new(Arc::new(source))));
@@ -487,20 +503,40 @@ impl<T> ScribeTailResolver<T> {
             let planned =
                 super::exec::PlannedFiles::staged(&runs, required_schema, time_column, pruning)
                     .ok_or_else(|| fault("Scribe staged run path is not UTF-8"))?;
-            leaves.push(
-                planned
-                    .scan(
-                        super::exec::HotObjects::Staged {
-                            storage: Arc::clone(&self.storage),
-                            lease,
-                        },
-                        assignment.binding.tenant_id,
-                        required_schema,
-                        time_column,
-                        session.config().options(),
+            let mut staged = planned
+                .scan(
+                    super::exec::HotObjects::Staged {
+                        storage: Arc::clone(&self.storage),
+                        lease,
+                    },
+                    assignment.binding.tenant_id,
+                    required_schema,
+                    time_column,
+                    session.config().options(),
+                )
+                .map_err(|_| fault("Scribe staged scan construction failed"))?;
+            if let Some(filter) = &live.filter {
+                staged = Arc::new(
+                    datafusion::physical_plan::filter::FilterExec::try_new(
+                        Arc::clone(filter),
+                        staged,
                     )
-                    .map_err(|_| fault("Scribe staged scan construction failed"))?,
+                    .map_err(|_| fault("Scribe staged filter construction failed"))?,
+                );
+            }
+            let staged = Arc::new(
+                datafusion::physical_plan::projection::ProjectionExec::try_new(
+                    live.exprs.iter().cloned(),
+                    staged,
+                )
+                .map_err(|_| fault("Scribe staged projection construction failed"))?,
             );
+            let options = session.config().options();
+            let staged = FilterPushdown::new()
+                .optimize(staged, options)
+                .and_then(|plan| ProjectionPushdown::new().optimize(plan, options))
+                .map_err(|_| fault("Scribe staged pushdown failed"))?;
+            leaves.push(staged);
         }
         match leaves.len() {
             1 => Ok(leaves.remove(0)),
@@ -654,6 +690,38 @@ where
             ));
         }
         let required_schema = signed_closure_schema(full_schema.as_ref(), assignment)?;
+        // The signed output and filter over the closure, decoded before any
+        // read: one that does not decode fails the assignment.
+        let parse = |node: &PhysicalExprNode| {
+            datafusion_proto::physical_plan::from_proto::parse_physical_expr(
+                node,
+                &session.task_ctx(),
+                &required_schema,
+                &OraclePhysicalExtensionCodec::encoder(),
+            )
+            .map_err(|_| "assignment expression does not decode over the closure".to_owned())
+        };
+        let exprs = assignment
+            .projection
+            .iter()
+            .map(|projected| {
+                let node = PhysicalExprNode::decode(projected.expression.as_slice())
+                    .map_err(|_| "assignment expression is not a physical expression".to_owned())?;
+                Ok(datafusion::physical_expr::projection::ProjectionExpr::new(
+                    parse(&node)?,
+                    projected.alias.clone(),
+                ))
+            })
+            .collect::<Result<Vec<_>, String>>()?;
+        let live = crate::scribe::memtable::LiveProjection {
+            filter: filter.map(parse).transpose()?,
+            exprs: datafusion::physical_expr::projection::ProjectionExprs::new(exprs),
+        };
+        let output_schema = Arc::new(
+            live.exprs
+                .project_schema(&required_schema)
+                .map_err(|_| "assignment projection does not plan over the closure".to_owned())?,
+        );
         let table_name = format!(
             "{}.{}",
             assignment.binding.namespace, assignment.binding.table
@@ -664,26 +732,15 @@ where
             cut.writer_epoch,
         );
         if assignment.scan_id != local_scan_id {
-            return empty_assignment_leaf(&required_schema, full_schema);
+            return empty_assignment_leaf(&output_schema, full_schema);
         }
         let start_partition = TimePartition::from_wire(cut.start_partition);
         let end_partition = TimePartition::from_wire(cut.end_partition);
-        // The signed filter over the closure. One that does not decode or
-        // plan prunes nothing: the decoded plan applies it regardless, and
-        // refuses a filter that does not decode.
-        let pruning = filter
-            .and_then(|filter| {
-                datafusion_proto::physical_plan::from_proto::parse_physical_expr(
-                    filter,
-                    &session.task_ctx(),
-                    &required_schema,
-                    &OraclePhysicalExtensionCodec::encoder(),
-                )
-                .ok()
-            })
-            .and_then(|predicate| {
-                crate::scan_sizing::BatchPruning::try_new(&required_schema, predicate)
-            });
+        // A filter that does not plan as a pruning predicate prunes nothing;
+        // the read still applies it to every row.
+        let pruning = live.filter.clone().and_then(|predicate| {
+            crate::scan_sizing::BatchPruning::try_new(&required_schema, predicate)
+        });
         let read = self
             .tail
             .open(FetchLiveTailRequest {
@@ -700,11 +757,14 @@ where
                 // plan's `Column` indices are closure indices.
                 required_fields: required_schema.fields().clone(),
                 pruning: pruning.clone(),
+                projection: Some(live.clone()),
             })
             .await?;
         let plan = self.live_leaf(
             read,
             &required_schema,
+            &live,
+            &output_schema,
             time_axis.column(),
             pruning.as_ref(),
             assignment,
@@ -814,6 +874,7 @@ where
             mut filters,
         } = self.preflight(request, &authenticated)?;
         let mut providers = HashMap::with_capacity(assignments.len());
+        let mut sources = HashMap::with_capacity(assignments.len());
         for (scan_id, assignment) in assignments {
             self.effects.resolver.fetch_add(1, Ordering::SeqCst);
             let resolved = self
@@ -827,13 +888,13 @@ where
                 )
                 .await
                 .map_err(PhysicalPlanFollowerError::Resolution)?;
-            // Two distinct schemas, checked in order. The fingerprint identifies
-            // the table's complete canonical schema, so it is checked against
-            // `full_schema`; the leaf the plan will actually read from must then
-            // expose exactly the closure derived from that same schema and the
-            // signed names. Checking only the fingerprint would admit a leaf of
-            // any width, and deriving the closure from the leaf's own schema
-            // would make the check circular.
+            // The fingerprint identifies the table's complete canonical
+            // schema, so it is checked against `full_schema`; the placeholder
+            // is then decoded at exactly the closure derived from that same
+            // schema and the signed names, and the fragment's projection over
+            // it decides the schema the source must expose. Deriving the
+            // closure from the source's own schema would make the check
+            // circular.
             let actual = super::assignment_schema_fingerprint(resolved.full_schema.as_ref());
             if actual != assignment.schema_fingerprint {
                 return Err(PhysicalPlanFollowerError::Resolution(
@@ -844,15 +905,15 @@ where
             }
             let expected = signed_closure_schema(resolved.full_schema.as_ref(), &assignment)
                 .map_err(|detail| PhysicalPlanFollowerError::Resolution(detail.into()))?;
-            if resolved.plan.schema() != expected {
-                return Err(PhysicalPlanFollowerError::Resolution(
-                    FollowerResolutionError::Fault(
-                        "resolved provider schema differs from the signed projection closure"
-                            .to_owned(),
-                    ),
-                ));
-            }
-            providers.insert(scan_id, resolved.plan);
+            providers.insert(
+                scan_id.clone(),
+                Arc::new(RemoteSourcePlaceholderExec::new(
+                    scan_id.clone(),
+                    &assignment.schema_fingerprint,
+                    expected,
+                )) as Arc<dyn ExecutionPlan>,
+            );
+            sources.insert(scan_id, resolved.plan);
         }
         // Re-read the immutable common plan after every source-resolution await.
         // This closes the same fail-closed boundary as the initial preflight:
@@ -870,7 +931,62 @@ where
         codec
             .require_complete_consumption()
             .map_err(|error| PhysicalPlanFollowerError::PostResolutionDecode(error.to_string()))?;
-        Ok(plan)
+        Self::bind_sources(plan, sources)
+            .map_err(|error| PhysicalPlanFollowerError::PostResolutionDecode(error.to_string()))
+    }
+
+    /// Replaces each scan's decoded `ProjectionExec`, its `FilterExec` and
+    /// its placeholder with the resolved source, which already filters and
+    /// projects exactly as they say.
+    ///
+    /// The decoded operators are what validate the fragment: their columns,
+    /// functions, aliases and order decode against the signed closure, and
+    /// the projection's output is the schema the source must expose. Running
+    /// them as well would apply the filter twice and read the source's output
+    /// as if it were the closure.
+    ///
+    /// # Errors
+    /// Returns a plan error when a source's schema differs from its decoded
+    /// projection's, or a placeholder is not under a projection.
+    fn bind_sources(
+        plan: Arc<dyn ExecutionPlan>,
+        mut sources: HashMap<String, Arc<dyn ExecutionPlan>>,
+    ) -> datafusion::error::Result<Arc<dyn ExecutionPlan>> {
+        use datafusion::common::tree_node::{Transformed, TreeNode as _};
+        use datafusion::physical_plan::filter::FilterExec;
+        use datafusion::physical_plan::projection::ProjectionExec;
+        let plan = plan
+            .transform_up(|node| {
+                let Some(projection) = node.downcast_ref::<ProjectionExec>() else {
+                    return Ok(Transformed::no(node));
+                };
+                let input = projection.input();
+                let input = input
+                    .downcast_ref::<FilterExec>()
+                    .map_or(input, FilterExec::input);
+                let Some(placeholder) = input.downcast_ref::<RemoteSourcePlaceholderExec>() else {
+                    return Ok(Transformed::no(node));
+                };
+                let source = sources.remove(placeholder.scan_id()).ok_or_else(|| {
+                    datafusion::error::DataFusionError::Plan(
+                        "fragment reads one scan twice".to_owned(),
+                    )
+                })?;
+                if source.schema() != node.schema() {
+                    return Err(datafusion::error::DataFusionError::Plan(
+                        "resolved source schema differs from the fragment's projection".to_owned(),
+                    ));
+                }
+                Ok(Transformed::yes(source))
+            })?
+            .data;
+        if sources.is_empty() {
+            Ok(plan)
+        } else {
+            Err(datafusion::error::DataFusionError::Plan(
+                "a fragment scan is not under its projection".to_owned(),
+            ))
+        }
     }
 
     /// Preflights, resolves, synchronously decodes, and creates one output stream.
@@ -960,6 +1076,11 @@ where
                 "assignment projection closure is empty".to_owned(),
             ));
         }
+        if assignment.projection.is_empty() {
+            return Err(PhysicalPlanFollowerError::Preflight(
+                "assignment carries no projection expressions".to_owned(),
+            ));
+        }
         let Some(cut) = assignment
             .scribe_provider_cut
             .as_ref()
@@ -1012,7 +1133,14 @@ where
             .map_err(|error| PhysicalPlanFollowerError::Preflight(error.to_string()))?;
         let mut encoded = HashMap::new();
         let mut filters = HashMap::new();
-        Self::collect_extensions(&root, None, &mut encoded, &mut filters)?;
+        let mut projections = HashMap::new();
+        Self::collect_extensions(
+            &root,
+            (None, None),
+            &mut encoded,
+            &mut filters,
+            &mut projections,
+        )?;
         let mut assignments = HashMap::with_capacity(request.assignments.len());
         for assignment in &request.assignments {
             if assignment.scan_id.is_empty()
@@ -1047,6 +1175,14 @@ where
                 "encoded scan set differs from assignments".to_owned(),
             ));
         }
+        if assignments
+            .iter()
+            .any(|(scan_id, assignment)| projections.get(scan_id) != Some(&assignment.projection))
+        {
+            return Err(PhysicalPlanFollowerError::Preflight(
+                "assignment projection differs from the fragment".to_owned(),
+            ));
+        }
         Ok(PreflightRequest {
             assignments,
             filters,
@@ -1056,24 +1192,44 @@ where
     /// Walks every child of follower-permitted native operators and leaf extensions.
     ///
     /// Each extension's scan identity is recorded in `encoded` with its schema
-    /// fingerprint, and `above`, the predicate of the `FilterExec` that is
-    /// the extension's direct parent, in `filters`.
+    /// fingerprint; `above.0`, the predicate of the `FilterExec` that is
+    /// the extension's direct parent, in `filters`; and `above.1`, the
+    /// `ProjectionExec` directly above the extension or above that filter, as
+    /// its encoded expressions and aliases in `projections`.
     ///
     /// # Errors
     /// Returns a preflight error for missing inputs, unsupported operators,
     /// malformed extensions, or duplicate scan identities.
     fn collect_extensions(
         node: &PhysicalPlanNode,
-        above: Option<&PhysicalExprNode>,
+        above: (
+            Option<&PhysicalExprNode>,
+            Option<&datafusion_proto::protobuf::ProjectionExecNode>,
+        ),
         encoded: &mut HashMap<String, String>,
         filters: &mut HashMap<String, PhysicalExprNode>,
+        projections: &mut HashMap<String, Vec<ProjectedExpression>>,
     ) -> Result<(), PhysicalPlanFollowerError> {
         let children: Vec<&PhysicalPlanNode> = match node.physical_plan_type.as_ref() {
             Some(PhysicalPlanType::Extension(extension)) => {
                 let payload = OraclePhysicalExtensionCodec::preflight_extension(&extension.node)
                     .map_err(|error| PhysicalPlanFollowerError::Preflight(error.to_string()))?;
-                if let Some(above) = above {
-                    filters.insert(payload.scan_id.clone(), above.clone());
+                if let Some(filter) = above.0 {
+                    filters.insert(payload.scan_id.clone(), filter.clone());
+                }
+                if let Some(projection) = above.1 {
+                    projections.insert(
+                        payload.scan_id.clone(),
+                        projection
+                            .expr
+                            .iter()
+                            .zip(&projection.expr_name)
+                            .map(|(expression, alias)| ProjectedExpression {
+                                expression: expression.encode_to_vec(),
+                                alias: alias.clone(),
+                            })
+                            .collect(),
+                    );
                 }
                 if !extension.inputs.is_empty()
                     || payload.scan_id.is_empty()
@@ -1136,11 +1292,12 @@ where
             ));
         }
         let above = match node.physical_plan_type.as_ref() {
-            Some(PhysicalPlanType::Filter(filter)) => filter.expr.as_ref(),
-            _ => None,
+            Some(PhysicalPlanType::Filter(filter)) => (filter.expr.as_ref(), above.1),
+            Some(PhysicalPlanType::Projection(projection)) => (None, Some(projection.as_ref())),
+            _ => (None, None),
         };
         for child in children {
-            Self::collect_extensions(child, above, encoded, filters)?;
+            Self::collect_extensions(child, above, encoded, filters, projections)?;
         }
         Ok(())
     }
@@ -1287,6 +1444,73 @@ pub(crate) mod tests {
         )
     }
 
+    /// Encodes the identity projection a leader signs over `closure` when its
+    /// live leaf absorbed no projection: each closure column, by name.
+    ///
+    /// # Panics
+    /// Panics when the projection cannot be encoded.
+    pub(crate) fn identity_projection(closure: &[String]) -> Vec<ProjectedExpression> {
+        let schema = Arc::new(Schema::new(
+            closure
+                .iter()
+                .map(|name| Field::new(name, DataType::Int64, true))
+                .collect::<Vec<_>>(),
+        ));
+        signed_projection(projected(Arc::new(
+            datafusion::physical_plan::empty::EmptyExec::new(schema),
+        )))
+    }
+
+    /// Encodes the projection of the `ProjectionExec` `plan` as a leader
+    /// signs it into an assignment.
+    ///
+    /// # Panics
+    /// Panics when `plan` is not a projection or cannot be encoded.
+    fn signed_projection(plan: Arc<dyn ExecutionPlan>) -> Vec<ProjectedExpression> {
+        let bytes = physical_plan_to_bytes_with_extension_codec(
+            plan,
+            &OraclePhysicalExtensionCodec::encoder(),
+        )
+        .expect("projection encodes");
+        let Some(PhysicalPlanType::Projection(projection)) =
+            PhysicalPlanNode::decode(bytes.as_ref())
+                .expect("projection decodes")
+                .physical_plan_type
+        else {
+            panic!("the encoded root is the projection");
+        };
+        projection
+            .expr
+            .iter()
+            .zip(projection.expr_name)
+            .map(|(expression, alias)| ProjectedExpression {
+                expression: expression.encode_to_vec(),
+                alias,
+            })
+            .collect()
+    }
+
+    /// Places the identity projection over `plan`, as a leader's live
+    /// fragment places its leaf's projection.
+    ///
+    /// # Panics
+    /// Panics when the projection cannot be planned.
+    pub(crate) fn projected(plan: Arc<dyn ExecutionPlan>) -> Arc<dyn ExecutionPlan> {
+        let schema = plan.schema();
+        Arc::new(
+            datafusion::physical_plan::projection::ProjectionExec::try_new(
+                datafusion::physical_expr::projection::ProjectionExprs::from_indices(
+                    &(0..schema.fields().len()).collect::<Vec<_>>(),
+                    &schema,
+                )
+                .iter()
+                .cloned(),
+                plan,
+            )
+            .expect("identity projection plans"),
+        )
+    }
+
     /// Resolver whose call counter proves the complete preflight gate precedes IO.
     #[derive(Debug)]
     struct CountingResolver {
@@ -1381,27 +1605,33 @@ pub(crate) mod tests {
             schema,
         ));
         let bytes = physical_plan_to_bytes_with_extension_codec(
-            Arc::new(
+            projected(Arc::new(
                 datafusion::physical_plan::filter::FilterExec::try_new(predicate, placeholder)
                     .expect("filter over the placeholder"),
-            ),
+            )),
             &OraclePhysicalExtensionCodec::encoder(),
         )
         .expect("encoded plan");
         let root = PhysicalPlanNode::decode(bytes.as_ref()).expect("decoded plan node");
         let mut encoded = HashMap::new();
         let mut filters = HashMap::new();
+        let mut projections = HashMap::new();
 
         PhysicalPlanFollower::<CountingResolver>::collect_extensions(
             &root,
-            None,
+            (None, None),
             &mut encoded,
             &mut filters,
+            &mut projections,
         )
         .expect("preflight accepts the filtered placeholder");
 
         assert!(encoded.contains_key("scan"));
         assert!(filters.contains_key("scan"));
+        assert_eq!(
+            projections.get("scan"),
+            Some(&identity_projection(&["value".to_owned()]))
+        );
     }
 
     /// Creates one valid Scribe-role request and its exact authenticated facts.
@@ -1424,11 +1654,11 @@ pub(crate) mod tests {
         )]));
         let fingerprint = super::super::assignment_schema_fingerprint(schema.as_ref());
         let bytes = physical_plan_to_bytes_with_extension_codec(
-            Arc::new(RemoteSourcePlaceholderExec::new(
+            projected(Arc::new(RemoteSourcePlaceholderExec::new(
                 "scan",
                 &fingerprint,
                 schema,
-            )),
+            ))),
             &OraclePhysicalExtensionCodec::encoder(),
         )?
         .to_vec();
@@ -1457,6 +1687,7 @@ pub(crate) mod tests {
                     scribe_provider_cut: Some(cut()),
                     schema_fingerprint: fingerprint,
                     required_columns: vec!["value".to_owned()],
+                    projection: identity_projection(&["value".to_owned()]),
                 }],
                 plan_fingerprint: physical_plan_fingerprint(&bytes),
             },
@@ -1517,6 +1748,7 @@ pub(crate) mod tests {
             scribe_provider_cut: Some(cut()),
             schema_fingerprint: fingerprint.clone(),
             required_columns: vec!["event_time".to_owned()],
+            projection: identity_projection(&["event_time".to_owned()]),
         };
         let session = SessionContext::new_with_config(
             crate::resources::OracleSessionShape::for_test().session_config(),
@@ -1604,6 +1836,7 @@ pub(crate) mod tests {
             scribe_provider_cut: Some(cut()),
             schema_fingerprint: super::super::assignment_schema_fingerprint(schema.as_ref()),
             required_columns: vec!["event_time".to_owned()],
+            projection: identity_projection(&["event_time".to_owned()]),
         };
         let session = SessionContext::new_with_config(
             crate::resources::OracleSessionShape::for_test().session_config(),
@@ -1717,6 +1950,7 @@ pub(crate) mod tests {
             scribe_provider_cut: cut.then(self::cut),
             schema_fingerprint: "shape".to_owned(),
             required_columns: vec!["event_time".to_owned()],
+            projection: identity_projection(&["event_time".to_owned()]),
         };
 
         require_scannable_work(&[assignment(true)]).expect("scannable fragment");
@@ -1959,6 +2193,7 @@ pub(crate) mod tests {
                         // closure, so this fixture names the single column its
                         // memtable schema actually carries.
                         required_columns: vec!["event_time".to_owned()],
+                        projection: identity_projection(&["event_time".to_owned()]),
                     },
                 )
                 .await,
@@ -2066,6 +2301,7 @@ pub(crate) mod tests {
             binding,
             scribe_provider_cut: Some(cut()),
             schema_fingerprint,
+            projection: identity_projection(&required_columns),
             required_columns,
         }
     }
@@ -2422,15 +2658,33 @@ pub(crate) mod tests {
         service: Arc<FetchLiveTailService>,
         session: &SessionState,
     ) -> (Arc<dyn ExecutionPlan>, uuid::Uuid) {
-        fixture
-            .memtable
-            .complete_staged(fixture.generation.get(), fixture.member)
-            .expect("the shard marks the generation durable");
         let schema = Arc::new(Schema::new(vec![Field::new(
             "value",
             DataType::Int64,
             false,
         )]));
+        let closure = vec!["value".to_owned()];
+        let projection = identity_projection(&closure);
+        resolve_staged_projection(fixture, service, session, schema, closure, projection).await
+    }
+
+    /// Resolves the Scribe leaf of `fixture`'s staged generation, over the
+    /// table `schema`, reading `projection` over the closure `required_columns`.
+    ///
+    /// # Panics
+    /// Panics when the fixture cannot be marked durable or resolution fails.
+    async fn resolve_staged_projection(
+        fixture: &StagedGenerationFixture,
+        service: Arc<FetchLiveTailService>,
+        session: &SessionState,
+        schema: SchemaRef,
+        required_columns: Vec<String>,
+        projection: Vec<ProjectedExpression>,
+    ) -> (Arc<dyn ExecutionPlan>, uuid::Uuid) {
+        fixture
+            .memtable
+            .complete_staged(fixture.generation.get(), fixture.member)
+            .expect("the shard marks the generation durable");
         let stream = service.stream();
         let binding = TenantTableBinding {
             tenant_id: fixture.key.tenant,
@@ -2457,7 +2711,8 @@ pub(crate) mod tests {
                 capture_id: request.capture_id,
             }),
             schema_fingerprint: super::super::assignment_schema_fingerprint(schema.as_ref()),
-            required_columns: vec!["value".to_owned()],
+            required_columns,
+            projection,
         };
         let plan = resolver
             .resolve(
@@ -2542,6 +2797,217 @@ pub(crate) mod tests {
         assert_eq!(
             stats.row_groups_pruned, 2,
             "the other row groups are skipped"
+        );
+    }
+
+    /// A scalar Variant read reads only its shredded leaves from a staged
+    /// run and rebuilds no whole Variant from memory.
+    ///
+    /// The generation `{"a": .., "b": ..}` is staged in the layout a sample
+    /// learns, which shreds `a` and `b`, and a later generation holds the same
+    /// rows shredded in memory. `attrs ->> 'a'`, signed as the assignment's
+    /// projection, decodes only `attrs.metadata` and the `a` subtree of the
+    /// run, never `b` or the residual, and evaluates over the memory rows'
+    /// physical leaves with no reconstruction; both return each row's `a`.
+    ///
+    /// # Panics
+    /// Panics when resolution or execution fails, the run decodes other
+    /// leaves, memory reconstructs a Variant, or a value differs.
+    #[tokio::test]
+    async fn live_projection_reads_shredded_leaves_without_whole_variants() {
+        use datafusion::common::tree_node::{TreeNode as _, TreeNodeRecursion};
+        use datafusion::datasource::physical_plan::{
+            FileScanConfig, FileSource as _, ParquetSource,
+        };
+
+        let text: arrow::array::ArrayRef = Arc::new(StringArray::from(vec![
+            r#"{"a":"x","b":1}"#,
+            r#"{"a":"y","b":2}"#,
+            r#"{"a":"z","b":3}"#,
+        ]));
+        let attrs = arrow::compute::cast(
+            &arrow::array::ArrayRef::from(
+                parquet_variant_compute::json_to_variant(&text).expect("valid JSON"),
+            ),
+            &wyrd_types::variant::variant_storage_type(),
+        )
+        .expect("Variant storage casts to the stored shape");
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("value", DataType::Int64, false),
+            wyrd_types::variant::variant_field("attrs", true),
+        ]));
+        let rows = arrow::record_batch::RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![Arc::new(Int64Array::from(vec![1_i64, 2, 3])), attrs],
+        )
+        .expect("logical rows");
+        let mut sampler = iceberg::writer::file_writer::variant_shredding::VariantSampler::new(
+            &schema,
+            crate::parquet::writer_properties::BIFROST_VARIANT_SHREDDING,
+            0,
+            &[rows.num_rows()],
+        );
+        sampler
+            .offer(&rows, &vec![0; rows.num_rows()], 0)
+            .expect("sample offer");
+        let layout = sampler.layout();
+        let shredded = layout.shred(&rows).expect("rows shred");
+        let fixture =
+            crate::scribe::tail_rpc::tests::staged_generation_fixture_of(&rows, &shredded, 1);
+        let resources = crate::resources::ScribeResources::for_test();
+        let key = (
+            fixture.key.tenant,
+            fixture.key.table.clone(),
+            fixture.key.table_version,
+        );
+        resources
+            .variant_layouts()
+            .install(&resources, key.clone(), Arc::clone(&schema), layout);
+        let learned = resources
+            .variant_layouts()
+            .get(key.0, &key.1, key.2)
+            .expect("the layout is learned");
+        fixture
+            .memtable
+            .insert_with_layout(
+                &fixture.key,
+                ScribeAppendMeta {
+                    batch_id: *uuid::Uuid::now_v7().as_bytes(),
+                    schema_fingerprint: [0; 32],
+                    data_digest: [0; 32],
+                    data_len: 0,
+                    payload_digest: [0; 32],
+                    payload_len: 0,
+                    slice_index: 0,
+                    slice_count: 1,
+                    rows_accepted: rows.num_rows(),
+                    wal_lsn_min: WalLsn::new(2),
+                    wal_lsn_max: WalLsn::new(2),
+                    seal_key: fixture.key.to_string(),
+                },
+                shredded,
+                Some(learned),
+            )
+            .expect("shredded memory rows insert");
+
+        let closure = vec!["attrs".to_owned()];
+        let closure_schema = signed_closure_schema(
+            schema.as_ref(),
+            &FollowerScanAssignment {
+                scan_id: String::new(),
+                binding: closure_fixture_binding(fixture.key.tenant),
+                scribe_provider_cut: None,
+                schema_fingerprint: String::new(),
+                required_columns: closure.clone(),
+                projection: Vec::new(),
+            },
+        )
+        .expect("closure resolves");
+        let text_of_a = SessionContext::new()
+            .create_physical_expr(
+                datafusion::functions_variant::VARIANT_GET_TEXT.call(vec![
+                    datafusion::prelude::col("attrs"),
+                    datafusion::prelude::lit("a"),
+                ]),
+                &datafusion::common::DFSchema::try_from(Arc::clone(&closure_schema))
+                    .expect("closure schema"),
+            )
+            .expect("attrs ->> 'a' plans");
+        let projection = signed_projection(Arc::new(
+            datafusion::physical_plan::projection::ProjectionExec::try_new(
+                [datafusion::physical_expr::projection::ProjectionExpr::new(
+                    text_of_a,
+                    "a".to_owned(),
+                )],
+                Arc::new(datafusion::physical_plan::empty::EmptyExec::new(
+                    Arc::clone(&closure_schema),
+                )),
+            )
+            .expect("projection plans"),
+        ));
+        let session = SessionContext::new_with_config(
+            crate::resources::OracleSessionShape::for_test().session_config(),
+        )
+        .state();
+        // The capture reads memory as the leaf resolves.
+        let before =
+            crate::schema::VARIANT_RECONSTRUCTIONS.load(std::sync::atomic::Ordering::SeqCst);
+        let (plan, _) = resolve_staged_projection(
+            &fixture,
+            Arc::clone(&fixture.service),
+            &session,
+            Arc::clone(&schema),
+            closure,
+            projection,
+        )
+        .await;
+
+        let run = std::fs::read(fixture.directory.path().join("run-copy-0.parquet"))
+            .map(bytes::Bytes::from)
+            .expect("staged run reads");
+        let reader = parquet::arrow::arrow_reader::ArrowReaderMetadata::load(
+            &run,
+            parquet::arrow::arrow_reader::ArrowReaderOptions::new(),
+        )
+        .expect("valid footer");
+        let mut leaves = Vec::new();
+        plan.apply(|node| {
+            if let Some(source) = node
+                .downcast_ref::<DataSourceExec>()
+                .and_then(|exec| exec.data_source().downcast_ref::<FileScanConfig>())
+                .and_then(|config| config.file_source().downcast_ref::<ParquetSource>())
+            {
+                let file_plan = super::super::nested_pushdown::FileReadPlan::new(
+                    &reader,
+                    &closure_schema,
+                    source.projection().cloned().expect("the scan is projected"),
+                    source.filter(),
+                    20,
+                )
+                .expect("per-file plan");
+                leaves.push(super::super::nested_pushdown::tests::decoded_leaves(
+                    &run, &file_plan,
+                ));
+            }
+            Ok(TreeNodeRecursion::Continue)
+        })
+        .expect("plan walks");
+        assert_eq!(
+            leaves,
+            [[
+                "attrs.metadata",
+                "attrs.typed_value.a.value",
+                "attrs.typed_value.a.typed_value",
+            ]],
+            "the staged run decodes only the key's leaves"
+        );
+
+        let batches = collect(plan, Arc::new(TaskContext::default()))
+            .await
+            .expect("the live read executes");
+        assert_eq!(
+            crate::schema::VARIANT_RECONSTRUCTIONS.load(std::sync::atomic::Ordering::SeqCst),
+            before,
+            "no whole Variant is rebuilt"
+        );
+        let mut values = batches
+            .iter()
+            .flat_map(|batch| {
+                let text =
+                    arrow::compute::cast(batch.column(0), &DataType::Utf8).expect("text casts");
+                text.as_any()
+                    .downcast_ref::<StringArray>()
+                    .expect("Utf8 text")
+                    .iter()
+                    .map(|value| value.map(str::to_owned))
+                    .collect::<Vec<_>>()
+            })
+            .collect::<Vec<_>>();
+        values.sort();
+        assert_eq!(
+            values,
+            ["x", "x", "y", "y", "z", "z"].map(|value| Some(value.to_owned())),
+            "memory and the staged run each return every row's `a`"
         );
     }
 
@@ -2771,7 +3237,7 @@ pub(crate) mod tests {
         let first = PhysicalPlanNode::decode(request.physical_plan_bytes.as_slice())
             .expect("first extension decodes");
         let second_bytes = physical_plan_to_bytes_with_extension_codec(
-            Arc::new(RemoteSourcePlaceholderExec::new(
+            projected(Arc::new(RemoteSourcePlaceholderExec::new(
                 "scan-two",
                 &request.assignments[0].schema_fingerprint,
                 Arc::new(Schema::new(vec![Field::new(
@@ -2779,7 +3245,7 @@ pub(crate) mod tests {
                     DataType::Int64,
                     true,
                 )])),
-            )),
+            ))),
             &OraclePhysicalExtensionCodec::encoder(),
         )
         .expect("second extension encodes");
@@ -2821,5 +3287,139 @@ pub(crate) mod tests {
         }
         assert_eq!(calls.load(Ordering::SeqCst), 0);
         assert_eq!(follower.effect_counts(), (0, 0, 0, 0));
+    }
+
+    /// A projection the fragment and its assignment do not agree on, or that
+    /// does not decode over the signed closure, fails before any source IO.
+    ///
+    /// An empty, re-aliased, altered, extended or fragment-less projection is
+    /// refused by preflight, before the resolver is called. A projection both
+    /// sides agree on but whose column lies outside the closure is refused by
+    /// the Scribe resolver before it opens the live tail.
+    ///
+    /// # Panics
+    /// Panics when a tampered request decodes, reaches the resolver, or the
+    /// out-of-closure projection reaches the tail.
+    #[tokio::test]
+    async fn live_projection_mismatch_fails_before_source_io() {
+        let (request, binding) = scribe_request().expect("valid Scribe request");
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "value",
+            DataType::Int64,
+            true,
+        )]));
+        let calls = Arc::new(AtomicUsize::new(0));
+        let follower = PhysicalPlanFollower::new(CountingResolver {
+            calls: Arc::clone(&calls),
+            schema: Arc::clone(&schema),
+        });
+        let mut cases = Vec::new();
+        let mut case = request.clone();
+        case.assignments[0].projection.clear();
+        cases.push(case);
+        let mut case = request.clone();
+        case.assignments[0].projection[0].alias = "other".to_owned();
+        cases.push(case);
+        let mut case = request.clone();
+        case.assignments[0].projection[0].expression.push(0);
+        cases.push(case);
+        let mut case = request.clone();
+        let extra = case.assignments[0].projection[0].clone();
+        case.assignments[0].projection.push(extra);
+        cases.push(case);
+        let mut case = request.clone();
+        case.physical_plan_bytes = physical_plan_to_bytes_with_extension_codec(
+            Arc::new(RemoteSourcePlaceholderExec::new(
+                "scan",
+                &request.assignments[0].schema_fingerprint,
+                Arc::clone(&schema),
+            )),
+            &OraclePhysicalExtensionCodec::encoder(),
+        )
+        .expect("bare placeholder encodes")
+        .to_vec();
+        case.plan_fingerprint = physical_plan_fingerprint(&case.physical_plan_bytes);
+        cases.push(case);
+        for case in &cases {
+            let state = SessionStateBuilder::new().with_default_features().build();
+            assert!(
+                follower
+                    .decode(
+                        case,
+                        authenticated(case, &binding),
+                        &state,
+                        &TaskContext::default()
+                    )
+                    .await
+                    .is_err()
+            );
+        }
+        assert_eq!(calls.load(Ordering::SeqCst), 0, "no tampered case resolves");
+
+        let requests = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let stream = StreamIdentity::new(
+            crate::scribe::stream_identity::NodeId::new(uuid::Uuid::from_u128(11)),
+            WriterEpoch::new(2),
+        );
+        let event_time = Arc::new(Schema::new(vec![Field::new(
+            "event_time",
+            DataType::Utf8,
+            true,
+        )]));
+        let resolver = ScribeTailResolver::with_schema(
+            Arc::new(RecordingTail {
+                stream,
+                requests: Arc::clone(&requests),
+                batches: Vec::new(),
+            }),
+            Arc::clone(&event_time),
+        );
+        let mut projection = identity_projection(&["event_time".to_owned()]);
+        let mut node = PhysicalExprNode::decode(projection[0].expression.as_slice())
+            .expect("identity expression decodes");
+        let Some(datafusion_proto::protobuf::physical_expr_node::ExprType::Column(column)) =
+            node.expr_type.as_mut()
+        else {
+            panic!("the identity expression is a column");
+        };
+        column.index = 5;
+        projection[0].expression = node.encode_to_vec();
+        let wire = TenantTableBinding {
+            tenant_id: binding.tenant_id,
+            namespace: "bifrost.logs".to_owned(),
+            table: "records".to_owned(),
+        };
+        let assignment = FollowerScanAssignment {
+            scan_id: local_scribe_scan_id(&wire, stream),
+            binding: wire,
+            scribe_provider_cut: Some(cut()),
+            schema_fingerprint: super::super::assignment_schema_fingerprint(event_time.as_ref()),
+            required_columns: vec!["event_time".to_owned()],
+            projection,
+        };
+        let session = SessionContext::new_with_config(
+            crate::resources::OracleSessionShape::for_test().session_config(),
+        )
+        .state();
+        assert!(
+            resolver
+                .resolve(
+                    ClusterRole::Scribe,
+                    test_query_id(),
+                    &assignment,
+                    None,
+                    &session
+                )
+                .await
+                .is_err(),
+            "a column outside the closure does not decode"
+        );
+        assert!(
+            requests
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .is_empty(),
+            "the refused projection never reaches the tail"
+        );
     }
 }

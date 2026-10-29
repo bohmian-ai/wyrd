@@ -378,6 +378,10 @@ pub struct FetchLiveTailRequest {
     /// The query's filter planned over `required_fields`, which Scribe prunes
     /// memory batches by before projecting them; `None` keeps every batch.
     pub pruning: Option<crate::scan_sizing::BatchPruning>,
+    /// The fragment's filter and output expressions over `required_fields`,
+    /// which Scribe applies to memory batches on their physical columns;
+    /// `None` returns the required fields themselves.
+    pub projection: Option<crate::scribe::memtable::LiveProjection>,
 }
 
 /// One shallow, structural hot snapshot returned by a shard owner.
@@ -963,6 +967,7 @@ impl FetchLiveTailService {
             &(request.start_partition..=request.end_partition),
             &request.required_fields,
             request.pruning.as_ref(),
+            request.projection.as_ref(),
         )?;
         Ok(LiveTailBatches {
             memtable: read
@@ -1382,6 +1387,29 @@ pub(crate) mod tests {
     /// # Panics
     /// Panics when any fixture step fails.
     pub(crate) fn staged_generation_fixture_with_runs(runs: usize) -> StagedGenerationFixture {
+        let rows = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![Field::new(
+                "value",
+                DataType::Int64,
+                false,
+            )])),
+            vec![Arc::new(Int64Array::from(vec![1_i64, 2, 3]))],
+        )
+        .expect("fixture batch");
+        staged_generation_fixture_of(&rows, &rows, runs)
+    }
+
+    /// Builds a [`StagedGenerationFixture`] whose generation holds the
+    /// logical `rows` and is staged as `runs` identical runs of `staged`,
+    /// those rows in the run's physical layout, one row group per row.
+    ///
+    /// # Panics
+    /// Panics when any fixture step fails.
+    pub(crate) fn staged_generation_fixture_of(
+        rows: &RecordBatch,
+        staged: &RecordBatch,
+        runs: usize,
+    ) -> StagedGenerationFixture {
         use crate::catalog::TableRef;
         use crate::scribe::assembly::StagedMemberId;
         use crate::scribe::hot_source::{HotAuthority, ScribeHotSourceRegistry};
@@ -1394,16 +1422,6 @@ pub(crate) mod tests {
         let stream = StreamIdentity::new(NodeId::generate(), WriterEpoch::new(1));
         let table = TableRef::new(crate::namespaces::BifrostNamespace::Bifrost, "events");
         let key = SealKey::new(tenant, table.clone(), day);
-        let schema = Arc::new(Schema::new(vec![Field::new(
-            "value",
-            DataType::Int64,
-            false,
-        )]));
-        let rows = RecordBatch::try_new(
-            Arc::clone(&schema),
-            vec![Arc::new(Int64Array::from(vec![1_i64, 2, 3]))],
-        )
-        .expect("fixture batch");
         let registry = Arc::new(ScribeHotSourceRegistry::new());
         let memtable = Arc::new(Memtable::new().with_hot_sources(0, Arc::clone(&registry)));
         memtable
@@ -1418,7 +1436,7 @@ pub(crate) mod tests {
                     payload_len: 0,
                     slice_index: 0,
                     slice_count: 1,
-                    rows_accepted: 3,
+                    rows_accepted: rows.num_rows(),
                     wal_lsn_min: WalLsn::new(1),
                     wal_lsn_max: WalLsn::new(1),
                     seal_key: key.to_string(),
@@ -1435,7 +1453,7 @@ pub(crate) mod tests {
         };
 
         let directory = tempfile::tempdir().expect("staged run directory");
-        let run = write_staged_run(directory.path(), schema, &rows, tenant);
+        let run = write_staged_run(directory.path(), staged.schema(), staged, tenant);
         let runs = (0..runs)
             .map(|index| {
                 let copy = directory.path().join(format!("run-copy-{index}.parquet"));
@@ -1467,13 +1485,14 @@ pub(crate) mod tests {
             super::TenantTableBinding::resolve((tenant, table)).expect("fixture binding resolves");
         let request = super::FetchLiveTailRequest {
             pruning: None,
+            projection: None,
             binding,
             target_stream: stream,
             query_id: uuid::Uuid::new_v4(),
             capture_id: uuid::Uuid::nil(),
             start_partition: day,
             end_partition: day,
-            required_fields: named_fields(["value"]),
+            required_fields: rows.schema().fields().clone(),
         };
         StagedGenerationFixture {
             service,
@@ -1591,6 +1610,7 @@ pub(crate) mod tests {
             super::TenantTableBinding::resolve((tenant, table)).expect("fixture binding resolves");
         let request = super::FetchLiveTailRequest {
             pruning: None,
+            projection: None,
             binding,
             target_stream: stream,
             query_id: uuid::Uuid::new_v4(),

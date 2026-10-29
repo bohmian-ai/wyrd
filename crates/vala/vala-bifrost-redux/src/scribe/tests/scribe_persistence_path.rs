@@ -387,6 +387,7 @@ async fn canonical_nested_batches_share_one_managed_wal_path() {
         &scribe,
         &FetchLiveTailRequest {
             pruning: None,
+            projection: None,
             binding,
             target_stream: StreamIdentity::new(NodeId::new(Uuid::nil()), WriterEpoch::new(1)),
             start_partition: day,
@@ -552,6 +553,7 @@ async fn assert_producer_rows_share_the_wal_path(scribe: &ScribeImpl, tenant: Da
         scribe,
         &FetchLiveTailRequest {
             pruning: None,
+            projection: None,
             binding: TenantTableBinding::resolve((tenant, table)).expect("binding"),
             target_stream: StreamIdentity::new(NodeId::new(Uuid::nil()), WriterEpoch::new(1)),
             start_partition: day,
@@ -665,6 +667,7 @@ async fn production_shard_snapshot_serves_exact_projection_and_lsn_range() {
     let (start_partition, end_partition) = receipt_hours(since, chrono::Duration::zero());
     let request = FetchLiveTailRequest {
         pruning: None,
+        projection: None,
         binding,
         target_stream: stream,
         start_partition,
@@ -788,6 +791,7 @@ fn value_read(
 ) -> FetchLiveTailRequest {
     FetchLiveTailRequest {
         pruning: None,
+        projection: None,
         binding: TenantTableBinding::resolve((tenant, table.clone())).expect("tail binding"),
         target_stream: stream,
         start_partition,

@@ -2061,6 +2061,9 @@ mod tests {
                 // never exercise object storage.
                 schema_fingerprint: "0".repeat(64),
                 required_columns: vec!["value".to_owned()],
+                projection: crate::oracle::follower::tests::identity_projection(&[
+                    "value".to_owned()
+                ]),
             }],
             binding,
             target_role: ClusterRole::Oracle,

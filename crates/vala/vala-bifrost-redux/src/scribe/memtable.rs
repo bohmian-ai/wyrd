@@ -974,7 +974,7 @@ impl Memtable {
     ) -> Result<Vec<ReadableBatch>, ScribeError> {
         let mut batches = Vec::new();
         for source in self.readable_sources(tenant, table, partitions)? {
-            source.project(required, None, &mut batches)?;
+            source.project(required, None, None, &mut batches)?;
         }
         Ok(batches)
     }
@@ -1961,7 +1961,8 @@ impl LiveCapture {
     }
 
     /// Reads one partition range of the capture: its memory batches `pruning`
-    /// keeps, projected to `required`, the accounting owners of those
+    /// keeps, projected to `required` or, with `live`, filtered and evaluated
+    /// as [`LiveProjection`] says, the accounting owners of those
     /// batches, its staged runs in merge order with the size and footer
     /// staging recorded for each, and the lease that keeps those runs on disk.
     ///
@@ -1985,6 +1986,7 @@ impl LiveCapture {
         partitions: &std::ops::RangeInclusive<crate::catalog::layout::TimePartition>,
         required: &[FieldRef],
         pruning: Option<&crate::scan_sizing::BatchPruning>,
+        live: Option<&LiveProjection>,
     ) -> Result<CapturedRead, ScribeError> {
         let in_range: Vec<&ReadableSource> = self
             .memory
@@ -1997,7 +1999,7 @@ impl LiveCapture {
             Vec::with_capacity(in_range.iter().map(|source| source.batch_count()).sum());
         let mut charges = Vec::with_capacity(in_range.len());
         for source in in_range {
-            source.project(required, pruning, &mut batches)?;
+            source.project(required, pruning, live, &mut batches)?;
             charges.push(Arc::clone(&source.charge));
         }
         let runs = self
@@ -2029,6 +2031,52 @@ thread_local! {
 #[cfg(test)]
 pub(crate) fn on_capture_selected_for_test(hook: Box<dyn FnOnce()>) {
     CAPTURE_SELECTED.with(|slot| *slot.borrow_mut() = Some(hook));
+}
+
+/// The rows a live read returns and the values it returns of them.
+///
+/// Both are planned over the read's required fields. A read given one filters
+/// every kept memory batch exactly by `filter` and returns only `exprs`, each
+/// evaluated on the batch's physical columns, so a scalar read of a shredded
+/// Variant reads its typed leaves and never reconstructs the whole value; an
+/// expression that is a bare column is reconstructed as a whole read is.
+#[derive(Debug, Clone)]
+pub struct LiveProjection {
+    /// Predicate every returned row satisfies, or `None` to keep every row.
+    pub filter: Option<Arc<dyn datafusion::physical_expr::PhysicalExpr>>,
+    /// Output expressions, in output order.
+    pub exprs: datafusion::physical_expr::projection::ProjectionExprs,
+}
+
+impl LiveProjection {
+    /// Rewrites the filter and expressions from `logical` onto one batch's
+    /// `physical` layout with `DataFusion`'s default expression adapter.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ScribeError::Internal`] when an expression does not adapt.
+    fn adapted(&self, logical: &SchemaRef, physical: SchemaRef) -> Result<Self, ScribeError> {
+        use datafusion::physical_expr_adapter::PhysicalExprAdapterFactory as _;
+        let failed = |error: datafusion::error::DataFusionError| ScribeError::Internal {
+            detail: format!("live-tail projection does not adapt: {error}"),
+        };
+        let adapter = datafusion::physical_expr_adapter::DefaultPhysicalExprAdapterFactory
+            .create(Arc::clone(logical), physical)
+            .map_err(failed)?;
+        Ok(Self {
+            filter: self
+                .filter
+                .as_ref()
+                .map(|filter| adapter.rewrite(Arc::clone(filter)))
+                .transpose()
+                .map_err(failed)?,
+            exprs: self
+                .exprs
+                .clone()
+                .try_map_exprs(|expr| adapter.rewrite(expr))
+                .map_err(failed)?,
+        })
+    }
 }
 
 /// One partition range read from a [`LiveCapture`].
@@ -2211,16 +2259,22 @@ impl ReadableSource {
     /// batch's bounds become inexact. A predicate that does not adapt or
     /// evaluate filters nothing here; the query's own filter still runs.
     ///
+    /// With `live`, a kept batch is instead filtered exactly by its filter and
+    /// emitted as its expressions, evaluated on the physical columns (see
+    /// [`LiveProjection`]), with bounds computed from the emitted rows.
+    ///
     /// [`DefaultPhysicalExprAdapterFactory`]: datafusion::physical_expr_adapter::DefaultPhysicalExprAdapterFactory
     ///
     /// # Errors
     ///
     /// Returns the column-selection error unchanged, or an internal error
-    /// when Variant reconstruction, Arrow cast, or batch assembly fails.
+    /// when Variant reconstruction, Arrow cast, batch assembly, or a `live`
+    /// filter or expression fails.
     fn project(
         &self,
         required: &[FieldRef],
         pruning: Option<&crate::scan_sizing::BatchPruning>,
+        live: Option<&LiveProjection>,
         output: &mut Vec<ReadableBatch>,
     ) -> Result<(), ScribeError> {
         let internal = |error: arrow::error::ArrowError| ScribeError::Internal {
@@ -2269,9 +2323,16 @@ impl ReadableSource {
             })
             .collect();
         let keep = pruning.map(|pruning| pruning.keep(&statistics, statistics.len()));
+        let live_schema = live
+            .map(|live| live.exprs.project_schema(&schema).map(Arc::new))
+            .transpose()
+            .map_err(|error| ScribeError::Internal {
+                detail: format!("live-tail projection does not plan: {error}"),
+            })?;
         // One generation pins one layout, so the predicate adapts once to the
         // first physical batch and serves them all.
         let mut adapted: Option<Option<Arc<dyn datafusion::physical_expr::PhysicalExpr>>> = None;
+        let mut live_adapted: Option<LiveProjection> = None;
         for (index, ((batch, wal_lsn_max), mut statistics)) in self
             .runs
             .iter()
@@ -2288,6 +2349,79 @@ impl ReadableSource {
                 })
             });
             let mut physical = physical_projection(batch, &schema, &projection);
+            if let (Some(live), Some(live_schema)) = (live, &live_schema) {
+                let adapted = match &live_adapted {
+                    Some(adapted) => adapted,
+                    None => live_adapted.insert(live.adapted(&schema, physical.schema())?),
+                };
+                if let Some(filter) = &adapted.filter {
+                    physical = datafusion::physical_plan::filter::batch_filter(&physical, filter)
+                        .map_err(|error| ScribeError::Internal {
+                        detail: format!("live-tail filter failed: {error}"),
+                    })?;
+                    if physical.num_rows() == 0 {
+                        continue;
+                    }
+                }
+                let rows = physical.num_rows();
+                let columns = adapted
+                    .exprs
+                    .iter()
+                    .zip(live.exprs.iter())
+                    .zip(live_schema.fields())
+                    .map(|((adapted, logical), field)| {
+                        let column = match logical
+                            .expr
+                            .downcast_ref::<datafusion::physical_expr::expressions::Column>(
+                        ) {
+                            // A whole column is reconstructed as a whole read is.
+                            Some(column) => {
+                                let at = column.index();
+                                match projection[at].1 {
+                                    Some(source) => crate::schema::logical_column(
+                                        &physical.schema_ref().fields()[at],
+                                        physical.column(at),
+                                        self.schema.field(source),
+                                    )
+                                    .map_err(|detail| ScribeError::Internal {
+                                        detail: format!(
+                                            "live-tail Variant reconstruction failed: {detail}"
+                                        ),
+                                    })?,
+                                    None => Arc::clone(physical.column(at)),
+                                }
+                            }
+                            // Any other expression reads the physical leaves.
+                            None => adapted
+                                .expr
+                                .evaluate(&physical)
+                                .and_then(|value| value.into_array(rows))
+                                .map_err(|error| ScribeError::Internal {
+                                    detail: format!("live-tail projection failed: {error}"),
+                                })?,
+                        };
+                        if column.data_type() == field.data_type() {
+                            Ok(column)
+                        } else {
+                            arrow::compute::cast(&column, field.data_type()).map_err(internal)
+                        }
+                    })
+                    .collect::<Result<Vec<_>, _>>()?;
+                let batch = RecordBatch::try_new_with_options(
+                    Arc::clone(live_schema),
+                    columns,
+                    &arrow::array::RecordBatchOptions::new().with_row_count(Some(rows)),
+                )
+                .map_err(internal)?;
+                output.push(ReadableBatch {
+                    partition_day: self.seal_key.partition.time(),
+                    wal_lsn_max,
+                    statistics: batch_statistics(&batch),
+                    batch,
+                    generation: self.generation,
+                });
+                continue;
+            }
             if let Some(pruning) = pruning.filter(|_| shredded) {
                 let predicate = adapted.get_or_insert_with(|| {
                     use datafusion::physical_expr_adapter::PhysicalExprAdapterFactory as _;
@@ -2610,7 +2744,7 @@ mod tests {
         let partitions = key.partition.time()..=key.partition.time();
         let lsns = |pruning| {
             let mut lsns = capture
-                .read(&partitions, schema.fields(), pruning)
+                .read(&partitions, schema.fields(), pruning, None)
                 .expect("capture read")
                 .batches
                 .iter()
@@ -2662,7 +2796,7 @@ mod tests {
         let partitions = key.partition.time()..=key.partition.time();
         let lsns = |capture: &LiveCapture, pruning| -> Vec<u64> {
             capture
-                .read(&partitions, schema.fields(), pruning)
+                .read(&partitions, schema.fields(), pruning, None)
                 .expect("capture read")
                 .batches
                 .iter()
@@ -2801,7 +2935,7 @@ mod tests {
         let recorded = Arc::clone(&capture.memory[0].runs[0].statistics[0]);
         let read = |fields: &[FieldRef]| {
             let mut batches = capture
-                .read(&partitions, fields, None)
+                .read(&partitions, fields, None, None)
                 .expect("capture read")
                 .batches;
             assert_eq!(batches.capacity(), 1, "the batch list is sized once");

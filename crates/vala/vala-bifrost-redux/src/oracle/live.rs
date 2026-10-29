@@ -31,6 +31,7 @@ use datafusion::error::{DataFusionError, Result as DataFusionResult};
 use datafusion::execution::TaskContext;
 use datafusion::physical_expr::DynamicFilterTracking;
 use datafusion::physical_expr::PhysicalExpr;
+use datafusion::physical_expr::projection::ProjectionExprs;
 use datafusion::physical_expr::utils::{conjunction, split_conjunction};
 use datafusion::physical_expr_common::physical_expr::snapshot_physical_expr;
 use datafusion::physical_optimizer::pruning::PruningPredicateBuilder;
@@ -41,17 +42,20 @@ use datafusion::physical_plan::filter_pushdown::{
 use datafusion::physical_plan::metrics::{
     ExecutionPlanMetricsSet, MetricBuilder, MetricsSet, Time,
 };
+use datafusion::physical_plan::projection::ProjectionExec;
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion::physical_plan::{
     DisplayAs, DisplayFormatType, ExecutionPlan, Partitioning, PlanProperties,
     SendableRecordBatchStream,
 };
+use datafusion_proto::protobuf::physical_plan_node::PhysicalPlanType;
 use futures_util::StreamExt as _;
+use prost::Message as _;
 use sha2::{Digest as _, Sha256};
 use wyrd_spec::vala::BifrostError;
 use wyrd_spec::vala::api::{
-    ClusterRole, FollowerScanAssignment, NodeId, ScribeProviderCut, TenantTableBinding,
-    TimePartitionWire, WorkerAttemptFrame,
+    ClusterRole, FollowerScanAssignment, NodeId, ProjectedExpression, ScribeProviderCut,
+    TenantTableBinding, TimePartitionWire, WorkerAttemptFrame,
 };
 
 use super::dispatcher::{
@@ -357,7 +361,14 @@ pub(super) struct LiveScribeExec {
     schema_fingerprint: String,
     /// Signed projection closure, in closure order.
     required_columns: Vec<String>,
-    /// Advertised closure schema and the session's target partitions.
+    /// Schema of `required_columns`: what each Scribe's placeholder exposes,
+    /// and what `predicate` and `projection` are expressed over.
+    closure: SchemaRef,
+    /// The leaf's output expressions over `closure`: the columns themselves
+    /// until `DataFusion`'s projection pushdown offers a projection, which
+    /// the leaf absorbs so every Scribe evaluates it on its own sources.
+    projection: ProjectionExprs,
+    /// Advertised output schema and the session's target partitions.
     properties: Arc<PlanProperties>,
     /// Conjunction of the query filters `DataFusion`'s `FilterPushdown`
     /// offered this leaf, shipped to every Scribe above its placeholder.
@@ -391,21 +402,30 @@ impl LiveScribeExec {
         partitions: usize,
     ) -> Self {
         let partitions = partitions.max(1);
+        let projection =
+            ProjectionExprs::from_indices(&(0..schema.fields().len()).collect::<Vec<_>>(), &schema);
         Self {
             routes: Arc::new(routes),
             time_axis,
             schema_fingerprint,
             required_columns,
-            properties: Arc::new(PlanProperties::new(
-                datafusion::physical_expr::EquivalenceProperties::new(schema),
-                Partitioning::UnknownPartitioning(partitions),
-                datafusion::physical_plan::execution_plan::EmissionType::Incremental,
-                datafusion::physical_plan::execution_plan::Boundedness::Bounded,
-            )),
+            properties: Self::properties_of(Arc::clone(&schema), partitions),
+            closure: schema,
+            projection,
             predicate: None,
             scan_metrics: Arc::default(),
             metrics: ExecutionPlanMetricsSet::new(),
         }
+    }
+
+    /// Builds the plan properties of a leaf emitting `schema` at `partitions`.
+    fn properties_of(schema: SchemaRef, partitions: usize) -> Arc<PlanProperties> {
+        Arc::new(PlanProperties::new(
+            datafusion::physical_expr::EquivalenceProperties::new(schema),
+            Partitioning::UnknownPartitioning(partitions),
+            datafusion::physical_plan::execution_plan::EmissionType::Incremental,
+            datafusion::physical_plan::execution_plan::Boundedness::Bounded,
+        ))
     }
 
     /// Returns the accumulator the Scribe's reported scan evidence lands in.
@@ -453,17 +473,20 @@ impl LiveScribeExec {
             return Ok((leaf, routes.routes));
         };
         let predicate = snapshot_physical_expr(Arc::clone(predicate))?;
-        let routes = routes.selected_by(&predicate, &self.schema(), self.time_axis.column());
+        let routes = routes.selected_by(&predicate, &self.closure, self.time_axis.column());
         leaf.predicate = Some(predicate);
         Ok((leaf, routes.routes))
     }
 
     /// Builds the signed fragment and destination for one route.
     ///
-    /// The encoded plan is the same identity-bound placeholder a Scribe
-    /// follower decodes for any hot-provider assignment, under a `FilterExec`
-    /// of the pushed predicate when there is one; its fingerprint binds the
-    /// ticket, the request, and the footer to one another.
+    /// The encoded plan is the leaf's `ProjectionExec` over the same
+    /// identity-bound placeholder a Scribe follower decodes for any
+    /// hot-provider assignment, with a `FilterExec` of the pushed predicate
+    /// between them when there is one; its fingerprint binds the ticket, the
+    /// request, and the footer to one another. The assignment carries the
+    /// projection's encoded expressions and aliases exactly as the plan
+    /// encodes them, so the follower can prove the two agree before any IO.
     ///
     /// # Errors
     ///
@@ -484,11 +507,15 @@ impl LiveScribeExec {
             Arc::new(super::codec::RemoteSourcePlaceholderExec::new(
                 scan_id.clone(),
                 &self.schema_fingerprint,
-                self.schema(),
+                Arc::clone(&self.closure),
             ));
         if let Some(predicate) = &self.predicate {
             plan = Arc::new(FilterExec::try_new(Arc::clone(predicate), plan)?);
         }
+        let plan = Arc::new(ProjectionExec::try_new(
+            self.projection.iter().cloned(),
+            plan,
+        )?);
         let physical_plan_bytes =
             datafusion_proto::bytes::physical_plan_to_bytes_with_extension_codec(
                 plan,
@@ -496,6 +523,27 @@ impl LiveScribeExec {
             )?
             .to_vec();
         let plan_fingerprint = super::codec::physical_plan_fingerprint(&physical_plan_bytes);
+        let projection = match datafusion_proto::protobuf::PhysicalPlanNode::decode(
+            physical_plan_bytes.as_slice(),
+        )
+        .map_err(|error| DataFusionError::Plan(error.to_string()))?
+        .physical_plan_type
+        {
+            Some(PhysicalPlanType::Projection(projection)) => projection
+                .expr
+                .iter()
+                .zip(projection.expr_name)
+                .map(|(expression, alias)| ProjectedExpression {
+                    expression: expression.encode_to_vec(),
+                    alias,
+                })
+                .collect(),
+            _ => {
+                return Err(DataFusionError::Plan(
+                    "live fragment did not encode its projection".to_owned(),
+                ));
+            }
+        };
         let assignment = FollowerScanAssignment {
             scan_id,
             binding: binding.clone(),
@@ -507,6 +555,7 @@ impl LiveScribeExec {
             }),
             schema_fingerprint: self.schema_fingerprint.clone(),
             required_columns: self.required_columns.clone(),
+            projection,
         };
         Ok((
             PhysicalDispatchFragment {
@@ -548,7 +597,7 @@ impl DisplayAs for LiveScribeExec {
 }
 
 impl ExecutionPlan for LiveScribeExec {
-    /// Visits the pushed predicate, the only physical expression this leaf owns.
+    /// Visits the pushed predicate, then the output expressions.
     ///
     /// # Errors
     /// Returns the visitor's error.
@@ -556,10 +605,38 @@ impl ExecutionPlan for LiveScribeExec {
         &self,
         f: &mut dyn FnMut(&Arc<dyn PhysicalExpr>) -> DataFusionResult<TreeNodeRecursion>,
     ) -> DataFusionResult<TreeNodeRecursion> {
-        match &self.predicate {
-            Some(predicate) => f(predicate),
-            None => Ok(TreeNodeRecursion::Continue),
+        for expr in self
+            .predicate
+            .iter()
+            .chain(self.projection.iter().map(|e| &e.expr))
+        {
+            if f(expr)? == TreeNodeRecursion::Stop {
+                return Ok(TreeNodeRecursion::Stop);
+            }
         }
+        Ok(TreeNodeRecursion::Continue)
+    }
+
+    /// Absorbs the projection above it, so every fragment evaluates it on
+    /// the Scribe's own sources and returns only its outputs.
+    ///
+    /// The absorbed expressions are rewritten over the closure, so a Scribe
+    /// reads them against the same placeholder columns the predicate uses.
+    ///
+    /// # Errors
+    /// Returns the `DataFusion` error raised when an expression cannot be
+    /// rewritten over the closure.
+    fn try_swapping_with_projection(
+        &self,
+        projection: &ProjectionExec,
+    ) -> DataFusionResult<Option<Arc<dyn ExecutionPlan>>> {
+        let mut leaf = self.clone();
+        leaf.projection = self.projection.try_merge(projection.projection_expr())?;
+        leaf.properties = Self::properties_of(
+            projection.schema(),
+            self.properties.partitioning.partition_count(),
+        );
+        Ok(Some(Arc::new(leaf)))
     }
 
     /// Takes the filters `DataFusion` pushes to this leaf as the predicate
@@ -569,7 +646,8 @@ impl ExecutionPlan for LiveScribeExec {
     ///
     /// Every filter is reported unsupported, so the leader's `FilterExec` and
     /// the producing operator stay the authority over correctness above the
-    /// leaf.
+    /// leaf. Filters arrive over the leaf's output and are rewritten over the
+    /// closure through its projection; one that cannot be is not taken.
     ///
     /// Filters bound to execution state — a dynamic filter, or
     /// `id = (SELECT max(id) ...)` whose value `ScalarSubqueryExec` supplies
@@ -594,7 +672,7 @@ impl ExecutionPlan for LiveScribeExec {
                 DynamicFilterTracking::classify(filter).contains_dynamic_filter()
                     == (phase == FilterPushdownPhase::Post)
             })
-            .cloned()
+            .filter_map(|filter| self.projection.unproject_expr(filter).ok())
             .collect::<Vec<_>>();
         let propagation = FilterPushdownPropagation::all_unsupported(child_pushdown_result);
         if pushed.is_empty() {
@@ -611,7 +689,7 @@ impl ExecutionPlan for LiveScribeExec {
         let mut leaf = self.clone();
         leaf.routes = Arc::new(self.routes.selected_by(
             &static_predicate,
-            &self.schema(),
+            &self.closure,
             self.time_axis.column(),
         ));
         leaf.predicate = Some(predicate);
@@ -623,7 +701,7 @@ impl ExecutionPlan for LiveScribeExec {
         "LiveScribeExec"
     }
 
-    /// Returns the closure schema and the session's target partitions.
+    /// Returns the output schema and the session's target partitions.
     fn properties(&self) -> &Arc<PlanProperties> {
         &self.properties
     }
@@ -742,7 +820,8 @@ impl LiveUnionBoundary {
 }
 
 impl datafusion::physical_optimizer::PhysicalOptimizerRule for LiveUnionBoundary {
-    /// Wraps every non-live sibling of each union that holds a live leaf,
+    /// Pushes a projection above a union holding a live leaf into each of
+    /// its children, then wraps every non-live sibling of each such union,
     /// preserving the sibling's output ordering.
     ///
     /// # Errors
@@ -757,6 +836,43 @@ impl datafusion::physical_optimizer::PhysicalOptimizerRule for LiveUnionBoundary
         let holds_live = |plan: &Arc<dyn ExecutionPlan>| {
             plan.exists(|node| Ok(node.downcast_ref::<LiveScribeExec>().is_some()))
         };
+        // `UnionExec` passes a projection down only when it narrows the
+        // schema, so the expressions of a projection that reads every closure
+        // column would stay on the leader and every Scribe would return whole
+        // columns. Pushed into each child, a published scan and a live leaf
+        // absorb it as each would without the union.
+        let plan = plan
+            .transform_up(|node| {
+                let Some(projection) = node.downcast_ref::<ProjectionExec>() else {
+                    return Ok(Transformed::no(node));
+                };
+                let Some(union) = projection
+                    .input()
+                    .downcast_ref::<datafusion::physical_plan::union::UnionExec>()
+                else {
+                    return Ok(Transformed::no(node));
+                };
+                if !holds_live(projection.input())? {
+                    return Ok(Transformed::no(node));
+                }
+                let children = union
+                    .children()
+                    .into_iter()
+                    .map(|child| {
+                        let projected = ProjectionExec::try_new(
+                            projection.expr().iter().cloned(),
+                            Arc::clone(child),
+                        )?;
+                        Ok(child
+                            .try_swapping_with_projection(&projected)?
+                            .unwrap_or_else(|| Arc::new(projected)))
+                    })
+                    .collect::<DataFusionResult<Vec<_>>>()?;
+                Ok(Transformed::yes(
+                    datafusion::physical_plan::union::UnionExec::try_new(children)?,
+                ))
+            })?
+            .data;
         plan.transform_up(|node| {
             if node
                 .downcast_ref::<datafusion::physical_plan::union::UnionExec>()
@@ -1146,11 +1262,13 @@ mod tests {
     use crate::oracle::dispatcher::{NativeCompletion, NativeOutputTally};
 
     /// A query filter pushed to the live leaf ships on every fragment above
-    /// the placeholder, while the leader keeps its own `FilterExec`.
+    /// the placeholder, under the leaf's projection, while the leader keeps
+    /// its own `FilterExec`.
     ///
     /// # Panics
     /// Panics when pushdown drops the leader's filter, leaves the leaf without
-    /// the predicate, or the fragment's encoded root is not a filter.
+    /// the predicate, or the fragment's encoded root is not a projection over
+    /// a filter.
     #[test]
     fn pushed_filter_ships_on_the_fragment_and_stays_on_the_leader() {
         use datafusion::physical_expr::expressions::{BinaryExpr, Column, Literal};
@@ -1196,8 +1314,14 @@ mod tests {
             .expect("the fragment encodes");
         let root = PhysicalPlanNode::decode(fragment.physical_plan_bytes.as_slice())
             .expect("the fragment plan decodes");
+        let Some(PhysicalPlanType::Projection(projection)) = root.physical_plan_type else {
+            panic!("the fragment ships the leaf's projection at its root");
+        };
         assert!(
-            matches!(root.physical_plan_type, Some(PhysicalPlanType::Filter(_))),
+            matches!(
+                projection.input.and_then(|input| input.physical_plan_type),
+                Some(PhysicalPlanType::Filter(_))
+            ),
             "the fragment ships the filter above its placeholder"
         );
     }

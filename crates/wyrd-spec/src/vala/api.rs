@@ -2132,6 +2132,24 @@ pub struct FollowerScanAssignment {
     /// Required output/predicate/hidden-tenant projection closure, in the
     /// stable order the leaf union and remote placeholder must expose.
     pub required_columns: Vec<String>,
+    /// The fragment's output expressions over `required_columns`, in output
+    /// order; never empty. They are the exact `ProjectionExec` the signed
+    /// fragment places above its placeholder, so a follower evaluates them on
+    /// its sources instead of returning whole input columns.
+    pub projection: Vec<ProjectedExpression>,
+}
+
+/// One output expression of a live fragment's projection.
+///
+/// The bytes are opaque here: they are a serialized `DataFusion`
+/// `PhysicalExprNode` that only the Oracle physical codec reads.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
+pub struct ProjectedExpression {
+    /// Serialized physical expression over the assignment's closure.
+    pub expression: Vec<u8>,
+    /// Output column name the expression produces.
+    pub alias: String,
 }
 
 /// Context-bound worker request carrying one serialized physical subtree.

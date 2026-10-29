@@ -3,10 +3,13 @@
 use std::sync::Arc;
 
 use datafusion::common::DFSchema;
+use datafusion::physical_expr::projection::ProjectionExprs;
 use datafusion::physical_plan::ExecutionPlan;
 use datafusion::physical_plan::filter::FilterExec;
+use datafusion::physical_plan::projection::ProjectionExec;
 use datafusion::prelude::SessionContext;
 use datafusion_proto::bytes::physical_plan_to_bytes_with_extension_codec;
+use datafusion_proto::protobuf::{PhysicalPlanNode, physical_plan_node::PhysicalPlanType};
 use vala_bifrost_redux::catalog::TableRef;
 use vala_bifrost_redux::namespaces::BifrostNamespace;
 use vala_bifrost_redux::oracle::assignment_schema_fingerprint;
@@ -20,7 +23,7 @@ use vala_bifrost_redux::oracle::peer::{
 use wyrd_server::config::BifrostTarget;
 use wyrd_spec::vala::api::{
     ClusterRole, ExecuteFragmentRequest, FollowerScanAssignment, NodeId, OracleRoleFence,
-    PeerContext, ReservationId, ScribeProviderCut, TenantTableBinding,
+    PeerContext, ProjectedExpression, ReservationId, ScribeProviderCut, TenantTableBinding,
 };
 use wyrd_tonic::prost::Message as _;
 use wyrd_tonic::tonic;
@@ -712,11 +715,30 @@ impl ScribeFragment {
                 session.create_physical_expr(session.parse_sql_expr(sql, &schema)?, &schema)?;
             plan = Arc::new(FilterExec::try_new(predicate, plan)?);
         }
+        // A live fragment reads its scan through the leaf's projection.
+        let identity = ProjectionExprs::from_indices(
+            &(0..projected.fields().len()).collect::<Vec<_>>(),
+            &projected,
+        );
         let plan = physical_plan_to_bytes_with_extension_codec(
-            plan,
+            Arc::new(ProjectionExec::try_new(identity.iter().cloned(), plan)?),
             &OraclePhysicalExtensionCodec::encoder(),
         )?
         .to_vec();
+        let Some(PhysicalPlanType::Projection(root)) =
+            PhysicalPlanNode::decode(plan.as_slice())?.physical_plan_type
+        else {
+            return Err("the encoded fragment root is its projection".into());
+        };
+        let projection = root
+            .expr
+            .iter()
+            .zip(root.expr_name)
+            .map(|(expression, alias)| ProjectedExpression {
+                expression: expression.encode_to_vec(),
+                alias,
+            })
+            .collect();
         Ok(Self {
             fingerprint: physical_plan_fingerprint(&plan),
             plan,
@@ -731,6 +753,7 @@ impl ScribeFragment {
                 }),
                 schema_fingerprint,
                 required_columns: columns.iter().map(|column| (*column).to_owned()).collect(),
+                projection,
             },
             leader: OracleRoleFence {
                 node_id: NodeId::new(plane.leader_node_id),

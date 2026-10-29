@@ -213,9 +213,13 @@ message FollowerScanAssignment {
   ScribeProviderCut scribe_provider_cut = 4;
   string schema_fingerprint = 5;
   repeated string required_columns = 6;
+  // Ordered, nonempty output expressions over required_columns: each a
+  // serialized DataFusion PhysicalExprNode and its output name.
+  repeated ProjectedExpression projection = 9;
   reserved 3, 7, 8;
   reserved "persisted", "predicates", "reader_cut";
 }
+message ProjectedExpression { bytes expression = 1; string alias = 2; }
 message ExecuteFragmentRequest {
   PeerContext context = 1; bytes physical_plan_bytes = 2; bytes reservation_id = 3;
   OracleRoleFence leader_fence = 4; OracleRoleFence target_fence = 5;

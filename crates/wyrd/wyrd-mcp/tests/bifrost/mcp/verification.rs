@@ -1296,6 +1296,84 @@ mod pg_tests {
         Ok(())
     }
 
+    /// An agent enqueues a Verifier over an uploaded File and reads the
+    /// settled execution back over MCP with its original File declaration as
+    /// the evidence.
+    ///
+    /// # Errors
+    ///
+    /// Returns server startup, bootstrap, registration, MCP transport,
+    /// upload, or tool-call failures, or an error when the execution never
+    /// settles.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the status, verdict, or evidence expectation fails.
+    #[tokio::test(flavor = "multi_thread")]
+    #[ignore = "requires the Postgres-backed Bifrost journey lane"]
+    async fn stored_evidence_readback_uses_canonical_records() -> Result<(), McpJourneyError> {
+        use sha2::Digest as _;
+        const DOCUMENT: &[u8] = br#"{"answer":1}"#;
+        let server = Box::pin(
+            WyrdTestServer::builder()
+                .with_verification_runtime_for_test()
+                .start_bound(),
+        )
+        .await?;
+        let admin = server
+            .bootstrap_service("mcp-readback-admin", &["admin"])
+            .await?;
+        let cards = Cards::connect_with(&client(&server, api_key(&admin)?)?).await?;
+        let fixture = register_fixture(&cards).await?;
+        let root = std::env::temp_dir().join(format!("wyrd-mcp-readback-{}", uuid::Uuid::now_v7()));
+        std::fs::create_dir_all(&root)?;
+        std::fs::write(root.join("verifier.yaml"), DOCUMENT_VERIFIER)?;
+        let document = Box::pin(cards.declare_from_path(&root.join("verifier.yaml"))).await?;
+        std::fs::remove_dir_all(&root)?;
+        let document = document
+            .root
+            .uid
+            .ok_or("a registered Card has a UID")?
+            .to_string();
+        let agent = server
+            .credential_registered_service(&fixture.service_ref, &["editor"])
+            .await?;
+        let agent_client = connect_rooted(&server, &agent).await?;
+        let http = rooted_client(&server, &agent)?;
+        let base_url = server.base_url().ok_or("a bound server has a URL")?;
+
+        let sha256 = format!("{:x}", sha2::Sha256::digest(DOCUMENT));
+        let files =
+            serde_json::json!({ "files": [{ "sha256": sha256, "size_bytes": DOCUMENT.len() }] });
+        let planned = structured(agent_client.call_tool(call(EVIDENCE, files)?).await?)?;
+        upload_planned(&http, base_url, &planned, DOCUMENT).await?;
+        let declaration = serde_json::json!({ "kind": "file", "sha256": sha256,
+                                              "size_bytes": DOCUMENT.len(), "format": "json" });
+        let accepted = structured(
+            agent_client
+                .call_tool(call(
+                    ENQUEUE,
+                    serde_json::json!({
+                        "verifier_card_uid": document,
+                        "card_uid": fixture.service_uid,
+                        "inputs": { "doc": declaration },
+                    }),
+                )?)
+                .await?,
+        )?;
+        let state = settle(&agent_client, text(&accepted, "/execution_id")?).await?;
+        assert_eq!(state["status"], "completed", "{state}");
+        assert_eq!(state["result"]["outcome"]["verdict"], "passed", "{state}");
+        assert_eq!(
+            state["result"]["outcome"]["evidence"],
+            serde_json::json!({ "doc": declaration }),
+            "{state}"
+        );
+        agent_client.cancel().await?;
+        server.shutdown().await?;
+        Ok(())
+    }
+
     /// A bound Service judges inline inputs with a Verifier over MCP.
     ///
     /// The tool result carries the exact Verifier and subject and the

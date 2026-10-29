@@ -639,6 +639,29 @@ test("file inputs use shared uploads", async ({ server, desk }) => {
   }
 });
 
+test("stored evidence readback uses canonical records", async ({ desk }) => {
+  const content = new TextEncoder().encode("a,b\n5,6");
+  const submitted = await desk.state
+    .run()
+    .observe.submit("document-formats", { document: verify.File.bytes(content, { format: "csv" }) });
+  if (submitted.kind !== "queued") {
+    throw new Error("Run evidence queues an execution");
+  }
+
+  const result = await submitted.execution.wait({ timeoutMs: WAIT_MS });
+  const status = await submitted.execution.status();
+
+  expect(status.result).toEqual(result);
+  expect(result.outcome.evidence).toEqual({
+    document: {
+      kind: "file",
+      sha256: createHash("sha256").update(content).digest("hex"),
+      size_bytes: content.length,
+      format: "csv",
+    },
+  });
+});
+
 test("document passed positionally fills the only slot", async ({ desk }) => {
   const result = await desk.state
     .run()

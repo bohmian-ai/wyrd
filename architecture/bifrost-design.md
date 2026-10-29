@@ -1070,9 +1070,22 @@ sets up no cache and charges nothing. Each budget defaults to a twentieth of
 managed memory within 32 MiB..512 MiB and may never exceed an eighth of it.
 
 The byte-range cache keeps the exact byte ranges Oracle scans read from
-warehouse objects, which are written once under unique names and never
-rewritten, so a cached range never goes stale; staged scratch objects are read
-uncached. A scan answered from the cache still counts the bytes in
+warehouse objects and Scribe staged runs. Both are written once under unique
+names and never rewritten: a staged run lives under its assembly key, shard
+and generation, and a lane's generations only move forward. So a cached range
+never goes stale, and a footer cache entry, validated against the object's
+recorded size, is never reused for another file. Staged and published scans
+share one planner (`PlannedFiles`: recorded size, rows and time bounds, the
+same bounds pruning and row-group partition cap) and one reader
+(`TenantParquetReaderFactory` over the cached Parquet reader), so a run the
+predicate excludes is never opened and a repeated query rereads no footer. A
+live fragment's assignment also carries the leader's signed projection
+expressions: the Scribe evaluates them in the staged scan through `DataFusion`
+projection pushdown, and on memory batches' physical arrays, so a scalar
+Variant read decodes only its shredded leaves. A projection that does not
+decode or plan over the closure fails the fragment before any source IO, and
+an empty projection such as `count(*)` stays on the leader. A scan answered
+from the cache still counts the bytes in
 `bytes_scanned`, and before its first cached range of an object it confirms the
 object exists, so a pinned object that vanished still fails the attempt as a
 stale object rather than being answered from memory. Apart from that standing

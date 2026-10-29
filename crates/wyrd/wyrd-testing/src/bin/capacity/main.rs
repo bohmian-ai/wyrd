@@ -532,7 +532,7 @@ mod tests {
         let writes = experiment(query::Experiment::WritesParquet, &[], HOST);
         let hot = experiment(query::Experiment::Hot, &[], HOST);
         let parquet = experiment(query::Experiment::Parquet, &[], HOST);
-        for (bifrost, budget) in [(&writes, 480), (&hot, 300), (&parquet, 300)] {
+        for (bifrost, budget) in [(&writes, 480), (&hot, 480), (&parquet, 300)] {
             assert!(bifrost.refusals().is_empty(), "{:?}", bifrost.refusals());
             assert_eq!(
                 bifrost.timing,
@@ -540,7 +540,7 @@ mod tests {
                     budget_seconds: budget,
                     ..timing
                 },
-                "writes-parquet fits 480 s and every other L1 experiment 300 s"
+                "writes-parquet and hot fit 480 s and parquet 300 s"
             );
             for control in ["fixture", "limits", "workload", "timing"] {
                 assert!(bifrost.controls.contains_key(control), "{control}");
@@ -624,10 +624,24 @@ mod tests {
                 "point-c1",
                 "point-c64",
                 "small-aggregate-c1",
-                "span-shredded-c1"
+                "span-shredded-c1",
+                "span-learned-shredded-c1",
+                "span-learned-shredded-c64"
             ]
         );
-        assert_eq!(steps(&hot, false), ["point-scaling"]);
+        assert_eq!(
+            steps(&hot, false),
+            ["point-scaling", "span-learned-shredded-scaling"]
+        );
+        assert!(
+            hot.controls["limits"]
+                .as_str()
+                .is_some_and(|limits| limits.contains(&format!(
+                    "WYRD_MAX_FILE_RETENTION_TIME={}",
+                    query::HOT_RETENTION.as_secs()
+                ))),
+            "hot rotates by the retention its day-2 windows are judged against"
+        );
         let reads = [
             "point-c1",
             "point-c64",

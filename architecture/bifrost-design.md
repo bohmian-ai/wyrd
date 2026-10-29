@@ -1677,6 +1677,8 @@ across a restart; durable batch, file, and task rows answer that question.
   `bifrost_scribe_lane_active{lane}` is running jobs.
   `bifrost_scribe_publication_files_total` and `_bytes_total` count committed
   publication output after its catalog transaction commits.
+  `bifrost_scribe_variant_layouts_learned{namespace}` is the process's cached
+  learned Variant layouts per Bifrost namespace, republished on each install.
 - **Oracle.** `oracle_query_duration_seconds{class,outcome}` starts after Gate
   dispatch and measures Oracle execution through its terminal; the production
   HPA and query reports read it. Outcomes are `success`, `degraded`, `failed`,

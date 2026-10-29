@@ -752,6 +752,31 @@ impl Telemetry {
         )
     }
 
+    /// Counts spans `first..last` whose shredded `region` key is `eu-west`,
+    /// bounded on `start_time_unix_nano` to the fixture day holding span
+    /// `first`, so one day's cohort is read and counted alone.
+    #[must_use]
+    pub fn day_shredded_filter(self, first: i64, last: i64) -> (String, Rows) {
+        let day = DAY_HOURS * HOUR_MS * 1_000_000;
+        let lower = DAY_START_NANOS + first / self.spans * day;
+        let upper = lower + day;
+        let count = (first..last)
+            .filter(|index| {
+                region(*index) == Some("eu-west")
+                    && (lower..upper).contains(&self.start_nanos(*index))
+            })
+            .count();
+        (
+            format!(
+                "SELECT COUNT(*) FROM {TABLE} \
+                 WHERE start_time_unix_nano >= to_timestamp_nanos({lower}) \
+                 AND start_time_unix_nano < to_timestamp_nanos({upper}) \
+                 AND attributes ->> 'region' = 'eu-west'"
+            ),
+            vec![vec![count.to_i64().unwrap_or(i64::MAX)]],
+        )
+    }
+
     /// Counts the first `written` spans carrying one long-tail key, which
     /// sits far below the shredding threshold and is read from the Variant
     /// residue.

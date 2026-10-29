@@ -196,6 +196,10 @@ impl VariantLayoutCache {
     /// root cannot charge the entry, or the layout cannot be applied to
     /// `logical`, the hint is dropped rather than failing assembly. Only
     /// generations opened later see the new hint.
+    ///
+    /// Each install republishes `bifrost_scribe_variant_layouts_learned`, the
+    /// cached layouts per Bifrost namespace, so an operator or diagnostic can
+    /// see that a process learned a layout for a namespace's tables.
     pub(crate) fn install(
         &self,
         resources: &crate::resources::ScribeResources,
@@ -223,6 +227,17 @@ impl VariantLayoutCache {
             while entries.len() > VARIANT_LAYOUT_CACHE_ENTRIES {
                 entries.pop_front();
             }
+        }
+        for namespace in crate::namespaces::BifrostNamespace::ALL {
+            let learned = entries
+                .iter()
+                .filter(|((_, table, _), _)| table.namespace == namespace)
+                .count();
+            metrics::gauge!(
+                "bifrost_scribe_variant_layouts_learned",
+                "namespace" => namespace.as_str()
+            )
+            .set(num_traits::ToPrimitive::to_f64(&learned).unwrap_or(f64::MAX));
         }
     }
 

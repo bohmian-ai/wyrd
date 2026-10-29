@@ -1,0 +1,40 @@
+# TASK-003 security, authorization, tenancy and audit review
+
+Overall result: **PASS**. No material finding proposed in this domain.
+
+## Immutable subject and scope
+
+Reviewed the complete security-relevant diff from `3a99eb05fd5ea78a21fd732212bf2c5d3672f27f` to `f1f6a9c833061ec6f0a781247b762ec3c0de4bea`, approved specification revision 2 and original TASK-003. HEAD remained the candidate and the inspected server source had no working-tree difference from it. No prior acceptance was carried forward. Source was not changed. No `.codegraph/` directory exists; normal source navigation was used.
+
+The boundary reviewed is reuse of the server executor identity for inventory queries, exact Artifact identity and tenant binding through metadata memoization, and the preservation of per-use Card authorization/audit decisions. This is a domain verdict, not acceptance of performance or the entire task.
+
+## Authority and source coverage
+
+| Boundary | Authority | Source and assessment |
+|---|---|---|
+| Executor identity producer | Root AGENTS.md; security posture principal and credential lifecycle; REQ-014–015, INV-002 | `components/auth/caller_extractor.rs::Caller::{from_authenticated,accepted,executed_by_system}`; `components/verification/service.rs::run_direct`; `verification/runner.rs::{system_principal,execute}`; `verification/cache.rs::Target::resolved`; SQL `20261024000000_flat_card_identity.sql::wyrd.verification_target`. Public authentication creates no executor identity. Direct and queued execution take the active SYSTEM identity from the tenant's target resolution. The target SQL binds and checks its tenant and explicitly filters the SYSTEM row by that tenant, kind and active status. The target cache is tenant-keyed and invalidated on SYSTEM row changes. |
+| Internal read authority | Security posture internal inventory reads; Bifrost design built-in inventory/read authorization; REQ-015 | `components/storage/inventory.rs::ObjectInventory::{executed_by,rows}`; `verification/authority.rs::SystemReadAuthority::{resolve,table_uid}`. Reuses the existing tokenless table-UID-scoped mechanism with only `bifrost.storage.objects`; there is no general query or write grant. The unchanged fallback looks up SYSTEM through `TenantConn`. Catalog lookup and query context use the supplied verified data tenant. |
+| Artifact metadata and exact identity | REQ-011, REQ-015, INV-002; TASK-003 preservation of permission/audit boundaries | `verification/hosted/evidence.rs::TenantEvidence::{inventory,artifact_file,select}`; `components/cards/routes.rs::{get_card_by_ref_for,get_card_objects_by_ref_for,authorize_card_ref}`; `components/cards/service.rs::{get_card_objects_by_ref,card_files,hydrate_card,verify_card_read_integrity}`; `wyrd-spec/src/reference.rs::{CardRefIdentity,CardRef::identity_key}`. The first read authorizes before registry/inventory IO, validates an optional UID and hydrates with integrity checks before memo insertion. The memo key retains kind/name/exact version and optional UID. Later hits authorize again before returning metadata; another UID cannot reuse a successful entry. |
+| File isolation and origin | REQ-010, REQ-015, INV-002, AC-007 | `TenantEvidence::{file_object,read,stored}` and `ObjectInventory::{file_object,file_fold}`. File queries retain the `file_upload` origin restriction and tenant query context; returned paths are validated as that tenant's evidence objects. Cache state belongs to a single reader with one fixed caller/tenant. Size and digest validation remain at byte reads. |
+| Audit boundary and sibling consumers | Root audit rule; security posture accepted authority and actor distinction | `audit/mod.rs::{authorize,authorize_recording_denial}`; `Caller::attribution`; `query/service.rs::oracle_context`; `verification/hosted/registry.rs::TenantRegistry::spec`; HTTP/MCP exact Card route callers; `cards/service.rs::{list_card_artifacts,get_card_by_uid,get_latest_card}`. Extracting `authorize_card_ref` preserves the existing permission, operation name, resource rendering, subject/actor attribution and outbox staging on both allow and deny. Exact HTTP/MCP and Agent/Prompt reads still pass through the shared authorized route. Other Card hydration consumers retain the same inventory owner and fallback identity behavior. |
+| Execution scope | TASK-003 bounded execution-owned reuse; specification excludes a general Card cache | `verification/hosted/blocks.rs::HostedBlocks::engine` constructs a fresh `TenantEvidence` with its execution caller, shared with its actions, tools and workspaces. The new memo does not survive into another execution or another caller. |
+
+The removed second `list_card_artifacts` read adds no independent permission check: it is a service-level lookup after the route's audited Card read. Returning the already hydrated inventory therefore removes repeated facts/query work while preserving the domain authorization boundary. Actual later Artifact uses still make their own decision, including workspace selection and byte access.
+
+## Acceptance matrix and available evidence
+
+| Obligation | Implementation evidence | Verification evidence | Result |
+|---|---|---|---|
+| Internal inventory reuse neither widens caller grants nor changes tenant | Identity producers and scoped `SystemReadAuthority` path above | Inspected `pg_hosted_artifacts::evidence_metadata_is_resolved_once`: two inventory decisions, reads succeed without caller Bifrost grants; foreign File returns retryable missing inventory | PASS |
+| Unauthorized and foreign Artifact references fail before evidence use | First-read route authorization and tenant registry transaction; cached-hit `authorize_card_ref` | New metadata test refuses no-grant/foreign Artifact reads; existing `artifact_reads_refuse_before_use` covers wrong tenant, grant, kind, UID and path | PASS |
+| Exact identity and content checks survive metadata reuse | Memo includes optional UID; hydration validates identity and hashes; `stored` validates bytes | Existing refusal test reuses one reader across wrong references and tampered byte reads | PASS |
+| Every repeated Artifact use retains Card decision and audit staging | Both branches of `inventory` call the existing audit owner before use | Source establishes both branches; metadata test exercises repeated reads, selection, media and workspace reuse. It counts Bifrost queries, not every Card audit event | PASS |
+| File read introduces no new application identity SQL | Production execution supplies the resolved SYSTEM executor, so `rows` skips the fallback registry lookup | Metadata test deliberately supplies an executor absent from the registry and verifies both inventory reads used it; production provenance independently traced above | PASS |
+
+## Verification limits and finding ledger
+
+No Cargo, benchmark or live service command was run by this domain reviewer. The orchestrator independently reran V1–V3 successfully against the candidate; `verification.md` records the exact command, three selected passes and unchanged source. This includes the metadata/foreign-tenant test used by this domain review. The task's appended implementation evidence records the targeted server tests and tenant-isolation check as passed; that evidence was read after independent diff/source tracing and is not treated as independent execution. The tests' assertions were inspected. The fresh executor in the metadata test proves identity reuse, not production identity provenance; the latter is established from the caller/target/SQL producers above. Per-use Card auditing is established from source, not a new audit-count experiment.
+
+Inventory query audit subject selection and the general SYSTEM read authority implementation predate this task; this diff preserves those mechanisms. No caller-controlled executor producer or new cross-tenant query path was found. Public inventory write policy and public SQL authorization were not changed and were not independently re-audited in full.
+
+Proposed material findings: **none**. No correction required within this reviewed boundary.

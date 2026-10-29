@@ -312,3 +312,7 @@ Diagnosis (first GREEN run of V1 reported 16 reads):
   RED binary.
 - **Fix site:** the source was touched and the run repeated (37/37 passed). No
   code change.
+
+## Subsequent maintainer decision
+
+After task review, the maintainer explicitly instructed: "we dont need a benchmark remediation". For TASK-003 acceptance, benchmark extension, reruns and baseline comparisons are no longer required. This current instruction overrides the measurement obligations above for this task; FIND-TASK-003-1 is withdrawn, not deferred to change review. Existing correctness, isolation, retry, validation and metadata-query-count proof remains required. Timing remains unmeasured and no performance claim is made. See [the recorded decision](../review/task-003-f1f6a9c83/maintainer-decision.md).

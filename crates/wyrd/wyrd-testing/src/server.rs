@@ -473,6 +473,7 @@ pub struct WyrdTestServerBuilder {
     scribe_ingest_limits: IngestLimits,
     /// Optional `scribe.outbox_capacity` the bound server's Scribe outbox admits.
     scribe_outbox_capacity: Option<usize>,
+    scribe_persistence_cpu_threads: Option<usize>,
     /// Optional projection of production Scribe rotation limits for real-server journeys.
     scribe_geometry_for_test: Option<vala_bifrost_redux::scribe::geometry::ScribeGeometry>,
     /// Optional faults installed in the real Scribe persistence graph for journeys.
@@ -653,6 +654,7 @@ impl Default for WyrdTestServerBuilder {
             scribe_admission: None,
             scribe_ingest_limits: IngestLimits::default(),
             scribe_outbox_capacity: None,
+            scribe_persistence_cpu_threads: None,
             scribe_geometry_for_test: None,
             scribe_persistence_faults_for_test: None,
             role_timing: None,
@@ -4571,6 +4573,15 @@ impl WyrdTestServerBuilder {
         self
     }
 
+    /// Sets `scribe.persistence_cpu_threads`, which also sizes the staging
+    /// workers and the publication claim budget, so a journey can pin that
+    /// budget instead of inheriting the host's parallelism.
+    #[must_use]
+    pub const fn with_scribe_persistence_cpu_threads_for_test(mut self, threads: usize) -> Self {
+        self.scribe_persistence_cpu_threads = Some(threads);
+        self
+    }
+
     /// Select a scaled Scribe geometry for a real-server journey.
     ///
     /// This installs no second lifecycle policy: the value is the same
@@ -5020,6 +5031,9 @@ impl WyrdTestServerBuilder {
         config.bifrost.scribe.ingest_request_bytes = self.scribe_ingest_limits.max_frame_bytes;
         if let Some(capacity) = self.scribe_outbox_capacity {
             config.bifrost.scribe.outbox_capacity = capacity;
+        }
+        if let Some(threads) = self.scribe_persistence_cpu_threads {
+            config.bifrost.scribe.persistence_cpu_threads = threads;
         }
         config.bifrost.storage = self.bifrost_storage_io;
         if let Some(oracle) = self.oracle_runtime.clone() {

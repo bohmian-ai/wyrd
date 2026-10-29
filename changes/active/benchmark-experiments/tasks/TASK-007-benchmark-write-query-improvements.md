@@ -1024,3 +1024,39 @@ before (db29ee915) and after (b8b55fda2):
 
 Within the 5% retain rule; no measurable gain. Kept because it removes a
 second parse from every attempt.
+
+## Scribe journey failures: diagnosis and fix
+
+Four `wyrd-testing --test scribe` journeys failed at 0aa09ae05 and later. An
+independent read-only diagnostician (Codex) read the traced run
+(`WYRD_LOG=info,vala_bifrost_redux=debug`) and the history, and found two
+causes. Both are test setup that disagrees with intended production
+behavior; no assertion changed.
+
+- **Claim budget** (`lifecycle::scribe_publishes_due_claims_concurrently_within_the_claim_budget`,
+  `lifecycle::concurrent_flushes_share_the_claim_budget_and_publish_each_claim_once`).
+  - Symptom: "9 claims were in flight at once; the claim budget is 4".
+  - Evidence: `boot/mod.rs` passes `persistence_cpu_threads` to
+    `ScribePersistenceConfig::new`, and `persistence.rs` builds the
+    assembler's claim budget from that worker count.
+  - Cause: e8e8342b9 sized staging workers, and so the claim budget, by
+    `persistence_cpu_threads` (20 on this host) instead of `wal_io_threads`
+    (4). The tests still assumed 4.
+  - Fix site: the harness gains
+    `WyrdTestServerBuilder::with_scribe_persistence_cpu_threads_for_test`,
+    and both journeys pin the budget to `CLAIM_BUDGET`.
+- **Unsettled audit write** (`telemetry::scribe_hot_path_telemetry_reconciles`,
+  `write_read::acknowledged_rows_survive_stage_pressure_and_restart`).
+  - Symptom: "the age tick did not publish the frozen memtable", and "1
+    staged Scribe writes did not settle within 60s".
+  - Evidence: the trace shows a `bifrost.system.audit_log` batch written
+    after the freeze, and an audit outbox write refused as `saturated` once
+    the test filled the shared root.
+  - Cause: the final read stages an audit row on the outbox, which delivers
+    in the background (edc1f2eac added the 50 ms linger). The tests froze
+    telemetry or filled memory before that row landed.
+  - Fix site: both journeys call `WyrdTestServer::settle_bifrost_outbox`
+    after the read.
+
+Verification: `cargo nextest run --locked -p wyrd-testing --test scribe -P
+journey --run-ignored=only` under the test Postgres: 41 passed.

@@ -632,6 +632,10 @@ async fn scribe_hot_path_telemetry_reconciles() {
         expected,
         "the table holds each acknowledged row once"
     );
+    server
+        .settle_bifrost_outbox()
+        .await
+        .expect("the read's audit row reaches Scribe before the freeze");
 
     // Freeze, publication not yet requested: the staged backlog is visible
     // and equals the staging owner, while acknowledged rows stay readable.

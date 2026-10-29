@@ -1172,6 +1172,10 @@ async fn acknowledged_rows_survive_stage_pressure_and_restart() {
         .await
         .expect("the near-maximum legal request is acknowledged");
     assert_eq!(sorted_values(&client, &table).await, rows);
+    server
+        .settle_bifrost_outbox()
+        .await
+        .expect("the read's audit row reaches Scribe before the root fills");
     let wal_root = server
         .scribe_wal_root_for_test()
         .expect("the pod composes a WAL")

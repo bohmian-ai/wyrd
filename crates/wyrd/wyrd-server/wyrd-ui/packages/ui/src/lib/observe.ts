@@ -4,7 +4,9 @@
  * `SIGNALS`; every value, range bound and identity is a typed `$n` bind.
  */
 import { failed, wyrdProblem, type Loaded, type Problem, type QueryParam, type QueryResult, type WireRequest } from './contract.js';
+import { fmtDuration } from './format.js';
 import { bucketFor, chartParams, resolveRange, type LoadContext } from './loaders.js';
+import { columnIndex } from './plot.js';
 import {
   SIGNALS,
   type AbsoluteRange,
@@ -325,4 +327,86 @@ export async function loadRecordDetail(input: RecordDetailInput, context: LoadCo
     return { input, result: { state: 'empty', data: read.value, reason: `No retained ${what} you may read.` } };
   }
   return { input, result: { state: 'populated', data: read.value } };
+}
+
+/**
+ * An Arrow JSON nanosecond timestamp (`2026-10-20T14:05:00.123456789+00:00`)
+ * as epoch nanoseconds, exact past the millisecond a `Date` keeps.
+ * Returns `undefined` for a value that is not such a timestamp.
+ */
+export function parseNanos(value: unknown): bigint | undefined {
+  if (typeof value !== 'string') return undefined;
+  const match = /^([^.]+?)(?:\.(\d{1,9}))?([zZ]|[+-]\d\d:?\d\d)?$/.exec(value);
+  const ms = match ? Date.parse(`${match[1]}${match[3] ?? 'Z'}`) : Number.NaN;
+  if (!match || Number.isNaN(ms)) return undefined;
+  return BigInt(ms) * 1_000_000n + BigInt((match[2] ?? '').padEnd(9, '0'));
+}
+
+/** A row cell as text: null is `∅`, a nanosecond duration reads as time, nested values as JSON. */
+export function cellText(column: string, value: unknown): string {
+  if (value === null || value === undefined) return '∅';
+  if (column === 'duration_nano') return fmtDuration(Math.round(Number(value) / 1e6));
+  if (column.endsWith('_unix_nano') && typeof value === 'string') return value.replace('T', ' ').replace(/(\+00:00|Z)$/, 'Z');
+  return typeof value === 'object' ? JSON.stringify(value) : String(value);
+}
+
+/** One span placed in its trace: depth under its parent and offset from the trace start. */
+export interface WaterfallSpan {
+  readonly spanId: string;
+  readonly parentId: string | null;
+  readonly depth: number;
+  readonly name: string;
+  readonly service: string | null;
+  readonly startMs: number;
+  readonly durationMs: number;
+  readonly error: boolean;
+  readonly children: number;
+}
+
+/**
+ * Place spans depth-first in start order. A span whose parent is not
+ * retained or not readable, or whose parents form a cycle, becomes a root,
+ * so no span is dropped.
+ */
+export function spanTree(result: QueryResult): WaterfallSpan[] {
+  const at = (name: string) => columnIndex(result, name);
+  const [id, parent, name, service, start, duration, status] = [
+    'span_id', 'parent_span_id', 'name', 'service_name', 'start_time_unix_nano', 'duration_nano', 'status_code'
+  ].map(at);
+  const ids = new Set(result.rows.map((row) => String(row[id])));
+  const children = new Map<string | null, (readonly unknown[])[]>();
+  for (const row of result.rows) {
+    const key = row[parent] !== null && ids.has(String(row[parent])) ? String(row[parent]) : null;
+    children.set(key, [...(children.get(key) ?? []), row]);
+  }
+  const origin = result.rows.reduce<bigint | undefined>((min, row) => {
+    const ns = parseNanos(row[start]);
+    return ns !== undefined && (min === undefined || ns < min) ? ns : min;
+  }, undefined);
+  const placed: WaterfallSpan[] = [];
+  const seen = new Set<string>();
+  const visit = (key: string | null, depth: number, rows = children.get(key) ?? []) => {
+    for (const row of rows) {
+      const spanId = String(row[id]);
+      if (seen.has(spanId)) continue;
+      seen.add(spanId);
+      const ns = parseNanos(row[start]);
+      placed.push({
+        spanId,
+        parentId: row[parent] === null ? null : String(row[parent]),
+        depth,
+        name: String(row[name]),
+        service: row[service] === null ? null : String(row[service]),
+        startMs: ns !== undefined && origin !== undefined ? Number(ns - origin) / 1e6 : 0,
+        durationMs: Number(row[duration]) / 1e6,
+        error: Number(row[status]) === STATUS_ERROR,
+        children: children.get(spanId)?.length ?? 0
+      });
+      visit(spanId, depth + 1);
+    }
+  };
+  visit(null, 0);
+  // A parent cycle is unreachable from any root; its spans still show, as roots.
+  visit(null, 0, result.rows.filter((row) => !seen.has(String(row[id]))));
+  return placed;
 }

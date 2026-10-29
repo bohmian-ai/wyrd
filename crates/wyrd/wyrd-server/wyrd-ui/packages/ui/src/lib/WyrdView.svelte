@@ -5,7 +5,7 @@
   and only the current generation may write results.
 -->
 <script lang="ts">
-  import { untrack } from 'svelte';
+  import { untrack, type Component } from 'svelte';
   import { fmtInstant, parseInstant } from './format.js';
   import { failed, wyrdProblem, type ActionIntent, type ActionState, type Executor, type Problem } from './contract.js';
   import {
@@ -14,17 +14,21 @@
     resolveRange,
     validateIntent,
     validatePanel,
-    type CardHeaderProps,
-    type ChartProps,
     type ComponentName,
-    type ComponentProps
+    type ComponentProps,
+    type ValidPanel
   } from './loaders.js';
-  import { ViewDocumentSchema, type AbsoluteRange, type Layout, type ViewDocument } from './schemas.js';
+  import { ViewDocumentSchema, type AbsoluteRange, type Layout, type Range, type ViewDocument } from './schemas.js';
   import { COLUMNS, GAP, NARROW, ROW, edit, place, rowsHeight } from './layout.js';
   import ActionButton from './components/ActionButton.svelte';
   import CardHeader from './components/CardHeader.svelte';
   import Chart from './components/Chart.svelte';
   import EmptyState from './components/EmptyState.svelte';
+  import FacetRail from './components/FacetRail.svelte';
+  import RecordDetail from './components/RecordDetail.svelte';
+  import RecordTable from './components/RecordTable.svelte';
+  import StatStrip from './components/StatStrip.svelte';
+  import TraceWaterfall from './components/TraceWaterfall.svelte';
   import type { PanelLoader, ViewActionHandler } from './view.js';
 
   interface Props {
@@ -57,6 +61,12 @@
   let brushed = $state<AbsoluteRange | undefined>();
   let panels = $state<PanelView[]>([]);
   let controllers: AbortController[] = [];
+  let timers: ReturnType<typeof setInterval>[] = [];
+
+  /** The component that renders each catalog name. */
+  const VIEWS: Record<ComponentName, Component<any>> = { Chart, CardHeader, StatStrip, FacetRail, RecordTable, TraceWaterfall, RecordDetail };
+  /** How often a live panel re-reads. */
+  const LIVE_MS = 5_000;
 
   /** The host's loader or executor; derived so a host re-passing the same one never reloads panels. */
   const source = $derived(load ?? executor);
@@ -233,6 +243,8 @@
   }
 
   function abortAll() {
+    for (const timer of timers) clearInterval(timer);
+    timers = [];
     for (const controller of controllers) controller.abort();
     controllers = [];
   }
@@ -253,10 +265,30 @@
         (loaded) => settle(panel.id, controller, 'code' in loaded ? failed(loaded) : loaded),
         (error: unknown) => settle(panel.id, controller, failed(wyrdProblem('internal', `The panel failed to load: ${String(error)}`)))
       );
+      if ((valid.input as { live?: boolean }).live) timers.push(setInterval(() => refresh(panel.id, valid, override, view.data.range, run), LIVE_MS));
       const loading = { input: valid.input, result: { state: 'loading' } } as ComponentProps[ComponentName];
       return { id: panel.id, component: valid.component, props: loading, actions: {} };
     });
   }
+
+  /**
+   * Re-read one live panel over a range re-resolved now, so a relative range
+   * slides. The previous refresh is aborted first; the panel keeps its rows
+   * until this one settles.
+   */
+  function refresh(id: string, valid: ValidPanel, override: AbsoluteRange | undefined, range: Range, run: PanelLoader) {
+    const tick = new AbortController();
+    controllers = [...controllers.filter((each) => !each.signal.aborted), tick];
+    refreshing.get(id)?.abort();
+    refreshing.set(id, tick);
+    const done = () => (controllers = controllers.filter((each) => each !== tick));
+    run(valid.component, valid.input, { range: override ?? resolveRange(range), signal: tick.signal }).then(
+      (loaded) => (settle(id, tick, 'code' in loaded ? failed(loaded) : loaded), done()),
+      (error: unknown) => (settle(id, tick, failed(wyrdProblem('internal', `The panel failed to load: ${String(error)}`))), done())
+    );
+  }
+  /** The in-flight refresh of each live panel. */
+  const refreshing = new Map<string, AbortController>();
 
   /** Accept a load only from a controller of the current generation; a failure keeps the panel's input. */
   function settle(id: string, controller: AbortController, outcome: ComponentProps[ComponentName] | ReturnType<typeof failed>) {
@@ -328,11 +360,8 @@
               <EmptyState state="error" problem={panel.problem} />
             {:else}
               {@const onaction = (intent: ActionIntent) => act(panel, intent)}
-              {#if panel.component === 'Chart'}
-                <Chart {...panel.props as ChartProps} actions={panel.actions} {onaction} />
-              {:else}
-                <CardHeader {...panel.props as CardHeaderProps} actions={panel.actions} {onaction} />
-              {/if}
+              {@const View = VIEWS[panel.component]}
+              <View {...panel.props} actions={panel.actions} {onaction} />
             {/if}
           </div>
           {#if editable}

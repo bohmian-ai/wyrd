@@ -90,3 +90,31 @@ Stop for a changed public contract, credential/security or durable ownership req
 - [AGENTS.md](../../../../AGENTS.md), [agent rules](../../../../AGENTS.md), [design](../../../../architecture/wyrd-design.md), [doctrine](../../../../architecture/wyrd-design.md).
 - [Execution](../../../../changes/implementation-execution.md), [TDD](../../../../changes/spec-driven-development.md), [testing](../../../../TESTING.md).
 - [Bifrost contracts](../../../../architecture/bifrost-design.md), [security](../../../../architecture/wyrd-security-posture.md), [deployment/release](../../../../architecture/operations/deployment-and-release.md).
+
+## Implementation Evidence
+
+Owners reused: `Bifrost`/`bifrost.query` through the TASK-003 executor and `loadPanel` (no second transport); canonical `bifrost.traces.spans`, `logs.records`, `metrics.points`, `gateway.calls` read directly. New code: `packages/ui/src/lib/observe.ts` (bound-clause SQL planner and shapers), five components, `SIGNALS` allowlists in `schemas.ts`.
+
+| Acceptance criterion | Implementation evidence | Verification evidence | Result |
+|---|---|---|---|
+| StatStrip, FacetRail, RecordTable, TraceWaterfall, RecordDetail: T1 states | `packages/ui/src/lib/components/*.svelte`; `EmptyState` for loading/empty/denied/error | `TASK-004: Canonical signal interactions` (state shells for all five); `/_gallery` Observe board, headless Chrome at 1280 and 390 px, no page overflow | PASS |
+| T2 actual requests and shape | `observe.ts::Binds`, `listQuery`, `countsQuery`, `facetQuery`, `statQueries`, `waterfallQuery`, `detailQuery`; values bound as `$n`, columns from `SIGNALS` | Exact SQL/params for traces (root rows of traces with any matching span), counts for visible traces only, logs facets, cost per currency, tokens from `gateway.calls.usage`; refused list issues no dependent read | PASS |
+| T3 view validation and render | `LOADERS`, `VIEWS` in `WyrdView.svelte`; catalog regenerated | Schema refusals (unknown column, injected trace id, `where` on gateway stats); WyrdView with all panels and the live interval | PASS |
+| T4 built AppBridge HTML | `dist/wyrd-view.html` | `TASK-004: Authorized Observe across hosts` AppBridge RecordTable + TraceWaterfall | PASS |
+| T5 real authorized Node/server data, both hosts | OTLP/HTTP JSON seeding per tenant | Same test over SDK and MCP: traces with counts `[TRACE,3,1]`, child-span WHERE lists its root, distinct trace facet, waterfall offsets 0/100/200 ns-exact, span/log detail, foreign tenant trace empty, `cards:read` principal denied on all five | PASS |
+| Interactions: WHERE/facets/counts, grouping, live hold, waterfall, detail | `RecordTable` hold (hover/focus/scroll/open, rows and counts together, "↑ N new"), `groupBy`; `TraceWaterfall` collapse/expand/errors-only/selected path; `RecordDetail` tabs and intents only with a host | Unit interactions incl. held counts after open, refused counts read "—", deep `spanId` opens its path | PASS |
+| Metrics keep recorded type; missing ≠ zero; no fabricated quantile | Metric columns pass through; structure columns (`bucket_counts`, `explicit_bounds`, …) listable; null cells render ∅, null stats "—" | T5 `ui.requests` sum int 7 / `ui.load` gauge double 0.5 with nulls; tokens `[[null]]`, cost `[]` with no gateway calls | PASS |
+| Service-scoped variants on REQ-023 | `StatStrip.scope` binds `workload_card_uid`/`subject_card_uid` | T5: span tagged `wyrd.card_uid` = declared Model → subject scope counts 1 of 3; unrecorded uid empty | PASS (subject); workload path shares the same bind, not separately seeded |
+
+Commands: the two scenario commands above (unit 1 passed; integration file 3 passed), `pnpm test` 42 passed, `pnpm check` 0 errors, `pnpm build`, `mise run codegen:check`, `git diff --check`.
+
+Diagnoses:
+- **Live WyrdView test timed out.** Symptom: `waitFor` never resolved under `vi.useFakeTimers`. Evidence: testing-library polls with the faked `setInterval`. Cause: the poll itself was frozen. Fix site: the test awaits a promise resolved when the counts request reaches the executor; no timeout change.
+- **T5 span `kind` mismatch.** Symptom: expected `'Unspecified'`. Evidence: `SpansTable` stores `kind` as Int32. Cause: wrong expectation. Fix site: assertion uses the stored `1`.
+- **Unlabeled DurationBar had zero-width track.** Cause: the grid kept a label column. Fix site: `DurationBar.svelte` `.unlabeled` grid.
+
+Limits: Int64 values above 2^53 lose precision in JSON transport; spans have no column-level sensitive-payload denial, table permission governs every column; `FilterSchema` expresses equality, not-equal and null only; verification-result signal, duration-bucket facets and pagination are not in this task.
+
+Non-goals confirmed: no Observe routes, no ingest schema, no new transport or lifecycle owner, no dependency added; only the UI package, gallery, fixtures and tests changed.
+
+Human visual checkpoint: pending — each of the five components on `/_gallery`, light/dark, desktop/mobile, keyboard and touch.

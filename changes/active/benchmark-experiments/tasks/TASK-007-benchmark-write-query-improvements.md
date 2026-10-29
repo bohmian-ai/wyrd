@@ -1267,3 +1267,15 @@ Owners and steps, in order, each committed on its own:
    evidence below, `bifrost-design.md` and benchmark README updates, `mise run
    verify:bifrost`.
 
+
+### Revision 20 closeout evidence
+
+Step 6 was completed with TASK-008. The figures come from its records and are not repeated here; see TASK-008 Evidence, Step 6.
+
+| Closeout item | Evidence | Result |
+|---|---|---|
+| One exclusive `mise run bench:l1:bifrost:hot` | `hot/20261029T223134Z-9a6e15750.json`: VALID, clean, 219.2 s of 300 s, with REQ-030's nine cases plus point scaling | PASS |
+| Item 10 evidence | The same record measures shredded and long-tail span filters on both sources: shredded memtable 38.011 ms / 164.740 CPU ms/q, staged 90.571 / 254.310 / 19.71 MB/q; long-tail memtable 24.822 / 108.000, staged 60.228 / 159.889 / 19.71 MB/q. Memory reads now report scanned rows and bytes (TASK-008 step 5) | PASS; performance misses are recorded in TASK-008 |
+| `architecture/bifrost-design.md` | Staged reads cached through the shared reader, live expression projection and memory scan facts; the bench-only stage/publish controls, their platform-admin `tenant_suspend` permission and nonblocking `platform.authz` audit, which the design had not described, are added under "Append, rotation, and staging" | PASS |
+| Benchmark README | `hot` already described the stage/publish placement; the scan-facts bullet now defines memtable rows and bytes | PASS |
+| `mise run verify:bifrost` | Red with seven failures, all of which fail identically on the pre-task base `471f69ff9` (TASK-008 Closeout gate); oracle, scribe and forge lanes green | FAIL, pre-existing |

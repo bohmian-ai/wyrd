@@ -791,6 +791,16 @@ authoritative until that transaction is
 committed or reconciled as identical. New cuts then use the published object;
 existing staged-reader leases finish before local deletion.
 
+A server built with the `bench` cargo feature, which only the benchmark
+build enables, adds `POST /platform/benchmark/scribe/stage` (`stage_writable`,
+`{"rows_staged": n}`) and `POST /platform/benchmark/scribe/publish`
+(`flush_staged`, `{"claims_published": n}`). Both run this process's
+production transitions for every tenant it holds, so a benchmark places its
+fixture without waiting on rotation or retention. They are serialized per
+replica, require the platform administrator's `tenant_suspend` permission, are
+audited as `platform.authz` without blocking, and are not OpenAPI operations.
+A shipped server has neither route.
+
 ### Live tail, recovery, and shutdown
 
 Every local path a node owns derives from its one exclusively locked

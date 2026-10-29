@@ -361,3 +361,145 @@ Path keys therefore never alias a different run. The limit is that a run rewritt
 | `server` `owner_inspection::failed_wal_replay_is_role_local` | FAIL (`owner_inspection.rs:365`) | FAIL | Predates this task |
 
 Every Bifrost read lane this task touches is green: oracle 62/62, scribe 42/42, forge 24/24. The seven failures are in the verification runtime, WAL replay, the audit journey and stale SDK/cluster tests, all outside TASK-008's write set, and are left for their owners.
+
+### Step 6: exclusive benchmarks
+
+Both runs were exclusive: nothing else built, tested or loaded the host, and the tree was clean at each start. The records are committed on `benchmark-records` (`3412ffce9`, not pushed).
+
+| Run | Record | Verdict | Measured elapsed / budget |
+|---|---|---|---|
+| `mise run bench:l1:bifrost:hot` | `hot/20261029T223134Z-9a6e15750.json` | VALID, clean | 219.2 s / 300 s |
+| `mise run bench:l1:bifrost:parquet` | `parquet/20261029T223613Z-9a6e15750.json` | VALID, clean | 284.8 s / 300 s |
+
+Host and build match every reference record: AMD Ryzen 9 9950X, 32 CPU / 91 GiB, Linux, rustc 1.99.0 (b940084d7), release, `-C force-frame-pointers=yes`, line-tables-only. Other-process load before and after each run was 0.52–0.65 cores, under the 3.2-core limit. The server binary differs only by this task's code and the fork repin (1,226,533,368 bytes vs 1,221,643,760 in 471f69ff9). The hot controls are identical to 471f69ff9's, and the parquet controls are identical to 459617bae's.
+
+Spread is the range across the three repetitions. A "—" for historical memory bytes or rows means the reference record never had them; no estimate is substituted. Memory bytes are distinct Arrow buffer bytes of the declared leaves (step 5), so they measure scan work, not storage, and are not comparable with staged Parquet bytes.
+
+#### Hot, against `hot/20261029T180639Z-471f69ff9.json`
+
+| Step | Metric | Repetitions | Median | Spread | Reference median | Δ |
+|---|---|---|---|---|---|---|
+| `point-memtable-c1` | p99 ms | 1.608 / 1.582 / 1.640 | 1.608 | 0.058 | 1.542 | +4.2% |
+| `point-memtable-c1` | CPU ms/q | 1.298 / 1.299 / 1.298 | 1.298 | 0.001 | 1.260 | +3.1% |
+| `point-memtable-c1` | bytes/q | 393,244 / 393,244 / 393,320 | 393,244 | 76 | — | — |
+| `point-memtable-c1` | rows/q | 16,390 / 16,390 / 16,393 | 16,390 | 3 | — | — |
+| `point-memtable-c1` | q/CPU-s | 770.5 / 770.0 / 770.1 | 770.1 | 0.5 | 793.9 | -3.0% |
+| `point-memtable-c64` | p99 ms | 5.022 / 4.964 / 5.214 | 5.022 | 0.250 | 4.903 | +2.4% |
+| `point-memtable-c64` | CPU ms/q | 1.783 / 1.783 / 1.792 | 1.783 | 0.009 | 1.745 | +2.2% |
+| `point-memtable-c64` | bytes/q | 393,296 / 393,288 / 393,265 | 393,288 | 31 | — | — |
+| `point-memtable-c64` | rows/q | 16,392 / 16,391 / 16,390 | 16,391 | 1 | — | — |
+| `point-memtable-c64` | q/CPU-s | 560.9 / 560.9 / 558.2 | 560.9 | 2.7 | 573.1 | -2.1% |
+| `point-staged-c1` | p99 ms | 3.557 / 3.416 / 3.398 | 3.416 | 0.160 | 3.598 | -5.1% |
+| `point-staged-c1` | CPU ms/q | 2.872 / 2.788 / 2.801 | 2.801 | 0.085 | 2.868 | -2.3% |
+| `point-staged-c1` | bytes/q | 222,766 / 222,211 / 222,778 | 222,766 | 566 | 213,323 | +4.4% |
+| `point-staged-c1` | rows/q | 1 / 1 / 1 | 1 | 0 | — | — |
+| `point-staged-c1` | q/CPU-s | 348.2 / 358.7 / 357.0 | 357.0 | 10.6 | 348.7 | +2.4% |
+| `small-aggregate-memtable-c1` | p99 ms | 3.308 / 3.408 / 3.469 | 3.408 | 0.162 | 2.902 | +17.4% |
+| `small-aggregate-memtable-c1` | CPU ms/q | 2.897 / 2.933 / 2.919 | 2.919 | 0.036 | 2.434 | +19.9% |
+| `small-aggregate-memtable-c1` | bytes/q | 2,264,040 / 2,263,670 / 2,263,945 | 2,263,945 | 370 | — | — |
+| `small-aggregate-memtable-c1` | rows/q | 94,324 / 94,308 / 94,320 | 94,320 | 15 | — | — |
+| `small-aggregate-memtable-c1` | q/CPU-s | 345.2 / 340.9 / 342.6 | 342.6 | 4.3 | 410.9 | -16.6% |
+| `small-aggregate-staged-c1` | p99 ms | 5.648 / 6.033 / 5.825 | 5.825 | 0.385 | 5.616 | +3.7% |
+| `small-aggregate-staged-c1` | CPU ms/q | 5.235 / 5.338 / 5.303 | 5.303 | 0.104 | 5.220 | +1.6% |
+| `small-aggregate-staged-c1` | bytes/q | 456,427 / 455,657 / 456,927 | 456,427 | 1,270 | 439,677 | +3.8% |
+| `small-aggregate-staged-c1` | rows/q | 78,143 / 78,143 / 78,143 | 78,143 | 0 | — | — |
+| `small-aggregate-staged-c1` | q/CPU-s | 191.0 / 187.3 / 188.6 | 188.6 | 3.7 | 191.6 | -1.6% |
+| `span-shredded-memtable-c1` | p99 ms | 38.011 / 37.454 / 38.273 | 38.011 | 0.819 | 36.635 | +3.8% |
+| `span-shredded-memtable-c1` | CPU ms/q | 164.740 / 164.516 / 164.870 | 164.740 | 0.354 | 185.897 | -11.4% |
+| `span-shredded-memtable-c1` | bytes/q | 278,134,783 / 278,134,783 / 278,134,783 | 278,134,783 | 0 | — | — |
+| `span-shredded-memtable-c1` | rows/q | 500,223 / 500,223 / 500,223 | 500,223 | 0 | — | — |
+| `span-shredded-memtable-c1` | q/CPU-s | 6.1 / 6.1 / 6.1 | 6.1 | 0.0 | 5.4 | +12.8% |
+| `span-shredded-staged-c1` | p99 ms | 90.571 / 91.095 / 89.981 | 90.571 | 1.114 | 98.566 | -8.1% |
+| `span-shredded-staged-c1` | CPU ms/q | 255.172 / 254.138 / 254.310 | 254.310 | 1.034 | 258.772 | -1.7% |
+| `span-shredded-staged-c1` | bytes/q | 19,709,951 / 19,709,951 / 19,709,951 | 19,709,951 | 0 | 19,709,951 | +0.0% |
+| `span-shredded-staged-c1` | rows/q | 31,487 / 31,487 / 31,487 | 31,487 | 0 | — | — |
+| `span-shredded-staged-c1` | q/CPU-s | 3.9 / 3.9 / 3.9 | 3.9 | 0.0 | 3.9 | +1.8% |
+| `span-long-tail-memtable-c1` | p99 ms | 25.641 / 24.822 / 24.723 | 24.822 | 0.918 | 23.691 | +4.8% |
+| `span-long-tail-memtable-c1` | CPU ms/q | 108.000 / 107.699 / 108.222 | 108.000 | 0.523 | 99.046 | +9.0% |
+| `span-long-tail-memtable-c1` | bytes/q | 278,134,783 / 278,134,783 / 278,134,783 | 278,134,783 | 0 | — | — |
+| `span-long-tail-memtable-c1` | rows/q | 500,223 / 500,223 / 500,223 | 500,223 | 0 | — | — |
+| `span-long-tail-memtable-c1` | q/CPU-s | 9.3 / 9.3 / 9.2 | 9.3 | 0.0 | 10.1 | -8.3% |
+| `span-long-tail-staged-c1` | p99 ms | 60.228 / 63.308 / 56.492 | 60.228 | 6.816 | 59.736 | +0.8% |
+| `span-long-tail-staged-c1` | CPU ms/q | 159.889 / 161.798 / 158.352 | 159.889 | 3.446 | 163.977 | -2.5% |
+| `span-long-tail-staged-c1` | bytes/q | 19,709,951 / 19,709,951 / 19,709,951 | 19,709,951 | 0 | 19,709,951 | +0.0% |
+| `span-long-tail-staged-c1` | rows/q | 505 / 505 / 505 | 505 | 0 | — | — |
+| `span-long-tail-staged-c1` | q/CPU-s | 6.3 / 6.2 / 6.3 | 6.3 | 0.1 | 6.1 | +2.6% |
+
+Point steps against the earlier records, by explicit mapping only (`point-c1` → `point-memtable-c1`, `point-c64` → `point-memtable-c64`). Those records predate the mixed-source fixture controls, so they are absolute recovery targets, not a like-for-like comparison:
+
+| Current step | Metric | 9a6e15750 | 471f69ff9 | 434aaf5c1 (`point-*`) | 12fc33f08 (`point-*`) |
+|---|---|---|---|---|---|
+| `point-memtable-c1` | q/CPU-s | 770.1 | 793.9 | 860.8 | 885.8 |
+| `point-memtable-c1` | p99 ms | 1.608 | 1.542 | 1.620 | 1.514 |
+| `point-memtable-c64` | p99 ms | 5.022 | 4.903 | 4.219 | 4.305 |
+| `point-memtable-c64` | q/CPU-s | 560.9 | 573.1 | 578.0 | 584.0 |
+
+Staged/memtable ratios, each within its own record:
+
+| Pair | Ratio | 9a6e15750 | 471f69ff9 | Memtable side |
+|---|---|---|---|---|
+| shredded | p99 | 2.383 | 2.690 | slower: 36.635 → 38.011 ms |
+| shredded | CPU/q | 1.544 | 1.392 | faster: 185.897 → 164.740 ms |
+| long-tail | p99 | 2.426 | 2.521 | slower: 23.691 → 24.822 ms |
+| long-tail | CPU/q | 1.480 | 1.656 | slower: 99.046 → 108.000 ms |
+
+#### Parquet, against `parquet/20261029T134546Z-459617bae.json`
+
+`full-scan-c1` reports p95, as the experiment declares. The warehouse path is unchanged: scanned bytes and rows on full-scan, shredded and long-tail are identical.
+
+| Step | Metric | Repetitions | Median | Spread | Reference median | Δ |
+|---|---|---|---|---|---|---|
+| `point-c1` | p99 ms | 2.871 / 2.906 / 3.176 | 2.906 | 0.305 | 2.886 | +0.7% |
+| `point-c1` | CPU ms/q | 2.215 / 2.232 / 2.229 | 2.229 | 0.017 | 2.160 | +3.2% |
+| `point-c1` | bytes/q | 185,436 / 185,150 / 185,179 | 185,179 | 286 | 181,370 | +2.1% |
+| `point-c1` | rows/q | 1 / 1 / 1 | 1 | 0 | 1 | +0.0% |
+| `point-c1` | q/CPU-s | 451.4 / 448.0 / 448.6 | 448.6 | 3.4 | 462.9 | -3.1% |
+| `point-c64` | p99 ms | 11.338 / 11.297 / 11.182 | 11.297 | 0.156 | 10.789 | +4.7% |
+| `point-c64` | CPU ms/q | 3.604 / 3.626 / 3.605 | 3.605 | 0.022 | 3.501 | +3.0% |
+| `point-c64` | bytes/q | 185,297 / 185,287 / 185,316 | 185,297 | 29 | 181,411 | +2.1% |
+| `point-c64` | rows/q | 1 / 1 / 1 | 1 | 0 | 1 | +0.0% |
+| `point-c64` | q/CPU-s | 277.5 / 275.7 / 277.4 | 277.4 | 1.7 | 285.6 | -2.9% |
+| `small-aggregate-c1` | p99 ms | 5.738 / 6.033 / 5.722 | 5.738 | 0.311 | 5.784 | -0.8% |
+| `small-aggregate-c1` | CPU ms/q | 5.016 / 5.412 / 5.021 | 5.021 | 0.395 | 5.076 | -1.1% |
+| `small-aggregate-c1` | bytes/q | 503,765 / 503,759 / 503,651 | 503,759 | 114 | 496,285 | +1.5% |
+| `small-aggregate-c1` | rows/q | 100,031 / 100,031 / 100,031 | 100,031 | 0 | 100,031 | +0.0% |
+| `small-aggregate-c1` | q/CPU-s | 199.3 / 184.8 / 199.2 | 199.2 | 14.6 | 197.0 | +1.1% |
+| `full-scan-c1` | p95 ms | 53.674 / 53.543 / 52.527 | 53.543 | 1.147 | 52.658 | +1.7% |
+| `full-scan-c1` | CPU ms/q | 468.119 / 467.228 / 459.608 | 467.228 | 8.511 | 467.426 | -0.0% |
+| `full-scan-c1` | bytes/q | 248,512,511 / 248,512,511 / 248,512,511 | 248,512,511 | 0 | 248,512,511 | +0.0% |
+| `full-scan-c1` | rows/q | 10,002,431 / 10,002,431 / 10,002,431 | 10,002,431 | 0 | 10,002,431 | +0.0% |
+| `full-scan-c1` | q/CPU-s | 2.1 / 2.1 / 2.2 | 2.1 | 0.0 | 2.1 | +0.0% |
+| `span-trace-c1` | p99 ms | 4.469 / 4.604 / 4.456 | 4.469 | 0.147 | 4.370 | +2.2% |
+| `span-trace-c1` | CPU ms/q | 3.755 / 3.927 / 3.853 | 3.853 | 0.172 | 3.795 | +1.5% |
+| `span-trace-c1` | bytes/q | 688,024 / 688,335 / 689,583 | 688,335 | 1,559 | 688,315 | +0.0% |
+| `span-trace-c1` | rows/q | 8 / 8 / 8 | 8 | 0 | 8 | +0.0% |
+| `span-trace-c1` | q/CPU-s | 266.3 / 254.6 / 259.5 | 259.5 | 11.7 | 263.5 | -1.5% |
+| `span-trace-c64` | p99 ms | 26.411 / 24.609 / 24.347 | 24.609 | 2.064 | 23.642 | +4.1% |
+| `span-trace-c64` | CPU ms/q | 7.095 / 7.021 / 7.040 | 7.040 | 0.074 | 6.925 | +1.7% |
+| `span-trace-c64` | bytes/q | 688,907 / 689,311 / 688,956 | 688,956 | 405 | 689,045 | -0.0% |
+| `span-trace-c64` | rows/q | 8 / 8 / 8 | 8 | 0 | 8 | +0.0% |
+| `span-trace-c64` | q/CPU-s | 140.9 / 142.4 / 142.0 | 142.0 | 1.5 | 144.4 | -1.6% |
+| `span-shredded-c1` | p99 ms | 17.203 / 16.957 / 17.416 | 17.203 | 0.459 | 16.925 | +1.6% |
+| `span-shredded-c1` | CPU ms/q | 74.788 / 74.247 / 76.116 | 74.788 | 1.869 | 75.518 | -1.0% |
+| `span-shredded-c1` | bytes/q | 18,006,015 / 18,006,015 / 18,006,015 | 18,006,015 | 0 | 18,006,015 | +0.0% |
+| `span-shredded-c1` | rows/q | 62,527 / 62,527 / 62,527 | 62,527 | 0 | 62,527 | +0.0% |
+| `span-shredded-c1` | q/CPU-s | 13.4 / 13.5 / 13.1 | 13.4 | 0.3 | 13.2 | +1.0% |
+| `span-long-tail-c1` | p99 ms | 39.059 / 36.700 / 36.176 | 36.700 | 2.884 | 37.487 | -2.1% |
+| `span-long-tail-c1` | CPU ms/q | 196.549 / 201.958 / 195.139 | 196.549 | 6.819 | 194.931 | +0.8% |
+| `span-long-tail-c1` | bytes/q | 29,442,047 / 29,442,047 / 29,442,047 | 29,442,047 | 0 | 29,442,047 | +0.0% |
+| `span-long-tail-c1` | rows/q | 977 / 977 / 977 | 977 | 0 | 977 | +0.0% |
+| `span-long-tail-c1` | q/CPU-s | 5.1 / 5.0 / 5.1 | 5.1 | 0.2 | 5.1 | -0.8% |
+
+#### Acceptance by record
+
+| Target | Result | Status |
+|---|---|---|
+| Full hot VALID within 300 s | VALID, 219.2 s | PASS |
+| `span-shredded-staged-c1` improves p99 and CPU/q against 471f69ff9 | 98.566 → 90.571 ms; 258.772 → 254.310 ms/q | PASS |
+| `span-shredded-memtable-c1` improves p99 and CPU/q against 471f69ff9 | CPU 185.897 → 164.740 ms/q; p99 36.635 → 38.011 ms (+3.8%) | **MISS** (p99) |
+| Staged/memtable p99 and CPU ratios shrink, with memory not slower | shredded p99 ratio shrinks, but memtable p99 is slower; shredded CPU ratio grows 1.392 → 1.544; long-tail ratios shrink, but the memtable is slower on both | **MISS** |
+| Point memtable c1 ≥ 861 q/CPU-s | 770.1 | **MISS** |
+| Point memtable c64 server p99 ≤ 4.31 ms | 5.022 ms | **MISS** |
+| Parquet: no latency, CPU or scanned-byte regression against 459617bae (no tolerance) | Higher on point c1 (p99 +0.7%, CPU +3.2%, bytes +2.1%), point c64 (p99 +4.7%, CPU +3.0%, bytes +2.1%), small-aggregate bytes (+1.5%), span-trace c1 (p99 +2.2%, CPU +1.5%), span-trace c64 (p99 +4.1%, CPU +1.7%), shredded p99 (+1.6%), long-tail CPU (+0.8%), full-scan p95 (+1.7%). Lower or equal on small-aggregate p99/CPU, full-scan CPU, shredded CPU, long-tail p99 | **MISS** |
+
+The other hot memtable steps also cost more server CPU per query than in 471f69ff9: point c1 +3.1%, point c64 +2.2%, small-aggregate +19.9%, long-tail +9.0%. Their staged counterparts held or improved on CPU, except small-aggregate staged (+1.6%). Staged scanned bytes rose on point (+4.4%) and small-aggregate (+3.8%). These measurements do not establish a cause, and none is claimed. Every **MISS** above is unfinished performance acceptance; it does not change either VALID verdict.

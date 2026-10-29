@@ -1,5 +1,5 @@
 /**
- * TASK-003 live proof. The built `ui://wyrd/view` HTML runs in the ext-apps
+ * TASK-003 and TASK-004 live proof. The built `ui://wyrd/view` HTML runs in the ext-apps
  * AppBridge test host; every other read goes to a real Wyrd server started by
  * `@wyrd/testing` over repository Postgres, through the SDK, the MCP endpoint,
  * and the BFF's real browser session. Nothing here mocks the server.
@@ -11,12 +11,24 @@ import type { Cookies } from '@sveltejs/kit';
 import { expect, vi } from 'vitest';
 import { z } from 'zod';
 import { Bifrost, Cards, TableConfig, WyrdClient, type CardRef } from 'wyrd-ai';
-import { loadCardHeader, loadChart, type ChartInput, type Executor, type WireRequest } from 'wyrd-ai-ui/loaders';
+import {
+  loadCardHeader,
+  loadChart,
+  loadFacetRail,
+  loadRecordDetail,
+  loadRecordTable,
+  loadStatStrip,
+  loadTraceWaterfall,
+  spanTree,
+  type ChartInput,
+  type Executor,
+  type WireRequest
+} from 'wyrd-ai-ui/loaders';
 import { mcpExecutor } from 'wyrd-ai-ui/mcp';
 import { nodeExecutor } from 'wyrd-ai-ui/node';
 import { env } from '$env/dynamic/private';
 import { browserSessions } from '$lib/server/auth/browser-sessions';
-import { card, registered, series, summary, timeseries } from '$lib/ui-fixtures';
+import { card, observeAnswer, registered, series, summary, timeseries } from '$lib/ui-fixtures';
 import { POST as loadPanel } from '../routes/t/[tenantKey]/ui/load/+server';
 import { declared, fixture, serverTest } from '../../../../../../sdks/wyrd-sdk-ts/wyrd/tests/support/server';
 import { load as loadExamplePage } from '../../../../../../examples/ui-app/src/routes/+page.server';
@@ -310,4 +322,183 @@ test('TASK-003: Actual four-host foundation proof', async ({ server, seeded }) =
     expect(response.status, panel.id).toBe(200);
     expect(text).not.toContain(server.apiKey);
   }
+});
+
+/** An OTLP/HTTP JSON attribute list. */
+const attrs = (values: Record<string, string>) => Object.entries(values).map(([key, value]) => ({ key, value: { stringValue: value } }));
+/** Nanoseconds since the epoch of an instant inside {@link RANGE}, as OTLP JSON spells them. */
+const nanos = (iso: string, extra = 0n) => String(BigInt(Date.parse(iso)) * 1_000_000n + extra);
+
+/**
+ * Export one trace (a root, a child, an erroring grandchild), one log record
+ * on the grandchild, and an integer sum and a double gauge, as `apiKey`, over
+ * the stock OTLP/HTTP JSON endpoints, then publish them.
+ */
+async function seedSignals(server: { baseUrl: string; flushBifrost(): void }, apiKey: string, ids: { trace: string; service: string }) {
+  const resource = { attributes: attrs({ 'service.name': ids.service }) };
+  const scope = { name: 'wyrd-ui-journey' };
+  const span = (spanId: string, parentSpanId: string, name: string, start: string, ms: number, code: number, attributes: Record<string, string> = {}) => ({
+    traceId: ids.trace,
+    spanId,
+    ...(parentSpanId ? { parentSpanId } : {}),
+    name,
+    kind: 1,
+    startTimeUnixNano: nanos(start, 7n),
+    endTimeUnixNano: String(BigInt(nanos(start, 7n)) + BigInt(ms) * 1_000_000n),
+    status: { code },
+    attributes: attrs(attributes)
+  });
+  const exports = {
+    '/v1/traces': {
+      resourceSpans: [
+        {
+          resource,
+          scopeSpans: [
+            {
+              scope,
+              spans: [
+                span('00f067aa0ba902b7', '', 'invoke_agent support', '2026-10-19T03:00:00Z', 900, 0, { 'gen_ai.operation.name': 'invoke_agent' }),
+                span('53995c3f42cd8ad8', '00f067aa0ba902b7', 'chat ranker', '2026-10-19T03:00:00.100Z', 400, 1, { 'gen_ai.input.messages': '[{"role":"user","parts":[{"type":"text","content":"refund?"}]}]' }),
+                span('b9c7c989f97918e1', '53995c3f42cd8ad8', 'execute_tool search', '2026-10-19T03:00:00.200Z', 100, 2)
+              ]
+            }
+          ]
+        }
+      ]
+    },
+    '/v1/logs': {
+      resourceLogs: [
+        {
+          resource,
+          scopeLogs: [
+            {
+              scope,
+              logRecords: [
+                {
+                  timeUnixNano: nanos('2026-10-19T03:00:00.250Z', 11n),
+                  observedTimeUnixNano: nanos('2026-10-19T03:00:00.251Z'),
+                  severityNumber: 17,
+                  severityText: 'ERROR',
+                  body: { stringValue: 'search timed out' },
+                  traceId: ids.trace,
+                  spanId: 'b9c7c989f97918e1'
+                }
+              ]
+            }
+          ]
+        }
+      ]
+    },
+    '/v1/metrics': {
+      resourceMetrics: [
+        {
+          resource,
+          scopeMetrics: [
+            {
+              scope,
+              metrics: [
+                { name: 'ui.requests', unit: '1', sum: { aggregationTemporality: 2, isMonotonic: true, dataPoints: [{ asInt: '7', timeUnixNano: nanos('2026-10-19T03:00:00Z') }] } },
+                { name: 'ui.load', unit: '1', gauge: { dataPoints: [{ asDouble: 0.5, timeUnixNano: nanos('2026-10-19T03:00:00Z') }] } }
+              ]
+            }
+          ]
+        }
+      ]
+    }
+  };
+  for (const [path, body] of Object.entries(exports)) {
+    const response = await fetch(new URL(path, server.baseUrl), {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', 'x-wyrd-api-key': apiKey },
+      body: JSON.stringify(body)
+    });
+    expect(response.status, `${path}: ${await response.text()}`).toBe(200);
+  }
+  server.flushBifrost();
+}
+
+test('TASK-004: Authorized Observe across hosts', async ({ server }) => {
+  const TRACE = '4bf92f3577b34da6a3ce929d0e0e4736';
+  const FOREIGN = 'a3ce929d0e0e47364bf92f3577b34da6';
+  await seedSignals(server, server.apiKey, { trace: TRACE, service: 'ui-agent' });
+  const acme = server.bootstrapServiceInTenant(server.seedTenant('ui-observe-foreign'), ['admin'], 'ui-observe-admin');
+  await seedSignals(server, acme, { trace: FOREIGN, service: 'foreign-agent' });
+
+  const client = WyrdClient.connect();
+  const mcp = await mcpOver(server.baseUrl, client);
+  try {
+    for (const executor of [nodeExecutor(client), mcp.executor]) {
+      const context = { executor, range: RANGE };
+      // Traces: one row per root span with counts over the whole trace; the other tenant's trace never appears.
+      const traces = await loadRecordTable({ signal: 'traces' }, context);
+      expect(traces.result, JSON.stringify(traces.result)).toMatchObject({
+        state: 'populated',
+        data: {
+          rows: { rows: [[expect.stringMatching(/^2026-10-19T03:00:00\.000000007/), 'invoke_agent support', 'ui-agent', 900_000_000, 0, TRACE, '00f067aa0ba902b7']] },
+          counts: { state: 'populated', data: { rows: [[TRACE, 3, 1]] } }
+        }
+      });
+      // Spans filter by a bound WHERE; the waterfall reads the exact trace with nanosecond starts.
+      const errors = await loadRecordTable({ signal: 'spans', where: [{ column: 'status_code', value: 2 }] }, context);
+      expect(errors.result).toMatchObject({ state: 'populated', data: { rows: { rows: [[expect.any(String), 'execute_tool search', 'ui-agent', 100_000_000, 2, 1, TRACE, 'b9c7c989f97918e1']] } } });
+      const waterfall = await loadTraceWaterfall({ traceId: TRACE }, context);
+      expect(waterfall.result.state === 'populated' && spanTree(waterfall.result.data).map((span) => [span.name, span.depth, span.startMs])).toEqual([
+        ['invoke_agent support', 0, 0],
+        ['chat ranker', 1, 100],
+        ['execute_tool search', 2, 200]
+      ]);
+      expect((await loadTraceWaterfall({ traceId: FOREIGN }, context)).result.state).toBe('empty');
+      // Detail returns the whole span, GenAI messages included, and the log record by its full key.
+      const span = await loadRecordDetail({ traceId: TRACE, spanId: '53995c3f42cd8ad8' }, context);
+      expect(span.result.state === 'populated' && JSON.stringify(span.result.data.rows[0])).toContain('refund?');
+      const logs = await loadRecordTable({ signal: 'logs' }, context);
+      expect(logs.result.state, JSON.stringify(logs.result)).toBe('populated');
+      const [time, , , , , , , observed, request] = logs.result.state === 'populated' ? logs.result.data.rows.rows[0] : [];
+      expect(logs.result.state === 'populated' && logs.result.data.rows.rows[0].slice(1, 7)).toEqual(['ERROR', 'ui-agent', 'search timed out', null, TRACE, 'b9c7c989f97918e1']);
+      const log = await loadRecordDetail({ log: { time_unix_nano: String(time), observed_time_unix_nano: String(observed), wyrd_request_id: String(request) } }, context);
+      expect(log.result).toMatchObject({ state: 'populated', data: { rows: [expect.anything()] } });
+      // Metrics keep their recorded type: the sum is integer-valued, the gauge double-valued, neither zero-filled.
+      const metrics = await loadRecordTable({ signal: 'metrics', columns: ['metric_name', 'metric_type', 'int_value', 'double_value', 'histogram_count'] }, context);
+      expect(metrics.result.state === 'populated' && [...metrics.result.data.rows.rows].sort((a, b) => String(a[0]).localeCompare(String(b[0])))).toEqual([
+        ['ui.load', 'gauge', null, 0.5, null],
+        ['ui.requests', 'sum', 7, null, null]
+      ]);
+      // Facets and stats count this tenant's evidence only.
+      expect((await loadFacetRail({ signal: 'spans', facets: ['service_name'] }, context)).result).toMatchObject({ state: 'populated', data: { facets: [{ values: { rows: [['ui-agent', 3]] } }] } });
+      const stats = await loadStatStrip({ stats: ['traces', 'spans', 'errors', 'invocations', 'cost'] }, context);
+      expect(stats.result.state !== 'loading' && stats.result.state !== 'denied' && stats.result.state !== 'error' && stats.result.data.stats.map(({ total }) => total.rows)).toEqual([[[1]], [[3]], [[1]], [[1]], []]);
+      // An earlier range holds nothing.
+      expect((await loadRecordTable({ signal: 'traces' }, { executor, range: BEFORE })).result).toMatchObject({ state: 'empty', reason: 'No traces match this WHERE in this range.' });
+      expect((await loadStatStrip({ stats: ['spans'] }, { executor, range: BEFORE })).result.state).toBe('empty');
+    }
+  } finally {
+    await mcp.close();
+  }
+
+  // A principal without query permission sees each component's denied state and no dependent read.
+  const cardReader = { executor: nodeExecutor(WyrdClient.connect({ credential: server.scopedApiKey('ui_observe_denied', ['cards:read']) })), range: RANGE };
+  for (const loaded of await Promise.all([
+    loadRecordTable({ signal: 'traces' }, cardReader),
+    loadTraceWaterfall({ traceId: TRACE }, cardReader),
+    loadRecordDetail({ traceId: TRACE, spanId: '53995c3f42cd8ad8' }, cardReader),
+    loadFacetRail({ signal: 'traces', facets: ['service_name'] }, cardReader),
+    loadStatStrip({ stats: ['traces'] }, cardReader)
+  ]))
+    expect(loaded.result).toMatchObject({ state: 'denied', problem: { code: DENIED } });
+
+  // T4: the built HTML renders Observe panels through host tools/call alone.
+  const doc = {
+    version: 'wyrd.view/v1',
+    catalogId: 'wyrd.ui/v1',
+    range: RANGE,
+    panels: [
+      { id: 'list', component: 'RecordTable', input: { signal: 'traces' } },
+      { id: 'trace', component: 'TraceWaterfall', input: { traceId: TRACE } }
+    ]
+  };
+  const app = await appBridgeView(doc, (_name, args) => observeAnswer(String(args.sql)) ?? { code: 'WYRD_SPEC_500_INTERNAL', title: 'Unexpected read' });
+  await vi.waitFor(() => expect(app.document.querySelector('[data-panel="trace"] [role="tree"]')).not.toBeNull());
+  expect(app.document.querySelector('[data-panel="list"]')?.textContent).toContain('invoke_agent support');
+  expect(app.calls.map((call) => call.name)).toEqual(['bifrost.query', 'bifrost.query', 'bifrost.query']);
+  expect(app.calls.find((call) => String(call.arguments.sql).includes("trace_id = decode($1, 'hex')"))?.arguments).toMatchObject({ params: [TRACE], max_rows: 10_000 });
 });

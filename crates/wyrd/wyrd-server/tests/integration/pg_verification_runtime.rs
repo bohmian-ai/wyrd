@@ -28,12 +28,15 @@ use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 use wyrd_runtime::{Permission, PermissionSet};
+use wyrd_server::verification::authority::BackgroundAuthority;
 use wyrd_server::verification::drift::DRIFT_INVALID;
+use wyrd_server::verification::drift::DriftEngine;
 use wyrd_server::verification::engines::EngineOutcome;
 use wyrd_server::verification::fault::{PublicationFault, SentBatch};
 use wyrd_server::verification::fitter::{BaselineFitter, FitGate};
 use wyrd_server::verification::health::RuntimeCapability;
 use wyrd_server::verification::runner::{EngineScript, VERIFIER_UNAVAILABLE};
+use wyrd_server::verification::scheduler::VerificationScheduler;
 use wyrd_server::verification::{CapabilityCrash, RuntimeLimits, VerificationRuntime};
 use wyrd_spec::DataTenantId;
 use wyrd_spec::card::drift::DriftMethod;
@@ -51,7 +54,9 @@ use wyrd_spec::verification::{
 use wyrd_sql::queries::drift_baselines::DriftBaselineQueue;
 use wyrd_sql::queries::storage::artifact_metadata::{self, NewArtifactMetadata};
 use wyrd_sql::queries::verification::{BindingActivity, InactivityTimeout, binding_activity};
-use wyrd_sql::queries::verifier_executions::TerminalStatus;
+use wyrd_sql::queries::verifier_executions::{
+    ScheduleOutcome, ScheduleTick, TerminalStatus, VerifierExecutionQueue,
+};
 use wyrd_testing::WyrdTestServer;
 use wyrd_testing::logs::LogCapture;
 use wyrd_testing::verification::{ExecutionRow, VerificationFixture};
@@ -2263,6 +2268,160 @@ async fn cancelled_scheduler_rolls_back_its_blocked_occurrence() {
         harness.cursor(binding).await,
         armed,
         "the cursor advance rolled back with the enqueue"
+    );
+}
+
+/// Fully qualified table every queued execution's input record lands in.
+const INPUTS: &str = "bifrost.verification.execution_inputs";
+
+impl Harness {
+    /// A scheduler over this server's Postgres, Scribe outbox, and tenant
+    /// issuer, run pass by pass by the test with no runner composed.
+    fn scheduler(&self) -> VerificationScheduler {
+        let state = self.server.state();
+        VerificationScheduler::new(
+            state.postgres.wyrd().clone(),
+            self.server.operator_pool(),
+            VerifierExecutionQueue::default(),
+            BackgroundAuthority::new(state.auth.tenant_issuer(state.bifrost.scribe_outbox())),
+            DriftEngine::new(state.clone(), Duration::from_secs(30)),
+            Duration::from_secs(1),
+        )
+    }
+
+    /// Register a fresh active owner of a due `0 2 * * *` schedule of the
+    /// harness Verifier and return its binding and armed cursor.
+    ///
+    /// # Panics
+    /// Panics when the owner, binding, or activation write fails.
+    async fn due_schedule(&self, owner: &str) -> (BindingId, Option<DateTime<Utc>>) {
+        let (owner, principal) = self.seed.service(owner).await.expect("owner registers");
+        let binding = self
+            .seed
+            .bind_schedule(&owner, &owner, &self.verifier, "0 2 * * *", Vec::new())
+            .await
+            .expect("binding projects");
+        self.seed
+            .activate(principal, &owner)
+            .await
+            .expect("owner activates");
+        self.make_due(binding).await;
+        (binding, self.cursor(binding).await)
+    }
+
+    /// Run `scheduler`'s passes until one decides an occurrence, which the
+    /// queue claims only 30 seconds after its cursor, and
+    /// return that pass's ticks.
+    ///
+    /// # Panics
+    /// Panics when a pass fails or none decides an occurrence within
+    /// [`WAIT`].
+    async fn due_pass(scheduler: &VerificationScheduler) -> Vec<ScheduleTick> {
+        let stop = CancellationToken::new();
+        let deadline = tokio::time::Instant::now() + WAIT;
+        loop {
+            let ticks = scheduler.pass(&stop).await.expect("the pass runs");
+            if !ticks.is_empty() {
+                return ticks;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "no occurrence came due"
+            );
+            tokio::time::sleep(Duration::from_millis(250)).await;
+        }
+    }
+}
+
+/// A scheduled run is admitted only by its own input record's
+/// acknowledgement: while that record's Scribe write is held, the pass has
+/// staged the run but no queue row exists, the cursor stays due, another
+/// queued execution's admission does not admit it, and a later pass does not
+/// prepare the occurrence again; a direct execution still returns. Once the
+/// write is released, the run is admitted under its staged identity and the
+/// cursor moves to the tick's next occurrence in the same commit.
+///
+/// # Panics
+/// Panics when a run exists before its input is acknowledged, the cursor
+/// moves early, the occurrence is prepared twice, the direct execution does
+/// not return, or the acknowledged run or cursor differs.
+#[tokio::test]
+async fn queued_origins_require_their_own_input_ack() {
+    let harness = Harness::start().await;
+    let (binding, armed) = harness.due_schedule("owner").await;
+    assert!(armed.is_some(), "activation armed the schedule cursor");
+    harness.server.flush_bifrost().await.expect("setup settles");
+    let scheduler = harness.scheduler();
+    let stop = CancellationToken::new();
+
+    let stall = harness
+        .server
+        .stall_next_bifrost_write_into(INPUTS)
+        .expect("Scribe stalls");
+    let ticks = Harness::due_pass(&scheduler).await;
+    let [tick] = ticks.as_slice() else {
+        panic!("one occurrence is due: {ticks:?}");
+    };
+    let ScheduleOutcome::Enqueued(staged) = tick.outcome else {
+        panic!("the occurrence calls for a run: {tick:?}");
+    };
+    stall.wait_entered().await;
+    assert!(
+        harness
+            .seed
+            .executions()
+            .await
+            .expect("executions read")
+            .is_empty(),
+        "no run exists before its input is acknowledged"
+    );
+    assert_eq!(harness.cursor(binding).await, armed, "the cursor stays due");
+    let other = harness.submit().await;
+    assert_eq!(
+        harness.seed.executions().await.expect("executions read"),
+        vec![other],
+        "another execution's admission does not admit the held run"
+    );
+    let again = scheduler.pass(&stop).await.expect("the pass runs");
+    assert!(
+        again.is_empty(),
+        "the outstanding occurrence is not prepared again: {again:?}"
+    );
+    let (verifier, subject, _, jwt) = traced_tenant(
+        &harness.server,
+        harness.server.pg_fixture().data_tenant_id(),
+        "direct-caller",
+    )
+    .await;
+    let direct = traced_execute(
+        &harness.server,
+        Some(&jwt),
+        (&verifier, &subject),
+        "00-0af7651916cd43dd8448eb211c80319c-b7ad6b7169203331-01",
+    )
+    .await;
+    assert_eq!(
+        direct,
+        axum::http::StatusCode::OK,
+        "a direct execution returns while a queued input is held"
+    );
+
+    stall.release();
+    stall.wait_completed().await;
+    harness
+        .server
+        .flush_bifrost()
+        .await
+        .expect("the held input is acknowledged and admitted");
+    let executions = harness.seed.executions().await.expect("executions read");
+    assert!(
+        executions.contains(&staged) && executions.len() == 2,
+        "the acknowledged run is admitted under its staged identity: {executions:?}"
+    );
+    assert_eq!(
+        harness.cursor(binding).await,
+        tick.next_run_at,
+        "admission moves the cursor to the next occurrence"
     );
 }
 

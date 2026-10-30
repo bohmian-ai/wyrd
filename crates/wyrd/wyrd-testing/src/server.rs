@@ -1232,7 +1232,13 @@ impl WyrdTestServer {
     /// acknowledged executions are not admitted, within the bound.
     pub async fn settle_bifrost_outbox(&self) -> Result<(), WyrdTestServerError> {
         let deadline = std::time::Instant::now() + FLUSH_BIFROST_BOUND;
-        let unwritten = self.inner.state.bifrost.scribe_outbox().settle(deadline).await;
+        let unwritten = self
+            .inner
+            .state
+            .bifrost
+            .scribe_outbox()
+            .settle(deadline)
+            .await;
         if unwritten != 0 {
             return Err(WyrdTestServerError::Flush(format!(
                 "{unwritten} staged Scribe writes did not settle within {FLUSH_BIFROST_BOUND:?}"
@@ -2884,6 +2890,20 @@ impl WyrdTestServer {
     ) -> Result<Arc<vala_bifrost_redux::scribe::IngestStall>, WyrdTestServerError> {
         self.bifrost_scribe()
             .map(|scribe| scribe.stall_next_ingest_for_test())
+            .ok_or_else(|| WyrdTestServerError::Start("server has no Bifrost Scribe".to_owned()))
+    }
+
+    /// Install a deterministic barrier holding the next Bifrost write into
+    /// `table`, a fully qualified table name, while every other write passes.
+    ///
+    /// # Errors
+    /// Returns an error when this server was started without a Bifrost Scribe.
+    pub fn stall_next_bifrost_write_into(
+        &self,
+        table: &str,
+    ) -> Result<Arc<vala_bifrost_redux::scribe::IngestStall>, WyrdTestServerError> {
+        self.bifrost_scribe()
+            .map(|scribe| scribe.stall_next_ingest_into_for_test(table))
             .ok_or_else(|| WyrdTestServerError::Start("server has no Bifrost Scribe".to_owned()))
     }
 

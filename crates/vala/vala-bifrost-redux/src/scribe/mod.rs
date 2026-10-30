@@ -398,6 +398,9 @@ pub struct IngestStall {
     completed: AtomicBool,
     /// Wakes lifecycle assertions after normal release or cancellation.
     completed_notify: tokio::sync::Notify,
+    /// The only table whose write the barrier holds; `None` holds the next
+    /// write into any table.
+    table: Option<String>,
 }
 
 #[cfg(any(test, feature = "test-support"))]
@@ -2299,7 +2302,23 @@ impl ScribeImpl {
     /// Install a one-shot test barrier at the public write seam.
     #[cfg(any(test, feature = "test-support"))]
     pub fn stall_next_ingest_for_test(&self) -> Arc<IngestStall> {
-        let stall = Arc::new(IngestStall::default());
+        self.stall_ingest_for_test(IngestStall::default())
+    }
+
+    /// Install a one-shot test barrier holding the next write into `table`,
+    /// a fully qualified table name, and passing every other write.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn stall_next_ingest_into_for_test(&self, table: &str) -> Arc<IngestStall> {
+        self.stall_ingest_for_test(IngestStall {
+            table: Some(table.to_owned()),
+            ..IngestStall::default()
+        })
+    }
+
+    /// Arm `stall` as the one-shot barrier at the public write seam.
+    #[cfg(any(test, feature = "test-support"))]
+    fn stall_ingest_for_test(&self, stall: IngestStall) -> Arc<IngestStall> {
+        let stall = Arc::new(stall);
         if let Ok(mut current) = self.ingest_stall.lock() {
             *current = Some(Arc::clone(&stall));
         }

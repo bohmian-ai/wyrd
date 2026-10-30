@@ -477,7 +477,8 @@ impl ScribeImpl {
         let reservation = self.admission.try_reserve(table)?;
         memory.attach_shard(shard)?;
         #[cfg(any(test, feature = "test-support"))]
-        self.pause_admitted_ingest_for_test().await;
+        self.pause_admitted_ingest_for_test(&binding.table_ref.fqn())
+            .await;
         Ok(RootAdmission {
             expected_schema_fingerprint,
             partition_scheme,
@@ -1008,15 +1009,18 @@ impl ScribeImpl {
         }
     }
 
-    /// Pause one admitted write at the deterministic test-support barrier.
+    /// Pause one admitted write into `table` at the deterministic
+    /// test-support barrier, when the armed barrier names no table or names
+    /// `table`.
     #[cfg(any(test, feature = "test-support"))]
-    async fn pause_admitted_ingest_for_test(&self) {
-        if let Some(stall) = self
-            .ingest_stall
-            .lock()
-            .ok()
-            .and_then(|mut current| current.take())
-        {
+    async fn pause_admitted_ingest_for_test(&self, table: &str) {
+        if let Some(stall) = self.ingest_stall.lock().ok().and_then(|mut current| {
+            current
+                .as_ref()
+                .is_some_and(|stall| stall.table.as_deref().is_none_or(|only| only == table))
+                .then(|| current.take())
+                .flatten()
+        }) {
             stall.enter();
             let _completion = super::IngestStallCompletion(&stall);
             stall.release.notified().await;

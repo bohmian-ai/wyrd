@@ -1,10 +1,19 @@
 ---
 id: SPEC-benchmark-experiments
-revision: 22
+revision: 24
 status: approved
 ---
 
 # Benchmarks as experiments
+
+Revision 24 defines the approved producer–consumer architecture with one shared
+processing pipeline. Concrete preparers and a closed admission enum reuse input
+publication, Scribe ACK, per-tenant batch queue acceptance and the distributed
+Bifrost-reading runner. There is no temporary snapshot or preparation table.
+Existing scheduling state is consumed atomically with acknowledged queue
+acceptance. Direct verification retains its nonqueued path and existing costs.
+One replacement TASK-009 retains full-gate proof, all engines' full L1 records,
+benchmark-records publication and the PR to main.
 
 Revision 20 makes `hot` measure everything hot. Hot data is every
 accepted row not yet published: memtable batches and staged Parquet runs.
@@ -1622,7 +1631,199 @@ compares exclusive hot/parquet records by step ID using existing metrics and
 targets. Benchmarks measure; correctness stays in owning unit and journey tests.
 Keep the `prepare_hot` gauge check unchanged.
 
+## Revision 24 supplement — one producer–consumer verification pipeline
+
+The maintainer approved one producer–consumer architecture with a shared
+processing pipeline: concrete producers prepare canonical input records and a
+closed enum carries submitted, scheduled or grouped admission metadata. Every
+queued origin reuses the existing input publication, Scribe ACK, batched queue
+admission and Bifrost-reading runner. Direct verification retains its immediate,
+nonqueued delivery through the same engine and record builders.
+
+There is no temporary input/snapshot/preparation table. Revision 23's worker
+input shortcut and the subsequent proposed prequeue journal are withdrawn.
+Existing schedule cursors and group pending rows remain the retry point until
+acknowledged work is accepted. The maintainer accepts orphan Bifrost input rows
+and repeated preparation before acceptance; this revision does not invent a
+cross-store transaction or stronger prequeue delivery guarantee to eliminate
+that trade-off.
+
+**REQ-035 — Shared work contract and ACK-gated admission.** Keep concrete
+preparation with the existing request, schedule and group owners. Generalize
+the existing submitted-work handoff into one internal prepared-work contract:
+the canonical input record, execution identity and a closed enum of submitted,
+scheduled and grouped admission metadata. Use exhaustive matching at the
+preparation/admission boundaries rather than boxed producer traits, plugins,
+another executor or producer-specific publication/admission loops. Preserve
+the existing input declarations, fixed observation IDs/window and ordered
+group source execution/result references. Selectors name existing Bifrost
+evidence and never copy its values into Postgres.
+
+All queued origins publish through the existing Scribe batching owner. Only
+the successful ACK of that work's own input authorizes queue admission. Model
+that transition with a small internal acknowledged-work value whose creation
+belongs to successful ACK processing; the shared admission owner accepts that
+value rather than an arbitrary prepared request. This is a code boundary, not
+a new public receipt, persistent ledger or promise against source retention.
+Lost/rejected/non-input writes cannot enqueue. No pending execution row exists
+before input ACK; existing explicit pre-admission terminal refusals remain
+non-runnable reporting. Submitted response timing, caller idempotency, authority
+and after-ACK validation stay unchanged: the returned ID confirms staging, not
+durable acceptance. Window submission still records observations.
+
+**REQ-036 — Atomic scheduling acceptance without another store.** Preparing
+scheduled/group input must not advance the schedule cursor or consume its
+pending group. This applies to candidates being queued; existing no-execution
+skip/disarm/refusal decisions keep their transactional cursor/consumption
+behavior and require no fabricated input record or ACK.
+Release the preparation transaction before publication; do not
+hold SQL locks/connections while awaiting Scribe. Carry the selected input and
+frozen admission command in the existing bounded in-memory handoff. Within that
+attempt preserve execution ID, original recorded_at, Verifier/version/subject/
+owner, binding, Trigger/Operators, accepted authority/attribution, retry budget,
+window or group/selection digest and applicable correlation. Do not re-resolve
+mutable binding or authority metadata after its input ACK. A process crash
+before acceptance may re-prepare the still-pending occurrence with a new
+candidate; only accepted work freezes the population for all execution retries.
+
+Extend the existing admission writer, not the scheduler with another queue
+writer. In one tenant transaction after input ACK, accept/replay execution using
+existing occurrence/content dedupe, then apply the matching scheduling-state
+transition. Scheduled acceptance advances only the expected cursor and must
+not overwrite a newer cursor or edited scheduling state. Group acceptance
+consumes only the activity generation used for that preparation. Add a
+non-reused activity generation to the existing group pending row, changed by its
+existing background activity upsert; conditional consumption preserves newer
+activity in the row. A completed old snapshot can be accepted while newer
+activity stays pending for a later run. Distinct later group snapshots may
+still coexist. Core execution and source-state transition commit together;
+rollback leaves the occurrence pending. Duplicate ACK/admission must not create
+another accepted execution or consume newer work. Preserve existing
+pre-admission refusal, five-minute source-incompleteness and authorization
+semantics without pretending that an unacknowledged input is accepted.
+
+Batch these operations in the existing writer: multiple ACKed items of one
+tenant share a transaction, including mixed origins and their scheduling
+updates. Existing conflict/refusal outcomes remain item-specific; transient SQL
+failure rolls back and retries the batch. Do not await each individual input
+ACK before preparing the next item. Use existing bounded passes/reservations
+and bounded process-local in-flight ownership to avoid repeatedly preparing
+the same occurrence while its handoff is outstanding; release that ownership
+on success, failure or cancellation. It is an optimization, not durable state;
+cross-replica correctness comes from Postgres transactions and unique keys.
+Publication/admission failures leave existing scheduling state for bounded
+retry; no new replay scanner, spool, table, public lifecycle or interval option
+is required. Ordinary permanently invalid pre-admission work follows its
+existing refusal/error path; infrastructure failures remain pending and visible.
+
+The accepted limitation is explicit: Bifrost publication and Postgres acceptance
+are not atomic. An input can be archived without its candidate being accepted,
+and a crash may change a not-yet-accepted selection. Queue dedupe prevents
+duplicate accepted logical occurrences; it does not promise unique physical
+input rows or exclude unaccepted evidence from group selection. Existing group
+source semantics already consult Bifrost rather than queue acceptance. Do not
+add an acceptance join, historical repair or extra readiness query to conceal
+that limit. Ordinary source validation, retention and logical replay dedupe
+continue to apply.
+
+**REQ-037 — One distributed queue runner and shared execution.** Every queued
+origin loads its acknowledged input record from Bifrost, resolves supplied
+declarations or window/group references using existing input/drift owners, and
+uses the existing HostedBlocks/VerificationEngine. The runner never reads a
+temporary Postgres input source. One runner implementation can have concurrent
+workers/replicas; Postgres claims and renewable leases coordinate them. Commit
+admission before issuing any local notification hint. Correctness depends on
+shared durable queue polling/claims, never on notification delivery, producer/
+worker colocation or a singleton process. Preserve fairness, lease fencing,
+cancellation, retry budgets, authoritative result identity and Operator dispatch.
+
+Direct verification keeps existing admission/reservations, uses request inputs,
+executes without queue coordination or a pre-execution input ACK, and stages
+input plus result afterward. Existing registry reads remain; no new direct,
+submit-request, capture or audit SQL writes are added. Keep the 50 ms Scribe
+linger and batching. Shared preparation/record construction must not bypass the
+queue's applied-lease fence for result staging. Preserve asynchronous result
+settlement: no result ACK-before-completion or provider exactly-once promise.
+Outages still cause normal bounded staging backpressure; no queued origin gets
+an unbounded bypass of resource admission.
+
+The canonical Bifrost tables remain execution_inputs by execution ID,
+execution_outputs by result ID and payload-free results by result ID. Reuse
+their encoders and common SDK/HTTP/MCP reader. Queued inputs are written before
+execution and are not written again as part of normal result recording; direct
+inputs are staged after execution. Update the existing server-owned
+queue_execution marker to true for submitted/schedule/group and false for
+direct; preserve existing submitted activation fields and background selector
+shapes. Background admission metadata stays in the typed handoff and then
+queue coordination, not a copied activation map in the input. The typed ACK
+handoff—not a caller-supplied boolean—authorizes queue insertion. No new
+built-in column or public input kind is needed.
+
+**REQ-038 — Retirement and full-gate proof.** Remove the rejected execution-row
+staged_input/infinity/activate/restage workaround and all revision-23 worker-PG-
+selector/terminal-plus-ACK-cleanup instructions. Update owning Wyrd/Bifrost
+architecture and affected consumers/tests to this one admission pipeline.
+Retain real missing-source/trace, query-pressure and historical missing-input
+errors; they are defensive behavior, not normal prepublication coordination.
+Revalidate dirty changes, retain needed repairs and discard stale logic without
+weakening tests or editing generated artifacts. The original exact regressions
+remain unchanged: one scheduled attempt/queue wait, four mixed-case attempts
+and 4 + 2*5 = 14 group Bifrost queries. No readiness probes, increased counts,
+lowered-to-12 expectation or loose assertion substitutes are allowed. Prove
+real client journeys, normal concurrency, distributed claims, ACK failure and
+atomicity, direct delivery and tenant isolation. The final integrated candidate
+passes the complete gate with failures repaired at their owners.
+
+**REQ-039 — L1 evidence and delivery.** Freeze a clean committed candidate after
+correctness/review and full-gate proof. Run complete default unprofiled L1
+Verification, Bifrost (writes-parquet, hot, parquet) and Gateway sequentially on
+a quiet Linux x86_64 host. Obtain five VALID records at the same final SHA,
+without dirty/subset/smoke substitutes. Keep targets met/missed/unsettled without
+changing validity or thresholds; retain eligible INVALID attempts and obtain
+valid replacements. Commit/push records only on benchmark-records through the
+existing benchmarks/history worktree; regenerate the report, push the code
+branch and create/update its PR against main with actual gate evidence, measured
+SHA, history commit/record paths and limitations. No merge, release, L2 or
+unrelated performance redesign is authorized.
+
+| Acceptance obligation | Required observation |
+|---|---|
+| AC-015 — All queued origins share ACK-gated admission | Before own-input ACK there is no pending execution or consumed scheduling item. ACKed work uses the same writer, core queue and runner. Direct delivery returns while archival is paused and capacity remains. |
+| AC-016 — Scheduling updates preserve concurrent activity | Cursor/group consumption and accepted queue state commit together; rollback preserves due work. Cross-replica occurrence/content dedupe creates one accepted execution. A delayed group ACK cannot erase newer activity. |
+| AC-017 — Common admission batches work safely | Mixed-origin ACKed items share per-tenant commits, failures retry normally and producer preparation continues without per-item ACK serialization. Lost local notification/process restart does not strand accepted work; prequeue orphan/re-preparation behavior remains an explicit limit. |
+| AC-018 — Execution and records stay consolidated | Concrete preparers and a closed enum feed existing owners. All queued input loads use Bifrost; direct adds no queue/ACK IO. Original counts, source rules, stale-lease protection, three-table readback and shipped surfaces remain correct. |
+| AC-019 — Closeout is reproducible | Full gate green; five full VALID records identify the final SHA; benchmark-records publication stays separate; main-based code PR links actual evidence and target outcomes. |
+
+**Approval and supersession.** The maintainer approved the common pipeline,
+enum recommendation, no-temporary-table trade-off, asynchronous preparation,
+per-tenant admission batch commits and distributed queue semantics, then asked
+for the replacement task and a fresh readiness review. This supersedes all
+revision-23 temporary-table/alternate-runner/terminal-cleanup instructions and
+the withdrawn prequeue-journal proposal. Unrelated revisions 19–22 and prior
+benchmark evidence remain history. The old TASK-009 readiness verdict covered
+revision 23 and does not approve this replacement. There is no open material
+decision in revision 24.
+
+
 ## Revision history and authority
+
+- Revision 24 — 2026-10-30 (approved): one producer–consumer pipeline with
+  concrete preparers, closed admission enum, shared Scribe ACK before queue
+  creation and per-tenant batched admission. No temporary table or alternate
+  worker input path. Existing cursors/pending groups remain until queue
+  acceptance; generation checks preserve newer group activity. Distributed
+  Postgres polling/leases own execution, and local notifications are hints.
+  Orphan prequeue inputs/re-preparation are accepted limitations. The replacement
+  TASK-009 includes full gate, five full L1 records, benchmark-records publication,
+  PR to main and a fresh task/spec readiness review.
+
+- Revision 23 — 2026-10-30 (approved then superseded by revision 24): the maintainer explicitly aligned on
+  separate temporary PostgreSQL selection snapshots, one shared execution
+  engine, two delivery modes, no pre-execution snapshot-publication wait, and
+  terminal-plus-archive-ACK cleanup. The maintainer requested one revision task
+  with consolidation, removal of obsolete work, full-gate proof, full L1 runs
+  for Verification/Bifrost/Gateway, benchmark-records publication and a PR to
+  main. Their follow-up authorizes discarding current changes unless needed.
 
 - Revision 22 — 2026-10-29 (approved): live assignments carry the plan's
   projection expressions for staged and memtable reads; follower projection

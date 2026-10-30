@@ -25,7 +25,7 @@ use wyrd_spec::ids::ModelId;
 use super::stream::{ChatChunks, Frames, MediaCapture, StreamCapture, relay, relay_media};
 use super::{
     BatchAction, IngressDialect, MediaRequest, Prepared, Wire, complete, faithful_embeddings,
-    prepare, refusal,
+    prepare, refusal, usage,
 };
 use crate::credential::ProviderSecret;
 use crate::engine::{
@@ -114,6 +114,7 @@ impl HttpProviderDispatch {
             ProviderAdapter::OpenAiCompatible { base_url } => {
                 Some(Url::parse(base_url.as_str()).ok()?)
             }
+            ProviderAdapter::Mock { .. } => return None,
         };
         let base = match base {
             Some(url) if !self.policy.admits(&url) => return None,
@@ -250,6 +251,7 @@ impl Client {
             Prepared::Anthropic(request) => to_raw_value(request),
             Prepared::Google(request) => to_raw_value(request),
             Prepared::Jev(request) => to_raw_value(request),
+            Prepared::Mock(answer) => to_raw_value(answer),
         }
         .map_err(|error| ProviderError::decode("gateway", error))?;
         match (self, prepared) {
@@ -642,7 +644,8 @@ impl ProviderDispatch for HttpProviderDispatch {
     ///
     /// The body is first prepared for the deployment's adapter; an
     /// unrepresentable request is rejected and an unusable endpoint, auth, or
-    /// credential fails before dispatch, neither reaching the network. A
+    /// credential fails before dispatch, neither reaching the network. A mock
+    /// deployment's matched fixture answer completes without any client. A
     /// streaming call returns translated frames, a Batches action its lifecycle
     /// answer, speech its audio stream, and other media its content unchanged;
     /// any other answer is decoded and, on an OpenAI ingress, translated back to
@@ -672,6 +675,18 @@ impl ProviderDispatch for HttpProviderDispatch {
                 return failed(FailureClass::Rejected);
             }
         };
+        // A mock rule's answer is complete: no client, credential, or network.
+        if let Prepared::Mock(answer) = prepared {
+            let usage = usage(Wire::OpenAi, &answer);
+            return match to_raw_value(&answer) {
+                Ok(body) => AttemptResult::Completed {
+                    capture: captured(&attempt, &body),
+                    body: ResponseBody::Json(body),
+                    usage,
+                },
+                Err(_) => failed(FailureClass::Rejected),
+            };
+        }
         let Some(client) = self.client(deployment, attempt.model, attempt.credential) else {
             tracing::warn!(
                 deployment = deployment.name.as_str(),

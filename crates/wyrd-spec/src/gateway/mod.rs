@@ -29,8 +29,8 @@ pub use credential::{
     ProviderCredentialView, ProviderCredentialWrite, ProviderCredentialWriteSource,
 };
 pub use deployment::{
-    DeploymentAccess, ProviderAdapter, ProviderAuth, ProviderAuthHeader, ProviderDeployment,
-    ProviderDeploymentsApplied, ProviderDeploymentsApply, VertexLocation,
+    DeploymentAccess, MockRule, ProviderAdapter, ProviderAuth, ProviderAuthHeader,
+    ProviderDeployment, ProviderDeploymentsApplied, ProviderDeploymentsApply, VertexLocation,
 };
 pub use policy::{
     FALLBACK_HEADER, FallbackRule, FallbackScope, GatewayBudget, GatewayBudgetPeriod,

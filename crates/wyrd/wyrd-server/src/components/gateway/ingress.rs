@@ -309,8 +309,8 @@ pub(super) const CARD_UID_HEADER_DOC: &str = "Optional Card the call is attribut
 /// OpenAPI description of the optional `wyrd-prompt-provider` request header.
 pub(super) const PROMPT_PROVIDER_HEADER_DOC: &str = "Optional Prompt provider of an Agent \
     call: `openai`, `anthropic`, `google`, `vertex`, `jev`, or a custom provider name. The \
-    requested deployment's adapter must be compatible with it (`openai` and custom: `openai` or \
-    `openai_compatible`; `anthropic`: `anthropic`; `google`: `gemini`; `vertex`: `vertex`; \
+    requested deployment's adapter must be compatible with it (`openai` and custom: `openai`, \
+    `openai_compatible`, or `mock`; `anthropic`: `anthropic`; `google`: `gemini`; `vertex`: `vertex`; \
     `jev`: `jev`), or the call is refused before dispatch with \
     WYRD_GATEWAY_400_INVALID_REQUEST naming `model`; fallback candidates keep ordinary \
     conversion. A repeated or invalid value is refused naming the header. Absent means a direct \

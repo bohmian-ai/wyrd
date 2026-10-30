@@ -8,7 +8,8 @@
 //! skipped, and a candidate whose deployment is missing, does not serve the
 //! operation, or does not permit the model is dropped; a deployment whose
 //! adapter cannot represent the request body is dropped later by
-//! [`CallPlan::retain_representable`].
+//! [`CallPlan::retain_representable`], which also refuses a plan mixing mock
+//! and network deployments.
 
 use serde_json::Value;
 use skald_spec::ProviderName;
@@ -120,8 +121,8 @@ impl CallPlan {
     /// Refuses an Agent call whose requested deployment's adapter is outside
     /// the initial-target compatibility matrix of its Prompt `provider`.
     ///
-    /// `openai` and custom Prompts need an `openai` or `openai_compatible`
-    /// adapter, `anthropic` an `anthropic`, `google` a `gemini`, `vertex` a
+    /// `openai` and custom Prompts need an `openai`, `openai_compatible`, or
+    /// `mock` adapter, `anthropic` an `anthropic`, `google` a `gemini`, `vertex` a
     /// `vertex`, and `jev` a `jev` adapter. Only the requested address is
     /// bound: fallback candidates keep ordinary conversion, and a plan whose
     /// requested deployment no longer serves the call is left to the
@@ -146,7 +147,9 @@ impl CallPlan {
             (provider, &initial.deployment.adapter),
             (
                 ProviderName::OpenAi | ProviderName::Custom(_),
-                ProviderAdapter::OpenAi | ProviderAdapter::OpenAiCompatible { .. },
+                ProviderAdapter::OpenAi
+                    | ProviderAdapter::OpenAiCompatible { .. }
+                    | ProviderAdapter::Mock { .. },
             ) | (ProviderName::Anthropic, ProviderAdapter::Anthropic)
                 | (ProviderName::Google, ProviderAdapter::Gemini)
                 | (ProviderName::Vertex, ProviderAdapter::Vertex { .. })
@@ -171,12 +174,15 @@ impl CallPlan {
     ///
     /// Runs before admission so an unrepresentable request never reaches a
     /// provider or consumes budget, while a request some candidate can carry
-    /// still routes to it.
+    /// still routes to it. A plan whose candidates mix mock and network
+    /// deployments is refused whole, so a mock call never falls back to a
+    /// provider nor a provider call to a fixture.
     ///
     /// # Errors
     ///
-    /// Returns the first [`UnsupportedRequest`] when no candidate can
-    /// represent the request; the plan is then empty.
+    /// Returns [`UnsupportedRequest`] naming `model` for a mixed plan, or the
+    /// first representation error when no candidate can represent the
+    /// request; the plan is then empty.
     pub fn retain_representable(
         &mut self,
         ingress: IngressDialect,
@@ -184,6 +190,16 @@ impl CallPlan {
         body: &Value,
         media: Option<&MediaRequest>,
     ) -> Result<(), UnsupportedRequest> {
+        let mock = |candidate: &PlannedCandidate| {
+            matches!(candidate.deployment.adapter, ProviderAdapter::Mock { .. })
+        };
+        if self.candidates.iter().any(mock) && !self.candidates.iter().all(mock) {
+            self.candidates.clear();
+            return Err(UnsupportedRequest::new(
+                "model",
+                "a call plan cannot mix mock and network deployments",
+            ));
+        }
         let operation = self.operation;
         let mut first = None;
         self.candidates.retain(|candidate| {
@@ -256,6 +272,14 @@ mod tests {
             )
             .expect("capture"),
         }
+    }
+
+    /// Mock adapter answering model `m` with one fixed completion.
+    fn mock_adapter() -> Value {
+        json!({"mock": {"rules": [{"model": "m", "response": {
+            "id": "c", "object": "chat.completion", "created": 0, "model": "m",
+            "choices": [{"index": 0, "message": {"role": "assistant", "content": "ok"}}],
+        }}]}})
     }
 
     /// Parses an address.
@@ -368,6 +392,7 @@ mod tests {
                     json!({"vertex": {"project": "acme", "location": "us-central1"}}),
                 ),
                 native("judge", json!("jev")),
+                native("mock", mock_adapter()),
             ],
             json!({"rules": [{"scope": "global", "candidates": [model("claude/m")]}]}),
         );
@@ -380,6 +405,9 @@ mod tests {
             ("google", "vertex", true),
             ("vertex", "gcp", true),
             ("jev", "judge", true),
+            ("openai", "mock", true),
+            ("local", "mock", true),
+            ("anthropic", "mock", false),
             ("openai", "claude", false),
             ("openai", "gcp", false),
             ("google", "gcp", false),
@@ -550,5 +578,47 @@ mod tests {
             ["chat/gpt-4o"],
             "an ordinary chat body is not a Jev request"
         );
+    }
+
+    /// A plan mixing mock and network deployments is refused whole before
+    /// any attempt, while an all-mock plan with mock fallback still routes.
+    ///
+    /// # Panics
+    ///
+    /// Panics when a mixed plan keeps a candidate or an all-mock plan is
+    /// refused.
+    #[test]
+    fn plans_never_mix_mock_and_network_deployments() {
+        let mock = |name: &str| -> ProviderDeployment {
+            serde_json::from_value(json!({"name": name, "adapter": mock_adapter(), "auth": "none"}))
+                .expect("mock deployment decodes")
+        };
+        let snap = snapshot(
+            vec![
+                mock("mock-a"),
+                mock("mock-b"),
+                deployment("network", None, None),
+            ],
+            json!({"rules": [
+                {"scope": {"model": {"model": model("mock-a/m")}}, "candidates": [model("network/m")]},
+                {"scope": {"model": {"model": model("mock-b/m")}}, "candidates": [model("mock-a/m")]},
+                {"scope": {"model": {"model": model("network/m")}}, "candidates": [model("mock-b/m")]},
+            ]}),
+        );
+        let body = json!({"model": "m", "messages": [{"role": "user", "content": "hi"}]});
+        for requested in ["mock-a/m", "network/m"] {
+            let mut plan = chat(&snap, requested);
+            assert_eq!(plan.candidates.len(), 2);
+            let error = plan
+                .retain_representable(IngressDialect::OpenAi, false, &body, None)
+                .expect_err("a mixed plan is refused");
+            assert_eq!(error.field, "model", "{requested}");
+            assert!(plan.candidates.is_empty(), "{requested}");
+        }
+        let mut mocks = chat(&snap, "mock-b/m");
+        mocks
+            .retain_representable(IngressDialect::OpenAi, false, &body, None)
+            .expect("an all-mock plan routes");
+        assert_eq!(models(&mocks), ["mock-b/m", "mock-a/m"]);
     }
 }

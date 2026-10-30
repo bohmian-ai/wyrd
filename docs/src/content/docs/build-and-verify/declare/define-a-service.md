@@ -5,7 +5,6 @@ pillar: wyrd
 section: Build and verify
 topic: Declare
 order: 1
-status: runnable
 ---
 
 Declare the Service your app runs: the components it is built from, each at an exact version, and the tables it records rows into. Every verdict then names exactly what it checked.
@@ -47,7 +46,7 @@ metadata:
 spec:
   service_type: agent
   tables:
-    - name: tickets  # becomes vala.datasets.tickets
+    - name: tickets  # becomes bifrost.datasets.tickets
       schema:
         type: object
         properties:  # in column order

@@ -4,7 +4,6 @@ description: Choose which processes run Verifiers, size the worker pool, and dia
 pillar: wyrd
 section: Operate
 order: 4
-status: runnable
 ---
 
 Decide which processes run Verifiers and how much Python each runs at once. Every value is in [Verification runtime limits](/reference/verification-runtime-limits/).

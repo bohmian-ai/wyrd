@@ -13,11 +13,11 @@ export type NavTopic = { label?: string; items: NavItem[] };
 export type NavGroup = { label: Section; topics: NavTopic[]; items: NavItem[] };
 export type NavEntry = { slug: string; meta: DocMetadata };
 
-// Planned products and planned journeys are reachable by URL and search with
-// their status, but never sit in primary navigation beside shipped tasks.
+// Planned products are reachable by URL and search, but never sit in primary
+// navigation beside shipped tasks.
 // Drafts join navigation only when `drafts` is set, which the dev server does.
 export function inPrimaryNav(meta: DocMetadata, drafts = false): boolean {
-  return (drafts || !meta.draft) && meta.pillar !== 'fathom' && meta.status !== 'planned';
+  return (drafts || !meta.draft) && meta.pillar !== 'fathom';
 }
 
 // Convert a content slug to a base-free nav path. Empty slug → root '/';

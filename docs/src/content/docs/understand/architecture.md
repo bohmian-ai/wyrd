@@ -24,7 +24,7 @@ Postgres holds declarations and their versions, principals and roles, and the co
 
 ## Identity
 
-People sign in through your OIDC identity provider. Apps, CI, and agents use API keys or workload identity. [Identity and authorization](/understand/identity-and-authorization/) explains principals, roles, and tenants.
+People sign in through your OIDC identity provider. Apps, CI, and agents use Service account keys. [Identity and authorization](/understand/identity-and-authorization/) explains principals, roles, and tenants.
 
 ## Model calls
 

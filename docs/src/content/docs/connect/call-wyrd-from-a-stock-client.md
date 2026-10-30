@@ -5,7 +5,6 @@ pillar: wyrd
 section: Connect
 order: 2
 draft: true
-status: runnable
 ---
 
 You don't need a Wyrd adapter to call the gateway from a provider SDK. Point the SDK's base URL at your Wyrd server, give it Wyrd's HTTP transport, and address the model as `<deployment>/<model>`. Each example on this page runs one real inference and prints the reply.
@@ -16,7 +15,7 @@ The transport is `wyrd.http_auth` in Python, an `httpx.Auth` that also works as 
 
 - A deployment for each model you call. The examples use `openai-prod`, `claude-prod`, and `gemini-team` from [Set up the LLM gateway](/connect/set-up-the-llm-gateway/). Swap in your own deployment names.
 - The capture policy from [step 5 of the setup](/connect/set-up-the-llm-gateway/#set-up-one-provider). Calls run without it, but none are recorded, so [Check that the call was recorded](#check-that-the-call-was-recorded) finds nothing.
-- A Wyrd credential the client can find: the config `wyrd init` saves, `WYRD_ACCESS_TOKEN`, workload identity, `WYRD_API_KEY`, or a saved `wyrd auth login`.
+- A Wyrd credential the client can find: the config `wyrd init` saves, `WYRD_API_KEY`, `WYRD_ACCESS_TOKEN`, or a saved `wyrd auth login`.
 - Python: `uv add 'wyrd-ai[gateway]'`, plus the SDK or framework you use. These examples were checked with `openai` 3.14, `anthropic` 1.6, `google-genai` 2.30, `openai-agents` 0.23, and `pydantic-ai-slim` 2.56.
 - TypeScript: `pnpm add wyrd-ai`, plus `openai` or `@anthropic-ai/sdk`.
 
@@ -182,14 +181,14 @@ print(result.output)
 
 ## Check that the call was recorded
 
-With the capture policy applied, each call lands in `vala.gateway.calls`, attributed to the Wyrd principal that made it:
+With the capture policy applied, each call lands in `bifrost.gateway.calls`, attributed to the Wyrd principal that made it:
 
 ```python
 from wyrd.bifrost import Bifrost
 
 rows = Bifrost().sql(
     "SELECT requested_model, outcome, started_at "
-    "FROM vala.gateway.calls ORDER BY started_at DESC LIMIT 5"
+    "FROM bifrost.gateway.calls ORDER BY started_at DESC LIMIT 5"
 ).to_arrow().to_pylist()
 print(rows)
 ```

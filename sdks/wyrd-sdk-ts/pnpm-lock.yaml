@@ -192,13 +192,13 @@ importers:
         version: 21.1.0
     optionalDependencies:
       wyrd-ai-darwin-arm64:
-        specifier: 0.3.0
+        specifier: 0.4.0
         version: link:../wyrd-darwin-arm64
       wyrd-ai-linux-arm64-gnu:
-        specifier: 0.3.0
+        specifier: 0.4.0
         version: link:../wyrd-linux-arm64-gnu
       wyrd-ai-linux-x64-gnu:
-        specifier: 0.3.0
+        specifier: 0.4.0
         version: link:../wyrd-linux-x64-gnu
 
   wyrd-darwin-arm64: {}

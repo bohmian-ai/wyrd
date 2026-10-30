@@ -8,13 +8,6 @@
   // synchronously into the prerendered HTML (no async-pending shell).
   const Content = $derived(getEntry(data.slug)?.default);
 
-  // A journey's availability leads the page and is indexed with it, so a
-  // partial or planned task never reads as a finished procedure in search.
-  const STATUS_LABEL = {
-    runnable: 'Runnable',
-    partial: 'Partially available',
-    planned: 'Planned — not yet available'
-  } as const;
 
   // `updated` is the page source's last commit date (see $lib/updated.js), shown
   // in UTC so the calendar day matches the commit regardless of reader locale.
@@ -36,11 +29,6 @@
 
 <!-- Archetype (article | hub | reference) is a styling/indexing hook only. -->
 <article class="prose" data-archetype={data.archetype} data-pagefind-body>
-  {#if data.metadata.status}
-    <p class="page-status" data-status={data.metadata.status}>
-      Status: {STATUS_LABEL[data.metadata.status]}
-    </p>
-  {/if}
   <!-- The frontmatter title is the page's only <h1>; content starts at ##. -->
   <h1>{data.metadata.title}</h1>
   {#if Content}<Content />{/if}

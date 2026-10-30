@@ -4,7 +4,6 @@ description: Add WyrdMiddleware to a FastAPI, Starlette, Django, or Litestar app
 pillar: wyrd
 section: Connect
 order: 4
-status: runnable
 ---
 
 Add `WyrdMiddleware` to any ASGI app, such as FastAPI, Starlette, Django, or Litestar. It starts Wyrd when your app starts, wraps each request in its own Run, and sends queued evidence when your app stops.
@@ -22,7 +21,7 @@ Add `WyrdMiddleware` to any ASGI app, such as FastAPI, Starlette, Django, or Lit
 ## Install
 
 ```bash
-uv add "wyrd-ai[otel]==0.3.0" uvicorn
+uv add "wyrd-ai[otel]==0.4.0" uvicorn
 ```
 
 Add your framework too, such as `uv add fastapi`. Then pull the Service into the app's directory, at build or deploy time rather than when the app starts:

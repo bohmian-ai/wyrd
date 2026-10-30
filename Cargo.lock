@@ -9112,7 +9112,7 @@ dependencies = [
 
 [[package]]
 name = "vala-bifrost-redux"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "arc-swap",
  "arrow",
@@ -9184,7 +9184,7 @@ dependencies = [
 
 [[package]]
 name = "vala-drift"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "arrow",
  "arrow-schema",
@@ -9201,7 +9201,7 @@ dependencies = [
 
 [[package]]
 name = "vala-ingest"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "arrow",
  "bytes",
@@ -9212,7 +9212,7 @@ dependencies = [
 
 [[package]]
 name = "vala-sql"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "chrono",
  "metrics",
@@ -9232,7 +9232,7 @@ dependencies = [
 
 [[package]]
 name = "vala-verify"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "arrow",
  "async-trait",
@@ -9753,7 +9753,7 @@ checksum = "1ebf944e87a7c253233ad6766e082e3cd714b5d03812acc24c318f549614536e"
 
 [[package]]
 name = "workspace-hack"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "ahash",
  "aho-corasick",
@@ -9919,7 +9919,7 @@ checksum = "1ffae5123b2d3fc086436f8834ae3ab053a283cfac8fe0a0b8eaae044768a4c4"
 
 [[package]]
 name = "wyrd"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "schemars 1.2.1",
  "serde",
@@ -9936,7 +9936,7 @@ dependencies = [
 
 [[package]]
 name = "wyrd-ai"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "arrow",
  "async-trait",
@@ -9968,7 +9968,7 @@ dependencies = [
 
 [[package]]
 name = "wyrd-auth"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "base64 0.22.1",
  "chrono",
@@ -10000,7 +10000,7 @@ dependencies = [
 
 [[package]]
 name = "wyrd-auth-issue"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "chrono",
  "ed25519-dalek",
@@ -10023,7 +10023,7 @@ dependencies = [
 
 [[package]]
 name = "wyrd-auth-oidc"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "chrono",
  "flate2",
@@ -10046,7 +10046,7 @@ dependencies = [
 
 [[package]]
 name = "wyrd-auth-verify"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "base64 0.22.1",
  "chrono",
@@ -10074,7 +10074,7 @@ dependencies = [
 
 [[package]]
 name = "wyrd-bench"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "criterion",
  "hdrhistogram",
@@ -10088,7 +10088,7 @@ dependencies = [
 
 [[package]]
 name = "wyrd-cards"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "chrono",
  "pyo3",
@@ -10110,7 +10110,7 @@ dependencies = [
 
 [[package]]
 name = "wyrd-cli"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "arrow",
  "assert_cmd",
@@ -10164,7 +10164,7 @@ dependencies = [
 
 [[package]]
 name = "wyrd-client"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "arrow",
  "arrow-schema",
@@ -10221,7 +10221,7 @@ dependencies = [
 
 [[package]]
 name = "wyrd-config"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "pyo3",
  "serde",
@@ -10240,7 +10240,7 @@ dependencies = [
 
 [[package]]
 name = "wyrd-crypt"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "aes-gcm",
  "argon2",
@@ -10252,7 +10252,7 @@ dependencies = [
 
 [[package]]
 name = "wyrd-dev-fixtures"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "secrecy",
  "serde_json",
@@ -10269,7 +10269,7 @@ dependencies = [
 
 [[package]]
 name = "wyrd-error-derive"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "quote",
  "syn 2.0.118",
@@ -10278,7 +10278,7 @@ dependencies = [
 
 [[package]]
 name = "wyrd-gateway"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "async-trait",
  "base64 0.22.1",
@@ -10313,7 +10313,7 @@ dependencies = [
 
 [[package]]
 name = "wyrd-interfaces"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "chrono",
  "flate2",
@@ -10331,7 +10331,7 @@ dependencies = [
 
 [[package]]
 name = "wyrd-loader"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "base64 0.22.1",
  "calamine",
@@ -10354,7 +10354,7 @@ dependencies = [
 
 [[package]]
 name = "wyrd-mcp"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "arrow",
  "chrono",
@@ -10384,7 +10384,7 @@ dependencies = [
 
 [[package]]
 name = "wyrd-queue"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "arrow",
  "arrow-schema",
@@ -10407,7 +10407,7 @@ dependencies = [
 
 [[package]]
 name = "wyrd-runtime"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "chrono",
  "metrics",
@@ -10425,7 +10425,7 @@ dependencies = [
 
 [[package]]
 name = "wyrd-rust-examples"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "anyhow",
  "axum",
@@ -10443,7 +10443,7 @@ dependencies = [
 
 [[package]]
 name = "wyrd-sdk-python"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "arrow",
  "arrow-schema",
@@ -10476,7 +10476,7 @@ dependencies = [
 
 [[package]]
 name = "wyrd-sdk-ts"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "arrow",
  "chrono",
@@ -10497,7 +10497,7 @@ dependencies = [
 
 [[package]]
 name = "wyrd-sdk-ts-testing"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "arrow",
  "chrono",
@@ -10519,7 +10519,7 @@ dependencies = [
 
 [[package]]
 name = "wyrd-semver"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "schemars 1.2.1",
  "semver",
@@ -10532,7 +10532,7 @@ dependencies = [
 
 [[package]]
 name = "wyrd-server"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "arc-swap",
  "arrow",
@@ -10637,11 +10637,12 @@ dependencies = [
 
 [[package]]
 name = "wyrd-skald-agent"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "async-trait",
  "chrono",
  "futures",
+ "jsonschema",
  "serde",
  "serde_json",
  "serde_yaml",
@@ -10662,7 +10663,7 @@ dependencies = [
 
 [[package]]
 name = "wyrd-skald-cache"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "mini-moka",
  "serde",
@@ -10673,7 +10674,7 @@ dependencies = [
 
 [[package]]
 name = "wyrd-skald-prompt"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "base64 0.22.1",
  "pyo3",
@@ -10689,7 +10690,7 @@ dependencies = [
 
 [[package]]
 name = "wyrd-skald-providers"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "async-trait",
  "base64 0.22.1",
@@ -10720,7 +10721,7 @@ dependencies = [
 
 [[package]]
 name = "wyrd-skald-runtime"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "async-trait",
  "serde_json",
@@ -10735,7 +10736,7 @@ dependencies = [
 
 [[package]]
 name = "wyrd-skald-spec"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "base64 0.22.1",
  "insta",
@@ -10751,7 +10752,7 @@ dependencies = [
 
 [[package]]
 name = "wyrd-skald-tool"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "async-trait",
  "schemars 1.2.1",
@@ -10766,12 +10767,13 @@ dependencies = [
 
 [[package]]
 name = "wyrd-spec"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "base64 0.22.1",
  "blake3",
  "chrono",
  "hex",
+ "jsonschema",
  "petgraph 0.6.5",
  "pretty_assertions",
  "proptest",
@@ -10799,7 +10801,7 @@ dependencies = [
 
 [[package]]
 name = "wyrd-sql"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "blake3",
  "chrono",
@@ -10832,7 +10834,7 @@ dependencies = [
 
 [[package]]
 name = "wyrd-storage"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "base64 0.22.1",
  "bytes",
@@ -10865,7 +10867,7 @@ dependencies = [
 
 [[package]]
 name = "wyrd-telemetry"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "hdrhistogram",
  "http",
@@ -10888,7 +10890,7 @@ dependencies = [
 
 [[package]]
 name = "wyrd-testing"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "arrow",
  "async-stream",
@@ -10966,7 +10968,7 @@ dependencies = [
 
 [[package]]
 name = "wyrd-tls"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "rustls",
  "thiserror 2.0.21",
@@ -10975,7 +10977,7 @@ dependencies = [
 
 [[package]]
 name = "wyrd-tonic"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "arc-swap",
  "chrono",
@@ -11003,7 +11005,7 @@ dependencies = [
 
 [[package]]
 name = "wyrd-types"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "arrow-schema",
  "bohmian-parquet-variant-compute",
@@ -11017,7 +11019,7 @@ dependencies = [
 
 [[package]]
 name = "wyrd-utils"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "flate2",
  "pyo3",
@@ -11035,7 +11037,7 @@ dependencies = [
 
 [[package]]
 name = "wyrd-vault"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "reqwest 0.13.4",
  "secrecy",
@@ -11050,7 +11052,7 @@ dependencies = [
 
 [[package]]
 name = "wyrd-version"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "schemars 1.2.1",
  "semver",

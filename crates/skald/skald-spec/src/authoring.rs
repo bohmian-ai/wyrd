@@ -428,7 +428,9 @@ impl AuthoredPrompt {
                 }
                 request
             }
-            (None, None) => self.portable_request(schema, &mut literals, &mut media_kinds)?,
+            (None, None) => {
+                self.portable_request(schema, named.is_none(), &mut literals, &mut media_kinds)?
+            }
             (Some(_), None) => return Err(invalid("body", "native `format` requires a `body`")),
             (None, Some(_)) => return Err(invalid("format", "native `body` requires a `format`")),
         };
@@ -555,7 +557,8 @@ impl AuthoredPrompt {
     /// placeholder names for [`compile`](Self::compile) to bind, and each
     /// binding's block kind in `media_kinds`. Every `${media:name}` token the
     /// author wrote, in any turn, is reserved before lowering so a generated
-    /// literal name can never take an authored input's place.
+    /// literal name can never take an authored input's place. `strict` sets
+    /// OpenAI's strict `json_schema` mode for `schema`.
     ///
     /// # Errors
     ///
@@ -565,6 +568,7 @@ impl AuthoredPrompt {
     fn portable_request(
         &self,
         schema: Option<Map<String, Value>>,
+        strict: bool,
         literals: &mut Vec<(String, MediaRef)>,
         media_kinds: &mut Vec<(String, MediaKind)>,
     ) -> SkaldResult<ProviderRequest> {
@@ -625,6 +629,7 @@ impl AuthoredPrompt {
                 turns,
                 &settings,
                 schema,
+                strict,
             )?),
         })
     }
@@ -760,6 +765,10 @@ impl PortableMessage {
 /// `schema`, the way the portable lowering would; `None` leaves it unset
 /// until the host resolves the name.
 ///
+/// OpenAI output is non-strict: a named format's schema, such as the Verdict
+/// schema with its `oneOf` locator and optional members, is outside OpenAI's
+/// strict subset, and the host validates the whole response against it.
+///
 /// # Errors
 ///
 /// Returns [`SkaldError::PromptInvalid`] for a body that already declares
@@ -785,7 +794,7 @@ fn named_output(
                     name: RESPONSE_SCHEMA_NAME.to_owned(),
                     description: None,
                     schema: Some(schema),
-                    strict: Some(true),
+                    strict: Some(false),
                 },
             });
         }
@@ -805,7 +814,7 @@ fn named_output(
                     name: RESPONSE_SCHEMA_NAME.to_owned(),
                     description: None,
                     schema: Some(schema),
-                    strict: Some(true),
+                    strict: Some(false),
                 });
             }
         }
@@ -889,8 +898,9 @@ fn check_format(provider: &ProviderName, format: PromptFormat) -> SkaldResult<()
 /// Builds the portable OpenAI Chat Completions request.
 ///
 /// System text becomes the first message, plain turns stay text, block turns
-/// become ordered text parts, and a schema becomes strict `json_schema`
-/// output named [`RESPONSE_SCHEMA_NAME`].
+/// become ordered text parts, and a schema becomes `json_schema` output
+/// named [`RESPONSE_SCHEMA_NAME`], strict when `strict` is set. An authored
+/// schema is strict; a named format's is not (see [`named_output`]).
 ///
 /// # Errors
 ///
@@ -902,6 +912,7 @@ fn openai_chat(
     turns: Vec<Turn>,
     settings: &PortableSettings,
     schema: Option<Map<String, Value>>,
+    strict: bool,
 ) -> SkaldResult<OpenAiChatRequest> {
     let destination = "chat_completion";
     refuse(destination, "top_k", settings.top_k.is_some())?;
@@ -939,7 +950,7 @@ fn openai_chat(
                 name: RESPONSE_SCHEMA_NAME.to_owned(),
                 description: None,
                 schema: Some(schema),
-                strict: Some(true),
+                strict: Some(strict),
             },
         }),
         stream: None,
@@ -2275,7 +2286,8 @@ mod tests {
     /// the Prompt keeps serializing the authored form through binds,
     /// unresolved names refuse to render, native bodies take the name beside
     /// `format` and `body` but refuse their own response settings, and a
-    /// malformed expanded form does not decode.
+    /// malformed expanded form does not decode. OpenAI output for a named
+    /// format is non-strict.
     ///
     /// # Panics
     ///
@@ -2312,6 +2324,11 @@ mod tests {
                 panic!("a resolved name is structured output");
             };
             assert_eq!(name, "response");
+            assert_eq!(
+                body(&prompt)["response_format"]["json_schema"]["strict"],
+                false,
+                "a named schema is outside OpenAI's strict subset"
+            );
             assert_eq!(
                 schema["properties"].get("data").is_some(),
                 format.get("data").is_some(),
@@ -2374,6 +2391,15 @@ mod tests {
             let prompt =
                 compile_with(&authored).unwrap_or_else(|error| panic!("{pointer}: {error}"));
             assert_eq!(body(&prompt).pointer(pointer), Some(&base), "{pointer}");
+            if authored["provider"] == "openai"
+                && let Some(format) = pointer.strip_suffix("/schema")
+            {
+                assert_eq!(
+                    body(&prompt).pointer(&format!("{format}/strict")),
+                    Some(&json!(false)),
+                    "{pointer}"
+                );
+            }
             assert_eq!(
                 serde_json::to_value(&prompt).expect("json"),
                 authored,
@@ -2392,6 +2418,25 @@ mod tests {
             7,
             "unrelated native options survive"
         );
+        for (format, pointer) in [
+            ("chat_completion", "/response_format/json_schema/strict"),
+            ("responses", "/text/format/strict"),
+        ] {
+            let messages = if format == "responses" {
+                "input"
+            } else {
+                "messages"
+            };
+            let mut authored = native(format, "openai", json!({messages: user}));
+            authored["response_format"] = json!({"kind": "verdict", "data": data});
+            let prompt = compile_with(&authored).expect("named native data compiles");
+            assert_eq!(
+                body(&prompt).pointer(pointer),
+                Some(&json!(false)),
+                "{format}: declared data keeps a named format non-strict"
+            );
+            assert_eq!(serde_json::to_value(&prompt).expect("json"), authored);
+        }
 
         for (authored, field) in [
             (

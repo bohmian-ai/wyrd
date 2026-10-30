@@ -13,6 +13,7 @@ name = "skald_agent"
 path = "src/lib.rs"
 
 [dependencies]
+jsonschema = { workspace = true }
 skald-spec = { workspace = true }
 skald-prompt = { workspace = true }
 skald-runtime = { workspace = true }

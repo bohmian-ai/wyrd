@@ -291,8 +291,9 @@ def completion(body: dict) -> tuple[int, dict]:
     the frame carrying ``UNBADGED_BASE64`` and passes every other. The policy
     judge (its prompt carries ``Rules:``) fails ``REFUSE-POLICY``, passes
     ``UNCITED`` without a citation, answers ``JUDGE-MALFORMED`` with no
-    Verdict, cites a foreign pointer on ``JUDGE-FOREIGN-CITE``, and otherwise
-    passes citing the answer text. The scored judge (its prompt carries
+    Verdict, answers ``JUDGE-REPAIRED`` with no Verdict until it is asked to
+    correct its reply, cites a foreign pointer on ``JUDGE-FOREIGN-CITE``, and
+    otherwise passes citing the answer text. The scored judge (its prompt carries
     ``SCORE:``) answers ``scored``. The handbook judge reads its mount and
     answers ``handbook_verdict``; the file probe plays ``probe_turn``. Every
     other judge agrees.
@@ -336,6 +337,7 @@ def completion(body: dict) -> tuple[int, dict]:
                 ("REFUSE-POLICY", BREAKS),
                 ("UNCITED", UNCITED),
                 ("JUDGE-MALFORMED", "not a verdict"),
+                ("JUDGE-REPAIRED", FOLLOWS if "was not accepted" in text else "not a verdict"),
                 ("JUDGE-FOREIGN-CITE", FOREIGN_CITE),
             ):
                 if marker in text:

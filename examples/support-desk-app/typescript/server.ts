@@ -134,6 +134,8 @@ if (import.meta.main) {
   const client = WyrdClient.connect();
   // The declared Service, pulled by `pnpm run deploy`.
   const state = WyrdState.fromPath(BUNDLE_DIR, { client });
+  // The Service name, version, and environment every span, gateway call, and verification carries. Name and version come from the bundle.
+  state.configure({ deploymentEnvironment: "development" });
   await state.startBifrost(); // writes tickets to Bifrost
   await state.startTelemetry(); // exports spans to Wyrd
   // ANCHOR_END: startup

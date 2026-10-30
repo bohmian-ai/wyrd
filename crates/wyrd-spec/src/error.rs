@@ -3217,15 +3217,17 @@ pub enum WyrdError {
         /// Structured detail payload.
         details: serde_json::Value,
     },
-    /// A structured-output agent run returned a response that is not a JSON object.
-    #[error("[WYRD_AGENT_422_STRUCTURED_DECODE] {message}")]
+    /// A structured-output agent run ended without an accepted answer: the
+    /// provider refused, or the final answer still violated its response
+    /// schema when the iteration budget ran out.
+    #[error("[WYRD_AGENT_422_STRUCTURED_INVALID] {message}")]
     #[wyrd_error(
-        code = "WYRD_AGENT_422_STRUCTURED_DECODE",
+        code = "WYRD_AGENT_422_STRUCTURED_INVALID",
         status = 422,
-        title = "Structured response decode failed",
-        remediation = "Inspect the model output; structured-output prompts must return a JSON object."
+        title = "Structured response invalid",
+        remediation = "The model refused, or did not correct its answer within the Agent's iteration budget; simplify the response schema, clarify the Prompt, choose a model that follows structured output, or raise max_iterations."
     )]
-    AgentStructuredDecode {
+    AgentStructuredInvalid {
         /// Human-readable error message.
         message: String,
         /// Structured detail payload.
@@ -3974,7 +3976,7 @@ impl WyrdError {
             | Self::AgentDelegationDepth { message, details }
             | Self::AgentInvalidArgument { message, details }
             | Self::AgentPromptRender { message, details }
-            | Self::AgentStructuredDecode { message, details }
+            | Self::AgentStructuredInvalid { message, details }
             | Self::AgentToolArgs { message, details }
             | Self::AgentCallbackPanic { message, details }
             | Self::AgentJournalAppend { message, details }
@@ -4369,7 +4371,7 @@ mod tests {
         ("WYRD_AGENT_422_INVALID_ARGUMENT", 422),
         ("WYRD_AGENT_422_LOOP_MESSAGE_TYPE", 422),
         ("WYRD_AGENT_422_PROMPT", 422),
-        ("WYRD_AGENT_422_STRUCTURED_DECODE", 422),
+        ("WYRD_AGENT_422_STRUCTURED_INVALID", 422),
         ("WYRD_AGENT_422_TOOL_ARGS", 422),
         ("WYRD_AGENT_500_CALLBACK_PANIC", 500),
         ("WYRD_AGENT_500_JOURNAL", 500),

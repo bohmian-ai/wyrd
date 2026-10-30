@@ -4,7 +4,6 @@ description: Fields, input slots, steps, checks, operators, references, citation
 pillar: wyrd
 section: Reference
 order: 1
-status: runnable
 ---
 
 A Verifier spec declares the evidence a caller sends, the steps that prepare it, and the requirements that judge it. Every object refuses keys it does not define.
@@ -65,6 +64,8 @@ A step's result is `steps.<id>.output`.
 
 ### Actions
 
+When to use each kind is in [Steps and checks](/understand/how-verification-works/#steps-and-checks).
+
 | `kind` | Fields | Output |
 | --- | --- | --- |
 | `extract` | `from`: a `media` slot | The file's text and structure, in the shape [Extraction output](/reference/extraction-output/) gives for its format |
@@ -87,6 +88,8 @@ A requirement ends `passed`, `failed`, `inconclusive`, or `not_applicable`.
 
 ### Checks
 
+When to use each kind is in [Steps and checks](/understand/how-verification-works/#steps-and-checks).
+
 | `kind` | Fields | Decides by |
 | --- | --- | --- |
 | `assert` | `path` or `each`, `operator`, `expected` | Comparing a value; `each` with `[*]` requires every item to pass |
@@ -94,6 +97,8 @@ A requirement ends `passed`, `failed`, `inconclusive`, or `not_applicable`.
 | `agent` | `agent`, `inputs`, `workspace` | An Agent, with its declared tools and optional workspace as in a step, whose Prompt `response_format` is `verdict` or a closed [verdict](#verdicts-and-citations) schema |
 | `code` | `runtime`, `source`, `entrypoint`, `inputs`, optional `response_format` | A Python function that returns a verdict |
 | `drift` | `on`, `method`, `signal`, `condition`, `profile` | Comparing a window of samples with a baseline |
+
+A `trace` check reads every retained span with the trace ID from `bifrost.traces.spans`, as the executing account, ordered by start time then span ID, up to 10,000 spans. A larger trace, a refused or failed query, a timed-out read, an undecodable span, or an input with no trace makes it `inconclusive`. A trace with no visible span is `inconclusive` under `verify`; in a queued execution, each attempt before the last ends with error code `evidence_unavailable` and status `retrying` (3 attempts, 30 s then 60 s apart), and the last is `inconclusive`. [Trace evidence](/understand/how-verification-works/#trace-evidence) explains the behavior.
 
 ## Comparison operators
 
@@ -166,7 +171,7 @@ An `agent` or `code` check returns a verdict:
 | `{json_pointer: "/path"}` | JSON inputs and DOCX or XLSX extraction output |
 | `{region: {page, x, y, width, height}}` | A rectangle on a page, in page coordinates |
 
-A citation names the original slot, or the `attachment_<n>` slot a fixed workspace file reports in `sources`, never an extract step or `/work` file. An invalid citation is dropped, and a `passed` verdict left without one is recorded as `inconclusive`. For JSON pointers into extracted files, see [Extraction output](/reference/extraction-output/#citations).
+A citation names the original slot, or the `attachment_<n>` slot a fixed workspace file reports in `sources`, never an extract step or `/work` file. With `response_format: verdict`, an Agent check's model may cite only the bare slots its inputs and workspace reach, such as `answer`, never `inputs.answer`. An invalid citation is dropped, and a `passed` verdict left without one is recorded as `inconclusive`. For JSON pointers into extracted files, see [Extraction output](/reference/extraction-output/#citations).
 
 ### Custom data
 
@@ -179,7 +184,7 @@ The server validates the whole verdict against the declared schema. Data must fi
 | Size | 65,536 bytes of compact UTF-8 JSON |
 | Depth | 16 containers; the root object is one, each nested object or array adds one |
 
-A verdict that fails its schema or a limit makes the requirement `inconclusive` with no `data`; the reason names the location or limit, never the content. Accepted data is the requirement result's `data`, on step and Verifier requirements alike, and is kept with the rest of the result.
+An Agent answer that fails its schema is returned to the model with a correction, and each correction spends one of the Agent's `max_iterations`. An answer still invalid on the last iteration, or a provider refusal, which is never corrected, makes the requirement `inconclusive` with `WYRD_AGENT_422_STRUCTURED_INVALID` in its reason. A `code` check's verdict is never corrected. A verdict that fails its schema or a limit makes the requirement `inconclusive` with no `data`; the reason names the location or limit, never the content. Accepted data is the requirement result's `data`, on step and Verifier requirements alike, and is kept with the rest of the result.
 
 ## Decide
 

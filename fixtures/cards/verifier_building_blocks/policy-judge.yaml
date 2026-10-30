@@ -1,5 +1,6 @@
 # A tool-less judge: it sees only the claim, the answer, and the refund rules
-# injected into its Prompt, and returns a cited Verdict.
+# injected into its Prompt, and returns a cited Verdict; its budget allows one
+# repair of an answer outside its response schema.
 apiVersion: wyrd/v1
 kind: Agent
 metadata:
@@ -7,7 +8,7 @@ metadata:
   version: 1.0.0
 spec:
   execution_route: {kind: wyrd_gateway, deployment: openai}
-  run_config: {max_iterations: 1}
+  run_config: {max_iterations: 2}
   prompt:
     provider: openai
     model: gpt-4o

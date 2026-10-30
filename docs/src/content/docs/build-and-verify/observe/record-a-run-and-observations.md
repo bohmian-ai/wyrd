@@ -5,7 +5,6 @@ pillar: wyrd
 section: Build and verify
 topic: Observe
 order: 1
-status: runnable
 ---
 
 Wrap each request your app handles in a Run. Everything inside it (the model call, the rows you record, and each verdict) is tied to that Run and to the exact Card version that produced it, so you can read the whole request back with one query.
@@ -13,7 +12,7 @@ Wrap each request your app handles in a Run. Everything inside it (the model cal
 You need the support-desk Service from [Write a Verifier](/build-and-verify/verify/author-a-verifier/) and a running server from [Set up Wyrd](/get-started/setup/). Install the SDK with its telemetry and gateway extras, and the OpenAI client:
 
 ```bash
-uv add "wyrd-ai[otel,gateway]==0.3.0" openai
+uv add "wyrd-ai[otel,gateway]==0.4.0" openai
 ```
 
 ## 1. Connect at startup
@@ -55,7 +54,7 @@ def answer(question: str):
         text = reply.choices[0].message.content
 
         # A row in the Service's tickets table, tagged with this Run.
-        run.observe.record("vala.datasets.tickets", {"question": question, "answer": text})
+        run.observe.record("bifrost.datasets.tickets", {"question": question, "answer": text})
         return run, agent, text
 ```
 
@@ -109,9 +108,9 @@ Every row the Run produced carries its `run_id`, so one query joins the ticket, 
 
 ```sql title="run.sql"
 SELECT t.question, t.answer, g.call_id, r.verdict
-FROM vala.datasets.tickets t
-JOIN vala.gateway.calls g ON g.run_id = t.run_id
-JOIN vala.verification.results r ON r.run_id = t.run_id
+FROM bifrost.datasets.tickets t
+JOIN bifrost.gateway.calls g ON g.run_id = t.run_id
+JOIN bifrost.verification.results r ON r.run_id = t.run_id
 WHERE t.run_id = $1
 ```
 

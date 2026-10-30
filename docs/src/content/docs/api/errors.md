@@ -4,7 +4,6 @@ description: Every stable Wyrd error code with its HTTP status, title, and fix.
 pillar: wyrd
 section: Reference
 order: 21
-status: runnable
 ---
 
 Every Wyrd error carries a stable `code`, such as `WYRD_SPEC_400_VALIDATION`: the area, the HTTP status, and the cause. Branch on `code`, never on the message. The same code reaches you over HTTP, MCP, the CLI, and every SDK.
@@ -39,7 +38,7 @@ This page is generated from the error definitions in the Wyrd source.
 | `WYRD_AGENT_422_MISSING_VERSION` | 422 | AgentCard version is missing | Set a concrete semantic version before saving or projecting the agent to a card envelope. |
 | `WYRD_AGENT_422_PROMPT` | 422 | Agent prompt rendering failed | Inspect the prompt template and the variables passed to the agent run. |
 | `WYRD_AGENT_422_RUNTIME_LOCAL_TOOLS_NOT_REGISTRABLE` | 422 | Runtime-local tools are not registrable | Remove runtime-local tool names before registration; local save, load, and run remain available. |
-| `WYRD_AGENT_422_STRUCTURED_DECODE` | 422 | Structured response decode failed | Inspect the model output; structured-output prompts must return a JSON object. |
+| `WYRD_AGENT_422_STRUCTURED_INVALID` | 422 | Structured response invalid | The model refused, or did not correct its answer within the Agent's iteration budget; simplify the response schema, clarify the Prompt, choose a model that follows structured output, or raise max_iterations. |
 | `WYRD_AGENT_422_TOOL_ARGS` | 422 | Tool arguments invalid | Adjust the provider-emitted tool arguments to match the tool input schema. |
 | `WYRD_AGENT_422_VALIDATION` | 422 | AgentCard validation failed | Fix the Agent Card envelope, metadata, prompt reference, tools, or run_config fields. |
 | `WYRD_AGENT_499_CALLBACK_ABORTED` | 499 | Callback aborted run | Inspect the callback exception and either return None to continue or return a valid replacement value. |

@@ -1745,8 +1745,13 @@ inline and stages its pinned inputs and result on the process Scribe outbox.
 `submit` stages its inputs; only after Scribe acknowledges them does the
 batched request outbox insert the queued `wyrd.verifier_executions` row. A
 server-owned `queue_execution` marker on the input record (false for
-`verify`, true for `submit`) is the only thing that activates queued work, so
-replaying input persistence never re-executes `verify`. The batched writer
+`verify`, true for `submit` and for scheduled and group executions) is the
+only thing that activates queued work, so replaying input persistence never
+re-executes `verify`. Scheduled and group executions follow the same
+pipeline: the scheduler prepares the execution and its input without writing
+the queue, stages the input, and on its acknowledgement the same batched
+writer admits the execution, moving the expected schedule cursor or
+consuming the selected pending group generation in that transaction. The batched writer
 decides `Idempotency-Key` replay and conflict per tenant, subject, actor, and
 key: a matching retry returns the same execution ID; a conflicting one settles
 `errored` with `WYRD_REGISTRY_409_IDEMPOTENCY_CONFLICT`, never runs, and leaves

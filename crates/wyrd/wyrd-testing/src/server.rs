@@ -1224,21 +1224,30 @@ impl WyrdTestServer {
     /// the outbox and written to Scribe in the background. After this returns,
     /// the writes staged before the call are in Scribe's memtable and
     /// queryable, and nothing has been sealed or published, so a journey can
-    /// query rows that are still live.
+    /// query rows that are still live. Every queued execution whose input
+    /// Scribe acknowledged is then admitted into the queue.
     ///
     /// # Errors
-    /// Returns an error when staged writes do not reach Scribe within the bound.
+    /// Returns an error when staged writes do not reach Scribe, or
+    /// acknowledged executions are not admitted, within the bound.
     pub async fn settle_bifrost_outbox(&self) -> Result<(), WyrdTestServerError> {
-        let unwritten = self
-            .inner
-            .state
-            .bifrost
-            .scribe_outbox()
-            .settle(std::time::Instant::now() + FLUSH_BIFROST_BOUND)
-            .await;
+        let deadline = std::time::Instant::now() + FLUSH_BIFROST_BOUND;
+        let unwritten = self.inner.state.bifrost.scribe_outbox().settle(deadline).await;
         if unwritten != 0 {
             return Err(WyrdTestServerError::Flush(format!(
                 "{unwritten} staged Scribe writes did not settle within {FLUSH_BIFROST_BOUND:?}"
+            )));
+        }
+        let unadmitted = self
+            .inner
+            .state
+            .verification
+            .submissions()
+            .settle(deadline)
+            .await;
+        if unadmitted != 0 {
+            return Err(WyrdTestServerError::Flush(format!(
+                "{unadmitted} acknowledged executions were not admitted within {FLUSH_BIFROST_BOUND:?}"
             )));
         }
         Ok(())

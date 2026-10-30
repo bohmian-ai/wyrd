@@ -384,9 +384,11 @@ typed columns:
   schedule selector records its `[previous boundary, due)` window and the
   selected observation `record_id`s. Selectors reference live logical rows,
   never copy their values, and are resolved on every execution, retry, and
-  read. The server-owned `queue_execution` marker is true only for
-  `submitted`, which alone activates queued work; its `activation` holds the
-  accepted route overrides, idempotency key, request digest, and authority.
+  read. The server-owned `queue_execution` marker is true for every queued
+  origin, `submitted`, `group`, and `schedule`, and false for `direct`; only
+  a marked row's acknowledgement admits queued work. A `submitted` row's
+  `activation` holds the accepted route overrides, idempotency key, request
+  digest, and authority.
   Its published input timestamp is `recorded_at`, the server-recorded input
   time, distinct from execution timing or sample/window time. It uses the
   same execution/binding/application-Run correlation names where applicable.

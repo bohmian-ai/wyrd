@@ -191,7 +191,7 @@ impl OutboxSink for SubmissionSink {
     /// Cancelled before `commit` is sent, the transaction rolls back and no
     /// execution exists; cancelled while `commit` resolves, the executions
     /// may already be durable. Either way the outbox counts the batch lost.
-    #[tracing::instrument(name = "verification.submissions", skip_all, fields(%tenant))]
+    #[tracing::instrument(name = "verification.submissions", skip_all)]
     async fn write(
         &self,
         tenant: DataTenantId,

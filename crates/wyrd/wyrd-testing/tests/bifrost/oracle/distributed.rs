@@ -17,8 +17,10 @@ use arrow::record_batch::RecordBatch;
 use bytes::Bytes;
 use iceberg::Catalog;
 use iceberg::spec::{self, NestedField, StructType, Type};
+use parquet::arrow::ARROW_SCHEMA_META_KEY;
+use parquet::arrow::ArrowWriter;
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
-use parquet::file::metadata::ParquetMetaData;
+use parquet::file::metadata::{KeyValue, ParquetMetaData};
 use parquet::file::reader::FileReader;
 use vala_bifrost_redux::catalog::{
     TableRef, TableUid, TenantTableBinding, inject_metadata_not_found_for_test,
@@ -27,6 +29,8 @@ use vala_bifrost_redux::catalog::{
 use vala_bifrost_redux::forge::ForgeConfig;
 use vala_bifrost_redux::namespaces::BifrostNamespace;
 use vala_bifrost_redux::oracle::{AuthorizedQueryContext, Oracle, iceberg_projection_probe};
+use vala_bifrost_redux::parquet::footer::tenant_key_value;
+use vala_bifrost_redux::parquet::writer_properties::bifrost_writer_properties_with_metadata;
 use vala_bifrost_redux::scribe::hot_source::HotAuthority;
 use wyrd_client::WyrdClient;
 use wyrd_client::bifrost::BifrostClientError;
@@ -2012,7 +2016,7 @@ async fn remote_staged_footer_refusal_fails_closed() -> Result<(), JourneyError>
     let runs = staged_runs(scribe, tenant, &table).await?;
     let foreign = cluster.add_tenant("oracle-staged-foreign").await?;
     for run in &runs {
-        rewrite_footer_tenant(run, tenant, foreign)?;
+        rewrite_footer_tenant(run, foreign)?;
     }
     cluster.refresh_oracle_snapshots().await?;
 
@@ -2089,41 +2093,41 @@ async fn staged_runs(
 
 /// Rewrites one staged run in place so its footer names `foreign` as tenant.
 ///
-/// Staging recorded the run's size, and the scan reads its footer at that
-/// size, so the run keeps its exact length: the owner's tenant id inside the
-/// footer is overwritten by the foreign id of equal length. Rows, schema and
-/// every other footer key stay byte-identical, so the footer tenant proof is
-/// the only check the rewritten run can fail.
+/// Rows, schema and every other footer key are copied unchanged, and the
+/// writer recipe is the one for the journey table's `wyrd_ingested_at` time
+/// column, so the footer tenant proof is the only check the rewritten run can
+/// fail.
 ///
 /// # Errors
 ///
-/// Returns a filesystem error, or an error when the footer does not hold the
-/// owner's tenant id exactly once or the two ids differ in length.
-fn rewrite_footer_tenant(
-    run: &Path,
-    owner: DataTenantId,
-    foreign: DataTenantId,
-) -> Result<(), JourneyError> {
-    let mut bytes = std::fs::read(run)?;
-    let (owner, foreign) = (owner.to_string(), foreign.to_string());
-    if owner.len() != foreign.len() || bytes.len() < 8 {
-        return Err("tenant ids differ in length or the run has no footer".into());
-    }
-    let length: [u8; 4] = bytes[bytes.len() - 8..bytes.len() - 4]
-        .try_into()
-        .map_err(|_| "unreadable footer length")?;
-    let footer = bytes.len() - 8 - usize::try_from(u32::from_le_bytes(length))?;
-    let hits: Vec<usize> = bytes[footer..]
-        .windows(owner.len())
-        .enumerate()
-        .filter(|(_, window)| *window == owner.as_bytes())
-        .map(|(offset, _)| footer + offset)
+/// Returns a filesystem, Arrow, or Parquet error.
+fn rewrite_footer_tenant(run: &Path, foreign: DataTenantId) -> Result<(), JourneyError> {
+    let builder = ParquetRecordBatchReaderBuilder::try_new(std::fs::File::open(run)?)?;
+    let tenant = tenant_key_value(foreign);
+    let mut metadata: Vec<KeyValue> = builder
+        .metadata()
+        .file_metadata()
+        .key_value_metadata()
+        .cloned()
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|entry| entry.key != tenant.key && entry.key != ARROW_SCHEMA_META_KEY)
         .collect();
-    let [at] = hits[..] else {
-        return Err(format!("footer holds the owner tenant {} times", hits.len()).into());
-    };
-    bytes[at..at + foreign.len()].copy_from_slice(foreign.as_bytes());
-    std::fs::write(run, bytes)?;
+    metadata.push(tenant);
+    let schema = builder.schema().clone();
+    let batches = builder.build()?.collect::<Result<Vec<_>, _>>()?;
+    let mut parquet = Vec::new();
+    let properties = bifrost_writer_properties_with_metadata(
+        metadata,
+        wyrd_spec::vala::managed_columns::WYRD_INGESTED_AT,
+        &[],
+    );
+    let mut writer = ArrowWriter::try_new(&mut parquet, schema, Some(properties))?;
+    for batch in &batches {
+        writer.write(batch)?;
+    }
+    writer.close()?;
+    std::fs::write(run, parquet)?;
     Ok(())
 }
 

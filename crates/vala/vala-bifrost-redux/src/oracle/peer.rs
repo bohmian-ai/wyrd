@@ -817,7 +817,6 @@ pub fn assignment_authority_digest_for(
                 schema_fingerprint_hex: assignment.schema_fingerprint.as_str(),
                 scribe_cut: assignment.scribe_provider_cut.as_ref(),
                 required_columns: &assignment.required_columns,
-                projection: &assignment.projection,
             },
         )
         .collect::<Vec<_>>();

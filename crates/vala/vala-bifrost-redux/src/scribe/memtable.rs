@@ -974,13 +974,7 @@ impl Memtable {
     ) -> Result<Vec<ReadableBatch>, ScribeError> {
         let mut batches = Vec::new();
         for source in self.readable_sources(tenant, table, partitions)? {
-            source.project(
-                required,
-                None,
-                None,
-                &mut batches,
-                &mut MemoryScan::default(),
-            )?;
+            source.project(required, None, &mut batches)?;
         }
         Ok(batches)
     }
@@ -1967,10 +1961,9 @@ impl LiveCapture {
     }
 
     /// Reads one partition range of the capture: its memory batches `pruning`
-    /// keeps, projected to `required` or, with `live`, filtered and evaluated
-    /// as [`LiveProjection`] says, the accounting owners of those
-    /// batches, its staged runs in merge order with the size and footer
-    /// staging recorded for each, and the lease that keeps those runs on disk.
+    /// keeps, projected to `required`, the accounting owners of those
+    /// batches, its staged run paths in merge order, and the lease that keeps
+    /// those runs on disk.
     ///
     /// The batch list is sized once from the in-range sources, so a read
     /// never regrows it.
@@ -1992,7 +1985,6 @@ impl LiveCapture {
         partitions: &std::ops::RangeInclusive<crate::catalog::layout::TimePartition>,
         required: &[FieldRef],
         pruning: Option<&crate::scan_sizing::BatchPruning>,
-        live: Option<&LiveProjection>,
     ) -> Result<CapturedRead, ScribeError> {
         let in_range: Vec<&ReadableSource> = self
             .memory
@@ -2004,9 +1996,8 @@ impl LiveCapture {
         let mut batches =
             Vec::with_capacity(in_range.iter().map(|source| source.batch_count()).sum());
         let mut charges = Vec::with_capacity(in_range.len());
-        let mut scanned = MemoryScan::default();
         for source in in_range {
-            source.project(required, pruning, live, &mut batches, &mut scanned)?;
+            source.project(required, pruning, &mut batches)?;
             charges.push(Arc::clone(&source.charge));
         }
         let runs = self
@@ -2014,12 +2005,11 @@ impl LiveCapture {
             .iter()
             .flat_map(|lease| lease.sources())
             .filter(|source| partitions.contains(&source.key.partition.time()))
-            .flat_map(|source| source.footers.reads(&source.runs))
+            .flat_map(|source| source.runs.iter().cloned())
             .collect();
         Ok(CapturedRead {
             batches,
             charges,
-            scanned,
             runs,
             lease: self.staged.clone(),
         })
@@ -2041,52 +2031,6 @@ pub(crate) fn on_capture_selected_for_test(hook: Box<dyn FnOnce()>) {
     CAPTURE_SELECTED.with(|slot| *slot.borrow_mut() = Some(hook));
 }
 
-/// The rows a live read returns and the values it returns of them.
-///
-/// Both are planned over the read's required fields. A read given one filters
-/// every kept memory batch exactly by `filter` and returns only `exprs`, each
-/// evaluated on the batch's physical columns, so a scalar read of a shredded
-/// Variant reads its typed leaves and never reconstructs the whole value; an
-/// expression that is a bare column is reconstructed as a whole read is.
-#[derive(Debug, Clone)]
-pub struct LiveProjection {
-    /// Predicate every returned row satisfies, or `None` to keep every row.
-    pub filter: Option<Arc<dyn datafusion::physical_expr::PhysicalExpr>>,
-    /// Output expressions, in output order.
-    pub exprs: datafusion::physical_expr::projection::ProjectionExprs,
-}
-
-impl LiveProjection {
-    /// Rewrites the filter and expressions from `logical` onto one batch's
-    /// `physical` layout with `DataFusion`'s default expression adapter.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`ScribeError::Internal`] when an expression does not adapt.
-    fn adapted(&self, logical: &SchemaRef, physical: SchemaRef) -> Result<Self, ScribeError> {
-        use datafusion::physical_expr_adapter::PhysicalExprAdapterFactory as _;
-        let failed = |error: datafusion::error::DataFusionError| ScribeError::Internal {
-            detail: format!("live-tail projection does not adapt: {error}"),
-        };
-        let adapter = datafusion::physical_expr_adapter::DefaultPhysicalExprAdapterFactory
-            .create(Arc::clone(logical), physical)
-            .map_err(failed)?;
-        Ok(Self {
-            filter: self
-                .filter
-                .as_ref()
-                .map(|filter| adapter.rewrite(Arc::clone(filter)))
-                .transpose()
-                .map_err(failed)?,
-            exprs: self
-                .exprs
-                .clone()
-                .try_map_exprs(|expr| adapter.rewrite(expr))
-                .map_err(failed)?,
-        })
-    }
-}
-
 /// One partition range read from a [`LiveCapture`].
 #[derive(Debug)]
 pub(crate) struct CapturedRead {
@@ -2095,130 +2039,10 @@ pub(crate) struct CapturedRead {
     /// Accounting owners of `batches`, which keep their bytes charged to the
     /// Scribe root while the read holds them.
     pub(crate) charges: Vec<Arc<crate::scribe::memory::RetainedArrowCharge>>,
-    /// The memory scan work producing `batches`, including batches the
-    /// read's filter emptied.
-    pub(crate) scanned: MemoryScan,
-    /// Staged runs with their recorded size and footer, in merge order.
-    pub(crate) runs: Vec<crate::scribe::hot_source::StagedRunRead>,
+    /// Staged run paths, in merge order.
+    pub(crate) runs: Vec<std::path::PathBuf>,
     /// Lease keeping `runs` on disk while the read holds it.
     pub(crate) lease: Option<Arc<crate::scribe::hot_source::StagedSourceLease>>,
-}
-
-/// Memory scan work of one live read: the rows its kept memory batches held
-/// and the distinct Arrow buffer bytes its filter and expressions read.
-///
-/// Counted per batch after bounds pruning and before row filtering, so a
-/// batch the bounds exclude contributes nothing and a batch the filter
-/// empties still counts. A shredded scalar read counts only the leaves its
-/// functions declare (see [`BufferTally`]). This is in-memory scan work, not
-/// Parquet IO, retained heap, a sizing estimate, returned rows or transport
-/// bytes.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub struct MemoryScan {
-    /// Rows of the kept batches, before the read's filter.
-    pub rows: u64,
-    /// Distinct Arrow buffer bytes the read's expressions access.
-    pub bytes: u64,
-}
-
-/// Distinct Arrow buffer bytes one batch's read touches.
-///
-/// Buffers are deduplicated by address within the batch, so two expressions
-/// over one column count it once. A column is counted whole unless a scalar
-/// function declares, through `required_input_fields`, the struct paths it
-/// reads; then only those subtrees and their ancestors' validity count, so a
-/// Variant path read excludes unused shredded siblings.
-#[derive(Default)]
-struct BufferTally {
-    /// Addresses of the buffers already counted.
-    seen: std::collections::HashSet<usize>,
-    /// Bytes of the counted buffers.
-    bytes: u64,
-}
-
-impl BufferTally {
-    /// Counts `buffer` once.
-    fn buffer(&mut self, buffer: &arrow::buffer::Buffer) {
-        if self.seen.insert(buffer.as_ptr() as usize) {
-            self.bytes = self.bytes.saturating_add(buffer.len() as u64);
-        }
-    }
-
-    /// Counts every buffer of `data` and its children.
-    fn data(&mut self, data: &arrow::array::ArrayData) {
-        for buffer in data.buffers() {
-            self.buffer(buffer);
-        }
-        if let Some(nulls) = data.nulls() {
-            self.buffer(nulls.buffer());
-        }
-        for child in data.child_data() {
-            self.data(child);
-        }
-    }
-
-    /// Counts the subtree `path` selects in `data`, with each struct
-    /// ancestor's validity; a path through a non-struct counts it whole.
-    fn path(&mut self, data: &arrow::array::ArrayData, path: &[String]) {
-        let Some((name, rest)) = path.split_first() else {
-            return self.data(data);
-        };
-        let arrow::datatypes::DataType::Struct(fields) = data.data_type() else {
-            return self.data(data);
-        };
-        if let Some(nulls) = data.nulls() {
-            self.buffer(nulls.buffer());
-        }
-        if let Some(child) = fields
-            .iter()
-            .position(|field| field.name() == name)
-            .and_then(|at| data.child_data().get(at))
-        {
-            self.path(child, rest);
-        }
-    }
-
-    /// Counts the columns of `batch` that `expr` reads.
-    fn expr(
-        &mut self,
-        expr: &Arc<dyn datafusion::physical_expr::PhysicalExpr>,
-        batch: &RecordBatch,
-    ) {
-        use datafusion::physical_expr::ScalarFunctionExpr;
-        use datafusion::physical_expr::expressions::Column;
-        let column = |expr: &Arc<dyn datafusion::physical_expr::PhysicalExpr>| {
-            expr.downcast_ref::<Column>()
-                .and_then(|column| batch.columns().get(column.index()))
-                .map(arrow::array::Array::to_data)
-        };
-        if expr.downcast_ref::<Column>().is_some() {
-            if let Some(data) = column(expr) {
-                self.data(&data);
-            }
-            return;
-        }
-        if let Some(function) = expr.downcast_ref::<ScalarFunctionExpr>()
-            && let Some(required) = function.required_input_fields(batch.schema_ref())
-        {
-            for (index, arg) in function.args().iter().enumerate() {
-                match (
-                    required.iter().find(|required| required.arg_index == index),
-                    column(arg),
-                ) {
-                    (Some(required), Some(data)) => {
-                        for path in &required.field_paths {
-                            self.path(&data, path);
-                        }
-                    }
-                    _ => self.expr(arg, batch),
-                }
-            }
-            return;
-        }
-        for child in expr.children() {
-            self.expr(child, batch);
-        }
-    }
 }
 
 /// Most appends a writable bucket's tail holds before it seals into a shared
@@ -2387,24 +2211,17 @@ impl ReadableSource {
     /// batch's bounds become inexact. A predicate that does not adapt or
     /// evaluate filters nothing here; the query's own filter still runs.
     ///
-    /// With `live`, a kept batch is instead filtered exactly by its filter and
-    /// emitted as its expressions, evaluated on the physical columns (see
-    /// [`LiveProjection`]), with bounds computed from the emitted rows.
-    ///
     /// [`DefaultPhysicalExprAdapterFactory`]: datafusion::physical_expr_adapter::DefaultPhysicalExprAdapterFactory
     ///
     /// # Errors
     ///
     /// Returns the column-selection error unchanged, or an internal error
-    /// when Variant reconstruction, Arrow cast, batch assembly, or a `live`
-    /// filter or expression fails.
+    /// when Variant reconstruction, Arrow cast, or batch assembly fails.
     fn project(
         &self,
         required: &[FieldRef],
         pruning: Option<&crate::scan_sizing::BatchPruning>,
-        live: Option<&LiveProjection>,
         output: &mut Vec<ReadableBatch>,
-        scanned: &mut MemoryScan,
     ) -> Result<(), ScribeError> {
         let internal = |error: arrow::error::ArrowError| ScribeError::Internal {
             detail: format!("live-tail Arrow projection failed: {error}"),
@@ -2452,16 +2269,9 @@ impl ReadableSource {
             })
             .collect();
         let keep = pruning.map(|pruning| pruning.keep(&statistics, statistics.len()));
-        let live_schema = live
-            .map(|live| live.exprs.project_schema(&schema).map(Arc::new))
-            .transpose()
-            .map_err(|error| ScribeError::Internal {
-                detail: format!("live-tail projection does not plan: {error}"),
-            })?;
         // One generation pins one layout, so the predicate adapts once to the
         // first physical batch and serves them all.
         let mut adapted: Option<Option<Arc<dyn datafusion::physical_expr::PhysicalExpr>>> = None;
-        let mut live_adapted: Option<LiveProjection> = None;
         for (index, ((batch, wal_lsn_max), mut statistics)) in self
             .runs
             .iter()
@@ -2478,93 +2288,6 @@ impl ReadableSource {
                 })
             });
             let mut physical = physical_projection(batch, &schema, &projection);
-            scanned.rows = scanned.rows.saturating_add(physical.num_rows() as u64);
-            let mut tally = BufferTally::default();
-            if let (Some(live), Some(live_schema)) = (live, &live_schema) {
-                let adapted = match &live_adapted {
-                    Some(adapted) => adapted,
-                    None => live_adapted.insert(live.adapted(&schema, physical.schema())?),
-                };
-                for expr in adapted
-                    .filter
-                    .iter()
-                    .chain(adapted.exprs.iter().map(|expr| &expr.expr))
-                {
-                    tally.expr(expr, &physical);
-                }
-                scanned.bytes = scanned.bytes.saturating_add(tally.bytes);
-                if let Some(filter) = &adapted.filter {
-                    physical = datafusion::physical_plan::filter::batch_filter(&physical, filter)
-                        .map_err(|error| ScribeError::Internal {
-                        detail: format!("live-tail filter failed: {error}"),
-                    })?;
-                    if physical.num_rows() == 0 {
-                        continue;
-                    }
-                }
-                let rows = physical.num_rows();
-                let columns = adapted
-                    .exprs
-                    .iter()
-                    .zip(live.exprs.iter())
-                    .zip(live_schema.fields())
-                    .map(|((adapted, logical), field)| {
-                        let column = match logical
-                            .expr
-                            .downcast_ref::<datafusion::physical_expr::expressions::Column>(
-                        ) {
-                            // A whole column is reconstructed as a whole read is.
-                            Some(column) => {
-                                let at = column.index();
-                                match projection[at].1 {
-                                    Some(source) => crate::schema::logical_column(
-                                        &physical.schema_ref().fields()[at],
-                                        physical.column(at),
-                                        self.schema.field(source),
-                                    )
-                                    .map_err(|detail| ScribeError::Internal {
-                                        detail: format!(
-                                            "live-tail Variant reconstruction failed: {detail}"
-                                        ),
-                                    })?,
-                                    None => Arc::clone(physical.column(at)),
-                                }
-                            }
-                            // Any other expression reads the physical leaves.
-                            None => adapted
-                                .expr
-                                .evaluate(&physical)
-                                .and_then(|value| value.into_array(rows))
-                                .map_err(|error| ScribeError::Internal {
-                                    detail: format!("live-tail projection failed: {error}"),
-                                })?,
-                        };
-                        if column.data_type() == field.data_type() {
-                            Ok(column)
-                        } else {
-                            arrow::compute::cast(&column, field.data_type()).map_err(internal)
-                        }
-                    })
-                    .collect::<Result<Vec<_>, _>>()?;
-                let batch = RecordBatch::try_new_with_options(
-                    Arc::clone(live_schema),
-                    columns,
-                    &arrow::array::RecordBatchOptions::new().with_row_count(Some(rows)),
-                )
-                .map_err(internal)?;
-                output.push(ReadableBatch {
-                    partition_day: self.seal_key.partition.time(),
-                    wal_lsn_max,
-                    statistics: batch_statistics(&batch),
-                    batch,
-                    generation: self.generation,
-                });
-                continue;
-            }
-            for column in physical.columns() {
-                tally.data(&column.to_data());
-            }
-            scanned.bytes = scanned.bytes.saturating_add(tally.bytes);
             if let Some(pruning) = pruning.filter(|_| shredded) {
                 let predicate = adapted.get_or_insert_with(|| {
                     use datafusion::physical_expr_adapter::PhysicalExprAdapterFactory as _;
@@ -2887,7 +2610,7 @@ mod tests {
         let partitions = key.partition.time()..=key.partition.time();
         let lsns = |pruning| {
             let mut lsns = capture
-                .read(&partitions, schema.fields(), pruning, None)
+                .read(&partitions, schema.fields(), pruning)
                 .expect("capture read")
                 .batches
                 .iter()
@@ -2939,7 +2662,7 @@ mod tests {
         let partitions = key.partition.time()..=key.partition.time();
         let lsns = |capture: &LiveCapture, pruning| -> Vec<u64> {
             capture
-                .read(&partitions, schema.fields(), pruning, None)
+                .read(&partitions, schema.fields(), pruning)
                 .expect("capture read")
                 .batches
                 .iter()
@@ -3078,7 +2801,7 @@ mod tests {
         let recorded = Arc::clone(&capture.memory[0].runs[0].statistics[0]);
         let read = |fields: &[FieldRef]| {
             let mut batches = capture
-                .read(&partitions, fields, None, None)
+                .read(&partitions, fields, None)
                 .expect("capture read")
                 .batches;
             assert_eq!(batches.capacity(), 1, "the batch list is sized once");

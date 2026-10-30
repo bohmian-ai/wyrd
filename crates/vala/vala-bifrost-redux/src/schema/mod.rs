@@ -101,14 +101,6 @@ pub fn logical_schema(physical: &Schema) -> Result<Schema, String> {
     ))
 }
 
-/// Shredded columns [`logical_column`] reconstructed in this test process.
-///
-/// Lets a test prove a scalar read evaluated over physical leaves without
-/// rebuilding a whole Variant.
-#[cfg(test)]
-pub(crate) static VARIANT_RECONSTRUCTIONS: std::sync::atomic::AtomicUsize =
-    std::sync::atomic::AtomicUsize::new(0);
-
 /// Restores one physical column to the type of its `logical` field.
 ///
 /// Only Variant storage is rewritten: each shredded Variant in `column`, at
@@ -130,8 +122,6 @@ pub fn logical_column(
     if column.data_type() == logical.data_type() {
         return Ok(Arc::clone(column));
     }
-    #[cfg(test)]
-    VARIANT_RECONSTRUCTIONS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
     let canonical = wyrd_types::variant::variant_storage_type();
     let (_, restored) = iceberg::arrow::unshred_variants(field, column)
         .and_then(|(field, column)| {

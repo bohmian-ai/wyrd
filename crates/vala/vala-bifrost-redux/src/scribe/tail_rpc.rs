@@ -5,6 +5,7 @@
 //! `ListActiveStreams` RPC, reads every fragment of that query from the
 //! retained capture, and releases it through `ReleaseCapture`.
 
+use std::path::PathBuf;
 use std::sync::Arc;
 
 #[cfg(feature = "test-support")]
@@ -378,10 +379,6 @@ pub struct FetchLiveTailRequest {
     /// The query's filter planned over `required_fields`, which Scribe prunes
     /// memory batches by before projecting them; `None` keeps every batch.
     pub pruning: Option<crate::scan_sizing::BatchPruning>,
-    /// The fragment's filter and output expressions over `required_fields`,
-    /// which Scribe applies to memory batches on their physical columns;
-    /// `None` returns the required fields themselves.
-    pub projection: Option<crate::scribe::memtable::LiveProjection>,
 }
 
 /// One shallow, structural hot snapshot returned by a shard owner.
@@ -415,21 +412,18 @@ pub struct LiveTailBatches {
     /// retained capture so retirement cannot uncharge them while this read
     /// holds them.
     charges: Vec<Arc<crate::scribe::memory::RetainedArrowCharge>>,
-    /// The capture's memory scan work, or `None` for a snapshot no capture
-    /// measured.
-    scanned: Option<crate::scribe::memtable::MemoryScan>,
-    /// Staged runs with their recorded size and footer, in merge order.
-    runs: Vec<crate::scribe::hot_source::StagedRunRead>,
+    /// Staged run paths in merge order.
+    runs: Vec<PathBuf>,
     /// Lease keeping `runs` on disk, shared with the retained capture.
     staged: Option<Arc<StagedSourceLease>>,
 }
 
 /// The parts of one [`LiveTailBatches`]: memory batches, their accounting
-/// owners, staged runs, and the lease keeping those runs on disk.
+/// owners, staged run paths, and the lease keeping those runs on disk.
 pub(crate) type LiveTailParts = (
     Vec<HotBatch>,
     Vec<Arc<crate::scribe::memory::RetainedArrowCharge>>,
-    Vec<crate::scribe::hot_source::StagedRunRead>,
+    Vec<PathBuf>,
     Option<Arc<StagedSourceLease>>,
 );
 
@@ -442,20 +436,14 @@ impl LiveTailBatches {
         Self {
             memtable,
             charges: Vec::new(),
-            scanned: None,
             runs: Vec::new(),
             staged: None,
         }
     }
 
-    /// Returns the capture's memory scan work, or `None` when no capture
-    /// measured these batches.
-    pub(crate) const fn scanned(&self) -> Option<crate::scribe::memtable::MemoryScan> {
-        self.scanned
-    }
-
     /// Splits the read into its memory batches, their accounting owners, its
-    /// staged runs in merge order, and the lease keeping those runs on disk.
+    /// staged run paths in merge order, and the lease keeping those runs on
+    /// disk.
     ///
     /// The caller must hold the charges for as long as any memory batch or a
     /// projection of one lives, and the lease for as long as it reads any run
@@ -977,7 +965,6 @@ impl FetchLiveTailService {
             &(request.start_partition..=request.end_partition),
             &request.required_fields,
             request.pruning.as_ref(),
-            request.projection.as_ref(),
         )?;
         Ok(LiveTailBatches {
             memtable: read
@@ -991,7 +978,6 @@ impl FetchLiveTailService {
                 })
                 .collect(),
             charges: read.charges,
-            scanned: Some(read.scanned),
             runs: read.runs,
             staged: read.lease,
         })
@@ -1284,7 +1270,7 @@ pub(crate) mod tests {
             .collect::<Vec<_>>();
         for run in runs {
             let reader = parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder::try_new(
-                std::fs::File::open(run.path).expect("leased staged run opens"),
+                std::fs::File::open(run).expect("leased staged run opens"),
             )
             .expect("staged run footer")
             .build()
@@ -1398,29 +1384,6 @@ pub(crate) mod tests {
     /// # Panics
     /// Panics when any fixture step fails.
     pub(crate) fn staged_generation_fixture_with_runs(runs: usize) -> StagedGenerationFixture {
-        let rows = RecordBatch::try_new(
-            Arc::new(Schema::new(vec![Field::new(
-                "value",
-                DataType::Int64,
-                false,
-            )])),
-            vec![Arc::new(Int64Array::from(vec![1_i64, 2, 3]))],
-        )
-        .expect("fixture batch");
-        staged_generation_fixture_of(&rows, &rows, runs)
-    }
-
-    /// Builds a [`StagedGenerationFixture`] whose generation holds the
-    /// logical `rows` and is staged as `runs` identical runs of `staged`,
-    /// those rows in the run's physical layout, one row group per row.
-    ///
-    /// # Panics
-    /// Panics when any fixture step fails.
-    pub(crate) fn staged_generation_fixture_of(
-        rows: &RecordBatch,
-        staged: &RecordBatch,
-        runs: usize,
-    ) -> StagedGenerationFixture {
         use crate::catalog::TableRef;
         use crate::scribe::assembly::StagedMemberId;
         use crate::scribe::hot_source::{HotAuthority, ScribeHotSourceRegistry};
@@ -1433,6 +1396,16 @@ pub(crate) mod tests {
         let stream = StreamIdentity::new(NodeId::generate(), WriterEpoch::new(1));
         let table = TableRef::new(crate::namespaces::BifrostNamespace::Bifrost, "events");
         let key = SealKey::new(tenant, table.clone(), day);
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "value",
+            DataType::Int64,
+            false,
+        )]));
+        let rows = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![Arc::new(Int64Array::from(vec![1_i64, 2, 3]))],
+        )
+        .expect("fixture batch");
         let registry = Arc::new(ScribeHotSourceRegistry::new());
         let memtable = Arc::new(Memtable::new().with_hot_sources(0, Arc::clone(&registry)));
         memtable
@@ -1447,7 +1420,7 @@ pub(crate) mod tests {
                     payload_len: 0,
                     slice_index: 0,
                     slice_count: 1,
-                    rows_accepted: rows.num_rows(),
+                    rows_accepted: 3,
                     wal_lsn_min: WalLsn::new(1),
                     wal_lsn_max: WalLsn::new(1),
                     seal_key: key.to_string(),
@@ -1464,16 +1437,15 @@ pub(crate) mod tests {
         };
 
         let directory = tempfile::tempdir().expect("staged run directory");
-        let run = write_staged_run(directory.path(), staged.schema(), staged, tenant);
+        let run = write_staged_run(directory.path(), schema, &rows, tenant);
         let runs = (0..runs)
             .map(|index| {
                 let copy = directory.path().join(format!("run-copy-{index}.parquet"));
                 std::fs::copy(&run, &copy).expect("fixture staged run copies");
                 copy
             })
-            .collect::<Vec<_>>();
+            .collect();
         let member = StagedMemberId::new(0, generation.get());
-        let footers = crate::scribe::hot_source::RunFooters::read_for_test(&runs);
         registry
             .advance(
                 &key,
@@ -1482,7 +1454,7 @@ pub(crate) mod tests {
                     member,
                     runs,
                     bytes: 4_096,
-                    footers,
+                    footers: crate::scribe::hot_source::RunFooters::default(),
                     wal: (WalLsn::new(1), WalLsn::new(1)),
                 },
             )
@@ -1496,14 +1468,13 @@ pub(crate) mod tests {
             super::TenantTableBinding::resolve((tenant, table)).expect("fixture binding resolves");
         let request = super::FetchLiveTailRequest {
             pruning: None,
-            projection: None,
             binding,
             target_stream: stream,
             query_id: uuid::Uuid::new_v4(),
             capture_id: uuid::Uuid::nil(),
             start_partition: day,
             end_partition: day,
-            required_fields: rows.schema().fields().clone(),
+            required_fields: named_fields(["value"]),
         };
         StagedGenerationFixture {
             service,
@@ -1621,7 +1592,6 @@ pub(crate) mod tests {
             super::TenantTableBinding::resolve((tenant, table)).expect("fixture binding resolves");
         let request = super::FetchLiveTailRequest {
             pruning: None,
-            projection: None,
             binding,
             target_stream: stream,
             query_id: uuid::Uuid::new_v4(),
@@ -1648,9 +1618,9 @@ pub(crate) mod tests {
                         GenerationOrdinal::new(0, frozen.seal_id),
                         HotAuthority::StagedRun {
                             member: crate::scribe::assembly::StagedMemberId::new(0, frozen.seal_id),
-                            footers: RunFooters::read_for_test(std::slice::from_ref(&run)),
                             runs: vec![run],
                             bytes: 4_096,
+                            footers: RunFooters::default(),
                             wal: (WalLsn::new(1), WalLsn::new(1)),
                         },
                     )
@@ -1717,7 +1687,7 @@ pub(crate) mod tests {
         assert!(rows.is_empty(), "a durable staged generation leaves memory");
         assert_eq!(runs.len(), 1, "the leased run is still named");
         assert!(
-            runs[0].path.exists(),
+            runs[0].exists(),
             "a leased staged run stays on disk after publication"
         );
         drop(lease);
@@ -1858,7 +1828,7 @@ pub(crate) mod tests {
         assert_eq!(service.retained_captures_for_test(), 1);
         assert!(service.open_capture(&request).is_err());
         let (_rows, _charges, runs, lease) = opened.into_parts();
-        assert!(lease.is_some() && runs.iter().all(|run| run.path.exists()));
+        assert!(lease.is_some() && runs.iter().all(|run| run.exists()));
     }
 
     /// An unreleased capture expires at its query deadline and is never

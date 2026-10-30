@@ -3,13 +3,10 @@
 use std::sync::Arc;
 
 use datafusion::common::DFSchema;
-use datafusion::physical_expr::projection::{ProjectionExpr, ProjectionExprs};
 use datafusion::physical_plan::ExecutionPlan;
 use datafusion::physical_plan::filter::FilterExec;
-use datafusion::physical_plan::projection::ProjectionExec;
 use datafusion::prelude::SessionContext;
 use datafusion_proto::bytes::physical_plan_to_bytes_with_extension_codec;
-use datafusion_proto::protobuf::{PhysicalPlanNode, physical_plan_node::PhysicalPlanType};
 use vala_bifrost_redux::catalog::TableRef;
 use vala_bifrost_redux::namespaces::BifrostNamespace;
 use vala_bifrost_redux::oracle::assignment_schema_fingerprint;
@@ -23,7 +20,7 @@ use vala_bifrost_redux::oracle::peer::{
 use wyrd_server::config::BifrostTarget;
 use wyrd_spec::vala::api::{
     ClusterRole, ExecuteFragmentRequest, FollowerScanAssignment, NodeId, OracleRoleFence,
-    PeerContext, ProjectedExpression, ReservationId, ScribeProviderCut, TenantTableBinding,
+    PeerContext, ReservationId, ScribeProviderCut, TenantTableBinding,
 };
 use wyrd_tonic::prost::Message as _;
 use wyrd_tonic::tonic;
@@ -504,7 +501,6 @@ async fn prove_leaf_predicates_round_trip_and_execute() -> Result<(), PeerJourne
         table,
         &columns,
         Some("attrs['kind'] IN ('a', 'c') AND (doc ->> 'n')::bigint = 2"),
-        None,
     )
     .await?;
     let tenant = cluster.tenant().as_uuid();
@@ -552,7 +548,6 @@ async fn prove_leaf_predicates_round_trip_and_execute() -> Result<(), PeerJourne
         table,
         &columns,
         Some("attrs['kind'] IN ('b', 'c') AND (doc ->> 'n')::bigint = 2"),
-        None,
     )
     .await?;
     let mut tampered = fragment.request(tenant)?;
@@ -607,218 +602,7 @@ async fn prove_leaf_predicates_round_trip_and_execute() -> Result<(), PeerJourne
     Ok(())
 }
 
-/// A Scribe executes a signed scalar projection over its shredded memory
-/// and staged runs, returning exactly the leader's answer, and refuses a
-/// projection that differs from the one the leader signed.
-///
-/// # Panics
-///
-/// Panics when any claim in the journey fails, naming the claim.
-#[tokio::test]
-#[ignore = "requires the serialized Postgres-backed Oracle journey lane"]
-async fn remote_shredded_projection_preserves_results_and_rejects_tampering() {
-    prove_remote_shredded_projection()
-        .await
-        .expect("remote shredded projection journey");
-}
-
-/// Executes `request` on the Scribe and returns its `(id, a)` rows, sorted.
-///
-/// # Errors
-///
-/// Returns the refusal, or a message when a frame is not the projected shape.
-async fn projected_rows(
-    client: &mut OraclePeerServiceClient<tonic::transport::Channel>,
-    request: proto::ExecuteFragmentRequest,
-) -> Result<Vec<(i64, Option<String>)>, PeerJourneyError> {
-    use arrow::array::{Array as _, AsArray as _};
-
-    let mut stream = client.execute_fragment(request).await?.into_inner();
-    let mut rows = Vec::new();
-    while let Some(frame) = stream.message().await? {
-        let Some(proto::worker_attempt_frame::Frame::ArrowIpcBatch(bytes)) = frame.frame else {
-            continue;
-        };
-        for batch in arrow::ipc::reader::StreamReader::try_new(std::io::Cursor::new(bytes), None)? {
-            let batch = batch?;
-            let names = batch
-                .schema()
-                .fields()
-                .iter()
-                .map(|field| field.name().clone())
-                .collect::<Vec<_>>();
-            if names != ["id", "a"] {
-                return Err(format!("the worker returned {names:?}, not the projection").into());
-            }
-            let ids = batch
-                .column(0)
-                .as_primitive_opt::<arrow::datatypes::Int64Type>()
-                .ok_or("the worker id is not Int64")?;
-            let text = arrow::compute::cast(batch.column(1), &arrow::datatypes::DataType::Utf8)?;
-            let text = text.as_string::<i32>();
-            rows.extend((0..batch.num_rows()).map(|row| {
-                (
-                    ids.value(row),
-                    text.is_valid(row).then(|| text.value(row).to_owned()),
-                )
-            }));
-        }
-    }
-    rows.sort();
-    Ok(rows)
-}
-
-/// Drives the remote shredded projection journey against one live topology.
-///
-/// A first cohort publishes and teaches the Scribe a layout, so a second
-/// cohort is retained shredded. The leader's fragment signs `doc ->> 'a'`
-/// over the `[id, doc]` closure; the Scribe that owns the stream answers it
-/// from memory and, after staging, from its staged runs. A fragment whose
-/// projection differs from the signed one, a re-signed assignment that no
-/// longer matches its fragment, and a foreign tenant each leave the Scribe's
-/// fragment-execution counter where it was.
-///
-/// # Errors
-///
-/// Returns the first claim that broke.
-async fn prove_remote_shredded_projection() -> Result<(), PeerJourneyError> {
-    use arrow::datatypes::{DataType, Field};
-
-    let cluster = PeerCluster::start(&[
-        BifrostTarget::Oracle,
-        BifrostTarget::Oracle,
-        BifrostTarget::Scribe,
-    ])
-    .await?;
-    let plane = ReservationPlane::observe(&cluster).await?;
-    let table = "peer_shredded_projection";
-    let schema = Arc::new(arrow::datatypes::Schema::new(vec![
-        Field::new("id", DataType::Int64, false),
-        wyrd_types::variant::variant_field("doc", true),
-    ]));
-    cluster
-        .register_table_with(
-            SCRIBE_POD,
-            table,
-            schema
-                .fields()
-                .iter()
-                .map(|field| field.as_ref().clone())
-                .collect(),
-        )
-        .await?;
-    let cohort = |first: i64| -> Result<_, PeerJourneyError> {
-        let ids = (first..first + 40).collect::<Vec<_>>();
-        let docs: arrow::array::ArrayRef = Arc::new(arrow::array::StringArray::from(
-            ids.iter()
-                .map(|id| format!(r#"{{"a":"s{id}","b":{id}}}"#))
-                .collect::<Vec<_>>(),
-        ));
-        let docs: arrow::array::ArrayRef = parquet_variant_compute::json_to_variant(&docs)?.into();
-        let batch = arrow::record_batch::RecordBatch::try_new(
-            Arc::clone(&schema),
-            vec![
-                Arc::new(arrow::array::Int64Array::from(ids.clone())),
-                arrow::compute::cast(&docs, &wyrd_types::variant::variant_storage_type())?,
-            ],
-        )?;
-        let answer = ids
-            .iter()
-            .map(|id| (*id, Some(format!("s{id}"))))
-            .collect::<Vec<_>>();
-        Ok((batch, answer))
-    };
-    let (published, _) = cohort(0)?;
-    cluster
-        .ingest_live_batch(SCRIBE_POD, table, &published)
-        .await?;
-    cluster.flush(SCRIBE_POD).await?;
-    let (shredded, answer) = cohort(40)?;
-    cluster
-        .ingest_live_batch(SCRIBE_POD, table, &shredded)
-        .await?;
-    let server = cluster.server(SCRIBE_POD)?;
-    let layouts = server
-        .bifrost_scribe()
-        .ok_or("the Scribe pod composes no Scribe")?
-        .writable_variant_layouts_for_test(
-            cluster.tenant(),
-            &TableRef::new(BifrostNamespace::Bifrost, table),
-        )?;
-    if layouts != [true] {
-        return Err(format!("the second cohort is not retained shredded: {layouts:?}").into());
-    }
-
-    let columns = ["id", "doc"];
-    let outputs = [("id", "id"), ("doc ->> 'a'", "a")];
-    let tenant = cluster.tenant().as_uuid();
-    let mut client = OraclePeerServiceClient::new(
-        PeerDial::member(cluster.peer_ca(), cluster.peer_addr(SCRIBE_POD)?)
-            .connect()
-            .await?,
-    );
-    for source in ["memory", "staged runs"] {
-        if source == "staged runs" {
-            server.stage_bifrost_writable_for_test().await?;
-        }
-        let fragment =
-            ScribeFragment::over(&cluster, &plane, table, &columns, None, Some(&outputs)).await?;
-        let before = cluster.scribe_fragments(SCRIBE_POD)?;
-        let rows = projected_rows(&mut client, fragment.request(tenant)?).await?;
-        if rows != answer {
-            return Err(format!("{source} answered {rows:?}").into());
-        }
-        if cluster.scribe_fragments(SCRIBE_POD)? != before + 1 {
-            return Err(format!("the {source} fragment did not execute exactly once").into());
-        }
-    }
-
-    let fragment =
-        ScribeFragment::over(&cluster, &plane, table, &columns, None, Some(&outputs)).await?;
-    let altered = ScribeFragment::over(
-        &cluster,
-        &plane,
-        table,
-        &columns,
-        None,
-        Some(&[("id", "id"), ("doc ->> 'b'", "a")]),
-    )
-    .await?;
-    let mut unsigned = fragment.request(tenant)?;
-    unsigned.physical_plan_bytes = altered.plan.clone();
-    unsigned.plan_fingerprint = altered.fingerprint.clone();
-    let mut resigned = fragment.clone();
-    resigned.assignment.projection = altered.assignment.projection.clone();
-    let refusals = [
-        (
-            "a fragment whose projection changed after signing",
-            unsigned,
-        ),
-        (
-            "an assignment re-signed with another fragment's projection",
-            resigned.request(tenant)?,
-        ),
-        (
-            "a fragment for a foreign tenant",
-            fragment.request(uuid::Uuid::now_v7())?,
-        ),
-    ];
-    for (description, request) in refusals {
-        let before = cluster.scribe_fragments(SCRIBE_POD)?;
-        if let Ok(rows) = projected_rows(&mut client, request).await {
-            return Err(format!("{description} answered {rows:?}").into());
-        }
-        if cluster.scribe_fragments(SCRIBE_POD)? != before {
-            return Err(format!("{description} executed on the Scribe").into());
-        }
-    }
-
-    cluster.shutdown().await?;
-    Ok(())
-}
-
 /// One live Scribe fragment built exactly as an Oracle leader builds it.
-#[derive(Clone)]
 struct ScribeFragment {
     /// The fragment's single hot-provider assignment, owned by the real tenant.
     assignment: FollowerScanAssignment,
@@ -849,19 +633,17 @@ impl ScribeFragment {
     ) -> Result<Self, PeerJourneyError> {
         cluster.register_table(SCRIBE_POD, table).await?;
         cluster.ingest_live_rows(SCRIBE_POD, table, 0, 8, 2).await?;
-        Self::over(cluster, plane, table, &["id"], None, None).await
+        Self::over(cluster, plane, table, &["id"], None).await
     }
 
     /// Builds the fragment for the one live partition of an already written
-    /// `table`, reading `columns` under the SQL `predicate`, when one is given,
-    /// and returning the SQL `outputs` under their aliases, or every closure
-    /// column when none are given.
+    /// `table`, reading `columns` under the SQL `predicate`, when one is given.
     ///
     /// `columns` is the signed projection closure, so it must name every
-    /// predicate and output column; the encoded placeholder exposes exactly
-    /// those columns. A predicate ships as the leader's live leaf ships one: a
+    /// predicate column; the encoded placeholder exposes exactly those
+    /// columns. A predicate ships as the leader's live leaf ships one: a
     /// `FilterExec` planned by a default `DataFusion` session above the
-    /// placeholder, under the leaf's projection, which the assignment signs.
+    /// placeholder.
     ///
     /// # Errors
     ///
@@ -874,7 +656,6 @@ impl ScribeFragment {
         table: &str,
         columns: &[&str],
         predicate: Option<&str>,
-        outputs: Option<&[(&str, &str)]>,
     ) -> Result<Self, PeerJourneyError> {
         let state = cluster.server(SCRIBE_POD)?.state();
         let catalog = state
@@ -907,7 +688,7 @@ impl ScribeFragment {
             .next()
             .ok_or("the Scribe reports no live partition")?;
         let (partition, stream) = (listed.time_partition, listed.stream);
-        let (schema, _) = catalog.assignment_schema(&table_ref, tenant).await?;
+        let schema = catalog.assignment_schema(&table_ref, tenant).await?;
         let schema_fingerprint = assignment_schema_fingerprint(&schema);
         let indices = columns
             .iter()
@@ -924,51 +705,18 @@ impl ScribeFragment {
             schema_fingerprint.clone(),
             Arc::clone(&projected),
         ));
-        let session = SessionContext::new();
-        let closure = DFSchema::try_from(projected.as_ref().clone())?;
         if let Some(sql) = predicate {
+            let session = SessionContext::new();
+            let schema = DFSchema::try_from(projected.as_ref().clone())?;
             let predicate =
-                session.create_physical_expr(session.parse_sql_expr(sql, &closure)?, &closure)?;
+                session.create_physical_expr(session.parse_sql_expr(sql, &schema)?, &schema)?;
             plan = Arc::new(FilterExec::try_new(predicate, plan)?);
         }
-        // A live fragment reads its scan through the leaf's projection.
-        let exprs = match outputs {
-            None => ProjectionExprs::from_indices(
-                &(0..projected.fields().len()).collect::<Vec<_>>(),
-                &projected,
-            ),
-            Some(outputs) => ProjectionExprs::new(
-                outputs
-                    .iter()
-                    .map(|(sql, alias)| {
-                        let expr = session.create_physical_expr(
-                            session.parse_sql_expr(sql, &closure)?,
-                            &closure,
-                        )?;
-                        Ok(ProjectionExpr::new(expr, (*alias).to_owned()))
-                    })
-                    .collect::<Result<Vec<_>, PeerJourneyError>>()?,
-            ),
-        };
         let plan = physical_plan_to_bytes_with_extension_codec(
-            Arc::new(ProjectionExec::try_new(exprs.iter().cloned(), plan)?),
+            plan,
             &OraclePhysicalExtensionCodec::encoder(),
         )?
         .to_vec();
-        let Some(PhysicalPlanType::Projection(root)) =
-            PhysicalPlanNode::decode(plan.as_slice())?.physical_plan_type
-        else {
-            return Err("the encoded fragment root is its projection".into());
-        };
-        let projection = root
-            .expr
-            .iter()
-            .zip(root.expr_name)
-            .map(|(expression, alias)| ProjectedExpression {
-                expression: expression.encode_to_vec(),
-                alias,
-            })
-            .collect();
         Ok(Self {
             fingerprint: physical_plan_fingerprint(&plan),
             plan,
@@ -983,7 +731,6 @@ impl ScribeFragment {
                 }),
                 schema_fingerprint,
                 required_columns: columns.iter().map(|column| (*column).to_owned()).collect(),
-                projection,
             },
             leader: OracleRoleFence {
                 node_id: NodeId::new(plane.leader_node_id),

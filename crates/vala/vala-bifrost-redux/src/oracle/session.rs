@@ -4,9 +4,6 @@
 //! `->`/`->>` planner, are built once per process; each query clones the
 //! result instead of rebuilding every registry.
 //!
-//! The template also carries [`super::live::LiveUnionProjection`], so every
-//! plan with a live leaf pushes its projection to the Scribe scan.
-//!
 //! The analytical leader's distributed session is the one exception: it is
 //! built from `DataFusion`'s default features directly, with the attempt's own
 //! runtime and the distributed planner.
@@ -21,10 +18,7 @@ use datafusion_proto::bytes::Serializeable as _;
 
 /// The process-wide template; it holds no tables and never changes.
 static SHARED: LazyLock<OracleSessionTemplate> = LazyLock::new(|| {
-    let template = SessionStateBuilder::new()
-        .with_default_features()
-        .with_physical_optimizer_rule(Arc::new(super::live::LiveUnionProjection))
-        .build();
+    let template = SessionStateBuilder::new().with_default_features().build();
     OracleSessionTemplate {
         functions: TaskContext::from(&template),
         template,

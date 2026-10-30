@@ -2132,24 +2132,6 @@ pub struct FollowerScanAssignment {
     /// Required output/predicate/hidden-tenant projection closure, in the
     /// stable order the leaf union and remote placeholder must expose.
     pub required_columns: Vec<String>,
-    /// The fragment's output expressions over `required_columns`, in output
-    /// order; never empty. They are the exact `ProjectionExec` the signed
-    /// fragment places above its placeholder, so a follower evaluates them on
-    /// its sources instead of returning whole input columns.
-    pub projection: Vec<ProjectedExpression>,
-}
-
-/// One output expression of a live fragment's projection.
-///
-/// The bytes are opaque here: they are a serialized `DataFusion`
-/// `PhysicalExprNode` that only the Oracle physical codec reads.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
-#[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
-pub struct ProjectedExpression {
-    /// Serialized physical expression over the assignment's closure.
-    pub expression: Vec<u8>,
-    /// Output column name the expression produces.
-    pub alias: String,
 }
 
 /// Context-bound worker request carrying one serialized physical subtree.
@@ -2197,17 +2179,11 @@ pub struct ExecuteFragmentRequest {
 )]
 #[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
 pub struct WorkerScanStats {
-    /// Bytes the follower's executed scans read: Parquet bytes read from
-    /// storage plus the distinct Arrow buffer bytes a Scribe memory read
-    /// accessed after bounds pruning. Memory bytes are scan work, not storage
-    /// IO, retained heap, or transport size. `None` means unavailable, not
-    /// zero: a source that measures neither must not be reported as a
-    /// zero-byte scan.
+    /// Physical bytes the follower's executed scans read, when its sources
+    /// report physical IO at all. `None` means unavailable, not zero: a
+    /// memory-backed source reads no storage and must not be reported as a
+    /// zero-byte scan of one that does.
     pub bytes_scanned: Option<u64>,
-    /// Input rows the follower's executed scans examined: Parquet scan output
-    /// rows plus the rows of the Scribe memory batches kept after bounds
-    /// pruning, before row filtering. `None` means unavailable, not zero.
-    pub rows_scanned: Option<u64>,
     /// Number of files represented by the follower's executed scan nodes.
     pub files_scanned: u64,
     /// Number of file partitions represented by the follower's executed scans.

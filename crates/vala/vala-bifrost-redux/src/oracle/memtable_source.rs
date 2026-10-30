@@ -68,10 +68,6 @@ pub(super) struct MemtableSource {
     /// Per batch of `inner`, partition by partition, whether its bounds
     /// prove `filter` holds on every row, so the batch streams unfiltered.
     matched: Vec<Vec<bool>>,
-    /// The Scribe capture's memory scan work behind these batches, carried
-    /// unchanged through every rewrite so a plan reports it once; `None` for
-    /// batches no capture measured.
-    scanned: Option<crate::scribe::memtable::MemoryScan>,
 }
 
 impl MemtableSource {
@@ -119,24 +115,7 @@ impl MemtableSource {
             partitioning,
             charges,
             filter: None,
-            scanned: None,
         })
-    }
-
-    /// Attaches the capture's memory scan work behind this source's batches.
-    #[must_use]
-    pub(super) const fn with_scanned(
-        mut self,
-        scanned: Option<crate::scribe::memtable::MemoryScan>,
-    ) -> Self {
-        self.scanned = scanned;
-        self
-    }
-
-    /// Returns the capture's memory scan work, or `None` when no capture
-    /// measured these batches.
-    pub(super) const fn scanned(&self) -> Option<crate::scribe::memtable::MemoryScan> {
-        self.scanned
     }
 
     /// Rewraps a fetch- or projection-rewritten copy of `inner`, keeping this
@@ -157,7 +136,6 @@ impl MemtableSource {
                 charges: Arc::clone(&self.charges),
                 filter: None,
                 matched: self.matched.clone(),
-                scanned: self.scanned,
             })
     }
 
@@ -225,7 +203,6 @@ impl MemtableSource {
             &source.statistics,
         );
         source.filter = Some(filter);
-        source.scanned = self.scanned;
         Ok(Some(source))
     }
 

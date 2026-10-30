@@ -503,3 +503,19 @@ Staged/memtable ratios, each within its own record:
 | Parquet: no latency, CPU or scanned-byte regression against 459617bae (no tolerance) | Higher on point c1 (p99 +0.7%, CPU +3.2%, bytes +2.1%), point c64 (p99 +4.7%, CPU +3.0%, bytes +2.1%), small-aggregate bytes (+1.5%), span-trace c1 (p99 +2.2%, CPU +1.5%), span-trace c64 (p99 +4.1%, CPU +1.7%), shredded p99 (+1.6%), long-tail CPU (+0.8%), full-scan p95 (+1.7%). Lower or equal on small-aggregate p99/CPU, full-scan CPU, shredded CPU, long-tail p99 | **MISS** |
 
 The other hot memtable steps also cost more server CPU per query than in 471f69ff9: point c1 +3.1%, point c64 +2.2%, small-aggregate +19.9%, long-tail +9.0%. Their staged counterparts held or improved on CPU, except small-aggregate staged (+1.6%). Staged scanned bytes rose on point (+4.4%) and small-aggregate (+3.8%). These measurements do not establish a cause, and none is claimed. Every **MISS** above is unfinished performance acceptance; it does not change either VALID verdict.
+
+## Rollback
+
+**Status: NOT DONE. The implementation is rolled back to `471f69ff9`.** The task, its evidence and both benchmark records are kept.
+
+Why:
+- Five performance acceptance targets missed, and `verify:bifrost` was red. That is unfinished acceptance, so the task should never have been declared IMPLEMENTED.
+- The tests checked scalar leaf projection on hand-built fixtures. The benchmark's real query shape was never tested: `COUNT(*)` with an `attributes ->>` predicate. The live path keeps the leader's filter (`oracle/live.rs`), so a scan can filter on a shredded leaf and still rebuild the whole `attributes` column afterward.
+- Identical scanned bytes for the shredded and long-tail steps do not prove the leaf went unused. The two predicates use different keys and selectivities, so comparing them does not measure what shredding is worth.
+
+Also removed by the rollback:
+- The V-TIME fix: the fork pin goes back to `19796a13e`; fork commit `8d6d6bf58` stays pushed.
+- Memory scan rows and bytes.
+- The `count(*)` and journey-fixture repairs.
+
+A next attempt starts with a failing end-to-end test of the benchmark query on memtable and staged data in the learned layout. It needs a same-key, same-selectivity comparison of shredded against unshredded, and staged must be profiled against memtable before any change.

@@ -512,33 +512,15 @@ impl TryFrom<proto::FollowerScanAssignment> for domain::FollowerScanAssignment {
     /// tenant column. There is no v1 fallback and no default-empty
     /// projection — a peer advertising v1 semantics by omitting this field
     /// is rejected outright rather than silently admitted with an
-    /// unprojected (tenant-dropping) closure. `projection` is required the
-    /// same way: an assignment without output expressions is refused rather
-    /// than read as whole columns.
+    /// unprojected (tenant-dropping) closure.
     ///
     /// # Errors
     /// Returns [`PrivateConversionError`] when identity, binding, schema
-    /// fingerprint, `required_columns`, or `projection` is absent, or a
-    /// projected expression has empty bytes or alias.
+    /// fingerprint, or `required_columns` is absent.
     fn try_from(value: proto::FollowerScanAssignment) -> Result<Self, Self::Error> {
         nonempty(&value.scan_id, "scan_id")?;
         nonempty(&value.schema_fingerprint, "schema_fingerprint")?;
         nonempty_vec(&value.required_columns, "required_columns")?;
-        nonempty_vec(&value.projection, "projection")?;
-        let projection = value
-            .projection
-            .into_iter()
-            .map(|projected| {
-                if projected.expression.is_empty() {
-                    return Err(PrivateConversionError::Missing("projection expression"));
-                }
-                nonempty(&projected.alias, "projection alias")?;
-                Ok(domain::ProjectedExpression {
-                    expression: projected.expression,
-                    alias: projected.alias,
-                })
-            })
-            .collect::<Result<_, _>>()?;
         Ok(Self {
             scan_id: value.scan_id,
             binding: value
@@ -551,7 +533,6 @@ impl TryFrom<proto::FollowerScanAssignment> for domain::FollowerScanAssignment {
                 .transpose()?,
             schema_fingerprint: value.schema_fingerprint,
             required_columns: value.required_columns,
-            projection,
         })
     }
 }
@@ -565,14 +546,6 @@ impl From<domain::FollowerScanAssignment> for proto::FollowerScanAssignment {
             scribe_provider_cut: value.scribe_provider_cut.map(Into::into),
             schema_fingerprint: value.schema_fingerprint,
             required_columns: value.required_columns,
-            projection: value
-                .projection
-                .into_iter()
-                .map(|projected| proto::ProjectedExpression {
-                    expression: projected.expression,
-                    alias: projected.alias,
-                })
-                .collect(),
         }
     }
 }
@@ -726,7 +699,6 @@ impl From<proto::WorkerScanStats> for domain::WorkerScanStats {
     fn from(value: proto::WorkerScanStats) -> Self {
         Self {
             bytes_scanned: value.bytes_scanned,
-            rows_scanned: value.rows_scanned,
             files_scanned: value.files_scanned,
             partitions_scanned: value.partitions_scanned,
             row_groups_scanned: value.row_groups_scanned,
@@ -742,7 +714,6 @@ impl From<domain::WorkerScanStats> for proto::WorkerScanStats {
     fn from(value: domain::WorkerScanStats) -> Self {
         Self {
             bytes_scanned: value.bytes_scanned,
-            rows_scanned: value.rows_scanned,
             files_scanned: value.files_scanned,
             partitions_scanned: value.partitions_scanned,
             row_groups_scanned: value.row_groups_scanned,
@@ -1242,7 +1213,6 @@ mod tests {
             completed: true,
             scan_stats: domain::WorkerScanStats {
                 bytes_scanned: Some(4_096),
-                rows_scanned: Some(9),
                 files_scanned: 3,
                 partitions_scanned: 2,
                 row_groups_scanned: 5,
@@ -1257,15 +1227,14 @@ mod tests {
         assert_eq!(actual, expected);
     }
 
-    /// A complete assignment, with its ordered projection expressions and
-    /// aliases, round-trips through the v2 wire, and a projected expression
-    /// with empty bytes or an empty alias is refused before it reaches the
-    /// domain type.
+    /// Every closed scalar/op round-trips through the v2 wire, and malformed
+    /// closed-shape input (unspecified op, literal on a null-check, missing
+    /// literal on a comparison) is rejected before it reaches the domain type.
     ///
     /// # Panics
     ///
-    /// Panics when a valid assignment fails to round-trip or a malformed
-    /// projection is accepted.
+    /// Panics when a valid scalar or operator fails to round-trip through the
+    /// v2 wire, or a malformed closed-shape predicate is accepted.
     #[test]
     fn follower_assignment_v2_contract() {
         let expected = domain::FollowerScanAssignment {
@@ -1282,16 +1251,6 @@ mod tests {
                 "time_unix_nano".into(),
                 "data_tenant_id".into(),
             ],
-            projection: vec![
-                domain::ProjectedExpression {
-                    expression: vec![1, 2, 3],
-                    alias: "service".into(),
-                },
-                domain::ProjectedExpression {
-                    expression: vec![4],
-                    alias: "time".into(),
-                },
-            ],
         };
 
         let actual = domain::FollowerScanAssignment::try_from(proto::FollowerScanAssignment::from(
@@ -1299,28 +1258,13 @@ mod tests {
         ))
         .expect("valid v2 assignment round-trips");
         assert_eq!(actual, expected);
-
-        let mut empty_bytes = proto::FollowerScanAssignment::from(expected.clone());
-        empty_bytes.projection[0].expression.clear();
-        assert!(matches!(
-            domain::FollowerScanAssignment::try_from(empty_bytes),
-            Err(PrivateConversionError::Missing("projection expression"))
-        ));
-        let mut empty_alias = proto::FollowerScanAssignment::from(expected);
-        empty_alias.projection[1].alias.clear();
-        assert!(matches!(
-            domain::FollowerScanAssignment::try_from(empty_alias),
-            Err(PrivateConversionError::Invalid {
-                field: "projection alias"
-            })
-        ));
     }
 
     /// A v1-shaped peer that omits `required_columns` is rejected outright:
     /// there is no dual decoder and no default-empty projection fallback.
     /// An empty `required_columns` would silently drop the hidden tenant
-    /// column, and an empty `projection` would read whole columns, so
-    /// decoding must fail closed rather than admit either.
+    /// column, so decoding must fail closed rather than admit the
+    /// assignment with an unprojected read.
     #[test]
     fn follower_assignment_v1_shaped_peer_is_rejected() {
         let expected = domain::FollowerScanAssignment {
@@ -1333,22 +1277,12 @@ mod tests {
             scribe_provider_cut: None,
             schema_fingerprint: "0".repeat(64),
             required_columns: vec!["data_tenant_id".into()],
-            projection: vec![domain::ProjectedExpression {
-                expression: vec![1],
-                alias: "data_tenant_id".into(),
-            }],
         };
-        let mut v1_shaped = proto::FollowerScanAssignment::from(expected.clone());
+        let mut v1_shaped = proto::FollowerScanAssignment::from(expected);
         v1_shaped.required_columns = Vec::new();
         assert!(matches!(
             domain::FollowerScanAssignment::try_from(v1_shaped),
             Err(PrivateConversionError::Missing("required_columns"))
-        ));
-        let mut expression_less = proto::FollowerScanAssignment::from(expected);
-        expression_less.projection = Vec::new();
-        assert!(matches!(
-            domain::FollowerScanAssignment::try_from(expression_less),
-            Err(PrivateConversionError::Missing("projection"))
         ));
     }
 }

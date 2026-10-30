@@ -1883,13 +1883,8 @@ async fn prove_source_transitions() -> Result<(), JourneyError> {
         context.request_id.clone(),
     ));
     // Forge keeps promoting case 1's files for a moment, and each promotion
-    // moves the cut and evicts the cached one only when its notification
-    // lands; wait until no file is left to promote, then until a query is
-    // served from the warm cache, so no promotion can evict it afterwards.
+    // moves the cut; wait until a query is served from the warm cache.
     tokio::time::timeout(SOURCE_TRANSITION_BOUND, async {
-        while file_tier_counts(&cluster, tenant, &table).await?.1 != 0 {
-            tokio::task::yield_now().await;
-        }
         loop {
             vala_bifrost_redux::catalog::reset_cut_reads_for_test();
             query_ids(&reader, &fqn, None).await?;

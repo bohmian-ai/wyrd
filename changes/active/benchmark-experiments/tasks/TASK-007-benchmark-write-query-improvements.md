@@ -1279,3 +1279,5 @@ Step 6 was completed with TASK-008. The figures come from its records and are no
 | `architecture/bifrost-design.md` | Staged reads cached through the shared reader, live expression projection and memory scan facts; the bench-only stage/publish controls, their platform-admin `tenant_suspend` permission and nonblocking `platform.authz` audit, which the design had not described, are added under "Append, rotation, and staging" | PASS |
 | Benchmark README | `hot` already described the stage/publish placement; the scan-facts bullet now defines memtable rows and bytes | PASS |
 | `mise run verify:bifrost` | Red with seven failures, all of which fail identically on the pre-task base `471f69ff9` (TASK-008 Closeout gate); oracle, scribe and forge lanes green | FAIL, pre-existing |
+
+TASK-008 was rolled back to `471f69ff9`. The `bifrost-design.md` and README rows above that describe its staged reader, live projection and memory scan facts no longer apply. The bench Scribe control paragraph and the `hot` record `20261029T223134Z-9a6e15750` remain.

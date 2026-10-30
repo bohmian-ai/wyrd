@@ -1107,7 +1107,7 @@ fn checksum_file(path: &Path) -> Result<String, ScribeError> {
 /// # Errors
 /// Returns [`ScribeError::Internal`] when the row count is negative or the
 /// time column is absent from the row group or carries no `INT64` statistics.
-pub(crate) fn extract_row_group_time_range(
+fn extract_row_group_time_range(
     rg: &RowGroupMetaData,
     time_column: &str,
     precision: TimePrecision,

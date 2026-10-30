@@ -239,7 +239,7 @@ impl ScribeMemberStager {
                     detail: "staged member size exceeds u64".to_owned(),
                 })?;
             fsync_file(&artifact.scratch_path)?;
-            footers.push((artifact.file_size, preflight_run(&artifact.scratch_path)?));
+            footers.push(preflight_run(&artifact.scratch_path)?);
             runs.push(StagedRunFile::new(
                 file_name,
                 artifact.file_size,

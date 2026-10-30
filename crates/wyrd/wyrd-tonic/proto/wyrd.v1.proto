@@ -213,13 +213,9 @@ message FollowerScanAssignment {
   ScribeProviderCut scribe_provider_cut = 4;
   string schema_fingerprint = 5;
   repeated string required_columns = 6;
-  // Ordered, nonempty output expressions over required_columns: each a
-  // serialized DataFusion PhysicalExprNode and its output name.
-  repeated ProjectedExpression projection = 9;
   reserved 3, 7, 8;
   reserved "persisted", "predicates", "reader_cut";
 }
-message ProjectedExpression { bytes expression = 1; string alias = 2; }
 message ExecuteFragmentRequest {
   PeerContext context = 1; bytes physical_plan_bytes = 2; bytes reservation_id = 3;
   OracleRoleFence leader_fence = 4; OracleRoleFence target_fence = 5;
@@ -234,9 +230,8 @@ message WorkerFooter {
   WorkerScanStats scan_stats = 7;
 }
 message WorkerScanStats {
-  // Parquet bytes read plus Scribe memory scan bytes (distinct Arrow buffers
-  // a memory read accessed). Absent when no source measured them; absent is
-  // not the same as zero, so the leader must not substitute one for the other.
+  // Absent when the follower's sources report no physical IO; absent is not
+  // the same as zero, so the leader must not substitute one for the other.
   optional uint64 bytes_scanned = 1;
   uint64 files_scanned = 2; uint64 partitions_scanned = 3;
   // Row groups retained and excluded by closed-predicate pruning on the
@@ -246,8 +241,6 @@ message WorkerScanStats {
   // so these can only be observed where the physical read happened.
   uint64 row_groups_scanned = 4; uint64 row_groups_pruned = 5;
   uint64 row_groups_pruned_bloom = 6; uint64 rows_pruned_page_index = 7;
-  // Input rows the follower's scans examined; absent when unmeasured.
-  optional uint64 rows_scanned = 8;
 }
 
 message InsertBatchRequest {

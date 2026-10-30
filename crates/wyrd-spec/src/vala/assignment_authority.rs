@@ -33,8 +33,6 @@ pub struct AssignmentDigestInput<'a> {
     pub scribe_cut: Option<&'a crate::vala::api::ScribeProviderCut>,
     /// Required output/predicate/hidden-tenant projection closure, in order.
     pub required_columns: &'a [String],
-    /// Ordered output expressions over the closure, as exact bytes and aliases.
-    pub projection: &'a [crate::vala::api::ProjectedExpression],
 }
 
 /// Digest encoding failure for one assignment-authority input.
@@ -51,12 +49,12 @@ pub enum AssignmentDigestError {
     },
 }
 
-/// Domain separator for the v11 assignment-authority digest.
+/// Domain separator for the v10 assignment-authority digest.
 ///
-/// v11 binds the fragment's ordered projection expressions and aliases, so a
-/// peer cannot substitute another output under a signed context. The domain
-/// differs so v10 bytes never validate as v11.
-const ASSIGNMENT_AUTHORITY_DOMAIN: &[u8] = b"wyrd.oracle.assignment-authority.v11\0";
+/// v10 binds the Scribe cut's retained live capture, so a peer cannot
+/// substitute another capture under a signed context. The domain differs so
+/// v9 bytes never validate as v10.
+const ASSIGNMENT_AUTHORITY_DOMAIN: &[u8] = b"wyrd.oracle.assignment-authority.v10\0";
 
 /// Appends a length-prefixed UTF-8 string: a big-endian `u32` byte length
 /// followed by the raw UTF-8 bytes.
@@ -202,11 +200,6 @@ fn push_assignment(
     for column in assignment.required_columns {
         push_string(buffer, column)?;
     }
-    push_count(buffer, assignment.projection.len(), "projection")?;
-    for projected in assignment.projection {
-        push_bytes(buffer, &projected.expression, "projection expression")?;
-        push_string(buffer, &projected.alias)?;
-    }
     Ok(())
 }
 
@@ -263,9 +256,7 @@ pub fn hex_lower(bytes: &[u8]) -> String {
 mod tests {
     use super::*;
 
-    use crate::vala::api::{
-        ProjectedExpression, ScribeProviderCut, TimeGranularityWire, TimePartitionWire,
-    };
+    use crate::vala::api::{ScribeProviderCut, TimeGranularityWire, TimePartitionWire};
 
     /// Builds the normative Scribe cut: writer epoch 7 over the two hourly
     /// partitions `2026-08-23T14:00:00Z` and `2026-08-23T15:00:00Z`, read from
@@ -315,22 +306,12 @@ mod tests {
     }
 
     /// Every field of an assignment — identity, table, fingerprint, cut
-    /// presence and content, closure order, and each projection expression's
-    /// bytes, alias, position and count — moves the digest, so a
+    /// presence and content, and projection order — moves the digest, so a
     /// peer cannot replay a signed context against a different read.
     #[test]
     fn every_assignment_field_changes_the_digest() {
         let (fingerprint, tenant_uuid, required_columns) = base_vector();
         let cut = normative_scribe_cut();
-        let projected = |expression: &[u8], alias: &str| ProjectedExpression {
-            expression: expression.to_vec(),
-            alias: alias.to_owned(),
-        };
-        let projection = vec![projected(b"a", "x"), projected(b"b", "y")];
-        let other_bytes = vec![projected(b"c", "x"), projected(b"b", "y")];
-        let other_alias = vec![projected(b"a", "z"), projected(b"b", "y")];
-        let swapped = vec![projected(b"b", "y"), projected(b"a", "x")];
-        let shorter = vec![projected(b"a", "x")];
         let baseline = AssignmentDigestInput {
             scan_id: "scan-1",
             tenant_uuid,
@@ -339,7 +320,6 @@ mod tests {
             schema_fingerprint_hex: &fingerprint,
             scribe_cut: Some(&cut),
             required_columns: &required_columns,
-            projection: &projection,
         };
         let mut other_fingerprint = fingerprint.clone();
         other_fingerprint.replace_range(0..2, "ff");
@@ -396,22 +376,6 @@ mod tests {
                 required_columns: &reordered,
                 ..baseline.clone()
             }),
-            digest_of(&AssignmentDigestInput {
-                projection: &other_bytes,
-                ..baseline.clone()
-            }),
-            digest_of(&AssignmentDigestInput {
-                projection: &other_alias,
-                ..baseline.clone()
-            }),
-            digest_of(&AssignmentDigestInput {
-                projection: &swapped,
-                ..baseline.clone()
-            }),
-            digest_of(&AssignmentDigestInput {
-                projection: &shorter,
-                ..baseline.clone()
-            }),
         ];
         let distinct: std::collections::BTreeSet<_> = digests.iter().collect();
         assert_eq!(distinct.len(), digests.len(), "every field is bound");
@@ -442,7 +406,6 @@ mod tests {
             schema_fingerprint_hex: "not-hex",
             scribe_cut: None,
             required_columns: &required_columns,
-            projection: &[],
         };
         assert!(matches!(
             assignment_authority_digest(std::slice::from_ref(&assignment)),

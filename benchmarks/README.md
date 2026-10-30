@@ -82,10 +82,7 @@ configuration declares server limits.
   latency cell the server and client p50/p95/p99.
 - **Bytes have declared sources.** Writes report rows, retained Arrow MiB
   (uncompressed), and encoded OTLP wire MiB. Queries report the mean scanned
-  rows and bytes of each query's own executed plan, from the same snapshots. A
-  memtable read counts the rows left after time-bound pruning and the distinct
-  Arrow buffer bytes of the columns it declares; its bytes are scan work, not
-  storage. The L1
+  rows and bytes of each query's own executed plan, from the same snapshots. The L1
   storage ratio is published Parquet bytes over retained Arrow bytes of one
   settled sample per path, excluding WAL, staging, and catalog bytes.
 - The `timing` control records the method, precision, range, series bounds,

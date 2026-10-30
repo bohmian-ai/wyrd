@@ -31,7 +31,6 @@ use datafusion::error::{DataFusionError, Result as DataFusionResult};
 use datafusion::execution::TaskContext;
 use datafusion::physical_expr::DynamicFilterTracking;
 use datafusion::physical_expr::PhysicalExpr;
-use datafusion::physical_expr::projection::ProjectionExprs;
 use datafusion::physical_expr::utils::{conjunction, split_conjunction};
 use datafusion::physical_expr_common::physical_expr::snapshot_physical_expr;
 use datafusion::physical_optimizer::pruning::PruningPredicateBuilder;
@@ -42,20 +41,17 @@ use datafusion::physical_plan::filter_pushdown::{
 use datafusion::physical_plan::metrics::{
     ExecutionPlanMetricsSet, MetricBuilder, MetricsSet, Time,
 };
-use datafusion::physical_plan::projection::ProjectionExec;
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion::physical_plan::{
     DisplayAs, DisplayFormatType, ExecutionPlan, Partitioning, PlanProperties,
     SendableRecordBatchStream,
 };
-use datafusion_proto::protobuf::physical_plan_node::PhysicalPlanType;
 use futures_util::StreamExt as _;
-use prost::Message as _;
 use sha2::{Digest as _, Sha256};
 use wyrd_spec::vala::BifrostError;
 use wyrd_spec::vala::api::{
-    ClusterRole, FollowerScanAssignment, NodeId, ProjectedExpression, ScribeProviderCut,
-    TenantTableBinding, TimePartitionWire, WorkerAttemptFrame,
+    ClusterRole, FollowerScanAssignment, NodeId, ScribeProviderCut, TenantTableBinding,
+    TimePartitionWire, WorkerAttemptFrame,
 };
 
 use super::dispatcher::{
@@ -361,14 +357,7 @@ pub(super) struct LiveScribeExec {
     schema_fingerprint: String,
     /// Signed projection closure, in closure order.
     required_columns: Vec<String>,
-    /// Schema of `required_columns`: what each Scribe's placeholder exposes,
-    /// and what `predicate` and `projection` are expressed over.
-    closure: SchemaRef,
-    /// The leaf's output expressions over `closure`: the columns themselves
-    /// until `DataFusion`'s projection pushdown offers a projection, which
-    /// the leaf absorbs so every Scribe evaluates it on its own sources.
-    projection: ProjectionExprs,
-    /// Advertised output schema and the session's target partitions.
+    /// Advertised closure schema and the session's target partitions.
     properties: Arc<PlanProperties>,
     /// Conjunction of the query filters `DataFusion`'s `FilterPushdown`
     /// offered this leaf, shipped to every Scribe above its placeholder.
@@ -402,30 +391,21 @@ impl LiveScribeExec {
         partitions: usize,
     ) -> Self {
         let partitions = partitions.max(1);
-        let projection =
-            ProjectionExprs::from_indices(&(0..schema.fields().len()).collect::<Vec<_>>(), &schema);
         Self {
             routes: Arc::new(routes),
             time_axis,
             schema_fingerprint,
             required_columns,
-            properties: Self::properties_of(Arc::clone(&schema), partitions),
-            closure: schema,
-            projection,
+            properties: Arc::new(PlanProperties::new(
+                datafusion::physical_expr::EquivalenceProperties::new(schema),
+                Partitioning::UnknownPartitioning(partitions),
+                datafusion::physical_plan::execution_plan::EmissionType::Incremental,
+                datafusion::physical_plan::execution_plan::Boundedness::Bounded,
+            )),
             predicate: None,
             scan_metrics: Arc::default(),
             metrics: ExecutionPlanMetricsSet::new(),
         }
-    }
-
-    /// Builds the plan properties of a leaf emitting `schema` at `partitions`.
-    fn properties_of(schema: SchemaRef, partitions: usize) -> Arc<PlanProperties> {
-        Arc::new(PlanProperties::new(
-            datafusion::physical_expr::EquivalenceProperties::new(schema),
-            Partitioning::UnknownPartitioning(partitions),
-            datafusion::physical_plan::execution_plan::EmissionType::Incremental,
-            datafusion::physical_plan::execution_plan::Boundedness::Bounded,
-        ))
     }
 
     /// Returns the accumulator the Scribe's reported scan evidence lands in.
@@ -473,20 +453,17 @@ impl LiveScribeExec {
             return Ok((leaf, routes.routes));
         };
         let predicate = snapshot_physical_expr(Arc::clone(predicate))?;
-        let routes = routes.selected_by(&predicate, &self.closure, self.time_axis.column());
+        let routes = routes.selected_by(&predicate, &self.schema(), self.time_axis.column());
         leaf.predicate = Some(predicate);
         Ok((leaf, routes.routes))
     }
 
     /// Builds the signed fragment and destination for one route.
     ///
-    /// The encoded plan is the leaf's `ProjectionExec` over the same
-    /// identity-bound placeholder a Scribe follower decodes for any
-    /// hot-provider assignment, with a `FilterExec` of the pushed predicate
-    /// between them when there is one; its fingerprint binds the ticket, the
-    /// request, and the footer to one another. The assignment carries the
-    /// projection's encoded expressions and aliases exactly as the plan
-    /// encodes them, so the follower can prove the two agree before any IO.
+    /// The encoded plan is the same identity-bound placeholder a Scribe
+    /// follower decodes for any hot-provider assignment, under a `FilterExec`
+    /// of the pushed predicate when there is one; its fingerprint binds the
+    /// ticket, the request, and the footer to one another.
     ///
     /// # Errors
     ///
@@ -507,15 +484,11 @@ impl LiveScribeExec {
             Arc::new(super::codec::RemoteSourcePlaceholderExec::new(
                 scan_id.clone(),
                 &self.schema_fingerprint,
-                Arc::clone(&self.closure),
+                self.schema(),
             ));
         if let Some(predicate) = &self.predicate {
             plan = Arc::new(FilterExec::try_new(Arc::clone(predicate), plan)?);
         }
-        let plan = Arc::new(ProjectionExec::try_new(
-            self.projection.iter().cloned(),
-            plan,
-        )?);
         let physical_plan_bytes =
             datafusion_proto::bytes::physical_plan_to_bytes_with_extension_codec(
                 plan,
@@ -523,27 +496,6 @@ impl LiveScribeExec {
             )?
             .to_vec();
         let plan_fingerprint = super::codec::physical_plan_fingerprint(&physical_plan_bytes);
-        let projection = match datafusion_proto::protobuf::PhysicalPlanNode::decode(
-            physical_plan_bytes.as_slice(),
-        )
-        .map_err(|error| DataFusionError::Plan(error.to_string()))?
-        .physical_plan_type
-        {
-            Some(PhysicalPlanType::Projection(projection)) => projection
-                .expr
-                .iter()
-                .zip(projection.expr_name)
-                .map(|(expression, alias)| ProjectedExpression {
-                    expression: expression.encode_to_vec(),
-                    alias,
-                })
-                .collect(),
-            _ => {
-                return Err(DataFusionError::Plan(
-                    "live fragment did not encode its projection".to_owned(),
-                ));
-            }
-        };
         let assignment = FollowerScanAssignment {
             scan_id,
             binding: binding.clone(),
@@ -555,7 +507,6 @@ impl LiveScribeExec {
             }),
             schema_fingerprint: self.schema_fingerprint.clone(),
             required_columns: self.required_columns.clone(),
-            projection,
         };
         Ok((
             PhysicalDispatchFragment {
@@ -597,7 +548,7 @@ impl DisplayAs for LiveScribeExec {
 }
 
 impl ExecutionPlan for LiveScribeExec {
-    /// Visits the pushed predicate, then the output expressions.
+    /// Visits the pushed predicate, the only physical expression this leaf owns.
     ///
     /// # Errors
     /// Returns the visitor's error.
@@ -605,43 +556,10 @@ impl ExecutionPlan for LiveScribeExec {
         &self,
         f: &mut dyn FnMut(&Arc<dyn PhysicalExpr>) -> DataFusionResult<TreeNodeRecursion>,
     ) -> DataFusionResult<TreeNodeRecursion> {
-        for expr in self
-            .predicate
-            .iter()
-            .chain(self.projection.iter().map(|e| &e.expr))
-        {
-            if f(expr)? == TreeNodeRecursion::Stop {
-                return Ok(TreeNodeRecursion::Stop);
-            }
+        match &self.predicate {
+            Some(predicate) => f(predicate),
+            None => Ok(TreeNodeRecursion::Continue),
         }
-        Ok(TreeNodeRecursion::Continue)
-    }
-
-    /// Absorbs the projection above it, so every fragment evaluates it on
-    /// the Scribe's own sources and returns only its outputs.
-    ///
-    /// The absorbed expressions are rewritten over the closure, so a Scribe
-    /// reads them against the same placeholder columns the predicate uses.
-    /// A projection of no columns, as `count(*)` plans, stays on the leader:
-    /// a live assignment always carries at least one expression.
-    ///
-    /// # Errors
-    /// Returns the `DataFusion` error raised when an expression cannot be
-    /// rewritten over the closure.
-    fn try_swapping_with_projection(
-        &self,
-        projection: &ProjectionExec,
-    ) -> DataFusionResult<Option<Arc<dyn ExecutionPlan>>> {
-        if projection.expr().is_empty() {
-            return Ok(None);
-        }
-        let mut leaf = self.clone();
-        leaf.projection = self.projection.try_merge(projection.projection_expr())?;
-        leaf.properties = Self::properties_of(
-            projection.schema(),
-            self.properties.partitioning.partition_count(),
-        );
-        Ok(Some(Arc::new(leaf)))
     }
 
     /// Takes the filters `DataFusion` pushes to this leaf as the predicate
@@ -651,8 +569,7 @@ impl ExecutionPlan for LiveScribeExec {
     ///
     /// Every filter is reported unsupported, so the leader's `FilterExec` and
     /// the producing operator stay the authority over correctness above the
-    /// leaf. Filters arrive over the leaf's output and are rewritten over the
-    /// closure through its projection; one that cannot be is not taken.
+    /// leaf.
     ///
     /// Filters bound to execution state — a dynamic filter, or
     /// `id = (SELECT max(id) ...)` whose value `ScalarSubqueryExec` supplies
@@ -677,7 +594,7 @@ impl ExecutionPlan for LiveScribeExec {
                 DynamicFilterTracking::classify(filter).contains_dynamic_filter()
                     == (phase == FilterPushdownPhase::Post)
             })
-            .filter_map(|filter| self.projection.unproject_expr(filter).ok())
+            .cloned()
             .collect::<Vec<_>>();
         let propagation = FilterPushdownPropagation::all_unsupported(child_pushdown_result);
         if pushed.is_empty() {
@@ -694,7 +611,7 @@ impl ExecutionPlan for LiveScribeExec {
         let mut leaf = self.clone();
         leaf.routes = Arc::new(self.routes.selected_by(
             &static_predicate,
-            &self.closure,
+            &self.schema(),
             self.time_axis.column(),
         ));
         leaf.predicate = Some(predicate);
@@ -706,7 +623,7 @@ impl ExecutionPlan for LiveScribeExec {
         "LiveScribeExec"
     }
 
-    /// Returns the output schema and the session's target partitions.
+    /// Returns the closure schema and the session's target partitions.
     fn properties(&self) -> &Arc<PlanProperties> {
         &self.properties
     }
@@ -825,7 +742,7 @@ impl LiveUnionBoundary {
 }
 
 impl datafusion::physical_optimizer::PhysicalOptimizerRule for LiveUnionBoundary {
-    /// Wraps every non-live sibling of each union holding a live leaf,
+    /// Wraps every non-live sibling of each union that holds a live leaf,
     /// preserving the sibling's output ordering.
     ///
     /// # Errors
@@ -885,87 +802,6 @@ impl datafusion::physical_optimizer::PhysicalOptimizerRule for LiveUnionBoundary
     /// Names the rule in `DataFusion` optimizer traces.
     fn name(&self) -> &'static str {
         "bifrost_live_union_boundary"
-    }
-
-    /// Asks `DataFusion` to verify the rewrite preserved the plan schema.
-    fn schema_check(&self) -> bool {
-        true
-    }
-}
-
-/// Physical optimizer rule that pushes a projection above a union holding a
-/// live leaf into each of the union's children.
-///
-/// `UnionExec` passes a projection down only when it narrows the schema, so
-/// a projection that reads every closure column — `SELECT value, v ->> 'a'`
-/// over a `[value, v]` closure — would stay on the leader and every Scribe
-/// would return whole columns. Pushed into each child, a published scan and
-/// a live leaf absorb it as each would without the union, so the live
-/// fragment carries the expressions and Scribe evaluates them over physical
-/// leaves. Every Oracle session starts from
-/// [`super::session::OracleSessionTemplate`], which installs it, so local and
-/// distributed plans bind the same fragment; it is a no-op for plans without
-/// a live leaf.
-#[derive(Debug)]
-pub(super) struct LiveUnionProjection;
-
-impl datafusion::physical_optimizer::PhysicalOptimizerRule for LiveUnionProjection {
-    /// Replaces each projection over a union holding a live leaf with the
-    /// union of that projection over each child.
-    ///
-    /// # Errors
-    ///
-    /// Returns a `DataFusion` error when a child or the union cannot be
-    /// rebuilt under the projection.
-    fn optimize(
-        &self,
-        plan: Arc<dyn ExecutionPlan>,
-        _config: &datafusion::config::ConfigOptions,
-    ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
-        let holds_live = |plan: &Arc<dyn ExecutionPlan>| {
-            plan.exists(|node| Ok(node.downcast_ref::<LiveScribeExec>().is_some()))
-        };
-        // `UnionExec` passes a projection down only when it narrows the
-        // schema, so the expressions of a projection that reads every closure
-        // column would stay on the leader and every Scribe would return whole
-        // columns. Pushed into each child, a published scan and a live leaf
-        // absorb it as each would without the union.
-        plan.transform_up(|node| {
-            let Some(projection) = node.downcast_ref::<ProjectionExec>() else {
-                return Ok(Transformed::no(node));
-            };
-            let Some(union) = projection
-                .input()
-                .downcast_ref::<datafusion::physical_plan::union::UnionExec>()
-            else {
-                return Ok(Transformed::no(node));
-            };
-            if !holds_live(projection.input())? {
-                return Ok(Transformed::no(node));
-            }
-            let children = union
-                .children()
-                .into_iter()
-                .map(|child| {
-                    let projected = ProjectionExec::try_new(
-                        projection.expr().iter().cloned(),
-                        Arc::clone(child),
-                    )?;
-                    Ok(child
-                        .try_swapping_with_projection(&projected)?
-                        .unwrap_or_else(|| Arc::new(projected)))
-                })
-                .collect::<DataFusionResult<Vec<_>>>()?;
-            Ok(Transformed::yes(
-                datafusion::physical_plan::union::UnionExec::try_new(children)?,
-            ))
-        })
-        .map(|transformed| transformed.data)
-    }
-
-    /// Names the rule in `DataFusion` optimizer traces.
-    fn name(&self) -> &'static str {
-        "bifrost_live_union_projection"
     }
 
     /// Asks `DataFusion` to verify the rewrite preserved the plan schema.
@@ -1119,7 +955,7 @@ fn live_error(stage: &str, error: &DispatchError) -> DataFusionError {
 
 /// Closed reason one live frame sequence failed validation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
-pub(super) enum LiveFrameError {
+enum LiveFrameError {
     /// A frame arrived after the footer or in-process completion.
     #[error("frame after footer")]
     AfterFooter,
@@ -1147,7 +983,7 @@ pub(super) enum LiveFrameError {
 /// already Arrow: their rows and native bytes are counted and they are
 /// released as they are, and the in-process completion closes the fragment
 /// only when its fingerprint and totals match, as a footer does.
-pub(super) struct LiveFrameDecoder {
+struct LiveFrameDecoder {
     /// Fingerprint the ticket was minted over and the footer must name.
     plan_fingerprint: String,
     /// Whether the leading schema frame arrived.
@@ -1168,7 +1004,7 @@ pub(super) struct LiveFrameDecoder {
 impl LiveFrameDecoder {
     /// Starts validating one fragment signed under `plan_fingerprint`, folding
     /// its validated scan evidence into `scan_metrics`.
-    pub(super) fn new(plan_fingerprint: String, scan_metrics: Arc<RemoteScanMetrics>) -> Self {
+    fn new(plan_fingerprint: String, scan_metrics: Arc<RemoteScanMetrics>) -> Self {
         Self {
             plan_fingerprint,
             schema_seen: false,
@@ -1204,10 +1040,7 @@ impl LiveFrameDecoder {
     /// late schema, a batch that is not one Arrow IPC batch, counter overflow,
     /// or a footer or in-process completion whose fragment, digest, byte
     /// count, row count, or completion flag contradicts what was delivered.
-    pub(super) fn accept(
-        &mut self,
-        frame: LiveFrame,
-    ) -> Result<Option<RecordBatch>, LiveFrameError> {
+    fn accept(&mut self, frame: LiveFrame) -> Result<Option<RecordBatch>, LiveFrameError> {
         if self.completed {
             return Err(LiveFrameError::AfterFooter);
         }
@@ -1313,13 +1146,11 @@ mod tests {
     use crate::oracle::dispatcher::{NativeCompletion, NativeOutputTally};
 
     /// A query filter pushed to the live leaf ships on every fragment above
-    /// the placeholder, under the leaf's projection, while the leader keeps
-    /// its own `FilterExec`.
+    /// the placeholder, while the leader keeps its own `FilterExec`.
     ///
     /// # Panics
     /// Panics when pushdown drops the leader's filter, leaves the leaf without
-    /// the predicate, or the fragment's encoded root is not a projection over
-    /// a filter.
+    /// the predicate, or the fragment's encoded root is not a filter.
     #[test]
     fn pushed_filter_ships_on_the_fragment_and_stays_on_the_leader() {
         use datafusion::physical_expr::expressions::{BinaryExpr, Column, Literal};
@@ -1365,93 +1196,9 @@ mod tests {
             .expect("the fragment encodes");
         let root = PhysicalPlanNode::decode(fragment.physical_plan_bytes.as_slice())
             .expect("the fragment plan decodes");
-        let Some(PhysicalPlanType::Projection(projection)) = root.physical_plan_type else {
-            panic!("the fragment ships the leaf's projection at its root");
-        };
         assert!(
-            matches!(
-                projection.input.and_then(|input| input.physical_plan_type),
-                Some(PhysicalPlanType::Filter(_))
-            ),
+            matches!(root.physical_plan_type, Some(PhysicalPlanType::Filter(_))),
             "the fragment ships the filter above its placeholder"
-        );
-    }
-
-    /// A projection above a union that does not narrow its schema still
-    /// reaches the live leaf, and every Oracle session carries the rule.
-    ///
-    /// `v + 1 AS w` over `[published, live]` keeps one column, so the
-    /// union's own pushdown would leave it on the leader. The rule replaces
-    /// it with the union of the projection over each child: the live leaf
-    /// absorbs it and its fragment signs `w`.
-    ///
-    /// # Panics
-    /// Panics when a fixture cannot be built, the rule leaves the projection
-    /// above the union, the live leaf does not absorb it, or the session
-    /// template lacks the rule.
-    #[test]
-    fn union_projection_reaches_the_live_fragment() {
-        use datafusion::datasource::memory::MemorySourceConfig;
-        use datafusion::physical_expr::expressions::{BinaryExpr, Column, Literal};
-        use datafusion::physical_optimizer::PhysicalOptimizerRule as _;
-        use datafusion::physical_plan::union::UnionExec;
-
-        let schema = Arc::new(Schema::new(vec![Field::new("v", DataType::Int64, false)]));
-        let published = MemorySourceConfig::try_new_exec(&[vec![]], Arc::clone(&schema), None)
-            .expect("the published scan builds");
-        let live = Arc::new(LiveScribeExec::new(
-            crate::oracle::exec::tests::one_live_route(wyrd_spec::DataTenantId::new_v7()),
-            crate::catalog::TimeAxis::new(
-                crate::oracle::exec::tests::FIXTURE_TIME_COLUMN,
-                crate::catalog::TimeGranularity::Hour,
-            ),
-            "f".repeat(64),
-            vec!["v".to_owned()],
-            Arc::clone(&schema),
-            1,
-        ));
-        let plus_one: Arc<dyn PhysicalExpr> = Arc::new(BinaryExpr::new(
-            Arc::new(Column::new("v", 0)),
-            datafusion::logical_expr::Operator::Plus,
-            Arc::new(Literal::new(1_i64.into())),
-        ));
-        let plan: Arc<dyn ExecutionPlan> = Arc::new(
-            ProjectionExec::try_new(
-                [datafusion::physical_expr::projection::ProjectionExpr::new(
-                    plus_one,
-                    "w".to_owned(),
-                )],
-                UnionExec::try_new(vec![published, live]).expect("the union plans"),
-            )
-            .expect("the projection plans"),
-        );
-
-        let rewritten = LiveUnionProjection
-            .optimize(plan, &ConfigOptions::default())
-            .expect("the rule applies");
-        assert!(
-            rewritten.downcast_ref::<UnionExec>().is_some(),
-            "the projection moved below the union"
-        );
-        let live = rewritten.children()[1]
-            .downcast_ref::<LiveScribeExec>()
-            .expect("the live leaf absorbed the projection");
-        let (fragment, _) = live
-            .fragment(&live.routes.routes[0], 0)
-            .expect("the fragment encodes");
-        let aliases = fragment.assignments[0]
-            .projection
-            .iter()
-            .map(|projected| projected.alias.as_str())
-            .collect::<Vec<_>>();
-        assert_eq!(aliases, ["w"], "the fragment signs the pushed expression");
-        assert!(
-            super::super::session::OracleSessionTemplate::shared()
-                .session(datafusion::execution::context::SessionConfig::new())
-                .physical_optimizers()
-                .iter()
-                .any(|rule| rule.name() == "bifrost_live_union_projection"),
-            "every Oracle session pushes projections to live leaves"
         );
     }
 
@@ -2026,14 +1773,13 @@ mod tests {
 
     /// A live read over a staged run reports its staged bytes to the query's
     /// scan stats, over both the remote footer and the in-process completion,
-    /// with their scanned rows; a measured memory read reports its own bytes
-    /// and rows, and an unmeasured one reports none.
+    /// while a memtable-only read reports none.
     ///
     /// The Scribe scans staged runs through its own hot-Parquet leaf and
     /// reports the bytes on the fragment's completion. The leader's collector
     /// walks the plan holding the live leaf, so each validated completion must
-    /// reach it exactly once; a read whose Scribe measured nothing leaves
-    /// bytes and rows absent rather than zero.
+    /// reach it exactly once; a read whose Scribe scanned no Parquet leaves
+    /// physical bytes absent rather than zero.
     ///
     /// # Panics
     /// Panics when a fixture batch or frame cannot be built, a valid frame is
@@ -2071,7 +1817,6 @@ mod tests {
         };
         let staged = |bytes| WorkerScanStats {
             bytes_scanned: Some(bytes),
-            rows_scanned: Some(3),
             files_scanned: 1,
             partitions_scanned: 1,
             ..WorkerScanStats::default()
@@ -2105,34 +1850,9 @@ mod tests {
         let mut stats = crate::oracle::exec::OracleQueryScanStats::from_plan(&live);
         stats.finalize();
         assert_eq!(
-            (
-                stats.physical_bytes_scanned,
-                stats.physical_rows_scanned,
-                stats.files_scanned
-            ),
-            (Some(5120), Some(6), 2),
-            "each staged fragment's bytes, rows and file reach the query once"
-        );
-
-        let measured = leaf();
-        let mut decoder =
-            LiveFrameDecoder::new(fingerprint.clone(), Arc::clone(measured.scan_metrics()));
-        decoder
-            .accept(NativeOutputTally::default().complete(
-                fingerprint.clone(),
-                WorkerScanStats {
-                    bytes_scanned: Some(48),
-                    rows_scanned: Some(6),
-                    ..WorkerScanStats::default()
-                },
-            ))
-            .expect("measured memory completion validates");
-        let mut stats = crate::oracle::exec::OracleQueryScanStats::from_plan(&measured);
-        stats.finalize();
-        assert_eq!(
-            (stats.physical_bytes_scanned, stats.physical_rows_scanned),
-            (Some(48), Some(6)),
-            "a measured memory read reports its scan work"
+            (stats.physical_bytes_scanned, stats.files_scanned),
+            (Some(5120), 2),
+            "each staged fragment's bytes and file reach the query once"
         );
 
         let memtable = leaf();
@@ -2144,9 +1864,8 @@ mod tests {
         let mut stats = crate::oracle::exec::OracleQueryScanStats::from_plan(&memtable);
         stats.finalize();
         assert_eq!(
-            (stats.physical_bytes_scanned, stats.physical_rows_scanned),
-            (None, None),
-            "an unmeasured memtable read reports no scan facts"
+            stats.physical_bytes_scanned, None,
+            "a memtable read scans no Parquet"
         );
     }
 }

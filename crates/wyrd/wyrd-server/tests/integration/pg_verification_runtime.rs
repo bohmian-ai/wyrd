@@ -2384,11 +2384,28 @@ async fn queued_origins_require_their_own_input_ack() {
         "no run exists before its input is acknowledged"
     );
     assert_eq!(harness.cursor(binding).await, armed, "the cursor stays due");
-    let other = harness.submit().await;
-    assert_eq!(
-        harness.seed.executions().await.expect("executions read"),
-        vec![other],
-        "another execution's admission does not admit the held run"
+    let elsewhere = DataTenantId::new_v7();
+    harness
+        .server
+        .pg_fixture()
+        .seed_additional_tenant_with_uuid(elsewhere, "queued-elsewhere")
+        .await
+        .expect("second tenant seeds");
+    let (queued, subject, _, caller) =
+        traced_tenant(&harness.server, elsewhere, "queued-caller").await;
+    let other = enqueue(&harness.server, &caller, (&queued, &subject)).await;
+    let reader = VerificationFixture::provision(harness.server.state(), elsewhere)
+        .await
+        .expect("tenant provisions");
+    wait_execution_in(&reader, other, status("pending")).await;
+    assert!(
+        harness
+            .seed
+            .executions()
+            .await
+            .expect("executions read")
+            .is_empty(),
+        "another execution's acknowledged admission does not admit the held run"
     );
     let again = scheduler.pass(&stop).await.expect("the pass runs");
     assert!(
@@ -2421,10 +2438,10 @@ async fn queued_origins_require_their_own_input_ack() {
         .flush_bifrost()
         .await
         .expect("the held input is acknowledged and admitted");
-    let executions = harness.seed.executions().await.expect("executions read");
-    assert!(
-        executions.contains(&staged) && executions.len() == 2,
-        "the acknowledged run is admitted under its staged identity: {executions:?}"
+    assert_eq!(
+        harness.seed.executions().await.expect("executions read"),
+        vec![staged],
+        "the acknowledged run is admitted under its staged identity"
     );
     assert_eq!(
         harness.cursor(binding).await,
@@ -5698,6 +5715,42 @@ async fn trace_unavailability_preserves_execution_mode() {
     );
 }
 
+/// Enqueue one assertion run of `verifier` about `subject` as `jwt` through
+/// the HTTP route and return the accepted execution ID, which the queue
+/// writer admits once its input record is acknowledged.
+///
+/// # Panics
+/// Panics when the request is not accepted.
+async fn enqueue(
+    server: &WyrdTestServer,
+    jwt: &str,
+    (verifier, subject): (&CardUid, &CardUid),
+) -> ExecutionId {
+    let body = serde_json::json!({
+        "verifier_card_uid": verifier,
+        "card_uid": subject,
+        "inputs": { "x": { "kind": "json", "value": 1 } },
+    });
+    let response = server
+        .oneshot_authenticated(
+            jwt,
+            axum::http::Request::builder()
+                .method(axum::http::Method::POST)
+                .uri("/v1/verification/enqueue")
+                .header(axum::http::header::CONTENT_TYPE, "application/json")
+                .body(axum::body::Body::from(body.to_string()))
+                .expect("enqueue request builds"),
+        )
+        .await
+        .expect("enqueue request responds");
+    let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .expect("enqueue body reads");
+    let accepted: serde_json::Value = serde_json::from_slice(&bytes).expect("enqueue body is JSON");
+    serde_json::from_value(accepted["execution_id"].clone())
+        .unwrap_or_else(|_| panic!("the request is accepted: {accepted}"))
+}
+
 /// Work admitted on one replica runs on another that never hears of it: a
 /// producer pod admits a submitted, a scheduled, and a grouped run through
 /// its own queue writer, whose wake reaches only that pod's idle runner,
@@ -5803,29 +5856,7 @@ async fn accepted_origins_run_without_local_notification() {
     }
     conn.commit().await.expect("setup commits");
 
-    let body = serde_json::json!({
-        "verifier_card_uid": assertion,
-        "card_uid": subject,
-        "inputs": { "x": { "kind": "json", "value": 1 } },
-    });
-    let response = producer
-        .oneshot_authenticated(
-            &jwt,
-            axum::http::Request::builder()
-                .method(axum::http::Method::POST)
-                .uri("/v1/verification/enqueue")
-                .header(axum::http::header::CONTENT_TYPE, "application/json")
-                .body(axum::body::Body::from(body.to_string()))
-                .expect("enqueue request builds"),
-        )
-        .await
-        .expect("enqueue request responds");
-    let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
-        .await
-        .expect("enqueue body reads");
-    let accepted: serde_json::Value = serde_json::from_slice(&bytes).expect("enqueue body is JSON");
-    let submitted: ExecutionId = serde_json::from_value(accepted["execution_id"].clone())
-        .unwrap_or_else(|_| panic!("the request is accepted: {accepted}"));
+    let submitted = enqueue(producer, &jwt, (&assertion, &subject)).await;
     let scheduler = VerificationScheduler::new(
         state.postgres.wyrd().clone(),
         producer.operator_pool(),

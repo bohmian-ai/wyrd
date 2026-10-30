@@ -3448,6 +3448,56 @@ async fn pending_groups(conn: &mut TenantConn<'_>, binding: BindingId) -> i64 {
         .expect("pending groups count")
 }
 
+/// Register a source and a group Verifier and project `owner`'s one
+/// `group_end` binding over that source, replacing its other bindings;
+/// returns the binding and the source activity that schedules its group
+/// `order-1`.
+///
+/// # Panics
+/// Panics when registration or projection fails.
+async fn group_end(
+    conn: &mut TenantConn<'_>,
+    actor: &Principal,
+    owner: &CardUid,
+) -> (BindingId, GroupActivity) {
+    let source = register_verifier(conn, actor, "turn", custom_drift()).await;
+    let judge = register_verifier(conn, actor, "conversation", custom_drift()).await;
+    let bindings = project_bindings(
+        conn,
+        owner,
+        &CardKind::Service,
+        &[NewBinding {
+            subject_occurrence_key: OWNER_OCCURRENCE_KEY.to_owned(),
+            card_uid: owner.clone(),
+            verifier_card_uid: judge,
+            trigger: FrozenTarget::Digest("sha256:trigger".to_owned()),
+            operators: Vec::new(),
+            activation: BindingActivation::GroupEnd(GroupEndSettings {
+                after: TriggerDuration::parse("1h").expect("valid duration"),
+                sources: BTreeMap::from([(
+                    SlotName::new("turns").expect("valid slot name"),
+                    GroupSource {
+                        reference: source_text(),
+                        subject_occurrence_key: OWNER_OCCURRENCE_KEY.to_owned(),
+                        card_uid: owner.clone(),
+                        verifier_card_uid: source.clone(),
+                    },
+                )]),
+                order_by: None,
+            }),
+        }],
+    )
+    .await
+    .expect("group binding projects");
+    let activity = GroupActivity {
+        owner_card_uid: owner.clone(),
+        card_uid: owner.clone(),
+        verifier_card_uid: source,
+        group_id: GroupId::new("order-1").expect("valid group id"),
+    };
+    (bindings[0], activity)
+}
+
 /// Acknowledged admission moves source state only in its own transaction and
 /// only from the state its candidate was prepared from. Preparing writes
 /// nothing, so the same occurrence yields two candidates; a rolled-back
@@ -3573,45 +3623,10 @@ async fn acknowledged_admission_preserves_scheduling_state() {
     conn.commit().await.expect("replay commits");
 
     let mut conn = fixture.tenant_conn().await.expect("groups open");
-    let source = register_verifier(&mut conn, &actor, "turn", custom_drift()).await;
-    let judge = register_verifier(&mut conn, &actor, "conversation", custom_drift()).await;
-    let slot = SlotName::new("turns").expect("valid slot name");
-    let bindings = project_bindings(
-        &mut conn,
-        &owner,
-        &CardKind::Service,
-        &[NewBinding {
-            subject_occurrence_key: OWNER_OCCURRENCE_KEY.to_owned(),
-            card_uid: owner.clone(),
-            verifier_card_uid: judge,
-            trigger: FrozenTarget::Digest("sha256:trigger".to_owned()),
-            operators: Vec::new(),
-            activation: BindingActivation::GroupEnd(GroupEndSettings {
-                after: TriggerDuration::parse("1h").expect("valid duration"),
-                sources: BTreeMap::from([(
-                    slot,
-                    GroupSource {
-                        reference: source_text(),
-                        subject_occurrence_key: OWNER_OCCURRENCE_KEY.to_owned(),
-                        card_uid: owner.clone(),
-                        verifier_card_uid: source.clone(),
-                    },
-                )]),
-                order_by: None,
-            }),
-        }],
-    )
-    .await
-    .expect("group binding projects");
-    let group_binding = bindings[0];
+    let (group_binding, activity) = group_end(&mut conn, &actor, &owner).await;
     let authority = background(&mut conn, principal).await;
     conn.commit().await.expect("group setup commits");
-    let activity = [GroupActivity {
-        owner_card_uid: owner.clone(),
-        card_uid: owner.clone(),
-        verifier_card_uid: source,
-        group_id: GroupId::new("order-1").expect("valid group id"),
-    }];
+    let activity = [activity];
     let record = async |conn: &mut TenantConn<'_>| {
         queue
             .record_group_activity(conn, &activity)
@@ -3719,4 +3734,153 @@ async fn acknowledged_admission_preserves_scheduling_state() {
         "same content accepts once"
     );
     conn.commit().await.expect("groups commit");
+}
+
+/// Admission is confined to the candidate's own tenant and identity. Another
+/// tenant's connection sees none of this tenant's due bindings or pending
+/// groups, and admitting this tenant's scheduled or group candidate there
+/// creates nothing, moves no cursor, and consumes no pending row: the
+/// binding is not found under that tenant's row security. In its own tenant
+/// each candidate is admitted under exactly the execution ID its input
+/// record was staged with.
+///
+/// # Panics
+/// Panics when another tenant observes, admits, or mutates this tenant's
+/// scheduling state, or a candidate is admitted under another identity.
+#[tokio::test]
+async fn queued_admission_preserves_tenant_and_input_identity() {
+    let fixture = PgFixture::start().await.expect("fixture starts");
+    let other = fixture
+        .seed_additional_tenant("verifier-executions-admission")
+        .await
+        .expect("second tenant seeds");
+    let actor = actor(fixture.data_tenant_id());
+    let queue = VerifierExecutionQueue::default();
+    let mut setup = fixture
+        .tenant_conn()
+        .await
+        .expect("tenant connection opens");
+    provision_system_principal(&mut setup, Attribution::unresolved())
+        .await
+        .expect("the tenant SYSTEM principal provisions");
+    let (owner, principal) = declare_service(&mut setup, &actor, "svc").await;
+    let verifier = register_verifier(&mut setup, &actor, "drift", custom_drift()).await;
+    let binding = bind(&mut setup, &owner, &verifier, Vec::new()).await;
+    let (grouper, member) = declare_service(&mut setup, &actor, "grouper").await;
+    let (group_binding, activity) = group_end(&mut setup, &actor, &grouper).await;
+    record_machine_authentication(&mut setup, principal, &owner)
+        .await
+        .expect("owner activates");
+    record_machine_authentication(&mut setup, member, &grouper)
+        .await
+        .expect("group owner activates");
+    let due = database_now(&mut setup).await - SCHEDULE_CLAIM_DELAY;
+    set_cursor(&mut setup, binding, Some(due)).await;
+    queue
+        .record_group_activity(&mut setup, std::slice::from_ref(&activity))
+        .await
+        .expect("activity records");
+    sqlx::query(
+        "UPDATE wyrd.verification_group_pending
+            SET due_at = statement_timestamp() - INTERVAL '1 second'",
+    )
+    .execute(&mut **setup.transaction())
+    .await
+    .expect("the group comes due");
+    setup.commit().await.expect("setup commits");
+
+    let mut foreign = fixture
+        .tenant_conn_for(other)
+        .await
+        .expect("tenant B opens");
+    assert!(
+        queue
+            .claim_due(&mut foreign, &[])
+            .await
+            .expect("due bindings read")
+            .is_none(),
+        "another tenant's due binding is invisible"
+    );
+    assert!(
+        queue
+            .claim_due_group(&mut foreign, &[])
+            .await
+            .expect("due groups read")
+            .is_none(),
+        "another tenant's pending group is invisible"
+    );
+    drop(foreign);
+
+    let mut conn = fixture.tenant_conn().await.expect("poller opens");
+    let scheduled = scheduled_candidate(&queue, &mut conn, principal).await;
+    let pending = queue
+        .claim_due_group(&mut conn, &[])
+        .await
+        .expect("due groups read")
+        .expect("the group is due");
+    let authority = background(&mut conn, member).await;
+    let Prepared::Candidate(grouped) = queue
+        .prepare_group(
+            &mut conn,
+            group_binding,
+            &pinned(group_binding, "order-1", &[(ExecutionId::new_v7(), None)]),
+            &authority,
+            Some(pending.generation),
+        )
+        .await
+        .expect("group prepares")
+    else {
+        panic!("the group calls for a run");
+    };
+    conn.rollback().await.expect("poller rolls back");
+
+    let mut foreign = fixture
+        .tenant_conn_for(other)
+        .await
+        .expect("tenant B opens");
+    assert_eq!(
+        queue
+            .accept_scheduled(&mut foreign, &scheduled)
+            .await
+            .expect("admission answers"),
+        EnqueueOutcome::Refused(EnqueueRefusal::BindingNotFound)
+    );
+    assert_eq!(
+        queue
+            .accept_grouped(&mut foreign, &grouped)
+            .await
+            .expect("admission answers"),
+        EnqueueOutcome::Refused(EnqueueRefusal::BindingNotFound)
+    );
+    assert_eq!(execution_count(&mut foreign).await, 0);
+    foreign.commit().await.expect("tenant B commits");
+
+    let mut conn = fixture.tenant_conn().await.expect("writer opens");
+    assert_eq!(execution_count(&mut conn).await, 0);
+    assert_eq!(
+        cursor(&mut conn, binding).await,
+        Some(due),
+        "another tenant moves no cursor"
+    );
+    assert_eq!(
+        pending_groups(&mut conn, group_binding).await,
+        1,
+        "another tenant consumes no pending group"
+    );
+    assert_eq!(
+        queue
+            .accept_scheduled(&mut conn, &scheduled)
+            .await
+            .expect("admission answers"),
+        EnqueueOutcome::Enqueued(scheduled.execution_id)
+    );
+    assert_eq!(
+        queue
+            .accept_grouped(&mut conn, &grouped)
+            .await
+            .expect("admission answers"),
+        EnqueueOutcome::Enqueued(grouped.execution_id)
+    );
+    assert_eq!(pending_groups(&mut conn, group_binding).await, 0);
+    conn.commit().await.expect("writer commits");
 }

@@ -1107,4 +1107,4 @@ def test_verification_staging_refuses_and_recovers(tmp_path: Path) -> None:
         rows = Bifrost(client=client_of(server)).sql(
             "SELECT count(*) AS n FROM bifrost.verification.execution_inputs", model=Count
         )
-        assert [row.n for row in rows] == [4 + offered]
+        assert [row.n for row in rows] == [5 + offered]

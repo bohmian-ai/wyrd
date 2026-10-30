@@ -833,6 +833,14 @@ async fn gateway_invocation_authorizes_each_model_and_accounts_attempts() {
     capture_metadata(&state, tenant).await;
     let invocation = GatewayInvocation::new(&state);
     let decision = |outcome: &str| ("gateway.invoke".to_owned(), outcome.to_owned());
+    // Setup's policy write is another request on another outbox lane, so only
+    // invoke decisions, each drained before the next request, have an order.
+    let invokes = || {
+        audit_decisions(&scribe, tenant)
+            .into_iter()
+            .filter(|(operation, _)| operation == "gateway.invoke")
+            .collect::<Vec<_>>()
+    };
 
     let refused = super::routes::chat_completions(
         State(state.clone()),
@@ -852,10 +860,7 @@ async fn gateway_invocation_authorizes_each_model_and_accounts_attempts() {
     );
     assert!(dispatch.seen().is_empty(), "a denial never dispatches");
     drain_gateway(&state).await;
-    assert_eq!(
-        audit_decisions(&scribe, tenant).last(),
-        Some(&decision("denied"))
-    );
+    assert_eq!(invokes(), [decision("denied")]);
 
     dispatch.push(Step::Return(failed(1000, 0)));
     let narrow = invoker(tenant, 1, [model_access("dep-a/a")]);
@@ -873,10 +878,9 @@ async fn gateway_invocation_authorizes_each_model_and_accounts_attempts() {
         "unauthorized dep-b/b is never dispatched"
     );
     drain_gateway(&state).await;
-    let decisions = audit_decisions(&scribe, tenant);
     assert_eq!(
-        decisions[decisions.len() - 2..],
-        [decision("allowed"), decision("denied")]
+        invokes(),
+        [decision("denied"), decision("allowed"), decision("denied")]
     );
 
     dispatch.push(Step::Return(failed(1000, 0)));

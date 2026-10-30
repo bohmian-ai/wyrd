@@ -809,7 +809,9 @@ test("custom_verdict_data_survives_readback", async ({ server, desk }) => {
     expect(rows).toHaveLength(1);
     return JSON.parse(rows[0]?.output ?? "null").requirements;
   };
-  expect(await retained(waited.execution_id), "the retained output keeps its data").toEqual(waited.outcome.requirements);
+  expect(await retained(waited.execution_id), "the retained output keeps its data").toEqual(
+    waited.outcome.requirements,
+  );
 
   for (const [marker, data] of Object.entries(EXACT_DATA)) {
     const text = `${marker} refunds`;

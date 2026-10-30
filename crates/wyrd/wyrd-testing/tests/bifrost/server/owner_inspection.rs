@@ -303,7 +303,7 @@ fn wal_segments(
 #[ignore = "requires Postgres and object storage"]
 async fn failed_wal_replay_is_role_local() -> Result<(), super::query::ServerJourneyError> {
     let data_root = tempfile::tempdir()?;
-    let server = combined_target(data_root.path()).start_bound().await?;
+    let mut server = combined_target(data_root.path()).start_bound().await?;
     super::query::await_server_ready(server.base_url().ok_or("missing HTTP URL")?).await?;
     let table = format!("wal_replay_{}", uuid::Uuid::now_v7().simple());
     server
@@ -333,6 +333,9 @@ async fn failed_wal_replay_is_role_local() -> Result<(), super::query::ServerJou
         .scribe_wal_root_for_test()
         .ok_or("the combined target composes a WAL")?
         .to_path_buf();
+    // Shutdown trims recycled segments to their logical length, so the WAL is
+    // corrupted and snapshotted only once its owner has stopped.
+    server.cancel_and_join_for_test().await?;
 
     let mut corrupted = 0;
     for (path, mut bytes) in wal_segments(&wal_root)? {

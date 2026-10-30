@@ -482,7 +482,10 @@ async fn schedule_next_due(
     queue: &VerifierExecutionQueue,
     conn: &mut TenantConn<'_>,
 ) -> Option<ScheduleTick> {
-    let due = queue.claim_due(conn).await.expect("due binding claims")?;
+    let due = queue
+        .claim_due(conn, &[])
+        .await
+        .expect("due binding claims")?;
     let authority = match due.owner() {
         Some((owner, _root)) => Some(background(conn, owner).await),
         None => None,
@@ -2781,7 +2784,7 @@ async fn group_snapshots_are_idempotent_and_react_in_settlement_order() {
         .expect("session zone resets");
     assert!(
         queue
-            .claim_due_group(&mut conn)
+            .claim_due_group(&mut conn, &[])
             .await
             .expect("claim")
             .is_none()
@@ -2795,7 +2798,7 @@ async fn group_snapshots_are_idempotent_and_react_in_settlement_order() {
         .await
         .expect("row expires");
     let due = queue
-        .claim_due_group(&mut conn)
+        .claim_due_group(&mut conn, &[])
         .await
         .expect("claim")
         .expect("an expired group is due");
@@ -2820,7 +2823,7 @@ async fn group_snapshots_are_idempotent_and_react_in_settlement_order() {
     .await
     .expect("row ages past the incomplete-snapshot bound");
     let due = queue
-        .claim_due_group(&mut conn)
+        .claim_due_group(&mut conn, &[])
         .await
         .expect("claim")
         .expect("an expired group is due");
@@ -2831,7 +2834,7 @@ async fn group_snapshots_are_idempotent_and_react_in_settlement_order() {
         .expect("row consumed");
     assert!(
         queue
-            .claim_due_group(&mut conn)
+            .claim_due_group(&mut conn, &[])
             .await
             .expect("claim")
             .is_none()
@@ -2984,7 +2987,7 @@ async fn group_snapshots_are_idempotent_and_react_in_settlement_order() {
         .await
         .expect("row expires");
     let due = queue
-        .claim_due_group(&mut conn)
+        .claim_due_group(&mut conn, &[])
         .await
         .expect("claim")
         .expect("the refused group is due");
@@ -3043,7 +3046,7 @@ async fn group_snapshots_are_idempotent_and_react_in_settlement_order() {
     );
     assert!(
         queue
-            .claim_due_group(&mut conn)
+            .claim_due_group(&mut conn, &[])
             .await
             .expect("claim")
             .is_none(),

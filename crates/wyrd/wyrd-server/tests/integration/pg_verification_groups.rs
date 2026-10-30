@@ -43,7 +43,8 @@ use wyrd_spec::verification::execution::{InputDeclaration, VerificationResult};
 use wyrd_sql::TenantConn;
 use wyrd_sql::queries::auth::service_accounts::system_principal_id;
 use wyrd_sql::queries::verifier_executions::{
-    ClaimedExecution, EnqueueOutcome, ExecutionInput, GroupActivity, VerifierExecutionQueue,
+    ClaimedExecution, EnqueueOutcome, ExecutionInput, GroupActivity, Prepared,
+    VerifierExecutionQueue,
 };
 use wyrd_testing::{Bootstrap, WyrdTestServer};
 
@@ -869,14 +870,14 @@ async fn pending_groups_debounce_and_stop_after_handoff() {
     let queue = VerifierExecutionQueue::default();
     let mut claimer = support.conn().await;
     let due = queue
-        .claim_due_group(&mut claimer)
+        .claim_due_group(&mut claimer, &[])
         .await
         .expect("claim runs")
         .expect("the group is due");
     let mut rival = support.conn().await;
     assert!(
         queue
-            .claim_due_group(&mut rival)
+            .claim_due_group(&mut rival, &[])
             .await
             .expect("claim runs")
             .is_none(),
@@ -934,19 +935,21 @@ async fn pending_groups_debounce_and_stop_after_handoff() {
                 );
                 tokio::time::sleep(Duration::from_millis(20)).await;
             }
-            let outcome = poller
+            let Prepared::Candidate((admission, _)) = poller
                 .poll(&mut claimer, &queue, &due, &authority, system)
                 .await
                 .expect("the snapshot pins")
-                .outcome;
+            else {
+                panic!("the snapshot is a new candidate");
+            };
+            let outcome = queue
+                .accept_grouped(&mut claimer, &admission)
+                .await
+                .expect("admits");
             assert!(
                 matches!(outcome, EnqueueOutcome::Enqueued(_)),
                 "{outcome:?}"
             );
-            queue
-                .consume_group(&mut claimer, &due)
-                .await
-                .expect("consumes");
             claimer.commit().await.expect("the handoff commits");
         },
     );

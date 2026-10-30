@@ -30,16 +30,17 @@
 //! held here is process memory: abrupt process death or the shutdown
 //! deadline loses it without changing the operation that produced it.
 //!
-//! A submitted execution's inputs row carries its [`Submission`]; once the
-//! write that holds it returns with the row acknowledged, the sink stages the
-//! submission on the [`SubmissionOutbox`] that accepts it into the durable
-//! queue, so no execution is queued before its inputs are durable.
+//! A queued execution's inputs row, submitted, scheduled, or grouped, carries
+//! its [`Queued`] admission; once the write that holds it returns with the
+//! row acknowledged, the sink stages it as [`Acknowledged`] work on the
+//! [`SubmissionOutbox`] that admits it into the durable queue, so no
+//! execution is queued before its inputs are durable.
 //!
 //! A sink given the Wyrd Postgres owner also schedules grouped verification:
 //! once a slice's frames are acknowledged, every grouped inputs or result row
 //! that was not lost records its group's activity in one tenant transaction
 //! through [`VerifierExecutionQueue::record_group_activity`], before any
-//! submission is handed off. A failed transaction fails the write, so the
+//! queued execution is handed off. A failed transaction fails the write, so the
 //! outbox retries the identical slice. Activity acknowledged by Scribe but
 //! not yet recorded when the process dies is lost with the rest of the
 //! outbox.
@@ -88,7 +89,7 @@ use wyrd_spec::vala::{
     ACT_PRINCIPAL_ID, SUB_PRINCIPAL_ID, SUBJECT_CARD_UID, WORKLOAD_CARD_UID, WYRD_REQUEST_ID,
 };
 use wyrd_sql::WyrdPostgres;
-use wyrd_sql::queries::verifier_executions::{GroupActivity, Submission, VerifierExecutionQueue};
+use wyrd_sql::queries::verifier_executions::{GroupActivity, VerifierExecutionQueue};
 use wyrd_tonic::otlp::trace::v1::ResourceSpans;
 use wyrd_tonic::prost::Message as _;
 use wyrd_tonic::tonic::Code;
@@ -98,7 +99,7 @@ use wyrd_tonic::wyrd::v1::scribe_capture_peer_service_client::ScribeCapturePeerS
 
 use crate::components::gateway::CallCapture;
 use crate::verification::results::{ResultPayload, ResultRow};
-use crate::verification::submissions::SubmissionSink;
+use crate::verification::submissions::{Queued, SubmissionSink};
 
 /// The process's one non-blocking outbox for every Scribe-bound write.
 pub type ScribeOutbox = Outbox<ScribeSink>;
@@ -209,11 +210,11 @@ pub enum ScribeWrite {
         row: ResultRow,
         /// The execution's subject and actor, which Scribe stamps on the row.
         attribution: Attribution,
-        /// A submitted execution and its reserved slot on the outbox that
-        /// queues it once Scribe acknowledges the row, so the handoff is never
-        /// refused; `None` for every other origin. The handed-off submission
+        /// A queued execution and its reserved slot on the outbox that admits
+        /// it once Scribe acknowledges the row, so the handoff is never
+        /// refused; `None` for a direct execution. The handed-off admission
         /// carries no input values: the runner reads them from the row.
-        queued: Option<(Reservation<SubmissionSink>, Box<Submission>)>,
+        queued: Option<(Reservation<SubmissionSink>, Box<Queued>)>,
     },
     /// One server span's tenant copy, attributed to the operation that
     /// emitted it.
@@ -230,6 +231,19 @@ pub enum ScribeWrite {
         /// or abandoned.
         permit: OwnedSemaphorePermit,
     },
+}
+
+/// One queued execution whose input record Scribe acknowledged. Only the
+/// Scribe sink builds it, after the row's frame was acknowledged and not
+/// lost, so the queue writer admits nothing whose inputs are not durable.
+#[derive(Debug, Clone)]
+pub struct Acknowledged(Queued);
+
+impl Acknowledged {
+    /// The acknowledged admission and its producer claim.
+    pub const fn queued(&self) -> &Queued {
+        &self.0
+    }
 }
 
 impl From<AuditEvent> for ScribeWrite {
@@ -1590,10 +1604,11 @@ impl OutboxSink for ScribeSink {
     /// different calls spread. A Verifier execution's inputs record and its
     /// result lane by their `execution_id`, so the inputs, staged first,
     /// commit no later than the result while different executions spread. A
-    /// queued submission's inputs record lanes as [`SubmissionSink::lane`]
-    /// does, so requests sharing an idempotency key are acknowledged, and
+    /// queued execution's inputs record lanes as
+    /// [`SubmissionSink::admission_lane`] does, so requests sharing an
+    /// idempotency key, or candidates of one binding, are acknowledged, and
     /// handed to that outbox, in arrival order; its result is staged only
-    /// after the submission was accepted. Server spans take lane 0. No reader relies on cross-batch commit
+    /// after the execution was admitted. Server spans take lane 0. No reader relies on cross-batch commit
     /// order: group lists order by the recorded input time or a declared key.
     fn lane(item: &ScribeWrite) -> u64 {
         let key = match item {
@@ -1604,9 +1619,9 @@ impl OutboxSink for ScribeSink {
                 .first()
                 .and_then(|row| row.row.text("execution_id")),
             ScribeWrite::ExecutionInputs {
-                queued: Some((_, submission)),
+                queued: Some((_, queued)),
                 ..
-            } => return SubmissionSink::lane(submission),
+            } => return SubmissionSink::admission_lane(&queued.admission),
             ScribeWrite::ExecutionInputs { row, .. } => row.row.text("execution_id"),
             ScribeWrite::Audit(None) | ScribeWrite::ServerSpans { .. } => None,
         };
@@ -1648,8 +1663,8 @@ impl OutboxSink for ScribeSink {
     /// are counted lost once the slice completes, never on a retried
     /// attempt. A process that reaches no Scribe drops the whole slice.
     /// Once the slice completes, the grouped activity of every write that was
-    /// not lost is recorded, then every submission whose inputs row was not
-    /// lost is staged on its [`SubmissionOutbox`]; a lost row queues nothing.
+    /// not lost is recorded, then every queued execution whose inputs row was
+    /// not lost is staged on its [`SubmissionOutbox`]; a lost row queues nothing.
     /// A failed activity transaction retries the slice before any loss is
     /// counted or reservation consumed.
     ///
@@ -1685,12 +1700,12 @@ impl OutboxSink for ScribeSink {
         count_lost::<Self>(lost.len(), LossReason::Rejected);
         for (index, item) in items.iter().enumerate() {
             if let ScribeWrite::ExecutionInputs {
-                queued: Some((reserved, submission)),
+                queued: Some((reserved, queued)),
                 ..
             } = item
                 && !lost.contains(&index)
             {
-                reserved.stage(tenant, (**submission).clone());
+                reserved.stage(tenant, Acknowledged((**queued).clone()));
             }
         }
         Ok(())

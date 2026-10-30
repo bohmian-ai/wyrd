@@ -71,6 +71,7 @@ use wyrd_sql::queries::verifier_executions::{
 use super::authority::{SystemReadAuthority, SystemReadAuthorityError};
 use super::engines::EngineOutcome;
 use super::inputs::ScheduleSelector;
+use super::submissions::SubmissionSink;
 use super::telemetry::{ExecutionTelemetry, Phase};
 use crate::query::scheduled::ScheduledQueryCaller;
 use crate::scribe_outbox::ScribeSink;
@@ -766,12 +767,18 @@ impl DriftEngine {
     }
 
     /// Reserve the Scribe outbox slot a scheduled execution's input record
-    /// is staged on, before its transaction commits.
+    /// is staged on and the queue slot that admits it once Scribe
+    /// acknowledges it, before its occurrence is claimed.
     ///
     /// # Errors
-    /// Returns [`OutboxFull`] when the outbox share is exhausted.
-    pub fn reserve(&self) -> Result<Reservation<ScribeSink>, OutboxFull> {
-        self.state.bifrost.scribe_outbox().reserve(1)
+    /// Returns [`OutboxFull`] when either outbox share is exhausted.
+    pub fn reserve(
+        &self,
+    ) -> Result<(Reservation<ScribeSink>, Reservation<SubmissionSink>), OutboxFull> {
+        Ok((
+            self.state.bifrost.scribe_outbox().reserve(1)?,
+            self.state.verification.submissions().reserve(1)?,
+        ))
     }
 
     /// Score every drift requirement of `spec` over the scheduled window of

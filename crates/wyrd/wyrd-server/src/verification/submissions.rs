@@ -26,6 +26,7 @@ use std::sync::Arc;
 
 use tokio::sync::Notify;
 
+use uuid::Uuid;
 use wyrd_runtime::outbox::{Outbox, OutboxLimits, OutboxSink};
 use wyrd_spec::DataTenantId;
 use wyrd_sql::queries::verifier_executions::{
@@ -157,6 +158,7 @@ impl OutboxSink for SubmissionSink {
     async fn write(
         &self,
         tenant: DataTenantId,
+        _slice: Uuid,
         submissions: &[Submission],
     ) -> Result<(), SqlError> {
         let mut conn = self.postgres.tenant_conn(tenant).await?;
@@ -222,7 +224,6 @@ mod tests {
 
     use std::collections::{BTreeMap, HashSet};
 
-    use uuid::Uuid;
     use wyrd_runtime::AcceptedAuthority;
     use wyrd_runtime::permission::PermissionSet;
     use wyrd_runtime::principal::{Principal, PrincipalId, PrincipalKind};

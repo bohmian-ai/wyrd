@@ -470,7 +470,7 @@ impl Overhead {
         let [small, large] = upstreams().await?;
         let (small_uri, large_uri) = (small.uri(), large.uri());
         let bases = PREFIXES.map(|prefix| {
-            if prefix == Case::ChatCapture.prefix() {
+            if prefix == Case::Buffered64KibCapturePayload.prefix() {
                 large_uri.as_str()
             } else {
                 small_uri.as_str()
@@ -509,7 +509,7 @@ impl Overhead {
             self.policy = Some(case.capture());
         }
         let shape = case.shape();
-        let labels = (case.label(), phase.label());
+        let labels = (case.id(), phase.label());
         if phase == Phase::Warmup {
             drive(tenant, &shape, clients, Instant::now() + window, labels).await?;
             settle(server).await?;

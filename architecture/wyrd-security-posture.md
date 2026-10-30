@@ -787,11 +787,14 @@ execution's inputs commit no later than its result while different requests
 and executions are written concurrently; queued submissions sharing an
 idempotency key share a lane, so they are acknowledged in arrival order. As a
 Kafka producer lingers, a lane's slice waits until its oldest write is 50 ms old
-or it holds 4,096 writes before it is submitted, so writes staged one per
+or it holds 4,096 writes or 32 MiB before it is submitted, and takes at most
+32 MiB of the lane's backlog, so writes staged one per
 request share one Scribe commit; producers never wait for it. It groups each lane's slice by
-destination, builds each group's server-projected rows once, encodes Arrow
-frames with content-derived batch ids, and submits them to the local Scribe or
-over the mutually authenticated peer plane to a Scribe pod. Only the local
+destination, builds each group's server-projected rows once into frames whose
+batch ids derive from the slice's idempotency key, which every retry of the
+slice keeps, and submits them to the local Scribe or over the mutually
+authenticated peer plane to a Scribe pod, encoding Arrow frames only for the
+peer plane. Only the local
 Scribe takes those rows in-process as server-built canonical batches, whose
 values are not revalidated; the trust follows from the in-process call, never
 from a flag a caller can set. Peer and native Arrow IPC is a trust boundary

@@ -262,14 +262,18 @@ impl Period {
 /// The closed benchmark case of a call of `stream` mode.
 #[must_use]
 pub const fn mode(stream: bool) -> Case {
-    if stream { Case::ChatStream } else { Case::Chat }
+    if stream {
+        Case::Streamed1KibCaptureMetadata
+    } else {
+        Case::Buffered1KibCaptureMetadata
+    }
 }
 
 /// The server timings of the calls `phase` admitted, both modes.
 #[must_use]
 pub fn cohort(population: &Population, phase: Period) -> Population {
-    let mut cohort = population.only(mode(false).label(), phase.label());
-    let streamed = population.only(mode(true).label(), phase.label());
+    let mut cohort = population.only(mode(false).id(), phase.label());
+    let streamed = population.only(mode(true).id(), phase.label());
     cohort.series.extend(streamed.series);
     cohort
 }
@@ -831,7 +835,7 @@ impl Driver {
             let marker = format!("{label}-{}", planned.index);
             let shape = self.shapes[usize::from(stream)].clone();
             let body = shape.body(&marker);
-            let labels = (mode(stream).label(), phases.phase(planned.offset).label());
+            let labels = (mode(stream).id(), phases.phase(planned.offset).label());
             let (http, upstream, arrived) = (
                 self.http.clone(),
                 Arc::clone(&self.upstream),
@@ -1041,7 +1045,7 @@ impl Capacity {
                     expected.push(Expected {
                         boundary,
                         outcome: SUCCEEDED,
-                        case: mode(stream).label(),
+                        case: mode(stream).id(),
                         phase: period.label(),
                         count: answered,
                     });

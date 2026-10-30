@@ -75,11 +75,98 @@ impl GatewayCapture {
     }
 
     /// A buffered Chat Completions answer whose message content is
-    /// `content_bytes` bytes, for answers of a chosen size.
+    /// `content_bytes` bytes of [`Self::prose`], for answers of a chosen size.
     pub fn sized_completion(content_bytes: usize) -> Value {
         let mut completion = Self::completion();
-        completion["choices"][0]["message"]["content"] = json!("x".repeat(content_bytes));
+        completion["choices"][0]["message"]["content"] = json!(Self::prose(content_bytes));
         completion
+    }
+
+    /// Exactly `bytes` bytes of ASCII English-like text, identical on every
+    /// call, so sized messages compress like chat rather than like one
+    /// repeated byte.
+    pub fn prose(bytes: usize) -> String {
+        const WORDS: [&str; 64] = [
+            "the",
+            "model",
+            "returns",
+            "a",
+            "summary",
+            "of",
+            "each",
+            "request",
+            "and",
+            "its",
+            "context",
+            "when",
+            "users",
+            "ask",
+            "about",
+            "billing",
+            "orders",
+            "shipping",
+            "we",
+            "should",
+            "check",
+            "account",
+            "status",
+            "before",
+            "answering",
+            "please",
+            "confirm",
+            "your",
+            "email",
+            "address",
+            "so",
+            "that",
+            "I",
+            "can",
+            "look",
+            "up",
+            "recent",
+            "invoices",
+            "refund",
+            "policy",
+            "allows",
+            "returns",
+            "within",
+            "thirty",
+            "days",
+            "after",
+            "delivery",
+            "if",
+            "item",
+            "is",
+            "unused",
+            "otherwise",
+            "contact",
+            "support",
+            "team",
+            "for",
+            "help",
+            "with",
+            "this",
+            "issue",
+            "today",
+            "thanks",
+            "again",
+            "next",
+        ];
+        let mut text = String::with_capacity(bytes + 16);
+        let mut state: u64 = 0x9e37_79b9_7f4a_7c15;
+        let mut sentence = 0;
+        while text.len() < bytes {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            // The modulus keeps the index below `WORDS.len()`.
+            let word = WORDS[usize::try_from(state % 64).unwrap_or_default()];
+            text.push_str(word);
+            sentence += 1;
+            text.push_str(if sentence % 12 == 0 { ". " } else { " " });
+        }
+        text.truncate(bytes);
+        text
     }
 
     /// The frames of one Chat Completions stream with id `id`, each one

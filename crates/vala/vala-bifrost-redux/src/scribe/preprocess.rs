@@ -793,7 +793,8 @@ fn prepare_slice(
 ) -> Result<PreparedSlice, ScribeError> {
     let seal_key = SealKey::new(context.tenant, context.table.clone(), partition)
         .with_table_version(context.table_version);
-    let data_payload = encode_ipc(&rows)?;
+    let memtable_bytes = crate::scribe::memory::retained_arrow_bytes(&rows);
+    let data_payload = encode_ipc(&rows, memtable_bytes)?;
     let identity_span = tracing::debug_span!(
         "scribe_logical_batch_identity",
         batch_id = %context.batch_id,
@@ -811,7 +812,6 @@ fn prepare_slice(
         SchemaFingerprint::from_arrow_schema(&rows.schema()).0,
     )
     .with_logical_data_identity(logical_data_digest, logical_data_len);
-    let memtable_bytes = crate::scribe::memory::retained_arrow_bytes(&rows);
     Ok(PreparedSlice {
         id: AppendSliceId {
             batch_id: context.batch_id,
@@ -826,19 +826,20 @@ fn prepare_slice(
     })
 }
 
-/// Encodes one current day as a ZSTD level-1 Arrow IPC stream.
+/// Encodes one current day as a ZSTD level-1 Arrow IPC stream, in one pass.
 ///
-/// The payload is written into one allocation sized to the bound admission
-/// reserved ([`crate::scribe::material_plan::wal_payload_bound`]), then shrunk
-/// to its compressed length so the WAL does not retain the uncompressed
-/// capacity. Every WAL reader decodes it with Arrow's standard `StreamReader`.
+/// The payload is written into one allocation of `capacity` bytes, the
+/// rows' retained Arrow bytes, which compression keeps it under in the common
+/// case, then shrunk to its compressed length so the WAL does not retain the
+/// spare capacity. The stream stays within
+/// [`crate::scribe::material_plan::wal_payload_bound`], which canonical
+/// admission reserved, so it is not counted again here. Every WAL reader
+/// decodes it with Arrow's standard `StreamReader`.
 ///
 /// # Errors
 ///
-/// Returns [`ScribeError::Internal`] when the bound or either Arrow step fails,
-/// or the payload exceeds its reserved bound.
-fn encode_ipc(rows: &RecordBatch) -> Result<Bytes, ScribeError> {
-    let bound = crate::scribe::material_plan::wal_payload_bound(rows)?;
+/// Returns [`ScribeError::Internal`] when either Arrow step fails.
+fn encode_ipc(rows: &RecordBatch, capacity: usize) -> Result<Bytes, ScribeError> {
     let options = arrow::ipc::writer::IpcWriteOptions::default()
         .try_with_compression(Some(crate::scribe::material_plan::WAL_IPC_COMPRESSION))
         .and_then(|options| {
@@ -849,7 +850,7 @@ fn encode_ipc(rows: &RecordBatch) -> Result<Bytes, ScribeError> {
         .map_err(|error| ScribeError::Internal {
             detail: format!("Arrow IPC compression unavailable: {error}"),
         })?;
-    let mut payload = Vec::with_capacity(bound);
+    let mut payload = Vec::with_capacity(capacity);
     let mut writer = arrow::ipc::writer::StreamWriter::try_new_with_options(
         &mut payload,
         &rows.schema(),
@@ -865,11 +866,6 @@ fn encode_ipc(rows: &RecordBatch) -> Result<Bytes, ScribeError> {
         detail: format!("Arrow IPC encode finish failed: {error}"),
     })?;
     drop(writer);
-    if payload.len() > bound {
-        return Err(ScribeError::Internal {
-            detail: "Arrow IPC encode exceeded its reserved bound".to_owned(),
-        });
-    }
     payload.shrink_to_fit();
     Ok(Bytes::from(payload))
 }
@@ -1287,7 +1283,7 @@ mod tests {
         )]));
         let batch = RecordBatch::try_new(schema, vec![Arc::new(map) as _]).expect("map batch");
 
-        let payload = encode_ipc(&batch).expect("encodes");
+        let payload = encode_ipc(&batch, 0).expect("encodes");
 
         assert!(
             payload.len()
@@ -1336,7 +1332,7 @@ mod tests {
         ])
         .expect("incompressible batch");
 
-        let payload = encode_ipc(&batch).expect("encodes");
+        let payload = encode_ipc(&batch, 0).expect("encodes");
         assert!(
             payload.len()
                 <= crate::scribe::material_plan::wal_payload_bound(&batch).expect("bounds")
@@ -1357,6 +1353,6 @@ mod tests {
         writer.write(&constant).expect("writes");
         writer.finish().expect("finishes");
         drop(writer);
-        assert!(encode_ipc(&constant).expect("encodes").len() < uncompressed.len());
+        assert!(encode_ipc(&constant, 0).expect("encodes").len() < uncompressed.len());
     }
 }

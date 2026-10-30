@@ -6,200 +6,438 @@ spec: SPEC-benchmark-experiments
 spec_revision: 22
 parent_task: TASK-007
 depends_on: [TASK-007]
-requirements: [REQ-006, REQ-029, REQ-030, REQ-031, REQ-032, REQ-033, REQ-034]
-invariants: [INV-001, INV-002, INV-003, INV-004, INV-005, INV-007, INV-009]
-acceptance: [AC-001, AC-005, AC-010]
+requirements: [REQ-001, REQ-002, REQ-003, REQ-004, REQ-006, REQ-007, REQ-008, REQ-010, REQ-011, REQ-012, REQ-013, REQ-014, REQ-015, REQ-016, REQ-019, REQ-020, REQ-021, REQ-023, REQ-024, REQ-025, REQ-026, REQ-029, REQ-030, REQ-031, REQ-032, REQ-033, REQ-034]
+invariants: [INV-001, INV-002, INV-003, INV-004, INV-005, INV-006, INV-007, INV-009, INV-010]
+acceptance: [AC-001, AC-002, AC-003, AC-004, AC-005, AC-008, AC-009, AC-010, AC-013, AC-014]
 ---
 
-# TASK-008 — close the hot read path and its evidence
+# TASK-008 — close out L1 benchmarks and measured optimizations
 
-## What changes and why
+## Outcome and Value
 
-Remove avoidable staged-read costs: use the published-file reader and planning
-owner on the Scribe that holds the files, retain real run facts, and push the
-plan's projection into staged and memtable scans. Fix the demonstrated time
-warning and complete memory scan measurements. Benchmarks measure performance;
-correctness belongs to unit and SDK journey tests in their owning code.
+Finish the packet's L1 work across Verification, Bifrost and Gateway with one
+standard measurement pattern, working hot shredding, measured optimization
+decisions, and complete results. For example, a `COUNT(*)` query filtering one
+learned attribute must avoid reconstructing the whole attributes value merely
+to recheck its predicate on the leader. A scalar-output test or a VALID run
+cannot establish that outcome.
 
-Preserve logical results, tenant proof, the publication cut, exactly-once
-generation selection, capture identity, deadlines, fences, cancellation and
-query-bound leases. Discovery, listing and `LiveTableRoutes` are unchanged:
-the leader never plans another node's files, and no footer crosses the network.
+Start from rollback `07a157cb9` (runtime restored to `471f69ff9`), not the failed
+attempt's code. Preserve its records as historical evidence, not current proof.
+The maintainer directed this L1-only scope and clarified completion: **target
+misses can be accepted only after controlled evidence establishes the attempted
+change's effect and the maintainer explicitly approves the remaining miss and
+keep/revert disposition**. VALID alone never grants that approval.
 
-Non-goals: decoded caches, retained staged Arrow, new Card kinds, SDK/public
-HTTP changes, benchmark modes, environment variables, guards, plan caching,
-writer recipe changes or `writes-parquet` changes. Keep existing stage/publish
-controls and the `prepare_hot` gauge check unchanged.
+## What Changes and What Must Stay True
 
-## Six steps
+Cover Bifrost writes-parquet, hot and parquet, Verification, and Gateway. Reuse
+the existing experiment lifecycle for instrumentation, measurement, validity,
+recording and reporting. Close the packet's existing optimization work,
+including verification persistence, gateway capture, Bifrost point/read/write
+costs, and hot shredding. Do not expand into unrelated optimization.
 
-Execute in this order, each committed on its own when commits are authorized.
-This planning edit does not authorize implementation or commits.
+Shredding must work through real SQL on memtable and staged data for scalar
+outputs and filter-only aggregates, locally and remotely. Staged and published
+Parquet share the existing planning and cached-reader policy on the node holding
+the data; their stores and capture/lease ownership legitimately differ. Measure
+shredding and the shared reader independently, including ingestion costs. Retain
+changes on measured merit and revert ineffective attempts. A target waiver does
+not waive functional requirements: abandoning the shared-reader or shredding
+outcome needs an explicit specification decision with the maintainer.
 
-### 1. Same reader
+Preserve exact results, tenant/authentication proof, audit, durability,
+publication cuts, exactly-once generation selection, full schema/assignment
+authority, deadlines, fences, cancellation and query-bound leases. Discovery,
+listing and routing do not change: the leader never plans peer files and no
+footer crosses the network. Invalid private projections fail before source IO;
+no silent whole-column fallback or weakened validation.
 
-In `crates/vala/vala-bifrost-redux/src/oracle/exec.rs`, build the
-`hot_parquet_scan` `HotObjects::Staged` reader exactly as
-`TenantWarehouseReads::reader_factory` does: `CachedParquetFileReaderFactory`
-with the node's `FileMetadataCache`, and `RangeCache` through
-`TenantParquetReaderFactory`, over `LocalFileSystem` instead of the warehouse
-store. Confirm metadata-cache entries are validated against `ObjectMeta`
-before relying on path keys. Delete the uncached branch and the
-"rewritable/never cached" claim.
+Non-goals: **L2 runs, L2 calibration and L2 investigations**; new benchmark modes,
+public APIs, configuration knobs, plan caches, decoded caches, retained staged
+Arrow, a replacement harness, weaker workloads/targets, or platform-specific
+resource controls. Preserve default L1 declarations and `prepare_hot`'s learned
+layout check. Same-key diagnostic comparisons do not restore the withdrawn
+four-cohort default benchmark. L1 closeout does not claim deferred L2 or final
+change review is complete. Planning authorizes no implementation or Git actions.
 
-### 2. Real file facts
+## Approach
 
-`LiveCapture::read` / `CapturedRead` in `scribe/memtable.rs` hand each staged
-run to the local reader with its size, row count and time bounds from the
-`RunFooters` already held, instead of a bare path. Retain exact per-run sizes
-at staging/recovery; `StagedSource.bytes` is a member total.
+Execute the five stages below in order. Each stage owns an observable checkpoint;
+the scenarios define behavior and the verification sections define its proof.
+They are not competing sequences. Keep one change and measurement at a time.
 
-`ScribeTailResolver::live_leaf` in `oracle/follower.rs` stops stat-ing paths
-and inventing unknown metadata, passes the table time column to
-`hot_parquet_scan`, and uses the same `keep` pruning and footer row-group
-partition cap as `OracleTableProvider::persisted_input`, through one shared
-owner. Preserve `planned.files` scan candidates versus `planned.kept` footer
-sizing and conservative treatment of unknown bounds. Keep local capture and
-lease ownership; routing and listing do not change.
+1. [Stage 1 — baseline and diagnosis](#stage-1--restored-baseline-and-diagnosis-only).
+2. [Stage 2 — real-SQL shredding](#stage-2--real-sql-hot-shredding).
+3. [Stage 3 — shared reading and staged-gap explanation](#stage-3--shared-stagedpublished-reading-and-staged-gap-explanation).
+4. [Stage 4 — remaining individual corrections](#stage-4--remaining-corrections-one-measured-change-at-a-time).
+5. [Stage 5 — integrated L1 results and disposition](#stage-5--integrated-l1-results-and-maintainer-disposition).
 
-**Behavior.** Staged and published scans share planning and the cached reader.
-An excluded run is never opened; a repeated query rereads no footer. Early
-stream drop releases its lease.
+## Execution Stages
 
-**RED.** V-A1 proves these properties with separate scan-open and footer-read
-counts; the current handoff loses run facts and uses divergent planning.
+An instruction such as **"Execute Stage 1 of TASK-008 only"** authorizes only
+that stage. Read the task's invariants and applicable spec first, use the linked
+proof, record the result here, and stop at the stage boundary. Do not continue
+to another stage without direction. A completed stage is not an IMPLEMENTED
+verdict for the whole task. Commits/pushes still require explicit authorization.
 
-**GREEN.** Complete the shared reader and local metadata handoff above, then
-run V-A1.
+Before resuming a later stage, verify the preceding stage's evidence and exact
+candidate. Reuse valid completed proof; do not restart or reapply reverted
+changes. If a prerequisite is missing, report the specific gap rather than
+silently expanding the requested stage. Missing target approval remains pending;
+never treat silence, a VALID run, or stage completion as maintainer approval.
 
-**REFACTOR.** Delete duplicate staged planning and reader construction.
+### Stage 1 — restored baseline and diagnosis only
 
-### 3. Projection reaches the scan — maintainer decision 1
+**Scope.** Inventory outstanding packet obligations and historical compatibility;
+verify that the engines use the shared experiment owner. Run all five restored
+L1 baselines. Inspect the actual hot SQL plans and profile equivalent staged and
+memory queries using current support before changing production code. Identify
+measured costs, hypotheses and evidence gaps separately, including what is needed
+for a same-key canonical/learned comparison. This stage changes no production or
+test code; benchmark artifacts and execution notes are its outputs.
 
-The live assignment carries the plan's projection expressions for staged and
-memtable reads. The follower runs projection pushdown as well as filter
-pushdown. `ReadableSource::project` evaluates the expressions on physical
-arrays without reconstructing an unused whole Variant. Keep the ordered input
-dependency closure, including hidden tenant and predicate inputs, separate
-from output expressions and aliases.
+**Proof.** [V-STANDARD](#v-standard--shared-pattern-regression-proof), existing
+[V-OTHER](#v-other--existing-persistence-and-capture-proof) regression proof,
+[V-DIAG](#v-diag--causal-comparisons-and-optimization-dispositions), baseline-only
+[V-L1](#v-l1--complete-release-process-evidence), and baseline compatibility from
+[V-REPORT](#v-report--every-step-and-explicit-approval). No new RED is required
+for this evidence-only stage. Existing failures remain visible for later repair;
+a broken baseline measurement must not be reported as valid.
 
-Keep A2's existing codec and authority rules: an ordered, nonempty projection
-of serialized `PhysicalExprNode` expressions and aliases through the Oracle
-physical expression codec; opaque bytes/names in `wyrd-spec`; a fresh proto
-tag after reserved tags 7/8. Bind exact ordered bytes and aliases into a new
-assignment-digest domain version and the projected fragment's plan fingerprint.
-Expression-less assignments fail closed; public API versions do not change.
+**Required evidence and exit.** Record paths and candidate/host/build/controls
+for all five experiments; per-step baseline results and any invalidity; the
+shared-owner audit; hot plans/profiles; supported cost findings; and the proposed
+first implementation change. If existing support cannot isolate a cost, state
+the missing observation and its owner, not a causal conclusion. Stop with this
+report. Do not implement shredding, reader changes, instrumentation or repairs.
 
-Preflight checks assignment/fragment agreement before IO. Decode validates
-columns/indices against authenticated inputs, function availability,
-aliases/order, logical output schema and the full-table fingerprint. Missing,
-malformed, tampered or mismatched projection produces no output or whole-column
-fallback. Preserve tenant proof even for `count(*)`, rebind downstream
-references, and retain filter semantics without double application or index
-drift. Local and remote dispatch execute the same bound fragment. Whole-value
-requests still use standard reconstruction; scalar requests do not.
+### Stage 2 — real-SQL hot shredding
 
-**Behavior.** A staged shredded-key read reads only its leaf and required
-metadata/residue; a memtable scalar read reconstructs no whole Variant.
-Logical results remain identical through memtable, stage and publish.
+**Scope.** Execute [Scenario 1](#scenario-1--real-sql-benefits-from-learned-hot-leaves)
+only. Prove and fix scalar and predicate-only aggregate behavior on learned
+memtable and staged data, with local/remote authority and correctness. Add the
+same-key diagnostic proof using existing test/lifecycle support, without changing
+the default benchmark declaration. Do not introduce the shared-reader change.
 
-**RED.** V-A2 proves physical leaf reads and malformed/tampered projection
-refusal; V-JOURNEY covers the SDK lifecycle and remote Scribe execution.
+**Proof.** [V-SQL](#v-sql--real-sql-and-physical-work) RED/GREEN/REFACTOR,
+[V-DIAG](#v-diag--causal-comparisons-and-optimization-dispositions) for isolated
+read and ingestion costs, and affected [V-CHECKS](#v-checks--affected-correctness-and-static-proof).
+Use Stage 1's baseline and hold other production behavior fixed. Do not depend
+on Stage 4's new scan counters for the initial physical-work proof.
 
-**GREEN.** Extend the existing assignment, codec, leader, follower and
-`ReadableSource::project` together. Run V-A2 and V-JOURNEY plus V-A1.
+**Required evidence and exit.** Record the diff, expected RED and passing
+correctness/authority proof, physical leaf/reconstruction observations,
+controlled read and ingest CPU/memory measurements, protected-workload effects,
+and a keep/revert recommendation. State every miss and unresolved question.
+Stop before the reader change; any proposed functional waiver requires the
+maintainer's specification decision.
 
-**REFACTOR.** Remove whole-column-only assumptions and update construction
-sites and codec/security fixtures without a compatibility path.
+### Stage 3 — shared staged/published reading and staged-gap explanation
 
-### 4. B — mixed known and unknown time bounds prune without warnings
+**Scope.** Execute [Scenario 2](#scenario-2--staged-parquet-shares-published-planning-and-reading)
+only, preserving the accepted Stage 2 behavior. Share planning and reader policy
+through the existing owner while retaining local storage/capture/lease differences.
+Revisit the staged/memory profiles to establish what this change removes and
+what cost remains; do not promise parity or silently attribute unrelated gains.
 
-**Behavior.** A `start_time_unix_nano` predicate over the actual hot container
-statistics excludes known-disjoint batches/runs, keeps unknown containers,
-and emits no conversion warning. Nulls, absent/inexact bounds, nanosecond
-precision and time-zone-bearing timestamp fields remain correct.
+**Proof.** [V-READER](#v-reader--shared-planning-and-reader), rerun affected
+[V-SQL](#v-sql--real-sql-and-physical-work),
+[V-DIAG](#v-diag--causal-comparisons-and-optimization-dispositions) with immediate
+pre-reader versus post-reader candidates, and affected
+[V-CHECKS](#v-checks--affected-correctness-and-static-proof). Retain the restored
+baseline as context, not as a substitute for isolating this change.
 
-**RED.** First add the planned V-TIME regression
-using `batch_statistics`, `set_time_bounds`, projected/inexact statistics and
-`BatchPruning`/`PrunableStatistics` as the hot path does. Mix typed exact bounds
-with the unknown containers that actually reach it. Assert the typed min/max
-arrays, keep mask and warning absence; prove the failing warning path, not
-merely a timestamp arithmetic failure. Record the concrete failing inputs.
+**Required evidence and exit.** Record RED/GREEN, reader/pruning/cache/lease
+proof, independent reader measurements including staged write pressure, the
+supported staged-gap explanation and unexplained remainder, and a keep/revert
+recommendation. Stop before time, accounting or other engine optimizations.
+Do not waive required shared reading merely because a target is missed.
 
-**GREEN.** If Wyrd supplies a wrong type/unit/timezone, invalid exactness or
-misaligned container statistics, fix that shared construction owner. If valid
-schema-aligned inputs fail because DataFusion inserts untyped
-`ScalarValue::Null` among typed values, fix `datafusion-common`'s
-`PrunableStatistics::get_exact_column_statistics` in the pinned fork with
-schema-typed unknowns, with its own focused regression. This evidence selects
-the owner; it is not an architecture choice. Format fork changes with
-`mise exec -- cargo +nightly fmt` in the fork, then update every root
-DataFusion patch pin and lockfile coherently. Never edit Cargo's checkout or
-suppress warnings. Rerun V-TIME and the earlier scenarios.
+### Stage 4 — remaining corrections, one measured change at a time
 
-**REFACTOR.** Keep one construction/conversion rule at the demonstrated owner;
-remove any workaround made redundant by that fix. Unknown statistics must
-still fail open for pruning, never discard potentially matching rows.
+**Scope.** Execute [Scenario 3](#scenario-3--hot-time-pruning-keeps-unknown-bounds-without-warnings),
+then [Scenario 4](#scenario-4--local-and-remote-memory-scan-facts-are-accurate).
+Then close the remaining in-scope Verification/Gateway/Bifrost optimization
+ledger. Reuse already-effective fixes and their compatible evidence. Each
+identified cost is a separate correction and measurement checkpoint; do not
+combine fixes and claim their aggregate result proves each one helped.
 
-### 5. C — memory reads report measured rows and bytes once
+**Proof.** [V-TIME](#v-time--actual-hot-statistics),
+[V-FACTS](#v-facts--scan-accounting),
+[V-OTHER](#v-other--existing-persistence-and-capture-proof),
+[V-DIAG](#v-diag--causal-comparisons-and-optimization-dispositions), regression
+proof for earlier stages, and affected [V-CHECKS](#v-checks--affected-correctness-and-static-proof).
+Record a focused behavior RED before each new code correction. For already-correct
+behavior, record verification-only proof instead of changing production code.
 
-**Behavior.** Count the physical input rows examined and physical Arrow bytes
-accessed by the projected/predicate columns after batch pruning, before row
-filtering and scalar output reduction. For shredded scalar reads count their
-physical leaf dependencies, metadata and required residue, excluding unused
-siblings. Deduplicate shared input buffers within a scanned batch; count a
-batch again if execution actually scans it again. Excluded batches contribute
-zero; an instrumented empty scan reports numeric zero. This is memory scan
-work, not Parquet compressed IO, retained heap, sizing estimates, returned
-rows or Arrow transport bytes. State the distinction in metric documentation.
+**Required evidence and exit.** Record the diff, correctness results, independent
+instrumentation-overhead measurements and per-correction before/after results.
+Every ledger item must have evidence and a proposed disposition or a precise
+unresolved issue; unknown effects are not proven ineffective changes. Stop before
+integrated qualification. Report remaining misses for maintainer approval, and
+route material decisions without starting unrelated work or L2.
 
-Capture-side filtering/projection is already execution work: preserve its
-facts even when it returns no rows. Carry those facts into the follower's scan
-evidence without counting the same batch again in `MemtableSource`. Both
-`NativeCompletion` and remote `WorkerFooter` carry them; Oracle sums mixed
-memory/staged contributions once per validated completion. Missing facts remain
-unavailable rather than zero, and cancelled/incomplete remote attempts cannot
+### Stage 5 — integrated L1 results and maintainer disposition
+
+**Scope.** Qualify the accepted integrated candidate after earlier stages have
+completed required correctness repairs. Run all five full L1 experiments and
+publish complete per-step results. This stage makes no production/test-code
+changes. If a correctness check or diagnosis requires another code change,
+identify the earlier stage to reopen and stop qualification; return correctness
+repairs not otherwise assigned to Stage 4. Do not bundle repairs or optimizations
+into final measurements.
+
+**Proof.** [V-CHECKS](#v-checks--affected-correctness-and-static-proof), final
+[V-L1](#v-l1--complete-release-process-evidence), and
+[V-REPORT](#v-report--every-step-and-explicit-approval). Reuse unaffected focused
+proof with its candidate/coverage recorded; final performance records must all
+measure the accepted integrated candidate.
+
+**Required evidence and exit.** Required correctness checks pass; all five final
+experiments have valid full records within budget; every default step and all
+requested metrics are reported against compatible baselines. Present each target
+miss, regression or unsettled result with its evidence and proposed disposition.
+Stop awaiting any required maintainer approval; do not declare IMPLEMENTED while
+approval, required behavior or required proof remains outstanding. After explicit
+disposition, report the task result for independent review. Deferred L2 and final
+change-review obligations remain outside this stage.
+
+## Ordered Implementation Scenarios
+
+Use RED/GREEN/REFACTOR for changed behavior. Already-correct behavior needs
+recorded regression/no-op proof, not artificial churn. Planned selectors must
+be confirmed after adding tests and before RED; setup/compile failure is not RED.
+
+### Scenario 1 — real SQL benefits from learned hot leaves
+
+**Behavior.** SDK queries through the real server return exact scalar and
+predicate-only aggregate results across memtable, staging and publication.
+Local and remote hot reads avoid unrelated leaves and unused whole-Variant
+reconstruction, including `COUNT(*)` with an attribute predicate. Whole-value
+requests, residual keys, missing/null values, mixed types, canonical data and
+mixed learned layouts retain correct semantics and tenant isolation.
+
+**RED.** [V-SQL](#v-sql--real-sql-and-physical-work) exercises the actual SQL shape
+on a learned layout, paired with owner-level physical dependency/reconstruction
+assertions. Show unnecessary whole-column work, not just correct scalar output
+from a manually constructed fragment. Reject missing/malformed/tampered or
+mismatched private projections before source IO. Different-key bytes alone
+cannot prove leaf use or its benefit.
+
+**GREEN.** Extend the existing live planning, signed assignment, codec and
+physical expression owners together. Preserve revision 22's ordered projection
+and alias authority, authenticated input closure/schema, hidden tenant inputs
+and local/remote parity. The approved private contract uses ordered serialized
+`PhysicalExprNode` expressions and aliases through the Oracle codec, opaque
+bytes/names in wyrd-spec, and a fresh proto tag after reserved tags 7/8. Bind
+ordered bytes/aliases into the new assignment-digest domain and fragment
+fingerprint. Expression-less or schema/function/index/alias-mismatched assignments
+fail closed; aggregate planning must still preserve tenant proof. Rerun V-SQL
+and its authority regressions.
+
+**REFACTOR.** Remove redundant reconstruction and whole-column assumptions at
+the existing owners. Add no expression engine, planner or compatibility path.
+
+### Scenario 2 — staged Parquet shares published planning and reading
+
+**Behavior.** Local staged reads retain real per-run sizes, row counts and time
+bounds, and share pruning, footer sizing, partitioning and metadata/range-cache
+policy with published reads. Excluded runs are never opened; repeat reads reuse
+footers. Unknown bounds stay conservative; stale/missing objects and tenant
+mismatches still fail. Early stream drop releases its lease.
+
+**RED.** [V-READER](#v-reader--shared-planning-and-reader) distinguishes scan-open
+and footer-read counts across cold/warm reads, known-disjoint/unknown bounds,
+object metadata changes and early drop. Current staged handoff loses file facts,
+stats paths and diverges from published planning/cached reading.
+
+**GREEN.** Extend the published planning/reader owner to staged local storage,
+retaining capture ownership. Confirm metadata validation before using path keys.
+Rerun V-READER and V-SQL; measure against the immediate pre-reader candidate
+with accepted shredding unchanged. Keep the restored baseline as context rather
+than attributing an aggregate task result to the reader.
+
+**REFACTOR.** Remove duplicate staged planning and uncached construction. Update
+the owning architecture's staged-uncached claim to the proven implemented policy.
+
+### Scenario 3 — hot time pruning keeps unknown bounds without warnings
+
+**Behavior.** The actual nanosecond-time hot path excludes known-disjoint
+containers, keeps unknown containers and emits no conversion warning. Nulls,
+inexact bounds, precision and timezone-bearing fields preserve correct answers.
+
+**RED.** [V-TIME](#v-time--actual-hot-statistics) reproduces the real mixed
+known/unknown statistics and warning; assert typed bounds, keep mask and warning
+absence. If it cannot reproduce, collect real inputs rather than guess a fix.
+
+**GREEN.** Fix the demonstrated statistics owner, in Wyrd or its pinned
+DataFusion fork. If the fork is responsible, reuse/revalidate its focused fix
+and update existing pins/lockfile coherently, without adding a dependency or
+suppressing warnings. Rerun V-TIME and earlier scenarios.
+
+**REFACTOR.** Keep one schema-correct unknown-bound rule. Unknown statistics
+must never prune potentially matching rows.
+
+### Scenario 4 — local and remote memory scan facts are accurate
+
+**Behavior.** Count physical input rows after pruning and before row filtering,
+and physical Arrow buffers accessed by predicate/output dependencies: necessary
+leaves, metadata and residue, excluding unused siblings. Deduplicate shared
+buffers within a scanned batch; actual rescans count again. Excluded batches
+contribute zero. Empty instrumented scans report zero; unavailable facts remain
+unavailable. Preserve facts even if filtering returns no rows. Aggregate each
+validated native/remote completion once; cancelled/incomplete attempts cannot
 claim successful complete facts.
 
-**RED.** V-FACTS adds planned
-pruned/empty/mixed memory facts and extends the existing aggregation test at
-`exec.rs:2202`. Preserve generic uninstrumented memory absence; assert numeric
-facts for the Scribe owner. Exercise both native and encoded completions,
-repeated finalization, missing evidence and rejected terminal frames. Before
-this step memory bytes are absent and remote rows have no transport field.
+**RED.** [V-FACTS](#v-facts--scan-accounting) covers pruned/empty/mixed sources,
+shared buffers, scalar/whole-value dependencies, no-result filters, repeated
+finalization and rejected/missing terminal evidence. Restored memory bytes and
+remote row facts are absent; generic uninstrumented memory must stay absent.
 
-**GREEN.** Instrument the actual memory-read owner, extend `WorkerScanStats`
-in `wyrd-spec` and the private proto with optional scanned rows, and propagate
-through conversion, follower finalization, dispatch and Oracle's remote
-accumulator. Preserve availability independently for each metric. Update the
-current row aggregation that excludes remote scans.
-Rerun V-FACTS and earlier scenarios.
+**GREEN.** Extend existing capture/completion evidence and private transport
+coherently, preserving each metric's availability. Run V-FACTS and earlier
+scenarios. Measure instrumentation overhead separately; do not presume it
+caused the previous CPU regressions.
 
-**REFACTOR.** Keep accounting in the existing evidence flow, remove stale
-“memory means no scan facts” assertions/comments, and prevent plan traversal
-or multiple finalization from double counting. Add no query metric endpoint.
+**REFACTOR.** Remove duplicate counting and stale absence assumptions. Reuse
+physical-read facts; add no endpoint or second accounting lifecycle.
 
-### 6. Measure
+## Acceptance Criteria
 
-Run `mise run bench:l1:bifrost:hot`, then
-`mise run bench:l1:bifrost:parquet`, exclusively, with no overlapping build,
-benchmark or synthetic load. Keep clean unprofiled records through the existing
-history workflow. Compare by step ID against the records below using
-**server p99 ms**, **server CPU ms per query** and **scanned bytes per query**.
-Show all three repetitions, medians and spread, host/build differences, memory
-scanned rows/query, point queries/CPU-second and elapsed budget. Historical
-missing memory facts remain missing; do not substitute estimates.
+One mapping covers this revised task. Prior proof can be reused only with its
+candidate, controls and coverage stated; unfinished earlier obligations remain
+visible in the closeout ledger.
 
-## Tests
+| Obligations | Required observation and proof |
+|---|---|
+| REQ-001–004, REQ-007–008, REQ-010–016; AC-001–004, AC-008–009 | V-STANDARD and full release-process records establish one shared declaration/execution/measurement/validity/record/report pattern across all engines. Sound target misses retain VALID; missing or corrupt evidence does not pass. |
+| REQ-029–033; AC-001, AC-010 | V-SQL proves scalar and aggregate SQL through learned memory/staged reads and publication, local/remote execution, mixed/residual cases, physical dependencies and tenant/projection refusal. V-DIAG measures equivalent data/key/predicate/results; region-versus-long-tail is workload coverage, not shredding A/B proof. |
+| REQ-034; INV-001–004, INV-009 | V-READER proves shared policy, real facts, pruning, validation and lease release. V-DIAG measures the shared reader separately and explains staged/memory costs. A ratio cannot improve by slowing memory. |
+| REQ-006, REQ-029–030; INV-001, INV-007 | V-TIME proves warning-free correct pruning; V-FACTS proves available, exactly-once local/remote facts. Memory-buffer and compressed-file bytes are labeled distinctly. |
+| REQ-019, REQ-021, REQ-023–026; AC-014 | V-OTHER and V-DIAG close the existing optimization ledger: verification persistence, gateway capture, Bifrost point/Parquet tails, OTLP/write CPU, single-shard costs and approved shard comparisons. Each attempt has causal diagnostics, comparable before/after evidence, correctness proof and a measured keep/revert disposition. |
+| REQ-011–014, REQ-019–020; AC-002, AC-005 (L1 only), AC-013 | V-L1 supplies five current full records, budgets, default steps, repetitions and denominators. V-REPORT explains historical compatibility; reuse or collect required same-build export-cost evidence. L2 is expressly deferred. |
+| INV-001–007, INV-009–010; AC-010 | V-CHECKS and affected focused journeys preserve correctness, tenancy, durability, audit, privacy, cleanup and bounded evidence. Required red checks block completion regardless of their origin. |
+| REQ-021; AC-014; maintainer direction | V-REPORT lists every miss/regression/unsettled result with diagnosis, attempted changes, keep/revert recommendation and explicit maintainer approval. No outstanding approval or required behavior may be labeled IMPLEMENTED. |
 
-Use unit tests in the owning modules and existing real-server SDK journeys.
-New selectors are planned: confirm their actual names after adding them and
-before RED. Run focused RED/GREEN proof during implementation, sequentially,
-with `WYRD_LOG=info,vala_bifrost_redux=debug` while diagnosing; read the trace.
+## Implementation Reference
 
-### V-A1 — same planning, reader, pruning, footer reuse and lease release
+Paths identify existing owners and inspected consumers, not a private-code
+allowlist. Extend the whole workflow rather than duplicate orchestration.
 
-First selector is planned; the others exist. Cover steps 1 and 2 together.
+- **Experiment standardization:** `capacity/main.rs` calls `levels::execute`;
+  `levels.rs` assembles declarations and regenerates reports.
+  `crates/wyrd/wyrd-testing/src/experiment.rs::{Declaration, Workload}` owns
+  measurement, validity and history. Verification `verification/mod.rs::plan`
+  and `run.rs::Bench::closed`, Gateway `gateway/mod.rs::plan` and
+  `run.rs::Bench::step`, and Bifrost `query/mod.rs::plan` already participate.
+  Their V-STANDARD tests are regression proof; close gaps in these owners.
+  Here `capacity/` means `crates/wyrd/wyrd-testing/src/bin/capacity/`.
+- **Actual query:** `capacity/query/isolated.rs::prepare_hot` learns a layout and
+  places both sources; `query/telemetry.rs` builds literal-key COUNT filters.
+  Preserve this default fixture. Trace `oracle/live.rs::LiveScribeExec`
+  projection/leader filtering to `scribe/memtable.rs::ReadableSource::project`;
+  the prior scalar-fragment test missed aggregate whole-column dependencies.
+  These read owners are under `crates/vala/vala-bifrost-redux/src/`.
+- **Staged/published reading:** `oracle/follower.rs::ScribeTailResolver::live_leaf`
+  currently stats paths and supplies unknown facts; published
+  `oracle/exec.rs::OracleTableProvider::persisted_input` uses `PlannedFiles`
+  and `TenantWarehouseReads::reader_factory`. Both reach `hot_parquet_scan`,
+  but only published uses cached warehouse reading. Extend that workflow with
+  existing `RunFooters` facts from `LiveCapture::read` / `CapturedRead`; sharing
+  one leaf call is not shared planning and reading.
+- **Authority and completion consumers:** existing Oracle expression codec,
+  dispatcher/follower, `wyrd-spec/src/vala/assignment_authority.rs`, `wyrd-tonic`
+  private proto/conversion and completion accumulation change together. Keep
+  revision 22's approved private projection representation/authority and opaque
+  transport in wyrd-spec, without importing execution dependencies there.
+- **Tests:** Oracle `published.rs` and `peer_network/security.rs` cover source
+  transitions and remote predicates; Scribe `telemetry.rs` covers layout
+  lifetime; follower/exec/live inline tests cover pruning, leases and facts.
+  V-SQL closes real SQL/physical-work coverage in these existing targets.
+  `scan_sizing.rs` and pinned DataFusion pruning own the time regression.
+- **Verification persistence:** `verification/run.rs::Bench::closed` drives the
+  SDK's execute route, then `VerificationControl::{execute, run_direct,
+  stage_direct}` in the server. Existing `verification/results.rs::ResultPayloadBuilder`
+  already writes inputs once, details plus payload-free summary, and encodes
+  typed Variants directly. `scribe_outbox.rs::{Frame::frames, Part::dense}` and
+  producer execution lanes already batch/sequence these writes. Revalidate
+  these owners with V-OTHER and phase measurements; do not reimplement them.
+- **Gateway capture:** benchmark `gateway/run.rs::Bench::step` reaches server
+  `components/gateway/invocation.rs::GatewayInvocation`, settlement and
+  `components/gateway/capture.rs::CallCapture`. Existing outbox projection
+  batches calls. `redacted_canonical_json` feeds `payload_column` through JSON
+  text, a candidate cost requiring profiling, not a proven bottleneck. Preserve
+  redaction, binary extraction, size limits, validation and capture accounting.
+  Settlement follows the answer: request latency alone cannot prove lower total
+  capture CPU. V-OTHER covers these existing owners before any new correction.
+- **Write optimization evidence:** reuse TASK-007 proof and retained phase
+  timings for Scribe costs. REQ-025 locates `otlp_decode.rs::WireFields::read_varint`
+  and `tables/signal.rs::finish_variant`; REQ-026 bounds shard/group-cycle work.
+  Revalidate consumers before changes. No replacement queue, runtime or storage
+  format is justified by this task.
+- **Contract/docs closure:** update affected private constructors, conversions,
+  authored consumers and generated outputs together; correct
+  `architecture/bifrost-design.md` at the reader owner and `benchmarks/README.md`
+  at metric definitions. Update TASK-007's outstanding evidence without erasing
+  history. No public SDK/HTTP capability is introduced.
+
+## Verification and Evidence
+
+All commands run sequentially through mise. Diagnose with
+`WYRD_LOG=info,vala_bifrost_redux=debug` and read traces. Reconfirm actual selectors
+for planned tests before RED. Oracle/Scribe targets, repository Postgres setup
+and journey profile are confirmed in Cargo/mise; no separate test harness.
+
+### V-STANDARD — shared-pattern regression proof
+
+The standardization audit and already-correct behavior need no manufactured RED.
+If an identified gap needs executable changes, add its focused failing assertion
+at the existing owner and record the exact selector/expected RED first.
+
+```sh
+mise exec -- cargo nextest run --locked -p wyrd-testing --lib -E 'test(/^experiment::tests::/)'
+mise exec -- cargo nextest run --locked -p wyrd-testing --bin capacity -E 'test(=verification::tests::level_one_declares_direct_sweep_and_strict_objective)'
+mise exec -- cargo nextest run --locked -p wyrd-testing --bin capacity -E 'test(=gateway::tests::overhead_declares_every_case_at_every_client_count)'
+mise exec -- cargo nextest run --locked -p wyrd-testing --bin capacity -E 'test(=gateway::run::tests::overhead_repetition_subtracts_waits_per_call_and_counts_capture)'
+```
+
+### V-OTHER — existing persistence and capture proof
+
+These confirmed existing owner tests support revalidation, not a demand for new
+production changes. Add a focused RED only after diagnostics identify a missing
+behavior; preserve applicable existing result-returning and tenant-negative
+journeys for any changed production workflow.
+
+```sh
+mise exec -- cargo nextest run --locked -p wyrd-server --lib -E 'test(=verification::results::tests::outcome_writes_output_then_summary)'
+mise exec -- cargo nextest run --locked -p wyrd-server --lib -E 'test(=scribe_outbox::tests::dense_projection_preserves_records_and_attribution)'
+mise exec -- cargo nextest run --locked -p wyrd-server --lib -E 'test(=scribe_outbox::tests::verification_lanes_keep_phase_order_across_retry)'
+mise exec -- cargo nextest run --locked -p wyrd-server --lib -E 'test(=components::gateway::capture::tests::payload_capture_redacts_secrets_and_references_binary_content)'
+mise exec -- cargo nextest run --locked -p wyrd-server --lib -E 'test(=components::gateway::capture::tests::oversized_payload_drops_capture)'
+```
+
+### V-SQL — real SQL and physical work
+
+First three selectors are **planned** in confirmed existing targets: two SDK
+journeys and an owner-level physical dependency test. Other selectors exist.
+Add malformed/tampered projection refusal to these focused authority proofs.
+
+```sh
+mise exec -- scripts/postgres/with-test-postgres.sh -- bash -lc 'mise run db:migrate:inner && cargo nextest run --locked -p wyrd-testing --test oracle -P journey --run-ignored=all -E "test(=published::learned_attribute_sql_preserves_results_across_sources)"'
+mise exec -- scripts/postgres/with-test-postgres.sh -- bash -lc 'mise run db:migrate:inner && cargo nextest run --locked -p wyrd-testing --test oracle -P journey --run-ignored=all -E "test(=peer_network::security::remote_learned_attribute_sql_preserves_results_and_authority)"'
+mise exec -- cargo nextest run --locked -p vala-bifrost-redux --lib -E 'test(=oracle::live::tests::attribute_count_sql_avoids_unused_variant_reconstruction)'
+mise exec -- cargo nextest run --locked -p wyrd-spec --lib -E 'test(=vala::assignment_authority::tests::every_assignment_field_changes_the_digest)'
+mise exec -- cargo nextest run --locked -p wyrd-tonic --lib -E 'test(=private_conversion::tests::follower_assignment_v2_contract)'
+mise exec -- cargo nextest run --locked -p wyrd-tonic --lib -E 'test(=private_conversion::tests::follower_assignment_v1_shaped_peer_is_rejected)'
+mise exec -- scripts/postgres/with-test-postgres.sh -- bash -lc 'mise run db:migrate:inner && cargo nextest run --locked -p wyrd-testing --test oracle -P journey --run-ignored=all -E "test(=published::source_transitions_preserve_exact_rows)"'
+mise exec -- scripts/postgres/with-test-postgres.sh -- bash -lc 'mise run db:migrate:inner && cargo nextest run --locked -p wyrd-testing --test scribe -P journey --run-ignored=all -E "test(=telemetry::variant_layouts_survive_memory_stage_publication_and_restart)"'
+```
+
+### V-READER — shared planning and reader
+
+First selector is **planned**; the others exist. Prove separate scan-open/footer
+counts, conservative bounds, object validation and lease release.
 
 ```sh
 mise exec -- cargo nextest run --locked -p vala-bifrost-redux --lib -E 'test(=oracle::exec::tests::staged_and_published_share_planning_pushdown_and_footer_reuse)'
@@ -207,41 +445,22 @@ mise exec -- cargo nextest run --locked -p vala-bifrost-redux --lib -E 'test(=or
 mise exec -- cargo nextest run --locked -p vala-bifrost-redux --lib -E 'test(=oracle::follower::tests::a_dropped_staged_scan_releases_its_lease_immediately)'
 ```
 
-### V-A2 — staged leaf, memtable scalar and fail-closed projection
+### V-TIME — actual hot statistics
 
-First two selectors are planned; extend existing digest and codec fixtures for
-ordered expression bytes/aliases, missing/malformed projections and tampering.
-Both live sources require projection; invalid assignments fail before source IO.
-
-```sh
-mise exec -- cargo nextest run --locked -p vala-bifrost-redux --lib -E 'test(=oracle::follower::tests::live_projection_reads_shredded_leaves_without_whole_variants)'
-mise exec -- cargo nextest run --locked -p vala-bifrost-redux --lib -E 'test(=oracle::follower::tests::live_projection_mismatch_fails_before_source_io)'
-mise exec -- cargo nextest run --locked -p wyrd-spec --lib -E 'test(=vala::assignment_authority::tests::every_assignment_field_changes_the_digest)'
-mise exec -- cargo nextest run --locked -p wyrd-tonic --lib -E 'test(=private_conversion::tests::follower_assignment_v2_contract)'
-mise exec -- cargo nextest run --locked -p wyrd-tonic --lib -E 'test(=private_conversion::tests::follower_assignment_v1_shaped_peer_is_rejected)'
-```
-
-### V-TIME — B's warning regression
-
-Planned Wyrd regression; reproduce the real hot statistics and warning first.
+Wyrd selector is **planned** after rollback. If the pinned fork is the demonstrated
+owner, revalidate already-pushed `8d6d6bf58` rather than invent another patch.
+The fork selector below is **planned pending confirmation** in that checkout;
+run its commands there only, with the same default-feature library target.
 
 ```sh
 mise exec -- cargo nextest run --locked -p vala-bifrost-redux --lib -E 'test(=scan_sizing::tests::nanosecond_pruning_preserves_unknown_container_bounds)'
-```
-
-If the test identifies the pinned DataFusion fork as owner, confirm the planned
-`pruning::tests` selector there before RED, then run in the fork:
-
-```sh
 mise exec -- cargo nextest run --locked -p datafusion-common --lib -E 'test(=pruning::tests::mixed_timestamp_bounds_preserve_unknown_containers)'
 mise exec -- cargo +nightly fmt
 ```
 
-### V-FACTS — C's local and remote scan facts
+### V-FACTS — scan accounting
 
-First selector is planned; extend the other two for instrumented memory,
-pruned/empty/mixed input and exactly-once native/remote aggregation. Generic
-uninstrumented memory facts remain absent.
+First selector is **planned**; other selectors exist.
 
 ```sh
 mise exec -- cargo nextest run --locked -p vala-bifrost-redux --lib -E 'test(=oracle::follower::tests::live_memory_scan_facts_survive_native_and_remote_completion)'
@@ -249,62 +468,686 @@ mise exec -- cargo nextest run --locked -p vala-bifrost-redux --lib -E 'test(=or
 mise exec -- cargo nextest run --locked -p vala-bifrost-redux --lib -E 'test(=oracle::live::tests::live_staged_read_reports_scanned_bytes_to_the_query)'
 ```
 
-### V-JOURNEY — SDK memtable, stage, publish and remote Scribe execution
+### V-DIAG — causal comparisons and optimization dispositions
 
-Use existing `WyrdTestServer`, repository Postgres and the journey profile.
-The scalar journey is planned; the lifecycle journey exists. Assert identical
-logical answers and tenant refusal.
+Profiles, evidence audits and measurements are proof work, not new executable
+behavior; no manufactured RED. Each resulting code fix first needs a focused
+failing behavior test at its owner, its exact command and expected RED recorded,
+then GREEN and REFACTOR. A performance target miss is not a correctness RED.
+
+Before code changes, declare the one intended comparison variable and hold
+logical rows, SQL, key, predicate, exact results, concurrency, build/host and
+cache conditions fixed. For shredding, compare canonical and learned physical
+representations of equivalent data.
+For staged versus memory, query the same rows before and after staging. Capture
+actual plans/profiles and file/batch/row-group/partition counts, leaf dependencies,
+reconstruction, result rows, CPU/query and latency. Distinguish memory-buffer
+bytes from compressed-file bytes. Attribute planning, metadata, decode,
+reconstruction, filtering, transport and partitioning costs only where evidence
+supports them; quantify remaining or unexplained cost rather than invent parity.
+
+Isolate shredding's ingestion cost too: ingest the same stream through the same
+production path with canonical versus learned physical retention, holding client
+count, acknowledgement boundary, workload size and other settings fixed. Use
+existing lifecycle/placement support; do not add a public layout selector or
+change the default writes fixture. Compare CPU/row, acknowledgement latency,
+throughput and peak/retained memory, including originals, typed leaves, residue
+and construction scratch; verify exact accounting through stage/release. Link
+compatible existing proof or collect this diagnostic pair and its controls.
+Higher construction CPU/memory or slower writes is an explicit trade-off against
+read savings requiring disposition, not something an aggregate writes record
+can attribute to shredding. Measure the shared-reader change's ingestion/backlog
+effect separately with equivalent staged write pressure.
+
+Existing diagnostic command (not final qualification):
 
 ```sh
-mise exec -- scripts/postgres/with-test-postgres.sh -- bash -lc 'mise run db:migrate:inner && cargo nextest run --locked -p wyrd-testing --test scribe -P journey --run-ignored=all -E "test(=telemetry::shredded_scalar_reads_match_in_memory_staged_and_published)"'
-mise exec -- scripts/postgres/with-test-postgres.sh -- bash -lc 'mise run db:migrate:inner && cargo nextest run --locked -p wyrd-testing --test scribe -P journey --run-ignored=all -E "test(=telemetry::variant_layouts_survive_memory_stage_publication_and_restart)"'
+mise run bench:l1:bifrost:hot -- --profile --steps span-shredded-memtable-c1,span-shredded-staged-c1
 ```
 
-The planned remote journey uses the existing `oracle` peer-network cluster
-setup and covers staged/memtable projection, owning-Scribe placement and
-fail-closed projection/tenant refusal:
+Keep one ledger here for prior and new attempts: cost/source owner, diagnostic
+artifact, baseline/candidate and controls, correctness proof, before/after metrics
+and spread, protected workload effects, keep/revert recommendation and maintainer
+disposition. Audit REQ-025's individual CPU changes and REQ-026's shard comparisons;
+one combined write result is not their individual proof. Preserve WAL/fence/replay,
+backpressure and accounting even if an older faster run omitted their cost.
+Measure scan-accounting overhead independently. Separate profiled diagnosis from
+normal unprofiled effect measurements. Repeat independent runs when noise makes
+the decision unsettled; within-process repetitions do not establish between-run
+noise, and no tolerance is invented after seeing results.
+
+Reuse compatible Verification/Gateway evidence; otherwise locate the current
+cost and collect its controlled before/after comparison. Reuse or collect the
+required same-build ordinary-export versus disabled-export diagnostic comparison,
+never subtracting it from final server costs. Do not change already-correct
+production behavior to manufacture activity. Unknown causes and incompatible
+baselines do not establish that a change was ineffective: finish available
+diagnosis and make any remaining gap explicit in the requested disposition.
+
+### V-CHECKS — affected correctness and static proof
+
+Run focused tests, then affected owner checks. Required format/lint commands are
+`mise run fmt` and `mise run lints`. Use `mise run codegen:check` for changed
+contracts/generated consumers, `mise run check:deps` for tier/fork changes and
+`mise run check:tenant-isolation` for affected query/tenant paths. Repair the
+outstanding Bifrost failures and run `mise run verify:bifrost` once on the final
+candidate. For Verification/Gateway production changes, inspect the actual write
+set and record/run existing owning checks and each new test's focused command.
+Unit suites cannot replace required journeys. Broad whole-change aggregates and
+unaffected language suites belong to final change review, not this task.
+Benchmarks remain manual and outside test gates.
+
+### V-L1 — complete release-process evidence
+
+Run for the restored baseline before optimization and for the accepted integrated
+candidate, serially and exclusively on a quiet host. Build through existing bench
+tasks: the measured server builds separately with only `bench`, preventing driver
+test-support feature leakage. Final records must cover all five experiments on
+the same candidate; later changes require replacement of affected records.
 
 ```sh
-mise exec -- scripts/postgres/with-test-postgres.sh -- bash -lc 'mise run db:migrate:inner && cargo nextest run --locked -p wyrd-testing --test oracle -P journey --run-ignored=all -E "test(=peer_network::security::remote_shredded_projection_preserves_results_and_rejects_tampering)"'
+mise run bench:l1:bifrost:writes
+mise run bench:l1:bifrost:hot
+mise run bench:l1:bifrost:parquet
+mise run bench:l1:verification
+mise run bench:l1:gateway
+mise run bench:results
 ```
 
-## Acceptance by record
+Require full defaults, clean unprofiled source, three repetitions, exact/integrity
+checks and normal configuration. Budgets: 480 s writes, 300 s for each other
+experiment. Preserve eligible records under either verdict in the existing
+`benchmark-records` workflow; do not rewrite immutable results or commit/push
+without authorization. Dirty, selected, smoke and profiled runs are diagnostic
+only. An INVALID final run needs diagnosis and a valid replacement.
 
-| Reference record under `benchmarks/history/bifrost/` | Required comparison |
+### V-REPORT — every step and explicit approval
+
+Show all default steps, not selected winners: all recorded server/client latency
+quantiles, CPU/work, work/CPU-second, throughput/core and vCPU, row/byte metrics
+with their source definitions, relevant phases/backlog/storage, verification
+tails and gateway capture. Retain each repetition, median/minimum/maximum/spread,
+record paths, host/compiler, controls, denominators, budget and omissions. No
+aggregate replaces step results. Regenerate reports and reconcile their values.
+
+Separate restored-baseline and whole-packet comparisons; state compatibility:
+
+| Reference | Permitted interpretation |
 |---|---|
-| `hot/20261029T180639Z-471f69ff9.json` | Every matching hot step, both sources; shredded memtable 36.63 ms / 185.9 CPU ms/query, staged 98.57 / 258.8 / 19.71 MB/query; long-tail memtable 23.69 / 99.0, staged 59.74 / 164.0 / 19.71 MB/query. Historical missing memory bytes stay missing. |
-| `hot/20261027T171701Z-434aaf5c1.json`, `hot/20261029T154823Z-12fc33f08.json` | Historical `point-c1` and `point-c64` compare to current `point-memtable-c1/c64` by an explicit table mapping only; do not rename current IDs. Earlier 861–886 queries/CPU-s and 4.22–4.31 ms server p99 versus 794 and 4.90 in 471f69ff9. Note changed mixed-source fixture controls. |
-| `parquet/20261029T134546Z-459617bae.json` | All matching parquet steps; shredded c1 16.92 / 75.5 / about 18 MB/query, long-tail c1 37.49 / 194.9 / about 29.4 MB/query. Preserve the warehouse path. |
+| Fresh restored `07a157cb9` baseline | Primary controlled before/after with fixed controls. |
+| Hot `20261029T180639Z-471f69ff9`; Parquet `20261029T134546Z-459617bae` | Immediate pre-attempt context when declarations/controls match. |
+| Early standardized Parquet `434aaf5c1`; writes `eaa8ad209` | Packet context for matching controls, not an invented pre-packet baseline. |
+| Older hot `434aaf5c1` / `12fc33f08` | Different fixture, latter INVALID: recovery targets only, no like-for-like claim. |
+| Reverted attempt `9a6e15750` | Historical failed-attempt observations, not current performance. |
+| Missing Verification/Gateway historical records | Mark unavailable. Only obtain historical comparisons if the same contract runs without rewriting old production behavior. Fresh final records alone prove no packet-wide improvement. |
 
-Recompute figures from records. Ratios use corresponding staged/memtable steps
-in the same record; a smaller ratio cannot pass if memory got slower.
+Preserve earlier goals alongside unchanged declaration targets: hot shredded
+p99 and CPU/query improve for both sources; staged/memory ratios shrink without
+slower memory; point memtable c1 recovers at least 861 queries/CPU-second and c64
+server p99 at most 4.31 ms; matching Parquet steps do not regress latency, CPU or
+scan bytes against `459617bae`. Historical point goals are not causal evidence.
+Include the existing Verification, Gateway and OTLP targets unchanged.
 
-| Record | Acceptance target |
+Every miss/regression/unsettled result needs diagnosis, controlled attempts and
+effectiveness, recommendation, remaining cost and explicit maintainer approval.
+Targets remain met/missed/unsettled, independent of VALID/INVALID. **No completion
+until the maintainer approves the remaining target misses and optimization
+dispositions.** This does not silently waive correctness or required function.
+Update TASK-007's open evidence and current task results without erasing history.
+Independent task/change review still apply; deferred L2 work remains deferred.
+
+## Maintainer revision — gateway capture backpressure (2026-10-29)
+
+Directed by the maintainer after Stage 1, and executed ahead of Stages 2–4.
+
+**Finding.** Gateway capture is the only Scribe outbox producer whose loss is
+caused by load. Verification reserves a slot and refuses its caller
+(`WYRD_VERIFICATION_429_STAGING_FULL`); Bifrost and the outbox writer retry
+Scribe backpressure. Gateway capture calls `Outbox::stage` after the caller has
+its answer (`invocation.rs:1057`). Since `2348d34d8` that sheds once the
+unreserved share is full. `f7b962d9e` had already deleted the
+retry-until-deadline capture writer that `wyrd-design.md` still describes. At
+`chat-capture.c64`, 88% of handed-over outbox items were shed. The gateway
+counted every capture as `staged` (`capture.rs:589`) because `stage` never
+reports a shed item.
+
+**Decision.**
+
+1. A call whose capture policy is not `Disabled` reserves one Scribe outbox
+   slot during admission, before the ledger charges it.
+2. While the outbox refuses the reservation, admission backs off and retries
+   until the call's deadline. The caller is slowed: this is backpressure.
+3. If no slot is admitted by the deadline, the call is refused with the
+   retryable `WYRD_GATEWAY_429_CAPTURE_STAGING_FULL` with
+   `details.retry_after_seconds`, as gateway limit refusals already do.
+   Nothing is charged and no provider is called.
+4. The capture is staged on that slot, so it is never shed. Its remaining
+   drops are capture's own counted reasons (payload, storage, deadline).
+5. Audit staging is unchanged: audits never block.
+
+`wyrd-design.md` changes with the code.
+
+**Target.** The direct Verification benchmark sustains about 75,000 requests/s
+through the same Scribe outbox without loss. About 10,000 requests/s with
+shedding is not acceptable for Gateway, and the disk is not an accepted
+explanation for capture loss. Gateway capture must lose nothing at every
+declared step. Its throughput gap to Verification is a Stage 4 ledger item that
+needs causal profiles, not a waiver.
+
+Gateway-induced server latency targets the same bound as Verification:
+overhead p99 < 500 µs at 64 clients for `chat`, `chat-stream` and
+`chat-capture`. This is the existing declared `overhead-p99` criterion.
+Baseline: 0.524, 0.239 and 4.04 ms. The capture-slot wait is part of
+admission, so it counts toward overhead. Backpressure makes overload visible
+as latency instead of hiding it as loss, but it does not meet the target:
+the capture path itself must become cheap enough.
+
+**Gateway profiles and labeling (Stage 4).**
+
+- Record per-phase capture timing for request-content resolution, object
+  persist (get, put, read-back), the admission wait and outbox staging-to-write,
+  reusing the experiment's HDR timing owner.
+- Record capture objects and bytes written per call.
+- Label outbox loss and write counts by write kind (`audit`, `capture`,
+  `result`, `inputs`, `spans`). This lets a record name which items were lost
+  instead of one mixed `shed` total.
+- Count admission refusals under the new code.
+- Profile `chat-capture.c64` with `--profile` and attribute server CPU to those
+  phases before proposing any capture optimization.
+
+**Proof.**
+
+- Focused RED, then GREEN: a full outbox makes a capturing call wait, then
+  refuse with `WYRD_GATEWAY_429_CAPTURE_STAGING_FULL`. A slot freed before the
+  deadline admits the call, and its capture is written, not shed.
+- The existing V-OTHER gateway capture tests.
+- `codegen:check` for the new error code.
+- A clean `bench:l1:gateway` record compared with
+  `gateway/overhead/20261030T010016Z-07a157cb9.json`.
+
+### Gateway capture backpressure — implementation evidence
+
+| Criterion | Implementation | Verification | Result |
+|---|---|---|---|
+| A capturing call reserves its slot at admission, waits until its deadline, then refuses with `WYRD_GATEWAY_429_CAPTURE_STAGING_FULL`, uncharged and undispatched | `invocation.rs` `GatewayInvocation::capture_slot`, `AdmittedCall::capture_slot`; `error.rs` `GatewayCaptureStagingFull` | RED: the call was admitted and dispatched (`GatewayDeadlineExceeded`). GREEN: `components::gateway::pg_invocation_tests::capturing_call_waits_for_a_capture_slot_and_refuses_at_its_deadline` | PASS |
+| The capture is staged on its reserved slot, never shed | `GatewayInvocation::capture` | same test (a freed slot admits the call and its row is written); L1 `capture_shed` 0 | PASS |
+| Existing gateway, outbox and HTTP error behavior holds | — | `components::gateway::`, `scribe_outbox::`, `http::error::` under test Postgres: 90/90; `wyrd-spec` error tests 49/49 | PASS |
+| Contracts and docs | TS `error-codes.ts` regenerated; `api/errors.md` row; `wyrd-design.md` capture paragraph | `mise run codegen:check`, `mise run fmt`, `mise run lints`, `git diff --check` | PASS |
+
+Commands:
+
+```sh
+mise exec -- scripts/postgres/with-test-postgres.sh -- cargo nextest run --locked -p wyrd-server --lib --features test-support -E 'test(=components::gateway::pg_invocation_tests::capturing_call_waits_for_a_capture_slot_and_refuses_at_its_deadline)'
+mise exec -- scripts/postgres/with-test-postgres.sh -- cargo nextest run --locked -p wyrd-server --lib --features test-support -E 'test(/^components::gateway::/) | test(/^scribe_outbox::/) | test(/^http::error::/)'
+```
+
+Diagnostic L1: `bench:l1:gateway -- --allow-dirty` →
+`target/benchmarks/gateway/overhead/20261030T015633Z-07a157cb9.json` (VALID,
+dirty tree, so diagnostic only), against the clean baseline
+`20261030T010016Z-07a157cb9`:
+
+| Step | overhead p99 ms | req/s | shed | CPU µs/req |
+|---|---|---|---|---|
+| `chat.c1` | 0.202 → 0.200 | 5,371 → 5,437 | 0 → 0 | 234 → 231 |
+| `chat.c64` | 0.524 → 0.513 | 50,134 → 50,503 | 0 → 0 | 386 → 389 |
+| `chat-stream.c1` | 0.429 → 0.380 | 24 → 24 | 0 → 0 | 5,372 → 5,372 |
+| `chat-stream.c64` | 0.239 → 0.242 | 1,550 → 1,547 | 0 → 0 | 971 → 981 |
+| `chat-capture.c1` | 0.758 → 0.755 | 1,680 → 1,608 | 0 → 0 | 1,165 → 1,227 |
+| `chat-capture.c64` | 4.04 → 429 | 10,166 → 3,428 | 90,998 → 0 | 2,088 → 2,999 |
+
+What the diagnostic run shows:
+
+- **Shedding is gone.** The loss became admission wait: payload
+  `chat-capture.c64` sustains about 3.4k calls/s, and its overhead p99 is the
+  backpressure wait.
+- **Throughput is not the outbox.** Metadata capture (`chat.c64`) sustains
+  about 50k calls/s through the same outbox with nothing shed.
+- **Payload capture is expensive.** It now pays for every capture it writes:
+  about 3.0 ms of server CPU per call, against 0.39 ms for metadata. That cost
+  is the Stage 4 profiling target.
+- **No 429 refusals occurred.** Public calls have a 5-minute deadline.
+
+Not covered: no HTTP journey drives the 429. The public 5-minute deadline
+makes it impractical without a test-only deadline control.
+
+## Maintainer revision — gateway capture cost (2026-10-29)
+
+Approved by the maintainer after the capture diagnosis below.
+
+**Cases.** Each L1 case id is named for its answer delivery, message size,
+and the tenant's `GatewayCaptureMode`. The id is also the benchmark case label
+the server records. A new case isolates message size from payload capture:
+
+| Case | Request and answer | Delivery | Stored per call | Isolates |
+|---|---|---|---|---|
+| `buffered-1kib-capture-metadata` | 1 KiB | one response | call record | baseline |
+| `streamed-1kib-capture-metadata` | 1 KiB | 32 events | call record | streaming |
+| `buffered-64kib-capture-metadata` (new) | 64 KiB | one response | call record | message size |
+| `buffered-64kib-capture-payload` | 64 KiB | one response | call record, request and response text | payload capture |
+
+The former ids were `chat`, `chat-stream` and `chat-capture`.
+
+**Diagnosis.** Profiled run `20261030T024210Z` (VALID, dirty), at 64 clients:
+
+| Case | req/s | CPU µs/call | overhead p99 | disk write |
+|---|---|---|---|---|
+| `buffered-1kib-capture-metadata` | ~51,000 | 384 | 0.50–0.53 ms | ~16 MB/s |
+| `buffered-64kib-capture-metadata` | ~15,500 | 1,250 | 2.2 ms | ~8 MB/s |
+| `buffered-64kib-capture-payload` | ~3,400 | ~3,400 | 428 ms | ~5 MB/s |
+
+- **Request path.** At 1 KiB, the tracing subscriber stack takes about 95 µs per
+  call, across about 12 spans, and every span reaches the OpenTelemetry layer
+  through the tenant-catalog filter. The HTTP metrics middleware takes about
+  30 µs. Upstream TCP connects in steady state take about 10 µs. Capture is
+  about 26 µs.
+- **Write pattern.** TASK-006-R1 kept the bulk capture projection.
+  Verification and audit stage owned scalars and encoded Variant cells, built
+  on the producer's task. Captures stage JSON text, and `CallCapture::project`
+  decodes and Variant-encodes it inside the serial lane write
+  (`ScribeSink::frames`). That is about 11% of server CPU in the payload case.
+- **Scribe.** At 16 writers and lanes instead of 4, payload throughput stayed
+  at about 3.5k/s while CPU per call rose to about 5,800 µs. Writes in flight
+  went from 2.1 to 11.5, and each write went from 11 to 67 ms, mostly
+  `shard_wait`, `wal_append` and `visibility`. The shard's commit stages use
+  about 0.01 cores. Their time is the WAL thread waiting on write and
+  `fdatasync`, the disk-sync limit TASK-006-R2 found. Verification was
+  unchanged (68–72k/s). The change was reverted.
+- **Workload.** The 64 KiB filler is `"x"` repeated, which compresses to almost
+  nothing, so every disk and WAL figure for it is optimistic.
+
+**Decision.**
+
+1. The 64 KiB request and stub answer carry deterministic text that
+   compresses like natural-language chat, not one repeated byte.
+2. Request-path CPU is reduced at its owners. The upstream client reuses
+   connections, and per-call span and metric cost is cut. Changing which spans
+   the tenant span copy contains follows the owning `wyrd-design.md` section
+   first.
+3. This reverses TASK-006-R1's capture decision. A capture stages its row
+   pre-encoded, as Verification does: owned scalars and encoded Variant cells
+   built on the capture task, appended at drain without re-encoding. Redaction,
+   canonicalization and the capture privacy policy are unchanged.
+4. Not in this revision: storing large bodies as objects referenced from the
+   row needs `$wyrd-spec`. It is considered only if steps 1–3 miss the target.
+   Scribe, its shard count and its writer and lane bounds are unchanged.
+
+**Target.**
+
+- Overhead p99 < 500 µs at 64 clients for every case, including
+  `buffered-64kib-capture-payload`.
+- Every case loses nothing.
+- Payload-capture throughput is reported as captured content bytes per second
+  on the realistic workload. 75,000 calls/s at 128 KiB is about 9.6 GB/s, so
+  Verification's call rate is not a target for payload capture.
+
+### Gateway capture cost — implementation evidence
+
+Run `20261030T034414Z` (gateway) and `20261030T034734Z`
+(`direct-verify-c64`), both `--allow-dirty` under `target/benchmarks/`. Both
+are INVALID only for `driver.saturated`: the driver used more than 6.4 of its
+8 cores in `buffered-64kib-capture-metadata.c64` and `direct-verify-c64`. Every
+correctness, capture-loss and shed criterion was met.
+
+| Step (c64) | Before (`20261030T024210Z`) | After | Overhead p99 |
+|---|---|---|---|
+| `buffered-1kib-capture-metadata` | ~51k/s, 384 µs CPU/call, 0.50–0.53 ms | 55.2k/s, 358 µs | 0.492 ms, met |
+| `streamed-1kib-capture-metadata` | — | 1.5k/s | 0.259 ms (end 0.252), met |
+| `buffered-64kib-capture-metadata` | ~15.5k/s, 1,250 µs, 2.2 ms | 17.1k/s, 1,106 µs | 1.95 ms, missed |
+| `buffered-64kib-capture-payload` | ~3.4k/s, ~3,400 µs, 428 ms | 3.9k/s, 2,824 µs | 427 ms, missed |
+| `direct-verify-c64` | 69.3k/s, 0.428 ms | 72.8k/s | 0.352 ms, met |
+
+Payload capture stores about 3,875 × 128 KiB ≈ 508 MB/s of captured content.
+
+| Step | Implementation | Verification |
+|---|---|---|
+| 1. Realistic text | `GatewayCapture::prose` in `wyrd-testing/src/gateway_capture.rs`, used by the workload and the stub | capacity bin tests 50/50 |
+| 2. Connection reuse | `POOL_MAX_IDLE_PER_HOST` in `skald-providers/src/endpoint.rs` | `wyrd-skald-providers` lib 48/48 |
+| 2. Span cost | OTel layer without busy/idle, thread or location fields, in `wyrd-telemetry/src/lib.rs` | `wyrd-telemetry` lib 33/33 |
+| 3. Pre-encoded capture | `CallCapture::{request,response}` encoded in `redacted_payload` on the capture task; `calls_batch` appends them and no longer serializes payload text | `components::gateway::` and `scribe_outbox::` 81/81 with Postgres; journeys `typed_builtin_payloads_are_queryable` and `variant_sql_registry_covers_every_session` pass; `mise run lints` clean |
+
+Result: the 1 KiB and streamed cases meet the target, and Verification did not
+regress. Steps 1–3 cut per-call CPU by 7–17%, but both 64 KiB c64 cases still
+miss. The payload p99 is unchanged at 427 ms, so payload encoding on the lane
+was not what limits it. Per item 4, the next step needs `$wyrd-spec` and
+maintainer direction.
+
+## Material Stop Conditions
+
+Stop for required authority to change security, durability, logical results,
+assignment/schema proof or lease semantics; public/persisted contracts,
+dependencies/features or owners; default workloads/targets; prohibited machinery;
+or approved functional outcomes. Revision 22's approved private projection
+change is in scope with coordinated consumers and fail-closed proof. Missing
+local services, red gates and recoverable failures require diagnosis and repair,
+not a handoff. Rejecting an ineffective implementation does not waive the shared
+reader/shredding outcome; bring measured evidence for any proposed spec decision.
+Pending performance approval leaves acceptance pending. Do not begin L2 work.
+
+## Authority Links
+
+- [Approved revision 22](../spec.md), including L1-only delivery and the hot
+  read-path supplement; current maintainer direction is recorded above.
+- [Repository rules](../../../../AGENTS.md), [testing](../../../../TESTING.md),
+  [spec-driven development](../../../spec-driven-development.md), and
+  [implementation execution](../../../implementation-execution.md).
+- [Bifrost authority](../../../../architecture/bifrost-design.md).
+
+## Stage 1 evidence — restored baseline and diagnosis
+
+Executed 2026-10-30 on `07a157cb9`, whose runtime is byte-identical to
+`471f69ff9`: `git diff 471f69ff9 07a157cb9` touches only `architecture/`,
+`spec.md` and the two task files, and the release server is 1,221,643,760 bytes
+in both builds. No production or test code changed. The only uncommitted
+tracked change, this task file, was moved aside for the five records so that
+`git diff HEAD` was empty (each record says `dirty: false`), then restored
+byte for byte (SHA-256 `4ff80f1e…9331`). This stage is not a task verdict.
+
+### Controls
+
+| Item | Value |
 |---|---|
-| Full hot | VALID within 300 s; both shredded source steps improve p99 and CPU/query against 471f69ff9; staged/memtable p99 and CPU ratios shrink. Point memtable c1 reaches at least 861 queries/CPU-s; c64 server p99 is at most 4.31 ms. |
-| Full parquet | No latency, CPU or scanned-byte regression on matching steps against 459617bae; no invented tolerance. |
+| Host | AMD Ryzen 9 9950X, 32 CPU / 91 GiB, Pop!_OS 24.04 x86_64; other-process load 0.87–0.96 cores before each run (limit 3.2) |
+| Build | `mise run bench:build`: release, rustc 1.99.0 (b940084d7), `-C force-frame-pointers=yes`, line-tables-only; server built alone with `bench` |
+| Order | serial and exclusive: writes → hot → parquet → verification → gateway, then two diagnostic hot runs; nothing else built or tested meanwhile |
+| Declarations | every experiment ran full defaults (no `--steps`, `--profile`, `--smoke` or `--allow-dirty`); hot, parquet and writes controls, criteria and variables equal their reference records' |
 
-Historical point figures remain absolute recovery targets despite changed
-fixture controls, not proof of a like-for-like regression or its cause. Report
-each miss as unfinished performance acceptance. A valid performance miss stays
-VALID; these targets introduce no benchmark verdict rules. Do not promise
-staged/memory parity or attribute gains without measurements.
+### Obligation inventory and historical compatibility
 
-## Closeout
+| Obligation | State at the restored baseline | Owning stage |
+|---|---|---|
+| REQ-029–033 real-SQL shredding | Rolled back. Learned layouts are read, but both sources rebuild the whole `attributes` Variant (profiles below) | 2 |
+| REQ-034 shared staged/published reader | Rolled back. Staged runs still use the uncached `HotObjects::Staged` reader | 3 |
+| REQ-006 time pruning without warnings | RED reproduces: 19,104 `datafusion_common::pruning: Failed to convert min values to array for column start_time_unix_nano` WARNs in one hot diagnostic run; fork pin back at `19796a13e`, fix `8d6d6bf58` still pushed | 4 |
+| REQ-029–030 memory scan facts | Absent: memtable steps report no `scanned_bytes_per_query` or rows | 4 |
+| REQ-019/024 Gateway capture | Correctness criterion fails: `chat-capture.c64` sheds about 89% of captures; Gateway has no VALID L1 record | 4 |
+| Verification L1 validity | Harness drift: `experiment.rs:2290-2298` still judges `driver.saturated` in full runs (added `aaa152dd4`), although revision 17 makes driver CPU context only (spec rule 6; REQ text "Driver CPU is never judged"). It is the only reason the baseline is INVALID | owner: `wyrd-testing` `experiment.rs` validity; not repaired in this stage |
+| REQ-025/026 write CPU and shard comparisons | TASK-007's per-change proof (Task 9 table) is still the only per-change evidence; nothing new in this stage | 4 |
+| `verify:bifrost` | Seven failures recorded on `3b7f9d5af` and `471f69ff9`; not rerun here (no code change) | 4/5 |
+| TASK-007 revision 20 closeout | Its README and `bifrost-design.md` rows for the staged reader, live projection and memory facts no longer apply (already noted in TASK-007) | 3/4 |
+| L2 | Deferred, untouched | — |
 
-Run `mise run fmt`, `mise run lints` and `mise run codegen:check` for changed
-contracts, then `mise run verify:bifrost` on the integrated candidate. Record
-actual failures and repairs. Update `architecture/bifrost-design.md` for live
-expression projection and the shared local planning/cached reader; retain its
-existing bench-only stage/publish controls, platform-admin `tenant_suspend`
-and nonblocking `platform.authz` audit. Close TASK-007's outstanding gate and
-evidence without erasing history. Add a compact implementation/verification/
-result table and step-ID comparisons here, with every performance miss explicit.
+Historical comparisons follow V-REPORT. The hot reference
+`20261029T180639Z-471f69ff9` runs the same binary as this baseline, so hot is
+an **A/A pair**. Parquet's `20261029T134546Z-459617bae` and writes'
+`20261029T120649Z-e4b65f4d0` have equal controls but 8 and 17 intervening code
+commits respectively, so they are context, not attribution. Writes
+`eaa8ad209` has different criteria, so it is packet context only. Verification
+and Gateway have no record in `benchmarks/history`; their historical columns
+are unavailable. `9a6e15750` is failed-attempt history only.
 
-Stop if implementation requires weakening tenant proof, logical results,
-fail-closed decoding, leases, durability or a non-goal. If cache validation
-cannot be confirmed, stop before relying on path keys. If B cannot reproduce
-the warning, retain it as open and collect real inputs rather than guess a fix.
+### Shared-owner audit
+
+Every L1 engine runs one path: `main.rs::level` → `levels::base` (host,
+source and build) → the engine `plan` (`query/mod.rs:462`,
+`verification/mod.rs:207`, `gateway/mod.rs:178`) → `levels::select`/`smoke` →
+`levels::execute` → `experiment::run` → `Record::publish`. The workloads
+(`query/isolated.rs::Isolated`, `verification/run.rs::Bench`,
+`gateway/run.rs::Overhead`) implement `experiment::Workload` and judge through
+the shared `Reading::percentile` and `Population::percentiles`. No engine has
+its own percentile, validity or record path. No gap was found and no change
+was needed.
+
+### Regression proof
+
+| Command | Result |
+|---|---|
+| `cargo nextest run --locked -p wyrd-testing --lib -E 'test(/^experiment::tests::/)'` | 14/14 PASS |
+| `-p wyrd-testing --bin capacity` (the three V-STANDARD selectors) | 3/3 PASS |
+| `-p wyrd-server --lib` (the five V-OTHER selectors) | 5/5 PASS |
+
+### L1 baseline records
+
+All five are under `benchmarks/history/` (the uncommitted `benchmark-records` worktree).
+
+| Experiment | Record | Verdict | Elapsed / budget | Reason |
+|---|---|---|---|---|
+| writes-parquet | `bifrost/writes-parquet/20261030T004200Z-07a157cb9.json` | VALID | 440.3 s / 480 s | — |
+| hot | `bifrost/hot/20261030T004925Z-07a157cb9.json` | VALID | 221.2 s / 300 s | — |
+| parquet | `bifrost/parquet/20261030T005310Z-07a157cb9.json` | VALID | 285.8 s / 300 s | — |
+| verification | `verification/direct-verify/20261030T005903Z-07a157cb9.json` | **INVALID** | 69.2 s / 300 s | only reason: `driver.saturated` at `direct-verify-c64` (7.20, 7.21, 7.28 cores > 6.40). The approved spec never judges driver CPU, so this INVALID is harness drift; no condition the spec judges is broken |
+| gateway | `gateway/overhead/20261030T010016Z-07a157cb9.json` | **INVALID** | 151.3 s / 300 s | `criterion.invalid` `chat-capture.c64/capture-shed`: 94,708, 90,998 and 89,788 items shed at the outbox limit (88–89% of outbox items) |
+
+Both INVALID causes are the same ones TASK-006-R1 recorded, and both repeat
+with tight spread in every repetition, so they are not host noise. They are
+broken baseline measurements, kept visible for repair, and neither is treated as
+valid. Performance values from those two records are shown below but
+judge nothing.
+
+Cells read `median (min–max)` over three repetitions; `ref` is the reference
+median and its change. Scaling and peak rows are derived from the steps shown
+and are omitted.
+
+#### Hot, against the A/A reference `471f69ff9`
+
+| Step | p99_ms | cpu_ms_per_query | queries_per_cpu_s | scanned_bytes_per_query |
+|---|---|---|---|---|
+| `point-memtable-c1` | 1.69 (1.67–1.73) · ref 1.54 +9.4% | 1.33 (1.32–1.34) · ref 1.26 +5.4% | 753.4 (745.8–758.5) · ref 793.9 -5.1% | — |
+| `point-memtable-c64` | 5.33 (5.22–5.38) · ref 4.9 +8.8% | 1.77 (1.77–1.77) · ref 1.74 +1.4% | 565.3 (565.0–566.6) · ref 573.1 -1.4% | — |
+| `point-staged-c1` | 3.33 (3.32–3.41) · ref 3.6 -7.5% | 2.89 (2.88–2.9) · ref 2.87 +0.8% | 346.1 (345.1–347.2) · ref 348.7 -0.8% | 222,512 (222,279–222,674) · ref 213,323 +4.3% |
+| `small-aggregate-memtable-c1` | 3.13 (3.13–3.21) · ref 2.9 +7.9% | 2.6 (2.55–2.63) · ref 2.43 +6.6% | 385.3 (380.8–392.9) · ref 410.9 -6.2% | — |
+| `small-aggregate-staged-c1` | 6.07 (5.99–6.16) · ref 5.62 +8.2% | 5.54 (5.52–5.54) · ref 5.22 +6.2% | 180.4 (180.4–181.1) · ref 191.6 -5.8% | 451,903 (451,841–451,935) · ref 439,677 +2.8% |
+| `span-shredded-memtable-c1` | 36.2 (35.9–36.3) · ref 36.6 -1.3% | 186.2 (185.4–186.6) · ref 185.9 +0.2% | 5.37 (5.36–5.39) · ref 5.38 -0.2% | — |
+| `span-shredded-staged-c1` | 93.1 (93.0–94.9) · ref 98.6 -5.5% | 262.5 (258.4–263.4) · ref 258.8 +1.4% | 3.81 (3.8–3.87) · ref 3.86 -1.4% | 19,709,951 (19,709,951–19,709,951) · ref 19,709,951 +0.0% |
+| `span-long-tail-memtable-c1` | 23.2 (23.2–23.2) · ref 23.7 -2.3% | 98.8 (98.6–98.9) · ref 99.0 -0.3% | 10.1 (10.1–10.1) · ref 10.1 +0.3% | — |
+| `span-long-tail-staged-c1` | 61.2 (60.6–62.4) · ref 59.7 +2.5% | 165.2 (165.2–165.2) · ref 164.0 +0.7% | 6.05 (6.05–6.05) · ref 6.1 -0.7% | 19,709,951 (19,709,951–19,709,951) · ref 19,709,951 +0.0% |
+
+The same binary moved point and small-aggregate steps by 5–9% in p99 and up to
+6.6% in CPU/query between these two runs. Staged scanned bytes moved by 2.8–4.3%:
+the fixture's staged files are not byte-identical between runs. Span steps
+agree within 2.5% (CPU within 1.4%). Two consequences: this host's between-run
+noise on small queries exceeds most of the deltas the failed attempt reported
+(for example point memtable CPU +3.1%), and no point or small-aggregate change
+below about 9% can be attributed from one run per side. That is an
+observation, not an invented tolerance. Effect measurements need repeated
+independent runs on each side.
+
+#### Parquet, against `459617bae` (context, 8 code commits apart)
+
+| Step | p99_ms | p95_ms | cpu_ms_per_query | queries_per_cpu_s | scanned_bytes_per_query | scanned_rows_per_query |
+|---|---|---|---|---|---|---|
+| `point-c1` | 3.21 (3.19–3.41) · ref 2.89 +11.1% | 2.82 (2.78–2.96) · ref 2.54 +11.0% | 2.35 (2.35–2.43) · ref 2.16 +9.0% | 424.6 (411.7–426.0) · ref 462.9 -8.3% | 197,552 (197,457–197,717) · ref 181,370 +8.9% | 1 (1–1) · ref 1 +0.0% |
+| `point-c64` | 12.6 (12.4–12.9) · ref 10.8 +17.0% | 10.1 (9.99–10.3) · ref 8.75 +15.8% | 3.78 (3.77–3.84) · ref 3.5 +8.0% | 264.5 (260.3–264.9) · ref 285.6 -7.4% | 197,567 (197,563–197,582) · ref 181,411 +8.9% | 1 (1–1) · ref 1 +0.0% |
+| `small-aggregate-c1` | 6.16 (6.09–6.31) · ref 5.78 +6.6% | 5.67 (5.64–5.75) · ref 5.35 +6.0% | 5.38 (5.31–5.39) · ref 5.08 +6.0% | 185.9 (185.7–188.5) · ref 197.0 -5.6% | 516,397 (516,350–516,926) · ref 496,285 +4.1% | 100,031 (100,031–100,031) · ref 100,031 +0.0% |
+| `full-scan-c1` | — | 51.7 (51.4–52.5) · ref 52.7 -1.7% | 465.8 (464.0–471.8) · ref 467.4 -0.4% | 2.15 (2.12–2.16) · ref 2.14 +0.4% | 248,512,511 (248,512,511–248,512,511) · ref 248,512,511 +0.0% | 10,002,431 (10,002,431–10,002,431) · ref 10,002,431 +0.0% |
+| `span-trace-c1` | 4.62 (4.58–5.24) · ref 4.37 +5.7% | 4.15 (4.11–4.47) · ref 3.98 +4.3% | 3.98 (3.97–4.1) · ref 3.8 +4.9% | 251.1 (243.7–252.2) · ref 263.5 -4.7% | 687,587 (686,641–690,693) · ref 688,315 -0.1% | 8 (8–8) · ref 8 +0.0% |
+| `span-trace-c64` | 25.4 (25.3–26.1) · ref 23.6 +7.6% | 21.3 (21.3–21.6) · ref 20.0 +6.8% | 7.08 (7.07–7.12) · ref 6.93 +2.2% | 141.3 (140.5–141.5) · ref 144.4 -2.1% | 689,673 (689,556–689,743) · ref 689,045 +0.1% | 8 (8–8) · ref 8 +0.0% |
+| `span-shredded-c1` | 17.3 (17.1–17.5) · ref 16.9 +2.2% | 16.2 (15.9–16.3) · ref 16.3 -0.7% | 75.2 (74.6–75.9) · ref 75.5 -0.4% | 13.3 (13.2–13.4) · ref 13.2 +0.4% | 18,006,015 (18,006,015–18,006,015) · ref 18,006,015 +0.0% | 62,527 (62,527–62,527) · ref 62,527 +0.0% |
+| `span-long-tail-c1` | 37.9 (37.8–38.8) · ref 37.5 +1.2% | 36.7 (36.3–37.0) · ref 36.1 +1.6% | 198.4 (197.5–198.6) · ref 194.9 +1.8% | 5.04 (5.04–5.06) · ref 5.13 -1.7% | 29,442,047 (29,442,047–29,442,047) · ref 29,442,047 +0.0% | 977.0 (977.0–977.0) · ref 977.0 +0.0% |
+
+Point lookups scan 8.9% more bytes (197.6 kB vs 181.4 kB) for the same one row.
+Without a same-code repeat of `459617bae` this cannot be split into code
+change versus fixture layout; the hot A/A pair shows staged bytes moving by
+4% on identical code.
+
+#### Writes-parquet, against `e4b65f4d0` (context, 17 code commits apart)
+
+| Step | rows_per_s | cpu_us_per_row | p99_ms | wire_mib_per_cpu_s | peak_mib | memtable_backlog_mib | staged_backlog_mib |
+|---|---|---|---|---|---|---|---|
+| `otlp-spans-c1` | 42,589 (40,235–49,758) · ref 44,638 -4.6% | 16.1 (12.6–18.5) · ref 15.3 +5.5% | 18.1 (13.5–19.9) · ref 15.2 +19.0% | 20.0 (17.4–25.6) · ref 21.1 -5.2% | 1,940 (1,116–1,959) · ref 1,950 -0.5% | 433.6 (91.6–475.4) · ref 489.7 -11.4% | 42.4 (42.4–84.8) · ref 75.7 -43.9% |
+| `otlp-spans-c64` | 279,818 (272,453–389,965) · ref 264,414 +5.8% | 20.8 (20.8–21.9) · ref 20.1 +3.8% | 209.6 (185.2–225.7) · ref 224.0 -6.4% | 15.5 (14.7–15.5) · ref 16.1 -3.6% | 3,156 (2,949–3,205) · ref 2,930 +7.7% | 685.9 (590.7–1,028) · ref 576.5 +19.0% | 493.2 (402.4–584.3) · ref 722.7 -31.8% |
+| `otlp-spans-1k-c1` | 21,500 (20,528–21,706) · ref 22,266 -3.4% | 39.6 (39.4–56.2) · ref 40.6 -2.3% | 28.5 (26.5–33.2) · ref 29.4 -3.2% | 25.4 (17.9–25.5) · ref 24.8 +2.3% | 2,483 (2,479–2,519) · ref 2,603 -4.6% | 445.4 (360.2–538.0) · ref 409.8 +8.7% | 45.9 (23.0–81.4) · ref 105.3 -56.4% |
+| `otlp-spans-1k-c64` | 133,691 (132,035–135,840) · ref 122,109 +9.5% | 47.3 (46.2–47.5) · ref 45.5 +3.8% | 328.5 (314.0–329.5) · ref 328.5 +0.0% | 21.3 (21.2–21.7) · ref 22.1 -3.7% | 3,626 (3,601–3,679) · ref 3,607 +0.5% | 861.2 (776.3–911.4) · ref 991.7 -13.2% | 260.0 (184.0–316.1) · ref 352.4 -26.2% |
+| `otlp-logs-c1` | 41,259 (37,361–43,499) · ref 42,886 -3.8% | 19.8 (19.4–20.3) · ref 18.2 +8.7% | 17.0 (16.9–23.3) · ref 21.4 -20.9% | 60.3 (58.7–61.6) · ref 65.5 -8.0% | 3,294 (3,266–3,297) · ref 3,241 +1.6% | 565.5 (487.7–617.9) · ref 513.1 +10.2% | 181.1 (120.8–241.4) · ref 339.7 -46.7% |
+| `otlp-logs-c64` | 275,558 (260,490–366,349) · ref 276,968 -0.5% | 27.6 (27.2–28.9) · ref 27.1 +1.8% | 219.8 (150.5–247.5) · ref 258.1 -14.8% | 43.3 (41.3–43.8) · ref 44.1 -1.8% | 4,867 (4,181–5,011) · ref 4,688 +3.8% | 1,394 (1,372–1,700) · ref 1,394 +0.0% | 1,877 (1,403–2,242) · ref 3,509 -46.5% |
+| `native-write-c1` | 853,472 (843,598–869,807) · ref 764,986 +11.6% | 1.56 (1.54–1.64) · ref 1.32 +18.7% | 164.8 (71.4–191.8) · ref 192.0 -14.2% | — | 2,942 (2,847–3,024) · ref 2,433 +20.9% | 702.4 (602.9–923.0) · ref 591.8 +18.7% | 124.2 (82.9–124.3) · ref 159.5 -22.2% |
+| `native-write-c64` | 2,522,490 (2,159,054–2,743,677) · ref 1,533,163 +64.5% | 2.41 (2.31–2.65) · ref 1.86 +30.0% | 1,211 (1,183–1,623) · ref 1,709 -29.1% | — | 5,968 (5,873–7,283) · ref 4,781 +24.8% | 2,646 (2,458–3,331) · ref 1,574 +68.1% | 543.3 (315.3–692.2) · ref 914.3 -40.6% |
+
+#### Verification (no historical record)
+
+| Step | overhead_p99_ms | p99_ms | cpu_us_per_verification | verifications_per_cpu_s | phase_stage_p99_ms | lost_writes |
+|---|---|---|---|---|---|---|
+| `direct-verify-c1` | 0.153 (0.15–0.16) | 0.154 (0.152–0.162) | 130.4 (126.9–145.7) | 7,668 (6,864–7,880) | 0.0415 (0.0402–0.0421) | 0 (0–0) |
+| `direct-verify-c64` | 0.445 (0.428–0.455) | 0.45 (0.43–0.458) | 253.1 (244.5–258.5) | 3,951 (3,868–4,089) | 0.0768 (0.0743–0.0774) | 0 (0–0) |
+
+#### Gateway (no historical record)
+
+| Step | overhead_p99_ms | p99_ms | cpu_us_per_request | requests_per_cpu_s | capture_staged | capture_shed |
+|---|---|---|---|---|---|---|
+| `chat.c1` | 0.202 (0.201–0.203) | 0.29 (0.289–0.291) | 233.8 (233.7–241.0) | 4,277 (4,150–4,280) | 26,862 (26,143–26,921) | 0 (0–0) |
+| `chat.c64` | 0.524 (0.522–0.528) | 1.63 (1.61–1.65) | 385.7 (384.1–392.4) | 2,593 (2,549–2,604) | 251,010 (249,259–253,468) | 0 (0–0) |
+| `chat-stream.c1` | 0.429 (0.392–0.716) | 0.751 (0.717–0.948) | 5,372 (5,372–16,198) | 186.2 (61.7–186.2) | 122.0 (122.0–122.0) | 0 (0–0) |
+| `chat-stream.c64` | 0.239 (0.236–0.362) | 0.483 (0.472–0.605) | 970.7 (965.6–981.6) | 1,030 (1,019–1,036) | 7,817 (7,800–7,842) | 0 (0–0) |
+| `chat-capture.c1` | 0.758 (0.729–0.796) | 0.991 (0.973–1.07) | 1,165 (1,151–1,553) | 858.1 (643.9–868.8) | 8,402 (8,230–8,505) | 0 (0–0) |
+| `chat-capture.c64` | 4.04 (3.93–4.2) | 8.18 (7.79–8.5) | 2,088 (1,957–2,095) | 478.9 (477.2–511.1) | 50,950 (50,631–53,686) | 90,998 (89,788–94,708) |
+
+#### Target status at the baseline
+
+Targets are reported independently of VALID/INVALID; a target in an INVALID
+record judges nothing.
+
+| Target | Baseline | Status |
+|---|---|---|
+| Hot `point-memtable-c64` p99 < 5 ms (declared) | 5.33 ms | missed |
+| Point memtable c64 p99 ≤ 4.31 ms; c1 ≥ 861 q/CPU-s (recovery goals) | 5.33 ms; 753.4 | missed; missed |
+| Parquet `point-c64` p99 < 5 ms (declared) | 12.6 ms (ref 10.8 ms, also missed) | missed |
+| Writes OTLP floor ≥ 30 wire MiB/CPU-s at `otlp-spans-peak` | 15.5 | missed; native floor (≥ 200k rows/s) met at 2.52M |
+| Verification overhead p99 < 0.5 ms at c64 | 0.445 ms | met; the record's only invalidity is the drifted driver check, so the target settles once that check is removed and the run repeated |
+| Gateway added overhead p99 < 0.5 ms at c64 | chat 0.524, chat-stream 0.239, chat-capture 4.04 ms | missed (chat, chat-capture); record INVALID |
+| Staged/memtable ratios, shredded / long-tail (to shrink later) | p99 2.57 / 2.64; CPU/q 1.41 / 1.67 | baseline |
+
+### Hot plans and profiles
+
+**Plan rendering is a missing observation.** Oracle accepts exactly one
+`SELECT` (`oracle/mod.rs:3438`), so there is no `EXPLAIN`. The only plan render,
+`wyrd::oracle::analytical` at debug (`analytical.rs:7241`), covers analytical
+multi-stage graphs. A diagnostic hot run with
+`WYRD_LOG=info,wyrd::oracle::analytical=debug` over the six span and
+small-aggregate steps (`target/benchmarks/bifrost/hot/20261030T010503Z-07a157cb9.json`,
+VALID, selected) logged no plan. Rendering an interactive query's executed
+plan needs a debug render at Oracle's interactive execution owner
+(`oracle/mod.rs`). That is instrumentation, so it is not added in this stage.
+The plan below is the executed operator chain read from the profile's call
+stacks, checked against the source.
+
+`SELECT COUNT(*) FROM spans WHERE start_time_unix_nano >= … AND < … AND attributes ->> 'region' = 'eu-west'`
+executes on both sources as:
+
+```text
+AggregateExec COUNT (leader)
+  FilterExec  time bounds AND variant_get(attributes, 'region') = 'eu-west'   (leader keeps it: live.rs:362-368, 570-572)
+    LiveScribeExec  required_columns = closure incl. whole `attributes`; predicate shipped to the Scribe
+      ScribeFragmentExecutor → ScribeTailResolver::resolve                       (in-process peer; IPC 0.1-0.3%)
+        memtable: FetchLiveTailService::open_capture → LiveCapture::read → ReadableSource::project
+        staged:   FileStream → PushDecoderStream (hot Parquet, uncached reader)
+```
+
+Profile: `mise run bench:l1:bifrost:hot -- --profile --steps span-shredded-memtable-c1,span-shredded-staged-c1`
+→ `target/benchmarks/bifrost/hot/20261030T010341Z-07a157cb9.json` (VALID,
+diagnostic), capture `…/20261030T010341Z/profiles/profile-978803.json.gz`,
+symbolicated against `target/profiling/release/wyrd-server` with `nm`. The
+measured window of each step (warmup excluded) is weighted by on-CPU samples:
+87,061 samples (≈87 s) for memtable, matching the record's 29 s per 5 s
+repetition, and 44,011 for staged. Shares are inclusive unless marked self.
+The profiled run measured 190 / 267 ms CPU per query (unprofiled baseline:
+186.2 / 262.5).
+
+| `span-shredded-memtable-c1` cost | Share |
+|---|---|
+| Scribe capture read `LiveCapture::read` | 70.9% |
+| └ whole-`attributes` reconstruction, `ReadableSource::project` → `schema::logical_column` → `unshred_variants` | 48.7% |
+| └ capture pre-filter `batch_filter`: `variant_get` on typed leaves 3.8%, filtering every physical column of the learned struct (`filter_record_batch`) 14.6% | 20.3% |
+| Leader `FilterExec` re-evaluating `variant_get` on the rebuilt Variants (outside the capture) | 17.5% |
+| Leader aggregate and the rest of the stream (outside capture and filters) | 13.1% |
+
+| `span-shredded-staged-c1` cost | Share |
+|---|---|
+| Hot Parquet decode `ParquetRecordBatchReader` (whole `attributes` struct reader 47.5%; ZSTD 20.9%) | 51.9% |
+| Whole-Variant reconstruction in the decoder projection (`DecoderProjection` → `CastExpr` → `cast_to_variant_field` → `unshred_variant`) | 31.8% |
+| Row-group reader build, including row-filter evaluation `with_predicate_options` 12.2% | 14.0% |
+| Footer and metadata reading | 1.7% |
+| Leader `FilterExec` outside the scan | 5.0% |
+| Cached reader frames (`CachedParquet…`, `FileMetadataCache`, `RangeCache`) | 0.0% |
+
+### Supported findings, hypotheses and evidence gaps
+
+Supported by the evidence above:
+
+1. **Both sources rebuild the whole `attributes` Variant to answer a
+   one-leaf `COUNT(*)`.** Memtable: 48.7% of server CPU, plus 17.5% re-filtering
+   the rebuilt values on the leader. Staged: 31.8%, on top of decoding the
+   whole shredded struct. This is the cost the rollback note predicted, now
+   measured on the real query shape.
+2. **The staged/memtable p99 gap is CPU times parallelism.** Unprofiled cores
+   used: shredded memtable 5.78 against staged 2.94; long-tail 4.79 against 2.87.
+   CPU/query ÷ cores reproduces each p50: 186.2/5.78 = 32.2 ms against 31.5;
+   262.5/2.94 = 89.3 ms against 86.8. So the shredded p99 ratio of 2.57 is the
+   1.41 CPU ratio times about 1.97 lower parallelism.
+3. **Same-code noise.** The hot A/A pair moves small-query p99 by up to 9% and
+   CPU by up to 6.6%, and staged bytes by up to 4.3%. Effect claims below that
+   size need repeated independent runs.
+4. **The time-pruning warning is live on the hot path** (19,104 WARNs in one
+   diagnostic run).
+5. **Gateway's baseline is a broken measurement**, not noise; Verification's
+   INVALID is harness drift (driver CPU is judged against revision 17). Gateway capture
+   durably stages only 1.3–1.7k items/s (82–105 MiB/s) against about 10k
+   offered/s at `chat-capture.c64`.
+
+Hypotheses (not causal conclusions):
+
+- H1: projecting the scalar `attributes ->> 'region'` (and, for `COUNT(*)`,
+  no Variant column) into the live fragment removes most of finding 1's
+  reconstruction and leader re-filter. The profile shares bound the memtable
+  saving at about 66% and staged's at about 32% plus the unread leaves' share of
+  the 47.5% struct decode. Stage 2 must measure the saving; this bound is not
+  a promise.
+- H2: staged's lower parallelism comes from the hot-Parquet scan's file and
+  partition grouping (`oracle/exec.rs::hot_parquet_scan`, shared planning in
+  Stage 3), not from the Scribe.
+- H3: the shared cached reader's direct saving on this step is small: footer
+  and metadata cost 1.7%, and the row-group builder 14% is mostly predicate
+  evaluation. Its value is in planning and pruning parity, so Stage 3 must
+  measure it separately and must not be credited with Stage 2's savings.
+- H4: the parquet point-lookup byte increase (+8.9%) and writes' native CPU/row
+  increase (+18.7% c1, +30% c64, with +64.5% c64 throughput) are
+  code-or-fixture effects of the intervening commits. They are unattributed.
+
+Missing observations and their owners:
+
+| Missing observation | Needed for | Owner |
+|---|---|---|
+| Executed physical plan of an interactive query | Plan proof without reading stacks | Oracle interactive execution, `oracle/mod.rs` |
+| Same-key canonical vs learned comparison: the same spans, key `region`, predicate, bounds and expected count, in canonical and in learned layout | Isolating shredding's read benefit (V-DIAG); different-key bytes cannot prove it | Existing lifecycle: `capacity/query/isolated.rs::prepare_hot` places spans only after the layout is learned. Loading an equivalent span range before the sample publish keeps it canonical. Stage 2 must add that diagnostic without changing the default declaration, or use the Scribe journey `telemetry::variant_layouts_survive_memory_stage_publication_and_restart` for physical assertions |
+| Shredding's ingestion cost (CPU/row, ack latency, retained memory for canonical vs learned retention of one stream) | V-DIAG ingest trade-off | Scribe memtable retention plus the same diagnostic placement; no current record separates it |
+| Staged per-query file, row-group and partition counts | Confirming H2 | `oracle/exec.rs::hot_parquet_scan` scan metrics |
+| Memtable scanned rows and bytes | REQ-029–030 facts | Stage 4, `scribe/memtable.rs` and completion facts |
+| Same-code repeat for parquet and writes references | Attributing H4 | Repeat runs at `459617bae` / `e4b65f4d0` if the comparison matters; otherwise report it as unattributed |
+| Profiles of the long-tail and small-aggregate steps | Extending findings 1 and 2 beyond the shredded pair | Same `--profile --steps` command; not taken in this stage |
+
+### Proposed first implementation change (Stage 2)
+
+Scenario 1 at the existing owners. Start with a V-SQL RED on the benchmark
+query shape, `COUNT(*)` with a time range and an `attributes ->> 'region'`
+predicate, over learned memtable and staged data. Pair it with the planned
+`oracle::live::tests::attribute_count_sql_avoids_unused_variant_reconstruction`
+owner assertion that today's plan requests whole `attributes` and rebuilds it.
+Then carry revision 22's ordered projection expressions through
+`LiveScribeExec` → assignment authority → follower, so that each source
+evaluates `variant_get` on the typed leaf and returns only the scalar (or no
+column for a predicate-only `COUNT`). Measure against this baseline with the
+same-key canonical/learned diagnostic above, plus repeated independent runs
+sized to the A/A noise. Do not change the staged reader in that stage.
+
+### Stage 1 exit
+
+| Required evidence | Location | Result |
+|---|---|---|
+| Paths, candidate, host, build, controls for all five experiments | Controls; L1 baseline records | PASS |
+| Per-step baseline results and invalidity | Per-experiment tables; INVALID reasons | PASS (two experiments INVALID, kept visible) |
+| Shared-owner audit | Shared-owner audit | PASS, no gap |
+| Hot plans and profiles | Hot plans and profiles | PASS for the shredded pair; the interactive plan render is a missing observation |
+| Supported costs, hypotheses and gaps kept separate | Findings | PASS |
+| Proposed first implementation change | Proposed first change | PASS |
+| No production or test code changed | `git status`: only this task file is modified | PASS |
+
+Stopped at the Stage 1 boundary. Nothing was committed or pushed, and no
+maintainer approval is implied. The new records sit uncommitted in the
+`benchmark-records` worktree.
+
+## Historical Attempt — superseded execution evidence
+
+The following records the rolled-back attempt. Old implementation claims,
+commands and acceptance wording are historical, not current instructions.
+They do not override the revised evidence-and-approval process above.
 
 ## Evidence
 

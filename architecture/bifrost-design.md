@@ -1287,15 +1287,19 @@ Python, TypeScript, and MCP.
 audit event is staged in memory on the process Scribe outbox, whose one
 background writer cuts each tenant's writes into producer lanes keyed by
 request, Verifier execution, or a queued submission's idempotency key, lets a
-lane's slice linger until its oldest write is 50 ms old or it holds 4,096 writes,
-as a Kafka producer's `linger.ms` and `batch.size` do, groups a lane's slice by destination, and
+lane's slice linger until its oldest write is 50 ms old or it holds 4,096 writes
+or 32 MiB of accounted bytes, as a Kafka producer's `linger.ms` and `batch.size`
+do, takes at most 32 MiB of a lane's backlog per slice, so a large backlog is
+written and its capacity released a bounded slice at a time, groups a lane's
+slice by destination, and
 builds each group's rows once into dense Arrow batches from the owned values
-and encoded Variants each write staged, never one batch per write. Each frame
-is encoded as Arrow IPC, which sizes and splits it and derives its batch id
-from that content. The local Scribe receives the frame's rows in-process as
+and encoded Variants each write staged, never one batch per write. Frames are
+sized from their rows' sliced Arrow bytes, and each frame's batch id derives
+from the slice's idempotency key, which every retry of the slice keeps, and
+the frame's position in it. The local Scribe receives the frame's rows in-process as
 server-built canonical batches under ordinary admission, without decoding or
-revalidating values the producer built; from a pod without Scribe, the IPC
-bytes travel to a Scribe pod over the mutually authenticated peer plane, which
+revalidating values the producer built and without an IPC encoding; from a pod
+without Scribe, the frame is encoded as Arrow IPC once and the bytes travel to a Scribe pod over the mutually authenticated peer plane, which
 validates them in full. Both carry the same rows under the same batch id. Audit frames are submitted under the
 platform audit principal, the one principal Scribe admits for the reserved
 system owner's audit history. A retryable failure resubmits the identical

@@ -89,24 +89,34 @@ pub const CAPACITY_FLAGS: [&str; 4] = [
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Case {
     /// Buffered 1 KiB chat with metadata capture.
-    Chat,
+    Buffered1KibCaptureMetadata,
     /// Streamed 1 KiB chat with metadata capture.
-    ChatStream,
+    Streamed1KibCaptureMetadata,
+    /// Buffered 64 KiB chat with metadata capture: `Buffered64KibCapturePayload`'s traffic
+    /// without its payload capture.
+    Buffered64KibCaptureMetadata,
     /// Buffered 64 KiB chat with request and response payload capture.
-    ChatCapture,
+    Buffered64KibCapturePayload,
 }
 
 impl Case {
     /// Every case, in run order.
-    pub const ALL: [Self; 3] = [Self::Chat, Self::ChatStream, Self::ChatCapture];
+    pub const ALL: [Self; 4] = [
+        Self::Buffered1KibCaptureMetadata,
+        Self::Streamed1KibCaptureMetadata,
+        Self::Buffered64KibCaptureMetadata,
+        Self::Buffered64KibCapturePayload,
+    ];
 
-    /// The case's stable id, the first part of its step ids.
+    /// The case's stable id: the first part of its step ids and the closed
+    /// benchmark case its calls declare.
     #[must_use]
     pub const fn id(self) -> &'static str {
         match self {
-            Self::Chat => "chat",
-            Self::ChatStream => "chat-stream",
-            Self::ChatCapture => "chat-capture",
+            Self::Buffered1KibCaptureMetadata => "buffered-1kib-capture-metadata",
+            Self::Streamed1KibCaptureMetadata => "streamed-1kib-capture-metadata",
+            Self::Buffered64KibCaptureMetadata => "buffered-64kib-capture-metadata",
+            Self::Buffered64KibCapturePayload => "buffered-64kib-capture-payload",
         }
     }
 
@@ -120,19 +130,9 @@ impl Case {
     #[must_use]
     pub const fn prefix(self) -> &'static str {
         match self {
-            Self::Chat => "chat",
-            Self::ChatStream => "stream",
-            Self::ChatCapture => "capture",
-        }
-    }
-
-    /// The closed benchmark case its calls declare.
-    #[must_use]
-    pub const fn label(self) -> &'static str {
-        match self {
-            Self::Chat => "buffered-metadata",
-            Self::ChatStream => "streamed-metadata",
-            Self::ChatCapture => "buffered-payload",
+            Self::Buffered1KibCaptureMetadata => "chat",
+            Self::Streamed1KibCaptureMetadata => "stream",
+            Self::Buffered64KibCaptureMetadata | Self::Buffered64KibCapturePayload => "capture",
         }
     }
 
@@ -140,8 +140,10 @@ impl Case {
     #[must_use]
     pub const fn capture(self) -> CapturePolicy {
         match self {
-            Self::Chat | Self::ChatStream => CapturePolicy::Metadata,
-            Self::ChatCapture => CapturePolicy::Payload,
+            Self::Buffered1KibCaptureMetadata
+            | Self::Streamed1KibCaptureMetadata
+            | Self::Buffered64KibCaptureMetadata => CapturePolicy::Metadata,
+            Self::Buffered64KibCapturePayload => CapturePolicy::Payload,
         }
     }
 
@@ -149,9 +151,11 @@ impl Case {
     #[must_use]
     pub fn shape(self) -> workload::Shape {
         let (stream, request_bytes, expected) = match self {
-            Self::Chat => (false, SMALL_BYTES, SMALL_BYTES),
-            Self::ChatStream => (true, SMALL_BYTES, STREAM_CHUNKS),
-            Self::ChatCapture => (false, LARGE_BYTES, LARGE_BYTES),
+            Self::Buffered1KibCaptureMetadata => (false, SMALL_BYTES, SMALL_BYTES),
+            Self::Streamed1KibCaptureMetadata => (true, SMALL_BYTES, STREAM_CHUNKS),
+            Self::Buffered64KibCaptureMetadata | Self::Buffered64KibCapturePayload => {
+                (false, LARGE_BYTES, LARGE_BYTES)
+            }
         };
         workload::Shape {
             model: format!("bench-{}/gpt-4o", self.prefix()),
@@ -229,7 +233,7 @@ pub fn declare(
 fn overhead(mut base: Declaration) -> Declaration {
     "overhead".clone_into(&mut base.experiment);
     base.question = format!(
-        "What overhead does the gateway add to buffered, streamed, and payload-captured chat at 1 and 64 closed-loop clients, and is its p99 strictly under {OVERHEAD_LIMIT_MS} ms at {SLO_CLIENTS} clients at every handoff point with every call answered and captured exactly once?"
+        "What overhead does the gateway add to 1 KiB buffered and streamed chat with metadata capture, and 64 KiB buffered chat with metadata and with payload capture, at 1 and 64 closed-loop clients, and is its p99 strictly under {OVERHEAD_LIMIT_MS} ms at {SLO_CLIENTS} clients at every handoff point with every call answered and captured exactly once?"
     );
     base.variables = BTreeMap::from([
         ("case".to_owned(), json!(Case::ALL.map(Case::id))),
@@ -288,7 +292,7 @@ fn overhead(mut base: Declaration) -> Declaration {
     }
     let every: Vec<String> = steps.iter().map(|step| step.id.clone()).collect();
     let at_slo: Vec<String> = Case::ALL.map(|case| case.step(SLO_CLIENTS)).to_vec();
-    let stream_at_slo = vec![Case::ChatStream.step(SLO_CLIENTS)];
+    let stream_at_slo = vec![Case::Streamed1KibCaptureMetadata.step(SLO_CLIENTS)];
     base.criteria = vec![
         Criterion::limit(
             "overhead-p99",
@@ -897,7 +901,7 @@ mod tests {
         }
     }
 
-    /// L1 declares all twelve case/client steps, the strict 0.5 ms overhead
+    /// L1 declares every case/client step, the strict 0.5 ms overhead
     /// p99 only at 64 clients with p99 sample sufficiency, and every
     /// correctness and capture criterion on every step, keeping the shared
     /// timing control; it is admissible.
@@ -915,7 +919,7 @@ mod tests {
             declared
                 .steps
                 .iter()
-                .any(|step| step.id == "chat-capture.c1")
+                .any(|step| step.id == "buffered-64kib-capture-payload.c1")
         );
         let overhead = declared
             .criteria
@@ -924,7 +928,12 @@ mod tests {
             .expect("the overhead criterion");
         assert_eq!(
             overhead.steps,
-            vec!["chat.c64", "chat-stream.c64", "chat-capture.c64"]
+            vec![
+                "buffered-1kib-capture-metadata.c64",
+                "streamed-1kib-capture-metadata.c64",
+                "buffered-64kib-capture-metadata.c64",
+                "buffered-64kib-capture-payload.c64"
+            ]
         );
         assert_eq!(overhead.percentile, Some(99));
         assert!(matches!(
@@ -945,12 +954,12 @@ mod tests {
         }
         assert!(declared.refusals().is_empty(), "{:?}", declared.refusals());
         assert_eq!(declared.controls["timing"], json!({ "method": "shared" }));
-        let shape = Case::ChatCapture.shape();
+        let shape = Case::Buffered64KibCapturePayload.shape();
         assert_eq!(
             (shape.request_bytes, shape.expected, shape.stream),
             (65_536, 65_536, false)
         );
-        assert_eq!(Case::ChatStream.shape().expected, 32);
+        assert_eq!(Case::Streamed1KibCaptureMetadata.shape().expected, 32);
     }
 
     /// L2 declares one contention step at the default rate with the SLO

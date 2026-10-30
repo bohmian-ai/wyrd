@@ -855,22 +855,31 @@ mod tests {
             .iter()
             .map(|clients| *clients as u64)
             .collect();
-        let mut shapes = sweep("chat", ".", &clients);
-        shapes.extend(sweep("chat-stream", ".", &clients));
-        shapes.extend(sweep("chat-capture", ".", &clients));
+        let mut shapes = sweep("buffered-1kib-capture-metadata", ".", &clients);
+        shapes.extend(sweep("streamed-1kib-capture-metadata", ".", &clients));
+        shapes.extend(sweep("buffered-64kib-capture-metadata", ".", &clients));
+        shapes.extend(sweep("buffered-64kib-capture-payload", ".", &clients));
         assert_eq!(steps(&gateway, true), shapes);
         assert_eq!(
             applies(&gateway, "overhead-p99"),
-            ["chat.c64", "chat-stream.c64", "chat-capture.c64"]
+            [
+                "buffered-1kib-capture-metadata.c64",
+                "streamed-1kib-capture-metadata.c64",
+                "buffered-64kib-capture-metadata.c64",
+                "buffered-64kib-capture-payload.c64"
+            ]
         );
-        assert_eq!(applies(&gateway, "overhead-end-p99"), ["chat-stream.c64"]);
+        assert_eq!(
+            applies(&gateway, "overhead-end-p99"),
+            ["streamed-1kib-capture-metadata.c64"]
+        );
         for every in [
             "capture-lost",
             "capture-shed",
             "capture-per-arrival",
             "no-errors",
         ] {
-            assert_eq!(applies(&gateway, every).len(), 6, "{every}");
+            assert_eq!(applies(&gateway, every).len(), 8, "{every}");
         }
         for metric in [
             "requests_per_s_per_vcpu",
@@ -1013,7 +1022,7 @@ mod tests {
             ),
             (
                 declare(Engine::Gateway, Level::One, &[], HOST, &root),
-                "chat-capture.c64",
+                "buffered-64kib-capture-payload.c64",
                 "requests",
                 vec![
                     "requests_per_s_per_vcpu",

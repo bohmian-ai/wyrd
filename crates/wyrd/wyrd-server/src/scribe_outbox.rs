@@ -4,12 +4,12 @@
 //! Producers stage logical [`ScribeWrite`] values on [`ScribeOutbox`] and
 //! return at once. The outbox writer hands each tenant's pending slice to
 //! [`ScribeSink`], which projects every write into its fixed destination rows,
-//! groups those rows by destination, encodes each group as Arrow IPC frames
-//! under content-derived batch ids, splitting any group larger than a quarter
-//! of the configured Scribe request ceiling by rows, encoding on the blocking
-//! pool, and submits up to [`FRAMES_IN_FLIGHT`] chunks of frames at once
-//! in-process to this pod's Scribe or over
-//! the peer plane to a live one. A
+//! groups those rows by destination into frames under batch ids derived from
+//! the slice's idempotency key, splitting any group larger than a quarter of
+//! the configured Scribe request ceiling by rows on the blocking pool, and
+//! submits up to [`FRAMES_IN_FLIGHT`] chunks of frames at once in-process to
+//! this pod's Scribe as canonical batches, never encoded, or over the peer
+//! plane to a live one as Arrow IPC streams, each encoded once. A
 //! peer call that has not answered within [`PEER_SUBMIT_TIMEOUT`] fails as
 //! unavailable, so the retry rotates to the next ready Scribe. Scribe ingress alone
 //! admits, accounts, persists, and acknowledges them; nothing here reserves
@@ -134,10 +134,23 @@ const SCRIBE_LINGER: Duration = Duration::from_millis(50);
 /// [`OutboxSink::BATCH_ITEMS`].
 const SCRIBE_BATCH_WRITES: usize = 4_096;
 
+/// Accounted bytes at which a lane commits without lingering further, and the
+/// most one lane write takes; see [`OutboxSink::BATCH_BYTES`].
+///
+/// Gateway captures hold their slots until the write carrying them commits,
+/// so an unbounded write of a payload-capture backlog, hundreds of
+/// megabytes, held the reserved byte share for its whole duration and made
+/// new calls wait for it. At the default 16 MiB Scribe request ceiling this
+/// is [`FRAMES_IN_FLIGHT`] frames of [`frame_budget`], so one write's frames
+/// are all submitted at once and its capacity returns within one round of
+/// acknowledgements.
+const SCRIBE_BATCH_BYTES: usize = 32 << 20;
+
 /// Default of `scribe.outbox_bytes`: the most accounted bytes the process
-/// Scribe outbox admits at once, as [`ScribeSink::weight`]. A quarter of it,
-/// 256 MiB, holds unreserved writes such as gateway captures, which bounds
-/// the captured content a saturated gateway keeps in memory.
+/// Scribe outbox admits at once, as [`ScribeSink::weight`]. Reserved writes,
+/// gateway captures, may hold three quarters of it, which bounds the
+/// captured content a saturated gateway keeps in memory; the remaining
+/// 256 MiB holds unreserved writes such as audit decisions and server spans.
 pub(crate) const SCRIBE_BYTES: usize = 1 << 30;
 
 /// Longest a peer Scribe may take to acknowledge one frame.
@@ -151,7 +164,7 @@ const PEER_SUBMIT_TIMEOUT: Duration = Duration::from_secs(30);
 /// Each frame waits for its own durable acknowledgement, so submitting them
 /// one at a time made a slice's write time the sum of its acknowledgements.
 /// Concurrent frames share Scribe's WAL commits instead. The bound keeps one
-/// slice's encoded frames, at most this many times the frame budget, within
+/// slice's encoded frames, about this many times the frame budget, within
 /// the memory a large backlog may take, and leaves Scribe admission room for
 /// the other writers' slices.
 const FRAMES_IN_FLIGHT: usize = 8;
@@ -159,9 +172,10 @@ const FRAMES_IN_FLIGHT: usize = 8;
 /// Frame budget for a Scribe request ceiling of `request_bytes`.
 ///
 /// A tenant slice can hold a long outage's backlog, so each frame's rows, as
-/// retained Arrow bytes and as encoded Arrow IPC, stay within a quarter of the ceiling. The
-/// quarter leaves room for IPC framing and keeps Scribe's decoded and expanded
-/// request bounds, which scale from the same ceiling, out of reach.
+/// sliced Arrow bytes, stay within a quarter of the ceiling. The quarter
+/// leaves room for IPC framing, so a frame is sized before it is encoded and
+/// encoded once, and keeps Scribe's decoded and expanded request bounds,
+/// which scale from the same ceiling, out of reach.
 const fn frame_budget(request_bytes: usize) -> usize {
     request_bytes / 4
 }
@@ -557,19 +571,19 @@ pub(crate) enum FramePayload {
     /// its receiving Scribe validates in full.
     Ipc(Bytes),
     /// The rows the server built in process, handed to the pod's own Scribe
-    /// as canonical batches: their encoded stream already gave the frame its
-    /// identity and wire size and was then dropped, so the rows are never
-    /// decoded back.
+    /// as canonical batches, never encoded.
     Rows {
         /// The frame's rows, in their own buffers.
         rows: RecordBatch,
-        /// Length of the encoded stream the frame's identity hashed.
+        /// The rows' sliced Arrow bytes, which Scribe's request ceiling
+        /// measures in place of a stream length.
         wire_bytes: usize,
     },
 }
 
 impl FramePayload {
-    /// Length of the frame's encoded stream.
+    /// Length of the frame's encoded stream, or its rows' sliced Arrow bytes
+    /// in process.
     fn wire_bytes(&self) -> usize {
         match self {
             Self::Ipc(ipc) => ipc.len(),
@@ -614,7 +628,8 @@ pub(crate) struct ScribeBatch {
     pub(crate) tenant: DataTenantId,
     /// Destination table.
     pub(crate) table: ScribeTable,
-    /// Content-derived identity Scribe deduplicates resubmissions on.
+    /// Identity, derived from the slice's idempotency key and the frame's
+    /// place in the slice, that Scribe deduplicates resubmissions on.
     pub(crate) batch_id: Uuid,
     /// Request the frame is admitted under.
     pub(crate) request_id: RequestId,
@@ -1217,31 +1232,38 @@ struct Chunk {
     owners: Vec<Owner>,
 }
 
+/// Where a chunk sits in its write: the slice's idempotency key, the index
+/// of its frame among the slice's frames, and its index in that frame.
+type Origin = (Uuid, usize, usize);
+
 /// One submitted stream: how Scribe answered, the stream, and the slice
 /// positions of the writes its rows came from.
 type Submitted = (Result<(), ScribeRefusal>, ScribeBatch, BTreeSet<usize>);
 
 impl Chunk {
     /// Builds the chunk's rows into one dense batch, appends each row's subject and actor
-    /// unless they are audit decisions that carry their own, and encodes them
-    /// as Arrow IPC streams of at most `budget` bytes, each under its
-    /// content-derived identity and with the slice positions of the writes
-    /// its rows came from.
+    /// unless they are audit decisions that carry their own, and cuts them
+    /// into frames of at most `budget` sliced row bytes, each under the
+    /// identity its `origin` and first row give it and with the slice
+    /// positions of the writes its rows came from.
     ///
-    /// A single row larger than `budget` is still encoded alone; Scribe
-    /// decides whether its ceiling admits it. Every stream is encoded and
-    /// hashed whatever the route, so a frame keeps one identity and one split
-    /// in process and over the peer plane. With `in_process`, each frame
-    /// carries its rows instead of its stream, which is dropped once hashed;
-    /// a frame split from a larger chunk carries its rows copied into their
-    /// own buffers, so Scribe charges it only its own rows.
+    /// A single row larger than `budget` still travels alone; Scribe decides
+    /// whether its ceiling admits it. The split and identity depend only on
+    /// the rows and `origin`, never the route, so a frame keeps one identity
+    /// in process and over the peer plane. Over the peer plane each frame is
+    /// encoded once as its Arrow IPC stream; in process it carries its rows
+    /// and is never encoded, and a frame split from a larger chunk carries its
+    /// rows copied into their own buffers, so Scribe charges it only its own
+    /// rows.
     ///
     /// # Errors
     ///
-    /// Returns the Arrow error when the rows cannot be built or encoded.
+    /// Returns the Arrow error when the rows cannot be built, measured, or
+    /// encoded.
     fn encode(
         &self,
         tenant: DataTenantId,
+        origin: Origin,
         budget: usize,
         in_process: bool,
     ) -> Result<Vec<(ScribeBatch, BTreeSet<usize>)>, arrow::error::ArrowError> {
@@ -1250,18 +1272,17 @@ impl Chunk {
             ScribeTable::AuditLog => rows,
             _ => self.attributed(&rows)?,
         };
-        let mut streams = Vec::new();
-        Self::split(&rows, 0, budget, &mut streams)?;
-        let whole = streams.len() == 1;
-        streams
+        let mut ranges = Vec::new();
+        Self::split(&rows, 0, budget, &mut ranges)?;
+        let whole = ranges.len() == 1;
+        ranges
             .into_iter()
-            .map(|(start, count, ipc)| {
+            .map(|(start, count, sliced)| {
                 let owners = self.owners[start..start + count]
                     .iter()
                     .map(|(position, _)| *position)
                     .collect();
-                let mut batch = self.identify(tenant, ipc);
-                if in_process {
+                let payload = if in_process {
                     let rows = if whole {
                         rows.clone()
                     } else {
@@ -1270,10 +1291,16 @@ impl Chunk {
                         );
                         arrow::compute::take_record_batch(&rows, &indices)?
                     };
-                    let wire_bytes = batch.payload.wire_bytes();
-                    batch.payload = FramePayload::Rows { rows, wire_bytes };
-                }
-                Ok((batch, owners))
+                    FramePayload::Rows {
+                        rows,
+                        wire_bytes: sliced,
+                    }
+                } else {
+                    let mut writer = StreamWriter::try_new(Vec::new(), &rows.schema())?;
+                    writer.write(&rows.slice(start, count))?;
+                    FramePayload::Ipc(Bytes::from(writer.into_inner()?))
+                };
+                Ok((self.identify(tenant, origin, start, payload), owners))
             })
             .collect()
     }
@@ -1319,58 +1346,75 @@ impl Chunk {
     }
 
     /// Appends `rows`, whose first row is row `first` of its frame, to
-    /// `streams` as one Arrow IPC stream with its first row and row count, or,
-    /// when that stream exceeds `budget` bytes and holds more than one row, as
-    /// the streams of each half in turn.
+    /// `ranges` as one frame's first row, row count, and sliced Arrow bytes,
+    /// or, when those bytes exceed `budget` and the rows hold more than one,
+    /// as the ranges of each half in turn.
     ///
-    /// Halving depends only on the rows, so an identical slice always splits
-    /// into identical streams, whatever its row sizes.
+    /// Rows are sized without encoding them, so a peer frame is encoded
+    /// exactly once and an in-process frame never; [`frame_budget`] leaves
+    /// the ceiling's other three quarters for IPC framing. Halving depends
+    /// only on the rows, so an identical slice always splits identically,
+    /// whatever its row sizes.
     ///
     /// # Errors
     ///
-    /// Returns the Arrow error when the rows cannot be encoded.
+    /// Returns the Arrow error when the rows cannot be measured.
     fn split(
         rows: &RecordBatch,
         first: usize,
         budget: usize,
-        streams: &mut Vec<(usize, usize, Vec<u8>)>,
+        ranges: &mut Vec<(usize, usize, usize)>,
     ) -> Result<(), arrow::error::ArrowError> {
-        let mut writer = StreamWriter::try_new(Vec::new(), &rows.schema())?;
-        writer.write(rows)?;
-        let ipc = writer.into_inner()?;
         let count = rows.num_rows();
-        if ipc.len() <= budget || count < 2 {
-            streams.push((first, count, ipc));
+        let mut sliced = 0_usize;
+        for column in rows.columns() {
+            sliced = sliced.saturating_add(column.to_data().get_slice_memory_size()?);
+        }
+        if sliced <= budget || count < 2 {
+            ranges.push((first, count, sliced));
             return Ok(());
         }
         let half = count / 2;
-        Self::split(&rows.slice(0, half), first, budget, streams)?;
+        Self::split(&rows.slice(0, half), first, budget, ranges)?;
         Self::split(
             &rows.slice(half, count - half),
             first + half,
             budget,
-            streams,
+            ranges,
         )
     }
 
-    /// Wraps one encoded stream of `frame` under its content-derived identity.
+    /// Wraps the frame of this chunk's rows from row `start` under the
+    /// identity its `origin` gives it.
     ///
-    /// The batch id hashes the tenant, destination, and encoded rows, each
-    /// row's attribution included, so a retry of the identical slice resubmits the same identity
-    /// and Scribe's batch-id dedup absorbs frames it already accepted. The
-    /// frame is admitted under a request id derived from the batch id, so it
-    /// too is stable across retries. The digest carries `UUIDv7` version and variant bits.
+    /// The batch id hashes the tenant, destination, the slice's idempotency
+    /// key, and the frame's place in the slice. The outbox passes the same
+    /// key with every retry of the identical slice, which frames, chunks, and
+    /// splits identically, so a retry resubmits the same identity and
+    /// Scribe's batch-id dedup absorbs frames it already accepted. The frame
+    /// is admitted under a request id derived from the batch id, so it too is
+    /// stable across retries. The digest carries `UUIDv7` version and variant
+    /// bits.
     ///
     /// # Panics
     ///
     /// Panics only if a `UUIDv7` batch id failed to parse as a request id,
     /// which its construction rules out.
-    fn identify(&self, tenant: DataTenantId, ipc: Vec<u8>) -> ScribeBatch {
+    fn identify(
+        &self,
+        tenant: DataTenantId,
+        (slice, frame, chunk): Origin,
+        start: usize,
+        payload: FramePayload,
+    ) -> ScribeBatch {
         let mut digest = Sha256::new();
-        digest.update(b"wyrd.scribe.outbox.batch-id.v1");
+        digest.update(b"wyrd.scribe.outbox.batch-id.v2");
         digest.update(tenant.as_uuid().as_bytes());
         digest.update(self.table.fqn().as_bytes());
-        digest.update(&ipc);
+        digest.update(slice.as_bytes());
+        for place in [frame, chunk, start] {
+            digest.update((place as u64).to_le_bytes());
+        }
         let digest: [u8; 32] = digest.finalize().into();
         let mut bytes = [0_u8; 16];
         bytes.copy_from_slice(&digest[..16]);
@@ -1384,7 +1428,7 @@ impl Chunk {
             table: self.table,
             batch_id,
             request_id,
-            payload: FramePayload::Ipc(Bytes::from(ipc)),
+            payload,
         }
     }
 }
@@ -1416,6 +1460,7 @@ impl ScribeSink {
         &self,
         route: &ScribeRoute,
         tenant: DataTenantId,
+        (slice, first): (Uuid, usize),
         frames: &[Frame],
         attempt: usize,
         lost: &mut BTreeSet<usize>,
@@ -1423,7 +1468,13 @@ impl ScribeSink {
         let budget = self.frame_budget;
         let mut in_flight = FuturesUnordered::new();
         let mut refused = None;
-        for chunk in frames.iter().flat_map(|frame| Self::chunks(frame, budget)) {
+        let chunks = frames.iter().enumerate().flat_map(|(index, frame)| {
+            Self::chunks(frame, budget)
+                .into_iter()
+                .enumerate()
+                .map(move |(chunk, rows)| ((slice, first + index, chunk), rows))
+        });
+        for (origin, chunk) in chunks {
             if in_flight.len() == FRAMES_IN_FLIGHT
                 && let Some(done) = in_flight.next().await
             {
@@ -1432,7 +1483,7 @@ impl ScribeSink {
             if refused.is_some() {
                 break;
             }
-            in_flight.push(Self::deliver(route, tenant, chunk, budget, attempt));
+            in_flight.push(Self::deliver(route, tenant, origin, chunk, budget, attempt));
         }
         while let Some(done) = in_flight.next().await {
             Self::tally(tenant, done, lost, &mut refused);
@@ -1455,13 +1506,14 @@ impl ScribeSink {
     async fn deliver(
         route: &ScribeRoute,
         tenant: DataTenantId,
+        origin: Origin,
         chunk: Chunk,
         budget: usize,
         attempt: usize,
     ) -> (Vec<Submitted>, Vec<usize>) {
         let in_process = route.in_process();
-        let encoding =
-            tokio::task::spawn_blocking(move || match chunk.encode(tenant, budget, in_process) {
+        let encoding = tokio::task::spawn_blocking(move || {
+            match chunk.encode(tenant, origin, budget, in_process) {
                 Ok(streams) => Ok(streams),
                 Err(error) => Err((
                     error,
@@ -1472,7 +1524,8 @@ impl ScribeSink {
                         .map(|(position, _)| position)
                         .collect(),
                 )),
-            });
+            }
+        });
         let streams = match encoding.await {
             Ok(Ok(streams)) => streams,
             Ok(Err((error, table, owners))) => {
@@ -1530,6 +1583,7 @@ impl OutboxSink for ScribeSink {
     const LANES: usize = SCRIBE_LANES;
     const LINGER: Duration = SCRIBE_LINGER;
     const BATCH_ITEMS: usize = SCRIBE_BATCH_WRITES;
+    const BATCH_BYTES: usize = SCRIBE_BATCH_BYTES;
 
     /// A gateway capture and every audit decision lane by their request
     /// correlation ID, so one call's decision and capture share a lane and
@@ -1610,6 +1664,7 @@ impl OutboxSink for ScribeSink {
     async fn write(
         &self,
         tenant: DataTenantId,
+        slice: Uuid,
         items: &[ScribeWrite],
     ) -> Result<(), ScribeRefusal> {
         let Some(route) = &self.route else {
@@ -1620,10 +1675,10 @@ impl OutboxSink for ScribeSink {
         let attempt = self.attempts.fetch_add(1, Ordering::Relaxed);
         let mut lost = BTreeSet::new();
         let frames = Self::frames(items, &mut lost);
-        let (details, summaries) =
-            frames.split_at(frames.partition_point(|frame| frame.table != ScribeTable::Results));
-        for phase in [details, summaries] {
-            self.submit(route, tenant, phase, attempt, &mut lost)
+        let split = frames.partition_point(|frame| frame.table != ScribeTable::Results);
+        let (details, summaries) = frames.split_at(split);
+        for (first, phase) in [(0, details), (split, summaries)] {
+            self.submit(route, tenant, (slice, first), phase, attempt, &mut lost)
                 .await?;
         }
         self.schedule_groups(tenant, items, &lost).await?;
@@ -1892,7 +1947,7 @@ mod tests {
         }
         outbox
             .sink()
-            .write(tenant, &slice)
+            .write(tenant, uuid::Uuid::now_v7(), &slice)
             .await
             .expect("the slice is written");
 
@@ -2113,7 +2168,7 @@ mod tests {
             let chunks = ScribeSink::chunks(frame, usize::MAX);
             assert_eq!(chunks.len(), 1, "{table}");
             let mut streams = chunks[0]
-                .encode(tenant, usize::MAX, false)
+                .encode(tenant, (uuid::Uuid::now_v7(), 0, 0), usize::MAX, false)
                 .expect("the frame encodes");
             assert_eq!(streams.len(), 1, "{table}");
             let (batch, positions) = streams.remove(0);
@@ -2469,7 +2524,7 @@ mod tests {
             .collect();
         outbox
             .sink()
-            .write(tenant, &slice)
+            .write(tenant, uuid::Uuid::now_v7(), &slice)
             .await
             .expect("the slice is written");
 
@@ -2816,10 +2871,11 @@ mod tests {
                     .all(|table| *table == "bifrost.verification.execution_outputs"),
             "the outputs split into several frames before the summaries: {tables:?}"
         );
-        let budget = frame_budget(SMALL_REQUEST_BYTES);
         assert!(
-            frames.iter().all(|frame| frame.ipc.len() <= budget),
-            "every frame fits the budget: {:?}",
+            frames
+                .iter()
+                .all(|frame| frame.ipc.len() <= SMALL_REQUEST_BYTES),
+            "every frame fits the Scribe request ceiling: {:?}",
             frames
                 .iter()
                 .map(|frame| (frame.table.as_str(), frame.ipc.len()))
@@ -2958,8 +3014,9 @@ mod tests {
     /// Proves the pod's own Scribe and a peer Scribe receive the same
     /// prepared frames: an execution's inputs record, then in a separate
     /// slice its oversized outputs and summaries, each lose one ACK and
-    /// replay, and both routes retain the same frame ids, each carrying the
-    /// same rows, attribution, and encoded stream within the budget, every
+    /// replay under the frame ids they first carried, and both routes retain
+    /// the same frames, each carrying the same rows, attribution, and encoded
+    /// stream within the budget, every
     /// local frame as canonical batches Scribe never decodes and every peer
     /// frame as the IPC stream its receiver validates. A gateway capture
     /// staged alongside travels each route the same way.
@@ -3046,14 +3103,15 @@ mod tests {
                 .partition(|frame| frame.table == "bifrost.verification.execution_inputs");
             assert_eq!(inputs_frames.len(), 1);
             assert_bounded_detail(&detail, DETAIL_RESULTS);
-            let frames = inputs_frames
+            let mut frames = inputs_frames
                 .into_iter()
                 .chain(detail)
                 .map(|frame| {
                     assert!(frame.pairs.iter().all(|pair| *pair == attribution));
-                    (frame.batch_id, (frame.table, frame.rows, frame.ipc))
+                    (frame.table, frame.rows, frame.ipc)
                 })
-                .collect::<HashMap<_, _>>();
+                .collect::<Vec<_>>();
+            frames.sort_unstable();
             routes.push((
                 frames,
                 captured
@@ -3125,13 +3183,13 @@ mod tests {
     }
 
     /// Proves a slice's frames await Scribe together rather than one at a
-    /// time, never more than [`FRAMES_IN_FLIGHT`] at once, within the frame
-    /// budget, and that every summary is acknowledged after every detail row.
+    /// time, never more than [`FRAMES_IN_FLIGHT`] at once, within the Scribe
+    /// request ceiling, and that every summary is acknowledged after every detail row.
     ///
     /// # Panics
     ///
     /// Panics when frames are submitted one at a time, exceed the bound or
-    /// the budget, lose a row, or a summary precedes a detail frame.
+    /// the ceiling, lose a row, or a summary precedes a detail frame.
     #[tokio::test]
     async fn a_slice_keeps_a_bounded_number_of_frames_in_flight() {
         const ROUNDS: usize = 4;
@@ -3159,8 +3217,12 @@ mod tests {
             (2..=FRAMES_IN_FLIGHT).contains(&peak),
             "frames overlap within the bound: {peak}"
         );
-        let budget = frame_budget(SMALL_REQUEST_BYTES);
-        assert!(frames.iter().all(|frame| frame.ipc.len() <= budget));
+        assert!(
+            frames
+                .iter()
+                .all(|frame| frame.ipc.len() <= SMALL_REQUEST_BYTES),
+            "every frame fits the Scribe request ceiling"
+        );
         let summaries = frames
             .iter()
             .position(|frame| frame.table == "bifrost.verification.results")

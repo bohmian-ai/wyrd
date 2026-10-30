@@ -3404,6 +3404,87 @@ async fn gateway_capture_follows_policy_and_never_affects_the_call() {
     drain_gateway(&unavailable).await;
 }
 
+/// Proves a capturing call waits for a Scribe outbox capture slot during
+/// admission instead of having its capture shed.
+///
+/// While every reservable slot is held, a call with a short deadline is
+/// refused with `WYRD_GATEWAY_429_CAPTURE_STAGING_FULL` after waiting out
+/// that deadline, before any provider sees it and with nothing captured. A
+/// call admitted while the slots are held waits, is admitted once they are
+/// released, answers, and its capture row is written.
+///
+/// # Panics
+/// Panics when the Postgres fixture, a seed or call, or an assertion fails.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn capturing_call_waits_for_a_capture_slot_and_refuses_at_its_deadline() {
+    let fixture = PgFixture::start().await.expect("fixture starts");
+    let tenant = fixture.data_tenant_id();
+    let dispatch = Scripted::shared();
+    let (state, scribe) = RecordingScribe::attach(replica(&fixture, dispatch.clone()).await);
+    configure(&state, tenant, json!([]), json!([]), "allow_unpriced").await;
+    GatewayAdministration::new(&state)
+        .put_capture(
+            &admin(tenant),
+            GatewayCapturePolicyWrite {
+                mode: GatewayCaptureMode::Metadata,
+                payload_fields: BTreeSet::new(),
+            },
+        )
+        .await
+        .expect("metadata policy stores");
+    let caller = invoker(tenant, 1, [open_access()]);
+    let reservable = crate::scribe_outbox::SCRIBE_CAPACITY * wyrd_runtime::outbox::RESERVED_SHARE.0
+        / wyrd_runtime::outbox::RESERVED_SHARE.1;
+    let held = state
+        .bifrost
+        .scribe_outbox()
+        .reserve(reservable)
+        .expect("every reservable slot is held");
+
+    let started = tokio::time::Instant::now();
+    let refused = GatewayInvocation::new(&state)
+        .invoke(
+            &caller,
+            request("dep-a/a", Some((1000, 500)), Duration::from_millis(200)),
+        )
+        .await
+        .expect_err("no capture slot frees before the deadline");
+    assert!(
+        matches!(refused, WyrdError::GatewayCaptureStagingFull { .. }),
+        "{refused:?}"
+    );
+    assert!(
+        started.elapsed() >= Duration::from_millis(200),
+        "the call waited for its deadline before refusing"
+    );
+    assert!(
+        dispatch.seen().is_empty(),
+        "a refused call reaches no provider"
+    );
+
+    let release = tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        drop(held);
+    });
+    dispatch.push(Step::Return(completed(100, 50)));
+    let answered = GatewayInvocation::new(&state)
+        .invoke(
+            &caller,
+            request("dep-a/a", Some((1000, 500)), Duration::from_secs(10)),
+        )
+        .await
+        .expect("a call waiting for a freed slot is admitted");
+    release.await.expect("release task");
+    assert_eq!(answered.status, 200);
+    drain_gateway(&state).await;
+    assert_eq!(
+        scribe.calls().len(),
+        1,
+        "only the admitted call is captured"
+    );
+    captured(&scribe, answered.call_id);
+}
+
 /// Proves a call's Run and Card UID attribution is authorized before
 /// dispatch and recorded on its captured row.
 ///

@@ -668,14 +668,16 @@ Wyrd principals are UUID-backed runtime identities that exist independently of
 any credential: issuing, rotating, revoking, or losing a credential never
 creates, destroys, or alters a principal or its role grants. Gateway capture
 is a server-internal write holding no token, role, or grant; Scribe stamps
-each captured row with the verified pair the call ran under. Each `wyrd-server` process owns one capture writer,
-chosen from pod topology (`WYRD_TARGET`): it submits in-process when Scribe
-runs in the pod, and otherwise over the peer plane through a capture-only RPC
-to a live, ready Scribe. A capture is delivered when Scribe acknowledges it
-before the call's deadline; backpressure and an unavailable Scribe are retried
-with bounded backoff until then, and anything else drops the capture with a
-counted reason without changing the call. No per-tenant client, queue, or
-backlog outlives the call. The same writer submits Verifier results to the
+each captured row with the verified pair the call ran under. Each `wyrd-server` process stages captures on its one
+Scribe outbox, which submits in-process when Scribe runs in the pod
+(`WYRD_TARGET`) and otherwise over the peer plane to a live, ready Scribe,
+retrying Scribe backpressure. A capturing call reserves its outbox slot during
+admission, before it is charged or dispatched; while the outbox is full,
+admission backs off and retries until the call's deadline, and then refuses the
+call with the retryable `WYRD_GATEWAY_429_CAPTURE_STAGING_FULL`. A reserved
+capture is never shed. Payload, storage, or deadline failures while the
+capture is projected drop it with a counted reason without changing the
+answered call. The same outbox submits Verifier results to the
 three result tables, attributed to the pair the result was produced under —
 the caller's verified pair for a realtime invocation, and the run's subject
 with the tenant's `System` principal as actor for a queued run — which Scribe

@@ -8,9 +8,9 @@
 //! owns the bounded queue, per-lane batching, retry with backoff, and
 //! shutdown; [`SubmissionSink`] is its one durable write. Each tenant's work
 //! is spread over [`SubmissionSink::LANES`] lanes that commit concurrently;
-//! every submission under one idempotency key, and every candidate of one
-//! binding, shares a lane, so its retries and conflicts are decided in
-//! arrival order. Each write is one tenant transaction: submissions resolve
+//! every submission under one idempotency key shares a lane, and every
+//! scheduled and group candidate of a tenant shares lane 0, so their
+//! retries, conflicts, and source transitions are decided in arrival order. Each write is one tenant transaction: submissions resolve
 //! each distinct target through [`VerifierCardCache::resolve`], the one read
 //! route every Verifier execution shares, and are accepted through
 //! [`VerifierExecutionQueue::accept_submissions`]; candidates are admitted
@@ -120,25 +120,26 @@ impl SubmissionSink {
     /// The lane of one queued execution. A keyed submission's lane is the
     /// hash of its (subject, actor, key), so every request under one key is
     /// decided in arrival order; an unkeyed one has no order to keep and
-    /// hashes its execution ID. A scheduled or group candidate hashes its
-    /// binding, so one binding's candidates are admitted in arrival order.
+    /// hashes its execution ID. Scheduled and group candidates share lane 0,
+    /// so a tenant's background admissions are admitted in arrival order and
+    /// batched together, with one writer moving their cursors and pending
+    /// rows at a time.
     pub(crate) fn admission_lane(admission: &Admission) -> u64 {
+        let Admission::Submitted(submission) = admission else {
+            return 0;
+        };
         let mut hasher = DefaultHasher::new();
-        match admission {
-            Admission::Submitted(submission) => match &submission.key {
-                Some(key) => {
-                    let attribution = submission.authority.attribution();
-                    (
-                        attribution.sub_principal_id,
-                        attribution.act_principal_id,
-                        &key.key,
-                    )
-                        .hash(&mut hasher);
-                }
-                None => submission.execution_id.hash(&mut hasher),
-            },
-            Admission::Scheduled(admission) => admission.binding_id.hash(&mut hasher),
-            Admission::Grouped(admission) => admission.binding_id.hash(&mut hasher),
+        match &submission.key {
+            Some(key) => {
+                let attribution = submission.authority.attribution();
+                (
+                    attribution.sub_principal_id,
+                    attribution.act_principal_id,
+                    &key.key,
+                )
+                    .hash(&mut hasher);
+            }
+            None => submission.execution_id.hash(&mut hasher),
         }
         hasher.finish()
     }

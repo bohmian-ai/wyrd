@@ -16,8 +16,10 @@ use axum::body::{Body, to_bytes};
 use axum::http::{Method, Request, StatusCode, header};
 use secrecy::SecretString;
 use serde_json::{Value, json};
+use sqlx::{AssertSqlSafe, PgPool};
 use tokio::sync::Semaphore;
 use tokio_util::sync::CancellationToken;
+use uuid::Uuid;
 use vala_bifrost_redux::catalog::TableRef;
 use vala_bifrost_redux::namespaces::BifrostNamespace;
 use wyrd_client::WyrdClient;
@@ -37,15 +39,16 @@ use wyrd_server::verification::groups::GroupPoller;
 use wyrd_server::verification::inputs::InputResolver;
 use wyrd_server::verification::results::{ResultPayload, ResultPayloadBuilder, ResultRun};
 use wyrd_server::verification::scheduler::{GroupHandoff, VerificationScheduler};
-use wyrd_spec::ids::{CardUid, ExecutionId, GroupId, SlotName};
+use wyrd_spec::ids::{BindingId, CardUid, ExecutionId, GroupId, SlotName};
 use wyrd_spec::registry::DeclarationReceipt;
 use wyrd_spec::verification::execution::{InputDeclaration, VerificationResult};
 use wyrd_sql::TenantConn;
 use wyrd_sql::queries::auth::service_accounts::system_principal_id;
 use wyrd_sql::queries::verifier_executions::{
-    ClaimedExecution, EnqueueOutcome, ExecutionInput, GroupActivity, Prepared,
-    VerifierExecutionQueue,
+    ClaimedExecution, EnqueueOutcome, ExecutionInput, GroupActivity, Prepared, ScheduleOutcome,
+    ScheduleTick, VerifierExecutionQueue,
 };
+use wyrd_testing::verification::VerificationFixture;
 use wyrd_testing::{Bootstrap, WyrdTestServer};
 
 /// How long an accepted enqueue may take to become readable.
@@ -1194,5 +1197,210 @@ async fn pending_groups_debounce_and_stop_after_handoff() {
     assert!(
         support.errored("unroled").await.is_empty(),
         "nothing is refused"
+    );
+}
+
+/// Bring `binding`'s schedule cursor claimable now: one claim delay behind
+/// PostgreSQL's clock.
+///
+/// # Panics
+/// Panics when the update fails.
+async fn claimable(support: &Support, binding: BindingId) {
+    let mut conn = support.conn().await;
+    sqlx::query(
+        "UPDATE wyrd.verification_bindings
+            SET next_run_at = statement_timestamp() - INTERVAL '30 seconds'
+          WHERE binding_id = $1",
+    )
+    .bind(binding.as_uuid())
+    .execute(&mut **conn.transaction())
+    .await
+    .expect("the cursor comes due");
+    conn.commit().await.expect("the cursor commits");
+}
+
+/// The transaction that last wrote `row` of `table`, read as the superuser.
+///
+/// # Panics
+/// Panics when the row cannot be read.
+async fn writer_xid(assertion: &PgPool, table: &str, key: &str, row: Uuid) -> String {
+    sqlx::query_scalar(AssertSqlSafe(format!(
+        "SELECT xmin::text FROM {table} WHERE {key} = $1"
+    )))
+    .bind(row)
+    .fetch_one(assertion)
+    .await
+    .expect("the row reads")
+}
+
+/// The queue writer batches one tenant's acknowledged background work: while
+/// a first scheduled run's admission is held in its transaction, the
+/// scheduler still prepares the next due binding and the group pass the due
+/// group, and further passes prepare neither outstanding item again. Once
+/// released, the held run commits alone and the scheduled and group runs,
+/// with the scheduled cursor advance and the group's pending-row consumption,
+/// commit together in one transaction.
+///
+/// # Panics
+/// Panics when preparation waits on the held admission, an outstanding item
+/// is prepared twice, or the later admissions and their source transitions
+/// do not share one commit.
+#[tokio::test]
+async fn queued_origins_share_batched_admission() {
+    let support = Support::start().await;
+    let tenant = support.server.data_tenant_id();
+    let state = support.server.state();
+    support.turn("batched", "yes", None).await;
+    support.turn("batched", "later", None).await;
+    let seed = VerificationFixture::provision(state, tenant)
+        .await
+        .expect("tenant provisions");
+    let verifier = seed
+        .drift_verifier("nightly")
+        .await
+        .expect("verifier registers");
+    let mut bindings = Vec::new();
+    for name in ["held", "batched"] {
+        let (owner, principal) = seed.service(name).await.expect("owner registers");
+        bindings.push(
+            seed.bind_schedule(&owner, &owner, &verifier, "0 2 * * *", Vec::new())
+                .await
+                .expect("binding projects"),
+        );
+        seed.activate(principal, &owner)
+            .await
+            .expect("owner activates");
+    }
+    let [held, batched] = bindings[..] else {
+        panic!("two bindings project");
+    };
+    support.server.flush_bifrost().await.expect("setup settles");
+    support.make_due().await;
+    let capacity = Arc::new(Semaphore::new(4));
+    let scheduler = support.scheduler(&capacity);
+    let stop = CancellationToken::new();
+    let assertion = support
+        .server
+        .pg_fixture()
+        .superuser_pool()
+        .expect("fixture exposes a superuser pool");
+    let mut blocker = assertion.begin().await.expect("blocker begins");
+    sqlx::query("LOCK TABLE wyrd.verifier_executions IN SHARE MODE")
+        .execute(&mut *blocker)
+        .await
+        .expect("table locks");
+
+    claimable(&support, held).await;
+    let ticks = scheduler.pass(&stop).await.expect("the pass runs");
+    let [
+        ScheduleTick {
+            outcome: ScheduleOutcome::Enqueued(first),
+            ..
+        },
+    ] = ticks[..]
+    else {
+        panic!("the held binding calls for a run: {ticks:?}");
+    };
+    let deadline = tokio::time::Instant::now() + VISIBLE;
+    while !sqlx::query_scalar::<_, bool>(
+        "SELECT EXISTS (SELECT 1 FROM pg_locks
+                         WHERE relation = 'wyrd.verifier_executions'::regclass
+                           AND mode = 'RowExclusiveLock' AND NOT granted)",
+    )
+    .fetch_one(&assertion)
+    .await
+    .expect("lock waiters read")
+    {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the acknowledged run's admission never blocked"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+
+    claimable(&support, batched).await;
+    let ticks = scheduler.pass(&stop).await.expect("the pass runs");
+    let [
+        ScheduleTick {
+            binding_id,
+            outcome: ScheduleOutcome::Enqueued(second),
+            next_run_at,
+            ..
+        },
+    ] = ticks[..]
+    else {
+        panic!("only the next binding calls for a run: {ticks:?}");
+    };
+    assert_eq!(
+        binding_id, batched,
+        "the held binding is not prepared again"
+    );
+    let handed = scheduler.group_pass(&stop).await.expect("the pass runs");
+    let [GroupHandoff::Enqueued(grouped)] = handed[..] else {
+        panic!("the due group hands off: {handed:?}");
+    };
+    assert!(
+        scheduler
+            .pass(&stop)
+            .await
+            .expect("the pass runs")
+            .is_empty()
+            && scheduler
+                .group_pass(&stop)
+                .await
+                .expect("the pass runs")
+                .is_empty(),
+        "outstanding work is not prepared again"
+    );
+    let unwritten = state
+        .bifrost
+        .scribe_outbox()
+        .settle(std::time::Instant::now() + VISIBLE)
+        .await;
+    assert_eq!(unwritten, 0, "every input is acknowledged");
+    assert!(
+        support.pending("batched").await.is_some(),
+        "the group stays pending until admitted"
+    );
+
+    blocker.rollback().await.expect("the writer is released");
+    support
+        .server
+        .settle_bifrost_outbox()
+        .await
+        .expect("the acknowledged runs are admitted");
+    let executions = "wyrd.verifier_executions";
+    let held_commit = writer_xid(&assertion, executions, "execution_id", first.as_uuid()).await;
+    let batch = writer_xid(&assertion, executions, "execution_id", second.as_uuid()).await;
+    assert_ne!(held_commit, batch, "the held run committed alone");
+    assert_eq!(
+        writer_xid(&assertion, executions, "execution_id", grouped.as_uuid()).await,
+        batch,
+        "the scheduled and group runs share one commit"
+    );
+    assert_eq!(
+        writer_xid(
+            &assertion,
+            "wyrd.verification_bindings",
+            "binding_id",
+            batched.as_uuid()
+        )
+        .await,
+        batch,
+        "the cursor advance commits with its run"
+    );
+    let mut conn = support.conn().await;
+    let cursor: Option<chrono::DateTime<chrono::Utc>> = sqlx::query_scalar(
+        "SELECT next_run_at FROM wyrd.verification_bindings WHERE binding_id = $1",
+    )
+    .bind(batched.as_uuid())
+    .fetch_one(&mut **conn.transaction())
+    .await
+    .expect("the cursor reads");
+    assert_eq!(cursor, next_run_at);
+    drop(conn);
+    assert!(
+        support.pending("batched").await.is_none(),
+        "the admission consumed the group"
     );
 }

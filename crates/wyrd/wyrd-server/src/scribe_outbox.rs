@@ -1606,7 +1606,7 @@ impl OutboxSink for ScribeSink {
     /// commit no later than the result while different executions spread. A
     /// queued execution's inputs record lanes as
     /// [`SubmissionSink::admission_lane`] does, so requests sharing an
-    /// idempotency key, or candidates of one binding, are acknowledged, and
+    /// idempotency key, or a tenant's scheduled and group candidates, are acknowledged, and
     /// handed to that outbox, in arrival order; its result is staged only
     /// after the execution was admitted. Server spans take lane 0. No reader relies on cross-batch commit
     /// order: group lists order by the recorded input time or a declared key.

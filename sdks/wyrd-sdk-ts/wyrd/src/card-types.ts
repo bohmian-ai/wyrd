@@ -3177,6 +3177,32 @@ export interface Metadata {
 }
 
 /**
+ * One stateless fixture rule of the [`ProviderAdapter::Mock`] adapter.
+ *
+ * Every supplied condition must match a call for the rule to answer it.
+ * Rules never consume state, so concurrent calls see the same rules.
+ */
+export interface MockRule {
+  /**
+   * Literal text some textual message content must contain; nonempty.
+   */
+  readonly contains?: string | null;
+  /**
+   * Protocol role the conversation's last message must have, such as
+   * `user` or `tool`.
+   */
+  readonly last_message_role?: string | null;
+  /**
+   * Selected model identifier the call must name exactly.
+   */
+  readonly model: ModelId;
+  /**
+   * Buffered OpenAI Chat Completions response returned unchanged.
+   */
+  readonly response: OpenAiChatResponse;
+}
+
+/**
  * Provider-native gateway model identifier: 1..=255 UTF-8 bytes without control characters.
  */
 export type ModelId = string;
@@ -3467,6 +3493,151 @@ export interface NumpyMeta {
    * Array shape inferred by the Python boundary.
    */
   readonly shape?: readonly number[];
+}
+
+export interface OpenAiChatChoice {
+  readonly finish_reason?: string | null;
+  readonly index: number;
+  readonly logprobs?: OpenAiChatLogprobs | null;
+  readonly message: OpenAiChatMessage;
+}
+
+export interface OpenAiChatLogprobs {
+  readonly content?: readonly JsonValue[];
+  readonly refusal?: readonly JsonValue[];
+}
+
+/**
+ * One chat message on the wire.
+ */
+export interface OpenAiChatMessage {
+  /**
+   * URL citations from web search, when present.
+   */
+  readonly annotations?: readonly OpenAiMessageAnnotation[];
+  /**
+   * Audio output, when present.
+   */
+  readonly audio?: OpenAiMessageAudio | null;
+  readonly content?: OpenAiMessageContent | null;
+  readonly name?: string | null;
+  readonly refusal?: string | null;
+  readonly role: string;
+  readonly tool_call_id?: string | null;
+  readonly tool_calls?: readonly OpenAiToolCall[] | null;
+}
+
+/**
+ * Response envelope.
+ */
+export interface OpenAiChatResponse {
+  readonly choices: readonly OpenAiChatChoice[];
+  readonly created: number;
+  readonly id: string;
+  readonly model: string;
+  readonly object: string;
+  readonly service_tier?: string | null;
+  readonly system_fingerprint?: string | null;
+  readonly usage?: OpenAiUsage | null;
+}
+
+export interface OpenAiCompletionTokensDetails {
+  readonly accepted_prediction_tokens?: number;
+  readonly audio_tokens?: number;
+  readonly reasoning_tokens?: number;
+  readonly rejected_prediction_tokens?: number;
+}
+
+export type OpenAiContentPart = OpenAiContentPartText | OpenAiContentPartImageUrl | OpenAiContentPartInputAudio | OpenAiContentPartFile;
+
+export interface OpenAiContentPartFile {
+  readonly file: OpenAiFilePart;
+  readonly type: "file";
+}
+
+export interface OpenAiContentPartImageUrl {
+  readonly image_url: OpenAiImageUrl;
+  readonly type: "image_url";
+}
+
+export interface OpenAiContentPartInputAudio {
+  readonly input_audio: OpenAiInputAudio;
+  readonly type: "input_audio";
+}
+
+export interface OpenAiContentPartText {
+  readonly text: string;
+  readonly type: "text";
+}
+
+export interface OpenAiFilePart {
+  readonly file_data?: string | null;
+  readonly file_id?: string | null;
+  readonly filename?: string | null;
+}
+
+export interface OpenAiImageUrl {
+  readonly detail?: string | null;
+  readonly url: string;
+}
+
+export interface OpenAiInputAudio {
+  readonly data: string;
+  readonly format: string;
+}
+
+/**
+ * A URL citation annotation returned by web search.
+ */
+export interface OpenAiMessageAnnotation {
+  readonly type: string;
+  readonly url_citation: OpenAiUrlCitation;
+}
+
+/**
+ * Audio output returned by the model.
+ */
+export interface OpenAiMessageAudio {
+  readonly data: string;
+  readonly expires_at: number;
+  readonly id: string;
+  readonly transcript: string;
+}
+
+export type OpenAiMessageContent = string | readonly OpenAiContentPart[];
+
+export interface OpenAiPromptTokensDetails {
+  readonly audio_tokens?: number;
+  readonly cached_tokens?: number;
+}
+
+export interface OpenAiToolCall {
+  readonly function: OpenAiToolFunctionCall;
+  readonly id: string;
+  readonly type: string;
+}
+
+export interface OpenAiToolFunctionCall {
+  readonly arguments: string;
+  readonly name: string;
+}
+
+/**
+ * Citation metadata for a web search result.
+ */
+export interface OpenAiUrlCitation {
+  readonly end_index: number;
+  readonly start_index: number;
+  readonly title: string;
+  readonly url: string;
+}
+
+export interface OpenAiUsage {
+  readonly completion_tokens: number;
+  readonly completion_tokens_details?: OpenAiCompletionTokensDetails | null;
+  readonly prompt_tokens: number;
+  readonly prompt_tokens_details?: OpenAiPromptTokensDetails | null;
+  readonly total_tokens: number;
 }
 
 /**
@@ -4267,9 +4438,25 @@ export interface PromptSpec {
  * The built-in variants use Skald's typed provider protocols and authenticate
  * with a credential of their reserved provider identity. `OpenAiCompatible`
  * uses the standard OpenAI routes under `base_url` with a credential of any
- * non-reserved provider identity.
+ * non-reserved provider identity. `Mock` answers inside the gateway from
+ * explicit fixture rules, contacts no upstream, and takes no credential.
  */
-export type ProviderAdapter = "openai" | "anthropic" | "gemini" | ProviderAdapterVertex | "jev" | ProviderAdapterOpenaiCompatible;
+export type ProviderAdapter = "openai" | "anthropic" | "gemini" | ProviderAdapterVertex | "jev" | ProviderAdapterOpenaiCompatible | ProviderAdapterMock;
+
+/**
+ * Internal mock answering buffered OpenAI Chat Completions from fixture
+ * rules; the first matching rule's response is the answer.
+ */
+export interface ProviderAdapterMock {
+  readonly mock: ProviderAdapterMockMock;
+}
+
+export interface ProviderAdapterMockMock {
+  /**
+   * Ordered fixture rules; nonempty.
+   */
+  readonly rules: readonly MockRule[];
+}
 
 /**
  * Standard OpenAI-compatible routes under a tenant base URL.

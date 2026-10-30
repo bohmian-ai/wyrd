@@ -287,7 +287,10 @@ credential.
   workload-issuer client secrets and gateway `managed_secret` provider keys.
   A gateway managed secret is sealed with its tenant, name, and provider
   inside the authenticated payload, so an envelope copied into another
-  tenant's or credential's row does not open. Wyrd stores no recoverable access token,
+  tenant's or credential's row does not open. A `mock` gateway deployment holds no
+  credential and opens no connection; its fixtures are tenant configuration
+  under ordinary gateway permissions, and its attempts are attributed to
+  provider `mock`, never to a real provider. Wyrd stores no recoverable access token,
   refresh token, authorization code, device code, or API key.
 - `wyrd init` keeps local database URLs and the tenant key only in the
   protected `credentials.toml`; `config.toml` `[dev]` holds non-secret

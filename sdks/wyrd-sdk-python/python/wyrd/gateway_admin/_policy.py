@@ -127,14 +127,50 @@ class OpenAiCompatibleAdapter(TypedDict):
     openai_compatible: _OpenAiCompatibleBase
 
 
+class MockRule(TypedDict):
+    """One stateless fixture rule of the internal mock adapter.
+
+    ``model`` must equal the called model exactly; ``last_message_role``, when
+    given, the last message's role; ``contains``, when given, a nonempty
+    literal substring of some textual message content. ``response`` is a
+    buffered ``chat.completion`` answer with at least one choice, returned
+    unchanged. Unknown keys are rejected.
+    """
+
+    model: str
+    last_message_role: NotRequired[str]
+    contains: NotRequired[str]
+    response: dict[str, object]
+
+
+class _MockRules(TypedDict):
+    rules: list[MockRule]
+
+
+class MockAdapter(TypedDict):
+    """Internal mock answering buffered Chat Completions from fixture rules.
+
+    The first rule in ``mock.rules`` (nonempty) matching a call answers it;
+    an unmatched or streamed call is refused with
+    ``WYRD_GATEWAY_400_INVALID_REQUEST``. It contacts no upstream, needs
+    ``auth: "none"``, and its attempts are attributed to provider ``mock`` and
+    never billed.
+    """
+
+    mock: _MockRules
+
+
 ProviderAdapter = (
-    Literal["openai", "anthropic", "gemini", "jev"] | VertexAdapter | OpenAiCompatibleAdapter
+    Literal["openai", "anthropic", "gemini", "jev"]
+    | VertexAdapter
+    | OpenAiCompatibleAdapter
+    | MockAdapter
 )
 """Upstream protocol family a deployment speaks.
 
 ``"openai"``, ``"anthropic"``, ``"gemini"``, and ``"jev"`` require a credential
 for the provider of the same name. OpenAI-protocol adapters serve every operation except
-``system_one``; the Anthropic, Gemini, and Vertex adapters serve
+``system_one``; the Anthropic, Gemini, Vertex, and mock adapters serve
 ``chat_completions`` only. The Jev adapter serves ``system_one``, typed
 ``{"model", "state", "questions"}`` requests answered by typed ``answers``, and
 a ``chat_completions`` pass-through whose last user message is the JSON text of

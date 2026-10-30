@@ -97,7 +97,7 @@ Owners reused: `Bifrost`/`bifrost.query` through the TASK-003 executor and `load
 
 | Acceptance criterion | Implementation evidence | Verification evidence | Result |
 |---|---|---|---|
-| StatStrip, FacetRail, RecordTable, TraceWaterfall, RecordDetail: T1 states | `packages/ui/src/lib/components/*.svelte`; `EmptyState` for loading/empty/denied/error | `TASK-004: Canonical signal interactions` (state shells for all five); `/_gallery` Observe board, headless Chrome at 1280 and 390 px, no page overflow | PASS |
+| StatStrip, FacetRail, RecordTable, TraceWaterfall, RecordDetail: T1 states | `packages/ui/src/lib/components/*.svelte`; `EmptyState` for loading/empty/denied/error | `TASK-004: Canonical signal interactions` (state shells for all five) proves states only; no comparison against the canvas boards was made. Board fidelity (Main, Spans, TraceDrawer, Logs, Metrics, Agent, Service) fails on layout, columns, typography, colour and formats | FAIL |
 | T2 actual requests and shape | `observe.ts::Binds`, `listQuery`, `countsQuery`, `facetQuery`, `statQueries`, `waterfallQuery`, `detailQuery`; values bound as `$n`, columns from `SIGNALS` | Exact SQL/params for traces (root rows of traces with any matching span), counts for visible traces only, logs facets, cost per currency, tokens from `gateway.calls.usage`; refused list issues no dependent read | PASS |
 | T3 view validation and render | `LOADERS`, `VIEWS` in `WyrdView.svelte`; catalog regenerated | Schema refusals (unknown column, injected trace id, `where` on gateway stats); WyrdView with all panels and the live interval | PASS |
 | T4 built AppBridge HTML | `dist/wyrd-view.html` | `TASK-004: Authorized Observe across hosts` AppBridge RecordTable + TraceWaterfall | PASS |
@@ -117,4 +117,4 @@ Limits: Int64 values above 2^53 lose precision in JSON transport; spans have no 
 
 Non-goals confirmed: no Observe routes, no ingest schema, no new transport or lifecycle owner, no dependency added; only the UI package, gallery, fixtures and tests changed.
 
-Human visual checkpoint: pending — each of the five components on `/_gallery`, light/dark, desktop/mobile, keyboard and touch.
+Human visual checkpoint: not reached. The components do not match their canvas boards and the gallery does not label each component with its board; the task is not IMPLEMENTED.

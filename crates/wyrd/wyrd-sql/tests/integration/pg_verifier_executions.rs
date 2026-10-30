@@ -40,11 +40,11 @@ use wyrd_sql::queries::verification::{
 };
 use wyrd_sql::queries::verification_target::VerificationTargets;
 use wyrd_sql::queries::verifier_executions::{
-    Cause, ClaimedExecution, Completion, EnqueueOutcome, EnqueueRefusal, ExecutionAuthority,
-    ExecutionInput, ExecutionLease, ExecutionOrigin, ExecutionStatus, GroupActivity,
-    GroupSelection, PinnedGroup, QueueCounts, RetryOutcome, ScheduleOutcome, ScheduleSkip,
-    ScheduleTick, Settlement, Submission, SubmissionOutcome, TerminalStatus,
-    VerifierExecutionQueue,
+    Cause, ClaimedExecution, Completion, DueSettlement, EnqueueOutcome, EnqueueRefusal,
+    ExecutionAuthority, ExecutionInput, ExecutionLease, ExecutionOrigin, ExecutionStatus,
+    GroupActivity, GroupSelection, PinnedGroup, Prepared, QueueCounts, RetryOutcome,
+    ScheduleOutcome, ScheduleSkip, ScheduleTick, ScheduledAdmission, Settlement, Submission,
+    SubmissionOutcome, TerminalStatus, VerifierExecutionQueue,
 };
 use wyrd_sql::row_types::cards::CardStatus;
 
@@ -3408,4 +3408,315 @@ async fn a_batch_completes_many_executions_like_complete() {
         dispatches, 2,
         "only the failed binding run dispatches, once"
     );
+}
+
+/// Claim and decide the next due binding, owned by `owner`, into a
+/// scheduled candidate the way the server scheduler does, writing nothing.
+///
+/// # Panics
+/// Panics when nothing is due or the tick settles without a candidate.
+async fn scheduled_candidate(
+    queue: &VerifierExecutionQueue,
+    conn: &mut TenantConn<'_>,
+    owner: PrincipalId,
+) -> ScheduledAdmission {
+    let due = queue
+        .claim_due(conn, &[])
+        .await
+        .expect("due binding claims")
+        .expect("the binding is due");
+    let authority = background(conn, owner).await;
+    match queue
+        .settle_due(conn, due, Some(authority))
+        .await
+        .expect("due binding settles")
+    {
+        DueSettlement::Candidate(admission) => *admission,
+        DueSettlement::Settled(tick) => panic!("expected a candidate, got {tick:?}"),
+    }
+}
+
+/// Count `binding`'s pending group rows.
+///
+/// # Panics
+/// Panics when the count cannot be read.
+async fn pending_groups(conn: &mut TenantConn<'_>, binding: BindingId) -> i64 {
+    sqlx::query_scalar("SELECT count(*) FROM wyrd.verification_group_pending WHERE binding_id = $1")
+        .bind(binding.as_uuid())
+        .fetch_one(&mut **conn.transaction())
+        .await
+        .expect("pending groups count")
+}
+
+/// Acknowledged admission moves source state only in its own transaction and
+/// only from the state its candidate was prepared from. Preparing writes
+/// nothing, so the same occurrence yields two candidates; a rolled-back
+/// admission leaves the occurrence due; two concurrent admissions accept one
+/// execution and advance the cursor once; a replay after the cursor was edited
+/// answers the accepted execution and leaves the edit. A group candidate
+/// consumes its pending row only while that row holds the candidate's
+/// generation, so newer activity on the row, or a row consumed and recreated
+/// since, stays pending; same-content candidates accept one execution.
+///
+/// # Panics
+/// Panics when preparation writes, a rollback or replay moves source state,
+/// contenders accept twice, or a stale generation consumes a pending row.
+#[tokio::test]
+async fn acknowledged_admission_preserves_scheduling_state() {
+    let fixture = PgFixture::start().await.expect("fixture starts");
+    let actor = actor(fixture.data_tenant_id());
+    let queue = VerifierExecutionQueue::default();
+    let mut setup = fixture
+        .tenant_conn()
+        .await
+        .expect("tenant connection opens");
+    provision_system_principal(&mut setup, Attribution::unresolved())
+        .await
+        .expect("the tenant SYSTEM principal provisions");
+    let (owner, principal) = declare_service(&mut setup, &actor, "svc").await;
+    let verifier = register_verifier(&mut setup, &actor, "drift", custom_drift()).await;
+    let binding = bind(&mut setup, &owner, &verifier, Vec::new()).await;
+    record_machine_authentication(&mut setup, principal, &owner)
+        .await
+        .expect("owner activates");
+    let due = database_now(&mut setup).await - SCHEDULE_CLAIM_DELAY;
+    set_cursor(&mut setup, binding, Some(due)).await;
+    setup.commit().await.expect("setup commits");
+
+    let mut conn = fixture.tenant_conn().await.expect("scheduler opens");
+    let first = scheduled_candidate(&queue, &mut conn, principal).await;
+    conn.rollback().await.expect("scheduler rolls back");
+    let mut conn = fixture.tenant_conn().await.expect("scheduler opens");
+    let second = scheduled_candidate(&queue, &mut conn, principal).await;
+    conn.rollback().await.expect("scheduler rolls back");
+    assert_ne!(first.execution_id, second.execution_id);
+    assert_eq!(first.window, second.window, "both prepare one occurrence");
+    let next = first
+        .tick(ScheduleOutcome::Enqueued(first.execution_id))
+        .next_run_at;
+
+    let mut conn = fixture.tenant_conn().await.expect("writer opens");
+    assert_eq!(
+        queue
+            .accept_scheduled(&mut conn, &first)
+            .await
+            .expect("admission answers"),
+        EnqueueOutcome::Enqueued(first.execution_id)
+    );
+    conn.rollback().await.expect("writer rolls back");
+    let mut conn = fixture.tenant_conn().await.expect("reader opens");
+    assert_eq!(
+        execution_count(&mut conn).await,
+        0,
+        "rollback admits nothing"
+    );
+    assert_eq!(
+        cursor(&mut conn, binding).await,
+        Some(due),
+        "the cursor stays due"
+    );
+    drop(conn);
+
+    let mut earlier = fixture.tenant_conn().await.expect("earlier writer opens");
+    let mut later = fixture.tenant_conn().await.expect("later writer opens");
+    let mut probe = fixture.tenant_conn().await.expect("probe opens");
+    assert_eq!(
+        queue
+            .accept_scheduled(&mut earlier, &first)
+            .await
+            .expect("earlier admission answers"),
+        EnqueueOutcome::Enqueued(first.execution_id)
+    );
+    let later_accept = async {
+        let outcome = queue
+            .accept_scheduled(&mut later, &second)
+            .await
+            .expect("later admission answers");
+        later.commit().await.expect("later commits");
+        outcome
+    };
+    tokio::pin!(later_accept);
+    let raced = tokio::select! {
+        outcome = &mut later_accept => Some(outcome),
+        () = await_blocked_backend(&mut probe) => None,
+    };
+    assert_eq!(raced, None, "the later contender waits for the earlier one");
+    earlier.commit().await.expect("earlier commits");
+    assert_eq!(
+        later_accept.await,
+        EnqueueOutcome::AlreadyEnqueued(first.execution_id),
+        "the later contender answers the accepted execution"
+    );
+    drop(probe);
+    let mut conn = fixture.tenant_conn().await.expect("reader opens");
+    assert_eq!(execution_count(&mut conn).await, 1);
+    assert_eq!(
+        cursor(&mut conn, binding).await,
+        next,
+        "the cursor moved once"
+    );
+
+    let edited = database_now(&mut conn).await + Duration::hours(1);
+    set_cursor(&mut conn, binding, Some(edited)).await;
+    assert_eq!(
+        queue
+            .accept_scheduled(&mut conn, &second)
+            .await
+            .expect("replay answers"),
+        EnqueueOutcome::AlreadyEnqueued(first.execution_id)
+    );
+    assert_eq!(
+        cursor(&mut conn, binding).await,
+        Some(edited),
+        "a replay leaves an edited cursor"
+    );
+    conn.commit().await.expect("replay commits");
+
+    let mut conn = fixture.tenant_conn().await.expect("groups open");
+    let source = register_verifier(&mut conn, &actor, "turn", custom_drift()).await;
+    let judge = register_verifier(&mut conn, &actor, "conversation", custom_drift()).await;
+    let slot = SlotName::new("turns").expect("valid slot name");
+    let bindings = project_bindings(
+        &mut conn,
+        &owner,
+        &CardKind::Service,
+        &[NewBinding {
+            subject_occurrence_key: OWNER_OCCURRENCE_KEY.to_owned(),
+            card_uid: owner.clone(),
+            verifier_card_uid: judge,
+            trigger: FrozenTarget::Digest("sha256:trigger".to_owned()),
+            operators: Vec::new(),
+            activation: BindingActivation::GroupEnd(GroupEndSettings {
+                after: TriggerDuration::parse("1h").expect("valid duration"),
+                sources: BTreeMap::from([(
+                    slot,
+                    GroupSource {
+                        reference: source_text(),
+                        subject_occurrence_key: OWNER_OCCURRENCE_KEY.to_owned(),
+                        card_uid: owner.clone(),
+                        verifier_card_uid: source.clone(),
+                    },
+                )]),
+                order_by: None,
+            }),
+        }],
+    )
+    .await
+    .expect("group binding projects");
+    let group_binding = bindings[0];
+    let authority = background(&mut conn, principal).await;
+    conn.commit().await.expect("group setup commits");
+    let activity = [GroupActivity {
+        owner_card_uid: owner.clone(),
+        card_uid: owner.clone(),
+        verifier_card_uid: source,
+        group_id: GroupId::new("order-1").expect("valid group id"),
+    }];
+    let record = async |conn: &mut TenantConn<'_>| {
+        queue
+            .record_group_activity(conn, &activity)
+            .await
+            .expect("activity records");
+    };
+    let claim = async |conn: &mut TenantConn<'_>| {
+        sqlx::query(
+            "UPDATE wyrd.verification_group_pending
+                SET due_at = statement_timestamp() - INTERVAL '1 second'
+              WHERE binding_id = $1",
+        )
+        .bind(group_binding.as_uuid())
+        .execute(&mut **conn.transaction())
+        .await
+        .expect("row expires");
+        queue
+            .claim_due_group(conn, &[])
+            .await
+            .expect("claim")
+            .expect("an expired group is due")
+    };
+    let prepare = async |conn: &mut TenantConn<'_>, snapshot: &PinnedGroup, generation| match queue
+        .prepare_group(conn, group_binding, snapshot, &authority, Some(generation))
+        .await
+        .expect("group prepares")
+    {
+        Prepared::Candidate(admission) => admission,
+        other => panic!("expected a group candidate, got {other:?}"),
+    };
+    let snapshot = |n: usize| {
+        let executions: Vec<_> = (0..n).map(|_| (ExecutionId::new_v7(), None)).collect();
+        pinned(group_binding, "order-1", &executions)
+    };
+
+    let mut conn = fixture.tenant_conn().await.expect("poller opens");
+    record(&mut conn).await;
+    let due = claim(&mut conn).await;
+    let updated = prepare(&mut conn, &snapshot(1), due.generation).await;
+    conn.commit().await.expect("poller commits");
+    let mut conn = fixture.tenant_conn().await.expect("writer opens");
+    queue
+        .accept_grouped(&mut conn, &updated)
+        .await
+        .expect("admission answers");
+    conn.rollback().await.expect("writer rolls back");
+    let mut conn = fixture.tenant_conn().await.expect("writer opens");
+    assert_eq!(pending_groups(&mut conn, group_binding).await, 1);
+    record(&mut conn).await;
+    assert_eq!(
+        queue
+            .accept_grouped(&mut conn, &updated)
+            .await
+            .expect("admission answers"),
+        EnqueueOutcome::Enqueued(updated.execution_id)
+    );
+    assert_eq!(
+        pending_groups(&mut conn, group_binding).await,
+        1,
+        "newer activity on the row stays pending"
+    );
+
+    let due = claim(&mut conn).await;
+    let recreated = prepare(&mut conn, &snapshot(2), due.generation).await;
+    queue
+        .consume_group(&mut conn, &due)
+        .await
+        .expect("row consumed");
+    record(&mut conn).await;
+    assert_eq!(
+        queue
+            .accept_grouped(&mut conn, &recreated)
+            .await
+            .expect("admission answers"),
+        EnqueueOutcome::Enqueued(recreated.execution_id)
+    );
+    assert_eq!(
+        pending_groups(&mut conn, group_binding).await,
+        1,
+        "a recreated row stays pending"
+    );
+
+    let due = claim(&mut conn).await;
+    let current = snapshot(3);
+    let winner = prepare(&mut conn, &current, due.generation).await;
+    let loser = prepare(&mut conn, &current, due.generation).await;
+    assert_eq!(
+        queue
+            .accept_grouped(&mut conn, &winner)
+            .await
+            .expect("admission answers"),
+        EnqueueOutcome::Enqueued(winner.execution_id)
+    );
+    assert_eq!(
+        pending_groups(&mut conn, group_binding).await,
+        0,
+        "the current generation is consumed"
+    );
+    assert_eq!(
+        queue
+            .accept_grouped(&mut conn, &loser)
+            .await
+            .expect("admission answers"),
+        EnqueueOutcome::AlreadyEnqueued(winner.execution_id),
+        "same content accepts once"
+    );
+    conn.commit().await.expect("groups commit");
 }

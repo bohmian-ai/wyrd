@@ -610,6 +610,11 @@ async fn available_rows_form_expiring_group_snapshots() {
     support.make_due().await;
     let handed = scheduler.group_pass(&stop).await.expect("the pass runs");
     assert_eq!(handed.len(), 1, "{handed:?}");
+    support
+        .server
+        .settle_bifrost_outbox()
+        .await
+        .expect("the staged snapshot is acknowledged and admitted");
     assert!(
         support.pending("visible").await.is_none(),
         "the handoff consumes it"
@@ -844,6 +849,11 @@ async fn pending_groups_debounce_and_stop_after_handoff() {
     );
     let handed = scheduler.group_pass(&stop).await.expect("the pass runs");
     assert_eq!(handed.len(), 1, "{handed:?}");
+    support
+        .server
+        .settle_bifrost_outbox()
+        .await
+        .expect("the staged snapshot is acknowledged and admitted");
     assert!(
         support.pending("debounce").await.is_none(),
         "the handoff consumes it"
@@ -1175,6 +1185,11 @@ async fn pending_groups_debounce_and_stop_after_handoff() {
         matches!(handed.as_slice(), [GroupHandoff::Enqueued(_)]),
         "an owner without roles is still verified: {handed:?}"
     );
+    support
+        .server
+        .settle_bifrost_outbox()
+        .await
+        .expect("the staged snapshot is acknowledged and admitted");
     assert!(support.pending("unroled").await.is_none(), "it is consumed");
     assert!(
         support.errored("unroled").await.is_empty(),

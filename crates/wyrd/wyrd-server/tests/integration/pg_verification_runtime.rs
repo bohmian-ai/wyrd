@@ -2199,9 +2199,14 @@ async fn bound_server_composes_the_runtime_and_reports_it_ready() {
     assert!(!health.is_up(RuntimeCapability::Runner));
 }
 
-/// A scheduler cancelled while its occurrence transaction is parked holding
-/// the due binding admits nothing: the uncommitted enqueue and cursor advance
-/// roll back together once the lock is released, and no run exists.
+/// A scheduler cancelled while the transaction settling its occurrence is
+/// parked holding the due binding commits nothing: the uncommitted cursor
+/// advance rolls back once the lock is released, and no run exists.
+///
+/// The owner is never activated, so the occurrence settles as skipped in the
+/// scheduler's own transaction, the one queue write a scheduler still makes;
+/// a run is admitted only by the queue writer after its input's
+/// acknowledgement.
 ///
 /// # Panics
 /// Panics when the scheduler never blocks, does not stop while blocked, or a
@@ -2209,7 +2214,7 @@ async fn bound_server_composes_the_runtime_and_reports_it_ready() {
 #[tokio::test]
 async fn cancelled_scheduler_rolls_back_its_blocked_occurrence() {
     let harness = Harness::start().await;
-    let (owner, principal) = harness
+    let (owner, _) = harness
         .seed
         .service("owner")
         .await
@@ -2219,16 +2224,11 @@ async fn cancelled_scheduler_rolls_back_its_blocked_occurrence() {
         .bind_schedule(&owner, &owner, &harness.verifier, "0 2 * * *", Vec::new())
         .await
         .expect("binding projects");
-    harness
-        .seed
-        .activate(principal, &owner)
-        .await
-        .expect("owner activates");
     harness.make_due(binding).await;
     let armed = harness.cursor(binding).await;
-    assert!(armed.is_some(), "activation armed the schedule cursor");
+    assert!(armed.is_some(), "the schedule cursor is due");
 
-    let blocker = harness.block_writes("wyrd.verifier_executions").await;
+    let blocker = harness.block_writes("wyrd.verification_bindings").await;
     let runtime = RunningRuntime::spawn(
         VerificationRuntime::builder(harness.server.state())
             .limits(Harness::limits())
@@ -2236,7 +2236,7 @@ async fn cancelled_scheduler_rolls_back_its_blocked_occurrence() {
             .expect("the scheduler composes"),
     );
     let pid = harness
-        .wait_blocked_writer("wyrd.verifier_executions")
+        .wait_blocked_writer("wyrd.verification_bindings")
         .await;
     let holds_binding: bool = sqlx::query_scalar(
         "SELECT EXISTS (SELECT 1 FROM pg_locks WHERE pid = $1 AND granted \
@@ -2267,7 +2267,7 @@ async fn cancelled_scheduler_rolls_back_its_blocked_occurrence() {
     assert_eq!(
         harness.cursor(binding).await,
         armed,
-        "the cursor advance rolled back with the enqueue"
+        "the cursor advance rolled back"
     );
 }
 
@@ -2429,25 +2429,27 @@ async fn queued_origins_require_their_own_input_ack() {
 const SCHEDULE_COMMIT_LOCK: i64 = 0x5752_5343;
 
 /// A scheduler cancelled while an occurrence's `COMMIT` is in flight awaits
-/// that commit to a known result before closing: exactly one run and its
-/// atomic cursor advance are admitted, no later occurrence starts, and a
-/// restart preserves that state while scheduling only the untouched binding.
+/// that commit to a known result before closing: exactly one cursor advance
+/// is committed, no later occurrence starts, and a restart preserves it
+/// while settling only the untouched binding.
 ///
-/// A test-scoped deferred constraint trigger on run inserts makes the
-/// occurrence's `COMMIT` wait on an advisory lock the test holds, so the run
-/// insert and cursor advance are applied and the commit selected when `stop`
-/// fires.
+/// Neither owner is activated, so each occurrence settles as skipped in the
+/// scheduler's own transaction, the one commit a scheduler still selects; a
+/// run's admission is the queue writer's. A test-scoped deferred constraint
+/// trigger on binding updates makes that `COMMIT` wait on an advisory lock
+/// the test holds, so the cursor advance is applied and the commit selected
+/// when `stop` fires.
 ///
 /// # Panics
 /// Panics when the commit never blocks, the scheduler closes before its
 /// selected commit resolves, a second occurrence starts after cancellation,
-/// or restart duplicates or loses the committed occurrence.
+/// or restart loses the committed advance or never settles the other.
 #[tokio::test]
 async fn scheduler_awaits_its_selected_commit_before_closing() {
     let harness = Harness::start().await;
     let mut bindings = Vec::new();
     for name in ["first", "second"] {
-        let (owner, principal) = harness.seed.service(name).await.expect("owner registers");
+        let (owner, _) = harness.seed.service(name).await.expect("owner registers");
         bindings.push(
             harness
                 .seed
@@ -2455,11 +2457,6 @@ async fn scheduler_awaits_its_selected_commit_before_closing() {
                 .await
                 .expect("binding projects"),
         );
-        harness
-            .seed
-            .activate(principal, &owner)
-            .await
-            .expect("owner activates");
     }
     let mut armed = Vec::new();
     for binding in &bindings {
@@ -2480,7 +2477,7 @@ async fn scheduler_awaits_its_selected_commit_before_closing() {
         .expect("hold function grants");
     sqlx::query(AssertSqlSafe(format!(
         "CREATE CONSTRAINT TRIGGER test_hold_schedule_commit \
-         AFTER INSERT ON wyrd.verifier_executions \
+         AFTER UPDATE ON wyrd.verification_bindings \
          DEFERRABLE INITIALLY DEFERRED FOR EACH ROW \
          EXECUTE FUNCTION wyrd.test_hold_schedule_commit('{SCHEDULE_COMMIT_LOCK}')"
     )))
@@ -2521,12 +2518,6 @@ async fn scheduler_awaits_its_selected_commit_before_closing() {
         .expect("commit lock releases");
     runtime.stop().await;
 
-    let runs = harness.seed.executions().await.expect("executions read");
-    assert_eq!(
-        runs.len(),
-        1,
-        "exactly the selected occurrence was admitted"
-    );
     let mut cursors = Vec::new();
     for binding in &bindings {
         cursors.push(harness.cursor(*binding).await);
@@ -2537,10 +2528,10 @@ async fn scheduler_awaits_its_selected_commit_before_closing() {
     assert_eq!(
         advanced.len(),
         1,
-        "one atomic cursor advance, no later occurrence: {cursors:?} from {armed:?}"
+        "one committed cursor advance, no later occurrence: {cursors:?} from {armed:?}"
     );
 
-    sqlx::query("DROP TRIGGER test_hold_schedule_commit ON wyrd.verifier_executions")
+    sqlx::query("DROP TRIGGER test_hold_schedule_commit ON wyrd.verification_bindings")
         .execute(&harness.assertion)
         .await
         .expect("hold trigger drops");
@@ -2548,34 +2539,31 @@ async fn scheduler_awaits_its_selected_commit_before_closing() {
         .execute(&harness.assertion)
         .await
         .expect("hold function drops");
+    let committed = advanced[0];
+    let untouched = 1 - committed;
     let restarted = RunningRuntime::spawn(scheduler_only());
     let deadline = tokio::time::Instant::now() + WAIT;
-    while harness
-        .seed
-        .executions()
-        .await
-        .expect("executions read")
-        .len()
-        < 2
-    {
+    while harness.cursor(bindings[untouched]).await == armed[untouched] {
         assert!(
             tokio::time::Instant::now() < deadline,
-            "the untouched occurrence was never scheduled"
+            "the untouched occurrence was never settled"
         );
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
     restarted.stop().await;
-    let after = harness.seed.executions().await.expect("executions read");
-    assert_eq!(after.len(), 2, "one run per occurrence across restart");
-    assert!(
-        after.contains(&runs[0]),
-        "the admitted run survives restart"
-    );
-    let committed = advanced[0];
     assert_eq!(
         harness.cursor(bindings[committed]).await,
         cursors[committed],
-        "restart preserves the admitted cursor advance"
+        "restart preserves the committed cursor advance"
+    );
+    assert!(
+        harness
+            .seed
+            .executions()
+            .await
+            .expect("executions read")
+            .is_empty(),
+        "skipped occurrences create no run"
     );
 }
 

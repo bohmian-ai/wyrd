@@ -24,6 +24,7 @@ use chrono::{DateTime, Utc};
 use datafusion::parquet::arrow::ArrowWriter;
 use sha2::{Digest as _, Sha256};
 use sqlx::{AssertSqlSafe, PgPool, Postgres, Transaction};
+use tokio::sync::Semaphore;
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
@@ -34,14 +35,17 @@ use wyrd_server::verification::drift::DriftEngine;
 use wyrd_server::verification::engines::EngineOutcome;
 use wyrd_server::verification::fault::{PublicationFault, SentBatch};
 use wyrd_server::verification::fitter::{BaselineFitter, FitGate};
+use wyrd_server::verification::groups::GroupPoller;
 use wyrd_server::verification::health::RuntimeCapability;
 use wyrd_server::verification::runner::{EngineScript, VERIFIER_UNAVAILABLE};
-use wyrd_server::verification::scheduler::VerificationScheduler;
+use wyrd_server::verification::scheduler::{GroupHandoff, VerificationScheduler};
 use wyrd_server::verification::{CapabilityCrash, RuntimeLimits, VerificationRuntime};
 use wyrd_spec::DataTenantId;
 use wyrd_spec::card::drift::DriftMethod;
-use wyrd_spec::card::verifier::{Check, DriftBaselineState};
-use wyrd_spec::ids::{BindingId, CardUid, ExecutionId, FeatureName, SlotName};
+use wyrd_spec::card::trigger::TriggerDuration;
+use wyrd_spec::card::verifier::{Check, DriftBaselineState, OWNER_OCCURRENCE_KEY};
+use wyrd_spec::envelope::CardKind;
+use wyrd_spec::ids::{BindingId, CardUid, ExecutionId, FeatureName, GroupId, SlotName};
 use wyrd_spec::vala::ids::TraceId;
 use wyrd_spec::verification::TaskId;
 use wyrd_spec::verification::execution::InputDeclaration;
@@ -49,13 +53,17 @@ use wyrd_spec::verification::execution::{
     RequirementDetail, RequirementOutcome, RequirementResult, VerificationOutcome,
 };
 use wyrd_spec::verification::{
-    DriftReport, DriftVerdict, FeatureDriftReport, VerificationError, VerificationVerdict,
+    DriftReport, DriftVerdict, FeatureDriftReport, GroupEndSettings, GroupSource,
+    VerificationError, VerificationVerdict,
 };
 use wyrd_sql::queries::drift_baselines::DriftBaselineQueue;
 use wyrd_sql::queries::storage::artifact_metadata::{self, NewArtifactMetadata};
-use wyrd_sql::queries::verification::{BindingActivity, InactivityTimeout, binding_activity};
+use wyrd_sql::queries::verification::{
+    BindingActivation, BindingActivity, FrozenTarget, InactivityTimeout, NewBinding,
+    binding_activity, project_bindings, record_machine_authentication,
+};
 use wyrd_sql::queries::verifier_executions::{
-    ScheduleOutcome, ScheduleTick, TerminalStatus, VerifierExecutionQueue,
+    GroupActivity, ScheduleOutcome, ScheduleTick, TerminalStatus, VerifierExecutionQueue,
 };
 use wyrd_testing::WyrdTestServer;
 use wyrd_testing::logs::LogCapture;
@@ -5688,4 +5696,193 @@ async fn trace_unavailability_preserves_execution_mode() {
             ("oversized trace", vec!["inconclusive".to_owned()]),
         ]
     );
+}
+
+/// Work admitted on one replica runs on another that never hears of it: a
+/// producer pod admits a submitted, a scheduled, and a grouped run through
+/// its own queue writer, whose wake reaches only that pod's idle runner,
+/// which it does not run. A runner on the second pod, sharing only
+/// Postgres and Bifrost, finds all three by polling the queue and runs each
+/// once.
+///
+/// # Panics
+/// Panics when a producer pass does not admit its run, or the second pod
+/// does not run every run exactly once.
+#[tokio::test]
+async fn accepted_origins_run_without_local_notification() {
+    use wyrd_testing::bifrost::cluster::{BifrostClusterSpec, WyrdTestCluster};
+
+    let cluster = WyrdTestCluster::start_spec(BifrostClusterSpec::two_mixed())
+        .await
+        .expect("two pods start");
+    let tenant = cluster.data_tenant_id();
+    let producer = cluster.server(0).expect("a producer pod");
+    let replica = cluster.server(1).expect("a runner pod");
+    let state = producer.state();
+    let (assertion, subject, _, jwt) = traced_tenant(producer, tenant, "producer-caller").await;
+    let seed = VerificationFixture::provision(state, tenant)
+        .await
+        .expect("tenant provisions");
+    let drift = seed
+        .drift_verifier("drift")
+        .await
+        .expect("verifier registers");
+    let (owner, principal) = seed.service("nightly").await.expect("owner registers");
+    seed.bind_schedule(&owner, &owner, &drift, "0 2 * * *", Vec::new())
+        .await
+        .expect("binding projects");
+    seed.activate(principal, &owner)
+        .await
+        .expect("owner activates");
+    let (grouper, member) = seed.service("grouper").await.expect("owner registers");
+    let source = seed
+        .drift_verifier("turn")
+        .await
+        .expect("verifier registers");
+    let mut conn = state
+        .postgres
+        .wyrd()
+        .tenant_conn(tenant)
+        .await
+        .expect("tenant connection opens");
+    project_bindings(
+        &mut conn,
+        &grouper,
+        &CardKind::Service,
+        &[NewBinding {
+            subject_occurrence_key: OWNER_OCCURRENCE_KEY.to_owned(),
+            card_uid: grouper.clone(),
+            verifier_card_uid: drift.clone(),
+            trigger: FrozenTarget::Digest("sha256:trigger".to_owned()),
+            operators: Vec::new(),
+            activation: BindingActivation::GroupEnd(GroupEndSettings {
+                after: TriggerDuration::parse("1h").expect("valid duration"),
+                sources: BTreeMap::from([(
+                    SlotName::new("turns").expect("valid slot name"),
+                    GroupSource {
+                        reference: serde_json::from_value(serde_json::json!(
+                            "verifiers.turn.requirements.promise.outcome"
+                        ))
+                        .expect("source text decodes"),
+                        subject_occurrence_key: OWNER_OCCURRENCE_KEY.to_owned(),
+                        card_uid: grouper.clone(),
+                        verifier_card_uid: source.clone(),
+                    },
+                )]),
+                order_by: None,
+            }),
+        }],
+    )
+    .await
+    .expect("group binding projects");
+    record_machine_authentication(&mut conn, member, &grouper)
+        .await
+        .expect("group owner activates");
+    VerifierExecutionQueue::default()
+        .record_group_activity(
+            &mut conn,
+            &[GroupActivity {
+                owner_card_uid: grouper.clone(),
+                card_uid: grouper.clone(),
+                verifier_card_uid: source,
+                group_id: GroupId::new("remote").expect("valid group id"),
+            }],
+        )
+        .await
+        .expect("activity records");
+    for due in [
+        "UPDATE wyrd.verification_group_pending SET due_at = statement_timestamp()",
+        "UPDATE wyrd.verification_bindings
+            SET next_run_at = statement_timestamp() - INTERVAL '30 seconds'
+          WHERE next_run_at IS NOT NULL",
+    ] {
+        sqlx::query(due)
+            .execute(&mut **conn.transaction())
+            .await
+            .expect("work comes due");
+    }
+    conn.commit().await.expect("setup commits");
+
+    let body = serde_json::json!({
+        "verifier_card_uid": assertion,
+        "card_uid": subject,
+        "inputs": { "x": { "kind": "json", "value": 1 } },
+    });
+    let response = producer
+        .oneshot_authenticated(
+            &jwt,
+            axum::http::Request::builder()
+                .method(axum::http::Method::POST)
+                .uri("/v1/verification/enqueue")
+                .header(axum::http::header::CONTENT_TYPE, "application/json")
+                .body(axum::body::Body::from(body.to_string()))
+                .expect("enqueue request builds"),
+        )
+        .await
+        .expect("enqueue request responds");
+    let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .expect("enqueue body reads");
+    let accepted: serde_json::Value = serde_json::from_slice(&bytes).expect("enqueue body is JSON");
+    let submitted: ExecutionId = serde_json::from_value(accepted["execution_id"].clone())
+        .unwrap_or_else(|_| panic!("the request is accepted: {accepted}"));
+    let scheduler = VerificationScheduler::new(
+        state.postgres.wyrd().clone(),
+        producer.operator_pool(),
+        VerifierExecutionQueue::default(),
+        BackgroundAuthority::new(state.auth.tenant_issuer(state.bifrost.scribe_outbox())),
+        DriftEngine::new(state.clone(), Duration::from_secs(30)),
+        Duration::from_secs(1),
+    )
+    .with_groups(
+        GroupPoller::new(state.clone(), Duration::from_secs(30)),
+        Arc::new(Semaphore::new(4)),
+    );
+    let stop = CancellationToken::new();
+    let ticks = scheduler.pass(&stop).await.expect("the pass runs");
+    let [
+        ScheduleTick {
+            outcome: ScheduleOutcome::Enqueued(scheduled),
+            ..
+        },
+    ] = ticks[..]
+    else {
+        panic!("the schedule calls for a run: {ticks:?}");
+    };
+    let handed = scheduler.group_pass(&stop).await.expect("the pass runs");
+    let [GroupHandoff::Enqueued(grouped)] = handed[..] else {
+        panic!("the due group hands off: {handed:?}");
+    };
+    producer
+        .flush_bifrost()
+        .await
+        .expect("the producer admits and publishes every run");
+    let runs = [submitted, scheduled, grouped];
+    let mut admitted = seed.executions().await.expect("executions read");
+    admitted.sort();
+    let mut expected = runs.to_vec();
+    expected.sort();
+    assert_eq!(admitted, expected, "the producer admitted every origin");
+
+    let script = EngineScript::default();
+    for _ in runs {
+        script.push(EngineOutcome::Completed(unscored_report()));
+    }
+    let runtime = RunningRuntime::spawn(
+        VerificationRuntime::builder(replica.state())
+            .limits(Harness::limits())
+            .engine_script(script.clone())
+            .build()
+            .expect("the runtime composes"),
+    );
+    for run in runs {
+        let row = wait_execution_in(&seed, run, status("completed")).await;
+        assert_eq!(row.attempts, 1, "one claim per run: {row:?}");
+    }
+    assert_eq!(
+        script.entered(),
+        runs.len(),
+        "the polling pod ran each once"
+    );
+    runtime.stop().await;
 }

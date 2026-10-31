@@ -6,7 +6,6 @@ section: Build and verify
 topic: Verify
 order: 4
 draft: true
-status: runnable
 ---
 
 A drift Verifier compares what a component sees in production with a baseline you declare once. Your service records samples with `submit`; a `schedule` Trigger judges each window and runs your Operators when a feature shifts. Drift is never judged in real time. This guide checks a churn model's inputs against last quarter's healthy data every hour.
@@ -205,7 +204,7 @@ A scheduled binding runs only while its Service is live. The server treats the b
 
 ## 6. Read the result
 
-Each judged window writes one row to `vala.verification.results`, tied to the binding and the window:
+Each judged window writes one row to `bifrost.verification.results`, tied to the binding and the window:
 
 <LangTabs langs={['python', 'rust', 'typescript']}>
 <LangTab lang="python">
@@ -216,7 +215,7 @@ from wyrd.bifrost import Bifrost
 rows = Bifrost().sql(
     """
     SELECT window_start, window_end, verdict, verifier_version
-    FROM vala.verification.results
+    FROM bifrost.verification.results
     WHERE binding_id = $1
     ORDER BY window_start DESC
     LIMIT 20
@@ -236,7 +235,7 @@ let rows = Bifrost::connect(BifrostOptions::default())
     .await?
     .sql(
         "SELECT window_start, window_end, verdict, verifier_version \
-         FROM vala.verification.results \
+         FROM bifrost.verification.results \
          WHERE binding_id = $1 \
          ORDER BY window_start DESC \
          LIMIT 20",
@@ -254,7 +253,7 @@ import { Bifrost } from "wyrd-ai";
 const bifrost = await Bifrost.connect();
 const rows = await bifrost.sql(
   `SELECT window_start, window_end, verdict, verifier_version
-     FROM vala.verification.results
+     FROM bifrost.verification.results
     WHERE binding_id = $1
     ORDER BY window_start DESC
     LIMIT 20`,

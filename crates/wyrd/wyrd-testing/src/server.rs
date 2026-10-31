@@ -473,6 +473,7 @@ pub struct WyrdTestServerBuilder {
     scribe_ingest_limits: IngestLimits,
     /// Optional `scribe.outbox_capacity` the bound server's Scribe outbox admits.
     scribe_outbox_capacity: Option<usize>,
+    scribe_persistence_cpu_threads: Option<usize>,
     /// Optional projection of production Scribe rotation limits for real-server journeys.
     scribe_geometry_for_test: Option<vala_bifrost_redux::scribe::geometry::ScribeGeometry>,
     /// Optional faults installed in the real Scribe persistence graph for journeys.
@@ -653,6 +654,7 @@ impl Default for WyrdTestServerBuilder {
             scribe_admission: None,
             scribe_ingest_limits: IngestLimits::default(),
             scribe_outbox_capacity: None,
+            scribe_persistence_cpu_threads: None,
             scribe_geometry_for_test: None,
             scribe_persistence_faults_for_test: None,
             role_timing: None,
@@ -1222,21 +1224,36 @@ impl WyrdTestServer {
     /// the outbox and written to Scribe in the background. After this returns,
     /// the writes staged before the call are in Scribe's memtable and
     /// queryable, and nothing has been sealed or published, so a journey can
-    /// query rows that are still live.
+    /// query rows that are still live. Every queued execution whose input
+    /// Scribe acknowledged is then admitted into the queue.
     ///
     /// # Errors
-    /// Returns an error when staged writes do not reach Scribe within the bound.
+    /// Returns an error when staged writes do not reach Scribe, or
+    /// acknowledged executions are not admitted, within the bound.
     pub async fn settle_bifrost_outbox(&self) -> Result<(), WyrdTestServerError> {
+        let deadline = std::time::Instant::now() + FLUSH_BIFROST_BOUND;
         let unwritten = self
             .inner
             .state
             .bifrost
             .scribe_outbox()
-            .settle(std::time::Instant::now() + FLUSH_BIFROST_BOUND)
+            .settle(deadline)
             .await;
         if unwritten != 0 {
             return Err(WyrdTestServerError::Flush(format!(
                 "{unwritten} staged Scribe writes did not settle within {FLUSH_BIFROST_BOUND:?}"
+            )));
+        }
+        let unadmitted = self
+            .inner
+            .state
+            .verification
+            .submissions()
+            .settle(deadline)
+            .await;
+        if unadmitted != 0 {
+            return Err(WyrdTestServerError::Flush(format!(
+                "{unadmitted} acknowledged executions were not admitted within {FLUSH_BIFROST_BOUND:?}"
             )));
         }
         Ok(())
@@ -1310,8 +1327,9 @@ impl WyrdTestServer {
     pub async fn stage_bifrost_writable_for_test(&self) -> Result<(), WyrdTestServerError> {
         self.bifrost_scribe()
             .ok_or_else(|| WyrdTestServerError::Start("server owns no Scribe".to_owned()))?
-            .stage_writable_for_test()
+            .stage_writable()
             .await
+            .map(|_| ())
             .map_err(|error| WyrdTestServerError::Start(error.to_string()))
     }
 
@@ -2872,6 +2890,20 @@ impl WyrdTestServer {
     ) -> Result<Arc<vala_bifrost_redux::scribe::IngestStall>, WyrdTestServerError> {
         self.bifrost_scribe()
             .map(|scribe| scribe.stall_next_ingest_for_test())
+            .ok_or_else(|| WyrdTestServerError::Start("server has no Bifrost Scribe".to_owned()))
+    }
+
+    /// Install a deterministic barrier holding the next Bifrost write into
+    /// `table`, a fully qualified table name, while every other write passes.
+    ///
+    /// # Errors
+    /// Returns an error when this server was started without a Bifrost Scribe.
+    pub fn stall_next_bifrost_write_into(
+        &self,
+        table: &str,
+    ) -> Result<Arc<vala_bifrost_redux::scribe::IngestStall>, WyrdTestServerError> {
+        self.bifrost_scribe()
+            .map(|scribe| scribe.stall_next_ingest_into_for_test(table))
             .ok_or_else(|| WyrdTestServerError::Start("server has no Bifrost Scribe".to_owned()))
     }
 
@@ -4571,6 +4603,15 @@ impl WyrdTestServerBuilder {
         self
     }
 
+    /// Sets `scribe.persistence_cpu_threads`, which also sizes the staging
+    /// workers and the publication claim budget, so a journey can pin that
+    /// budget instead of inheriting the host's parallelism.
+    #[must_use]
+    pub const fn with_scribe_persistence_cpu_threads_for_test(mut self, threads: usize) -> Self {
+        self.scribe_persistence_cpu_threads = Some(threads);
+        self
+    }
+
     /// Select a scaled Scribe geometry for a real-server journey.
     ///
     /// This installs no second lifecycle policy: the value is the same
@@ -5020,6 +5061,9 @@ impl WyrdTestServerBuilder {
         config.bifrost.scribe.ingest_request_bytes = self.scribe_ingest_limits.max_frame_bytes;
         if let Some(capacity) = self.scribe_outbox_capacity {
             config.bifrost.scribe.outbox_capacity = capacity;
+        }
+        if let Some(threads) = self.scribe_persistence_cpu_threads {
+            config.bifrost.scribe.persistence_cpu_threads = threads;
         }
         config.bifrost.storage = self.bifrost_storage_io;
         if let Some(oracle) = self.oracle_runtime.clone() {

@@ -36,7 +36,6 @@ Navigation, search, the landing page's section links, and `llms.txt` are all der
 | `topic` | under `Build and verify` only | `Declare`, `Observe`, or `Verify` |
 | `order` | no | Number; lower sorts first within its section or topic |
 | `description` | no | One sentence, used in search, metadata, and `llms.txt` |
-| `status` | no | `runnable`, `partial`, or `planned`; `planned` pages stay out of navigation |
 | `draft` | no | `true` keeps the page out of production builds |
 
 An unknown `section` or `topic` fails the build. The "Last updated" date comes from the last commit that changed the page file, so an uncommitted page shows none; do not set it by hand.

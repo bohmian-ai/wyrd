@@ -99,6 +99,9 @@ pub(crate) async fn write_response(
             );
         }
     }
+    // A tokio file finishes writes on a blocking thread; without this flush a
+    // caller that renames or reads the destination can see it short or empty.
+    tokio::io::AsyncWriteExt::flush(&mut file).await?;
     if let Some(verification) = verification {
         let actual_sha256 = base64::engine::general_purpose::STANDARD.encode(digest.finalize());
         if bytes_written != verification.expected_size_bytes

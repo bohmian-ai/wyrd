@@ -3065,8 +3065,9 @@ async fn grouped_executions_include_late_evidence() {
 }
 
 /// Scribe outbox capacity of the staging-pressure story: three quarters of
-/// it, four writes, is what two direct judgments reserve.
-const STAGING_CAPACITY: usize = 6;
+/// it, six writes, is what two direct judgments reserve, two result writes
+/// and one gateway capture each.
+const STAGING_CAPACITY: usize = 8;
 
 /// How long the slow judge of the staging-pressure story holds each call.
 const JUDGE_DELAY: Duration = Duration::from_secs(15);
@@ -3258,8 +3259,8 @@ async fn verification_staging_refuses_and_recovers() {
         .expect("the inputs rows count");
     assert_eq!(
         recorded.iter().map(|count| count.rows).collect::<Vec<_>>(),
-        [4 + offered],
-        "the burst judgments, the normal calls, and the recovered and grouped calls; nothing of the refused calls"
+        [5 + offered],
+        "the burst judgments, the normal calls, the recovered and grouped calls, and the group's selector; nothing of the refused calls"
     );
     assistant.deployment.shutdown().await;
 }

@@ -121,9 +121,17 @@ What each engine covers:
       protobuf decode, which is labelled unavailable for native writes.
       Group stages are shared by every append of a group, so phases overlap
       and are never summed.
-    - `hot`: 10M events rows and 1M spans held in memtables (a staged or
-      published row is INVALID); point lookups at 1/64, with p99 below 5 ms
-      at 64, a small aggregate and a shredded-attribute span filter at 1.
+    - `hot`: the rows a query reads before they are published, in a
+      memtable or a staged run. Nothing moves by itself (16,384 MB rotation
+      sizes, 24 h retention): before any window the driver places the
+      fixture through the `bench` build's platform-admin Scribe control
+      (`POST /platform/benchmark/scribe/stage` and `.../publish`). It
+      publishes 500k day-2 spans, which must teach the server a span Variant
+      layout, then loads the first half of 10M events rows and 1M day-1
+      spans and stages it, and loads the second half into memtables. Point
+      lookups at 1/64 (p99 below 5 ms at 64 on the memtable half) and a small
+      aggregate run against each half, and so do `parquet`'s shredded and
+      long-tail span filters, bounded to each half's start times.
     - `parquet`: the same fixtures and a 200,000-row native and logs
       storage sample, settled once as Parquet; point lookups at 1/64, a
       small aggregate and a full scan at 1 (scans report p95), span

@@ -582,7 +582,9 @@ pub fn init_test_capture(
 /// event the tenant copy needs: catalog spans and events at `INFO` or above,
 /// the verbosity the tenant catalog is defined at. Neither filter can
 /// therefore remove a tenant copy. With `level` set, each exported span also
-/// carries its `tracing` level.
+/// carries its `tracing` level. Spans carry no busy/idle times, thread, or
+/// code location: each costs work on every span or every poll of an
+/// instrumented future, and no tenant copy keeps them.
 fn subscriber<W>(
     logs: EnvFilter,
     traces: EnvFilter,
@@ -611,6 +613,9 @@ where
             tracing_opentelemetry::layer()
                 .with_tracer(tracer)
                 .with_level(level)
+                .with_tracked_inactivity(false)
+                .with_threads(false)
+                .with_location(false)
                 .with_filter(traces.or(tenant)),
         )
 }
@@ -1321,7 +1326,7 @@ mod tests {
                 });
             }
         });
-        let gateway = request("buffered-metadata", "repetition-1");
+        let gateway = request("buffered-1kib-capture-metadata", "repetition-1");
         super::record_timing(
             &gateway,
             "gateway.buffered",
@@ -1419,7 +1424,7 @@ mod tests {
             "each observation and part once"
         );
 
-        let gateway = series("buffered-metadata", "gateway.buffered");
+        let gateway = series("buffered-1kib-capture-metadata", "gateway.buffered");
         assert_eq!(gateway.count, 3);
         let residual = gateway.residual.as_ref().expect("residual component");
         assert_eq!(

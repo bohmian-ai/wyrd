@@ -75,11 +75,98 @@ impl GatewayCapture {
     }
 
     /// A buffered Chat Completions answer whose message content is
-    /// `content_bytes` bytes, for answers of a chosen size.
+    /// `content_bytes` bytes of [`Self::prose`], for answers of a chosen size.
     pub fn sized_completion(content_bytes: usize) -> Value {
         let mut completion = Self::completion();
-        completion["choices"][0]["message"]["content"] = json!("x".repeat(content_bytes));
+        completion["choices"][0]["message"]["content"] = json!(Self::prose(content_bytes));
         completion
+    }
+
+    /// Exactly `bytes` bytes of ASCII English-like text, identical on every
+    /// call, so sized messages compress like chat rather than like one
+    /// repeated byte.
+    pub fn prose(bytes: usize) -> String {
+        const WORDS: [&str; 64] = [
+            "the",
+            "model",
+            "returns",
+            "a",
+            "summary",
+            "of",
+            "each",
+            "request",
+            "and",
+            "its",
+            "context",
+            "when",
+            "users",
+            "ask",
+            "about",
+            "billing",
+            "orders",
+            "shipping",
+            "we",
+            "should",
+            "check",
+            "account",
+            "status",
+            "before",
+            "answering",
+            "please",
+            "confirm",
+            "your",
+            "email",
+            "address",
+            "so",
+            "that",
+            "I",
+            "can",
+            "look",
+            "up",
+            "recent",
+            "invoices",
+            "refund",
+            "policy",
+            "allows",
+            "returns",
+            "within",
+            "thirty",
+            "days",
+            "after",
+            "delivery",
+            "if",
+            "item",
+            "is",
+            "unused",
+            "otherwise",
+            "contact",
+            "support",
+            "team",
+            "for",
+            "help",
+            "with",
+            "this",
+            "issue",
+            "today",
+            "thanks",
+            "again",
+            "next",
+        ];
+        let mut text = String::with_capacity(bytes + 16);
+        let mut state: u64 = 0x9e37_79b9_7f4a_7c15;
+        let mut sentence = 0;
+        while text.len() < bytes {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            // The modulus keeps the index below `WORDS.len()`.
+            let word = WORDS[usize::try_from(state % 64).unwrap_or_default()];
+            text.push_str(word);
+            sentence += 1;
+            text.push_str(if sentence % 12 == 0 { ". " } else { " " });
+        }
+        text.truncate(bytes);
+        text
     }
 
     /// The frames of one Chat Completions stream with id `id`, each one
@@ -317,6 +404,9 @@ type Sends = Arc<Mutex<HashMap<String, Vec<Instant>>>>;
 struct Paced {
     /// The answer shape.
     pacing: Pacing,
+    /// The buffered answer's body, identical on every call, so it is built
+    /// once.
+    buffered: Bytes,
     /// Frame send times of calls not yet taken.
     sends: Sends,
     /// Calls whose send times may be held at once; a later call is answered
@@ -360,6 +450,9 @@ impl PacedUpstream {
             .route("/{*path}", post(answer))
             .with_state(Paced {
                 pacing,
+                buffered: Bytes::from(
+                    GatewayCapture::sized_completion(pacing.buffered_bytes).to_string(),
+                ),
                 sends: Arc::clone(&sends),
                 bound,
             });
@@ -447,9 +540,8 @@ async fn answer(State(paced): State<Paced>, body: Bytes) -> Response {
     let pacing = paced.pacing;
     if request["stream"] != Value::Bool(true) {
         pause(pacing.buffered_delay).await;
-        let completion = GatewayCapture::sized_completion(pacing.buffered_bytes).to_string();
         paced.record(&marker);
-        return ([(CONTENT_TYPE, "application/json")], completion).into_response();
+        return ([(CONTENT_TYPE, "application/json")], paced.buffered).into_response();
     }
     pause(pacing.stream_delay).await;
     let frames = GatewayCapture::chat_event_frames(&marker, pacing.chunks);

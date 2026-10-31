@@ -42,7 +42,7 @@ export const verificationPaths: SequenceSpec = {
           to: 'bif',
           kind: 'best',
           label: 'inputs + result rows',
-          say: 'Before replying, the server stages the pinned inputs and the result on the Scribe outbox; Scribe writes them to <code>vala.verification.execution_inputs</code> and <code>vala.verification.results</code> afterward. No work is queued.'
+          say: 'Before replying, the server stages the pinned inputs and the result on the Scribe outbox; Scribe writes them to <code>bifrost.verification.execution_inputs</code> and <code>bifrost.verification.results</code> afterward. No work is queued.'
         }
       ]
     },
@@ -65,7 +65,7 @@ export const verificationPaths: SequenceSpec = {
           to: 'bif',
           kind: 'data',
           label: 'result row · verdict',
-          say: 'The result is written to <code>vala.verification.results</code>. <code>wait</code> polls the execution until the result is visible.'
+          say: 'The result is written to <code>bifrost.verification.results</code>. <code>wait</code> polls the execution until the result is visible.'
         },
         {
           from: 'srv',
@@ -153,7 +153,7 @@ export const runLifecycle: DiagramSpec = {
           w: 92,
           h: 54,
           title: 'verdict',
-          detail: verdict('Read from the result', 'The result’s <code>outcome.verdict</code>, also stored in <code>vala.verification.results</code>.', 'Only on <code>failed</code>', 'Read the requirement breakdown.')
+          detail: verdict('Read from the result', 'The result’s <code>outcome.verdict</code>, also stored in <code>bifrost.verification.results</code>.', 'Only on <code>failed</code>', 'Read the requirement breakdown.')
         },
         state('passed', 700, 14, 'ok', '✓', verdict(badge('ok', '✓', 'passed'), 'The behavior met the standard.', 'None', 'Nothing.'), 140, 44),
         state(
@@ -328,7 +328,7 @@ export const verificationParts: DiagramSpec = {
       nodes: ['steps', 'reqs', 'agent', 'tools', 'monty', 'gateway', 'model'],
       edges: ['xa', 'at', 'tm', 'ag', 'gm'],
       caption:
-        'An <code>agent</code> step or check runs an Agent whose model calls go through the LLM gateway with your provider key. A step Agent can call built-in tools: <code>cards.*</code>, <code>bifrost.*</code>, <code>fs.*</code> over a scratch copy of the inputs, and <code>code.run</code> in the Monty pool. A check Agent may use only <code>bifrost.query</code>, and its pass must cite the evidence.'
+        'An <code>agent</code> step or check runs an Agent whose model calls go through the LLM gateway with your provider key. Step and check Agents can call the built-in tools they declare: <code>cards.*</code>, <code>bifrost.*</code>, <code>fs.*</code> over the files mounted in their workspace, and <code>code.run</code> in the Monty pool. A check Agent’s pass must cite the evidence.'
     },
     {
       label: 'Verdict',

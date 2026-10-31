@@ -752,6 +752,37 @@ impl Telemetry {
         )
     }
 
+    /// The [`Self::shredded_filter`] (`shredded`) or
+    /// [`Self::long_tail_filter`] count over spans `first..last` alone,
+    /// bounded on `start_time_unix_nano` to those spans' start times.
+    /// `first` and `last` are whole traces: multiples of [`SPANS_PER_TRACE`].
+    #[must_use]
+    pub fn bounded_filter(self, shredded: bool, first: i64, last: i64) -> (String, Rows) {
+        let (lower, upper) = (self.start_nanos(first), self.start_nanos(last));
+        let (predicate, keep): (String, fn(i64) -> bool) = if shredded {
+            ("attributes ->> 'region' = 'eu-west'".to_owned(), |index| {
+                region(index) == Some("eu-west")
+            })
+        } else {
+            (
+                format!("attributes ->> '{TAIL_PREFIX}k{TAIL_KEY:04}' IS NOT NULL"),
+                |index| tail(index).any(|tail| tail % TAIL_KEYS == TAIL_KEY),
+            )
+        };
+        let count = (first..last)
+            .filter(|index| keep(*index) && (lower..upper).contains(&self.start_nanos(*index)))
+            .count();
+        (
+            format!(
+                "SELECT COUNT(*) FROM {TABLE} \
+                 WHERE start_time_unix_nano >= to_timestamp_nanos({lower}) \
+                 AND start_time_unix_nano < to_timestamp_nanos({upper}) \
+                 AND {predicate}"
+            ),
+            vec![vec![count.to_i64().unwrap_or(i64::MAX)]],
+        )
+    }
+
     /// Counts the first `written` spans carrying one long-tail key, which
     /// sits far below the shredding threshold and is read from the Variant
     /// residue.

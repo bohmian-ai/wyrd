@@ -4,7 +4,6 @@ description: Environment settings that bound Verifier files, extraction, workspa
 pillar: wyrd
 section: Reference
 order: 4
-status: runnable
 ---
 
 Environment variables on `wyrd-server`, read once at startup; a change takes a restart. Apart from `WYRD_VERIFICATION_ENABLED`, none has a TOML equivalent. Each process applies them on its own.

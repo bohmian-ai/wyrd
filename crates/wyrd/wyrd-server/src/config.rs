@@ -319,7 +319,8 @@ pub struct ScribeRuntimeConfig {
     /// Persistence CPU worker count for Parquet preparation and bounded replay work.
     #[serde(default = "default_scribe_persistence_cpu_threads")]
     pub persistence_cpu_threads: usize,
-    /// WAL IO worker count.
+    /// WAL IO worker count. Boot runs at least one worker per shard; see
+    /// [`Self::wal_io_workers`].
     #[serde(default = "default_scribe_wal_io_threads")]
     pub wal_io_threads: usize,
     /// Maximum encoded bytes accepted for one native or OTLP request.
@@ -345,7 +346,9 @@ pub struct ScribeRuntimeConfig {
     pub outbox_bytes: usize,
     /// Number of Scribe shards, each with its own WAL and memtable.
     ///
-    /// `WYRD_SCRIBE_SHARD_COUNT` overrides the file value. Default 1.
+    /// Each shard syncs its own WAL, so more shards mean more syncs per
+    /// acknowledged request. `WYRD_SCRIBE_SHARD_COUNT` overrides the file
+    /// value. Default 1.
     #[serde(default = "default_scribe_shard_count")]
     pub shard_count: usize,
     /// Megabytes one shard's WAL segment holds before the shard rotates.
@@ -1536,6 +1539,16 @@ impl Default for ScribeRuntimeConfig {
 }
 
 impl ScribeRuntimeConfig {
+    /// WAL IO workers boot starts: `wal_io_threads`, raised to one per shard.
+    ///
+    /// Each shard's group commit holds a worker for its blocking append and
+    /// `fdatasync`, so fewer workers than shards queue one shard's append
+    /// behind another shard's sync.
+    #[must_use]
+    pub fn wal_io_workers(&self) -> usize {
+        self.wal_io_threads.max(self.shard_count)
+    }
+
     /// Validate that every configured bound can provide bounded operation.
     ///
     /// # Errors
@@ -5034,6 +5047,19 @@ minimum_slots = 2
             .validate()
             .expect_err("an early seal above the shard memtable limit must be refused");
         assert!(error.contains("seal_key_early_seal_bytes"), "{error}");
+    }
+
+    /// Boot runs one WAL IO worker per shard when the configured count is lower.
+    #[test]
+    fn wal_io_workers_cover_every_shard() {
+        let mut config = ScribeRuntimeConfig {
+            wal_io_threads: 4,
+            shard_count: 16,
+            ..ScribeRuntimeConfig::default()
+        };
+        assert_eq!(config.wal_io_workers(), 16);
+        config.shard_count = 1;
+        assert_eq!(config.wal_io_workers(), 4);
     }
 
     /// Rejects every independently configurable Scribe bound before boot.

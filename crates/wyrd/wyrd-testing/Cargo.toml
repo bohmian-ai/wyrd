@@ -121,6 +121,8 @@ wiremock = { workspace = true }
 sysinfo = { workspace = true }
 
 [dev-dependencies]
+# The benchmark-control journey drives the `bench` Scribe stage/publish routes.
+wyrd-server = { workspace = true, features = ["bench"] }
 # The peer-context journey encodes a Scribe fragment exactly as a leader does.
 datafusion-proto = { workspace = true }
 # The leaf-predicate peer journey plans its filter as a leader's session does.

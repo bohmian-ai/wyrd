@@ -25,11 +25,12 @@ use skald_spec::{MediaRef, ResponseType};
 use tokio::time::Instant;
 use wyrd_spec::card::agent::{AgentSpec, BuiltinTool, ExecutionRoute};
 use wyrd_spec::card::verifier::{Action, AgentCall, Check, InputSlot};
+use wyrd_spec::error::WyrdError;
 use wyrd_spec::ids::SlotName;
 use wyrd_spec::reference::{CardRef, InlineableRef};
 use wyrd_spec::verification::TaskId;
 use wyrd_spec::verification::VerificationVerdict;
-use wyrd_spec::verification::execution::{CallProvenance, Citation, InputDeclaration};
+use wyrd_spec::verification::execution::{CallProvenance, Citation, InputDeclaration, Verdict};
 
 use super::tools::{AgentToolset, ToolSession, finished};
 use super::{
@@ -254,16 +255,19 @@ impl AgentExecutor {
     /// Input keys must equal the Prompt's text and media placeholders. JSON
     /// strings render raw and other JSON as JSON text; evidence binds as
     /// provider-native media, which Skald checks against the placeholder kind.
+    /// Non-empty `slots` narrow the copy's Verdict citation slots, so the
+    /// provider and the Agent's validation admit only the reachable ones.
     ///
     /// # Errors
     /// Returns [`BlockError::Terminal`] for a placeholder mismatch, evidence
     /// bound to text or JSON bound to media, a media kind the placeholder
-    /// does not accept, or a missing evidence reader, plus the reader's
-    /// errors.
+    /// does not accept, a missing evidence reader, or a narrowed schema its
+    /// provider rejects, plus the reader's errors.
     async fn bind(
         &self,
         prompt: &Prompt,
         inputs: &BTreeMap<String, CallInput>,
+        slots: &BTreeSet<SlotName>,
     ) -> Result<(Prompt, Vec<(String, String)>), BlockError> {
         let native = prompt.native();
         let placeholders: BTreeSet<&str> = native
@@ -305,10 +309,20 @@ impl AgentExecutor {
                 }
             }
         }
+        if !slots.is_empty() {
+            bound
+                .edit_response_schema_mut(|schema| Verdict::restrict_slots(schema, slots))
+                .map_err(|error| BlockError::Terminal {
+                    reason: format!("the Verdict citation slots cannot be narrowed: {error}"),
+                })?;
+        }
         Ok((Prompt::from_native(bound), vars))
     }
 
     /// Run one Agent call and return its raw run plus provenance.
+    ///
+    /// `slots` are the citation slots a check invocation can reach, empty for
+    /// a step; see [`Self::bind`].
     ///
     /// Steps and checks get exactly their declared built-ins from the toolset, which holds the
     /// invocation's workspace until the run ends. The first tool refused
@@ -330,11 +344,12 @@ impl AgentExecutor {
         call: &AgentCall,
         inputs: &BTreeMap<String, CallInput>,
         workspace: &BTreeMap<String, CallInput>,
+        slots: &BTreeSet<SlotName>,
         deadline: Instant,
     ) -> Result<Invoked, BlockError> {
         let resolved = self.resolve(&call.agent).await?;
         let route = self.route(id, &resolved.spec.execution_route)?;
-        let (prompt, vars) = self.bind(&resolved.prompt, inputs).await?;
+        let (prompt, vars) = self.bind(&resolved.prompt, inputs, slots).await?;
         let declared = resolved
             .spec
             .tool_names
@@ -413,28 +428,29 @@ impl AgentExecutor {
 impl ActionExecutor for AgentExecutor {
     /// Run an Agent step action and return its output data.
     ///
-    /// Structured output must satisfy the Prompt's response schema; a text
-    /// Prompt's answer is returned as a JSON string.
+    /// The Agent loop validates structured output against the Prompt's
+    /// response schema; a text Prompt's answer is returned as a JSON string.
     ///
     /// # Errors
-    /// Returns [`BlockError::Terminal`] for a non-Agent action or output that
-    /// violates the response schema, plus [`Self::invoke`] failures.
+    /// Returns [`BlockError::Terminal`] for a non-Agent action, plus
+    /// [`Self::invoke`] failures.
     async fn execute(&self, call: BlockCall<'_, Action>) -> Result<ActionOutput, BlockError> {
         let Action::Agent(agent) = call.block else {
             return Err(terminal("the Agent executor runs only Agent actions"));
         };
         let invoked = self
-            .invoke(call.id, agent, &call.inputs, &call.workspace, call.deadline)
+            .invoke(
+                call.id,
+                agent,
+                &call.inputs,
+                &call.workspace,
+                &BTreeSet::new(),
+                call.deadline,
+            )
             .await?;
-        let output = match (&invoked.prompt.native().response_type, invoked.structured) {
-            (ResponseType::JsonSchema { schema, .. }, Some(map)) => {
-                let output = Value::Object(map);
-                conforms(schema, &output)?;
-                output
-            }
-            (_, Some(map)) => Value::Object(map),
-            (_, None) => Value::String(invoked.text),
-        };
+        let output = invoked
+            .structured
+            .map_or(Value::String(invoked.text), Value::Object);
         Ok(ActionOutput {
             output,
             provenance: Some(invoked.provenance),
@@ -461,8 +477,21 @@ impl CheckExecutor for AgentExecutor {
         if call.position == Position::Step {
             return Err(terminal("an Agent check cannot run in step position"));
         }
+        let reachable: BTreeSet<SlotName> = call
+            .inputs
+            .values()
+            .chain(call.workspace.values())
+            .flat_map(|input| input.sources.iter().cloned())
+            .collect();
         let invoked = self
-            .invoke(call.id, agent, &call.inputs, &call.workspace, call.deadline)
+            .invoke(
+                call.id,
+                agent,
+                &call.inputs,
+                &call.workspace,
+                &reachable,
+                call.deadline,
+            )
             .await?;
         let answer = invoked
             .structured
@@ -473,12 +502,6 @@ impl CheckExecutor for AgentExecutor {
             ));
         };
         let mut verdict = verdict_from(schema, Value::Object(answer))?;
-        let reachable: BTreeSet<SlotName> = call
-            .inputs
-            .values()
-            .chain(call.workspace.values())
-            .flat_map(|input| input.sources.iter().cloned())
-            .collect();
         let citations = std::mem::take(&mut verdict.citations);
         if let Some(reader) = &self.evidence {
             verdict.citations = reader.cited(&reachable, citations).await?;
@@ -525,32 +548,15 @@ struct Invoked {
     tool_calls: Vec<wyrd_spec::verification::execution::ToolCallRecord>,
 }
 
-/// Refuse `output` that violates `schema`.
-///
-/// # Errors
-/// Returns [`BlockError::Terminal`] for an invalid schema or output.
-fn conforms(schema: &Value, output: &Value) -> Result<(), BlockError> {
-    let validator = jsonschema::validator_for(schema).map_err(|error| BlockError::Terminal {
-        reason: format!("the Prompt response schema is invalid: {error}"),
-    })?;
-    match validator.iter_errors(output).next() {
-        None => Ok(()),
-        Some(error) => Err(BlockError::Terminal {
-            reason: format!(
-                "the Agent output violates its response schema at {}: {error}",
-                error.instance_path()
-            ),
-        }),
-    }
-}
-
 /// Classify an Agent run failure.
 ///
 /// Provider answers follow the shared Agent classification and expose only a
 /// gateway problem's stable code and message or a provider's stable code,
 /// never a provider body. A runtime failure with no provider answer, such as
-/// an unregistered provider, may clear on retry. Malformed structured output
-/// and every non-provider failure except an Agent timeout are terminal.
+/// an unregistered provider, may clear on retry. Structured output still
+/// invalid when the Agent's iteration budget ran out carries its stable code
+/// and schema locations only. It is terminal, like every non-provider
+/// failure except an Agent timeout.
 #[must_use]
 pub fn block_error(error: AgentError) -> BlockError {
     let reason = match &error {
@@ -560,6 +566,9 @@ pub fn block_error(error: AgentError) -> BlockError {
         }) => format!("{}: {}", problem.code, problem.message),
         AgentError::Provider(SkaldRuntimeError::Provider { source, .. }) => {
             format!("provider failure {}", source.code())
+        }
+        AgentError::StructuredOutputInvalid { .. } => {
+            format!("{}: {error}", WyrdError::from(&error).code())
         }
         other => other.to_string(),
     };

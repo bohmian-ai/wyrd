@@ -75,7 +75,9 @@ fn openai_text_response(text: &str) -> ProviderResponse {
     })
 }
 
-fn openai_tool_call_response(name: &str, args: serde_json::Value) -> ProviderResponse {
+/// An OpenAI Chat answer requesting one call of tool `name` with `args`,
+/// shared by tests that script a tool turn.
+pub(crate) fn openai_tool_call_response(name: &str, args: serde_json::Value) -> ProviderResponse {
     ProviderResponse::OpenAiChatCompletion(OpenAiChatResponse {
         id: "resp_call".to_owned(),
         object: "chat.completion".to_owned(),

@@ -7610,6 +7610,242 @@ async fn group_lookup_preserves_source_occurrences() -> Result<(), ServerJourney
     Ok(())
 }
 
+/// Every queued origin waits for its own input record's acknowledgement
+/// before the queue holds it, and then reads back the input it was admitted
+/// with (REQ-035, REQ-036; AC-015, AC-016).
+///
+/// The `support` Service declares a per-turn `turn-check` and a `group_end`
+/// `conversation-verifier`; `observed-service` binds its Model daily to the
+/// Custom `observed-drift` Verifier. Each hydrated Service authors through
+/// its own Run: the Model's Window sample is recorded by `submit`, and while
+/// Scribe holds the input record of the agent's grouped `submit`, the SDK
+/// sees no such execution and a direct `verify` still answers. Released, the turn is queued under the
+/// ID its enqueue returned and the production runtime completes it. The
+/// runtime then prepares the expired group's run, whose input record Scribe
+/// holds next: the queue still holds only the turn, and a direct verify
+/// still answers. Released, the group run and the scheduled window complete
+/// on their first attempt like the turn, and the group run reads back
+/// exactly the held turn.
+///
+/// # Errors
+/// Returns cluster, declaration, credential, route, runtime, or SDK
+/// errors, or the first admission or readback that differs.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires the serialized Postgres-backed journey lane"]
+async fn queued_origins_share_ack_gated_admission() -> Result<(), ServerJourneyError> {
+    use wyrd_client::verify::{Execution, Submission};
+    use wyrd_spec::ids::GroupId;
+
+    let cluster = WyrdTestCluster::start_spec(BifrostClusterSpec::one_mixed()).await?;
+    let server = cluster.server(0).ok_or("missing mixed node")?;
+    let tenant = cluster.data_tenant_id();
+    for (namespace, table) in [
+        ("verification", "execution_inputs"),
+        ("verification", "results"),
+        ("drift", "observations"),
+    ] {
+        server
+            .ensure_builtin_table_for_test(tenant, namespace, table)
+            .await?;
+    }
+    let seed = VerificationFixture::provision(server.state(), tenant).await?;
+    let admin = server.bootstrap_service("ack-admin", &["admin"]).await?;
+    let admin = native_client(
+        server,
+        admin
+            .api_key()
+            .ok_or("the admin has an API key")?
+            .expose_secret(),
+    )?;
+    let receipt = Box::pin(
+        wyrd_client::cards::Cards::connect_with(&admin)
+            .await?
+            .declare_from_path(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/../../../fixtures/cards/verify_in_real_time/support.yaml"
+            )),
+    )
+    .await?;
+    let root = receipt.root.uid.clone().ok_or("the Service has a UID")?;
+    let machine = server
+        .credential_registered_service(&receipt.root, &["editor"])
+        .await?;
+    let token = server
+        .exchange_api_key_for_workload(
+            machine.api_key().ok_or("the Service has an API key")?,
+            &root,
+        )
+        .await?;
+    let cards = wyrd_client::cards::Cards::connect_with(&admin).await?;
+    let hydrate = |card: CardRef, client: wyrd_client::WyrdClient| {
+        let cards = &cards;
+        async move {
+            let bundle = tempfile::tempdir()?;
+            Box::pin(
+                wyrd_client::cards::CardGraphPuller::new(cards.registry_context()).pull(
+                    &wyrd_client::cards::CardSelector::exact(card),
+                    &bundle.path().join("bundle"),
+                    wyrd_client::cards::BundleMode::Complete,
+                ),
+            )
+            .await?;
+            let state = wyrd_client::state::WyrdState::from_path_with(
+                bundle.path().join("bundle"),
+                client,
+            )?;
+            state.start_bifrost().await?;
+            Ok::<_, ServerJourneyError>((state, bundle))
+        }
+    };
+    let (support, _support_bundle) =
+        hydrate(receipt.root.clone(), native_client(server, &token)?).await?;
+    let direct = || async {
+        support
+            .run_for_card("agent")?
+            .observe()
+            .verify("turn-check", json!({"answer": "direct"}))
+            .await
+    };
+
+    let fixtures = std::path::Path::new(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../../fixtures/cards/observe_a_run"
+    ));
+    Box::pin(cards.declare_from_path(&fixtures.join("observed-model.yaml"))).await?;
+    let observed = Box::pin(cards.declare_from_path(&fixtures.join("observed-service.yaml")))
+        .await?
+        .root;
+    let observed_uid = observed
+        .uid
+        .clone()
+        .ok_or("the observed Service has a UID")?;
+    let Bootstrap::Machine { id, api_key, .. } = server
+        .credential_registered_service(&observed, &["workload"])
+        .await?
+    else {
+        return Err("a service credential returned a user".into());
+    };
+    seed.activate(id, &observed_uid).await?;
+    let binding = cards
+        .get(wyrd_client::cards::CardSelector::exact(observed.clone()))
+        .await?
+        .status
+        .and_then(|status| status.verification)
+        .and_then(|verification| verification.binding_ids.into_iter().next())
+        .ok_or("the observed Service binds its schedule")?;
+    let (window, _window_bundle) = hydrate(
+        observed,
+        native_client(server, api_key.expose_secret())?.for_workload(observed_uid),
+    )
+    .await?;
+    let sampled = window
+        .run_for_card("model")?
+        .observe()
+        .submit("observed-drift", json!({"latency": 12.5}))
+        .await?;
+    if !matches!(sampled, Submission::Recorded) {
+        return Err(format!("a Window sample is recorded: {sampled:?}").into());
+    }
+    window.shutdown().await?;
+    server.flush_bifrost().await?;
+
+    let held = server.stall_next_bifrost_write_into(EXECUTION_INPUTS)?;
+    let Submission::Queued(accepted) = support
+        .run_for_card("agent")?
+        .observe()
+        .group_id(GroupId::new("held")?)
+        .submit("turn-check", json!({"answer": "yes"}))
+        .await?
+    else {
+        return Err("a turn-check submission queues an execution".into());
+    };
+    held.wait_entered().await;
+    let staged = *accepted.id();
+    match Execution::connect_with(staged, &admin)
+        .await?
+        .status()
+        .await
+    {
+        Err(WyrdError::VerificationExecutionNotFound { .. }) => {}
+        other => return Err(format!("a held turn is not queued: {other:?}").into()),
+    }
+    direct().await?;
+    seed.make_binding_due(binding).await?;
+    let runtime = VerificationRuntime::builder(server.state())
+        .build()
+        .ok_or("the runtime did not compose")?;
+    let stop = CancellationToken::new();
+    let task = tokio::spawn(runtime.run(stop.clone()));
+    held.release();
+    let turn = await_queued(&seed, &json!({"execution_id": staged})).await?;
+    if turn != staged {
+        return Err(format!("the turn is queued as {turn}, not {staged}").into());
+    }
+    let deadline = tokio::time::Instant::now() + WAIT;
+    while seed.execution(turn).await?.status != "completed" {
+        if tokio::time::Instant::now() >= deadline {
+            return Err("the turn never completed".into());
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+
+    let held = server.stall_next_bifrost_write_into(EXECUTION_INPUTS)?;
+    held.wait_entered().await;
+    let queued = seed.executions().await?;
+    if queued != [turn] {
+        return Err(format!("a held background run is not queued: {queued:?}").into());
+    }
+    direct().await?;
+    held.release();
+    let deadline = tokio::time::Instant::now() + WAIT;
+    let rows = loop {
+        let mut rows = Vec::new();
+        for execution in seed.executions().await? {
+            rows.push((execution, seed.execution(execution).await?));
+        }
+        if rows.len() == 3 && rows.iter().all(|(_, row)| row.status == "completed") {
+            break rows;
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return Err(format!("every origin never completed: {rows:?}").into());
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    };
+    stop.cancel();
+    tokio::time::timeout(WAIT, task).await??;
+    if rows.iter().any(|(_, row)| row.attempts != 1) {
+        return Err(format!("each origin completes on its first attempt: {rows:?}").into());
+    }
+    server.flush_bifrost().await?;
+    cluster.refresh_oracle_snapshots().await?;
+    let mut grouped = None;
+    for (execution, _) in &rows {
+        let state = Execution::connect_with(*execution, &admin)
+            .await?
+            .status()
+            .await?;
+        if let Some(snapshot) = state.group {
+            grouped = Some(
+                snapshot
+                    .sources
+                    .into_iter()
+                    .map(|(slot, source)| (slot.to_string(), source.execution_ids))
+                    .collect::<BTreeMap<_, _>>(),
+            );
+        }
+    }
+    let expected = BTreeMap::from([
+        ("answered".to_owned(), vec![turn]),
+        ("turns".to_owned(), vec![turn]),
+    ]);
+    if grouped.as_ref() != Some(&expected) {
+        return Err(format!("the group run reads back its held turn: {grouped:?}").into());
+    }
+    support.shutdown().await?;
+    cluster.shutdown().await?;
+    Ok(())
+}
+
 /// Call MCP `bifrost.query` on `server` as `token` with `arguments`, and
 /// return the structured content and whether the call was a tool error.
 ///

@@ -598,22 +598,6 @@ svg {
   margin-top: 0;
 }
 
-.page-status {
-  display: inline-block;
-  margin: 0 0 12px;
-  padding: 2px 8px;
-  border: 1px solid var(--border);
-  border-left: 2px solid var(--ok);
-  border-radius: var(--r);
-  color: var(--muted);
-  font: 12px/1.6 var(--font-mono);
-}
-.page-status[data-status='partial'] {
-  border-left-color: var(--warn);
-}
-.page-status[data-status='planned'] {
-  border-left-color: var(--muted);
-}
 .page-updated {
   margin: 32px 0 0;
   color: var(--muted);

@@ -33,7 +33,7 @@ use wyrd_spec::verification::{
 };
 use wyrd_sql::queries::cards::get_card_by_uid;
 use wyrd_sql::queries::verifier_executions::{
-    Cause, EnqueueRefusal, Submission, VerifierExecutionQueue,
+    Admission, Cause, EnqueueRefusal, Submission, VerifierExecutionQueue,
 };
 use wyrd_sql::{ParsedCardRow, TenantConn};
 use wyrd_storage::StorageError;
@@ -54,6 +54,7 @@ use crate::verification::inputs::InputResolver;
 use crate::verification::results::{
     InputRecord, ResultPayloadBuilder, ResultPayloadError, ResultRun,
 };
+use crate::verification::submissions::Queued;
 use crate::verification::telemetry::{ExecutionMode, ExecutionTelemetry, Phase};
 
 /// Audit operation of a binding status read.
@@ -795,7 +796,13 @@ impl<'a> VerificationControl<'a> {
             ScribeWrite::ExecutionInputs {
                 row,
                 attribution: caller.attribution(),
-                queued: Some((queued, Box::new(submission))),
+                queued: Some((
+                    queued,
+                    Box::new(Queued {
+                        admission: Admission::Submitted(submission),
+                        claim: None,
+                    }),
+                )),
             },
         );
         Ok(EnqueueVerificationResponse { execution_id })

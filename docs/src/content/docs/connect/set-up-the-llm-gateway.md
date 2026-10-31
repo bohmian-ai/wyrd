@@ -4,7 +4,6 @@ description: Store a provider key on your Wyrd server, create a deployment for i
 pillar: wyrd
 section: Connect
 order: 1
-status: runnable
 ---
 
 Call OpenAI through your Wyrd server. Your code signs in to Wyrd, Wyrd adds the provider key and records the call, and the key never leaves the server.
@@ -52,7 +51,7 @@ Calls made before this step are never recorded.
 ## 4. Make a request
 
 ```bash
-uv add "wyrd-ai[gateway]==0.3.0" openai
+uv add "wyrd-ai[gateway]==0.4.0" openai
 ```
 
 ```python title="call.py"
@@ -85,7 +84,7 @@ It prints the model's reply. OpenAI received `gpt-4o` with your stored key and n
 from wyrd.bifrost import Bifrost
 
 rows = Bifrost().sql(
-    "SELECT requested_model, outcome FROM vala.gateway.calls ORDER BY started_at DESC LIMIT 1"
+    "SELECT requested_model, outcome FROM bifrost.gateway.calls ORDER BY started_at DESC LIMIT 1"
 ).to_arrow().to_pylist()
 print(rows)
 ```

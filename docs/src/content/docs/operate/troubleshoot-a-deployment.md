@@ -4,8 +4,6 @@ description: Find the cause of a Wyrd server that refuses to migrate or start, f
 pillar: wyrd
 section: Operate
 order: 5
-draft: true
-status: partial
 ---
 
 Match the code or message you see below. This page covers server installation, local setup recovery, and database failures.
@@ -70,16 +68,16 @@ When the server refuses its database, it exits and its last log line says why.
 | --- | --- | --- |
 | `wyrd._sqlx_migrations is unreadable` | The database was never migrated | Run `wyrd-server migrate` |
 | `migration <version> … is not applied` | The database was migrated by an older release | Run `wyrd-server migrate` with this release |
-| `is a superuser` or `BYPASSRLS` | A database URL names an administrator login | Use the ordinary logins from [Deploy Wyrd for a team](/operate/deploy-wyrd-for-a-team/) |
-| `platform login <name> does not own <table>` | The two URLs are swapped | Swap them back |
+| `is a superuser` or `BYPASSRLS` | A database URL names an administrator login | Use an ordinary login, as in [Deploy Wyrd for a team](/operate/deploy-wyrd-for-a-team/) |
+| `platform login <name> does not own <table>` | With two logins, the URLs are swapped | Swap them back |
 | `holds TRUNCATE, REFERENCES, or TRIGGER` | The tenant login was granted too much | `REVOKE TRUNCATE, REFERENCES, TRIGGER ON ALL TABLES IN SCHEMA wyrd, vala FROM wyrd_tenant` |
-| `permission denied for schema vala` | The tenant login has no grants | Run step 2 of [Deploy Wyrd for a team](/operate/deploy-wyrd-for-a-team/#2-grant-the-tenant-login-its-access) |
-| `permission denied for database` during `migrate` | The platform login does not own the database | `ALTER DATABASE wyrd OWNER TO wyrd_platform` as the administrator |
+| `permission denied for schema vala` | The tenant login has no grants | Run the grants in [When to add a tenant login](/operate/deploy-wyrd-for-a-team/#when-to-add-a-tenant-login) |
+| `permission denied for database` during `migrate` | The platform login does not own the database | `ALTER DATABASE wyrd OWNER TO wyrd` as the administrator |
 
 ## Stored secrets
 
 | Message contains | Cause | Fix |
 | --- | --- | --- |
-| `gateway credential protection is unavailable` | The server has no sealing key, so it cannot encrypt a `managed_secret` provider key | Set `WYRD_SEALING_KEY_FILE` as in [Deploy Wyrd for a team](/operate/deploy-wyrd-for-a-team/#4-start-the-server-and-check-readiness) and restart. `wyrd init` creates one for you |
+| `gateway credential protection is unavailable` | The server has no sealing key, so it cannot encrypt a `managed_secret` provider key | Set `WYRD_SEALING_KEY_FILE` as in [Deploy Wyrd for a team](/operate/deploy-wyrd-for-a-team/#3-start-the-server-and-check-readiness) and restart. `wyrd init` creates one for you |
 | `exist but no sealing key is configured` at startup | Encrypted secrets are stored, and the server started without the key they were sealed under | Start with the same `WYRD_SEALING_KEY_FILE` as before |
 | A gateway call fails with an upstream-unavailable error after a key change | The provider key was sealed under a key the server no longer holds | List the old key in `WYRD_SEALING_RETAINED_KEYS_FILE` and restart, or put the credential again |

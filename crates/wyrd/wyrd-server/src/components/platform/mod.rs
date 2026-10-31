@@ -13,9 +13,14 @@
 //! replaces the global credential, so losing the provider costs the deployment
 //! nothing but individual sign-in.
 //!
+//! `benchmark`, built only with the `bench` feature, lets a benchmark stage
+//! and publish this replica's Scribe on request.
+//!
 //! `builtins` gives every tenant the canonical Bifrost built-in tables at
 //! provisioning and reconciles them for active tenants at startup.
 
+#[cfg(feature = "bench")]
+pub mod benchmark;
 pub mod builtins;
 pub mod credentials;
 pub mod identity;

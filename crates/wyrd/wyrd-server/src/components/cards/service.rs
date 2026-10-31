@@ -912,7 +912,10 @@ async fn initialize_uploads(
     // Metadata-only cards, and replayed artifact cards whose manifests are
     // already verified, complete in the same server-owned lifecycle seam. A
     // card with a still-pending upload plan remains Pending for the client
-    // upload phase.
+    // upload phase. A failed completion fails the declaration's Pending
+    // Cards, except an unacknowledged inventory row: that refusal is
+    // retryable, so its Card stays Pending for the idempotent retry or the
+    // Card reconciler.
     for index in 0..response.outcomes.len() {
         let outcome = response.outcomes[index].clone();
         if outcome.status != CardLifecycleStatus::Pending
@@ -938,6 +941,9 @@ async fn initialize_uploads(
             .await
         {
             Ok(outcome) => outcome,
+            Err(error) if error.code() == "WYRD_VALA_503_BIFROST_WRITER_UNAVAILABLE" => {
+                return Err(error);
+            }
             Err(error) => {
                 abort_pending_declaration_cards(state, caller, &response.outcomes, idempotency_key)
                     .await;

@@ -687,3 +687,65 @@ mise exec -- scripts/postgres/with-test-postgres.sh -- bash -lc 'mise run db:mig
   [benchmark methods/history](../../../../benchmarks/README.md)
 - [Prior storage task, superseded only within this revision](TASK-006-R1-simplify-verification-data-plumbing.md)
 
+
+## Implementation Evidence
+
+Implementation `4778abf71` plus the outbox fix `e9e3d95cb` on `change/benchmark-rev19`. Every command ran serially
+through `scripts/postgres/with-test-postgres.sh` against the repository Postgres.
+
+| Acceptance criterion | Implementation evidence | Verification evidence | Result |
+|---|---|---|---|
+| REQ-035, AC-015: own-input ACK before any queued row; direct unaffected | `scribe_outbox.rs::ScribeWrite::ExecutionInputs` carries `Queued` for every origin; `verification/submissions.rs::SubmissionSink::write` admits only `Acknowledged` work | V1 `pg_verification_runtime::queued_origins_require_their_own_input_ack`; V18 `verification_runtime::queued_origins_share_ack_gated_admission` | PASS |
+| REQ-036, AC-016: cursor/generation move with admission; fixed in-flight metadata | `wyrd-sql` `accept_scheduled` (`ADVANCE_EXPECTED_CURSOR_SQL`), `accept_grouped` (`CONSUME_GROUP_GENERATION_SQL`) | V2 `pg_verifier_executions::acknowledged_admission_preserves_scheduling_state`; V4 `pg_verification_groups::failed_handoffs_retry_without_consuming_source_work` | PASS |
+| REQ-036/037, AC-017: per-tenant mixed-origin batches, distributed polling, exclusive leases | `admission_lane`: a tenant's scheduled and group candidates share lane 0; submissions hash key or execution id | V3 `pg_verification_groups::queued_origins_share_batched_admission`; V5 `pg_verification_runtime::accepted_origins_run_without_local_notification`; V17 `two_replicas_claim_each_queued_run_exactly_once` | PASS |
+| REQ-037, AC-018, INV-001/003: isolation, stale fence, payload owners, SDK behavior | unchanged runner fence and Bifrost owners | V6 `pg_verifier_executions::queued_admission_preserves_tenant_and_input_identity`; V9; V10; V11 Rust `wyrd-ai`, Python pytest, TypeScript vitest | PASS |
+| REQ-038, AC-018/019: exact counts, static checks, gate | no count or assertion changed | V7 four attempts, one scheduled wait; V8 exactly 14 queries; V12 fmt, lints, `test:sql`, `check:tenant-isolation`, `check:deps`, `codegen:check`, `git diff --check` all exit 0; V13 see below | PASS |
+
+Selector deviations: V2 and V6 live in `wyrd-sql/tests/integration/pg_verifier_executions.rs`
+(lane `test:sql`) because they drive the SQL owner directly; V3 and V4 live in
+`wyrd-server/tests/integration/pg_verification_groups.rs` beside the group
+fixtures. Names are unchanged; run with `test(=pg_verifier_executions::<name>)` or
+`test(=pg_verification_groups::<name>)` in the same targets.
+
+Full-file regression: `pg_verification_runtime::` and `pg_verification_groups::`
+58 run, 58 passed at `4778abf71`. An earlier run (5 failures) preceded
+`51bc7d183`, which aligned those pre-existing scheduler/group tests with
+acknowledged admission (superseded promise: insert before publication).
+
+Non-goals held: no temp/prequeue table, no inputs on execution rows, no hold or
+infinity scheme, no recovery machinery, the 50 ms linger unchanged.
+
+V18 `verification_runtime::queued_origins_share_ack_gated_admission` (journey,
+`-p wyrd-testing --test server`) passed. V7–V11 and V17 passed by exact selector
+at `4778abf71`; V11 on Rust, Python and TypeScript.
+
+### V13 gate
+
+| Candidate | Invocation | Result | Log |
+|---|---|---|---|
+| `4778abf71` | `mise run -c -j 1 gate` | exit 100: only `test:bifrost:gate` red, 275/276; `forge live_rewrite::compaction_target_registers_describes_and_steers_forge_rewrites` | outside the tree |
+| `e9e3d95cb` | `mise run -c -j 4 gate` (maintainer-directed `-j 4`) | exit 0, every lane green | outside the tree |
+
+Diagnosis of the red lane:
+
+- **Symptom:** `flush_bifrost` at `live_rewrite.rs:2276` returned
+  `1 staged Scribe writes did not settle within 60s`; it passed alone and in
+  four further lane runs.
+- **Evidence:** the dump at failure showed one outbox item pending, no write
+  failure or retry, and no further write started. `OutboxWriter::run` called
+  `dispatch` and `next_wake`, each reading `Instant::now()` itself.
+- **Cause:** a lane whose linger deadline passed between the two reads was
+  not ready for `dispatch` and was filtered as already due by `next_wake`,
+  which then returned `None`; the writer awaited `pending()` until another
+  item or completion arrived. Introduced by `edc1f2eac` (lane linger), not by
+  this task's diff.
+- **Fix site:** `wyrd-runtime/src/outbox.rs`, the shared owner of
+  `ScribeSink` (audit, captures, spans, verification inputs/results) and
+  `SubmissionSink`; the loop now passes one instant to both. Retry deadlines
+  share the same instant.
+- **Diagnosticians:** a read-only Claude diagnostician located the stall
+  before Scribe ingest without naming a cause; a read-only Codex diagnostician
+  named the lost wakeup, confirmed in source.
+- **Proof:** `outbox::tests::a_lane_short_of_its_linger_keeps_a_wake_at_its_deadline`
+  fails with the old second clock read and passes with the fix; outbox tests
+  20/20, `test:shared` 823/823, lints, fmt, and the green gate above.

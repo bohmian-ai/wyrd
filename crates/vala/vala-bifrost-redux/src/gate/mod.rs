@@ -40,9 +40,9 @@ pub use crate::gate::limits::{IngestLimits, OtlpWireLimits};
 use crate::namespaces::BifrostNamespace;
 use crate::oracle::{AuthorizedQueryContext, OracleQueryStream, QueryStreamLifecycle};
 pub use crate::otlp_contract::{IngestOutcome, LogsOutcome, MetricsOutcome};
-use crate::scribe::preprocess::LogicalIdentity;
+use crate::scribe::preprocess::logical_data_identity;
 use crate::tables::{
-    CallsTable, DomainTable, ExecutionInputsTable, ResultFeaturesTable, ResultsTable, TableError,
+    CallsTable, DomainTable, ExecutionInputsTable, ExecutionOutputsTable, ResultsTable, TableError,
 };
 use wyrd_runtime::principal::CardAttribution;
 use wyrd_spec::auth::Attribution;
@@ -67,8 +67,21 @@ fn projection_error(signal: &str, error: &TableError) -> IngestError {
         }
     }
 }
-/// Record the bounded-cardinality Gate request families used by D24.
+/// Record the bounded-cardinality Gate request families used by D24, and
+/// a write's server time through [`wyrd_telemetry::record_timing`] at
+/// boundary `bifrost.gate.write` under the current span's benchmark
+/// classification; no benchmark reads a query's Gate time, so it records
+/// none.
 fn record_gate_request(operation: &'static str, outcome: &'static str, elapsed: Duration) {
+    if operation == "write" {
+        wyrd_telemetry::record_timing(
+            &tracing::Span::current(),
+            "bifrost.gate.write",
+            outcome,
+            elapsed,
+            None,
+        );
+    }
     metrics::counter!("bifrost_gate_requests_total", "operation" => operation, "outcome" => outcome)
         .increment(1);
     metrics::histogram!(
@@ -106,7 +119,7 @@ fn record_write_rejection(error: &IngestError) {
 /// (the pair Scribe stamps on the rows), the logical table FQN,
 /// the accepted `context` — workload root and deployment environment — that
 /// the shared dimensions are stamped from, and the canonical batch's logical
-/// Arrow digest from [`LogicalIdentity`], which binds the batch's accepted
+/// Arrow digest from [`logical_data_identity`], which binds the batch's accepted
 /// correlation columns. The logical digest omits the per-request managed
 /// columns (request id, ingest time) that change across a legitimate retry,
 /// so a genuine replay still converges;
@@ -132,9 +145,8 @@ fn otlp_batch_id(
     publisher: Attribution,
     context: [Option<&str>; 2],
     table: &TableRef,
-    identity: &LogicalIdentity,
+    logical_digest: &[u8; 32],
 ) -> Uuid {
-    let logical_digest = identity.digest();
     let mut digest = Sha256::new();
     digest.update(b"wyrd.otlp.batch-id.v1");
     digest.update(tenant.as_uuid().as_bytes());
@@ -975,7 +987,8 @@ impl<A: GateAudit + 'static> Gate<A> {
         if batch.num_rows() == 0 {
             return Ok(());
         }
-        let identity = LogicalIdentity::of(&batch).map_err(IngestError::from_scribe)?;
+        let (logical_digest, _) =
+            logical_data_identity(&batch).map_err(IngestError::from_scribe)?;
         let batch_id = otlp_batch_id(
             auth.tenant,
             auth.attribution(),
@@ -984,18 +997,15 @@ impl<A: GateAudit + 'static> Gate<A> {
                 auth.deployment_environment.as_deref(),
             ],
             &table,
-            &identity,
+            &logical_digest,
         );
         let dimensions = self
             .frame_dimensions(auth, attributed_cards.as_deref())
             .await?;
-        let payload = IngressPayload::Canonical(
-            match owner {
-                Some(owner) => CanonicalIngress::new(vec![batch], owner),
-                None => CanonicalIngress::unreserved(vec![batch]),
-            }
-            .with_logical_identity(identity),
-        );
+        let payload = IngressPayload::Canonical(match owner {
+            Some(owner) => CanonicalIngress::new(vec![batch], owner),
+            None => CanonicalIngress::unreserved(vec![batch]),
+        });
         let scribe = self.scribe.as_ref().ok_or(IngestError::IngressClosed)?;
         scribe
             .ingest_frame(ScribeIngressFrame {
@@ -1127,7 +1137,10 @@ fn is_verification_result_table(table: &TableRef) -> bool {
     [
         (ResultsTable::NAMESPACE, ResultsTable::NAME),
         (ExecutionInputsTable::NAMESPACE, ExecutionInputsTable::NAME),
-        (ResultFeaturesTable::NAMESPACE, ResultFeaturesTable::NAME),
+        (
+            ExecutionOutputsTable::NAMESPACE,
+            ExecutionOutputsTable::NAME,
+        ),
     ]
     .into_iter()
     .any(|(namespace, name)| {
@@ -2749,7 +2762,7 @@ mod tests {
         for table in [
             "bifrost.verification.results",
             "bifrost.verification.execution_inputs",
-            "bifrost.drift.result_features",
+            "bifrost.verification.execution_outputs",
         ] {
             for (label, auth) in &principals {
                 let scribe_calls = Arc::new(AtomicUsize::new(0));
@@ -2909,6 +2922,111 @@ mod tests {
         );
     }
 
+    /// Scribe double whose admission, the write's durable append, takes
+    /// 30 ms.
+    struct SlowScribe;
+
+    #[async_trait]
+    impl Scribe for SlowScribe {
+        /// Always ready, so the Gate admits the write and its slow append
+        /// is the only delay.
+        fn is_ready(&self) -> bool {
+            true
+        }
+
+        /// Give the Gate a registered identity for any test destination.
+        ///
+        /// # Errors
+        /// This test implementation never returns an error.
+        async fn resolve_write_table(
+            &self,
+            _tenant: DataTenantId,
+            _table: &TableRef,
+        ) -> Result<TableUid, ScribeError> {
+            Ok(TableUid::from_bytes([7; 16]))
+        }
+
+        /// Admits the frame after 30 ms.
+        ///
+        /// # Errors
+        /// This test implementation never returns an error.
+        async fn ingest_frame(
+            &self,
+            _frame: ScribeIngressFrame,
+        ) -> Result<FrameAdmission, ScribeError> {
+            tokio::time::sleep(std::time::Duration::from_millis(30)).await;
+            Ok(FrameAdmission {
+                batch_id: uuid::Uuid::now_v7(),
+                rows_accepted: 0,
+                receipt_micros: 0,
+                first_commit: true,
+            })
+        }
+    }
+
+    /// A native write's `bifrost.gate.write` observation runs until Scribe
+    /// admitted it durably, so a 30 ms append is inside it; a write refused
+    /// before Scribe is its own `failed` observation.
+    ///
+    /// # Panics
+    /// Panics when an outcome, count, or elapsed bound is wrong.
+    #[tokio::test]
+    async fn histogram_write_boundary_includes_durable_append() {
+        use wyrd_telemetry::timing;
+
+        timing::enable();
+        let before = timing::snapshot();
+        let gate = Gate::<RecordingAudit>::with_test_scribe(
+            Arc::new(SlowScribe),
+            test_interceptor(),
+            IngestLimits::default(),
+        )
+        .with_audit(RecordingAudit::new());
+        let caller = context_with(
+            PrincipalId::new(uuid::Uuid::now_v7()),
+            PrincipalKind::User,
+            [Permission::bifrost_record_write()],
+        );
+        let request = |table_version| {
+            let mut request =
+                wyrd_tonic::tonic::Request::new(wyrd_tonic::wyrd::v1::InsertBatchRequest {
+                    table_version,
+                    ..native_frame("bifrost.datasets.events")
+                });
+            request.extensions_mut().insert(super::auth::ResolvedCaller(
+                wyrd_auth_verify::VerifiedToken {
+                    principal: caller.principal.clone(),
+                    delegation_chain: Vec::new(),
+                    exp: chrono::Utc::now() + chrono::Duration::hours(1),
+                },
+            ));
+            request
+        };
+        gate.write_batch(request(1))
+            .await
+            .expect("the write is admitted");
+        assert!(gate.write_batch(request(0)).await.is_err());
+        let interval = timing::snapshot().since(&before).expect("one process");
+        let series = |outcome: &str| {
+            interval
+                .series
+                .iter()
+                .find(|series| series.boundary == "bifrost.gate.write" && series.outcome == outcome)
+                .unwrap_or_else(|| panic!("no {outcome} series: {:?}", interval.series))
+        };
+        assert_eq!(series("success").count, 1);
+        let lowest = series("success")
+            .elapsed
+            .quantile(0.0)
+            .expect("one observation")
+            .lowest;
+        assert!(
+            lowest >= 29_000_000,
+            "through the durable append: {lowest} ns"
+        );
+        assert_eq!(series("failed").count, 1);
+    }
+
     /// Query request lifecycles emit one exact terminal and drain active work.
     #[test]
     fn query_request_lifecycle_reconciles_exact_terminal_outcomes() {
@@ -3020,9 +3138,9 @@ mod otlp_batch_id_tests {
         let spans = TableRef::new(BifrostNamespace::Traces, "spans");
         let records = TableRef::new(BifrostNamespace::Logs, "records");
         let in_context = |context, tenant, principal, table: &TableRef, values: &[i32], run| {
-            let identity = crate::scribe::preprocess::LogicalIdentity::of(&batch(values, run))
+            let (logical_digest, _) = super::logical_data_identity(&batch(values, run))
                 .expect("the fixture batch has a logical identity");
-            otlp_batch_id(tenant, principal, context, table, &identity)
+            otlp_batch_id(tenant, principal, context, table, &logical_digest)
         };
         let id = |tenant, principal, table: &TableRef, values: &[i32], run| {
             in_context([None, None], tenant, principal, table, values, run)

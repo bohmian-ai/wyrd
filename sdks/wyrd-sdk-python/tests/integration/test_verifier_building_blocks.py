@@ -276,10 +276,10 @@ class Numbers(RootModel[dict[str, float]]):
     """Numbers only, which the scores' text categories do not fit."""
 
 
-class RetainedOutcome(BaseModel):
-    """One retained result's outcome as JSON text."""
+class RetainedOutput(BaseModel):
+    """One retained result's output record as JSON text."""
 
-    outcome: str
+    output: str
 
 
 def scored_review(desk: WyrdState, text: str = SCORED_TEXT) -> verify.VerificationResult:
@@ -710,7 +710,7 @@ def test_custom_verdict_data_survives_readback(
     status = execution.status()
     assert status["result"]["outcome"]["requirements"] == waited.requirements
 
-    assert retained(wyrd_server, waited.execution_id) == status["result"]["outcome"]
+    assert retained(wyrd_server, waited.execution_id) == status["result"]["outcome"]["requirements"]
 
     for marker, data in EXACT_DATA.items():
         text = f"{marker} refunds"
@@ -720,18 +720,18 @@ def test_custom_verdict_data_survives_readback(
         assert requirement(waited, "well-formed")["data"] == data, marker
         status = execution.status()
         assert status["result"]["outcome"]["requirements"] == waited.requirements, marker
-        assert retained(wyrd_server, waited.execution_id) == status["result"]["outcome"], marker
+        assert retained(wyrd_server, waited.execution_id) == waited.requirements, marker
 
 
 def retained(wyrd_server: WyrdTestServer, execution_id: str) -> object:
-    """The retained outcome of ``execution_id``, read back from Bifrost after publishing."""
+    """The retained requirements of ``execution_id``, read back from Bifrost after publishing."""
     wyrd_server.flush_bifrost()
     [row] = Bifrost(client=client_of(wyrd_server)).sql(
-        "SELECT to_json(outcome) AS outcome FROM bifrost.verification.results WHERE execution_id = $1",
+        "SELECT to_json(output) AS output FROM bifrost.verification.execution_outputs WHERE execution_id = $1",
         [execution_id],
-        model=RetainedOutcome,
+        model=RetainedOutput,
     )
-    return json.loads(row.outcome)
+    return json.loads(row.output)["requirements"]
 
 
 def deep(containers: int) -> object:

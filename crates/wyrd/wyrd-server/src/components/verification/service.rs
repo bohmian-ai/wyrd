@@ -10,7 +10,6 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::time::Duration;
 
-use arrow::record_batch::RecordBatch;
 use chrono::Utc;
 use tokio_util::sync::CancellationToken;
 use tracing::Instrument as _;
@@ -22,17 +21,19 @@ use wyrd_spec::auth::Sha256Hex;
 use wyrd_spec::card::verifier::CheckEvidence;
 use wyrd_spec::error::WyrdError;
 use wyrd_spec::error::storage::WyrdStorageError;
-use wyrd_spec::ids::{BindingId, CardUid, ExecutionId, IdempotencyKey, VerificationResultId};
-use wyrd_spec::vala::api::{AuditOutcome, BifrostQueryRequest};
-use wyrd_spec::vala::ids::{RunId, SpanId, TraceId};
+use wyrd_spec::ids::{BindingId, CardUid, ExecutionId, IdempotencyKey};
+use wyrd_spec::vala::api::AuditOutcome;
+use wyrd_spec::vala::ids::{SpanId, TraceId};
 use wyrd_spec::verification::execution::{
     EnqueueVerificationResponse, EvidencePlanRequest, EvidencePlanResponse, EvidenceUpload,
     VerificationExecutionState, VerificationOutcome, VerificationRequest, VerificationResult,
 };
-use wyrd_spec::verification::{VerificationBindingStatus, VerifierReadiness};
+use wyrd_spec::verification::{
+    VerificationBindingStatus, VerificationExecutionStatus, VerifierReadiness,
+};
 use wyrd_sql::queries::cards::get_card_by_uid;
 use wyrd_sql::queries::verifier_executions::{
-    Cause, EnqueueRefusal, Submission, VerifierExecutionQueue,
+    Admission, Cause, EnqueueRefusal, Submission, VerifierExecutionQueue,
 };
 use wyrd_sql::{ParsedCardRow, TenantConn};
 use wyrd_storage::StorageError;
@@ -49,7 +50,11 @@ use crate::scribe_outbox::{ScribeSink, ScribeWrite};
 use crate::state::{AppState, registry_db_error};
 use crate::verification::cache::{Db, Target, exact_ref};
 use crate::verification::hosted::blocks::{Execution, HostedBlocks};
-use crate::verification::results::{ResultPayloadBuilder, ResultPayloadError, ResultRun};
+use crate::verification::inputs::InputResolver;
+use crate::verification::results::{
+    InputRecord, ResultPayloadBuilder, ResultPayloadError, ResultRun,
+};
+use crate::verification::submissions::Queued;
 use crate::verification::telemetry::{ExecutionMode, ExecutionTelemetry, Phase};
 
 /// Audit operation of a binding status read.
@@ -72,9 +77,6 @@ const ENQUEUE: &str = "verification.enqueue";
 
 /// Lifetime of one evidence upload URL.
 const EVIDENCE_UPLOAD_TTL: Duration = Duration::from_mins(10);
-
-/// Stable query error of a tenant result table no result has created yet.
-const RESULTS_NOT_CREATED: &str = "WYRD_VALA_404_BIFROST_TABLE_NOT_FOUND";
 
 /// Map an inputs or result encoding failure to its public error.
 ///
@@ -197,9 +199,13 @@ impl<'a> VerificationControl<'a> {
     ///
     /// Authorizes and audits `cards:read` standalone, reads the status and
     /// both exact Cards in one tenant transaction, then — for a completed
-    /// execution — reads its result from `bifrost.verification.results` as the
-    /// caller through the ordinary Bifrost query entry. A result Scribe has
-    /// not yet published leaves `result` absent, so the caller polls again.
+    /// execution — reads its PostgreSQL-selected result through the one
+    /// result reader as the caller, through the ordinary Bifrost query entry.
+    /// A group execution's source selection is read from its input record. A
+    /// direct execution has no queue row: its ID resolves only through a
+    /// published result whose input record has the `direct` origin, and reads
+    /// as completed. A result Scribe has not yet published leaves `result`
+    /// absent, so the caller polls again.
     ///
     /// # Errors
     /// Returns [`WyrdError::PermissionDeniedRbac`] without `cards:read`,
@@ -219,6 +225,12 @@ impl<'a> VerificationControl<'a> {
             GET_EXECUTION,
             &resource,
         )?;
+        let query = ScheduledQueryCaller::authenticated(
+            self.state.clone(),
+            caller.clone(),
+            CancellationToken::new(),
+        )?;
+        let records = InputResolver::new(&query, None);
         let mut conn = self
             .state
             .registry_tenant_conn(caller.data_tenant_id)
@@ -227,93 +239,100 @@ impl<'a> VerificationControl<'a> {
             .queue
             .execution_status(&mut conn, execution_id)
             .await
-            .map_err(registry_db_error)?
-            .ok_or_else(|| WyrdError::VerificationExecutionNotFound {
-                message: "no verification execution with this ID in the caller's tenant".to_owned(),
-                details: serde_json::json!({ "execution_id": execution_id }),
-            })?;
-        let mut state = status.state;
-        let Some(result_id) = status.result_id else {
-            return Ok(state);
+            .map_err(registry_db_error)?;
+        let Some(status) = status else {
+            drop(conn);
+            return self
+                .direct_execution(caller, &records, execution_id)
+                .await?
+                .ok_or_else(|| WyrdError::VerificationExecutionNotFound {
+                    message: "no verification execution with this ID in the caller's tenant"
+                        .to_owned(),
+                    details: serde_json::json!({ "execution_id": execution_id }),
+                });
         };
+        let mut state = status.state;
         let verifier = Self::card(&mut conn, &status.verifier_card_uid).await?;
         let subject = Self::card(&mut conn, &status.card_uid).await?;
         drop(conn);
-        let (Some(verifier), Some(subject)) = (verifier, subject) else {
+        if state.group_id.is_some() && state.owner_card_uid.is_some() {
+            state.group = match records.record(execution_id).await? {
+                Some(record) => record.group()?.map(|selector| selector.snapshot()),
+                None => None,
+            };
+        }
+        let (Some(result_id), Some(verifier), Some(subject)) =
+            (status.result_id, verifier, subject)
+        else {
             return Ok(state);
         };
-        state.result = self
-            .read_result(caller, result_id)
-            .await?
-            .map(|(run_id, outcome)| VerificationResult {
+        state.result =
+            records
+                .result(result_id)
+                .await?
+                .map(|(run_id, outcome)| VerificationResult {
+                    execution_id,
+                    run_id,
+                    verifier: exact_ref(&verifier),
+                    subject: exact_ref(&subject),
+                    outcome,
+                    deployment_environment: status.deployment_environment,
+                });
+        Ok(state)
+    }
+
+    /// The completed status of direct execution `execution_id`, `None` until
+    /// its result, output, and input records are visible or when no direct
+    /// execution has this ID. A caller who may not query the verification
+    /// tables sees no direct execution, so the lookup answers `None` rather
+    /// than refusing an ID that may belong to a queued execution.
+    ///
+    /// # Errors
+    /// Returns a query failure, a registry error when a Card read fails, and
+    /// an internal error when a stored record is malformed.
+    async fn direct_execution(
+        &self,
+        caller: &Caller,
+        records: &InputResolver<'_>,
+        execution_id: ExecutionId,
+    ) -> Result<Option<VerificationExecutionState>, WyrdError> {
+        let direct = match records.direct(execution_id).await {
+            Err(WyrdError::PermissionDeniedRbac { .. }) => return Ok(None),
+            read => read?,
+        };
+        let Some(direct) = direct else {
+            return Ok(None);
+        };
+        let Some((run_id, outcome)) = records.result(direct.result_id).await? else {
+            return Ok(None);
+        };
+        let mut conn = self
+            .state
+            .registry_tenant_conn(caller.data_tenant_id)
+            .await?;
+        let verifier = Self::card(&mut conn, &direct.verifier_card_uid).await?;
+        let subject = Self::card(&mut conn, &direct.card_uid).await?;
+        drop(conn);
+        let (Some(verifier), Some(subject)) = (verifier, subject) else {
+            return Ok(None);
+        };
+        Ok(Some(VerificationExecutionState {
+            execution_id,
+            status: VerificationExecutionStatus::Completed,
+            error: None,
+            result: Some(VerificationResult {
                 execution_id,
                 run_id,
                 verifier: exact_ref(&verifier),
                 subject: exact_ref(&subject),
                 outcome,
-                deployment_environment: status.deployment_environment,
-            });
-        Ok(state)
-    }
-
-    /// Read one published result's application Run and outcome as `caller`.
-    ///
-    /// `Ok(None)` when no row is visible yet, including a tenant whose result
-    /// table no result has created.
-    ///
-    /// # Errors
-    /// Returns the query refusal or failure, and an internal error when the
-    /// stored outcome does not decode.
-    async fn read_result(
-        &self,
-        caller: &Caller,
-        result_id: VerificationResultId,
-    ) -> Result<Option<(Option<RunId>, VerificationOutcome)>, WyrdError> {
-        let query = ScheduledQueryCaller::authenticated(
-            self.state.clone(),
-            caller.clone(),
-            CancellationToken::new(),
-        )?;
-        let mut batches: Vec<RecordBatch> = Vec::new();
-        let request = BifrostQueryRequest {
-            params: Vec::new(),
-            sql: format!(
-                "SELECT outcome, run_id FROM bifrost.verification.results \
-                 WHERE result_id = '{result_id}' LIMIT 1"
-            ),
-            deadline_ms: None,
-        };
-        let read = query.run_with(request, |batch| {
-            batches.push(batch);
-            Ok(())
-        });
-        match read.await {
-            Err(error) if error.code() == RESULTS_NOT_CREATED => return Ok(None),
-            Err(error) => return Err(error),
-            Ok(_) => {}
-        }
-        let Some(batch) = batches.iter().find(|batch| batch.num_rows() > 0) else {
-            return Ok(None);
-        };
-        let decode =
-            |error: String| WyrdError::internal(format!("stored result is invalid: {error}"));
-        let column = |name: &str| {
-            batch
-                .column_by_name(name)
-                .ok_or_else(|| decode(format!("no {name} column")))
-        };
-        let outcome = wyrd_queue::variant::variant_cell_to_json(column("outcome")?.as_ref(), 0)
-            .map_err(|error| decode(format!("{error:?}")))?;
-        let outcome = serde_json::from_value(outcome).map_err(|error| decode(error.to_string()))?;
-        let run = column("run_id")?;
-        let run_id = if run.is_null(0) {
-            None
-        } else {
-            let run = arrow::util::display::array_value_to_string(run, 0)
-                .map_err(|error| decode(error.to_string()))?;
-            Some(RunId::from_string(run))
-        };
-        Ok(Some((run_id, outcome)))
+                deployment_environment: direct.deployment_environment,
+            }),
+            dispatches: Vec::new(),
+            group_id: direct.group_id,
+            owner_card_uid: None,
+            group: None,
+        }))
     }
 
     /// Plan uploads of the caller's evidence files that storage lacks.
@@ -757,8 +776,13 @@ impl<'a> VerificationControl<'a> {
             now,
             now,
         )
-        .inputs(&submission.request.inputs, Some(&submission))
+        .inputs(InputRecord::Submitted(&submission))
         .map_err(|error| payload_error(&error))?;
+        // The staged row is the one store of the submission's values; the
+        // acknowledged handoff carries only its coordination identity.
+        let mut submission = submission;
+        std::mem::take(&mut submission.request.inputs);
+        std::mem::take(&mut submission.request.execution_route_overrides);
         let queued = submissions.reserve(1).map_err(staging_full)?;
         let staged = self
             .state
@@ -772,7 +796,13 @@ impl<'a> VerificationControl<'a> {
             ScribeWrite::ExecutionInputs {
                 row,
                 attribution: caller.attribution(),
-                queued: Some((queued, Box::new(submission))),
+                queued: Some((
+                    queued,
+                    Box::new(Queued {
+                        admission: Admission::Submitted(submission),
+                        claim: None,
+                    }),
+                )),
             },
         );
         Ok(EnqueueVerificationResponse { execution_id })
@@ -820,7 +850,7 @@ impl<'a> VerificationControl<'a> {
             Utc::now(),
         );
         let built = builder
-            .inputs(&request.inputs, None)
+            .inputs(InputRecord::Direct(&request.inputs))
             .and_then(|row| Ok((row, builder.build(outcome)?)));
         match built {
             Ok((row, payload)) => {

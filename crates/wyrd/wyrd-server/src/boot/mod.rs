@@ -418,7 +418,7 @@ async fn build_bifrost_external_dependencies(
     .map_err(|error| ServerBootError::Scribe(error.to_string()))?;
     if let Some(oracle) = resources.oracle() {
         bifrost_storage = bifrost_storage
-            .with_metadata_cache(&oracle.metadata())
+            .with_oracle_caches(&oracle.metadata())
             .map_err(|error| ServerBootError::Scribe(error.to_string()))?;
     }
     let bifrost_storage = Arc::new(bifrost_storage);
@@ -623,16 +623,20 @@ pub async fn compose_bifrost(
             .map_err(|error| {
                 ServerBootError::Scribe(format!("persistence CPU pool failed: {error}"))
             })?,
-            ScribeWalIoPool::try_new_with_capacity_and_delay(scribe_config.wal_io_threads, 256, {
-                #[cfg(feature = "test-support")]
+            ScribeWalIoPool::try_new_with_capacity_and_delay(
+                scribe_config.wal_io_workers(),
+                256,
                 {
-                    wal_sync_delay
-                }
-                #[cfg(not(feature = "test-support"))]
-                {
-                    Duration::ZERO
-                }
-            })
+                    #[cfg(feature = "test-support")]
+                    {
+                        wal_sync_delay
+                    }
+                    #[cfg(not(feature = "test-support"))]
+                    {
+                        Duration::ZERO
+                    }
+                },
+            )
             .map_err(|error| ServerBootError::Scribe(format!("WAL IO pool failed: {error}")))?,
         );
         // Built once, not once per feature branch. The previous shape
@@ -640,8 +644,16 @@ pub async fn compose_bifrost(
         // and a field added to only one of them compiles cleanly on the
         // all-features route while breaking the default-feature production
         // server. One initializer makes that divergence unrepresentable.
+        // The unstaged bound keeps two rotated generations waiting per staging
+        // worker, so staging never idles for lack of work, and never lets the
+        // backlog hold more than half the shared memory queries also use.
         let admission_defaults = AdmissionConfig {
             memory_limit_bytes: pod_memory_limit,
+            immutable_limit_bytes: geometry
+                .shard_generation_rotation_usize()
+                .saturating_mul(2)
+                .saturating_mul(scribe_config.persistence_cpu_threads)
+                .min(pod_memory_limit / 2),
         };
         #[cfg(feature = "test-support")]
         let admission = test_controls
@@ -650,10 +662,14 @@ pub async fn compose_bifrost(
             .unwrap_or(admission_defaults);
         #[cfg(not(feature = "test-support"))]
         let admission = admission_defaults;
+        // One staging worker per persistence CPU thread: a worker spends most
+        // of a job outside the CPU lane (fsyncs, the staged record, the
+        // manifest, the shard's acknowledgement), so fewer workers than CPU
+        // threads would leave the encode lane idle while generations wait.
         let persistence = ScribePersistenceConfig::new(
             Arc::new(postgres.vala().clone()),
             64,
-            scribe_config.wal_io_threads,
+            scribe_config.persistence_cpu_threads,
         )
         .with_operator_pool(postgres.operator_pool().ok_or_else(|| {
             ServerBootError::Scribe(

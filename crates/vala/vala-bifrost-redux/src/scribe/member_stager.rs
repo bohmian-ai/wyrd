@@ -216,6 +216,7 @@ impl ScribeMemberStager {
         std::fs::create_dir_all(&directory).map_err(|error| ScribeError::Internal {
             detail: format!("create the staged member directory: {error}"),
         })?;
+        let encode_started = std::time::Instant::now();
         let encoded = crate::scribe::parquet_writer::encode_batch(
             request.frozen,
             request.binding,
@@ -225,6 +226,8 @@ impl ScribeMemberStager {
             request.layout,
             request.memory,
         )?;
+        crate::scribe::persistence::record_persist_stage("encode", encode_started);
+        let sync_started = std::time::Instant::now();
         let mut runs = Vec::with_capacity(encoded.artifacts.len());
         let mut footers = Vec::with_capacity(encoded.artifacts.len());
         let mut staged_bytes = 0_u64;
@@ -248,6 +251,7 @@ impl ScribeMemberStager {
         }
         encoded.artifacts.retain_for_reconciliation();
         fsync_directory(&directory)?;
+        crate::scribe::persistence::record_persist_stage("sync_runs", sync_started);
         Ok(StagedRuns {
             key,
             member,
@@ -465,8 +469,8 @@ mod tests {
             ),
             shard_id: 5,
             schema,
-            batches: vec![batch],
-            statistics: Vec::new(),
+            batches: vec![batch].into(),
+            statistics: Arc::default(),
             metas: vec![],
             opened_at: std::time::Instant::now(),
             closed_at: std::time::Instant::now(),

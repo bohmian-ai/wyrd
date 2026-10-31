@@ -1,9 +1,9 @@
-//! The `bifrost.datasets.events` fixture, the named benchmark cases, their exact
-//! answers, and their targets.
+//! The `bifrost.datasets.events` fixture, the named benchmark cases, and their
+//! exact answers.
 //!
 //! Everything the benchmark writes and asks lives here, in plain functions of
-//! one row index, so a reader can check any report row against its data,
-//! statement, expected answer, and target without following a workload DSL.
+//! one row index, so a reader can check any record against its data,
+//! statement, and expected answer without following a workload DSL.
 
 use std::sync::Arc;
 
@@ -50,9 +50,6 @@ pub const SMALL_ROWS: i64 = 100_000;
 /// Rows each medium aggregate groups.
 pub const MILLION_ROWS: i64 = 1_000_000;
 
-/// Hours the heavy broad window covers: about 70% of the day.
-pub const HEAVY_BROAD_HOURS: i64 = 17;
-
 /// Expected or returned rows, every column cast to `i64`.
 pub type Rows = Vec<Vec<i64>>;
 
@@ -81,38 +78,17 @@ pub fn schema() -> SchemaRef {
 /// One fixture size and every per-row value derived from it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Fixture {
-    /// Rows seeded into [`TABLE`].
+    /// The first `event_id` the cases ask about: 0 for a whole fixture, or
+    /// where one cohort of a larger loaded fixture starts.
+    pub first: i64,
+    /// Rows from `first` the cases ask about. A loaded fixture seeds rows
+    /// `0..rows` into [`TABLE`].
     pub rows: i64,
-    /// Hours the broad-window case groups.
-    pub broad_hours: i64,
 }
 
 impl Fixture {
-    /// The standard 10-million-row fixture; its broad window is the whole day.
-    #[must_use]
-    pub const fn standard() -> Self {
-        Self {
-            rows: STANDARD_ROWS,
-            broad_hours: DAY_HOURS,
-        }
-    }
-
-    /// The 100-million-row heavy fixture; its broad window is 17 of 24 hours.
-    #[must_use]
-    pub const fn heavy() -> Self {
-        Self {
-            rows: HEAVY_ROWS,
-            broad_hours: HEAVY_BROAD_HOURS,
-        }
-    }
-
-    /// Whether this is the heavy-scan fixture.
-    #[must_use]
-    pub const fn is_heavy(self) -> bool {
-        self.rows == HEAVY_ROWS
-    }
-
-    /// `event_time` of row `id`: the rows spread evenly over one day.
+    /// `event_time` of row `id` of a whole fixture: the rows spread evenly
+    /// over one day.
     #[must_use]
     pub const fn event_time(self, id: i64) -> i64 {
         DAY_START_MS + id * (DAY_HOURS * HOUR_MS) / self.rows
@@ -191,28 +167,7 @@ fn payload(id: i64, buffer: &mut [u8; 64]) -> &str {
     std::str::from_utf8(&buffer[..len]).unwrap_or_default()
 }
 
-/// Latency, rate, and scan targets one case must meet; `None` is unjudged.
-#[derive(Debug, Clone, Copy, PartialEq, Default)]
-pub struct Target {
-    /// Client p50 ceiling, milliseconds.
-    pub p50_ms: Option<f64>,
-    /// Client p95 ceiling, milliseconds.
-    pub p95_ms: Option<f64>,
-    /// Client p99 ceiling, milliseconds.
-    pub p99_ms: Option<f64>,
-    /// Client p99 limit, milliseconds, that equality meets.
-    pub p99_at_most_ms: Option<f64>,
-    /// Successful queries-per-second floor at the same concurrency as the
-    /// latency ceilings.
-    pub min_qps: Option<f64>,
-    /// Successful queries-per-second floor at a sweep's busiest point, with
-    /// the latency ceilings judged at one client instead.
-    pub peak_qps: Option<f64>,
-    /// Physical scan bytes-per-second floor.
-    pub min_scan_bytes_per_second: Option<f64>,
-}
-
-/// Every named read case; SQL, rows examined, answer, and target sit together.
+/// Every named read case; SQL, rows examined, and answer sit together.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Case {
     /// Q1: one event by ID, rotated across the table.
@@ -223,22 +178,20 @@ pub enum Case {
     MillionAggregate,
     /// Q3b: the same `GROUP BY` over every event.
     TableAggregate,
-    /// Q4: hourly buckets over the broad time window.
-    BroadWindow,
-    /// Q5: aggregate every event, reading the varying payload.
+    /// Q4: aggregate every event, reading the varying payload.
     FullScan,
 }
 
 impl Case {
-    /// Stable report name.
+    /// The benchmark case label its requests carry, so a benchmark-mode
+    /// server keeps each class's timings apart.
     #[must_use]
-    pub const fn name(self) -> &'static str {
+    pub const fn label(self) -> &'static str {
         match self {
-            Self::Selective => "selective",
+            Self::Selective => "point-lookup",
             Self::SmallAggregate => "small-aggregate",
-            Self::MillionAggregate => "1m-aggregate",
+            Self::MillionAggregate => "million-aggregate",
             Self::TableAggregate => "table-aggregate",
-            Self::BroadWindow => "broad-window",
             Self::FullScan => "full-scan",
         }
     }
@@ -252,7 +205,7 @@ impl Case {
         match self {
             Self::SmallAggregate => 64,
             Self::MillionAggregate => 8,
-            Self::Selective | Self::TableAggregate | Self::BroadWindow | Self::FullScan => 1,
+            Self::Selective | Self::TableAggregate | Self::FullScan => 1,
         }
     }
 
@@ -272,13 +225,6 @@ impl Case {
                      GROUP BY service_id ORDER BY service_id"
                 )
             }
-            Self::BroadWindow => format!(
-                "SELECT (event_time - {DAY_START_MS}) / {HOUR_MS} AS hour, COUNT(*) AS events, \
-                 SUM(duration_ms) AS total_ms FROM {TABLE} \
-                 WHERE event_time >= {DAY_START_MS} AND event_time < {} \
-                 GROUP BY 1 ORDER BY 1",
-                DAY_START_MS + fixture.broad_hours * HOUR_MS
-            ),
             Self::FullScan => format!(
                 "SELECT COUNT(*) AS events, SUM(duration_ms) AS total_ms, \
                  SUM(LENGTH(payload)) AS payload_bytes FROM {TABLE}"
@@ -312,25 +258,6 @@ impl Case {
                     .map(|(group, service)| vec![service, group[0], group[1]])
                     .collect()
             }
-            Self::BroadWindow => {
-                let end = DAY_START_MS + fixture.broad_hours * HOUR_MS;
-                let mut hours = vec![[0_i64; 2]; DAY_HOURS.to_usize().unwrap_or(0)];
-                for id in 0..fixture.rows {
-                    let time = fixture.event_time(id);
-                    if time < end {
-                        let hour =
-                            &mut hours[((time - DAY_START_MS) / HOUR_MS).to_usize().unwrap_or(0)];
-                        hour[0] += 1;
-                        hour[1] += duration(id);
-                    }
-                }
-                hours
-                    .iter()
-                    .zip(0..)
-                    .filter(|(hour, _)| hour[0] > 0)
-                    .map(|(hour, index)| vec![index, hour[0], hour[1]])
-                    .collect()
-            }
             Self::FullScan => {
                 let (mut total, mut bytes) = (0, 0);
                 for id in 0..fixture.rows {
@@ -342,51 +269,16 @@ impl Case {
         }
     }
 
-    /// The case's target on `fixture`; the broad and full scans are judged
-    /// only on the heavy fixture.
-    #[must_use]
-    pub fn target(self, fixture: Fixture) -> Target {
-        match self {
-            Self::Selective => Target {
-                p99_at_most_ms: Some(1.0),
-                peak_qps: Some(1_200.0),
-                ..Target::default()
-            },
-            Self::SmallAggregate => Target {
-                p95_ms: Some(100.0),
-                min_qps: Some(200.0),
-                ..Target::default()
-            },
-            Self::MillionAggregate => Target {
-                p95_ms: Some(300.0),
-                min_qps: Some(40.0),
-                ..Target::default()
-            },
-            Self::TableAggregate => Target {
-                p95_ms: Some(300.0),
-                ..Target::default()
-            },
-            Self::BroadWindow if fixture.is_heavy() => Target {
-                p99_ms: Some(2_000.0),
-                ..Target::default()
-            },
-            Self::FullScan if fixture.is_heavy() => Target {
-                p99_ms: Some(2_000.0),
-                min_scan_bytes_per_second: Some(1_000_000_000.0),
-                ..Target::default()
-            },
-            Self::BroadWindow | Self::FullScan => Target::default(),
-        }
-    }
-
-    /// The `event_id` range an aggregate groups for `sequence`.
-    const fn range(self, fixture: Fixture, sequence: u64) -> (i64, i64) {
+    /// The `event_id` range an aggregate groups for `sequence`: its
+    /// declared rows, or one variant's share of a smaller (smoke) fixture.
+    fn range(self, fixture: Fixture, sequence: u64) -> (i64, i64) {
         let (rows, variants) = match self {
-            Self::SmallAggregate => (SMALL_ROWS, 64),
-            Self::MillionAggregate => (MILLION_ROWS, 8),
-            _ => return (0, fixture.rows),
+            Self::SmallAggregate => (SMALL_ROWS.min(fixture.rows / 64), 64),
+            Self::MillionAggregate => (MILLION_ROWS.min(fixture.rows / 8), 8),
+            _ => return (fixture.first, fixture.first + fixture.rows),
         };
-        let first = (sequence % variants).cast_signed() * (fixture.rows / variants.cast_signed());
+        let first = fixture.first
+            + (sequence % variants).cast_signed() * (fixture.rows / variants.cast_signed());
         (first, first + rows)
     }
 }
@@ -395,7 +287,8 @@ impl Case {
 /// spreading consecutive sequences across the whole table.
 #[must_use]
 pub const fn selective_id(fixture: Fixture, sequence: u64) -> i64 {
-    (sequence.wrapping_mul(2_654_435_761) % fixture.rows.cast_unsigned()).cast_signed()
+    fixture.first
+        + (sequence.wrapping_mul(2_654_435_761) % fixture.rows.cast_unsigned()).cast_signed()
 }
 
 #[cfg(test)]
@@ -411,14 +304,23 @@ mod tests {
     #[test]
     fn events_fixture_answers_are_exact() {
         let fixture = Fixture {
+            first: 0,
             rows: 64 * 1_000_000,
-            broad_hours: 24,
         };
-        let batch = Fixture::standard().batch(0, 3).expect("fixture rows");
+        let batch = Fixture {
+            first: 0,
+            rows: STANDARD_ROWS,
+        }
+        .batch(0, 3)
+        .expect("fixture rows");
         assert_eq!(batch.num_rows(), 3);
         assert_eq!(batch.schema(), schema());
         assert_eq!(
-            Fixture::standard().event_time(STANDARD_ROWS / 2),
+            Fixture {
+                first: 0,
+                rows: STANDARD_ROWS
+            }
+            .event_time(STANDARD_ROWS / 2),
             DAY_START_MS + 12 * HOUR_MS
         );
         assert!((16..=64).contains(&payload_len(7)));
@@ -440,6 +342,28 @@ mod tests {
         assert_eq!(
             Case::Selective.expected(fixture, 3),
             vec![vec![id, service(id), duration(id)]]
+        );
+
+        let upper = Fixture {
+            first: STANDARD_ROWS / 2,
+            rows: STANDARD_ROWS / 2,
+        };
+        assert!(
+            (0..64).all(|sequence| (STANDARD_ROWS / 2..STANDARD_ROWS)
+                .contains(&selective_id(upper, sequence))),
+            "a cohort's point lookups stay in its rows"
+        );
+        let last = Case::SmallAggregate.expected(upper, 63);
+        assert_eq!(
+            last.iter().map(|row| row[1]).sum::<i64>(),
+            STANDARD_ROWS / 2 / 64,
+            "a cohort's last aggregate variant ends inside its rows"
+        );
+        assert!(
+            Case::SmallAggregate
+                .sql(upper, 0)
+                .contains("event_id >= 5000000 AND event_id < 5078125"),
+            "a cohort's aggregates start at its first row"
         );
     }
 }

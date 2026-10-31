@@ -948,15 +948,15 @@ async fn capacity_refusal_is_busy_at_every_hosted_consumer() {
 /// A queued execution refused the only Python worker returns to the queue
 /// with its attempt refunded and runs once capacity frees.
 ///
-/// The runtime hosts a one-worker pool with no waiters. The first queued
-/// execution's code spins for the whole code timeout, holding the worker;
-/// the second, claimed meanwhile, is refused busy and deferred rather than
-/// failed, retried, or judged. Once the spinner ends, the second completes
+/// The runtime hosts a one-worker pool with no waiters, whose one admission
+/// the test holds. The queued execution is refused busy and deferred rather
+/// than failed, retried, or judged; once the admission drops, it completes
 /// on its first counted attempt with its real verdict.
 ///
 /// # Panics
-/// Panics when the server, seeding, or runtime fails, the second execution
-/// is never deferred, or it settles other than `completed` on one attempt.
+/// Panics when the server, seeding, or runtime fails, the execution is never
+/// deferred, settles while the admission is held, or settles other than
+/// `completed` on one attempt.
 #[tokio::test]
 async fn busy_queued_execution_is_deferred_until_capacity_frees() {
     let logs = LogCapture::install();
@@ -971,7 +971,7 @@ async fn busy_queued_execution_is_deferred_until_capacity_frees() {
         .await
         .expect("tenant receives every built-in table");
     let state = registered.server.state().clone();
-    let seed = VerificationFixture::provision(state.postgres.wyrd(), tenant)
+    let seed = VerificationFixture::provision(&state, tenant)
         .await
         .expect("tenant provisions");
     let (subject, _) = seed
@@ -991,13 +991,6 @@ async fn busy_queued_execution_is_deferred_until_capacity_frees() {
             }]
         })
     };
-    let spinner = seed
-        .verifier(
-            "busy-spinner",
-            &code("spin", "def f(x):\n    while True:\n        pass", json!(0)),
-        )
-        .await
-        .expect("spinner registers");
     let adder = seed
         .verifier(
             "busy-adder",
@@ -1011,10 +1004,21 @@ async fn busy_queued_execution_is_deferred_until_capacity_frees() {
             InputDeclaration::Json { value: json!(1) },
         )])
     };
-    let spinning = seed
-        .submit(&spinner, &subject, one())
-        .await
-        .expect("spinner queues");
+    let none = serde_json::Map::new();
+    let far = Instant::now() + Duration::from_secs(30);
+    let sandbox = Arc::clone(
+        state
+            .verification
+            .blocks()
+            .expect("blocks are hosted")
+            .sandbox(),
+    );
+    // One admitted operation holds the only worker admission while pending.
+    let mut held = Box::pin(sandbox.run("def f():\n    return 1", "f", &none, Vec::new(), far));
+    assert!(
+        futures_util::FutureExt::now_or_never(&mut held).is_none(),
+        "the held operation waits for its worker"
+    );
     let deferred = seed
         .submit(&adder, &subject, one())
         .await
@@ -1032,6 +1036,18 @@ async fn busy_queued_execution_is_deferred_until_capacity_frees() {
     let stop = CancellationToken::new();
     let task = tokio::spawn(runtime.run(stop.clone()));
     let deadline = Instant::now() + Duration::from_mins(1);
+    while !logs.text().lines().any(|line| {
+        line.contains("deferred by admission backpressure") && line.contains(&deferred.to_string())
+    }) {
+        assert!(Instant::now() < deadline, "the adder was never deferred");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    let waiting = seed.execution(deferred).await.expect("execution reads");
+    assert_eq!(
+        waiting.result_id, None,
+        "a deferral judges nothing: {waiting:?}"
+    );
+    drop(held);
     let settled = loop {
         let row = seed.execution(deferred).await.expect("execution reads");
         if !matches!(row.status.as_str(), "pending" | "running" | "retrying") {
@@ -1046,21 +1062,12 @@ async fn busy_queued_execution_is_deferred_until_capacity_frees() {
     stop.cancel();
     task.await.expect("the runtime stops");
 
-    let text = logs.text();
-    assert!(
-        text.lines()
-            .any(|line| line.contains("deferred by admission backpressure")
-                && line.contains(&deferred.to_string())),
-        "the adder was refused the busy worker and deferred:\n{text}"
-    );
     assert_eq!(
         (settled.status.as_str(), settled.attempts),
         ("completed", 1),
         "a deferral spends no attempt: {settled:?}"
     );
     assert!(settled.result_id.is_some(), "{settled:?}");
-    let spun = seed.execution(spinning).await.expect("spinner reads");
-    assert_eq!(spun.status, "completed", "{spun:?}");
 }
 
 /// Hosted limits whose individual input-file bound admits the 11-byte notes
@@ -1246,7 +1253,7 @@ async fn nonconforming_queued_evidence_errors_without_a_verdict() {
         .await
         .expect("tenant receives every built-in table");
     let state = registered.server.state().clone();
-    let seed = VerificationFixture::provision(state.postgres.wyrd(), tenant)
+    let seed = VerificationFixture::provision(&state, tenant)
         .await
         .expect("tenant provisions");
     let (subject, _) = seed

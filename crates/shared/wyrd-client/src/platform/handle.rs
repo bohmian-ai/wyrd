@@ -383,6 +383,46 @@ impl Platform {
         .await
     }
 
+    /// Stage every writable row on the server replica, publishing nothing.
+    ///
+    /// Reaches the benchmark control that only a server built with its `bench`
+    /// feature serves. Returns the rows staged; every row acknowledged before
+    /// the call is in a staged run when it returns.
+    ///
+    /// # Errors
+    /// Returns a Wyrd error when the server lacks the control, the caller lacks
+    /// platform administration, or staging fails; a retry stages the rest.
+    #[cfg(feature = "test-support")]
+    pub async fn stage_scribe(&self) -> Result<u64, WyrdError> {
+        #[derive(serde::Deserialize)]
+        struct Staged {
+            rows_staged: u64,
+        }
+        let staged: Staged = self
+            .call::<(), _>(Method::POST, "/platform/benchmark/scribe/stage", None)
+            .await?;
+        Ok(staged.rows_staged)
+    }
+
+    /// Stage, claim and publish every row on the server replica.
+    ///
+    /// The benchmark control's second half; each claim teaches the server its
+    /// learned layout as rotation does. Returns the claims published.
+    ///
+    /// # Errors
+    /// As [`Self::stage_scribe`]; a retry publishes the rest.
+    #[cfg(feature = "test-support")]
+    pub async fn publish_scribe(&self) -> Result<u64, WyrdError> {
+        #[derive(serde::Deserialize)]
+        struct Published {
+            claims_published: u64,
+        }
+        let published: Published = self
+            .call::<(), _>(Method::POST, "/platform/benchmark/scribe/publish", None)
+            .await?;
+        Ok(published.claims_published)
+    }
+
     /// Send one authenticated platform request expecting a JSON body.
     ///
     /// # Errors

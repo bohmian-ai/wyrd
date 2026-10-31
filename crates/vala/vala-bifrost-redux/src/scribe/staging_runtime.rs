@@ -716,11 +716,7 @@ impl ScribeStagingRuntime {
             let id = member.record().member();
             let wal = member.record().wal_range();
             let authority = match member.record().state() {
-                StagedMemberState::Published {
-                    published_object_identities,
-                    ..
-                }
-                | StagedMemberState::CleanupPending {
+                StagedMemberState::CleanupPending {
                     published_object_identities,
                     ..
                 } => {
@@ -786,8 +782,9 @@ impl ScribeStagingRuntime {
     /// Reconstructs one recovered key's encoding context, or fails closed.
     ///
     /// The layout is re-resolved from the recipe the members' rows were
-    /// accepted under, which their record carries, against the runs' own
-    /// schema, so a later Bloom or layout alteration never strands them.
+    /// accepted under, which their record carries, against the logical schema
+    /// reconstructed from the runs' own (possibly shredded) layout, so a later
+    /// Bloom or layout alteration never strands them.
     ///
     /// `members` are the members restore keeps. The schema is read from their
     /// runs only: a key can also hold the leftovers of a claim that already
@@ -813,7 +810,12 @@ impl ScribeStagingRuntime {
             .ok_or_else(|| ScribeError::Internal {
                 detail: "a recovered staged key names no run to read its schema from".to_owned(),
             })?;
-        let schema = Arc::clone(crate::scribe::member_stager::preflight_run(&run)?.schema());
+        let physical = Arc::clone(crate::scribe::member_stager::preflight_run(&run)?.schema());
+        let schema = Arc::new(crate::schema::logical_schema(&physical).map_err(|detail| {
+            ScribeError::Internal {
+                detail: format!("reconstruct a recovered staged run's logical schema: {detail}"),
+            }
+        })?);
         if crate::parquet::footer::schema_fingerprint(schema.as_ref()) != key.schema_fingerprint() {
             return Err(ScribeError::Internal {
                 detail: "a recovered staged run's schema is not the schema its key names"
@@ -871,7 +873,10 @@ impl ScribeStagingRuntime {
     ///
     /// This is the blocking half of assembly and belongs on the persistence CPU
     /// lane. Objects roll at the configured target, so a claim that overshoots
-    /// its target publishes several objects rather than one oversized one.
+    /// its target publishes several objects rather than one oversized one. A
+    /// successful assembly refreshes the process's advisory Variant layout for
+    /// the claim's exact tenant, table, and version, so generations opened
+    /// later retain their rows in the layout this claim learned.
     ///
     /// # Errors
     ///
@@ -885,7 +890,8 @@ impl ScribeStagingRuntime {
     ) -> Result<AssembledClaim, ScribeError> {
         let context = self.context_for(claim.key())?;
         let object_base = claim_object_base(claim, request.runs, &context)?;
-        self.claims.encode(AssembleClaimRequest {
+        let resources = request.memory.clone();
+        let assembled = self.claims.encode(AssembleClaimRequest {
             runs: request.runs,
             schema: Arc::clone(&context.schema),
             layout: &context.layout,
@@ -894,7 +900,15 @@ impl ScribeStagingRuntime {
             target_object_bytes: self.target_object_bytes,
             memory: request.memory,
             tenant: context.binding.tenant,
-        })
+        })?;
+        let key = claim.key();
+        resources.variant_layouts().install(
+            &resources,
+            (key.tenant(), key.table().clone(), key.table_version()),
+            Arc::clone(&context.schema),
+            assembled.variant_layout.clone(),
+        );
+        Ok(assembled)
     }
 
     /// Publishes one assembled claim, retires its members, and settles it.
@@ -1145,8 +1159,8 @@ mod tests {
             ),
             shard_id: usize::from(shard),
             schema,
-            batches: vec![record],
-            statistics: Vec::new(),
+            batches: vec![record].into(),
+            statistics: Arc::default(),
             metas: vec![],
             opened_at: std::time::Instant::now(),
             closed_at: std::time::Instant::now(),
@@ -1782,8 +1796,8 @@ mod tests {
     }
 
     /// Leaves the claim's members in the mixed terminal states a crash can
-    /// strand: one still `Publishing`, one `Published`, one `CleanupPending`,
-    /// and one `Published` again, each carrying its own persisted LSN range.
+    /// strand: one still `Publishing` and three `CleanupPending`, each
+    /// carrying its own persisted LSN range.
     ///
     /// This is the exact shape recovery must retire without republishing, so
     /// the states are written directly onto the stage rather than reached
@@ -1811,7 +1825,7 @@ mod tests {
             .await
             .expect("first member remains publishing");
         for (index, state) in [
-            StagedMemberState::Published {
+            StagedMemberState::CleanupPending {
                 claim_id: claim_id.to_owned(),
                 file_list_commit_key: "node:10:49".to_owned(),
                 published_object_identities: objects.clone(),
@@ -1823,7 +1837,7 @@ mod tests {
                 published_object_identities: objects.clone(),
                 persisted_lsn_ranges: vec![StagedLsnRange { min: 30, max: 39 }],
             },
-            StagedMemberState::Published {
+            StagedMemberState::CleanupPending {
                 claim_id: claim_id.to_owned(),
                 file_list_commit_key: "node:10:49".to_owned(),
                 published_object_identities: objects,
@@ -1963,11 +1977,10 @@ mod tests {
     /// Crashes a four-member claim at one boundary between the batched steps
     /// publication moves a claim through, then proves restart retires it.
     ///
-    /// Publication moves every member durably to `Published`, then every
-    /// member to `CleanupPending`, then removes them together. The fixture
-    /// reproduces the durable state at the chosen boundary with the same stage
-    /// operations: all members in `Published` (`cleanup_pending == false`) or
-    /// all in `CleanupPending`, with the first `retired` members already
+    /// Publication moves every member durably to `CleanupPending`, then
+    /// removes them together. The fixture reproduces the durable state at the
+    /// chosen boundary with the same stage operations: all members in
+    /// `CleanupPending`, with the first `retired` members already
     /// removed by one batched [`ScribeHotStage::retire_all`]. With
     /// `half_removed`, the next two survivors are left the way a crash inside
     /// one member's removal leaves it: one keeps its record but has lost its
@@ -1981,11 +1994,7 @@ mod tests {
     /// Panics when the fixture cannot stage or drive the claim, or when
     /// recovery republishes, leaves a resumable claim, leaks staged bytes,
     /// leaves a member directory, or leaves a restored authority alive.
-    async fn recovers_claim_interrupted_between_batched_states(
-        cleanup_pending: bool,
-        retired: usize,
-        half_removed: bool,
-    ) {
+    async fn recovers_claim_interrupted_between_batched_states(retired: usize, half_removed: bool) {
         let root = tempfile::tempdir().expect("runtime root");
         let stage_root = root.path().join("stage");
         let wal_root = root.path().join("member-wal");
@@ -2027,7 +2036,7 @@ mod tests {
         })
         .await;
         move_claim(&stage, &key, &member_ids, |member| {
-            StagedMemberState::Published {
+            StagedMemberState::CleanupPending {
                 claim_id: claim_id.clone(),
                 file_list_commit_key: "node:10:49".to_owned(),
                 published_object_identities: objects.clone(),
@@ -2035,17 +2044,6 @@ mod tests {
             }
         })
         .await;
-        if cleanup_pending {
-            move_claim(&stage, &key, &member_ids, |member| {
-                StagedMemberState::CleanupPending {
-                    claim_id: claim_id.clone(),
-                    file_list_commit_key: "node:10:49".to_owned(),
-                    published_object_identities: objects.clone(),
-                    persisted_lsn_ranges: ranges(member),
-                }
-            })
-            .await;
-        }
         stage
             .retire_all(&key, &member_ids[..retired])
             .await
@@ -2126,17 +2124,6 @@ mod tests {
         }
     }
 
-    /// A claim that crashed after every member recorded the commit, before
-    /// any moved to cleanup, retires on restart.
-    ///
-    /// # Panics
-    ///
-    /// Panics when recovery leaves the claim, its bytes, or its authority.
-    #[tokio::test]
-    async fn a_claim_crashed_after_its_published_step_retires_on_restart() {
-        recovers_claim_interrupted_between_batched_states(false, 0, false).await;
-    }
-
     /// A claim that crashed after every member moved to cleanup, before any
     /// was removed, retires on restart.
     ///
@@ -2145,7 +2132,7 @@ mod tests {
     /// Panics when recovery leaves the claim, its bytes, or its authority.
     #[tokio::test]
     async fn a_claim_crashed_after_its_cleanup_step_retires_on_restart() {
-        recovers_claim_interrupted_between_batched_states(true, 0, false).await;
+        recovers_claim_interrupted_between_batched_states(0, false).await;
     }
 
     /// A claim that crashed partway through its batched removal retires its
@@ -2156,7 +2143,7 @@ mod tests {
     /// Panics when recovery leaves the claim, its bytes, or its authority.
     #[tokio::test]
     async fn a_claim_crashed_inside_its_batched_removal_retires_on_restart() {
-        recovers_claim_interrupted_between_batched_states(true, 2, false).await;
+        recovers_claim_interrupted_between_batched_states(2, false).await;
     }
 
     /// A claim that crashed inside one member's removal — a member left with
@@ -2169,7 +2156,7 @@ mod tests {
     /// claim, its bytes, a member directory, or its authority.
     #[tokio::test]
     async fn a_claim_crashed_inside_one_member_removal_retires_on_restart() {
-        recovers_claim_interrupted_between_batched_states(true, 1, true).await;
+        recovers_claim_interrupted_between_batched_states(1, true).await;
     }
 
     /// A live claim refused inside its removal is finished by its next driver,
@@ -2260,8 +2247,7 @@ mod tests {
 
     /// Leaves a claim the way a publication refused inside its removal does.
     ///
-    /// Every member is moved through `Publishing`, `Published`, and
-    /// `CleanupPending` with its authority on the committed object, exactly as
+    /// Every member is moved through `Publishing` and `CleanupPending` with its authority on the committed object, exactly as
     /// publication orders it. Then only part of the removal happens: the first
     /// member is removed and released, the second loses its record but keeps
     /// its runs and authority, the third keeps its record but loses its runs,
@@ -2307,15 +2293,6 @@ mod tests {
                 max: shard * 10 + 9,
             }]
         };
-        move_claim(stage, key, member_ids, |member| {
-            StagedMemberState::Published {
-                claim_id: claim_id.clone(),
-                file_list_commit_key: "node:10:49".to_owned(),
-                published_object_identities: objects.clone(),
-                persisted_lsn_ranges: ranges(member),
-            }
-        })
-        .await;
         move_claim(stage, key, member_ids, |member| {
             StagedMemberState::CleanupPending {
                 claim_id: claim_id.clone(),
@@ -2698,7 +2675,7 @@ mod pg_tests {
             .expect("four members form one claim");
         let claim_id = claim.id().to_string();
         move_claim(&stage, &key, &finished, |member| {
-            StagedMemberState::Published {
+            StagedMemberState::CleanupPending {
                 claim_id: claim_id.clone(),
                 file_list_commit_key: "node:10:49".to_owned(),
                 published_object_identities: vec![format!("objects/{claim_id}/hot-0.parquet")],

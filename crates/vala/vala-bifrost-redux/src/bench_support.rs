@@ -128,7 +128,7 @@ impl WalBenchSupport {
         })
     }
 
-    /// Prepare a v7 data record without filesystem work.
+    /// Prepare a v8 data record without filesystem work.
     pub fn prepare(
         &self,
         batch_id: [u8; 16],

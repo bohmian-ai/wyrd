@@ -46,6 +46,9 @@ pub(crate) struct DurableCompletion {
     /// accepting version, and the shard holds the append's tenant group
     /// uncommitted until it answers.
     pub accepted_under: Option<AcceptedUnder>,
+    /// When the shard owner sent this completion, so the waiter times its
+    /// delivery.
+    pub sent: Instant,
 }
 
 /// A batch id the durable fence accepted under another table version, held
@@ -92,9 +95,8 @@ pub(crate) struct AdmittedAppend {
 /// Root-owned row source entering current-only persistence preprocessing.
 #[derive(Debug)]
 pub(crate) enum AdmittedRows {
-    /// One already-stamped projected batch, with the logical identity Gate
-    /// computed when the batch still holds its inputs.
-    Projected(RecordBatch, Option<LogicalIdentity>),
+    /// One already-stamped projected batch.
+    Projected(RecordBatch),
     /// One native stream decoded a record batch at a time on the persistence lane.
     Native(Box<NativeAdmittedRows>),
 }
@@ -346,7 +348,6 @@ impl NativeSliceProducer {
                         },
                         partition,
                         rows,
-                        None,
                     )?;
                     slice
                         .wal_append
@@ -445,7 +446,7 @@ pub(crate) struct PreparedSlice {
 /// length, offset, the validity bitmap, every data buffer, and every child
 /// recursively, so two batches agree only when their Arrow representation
 /// agrees byte-for-byte. `bytes` accumulates the contributed buffer length the
-/// WAL-v7 metadata records alongside the digest.
+/// WAL-v8 metadata records alongside the digest.
 ///
 /// # Errors
 ///
@@ -482,104 +483,6 @@ fn digest_array_data(
     Ok(())
 }
 
-/// A logical identity already computed over one batch, reusable for any rows
-/// that still hold that batch's exact identity inputs.
-///
-/// Gate derives the OTLP batch id from [`logical_data_identity`] over its
-/// projected batch, and Scribe needs the same digest for every WAL slice it
-/// cuts from the decoded rows. Decode re-types and stamps columns but, for a
-/// batch already in its registered layout, keeps every user column's buffers;
-/// an undivided slice then holds the same buffers again. [`Self::for_rows`]
-/// hands the digest back only when every input the digest reads is
-/// pointer-identical, so the reused value always equals a recomputation.
-#[derive(Debug, Clone)]
-pub(crate) struct LogicalIdentity {
-    /// SHA-256 digest from [`logical_data_identity`].
-    digest: [u8; 32],
-    /// Buffer length from [`logical_data_identity`].
-    len: u32,
-    /// The rows the digest was computed over, holding its inputs alive.
-    rows: RecordBatch,
-}
-
-impl LogicalIdentity {
-    /// Computes the logical identity of `rows` and keeps the rows it covers.
-    ///
-    /// # Errors
-    ///
-    /// Returns the [`logical_data_identity`] failure.
-    pub(crate) fn of(rows: &RecordBatch) -> Result<Self, ScribeError> {
-        let (digest, len) = logical_data_identity(rows)?;
-        Ok(Self {
-            digest,
-            len,
-            rows: rows.clone(),
-        })
-    }
-
-    /// The logical digest.
-    pub(crate) const fn digest(&self) -> &[u8; 32] {
-        &self.digest
-    }
-
-    /// Returns this identity for `rows` when `rows` hold exactly its inputs:
-    /// the same non-volatile column names in the same order, each with the
-    /// same length, offset, validity bytes, data buffers, and children by
-    /// address. Any difference returns `None`, and the caller recomputes.
-    pub(crate) fn for_rows(&self, rows: &RecordBatch) -> Option<([u8; 32], u32)> {
-        let inputs = |batch: &RecordBatch| {
-            let schema = batch.schema();
-            schema
-                .fields()
-                .iter()
-                .zip(batch.columns())
-                .filter(|(field, _)| !is_volatile_column(field.name()))
-                .map(|(field, column)| (field.name().clone(), column.to_data()))
-                .collect::<Vec<_>>()
-        };
-        let (known, offered) = (inputs(&self.rows), inputs(rows));
-        let same = known.len() == offered.len()
-            && known
-                .iter()
-                .zip(&offered)
-                .all(|((left_name, left), (right_name, right))| {
-                    left_name == right_name && same_identity_inputs(left, right)
-                });
-        same.then_some((self.digest, self.len))
-    }
-}
-
-/// Reports whether two arrays present [`digest_array_data`] the same bytes by
-/// address: length, offset, validity bytes, every data buffer, and every
-/// child, recursively.
-///
-/// Comparing slices with [`std::ptr::eq`] compares both their start and their
-/// length, so equal here means the digest reads the very same memory.
-fn same_identity_inputs(left: &ArrayData, right: &ArrayData) -> bool {
-    left.len() == right.len()
-        && left.offset() == right.offset()
-        && match (
-            left.nulls().map(|nulls| nulls.buffer().as_slice()),
-            right.nulls().map(|nulls| nulls.buffer().as_slice()),
-        ) {
-            (Some(left), Some(right)) => std::ptr::eq(left, right),
-            (None, None) => true,
-            _ => false,
-        }
-        && left.buffers().len() == right.buffers().len()
-        && left
-            .buffers()
-            .iter()
-            .zip(right.buffers())
-            .all(|(left, right)| std::ptr::eq(left.as_slice(), right.as_slice()))
-        && left.child_data().len() == right.child_data().len()
-        && left
-            .child_data()
-            .iter()
-            .zip(right.child_data())
-            .all(|(left, right)| same_identity_inputs(left, right))
-}
-
 /// Reports whether `name` is a managed column a legitimate retry restamps
 /// with a fresh value: the request and ingestion-time columns.
 ///
@@ -602,7 +505,7 @@ fn is_volatile_column(name: &str) -> bool {
 ///
 /// # Errors
 ///
-/// Returns an internal error when the stable buffer length exceeds its WAL-v7
+/// Returns an internal error when the stable buffer length exceeds its WAL-v8
 /// metadata representation.
 pub(crate) fn logical_data_identity(rows: &RecordBatch) -> Result<([u8; 32], u32), ScribeError> {
     let mut digest = Sha256::new();
@@ -687,7 +590,7 @@ fn prepare_rows(
         memory_bytes,
     } = context;
     match rows {
-        AdmittedRows::Projected(rows, known) => {
+        AdmittedRows::Projected(rows) => {
             let mut slices = Vec::new();
             append_prepared_slices(
                 &mut slices,
@@ -700,15 +603,14 @@ fn prepare_rows(
                 },
                 &partition_scheme,
                 &rows,
-                known.as_ref(),
             )?;
             let slice_count = u32::try_from(slices.len()).map_err(|_| ScribeError::Internal {
-                detail: "Scribe batch exceeds the v7 WAL slice-count bound".to_owned(),
+                detail: "Scribe batch exceeds the v8 WAL slice-count bound".to_owned(),
             })?;
             for (slice_index, slice) in slices.iter_mut().enumerate() {
                 let slice_index =
                     u32::try_from(slice_index).map_err(|_| ScribeError::Internal {
-                        detail: "Scribe batch slice index exceeds the v7 WAL bound".to_owned(),
+                        detail: "Scribe batch slice index exceeds the v8 WAL bound".to_owned(),
                     })?;
                 slice
                     .wal_append
@@ -739,14 +641,14 @@ fn prepare_rows(
 ///
 /// # Errors
 ///
-/// Returns an internal error when the slice set exceeds WAL v7 integer bounds.
+/// Returns an internal error when the slice set exceeds WAL v8 integer bounds.
 fn assign_slice_ordinals(slices: &mut [PreparedSlice]) -> Result<(), ScribeError> {
     let count = u32::try_from(slices.len()).map_err(|_| ScribeError::Internal {
-        detail: "Scribe batch exceeds the v7 WAL slice-count bound".to_owned(),
+        detail: "Scribe batch exceeds the v8 WAL slice-count bound".to_owned(),
     })?;
     for (index, slice) in slices.iter_mut().enumerate() {
         let index = u32::try_from(index).map_err(|_| ScribeError::Internal {
-            detail: "Scribe batch slice index exceeds the v7 WAL bound".to_owned(),
+            detail: "Scribe batch slice index exceeds the v8 WAL bound".to_owned(),
         })?;
         slice.wal_append.assign_slice_ordinal(index, count);
         slice.id.slice_index = index;
@@ -855,11 +757,10 @@ fn append_prepared_slices(
     context: SliceContext<'_>,
     partition_scheme: &PartitionScheme,
     rows: &RecordBatch,
-    known: Option<&LogicalIdentity>,
 ) -> Result<(), ScribeError> {
     for slice in split_batch_by_partition(rows, partition_scheme)? {
         let (partition, partition_rows) = slice?;
-        slices.push(prepare_slice(context, partition, partition_rows, known)?);
+        slices.push(prepare_slice(context, partition, partition_rows)?);
     }
     Ok(())
 }
@@ -881,10 +782,6 @@ struct SliceContext<'a> {
 
 /// Builds one exact-capacity WAL slice from the current materialized day.
 ///
-/// The slice's logical identity is taken from `known` when the slice still
-/// holds its inputs ([`LogicalIdentity::for_rows`]), as an undivided canonical
-/// batch does, and is computed otherwise.
-///
 /// # Errors
 ///
 /// Returns [`ScribeError`] when Arrow IPC encoding fails or the logical
@@ -893,21 +790,18 @@ fn prepare_slice(
     context: SliceContext<'_>,
     partition: PhysicalPartition,
     rows: RecordBatch,
-    known: Option<&LogicalIdentity>,
 ) -> Result<PreparedSlice, ScribeError> {
     let seal_key = SealKey::new(context.tenant, context.table.clone(), partition)
         .with_table_version(context.table_version);
-    let data_payload = encode_ipc(&rows)?;
+    let memtable_bytes = crate::scribe::memory::retained_arrow_bytes(&rows);
+    let data_payload = encode_ipc(&rows, memtable_bytes)?;
     let identity_span = tracing::debug_span!(
         "scribe_logical_batch_identity",
         batch_id = %context.batch_id,
         table = %context.table.fqn(),
     );
     let (logical_data_digest, logical_data_len) =
-        match known.and_then(|known| known.for_rows(&rows)) {
-            Some(identity) => identity,
-            None => identity_span.in_scope(|| logical_data_identity(&rows))?,
-        };
+        identity_span.in_scope(|| logical_data_identity(&rows))?;
     let wal_append = PreparedWalAppend::new(
         crate::scribe::wal::WalLsn::ZERO,
         *context.batch_id.as_bytes(),
@@ -918,7 +812,6 @@ fn prepare_slice(
         SchemaFingerprint::from_arrow_schema(&rows.schema()).0,
     )
     .with_logical_data_identity(logical_data_digest, logical_data_len);
-    let memtable_bytes = crate::scribe::memory::retained_arrow_bytes(&rows);
     Ok(PreparedSlice {
         id: AppendSliceId {
             batch_id: context.batch_id,
@@ -933,19 +826,20 @@ fn prepare_slice(
     })
 }
 
-/// Encodes one current day as a ZSTD level-1 Arrow IPC stream.
+/// Encodes one current day as a ZSTD level-1 Arrow IPC stream, in one pass.
 ///
-/// The payload is written into one allocation sized to the bound admission
-/// reserved ([`crate::scribe::material_plan::wal_payload_bound`]), then shrunk
-/// to its compressed length so the WAL does not retain the uncompressed
-/// capacity. Every WAL reader decodes it with Arrow's standard `StreamReader`.
+/// The payload is written into one allocation of `capacity` bytes, the
+/// rows' retained Arrow bytes, which compression keeps it under in the common
+/// case, then shrunk to its compressed length so the WAL does not retain the
+/// spare capacity. The stream stays within
+/// [`crate::scribe::material_plan::wal_payload_bound`], which canonical
+/// admission reserved, so it is not counted again here. Every WAL reader
+/// decodes it with Arrow's standard `StreamReader`.
 ///
 /// # Errors
 ///
-/// Returns [`ScribeError::Internal`] when the bound or either Arrow step fails,
-/// or the payload exceeds its reserved bound.
-fn encode_ipc(rows: &RecordBatch) -> Result<Bytes, ScribeError> {
-    let bound = crate::scribe::material_plan::wal_payload_bound(rows)?;
+/// Returns [`ScribeError::Internal`] when either Arrow step fails.
+fn encode_ipc(rows: &RecordBatch, capacity: usize) -> Result<Bytes, ScribeError> {
     let options = arrow::ipc::writer::IpcWriteOptions::default()
         .try_with_compression(Some(crate::scribe::material_plan::WAL_IPC_COMPRESSION))
         .and_then(|options| {
@@ -956,7 +850,7 @@ fn encode_ipc(rows: &RecordBatch) -> Result<Bytes, ScribeError> {
         .map_err(|error| ScribeError::Internal {
             detail: format!("Arrow IPC compression unavailable: {error}"),
         })?;
-    let mut payload = Vec::with_capacity(bound);
+    let mut payload = Vec::with_capacity(capacity);
     let mut writer = arrow::ipc::writer::StreamWriter::try_new_with_options(
         &mut payload,
         &rows.schema(),
@@ -972,11 +866,6 @@ fn encode_ipc(rows: &RecordBatch) -> Result<Bytes, ScribeError> {
         detail: format!("Arrow IPC encode finish failed: {error}"),
     })?;
     drop(writer);
-    if payload.len() > bound {
-        return Err(ScribeError::Internal {
-            detail: "Arrow IPC encode exceeded its reserved bound".to_owned(),
-        });
-    }
     payload.shrink_to_fit();
     Ok(Bytes::from(payload))
 }
@@ -1015,9 +904,9 @@ fn hex_digest(digest: &[u8; 32]) -> String {
 /// carry fresh per-request timestamps on every attempt and would therefore
 /// make an honest client retry look like a contradiction.
 ///
-/// This is not the WAL v7 `wal_digest`. That digest binds exact payload bytes so
+/// This is not the WAL v8 `wal_digest`. That digest binds exact payload bytes so
 /// a substituted slice cannot be authorized by a valid terminal record. The two
-/// answer different questions, are computed apart, and the v7 COMMIT record
+/// answer different questions, are computed apart, and the v8 COMMIT record
 /// persists both — see [`crate::scribe::wal::WalCommitIdentity`].
 ///
 /// The owner exists so there is one layout for this durable identity. It is
@@ -1364,74 +1253,6 @@ mod tests {
         assert_ne!(first, identity(rows(7, "s2", "request-a", 10)));
     }
 
-    /// A known logical identity is reused only for rows holding its exact
-    /// inputs, and the reused value equals a recomputation.
-    ///
-    /// Restamping the volatile request column, as decode does, keeps the
-    /// identity; restamping a correlation column, the same values in fresh
-    /// buffers, and a partition `take` all fall back to recomputation.
-    ///
-    /// # Panics
-    ///
-    /// Panics when a fixture batch does not build, the restamped rows do not
-    /// reuse the identity or reuse a wrong one, or copied, taken, or
-    /// re-correlated rows do.
-    #[test]
-    fn known_identity_is_reused_only_for_its_exact_inputs() {
-        let batch = |values: ArrayRef, request: &str| {
-            RecordBatch::try_new(
-                Arc::new(Schema::new(vec![
-                    Field::new("value", DataType::Int64, true),
-                    Field::new(WYRD_REQUEST_ID, DataType::Utf8, false),
-                ])),
-                vec![values, Arc::new(StringArray::from(vec![request; 3]))],
-            )
-            .expect("identity batch")
-        };
-        let values: ArrayRef = Arc::new(Int64Array::from(vec![Some(1), None, Some(3)]));
-        let gate = batch(Arc::clone(&values), "gate");
-        let known = super::LogicalIdentity::of(&gate).expect("known identity");
-
-        let stamped = batch(Arc::clone(&values), "scribe");
-        assert_eq!(
-            known.for_rows(&stamped),
-            Some(logical_data_identity(&stamped).expect("recomputed identity")),
-            "restamped managed columns keep the known identity"
-        );
-
-        let correlated = RecordBatch::try_new(
-            Arc::new(Schema::new(vec![
-                Field::new("value", DataType::Int64, true),
-                Field::new(WORKLOAD_CARD_UID, DataType::Utf8, true),
-                Field::new(WYRD_REQUEST_ID, DataType::Utf8, false),
-            ])),
-            vec![
-                Arc::clone(&values),
-                Arc::new(StringArray::from(vec!["s1"; 3])),
-                Arc::new(StringArray::from(vec!["scribe"; 3])),
-            ],
-        )
-        .expect("correlated batch");
-        assert_eq!(
-            known.for_rows(&correlated),
-            None,
-            "a stamped correlation column recomputes"
-        );
-
-        let copied = batch(
-            Arc::new(Int64Array::from(vec![Some(1), None, Some(3)])),
-            "gate",
-        );
-        assert_eq!(known.for_rows(&copied), None, "fresh buffers recompute");
-
-        let indices = arrow::array::UInt32Array::from(vec![0_u32, 1, 2]);
-        let taken = batch(
-            arrow::compute::take(values.as_ref(), &indices, None).expect("take"),
-            "gate",
-        );
-        assert_eq!(known.for_rows(&taken), None, "a partition take recomputes");
-    }
-
     /// The WAL payload is an Arrow stream within its bound that Arrow reads back.
     ///
     /// Covers a nested Map column with a null map and a null value so the
@@ -1462,7 +1283,7 @@ mod tests {
         )]));
         let batch = RecordBatch::try_new(schema, vec![Arc::new(map) as _]).expect("map batch");
 
-        let payload = encode_ipc(&batch).expect("encodes");
+        let payload = encode_ipc(&batch, 0).expect("encodes");
 
         assert!(
             payload.len()
@@ -1511,7 +1332,7 @@ mod tests {
         ])
         .expect("incompressible batch");
 
-        let payload = encode_ipc(&batch).expect("encodes");
+        let payload = encode_ipc(&batch, 0).expect("encodes");
         assert!(
             payload.len()
                 <= crate::scribe::material_plan::wal_payload_bound(&batch).expect("bounds")
@@ -1532,6 +1353,6 @@ mod tests {
         writer.write(&constant).expect("writes");
         writer.finish().expect("finishes");
         drop(writer);
-        assert!(encode_ipc(&constant).expect("encodes").len() < uncompressed.len());
+        assert!(encode_ipc(&constant, 0).expect("encodes").len() < uncompressed.len());
     }
 }

@@ -25,7 +25,7 @@ use wyrd_tonic::wyrd::v1::scribe_capture_peer_service_server::{
 };
 use wyrd_tonic::wyrd::v1::{IngestCaptureRequest, IngestCaptureResponse};
 
-use crate::scribe_outbox::{ScribeBatch, ScribeTable};
+use crate::scribe_outbox::{FramePayload, ScribeBatch, ScribeTable};
 
 /// Private gRPC adapter writing peer-submitted capture into this pod's Scribe.
 pub struct ScribeCapturePeerGrpc {
@@ -87,7 +87,7 @@ impl ScribeCapturePeerGrpc {
             table,
             batch_id,
             request_id,
-            ipc: request.arrow_ipc,
+            payload: FramePayload::Ipc(request.arrow_ipc),
         })
     }
 }
@@ -174,7 +174,7 @@ mod tests {
             (tenant, "bifrost.gateway.calls"),
             (tenant, "bifrost.traces.spans"),
             (tenant, "bifrost.verification.results"),
-            (tenant, "bifrost.drift.result_features"),
+            (tenant, "bifrost.verification.execution_outputs"),
             (tenant, "bifrost.verification.execution_inputs"),
         ] {
             let batch = ScribeCapturePeerGrpc::batch(request(tenant, table)).expect("accepted");

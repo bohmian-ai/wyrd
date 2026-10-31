@@ -20,7 +20,7 @@ serde_json = { workspace = true }
 arc-swap = { workspace = true }
 tokio = { workspace = true, features = ["sync", "rt", "macros", "time"] }
 tokio-util = { workspace = true, features = ["rt"] }
-tokio-stream = { version = "0.1", features = ["net"] }
+tokio-stream = "0.1"
 tracing = { workspace = true }
 thiserror = { workspace = true }
 uuid = { workspace = true }

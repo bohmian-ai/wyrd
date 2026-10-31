@@ -376,13 +376,18 @@ impl OracleTelemetry {
     /// admitted, so it does not count as active work until
     /// [`QueryTelemetryGuard::admitted`] runs. The returned guard owns the
     /// `bifrost.oracle.stream` span, which the response stream polls inside
-    /// and which closes only after terminal cleanup drops the guard.
+    /// and which closes only after terminal cleanup drops the guard. At
+    /// finish the span also records the executed plan's final
+    /// `rows_scanned` and `bytes_scanned` when its scans reported them, as
+    /// integers in the query's trace.
     #[must_use]
     fn start_query(query_class: QueryClass) -> QueryTelemetryGuard {
         let span = tracing::info_span!(
             "bifrost.oracle.stream",
             query_class = query_class_label(query_class),
-            outcome = tracing::field::Empty
+            outcome = tracing::field::Empty,
+            rows_scanned = tracing::field::Empty,
+            bytes_scanned = tracing::field::Empty
         );
         let source_span = tracing::info_span!(
             parent: &span,
@@ -559,7 +564,10 @@ impl QueryTelemetryGuard {
         self.scan_stats = scan_stats;
     }
 
-    /// Emits the final query and stream outcome exactly once.
+    /// Emits the final query and stream outcome exactly once, with the
+    /// executed plan's scan rows and bytes on the query span when known,
+    /// and records them into the benchmark scan histograms under the
+    /// request's classification.
     fn finish(&mut self, outcome: &'static str) {
         if self.finalization == QueryTelemetryFinalization::Closed {
             return;
@@ -568,6 +576,12 @@ impl QueryTelemetryGuard {
         self.finish_source_span(outcome);
         self.span.record("outcome", outcome);
         self.scan_stats.finalize();
+        wyrd_telemetry::timing::record_scan(
+            &self.span,
+            outcome,
+            self.scan_stats.physical_rows_scanned,
+            self.scan_stats.physical_bytes_scanned,
+        );
         metrics::counter!(
             "oracle_query_files_scanned_total",
             "class" => query_class_label(self.query_class)
@@ -599,11 +613,22 @@ impl QueryTelemetryGuard {
         )
         .increment(self.scan_stats.pruning.rows_pruned_page_index);
         if let Some(bytes) = self.scan_stats.physical_bytes_scanned {
+            self.span
+                .record("bytes_scanned", i64::try_from(bytes).unwrap_or(i64::MAX));
             metrics::counter!(
                 "oracle_query_bytes_scanned_total",
                 "class" => query_class_label(self.query_class)
             )
             .increment(bytes);
+        }
+        if let Some(rows) = self.scan_stats.physical_rows_scanned {
+            self.span
+                .record("rows_scanned", i64::try_from(rows).unwrap_or(i64::MAX));
+            metrics::counter!(
+                "oracle_query_rows_scanned_total",
+                "class" => query_class_label(self.query_class)
+            )
+            .increment(rows);
         }
         metrics::histogram!(
             "oracle_query_duration_seconds",
@@ -1041,6 +1066,8 @@ struct CutExecution {
 /// Every table here stays readable for the query's deadline because Forge
 /// retains a replaced snapshot for at least the maximum query deadline.
 pub struct PlannedSqlCut {
+    /// The request's validated statement, planned afresh by every build.
+    statement: DfStatement,
     /// Exact immutable table cuts.
     cuts: Vec<PinnedSealedTable>,
     /// Fraction of pinned sealed bytes in the local hot tier.
@@ -1750,7 +1777,7 @@ impl Oracle {
         request: &BifrostQueryRequest,
         absolute_deadline_ms: i64,
     ) -> Result<(OracleQueryAttemptRoster, PlannedSqlCut), BifrostError> {
-        let tables = self.validate_query(request)?;
+        let (statement, tables) = self.planner.validate_statement(request)?;
         if !self.is_ready() {
             return Err(BifrostError::OracleRoleUnavailable);
         }
@@ -1775,7 +1802,7 @@ impl Oracle {
             .planner
             .pin_cut(
                 context,
-                &tables,
+                (statement, &tables),
                 deadline,
                 &self.catalog,
                 Arc::new(profile::QueryProfile::new()),
@@ -2064,7 +2091,7 @@ impl Oracle {
                 .planner
                 .pin_cut(
                     context,
-                    &tables,
+                    (planned.statement, &tables),
                     deadline,
                     &self.catalog,
                     Arc::clone(&planned.profile),
@@ -2850,7 +2877,7 @@ impl Oracle {
         let logical_planning = planned.profile.physical_planning.timer();
         let logical = Self::before_deadline(
             deadline,
-            Self::plan_logical(&planning, context, &request.sql, &request.params),
+            Self::plan_logical(&planning, context, &planned.statement, &request.params),
         )
         .await?
         .map_err(|OracleExecutionError::Public(error)| error)?;
@@ -3146,6 +3173,10 @@ impl Oracle {
 
     /// Lowers one validated statement to its authorized, optimized logical plan.
     ///
+    /// The statement is cloned, never consumed, so a stale-selection rebuild
+    /// lowers the same unbound statement against its fresh providers and
+    /// parameter bindings.
+    ///
     /// `params[i]` replaces placeholder `$(i + 1)` as a literal in the logical
     /// plan before optimization, so a bound value is data and never SQL text,
     /// and the optimizer's type coercion widens it to the compared column.
@@ -3165,11 +3196,16 @@ impl Oracle {
     async fn plan_logical(
         session: &SessionContext,
         context: &AuthorizedQueryContext,
-        sql: &str,
+        statement: &DfStatement,
         params: &[QueryParam],
     ) -> Result<datafusion::logical_expr::LogicalPlan, OracleExecutionError> {
+        let plan = session
+            .state()
+            .statement_to_plan(statement.clone())
+            .await
+            .map_err(|error| map_sql_planning_error(&error))?;
         let frame = session
-            .sql(sql)
+            .execute_logical_plan(plan)
             .await
             .and_then(|frame| frame.with_param_values(bind_values(params)))
             .map_err(|error| map_sql_planning_error(&error))?;
@@ -3371,13 +3407,17 @@ fn failed_terminal_on_path(
     }
 }
 
-/// Parses one exact SQL query and returns its distinct canonical table references.
+/// Parses one exact SQL query and returns it with its distinct canonical table
+/// references.
+///
+/// The returned statement is the only parse of the request inside the
+/// executing Oracle: planning lowers it rather than parsing the SQL again.
 ///
 /// # Errors
 ///
 /// Returns invalid SQL for parse failures, non-query statements, unknown
 /// namespaces, unsafe names, or a statement that references no Bifrost table.
-fn parse_select_tables(sql: &str) -> Result<Vec<TableRef>, BifrostError> {
+fn parse_select(sql: &str) -> Result<(DfStatement, Vec<TableRef>), BifrostError> {
     let statements = DFParser::parse_sql(sql).map_err(|error| BifrostError::QueryInvalidSql {
         detail: format!("parse error: {error}"),
     })?;
@@ -3419,7 +3459,8 @@ fn parse_select_tables(sql: &str) -> Result<Vec<TableRef>, BifrostError> {
                 detail: "query contains an invalid Bifrost table reference".to_owned(),
             })
         })
-        .collect()
+        .collect::<Result<_, _>>()
+        .map(|tables| (statement, tables))
 }
 
 /// Computes a stable scrubbed digest from whitespace-normalized SQL or plan text.
@@ -4381,6 +4422,79 @@ mod tests {
         session
     }
 
+    /// Parses one test query through the production validation parse.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the query is not one valid Bifrost `SELECT`.
+    fn statement(sql: &str) -> DfStatement {
+        parse_select(sql).expect("test query validates").0
+    }
+
+    /// One validated statement plans afresh for every request binding: its
+    /// parameter values, payload authority, and session providers come from
+    /// the planning call, never from an earlier plan of the same statement.
+    ///
+    /// # Panics
+    ///
+    /// Panics when a plan keeps an earlier binding, a payload-denied context
+    /// plans, or a session without the table plans.
+    #[tokio::test]
+    async fn validated_statement_is_parsed_once_with_fresh_bindings() {
+        let metadata = payload_context(&[Permission::bifrost_query_read()]);
+        let payload = payload_context(&[
+            Permission::bifrost_query_read(),
+            Permission::gateway_payload_read(),
+        ]);
+        let session = payload_session();
+        let (parsed, tables) = parse_select(
+            "WITH recent AS (SELECT call_id, request_payload FROM bifrost.gateway.calls) \
+             SELECT call_id FROM recent WHERE call_id = $1 OR request_payload IS NOT NULL",
+        )
+        .expect("CTE query validates");
+        assert_eq!(
+            tables.iter().map(TableRef::fqn).collect::<Vec<_>>(),
+            vec!["bifrost.gateway.calls".to_owned()]
+        );
+        for value in ["first", "second"] {
+            let plan = Oracle::plan_logical(
+                &session,
+                &payload,
+                &parsed,
+                &[QueryParam::String(value.to_owned())],
+            )
+            .await
+            .expect("payload authority plans the statement");
+            let shown = plan.display_indent().to_string();
+            assert!(shown.contains(value), "binding {value} missing: {shown}");
+            assert!(
+                !shown.contains(if value == "first" { "second" } else { "first" }),
+                "an earlier binding survived: {shown}"
+            );
+        }
+        assert!(matches!(
+            Oracle::plan_logical(
+                &session,
+                &metadata,
+                &parsed,
+                &[QueryParam::String("first".to_owned())]
+            )
+            .await,
+            Err(OracleExecutionError::Public(BifrostError::QueryForbidden))
+        ));
+        assert!(
+            Oracle::plan_logical(
+                &SessionContext::new(),
+                &payload,
+                &parsed,
+                &[QueryParam::String("first".to_owned())]
+            )
+            .await
+            .is_err(),
+            "a session without the provider planned the statement"
+        );
+    }
+
     /// Bound values replace `$n` placeholders as literals, so SQL text inside a
     /// value stays data, and a placeholder without a value is refused at
     /// planning with the repairable invalid-query code.
@@ -4398,7 +4512,7 @@ mod tests {
         let plan = match Oracle::plan_logical(
             &session,
             &context,
-            sql,
+            &statement(sql),
             &[QueryParam::String(hostile.to_owned())],
         )
         .await
@@ -4412,7 +4526,7 @@ mod tests {
             "bound text is not a literal: {shown}"
         );
         assert!(matches!(
-            Oracle::plan_logical(&session, &context, sql, &[]).await,
+            Oracle::plan_logical(&session, &context, &statement(sql), &[]).await,
             Err(OracleExecutionError::Public(
                 BifrostError::QueryInvalidSql { .. }
             ))
@@ -4440,7 +4554,9 @@ mod tests {
             "SELECT count(*) FROM bifrost.gateway.calls",
             "SELECT * FROM bifrost.logs.records",
         ] {
-            if let Err(error) = Oracle::plan_logical(&session, &metadata, sql, &[]).await {
+            if let Err(error) =
+                Oracle::plan_logical(&session, &metadata, &statement(sql), &[]).await
+            {
                 panic!("metadata read {sql} was refused: {error}");
             }
         }
@@ -4453,12 +4569,13 @@ mod tests {
         ] {
             assert!(
                 matches!(
-                    Oracle::plan_logical(&session, &metadata, sql, &[]).await,
+                    Oracle::plan_logical(&session, &metadata, &statement(sql), &[]).await,
                     Err(OracleExecutionError::Public(BifrostError::QueryForbidden))
                 ),
                 "{sql} reached payload without authority"
             );
-            if let Err(error) = Oracle::plan_logical(&session, &payload, sql, &[]).await {
+            if let Err(error) = Oracle::plan_logical(&session, &payload, &statement(sql), &[]).await
+            {
                 panic!("payload authority was refused for {sql}: {error}");
             }
         }
@@ -4998,7 +5115,7 @@ mod tests {
     /// excluded.
     #[test]
     fn query_floor_extracts_joined_and_cte_tables() {
-        let tables = parse_select_tables(
+        let (_, tables) = parse_select(
             "WITH recent AS (SELECT * FROM bifrost.bifrost.spans) \
              SELECT * FROM recent JOIN bifrost.bifrost.observations o ON true",
         )

@@ -1,10 +1,13 @@
 //! Arrow payloads for one Verifier execution: pure mapping, no transport.
 //!
 //! [`ResultPayloadBuilder`] maps one engine [`VerificationOutcome`] onto the
-//! authored schemas of `bifrost.verification.results` and
-//! `bifrost.drift.result_features`, and the execution's pinned inputs onto
-//! `bifrost.verification.execution_inputs`, taken from the tables' own declarations so
-//! the payload can never drift from the registered contract. Every batch also
+//! authored schemas of `bifrost.verification.execution_outputs` (its
+//! requirements and steps) and `bifrost.verification.results` (its
+//! payload-free summary), and the execution's [`InputRecord`] onto
+//! `bifrost.verification.execution_inputs`, taken from the tables' own
+//! declarations so the payload can never drift from the registered contract.
+//! Each fact is stored once: inputs only in the inputs record, judgment
+//! detail only in the output record. Every batch also
 //! carries the three correlation columns Scribe admits from a row-attributed
 //! payload: `workload_card_uid` (the binding owner), `subject_card_uid` (the
 //! Card verified; the Verifier is the authored `verifier_card_uid`), and
@@ -15,24 +18,22 @@ use std::any::TypeId;
 use std::collections::{BTreeMap, HashMap};
 use std::sync::{Arc, LazyLock};
 
-use arrow::array::{ArrayRef, BooleanArray, Float64Array, StringArray, TimestampMicrosecondArray};
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use arrow::error::ArrowError;
-use arrow::record_batch::RecordBatch;
 
 use chrono::{DateTime, Utc};
 use serde::Serialize;
 use serde_json::Error as JsonError;
+use vala_bifrost_redux::tables::DomainTable;
+use vala_bifrost_redux::tables::staged::{Cell, StagedRow};
 use vala_bifrost_redux::tables::verification::{
-    ACTIVATION, ExecutionInputsTable, INPUTS, OUTCOME, ResultsTable,
+    ACTIVATION, ExecutionInputsTable, ExecutionOutputsTable, INPUTS, OUTPUT, ResultsTable,
 };
-use vala_bifrost_redux::tables::{DomainTable, ResultFeaturesTable};
-use wyrd_queue::variant::{EncodedVariant, VariantColumnBuilder};
+use wyrd_queue::variant::EncodedVariant;
 use wyrd_runtime::request_context::AcceptedAuthority;
 use wyrd_spec::card::agent::ExecutionRoute;
 use wyrd_spec::ids::{BindingId, CardUid, ExecutionId, GroupId, SlotName, VerificationResultId};
 use wyrd_spec::vala::BifrostError;
-use wyrd_spec::vala::api::UTC_TIME_ZONE;
 use wyrd_spec::vala::ids::RunId;
 use wyrd_spec::vala::managed_columns::{
     DEPLOYMENT_ENVIRONMENT, RUN_ID, SERVICE_NAME, SERVICE_VERSION, SUBJECT_CARD_UID, SUBJECT_KIND,
@@ -40,12 +41,12 @@ use wyrd_spec::vala::managed_columns::{
 };
 use wyrd_spec::verification::TaskId;
 use wyrd_spec::verification::execution::{
-    CallProvenance, InputDeclaration, RequirementDetail, RequirementResult, VerificationOutcome,
+    InputDeclaration, RequirementResult, StepResult, VerificationOutcome,
 };
-use wyrd_spec::verification::{
-    DriftReport, DriftVerdict, DriftWindow, FeatureDriftReport, FrozenTarget, VerificationVerdict,
-};
+use wyrd_spec::verification::{DriftWindow, FrozenTarget, VerificationVerdict};
 use wyrd_sql::queries::verifier_executions::Submission;
+
+use super::inputs::{GroupSelector, InputOrigin, ScheduleSelector};
 
 /// Why an outcome could not be mapped to result batches.
 ///
@@ -59,8 +60,8 @@ pub enum ResultPayloadError {
     /// An outcome value exceeds a Variant limit and cannot be stored.
     #[error("result Variant value refused")]
     Variant(#[from] BifrostError),
-    /// The mapped columns did not form a valid batch.
-    #[error("result batch assembly failed")]
+    /// The mapped values did not fill the table's schema.
+    #[error("result row assembly failed")]
     Arrow(#[from] ArrowError),
     /// The authored columns do not name each table field exactly once.
     ///
@@ -75,28 +76,33 @@ pub enum ResultPayloadError {
     },
 }
 
-/// One authored result column: the table field name it fills and its values.
+/// One authored result value: the table field name it fills and its value.
 ///
-/// The name, not the position, binds the values to the destination table's
+/// The name, not the position, binds the value to the destination table's
 /// field, so a reordered table declaration cannot relabel evidence.
-type NamedColumn = (&'static str, ArrayRef);
+type NamedColumn = (&'static str, Cell);
 
-/// The one schema every row of each result table shares: the table's fields
-/// followed by the [`CORRELATION`] columns, keyed by its table type.
+/// The one schema every row of each result table shares, the table's fields
+/// followed by the [`CORRELATION`] columns, and the table's fully qualified
+/// name, keyed by its table type.
 ///
-/// Each result row is its own batch until the Scribe outbox concatenates a
-/// slice of them, so one shared schema lets the outbox group rows by pointer
-/// and spares every row its own field allocations.
-static SCHEMAS: LazyLock<[(TypeId, SchemaRef); 3]> = LazyLock::new(|| {
-    /// `T`'s fields followed by the correlation columns, keyed by `T`.
-    fn schema<T: DomainTable + 'static>() -> (TypeId, SchemaRef) {
+/// Each result row is staged on its own until the Scribe outbox builds a
+/// slice of them into one batch, so one shared schema lets the outbox group
+/// rows by pointer and spares every row its own field allocations.
+static SCHEMAS: LazyLock<[(TypeId, String, SchemaRef); 3]> = LazyLock::new(|| {
+    /// `T`'s name and fields followed by the correlation columns, keyed by `T`.
+    fn schema<T: DomainTable + 'static>() -> (TypeId, String, SchemaRef) {
         let mut fields = T::arrow_fields();
         fields.extend(CORRELATION.map(|name| Field::new(name, DataType::Utf8, true)));
-        (TypeId::of::<T>(), Arc::new(Schema::new(fields)))
+        (
+            TypeId::of::<T>(),
+            format!("bifrost.{}.{}", T::NAMESPACE, T::NAME),
+            Arc::new(Schema::new(fields)),
+        )
     }
     [
         schema::<ResultsTable>(),
-        schema::<ResultFeaturesTable>(),
+        schema::<ExecutionOutputsTable>(),
         schema::<ExecutionInputsTable>(),
     ]
 });
@@ -105,28 +111,36 @@ static SCHEMAS: LazyLock<[(TypeId, SchemaRef); 3]> = LazyLock::new(|| {
 /// fields, in this order.
 const CORRELATION: [&str; 3] = [WORKLOAD_CARD_UID, SUBJECT_CARD_UID, RUN_ID];
 
-/// One sealed-ready batch and the table it is written to.
+/// One staged result row and the table it is written to.
 #[derive(Debug, Clone)]
-pub struct ResultBatch {
+pub struct ResultRow {
     /// Fully qualified destination table, such as `bifrost.verification.results`.
-    pub table: String,
-    /// The rows, including the correlation columns.
-    pub batch: RecordBatch,
+    pub table: &'static str,
+    /// The row's values, including the correlation columns.
+    pub row: StagedRow,
 }
 
-/// Every batch of one result, in required write order.
+impl ResultRow {
+    /// Memory this row holds while it is staged, as
+    /// [`StagedRow::owned_bytes`].
+    #[must_use]
+    pub fn owned_bytes(&self) -> usize {
+        self.row.owned_bytes()
+    }
+}
+
+/// Every row of one result, in required write order.
 ///
-/// Drift feature rows precede the summary; a result with no drift detail
-/// holds only the summary. Built once and staged on the Scribe outbox, which
-/// resends identical rows on every retry.
+/// The output record precedes the summary. Built once and staged on the
+/// Scribe outbox, which resends identical rows on every retry.
 #[derive(Debug, Clone)]
 pub struct ResultPayload {
     /// The result identity every row carries.
     result_id: VerificationResultId,
     /// The overall verdict the summary records.
     verdict: VerificationVerdict,
-    /// Details first, summary last; never an empty batch.
-    batches: Vec<ResultBatch>,
+    /// The output record, then the summary.
+    rows: Vec<ResultRow>,
 }
 
 impl ResultPayload {
@@ -142,11 +156,22 @@ impl ResultPayload {
         self.verdict
     }
 
-    /// Every batch in write order: details, then the summary.
+    /// Every row in write order: the output, then the summary.
     #[must_use]
-    pub fn batches(&self) -> &[ResultBatch] {
-        &self.batches
+    pub fn rows(&self) -> &[ResultRow] {
+        &self.rows
     }
+}
+
+/// The stored `output` Variant: a [`VerificationOutcome`]'s requirements and
+/// steps, without the verdict the summary records or the `evidence` only the
+/// execution's input record stores.
+#[derive(Serialize)]
+struct StoredOutput<'a> {
+    /// Every requirement, step requirements included.
+    requirements: &'a [RequirementResult],
+    /// Every step in plan order.
+    steps: &'a [StepResult],
 }
 
 /// The accepted request context of a submitted execution, recorded as its
@@ -161,6 +186,20 @@ struct Activation<'a> {
     request_sha256: Option<String>,
     /// The submitting caller's verified effective authority.
     authority: &'a AcceptedAuthority,
+}
+
+/// What one execution's input record holds, by origin.
+#[derive(Debug, Clone, Copy)]
+pub enum InputRecord<'r> {
+    /// A direct execution's supplied declarations; it never queues work.
+    Direct(&'r BTreeMap<SlotName, InputDeclaration>),
+    /// A queued submission: its declarations and accepted activation
+    /// context, queued once Scribe acknowledges the record.
+    Submitted(&'r Submission),
+    /// A group execution's settled selection.
+    Group(&'r GroupSelector),
+    /// A scheduled drift execution's frozen observation selection.
+    Schedule(&'r ScheduleSelector),
 }
 
 /// The identities of the execution a result belongs to.
@@ -198,19 +237,7 @@ pub struct ResultRun<'a> {
     pub window: Option<&'a DriftWindow>,
 }
 
-/// One `bifrost.drift.result_features` row before encoding.
-struct DriftRow<'r> {
-    /// The drift requirement that scored the feature.
-    requirement: &'r str,
-    /// The requirement's report, which names the method.
-    report: &'r DriftReport,
-    /// The window the feature was scored over.
-    window: DriftWindow,
-    /// The scored feature.
-    feature: &'r FeatureDriftReport,
-}
-
-/// Maps one completed execution's outcome onto its result batches.
+/// Maps one completed execution's outcome onto its result rows.
 ///
 /// Owns the identities every row repeats — result, execution, Verifier,
 /// subject, owner, binding — plus the execution interval, so each table
@@ -244,17 +271,16 @@ impl<'a> ResultPayloadBuilder<'a> {
         }
     }
 
-    /// Map `outcome` to its ordered batches under a newly minted result
+    /// Map `outcome` to its ordered rows under a newly minted result
     /// identity.
     ///
     /// Each call produces a distinct [`VerificationResultId`], carried by
     /// every row of the payload, so two attempts of one execution never share
     /// a result identity; the execution correlates them through
     /// `execution_id`. Retrying the staged payload resends the same rows and
-    /// identity. Every drift requirement writes one `result_features` row per scored
-    /// feature, keyed by its `requirement_id`, all in one batch before the
-    /// summary. The one `results` row records the overall verdict and the
-    /// whole outcome as the `outcome` Variant.
+    /// identity. The one `execution_outputs` row stores the requirements and
+    /// steps as its `output` Variant, before the one payload-free `results`
+    /// row recording the overall verdict.
     ///
     /// # Errors
     /// Returns [`ResultPayloadError::ColumnMismatch`] when authored columns
@@ -266,29 +292,35 @@ impl<'a> ResultPayloadBuilder<'a> {
         outcome: &VerificationOutcome,
     ) -> Result<ResultPayload, ResultPayloadError> {
         let result_id = VerificationResultId::new_v7();
-        let mut batches = Vec::with_capacity(2);
-        if let Some(features) = self.drift_features(result_id, &outcome.requirements)? {
-            batches.push(self.finish::<ResultFeaturesTable>(features)?);
-        }
-        batches.push(self.finish::<ResultsTable>(self.summary(result_id, outcome)?)?);
+        let output = StoredOutput {
+            requirements: &outcome.requirements,
+            steps: &outcome.steps,
+        };
+        let rows = vec![
+            self.finish::<ExecutionOutputsTable>(vec![
+                ("result_id", Cell::text(Some(result_id.to_string()))),
+                (
+                    "execution_id",
+                    Cell::text(Some(self.run.execution_id.to_string())),
+                ),
+                ("ended_at", time(Some(self.ended_at))),
+                (OUTPUT, variant(OUTPUT, Some(&output))?),
+            ])?,
+            self.finish::<ResultsTable>(self.summary(result_id, outcome)?)?,
+        ];
         Ok(ResultPayload {
             result_id,
             verdict: outcome.verdict,
-            batches,
+            rows,
         })
     }
 
     /// Author the named columns of the one `bifrost.verification.results` row
-    /// identified by `result_id`.
-    ///
-    /// The outcome is serialized straight to JSON text for the one Variant
-    /// walker, never through an intermediate `serde_json::Value`; every
-    /// direct verify pays this on its request.
+    /// identified by `result_id`: identities, verdict, and timing, with no
+    /// payload.
     ///
     /// # Errors
-    /// Returns a JSON error when the Trigger or outcome cannot be encoded and
-    /// [`ResultPayloadError::Variant`] when the outcome exceeds a Variant
-    /// limit.
+    /// Returns a JSON error when the Trigger cannot be encoded.
     fn summary(
         &self,
         result_id: VerificationResultId,
@@ -296,215 +328,99 @@ impl<'a> ResultPayloadBuilder<'a> {
     ) -> Result<Vec<NamedColumn>, ResultPayloadError> {
         let trigger = self.run.trigger.map(canonical_json).transpose()?;
         let verdict: &'static str = outcome.verdict.into();
-        let outcome = serde_json::to_string(outcome)?;
         let window = self.run.window;
         Ok(vec![
-            ("result_id", text([Some(result_id.to_string())])),
+            ("result_id", Cell::text(Some(result_id.to_string()))),
             (
                 "execution_id",
-                text([Some(self.run.execution_id.to_string())]),
+                Cell::text(Some(self.run.execution_id.to_string())),
             ),
-            ("execution_status", text([Some("completed")])),
-            ("verdict", text([Some(verdict)])),
-            ("verifier_version", text([Some(self.run.verifier_version)])),
+            ("execution_status", Cell::text(Some("completed"))),
+            ("verdict", Cell::text(Some(verdict))),
+            (
+                "verifier_version",
+                Cell::text(Some(self.run.verifier_version)),
+            ),
             (
                 "verifier_card_uid",
-                text([Some(self.verifier_uid.as_str())]),
+                Cell::text(Some(self.verifier_uid.as_str())),
             ),
-            ("binding_id", text([self.binding()])),
-            ("group_id", text([self.group()])),
-            ("trigger_identity", text([trigger])),
-            (
-                "window_start",
-                timestamps([window.map(|window| window.start)]),
-            ),
-            ("window_end", timestamps([window.map(|window| window.end)])),
-            ("started_at", timestamps([Some(self.started_at)])),
-            ("ended_at", timestamps([Some(self.ended_at)])),
-            (
-                OUTCOME,
-                VariantColumnBuilder::encode(
-                    OUTCOME,
-                    [Some(outcome.as_str())],
-                    EncodedVariant::from_json_text,
-                )?,
-            ),
+            ("binding_id", Cell::text(self.binding())),
+            ("group_id", Cell::text(self.group())),
+            ("trigger_identity", Cell::text(trigger)),
+            ("window_start", time(window.map(|window| window.start))),
+            ("window_end", time(window.map(|window| window.end))),
+            ("started_at", time(Some(self.started_at))),
+            ("ended_at", time(Some(self.ended_at))),
         ])
     }
 
-    /// Map the execution's pinned `inputs` to its one
+    /// Map the execution's `record` to its one
     /// `bifrost.verification.execution_inputs` row, recorded at `started_at`.
     ///
-    /// A `submission` marks the row `queue_execution` and records its
-    /// accepted request context — route overrides, idempotency key and
-    /// request digest, and the accepted authority — as the `activation`
-    /// Variant; a direct execution passes `None` and its row can never queue
-    /// work.
+    /// The row's `origin` names the record kind and its `inputs` Variant holds
+    /// the supplied declarations or the selector. Every queued origin,
+    /// submitted, group, or schedule, marks the row `queue_execution`; a
+    /// direct row never queues work. Only a submission records its accepted
+    /// request context — route overrides, idempotency key and request
+    /// digest, and the accepted authority — as the `activation` Variant.
     ///
     /// # Errors
-    /// Returns a JSON or Variant error when the inputs or activation cannot
-    /// be encoded, and the [`Self::finish`] errors.
-    pub fn inputs(
-        &self,
-        inputs: &BTreeMap<SlotName, InputDeclaration>,
-        submission: Option<&Submission>,
-    ) -> Result<ResultBatch, ResultPayloadError> {
-        let activation = submission
-            .map(|submission| {
-                serde_json::to_string(&Activation {
-                    route_overrides: &submission.request.execution_route_overrides,
-                    idempotency_key: submission.key.as_ref().map(|key| key.key.as_str()),
-                    request_sha256: submission
-                        .key
-                        .as_ref()
-                        .map(|key| hex::encode(key.request_sha256)),
-                    authority: &submission.authority,
-                })
-            })
-            .transpose()?;
-        let inputs = serde_json::to_string(inputs)?;
+    /// Returns a Variant error when the inputs or activation cannot be
+    /// encoded, and the [`Self::finish`] errors.
+    pub fn inputs(&self, record: InputRecord<'_>) -> Result<ResultRow, ResultPayloadError> {
+        /// The `inputs` Variant cell of `value`.
+        fn encoded<T: Serialize>(value: &T) -> Result<Cell, ResultPayloadError> {
+            variant(INPUTS, Some(value))
+        }
+        let (origin, inputs, submission) = match record {
+            InputRecord::Direct(inputs) => (InputOrigin::Direct, encoded(inputs)?, None),
+            InputRecord::Submitted(submission) => (
+                InputOrigin::Submitted,
+                encoded(&submission.request.inputs)?,
+                Some(submission),
+            ),
+            InputRecord::Group(selector) => (InputOrigin::Group, encoded(selector)?, None),
+            InputRecord::Schedule(selector) => (InputOrigin::Schedule, encoded(selector)?, None),
+        };
+        let activation = submission.map(|submission| Activation {
+            route_overrides: &submission.request.execution_route_overrides,
+            idempotency_key: submission.key.as_ref().map(|key| key.key.as_str()),
+            request_sha256: submission
+                .key
+                .as_ref()
+                .map(|key| hex::encode(key.request_sha256)),
+            authority: &submission.authority,
+        });
         self.finish::<ExecutionInputsTable>(vec![
             (
                 "execution_id",
-                text([Some(self.run.execution_id.to_string())]),
+                Cell::text(Some(self.run.execution_id.to_string())),
             ),
             (
                 "verifier_card_uid",
-                text([Some(self.verifier_uid.as_str())]),
+                Cell::text(Some(self.verifier_uid.as_str())),
             ),
-            ("binding_id", text([self.binding()])),
-            ("group_id", text([self.group()])),
-            (
-                "queue_execution",
-                Arc::new(BooleanArray::from(vec![submission.is_some()])),
-            ),
-            (
-                INPUTS,
-                VariantColumnBuilder::encode(
-                    INPUTS,
-                    [Some(inputs.as_str())],
-                    EncodedVariant::from_json_text,
-                )?,
-            ),
-            (
-                ACTIVATION,
-                VariantColumnBuilder::encode(
-                    ACTIVATION,
-                    [activation.as_deref()],
-                    EncodedVariant::from_json_text,
-                )?,
-            ),
-            ("recorded_at", timestamps([Some(self.started_at)])),
+            ("binding_id", Cell::text(self.binding())),
+            ("group_id", Cell::text(self.group())),
+            ("origin", Cell::text(Some(origin.as_str()))),
+            ("queue_execution", Cell::Flag(origin != InputOrigin::Direct)),
+            (INPUTS, inputs),
+            (ACTIVATION, variant(ACTIVATION, activation.as_ref())?),
+            ("recorded_at", time(Some(self.started_at))),
         ])
     }
 
-    /// Author the named `bifrost.drift.result_features` columns: one row per
-    /// scored feature of every drift requirement, each keyed by `result_id`.
+    /// Assemble table `T`'s row from its named authored values.
     ///
-    /// A row's window is its requirement's scored window, else the
-    /// execution's scheduled window, else the execution interval. Returns
-    /// `None` when no requirement scored a feature, so no empty batch is ever
-    /// written. A non-finite score or threshold becomes null.
-    ///
-    /// # Errors
-    /// Returns a JSON error when a method or verdict cannot be encoded.
-    fn drift_features(
-        &self,
-        result_id: VerificationResultId,
-        requirements: &[RequirementResult],
-    ) -> Result<Option<Vec<NamedColumn>>, ResultPayloadError> {
-        let mut rows: Vec<DriftRow<'_>> = Vec::new();
-        for requirement in requirements {
-            let Some(RequirementDetail::Drift(report)) = &requirement.detail else {
-                continue;
-            };
-            let window = match &requirement.provenance {
-                Some(CallProvenance::Drift {
-                    window: Some(window),
-                }) => *window,
-                _ => self.run.window.copied().unwrap_or(DriftWindow {
-                    start: self.started_at,
-                    end: self.ended_at,
-                }),
-            };
-            rows.extend(report.features.values().map(|feature| DriftRow {
-                requirement: requirement.id.as_str(),
-                report,
-                window,
-                feature,
-            }));
-        }
-        if rows.is_empty() {
-            return Ok(None);
-        }
-        let count = rows.len();
-        let methods = rows
-            .iter()
-            .map(|row| serialized_name(&row.report.method))
-            .collect::<Result<Vec<_>, _>>()?;
-        let verdicts = rows
-            .iter()
-            .map(|row| Some(drift_verdict(row.feature.verdict)));
-        Ok(Some(vec![
-            (
-                "result_id",
-                text(std::iter::repeat_n(Some(result_id.to_string()), count)),
-            ),
-            (
-                "requirement_id",
-                text(rows.iter().map(|row| Some(row.requirement))),
-            ),
-            (
-                "verifier_card_uid",
-                text(std::iter::repeat_n(Some(self.verifier_uid.as_str()), count)),
-            ),
-            (
-                "binding_id",
-                text(std::iter::repeat_n(self.binding(), count)),
-            ),
-            (
-                "window_start",
-                timestamps(rows.iter().map(|row| Some(row.window.start))),
-            ),
-            (
-                "window_end",
-                timestamps(rows.iter().map(|row| Some(row.window.end))),
-            ),
-            ("method", text(methods)),
-            (
-                "feature",
-                text(rows.iter().map(|row| Some(row.feature.feature.as_str()))),
-            ),
-            (
-                "score",
-                Arc::new(
-                    rows.iter()
-                        .map(|row| row.feature.score.filter(|score| score.is_finite()))
-                        .collect::<Float64Array>(),
-                ),
-            ),
-            (
-                "threshold",
-                Arc::new(
-                    rows.iter()
-                        .map(|row| row.feature.threshold.filter(|value| value.is_finite()))
-                        .collect::<Float64Array>(),
-                ),
-            ),
-            ("verdict", text(verdicts)),
-        ]))
-    }
-
-    /// Assemble table `T`'s batch from its named authored columns.
-    ///
-    /// `T::arrow_fields()` is the only schema authority: the columns are
+    /// `T::arrow_fields()` is the only schema authority: the values are
     /// ordered by its field names (see [`Self::assemble`]) under `T`'s shared
-    /// schema in [`SCHEMAS`], and the batch is addressed to the table's fully
+    /// schema in [`SCHEMAS`], and the row is addressed to the table's fully
     /// qualified name.
     ///
     /// # Errors
-    /// Returns [`ResultPayloadError::ColumnMismatch`] when the columns do not
-    /// name each field exactly once, or an Arrow error when a column does not
+    /// Returns [`ResultPayloadError::ColumnMismatch`] when the values do not
+    /// name each field exactly once, or an Arrow error when a value does not
     /// match its field.
     ///
     /// # Panics
@@ -513,42 +429,39 @@ impl<'a> ResultPayloadBuilder<'a> {
     fn finish<T: DomainTable + 'static>(
         &self,
         columns: Vec<NamedColumn>,
-    ) -> Result<ResultBatch, ResultPayloadError> {
-        let schema = SCHEMAS
+    ) -> Result<ResultRow, ResultPayloadError> {
+        let (_, table, schema) = SCHEMAS
             .iter()
-            .find(|(table, _)| *table == TypeId::of::<T>())
-            .map(|(_, schema)| Arc::clone(schema))
+            .find(|(table, _, _)| *table == TypeId::of::<T>())
             .expect("every result table has a shared schema");
-        Ok(ResultBatch {
-            table: format!("bifrost.{}.{}", T::NAMESPACE, T::NAME),
-            batch: self.assemble(schema, columns)?,
+        Ok(ResultRow {
+            table,
+            row: self.assemble(Arc::clone(schema), columns)?,
         })
     }
 
-    /// Order named columns by `schema`'s table fields, then append the
-    /// correlation columns.
+    /// Order named values by `schema`'s table fields, then append the
+    /// correlation values.
     ///
     /// `schema` is a table's fields followed by the [`CORRELATION`] columns.
-    /// Every authored column must fill exactly one table field by name; the
-    /// arrays are placed in field order, never in authoring order, so a
+    /// Every authored value must fill exactly one table field by name; the
+    /// values are placed in field order, never in authoring order, so a
     /// reordered declaration keeps each value under its own name. The shared
-    /// dimensions and correlation columns repeat the run's context for the
-    /// authored row count.
+    /// dimensions and correlation columns carry the run's context.
     ///
     /// # Errors
     /// Returns [`ResultPayloadError::ColumnMismatch`] with problem
     /// `duplicate` when a name is authored twice, `missing` when a field has
-    /// no column, or `unexpected` when a column names no field; returns an
-    /// Arrow error when a column does not match its field's type or length.
+    /// no value, or `unexpected` when a value names no field; returns an
+    /// Arrow error when a value does not match its field's type.
     fn assemble(
         &self,
         schema: SchemaRef,
         columns: Vec<NamedColumn>,
-    ) -> Result<RecordBatch, ResultPayloadError> {
-        let rows = columns.first().map_or(0, |(_, array)| array.len());
-        let mut named: HashMap<&'static str, ArrayRef> = HashMap::with_capacity(columns.len());
-        for (name, array) in columns {
-            if named.insert(name, array).is_some() {
+    ) -> Result<StagedRow, ResultPayloadError> {
+        let mut named: HashMap<&'static str, Cell> = HashMap::with_capacity(columns.len());
+        for (name, cell) in columns {
+            if named.insert(name, cell).is_some() {
                 return Err(ResultPayloadError::ColumnMismatch {
                     column: name.to_owned(),
                     problem: "duplicate",
@@ -564,18 +477,18 @@ impl<'a> ResultPayloadBuilder<'a> {
                 (SUBJECT_NAME, None),
                 (SUBJECT_VERSION, None),
             ]
-            .map(|(name, value)| (name, text(std::iter::repeat_n(value, rows)))),
+            .map(|(name, value)| (name, Cell::text(value))),
         );
         let fields = schema.fields();
-        let mut arrays = Vec::with_capacity(fields.len());
+        let mut cells = Vec::with_capacity(fields.len());
         for field in &fields[..fields.len().saturating_sub(CORRELATION.len())] {
-            let array = named.remove(field.name().as_str()).ok_or_else(|| {
+            let cell = named.remove(field.name().as_str()).ok_or_else(|| {
                 ResultPayloadError::ColumnMismatch {
                     column: field.name().clone(),
                     problem: "missing",
                 }
             })?;
-            arrays.push(array);
+            cells.push(cell);
         }
         if let Some(name) = named.into_keys().next() {
             return Err(ResultPayloadError::ColumnMismatch {
@@ -583,16 +496,12 @@ impl<'a> ResultPayloadBuilder<'a> {
                 problem: "unexpected",
             });
         }
-        arrays.push(text(std::iter::repeat_n(self.owner(), rows)));
-        arrays.push(text(std::iter::repeat_n(
-            Some(self.run.card_uid.as_str()),
-            rows,
-        )));
-        arrays.push(text(std::iter::repeat_n(
-            self.run.run_id.map(RunId::as_str),
-            rows,
-        )));
-        Ok(RecordBatch::try_new(schema, arrays)?)
+        cells.extend([
+            Cell::text(self.owner()),
+            Cell::text(Some(self.run.card_uid.as_str())),
+            Cell::text(self.run.run_id.map(RunId::as_str)),
+        ]);
+        Ok(StagedRow::new(schema, cells)?)
     }
 
     /// The binding owner Card UID, null for an execution with no binding.
@@ -622,41 +531,24 @@ fn canonical_json<T: Serialize>(value: &T) -> Result<String, JsonError> {
     serde_jcs::to_string(&serde_json::to_value(value)?)
 }
 
-/// The serialized name of a unit enum value, such as `Psi` or `NoDrift`.
+/// The Variant cell of `value`, encoded and validated now, named `field` in
+/// a refusal.
 ///
 /// # Errors
-/// Returns a JSON error when the value cannot be serialized.
-fn serialized_name<T: Serialize>(value: &T) -> Result<Option<String>, JsonError> {
-    Ok(serde_json::to_value(value)?.as_str().map(str::to_owned))
+/// Returns [`ResultPayloadError::Variant`] when `value` exceeds a Variant
+/// limit.
+fn variant<T: Serialize>(field: &str, value: Option<&T>) -> Result<Cell, ResultPayloadError> {
+    let encoded = value
+        .map(EncodedVariant::from_serialize)
+        .transpose()
+        .map_err(|violation| violation.into_error(field, 0))?;
+    Ok(Cell::Variant(encoded))
 }
 
-/// The stored value of a Drift feature verdict: the snake_case spelling the
-/// published `bifrost.drift.result_features.verdict` column carries, matching
-/// `bifrost.verification.results.verdict`.
-const fn drift_verdict(verdict: DriftVerdict) -> &'static str {
-    match verdict {
-        DriftVerdict::NoDrift => "no_drift",
-        DriftVerdict::Drift => "drift",
-        DriftVerdict::Inconclusive => "inconclusive",
-    }
-}
-
-/// Build a nullable UTF-8 column.
-fn text<S: AsRef<str>>(values: impl IntoIterator<Item = Option<S>>) -> ArrayRef {
-    Arc::new(StringArray::from_iter(values))
-}
-
-/// Build a nullable microsecond timestamp column in the stored
-/// [`UTC_TIME_ZONE`] spelling every built-in result table declares.
-fn timestamps(values: impl IntoIterator<Item = Option<DateTime<Utc>>>) -> ArrayRef {
-    Arc::new(
-        TimestampMicrosecondArray::from_iter(
-            values
-                .into_iter()
-                .map(|value| value.map(|at| at.timestamp_micros())),
-        )
-        .with_timezone(UTC_TIME_ZONE),
-    )
+/// The microsecond timestamp cell of `value`, stored in the UTC spelling
+/// every built-in result table declares.
+fn time(value: Option<DateTime<Utc>>) -> Cell {
+    Cell::Micros(value.map(|at| at.timestamp_micros()))
 }
 
 #[cfg(test)]
@@ -666,14 +558,14 @@ mod tests {
     use std::collections::BTreeMap;
 
     use arrow::array::{Array, AsArray};
-    use arrow::datatypes::Float64Type;
+    use arrow::record_batch::RecordBatch;
     use chrono::TimeZone;
     use serde_json::Value;
     use wyrd_spec::card::drift::DriftMethod;
     use wyrd_spec::card::verifier::Check;
     use wyrd_spec::ids::FeatureName;
-    use wyrd_spec::verification::TaskId;
-    use wyrd_spec::verification::execution::RequirementOutcome;
+    use wyrd_spec::verification::execution::{RequirementDetail, RequirementOutcome};
+    use wyrd_spec::verification::{DriftReport, DriftVerdict, FeatureDriftReport};
 
     use super::*;
 
@@ -803,6 +695,15 @@ mod tests {
         }
     }
 
+    /// The one-row batch `row` builds into.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the row does not build.
+    fn project(row: &ResultRow) -> RecordBatch {
+        StagedRow::project(std::slice::from_ref(&row.row)).expect("row projects")
+    }
+
     /// Read one UTF-8 cell.
     fn cell(batch: &RecordBatch, column: &str, row: usize) -> Option<String> {
         let array = batch
@@ -812,81 +713,54 @@ mod tests {
         array.is_valid(row).then(|| array.value(row).to_owned())
     }
 
-    /// Drift feature rows carry their requirement and precede the summary,
-    /// a non-finite score is null, and the summary stores the whole outcome;
-    /// every row carries the payload's result identity, and the summary also
-    /// names the execution.
+    /// The output row precedes the summary and stores the requirements and
+    /// steps with a non-finite score as null but no verdict or evidence; the
+    /// summary carries no payload. Both rows carry the payload's result
+    /// identity and name the execution.
     ///
     /// # Panics
     /// Panics when the outcome maps to other rows.
     #[test]
-    fn outcome_writes_requirement_features_then_summary() {
+    fn outcome_writes_output_then_summary() {
         let run = TestRun::new();
         let outcome = outcome();
         let payload = run.builder().build(&outcome).expect("outcome maps");
-        let [features, summary] = payload.batches() else {
-            panic!("features then summary");
+        let [output, summary] = payload.rows() else {
+            panic!("output then summary");
         };
-        assert_eq!(features.table, "bifrost.drift.result_features");
+        assert_eq!(output.table, "bifrost.verification.execution_outputs");
         assert_eq!(summary.table, "bifrost.verification.results");
-        let rows = &features.batch;
-        assert_eq!(rows.num_rows(), 2);
-        for row in 0..2 {
+        let execution = run.execution_id.to_string();
+        let (output, summary) = (project(output), project(summary));
+        for batch in [&output, &summary] {
+            assert_eq!(batch.num_rows(), 1);
             assert_eq!(
-                cell(rows, "requirement_id", row).as_deref(),
-                Some("income_stable")
-            );
-            assert_eq!(cell(rows, "method", row).as_deref(), Some("Psi"));
-            assert_eq!(
-                cell(rows, "result_id", row),
+                cell(batch, "result_id", 0),
                 Some(payload.result_id().to_string())
             );
+            assert_eq!(cell(batch, "execution_id", 0).as_ref(), Some(&execution));
         }
-        assert_eq!(cell(rows, "feature", 0).as_deref(), Some("dti"));
-        assert_eq!(cell(rows, "verdict", 1).as_deref(), Some("drift"));
-        let scores = rows
-            .column_by_name("score")
-            .expect("score column")
-            .as_primitive::<Float64Type>();
-        assert!(scores.is_null(0));
-        assert!((scores.value(1) - 0.4).abs() < f64::EPSILON);
-        let summary = &summary.batch;
-        let execution = run.execution_id.to_string();
-        assert_eq!(
-            cell(summary, "result_id", 0),
-            Some(payload.result_id().to_string())
-        );
-        assert_eq!(cell(summary, "execution_id", 0), Some(execution));
+        let summary = &summary;
         assert_eq!(cell(summary, "verdict", 0).as_deref(), Some("failed"));
         assert_eq!(
             cell(summary, RUN_ID, 0).as_deref(),
             Some(run.run_id.as_str())
         );
+        assert!(summary.column_by_name(OUTPUT).is_none());
         let stored = wyrd_queue::variant::variant_cell_to_json(
-            summary
-                .column_by_name(OUTCOME)
-                .expect("outcome column")
+            output
+                .column_by_name(OUTPUT)
+                .expect("output column")
                 .as_ref(),
             0,
         )
-        .expect("outcome Variant decodes");
+        .expect("output Variant decodes");
         let mut expected = serde_json::to_value(&outcome).expect("outcome encodes");
         expected["requirements"][0]["detail"]["drift"]["features"]["dti"]["score"] = Value::Null;
-        assert_eq!(stored, expected);
-    }
-
-    /// An outcome with no drift detail writes only the summary.
-    ///
-    /// # Panics
-    /// Panics when a feature batch is written.
-    #[test]
-    fn outcome_without_drift_writes_only_the_summary() {
-        let run = TestRun::new();
-        let mut outcome = outcome();
-        outcome.requirements.remove(0);
-        let payload = run.builder().build(&outcome).expect("outcome maps");
-        assert_eq!(payload.batches().len(), 1);
-        assert_eq!(payload.verdict(), VerificationVerdict::Failed);
+        let object = expected.as_object_mut().expect("outcome object");
+        object.remove("evidence");
+        object.remove("verdict");
+        assert_eq!(stored, expected, "the output omits verdict and evidence");
     }
 
     /// Two attempts of one execution each mint their own result identity
@@ -905,16 +779,13 @@ mod tests {
         let second = run.builder().build(&outcome).expect("outcome maps");
         assert_ne!(first.result_id(), second.result_id());
         let execution = |payload: &ResultPayload| {
-            let summary = payload.batches().last().expect("a summary batch");
-            cell(&summary.batch, "execution_id", 0)
+            let summary = payload.rows().last().expect("a summary row");
+            cell(&project(summary), "execution_id", 0)
         };
         assert_eq!(execution(&first), Some(run.execution_id.to_string()));
         assert_eq!(execution(&first), execution(&second));
-        for (ours, theirs) in first.batches().iter().zip(second.batches()) {
-            assert!(Arc::ptr_eq(
-                ours.batch.schema_ref(),
-                theirs.batch.schema_ref()
-            ));
+        for (ours, theirs) in first.rows().iter().zip(second.rows()) {
+            assert!(Arc::ptr_eq(ours.row.schema(), theirs.row.schema()));
         }
     }
 
@@ -968,12 +839,12 @@ mod tests {
             ),
             (
                 "duplicate",
-                |columns| columns.push(("verdict", text([Some("passed")]))),
+                |columns| columns.push(("verdict", Cell::text(Some("passed")))),
                 "verdict",
             ),
             (
                 "unexpected",
-                |columns| columns.push(("bogus", text([Some("x")]))),
+                |columns| columns.push(("bogus", Cell::text(Some("x")))),
                 "bogus",
             ),
         ];

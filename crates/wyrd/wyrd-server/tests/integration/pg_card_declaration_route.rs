@@ -3814,7 +3814,11 @@ async fn runtime_activity_follows_only_qualifying_exchanges() {
     let authority =
         BackgroundAuthority::new(state.auth.tenant_issuer(state.bifrost.scribe_outbox()));
     let mut outcomes = Vec::new();
-    while let Some(due) = queue.claim_due(&mut conn).await.expect("scheduler claims") {
+    while let Some(due) = queue
+        .claim_due(&mut conn, &[])
+        .await
+        .expect("scheduler claims")
+    {
         let accepted = match due.owner() {
             Some((owner, root)) => authority
                 .resolve(&mut conn, owner, root)

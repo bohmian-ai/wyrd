@@ -403,10 +403,12 @@ const CALLER_TRACE: &str = "0af7651916cd43dd8448eb211c80319c";
 const CALLER_SPAN: &str = "b7ad6b7169203331";
 
 /// An answer the assertion expects passes, judged against the agent within
-/// the caller's Run.
+/// the caller's Run; once published, the direct execution, which never
+/// queued, reads back by its ID as the same result.
 ///
 /// # Panics
-/// Panics when the verify fails or the result differs.
+/// Panics when the verify fails, the result differs, or the read-back
+/// result differs from the returned one.
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "requires the repository-managed Postgres journey lifecycle"]
 async fn agent_answer_passes_its_verifier() {
@@ -431,6 +433,19 @@ async fn agent_answer_passes_its_verifier() {
         (requirement.id.as_str(), requirement.outcome),
         ("says-yes", RequirementOutcome::Passed)
     );
+    assistant
+        .deployment
+        .server()
+        .flush_bifrost()
+        .await
+        .expect("rows publish");
+    let resumed = Execution::connect_with(result.execution_id, &assistant.deployment.admin())
+        .await
+        .expect("the handle rebuilds from its ID")
+        .wait(WAIT)
+        .await
+        .expect("the direct execution reads back");
+    assert_eq!(resumed, result);
     assistant.deployment.shutdown().await;
 }
 
@@ -3050,8 +3065,9 @@ async fn grouped_executions_include_late_evidence() {
 }
 
 /// Scribe outbox capacity of the staging-pressure story: three quarters of
-/// it, four writes, is what two direct judgments reserve.
-const STAGING_CAPACITY: usize = 6;
+/// it, six writes, is what two direct judgments reserve, two result writes
+/// and one gateway capture each.
+const STAGING_CAPACITY: usize = 8;
 
 /// How long the slow judge of the staging-pressure story holds each call.
 const JUDGE_DELAY: Duration = Duration::from_secs(15);
@@ -3243,8 +3259,8 @@ async fn verification_staging_refuses_and_recovers() {
         .expect("the inputs rows count");
     assert_eq!(
         recorded.iter().map(|count| count.rows).collect::<Vec<_>>(),
-        [4 + offered],
-        "the burst judgments, the normal calls, and the recovered and grouped calls; nothing of the refused calls"
+        [5 + offered],
+        "the burst judgments, the normal calls, the recovered and grouped calls, and the group's selector; nothing of the refused calls"
     );
     assistant.deployment.shutdown().await;
 }

@@ -175,6 +175,12 @@ impl CallTelemetry {
     /// Records the server duration from arrival to `at`, the `upstream`
     /// time under `upstream_point`, and their difference at handoff `point`;
     /// nothing without an arrival.
+    ///
+    /// The same duration and provider wait are also recorded through
+    /// [`wyrd_telemetry::record_timing`] under the current span's benchmark
+    /// classification, at boundary `gateway.buffered`,
+    /// `gateway.stream.head`, or `gateway.stream.end`; the benchmark
+    /// histograms keep each call's residual beside both.
     fn point(
         &self,
         point: &'static str,
@@ -189,6 +195,17 @@ impl CallTelemetry {
         let duration = at.saturating_duration_since(arrival);
         let stream = if self.stream { "true" } else { "false" };
         let outcome = outcome_name(outcome);
+        wyrd_telemetry::record_timing(
+            &tracing::Span::current(),
+            match (self.stream, point) {
+                (false, _) => "gateway.buffered",
+                (true, "answer") => "gateway.stream.head",
+                (true, _) => "gateway.stream.end",
+            },
+            outcome,
+            duration,
+            Some(upstream),
+        );
         metrics::histogram!(
             GATEWAY_DURATION_SECONDS,
             "operation" => self.operation,
@@ -212,5 +229,76 @@ impl CallTelemetry {
             "point" => upstream_point
         )
         .record(upstream.as_secs_f64());
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    //! Proof of the handoff boundaries' benchmark histogram observations.
+
+    use super::*;
+    use wyrd_telemetry::timing;
+
+    /// A stream records its head and its final frame as separate
+    /// observations, each with its own provider wait and residual; a
+    /// buffered call whose wait exceeds its time is a negative residual,
+    /// never a clamped zero; a call without an arrival records nothing.
+    ///
+    /// # Panics
+    /// Panics when a boundary, count, wait, or residual is wrong.
+    #[test]
+    fn histograms_preserve_head_and_final_overhead() {
+        timing::enable();
+        let before = timing::snapshot();
+        let arrival = Instant::now()
+            .checked_sub(Duration::from_millis(300))
+            .expect("invariant: the monotonic clock is past 300 ms");
+        let stream = CallTelemetry::new(GatewayOperation::ChatCompletions, true, Some(arrival));
+        stream.answered(GatewayCallOutcome::Succeeded, Duration::from_millis(100));
+        stream.ended(
+            GatewayCallOutcome::Succeeded,
+            arrival + Duration::from_millis(500),
+            Duration::from_millis(450),
+        );
+        CallTelemetry::new(GatewayOperation::ChatCompletions, false, Some(arrival))
+            .answered(GatewayCallOutcome::Succeeded, Duration::from_secs(1));
+        CallTelemetry::new(GatewayOperation::ChatCompletions, false, None)
+            .answered(GatewayCallOutcome::Succeeded, Duration::ZERO);
+        let interval = timing::snapshot().since(&before).expect("one process");
+        let series = |boundary: &str| {
+            interval
+                .series
+                .iter()
+                .find(|series| series.boundary == boundary)
+                .unwrap_or_else(|| panic!("no {boundary} series: {:?}", interval.series))
+        };
+        let holds = |distribution: Option<&timing::Distribution>, ns: u64| {
+            distribution
+                .and_then(timing::Distribution::maximum)
+                .is_some_and(|bucket| bucket.lowest <= ns && ns <= bucket.highest)
+        };
+        let head = series("gateway.stream.head");
+        assert_eq!((head.outcome.as_str(), head.count), ("succeeded", 1));
+        assert!(head.problems().is_empty(), "{:?}", head.problems());
+        assert!(holds(head.excluded.as_ref(), 100_000_000));
+        let end = series("gateway.stream.end");
+        assert!(end.problems().is_empty(), "{:?}", end.problems());
+        assert!(
+            holds(Some(&end.elapsed), 500_000_000),
+            "handoff to the final frame"
+        );
+        assert!(holds(end.excluded.as_ref(), 450_000_000));
+        assert!(holds(end.residual.as_ref(), 50_000_000), "its own overhead");
+        let buffered = series("gateway.buffered");
+        assert_eq!((buffered.count, buffered.negative_residual), (1, 1));
+        assert!(
+            !buffered.problems().is_empty(),
+            "a negative residual is invalid"
+        );
+        assert_eq!(
+            interval.series.len(),
+            3,
+            "an unarrived call records nothing"
+        );
     }
 }

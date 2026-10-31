@@ -92,6 +92,10 @@ Set these variables, then start `wyrd-server` with the same `WYRD_DATABASE_URL`:
 | `WYRD_STORAGE_URL` | `s3://bucket`, `gs://bucket`, or `az://account/container`; bucket only, no path. S3 reads its region from `AWS_REGION` | Data goes to a local directory that only this process sees |
 | `WYRD_SIGNING_KEY_FILE` | Path to `signing.pem` | Startup fails when `APP_ENV=production`; otherwise each process makes a temporary key, and tokens stop working after a restart and on other replicas |
 | `WYRD_SEALING_KEY_FILE` | Path to `sealing.key` | Storing a `managed_secret` fails with `gateway credential protection is unavailable` |
+| `WYRD_OTLP_ENDPOINT` | Your OpenTelemetry collector's OTLP/gRPC URL, such as `http://collector:4317` | The server exports no traces to you; tenants' own timelines still work |
+| `WYRD_OTLP_SAMPLE_RATIO` | The share of traces exported to your collector, from `0` to `1` | `0.01`: 1% of traces |
+| `WYRD_TRACE_FILTER` | Which spans reach your collector, such as `info,wyrd_server=debug` | `info` |
+| `WYRD_LOG` | Which log lines the server writes. Keep `opentelemetry_sdk` warnings: they report dropped trace exports | `info` |
 
 ```bash
 curl -s -o /dev/null -w '%{http_code}\n' http://<server-host>:8080/readyz

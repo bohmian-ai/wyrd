@@ -10,6 +10,12 @@
 //! fitted edges and labels, and window bounds are escaped typed literals; a
 //! Verifier contributes no SQL text.
 //!
+//! A scheduled execution's population is frozen when the scheduler prepares
+//! it: [`DriftEngine::select`] lists the window's observation `record_id`s
+//! once, the execution's input record stores them, and every requirement and
+//! retry reads only those records, so an observation ingested later never
+//! joins a prepared run.
+//!
 //! Each run issues exactly one statement as the tenant's SYSTEM principal
 //! under a tokenless read authority holding only `bifrost_query:read` on the
 //! tenant's registered observation table, dispatched through the ordinary
@@ -34,7 +40,7 @@
 use std::collections::BTreeMap;
 use std::time::Duration;
 
-use arrow::array::{Array, Float64Array, Int64Array, RecordBatch};
+use arrow::array::{Array, AsArray, Float64Array, Int64Array, RecordBatch};
 use chrono::{DateTime, SecondsFormat, Utc};
 use datafusion::sql::sqlparser::ast::Value;
 use tokio_util::sync::CancellationToken;
@@ -47,6 +53,7 @@ use vala_drift::{
     SpcScorer, score_custom_mean, score_psi_counts,
 };
 use vala_verify::blocks::DriftChecks;
+use wyrd_runtime::outbox::{OutboxFull, Reservation};
 use wyrd_spec::DataTenantId;
 use wyrd_spec::auth::PrincipalId;
 use wyrd_spec::card::drift::{DriftProfile, DriftSpec, PsiProfile};
@@ -57,12 +64,17 @@ use wyrd_spec::vala::api::BifrostQueryRequest;
 use wyrd_spec::vala::error::BifrostError;
 use wyrd_spec::verification::TaskId;
 use wyrd_spec::verification::{DriftWindow, VerificationError};
-use wyrd_sql::queries::verifier_executions::{ClaimedExecution, TerminalStatus};
+use wyrd_sql::queries::verifier_executions::{
+    ClaimedExecution, ExecutionAuthority, TerminalStatus,
+};
 
 use super::authority::{SystemReadAuthority, SystemReadAuthorityError};
 use super::engines::EngineOutcome;
+use super::inputs::ScheduleSelector;
+use super::submissions::SubmissionSink;
 use super::telemetry::{ExecutionTelemetry, Phase};
 use crate::query::scheduled::ScheduledQueryCaller;
+use crate::scribe_outbox::ScribeSink;
 use crate::state::AppState;
 
 /// Stable error code when a PSI or SPC Verifier has no ready fitted baseline.
@@ -115,7 +127,8 @@ fn retry(code: &str, message: impl Into<String>) -> EngineOutcome {
 /// A pure value: it renders the fixed SQL and never executes it. Every
 /// statement filters the exact `subject_card_uid`, one feature `series`, and
 /// `created_at`, the table's time column, in `[start, end)` before its
-/// method-specific aggregate.
+/// method-specific aggregate, and, once [`Self::of`] froze the population,
+/// only its `record_id`s.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ObservationWindow {
     /// Observed subject Card UID as the managed `subject_card_uid` column stores it.
@@ -124,6 +137,8 @@ pub struct ObservationWindow {
     start: DateTime<Utc>,
     /// Exclusive window end.
     end: DateTime<Utc>,
+    /// The frozen population's `record_id` predicate, `None` before freezing.
+    records: Option<String>,
 }
 
 impl ObservationWindow {
@@ -134,7 +149,33 @@ impl ObservationWindow {
             subject: subject.to_string(),
             start: window.start,
             end: window.end,
+            records: None,
         }
+    }
+
+    /// Restrict every statement to the frozen `records`; an empty population
+    /// selects nothing.
+    #[must_use]
+    pub fn of(mut self, records: &[String]) -> Self {
+        // ponytail: one literal IN list per statement; a frozen population
+        // past the statement size bound needs a join against the input record.
+        self.records = Some(if records.is_empty() {
+            "false".to_owned()
+        } else {
+            let ids: Vec<_> = records.iter().map(|id| Self::text(id)).collect();
+            format!("record_id IN ({})", ids.join(", "))
+        });
+        self
+    }
+
+    /// The statement listing the window's distinct observation `record_id`s
+    /// in order: the population a scheduled execution freezes.
+    #[must_use]
+    pub fn selection(&self) -> String {
+        format!(
+            "SELECT DISTINCT record_id {} ORDER BY record_id",
+            self.rows_in("true")
+        )
     }
 
     /// Render `value` as an escaped SQL string literal.
@@ -158,10 +199,11 @@ impl ObservationWindow {
     fn rows_in(&self, filter: &str) -> String {
         format!(
             "FROM {OBSERVATIONS} WHERE subject_card_uid = {} AND {filter} \
-             AND created_at >= {} AND created_at < {}",
+             AND created_at >= {} AND created_at < {} AND {}",
             Self::text(&self.subject),
             Self::instant(self.start),
             Self::instant(self.end),
+            self.records.as_deref().unwrap_or("true"),
         )
     }
 
@@ -668,8 +710,79 @@ impl DriftEngine {
         }
     }
 
-    /// Score every drift requirement of `spec` over its scheduled `window`
-    /// for `tenant`.
+    /// Freeze the observation population a scheduled execution of `subject`
+    /// over `window` judges: the window's distinct `record_id`s, read once as
+    /// `authority`'s SYSTEM actor serving its owner. A tenant that never
+    /// registered the observation table selects nothing.
+    ///
+    /// # Errors
+    /// Returns the authority, admission, query, or decode failure; the caller
+    /// leaves the occurrence due.
+    pub async fn select(
+        &self,
+        tenant: DataTenantId,
+        authority: &ExecutionAuthority,
+        subject: &CardUid,
+        window: &DriftWindow,
+    ) -> Result<Vec<String>, String> {
+        let read = SystemReadAuthority::resolve(
+            &self.state,
+            tenant,
+            Some(authority.attribution().act_principal_id),
+            &[TableRef::new(BifrostNamespace::Drift, "observations")],
+        )
+        .await
+        .map_err(|error| error.to_string())?
+        .serving(authority.authority());
+        if read.context().principal.effective_permissions.is_empty() {
+            return Ok(Vec::new());
+        }
+        let query = ScheduledQueryCaller::new(
+            self.state.clone(),
+            read.into_context(),
+            CancellationToken::new(),
+        );
+        let mut records = Vec::new();
+        query
+            .run_with(
+                BifrostQueryRequest {
+                    params: Vec::new(),
+                    sql: ObservationWindow::new(subject, window).selection(),
+                    deadline_ms: Some(
+                        i64::try_from(self.query_timeout.as_millis()).unwrap_or(i64::MAX),
+                    ),
+                },
+                |batch| {
+                    let ids = batch
+                        .column_by_name("record_id")
+                        .and_then(|ids| ids.as_string_opt::<i32>())
+                        .ok_or_else(|| WyrdError::from(BifrostError::QueryStreamProtocol))?;
+                    records.extend(ids.iter().flatten().map(str::to_owned));
+                    Ok(())
+                },
+            )
+            .await
+            .map_err(|error| error.to_string())?;
+        Ok(records)
+    }
+
+    /// Reserve the Scribe outbox slot a scheduled execution's input record
+    /// is staged on and the queue slot that admits it once Scribe
+    /// acknowledges it, before its occurrence is claimed.
+    ///
+    /// # Errors
+    /// Returns [`OutboxFull`] when either outbox share is exhausted.
+    pub fn reserve(
+        &self,
+    ) -> Result<(Reservation<ScribeSink>, Reservation<SubmissionSink>), OutboxFull> {
+        Ok((
+            self.state.bifrost.scribe_outbox().reserve(1)?,
+            self.state.verification.submissions().reserve(1)?,
+        ))
+    }
+
+    /// Score every drift requirement of `spec` over the scheduled window of
+    /// `selected` for `tenant`, reading only its frozen records.
     ///
     /// The exact Verifier is the only source of samples: each drift check
     /// reads its declared measurements for the subject, and no requirement is
@@ -692,20 +805,22 @@ impl DriftEngine {
         run: &ClaimedExecution,
         system: PrincipalId,
         spec: &VerifierSpec,
-        window: &DriftWindow,
+        selected: &ScheduleSelector,
         telemetry: &ExecutionTelemetry,
     ) -> Result<DriftChecks, EngineOutcome> {
+        let window = &selected.window;
         let reader = Reader {
             engine: self,
             tenant,
             system,
             run,
             telemetry,
+            observations: ObservationWindow::new(&run.card_uid, window).of(&selected.record_ids),
         };
         let mut checks = DriftChecks::new(Some(*window), BTreeMap::new(), BTreeMap::new());
         for (requirement, check) in spec.drift_checks() {
             let report = reader
-                .score(requirement, &check.spec, window)
+                .score(requirement, &check.spec)
                 .await?
                 .unwrap_or_else(|| {
                     tracing::debug!(
@@ -761,6 +876,8 @@ struct Reader<'a> {
     run: &'a ClaimedExecution,
     /// The execution whose input-read phase this reader records.
     telemetry: &'a ExecutionTelemetry,
+    /// The execution's window over its frozen population.
+    observations: ObservationWindow,
 }
 
 impl Reader<'_> {
@@ -772,10 +889,8 @@ impl Reader<'_> {
         &self,
         requirement: &TaskId,
         spec: &DriftSpec,
-        window: &DriftWindow,
     ) -> Result<Option<DriftReport>, EngineOutcome> {
-        let (run, telemetry) = (self.run, self.telemetry);
-        let window = ObservationWindow::new(&run.card_uid, window);
+        let (run, telemetry, window) = (self.run, self.telemetry, &self.observations);
         let invalid = |message: String| terminal(DRIFT_INVALID, message);
         let scored = |result: Result<DriftReport, DriftScoreError>| {
             result.map(Some).map_err(|error| invalid(error.to_string()))
@@ -1333,6 +1448,55 @@ mod tests {
             "a repeated series row makes its record incomplete"
         );
         assert!(window().incomplete(&[], &[]).is_err());
+    }
+
+    /// The selection lists the window's distinct subject records in order,
+    /// and a frozen population restricts every statement to its records; an
+    /// empty one selects nothing, so a later observation never joins it.
+    #[tokio::test]
+    async fn a_frozen_population_restricts_every_statement() {
+        let uid = subject().to_string();
+        let uid = uid.as_str();
+        let rows = vec![
+            (uid, "x", Some(1.0), None, 0, "r2"),
+            (uid, "c", None, Some("a"), 0, "r2"),
+            (uid, "x", Some(1.0), None, 0, "r1"),
+            ("other", "x", Some(1.0), None, 0, "r3"),
+            (uid, "x", Some(1.0), None, 7200, "r4"),
+        ];
+        let selected: Vec<String> = run(&window().selection(), &rows)
+            .await
+            .iter()
+            .flat_map(|batch| {
+                batch
+                    .column_by_name("record_id")
+                    .expect("record_id column")
+                    .as_string::<i32>()
+                    .iter()
+                    .flatten()
+                    .map(str::to_owned)
+                    .collect::<Vec<_>>()
+            })
+            .collect();
+        assert_eq!(selected, ["r1", "r2"]);
+        let late = vec![(uid, "x", Some(1.0), None, 0, "r9")];
+        let frozen = window()
+            .of(&selected)
+            .incomplete(&["x"], &["c"])
+            .expect("completeness SQL");
+        assert_eq!(
+            incomplete(&frozen, &[rows, late].concat()).await,
+            1,
+            "only r1 omits c"
+        );
+        let invalid = [(uid, "x", None, None, 0, "r1")];
+        let open = window().incomplete(&["x"], &[]).expect("completeness SQL");
+        assert_eq!(incomplete(&open, &invalid).await, 1);
+        let empty = window()
+            .of(&[])
+            .incomplete(&["x"], &[])
+            .expect("completeness SQL");
+        assert_eq!(incomplete(&empty, &invalid).await, 0, "nothing is selected");
     }
 
     /// The Custom aggregate is one row over the window; only a non-empty,

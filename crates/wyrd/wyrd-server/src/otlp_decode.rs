@@ -12,7 +12,7 @@ use wyrd_tonic::otlp::trace::v1::{ResourceSpans, ScopeSpans, Span, Status, span}
 use wyrd_tonic::otlp::trace_service::ExportTraceServiceRequest;
 
 /// Maximum deprecated protobuf group nesting accepted by the bounded scanner.
-const MAX_WIRE_GROUP_DEPTH: usize = 8;
+pub(crate) const MAX_WIRE_GROUP_DEPTH: usize = 8;
 
 /// Exact adapter facts established without constructing generated messages.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -238,7 +238,7 @@ impl TraceWireFacts {
 
 /// One parsed protobuf field borrowing its original wire storage.
 #[derive(Clone, Copy, Debug)]
-enum WireValue<'a> {
+pub(crate) enum WireValue<'a> {
     /// Varint field value.
     Varint(u64),
     /// Fixed-width 64-bit value.
@@ -253,18 +253,18 @@ enum WireValue<'a> {
 
 /// Non-materializing protobuf cursor over one message body.
 #[derive(Debug)]
-struct WireFields<'a> {
+pub(crate) struct WireFields<'a> {
     /// Complete borrowed message bytes.
     bytes: &'a [u8],
     /// Next unread byte offset.
-    cursor: usize,
+    pub(crate) cursor: usize,
     /// Maximum deprecated-group nesting accepted by this cursor.
     group_depth_limit: usize,
 }
 
 impl<'a> WireFields<'a> {
     /// Creates a cursor without allocating or copying the message.
-    fn new(bytes: &'a [u8]) -> Self {
+    pub(crate) fn new(bytes: &'a [u8]) -> Self {
         Self {
             bytes,
             cursor: 0,
@@ -273,7 +273,7 @@ impl<'a> WireFields<'a> {
     }
 
     /// Creates a cursor using an operator-lowered group-depth ceiling.
-    fn with_group_depth(bytes: &'a [u8], group_depth_limit: usize) -> Self {
+    pub(crate) fn with_group_depth(bytes: &'a [u8], group_depth_limit: usize) -> Self {
         Self {
             bytes,
             cursor: 0,
@@ -287,7 +287,7 @@ impl<'a> WireFields<'a> {
     ///
     /// Returns the stable malformed-request error for invalid tags, wire
     /// types, varints, lengths, or truncated fixed-width values.
-    fn next(&mut self) -> Result<Option<(u32, WireValue<'a>)>, IngestError> {
+    pub(crate) fn next(&mut self) -> Result<Option<(u32, WireValue<'a>)>, IngestError> {
         if self.cursor == self.bytes.len() {
             return Ok(None);
         }
@@ -323,13 +323,21 @@ impl<'a> WireFields<'a> {
         Ok(Some((tag, value)))
     }
 
-    /// Reads one canonical protobuf varint from the current cursor.
+    /// Reads one canonical protobuf varint from the current cursor. A
+    /// single-byte varint, the common case for tags and short lengths,
+    /// returns before the general loop.
     ///
     /// # Errors
     ///
     /// Returns the stable malformed-request error for truncation or a value
     /// wider than ten bytes.
-    fn read_varint(&mut self) -> Result<u64, IngestError> {
+    pub(crate) fn read_varint(&mut self) -> Result<u64, IngestError> {
+        if let Some(&byte) = self.bytes.get(self.cursor)
+            && byte < 0x80
+        {
+            self.cursor += 1;
+            return Ok(u64::from(byte));
+        }
         let mut value = 0_u64;
         for shift in (0..70).step_by(7) {
             let byte = *self
@@ -880,13 +888,108 @@ pub(crate) fn decode_trace_protobuf(
     Ok(ExportTraceServiceRequest { resource_spans })
 }
 
+/// One message's first decode pass: for each field tag below `N`, how often
+/// it occurs as a length-delimited value and its last such body.
+///
+/// Decoding a message takes this pass and then one pass over its fields that
+/// validates every known field's wire type, sets scalars, and pushes repeated
+/// children into vectors sized from [`Self::count`]. A singular string or
+/// message keeps protobuf's last-wins rule through [`Self::last`], and a
+/// singular message occurring once decodes from its one body; one repeated
+/// across occurrences merges through its multi-pass fallback.
+pub(crate) struct Scanned<'a, const N: usize> {
+    /// The scanned message bytes.
+    bytes: &'a [u8],
+    /// Length-delimited occurrences per tag.
+    counts: [usize; N],
+    /// Final length-delimited body per tag.
+    last: [Option<&'a [u8]>; N],
+}
+
+impl<'a, const N: usize> Scanned<'a, N> {
+    /// Scans `bytes` once.
+    ///
+    /// # Errors
+    ///
+    /// Returns a malformed-request error for invalid framing or count
+    /// overflow.
+    pub(crate) fn of(bytes: &'a [u8]) -> Result<Self, IngestError> {
+        let mut scanned = Self {
+            bytes,
+            counts: [0; N],
+            last: [None; N],
+        };
+        let mut fields = WireFields::new(bytes);
+        while let Some((tag, value)) = fields.next()? {
+            let (Some(index), WireValue::Bytes(body)) =
+                (usize::try_from(tag).ok().filter(|index| *index < N), value)
+            else {
+                continue;
+            };
+            scanned.counts[index] = scanned.counts[index]
+                .checked_add(1)
+                .ok_or_else(|| malformed("OTLP repeated-field count overflow"))?;
+            scanned.last[index] = Some(body);
+        }
+        Ok(scanned)
+    }
+
+    /// Length-delimited occurrences of `tag`.
+    pub(crate) fn count(&self, tag: usize) -> usize {
+        self.counts[tag]
+    }
+
+    /// The final length-delimited body of `tag`.
+    pub(crate) fn last(&self, tag: usize) -> Option<&'a [u8]> {
+        self.last[tag]
+    }
+
+    /// The final `tag` text, or empty when absent.
+    ///
+    /// # Errors
+    ///
+    /// Returns a malformed-request error when it is not UTF-8.
+    pub(crate) fn string(&self, tag: usize) -> Result<String, IngestError> {
+        Ok(self
+            .last(tag)
+            .map(fixed_string)
+            .transpose()?
+            .unwrap_or_default())
+    }
+
+    /// The final `tag` bytes, or empty when absent.
+    pub(crate) fn owned_bytes(&self, tag: usize) -> Vec<u8> {
+        self.last(tag).map_or_else(Vec::new, fixed_bytes)
+    }
+
+    /// The singular message `tag`: absent, decoded by `single` from its one
+    /// body, or merged across every occurrence by `merged`.
+    ///
+    /// # Errors
+    ///
+    /// Returns the decoder's malformed-request error.
+    pub(crate) fn singular<T>(
+        &self,
+        tag: u32,
+        single: impl FnOnce(&'a [u8]) -> Result<T, IngestError>,
+        merged: impl FnOnce(&'a [u8], u32) -> Result<Option<T>, IngestError>,
+    ) -> Result<Option<T>, IngestError> {
+        let index = usize::try_from(tag).unwrap_or(usize::MAX);
+        match (self.counts[index], self.last[index]) {
+            (0, _) => Ok(None),
+            (1, Some(body)) => single(body).map(Some),
+            _ => merged(self.bytes, tag),
+        }
+    }
+}
+
 /// Counts repeated length-delimited messages without retaining descriptors.
 ///
 /// # Errors
 ///
 /// Returns a malformed-request error for invalid framing, a wrong known wire
 /// type, or cardinality overflow.
-fn repeated_message_count(bytes: &[u8], wanted_tag: u32) -> Result<usize, IngestError> {
+pub(crate) fn repeated_message_count(bytes: &[u8], wanted_tag: u32) -> Result<usize, IngestError> {
     let mut count = 0_usize;
     let mut fields = WireFields::new(bytes);
     while let Some((tag, value)) = fields.next()? {
@@ -908,7 +1011,10 @@ fn repeated_message_count(bytes: &[u8], wanted_tag: u32) -> Result<usize, Ingest
 ///
 /// Returns a malformed-request error for invalid framing or a wrong known wire
 /// type.
-fn last_bytes_field(bytes: &[u8], wanted_tag: u32) -> Result<Option<&[u8]>, IngestError> {
+pub(crate) fn last_bytes_field(
+    bytes: &[u8],
+    wanted_tag: u32,
+) -> Result<Option<&[u8]>, IngestError> {
     let mut retained = None;
     let mut fields = WireFields::new(bytes);
     while let Some((tag, value)) = fields.next()? {
@@ -928,7 +1034,7 @@ fn last_bytes_field(bytes: &[u8], wanted_tag: u32) -> Result<Option<&[u8]>, Inge
 ///
 /// Returns a malformed-request error for invalid parent/child framing or wire
 /// types.
-fn last_bytes_across_messages(
+pub(crate) fn last_bytes_across_messages(
     bytes: &[u8],
     parent_tag: u32,
     child_tag: u32,
@@ -983,7 +1089,7 @@ fn repeated_count_across_messages(
 /// # Errors
 ///
 /// Returns a malformed-request error when the bytes are not valid UTF-8.
-fn fixed_string(bytes: &[u8]) -> Result<String, IngestError> {
+pub(crate) fn fixed_string(bytes: &[u8]) -> Result<String, IngestError> {
     let text = std::str::from_utf8(bytes).map_err(|_| malformed("invalid protobuf string"))?;
     let mut value = String::with_capacity(bytes.len());
     value.push_str(text);
@@ -991,26 +1097,26 @@ fn fixed_string(bytes: &[u8]) -> Result<String, IngestError> {
 }
 
 /// Copies bytes into a vector whose capacity is exactly the wire length.
-fn fixed_bytes(bytes: &[u8]) -> Vec<u8> {
+pub(crate) fn fixed_bytes(bytes: &[u8]) -> Vec<u8> {
     let mut value = Vec::with_capacity(bytes.len());
     value.extend_from_slice(bytes);
     value
 }
 
 /// Applies protobuf's low-32-bit unsigned varint conversion without a cast.
-fn protobuf_u32(value: u64) -> u32 {
+pub(crate) fn protobuf_u32(value: u64) -> u32 {
     let bytes = value.to_le_bytes();
     u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]])
 }
 
 /// Applies protobuf's low-32-bit signed varint conversion without a cast.
-fn protobuf_i32(value: u64) -> i32 {
+pub(crate) fn protobuf_i32(value: u64) -> i32 {
     let bytes = value.to_le_bytes();
     i32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]])
 }
 
 /// Reinterprets one protobuf signed varint's complete two's-complement bits.
-fn protobuf_i64(value: u64) -> i64 {
+pub(crate) fn protobuf_i64(value: u64) -> i64 {
     i64::from_le_bytes(value.to_le_bytes())
 }
 
@@ -1020,13 +1126,10 @@ fn protobuf_i64(value: u64) -> i64 {
 ///
 /// Returns a malformed-request error for invalid framing or known wire types.
 fn decode_resource_spans(bytes: &[u8]) -> Result<ResourceSpans, IngestError> {
-    let resource = decode_merged_resource(bytes, 1)?;
-    let scope_count = repeated_message_count(bytes, 2)?;
-    let mut scope_spans = Vec::with_capacity(scope_count);
-    let schema_url = last_bytes_field(bytes, 3)?
-        .map(fixed_string)
-        .transpose()?
-        .unwrap_or_default();
+    let scanned = Scanned::<4>::of(bytes)?;
+    let resource = scanned.singular(1, decode_resource, decode_merged_resource)?;
+    let mut scope_spans = Vec::with_capacity(scanned.count(2));
+    let schema_url = scanned.string(3)?;
     let mut fields = WireFields::new(bytes);
     while let Some((tag, value)) = fields.next()? {
         match (tag, value) {
@@ -1043,12 +1146,31 @@ fn decode_resource_spans(bytes: &[u8]) -> Result<ResourceSpans, IngestError> {
     })
 }
 
+/// Constructs one resource from its single encoded occurrence.
+///
+/// # Errors
+///
+/// Returns a malformed-request error for invalid framing or known wire types.
+pub(crate) fn decode_resource(bytes: &[u8]) -> Result<Resource, IngestError> {
+    let scanned = Scanned::<4>::of(bytes)?;
+    let mut resource = Resource {
+        attributes: Vec::with_capacity(scanned.count(1)),
+        entity_refs: Vec::with_capacity(scanned.count(3)),
+        ..Resource::default()
+    };
+    merge_resource(bytes, &mut resource)?;
+    Ok(resource)
+}
+
 /// Merges every occurrence of one singular resource message into one value.
 ///
 /// # Errors
 ///
 /// Returns a malformed-request error for invalid framing or known wire types.
-fn decode_merged_resource(bytes: &[u8], wanted_tag: u32) -> Result<Option<Resource>, IngestError> {
+pub(crate) fn decode_merged_resource(
+    bytes: &[u8],
+    wanted_tag: u32,
+) -> Result<Option<Resource>, IngestError> {
     let (occurrences, attribute_count) = repeated_count_across_messages(bytes, wanted_tag, 1)?;
     if occurrences == 0 {
         return Ok(None);
@@ -1098,18 +1220,11 @@ fn merge_resource(bytes: &[u8], resource: &mut Resource) -> Result<(), IngestErr
 ///
 /// Returns a malformed-request error for invalid framing, UTF-8, or wire types.
 fn decode_entity_ref(bytes: &[u8]) -> Result<EntityRef, IngestError> {
-    let id_count = repeated_message_count(bytes, 3)?;
-    let description_count = repeated_message_count(bytes, 4)?;
-    let schema_url = last_bytes_field(bytes, 1)?
-        .map(fixed_string)
-        .transpose()?
-        .unwrap_or_default();
-    let r#type = last_bytes_field(bytes, 2)?
-        .map(fixed_string)
-        .transpose()?
-        .unwrap_or_default();
-    let mut id_keys = Vec::with_capacity(id_count);
-    let mut description_keys = Vec::with_capacity(description_count);
+    let scanned = Scanned::<5>::of(bytes)?;
+    let schema_url = scanned.string(1)?;
+    let r#type = scanned.string(2)?;
+    let mut id_keys = Vec::with_capacity(scanned.count(3));
+    let mut description_keys = Vec::with_capacity(scanned.count(4));
     let mut fields = WireFields::new(bytes);
     while let Some((tag, value)) = fields.next()? {
         match (tag, value) {
@@ -1134,13 +1249,10 @@ fn decode_entity_ref(bytes: &[u8]) -> Result<EntityRef, IngestError> {
 ///
 /// Returns a malformed-request error for invalid framing or known wire types.
 fn decode_scope_spans(bytes: &[u8]) -> Result<ScopeSpans, IngestError> {
-    let scope = decode_merged_scope(bytes, 1)?;
-    let span_count = repeated_message_count(bytes, 2)?;
-    let mut spans = Vec::with_capacity(span_count);
-    let schema_url = last_bytes_field(bytes, 3)?
-        .map(fixed_string)
-        .transpose()?
-        .unwrap_or_default();
+    let scanned = Scanned::<4>::of(bytes)?;
+    let scope = scanned.singular(1, decode_scope, decode_merged_scope)?;
+    let mut spans = Vec::with_capacity(scanned.count(2));
+    let schema_url = scanned.string(3)?;
     let mut fields = WireFields::new(bytes);
     while let Some((tag, value)) = fields.next()? {
         match (tag, value) {
@@ -1157,12 +1269,29 @@ fn decode_scope_spans(bytes: &[u8]) -> Result<ScopeSpans, IngestError> {
     })
 }
 
+/// Constructs one instrumentation scope from its single encoded occurrence.
+///
+/// # Errors
+///
+/// Returns a malformed-request error for invalid framing, UTF-8, or wire types.
+pub(crate) fn decode_scope(bytes: &[u8]) -> Result<InstrumentationScope, IngestError> {
+    let scanned = Scanned::<5>::of(bytes)?;
+    let mut scope = InstrumentationScope {
+        name: scanned.string(1)?,
+        version: scanned.string(2)?,
+        attributes: Vec::with_capacity(scanned.count(3)),
+        ..InstrumentationScope::default()
+    };
+    merge_scope(bytes, &mut scope)?;
+    Ok(scope)
+}
+
 /// Merges every occurrence of one singular instrumentation scope.
 ///
 /// # Errors
 ///
 /// Returns a malformed-request error for invalid framing, UTF-8, or wire types.
-fn decode_merged_scope(
+pub(crate) fn decode_merged_scope(
     bytes: &[u8],
     wanted_tag: u32,
 ) -> Result<Option<InstrumentationScope>, IngestError> {
@@ -1221,26 +1350,17 @@ fn merge_scope(bytes: &[u8], scope: &mut InstrumentationScope) -> Result<(), Ing
 ///
 /// Returns a malformed-request error for invalid framing, UTF-8, or wire types.
 fn decode_span(bytes: &[u8]) -> Result<Span, IngestError> {
-    let attribute_count = repeated_message_count(bytes, 9)?;
-    let event_count = repeated_message_count(bytes, 11)?;
-    let link_count = repeated_message_count(bytes, 13)?;
-    let status = decode_merged_status(bytes, 15)?;
+    let scanned = Scanned::<17>::of(bytes)?;
     let mut span = Span {
-        trace_id: last_bytes_field(bytes, 1)?.map_or_else(Vec::new, fixed_bytes),
-        span_id: last_bytes_field(bytes, 2)?.map_or_else(Vec::new, fixed_bytes),
-        trace_state: last_bytes_field(bytes, 3)?
-            .map(fixed_string)
-            .transpose()?
-            .unwrap_or_default(),
-        parent_span_id: last_bytes_field(bytes, 4)?.map_or_else(Vec::new, fixed_bytes),
-        name: last_bytes_field(bytes, 5)?
-            .map(fixed_string)
-            .transpose()?
-            .unwrap_or_default(),
-        attributes: Vec::with_capacity(attribute_count),
-        events: Vec::with_capacity(event_count),
-        links: Vec::with_capacity(link_count),
-        status,
+        trace_id: scanned.owned_bytes(1),
+        span_id: scanned.owned_bytes(2),
+        trace_state: scanned.string(3)?,
+        parent_span_id: scanned.owned_bytes(4),
+        name: scanned.string(5)?,
+        attributes: Vec::with_capacity(scanned.count(9)),
+        events: Vec::with_capacity(scanned.count(11)),
+        links: Vec::with_capacity(scanned.count(13)),
+        status: scanned.singular(15, decode_status, decode_merged_status)?,
         ..Span::default()
     };
     let mut fields = WireFields::new(bytes);
@@ -1272,13 +1392,10 @@ fn decode_span(bytes: &[u8]) -> Result<Span, IngestError> {
 ///
 /// Returns a malformed-request error for invalid framing, UTF-8, or wire types.
 fn decode_event(bytes: &[u8]) -> Result<span::Event, IngestError> {
-    let attribute_count = repeated_message_count(bytes, 3)?;
+    let scanned = Scanned::<5>::of(bytes)?;
     let mut event = span::Event {
-        name: last_bytes_field(bytes, 2)?
-            .map(fixed_string)
-            .transpose()?
-            .unwrap_or_default(),
-        attributes: Vec::with_capacity(attribute_count),
+        name: scanned.string(2)?,
+        attributes: Vec::with_capacity(scanned.count(3)),
         ..span::Event::default()
     };
     let mut fields = WireFields::new(bytes);
@@ -1303,15 +1420,12 @@ fn decode_event(bytes: &[u8]) -> Result<span::Event, IngestError> {
 ///
 /// Returns a malformed-request error for invalid framing, UTF-8, or wire types.
 fn decode_link(bytes: &[u8]) -> Result<span::Link, IngestError> {
-    let attribute_count = repeated_message_count(bytes, 4)?;
+    let scanned = Scanned::<7>::of(bytes)?;
     let mut link = span::Link {
-        trace_id: last_bytes_field(bytes, 1)?.map_or_else(Vec::new, fixed_bytes),
-        span_id: last_bytes_field(bytes, 2)?.map_or_else(Vec::new, fixed_bytes),
-        trace_state: last_bytes_field(bytes, 3)?
-            .map(fixed_string)
-            .transpose()?
-            .unwrap_or_default(),
-        attributes: Vec::with_capacity(attribute_count),
+        trace_id: scanned.owned_bytes(1),
+        span_id: scanned.owned_bytes(2),
+        trace_state: scanned.string(3)?,
+        attributes: Vec::with_capacity(scanned.count(4)),
         ..span::Link::default()
     };
     let mut fields = WireFields::new(bytes);
@@ -1359,6 +1473,20 @@ fn decode_merged_status(bytes: &[u8], wanted_tag: u32) -> Result<Option<Status>,
     Ok(Some(status))
 }
 
+/// Constructs one span status from its single encoded occurrence.
+///
+/// # Errors
+///
+/// Returns a malformed-request error for invalid framing, UTF-8, or wire types.
+fn decode_status(bytes: &[u8]) -> Result<Status, IngestError> {
+    let mut status = Status {
+        message: Scanned::<3>::of(bytes)?.string(2)?,
+        ..Status::default()
+    };
+    merge_status(bytes, &mut status)?;
+    Ok(status)
+}
+
 /// Merges one encoded span status into its destination.
 ///
 /// # Errors
@@ -1382,12 +1510,10 @@ fn merge_status(bytes: &[u8], status: &mut Status) -> Result<(), IngestError> {
 /// # Errors
 ///
 /// Returns a malformed-request error for invalid framing, UTF-8, or wire types.
-fn decode_key_value(bytes: &[u8]) -> Result<KeyValue, IngestError> {
-    let value = decode_merged_any_value(bytes, 2)?;
-    let key = last_bytes_field(bytes, 1)?
-        .map(fixed_string)
-        .transpose()?
-        .unwrap_or_default();
+pub(crate) fn decode_key_value(bytes: &[u8]) -> Result<KeyValue, IngestError> {
+    let scanned = Scanned::<3>::of(bytes)?;
+    let value = scanned.singular(2, decode_any_value, decode_merged_any_value)?;
+    let key = scanned.string(1)?;
     let mut fields = WireFields::new(bytes);
     while let Some((tag, wire_value)) = fields.next()? {
         match (tag, wire_value) {
@@ -1401,7 +1527,7 @@ fn decode_key_value(bytes: &[u8]) -> Result<KeyValue, IngestError> {
 
 /// Borrowed encoded bodies that merge into one singular `AnyValue` message.
 #[derive(Clone, Copy)]
-enum AnyValueBodies<'a> {
+pub(crate) enum AnyValueBodies<'a> {
     /// One ordinary array element body.
     Single(&'a [u8]),
     /// Repeated singular-message occurrences inside a parent message.
@@ -1420,7 +1546,7 @@ impl AnyValueBodies<'_> {
     ///
     /// Returns a malformed-request error for parent framing or a wrong outer
     /// wire type, or propagates an error returned by `visitor`.
-    fn try_for_each(
+    pub(crate) fn try_for_each(
         self,
         mut visitor: impl FnMut(&[u8]) -> Result<(), IngestError>,
     ) -> Result<usize, IngestError> {
@@ -1451,13 +1577,13 @@ impl AnyValueBodies<'_> {
 
 /// Final oneof run selected across merged `AnyValue` message occurrences.
 #[derive(Clone, Copy, Default)]
-struct AnyValueSelection {
+pub(crate) struct AnyValueSelection {
     /// Selected oneof field tag, or zero for an empty value.
-    tag: u32,
+    pub(crate) tag: u32,
     /// Ordinal of the first field in the final same-variant merge run.
-    run_start: usize,
+    pub(crate) run_start: usize,
     /// Repeated nested elements contributed by that final message run.
-    nested_count: usize,
+    pub(crate) nested_count: usize,
 }
 
 /// Constructs one recursive OTLP value with fixed nested collection capacity.
@@ -1465,7 +1591,7 @@ struct AnyValueSelection {
 /// # Errors
 ///
 /// Returns a malformed-request error for invalid framing, UTF-8, or wire types.
-fn decode_any_value(bytes: &[u8]) -> Result<AnyValue, IngestError> {
+pub(crate) fn decode_any_value(bytes: &[u8]) -> Result<AnyValue, IngestError> {
     decode_any_value_bodies(AnyValueBodies::Single(bytes))
 }
 
@@ -1474,7 +1600,10 @@ fn decode_any_value(bytes: &[u8]) -> Result<AnyValue, IngestError> {
 /// # Errors
 ///
 /// Returns a malformed-request error for invalid framing, UTF-8, or wire types.
-fn decode_merged_any_value(bytes: &[u8], wanted_tag: u32) -> Result<Option<AnyValue>, IngestError> {
+pub(crate) fn decode_merged_any_value(
+    bytes: &[u8],
+    wanted_tag: u32,
+) -> Result<Option<AnyValue>, IngestError> {
     let bodies = AnyValueBodies::Repeated {
         parent: bytes,
         tag: wanted_tag,
@@ -1492,7 +1621,9 @@ fn decode_merged_any_value(bytes: &[u8], wanted_tag: u32) -> Result<Option<AnyVa
 ///
 /// Returns a malformed-request error for invalid framing, wire types, or
 /// cardinality overflow.
-fn select_any_value_bodies(bodies: AnyValueBodies<'_>) -> Result<AnyValueSelection, IngestError> {
+pub(crate) fn select_any_value_bodies(
+    bodies: AnyValueBodies<'_>,
+) -> Result<AnyValueSelection, IngestError> {
     let mut selection = AnyValueSelection::default();
     let mut ordinal = 0_usize;
     bodies.try_for_each(|body| {
@@ -1590,7 +1721,7 @@ fn decode_any_value_bodies(bodies: AnyValueBodies<'_>) -> Result<AnyValue, Inges
 /// # Errors
 ///
 /// Returns a malformed-request error when `value` has the wrong wire type.
-fn validate_any_value_wire(tag: u32, value: WireValue<'_>) -> Result<(), IngestError> {
+pub(crate) fn validate_any_value_wire(tag: u32, value: WireValue<'_>) -> Result<(), IngestError> {
     if matches!(
         (tag, value),
         (1 | 5 | 6 | 7, WireValue::Bytes(_))
@@ -1638,12 +1769,12 @@ fn merge_key_value_list(bytes: &[u8], value: &mut KeyValueList) -> Result<(), In
 }
 
 /// Constructs the stable malformed error for a known field's wire mismatch.
-fn wrong_wire(field: &str) -> IngestError {
+pub(crate) fn wrong_wire(field: &str) -> IngestError {
     malformed(&format!("invalid protobuf wire type for {field}"))
 }
 
 /// Constructs the existing stable malformed OTLP refusal.
-fn malformed(message: &str) -> IngestError {
+pub(crate) fn malformed(message: &str) -> IngestError {
     IngestError::Decode(message.to_owned())
 }
 
@@ -1986,6 +2117,40 @@ mod tests {
             u64::try_from(message.len()).expect("invariant: encoded length fits u64"),
         );
         bytes.extend_from_slice(message);
+    }
+
+    /// Varints read the value prost encodes and advance past it at the one-
+    /// and multi-byte boundaries, and truncation, an eleventh byte, and a
+    /// tenth-byte overflow stay malformed.
+    ///
+    /// # Panics
+    /// Panics when a value, cursor, or refusal differs.
+    #[test]
+    fn varints_read_boundaries_and_refuse_malformed_input() {
+        for value in [
+            0,
+            1,
+            0x7f,
+            0x80,
+            0x3fff,
+            0x4000,
+            u64::from(u32::MAX),
+            u64::MAX,
+        ] {
+            let mut bytes = Vec::new();
+            push_varint(&mut bytes, value);
+            bytes.push(0x2a);
+            let mut fields = WireFields::new(&bytes);
+            assert_eq!(fields.read_varint().expect("canonical varint"), value);
+            assert_eq!(fields.cursor, bytes.len() - 1, "{value}");
+        }
+        let mut overflow = vec![0xff; 9];
+        overflow.push(0x02);
+        let mut eleven = vec![0x80; 10];
+        eleven.push(0x00);
+        for bytes in [&[][..], &[0x80][..], &overflow, &eleven] {
+            assert!(WireFields::new(bytes).read_varint().is_err(), "{bytes:?}");
+        }
     }
 
     /// Proves trace preflight derives typed capacity without decoding.
@@ -2346,6 +2511,55 @@ mod tests {
         assert_eq!(decoded_request, expected_request);
         assert_eq!(plan.decode_bytes, decoded_trace_capacity(&decoded_request));
         assert_fixed_trace_capacity(&decoded_request);
+    }
+
+    /// Repeated singular strings keep the last value as prost does, and a
+    /// singular string or message field sent with a non-length-delimited
+    /// wire type is refused.
+    ///
+    /// # Panics
+    ///
+    /// Panics when a duplicate decodes differently from prost or a wrong wire
+    /// type decodes.
+    #[test]
+    fn trace_fixed_decode_keeps_last_strings_and_refuses_wrong_wire_types() {
+        let mut span_wire = Span {
+            name: "first".to_owned(),
+            ..Span::default()
+        }
+        .encode_to_vec();
+        span_wire.extend(
+            Span {
+                name: "retained".to_owned(),
+                trace_state: "state".to_owned(),
+                ..Span::default()
+            }
+            .encode_to_vec(),
+        );
+        let decoded = decode_span(&span_wire).expect("duplicate span strings must decode");
+        assert_eq!(
+            decoded,
+            Span::decode(span_wire.as_slice()).expect("prost must decode duplicates")
+        );
+        assert_eq!(decoded.name, "retained");
+
+        for tag in [5_u64, 15] {
+            let mut wire = Vec::new();
+            push_varint(&mut wire, tag << 3);
+            push_varint(&mut wire, 1);
+            assert!(
+                decode_span(&wire).is_err(),
+                "span tag {tag} varint must be refused"
+            );
+        }
+        let mut key_value_wire = Vec::new();
+        push_varint(&mut key_value_wire, 2 << 3);
+        push_varint(&mut key_value_wire, 1);
+        assert!(decode_key_value(&key_value_wire).is_err());
+        let mut resource_wire = Vec::new();
+        push_varint(&mut resource_wire, 1 << 3);
+        push_varint(&mut resource_wire, 1);
+        assert!(decode_resource_spans(&resource_wire).is_err());
     }
 
     /// Proves unknown groups are bounded by the fixed scanner depth.

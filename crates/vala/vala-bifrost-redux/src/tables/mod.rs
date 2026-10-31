@@ -33,17 +33,18 @@ pub mod logs;
 pub mod managed_columns;
 pub mod metrics;
 pub mod signal;
+pub mod staged;
 pub mod traces;
 pub mod verification;
 
 pub use audit::AuditLogTable;
 pub use drift::ObservationsTable;
-pub use drift::{ObservationsTable as DriftObservationsTable, ResultFeaturesTable};
+pub use drift::ObservationsTable as DriftObservationsTable;
 pub use gateway::CallsTable;
 pub use logs::RecordsTable;
 pub use metrics::PointsTable;
 pub use traces::SpansTable;
-pub use verification::{ExecutionInputsTable, ResultsTable};
+pub use verification::{ExecutionInputsTable, ExecutionOutputsTable, ResultsTable};
 
 /// Errors from pure table schema and projection operations.
 #[derive(Debug, Error)]
@@ -525,8 +526,7 @@ fn validate_variant_values(
         let (Some(metadata), Some(value)) = (child("metadata"), child("value")) else {
             return Err(malformed());
         };
-        return EncodedVariant::from_bytes(metadata, value)
-            .map(drop)
+        return EncodedVariant::validate_bytes(metadata, value)
             .map_err(|violation| violation.into_error(label, row));
     }
     match declared.data_type() {
@@ -1283,7 +1283,7 @@ pub static BUILTIN_TABLES: [BuiltinTableDefinition; 9] = [
     definition::<DriftObservationsTable>(),
     definition::<ResultsTable>(),
     definition::<ExecutionInputsTable>(),
-    definition::<ResultFeaturesTable>(),
+    definition::<ExecutionOutputsTable>(),
     definition::<AuditLogTable>(),
     definition::<CallsTable>(),
 ];
@@ -1495,10 +1495,10 @@ mod tests {
                             "group_id",
                         ],
                     ),
-                    ("drift", "result_features") => (
-                        WYRD_INGESTED_AT,
+                    ("verification", "execution_outputs") => (
+                        "ended_at",
                         PartitionTransformWire::Day,
-                        &["result_id"],
+                        &["result_id", "execution_id"],
                     ),
                     ("system", "audit_log") => ("created_at", PartitionTransformWire::Day, &[]),
                     _ => panic!("{fqn} declares no pinned time column"),
@@ -1619,6 +1619,7 @@ mod tests {
                     utf8("verifier_card_uid", false),
                     utf8("binding_id", true),
                     utf8("group_id", true),
+                    utf8("origin", false),
                     boolean("queue_execution", false),
                     variant_field("inputs", false),
                     variant_field("activation", true),
@@ -1643,20 +1644,13 @@ mod tests {
                 ],
             },
             VerificationContract {
-                namespace: "drift",
-                name: "result_features",
+                namespace: "verification",
+                name: "execution_outputs",
                 columns: vec![
                     utf8("result_id", false),
-                    utf8("requirement_id", false),
-                    utf8("verifier_card_uid", false),
-                    utf8("binding_id", true),
-                    ts_us_utc("window_start", false),
-                    ts_us_utc("window_end", false),
-                    utf8("method", false),
-                    utf8("feature", false),
-                    float64("score", true),
-                    float64("threshold", true),
-                    utf8("verdict", false),
+                    utf8("execution_id", false),
+                    ts_us_utc("ended_at", false),
+                    variant_field("output", false),
                     utf8("service_name", true),
                     utf8("service_version", true),
                     utf8("deployment_environment", true),
@@ -1671,13 +1665,14 @@ mod tests {
                     SUBJECT_CARD_UID,
                     RUN_ID,
                     "result_id",
+                    "execution_id",
                 ],
             },
         ]
     }
 
-    /// The approved contract for `verification.results`, whose generic
-    /// outcome is one required `VerificationOutcome` Variant.
+    /// The approved contract for `verification.results`, the payload-free
+    /// result summary.
     fn verification_results_contract() -> VerificationContract {
         VerificationContract {
             namespace: "verification",
@@ -1696,7 +1691,6 @@ mod tests {
                 ts_us_utc("window_end", true),
                 ts_us_utc("started_at", false),
                 ts_us_utc("ended_at", false),
-                variant_field("outcome", false),
                 utf8("service_name", true),
                 utf8("service_version", true),
                 utf8("deployment_environment", true),
@@ -1749,7 +1743,7 @@ mod tests {
     /// them and dashboards query them — so a reordered, retyped, renamed, or
     /// newly nullable column is a breaking change rather than an
     /// implementation detail. Pinning the whole physical list here, including
-    /// the shared dimensions and the `outcome` Variant, is what makes that break
+    /// the shared dimensions and the Variant payloads, is what makes that break
     /// fail in this crate instead of at a caller's insert.
     ///
     /// # Panics
@@ -3349,7 +3343,7 @@ mod tests {
                     "scope_attributes",
                 ][..],
             ),
-            ("verification", "results", &["outcome"][..]),
+            ("verification", "execution_outputs", &["output"][..]),
             (
                 "verification",
                 "execution_inputs",

@@ -70,3 +70,6 @@ changes/**/review/**/*.diff
 changes/**/review/**/*.patch
 changes/**/review/**/*.tar.gz
 /.wyrd
+
+# Benchmark record history: a worktree of the benchmark-records branch
+benchmarks/history/

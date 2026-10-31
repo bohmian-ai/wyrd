@@ -17,11 +17,10 @@ use wyrd_tonic::otlp::metrics_service::ExportMetricsServiceRequest;
 use wyrd_tonic::otlp::resource::v1::Resource;
 
 use crate::otlp_decode::{
-    GROUP_FAN_OUT, OtlpDecodePlan, ProjectedOutput, RESOURCE_FAN_OUT, enforce_expanded_ceiling,
+    GROUP_FAN_OUT, OtlpDecodePlan, ProjectedOutput, RESOURCE_FAN_OUT, WireFields, WireValue,
+    enforce_expanded_ceiling, fixed_bytes, fixed_string, malformed, protobuf_i32, protobuf_i64,
+    protobuf_u32, validate_any_value_wire, wrong_wire,
 };
-
-/// Maximum deprecated protobuf group nesting accepted by the bounded scanner.
-const MAX_WIRE_GROUP_DEPTH: usize = 8;
 
 /// Bounded allocation facts for one metrics export.
 #[derive(Debug)]
@@ -117,219 +116,6 @@ impl MetricsWireFacts {
             .checked_mul(size_of::<T>())
             .ok_or_else(|| malformed("OTLP metrics primitive capacity overflow"))?;
         self.add_decode_bytes(bytes)
-    }
-}
-
-/// One parsed protobuf field borrowing its original transport bytes.
-#[derive(Clone, Copy, Debug)]
-enum WireValue<'a> {
-    /// Varint field.
-    Varint(u64),
-    /// Little-endian fixed64 field.
-    Fixed64(u64),
-    /// Length-delimited field.
-    Bytes(&'a [u8]),
-    /// Little-endian fixed32 field.
-    Fixed32,
-    /// Validated deprecated group field.
-    Group,
-}
-
-/// Non-materializing cursor over one protobuf message body.
-#[derive(Debug)]
-struct WireFields<'a> {
-    /// Complete borrowed body.
-    bytes: &'a [u8],
-    /// Offset of the next field key.
-    cursor: usize,
-    /// Maximum accepted deprecated-group depth.
-    group_depth_limit: usize,
-}
-
-impl<'a> WireFields<'a> {
-    /// Creates a cursor with the protocol maximum group depth.
-    fn new(bytes: &'a [u8]) -> Self {
-        Self::with_group_depth(bytes, MAX_WIRE_GROUP_DEPTH)
-    }
-
-    /// Creates a cursor using the lower configured group-depth ceiling.
-    fn with_group_depth(bytes: &'a [u8], limit: usize) -> Self {
-        Self {
-            bytes,
-            cursor: 0,
-            group_depth_limit: limit.min(MAX_WIRE_GROUP_DEPTH),
-        }
-    }
-
-    /// Parses the next field and validates its complete framing.
-    ///
-    /// # Errors
-    ///
-    /// Returns a malformed-request error for invalid tags, wire types, lengths,
-    /// varints, fixed fields, or deprecated groups.
-    fn next(&mut self) -> Result<Option<(u32, WireValue<'a>)>, IngestError> {
-        if self.cursor == self.bytes.len() {
-            return Ok(None);
-        }
-        let key = self.read_varint()?;
-        let tag = u32::try_from(key >> 3).map_err(|_| malformed("invalid protobuf tag"))?;
-        if tag == 0 {
-            return Err(malformed("protobuf tag zero is invalid"));
-        }
-        let value = match key & 7 {
-            0 => WireValue::Varint(self.read_varint()?),
-            1 => WireValue::Fixed64(self.read_fixed_u64()?),
-            2 => {
-                let length = usize::try_from(self.read_varint()?)
-                    .map_err(|_| malformed("protobuf length does not fit usize"))?;
-                let end = self
-                    .cursor
-                    .checked_add(length)
-                    .ok_or_else(|| malformed("protobuf length overflow"))?;
-                let bytes = self
-                    .bytes
-                    .get(self.cursor..end)
-                    .ok_or_else(|| malformed("truncated protobuf field"))?;
-                self.cursor = end;
-                WireValue::Bytes(bytes)
-            }
-            3 => {
-                self.skip_group(tag)?;
-                WireValue::Group
-            }
-            5 => {
-                self.read_fixed_u32()?;
-                WireValue::Fixed32
-            }
-            _ => return Err(malformed("unsupported protobuf wire type")),
-        };
-        Ok(Some((tag, value)))
-    }
-
-    /// Reads one protobuf varint.
-    ///
-    /// # Errors
-    ///
-    /// Returns a malformed-request error for truncation or values over ten bytes.
-    fn read_varint(&mut self) -> Result<u64, IngestError> {
-        let mut value = 0_u64;
-        for shift in (0..70).step_by(7) {
-            let byte = *self
-                .bytes
-                .get(self.cursor)
-                .ok_or_else(|| malformed("truncated protobuf varint"))?;
-            self.cursor += 1;
-            if shift == 63 && byte > 1 {
-                return Err(malformed("protobuf varint overflow"));
-            }
-            value |= u64::from(byte & 0x7f) << shift;
-            if byte & 0x80 == 0 {
-                return Ok(value);
-            }
-        }
-        Err(malformed("protobuf varint exceeds ten bytes"))
-    }
-
-    /// Reads one little-endian fixed64 value.
-    ///
-    /// # Errors
-    ///
-    /// Returns a malformed-request error when eight bytes are unavailable.
-    fn read_fixed_u64(&mut self) -> Result<u64, IngestError> {
-        let end = self
-            .cursor
-            .checked_add(8)
-            .ok_or_else(|| malformed("fixed64 overflow"))?;
-        let bytes: [u8; 8] = self
-            .bytes
-            .get(self.cursor..end)
-            .ok_or_else(|| malformed("truncated protobuf fixed64"))?
-            .try_into()
-            .map_err(|_| malformed("invalid protobuf fixed64"))?;
-        self.cursor = end;
-        Ok(u64::from_le_bytes(bytes))
-    }
-
-    /// Reads one little-endian fixed32 value.
-    ///
-    /// # Errors
-    ///
-    /// Returns a malformed-request error when four bytes are unavailable.
-    fn read_fixed_u32(&mut self) -> Result<u32, IngestError> {
-        let end = self
-            .cursor
-            .checked_add(4)
-            .ok_or_else(|| malformed("fixed32 overflow"))?;
-        let bytes: [u8; 4] = self
-            .bytes
-            .get(self.cursor..end)
-            .ok_or_else(|| malformed("truncated protobuf fixed32"))?
-            .try_into()
-            .map_err(|_| malformed("invalid protobuf fixed32"))?;
-        self.cursor = end;
-        Ok(u32::from_le_bytes(bytes))
-    }
-
-    /// Skips one deprecated group using a fixed stack.
-    ///
-    /// # Errors
-    ///
-    /// Returns a malformed-request error for mismatched, unterminated, or too-deep groups.
-    fn skip_group(&mut self, group_tag: u32) -> Result<(), IngestError> {
-        let mut stack = [0_u32; MAX_WIRE_GROUP_DEPTH];
-        if self.group_depth_limit == 0 {
-            return Err(malformed("protobuf group depth exceeded"));
-        }
-        stack[0] = group_tag;
-        let mut depth = 1_usize;
-        while depth != 0 {
-            let key = self.read_varint()?;
-            let tag = u32::try_from(key >> 3).map_err(|_| malformed("invalid group tag"))?;
-            if tag == 0 {
-                return Err(malformed("protobuf group tag zero is invalid"));
-            }
-            match key & 7 {
-                3 => {
-                    if depth >= self.group_depth_limit {
-                        return Err(malformed("protobuf group depth exceeded"));
-                    }
-                    stack[depth] = tag;
-                    depth += 1;
-                }
-                4 => {
-                    if stack[depth - 1] != tag {
-                        return Err(malformed("mismatched protobuf end group"));
-                    }
-                    depth -= 1;
-                }
-                wire_type => self.skip_value(wire_type)?,
-            }
-        }
-        Ok(())
-    }
-
-    /// Skips one non-group protobuf value.
-    ///
-    /// # Errors
-    ///
-    /// Returns a malformed-request error for invalid or truncated values.
-    fn skip_value(&mut self, wire_type: u64) -> Result<(), IngestError> {
-        match wire_type {
-            0 => self.read_varint().map(|_| ()),
-            1 => self.read_fixed_u64().map(|_| ()),
-            2 => {
-                let length = usize::try_from(self.read_varint()?)
-                    .map_err(|_| malformed("protobuf length does not fit usize"))?;
-                self.cursor = self
-                    .cursor
-                    .checked_add(length)
-                    .filter(|end| *end <= self.bytes.len())
-                    .ok_or_else(|| malformed("truncated protobuf field"))?;
-                Ok(())
-            }
-            5 => self.read_fixed_u32().map(|_| ()),
-            _ => Err(malformed("unsupported protobuf wire type in group")),
-        }
     }
 }
 
@@ -976,24 +762,6 @@ fn select_any_value_bodies(bodies: MessageBodies<'_>) -> Result<OneofSelection, 
         Ok(())
     })?;
     Ok(selection)
-}
-
-/// Validates the generated wire type for one `AnyValue` variant.
-///
-/// # Errors
-///
-/// Returns a malformed-request error for a wrong wire type.
-fn validate_any_value_wire(tag: u32, value: WireValue<'_>) -> Result<(), IngestError> {
-    if matches!(
-        (tag, value),
-        (1 | 5 | 6 | 7, WireValue::Bytes(_))
-            | (2 | 3, WireValue::Varint(_))
-            | (4, WireValue::Fixed64(_))
-    ) {
-        Ok(())
-    } else {
-        Err(wrong_wire("OTLP any value"))
-    }
 }
 
 /// Constructs a metrics request using only capacities proven by `plan`.
@@ -1861,25 +1629,6 @@ fn decode_last_bytes(bytes: &[u8], tag: u32) -> Result<Vec<u8>, IngestError> {
     Ok(last_bytes_field(bytes, tag)?.map_or_else(Vec::new, fixed_bytes))
 }
 
-/// Copies UTF-8 bytes into a string with exact capacity.
-///
-/// # Errors
-///
-/// Returns a malformed-request error when the bytes are not valid UTF-8.
-fn fixed_string(bytes: &[u8]) -> Result<String, IngestError> {
-    let text = std::str::from_utf8(bytes).map_err(|_| malformed("invalid protobuf string"))?;
-    let mut value = String::with_capacity(bytes.len());
-    value.push_str(text);
-    Ok(value)
-}
-
-/// Copies bytes into a vector with exact capacity.
-fn fixed_bytes(bytes: &[u8]) -> Vec<u8> {
-    let mut value = Vec::with_capacity(bytes.len());
-    value.extend_from_slice(bytes);
-    value
-}
-
 /// Counts fixed64 values across packed and unpacked occurrences.
 ///
 /// # Errors
@@ -2009,23 +1758,6 @@ fn extend_varints(bytes: &[u8], values: &mut Vec<u64>) -> Result<(), IngestError
     Ok(())
 }
 
-/// Applies protobuf's low-32-bit unsigned varint conversion.
-fn protobuf_u32(value: u64) -> u32 {
-    let bytes = value.to_le_bytes();
-    u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]])
-}
-
-/// Applies protobuf's low-32-bit signed varint conversion.
-fn protobuf_i32(value: u64) -> i32 {
-    let bytes = value.to_le_bytes();
-    i32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]])
-}
-
-/// Reinterprets a signed fixed64/varint's two's-complement bits.
-fn protobuf_i64(value: u64) -> i64 {
-    i64::from_le_bytes(value.to_le_bytes())
-}
-
 /// Decodes a protobuf zig-zag signed 32-bit value.
 fn decode_zigzag_i32(value: u64) -> i32 {
     let low = protobuf_u32(value);
@@ -2034,19 +1766,10 @@ fn decode_zigzag_i32(value: u64) -> i32 {
     i32::from_le_bytes((magnitude ^ sign).to_le_bytes())
 }
 
-/// Constructs a stable wrong-wire-type refusal for a known field.
-fn wrong_wire(field: &str) -> IngestError {
-    malformed(&format!("invalid protobuf wire type for {field}"))
-}
-
-/// Constructs the existing stable malformed OTLP refusal.
-fn malformed(message: &str) -> IngestError {
-    IngestError::Decode(message.to_owned())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::otlp_decode::MAX_WIRE_GROUP_DEPTH;
     use vala_bifrost_redux::gate::limits::OTLP_WIRE_LIMITS;
     use wyrd_tonic::prost::Message;
 

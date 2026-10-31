@@ -1,527 +1,867 @@
-//! AI gateway overhead benchmark.
+//! AI gateway benchmark experiments: L1 `overhead` and L2 `capacity`.
 //!
-//! Reads as the production journey it measures. An operator starts one
+//! Both read as the production journey they measure. An operator starts one
 //! release `wyrd-server` through the local-development guide (`migrate`,
-//! serve, `setup`) on the whole host; the report title carries the host
-//! fingerprint and build identity, so compare only reports from matching
-//! hosts. The tenant administrator configures `openai_compatible`
-//! deployments against a local upstream, an explicit capture policy, and one
-//! machine principal per client; every call is raw HTTP/1.1 keep-alive
-//! `POST /v1/chat/completions` with a `wyrd_sk_` key, timed until the
-//! complete answer is validated. All evidence comes from client timings,
-//! `/metrics`, and the OS's readings of the server process.
+//! serve, `setup`) as a plain child process. The tenant administrator
+//! configures `openai_compatible` deployments against a local upstream, an
+//! explicit capture policy, and one machine principal per caller; every call
+//! is raw HTTP/1.1 keep-alive `POST /v1/chat/completions` with a `wyrd_sk_`
+//! key, timed until the complete answer is validated. All evidence comes from
+//! client timings, `/metrics`, tenant capture reads, and the OS's readings of
+//! the server process.
 //!
-//! `gateway-overhead` runs [`Case`]s, each selectable with `--case 1,2,3`,
-//! at each client count of its matrix that `--clients 1,4,16,64` keeps:
+//! - L1 `overhead` ([`run`]): closed-loop clients at 1 and 64 for each
+//!   [`Case`] against an instant upstream. The server's added overhead
+//!   (arrival to handoff, less the provider exchange) p99 must be strictly
+//!   under 0.5 ms at 64 clients at every applicable handoff point; every
+//!   step needs zero refused or invalid answers, one staged capture per
+//!   arrival, no drop, no loss, no shedding, and a bounded drain.
+//! - L2 `capacity` ([`capacity`]): one open-loop step whose every repetition
+//!   runs capacity → overload → recovery against a paced upstream with four
+//!   contending tenants, judging completion, first token, chunk lag, and full
+//!   stream p99 against declared SLOs in capacity and recovery, only declared
+//!   admission refusals in overload, bounded backlog and drain, and capture
+//!   accounting throughout.
 //!
-//! 1. `chat`: about 1 KiB in, a 1 KiB buffered answer, metadata capture.
-//! 2. `chat-stream`: the same request streamed, 32 data events then
-//!    `[DONE]`, metadata capture.
-//! 3. `chat-capture`: 64 KiB in and out, request and response payload
-//!    capture, at 16 and 64 clients.
-//!
-//! The upstream answers instantly, so each row judges the server's own
-//! overhead (arrival to handoff, less the provider exchange) p99 strictly
-//! under 1 ms at every handoff point, beside client roundtrip percentiles,
-//! capture integrity, a bounded drain, and a loss-free shutdown.
-//!
-//! Run through `mise run bench:gateway:overhead`. Every window is recorded
-//! with `perf` under `profiles/` unless `--no-profile`, and prints the
-//! runtime component Pareto, the CPU Pareto by crate, and the off-CPU stacks
-//! as it ends. The report, raw samples (`samples.jsonl`), and server log
-//! land in `target/gateway-overhead/`; each row prints as it is judged.
-//! Exits nonzero when any row fails.
+//! Each module declares its experiment here and drives it through the shared
+//! lifecycle in `wyrd_testing::experiment`, which owns repetitions, validity,
+//! judgment, the record, and the report.
 
-mod capacity;
-mod envelope;
-mod report;
-mod run;
-mod workload;
+pub mod capacity;
+pub mod run;
+pub mod workload;
 
-use std::path::{Path, PathBuf};
-use std::process::ExitCode;
-use std::sync::Arc;
+use std::collections::BTreeMap;
+use std::path::Path;
 
-use capacity::{KEYS_PER_TENANT, Load, MAX_IN_FLIGHT, PACING, RATES, Slo, TENANTS};
-use envelope::{CAPACITY_HEADER, envelope};
-use report::{OVERHEAD_HEADER, Report, Shutdown, Verdict};
-use run::{Bench, Profiler, WARMUP, WINDOW, settle};
-use wiremock::matchers::{method, path};
-use wiremock::{Mock, MockServer, ResponseTemplate};
-use workload::{CapturePolicy, Shape, Tenant};
-use wyrd_testing::capacity::{binary_identity, install_tracing, release_binary};
-use wyrd_testing::gateway_capture::{GatewayCapture, PacedUpstream};
-use wyrd_testing::release_server::{LocalServer, Placement};
+use serde_json::{Value, json};
+use wyrd_testing::experiment::{
+    Criterion, Declaration, Derive, Direction, Engine, Level, Metric, Op, Step,
+};
+use wyrd_testing::release_server::LocalServer;
 
-/// Error type of every benchmark step: the binary only reports it.
-type Result<T> = std::result::Result<T, Box<dyn std::error::Error + Send + Sync>>;
+use crate::levels::{Context, Plan};
+use capacity::{
+    ADMISSION_REFUSALS, KEYS_PER_TENANT, MAX_IN_FLIGHT, MISS_AFTER, OVERLOAD_FACTOR, PACING,
+    RECOVERY_GRACE, Slo, TENANTS,
+};
+use workload::CapturePolicy;
 
-/// Every client count any case runs at.
-const CLIENTS: [usize; 4] = [1, 4, 16, 64];
+/// Error type of every workload step; the shared lifecycle records it.
+pub type Result<T> = std::result::Result<T, Box<dyn std::error::Error + Send + Sync>>;
 
-/// Where the overhead report, samples, profiles, and server log land.
-const OUTPUT: &str = "target/gateway-overhead";
+/// Every client count an L1 case runs at.
+pub const CLIENTS: [usize; 2] = [1, 64];
 
-/// Where the capacity report, samples, profiles, and server log land.
-const CAPACITY_OUTPUT: &str = "target/gateway-capacity";
+/// The client count the fixed overhead SLO applies at.
+pub const SLO_CLIENTS: usize = 64;
 
-/// Data events of every streamed answer.
-const STREAM_CHUNKS: usize = 32;
+/// The strict L1 overhead p99 limit, milliseconds; equality misses.
+pub const OVERHEAD_LIMIT_MS: f64 = 0.5;
 
-/// Request content, and buffered answer content, of the small cases.
-const SMALL_BYTES: usize = 1024;
+/// The declared server process whose CPU every repetition sums.
+pub const PROCESS: &str = "wyrd-server";
 
-/// Request and answer content of the payload-capture case.
-const LARGE_BYTES: usize = 64 * 1024;
+/// Data events of every streamed L1 answer.
+pub const STREAM_CHUNKS: usize = 32;
 
-/// One overhead case of the matrix.
+/// Request content, and buffered answer content, of the small L1 cases.
+pub const SMALL_BYTES: usize = 1024;
+
+/// Request and answer content of the L1 payload-capture case.
+pub const LARGE_BYTES: usize = 64 * 1024;
+
+/// The L2 aggregate offered rate when `--rate` is not given, requests/s.
+pub const DEFAULT_RATE: f64 = 250.0;
+
+/// The L2 experiment's only step.
+pub const CONTENTION: &str = "contention";
+
+/// L2 flags that take a value.
+pub const CAPACITY_FLAGS: [&str; 4] = [
+    "--rate",
+    "--max-completion-ms",
+    "--max-first-token-ms",
+    "--max-stream-ms",
+];
+
+/// One L1 overhead case.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Case {
-    /// Buffered 1 KiB chat.
-    Chat,
-    /// Streamed 1 KiB chat.
-    ChatStream,
-    /// Buffered 64 KiB chat with payload capture.
-    ChatCapture,
+    /// Buffered 1 KiB chat with metadata capture.
+    Buffered1KibCaptureMetadata,
+    /// Streamed 1 KiB chat with metadata capture.
+    Streamed1KibCaptureMetadata,
+    /// Buffered 64 KiB chat with metadata capture: `Buffered64KibCapturePayload`'s traffic
+    /// without its payload capture.
+    Buffered64KibCaptureMetadata,
+    /// Buffered 64 KiB chat with request and response payload capture.
+    Buffered64KibCapturePayload,
 }
 
 impl Case {
     /// Every case, in run order.
-    const ALL: [Self; 3] = [Self::Chat, Self::ChatStream, Self::ChatCapture];
+    pub const ALL: [Self; 4] = [
+        Self::Buffered1KibCaptureMetadata,
+        Self::Streamed1KibCaptureMetadata,
+        Self::Buffered64KibCaptureMetadata,
+        Self::Buffered64KibCapturePayload,
+    ];
 
-    /// The case `--case` names by number.
-    fn numbered(item: &str) -> Option<Self> {
-        match item {
-            "1" => Some(Self::Chat),
-            "2" => Some(Self::ChatStream),
-            "3" => Some(Self::ChatCapture),
-            _ => None,
+    /// The case's stable id: the first part of its step ids and the closed
+    /// benchmark case its calls declare.
+    #[must_use]
+    pub const fn id(self) -> &'static str {
+        match self {
+            Self::Buffered1KibCaptureMetadata => "buffered-1kib-capture-metadata",
+            Self::Streamed1KibCaptureMetadata => "streamed-1kib-capture-metadata",
+            Self::Buffered64KibCaptureMetadata => "buffered-64kib-capture-metadata",
+            Self::Buffered64KibCapturePayload => "buffered-64kib-capture-payload",
         }
     }
 
-    /// The report's name of the case, its number first.
-    const fn name(self) -> &'static str {
-        match self {
-            Self::Chat => "1 chat",
-            Self::ChatStream => "2 chat-stream",
-            Self::ChatCapture => "3 chat-capture",
-        }
-    }
-
-    /// The client counts the case runs at.
-    const fn clients(self) -> &'static [usize] {
-        match self {
-            Self::Chat | Self::ChatStream => &CLIENTS,
-            Self::ChatCapture => &[16, 64],
-        }
+    /// The case whose [`Self::id`] is `id`.
+    #[must_use]
+    pub fn named(id: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|case| case.id() == id)
     }
 
     /// The upstream path prefix whose deployment answers it.
-    const fn prefix(self) -> &'static str {
+    #[must_use]
+    pub const fn prefix(self) -> &'static str {
         match self {
-            Self::Chat => "chat",
-            Self::ChatStream => "stream",
-            Self::ChatCapture => "capture",
+            Self::Buffered1KibCaptureMetadata => "chat",
+            Self::Streamed1KibCaptureMetadata => "stream",
+            Self::Buffered64KibCaptureMetadata | Self::Buffered64KibCapturePayload => "capture",
         }
     }
 
     /// What its tenant captures.
-    const fn capture(self) -> CapturePolicy {
+    #[must_use]
+    pub const fn capture(self) -> CapturePolicy {
         match self {
-            Self::Chat | Self::ChatStream => CapturePolicy::Metadata,
-            Self::ChatCapture => CapturePolicy::Payload,
+            Self::Buffered1KibCaptureMetadata
+            | Self::Streamed1KibCaptureMetadata
+            | Self::Buffered64KibCaptureMetadata => CapturePolicy::Metadata,
+            Self::Buffered64KibCapturePayload => CapturePolicy::Payload,
         }
     }
 
     /// What each of its calls asks for and expects back.
-    fn shape(self) -> Shape {
+    #[must_use]
+    pub fn shape(self) -> workload::Shape {
         let (stream, request_bytes, expected) = match self {
-            Self::Chat => (false, SMALL_BYTES, SMALL_BYTES),
-            Self::ChatStream => (true, SMALL_BYTES, STREAM_CHUNKS),
-            Self::ChatCapture => (false, LARGE_BYTES, LARGE_BYTES),
+            Self::Buffered1KibCaptureMetadata => (false, SMALL_BYTES, SMALL_BYTES),
+            Self::Streamed1KibCaptureMetadata => (true, SMALL_BYTES, STREAM_CHUNKS),
+            Self::Buffered64KibCaptureMetadata | Self::Buffered64KibCapturePayload => {
+                (false, LARGE_BYTES, LARGE_BYTES)
+            }
         };
-        Shape {
+        workload::Shape {
             model: format!("bench-{}/gpt-4o", self.prefix()),
             stream,
             request_bytes,
             expected,
         }
     }
-}
 
-/// The overhead steps one command line selects.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Overhead {
-    /// Each selected `(case, clients)` step, in run order.
-    steps: Vec<(Case, usize)>,
-    /// Whether every window is profiled.
-    profile: bool,
-}
-
-impl Overhead {
-    /// Reads `--case`, `--clients`, and `--no-profile` from `arguments`, the
-    /// command line with the subcommand removed. The steps are each selected
-    /// case's matrix intersected with the selected clients; both default to
-    /// all.
-    ///
-    /// # Errors
-    ///
-    /// Returns a message for an unknown argument, an invalid or duplicate
-    /// value, or a selection with no step.
-    pub fn parse(arguments: &[String]) -> std::result::Result<Self, String> {
-        crate::flags::known(arguments, &["--case", "--clients"], &["--no-profile"])?;
-        let cases = crate::flags::list(arguments, "--case", "cases 1, 2, and 3", Case::numbered)?
-            .unwrap_or_else(|| Case::ALL.to_vec());
-        let clients = crate::flags::clients(arguments, &CLIENTS)?;
-        let steps: Vec<(Case, usize)> = cases
-            .iter()
-            .flat_map(|case| {
-                case.clients()
-                    .iter()
-                    .filter(|count| clients.contains(count))
-                    .map(|count| (*case, *count))
-            })
-            .collect();
-        if steps.is_empty() {
-            return Err(format!(
-                "no overhead step runs: --clients {clients:?} is outside every selected case's matrix"
-            ));
-        }
-        Ok(Self {
-            steps,
-            profile: !arguments.iter().any(|argument| argument == "--no-profile"),
-        })
-    }
-
-    /// Runs every step against one fresh server, writing evidence under
-    /// `output`, and returns whether every row passed.
-    ///
-    /// # Errors
-    ///
-    /// Returns a server, upstream, provisioning, or evidence failure that
-    /// stopped it; a step's failure becomes its FAIL row instead.
-    async fn benchmark(&self, output: &Path) -> Result<bool> {
-        fresh(output)?;
-        let binary = release_binary()?;
-        let server = LocalServer::start(&binary, &["bench"], &[], Placement::Host).await?;
-        let [setup] = server.tenants() else {
-            return Err("setup provisioned one tenant".into());
-        };
-        let upstream = upstream().await;
-        let keys = self
-            .steps
-            .iter()
-            .map(|(_, clients)| *clients)
-            .max()
-            .unwrap_or(1);
-        let tenant = Tenant::provision(setup, &upstream.uri(), keys).await?;
-        let profiles = self.profile.then(|| output.join("profiles"));
-        let bench = Bench::new(&server, &tenant, profiles);
-        let title = format!(
-            "Gateway overhead: {}, binary {}, {}s warmup + {}s windows, {}",
-            server.describe(),
-            binary_identity(&binary)?,
-            WARMUP.as_secs(),
-            WINDOW.as_secs(),
-            if self.profile {
-                "profiled at 999 Hz"
-            } else {
-                "not profiled"
-            },
-        );
-        let mut report = Report::new(title, OVERHEAD_HEADER, server.memory_limit_bytes());
-        for &(case, clients) in &self.steps {
-            let name = format!("{} {clients}", case.name());
-            let step = match tenant.capture(case.capture()).await {
-                Ok(()) => bench.run(&name, &case.shape(), clients).await,
-                Err(error) => Err(error),
-            };
-            match step {
-                Ok(step) => report.overhead(&step),
-                Err(error) => report.failed(&name, error.to_string()),
-            }
-            report.write_to(output)?;
-        }
-        stop(server, output, &mut report).await
+    /// The step id of this case at `clients`.
+    #[must_use]
+    pub fn step(self, clients: usize) -> String {
+        format!("{}.c{clients}", self.id())
     }
 }
 
-/// The capacity windows one command line selects.
-#[derive(Debug, Clone, PartialEq)]
-pub struct Capacity {
-    /// Selected cases, in run order.
-    loads: Vec<Load>,
-    /// Offered aggregate rates, ascending.
-    rates: Vec<f64>,
-    /// The declared SLOs.
-    slo: Slo,
-    /// Whether every window is profiled.
-    profile: bool,
-}
-
-impl Capacity {
-    /// Reads `--case`, `--rates`, the `--max-*-ms` SLOs, and `--no-profile`
-    /// from `arguments`, the command line with the subcommand removed.
-    /// Cases default to all and rates to [`RATES`]; rates run ascending.
-    ///
-    /// # Errors
-    ///
-    /// Returns a message for an unknown argument (including `--clients`),
-    /// an invalid or duplicate value, or a missing SLO a selected case needs.
-    pub fn parse(arguments: &[String]) -> std::result::Result<Self, String> {
-        crate::flags::known(
-            arguments,
-            &[
-                "--case",
-                "--rates",
-                "--max-answer-ms",
-                "--max-first-token-ms",
-                "--max-chunk-lag-ms",
-                "--max-stream-ms",
-            ],
-            &["--no-profile"],
-        )?;
-        let loads = crate::flags::list(arguments, "--case", "cases 1, 2, and 3", Load::numbered)?
-            .unwrap_or_else(|| Load::ALL.to_vec());
-        let mut rates = crate::flags::list(arguments, "--rates", "positive requests/s", |item| {
-            item.parse::<f64>()
-                .ok()
-                .filter(|rate| rate.is_finite() && *rate > 0.0)
-        })?
-        .unwrap_or_else(|| RATES.to_vec());
-        rates.sort_by(f64::total_cmp);
-        Ok(Self {
-            slo: Slo::parse(arguments, &loads)?,
-            loads,
-            rates,
-            profile: !arguments.iter().any(|argument| argument == "--no-profile"),
-        })
-    }
-
-    /// Runs every selected case's ascending rate sweep, stopping a case at
-    /// its first non-sustainable rate, then its overload sequence after the
-    /// highest sustainable one, against one fresh four-tenant server, and
-    /// returns whether the command passed.
-    ///
-    /// # Errors
-    ///
-    /// Returns a server, upstream, provisioning, or evidence failure that
-    /// stopped it; a window's failure becomes its FAIL row instead.
-    async fn benchmark(&self, output: &Path) -> Result<bool> {
-        fresh(output)?;
-        let binary = release_binary()?;
-        let server = LocalServer::start(&binary, &TENANTS, &[], Placement::Host).await?;
-        let upstream = Arc::new(PacedUpstream::start(PACING, MAX_IN_FLIGHT).await?);
-        let mut tenants = Vec::with_capacity(TENANTS.len());
-        for setup in server.tenants() {
-            let tenant = Tenant::provision(setup, &upstream.uri(), KEYS_PER_TENANT).await?;
-            tenant.capture(CapturePolicy::Metadata).await?;
-            tenants.push(tenant);
-        }
-        let profiles = self.profile.then(|| output.join("profiles"));
-        let bench = capacity::Bench::new(
-            &server,
-            &tenants,
-            Arc::clone(&upstream),
-            workload::http()?,
-            Profiler::new(&server, profiles),
-        );
-        let title = format!(
-            "Gateway capacity: {}, binary {}, SLO p99 bounds {:?} s, upstream {PACING:?}, {}s warmup + {}s windows, {KEYS_PER_TENANT} warmed keys per tenant, {MAX_IN_FLIGHT} in-flight bound, arrivals over {} ms late missed, {}",
-            server.describe(),
-            binary_identity(&binary)?,
-            self.slo,
-            capacity::WARMUP.as_secs(),
-            capacity::WINDOW.as_secs(),
-            capacity::MISS_AFTER.as_millis(),
-            if self.profile {
-                "profiled at 999 Hz"
-            } else {
-                "not profiled"
-            },
-        );
-        let mut report = Report::new(title, CAPACITY_HEADER, server.memory_limit_bytes());
-        for &load in &self.loads {
-            let mut tested = Vec::new();
-            for &rate in &self.rates {
-                match bench.rate(load, rate).await {
-                    Ok(measured) => tested.push((rate, report.rate(load, &measured, &self.slo))),
-                    Err(error) => {
-                        report.failed(&format!("{} {rate}/s", load.name()), error.to_string());
-                        tested.push((rate, Verdict::Invalid));
-                    }
-                }
-                report.write_to(output)?;
-                if tested
-                    .last()
-                    .is_some_and(|(_, verdict)| *verdict != Verdict::Sustainable)
-                {
-                    break;
-                }
-            }
-            if tested.len() < self.rates.len() {
-                report.note(format!(
-                    "{}: rates above the first failing rate were not run",
-                    load.name()
-                ));
-            }
-            let (envelope, found) = envelope(load, &tested);
-            report.note(envelope);
-            let highest = tested
-                .iter()
-                .filter(|(_, verdict)| *verdict == Verdict::Sustainable)
-                .map(|(rate, _)| *rate)
-                .next_back();
-            match highest {
-                Some(rate) => match bench.overload(load, rate).await {
-                    Ok((high, low)) => report.overload(load, &high, &low, &self.slo),
-                    Err(error) => {
-                        report.failed(&format!("{} overload", load.name()), error.to_string());
-                    }
-                },
-                None if !found => report.failed(
-                    &format!("{} envelope", load.name()),
-                    "no measured sustainable rate".to_owned(),
-                ),
-                None => {}
-            }
-            report.write_to(output)?;
-        }
-        stop(server, output, &mut report).await
-    }
-}
-
-/// Settles `server`, stops it, retains its log under `output`, adds the
-/// shutdown row, writes the report, and returns whether every row passed.
+/// Plans the Gateway experiment at the context's level: refuses unknown
+/// flags, declares it, and builds its workload, which starts nothing until
+/// the lifecycle prepares it.
 ///
 /// # Errors
 ///
-/// Returns the report write failure.
-async fn stop(server: LocalServer, output: &Path, report: &mut Report) -> Result<bool> {
-    let settled = quiescent(&server).await;
-    let log = output.join("server.log");
-    let stopped = server.stop(&log).map_err(Into::into);
-    report.shutdown(&Shutdown {
-        stopped,
-        settled,
-        log: std::fs::read_to_string(&log).map_err(Into::into),
-    });
-    report.write_to(output)?;
-    Ok(report.passed())
+/// Returns a message for an unknown argument or an invalid declared value.
+pub fn plan(context: &Context<'_>, base: Declaration) -> std::result::Result<Plan, String> {
+    let valued: &[&str] = match context.level {
+        Level::One => &[],
+        Level::Two => &CAPACITY_FLAGS,
+    };
+    context.known(valued, &[])?;
+    let declaration = declare(context.level, context.arguments, base, context.root)?;
+    let log = context
+        .output(Engine::Gateway, &declaration.experiment)
+        .join("server.log");
+    let workload: Box<dyn wyrd_testing::experiment::Workload> = match context.level {
+        Level::One => Box::new(run::Overhead::new(log)),
+        Level::Two => Box::new(capacity::Capacity::new(log)),
+    };
+    Ok(Plan {
+        declaration,
+        workload,
+    })
 }
 
-/// Replaces `output` with an empty directory, leaving every other mode's
-/// evidence alone.
+/// Fills `base` with the Gateway experiment at `level`: its id, question,
+/// sweep, controls, metrics, criteria, and steps. Pure: it reads only
+/// `arguments`, so tests judge the real declaration without a server.
 ///
 /// # Errors
 ///
-/// Returns the filesystem failure.
-fn fresh(output: &Path) -> Result<()> {
-    if output.exists() {
-        std::fs::remove_dir_all(output)?;
+/// Returns a message for an invalid `--rate` or SLO override.
+pub fn declare(
+    level: Level,
+    arguments: &[String],
+    base: Declaration,
+    _root: &Path,
+) -> std::result::Result<Declaration, String> {
+    match level {
+        Level::One => Ok(overhead(base)),
+        Level::Two => {
+            let rate = crate::flags::value(arguments, "--rate")?
+                .map(|value| {
+                    value
+                        .parse::<f64>()
+                        .ok()
+                        .filter(|rate| rate.is_finite() && *rate > 0.0)
+                        .ok_or_else(|| format!("--rate takes positive requests/s, got `{value}`"))
+                })
+                .transpose()?;
+            Ok(capacity_declaration(base, rate, Slo::parse(arguments)?))
+        }
     }
-    std::fs::create_dir_all(output)?;
-    Ok(())
 }
 
-/// Whether `server` settled with nothing active or pending and no outbox
-/// item ever lost other than shed at an outbox limit, which saturated rows
-/// already report, before it is stopped.
-///
-/// # Errors
-///
-/// Returns scrape failures.
-async fn quiescent(server: &LocalServer) -> Result<bool> {
-    if settle(server).await?.is_none() {
-        return Ok(false);
-    }
-    let metrics = server.metrics().await?;
-    let lost = metrics.sum("outbox_events_lost_total", &[]);
-    Ok(lost - metrics.sum("outbox_events_lost_total", &["reason=\"shed\""]) == 0.0)
-}
-
-/// The instant overhead upstream: one route per [`Case::prefix`], answering
-/// its case's buffered answer or whole stream, recording no requests so its
-/// memory stays bounded.
-async fn upstream() -> MockServer {
-    let upstream = MockServer::builder()
-        .disable_request_recording()
-        .start()
-        .await;
-    let answers = [
+/// The L1 `overhead` declaration over `base`.
+fn overhead(mut base: Declaration) -> Declaration {
+    "overhead".clone_into(&mut base.experiment);
+    base.question = format!(
+        "What overhead does the gateway add to 1 KiB buffered and streamed chat with metadata capture, and 64 KiB buffered chat with metadata and with payload capture, at 1 and 64 closed-loop clients, and is its p99 strictly under {OVERHEAD_LIMIT_MS} ms at {SLO_CLIENTS} clients at every handoff point with every call answered and captured exactly once?"
+    );
+    base.variables = BTreeMap::from([
+        ("case".to_owned(), json!(Case::ALL.map(Case::id))),
+        ("clients".to_owned(), json!(CLIENTS)),
+    ]);
+    base.controls.extend([
         (
-            "chat",
-            ResponseTemplate::new(200).set_body_json(GatewayCapture::sized_completion(SMALL_BYTES)),
-        ),
-        (
-            "stream",
-            ResponseTemplate::new(200).set_body_raw(
-                GatewayCapture::chat_events("chatcmpl-bench", STREAM_CHUNKS),
-                "text/event-stream",
+            "fixture".to_owned(),
+            json!(
+                "stub-provider: an instant local upstream answering a 1 KiB buffered completion, a 32-event stream, and a 64 KiB buffered completion"
             ),
         ),
         (
-            "capture",
-            ResponseTemplate::new(200).set_body_json(GatewayCapture::sized_completion(LARGE_BYTES)),
+            "workload".to_owned(),
+            json!(format!(
+                "one tenant, one wyrd_sk_ key and keep-alive connection per closed-loop client; each client sends its next call when the last is validated; {}",
+                Case::ALL
+                    .map(|case| format!(
+                        "{}: {} capture",
+                        case.id(),
+                        match case.capture() {
+                            CapturePolicy::Metadata => "metadata",
+                            CapturePolicy::Payload => "request and response payload",
+                        }
+                    ))
+                    .join(", ")
+            )),
         ),
-    ];
-    for (prefix, answer) in answers {
-        Mock::given(method("POST"))
-            .and(path(format!("/{prefix}/v1/chat/completions")))
-            .respond_with(answer)
-            .mount(&upstream)
-            .await;
-    }
-    upstream
-}
-
-/// Runs the overhead benchmark. `arguments` is the process command line
-/// with the `gateway-overhead` subcommand removed.
-pub(crate) async fn overhead(arguments: Vec<String>) -> ExitCode {
-    install_tracing();
-    let outcome = match Overhead::parse(&arguments) {
-        Ok(overhead) => overhead.benchmark(&PathBuf::from(OUTPUT)).await,
-        Err(error) => Err(error.into()),
-    };
-    exit("overhead", outcome)
-}
-
-/// Runs the capacity benchmark. `arguments` is the process command line
-/// with the `gateway-capacity` subcommand removed.
-pub(crate) async fn capacity(arguments: Vec<String>) -> ExitCode {
-    install_tracing();
-    let outcome = match Capacity::parse(&arguments) {
-        Ok(capacity) => capacity.benchmark(&PathBuf::from(CAPACITY_OUTPUT)).await,
-        Err(error) => Err(error.into()),
-    };
-    exit("capacity", outcome)
-}
-
-/// The exit code of `mode`'s `outcome`, printing a harness failure.
-fn exit(mode: &str, outcome: Result<bool>) -> ExitCode {
-    match outcome {
-        Ok(true) => ExitCode::SUCCESS,
-        Ok(false) => ExitCode::FAILURE,
-        Err(error) => {
-            eprintln!("gateway {mode} benchmark failed: {error}");
-            ExitCode::FAILURE
+        (
+            "limits".to_owned(),
+            json!({
+                "overhead_p99_ms_lt": OVERHEAD_LIMIT_MS,
+                "at_clients": SLO_CLIENTS,
+                "errors": 0,
+                "capture": "one staged capture per arrival; no drop, loss, or shedding",
+                "drain_seconds": run::DRAIN_LIMIT.as_secs(),
+            }),
+        ),
+        ("server_processes".to_owned(), json!([PROCESS])),
+    ]);
+    base.metrics = overhead_metrics();
+    let mut steps = Vec::new();
+    for case in Case::ALL {
+        for clients in CLIENTS {
+            let shape = case.shape();
+            steps.push(Step::measured(
+                &case.step(clients),
+                json!({
+                    "case": case.id(),
+                    "clients": clients,
+                    "stream": shape.stream,
+                    "request_bytes": shape.request_bytes,
+                }),
+            ));
         }
     }
+    let every: Vec<String> = steps.iter().map(|step| step.id.clone()).collect();
+    let at_slo: Vec<String> = Case::ALL.map(|case| case.step(SLO_CLIENTS)).to_vec();
+    let stream_at_slo = vec![Case::Streamed1KibCaptureMetadata.step(SLO_CLIENTS)];
+    base.criteria = vec![
+        Criterion::limit(
+            "overhead-p99",
+            "overhead_p99_ms",
+            &at_slo,
+            Op::Lt,
+            OVERHEAD_LIMIT_MS,
+        )
+        .percentile(99),
+        Criterion::limit(
+            "overhead-end-p99",
+            "overhead_end_p99_ms",
+            &stream_at_slo,
+            Op::Lt,
+            OVERHEAD_LIMIT_MS,
+        )
+        .percentile(99),
+        Criterion::every("no-errors", "errors", &every, Op::Le, 0.0),
+        Criterion::every(
+            "capture-per-arrival",
+            "capture_unstaged",
+            &every,
+            Op::Le,
+            0.0,
+        ),
+        Criterion::every("capture-dropped", "capture_dropped", &every, Op::Le, 0.0),
+        Criterion::every("capture-lost", "capture_lost", &every, Op::Le, 0.0),
+        Criterion::every("capture-shed", "capture_shed", &every, Op::Le, 0.0),
+        Criterion::every("drained", "undrained", &every, Op::Le, 0.0),
+    ];
+    base.steps = steps;
+    base
+}
+
+/// Every metric an L1 repetition reads or derives.
+fn overhead_metrics() -> Vec<Metric> {
+    let mut metrics = vec![
+        Metric::raw(
+            "requests",
+            "requests",
+            "client: calls that ended with a complete validated answer in the window",
+        ),
+        Metric::raw(
+            "arrivals",
+            "requests",
+            "client: calls sent in the window, whatever their outcome",
+        ),
+        Metric::raw(
+            "errors",
+            "requests",
+            "client: calls refused, timed out, failed, or answered invalidly in the window",
+        ),
+        Metric::raw(
+            "server_failures",
+            "requests",
+            "server: answer-handoff timings whose outcome is not `succeeded`, counted in their own outcome series and never judged",
+        ),
+        Metric::raw(
+            "first_event_p99_ms",
+            "ms",
+            "diagnostic only: client send until a stream's first complete data event; streams only",
+        ),
+        Metric::raw(
+            "overhead_p99_ms",
+            "ms",
+            "server: per call, handler entry until the answer handoff (`gateway.buffered`, or a stream's head at `gateway.stream.head`) less the union of that call's own provider waits; nearest-rank bucket bounds of the server's timing histograms",
+        ),
+        Metric::raw(
+            "overhead_p50_ms",
+            "ms",
+            "server: the median of the same per-call overhead as `overhead_p99_ms`",
+        ),
+        Metric::raw(
+            "overhead_end_p50_ms",
+            "ms",
+            "server: the median of the same per-stream overhead as `overhead_end_p99_ms`; streams only",
+        ),
+        Metric::raw(
+            "overhead_end_p99_ms",
+            "ms",
+            "server: per stream, handler entry until its final frame handoff (`gateway.stream.end`) less the union of its own provider waits; nearest-rank bucket bounds of the server's timing histograms; streams only",
+        ),
+        Metric::raw(
+            "upstream_p99_ms",
+            "ms",
+            "server: the union of a call's own provider waits until the answer handoff; nearest-rank bucket bounds of the server's timing histograms",
+        ),
+        Metric::raw("client_p50_ms", "ms", CLIENT_TIME),
+        Metric::raw("client_p95_ms", "ms", CLIENT_TIME),
+        Metric::raw("client_p99_ms", "ms", CLIENT_TIME),
+        Metric::raw(
+            "capture_staged",
+            "captures",
+            "server: wyrd_gateway_capture_total{outcome=staged}, baseline to post-drain scrape",
+        ),
+        Metric::raw(
+            "capture_unstaged",
+            "captures",
+            "server: |staged captures − arrivals|, arrivals without exactly one staged capture",
+        ),
+        Metric::raw(
+            "capture_dropped",
+            "captures",
+            "server: captures dropped before staging, any reason",
+        ),
+        Metric::raw(
+            "capture_lost",
+            "items",
+            "server: outbox_events_lost_total for every reason but accounted shedding",
+        ),
+        Metric::raw(
+            "capture_shed",
+            "items",
+            "server: outbox_events_lost_total{reason=shed}, items shed at an outbox's staging limit, accounted separately from loss",
+        ),
+        Metric::raw(
+            "capture_bytes",
+            "bytes",
+            "server: accounted bytes the Scribe outbox wrote from the window open to its measured stop, the CPU interval; drained writes are excluded",
+        ),
+        Metric::raw(
+            "drain_s",
+            "s",
+            "server: arrivals stopped until no gateway call is active and every outbox is empty",
+        ),
+        Metric::raw(
+            "undrained",
+            "items",
+            "server: active gateway calls plus pending outbox items still present when the drain limit passed",
+        ),
+    ];
+    metrics.extend(latency_metrics(
+        "server: handler entry until the answer handoff (`gateway.buffered`, or a stream's head at `gateway.stream.head`), successful calls; nearest-rank bucket bounds of the server's timing histograms",
+    ));
+    metrics.extend(efficiency_metrics());
+    metrics
+}
+
+/// The boundary of the diagnostic client round trip, which never judges.
+const CLIENT_TIME: &str = "diagnostic only: client send until the complete validated answer (a stream's EOF), never judged";
+
+/// The common report's `p50_ms`, `p95_ms`, and `p99_ms` over `boundary`.
+fn latency_metrics(boundary: &str) -> Vec<Metric> {
+    ["p50_ms", "p95_ms", "p99_ms"]
+        .map(|id| Metric::raw(id, "ms", boundary))
+        .to_vec()
+}
+
+/// The derived rate and per-core metrics every Gateway repetition reports.
+fn efficiency_metrics() -> Vec<Metric> {
+    vec![
+        Metric::cores(),
+        Metric::derived(
+            "rate",
+            "requests/s",
+            "answered requests per measured second",
+            Direction::Higher,
+            Derive::Rate {
+                work: "requests".to_owned(),
+                scale: 1.0,
+            },
+        ),
+        Metric::derived(
+            "requests_per_s_per_vcpu",
+            "requests/s/vCPU",
+            "(W/T)/P: answered requests per wall second per provisioned vCPU",
+            Direction::Higher,
+            Derive::PerVcpu {
+                work: "requests".to_owned(),
+                scale: 1.0,
+            },
+        ),
+        Metric::derived(
+            "requests_per_cpu_s",
+            "requests/cpu-s",
+            "W/C: answered requests per server CPU-second used",
+            Direction::Higher,
+            Derive::PerCpu {
+                work: "requests".to_owned(),
+                scale: 1.0,
+            },
+        ),
+        Metric::derived(
+            "cpu_us_per_request",
+            "µs/request",
+            "server CPU microseconds per answered request",
+            Direction::Lower,
+            Derive::CpuPer {
+                work: "requests".to_owned(),
+                scale: 1e6,
+            },
+        ),
+        Metric::derived(
+            "capture_bytes_per_s_per_vcpu",
+            "B/s/vCPU",
+            "(W/T)/P: accounted capture bytes the Scribe outbox wrote per wall second per provisioned vCPU",
+            Direction::Higher,
+            Derive::PerVcpu {
+                work: "capture_bytes".to_owned(),
+                scale: 1.0,
+            },
+        ),
+        Metric::derived(
+            "capture_bytes_per_cpu_s",
+            "B/cpu-s",
+            "W/C: accounted capture bytes the Scribe outbox wrote per server CPU-second used",
+            Direction::Higher,
+            Derive::PerCpu {
+                work: "capture_bytes".to_owned(),
+                scale: 1.0,
+            },
+        ),
+    ]
+}
+
+/// The L2 `capacity` declaration over `base` at `rate` (or
+/// [`DEFAULT_RATE`]) with `slo`.
+fn capacity_declaration(mut base: Declaration, rate: Option<f64>, slo: Slo) -> Declaration {
+    let rate = rate.unwrap_or(DEFAULT_RATE);
+    let phases = capacity::Phases::of(std::time::Duration::from_secs(
+        base.timing.repetition_seconds,
+    ));
+    "capacity".clone_into(&mut base.experiment);
+    base.question = format!(
+        "At {rate} requests/s offered open-loop by four contending tenants, does the gateway meet its server completion, first-token handoff, and final-frame handoff SLOs with bounded backlog, refuse only by declared admission limits under {OVERLOAD_FACTOR}x overload, recover within {} s, drain within {} s, and account for every capture?",
+        RECOVERY_GRACE.as_secs(),
+        run::DRAIN_LIMIT.as_secs()
+    );
+    base.variables = BTreeMap::from([(
+        "phase".to_owned(),
+        json!(["capacity", "overload", "recovery"]),
+    )]);
+    base.controls.extend([
+        (
+            "fixture".to_owned(),
+            json!({
+                "upstream": "paced local upstream",
+                "buffered_delay_ms": PACING.buffered_delay.as_millis(),
+                "buffered_bytes": PACING.buffered_bytes,
+                "stream_delay_ms": PACING.stream_delay.as_millis(),
+                "chunks": PACING.chunks,
+                "chunk_interval_ms": PACING.chunk_interval.as_millis(),
+            }),
+        ),
+        (
+            "workload".to_owned(),
+            json!({
+                "tenants": TENANTS,
+                "shares": [70, 10, 10, 10],
+                "modes": "every tenant alternates buffered and streamed calls",
+                "keys_per_tenant": KEYS_PER_TENANT,
+                "capture": "metadata",
+                "rate": rate,
+                "overload_rate": rate * OVERLOAD_FACTOR,
+                "phases_of_repetition_seconds": {
+                    "capacity": phases.capacity.as_secs(),
+                    "overload": phases.overload.as_secs(),
+                    "recovery": phases.recovery.as_secs(),
+                    "recovery_grace": phases.grace.as_secs(),
+                },
+                "max_in_flight": MAX_IN_FLIGHT,
+                "miss_after_ms": MISS_AFTER.as_millis(),
+            }),
+        ),
+        (
+            "limits".to_owned(),
+            json!({
+                "slo_p99_ms": slo.limits(),
+                "slo_overrides": slo.overrides,
+                "backlog_growth_requests": rate,
+                "admission_refusals": ADMISSION_REFUSALS,
+                "drain_seconds": run::DRAIN_LIMIT.as_secs(),
+                "recovery_seconds": RECOVERY_GRACE.as_secs(),
+                "capture": "lost always zero; shedding only in overload",
+            }),
+        ),
+        ("server_processes".to_owned(), json!([PROCESS])),
+    ]);
+    base.metrics = capacity_metrics();
+    base.steps = vec![Step::measured(
+        CONTENTION,
+        json!({
+            "case": "tenant-contention",
+            "tenants": TENANTS.len(),
+            "rate": rate,
+            "overload_rate": rate * OVERLOAD_FACTOR,
+        }),
+    )];
+    let step = [CONTENTION.to_owned()];
+    let mut criteria = Vec::new();
+    for phase in ["capacity", "recovery"] {
+        for (name, bound) in [
+            ("completion", slo.completion),
+            ("first_token", slo.first_token),
+            ("stream", slo.stream),
+        ] {
+            criteria.push(
+                Criterion::limit(
+                    &format!("{phase}-{}", name.replace('_', "-")),
+                    &format!("{phase}.{name}_p99_ms"),
+                    &step,
+                    Op::Le,
+                    bound,
+                )
+                .percentile(99),
+            );
+        }
+        criteria.push(Criterion::every(
+            &format!("{phase}-errors"),
+            &format!("{phase}.errors"),
+            &step,
+            Op::Le,
+            0.0,
+        ));
+    }
+    criteria.extend([
+        Criterion::every(
+            "capacity-backlog",
+            "capacity.backlog_growth",
+            &step,
+            Op::Le,
+            rate,
+        ),
+        Criterion::every(
+            "overload-refusals",
+            "overload.unexpected",
+            &step,
+            Op::Le,
+            0.0,
+        ),
+        Criterion::every("drained", "undrained", &step, Op::Le, 0.0),
+        Criterion::every("capture-lost", "capture.lost", &step, Op::Le, 0.0),
+        Criterion::every("capture-dropped", "capture.dropped", &step, Op::Le, 0.0),
+        Criterion::every(
+            "capture-per-admitted",
+            "capture.unstaged",
+            &step,
+            Op::Le,
+            0.0,
+        ),
+        Criterion::every(
+            "capture-shed-outside-overload",
+            "capture.shed_outside_overload",
+            &step,
+            Op::Le,
+            0.0,
+        ),
+        Criterion::every(
+            "capture-ownership",
+            "capture.misattributed",
+            &step,
+            Op::Le,
+            0.0,
+        ),
+    ]);
+    base.criteria = criteria;
+    base
+}
+
+/// Every metric an L2 repetition reads or derives, phase metrics flattened
+/// as `<phase>.<metric>`.
+fn capacity_metrics() -> Vec<Metric> {
+    let from = "server: handler entry until";
+    let mut metrics = Vec::new();
+    for (phase, scope, client) in [
+        (
+            "capacity",
+            "observations completed in the capacity phase, every tenant together",
+            "calls scheduled in the capacity phase; the worst tenant's p99",
+        ),
+        (
+            "recovery",
+            "observations completed after the recovery grace, every tenant together",
+            "calls scheduled after the recovery grace; every tenant together",
+        ),
+    ] {
+        for (name, boundary) in [
+            (
+                "completion",
+                "the buffered answer's handoff (`gateway.buffered`)",
+            ),
+            (
+                "first_token",
+                "a stream's head handoff (`gateway.stream.head`)",
+            ),
+            (
+                "chunk_lag",
+                "each stream data event's receipt, measured behind its upstream send",
+            ),
+            (
+                "stream",
+                "a stream's final frame handoff (`gateway.stream.end`)",
+            ),
+        ] {
+            let boundary = if name == "chunk_lag" {
+                format!("diagnostic only, client: {boundary}, {client}; never judged")
+            } else {
+                format!(
+                    "{from} {boundary}, {scope}; successful calls' nearest-rank bucket bounds of the server's timing histograms"
+                )
+            };
+            metrics.push(Metric::raw(
+                &format!("{phase}.{name}_p99_ms"),
+                "ms",
+                &boundary,
+            ));
+        }
+        metrics.push(Metric::raw(
+            &format!("{phase}.errors"),
+            "requests",
+            &format!(
+                "client: {phase} calls that did not end with a validated answer, refusals included"
+            ),
+        ));
+    }
+    metrics.extend([
+        Metric::raw(
+            "capacity.backlog_growth",
+            "requests",
+            "driver in-flight calls, server active calls, and outbox items: the largest growth of a series' mean from the first to the last 3 s of the capacity phase",
+        ),
+        Metric::raw(
+            "capacity.overhead_p99_ms",
+            "ms",
+            "server: diagnostic per-call buffered completion less the union of the call's own provider waits, calls completed in the capacity phase; nearest-rank bucket bounds of the server's timing histograms",
+        ),
+        Metric::raw(
+            "overload.refused",
+            "requests",
+            "client: overload and recovery-grace calls refused with a declared admission code",
+        ),
+        Metric::raw(
+            "overload.unexpected",
+            "requests",
+            "client: overload and recovery-grace calls that ended unanswered other than by a declared admission refusal",
+        ),
+        Metric::raw(
+            "overload.shed",
+            "items",
+            "server: outbox items shed at the staging limit from the overload start to the recovery grace end",
+        ),
+        Metric::raw(
+            "requests",
+            "requests",
+            "client: calls answered with a validated answer over the whole sequence",
+        ),
+        Metric::raw(
+            "errors",
+            "requests",
+            "client: calls that ended unanswered other than by a declared overload admission refusal",
+        ),
+        Metric::raw(
+            "capture.staged",
+            "captures",
+            "server: staged captures over the sequence and its drain",
+        ),
+        Metric::raw(
+            "capture.unstaged",
+            "captures",
+            "server: |staged captures − calls the server admitted and settled|",
+        ),
+        Metric::raw("capture.dropped", "captures", "server: captures dropped before staging"),
+        Metric::raw(
+            "capture.lost",
+            "items",
+            "server: outbox items lost for every reason but accounted shedding",
+        ),
+        Metric::raw(
+            "capture.shed_outside_overload",
+            "items",
+            "server: outbox items shed in the capacity phase, the judged recovery, or the drain",
+        ),
+        Metric::raw(
+            "capture.misattributed",
+            "tenants",
+            "tenant reads: tenants whose readable capture rows fall outside their own answered-to-admissible calls, plus one when rows do not sum to the staged captures",
+        ),
+        Metric::raw(
+            "capture_bytes",
+            "bytes",
+            "server: accounted bytes the Scribe outbox wrote while arrivals ran",
+        ),
+        Metric::raw(
+            "drain_s",
+            "s",
+            "server: arrivals completed until no gateway call is active and every outbox is empty",
+        ),
+        Metric::raw(
+            "undrained",
+            "items",
+            "server: active gateway calls plus pending outbox items still present when the drain limit passed",
+        ),
+    ]);
+    metrics.extend(latency_metrics(
+        "client: scheduled arrival until the complete validated buffered answer, every tenant, capacity phase",
+    ));
+    metrics.extend(efficiency_metrics());
+    metrics
+}
+
+/// Server log lines that report an outbox item lost.
+const LOSS_MARKERS: [&str; 3] = ["was lost", "items unwritten", "write task failed"];
+
+/// Settles `server`, stops it cleanly, and copies its log to `log`.
+///
+/// # Errors
+///
+/// Returns every reason the stop was not loss-free: active or pending work
+/// at the drain limit, an outbox item lost other than shed, an unclean
+/// exit, or a log that is unreadable or reports a lost item.
+pub async fn shutdown(server: LocalServer, log: &Path) -> Result<()> {
+    let drain = run::settle(&server).await?;
+    let metrics = server.metrics().await?;
+    let lost = metrics.sum("outbox_events_lost_total", &[])
+        - metrics.sum("outbox_events_lost_total", &["reason=\"shed\""]);
+    if let Some(directory) = log.parent() {
+        std::fs::create_dir_all(directory)?;
+    }
+    let mut problems = Vec::new();
+    if drain.remaining > 0.0 {
+        problems.push(format!(
+            "{} active calls or pending outbox items before stop",
+            drain.remaining
+        ));
+    }
+    if lost != 0.0 {
+        problems.push(format!(
+            "{lost} outbox items lost other than shed over the run"
+        ));
+    }
+    if let Err(error) = server.stop(log).await {
+        problems.push(format!("unclean exit: {error}"));
+    }
+    match std::fs::read_to_string(log) {
+        Ok(text) => {
+            let lines = text
+                .lines()
+                .filter(|line| LOSS_MARKERS.iter().any(|marker| line.contains(marker)))
+                .count();
+            if lines > 0 {
+                problems.push(format!("{lines} server log lines report lost items"));
+            }
+        }
+        Err(error) => problems.push(format!("server log unreadable: {error}")),
+    }
+    if problems.is_empty() {
+        Ok(())
+    } else {
+        Err(problems.join("; ").into())
+    }
+}
+
+/// A declared step's float parameter `name`.
+fn param(step: &Step, name: &str) -> Option<f64> {
+    step.params.get(name).and_then(Value::as_f64)
 }
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
-    use std::time::Duration;
+    use std::collections::BTreeMap;
+    use std::path::Path;
 
-    use tokio::sync::Semaphore;
-    use tokio::time::Instant;
+    use serde_json::{Value, json};
+    use wyrd_testing::experiment::{
+        Declaration, Engine, HostRecord, Invocation, Level, Mode, Op, Rule, Source, Validity,
+    };
+    use wyrd_testing::release_server::Host;
 
-    use super::capacity::{Load, Measured, Schedule, Slo, open_loop};
-    use super::envelope::CAPACITY_HEADER;
-    use super::report::{OVERHEAD_HEADER, Report};
-    use super::run::Step;
-    use super::{CAPACITY_OUTPUT, Capacity, Case, OUTPUT, Overhead, fresh};
+    use super::{CLIENTS, CONTENTION, Case, DEFAULT_RATE, declare};
 
     /// A command line of `arguments` after the program name.
     fn line(arguments: &[&str]) -> Vec<String> {
@@ -531,301 +871,154 @@ mod tests {
             .collect()
     }
 
-    /// The default overhead selection is all ten profiled steps; `--case`
-    /// and `--clients` keep only their intersection with each case's
-    /// matrix, and invalid, unknown, or empty selections fail.
+    /// A base declaration at `level` that needs no release binary, with a
+    /// shared `timing` control as the runner assembles one.
     ///
     /// # Panics
     ///
-    /// Panics when a selection parses the wrong way.
+    /// Panics when the host cannot be read.
+    fn base(level: Level) -> Declaration {
+        let host = Host::detect().expect("the host");
+        Declaration {
+            engine: Engine::Gateway,
+            experiment: String::new(),
+            level,
+            question: String::new(),
+            timing: level.timing(),
+            validity: Validity::default(),
+            variables: BTreeMap::new(),
+            controls: BTreeMap::from([("timing".to_owned(), json!({ "method": "shared" }))]),
+            metrics: Vec::new(),
+            criteria: Vec::new(),
+            steps: Vec::new(),
+            selection: None,
+            source: Source::from_diff("0".repeat(40), b"", false),
+            build: Value::Null,
+            command: Invocation::new(&[], &[]),
+            host: HostRecord::new(&host, "test"),
+            refusals: Vec::new(),
+            mode: Mode::Full,
+        }
+    }
+
+    /// L1 declares every case/client step, the strict 0.5 ms overhead
+    /// p99 only at 64 clients with p99 sample sufficiency, and every
+    /// correctness and capture criterion on every step, keeping the shared
+    /// timing control; it is admissible.
+    ///
+    /// # Panics
+    ///
+    /// Panics when a step or criterion is missing or misdeclared.
     #[test]
-    fn case_and_client_selection_preserves_matrix() {
-        let all = Overhead::parse(&line(&[])).expect("the default selection");
-        assert!(all.profile);
-        assert_eq!(all.steps.len(), 10);
-        assert_eq!(
-            all.steps
+    fn overhead_declares_every_case_at_every_client_count() {
+        let declared = declare(Level::One, &line(&[]), base(Level::One), Path::new("."))
+            .expect("the L1 declaration");
+        assert_eq!(declared.experiment, "overhead");
+        assert_eq!(declared.steps.len(), Case::ALL.len() * CLIENTS.len());
+        assert!(
+            declared
+                .steps
                 .iter()
-                .filter(|(case, _)| *case == Case::ChatCapture)
-                .count(),
-            2
+                .any(|step| step.id == "buffered-64kib-capture-payload.c1")
         );
-        let quick = Overhead::parse(&line(&["--case", "1", "--clients", "16", "--no-profile"]))
-            .expect("one step");
-        assert_eq!(quick.steps, vec![(Case::Chat, 16)]);
-        assert!(!quick.profile);
-        let wide = Overhead::parse(&line(&["--clients", "64"])).expect("three steps");
+        let overhead = declared
+            .criteria
+            .iter()
+            .find(|criterion| criterion.id == "overhead-p99")
+            .expect("the overhead criterion");
         assert_eq!(
-            wide.steps,
+            overhead.steps,
             vec![
-                (Case::Chat, 64),
-                (Case::ChatStream, 64),
-                (Case::ChatCapture, 64)
+                "buffered-1kib-capture-metadata.c64",
+                "streamed-1kib-capture-metadata.c64",
+                "buffered-64kib-capture-metadata.c64",
+                "buffered-64kib-capture-payload.c64"
             ]
         );
-        for refused in [
-            &["--case", "3", "--clients", "1"][..],
-            &["--case", "4"],
-            &["--case", "1,1"],
-            &["--clients", "8"],
-            &["--rate", "50"],
-            &["--case"],
-        ] {
-            assert!(Overhead::parse(&line(refused)).is_err(), "{refused:?}");
+        assert_eq!(overhead.percentile, Some(99));
+        assert!(matches!(
+            overhead.rule,
+            Rule { op: Op::Lt, limit, .. } if (limit - 0.5).abs() < f64::EPSILON
+        ));
+        for id in ["no-errors", "capture-lost", "capture-shed", "drained"] {
+            let criterion = declared
+                .criteria
+                .iter()
+                .find(|criterion| criterion.id == id)
+                .expect("a correctness criterion");
+            assert_eq!(
+                criterion.steps.len(),
+                Case::ALL.len() * CLIENTS.len(),
+                "{id}"
+            );
         }
-        let shape = Case::ChatCapture.shape();
+        assert!(declared.refusals().is_empty(), "{:?}", declared.refusals());
+        assert_eq!(declared.controls["timing"], json!({ "method": "shared" }));
+        let shape = Case::Buffered64KibCapturePayload.shape();
         assert_eq!(
             (shape.request_bytes, shape.expected, shape.stream),
             (65_536, 65_536, false)
         );
-        assert_eq!(Case::ChatStream.shape().expected, 32);
+        assert_eq!(Case::Streamed1KibCaptureMetadata.shape().expected, 32);
     }
 
-    /// The capacity SLO flags of the release runs.
-    const SLOS: [&str; 8] = [
-        "--max-answer-ms",
-        "200",
-        "--max-first-token-ms",
-        "350",
-        "--max-chunk-lag-ms",
-        "50",
-        "--max-stream-ms",
-        "1100",
-    ];
-
-    /// Capacity parses cases, ascending rates, and every SLO a selected mode
-    /// needs, refusing `--clients`; open-loop arrivals keep the offered rate
-    /// whatever responses do, count a stalled driver's late arrivals missed
-    /// instead of bursting them, count arrivals over the in-flight bound
-    /// capped, and spread contention 70/10/10/10 with both modes per tenant.
+    /// L2 declares one contention step at the default rate with the SLO
+    /// defaults, keeps the shared timing control, fixes explicit overrides before execution in its controls,
+    /// and refuses invalid values.
     ///
     /// # Panics
     ///
-    /// Panics when a selection, schedule, or driver count is wrong.
+    /// Panics when a default, override, or refusal is wrong.
     #[test]
-    fn capacity_arrivals_preserve_offered_rate_and_slo_inputs() {
-        let all = Capacity::parse(&line(&SLOS)).expect("the default selection");
-        assert_eq!(all.loads, Load::ALL.to_vec());
-        assert_eq!(all.rates, vec![50.0, 100.0, 250.0, 500.0, 1000.0]);
-        assert_eq!(all.slo.answer, Some(0.2));
-        assert_eq!(all.slo.stream, Some(1.1));
-        let buffered = Capacity::parse(&line(&[
-            "--case",
-            "1",
-            "--rates",
-            "250,50",
-            "--max-answer-ms",
-            "200",
-        ]))
-        .expect("a buffered selection needs only its bound");
-        assert_eq!(buffered.rates, vec![50.0, 250.0]);
+    fn capacity_declares_default_slos_and_recorded_overrides() {
+        let declared = declare(Level::Two, &line(&[]), base(Level::Two), Path::new("."))
+            .expect("the L2 declaration");
+        assert_eq!(declared.experiment, "capacity");
+        assert_eq!(declared.steps.len(), 1);
+        assert_eq!(declared.steps[0].id, CONTENTION);
+        assert_eq!(declared.steps[0].params["rate"], json!(DEFAULT_RATE));
+        assert_eq!(declared.controls["timing"], json!({ "method": "shared" }));
+        let limit = |declared: &super::Declaration, id: &str| {
+            declared
+                .criteria
+                .iter()
+                .find(|criterion| criterion.id == id)
+                .map(|criterion| criterion.rule.limit)
+        };
+        for (id, bound) in [
+            ("capacity-completion", 200.0),
+            ("capacity-first-token", 350.0),
+            ("capacity-stream", 1_100.0),
+            ("recovery-completion", 200.0),
+            ("capacity-backlog", DEFAULT_RATE),
+        ] {
+            assert_eq!(limit(&declared, id), Some(bound), "{id}");
+        }
+        assert!(declared.refusals().is_empty(), "{:?}", declared.refusals());
+        let overridden = declare(
+            Level::Two,
+            &line(&["--rate", "100", "--max-completion-ms", "150"]),
+            base(Level::Two),
+            Path::new("."),
+        )
+        .expect("an overridden declaration");
+        assert_eq!(limit(&overridden, "capacity-completion"), Some(150.0));
+        assert_eq!(limit(&overridden, "capacity-backlog"), Some(100.0));
         assert_eq!(
-            buffered.slo,
-            Slo {
-                answer: Some(0.2),
-                ..Slo::default()
-            }
+            overridden.controls["limits"]["slo_overrides"],
+            json!(["--max-completion-ms"])
         );
         for refused in [
-            &["--case", "2", "--max-answer-ms", "200"][..],
-            &["--case", "1"],
-            &["--case", "1", "--max-answer-ms", "0"],
-            &["--case", "1", "--max-answer-ms", "inf"],
-            &["--case", "1", "--max-answer-ms", "200", "--rates", "50,50"],
-            &["--case", "1", "--max-answer-ms", "200", "--rates", "-5"],
-            &["--case", "1", "--max-answer-ms", "200", "--clients", "4"],
-            &["--case", "4", "--max-answer-ms", "200"],
+            &["--rate", "0"][..],
+            &["--rate", "-5"],
+            &["--max-stream-ms", "inf"],
+            &["--max-first-token-ms", "0"],
+            &["--rate", "1", "--rate", "2"],
         ] {
-            assert!(Capacity::parse(&line(refused)).is_err(), "{refused:?}");
-        }
-
-        let planned = Schedule::new(vec![
-            (100.0, Duration::from_secs(1)),
-            (50.0, Duration::from_secs(2)),
-        ])
-        .planned();
-        assert_eq!(planned.len(), 200);
-        assert_eq!(planned[100].offset, Duration::from_secs(1));
-        assert_eq!(planned[101].offset, Duration::from_millis(1_020));
-
-        let contention: Vec<(usize, bool)> = (0..1_000)
-            .map(|index| Load::TenantContention.arrival(index))
-            .collect();
-        for (tenant, share) in [(0, 700), (1, 100), (2, 100), (3, 100)] {
-            let mine: Vec<bool> = contention
-                .iter()
-                .filter(|(owner, _)| *owner == tenant)
-                .map(|(_, stream)| *stream)
-                .collect();
-            assert_eq!(mine.len(), share, "tenant {tenant}");
-            assert_eq!(
-                mine.iter().filter(|stream| **stream).count(),
-                share / 2,
-                "tenant {tenant}"
+            assert!(
+                declare(Level::Two, &line(refused), base(Level::Two), Path::new(".")).is_err(),
+                "{refused:?}"
             );
         }
-
-        let runtime = tokio::runtime::Builder::new_current_thread()
-            .enable_time()
-            .start_paused(true)
-            .build()
-            .expect("a paused test runtime");
-        runtime.block_on(async {
-            // Responses far slower than the arrival interval keep the rate.
-            let schedule = Schedule::new(vec![(100.0, Duration::from_secs(1))]);
-            let slow = || async { tokio::time::sleep(Duration::from_secs(5)).await };
-            let driven = open_loop(
-                &schedule,
-                Instant::now(),
-                Arc::new(Semaphore::new(1_000)),
-                1_000,
-                |_| slow(),
-            )
-            .await;
-            assert_eq!(
-                (driven.scheduled, driven.sent, driven.missed, driven.capped),
-                (100, 100, 0, 0)
-            );
-            assert_eq!(driven.peak_in_flight, 100);
-            assert!(driven.lateness_us.iter().all(|late| *late == 0));
-            // Arrivals beyond the in-flight bound are capped, not queued.
-            let schedule = Schedule::new(vec![(100.0, Duration::from_millis(100))]);
-            let driven = open_loop(
-                &schedule,
-                Instant::now(),
-                Arc::new(Semaphore::new(2)),
-                2,
-                |_| slow(),
-            )
-            .await;
-            assert_eq!((driven.scheduled, driven.sent, driven.capped), (10, 2, 8));
-        });
-        // A driver stall misses the arrivals it overran instead of bursting
-        // them later; every arrival is accounted for.
-        let runtime = tokio::runtime::Builder::new_current_thread()
-            .enable_time()
-            .build()
-            .expect("a test runtime");
-        runtime.block_on(async {
-            let schedule = Schedule::new(vec![(1_000.0, Duration::from_millis(100))]);
-            let driven = open_loop(
-                &schedule,
-                Instant::now(),
-                Arc::new(Semaphore::new(1_000)),
-                1_000,
-                |planned| {
-                    if planned.index == 10 {
-                        std::thread::sleep(Duration::from_millis(60));
-                    }
-                    async {}
-                },
-            )
-            .await;
-            assert_eq!(driven.scheduled, 100);
-            assert!(driven.missed >= 30, "{driven:?}");
-            assert_eq!(driven.sent + driven.missed + driven.capped, 100);
-            assert!(driven.lateness_us.iter().all(|late| *late <= 20_000));
-        });
-    }
-
-    /// Both modes profile by default and not with `--no-profile`, write
-    /// separate output directories that replace only their own, and record
-    /// the same raw roundtrip fields and verdicts whether profiled or not.
-    ///
-    /// # Panics
-    ///
-    /// Panics when a mode's flags, output, samples, or verdicts differ.
-    #[test]
-    fn benchmark_modes_preserve_profiles_and_roundtrip_evidence() {
-        assert!(Overhead::parse(&line(&[])).expect("overhead").profile);
-        assert!(
-            !Overhead::parse(&line(&["--no-profile"]))
-                .expect("overhead")
-                .profile
-        );
-        assert!(Capacity::parse(&line(&SLOS)).expect("capacity").profile);
-        let mut quiet = SLOS.to_vec();
-        quiet.push("--no-profile");
-        assert!(!Capacity::parse(&line(&quiet)).expect("capacity").profile);
-
-        assert_ne!(OUTPUT, CAPACITY_OUTPUT);
-        let root = tempfile::tempdir().expect("a scratch directory");
-        let (overhead, capacity) = (root.path().join("overhead"), root.path().join("capacity"));
-        std::fs::create_dir_all(&capacity).expect("capacity output");
-        std::fs::write(capacity.join("report.md"), "kept").expect("capacity evidence");
-        std::fs::create_dir_all(&overhead).expect("overhead output");
-        std::fs::write(overhead.join("stale"), "old").expect("stale overhead evidence");
-        fresh(&overhead).expect("a fresh overhead output");
-        assert!(!overhead.join("stale").exists());
-        assert!(capacity.join("report.md").exists());
-
-        let rendered = |profiled: bool| {
-            let mut step = Step {
-                name: "1 chat 16".to_owned(),
-                clients: 16,
-                ..Step::default()
-            };
-            step.samples.arrivals = 2;
-            step.samples.completion_us = vec![300, 400];
-            step.profile_gaps = profiled.then(Vec::new);
-            let mut measured = Measured {
-                name: "1 buffered 50/s".to_owned(),
-                rate: 50.0,
-                seconds: 60.0,
-                ..Measured::default()
-            };
-            measured.profile_gaps = profiled.then(Vec::new);
-            let directory = tempfile::tempdir().expect("a report directory");
-            let mut report = Report::new("overhead".to_owned(), OVERHEAD_HEADER, 64 << 30);
-            report.overhead(&step);
-            report
-                .write_to(directory.path())
-                .expect("the overhead report");
-            let mut lines =
-                std::fs::read_to_string(directory.path().join("samples.jsonl")).expect("samples");
-            let mut verdicts =
-                std::fs::read_to_string(directory.path().join("report.md")).expect("report");
-            let mut report = Report::new("capacity".to_owned(), CAPACITY_HEADER, 64 << 30);
-            let slo = Slo {
-                answer: Some(0.2),
-                ..Slo::default()
-            };
-            report.rate(Load::Buffered, &measured, &slo);
-            report
-                .write_to(directory.path())
-                .expect("the capacity report");
-            lines.push_str(
-                &std::fs::read_to_string(directory.path().join("samples.jsonl")).expect("samples"),
-            );
-            verdicts.push_str(
-                &std::fs::read_to_string(directory.path().join("report.md")).expect("report"),
-            );
-            let keys: Vec<Vec<String>> = lines
-                .lines()
-                .map(|line| {
-                    let value: serde_json::Value = serde_json::from_str(line).expect("a JSON line");
-                    assert_eq!(value["profiled"], profiled);
-                    value
-                        .as_object()
-                        .expect("an object")
-                        .keys()
-                        .cloned()
-                        .collect()
-                })
-                .collect();
-            let verdicts: Vec<String> = verdicts
-                .lines()
-                .filter(|line| line.starts_with("| 1 "))
-                .map(|line| line.rsplit(" | ").nth(1).unwrap_or_default().to_owned())
-                .collect();
-            (keys, verdicts)
-        };
-        let (profiled_keys, profiled_verdicts) = rendered(true);
-        let (quiet_keys, quiet_verdicts) = rendered(false);
-        assert_eq!(profiled_keys, quiet_keys);
-        assert!(profiled_keys[0].contains(&"completion_us".to_owned()));
-        assert!(profiled_keys[1].contains(&"calls".to_owned()));
-        assert_eq!(profiled_verdicts, quiet_verdicts);
-        assert_eq!(profiled_verdicts.len(), 5, "{profiled_verdicts:?}");
     }
 }

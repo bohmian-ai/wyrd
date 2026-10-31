@@ -100,7 +100,11 @@ impl ProfileFamily {
     /// Emits one settled unit's `events`: each adds to this family's
     /// `event`-labelled counter of its kind, the profile counter increments
     /// once, and one DEBUG event renders the unit's events.
+    ///
+    /// The events are rendered only when that DEBUG event is enabled, so a
+    /// unit settled with DEBUG off pays for the counters alone.
     pub(crate) fn emit(self, events: &BTreeMap<String, ProfileValue>) {
+        let render = tracing::enabled!(tracing::Level::DEBUG);
         let mut rendered = String::new();
         for (event, value) in events {
             let (family, amount, unit) = match *value {
@@ -108,9 +112,51 @@ impl ProfileFamily {
                 ProfileValue::Count(amount) => (self.counts, amount, ""),
             };
             metrics::counter!(family, "event" => event.clone()).increment(amount);
-            let _ = write!(rendered, "{event}={amount}{unit} ");
+            if render {
+                let _ = write!(rendered, "{event}={amount}{unit} ");
+            }
         }
         metrics::counter!(self.profiles).increment(1);
-        tracing::debug!(profile = rendered.trim_end(), "{}", self.message);
+        if render {
+            tracing::debug!(profile = rendered.trim_end(), "{}", self.message);
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::BTreeMap;
+
+    use super::{ProfileFamily, ProfileValue};
+
+    /// A unit settled with DEBUG off skips rendering yet still adds every
+    /// event to its counter and counts the profile once.
+    ///
+    /// # Panics
+    ///
+    /// Panics when DEBUG is enabled on the test thread or a counter is not
+    /// emitted.
+    #[test]
+    fn emit_counts_events_without_debug() {
+        let recorder = wyrd_bench::BenchmarkRecorder::default();
+        let events = BTreeMap::from([
+            ("stage".to_owned(), ProfileValue::Nanoseconds(5)),
+            ("rows".to_owned(), ProfileValue::Count(3)),
+        ]);
+        metrics::with_local_recorder(&recorder, || {
+            assert!(!tracing::enabled!(tracing::Level::DEBUG));
+            ProfileFamily::SCRIBE_WRITE.emit(&events);
+        });
+        let counters = recorder.snapshot().counters;
+
+        assert_eq!(
+            counters.get("scribe_write_profile_nanoseconds_total{event=\"stage\"}"),
+            Some(&5)
+        );
+        assert_eq!(
+            counters.get("scribe_write_profile_count_total{event=\"rows\"}"),
+            Some(&3)
+        );
+        assert_eq!(counters.get("scribe_write_profiles_total"), Some(&1));
     }
 }

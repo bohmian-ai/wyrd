@@ -1,0 +1,556 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Wyrd Benchmark Results</title>
+<style>
+:root {
+  --bg: #fbfbfa; --panel: #ffffff; --ink: #1d1f23; --muted: #5f6570; --line: #e2e4e8;
+  --accent: #2f5bd3; --pass: #1f7a46; --pass-bg: #e3f3e9; --fail: #b3261e; --fail-bg: #fbe6e4;
+  --invalid: #8a5a00; --invalid-bg: #fdf1d8; --none: #6b7280; --none-bg: #eef0f3;
+  --better: #1f7a46; --worse: #b3261e; --limit: #b3261e; --grid: #eceef1;
+}
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    --bg: #15171a; --panel: #1c1f23; --ink: #e7e9ec; --muted: #a0a6b0; --line: #2e3238;
+    --accent: #8aa8ff; --pass: #6fd39a; --pass-bg: #173524; --fail: #ff8f86; --fail-bg: #3d1d1b;
+    --invalid: #f2c46b; --invalid-bg: #3a2e14; --none: #a0a6b0; --none-bg: #2a2e34;
+    --better: #6fd39a; --worse: #ff8f86; --limit: #ff8f86; --grid: #262a30;
+  }
+}
+:root[data-theme="dark"] {
+  --bg: #15171a; --panel: #1c1f23; --ink: #e7e9ec; --muted: #a0a6b0; --line: #2e3238;
+  --accent: #8aa8ff; --pass: #6fd39a; --pass-bg: #173524; --fail: #ff8f86; --fail-bg: #3d1d1b;
+  --invalid: #f2c46b; --invalid-bg: #3a2e14; --none: #a0a6b0; --none-bg: #2a2e34;
+  --better: #6fd39a; --worse: #ff8f86; --limit: #ff8f86; --grid: #262a30;
+}
+* { box-sizing: border-box; }
+body { margin: 0; background: var(--bg); color: var(--ink);
+  font: 15px/1.5 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; }
+header { border-bottom: 1px solid var(--line); background: var(--panel); }
+.wrap { max-width: 1180px; margin: 0 auto; padding: 0 16px; }
+header .wrap { display: flex; flex-wrap: wrap; gap: 12px; align-items: center; padding-top: 12px; padding-bottom: 12px; }
+header h1 { font-size: 17px; margin: 0; flex: 1 1 auto; }
+header h1 a { color: inherit; text-decoration: none; }
+select, button { font: inherit; color: inherit; background: var(--panel); border: 1px solid var(--line);
+  border-radius: 6px; padding: 4px 8px; max-width: 100%; }
+button { cursor: pointer; }
+main { padding: 20px 0 64px; }
+h2 { font-size: 22px; margin: 0 0 4px; }
+h3 { font-size: 16px; margin: 28px 0 8px; }
+h4 { font-size: 14px; margin: 18px 0 6px; color: var(--muted); text-transform: uppercase; letter-spacing: .04em; }
+p { margin: 6px 0; }
+.muted { color: var(--muted); }
+.small { font-size: 13px; }
+.question { border-left: 3px solid var(--accent); padding: 4px 12px; margin: 10px 0 16px; font-style: italic; }
+.panel { background: var(--panel); border: 1px solid var(--line); border-radius: 8px; padding: 14px 16px; margin: 12px 0; }
+.scroll { overflow-x: auto; }
+table { border-collapse: collapse; width: 100%; font-size: 14px; }
+th, td { text-align: left; padding: 6px 10px; border-bottom: 1px solid var(--line); vertical-align: top; }
+th { font-weight: 600; color: var(--muted); font-size: 12px; text-transform: uppercase; letter-spacing: .03em; white-space: nowrap; }
+td.num, th.num { text-align: right; font-variant-numeric: tabular-nums; white-space: nowrap; }
+tr.clickable { cursor: pointer; }
+tr.clickable:hover td { background: var(--grid); }
+tr.selected td { background: var(--grid); }
+code, .mono { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 13px; }
+.badge { display: inline-block; padding: 1px 8px; border-radius: 999px; font-size: 12px; font-weight: 700; letter-spacing: .03em; white-space: nowrap; }
+.VALID, .met { color: var(--pass); background: var(--pass-bg); }
+.missed { color: var(--fail); background: var(--fail-bg); }
+.INVALID, .invalid { color: var(--invalid); background: var(--invalid-bg); }
+.NONE, .unsettled { color: var(--none); background: var(--none-bg); }
+.better { color: var(--better); }
+.worse { color: var(--worse); }
+.controls { display: flex; flex-wrap: wrap; gap: 10px 16px; align-items: center; margin: 8px 0; }
+.controls label { display: flex; gap: 6px; align-items: center; font-size: 14px; }
+dl.method { display: grid; grid-template-columns: minmax(120px, 200px) 1fr; gap: 6px 16px; margin: 0; }
+dl.method dt { color: var(--muted); }
+dl.method dd { margin: 0; overflow-wrap: anywhere; }
+details { margin: 6px 0; }
+summary { cursor: pointer; color: var(--accent); }
+.warn { border-left: 3px solid var(--invalid); padding: 6px 12px; background: var(--invalid-bg); border-radius: 4px; margin: 8px 0; }
+svg text { fill: var(--muted); font-size: 11px; }
+svg .axis { stroke: var(--line); }
+svg .gridline { stroke: var(--grid); }
+svg .whisker { stroke: var(--muted); stroke-width: 1.5; }
+svg .limit { stroke: var(--limit); stroke-dasharray: 6 4; stroke-width: 1.5; }
+svg .limit-label { fill: var(--limit); }
+svg .pt { cursor: pointer; stroke-width: 2; }
+svg .pt.VALID { fill: var(--pass); stroke: var(--pass); }
+svg .pt.INVALID { fill: var(--panel); stroke: var(--invalid); }
+svg .pt.sel { stroke: var(--accent); stroke-width: 3; }
+.legend { display: flex; flex-wrap: wrap; gap: 14px; font-size: 13px; color: var(--muted); margin-top: 4px; }
+.dot { display: inline-block; width: 10px; height: 10px; border-radius: 50%; margin-right: 5px; vertical-align: -1px; border: 2px solid; }
+.dot.VALID { background: var(--pass); border-color: var(--pass); }
+.dot.INVALID { background: var(--panel); border-color: var(--invalid); }
+td.note { min-width: 180px; max-width: 320px; overflow-wrap: anywhere; }
+.empty { padding: 32px; text-align: center; color: var(--muted); }
+@media (max-width: 640px) {
+  dl.method { grid-template-columns: 1fr; }
+  dl.method dt { margin-top: 6px; }
+  h2 { font-size: 19px; }
+}
+</style>
+</head>
+<body>
+<header>
+  <div class="wrap">
+    <h1><a href="#">Wyrd benchmark results</a></h1>
+    <select id="experiment" aria-label="Experiment"></select>
+    <button id="theme" type="button" title="Switch light and dark">Theme</button>
+  </div>
+</header>
+<main class="wrap" id="main"></main>
+<script id="records" type="application/json">/*RECORDS*/[]</script>
+<script>
+"use strict";
+const ENTRIES = JSON.parse(document.getElementById("records").textContent);
+const VERDICTS = { VALID: "Valid", INVALID: "Invalid" };
+const VERDICT_MEANING = {
+  VALID: "the measurement was trustworthy and complete and every correctness and integrity criterion held; targets are reported, never judged into the verdict",
+  INVALID: "the measurement could not support a result; see the reasons",
+};
+const OUTCOME_MEANING = {
+  met: "the median meets the target",
+  missed: "the median misses the target; the run stays valid",
+  unsettled: "the reading's precision cannot settle the target",
+  INVALID: "a correctness or integrity criterion failed in some repetition",
+};
+const OPS = { lt: "<", le: "≤", gt: ">", ge: "≥" };
+
+// ---------- helpers ----------
+const el = (tag, attrs = {}, ...kids) => {
+  const node = document.createElement(tag);
+  for (const [k, v] of Object.entries(attrs)) {
+    if (v == null || v === false) continue;
+    if (k === "class") node.className = v;
+    else if (k.startsWith("on")) node.addEventListener(k.slice(2), v);
+    else node.setAttribute(k, v === true ? "" : v);
+  }
+  for (const kid of kids.flat()) if (kid != null && kid !== false) node.append(kid instanceof Node ? kid : String(kid));
+  return node;
+};
+const svgEl = (tag, attrs = {}, ...kids) => {
+  const node = document.createElementNS("http://www.w3.org/2000/svg", tag);
+  for (const [k, v] of Object.entries(attrs)) if (v != null) node.setAttribute(k, v);
+  for (const kid of kids.flat()) if (kid != null) node.append(kid instanceof Node ? kid : String(kid));
+  return node;
+};
+const sig = (v) => {
+  if (v == null || !Number.isFinite(v)) return "—";
+  if (v === 0) return "0";
+  const a = Math.abs(v);
+  if (a >= 1000) return Math.round(v).toLocaleString("en-US");
+  return String(Number(v.toPrecision(3)));
+};
+const unitText = (unit) => (unit ? " " + unit : "");
+const reading = (r, unit) => {
+  if (!r) return { text: "—", title: "not recorded" };
+  if (r.value == null && r.above != null) return { text: "> " + sig(r.above) + unitText(unit), title: "censored: only known to exceed " + r.above };
+  if (r.value == null) return { text: "—", title: r.reason || "missing" };
+  let title = "";
+  if (r.above != null) title = "histogram bucket: above " + r.above + " and at most " + r.value;
+  if (r.samples != null) title += (title ? "; " : "") + r.samples.toLocaleString("en-US") + " samples";
+  if (r.rank != null) title += "; rank " + r.rank.toLocaleString("en-US");
+  return { text: sig(r.value) + unitText(unit), title };
+};
+const valueOf = (r) => (r && r.value != null ? r.value : null);
+const badge = (label) => el("span", { class: "badge " + (VERDICTS[label] || OUTCOME_MEANING[label] ? label : "NONE"), title: VERDICT_MEANING[label] || OUTCOME_MEANING[label] || "" }, label || "—");
+const when = (iso) => (iso ? iso.replace("T", " ").replace(/\.\d+/, "").replace("Z", " UTC") : "unknown time");
+const shortWhen = (iso) => (iso ? iso.slice(5, 16).replace("T", " ") : "?");
+const short = (sha) => (sha ? sha.slice(0, 9) : "—");
+const plural = (n, word) => n + " " + word + (n === 1 ? "" : "s");
+
+// ---------- data ----------
+const groups = new Map();
+for (const entry of ENTRIES) {
+  const r = entry.record || {};
+  const key = (r.engine || "unknown") + "/" + (r.experiment || "unknown");
+  if (!groups.has(key)) groups.set(key, []);
+  groups.get(key).push(entry);
+}
+for (const runs of groups.values()) runs.sort((a, b) => (a.record.started_at || a.path).localeCompare(b.record.started_at || b.path));
+const keys = [...groups.keys()].sort();
+
+const limitCriteria = (record) => (record.criteria && record.criteria.criteria) || [];
+const metricDecl = (record, id) => ((record.criteria && record.criteria.metrics) || []).find((m) => m.id === id);
+const stepOf = (record, id) => (record.steps || []).find((s) => s.id === id);
+const summaryOf = (record, step, metric) => {
+  const s = stepOf(record, step);
+  return s && s.summary ? s.summary[metric] : undefined;
+};
+const unitOf = (runs, metric) => {
+  for (const run of runs) {
+    const decl = metricDecl(run.record, metric);
+    if (decl && decl.unit) return decl.unit;
+    for (const step of run.record.steps || []) {
+      const s = step.summary && step.summary[metric];
+      if (s && s.unit) return s.unit;
+    }
+  }
+  return "";
+};
+const objectiveTally = (record) => {
+  let pass = 0, total = 0;
+  const limits = new Set(limitCriteria(record).map((c) => c.id));
+  for (const step of record.steps || []) {
+    for (const j of step.criteria || []) {
+      if (!limits.has(j.criterion) || j.applicable === false) continue;
+      total += 1;
+      if (j.outcome === "met") pass += 1;
+    }
+  }
+  return { pass, total };
+};
+
+const runNotes = (entry) => {
+  const r = entry.record, notes = [];
+  const selection = r.controls && r.controls.selection;
+  if (selection && selection.length) notes.push("steps " + selection.join(", ") + " only");
+  if (r.artifacts && r.artifacts.profile && r.artifacts.profile.requested) notes.push("profiled");
+  const measured = (r.steps || []).some((s) => (s.repetitions || []).length);
+  if (!measured) {
+    const first = (r.reasons || [])[0];
+    const why = first ? first.message : "";
+    notes.push("nothing measured" + (why ? ": " + (why.length > 90 ? why.slice(0, 90) + "…" : why) : ""));
+  }
+  if (entry.problem) notes.push("older record format");
+  return notes.join(" · ");
+};
+
+// ---------- state ----------
+const state = { exp: null, run: null, cmp: [], metric: null, step: null };
+const readHash = () => {
+  const params = new URLSearchParams(location.hash.slice(1));
+  state.exp = params.get("exp");
+  state.run = params.get("run");
+  state.cmp = (params.get("cmp") || "").split(",").filter(Boolean);
+  state.metric = params.get("metric");
+  state.step = params.get("step");
+};
+const writeHash = () => {
+  const params = new URLSearchParams();
+  for (const k of ["exp", "run", "metric", "step"]) if (state[k]) params.set(k, state[k]);
+  if (state.cmp.length) params.set("cmp", state.cmp.join(","));
+  const next = "#" + params.toString();
+  if (location.hash !== next) history.replaceState(null, "", next);
+};
+const go = (changes) => { Object.assign(state, changes); writeHash(); render(); };
+
+// ---------- views ----------
+function overview() {
+  const rows = keys.map((key) => {
+    const runs = groups.get(key);
+    const last = runs[runs.length - 1].record;
+    const t = objectiveTally(last);
+    return el("tr", { class: "clickable", onclick: () => go({ exp: key, run: null, cmp: [], metric: null, step: null }) },
+      el("td", {}, last.engine || "—"),
+      el("td", {}, el("strong", {}, last.experiment || "—")),
+      el("td", { class: "num" }, last.level != null ? "L" + last.level : "—"),
+      el("td", { class: "num" }, runs.length),
+      el("td", { class: "num" }, when(last.started_at), el("div", { class: "small muted" }, runNotes(runs[runs.length - 1]))),
+      el("td", {}, badge(last.verdict)),
+      el("td", { class: "num" }, t.total ? t.pass + " / " + t.total : "—"),
+      el("td", { class: "small muted" }, last.question || ""));
+  });
+  return [
+    el("h2", {}, "Experiments"),
+    el("p", { class: "muted" }, plural(ENTRIES.length, "recorded run") + " across " + plural(keys.length, "experiment") +
+      ". Each run is one record under benchmarks/. Pick an experiment to read its latest result and compare its history."),
+    el("div", { class: "panel scroll" }, el("table", {},
+      el("thead", {}, el("tr", {}, ...["Engine", "Experiment", "Level", "Runs", "Latest run", "Verdict", "Limits met", "Question"].map((h, i) => el("th", { class: [2, 3, 4, 6].includes(i) ? "num" : null }, h)))),
+      el("tbody", {}, rows))),
+    el("p", { class: "small muted" }, "Verdicts: ", badge("VALID"), " " + VERDICT_MEANING.VALID + ". ",
+      badge("INVALID"), " " + VERDICT_MEANING.INVALID + ". \"Limits met\" counts the latest run's criteria whose outcome is met."),
+  ];
+}
+
+function metricOptions(runs) {
+  const first = new Set(), rest = new Set();
+  for (const run of runs) {
+    for (const c of limitCriteria(run.record)) first.add(c.metric);
+    for (const step of run.record.steps || []) for (const id of Object.keys(step.summary || {})) rest.add(id);
+  }
+  return [...first, ...[...rest].filter((id) => !first.has(id)).sort()];
+}
+function stepOptions(runs) {
+  const steps = [];
+  for (const run of runs) for (const step of run.record.steps || []) if (!steps.includes(step.id)) steps.push(step.id);
+  return steps;
+}
+function limitFor(runs, metric, step) {
+  for (let i = runs.length - 1; i >= 0; i -= 1) {
+    for (const c of limitCriteria(runs[i].record)) if (c.metric === metric && c.steps.includes(step)) return c;
+  }
+  return null;
+}
+
+function chart(runs, metric, step, unit, limit) {
+  const W = 860, H = 280, L = 64, R = 16, T = 18, B = 54;
+  const pts = runs.map((run, i) => {
+    const s = summaryOf(run.record, step, metric);
+    return { i, run, s, v: s ? valueOf(s.median) : null, lo: s ? s.min : null, hi: s ? s.max : null };
+  });
+  const values = pts.flatMap((p) => [p.v, p.lo, p.hi]).filter((v) => v != null && Number.isFinite(v));
+  if (limit && limit.rule.limit != null) values.push(limit.rule.limit);
+  if (!values.length) return el("p", { class: "empty" }, "No run recorded " + metric + " for " + step + ".");
+  let lo = Math.min(0, ...values), hi = Math.max(...values);
+  if (hi === lo) hi = lo + 1;
+  hi += (hi - lo) * 0.08;
+  const x = (i) => L + (runs.length === 1 ? (W - L - R) / 2 : (i * (W - L - R)) / (runs.length - 1));
+  const y = (v) => T + (H - T - B) * (1 - (v - lo) / (hi - lo));
+  const svg = svgEl("svg", { viewBox: `0 0 ${W} ${H}`, width: "100%", role: "img", "aria-label": `${metric} at ${step} across runs` });
+  for (let k = 0; k <= 4; k += 1) {
+    const v = lo + ((hi - lo) * k) / 4;
+    svg.append(svgEl("line", { class: "gridline", x1: L, x2: W - R, y1: y(v), y2: y(v) }));
+    svg.append(svgEl("text", { x: L - 6, y: y(v) + 4, "text-anchor": "end" }, sig(v)));
+  }
+  svg.append(svgEl("line", { class: "axis", x1: L, x2: W - R, y1: H - B, y2: H - B }));
+  svg.append(svgEl("text", { x: 12, y: T + (H - T - B) / 2, transform: `rotate(-90 12 ${T + (H - T - B) / 2})`, "text-anchor": "middle" }, unit || metric));
+  if (limit && limit.rule.limit != null) {
+    const ly = y(limit.rule.limit);
+    svg.append(svgEl("line", { class: "limit", x1: L, x2: W - R, y1: ly, y2: ly }));
+    svg.append(svgEl("text", { class: "limit-label", x: W - R, y: ly - 5, "text-anchor": "end" }, `limit ${OPS[limit.rule.op] || limit.rule.op} ${sig(limit.rule.limit)}${unitText(unit)}`));
+  }
+  const every = Math.max(1, Math.ceil(runs.length / 12));
+  for (const p of pts) {
+    const cx = x(p.i);
+    if (p.i % every === 0 || p.i === runs.length - 1) {
+      svg.append(svgEl("text", { x: cx, y: H - B + 16, "text-anchor": "end", transform: `rotate(-35 ${cx} ${H - B + 16})` }, shortWhen(p.run.record.started_at)));
+    }
+    if (p.v == null) continue;
+    if (p.lo != null && p.hi != null && p.hi > p.lo) {
+      svg.append(svgEl("line", { class: "whisker", x1: cx, x2: cx, y1: y(p.lo), y2: y(p.hi) }));
+      for (const v of [p.lo, p.hi]) svg.append(svgEl("line", { class: "whisker", x1: cx - 4, x2: cx + 4, y1: y(v), y2: y(v) }));
+    }
+    const verdict = VERDICTS[p.run.record.verdict] ? p.run.record.verdict : "INVALID";
+    const dot = svgEl("circle", { class: `pt ${verdict}${p.run.path === state.run ? " sel" : ""}`, cx, cy: y(p.v), r: 5 },
+      svgEl("title", {}, `${when(p.run.record.started_at)} · ${short(p.run.record.commit)} · ${p.run.record.verdict}\nmedian ${sig(p.v)}${unitText(unit)}` +
+        (p.lo != null ? `, repetitions ${sig(p.lo)}–${sig(p.hi)}` : "")));
+    dot.addEventListener("click", () => go({ run: p.run.path }));
+    svg.append(dot);
+  }
+  return el("div", {}, svg, el("div", { class: "legend" },
+    el("span", {}, el("span", { class: "dot VALID" }), "valid"), el("span", {}, el("span", { class: "dot INVALID" }), "invalid"),
+    el("span", {}, "dot = median of the repetitions; bar = lowest to highest repetition; click a dot to open that run")));
+}
+
+function experimentView(key) {
+  const runs = groups.get(key);
+  if (!runs) return [el("p", { class: "empty" }, "Unknown experiment " + key + ".")];
+  const latest = runs[runs.length - 1];
+  const metrics = metricOptions(runs), steps = stepOptions(runs);
+  const firstLimit = limitCriteria(latest.record)[0];
+  const metric = metrics.includes(state.metric) ? state.metric : (firstLimit ? firstLimit.metric : metrics[0]);
+  const step = steps.includes(state.step) ? state.step : (firstLimit && firstLimit.steps[0]) || steps[0];
+  const unit = unitOf(runs, metric);
+  const limit = limitFor(runs, metric, step);
+  const selected = runs.find((r) => r.path === state.run) || latest;
+  const decl = metricDecl(latest.record, metric);
+
+  const metricSelect = el("select", { onchange: (e) => go({ metric: e.target.value }) },
+    metrics.map((m) => el("option", { value: m, selected: m === metric }, m)));
+  const stepSelect = el("select", { onchange: (e) => go({ step: e.target.value }) },
+    steps.map((s) => el("option", { value: s, selected: s === step }, s)));
+
+  const head = [
+    el("p", { class: "muted small" }, (latest.record.engine || "") + " · level " + (latest.record.level ?? "—") + " · " + plural(runs.length, "run")),
+    el("h2", {}, latest.record.experiment),
+    el("p", { class: "question" }, latest.record.question || ""),
+  ];
+
+  const history = el("section", {},
+    el("h3", {}, "History"),
+    el("div", { class: "controls" }, el("label", {}, "Metric", metricSelect), el("label", {}, "Step", stepSelect)),
+    decl && decl.boundary ? el("p", { class: "small muted" }, el("strong", {}, metric + ": "), decl.boundary) : null,
+    el("div", { class: "panel" }, chart(runs, metric, step, unit, limit)));
+
+  const cmp = state.cmp.filter((p) => runs.some((r) => r.path === p));
+  const toggle = (path) => {
+    const next = cmp.includes(path) ? cmp.filter((p) => p !== path) : [...cmp, path];
+    go({ cmp: next });
+  };
+  const rows = runs.map((run) => {
+    const r = run.record, s = summaryOf(r, step, metric), t = objectiveTally(r);
+    const v = reading(s && s.median, unit);
+    return el("tr", { class: "clickable" + (run.path === selected.path ? " selected" : ""), onclick: () => go({ run: run.path }) },
+      el("td", { onclick: (e) => e.stopPropagation() }, el("input", { type: "checkbox", "aria-label": "compare", checked: cmp.includes(run.path), onchange: () => toggle(run.path) })),
+      el("td", { class: "num" }, when(r.started_at)),
+      el("td", {}, el("code", {}, short(r.commit)), r.dirty ? el("span", { class: "small muted" }, " dirty") : null),
+      el("td", {}, r.mode || "full"),
+      el("td", {}, badge(r.verdict)),
+      el("td", { class: "num", title: v.title }, v.text),
+      el("td", { class: "num" }, t.total ? t.pass + " / " + t.total : "—"),
+      el("td", { class: "small muted note" }, runNotes(run)));
+  });
+  const table = el("section", {},
+    el("h3", {}, "Runs, oldest first"),
+    el("p", { class: "small muted" }, "Click a run to read it below. Tick two or more to compare them side by side."),
+    el("div", { class: "panel scroll" }, el("table", {},
+      el("thead", {}, el("tr", {}, el("th", {}, "Compare"), el("th", { class: "num" }, "Started"), el("th", {}, "Commit"), el("th", {}, "Mode"),
+        el("th", {}, "Verdict"), el("th", { class: "num" }, metric + " @ " + step), el("th", { class: "num" }, "Limits met"), el("th", {}, "Note"))),
+      el("tbody", {}, rows))),
+    cmp.length ? el("p", {}, el("button", { type: "button", onclick: () => go({ cmp: [] }) }, "Clear comparison")) : null);
+
+  const compared = runs.filter((r) => cmp.includes(r.path));
+  return [...head, history, table, compared.length >= 2 ? compareView(compared, step) : null, runView(selected)];
+}
+
+function compareView(runs, step) {
+  const first = runs[0].record, last = runs[runs.length - 1].record;
+  const limits = new Map();
+  for (const run of runs) for (const c of limitCriteria(run.record)) if (c.steps.includes(step)) limits.set(c.metric, c);
+  const ids = [];
+  for (const id of limits.keys()) ids.push(id);
+  for (const run of runs) { const s = stepOf(run.record, step); for (const id of Object.keys((s && s.summary) || {})) if (!ids.includes(id)) ids.push(id); }
+  const rows = ids.map((id) => {
+    const unit = unitOf(runs, id);
+    const decl = metricDecl(last, id) || metricDecl(first, id);
+    const a = valueOf((summaryOf(first, step, id) || {}).median), b = valueOf((summaryOf(last, step, id) || {}).median);
+    let change = "—", cls = null;
+    if (a != null && b != null && a !== 0) {
+      const pct = ((b - a) / Math.abs(a)) * 100;
+      change = (pct > 0 ? "+" : "") + pct.toFixed(1) + "%";
+      if (decl && decl.direction && Math.abs(pct) >= 0.05) cls = (decl.direction === "higher") === pct > 0 ? "better" : "worse";
+      const c = limits.get(id);
+      if (!cls && c && Math.abs(pct) >= 0.05) cls = ((c.rule.op === "lt" || c.rule.op === "le") === pct < 0) ? "better" : "worse";
+    }
+    const c = limits.get(id);
+    return el("tr", {},
+      el("td", { title: decl ? decl.boundary : "" }, el("code", {}, id), c ? el("div", { class: "small muted" }, "limit " + (OPS[c.rule.op] || c.rule.op) + " " + sig(c.rule.limit) + unitText(unit)) : null),
+      ...runs.map((run) => { const r = reading((summaryOf(run.record, step, id) || {}).median, unit); return el("td", { class: "num", title: r.title }, r.text); }),
+      el("td", { class: "num " + (cls || "") }, change));
+  });
+  return el("section", {},
+    el("h3", {}, "Comparison at " + step),
+    el("p", { class: "small muted" }, "Medians of each run's repetitions, oldest first. Change is the last selected run against the first; green is better and red worse where the metric declares a direction or a limit."),
+    el("div", { class: "panel scroll" }, el("table", {},
+      el("thead", {}, el("tr", {}, el("th", {}, "Metric"), ...runs.map((run) => el("th", { class: "num" }, shortWhen(run.record.started_at), el("br"), el("code", {}, short(run.record.commit)), el("br"), badge(run.record.verdict))), el("th", { class: "num" }, "Change"))),
+      el("tbody", {}, rows))));
+}
+
+function outcome(record) {
+  const items = [];
+  const limits = limitCriteria(record);
+  for (const c of limits) {
+    for (const stepId of c.steps) {
+      const step = stepOf(record, stepId);
+      const j = step && (step.criteria || []).find((x) => x.criterion === c.id);
+      if (!j) continue;
+      const unit = (step.summary && step.summary[c.metric] && step.summary[c.metric].unit) || (metricDecl(record, c.metric) || {}).unit || "";
+      const obs = reading(j.observed, unit);
+      items.push(el("tr", {},
+        el("td", {}, el("strong", {}, c.id)),
+        el("td", {}, stepId),
+        el("td", { class: "num", title: obs.title }, obs.text),
+        el("td", { class: "num" }, (OPS[c.rule.op] || c.rule.op) + " " + sig(c.rule.limit) + unitText(unit) + (c.rule.over ? " (" + c.rule.over + ")" : "")),
+        el("td", {}, j.applicable === false ? badge("NONE") : badge(j.outcome)),
+        el("td", { class: "small muted" }, j.reason || "")));
+    }
+  }
+  return items;
+}
+
+function reasonGroups(record) {
+  const byCode = new Map();
+  for (const r of record.reasons || []) {
+    const k = r.code || "reason";
+    if (!byCode.has(k)) byCode.set(k, []);
+    byCode.get(k).push(r);
+  }
+  return [...byCode.entries()].map(([code, list]) => el("li", {},
+    el("code", {}, code), " × " + list.length + ": ", list[0].message,
+    list.length > 1 ? el("details", {}, el("summary", {}, "all " + list.length),
+      el("ul", { class: "small" }, list.map((r) => el("li", {}, (r.step ? r.step + " · " : "") + (r.criterion ? r.criterion + ": " : "") + r.message)))) : null));
+}
+
+function stepResults(record, step) {
+  const crit = new Set(((record.criteria && record.criteria.criteria) || []).filter((c) => c.steps.includes(step.id)).map((c) => c.metric));
+  const ids = Object.keys(step.summary || {}).sort((a, b) => (crit.has(b) - crit.has(a)) || a.localeCompare(b));
+  const reps = step.repetitions || [];
+  const rows = ids.map((id) => {
+    const s = step.summary[id], decl = metricDecl(record, id), unit = s.unit || (decl && decl.unit) || "";
+    const med = reading(s.median, unit);
+    return el("tr", {},
+      el("td", { title: decl ? decl.boundary : "" }, el("code", {}, id), crit.has(id) ? el("span", { class: "small muted" }, " judged") : null),
+      el("td", { class: "num", title: med.title }, el("strong", {}, med.text)),
+      el("td", { class: "num" }, s.min != null ? sig(s.min) + " – " + sig(s.max) : "—"),
+      ...reps.map((rep) => { const r = reading((rep.metrics || {})[id], ""); return el("td", { class: "num", title: r.title }, r.text); }),
+      el("td", { class: "small muted" }, decl ? decl.boundary : ""));
+  });
+  return el("div", {},
+    el("h4", {}, step.id + "  ", el("span", { class: "mono small" }, JSON.stringify(step.params || {})), "  ", badge(step.verdict)),
+    step.status && step.status !== "measured" ? el("p", { class: "small muted" }, "status: " + step.status) : null,
+    el("div", { class: "panel scroll" }, el("table", {},
+      el("thead", {}, el("tr", {}, el("th", {}, "Metric"), el("th", { class: "num" }, "Median"), el("th", { class: "num" }, "Range"),
+        ...reps.map((_, i) => el("th", { class: "num" }, "Rep " + (i + 1))), el("th", {}, "Definition"))),
+      el("tbody", {}, rows))),
+    reps.some((rep) => (rep.observations || []).length || (rep.invalid || []).length) ? el("details", {}, el("summary", {}, "Server component observations and repetition notes"),
+      reps.map((rep, i) => el("div", { class: "small" }, el("strong", {}, "Repetition " + (i + 1)),
+        el("ul", {}, [...(rep.invalid || []).map((t) => el("li", { class: "worse" }, t)), ...(rep.observations || []).map((t) => el("li", { class: "mono" }, t))])))) : null);
+}
+
+function methodList(record) {
+  const t = record.controls && record.controls.timing, v = record.controls && record.controls.validity;
+  const values = (record.controls && record.controls.values) || {};
+  const host = record.host || {}, build = record.build || {};
+  const pairs = [
+    ["Started", when(record.started_at) + (record.elapsed_seconds != null ? " · ran " + sig(record.elapsed_seconds) + " s" : "")],
+    ["Source", el("span", {}, el("code", {}, record.commit || "—"), record.dirty ? " · dirty (diff " + short(record.diff_sha256) + ")" : " · clean")],
+    ["Command", el("code", {}, "capacity " + ((record.command && record.command.args) || []).join(" "))],
+    ["Variables", el("code", {}, JSON.stringify(record.variables || {}))],
+    t ? ["Timing", `${t.warmup_seconds} s discarded warmup, then ${t.repetitions} × ${t.repetition_seconds} s measured repetitions per step; budget ${t.budget_seconds} s`] : null,
+    v ? ["Validity rules", `host quiet: other processes ≤ ${v.host_busy_fraction * 100}% of CPUs over ${v.host_sample_seconds} s before and after; driver ≤ ${v.driver_fraction * 100}% of ${v.driver_cores} cores; open-loop send lateness p99 ≤ ${v.lateness_p99_us / 1000} ms; at least ${v.p99_samples} samples per p99 and ${v.p95_samples} per p95`] : null,
+    ["Host", `${host.fingerprint || host.cpu_model || "—"} · ${host.os_version || host.os || ""} ${host.arch || ""}`],
+    ["Storage", host.storage || "—"],
+    ["Build", `${build.profile || ""} · ${build.compiler || ""} · ${build.rustflags || ""}`],
+    ...Object.entries(values).filter(([k]) => k !== "timing").map(([k, val]) => [k[0].toUpperCase() + k.slice(1), typeof val === "string" ? val : el("code", {}, JSON.stringify(val))]),
+    values.timing ? ["Latency method", el("div", {}, ...Object.entries(values.timing).map(([k, val]) => el("div", { class: "small" }, el("span", { class: "muted" }, k + ": "), typeof val === "string" ? val : JSON.stringify(val))))] : null,
+  ].filter(Boolean);
+  return el("dl", { class: "method" }, pairs.flatMap(([k, val]) => [el("dt", {}, k), el("dd", {}, val)]));
+}
+
+function runView(run) {
+  const r = run.record;
+  const items = outcome(r);
+  const tally = objectiveTally(r);
+  return el("section", {},
+    el("h3", {}, "Run ", when(r.started_at), " ", badge(r.verdict)),
+    el("p", { class: "small muted" }, el("code", {}, run.path), " · schema " + (r.schema_version ?? "?") + " · " + (r.mode || "full") + " mode", runNotes(run) ? " · " + runNotes(run) : ""),
+    run.problem ? el("p", { class: "warn small" }, "This record does not read as a current record (" + run.problem + "). It is shown as stored; some sections may be incomplete.") : null,
+    el("h4", {}, "Result"),
+    el("p", {}, VERDICT_MEANING[r.verdict] ? "Verdict " + r.verdict + ": " + VERDICT_MEANING[r.verdict] + "." : ""),
+    items.length ? el("div", { class: "panel scroll" }, el("p", { class: "small muted" }, tally.pass + " of " + tally.total + " absolute limits met."),
+      el("table", {}, el("thead", {}, el("tr", {}, ...["Criterion", "Step", "Observed", "Limit", "Verdict", "Reason"].map((h, i) => el("th", { class: i === 2 || i === 3 ? "num" : null }, h)))), el("tbody", {}, items))) : null,
+    (r.reasons || []).length ? el("div", {}, el("p", {}, el("strong", {}, "Why the verdict is " + r.verdict + ":")), el("ul", {}, reasonGroups(r))) : null,
+    el("h4", {}, "Method"),
+    el("div", { class: "panel" }, methodList(r)),
+    el("h4", {}, "Results by step"),
+    el("p", { class: "small muted" }, "Each value is the median of the step's repetitions; Range is the lowest to highest repetition. Latency percentiles are the server's own timings; hover a value for its histogram bucket and sample count."),
+    (r.steps || []).map((step) => stepResults(r, step)));
+}
+
+// ---------- shell ----------
+function render() {
+  const select = document.getElementById("experiment");
+  select.replaceChildren(el("option", { value: "" }, "All experiments"),
+    ...keys.map((k) => el("option", { value: k, selected: k === state.exp }, k + " (" + groups.get(k).length + ")")));
+  const main = document.getElementById("main");
+  if (!ENTRIES.length) {
+    main.replaceChildren(el("p", { class: "empty" }, "No records. Run a benchmark, then `mise run bench:results`."));
+    return;
+  }
+  main.replaceChildren(...(state.exp && groups.has(state.exp) ? experimentView(state.exp) : overview()).filter(Boolean));
+}
+document.getElementById("experiment").addEventListener("change", (e) => go({ exp: e.target.value || null, run: null, cmp: [], metric: null, step: null }));
+document.getElementById("theme").addEventListener("click", () => {
+  const root = document.documentElement;
+  const dark = root.dataset.theme ? root.dataset.theme === "dark" : matchMedia("(prefers-color-scheme: dark)").matches;
+  root.dataset.theme = dark ? "light" : "dark";
+});
+window.addEventListener("hashchange", () => { readHash(); render(); });
+readHash();
+render();
+</script>
+</body>
+</html>

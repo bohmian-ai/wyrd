@@ -164,7 +164,7 @@ Each citation names an original input slot and a location in it, such as `{ "slo
 
 ## 4. Confirm the result was stored
 
-After it answers, the server stores the pinned inputs and the result in `bifrost.verification.results`, tied to your run, with `binding_id` null. A `verify` call never starts queued work and never runs Operators.
+After it answers, the server stores the pinned inputs in `bifrost.verification.execution_inputs` and the result in `bifrost.verification.results`, tied to your run, with `binding_id` null. A `verify` call never starts queued work and never runs Operators.
 
 <LangTabs langs={['python', 'rust', 'typescript']}>
 <LangTab lang="python">

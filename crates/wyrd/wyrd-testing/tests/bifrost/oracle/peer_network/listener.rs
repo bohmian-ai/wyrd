@@ -547,10 +547,12 @@ async fn a_frame_above_the_tonic_default_is_acknowledged_and_retained(
         operation.clone(),
         wyrd_spec::vala::api::AuditOutcome::Allowed,
     );
-    let batch = vala_bifrost_redux::tables::audit::projection::project_audit_event(
-        &event,
-        chrono::Utc::now(),
-    )?;
+    let batch = vala_bifrost_redux::tables::staged::StagedRow::project(&[
+        vala_bifrost_redux::tables::audit::projection::stage_audit_event(
+            &event,
+            chrono::Utc::now(),
+        )?,
+    ])?;
     let mut writer = arrow::ipc::writer::StreamWriter::try_new(Vec::new(), &batch.schema())?;
     writer.write(&batch)?;
     writer.finish()?;

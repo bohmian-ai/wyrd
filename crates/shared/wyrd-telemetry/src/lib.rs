@@ -4,12 +4,18 @@
 
 mod context;
 mod export;
+mod log_writer;
+pub mod timing;
 
 pub use context::{
     caller_sampled, continued_context, current_context, inbound_context, serve_linked_work,
     serve_request,
 };
-pub use export::{TenantSpanRoute, TenantSpanSink, bind_operation_route, bind_tenant_route};
+pub use export::{
+    TRACE_EXPORT_FAILED_BATCHES_TOTAL, TenantSpanRoute, TenantSpanSink, bind_operation_route,
+    bind_tenant_route,
+};
+pub use log_writer::LOG_LINES_DROPPED_TOTAL;
 
 #[cfg(feature = "test-support")]
 use std::collections::BTreeMap;
@@ -23,15 +29,21 @@ use wyrd_spec::error::WyrdError;
 #[derive(Debug, Clone, PartialEq, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct TelemetryConfig {
-    /// Env filter directive.
+    /// Log output filter directive.
     pub filter: String,
+    /// Operator trace verbosity: the filter directive selecting which spans
+    /// and events reach the operator's trace backend. It never removes a
+    /// tenant copy.
+    #[serde(default = "default_trace_filter")]
+    pub trace_filter: String,
     /// Optional OTLP endpoint URL.
     pub endpoint: Option<String>,
     /// Logical service name reported by exporters.
     pub service_name: Option<String>,
     /// OTLP transport protocol.
     pub protocol: OtlpProtocol,
-    /// Optional sampling ratio in the `0.0..=1.0` range.
+    /// Operator sampling ratio in the `0.0..=1.0` range; unset selects
+    /// [`TelemetryConfig::operator_sample_ratio`]'s default.
     pub sample_ratio: Option<f64>,
     /// Optional exporter timeout in milliseconds.
     pub export_timeout_ms: Option<u64>,
@@ -41,6 +53,7 @@ impl Default for TelemetryConfig {
     fn default() -> Self {
         Self {
             filter: "info".to_string(),
+            trace_filter: default_trace_filter(),
             endpoint: None,
             service_name: None,
             protocol: OtlpProtocol::Grpc,
@@ -48,6 +61,32 @@ impl Default for TelemetryConfig {
             export_timeout_ms: None,
         }
     }
+}
+
+impl TelemetryConfig {
+    /// The operator sampling ratio: `sample_ratio`, or 0.01 when unset.
+    ///
+    /// This is the one default and validation of the ratio. `0.0` exports no
+    /// trace and `1.0` every trace; the ratio applies only to the operator,
+    /// never to tenant copies.
+    ///
+    /// # Errors
+    ///
+    /// Returns the reason when `sample_ratio` is outside `0.0..=1.0` or NaN.
+    pub fn operator_sample_ratio(&self) -> Result<f64, String> {
+        match self.sample_ratio {
+            None => Ok(0.01),
+            Some(ratio) if (0.0..=1.0).contains(&ratio) => Ok(ratio),
+            Some(ratio) => Err(format!(
+                "telemetry.sample_ratio must be in [0.0, 1.0], got {ratio}"
+            )),
+        }
+    }
+}
+
+/// Default operator trace verbosity.
+fn default_trace_filter() -> String {
+    "info".to_owned()
 }
 
 /// OTLP exporter protocol selection.
@@ -63,13 +102,17 @@ pub enum OtlpProtocol {
 
 /// Guard returned by [`init`] and [`init_test_only_no_global`].
 ///
-/// Drop (or call [`TelemetryGuard::shutdown`]) to cleanly flush and shut down
-/// any wired OTLP exporters before the process exits.
+/// Drop it (or call [`TelemetryGuard::shutdown`]) after serving stops to
+/// flush and shut down the tracer provider, even though the global
+/// subscriber still holds a tracer.
 #[must_use = "TelemetryGuard must outlive the process and be dropped on shutdown"]
 #[derive(Debug)]
 pub struct TelemetryGuard {
     config: TelemetryConfig,
     tracer_provider: Option<opentelemetry_sdk::trace::SdkTracerProvider>,
+    /// The formatted-log writer thread of [`init`]; dropping it drains the
+    /// lines still queued for stdout.
+    log_writer: Option<log_writer::LogWriter>,
 }
 
 /// Read-only representation of one finished production-pipeline span.
@@ -261,15 +304,40 @@ impl TelemetryGuard {
         }
     }
 
-    /// Shut down telemetry exports.
+    /// Shut down telemetry exports now rather than when the guard drops.
     ///
-    /// When an OTLP exporter is wired, this flushes and shuts down the tracer
-    /// provider. Otherwise it is a no-op.
+    /// Equivalent to dropping the guard; see its [`Drop`] implementation.
     pub fn shutdown(self) {
-        if let Some(provider) = self.tracer_provider
+        drop(self);
+    }
+}
+
+impl Drop for TelemetryGuard {
+    /// Flush and shut down the tracer provider exactly once.
+    ///
+    /// The global subscriber's tracer keeps the provider alive after the
+    /// guard is gone, so the provider's own final-reference cleanup never
+    /// runs; the guard shuts it down explicitly. Shutdown exports the queued
+    /// spans, shuts down every exporter within the SDK's default timeout, and
+    /// logs the processor's lifetime dropped-span total. A shutdown error is
+    /// logged, never raised. Without a provider this does nothing.
+    ///
+    /// Then logs, as a final line, how many formatted lines were dropped
+    /// because stdout fell behind, and drains the lines still queued.
+    fn drop(&mut self) {
+        if let Some(provider) = self.tracer_provider.take()
             && let Err(e) = provider.shutdown()
         {
             tracing::warn!(error = %e, "OTLP shutdown error");
+        }
+        if let Some(writer) = self.log_writer.take() {
+            let dropped_lines = writer.dropped_lines();
+            if dropped_lines > 0 {
+                tracing::warn!(
+                    dropped_lines,
+                    "formatted log lines were dropped because stdout fell behind"
+                );
+            }
         }
     }
 }
@@ -304,21 +372,63 @@ pub fn link_remote_span(
     ));
 }
 
-/// Resolve the effective tracing filter from multiple sources in priority order.
+/// Records one request's server timing at an owning boundary into the
+/// bounded benchmark histograms under `parent`'s request classification.
+///
+/// `elapsed` is the owner's monotonic time from handler entry to `boundary`
+/// (result ready, write acknowledged, or response handoff), and `excluded`
+/// the union of the waits the owner does not count as its own work, such as
+/// provider exchanges or Verifier blocks, when the boundary has any, with
+/// the closed `boundary` and `outcome` labels. Nothing is recorded until
+/// [`timing::enable`]; see [`timing`].
+pub fn record_timing(
+    parent: &tracing::Span,
+    boundary: &'static str,
+    outcome: &'static str,
+    elapsed: std::time::Duration,
+    excluded: Option<std::time::Duration>,
+) {
+    timing::record(parent, boundary, outcome, elapsed, excluded, &[]);
+}
+
+/// Records one request's server timing as [`record_timing`] does, plus each
+/// `(boundary, duration)` of `parts`: a component of the same request, such
+/// as one execution phase, recorded as an observation of its own boundary
+/// under the same outcome and classification.
+///
+/// The request and its parts are recorded under one lock acquisition, so a
+/// snapshot holds either all of them or none, and a part costs no more
+/// lock traffic than the request already pays.
+pub fn record_timing_parts(
+    parent: &tracing::Span,
+    boundary: &'static str,
+    outcome: &'static str,
+    elapsed: std::time::Duration,
+    excluded: Option<std::time::Duration>,
+    parts: &[(&'static str, std::time::Duration)],
+) {
+    timing::record(parent, boundary, outcome, elapsed, excluded, parts);
+}
+
+/// Resolve the effective log filter from multiple sources in priority order.
 ///
 /// Priority: `WYRD_LOG` env var → `RUST_LOG` env var → `config.filter` field → `"info"`.
 pub fn resolve_filter(config: &TelemetryConfig) -> EnvFilter {
-    if let Ok(val) = std::env::var("WYRD_LOG")
-        && !val.is_empty()
-    {
-        return EnvFilter::new(val);
-    }
-    if let Ok(val) = std::env::var("RUST_LOG")
-        && !val.is_empty()
-    {
-        return EnvFilter::new(val);
-    }
-    EnvFilter::new(&config.filter)
+    env_filter(&["WYRD_LOG", "RUST_LOG"], &config.filter)
+}
+
+/// Resolve the operator trace filter: the `WYRD_TRACE_FILTER` env var, else
+/// `config.trace_filter`.
+fn resolve_trace_filter(config: &TelemetryConfig) -> EnvFilter {
+    env_filter(&["WYRD_TRACE_FILTER"], &config.trace_filter)
+}
+
+/// The filter named by the first non-empty variable of `vars`, else
+/// `fallback`.
+fn env_filter(vars: &[&str], fallback: &str) -> EnvFilter {
+    vars.iter()
+        .find_map(|var| std::env::var(var).ok().filter(|value| !value.is_empty()))
+        .map_or_else(|| EnvFilter::new(fallback), EnvFilter::new)
 }
 
 /// Initialize a tracing subscriber without setting it as the global default.
@@ -330,24 +440,32 @@ pub fn init_test_only_no_global(config: TelemetryConfig) -> TelemetryGuard {
     TelemetryGuard {
         config,
         tracer_provider: None,
+        log_writer: None,
     }
 }
 
 /// Initialize a tracing subscriber for server processes.
 ///
-/// Installs one global subscriber: the configured filter, formatted log
-/// output, and an OpenTelemetry layer over the process tracer provider. The
-/// provider is always built, so tenant span export works with or without an
-/// operator destination. When `config.endpoint` is set, the spans the server
-/// sampler samples are also batched to that OTLP endpoint.
+/// Installs one global subscriber: formatted log output filtered by
+/// [`resolve_filter`], and an OpenTelemetry layer over the process tracer
+/// provider filtered by the operator trace filter (`WYRD_TRACE_FILTER`, else
+/// `config.trace_filter`) plus the tenant catalog. The provider is always
+/// built, so tenant span export works with or without an operator
+/// destination. When `config.endpoint` is set, the spans the server sampler
+/// samples are also batched to that OTLP endpoint.
+///
+/// Formatted logs reach stdout through one writer thread behind a bounded
+/// queue, so emitting an event never blocks on stdout; a line that finds the
+/// queue full is dropped and counted, and the guard reports the count.
 ///
 /// # Errors
-/// Returns an error if another Rustls provider already owns the process, a
+/// Returns an error if the sampling ratio is invalid, another Rustls
+/// provider already owns the process, the log writer thread cannot start, a
 /// global subscriber was already installed, or the OTLP exporter fails to
 /// build.
 pub fn init(config: TelemetryConfig) -> Result<TelemetryGuard, WyrdError> {
     use opentelemetry::trace::TracerProvider as _;
-    use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
+    use tracing_subscriber::util::SubscriberInitExt as _;
 
     let operator = config
         .endpoint
@@ -356,82 +474,150 @@ pub fn init(config: TelemetryConfig) -> Result<TelemetryGuard, WyrdError> {
         .transpose()?
         .map(|exporter| {
             export::OperatorExport(
-                opentelemetry_sdk::trace::BatchSpanProcessor::builder(exporter).build(),
+                opentelemetry_sdk::trace::BatchSpanProcessor::builder(export::FailedBatches(
+                    exporter,
+                ))
+                .build(),
             )
         });
     let provider = export::tracer_provider(
-        telemetry_sampler(&config),
+        telemetry_sampler(&config)?,
         telemetry_resource(&config),
         operator,
     );
-    tracing_subscriber::registry()
-        .with(resolve_filter(&config))
-        .with(tracing_subscriber::fmt::layer())
-        .with(tracing_opentelemetry::layer().with_tracer(provider.tracer("wyrd")))
-        .try_init()
-        .map_err(|_| WyrdError::Conflict {
-            message: "global tracing subscriber already set".to_string(),
-            details: serde_json::json!({ "component": "telemetry" }),
-        })?;
+    let (writer, log_writer) =
+        log_writer::LogWriter::start(std::io::stdout(), log_writer::QUEUED_LINES).map_err(
+            |error| WyrdError::Internal {
+                message: "telemetry log writer thread failed to start".to_owned(),
+                details: serde_json::json!({ "cause": error.to_string() }),
+            },
+        )?;
+    subscriber(
+        resolve_filter(&config),
+        resolve_trace_filter(&config),
+        provider.tracer("wyrd"),
+        false,
+        writer,
+    )
+    .try_init()
+    .map_err(|_| WyrdError::Conflict {
+        message: "global tracing subscriber already set".to_string(),
+        details: serde_json::json!({ "component": "telemetry" }),
+    })?;
     Ok(TelemetryGuard {
         config,
         tracer_provider: Some(provider),
+        log_writer: Some(log_writer),
     })
 }
 
 /// Install a production-shaped OpenTelemetry provider with in-memory export.
 ///
 /// This initializer uses the same resource, sampler, SDK provider, tenant
-/// export, OTel layer, filter, formatter, and global subscriber path as
-/// [`init`]. The operator's exporter destination differs, allowing journeys to inspect completed spans without a
-/// second telemetry implementation, and every captured span also carries its
-/// `tracing` level as the `level` attribute.
+/// export, subscriber composition, and global subscriber path as [`init`].
+/// The operator's exporter destination differs, allowing journeys to inspect
+/// completed spans without a second telemetry implementation, and every
+/// captured span also carries its `tracing` level as the `level` attribute.
 ///
-/// Capture is unfiltered: every span and event the code emits reaches the
-/// exporter, so what a test can assert on never depends on `WYRD_LOG`. Only
-/// the formatted log output is filtered, by [`resolve_filter`].
+/// An unset `sample_ratio` captures every trace rather than the production
+/// 1% default; an explicit ratio applies as in production. The operator
+/// trace filter is fixed at `trace`, so capture is unfiltered:
+/// every span and event the code emits reaches the exporter, and what a test
+/// can assert on never depends on `WYRD_LOG` or `WYRD_TRACE_FILTER`. Only the
+/// formatted log output is filtered, by [`resolve_filter`].
 ///
 /// # Errors
 ///
-/// Returns [`WyrdError::Conflict`] if another global subscriber is installed.
+/// Returns [`WyrdError::Validation`] if the sampling ratio is invalid, or
+/// [`WyrdError::Conflict`] if another global subscriber is installed.
 #[cfg(feature = "test-support")]
 pub fn init_test_capture(
     config: TelemetryConfig,
 ) -> Result<(TelemetryGuard, TestTraceCapture), WyrdError> {
     use opentelemetry::trace::TracerProvider as _;
-    use tracing_subscriber::{Layer as _, layer::SubscriberExt, util::SubscriberInitExt};
+    use tracing_subscriber::util::SubscriberInitExt as _;
 
     let capture = TestTraceCapture::default();
     let exporter = CaptureExporter {
         spans: Arc::clone(&capture.spans),
     };
+    let sampler = match config.sample_ratio {
+        None => opentelemetry_sdk::trace::Sampler::TraceIdRatioBased(1.0),
+        Some(_) => telemetry_sampler(&config)?,
+    };
     let provider = export::tracer_provider(
-        telemetry_sampler(&config),
+        sampler,
         telemetry_resource(&config),
         Some(export::OperatorExport(
             opentelemetry_sdk::trace::SimpleSpanProcessor::new(exporter),
         )),
     );
-    let tracer = provider.tracer("wyrd");
-    tracing_subscriber::registry()
-        .with(tracing_subscriber::fmt::layer().with_filter(resolve_filter(&config)))
-        .with(
-            tracing_opentelemetry::layer()
-                .with_tracer(tracer)
-                .with_level(true),
-        )
-        .try_init()
-        .map_err(|_| WyrdError::Conflict {
-            message: "global tracing subscriber already set".to_owned(),
-            details: serde_json::json!({ "component": "telemetry" }),
-        })?;
+    subscriber(
+        resolve_filter(&config),
+        EnvFilter::new("trace"),
+        provider.tracer("wyrd"),
+        true,
+        std::io::stdout,
+    )
+    .try_init()
+    .map_err(|_| WyrdError::Conflict {
+        message: "global tracing subscriber already set".to_owned(),
+        details: serde_json::json!({ "component": "telemetry" }),
+    })?;
     Ok((
         TelemetryGuard {
             config,
             tracer_provider: Some(provider),
+            log_writer: None,
         },
         capture,
     ))
+}
+
+/// Compose the process subscriber shared by [`init`] and the test capture.
+///
+/// Each destination has its own filter. Formatted log output passes `logs`.
+/// The OpenTelemetry layer over `tracer` passes `traces`, the operator's
+/// diagnostic verbosity, and, whatever either filter says, every span and
+/// event the tenant copy needs: catalog spans and events at `INFO` or above,
+/// the verbosity the tenant catalog is defined at. Neither filter can
+/// therefore remove a tenant copy. With `level` set, each exported span also
+/// carries its `tracing` level. Spans carry no busy/idle times, thread, or
+/// code location: each costs work on every span or every poll of an
+/// instrumented future, and no tenant copy keeps them.
+fn subscriber<W>(
+    logs: EnvFilter,
+    traces: EnvFilter,
+    tracer: opentelemetry_sdk::trace::Tracer,
+    level: bool,
+    writer: W,
+) -> impl tracing::Subscriber + Send + Sync
+where
+    W: for<'writer> tracing_subscriber::fmt::MakeWriter<'writer> + Send + Sync + 'static,
+{
+    use tracing_subscriber::Layer as _;
+    use tracing_subscriber::filter::{FilterExt as _, filter_fn};
+    use tracing_subscriber::layer::SubscriberExt as _;
+
+    let tenant = filter_fn(|metadata| {
+        *metadata.level() <= tracing::Level::INFO
+            && (metadata.is_event() || export::in_catalog(metadata.name()))
+    });
+    tracing_subscriber::registry()
+        .with(
+            tracing_subscriber::fmt::layer()
+                .with_writer(writer)
+                .with_filter(logs),
+        )
+        .with(
+            tracing_opentelemetry::layer()
+                .with_tracer(tracer)
+                .with_level(level)
+                .with_tracked_inactivity(false)
+                .with_threads(false)
+                .with_location(false)
+                .with_filter(traces.or(tenant)),
+        )
 }
 
 /// Build the process resource shared by production and test exporters.
@@ -449,11 +635,20 @@ fn telemetry_resource(config: &TelemetryConfig) -> opentelemetry_sdk::Resource {
 ///
 /// The process sampler applies it without reading any client-supplied trace
 /// field; see the `export` module.
-fn telemetry_sampler(config: &TelemetryConfig) -> opentelemetry_sdk::trace::Sampler {
-    config.sample_ratio.map_or(
-        opentelemetry_sdk::trace::Sampler::AlwaysOn,
-        opentelemetry_sdk::trace::Sampler::TraceIdRatioBased,
-    )
+///
+/// # Errors
+///
+/// Returns [`WyrdError::Validation`] when the configured ratio is invalid.
+fn telemetry_sampler(
+    config: &TelemetryConfig,
+) -> Result<opentelemetry_sdk::trace::Sampler, WyrdError> {
+    config
+        .operator_sample_ratio()
+        .map(opentelemetry_sdk::trace::Sampler::TraceIdRatioBased)
+        .map_err(|message| WyrdError::Validation {
+            message,
+            details: serde_json::json!({ "component": "telemetry" }),
+        })
 }
 
 /// Build the configured OTLP span exporter after claiming Wyrd's TLS provider.
@@ -497,6 +692,551 @@ fn build_otlp_exporter(
 
 #[cfg(all(test, feature = "test-support"))]
 mod tests {
+    use std::sync::{Arc, Mutex, PoisonError};
+
+    use opentelemetry::trace::TracerProvider as _;
+    use opentelemetry_proto::tonic::trace::v1::ResourceSpans;
+    use tracing_subscriber::EnvFilter;
+    use wyrd_spec::DataTenantId;
+    use wyrd_spec::auth::{Attribution, PrincipalId};
+    use wyrd_spec::trace::TraceContext;
+
+    use crate::{TenantSpanRoute, TenantSpanSink};
+
+    /// Span names of every tenant copy staged, in end order.
+    #[derive(Default)]
+    struct Staged(
+        /// The staged span names.
+        Mutex<Vec<String>>,
+    );
+
+    impl TenantSpanSink for Staged {
+        /// Record the staged copy's span names.
+        fn stage(&self, _route: TenantSpanRoute, span: ResourceSpans) {
+            self.0
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .extend(
+                    span.scope_spans
+                        .iter()
+                        .flat_map(|scope| &scope.spans)
+                        .map(|span| span.name.clone()),
+                );
+        }
+    }
+
+    /// Serve one sampled client's request under the production subscriber
+    /// composed with log filter `logs`, operator filter `traces`, and
+    /// operator sampling `ratio`, and return the tenant copies and the
+    /// operator's spans by name, and the log output.
+    ///
+    /// The request runs a catalog child, a debug diagnostic span, an info
+    /// event, and an error event.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the fixed caller traceparent or principal id fails to
+    /// parse.
+    fn serve(logs: &str, traces: &str, ratio: f64) -> (Vec<String>, Vec<String>, String) {
+        let operator = super::CaptureExporter {
+            spans: Arc::default(),
+        };
+        let exported = Arc::clone(&operator.spans);
+        let provider = super::export::tracer_provider(
+            opentelemetry_sdk::trace::Sampler::TraceIdRatioBased(ratio),
+            opentelemetry_sdk::Resource::builder_empty().build(),
+            Some(super::export::OperatorExport(
+                opentelemetry_sdk::trace::SimpleSpanProcessor::new(operator),
+            )),
+        );
+        let staged = Arc::new(Staged::default());
+        let sink: Arc<dyn TenantSpanSink> = Arc::clone(&staged) as _;
+        let caller = TraceContext::parse_traceparent(
+            "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01",
+            String::new(),
+        )
+        .expect("a valid traceparent");
+        let output = Logs::default();
+        let writer = output.clone();
+        let subscriber = super::subscriber(
+            EnvFilter::new(logs),
+            EnvFilter::new(traces),
+            provider.tracer("wyrd"),
+            false,
+            move || writer.clone(),
+        );
+        tracing::subscriber::with_default(subscriber, || {
+            let request = tracing::info_span!("request");
+            crate::serve_request(&request, Some(&caller), Some(&sink));
+            request.in_scope(|| {
+                crate::bind_tenant_route(TenantSpanRoute {
+                    tenant: DataTenantId::new_v7(),
+                    attribution: Attribution::direct(
+                        "01900000-0000-7000-8000-000000000007"
+                            .parse::<PrincipalId>()
+                            .expect("a principal id"),
+                    ),
+                });
+                tracing::info_span!("verification.run").in_scope(|| {
+                    tracing::debug_span!("verification.detail").in_scope(|| {});
+                    tracing::info!("verification step");
+                    tracing::error!(error.type = "timeout", "verification failed");
+                });
+            });
+        });
+        let operator = exported
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .iter()
+            .map(|span| span.name.to_string())
+            .collect();
+        let tenant = std::mem::take(&mut *staged.0.lock().unwrap_or_else(PoisonError::into_inner));
+        (tenant, operator, output.text())
+    }
+
+    /// Log verbosity and operator trace verbosity leave the tenant copy of
+    /// a sampled client's request unchanged; only the operator's diagnostic
+    /// spans follow the operator filter, and an error in a request the
+    /// operator did not sample is still logged inside its request span.
+    ///
+    /// # Panics
+    ///
+    /// Panics when a tenant copy differs between filter settings, the
+    /// operator receives the wrong spans, or the unsampled error is missing
+    /// from the log or lacks its request's span context.
+    #[test]
+    fn production_filters_preserve_tenant_traces() {
+        let (tenant, operator, logs) = serve("info", "info", 0.0);
+        assert_eq!(tenant, ["verification.run", "request"]);
+        assert!(
+            operator.is_empty(),
+            "ratio zero exports nothing: {operator:?}"
+        );
+        let failure = logs
+            .lines()
+            .find(|line| line.contains("verification failed"))
+            .unwrap_or_else(|| panic!("the unsampled error is logged: {logs}"));
+        assert!(
+            failure.contains("request") && failure.contains("verification.run"),
+            "the error carries its request's span context: {failure}"
+        );
+        assert!(!serve("off", "info", 0.0).2.contains("verification failed"));
+        for (logs, traces) in [("off", "info"), ("error", "error"), ("info", "off")] {
+            assert_eq!(
+                serve(logs, traces, 0.0).0,
+                tenant,
+                "logs {logs:?}, traces {traces:?}"
+            );
+        }
+        assert_eq!(serve("off", "info", 1.0).1, ["verification.run", "request"]);
+        assert_eq!(
+            serve("off", "debug", 1.0).1,
+            ["verification.detail", "verification.run", "request"]
+        );
+    }
+
+    /// Log output shared between a test and the subscriber writing it.
+    #[derive(Clone, Default)]
+    struct Logs(
+        /// The bytes written so far.
+        Arc<Mutex<Vec<u8>>>,
+    );
+
+    impl Logs {
+        /// Everything written so far.
+        fn text(&self) -> String {
+            String::from_utf8_lossy(&self.0.lock().unwrap_or_else(PoisonError::into_inner))
+                .into_owned()
+        }
+    }
+
+    impl std::io::Write for Logs {
+        /// Append `bytes`.
+        ///
+        /// # Errors
+        ///
+        /// Never fails.
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+
+        /// Nothing is buffered.
+        ///
+        /// # Errors
+        ///
+        /// Never fails.
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// An operator exporter whose every export call blocks until the test
+    /// releases it with the call's result.
+    #[derive(Debug)]
+    struct Gated {
+        /// Reports each call's batch size as the call starts.
+        started: Mutex<std::sync::mpsc::Sender<usize>>,
+        /// Supplies each call's result.
+        results: Mutex<std::sync::mpsc::Receiver<opentelemetry_sdk::error::OTelSdkResult>>,
+        /// Reports shutdown.
+        shut: Mutex<std::sync::mpsc::Sender<()>>,
+    }
+
+    impl opentelemetry_sdk::trace::SpanExporter for Gated {
+        /// Report the call, then wait for the test to release its result.
+        ///
+        /// # Errors
+        ///
+        /// Returns the error the test released for this call.
+        fn export(
+            &self,
+            batch: Vec<opentelemetry_sdk::trace::SpanData>,
+        ) -> impl std::future::Future<Output = opentelemetry_sdk::error::OTelSdkResult> + Send
+        {
+            let _ = self
+                .started
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .send(batch.len());
+            let result = self
+                .results
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .recv()
+                .unwrap_or(Ok(()));
+            std::future::ready(result)
+        }
+
+        /// Report shutdown.
+        ///
+        /// # Errors
+        ///
+        /// Never fails.
+        fn shutdown_with_timeout(
+            &mut self,
+            _timeout: std::time::Duration,
+        ) -> opentelemetry_sdk::error::OTelSdkResult {
+            let _ = self
+                .shut
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .send(());
+            Ok(())
+        }
+    }
+
+    /// Counts increments of the counter named `.0` and nothing else.
+    pub(crate) struct CounterCell(
+        /// The counted counter's name.
+        pub(crate) &'static str,
+        /// The counted counter's cell.
+        pub(crate) Arc<std::sync::atomic::AtomicU64>,
+    );
+
+    impl metrics::Recorder for CounterCell {
+        /// Descriptions are not recorded.
+        fn describe_counter(
+            &self,
+            _: metrics::KeyName,
+            _: Option<metrics::Unit>,
+            _: metrics::SharedString,
+        ) {
+        }
+
+        /// Descriptions are not recorded.
+        fn describe_gauge(
+            &self,
+            _: metrics::KeyName,
+            _: Option<metrics::Unit>,
+            _: metrics::SharedString,
+        ) {
+        }
+
+        /// Descriptions are not recorded.
+        fn describe_histogram(
+            &self,
+            _: metrics::KeyName,
+            _: Option<metrics::Unit>,
+            _: metrics::SharedString,
+        ) {
+        }
+
+        /// The counted counter shares one cell; any other is a no-op.
+        fn register_counter(
+            &self,
+            key: &metrics::Key,
+            _: &metrics::Metadata<'_>,
+        ) -> metrics::Counter {
+            if key.name() == self.0 {
+                metrics::Counter::from_arc(Arc::clone(&self.1))
+            } else {
+                metrics::Counter::noop()
+            }
+        }
+
+        /// Gauges are not recorded.
+        fn register_gauge(&self, _: &metrics::Key, _: &metrics::Metadata<'_>) -> metrics::Gauge {
+            metrics::Gauge::noop()
+        }
+
+        /// Histograms are not recorded.
+        fn register_histogram(
+            &self,
+            _: &metrics::Key,
+            _: &metrics::Metadata<'_>,
+        ) -> metrics::Histogram {
+            metrics::Histogram::noop()
+        }
+    }
+
+    /// A failed export call counts one failed batch and returns its error
+    /// unchanged; a successful one counts nothing. Through the stock batch
+    /// processor: a stalled export never blocks a
+    /// span's end, a full queue drops spans with the SDK's first-drop warning
+    /// and its exact lifetime total at shutdown, each failed export call
+    /// counts one failed batch while its error reaches the processor, and a
+    /// stalled shutdown returns within its timeout before the exporter is
+    /// shut down.
+    ///
+    /// # Panics
+    ///
+    /// Panics when another metrics recorder is installed, an export call
+    /// does not start or complete as released, a failed call is miscounted
+    /// or its error altered, a drop signal is missing, or the stalled
+    /// shutdown does not time out before reaching the exporter.
+    #[test]
+    fn operator_export_loss_is_observable() {
+        use opentelemetry::trace::{Span as _, Tracer as _};
+        use opentelemetry_sdk::trace::SpanExporter as _;
+        use std::future::Future as _;
+        use std::sync::atomic::Ordering;
+        use std::sync::mpsc::channel;
+
+        let failed = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        metrics::set_global_recorder(CounterCell(
+            crate::TRACE_EXPORT_FAILED_BATCHES_TOTAL,
+            Arc::clone(&failed),
+        ))
+        .expect("the only recorder in this test process");
+        let (started, calls) = channel();
+        let (release, results) = channel();
+        let (shut, shutdowns) = channel();
+        let direct = super::export::FailedBatches(Gated {
+            started: Mutex::new(channel().0),
+            results: Mutex::new(results),
+            shut: Mutex::new(channel().0),
+        });
+        let failure = || {
+            opentelemetry_sdk::error::OTelSdkError::InternalFailure("collector unavailable".into())
+        };
+        let export = |result| {
+            release.send(result).expect("the exporter waits");
+            let mut call = std::pin::pin!(direct.export(Vec::new()));
+            match call
+                .as_mut()
+                .poll(&mut std::task::Context::from_waker(std::task::Waker::noop()))
+            {
+                std::task::Poll::Ready(result) => result,
+                std::task::Poll::Pending => panic!("the export completed"),
+            }
+        };
+        assert!(matches!(
+            export(Err(failure())),
+            Err(opentelemetry_sdk::error::OTelSdkError::InternalFailure(cause))
+                if cause == "collector unavailable"
+        ));
+        assert!(export(Ok(())).is_ok());
+        assert_eq!(failed.load(Ordering::Acquire), 1, "only the failed call");
+        let (release, results) = channel();
+        let processor = opentelemetry_sdk::trace::BatchSpanProcessor::builder(
+            super::export::FailedBatches(Gated {
+                started: Mutex::new(started),
+                results: Mutex::new(results),
+                shut: Mutex::new(shut),
+            }),
+        )
+        .with_batch_config(
+            opentelemetry_sdk::trace::BatchConfigBuilder::default()
+                .with_max_queue_size(1)
+                .with_max_export_batch_size(1)
+                .with_scheduled_delay(std::time::Duration::from_secs(3600))
+                .build(),
+        )
+        .build();
+        let provider = super::export::tracer_provider(
+            opentelemetry_sdk::trace::Sampler::AlwaysOn,
+            opentelemetry_sdk::Resource::builder_empty().build(),
+            Some(super::export::OperatorExport(processor)),
+        );
+        let tracer = provider.tracer("wyrd");
+        let logs = Logs::default();
+        let writer = logs.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(move || writer.clone())
+            .with_ansi(false)
+            .finish();
+        tracing::subscriber::with_default(subscriber, || {
+            let end = |name: &'static str| tracer.start(name).end();
+            end("exported");
+            assert_eq!(calls.recv(), Ok(1), "the first export call is stalled");
+            end("queued");
+            end("dropped");
+            end("dropped too");
+            assert!(
+                logs.text()
+                    .contains("BatchSpanProcessor.SpanDroppingStarted")
+            );
+            release
+                .send(Err(
+                    opentelemetry_sdk::error::OTelSdkError::InternalFailure(
+                        "collector unavailable".to_owned(),
+                    ),
+                ))
+                .expect("the exporter waits");
+            assert_eq!(calls.recv(), Ok(1), "the queued span exports next");
+            release.send(Ok(())).expect("the exporter waits");
+            assert!(provider.force_flush().is_ok());
+            assert_eq!(failed.load(Ordering::Acquire), 2, "one more failed call");
+            end("stalled at shutdown");
+            assert_eq!(calls.recv(), Ok(1));
+            let bound = std::time::Duration::from_millis(100);
+            assert!(matches!(
+                provider.shutdown_with_timeout(bound),
+                Err(opentelemetry_sdk::error::OTelSdkError::InternalFailure(errors))
+                    if errors.contains("Timeout(100ms)")
+            ));
+            assert!(
+                logs.text().contains("dropped_span_count=2"),
+                "{}",
+                logs.text()
+            );
+            release.send(Ok(())).expect("the exporter waits");
+            assert_eq!(shutdowns.recv(), Ok(()), "shutdown reaches the exporter");
+        });
+        assert_eq!(failed.load(Ordering::Acquire), 2);
+    }
+
+    /// Dropping the guard shuts down the provider even while a tracer still
+    /// holds it, as the global subscriber does in production: the queued span
+    /// is exported, the exporter is shut down once, and the SDK logs its
+    /// exact lifetime dropped total. An explicit shutdown also shuts the
+    /// exporter down once, and a guard without a provider drops harmlessly.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the stalled export never starts, a drop is not warned,
+    /// the queued span is not drained, the dropped total is missing, or an
+    /// exporter is shut down other than exactly once.
+    #[test]
+    fn guard_drop_shuts_down_a_retained_provider() {
+        use opentelemetry::trace::{Span as _, Tracer as _};
+        use std::sync::mpsc::{TryRecvError, channel};
+
+        let guarded = |started, results, shut| {
+            let processor = opentelemetry_sdk::trace::BatchSpanProcessor::builder(Gated {
+                started: Mutex::new(started),
+                results: Mutex::new(results),
+                shut: Mutex::new(shut),
+            })
+            .with_batch_config(
+                opentelemetry_sdk::trace::BatchConfigBuilder::default()
+                    .with_max_queue_size(1)
+                    .with_max_export_batch_size(1)
+                    .with_scheduled_delay(std::time::Duration::from_secs(3600))
+                    .build(),
+            )
+            .build();
+            let provider = super::export::tracer_provider(
+                opentelemetry_sdk::trace::Sampler::AlwaysOn,
+                opentelemetry_sdk::Resource::builder_empty().build(),
+                Some(super::export::OperatorExport(processor)),
+            );
+            let tracer = provider.tracer("wyrd");
+            let guard = super::TelemetryGuard {
+                config: super::TelemetryConfig::default(),
+                tracer_provider: Some(provider),
+                log_writer: None,
+            };
+            (guard, tracer)
+        };
+        let (started, calls) = channel();
+        let (release, results) = channel();
+        let (shut, shutdowns) = channel();
+        let (guard, tracer) = guarded(started, results, shut);
+        let logs = Logs::default();
+        let writer = logs.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(move || writer.clone())
+            .with_ansi(false)
+            .finish();
+        tracing::subscriber::with_default(subscriber, || {
+            let end = |name: &'static str| tracer.start(name).end();
+            end("exported");
+            assert_eq!(calls.recv(), Ok(1), "the first export call is stalled");
+            end("queued");
+            end("dropped");
+            assert!(
+                logs.text()
+                    .contains("BatchSpanProcessor.SpanDroppingStarted")
+            );
+            for _ in 0..2 {
+                release.send(Ok(())).expect("the exporter waits");
+            }
+            drop(guard);
+            assert_eq!(calls.try_recv(), Ok(1), "the queued span is drained");
+            assert_eq!(shutdowns.try_recv(), Ok(()), "the exporter is shut down");
+            assert!(
+                logs.text().contains("dropped_span_count=1"),
+                "{}",
+                logs.text()
+            );
+        });
+        drop(tracer);
+        assert_eq!(shutdowns.try_recv(), Err(TryRecvError::Disconnected));
+
+        let (shut, shutdowns) = channel();
+        let (guard, _tracer) = guarded(channel().0, channel().1, shut);
+        guard.shutdown();
+        assert_eq!(shutdowns.try_recv(), Ok(()));
+        assert_eq!(shutdowns.try_recv(), Err(TryRecvError::Disconnected));
+        drop(super::init_test_only_no_global(
+            super::TelemetryConfig::default(),
+        ));
+    }
+
+    /// An unset operator ratio samples 1% of traces, an explicit ratio in
+    /// `0.0..=1.0` is honored exactly, and anything else is refused.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the default is not 1%, an explicit ratio is altered, or
+    /// an invalid ratio is accepted.
+    #[test]
+    fn operator_sampling_defaults_are_explicit() {
+        let sampler = |sample_ratio| {
+            super::telemetry_sampler(&super::TelemetryConfig {
+                sample_ratio,
+                ..super::TelemetryConfig::default()
+            })
+            .map(|sampler| format!("{sampler:?}"))
+            .ok()
+        };
+        assert_eq!(sampler(None).as_deref(), Some("TraceIdRatioBased(0.01)"));
+        for ratio in [0.0, 0.25, 1.0] {
+            assert_eq!(
+                sampler(Some(ratio)),
+                Some(format!("TraceIdRatioBased({ratio:?})"))
+            );
+        }
+        for ratio in [-0.1, 1.1, f64::NAN, f64::INFINITY] {
+            assert_eq!(sampler(Some(ratio)), None, "{ratio} is refused");
+        }
+    }
+
     /// The upgraded SDK pipeline exports completed spans with preserved attributes.
     #[test]
     fn capture_pipeline_preserves_span_semantics() {
@@ -513,6 +1253,215 @@ mod tests {
             spans[0].attributes.get("component"),
             Some(&"wyrd".to_owned())
         );
+        guard.shutdown();
+    }
+
+    /// Concurrent observations under labelled requests land exactly once in
+    /// their own case and phase series, as does each recorded part under
+    /// its own boundary; interval snapshots conserve counts,
+    /// keep zero, bound each percentile by its bucket, and report
+    /// out-of-range, negative, reset, and replaced-process evidence.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the test pipeline does not initialize or any count,
+    /// bound, or invalidity is wrong.
+    #[test]
+    fn benchmark_histograms_preserve_bounded_intervals() {
+        use super::timing::{self, CASE_HEADER, PHASE_HEADER};
+        use std::time::Duration;
+
+        let (guard, _capture) = super::init_test_capture(super::TelemetryConfig::default())
+            .expect("test telemetry pipeline initializes");
+        let request = |case: &str, phase: &str| {
+            let span = tracing::info_span!("request");
+            let mut headers = http::HeaderMap::new();
+            headers.insert(CASE_HEADER, case.parse().expect("header value"));
+            headers.insert(PHASE_HEADER, phase.parse().expect("header value"));
+            timing::label_request(&span, &headers);
+            span
+        };
+        let unlabelled = tracing::info_span!("request");
+        let ignored = request("point-lookup", "warmup");
+        super::record_timing(&ignored, "bifrost.query", "success", Duration::ZERO, None);
+        timing::enable();
+        assert_eq!(
+            timing::snapshot().series.len(),
+            0,
+            "nothing is recorded before enable, and labels set then are ignored"
+        );
+        let started = timing::snapshot();
+
+        let warmup = request("point-lookup", "warmup");
+        for _ in 0..10 {
+            super::record_timing(
+                &warmup,
+                "bifrost.query",
+                "success",
+                Duration::from_micros(3),
+                None,
+            );
+        }
+        let warm = timing::snapshot();
+        let point = request("point-lookup", "repetition-1");
+        let scan = request("full-scan", "repetition-1");
+        std::thread::scope(|threads| {
+            for thread in 0..8_u64 {
+                let (point, scan, unlabelled) = (&point, &scan, &unlabelled);
+                threads.spawn(move || {
+                    for i in 0..1_000_u64 {
+                        let elapsed = Duration::from_nanos(thread * 1_000 + i);
+                        super::record_timing(point, "bifrost.query", "success", elapsed, None);
+                        if i % 10 == 0 {
+                            super::record_timing(scan, "bifrost.query", "success", elapsed, None);
+                            super::record_timing(
+                                unlabelled,
+                                "bifrost.query",
+                                "success",
+                                elapsed,
+                                None,
+                            );
+                        }
+                    }
+                });
+            }
+        });
+        let gateway = request("buffered-1kib-capture-metadata", "repetition-1");
+        super::record_timing(
+            &gateway,
+            "gateway.buffered",
+            "success",
+            Duration::from_micros(500),
+            Some(Duration::from_micros(400)),
+        );
+        super::record_timing(
+            &gateway,
+            "gateway.buffered",
+            "success",
+            Duration::from_nanos(10),
+            Some(Duration::from_nanos(11)),
+        );
+        super::record_timing(
+            &gateway,
+            "gateway.buffered",
+            "success",
+            Duration::from_secs(600),
+            Some(Duration::ZERO),
+        );
+        let verify = request("direct-verify", "repetition-1");
+        super::record_timing_parts(
+            &verify,
+            "verification.direct",
+            "success",
+            Duration::from_micros(300),
+            Some(Duration::from_micros(10)),
+            &[
+                ("verification.direct.engine", Duration::from_micros(100)),
+                ("verification.direct.stage", Duration::ZERO),
+            ],
+        );
+        let _invalid = request("drop table", "repetition-1");
+        let measured = timing::snapshot();
+
+        let warmed = warm.since(&started).expect("same process");
+        assert_eq!(warmed.series.len(), 1);
+        assert_eq!(warmed.series[0].phase, "warmup");
+        assert_eq!(warmed.series[0].count, 10);
+
+        let interval = measured.since(&warm).expect("same process");
+        let series = |case: &str, boundary: &str| {
+            interval
+                .series
+                .iter()
+                .find(|series| {
+                    series.case == case
+                        && series.boundary == boundary
+                        && series.outcome == "success"
+                })
+                .unwrap_or_else(|| panic!("no {case} {boundary} series"))
+        };
+        let engine = series("direct-verify", "verification.direct.engine");
+        let at = engine.elapsed.quantile(1.0).expect("one part");
+        assert_eq!(
+            engine.count, 1,
+            "a part is one observation of its own boundary"
+        );
+        assert!(at.lowest <= 100_000 && 100_000 <= at.highest);
+        assert!(engine.excluded.is_none() && engine.problems().is_empty());
+        assert_eq!(
+            series("direct-verify", "verification.direct.stage").count,
+            1
+        );
+        assert_eq!(series("direct-verify", "verification.direct").count, 1);
+        let point = series("point-lookup", "bifrost.query");
+        assert_eq!(point.phase, "repetition-1");
+        assert_eq!((point.count, point.elapsed.len()), (8_000, 8_000));
+        assert!(point.problems().is_empty(), "{:?}", point.problems());
+        assert_eq!(series("full-scan", "bifrost.query").count, 800);
+        assert_eq!(series(timing::UNLABELLED, "bifrost.query").count, 800);
+        assert!(
+            interval
+                .series
+                .iter()
+                .all(|series| series.phase != "warmup"),
+            "warmup observations stay in the warmup interval"
+        );
+        let zero = point.elapsed.quantile(0.0).expect("observations");
+        assert_eq!(
+            (zero.lowest, zero.highest),
+            (0, 0),
+            "zero is counted exactly"
+        );
+        let p99 = point.elapsed.quantile(0.99).expect("observations");
+        assert_eq!(p99.rank, 7_920);
+        assert!(p99.lowest <= 7_919 && 7_919 <= p99.highest);
+        assert!(p99.highest - p99.lowest <= 7_919 / 1_000);
+        let whole = measured.since(&started).expect("same process");
+        let total: u64 = whole.series.iter().map(|series| series.count).sum();
+        assert_eq!(
+            total,
+            10 + 8_000 + 800 + 800 + 3 + 3,
+            "each observation and part once"
+        );
+
+        let gateway = series("buffered-1kib-capture-metadata", "gateway.buffered");
+        assert_eq!(gateway.count, 3);
+        let residual = gateway.residual.as_ref().expect("residual component");
+        assert_eq!(
+            residual.len(),
+            1,
+            "only the in-range, non-negative residual"
+        );
+        let half = gateway.elapsed.quantile(0.0).expect("observation");
+        assert!(half.lowest <= 10 && 10 <= half.highest);
+        let problems = gateway.problems().join("; ");
+        assert!(
+            problems.contains("2 durations outside the trackable range"),
+            "{problems}"
+        );
+        assert!(
+            problems.contains("1 excluded waits exceeding elapsed time"),
+            "{problems}"
+        );
+        assert!(
+            problems.contains("2 elapsed observations for 3 requests"),
+            "{problems}"
+        );
+        assert_eq!(
+            interval.invalid_labels, 1,
+            "the unknown declaration is counted once"
+        );
+
+        let mut replaced = measured.clone();
+        replaced.process = "another".to_owned();
+        assert!(replaced.since(&warm).is_err_and(|e| e.contains("replaced")));
+        assert!(
+            warm.since(&measured).is_err(),
+            "a reversed interval is a reset"
+        );
+        let mut reset = measured.clone();
+        reset.series.retain(|series| series.case != "point-lookup");
+        assert!(reset.since(&warm).is_err(), "a vanished series is a reset");
         guard.shutdown();
     }
 }

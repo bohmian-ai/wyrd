@@ -72,7 +72,8 @@ impl ClaimRuns {
 pub struct AssembleClaimRequest<'a> {
     /// Validated runs gathered for the claim.
     pub runs: &'a ClaimRuns,
-    /// Physical schema shared by every run and every emitted object.
+    /// Logical schema of every run and every emitted object; runs may hold it
+    /// in another Variant layout.
     pub schema: SchemaRef,
     /// Registered physical write recipe the merge and writer obey.
     pub layout: &'a PhysicalLayout,
@@ -100,6 +101,11 @@ pub struct AssembledClaim {
     pub row_group_stats: Vec<RowGroupStats>,
     /// Rows written across the objects, equal to the claim's promised rows.
     pub rows: u64,
+    /// Variant layout the claim's sample chose and every object was shredded with.
+    ///
+    /// Returned so the caller can refresh the process's advisory layout hint
+    /// for the claim's table definition.
+    pub variant_layout: iceberg::writer::file_writer::variant_shredding::VariantLayout,
 }
 
 /// Merges and encodes the members of one claim.
@@ -257,6 +263,7 @@ impl ClaimAssembler {
         let merge = StagedRunMerge::open(
             request.runs.runs(),
             request.schema,
+            request.tenant,
             request.layout,
             MERGE_BATCH_ROWS,
         )?;
@@ -270,7 +277,7 @@ impl ClaimAssembler {
                 tenant: request.tenant,
             },
             &request.memory,
-            variant_layout,
+            variant_layout.clone(),
             merge,
         )?;
         let rows = artifacts.iter().try_fold(0_u64, |sum, artifact| {
@@ -294,6 +301,7 @@ impl ClaimAssembler {
             artifacts,
             row_group_stats,
             rows,
+            variant_layout,
         })
     }
 }
@@ -352,8 +360,8 @@ mod tests {
             ),
             shard_id: usize::from(batch),
             schema,
-            batches: vec![record],
-            statistics: Vec::new(),
+            batches: vec![record].into(),
+            statistics: Arc::default(),
             metas: vec![],
             opened_at: std::time::Instant::now(),
             closed_at: std::time::Instant::now(),

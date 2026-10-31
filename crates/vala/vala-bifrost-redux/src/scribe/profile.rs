@@ -10,6 +10,7 @@
 //! [`GroupStages`] step once and charges it to every request of the group.
 
 use std::collections::BTreeMap;
+use std::time::Duration;
 
 use datafusion::physical_plan::metrics::Time;
 
@@ -17,6 +18,12 @@ use crate::profile::{ProfileFamily, ProfileValue};
 
 /// Prefix naming Scribe's steps among the emitted events.
 const SCRIBE_EVENT: &str = "Scribe";
+
+/// The benchmark timing boundary of Scribe's part of one acknowledged write:
+/// transport admission until the request task resumes with its durable
+/// acknowledgement. Each [`WriteProfile::record_timing`] part is its own
+/// boundary under `bifrost.scribe.write.`.
+pub(crate) const WRITE_TIMING: &str = "bifrost.scribe.write";
 
 /// The serial group-commit stages one shard cycle runs, in order.
 #[derive(Debug, Default)]
@@ -76,6 +83,47 @@ pub(crate) struct WriteProfile {
 }
 
 impl WriteProfile {
+    /// Records this acknowledged write through
+    /// [`wyrd_telemetry::record_timing_parts`] at [`WRITE_TIMING`] under the
+    /// current span's benchmark classification: `elapsed`, then each step as
+    /// a part.
+    ///
+    /// The parts are `admission` (tenant, table, schema, and memory
+    /// validation), `decode`, `preprocess`, `shard_wait`, `wal_append` (the
+    /// group's SLICE and COMMIT records), `wal_sync`, `visibility` (fences
+    /// and memtable insert), and `ack`, the delivery from the shard's send
+    /// until the request task resumed. Group stages are shared: every
+    /// request of a group carries the whole stage, so parts overlap across
+    /// requests and are never summed into a latency.
+    pub(crate) fn record_timing(&self, elapsed: Duration, ack: Duration) {
+        let time =
+            |time: &Time| Duration::from_nanos(u64::try_from(time.value()).unwrap_or(u64::MAX));
+        let group = &self.group;
+        wyrd_telemetry::record_timing_parts(
+            &tracing::Span::current(),
+            WRITE_TIMING,
+            "success",
+            elapsed,
+            None,
+            &[
+                ("bifrost.scribe.write.admission", time(&self.admission)),
+                ("bifrost.scribe.write.decode", time(&self.decode)),
+                ("bifrost.scribe.write.preprocess", time(&self.preprocess)),
+                ("bifrost.scribe.write.shard_wait", time(&self.shard_wait)),
+                (
+                    "bifrost.scribe.write.wal_append",
+                    time(&group.write) + time(&group.commit),
+                ),
+                ("bifrost.scribe.write.wal_sync", time(&group.sync)),
+                (
+                    "bifrost.scribe.write.visibility",
+                    time(&group.fence) + time(&group.insert),
+                ),
+                ("bifrost.scribe.write.ack", ack),
+            ],
+        );
+    }
+
     /// Every step as a `Scribe.<step>` nanosecond event.
     fn events(&self) -> BTreeMap<String, ProfileValue> {
         [

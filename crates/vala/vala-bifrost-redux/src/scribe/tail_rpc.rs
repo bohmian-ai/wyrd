@@ -376,6 +376,9 @@ pub struct FetchLiveTailRequest {
     /// Each carries the table's current name, type, and field id, so Scribe
     /// resolves rows admitted under an earlier schema revision by id.
     pub required_fields: arrow::datatypes::Fields,
+    /// The query's filter planned over `required_fields`, which Scribe prunes
+    /// memory batches by before projecting them; `None` keeps every batch.
+    pub pruning: Option<crate::scan_sizing::BatchPruning>,
 }
 
 /// One shallow, structural hot snapshot returned by a shard owner.
@@ -961,6 +964,7 @@ impl FetchLiveTailService {
         let read = retained.capture.read(
             &(request.start_partition..=request.end_partition),
             &request.required_fields,
+            request.pruning.as_ref(),
         )?;
         Ok(LiveTailBatches {
             memtable: read
@@ -1463,6 +1467,7 @@ pub(crate) mod tests {
         let binding =
             super::TenantTableBinding::resolve((tenant, table)).expect("fixture binding resolves");
         let request = super::FetchLiveTailRequest {
+            pruning: None,
             binding,
             target_stream: stream,
             query_id: uuid::Uuid::new_v4(),
@@ -1586,6 +1591,7 @@ pub(crate) mod tests {
         let binding =
             super::TenantTableBinding::resolve((tenant, table)).expect("fixture binding resolves");
         let request = super::FetchLiveTailRequest {
+            pruning: None,
             binding,
             target_stream: stream,
             query_id: uuid::Uuid::new_v4(),

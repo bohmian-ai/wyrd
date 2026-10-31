@@ -129,7 +129,8 @@ pub fn any_value_variant(
 
 /// Finish one built Variant and validate it under the Bifrost limits.
 ///
-/// Validation reuses the canonical Arrow writer's check, so the size limit is
+/// [`EncodedVariant::from_builder`] applies the canonical Arrow writer's
+/// limits without re-validating the builder's encoding, so the size limit is
 /// applied first and the depth limit, which names the first container past it,
 /// second. The protobuf decoder already bounds `OTLP` nesting, so building
 /// before validating cannot recurse without bound.
@@ -141,9 +142,7 @@ fn finish_variant(
     field: &'static str,
     builder: VariantBuilder,
 ) -> Result<EncodedVariant, VariantFailure> {
-    let (metadata, value) = builder.finish();
-    EncodedVariant::from_bytes(&metadata, &value)
-        .map_err(|violation| VariantFailure { field, violation })
+    EncodedVariant::from_builder(builder).map_err(|violation| VariantFailure { field, violation })
 }
 
 /// Append one `OTLP` value at any Variant builder position.

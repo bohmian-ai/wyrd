@@ -76,6 +76,8 @@ tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
 # Local judge, model upstream, and Operator hook the stories call through the
 # server.
 wiremock = { workspace = true }
+# The production server telemetry the quiet-operator timeline story installs.
+wyrd-telemetry = { workspace = true }
 wyrd-testing = { workspace = true }
 
 [lints]

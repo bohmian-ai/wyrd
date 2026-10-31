@@ -273,7 +273,7 @@ pub fn check_output_schema(schema: &Value, field: &str, object_root: bool) -> Sk
 /// Native body path of a request's output schema, and whether its
 /// destination requires an object root (OpenAI with `strict: true`).
 ///
-/// Only the four kinds [`response_type_of`] derives schemas from reach here.
+/// Only the four kinds [`ResponseType::of`] derives schemas from reach here.
 fn output_schema_field(request: &ProviderRequest) -> (&'static str, bool) {
     use crate::wire::openai_chat::OpenAiResponseFormat;
     use crate::wire::openai_responses::OpenAiTextResponseFormat;
@@ -367,7 +367,7 @@ impl Prompt {
                 "the request body model must equal the Prompt's literal model",
             ));
         }
-        let response_type = response_type_of(&request);
+        let response_type = ResponseType::of(&request);
         if let ResponseType::JsonSchema { schema, .. } = &response_type {
             let (field, object_root) = output_schema_field(&request);
             check_output_schema(schema, field, object_root)?;
@@ -631,6 +631,78 @@ impl Prompt {
         prompt.bind_mut(vars)?;
         Ok(prompt.request)
     }
+
+    /// Applies `edit` to the response schema inside the native request and
+    /// re-derives [`response_type`](Self::response_type), so the edited
+    /// schema is both sent and validated.
+    ///
+    /// A host uses it on a per-call copy, for example to narrow a schema to
+    /// what one invocation may answer; the edit is the host's, and Skald
+    /// never interprets it. A Prompt without a response schema is unchanged.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SkaldError::PromptInvalid`] at the schema's native body path
+    /// when the edited schema is invalid for its destination (see
+    /// [`check_output_schema`]).
+    pub fn edit_response_schema_mut(&mut self, edit: impl FnOnce(&mut Value)) -> SkaldResult<()> {
+        use crate::wire::anthropic_messages::AnthropicOutputFormat;
+        use crate::wire::openai_chat::OpenAiResponseFormat;
+        use crate::wire::openai_responses::OpenAiTextResponseFormat;
+
+        /// Applies `edit` to an object-typed schema field.
+        fn object(schema: &mut serde_json::Map<String, Value>, edit: impl FnOnce(&mut Value)) {
+            let mut value = Value::Object(std::mem::take(schema));
+            edit(&mut value);
+            if let Value::Object(edited) = value {
+                *schema = edited;
+            }
+        }
+        match &mut self.request {
+            ProviderRequest::OpenAiChatCompletion(request) => {
+                if let Some(OpenAiResponseFormat::JsonSchema { json_schema }) =
+                    &mut request.response_format
+                    && let Some(schema) = &mut json_schema.schema
+                {
+                    object(schema, edit);
+                }
+            }
+            ProviderRequest::OpenAiResponses(request) => {
+                if let Some(OpenAiTextResponseFormat::JsonSchema {
+                    schema: Some(schema),
+                    ..
+                }) = request.text.as_mut().and_then(|text| text.format.as_mut())
+                {
+                    object(schema, edit);
+                }
+            }
+            ProviderRequest::AnthropicMessage(request) => {
+                if let Some(config) = &mut request.output_config {
+                    let AnthropicOutputFormat::JsonSchema { schema } = &mut config.format;
+                    edit(schema);
+                }
+            }
+            ProviderRequest::GeminiGenerateContent(request) => {
+                if let Some(config) = &mut request.settings.generation_config {
+                    let schema = if config.response_json_schema.is_some() {
+                        &mut config.response_json_schema
+                    } else {
+                        &mut config.response_schema
+                    };
+                    if let Some(schema) = schema {
+                        edit(schema);
+                    }
+                }
+            }
+            _ => {}
+        }
+        self.response_type = ResponseType::of(&self.request);
+        if let ResponseType::JsonSchema { schema, .. } = &self.response_type {
+            let (field, object_root) = output_schema_field(&self.request);
+            check_output_schema(schema, field, object_root)?;
+        }
+        Ok(())
+    }
 }
 
 fn replace_string_leaves(value: &mut Value, vars: &[(&str, &str)]) {
@@ -655,57 +727,63 @@ fn replace_string_leaves(value: &mut Value, vars: &[(&str, &str)]) {
     }
 }
 
-/// Derives the expected response shape from a request's structured-output field.
-///
-/// Portable schemas carry the name `response`; Anthropic and GenerateContent
-/// declare no schema name, so they use the same one.
-fn response_type_of(request: &ProviderRequest) -> ResponseType {
-    use crate::wire::anthropic_messages::AnthropicOutputFormat;
-    use crate::wire::openai_chat::OpenAiResponseFormat;
-    use crate::wire::openai_responses::OpenAiTextResponseFormat;
+impl ResponseType {
+    /// The response shape `request` asks for, read from its structured-output
+    /// field: the authority for validating that request's answer, since
+    /// rendering and request hooks may change the schema a Prompt declared.
+    ///
+    /// Portable schemas carry the name `response`; Anthropic and
+    /// GenerateContent declare no schema name, so they use the same one.
+    pub fn of(request: &ProviderRequest) -> Self {
+        use crate::wire::anthropic_messages::AnthropicOutputFormat;
+        use crate::wire::openai_chat::OpenAiResponseFormat;
+        use crate::wire::openai_responses::OpenAiTextResponseFormat;
 
-    let named = |name: &str, schema: Value| ResponseType::JsonSchema {
-        name: name.to_owned(),
-        schema,
-    };
-    match request {
-        ProviderRequest::OpenAiChatCompletion(request) => match &request.response_format {
-            Some(OpenAiResponseFormat::JsonSchema { json_schema }) => json_schema
-                .schema
-                .clone()
-                .map_or(ResponseType::Text, |schema| {
-                    named(&json_schema.name, Value::Object(schema))
-                }),
-            _ => ResponseType::Text,
-        },
-        ProviderRequest::OpenAiResponses(request) => {
-            match request.text.as_ref().and_then(|text| text.format.as_ref()) {
-                Some(OpenAiTextResponseFormat::JsonSchema {
-                    name,
-                    schema: Some(schema),
-                    ..
-                }) => named(name, Value::Object(schema.clone())),
-                _ => ResponseType::Text,
-            }
-        }
-        ProviderRequest::AnthropicMessage(request) => match &request.output_config {
-            Some(config) => match &config.format {
-                AnthropicOutputFormat::JsonSchema { schema } => named("response", schema.clone()),
-            },
-            None => ResponseType::Text,
-        },
-        ProviderRequest::GeminiGenerateContent(request) => request
-            .settings
-            .generation_config
-            .as_ref()
-            .and_then(|config| {
-                config
-                    .response_json_schema
+        let named = |name: &str, schema: Value| ResponseType::JsonSchema {
+            name: name.to_owned(),
+            schema,
+        };
+        match request {
+            ProviderRequest::OpenAiChatCompletion(request) => match &request.response_format {
+                Some(OpenAiResponseFormat::JsonSchema { json_schema }) => json_schema
+                    .schema
                     .clone()
-                    .or_else(|| config.response_schema.clone())
-            })
-            .map_or(ResponseType::Text, |schema| named("response", schema)),
-        _ => ResponseType::Text,
+                    .map_or(ResponseType::Text, |schema| {
+                        named(&json_schema.name, Value::Object(schema))
+                    }),
+                _ => ResponseType::Text,
+            },
+            ProviderRequest::OpenAiResponses(request) => {
+                match request.text.as_ref().and_then(|text| text.format.as_ref()) {
+                    Some(OpenAiTextResponseFormat::JsonSchema {
+                        name,
+                        schema: Some(schema),
+                        ..
+                    }) => named(name, Value::Object(schema.clone())),
+                    _ => ResponseType::Text,
+                }
+            }
+            ProviderRequest::AnthropicMessage(request) => match &request.output_config {
+                Some(config) => match &config.format {
+                    AnthropicOutputFormat::JsonSchema { schema } => {
+                        named("response", schema.clone())
+                    }
+                },
+                None => ResponseType::Text,
+            },
+            ProviderRequest::GeminiGenerateContent(request) => request
+                .settings
+                .generation_config
+                .as_ref()
+                .and_then(|config| {
+                    config
+                        .response_json_schema
+                        .clone()
+                        .or_else(|| config.response_schema.clone())
+                })
+                .map_or(ResponseType::Text, |schema| named("response", schema)),
+            _ => ResponseType::Text,
+        }
     }
 }
 
@@ -2106,6 +2184,60 @@ mod prompt_render {
         assert_eq!(
             serde_json::from_str::<ResponseType>(&json).unwrap(),
             response_type
+        );
+    }
+}
+
+#[cfg(test)]
+mod response_schema_edit {
+    //! Response-schema edits reach every structured request kind and keep
+    //! the derived response type in step.
+
+    use serde_json::json;
+
+    use crate::wire::openai_chat::{OpenAiJsonSchema, OpenAiResponseFormat};
+    use crate::{Prompt, ProviderRequest, ResponseType, common};
+
+    /// An edit reaches both the sent request and the derived response type,
+    /// and an edit the destination rejects fails construction-time checks.
+    ///
+    /// # Panics
+    /// Panics when the edit is lost on either side or an invalid edit passes.
+    #[test]
+    fn edit_response_schema_reaches_request_and_type() {
+        let mut request = common::openai_chat_request();
+        request.response_format = Some(OpenAiResponseFormat::JsonSchema {
+            json_schema: OpenAiJsonSchema {
+                name: "answer".to_owned(),
+                description: None,
+                schema: json!({"type": "object", "properties": {"slot": {"type": "string"}}})
+                    .as_object()
+                    .cloned(),
+                strict: Some(false),
+            },
+        });
+        let model = request.model.clone();
+        let mut prompt =
+            Prompt::new(ProviderRequest::OpenAiChatCompletion(request), &model).expect("builds");
+        prompt
+            .edit_response_schema_mut(|schema| {
+                schema["properties"]["slot"]["enum"] = json!(["order"]);
+            })
+            .expect("narrowed schema is valid");
+        let ResponseType::JsonSchema { schema, .. } = &prompt.response_type else {
+            panic!("structured Prompt");
+        };
+        assert_eq!(schema["properties"]["slot"]["enum"], json!(["order"]));
+        assert!(
+            serde_json::to_string(&prompt.request)
+                .expect("serializes")
+                .contains("order")
+        );
+
+        assert!(
+            prompt
+                .edit_response_schema_mut(|schema| *schema = json!({"type": 5}))
+                .is_err()
         );
     }
 }

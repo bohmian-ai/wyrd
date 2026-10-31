@@ -10,7 +10,7 @@ Bifrost is the analytical warehouse inside every Wyrd server. Observations, verd
 
 ```sql
 SELECT verdict, count(*) AS executions
-FROM vala.verification.results
+FROM bifrost.verification.results
 GROUP BY verdict
 ```
 

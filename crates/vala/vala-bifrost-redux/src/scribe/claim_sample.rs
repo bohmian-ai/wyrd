@@ -1,11 +1,16 @@
 //! Seeded, stratified Variant sample of one claim's staged runs.
 //!
 //! A claim's final objects all share one Variant layout, chosen before the
-//! writer opens. [`ClaimVariantSample`] reads the claim's local, unshredded
-//! runs twice: pass 1 reads only `sub_principal_id` to count each subject's rows,
+//! writer opens. [`ClaimVariantSample`] reads the claim's local runs twice:
+//! pass 1 reads only `sub_principal_id` to count each subject's rows,
 //! pass 2 reads `sub_principal_id` and the Variant columns and offers every row to
 //! the fork's [`VariantSampler`], which keeps a row when its seeded hash falls
 //! under its stratum's Cochran rate. Only counters are held, never rows.
+//!
+//! A run may already be shredded with its generation's layout. Its Variant
+//! columns are reconstructed to complete logical values before they are
+//! offered, so a key that layout left in the residual is counted exactly like
+//! a key it shredded, and the claim's fresh layout can choose it.
 //!
 //! The seed is the claim identity and a row's position is its position across
 //! the runs in claim order, so a re-run claim picks the same sample.
@@ -112,12 +117,12 @@ impl<'a> ClaimVariantSample<'a> {
         Ok(sampler.layout())
     }
 
-    /// Reads `columns` of every run in claim order and visits each batch.
+    /// Reads `columns` of every run in claim order and visits each batch in the logical schema.
     ///
     /// # Errors
     ///
-    /// Returns [`ScribeError::Internal`] when a run cannot be opened or decoded,
-    /// or any error `visit` returns.
+    /// Returns [`ScribeError::Internal`] when a run cannot be opened, decoded,
+    /// or reconstructed to the logical schema, or any error `visit` returns.
     fn scan(
         &self,
         columns: &[impl AsRef<str>],
@@ -125,9 +130,18 @@ impl<'a> ClaimVariantSample<'a> {
     ) -> Result<(), ScribeError> {
         for run in self.runs {
             for batch in self.run_reader(run, columns)? {
-                visit(&batch.map_err(|error| ScribeError::Internal {
+                let batch = batch.map_err(|error| ScribeError::Internal {
                     detail: format!("decode the staged run for Variant sampling: {error}"),
-                })?)?;
+                })?;
+                let batch =
+                    crate::schema::logical_batch(&batch, self.schema).map_err(|detail| {
+                        ScribeError::Internal {
+                            detail: format!(
+                                "reconstruct a staged run for Variant sampling: {detail}"
+                            ),
+                        }
+                    })?;
+                visit(&batch)?;
             }
         }
         Ok(())
@@ -135,8 +149,9 @@ impl<'a> ClaimVariantSample<'a> {
 
     /// Opens one run projected to the named top-level columns.
     ///
-    /// Staged runs are unshredded, so each top-level Arrow field is one Parquet
-    /// root column at the same index.
+    /// Shredding rewrites a column's storage but never adds or reorders
+    /// top-level fields, so each logical field is one Parquet root column at
+    /// the same index in every run, shredded or not.
     ///
     /// # Errors
     ///

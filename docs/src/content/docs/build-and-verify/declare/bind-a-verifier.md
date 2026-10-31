@@ -5,7 +5,6 @@ pillar: wyrd
 section: Build and verify
 topic: Declare
 order: 2
-status: runnable
 ---
 
 Attach each Verifier to what it checks, and choose who runs it: your code, or a schedule.

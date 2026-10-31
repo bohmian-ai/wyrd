@@ -27,6 +27,7 @@ pub mod registry;
 pub mod request_builder;
 pub mod run;
 pub mod session;
+mod structured;
 
 pub use agent::{
     Agent, AgentCallbacks, AgentWire, LocalPromptResolver, PromptResolver,

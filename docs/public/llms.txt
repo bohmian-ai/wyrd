@@ -16,7 +16,7 @@ Set up a local server, then run one verification, in this order. A connected Wyr
 ## Get started
 
 - [What Wyrd does](/wyrd/get-started/introduction/): Wyrd verifies what your AI system does against the requirements you declare, and records which versions produced each result.
-- [Set up Wyrd](/wyrd/get-started/setup/): Install the Wyrd 0.3.0 CLI and SDK for Python, Rust, or TypeScript, then let your coding agent start a local server and run a first verification, or do it by hand.
+- [Set up Wyrd](/wyrd/get-started/setup/): Install the Wyrd 0.4.0 CLI and SDK for Python, Rust, or TypeScript, then let your coding agent start a local server and run a first verification, or do it by hand.
 - [Run your first verification](/wyrd/get-started/quickstart/): Declare a Verifier and the Service it checks in two YAML files, then verify a passing and a failing support answer from one Python, Rust, or TypeScript program.
 - [Use with your coding agent](/wyrd/get-started/use-with-your-coding-agent/): Give your coding agent the Wyrd docs through llms.txt and Wyrd's tools through MCP with wyrd mcp install.
 
@@ -35,16 +35,21 @@ Set up a local server, then run one verification, in this order. A connected Wyr
 
 ## Operate
 
+- [Deploy for a team](/wyrd/operate/deploy-wyrd-for-a-team/): Prepare PostgreSQL with one login, migrate it, start the server, and create the first tenant.
+- [Deploy a Service from CI](/wyrd/operate/deploy-a-service-from-ci/): Give CI and each Service its own key, declare and pull the Service in CI, and start the application from the bundle.
+- [Add people](/wyrd/operate/add-people/): Connect your identity provider, such as Okta or Keycloak, so people sign in to Wyrd, then grant them roles.
 - [Verification runtime](/wyrd/operate/configure-verification-runtime/): Choose which processes run Verifiers, size the worker pool, and diagnose startup refusals.
+- [Permissions](/wyrd/operate/grant-and-inspect-permissions/): See which roles a principal holds, grant or revoke a role, cut a principal off, and confirm the result in the audit log.
+- [Troubleshooting](/wyrd/operate/troubleshoot-a-deployment/): Find the cause of a Wyrd server that refuses to migrate or start, from the message it prints.
 
 ## Understand
 
 - [Architecture](/wyrd/understand/architecture/): What a team deployment of Wyrd runs, what it connects to, and why each part is separate.
-- [How verification works](/wyrd/understand/how-verification-works/): Inputs, steps, requirements, and decide; verify versus submit; executions, verdicts, results, and Operators.
+- [How verification works](/wyrd/understand/how-verification-works/): Inputs, steps, requirements, and decide; Agent workspaces; verify versus submit; executions, verdicts, results, and Operators.
 - [Runs and evidence](/wyrd/understand/runs-observations-and-evidence/): How Wyrd records what a declared service actually does, and ties each observation to the version that ran.
 - [Cards and versions](/wyrd/understand/cards-versions-and-relationships/): A Service declaration is a set of versioned Cards, each one a declared component of an AI system.
 - [Bifrost](/wyrd/understand/bifrost/): Wyrd's analytical warehouse, the two ways to write to it, and when a written row becomes queryable.
-- [Identity and access](/wyrd/understand/identity-and-authorization/): Every call to Wyrd is made as a principal whose roles decide what it may do, and every decision is audited.
+- [Identity and access](/wyrd/understand/identity-and-authorization/): Every call to Wyrd is made as an account whose roles decide what it may do; a running Service also names its exact release, from its bundle.
 
 ## Reference
 

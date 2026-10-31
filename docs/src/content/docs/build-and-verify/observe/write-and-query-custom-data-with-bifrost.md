@@ -6,7 +6,6 @@ section: Build and verify
 topic: Observe
 order: 2
 draft: true
-status: runnable
 ---
 
 Bifrost is Wyrd's analytical warehouse, and you can use it directly: register a table from a type you already have, load rows into it, and query it, or any table you can read, with SQL. Use this for backfills, batch jobs, notebooks, and analysis. Inside a running service, prefer [`observe.record`](/build-and-verify/observe/record-a-run-and-observations/), which ties each row to the run and Card that produced it.
@@ -37,7 +36,7 @@ class TicketOutcome(BaseModel):
     handle_time_s: float
 
 
-bifrost = Bifrost(TableConfig(TicketOutcome, "vala.datasets.ticket_outcomes"))
+bifrost = Bifrost(TableConfig(TicketOutcome, "bifrost.datasets.ticket_outcomes"))
 print(bifrost.register())  # "created" or "already_exists"
 ```
 
@@ -54,7 +53,7 @@ struct TicketOutcome {
     handle_time_s: f64,
 }
 
-let table = TableConfig::from_model::<TicketOutcome>("vala.datasets.ticket_outcomes")?;
+let table = TableConfig::from_model::<TicketOutcome>("bifrost.datasets.ticket_outcomes")?;
 let bifrost = Bifrost::connect(BifrostOptions {
     table: Some(table),
     ..BifrostOptions::default()
@@ -77,7 +76,7 @@ const TicketOutcome = z.object({
 });
 
 const bifrost = await Bifrost.connect({
-  table: TableConfig.fromJsonSchema("vala.datasets.ticket_outcomes", TicketOutcome),
+  table: TableConfig.fromJsonSchema("bifrost.datasets.ticket_outcomes", TicketOutcome),
 });
 console.log(await bifrost.register()); // "created" or "already_exists"
 ```
@@ -93,7 +92,7 @@ By default the table is partitioned on `wyrd_ingested_at`, the time Bifrost rece
 <LangTab lang="python">
 
 ```python
-TableConfig(TicketOutcome, "vala.datasets.ticket_outcomes", time_column="closed_at")
+TableConfig(TicketOutcome, "bifrost.datasets.ticket_outcomes", time_column="closed_at")
 ```
 
 </LangTab>
@@ -103,7 +102,7 @@ TableConfig(TicketOutcome, "vala.datasets.ticket_outcomes", time_column="closed_
 // The layout type is not re-exported from wyrd_ai yet; add wyrd-spec as a dependency.
 use wyrd_spec::vala::api::PhysicalLayoutWire;
 
-let table = TableConfig::from_model::<TicketOutcome>("vala.datasets.ticket_outcomes")?
+let table = TableConfig::from_model::<TicketOutcome>("bifrost.datasets.ticket_outcomes")?
     .with_layout(PhysicalLayoutWire {
         time_column: Some("closed_at".into()),
         partition_by: vec![],
@@ -116,7 +115,7 @@ let table = TableConfig::from_model::<TicketOutcome>("vala.datasets.ticket_outco
 <LangTab lang="typescript">
 
 ```typescript
-TableConfig.fromJsonSchema("vala.datasets.ticket_outcomes", TicketOutcome, {
+TableConfig.fromJsonSchema("bifrost.datasets.ticket_outcomes", TicketOutcome, {
   layout: { timeColumn: "closed_at" },
 });
 ```
@@ -183,7 +182,7 @@ When you are done writing, call `shutdown()` to drain and stop the writer.
 ```python
 result = bifrost.sql(
     "SELECT resolved, avg(handle_time_s) AS avg_s, count(*) AS n "
-    "FROM vala.datasets.ticket_outcomes WHERE handle_time_s > $1 GROUP BY resolved",
+    "FROM bifrost.datasets.ticket_outcomes WHERE handle_time_s > $1 GROUP BY resolved",
     [10.0],
 )
 print(result.to_pandas())
@@ -207,7 +206,7 @@ struct Summary {
 let rows: Vec<Summary> = bifrost
     .sql_as(
         "SELECT resolved, avg(handle_time_s) AS avg_s, count(*) AS n \
-         FROM vala.datasets.ticket_outcomes WHERE handle_time_s > $1 GROUP BY resolved",
+         FROM bifrost.datasets.ticket_outcomes WHERE handle_time_s > $1 GROUP BY resolved",
         &[QueryParam::Float(10.0)],
     )
     .await?;
@@ -223,7 +222,7 @@ const Summary = z.object({ resolved: z.boolean(), avg_s: z.number(), n: z.bigint
 
 const rows = await bifrost.sql(
   `SELECT resolved, avg(handle_time_s) AS avg_s, count(*) AS n
-     FROM vala.datasets.ticket_outcomes WHERE handle_time_s > $1 GROUP BY resolved`,
+     FROM bifrost.datasets.ticket_outcomes WHERE handle_time_s > $1 GROUP BY resolved`,
   [10.0],
   Summary,
 );
@@ -272,14 +271,14 @@ The tables you can read besides your own:
 
 | Namespace | Holds |
 | --- | --- |
-| `vala.drift` | Drift samples |
-| `vala.verification` | One row per verdict, and the pinned inputs of each execution |
-| `vala.traces`, `vala.metrics`, `vala.logs` | OpenTelemetry data |
-| `vala.gateway` | AI Gateway calls. Request and response payload columns also need `gateway_payload:read` |
-| `vala.system` | The audit log |
-| `vala.datasets` | Your own tables |
+| `bifrost.drift` | Drift samples |
+| `bifrost.verification` | One row per verdict, and the pinned inputs of each execution |
+| `bifrost.traces`, `bifrost.metrics`, `bifrost.logs` | OpenTelemetry data |
+| `bifrost.gateway` | AI Gateway calls. Request and response payload columns also need `gateway_payload:read` |
+| `bifrost.system` | The audit log |
+| `bifrost.datasets` | Your own tables |
 
-Only `vala.datasets` accepts writes from you.
+Only `bifrost.datasets` accepts writes from you.
 
 ## What can go wrong
 

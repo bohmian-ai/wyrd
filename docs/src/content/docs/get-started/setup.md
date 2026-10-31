@@ -1,10 +1,9 @@
 ---
 title: Set up Wyrd
-description: Install the Wyrd 0.3.0 CLI and SDK for Python, Rust, or TypeScript, then let your coding agent start a local server and run a first verification, or do it by hand.
+description: Install the Wyrd 0.4.0 CLI and SDK for Python, Rust, or TypeScript, then let your coding agent start a local server and run a first verification, or do it by hand.
 pillar: wyrd
 section: Get started
 order: 2
-status: runnable
 ---
 
 Install Wyrd, then set up the rest with your coding agent or by hand. Either way you end with a local server running and your code connected to it.
@@ -24,7 +23,7 @@ Install Wyrd, then set up the rest with your coding agent or by hand. Either way
 
 ```bash
 uv init quickstart && cd quickstart
-uv add "wyrd-ai==0.3.0"
+uv add "wyrd-ai==0.4.0"
 ```
 
 Run the CLI as `uv run wyrd`.
@@ -33,9 +32,9 @@ Run the CLI as `uv run wyrd`.
 <LangTab lang="rust">
 
 ```bash
-cargo install wyrd-cli --version 0.3.0 --locked
+cargo install wyrd-cli --version 0.4.0 --locked
 cargo new quickstart && cd quickstart
-cargo add wyrd-ai@0.3.0 tokio --features tokio/full
+cargo add wyrd-ai@0.4.0 tokio --features tokio/full
 ```
 
 </LangTab>
@@ -44,7 +43,7 @@ cargo add wyrd-ai@0.3.0 tokio --features tokio/full
 ```bash
 mkdir quickstart && cd quickstart
 pnpm init && pnpm pkg set type=module
-pnpm add wyrd-ai@0.3.0
+pnpm add wyrd-ai@0.4.0
 ```
 
 Run the CLI as `pnpm wyrd`.

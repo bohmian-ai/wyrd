@@ -1132,6 +1132,7 @@ impl BifrostRuntimeResources {
             governor: self.governor.clone(),
             volumes: self.volumes.clone(),
             memory_root: Arc::clone(&self.memory_root),
+            variant_layouts: Arc::default(),
         });
         Ok(BifrostRoleResources {
             scribe,
@@ -1259,9 +1260,19 @@ pub struct ScribeResources {
     /// to its categorized ingest and memtable leases. The leader stream that
     /// dispatched it owns its lifetime, so it takes no slot or permit here.
     memory_root: Arc<GovernedMemoryRoot>,
+    /// Process-local advisory Variant layouts learned by this process's claims.
+    ///
+    /// Shared by every clone, so the claim lane that learns a layout and the
+    /// shards that open later generations see one cache.
+    variant_layouts: Arc<crate::scribe::layout_cache::VariantLayoutCache>,
 }
 
 impl ScribeResources {
+    /// Returns the process's advisory cache of learned Variant layouts.
+    pub(crate) fn variant_layouts(&self) -> &Arc<crate::scribe::layout_cache::VariantLayoutCache> {
+        &self.variant_layouts
+    }
+
     /// Returns the pod's effective CPU count from its checked resource plan.
     ///
     /// Persistence sizes its claim-merge lane by it, so concurrent merges never

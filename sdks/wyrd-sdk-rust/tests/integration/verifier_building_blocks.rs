@@ -33,8 +33,7 @@ use wyrd_ai::state::WyrdState;
 use wyrd_ai::verify::{Execution, File, Input, Inputs, Submission};
 use wyrd_ai::{
     Bifrost, CallProvenance, Citation, Locator, MediaFormat, RequirementOutcome, RequirementResult,
-    StepResult, StepStatus, VerificationOutcome, VerificationResult, VerificationVerdict,
-    WyrdClient,
+    StepResult, StepStatus, VerificationResult, VerificationVerdict, WyrdClient,
 };
 use wyrd_spec::auth::TokenAudience;
 use wyrd_testing::server::WyrdTestServer;
@@ -321,6 +320,17 @@ impl PolicyDesk {
         answer(&upstream, "REFUSE-POLICY", BREAKS, 3).await;
         answer(&upstream, "UNCITED", UNCITED, 3).await;
         answer(&upstream, "JUDGE-MALFORMED", "not a verdict", 3).await;
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .and(body_string_contains("JUDGE-REPAIRED"))
+            .and(body_string_contains("was not accepted"))
+            .respond_with(completion(
+                json!({ "role": "assistant", "content": FOLLOWS }),
+            ))
+            .with_priority(2)
+            .mount(&upstream)
+            .await;
+        answer(&upstream, "JUDGE-REPAIRED", "not a verdict", 3).await;
         answer(&upstream, "JUDGE-FOREIGN-CITE", FOREIGN_CITE, 3).await;
         script_investigator(&upstream).await;
         answer(&upstream, "Claim:", FOLLOWS, 4).await;
@@ -1127,6 +1137,52 @@ async fn invalid_judge_verdicts_are_inconclusive() {
             "{marker}"
         );
     }
+    let result = desk.review(review("JUDGE-MALFORMED", 50, None)).await;
+    let malformed = requirement(&result, "follows-policy");
+    assert!(
+        malformed
+            .reason
+            .contains("WYRD_AGENT_422_STRUCTURED_INVALID")
+            && !malformed.reason.contains("not a verdict"),
+        "{malformed:?}"
+    );
+    desk.deployment.shutdown().await;
+}
+
+/// A judge answering outside its response schema is asked to correct its
+/// reply within its iteration budget, and the corrected Verdict judges
+/// `follows-policy`.
+///
+/// # Panics
+/// Panics when the review is refused, the repair turn is missing, or the
+/// corrected Verdict does not pass citing the answer.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires the repository-managed Postgres journey lifecycle"]
+async fn judge_repairs_an_invalid_verdict() {
+    let desk = PolicyDesk::start().await;
+
+    let result = desk
+        .review(review(
+            "JUDGE-REPAIRED: refunds follow our policy.",
+            50,
+            None,
+        ))
+        .await;
+
+    let judged = requirement(&result, "follows-policy");
+    assert_eq!(judged.outcome, RequirementOutcome::Passed, "{judged:?}");
+    assert_eq!(judged.citations, answer_text());
+    let asked: Vec<String> = desk
+        .upstream
+        .received_requests()
+        .await
+        .expect("the upstream records requests")
+        .iter()
+        .map(|request| String::from_utf8_lossy(&request.body).into_owned())
+        .filter(|body| body.contains("JUDGE-REPAIRED") && body.contains("Rules:"))
+        .collect();
+    assert_eq!(asked.len(), 2, "one repair");
+    assert!(asked[1].contains("was not accepted"), "{}", asked[1]);
     desk.deployment.shutdown().await;
 }
 
@@ -1309,11 +1365,18 @@ enum Scored {
     },
 }
 
-/// One retained result's outcome, read back as JSON text.
+/// One retained execution's output, read back as JSON text.
 #[derive(Debug, Deserialize)]
-struct RetainedOutcome {
-    /// The stored outcome Variant as JSON text.
-    outcome: String,
+struct RetainedOutput {
+    /// The stored output Variant as JSON text.
+    output: String,
+}
+
+/// The requirements a retained output Variant holds.
+#[derive(Debug, Deserialize)]
+struct RetainedRequirements {
+    /// Every retained requirement, step requirements included.
+    requirements: Vec<RequirementResult>,
 }
 
 /// Assert `result` carries `scored-review`'s readback for a four-word answer:
@@ -1388,8 +1451,8 @@ async fn custom_verdict_data_survives_readback() {
 
     assert_eq!(
         retained(&desk, &waited).await,
-        waited.outcome,
-        "the retained outcome keeps its data"
+        waited.outcome.requirements,
+        "the retained output keeps its data"
     );
 
     for (marker, data) in exact_data() {
@@ -1415,32 +1478,32 @@ async fn custom_verdict_data_survives_readback() {
         assert_eq!(status.result.as_ref(), Some(&waited), "{marker}: status");
         assert_eq!(
             retained(&desk, &waited).await,
-            waited.outcome,
+            waited.outcome.requirements,
             "{marker}: retained"
         );
     }
     desk.deployment.shutdown().await;
 }
 
-/// The retained outcome of `result`'s execution, read back from Bifrost
+/// The retained requirements of `result`'s execution, read back from Bifrost
 /// after publishing pending rows.
 ///
 /// # Panics
 /// Panics when rows do not publish or the execution has not exactly one
-/// decodable retained outcome.
-async fn retained(desk: &PolicyDesk, result: &VerificationResult) -> VerificationOutcome {
+/// decodable retained output.
+async fn retained(desk: &PolicyDesk, result: &VerificationResult) -> Vec<RequirementResult> {
     desk.deployment
         .server()
         .flush_bifrost()
         .await
         .expect("rows publish");
-    let retained: Vec<RetainedOutcome> =
+    let retained: Vec<RetainedOutput> =
         Bifrost::connect_with(&desk.deployment.admin(), BifrostOptions::default())
             .await
             .expect("Bifrost connects")
             .sql_as(
-                "SELECT to_json(outcome) AS outcome \
-                   FROM bifrost.verification.results WHERE execution_id = $1",
+                "SELECT to_json(output) AS output \
+                   FROM bifrost.verification.execution_outputs WHERE execution_id = $1",
                 &[QueryParam::String(result.execution_id.to_string())],
             )
             .await
@@ -1448,7 +1511,9 @@ async fn retained(desk: &PolicyDesk, result: &VerificationResult) -> Verificatio
     let [retained] = retained.as_slice() else {
         panic!("one retained result: {retained:?}");
     };
-    serde_json::from_str(&retained.outcome).expect("the outcome decodes")
+    serde_json::from_str::<RetainedRequirements>(&retained.output)
+        .expect("the output decodes")
+        .requirements
 }
 
 /// The `well-formed` code check's data at its inclusive bounds, by answer

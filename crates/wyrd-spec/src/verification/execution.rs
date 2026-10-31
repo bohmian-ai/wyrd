@@ -8,7 +8,7 @@
 //! [`VerificationExecutionState`]. Execution status stays separate from the
 //! verdict: a failed requirement is a normal result, never a transport error.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use schemars::JsonSchema;
 use serde::de::DeserializeOwned;
@@ -602,9 +602,11 @@ impl Verdict {
                 ),
             ));
         }
-        let Ok(Value::Object(mut schema)) =
-            serde_json::to_value(crate::schema::schema_for::<Self>())
-        else {
+        let Ok(mut generated) = serde_json::to_value(crate::schema::schema_for::<Self>()) else {
+            unreachable!("a generated root schema serializes to a JSON object");
+        };
+        portable(&mut generated);
+        let Value::Object(mut schema) = generated else {
             unreachable!("a generated root schema serializes to a JSON object");
         };
         let required = |schema: &mut Map<String, Value>| {
@@ -654,6 +656,26 @@ impl Verdict {
         Ok(schema)
     }
 
+    /// Narrows a resolved Verdict schema's citation slots to `slots`, the
+    /// bare slot names one check invocation can reach.
+    ///
+    /// Hosts apply it to a per-call copy before the model runs, so the
+    /// provider request and local validation admit the same slots and a
+    /// wrong slot is repaired rather than judged. An empty set, or a schema
+    /// without the generated `SlotName` definition, is left unchanged;
+    /// final evidence validation still decides every citation.
+    pub fn restrict_slots(schema: &mut Value, slots: &BTreeSet<SlotName>) {
+        if slots.is_empty() {
+            return;
+        }
+        if let Some(slot) = schema.pointer_mut("/$defs/SlotName") {
+            *slot = serde_json::json!({
+                "type": "string",
+                "enum": slots.iter().map(SlotName::as_str).collect::<Vec<_>>(),
+            });
+        }
+    }
+
     /// Refuses custom `data` beyond the fixed size and depth bounds.
     ///
     /// Size is the compact UTF-8 JSON encoding of `data` alone, with only
@@ -689,6 +711,61 @@ impl Verdict {
             ));
         }
         Ok(())
+    }
+}
+
+/// Projects a generated schema onto the subset OpenAI strict mode,
+/// Anthropic, and Gemini all accept, without changing what it admits beyond
+/// numeric ranges.
+///
+/// `oneOf` becomes `anyOf`, which is equivalent for the disjoint closed
+/// alternatives the generator emits, and an alternation of `const` values
+/// becomes one `enum`. Siblings of `$ref`, `format`, and `minimum` are
+/// dropped; typed decoding still enforces the numeric ranges they stated.
+/// Keys of `properties` and `$defs` are names, never keywords. It runs on
+/// the generated envelope only, before any authored `data` schema is
+/// embedded.
+fn portable(schema: &mut Value) {
+    let Value::Object(node) = schema else {
+        return;
+    };
+    if node.contains_key("$ref") {
+        node.retain(|key, _| key == "$ref");
+        return;
+    }
+    node.remove("format");
+    node.remove("minimum");
+    if let Some(Value::Array(alternatives)) = node.remove("oneOf") {
+        let constants: Option<Vec<Value>> = alternatives
+            .iter()
+            .map(|alternative| alternative.get("const").cloned())
+            .collect();
+        let kind = alternatives
+            .first()
+            .and_then(|first| first.get("type"))
+            .cloned();
+        match constants {
+            Some(values)
+                if alternatives
+                    .iter()
+                    .all(|alternative| alternative.get("type") == kind.as_ref()) =>
+            {
+                if let Some(kind) = kind {
+                    node.insert("type".to_owned(), kind);
+                }
+                node.insert("enum".to_owned(), Value::Array(values));
+            }
+            _ => {
+                node.insert("anyOf".to_owned(), Value::Array(alternatives));
+            }
+        }
+    }
+    for (keyword, value) in node.iter_mut() {
+        match (keyword.as_str(), value) {
+            ("properties" | "$defs", Value::Object(named)) => named.values_mut().for_each(portable),
+            (_, Value::Array(items)) => items.iter_mut().for_each(portable),
+            (_, value) => portable(value),
+        }
     }
 }
 
@@ -1003,6 +1080,207 @@ mod tests {
                 .is_none(),
             "absent data is omitted"
         );
+    }
+
+    /// The plain Verdict schema is the portable structural target once
+    /// titles and descriptions are removed: an outcome enum, closed citation
+    /// objects, and five disjoint closed locator shapes under `anyOf`, with
+    /// no `oneOf`, `const`, numeric annotations, or `$ref` siblings. The
+    /// schema accepts every locator shape and refuses wrong outcomes,
+    /// missing or extra fields, and several locator keys, while values the
+    /// portable schema admits but `u32` cannot hold still fail decoding.
+    ///
+    /// # Panics
+    /// Panics when the schema differs from the target or a value is judged
+    /// on the wrong side.
+    #[test]
+    fn plain_verdict_schema_is_portable() {
+        /// Refuses a non-portable keyword or a `$ref` sibling anywhere.
+        ///
+        /// # Panics
+        /// Panics at the first node holding `oneOf`, `const`, `minimum`,
+        /// `format`, or a `$ref` with siblings.
+        fn portable(value: &Value) {
+            match value {
+                Value::Object(map) => {
+                    assert!(!map.contains_key("$ref") || map.len() == 1, "{map:?}");
+                    for keyword in ["oneOf", "const", "minimum", "format"] {
+                        assert!(!map.contains_key(keyword), "{keyword} in {map:?}");
+                    }
+                    map.values().for_each(portable);
+                }
+                Value::Array(items) => items.iter().for_each(portable),
+                _ => {}
+            }
+        }
+        /// The schema with every `title` and `description` removed.
+        fn structure(value: &Value) -> Value {
+            match value {
+                Value::Object(map) => Value::Object(
+                    map.iter()
+                        .filter(|(key, _)| !matches!(key.as_str(), "title" | "description"))
+                        .map(|(key, value)| (key.clone(), structure(value)))
+                        .collect(),
+                ),
+                Value::Array(items) => Value::Array(items.iter().map(structure).collect()),
+                other => other.clone(),
+            }
+        }
+        let schema = Value::Object(
+            Verdict::response_format(&NamedResponseFormat::Name(VERDICT_FORMAT.to_owned()))
+                .expect("resolves"),
+        );
+        let integer = || json!({"type": "integer"});
+        let number = || json!({"type": "number"});
+        let closed = |key: &str, value: Value| json!({"type": "object", "properties": {key: value}, "required": [key], "additionalProperties": false});
+        let target = json!({
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "type": "object",
+            "properties": {
+                "outcome": {"$ref": "#/$defs/VerificationVerdict"},
+                "reason": {"type": "string"},
+                "citations": {"type": "array", "items": {"$ref": "#/$defs/Citation"}}
+            },
+            "additionalProperties": false,
+            "required": ["outcome", "reason", "citations"],
+            "$defs": {
+                "VerificationVerdict": {"type": "string", "enum": ["passed", "failed", "inconclusive"]},
+                "Citation": {
+                    "type": "object",
+                    "properties": {
+                        "slot": {"$ref": "#/$defs/SlotName"},
+                        "locator": {"$ref": "#/$defs/Locator"}
+                    },
+                    "additionalProperties": false,
+                    "required": ["slot", "locator"]
+                },
+                "SlotName": {"type": "string"},
+                "Locator": {"anyOf": [
+                    closed("page", integer()),
+                    closed("slide", integer()),
+                    closed("lines", json!({
+                        "type": "object",
+                        "properties": {"start": integer(), "end": integer()},
+                        "required": ["start", "end"],
+                        "additionalProperties": false
+                    })),
+                    closed("json_pointer", json!({"type": "string"})),
+                    closed("region", json!({
+                        "type": "object",
+                        "properties": {
+                            "page": integer(), "x": number(), "y": number(),
+                            "width": number(), "height": number()
+                        },
+                        "required": ["page", "x", "y", "width", "height"],
+                        "additionalProperties": false
+                    })),
+                ]}
+            }
+        });
+        assert_eq!(structure(&schema), target, "{schema:#}");
+        portable(&schema);
+        let validator = jsonschema::validator_for(&schema).expect("valid schema");
+        let verdict = |outcome: Value, locator: Value| json!({"outcome": outcome, "reason": "r", "citations": [{"slot": "order", "locator": locator}]});
+        for locator in [
+            json!({"page": 1}),
+            json!({"slide": 2}),
+            json!({"lines": {"start": 1, "end": 3}}),
+            json!({"json_pointer": "/a"}),
+            json!({"region": {"page": 1, "x": 0.5, "y": 1, "width": 2, "height": 3}}),
+        ] {
+            let value = verdict(json!("failed"), locator);
+            assert!(validator.is_valid(&value), "{value}");
+            serde_json::from_value::<Verdict>(value.clone())
+                .unwrap_or_else(|error| panic!("{value}: {error}"));
+        }
+        for value in [
+            verdict(json!("FAIL"), json!({"page": 1})),
+            verdict(json!("passed"), json!({"page": 1, "slide": 2})),
+            verdict(json!("passed"), json!({"lines": {"start": 1}})),
+            verdict(json!("passed"), json!({"page": 1, "extra": 1})),
+            json!({"outcome": "passed", "reason": "r"}),
+            json!({"outcome": "passed", "reason": "r", "citations": [], "extra": 1}),
+            json!({"outcome": "passed", "reason": "r", "citations": [{"slot": "order"}]}),
+        ] {
+            assert!(!validator.is_valid(&value), "{value}");
+        }
+        for page in [json!(-1), json!(4_294_967_296_u64)] {
+            let value = verdict(json!("passed"), json!({"page": page}));
+            assert!(validator.is_valid(&value), "{value}");
+            assert!(
+                serde_json::from_value::<Verdict>(value.clone()).is_err(),
+                "{value}"
+            );
+        }
+    }
+
+    /// An expanded format embeds the authored `data` schema with only the
+    /// private `$id` added: its `oneOf`, `const`, numeric and `format`
+    /// keywords, optional fields, and local references keep their meaning
+    /// while the envelope around it is portable.
+    ///
+    /// # Panics
+    /// Panics when an authored keyword changes or the data is not required.
+    #[test]
+    fn expanded_verdict_keeps_authored_data_schema() {
+        let data = json!({
+            "type": "object",
+            "properties": {
+                "score": {"type": "integer", "minimum": 1, "format": "int32", "description": "kept"},
+                "kind": {"oneOf": [{"const": "a"}, {"const": "b"}]},
+                "item": {"$ref": "#/$defs/item", "description": "kept"}
+            },
+            "required": ["score"],
+            "$defs": {"item": {"type": "string", "minLength": 2}}
+        });
+        let format: NamedResponseFormat =
+            serde_json::from_value(json!({"kind": "verdict", "data": data})).expect("format");
+        let schema = Value::Object(Verdict::response_format(&format).expect("resolves"));
+        let mut embedded = data.clone();
+        embedded["$id"] = json!(DATA_RESOURCE);
+        assert_eq!(schema["properties"]["data"], embedded);
+        assert!(
+            schema["required"]
+                .as_array()
+                .expect("required")
+                .contains(&json!("data"))
+        );
+        assert!(schema["$defs"]["Locator"].get("anyOf").is_some());
+        let validator = jsonschema::validator_for(&schema).expect("valid schema");
+        let verdict = |data: Value| json!({"outcome": "passed", "reason": "r", "citations": [], "data": data});
+        assert!(validator.is_valid(&verdict(json!({"score": 1, "kind": "a", "item": "ok"}))));
+        for data in [
+            json!({"score": 0}),
+            json!({"score": 1, "kind": "c"}),
+            json!({"score": 1, "item": "x"}),
+            json!({}),
+        ] {
+            assert!(!validator.is_valid(&verdict(data.clone())), "{data}");
+        }
+    }
+
+    /// Restriction admits exactly the reachable bare slots, and an empty set
+    /// leaves the schema unchanged.
+    ///
+    /// # Panics
+    /// Panics when a slot outside the set, or a prefixed slot, is admitted.
+    #[test]
+    fn restrict_slots_admits_only_reachable_slots() {
+        let plain = Value::Object(
+            Verdict::response_format(&NamedResponseFormat::Name(VERDICT_FORMAT.to_owned()))
+                .expect("resolves"),
+        );
+        let mut unchanged = plain.clone();
+        Verdict::restrict_slots(&mut unchanged, &BTreeSet::new());
+        assert_eq!(unchanged, plain);
+        let mut schema = plain;
+        let slots = ["order", "receipt"].map(|slot| SlotName::new(slot).expect(slot));
+        Verdict::restrict_slots(&mut schema, &slots.into_iter().collect());
+        let slot = jsonschema::validator_for(&schema["$defs"]["SlotName"]).expect("valid");
+        assert!(slot.is_valid(&json!("order")) && slot.is_valid(&json!("receipt")));
+        for wrong in ["inputs.order", "other", ""] {
+            assert!(!slot.is_valid(&json!(wrong)), "{wrong}");
+        }
     }
 
     /// A delayed idempotency conflict is reported with the existing stable

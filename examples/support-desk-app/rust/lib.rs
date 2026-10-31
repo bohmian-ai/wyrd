@@ -37,7 +37,7 @@ use wyrd_ai::cards::{BundleMode, CardSelector, Cards};
 use wyrd_ai::gateway_admin::{GatewayCaptureMode, GatewayCapturePolicyWrite};
 use wyrd_ai::observe::Run;
 use wyrd_ai::otel::start_telemetry;
-use wyrd_ai::state::WyrdState;
+use wyrd_ai::state::{ConfigureOptions, WyrdState};
 use wyrd_ai::verify::{Execution, File, Input, Inputs, Submission};
 use wyrd_ai::{
     Bifrost, ExecutionId, ExecutionRoute, Gateway, RequirementResult, VerificationResult,
@@ -91,6 +91,12 @@ impl SupportDesk {
         // ANCHOR_END: deploy
         // ANCHOR: init
         let state = WyrdState::from_path_with(bundle, client.clone())?;
+        // The Service name, version, and environment every span, gateway call, and
+        // verification carries. Name and version come from the bundle.
+        state.configure(ConfigureOptions {
+            deployment_environment: Some("development".to_owned()),
+            ..ConfigureOptions::default()
+        })?;
         // Starts the buffered writer the ticket rows go through.
         state.start_bifrost().await?;
         // ANCHOR_END: init

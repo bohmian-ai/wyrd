@@ -1000,8 +1000,8 @@ test("grouped conversations coexist with drift", async ({ server, state: drift }
   }
 });
 
-/** Scribe outbox capacity of the staging-pressure story: its reserved three quarters, four writes, is what two direct judgments reserve. */
-const STAGING_CAPACITY = 6;
+/** Scribe outbox capacity of the staging-pressure story: its reserved three quarters, six writes, is what two direct judgments reserve, two result writes and one gateway capture each. */
+const STAGING_CAPACITY = 8;
 
 /** How long the staging-pressure story's judge holds each call. */
 const JUDGE_DELAY_MS = 15_000;
@@ -1112,5 +1112,5 @@ stagingTest("verification_staging_refuses_and_recovers", async ({ server, state 
     [],
     z.object({ n: z.coerce.number() }),
   );
-  expect(rows).toEqual([{ n: 4 + offered }]);
+  expect(rows).toEqual([{ n: 5 + offered }]);
 });

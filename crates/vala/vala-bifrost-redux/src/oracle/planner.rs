@@ -48,6 +48,21 @@ impl OraclePlanner {
         &self,
         request: &BifrostQueryRequest,
     ) -> Result<Vec<TableRef>, BifrostError> {
+        self.validate_statement(request).map(|(_, tables)| tables)
+    }
+
+    /// Validates one request as [`Self::validate_query`] does and also returns
+    /// the parsed statement.
+    ///
+    /// The executing Oracle plans from this statement, so validation and
+    /// planning share one parse.
+    ///
+    /// # Errors
+    /// Returns [`BifrostError::QueryInvalidSql`] for floor violations.
+    pub(super) fn validate_statement(
+        &self,
+        request: &BifrostQueryRequest,
+    ) -> Result<(DfStatement, Vec<TableRef>), BifrostError> {
         request
             .validate()
             .map_err(|error| BifrostError::QueryInvalidSql {
@@ -58,7 +73,7 @@ impl OraclePlanner {
                 detail: "query exceeds configured SQL byte limit".to_owned(),
             });
         }
-        parse_select_tables(&request.sql)
+        parse_select(&request.sql)
     }
 
     /// Projects one request's `deadline_ms` to the total budget it runs under.
@@ -162,7 +177,8 @@ impl OraclePlanner {
     /// dropped pin leaves nothing to release. Nothing here derives a class —
     /// the class comes from the physical root built on top of this cut. The
     /// pin times its reads into `profile`, which a selection retry passes
-    /// again so one query emits one profile.
+    /// again so one query emits one profile, along with the validated
+    /// `statement` every physical build plans from.
     ///
     /// # Errors
     /// Returns [`BifrostError::QueryTimeout`] when the deadline passes first,
@@ -170,7 +186,7 @@ impl OraclePlanner {
     pub(super) async fn pin_cut(
         &self,
         context: &AuthorizedQueryContext,
-        tables: &[TableRef],
+        (statement, tables): (DfStatement, &[TableRef]),
         deadline: Instant,
         catalog: &Arc<BifrostCatalog>,
         profile: Arc<super::profile::QueryProfile>,
@@ -202,6 +218,7 @@ impl OraclePlanner {
             "Oracle pinned one sealed cut"
         );
         Ok(PlannedSqlCut {
+            statement,
             cuts,
             local_ratio,
             profile,

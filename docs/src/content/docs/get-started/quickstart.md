@@ -4,7 +4,6 @@ description: Declare a Verifier and the Service it checks in two YAML files, the
 pillar: wyrd
 section: Get started
 order: 3
-status: runnable
 ---
 
 You write two small YAML files and one short program in Python, Rust, or TypeScript. The program declares them to your server, then asks Wyrd to verify two support answers against one requirement: the answer never promises a guaranteed refund. One answer passes and one fails, and each verdict names the exact versions that produced it.

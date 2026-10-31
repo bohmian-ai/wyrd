@@ -26,6 +26,7 @@ use wyrd_client::gateway_admin::{
 use wyrd_client::transport::trace::benchmark_headers;
 use wyrd_client::{Bifrost, Gateway, GlobalConfig, Principals, WyrdClient};
 use wyrd_spec::auth::CreateServicePrincipalRequest;
+use wyrd_testing::gateway_capture::GatewayCapture;
 use wyrd_testing::release_server::{SERVER_URL, SetupTenant};
 
 use crate::gateway::Result;
@@ -197,7 +198,7 @@ impl Shape {
             "max_completion_tokens": 64,
             "messages": [
                 {"role": "system", "content": marker},
-                {"role": "user", "content": "x".repeat(self.request_bytes)},
+                {"role": "user", "content": GatewayCapture::prose(self.request_bytes)},
             ],
         });
         if self.stream {
@@ -459,6 +460,11 @@ mod tests {
         let mut erroring = EventReader::default();
         let error = "data: {\"error\":{\"code\":\"WYRD_GATEWAY_502_UPSTREAM_UNAVAILABLE\"}}\n\ndata: [DONE]\n\n";
         assert!(erroring.push(error.as_bytes(), &mut Vec::new()).is_err());
+
+        let prose = GatewayCapture::prose(65_536);
+        assert_eq!(prose.len(), 65_536);
+        assert_eq!(prose, GatewayCapture::prose(65_536));
+        assert!(prose.split(' ').count() > 10_000, "sized text is words");
 
         let answer = GatewayCapture::sized_completion(800).to_string();
         assert_eq!(buffered(answer.as_bytes(), 800), Outcome::Answered);

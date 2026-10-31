@@ -24,7 +24,6 @@ const corpus: NavEntry[] = [
   page('get-started/quickstart', { title: 'Quickstart', section: 'Get started', order: 2 }),
   page('get-started/introduction', { title: 'Introduction', section: 'Get started', order: 1 }),
   page('declare/service', { title: 'Define a service', section: 'Build and verify', topic: 'Declare' }),
-  page('get-started/planned', { title: 'Planned', section: 'Get started', status: 'planned' }),
   page('get-started/draft', { title: 'Draft', section: 'Get started', draft: true })
 ];
 const nav = buildNav(corpus);
@@ -78,17 +77,15 @@ describe('published pages define navigation', () => {
     expect(nav[0].topics.map((topic) => topic.label)).toEqual([undefined]);
   });
 
-  it('keeps planned and draft pages out of navigation', () => {
-    expect(flat.map((item) => item.label)).not.toContain('Planned');
+  it('keeps draft and Fathom pages out of navigation', () => {
     expect(flat.map((item) => item.label)).not.toContain('Draft');
-    expect(inPrimaryNav({ title: 'X', pillar: 'wyrd', section: 'Operate', status: 'partial' })).toBe(true);
+    expect(inPrimaryNav({ title: 'X', pillar: 'wyrd', section: 'Operate' })).toBe(true);
     expect(inPrimaryNav({ title: 'X', pillar: 'fathom', section: 'Operate' })).toBe(false);
   });
 
-  it('shows draft pages, but never planned ones, when drafts are enabled for dev', () => {
+  it('shows draft pages when drafts are enabled for dev', () => {
     const labels = buildNav(corpus, true).flatMap((group) => group.items.map((item) => item.label));
     expect(labels).toContain('Draft');
-    expect(labels).not.toContain('Planned');
   });
 });
 

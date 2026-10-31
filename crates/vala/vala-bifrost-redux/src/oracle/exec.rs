@@ -1239,8 +1239,9 @@ pub(super) fn hot_parquet_scan(
 /// as sources [`hot_parquet_scan`] reads exactly like hot files.
 ///
 /// Iceberg only lists the files, planned with the scan's pushed predicate so
-/// manifest statistics drop files. A scan of a table with no snapshot returns
-/// no file without building an Iceberg scan.
+/// manifest statistics drop files, reading at most `concurrency` manifests and
+/// entries at once. A scan of a table with no snapshot returns no file without
+/// building an Iceberg scan.
 ///
 /// Wyrd writes no delete file and no encrypted file. A planned file with
 /// either is refused: the reader would ignore its deletes, and an encrypted
@@ -1253,9 +1254,9 @@ pub(super) fn hot_parquet_scan(
 /// file with key metadata, and a not-implemented error for a file with deletes.
 pub(super) async fn published_files(
     scan: &IcebergTableScan,
+    concurrency: usize,
 ) -> DataFusionResult<Vec<HotFileSource>> {
-    // A scan of a table with no snapshot plans no file; skip building
-    // Iceberg's scan, which probes the host's parallelism each time.
+    // A scan of a table with no snapshot plans no file.
     if scan.snapshot_id().is_none() && scan.table().metadata().current_snapshot().is_none() {
         return Ok(Vec::new());
     }
@@ -1265,7 +1266,8 @@ pub(super) async fn published_files(
     let mut builder = scan
         .table()
         .scan()
-        .with_schema_id(scan.table().metadata().current_schema_id());
+        .with_schema_id(scan.table().metadata().current_schema_id())
+        .with_concurrency_limit(concurrency);
     if let Some(snapshot_id) = scan.snapshot_id() {
         builder = builder.snapshot_id(snapshot_id);
     }
@@ -1641,7 +1643,7 @@ impl OracleTableProvider {
             .ok_or_else(|| {
                 DataFusionError::Plan("Oracle requires the pinned IcebergTableScan".to_owned())
             })?;
-        let mut files = published_files(published).await?;
+        let mut files = published_files(published, state.config().target_partitions()).await?;
         files.extend(self.hot_files.iter().cloned());
         let pushed = crate::scan_sizing::ScanScope {
             columns: Vec::new(),

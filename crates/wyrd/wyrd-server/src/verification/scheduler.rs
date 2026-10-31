@@ -1,55 +1,69 @@
-//! Turns due binding schedules into Verifier runs.
+//! Turns due binding schedules and expired pending groups into Verifier
+//! runs.
 //!
 //! [`VerificationScheduler`] lists tenants with a due scheduled binding
-//! through the operator pool, then advances each tenant's due bindings one
+//! through the operator pool, then decides each tenant's due bindings one
 //! occurrence per short tenant transaction: [`VerifierExecutionQueue::claim_due`]
-//! decides the occurrence, [`BackgroundAuthority`] resolves the owner/SYSTEM
-//! authority a run would be accepted under, and
-//! [`VerifierExecutionQueue::schedule_due`] settles it. The queue locks each binding with
-//! `SKIP LOCKED` and dedupes an occurrence's run, so concurrent schedulers on
-//! many processes, duplicate ticks, and a restart mid-pass never create a
-//! second run for one occurrence. A newly enqueued run's observation
-//! population is frozen by [`DriftEngine::select`] in the same transaction,
-//! and its schedule input record is staged on a Scribe outbox slot reserved
-//! before the transaction, after the commit.
+//! locks the occurrence with `SKIP LOCKED`, [`BackgroundAuthority`] resolves
+//! the owner/SYSTEM authority a run would be accepted under, and
+//! [`VerifierExecutionQueue::settle_due`] decides it. A tick that calls for
+//! no new run moves the cursor and commits. A run is prepared, never
+//! written: the transaction rolls back, [`DriftEngine::select`] freezes its
+//! observation population, and its schedule input record is staged with
+//! its [`Queued`] admission on the Scribe and queue slots reserved before
+//! the claim. Only once Scribe acknowledges that record does the queue
+//! writer admit the run and move the expected cursor in one transaction, so
+//! no run is claimable before its input is durable.
 //!
 //! In a process hosting Verifier blocks a separate group loop hands expired
 //! pending groups off through [`GroupPoller`]: per item it takes one permit
-//! of the shared execution capacity and one Scribe outbox slot, then in one
+//! of the shared execution capacity and the same two slots, then in one
 //! short transaction claims the pending row with
-//! [`VerifierExecutionQueue::claim_due_group`], selects and enqueues one
-//! snapshot, consumes the row, and commits; a newly enqueued execution's
-//! selector record is staged on the reserved slot after the commit. The
-//! permit is released at handoff, before any Verifier runs. An inactive owner or a
+//! [`VerifierExecutionQueue::claim_due_group`] and pins one snapshot. A new
+//! snapshot is prepared and staged like a scheduled run, its admission
+//! consuming the pending row's generation, so newer activity stays pending;
+//! an existing snapshot consumes the row and commits. The permit is
+//! released at handoff, before any Verifier runs. An inactive owner or a
 //! rejected owner authority is recorded as one terminal errored group
 //! execution in that same transaction, which also consumes the row. A
 //! retryable failure rolls back and ends that tenant's group pass, leaving
 //! the item pending.
+//!
+//! A bounded in-flight set keeps this process from preparing a source again
+//! while its staged candidate is outstanding: each claim is held by the
+//! candidate's Scribe write and queued admission and released when the
+//! admission is written or its input record is lost. Another process may
+//! still prepare the same source; the queue's occurrence and snapshot
+//! dedupe and the expected cursor admit at most one run, and the loser's
+//! input record stays an unreferenced row. A crash before admission loses
+//! nothing durable: the source stays due and is prepared again.
 
-use std::sync::Arc;
+use std::collections::HashSet;
+use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
 use tokio::sync::Semaphore;
 use tokio_util::sync::CancellationToken;
+use wyrd_runtime::outbox::Reservation;
 use wyrd_runtime::principal::PrincipalId;
 use wyrd_spec::DataTenantId;
 use wyrd_spec::error::WyrdError;
-use wyrd_spec::ids::ExecutionId;
-use wyrd_spec::verification::DriftWindow;
+use wyrd_spec::ids::{BindingId, ExecutionId, GroupId};
 use wyrd_spec::verification::VerificationError;
 use wyrd_sql::queries::auth::service_accounts::system_principal_id;
 use wyrd_sql::queries::verifier_executions::{
-    DueBinding, DueGroup, EnqueueOutcome, ExecutionAuthority, QueueCounts, ScheduleOutcome,
-    ScheduleSkip, ScheduleTick, VerifierExecutionQueue,
+    Admission, DueBinding, DueGroup, DueSettlement, GroupedAdmission, Prepared, QueueCounts,
+    ScheduleOutcome, ScheduleSkip, ScheduleTick, ScheduledAdmission, VerifierExecutionQueue,
 };
 use wyrd_sql::{OperatorPool, SqlError, TenantConn, WyrdPostgres};
 
 use super::authority::{AuthorityRefusal, BackgroundAuthority};
 use super::drift::DriftEngine;
-use super::groups::{GroupPollError, GroupPoller, Polled};
+use super::groups::{GroupPollError, GroupPoller};
 use super::inputs::ScheduleSelector;
-use super::results::{InputRecord, ResultPayloadBuilder, ResultPayloadError, ResultRun};
-use crate::scribe_outbox::ScribeWrite;
+use super::results::{InputRecord, ResultPayloadBuilder, ResultPayloadError, ResultRow, ResultRun};
+use super::submissions::{Queued, SubmissionSink};
+use crate::scribe_outbox::{ScribeSink, ScribeWrite};
 
 #[cfg(feature = "test-support")]
 use super::CapabilityCrash;
@@ -63,16 +77,92 @@ const TENANTS_PER_PASS: i64 = 64;
 /// next tenant runs.
 const TICKS_PER_TENANT: usize = 32;
 
-/// One committed handoff of an expired pending group, which consumed it.
+/// One handoff of an expired pending group.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum GroupHandoff {
-    /// The pinned snapshot was enqueued as this group execution.
+    /// The pinned snapshot was staged as this group execution, admitted, and
+    /// the pending generation consumed, once Scribe acknowledges its input.
     Enqueued(ExecutionId),
     /// An identical snapshot's group execution already existed.
     AlreadyEnqueued(ExecutionId),
     /// The owner was inactive or refused; this terminal errored group
     /// execution records why, with nothing evaluated.
     Errored(ExecutionId),
+}
+
+/// A due source this process prepares work from.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+enum Source {
+    /// One scheduled binding's due occurrence.
+    Binding(DataTenantId, BindingId),
+    /// One binding's pending group.
+    Group(DataTenantId, BindingId, GroupId),
+}
+
+/// The sources this process has staged candidates for that are not yet
+/// admitted or lost. Each entry is held by a candidate holding a reserved
+/// queue slot, so the set is bounded by the queue outbox's capacity.
+#[derive(Debug, Default)]
+struct InFlightSet(Mutex<HashSet<Source>>);
+
+impl InFlightSet {
+    /// Claim `source`, or `None` when a candidate of it is outstanding.
+    fn claim(self: &Arc<Self>, source: Source) -> Option<Arc<InFlight>> {
+        self.0
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .insert(source.clone())
+            .then(|| {
+                Arc::new(InFlight {
+                    source,
+                    set: Arc::clone(self),
+                })
+            })
+    }
+
+    /// The claimed sources of `tenant` matching `pick`, which the next claim
+    /// passes over.
+    fn claimed<T>(&self, pick: impl Fn(&Source) -> Option<T>) -> Vec<T> {
+        self.0
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .iter()
+            .filter_map(pick)
+            .collect()
+    }
+}
+
+/// One process-local claim on a due source, shared by its candidate's
+/// Scribe write and queued admission and released when the last drops: once
+/// the admission is written, its input record is lost, or the candidate is
+/// abandoned before staging.
+#[derive(Debug)]
+pub struct InFlight {
+    /// The claimed source.
+    source: Source,
+    /// The set the claim is released from.
+    set: Arc<InFlightSet>,
+}
+
+impl Drop for InFlight {
+    /// Releases the claim when its last holder drops: removes the source from
+    /// the shared in-flight set so a later poll may claim it again. A poisoned
+    /// set is recovered, since removing one entry cannot leave it torn.
+    fn drop(&mut self) {
+        self.set
+            .0
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .remove(&self.source);
+    }
+}
+
+/// What one claimed source's transaction decided, reported as `O`.
+enum Step<'c, O> {
+    /// Settled without new work; the connection commits it.
+    Settled(TenantConn<'c>, O),
+    /// New work and its claim, rolled back, to stage with its input row.
+    Candidate(O, Box<Queued>, ResultRow),
 }
 
 /// The group loop's snapshot reader and the shared execution capacity each
@@ -100,6 +190,8 @@ pub struct VerificationScheduler {
     poll_interval: Duration,
     /// Pending group handoff, present only where Verifier blocks are hosted.
     groups: Option<Groups>,
+    /// Sources whose staged candidates are outstanding.
+    in_flight: Arc<InFlightSet>,
     /// Test-only crash switch.
     #[cfg(feature = "test-support")]
     crash: Option<CapabilityCrash>,
@@ -132,6 +224,7 @@ impl VerificationScheduler {
             drift,
             poll_interval,
             groups: None,
+            in_flight: Arc::default(),
             #[cfg(feature = "test-support")]
             crash: None,
             #[cfg(feature = "test-support")]
@@ -326,30 +419,31 @@ impl VerificationScheduler {
         record_pass("group", started, Ok(handed))
     }
 
-    /// Commit up to [`TICKS_PER_TENANT`] due occurrences of `tenant`, one
-    /// transaction each, appending every committed tick to `ticks`.
+    /// Decide up to [`TICKS_PER_TENANT`] due occurrences of `tenant`, one
+    /// transaction each, appending every tick to `ticks`.
     ///
-    /// Each occurrence first reserves one Scribe outbox slot; none ends the
-    /// tenant's pass before any claim. A newly enqueued run's population is
-    /// selected inside the transaction and its input record staged on the
-    /// slot after the commit; a failed selection rolls the occurrence back,
-    /// leaving it due, and ends the tenant's pass.
+    /// Each occurrence first reserves one Scribe outbox slot and one queue
+    /// slot; none ends the tenant's pass before any claim. Bindings with an
+    /// outstanding candidate are passed over. A settled tick commits. A run
+    /// is claimed in flight, rolled back, its population selected, and its
+    /// input record staged with its admission, reported as
+    /// [`ScheduleOutcome::Enqueued`]; a failed selection releases the claim,
+    /// leaving the occurrence due, and ends the tenant's pass.
     ///
-    /// Selecting an occurrence's commit is its linearization point. Opening
-    /// the transaction and applying the atomic run insert and cursor advance
-    /// race `stop`; if `stop` wins, the dropped transaction rolls back and the
-    /// method returns. Once the commit is selected it is awaited without
-    /// cancellation, so its result is always known: a committed tick is
-    /// recorded as admitted before scheduler closure, and no later occurrence
-    /// starts when `stop` arrived meanwhile.
+    /// Committing a settled tick or staging a candidate is the occurrence's
+    /// linearization point. Everything before it races `stop`; if `stop`
+    /// wins, the dropped transaction rolls back and the method returns. A
+    /// selected commit is awaited without cancellation, so its result is
+    /// always known, and no later occurrence starts when `stop` arrived
+    /// meanwhile.
     ///
     /// # Errors
     /// Returns [`SqlError`] when a tenant transaction fails; earlier ticks
-    /// stay committed.
+    /// stay committed or staged.
     ///
     /// # Cancellation
-    /// Cancellation before commit selection rolls back the in-progress
-    /// occurrence; a selected commit completes before returning.
+    /// Cancellation before the linearization point rolls back the
+    /// in-progress occurrence; a selected commit completes before returning.
     async fn schedule_tenant(
         &self,
         tenant: DataTenantId,
@@ -357,13 +451,17 @@ impl VerificationScheduler {
         ticks: &mut Vec<ScheduleTick>,
     ) -> Result<(), SqlError> {
         for _ in 0..TICKS_PER_TENANT {
-            let Ok(slot) = self.drift.reserve() else {
-                tracing::warn!(%tenant, "the Scribe outbox share is full; occurrences stay due");
+            let Ok(slots) = self.drift.reserve() else {
+                tracing::warn!(%tenant, "the Scribe or queue outbox share is full; occurrences stay due");
                 return Ok(());
             };
+            let skip = self.in_flight.claimed(|source| match source {
+                Source::Binding(owner, binding) if *owner == tenant => Some(*binding),
+                _ => None,
+            });
             let applied = async {
                 let mut conn = self.postgres.tenant_conn(tenant).await?;
-                let Some(due) = self.queue.claim_due(&mut conn).await? else {
+                let Some(due) = self.queue.claim_due(&mut conn, &skip).await? else {
                     return Ok::<_, SqlError>(None);
                 };
                 let authority = match due.owner() {
@@ -373,39 +471,48 @@ impl VerificationScheduler {
                     None => None,
                 };
                 let prepared = due.clone();
-                let tick = self
-                    .queue
-                    .schedule_due(&mut conn, due, authority.clone())
-                    .await?;
-                let record = match (tick.outcome, prepared.window(), &authority) {
-                    (ScheduleOutcome::Enqueued(id), Some(window), Some(authority)) => {
-                        match self
-                            .selector(tenant, &prepared, *window, id, authority)
-                            .await
-                        {
-                            Ok(record) => Some(record),
-                            Err(error) => {
-                                tracing::warn!(%tenant, binding_id = %prepared.binding_id, %error, "scheduled population selection failed; the occurrence stays due");
-                                return Ok(None);
-                            }
-                        }
-                    }
-                    _ => None,
+                let admission = match self.queue.settle_due(&mut conn, due, authority).await? {
+                    DueSettlement::Settled(tick) => return Ok(Some(Step::Settled(conn, tick))),
+                    DueSettlement::Candidate(admission) => *admission,
                 };
-                Ok(Some((conn, tick, record)))
+                let Some(claim) = self
+                    .in_flight
+                    .claim(Source::Binding(tenant, admission.binding_id))
+                else {
+                    return Ok(None);
+                };
+                drop(conn);
+                match self.selector(tenant, &prepared, &admission).await {
+                    Ok(row) => Ok(Some(Step::Candidate(
+                        admission.tick(ScheduleOutcome::Enqueued(admission.execution_id)),
+                        Box::new(Queued {
+                            admission: Admission::Scheduled(admission),
+                            claim: Some(claim),
+                        }),
+                        row,
+                    ))),
+                    Err(error) => {
+                        tracing::warn!(%tenant, binding_id = %prepared.binding_id, %error, "scheduled population selection failed; the occurrence stays due");
+                        Ok(None)
+                    }
+                }
             };
             let applied = tokio::select! {
                 biased;
                 () = stop.cancelled() => return Ok(()),
                 applied = applied => applied?,
             };
-            let Some((conn, tick, record)) = applied else {
-                return Ok(());
+            let tick = match applied {
+                None => return Ok(()),
+                Some(Step::Settled(conn, tick)) => {
+                    conn.commit().await?;
+                    tick
+                }
+                Some(Step::Candidate(tick, queued, row)) => {
+                    stage(tenant, slots, queued, row);
+                    tick
+                }
             };
-            conn.commit().await?;
-            if let Some(record) = record {
-                slot.stage(tenant, record);
-            }
             metrics::counter!(
                 crate::app::metrics::VERIFICATION_SCHEDULE_TICKS_TOTAL,
                 "outcome" => tick_label(tick.outcome)
@@ -419,8 +526,8 @@ impl VerificationScheduler {
         Ok(())
     }
 
-    /// Freeze the population of `execution`, the run newly enqueued for
-    /// `due`'s `window` under `authority`, as its schedule input record.
+    /// Freeze the population of `admission`, the run prepared for `due`, as
+    /// its schedule input record.
     ///
     /// # Errors
     /// Returns the selection read's failure, or the record's encoding
@@ -429,19 +536,18 @@ impl VerificationScheduler {
         &self,
         tenant: DataTenantId,
         due: &DueBinding,
-        window: DriftWindow,
-        execution: ExecutionId,
-        authority: &ExecutionAuthority,
-    ) -> Result<ScribeWrite, String> {
+        admission: &ScheduledAdmission,
+    ) -> Result<ResultRow, String> {
+        let window = admission.window;
         let record_ids = self
             .drift
-            .select(tenant, authority, &due.card_uid, &window)
+            .select(tenant, admission.authority(), &due.card_uid, &window)
             .await?;
         let selector = ScheduleSelector { window, record_ids };
         let now = chrono::Utc::now();
-        let row = ResultPayloadBuilder::new(
+        ResultPayloadBuilder::new(
             ResultRun {
-                execution_id: execution,
+                execution_id: admission.execution_id,
                 run_id: None,
                 // The inputs row records no Verifier version.
                 verifier_version: "",
@@ -458,35 +564,31 @@ impl VerificationScheduler {
             now,
         )
         .inputs(InputRecord::Schedule(&selector))
-        .map_err(|error: ResultPayloadError| error.to_string())?;
-        Ok(ScribeWrite::ExecutionInputs {
-            row,
-            attribution: authority.attribution(),
-            queued: None,
-        })
+        .map_err(|error: ResultPayloadError| error.to_string())
     }
 
     /// Hand off up to [`TICKS_PER_TENANT`] expired pending groups of
-    /// `tenant`, one transaction each, appending every committed outcome to
-    /// `handed`.
+    /// `tenant`, one transaction each, appending every outcome to `handed`.
     ///
     /// Each item first takes one permit of the shared execution capacity and
-    /// reserves one Scribe outbox slot; no permit or slot ends the tenant's
-    /// pass before any claim or read. After the commit, a newly enqueued
-    /// execution's selector record is staged on that slot. The
-    /// transaction claims one pending row, decides it through
-    /// [`Self::hand_off`], consumes the row, and commits; the connection and
+    /// reserves one Scribe outbox slot and one queue slot; no permit or slot
+    /// ends the tenant's pass before any claim or read. Groups with an
+    /// outstanding candidate are passed over. The transaction claims one
+    /// pending row and decides it through [`Self::hand_off`]: a settled item
+    /// consumes the row and commits; a new snapshot is claimed in flight,
+    /// rolled back, and staged with its admission, which consumes the row's
+    /// generation once Scribe acknowledges its input. The connection and
     /// permit are released before any Verifier runs. An item `hand_off`
     /// leaves pending rolls back and ends the tenant's pass, so the same
     /// oldest row is not reclaimed until the next pass.
     ///
     /// # Errors
     /// Returns [`SqlError`] when a tenant transaction fails; earlier handoffs
-    /// stay committed.
+    /// stay committed or staged.
     ///
     /// # Cancellation
-    /// As [`Self::schedule_tenant`]: cancellation before commit selection
-    /// rolls back the in-progress handoff.
+    /// As [`Self::schedule_tenant`]: cancellation before the linearization
+    /// point rolls back the in-progress handoff.
     async fn hand_off_groups(
         &self,
         groups: &Groups,
@@ -498,14 +600,20 @@ impl VerificationScheduler {
             let Ok(_permit) = groups.capacity.try_acquire() else {
                 return Ok(());
             };
-            let Ok(slot) = groups.poller.reserve() else {
-                tracing::warn!(%tenant, "the Scribe outbox share is full; groups stay pending");
+            let Ok(slots) = groups.poller.reserve() else {
+                tracing::warn!(%tenant, "the Scribe or queue outbox share is full; groups stay pending");
                 return Ok(());
             };
+            let skip = self.in_flight.claimed(|source| match source {
+                Source::Group(owner, binding, group) if *owner == tenant => {
+                    Some((*binding, group.clone()))
+                }
+                _ => None,
+            });
             let started = Instant::now();
             let applied = async {
                 let mut conn = self.postgres.tenant_conn(tenant).await?;
-                let Some(due) = self.queue.claim_due_group(&mut conn).await? else {
+                let Some(due) = self.queue.claim_due_group(&mut conn, &skip).await? else {
                     return Ok::<_, SqlError>(None);
                 };
                 #[cfg(feature = "test-support")]
@@ -513,25 +621,48 @@ impl VerificationScheduler {
                     overdue: due.overdue || self.overdue,
                     ..due
                 };
-                let Some(handoff) = self.hand_off(groups, &mut conn, &due).await? else {
-                    return Ok(None);
-                };
-                self.queue.consume_group(&mut conn, &due).await?;
-                Ok(Some((conn, handoff)))
+                match self.hand_off(groups, &mut conn, &due).await? {
+                    None => Ok(None),
+                    Some(Ok(handoff)) => {
+                        self.queue.consume_group(&mut conn, &due).await?;
+                        Ok(Some(Step::Settled(conn, handoff)))
+                    }
+                    Some(Err((admission, row))) => {
+                        let Some(claim) = self.in_flight.claim(Source::Group(
+                            tenant,
+                            due.binding_id,
+                            due.group_id.clone(),
+                        )) else {
+                            return Ok(None);
+                        };
+                        drop(conn);
+                        Ok(Some(Step::Candidate(
+                            GroupHandoff::Enqueued(admission.execution_id),
+                            Box::new(Queued {
+                                admission: Admission::Grouped(admission),
+                                claim: Some(claim),
+                            }),
+                            row,
+                        )))
+                    }
+                }
             };
             let applied = tokio::select! {
                 biased;
                 () = stop.cancelled() => return Ok(()),
                 applied = applied => applied,
             };
-            let (conn, (handoff, record)) = match applied {
-                Ok(Some(applied)) => applied,
+            let handoff = match applied {
+                Ok(Some(Step::Settled(conn, handoff))) => {
+                    record_pass("group_handoff", started, conn.commit().await)?;
+                    handoff
+                }
+                Ok(Some(Step::Candidate(handoff, queued, row))) => {
+                    stage(tenant, slots, queued, row);
+                    record_pass("group_handoff", started, Ok(handoff))?
+                }
                 other => return record_pass("group_handoff", started, other.map(drop)),
             };
-            record_pass("group_handoff", started, conn.commit().await)?;
-            if let Some(record) = record {
-                slot.stage(tenant, record);
-            }
             metrics::counter!(
                 crate::app::metrics::VERIFICATION_SCHEDULE_TICKS_TOTAL,
                 "outcome" => group_label(handoff)
@@ -545,11 +676,11 @@ impl VerificationScheduler {
         Ok(())
     }
 
-    /// Decide the claimed pending group `due` on `conn`, writing its
-    /// execution and returning a newly enqueued execution's selector record
-    /// to stage after commit, or `None` to leave it pending.
+    /// Decide the claimed pending group `due` on `conn`: a settled handoff
+    /// whose row the caller consumes, a prepared new snapshot and its
+    /// selector input record to stage, or `None` to leave it pending.
     ///
-    /// An active owner's recovered authority pins and enqueues one snapshot
+    /// An active owner's recovered authority pins and prepares one snapshot
     /// (or finds the identical snapshot's execution), read as the tenant's
     /// SYSTEM principal. An inactive owner or a rejected owner authority is
     /// recorded through [`VerifierExecutionQueue::refuse_group`] as one
@@ -571,7 +702,7 @@ impl VerificationScheduler {
         groups: &Groups,
         conn: &mut TenantConn<'_>,
         due: &DueGroup,
-    ) -> Result<Option<(GroupHandoff, Option<ScribeWrite>)>, SqlError> {
+    ) -> Result<Option<Result<GroupHandoff, (GroupedAdmission, ResultRow)>>, SqlError> {
         let pending = |label: &'static str, reason: &dyn std::fmt::Display| {
             metrics::counter!(
                 crate::app::metrics::VERIFICATION_GROUP_HANDOFFS_BLOCKED_TOTAL,
@@ -628,20 +759,11 @@ impl VerificationScheduler {
                 .poll(conn, &self.queue, due, &authority, system)
                 .await
             {
-                Ok(Polled {
-                    outcome: EnqueueOutcome::Enqueued(id),
-                    record,
-                }) => return Ok(Some((GroupHandoff::Enqueued(id), record))),
-                Ok(Polled {
-                    outcome: EnqueueOutcome::AlreadyEnqueued(id),
-                    ..
-                }) => {
-                    return Ok(Some((GroupHandoff::AlreadyEnqueued(id), None)));
+                Ok(Prepared::Candidate(candidate)) => return Ok(Some(Err(candidate))),
+                Ok(Prepared::Existing(id)) => {
+                    return Ok(Some(Ok(GroupHandoff::AlreadyEnqueued(id))));
                 }
-                Ok(Polled {
-                    outcome: EnqueueOutcome::Refused(refusal),
-                    ..
-                }) => {
+                Ok(Prepared::Refused(refusal)) => {
                     return Ok(pending("enqueue_refused", &format!("{refusal:?}")));
                 }
                 Err(GroupPollError::Sql(error)) => return Err(SqlError::from(error)),
@@ -683,7 +805,7 @@ impl VerificationScheduler {
             reason = %refusal,
             "group refused; recorded a terminal errored execution"
         );
-        Ok(Some((GroupHandoff::Errored(execution), None)))
+        Ok(Some(Ok(GroupHandoff::Errored(execution))))
     }
 
     /// Publish the cross-tenant queue depth gauges.
@@ -696,6 +818,25 @@ impl VerificationScheduler {
         record_depth("dispatches", depth.dispatches);
         Ok(())
     }
+}
+
+/// Stage `queued`'s input `row` on the reserved Scribe slot of `slots`,
+/// carrying the reserved queue slot that admits it once Scribe acknowledges
+/// the row.
+fn stage(
+    tenant: DataTenantId,
+    (scribe, queue): (Reservation<ScribeSink>, Reservation<SubmissionSink>),
+    queued: Box<Queued>,
+    row: ResultRow,
+) {
+    scribe.stage(
+        tenant,
+        ScribeWrite::ExecutionInputs {
+            row,
+            attribution: queued.admission.attribution(),
+            queued: Some((queue, queued)),
+        },
+    );
 }
 
 /// Set the depth gauge of one queue's three non-terminal states.

@@ -650,6 +650,22 @@ def test_invalid_judge_verdicts_are_inconclusive(desk: WyrdState) -> None:
         assert judged["outcome"] == "inconclusive", (marker, judged)
         assert judged["reason"], f"{marker}: it says why"
         assert result.verdict == "inconclusive", marker
+    malformed = requirement(review(desk, "JUDGE-MALFORMED", 50), "follows-policy")
+    assert "WYRD_AGENT_422_STRUCTURED_INVALID" in malformed["reason"], malformed
+    assert "not a verdict" not in malformed["reason"], malformed
+
+
+def test_judge_repairs_an_invalid_verdict(desk: WyrdState, receiver: Receiver) -> None:
+    result = review(desk, "JUDGE-REPAIRED: refunds follow our policy.", 50)
+
+    judged = requirement(result, "follows-policy")
+    assert (judged["outcome"], judged["citations"]) == ("passed", ANSWER_TEXT), judged
+    asked = [
+        text
+        for text in map(json.dumps, (each.body for each in receiver.to("/v1/chat/completions")))
+        if "JUDGE-REPAIRED" in text and "Rules:" in text
+    ]
+    assert len(asked) == 2 and "was not accepted" in asked[1], asked
 
 
 def test_code_check_fails_with_citations_and_is_inconclusive_otherwise(desk: WyrdState) -> None:

@@ -17,6 +17,8 @@ mod pg_grpc_ingest_smoke;
 mod pg_grpc_smoke;
 /// Registered Artifact evidence and code through the hosted runtime.
 mod pg_hosted_artifacts;
+/// Uploaded verification Files through the hosted evidence reader.
+mod pg_hosted_files;
 mod pg_merge_http_protected;
 mod pg_openapi_contract;
 mod pg_operator_connection_routes;

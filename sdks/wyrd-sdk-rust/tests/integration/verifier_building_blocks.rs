@@ -1979,3 +1979,71 @@ async fn uploaded_artifacts_are_reused_by_service_judges() {
     }
     deployment.shutdown().await;
 }
+
+/// A path-backed and an in-memory File each travel the shared upload and
+/// completion and are read back by the Verifier; each is then a completed
+/// File the server's next evidence plan reuses instead of uploading again.
+///
+/// # Panics
+/// Panics when a verify or plan is refused, or an output or plan differs.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires the repository-managed Postgres journey lifecycle"]
+async fn file_inputs_use_shared_uploads() {
+    let desk = PolicyDesk::start().await;
+    let path = fixture("cards/verifier_building_blocks/samples/sample.csv");
+    let in_memory = b"a,b\n3,4".to_vec();
+    for (file, rows) in [
+        (File::path(path.clone()), json!([["a", "b"], ["1", "2"]])),
+        (
+            File::bytes(in_memory.clone()).with_format(MediaFormat::Csv),
+            json!([["a", "b"], ["3", "4"]]),
+        ),
+    ] {
+        let result = desk
+            .state
+            .run()
+            .observe()
+            .verify("document-formats", file)
+            .await
+            .expect("the File is uploaded and read");
+        assert_eq!(
+            step(&result, "read").output.as_ref(),
+            Some(&json!({"format": "csv", "rows": rows}))
+        );
+    }
+
+    let token = desk
+        .client
+        .access_token()
+        .await
+        .expect("access token mints");
+    let base_url = desk
+        .deployment
+        .server()
+        .base_url()
+        .expect("bound server has a URL");
+    for bytes in [std::fs::read(&path).expect("the sample reads"), in_memory] {
+        let files = json!({ "files": [{
+            "sha256": wyrd_spec::auth::Sha256Hex::digest(&bytes).to_string(),
+            "size_bytes": bytes.len(),
+        }] });
+        let planned: Value = reqwest::Client::new()
+            .post(format!("{base_url}/v1/verification/evidence"))
+            .header("x-wyrd-access-token", format!("Bearer {}", token.expose()))
+            .json(&files)
+            .send()
+            .await
+            .expect("the server answers")
+            .error_for_status()
+            .expect("the plan is admitted")
+            .json()
+            .await
+            .expect("the plan decodes");
+        assert_eq!(
+            planned["uploads"],
+            json!([]),
+            "the completed File is reused"
+        );
+    }
+    desk.deployment.shutdown().await;
+}

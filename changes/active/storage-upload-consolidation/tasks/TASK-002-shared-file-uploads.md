@@ -271,3 +271,47 @@ The combined baseline and Artifact authoring workflow must survive.
 - [Python rules](../../../../sdks/wyrd-sdk-python/AGENTS.md).
 - [TypeScript rules](../../../../sdks/wyrd-sdk-ts/AGENTS.md).
 
+
+## Implementation Evidence
+
+Commits `fa0870703`..`4ab2bdf1d` on `shared-file-uploads`.
+
+| Acceptance criterion | Implementation evidence | Verification evidence | Result |
+|---|---|---|---|
+| REQ-001, REQ-003, REQ-016; INV-004; AC-001 | `wyrd-storage/src/service.rs` (Card-less `upload_init`, `upload_owner` with declared size); `components/verification/service.rs::evidence` plans through the shared planner with file/aggregate limits; `storage/routes.rs::local_blob` bounded by declared size, exempt from the 1 MiB body limit (`http/middleware/body_limit.rs`) | V1 `pg_verification_routes::file_upload_uses_shared_completion`; V3 SHA256/SIZE mismatch and per-file/aggregate 413; `storage_e2e::{local_client_server_round_trip, s3_multipart_e2e, gcs_single_put_e2e, azure_multipart_e2e}` now complete a File per backend (`mise run test:storage:e2e`) | PASS |
+| REQ-010, REQ-013; AC-004, AC-006 | `components/storage/inventory.rs::file_object` (completed, undeleted, same-tenant `file_upload` fact matching digest and size); `verification/hosted/evidence.rs::file_object` reads the recorded location and re-checks length, digest, and limit | V2 `file_reuse_requires_completed_file_inventory` (uncompleted bytes, Card file/envelope facts, foreign tenant, size mismatch, deletion, inconclusive readiness); `pg_hosted_files::*` (5 tests); V4 Rust, V5 Python, V6 TypeScript `file_inputs_use_shared_uploads` | PASS |
+| REQ-015; INV-002; AC-007 | `storage/routes.rs::authorize_upload` derives `cards:write` or any `verifier:run` from the persisted owner after a tenant-scoped lookup (foreign → 404) | V3 `file_upload_authority_and_validation_are_preserved` (exact-grant operations, Card-write denial, foreign 404, malformed 400, audited decisions); V7 `wyrd-mcp` `file_inputs_use_shared_uploads` (exact role; other Verifier refused) | PASS |
+| REQ-007, REQ-016–017; INV-003; AC-003, AC-008 (File portion) | Local evidence route, `upload_evidence`, `upload_local_evidence`, `evidence_upload_plan` removed; `EvidenceUpload { sha256, upload_id, plan }`; MCP guide/description, `docs/.../mcp-tools.md`, generated `llms-full.txt`, `architecture/wyrd-design.md` Verifier evidence section | `pg_openapi_contract` (route absent); V8 `wyrd-cli card_lifecycle::pg_tests::artifact_upload_keeps_shared_completion` and `card_lifecycle_cli_journey`; `codegen:regen` no diff, `codegen:check`, `docs:check` | PASS |
+
+Checks run on the final tree: `fmt`, `lints`, `py:format`, `py:lints`,
+`py:typecheck`, `ts:typecheck`, `ts:napi:check`, `codegen:check`, `check:deps`,
+`check:tenant-isolation`, `check:storage:drift`, `docs:check`,
+`git diff --check`; `cargo nextest` for `wyrd-server` and `wyrd-mcp` `--lib`
+(574 passed), `wyrd-storage` and `wyrd-client` `--lib` (320 passed), and the
+`pg_verification_routes`, `pg_hosted_files`, and `pg_openapi_contract` modules
+(44 passed).
+
+Diagnosis (storage e2e):
+- **Symptom:** `storage_e2e::local_client_server_round_trip` and
+  `local_upload_capability_rejects_raw_paths_and_bad_bytes` failed at Card
+  completion with `WriterUnavailable { table: "bifrost.storage.objects" }`.
+- **Evidence:** the outbox logged "Scribe rejected a frame terminally", and the
+  in-process Scribe returned `ingest card scope validation failed`.
+- **Cause:** since TASK-001, completion records a card-scoped inventory fact.
+  The journeys named a fabricated `FIXED_CARD_UID` that the tenant never
+  registered.
+- **Fix site:** the journey fixture now registers its Card (`register_card`).
+  The refusal journey keeps the fixed UID because it is refused before the Card
+  is resolved. No production caller completes for an unregistered Card.
+
+Non-goals stayed excluded: no compatibility alias, alternate planner,
+provider-specific SDK loop, new completion mode, extra hashing pass, retention
+policy, migration, or Card/File physical sharing. File and ArtifactRef
+declaration shapes and exact invocation authorization are unchanged. No
+unrelated file changed.
+
+Material limits:
+- Real-GCS multipart was not run because no GCS credentials are available.
+  The emulator lanes prove GCS single-put, S3 multipart, and Azure block blob.
+- Deletion dominates: a re-upload of a deleted File digest is not reused, which
+  matches Card fold semantics. No path deletes Files today.

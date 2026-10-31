@@ -847,14 +847,15 @@ fn values_project_onto_named_slots_by_slot_type() {
 }
 
 /// `execute` hashes path and in-memory files during the call, plans each
-/// distinct digest once, uploads only the digest the server lacks with one
-/// PUT, and sends inline JSON, trace, Artifact, and pinned file
-/// declarations in one execution request.
+/// distinct digest once, transfers each planned upload by its single-PUT or
+/// multipart plan and completes it through the shared storage route, and
+/// sends inline JSON, trace, Artifact, and pinned file declarations in one
+/// execution request.
 ///
 /// # Panics
 /// Panics when a request or the typed result differs from expected.
 #[tokio::test]
-async fn execute_pins_files_and_uploads_only_missing_digests() {
+async fn execute_pins_files_and_completes_shared_uploads() {
     use sha2::Digest as _;
     use wiremock::matchers::{method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
@@ -865,16 +866,26 @@ async fn execute_pins_files_and_uploads_only_missing_digests() {
     std::fs::write(&policy, b"%PDF-policy").expect("policy written");
     let policy_sha = hex::encode(sha2::Sha256::digest(b"%PDF-policy"));
     let deck_sha = hex::encode(sha2::Sha256::digest(b"%PDF-deck"));
-    let plan = wyrd_spec::storage::UploadPlan::SinglePut {
+    let deck_upload = wyrd_spec::storage::UploadId::new();
+    let policy_upload = wyrd_spec::storage::UploadId::new();
+    let deck_plan = wyrd_spec::storage::UploadPlan::SinglePut {
         put_url: format!("{}/bucket/{deck_sha}", server.uri()),
         ttl_secs: 60,
+        required_headers: Vec::new(),
+    };
+    let policy_plan = wyrd_spec::storage::UploadPlan::Multipart {
+        part_count: 1,
+        part_size_bytes: 11,
+        part_url_ttl_secs: 60,
         required_headers: Vec::new(),
     };
     Mock::given(method("POST"))
         .and(path("/v1/verification/evidence"))
         .respond_with(
-            ResponseTemplate::new(200)
-                .set_body_json(json!({ "uploads": [{ "sha256": deck_sha, "plan": plan }] })),
+            ResponseTemplate::new(200).set_body_json(json!({ "uploads": [
+            { "sha256": policy_sha, "upload_id": policy_upload, "plan": policy_plan },
+            { "sha256": deck_sha, "upload_id": deck_upload, "plan": deck_plan },
+        ] })),
         )
         .expect(1)
         .mount(&server)
@@ -885,6 +896,32 @@ async fn execute_pins_files_and_uploads_only_missing_digests() {
         .expect(1)
         .mount(&server)
         .await;
+    Mock::given(method("POST"))
+        .and(path(format!("/v1/cards/upload/{policy_upload}/part-url")))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "url": format!("{}/bucket/{policy_sha}/1", server.uri()), "ttl_secs": 60
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("PUT"))
+        .and(path(format!("/bucket/{policy_sha}/1")))
+        .respond_with(ResponseTemplate::new(200).insert_header("ETag", "\"policy-part\""))
+        .expect(1)
+        .mount(&server)
+        .await;
+    for (upload, sha) in [(&deck_upload, &deck_sha), (&policy_upload, &policy_sha)] {
+        Mock::given(method("POST"))
+            .and(path(format!("/v1/cards/upload/{upload}/complete")))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "stored": {
+                "storage_path": format!("t/evidence/sha256/{sha}/{upload}"), "size_bytes": 1,
+                "sha256": "", "content_type": null, "sse_marker": null,
+                "created_at": "2026-10-28T00:00:00Z"
+            } })))
+            .expect(1)
+            .mount(&server)
+            .await;
+    }
     let id = wyrd_spec::ids::ExecutionId::new_v7();
     Mock::given(method("POST"))
         .and(path("/v1/verification/execute"))
@@ -943,6 +980,18 @@ async fn execute_pins_files_and_uploads_only_missing_digests() {
             { "sha256": deck_sha, "size_bytes": 9 },
         ] }),
         "each distinct digest is planned once, in slot order"
+    );
+    assert_eq!(
+        body(&format!("/v1/cards/upload/{deck_upload}/complete")),
+        json!({ "protocol": "single_put", "data": {} }),
+        "an in-memory File completes its single PUT through the shared route"
+    );
+    assert_eq!(
+        body(&format!("/v1/cards/upload/{policy_upload}/complete")),
+        json!({ "protocol": "multipart", "data": { "parts": [
+            { "part_number": 1, "e_tag": "\"policy-part\"" }
+        ] } }),
+        "a path-backed File completes its multipart plan through the shared route"
     );
     assert_eq!(
         body("/v1/verification/execute")["inputs"],

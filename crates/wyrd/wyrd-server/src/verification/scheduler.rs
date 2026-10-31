@@ -145,6 +145,9 @@ pub struct InFlight {
 }
 
 impl Drop for InFlight {
+    /// Releases the claim when its last holder drops: removes the source from
+    /// the shared in-flight set so a later poll may claim it again. A poisoned
+    /// set is recovered, since removing one entry cannot leave it torn.
     fn drop(&mut self) {
         self.set
             .0

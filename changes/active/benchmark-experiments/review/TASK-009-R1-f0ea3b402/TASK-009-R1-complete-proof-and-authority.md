@@ -75,3 +75,16 @@ mise exec -- scripts/postgres/with-test-postgres.sh -- bash -lc 'mise run db:mig
 ```
 
 Use static paragraph/source comparison for authority and destructor rustdoc. Run `mise run fmt`, the owning lints for the Rust write set, and `mise exec -- git diff --check`. Confirm owning tasks in `mise.toml`; keep Cargo work sequential. Run another exact regression only if a changed dependency or actual failure justifies it. Do not require complete journey suites, full benchmarks or a broad aggregate inside this task remediation. Original integrated final-source proof and delivery run in their established closeout phases.
+
+## Implementation Evidence
+
+| Finding | Implementation evidence | Verification evidence | Result |
+|---|---|---|---|
+| FIND-TASK-009-2 | `verification_runtime.rs::queued_origins_share_ack_gated_admission`: `support` and `observed-service` are pulled and hydrated as `WyrdState`s; the Window sample is `Observe::submit("observed-drift")` (`Submission::Recorded`), the held turn is `Observe::group_id("held").submit("turn-check")` (`Submission::Queued`), direct is `Observe::verify`. Raw enqueue/execute bodies, `Bifrost::write_batch`, `custom_drift_verifier` and `bind_schedule` removed; `activate` and `make_binding_due` remain as timing controls. Held-ACK, direct, first-attempt and grouped readback assertions unchanged | the exact selector above: 1 run, 1 passed (33.5 s) | PASS |
+| FIND-TASK-009-3 | `architecture/wyrd-design.md` group paragraph: preparation writes nothing and rolls back, the selector is staged, and on its ACK the batched writer inserts the execution and deletes the pending row only at the selected generation; unchanged digests settle in preparation; newer activity keeps a fresh generation. Scheduled text: "prepares" the occurrence. `architecture/bifrost-design.md`: selector staged before admission, its ACK admits in the cursor/generation transaction, defensive missing-evidence retry kept | static comparison with `accept_grouped`, `prepare_group`, `hand_off_groups`, migration `20261028000000`; `mise run docs:check` exit 0 | PASS |
+| FIND-TASK-009-4 | `scheduler.rs` `InFlight::drop` rustdoc: release on last holder, removal from the shared set, poison recovery | `cargo clippy -p wyrd-server --lib -D warnings` clean; no behavior change | PASS |
+| FIND-TASK-009-1 | TASK-009 "Later executable source and closeout status" names `da366eefe`, `f0ea3b402`, this remediation, and V13–V16 as pending | static | PASS |
+
+Checks: `mise run fmt`, `cargo clippy -p wyrd-testing --all-targets -D warnings`,
+`git diff --check` clean. Non-goals held: no production admission change, no
+new harness, SDK API, raw SQL in stories, benchmark, aggregate, or publication.

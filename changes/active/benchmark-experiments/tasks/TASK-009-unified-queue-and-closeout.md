@@ -749,3 +749,27 @@ Diagnosis of the red lane:
 - **Proof:** `outbox::tests::a_lane_short_of_its_linger_keeps_a_wake_at_its_deadline`
   fails with the old second clock read and passes with the fix; outbox tests
   20/20, `test:shared` 823/823, lints, fmt, and the green gate above.
+
+### Later executable source and closeout status
+
+The green V13 above identifies `e9e3d95cb` only. Two executable changes
+followed it, found by profiling the L1 drivers:
+
+- `da366eefe`: `wyrd-client` `BoundVerifier` borrows the bound Verifier's
+  `VerifierSpec` instead of a per-call JSON round-trip (Observe resolution).
+  `wyrd-client` lib 267/267; `wyrd-ai` `verify_in_real_time::` and
+  `verifier_building_blocks::` 50/50.
+- `f0ea3b402`: the capacity Gateway driver's paced upstream builds its
+  buffered answer once. `gateway resilience::gateway_capacity_paces_streams_isolates_tenants_and_recovers` 1/1.
+
+Remediation `TASK-009-R1` (review `TASK-009-R1-f0ea3b402`) follows them; its
+proof is in that task.
+
+| Obligation | Status |
+|---|---|
+| V13 on the settled final source | PENDING: no aggregate has run on `f0ea3b402` or later; record SHA, invocation, exit, lanes and log at closeout |
+| V14 five L1 records | Recorded at `19f4190a8` (history commit `8c066985a`), accepted by the maintainer as valid; final-source measurement PENDING |
+| V15 records publication | Pushed for `19f4190a8`; final-source records PENDING |
+| V16 PR | PENDING, not opened |
+
+Whole-task PASS is not claimed while these are pending.

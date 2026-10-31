@@ -1824,10 +1824,12 @@ acknowledges its `execution_inputs` batch, through the existing batched
 request outbox; staged inputs not yet acknowledged are lost on abrupt process
 death, and the execution then never becomes visible. The row stores no input
 values: the runner resolves them, and the accepted routes, from that input
-record. A group or schedule execution's selector record is staged on a slot
-reserved before its PostgreSQL commit and is staged right after it; a runner
-claiming the execution before the record is readable retries it as evidence
-unavailable. A pod without
+record. A group or schedule execution follows the same order: the scheduler
+prepares it without writing the queue and stages its selector record on a
+slot reserved before preparation, and only that record's acknowledgement
+admits the execution, in the transaction that moves the expected schedule
+cursor or consumes the selected pending group generation. A runner that
+still finds the record unreadable retries it as evidence unavailable. A pod without
 Scribe submits through `ScribeCapturePeerService.IngestCapture` on the peer
 listener, which the same `wyrd-peer` mTLS admits; the request names its
 tenant and one of those five tables or `bifrost.system.audit_log` explicitly,

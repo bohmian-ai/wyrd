@@ -7613,10 +7613,11 @@ async fn group_lookup_preserves_source_occurrences() -> Result<(), ServerJourney
 /// with (REQ-035, REQ-036; AC-015, AC-016).
 ///
 /// The `support` Service declares a per-turn `turn-check` and a `group_end`
-/// `conversation-verifier`; a second Service is bound monthly to a Custom
-/// Drift Verifier over its own `score` observation. While Scribe holds the
-/// Service's enqueued turn's input record, the SDK sees no such execution
-/// and a direct verify still answers. Released, the turn is queued under the
+/// `conversation-verifier`; `observed-service` binds its Model daily to the
+/// Custom `observed-drift` Verifier. Each hydrated Service authors through
+/// its own Run: the Model's Window sample is recorded by `submit`, and while
+/// Scribe holds the input record of the agent's grouped `submit`, the SDK
+/// sees no such execution and a direct `verify` still answers. Released, the turn is queued under the
 /// ID its enqueue returned and the production runtime completes it. The
 /// runtime then prepares the expired group's run, whose input record Scribe
 /// holds next: the queue still holds only the turn, and a direct verify
@@ -7630,7 +7631,8 @@ async fn group_lookup_preserves_source_occurrences() -> Result<(), ServerJourney
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "requires the serialized Postgres-backed journey lane"]
 async fn queued_origins_share_ack_gated_admission() -> Result<(), ServerJourneyError> {
-    use wyrd_client::verify::Execution;
+    use wyrd_client::verify::{Execution, Submission};
+    use wyrd_spec::ids::GroupId;
 
     let cluster = WyrdTestCluster::start_spec(BifrostClusterSpec::one_mixed()).await?;
     let server = cluster.server(0).ok_or("missing mixed node")?;
@@ -7662,15 +7664,6 @@ async fn queued_origins_share_ack_gated_admission() -> Result<(), ServerJourneyE
             )),
     )
     .await?;
-    let uid = |name: &str| {
-        receipt
-            .outcomes
-            .iter()
-            .find(|outcome| outcome.card_ref.name.as_str() == name)
-            .and_then(|outcome| outcome.card_ref.uid.clone())
-            .ok_or(format!("the receipt names {name}"))
-    };
-    let (agent, turn_check) = (uid("assistant-agent")?, uid("turn-check")?);
     let root = receipt.root.uid.clone().ok_or("the Service has a UID")?;
     let machine = server
         .credential_registered_service(&receipt.root, &["editor"])
@@ -7681,74 +7674,91 @@ async fn queued_origins_share_ack_gated_admission() -> Result<(), ServerJourneyE
             &root,
         )
         .await?;
-    let service = native_client(server, &token)?;
-    let direct = || async {
-        service
-            .request_json::<Value, Value>(
-                reqwest::Method::POST,
-                "/v1/verification/execute",
-                Some(&enqueue_body(
-                    &turn_check,
-                    &agent,
-                    json!({"turn": {"kind": "json", "value": {"answer": "direct"}}}),
-                )),
+    let cards = wyrd_client::cards::Cards::connect_with(&admin).await?;
+    let hydrate = |card: CardRef, client: wyrd_client::WyrdClient| {
+        let cards = &cards;
+        async move {
+            let bundle = tempfile::tempdir()?;
+            Box::pin(
+                wyrd_client::cards::CardGraphPuller::new(cards.registry_context()).pull(
+                    &wyrd_client::cards::CardSelector::exact(card),
+                    &bundle.path().join("bundle"),
+                    wyrd_client::cards::BundleMode::Complete,
+                ),
             )
+            .await?;
+            let state = wyrd_client::state::WyrdState::from_path_with(
+                bundle.path().join("bundle"),
+                client,
+            )?;
+            state.start_bifrost().await?;
+            Ok::<_, ServerJourneyError>((state, bundle))
+        }
+    };
+    let (support, _support_bundle) =
+        hydrate(receipt.root.clone(), native_client(server, &token)?).await?;
+    let direct = || async {
+        support
+            .run_for_card("agent")?
+            .observe()
+            .verify("turn-check", json!({"answer": "direct"}))
             .await
     };
 
-    let verifier = seed
-        .custom_drift_verifier("ack-window", "score", 0.0, 1000.0)
-        .await?;
-    let card = server
-        .bootstrap_service_in_tenant(tenant, "ack-window", &[])
+    let fixtures = std::path::Path::new(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../../fixtures/cards/observe_a_run"
+    ));
+    Box::pin(cards.declare_from_path(&fixtures.join("observed-model.yaml"))).await?;
+    let observed = Box::pin(cards.declare_from_path(&fixtures.join("observed-service.yaml")))
         .await?
-        .card_ref()
-        .ok_or("a service bootstrap returned a user")?
-        .clone();
+        .root;
+    let observed_uid = observed
+        .uid
+        .clone()
+        .ok_or("the observed Service has a UID")?;
     let Bootstrap::Machine { id, api_key, .. } = server
-        .credential_registered_service(&card, &["admin"])
+        .credential_registered_service(&observed, &["workload"])
         .await?
     else {
         return Err("a service credential returned a user".into());
     };
-    let subject = card.uid.clone().ok_or("the subject Card has no UID")?;
-    let writer = Bifrost::connect_with(
-        &native_client(server, api_key.expose_secret())?.for_workload(subject.clone()),
-        BifrostOptions::default(),
+    seed.activate(id, &observed_uid).await?;
+    let binding = cards
+        .get(wyrd_client::cards::CardSelector::exact(observed.clone()))
+        .await?
+        .status
+        .and_then(|status| status.verification)
+        .and_then(|verification| verification.binding_ids.into_iter().next())
+        .ok_or("the observed Service binds its schedule")?;
+    let (window, _window_bundle) = hydrate(
+        observed,
+        native_client(server, api_key.expose_secret())?.for_workload(observed_uid),
     )
     .await?;
-    writer
-        .write_batch(
-            DRIFT_OBSERVATIONS,
-            &observation_batch(
-                &format!("ack-window-{}", uuid::Uuid::now_v7()),
-                &subject,
-                observed_in_current_month(Utc::now())?,
-                3.0,
-            )?,
-        )
+    let sampled = window
+        .run_for_card("model")?
+        .observe()
+        .submit("observed-drift", json!({"latency": 12.5}))
         .await?;
-    seed.activate(id, &subject).await?;
-    let binding = seed
-        .bind_schedule(&subject, &subject, &verifier, MONTHLY, Vec::new())
-        .await?;
+    if !matches!(sampled, Submission::Recorded) {
+        return Err(format!("a Window sample is recorded: {sampled:?}").into());
+    }
+    window.shutdown().await?;
     server.flush_bifrost().await?;
 
     let held = server.stall_next_bifrost_write_into(EXECUTION_INPUTS)?;
-    let accepted: Value = service
-        .request_json(
-            reqwest::Method::POST,
-            "/v1/verification/enqueue",
-            Some(&json!({
-                "verifier_card_uid": turn_check,
-                "card_uid": agent,
-                "group_id": "held",
-                "inputs": {"turn": {"kind": "json", "value": {"answer": "yes"}}},
-            })),
-        )
-        .await?;
+    let Submission::Queued(accepted) = support
+        .run_for_card("agent")?
+        .observe()
+        .group_id(GroupId::new("held")?)
+        .submit("turn-check", json!({"answer": "yes"}))
+        .await?
+    else {
+        return Err("a turn-check submission queues an execution".into());
+    };
     held.wait_entered().await;
-    let staged: ExecutionId = serde_json::from_value(accepted["execution_id"].clone())?;
+    let staged = *accepted.id();
     match Execution::connect_with(staged, &admin)
         .await?
         .status()
@@ -7765,7 +7775,7 @@ async fn queued_origins_share_ack_gated_admission() -> Result<(), ServerJourneyE
     let stop = CancellationToken::new();
     let task = tokio::spawn(runtime.run(stop.clone()));
     held.release();
-    let turn = await_queued(&seed, &accepted).await?;
+    let turn = await_queued(&seed, &json!({"execution_id": staged})).await?;
     if turn != staged {
         return Err(format!("the turn is queued as {turn}, not {staged}").into());
     }
@@ -7829,6 +7839,7 @@ async fn queued_origins_share_ack_gated_admission() -> Result<(), ServerJourneyE
     if grouped.as_ref() != Some(&expected) {
         return Err(format!("the group run reads back its held turn: {grouped:?}").into());
     }
+    support.shutdown().await?;
     cluster.shutdown().await?;
     Ok(())
 }

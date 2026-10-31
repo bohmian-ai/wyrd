@@ -1635,14 +1635,19 @@ range start is the earliest selected admission time, equal to the end when
 nothing is selected. Each run selects cumulative history of its `group_id`
 and exact source scope through its own cutoff, never a disjoint next
 interval, so later-visible earlier evidence and later results join the next
-run. The same tenant transaction enqueues the ordinary execution, holding
-only the selection's content digest, and deletes its scheduling row; the
-selection itself — range, per-slot authored references, ordered source
-execution IDs and selected result IDs — is the execution's `group` input
-record in Bifrost, staged right after the commit on capacity reserved before
-it. The digest covers binding, group, membership, selected results and
-order, never the cutoff, so an unchanged selection's content-identity
-conflict also consumes the pending row. Retryable runtime,
+run. A new selection is a prepared candidate: the preparation transaction
+writes nothing and rolls back, releasing the row lock, and the selection
+itself — range, per-slot authored references, ordered source execution IDs
+and selected result IDs — is staged as the execution's `group` input record
+in Bifrost on capacity reserved before the claim. Only after Scribe
+acknowledges that record does the batched queue writer, in one tenant
+transaction, insert the ordinary execution holding only the selection's
+content digest and delete the pending row while it still holds the
+generation the candidate was selected from. The digest covers binding,
+group, membership, selected results and order, never the cutoff; a
+selection whose digest the binding and group already hold is settled during
+preparation and consumes the pending row in that transaction, and a
+conflicting admission returns the existing execution. Retryable runtime,
 capacity, database and query failures retain pending and are traced. Genuine auth
 or owner-activity rejection, including an inactive/retired owner, records one
 terminal errored group execution and consumes pending atomically. Recording
@@ -1653,10 +1658,12 @@ actor remain attributable. Every runnable execution keeps its accepted-authority
 and input invariants. Missing issuer/SYSTEM/attribution infrastructure is retryable
 Wyrd failure, not proof of rejected owner authority. Existing latest binding
 execution status then execution readback exposes the terminal error; it is not a
-new group-history API. Concurrent activity waits only in
-the background on the row lock and recreates a pending row after successful
-handoff. Release the transaction and preparation permit before Verifier/provider
-execution. With no new activity, there is no pending row and no further Bifrost
+new group-history API. Every activity upsert draws a fresh generation, so
+activity acknowledged after a candidate's selection keeps the pending row,
+and a row recreated after consumption starts a new one; that activity joins a
+later snapshot. While a candidate awaits acknowledgement, the process skips
+its group so it is not prepared twice. Release the preparation permit before
+Verifier/provider execution. With no new activity, there is no pending row and no further Bifrost
 read for that group. Distinct later snapshots may overlap earlier executions.
 
 Source lists share execution ordering, with null for a missing outcome or an
@@ -2082,7 +2089,7 @@ For `schedule`, each due occurrence creates one
 execution per active binding over that binding's subject window
 `[previous boundary, due)`, filling each `samples` slot from its own
 `features`. The scheduler freezes the window's observation `record_id`s for
-the subject when it enqueues the occurrence and records them, with the
+the subject when it prepares the occurrence and records them, with the
 window, as the execution's `schedule` input record; every requirement and
 retry reads exactly that population, an empty window is a real empty
 selector, and later observations never change a prepared run. Missed

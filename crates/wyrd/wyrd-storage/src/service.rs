@@ -807,20 +807,31 @@ async fn abort_prior_best_effort(
     }
 }
 
+/// Re-mint the plan of a replayed upload initialization.
+///
+/// The local backend answers with the same authenticated upload route its
+/// first initialization returned; a cloud backend re-signs its plan.
+///
+/// # Errors
+/// Returns the mapped storage error when a cloud backend cannot re-sign.
 async fn remint_replayed_upload_init(
     state: &StorageServiceState<'_>,
     response: InitReplay,
 ) -> Result<UploadInitResponse, WyrdError> {
-    let plan = state
-        .storage
-        .signer()
-        .remint_plan(
-            &response.validated,
-            &response.replay_input,
-            state.storage.presign_ttl(),
-        )
-        .await
-        .map_err(map_storage_error)?;
+    let plan = if response.backend == StorageBackendKind::Local {
+        local_single_put_plan(state.storage, &response.upload_id)
+    } else {
+        state
+            .storage
+            .signer()
+            .remint_plan(
+                &response.validated,
+                &response.replay_input,
+                state.storage.presign_ttl(),
+            )
+            .await
+            .map_err(map_storage_error)?
+    };
     Ok(UploadInitResponse {
         upload_id: response.upload_id,
         backend: response.backend,

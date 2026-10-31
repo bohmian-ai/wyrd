@@ -1992,6 +1992,89 @@ async fn heavy_declaration_initializes_upload_after_commit() {
     server.shutdown().await.expect("test server shuts down");
 }
 
+/// A replayed declaration re-mints the plan of a Pending Card's incomplete
+/// upload under the same upload, which then completes the Card.
+///
+/// This is how a client recovers a Card whose declaration failed after its
+/// commit, during upload initialization or inline completion.
+///
+/// # Panics
+/// Panics when the server cannot start, a declaration or its replay is not
+/// created, the replay returns no plan or a different upload, or the upload
+/// does not activate the Card.
+#[tokio::test(flavor = "current_thread")]
+async fn declaration_replay_remints_incomplete_upload_plan() {
+    let storage_root = tempfile::tempdir().expect("storage root creates");
+    let server = WyrdTestServer::builder()
+        .with_storage_settings(StorageSettings {
+            backend: BackendConfig::Local {
+                root: storage_root.path().to_path_buf(),
+            },
+            require_encryption: false,
+            presign_ttl: Duration::from_mins(10),
+            part_size_bytes: 16 * 1024 * 1024,
+            multipart_threshold_bytes: 100 * 1024 * 1024,
+        })
+        .start_bound()
+        .await
+        .expect("bound test server starts");
+    let Bootstrap::User { jwt, .. } = server
+        .bootstrap_user("registry-upload-replay", &["editor"])
+        .await
+        .expect("writer bootstraps")
+    else {
+        panic!("user bootstrap returned a non-user principal");
+    };
+
+    let (status, declared) = send_json(
+        &server,
+        &jwt,
+        heavy_declaration_request("upload-replay-001"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{declared}");
+    let (status, replayed) = send_json(
+        &server,
+        &jwt,
+        heavy_declaration_request("upload-replay-001"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{replayed}");
+    assert_eq!(replayed["outcomes"][0]["status"], "pending");
+    let entry = &replayed["upload_plans"][0]["entries"][0];
+    assert_eq!(entry["relative_path"], "prompt.txt");
+    assert_eq!(
+        entry["upload_id"], declared["upload_plans"][0]["entries"][0]["upload_id"],
+        "a replay re-mints the plan of the same upload"
+    );
+
+    let put = Request::builder()
+        .method(Method::PUT)
+        .uri(
+            entry["plan"]["data"]["put_url"]
+                .as_str()
+                .expect("local plan names its URL"),
+        )
+        .body(Body::from("a"))
+        .expect("upload request builds");
+    let (status, body) = send_json(&server, &jwt, put).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let card_uid: CardUid =
+        serde_json::from_value(replayed["outcomes"][0]["card_ref"]["uid"].clone())
+            .expect("response contains card UID");
+    let complete = Request::builder()
+        .method(Method::POST)
+        .uri(format!("/v1/cards/{card_uid}/complete"))
+        .header("Idempotency-Key", "upload-replay-001")
+        .body(Body::empty())
+        .expect("card completion request builds");
+    let (status, body) = send_json(&server, &jwt, complete).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["outcomes"][0]["status"], "active");
+
+    server.shutdown().await.expect("test server shuts down");
+}
+
 /// The production reconciler retries a missing artifact and activates the Card
 /// after the object becomes available; the client's upload completion,
 /// arriving after that activation already completed the upload, still
@@ -2304,13 +2387,16 @@ async fn delete_storage_failure_preserves_cleanup_state() {
     std::fs::rename(&moved_storage_root, storage_root.path()).expect("storage root restores");
 }
 
-/// A blob storage failure refuses declaration and leaves durable failure state.
+/// A blob storage failure refuses declaration, leaves the Card Pending with its
+/// blob reconciliation scheduled, and the idempotent retry completes it.
 ///
 /// # Panics
-/// Panics when the server cannot start, the declaration succeeds, or the Card
-/// is not left `failed` with no blob URI and a recorded failure time.
+/// Panics when the server cannot start, the declaration succeeds while storage
+/// is broken, the Card is not left `pending` with no blob URI, a recorded
+/// failure time, and a pending `blob` reconciliation, or the retry after
+/// storage recovers does not activate it.
 #[tokio::test(flavor = "current_thread")]
-async fn blob_storage_failure_leaves_durable_failure_state() {
+async fn blob_storage_failure_leaves_card_pending_for_reconcile() {
     let storage_root = tempfile::tempdir().expect("storage root creates");
     let server = WyrdTestServer::builder()
         .with_storage_settings(StorageSettings {
@@ -2358,17 +2444,36 @@ async fn blob_storage_failure_leaves_durable_failure_state() {
         String,
         Option<String>,
         Option<chrono::DateTime<chrono::Utc>>,
+        String,
+        String,
     ) = sqlx::query_as(
-        "SELECT status, card_blob_uri, blob_failed_at FROM wyrd.cards \
-             WHERE name = 'blob-storage-failure'",
+        "SELECT status, card_blob_uri, blob_failed_at, reconcile_kind, reconcile_status \
+             FROM wyrd.cards WHERE name = 'blob-storage-failure'",
     )
     .fetch_one(&mut **conn.transaction())
     .await
-    .expect("failed card state reads");
-    assert_eq!(failure_state.0, "failed");
+    .expect("pending card state reads");
+    assert_eq!(failure_state.0, "pending");
     assert!(failure_state.1.is_none());
     assert!(failure_state.2.is_some());
+    assert_eq!(failure_state.3, "blob");
+    assert_eq!(failure_state.4, "pending");
     conn.commit().await.expect("assertion transaction commits");
+
+    std::fs::remove_file(storage_root.path()).expect("broken storage root removes");
+    std::fs::rename(&moved_storage_root, storage_root.path()).expect("storage root restores");
+    let response = server
+        .oneshot_authenticated(
+            &jwt,
+            prompt_declaration_request("blob-storage-failure", "blob-storage-failure-001"),
+        )
+        .await
+        .expect("retried registration responds");
+    let status = response.status();
+    let body = response_json(response).await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    assert_eq!(body["outcomes"][0]["status"], "active", "{body}");
+    assert!(body["outcomes"][0]["card_blob_uri"].as_str().is_some());
 
     server.shutdown().await.expect("test server shuts down");
 }

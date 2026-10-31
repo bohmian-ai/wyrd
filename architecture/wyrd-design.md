@@ -2354,7 +2354,10 @@ Key derivation (client-side):
 Server-side behavior:
 
 - Same key, same `request_hash` → `IdempotentNoop` replay, returns the
-  original response.
+  original outcomes with a re-minted plan, under the same upload, for every
+  declared upload not yet completed. A declaration that failed after its
+  commit, in upload initialization or inline completion, leaves its Cards
+  Pending; this replay or the reconcile sweep finishes them.
 - Same key, different `request_hash` →
   `WYRD_REGISTRY_409_IDEMPOTENCY_CONFLICT`.
 - Key not seen → normal processing; key + hash stored on completion.

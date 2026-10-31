@@ -404,6 +404,9 @@ type Sends = Arc<Mutex<HashMap<String, Vec<Instant>>>>;
 struct Paced {
     /// The answer shape.
     pacing: Pacing,
+    /// The buffered answer's body, identical on every call, so it is built
+    /// once.
+    buffered: Bytes,
     /// Frame send times of calls not yet taken.
     sends: Sends,
     /// Calls whose send times may be held at once; a later call is answered
@@ -447,6 +450,9 @@ impl PacedUpstream {
             .route("/{*path}", post(answer))
             .with_state(Paced {
                 pacing,
+                buffered: Bytes::from(
+                    GatewayCapture::sized_completion(pacing.buffered_bytes).to_string(),
+                ),
                 sends: Arc::clone(&sends),
                 bound,
             });
@@ -534,9 +540,8 @@ async fn answer(State(paced): State<Paced>, body: Bytes) -> Response {
     let pacing = paced.pacing;
     if request["stream"] != Value::Bool(true) {
         pause(pacing.buffered_delay).await;
-        let completion = GatewayCapture::sized_completion(pacing.buffered_bytes).to_string();
         paced.record(&marker);
-        return ([(CONTENT_TYPE, "application/json")], completion).into_response();
+        return ([(CONTENT_TYPE, "application/json")], paced.buffered).into_response();
     }
     pause(pacing.stream_delay).await;
     let frames = GatewayCapture::chat_event_frames(&marker, pacing.chunks);

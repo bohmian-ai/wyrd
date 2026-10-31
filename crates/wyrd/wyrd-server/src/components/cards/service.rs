@@ -818,6 +818,16 @@ async fn wait_for_replay(
 }
 
 /// Initialize pending artifact uploads after the composite transaction commits.
+///
+/// Initialization and inline completion are post-commit side effects: a
+/// failure returns its error and leaves the declared Cards Pending. The
+/// idempotent retry replays the declaration, re-minting every incomplete
+/// upload's plan under its existing upload, or the Card reconciler settles
+/// the Card.
+///
+/// # Errors
+/// Returns the first upload initialization failure and the completion
+/// errors of a Card that completes inline.
 #[tracing::instrument(
     skip(state, caller, seed),
     fields(operation = "card.declaration.initialize_uploads")
@@ -897,7 +907,6 @@ async fn initialize_uploads(
         }
     }
     if let Some(error) = initialization_error {
-        abort_pending_declaration_cards(state, caller, &response.outcomes, idempotency_key).await;
         return Err(error);
     }
     plans.sort_by(|left, right| {
@@ -912,10 +921,9 @@ async fn initialize_uploads(
     // Metadata-only cards, and replayed artifact cards whose manifests are
     // already verified, complete in the same server-owned lifecycle seam. A
     // card with a still-pending upload plan remains Pending for the client
-    // upload phase. A failed completion fails the declaration's Pending
-    // Cards, except an unacknowledged inventory row: that refusal is
-    // retryable, so its Card stays Pending for the idempotent retry or the
-    // Card reconciler.
+    // upload phase. A failed completion leaves its Card Pending with its
+    // reconciliation scheduled, so the idempotent retry or the Card
+    // reconciler completes it.
     for index in 0..response.outcomes.len() {
         let outcome = response.outcomes[index].clone();
         if outcome.status != CardLifecycleStatus::Pending
@@ -937,19 +945,7 @@ async fn initialize_uploads(
         {
             continue;
         }
-        response.outcomes[index] = match complete_card(state, caller, card_uid, idempotency_key)
-            .await
-        {
-            Ok(outcome) => outcome,
-            Err(error) if error.code() == "WYRD_VALA_503_BIFROST_WRITER_UNAVAILABLE" => {
-                return Err(error);
-            }
-            Err(error) => {
-                abort_pending_declaration_cards(state, caller, &response.outcomes, idempotency_key)
-                    .await;
-                return Err(error);
-            }
-        };
+        response.outcomes[index] = complete_card(state, caller, card_uid, idempotency_key).await?;
     }
     Ok(response)
 }
@@ -987,26 +983,6 @@ async fn initialize_card_uploads(
         entries.push(entry);
     }
     Ok(entries)
-}
-
-/// Abort every still-pending Card when post-commit initialization fails.
-async fn abort_pending_declaration_cards(
-    state: &AppState,
-    caller: &Caller,
-    outcomes: &[CardDeclarationOutcome],
-    idempotency_key: &str,
-) {
-    for outcome in outcomes {
-        if outcome.status != CardLifecycleStatus::Pending {
-            continue;
-        }
-        let Some(card_uid) = outcome.card_ref.uid.as_ref() else {
-            continue;
-        };
-        if let Err(error) = abort_card(state, caller, card_uid, idempotency_key).await {
-            tracing::error!(%error, %card_uid, "registration failure cleanup did not complete");
-        }
-    }
 }
 
 /// Load manifest rows in a short tenant transaction.
@@ -2323,69 +2299,6 @@ async fn finish_card_delete(
     })
 }
 
-/// Abort one incomplete Card and clean its upload/object state.
-///
-/// This is an internal lifecycle cleanup seam. It is intentionally not exposed
-/// as a method on the public `Cards` handle. Cleanup is best-effort, while the
-/// Pending→Failed transition commits atomically as registry lineage and
-/// cleanup finishes only once its deletion is recorded (see
-/// [`commit_card_failure`]); it evaluates no permission and appends no
-/// canonical audit event.
-///
-/// # Errors
-/// Returns the registry errors of the reads and transition,
-/// `WYRD_SPEC_409_CONFLICT` when the Card is not abortable,
-/// `WYRD_REGISTRY_507_ARTIFACT_VERIFY_FAILED` when cleanup
-/// is incomplete, and the inventory's retryable write failure when the
-/// deletion is not acknowledged.
-#[tracing::instrument(
-    skip(state, caller, idempotency_key),
-    fields(
-        operation = "card.declaration.cleanup",
-        idempotency_key_present = !idempotency_key.is_empty()
-    )
-)]
-async fn abort_card(
-    state: &AppState,
-    caller: &Caller,
-    card_uid: &CardUid,
-    idempotency_key: &str,
-) -> Result<CardDeclarationOutcome, WyrdError> {
-    let completion_state = load_card_completion_state(state, caller, card_uid).await?;
-    validate_card_abort_status(&completion_state.card, card_uid)?;
-    let cleanup_failures = cleanup_card_artifacts(
-        state,
-        caller,
-        card_uid,
-        &completion_state.card,
-        &completion_state.manifests,
-    )
-    .await;
-    commit_card_failure(
-        state,
-        caller,
-        &completion_state.card,
-        cleanup_failures.is_empty(),
-    )
-    .await?;
-    if !cleanup_failures.is_empty() {
-        return Err(WyrdError::RegistryArtifactVerifyFailed {
-            message: "card registration cleanup was incomplete".to_owned(),
-            details: serde_json::json!({
-                "card_uid": card_uid,
-                "failure_count": cleanup_failures.len(),
-            }),
-        });
-    }
-    load_card_declaration_outcome(
-        state,
-        caller,
-        card_uid,
-        DeclarationOutcomeKind::IdempotentNoop,
-    )
-    .await
-}
-
 /// Load the parsed Card and tenant-bound manifest/upload rows.
 async fn load_card_completion_state(
     state: &AppState,
@@ -2566,21 +2479,6 @@ async fn load_card_declaration_outcome(
     let card = sql_get_card_by_uid(&mut conn, card_uid).await?;
     conn.commit().await.map_err(registry_db_error)?;
     Ok(existing_row_to_response(&card, outcome))
-}
-
-/// Validate that abort is legal and allow Failed cleanup retries.
-fn validate_card_abort_status(card: &ParsedCardRow, card_uid: &CardUid) -> Result<(), WyrdError> {
-    match card.status {
-        CardStatus::Pending | CardStatus::Failed => Ok(()),
-        CardStatus::Active => Err(WyrdError::Conflict {
-            message: "active cards cannot be aborted".to_owned(),
-            details: serde_json::json!({ "card_uid": card_uid }),
-        }),
-        status => Err(WyrdError::Conflict {
-            message: "card registration is not abortable in its current state".to_owned(),
-            details: serde_json::json!({ "card_uid": card_uid, "status": status }),
-        }),
-    }
 }
 
 /// Attempt cleanup for every manifest and return only failure details.

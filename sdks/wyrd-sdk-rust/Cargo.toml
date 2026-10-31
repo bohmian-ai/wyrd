@@ -77,7 +77,7 @@ tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
 # server.
 wiremock = { workspace = true }
 # The production server telemetry the quiet-operator timeline story installs.
-wyrd-telemetry = { workspace = true }
+wyrd-telemetry = { path = "../../crates/shared/wyrd-telemetry" }
 wyrd-testing = { workspace = true }
 
 [lints]

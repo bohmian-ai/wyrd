@@ -390,18 +390,27 @@ pub async fn insert_artifact_manifest_rows(
     Ok(())
 }
 
-/// Load manifest rows that still need post-commit initialization.
+/// Load manifest rows whose upload has not completed.
+///
+/// A row awaiting initialization and an initialized row whose storage upload
+/// is not completed both return, so a replayed declaration re-mints every
+/// incomplete upload's plan; the per-operation upload idempotency key replays
+/// the existing upload.
 pub async fn manifest_rows_for_init(
     conn: &mut TenantConn<'_>,
     card_uid: &CardUid,
 ) -> Result<Vec<CardArtifactManifestRow>, WyrdError> {
     sqlx::query_as::<_, CardArtifactManifestRow>(
-        r"SELECT card_uid, manifest_id, relative_path, expected_sha256, size_bytes,
-                  content_type, upload_status, upload_id
-             FROM wyrd.card_artifact_manifest
-            WHERE card_uid = $1
-              AND upload_status = 'awaiting_init'
-            ORDER BY relative_path",
+        r"SELECT m.card_uid, m.manifest_id, m.relative_path, m.expected_sha256,
+                  m.size_bytes, m.content_type, m.upload_status, m.upload_id
+             FROM wyrd.card_artifact_manifest m
+              LEFT JOIN wyrd.storage_multipart_uploads u
+               ON u.id = m.upload_id
+            WHERE m.card_uid = $1
+              AND (m.upload_status = 'awaiting_init'
+                   OR (m.upload_status = 'pending'
+                       AND u.status IS DISTINCT FROM 'completed'))
+            ORDER BY m.relative_path",
     )
     .bind(card_uid.as_uuid())
     .fetch_all(&mut **conn.transaction())

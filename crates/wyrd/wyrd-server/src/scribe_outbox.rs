@@ -1479,9 +1479,10 @@ impl Chunk {
 }
 
 impl ScribeSink {
-    /// Submits every frame of `frames` along `route` for write `attempt`,
-    /// keeping up to [`FRAMES_IN_FLIGHT`] chunks encoding or awaiting
-    /// acknowledgement.
+    /// Submits every frame of `frames`, the frames of outbox slice `slice`
+    /// from index `first` on, along `route` for write `attempt`, keeping up
+    /// to [`FRAMES_IN_FLIGHT`] chunks encoding or awaiting acknowledgement.
+    /// `items` are the slice's writes.
     ///
     /// Each frame is cut into [`Chunk`]s, and each chunk is concatenated and
     /// encoded on the blocking pool by [`Self::deliver`] only as a slot
@@ -1506,9 +1507,8 @@ impl ScribeSink {
         &self,
         route: &ScribeRoute,
         tenant: DataTenantId,
-        items: &[ScribeWrite],
-        (slice, first): (Uuid, usize),
-        frames: &[Frame],
+        (slice, items): (Uuid, &[ScribeWrite]),
+        (first, frames): (usize, &[Frame]),
         attempt: usize,
         lost: &mut BTreeSet<usize>,
     ) -> Result<(), ScribeRefusal> {
@@ -1744,8 +1744,8 @@ impl OutboxSink for ScribeSink {
         let frames = Self::frames(items, &mut lost);
         let split = frames.partition_point(|frame| frame.table != ScribeTable::Results);
         let (details, summaries) = frames.split_at(split);
-        for (first, phase) in [(0, details), (split, summaries)] {
-            self.submit(route, tenant, items, (slice, first), phase, attempt, &mut lost)
+        for phase in [(0, details), (split, summaries)] {
+            self.submit(route, tenant, (slice, items), phase, attempt, &mut lost)
                 .await?;
         }
         self.schedule_groups(tenant, items, &lost).await?;

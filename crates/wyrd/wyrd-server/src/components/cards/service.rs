@@ -116,10 +116,12 @@ pub async fn get_card_by_uid(
     let verification = verification_status(&mut conn, card_uid).await?;
     conn.commit().await.map_err(registry_db_error)?;
     let inventory = card_files(state, caller, card_uid, &manifests).await?;
-    hydrate_card(state, caller, row, inbound, inventory, verification).await
+    hydrate_card(state, caller, row, inbound, &inventory, verification).await
 }
 
-/// Load a fully hydrated Card by its exact tenant-scoped reference.
+/// Load a fully hydrated Card by its exact tenant-scoped reference, with
+/// the recorded objects its hydration verified, so a reader of its files
+/// needs no second inventory read.
 ///
 /// Reads the row, inbound edges, artifact manifest, and owned verification
 /// binding IDs in one tenant transaction, then the object inventory, then
@@ -129,11 +131,11 @@ pub async fn get_card_by_uid(
 /// Returns the registry not-found, unavailable, or integrity errors raised by
 /// the tenant reads and [`hydrate_card`], and the retryable readiness errors
 /// of [`card_files`].
-pub async fn get_card_by_ref(
+pub async fn get_card_objects_by_ref(
     state: &AppState,
     caller: &Caller,
     card_ref: &CardRef,
-) -> Result<GetCardResponse, WyrdError> {
+) -> Result<(GetCardResponse, CardObjects), WyrdError> {
     let mut conn = state.registry_tenant_conn(caller.data_tenant_id).await?;
     let row = wyrd_sql::queries::cards::get_card_by_ref(
         &mut conn,
@@ -147,7 +149,8 @@ pub async fn get_card_by_ref(
     let verification = verification_status(&mut conn, &row.card_uid).await?;
     conn.commit().await.map_err(registry_db_error)?;
     let inventory = card_files(state, caller, &row.card_uid, &manifests).await?;
-    hydrate_card(state, caller, row, inbound, inventory, verification).await
+    let response = hydrate_card(state, caller, row, inbound, &inventory, verification).await?;
+    Ok((response, inventory))
 }
 
 /// Resolve and load the newest stable Active Card in one identity line.
@@ -174,7 +177,7 @@ pub async fn get_latest_card(
     let verification = verification_status(&mut conn, &row.card_uid).await?;
     conn.commit().await.map_err(registry_db_error)?;
     let inventory = card_files(state, caller, &row.card_uid, &manifests).await?;
-    hydrate_card(state, caller, row, inbound, inventory, verification).await
+    hydrate_card(state, caller, row, inbound, &inventory, verification).await
 }
 
 /// List versions in one card identity line, excluding deleted rows.
@@ -321,7 +324,8 @@ async fn card_manifests(
     Ok(manifests)
 }
 
-/// Read a Card's completed files from the object inventory.
+/// Read a Card's completed files from the object inventory, as the
+/// caller's SYSTEM executor when Wyrd executes the work.
 ///
 /// A manifest entry Postgres already completed must be visible: an absent
 /// one is not-yet-visible inventory, never proof of absence.
@@ -336,6 +340,7 @@ async fn card_files(
     manifests: &[CardManifestCompletionRow],
 ) -> Result<CardObjects, WyrdError> {
     let objects = ObjectInventory::new(state)
+        .executed_by(caller.executed_by)
         .card_objects(caller.data_tenant_id, card_uid)
         .await?;
     if let Some(missing) = manifests
@@ -368,7 +373,7 @@ async fn hydrate_card(
     caller: &Caller,
     row: wyrd_sql::row_types::cards::ParsedCardRow,
     inbound: Vec<CardRef>,
-    inventory: CardObjects,
+    inventory: &CardObjects,
     verification: Option<VerificationStatus>,
 ) -> Result<GetCardResponse, WyrdError> {
     let uri = row.card_blob_uri.as_deref().ok_or_else(|| {
@@ -411,7 +416,7 @@ async fn hydrate_card(
             "stored Card blob identity does not match its registry row",
         ));
     }
-    verify_card_read_integrity(&row, &card, &inventory)?;
+    verify_card_read_integrity(&row, &card, inventory)?;
     card.relationships.inbound = inbound.iter().map(ToString::to_string).collect();
     card.relationships.inbound_refs = inbound
         .into_iter()

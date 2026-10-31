@@ -1742,7 +1742,13 @@ completion guarantee for Card files and Files alike. Planning reuses a File
 only when a completed, undeleted same-tenant `file_upload` fact matches its
 digest and length; object presence, a Card file, or another tenant's record
 never stands in for one. Verification reads a File from its recorded storage
-location and re-checks its length and digest. Per-file and aggregate limits
+location and re-checks its length and digest. Each execution resolves its File
+and Artifact metadata once, at admission, and reuses it for every read; each
+Artifact use still authorizes its own `card:read`. A File with no visible
+completed record, or an unreadable inventory, is not ready: direct execution
+answers `WYRD_SERVER_503_SERVICE_UNAVAILABLE`, and a queued attempt ends
+`retrying` with `evidence_unavailable` under the queue's ordinary attempt
+bounds, the last ending `errored`. Per-file and aggregate limits
 (`WYRD_VERIFICATION_FILE_MAX_MIB`, `WYRD_VERIFICATION_FILES_MAX_MIB`) are
 enforced at planning. `ArtifactRef` selects a declared Artifact under its own
 authorization.

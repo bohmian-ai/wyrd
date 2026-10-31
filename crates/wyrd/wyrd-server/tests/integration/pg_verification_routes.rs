@@ -231,7 +231,11 @@ async fn enqueue(
 ///
 /// # Panics
 /// Panics when the request cannot be built or the route fails to respond.
-async fn execute(server: &WyrdTestServer, jwt: &str, body: String) -> (StatusCode, Value) {
+pub(crate) async fn execute(
+    server: &WyrdTestServer,
+    jwt: &str,
+    body: String,
+) -> (StatusCode, Value) {
     post(server, jwt, "/v1/verification/execute", body, None).await
 }
 
@@ -754,7 +758,7 @@ async fn enqueue_admits_only_signed_scope_subjects() {
 
 /// A Verifier judging one uploaded JSON document: its extracted `answer`
 /// must equal `1`.
-fn document_answer_is_one() -> Value {
+pub(crate) fn document_answer_is_one() -> Value {
     json!({
         "inputs": { "doc": { "type": "media", "formats": ["json"] } },
         "steps": [{
@@ -771,7 +775,7 @@ fn document_answer_is_one() -> Value {
 }
 
 /// The JSON document a File test uploads; the document Verifier passes it.
-const DOCUMENT: &[u8] = br#"{"answer":1}"#;
+pub(crate) const DOCUMENT: &[u8] = br#"{"answer":1}"#;
 
 /// The shared single-PUT completion body every local upload completes with.
 fn single_put() -> Value {
@@ -1065,18 +1069,82 @@ async fn file_sessions_are_independent() {
     server.shutdown().await.expect("test server shuts down");
 }
 
-/// Assert a direct execution stayed inconclusive because its File has no
-/// completed upload record, rather than reading a guessed path.
+/// A judged File execution reads back from its canonical records alone: once
+/// its stored bytes are deleted, a new judgment can no longer pass, while the
+/// status read still returns the original verdict and File declaration.
+///
+/// # Panics
+/// Panics when the server fails to start, a fixture write fails, a route fails
+/// to respond, or any status, verdict, or evidence expectation fails.
+#[tokio::test(flavor = "current_thread")]
+async fn canonical_readback_does_not_read_payload_bytes() {
+    let server = WyrdTestServer::start_in_process()
+        .await
+        .expect("test server starts");
+    let fixture = Fixture::seed(&server).await;
+    let document = fixture
+        .seed
+        .verifier("vf-readback-document", &document_answer_is_one())
+        .await
+        .expect("document Verifier registers");
+    let (_, jwt) = user(&server, "vf-readback-writer", &["editor"]).await;
+    let stored = upload_file(&server, &jwt, DOCUMENT).await;
+    let request = document_request(&fixture, &document, DOCUMENT);
+    let (status, judged) = execute(&server, &jwt, request.clone()).await;
+    assert_eq!(status, StatusCode::OK, "{judged}");
+    assert_eq!(judged["outcome"]["verdict"], "passed", "{judged}");
+
+    server
+        .state()
+        .storage
+        .delete_object(
+            &wyrd_storage::tenant_path::validate_evidence(&stored, server.data_tenant_id())
+                .expect("the recorded File location validates"),
+        )
+        .await
+        .expect("the stored bytes delete");
+    let (status, rejudged) = execute(&server, &jwt, request).await;
+    assert!(
+        status != StatusCode::OK || rejudged["outcome"]["verdict"] != "passed",
+        "{rejudged}"
+    );
+
+    server.flush_bifrost().await.expect("Scribe flushes");
+    let uri = format!(
+        "/v1/verification/executions/{}",
+        judged["execution_id"].as_str().expect("id")
+    );
+    let (status, read) = get(&server, &jwt, &uri).await;
+    assert_eq!(status, StatusCode::OK, "{read}");
+    assert_eq!(read["status"], "completed", "{read}");
+    assert_eq!(read["result"]["outcome"]["verdict"], "passed", "{read}");
+    assert_eq!(
+        read["result"]["outcome"]["evidence"], judged["outcome"]["evidence"],
+        "{read}"
+    );
+    assert_eq!(
+        read["result"]["outcome"]["evidence"]["doc"]["sha256"],
+        Sha256Hex::digest(DOCUMENT).to_string(),
+        "{read}"
+    );
+    server.shutdown().await.expect("test server shuts down");
+}
+
+/// Assert a direct execution was refused as not ready because its File has
+/// no completed upload record, rather than judged from a guessed path.
 ///
 /// # Panics
 /// Panics when the execution answered otherwise.
 #[track_caller]
 fn assert_not_ready(status: StatusCode, judged: &Value) {
-    assert_eq!(status, StatusCode::OK, "{judged}");
-    assert_eq!(judged["outcome"]["verdict"], "inconclusive", "{judged}");
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{judged}");
     assert_eq!(
-        judged["outcome"]["steps"][0]["reason"],
-        "the evidence file has no completed upload record yet",
+        judged["code"], "WYRD_SERVER_503_SERVICE_UNAVAILABLE",
+        "{judged}"
+    );
+    assert_eq!(
+        judged["details"]["reason"],
+        "input doc: the evidence file has no completed upload record yet",
         "{judged}"
     );
 }

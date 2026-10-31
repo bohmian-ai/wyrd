@@ -25,6 +25,7 @@ use wyrd_spec::storage::IDEMPOTENCY_KEY_HEADER;
 use crate::audit;
 use crate::components::auth::Caller;
 use crate::components::cards::service;
+use crate::components::storage::inventory::CardObjects;
 use crate::http::error::WyrdErrorResponse;
 use crate::state::AppState;
 use utoipa_axum::router::OpenApiRouter;
@@ -163,22 +164,31 @@ async fn get_card_by_ref_http(
 /// UID must name the UID of the Card at that identity.
 ///
 /// # Errors
-/// Returns [`WyrdError::PermissionDeniedRbac`] without `cards:read`,
-/// [`WyrdError::RegistryCardNotFound`] when the named UID is another Card's,
-/// and the errors of [`service::get_card_by_ref`].
+/// Returns the errors of [`get_card_objects_by_ref_for`].
 pub(crate) async fn get_card_by_ref_for(
     state: &AppState,
     caller: &Caller,
     card_ref: &CardRef,
 ) -> Result<GetCardResponse, WyrdError> {
-    audit::authorize(
-        state,
-        caller,
-        &Permission::card_read(),
-        "card.read.ref",
-        &card_resource(card_ref),
-    )?;
-    let response = service::get_card_by_ref(state, caller, card_ref).await?;
+    get_card_objects_by_ref_for(state, caller, card_ref)
+        .await
+        .map(|(response, _)| response)
+}
+
+/// [`get_card_by_ref_for`], also returning the Card's recorded objects its
+/// hydration read, for a reader of the Card's files.
+///
+/// # Errors
+/// Returns the errors of [`authorize_card_ref`],
+/// [`WyrdError::RegistryCardNotFound`] when the named UID is another Card's,
+/// and the errors of [`service::get_card_objects_by_ref`].
+pub(crate) async fn get_card_objects_by_ref_for(
+    state: &AppState,
+    caller: &Caller,
+    card_ref: &CardRef,
+) -> Result<(GetCardResponse, CardObjects), WyrdError> {
+    authorize_card_ref(state, caller, card_ref)?;
+    let (response, objects) = service::get_card_objects_by_ref(state, caller, card_ref).await?;
     if let Some(uid) = &card_ref.uid
         && response.card.metadata.uid.as_ref() != Some(uid)
     {
@@ -186,7 +196,27 @@ pub(crate) async fn get_card_by_ref_for(
             "card UID does not match the referenced identity",
         ));
     }
-    Ok(response)
+    Ok((response, objects))
+}
+
+/// Authorize and audit the caller's `cards:read` of one exact Card
+/// reference, the decision every read of that reference makes.
+///
+/// # Errors
+/// Returns [`WyrdError::PermissionDeniedRbac`] without `cards:read`.
+pub(crate) fn authorize_card_ref(
+    state: &AppState,
+    caller: &Caller,
+    card_ref: &CardRef,
+) -> Result<(), WyrdError> {
+    audit::authorize(
+        state,
+        caller,
+        &Permission::card_read(),
+        "card.read.ref",
+        &card_resource(card_ref),
+    )?;
+    Ok(())
 }
 
 /// Resolve the newest stable Active Card in an identity line.

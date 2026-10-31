@@ -4,16 +4,20 @@
 //! Artifact files, and Artifact code, and the one citation validator over an
 //! execution's pinned input slots. A file is read from the location its
 //! completed File upload recorded in the object inventory; an Artifact file
-//! is resolved through the registry's authorized, audited Card read and its
-//! server-owned inventory. Either read is bounded by the expected length and the file
+//! is resolved through the registry's authorized, audited Card read and the
+//! objects its hydration read from the same inventory. Each File's location
+//! and each Artifact's files are resolved once per execution, at admission,
+//! and reused by every later selection, read, and workspace; each Artifact
+//! use still makes its own audited `card:read` decision. Either read is
+//! bounded by the expected length and the file
 //! limit and returns bytes only when their length and SHA-256 match, and
 //! evidence also only when its sniffed format matches, so a mismatched file
 //! can never feed a pass. Extraction, workspaces, citations, and native media all read through
 //! it; it is also the Agent executor's [`EvidenceReader`] and the `extract`
 //! action's [`ActionExecutor`].
 
-use std::collections::{BTreeMap, BTreeSet};
-use std::sync::{Mutex, PoisonError};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::sync::{Arc, Mutex, PoisonError};
 
 use async_trait::async_trait;
 use base64::Engine as _;
@@ -26,7 +30,7 @@ use wyrd_spec::auth::Sha256Hex;
 use wyrd_spec::card::verifier::{Action, InputSlot};
 use wyrd_spec::envelope::CardKind;
 use wyrd_spec::ids::{CardUid, SlotName};
-use wyrd_spec::reference::CardRef;
+use wyrd_spec::reference::{CardRef, CardRefIdentity};
 use wyrd_spec::registry::StoredArtifactEntry;
 use wyrd_spec::verification::execution::{CallProvenance, Citation, InputDeclaration, Locator};
 use wyrd_storage::error::StorageError;
@@ -35,8 +39,7 @@ use wyrd_storage::tenant_path::{self, ValidatedPath};
 use super::registry::refusal;
 use super::{HostedLimits, extract_refused};
 use crate::components::auth::Caller;
-use crate::components::cards::routes::get_card_by_ref_for;
-use crate::components::cards::service::list_card_artifacts;
+use crate::components::cards::routes::{authorize_card_ref, get_card_objects_by_ref_for};
 use crate::components::storage::inventory::ObjectInventory;
 use crate::state::AppState;
 
@@ -51,15 +54,23 @@ pub struct TenantEvidence {
     /// The execution's pinned input declarations, the only citable sources;
     /// [`EvidenceReader::admit`] adds the engine's fixed attachment slots.
     slots: Mutex<BTreeMap<SlotName, InputDeclaration>>,
+    /// Each File's recorded location by declared digest and size, resolved
+    /// once for this execution.
+    files: Mutex<HashMap<(Sha256Hex, u64), ValidatedPath>>,
+    /// Each exact Artifact's UID and files, resolved once for this execution.
+    artifacts: Mutex<BTreeMap<ArtifactKey, Arc<ArtifactInventory>>>,
     /// File limits in force.
     limits: HostedLimits,
 }
+
+/// An exact Artifact reference: its identity and optional pinned UID.
+type ArtifactKey = (CardRefIdentity, Option<CardUid>);
 
 impl TenantEvidence {
     /// A reader of `caller`'s tenant evidence whose citable sources are the
     /// execution's pinned `slots`, under `limits`.
     #[must_use]
-    pub const fn new(
+    pub fn new(
         state: AppState,
         caller: Caller,
         slots: BTreeMap<SlotName, InputDeclaration>,
@@ -69,6 +80,8 @@ impl TenantEvidence {
             state,
             caller,
             slots: Mutex::new(slots),
+            files: Mutex::default(),
+            artifacts: Mutex::default(),
             limits,
         }
     }
@@ -185,8 +198,10 @@ impl TenantEvidence {
     /// The recorded location of the completed File upload of `sha256` and
     /// `size`.
     ///
-    /// The location comes only from the tenant's object inventory; a File
-    /// with no visible completed record is not ready, never a path guess.
+    /// The location comes only from the tenant's object inventory, read once
+    /// per execution as the caller's SYSTEM executor, so the read adds no
+    /// registry lookup; a File with no visible completed record is not
+    /// ready, never a path guess.
     ///
     /// # Errors
     /// Returns [`BlockError::Terminal`] for a file over the input file
@@ -201,11 +216,19 @@ impl TenantEvidence {
         if size > self.limits.file_max_bytes {
             return Err(terminal("the file exceeds the input file limit"));
         }
+        let key = (*sha256, size);
+        if let Some(path) = lock(&self.files).get(&key) {
+            return Ok(path.clone());
+        }
         match ObjectInventory::new(&self.state)
+            .executed_by(self.caller.executed_by)
             .file_object(self.caller.data_tenant_id, sha256, size)
             .await
         {
-            Ok(Some(path)) => Ok(path),
+            Ok(Some(path)) => {
+                lock(&self.files).insert(key, path.clone());
+                Ok(path)
+            }
             Ok(None) => Err(BlockError::Retryable {
                 reason: "the evidence file has no completed upload record yet".to_owned(),
             }),
@@ -240,11 +263,11 @@ impl TenantEvidence {
     /// The stored metadata of one file of exact Artifact `card`, read
     /// without its bytes.
     ///
-    /// The Card is resolved through the registry's own authorized read, so
-    /// the caller's `card:read` decision is checked and audited and a
-    /// mismatched UID is refused. The file comes from the Card's
-    /// server-authoritative inventory: `path` names it, or the Artifact must
-    /// hold exactly one. Admission and [`Self::artifact`] share this lookup.
+    /// The Card is resolved through [`Self::inventory`], so the caller's
+    /// `card:read` decision is checked and audited and a mismatched UID is
+    /// refused. The file comes from the Card's server-authoritative
+    /// inventory: `path` names it, or the Artifact must hold exactly one.
+    /// Admission and [`Self::artifact`] share this lookup.
     ///
     /// # Errors
     /// Returns [`BlockError::Terminal`] for a non-Artifact reference, a
@@ -256,13 +279,11 @@ impl TenantEvidence {
         card: &CardRef,
         path: Option<&str>,
     ) -> Result<ArtifactFile, BlockError> {
-        let (uid, inventory) = self.inventory(card).await?;
-        let entry = match (path, inventory.as_slice()) {
-            (Some(path), entries) => entries
-                .iter()
-                .find(|entry| entry.relative_path.as_str() == path),
-            (None, [only]) => Some(only),
-            (None, _) => None,
+        let inventory = self.inventory(card).await?;
+        let entry = match path {
+            Some(path) => inventory.files.get(path),
+            None if inventory.files.len() == 1 => inventory.files.values().next(),
+            None => None,
         }
         .ok_or_else(|| terminal("the Artifact holds no such file; name one of its paths"))?;
         let size = u64::try_from(entry.size_bytes)
@@ -274,7 +295,7 @@ impl TenantEvidence {
             .ok_or_else(|| terminal("the Artifact file has a malformed stored digest"))?;
         let tenant = self.caller.data_tenant_id;
         let object = tenant_path::validate(
-            &tenant_path::build(tenant, uid.as_str(), entry.relative_path.as_str()),
+            &tenant_path::build(tenant, inventory.uid.as_str(), entry.relative_path.as_str()),
             tenant,
         )
         .map_err(|_| terminal("the Artifact file path is not a valid tenant path"))?;
@@ -289,22 +310,28 @@ impl TenantEvidence {
         })
     }
 
-    /// The UID and server-authoritative file inventory of exact Artifact
-    /// `card`, resolved through the registry's own authorized, audited Card
-    /// read, so a mismatched UID is refused.
+    /// The UID and server-authoritative files of exact Artifact `card`.
+    ///
+    /// Every use makes the caller's own audited `card:read` decision. The
+    /// first resolves the Card through the registry's authorized read, so a
+    /// mismatched UID is refused, and keeps the files its hydration read
+    /// from the object inventory; later uses in this execution reuse them.
     ///
     /// # Errors
     /// Returns [`BlockError::Terminal`] for a non-Artifact reference or a
     /// refused or missing Card, and [`BlockError::Retryable`] when the
-    /// registry is unavailable.
-    async fn inventory(
-        &self,
-        card: &CardRef,
-    ) -> Result<(CardUid, Vec<StoredArtifactEntry>), BlockError> {
+    /// registry or inventory is unavailable.
+    async fn inventory(&self, card: &CardRef) -> Result<Arc<ArtifactInventory>, BlockError> {
         if card.kind != CardKind::Artifact {
             return Err(terminal("the reference does not name an Artifact Card"));
         }
-        let resolved = get_card_by_ref_for(&self.state, &self.caller, card)
+        let key = (card.identity_key(), card.uid.clone());
+        let known = lock(&self.artifacts).get(&key).cloned();
+        if let Some(inventory) = known {
+            authorize_card_ref(&self.state, &self.caller, card).map_err(|error| refusal(&error))?;
+            return Ok(inventory);
+        }
+        let (resolved, objects) = get_card_objects_by_ref_for(&self.state, &self.caller, card)
             .await
             .map_err(|error| refusal(&error))?;
         let uid = resolved
@@ -312,11 +339,12 @@ impl TenantEvidence {
             .metadata
             .uid
             .ok_or_else(|| terminal("the Artifact Card has no UID"))?;
-        let inventory = list_card_artifacts(&self.state, &self.caller, &uid)
-            .await
-            .map_err(|error| refusal(&error))?
-            .artifacts;
-        Ok((uid, inventory))
+        let inventory = Arc::new(ArtifactInventory {
+            uid,
+            files: objects.files,
+        });
+        lock(&self.artifacts).insert(key, Arc::clone(&inventory));
+        Ok(inventory)
     }
 
     /// The bytes of stored object `path`, which must be `size` bytes long
@@ -378,6 +406,14 @@ impl TenantEvidence {
     }
 }
 
+/// One exact Artifact's resolved identity and completed files.
+struct ArtifactInventory {
+    /// The Card's UID, the namespace of its stored files.
+    uid: CardUid,
+    /// Completed files by Card-relative path.
+    files: BTreeMap<String, StoredArtifactEntry>,
+}
+
 /// One registered Artifact file's stored metadata, from its inventory.
 struct ArtifactFile {
     /// The file's tenant storage object.
@@ -399,21 +435,21 @@ impl EvidenceReader for TenantEvidence {
     /// Returns [`Self::inventory`]'s errors and [`BlockError::Terminal`] for
     /// a selection matching no file.
     async fn select(&self, card: &CardRef, path: Option<&str>) -> Result<Vec<String>, BlockError> {
-        let (_, inventory) = self.inventory(card).await?;
-        let mut selected: Vec<String> = inventory
-            .into_iter()
-            .map(|entry| entry.relative_path.as_str().to_owned())
+        let inventory = self.inventory(card).await?;
+        let selected: Vec<String> = inventory
+            .files
+            .keys()
             .filter(|file| {
                 path.is_none_or(|path| {
                     let dir = path.trim_end_matches('/');
-                    file == path
+                    *file == path
                         || file
                             .strip_prefix(dir)
                             .is_some_and(|rest| rest.starts_with('/'))
                 })
             })
+            .cloned()
             .collect();
-        selected.sort();
         if selected.is_empty() {
             return Err(terminal(
                 "the Artifact holds no file at the selected path; name one of its files or directories",
@@ -432,16 +468,19 @@ impl EvidenceReader for TenantEvidence {
     /// must then fit the Deployment's individual input-file limit, and
     /// their declared lengths must fit its combined input-file limit
     /// together. Each original input counts once, whatever later
-    /// reads, workspaces, or retries do with it; no bytes are read here.
-    /// Admitted declarations the execution did not pin, the engine's fixed
-    /// attachments, become citable slots.
+    /// reads, workspaces, or retries do with it. Each uploaded file's
+    /// recorded location is then resolved through [`Self::file_object`];
+    /// no bytes are read here. Admitted declarations the execution did not
+    /// pin, the engine's fixed attachments, become citable slots.
     ///
     /// # Errors
     /// Returns [`EngineError::InputTooLarge`] past a slot, individual, or
     /// combined limit,
     /// [`EngineError::InputInvalid`] for an Artifact file that cannot be
     /// resolved or that its slot does not accept, and
-    /// [`EngineError::EvidenceUnavailable`] when the registry is unavailable.
+    /// [`EngineError::EvidenceUnavailable`] when the registry or inventory
+    /// is unavailable or an uploaded file has no visible completed record
+    /// yet.
     async fn admit(
         &self,
         slots: &BTreeMap<SlotName, InputSlot>,
@@ -455,12 +494,7 @@ impl EvidenceReader for TenantEvidence {
                     let file = self
                         .artifact_file(artifact, path.as_deref())
                         .await
-                        .map_err(|error| match error {
-                            BlockError::Retryable { reason } => {
-                                EngineError::EvidenceUnavailable(format!("input {name}: {reason}"))
-                            }
-                            error => EngineError::InputInvalid(format!("input {name}: {error}")),
-                        })?;
+                        .map_err(|error| admission(name, error))?;
                     if let Some(InputSlot::Media {
                         formats, max_bytes, ..
                     }) = slots.get(name)
@@ -496,7 +530,17 @@ impl EvidenceReader for TenantEvidence {
                     ))
                 })?;
         }
-        let mut pinned = self.slots.lock().unwrap_or_else(PoisonError::into_inner);
+        for (name, declaration) in evidence {
+            if let InputDeclaration::File {
+                sha256, size_bytes, ..
+            } = declaration
+            {
+                self.file_object(sha256, *size_bytes)
+                    .await
+                    .map_err(|error| admission(name, error))?;
+            }
+        }
+        let mut pinned = lock(&self.slots);
         for (name, declaration) in evidence {
             pinned
                 .entry(name.clone())
@@ -636,6 +680,23 @@ pub fn sniffs_as(bytes: &[u8], format: MediaFormat) -> bool {
         | MediaFormat::Csv
         | MediaFormat::Json => std::str::from_utf8(bytes).is_ok(),
     }
+}
+
+/// The admission refusal of input `name` whose metadata resolution failed
+/// with `error`: retryable readiness stays retryable, anything else is
+/// invalid input.
+fn admission(name: &SlotName, error: BlockError) -> EngineError {
+    match error {
+        BlockError::Retryable { reason } => {
+            EngineError::EvidenceUnavailable(format!("input {name}: {reason}"))
+        }
+        error => EngineError::InputInvalid(format!("input {name}: {error}")),
+    }
+}
+
+/// Lock `memo`, recovering a poisoned lock: every value in it is complete.
+fn lock<T>(memo: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    memo.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
 /// A terminal error with fixed `reason`.

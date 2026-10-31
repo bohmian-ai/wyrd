@@ -1341,6 +1341,106 @@ async fn retryable_engine_failures_exhaust_to_errored() {
     runtime.stop().await;
 }
 
+/// A File with no completed upload record is not ready rather than judged:
+/// queued work retries as `evidence_unavailable` within its attempt budget and
+/// completes once the upload completes, and direct work over unreadable
+/// inventory is refused as unavailable and judged on a later request.
+///
+/// # Panics
+/// Panics when a run reaches another state or a direct request answers
+/// otherwise.
+#[tokio::test]
+async fn inventory_readiness_preserves_execution_bounds() {
+    use crate::pg_verification_routes::{DOCUMENT, document_answer_is_one, execute, upload_file};
+    let harness = Harness::start().await;
+    let document = harness
+        .seed
+        .verifier("readiness-document", &document_answer_is_one())
+        .await
+        .expect("document Verifier registers");
+    let wyrd_testing::Bootstrap::User { jwt, .. } = harness
+        .server
+        .bootstrap_user("readiness-writer", &["editor"])
+        .await
+        .expect("writer bootstraps")
+    else {
+        panic!("user bootstrap returned a machine principal");
+    };
+    let doc = serde_json::json!({
+        "kind": "file", "sha256": wyrd_spec::auth::Sha256Hex::digest(DOCUMENT).to_string(),
+        "size_bytes": DOCUMENT.len(), "format": "json"
+    });
+    let inputs = || {
+        BTreeMap::from([(
+            SlotName::new("doc").expect("slot"),
+            serde_json::from_value::<InputDeclaration>(doc.clone()).expect("File declaration"),
+        )])
+    };
+    let runtime = RunningRuntime::spawn(
+        VerificationRuntime::builder(harness.server.state())
+            .limits(Harness::limits())
+            .build()
+            .expect("the runtime composes"),
+    );
+
+    let exhausted = harness
+        .seed
+        .submit(&document, &harness.subject, inputs())
+        .await
+        .expect("submission accepted");
+    for attempt in 1..=2 {
+        let row = harness
+            .wait_execution(exhausted, move |row| {
+                row.status == "retrying" && row.attempts == attempt
+            })
+            .await;
+        assert_eq!(row.error_code.as_deref(), Some("evidence_unavailable"));
+        harness.expire(exhausted).await;
+    }
+    let row = harness.wait_execution(exhausted, status("errored")).await;
+    assert_eq!(
+        (row.attempts, row.error_code.as_deref()),
+        (3, Some("evidence_unavailable"))
+    );
+
+    let recovered = harness
+        .seed
+        .submit(&document, &harness.subject, inputs())
+        .await
+        .expect("submission accepted");
+    harness
+        .wait_execution(recovered, |row| row.status == "retrying")
+        .await;
+    upload_file(&harness.server, &jwt, DOCUMENT).await;
+    harness
+        .seed
+        .make_retry_due(recovered)
+        .await
+        .expect("retry is due");
+    let row = harness.wait_execution(recovered, status("completed")).await;
+    assert!(row.result_id.is_some(), "{row:?}");
+    runtime.stop().await;
+
+    let body = serde_json::json!({
+        "verifier_card_uid": document, "card_uid": harness.subject, "inputs": { "doc": doc }
+    })
+    .to_string();
+    harness.server.fail_next_query_after_schema();
+    let (code, refused) = execute(&harness.server, &jwt, body.clone()).await;
+    assert_eq!(
+        code,
+        axum::http::StatusCode::SERVICE_UNAVAILABLE,
+        "{refused}"
+    );
+    assert_eq!(
+        refused["details"]["reason"], "input doc: the evidence inventory cannot be read now",
+        "{refused}"
+    );
+    let (code, judged) = execute(&harness.server, &jwt, body).await;
+    assert_eq!(code, axum::http::StatusCode::OK, "{judged}");
+    assert_eq!(judged["outcome"]["verdict"], "passed", "{judged}");
+}
+
 /// Input-admission deferrals are backpressure, not failed attempts: a run
 /// deferred more times than its attempt budget still completes on its first
 /// charged attempt.

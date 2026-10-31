@@ -1,0 +1,3591 @@
+{
+  "schema_version": 3,
+  "engine": "verification",
+  "experiment": "direct-verify",
+  "level": 1,
+  "question": "Does direct `observe().verify` keep the server's verification overhead p99 strictly under 0.5 ms at 64 closed-loop clients, answering every call with the expected verdict, and what does each verification cost the server per CPU-second at 1 and 64 clients?",
+  "started_at": "2026-10-31T01:18:40.372779202Z",
+  "finished_at": "2026-10-31T01:19:49.645447093Z",
+  "elapsed_seconds": 69.272653272,
+  "commit": "19f4190a8a2dd30f2de264a890ff925f814c7eaa",
+  "dirty": false,
+  "dirty_override": false,
+  "diff_sha256": null,
+  "host": {
+    "os": "linux",
+    "os_version": "Linux (Pop!_OS 24.04)",
+    "arch": "x86_64",
+    "cpu_model": "AMD Ryzen 9 9950X 16-Core Processor",
+    "logical_cpus": 32,
+    "memory_bytes": 98742132736,
+    "storage": "file:// store in a temporary directory on the local filesystem",
+    "fingerprint": "AMD Ryzen 9 9950X 16-Core Processor, 32 CPU / 91 GiB, linux"
+  },
+  "build": {
+    "profile": "release",
+    "rustflags": "-C force-frame-pointers=yes",
+    "debug": "line-tables-only",
+    "compiler": "rustc 1.99.0 (b940084d7 2026-09-28)",
+    "server": {
+      "name": "wyrd-server",
+      "bytes": 1222586280,
+      "modified": "2026-10-31T01:14:43.265027392Z"
+    },
+    "driver": {
+      "name": "capacity",
+      "bytes": 998600784,
+      "modified": "2026-10-31T01:18:37.196669342Z"
+    }
+  },
+  "command": {
+    "args": [
+      "l1",
+      "verification"
+    ],
+    "config": {
+      "WYRD_DATABASE_URL": "<set>",
+      "WYRD_DB_MAX_CONNECTIONS": "8",
+      "WYRD_DB_MAX_CONNECTIONS_VALA": "8",
+      "WYRD_PLATFORM_DATABASE_URL": "<set>",
+      "WYRD_TEST_DATABASE_ADMIN_URL": "<set>"
+    }
+  },
+  "variables": {
+    "clients": [
+      1,
+      64
+    ]
+  },
+  "controls": {
+    "timing": {
+      "warmup_seconds": 5,
+      "repetition_seconds": 5,
+      "repetitions": 3,
+      "budget_seconds": 300,
+      "minimum_seconds": 0
+    },
+    "validity": {
+      "host_busy_fraction": 0.1,
+      "host_sample_seconds": 10,
+      "driver_cores": 8.0,
+      "driver_fraction": 0.8,
+      "lateness_p99_us": 5000.0,
+      "p99_samples": 1000,
+      "p95_samples": 200
+    },
+    "values": {
+      "fixture": "one tenant: an assertion Verifier of four `equals` checks over one 2 KiB `context` slot, a Model, and one Service per application with its own Card-bound family runtime key; every odd arrival answers check `d` wrong, so both verdicts stay in every window",
+      "limits": "server defaults on the whole host; no resource quota",
+      "timing": {
+        "method": "server benchmark histograms: integer nanoseconds from the owning server boundary's std::time::Instant timers, recorded into bounded HDR histograms and read as cumulative snapshots from the loopback metrics listener; each window is the bucket-count difference of two snapshots of one process",
+        "clock": "std::time::Instant: the OS monotonic clock",
+        "precision": "3 significant digits; each percentile is judged on its whole bucket's bounds",
+        "range_ns": [
+          1,
+          137438953472
+        ],
+        "scan_range": [
+          1,
+          1125899906842624
+        ],
+        "max_series": 256,
+        "max_scan_series": 64,
+        "percentile": "nearest rank ceil(q * N) over the window's distribution",
+        "server_env": {
+          "WYRD_METRICS_BENCHMARK_SNAPSHOT": "1"
+        },
+        "tracing": "operator span export stays at its default (disabled); no span is required for timing",
+        "assignment": "every request carries its closed case and the repetition or admission phase that admitted it, attached when its request span opens; a window takes the observations recorded between its opening snapshot and one taken after its admitted cohort drained, so a late completion stays in its admitted cohort; each cohort's judged-outcome count must equal the completions the driver saw, other outcomes (retried or refused attempts) are counted beside it; a short or extra count, a dropped or out-of-range observation, an unknown label, a missing or negative component, scans that are not the answered cohort's, or a replaced process makes it invalid",
+        "measurement": "work, wall seconds, and server and driver CPU stop at the admission stop, before the requests then in flight drain; their completions count as late work beside the measured work, and their latency stays in the final cohort",
+        "evidence": "each window's full opening and drained snapshots are kept under the run's target artifacts as timings/<step>/<phase>.json; the record keeps each cohort's reconciliation and each percentile's rank and bucket bounds",
+        "timer_resolution_ns": 20
+      },
+      "workload": "closed-loop public-client `observe().verify` (direct mode), one application per client, each sending its next call once the last answers"
+    },
+    "selection": null
+  },
+  "criteria": {
+    "metrics": [
+      {
+        "id": "cores",
+        "unit": "cores",
+        "boundary": "C/T: server CPU-seconds of the declared processes per wall second of the window",
+        "direction": null,
+        "derive": {
+          "kind": "cores"
+        }
+      },
+      {
+        "id": "rate",
+        "unit": "verifications/s",
+        "boundary": "acknowledged verifications per wall second of the window",
+        "direction": "higher",
+        "derive": {
+          "kind": "rate",
+          "work": "verifications",
+          "scale": 1.0
+        }
+      },
+      {
+        "id": "verifications",
+        "unit": "verifications",
+        "boundary": "acknowledged direct and background calls in the window",
+        "direction": null,
+        "derive": null
+      },
+      {
+        "id": "errors",
+        "unit": "errors",
+        "boundary": "refused calls outside a declared overload admission refusal",
+        "direction": null,
+        "derive": null
+      },
+      {
+        "id": "verifications_per_s_per_vcpu",
+        "unit": "verifications/s/vCPU",
+        "boundary": "(W/T)/P: acknowledged verifications per wall second per provisioned vCPU",
+        "direction": "higher",
+        "derive": {
+          "kind": "per_vcpu",
+          "work": "verifications",
+          "scale": 1.0
+        }
+      },
+      {
+        "id": "verifications_per_cpu_s",
+        "unit": "verifications/cpu-s",
+        "boundary": "W/C: acknowledged verifications per server CPU-second used",
+        "direction": "higher",
+        "derive": {
+          "kind": "per_cpu",
+          "work": "verifications",
+          "scale": 1.0
+        }
+      },
+      {
+        "id": "cpu_us_per_verification",
+        "unit": "µs/verification",
+        "boundary": "server CPU per acknowledged verification",
+        "direction": "lower",
+        "derive": {
+          "kind": "cpu_per",
+          "work": "verifications",
+          "scale": 1000000.0
+        }
+      },
+      {
+        "id": "p50_ms",
+        "unit": "ms",
+        "boundary": "server: a direct execution's start until its result is ready (`verification.direct`, outcome `completed`), every acknowledged call; nearest-rank bucket bounds of the server's timing histograms",
+        "direction": null,
+        "derive": null
+      },
+      {
+        "id": "p95_ms",
+        "unit": "ms",
+        "boundary": "server: a direct execution's start until its result is ready (`verification.direct`, outcome `completed`), every acknowledged call; nearest-rank bucket bounds of the server's timing histograms",
+        "direction": null,
+        "derive": null
+      },
+      {
+        "id": "p99_ms",
+        "unit": "ms",
+        "boundary": "server: a direct execution's start until its result is ready (`verification.direct`, outcome `completed`), every acknowledged call; nearest-rank bucket bounds of the server's timing histograms",
+        "direction": null,
+        "derive": null
+      },
+      {
+        "id": "client_p50_ms",
+        "unit": "ms",
+        "boundary": "diagnostic only: public-client `verify` call until its judged result, every acknowledged call; never judged",
+        "direction": null,
+        "derive": null
+      },
+      {
+        "id": "client_p95_ms",
+        "unit": "ms",
+        "boundary": "diagnostic only: public-client `verify` call until its judged result, every acknowledged call; never judged",
+        "direction": null,
+        "derive": null
+      },
+      {
+        "id": "client_p99_ms",
+        "unit": "ms",
+        "boundary": "diagnostic only: public-client `verify` call until its judged result, every acknowledged call; never judged",
+        "direction": null,
+        "derive": null
+      },
+      {
+        "id": "wrong",
+        "unit": "verifications",
+        "boundary": "direct results whose verdict was not the expected one",
+        "direction": null,
+        "derive": null
+      },
+      {
+        "id": "lost_writes",
+        "unit": "writes",
+        "boundary": "server: `outbox_events_lost_total{outbox=\"scribe\"}` added over the window and its drain, every reason including shed audit decisions",
+        "direction": null,
+        "derive": null
+      },
+      {
+        "id": "overhead_p99_ms",
+        "unit": "ms",
+        "boundary": "server: per execution, `verification.direct` elapsed less the union of its own Verifier blocks; nearest-rank bucket bounds of the server's timing histograms",
+        "direction": null,
+        "derive": null
+      },
+      {
+        "id": "overhead_mean_ms",
+        "unit": "ms",
+        "boundary": "server: exact mean of the per-execution residuals",
+        "direction": null,
+        "derive": null
+      },
+      {
+        "id": "overhead_max_ms",
+        "unit": "ms",
+        "boundary": "server: the largest per-execution residual; its histogram bucket's bounds",
+        "direction": null,
+        "derive": null
+      },
+      {
+        "id": "verifier_p99_ms",
+        "unit": "ms",
+        "boundary": "server: the union of an execution's own Verifier blocks; nearest-rank bucket bounds of the server's timing histograms",
+        "direction": null,
+        "derive": null
+      },
+      {
+        "id": "verifier_mean_ms",
+        "unit": "ms",
+        "boundary": "server: exact mean of the Verifier block unions",
+        "direction": null,
+        "derive": null
+      },
+      {
+        "id": "server_failures",
+        "unit": "verifications",
+        "boundary": "server: `verification.direct` timings whose outcome is not `completed`, counted in their own outcome series and never judged",
+        "direction": null,
+        "derive": null
+      },
+      {
+        "id": "overhead_over_500us",
+        "unit": "verifications",
+        "boundary": "server: executions whose residual exceeds 0.5 ms, bounded by the one histogram bucket that straddles it",
+        "direction": null,
+        "derive": null
+      },
+      {
+        "id": "overhead_over_1ms",
+        "unit": "verifications",
+        "boundary": "server: executions whose residual exceeds 1 ms, bounded by the one histogram bucket that straddles it",
+        "direction": null,
+        "derive": null
+      },
+      {
+        "id": "overhead_over_5ms",
+        "unit": "verifications",
+        "boundary": "server: executions whose residual exceeds 5 ms, bounded by the one histogram bucket that straddles it",
+        "direction": null,
+        "derive": null
+      },
+      {
+        "id": "overhead_over_10ms",
+        "unit": "verifications",
+        "boundary": "server: executions whose residual exceeds 10 ms, bounded by the one histogram bucket that straddles it",
+        "direction": null,
+        "derive": null
+      },
+      {
+        "id": "phase_admit_p99_ms",
+        "unit": "ms",
+        "boundary": "server diagnostic: the nearest-rank p99 of each execution's `verification.direct.admit` time, its histogram bucket's bounds; phases overlap (engine holds prepare) and are never summed",
+        "direction": null,
+        "derive": null
+      },
+      {
+        "id": "phase_admit_max_ms",
+        "unit": "ms",
+        "boundary": "server diagnostic: the largest value of each execution's `verification.direct.admit` time, its histogram bucket's bounds; phases overlap (engine holds prepare) and are never summed",
+        "direction": null,
+        "derive": null
+      },
+      {
+        "id": "phase_load_p99_ms",
+        "unit": "ms",
+        "boundary": "server diagnostic: the nearest-rank p99 of each execution's `verification.direct.load` time, its histogram bucket's bounds; phases overlap (engine holds prepare) and are never summed",
+        "direction": null,
+        "derive": null
+      },
+      {
+        "id": "phase_load_max_ms",
+        "unit": "ms",
+        "boundary": "server diagnostic: the largest value of each execution's `verification.direct.load` time, its histogram bucket's bounds; phases overlap (engine holds prepare) and are never summed",
+        "direction": null,
+        "derive": null
+      },
+      {
+        "id": "phase_prepare_p99_ms",
+        "unit": "ms",
+        "boundary": "server diagnostic: the nearest-rank p99 of each execution's `verification.direct.prepare` time, its histogram bucket's bounds; phases overlap (engine holds prepare) and are never summed",
+        "direction": null,
+        "derive": null
+      },
+      {
+        "id": "phase_prepare_max_ms",
+        "unit": "ms",
+        "boundary": "server diagnostic: the largest value of each execution's `verification.direct.prepare` time, its histogram bucket's bounds; phases overlap (engine holds prepare) and are never summed",
+        "direction": null,
+        "derive": null
+      },
+      {
+        "id": "phase_engine_p99_ms",
+        "unit": "ms",
+        "boundary": "server diagnostic: the nearest-rank p99 of each execution's `verification.direct.engine` time, its histogram bucket's bounds; phases overlap (engine holds prepare) and are never summed",
+        "direction": null,
+        "derive": null
+      },
+      {
+        "id": "phase_engine_max_ms",
+        "unit": "ms",
+        "boundary": "server diagnostic: the largest value of each execution's `verification.direct.engine` time, its histogram bucket's bounds; phases overlap (engine holds prepare) and are never summed",
+        "direction": null,
+        "derive": null
+      },
+      {
+        "id": "phase_stage_p99_ms",
+        "unit": "ms",
+        "boundary": "server diagnostic: the nearest-rank p99 of each execution's `verification.direct.stage` time, its histogram bucket's bounds; phases overlap (engine holds prepare) and are never summed",
+        "direction": null,
+        "derive": null
+      },
+      {
+        "id": "phase_stage_max_ms",
+        "unit": "ms",
+        "boundary": "server diagnostic: the largest value of each execution's `verification.direct.stage` time, its histogram bucket's bounds; phases overlap (engine holds prepare) and are never summed",
+        "direction": null,
+        "derive": null
+      },
+      {
+        "id": "phase_outside_p99_ms",
+        "unit": "ms",
+        "boundary": "server diagnostic: the nearest-rank p99 of each execution's `verification.direct.outside` time, its histogram bucket's bounds; phases overlap (engine holds prepare) and are never summed",
+        "direction": null,
+        "derive": null
+      },
+      {
+        "id": "phase_outside_max_ms",
+        "unit": "ms",
+        "boundary": "server diagnostic: the largest value of each execution's `verification.direct.outside` time, its histogram bucket's bounds; phases overlap (engine holds prepare) and are never summed",
+        "direction": null,
+        "derive": null
+      }
+    ],
+    "criteria": [
+      {
+        "id": "overhead-p99",
+        "metric": "overhead_p99_ms",
+        "steps": [
+          "direct-verify-c64"
+        ],
+        "rule": {
+          "op": "lt",
+          "limit": 0.5,
+          "over": "median"
+        },
+        "percentile": 99
+      },
+      {
+        "id": "no-errors",
+        "metric": "errors",
+        "steps": [
+          "direct-verify-c1",
+          "direct-verify-c64"
+        ],
+        "rule": {
+          "op": "le",
+          "limit": 0.0,
+          "over": "every"
+        },
+        "percentile": null
+      },
+      {
+        "id": "correct-verdicts",
+        "metric": "wrong",
+        "steps": [
+          "direct-verify-c1",
+          "direct-verify-c64"
+        ],
+        "rule": {
+          "op": "le",
+          "limit": 0.0,
+          "over": "every"
+        },
+        "percentile": null
+      },
+      {
+        "id": "no-lost-evidence",
+        "metric": "lost_writes",
+        "steps": [
+          "direct-verify-c1",
+          "direct-verify-c64"
+        ],
+        "rule": {
+          "op": "le",
+          "limit": 0.0,
+          "over": "every"
+        },
+        "percentile": null
+      }
+    ]
+  },
+  "steps": [
+    {
+      "id": "direct-verify-c1",
+      "params": {
+        "clients": 1,
+        "op": "verify"
+      },
+      "status": "measured",
+      "timing": {
+        "warmup_seconds": 5,
+        "repetition_seconds": 5,
+        "repetitions": 3,
+        "budget_seconds": 300,
+        "minimum_seconds": 0
+      },
+      "repetitions": [
+        {
+          "seconds": 5.000919897,
+          "processes": [
+            "wyrd-server"
+          ],
+          "server_cpu_seconds": 5.29,
+          "peak_memory_bytes": 939450368,
+          "memory_interval_ms": 10,
+          "driver_cpu_seconds": 1.46,
+          "provisioned_vcpus": 32,
+          "metrics": {
+            "client_p50_ms": {
+              "value": 0.087,
+              "above": null,
+              "samples": 46484,
+              "reason": null
+            },
+            "client_p95_ms": {
+              "value": 0.208,
+              "above": null,
+              "samples": 46484,
+              "reason": null
+            },
+            "client_p99_ms": {
+              "value": 0.303,
+              "above": null,
+              "samples": 46484,
+              "reason": null
+            },
+            "cores": {
+              "value": 1.0578053855998406,
+              "above": null,
+              "samples": null,
+              "reason": null
+            },
+            "cpu_us_per_verification": {
+              "value": 113.80504700643246,
+              "above": null,
+              "samples": null,
+              "reason": null
+            },
+            "drain_seconds": {
+              "value": 0.004310997,
+              "above": null,
+              "samples": null,
+              "reason": null
+            },
+            "errors": {
+              "value": 0.0,
+              "above": null,
+              "samples": null,
+              "reason": null
+            },
+            "lost_writes": {
+              "value": 0.0,
+              "above": null,
+              "samples": null,
+              "reason": null
+            },
+            "max_ms": {
+              "value": 1.699839,
+              "above": 1.698815,
+              "samples": 46484,
+              "rank": 46484,
+              "reason": null
+            },
+            "overhead_max_ms": {
+              "value": 1.698815,
+              "above": 1.697791,
+              "samples": 46484,
+              "rank": 46484,
+              "reason": null
+            },
+            "overhead_mean_ms": {
+              "value": 0.04879575208673952,
+              "above": 0.0487592826563979,
+              "samples": 46484,
+              "reason": null
+            },
+            "overhead_over_10ms": {
+              "value": 0.0,
+              "above": null,
+              "samples": null,
+              "reason": null
+            },
+            "overhead_over_1ms": {
+              "value": 1.0,
+              "above": null,
+              "samples": null,
+              "reason": null
+            },
+            "overhead_over_500us": {
+              "value": 1.0,
+              "above": null,
+              "samples": null,
+              "reason": null
+            },
+            "overhead_over_5ms": {
+              "value": 0.0,
+              "above": null,
+              "samples": null,
+              "reason": null
+            },
+            "overhead_p99_ms": {
+              "value": 0.147839,
+              "above": 0.147711,
+              "samples": 46484,
+              "rank": 46020,
+              "reason": null
+            },
+            "p50_ms": {
+              "value": 0.040159,
+              "above": 0.040127,
+              "samples": 46484,
+              "rank": 23242,
+              "reason": null
+            },
+            "p95_ms": {
+              "value": 0.097215,
+              "above": 0.097151,
+              "samples": 46484,
+              "rank": 44160,
+              "reason": null
+            },
+            "p99_ms": {
+              "value": 0.149631,
+              "above": 0.149503,
+              "samples": 46484,
+              "rank": 46020,
+              "reason": null
+            },
+            "phase_admit_max_ms": {
+              "value": 0.119935,
+              "above": 0.119871,
+              "samples": 46484,
+              "rank": 46484,
+              "reason": null
+            },
+            "phase_admit_p99_ms": {
+              "value": 0.005431,
+              "above": 0.005427,
+              "samples": 46484,
+              "rank": 46020,
+              "reason": null
+            },
+            "phase_engine_max_ms": {
+              "value": 0.370687,
+              "above": 0.370431,
+              "samples": 46484,
+              "rank": 46484,
+              "reason": null
+            },
+            "phase_engine_p99_ms": {
+              "value": 0.023471,
+              "above": 0.023455,
+              "samples": 46484,
+              "rank": 46020,
+              "reason": null
+            },
+            "phase_load_max_ms": {
+              "value": 0.028575,
+              "above": 0.028559,
+              "samples": 46484,
+              "rank": 46484,
+              "reason": null
+            },
+            "phase_load_p99_ms": {
+              "value": 0.003457,
+              "above": 0.003455,
+              "samples": 46484,
+              "rank": 46020,
+              "reason": null
+            },
+            "phase_outside_max_ms": {
+              "value": 1.658879,
+              "above": 1.657855,
+              "samples": 46484,
+              "rank": 46484,
+              "reason": null
+            },
+            "phase_outside_p99_ms": {
+              "value": 0.080895,
+              "above": 0.080831,
+              "samples": 46484,
+              "rank": 46020,
+              "reason": null
+            },
+            "phase_prepare_max_ms": {
+              "value": null,
+              "above": null,
+              "samples": null,
+              "reason": "no completed `verification.direct.prepare` time in the window"
+            },
+            "phase_prepare_p99_ms": {
+              "value": null,
+              "above": null,
+              "samples": null,
+              "reason": "no completed `verification.direct.prepare` time in the window"
+            },
+            "phase_stage_max_ms": {
+              "value": 0.357631,
+              "above": 0.357375,
+              "samples": 46484,
+              "rank": 46484,
+              "reason": null
+            },
+            "phase_stage_p99_ms": {
+              "value": 0.039487,
+              "above": 0.039455,
+              "samples": 46484,
+              "rank": 46020,
+              "reason": null
+            },
+            "rate": {
+              "value": 9294.889931727295,
+              "above": null,
+              "samples": null,
+              "reason": null
+            },
+            "server_failures": {
+              "value": 0.0,
+              "above": null,
+              "samples": null,
+              "reason": null
+            },
+            "verifications": {
+              "value": 46483.0,
+              "above": null,
+              "samples": null,
+              "reason": null
+            },
+            "verifications_after_window": {
+              "value": 1.0,
+              "above": null,
+              "samples": null,
+              "reason": null
+            },
+            "verifications_per_cpu_s": {
+              "value": 8786.95652173913,
+              "above": null,
+              "samples": null,
+              "reason": null
+            },
+            "verifications_per_s_per_vcpu": {
+              "value": 290.465310366478,
+              "above": null,
+              "samples": null,
+              "reason": null
+            },
+            "verifier_mean_ms": {
+              "value": 0.0007060948283280268,
+              "above": 0.0007060795757680062,
+              "samples": 46484,
+              "reason": null
+            },
+            "verifier_p99_ms": {
+              "value": 0.002105,
+              "above": 0.002103,
+              "samples": 46484,
+              "rank": 46020,
+              "reason": null
+            },
+            "wrong": {
+              "value": 0.0,
+              "above": null,
+              "samples": null,
+              "reason": null
+            }
+          },
+          "arrivals": null,
+          "invalid": [],
+          "observations": [
+            "server timing: 293205 observations in 15 series, 0 scanned queries",
+            "component outbox_write{outbox=scribe}: 0.1484 ms/call, 17.4596 ms mean over 395",
+            "component bifrost_scribe_lane_job{lane=wal_io}: 0.0423 ms/call, 1.2255 ms mean over 1605",
+            "component bifrost_scribe_wal_fsync{outcome=success}: 0.0414 ms/call, 3.5957 ms mean over 535",
+            "component phase_duration{phase=stage}: 0.0138 ms/call, 0.0138 ms mean over 46484",
+            "component bifrost_scribe_lane_job{lane=ingress}: 0.0123 ms/call, 0.1804 ms mean over 3168",
+            "component phase_duration{phase=engine}: 0.0074 ms/call, 0.0074 ms mean over 46484",
+            "component phase_duration{phase=admit}: 0.0015 ms/call, 0.0015 ms mean over 46484",
+            "component phase_duration{phase=load}: 0.0011 ms/call, 0.0011 ms mean over 46484",
+            "component block_duration{kind=assert}: 0.0007 ms/call, 0.0002 ms mean over 185936",
+            "component bifrost_scribe_wal_append{outcome=success}: 0.0005 ms/call, 0.0070 ms mean over 3168",
+            "component bifrost_scribe_queue_wait: 0.0002 ms/call, 0.0049 ms mean over 1584",
+            "component store_duration{op=runnable_scan}: 0.0001 ms/call, 0.6621 ms mean over 5",
+            "component store_duration{op=due_group_scan}: 0.0001 ms/call, 0.6025 ms mean over 5",
+            "component store_duration{op=queue_depth}: 0.0001 ms/call, 0.5357 ms mean over 5",
+            "component store_duration{op=due_scan}: 0.0000 ms/call, 0.4119 ms mean over 5"
+          ],
+          "reconciliation": [
+            {
+              "boundary": "verification.direct",
+              "outcome": "completed",
+              "case": "direct-verify",
+              "phase": "repetition-1",
+              "expected": 46484,
+              "recorded": 46484
+            }
+          ]
+        },
+        {
+          "seconds": 5.000667186,
+          "processes": [
+            "wyrd-server"
+          ],
+          "server_cpu_seconds": 6.33,
+          "peak_memory_bytes": 1635348480,
+          "memory_interval_ms": 10,
+          "driver_cpu_seconds": 1.44,
+          "provisioned_vcpus": 32,
+          "metrics": {
+            "client_p50_ms": {
+              "value": 0.088,
+              "above": null,
+              "samples": 44757,
+              "reason": null
+            },
+            "client_p95_ms": {
+              "value": 0.218,
+              "above": null,
+              "samples": 44757,
+              "reason": null
+            },
+            "client_p99_ms": {
+              "value": 0.311,
+              "above": null,
+              "samples": 44757,
+              "reason": null
+            },
+            "cores": {
+              "value": 1.2658310910435382,
+              "above": null,
+              "samples": null,
+              "reason": null
+            },
+            "cpu_us_per_verification": {
+              "value": 141.4335508088301,
+              "above": null,
+              "samples": null,
+              "reason": null
+            },
+            "drain_seconds": {
+              "value": 0.004821741,
+              "above": null,
+              "samples": null,
+              "reason": null
+            },
+            "errors": {
+              "value": 0.0,
+              "above": null,
+              "samples": null,
+              "reason": null
+            },
+            "lost_writes": {
+              "value": 0.0,
+              "above": null,
+              "samples": null,
+              "reason": null
+            },
+            "max_ms": {
+              "value": 2.220031,
+              "above": 2.217983,
+              "samples": 44757,
+              "rank": 44757,
+              "reason": null
+            },
+            "overhead_max_ms": {
+              "value": 2.220031,
+              "above": 2.217983,
+              "samples": 44757,
+              "rank": 44757,
+              "reason": null
+            },
+            "overhead_mean_ms": {
+              "value": 0.05055141915231137,
+              "above": 0.05051394219898563,
+              "samples": 44757,
+              "reason": null
+            },
+            "overhead_over_10ms": {
+              "value": 0.0,
+              "above": null,
+              "samples": null,
+              "reason": null
+            },
+            "overhead_over_1ms": {
+              "value": 2.0,
+              "above": null,
+              "samples": null,
+              "reason": null
+            },
+            "overhead_over_500us": {
+              "value": 5.0,
+              "above": null,
+              "samples": null,
+              "reason": null
+            },
+            "overhead_over_5ms": {
+              "value": 0.0,
+              "above": null,
+              "samples": null,
+              "reason": null
+            },
+            "overhead_p99_ms": {
+              "value": 0.152575,
+              "above": 0.152447,
+              "samples": 44757,
+              "rank": 44310,
+              "reason": null
+            },
+            "p50_ms": {
+              "value": 0.040863,
+              "above": 0.040831,
+              "samples": 44757,
+              "rank": 22379,
+              "reason": null
+            },
+            "p95_ms": {
+              "value": 0.101183,
+              "above": 0.101119,
+              "samples": 44757,
+              "rank": 42520,
+              "reason": null
+            },
+            "p99_ms": {
+              "value": 0.154751,
+              "above": 0.154623,
+              "samples": 44757,
+              "rank": 44310,
+              "reason": null
+            },
+            "phase_admit_max_ms": {
+              "value": 0.176383,
+              "above": 0.176255,
+              "samples": 44757,
+              "rank": 44757,
+              "reason": null
+            },
+            "phase_admit_p99_ms": {
+              "value": 0.005471,
+              "above": 0.005467,
+              "samples": 44757,
+              "rank": 44310,
+              "reason": null
+            },
+            "phase_engine_max_ms": {
+              "value": 1.625087,
+              "above": 1.624063,
+              "samples": 44757,
+              "rank": 44757,
+              "reason": null
+            },
+            "phase_engine_p99_ms": {
+              "value": 0.024319,
+              "above": 0.024303,
+              "samples": 44757,
+              "rank": 44310,
+              "reason": null
+            },
+            "phase_load_max_ms": {
+              "value": 0.042527,
+              "above": 0.042495,
+              "samples": 44757,
+              "rank": 44757,
+              "reason": null
+            },
+            "phase_load_p99_ms": {
+              "value": 0.003939,
+              "above": 0.003937,
+              "samples": 44757,
+              "rank": 44310,
+              "reason": null
+            },
+            "phase_outside_max_ms": {
+              "value": 0.910335,
+              "above": 0.909823,
+              "samples": 44757,
+              "rank": 44757,
+              "reason": null
+            },
+            "phase_outside_p99_ms": {
+              "value": 0.084671,
+              "above": 0.084607,
+              "samples": 44757,
+              "rank": 44310,
+              "reason": null
+            },
+            "phase_prepare_max_ms": {
+              "value": null,
+              "above": null,
+              "samples": null,
+              "reason": "no completed `verification.direct.prepare` time in the window"
+            },
+            "phase_prepare_p99_ms": {
+              "value": null,
+              "above": null,
+              "samples": null,
+              "reason": "no completed `verification.direct.prepare` time in the window"
+            },
+            "phase_stage_max_ms": {
+              "value": 2.179071,
+              "above": 2.177023,
+              "samples": 44757,
+              "rank": 44757,
+              "reason": null
+            },
+            "phase_stage_p99_ms": {
+              "value": 0.040735,
+              "above": 0.040703,
+              "samples": 44757,
+              "rank": 44310,
+              "reason": null
+            },
+            "rate": {
+              "value": 8950.005736294564,
+              "above": null,
+              "samples": null,
+              "reason": null
+            },
+            "server_failures": {
+              "value": 0.0,
+              "above": null,
+              "samples": null,
+              "reason": null
+            },
+            "verifications": {
+              "value": 44756.0,
+              "above": null,
+              "samples": null,
+              "reason": null
+            },
+            "verifications_after_window": {
+              "value": 1.0,
+              "above": null,
+              "samples": null,
+              "reason": null
+            },
+            "verifications_per_cpu_s": {
+              "value": 7070.458135860979,
+              "above": null,
+              "samples": null,
+              "reason": null
+            },
+            "verifications_per_s_per_vcpu": {
+              "value": 279.68767925920514,
+              "above": null,
+              "samples": null,
+              "reason": null
+            },
+            "verifier_mean_ms": {
+              "value": 0.0007301288960386085,
+              "above": 0.0007301101950532877,
+              "samples": 44757,
+              "reason": null
+            },
+            "verifier_p99_ms": {
+              "value": 0.002155,
+              "above": 0.002153,
+              "samples": 44757,
+              "rank": 44310,
+              "reason": null
+            },
+            "wrong": {
+              "value": 0.0,
+              "above": null,
+              "samples": null,
+              "reason": null
+            }
+          },
+          "arrivals": null,
+          "invalid": [],
+          "observations": [
+            "server timing: 282888 observations in 15 series, 0 scanned queries",
+            "component outbox_write{outbox=scribe}: 0.1725 ms/call, 19.4925 ms mean over 396",
+            "component bifrost_scribe_lane_job{lane=wal_io}: 0.0514 ms/call, 1.1833 ms mean over 1945",
+            "component bifrost_scribe_wal_fsync{outcome=success}: 0.0501 ms/call, 3.4737 ms mean over 646",
+            "component bifrost_scribe_lane_job{lane=persistence}: 0.0218 ms/call, 195.3782 ms mean over 5",
+            "component phase_duration{phase=stage}: 0.0142 ms/call, 0.0142 ms mean over 44757",
+            "component bifrost_scribe_lane_job{lane=ingress}: 0.0127 ms/call, 0.1788 ms mean over 3184",
+            "component phase_duration{phase=engine}: 0.0077 ms/call, 0.0077 ms mean over 44757",
+            "component phase_duration{phase=admit}: 0.0016 ms/call, 0.0016 ms mean over 44757",
+            "component phase_duration{phase=load}: 0.0012 ms/call, 0.0012 ms mean over 44757",
+            "component block_duration{kind=assert}: 0.0007 ms/call, 0.0002 ms mean over 179028",
+            "component bifrost_scribe_wal_append{outcome=success}: 0.0006 ms/call, 0.0078 ms mean over 3172",
+            "component bifrost_scribe_queue_wait: 0.0002 ms/call, 0.0045 ms mean over 1593",
+            "component store_duration{op=runnable_scan}: 0.0001 ms/call, 0.6263 ms mean over 5",
+            "component store_duration{op=queue_depth}: 0.0001 ms/call, 0.6073 ms mean over 5",
+            "component store_duration{op=due_group_scan}: 0.0001 ms/call, 0.4716 ms mean over 5"
+          ],
+          "reconciliation": [
+            {
+              "boundary": "verification.direct",
+              "outcome": "completed",
+              "case": "direct-verify",
+              "phase": "repetition-2",
+              "expected": 44757,
+              "recorded": 44757
+            }
+          ]
+        },
+        {
+          "seconds": 5.000691482,
+          "processes": [
+            "wyrd-server"
+          ],
+          "server_cpu_seconds": 5.25,
+          "peak_memory_bytes": 904384512,
+          "memory_interval_ms": 10,
+          "driver_cpu_seconds": 1.46,
+          "provisioned_vcpus": 32,
+          "metrics": {
+            "client_p50_ms": {
+              "value": 0.087,
+              "above": null,
+              "samples": 46460,
+              "reason": null
+            },
+            "client_p95_ms": {
+              "value": 0.207,
+              "above": null,
+              "samples": 46460,
+              "reason": null
+            },
+            "client_p99_ms": {
+              "value": 0.288,
+              "above": null,
+              "samples": 46460,
+              "reason": null
+            },
+            "cores": {
+              "value": 1.0498548088594122,
+              "above": null,
+              "samples": null,
+              "reason": null
+            },
+            "cpu_us_per_verification": {
+              "value": 113.00286273918938,
+              "above": null,
+              "samples": null,
+              "reason": null
+            },
+            "drain_seconds": {
+              "value": 0.004785452,
+              "above": null,
+              "samples": null,
+              "reason": null
+            },
+            "errors": {
+              "value": 0.0,
+              "above": null,
+              "samples": null,
+              "reason": null
+            },
+            "lost_writes": {
+              "value": 0.0,
+              "above": null,
+              "samples": null,
+              "reason": null
+            },
+            "max_ms": {
+              "value": 0.572927,
+              "above": 0.572415,
+              "samples": 46460,
+              "rank": 46460,
+              "reason": null
+            },
+            "overhead_max_ms": {
+              "value": 0.570367,
+              "above": 0.569855,
+              "samples": 46460,
+              "rank": 46460,
+              "reason": null
+            },
+            "overhead_mean_ms": {
+              "value": 0.048466476883340506,
+              "above": 0.04843023467498924,
+              "samples": 46460,
+              "reason": null
+            },
+            "overhead_over_10ms": {
+              "value": 0.0,
+              "above": null,
+              "samples": null,
+              "reason": null
+            },
+            "overhead_over_1ms": {
+              "value": 0.0,
+              "above": null,
+              "samples": null,
+              "reason": null
+            },
+            "overhead_over_500us": {
+              "value": 1.0,
+              "above": null,
+              "samples": null,
+              "reason": null
+            },
+            "overhead_over_5ms": {
+              "value": 0.0,
+              "above": null,
+              "samples": null,
+              "reason": null
+            },
+            "overhead_p99_ms": {
+              "value": 0.137471,
+              "above": 0.137343,
+              "samples": 46460,
+              "rank": 45996,
+              "reason": null
+            },
+            "p50_ms": {
+              "value": 0.040191,
+              "above": 0.040159,
+              "samples": 46460,
+              "rank": 23230,
+              "reason": null
+            },
+            "p95_ms": {
+              "value": 0.094399,
+              "above": 0.094335,
+              "samples": 46460,
+              "rank": 44137,
+              "reason": null
+            },
+            "p99_ms": {
+              "value": 0.139135,
+              "above": 0.139007,
+              "samples": 46460,
+              "rank": 45996,
+              "reason": null
+            },
+            "phase_admit_max_ms": {
+              "value": 0.029183,
+              "above": 0.029167,
+              "samples": 46460,
+              "rank": 46460,
+              "reason": null
+            },
+            "phase_admit_p99_ms": {
+              "value": 0.005099,
+              "above": 0.005095,
+              "samples": 46460,
+              "rank": 45996,
+              "reason": null
+            },
+            "phase_engine_max_ms": {
+              "value": 0.376319,
+              "above": 0.376063,
+              "samples": 46460,
+              "rank": 46460,
+              "reason": null
+            },
+            "phase_engine_p99_ms": {
+              "value": 0.021327,
+              "above": 0.021311,
+              "samples": 46460,
+              "rank": 45996,
+              "reason": null
+            },
+            "phase_load_max_ms": {
+              "value": 0.019519,
+              "above": 0.019503,
+              "samples": 46460,
+              "rank": 46460,
+              "reason": null
+            },
+            "phase_load_p99_ms": {
+              "value": 0.003387,
+              "above": 0.003385,
+              "samples": 46460,
+              "rank": 45996,
+              "reason": null
+            },
+            "phase_outside_max_ms": {
+              "value": 0.510463,
+              "above": 0.510207,
+              "samples": 46460,
+              "rank": 46460,
+              "reason": null
+            },
+            "phase_outside_p99_ms": {
+              "value": 0.075455,
+              "above": 0.075391,
+              "samples": 46460,
+              "rank": 45996,
+              "reason": null
+            },
+            "phase_prepare_max_ms": {
+              "value": null,
+              "above": null,
+              "samples": null,
+              "reason": "no completed `verification.direct.prepare` time in the window"
+            },
+            "phase_prepare_p99_ms": {
+              "value": null,
+              "above": null,
+              "samples": null,
+              "reason": "no completed `verification.direct.prepare` time in the window"
+            },
+            "phase_stage_max_ms": {
+              "value": 0.418815,
+              "above": 0.418559,
+              "samples": 46460,
+              "rank": 46460,
+              "reason": null
+            },
+            "phase_stage_p99_ms": {
+              "value": 0.037695,
+              "above": 0.037663,
+              "samples": 46460,
+              "rank": 45996,
+              "reason": null
+            },
+            "rate": {
+              "value": 9290.515155199892,
+              "above": null,
+              "samples": null,
+              "reason": null
+            },
+            "server_failures": {
+              "value": 0.0,
+              "above": null,
+              "samples": null,
+              "reason": null
+            },
+            "verifications": {
+              "value": 46459.0,
+              "above": null,
+              "samples": null,
+              "reason": null
+            },
+            "verifications_after_window": {
+              "value": 1.0,
+              "above": null,
+              "samples": null,
+              "reason": null
+            },
+            "verifications_per_cpu_s": {
+              "value": 8849.333333333334,
+              "above": null,
+              "samples": null,
+              "reason": null
+            },
+            "verifications_per_s_per_vcpu": {
+              "value": 290.3285985999966,
+              "above": null,
+              "samples": null,
+              "reason": null
+            },
+            "verifier_mean_ms": {
+              "value": 0.0007018930047352561,
+              "above": 0.0007018818338355575,
+              "samples": 46460,
+              "reason": null
+            },
+            "verifier_p99_ms": {
+              "value": 0.001903,
+              "above": null,
+              "samples": 46460,
+              "rank": 45996,
+              "reason": null
+            },
+            "wrong": {
+              "value": 0.0,
+              "above": null,
+              "samples": null,
+              "reason": null
+            }
+          },
+          "arrivals": null,
+          "invalid": [],
+          "observations": [
+            "server timing: 293052 observations in 15 series, 0 scanned queries",
+            "component outbox_write{outbox=scribe}: 0.1597 ms/call, 18.7821 ms mean over 395",
+            "component bifrost_scribe_lane_job{lane=wal_io}: 0.0414 ms/call, 1.2026 ms mean over 1601",
+            "component bifrost_scribe_wal_fsync{outcome=success}: 0.0405 ms/call, 3.5324 ms mean over 533",
+            "component phase_duration{phase=stage}: 0.0136 ms/call, 0.0136 ms mean over 46460",
+            "component bifrost_scribe_lane_job{lane=ingress}: 0.0113 ms/call, 0.1660 ms mean over 3172",
+            "component phase_duration{phase=engine}: 0.0074 ms/call, 0.0074 ms mean over 46460",
+            "component phase_duration{phase=admit}: 0.0015 ms/call, 0.0015 ms mean over 46460",
+            "component phase_duration{phase=load}: 0.0011 ms/call, 0.0011 ms mean over 46460",
+            "component block_duration{kind=assert}: 0.0007 ms/call, 0.0002 ms mean over 185840",
+            "component bifrost_scribe_wal_append{outcome=success}: 0.0005 ms/call, 0.0069 ms mean over 3172",
+            "component bifrost_scribe_queue_wait: 0.0002 ms/call, 0.0045 ms mean over 1586",
+            "component store_duration{op=runnable_scan}: 0.0001 ms/call, 0.6569 ms mean over 5",
+            "component store_duration{op=queue_depth}: 0.0001 ms/call, 0.6083 ms mean over 5",
+            "component store_duration{op=due_scan}: 0.0001 ms/call, 0.4970 ms mean over 5",
+            "component store_duration{op=due_group_scan}: 0.0000 ms/call, 0.4091 ms mean over 5"
+          ],
+          "reconciliation": [
+            {
+              "boundary": "verification.direct",
+              "outcome": "completed",
+              "case": "direct-verify",
+              "phase": "repetition-3",
+              "expected": 46460,
+              "recorded": 46460
+            }
+          ]
+        }
+      ],
+      "summary": {
+        "client_p50_ms": {
+          "unit": "ms",
+          "median": {
+            "value": 0.087,
+            "above": null,
+            "samples": 44757,
+            "reason": null
+          },
+          "min": 0.087,
+          "max": 0.088,
+          "spread": 0.0010000000000000009
+        },
+        "client_p95_ms": {
+          "unit": "ms",
+          "median": {
+            "value": 0.208,
+            "above": null,
+            "samples": 44757,
+            "reason": null
+          },
+          "min": 0.207,
+          "max": 0.218,
+          "spread": 0.01100000000000001
+        },
+        "client_p99_ms": {
+          "unit": "ms",
+          "median": {
+            "value": 0.303,
+            "above": null,
+            "samples": 44757,
+            "reason": null
+          },
+          "min": 0.288,
+          "max": 0.311,
+          "spread": 0.02300000000000002
+        },
+        "cores": {
+          "unit": "cores",
+          "median": {
+            "value": 1.0578053855998406,
+            "above": null,
+            "samples": null,
+            "reason": null
+          },
+          "min": 1.0498548088594122,
+          "max": 1.2658310910435382,
+          "spread": 0.215976282184126
+        },
+        "cpu_us_per_verification": {
+          "unit": "µs/verification",
+          "median": {
+            "value": 113.80504700643246,
+            "above": null,
+            "samples": null,
+            "reason": null
+          },
+          "min": 113.00286273918938,
+          "max": 141.4335508088301,
+          "spread": 28.43068806964071
+        },
+        "drain_seconds": {
+          "unit": "",
+          "median": {
+            "value": 0.004785452,
+            "above": null,
+            "samples": null,
+            "reason": null
+          },
+          "min": 0.004310997,
+          "max": 0.004821741,
+          "spread": 0.0005107440000000005
+        },
+        "errors": {
+          "unit": "errors",
+          "median": {
+            "value": 0.0,
+            "above": null,
+            "samples": null,
+            "reason": null
+          },
+          "min": 0.0,
+          "max": 0.0,
+          "spread": 0.0
+        },
+        "lost_writes": {
+          "unit": "writes",
+          "median": {
+            "value": 0.0,
+            "above": null,
+            "samples": null,
+            "reason": null
+          },
+          "min": 0.0,
+          "max": 0.0,
+          "spread": 0.0
+        },
+        "max_ms": {
+          "unit": "",
+          "median": {
+            "value": 1.699839,
+            "above": 1.698815,
+            "samples": 44757,
+            "reason": null
+          },
+          "min": null,
+          "max": null,
+          "spread": null
+        },
+        "overhead_max_ms": {
+          "unit": "ms",
+          "median": {
+            "value": 1.698815,
+            "above": 1.697791,
+            "samples": 44757,
+            "reason": null
+          },
+          "min": null,
+          "max": null,
+          "spread": null
+        },
+        "overhead_mean_ms": {
+          "unit": "ms",
+          "median": {
+            "value": 0.04879575208673952,
+            "above": 0.0487592826563979,
+            "samples": 44757,
+            "reason": null
+          },
+          "min": null,
+          "max": null,
+          "spread": null
+        },
+        "overhead_over_10ms": {
+          "unit": "verifications",
+          "median": {
+            "value": 0.0,
+            "above": null,
+            "samples": null,
+            "reason": null
+          },
+          "min": 0.0,
+          "max": 0.0,
+          "spread": 0.0
+        },
+        "overhead_over_1ms": {
+          "unit": "verifications",
+          "median": {
+            "value": 1.0,
+            "above": null,
+            "samples": null,
+            "reason": null
+          },
+          "min": 0.0,
+          "max": 2.0,
+          "spread": 2.0
+        },
+        "overhead_over_500us": {
+          "unit": "verifications",
+          "median": {
+            "value": 1.0,
+            "above": null,
+            "samples": null,
+            "reason": null
+          },
+          "min": 1.0,
+          "max": 5.0,
+          "spread": 4.0
+        },
+        "overhead_over_5ms": {
+          "unit": "verifications",
+          "median": {
+            "value": 0.0,
+            "above": null,
+            "samples": null,
+            "reason": null
+          },
+          "min": 0.0,
+          "max": 0.0,
+          "spread": 0.0
+        },
+        "overhead_p99_ms": {
+          "unit": "ms",
+          "median": {
+            "value": 0.147839,
+            "above": 0.147711,
+            "samples": 44757,
+            "reason": null
+          },
+          "min": null,
+          "max": null,
+          "spread": null
+        },
+        "p50_ms": {
+          "unit": "ms",
+          "median": {
+            "value": 0.040191,
+            "above": 0.040159,
+            "samples": 44757,
+            "reason": null
+          },
+          "min": null,
+          "max": null,
+          "spread": null
+        },
+        "p95_ms": {
+          "unit": "ms",
+          "median": {
+            "value": 0.097215,
+            "above": 0.097151,
+            "samples": 44757,
+            "reason": null
+          },
+          "min": null,
+          "max": null,
+          "spread": null
+        },
+        "p99_ms": {
+          "unit": "ms",
+          "median": {
+            "value": 0.149631,
+            "above": 0.149503,
+            "samples": 44757,
+            "reason": null
+          },
+          "min": null,
+          "max": null,
+          "spread": null
+        },
+        "phase_admit_max_ms": {
+          "unit": "ms",
+          "median": {
+            "value": 0.119935,
+            "above": 0.119871,
+            "samples": 44757,
+            "reason": null
+          },
+          "min": null,
+          "max": null,
+          "spread": null
+        },
+        "phase_admit_p99_ms": {
+          "unit": "ms",
+          "median": {
+            "value": 0.005431,
+            "above": 0.005427,
+            "samples": 44757,
+            "reason": null
+          },
+          "min": null,
+          "max": null,
+          "spread": null
+        },
+        "phase_engine_max_ms": {
+          "unit": "ms",
+          "median": {
+            "value": 0.376319,
+            "above": 0.376063,
+            "samples": 44757,
+            "reason": null
+          },
+          "min": null,
+          "max": null,
+          "spread": null
+        },
+        "phase_engine_p99_ms": {
+          "unit": "ms",
+          "median": {
+            "value": 0.023471,
+            "above": 0.023455,
+            "samples": 44757,
+            "reason": null
+          },
+          "min": null,
+          "max": null,
+          "spread": null
+        },
+        "phase_load_max_ms": {
+          "unit": "ms",
+          "median": {
+            "value": 0.028575,
+            "above": 0.028559,
+            "samples": 44757,
+            "reason": null
+          },
+          "min": null,
+          "max": null,
+          "spread": null
+        },
+        "phase_load_p99_ms": {
+          "unit": "ms",
+          "median": {
+            "value": 0.003457,
+            "above": 0.003455,
+            "samples": 44757,
+            "reason": null
+          },
+          "min": null,
+          "max": null,
+          "spread": null
+        },
+        "phase_outside_max_ms": {
+          "unit": "ms",
+          "median": {
+            "value": 0.910335,
+            "above": 0.909823,
+            "samples": 44757,
+            "reason": null
+          },
+          "min": null,
+          "max": null,
+          "spread": null
+        },
+        "phase_outside_p99_ms": {
+          "unit": "ms",
+          "median": {
+            "value": 0.080895,
+            "above": 0.080831,
+            "samples": 44757,
+            "reason": null
+          },
+          "min": null,
+          "max": null,
+          "spread": null
+        },
+        "phase_prepare_max_ms": {
+          "unit": "ms",
+          "median": {
+            "value": null,
+            "above": null,
+            "samples": null,
+            "reason": "no completed `verification.direct.prepare` time in the window"
+          },
+          "min": null,
+          "max": null,
+          "spread": null
+        },
+        "phase_prepare_p99_ms": {
+          "unit": "ms",
+          "median": {
+            "value": null,
+            "above": null,
+            "samples": null,
+            "reason": "no completed `verification.direct.prepare` time in the window"
+          },
+          "min": null,
+          "max": null,
+          "spread": null
+        },
+        "phase_stage_max_ms": {
+          "unit": "ms",
+          "median": {
+            "value": 0.418815,
+            "above": 0.418559,
+            "samples": 44757,
+            "reason": null
+          },
+          "min": null,
+          "max": null,
+          "spread": null
+        },
+        "phase_stage_p99_ms": {
+          "unit": "ms",
+          "median": {
+            "value": 0.039487,
+            "above": 0.039455,
+            "samples": 44757,
+            "reason": null
+          },
+          "min": null,
+          "max": null,
+          "spread": null
+        },
+        "rate": {
+          "unit": "verifications/s",
+          "median": {
+            "value": 9290.515155199892,
+            "above": null,
+            "samples": null,
+            "reason": null
+          },
+          "min": 8950.005736294564,
+          "max": 9294.889931727295,
+          "spread": 344.88419543273085
+        },
+        "server_failures": {
+          "unit": "verifications",
+          "median": {
+            "value": 0.0,
+            "above": null,
+            "samples": null,
+            "reason": null
+          },
+          "min": 0.0,
+          "max": 0.0,
+          "spread": 0.0
+        },
+        "verifications": {
+          "unit": "verifications",
+          "median": {
+            "value": 46459.0,
+            "above": null,
+            "samples": null,
+            "reason": null
+          },
+          "min": 44756.0,
+          "max": 46483.0,
+          "spread": 1727.0
+        },
+        "verifications_after_window": {
+          "unit": "",
+          "median": {
+            "value": 1.0,
+            "above": null,
+            "samples": null,
+            "reason": null
+          },
+          "min": 1.0,
+          "max": 1.0,
+          "spread": 0.0
+        },
+        "verifications_per_cpu_s": {
+          "unit": "verifications/cpu-s",
+          "median": {
+            "value": 8786.95652173913,
+            "above": null,
+            "samples": null,
+            "reason": null
+          },
+          "min": 7070.458135860979,
+          "max": 8849.333333333334,
+          "spread": 1778.8751974723546
+        },
+        "verifications_per_s_per_vcpu": {
+          "unit": "verifications/s/vCPU",
+          "median": {
+            "value": 290.3285985999966,
+            "above": null,
+            "samples": null,
+            "reason": null
+          },
+          "min": 279.68767925920514,
+          "max": 290.465310366478,
+          "spread": 10.777631107272839
+        },
+        "verifier_mean_ms": {
+          "unit": "ms",
+          "median": {
+            "value": 0.0007060948283280268,
+            "above": 0.0007060795757680062,
+            "samples": 44757,
+            "reason": null
+          },
+          "min": null,
+          "max": null,
+          "spread": null
+        },
+        "verifier_p99_ms": {
+          "unit": "ms",
+          "median": {
+            "value": 0.002105,
+            "above": 0.002103,
+            "samples": 44757,
+            "reason": null
+          },
+          "min": null,
+          "max": null,
+          "spread": null
+        },
+        "wrong": {
+          "unit": "verifications",
+          "median": {
+            "value": 0.0,
+            "above": null,
+            "samples": null,
+            "reason": null
+          },
+          "min": 0.0,
+          "max": 0.0,
+          "spread": 0.0
+        }
+      },
+      "criteria": [
+        {
+          "criterion": "no-errors",
+          "observed": {
+            "value": 0.0,
+            "above": null,
+            "samples": null,
+            "reason": null
+          },
+          "values": [
+            {
+              "value": 0.0,
+              "above": null,
+              "samples": null,
+              "reason": null
+            },
+            {
+              "value": 0.0,
+              "above": null,
+              "samples": null,
+              "reason": null
+            },
+            {
+              "value": 0.0,
+              "above": null,
+              "samples": null,
+              "reason": null
+            }
+          ],
+          "outcome": "met",
+          "reason": null,
+          "applicable": true
+        },
+        {
+          "criterion": "correct-verdicts",
+          "observed": {
+            "value": 0.0,
+            "above": null,
+            "samples": null,
+            "reason": null
+          },
+          "values": [
+            {
+              "value": 0.0,
+              "above": null,
+              "samples": null,
+              "reason": null
+            },
+            {
+              "value": 0.0,
+              "above": null,
+              "samples": null,
+              "reason": null
+            },
+            {
+              "value": 0.0,
+              "above": null,
+              "samples": null,
+              "reason": null
+            }
+          ],
+          "outcome": "met",
+          "reason": null,
+          "applicable": true
+        },
+        {
+          "criterion": "no-lost-evidence",
+          "observed": {
+            "value": 0.0,
+            "above": null,
+            "samples": null,
+            "reason": null
+          },
+          "values": [
+            {
+              "value": 0.0,
+              "above": null,
+              "samples": null,
+              "reason": null
+            },
+            {
+              "value": 0.0,
+              "above": null,
+              "samples": null,
+              "reason": null
+            },
+            {
+              "value": 0.0,
+              "above": null,
+              "samples": null,
+              "reason": null
+            }
+          ],
+          "outcome": "met",
+          "reason": null,
+          "applicable": true
+        }
+      ],
+      "verdict": "VALID",
+      "reasons": []
+    },
+    {
+      "id": "direct-verify-c64",
+      "params": {
+        "clients": 64,
+        "op": "verify"
+      },
+      "status": "measured",
+      "timing": {
+        "warmup_seconds": 5,
+        "repetition_seconds": 5,
+        "repetitions": 3,
+        "budget_seconds": 300,
+        "minimum_seconds": 0
+      },
+      "repetitions": [
+        {
+          "seconds": 5.001509413,
+          "processes": [
+            "wyrd-server"
+          ],
+          "server_cpu_seconds": 87.35,
+          "peak_memory_bytes": 2988355584,
+          "memory_interval_ms": 10,
+          "driver_cpu_seconds": 39.11,
+          "provisioned_vcpus": 32,
+          "metrics": {
+            "client_p50_ms": {
+              "value": 0.752,
+              "above": null,
+              "samples": 379311,
+              "reason": null
+            },
+            "client_p95_ms": {
+              "value": 1.569,
+              "above": null,
+              "samples": 379311,
+              "reason": null
+            },
+            "client_p99_ms": {
+              "value": 2.179,
+              "above": null,
+              "samples": 379311,
+              "reason": null
+            },
+            "cores": {
+              "value": 17.46472770259285,
+              "above": null,
+              "samples": null,
+              "reason": null
+            },
+            "cpu_us_per_verification": {
+              "value": 230.32482788262004,
+              "above": null,
+              "samples": null,
+              "reason": null
+            },
+            "drain_seconds": {
+              "value": 0.031192594,
+              "above": null,
+              "samples": null,
+              "reason": null
+            },
+            "errors": {
+              "value": 0.0,
+              "above": null,
+              "samples": null,
+              "reason": null
+            },
+            "lost_writes": {
+              "value": 0.0,
+              "above": null,
+              "samples": null,
+              "reason": null
+            },
+            "max_ms": {
+              "value": 15.548415,
+              "above": 15.540223,
+              "samples": 379311,
+              "rank": 379311,
+              "reason": null
+            },
+            "overhead_max_ms": {
+              "value": 15.540223,
+              "above": 15.532031,
+              "samples": 379311,
+              "rank": 379311,
+              "reason": null
+            },
+            "overhead_mean_ms": {
+              "value": 0.11650704546137602,
+              "above": 0.11643017491978877,
+              "samples": 379311,
+              "reason": null
+            },
+            "overhead_over_10ms": {
+              "value": 3.0,
+              "above": null,
+              "samples": null,
+              "reason": null
+            },
+            "overhead_over_1ms": {
+              "value": 738.0,
+              "above": 735.0,
+              "samples": null,
+              "reason": null
+            },
+            "overhead_over_500us": {
+              "value": 2315.0,
+              "above": null,
+              "samples": null,
+              "reason": null
+            },
+            "overhead_over_5ms": {
+              "value": 6.0,
+              "above": null,
+              "samples": null,
+              "reason": null
+            },
+            "overhead_p99_ms": {
+              "value": 0.349951,
+              "above": 0.349695,
+              "samples": 379311,
+              "rank": 375518,
+              "reason": null
+            },
+            "p50_ms": {
+              "value": 0.110079,
+              "above": 0.110015,
+              "samples": 379311,
+              "rank": 189656,
+              "reason": null
+            },
+            "p95_ms": {
+              "value": 0.178815,
+              "above": 0.178687,
+              "samples": 379311,
+              "rank": 360346,
+              "reason": null
+            },
+            "p99_ms": {
+              "value": 0.352255,
+              "above": 0.351999,
+              "samples": 379311,
+              "rank": 375518,
+              "reason": null
+            },
+            "phase_admit_max_ms": {
+              "value": 3.166207,
+              "above": 3.164159,
+              "samples": 379311,
+              "rank": 379311,
+              "reason": null
+            },
+            "phase_admit_p99_ms": {
+              "value": 0.008059,
+              "above": 0.008055,
+              "samples": 379311,
+              "rank": 375518,
+              "reason": null
+            },
+            "phase_engine_max_ms": {
+              "value": 11.665407,
+              "above": 11.657215,
+              "samples": 379311,
+              "rank": 379311,
+              "reason": null
+            },
+            "phase_engine_p99_ms": {
+              "value": 0.036639,
+              "above": 0.036607,
+              "samples": 379311,
+              "rank": 375518,
+              "reason": null
+            },
+            "phase_load_max_ms": {
+              "value": 3.420159,
+              "above": 3.418111,
+              "samples": 379311,
+              "rank": 379311,
+              "reason": null
+            },
+            "phase_load_p99_ms": {
+              "value": 0.005483,
+              "above": 0.005479,
+              "samples": 379311,
+              "rank": 375518,
+              "reason": null
+            },
+            "phase_outside_max_ms": {
+              "value": 7.966719,
+              "above": 7.962623,
+              "samples": 379311,
+              "rank": 379311,
+              "reason": null
+            },
+            "phase_outside_p99_ms": {
+              "value": 0.201727,
+              "above": 0.201599,
+              "samples": 379311,
+              "rank": 375518,
+              "reason": null
+            },
+            "phase_prepare_max_ms": {
+              "value": null,
+              "above": null,
+              "samples": null,
+              "reason": "no completed `verification.direct.prepare` time in the window"
+            },
+            "phase_prepare_p99_ms": {
+              "value": null,
+              "above": null,
+              "samples": null,
+              "reason": "no completed `verification.direct.prepare` time in the window"
+            },
+            "phase_stage_max_ms": {
+              "value": 15.466495,
+              "above": 15.458303,
+              "samples": 379311,
+              "rank": 379311,
+              "reason": null
+            },
+            "phase_stage_p99_ms": {
+              "value": 0.066111,
+              "above": 0.066047,
+              "samples": 379311,
+              "rank": 375518,
+              "reason": null
+            },
+            "rate": {
+              "value": 75826.50929622473,
+              "above": null,
+              "samples": null,
+              "reason": null
+            },
+            "server_failures": {
+              "value": 0.0,
+              "above": null,
+              "samples": null,
+              "reason": null
+            },
+            "verifications": {
+              "value": 379247.0,
+              "above": null,
+              "samples": null,
+              "reason": null
+            },
+            "verifications_after_window": {
+              "value": 64.0,
+              "above": null,
+              "samples": null,
+              "reason": null
+            },
+            "verifications_per_cpu_s": {
+              "value": 4341.69433314253,
+              "above": null,
+              "samples": null,
+              "reason": null
+            },
+            "verifications_per_s_per_vcpu": {
+              "value": 2369.578415507023,
+              "above": null,
+              "samples": null,
+              "reason": null
+            },
+            "verifier_mean_ms": {
+              "value": 0.0013486330478156446,
+              "above": 0.0013485352309846011,
+              "samples": 379311,
+              "reason": null
+            },
+            "verifier_p99_ms": {
+              "value": 0.003145,
+              "above": 0.003143,
+              "samples": 379311,
+              "rank": 375518,
+              "reason": null
+            },
+            "wrong": {
+              "value": 0.0,
+              "above": null,
+              "samples": null,
+              "reason": null
+            }
+          },
+          "arrivals": null,
+          "invalid": [],
+          "observations": [
+            "server timing: 2288358 observations in 15 series, 0 scanned queries",
+            "component outbox_write{outbox=scribe}: 0.0511 ms/call, 57.3244 ms mean over 338",
+            "component phase_duration{phase=stage}: 0.0290 ms/call, 0.0290 ms mean over 379311",
+            "component bifrost_scribe_lane_job{lane=persistence}: 0.0196 ms/call, 437.9746 ms mean over 17",
+            "component phase_duration{phase=engine}: 0.0173 ms/call, 0.0173 ms mean over 379311",
+            "component bifrost_scribe_lane_job{lane=ingress}: 0.0102 ms/call, 1.2284 ms mean over 3141",
+            "component phase_duration{phase=admit}: 0.0041 ms/call, 0.0041 ms mean over 379311",
+            "component bifrost_scribe_lane_job{lane=wal_io}: 0.0038 ms/call, 1.3404 ms mean over 1062",
+            "component bifrost_scribe_wal_fsync{outcome=success}: 0.0033 ms/call, 3.5647 ms mean over 350",
+            "component phase_duration{phase=load}: 0.0028 ms/call, 0.0028 ms mean over 379311",
+            "component block_duration{kind=assert}: 0.0013 ms/call, 0.0003 ms mean over 1517244",
+            "component bifrost_scribe_queue_wait: 0.0003 ms/call, 0.0867 ms mean over 1388",
+            "component bifrost_scribe_wal_append{outcome=success}: 0.0001 ms/call, 0.0165 ms mean over 2774",
+            "component store_duration{op=due_scan}: 0.0000 ms/call, 3.0221 ms mean over 5",
+            "component store_duration{op=queue_depth}: 0.0000 ms/call, 2.8927 ms mean over 5",
+            "component store_duration{op=due_group_scan}: 0.0000 ms/call, 2.5471 ms mean over 5"
+          ],
+          "reconciliation": [
+            {
+              "boundary": "verification.direct",
+              "outcome": "completed",
+              "case": "direct-verify",
+              "phase": "repetition-1",
+              "expected": 379311,
+              "recorded": 379311
+            }
+          ]
+        },
+        {
+          "seconds": 5.001411756,
+          "processes": [
+            "wyrd-server"
+          ],
+          "server_cpu_seconds": 89.3,
+          "peak_memory_bytes": 3171262464,
+          "memory_interval_ms": 10,
+          "driver_cpu_seconds": 37.75999999999999,
+          "provisioned_vcpus": 32,
+          "metrics": {
+            "client_p50_ms": {
+              "value": 0.786,
+              "above": null,
+              "samples": 362023,
+              "reason": null
+            },
+            "client_p95_ms": {
+              "value": 1.662,
+              "above": null,
+              "samples": 362023,
+              "reason": null
+            },
+            "client_p99_ms": {
+              "value": 2.3,
+              "above": null,
+              "samples": 362023,
+              "reason": null
+            },
+            "cores": {
+              "value": 17.854958631004582,
+              "above": null,
+              "samples": null,
+              "reason": null
+            },
+            "cpu_us_per_verification": {
+              "value": 246.71302550841392,
+              "above": null,
+              "samples": null,
+              "reason": null
+            },
+            "drain_seconds": {
+              "value": 0.039126855,
+              "above": null,
+              "samples": null,
+              "reason": null
+            },
+            "errors": {
+              "value": 0.0,
+              "above": null,
+              "samples": null,
+              "reason": null
+            },
+            "lost_writes": {
+              "value": 0.0,
+              "above": null,
+              "samples": null,
+              "reason": null
+            },
+            "max_ms": {
+              "value": 15.876095,
+              "above": 15.867903,
+              "samples": 362023,
+              "rank": 362023,
+              "reason": null
+            },
+            "overhead_max_ms": {
+              "value": 15.876095,
+              "above": 15.867903,
+              "samples": 362023,
+              "rank": 362023,
+              "reason": null
+            },
+            "overhead_mean_ms": {
+              "value": 0.11810950086872933,
+              "above": 0.118031032765874,
+              "samples": 362023,
+              "reason": null
+            },
+            "overhead_over_10ms": {
+              "value": 3.0,
+              "above": null,
+              "samples": null,
+              "reason": null
+            },
+            "overhead_over_1ms": {
+              "value": 614.0,
+              "above": null,
+              "samples": null,
+              "reason": null
+            },
+            "overhead_over_500us": {
+              "value": 2272.0,
+              "above": 2270.0,
+              "samples": null,
+              "reason": null
+            },
+            "overhead_over_5ms": {
+              "value": 6.0,
+              "above": null,
+              "samples": null,
+              "reason": null
+            },
+            "overhead_p99_ms": {
+              "value": 0.353535,
+              "above": 0.353279,
+              "samples": 362023,
+              "rank": 358403,
+              "reason": null
+            },
+            "p50_ms": {
+              "value": 0.111359,
+              "above": 0.111295,
+              "samples": 362023,
+              "rank": 181012,
+              "reason": null
+            },
+            "p95_ms": {
+              "value": 0.183295,
+              "above": 0.183167,
+              "samples": 362023,
+              "rank": 343922,
+              "reason": null
+            },
+            "p99_ms": {
+              "value": 0.356607,
+              "above": 0.356351,
+              "samples": 362023,
+              "rank": 358403,
+              "reason": null
+            },
+            "phase_admit_max_ms": {
+              "value": 2.824191,
+              "above": 2.822143,
+              "samples": 362023,
+              "rank": 362023,
+              "reason": null
+            },
+            "phase_admit_p99_ms": {
+              "value": 0.008423,
+              "above": 0.008415,
+              "samples": 362023,
+              "rank": 358403,
+              "reason": null
+            },
+            "phase_engine_max_ms": {
+              "value": 12.402687,
+              "above": 12.394495,
+              "samples": 362023,
+              "rank": 362023,
+              "reason": null
+            },
+            "phase_engine_p99_ms": {
+              "value": 0.037919,
+              "above": 0.037887,
+              "samples": 362023,
+              "rank": 358403,
+              "reason": null
+            },
+            "phase_load_max_ms": {
+              "value": 1.646591,
+              "above": 1.645567,
+              "samples": 362023,
+              "rank": 362023,
+              "reason": null
+            },
+            "phase_load_p99_ms": {
+              "value": 0.005563,
+              "above": 0.005559,
+              "samples": 362023,
+              "rank": 358403,
+              "reason": null
+            },
+            "phase_outside_max_ms": {
+              "value": 3.784703,
+              "above": 3.782655,
+              "samples": 362023,
+              "rank": 362023,
+              "reason": null
+            },
+            "phase_outside_p99_ms": {
+              "value": 0.209919,
+              "above": 0.209791,
+              "samples": 362023,
+              "rank": 358403,
+              "reason": null
+            },
+            "phase_prepare_max_ms": {
+              "value": null,
+              "above": null,
+              "samples": null,
+              "reason": "no completed `verification.direct.prepare` time in the window"
+            },
+            "phase_prepare_p99_ms": {
+              "value": null,
+              "above": null,
+              "samples": null,
+              "reason": "no completed `verification.direct.prepare` time in the window"
+            },
+            "phase_stage_max_ms": {
+              "value": 15.794175,
+              "above": 15.785983,
+              "samples": 362023,
+              "rank": 362023,
+              "reason": null
+            },
+            "phase_stage_p99_ms": {
+              "value": 0.067391,
+              "above": 0.067327,
+              "samples": 362023,
+              "rank": 358403,
+              "reason": null
+            },
+            "rate": {
+              "value": 72371.36585800434,
+              "above": null,
+              "samples": null,
+              "reason": null
+            },
+            "server_failures": {
+              "value": 0.0,
+              "above": null,
+              "samples": null,
+              "reason": null
+            },
+            "verifications": {
+              "value": 361959.0,
+              "above": null,
+              "samples": null,
+              "reason": null
+            },
+            "verifications_after_window": {
+              "value": 64.0,
+              "above": null,
+              "samples": null,
+              "reason": null
+            },
+            "verifications_per_cpu_s": {
+              "value": 4053.292273236282,
+              "above": null,
+              "samples": null,
+              "reason": null
+            },
+            "verifications_per_s_per_vcpu": {
+              "value": 2261.6051830626357,
+              "above": null,
+              "samples": null,
+              "reason": null
+            },
+            "verifier_mean_ms": {
+              "value": 0.0013634152940559024,
+              "above": 0.0013633084914494384,
+              "samples": 362023,
+              "reason": null
+            },
+            "verifier_p99_ms": {
+              "value": 0.003247,
+              "above": 0.003245,
+              "samples": 362023,
+              "rank": 358403,
+              "reason": null
+            },
+            "wrong": {
+              "value": 0.0,
+              "above": null,
+              "samples": null,
+              "reason": null
+            }
+          },
+          "arrivals": null,
+          "invalid": [],
+          "observations": [
+            "server timing: 2184756 observations in 15 series, 0 scanned queries",
+            "component outbox_write{outbox=scribe}: 0.0544 ms/call, 57.2138 ms mean over 344",
+            "component bifrost_scribe_lane_job{lane=persistence}: 0.0328 ms/call, 742.2026 ms mean over 16",
+            "component phase_duration{phase=stage}: 0.0298 ms/call, 0.0298 ms mean over 362023",
+            "component phase_duration{phase=engine}: 0.0177 ms/call, 0.0177 ms mean over 362023",
+            "component bifrost_scribe_lane_job{lane=ingress}: 0.0105 ms/call, 1.1988 ms mean over 3156",
+            "component phase_duration{phase=admit}: 0.0041 ms/call, 0.0041 ms mean over 362023",
+            "component bifrost_scribe_lane_job{lane=wal_io}: 0.0036 ms/call, 1.1879 ms mean over 1084",
+            "component bifrost_scribe_wal_fsync{outcome=success}: 0.0031 ms/call, 3.1370 ms mean over 356",
+            "component phase_duration{phase=load}: 0.0027 ms/call, 0.0027 ms mean over 362023",
+            "component block_duration{kind=assert}: 0.0014 ms/call, 0.0003 ms mean over 1448092",
+            "component bifrost_scribe_queue_wait: 0.0004 ms/call, 0.0917 ms mean over 1396",
+            "component bifrost_scribe_wal_append{outcome=success}: 0.0001 ms/call, 0.0159 ms mean over 2792",
+            "component store_duration{op=due_group_scan}: 0.0001 ms/call, 4.2674 ms mean over 5",
+            "component store_duration{op=runnable_scan}: 0.0000 ms/call, 2.8582 ms mean over 5",
+            "component store_duration{op=queue_depth}: 0.0000 ms/call, 2.7093 ms mean over 5"
+          ],
+          "reconciliation": [
+            {
+              "boundary": "verification.direct",
+              "outcome": "completed",
+              "case": "direct-verify",
+              "phase": "repetition-2",
+              "expected": 362023,
+              "recorded": 362023
+            }
+          ]
+        },
+        {
+          "seconds": 5.001991573,
+          "processes": [
+            "wyrd-server"
+          ],
+          "server_cpu_seconds": 88.87,
+          "peak_memory_bytes": 3244412928,
+          "memory_interval_ms": 10,
+          "driver_cpu_seconds": 38.510000000000005,
+          "provisioned_vcpus": 32,
+          "metrics": {
+            "client_p50_ms": {
+              "value": 0.761,
+              "above": null,
+              "samples": 374994,
+              "reason": null
+            },
+            "client_p95_ms": {
+              "value": 1.594,
+              "above": null,
+              "samples": 374994,
+              "reason": null
+            },
+            "client_p99_ms": {
+              "value": 2.206,
+              "above": null,
+              "samples": 374994,
+              "reason": null
+            },
+            "cores": {
+              "value": 17.76692317510228,
+              "above": null,
+              "samples": null,
+              "reason": null
+            },
+            "cpu_us_per_verification": {
+              "value": 237.03091243698825,
+              "above": null,
+              "samples": null,
+              "reason": null
+            },
+            "drain_seconds": {
+              "value": 0.028013477,
+              "above": null,
+              "samples": null,
+              "reason": null
+            },
+            "errors": {
+              "value": 0.0,
+              "above": null,
+              "samples": null,
+              "reason": null
+            },
+            "lost_writes": {
+              "value": 0.0,
+              "above": null,
+              "samples": null,
+              "reason": null
+            },
+            "max_ms": {
+              "value": 18.530303,
+              "above": 18.513919,
+              "samples": 374994,
+              "rank": 374994,
+              "reason": null
+            },
+            "overhead_max_ms": {
+              "value": 18.530303,
+              "above": 18.513919,
+              "samples": 374994,
+              "rank": 374994,
+              "reason": null
+            },
+            "overhead_mean_ms": {
+              "value": 0.11742614483965076,
+              "above": 0.11734845463927422,
+              "samples": 374994,
+              "reason": null
+            },
+            "overhead_over_10ms": {
+              "value": 1.0,
+              "above": null,
+              "samples": null,
+              "reason": null
+            },
+            "overhead_over_1ms": {
+              "value": 565.0,
+              "above": null,
+              "samples": null,
+              "reason": null
+            },
+            "overhead_over_500us": {
+              "value": 2155.0,
+              "above": 2149.0,
+              "samples": null,
+              "reason": null
+            },
+            "overhead_over_5ms": {
+              "value": 2.0,
+              "above": null,
+              "samples": null,
+              "reason": null
+            },
+            "overhead_p99_ms": {
+              "value": 0.328447,
+              "above": 0.328191,
+              "samples": 374994,
+              "rank": 371245,
+              "reason": null
+            },
+            "p50_ms": {
+              "value": 0.111423,
+              "above": 0.111359,
+              "samples": 374994,
+              "rank": 187497,
+              "reason": null
+            },
+            "p95_ms": {
+              "value": 0.179327,
+              "above": 0.179199,
+              "samples": 374994,
+              "rank": 356245,
+              "reason": null
+            },
+            "p99_ms": {
+              "value": 0.329983,
+              "above": 0.329727,
+              "samples": 374994,
+              "rank": 371245,
+              "reason": null
+            },
+            "phase_admit_max_ms": {
+              "value": 1.663999,
+              "above": 1.662975,
+              "samples": 374994,
+              "rank": 374994,
+              "reason": null
+            },
+            "phase_admit_p99_ms": {
+              "value": 0.008167,
+              "above": 0.008163,
+              "samples": 374994,
+              "rank": 371245,
+              "reason": null
+            },
+            "phase_engine_max_ms": {
+              "value": 8.421375,
+              "above": 8.413183,
+              "samples": 374994,
+              "rank": 374994,
+              "reason": null
+            },
+            "phase_engine_p99_ms": {
+              "value": 0.036863,
+              "above": 0.036831,
+              "samples": 374994,
+              "rank": 371245,
+              "reason": null
+            },
+            "phase_load_max_ms": {
+              "value": 1.370111,
+              "above": 1.369087,
+              "samples": 374994,
+              "rank": 374994,
+              "reason": null
+            },
+            "phase_load_p99_ms": {
+              "value": 0.005543,
+              "above": 0.005539,
+              "samples": 374994,
+              "rank": 371245,
+              "reason": null
+            },
+            "phase_outside_max_ms": {
+              "value": 4.098047,
+              "above": 4.095999,
+              "samples": 374994,
+              "rank": 374994,
+              "reason": null
+            },
+            "phase_outside_p99_ms": {
+              "value": 0.187519,
+              "above": 0.187391,
+              "samples": 374994,
+              "rank": 371245,
+              "reason": null
+            },
+            "phase_prepare_max_ms": {
+              "value": null,
+              "above": null,
+              "samples": null,
+              "reason": "no completed `verification.direct.prepare` time in the window"
+            },
+            "phase_prepare_p99_ms": {
+              "value": null,
+              "above": null,
+              "samples": null,
+              "reason": "no completed `verification.direct.prepare` time in the window"
+            },
+            "phase_stage_max_ms": {
+              "value": 18.464767,
+              "above": 18.448383,
+              "samples": 374994,
+              "rank": 374994,
+              "reason": null
+            },
+            "phase_stage_p99_ms": {
+              "value": 0.066815,
+              "above": 0.066751,
+              "samples": 374994,
+              "rank": 371245,
+              "reason": null
+            },
+            "rate": {
+              "value": 74956.14387353547,
+              "above": null,
+              "samples": null,
+              "reason": null
+            },
+            "server_failures": {
+              "value": 0.0,
+              "above": null,
+              "samples": null,
+              "reason": null
+            },
+            "verifications": {
+              "value": 374930.0,
+              "above": null,
+              "samples": null,
+              "reason": null
+            },
+            "verifications_after_window": {
+              "value": 64.0,
+              "above": null,
+              "samples": null,
+              "reason": null
+            },
+            "verifications_per_cpu_s": {
+              "value": 4218.859007539102,
+              "above": null,
+              "samples": null,
+              "reason": null
+            },
+            "verifications_per_s_per_vcpu": {
+              "value": 2342.3794960479836,
+              "above": null,
+              "samples": null,
+              "reason": null
+            },
+            "verifier_mean_ms": {
+              "value": 0.0013465899987733137,
+              "above": 0.0013465026933764273,
+              "samples": 374994,
+              "reason": null
+            },
+            "verifier_p99_ms": {
+              "value": 0.003167,
+              "above": 0.003165,
+              "samples": 374994,
+              "rank": 371245,
+              "reason": null
+            },
+            "wrong": {
+              "value": 0.0,
+              "above": null,
+              "samples": null,
+              "reason": null
+            }
+          },
+          "arrivals": null,
+          "invalid": [],
+          "observations": [
+            "server timing: 2262717 observations in 15 series, 0 scanned queries",
+            "component outbox_write{outbox=scribe}: 0.0519 ms/call, 56.1074 ms mean over 347",
+            "component bifrost_scribe_lane_job{lane=persistence}: 0.0307 ms/call, 605.6751 ms mean over 19",
+            "component phase_duration{phase=stage}: 0.0295 ms/call, 0.0295 ms mean over 374994",
+            "component phase_duration{phase=engine}: 0.0175 ms/call, 0.0175 ms mean over 374994",
+            "component bifrost_scribe_lane_job{lane=ingress}: 0.0102 ms/call, 1.1448 ms mean over 3353",
+            "component phase_duration{phase=admit}: 0.0041 ms/call, 0.0041 ms mean over 374994",
+            "component bifrost_scribe_lane_job{lane=wal_io}: 0.0035 ms/call, 1.1728 ms mean over 1105",
+            "component bifrost_scribe_wal_fsync{outcome=success}: 0.0030 ms/call, 3.1065 ms mean over 363",
+            "component phase_duration{phase=load}: 0.0027 ms/call, 0.0027 ms mean over 374994",
+            "component block_duration{kind=assert}: 0.0013 ms/call, 0.0003 ms mean over 1499976",
+            "component bifrost_scribe_queue_wait: 0.0003 ms/call, 0.0843 ms mean over 1414",
+            "component bifrost_scribe_wal_append{outcome=success}: 0.0001 ms/call, 0.0153 ms mean over 2828",
+            "component store_duration{op=runnable_scan}: 0.0000 ms/call, 3.1034 ms mean over 5",
+            "component store_duration{op=due_group_scan}: 0.0000 ms/call, 3.0922 ms mean over 5",
+            "component store_duration{op=queue_depth}: 0.0000 ms/call, 1.9791 ms mean over 5"
+          ],
+          "reconciliation": [
+            {
+              "boundary": "verification.direct",
+              "outcome": "completed",
+              "case": "direct-verify",
+              "phase": "repetition-3",
+              "expected": 374994,
+              "recorded": 374994
+            }
+          ]
+        }
+      ],
+      "summary": {
+        "client_p50_ms": {
+          "unit": "ms",
+          "median": {
+            "value": 0.761,
+            "above": null,
+            "samples": 362023,
+            "reason": null
+          },
+          "min": 0.752,
+          "max": 0.786,
+          "spread": 0.03400000000000003
+        },
+        "client_p95_ms": {
+          "unit": "ms",
+          "median": {
+            "value": 1.594,
+            "above": null,
+            "samples": 362023,
+            "reason": null
+          },
+          "min": 1.569,
+          "max": 1.662,
+          "spread": 0.09299999999999997
+        },
+        "client_p99_ms": {
+          "unit": "ms",
+          "median": {
+            "value": 2.206,
+            "above": null,
+            "samples": 362023,
+            "reason": null
+          },
+          "min": 2.179,
+          "max": 2.3,
+          "spread": 0.121
+        },
+        "cores": {
+          "unit": "cores",
+          "median": {
+            "value": 17.76692317510228,
+            "above": null,
+            "samples": null,
+            "reason": null
+          },
+          "min": 17.46472770259285,
+          "max": 17.854958631004582,
+          "spread": 0.39023092841173224
+        },
+        "cpu_us_per_verification": {
+          "unit": "µs/verification",
+          "median": {
+            "value": 237.03091243698825,
+            "above": null,
+            "samples": null,
+            "reason": null
+          },
+          "min": 230.32482788262004,
+          "max": 246.71302550841392,
+          "spread": 16.38819762579388
+        },
+        "drain_seconds": {
+          "unit": "",
+          "median": {
+            "value": 0.031192594,
+            "above": null,
+            "samples": null,
+            "reason": null
+          },
+          "min": 0.028013477,
+          "max": 0.039126855,
+          "spread": 0.011113378000000004
+        },
+        "errors": {
+          "unit": "errors",
+          "median": {
+            "value": 0.0,
+            "above": null,
+            "samples": null,
+            "reason": null
+          },
+          "min": 0.0,
+          "max": 0.0,
+          "spread": 0.0
+        },
+        "lost_writes": {
+          "unit": "writes",
+          "median": {
+            "value": 0.0,
+            "above": null,
+            "samples": null,
+            "reason": null
+          },
+          "min": 0.0,
+          "max": 0.0,
+          "spread": 0.0
+        },
+        "max_ms": {
+          "unit": "",
+          "median": {
+            "value": 15.876095,
+            "above": 15.867903,
+            "samples": 362023,
+            "reason": null
+          },
+          "min": null,
+          "max": null,
+          "spread": null
+        },
+        "overhead_max_ms": {
+          "unit": "ms",
+          "median": {
+            "value": 15.876095,
+            "above": 15.867903,
+            "samples": 362023,
+            "reason": null
+          },
+          "min": null,
+          "max": null,
+          "spread": null
+        },
+        "overhead_mean_ms": {
+          "unit": "ms",
+          "median": {
+            "value": 0.11742614483965076,
+            "above": 0.11734845463927422,
+            "samples": 362023,
+            "reason": null
+          },
+          "min": null,
+          "max": null,
+          "spread": null
+        },
+        "overhead_over_10ms": {
+          "unit": "verifications",
+          "median": {
+            "value": 3.0,
+            "above": null,
+            "samples": null,
+            "reason": null
+          },
+          "min": 1.0,
+          "max": 3.0,
+          "spread": 2.0
+        },
+        "overhead_over_1ms": {
+          "unit": "verifications",
+          "median": {
+            "value": 614.0,
+            "above": 614.0,
+            "samples": null,
+            "reason": null
+          },
+          "min": null,
+          "max": null,
+          "spread": null
+        },
+        "overhead_over_500us": {
+          "unit": "verifications",
+          "median": {
+            "value": 2272.0,
+            "above": 2270.0,
+            "samples": null,
+            "reason": null
+          },
+          "min": null,
+          "max": null,
+          "spread": null
+        },
+        "overhead_over_5ms": {
+          "unit": "verifications",
+          "median": {
+            "value": 6.0,
+            "above": null,
+            "samples": null,
+            "reason": null
+          },
+          "min": 2.0,
+          "max": 6.0,
+          "spread": 4.0
+        },
+        "overhead_p99_ms": {
+          "unit": "ms",
+          "median": {
+            "value": 0.349951,
+            "above": 0.349695,
+            "samples": 362023,
+            "reason": null
+          },
+          "min": null,
+          "max": null,
+          "spread": null
+        },
+        "p50_ms": {
+          "unit": "ms",
+          "median": {
+            "value": 0.111359,
+            "above": 0.111295,
+            "samples": 362023,
+            "reason": null
+          },
+          "min": null,
+          "max": null,
+          "spread": null
+        },
+        "p95_ms": {
+          "unit": "ms",
+          "median": {
+            "value": 0.179327,
+            "above": 0.179199,
+            "samples": 362023,
+            "reason": null
+          },
+          "min": null,
+          "max": null,
+          "spread": null
+        },
+        "p99_ms": {
+          "unit": "ms",
+          "median": {
+            "value": 0.352255,
+            "above": 0.351999,
+            "samples": 362023,
+            "reason": null
+          },
+          "min": null,
+          "max": null,
+          "spread": null
+        },
+        "phase_admit_max_ms": {
+          "unit": "ms",
+          "median": {
+            "value": 2.824191,
+            "above": 2.822143,
+            "samples": 362023,
+            "reason": null
+          },
+          "min": null,
+          "max": null,
+          "spread": null
+        },
+        "phase_admit_p99_ms": {
+          "unit": "ms",
+          "median": {
+            "value": 0.008167,
+            "above": 0.008163,
+            "samples": 362023,
+            "reason": null
+          },
+          "min": null,
+          "max": null,
+          "spread": null
+        },
+        "phase_engine_max_ms": {
+          "unit": "ms",
+          "median": {
+            "value": 11.665407,
+            "above": 11.657215,
+            "samples": 362023,
+            "reason": null
+          },
+          "min": null,
+          "max": null,
+          "spread": null
+        },
+        "phase_engine_p99_ms": {
+          "unit": "ms",
+          "median": {
+            "value": 0.036863,
+            "above": 0.036831,
+            "samples": 362023,
+            "reason": null
+          },
+          "min": null,
+          "max": null,
+          "spread": null
+        },
+        "phase_load_max_ms": {
+          "unit": "ms",
+          "median": {
+            "value": 1.646591,
+            "above": 1.645567,
+            "samples": 362023,
+            "reason": null
+          },
+          "min": null,
+          "max": null,
+          "spread": null
+        },
+        "phase_load_p99_ms": {
+          "unit": "ms",
+          "median": {
+            "value": 0.005543,
+            "above": 0.005539,
+            "samples": 362023,
+            "reason": null
+          },
+          "min": null,
+          "max": null,
+          "spread": null
+        },
+        "phase_outside_max_ms": {
+          "unit": "ms",
+          "median": {
+            "value": 4.098047,
+            "above": 4.095999,
+            "samples": 362023,
+            "reason": null
+          },
+          "min": null,
+          "max": null,
+          "spread": null
+        },
+        "phase_outside_p99_ms": {
+          "unit": "ms",
+          "median": {
+            "value": 0.201727,
+            "above": 0.201599,
+            "samples": 362023,
+            "reason": null
+          },
+          "min": null,
+          "max": null,
+          "spread": null
+        },
+        "phase_prepare_max_ms": {
+          "unit": "ms",
+          "median": {
+            "value": null,
+            "above": null,
+            "samples": null,
+            "reason": "no completed `verification.direct.prepare` time in the window"
+          },
+          "min": null,
+          "max": null,
+          "spread": null
+        },
+        "phase_prepare_p99_ms": {
+          "unit": "ms",
+          "median": {
+            "value": null,
+            "above": null,
+            "samples": null,
+            "reason": "no completed `verification.direct.prepare` time in the window"
+          },
+          "min": null,
+          "max": null,
+          "spread": null
+        },
+        "phase_stage_max_ms": {
+          "unit": "ms",
+          "median": {
+            "value": 15.794175,
+            "above": 15.785983,
+            "samples": 362023,
+            "reason": null
+          },
+          "min": null,
+          "max": null,
+          "spread": null
+        },
+        "phase_stage_p99_ms": {
+          "unit": "ms",
+          "median": {
+            "value": 0.066815,
+            "above": 0.066751,
+            "samples": 362023,
+            "reason": null
+          },
+          "min": null,
+          "max": null,
+          "spread": null
+        },
+        "rate": {
+          "unit": "verifications/s",
+          "median": {
+            "value": 74956.14387353547,
+            "above": null,
+            "samples": null,
+            "reason": null
+          },
+          "min": 72371.36585800434,
+          "max": 75826.50929622473,
+          "spread": 3455.143438220388
+        },
+        "server_failures": {
+          "unit": "verifications",
+          "median": {
+            "value": 0.0,
+            "above": null,
+            "samples": null,
+            "reason": null
+          },
+          "min": 0.0,
+          "max": 0.0,
+          "spread": 0.0
+        },
+        "verifications": {
+          "unit": "verifications",
+          "median": {
+            "value": 374930.0,
+            "above": null,
+            "samples": null,
+            "reason": null
+          },
+          "min": 361959.0,
+          "max": 379247.0,
+          "spread": 17288.0
+        },
+        "verifications_after_window": {
+          "unit": "",
+          "median": {
+            "value": 64.0,
+            "above": null,
+            "samples": null,
+            "reason": null
+          },
+          "min": 64.0,
+          "max": 64.0,
+          "spread": 0.0
+        },
+        "verifications_per_cpu_s": {
+          "unit": "verifications/cpu-s",
+          "median": {
+            "value": 4218.859007539102,
+            "above": null,
+            "samples": null,
+            "reason": null
+          },
+          "min": 4053.292273236282,
+          "max": 4341.69433314253,
+          "spread": 288.4020599062478
+        },
+        "verifications_per_s_per_vcpu": {
+          "unit": "verifications/s/vCPU",
+          "median": {
+            "value": 2342.3794960479836,
+            "above": null,
+            "samples": null,
+            "reason": null
+          },
+          "min": 2261.6051830626357,
+          "max": 2369.578415507023,
+          "spread": 107.97323244438712
+        },
+        "verifier_mean_ms": {
+          "unit": "ms",
+          "median": {
+            "value": 0.0013486330478156446,
+            "above": 0.0013485352309846011,
+            "samples": 362023,
+            "reason": null
+          },
+          "min": null,
+          "max": null,
+          "spread": null
+        },
+        "verifier_p99_ms": {
+          "unit": "ms",
+          "median": {
+            "value": 0.003167,
+            "above": 0.003165,
+            "samples": 362023,
+            "reason": null
+          },
+          "min": null,
+          "max": null,
+          "spread": null
+        },
+        "wrong": {
+          "unit": "verifications",
+          "median": {
+            "value": 0.0,
+            "above": null,
+            "samples": null,
+            "reason": null
+          },
+          "min": 0.0,
+          "max": 0.0,
+          "spread": 0.0
+        }
+      },
+      "criteria": [
+        {
+          "criterion": "overhead-p99",
+          "observed": {
+            "value": 0.349951,
+            "above": 0.349695,
+            "samples": 362023,
+            "reason": null
+          },
+          "values": [
+            {
+              "value": 0.349951,
+              "above": 0.349695,
+              "samples": 379311,
+              "rank": 375518,
+              "reason": null
+            },
+            {
+              "value": 0.353535,
+              "above": 0.353279,
+              "samples": 362023,
+              "rank": 358403,
+              "reason": null
+            },
+            {
+              "value": 0.328447,
+              "above": 0.328191,
+              "samples": 374994,
+              "rank": 371245,
+              "reason": null
+            }
+          ],
+          "outcome": "met",
+          "reason": null,
+          "applicable": true
+        },
+        {
+          "criterion": "no-errors",
+          "observed": {
+            "value": 0.0,
+            "above": null,
+            "samples": null,
+            "reason": null
+          },
+          "values": [
+            {
+              "value": 0.0,
+              "above": null,
+              "samples": null,
+              "reason": null
+            },
+            {
+              "value": 0.0,
+              "above": null,
+              "samples": null,
+              "reason": null
+            },
+            {
+              "value": 0.0,
+              "above": null,
+              "samples": null,
+              "reason": null
+            }
+          ],
+          "outcome": "met",
+          "reason": null,
+          "applicable": true
+        },
+        {
+          "criterion": "correct-verdicts",
+          "observed": {
+            "value": 0.0,
+            "above": null,
+            "samples": null,
+            "reason": null
+          },
+          "values": [
+            {
+              "value": 0.0,
+              "above": null,
+              "samples": null,
+              "reason": null
+            },
+            {
+              "value": 0.0,
+              "above": null,
+              "samples": null,
+              "reason": null
+            },
+            {
+              "value": 0.0,
+              "above": null,
+              "samples": null,
+              "reason": null
+            }
+          ],
+          "outcome": "met",
+          "reason": null,
+          "applicable": true
+        },
+        {
+          "criterion": "no-lost-evidence",
+          "observed": {
+            "value": 0.0,
+            "above": null,
+            "samples": null,
+            "reason": null
+          },
+          "values": [
+            {
+              "value": 0.0,
+              "above": null,
+              "samples": null,
+              "reason": null
+            },
+            {
+              "value": 0.0,
+              "above": null,
+              "samples": null,
+              "reason": null
+            },
+            {
+              "value": 0.0,
+              "above": null,
+              "samples": null,
+              "reason": null
+            }
+          ],
+          "outcome": "met",
+          "reason": null,
+          "applicable": true
+        }
+      ],
+      "verdict": "INVALID",
+      "reasons": [
+        {
+          "code": "driver.saturated",
+          "step": "direct-verify-c64",
+          "criterion": null,
+          "message": "repetition 1: the driver used 7.82 cores, over 6.40 (80% of its 8 core budget)"
+        },
+        {
+          "code": "driver.saturated",
+          "step": "direct-verify-c64",
+          "criterion": null,
+          "message": "repetition 2: the driver used 7.55 cores, over 6.40 (80% of its 8 core budget)"
+        },
+        {
+          "code": "driver.saturated",
+          "step": "direct-verify-c64",
+          "criterion": null,
+          "message": "repetition 3: the driver used 7.70 cores, over 6.40 (80% of its 8 core budget)"
+        }
+      ]
+    }
+  ],
+  "validity": {
+    "thresholds": {
+      "host_busy_fraction": 0.1,
+      "host_sample_seconds": 10,
+      "driver_cores": 8.0,
+      "driver_fraction": 0.8,
+      "lateness_p99_us": 5000.0,
+      "p99_samples": 1000,
+      "p95_samples": 200
+    },
+    "host_before": {
+      "logical_cpus": 32,
+      "seconds": 10.040799792,
+      "other_cores": 0.7502182352542874,
+      "busiest": [
+        [
+          "qemu-system-x86",
+          0.20750717163085938
+        ],
+        [
+          "kcompactd0",
+          0.138670654296875
+        ],
+        [
+          "qemu-system-x86",
+          0.05586731433868408
+        ],
+        [
+          "qemu-system-x86",
+          0.05087916374206543
+        ]
+      ]
+    },
+    "host_after": {
+      "logical_cpus": 32,
+      "seconds": 10.038933867,
+      "other_cores": 0.7205364078283292,
+      "busiest": [
+        [
+          "qemu-system-x86",
+          0.24051145553588868
+        ],
+        [
+          "qemu-system-x86",
+          0.06586620807647706
+        ],
+        [
+          "qemu-system-x86",
+          0.06287229061126709
+        ],
+        [
+          "qemu-system-x86",
+          0.06087634563446045
+        ]
+      ]
+    },
+    "budget_seconds": 300,
+    "minimum_seconds": 0,
+    "elapsed_seconds": 69.272653272,
+    "reasons": []
+  },
+  "verdict": "INVALID",
+  "reasons": [
+    {
+      "code": "driver.saturated",
+      "step": "direct-verify-c64",
+      "criterion": null,
+      "message": "repetition 1: the driver used 7.82 cores, over 6.40 (80% of its 8 core budget)"
+    },
+    {
+      "code": "driver.saturated",
+      "step": "direct-verify-c64",
+      "criterion": null,
+      "message": "repetition 2: the driver used 7.55 cores, over 6.40 (80% of its 8 core budget)"
+    },
+    {
+      "code": "driver.saturated",
+      "step": "direct-verify-c64",
+      "criterion": null,
+      "message": "repetition 3: the driver used 7.70 cores, over 6.40 (80% of its 8 core budget)"
+    }
+  ],
+  "artifacts": {
+    "directory": "/home/thorrester/Documents/GitHub/wyrd-worktrees/benchmark-rev19/target/benchmarks/verification/direct-verify/20261031T011840Z",
+    "profile": {
+      "requested": false,
+      "complete": false,
+      "captures": [],
+      "notes": []
+    }
+  },
+  "mode": "full"
+}

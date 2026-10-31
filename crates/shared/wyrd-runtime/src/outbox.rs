@@ -974,12 +974,15 @@ impl<S: OutboxSink> OutboxWriter<S> {
         let mut received = Vec::new();
         let mut open = true;
         loop {
-            self.dispatch();
+            // One instant for both, so a lane `dispatch` finds still lingering
+            // is one `next_wake` still waits for.
+            let now = Instant::now();
+            self.dispatch(now);
             if !open && self.waiting.is_empty() && self.failed.is_empty() && self.writing.is_empty()
             {
                 return;
             }
-            let retry = self.next_wake();
+            let retry = self.next_wake(now);
             tokio::select! {
                 biased;
                 () = self.abandon.cancelled() => return,
@@ -1022,11 +1025,10 @@ impl<S: OutboxSink> OutboxWriter<S> {
     /// The write task keeps its items through a panicking sink, including a
     /// panic while rendering the sink's error, and returns them with the panic
     /// as the error, so they are retried like any failed write.
-    fn dispatch(&mut self) {
+    fn dispatch(&mut self, now: Instant) {
         if self.writing.len() >= self.concurrency {
             return;
         }
-        let now = Instant::now();
         let mut busy: HashMap<DataTenantId, usize> = HashMap::new();
         for ((tenant, _), ..) in self.in_flight.values() {
             *busy.entry(*tenant).or_default() += 1;
@@ -1150,14 +1152,17 @@ impl<S: OutboxSink> OutboxWriter<S> {
         self.since.get(&lane).map(|since| *since + S::LINGER)
     }
 
-    /// The earliest future time a failed lane may retry or a lingering lane
-    /// may write, or `None` when no timer is needed because every write slot
-    /// is busy or nothing waits on time.
-    fn next_wake(&self) -> Option<Instant> {
+    /// The earliest time after `now` a failed lane may retry or a lingering
+    /// lane may write, or `None` when no timer is needed because every write
+    /// slot is busy or nothing waits on time.
+    ///
+    /// `now` must be the instant the preceding [`Self::dispatch`] judged
+    /// readiness at: a lane it left lingering then has its deadline after
+    /// `now`, so the writer always wakes for it.
+    fn next_wake(&self, now: Instant) -> Option<Instant> {
         if self.writing.len() >= self.concurrency {
             return None;
         }
-        let now = Instant::now();
         let retries = self
             .retry_at
             .iter()
@@ -1586,6 +1591,66 @@ mod tests {
         );
         let written = outbox.sink().written.lock().expect("unpoisoned").clone();
         assert_eq!(written, [vec![1, 2], vec![3, 4, 5]]);
+    }
+
+    /// Proves the writer judges a lane's readiness and its next wake at one
+    /// instant: a lane one tick short of its linger is left waiting with a
+    /// wake at its deadline, and at that deadline it is written.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the short lane is written, has no wake at its deadline,
+    /// or is not written at it, or the monotonic clock is not yet one linger
+    /// past its origin.
+    #[tokio::test]
+    async fn a_lane_short_of_its_linger_keeps_a_wake_at_its_deadline() {
+        let (_queue, requests) = tokio::sync::mpsc::unbounded_channel();
+        let mut writer = super::OutboxWriter {
+            sink: Arc::new(LingerSink::default()),
+            requests,
+            waiting: HashMap::new(),
+            since: HashMap::new(),
+            closed: false,
+            failed: HashMap::new(),
+            writing: tokio::task::JoinSet::new(),
+            in_flight: HashMap::new(),
+            retry_at: HashMap::new(),
+            concurrency: 1,
+            pending: Arc::default(),
+            admission: Arc::default(),
+            idle: Arc::default(),
+            abandon: tokio_util::sync::CancellationToken::new(),
+        };
+        let lane = (DataTenantId::new_v7(), 0);
+        // The deadline has already passed on the clock, as it can between
+        // the writer's dispatch and its wake.
+        let since = Instant::now()
+            .checked_sub(LingerSink::LINGER + Duration::from_secs(1))
+            .expect("the monotonic clock is past one linger");
+        writer.since.insert(lane, since);
+        writer
+            .waiting
+            .entry(lane)
+            .or_default()
+            .0
+            .push((1_u32, super::Load::default()));
+        let deadline = since + LingerSink::LINGER;
+        let short = deadline
+            .checked_sub(Duration::from_nanos(1))
+            .expect("the deadline is past one tick");
+        writer.dispatch(short);
+        assert!(writer.writing.is_empty(), "a lingering lane was written");
+        assert_eq!(
+            writer.next_wake(short),
+            Some(deadline),
+            "a lingering lane has no wake at its deadline"
+        );
+        writer.dispatch(deadline);
+        assert_eq!(
+            writer.writing.len(),
+            1,
+            "the lane is written at its deadline"
+        );
     }
 
     /// A two-lane sink, odd items in lane 1 and even in lane 0, that records

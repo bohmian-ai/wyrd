@@ -1,12 +1,12 @@
 ---
 id: SPEC-storage-upload-consolidation
-revision: 1
+revision: 2
 status: approved
 ---
 
 # Shared uploads and one Bifrost object inventory
 
-## Problem and approved direction
+## Problem and proposed direction
 
 Artifact files and verification `File` inputs upload bytes to tenant object
 storage but use different planning and recording workflows. Artifact files
@@ -39,17 +39,25 @@ branch. Consolidation is a separate follow-up change on their combined result.
 The Artifact upload interfaces from PR 216 and the benchmark branch's
 verification plumbing must both survive integration.
 
+Nothing has shipped. This change targets a fresh installation of the combined
+baseline; preserving existing deployment data or upgrading a deployed inventory
+is not required. No data migration, backfill, staged rollout, old-writer drain,
+or mixed-version serving support is in scope.
+
 The maintainer explicitly approved the narrowed proposal on 2026-10-27 and
 requested this specification, including verification table ownership and
 evidence resolution. Approval covers the conditional upload-only ACK behavior
 below; it does not authorize unrelated reliability or storage work. No
 implementation tasks are created by this specification.
+Revision 2 incorporates the maintainer's correction that nothing has shipped
+and removes the migration requirements. The maintainer approved proceeding
+with this revision by requesting planning after the revision handoff.
 
 ## Scope and costs
 
 The change covers upload planning, transfer and completion reuse; one Bifrost
 inventory; replacing its former readers; canonical verification evidence
-assembly; and the necessary metadata cutover and contract projections.
+assembly; and the necessary contract projections. It includes no migration work.
 
 An upload-only ACK wait can increase upload-completion latency. Bifrost inventory
 resolution adds query work to File verification and replaces the existing
@@ -102,12 +110,12 @@ for storage identity, declared digest, and Card binding. Its contract contains:
 |---|---|
 | Storage identity and location | The tenant-qualified stored object; existing upload identity associates transfer retries where present. No new public object-ID system is required. |
 | Backend | The existing configured storage backend. |
-| Declared SHA-256 | The existing storage digest representation, normalized for lookup against File declarations. Absent only when the existing envelope or historical metadata supplies no digest. |
-| Size in bytes | The existing completion size, or object metadata size during backfill. |
+| Declared SHA-256 | The existing storage digest representation, normalized for lookup against File declarations. Absent only when the existing envelope write supplies no digest. |
+| Size in bytes | The existing completion or envelope-write size. |
 | Content type and encryption marker | Existing metadata, nullable when unavailable. |
 | Origin | Card file, File upload, or Card envelope; this is not an authorization grant. |
 | Optional Card UID and relative path | The exact Card binding; envelope records are distinguishable from listed artifact files. |
-| Recording time | The inventory recording instant, not an invented historical upload time. |
+| Recording time | The inventory recording instant. |
 | Completion or existing deletion fact | Distinguishes an available completed object from one removed by the existing lifecycle. |
 
 Transport retries and reconstructed completion retries identify the same
@@ -120,7 +128,7 @@ logical object deduplication.
 **REQ-005 — Replace all inventory consumers.** Artifact listing, Card hydration,
 download initialization, cleanup's inventory reads, and verification obtain
 completed-object facts from Bifrost. Remove
-`wyrd.storage_artifact_metadata` as a serving authority after cutover. Existing
+`wyrd.storage_artifact_metadata` as a serving authority. Existing
 Card pointers may continue to identify their objects; they do not provide an
 alternate inventory when the Bifrost record is unavailable.
 
@@ -227,7 +235,7 @@ authorization check remains. Existing target-cache misses, queue coordination,
 and Bifrost's own catalog/fence SQL are unchanged. This is not a claim that
 every transitive operation in verification is Postgres-free.
 
-### Authorization, public surfaces, and cutover
+### Authorization, public surfaces, and fresh installation
 
 **REQ-015 — Existing authority.** File upload admission keeps operation-level
 `verifier:run`; invoking a Verifier keeps its exact invocation permission.
@@ -248,21 +256,11 @@ it cannot own a separate planner, transfer, or completion workflow. Remove the
 evidence-only local route and obsolete contracts without compatibility aliases.
 Update generated contracts, authored stubs, and examples through their owners.
 
-**REQ-017 — One-authority cutover.** Coordinate migration after the combined
-baseline lands. Pause affected admission and drain old writers before switching
-authority; no mixed serving phase reads or writes two inventories. Backfill
-Card-file metadata from the existing inventory, Card-envelope references from
-Card metadata, and File metadata from existing tenant object names and object
-metadata. Do not add full-content hashing to migration or invent unavailable
-historical digests, uploaders, or upload times. Existing physical keys and
-declaration shapes need no relocation or rewriting for this cutover.
-
-Reconcile source coverage and backfill visibility before enabling new readers;
-unresolved missing objects or unrepresentable metadata block cutover and are
-reported. Switch all consumers before removing the Postgres inventory and old
-routes. Pending transfers must be drained or explicitly stopped under their
-existing lifecycle, not silently abandoned. Use the existing migration/backup
-and recovery contract; no old serving replica may remain after contraction.
+**REQ-017 — Fresh-install authority.** A fresh installation creates and uses
+only the consolidated completed-object inventory. Remove the obsolete Postgres
+inventory and evidence-only routes from the resulting installation contract.
+Nothing has shipped, so no existing-object migration, metadata backfill,
+admission pause, old-writer drain, or mixed-version compatibility is required.
 
 **REQ-018 — Existing deletion behavior.** Preserve current explicit Card/object
 deletion and evidence retention behavior. Reflect an existing deletion in the
@@ -310,7 +308,7 @@ backend integration uses the existing local/emulator/cloud lanes as appropriate.
 | AC-005 Canonical queries | Read direct, submitted, group, and scheduled evidence/results. Inputs/selectors, outputs, and summaries reconstruct the expected response without copied evidence payloads in other stores. | REQ-009, REQ-012, INV-005 |
 | AC-006 Delayed visibility | Delay or make the inventory unreadable after transfer. Verification returns a bounded retryable readiness failure, never guesses a path or consults a second inventory. A corrupt byte read still fails its existing digest check. | REQ-013, INV-004 |
 | AC-007 Isolation and permissions | Try foreign-tenant digests, Card paths, uploads, and inventory writes with insufficient authority. No cross-tenant result or privilege widening occurs; normal operation permissions still suffice. | REQ-015, INV-002 |
-| AC-008 Cutover and deletion | Rehearse backfill from both prior upload paths and Card envelopes, then remove the old inventory/routes. Metadata-only migration preserves existing references; current explicit deletion is reflected and cannot be undone by completion replay. | REQ-017–018 |
+| AC-008 Fresh installation and deletion | Start a fresh installation and upload Card files, Card envelopes, and File inputs. Only the consolidated inventory serves these objects; the obsolete Postgres inventory and evidence-only routes are absent. Current explicit deletion is reflected and cannot be undone by completion replay. | REQ-017–018 |
 
 Compare upload-completion and verification measurements with the combined
 baseline through its existing applicable performance lanes. Demonstrate ACK
@@ -322,7 +320,7 @@ Exact test selectors and the minimal lane closure belong in the later task packe
 
 ## Authority reconciliation and inspected owners
 
-The approved changes require the following narrow architecture updates with
+The proposed changes require the following narrow architecture updates with
 implementation. Existing wording describes the old behavior; it is not a second
 permitted serving contract. Do not use this change to rewrite unrelated sections.
 
@@ -332,7 +330,6 @@ permitted serving contract. Do not use this change to rewrite unrelated sections
 | [Wyrd design: Registry lifecycle](../../../architecture/wyrd-design.md#registry-lifecycle) | Keep Card metadata/activation and expected manifests in Postgres; distinguish Card object references from completed-object inventory. |
 | [Bifrost design](../../../architecture/bifrost-design.md#public-surface) | Declare the new built-in, scoped reads and internal-only writes; retain the benchmark's inputs/outputs/summary split, Scribe ACK meaning, and live-query limits. |
 | [Security posture](../../../architecture/wyrd-security-posture.md#principal-and-credential-lifecycle) | Add only the inventory peer destination and scoped internal read; preserve tenant attribution and the non-blocking audit contract. |
-| [Operations migration contract](../../../architecture/operations/deployment-and-release.md#migration-contract) | Document coordinated inventory cutover, old-writer drain, coverage checks, and recovery under existing migration rules. |
 
 Repository facts were inspected on PR 216's upload implementation and benchmark
 head `d86cf238e058c2940027e72f838160a2db431306`. These references explain reuse;
@@ -365,3 +362,4 @@ implementation choices and exact verification commands remain for planning.
 | Revision | Date | Status and approval |
 |---|---|---|
 | 1 | 2026-10-27 | Approved by the maintainer with “Approve” and the request to include verification table consolidation. The independent comprehension pass identified an ambiguous File-reuse scope; the text now explicitly preserves File-only reuse and existing Card deletion lifetimes. The focused recheck found no remaining comprehension gap. Adds no hashing, immutability, retention, or queue-redesign scope. |
+| 2 | 2026-10-27 | Approved by the maintainer's request to proceed with planning after the revision handoff. Nothing has shipped. Removes deployment migration, backfill, drain, and cutover requirements and their operations-documentation obligation. Replaces their acceptance criterion with fresh-install inventory ownership; upload, authorization, deletion, and verification guarantees remain. The independent comprehension pass found no contradiction or missing explanation in the revised baseline and migration scope. |

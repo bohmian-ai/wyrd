@@ -29,6 +29,9 @@ use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 use wyrd_runtime::{Permission, PermissionSet};
+use wyrd_server::components::storage::inventory::{
+    ObjectFact, ObjectInventory, ObjectOrigin, ObjectState,
+};
 use wyrd_server::verification::authority::BackgroundAuthority;
 use wyrd_server::verification::drift::DRIFT_INVALID;
 use wyrd_server::verification::drift::DriftEngine;
@@ -41,6 +44,7 @@ use wyrd_server::verification::runner::{EngineScript, VERIFIER_UNAVAILABLE};
 use wyrd_server::verification::scheduler::{GroupHandoff, VerificationScheduler};
 use wyrd_server::verification::{CapabilityCrash, RuntimeLimits, VerificationRuntime};
 use wyrd_spec::DataTenantId;
+use wyrd_spec::auth::Attribution;
 use wyrd_spec::card::drift::DriftMethod;
 use wyrd_spec::card::trigger::TriggerDuration;
 use wyrd_spec::card::verifier::{Check, DriftBaselineState, OWNER_OCCURRENCE_KEY};
@@ -57,7 +61,6 @@ use wyrd_spec::verification::{
     VerificationError, VerificationVerdict,
 };
 use wyrd_sql::queries::drift_baselines::DriftBaselineQueue;
-use wyrd_sql::queries::storage::artifact_metadata::{self, NewArtifactMetadata};
 use wyrd_sql::queries::verification::{
     BindingActivation, BindingActivity, FrozenTarget, InactivityTimeout, NewBinding,
     binding_activity, project_bindings, record_machine_authentication,
@@ -294,15 +297,19 @@ impl Harness {
             .split_off(self.audit_floor)
     }
 
-    /// Flush the server's Scribe and count the tenant's durable rows per
-    /// `namespace.table`.
+    /// Settle the runtime's result outbox, flush the server's Scribe, and
+    /// count the tenant's durable rows per `namespace.table`.
     ///
-    /// Counts come from the published file list, so a replay Scribe
-    /// deduplicated contributes no rows while a fresh batch does.
+    /// The runtime writes results through the fault outbox, which the
+    /// server flush does not settle, so it settles first. Counts come from
+    /// the published file list, so a replay Scribe deduplicated contributes
+    /// no rows while a fresh batch does.
     ///
     /// # Panics
-    /// Panics when the flush or the file-list read fails.
+    /// Panics when staged results stay unwritten, or the flush or the
+    /// file-list read fails.
     async fn durable_rows(&self) -> BTreeMap<String, i64> {
+        self.fault.sent().await;
         self.server
             .flush_bifrost()
             .await
@@ -898,6 +905,7 @@ async fn attempts_record_queue_wait_phases_terminal_latency_and_one_trace() {
                 span.name == "verification.attempt"
                     && span.attributes.get("execution_id") == Some(&execution.to_string())
                     && span.attributes.get("attempt").map(String::as_str) == Some(attempt)
+                    && span.attributes.get("outcome").map(String::as_str) != Some("deferred")
             })
             .unwrap_or_else(|| panic!("attempt {attempt} of {execution} is traced: {spans:#?}"))
     };
@@ -2713,12 +2721,13 @@ async fn claim_committed_after_cancellation_is_released_unexecuted() {
         .expect("hold function drops");
 }
 
-/// Write a small Parquet artifact for `data` and register its metadata, so a
+/// Write a small Parquet artifact for `data` and record it in the object
+/// inventory, so a
 /// fit of a baseline pinned to `data` decodes and settles `ready`.
 ///
 /// # Panics
-/// Panics when the Parquet encode, the storage write, or the metadata insert
-/// fails.
+/// Panics when the Parquet encode, the storage write, or the inventory
+/// record fails.
 async fn baseline_artifact(server: &WyrdTestServer, seed: &VerificationFixture, data: &CardUid) {
     let schema = Arc::new(Schema::new(vec![Field::new(
         "latency_ms",
@@ -2743,28 +2752,23 @@ async fn baseline_artifact(server: &WyrdTestServer, seed: &VerificationFixture, 
         .put_object(&object, bytes.clone())
         .await
         .expect("artifact writes");
-    let mut conn = server
-        .state()
-        .postgres
-        .wyrd()
-        .tenant_conn(seed.tenant())
+    let fact = ObjectFact {
+        storage_path: path,
+        upload_id: None,
+        backend: storage.backend().to_string(),
+        sha256: Some(sha256),
+        size_bytes: i64::try_from(bytes.len()).expect("artifact size fits"),
+        content_type: Some("application/vnd.apache.parquet".to_owned()),
+        sse_marker: None,
+        origin: ObjectOrigin::CardFile,
+        card_uid: Some(data.clone()),
+        relative_path: Some("data/data.parquet".to_owned()),
+        state: ObjectState::Completed,
+    };
+    ObjectInventory::new(server.state())
+        .record(seed.tenant(), Attribution::unresolved(), &[fact])
         .await
-        .expect("tenant connection opens");
-    artifact_metadata::insert(
-        &mut conn,
-        NewArtifactMetadata {
-            storage_path: &path,
-            card_uid: data.as_str(),
-            size_bytes: i64::try_from(bytes.len()).expect("artifact size fits"),
-            sha256: &sha256,
-            content_type: Some("application/vnd.apache.parquet"),
-            sse_marker: None,
-            backend: storage.backend(),
-        },
-    )
-    .await
-    .expect("artifact metadata inserts");
-    conn.commit().await.expect("artifact metadata commits");
+        .expect("the artifact is recorded in the object inventory");
 }
 
 /// Read `(state, attempts)` of `verifier`'s baseline row.
@@ -2800,7 +2804,7 @@ fn fitter(harness: &Harness, drain_grace: Duration, gate: &FitGate) -> Arc<Basel
                 .postgres
                 .operator_pool()
                 .expect("server has an operator pool"),
-            Arc::clone(&state.storage),
+            state.clone(),
             &limits,
         )
         .with_fit_gate(gate.clone()),

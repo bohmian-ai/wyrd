@@ -2326,6 +2326,15 @@ complicates recovery for negligible authoring benefit, so v1 refuses
 it. Presigned upload URLs are tenant-scoped, `PUT`-only,
 single-artifact, and expire after 3600s.
 
+PostgreSQL coordinates manifests and upload sessions; it keeps no inventory
+of completed objects. Every completed artifact, envelope, and deletion is a
+row in `bifrost.storage.objects` (see the Bifrost authority), and Card
+listing, hydration, downloads, and drift baseline fitting all resolve a
+Card's files there. Activation re-verifies each declared upload and records
+it before the Card turns `Active`. A manifest entry that is complete in
+PostgreSQL but not yet visible in the inventory answers the retryable
+`WYRD_VALA_503_QUERY_VISIBILITY_UNAVAILABLE`.
+
 ### Idempotency
 
 Idempotency is a client responsibility. The `Idempotency-Key` header is

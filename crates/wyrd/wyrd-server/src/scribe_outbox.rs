@@ -60,7 +60,7 @@ use chrono::Utc;
 use futures_util::StreamExt as _;
 use futures_util::stream::FuturesUnordered;
 use sha2::{Digest, Sha256};
-use tokio::sync::{OwnedSemaphorePermit, Semaphore};
+use tokio::sync::{OwnedSemaphorePermit, Semaphore, oneshot};
 use uuid::Uuid;
 use vala_bifrost_redux::catalog::TableRef;
 use vala_bifrost_redux::cluster::ClusterRegistry;
@@ -73,6 +73,7 @@ use vala_bifrost_redux::oracle::dispatcher::BifrostPeerTls;
 use vala_bifrost_redux::tables::audit::projection::stage_audit_event;
 use vala_bifrost_redux::tables::gateway::CallsTable;
 use vala_bifrost_redux::tables::staged::StagedRow;
+use vala_bifrost_redux::tables::storage::ObjectsTable;
 use vala_bifrost_redux::tables::traces::project_resource_spans;
 use vala_bifrost_redux::tables::{
     AuditLogTable, DomainTable, ExecutionInputsTable, ExecutionOutputsTable, ResultsTable,
@@ -230,6 +231,21 @@ pub enum ScribeWrite {
         /// is staged or retried and released once it is written, consumed,
         /// or abandoned.
         permit: OwnedSemaphorePermit,
+    },
+    /// One storage object's completion or deletion fact, staged as its
+    /// `bifrost.storage.objects` row.
+    Object {
+        /// The `bifrost.storage.objects` row.
+        row: StagedRow,
+        /// The object's Card subject and the acting caller, which Scribe
+        /// stamps on the row.
+        attribution: Attribution,
+        /// Fired once Scribe acknowledges the frame holding this row, and
+        /// only then: a rejected, unprojectable, or dropped write drops the
+        /// sender instead. Firing never blocks, so the waiting caller holds
+        /// no other write. Taken under its lock because the sink sees the
+        /// slice by reference.
+        acked: Mutex<Option<oneshot::Sender<()>>>,
     },
 }
 
@@ -410,6 +426,13 @@ impl ScribeWrite {
                 attribution: *attribution,
                 part: Part::Batch(project_spans(spans).ok_or("projection")?),
             }]),
+            Self::Object {
+                row, attribution, ..
+            } => Ok(vec![Rows {
+                table: ScribeTable::Objects,
+                attribution: *attribution,
+                part: Part::Row(row.clone()),
+            }]),
         }
     }
 
@@ -431,7 +454,9 @@ impl ScribeWrite {
                 .iter()
                 .find(|row| ScribeTable::from_fqn(row.table) == Some(ScribeTable::Results))
                 .map(|row| &row.row)?,
-            Self::Audit(_) | Self::Capture(_) | Self::ServerSpans { .. } => return None,
+            Self::Audit(_) | Self::Capture(_) | Self::ServerSpans { .. } | Self::Object { .. } => {
+                return None;
+            }
         };
         let cell = |name: &str| row.text(name);
         let group_id = GroupId::new(cell("group_id")?).ok()?;
@@ -445,7 +470,8 @@ impl ScribeWrite {
 }
 
 /// The destinations the Scribe outbox writes: retained audit history, the two
-/// gateway capture tables, and the three Verifier tables.
+/// gateway capture tables, the three Verifier tables, and the storage object
+/// inventory.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ScribeTable {
     /// `bifrost.system.audit_log`, one row per authorization decision.
@@ -461,17 +487,20 @@ pub enum ScribeTable {
     ExecutionOutputs,
     /// `bifrost.verification.execution_inputs`, one row per execution's inputs.
     ExecutionInputs,
+    /// `bifrost.storage.objects`, one row per completed or deleted object.
+    Objects,
 }
 
 impl ScribeTable {
     /// Every destination, in a fixed order.
-    const ALL: [Self; 6] = [
+    const ALL: [Self; 7] = [
         Self::AuditLog,
         Self::Calls,
         Self::Spans,
         Self::Results,
         Self::ExecutionOutputs,
         Self::ExecutionInputs,
+        Self::Objects,
     ];
 
     /// Fully qualified table name, which the peer RPC carries.
@@ -484,6 +513,7 @@ impl ScribeTable {
             Self::Results => "bifrost.verification.results",
             Self::ExecutionOutputs => "bifrost.verification.execution_outputs",
             Self::ExecutionInputs => "bifrost.verification.execution_inputs",
+            Self::Objects => "bifrost.storage.objects",
         }
     }
 
@@ -511,6 +541,7 @@ impl ScribeTable {
             Self::ExecutionInputs => {
                 TableRef::new(BifrostNamespace::Verification, ExecutionInputsTable::NAME)
             }
+            Self::Objects => TableRef::new(BifrostNamespace::Storage, ObjectsTable::NAME),
         }
     }
 }
@@ -1448,17 +1479,19 @@ impl Chunk {
 }
 
 impl ScribeSink {
-    /// Submits every frame of `frames` along `route` for write `attempt`,
-    /// keeping up to [`FRAMES_IN_FLIGHT`] chunks encoding or awaiting
-    /// acknowledgement.
+    /// Submits every frame of `frames`, the frames of outbox slice `slice`
+    /// from index `first` on, along `route` for write `attempt`, keeping up
+    /// to [`FRAMES_IN_FLIGHT`] chunks encoding or awaiting acknowledgement.
+    /// `items` are the slice's writes.
     ///
     /// Each frame is cut into [`Chunk`]s, and each chunk is concatenated and
     /// encoded on the blocking pool by [`Self::deliver`] only as a slot
     /// frees, so the slice's encoding runs in parallel and at most
     /// [`FRAMES_IN_FLIGHT`] chunks' streams are held at once. Writes whose
     /// rows cannot be encoded, or whose stream Scribe rejects terminally,
-    /// are added to `lost`. After a retryable refusal no further chunk is
-    /// started; those in flight still finish.
+    /// are added to `lost`. Each storage object write of `items` is notified
+    /// as its own frame is acknowledged. After a retryable refusal no further
+    /// chunk is started; those in flight still finish.
     ///
     /// # Errors
     ///
@@ -1474,8 +1507,8 @@ impl ScribeSink {
         &self,
         route: &ScribeRoute,
         tenant: DataTenantId,
-        (slice, first): (Uuid, usize),
-        frames: &[Frame],
+        (slice, items): (Uuid, &[ScribeWrite]),
+        (first, frames): (usize, &[Frame]),
         attempt: usize,
         lost: &mut BTreeSet<usize>,
     ) -> Result<(), ScribeRefusal> {
@@ -1492,7 +1525,7 @@ impl ScribeSink {
             if in_flight.len() == FRAMES_IN_FLIGHT
                 && let Some(done) = in_flight.next().await
             {
-                Self::tally(tenant, done, lost, &mut refused);
+                Self::tally(tenant, items, done, lost, &mut refused);
             }
             if refused.is_some() {
                 break;
@@ -1500,7 +1533,7 @@ impl ScribeSink {
             in_flight.push(Self::deliver(route, tenant, origin, chunk, budget, attempt));
         }
         while let Some(done) = in_flight.next().await {
-            Self::tally(tenant, done, lost, &mut refused);
+            Self::tally(tenant, items, done, lost, &mut refused);
         }
         refused.map_or(Ok(()), Err)
     }
@@ -1561,11 +1594,13 @@ impl ScribeSink {
     }
 
     /// Records one delivered chunk: writes that could not be encoded or
-    /// whose stream was rejected terminally are added to `lost`, and the
-    /// first retryable refusal is kept in `refused` unless an earlier one
-    /// already is.
+    /// whose stream was rejected terminally are added to `lost`, the first
+    /// retryable refusal is kept in `refused` unless an earlier one already
+    /// is, and each storage object write of `items` in an acknowledged stream
+    /// is notified.
     fn tally(
         tenant: DataTenantId,
+        items: &[ScribeWrite],
         (submitted, unencodable): (Vec<Submitted>, Vec<usize>),
         lost: &mut BTreeSet<usize>,
         refused: &mut Option<ScribeRefusal>,
@@ -1573,7 +1608,19 @@ impl ScribeSink {
         lost.extend(unencodable);
         for (result, batch, owners) in submitted {
             match result {
-                Ok(()) => {}
+                Ok(()) => {
+                    for position in owners {
+                        if let Some(ScribeWrite::Object { acked, .. }) = items.get(position)
+                            && let Some(sender) = acked
+                                .lock()
+                                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                                .take()
+                        {
+                            // The waiter may have given up; nothing else is owed.
+                            let _ = sender.send(());
+                        }
+                    }
+                }
                 Err(ScribeRefusal::Rejected) => {
                     tracing::error!(outbox = Self::NAME, %tenant, table = batch.table.fqn(), batch_id = %batch.batch_id, writes = owners.len(), "Scribe rejected a frame terminally; its writes are dropped");
                     lost.extend(owners);
@@ -1608,7 +1655,9 @@ impl OutboxSink for ScribeSink {
     /// [`SubmissionSink::admission_lane`] does, so requests sharing an
     /// idempotency key, or a tenant's scheduled and group candidates, are acknowledged, and
     /// handed to that outbox, in arrival order; its result is staged only
-    /// after the execution was admitted. Server spans take lane 0. No reader relies on cross-batch commit
+    /// after the execution was admitted. A storage object write lanes by its
+    /// `storage_path`, so one object's completion and deletion keep their
+    /// order. Server spans take lane 0. No reader relies on cross-batch commit
     /// order: group lists order by the recorded input time or a declared key.
     fn lane(item: &ScribeWrite) -> u64 {
         let key = match item {
@@ -1623,6 +1672,7 @@ impl OutboxSink for ScribeSink {
                 ..
             } => return SubmissionSink::admission_lane(&queued.admission),
             ScribeWrite::ExecutionInputs { row, .. } => row.row.text("execution_id"),
+            ScribeWrite::Object { row, .. } => row.text("storage_path"),
             ScribeWrite::Audit(None) | ScribeWrite::ServerSpans { .. } => None,
         };
         key.map_or(0, |key| {
@@ -1633,7 +1683,8 @@ impl OutboxSink for ScribeSink {
     }
 
     /// Captured content bytes for a capture, the encoded size of a server
-    /// span, and the memory a staged audit or Verifier row holds, as
+    /// span, and the memory a staged audit, Verifier, or storage object row
+    /// holds, as
     /// [`StagedRow::owned_bytes`].
     fn weight(item: &ScribeWrite) -> usize {
         match item {
@@ -1643,6 +1694,7 @@ impl OutboxSink for ScribeSink {
                 payload.rows().iter().map(ResultRow::owned_bytes).sum()
             }
             ScribeWrite::ExecutionInputs { row, .. } => row.owned_bytes(),
+            ScribeWrite::Object { row, .. } => row.owned_bytes(),
             ScribeWrite::ServerSpans { spans, .. } => spans.encoded_len(),
         }
     }
@@ -1692,8 +1744,8 @@ impl OutboxSink for ScribeSink {
         let frames = Self::frames(items, &mut lost);
         let split = frames.partition_point(|frame| frame.table != ScribeTable::Results);
         let (details, summaries) = frames.split_at(split);
-        for (first, phase) in [(0, details), (split, summaries)] {
-            self.submit(route, tenant, (slice, first), phase, attempt, &mut lost)
+        for phase in [(0, details), (split, summaries)] {
+            self.submit(route, tenant, (slice, items), phase, attempt, &mut lost)
                 .await?;
         }
         self.schedule_groups(tenant, items, &lost).await?;
@@ -1763,9 +1815,12 @@ mod tests {
         ScribeRoute, ScribeSink, ScribeTable, ScribeWrite, ServerSpanSink, StagedRow,
         TENANT_SPAN_PERMITS, concat_batches, frame_budget, payload_ipc,
     };
+    use base64::Engine as _;
+
     use crate::components::gateway::CallCapture;
     use crate::components::gateway::capture_tests::{facts, policy};
     use crate::components::gateway::recording::{Received, RecordingScribe};
+    use crate::components::storage::inventory::{ObjectFact, ObjectOrigin, ObjectState};
     use crate::grpc::capture_peer::ScribeCapturePeerGrpc;
     use crate::verification::results::{InputRecord, ResultPayloadBuilder, ResultRun};
 
@@ -2474,6 +2529,232 @@ mod tests {
             "the replay is identical"
         );
         assert_eq!(summaries(&scribe.inner.received()), 3);
+    }
+
+    /// A Scribe that admits every frame through `inner`, holding each storage
+    /// object frame until `release` has a permit.
+    struct ObjectGate {
+        /// Records every admitted frame and answers scripted refusals.
+        inner: Arc<RecordingScribe>,
+        /// Permits the held object frames wait for.
+        release: tokio::sync::Semaphore,
+        /// Signalled when an object frame arrives.
+        arrived: tokio::sync::Notify,
+    }
+
+    #[async_trait::async_trait]
+    impl Scribe for ObjectGate {
+        /// Always ready.
+        fn is_ready(&self) -> bool {
+            true
+        }
+
+        /// Admits `frame` through the recording Scribe, after a release
+        /// permit when it names the object inventory.
+        ///
+        /// # Errors
+        ///
+        /// Returns the recording Scribe's scripted refusal.
+        ///
+        /// # Panics
+        ///
+        /// Panics when the release semaphore is closed while an object frame
+        /// waits.
+        async fn ingest_frame(
+            &self,
+            frame: ScribeIngressFrame,
+        ) -> Result<FrameAdmission, ScribeError> {
+            if frame.table == ScribeTable::Objects.table_ref() {
+                self.arrived.notify_one();
+                self.release
+                    .acquire()
+                    .await
+                    .expect("the release stays open")
+                    .forget();
+            }
+            self.inner.ingest_frame(frame).await
+        }
+
+        /// Resolves through the recording Scribe.
+        ///
+        /// # Errors
+        ///
+        /// Returns the recording Scribe's resolution error.
+        async fn resolve_write_table(
+            &self,
+            tenant: DataTenantId,
+            table: &TableRef,
+        ) -> Result<TableUid, ScribeError> {
+            self.inner.resolve_write_table(tenant, table).await
+        }
+    }
+
+    /// One completed storage object write at `path`, and the receiver its
+    /// acknowledgement fires.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the fact does not project.
+    fn object(path: &str) -> (ScribeWrite, tokio::sync::oneshot::Receiver<()>) {
+        let fact = ObjectFact {
+            storage_path: path.to_owned(),
+            upload_id: None,
+            backend: "local".to_owned(),
+            sha256: Some(base64::engine::general_purpose::STANDARD.encode([7; 32])),
+            size_bytes: 1,
+            content_type: None,
+            sse_marker: None,
+            origin: ObjectOrigin::CardFile,
+            card_uid: Some(uid()),
+            relative_path: Some("a.txt".to_owned()),
+            state: ObjectState::Completed,
+        };
+        let (sender, acked) = tokio::sync::oneshot::channel();
+        let write = ScribeWrite::Object {
+            row: fact.row().expect("the fact projects"),
+            attribution: background(),
+            acked: Mutex::new(Some(sender)),
+        };
+        (write, acked)
+    }
+
+    /// Whether `acked` has not fired yet.
+    fn pending(acked: &mut tokio::sync::oneshot::Receiver<()>) -> bool {
+        matches!(
+            acked.try_recv(),
+            Err(tokio::sync::oneshot::error::TryRecvError::Empty)
+        )
+    }
+
+    /// Proves an inventory write's acknowledgement is its own and isolated.
+    ///
+    /// While an object frame is held in Scribe its waiter is not notified,
+    /// so a caller's bounded wait times out, and audit, capture, a server
+    /// span copy, and a direct execution's inputs and result in other lanes
+    /// are written meanwhile; a lost ACK is not success, and the waiter is
+    /// notified only once the replayed frame is acknowledged. A terminal
+    /// rejection and a process that reaches no Scribe drop the waiter's
+    /// sender instead, an unknown outcome, never success.
+    ///
+    /// # Panics
+    ///
+    /// Panics when a waiter is notified without its own acknowledgement,
+    /// another producer waits for the held write, or a lost write notifies.
+    #[tokio::test]
+    async fn inventory_ack_is_isolated() {
+        let lane = |write: &ScribeWrite| ScribeSink::lane(write) % SCRIBE_LANES as u64;
+        let path = (0..64)
+            .map(|index| format!("held-{index}"))
+            .find(|path| lane(&object(path).0) != 0)
+            .expect("some path takes a lane other than the span lane");
+        let held_lane = lane(&object(&path).0);
+        let elsewhere = |make: &dyn Fn() -> ScribeWrite| {
+            std::iter::repeat_with(make)
+                .take(256)
+                .find(|write| lane(write) != held_lane)
+                .expect("some write takes another lane")
+        };
+        let scribe = Arc::new(ObjectGate {
+            inner: Arc::default(),
+            release: tokio::sync::Semaphore::new(0),
+            arrived: tokio::sync::Notify::new(),
+        });
+        let outbox = route_outbox(
+            ScribeRoute::Local(Arc::clone(&scribe) as _, None),
+            BIFROST_INGEST_REQUEST_LIMIT_BYTES,
+        );
+        let tenant = DataTenantId::new_v7();
+        let (write, mut acked) = object(&path);
+        outbox.stage(tenant, write);
+        tokio::time::timeout(Duration::from_secs(10), scribe.arrived.notified())
+            .await
+            .expect("the object frame reaches Scribe");
+
+        outbox.stage(
+            tenant,
+            elsewhere(&|| decision("bifrost.record.write").into()),
+        );
+        outbox.stage(tenant, elsewhere(&|| capture(tenant).into()));
+        let (route, span) = span_copy(tenant);
+        ServerSpanSink::new(Arc::clone(&outbox)).stage(route, span);
+        let execution = std::iter::repeat_with(ExecutionId::new_v7)
+            .take(256)
+            .find(|execution| lane(&direct_inputs(*execution, background())) != held_lane)
+            .expect("some execution takes another lane");
+        outbox.stage(tenant, direct_inputs(execution, background()));
+        outbox.stage(
+            tenant,
+            execution_result(execution, &uid(), background(), 0, 0),
+        );
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            let tables: HashSet<_> = scribe
+                .inner
+                .received()
+                .into_iter()
+                .map(|frame| frame.table)
+                .collect();
+            let written = [
+                "bifrost.gateway.calls",
+                "bifrost.traces.spans",
+                "bifrost.verification.execution_inputs",
+                "bifrost.verification.results",
+            ]
+            .iter()
+            .all(|table| tables.contains(*table));
+            if written && !scribe.inner.audit_frames().is_empty() {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "other producers wait: {tables:?}"
+            );
+            tokio::task::yield_now().await;
+        }
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), &mut acked)
+                .await
+                .is_err(),
+            "a held write's bounded wait times out"
+        );
+
+        scribe.inner.refuse_next(ScribeError::IngressClosed);
+        scribe.release.add_permits(1);
+        tokio::time::timeout(Duration::from_secs(10), scribe.arrived.notified())
+            .await
+            .expect("the refused frame is replayed");
+        assert!(pending(&mut acked), "a lost ACK is not success");
+        scribe.release.add_permits(1);
+        tokio::time::timeout(Duration::from_secs(10), acked)
+            .await
+            .expect("the acknowledgement arrives")
+            .expect("its own acknowledgement notifies the waiter");
+
+        scribe
+            .release
+            .add_permits(tokio::sync::Semaphore::MAX_PERMITS);
+        settle(&outbox).await;
+        scribe.inner.refuse_next(ScribeError::InvalidFrame);
+        let (write, rejected) = object(&path);
+        outbox.stage(tenant, write);
+        assert!(
+            tokio::time::timeout(Duration::from_secs(10), rejected)
+                .await
+                .expect("the rejection settles")
+                .is_err(),
+            "a rejected write never notifies success"
+        );
+
+        let unreachable = ScribeSink::outbox(None, BIFROST_INGEST_REQUEST_LIMIT_BYTES);
+        let (write, dropped) = object(&path);
+        unreachable.stage(tenant, write);
+        assert!(
+            tokio::time::timeout(Duration::from_secs(10), dropped)
+                .await
+                .expect("the drop settles")
+                .is_err(),
+            "a dropped write never notifies success"
+        );
     }
 
     /// Proves audit decisions stage through the [`AuditStage`] seam and frame

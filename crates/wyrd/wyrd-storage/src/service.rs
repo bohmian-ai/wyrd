@@ -15,13 +15,13 @@ use wyrd_spec::error::WyrdError;
 use wyrd_spec::error::storage::WyrdStorageError;
 use wyrd_spec::ids::CardUid;
 use wyrd_spec::ids::IdempotencyKey;
+use wyrd_spec::registry::StoredArtifactEntry;
 use wyrd_spec::storage::{
     AbortResponse, AzureBlockBlobComplete, DownloadInitRequest, DownloadInitResponse, DownloadPlan,
     MultipartComplete, PartUrlResponse, StorageBackendKind, StoredObjectRef, UploadCompleteRequest,
     UploadCompleteResponse, UploadId, UploadIdParseError, UploadInitRequest, UploadInitResponse,
     UploadPlan, WireProtocol,
 };
-use wyrd_sql::queries::storage::artifact_metadata::ArtifactMetadataRow;
 use wyrd_sql::queries::storage::multipart_uploads::{self, MultipartUploadRow, UploadStatus};
 use wyrd_sql::{TenantConn, WyrdPostgres};
 
@@ -372,15 +372,73 @@ pub async fn upload_complete(
         row.block_count_planned,
     )?;
     conn.commit().await.map_err(|error| map_sql_error(&error))?;
+    finish_upload(&state, caller, upload_uuid, validated, row, replay, payload).await
+}
 
+/// Complete an upload on the server's behalf, without a client payload.
+///
+/// Card reconciliation reaches completion through this entry, so it records
+/// exactly what [`upload_complete`] records: an already completed upload is
+/// replayed, and a pending upload whose bytes need no backend commit — a
+/// single PUT, or a local write — is verified and completed. A pending
+/// upload that still needs its client's commit payload is refused, since only
+/// the client can supply it.
+///
+/// # Errors
+/// Returns [`WyrdStorageError::UploadNotPending`] for an upload that is
+/// initiating, aborted, failed, or still awaiting its client's commit, and
+/// the errors of [`upload_complete`].
+#[instrument(skip(storage, postgres, caller), fields(tenant = %caller.data_tenant_id, upload_id = %upload_id))]
+pub async fn reconcile_upload(
+    storage: &StorageHandle,
+    postgres: &WyrdPostgres,
+    caller: &StorageCaller,
+    upload_id: UploadId,
+) -> Result<UploadCompleteResponse, WyrdError> {
+    let state = StorageServiceState { storage, postgres };
+    let upload_uuid = upload_id_uuid(&upload_id)?;
+    let mut conn = state.storage_tenant_conn(caller.data_tenant_id).await?;
+    let row = load_upload(&mut conn, upload_uuid).await?;
+    conn.commit().await.map_err(|error| map_sql_error(&error))?;
+    let (replay, payload) = match (row.status, row.wire_protocol, row.backend) {
+        (UploadStatus::Completed, _, _) => (true, None),
+        (UploadStatus::Pending, WireProtocol::SinglePutV1, _) => (false, None),
+        (UploadStatus::Pending, WireProtocol::LocalFsV1, StorageBackendKind::Local) => {
+            (false, Some(CompletePayload::Local))
+        }
+        _ => return Err(WyrdStorageError::UploadNotPending.into()),
+    };
+    let validated =
+        tenant_path::validate(&row.storage_path, caller.data_tenant_id).map_err(map_tenant_path)?;
+    finish_upload(&state, caller, upload_uuid, validated, row, replay, payload).await
+}
+
+/// Commit, verify, and record one upload's completion.
+///
+/// `replay` marks an already completed upload, which re-verifies the stored
+/// object without a backend commit; otherwise `payload` is the backend
+/// commit payload, `None` when the protocol needs none.
+///
+/// # Errors
+/// Returns the backend commit, head, size, encryption, or persistence
+/// failure; each verification failure marks the upload failed first.
+async fn finish_upload(
+    state: &StorageServiceState<'_>,
+    caller: &StorageCaller,
+    upload_uuid: Uuid,
+    validated: ValidatedPath,
+    row: MultipartUploadRow,
+    replay: bool,
+    payload: Option<CompletePayload>,
+) -> Result<UploadCompleteResponse, WyrdError> {
     if !replay {
-        complete_backend_upload(&state, caller, upload_uuid, &validated, &row, payload).await?;
+        complete_backend_upload(state, caller, upload_uuid, &validated, &row, payload).await?;
     }
-    let head = verified_object_head(&state, caller, upload_uuid, &validated, &row).await?;
-    verify_object_head(&state, caller, upload_uuid, &validated, &row, &head).await?;
+    let head = verified_object_head(state, caller, upload_uuid, &validated, &row).await?;
+    verify_object_head(state, caller, upload_uuid, &validated, &row, &head).await?;
 
     let mut conn = state.storage_tenant_conn(caller.data_tenant_id).await?;
-    persist_completed_upload(&mut conn, upload_uuid, &validated, &row, &head).await?;
+    persist_completed_upload(&mut conn, upload_uuid, &row).await?;
     conn.commit().await.map_err(|error| map_sql_error(&error))?;
 
     Ok(UploadCompleteResponse {
@@ -591,24 +649,26 @@ pub async fn upload_local_evidence(
         .map_err(map_storage_error)
 }
 
-/// Initialize an artifact download.
-#[instrument(skip(storage, postgres, caller, body), fields(tenant = %caller.data_tenant_id))]
+/// Initialize a download of one completed Card artifact.
+///
+/// `stored` is the artifact's completed-object inventory entry, which the
+/// caller resolved for exactly `body`'s Card and path; its size and declared
+/// digest are returned with the plan.
+///
+/// # Errors
+/// Returns the tenant-path refusal for an invalid path, an internal error for
+/// a negative recorded size, and the presign failure.
+#[instrument(skip(storage, caller, body, stored), fields(tenant = %caller.data_tenant_id))]
 pub async fn download_init(
     storage: &StorageHandle,
-    postgres: &WyrdPostgres,
     caller: &StorageCaller,
     body: DownloadInitRequest,
+    stored: StoredArtifactEntry,
 ) -> Result<DownloadInitResponse, WyrdError> {
-    let state = StorageServiceState { storage, postgres };
     let validated = validated_download_path(caller, &body)?;
-
-    let mut conn = state.storage_tenant_conn(caller.data_tenant_id).await?;
-    let metadata = load_artifact_metadata(&mut conn, &validated).await?;
-    conn.commit().await.map_err(|error| map_sql_error(&error))?;
-
-    let request_ttl_secs = compute_download_ttl(&body, state.storage.presign_ttl_secs());
-    let get_url = download_url(&state, &validated, request_ttl_secs).await?;
-    let ttl_secs = if state.storage.backend() == StorageBackendKind::Local {
+    let request_ttl_secs = compute_download_ttl(&body, storage.presign_ttl_secs());
+    let get_url = download_url(storage, &validated, request_ttl_secs).await?;
+    let ttl_secs = if storage.backend() == StorageBackendKind::Local {
         0
     } else {
         request_ttl_secs
@@ -616,16 +676,16 @@ pub async fn download_init(
 
     Ok(DownloadInitResponse {
         plan: DownloadPlan { get_url, ttl_secs },
-        size_bytes: u64::try_from(metadata.size_bytes).map_err(|_| {
+        size_bytes: u64::try_from(stored.size_bytes).map_err(|_| {
             internal_error(
                 "stored artifact size is negative",
                 serde_json::json!({
                     "storage_path": validated.full,
-                    "size_bytes": metadata.size_bytes,
+                    "size_bytes": stored.size_bytes,
                 }),
             )
         })?,
-        sha256: metadata.sha256,
+        sha256: stored.sha256,
     })
 }
 
@@ -794,35 +854,25 @@ fn validated_download_path(
     tenant_path::validate(&storage_path, caller.data_tenant_id).map_err(map_tenant_path)
 }
 
-async fn load_artifact_metadata(
-    conn: &mut TenantConn<'_>,
-    validated: &ValidatedPath,
-) -> Result<ArtifactMetadataRow, WyrdError> {
-    wyrd_sql::queries::storage::artifact_metadata::get(conn, &validated.full)
-        .await
-        .map_err(|error| map_sql_error(&error))?
-        .ok_or_else(|| {
-            map_storage_error(StorageError::ObjectNotFound {
-                storage_path: validated.full.clone(),
-            })
-        })
-}
-
 fn compute_download_ttl(body: &DownloadInitRequest, default_ttl_secs: u32) -> u32 {
     body.ttl_secs.unwrap_or(default_ttl_secs).clamp(60, 3600)
 }
 
+/// Mint the download URL for one validated object: the local backend's
+/// root-relative route, or a backend-presigned GET valid for `ttl_secs`.
+///
+/// # Errors
+/// Returns the mapped storage error when the backend cannot presign the GET.
 async fn download_url(
-    state: &StorageServiceState<'_>,
+    storage: &StorageHandle,
     validated: &ValidatedPath,
     ttl_secs: u32,
 ) -> Result<String, WyrdError> {
-    if state.storage.backend() == StorageBackendKind::Local {
+    if storage.backend() == StorageBackendKind::Local {
         return Ok(local_download_url(validated));
     }
 
-    state
-        .storage
+    storage
         .signer()
         .presign_get(validated, Duration::from_secs(u64::from(ttl_secs)))
         .await
@@ -1250,32 +1300,19 @@ async fn verified_object_head(
     }
 }
 
+/// Mark `upload_uuid` completed and, for a Card upload, its manifest entry
+/// verified, inside the caller's transaction.
+///
+/// Nothing is durable until the caller commits `conn`, so a failure here or
+/// before that commit leaves the upload pending for a retried completion.
+///
+/// # Errors
+/// Returns the mapped SQL error when either update fails.
 async fn persist_completed_upload(
     conn: &mut TenantConn<'_>,
     upload_uuid: Uuid,
-    validated: &ValidatedPath,
     row: &MultipartUploadRow,
-    head: &HeadInfo,
 ) -> Result<(), WyrdError> {
-    wyrd_sql::queries::storage::artifact_metadata::insert(
-        conn,
-        wyrd_sql::queries::storage::artifact_metadata::NewArtifactMetadata {
-            storage_path: &validated.full,
-            card_uid: &validated.card_uid,
-            size_bytes: i64::try_from(head.size_bytes).map_err(|_| {
-                internal_error(
-                    "verified object size exceeds storage metadata range",
-                    serde_json::json!({ "size_bytes": head.size_bytes }),
-                )
-            })?,
-            sha256: &row.expected_sha256,
-            content_type: head.content_type.as_deref().or(row.content_type.as_deref()),
-            sse_marker: head.sse_marker.as_deref(),
-            backend: row.backend,
-        },
-    )
-    .await
-    .map_err(|error| map_sql_error(&error))?;
     multipart_uploads::mark_completed(conn, upload_uuid)
         .await
         .map_err(|error| map_sql_error(&error))?;

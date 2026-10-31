@@ -34,6 +34,7 @@ pub mod managed_columns;
 pub mod metrics;
 pub mod signal;
 pub mod staged;
+pub mod storage;
 pub mod traces;
 pub mod verification;
 
@@ -43,6 +44,7 @@ pub use drift::ObservationsTable as DriftObservationsTable;
 pub use gateway::CallsTable;
 pub use logs::RecordsTable;
 pub use metrics::PointsTable;
+pub use storage::ObjectsTable;
 pub use traces::SpansTable;
 pub use verification::{ExecutionInputsTable, ExecutionOutputsTable, ResultsTable};
 
@@ -1276,7 +1278,7 @@ const fn definition<T: DomainTable>() -> BuiltinTableDefinition {
 }
 
 /// The single canonical list of ten server-owned built-in tables.
-pub static BUILTIN_TABLES: [BuiltinTableDefinition; 9] = [
+pub static BUILTIN_TABLES: [BuiltinTableDefinition; 10] = [
     definition::<SpansTable>(),
     definition::<PointsTable>(),
     definition::<RecordsTable>(),
@@ -1286,11 +1288,12 @@ pub static BUILTIN_TABLES: [BuiltinTableDefinition; 9] = [
     definition::<ExecutionOutputsTable>(),
     definition::<AuditLogTable>(),
     definition::<CallsTable>(),
+    definition::<ObjectsTable>(),
 ];
 
 /// Return all immutable built-in definitions.
 #[must_use]
-pub const fn builtin_tables() -> &'static [BuiltinTableDefinition; 9] {
+pub const fn builtin_tables() -> &'static [BuiltinTableDefinition; 10] {
     &BUILTIN_TABLES
 }
 
@@ -1499,6 +1502,11 @@ mod tests {
                         "ended_at",
                         PartitionTransformWire::Day,
                         &["result_id", "execution_id"],
+                    ),
+                    ("storage", "objects") => (
+                        "recorded_at",
+                        PartitionTransformWire::Day,
+                        &["storage_path", "sha256"],
                     ),
                     ("system", "audit_log") => ("created_at", PartitionTransformWire::Day, &[]),
                     _ => panic!("{fqn} declares no pinned time column"),

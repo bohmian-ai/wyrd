@@ -765,11 +765,14 @@ followed it, found by profiling the L1 drivers:
 Remediation `TASK-009-R1` (review `TASK-009-R1-f0ea3b402`) follows them; its
 proof is in that task.
 
-| Obligation | Status |
-|---|---|
-| V13 on the settled final source | PENDING: no aggregate has run on `f0ea3b402` or later; record SHA, invocation, exit, lanes and log at closeout |
-| V14 five L1 records | Recorded at `19f4190a8` (history commit `8c066985a`), accepted by the maintainer as valid; final-source measurement PENDING |
-| V15 records publication | Pushed for `19f4190a8`; final-source records PENDING |
-| V16 PR | PENDING, not opened |
+Review `TASK-009-R2-b6e69d66b` accepted the remediation (PASS). Closeout on
+the settled source `92b62f9c0`:
 
-Whole-task PASS is not claimed while these are pending.
+| Obligation | Evidence | Result |
+|---|---|---|
+| V13 final-source gate | `mise run -c -j 4 gate` (maintainer-directed `-j 4`) at `92b62f9c0`: exit 0 in 1,318 s, every lane green, `test:bifrost:gate` 276/276; log outside the tree | PASS |
+| V14 five L1 records | `mise run bench:l1` at `92b62f9c0`: Bifrost writes-parquet, hot, parquet and Gateway overhead VALID; Verification direct-verify INVALID only on `driver.saturated` (6.54 and 6.47 of 6.40 cores, repetitions 1 and 3), every correctness criterion met; the maintainer accepts the driver budget | PASS (maintainer-accepted) |
+| V15 records publication | `benchmark-records` commit `274cbfb83`, pushed | PASS |
+| V16 PR | opened against `main` | see the PR |
+
+The earlier records at `19f4190a8` (`8c066985a`) keep their attribution.

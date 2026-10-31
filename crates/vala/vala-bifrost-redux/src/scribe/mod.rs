@@ -14,6 +14,7 @@ pub mod geometry;
 pub mod hot_source;
 pub mod hot_stage;
 mod ingress;
+pub(crate) mod layout_cache;
 pub mod manifest;
 pub(crate) mod material_plan;
 pub mod member_stager;
@@ -397,6 +398,9 @@ pub struct IngestStall {
     completed: AtomicBool,
     /// Wakes lifecycle assertions after normal release or cancellation.
     completed_notify: tokio::sync::Notify,
+    /// The only table whose write the barrier holds; `None` holds the next
+    /// write into any table.
+    table: Option<String>,
 }
 
 #[cfg(any(test, feature = "test-support"))]
@@ -1199,6 +1203,8 @@ impl ScribeImpl {
                 seal_max_age,
                 wal: Arc::clone(&wal),
                 persistence_cpu: persistence_cpu.clone(),
+                ingress_cpu: ingress_cpu.clone(),
+                variant_layouts: Arc::clone(memory.variant_layouts()),
                 wal_io: wal_io.clone(),
                 persistence: persistence.clone(),
                 control_postgres: control_postgres.clone(),
@@ -1374,7 +1380,7 @@ impl ScribeImpl {
                     self.shards.flush_all(),
                 )
                 .await,
-                Ok(Ok(()))
+                Ok(Ok(_))
             )
         } else {
             false
@@ -1588,7 +1594,39 @@ impl ScribeImpl {
     /// behavior without bypassing the shard command boundary.
     #[cfg(any(test, feature = "test-support"))]
     pub async fn flush_writable_for_test(&self) -> Result<(), ScribeError> {
-        self.shards.flush_all().await
+        self.shards.flush_all().await.map(|_| ())
+    }
+
+    /// Returns the physical schema of the Variant layout this process learned
+    /// for `tenant`'s `table` at any version, or `None` while it stays cold.
+    #[must_use]
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn learned_variant_layout_for_test(
+        &self,
+        tenant: wyrd_spec::DataTenantId,
+        table: &crate::catalog::TableRef,
+    ) -> Option<arrow::datatypes::SchemaRef> {
+        self.memory
+            .variant_layouts()
+            .physical_for_test(tenant, table)
+    }
+
+    /// Reports, per writable generation of `tenant`'s `table`, whether it pinned a learned layout.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ScribeError`] when the runtime is closed or a bucket lock is poisoned.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn writable_variant_layouts_for_test(
+        &self,
+        tenant: wyrd_spec::DataTenantId,
+        table: &crate::catalog::TableRef,
+    ) -> Result<Vec<bool>, ScribeError> {
+        let mut pinned = Vec::new();
+        for memtable in self.shards.memtables()? {
+            pinned.extend(memtable.writable_layouts_for_test(tenant, table)?);
+        }
+        Ok(pinned)
     }
 
     /// Return the bounded persistence queue depth for test-tier drain checks.
@@ -2264,7 +2302,23 @@ impl ScribeImpl {
     /// Install a one-shot test barrier at the public write seam.
     #[cfg(any(test, feature = "test-support"))]
     pub fn stall_next_ingest_for_test(&self) -> Arc<IngestStall> {
-        let stall = Arc::new(IngestStall::default());
+        self.stall_ingest_for_test(IngestStall::default())
+    }
+
+    /// Install a one-shot test barrier holding the next write into `table`,
+    /// a fully qualified table name, and passing every other write.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn stall_next_ingest_into_for_test(&self, table: &str) -> Arc<IngestStall> {
+        self.stall_ingest_for_test(IngestStall {
+            table: Some(table.to_owned()),
+            ..IngestStall::default()
+        })
+    }
+
+    /// Arm `stall` as the one-shot barrier at the public write seam.
+    #[cfg(any(test, feature = "test-support"))]
+    fn stall_ingest_for_test(&self, stall: IngestStall) -> Arc<IngestStall> {
+        let stall = Arc::new(stall);
         if let Ok(mut current) = self.ingest_stall.lock() {
             *current = Some(Arc::clone(&stall));
         }
@@ -2452,32 +2506,23 @@ impl ScribeImpl {
 
     /// Freezes every active bucket and waits until each is a durable staged member.
     ///
-    /// This is the first half of [`Self::flush_staged`] taken on its own, so a
-    /// harness can query rows served by staged runs before anything publishes
-    /// them.
+    /// This is the first half of [`Self::flush_staged`] taken on its own: it
+    /// publishes nothing, so a caller can read rows served by staged runs
+    /// before anything publishes them. Shards freeze one after another, so only
+    /// rows acknowledged before the call are guaranteed to move. Returns the
+    /// writable rows it froze.
     ///
     /// # Errors
     ///
     /// Returns [`ScribeError`] when a shard cannot freeze its writable
     /// generations; those rows stay appendable and WAL-authoritative.
-    #[cfg(any(test, feature = "test-support"))]
-    pub async fn stage_writable_for_test(&self) -> Result<(), ScribeError> {
-        self.stage_writable().await
-    }
-
-    /// Freezes every active bucket and waits for the persistence queue to stage it.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`ScribeError`] when a shard cannot freeze its writable
-    /// generations.
-    async fn stage_writable(&self) -> Result<(), ScribeError> {
-        self.shards.flush_all().await?;
+    pub async fn stage_writable(&self) -> Result<usize, ScribeError> {
+        let rows = self.shards.flush_all().await?;
         self.shards.drain().await;
         if let Some(persistence) = &self.persistence {
             persistence.drain().await;
         }
-        Ok(())
+        Ok(rows)
     }
 
     /// Flushes every active bucket through the staged and claim lifecycle.

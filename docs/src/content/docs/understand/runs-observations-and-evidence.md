@@ -18,7 +18,7 @@ A run is one execution of a service, such as answering one question. Every obser
 ```python
 with state.run("agent") as run:
     answer = answer_question(question)
-    run.observe.record("vala.datasets.tickets", {"question": question, "answer": answer})
+    run.observe.record("bifrost.datasets.tickets", {"question": question, "answer": answer})
 ```
 
 </LangTab>
@@ -28,7 +28,7 @@ with state.run("agent") as run:
 let run = state.run_for_card("agent")?;
 let answer = answer_question(question).await?;
 run.observe()
-    .record("vala.datasets.tickets", &json!({ "question": question, "answer": answer }))
+    .record("bifrost.datasets.tickets", &json!({ "question": question, "answer": answer }))
     .await?;
 ```
 
@@ -38,7 +38,7 @@ run.observe()
 ```typescript
 const run = state.run("agent");
 const answer = await answerQuestion(question);
-await run.observe.record("vala.datasets.tickets", { question, answer });
+await run.observe.record("bifrost.datasets.tickets", { question, answer });
 ```
 
 </LangTab>
@@ -52,10 +52,10 @@ Observations go to Bifrost, the Wyrd data plane:
 
 | Recorded with | Lands in |
 | --- | --- |
-| `observe.record(table, row)` | A caller-owned `vala.datasets.<name>` table |
-| `observe.verify` and `observe.submit` | `vala.verification.execution_inputs` and `vala.verification.results` |
-| Drift samples, with `observe.submit` | `vala.drift.observations` |
-| OpenTelemetry spans, metrics, and logs | `vala.traces.spans`, `vala.metrics.points`, and `vala.logs.records` |
+| `observe.record(table, row)` | A caller-owned `bifrost.datasets.<name>` table |
+| `observe.verify` and `observe.submit` | `bifrost.verification.execution_inputs` and `bifrost.verification.results` |
+| Drift samples, with `observe.submit` | `bifrost.drift.observations` |
+| OpenTelemetry spans, metrics, and logs | `bifrost.traces.spans`, `bifrost.metrics.points`, and `bifrost.logs.records` |
 
 Every row carries its `subject_card_uid`, its `run_id`, and the principal that wrote it. A service may write only about Cards in its own graph. Anything else fails with `WYRD_VALA_403_BIFROST_CARD_SCOPE` ([Errors](/api/errors/)).
 
@@ -71,8 +71,8 @@ Observations and verdicts share `run_id`, so one SQL query joins what a run saw 
 
 ```sql
 SELECT t.question, t.answer, r.verdict, r.verifier_version
-FROM vala.datasets.tickets AS t
-JOIN vala.verification.results AS r ON r.run_id = t.run_id
+FROM bifrost.datasets.tickets AS t
+JOIN bifrost.verification.results AS r ON r.run_id = t.run_id
 ```
 
 ## Next

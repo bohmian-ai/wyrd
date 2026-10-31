@@ -234,6 +234,21 @@ impl ScanScope {
     }
 }
 
+/// Throwaway metrics the row-group pruner requires of every sizing; never
+/// reported, so one process-wide set serves every sizer instead of
+/// registering a file's worth of metrics per sizing.
+// ponytail: every sizer adds to the same atomic counters; give each worker
+// thread its own set if that contention shows up in a profile.
+static PRUNER_METRICS: std::sync::LazyLock<
+    datafusion::datasource::physical_plan::parquet::ParquetFileMetrics,
+> = std::sync::LazyLock::new(|| {
+    datafusion::datasource::physical_plan::parquet::ParquetFileMetrics::new(
+        0,
+        "scan_sizing",
+        &datafusion::physical_plan::metrics::ExecutionPlanMetricsSet::new(),
+    )
+});
+
 /// The one owner of how many bytes a scan reads, on every tier.
 ///
 /// A scan reads units, each with recorded bounds: a memtable batch, or a
@@ -256,8 +271,6 @@ pub(crate) struct ScanSizer<'scope> {
     /// Indexes of the sized schema's columns the scope covers, in the order
     /// a memtable batch's column statistics are recorded.
     covered: Vec<usize>,
-    /// Throwaway metrics the row-group pruner requires; never reported.
-    metrics: datafusion::datasource::physical_plan::parquet::ParquetFileMetrics,
 }
 
 impl<'scope> ScanSizer<'scope> {
@@ -265,7 +278,6 @@ impl<'scope> ScanSizer<'scope> {
     /// or files were written under.
     #[must_use]
     pub(crate) fn new(scope: &'scope ScanScope, schema: &arrow::datatypes::SchemaRef) -> Self {
-        let metrics = datafusion::physical_plan::metrics::ExecutionPlanMetricsSet::new();
         Self {
             scope,
             schema: Arc::clone(schema),
@@ -277,11 +289,6 @@ impl<'scope> ScanSizer<'scope> {
                 .filter(|(_, field)| scope.covers(field.name()))
                 .map(|(index, _)| index)
                 .collect(),
-            metrics: datafusion::datasource::physical_plan::parquet::ParquetFileMetrics::new(
-                0,
-                "scan_sizing",
-                &metrics,
-            ),
         }
     }
 
@@ -327,7 +334,7 @@ impl<'scope> ScanSizer<'scope> {
                     &file_schema,
                     footer,
                     pruning.predicate(),
-                    &self.metrics,
+                    &PRUNER_METRICS,
                 );
             }
         }

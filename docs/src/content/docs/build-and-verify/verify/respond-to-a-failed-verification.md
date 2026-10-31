@@ -6,7 +6,6 @@ section: Build and verify
 topic: Verify
 order: 5
 draft: true
-status: runnable
 ---
 
 An Operator is what Wyrd does when a Verifier fails: post to a webhook, page PagerDuty, or message Slack. You attach it to a binding with `on_failure`, and the server runs it once per failed execution. This page wires a daily latency check to an on-call webhook.
@@ -72,7 +71,7 @@ Each Operator run is a dispatch on the execution. Find the latest execution of t
 
 ```sql
 SELECT execution_id, verdict, ended_at
-FROM vala.verification.results
+FROM bifrost.verification.results
 WHERE binding_id = $1
 ORDER BY ended_at DESC
 LIMIT 1

@@ -453,11 +453,11 @@ fn agent_errors_project_onto_the_catalog() {
             "WYRD_AGENT_504_TIMEOUT",
         ),
         (
-            AgentError::StructuredOutputDecode {
+            AgentError::StructuredOutputInvalid {
                 agent: "a".to_owned(),
-                detail: "bad".to_owned(),
+                violations: vec!["/required".to_owned()],
             },
-            "WYRD_AGENT_422_STRUCTURED_DECODE",
+            "WYRD_AGENT_422_STRUCTURED_INVALID",
         ),
         (
             AgentError::InvalidArgument {

@@ -4,7 +4,6 @@ description: Give your coding agent the Wyrd docs through llms.txt and Wyrd's to
 pillar: wyrd
 section: Get started
 order: 4
-status: runnable
 ---
 
 Point your coding agent at the Wyrd docs, then connect it to your Wyrd server so it can read your declarations, verdicts, and evidence.

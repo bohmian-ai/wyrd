@@ -86,9 +86,10 @@ pub const CASES: &[&str] = &[
     "direct-verify",
     "queued-verify",
     "evidence-write",
-    "buffered-metadata",
-    "streamed-metadata",
-    "buffered-payload",
+    "buffered-1kib-capture-metadata",
+    "streamed-1kib-capture-metadata",
+    "buffered-64kib-capture-metadata",
+    "buffered-64kib-capture-payload",
     "probe",
 ];
 

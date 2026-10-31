@@ -613,17 +613,22 @@ impl SessionMemory for RecordingSession {
     }
 }
 
+/// A journal keeping every appended event in memory; clones share it, so a
+/// test keeps one clone while the Agent appends through another.
 #[derive(Clone, Default)]
-struct RecordingJournal {
+pub(crate) struct RecordingJournal {
+    /// Appended events in order; a poisoned lock is recovered, not fatal.
     events: Arc<Mutex<Vec<JournalEvent>>>,
 }
 
 impl RecordingJournal {
-    fn new() -> Self {
+    /// An empty journal.
+    pub(crate) fn new() -> Self {
         Self::default()
     }
 
-    fn events(&self) -> Vec<JournalEvent> {
+    /// A snapshot of every event appended so far, in order.
+    pub(crate) fn events(&self) -> Vec<JournalEvent> {
         match self.events.lock() {
             Ok(guard) => guard.clone(),
             Err(poisoned) => poisoned.into_inner().clone(),

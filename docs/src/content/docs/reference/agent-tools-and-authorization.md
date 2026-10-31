@@ -4,7 +4,6 @@ description: Built-in tools a Verifier's Agent can call and the permissions each
 pillar: wyrd
 section: Reference
 order: 3
-status: runnable
 ---
 
 A Verifier's Agent calls server built-in tools, named in its `tool_names`. There is no fetch tool and no network access.
@@ -42,6 +41,26 @@ Every call needs both a `tool:invoke` grant and the tool's resource permission. 
 ```
 
 The scope is `all` or one exact tool name, never a pattern. A call runs as the principal that started the verification, or the binding owner for a scheduled one; delegation can narrow that authority but never widen it. `verifier:run` and declaring a tool grant nothing.
+
+## Failed tool calls
+
+A failed call does not end the step. The model receives `code`, `error`, and, for a call it can repair, `details`, then may call again; the step's `tool_calls` record keeps the `error`. An `fs.*` call that breaks one of the rules below returns `WYRD_SPEC_400_VALIDATION` with `details` naming the `rule`, the argument `field`, its `value`, and what was `expected`. A local IO failure returns `SKALD_TOOL_500_CALL` without `details`.
+
+| Rule | Cause |
+| --- | --- |
+| `workspace_path` | A path is not under `/inputs` or `/work`, or has an empty, `.`, or `..` segment |
+| `workspace_missing` | No file or directory exists at the path |
+| `regular_file` | A file argument names a directory or a non-regular file |
+| `utf8_text` | `fs.read` names a file that is not UTF-8 text |
+| `result_limit` | The `fs.read` path is too long for any line to fit within the tool result limit |
+| `search_query` | `fs.search` has an empty `query` |
+| `search_pattern` | A `regex` query is not valid Rust regex syntax |
+| `search_glob` | `glob` is not a relative glob without `..` segments |
+| `extractable_document` | `fs.extract` names a file that is not an extractable document |
+| `extraction_refused` | `fs.extract` names a malformed document or one over the extraction limits |
+| `output_path` | `output_path` is not a new file path under `/work` |
+| `output_exists` | `output_path` already exists |
+| `work_budget` | The file or the extraction exceeds the `/work` write budget |
 
 ## Errors
 

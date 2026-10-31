@@ -623,16 +623,20 @@ pub async fn compose_bifrost(
             .map_err(|error| {
                 ServerBootError::Scribe(format!("persistence CPU pool failed: {error}"))
             })?,
-            ScribeWalIoPool::try_new_with_capacity_and_delay(scribe_config.wal_io_threads, 256, {
-                #[cfg(feature = "test-support")]
+            ScribeWalIoPool::try_new_with_capacity_and_delay(
+                scribe_config.wal_io_workers(),
+                256,
                 {
-                    wal_sync_delay
-                }
-                #[cfg(not(feature = "test-support"))]
-                {
-                    Duration::ZERO
-                }
-            })
+                    #[cfg(feature = "test-support")]
+                    {
+                        wal_sync_delay
+                    }
+                    #[cfg(not(feature = "test-support"))]
+                    {
+                        Duration::ZERO
+                    }
+                },
+            )
             .map_err(|error| ServerBootError::Scribe(format!("WAL IO pool failed: {error}")))?,
         );
         // Built once, not once per feature branch. The previous shape

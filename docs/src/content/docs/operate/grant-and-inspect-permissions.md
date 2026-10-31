@@ -3,19 +3,17 @@ title: Permissions
 description: See which roles a principal holds, grant or revoke a role, cut a principal off, and confirm the result in the audit log.
 pillar: wyrd
 section: Operate
-order: 3
-draft: true
-status: partial
+order: 4
 ---
 
-Grant a role to give a principal more access, revoke it to take access away, and read the audit log to confirm what the server decided. Every command here changes access for the whole tenant; roles are not scoped to a space.
+Grant a role to give a principal more access, revoke it to take access away, and read the audit log to confirm what the server decided. Every command here changes access for the whole tenant.
 
 ## Prerequisites
 
-- A credential with the `admin` role, such as the tenant `admin_credential` from [Deploy Wyrd for a team](/operate/deploy-wyrd-for-a-team/#5-create-the-first-tenant), or the key `wyrd init` saved.
+- A credential with the `admin` role, such as the tenant `admin_credential` from [Deploy Wyrd for a team](/operate/deploy-wyrd-for-a-team/#4-create-the-first-tenant), or the key `wyrd init` saved.
 - The principal's ID. `wyrd principal list` shows it.
 
-If you are not sure which role you need, [Identity and authorization](/understand/identity-and-authorization/#roles-and-permissions) lists what each built-in role allows.
+If you are not sure which role you need, [Identity and access](/understand/identity-and-authorization/#roles) lists what each built-in role allows.
 
 ## 1. Find the principal and its roles
 
@@ -26,7 +24,7 @@ wyrd principal list --kind service
 wyrd principal role list --principal <principal-id>
 ```
 
-A Service or Agent principal created by `wyrd declare` starts with `workload`. A tenant administrator holds `admin`.
+A Service account holds the roles it was created with; [Deploy a Service from CI](/operate/deploy-a-service-from-ci/) creates one with `editor` and one with `workload`. A tenant administrator holds `admin`.
 
 ## 2. Grant or revoke a role
 
@@ -85,7 +83,7 @@ To stop a principal entirely, suspend it:
 wyrd principal revoke <principal-id> --kind service --reason "credential leaked in CI logs"
 ```
 
-New tokens are refused at once, and tokens already issued expire within 5 minutes. To stop one credential but keep the principal, revoke just that credential with the `principals.revoke_credential` [MCP tool](/reference/mcp-tools/#principal-credentials).
+New tokens are refused at once, and tokens already issued expire within 5 minutes. To stop one key but keep the account, revoke just that key with `wyrd principal credential revoke`, or the `principals.revoke_credential` [MCP tool](/reference/mcp-tools/#principal-credentials).
 
 ## 4. Confirm the decision
 
@@ -93,7 +91,7 @@ Every permission check is recorded in the audit log. To see what was refused rec
 
 ```sql
 SELECT created_at, sub_principal_id, permission, outcome
-FROM vala.system.audit_log
+FROM bifrost.system.audit_log
 WHERE outcome = 'denied'
 ORDER BY created_at DESC
 LIMIT 20

@@ -621,13 +621,24 @@ mod tests {
         assert_eq!(
             steps(&hot, true),
             [
-                "point-c1",
-                "point-c64",
-                "small-aggregate-c1",
-                "span-shredded-c1"
+                "point-memtable-c1",
+                "point-memtable-c64",
+                "point-staged-c1",
+                "small-aggregate-memtable-c1",
+                "small-aggregate-staged-c1",
+                "span-shredded-memtable-c1",
+                "span-shredded-staged-c1",
+                "span-long-tail-memtable-c1",
+                "span-long-tail-staged-c1"
             ]
         );
-        assert_eq!(steps(&hot, false), ["point-scaling"]);
+        assert_eq!(steps(&hot, false), ["point-memtable-scaling"]);
+        assert!(
+            hot.controls["limits"]
+                .as_str()
+                .is_some_and(|limits| limits.contains("WYRD_MAX_FILE_RETENTION_TIME=86400")),
+            "under the hot settings nothing ages out; only the benchmark control moves rows"
+        );
         let reads = [
             "point-c1",
             "point-c64",
@@ -665,8 +676,8 @@ mod tests {
             "writes-parquet runs the production rotation with a 30 s retention"
         );
         assert!(applies(&writes, "point-p99-slo").is_empty());
-        for bifrost in [&hot, &parquet] {
-            assert_eq!(applies(bifrost, "point-p99-slo"), ["point-c64"]);
+        for (bifrost, point) in [(&hot, "point-memtable-c64"), (&parquet, "point-c64")] {
+            assert_eq!(applies(bifrost, "point-p99-slo"), [point]);
             let slo = bifrost
                 .criteria
                 .iter()
@@ -844,22 +855,31 @@ mod tests {
             .iter()
             .map(|clients| *clients as u64)
             .collect();
-        let mut shapes = sweep("chat", ".", &clients);
-        shapes.extend(sweep("chat-stream", ".", &clients));
-        shapes.extend(sweep("chat-capture", ".", &clients));
+        let mut shapes = sweep("buffered-1kib-capture-metadata", ".", &clients);
+        shapes.extend(sweep("streamed-1kib-capture-metadata", ".", &clients));
+        shapes.extend(sweep("buffered-64kib-capture-metadata", ".", &clients));
+        shapes.extend(sweep("buffered-64kib-capture-payload", ".", &clients));
         assert_eq!(steps(&gateway, true), shapes);
         assert_eq!(
             applies(&gateway, "overhead-p99"),
-            ["chat.c64", "chat-stream.c64", "chat-capture.c64"]
+            [
+                "buffered-1kib-capture-metadata.c64",
+                "streamed-1kib-capture-metadata.c64",
+                "buffered-64kib-capture-metadata.c64",
+                "buffered-64kib-capture-payload.c64"
+            ]
         );
-        assert_eq!(applies(&gateway, "overhead-end-p99"), ["chat-stream.c64"]);
+        assert_eq!(
+            applies(&gateway, "overhead-end-p99"),
+            ["streamed-1kib-capture-metadata.c64"]
+        );
         for every in [
             "capture-lost",
             "capture-shed",
             "capture-per-arrival",
             "no-errors",
         ] {
-            assert_eq!(applies(&gateway, every).len(), 6, "{every}");
+            assert_eq!(applies(&gateway, every).len(), 8, "{every}");
         }
         for metric in [
             "requests_per_s_per_vcpu",
@@ -926,6 +946,11 @@ mod tests {
                     "wire_bytes_per_row",
                     "published_files",
                     "published_mib",
+                    "wal_bytes_per_row",
+                    "staged_bytes_per_row",
+                    "published_bytes_per_row",
+                    "wal_syncs",
+                    "stage_syncs",
                     "memtable_backlog_mib",
                     "staged_backlog_mib",
                 ],
@@ -968,7 +993,7 @@ mod tests {
             ),
             (
                 bifrost(query::Experiment::Hot),
-                "small-aggregate-c1",
+                "small-aggregate-memtable-c1",
                 "queries",
                 vec![
                     "queries_per_s_per_vcpu",
@@ -997,7 +1022,7 @@ mod tests {
             ),
             (
                 declare(Engine::Gateway, Level::One, &[], HOST, &root),
-                "chat-capture.c64",
+                "buffered-64kib-capture-payload.c64",
                 "requests",
                 vec![
                     "requests_per_s_per_vcpu",

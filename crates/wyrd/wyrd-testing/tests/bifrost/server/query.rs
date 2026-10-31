@@ -852,6 +852,9 @@ async fn prove_scheduled_analytical_completion(
         ingress.state().bifrost.query_controls().is_some(),
         "forwarded ingress retains lifecycle routing"
     );
+    // The remote leader stages each read decision on its own outbox, so the
+    // cluster barrier settles every server before each count.
+    cluster.await_audit_retained().await?;
     let before = audit_rows(ingress, tenant, "bifrost.query.read_decision").await?;
     // Forwarding-only ingress: this node owns no Oracle, so the read decision
     // below is built and committed by the remote leader from the context the
@@ -874,6 +877,7 @@ async fn prove_scheduled_analytical_completion(
     assert_eq!(outcome.rows, u64::try_from(FIXTURE_VALUES.len())?);
     assert_eq!(outcome.terminal.row_count, outcome.rows);
     await_owners_released(cluster).await?;
+    cluster.await_audit_retained().await?;
     assert_eq!(
         audit_rows(ingress, tenant, "bifrost.query.read_decision").await?,
         before + 1
@@ -935,6 +939,7 @@ async fn prove_scheduled_analytical_completion(
         .expect_err("an actively cancelled schedule has no outcome");
     assert_eq!(error.code(), "WYRD_VALA_502_QUERY_STREAM_INCOMPLETE");
     await_owners_released(cluster).await?;
+    cluster.await_audit_retained().await?;
     assert_eq!(
         audit_rows(ingress, tenant, "bifrost.query.read_decision").await?,
         before + 2

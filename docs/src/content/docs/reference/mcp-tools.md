@@ -4,7 +4,6 @@ description: Wyrd MCP tool names, permissions, shapes, and query limits.
 pillar: wyrd
 section: Reference
 order: 5
-status: runnable
 ---
 
 The server serves MCP protocol revision 2026-07-28 over HTTP at `/mcp`; `wyrd mcp proxy` relays the same tools over stdio.

@@ -782,8 +782,9 @@ impl ScribeStagingRuntime {
     /// Reconstructs one recovered key's encoding context, or fails closed.
     ///
     /// The layout is re-resolved from the recipe the members' rows were
-    /// accepted under, which their record carries, against the runs' own
-    /// schema, so a later Bloom or layout alteration never strands them.
+    /// accepted under, which their record carries, against the logical schema
+    /// reconstructed from the runs' own (possibly shredded) layout, so a later
+    /// Bloom or layout alteration never strands them.
     ///
     /// `members` are the members restore keeps. The schema is read from their
     /// runs only: a key can also hold the leftovers of a claim that already
@@ -809,7 +810,12 @@ impl ScribeStagingRuntime {
             .ok_or_else(|| ScribeError::Internal {
                 detail: "a recovered staged key names no run to read its schema from".to_owned(),
             })?;
-        let schema = Arc::clone(crate::scribe::member_stager::preflight_run(&run)?.schema());
+        let physical = Arc::clone(crate::scribe::member_stager::preflight_run(&run)?.schema());
+        let schema = Arc::new(crate::schema::logical_schema(&physical).map_err(|detail| {
+            ScribeError::Internal {
+                detail: format!("reconstruct a recovered staged run's logical schema: {detail}"),
+            }
+        })?);
         if crate::parquet::footer::schema_fingerprint(schema.as_ref()) != key.schema_fingerprint() {
             return Err(ScribeError::Internal {
                 detail: "a recovered staged run's schema is not the schema its key names"
@@ -867,7 +873,10 @@ impl ScribeStagingRuntime {
     ///
     /// This is the blocking half of assembly and belongs on the persistence CPU
     /// lane. Objects roll at the configured target, so a claim that overshoots
-    /// its target publishes several objects rather than one oversized one.
+    /// its target publishes several objects rather than one oversized one. A
+    /// successful assembly refreshes the process's advisory Variant layout for
+    /// the claim's exact tenant, table, and version, so generations opened
+    /// later retain their rows in the layout this claim learned.
     ///
     /// # Errors
     ///
@@ -881,7 +890,8 @@ impl ScribeStagingRuntime {
     ) -> Result<AssembledClaim, ScribeError> {
         let context = self.context_for(claim.key())?;
         let object_base = claim_object_base(claim, request.runs, &context)?;
-        self.claims.encode(AssembleClaimRequest {
+        let resources = request.memory.clone();
+        let assembled = self.claims.encode(AssembleClaimRequest {
             runs: request.runs,
             schema: Arc::clone(&context.schema),
             layout: &context.layout,
@@ -890,7 +900,15 @@ impl ScribeStagingRuntime {
             target_object_bytes: self.target_object_bytes,
             memory: request.memory,
             tenant: context.binding.tenant,
-        })
+        })?;
+        let key = claim.key();
+        resources.variant_layouts().install(
+            &resources,
+            (key.tenant(), key.table().clone(), key.table_version()),
+            Arc::clone(&context.schema),
+            assembled.variant_layout.clone(),
+        );
+        Ok(assembled)
     }
 
     /// Publishes one assembled claim, retires its members, and settles it.

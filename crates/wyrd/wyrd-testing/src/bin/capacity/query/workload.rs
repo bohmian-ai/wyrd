@@ -78,12 +78,17 @@ pub fn schema() -> SchemaRef {
 /// One fixture size and every per-row value derived from it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Fixture {
-    /// Rows seeded into [`TABLE`].
+    /// The first `event_id` the cases ask about: 0 for a whole fixture, or
+    /// where one cohort of a larger loaded fixture starts.
+    pub first: i64,
+    /// Rows from `first` the cases ask about. A loaded fixture seeds rows
+    /// `0..rows` into [`TABLE`].
     pub rows: i64,
 }
 
 impl Fixture {
-    /// `event_time` of row `id`: the rows spread evenly over one day.
+    /// `event_time` of row `id` of a whole fixture: the rows spread evenly
+    /// over one day.
     #[must_use]
     pub const fn event_time(self, id: i64) -> i64 {
         DAY_START_MS + id * (DAY_HOURS * HOUR_MS) / self.rows
@@ -270,9 +275,10 @@ impl Case {
         let (rows, variants) = match self {
             Self::SmallAggregate => (SMALL_ROWS.min(fixture.rows / 64), 64),
             Self::MillionAggregate => (MILLION_ROWS.min(fixture.rows / 8), 8),
-            _ => return (0, fixture.rows),
+            _ => return (fixture.first, fixture.first + fixture.rows),
         };
-        let first = (sequence % variants).cast_signed() * (fixture.rows / variants.cast_signed());
+        let first = fixture.first
+            + (sequence % variants).cast_signed() * (fixture.rows / variants.cast_signed());
         (first, first + rows)
     }
 }
@@ -281,7 +287,8 @@ impl Case {
 /// spreading consecutive sequences across the whole table.
 #[must_use]
 pub const fn selective_id(fixture: Fixture, sequence: u64) -> i64 {
-    (sequence.wrapping_mul(2_654_435_761) % fixture.rows.cast_unsigned()).cast_signed()
+    fixture.first
+        + (sequence.wrapping_mul(2_654_435_761) % fixture.rows.cast_unsigned()).cast_signed()
 }
 
 #[cfg(test)]
@@ -297,9 +304,11 @@ mod tests {
     #[test]
     fn events_fixture_answers_are_exact() {
         let fixture = Fixture {
+            first: 0,
             rows: 64 * 1_000_000,
         };
         let batch = Fixture {
+            first: 0,
             rows: STANDARD_ROWS,
         }
         .batch(0, 3)
@@ -308,6 +317,7 @@ mod tests {
         assert_eq!(batch.schema(), schema());
         assert_eq!(
             Fixture {
+                first: 0,
                 rows: STANDARD_ROWS
             }
             .event_time(STANDARD_ROWS / 2),
@@ -332,6 +342,28 @@ mod tests {
         assert_eq!(
             Case::Selective.expected(fixture, 3),
             vec![vec![id, service(id), duration(id)]]
+        );
+
+        let upper = Fixture {
+            first: STANDARD_ROWS / 2,
+            rows: STANDARD_ROWS / 2,
+        };
+        assert!(
+            (0..64).all(|sequence| (STANDARD_ROWS / 2..STANDARD_ROWS)
+                .contains(&selective_id(upper, sequence))),
+            "a cohort's point lookups stay in its rows"
+        );
+        let last = Case::SmallAggregate.expected(upper, 63);
+        assert_eq!(
+            last.iter().map(|row| row[1]).sum::<i64>(),
+            STANDARD_ROWS / 2 / 64,
+            "a cohort's last aggregate variant ends inside its rows"
+        );
+        assert!(
+            Case::SmallAggregate
+                .sql(upper, 0)
+                .contains("event_id >= 5000000 AND event_id < 5078125"),
+            "a cohort's aggregates start at its first row"
         );
     }
 }

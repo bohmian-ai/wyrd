@@ -46,7 +46,7 @@ use wyrd_spec::verification::GroupEndSettings;
 use wyrd_spec::verification::execution::InputDeclaration;
 use wyrd_sql::TenantConn;
 use wyrd_sql::queries::verifier_executions::{
-    DueGroup, EnqueueOutcome, ExecutionAuthority, GroupSelection, PinnedGroup,
+    DueGroup, ExecutionAuthority, GroupSelection, GroupedAdmission, PinnedGroup, Prepared,
     VerifierExecutionQueue,
 };
 
@@ -55,9 +55,10 @@ use super::drift::ObservationWindow;
 use super::inputs::{
     GroupSelector, InputResolver, SelectionRange, SlotSelection, SourceRef, TABLE_NOT_FOUND,
 };
-use super::results::{InputRecord, ResultPayloadBuilder, ResultRun};
+use super::results::{InputRecord, ResultPayloadBuilder, ResultRow, ResultRun};
+use super::submissions::SubmissionSink;
 use crate::query::scheduled::ScheduledQueryCaller;
-use crate::scribe_outbox::{ScribeSink, ScribeWrite};
+use crate::scribe_outbox::ScribeSink;
 use crate::state::AppState;
 
 /// Why one pending group was not handed off.
@@ -86,16 +87,6 @@ impl From<WyrdError> for GroupPollError {
     }
 }
 
-/// One group handoff decided by [`GroupPoller::poll`]: the enqueue outcome
-/// and, for a newly enqueued execution, its selector record to stage once the
-/// handoff commits.
-pub struct Polled {
-    /// The enqueue outcome.
-    pub outcome: EnqueueOutcome,
-    /// The new execution's input record; `None` unless enqueued.
-    pub record: Option<ScribeWrite>,
-}
-
 /// Owner of the Bifrost read that selects one pending group's sources.
 pub struct GroupPoller {
     /// Server state owning the Bifrost catalog and query service.
@@ -116,17 +107,24 @@ impl GroupPoller {
     }
 
     /// Reserve the Scribe outbox slot a handoff's selector record is staged
-    /// on, before its transaction commits.
+    /// on and the queue slot that admits it once Scribe acknowledges it,
+    /// before the pending group is claimed.
     ///
     /// # Errors
-    /// Returns [`OutboxFull`] when the reserved share is full, so the group
-    /// stays pending.
-    pub fn reserve(&self) -> Result<Reservation<ScribeSink>, OutboxFull> {
-        self.state.bifrost.scribe_outbox().reserve(1)
+    /// Returns [`OutboxFull`] when either reserved share is full, so the
+    /// group stays pending.
+    pub fn reserve(
+        &self,
+    ) -> Result<(Reservation<ScribeSink>, Reservation<SubmissionSink>), OutboxFull> {
+        Ok((
+            self.state.bifrost.scribe_outbox().reserve(1)?,
+            self.state.verification.submissions().reserve(1)?,
+        ))
     }
 
-    /// Select one snapshot of the claimed pending group `due` and enqueue its
-    /// group execution under the owner's accepted `authority`.
+    /// Select one snapshot of the claimed pending group `due` and prepare its
+    /// group execution under the owner's accepted `authority`, writing
+    /// nothing.
     ///
     /// The statement runs as the tenant's `system` principal holding
     /// `bifrost_query:read` on exactly the registered verification inputs,
@@ -134,10 +132,11 @@ impl GroupPoller {
     /// owner's own grants play no part in the read. It reads rows admitted
     /// before `due.due_at`. A tenant without a results table is read from
     /// inputs alone. An unchanged snapshot answers with its existing
-    /// execution, and the enqueued execution keeps `authority` for its work.
-    /// A read showing a result without its execution's input or output
-    /// selects nothing. The caller consumes the pending row, commits, and
-    /// then stages the returned record.
+    /// execution; a new one is a candidate that keeps `authority` for its
+    /// work, consumes `due`'s pending generation when admitted, and comes
+    /// with its selector input record for the caller to stage. A read
+    /// showing a result without its execution's input or output selects
+    /// nothing.
     ///
     /// # Errors
     /// Returns [`GroupPollError::Sql`] when a Postgres statement fails and
@@ -169,7 +168,7 @@ impl GroupPoller {
         due: &DueGroup,
         authority: &ExecutionAuthority,
         system: PrincipalId,
-    ) -> Result<Polled, GroupPollError> {
+    ) -> Result<Prepared<(GroupedAdmission, ResultRow)>, GroupPollError> {
         let tables = ["execution_inputs", "results", "execution_outputs"]
             .map(|name| TableRef::new(BifrostNamespace::Verification, name));
         let read =
@@ -248,31 +247,39 @@ impl GroupPoller {
                 })
                 .collect(),
         )?;
-        let outcome = queue
-            .enqueue_group(conn, due.binding_id, &pinned, authority)
-            .await?;
-        let record = match outcome {
-            EnqueueOutcome::Enqueued(execution_id) => {
-                Some(Self::record(due, execution_id, authority, &selector)?)
-            }
-            EnqueueOutcome::AlreadyEnqueued(_) | EnqueueOutcome::Refused(_) => None,
-        };
-        Ok(Polled { outcome, record })
+        Ok(
+            match queue
+                .prepare_group(
+                    conn,
+                    due.binding_id,
+                    &pinned,
+                    authority,
+                    Some(due.generation),
+                )
+                .await?
+            {
+                Prepared::Candidate(admission) => {
+                    let row = Self::record(due, admission.execution_id, &selector)?;
+                    Prepared::Candidate((admission, row))
+                }
+                Prepared::Existing(execution_id) => Prepared::Existing(execution_id),
+                Prepared::Refused(refusal) => Prepared::Refused(refusal),
+            },
+        )
     }
 
     /// The `origin = group` input record of new execution `execution_id`,
-    /// holding `selector` and attributed like the execution.
+    /// holding `selector`.
     ///
     /// # Errors
     /// Returns [`GroupPollError::Read`] when the selector cannot be encoded.
     fn record(
         due: &DueGroup,
         execution_id: ExecutionId,
-        authority: &ExecutionAuthority,
         selector: &GroupSelector,
-    ) -> Result<ScribeWrite, GroupPollError> {
+    ) -> Result<ResultRow, GroupPollError> {
         let now = Utc::now();
-        let row = ResultPayloadBuilder::new(
+        ResultPayloadBuilder::new(
             ResultRun {
                 execution_id,
                 run_id: None,
@@ -291,12 +298,7 @@ impl GroupPoller {
             now,
         )
         .inputs(InputRecord::Group(selector))
-        .map_err(|error| GroupPollError::Read(error.to_string()))?;
-        Ok(ScribeWrite::ExecutionInputs {
-            row,
-            attribution: authority.attribution(),
-            queued: None,
-        })
+        .map_err(|error| GroupPollError::Read(error.to_string()))
     }
 }
 

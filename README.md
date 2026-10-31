@@ -39,14 +39,14 @@ You need PostgreSQL 16 and one of Python 3.11, Rust 1.95, or Node.js 22.18, on m
 
 ```bash
 # Python
-uv add "wyrd-ai==0.3.0"
+uv add "wyrd-ai==0.4.0"
 
 # Rust
-cargo install wyrd-cli --version 0.3.0 --locked
-cargo add wyrd-ai@0.3.0 tokio --features tokio/full
+cargo install wyrd-cli --version 0.4.0 --locked
+cargo add wyrd-ai@0.4.0 tokio --features tokio/full
 
 # TypeScript
-pnpm add wyrd-ai@0.3.0
+pnpm add wyrd-ai@0.4.0
 ```
 
 Start a local server with `wyrd init` (`uv run wyrd init` or `pnpm wyrd init`), or let your coding agent do it with `wyrd init guided`. [Set up Wyrd](https://docs.bohmian.ai/wyrd/get-started/setup/) has the details.

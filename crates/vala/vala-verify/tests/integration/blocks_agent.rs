@@ -7,12 +7,13 @@ use std::time::Duration;
 use async_trait::async_trait;
 use serde_json::{Value, json};
 use skald_prompt::{OpenAiChatOptions, Prompt, ResponseFormat, openai_chat};
-use skald_runtime::{MockProvider, ProviderRegistry};
+use skald_providers::{ProviderError, ProviderStream};
+use skald_runtime::{MockProvider, Provider, ProviderRegistry};
 use skald_spec::wire::openai_chat::{
     OpenAiChatChoice, OpenAiChatMessage, OpenAiChatResponse, OpenAiMessageContent, OpenAiToolCall,
     OpenAiToolFunctionCall,
 };
-use skald_spec::{MediaRef, ProviderName, ProviderResponse};
+use skald_spec::{MediaRef, ProviderName, ProviderRequest, ProviderResponse};
 use skald_tool::{AgentTool, ToolError, ToolRegistry};
 use tokio::time::Instant;
 use vala_verify::blocks::{
@@ -225,6 +226,15 @@ fn agent(prompt: Prompt, tools: &[&str]) -> AgentCall {
     }
 }
 
+/// `call` with a one-iteration budget, so its first invalid structured
+/// answer exhausts the Agent instead of being repaired.
+fn once(mut call: AgentCall) -> AgentCall {
+    if let InlineableRef::Inline(spec) = &mut call.agent {
+        spec.run_config.max_iterations = Some(1);
+    }
+    call
+}
+
 /// A provider registry answering with `responses` in order.
 fn providers(responses: Vec<ProviderResponse>) -> Arc<ProviderRegistry> {
     let mock = MockProvider::new(ProviderName::OpenAi);
@@ -362,21 +372,42 @@ async fn step_agent_returns_structured_output() {
     );
 }
 
-/// A structured answer violating the Prompt's response schema is terminal.
+/// A structured answer still violating the Prompt's response schema when
+/// the budget runs out is terminal with the stable code and no answer
+/// content; within the budget it is repaired.
 ///
 /// # Panics
-/// Panics when the answer is accepted or retryable.
+/// Panics when the invalid answer is accepted, retryable, or echoed, or the
+/// repaired answer is refused.
 #[tokio::test(flavor = "multi_thread")]
 async fn step_agent_rejects_schema_violation() {
-    let executor = executor(vec![openai_text_response(r#"{"passed": "yes"}"#)]);
+    let invalid = || openai_text_response(r#"{"passed": "s3cr3t-value", "s3cr3t-key": 1}"#);
+    let exhausted = executor(vec![invalid()]);
     let error = step(
-        &executor,
-        &agent(structured_prompt(), &[]),
+        &exhausted,
+        &once(agent(structured_prompt(), &[])),
         input("response", json!("ok")),
     )
     .await
     .expect_err("the answer violates the schema");
-    assert!(matches!(error, BlockError::Terminal { .. }), "{error}");
+    let BlockError::Terminal { reason } = &error else {
+        panic!("expected terminal, got {error}");
+    };
+    assert!(
+        reason.starts_with("WYRD_AGENT_422_STRUCTURED_INVALID: "),
+        "{reason}"
+    );
+    assert!(!reason.contains("s3cr3t"), "{reason}");
+
+    let repaired = executor(vec![invalid(), openai_text_response(r#"{"passed": true}"#)]);
+    let output = step(
+        &repaired,
+        &agent(structured_prompt(), &[]),
+        input("response", json!("ok")),
+    )
+    .await
+    .expect("the repaired answer is accepted");
+    assert_eq!(output.output, json!({"passed": true}));
 }
 
 /// Inputs must equal the Prompt placeholders.
@@ -576,8 +607,9 @@ fn named_judge(format: Value) -> AgentCall {
 /// UTF-8 text or of a wide array, 16 nested containers, and failed
 /// judgments, is kept; missing, wrong, null, or undeclared data, one byte
 /// past either size boundary, 17 containers, and unknown envelope members
-/// are terminal without echoing the answer; the plain format refuses any
-/// data; and a citation-less pass is still inconclusive.
+/// are terminal without echoing the answer on a one-iteration budget; the
+/// plain format refuses any data; and a citation-less pass is still
+/// inconclusive.
 ///
 /// # Panics
 /// Panics when an invalid answer is accepted, a valid one is refused, or a
@@ -586,7 +618,7 @@ fn named_judge(format: Value) -> AgentCall {
 async fn check_agent_validates_custom_data() {
     let data = json!({"type": "object", "properties": {"score": {"type": "number"}, "note": {"type": "string"}, "tree": {}},
         "required": ["score", "note"], "additionalProperties": false});
-    let custom = named_judge(json!({"kind": "verdict", "data": data}));
+    let custom = once(named_judge(json!({"kind": "verdict", "data": data})));
     let cited = json!([{"slot": "deck", "locator": {"page": 3}}]);
     let answer = |outcome: &str, extra: Value| {
         let mut body = json!({"outcome": outcome, "reason": "judged", "citations": cited});
@@ -680,7 +712,7 @@ async fn check_agent_validates_custom_data() {
     }
 
     for format in [json!("verdict"), json!({"kind": "verdict"})] {
-        let plain = named_judge(format.clone());
+        let plain = once(named_judge(format.clone()));
         let executor = executor(vec![
             answer("failed", json!({})),
             answer("failed", json!({"data": {"score": 1}})),
@@ -709,10 +741,12 @@ async fn check_agent_validates_custom_data() {
         );
     }
 
-    let rooted = named_judge(json!({"kind": "verdict", "data": {"type": "object",
+    let rooted = once(named_judge(
+        json!({"kind": "verdict", "data": {"type": "object",
         "required": ["reason", "copy", "pair"],
         "properties": {"reason": {"type": "integer"}, "copy": {"$ref": "#/properties/reason"},
-            "pair": {"type": "array", "prefixItems": [{"type": "string"}, {"type": "integer"}]}}}}));
+            "pair": {"type": "array", "prefixItems": [{"type": "string"}, {"type": "integer"}]}}}}),
+    ));
     let good = json!({"reason": 1, "copy": 2, "pair": ["a", 1]});
     let executor = executor(vec![
         answer("passed", json!({"data": good})),
@@ -744,21 +778,212 @@ async fn check_agent_validates_custom_data() {
     }
 }
 
-/// A check Agent answer outside the Verdict schema is terminal.
+/// A check Agent answer outside the Verdict schema exhausts a one-iteration
+/// budget terminally, with the stable code and no answer content.
 ///
 /// # Panics
-/// Panics when the answer is accepted or retryable.
+/// Panics when the answer is accepted, retryable, or echoed.
 #[tokio::test(flavor = "multi_thread")]
 async fn check_agent_rejects_non_verdict() {
-    let executor = executor(vec![openai_text_response(r#"{"outcome": "passed"}"#)]);
+    let executor = executor(vec![openai_text_response(
+        r#"{"outcome": "s3cr3t", "s3cr3t-key": {"nested": "s3cr3t"}}"#,
+    )]);
     let error = check(
         &executor,
-        &agent(verdict_prompt(), &[]),
+        &once(named_judge(json!("verdict"))),
         input("response", json!("ok")),
     )
     .await
     .expect_err("the answer is not a Verdict");
-    assert!(matches!(error, BlockError::Terminal { .. }), "{error}");
+    let BlockError::Terminal { reason } = &error else {
+        panic!("expected terminal, got {error}");
+    };
+    assert!(
+        reason.starts_with("WYRD_AGENT_422_STRUCTURED_INVALID: "),
+        "{reason}"
+    );
+    assert!(!reason.contains("s3cr3t"), "{reason}");
+}
+
+/// A check Agent whose provider refuses without an answer is terminal with
+/// the stable code after one call, though budget and a valid Verdict remain.
+///
+/// # Panics
+/// Panics when the refusal is repaired, accepted, or echoed.
+#[tokio::test(flavor = "multi_thread")]
+async fn check_agent_refusal_is_not_repaired() {
+    let mut refusal = openai_text_response("");
+    if let ProviderResponse::OpenAiChatCompletion(response) = &mut refusal {
+        response.choices[0].message.content = None;
+        response.choices[0].message.refusal = Some("s3cr3t".to_owned());
+    }
+    let valid = openai_text_response(
+        &json!({"outcome": "passed", "reason": "r", "citations": []}).to_string(),
+    );
+    let (executor, provider) = recording(vec![refusal, valid]);
+    let error = check(
+        &executor,
+        &named_judge(json!("verdict")),
+        input("response", json!("ok")),
+    )
+    .await
+    .expect_err("a refusal is inconclusive");
+    let BlockError::Terminal { reason } = &error else {
+        panic!("expected terminal, got {error}");
+    };
+    assert!(
+        reason.starts_with("WYRD_AGENT_422_STRUCTURED_INVALID: "),
+        "{reason}"
+    );
+    assert!(!reason.contains("s3cr3t"), "{reason}");
+    assert_eq!(provider.requests.lock().expect("unpoisoned").len(), 1);
+}
+
+/// A provider that records each native request before answering from a
+/// [`MockProvider`] queue.
+#[derive(Clone)]
+struct Recording {
+    /// The scripted answers.
+    mock: MockProvider,
+    /// Requests in send order.
+    requests: Arc<std::sync::Mutex<Vec<ProviderRequest>>>,
+}
+
+#[async_trait]
+impl Provider for Recording {
+    /// Records `request` and answers from the queue.
+    ///
+    /// # Errors
+    /// Returns the mock's error for an empty queue.
+    ///
+    /// # Panics
+    /// Panics when the request log's lock is poisoned.
+    async fn send(&self, request: ProviderRequest) -> Result<ProviderResponse, ProviderError> {
+        self.requests
+            .lock()
+            .expect("unpoisoned")
+            .push(request.clone());
+        self.mock.send(request).await
+    }
+
+    /// Streams are not used.
+    ///
+    /// # Errors
+    /// Always the mock's empty-stream error.
+    async fn stream(&self, request: ProviderRequest) -> Result<ProviderStream, ProviderError> {
+        self.mock.stream(request).await
+    }
+
+    /// The mocked provider name.
+    fn name(&self) -> ProviderName {
+        self.mock.name()
+    }
+}
+
+/// An executor over a [`Recording`] provider answering `responses`.
+fn recording(responses: Vec<ProviderResponse>) -> (AgentExecutor, Recording) {
+    let provider = Recording {
+        mock: MockProvider::new(ProviderName::OpenAi),
+        requests: Arc::default(),
+    };
+    for response in responses {
+        provider.mock.push_response(response);
+    }
+    let mut providers = ProviderRegistry::new();
+    providers.register(Arc::new(provider.clone()));
+    let executor = AgentExecutor::new(
+        Arc::new(providers),
+        Arc::new(NoRegistry),
+        Arc::new(NoRegistry),
+    )
+    .with_evidence(Arc::new(PinnedDeck));
+    (executor, provider)
+}
+
+/// The citation-slot `enum` one recorded OpenAI chat request sends, null
+/// when the slots are unrestricted.
+///
+/// # Panics
+/// Panics when the request carries no JSON schema response format.
+fn sent_slots(request: &ProviderRequest) -> Value {
+    let body = serde_json::to_value(request).expect("request serializes");
+    body["body"]["response_format"]["json_schema"]["schema"]["$defs"]["SlotName"]["enum"].clone()
+}
+
+/// One JSON `response` input whose provenance is `slots`.
+///
+/// # Panics
+/// Panics when a slot name is invalid.
+fn sourced(value: &str, slots: &[&str]) -> BTreeMap<String, CallInput> {
+    BTreeMap::from([(
+        "response".to_owned(),
+        CallInput {
+            value: CallValue::Json(json!(value)),
+            sources: slots
+                .iter()
+                .map(|&slot| SlotName::new(slot).expect("slot"))
+                .collect(),
+        },
+    )])
+}
+
+/// A check's provider request admits exactly the invocation's reachable
+/// slots, so a prefixed slot is repaired before judgment; concurrent calls
+/// keep distinct restrictions, the Agent Card is untouched, and a call with
+/// no reachable source sends the unrestricted slot definition.
+///
+/// # Panics
+/// Panics when a request's slots differ from its call's, the wrong slot is
+/// not repaired, or the Card changes.
+#[tokio::test(flavor = "multi_thread")]
+async fn check_agent_narrows_citation_slots_per_call() {
+    let verdict = |slot: &str| {
+        openai_text_response(
+            &json!({"outcome": "passed", "reason": "r", "citations": [{"slot": slot, "locator": {"page": 3}}]})
+                .to_string(),
+        )
+    };
+    let judge = named_judge(json!("verdict"));
+    let card = serde_json::to_value(&judge.agent).expect("card");
+    let (executor, provider) = recording(vec![verdict("inputs.deck"), verdict("deck")]);
+    let output = check(&executor, &judge, sourced("x", &["deck"]))
+        .await
+        .expect("the repaired check runs");
+    assert_eq!(output.verdict.outcome, VerificationVerdict::Passed);
+    let requests = provider.requests.lock().expect("unpoisoned").clone();
+    assert_eq!(requests.len(), 2, "one repair");
+    for request in &requests {
+        assert_eq!(sent_slots(request), json!(["deck"]));
+    }
+    assert!(
+        serde_json::to_string(&requests[1])
+            .expect("serializes")
+            .contains("was not accepted"),
+        "the repair turn reaches the provider"
+    );
+
+    let (executor, provider) = recording(vec![verdict("deck"), verdict("deck"), verdict("deck")]);
+    let (first, second) = tokio::join!(
+        check(&executor, &judge, sourced("call-a", &["deck"])),
+        check(&executor, &judge, sourced("call-b", &["deck", "policy"])),
+    );
+    first.expect("first check");
+    second.expect("second check");
+    check(&executor, &judge, sourced("call-c", &[]))
+        .await
+        .expect("unsourced check");
+    for request in provider.requests.lock().expect("unpoisoned").iter() {
+        let text = serde_json::to_string(request).expect("serializes");
+        let expected = if text.contains("call-a") {
+            json!(["deck"])
+        } else if text.contains("call-b") {
+            json!(["deck", "policy"])
+        } else {
+            Value::Null
+        };
+        assert_eq!(sent_slots(request), expected, "{text}");
+    }
+    assert_eq!(serde_json::to_value(&judge.agent).expect("card"), card);
 }
 
 /// A check Agent reads its workspace through its declared tools, and a

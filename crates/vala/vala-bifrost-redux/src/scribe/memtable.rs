@@ -326,16 +326,94 @@ impl Memtable {
         meta: ScribeAppendMeta,
         batch: RecordBatch,
     ) -> Result<(), ScribeError> {
+        self.insert_with_layout(seal_key, meta, batch, None)
+    }
+
+    /// Inserts an append whose rows are already in `layout`, or canonical when `None`.
+    ///
+    /// A new generation pins `layout` for its whole life and keeps the
+    /// layout's logical schema as its table schema, while its batches hold the
+    /// physical rows. Every later append to that generation must carry the
+    /// same layout; the shard chose it from [`Self::generation_layout`] before
+    /// converting, so a difference is an ownership bug and is refused.
+    ///
+    /// # Errors
+    /// Returns [`ScribeError::Internal`] if the bucket lock is poisoned or the
+    /// append's layout is not the generation's pinned layout.
+    pub(crate) fn insert_with_layout(
+        &self,
+        seal_key: &SealKey,
+        meta: ScribeAppendMeta,
+        batch: RecordBatch,
+        layout: Option<Arc<crate::scribe::layout_cache::LearnedLayout>>,
+    ) -> Result<(), ScribeError> {
         let mut buckets = self.writable.write().map_err(|e| ScribeError::Internal {
             detail: format!("memtable bucket lock poisoned: {e}"),
         })?;
 
-        let bucket = buckets
-            .entry(seal_key.clone())
-            .or_insert_with(|| MemtableBucket::new(seal_key.clone(), batch.schema()));
+        let bucket = buckets.entry(seal_key.clone()).or_insert_with(|| {
+            let schema = layout
+                .as_ref()
+                .map_or_else(|| batch.schema(), |layout| Arc::clone(layout.logical()));
+            MemtableBucket::new(seal_key.clone(), schema).with_layout(layout.clone())
+        });
+        let same_layout = match (&bucket.layout, &layout) {
+            (None, None) => true,
+            (Some(pinned), Some(layout)) => Arc::ptr_eq(pinned, layout),
+            _ => false,
+        };
+        if !same_layout {
+            return Err(ScribeError::Internal {
+                detail: format!("append to {seal_key} is not in its generation's pinned layout"),
+            });
+        }
 
         bucket.append(meta, batch);
         Ok(())
+    }
+
+    /// Returns the Variant layout rows of `seal_key` must take; `None` is canonical.
+    ///
+    /// An open generation keeps the layout it pinned. With none open, the
+    /// generation the rows will open takes `fresh()`, which is called with
+    /// the bucket lock released.
+    ///
+    /// # Errors
+    /// Returns [`ScribeError::Internal`] if the bucket lock is poisoned.
+    pub(crate) fn generation_layout(
+        &self,
+        seal_key: &SealKey,
+        fresh: impl FnOnce() -> Option<Arc<crate::scribe::layout_cache::LearnedLayout>>,
+    ) -> Result<Option<Arc<crate::scribe::layout_cache::LearnedLayout>>, ScribeError> {
+        let pinned = self
+            .writable
+            .read()
+            .map_err(|e| ScribeError::Internal {
+                detail: format!("memtable bucket lock poisoned: {e}"),
+            })?
+            .get(seal_key)
+            .map(|bucket| bucket.layout.clone());
+        Ok(pinned.unwrap_or_else(fresh))
+    }
+
+    /// Reports, per writable bucket of `tenant`'s `table`, whether it pinned a learned layout.
+    ///
+    /// # Errors
+    /// Returns [`ScribeError::Internal`] if the bucket lock is poisoned.
+    #[cfg(any(test, feature = "test-support"))]
+    pub(crate) fn writable_layouts_for_test(
+        &self,
+        tenant: DataTenantId,
+        table: &crate::catalog::TableRef,
+    ) -> Result<Vec<bool>, ScribeError> {
+        let buckets = self.writable.read().map_err(|e| ScribeError::Internal {
+            detail: format!("memtable bucket lock poisoned: {e}"),
+        })?;
+        Ok(buckets
+            .iter()
+            .filter(|(key, _)| key.tenant == tenant && &key.table == table)
+            .map(|(_, bucket)| bucket.layout.is_some())
+            .collect())
     }
 
     /// Return the row count for a batch that is still retained in the active
@@ -1338,7 +1416,13 @@ impl Default for Memtable {
 #[derive(Debug)]
 pub(crate) struct MemtableBucket {
     seal_key: SealKey,
+    /// Logical table schema of the generation's rows.
     schema: SchemaRef,
+    /// Variant layout the generation pinned when it opened; `None` is canonical.
+    ///
+    /// Every batch is in this layout's physical schema, which may differ from
+    /// `schema` only in shredded Variant storage.
+    layout: Option<Arc<crate::scribe::layout_cache::LearnedLayout>>,
     /// Sealed runs of [`APPEND_RUN_LEN`] appends each, oldest first, shared
     /// by reference with every live capture.
     runs: Vec<AppendRun>,
@@ -1360,6 +1444,7 @@ impl MemtableBucket {
         Self {
             seal_key,
             schema,
+            layout: None,
             runs: Vec::new(),
             tail: AppendTail::default(),
             metas: Vec::new(),
@@ -1369,6 +1454,15 @@ impl MemtableBucket {
             last_insert_at: now,
             charge: Arc::default(),
         }
+    }
+
+    /// Pins the Variant layout this generation's rows are retained in.
+    fn with_layout(
+        mut self,
+        layout: Option<Arc<crate::scribe::layout_cache::LearnedLayout>>,
+    ) -> Self {
+        self.layout = layout;
+        self
     }
 
     /// Retains one append batch with its metadata and exact column bounds.
@@ -1690,10 +1784,14 @@ pub struct FrozenMemtable {
     /// the same value its hot-source ordinals carry. Post-commit routing MUST
     /// use this field rather than recomputing the route from `seal_key`.
     pub shard_id: usize,
-    /// Arrow schema shared by all append batches.
+    /// Logical table schema of every append batch.
     pub schema: SchemaRef,
     /// Original append batches, preserved for LSN-granular live tail reads
     /// and shared by reference with every live capture.
+    ///
+    /// All batches share one physical schema: `schema` for a canonical
+    /// generation, or the layout the generation pinned when it opened, which
+    /// differs from `schema` only in shredded Variant storage.
     pub batches: Arc<[RecordBatch]>,
     /// Exact column bounds of each batch, index-aligned with `batches`.
     ///
@@ -2102,10 +2200,23 @@ impl ReadableSource {
     /// every batch. Bounds are shared unchanged when the projection reads
     /// every written column, in order and uncast.
     ///
+    /// A generation retained in a learned Variant layout is emitted in its
+    /// logical schema: each projected shredded Variant column is reconstructed
+    /// from its typed leaves and residual, so a capture never exposes a
+    /// physical layout and memory unions with staged and published rows value
+    /// for value. Before reconstruction such a batch is filtered by `pruning`'s
+    /// predicate, adapted to the physical layout by DataFusion's
+    /// [`DefaultPhysicalExprAdapterFactory`], so only matching rows are
+    /// reconstructed and Variant functions can read typed leaves. A filtered
+    /// batch's bounds become inexact. A predicate that does not adapt or
+    /// evaluate filters nothing here; the query's own filter still runs.
+    ///
+    /// [`DefaultPhysicalExprAdapterFactory`]: datafusion::physical_expr_adapter::DefaultPhysicalExprAdapterFactory
+    ///
     /// # Errors
     ///
     /// Returns the column-selection error unchanged, or an internal error
-    /// when Arrow cast or batch assembly fails.
+    /// when Variant reconstruction, Arrow cast, or batch assembly fails.
     fn project(
         &self,
         required: &[FieldRef],
@@ -2158,7 +2269,10 @@ impl ReadableSource {
             })
             .collect();
         let keep = pruning.map(|pruning| pruning.keep(&statistics, statistics.len()));
-        for (index, ((batch, wal_lsn_max), statistics)) in self
+        // One generation pins one layout, so the predicate adapts once to the
+        // first physical batch and serves them all.
+        let mut adapted: Option<Option<Arc<dyn datafusion::physical_expr::PhysicalExpr>>> = None;
+        for (index, ((batch, wal_lsn_max), mut statistics)) in self
             .runs
             .iter()
             .flat_map(|run| run.batches.iter().zip(run.wal_lsns.iter().copied()))
@@ -2168,19 +2282,57 @@ impl ReadableSource {
             if keep.as_ref().is_some_and(|keep| !keep[index]) {
                 continue;
             }
-            let rows = batch.num_rows();
+            let shredded = projection.iter().any(|(_, source)| {
+                source.is_some_and(|column| {
+                    batch.column(column).data_type() != self.schema.field(column).data_type()
+                })
+            });
+            let mut physical = physical_projection(batch, &schema, &projection);
+            if let Some(pruning) = pruning.filter(|_| shredded) {
+                let predicate = adapted.get_or_insert_with(|| {
+                    use datafusion::physical_expr_adapter::PhysicalExprAdapterFactory as _;
+                    datafusion::physical_expr_adapter::DefaultPhysicalExprAdapterFactory
+                        .create(Arc::clone(&schema), physical.schema())
+                        .ok()?
+                        .rewrite(Arc::clone(pruning.predicate().orig_expr()))
+                        .ok()
+                });
+                if let Some(kept) = predicate.as_ref().and_then(|predicate| {
+                    datafusion::physical_plan::filter::batch_filter(&physical, predicate).ok()
+                }) {
+                    if kept.num_rows() == 0 {
+                        continue;
+                    }
+                    if kept.num_rows() != physical.num_rows() {
+                        statistics = Arc::new(statistics.as_ref().clone().to_inexact());
+                    }
+                    physical = kept;
+                }
+            }
+            let rows = physical.num_rows();
             let columns = projection
                 .iter()
-                .zip(&kept)
-                .map(|((field, source), kept)| match (source, kept) {
-                    (Some(column), Some(_)) => Ok(Arc::clone(batch.column(*column))),
-                    (Some(column), None) => {
-                        arrow::compute::cast(batch.column(*column), field.data_type())
+                .zip(physical.schema_ref().fields())
+                .zip(physical.columns())
+                .map(|(((field, source), stored), column)| match source {
+                    Some(source) => {
+                        let logical = crate::schema::logical_column(
+                            stored,
+                            column,
+                            self.schema.field(*source),
+                        )
+                        .map_err(|detail| ScribeError::Internal {
+                            detail: format!("live-tail Variant reconstruction failed: {detail}"),
+                        })?;
+                        if logical.data_type() == field.data_type() {
+                            Ok(logical)
+                        } else {
+                            arrow::compute::cast(&logical, field.data_type()).map_err(internal)
+                        }
                     }
-                    (None, _) => Ok(arrow::array::new_null_array(field.data_type(), rows)),
+                    None => Ok(Arc::clone(column)),
                 })
-                .collect::<Result<Vec<_>, _>>()
-                .map_err(internal)?;
+                .collect::<Result<Vec<_>, _>>()?;
             let batch = RecordBatch::try_new_with_options(
                 Arc::clone(&schema),
                 columns,
@@ -2197,6 +2349,47 @@ impl ReadableSource {
         }
         Ok(())
     }
+}
+
+/// Returns `batch`'s columns `projection` reads, unconverted, under the names
+/// of `schema`, with a projected field the batch predates filled with nulls:
+/// the stored layout a capture filters before reconstructing it in `schema`.
+///
+/// # Panics
+///
+/// Never in practice: every column comes from `batch` or is built at its row
+/// count, under its own field.
+fn physical_projection(
+    batch: &RecordBatch,
+    schema: &SchemaRef,
+    projection: &[(FieldRef, Option<usize>)],
+) -> RecordBatch {
+    let (fields, columns): (Vec<_>, Vec<_>) = projection
+        .iter()
+        .zip(schema.fields())
+        .map(|((field, source), named)| match source {
+            Some(column) => (
+                Arc::new(
+                    batch
+                        .schema_ref()
+                        .field(*column)
+                        .clone()
+                        .with_name(named.name()),
+                ),
+                Arc::clone(batch.column(*column)),
+            ),
+            None => (
+                Arc::clone(named),
+                arrow::array::new_null_array(field.data_type(), batch.num_rows()),
+            ),
+        })
+        .unzip();
+    RecordBatch::try_new_with_options(
+        Arc::new(Schema::new(fields)),
+        columns,
+        &arrow::array::RecordBatchOptions::new().with_row_count(Some(batch.num_rows())),
+    )
+    .expect("columns taken from one batch share its row count and their own fields")
 }
 
 /// Computes one append batch's exact row count, every column's byte size,

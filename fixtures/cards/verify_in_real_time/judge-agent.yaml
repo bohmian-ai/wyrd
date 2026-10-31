@@ -6,4 +6,4 @@ metadata:
 spec:
   prompt: ./judge-prompt.yaml
   execution_route: {kind: wyrd_gateway, deployment: openai}
-  run_config: {max_iterations: 1}
+  run_config: {max_iterations: 2}

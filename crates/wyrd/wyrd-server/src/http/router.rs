@@ -118,7 +118,7 @@ pub fn build_router(state: AppState) -> Router {
     // keep in step with this one. Gateway inference sits outside `/v1`'s
     // default-deny layer because each protocol authenticates its own SDK
     // credential carrier, but it is documented by the same composition.
-    let (routed, mut document) = OpenApiRouter::with_openapi(WyrdApiDoc::openapi())
+    let api = OpenApiRouter::with_openapi(WyrdApiDoc::openapi())
         .merge(auth_routes)
         .merge(platform_auth_router())
         .merge(platform_login_router())
@@ -126,8 +126,10 @@ pub fn build_router(state: AppState) -> Router {
         .merge(platform_identity_router())
         .merge(platform_credentials_router())
         .merge(gateway_ingress_router(&state))
-        .nest("/v1", v1_group)
-        .split_for_parts();
+        .nest("/v1", v1_group);
+    #[cfg(feature = "bench")]
+    let api = api.merge(crate::components::platform::benchmark::platform_benchmark_router());
+    let (routed, mut document) = api.split_for_parts();
     // The document-wide modifiers run after composition because they read the
     // assembled paths.
     SecurityAddon.modify(&mut document);

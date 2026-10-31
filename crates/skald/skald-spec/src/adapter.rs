@@ -166,6 +166,17 @@ impl<'a> ResponseAdapter<'a> {
         Some(UsageView { usage })
     }
 
+    /// Whether the provider declined to answer: an OpenAI Chat `refusal`, or
+    /// a finish the adapter reduces to [`FinishReason::ContentFilter`].
+    pub fn refused(&self) -> bool {
+        let chat_refusal = matches!(
+            self.response,
+            ProviderResponse::OpenAiChatCompletion(response)
+                if response.choices.first().is_some_and(|choice| choice.message.refusal.is_some())
+        );
+        chat_refusal || self.finish_reason() == FinishReason::ContentFilter
+    }
+
     /// Read reduced provider finish reason.
     pub fn finish_reason(&self) -> FinishReason {
         match self.response {

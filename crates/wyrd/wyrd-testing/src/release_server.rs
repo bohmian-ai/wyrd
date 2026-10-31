@@ -29,7 +29,7 @@ pub(crate) mod os;
 
 pub use os::{HostLoad, PEAK_SAMPLE_INTERVAL_MS, PeakSampler};
 
-use secrecy::SecretString;
+use secrecy::{ExposeSecret, SecretString};
 use tempfile::TempDir;
 
 /// The server's default public HTTP address, as the guide exports it in
@@ -149,6 +149,9 @@ pub struct LocalServer {
     host: Host,
     /// Tenants in the order `setup` provisioned them.
     tenants: Vec<SetupTenant>,
+    /// The platform root credential the first `setup` disclosed, kept only
+    /// in this process's memory for the server's lifetime.
+    platform: Option<SecretString>,
 }
 
 impl LocalServer {
@@ -192,12 +195,11 @@ impl LocalServer {
 
         let operator = |program: &Path| operator(program, &workdir, &storage_url, env);
 
-        let mut platform: Option<String> = None;
         for slug in tenants {
             let mut setup = operator(binary);
             setup.args(["setup", "--tenant", slug]);
-            if let Some(credential) = &platform {
-                setup.env("WYRD_PLATFORM_CREDENTIAL", credential);
+            if let Some(credential) = &server.platform {
+                setup.env("WYRD_PLATFORM_CREDENTIAL", credential.expose_secret());
             }
             let printed =
                 OperatorRun::spawn(&mut setup, &workdir.join(format!("setup-{slug}.stderr")))?
@@ -210,11 +212,11 @@ impl LocalServer {
                     .map(|value| value.trim().to_owned())
                     .ok_or_else(|| format!("`wyrd-server setup --tenant {slug}` printed no {name}"))
             };
-            if platform.is_none() {
-                platform = printed
+            if server.platform.is_none() {
+                server.platform = printed
                     .lines()
                     .find(|line| line.starts_with("wyrd_global_"))
-                    .map(str::to_owned);
+                    .map(|line| SecretString::from(line.to_owned()));
             }
             server.tenants.push(SetupTenant {
                 slug: (*slug).to_owned(),
@@ -249,6 +251,7 @@ impl LocalServer {
             child: None,
             root,
             tenants: Vec::new(),
+            platform: None,
         };
         server.launch(binary, storage_url, env).await?;
         Ok(server)
@@ -327,6 +330,12 @@ impl LocalServer {
             .first()
             .expect("the server was started with at least one tenant")
             .api_key
+    }
+
+    /// The platform root credential the first `setup` disclosed, or `None`
+    /// when the server was started with no tenant.
+    pub const fn platform_credential(&self) -> Option<&SecretString> {
+        self.platform.as_ref()
     }
 
     /// Every tenant `setup` provisioned, in order.

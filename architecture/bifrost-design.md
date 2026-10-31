@@ -384,9 +384,11 @@ typed columns:
   schedule selector records its `[previous boundary, due)` window and the
   selected observation `record_id`s. Selectors reference live logical rows,
   never copy their values, and are resolved on every execution, retry, and
-  read. The server-owned `queue_execution` marker is true only for
-  `submitted`, which alone activates queued work; its `activation` holds the
-  accepted route overrides, idempotency key, request digest, and authority.
+  read. The server-owned `queue_execution` marker is true for every queued
+  origin, `submitted`, `group`, and `schedule`, and false for `direct`; only
+  a marked row's acknowledgement admits queued work. A `submitted` row's
+  `activation` holds the accepted route overrides, idempotency key, request
+  digest, and authority.
   Its published input timestamp is `recorded_at`, the server-recorded input
   time, distinct from execution timing or sample/window time. It uses the
   same execution/binding/application-Run correlation names where applicable.
@@ -415,7 +417,8 @@ that do not fit the layout stay in the residual `value`,
 so the layout changes performance only, never a result. Both readers unshred
 at any depth before rows leave the scan.
 
-- **Scribe** recovery-stage runs stay unshredded. Each final hot object's
+- **Scribe** keeps one logical schema per table version and may retain rows
+  in a physical layout. Each final hot object's
   layout is chosen before its writer opens, from one seeded, stratified sample
   of the claim: strata are `sub_principal_id` values, subjects with fewer than 30
   rows share one stratum, and each stratum samples Cochran's size for 99%
@@ -423,7 +426,30 @@ at any depth before rows leave the scan.
   stratum's sampled non-null values hold it with one compatible type. The seed
   is the claim, so a re-run claim writes the same objects. Each element of a
   Variant inside a List counts as one observation, and one layout covers every
-  element. The sample holds counters, never rows.
+  element. The sample holds counters, never rows. The sample and the claim
+  merge read complete values — typed leaves plus residual reconstructed by the
+  recursive `unshred_variants` — so a key a staged run kept only in its
+  residual stays discoverable; runs of different layouts merge only after
+  their footers name the claim's logical schema and tenant.
+- **Learned layouts.** A successful claim assembly installs its layout in a
+  process-local advisory cache keyed by exact tenant, table, and table
+  version, in completion order; entries are bounded in count and charged to
+  the Scribe governed root, and eviction releases only the cache's ownership.
+  A shard pins the cached layout when it opens a generation for a seal key and
+  keeps it until the generation closes; a generation opened cold stays
+  canonical. Rows are shredded on the admitted ingress CPU lane before WAL
+  submission, with an upper bound for the conversion reserved first and the
+  originals released after; the WAL keeps canonical IPC, logical fingerprint,
+  and digest. A failed reservation or conversion refuses the append before
+  WAL. Staging writes the frozen generation's rows as is; recovery
+  reconstructs the run's logical schema from its layout. Memory reads
+  reconstruct logical Variant storage before rows leave the capture, so unions
+  and remote output never expose a physical layout. A capture first filters a
+  physical generation by the query predicate, adapted to that layout by
+  DataFusion's expression adapter, so only matching rows are reconstructed;
+  Wyrd classifies no query shape. A restart or eviction only
+  returns new generations to canonical until a claim teaches the process
+  again; no hint crosses processes, tenants, or table versions.
 - **Forge** samples nothing. It sums each source footer's shredded-leaf
   non-null counts, keeps keys covering at least 10% of the combined rows,
   gives a type conflict to the type covering more rows, and writes every output
@@ -568,6 +594,15 @@ retries use the recorded shard. Each shard owns a bounded mailbox, its own WAL
 stream, memtable buckets, and cohort state. Shards are a pod-local concurrency
 topology, not tenant partitions or table reservations. Replay maps a recorded
 shard onto the running count, so the count may change across restarts.
+
+Each shard syncs only its own WAL, so one group's sync covers only that
+shard's requests. More shards therefore mean more syncs per acknowledged
+request, which lowers throughput wherever a durable sync is expensive; the
+default of one shard maximizes sync coverage. A WAL sync covers every append
+that finished before it began, appends continue while it runs, and a sync
+whose appends an earlier sync already covered issues no `fdatasync`. A shard
+holds one WAL IO worker for each blocking append and sync, so boot runs at
+least one WAL IO worker per shard.
 
 Each shard rotates its WAL and memtable together when the WAL reaches
 `WYRD_MAX_FILE_SIZE_ON_DISK` (MiB), the memtable reaches
@@ -757,6 +792,16 @@ current-property reconstruction may relabel a staged output. Staged runs remain
 authoritative until that transaction is
 committed or reconciled as identical. New cuts then use the published object;
 existing staged-reader leases finish before local deletion.
+
+A server built with the `bench` cargo feature, which only the benchmark
+build enables, adds `POST /platform/benchmark/scribe/stage` (`stage_writable`,
+`{"rows_staged": n}`) and `POST /platform/benchmark/scribe/publish`
+(`flush_staged`, `{"claims_published": n}`). Both run this process's
+production transitions for every tenant it holds, so a benchmark places its
+fixture without waiting on rotation or retention. They are serialized per
+replica, require the platform administrator's `tenant_suspend` permission, are
+audited as `platform.authz` without blocking, and are not OpenAPI operations.
+A shipped server has neither route.
 
 ### Live tail, recovery, and shutdown
 
@@ -1244,15 +1289,19 @@ Python, TypeScript, and MCP.
 audit event is staged in memory on the process Scribe outbox, whose one
 background writer cuts each tenant's writes into producer lanes keyed by
 request, Verifier execution, or a queued submission's idempotency key, lets a
-lane's slice linger until its oldest write is 50 ms old or it holds 4,096 writes,
-as a Kafka producer's `linger.ms` and `batch.size` do, groups a lane's slice by destination, and
+lane's slice linger until its oldest write is 50 ms old or it holds 4,096 writes
+or 32 MiB of accounted bytes, as a Kafka producer's `linger.ms` and `batch.size`
+do, takes at most 32 MiB of a lane's backlog per slice, so a large backlog is
+written and its capacity released a bounded slice at a time, groups a lane's
+slice by destination, and
 builds each group's rows once into dense Arrow batches from the owned values
-and encoded Variants each write staged, never one batch per write. Each frame
-is encoded as Arrow IPC, which sizes and splits it and derives its batch id
-from that content. The local Scribe receives the frame's rows in-process as
+and encoded Variants each write staged, never one batch per write. Frames are
+sized from their rows' sliced Arrow bytes, and each frame's batch id derives
+from the slice's idempotency key, which every retry of the slice keeps, and
+the frame's position in it. The local Scribe receives the frame's rows in-process as
 server-built canonical batches under ordinary admission, without decoding or
-revalidating values the producer built; from a pod without Scribe, the IPC
-bytes travel to a Scribe pod over the mutually authenticated peer plane, which
+revalidating values the producer built and without an IPC encoding; from a pod
+without Scribe, the frame is encoded as Arrow IPC once and the bytes travel to a Scribe pod over the mutually authenticated peer plane, which
 validates them in full. Both carry the same rows under the same batch id. Audit frames are submitted under the
 platform audit principal, the one principal Scribe admits for the reserved
 system owner's audit history. A retryable failure resubmits the identical
@@ -1645,6 +1694,8 @@ across a restart; durable batch, file, and task rows answer that question.
   `bifrost_scribe_lane_active{lane}` is running jobs.
   `bifrost_scribe_publication_files_total` and `_bytes_total` count committed
   publication output after its catalog transaction commits.
+  `bifrost_scribe_variant_layouts_learned{namespace}` is the process's cached
+  learned Variant layouts per Bifrost namespace, republished on each install.
 - **Oracle.** `oracle_query_duration_seconds{class,outcome}` starts after Gate
   dispatch and measures Oracle execution through its terminal; the production
   HPA and query reports read it. Outcomes are `success`, `degraded`, `failed`,
@@ -1775,10 +1826,13 @@ acknowledges its `execution_inputs` batch, through the existing batched
 request outbox; staged inputs not yet acknowledged are lost on abrupt process
 death, and the execution then never becomes visible. The row stores no input
 values: the runner resolves them, and the accepted routes, from that input
-record. A group or schedule execution's selector record is staged on a slot
-reserved before its PostgreSQL commit and is staged right after it; a runner
-claiming the execution before the record is readable retries it as evidence
-unavailable. `bifrost.storage.objects` is the one completed-object inventory:
+record. A group or schedule execution follows the same order: the scheduler
+prepares it without writing the queue and stages its selector record on a
+slot reserved before preparation, and only that record's acknowledgement
+admits the execution, in the transaction that moves the expected schedule
+cursor or consumes the selected pending group generation. A runner that
+still finds the record unreadable retries it as evidence unavailable.
+`bifrost.storage.objects` is the one completed-object inventory:
 each Card file completion, Card envelope write, and Card deletion stages one
 row, keyed by `storage_path` and bound to its Card through `subject_card_uid`
 and `relative_path`, and a deletion row dominates every completion of that

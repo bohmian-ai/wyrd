@@ -527,8 +527,14 @@ spec:
 ```
 
 `response_format: verdict` (or `{kind: verdict}`) compiles the closed
-Verdict schema generated from Wyrd's canonical `Verdict` type; `data` adds a
-required custom object with that schema. A `data` schema is JSON Schema
+Verdict schema generated from Wyrd's canonical `Verdict` type, projected onto
+the subset OpenAI strict mode, Anthropic, and Gemini all accept: `oneOf`
+becomes `anyOf`, a `const` alternation one `enum`, and `$ref` siblings,
+`format`, and `minimum` are dropped, while typed decoding still enforces the
+numeric ranges. `data` adds a required custom object with that schema, kept
+exactly as authored. A named format lowers to non-strict OpenAI structured
+output, because an authored `data` schema need not satisfy strict mode;
+validation is Wyrd's either way. A `data` schema is JSON Schema
 2020-12 (no other `$schema`) without a root `$id`; it is embedded as its own
 resource so its local references resolve as they do standalone. The card keeps and hashes the
 authored form, never the expanded provider settings. On a native body the
@@ -574,6 +580,19 @@ through the caller's tenant gateway, with ordinary authorization, capture,
 and audit; the deployment is never derived from the Prompt provider. An
 invocation may supply a whole replacement route for that invocation only;
 it never changes the Card, its hash, or a concurrent invocation.
+
+A structured-output Agent validates every proposed final answer against the
+exact response schema its outgoing request sent, after rendering and
+`before_model` hooks. An invalid answer (malformed JSON, a non-object, or a
+schema violation) is answered with one bounded correction turn citing the
+violated rules and schema fragments, and the loop continues: a repair spends
+one iteration of `max_iterations`, shared with tool turns. An answer still
+invalid on the last iteration ends the run with
+`WYRD_AGENT_422_STRUCTURED_INVALID`, which is terminal and never retried; its
+message and details carry at most ten schema locations, never reply values,
+reply keys, or parser text. A provider refusal without an answer is never
+repaired: it ends the run at once with the same code and a fixed diagnostic. The correction is conversation content, captured
+under the run's sensitive capture policy, not error or log content.
 
 ### Mcp
 MCP server registration. The server enumerates its own tools at runtime; we do
@@ -668,14 +687,16 @@ Wyrd principals are UUID-backed runtime identities that exist independently of
 any credential: issuing, rotating, revoking, or losing a credential never
 creates, destroys, or alters a principal or its role grants. Gateway capture
 is a server-internal write holding no token, role, or grant; Scribe stamps
-each captured row with the verified pair the call ran under. Each `wyrd-server` process owns one capture writer,
-chosen from pod topology (`WYRD_TARGET`): it submits in-process when Scribe
-runs in the pod, and otherwise over the peer plane through a capture-only RPC
-to a live, ready Scribe. A capture is delivered when Scribe acknowledges it
-before the call's deadline; backpressure and an unavailable Scribe are retried
-with bounded backoff until then, and anything else drops the capture with a
-counted reason without changing the call. No per-tenant client, queue, or
-backlog outlives the call. The same writer submits Verifier results to the
+each captured row with the verified pair the call ran under. Each `wyrd-server` process stages captures on its one
+Scribe outbox, which submits in-process when Scribe runs in the pod
+(`WYRD_TARGET`) and otherwise over the peer plane to a live, ready Scribe,
+retrying Scribe backpressure. A capturing call reserves its outbox slot during
+admission, before it is charged or dispatched; while the outbox is full,
+admission backs off and retries until the call's deadline, and then refuses the
+call with the retryable `WYRD_GATEWAY_429_CAPTURE_STAGING_FULL`. A reserved
+capture is never shed. Payload, storage, or deadline failures while the
+capture is projected drop it with a counted reason without changing the
+answered call. The same outbox submits Verifier results to the
 three result tables, attributed to the pair the result was produced under —
 the caller's verified pair for a realtime invocation, and the run's subject
 with the tenant's `System` principal as actor for a queued run — which Scribe
@@ -1525,8 +1546,14 @@ A citation names an original input slot, or a fixed workspace file's
 `attachment_<n>` slot as the `fs.*` tools report it in `sources`, and a typed
 locator (`page`, `slide`, `lines`, `json_pointer`, or page `region`);
 workspace paths map back to their slots, and `/work` scratch is never a
-source. The server validates every citation against the pinned evidence, and a
-passed Agent check without a valid citation becomes inconclusive.
+source. Before an Agent check runs, a `verdict`-format Prompt's citation
+slots are narrowed on that invocation's copy to the bare slots its bound
+inputs and workspace reach, so the provider request and the Agent's
+validation admit the same slots and a wrong or `inputs.`-prefixed slot is
+repaired; with no reachable source the slots are left open. The Card and
+concurrent invocations are unchanged. The server validates every citation
+against the pinned evidence, and a passed Agent check without a valid
+citation becomes inconclusive.
 
 Verifiers judge one of two evidence modes, fixed at declaration; mixing them
 is refused.
@@ -1609,14 +1636,19 @@ range start is the earliest selected admission time, equal to the end when
 nothing is selected. Each run selects cumulative history of its `group_id`
 and exact source scope through its own cutoff, never a disjoint next
 interval, so later-visible earlier evidence and later results join the next
-run. The same tenant transaction enqueues the ordinary execution, holding
-only the selection's content digest, and deletes its scheduling row; the
-selection itself — range, per-slot authored references, ordered source
-execution IDs and selected result IDs — is the execution's `group` input
-record in Bifrost, staged right after the commit on capacity reserved before
-it. The digest covers binding, group, membership, selected results and
-order, never the cutoff, so an unchanged selection's content-identity
-conflict also consumes the pending row. Retryable runtime,
+run. A new selection is a prepared candidate: the preparation transaction
+writes nothing and rolls back, releasing the row lock, and the selection
+itself — range, per-slot authored references, ordered source execution IDs
+and selected result IDs — is staged as the execution's `group` input record
+in Bifrost on capacity reserved before the claim. Only after Scribe
+acknowledges that record does the batched queue writer, in one tenant
+transaction, insert the ordinary execution holding only the selection's
+content digest and delete the pending row while it still holds the
+generation the candidate was selected from. The digest covers binding,
+group, membership, selected results and order, never the cutoff; a
+selection whose digest the binding and group already hold is settled during
+preparation and consumes the pending row in that transaction, and a
+conflicting admission returns the existing execution. Retryable runtime,
 capacity, database and query failures retain pending and are traced. Genuine auth
 or owner-activity rejection, including an inactive/retired owner, records one
 terminal errored group execution and consumes pending atomically. Recording
@@ -1627,10 +1659,12 @@ actor remain attributable. Every runnable execution keeps its accepted-authority
 and input invariants. Missing issuer/SYSTEM/attribution infrastructure is retryable
 Wyrd failure, not proof of rejected owner authority. Existing latest binding
 execution status then execution readback exposes the terminal error; it is not a
-new group-history API. Concurrent activity waits only in
-the background on the row lock and recreates a pending row after successful
-handoff. Release the transaction and preparation permit before Verifier/provider
-execution. With no new activity, there is no pending row and no further Bifrost
+new group-history API. Every activity upsert draws a fresh generation, so
+activity acknowledged after a candidate's selection keeps the pending row,
+and a row recreated after consumption starts a new one; that activity joins a
+later snapshot. While a candidate awaits acknowledgement, the process skips
+its group so it is not prepared twice. Release the preparation permit before
+Verifier/provider execution. With no new activity, there is no pending row and no further Bifrost
 read for that group. Distinct later snapshots may overlap earlier executions.
 
 Source lists share execution ordering, with null for a missing outcome or an
@@ -1736,8 +1770,13 @@ inline and stages its pinned inputs and result on the process Scribe outbox.
 `submit` stages its inputs; only after Scribe acknowledges them does the
 batched request outbox insert the queued `wyrd.verifier_executions` row. A
 server-owned `queue_execution` marker on the input record (false for
-`verify`, true for `submit`) is the only thing that activates queued work, so
-replaying input persistence never re-executes `verify`. The batched writer
+`verify`, true for `submit` and for scheduled and group executions) is the
+only thing that activates queued work, so replaying input persistence never
+re-executes `verify`. Scheduled and group executions follow the same
+pipeline: the scheduler prepares the execution and its input without writing
+the queue, stages the input, and on its acknowledgement the same batched
+writer admits the execution, moving the expected schedule cursor or
+consuming the selected pending group generation in that transaction. The batched writer
 decides `Idempotency-Key` replay and conflict per tenant, subject, actor, and
 key: a matching retry returns the same execution ID; a conflicting one settles
 `errored` with `WYRD_REGISTRY_409_IDEMPOTENCY_CONFLICT`, never runs, and leaves
@@ -2068,7 +2107,7 @@ For `schedule`, each due occurrence creates one
 execution per active binding over that binding's subject window
 `[previous boundary, due)`, filling each `samples` slot from its own
 `features`. The scheduler freezes the window's observation `record_id`s for
-the subject when it enqueues the occurrence and records them, with the
+the subject when it prepares the occurrence and records them, with the
 window, as the execution's `schedule` input record; every requirement and
 retry reads exactly that population, an empty window is a real empty
 selector, and later observations never change a prepared run. Missed

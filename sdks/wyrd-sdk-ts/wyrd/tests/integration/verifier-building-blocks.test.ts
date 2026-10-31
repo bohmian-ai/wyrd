@@ -112,7 +112,8 @@ const POLICY = resolve(import.meta.dirname, "../../../../../examples/support-des
  * its answer names; otherwise its first turn calls `fs.extract` on the workspace
  * policy and its turn with the tool result answers the limit. The investigator
  * calls every tool at once and finishes once it holds their results; the judge
- * answers by the scripted case its claim names.
+ * answers by the scripted case its claim names, and on `JUDGE-REPAIRED`
+ * answers no Verdict until it is asked to correct its reply.
  */
 function upstream(request: ReceivedRequest): Reply {
   const body = request.body;
@@ -150,6 +151,7 @@ function upstream(request: ReceivedRequest): Reply {
     ["REFUSE-POLICY", BREAKS],
     ["UNCITED", UNCITED],
     ["JUDGE-MALFORMED", "not a verdict"],
+    ["JUDGE-REPAIRED", body.includes("was not accepted") ? FOLLOWS : "not a verdict"],
     ["JUDGE-FOREIGN-CITE", FOREIGN_CITE],
     ["Claim:", FOLLOWS],
   ] as const) {
@@ -693,6 +695,21 @@ test("failed reader leaves its dependents inconclusive", async ({ desk }) => {
     }
     expect(result.outcome.verdict, marker).toBe("inconclusive");
   }
+  const malformed = requirement(await reviewNow(desk, review("JUDGE-MALFORMED", 50)), "follows-policy");
+  expect(malformed.reason).toContain("WYRD_AGENT_422_STRUCTURED_INVALID");
+  expect(malformed.reason).not.toContain("not a verdict");
+});
+
+test("judge repairs an invalid verdict", async ({ provider, desk }) => {
+  const result = await reviewNow(desk, review("JUDGE-REPAIRED: refunds follow our policy.", 50));
+
+  const judged = requirement(result, "follows-policy");
+  expect([judged.outcome, judged.citations]).toEqual(["passed", ANSWER_TEXT]);
+  const asked = provider.received.filter(
+    (request) => request.body.includes("JUDGE-REPAIRED") && request.body.includes("Rules:"),
+  );
+  expect(asked, "one repair").toHaveLength(2);
+  expect(asked[1]?.body).toContain("was not accepted");
 });
 
 test("failed code step leaves its assertion inconclusive", async ({ desk }) => {

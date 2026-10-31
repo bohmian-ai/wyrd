@@ -116,28 +116,6 @@ describe('validateFrontmatter', () => {
     expect(result).toEqual({ title: 'X', pillar: 'wyrd', section: 'Reference' });
   });
 
-  // A journey's availability is a reader-facing claim, so a mistyped status
-  // fails the build instead of silently dropping the label.
-  it('accepts runnable, partial, and planned journey status', () => {
-    for (const status of ['runnable', 'partial', 'planned'] as const) {
-      expect(
-        validateFrontmatter('/src/content/docs/j.svx', { title: 'X', pillar: 'wyrd', section: 'Reference', status })
-          .status
-      ).toBe(status);
-    }
-  });
-
-  it('throws naming the path for an unknown journey status', () => {
-    expect(() =>
-      validateFrontmatter('/src/content/docs/bad-status.svx', {
-        title: 'X',
-        pillar: 'wyrd',
-        section: 'Reference',
-        status: 'beta'
-      })
-    ).toThrow(/bad-status\.svx.*runnable, partial, planned/);
-  });
-
   // Section and topic place a page in the approved map; a typo must fail the
   // build instead of silently moving the page or leaving it unreachable.
   it('throws naming the path when section is missing or unknown', () => {

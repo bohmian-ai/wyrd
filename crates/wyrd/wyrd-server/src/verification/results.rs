@@ -359,11 +359,11 @@ impl<'a> ResultPayloadBuilder<'a> {
     /// `bifrost.verification.execution_inputs` row, recorded at `started_at`.
     ///
     /// The row's `origin` names the record kind and its `inputs` Variant holds
-    /// the supplied declarations or the selector. Only a submission marks the
-    /// row `queue_execution` and records its accepted request context — route
-    /// overrides, idempotency key and request digest, and the accepted
-    /// authority — as the `activation` Variant; every other row can never
-    /// queue work.
+    /// the supplied declarations or the selector. Every queued origin,
+    /// submitted, group, or schedule, marks the row `queue_execution`; a
+    /// direct row never queues work. Only a submission records its accepted
+    /// request context — route overrides, idempotency key and request
+    /// digest, and the accepted authority — as the `activation` Variant.
     ///
     /// # Errors
     /// Returns a Variant error when the inputs or activation cannot be
@@ -404,7 +404,7 @@ impl<'a> ResultPayloadBuilder<'a> {
             ("binding_id", Cell::text(self.binding())),
             ("group_id", Cell::text(self.group())),
             ("origin", Cell::text(Some(origin.as_str()))),
-            ("queue_execution", Cell::Flag(submission.is_some())),
+            ("queue_execution", Cell::Flag(origin != InputOrigin::Direct)),
             (INPUTS, inputs),
             (ACTIVATION, variant(ACTIVATION, activation.as_ref())?),
             ("recorded_at", time(Some(self.started_at))),

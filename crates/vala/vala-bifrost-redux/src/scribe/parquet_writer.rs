@@ -311,7 +311,7 @@ pub fn encode_ordered_claim(
     variant_layout: VariantLayout,
     ordered: impl Iterator<Item = Result<RecordBatch, ScribeError>>,
 ) -> Result<(BoundedParquetArtifactSet, Vec<RowGroupStats>), ScribeError> {
-    let mut roller = RollingArtifactWriter::new(plan, Some(variant_layout));
+    let mut roller = RollingArtifactWriter::new(plan, VariantPlan::Final(variant_layout));
     for batch in ordered {
         roller.append_charged_batch(memory, &batch?)?;
     }
@@ -366,7 +366,12 @@ impl<'a> ParquetBatchEncoder<'a> {
     /// Returns [`ScribeError::Internal`] for an invalid binding, Arrow
     /// materialization failure, or an invalid encoded artifact.
     fn encode(self) -> Result<ParquetEncoded, ScribeError> {
-        let mut roller = RollingArtifactWriter::new(self.plan(), None);
+        let mut roller = RollingArtifactWriter::new(
+            self.plan(),
+            VariantPlan::Staged {
+                logical: Arc::clone(&self.frozen.schema),
+            },
+        );
         for candidate in &self.candidates {
             let sorted_batch = self.prepare_sorted_candidate(*candidate)?;
             roller.append_charged_batch(&self.memory, &sorted_batch)?;
@@ -577,6 +582,10 @@ struct OpenArtifact {
     /// The footer identity and fingerprint are taken from this schema, so a
     /// shredded object keeps the identity of its logical table schema.
     schema: Arc<Schema>,
+    /// Exact fingerprint of the physical schema the encoder was opened on.
+    ///
+    /// A batch already in this schema is written as is, never shredded again.
+    physical: crate::schema::SchemaFingerprint,
     /// Open Parquet encoder owning the buffered sink.
     writer: ArrowWriter<BufWriter<SyncingFile>>,
     /// Rows appended so far across every batch.
@@ -602,27 +611,47 @@ struct RollingArtifactWriter<'a> {
     artifacts: Vec<BoundedParquetArtifact>,
     /// Footer-derived statistics for every sealed row group in write order.
     row_group_stats: Vec<RowGroupStats>,
-    /// Variant layout every final object is opened and shredded with.
+    /// Variant layout every artifact is opened with, chosen before the writer opens.
+    variants: VariantPlan,
+}
+
+/// The Variant layout a rolling writer opens every artifact with.
+///
+/// Both kinds preserve native input: a batch that already carries the
+/// artifact's physical schema is written as is and is never shredded again.
+enum VariantPlan {
+    /// A staged run in its frozen generation's own layout.
     ///
-    /// Chosen before the writer opens. `None` writes recovery-stage runs:
-    /// unshredded, and not measured by the residual-share metric.
-    variant_layout: Option<VariantLayout>,
+    /// Every batch of a generation already carries the one physical schema
+    /// the generation pinned when it opened — canonical, or shredded — so the
+    /// artifact opens on the first batch's schema and writes each batch
+    /// natively. `logical`, the generation's logical schema, names the footer
+    /// identity. Staged runs are not measured by the residual-share metric.
+    Staged {
+        /// Logical schema of the generation being staged.
+        logical: Arc<Schema>,
+    },
+    /// A final object shredded with the claim's freshly sampled layout.
+    ///
+    /// The claim merge emits logical rows, so the first batch's schema is the
+    /// logical schema and each batch is shredded. Final objects are measured
+    /// by the residual-share metric.
+    Final(VariantLayout),
 }
 
 impl<'a> RollingArtifactWriter<'a> {
     /// Starts a rolling writer at the plan's first generation-global ordinal.
     ///
-    /// Every artifact opens with `variant_layout` as soon as its first batch
-    /// arrives; no rows are retained to choose it. `None` writes recovery-stage
-    /// runs.
-    fn new(plan: ArtifactPlan<'a>, variant_layout: Option<VariantLayout>) -> Self {
+    /// Every artifact opens with `variants` as soon as its first batch
+    /// arrives; no rows are retained to choose it.
+    fn new(plan: ArtifactPlan<'a>, variants: VariantPlan) -> Self {
         Self {
             plan,
             next_ordinal: plan.first_ordinal,
             open: None,
             artifacts: Vec::new(),
             row_group_stats: Vec::new(),
-            variant_layout,
+            variants,
         }
     }
 
@@ -673,7 +702,11 @@ impl<'a> RollingArtifactWriter<'a> {
         self.roll_if_due()
     }
 
-    /// Shreds one batch with the writer's Variant layout, if any, and hands it to the encoder.
+    /// Hands one batch to the encoder in the open artifact's physical schema.
+    ///
+    /// A batch already in that schema — native input from a shredded
+    /// generation — is written as is; any other batch of a final object is
+    /// shredded with the claim's layout, and any other staged batch is refused.
     ///
     /// # Errors
     ///
@@ -691,14 +724,21 @@ impl<'a> RollingArtifactWriter<'a> {
             });
         };
         let shredded;
-        let batch = match &self.variant_layout {
-            Some(layout) => {
-                shredded = layout
-                    .shred(ordered_batch)
-                    .map_err(|error| variant_error(&error))?;
-                &shredded
-            }
-            None => ordered_batch,
+        let batch = if crate::schema::SchemaFingerprint::from_arrow_schema_exact(
+            ordered_batch.schema_ref(),
+        ) == open.physical
+        {
+            ordered_batch
+        } else {
+            let VariantPlan::Final(layout) = &self.variants else {
+                return Err(ScribeError::Internal {
+                    detail: "a staged generation's batches changed physical layout".to_owned(),
+                });
+            };
+            shredded = layout
+                .shred(ordered_batch)
+                .map_err(|error| variant_error(&error))?;
+            &shredded
         };
         open.writer
             .write(batch)
@@ -730,9 +770,9 @@ impl<'a> RollingArtifactWriter<'a> {
 
     /// Opens the next artifact for the batch that is about to be written.
     ///
-    /// The artifact keeps the batch's logical schema; its encoder is opened
-    /// on the writer's Variant layout's physical schema, or on the logical
-    /// schema for a recovery-stage run.
+    /// The artifact keeps the logical schema — the staged generation's, or
+    /// the claim batch's own. A staged run's encoder opens on the batch's own
+    /// physical schema; a final object's on its layout's physical schema.
     ///
     /// # Errors
     ///
@@ -752,13 +792,18 @@ impl<'a> RollingArtifactWriter<'a> {
         let file = std::fs::File::create(&scratch_path).map_err(|error| ScribeError::Internal {
             detail: format!("create Scribe Parquet scratch artifact: {error}"),
         })?;
-        let schema = group.schema();
-        let physical = match &self.variant_layout {
-            Some(layout) => layout
-                .physical_schema(&schema)
-                .map_err(|error| variant_error(&error))?,
-            None => Arc::clone(&schema),
+        let (schema, physical) = match &self.variants {
+            VariantPlan::Staged { logical } => (Arc::clone(logical), group.schema()),
+            VariantPlan::Final(layout) => {
+                let schema = group.schema();
+                let physical = layout
+                    .physical_schema(&schema)
+                    .map_err(|error| variant_error(&error))?;
+                (schema, physical)
+            }
         };
+        let physical_fingerprint =
+            crate::schema::SchemaFingerprint::from_arrow_schema_exact(&physical);
         let writer = ArrowWriter::try_new(
             BufWriter::new(SyncingFile::new(file)),
             physical,
@@ -776,6 +821,7 @@ impl<'a> RollingArtifactWriter<'a> {
             object_identity,
             scratch_path,
             schema,
+            physical: physical_fingerprint,
             writer,
             rows: 0,
         })
@@ -802,6 +848,7 @@ impl<'a> RollingArtifactWriter<'a> {
             schema,
             mut writer,
             rows,
+            ..
         } = open;
         for field in BifrostFooterIdentity::new(schema.as_ref(), &object_identity, self.plan.tenant)
             .map_err(|detail| ScribeError::Internal { detail })?
@@ -836,7 +883,7 @@ impl<'a> RollingArtifactWriter<'a> {
             schema_fingerprint,
             variant_residual_share,
         } = evidence;
-        if self.variant_layout.is_some() {
+        if matches!(self.variants, VariantPlan::Final(_)) {
             VariantWriter::Scribe.record(variant_residual_share);
         }
         self.row_group_stats.extend(row_group_stats.iter().cloned());
@@ -3168,6 +3215,127 @@ mod tests {
         assert_eq!(samples.len(), 1, "one writer series: {samples:?}");
         assert!(samples[0].0.contains("scribe"), "{samples:?}");
         assert_eq!(samples[0].1.count, 1, "one final object");
+    }
+
+    /// Writes `batch` as one staged run in `layout` and returns the run's path.
+    fn staged_run(
+        batch: &RecordBatch,
+        layout: VariantLayout,
+        scratch: &Path,
+        tenant: DataTenantId,
+    ) -> PathBuf {
+        let logical = batch.schema();
+        let physical_layout = crate::tables::hourly_test_layout(logical.as_ref());
+        let native = layout
+            .shred(batch)
+            .expect("native input in the run's layout");
+        let mut writer = RollingArtifactWriter::new(
+            claim_plan(scratch, &physical_layout, tenant),
+            VariantPlan::Staged { logical },
+        );
+        writer
+            .append_ordered_batch(&native)
+            .expect("native input writes as is");
+        let (artifacts, _) = writer.finish().expect("staged run seals");
+        artifacts[0].scratch_path.clone()
+    }
+
+    /// Runs staged in different Variant layouts merge into one claim whose
+    /// fresh sample still finds a key one run kept only in its residual.
+    ///
+    /// The first run is unshredded. The second is staged in a layout that
+    /// shreds only `a`, so its `b` values live in the residual `value`. The
+    /// claim merge accepts the layout difference after its footer names the
+    /// claim's logical schema and tenant, reconstructs complete values, and the
+    /// claim sample shreds both `a` and `b`; every value round-trips. A run
+    /// whose footer names another tenant is refused before any row is merged.
+    #[test]
+    fn mixed_staged_layouts_preserve_values_and_fresh_discovery() {
+        let tenant = DataTenantId::new_v7();
+        let scratch = tempfile::tempdir().expect("run scratch");
+        let first = variant_run(1, &[r#"{"a":1}"#, r#"{"a":2}"#]);
+        let second = variant_run(3, &[r#"{"a":3,"b":"x"}"#, r#"{"b":"y"}"#]);
+        let schema = first.schema();
+        let claim =
+            crate::scribe::assembly::StagingClaimId::from_hex(&"07".repeat(32)).expect("claim id");
+        let a_only_dir = scratch.path().join("a-only");
+        std::fs::create_dir_all(&a_only_dir).expect("layout scratch");
+        let a_only_run = staged_run(&first, VariantLayout::default(), &a_only_dir, tenant);
+        let a_only = crate::scribe::claim_sample::ClaimVariantSample::new(
+            claim,
+            std::slice::from_ref(&a_only_run),
+            &schema,
+        )
+        .layout()
+        .expect("a-only layout");
+        assert!(!a_only.is_unshredded(), "the a-only sample shreds `a`");
+
+        let runs_dir = scratch.path().join("runs");
+        std::fs::create_dir_all(&runs_dir).expect("run scratch");
+        let first_dir = runs_dir.join("first");
+        let second_dir = runs_dir.join("second");
+        std::fs::create_dir_all(&first_dir).expect("first scratch");
+        std::fs::create_dir_all(&second_dir).expect("second scratch");
+        let runs = vec![
+            staged_run(&first, VariantLayout::default(), &first_dir, tenant),
+            staged_run(&second, a_only.clone(), &second_dir, tenant),
+        ];
+        let (shredded, values) = read_variant_artifact(&runs[1]);
+        assert_eq!(
+            shredded,
+            ["a"],
+            "the staged run keeps its generation's layout"
+        );
+        assert_eq!(values, [r#"{"a":3,"b":"x"}"#, r#"{"b":"y"}"#]);
+
+        let fresh = crate::scribe::claim_sample::ClaimVariantSample::new(claim, &runs, &schema)
+            .layout()
+            .expect("claim sample over mixed layouts");
+        let layout = crate::tables::hourly_test_layout(schema.as_ref());
+        let merge = crate::scribe::claim_merge::StagedRunMerge::open(
+            &runs,
+            Arc::clone(&schema),
+            tenant,
+            &layout,
+            1,
+        )
+        .expect("a layout difference merges after logical and tenant checks");
+        let claim_scratch = tempfile::tempdir().expect("claim scratch");
+        let (artifacts, _) = encode_ordered_claim(
+            claim_plan(claim_scratch.path(), &layout, tenant),
+            &crate::resources::ScribeResources::for_test(),
+            fresh,
+            merge,
+        )
+        .expect("claim encodes");
+        let (shredded, values) = read_variant_artifact(&artifacts[0].scratch_path);
+        assert_eq!(
+            shredded,
+            ["a", "b"],
+            "a key found only in a residual is discoverable"
+        );
+        assert_eq!(
+            values,
+            [
+                r#"{"a":1}"#,
+                r#"{"a":2}"#,
+                r#"{"a":3,"b":"x"}"#,
+                r#"{"b":"y"}"#
+            ]
+        );
+
+        let refusal = crate::scribe::claim_merge::StagedRunMerge::open(
+            &runs,
+            schema,
+            DataTenantId::new_v7(),
+            &layout,
+            1,
+        )
+        .expect_err("another tenant's shredded run is refused");
+        assert!(
+            refusal.to_string().contains("tenant"),
+            "the refusal names the tenant: {refusal}"
+        );
     }
 
     /// Row-group bounds are read from the table's own time column, and a

@@ -24,6 +24,7 @@ use crate::request_builder::{
 };
 use crate::run::{AgentRun, FinishReason};
 use crate::session::{Role, SessionId, SessionTurn, session_turn_to_conversation_turn};
+use crate::structured::StructuredOutput;
 
 #[derive(Debug, Clone)]
 struct ToolCall {
@@ -58,8 +59,9 @@ impl Agent {
     /// `wyrd_gateway` route has no gateway caller or a non-gateway model,
     /// [`AgentError::JournalAppendFailed`] when a non-terminal journal
     /// append fails, session read or append failures, callback panics, Prompt
-    /// rendering and loop-shape errors, provider and tool failures, structured
-    /// output decode failures, an exhausted iteration budget, or
+    /// rendering and loop-shape errors, provider and tool failures, an
+    /// answer still violating the response schema at the last iteration, an
+    /// exhausted iteration budget, or
     /// [`AgentError::Timeout`].
     pub async fn run_with(
         &self,
@@ -338,11 +340,19 @@ impl Agent {
     /// Each iteration dispatches under a `chat` span, journals the call and
     /// result, and runs requested tools concurrently under `execute_tool` spans
     /// until the model stops calling tools or the iteration budget is spent.
+    /// A structured-output run validates every final answer against the
+    /// exact response schema its outgoing request sent, after rendering and
+    /// `before_model` hooks; an invalid answer stays in the conversation,
+    /// followed by a bounded correction turn, and the next iteration asks
+    /// again, so repairs spend the same budget as tool turns. A provider
+    /// refusal without an answer is never repaired.
     ///
     /// # Errors
     ///
     /// Returns `AgentError` for a zero or exhausted iteration budget, a provider,
-    /// tool, journal, session, or structured-output failure.
+    /// tool, journal, or session failure, and
+    /// [`AgentError::StructuredOutputInvalid`] when the last iteration's answer
+    /// still violates the response schema or the provider refuses to answer.
     async fn run_loop(
         &self,
         providers: &ProviderRegistry,
@@ -364,6 +374,7 @@ impl Agent {
 
         let concurrency_cap = self.run_config.tool_concurrency_cap.unwrap_or(8).max(1);
         let max_iterations = self.run_config.max_iterations;
+        let mut structured: Option<StructuredOutput> = None;
 
         for iteration in 0..max_iterations {
             self.journal
@@ -410,6 +421,15 @@ impl Agent {
                 ChainResult::Replaced(replacement) => replacement,
             };
 
+            // The outgoing request, after rendering and hooks, owns the
+            // schema its answer must satisfy.
+            structured = match ResponseType::of(&request) {
+                ResponseType::Text => None,
+                ResponseType::JsonSchema { schema, .. } => match structured.take() {
+                    Some(current) if current.schema() == &schema => Some(current),
+                    _ => Some(StructuredOutput::new(&self.id, &schema)?),
+                },
+            };
             self.append_model_journal_call(iteration, &request).await?;
             let provider = self.prompt.native().provider();
             let chat = chat_span(&provider, &request, model);
@@ -476,7 +496,36 @@ impl Agent {
                     .text()
                     .map(std::borrow::Cow::into_owned)
                     .unwrap_or_default();
-                let structured_output = self.parse_structured_output(&output)?;
+                if structured.is_some() && output.trim().is_empty() && response.adapter().refused()
+                {
+                    return Err(AgentError::StructuredOutputInvalid {
+                        agent: self.id.clone(),
+                        violations: vec!["provider refused without an answer".to_owned()],
+                    });
+                }
+                let structured_output = match structured.as_ref().map(|s| s.check(&output)) {
+                    None => None,
+                    Some(Ok(map)) => Some(map),
+                    Some(Err(rejection)) if iteration + 1 == max_iterations => {
+                        return Err(AgentError::StructuredOutputInvalid {
+                            agent: self.id.clone(),
+                            violations: rejection.violations,
+                        });
+                    }
+                    Some(Err(rejection)) => {
+                        conversation.append_user(rejection.correction.as_str());
+                        self.append_session_turn(
+                            session_id,
+                            SessionTurn {
+                                role: Role::User,
+                                content: rejection.correction,
+                                call_id: None,
+                            },
+                        )
+                        .await?;
+                        continue;
+                    }
+                };
                 let run = AgentRun {
                     output,
                     final_response: Some(std::sync::Arc::new(response)),
@@ -861,38 +910,6 @@ impl Agent {
             session_id: session_id.map(|id| id.as_str().to_owned()),
             iteration,
             conversation: Arc::new(conversation.clone()),
-        }
-    }
-
-    /// Decode the final `output` text as the structured object a JSON-schema
-    /// Prompt declares; a text Prompt yields `None`.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`AgentError::StructuredOutputDecode`] when the text is not
-    /// JSON or not a JSON object.
-    fn parse_structured_output(
-        &self,
-        output: &str,
-    ) -> AgentResult<Option<serde_json::Map<String, serde_json::Value>>> {
-        match &self.prompt.native().response_type {
-            ResponseType::Text => Ok(None),
-            ResponseType::JsonSchema { .. } => {
-                let value: serde_json::Value =
-                    serde_json::from_str(output.trim()).map_err(|error| {
-                        AgentError::StructuredOutputDecode {
-                            agent: self.id.clone(),
-                            detail: error.to_string(),
-                        }
-                    })?;
-                let serde_json::Value::Object(map) = value else {
-                    return Err(AgentError::StructuredOutputDecode {
-                        agent: self.id.clone(),
-                        detail: "structured output must be a JSON object".to_owned(),
-                    });
-                };
-                Ok(Some(map))
-            }
         }
     }
 }

@@ -98,8 +98,8 @@ async fn scribe_publishes_idle_rows_on_its_own_clock() {
     server.shutdown().await.expect("the server drains cleanly");
 }
 
-/// Claims the pod may hold at once: the harness runs the default Scribe
-/// configuration, whose four WAL IO workers size the claim budget.
+/// Claims the pod may hold at once: each journey pins
+/// `scribe.persistence_cpu_threads`, which sizes the claim budget.
 const CLAIM_BUDGET: usize = 4;
 
 /// Tables the concurrent-publication case makes due together: twice the
@@ -145,6 +145,7 @@ async fn scribe_publishes_due_claims_concurrently_within_the_claim_budget() {
     let server = WyrdTestServer::builder()
         .with_scribe_geometry_for_test(geometry)
         .with_scribe_persistence_faults_for_test(faults.clone())
+        .with_scribe_persistence_cpu_threads_for_test(CLAIM_BUDGET)
         .start_bound()
         .await
         .expect("the Scribe production harness starts");
@@ -217,6 +218,7 @@ async fn concurrent_flushes_share_the_claim_budget_and_publish_each_claim_once()
     faults.hold_object_writes_for_test();
     let server = WyrdTestServer::builder()
         .with_scribe_persistence_faults_for_test(faults.clone())
+        .with_scribe_persistence_cpu_threads_for_test(CLAIM_BUDGET)
         .start_bound()
         .await
         .expect("the Scribe production harness starts");

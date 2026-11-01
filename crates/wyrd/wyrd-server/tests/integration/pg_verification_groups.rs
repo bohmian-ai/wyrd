@@ -54,6 +54,10 @@ use wyrd_testing::{Bootstrap, WyrdTestServer};
 /// How long an accepted enqueue may take to become readable.
 const VISIBLE: Duration = Duration::from_secs(30);
 
+/// The group window every test runs under: longer than any test, so only
+/// [`Support::make_due`] brings a group due.
+const HELD: &str = "1h";
+
 /// How long a test claim leases an execution; no runner competes for it.
 const LEASE: chrono::TimeDelta = chrono::TimeDelta::minutes(10);
 
@@ -77,8 +81,12 @@ impl Support {
     /// Boot a bound server, register the support Service fixture, and
     /// credential and activate the Service.
     ///
+    /// The fixture's group window is lengthened to [`HELD`] so a group comes
+    /// due only through [`Self::make_due`], never by elapsed wall time.
+    ///
     /// # Panics
-    /// Panics when the server, registration, or credential exchange fails.
+    /// Panics when the server, registration, credential exchange, or window
+    /// update fails.
     async fn start() -> Self {
         let server = WyrdTestServer::builder()
             .start_bound()
@@ -100,6 +108,21 @@ impl Support {
                 .and_then(|outcome| outcome.card_ref.uid.clone())
                 .expect("the receipt names the Card")
         };
+        let mut conn = server
+            .tenant_conn_for(server.data_tenant_id())
+            .await
+            .expect("tenant connection opens");
+        let held = sqlx::query(
+            "UPDATE wyrd.verification_bindings
+                SET group_end = jsonb_set(group_end, '{after}', to_jsonb($1::text))
+              WHERE activation = 'group_end'",
+        )
+        .bind(HELD)
+        .execute(&mut **conn.transaction())
+        .await
+        .expect("the group window lengthens");
+        assert!(held.rows_affected() > 0, "the fixture binds a group window");
+        conn.commit().await.expect("the group window commits");
         Self {
             owner: uid("support"),
             agent: uid("assistant-agent"),

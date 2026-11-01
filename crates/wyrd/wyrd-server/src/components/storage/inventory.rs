@@ -246,8 +246,10 @@ impl<'s> ObjectInventory<'s> {
     /// Read `card_uid`'s recorded objects in `tenant`, after the caller's
     /// Card authorization.
     ///
-    /// A table the tenant never wrote reads as no rows; callers treat a
-    /// missing expected object as retryable readiness.
+    /// The read runs as `system`, the tenant's SYSTEM principal the caller
+    /// read in its own Card transaction. A table the tenant never wrote
+    /// reads as no rows; callers treat a missing expected object as
+    /// retryable readiness.
     ///
     /// # Errors
     /// Returns the errors of [`Self::rows`], and
@@ -257,11 +259,13 @@ impl<'s> ObjectInventory<'s> {
     pub async fn card_objects(
         &self,
         tenant: DataTenantId,
+        system: Option<PrincipalId>,
         card_uid: &CardUid,
     ) -> Result<CardObjects, WyrdError> {
         let batches = self
             .rows(
                 tenant,
+                system,
                 &format!(
                     "{SUBJECT_CARD_UID} = {}",
                     ObservationWindow::text(card_uid.as_str())
@@ -283,8 +287,9 @@ impl<'s> ObjectInventory<'s> {
     ///
     /// # Errors
     /// Returns the errors of [`Self::rows`], and
-    /// `WYRD_VALA_503_QUERY_VISIBILITY_UNAVAILABLE` when a matching record is
-    /// malformed or its path is not this tenant's File object.
+    /// `WYRD_VALA_503_QUERY_VISIBILITY_UNAVAILABLE` when the SYSTEM principal
+    /// cannot be read, or a matching record is malformed or its path is not
+    /// this tenant's File object.
     #[tracing::instrument(skip_all, fields(%tenant, %sha256))]
     pub async fn file_object(
         &self,
@@ -292,9 +297,20 @@ impl<'s> ObjectInventory<'s> {
         sha256: &Sha256Hex,
         size_bytes: u64,
     ) -> Result<Option<ValidatedPath>, WyrdError> {
+        let system = {
+            let mut conn = self.state.registry_tenant_conn(tenant).await?;
+            let system = system_principal_id(&mut conn)
+                .await
+                .map_err(|error| Self::unreadable(&error))?;
+            conn.commit()
+                .await
+                .map_err(|error| Self::unreadable(&error))?;
+            system.map(PrincipalId::new)
+        };
         let batches = self
             .rows(
                 tenant,
+                system,
                 // A deletion row carries no digest, so every File deletion
                 // is read to exclude its path.
                 // ponytail: scans all File deletions; filter by path once
@@ -310,36 +326,31 @@ impl<'s> ObjectInventory<'s> {
         Self::file_fold(tenant, size_bytes, &batches)
     }
 
+    /// Log why the inventory cannot be read and answer the retryable
+    /// visibility error.
+    fn unreadable(error: &dyn std::fmt::Display) -> WyrdError {
+        tracing::warn!(%error, "the object inventory cannot be read");
+        WyrdError::from(BifrostError::QueryVisibilityUnavailable)
+    }
+
     /// Read every inventory row of `tenant` matching SQL `predicate`.
     ///
-    /// The read runs under the tenant's SYSTEM principal granted only this
-    /// table. A table the tenant never wrote reads as no rows.
+    /// The read runs as `system`, the tenant's SYSTEM principal, granted only
+    /// this table. A table the tenant never wrote reads as no rows.
     ///
     /// # Errors
-    /// Returns `WYRD_VALA_503_QUERY_VISIBILITY_UNAVAILABLE` when the SYSTEM
-    /// principal or read authority is unavailable, and the query's own error
-    /// when it fails.
+    /// Returns `WYRD_VALA_503_QUERY_VISIBILITY_UNAVAILABLE` when the read
+    /// authority is unavailable, and the query's own error when it fails.
     async fn rows(
         &self,
         tenant: DataTenantId,
+        system: Option<PrincipalId>,
         predicate: &str,
     ) -> Result<Vec<RecordBatch>, WyrdError> {
-        let unavailable = |error: &dyn std::fmt::Display| {
-            tracing::warn!(%error, "the object inventory cannot be read");
-            WyrdError::from(BifrostError::QueryVisibilityUnavailable)
-        };
-        let system = {
-            let mut conn = self.state.registry_tenant_conn(tenant).await?;
-            let system = system_principal_id(&mut conn)
-                .await
-                .map_err(|error| unavailable(&error))?;
-            conn.commit().await.map_err(|error| unavailable(&error))?;
-            system.map(PrincipalId::new)
-        };
         let table = [TableRef::new(BifrostNamespace::Storage, ObjectsTable::NAME)];
         let read = SystemReadAuthority::resolve(self.state, tenant, system, &table)
             .await
-            .map_err(|error| unavailable(&error))?;
+            .map_err(|error| Self::unreadable(&error))?;
         let query = ScheduledQueryCaller::new(
             self.state.clone(),
             read.into_context(),

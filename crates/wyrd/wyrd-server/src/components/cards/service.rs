@@ -157,6 +157,39 @@ pub async fn get_card_objects_by_ref(
     Ok((response, inventory))
 }
 
+/// Load the stored spec of the Card at an exact tenant-scoped reference.
+///
+/// Verifier blocks resolve Agent and Prompt Cards through this read: it runs
+/// the registry lookup alone, with no relationships, object inventory, or
+/// blob, so judging never waits on Bifrost query capacity. Like
+/// [`get_card_by_ref`], a Card is readable only once its immutable blob is
+/// active.
+///
+/// # Errors
+/// Returns the registry not-found, unavailable, or parse errors of the tenant
+/// read, and `WYRD_REGISTRY_404_CARD_NOT_FOUND` before the blob is active.
+pub async fn get_card_spec_by_ref(
+    state: &AppState,
+    caller: &Caller,
+    card_ref: &CardRef,
+) -> Result<wyrd_sql::row_types::cards::ParsedCardRow, WyrdError> {
+    let mut conn = state.registry_tenant_conn(caller.data_tenant_id).await?;
+    let row = wyrd_sql::queries::cards::get_card_by_ref(
+        &mut conn,
+        card_ref.kind.clone(),
+        &card_ref.name,
+        &card_ref.version,
+    )
+    .await?;
+    conn.commit().await.map_err(registry_db_error)?;
+    if row.card_blob_uri.is_none() {
+        return Err(WyrdError::registry_card_not_found(
+            "Card is not available until its immutable blob is active",
+        ));
+    }
+    Ok(row)
+}
+
 /// Resolve and load the newest stable Active Card in one identity line.
 ///
 /// Reads the row, inbound edges, artifact manifest, and owned verification

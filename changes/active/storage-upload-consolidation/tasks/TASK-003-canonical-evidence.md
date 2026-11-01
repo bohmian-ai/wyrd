@@ -262,4 +262,3 @@ or weaken correctness.
 - [Bifrost durability and visibility](../../../../architecture/bifrost-design.md#durability-and-visibility).
 - [Security posture](../../../../architecture/wyrd-security-posture.md).
 - [Benchmark measurement rules](../../../../benchmarks/README.md).
-

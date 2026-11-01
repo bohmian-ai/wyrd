@@ -13,7 +13,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, LazyLock, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use arrow::array::{Array as _, AsArray as _, RecordBatch};
 use arrow::datatypes::{DataType, Field, Int64Type, Schema, SchemaRef};
@@ -182,9 +182,14 @@ impl<'s> ObjectInventory<'s> {
     /// Record `facts` for `tenant` under `attribution` and wait for each
     /// row's own Scribe acknowledgement.
     ///
+    /// Each row is staged on its own reserved outbox slot, so unreserved
+    /// audit traffic cannot shed it; a full reserved share makes the call
+    /// wait for a slot instead.
+    ///
     /// # Errors
-    /// Returns `WYRD_VALA_503_BIFROST_WRITER_UNAVAILABLE` when any row is
-    /// shed, rejected, dropped, or unacknowledged within [`Self::budget`];
+    /// Returns `WYRD_VALA_503_BIFROST_WRITER_UNAVAILABLE` when a row gets no
+    /// reserved slot, or is rejected, dropped, or unacknowledged, within
+    /// [`Self::budget`];
     /// the outcome is unknown and the caller retries. Returns an internal
     /// error when a fact cannot be projected.
     #[tracing::instrument(skip_all, fields(%tenant, rows = facts.len()))]
@@ -195,20 +200,37 @@ impl<'s> ObjectInventory<'s> {
         facts: &[ObjectFact],
     ) -> Result<(), WyrdError> {
         let outbox = self.state.bifrost.scribe_outbox();
+        let deadline = Instant::now() + self.budget();
+        let unavailable = || {
+            WyrdError::from(BifrostError::WriterUnavailable {
+                table: OBJECTS.to_owned(),
+            })
+        };
         let mut acks = Vec::with_capacity(facts.len());
         for fact in facts {
+            let row = fact.row()?;
+            let slot = outbox.reserve_until(1, deadline).await.map_err(|full| {
+                tracing::warn!(
+                    admitted = full.admitted,
+                    limit = full.limit,
+                    unit = full.unit,
+                    "an object inventory write got no reserved slot"
+                );
+                unavailable()
+            })?;
             let (sender, ack) = oneshot::channel();
-            outbox.stage(
+            slot.stage(
                 tenant,
                 ScribeWrite::Object {
-                    row: fact.row()?,
+                    row,
                     attribution,
                     acked: Mutex::new(Some(sender)),
                 },
             );
             acks.push(ack);
         }
-        let acked = tokio::time::timeout(self.budget(), futures_util::future::try_join_all(acks));
+        let acked =
+            tokio::time::timeout_at(deadline.into(), futures_util::future::try_join_all(acks));
         match acked.await {
             Ok(Ok(_)) => Ok(()),
             outcome => {
@@ -216,10 +238,7 @@ impl<'s> ObjectInventory<'s> {
                     timed_out = outcome.is_err(),
                     "an object inventory write was not acknowledged"
                 );
-                Err(BifrostError::WriterUnavailable {
-                    table: OBJECTS.to_owned(),
-                }
-                .into())
+                Err(unavailable())
             }
         }
     }

@@ -238,7 +238,7 @@ Selected mode: **ACK** (isolation proven; no staged fallback).
 
 | Acceptance criterion | Implementation evidence | Verification evidence | Result |
 |---|---|---|---|
-| V1: files/envelopes served only from Bifrost; SQL inventory, callers and seeds removed | `tables/storage/objects.rs`; `components/storage/inventory.rs`; `cards/service.rs` (`card_files`, `card_file`, envelope in `write_card_blob`); `storage/routes.rs`; `verification/fitter.rs`; drop migration `20261028000000`; CLI and fitter seeds via `ObjectInventory::record` | `pg_card_declaration_route::completed_objects_use_one_inventory`; `pg_migration::*` (22); `card_lifecycle::*` (23); `pg_verification_runtime` baseline tests | PASS |
+| V1: files/envelopes served only from Bifrost; SQL inventory, callers and seeds removed | `tables/storage/objects.rs`; `components/storage/inventory.rs`; `cards/service.rs` (`card_files`, `card_file`, envelope in `write_card_blob`); `storage/routes.rs`; `verification/fitter.rs`; drop migration `20261028000001`; CLI and fitter seeds via `ObjectInventory::record` | `pg_card_declaration_route::completed_objects_use_one_inventory`; `pg_migration::*` (22); `card_lifecycle::*` (23); `pg_verification_runtime` baseline tests | PASS |
 | V2: replay is one logical file; deletion dominates stale completion; cleanup still works | `ObjectInventory::fold` (deleted dominates); `record_card_deletion` in `finish_card_delete` and `reconcile_cleanup_claim` | `pg_card_declaration_route::deleted_objects_survive_completion_replay` | PASS |
 | V3: typed readiness and refusal, bounded failure, no fallback, no public append, no tenant widening | `card_objects` under a table-scoped SYSTEM read; `card_files` readiness → `WYRD_VALA_503_QUERY_VISIBILITY_UNAVAILABLE`; Gate reserves `bifrost.storage.objects` | `pg_card_declaration_route::inventory_reads_are_scoped_and_retryable` (502 `QUERY_STREAM_INCOMPLETE`, then retry 200; 503 visibility; foreign tenant empty; public `write_batch` → `WYRD_VALA_403_BIFROST_RESERVED_BUILTIN_WRITE`); `gate::tests::gate_reserves_server_capture_tables` | PASS |
 | V4 plus V1's real API: genuine and isolated ACK | `ScribeWrite::Object` notified in `ScribeSink::tally` only on its own stream's Ok; `ObjectInventory::record` waits for half the deadline, else `WRITER_UNAVAILABLE` | `scribe_outbox::tests::inventory_ack_is_isolated`; V1 reads the file from the inventory right after `declare` returns | PASS |
@@ -269,7 +269,7 @@ the two absence assertions remain.
 Bounded corrections and limits:
 
 - Migrations are immutable, so the removal is the new drop migration
-  `20261028000000_drop_storage_artifact_metadata.sql`, plus a new migration
+  `20261028000001_drop_storage_artifact_metadata.sql`, plus a new migration
   widening the Forge namespace CHECK. No data migration is involved.
 - The Card binding uses the managed `subject_card_uid` rather than a
   `card_uid` user field. The attribution journey refuses that retired name on

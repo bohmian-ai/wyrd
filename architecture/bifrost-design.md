@@ -1836,8 +1836,10 @@ still finds the record unreadable retries it as evidence unavailable.
 each Card file completion, Card envelope write, and Card deletion stages one
 row, keyed by `storage_path` and bound to its Card through `subject_card_uid`
 and `relative_path`, and a deletion row dominates every completion of that
-Card, earlier or later. A completion returns only after Scribe acknowledges
-its own inventory row, waiting at most half the query deadline and otherwise
+Card, earlier or later. Each row is staged on its own reserved outbox slot,
+so audit traffic cannot shed it. A completion returns only after Scribe
+acknowledges its own inventory row, waiting for the slot and the
+acknowledgement at most half the query deadline and otherwise
 answering `WYRD_VALA_503_BIFROST_WRITER_UNAVAILABLE`; no other producer waits
 on it. Card reads, after the caller's Card authorization, read the inventory
 as the tenant `System` principal granted only that table, so no Bifrost query

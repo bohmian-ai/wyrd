@@ -30,10 +30,8 @@ use wyrd_spec::ids::CardUid;
 use wyrd_spec::verification::VerificationError;
 use wyrd_sql::queries::cards::get_card_by_uid;
 use wyrd_sql::queries::drift_baselines::{ClaimedBaseline, DriftBaselineQueue};
-use wyrd_sql::queries::storage::artifact_metadata;
 use wyrd_sql::row_types::cards::CardStatus;
 use wyrd_sql::{OperatorPool, SqlError, WyrdPostgres};
-use wyrd_storage::StorageHandle;
 use wyrd_storage::tenant_path;
 
 #[cfg(feature = "test-support")]
@@ -41,6 +39,8 @@ use super::CapabilityCrash;
 use super::RuntimeLimits;
 #[cfg(feature = "test-support")]
 use super::health::RuntimeCapability;
+use crate::components::cards::service::{card_file, reconciliation_caller};
+use crate::state::AppState;
 
 /// Stable error code when the pinned Verifier or Data Card cannot be used.
 pub const BASELINE_DATA_UNAVAILABLE: &str = "baseline_data_unavailable";
@@ -73,8 +73,9 @@ pub struct BaselineFitter {
     postgres: WyrdPostgres,
     /// Operator pool for the cross-tenant due list.
     operator: OperatorPool,
-    /// Artifact storage the Data Card's Parquet is read from.
-    storage: Arc<StorageHandle>,
+    /// The server whose object inventory resolves, and whose storage holds,
+    /// the Data Card's Parquet.
+    state: AppState,
     /// Baseline queue transitions and retry policy.
     queue: DriftBaselineQueue,
     /// How long one claim holds a fit before another process may reclaim it.
@@ -94,7 +95,8 @@ pub struct BaselineFitter {
 }
 
 impl BaselineFitter {
-    /// Build a fitter over the Wyrd Postgres owner, the operator pool, and storage.
+    /// Build a fitter over the Wyrd Postgres owner, the operator pool, and the
+    /// server whose object inventory and storage hold baseline artifacts.
     ///
     /// The fitter carries no coordination clock: due times, leases, and retry
     /// deadlines are PostgreSQL's. From `limits` it takes the lease length,
@@ -104,13 +106,13 @@ impl BaselineFitter {
     pub fn new(
         postgres: WyrdPostgres,
         operator: OperatorPool,
-        storage: Arc<StorageHandle>,
+        state: AppState,
         limits: &RuntimeLimits,
     ) -> Self {
         Self {
             postgres,
             operator,
-            storage,
+            state,
             queue: DriftBaselineQueue::default(),
             lease: chrono::Duration::from_std(limits.lease).unwrap_or(chrono::Duration::MAX),
             poll_interval: limits.poll_interval,
@@ -323,7 +325,8 @@ impl BaselineFitter {
         let path =
             tenant_path::validate(&path, tenant).map_err(|error| invalid(error.to_string()))?;
         let bytes = bytes::Bytes::from(
-            self.storage
+            self.state
+                .storage
                 .get_object(&path)
                 .await
                 .map_err(|error| invalid(error.to_string()))?,
@@ -388,16 +391,25 @@ impl BaselineFitter {
                 claimed.data_card_uid
             )));
         }
+        drop(conn);
         let path = artifact_path(tenant, &claimed.data_card_uid);
-        let metadata = artifact_metadata::get(&mut conn, &path)
-            .await
-            .map_err(|error| unavailable(error.to_string()))?
-            .ok_or_else(|| {
+        let metadata = card_file(
+            &self.state,
+            &reconciliation_caller(tenant),
+            &claimed.data_card_uid,
+            DATA_ARTIFACT,
+        )
+        .await
+        .map_err(|error| {
+            if error.code() == "WYRD_STORAGE_404_OBJECT_NOT_FOUND" {
                 fit_error(
                     BASELINE_ARTIFACT_INVALID,
                     format!("baseline Data Card has no registered {DATA_ARTIFACT}"),
                 )
-            })?;
+            } else {
+                unavailable(error.to_string())
+            }
+        })?;
         if metadata.size_bytes > MAX_ARTIFACT_BYTES {
             return Err(fit_error(
                 BASELINE_ARTIFACT_INVALID,

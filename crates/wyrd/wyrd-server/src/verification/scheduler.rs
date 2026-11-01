@@ -622,7 +622,10 @@ impl VerificationScheduler {
                     ..due
                 };
                 match self.hand_off(groups, &mut conn, &due).await? {
-                    None => Ok(None),
+                    None => {
+                        conn.rollback().await?;
+                        Ok(None)
+                    }
                     Some(Ok(handoff)) => {
                         self.queue.consume_group(&mut conn, &due).await?;
                         Ok(Some(Step::Settled(conn, handoff)))
@@ -633,9 +636,10 @@ impl VerificationScheduler {
                             due.binding_id,
                             due.group_id.clone(),
                         )) else {
+                            conn.rollback().await?;
                             return Ok(None);
                         };
-                        drop(conn);
+                        conn.rollback().await?;
                         Ok(Some(Step::Candidate(
                             GroupHandoff::Enqueued(admission.execution_id),
                             Box::new(Queued {

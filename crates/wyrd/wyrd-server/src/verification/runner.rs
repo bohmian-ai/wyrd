@@ -870,6 +870,8 @@ impl VerifierRunner {
     /// PostgreSQL-measured queue wait, the `settlement` phase, and — only once
     /// a terminal outcome is durably settled — the run's trigger-to-terminal
     /// latency: its age at claim plus this attempt's elapsed [`Instant`] time.
+    /// A settled deferral spends no attempt, so it records only its span's
+    /// outcome and none of these series.
     /// Returns whether admission backpressure deferred the run.
     async fn attempt(
         &self,
@@ -924,6 +926,9 @@ impl VerifierRunner {
         let failed = !matches!(outcome, "completed" | "released" | "deferred");
         if failed {
             span.record("otel.status_code", "ERROR");
+        }
+        if outcome == "deferred" {
+            return refused;
         }
         metrics::histogram!(
             crate::app::metrics::VERIFICATION_QUEUE_WAIT_SECONDS,

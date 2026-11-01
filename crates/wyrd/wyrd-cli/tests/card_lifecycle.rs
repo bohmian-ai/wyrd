@@ -1371,7 +1371,8 @@ mod pg_tests {
             .superuser_pool()
             .expect("superuser pool opens");
         let original_storage_path: String = sqlx::query_scalar(
-            "SELECT storage_path FROM wyrd.storage_artifact_metadata WHERE card_uid = $1",
+            "SELECT storage_path FROM wyrd.storage_multipart_uploads \
+              WHERE card_uid = $1 AND status = 'completed'",
         )
         .bind(&uid)
         .fetch_one(&superuser)
@@ -1440,15 +1441,30 @@ mod pg_tests {
         assert!(!temp.path().join("size-mismatch").exists());
         std::fs::write(&artifact_path, b"cli-card-artifact").expect("artifact bytes restore");
 
-        sqlx::query(
-            "UPDATE wyrd.storage_artifact_metadata SET size_bytes = $1, storage_path = $2 WHERE card_uid = $3",
-        )
-        .bind(i64::try_from(b"cli-card-artifact".len()).expect("a short literal length fits i64"))
-        .bind("../escape")
-        .bind(&uid)
-        .execute(&superuser)
-        .await
-        .expect("artifact path corrupts");
+        // Record an inventory row whose stored path escapes its Card; a read
+        // refuses it rather than serving a path outside the Card.
+        let escaped = wyrd_server::components::storage::inventory::ObjectFact {
+            storage_path: "../escape".to_owned(),
+            upload_id: None,
+            backend: server.state().storage.backend().to_string(),
+            sha256: Some(correct_digest.clone()),
+            size_bytes: i64::try_from(b"cli-card-artifact".len())
+                .expect("a short literal length fits i64"),
+            content_type: Some("text/plain".to_owned()),
+            sse_marker: None,
+            origin: wyrd_server::components::storage::inventory::ObjectOrigin::CardFile,
+            card_uid: Some(wyrd_spec::ids::CardUid::new(uid.as_str()).expect("uid parses")),
+            relative_path: Some("prompt.txt".to_owned()),
+            state: wyrd_server::components::storage::inventory::ObjectState::Completed,
+        };
+        wyrd_server::components::storage::inventory::ObjectInventory::new(server.state())
+            .record(
+                server.data_tenant_id(),
+                wyrd_spec::auth::Attribution::unresolved(),
+                &[escaped],
+            )
+            .await
+            .expect("the escaping row is recorded");
         let unsafe_path = run_cli_async_with_token!(
             &jwt,
             "pull",
@@ -1472,16 +1488,6 @@ mod pg_tests {
             "WYRD_REGISTRY_400_INVALID_CARD_SPEC"
         );
         assert!(!temp.path().join("unsafe-path").exists());
-        sqlx::query(
-            "UPDATE wyrd.storage_artifact_metadata SET size_bytes = $1, sha256 = $2, storage_path = $3 WHERE card_uid = $4",
-        )
-        .bind(i64::try_from(b"cli-card-artifact".len()).expect("a short literal length fits i64"))
-        .bind(&correct_digest)
-        .bind(&original_storage_path)
-        .bind(&uid)
-        .execute(&superuser)
-        .await
-        .expect("artifact metadata restores");
 
         let deleted = run_cli_async_with_token!(
             &jwt, "delete", "--kind", "Prompt", "--uid", &uid, "--server", &base_url, "--format",
@@ -2625,7 +2631,8 @@ mod pg_tests {
             .superuser_pool()
             .expect("superuser pool opens");
         let storage_path: String = sqlx::query_scalar(
-            "SELECT storage_path FROM wyrd.storage_artifact_metadata WHERE card_uid = $1",
+            "SELECT storage_path FROM wyrd.storage_multipart_uploads \
+              WHERE card_uid = $1 AND status = 'completed'",
         )
         .bind(&uid)
         .fetch_one(&superuser)

@@ -23,12 +23,14 @@ pub enum BifrostNamespace {
     Datasets, // Redux-only variant for dynamic table namespace
     /// Gateway capture tables such as `bifrost.gateway.calls`.
     Gateway,
+    /// `bifrost.storage` — the completed uploaded-object inventory.
+    Storage,
 }
 
 impl BifrostNamespace {
     /// All known namespaces. Adding a variant here causes a compile error at every
     /// `match` that is missing a branch — the exhaustiveness guard.
-    pub const ALL: [Self; 9] = [
+    pub const ALL: [Self; 10] = [
         Self::Audit,
         Self::Bifrost,
         Self::Traces,
@@ -38,6 +40,7 @@ impl BifrostNamespace {
         Self::Verification,
         Self::Datasets,
         Self::Gateway,
+        Self::Storage,
     ];
 
     /// The wire namespace string (e.g. `"bifrost.traces"`) every FQN is built from.
@@ -52,6 +55,7 @@ impl BifrostNamespace {
             Self::Verification => "bifrost.verification",
             Self::Datasets => "bifrost.datasets",
             Self::Gateway => "bifrost.gateway",
+            Self::Storage => "bifrost.storage",
         }
     }
 
@@ -74,6 +78,7 @@ impl BifrostNamespace {
             "verification" => Some(Self::Verification),
             "datasets" => Some(Self::Datasets),
             "gateway" => Some(Self::Gateway),
+            "storage" => Some(Self::Storage),
             _ => None,
         }
     }

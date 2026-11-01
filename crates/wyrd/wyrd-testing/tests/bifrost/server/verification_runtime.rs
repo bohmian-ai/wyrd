@@ -1385,13 +1385,13 @@ async fn typed_builtin_payloads_are_queryable() -> Result<(), ServerJourneyError
 
 /// Every built-in and a dynamic table share one attribution envelope.
 ///
-/// Each of the nine freshly provisioned built-ins describes, through the
+/// Each of the ten freshly provisioned built-ins describes, through the
 /// public HTTP route, exactly `subject_card_uid` then `run_id` as writer
 /// correlation inputs, its declared ledger layout as the resolved layout, and
 /// the six shared dimensions once each as nullable text, with no managed or
 /// retired `card_uid`/`owner_card_uid` name among its own fields. A dynamic
 /// table describes its two declared fields and the same correlation inputs,
-/// and no shared dimension. All ten tables plan a read of the seven managed
+/// and no shared dimension. All eleven tables plan a read of the seven managed
 /// columns, and the dynamic table refuses a read of a shared dimension.
 /// Rows written by three producers carry their own origin: a verification
 /// result names its binding owner as workload and its subject Card, written
@@ -6236,7 +6236,9 @@ fn timestamp(at: DateTime<Utc>) -> String {
 /// The audit log's FQN.
 const AUDIT_LOG: &str = "bifrost.system.audit_log";
 
-/// The nine attributable built-ins with the time column each partitions on.
+/// The nine attributable signal and evidence built-ins, with the time column
+/// each partitions on; the server-written storage inventory has no producer
+/// here.
 const EXPLORED: [Explored; 9] = [
     Explored {
         table: SPANS,

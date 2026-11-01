@@ -29,7 +29,7 @@ use wyrd_spec::storage::{
 use wyrd_storage::{BackendConfig, StorageSettings, settings};
 use wyrd_testing::WyrdTestServer;
 
-/// Card identity every journey plans against; storage paths are scoped by tenant, so reuse is safe.
+/// Card identity the refusal journey names; it is refused before the Card is resolved.
 const FIXED_CARD_UID: &str = "018f0000-0000-7000-8000-000000000001";
 /// Payload size below [`LOW_THRESHOLD_BYTES`], so plans are a single PUT.
 const SINGLE_PUT_PAYLOAD_BYTES: usize = 512 * 1024;
@@ -92,6 +92,32 @@ async fn bootstrap_service_jwt(srv: &WyrdTestServer, name: &str) -> String {
     srv.exchange_api_key(service.api_key().expect("service API key"))
         .await
         .expect("exchange API key")
+}
+
+/// Registers the Service Card a journey uploads for and returns its UID.
+///
+/// Completion records a card-scoped inventory fact, which Scribe refuses for
+/// a Card the tenant never registered.
+///
+/// # Panics
+/// Panics when registration is refused or returns no UID.
+async fn register_card(client: &WyrdClient) -> CardUid {
+    let registered: serde_json::Value = client
+        .submit_with_idempotency_key(
+            reqwest::Method::POST,
+            "/v1/cards",
+            &serde_json::json!({ "submissions": [{
+                "apiVersion": "wyrd/v1", "kind": "Service",
+                "metadata": { "name": "storage-journey", "version": "1.0.0" },
+                "spec": {},
+                "artifacts": []
+            }] }),
+            "storage-journey-card",
+        )
+        .await
+        .expect("register the journey Card");
+    serde_json::from_value(registered["outcomes"][0]["card_ref"]["uid"].clone())
+        .expect("registration returns the Card UID")
 }
 
 /// Starts a bound artifact-storage server over `settings`.
@@ -217,7 +243,7 @@ async fn run_client_server_journey(
     let client = client_for(&srv, &token);
     let storage = WyrdStorageClient::new(&client);
     let content = patterned_payload(content_size);
-    let card_uid = CardUid::new(FIXED_CARD_UID).expect("card UID");
+    let card_uid = register_card(&client).await;
     let idempotency_key = "storage-client-journey-001";
     let init: UploadInitResponse = client
         .submit_with_idempotency_key(
@@ -411,7 +437,7 @@ async fn local_upload_capability_rejects_raw_paths_and_bad_bytes() {
     let token = bootstrap_service_jwt(&srv, "storage-local-negative").await;
     let client = client_for(&srv, &token);
     let content = b"good";
-    let card_uid = CardUid::new(FIXED_CARD_UID).expect("card UID");
+    let card_uid = register_card(&client).await;
     let init: UploadInitResponse = client
         .submit_with_idempotency_key(
             reqwest::Method::POST,

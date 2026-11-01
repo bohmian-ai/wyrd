@@ -9,7 +9,7 @@
 use std::sync::Arc;
 
 use arrow::array::{
-    ArrayRef, BooleanBuilder, RecordBatch, StringBuilder, TimestampMicrosecondBuilder,
+    ArrayRef, BooleanBuilder, Int64Builder, RecordBatch, StringBuilder, TimestampMicrosecondBuilder,
 };
 use arrow::datatypes::{DataType, SchemaRef, TimeUnit};
 use arrow::error::ArrowError;
@@ -23,6 +23,8 @@ pub enum Cell {
     Text(Option<Box<str>>),
     /// A boolean value.
     Flag(bool),
+    /// A 64-bit integer value.
+    Int(i64),
     /// A microsecond timestamp, or null; the column's declared type carries
     /// its time zone.
     Micros(Option<i64>),
@@ -50,6 +52,7 @@ impl Cell {
         match self {
             Self::Text(_) => field.data_type() == &DataType::Utf8,
             Self::Flag(_) => field.data_type() == &DataType::Boolean,
+            Self::Int(_) => field.data_type() == &DataType::Int64,
             Self::Micros(_) => matches!(
                 field.data_type(),
                 DataType::Timestamp(TimeUnit::Microsecond, _)
@@ -63,7 +66,7 @@ impl Cell {
         match self {
             Self::Text(value) => value.as_ref().map_or(0, |value| value.len()),
             Self::Variant(value) => value.as_ref().map_or(0, EncodedVariant::encoded_bytes),
-            Self::Flag(_) | Self::Micros(_) => 0,
+            Self::Flag(_) | Self::Int(_) | Self::Micros(_) => 0,
         }
     }
 }
@@ -195,6 +198,15 @@ impl StagedRow {
                 }
                 Arc::new(column.finish())
             }
+            Cell::Int(_) => {
+                let mut column = Int64Builder::with_capacity(rows.len());
+                for cell in cells {
+                    if let Cell::Int(value) = cell {
+                        column.append_value(*value);
+                    }
+                }
+                Arc::new(column.finish())
+            }
             Cell::Micros(_) => {
                 let mut column = TimestampMicrosecondBuilder::with_capacity(rows.len())
                     .with_data_type(data_type.clone());
@@ -259,6 +271,7 @@ mod tests {
                 true,
             ),
             variant_field("detail", true),
+            Field::new("size", DataType::Int64, false),
         ]));
         let detail =
             EncodedVariant::from_json(&serde_json::json!({"k": ["v", 1]})).expect("encodes");
@@ -268,18 +281,21 @@ mod tests {
                 Cell::Flag(true),
                 Cell::Micros(Some(7)),
                 Cell::Variant(Some(detail.clone())),
+                Cell::Int(-3),
             ],
             vec![
                 Cell::text(None::<&str>),
                 Cell::Flag(false),
                 Cell::Micros(None),
                 Cell::Variant(None),
+                Cell::Int(0),
             ],
             vec![
                 Cell::text(Some("")),
                 Cell::Flag(true),
                 Cell::Micros(Some(9)),
                 Cell::Variant(None),
+                Cell::Int(i64::MAX),
             ],
         ]
         .map(|cells| StagedRow::new(Arc::clone(&schema), cells).expect("row stages"));
@@ -307,6 +323,10 @@ mod tests {
             serde_json::json!({"k": ["v", 1]})
         );
         assert!(batch.column(3).is_null(1) && batch.column(3).is_null(2));
+        let sizes = batch
+            .column(4)
+            .as_primitive::<arrow::datatypes::Int64Type>();
+        assert_eq!(sizes.values().to_vec(), [-3, 0, i64::MAX]);
         assert_eq!(rows[0].text("name"), Some("ünïcode"));
         assert_eq!(rows[1].text("name"), None);
         assert!(rows[0].owned_bytes() >= "ünïcode".len() + detail.encoded_bytes());
@@ -319,7 +339,8 @@ mod tests {
                     Cell::Flag(true),
                     Cell::Flag(true),
                     Cell::Micros(None),
-                    Cell::Variant(None)
+                    Cell::Variant(None),
+                    Cell::Int(0)
                 ],
             )
             .is_err(),
@@ -332,7 +353,8 @@ mod tests {
                     Cell::text(None::<&str>),
                     Cell::Micros(None),
                     Cell::Micros(None),
-                    Cell::Variant(None)
+                    Cell::Variant(None),
+                    Cell::Int(0)
                 ],
             )
             .is_err(),

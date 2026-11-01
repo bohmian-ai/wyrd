@@ -2326,6 +2326,15 @@ complicates recovery for negligible authoring benefit, so v1 refuses
 it. Presigned upload URLs are tenant-scoped, `PUT`-only,
 single-artifact, and expire after 3600s.
 
+PostgreSQL coordinates manifests and upload sessions; it keeps no inventory
+of completed objects. Every completed artifact, envelope, and deletion is a
+row in `bifrost.storage.objects` (see the Bifrost authority), and Card
+listing, hydration, downloads, and drift baseline fitting all resolve a
+Card's files there. Activation re-verifies each declared upload and records
+it before the Card turns `Active`. A manifest entry that is complete in
+PostgreSQL but not yet visible in the inventory answers the retryable
+`WYRD_VALA_503_QUERY_VISIBILITY_UNAVAILABLE`.
+
 ### Idempotency
 
 Idempotency is a client responsibility. The `Idempotency-Key` header is
@@ -2345,7 +2354,10 @@ Key derivation (client-side):
 Server-side behavior:
 
 - Same key, same `request_hash` → `IdempotentNoop` replay, returns the
-  original response.
+  original outcomes with a re-minted plan, under the same upload, for every
+  declared upload not yet completed. A declaration that failed after its
+  commit, in upload initialization or inline completion, leaves its Cards
+  Pending; this replay or the reconcile sweep finishes them.
 - Same key, different `request_hash` →
   `WYRD_REGISTRY_409_IDEMPOTENCY_CONFLICT`.
 - Key not seen → normal processing; key + hash stored on completion.

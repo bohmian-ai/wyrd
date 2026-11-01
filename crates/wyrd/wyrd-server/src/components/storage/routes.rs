@@ -17,7 +17,7 @@ use serde::Deserialize;
 use wyrd_runtime::Permission;
 use wyrd_spec::error::storage::WyrdStorageError;
 use wyrd_spec::error::{WyrdError, WyrdProblem};
-use wyrd_spec::ids::IdempotencyKey;
+use wyrd_spec::ids::{CardUid, IdempotencyKey};
 use wyrd_spec::storage::{
     AbortResponse, DownloadInitRequest, IDEMPOTENCY_KEY_HEADER, LocalBlobUploadResponse,
     PartUrlResponse, UploadCompleteRequest, UploadId, UploadInitRequest,
@@ -27,6 +27,10 @@ use wyrd_storage::service::{self, StorageCaller};
 
 use crate::audit;
 use crate::components::auth::Caller;
+use crate::components::cards::service::card_file;
+use crate::components::storage::inventory::{
+    ObjectFact, ObjectInventory, ObjectOrigin, ObjectState,
+};
 use crate::http::error::WyrdErrorResponse;
 use crate::state::AppState;
 use utoipa_axum::router::OpenApiRouter;
@@ -172,7 +176,18 @@ async fn part_url(
 ///
 /// The optional `Idempotency-Key` is forwarded to the storage service so a
 /// retried client completion keeps the same request context. The service
-/// verifies the backend object before persisting its artifact metadata.
+/// verifies the backend object and commits the upload's completion; the
+/// handler then records the completed object in `bifrost.storage.objects`
+/// and responds only once that row is acknowledged. An unacknowledged
+/// record leaves the completion committed with its outcome unknown, and a
+/// retried completion records the same object again.
+///
+/// # Errors
+/// Returns the idempotency, upload-id, and authorization refusals, the
+/// storage service's completion errors, an internal error when the stored
+/// path or size cannot be recorded, and
+/// `WYRD_VALA_503_BIFROST_WRITER_UNAVAILABLE` when the inventory does not
+/// acknowledge the completed object in time.
 #[utoipa::path(
     post,
     path = "/cards/upload/{id}/complete",
@@ -203,12 +218,17 @@ async fn part_url(
           WYRD_SPEC_409_CONFLICT)", body = WyrdProblem),
         (status = 500, description = "The storage backend or the platform store failed \
           (WYRD_STORAGE_500_BACKEND, WYRD_SPEC_500_INTERNAL)", body = WyrdProblem),
-        (status = 503, description = "No verifier is configured for the access token, or \
-          the storage backend is transiently unavailable \
-          (WYRD_AUTH_503_VERIFY_UNAVAILABLE, \
-          WYRD_STORAGE_503_BACKEND_UNAVAILABLE)", body = WyrdProblem)
+        (status = 503, description = "No verifier is configured for the access token, the \
+          storage backend is transiently unavailable, or the object inventory did not \
+          acknowledge the completion in time; retry the completion \
+          (WYRD_AUTH_503_VERIFY_UNAVAILABLE, WYRD_STORAGE_503_BACKEND_UNAVAILABLE, \
+          WYRD_VALA_503_BIFROST_WRITER_UNAVAILABLE)", body = WyrdProblem)
     ),
     tag = "Storage"
+)]
+#[tracing::instrument(
+    skip(state, caller, headers, body),
+    fields(operation = "storage.upload.complete")
 )]
 async fn complete(
     State(state): State<AppState>,
@@ -226,17 +246,36 @@ async fn complete(
         &format!("upload:{upload_id}"),
     )?;
     let storage_caller = storage_caller(&caller);
-    service::upload_complete(
+    let response = service::upload_complete(
         &state.storage,
         state.postgres.wyrd(),
         &storage_caller,
-        upload_id,
+        upload_id.clone(),
         idempotency_key,
         body,
     )
-    .await
-    .map(Json)
-    .map_err(WyrdErrorResponse::from)
+    .await?;
+    let stored = &response.stored;
+    let path = wyrd_storage::tenant_path::validate(&stored.storage_path, caller.data_tenant_id)
+        .map_err(|error| WyrdError::internal(format!("completed object path: {error}")))?;
+    let fact = ObjectFact {
+        storage_path: stored.storage_path.clone(),
+        upload_id: Some(upload_id.to_string()),
+        backend: state.storage.backend().to_string(),
+        sha256: Some(stored.sha256.clone()),
+        size_bytes: i64::try_from(stored.size_bytes)
+            .map_err(|_| WyrdError::internal("completed object size overflows"))?,
+        content_type: stored.content_type.clone(),
+        sse_marker: stored.sse_marker.clone(),
+        origin: ObjectOrigin::CardFile,
+        card_uid: Some(CardUid::new(&path.card_uid).map_err(WyrdError::from_card_uid_error)?),
+        relative_path: Some(path.relative_path),
+        state: ObjectState::Completed,
+    };
+    ObjectInventory::new(&state)
+        .record(caller.data_tenant_id, caller.attribution(), &[fact])
+        .await?;
+    Ok(Json(response))
 }
 
 /// Abort an upload and release its pending storage state.
@@ -375,6 +414,14 @@ async fn local_blob(
 }
 
 /// Create a signed or local download plan for a stored artifact.
+///
+/// The artifact must be the Card's completed file in the object inventory
+/// after card-read authorization.
+///
+/// # Errors
+/// Returns the authorization refusal, the Card and inventory lookup errors —
+/// including `WYRD_VALA_503_QUERY_VISIBILITY_UNAVAILABLE` while a completed
+/// file is not visible yet — and the storage service's planning errors.
 #[utoipa::path(
     post,
     path = "/cards/download/init",
@@ -391,17 +438,20 @@ async fn local_blob(
         (status = 403, description = "The principal lacks card read, or the object belongs to \
           another tenant (WYRD_PERMISSION_403_DENIED_RBAC, WYRD_STORAGE_403_UPLOAD_FOREIGN_TENANT)", body = WyrdProblem),
         (status = 404, description = "No such card artifact, or its object is gone from the \
-          backend (WYRD_SPEC_404_NOT_FOUND, WYRD_STORAGE_404_OBJECT_NOT_FOUND)",
+          backend (WYRD_SPEC_404_NOT_FOUND, WYRD_REGISTRY_404_CARD_NOT_FOUND, \
+          WYRD_STORAGE_404_OBJECT_NOT_FOUND)",
          body = WyrdProblem),
         (status = 500, description = "The storage backend or the platform store failed \
           (WYRD_STORAGE_500_BACKEND, WYRD_SPEC_500_INTERNAL)", body = WyrdProblem),
-        (status = 503, description = "No verifier is configured for the access token, or \
-          the storage backend is transiently unavailable \
-          (WYRD_AUTH_503_VERIFY_UNAVAILABLE, \
-          WYRD_STORAGE_503_BACKEND_UNAVAILABLE, WYRD_STORAGE_503_PRESIGN_EXPIRED)", body = WyrdProblem)
+        (status = 503, description = "No verifier is configured for the access token, the \
+          storage backend is transiently unavailable, or the completed artifact is not \
+          visible in the object inventory yet; retry the download \
+          (WYRD_AUTH_503_VERIFY_UNAVAILABLE, WYRD_STORAGE_503_BACKEND_UNAVAILABLE, \
+          WYRD_STORAGE_503_PRESIGN_EXPIRED, WYRD_VALA_503_QUERY_VISIBILITY_UNAVAILABLE)", body = WyrdProblem)
     ),
     tag = "Storage"
 )]
+#[tracing::instrument(skip(state, caller, body), fields(operation = "storage.download.init"))]
 async fn download_init(
     State(state): State<AppState>,
     caller: Caller,
@@ -413,8 +463,8 @@ async fn download_init(
         "storage.download.init",
         &format!("card:{}", body.card_uid),
     )?;
-    let storage_caller = storage_caller(&caller);
-    service::download_init(&state.storage, state.postgres.wyrd(), &storage_caller, body)
+    let stored = card_file(&state, &caller, &body.card_uid, &body.relative_path).await?;
+    service::download_init(&state.storage, &storage_caller(&caller), body, stored)
         .await
         .map(Json)
         .map_err(WyrdErrorResponse::from)

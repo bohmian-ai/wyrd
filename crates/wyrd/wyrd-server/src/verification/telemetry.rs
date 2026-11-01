@@ -126,8 +126,10 @@ type Ledger = [Vec<Interval>; 7];
 /// Owner of one verification execution's metrics lifetime.
 ///
 /// Created when a direct request reaches the server or a queued attempt is
-/// claimed; it counts the attempt and raises the active gauge at once and
-/// lowers the gauge exactly once on drop. A direct execution dropped before
+/// claimed; it raises the active gauge at once and lowers it exactly once on
+/// drop. The attempt is counted when its outcome is emitted, so a queued
+/// claim dropped without [`finish`](Self::finish) — a deferral that spends
+/// no attempt — emits no attempt series. A direct execution dropped before
 /// [`finish`](Self::finish), a client disconnect, finishes as `cancelled`.
 #[derive(Debug)]
 pub struct ExecutionTelemetry {
@@ -146,11 +148,9 @@ pub struct ExecutionTelemetry {
 impl ExecutionTelemetry {
     /// Start accounting for one `mode` execution from `since` — a direct
     /// request's HTTP arrival at this server, or a queued run's claim — or
-    /// from now when there is neither (an MCP call): count the attempt and
-    /// raise the active gauge.
+    /// from now when there is neither (an MCP call): raise the active gauge.
     #[must_use]
     pub fn start(mode: ExecutionMode, since: Option<Instant>) -> Self {
-        metrics::counter!(VERIFICATION_RUN_ATTEMPTS_TOTAL, "mode" => mode.as_str()).increment(1);
         metrics::gauge!(VERIFICATION_ACTIVE_RUNS, "mode" => mode.as_str()).increment(1.0);
         Self {
             mode,
@@ -221,8 +221,9 @@ impl ExecutionTelemetry {
         self.finished = true;
     }
 
-    /// Emit the outcome families of [`finish`](Self::finish): each phase,
-    /// the whole execution, the Verifier's block time, and the overhead.
+    /// Emit the outcome families of [`finish`](Self::finish): the attempt
+    /// count, each phase, the whole execution, the Verifier's block time,
+    /// and the overhead.
     ///
     /// A direct execution's duration and block union are also recorded
     /// through [`wyrd_telemetry::record_timing_parts`] under the current
@@ -234,6 +235,7 @@ impl ExecutionTelemetry {
         let total = self.started.elapsed();
         let ledger = self.lock();
         let mode = self.mode.as_str();
+        metrics::counter!(VERIFICATION_RUN_ATTEMPTS_TOTAL, "mode" => mode).increment(1);
         let mut parts = Vec::with_capacity(Phase::ALL.len() + 1);
         for (phase, intervals) in Phase::ALL.iter().zip(ledger.iter()) {
             if !intervals.is_empty() {

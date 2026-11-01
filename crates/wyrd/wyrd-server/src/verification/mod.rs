@@ -518,7 +518,7 @@ impl VerificationRuntimeBuilder<'_> {
         let fitter = BaselineFitter::new(
             postgres.clone(),
             operator.clone(),
-            Arc::clone(&self.state.storage),
+            self.state.clone(),
             &self.limits,
         );
         #[cfg(feature = "test-support")]

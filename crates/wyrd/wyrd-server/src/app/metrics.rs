@@ -81,7 +81,8 @@ pub const WYRD_STORAGE_OPERATION_DURATION_SECONDS: &str = "wyrd_storage_operatio
 pub const VERIFICATION_QUEUE_DEPTH: &str = "wyrd_verification_queue_depth";
 /// Verifier executions currently in flight in this process, by `mode`.
 pub const VERIFICATION_ACTIVE_RUNS: &str = "wyrd_verification_active_runs";
-/// Claimed queued attempts and admitted direct executions, by `mode`.
+/// Settled queued attempts and admitted direct executions, by `mode`; a
+/// deferred claim spends no attempt and is not counted.
 pub const VERIFICATION_RUN_ATTEMPTS_TOTAL: &str = "wyrd_verification_run_attempts_total";
 /// Unsuccessful execution outcomes, by `mode` and `outcome`; a
 /// completed failed judgment is not one.
@@ -90,7 +91,8 @@ pub const VERIFICATION_RUN_FAILURES_TOTAL: &str = "wyrd_verification_run_failure
 /// `mode` and `outcome`.
 pub const VERIFICATION_RUN_DURATION_SECONDS: &str = "wyrd_verification_run_duration_seconds";
 /// How long a claimed Verifier run had been claimable before its claim, as
-/// PostgreSQL measured it, by `origin`.
+/// PostgreSQL measured it, by `origin`; recorded once per attempt, never for
+/// a deferred claim.
 pub const VERIFICATION_QUEUE_WAIT_SECONDS: &str = "wyrd_verification_queue_wait_seconds";
 /// Run creation to durable terminal settlement, by `origin` and
 /// terminal `outcome`; its `_count` is the settled terminal runs.

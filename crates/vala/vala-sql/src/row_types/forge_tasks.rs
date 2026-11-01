@@ -108,6 +108,7 @@ impl ForgeTaskTableIdentity {
             "bifrost.dev",
             "bifrost.datasets",
             "bifrost.gateway",
+            "bifrost.storage",
         ];
         let value = Self {
             catalog: catalog.into(),

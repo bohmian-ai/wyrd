@@ -361,7 +361,6 @@ mod tests {
             "src/queries/platform/principal_grants.rs",
             "src/queries/storage/mod.rs",
             "src/queries/storage/multipart_uploads.rs",
-            "src/queries/storage/artifact_metadata.rs",
             "src/queries/storage/idempotency.rs",
             "src/queries/storage/admin/mod.rs",
             "src/queries/storage/admin/multipart_uploads.rs",
@@ -556,7 +555,6 @@ mod tests {
             .join("\n");
         for table in [
             "wyrd.storage_multipart_uploads",
-            "wyrd.storage_artifact_metadata",
             "wyrd.storage_idempotency_keys",
         ] {
             assert!(
@@ -592,11 +590,7 @@ mod tests {
     #[test]
     fn storage_query_boundaries_are_explicit() {
         let crate_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
-        let tenant_modules = [
-            "multipart_uploads.rs",
-            "artifact_metadata.rs",
-            "idempotency.rs",
-        ];
+        let tenant_modules = ["multipart_uploads.rs", "idempotency.rs"];
 
         for file_name in tenant_modules {
             let path = crate_dir.join("src/queries/storage").join(file_name);

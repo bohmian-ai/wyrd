@@ -1,13 +1,14 @@
 //! Private tonic adapter for server-internal writes submitted by a pod without
-//! Scribe: audit decisions, gateway capture, Verifier results, and tenant
-//! copies of server spans.
+//! Scribe: audit decisions, gateway capture, Verifier results, tenant
+//! copies of server spans, and storage object inventory facts.
 //!
 //! Mounted only on the mutually authenticated peer listener of a pod that runs
 //! Scribe, so every caller already presented the cluster `wyrd-peer`
 //! certificate. That admits a trusted cluster process, not a tenant: the
 //! request names its tenant and destination explicitly and carries no token.
 //! The service accepts only the audit log, the two capture destinations, and
-//! the Verifier result and execution input tables, whose rows carry the subject and actor
+//! the Verifier result and execution input tables, and the storage object
+//! inventory, whose rows carry the subject and actor
 //! Scribe stamps, and the reserved system tenant only for audit history,
 //! then submits through the same frame the in-process Scribe outbox route
 //! uses.
@@ -56,7 +57,7 @@ impl ScribeCapturePeerGrpc {
     ///
     /// Returns `InvalidArgument` for a malformed tenant, batch, or request id,
     /// and `PermissionDenied` for the reserved
-    /// system tenant outside audit history or any table other than the six
+    /// system tenant outside audit history or any table other than the seven
     /// server-internal destinations.
     fn batch(request: IngestCaptureRequest) -> Result<ScribeBatch, Status> {
         let tenant = request
@@ -65,7 +66,7 @@ impl ScribeCapturePeerGrpc {
             .map_err(|_| Status::invalid_argument("capture tenant_id is not a tenant id"))?;
         let table = ScribeTable::from_fqn(&request.table).ok_or_else(|| {
             Status::permission_denied(format!(
-                "the peer writer accepts only the audit, gateway capture, and Verifier result and input tables, not {}",
+                "the peer writer accepts only the audit, gateway capture, Verifier result and input, and storage object tables, not {}",
                 request.table
             ))
         })?;

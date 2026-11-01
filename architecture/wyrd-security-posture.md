@@ -80,12 +80,15 @@ physical location, so callers of one tenant may share a frame but tenants never
 do. Outbox frames name `PLATFORM_AUDIT_PRINCIPAL`, the no-verified-caller
 marker, as their transport principal; it grants nothing and never replaces a
 row's verified pair or the invocation caller in audit. Gate refuses every
-public write to `bifrost.gateway.calls`. A pod without Scribe sends its outbox
+public write to `bifrost.gateway.calls` and `bifrost.storage.objects`. A pod without Scribe sends its outbox
 writes over the peer plane's capture RPC, admitted by `wyrd-peer` mTLS alone.
 Each request's rows carry the subject/actor pairs the local writer would
-stamp, and the RPC accepts only the six server-internal destinations: retained audit history, the two capture tables,
-and the three Verifier result tables. Only audit history may name the reserved
-system tenant; an audit row keeps its decision pair as content. A compromised cluster
+stamp, and the RPC accepts only the seven server-internal destinations: retained audit history, the two capture tables,
+the three Verifier result tables, and the storage object inventory. Only audit history may name the reserved
+system tenant; an audit row keeps its decision pair as content. Card file
+reads consult that inventory only after the caller's Card decision, as the
+tenant's `System` principal granted that one table, so they neither need nor
+widen a caller's Bifrost query permission and never cross tenants. A compromised cluster
 member, already out of scope, is the only caller that could misuse it.
 
 Registering a Service or Agent Card creates Card versions only, never a

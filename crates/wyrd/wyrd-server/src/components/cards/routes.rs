@@ -12,7 +12,7 @@ use axum::http::{HeaderMap, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use serde::Deserialize;
 use wyrd_runtime::Permission;
-use wyrd_spec::envelope::CardKind;
+use wyrd_spec::envelope::{CardKind, Spec};
 use wyrd_spec::error::{WyrdError, WyrdProblem};
 use wyrd_spec::ids::{CardName, CardUid, IdempotencyKey};
 use wyrd_spec::reference::CardRef;
@@ -187,6 +187,40 @@ pub(crate) async fn get_card_by_ref_for(
         ));
     }
     Ok(response)
+}
+
+/// Authorize, audit, and read the stored spec of one Card by exact identity.
+///
+/// The spec-only twin of [`get_card_by_ref_for`]: the same `cards:read`
+/// audit resource and UID check, over [`service::get_card_spec_by_ref`].
+///
+/// # Errors
+/// Returns [`WyrdError::PermissionDeniedRbac`] without `cards:read`,
+/// [`WyrdError::RegistryCardNotFound`] when the named UID is another Card's,
+/// and the errors of [`service::get_card_spec_by_ref`].
+pub(crate) async fn get_card_spec_by_ref_for(
+    state: &AppState,
+    caller: &Caller,
+    card_ref: &CardRef,
+) -> Result<Spec, WyrdError> {
+    audit::authorize(
+        state,
+        caller,
+        &Permission::card_read(),
+        "card.read.ref",
+        &card_resource(card_ref),
+    )?;
+    let row = service::get_card_spec_by_ref(state, caller, card_ref).await?;
+    if card_ref
+        .uid
+        .as_ref()
+        .is_some_and(|uid| *uid != row.card_uid)
+    {
+        return Err(WyrdError::registry_card_not_found(
+            "card UID does not match the referenced identity",
+        ));
+    }
+    Ok(row.spec)
 }
 
 /// Resolve the newest stable Active Card in an identity line.

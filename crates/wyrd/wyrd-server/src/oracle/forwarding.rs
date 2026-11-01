@@ -489,6 +489,11 @@ impl ReadyOracleForwarder {
     }
 
     /// Validates every redundant cut/envelope binding before local leadership begins.
+    ///
+    /// # Errors
+    /// Returns [`BifrostError::QueryPeerSecurity`] when a binding does not match
+    /// this node, and [`BifrostError::QueryTimeout`] when an authentic claim's
+    /// deadline has already passed.
     fn validate_claims(
         claims: &ForwardQueryClaims,
         local_node_id: NodeId,
@@ -501,10 +506,12 @@ impl ReadyOracleForwarder {
             .map_err(|_| BifrostError::QueryPeerSecurity)?;
         if claims.audience != local_node_id
             || claims.worker_fence != local_fence
-            || claims.absolute_deadline_ms <= chrono::Utc::now().timestamp_millis()
             || uuid::Uuid::parse_str(claims.context.request_id.as_str()).is_err()
         {
             return Err(BifrostError::QueryPeerSecurity);
+        }
+        if claims.absolute_deadline_ms <= chrono::Utc::now().timestamp_millis() {
+            return Err(BifrostError::QueryTimeout);
         }
         Ok(())
     }
@@ -769,6 +776,32 @@ mod tests {
         assert!(matches!(
             forwarded_query_error(status),
             BifrostError::QueryForbidden
+        ));
+    }
+
+    /// An authentic envelope whose deadline has passed is a timeout, while a
+    /// mismatched audience stays a peer-security refusal.
+    #[test]
+    fn expired_claims_time_out_and_foreign_claims_stay_refused() {
+        let now = chrono::Utc::now();
+        let node = NodeId::new(uuid::Uuid::from_u128(7));
+        let (context, request) = query_input();
+        let expired = ForwardingAttempt {
+            context,
+            request,
+            now,
+            wall_deadline: now - chrono::Duration::milliseconds(1),
+        }
+        .into_claims((node, 9))
+        .expect("claims build");
+        assert!(matches!(
+            ReadyOracleForwarder::validate_claims(&expired, node, 9),
+            Err(BifrostError::QueryTimeout)
+        ));
+        let foreign = NodeId::new(uuid::Uuid::from_u128(8));
+        assert!(matches!(
+            ReadyOracleForwarder::validate_claims(&expired, foreign, 9),
+            Err(BifrostError::QueryPeerSecurity)
         ));
     }
 

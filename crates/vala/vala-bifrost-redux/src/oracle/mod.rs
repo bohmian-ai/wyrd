@@ -2495,7 +2495,8 @@ impl Oracle {
     /// Inserts one admitted query against the ingress-captured membership cut.
     ///
     /// # Errors
-    /// Returns a stable role or conflict error when the immutable cut cannot be retained.
+    /// Returns a stable role or conflict error when the immutable cut cannot be retained,
+    /// and [`BifrostError::QueryTimeout`] when the cut's deadline has already passed.
     fn register_running_query(
         &self,
         context: &AuthorizedQueryContext,
@@ -2507,9 +2508,11 @@ impl Oracle {
         if admitted.query_id != participant_cut.attempt_id()
             || admitted.leader.node_id != participant_cut.leader().node_id
             || admitted.leader.fencing_token != participant_cut.leader().fencing_token
-            || participant_cut.deadline() <= now
         {
             return Err(BifrostError::QueryPeerSecurity);
+        }
+        if participant_cut.deadline() <= now {
+            return Err(BifrostError::QueryTimeout);
         }
         let entry = RunningQueryEntry::with_cancellation(
             context.data_tenant_id,

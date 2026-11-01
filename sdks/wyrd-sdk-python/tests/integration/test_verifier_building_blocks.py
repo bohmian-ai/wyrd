@@ -597,6 +597,26 @@ def test_file_inputs_use_shared_uploads(desk: WyrdState, wyrd_server: WyrdTestSe
         assert planned.json()["uploads"] == []
 
 
+def test_stored_evidence_readback_uses_canonical_records(desk: WyrdState) -> None:
+    content = b"a,b\n5,6"
+    execution = desk.run().observe.submit("document-formats", verify.File(content, format="csv"))
+    assert isinstance(execution, verify.Execution)
+
+    result = execution.wait(WAIT_SECONDS)
+    status = execution.status()
+
+    assert status["result"]["execution_id"] == execution.id
+    assert status["result"]["outcome"]["verdict"] == result.verdict
+    assert list(status["result"]["outcome"]["evidence"].values()) == [
+        {
+            "kind": "file",
+            "sha256": hashlib.sha256(content).hexdigest(),
+            "size_bytes": len(content),
+            "format": "csv",
+        }
+    ]
+
+
 def test_failed_reader_leaves_its_dependents_inconclusive(isolated_desk: WyrdState) -> None:
     # PROVIDER-DOWN runs last: its failure starts the deployment's cooldown.
     for marker in ("OFF-SCHEMA", "SLOW-READER", "PROVIDER-DOWN"):

@@ -23,6 +23,7 @@ use wyrd_server::config::BifrostTarget;
 use wyrd_spec::DataTenantId;
 use wyrd_spec::auth::Sha256Hex;
 use wyrd_spec::ids::CardUid;
+use wyrd_spec::registry::{CardUploadEntry, DeclareCardResponse};
 use wyrd_spec::storage::{
     DownloadInitRequest, DownloadInitResponse, DownloadPlan, StorageBackendKind, UploadInitRequest,
     UploadInitResponse, UploadPlan,
@@ -96,15 +97,31 @@ async fn bootstrap_service_jwt(srv: &WyrdTestServer, name: &str) -> String {
         .expect("exchange API key")
 }
 
-/// Registers the Service Card a journey uploads for and returns its UID.
+/// Registers the Service Card a journey uploads for, declaring `artifact`'s
+/// path and bytes when given, and returns its UID and that file's upload.
 ///
 /// Completion records a card-scoped inventory fact, which Scribe refuses for
-/// a Card the tenant never registered.
+/// a Card the tenant never registered; a Card serves only the files it
+/// declared.
 ///
 /// # Panics
-/// Panics when registration is refused or returns no UID.
-async fn register_card(client: &WyrdClient) -> CardUid {
-    let registered: serde_json::Value = client
+/// Panics when registration is refused, returns no UID, or plans no upload
+/// for a declared file.
+async fn register_card(
+    client: &WyrdClient,
+    artifact: Option<(&str, &[u8])>,
+) -> (CardUid, Option<CardUploadEntry>) {
+    let artifacts: Vec<_> = artifact
+        .iter()
+        .map(|(relative_path, content)| {
+            serde_json::json!({
+                "relative_path": relative_path,
+                "sha256": sha256_b64(content),
+                "size_bytes": content.len(),
+            })
+        })
+        .collect();
+    let registered: DeclareCardResponse = client
         .submit_with_idempotency_key(
             reqwest::Method::POST,
             "/v1/cards",
@@ -112,14 +129,26 @@ async fn register_card(client: &WyrdClient) -> CardUid {
                 "apiVersion": "wyrd/v1", "kind": "Service",
                 "metadata": { "name": "storage-journey", "version": "1.0.0" },
                 "spec": {},
-                "artifacts": []
+                "artifacts": artifacts
             }] }),
             "storage-journey-card",
         )
         .await
         .expect("register the journey Card");
-    serde_json::from_value(registered["outcomes"][0]["card_ref"]["uid"].clone())
-        .expect("registration returns the Card UID")
+    let card_uid = registered.outcomes[0]
+        .card_ref
+        .uid
+        .clone()
+        .expect("registration returns the Card UID");
+    let upload = artifact.map(|_| {
+        registered
+            .upload_plans
+            .into_iter()
+            .flat_map(|plan| plan.entries)
+            .next()
+            .expect("the declared file has an upload")
+    });
+    (card_uid, upload)
 }
 
 /// Starts a bound artifact-storage server over `settings`.
@@ -247,23 +276,9 @@ async fn run_client_server_journey(
     let client = client_for(&srv, &token);
     let storage = WyrdStorageClient::new(&client);
     let content = patterned_payload(content_size);
-    let card_uid = register_card(&client).await;
+    let (card_uid, upload) = register_card(&client, Some((relative_path, &content))).await;
+    let init = upload.expect("the journey file has an upload");
     let idempotency_key = "storage-client-journey-001";
-    let init: UploadInitResponse = client
-        .submit_with_idempotency_key(
-            reqwest::Method::POST,
-            "/v1/cards/upload/init",
-            &UploadInitRequest {
-                card_uid: card_uid.clone(),
-                relative_path: relative_path.to_owned(),
-                expected_sha256: sha256_b64(&content),
-                expected_size_bytes: content.len() as u64,
-                content_type: None,
-            },
-            idempotency_key,
-        )
-        .await
-        .expect("upload init succeeds");
     let upload_plan = init.plan.clone();
     storage
         .upload_artifact(
@@ -332,7 +347,7 @@ async fn run_client_server_journey(
             reqwest::Method::POST,
             "/v1/cards/download/init",
             Some(&DownloadInitRequest {
-                card_uid,
+                card_uid: card_uid.clone(),
                 relative_path: relative_path.to_owned(),
                 ttl_secs: None,
             }),
@@ -344,7 +359,7 @@ async fn run_client_server_journey(
         DownloadPlan {
             get_url: format!(
                 "{base_url}/v1/cards/download/local?path={}",
-                init.storage_path
+                wyrd_storage::tenant_path::build(tenant, card_uid.as_str(), relative_path)
             ),
             ttl_secs: 0,
         }
@@ -493,7 +508,7 @@ async fn local_upload_capability_rejects_raw_paths_and_bad_bytes() {
     let token = bootstrap_service_jwt(&srv, "storage-local-negative").await;
     let client = client_for(&srv, &token);
     let content = b"good";
-    let card_uid = register_card(&client).await;
+    let (card_uid, _) = register_card(&client, None).await;
     let init: UploadInitResponse = client
         .submit_with_idempotency_key(
             reqwest::Method::POST,

@@ -897,6 +897,52 @@ async fn submitted_review_is_judged_in_the_background() {
     desk.deployment.shutdown().await;
 }
 
+/// A submitted File's settled status reads back the result wait returned,
+/// with the original File declaration as its evidence.
+///
+/// # Panics
+/// Panics when the submission is refused or the readback differs.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires the repository-managed Postgres journey lifecycle"]
+async fn stored_evidence_readback_uses_canonical_records() {
+    let desk = PolicyDesk::start().await;
+    let bytes = b"a,b\n5,6".to_vec();
+    let Submission::Queued(execution) = desk
+        .state
+        .run()
+        .observe()
+        .submit(
+            "document-formats",
+            File::bytes(bytes.clone()).with_format(MediaFormat::Csv),
+        )
+        .await
+        .expect("the File is submitted")
+    else {
+        panic!("Run evidence queues an execution");
+    };
+    let result = execution.wait(WAIT).await.expect("the File settles");
+    let status = execution.status().await.expect("the settled status reads");
+
+    assert_eq!(status.result.as_ref(), Some(&result));
+    let evidence = serde_json::to_value(&result.outcome.evidence).expect("evidence encodes");
+    let declarations: Vec<&Value> = evidence
+        .as_object()
+        .expect("evidence is by slot")
+        .values()
+        .collect();
+    assert_eq!(
+        declarations,
+        [&json!({
+            "kind": "file",
+            "sha256": wyrd_spec::auth::Sha256Hex::digest(&bytes).to_string(),
+            "size_bytes": bytes.len(),
+            "format": "csv",
+        })],
+        "{evidence}"
+    );
+    desk.deployment.shutdown().await;
+}
+
 /// Each of the nine extractable formats extracts into its exact locked
 /// output, which the downstream assertion consumes.
 ///

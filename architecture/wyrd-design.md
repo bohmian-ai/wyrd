@@ -1742,7 +1742,13 @@ completion guarantee for Card files and Files alike. Planning reuses a File
 only when a completed, undeleted same-tenant `file_upload` fact matches its
 digest and length; object presence, a Card file, or another tenant's record
 never stands in for one. Verification reads a File from its recorded storage
-location and re-checks its length and digest. Per-file and aggregate limits
+location and re-checks its length and digest. Each execution resolves its File
+and Artifact metadata once, at admission, and reuses it for every read; each
+Artifact use still authorizes its own `card:read`. A File with no visible
+completed record, or an unreadable inventory, is not ready: direct execution
+answers `WYRD_SERVER_503_SERVICE_UNAVAILABLE`, and a queued attempt ends
+`retrying` with `evidence_unavailable` under the queue's ordinary attempt
+bounds, the last ending `errored`. Per-file and aggregate limits
 (`WYRD_VERIFICATION_FILE_MAX_MIB`, `WYRD_VERIFICATION_FILES_MAX_MIB`) are
 enforced at planning. `ArtifactRef` selects a declared Artifact under its own
 authorization.
@@ -2338,14 +2344,14 @@ complicates recovery for negligible authoring benefit, so v1 refuses
 it. Presigned upload URLs are tenant-scoped, `PUT`-only,
 single-artifact, and expire after 3600s.
 
-PostgreSQL coordinates manifests and upload sessions; it keeps no inventory
-of completed objects. Every completed artifact, envelope, and deletion is a
-row in `bifrost.storage.objects` (see the Bifrost authority), and Card
-listing, hydration, downloads, and drift baseline fitting all resolve a
-Card's files there. Activation re-verifies each declared upload and records
-it before the Card turns `Active`. A manifest entry that is complete in
-PostgreSQL but not yet visible in the inventory answers the retryable
-`WYRD_VALA_503_QUERY_VISIBILITY_UNAVAILABLE`.
+PostgreSQL coordinates manifests and upload sessions. Every completed
+artifact, envelope, and deletion is also a row in `bifrost.storage.objects`
+(see the Bifrost authority), the durable object record. Card reads never
+query Bifrost: Card listing, hydration, downloads, verifier Card resolution,
+workspace Artifact files, and drift baseline fitting serve a Card's
+declared files that storage completed, from its PostgreSQL manifest, read in
+the Card's own tenant transaction. Activation re-verifies each declared
+upload and records it before the Card turns `Active`.
 
 ### Idempotency
 

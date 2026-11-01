@@ -131,6 +131,8 @@ impl HumanSso {
             page.contains("Connection test complete"),
             "the test sign-in completes: {page}"
         );
+        // The sign-in can outlive a short-lived access token.
+        let token = self.access_token(admin_key).await;
         self.call(
             &token,
             reqwest::Method::POST,

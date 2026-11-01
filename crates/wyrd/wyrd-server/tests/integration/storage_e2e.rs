@@ -21,11 +21,13 @@ use wyrd_client::transport::config::HttpConfig;
 use wyrd_client::transport::credential::ResolvedCredential;
 use wyrd_server::config::BifrostTarget;
 use wyrd_spec::DataTenantId;
+use wyrd_spec::auth::Sha256Hex;
 use wyrd_spec::ids::CardUid;
 use wyrd_spec::storage::{
     DownloadInitRequest, DownloadInitResponse, DownloadPlan, StorageBackendKind, UploadInitRequest,
     UploadInitResponse, UploadPlan,
 };
+use wyrd_spec::verification::execution::{EvidenceFile, EvidencePlanRequest, EvidencePlanResponse};
 use wyrd_storage::{BackendConfig, StorageSettings, settings};
 use wyrd_testing::WyrdTestServer;
 
@@ -220,7 +222,9 @@ async fn purge_journey_objects(settings: &StorageSettings, tenant: DataTenantId)
 ///
 /// Starts a bound server over `settings`, initializes an upload for
 /// `relative_path` with `content_size` patterned bytes (which selects the
-/// single-PUT or multipart plan against [`LOW_THRESHOLD_BYTES`]), uploads and completes it through `WyrdStorageClient`, plans a download, and
+/// single-PUT or multipart plan against [`LOW_THRESHOLD_BYTES`]), uploads and completes it through `WyrdStorageClient`, uploads and
+/// completes the same bytes as two concurrently planned verification File sessions on the
+/// same protocol, plans a download, and
 /// streams it back with digest and size verification. The server is shut down
 /// and every object the run could produce is purged *before* the download
 /// outcome is asserted, so a failed transfer still cleans shared cloud buckets.
@@ -270,6 +274,58 @@ async fn run_client_server_journey(
         )
         .await
         .expect("storage client uploads and completes artifact");
+
+    // The same bytes as a verification File: a Card file never supplies one,
+    // so it is planned on the same protocol and completed through the same
+    // client, after which the next plan reuses its completed record. Two
+    // sessions planned before either transfers each own their object, so
+    // both complete.
+    let files = EvidencePlanRequest {
+        files: vec![EvidenceFile {
+            sha256: Sha256Hex::digest(&content),
+            size_bytes: content.len() as u64,
+        }],
+    };
+    let mut sessions = Vec::new();
+    for _ in 0..2 {
+        let planned: EvidencePlanResponse = client
+            .request_json(
+                reqwest::Method::POST,
+                "/v1/verification/evidence",
+                Some(&files),
+            )
+            .await
+            .expect("File evidence plans");
+        let [file] = planned.uploads.as_slice() else {
+            panic!("one File upload is planned: {planned:?}");
+        };
+        assert_eq!(
+            std::mem::discriminant(&file.plan),
+            std::mem::discriminant(&upload_plan),
+            "a File follows the Card file's planner policy"
+        );
+        sessions.push(file.clone());
+    }
+    for file in &sessions {
+        storage
+            .upload_artifact(
+                &file.upload_id,
+                &file.plan,
+                content.clone(),
+                &format!("storage-file-journey-{}", file.upload_id),
+            )
+            .await
+            .expect("storage client uploads and completes each File session");
+    }
+    let reused: EvidencePlanResponse = client
+        .request_json(
+            reqwest::Method::POST,
+            "/v1/verification/evidence",
+            Some(&files),
+        )
+        .await
+        .expect("File evidence replans");
+    assert!(reused.uploads.is_empty(), "the completed File is reused");
 
     let download: DownloadInitResponse = client
         .request_json(

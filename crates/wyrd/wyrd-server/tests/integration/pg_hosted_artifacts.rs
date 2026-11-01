@@ -170,7 +170,10 @@ impl Registered {
 }
 
 /// A fresh user of `tenant` holding exactly `permissions`.
-fn user(tenant: DataTenantId, permissions: impl IntoIterator<Item = Permission>) -> Caller {
+pub(crate) fn user(
+    tenant: DataTenantId,
+    permissions: impl IntoIterator<Item = Permission>,
+) -> Caller {
     Caller {
         data_tenant_id: tenant,
         principal: Principal::new(

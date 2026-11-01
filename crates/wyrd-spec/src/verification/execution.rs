@@ -26,6 +26,7 @@ use crate::card::verifier::{Check, CodeRuntime};
 use crate::error::WyrdError;
 use crate::ids::{CardUid, ExecutionId, GroupId, SlotName};
 use crate::reference::CardRef;
+use crate::storage::ids::UploadId;
 use crate::storage::upload::UploadPlan;
 use crate::vala::ids::{RunId, TraceId};
 use crate::verification::TaskId;
@@ -126,21 +127,28 @@ pub struct EvidencePlanRequest {
 }
 
 /// `POST /v1/verification/evidence` response: upload plans only for files
-/// the server does not already hold.
+/// the server does not already hold as completed File uploads.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
 pub struct EvidencePlanResponse {
-    /// One plan per missing file; present files are omitted.
+    /// One upload per missing file; completed files are omitted.
     pub uploads: Vec<EvidenceUpload>,
 }
 
-/// How to upload one missing file.
+/// How to upload one missing file through the shared storage lifecycle.
+///
+/// Transfer the bytes by `plan`, then finish with
+/// `POST /v1/cards/upload/{upload_id}/complete`; multipart part URLs come
+/// from `POST /v1/cards/upload/{upload_id}/part-url`. Completion succeeds
+/// once the File's inventory record is acknowledged.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
 pub struct EvidenceUpload {
     /// Digest of the file this plan uploads.
     #[cfg_attr(feature = "server", schema(value_type = String))]
     pub sha256: Sha256Hex,
+    /// Upload session to transfer into and complete.
+    pub upload_id: UploadId,
     /// The upload plan.
     pub plan: UploadPlan,
 }

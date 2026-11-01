@@ -157,49 +157,6 @@ impl WyrdStorageClient {
         Ok(())
     }
 
-    /// Upload one verification evidence file to its server-minted plan.
-    ///
-    /// Evidence is pinned by digest and has no upload record to complete, so
-    /// only the single-request plans the evidence route mints are accepted;
-    /// the transfer itself is the same dispatch Artifact uploads use.
-    ///
-    /// # Arguments
-    ///
-    /// * `plan` - Server-minted single-PUT or local-filesystem plan.
-    /// * `source` - File bytes; its size hint enforces an exact-length transfer.
-    /// * `idempotency_key` - Stable key replayed on the backend request.
-    ///
-    /// # Errors
-    /// Returns `PlanMismatch` for a multipart or Azure plan, and otherwise the
-    /// transfer's source, transport, or backend error.
-    pub(crate) async fn upload_evidence<S: ArtifactSource>(
-        &self,
-        plan: &UploadPlan,
-        source: S,
-        idempotency_key: &str,
-    ) -> Result<(), StorageClientError> {
-        if !matches!(
-            plan,
-            UploadPlan::SinglePut { .. } | UploadPlan::LocalFs { .. }
-        ) {
-            return Err(StorageClientError::PlanMismatch {
-                expected: "SinglePut",
-                actual: upload::plan_variant(plan),
-            });
-        }
-        self.upload(
-            plan,
-            source,
-            UploadHooks {
-                idempotency_key,
-                progress: None,
-                part_url_minter: None,
-            },
-        )
-        .await?;
-        Ok(())
-    }
-
     /// Dispatch an artifact according to a server-minted plan.
     ///
     /// # Arguments

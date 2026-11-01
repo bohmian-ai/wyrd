@@ -1042,6 +1042,91 @@ mod pg_tests {
         }
     }
 
+    /// An Artifact file declared through the CLI still completes through the
+    /// shared upload lifecycle beside verification Files: it pulls back with
+    /// its exact bytes, and its Card-file record never stands in for a
+    /// verification File of identical content.
+    ///
+    /// # Panics
+    /// Panics when the server fails to start, a CLI command fails, the pulled
+    /// bytes differ, or the evidence plan reuses the Card file.
+    #[tokio::test]
+    async fn artifact_upload_keeps_shared_completion() {
+        let temp = tempfile::tempdir().expect("tempdir creates");
+        let path = write_prompt(&temp);
+        let (server, base_url, _storage_root, shutdown, serve_handle) = start_cli_server().await;
+        let Bootstrap::User { jwt, .. } = server
+            .bootstrap_user("cli-artifact-writer", &["editor"])
+            .await
+            .expect("writer bootstraps")
+        else {
+            panic!("writer bootstrap returned a non-user principal");
+        };
+        let receipt = run_cli_json(
+            vec![
+                "declare".to_owned(),
+                path.to_str().expect("prompt path is UTF-8").to_owned(),
+                "--server".to_owned(),
+                base_url.clone(),
+                "--format".to_owned(),
+                "json".to_owned(),
+            ],
+            &jwt,
+        )
+        .await
+        .expect("the Prompt declares");
+        let uid = receipt["root"]["uid"]
+            .as_str()
+            .expect("receipt names a UID");
+        let pulled = temp.path().join("pulled");
+        run_cli_json(
+            vec![
+                "pull".to_owned(),
+                "--kind".to_owned(),
+                "Prompt".to_owned(),
+                "--uid".to_owned(),
+                uid.to_owned(),
+                "--output-dir".to_owned(),
+                pulled.to_str().expect("pull path is UTF-8").to_owned(),
+                "--server".to_owned(),
+                base_url.clone(),
+                "--format".to_owned(),
+                "json".to_owned(),
+            ],
+            &jwt,
+        )
+        .await
+        .expect("the Prompt pulls");
+        assert_eq!(
+            std::fs::read(pulled.join("cards/root/artifacts/prompt.txt"))
+                .expect("pulled artifact reads"),
+            b"cli-card-artifact"
+        );
+
+        let artifact = b"cli-card-artifact";
+        let planned: Value = reqwest::Client::new()
+            .post(format!("{base_url}/v1/verification/evidence"))
+            .header("x-wyrd-access-token", format!("Bearer {jwt}"))
+            .json(&serde_json::json!({ "files": [{
+                "sha256": format!("{:x}", sha2::Sha256::digest(artifact)),
+                "size_bytes": artifact.len(),
+            }] }))
+            .send()
+            .await
+            .expect("the server answers")
+            .error_for_status()
+            .expect("the plan is admitted")
+            .json()
+            .await
+            .expect("the plan decodes");
+        assert_eq!(
+            planned["uploads"].as_array().map(Vec::len),
+            Some(1),
+            "a Card file never supplies a verification File: {planned}"
+        );
+        stop_cli_server(server, shutdown, serve_handle).await;
+    }
+
     #[tokio::test]
     async fn card_lifecycle_cli_journey() {
         let temp = tempfile::tempdir().expect("tempdir creates");

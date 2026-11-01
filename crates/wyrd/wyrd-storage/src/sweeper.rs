@@ -277,6 +277,11 @@ impl Sweeper {
 
     /// Abort one expired upload and commit its reclamation under that tenant.
     ///
+    /// The stored path is validated by the row's persisted owner, exactly as
+    /// the normal upload lifecycle does: a Card upload must name its Card's
+    /// file and a File upload its evidence session object, both in the row's
+    /// tenant.
+    ///
     /// Backend abort happens before the tenant transaction. If the database
     /// mutation fails, a later tick may retry the idempotent backend abort and
     /// the still-live control row.
@@ -294,8 +299,11 @@ impl Sweeper {
                 row.id
             ))
         })?;
-        let validated = tenant_path::validate(&row.storage_path, data_tenant_id)
-            .map_err(|error| StorageError::TenantPathMismatch(error.to_string()))?;
+        let validated = match row.card_uid {
+            Some(_) => tenant_path::validate(&row.storage_path, data_tenant_id),
+            None => tenant_path::validate_evidence(&row.storage_path, data_tenant_id),
+        }
+        .map_err(|error| StorageError::TenantPathMismatch(error.to_string()))?;
         let backend =
             StorageBackendKind::from_str(&row.backend).map_err(|error| StorageError::Backend {
                 backend: self.handle.backend(),

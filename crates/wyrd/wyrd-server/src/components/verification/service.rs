@@ -8,7 +8,6 @@
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
-use std::time::Duration;
 
 use chrono::Utc;
 use tokio_util::sync::CancellationToken;
@@ -17,10 +16,8 @@ use vala_verify::blocks::{DriftChecks, EngineError};
 use wyrd_runtime::outbox::{OutboxFull, Reservation};
 use wyrd_runtime::permission::{Action, Resource};
 use wyrd_runtime::{AcceptedAuthority, CardAttribution, Permission};
-use wyrd_spec::auth::Sha256Hex;
 use wyrd_spec::card::verifier::CheckEvidence;
 use wyrd_spec::error::WyrdError;
-use wyrd_spec::error::storage::WyrdStorageError;
 use wyrd_spec::ids::{BindingId, CardUid, ExecutionId, IdempotencyKey};
 use wyrd_spec::vala::api::AuditOutcome;
 use wyrd_spec::vala::ids::{SpanId, TraceId};
@@ -36,12 +33,12 @@ use wyrd_sql::queries::verifier_executions::{
     Admission, Cause, EnqueueRefusal, Submission, VerifierExecutionQueue,
 };
 use wyrd_sql::{ParsedCardRow, TenantConn};
-use wyrd_storage::StorageError;
-use wyrd_storage::tenant_path;
 
 use crate::audit;
 use crate::components::auth::Caller;
 use crate::components::gateway::GatewayCallContext;
+use crate::components::storage::inventory::ObjectInventory;
+use crate::components::storage::routes::storage_caller;
 use crate::http::error::permission_deny_reason_to_wyrd;
 use crate::http::middleware::edge_timeout::EdgeTimer;
 use crate::http::middleware::metrics::RequestArrival;
@@ -66,17 +63,11 @@ const GET_EXECUTION: &str = "verification.execution.read";
 /// Audit operation of an evidence upload plan.
 const EVIDENCE: &str = "verification.evidence";
 
-/// Audit operation of a local-backend evidence body upload.
-const EVIDENCE_UPLOAD: &str = "verification.evidence.upload";
-
 /// Audit operation of a direct execution.
 const EXECUTE: &str = "verification.execute";
 
 /// Audit operation of a background submission.
 const ENQUEUE: &str = "verification.enqueue";
-
-/// Lifetime of one evidence upload URL.
-const EVIDENCE_UPLOAD_TTL: Duration = Duration::from_mins(10);
 
 /// Map an inputs or result encoding failure to its public error.
 ///
@@ -335,27 +326,36 @@ impl<'a> VerificationControl<'a> {
         }))
     }
 
-    /// Plan uploads of the caller's evidence files that storage lacks.
+    /// Plan uploads of the caller's evidence files that are not completed
+    /// File uploads.
     ///
-    /// Admits and audits any `verifier:run` grant, refuses a file
-    /// or request larger than the Deployment limits, and returns one
-    /// single-PUT plan for each digest whose object
-    /// `<tenant>/evidence/sha256/<digest>` is absent or of another length.
-    /// Writes nothing: the bytes go straight to tenant storage, and readers
-    /// check digest and length again.
+    /// Admits and audits any `verifier:run` grant, refuses a file or request
+    /// larger than the Deployment limits, and opens one shared storage upload
+    /// session for each digest the tenant's inventory holds no completed File
+    /// upload of that size for. A Card file of identical content does not
+    /// qualify. The bytes go straight to tenant storage through the shared
+    /// lifecycle, whose completion records the File in the inventory.
     ///
     /// # Errors
     /// Returns [`WyrdError::PermissionDeniedRbac`] without any `verifier:run` grant,
     /// [`WyrdError::VerificationInputTooLarge`] past a limit,
     /// [`WyrdError::ServiceUnavailable`] when this process hosts no Verifier
-    /// blocks, and the storage error when a lookup or signature fails.
+    /// blocks, `WYRD_VALA_503_QUERY_VISIBILITY_UNAVAILABLE` when the
+    /// inventory cannot be read now, and the storage error when an upload
+    /// cannot be initialized.
+    ///
+    /// # Cancellation
+    /// Sessions are opened one file at a time and each commits as it opens,
+    /// so a later failure or cancellation leaves the earlier sessions open
+    /// without returning them; the storage sweeper reclaims them on expiry.
+    /// A retry opens new, independent sessions and never revokes them.
     pub(crate) async fn evidence(
         &self,
         caller: &Caller,
         request: &EvidencePlanRequest,
     ) -> Result<EvidencePlanResponse, WyrdError> {
         let limits = *self.blocks()?.limits();
-        self.authorize_evidence(caller, EVIDENCE)?;
+        self.authorize_evidence(caller, EVIDENCE, "verification.evidence")?;
         let total: u64 = request.files.iter().map(|file| file.size_bytes).sum();
         if let Some(file) = request
             .files
@@ -379,69 +379,31 @@ impl<'a> VerificationControl<'a> {
                 details: serde_json::json!({ "max_bytes": limits.files_max_bytes }),
             });
         }
-        let storage_error = |error: StorageError| WyrdError::from(WyrdStorageError::from(error));
+        let inventory = ObjectInventory::new(self.state);
         let mut uploads = Vec::new();
         for file in &request.files {
-            let path = tenant_path::evidence(caller.data_tenant_id, &file.sha256);
-            match self.state.storage.object_len(&path).await {
-                Ok(len) if len == file.size_bytes => continue,
-                Ok(_) | Err(StorageError::ObjectNotFound { .. }) => {}
-                Err(error) => return Err(storage_error(error)),
+            if inventory
+                .file_object(caller.data_tenant_id, &file.sha256, file.size_bytes)
+                .await?
+                .is_some()
+            {
+                continue;
             }
-            let plan = wyrd_storage::service::evidence_upload_plan(
+            let init = wyrd_storage::service::file_upload_init(
                 &self.state.storage,
-                &path,
+                self.state.postgres.wyrd(),
+                &storage_caller(caller),
                 &file.sha256,
                 file.size_bytes,
-                EVIDENCE_UPLOAD_TTL,
             )
-            .await
-            .map_err(storage_error)?;
+            .await?;
             uploads.push(EvidenceUpload {
                 sha256: file.sha256,
-                plan,
+                upload_id: init.upload_id,
+                plan: init.plan,
             });
         }
         Ok(EvidencePlanResponse { uploads })
-    }
-
-    /// Store one evidence body on the local backend, where an evidence plan
-    /// is the authenticated route rather than a presigned URL.
-    ///
-    /// Admits and audits any `verifier:run` grant like
-    /// [`Self::evidence`], reads at most the Deployment `file_max_bytes`, and
-    /// writes the body to `<tenant>/evidence/sha256/<digest>` only when it
-    /// hashes to `sha256`. Writes nothing to Postgres.
-    ///
-    /// # Errors
-    /// Returns [`WyrdError::PermissionDeniedRbac`] without any `verifier:run` grant,
-    /// [`WyrdError::VerificationInputTooLarge`] past `file_max_bytes`,
-    /// [`WyrdError::ServiceUnavailable`] when this process hosts no Verifier
-    /// blocks, the storage `Sha256Mismatch` error for a body of another
-    /// digest, and the storage error when the write fails.
-    pub(crate) async fn upload_local_evidence(
-        &self,
-        caller: &Caller,
-        sha256: &Sha256Hex,
-        body: axum::body::Body,
-    ) -> Result<(), WyrdError> {
-        let max_bytes = self.blocks()?.limits().file_max_bytes;
-        self.authorize_evidence(caller, EVIDENCE_UPLOAD)?;
-        let too_large = || WyrdError::VerificationInputTooLarge {
-            message: format!("evidence files may be at most {max_bytes} bytes"),
-            details: serde_json::json!({ "sha256": sha256, "max_bytes": max_bytes }),
-        };
-        let limit = usize::try_from(max_bytes).map_err(|_| too_large())?;
-        let body = axum::body::to_bytes(body, limit)
-            .await
-            .map_err(|_| too_large())?;
-        wyrd_storage::service::upload_local_evidence(
-            &self.state.storage,
-            caller.data_tenant_id,
-            sha256,
-            &body,
-        )
-        .await
     }
 
     /// Execute one exact Verifier over supplied evidence and return its
@@ -1018,18 +980,25 @@ impl<'a> VerificationControl<'a> {
         decision
     }
 
-    /// Admit evidence staging for `operation` and stage the single allow or
-    /// deny decision without waiting for its commit.
+    /// Admit evidence staging for `operation` on `resource` and stage the
+    /// single allow or deny decision without waiting for its commit.
     ///
     /// Staging selects no Verifier and cannot execute one, so any
     /// `verifier:run` grant admits it, including one scoped to a single
-    /// Verifier UID. The exact Verifier is authorized later by
-    /// [`Self::authorize_run`] when execute or enqueue names it.
+    /// Verifier UID. Planning and every shared storage operation on a File
+    /// upload session are admitted this way. The exact Verifier is
+    /// authorized later by [`Self::authorize_run`] when execute or enqueue
+    /// names it.
     ///
     /// # Errors
     /// Returns [`WyrdError::PermissionDeniedRbac`] when the caller holds no
     /// `verifier:run` grant of any scope.
-    fn authorize_evidence(&self, caller: &Caller, operation: &str) -> Result<(), WyrdError> {
+    pub(crate) fn authorize_evidence(
+        &self,
+        caller: &Caller,
+        operation: &str,
+        resource: &str,
+    ) -> Result<(), WyrdError> {
         let required = Permission::verifier_run_any();
         let allowed = caller
             .principal
@@ -1042,13 +1011,7 @@ impl<'a> VerificationControl<'a> {
         };
         self.state.bifrost.scribe_outbox().stage(
             caller.data_tenant_id,
-            audit::audit_event(
-                caller,
-                operation,
-                "verification.evidence",
-                &required.to_string(),
-                outcome,
-            ),
+            audit::audit_event(caller, operation, resource, &required.to_string(), outcome),
         );
         if allowed {
             Ok(())

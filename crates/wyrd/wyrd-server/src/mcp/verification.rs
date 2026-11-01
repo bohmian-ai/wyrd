@@ -105,8 +105,10 @@ pub(super) fn write_descriptors() -> Vec<Tool> {
         tool::<EvidencePlanRequest, EvidencePlanResponse>(
             EVIDENCE,
             "Plan evidence uploads",
-            "Declare files by SHA-256 and length before verifying them and receive one direct \
-             upload plan per file the server does not already hold. Requires verifier:run.",
+            "Declare files by SHA-256 and length before verifying them and receive an upload_id \
+             and upload plan per file the server does not already hold; send the bytes as the \
+             plan says, then complete with POST /v1/cards/upload/{upload_id}/complete. \
+             Requires verifier:run.",
             false,
         ),
         tool::<VerificationRequest, VerificationResult>(

@@ -1367,6 +1367,13 @@ mod pg_tests {
             .expect("RLS test rows clean up");
     }
 
+    /// The tenant-bound storage upload queries round-trip one Card upload
+    /// under its tenant's connection: insert, pending dedupe lookup, and the
+    /// lifecycle transitions read back what was written.
+    ///
+    /// # Panics
+    /// Panics when Postgres setup, a query, or a commit fails, or a read-back
+    /// row differs from what was written.
     #[tokio::test]
     async fn storage_queries_round_trip_under_tenant_conn() {
         let Some(migrator_url) = database_url() else {
@@ -1400,7 +1407,7 @@ mod pg_tests {
                 &mut conn,
                 storage::multipart_uploads::NewMultipartUpload {
                     id: upload_id,
-                    card_uid: &card_uid,
+                    card_uid: Some(&card_uid),
                     relative_path: "model.bin",
                     storage_path: &storage_path,
                     backend: StorageBackendKind::S3,
@@ -1427,7 +1434,7 @@ mod pg_tests {
 
             let pending = storage::multipart_uploads::find_pending_for_dedupe(
                 &mut conn,
-                &card_uid,
+                Some(&card_uid),
                 "model.bin",
                 &sha,
             )
@@ -1512,6 +1519,12 @@ mod pg_tests {
         }
     }
 
+    /// The operator sweep query selects an expired pending upload with its
+    /// persisted owning Card, and the tenant-bound abort retires it.
+    ///
+    /// # Panics
+    /// Panics when Postgres setup, a query, or a commit fails, or the expired
+    /// upload is not selected with its owner or is still completable.
     #[tokio::test]
     async fn storage_admin_queries_find_and_abort_expired_uploads() {
         let Some(url) = database_url() else {
@@ -1558,9 +1571,12 @@ mod pg_tests {
         )
         .await
         .expect("expired upload query succeeds");
-        assert!(
-            rows.iter().any(|row| row.id == upload_id),
-            "expired upload must be selected for sweeping"
+        assert_eq!(
+            rows.iter()
+                .find(|row| row.id == upload_id)
+                .map(|row| row.card_uid.as_deref()),
+            Some(Some(card_uid.as_str())),
+            "expired upload must be selected for sweeping with its owner"
         );
 
         let mut conn = TenantConn::acquire(store.pool(), tenant)

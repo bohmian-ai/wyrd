@@ -26,6 +26,7 @@ selected mounts so each journey asserts exactly what the tools returned.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import secrets
 import time
@@ -33,6 +34,7 @@ from collections.abc import Callable, Iterator, Sequence
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, cast
 
+import httpx
 import pytest
 from opentelemetry import trace
 from opentelemetry.sdk.trace import TracerProvider
@@ -569,6 +571,30 @@ def test_every_format_extracts_its_locked_output(desk: WyrdState) -> None:
 
         assert step(result, "read")["output"] == expected, name
         assert requirement(result, "extracted")["outcome"] == "passed", name
+
+
+def test_file_inputs_use_shared_uploads(desk: WyrdState, wyrd_server: WyrdTestServer) -> None:
+    path = FIXTURES / "cards/verifier_building_blocks/samples/sample.csv"
+    in_memory = b"a,b\n3,4"
+    for file, rows in [
+        (verify.File(path), [["a", "b"], ["1", "2"]]),
+        (verify.File(in_memory, format="csv"), [["a", "b"], ["3", "4"]]),
+    ]:
+        result = desk.run().observe.verify("document-formats", file)
+        assert step(result, "read")["output"] == {"format": "csv", "rows": rows}
+
+    for content in [path.read_bytes(), in_memory]:
+        planned = httpx.post(
+            f"{wyrd_server.base_url}/v1/verification/evidence",
+            headers={"x-wyrd-access-token": f"Bearer {wyrd_server.access_token()}"},
+            json={
+                "files": [
+                    {"sha256": hashlib.sha256(content).hexdigest(), "size_bytes": len(content)}
+                ]
+            },
+        )
+        assert planned.status_code == 200, planned.text
+        assert planned.json()["uploads"] == []
 
 
 def test_failed_reader_leaves_its_dependents_inconclusive(isolated_desk: WyrdState) -> None:

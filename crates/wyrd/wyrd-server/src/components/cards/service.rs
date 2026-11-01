@@ -10,6 +10,7 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::Semaphore;
 use uuid::Uuid;
 use vala_bifrost_redux::namespaces::BifrostNamespace;
+use wyrd_runtime::principal::PrincipalId;
 use wyrd_runtime::{PermissionSet, Principal, PrincipalKind};
 use wyrd_semver::{VersionBlock, VersionRange, VersionSpec};
 use wyrd_spec::DataTenantId;
@@ -43,6 +44,7 @@ use wyrd_spec::vala::api::RegisterTableRequest;
 use wyrd_spec::verification::{GroupEndSettings, GroupSource};
 use wyrd_sql::CardStatus;
 use wyrd_sql::TenantConn;
+use wyrd_sql::queries::auth::service_accounts::system_principal_id;
 use wyrd_sql::queries::cards::{
     CardArtifactManifestRow, CardDeclarationOperationRow, CardDeleteState,
     CardManifestCompletionRow, CardQuery, CardReconcileClaim, ListCursor, NewCardRow,
@@ -114,8 +116,9 @@ pub async fn get_card_by_uid(
     let inbound = inbound_relationships(&mut conn, card_uid).await?;
     let manifests = manifest_completion_rows(&mut conn, card_uid).await?;
     let verification = verification_status(&mut conn, card_uid).await?;
+    let system = system_reader(&mut conn).await?;
     conn.commit().await.map_err(registry_db_error)?;
-    let inventory = card_files(state, caller, card_uid, &manifests).await?;
+    let inventory = card_files(state, caller, system, card_uid, &manifests).await?;
     hydrate_card(state, caller, row, inbound, &inventory, verification).await
 }
 
@@ -147,8 +150,9 @@ pub async fn get_card_objects_by_ref(
     let inbound = inbound_relationships(&mut conn, &row.card_uid).await?;
     let manifests = manifest_completion_rows(&mut conn, &row.card_uid).await?;
     let verification = verification_status(&mut conn, &row.card_uid).await?;
+    let system = system_reader(&mut conn).await?;
     conn.commit().await.map_err(registry_db_error)?;
-    let inventory = card_files(state, caller, &row.card_uid, &manifests).await?;
+    let inventory = card_files(state, caller, system, &row.card_uid, &manifests).await?;
     let response = hydrate_card(state, caller, row, inbound, &inventory, verification).await?;
     Ok((response, inventory))
 }
@@ -175,8 +179,9 @@ pub async fn get_latest_card(
     let inbound = inbound_relationships(&mut conn, &row.card_uid).await?;
     let manifests = manifest_completion_rows(&mut conn, &row.card_uid).await?;
     let verification = verification_status(&mut conn, &row.card_uid).await?;
+    let system = system_reader(&mut conn).await?;
     conn.commit().await.map_err(registry_db_error)?;
-    let inventory = card_files(state, caller, &row.card_uid, &manifests).await?;
+    let inventory = card_files(state, caller, system, &row.card_uid, &manifests).await?;
     hydrate_card(state, caller, row, inbound, &inventory, verification).await
 }
 
@@ -266,8 +271,8 @@ pub async fn list_card_artifacts(
     caller: &Caller,
     card_uid: &CardUid,
 ) -> Result<ArtifactInventoryResponse, WyrdError> {
-    let manifests = card_manifests(state, caller, card_uid).await?;
-    let artifacts = card_files(state, caller, card_uid, &manifests)
+    let (manifests, system) = card_manifests(state, caller, card_uid).await?;
+    let artifacts = card_files(state, caller, system, card_uid, &manifests)
         .await?
         .files
         .into_values()
@@ -291,8 +296,8 @@ pub async fn card_file(
     card_uid: &CardUid,
     relative_path: &str,
 ) -> Result<wyrd_spec::registry::StoredArtifactEntry, WyrdError> {
-    let manifests = card_manifests(state, caller, card_uid).await?;
-    card_files(state, caller, card_uid, &manifests)
+    let (manifests, system) = card_manifests(state, caller, card_uid).await?;
+    card_files(state, caller, system, card_uid, &manifests)
         .await?
         .files
         .remove(relative_path)
@@ -308,7 +313,8 @@ pub async fn card_file(
         })
 }
 
-/// Read a live Card's manifest in one tenant transaction.
+/// Read a live Card's manifest and the tenant's inventory reader in one
+/// tenant transaction.
 ///
 /// # Errors
 /// Returns the registry not-found or unavailable errors of the reads.
@@ -316,12 +322,26 @@ async fn card_manifests(
     state: &AppState,
     caller: &Caller,
     card_uid: &CardUid,
-) -> Result<Vec<CardManifestCompletionRow>, WyrdError> {
+) -> Result<(Vec<CardManifestCompletionRow>, Option<PrincipalId>), WyrdError> {
     let mut conn = state.registry_tenant_conn(caller.data_tenant_id).await?;
     let _ = sql_get_card_by_uid(&mut conn, card_uid).await?;
     let manifests = manifest_completion_rows(&mut conn, card_uid).await?;
+    let system = system_reader(&mut conn).await?;
     conn.commit().await.map_err(registry_db_error)?;
-    Ok(manifests)
+    Ok((manifests, system))
+}
+
+/// The tenant `System` principal [`card_files`] reads the inventory as, read
+/// inside the caller's Card transaction so a Card read takes one tenant
+/// connection.
+///
+/// # Errors
+/// Returns registry unavailability when the read fails.
+async fn system_reader(conn: &mut TenantConn<'_>) -> Result<Option<PrincipalId>, WyrdError> {
+    Ok(system_principal_id(conn)
+        .await
+        .map_err(registry_db_error)?
+        .map(PrincipalId::new))
 }
 
 /// Read a Card's completed files from the object inventory, as the
@@ -336,11 +356,12 @@ async fn card_manifests(
 async fn card_files(
     state: &AppState,
     caller: &Caller,
+    system: Option<PrincipalId>,
     card_uid: &CardUid,
     manifests: &[CardManifestCompletionRow],
 ) -> Result<CardObjects, WyrdError> {
     let objects = ObjectInventory::new(state)
-        .executed_by(caller.executed_by)
+        .executed_by(caller.executed_by.or(system))
         .card_objects(caller.data_tenant_id, card_uid)
         .await?;
     if let Some(missing) = manifests

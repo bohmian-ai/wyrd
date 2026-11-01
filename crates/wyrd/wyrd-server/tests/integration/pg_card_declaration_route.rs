@@ -21,6 +21,7 @@ use wyrd_client::transport::config::{GrpcConfig, HttpConfig};
 use wyrd_client::transport::credential::ResolvedCredential;
 use wyrd_client::{Bifrost, WyrdClient};
 use wyrd_loader::{build_declaration_input, load};
+use wyrd_runtime::principal::PrincipalId;
 use wyrd_server::components::storage::inventory::{
     ObjectFact, ObjectInventory, ObjectOrigin, ObjectState,
 };
@@ -31,6 +32,7 @@ use wyrd_spec::ids::{CardName, CardUid, DataTenantId};
 use wyrd_spec::reference::{CardRef, InlineableRef};
 use wyrd_spec::registry::{CardLifecycleStatus, DeclarationOutcomeKind};
 use wyrd_spec::storage::UploadId;
+use wyrd_sql::queries::auth::service_accounts::system_principal_id;
 use wyrd_sql::queries::cards::get_card_by_uid;
 use wyrd_sql::queries::verification::{InactivityTimeout, binding_activity};
 use wyrd_sql::queries::verifier_executions::{
@@ -5234,6 +5236,23 @@ fn list_artifacts_request(card_uid: &CardUid) -> Request<Body> {
         .expect("list request builds")
 }
 
+/// The tenant `System` principal the inventory reads `tenant` as.
+///
+/// # Panics
+/// Panics when the read fails.
+async fn system_reader(server: &WyrdTestServer, tenant: DataTenantId) -> Option<PrincipalId> {
+    let mut conn = server
+        .tenant_conn_for(tenant)
+        .await
+        .expect("tenant connection opens");
+    let system = system_principal_id(&mut conn)
+        .await
+        .expect("SYSTEM reads")
+        .map(PrincipalId::new);
+    conn.commit().await.expect("the read commits");
+    system
+}
+
 /// Build the download-init request for `card_uid`'s `prompt.txt`.
 ///
 /// # Panics
@@ -5281,7 +5300,11 @@ async fn completed_objects_use_one_inventory() {
     conn.commit().await.expect("assertion transaction commits");
 
     let objects = ObjectInventory::new(server.state())
-        .card_objects(server.data_tenant_id(), &prompt.card_uid)
+        .card_objects(
+            server.data_tenant_id(),
+            system_reader(server, server.data_tenant_id()).await,
+            &prompt.card_uid,
+        )
         .await
         .expect("inventory reads");
     assert!(!objects.deleted);
@@ -5387,7 +5410,11 @@ async fn deleted_objects_survive_completion_replay() {
         .expect("a completion acknowledged after deletion still records");
 
     let objects = ObjectInventory::new(server.state())
-        .card_objects(server.data_tenant_id(), &prompt.card_uid)
+        .card_objects(
+            server.data_tenant_id(),
+            system_reader(server, server.data_tenant_id()).await,
+            &prompt.card_uid,
+        )
         .await
         .expect("inventory reads");
     assert!(objects.deleted);
@@ -5430,7 +5457,11 @@ async fn inventory_reads_are_scoped_and_retryable() {
         .await
         .expect("foreign tenant seeds");
     let objects = ObjectInventory::new(server.state())
-        .card_objects(foreign, &prompt.card_uid)
+        .card_objects(
+            foreign,
+            system_reader(server, foreign).await,
+            &prompt.card_uid,
+        )
         .await
         .expect("foreign inventory reads");
     assert!(objects.files.is_empty());
@@ -5557,7 +5588,11 @@ async fn hydration_requires_recorded_envelope() {
         .to_owned();
     let card_uid: CardUid = uid.parse().expect("Card UID parses");
     let objects = ObjectInventory::new(server.state())
-        .card_objects(server.data_tenant_id(), &card_uid)
+        .card_objects(
+            server.data_tenant_id(),
+            system_reader(&server, server.data_tenant_id()).await,
+            &card_uid,
+        )
         .await
         .expect("inventory reads");
     let (recorded, _) = objects.envelope.expect("envelope is recorded");
@@ -5804,7 +5839,11 @@ async fn compensation_records_inventory_deletion() {
         .await
         .expect("a replayed completion records");
     let objects = ObjectInventory::new(server.state())
-        .card_objects(server.data_tenant_id(), &card_uid)
+        .card_objects(
+            server.data_tenant_id(),
+            system_reader(&server, server.data_tenant_id()).await,
+            &card_uid,
+        )
         .await
         .expect("inventory reads");
     assert!(objects.deleted);

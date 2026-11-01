@@ -35,7 +35,6 @@ use wyrd_spec::registry::{RelativeArtifactPath, StoredArtifactEntry};
 use wyrd_spec::vala::BifrostError;
 use wyrd_spec::vala::api::BifrostQueryRequest;
 use wyrd_spec::vala::managed_columns::{RUN_ID, SUBJECT_CARD_UID, WORKLOAD_CARD_UID};
-use wyrd_sql::queries::auth::service_accounts::system_principal_id;
 use wyrd_storage::tenant_path;
 
 use crate::query::scheduled::ScheduledQueryCaller;
@@ -245,9 +244,10 @@ impl<'s> ObjectInventory<'s> {
     /// Read `card_uid`'s recorded objects in `tenant`, after the caller's
     /// Card authorization.
     ///
-    /// The read runs under the tenant's SYSTEM principal granted only this
-    /// table. A table the tenant never wrote reads as no rows; callers treat
-    /// a missing expected object as retryable readiness.
+    /// The read runs as `system`, the tenant's SYSTEM principal the caller
+    /// read in its own Card transaction, granted only this table. A table
+    /// the tenant never wrote reads as no rows; callers treat a missing
+    /// expected object as retryable readiness.
     ///
     /// # Errors
     /// Returns `WYRD_VALA_503_QUERY_VISIBILITY_UNAVAILABLE` when the SYSTEM
@@ -258,19 +258,12 @@ impl<'s> ObjectInventory<'s> {
     pub async fn card_objects(
         &self,
         tenant: DataTenantId,
+        system: Option<PrincipalId>,
         card_uid: &CardUid,
     ) -> Result<CardObjects, WyrdError> {
         let unavailable = |error: &dyn std::fmt::Display| {
             tracing::warn!(%error, "the object inventory cannot be read");
             WyrdError::from(BifrostError::QueryVisibilityUnavailable)
-        };
-        let system = {
-            let mut conn = self.state.registry_tenant_conn(tenant).await?;
-            let system = system_principal_id(&mut conn)
-                .await
-                .map_err(|error| unavailable(&error))?;
-            conn.commit().await.map_err(|error| unavailable(&error))?;
-            system.map(PrincipalId::new)
         };
         let table = [TableRef::new(BifrostNamespace::Storage, ObjectsTable::NAME)];
         let read = SystemReadAuthority::resolve(self.state, tenant, system, &table)

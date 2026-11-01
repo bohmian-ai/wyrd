@@ -270,4 +270,3 @@ The combined baseline and Artifact authoring workflow must survive.
 - [Security posture](../../../../architecture/wyrd-security-posture.md).
 - [Python rules](../../../../sdks/wyrd-sdk-python/AGENTS.md).
 - [TypeScript rules](../../../../sdks/wyrd-sdk-ts/AGENTS.md).
-

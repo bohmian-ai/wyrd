@@ -1463,8 +1463,6 @@ mod pg_tests {
         .fetch_one(&superuser)
         .await
         .expect("artifact storage path reads");
-        let correct_digest = base64::engine::general_purpose::STANDARD
-            .encode(sha2::Sha256::digest(b"cli-card-artifact"));
         // Corrupt the stored bytes, not the inventory row: the server refuses a
         // row that disagrees with the committed Card's artifact hash before any
         // download, so only tampered bytes reach client-side verification.
@@ -1526,30 +1524,16 @@ mod pg_tests {
         assert!(!temp.path().join("size-mismatch").exists());
         std::fs::write(&artifact_path, b"cli-card-artifact").expect("artifact bytes restore");
 
-        // Record an inventory row whose stored path escapes its Card; a read
-        // refuses it rather than serving a path outside the Card.
-        let escaped = wyrd_server::components::storage::inventory::ObjectFact {
-            storage_path: "../escape".to_owned(),
-            upload_id: None,
-            backend: server.state().storage.backend().to_string(),
-            sha256: Some(correct_digest.clone()),
-            size_bytes: i64::try_from(b"cli-card-artifact".len())
-                .expect("a short literal length fits i64"),
-            content_type: Some("text/plain".to_owned()),
-            sse_marker: None,
-            origin: wyrd_server::components::storage::inventory::ObjectOrigin::CardFile,
-            card_uid: Some(wyrd_spec::ids::CardUid::new(uid.as_str()).expect("uid parses")),
-            relative_path: Some("prompt.txt".to_owned()),
-            state: wyrd_server::components::storage::inventory::ObjectState::Completed,
-        };
-        wyrd_server::components::storage::inventory::ObjectInventory::new(server.state())
-            .record(
-                server.data_tenant_id(),
-                wyrd_spec::auth::Attribution::unresolved(),
-                &[escaped],
-            )
-            .await
-            .expect("the escaping row is recorded");
+        // Corrupt the manifest path so it escapes its Card; a read refuses it
+        // rather than serving a path outside the Card.
+        sqlx::query(
+            "UPDATE wyrd.card_artifact_manifest SET relative_path = $1 WHERE card_uid = $2::uuid",
+        )
+        .bind("../escape")
+        .bind(&uid)
+        .execute(&superuser)
+        .await
+        .expect("manifest path corrupts");
         let unsafe_path = run_cli_async_with_token!(
             &jwt,
             "pull",

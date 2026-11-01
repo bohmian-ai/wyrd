@@ -369,6 +369,8 @@ pub struct CardManifestCompletionRow {
     pub expected_sha256: String,
     /// Manifest-declared byte length.
     pub expected_size_bytes: i64,
+    /// Manifest-declared media type.
+    pub content_type: Option<String>,
     /// Storage upload identifier recorded during upload initialization.
     pub upload_id: Option<Uuid>,
     /// Card-manifest lifecycle state.
@@ -404,6 +406,7 @@ pub async fn manifest_completion_rows(
         r"SELECT m.relative_path,
                   m.expected_sha256,
                   m.size_bytes AS expected_size_bytes,
+                  m.content_type,
                   m.upload_id,
                   m.upload_status AS manifest_status,
                   u.card_uid AS storage_card_uid,

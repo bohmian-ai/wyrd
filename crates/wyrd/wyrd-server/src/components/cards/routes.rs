@@ -24,8 +24,7 @@ use wyrd_spec::storage::IDEMPOTENCY_KEY_HEADER;
 
 use crate::audit;
 use crate::components::auth::Caller;
-use crate::components::cards::service;
-use crate::components::storage::inventory::CardObjects;
+use crate::components::cards::service::{self, CardFiles};
 use crate::http::error::WyrdErrorResponse;
 use crate::state::AppState;
 use utoipa_axum::router::OpenApiRouter;
@@ -175,8 +174,8 @@ pub(crate) async fn get_card_by_ref_for(
         .map(|(response, _)| response)
 }
 
-/// [`get_card_by_ref_for`], also returning the Card's recorded objects its
-/// hydration read, for a reader of the Card's files.
+/// [`get_card_by_ref_for`], also returning the completed files its
+/// hydration verified, for a reader of the Card's files.
 ///
 /// # Errors
 /// Returns the errors of [`authorize_card_ref`],
@@ -186,9 +185,9 @@ pub(crate) async fn get_card_objects_by_ref_for(
     state: &AppState,
     caller: &Caller,
     card_ref: &CardRef,
-) -> Result<(GetCardResponse, CardObjects), WyrdError> {
+) -> Result<(GetCardResponse, CardFiles), WyrdError> {
     authorize_card_ref(state, caller, card_ref)?;
-    let (response, objects) = service::get_card_objects_by_ref(state, caller, card_ref).await?;
+    let (response, files) = service::get_card_objects_by_ref(state, caller, card_ref).await?;
     if let Some(uid) = &card_ref.uid
         && response.card.metadata.uid.as_ref() != Some(uid)
     {
@@ -196,7 +195,7 @@ pub(crate) async fn get_card_objects_by_ref_for(
             "card UID does not match the referenced identity",
         ));
     }
-    Ok((response, objects))
+    Ok((response, files))
 }
 
 /// Authorize and audit the caller's `cards:read` of one exact Card

@@ -393,13 +393,15 @@ async fn artifact_reads_refuse_before_use() {
 }
 
 /// One execution resolves each input's metadata once: an uploaded File's
-/// recorded location and an exact Artifact's files are each read from the
-/// object inventory a single time, at admission, and every later selection,
-/// read, citation, native media, and workspace reuses them.
+/// recorded location is read from the object inventory, and an exact
+/// Artifact's files from its Card manifest, a single time each, at
+/// admission, and every later selection, read, citation, native media, and
+/// workspace reuses them.
 ///
-/// Both inventory reads run as the execution's SYSTEM executor, here a
-/// fresh principal the tenant registry never named, so neither looks the
-/// SYSTEM principal up in Postgres. Every Artifact use still makes its own
+/// The one inventory read runs as the execution's SYSTEM executor, here a
+/// fresh principal the tenant registry never named, so it does not look the
+/// SYSTEM principal up in Postgres; the Artifact never reads the inventory.
+/// Every Artifact use still makes its own
 /// `card:read` decision: a caller without the grant or in another tenant is
 /// refused before any object is read, and a foreign tenant's caller finds
 /// no completed File for the same digest.
@@ -510,8 +512,8 @@ async fn evidence_metadata_is_resolved_once() {
         .expect("read decisions count");
     assert_eq!(
         after - before,
-        2,
-        "one inventory read for the File and one for the Artifact"
+        1,
+        "one inventory read for the File and none for the Artifact"
     );
     let executed = server
         .retained_audit_records(
@@ -525,8 +527,8 @@ async fn evidence_metadata_is_resolved_once() {
         .expect("retained audit reads");
     assert_eq!(
         executed.len(),
-        2,
-        "both reads ran as the executor: {executed:?}"
+        1,
+        "the File read ran as the executor: {executed:?}"
     );
 
     let other = server

@@ -2344,14 +2344,14 @@ complicates recovery for negligible authoring benefit, so v1 refuses
 it. Presigned upload URLs are tenant-scoped, `PUT`-only,
 single-artifact, and expire after 3600s.
 
-PostgreSQL coordinates manifests and upload sessions; it keeps no inventory
-of completed objects. Every completed artifact, envelope, and deletion is a
-row in `bifrost.storage.objects` (see the Bifrost authority), and Card
-listing, hydration, downloads, and drift baseline fitting all resolve a
-Card's files there. Activation re-verifies each declared upload and records
-it before the Card turns `Active`. A manifest entry that is complete in
-PostgreSQL but not yet visible in the inventory answers the retryable
-`WYRD_VALA_503_QUERY_VISIBILITY_UNAVAILABLE`.
+PostgreSQL coordinates manifests and upload sessions. Every completed
+artifact, envelope, and deletion is also a row in `bifrost.storage.objects`
+(see the Bifrost authority), the durable object record. Card reads never
+query Bifrost: Card listing, hydration, downloads, verifier Card resolution,
+workspace Artifact files, and drift baseline fitting serve a Card's
+declared files that storage completed, from its PostgreSQL manifest, read in
+the Card's own tenant transaction. Activation re-verifies each declared
+upload and records it before the Card turns `Active`.
 
 ### Idempotency
 

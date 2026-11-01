@@ -5,11 +5,13 @@
 //! through [`ObjectInventory::record`], which stages the row on the process
 //! Scribe outbox and waits, within half the request timeout, for that row's
 //! own acknowledgement; no other producer waits on it. Card deletion records
-//! one `deleted` row the same way. Readers resolve one Card's objects through
-//! [`ObjectInventory::card_objects`], and one completed verification File
-//! through [`ObjectInventory::file_object`], under a SYSTEM principal granted
-//! only this table, after the caller's domain authorization; an absent row is
-//! retryable readiness, never proof of deletion.
+//! one `deleted` row the same way. Card reads never consult it: they serve
+//! files from the Card's PostgreSQL manifest. One Card's recorded objects read
+//! back through [`ObjectInventory::card_objects`], and one completed
+//! verification File resolves through [`ObjectInventory::file_object`], under
+//! a SYSTEM principal granted only this table, after the caller's domain
+//! authorization; an absent row is retryable readiness, never proof of
+//! deletion.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, LazyLock, Mutex};

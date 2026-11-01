@@ -29,9 +29,6 @@ use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 use wyrd_runtime::{Permission, PermissionSet};
-use wyrd_server::components::storage::inventory::{
-    ObjectFact, ObjectInventory, ObjectOrigin, ObjectState,
-};
 use wyrd_server::verification::authority::BackgroundAuthority;
 use wyrd_server::verification::drift::DRIFT_INVALID;
 use wyrd_server::verification::drift::DriftEngine;
@@ -44,7 +41,6 @@ use wyrd_server::verification::runner::{EngineScript, VERIFIER_UNAVAILABLE};
 use wyrd_server::verification::scheduler::{GroupHandoff, VerificationScheduler};
 use wyrd_server::verification::{CapabilityCrash, RuntimeLimits, VerificationRuntime};
 use wyrd_spec::DataTenantId;
-use wyrd_spec::auth::Attribution;
 use wyrd_spec::card::drift::DriftMethod;
 use wyrd_spec::card::trigger::TriggerDuration;
 use wyrd_spec::card::verifier::{Check, DriftBaselineState, OWNER_OCCURRENCE_KEY};
@@ -2821,13 +2817,13 @@ async fn claim_committed_after_cancellation_is_released_unexecuted() {
         .expect("hold function drops");
 }
 
-/// Write a small Parquet artifact for `data` and record it in the object
-/// inventory, so a
-/// fit of a baseline pinned to `data` decodes and settles `ready`.
+/// Write a small Parquet artifact for `data` and record it as a verified
+/// manifest file, so a fit of a baseline pinned to `data` decodes and
+/// settles `ready`.
 ///
 /// # Panics
-/// Panics when the Parquet encode, the storage write, or the inventory
-/// record fails.
+/// Panics when the Parquet encode, the storage write, or the manifest
+/// insert fails.
 async fn baseline_artifact(server: &WyrdTestServer, seed: &VerificationFixture, data: &CardUid) {
     let schema = Arc::new(Schema::new(vec![Field::new(
         "latency_ms",
@@ -2852,23 +2848,25 @@ async fn baseline_artifact(server: &WyrdTestServer, seed: &VerificationFixture, 
         .put_object(&object, bytes.clone())
         .await
         .expect("artifact writes");
-    let fact = ObjectFact {
-        storage_path: path,
-        upload_id: None,
-        backend: storage.backend().to_string(),
-        sha256: Some(sha256),
-        size_bytes: i64::try_from(bytes.len()).expect("artifact size fits"),
-        content_type: Some("application/vnd.apache.parquet".to_owned()),
-        sse_marker: None,
-        origin: ObjectOrigin::CardFile,
-        card_uid: Some(data.clone()),
-        relative_path: Some("data/data.parquet".to_owned()),
-        state: ObjectState::Completed,
-    };
-    ObjectInventory::new(server.state())
-        .record(seed.tenant(), Attribution::unresolved(), &[fact])
-        .await
-        .expect("the artifact is recorded in the object inventory");
+    let superuser = server
+        .pg_fixture()
+        .superuser_pool()
+        .expect("superuser pool opens");
+    sqlx::query(
+        "INSERT INTO wyrd.card_artifact_manifest \
+           (manifest_id, data_tenant_id, card_uid, relative_path, expected_sha256, \
+            size_bytes, content_type, upload_status) \
+         VALUES ($1, $2, $3, 'data/data.parquet', $4, $5, \
+                 'application/vnd.apache.parquet', 'verified')",
+    )
+    .bind(Uuid::now_v7())
+    .bind(seed.tenant().as_uuid())
+    .bind(data.as_uuid())
+    .bind(sha256)
+    .bind(i64::try_from(bytes.len()).expect("artifact size fits"))
+    .execute(&superuser)
+    .await
+    .expect("the artifact is a verified manifest file");
 }
 
 /// Read `(state, attempts)` of `verifier`'s baseline row.

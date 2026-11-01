@@ -37,7 +37,6 @@ use wyrd_sql::queries::verifier_executions::{
     ScheduleOutcome, ScheduleSkip, VerifierExecutionQueue,
 };
 use wyrd_storage::settings::{BackendConfig, StorageSettings};
-use wyrd_storage::tenant_path;
 use wyrd_testing::{Bootstrap, WyrdTestServer};
 
 /// An assertion Verifier spec over one `json` slot.
@@ -5402,28 +5401,39 @@ async fn deleted_objects_survive_completion_replay() {
 }
 
 #[tokio::test(flavor = "current_thread")]
-/// Inventory reads are Card-scoped, bounded, retryable, and never widened.
+/// Card reads never query the object inventory, whose reads stay
+/// Card-scoped and never widened.
 ///
-/// A failed inventory query returns its typed error and the retry serves
-/// the file; a complete manifest entry missing from the inventory is
-/// retryable visibility, not absence; another tenant's inventory holds
-/// nothing of this Card; and a public append is refused.
+/// With the next query armed to fail, listing, downloading, and reading the
+/// Card all succeed, and the failure still lands on the next inventory read;
+/// another tenant's inventory holds nothing of this Card; and a public append
+/// is refused.
 ///
 /// # Panics
-/// Panics when setup, a request, or an inventory read fails, or when a
-/// response carries another status or code, or another tenant sees files.
-async fn inventory_reads_are_scoped_and_retryable() {
+/// Panics when setup or a request fails, when a Card read fails or an
+/// inventory read misses the armed failure, or another tenant sees files.
+async fn card_reads_skip_the_inventory_and_its_reads_are_scoped() {
     let prompt = declare_artifact_prompt("inventory-scoped").await;
     let server = &prompt.server;
 
     server.fail_next_query_after_schema();
-    let (status, body) =
-        send_json(server, &prompt.jwt, download_init_request(&prompt.card_uid)).await;
-    assert_eq!(status, StatusCode::BAD_GATEWAY, "{body}");
-    assert_eq!(body["code"], "WYRD_VALA_502_QUERY_STREAM_INCOMPLETE");
+    let (status, body) = send_json(
+        server,
+        &prompt.jwt,
+        list_artifacts_request(&prompt.card_uid),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
     let (status, body) =
         send_json(server, &prompt.jwt, download_init_request(&prompt.card_uid)).await;
     assert_eq!(status, StatusCode::OK, "{body}");
+    let response = read_card(server, &prompt.jwt, "Prompt", prompt.card_uid.as_str()).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let failed = ObjectInventory::new(server.state())
+        .card_objects(server.data_tenant_id(), &prompt.card_uid)
+        .await
+        .expect_err("the armed failure lands on the inventory read");
+    assert_eq!(failed.code(), "WYRD_VALA_502_QUERY_STREAM_INCOMPLETE");
 
     let foreign = server
         .seed_tenant("inventory-foreign")
@@ -5434,27 +5444,6 @@ async fn inventory_reads_are_scoped_and_retryable() {
         .await
         .expect("foreign inventory reads");
     assert!(objects.files.is_empty());
-
-    let mut conn = server
-        .tenant_conn_for(server.data_tenant_id())
-        .await
-        .expect("tenant connection opens");
-    sqlx::query(
-        "UPDATE wyrd.card_artifact_manifest SET relative_path = 'unseen.txt' WHERE card_uid = $1",
-    )
-    .bind(prompt.card_uid.as_uuid())
-    .execute(&mut **conn.transaction())
-    .await
-    .expect("manifest entry renames");
-    conn.commit().await.expect("manifest change commits");
-    let (status, body) = send_json(
-        server,
-        &prompt.jwt,
-        list_artifacts_request(&prompt.card_uid),
-    )
-    .await;
-    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{body}");
-    assert_eq!(body["code"], "WYRD_VALA_503_QUERY_VISIBILITY_UNAVAILABLE");
 
     let config = ClientConfig {
         http: HttpConfig {
@@ -5502,93 +5491,6 @@ async fn inventory_reads_are_scoped_and_retryable() {
         .shutdown()
         .await
         .expect("test server shuts down");
-}
-
-/// Point `card_uid`'s registry envelope pointer at `uri`.
-///
-/// # Panics
-/// Panics when the tenant connection, update, or commit fails.
-async fn set_card_blob_uri(server: &WyrdTestServer, card_uid: &CardUid, uri: &str) {
-    let mut conn = server
-        .tenant_conn_for(server.data_tenant_id())
-        .await
-        .expect("tenant connection opens");
-    sqlx::query("UPDATE wyrd.cards SET card_blob_uri = $2 WHERE card_uid = $1")
-        .bind(card_uid.as_uuid())
-        .bind(uri)
-        .execute(&mut **conn.transaction())
-        .await
-        .expect("envelope pointer updates");
-    conn.commit().await.expect("pointer change commits");
-}
-
-#[tokio::test(flavor = "current_thread")]
-/// Hydration serves only the envelope the object inventory recorded.
-///
-/// A metadata-only Active Card whose retained pointer names identical bytes
-/// at a path with no recorded envelope is retryable visibility, refused
-/// before any envelope read; pointing back at the recorded envelope
-/// hydrates the Card.
-///
-/// # Panics
-/// Panics when setup, a request, or storage IO fails, or when a read
-/// carries another status or code.
-async fn hydration_requires_recorded_envelope() {
-    let server = WyrdTestServer::start_in_process()
-        .await
-        .expect("test server starts");
-    let Bootstrap::User { jwt, .. } = server
-        .bootstrap_user("envelope-reader", &["editor"])
-        .await
-        .expect("writer bootstraps")
-    else {
-        panic!("user bootstrap returned a non-user principal");
-    };
-    let (status, body) = send_json(
-        &server,
-        &jwt,
-        prompt_declaration_request("envelope-required", "envelope-required"),
-    )
-    .await;
-    assert_eq!(status, StatusCode::CREATED, "{body}");
-    let uid = body["outcomes"][0]["card_ref"]["uid"]
-        .as_str()
-        .expect("outcome names the Card UID")
-        .to_owned();
-    let card_uid: CardUid = uid.parse().expect("Card UID parses");
-    let objects = ObjectInventory::new(server.state())
-        .card_objects(server.data_tenant_id(), &card_uid)
-        .await
-        .expect("inventory reads");
-    let (recorded, _) = objects.envelope.expect("envelope is recorded");
-    let tenant = server.data_tenant_id();
-    let storage = &server.state().storage;
-    let bytes = storage
-        .get_object(&tenant_path::validate(&recorded, tenant).expect("recorded path validates"))
-        .await
-        .expect("envelope bytes read");
-    let unrecorded = tenant_path::build(tenant, &uid, "blob/unrecorded.json");
-    storage
-        .put_object(
-            &tenant_path::validate(&unrecorded, tenant).expect("copy path validates"),
-            bytes,
-        )
-        .await
-        .expect("envelope copy writes");
-
-    set_card_blob_uri(&server, &card_uid, &format!("wyrd://{unrecorded}")).await;
-    let response = read_card(&server, &jwt, "Prompt", &uid).await;
-    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
-    assert_eq!(
-        response_json(response).await["code"],
-        "WYRD_VALA_503_QUERY_VISIBILITY_UNAVAILABLE"
-    );
-
-    set_card_blob_uri(&server, &card_uid, &format!("wyrd://{recorded}")).await;
-    let response = read_card(&server, &jwt, "Prompt", &uid).await;
-    assert_eq!(response.status(), StatusCode::OK);
-
-    server.shutdown().await.expect("test server shuts down");
 }
 
 /// Read `card_uid`'s lifecycle status, reconciliation kind, and

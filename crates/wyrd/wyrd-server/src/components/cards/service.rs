@@ -10,7 +10,6 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::Semaphore;
 use uuid::Uuid;
 use vala_bifrost_redux::namespaces::BifrostNamespace;
-use wyrd_runtime::principal::PrincipalId;
 use wyrd_runtime::{PermissionSet, Principal, PrincipalKind};
 use wyrd_semver::{VersionBlock, VersionRange, VersionSpec};
 use wyrd_spec::DataTenantId;
@@ -36,7 +35,8 @@ use wyrd_spec::registry::{
     CardSubmission, CardSummary, CardUploadEntry, CardUploadPlan, DeclarationOperationId,
     DeclarationOutcomeKind, DeclarationReplaySeed, DeclareCardRequest, DeclareCardResponse,
     DeleteCardResponse, GetCardResponse, ListCardsRequest, ListCardsResponse, ListVersionsResponse,
-    RelativeArtifactPath, canonical_artifact_manifest_hash, validate_artifact_manifest,
+    RelativeArtifactPath, StoredArtifactEntry, canonical_artifact_manifest_hash,
+    validate_artifact_manifest,
 };
 use wyrd_spec::request_id::RequestId;
 use wyrd_spec::storage::{UploadId, UploadInitRequest, UploadPlan};
@@ -44,7 +44,6 @@ use wyrd_spec::vala::api::RegisterTableRequest;
 use wyrd_spec::verification::{GroupEndSettings, GroupSource};
 use wyrd_sql::CardStatus;
 use wyrd_sql::TenantConn;
-use wyrd_sql::queries::auth::service_accounts::system_principal_id;
 use wyrd_sql::queries::cards::{
     CardArtifactManifestRow, CardDeclarationOperationRow, CardDeleteState,
     CardManifestCompletionRow, CardQuery, CardReconcileClaim, ListCursor, NewCardRow,
@@ -83,7 +82,7 @@ use crate::components::cards::resolve::{
     EffectiveSpecs, ResolvedRefs, bind_card_references, source_binding,
 };
 use crate::components::storage::inventory::{
-    CardObjects, ObjectFact, ObjectInventory, ObjectOrigin, ObjectState,
+    ObjectFact, ObjectInventory, ObjectOrigin, ObjectState,
 };
 use crate::components::storage::routes::storage_caller;
 use crate::state::{AppState, registry_db_error};
@@ -99,13 +98,11 @@ struct CardListCursor {
 /// Load a fully hydrated Card by its tenant-scoped UID.
 ///
 /// Reads the row, inbound edges, artifact manifest, and owned verification
-/// binding IDs in one tenant transaction, then the object inventory, then
-/// hydrates the immutable blob.
+/// binding IDs in one tenant transaction, then hydrates the immutable blob.
 ///
 /// # Errors
 /// Returns the registry not-found, unavailable, or integrity errors raised by
-/// the tenant reads and [`hydrate_card`], and the retryable readiness errors
-/// of [`card_files`].
+/// the tenant reads, [`card_files`], and [`hydrate_card`].
 pub async fn get_card_by_uid(
     state: &AppState,
     caller: &Caller,
@@ -116,29 +113,26 @@ pub async fn get_card_by_uid(
     let inbound = inbound_relationships(&mut conn, card_uid).await?;
     let manifests = manifest_completion_rows(&mut conn, card_uid).await?;
     let verification = verification_status(&mut conn, card_uid).await?;
-    let system = system_reader(&mut conn).await?;
     conn.commit().await.map_err(registry_db_error)?;
-    let inventory = card_files(state, caller, system, card_uid, &manifests).await?;
-    hydrate_card(state, caller, row, inbound, &inventory, verification).await
+    let files = card_files(&manifests)?;
+    hydrate_card(state, caller, row, inbound, &files, verification).await
 }
 
 /// Load a fully hydrated Card by its exact tenant-scoped reference, with
-/// the recorded objects its hydration verified, so a reader of its files
-/// needs no second inventory read.
+/// the completed files its hydration verified, so a reader of its files
+/// needs no second read.
 ///
 /// Reads the row, inbound edges, artifact manifest, and owned verification
-/// binding IDs in one tenant transaction, then the object inventory, then
-/// hydrates the immutable blob.
+/// binding IDs in one tenant transaction, then hydrates the immutable blob.
 ///
 /// # Errors
 /// Returns the registry not-found, unavailable, or integrity errors raised by
-/// the tenant reads and [`hydrate_card`], and the retryable readiness errors
-/// of [`card_files`].
+/// the tenant reads, [`card_files`], and [`hydrate_card`].
 pub async fn get_card_objects_by_ref(
     state: &AppState,
     caller: &Caller,
     card_ref: &CardRef,
-) -> Result<(GetCardResponse, CardObjects), WyrdError> {
+) -> Result<(GetCardResponse, CardFiles), WyrdError> {
     let mut conn = state.registry_tenant_conn(caller.data_tenant_id).await?;
     let row = wyrd_sql::queries::cards::get_card_by_ref(
         &mut conn,
@@ -150,18 +144,16 @@ pub async fn get_card_objects_by_ref(
     let inbound = inbound_relationships(&mut conn, &row.card_uid).await?;
     let manifests = manifest_completion_rows(&mut conn, &row.card_uid).await?;
     let verification = verification_status(&mut conn, &row.card_uid).await?;
-    let system = system_reader(&mut conn).await?;
     conn.commit().await.map_err(registry_db_error)?;
-    let inventory = card_files(state, caller, system, &row.card_uid, &manifests).await?;
-    let response = hydrate_card(state, caller, row, inbound, &inventory, verification).await?;
-    Ok((response, inventory))
+    let files = card_files(&manifests)?;
+    let response = hydrate_card(state, caller, row, inbound, &files, verification).await?;
+    Ok((response, files))
 }
 
 /// Load the stored spec of the Card at an exact tenant-scoped reference.
 ///
 /// Verifier blocks resolve Agent and Prompt Cards through this read: it runs
-/// the registry lookup alone, with no relationships, object inventory, or
-/// blob, so judging never waits on Bifrost query capacity. Like
+/// the registry lookup alone, with no relationships, files, or blob. Like
 /// [`get_card_by_ref`], a Card is readable only once its immutable blob is
 /// active.
 ///
@@ -193,13 +185,11 @@ pub async fn get_card_spec_by_ref(
 /// Resolve and load the newest stable Active Card in one identity line.
 ///
 /// Reads the row, inbound edges, artifact manifest, and owned verification
-/// binding IDs in one tenant transaction, then the object inventory, then
-/// hydrates the immutable blob.
+/// binding IDs in one tenant transaction, then hydrates the immutable blob.
 ///
 /// # Errors
 /// Returns the registry not-found, unavailable, or integrity errors raised by
-/// the tenant reads and [`hydrate_card`], and the retryable readiness errors
-/// of [`card_files`].
+/// the tenant reads, [`card_files`], and [`hydrate_card`].
 pub async fn get_latest_card(
     state: &AppState,
     caller: &Caller,
@@ -212,10 +202,9 @@ pub async fn get_latest_card(
     let inbound = inbound_relationships(&mut conn, &row.card_uid).await?;
     let manifests = manifest_completion_rows(&mut conn, &row.card_uid).await?;
     let verification = verification_status(&mut conn, &row.card_uid).await?;
-    let system = system_reader(&mut conn).await?;
     conn.commit().await.map_err(registry_db_error)?;
-    let inventory = card_files(state, caller, system, &row.card_uid, &manifests).await?;
-    hydrate_card(state, caller, row, inbound, &inventory, verification).await
+    let files = card_files(&manifests)?;
+    hydrate_card(state, caller, row, inbound, &files, verification).await
 }
 
 /// List versions in one card identity line, excluding deleted rows.
@@ -298,29 +287,25 @@ pub async fn list_cards(
 ///
 /// # Errors
 /// Returns the registry not-found or unavailable errors of the Card read and
-/// the retryable readiness errors of [`card_files`].
+/// the errors of [`card_files`].
 pub async fn list_card_artifacts(
     state: &AppState,
     caller: &Caller,
     card_uid: &CardUid,
 ) -> Result<ArtifactInventoryResponse, WyrdError> {
-    let (manifests, system) = card_manifests(state, caller, card_uid).await?;
-    let artifacts = card_files(state, caller, system, card_uid, &manifests)
-        .await?
-        .files
-        .into_values()
-        .collect();
+    let manifests = card_manifests(state, caller, card_uid).await?;
+    let artifacts = card_files(&manifests)?.into_values().collect();
     Ok(ArtifactInventoryResponse { artifacts })
 }
 
-/// Resolve one completed file of a Card from the object inventory.
+/// Resolve one completed file of a Card from its manifest.
 ///
 /// Card listing, downloads, verification evidence, and baseline fitting
 /// share this one bounded lookup after their own Card authorization.
 ///
 /// # Errors
 /// Returns the registry not-found or unavailable errors of the Card read,
-/// the retryable readiness errors of [`card_files`], and
+/// the errors of [`card_files`], and
 /// `WYRD_STORAGE_404_OBJECT_NOT_FOUND` when the Card declares no completed
 /// file at `relative_path`.
 pub async fn card_file(
@@ -328,11 +313,9 @@ pub async fn card_file(
     caller: &Caller,
     card_uid: &CardUid,
     relative_path: &str,
-) -> Result<wyrd_spec::registry::StoredArtifactEntry, WyrdError> {
-    let (manifests, system) = card_manifests(state, caller, card_uid).await?;
-    card_files(state, caller, system, card_uid, &manifests)
-        .await?
-        .files
+) -> Result<StoredArtifactEntry, WyrdError> {
+    let manifests = card_manifests(state, caller, card_uid).await?;
+    card_files(&manifests)?
         .remove(relative_path)
         .ok_or_else(|| {
             WyrdStorageError::ObjectNotFound {
@@ -346,8 +329,7 @@ pub async fn card_file(
         })
 }
 
-/// Read a live Card's manifest and the tenant's inventory reader in one
-/// tenant transaction.
+/// Read a live Card's manifest in one tenant transaction.
 ///
 /// # Errors
 /// Returns the registry not-found or unavailable errors of the reads.
@@ -355,79 +337,63 @@ async fn card_manifests(
     state: &AppState,
     caller: &Caller,
     card_uid: &CardUid,
-) -> Result<(Vec<CardManifestCompletionRow>, Option<PrincipalId>), WyrdError> {
+) -> Result<Vec<CardManifestCompletionRow>, WyrdError> {
     let mut conn = state.registry_tenant_conn(caller.data_tenant_id).await?;
     let _ = sql_get_card_by_uid(&mut conn, card_uid).await?;
     let manifests = manifest_completion_rows(&mut conn, card_uid).await?;
-    let system = system_reader(&mut conn).await?;
     conn.commit().await.map_err(registry_db_error)?;
-    Ok((manifests, system))
+    Ok(manifests)
 }
 
-/// The tenant `System` principal [`card_files`] reads the inventory as, read
-/// inside the caller's Card transaction so a Card read takes one tenant
-/// connection.
-///
-/// # Errors
-/// Returns registry unavailability when the read fails.
-async fn system_reader(conn: &mut TenantConn<'_>) -> Result<Option<PrincipalId>, WyrdError> {
-    Ok(system_principal_id(conn)
-        .await
-        .map_err(registry_db_error)?
-        .map(PrincipalId::new))
-}
+/// A Card's completed files by Card-relative path.
+pub(crate) type CardFiles = BTreeMap<String, StoredArtifactEntry>;
 
-/// Read a Card's completed files from the object inventory, as the
-/// caller's SYSTEM executor when Wyrd executes the work.
+/// Project a Card's completed files from its manifest rows.
 ///
-/// A manifest entry Postgres already completed must be visible: an absent
-/// one is not-yet-visible inventory, never proof of absence.
+/// Card reads serve the files the Card declared and storage completed, read
+/// with the Card in one tenant transaction; `bifrost.storage.objects`
+/// records the same completions but is never on the Card read path.
 ///
 /// # Errors
-/// Returns `WYRD_VALA_503_QUERY_VISIBILITY_UNAVAILABLE` when a completed
-/// manifest entry is not visible yet, and the inventory read's errors.
-async fn card_files(
-    state: &AppState,
-    caller: &Caller,
-    system: Option<PrincipalId>,
-    card_uid: &CardUid,
-    manifests: &[CardManifestCompletionRow],
-) -> Result<CardObjects, WyrdError> {
-    let objects = ObjectInventory::new(state)
-        .executed_by(caller.executed_by.or(system))
-        .card_objects(caller.data_tenant_id, card_uid)
-        .await?;
-    if let Some(missing) = manifests
+/// Returns `WYRD_REGISTRY_400_INVALID_CARD_SPEC` when a stored manifest path
+/// no longer parses.
+fn card_files(manifests: &[CardManifestCompletionRow]) -> Result<CardFiles, WyrdError> {
+    manifests
         .iter()
         .filter(|manifest| manifest_ready_for_completion(manifest))
-        .find(|manifest| !objects.files.contains_key(&manifest.relative_path))
-    {
-        tracing::info!(%card_uid, relative_path = %missing.relative_path, "a completed Card file is not visible in the object inventory yet");
-        return Err(wyrd_spec::vala::BifrostError::QueryVisibilityUnavailable.into());
-    }
-    Ok(objects)
+        .map(|manifest| {
+            let relative_path = RelativeArtifactPath::new(&manifest.relative_path)
+                .map_err(|error| WyrdError::registry_invalid_card_spec(error.to_string()))?;
+            Ok((
+                manifest.relative_path.clone(),
+                StoredArtifactEntry {
+                    relative_path,
+                    sha256: manifest.expected_sha256.clone(),
+                    size_bytes: manifest.expected_size_bytes,
+                    content_type: manifest.content_type.clone(),
+                },
+            ))
+        })
+        .collect()
 }
 
 /// Rebuild the served Card from its immutable blob and live registry state.
 ///
-/// Reads the blob only once the object inventory records an envelope at the
-/// registry's retained pointer, verifies it against the registry row and
-/// artifact inventory, then overlays server-derived state: inbound
+/// Reads the blob at the registry's retained pointer, verifies it against the
+/// registry row and completed files, then overlays server-derived state: inbound
 /// relationships and `status`, whose `verification.binding_ids` lists the
 /// owner's projected bindings and is omitted when the Card owns none.
 ///
 /// # Errors
 /// Returns `WYRD_REGISTRY_404_CARD_NOT_FOUND` before the blob is active,
 /// `WYRD_REGISTRY_400_INVALID_CARD_SPEC` when the blob URI, identity, or
-/// integrity check fails, `WYRD_VALA_503_QUERY_VISIBILITY_UNAVAILABLE` when
-/// no envelope is recorded at the pointer yet, and the mapped storage error
-/// when the read fails.
+/// integrity check fails, and the mapped storage error when the read fails.
 async fn hydrate_card(
     state: &AppState,
     caller: &Caller,
     row: wyrd_sql::row_types::cards::ParsedCardRow,
     inbound: Vec<CardRef>,
-    inventory: &CardObjects,
+    files: &CardFiles,
     verification: Option<VerificationStatus>,
 ) -> Result<GetCardResponse, WyrdError> {
     let uri = row.card_blob_uri.as_deref().ok_or_else(|| {
@@ -444,14 +410,6 @@ async fn hydrate_card(
         return Err(WyrdError::registry_invalid_card_spec(
             "stored Card blob is not bound to its registry row",
         ));
-    }
-    if inventory
-        .envelope
-        .as_ref()
-        .is_none_or(|(recorded, _)| recorded != path)
-    {
-        tracing::info!(card_uid = %row.card_uid, "the Card envelope is not visible in the object inventory yet");
-        return Err(wyrd_spec::vala::BifrostError::QueryVisibilityUnavailable.into());
     }
     let bytes = state
         .storage
@@ -470,7 +428,7 @@ async fn hydrate_card(
             "stored Card blob identity does not match its registry row",
         ));
     }
-    verify_card_read_integrity(&row, &card, inventory)?;
+    verify_card_read_integrity(&row, &card, files)?;
     card.relationships.inbound = inbound.iter().map(ToString::to_string).collect();
     card.relationships.inbound_refs = inbound
         .into_iter()
@@ -530,10 +488,9 @@ async fn verification_status(
 fn verify_card_read_integrity(
     row: &wyrd_sql::row_types::cards::ParsedCardRow,
     card: &Card,
-    inventory: &CardObjects,
+    files: &CardFiles,
 ) -> Result<(), WyrdError> {
-    let manifest = inventory
-        .files
+    let manifest = files
         .values()
         .map(|entry| {
             Ok(ArtifactManifestEntry {

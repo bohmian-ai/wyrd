@@ -446,13 +446,12 @@ async fn local_blob(
 
 /// Create a signed or local download plan for a stored artifact.
 ///
-/// The artifact must be the Card's completed file in the object inventory
-/// after card-read authorization.
+/// The artifact must be a completed file of the Card's manifest after
+/// card-read authorization.
 ///
 /// # Errors
-/// Returns the authorization refusal, the Card and inventory lookup errors —
-/// including `WYRD_VALA_503_QUERY_VISIBILITY_UNAVAILABLE` while a completed
-/// file is not visible yet — and the storage service's planning errors.
+/// Returns the authorization refusal, the Card and manifest lookup errors,
+/// and the storage service's planning errors.
 #[utoipa::path(
     post,
     path = "/cards/download/init",
@@ -474,11 +473,10 @@ async fn local_blob(
          body = WyrdProblem),
         (status = 500, description = "The storage backend or the platform store failed \
           (WYRD_STORAGE_500_BACKEND, WYRD_SPEC_500_INTERNAL)", body = WyrdProblem),
-        (status = 503, description = "No verifier is configured for the access token, the \
-          storage backend is transiently unavailable, or the completed artifact is not \
-          visible in the object inventory yet; retry the download \
+        (status = 503, description = "No verifier is configured for the access token, or the \
+          storage backend is transiently unavailable; retry the download \
           (WYRD_AUTH_503_VERIFY_UNAVAILABLE, WYRD_STORAGE_503_BACKEND_UNAVAILABLE, \
-          WYRD_STORAGE_503_PRESIGN_EXPIRED, WYRD_VALA_503_QUERY_VISIBILITY_UNAVAILABLE)", body = WyrdProblem)
+          WYRD_STORAGE_503_PRESIGN_EXPIRED)", body = WyrdProblem)
     ),
     tag = "Storage"
 )]

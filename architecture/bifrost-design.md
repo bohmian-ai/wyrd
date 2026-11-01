@@ -1841,11 +1841,12 @@ so audit traffic cannot shed it. A completion returns only after Scribe
 acknowledges its own inventory row, waiting for the slot and the
 acknowledgement at most half the query deadline and otherwise
 answering `WYRD_VALA_503_BIFROST_WRITER_UNAVAILABLE`; no other producer waits
-on it. Card reads, after the caller's Card authorization, read the inventory
-as the tenant `System` principal granted only that table, so no Bifrost query
-permission is needed. A manifest entry PostgreSQL holds complete but the
-inventory does not yet show answers `WYRD_VALA_503_QUERY_VISIBILITY_UNAVAILABLE`;
-an absent row is never evidence of deletion. A pod without
+on it. Card reads never read the inventory; they serve the Card's declared
+files from its PostgreSQL manifest. A verification File read, after the
+caller's authorization, reads the inventory as the tenant `System` principal
+granted only that table, so no Bifrost query permission is needed; a File not
+yet visible answers `WYRD_VALA_503_QUERY_VISIBILITY_UNAVAILABLE`, and an
+absent row is never evidence of deletion. A pod without
 Scribe submits through `ScribeCapturePeerService.IngestCapture` on the peer
 listener, which the same `wyrd-peer` mTLS admits; the request names its
 tenant and one of those six tables or `bifrost.system.audit_log` explicitly,

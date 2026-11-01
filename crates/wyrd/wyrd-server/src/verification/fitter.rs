@@ -73,7 +73,7 @@ pub struct BaselineFitter {
     postgres: WyrdPostgres,
     /// Operator pool for the cross-tenant due list.
     operator: OperatorPool,
-    /// The server whose object inventory resolves, and whose storage holds,
+    /// The server whose Card manifest resolves, and whose storage holds,
     /// the Data Card's Parquet.
     state: AppState,
     /// Baseline queue transitions and retry policy.
@@ -96,7 +96,7 @@ pub struct BaselineFitter {
 
 impl BaselineFitter {
     /// Build a fitter over the Wyrd Postgres owner, the operator pool, and the
-    /// server whose object inventory and storage hold baseline artifacts.
+    /// server whose Card manifests and storage hold baseline artifacts.
     ///
     /// The fitter carries no coordination clock: due times, leases, and retry
     /// deadlines are PostgreSQL's. From `limits` it takes the lease length,

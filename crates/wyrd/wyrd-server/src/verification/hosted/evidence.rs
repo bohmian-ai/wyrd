@@ -5,7 +5,7 @@
 //! execution's pinned input slots. A file is read from the location its
 //! completed File upload recorded in the object inventory; an Artifact file
 //! is resolved through the registry's authorized, audited Card read and the
-//! objects its hydration read from the same inventory. Each File's location
+//! manifest files its hydration verified. Each File's location
 //! and each Artifact's files are resolved once per execution, at admission,
 //! and reused by every later selection, read, and workspace; each Artifact
 //! use still makes its own audited `card:read` decision. Either read is
@@ -314,13 +314,13 @@ impl TenantEvidence {
     ///
     /// Every use makes the caller's own audited `card:read` decision. The
     /// first resolves the Card through the registry's authorized read, so a
-    /// mismatched UID is refused, and keeps the files its hydration read
-    /// from the object inventory; later uses in this execution reuse them.
+    /// mismatched UID is refused, and keeps the manifest files its hydration
+    /// verified; later uses in this execution reuse them.
     ///
     /// # Errors
     /// Returns [`BlockError::Terminal`] for a non-Artifact reference or a
     /// refused or missing Card, and [`BlockError::Retryable`] when the
-    /// registry or inventory is unavailable.
+    /// registry is unavailable.
     async fn inventory(&self, card: &CardRef) -> Result<Arc<ArtifactInventory>, BlockError> {
         if card.kind != CardKind::Artifact {
             return Err(terminal("the reference does not name an Artifact Card"));
@@ -331,7 +331,7 @@ impl TenantEvidence {
             authorize_card_ref(&self.state, &self.caller, card).map_err(|error| refusal(&error))?;
             return Ok(inventory);
         }
-        let (resolved, objects) = get_card_objects_by_ref_for(&self.state, &self.caller, card)
+        let (resolved, files) = get_card_objects_by_ref_for(&self.state, &self.caller, card)
             .await
             .map_err(|error| refusal(&error))?;
         let uid = resolved
@@ -339,10 +339,7 @@ impl TenantEvidence {
             .metadata
             .uid
             .ok_or_else(|| terminal("the Artifact Card has no UID"))?;
-        let inventory = Arc::new(ArtifactInventory {
-            uid,
-            files: objects.files,
-        });
+        let inventory = Arc::new(ArtifactInventory { uid, files });
         lock(&self.artifacts).insert(key, Arc::clone(&inventory));
         Ok(inventory)
     }

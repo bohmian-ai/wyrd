@@ -5,9 +5,12 @@
  * evidence exported over stock OTLP. Nothing here mocks the server or the BFF.
  */
 import { execFileSync, spawn } from 'node:child_process';
+import { mkdtempSync, readFileSync } from 'node:fs';
 import { createServer } from 'node:net';
+import { tmpdir } from 'node:os';
+import { join, resolve } from 'node:path';
 import { chromium, type Browser, type Page } from 'playwright';
-import { expect, vi } from 'vitest';
+import { test as base, expect, vi } from 'vitest';
 import { serverTest } from '../../../../../../sdks/wyrd-sdk-ts/wyrd/tests/support/server';
 import { exportOtlp, nanos, seedSignals } from '$lib/ui-signals.integration';
 
@@ -290,4 +293,70 @@ test('authenticated metrics investigation', async ({ server, ui }) => {
   await page.locator('[data-panel="facets"]').getByRole('button', { name: /ui\.latency/ }).click();
   await expect.poll(() => page.locator('[data-panel="series"]').textContent(), { timeout: 30_000 }).toContain('gauge and sum points only');
   await expect.poll(() => list.textContent()).toContain('[1,2]');
+});
+
+/** The repository root, where `mise run dev:full` runs. */
+const REPO = resolve(import.meta.dirname, '../../../../../..');
+
+/** Whether anything still answers HTTP on this loopback port. */
+async function answers(port: number): Promise<boolean> {
+  return fetch(`http://127.0.0.1:${port}/`, { signal: AbortSignal.timeout(2_000) }).then(
+    () => true,
+    () => false
+  );
+}
+
+/** The `Traces` total the overview shows. */
+async function traceTotal(page: Page): Promise<number> {
+  const text = (await page.locator('[data-panel="overview"]').textContent()) ?? '';
+  return Number(/Traces\s*([\d,]+)/.exec(text)?.[1].replaceAll(',', '') ?? NaN);
+}
+
+base('development environment lifecycle', { timeout: 1_800_000 }, async () => {
+  // The launcher's ports are fixed; another service on one would be mistaken for this environment.
+  for (const port of [8080, 3000, 8000, 1080]) expect(await answers(port), `port ${port} is already serving; stop that service first`).toBe(false);
+  // A config home of its own: startup replaces the dev key there, never in the developer's.
+  const config = mkdtempSync(join(tmpdir(), 'wyrd-dev-'));
+  const child = spawn('mise', ['run', 'dev:full', '--requests', '20', '--concurrency', '2'], {
+    cwd: REPO,
+    env: { ...process.env, WYRD_CONFIG_HOME: config },
+    detached: true,
+    stdio: ['ignore', 'pipe', 'pipe']
+  });
+  let output = '';
+  for (const stream of [child.stdout, child.stderr]) stream.on('data', (chunk: Buffer) => (output += chunk.toString()));
+  const exited = new Promise<number | null>((done) => child.once('exit', (code) => done(code)));
+  const browser = await chromium.launch();
+  try {
+    // One command reaches readiness, runs the batch to terminal evidence and reports usable URLs.
+    await vi.waitFor(() => expect(output).toMatch(/batch {8}(passed|FAILED)/), { timeout: 1_500_000, interval: 1_000 });
+    expect(output).toContain('batch        passed');
+    expect(output).toContain('UI           http://127.0.0.1:3000/t/dev/login/api-key');
+    for (const port of [8080, 3000, 8000, 1080]) expect(await answers(port), `port ${port}`).toBe(true);
+    const key = /api_key = "([^"]+)"/.exec(readFileSync(join(config, 'credentials.toml'), 'utf8'))?.[1];
+    expect(key).toBeDefined();
+
+    // Normal browser login reaches the batch's retained traces, logs and metrics.
+    const page = await signIn(browser, 'http://127.0.0.1:3000', 'dev', key!);
+    const observe = 'http://127.0.0.1:3000/t/dev/observe';
+    for (const signal of ['traces', 'logs', 'metrics']) {
+      await page.goto(`${observe}?signal=${signal}&last=1h`);
+      await expect.poll(() => page.locator('[data-panel="list"] tbody tr').count(), { timeout: 120_000 }).toBeGreaterThan(0);
+    }
+
+    // An appended batch reaches the running environment without a restart.
+    await page.goto(`${observe}?last=1h`);
+    await expect.poll(() => traceTotal(page), { timeout: 60_000 }).toBeGreaterThan(0);
+    const before = await traceTotal(page);
+    execFileSync('mise', ['run', 'dev:batch', '--requests', '4', '--concurrency', '2'], { cwd: REPO, env: { ...process.env, WYRD_CONFIG_HOME: config }, stdio: 'inherit' });
+    await expect
+      .poll(async () => (await page.reload(), traceTotal(page)), { timeout: 120_000, interval: 2_000 })
+      .toBeGreaterThan(before);
+  } finally {
+    await browser.close();
+    // Ctrl-C stops every owned child: the app first, so its telemetry drains.
+    if (child.exitCode === null) process.kill(-child.pid!, 'SIGINT');
+    await exited;
+  }
+  for (const port of [8080, 3000, 8000]) expect(await answers(port), `port ${port} after Ctrl-C`).toBe(false);
 });

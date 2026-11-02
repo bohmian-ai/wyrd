@@ -386,9 +386,9 @@ nested int64 projection, which is outside this remediation.
 
 ### Visual evidence
 
-Candidate captures are in `candidate/` beside this file:
-`{Main,Spans,TraceDrawer,TimePicker,Logs,Metrics,State-empty,State-error}-{desktop,mobile}-{dark,light}.png`
-(desktop 1440×1000 viewport, mobile 390 full page), against
+Candidate captures were taken outside the repository (never committed) for
+Main, Spans, TraceDrawer, TimePicker, Logs, Metrics, empty and error states, in
+desktop (1440×1000 viewport) and mobile (390 full page), dark and light, against
 `references/canvas/png/{Main,Spans,TraceDrawer,Logs,Metrics}.png`. They come from
 `dev:full` with a 40-request batch. Denied, partial, keyboard/focus and long-content
 states are proven by the journeys, not captured.

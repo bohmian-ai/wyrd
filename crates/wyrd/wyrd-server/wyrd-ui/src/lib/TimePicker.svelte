@@ -83,6 +83,8 @@
   let recent = $state.raw<readonly PickedRange[]>([]);
   let trigger = $state<HTMLButtonElement>();
   let root = $state<HTMLDivElement>();
+  /** The panel's offset from the trigger's right edge, keeping it 16px inside the viewport wherever the toolbar wrapped the trigger. */
+  let offset = $state(0);
 
   /** Recently committed ranges; browser storage may be unavailable, so it fails soft. */
   function readRecent(): PickedRange[] {
@@ -114,6 +116,11 @@
     } else {
       from = zonedText(Date.parse(range.from), zone);
       to = zonedText(Date.parse(range.to), zone);
+    }
+    if (trigger) {
+      const { right } = trigger.getBoundingClientRect();
+      const width = Math.min(472, innerWidth - 32);
+      offset = right - Math.min(Math.max(16, right - width), innerWidth - 16 - width) - width;
     }
     open = true;
   }
@@ -158,7 +165,7 @@
   </button>
   {#if open}
     <!-- svelte-ignore a11y_no_noninteractive_element_interactions -->
-    <div class="dialog" role="dialog" aria-label="Time range" tabindex="-1" onkeydown={(event) => event.key === 'Escape' && hide()}>
+    <div class="dialog" style:right="{offset}px" role="dialog" aria-label="Time range" tabindex="-1" onkeydown={(event) => event.key === 'Escape' && hide()}>
       <div class="relative">
         <p class="h">Relative</p>
         {#each presets as preset (preset)}
@@ -224,7 +231,6 @@
     border: 1px solid var(--border);
     border-radius: var(--r);
     background: var(--surface);
-    box-shadow: 0 12px 32px #00000040;
   }
   .relative {
     display: flex;

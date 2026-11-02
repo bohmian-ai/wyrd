@@ -94,6 +94,8 @@
 
   // Traces.
   let filtersOpen = $state(true);
+  /** The list bar's slot for the trace list's Wrap, Columns and CSV. */
+  let listTools = $state<HTMLElement>();
   const totals = $derived.by(() => {
     const read = view?.overview?.totals;
     if (read?.state !== 'populated' || !data.range) return undefined;
@@ -245,16 +247,23 @@
         <span class="counts">{fmtNumber(totals.traces)} traces · <span class:bad={totals.errorShare > 0}>{fmtNumber(totals.errorShare)}% error</span> · p95 {fmtDuration(totals.p95)}</span>
       {/if}
       {@render grouping()}
+      <span class="listtools" bind:this={listTools}></span>
     </div>
     <div class="split" class:folded={!filtersOpen}>
       {#if filtersOpen}<div id="facets" data-panel="facets"><FacetRail {...observe.facets} {actions} onaction={onaction('FacetRail')} /></div>{/if}
-      <div data-panel="list"><RecordTable {...observe.list} {actions} onaction={onaction('RecordTable')} oncolumns={(columns) => go({ ...closed(current), columns })} /></div>
+      <div data-panel="list">
+        <RecordTable {...observe.list} {actions} onaction={onaction('RecordTable')} oncolumns={(columns) => go({ ...closed(current), columns })} controls={listTools} />
+      </div>
     </div>
     {@render children()}
   {:else if current.signal === 'logs'}
     {#if observe.timeline}
-      <section class="panel" aria-label="Timeline" data-panel="timeline">
-        <Chart {...observe.timeline} bars colors={LEVELS} {actions} onaction={onaction('Chart')} />
+      {@const timeline = observe.timeline}
+      <section class="panel overview" aria-label="Timeline" data-panel="timeline">
+        <Chart {...timeline} compact bars colors={LEVELS} {actions} onaction={onaction('Chart')} />
+        {#if timeline.executed}
+          <button type="button" class="query" onclick={() => timeline.executed && onaction('Chart')({ name: 'chart.open_in_query', input: timeline.executed })}>Open in Query ↗</button>
+        {/if}
       </section>
     {/if}
     <div class="listbar">{@render grouping()}</div>
@@ -519,6 +528,14 @@
     justify-content: space-between;
     gap: 8px;
   }
+  .query {
+    border: 0;
+    padding: 0;
+    background: transparent;
+    color: var(--declare);
+    font: 11px var(--font-mono);
+    cursor: pointer;
+  }
   .h {
     margin: 0;
     color: var(--muted);
@@ -576,6 +593,9 @@
   }
   .counts {
     color: var(--muted);
+  }
+  .listtools {
+    display: contents;
   }
   .bad {
     color: var(--danger);

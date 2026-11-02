@@ -12,8 +12,11 @@
   twenty series only the first twenty start shown, and the table says so. A
   host that passes `shown` owns which series are drawn and hears each change
   through `onseries`. `compact` draws a headline overview tile without the
-  table and footer; `bars` stacks a timeseries' series as bars, coloured by
-  `colors` when the host names a colour per caption.
+  table and footer, with a key when the host names several `colors`; `bars`
+  stacks a timeseries' series as bars, coloured by `colors` when the host
+  names a colour per caption. A keyed series' caption stays one line; opening
+  it lists every recorded identity cell, and an equal-instant sample keeps its
+  own marker and tooltip value.
 -->
 <script lang="ts">
   import type { ActionProps } from '../contract.js';
@@ -94,6 +97,8 @@
   const xs = $derived([...new Set(lines.flatMap((line) => line.points.map((point) => point.x)))].sort((a, b) => a - b));
   /** Series the reader chose to draw, by key, when the host does not own the choice; unset draws the first twenty. */
   let chosen = $state.raw<ReadonlySet<string>>();
+  /** The keyed series whose full recorded identity the reader opened. */
+  let inspected = $state<string>();
   const visible = $derived(shown ?? chosen ?? new Set(lines.slice(0, MAX_SERIES).map((line) => line.key)));
   const drawn = $derived(lines.filter((line) => visible.has(line.key)));
   /** Latest, largest and mean of the values a series plotted; it has at least one. */
@@ -268,6 +273,9 @@
   <header>
     <h3>{input.title ?? 'Chart'}{#if input.unit && !compact}{' '}<span class="unit">· {input.unit}</span>{/if}</h3>
     {#if headline}<span class="headline">{headline}</span>{/if}
+    {#if compact && Object.keys(colors).length > 1}
+      <span class="key" aria-label="Key">{#each Object.entries(colors) as [label, color] (label)}<span><i style:background={color}></i>{label}</span>{/each}</span>
+    {/if}
     {#if degraded && data}
       <span title={data.terminal.warnings.join(', ')}><StatusPill tone="warn" label="Partial result" /></span>
     {/if}
@@ -342,7 +350,7 @@
                 stroke={look.stroke}
                 stroke-dasharray={look.dash}
               />
-              {#each line.points.length <= 60 ? line.points : [] as point (point.x)}
+              {#each line.points.length <= 60 ? line.points : [] as point, occurrence (occurrence)}
                 <path class="marker" d={marker(look.marker, sx(point.x), sy(point.y))} fill={look.stroke} />
               {/each}
               {/if}
@@ -360,8 +368,8 @@
           <p class="tooltip" role="status">
             <time datetime={new Date(at).toISOString()}>{fmtInstant(at)}</time>
             {#each drawn as line (line.key)}
-              {@const point = line.points.find((each) => each.x === at)}
-              <span>{line.label}: {point ? `${fmtNumber(point.y)}${unitLabel}` : '—'}</span>
+              {@const points = line.points.filter((each) => each.x === at)}
+              <span>{line.label}: {points.length ? points.map((point) => `${fmtNumber(point.y)}${unitLabel}`).join(', ') : '—'}</span>
             {/each}
           </p>
         {/if}
@@ -391,12 +399,26 @@
                         // The box shows what is drawn; a host may not accept the change.
                         event.currentTarget.checked = visible.has(line.key);
                       }} /></td>
-                  <th scope="row" title={identity ? line.key : undefined}>
-                    <svg viewBox="0 0 24 8" width="24" height="8" aria-hidden="true">
-                      <line x1="0" x2="24" y1="4" y2="4" stroke={look.stroke} stroke-dasharray={look.dash} />
-                      <path d={marker(look.marker, 12, 4)} fill={look.stroke} />
-                    </svg>
-                    {line.label}
+                  <th scope="row">
+                    <span class="who">
+                      <svg viewBox="0 0 24 8" width="24" height="8" aria-hidden="true">
+                        <line x1="0" x2="24" y1="4" y2="4" stroke={look.stroke} stroke-dasharray={look.dash} />
+                        <path d={marker(look.marker, 12, 4)} fill={look.stroke} />
+                      </svg>
+                      {#if identity}
+                        <!-- A bounded caption; opening it lists every recorded identity cell. -->
+                        <button type="button" class="caption" title={line.label} aria-expanded={inspected === line.key} onclick={() => (inspected = inspected === line.key ? undefined : line.key)}
+                          >{line.label}</button
+                        >
+                      {:else}
+                        <span class="caption">{line.label}</span>
+                      {/if}
+                    </span>
+                    {#if identity && inspected === line.key}
+                      <dl class="dimensions">
+                        {#each JSON.parse(line.key) as cell, at (at)}<dt>{identity[at]}</dt><dd>{cell === null ? '∅' : String(cell)}</dd>{/each}
+                      </dl>
+                    {/if}
                   </th>
                   {#if identity}
                     <td>{values ? String(values.latest ?? '∅') : '—'}</td>
@@ -597,7 +619,7 @@
     margin: 0 0 4px;
     font: 12px var(--font-mono);
   }
-  .series button {
+  .series p button {
     border: 1px solid var(--border);
     border-radius: var(--r);
     padding: 2px 8px;
@@ -633,6 +655,61 @@
   .legend td:first-child {
     width: 100%;
     text-align: left;
+  }
+  /* The caption column takes the spare width and no more, so the exact values always show. */
+  .legend th:nth-child(2) {
+    max-width: 0;
+  }
+  .who {
+    display: flex;
+    align-items: center;
+    min-width: 0;
+  }
+  .caption {
+    flex: 1;
+    min-width: 0;
+    overflow: hidden;
+    border: 0;
+    padding: 0;
+    background: transparent;
+    color: inherit;
+    font: inherit;
+    text-align: left;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  button.caption {
+    cursor: pointer;
+  }
+  .caption:focus-visible {
+    outline: 2px solid var(--declare);
+  }
+  .dimensions {
+    display: grid;
+    grid-template-columns: auto minmax(0, 1fr);
+    gap: 2px 8px;
+    margin: 4px 0 6px 30px;
+    color: var(--muted);
+    white-space: normal;
+  }
+  .dimensions dd {
+    margin: 0;
+    overflow-wrap: anywhere;
+    color: var(--text);
+  }
+  .key {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 4px 12px;
+    margin-left: auto;
+    color: var(--muted);
+    font: 11px var(--font-mono);
+  }
+  .key i {
+    display: inline-block;
+    width: 8px;
+    height: 8px;
+    margin-right: 6px;
   }
   .legend td:first-child {
     width: 1%;

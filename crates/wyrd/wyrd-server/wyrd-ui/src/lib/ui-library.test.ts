@@ -1353,6 +1353,34 @@ test('TASK-004: Canonical signal interactions', async () => {
   expect(list.getByRole('status')).toHaveTextContent(/^Live$/);
   expect(list.getByText('new root')).toBeInTheDocument();
   list.unmount();
+  // A held list given a new column projection shows the read that carries it: headings, cells, CSV and Query describe one read.
+  const read = (columns: readonly string[], sql: string) => ({
+    input: { signal: 'logs', live: true, columns },
+    executed: { sql, params: [] },
+    result: {
+      state: 'populated',
+      data: {
+        rows: {
+          columns: [...columns, 'trace_id', 'span_id', 'observed_time_unix_nano', 'wyrd_request_id'].map((name) => ({ name, data_type: 'Utf8', nullable: true })),
+          rows: [[...columns.map((column) => `${column} value`), TRACE, '00f067aa0ba902b7', '2026-10-20T12:00:00Z', 'r1']],
+          terminal: { outcome: 'success', row_count: 1, warnings: [] }
+        }
+      }
+    },
+    onaction: openAction
+  });
+  const projected = render(RecordTable, read(['body_text'], 'first') as never);
+  await fireEvent.mouseEnter(projected.getByRole('region'));
+  await projected.rerender({ ...read(['body_text', 'severity_text'], 'second'), result: { state: 'loading' } } as never);
+  expect(projected.queryByRole('columnheader', { name: /severity/i })).toBeNull();
+  await projected.rerender(read(['body_text', 'severity_text'], 'second') as never);
+  expect(projected.getByRole('status')).toHaveTextContent('Live paused while you read');
+  expect(projected.getByRole('columnheader', { name: /severity/i })).toBeInTheDocument();
+  expect(projected.getByText('severity_text value')).toBeInTheDocument();
+  expect(decodeURIComponent(projected.getByRole('link', { name: 'CSV' }).getAttribute('href') ?? '')).toContain('body_text value,severity_text value');
+  await fireEvent.click(projected.getByRole('button', { name: /Open in Query/ }));
+  expect(openAction).toHaveBeenLastCalledWith({ name: 'record.open_in_query', input: { sql: 'second', params: [] } });
+  projected.unmount();
   // The footer states the returned extent, never an unread total; a service is a chip.
   const footed = render(RecordTable, { input: { signal: 'traces' }, result: populated });
   expect(footed.getByText(/^Showing 3\s+traces$/)).toBeInTheDocument();
@@ -1528,6 +1556,14 @@ test('TASK-004: Canonical signal interactions', async () => {
     ['', '∅', '2', '2', '1.5'],
     ['', '{}', '3', '3', '2.5']
   ]);
+  // A caption opens to every recorded identity cell by name, by keyboard or touch.
+  const caption = metricChart.getByRole('button', { name: '{"route":"not set"}' });
+  expect(caption).toHaveAttribute('aria-expanded', 'false');
+  await fireEvent.click(caption);
+  expect(caption).toHaveAttribute('aria-expanded', 'true');
+  expect(caption.closest('th')?.querySelector('dl')).toHaveTextContent('metric_typegaugeattributes{"route":"not set"}');
+  await fireEvent.click(caption);
+  expect(metricRows()[0]).toEqual(['', '{"route":"not set"}', '9007199254740993', '9007199254740993', '0.5']);
   expect(metricChart.container.textContent).not.toMatch(/\bother\b/);
   expect(metricChart.getByText(/24 series · 20 shown · exact Latest, Max and Mean/)).toBeInTheDocument();
   expect(metricChart.container.querySelectorAll('svg.plot polyline')).toHaveLength(20);
@@ -1545,6 +1581,21 @@ test('TASK-004: Canonical signal interactions', async () => {
   expect(metricChart.getByText('Not authorized')).toBeInTheDocument();
   expect(metricRows()[0].slice(2)).toEqual(['—', '—', '—']);
   metricChart.unmount();
+
+  // Two recorded samples of one series at one instant both draw, and the tooltip names both.
+  const twin = render(Chart, {
+    input: metricInput,
+    result: {
+      state: 'populated',
+      data: { columns: metricColumns, rows: [['2026-10-20T10:00:00Z', 'gauge', '{}', 1], ['2026-10-20T10:00:00Z', 'gauge', '{}', 3]], terminal: { outcome: 'success', row_count: 2, warnings: [] } }
+    },
+    identity,
+    summary: { state: 'populated', data: { ...exactSummary, rows: [['gauge', '{}', 2, '3', '3', '2']] } }
+  } as never);
+  expect(twin.container.querySelectorAll('svg.plot path.marker')).toHaveLength(2);
+  await fireEvent.focus(twin.getByRole('application'));
+  expect(twin.getByRole('status')).toHaveTextContent('gauge · {}: 1, 3');
+  twin.unmount();
 
   // A host that owns the list's columns is offered every column of the signal, and a toggle reports the next set.
   let chosenColumns: readonly string[] | undefined;

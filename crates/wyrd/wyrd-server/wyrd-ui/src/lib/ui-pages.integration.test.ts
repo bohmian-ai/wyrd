@@ -116,6 +116,12 @@ test('authenticated traces and spans', async ({ ui }) => {
   expect(await overview.getByRole('region').count()).toBe(3);
   await expect.poll(() => overview.textContent()).toMatch(/1 traces/);
   expect(await list.locator('tbody tr').count()).toBe(1);
+  // Wrap, Columns and CSV sit in the list bar, once.
+  const listbar = page.locator('.listbar');
+  await expect.poll(() => listbar.locator('summary', { hasText: 'Columns' }).count()).toBe(1);
+  expect(await listbar.getByRole('link', { name: 'CSV' }).count()).toBe(1);
+  expect(await listbar.getByRole('button', { name: 'Wrap lines' }).count()).toBe(1);
+  expect(await list.locator('summary', { hasText: 'Columns' }).count()).toBe(0);
 
   // Spans lists every span of the trace.
   await page.getByRole('group', { name: 'Rows' }).getByRole('link', { name: 'Spans' }).click();
@@ -152,6 +158,13 @@ test('authenticated traces and spans', async ({ ui }) => {
   await expect.poll(() => drawer.getByRole('tree').getByRole('treeitem').count(), { timeout: 30_000 }).toBe(3);
   expect(new URL(page.url()).searchParams.get('trace')).toBe(TRACE);
   expect(await serverHtml(page, page.url())).toContain('role="treeitem"');
+  // The drawer is the wide trace surface: root and totals head it, beside Link, Expand and Close.
+  expect(await drawer.locator('header').first().textContent()).toMatch(/trace [0-9a-f]{32}.*3 spans/s);
+  expect((await drawer.boundingBox())?.width).toBe(884);
+  await drawer.getByRole('button', { name: /^Expand ↗$/ }).click();
+  expect((await drawer.boundingBox())?.width).toBe(page.viewportSize()?.width);
+  await drawer.getByRole('button', { name: /^Collapse ↗$/ }).click();
+  expect(await drawer.getByRole('button', { name: 'Link' }).count()).toBe(1);
   await page.reload();
   await expect.poll(() => page.getByRole('dialog', { name: 'Trace' }).getByRole('tab').count()).toBeGreaterThan(0);
   await page.getByRole('button', { name: 'Close Trace' }).click();
@@ -200,6 +213,22 @@ test('authenticated traces and spans', async ({ ui }) => {
   await picker.click();
   await expect.poll(() => dialog.textContent()).toContain('01:00:00 → 11:00:00');
   await dialog.press('Escape');
+  // At 390px the open picker keeps every control inside the viewport.
+  const size = page.viewportSize();
+  await page.setViewportSize({ width: 390, height: 844 });
+  await picker.click();
+  const panel = await dialog.boundingBox();
+  expect(panel && panel.x >= 0 && panel.x + panel.width <= 390).toBe(true);
+  for (const name of ['From', 'To']) {
+    const field = await dialog.getByLabel(name).boundingBox();
+    expect(field && field.x >= 0 && field.x + field.width <= 390).toBe(true);
+  }
+  for (const name of ['UTC', 'Local', 'Apply range', 'Last 6 hours']) {
+    const control = await dialog.getByRole('button', { name }).first().boundingBox();
+    expect(control && control.x >= 0 && control.x + control.width <= 390).toBe(true);
+  }
+  await dialog.press('Escape');
+  if (size) await page.setViewportSize(size);
   await page.goBack();
   await expect.poll(() => list.locator('tbody tr').count()).toBe(1);
 
@@ -234,7 +263,9 @@ test('authenticated logs investigation', async ({ ui }) => {
   expect(await list.textContent()).not.toContain('foreign-agent');
   const timeline = page.locator('[data-panel="timeline"]');
   await expect.poll(() => timeline.textContent()).toMatch(/Records per/);
-  expect(await timeline.locator('table.legend tbody tr').allTextContents()).toEqual([expect.stringContaining('error')]);
+  expect(await timeline.getByLabel('Key').textContent()).toMatch(/info.*warn.*error/);
+  expect(await timeline.getByRole('application').getAttribute('aria-label')).toMatch(/: error$/);
+  expect(await timeline.getByRole('button', { name: /Open in Query/ }).count()).toBe(1);
 
   // Severity facets filter the timeline and the records alike.
   await page.locator('[data-panel="facets"]').getByRole('button', { name: /ERROR/ }).click();
@@ -330,6 +361,9 @@ test('authenticated metrics investigation', async ({ server, ui }) => {
                   ]
                 }
               },
+              // Mixed int64 and double samples that round to one double: Max compares them exactly.
+              { name: 'ui.low', unit: '1', gauge: { dataPoints: [point('2026-10-19T04:00:00Z', { asInt: '-9007199254740993' }), point('2026-10-19T04:01:00Z', { asDouble: -9007199254740992 })] } },
+              { name: 'ui.high', unit: '1', gauge: { dataPoints: [point('2026-10-19T04:00:00Z', { asInt: UNSAFE[0] }), point('2026-10-19T04:01:00Z', { asDouble: 9007199254740992 })] } },
               {
                 name: 'ui.window',
                 unit: 'ms',
@@ -378,6 +412,16 @@ test('authenticated metrics investigation', async ({ server, ui }) => {
   expect(rows.find((row) => row.includes('ui-worker'))).toMatch(/100\s*100\s*51\.25/);
   // Another route at the same instant stays its own series.
   expect(rows.find((row) => row.includes('{"route":"not set"}'))).toMatch(/5\s*5\s*5/);
+
+  // Max of samples that round to one double is the exactly larger one, whichever representation it has.
+  for (const [metric, max] of [['ui.low', '-9007199254740992'], ['ui.high', UNSAFE[0]]] as const) {
+    await page.goto(`${metrics}&where=${encodeURIComponent(JSON.stringify([{ column: 'metric_name', value: metric }]))}`);
+    await expect.poll(() => legend.count(), { timeout: 30_000 }).toBe(1);
+    const [, , latest, largest] = await legend.first().locator('td, th').allTextContents();
+    expect([latest.trim(), largest.trim().replace(/\.0$/, '')]).toEqual([expect.stringMatching(/^-?9007199254740992(\.0)?$/), max]);
+  }
+  await page.goto(`${metrics}&where=${encodeURIComponent(JSON.stringify([{ column: 'metric_name', value: 'ui.queue' }]))}`);
+  await expect.poll(() => legend.count(), { timeout: 30_000 }).toBe(5);
 
   // Unticking a series hides its line; the table and the chart name the same series.
   const lines = () => chart.locator('svg.plot polyline').count();

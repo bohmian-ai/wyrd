@@ -15,7 +15,9 @@
 
   Columns hides read columns; a host that passes `oncolumns` instead offers
   every column the signal may show and reads the reader's choice again. CSV
-  saves the rows and columns on screen.
+  saves the rows and columns on screen. A host that passes `controls` places
+  Wrap, Columns and CSV in that element, such as its list bar, instead of
+  above the table.
 -->
 <script lang="ts">
   import type { ActionProps, QueryResult } from '../contract.js';
@@ -35,8 +37,15 @@
     actions = {},
     onaction,
     paused = false,
-    oncolumns
-  }: RecordTableProps & ActionProps & { paused?: boolean; oncolumns?: (columns: readonly string[]) => void } = $props();
+    oncolumns,
+    controls
+  }: RecordTableProps & ActionProps & { paused?: boolean; oncolumns?: (columns: readonly string[]) => void; controls?: HTMLElement } = $props();
+
+  /** Keep `node` inside `target` while it is mounted. */
+  const placeIn = (target: HTMLElement) => (node: HTMLElement) => {
+    target.append(node);
+    return () => node.remove();
+  };
 
   const TONES: Record<number, Tone> = { 0: 'neutral', 1: 'ok', 2: 'danger' };
   const NOUNS = { traces: 'traces', spans: 'spans', logs: 'records', metrics: 'points' } as const;
@@ -45,17 +54,27 @@
   const loaded = $derived(result.state === 'populated' ? result.data : result.state === 'empty' ? { rows: result.data.rows } : undefined);
   const latest = $derived(loaded?.rows);
 
-  /** Rows and counts on screen while the reader holds a live list. */
-  let held = $state.raw<typeof loaded>();
+  /** The signal list's column projection; authored SQL has none. */
+  const projection = $derived('signal' in input ? shownColumns(input) : undefined);
+  /**
+   * Rows, counts, columns and executed query on screen while the reader holds
+   * a live list. A changed projection replaces the snapshot once a read that
+   * carries every new column lands, so headings, cells, CSV and Open in Query
+   * always describe one read.
+   */
+  let held = $state.raw<{ data: NonNullable<typeof loaded>; columns: typeof projection; executed: typeof executed }>();
   let reading = $state(false);
   /** A record opened from this list, until the reader resumes. */
   let opened = $state(false);
   const holding = $derived(input.live === true && (paused || reading || opened));
+  const same = (a: readonly string[] | undefined, b: readonly string[] | undefined) => JSON.stringify(a) === JSON.stringify(b);
   $effect.pre(() => {
     if (!holding) held = undefined;
-    else if (!held) held = loaded;
+    else if (loaded && (!held || (!same(held.columns, projection) && (projection ?? []).every((column) => columnIndex(loaded.rows, column) >= 0))))
+      held = { data: loaded, columns: projection, executed };
   });
-  const shown = $derived(held ?? loaded);
+  const shown = $derived(held?.data ?? loaded);
+  const query = $derived(held ? held.executed : executed);
   const rows = $derived(shown?.rows);
   function resume() {
     held = undefined;
@@ -63,7 +82,7 @@
     opened = false;
   }
 
-  const columns = $derived(rows ? ('signal' in input ? shownColumns(input) : rows.columns.map((column) => column.name)) : []);
+  const columns = $derived(rows ? ((held ? held.columns : projection) ?? rows.columns.map((column) => column.name)) : []);
   /** Columns the reader hid with Columns; reads are unchanged. */
   let hidden = $state.raw<ReadonlySet<string>>(new Set());
   const visible = $derived(columns.filter((column) => !hidden.has(column)));
@@ -76,7 +95,7 @@
     return JSON.stringify(keys.length ? keys : row);
   };
   const fresh = $derived.by(() => {
-    const before = held?.rows;
+    const before = held?.data.rows;
     if (!before || !latest || before === latest) return 0;
     const seen = new Set(before.rows.map((row) => keyOf(before, row)));
     return latest.rows.filter((row) => !seen.has(keyOf(latest, row))).length;
@@ -192,29 +211,12 @@
       <p class="note" role="note">Span and error counts unavailable: {counts.problem.title} ({counts.problem.code})</p>
     {/if}
     <div class="frame">
-      {#if signal}
+      {#if signal && controls}
+        <span class="tools" {@attach placeIn(controls)}>{@render tools()}</span>
+      {:else if signal}
         <div class="bar">
           <span>{fmtCount(rows.rows.length)} {noun} · newest first</span>
-          <span class="tools">
-            <button type="button" aria-pressed={wrap} onclick={() => (wrap = !wrap)}>Wrap lines</button>
-            <details class="columns">
-              <summary>Columns</summary>
-              <fieldset>
-                <legend>Shown columns</legend>
-                {#each offeredColumns as column (column)}
-                  <label title={column}><input
-                      type="checkbox"
-                      checked={isShown(column)}
-                      onchange={(event) => {
-                        // A refused change, hiding the last column, leaves the box as listed.
-                        if (!toggle(column)) event.currentTarget.checked = isShown(column);
-                      }}
-                    /> {heading(column)}</label>
-                {/each}
-              </fieldset>
-            </details>
-            <a class="csv" href="data:text/csv;charset=utf-8,{encodeURIComponent(csv)}" download="{signal}.csv">CSV</a>
-          </span>
+          <span class="tools">{@render tools()}</span>
         </div>
       {/if}
       <div
@@ -307,14 +309,14 @@
       {/if}
     </div>
     <ActionNote state={openState} />
-    {#if executed}
+    {#if query}
       <span class="query">
         <ActionButton
           variant="link"
           label="Open in Query"
           icon="↗"
           state={onaction ? actions['record.open_in_query'] : { state: 'unavailable', reason: 'This host has no Query' }}
-          onclick={() => onaction?.({ name: 'record.open_in_query', input: executed })}
+          onclick={() => onaction?.({ name: 'record.open_in_query', input: query })}
         />
       </span>
     {/if}
@@ -326,6 +328,27 @@
 {:else if result.state === 'denied' || result.state === 'error'}
   <EmptyState state={result.state} problem={result.problem} />
 {/if}
+
+{#snippet tools()}
+  <button type="button" aria-pressed={wrap} onclick={() => (wrap = !wrap)}>Wrap lines</button>
+  <details class="columns">
+    <summary>Columns</summary>
+    <fieldset>
+      <legend>Shown columns</legend>
+      {#each offeredColumns as column (column)}
+        <label title={column}><input
+            type="checkbox"
+            checked={isShown(column)}
+            onchange={(event) => {
+              // A refused change, hiding the last column, leaves the box as listed.
+              if (!toggle(column)) event.currentTarget.checked = isShown(column);
+            }}
+          /> {heading(column)}</label>
+      {/each}
+    </fieldset>
+  </details>
+  <a class="csv" href="data:text/csv;charset=utf-8,{encodeURIComponent(csv)}" download="{signal}.csv">CSV</a>
+{/snippet}
 
 <style>
   .query {

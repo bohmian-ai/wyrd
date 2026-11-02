@@ -368,9 +368,10 @@ export interface MetricProps {
  * `at`, the identity columns, `i` (exact integers as DECIMAL) and `d`
  * (doubles). With an aggregation, the samples are first aggregated once per
  * instant and identity; integers stay exact unless a double shares the group.
- * The summary's Latest, Max and Mean are server text: Max orders by numeric
- * value and then by the exact integer, and Mean is the exact decimal mean
- * unless a double is present.
+ * The summary's Latest, Max and Mean are server text: Max orders by double
+ * value and breaks a rounded tie exactly, comparing the integer with the
+ * double as decimals (a double that ties an int64 is integral), and Mean is
+ * the exact decimal mean unless a double is present.
  */
 export function metricQueries(input: MetricInput, range: AbsoluteRange, predicate?: string): { identity: readonly string[]; chart: Executed; summary: Executed } {
   const filters = SIGNALS.metrics.filters as readonly string[];
@@ -400,7 +401,7 @@ export function metricQueries(input: MetricInput, range: AbsoluteRange, predicat
     chart: { sql: `SELECT at, ${names}, v AS value FROM (${valued}) ORDER BY at`, params: binds.params },
     summary: {
       sql:
-        `SELECT ${names}, count(*) AS points, last_value(t ORDER BY at) AS latest, first_value(t ORDER BY v DESC, i DESC NULLS LAST) AS max, ` +
+        `SELECT ${names}, count(*) AS points, last_value(t ORDER BY at) AS latest, first_value(t ORDER BY v DESC, COALESCE(i, CASE WHEN abs(d) < 1e19 THEN CAST(d AS DECIMAL(38, 0)) END) DESC NULLS LAST) AS max, ` +
         `CASE WHEN count(d) = 0 THEN CAST(avg(i) AS VARCHAR) ELSE CAST(avg(v) AS VARCHAR) END AS mean ` +
         `FROM (${valued}) GROUP BY ${names} ORDER BY ${names}`,
       params: binds.params

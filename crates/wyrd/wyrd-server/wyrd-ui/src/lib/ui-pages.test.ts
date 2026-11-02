@@ -191,8 +191,8 @@ test('observe signal planning and interactions', async () => {
   expect(each.chart.sql).toContain('to_json(attributes) AS attributes');
   expect(each.chart.sql).toContain('AND (service_name IS NOT NULL)');
   expect(each.chart.sql).not.toMatch(/GROUP BY|COALESCE\(CAST\(service_name/);
-  // The summary reads exact text: Max orders by value then exact integer; Mean stays decimal unless a double is present.
-  expect(each.summary.sql).toContain('last_value(t ORDER BY at) AS latest, first_value(t ORDER BY v DESC, i DESC NULLS LAST) AS max');
+  // The summary reads exact text: Max orders by value and breaks a rounded tie exactly; Mean stays decimal unless a double is present.
+  expect(each.summary.sql).toContain('last_value(t ORDER BY at) AS latest, first_value(t ORDER BY v DESC, COALESCE(i, CASE WHEN abs(d) < 1e19 THEN CAST(d AS DECIMAL(38, 0)) END) DESC NULLS LAST) AS max');
   expect(each.summary.sql).toContain('CASE WHEN count(d) = 0 THEN CAST(avg(i) AS VARCHAR) ELSE CAST(avg(v) AS VARCHAR) END AS mean');
   expect(each.summary.sql).toContain('FROM (SELECT *, COALESCE(CAST(i AS DOUBLE), d) AS v');
   // An explicit aggregation applies once per instant, kept apart by `by`.

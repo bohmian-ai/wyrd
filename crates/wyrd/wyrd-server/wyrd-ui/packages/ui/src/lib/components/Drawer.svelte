@@ -1,6 +1,9 @@
 <!--
   A side panel on the native modal <dialog>: focus trapping, Escape and the
   backdrop come from the platform. The host owns `open`; closing reports through `onclose`.
+  A host may widen it with `width` (never past the viewport), replace the
+  title text with a `heading` (the title stays its accessible name) and add
+  header `tools` before Close.
 -->
 <script lang="ts">
   import type { Snippet } from 'svelte';
@@ -10,9 +13,12 @@
     title: string;
     onclose: () => void;
     children: Snippet;
+    width?: string;
+    heading?: Snippet;
+    tools?: Snippet;
   }
 
-  let { open, title, onclose, children }: Props = $props();
+  let { open, title, onclose, children, width = '480px', heading, tools }: Props = $props();
   let dialog: HTMLDialogElement | undefined = $state();
 
   $effect(() => {
@@ -22,10 +28,13 @@
   });
 </script>
 
-<dialog bind:this={dialog} aria-label={title} {onclose}>
+<dialog bind:this={dialog} aria-label={title} {onclose} style:width="min({width}, 100vw)">
   <header>
-    <h2>{title}</h2>
-    <button type="button" aria-label="Close {title}" onclick={onclose}>✕</button>
+    <div class="heading">{#if heading}{@render heading()}{:else}<h2>{title}</h2>{/if}</div>
+    <span class="tools">
+      {@render tools?.()}
+      <button type="button" aria-label="Close {title}" onclick={onclose}>✕ <span class="esc" aria-hidden="true">Esc</span></button>
+    </span>
   </header>
   <div class="body">{@render children()}</div>
 </dialog>
@@ -33,8 +42,8 @@
 <style>
   dialog {
     inset: 0 0 0 auto;
-    width: min(480px, 100vw);
     height: 100dvh;
+    max-width: 100vw;
     max-height: none;
     margin: 0;
     border: 0;
@@ -45,22 +54,37 @@
   }
   header {
     display: flex;
-    align-items: center;
+    align-items: flex-start;
     justify-content: space-between;
     gap: 8px;
     border-bottom: 1px solid var(--border-soft);
     padding: 12px 16px;
   }
+  .heading {
+    min-width: 0;
+  }
   h2 {
     margin: 0;
     font: var(--weight-strong) 14px var(--font-sans);
   }
+  .tools {
+    display: flex;
+    flex-shrink: 0;
+    gap: 6px;
+  }
+  .tools :global(button),
   button {
+    height: 30px;
+    padding: 0 10px;
     border: 1px solid var(--border);
     border-radius: var(--r);
     background: var(--surface);
     color: var(--text);
+    font: 12px var(--font-sans);
     cursor: pointer;
+  }
+  .esc {
+    color: var(--muted);
   }
   .body {
     padding: 16px;

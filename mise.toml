@@ -1278,19 +1278,67 @@ printf "\nMockServer ready on http://127.0.0.1:1080 with %s OpenAI expectations\
 """
 
 [tasks."dev:full"]
-description = "Boot MockServer, wyrd-server (OpenAI calls go to MockServer) and UI on :3000"
+description = "Boot MockServer, wyrd-server, the UI on :3000 and the canonical wyrd-example-py app on :8000, then send one workload batch"
+usage = """
+flag "--requests <n>" default="3000" help="Workload requests in the startup batch"
+flag "--concurrency <n>" default="8" help="Requests in flight at once"
+"""
 shell = "bash -c"
 run = """
+set -Eeuo pipefail
 cargo build -p wyrd-server
+scripts/dev/example-app.sh prepare
+# Each service runs in its own process group, so stopping one stops all of its children.
+set -m
+pids=()
+trap 'for pid in "${pids[@]}"; do kill -TERM -- "-$pid" 2>/dev/null || true; done; wait' EXIT INT TERM
 mise run dev:mockserver &
-MOCK_PID=$!
+pids+=($!)
+credentials=${WYRD_CONFIG_HOME:-${XDG_CONFIG_HOME:-$HOME/.config}/wyrd}/credentials.toml
+started=$(mktemp)
 WYRD_CONFIG_PATH="$PWD/tests/fixtures/mockserver/server.toml" WYRD_SEALING_KEY_BASE64=$(openssl rand -base64 32) scripts/postgres/dev-server.sh &
-SERVER_PID=$!
-cd crates/wyrd/wyrd-server/wyrd-ui && pnpm install --frozen-lockfile && pnpm run dev --host 0.0.0.0 --port ${WYRD_UI_PORT:-3000} &
-UI_PID=$!
-trap 'kill $MOCK_PID $SERVER_PID $UI_PID 2>/dev/null' EXIT INT TERM
-wait -n $MOCK_PID $SERVER_PID $UI_PID
+server=$!
+pids+=($server)
+(cd crates/wyrd/wyrd-server/wyrd-ui && pnpm install --frozen-lockfile && exec pnpm run dev --host 0.0.0.0 --port ${WYRD_UI_PORT:-3000}) &
+pids+=($!)
+# Ready means serving and holding this start's new tenant key.
+until curl -sf http://127.0.0.1:8080/readyz >/dev/null && [[ $credentials -nt $started ]]; do
+  kill -0 "$server" 2>/dev/null || { echo "wyrd-server exited before it was ready" >&2; exit 1; }
+  sleep 1
+done
+rm -f "$started"
+until curl -sf http://127.0.0.1:1080/mockserver/ready >/dev/null; do
+  kill -0 "${pids[0]}" 2>/dev/null || { echo "MockServer exited before it was ready" >&2; exit 1; }
+  sleep 1
+done
+scripts/dev/example-app.sh setup
+scripts/dev/example-app.sh serve &
+app=$!
+pids+=($app)
+until curl -sf -o /dev/null http://127.0.0.1:${WYRD_EXAMPLE_PORT:-8000}/docs; do
+  kill -0 "$app" 2>/dev/null || { echo "wyrd-example-py exited before it was ready" >&2; exit 1; }
+  sleep 1
+done
+if scripts/dev/example-app.sh batch --requests "$usage_requests" --concurrency "$usage_concurrency"; then
+  batch="passed"
+else
+  batch="FAILED (see the report above); every service is still running for diagnosis"
+fi
+printf '\nwyrd-server  http://127.0.0.1:8080 (fresh database; tenant dev key replaced %s)\n' "$credentials"
+printf 'UI           http://127.0.0.1:%s/t/dev/login/api-key (sign in with that api_key)\n' "${WYRD_UI_PORT:-3000}"
+printf 'example app  http://127.0.0.1:%s/docs\n' "${WYRD_EXAMPLE_PORT:-8000}"
+printf 'MockServer   http://127.0.0.1:1080/mockserver/dashboard\n'
+printf 'batch        %s; send another with mise run dev:batch -- --requests 20 --concurrency 2\n\n' "$batch"
+wait -n "${pids[@]}"
 """
+
+[tasks."dev:batch"]
+description = "Send one more workload batch to the running dev:full canonical app"
+usage = """
+flag "--requests <n>" default="3000" help="Workload requests in the batch"
+flag "--concurrency <n>" default="8" help="Requests in flight at once"
+"""
+run = 'scripts/dev/example-app.sh batch --requests "$usage_requests" --concurrency "$usage_concurrency"'
 
 [tasks.check]
 description = "Whole-plan closeout gate: fmt check + all-feature Clippy"

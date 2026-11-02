@@ -25,7 +25,9 @@ exec "$root/scripts/postgres/with-test-postgres.sh" -- bash -c '
   done
   key=$(./target/debug/wyrd-server setup --tenant dev | sed -n "s/^admin_credential: //p")
   config=${WYRD_CONFIG_HOME:-${XDG_CONFIG_HOME:-$HOME/.config}/wyrd}
+  # SDKs and the CLI refuse a saved credential others can read.
   mkdir -p "$config"
+  chmod 700 "$config"
   printf "[default]\napi_key = \"%s\"\n" "$key" > "$config/credentials.toml"
   chmod 600 "$config/credentials.toml"
   printf "\nwyrd-server ready on http://127.0.0.1:8080; tenant dev key saved to %s\n\n" "$config/credentials.toml"

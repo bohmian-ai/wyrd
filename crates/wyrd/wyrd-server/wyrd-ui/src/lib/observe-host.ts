@@ -130,6 +130,7 @@ export function observeView(state: ObserveState) {
   const panels: { id: string; component: string; input: unknown; layout?: unknown }[] = [];
   if (state.signal === 'traces')
     panels.push({ id: 'overview', component: 'StatStrip', input: { stats: ['traces', 'errors', 'duration_p95'], ...filter } });
+  if (state.signal === 'logs') panels.push({ id: 'overview', component: 'StatStrip', input: { stats: ['logs', 'log_errors'], ...filter } });
   panels.push(
     { id: 'facets', component: 'FacetRail', input: { signal, facets: FACETS[signal], ...filter }, layout: { x: 0, y: 0, w: 3, h: 14 } },
     {

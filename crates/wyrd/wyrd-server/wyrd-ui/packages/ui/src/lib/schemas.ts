@@ -245,11 +245,15 @@ export const LogKeySchema = z
 export const RecordDetailInputSchema = z.union([z.object({ traceId, spanId }).strict(), z.object({ log: LogKeySchema }).strict()]);
 
 /**
- * Built-in stats over the canonical tables. Span stats honour `where`;
- * `invocations` counts `invoke_agent` operations; `tokens` (token-unit
- * usage), `calls` and `cost` read `bifrost.gateway.calls`.
+ * Built-in stats over the canonical tables. Span and log stats honour `where`;
+ * `invocations` counts `invoke_agent` operations; `logs` counts log records and
+ * `log_errors` those of severity ERROR or above; `tokens` (token-unit usage),
+ * `calls` and `cost` read `bifrost.gateway.calls`.
  */
-export const STATS = ['traces', 'spans', 'errors', 'duration_p95', 'invocations', 'tokens', 'calls', 'cost'] as const;
+export const STATS = ['traces', 'spans', 'errors', 'duration_p95', 'invocations', 'logs', 'log_errors', 'tokens', 'calls', 'cost'] as const;
+
+/** Whether a strip reads log records: its `where` then names log columns. */
+export const logStats = (stats: readonly string[]) => stats.some((stat) => stat === 'logs' || stat === 'log_errors');
 
 /** The input of `StatStrip`: up to five stats under one range and an optional Wyrd ownership scope. */
 export const StatStripInputSchema = z
@@ -262,7 +266,11 @@ export const StatStripInputSchema = z
   })
   .strict()
   .superRefine((input, context) => {
-    knownColumns('spans', (input.where ?? []).map((each) => each.column), SIGNALS.spans.filters, ['where'], context);
+    const logs = logStats(input.stats);
+    knownColumns(logs ? 'logs' : 'spans', (input.where ?? []).map((each) => each.column), SIGNALS[logs ? 'logs' : 'spans'].filters, ['where'], context);
+    const filtered = !!input.where?.length || !!input.where_sql?.trim();
+    if (logs && filtered && input.stats.some((stat) => !logStats([stat])))
+      context.addIssue({ code: 'custom', path: ['stats'], message: 'one strip filters either log records or spans, not both' });
     const gateway = input.stats.some((stat) => stat === 'tokens' || stat === 'calls' || stat === 'cost');
     if (input.where?.length && gateway)
       context.addIssue({ code: 'custom', path: ['where'], message: 'span filters do not apply to gateway tokens, calls or cost' });
@@ -342,8 +350,8 @@ export const components = {
   },
   StatStrip: {
     description:
-      'One to five recorded numbers with a sparkline each, from built-in reads of bifrost.traces.spans and ' +
-      'bifrost.gateway.calls, optionally scoped to one workload_card_uid or subject_card_uid.',
+      'One to five recorded numbers with a sparkline each, from built-in reads of bifrost.traces.spans, ' +
+      'bifrost.logs.records and bifrost.gateway.calls, optionally scoped to one workload_card_uid or subject_card_uid.',
     input: StatStripInputSchema,
     states: ['populated', 'empty', 'denied', 'error', 'loading'],
     emits: {}

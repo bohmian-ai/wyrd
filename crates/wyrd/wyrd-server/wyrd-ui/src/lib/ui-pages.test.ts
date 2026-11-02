@@ -58,6 +58,20 @@ test('observe signal planning and interactions', async () => {
   for (const call of queries) expect(call.op === 'bifrost.query' && call.sql).toContain('(http_response_status_code = 404)');
   expect(roots.executed?.sql).toContain('parent_span_id IS NULL AND trace_id IN (SELECT trace_id FROM bifrost.traces.spans WHERE');
 
+  // The Logs timeline counts log records under the logs predicate; severity is the recorded number.
+  const timeline = recording(normalizing("body_text LIKE '%refund%'"));
+  await loadStatStrip(
+    { stats: ['logs', 'log_errors'], where: [{ column: 'severity_text', value: 'ERROR' }], where_sql: "body_text like '%refund%'" },
+    { executor: timeline.executor, range: RANGE }
+  );
+  expect(timeline.calls[0]).toMatchObject({ op: 'bifrost.validate_predicate', namespace: 'bifrost.logs', name: 'records' });
+  const logReads = timeline.calls.filter((call) => call.op === 'bifrost.query');
+  expect(logReads).toHaveLength(4);
+  for (const call of logReads) expect(call.op === 'bifrost.query' && call.sql).toMatch(/FROM bifrost\.logs\.records WHERE .*severity_text = \$\d.*\(body_text LIKE '%refund%'\)/);
+  expect(logReads.filter((call) => call.op === 'bifrost.query' && call.sql.includes('severity_number >= 17'))).toHaveLength(2);
+  expect(validatePanel('StatStrip', { stats: ['logs', 'spans'], where: [{ column: 'severity_text', value: 'ERROR' }] })).toMatchObject({ code: 'WYRD_SPEC_400_VALIDATION' });
+  expect(validatePanel('StatStrip', { stats: ['logs'], where: [{ column: 'name', value: 'x' }] })).toMatchObject({ detail: expect.stringContaining('name is not a logs column') });
+
   // A refused predicate stops the panel with its stable problem and issues no dependent read.
   for (const [problem, state] of [
     [wyrdProblem('validation', 'unknown column'), 'error'],
@@ -102,8 +116,8 @@ test('observe signal planning and interactions', async () => {
   const main = observeView(state);
   expect(validateView(main)).not.toHaveProperty('code');
   for (const panel of main.panels) expect(validatePanel(panel.component, panel.input)).not.toHaveProperty('code');
-  expect(main.panels.map((panel) => panel.component)).toEqual(['FacetRail', 'RecordTable']);
-  expect(main.panels[1].input).toEqual({
+  expect(main.panels.map((panel) => panel.component)).toEqual(['StatStrip', 'FacetRail', 'RecordTable']);
+  expect(main.panels[2].input).toEqual({
     signal: 'logs',
     where: [{ column: 'service_name', value: 'support-desk' }],
     where_sql: 'severity_number >= 17',

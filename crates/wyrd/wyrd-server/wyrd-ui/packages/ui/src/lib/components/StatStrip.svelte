@@ -18,6 +18,8 @@
     errors: 'Error spans',
     duration_p95: 'p95 duration',
     invocations: 'Agent invocations',
+    logs: 'Log records',
+    log_errors: 'Error logs',
     tokens: 'Tokens',
     calls: 'Gateway calls',
     cost: 'Cost'

@@ -156,3 +156,57 @@ test('authenticated traces and spans', async ({ ui }) => {
   await viewer.goto(`${observe}?from=${RANGE.from}&to=${RANGE.to}`);
   await expect.poll(() => viewer.locator('[data-panel="list"]').textContent()).toContain('WYRD_PERMISSION_403_DENIED_RBAC');
 });
+
+test('authenticated logs investigation', async ({ ui }) => {
+  const page = await signIn(ui.browser, ui.base, TENANT, ui.adminKey);
+  const logs = `${ui.base}/t/${TENANT}/observe?signal=logs&from=${RANGE.from}&to=${RANGE.to}`;
+  await page.goto(logs);
+  const list = page.locator('[data-panel="list"]');
+
+  // The recorded record of this tenant only, with its recorded severity, and a timeline under the same filters.
+  await expect.poll(() => list.textContent(), { timeout: 30_000 }).toContain('search timed out');
+  expect(await list.textContent()).toContain('ERROR');
+  expect(await list.textContent()).not.toContain('foreign-agent');
+  await expect.poll(() => page.locator('[data-panel="overview"]').textContent()).toMatch(/Log records\s*1.*Error logs\s*1/s);
+
+  // Severity facets filter the timeline and the records alike.
+  await page.locator('[data-panel="facets"]').getByRole('button', { name: /ERROR/ }).click();
+  await expect.poll(() => new URL(page.url()).searchParams.get('where')).toBe(JSON.stringify([{ column: 'severity_text', value: 'ERROR' }]));
+  await expect.poll(() => list.locator('tbody tr').count()).toBe(1);
+
+  // Wrap, columns and paging are reader controls over the rows already read.
+  await list.getByRole('button', { name: 'Wrap lines' }).click();
+  expect(await list.getByRole('button', { name: 'Wrap lines' }).getAttribute('aria-pressed')).toBe('true');
+  await list.locator('summary', { hasText: 'Columns' }).click();
+  await list.locator('label[title="body_text"] input').uncheck();
+  expect(await list.locator('th[title="body_text"]').count()).toBe(0);
+  await list.locator('label[title="body_text"] input').check();
+  expect(await list.getByRole('navigation', { name: 'Pages' }).getByRole('combobox').inputValue()).toBe('50');
+
+  // The record opens by its exact identity, with its body and recorded fields.
+  await list.locator('tbody tr').first().click();
+  const drawer = page.getByRole('dialog', { name: 'Log record' });
+  await expect.poll(() => drawer.textContent(), { timeout: 30_000 }).toContain('search timed out');
+  expect(JSON.parse(new URL(page.url()).searchParams.get('log') ?? '{}')).toMatchObject({ wyrd_request_id: expect.any(String) });
+
+  // Open trace leaves Logs in history; Back returns to the same record.
+  const opened = page.url();
+  await drawer.getByRole('button', { name: /Open trace/ }).click();
+  await expect.poll(() => new URL(page.url()).searchParams.get('trace')).toBe(TRACE);
+  expect(new URL(page.url()).searchParams.get('signal')).toBeNull();
+  await expect.poll(() => page.getByRole('dialog', { name: 'Trace' }).getByRole('treeitem').count(), { timeout: 30_000 }).toBe(3);
+  await page.goBack();
+  await page.waitForURL(opened);
+  await expect.poll(() => page.getByRole('dialog', { name: 'Log record' }).textContent()).toContain('search timed out');
+
+  // A detail field filters or excludes into WHERE; excluding the only service leaves a truthful empty list.
+  await page.getByRole('dialog', { name: 'Log record' }).getByRole('button', { name: 'Exclude' }).click();
+  await expect.poll(() => JSON.parse(new URL(page.url()).searchParams.get('where') ?? '[]')).toContainEqual({ column: 'service_name', value: 'ui-agent', not: true });
+  await expect.poll(() => list.textContent()).toContain('No rows in bifrost.logs.records');
+  expect(new URL(page.url()).searchParams.has('log')).toBe(false);
+
+  // A principal holding no role sees the Logs panels denied with their stable code.
+  const viewer = await signIn(ui.browser, ui.base, TENANT, ui.readerKey);
+  await viewer.goto(logs);
+  await expect.poll(() => viewer.locator('[data-panel="overview"]').textContent()).toContain('WYRD_PERMISSION_403_DENIED_RBAC');
+});

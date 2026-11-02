@@ -735,7 +735,7 @@
       ]
     },
     "StatStrip": {
-      "description": "One to five recorded numbers with a sparkline each, from built-in reads of bifrost.traces.spans and bifrost.gateway.calls, optionally scoped to one workload_card_uid or subject_card_uid.",
+      "description": "One to five recorded numbers with a sparkline each, from built-in reads of bifrost.traces.spans, bifrost.logs.records and bifrost.gateway.calls, optionally scoped to one workload_card_uid or subject_card_uid.",
       "input": {
         "$schema": "https://json-schema.org/draft/2020-12/schema",
         "type": "object",
@@ -752,6 +752,8 @@
                 "errors",
                 "duration_p95",
                 "invocations",
+                "logs",
+                "log_errors",
                 "tokens",
                 "calls",
                 "cost"

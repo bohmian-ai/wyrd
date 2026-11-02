@@ -9,6 +9,7 @@ import { bucketFor, chartParams, resolveRange, type LoadContext } from './loader
 import { columnIndex } from './plot.js';
 import {
   SIGNALS,
+  logStats,
   type AbsoluteRange,
   type FacetRailInput,
   type Filter,
@@ -165,6 +166,9 @@ const STAT_SOURCES: Record<Stat, { table: string; time: string; value: string; f
   errors: { table: SIGNALS.spans.table, time: SIGNALS.spans.time, value: 'count(*)', filter: `status_code = ${STATUS_ERROR}` },
   duration_p95: { table: SIGNALS.spans.table, time: SIGNALS.spans.time, value: 'approx_percentile_cont(duration_nano, 0.95)', roots: true },
   invocations: { table: SIGNALS.spans.table, time: SIGNALS.spans.time, value: 'count(*)', filter: "gen_ai_operation_name = 'invoke_agent'" },
+  logs: { table: SIGNALS.logs.table, time: SIGNALS.logs.time, value: 'count(*)' },
+  // OTLP severity numbers 17-24 are ERROR and FATAL; the recorded number decides, never the text or a name.
+  log_errors: { table: SIGNALS.logs.table, time: SIGNALS.logs.time, value: 'count(*)', filter: 'severity_number >= 17' },
   // The gateway's metered usage: one row per call and usage entry, counting only token units, so
   // nested spans never count one call twice. Null, never zero, when no call recorded any.
   tokens: {
@@ -181,13 +185,13 @@ const STAT_SOURCES: Record<Stat, { table: string; time: string; value: string; f
 /** The total and per-bucket reads of one stat. */
 export function statQueries(stat: Stat, input: StatStripInput, range: AbsoluteRange, bucket: string, predicate?: string): [Executed, Executed] {
   const source = STAT_SOURCES[stat];
-  const span = source.table === SIGNALS.spans.table;
+  const filtered = source.table === SIGNALS.spans.table || source.table === SIGNALS.logs.table;
   const plan = (series: boolean) => {
     const binds = Binds.over(source.time, range);
     const bin = series ? `date_bin(${binds.bind(bucket)}::interval, ${source.time})` : '';
     if (source.filter) binds.clauses.push(source.filter);
     if (input.scope) binds.clauses.push(`${input.scope.column} = ${binds.bind(input.scope.uid)}`);
-    if (span) binds.where(input.where).predicate(predicate);
+    if (filtered) binds.where(input.where).predicate(predicate);
     if (source.roots) binds.roots(source.table);
     const currency = source.byCurrency ? ', currency' : '';
     const sql = series
@@ -202,7 +206,7 @@ export function statQueries(stat: Stat, input: StatStripInput, range: AbsoluteRa
 export async function loadStatStrip(input: StatStripInput, context: LoadContext): Promise<StatStripProps> {
   const range = rangeOf(input.range, context);
   if ('code' in range) return { input, result: { state: 'error', problem: range } };
-  const predicate = await predicateFor(SIGNALS.spans.table, input.where_sql, context);
+  const predicate = await predicateFor(SIGNALS[logStats(input.stats) ? 'logs' : 'spans'].table, input.where_sql, context);
   if ('state' in predicate) return { input, result: predicate };
   const plans = input.stats.map((stat) => statQueries(stat, input, range, bucketFor(range), predicate.sql));
   const results = await context.executor.run(plans.flatMap(([total, series]) => [query(total.sql, total.params), query(series.sql, series.params)]), context.signal);

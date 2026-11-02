@@ -710,3 +710,134 @@ async fn subject_actor_rows_and_reserved_columns() {
         .expect_err("another tenant cannot read the table");
     deployment.shutdown().await;
 }
+
+/// A predicate over a table's own columns comes back normalized; any other
+/// shape, a column the table lacks, or one past 8 KiB is invalid SQL; an
+/// ungranted table is refused without naming its columns; and another
+/// tenant's caller cannot see the table at all.
+///
+/// # Panics
+/// Panics when an outcome differs from the one described.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires the repository-managed Postgres journey lifecycle"]
+async fn predicates_are_typed_bounded_and_tenant_scoped() {
+    let (deployment, admin) = live().await;
+    let (namespace, name) = ("bifrost.datasets", "query_rows");
+    let code =
+        |error: wyrd_ai::bifrost::BifrostClientError| WyrdError::from(error).code().to_owned();
+
+    for (expression, normalized) in [
+        ("id >= 2 and value like 't%'", "id >= 2 AND value LIKE 't%'"),
+        ("run_id is not null", "run_id IS NOT NULL"),
+        (
+            "id in (1, 3) or value between 'a' and 'p'",
+            "id IN (1, 3) OR value BETWEEN 'a' AND 'p'",
+        ),
+        ("  ", ""),
+    ] {
+        assert_eq!(
+            admin
+                .validate_predicate(namespace, name, expression)
+                .await
+                .expect(expression),
+            normalized
+        );
+    }
+    let over = format!("id = 1 AND value = '{}'", "x".repeat(8 * 1024));
+    for expression in [
+        "id = 1; DROP TABLE query_rows",
+        "id IN (SELECT id FROM bifrost.datasets.query_rows)",
+        "id = $1",
+        "id = 1 -- comment",
+        "verdict = 'passed'",
+        "upper(value) = 'ONE'",
+        over.as_str(),
+    ] {
+        let refused = admin
+            .validate_predicate(namespace, name, expression)
+            .await
+            .expect_err(expression);
+        assert_eq!(
+            code(refused),
+            "WYRD_VALA_400_QUERY_INVALID_SQL",
+            "{expression}"
+        );
+    }
+
+    let datasets_only = json!({
+        "resource": "bifrost_query",
+        "action": "read",
+        "scope": { "bifrost": { "schema": { "catalog": "bifrost", "schema": "datasets" } } },
+    });
+    deployment
+        .server()
+        .seed_role("datasets_reader", &[datasets_only])
+        .await
+        .expect("role seeds");
+    let reader = Bifrost::connect_with(
+        &deployment.client(
+            &deployment
+                .key("datasets_reader", &["datasets_reader"])
+                .await,
+        ),
+        BifrostOptions::default(),
+    )
+    .await
+    .expect("Bifrost connects");
+    assert_eq!(
+        reader
+            .validate_predicate(namespace, name, "id = 1")
+            .await
+            .expect("the granted table validates"),
+        "id = 1"
+    );
+    let refused = WyrdError::from(
+        reader
+            .validate_predicate("bifrost.verification", "results", "verdcit = 'passed'")
+            .await
+            .expect_err("the ungranted table is refused"),
+    );
+    let message = refused.to_string();
+    assert_eq!(refused.code(), "WYRD_VALA_403_QUERY_FORBIDDEN", "{message}");
+    assert!(
+        !message.contains("verdict") && !message.contains("verdcit"),
+        "{message}"
+    );
+
+    let denied = Bifrost::connect_with(
+        &deployment.client(
+            &deployment
+                .scoped_key("predicate_denied", &["cards:read"])
+                .await,
+        ),
+        BifrostOptions::default(),
+    )
+    .await
+    .expect("Bifrost connects");
+    assert_eq!(
+        code(
+            denied
+                .validate_predicate(namespace, name, "id = 1")
+                .await
+                .expect_err("refused")
+        ),
+        "WYRD_PERMISSION_403_DENIED_RBAC"
+    );
+
+    let other = Bifrost::connect_with(
+        &deployment.client(&deployment.other_tenant_admin("predicate_other").await),
+        BifrostOptions::default(),
+    )
+    .await
+    .expect("Bifrost connects");
+    assert_eq!(
+        code(
+            other
+                .validate_predicate(namespace, name, "id = 1")
+                .await
+                .expect_err("unseen")
+        ),
+        "WYRD_VALA_404_BIFROST_TABLE_NOT_FOUND"
+    );
+    deployment.shutdown().await;
+}

@@ -1260,6 +1260,181 @@ mod pg_tests {
         Ok(())
     }
 
+    /// An agent checks a `WHERE` filter with `bifrost.validate_predicate`
+    /// before using it.
+    ///
+    /// A predicate over the table's own columns comes back normalized;
+    /// another shape, an unknown column, or one past 8 KiB is invalid SQL;
+    /// malformed arguments are MCP invalid params; a table outside the
+    /// agent's grant is refused without naming its columns; gateway payload
+    /// columns need the payload grant; another tenant cannot see the table.
+    ///
+    /// # Errors
+    ///
+    /// Returns fixture, MCP, or shutdown failures.
+    ///
+    /// # Panics
+    ///
+    /// Panics when an outcome differs from the one described.
+    #[tokio::test(flavor = "multi_thread")]
+    #[ignore = "requires the Postgres-backed Bifrost journey lane"]
+    async fn predicates_are_typed_bounded_and_tenant_scoped() -> Result<(), McpJourneyError> {
+        let server = WyrdTestServer::start_bound().await?;
+        let fixture = seed_query_fixture(&server, "mcp-predicates").await?;
+        let (namespace, name) = fixture
+            .table
+            .rsplit_once('.')
+            .ok_or("the fixture table is qualified")?;
+        let admin = ()
+            .serve_with_lifecycle(
+                transport(
+                    &server,
+                    ResolvedCredential::BearerToken(fixture.token.clone().into()),
+                    None,
+                )?,
+                discover(),
+            )
+            .await?;
+        let validate = |namespace: &str, name: &str, expression: &str| {
+            CallToolRequestParams::new("bifrost.validate_predicate").with_arguments(
+                serde_json::json!({"namespace": namespace, "name": name, "expression": expression})
+                    .as_object()
+                    .expect("arguments are an object")
+                    .clone(),
+            )
+        };
+
+        for (expression, normalized) in [
+            ("id >= 2 and value like 'b%'", "id >= 2 AND value LIKE 'b%'"),
+            (
+                "value in ('a', 'b') or id is null",
+                "value IN ('a', 'b') OR id IS NULL",
+            ),
+            ("", ""),
+        ] {
+            let result = structured(
+                admin
+                    .call_tool(validate(namespace, name, expression))
+                    .await?,
+            )?;
+            assert_eq!(
+                result,
+                serde_json::json!({ "expression": normalized }),
+                "{expression}"
+            );
+        }
+        let over = format!("value = '{}'", "x".repeat(8 * 1024));
+        for expression in [
+            "id = 1; DELETE FROM t",
+            "id IN (SELECT id FROM bifrost.traces.spans)",
+            "id = $1",
+            "id = 1 /* c */",
+            "verdict = 'passed'",
+            over.as_str(),
+        ] {
+            let refusal = problem(
+                admin
+                    .call_tool(validate(namespace, name, expression))
+                    .await?,
+            )?;
+            assert_eq!(
+                refusal["code"], "WYRD_VALA_400_QUERY_INVALID_SQL",
+                "{expression}"
+            );
+        }
+        for arguments in [
+            serde_json::json!({"namespace": namespace, "name": name}),
+            serde_json::json!({"namespace": namespace, "name": name, "expression": "id = 1", "sql": "x"}),
+        ] {
+            let error = admin
+                .call_tool(
+                    CallToolRequestParams::new("bifrost.validate_predicate").with_arguments(
+                        arguments
+                            .as_object()
+                            .expect("arguments are an object")
+                            .clone(),
+                    ),
+                )
+                .await
+                .expect_err("malformed arguments are refused");
+            assert!(
+                matches!(error, ServiceError::McpError(ref error) if error.code == ErrorCode::INVALID_PARAMS),
+                "{error}"
+            );
+        }
+
+        let logs_only: Permission = serde_json::from_value(serde_json::json!({
+            "resource": "bifrost_query",
+            "action": "read",
+            "scope": { "bifrost": { "schema": { "catalog": "bifrost", "schema": "logs" } } },
+        }))?;
+        let scoped = agent_with_permissions(&server, "mcp_logs_reader", &[logs_only]).await?;
+        structured(
+            scoped
+                .call_tool(validate("bifrost.logs", "records", "severity_number >= 17"))
+                .await?,
+        )?;
+        let refusal = problem(
+            scoped
+                .call_tool(validate(namespace, name, "valeu = 'a'"))
+                .await?,
+        )?;
+        assert_eq!(refusal["code"], "WYRD_VALA_403_QUERY_FORBIDDEN");
+        let text = refusal.to_string();
+        assert!(!text.contains("value") && !text.contains("valeu"), "{text}");
+
+        let metadata = agent_with_permissions(
+            &server,
+            "mcp_predicate_metadata",
+            &[Permission::bifrost_query_read()],
+        )
+        .await?;
+        let payload = agent_with_permissions(
+            &server,
+            "mcp_predicate_payload",
+            &[
+                Permission::bifrost_query_read(),
+                Permission::gateway_payload_read(),
+            ],
+        )
+        .await?;
+        let on_payload = validate("bifrost.gateway", "calls", "request_payload IS NOT NULL");
+        let refusal = problem(metadata.call_tool(on_payload.clone()).await?)?;
+        assert_eq!(refusal["code"], "WYRD_VALA_400_QUERY_INVALID_SQL");
+        structured(
+            metadata
+                .call_tool(validate("bifrost.gateway", "calls", "run_id IS NOT NULL"))
+                .await?,
+        )?;
+        structured(payload.call_tool(on_payload).await?)?;
+
+        let tenant = server.seed_tenant("mcp-predicates-other").await?;
+        let other = server
+            .bootstrap_service_in_tenant(tenant, "mcp_predicates_other", &["admin"])
+            .await?;
+        let other_token = server
+            .exchange_api_key(other.api_key().ok_or("a service carries a key")?)
+            .await?;
+        let other = ()
+            .serve_with_lifecycle(
+                transport(
+                    &server,
+                    ResolvedCredential::BearerToken(other_token.into()),
+                    None,
+                )?,
+                discover(),
+            )
+            .await?;
+        let refusal = problem(other.call_tool(validate(namespace, name, "id = 1")).await?)?;
+        assert_eq!(refusal["code"], "WYRD_VALA_404_BIFROST_TABLE_NOT_FOUND");
+
+        for agent in [admin, scoped, metadata, payload, other] {
+            agent.cancel().await?;
+        }
+        server.shutdown().await?;
+        Ok(())
+    }
+
     /// Connect one MCP client whose principal holds exactly `permissions`.
     ///
     /// # Errors

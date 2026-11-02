@@ -44,8 +44,9 @@
     return Number.isNaN(ms) ? undefined : ms;
   }
 
-  /** An instant as `YYYY-MM-DD HH:MM:SS` in `zone`. */
+  /** An instant as `YYYY-MM-DD HH:MM:SS` in `zone`; an unreadable one reads as such. */
   export function zonedText(ms: number, zone: Zone): string {
+    if (Number.isNaN(ms)) return 'invalid time';
     const date = new Date(zone === 'utc' ? ms : ms - new Date(ms).getTimezoneOffset() * 60_000);
     return date.toISOString().slice(0, 19).replace('T', ' ');
   }

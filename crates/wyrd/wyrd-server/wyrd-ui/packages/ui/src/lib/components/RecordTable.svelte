@@ -152,15 +152,17 @@
   /** The columns Columns offers: every column of the signal when the host reads the choice, else the read ones. */
   const offeredColumns = $derived(oncolumns && signal ? signalColumns(signal) : columns);
   const isShown = (column: string) => visible.includes(column);
-  function toggle(column: string) {
+  /** Show or hide `column`; false when the change was refused because no column would remain. */
+  function toggle(column: string): boolean {
     if (oncolumns && signal) {
       const next = offeredColumns.filter((each) => (each === column ? !isShown(each) : isShown(each)));
       if (next.length) oncolumns(next);
-      return;
+      return next.length > 0;
     }
     const next = new Set(hidden);
     if (!next.delete(column)) next.add(column);
     hidden = next;
+    return true;
   }
   /** The rows on screen as RFC 4180 CSV, cells as their exact returned text. */
   const csv = $derived.by(() => {
@@ -204,9 +206,8 @@
                       type="checkbox"
                       checked={isShown(column)}
                       onchange={(event) => {
-                        toggle(column);
-                        // The box shows what is listed; a host applies the choice by navigating.
-                        event.currentTarget.checked = isShown(column);
+                        // A refused change, hiding the last column, leaves the box as listed.
+                        if (!toggle(column)) event.currentTarget.checked = isShown(column);
                       }}
                     /> {heading(column)}</label>
                 {/each}

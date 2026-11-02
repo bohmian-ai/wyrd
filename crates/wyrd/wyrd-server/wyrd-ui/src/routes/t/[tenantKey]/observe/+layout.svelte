@@ -204,7 +204,7 @@
   {:else if current.signal === 'traces'}
     {#if observe.overview}
       {@const overview = observe.overview}
-      <section class="panel overview" aria-label="Overview">
+      <section class="panel overview" aria-label="Overview" data-panel="overview">
         <header>
           <p class="h">Drag across any chart to zoom all three</p>
           {#if zoomedIn && data.range}
@@ -247,25 +247,25 @@
       {@render grouping()}
     </div>
     <div class="split" class:folded={!filtersOpen}>
-      {#if filtersOpen}<div id="facets"><FacetRail {...observe.facets} {actions} onaction={onaction('FacetRail')} /></div>{/if}
-      <RecordTable {...observe.list} {actions} onaction={onaction('RecordTable')} oncolumns={(columns) => go({ ...closed(current), columns })} />
+      {#if filtersOpen}<div id="facets" data-panel="facets"><FacetRail {...observe.facets} {actions} onaction={onaction('FacetRail')} /></div>{/if}
+      <div data-panel="list"><RecordTable {...observe.list} {actions} onaction={onaction('RecordTable')} oncolumns={(columns) => go({ ...closed(current), columns })} /></div>
     </div>
     {@render children()}
   {:else if current.signal === 'logs'}
     {#if observe.timeline}
-      <section class="panel" aria-label="Timeline">
+      <section class="panel" aria-label="Timeline" data-panel="timeline">
         <Chart {...observe.timeline} bars colors={LEVELS} {actions} onaction={onaction('Chart')} />
       </section>
     {/if}
     <div class="listbar">{@render grouping()}</div>
     <div class="split">
-      <FacetRail {...observe.facets} {actions} onaction={onaction('FacetRail')} />
-      <RecordTable {...observe.list} {actions} onaction={onaction('RecordTable')} oncolumns={(columns) => go({ ...closed(current), columns })} />
+      <div data-panel="facets"><FacetRail {...observe.facets} {actions} onaction={onaction('FacetRail')} /></div>
+      <div data-panel="list"><RecordTable {...observe.list} {actions} onaction={onaction('RecordTable')} oncolumns={(columns) => go({ ...closed(current), columns })} /></div>
     </div>
     {@render children()}
   {:else}
     <div class="metrics">
-      <aside class="panel rail" aria-label="Metrics">
+      <aside class="panel rail" aria-label="Metrics" data-panel="metrics">
         <input class="find" type="search" bind:value={find} placeholder="find a metric…" aria-label="Find a metric" />
         {#each [['service_name', 'Service'], ['subject_card_uid', 'Card']] as const as [column, label] (column)}
           <label class="h">
@@ -295,7 +295,7 @@
       <div class="main">
         {#if view?.series}
           {@const series = view.series}
-          <section class="panel">
+          <section class="panel" data-panel="series">
             <header class="metric">
               <div>
                 <h2>{metric}</h2>
@@ -313,6 +313,7 @@
               <label class="by">
                 by
                 <select
+                  aria-label="Group series by"
                   value={current.by ?? ''}
                   disabled={!current.agg}
                   title={current.agg ? undefined : 'Choose an aggregation to group by'}
@@ -336,7 +337,7 @@
         {:else}
           <EmptyState state="empty" title="Choose a metric" detail="Pick a metric on the left to plot its recorded series." />
         {/if}
-        <RecordTable {...observe.list} {actions} onaction={onaction('RecordTable')} oncolumns={(columns) => go({ ...closed(current), columns })} />
+        <div data-panel="list"><RecordTable {...observe.list} {actions} onaction={onaction('RecordTable')} oncolumns={(columns) => go({ ...closed(current), columns })} /></div>
       </div>
     </div>
   {/if}
@@ -345,7 +346,7 @@
 {#snippet grouping()}
   <label class="by">
     Group by
-    <select value={current.group ?? ''} onchange={(event) => go({ ...closed(current), group: event.currentTarget.value || undefined })}>
+    <select aria-label="Group by" value={current.group ?? ''} onchange={(event) => go({ ...closed(current), group: event.currentTarget.value || undefined })}>
       <option value="">none</option>
       {#each groupColumns(current) as column (column)}<option value={column}>{columnLabel(column)}</option>{/each}
     </select>

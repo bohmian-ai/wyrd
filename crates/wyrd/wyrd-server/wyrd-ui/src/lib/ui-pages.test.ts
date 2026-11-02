@@ -148,6 +148,7 @@ test('observe signal planning and interactions', async () => {
   expect(presetLabel('1h')).toBe('Last 1 hour');
   expect(presetLabel('30d')).toBe('Last 30 days');
   expect(rangeLabel({ from: '2026-10-13T19:02:10Z', to: '2026-10-13T19:14:40Z' }, 'utc')).toBe('19:02:10 → 19:14:40');
+  expect(rangeLabel({ from: '2026-10-13T19:02:10Z', to: 'yesterday' }, 'utc')).toBe('2026-10-13 19:02 → invalid time');
 
   // The list load never reads the open record's params, so opening one reloads nothing else.
   const withRecord = new URLSearchParams(writeState({ ...state, trace: 'a'.repeat(32), span: 'b'.repeat(16) }));

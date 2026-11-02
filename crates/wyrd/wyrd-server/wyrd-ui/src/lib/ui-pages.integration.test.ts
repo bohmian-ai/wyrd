@@ -80,29 +80,52 @@ const test = serverTest().extend<{ ui: { base: string; browser: Browser; adminKe
   ]
 });
 
+/** The server-rendered HTML of `url` in `page`'s session, before any script runs. */
+async function serverHtml(page: Page, url: string): Promise<string> {
+  const response = await page.request.get(url);
+  expect(response.status()).toBe(200);
+  return response.text();
+}
+
 test('authenticated traces and spans', async ({ ui }) => {
   const page = await signIn(ui.browser, ui.base, TENANT, ui.adminKey);
   const observe = `${ui.base}/t/${TENANT}/observe`;
+  const signals = page.getByRole('navigation', { name: 'Signal' });
 
-  // The shell links Observe; Traces is the default signal.
-  await page.getByRole('navigation', { name: 'Primary' }).getByRole('link', { name: 'Observe' }).click();
+  // The rail links Observe; Traces is the default signal; undelivered destinations stay visible and disabled.
+  const rail = page.getByRole('navigation', { name: 'Destinations' });
+  await rail.getByRole('link', { name: 'Observe' }).click();
   await page.waitForURL(observe);
-  await expect.poll(() => page.getByRole('link', { name: 'Traces' }).getAttribute('aria-current')).toBe('page');
+  await expect.poll(() => signals.getByRole('link', { name: 'Traces' }).getAttribute('aria-current')).toBe('page');
+  expect(await rail.locator('[aria-disabled="true"]', { hasText: 'Verify' }).count()).toBe(1);
+  expect(await page.getByRole('button', { name: /Find or ask/ }).isDisabled()).toBe(true);
 
-  // Trace roots of this tenant only, with the overview and facets under the same range.
-  await page.goto(`${observe}?from=${RANGE.from}&to=${RANGE.to}`);
+  // The first HTML response already carries this tenant's evidence: no script runs the initial reads.
+  const ranged = `${observe}?from=${RANGE.from}&to=${RANGE.to}`;
+  const html = await serverHtml(page, ranged);
+  expect(html).toContain('invoke_agent support');
+  expect(html).toContain('Drag across any chart to zoom all three');
+  expect(html).not.toContain('foreign-agent');
+
+  // Trace roots of this tenant only, with the three overview charts and facets under the same range.
+  await page.goto(ranged);
   const list = page.locator('[data-panel="list"]');
+  const overview = page.locator('[data-panel="overview"]');
   await expect.poll(() => list.textContent(), { timeout: 30_000 }).toContain('invoke_agent support');
   expect(await list.textContent()).not.toContain('foreign-agent');
-  await expect.poll(() => page.locator('[data-panel="overview"]').textContent()).toMatch(/Traces\s*1/);
+  expect(await overview.getByRole('region').count()).toBe(3);
+  await expect.poll(() => overview.textContent()).toMatch(/1 traces/);
   expect(await list.locator('tbody tr').count()).toBe(1);
 
-  // All spans lists every span of the trace.
-  await page.getByRole('link', { name: 'All spans' }).click();
+  // Spans lists every span of the trace.
+  await page.getByRole('group', { name: 'Rows' }).getByRole('link', { name: 'Spans' }).click();
   await expect.poll(() => list.locator('tbody tr').count()).toBe(3);
   expect(new URL(page.url()).searchParams.get('mode')).toBe('spans');
 
-  // A facet value becomes a shareable WHERE clause.
+  // Filters fold and unfold; a facet value becomes a shareable WHERE clause.
+  await page.getByRole('button', { name: /^Filters/ }).click();
+  expect(await page.locator('[data-panel="facets"]').count()).toBe(0);
+  await page.getByRole('button', { name: /^Filters/ }).click();
   await page.locator('[data-panel="facets"]').getByRole('button', { name: /chat ranker/ }).click();
   await expect.poll(() => new URL(page.url()).searchParams.get('where')).toBe(JSON.stringify([{ column: 'name', value: 'chat ranker' }]));
   await expect.poll(() => list.locator('tbody tr').count()).toBe(1);
@@ -112,22 +135,23 @@ test('authenticated traces and spans', async ({ ui }) => {
   // An invalid draft is refused with its stable code and never replaces the applied view.
   const before = page.url();
   await page.getByLabel('WHERE').fill('no_such_column = 1');
-  await page.getByRole('button', { name: 'Apply' }).last().click();
+  await page.getByLabel('WHERE').press('Enter');
   await expect.poll(() => page.getByRole('alert').textContent()).toContain('WYRD_VALA_400_QUERY_INVALID_SQL');
   expect(page.url()).toBe(before);
   expect(await list.locator('tbody tr').count()).toBe(3);
   // A valid draft is applied in its server-normalized form.
   await page.getByLabel('WHERE').fill('status_code=2');
-  await page.getByRole('button', { name: 'Apply' }).last().click();
+  await page.getByLabel('WHERE').press('Enter');
   await expect.poll(() => new URL(page.url()).searchParams.get('where_sql')).toBe('status_code = 2');
   await expect.poll(() => list.locator('tbody tr').count()).toBe(1);
   expect(await list.textContent()).toContain('execute_tool search');
 
-  // Opening the span shows the exact trace and its detail; the state survives reload.
+  // Opening the span shows the exact trace and its detail, server-rendered too; the state survives reload.
   await list.locator('tbody tr').first().click();
   const drawer = page.getByRole('dialog', { name: 'Trace' });
   await expect.poll(() => drawer.getByRole('tree').getByRole('treeitem').count(), { timeout: 30_000 }).toBe(3);
   expect(new URL(page.url()).searchParams.get('trace')).toBe(TRACE);
+  expect(await serverHtml(page, page.url())).toContain('role="treeitem"');
   await page.reload();
   await expect.poll(() => page.getByRole('dialog', { name: 'Trace' }).getByRole('tab').count()).toBeGreaterThan(0);
   await page.getByRole('button', { name: 'Close Trace' }).click();
@@ -145,65 +169,108 @@ test('authenticated traces and spans', async ({ ui }) => {
   await page.getByRole('link', { name: '← Back to Observe' }).click();
   await page.waitForURL(observed);
 
+  // Zoom halves the applied range around its centre for every panel; Back and reload restore the committed range.
+  await page.getByRole('button', { name: 'Zoom in' }).click();
+  await expect.poll(() => new URL(page.url()).searchParams.get('from')).toBe('2026-10-19T03:00:00.000Z');
+  expect(new URL(page.url()).searchParams.get('to')).toBe('2026-10-19T09:00:00.000Z');
+  await expect.poll(() => overview.getByRole('button', { name: 'Reset zoom' }).textContent()).toContain('03:00:00 – 09:00:00');
+  await page.reload();
+  expect(new URL(page.url()).searchParams.get('from')).toBe('2026-10-19T03:00:00.000Z');
+  await page.goBack();
+  await page.waitForURL(observed);
+
+  // The time picker commits a preset or a validated custom range, in the chosen zone.
+  const picker = page.getByRole('button', { name: /^Time range/ });
+  await picker.click();
+  const dialog = page.getByRole('dialog', { name: 'Time range' });
+  await dialog.getByLabel('From').fill('yesterday-ish');
+  await dialog.getByRole('button', { name: 'Apply range' }).click();
+  await expect.poll(() => dialog.getByRole('alert').textContent()).toContain('From is not');
+  expect(page.url()).toBe(observed);
+  await dialog.getByLabel('From').fill('2026-10-19 01:00');
+  await dialog.getByLabel('To').fill('2026-10-19T11:00:00Z');
+  await dialog.getByRole('button', { name: 'Apply range' }).click();
+  await expect.poll(() => new URL(page.url()).searchParams.get('from')).toBe('2026-10-19T01:00:00.000Z');
+  expect(new URL(page.url()).searchParams.get('to')).toBe('2026-10-19T11:00:00.000Z');
+  await expect.poll(() => list.locator('tbody tr').count()).toBe(1);
+  await picker.click();
+  await dialog.getByRole('button', { name: 'Last 6 hours' }).click();
+  await expect.poll(() => new URL(page.url()).searchParams.get('last')).toBe('6h');
+  expect(new URL(page.url()).searchParams.has('from')).toBe(false);
+  await picker.click();
+  await expect.poll(() => dialog.textContent()).toContain('01:00:00 → 11:00:00');
+  await dialog.press('Escape');
+  await page.goBack();
+  await expect.poll(() => list.locator('tbody tr').count()).toBe(1);
+
   // Live holds what is on screen while it is read.
-  await page.getByLabel('Live').check();
+  await page.getByRole('button', { name: 'Live' }).click();
   await expect.poll(() => new URL(page.url()).searchParams.get('live')).toBe('1');
   await expect.poll(() => list.getByRole('status').textContent()).toMatch(/Live/);
 
   // An empty range is truthful, not blank.
   await page.goto(`${observe}?from=2026-10-18T00:00:00.000Z&to=2026-10-18T12:00:00.000Z`);
   await expect.poll(() => list.textContent()).toContain('No root spans in bifrost.traces.spans');
+  // A malformed range is refused with its field, before any read.
+  expect(await serverHtml(page, `${observe}?from=2026-10-19T00:00:00Z&to=yesterday`)).toContain('WYRD_SPEC_400_VALIDATION');
 
-  // A principal holding no role sees each panel denied with its stable code.
+  // A principal holding no role sees each panel denied with its stable code, in the first response.
   const viewer = await signIn(ui.browser, ui.base, TENANT, ui.readerKey);
-  await viewer.goto(`${observe}?from=${RANGE.from}&to=${RANGE.to}`);
+  expect(await serverHtml(viewer, ranged)).toContain('WYRD_PERMISSION_403_DENIED_RBAC');
+  await viewer.goto(ranged);
   await expect.poll(() => viewer.locator('[data-panel="list"]').textContent()).toContain('WYRD_PERMISSION_403_DENIED_RBAC');
 });
 
 test('authenticated logs investigation', async ({ ui }) => {
   const page = await signIn(ui.browser, ui.base, TENANT, ui.adminKey);
   const logs = `${ui.base}/t/${TENANT}/observe?signal=logs&from=${RANGE.from}&to=${RANGE.to}`;
+  expect(await serverHtml(page, logs)).toContain('search timed out');
   await page.goto(logs);
   const list = page.locator('[data-panel="list"]');
 
-  // The recorded record of this tenant only, with its recorded severity, and a timeline under the same filters.
+  // The recorded record of this tenant only, with its recorded severity, and a severity timeline under the same filters.
   await expect.poll(() => list.textContent(), { timeout: 30_000 }).toContain('search timed out');
   expect(await list.textContent()).toContain('ERROR');
   expect(await list.textContent()).not.toContain('foreign-agent');
-  await expect.poll(() => page.locator('[data-panel="overview"]').textContent()).toMatch(/Log records\s*1.*Error logs\s*1/s);
+  const timeline = page.locator('[data-panel="timeline"]');
+  await expect.poll(() => timeline.textContent()).toMatch(/Records per/);
+  expect(await timeline.locator('table.legend tbody tr').allTextContents()).toEqual([expect.stringContaining('error')]);
 
   // Severity facets filter the timeline and the records alike.
   await page.locator('[data-panel="facets"]').getByRole('button', { name: /ERROR/ }).click();
   await expect.poll(() => new URL(page.url()).searchParams.get('where')).toBe(JSON.stringify([{ column: 'severity_text', value: 'ERROR' }]));
   await expect.poll(() => list.locator('tbody tr').count()).toBe(1);
 
-  // Wrap, columns and paging are reader controls over the rows already read.
+  // Wrap and paging are reader controls over the rows already read; Columns is kept in the URL.
   await list.getByRole('button', { name: 'Wrap lines' }).click();
   expect(await list.getByRole('button', { name: 'Wrap lines' }).getAttribute('aria-pressed')).toBe('true');
   await list.locator('summary', { hasText: 'Columns' }).click();
   await list.locator('label[title="body_text"] input').uncheck();
-  expect(await list.locator('th[title="body_text"]').count()).toBe(0);
-  await list.locator('label[title="body_text"] input').check();
+  await expect.poll(() => list.locator('th[title="body_text"]').count()).toBe(0);
+  expect(JSON.parse(new URL(page.url()).searchParams.get('columns') ?? '[]')).not.toContain('body_text');
+  await page.goBack();
+  await expect.poll(() => list.locator('th[title="body_text"]').count()).toBe(1);
   expect(await list.getByRole('navigation', { name: 'Pages' }).getByRole('combobox').inputValue()).toBe('50');
 
-  // The record opens by its exact identity, with its body and recorded fields.
+  // The record opens by its exact identity beside the list, with its body and recorded fields.
   await list.locator('tbody tr').first().click();
-  const drawer = page.getByRole('dialog', { name: 'Log record' });
-  await expect.poll(() => drawer.textContent(), { timeout: 30_000 }).toContain('search timed out');
+  const aside = page.getByRole('complementary', { name: 'Log record' });
+  await expect.poll(() => aside.textContent(), { timeout: 30_000 }).toContain('search timed out');
   expect(JSON.parse(new URL(page.url()).searchParams.get('log') ?? '{}')).toMatchObject({ wyrd_request_id: expect.any(String) });
+  expect(await serverHtml(page, page.url())).toContain('aria-label="Log record"');
 
   // Open trace leaves Logs in history; Back returns to the same record.
   const opened = page.url();
-  await drawer.getByRole('button', { name: /Open trace/ }).click();
+  await aside.getByRole('button', { name: /Open trace/ }).click();
   await expect.poll(() => new URL(page.url()).searchParams.get('trace')).toBe(TRACE);
   expect(new URL(page.url()).searchParams.get('signal')).toBeNull();
   await expect.poll(() => page.getByRole('dialog', { name: 'Trace' }).getByRole('treeitem').count(), { timeout: 30_000 }).toBe(3);
   await page.goBack();
   await page.waitForURL(opened);
-  await expect.poll(() => page.getByRole('dialog', { name: 'Log record' }).textContent()).toContain('search timed out');
+  await expect.poll(() => page.getByRole('complementary', { name: 'Log record' }).textContent()).toContain('search timed out');
 
   // A detail field filters or excludes into WHERE; excluding the only service leaves a truthful empty list.
-  await page.getByRole('dialog', { name: 'Log record' }).getByRole('button', { name: 'Exclude' }).click();
+  await page.getByRole('complementary', { name: 'Log record' }).getByRole('button', { name: 'Exclude' }).click();
   await expect.poll(() => JSON.parse(new URL(page.url()).searchParams.get('where') ?? '[]')).toContainEqual({ column: 'service_name', value: 'ui-agent', not: true });
   await expect.poll(() => list.textContent()).toContain('No rows in bifrost.logs.records');
   expect(new URL(page.url()).searchParams.has('log')).toBe(false);
@@ -211,17 +278,18 @@ test('authenticated logs investigation', async ({ ui }) => {
   // A principal holding no role sees the Logs panels denied with their stable code.
   const viewer = await signIn(ui.browser, ui.base, TENANT, ui.readerKey);
   await viewer.goto(logs);
-  await expect.poll(() => viewer.locator('[data-panel="overview"]').textContent()).toContain('WYRD_PERMISSION_403_DENIED_RBAC');
+  await expect.poll(() => viewer.locator('[data-panel="timeline"]').textContent()).toContain('WYRD_PERMISSION_403_DENIED_RBAC');
 });
 
 /** Integers past 2^53, which a JSON number cannot carry exactly. */
 const UNSAFE = ['9007199254740993', '9007199254740995'] as const;
 
 test('authenticated metrics investigation', async ({ server, ui }) => {
-  // One metric name recorded with two meanings, unsafe integers, and a histogram.
+  // One metric name recorded with two meanings and unsafe integers; every recorded structure with unsafe nested counts.
   const point = (at: string, value: Record<string, unknown>) => ({ timeUnixNano: nanos(at), ...value });
   const scope = { name: 'wyrd-ui-metrics' };
   const resource = (service: string) => ({ attributes: [{ key: 'service.name', value: { stringValue: service } }] });
+  const route = (value: string) => [{ key: 'route', value: { stringValue: value } }];
   await exportOtlp(server, ui.adminKey, '/v1/metrics', {
     resourceMetrics: [
       {
@@ -236,7 +304,12 @@ test('authenticated metrics investigation', async ({ server, ui }) => {
                 sum: {
                   aggregationTemporality: 2,
                   isMonotonic: true,
-                  dataPoints: [point('2026-10-19T04:00:00Z', { asInt: UNSAFE[0] }), point('2026-10-19T04:01:00Z', { asInt: UNSAFE[1] })]
+                  dataPoints: [
+                    point('2026-10-19T04:00:00Z', { asInt: UNSAFE[0] }),
+                    point('2026-10-19T04:01:00Z', { asInt: UNSAFE[1], exemplars: [{ timeUnixNano: nanos('2026-10-19T04:01:00Z'), asDouble: 7.5, filteredAttributes: route('/exemplar') }] }),
+                    // The same instant with another point dimension: a separate series, never summed.
+                    point('2026-10-19T04:00:00Z', { asInt: '5', attributes: route('not set') })
+                  ]
                 }
               },
               {
@@ -244,55 +317,109 @@ test('authenticated metrics investigation', async ({ server, ui }) => {
                 unit: 's',
                 histogram: {
                   aggregationTemporality: 1,
-                  dataPoints: [point('2026-10-19T04:00:00Z', { count: '3', sum: 1.5, bucketCounts: ['1', '2'], explicitBounds: [1] })]
+                  dataPoints: [point('2026-10-19T04:00:00Z', { count: '9007199254740995', sum: 1.5, bucketCounts: [UNSAFE[0], '2'], explicitBounds: [1] })]
                 }
+              },
+              {
+                name: 'ui.spread',
+                unit: 'ms',
+                exponentialHistogram: {
+                  aggregationTemporality: 2,
+                  dataPoints: [
+                    point('2026-10-19T04:00:00Z', { count: '9007199254740996', sum: 4, scale: 1, zeroCount: '0', positive: { offset: 2, bucketCounts: [UNSAFE[0], '1'] }, negative: { offset: -1, bucketCounts: ['2'] } })
+                  ]
+                }
+              },
+              {
+                name: 'ui.window',
+                unit: 'ms',
+                summary: { dataPoints: [point('2026-10-19T04:00:00Z', { count: UNSAFE[1], sum: 12.25, quantileValues: [{ quantile: 0.5, value: 3 }, { quantile: 0.99, value: 9 }] })] }
               }
             ]
           }
         ]
       },
-      { resource: resource('ui-worker'), scopeMetrics: [{ scope, metrics: [{ name: 'ui.queue', unit: 'By', gauge: { dataPoints: [point('2026-10-19T04:00:00Z', { asDouble: 2.5 })] } }] }] }
+      { resource: resource('ui-worker'), scopeMetrics: [{ scope, metrics: [{ name: 'ui.queue', unit: 'By', gauge: { dataPoints: [point('2026-10-19T04:00:00Z', { asDouble: 2.5 }), point('2026-10-19T04:01:00Z', { asInt: '100' })] } }] }] },
+      // A service recorded as the text "not set", and a resource with no service at all.
+      { resource: resource('not set'), scopeMetrics: [{ scope, metrics: [{ name: 'ui.queue', unit: 'By', gauge: { dataPoints: [point('2026-10-19T04:00:00Z', { asDouble: 1 })] } }] }] },
+      { resource: { attributes: [] }, scopeMetrics: [{ scope, metrics: [{ name: 'ui.queue', unit: 'By', gauge: { dataPoints: [point('2026-10-19T04:00:00Z', { asDouble: 2 })] } }] }] }
     ]
   });
   server.flushBifrost();
 
   const page = await signIn(ui.browser, ui.base, TENANT, ui.adminKey);
-  await page.goto(`${ui.base}/t/${TENANT}/observe?signal=metrics&from=${RANGE.from}&to=${RANGE.to}`);
+  const metrics = `${ui.base}/t/${TENANT}/observe?signal=metrics&from=${RANGE.from}&to=${RANGE.to}`;
+  await page.goto(metrics);
   const list = page.locator('[data-panel="list"]');
+  const rail = page.locator('[data-panel="metrics"]');
 
-  // Points list exact integers and recorded structures; no chart until a metric is selected.
+  // Points list exact integers; the rail lists each recorded metric with its type and unit; no chart until one is chosen.
   await expect.poll(() => list.textContent(), { timeout: 30_000 }).toContain(UNSAFE[1]);
   expect(await list.textContent()).toContain(UNSAFE[0]);
-  expect(await list.textContent()).toContain('histogram');
+  expect(await rail.getByRole('link').allTextContents()).toEqual(
+    expect.arrayContaining([expect.stringMatching(/ui\.latency\s*histogram · s/), expect.stringMatching(/ui\.queue\s*gauge · By/), expect.stringMatching(/ui\.queue\s*sum · 1/)])
+  );
   expect(await page.locator('[data-panel="series"]').count()).toBe(0);
+  await rail.getByRole('searchbox', { name: 'Find a metric' }).fill('spr');
+  expect(await rail.getByRole('link').allTextContents()).toEqual([expect.stringContaining('ui.spread')]);
+  await rail.getByRole('searchbox', { name: 'Find a metric' }).fill('');
 
-  // Selecting the metric charts one line per recorded meaning and summarizes each exactly.
-  await page.locator('[data-panel="facets"]').getByRole('button', { name: /ui\.queue/ }).click();
+  // Selecting the metric charts every recorded series apart and summarizes each exactly, in the first response too.
+  await rail.getByRole('link', { name: /ui\.queue/ }).first().click();
   const chart = page.locator('[data-panel="series"]');
-  await expect.poll(() => chart.locator('table.legend tbody tr').count(), { timeout: 30_000 }).toBe(2);
+  const legend = chart.locator('table.legend tbody tr');
+  await expect.poll(() => legend.count(), { timeout: 30_000 }).toBe(5);
   expect(await chart.textContent()).toContain('plotted as double precision');
-  const summary = page.locator('[data-panel="summary"]');
-  await expect.poll(() => summary.locator('tbody tr').count()).toBe(2);
-  const rows = await summary.locator('tbody tr').allTextContents();
-  const sum = rows.find((row) => row.includes('sum'));
-  expect(sum).toContain('cumulative');
-  expect(sum).toContain('monotonic');
-  expect(sum).toContain(UNSAFE[1]);
-  expect(sum).toContain('9007199254740994');
-  expect(rows.find((row) => row.includes('gauge'))).toContain('2.5');
+  expect(await serverHtml(page, page.url())).toContain(UNSAFE[1]);
+  const rows = await legend.allTextContents();
+  // The unsafe series: latest and max exact, mean exact decimal.
+  expect(rows.find((row) => row.includes(UNSAFE[1]))).toContain('9007199254740994');
+  // Mixed integer and double samples: max is the integer 100, mean over both.
+  expect(rows.find((row) => row.includes('ui-worker'))).toMatch(/100\s*100\s*51\.25/);
+  // Another route at the same instant stays its own series.
+  expect(rows.find((row) => row.includes('{"route":"not set"}'))).toMatch(/5\s*5\s*5/);
 
-  // Unticking a series hides its line, and grouping by a recorded dimension keeps the meanings apart.
+  // Unticking a series hides its line; the table and the chart name the same series.
+  const lines = () => chart.locator('svg.plot polyline').count();
+  expect(await lines()).toBe(5);
   await chart.getByRole('checkbox').first().uncheck();
-  await expect.poll(() => chart.textContent()).toContain('1 shown');
-  await page.getByLabel('Group by').selectOption('service_name');
-  await expect.poll(() => summary.textContent()).toContain('ui-worker');
-  expect(new URL(page.url()).searchParams.get('group')).toBe('service_name');
+  await expect.poll(() => chart.textContent()).toContain('4 shown');
+  expect(await lines()).toBe(4);
 
-  // A histogram is listed with its recorded structure and explicitly not plotted.
+  // An explicit aggregation applies once per instant; grouping keeps a recorded dimension apart; percentiles are unavailable.
+  const calculation = chart.getByRole('group', { name: 'Calculation' });
+  expect(await calculation.getByText('p90').getAttribute('aria-disabled')).toBe('true');
+  expect(await chart.getByLabel('Group series by').isDisabled()).toBe(true);
+  await calculation.getByRole('link', { name: 'max' }).click();
+  await expect.poll(() => new URL(page.url()).searchParams.get('agg')).toBe('max');
+  await expect.poll(() => legend.count()).toBe(2);
+  expect((await legend.allTextContents()).find((row) => row.includes('sum'))).toContain(UNSAFE[1]);
+  await chart.getByLabel('Group series by').selectOption('service_name');
+  await expect.poll(() => new URL(page.url()).searchParams.get('by')).toBe('service_name');
+  // An unset service and the text "not set" stay two groups.
+  await expect.poll(() => legend.count()).toBe(4);
+  // Captions name only the cells that differ; the service is the last of them.
+  const services = (await legend.locator('th[scope="row"]').allTextContents()).map((caption) => caption.trim().split(' · ').at(-1));
+  expect(services.toSorted()).toEqual(['not set', 'ui-agent', 'ui-worker', '∅']);
+
+  // Histogram, exponential histogram and summary points are listed with exact nested counts and explicitly not plotted.
+  const structures = ['metric_name', 'histogram_count', 'bucket_counts', 'explicit_bounds', 'positive_buckets', 'negative_buckets', 'summary_count', 'summary_sum', 'quantile_values', 'exemplars'];
+  await page.goto(`${metrics}&where=${encodeURIComponent(JSON.stringify([{ column: 'metric_name', value: 'ui.latency' }]))}&columns=${encodeURIComponent(JSON.stringify(structures))}`);
+  await expect.poll(() => chart.textContent(), { timeout: 30_000 }).toContain('No gauge or sum point of ui.latency');
+  await expect.poll(() => list.textContent()).toContain(`["${UNSAFE[0]}","2"]`);
+  expect(await list.textContent()).toContain('9007199254740995');
   await page.getByRole('link', { name: 'Remove metric_name' }).click();
-  await page.locator('[data-panel="facets"]').getByRole('button', { name: /ui\.latency/ }).click();
-  await expect.poll(() => page.locator('[data-panel="series"]').textContent(), { timeout: 30_000 }).toContain('gauge and sum points only');
-  await expect.poll(() => list.textContent()).toContain('[1,2]');
+  await expect.poll(() => list.textContent()).toContain(`"bucket_counts":["${UNSAFE[0]}","1"]`);
+  const all = await list.textContent();
+  expect(all).toContain('"offset":-1');
+  expect(all).toContain(UNSAFE[1]);
+  expect(all).toContain('12.25');
+  expect(all).toContain('0.99');
+  expect(all).toContain('/exemplar');
+  // Revealing one more structure goes through Columns into the URL.
+  await list.locator('summary', { hasText: 'Columns' }).click();
+  await list.locator('label[title="exponential_zero_count"] input').check();
+  await expect.poll(() => JSON.parse(new URL(page.url()).searchParams.get('columns') ?? '[]')).toContain('exponential_zero_count');
 });
 
 /** The repository root, where `mise run dev:full` runs. */

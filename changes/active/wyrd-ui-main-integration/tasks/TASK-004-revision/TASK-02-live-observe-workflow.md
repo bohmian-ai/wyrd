@@ -513,5 +513,41 @@ ordinary local service recovery stay implementation-owned.
 
 ## Execution Evidence
 
-Planning only. Existing code/evidence is preserved, but this task has no recorded
-implementation, batch, browser, independent-review PASS or human acceptance.
+Implementation `4a7633111..bb524ffc9` on `task/wyrd-ui-main-integration/TASK-004`.
+Independent review and human acceptance are still pending.
+
+| Acceptance criterion | Implementation evidence | Verification evidence | Result |
+|---|---|---|---|
+| REQ-038; AC-021: canonical source, current production wheel, batch accounting, retained signals | `mise.toml` `dev:full`/`dev:batch`; `scripts/dev/example-app.sh`; `scripts/dev/wyrd-example-py.patch` | V2 `test_batch_reports_all_outcomes_and_retained_signals` | PASS |
+| REQ-038: one command reaches readiness, appended batch, Ctrl-C cleanup | `src/lib/ui-pages.integration.test.ts` `development environment lifecycle` | V1: refused before startup, because 8080/3000/8000 are held by an unrelated local service (`gif-guard-demo` wyrd-server 0.4.1, its UI, uvicorn) | NOT RUN |
+| REQ-040; AC-023: permission-first fragment validation on every surface | `wyrd-server/src/query/{service,routes,floor}.rs`, `mcp/bifrost.rs`, `wyrd-client` Bifrost, Python/TS SDKs | V10, V11, V12, V13 `predicates_are_typed_bounded_and_tenant_scoped` | PASS |
+| REQ-040: same predicate across charts/facets/list, no dependent read after refusal | `packages/ui/src/lib/observe.ts::predicateFor`; `schemas.ts` `where_sql` | V3 `observe signal planning and interactions` | PASS |
+| REQ-007/021/039; AC-022: shell, Observe tabs, URL state, drawer, Query inspector | `src/lib/observe-host.ts`; `routes/t/[tenantKey]/{observe,query}/`; `+layout.svelte` nav | V3; V4 `authenticated traces and spans` | PASS |
+| REQ-015/022/023/028; AC-008/017/018: roots vs spans, exact trace, invalid draft unapplied, denial, empty | Observe host, `RecordTable` `record.open_in_query` | V4 (production `node build` BFF, Chromium, real server) | PASS |
+| REQ-016; AC-008/018: Logs timeline/severity, wrap/columns/paging, detail, Exclude into WHERE, Open trace and Back | `STATS` `logs`/`log_errors`; host Logs view | V3; V5 `authenticated logs investigation` | PASS |
+| REQ-017; AC-008/018: Metrics series per recorded meaning, exact Latest/Max/Mean, unsafe integers, histogram listed and not plotted | `observe.ts::metricPanels`, exact `CAST … AS VARCHAR` projection; observe `+page.server.ts` predicate load | V3; V6 `authenticated metrics investigation` (mean `9007199254740994` from real SQL) | PASS |
+| Shared Observe regressions | Moved OTLP seeding to `src/lib/ui-signals.integration.ts`; int metrics now decimal text | V7 `TASK-004: Canonical signal interactions`; V8 `TASK-004: Authorized Observe across hosts` | PASS |
+| V9 final `dev:full` replay with screenshots | — | Not run: same port conflict as V1 | NOT RUN |
+| INV-001–007 static checks | — | `mise run fmt`, `lints`, `py:lints`, `codegen:check`, `check:py-wheel-no-testing`, `pnpm run check`, full UI vitest (45), `git diff --check` (with `*.patch -whitespace`) | PASS |
+
+Diagnoses:
+- **Symptom:** `floor.rs` case `NAME in (...)` expected lowercase. **Evidence:**
+  the normalizer preserves identifier spelling. **Cause:** the expectation was
+  wrong; DataFusion folds unquoted identifiers at execution. **Fix site:** the
+  test expectation.
+- **Symptom:** UI vitest failed to load `examples/ui-app/.svelte-kit/tsconfig.json`.
+  **Cause:** the example had never been synced. **Fix:** `svelte-kit sync`;
+  environmental, no source change.
+
+Limits and decisions:
+- Playwright `1.64.1` is a test-only devDependency. Re-locking re-resolved the
+  manifest's `latest` pins (svelte 5.57.3, vite 8.3.5 and others) at patch level.
+- The metric chart and summary are authored SQL, which binds only the range.
+  Metric name and WHERE values enter as escaped literals over allowlisted
+  columns, and `where_sql` is server-normalized at page load first.
+- Chart geometry is double precision, and its title says so. Nested
+  `bucket_counts` stay JSON numbers.
+- `record.logs` (span → logs) answers `unavailable`, because the logs filters
+  have no trace or span column.
+- Non-goals stayed excluded: no new wire encoding, no new query authority, no
+  schema change, no page-owned data service.

@@ -1,6 +1,6 @@
 # TASK-009 — Change Request and repository component family
 
-Spec: [revision 11, approved](../spec.md). Status: Proposed; platform prerequisite holds completion.
+Spec: [revision 15, approved](../spec.md). Status: Proposed; listed dependencies and required evidence govern completion.
 Dependencies: [TASK-003](TASK-003-shared-ui-foundation.md), [TASK-005](TASK-005-card-components.md), [TASK-007](TASK-007-verify-components.md).
 Mapped obligations: REQ-030, REQ-029, REQ-020, AC-011, AC-010; all INV-001–INV-007 apply, with TASK-001-specific exclusions only in TASK-001.
 
@@ -14,13 +14,21 @@ Change Request collaboration and repository connection controls are reusable and
 
 Own ChangeRequestList, ChangeHeader, SubjectsTable, RevisionList, ActivityFeed, ChangeVerifierList, RequestVerificationForm, ReviewSubmission, Participants, RepositoryList, WyrdTomlView and VerifierFolderTable. Preserve REQ-029 revision causes, multi-PR/repository scope, verification origins/starts, comments/reviews and webhook settings. No Claims, gates, carry-forward, override or browser-owned CR store. Historical mock is visual/behavior reference only.
 
-Use committed main `8651b96fd`, the approved spec and current canvas. Historical `wyrd-server-ui` at `7bfc3a8a` supplies read/state/test evidence only. Current uncommitted trace changes are unrelated and must be preserved. Package components render typed props; portable loaders plan/shape; executor/host boundaries own credentials, authorized IO and action execution. Preserve tenant isolation, stable errors and server audit behavior. No speculative framework, test-only configuration or replacement selectors.
+Use approved spec revision 15, the current canvas and current source contracts. `8651b96fd` is the historical migration baseline, not the current schema authority. Historical `wyrd-server-ui` at `7bfc3a8a` supplies read/state/test evidence only. Package components render typed props; portable loaders plan/shape; executor/host boundaries own credentials, authorized IO and action execution. Preserve tenant isolation, stable errors and server audit behavior. No speculative framework, test-only configuration or replacement selectors.
 
 | Capability | Existing owner/symbol | Inspected callers/tests | Missing behavior | Selected extension | New machinery justification |
 |---|---|---|---|---|---|
 | Change behavior reference | Historical 7bfc3a8a features/changes/Overview.svelte, Verification.svelte, ChangesJourney.test.ts and review-actions.test.ts | Historical routes and server/mock/changes/store.ts; current main lacks CR/repository durable contract | Reusable components and live contract absent | Consume separately specified platform CR/repository contract through normal host boundaries | Do not port mock store or invent its API as production authority |
 
-Paths under `src/mcp`, `src/query` or `tests/integration` described as server owners are rooted at `crates/wyrd/wyrd-server/`. Proposed TASK dependencies are not capabilities already present on main.
+Paths under `src/mcp`, `src/query` or `tests/integration` described as server owners are rooted at `crates/wyrd/wyrd-server/`. Revalidate source-map availability against the current checkout; historical missing-behavior claims do not override delivered contracts or completed dependencies.
+
+## Required Board Coverage
+
+ChangeRequestList → Changes table; ChangeHeader → ChangeDetail/ChangeVerification heading; SubjectsTable → Subjects; RevisionList → Revision sidebar; ActivityFeed → conversation; ChangeVerifierList → sidebar/Verification; RequestVerificationForm → request section; ReviewSubmission/Participants → review/sidebar. RepositoryList/WyrdTomlView/VerifierFolderTable → Repos Connected/configuration/folder regions. Audit/file regions use the specific approved historical references under REQ-029 and current spec/canvas overrides, never guessed server payloads.
+
+Record reference region, implementation screenshot, state, theme and viewport. Distinguish behavioral proof, visual comparison and individual human acceptance. Every difference needs a fix or an explicitly approved exception. See the [audit and evidence rules](../references/task-audit-2026-10-29.md).
+
+Historical inspection inputs at `7bfc3a8a`: `crates/wyrd/wyrd-server/wyrd-ui/src/routes/t/[tenantKey]/changes/[id]/audit/+page.svelte` and `crates/wyrd/wyrd-server/wyrd-ui/src/routes/t/[tenantKey]/changes/[id]/subjects/[subjectId]/+page.svelte` (with their server loads). Inspect their bodies against REQ-029 before reuse. Path existence alone does not establish an approved complete Files changed tab; surface any remaining missing visual contract instead of inventing it.
 
 ## Approach
 

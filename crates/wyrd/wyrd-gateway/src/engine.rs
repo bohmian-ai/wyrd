@@ -35,7 +35,7 @@ use wyrd_spec::DataTenantId;
 use wyrd_spec::error::WyrdError;
 use wyrd_spec::gateway::{
     GatewayCallId, GatewayCallOutcome, GatewayOperation, GatewayUsageAmount, ModelRef,
-    ProviderAdapter, ProviderDeployment,
+    ProviderDeployment,
 };
 use wyrd_spec::ids::{ModelId, ProviderDeploymentName};
 
@@ -384,8 +384,7 @@ pub struct AttemptRecord {
     pub provider: &'static str,
     /// Attempt outcome.
     pub outcome: GatewayCallOutcome,
-    /// Whether the provider may have received the request and may bill it;
-    /// never for a mock attempt, which reaches no provider.
+    /// Whether the provider may have received the request and may bill it.
     pub billable: bool,
     /// Usage evidence.
     pub usage: AttemptUsage,
@@ -624,15 +623,13 @@ impl GatewayEngine {
                     .attempt(input, candidate, ordinal, &dispatched, &mut *timing)
                     .instrument(span.clone()) => Ok(result),
             };
-            // A mock attempt reaches no provider, so nothing can bill it.
-            let mock = matches!(deployment.adapter, ProviderAdapter::Mock { .. });
-            let record = |outcome, billable: bool, usage| AttemptRecord {
+            let record = |outcome, billable, usage| AttemptRecord {
                 ordinal,
                 deployment: deployment.name.clone(),
                 model: candidate.model.clone(),
                 provider: provider_name(candidate),
                 outcome,
-                billable: billable && !mock,
+                billable,
                 usage,
                 started_at,
                 terminal_at: Utc::now(),
@@ -833,12 +830,14 @@ fn attempt_span(ordinal: NonZeroU32, candidate: &PlannedCandidate) -> tracing::S
 }
 
 /// GenAI provider name of `candidate`'s admitted adapter: its built-in
-/// provider, `openai_compatible` for a custom OpenAI-compatible endpoint, or
-/// `mock` for the internal mock. Shared by the live attempt span and the
-/// retained [`AttemptRecord`], so both name the adapter rather than the
-/// operator-chosen deployment name.
+/// provider, or `openai_compatible` for a custom OpenAI-compatible endpoint.
+/// Shared by the live attempt span and the retained [`AttemptRecord`], so
+/// both name the adapter rather than the operator-chosen deployment name.
 const fn provider_name(candidate: &PlannedCandidate) -> &'static str {
-    candidate.deployment.adapter.provider_name()
+    match candidate.deployment.adapter.builtin_provider() {
+        Some(provider) => provider,
+        None => "openai_compatible",
+    }
 }
 
 /// Closed snake-case label of `outcome`, shared by spans, metrics, and
@@ -1400,46 +1399,5 @@ mod tests {
             (Duration::from_millis(2), Duration::from_millis(1))
         );
         assert_eq!(failed.open, None);
-    }
-
-    /// A completed mock attempt carries its usage and the `mock` provider
-    /// but is never billable, and resolves no credential.
-    ///
-    /// # Panics
-    /// Panics when the mock attempt is billable, names another provider, or
-    /// receives a credential.
-    #[tokio::test]
-    async fn mock_attempts_are_never_billable() {
-        let mut snap = snapshot();
-        snap.deployments[0] = serde_json::from_value(json!({
-            "name": "dep-a1",
-            "adapter": {"mock": {"rules": [{"model": "a", "response": {
-                "id": "c", "object": "chat.completion", "created": 0, "model": "a",
-                "choices": [{"index": 0, "message": {"role": "assistant", "content": "ok"}}],
-            }}]}},
-            "auth": "none",
-        }))
-        .expect("mock deployment");
-        snap.fallback = serde_json::from_value(json!({"rules": []})).expect("fallback");
-        let dispatch = Recording::new(vec![Some(completed())]);
-        let execution = run(
-            &engine(dispatch.clone()),
-            &snap,
-            GatewayOperation::ChatCompletions,
-            Duration::from_secs(5),
-            &CancellationToken::new(),
-        )
-        .await;
-        assert_eq!(execution.outcome, GatewayCallOutcome::Succeeded);
-        assert_eq!(
-            attempt_outcomes(&execution),
-            [("dep-a1".to_owned(), GatewayCallOutcome::Succeeded, false)]
-        );
-        assert_eq!(execution.attempts[0].provider, "mock");
-        assert!(execution.attempts[0].usage.provider_usage_json.is_some());
-        assert_eq!(
-            *dispatch.seen.lock().expect("seen"),
-            [("dep-a1".to_owned(), None)]
-        );
     }
 }

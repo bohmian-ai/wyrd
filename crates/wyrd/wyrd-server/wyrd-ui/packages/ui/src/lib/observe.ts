@@ -65,7 +65,7 @@ export interface RecordDetailProps {
 /** Rows a facet reads: ten shown, the eleventh only reports that more exist. */
 export const FACET_VALUES = 10;
 /** Rows a list reads unless its input says otherwise. */
-const LIST_LIMIT = 50;
+export const LIST_LIMIT = 50;
 /** Spans a trace may hold before its read is refused as too large rather than shown truncated. */
 const TRACE_SPANS = 10_000;
 

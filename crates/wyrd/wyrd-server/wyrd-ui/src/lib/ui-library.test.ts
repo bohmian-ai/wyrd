@@ -94,6 +94,9 @@ import { Bifrost, WyrdError, type WyrdClient } from 'wyrd-ai';
 import catalog from 'wyrd-ai-ui/catalog.json';
 import { place as placeAll, rowsHeight } from '../../packages/ui/src/lib/layout';
 import {
+  AUTHORED_SQL,
+  authored,
+  bareSpan,
   buckets,
   card,
   costs,
@@ -102,11 +105,14 @@ import {
   fixtureExecutor,
   LOG,
   logRow,
+  logs,
   observeAnswer,
   RANGE,
   registered,
   series,
   spanRow,
+  spans,
+  stateExecutors,
   summary,
   terminal,
   timeseries,
@@ -137,7 +143,7 @@ test('TASK-003: Validated portable rendering', async () => {
   // Timeseries: one line per series value, each with a distinct dash and marker in the legend.
   const plot = render(Chart, { input: timeseries, result: { state: 'populated', data: series } });
   expect(plot.getByRole('heading', { name: 'Latency · ms' })).toBeInTheDocument();
-  const legend = plot.container.querySelectorAll('.legend li');
+  const legend = plot.container.querySelectorAll('.legend tbody th');
   expect([...legend].map((item) => item.textContent?.trim())).toEqual(['a', 'b']);
   expect(new Set([...plot.container.querySelectorAll('.legend line')].map((line) => line.getAttribute('stroke-dasharray'))).size).toBe(2);
   // Focus opens the tooltip on the latest point; Home walks to the first. A zone-less timestamp reads as UTC.
@@ -156,7 +162,7 @@ test('TASK-003: Validated portable rendering', async () => {
   const models = (count: number): QueryResult => ({ ...series, rows: Array.from({ length: count }, (_, index) => ['2026-10-20T10:00:00Z', `m${index + 1}`, index + 1]), terminal: terminal(count) });
   for (const count of [5, 20, 21]) {
     const many = render(Chart, { input: timeseries, result: { state: 'populated', data: models(count) } });
-    const labels = [...many.container.querySelectorAll('.legend li')].map((item) => item.textContent?.trim());
+    const labels = [...many.container.querySelectorAll('.legend tbody th')].map((item) => item.textContent?.trim());
     expect(labels).toHaveLength(Math.min(count, 20));
     expect(labels.at(-1)).toBe(count > 20 ? 'other' : `m${count}`);
     const cues = [...many.container.querySelectorAll('.legend svg')].map((icon) => `${icon.querySelector('line')?.getAttribute('stroke-dasharray')}|${icon.querySelector('path')?.getAttribute('d')}`);
@@ -168,7 +174,7 @@ test('TASK-003: Validated portable rendering', async () => {
   }
   // Authored series named "other" keep their values; the aggregate's caption stays distinct from every one of them.
   const grouped = (groups: [string, number][]): QueryResult => ({ ...series, rows: groups.map(([name, value]) => ['2026-10-20T10:00:00Z', name, value]), terminal: terminal(groups.length) });
-  const captions = (view: { container: Element }) => [...view.container.querySelectorAll('.legend li')].map((item) => item.textContent?.trim());
+  const captions = (view: { container: Element }) => [...view.container.querySelectorAll('.legend tbody th')].map((item) => item.textContent?.trim());
   const readings = (view: { container: Element }) => [...view.container.querySelectorAll('.tooltip span')].map((item) => item.textContent);
   const taken: [string, number][] = [['other', 21], ...Array.from({ length: 20 }, (_, index): [string, number] => [`s${index + 1}`, index + 1])];
   const named = render(Chart, { input: timeseries, result: { state: 'populated', data: grouped(taken) } });
@@ -1298,7 +1304,23 @@ test('TASK-004: Canonical signal interactions', async () => {
   expect(rail.getByRole('button', { name: /agent-api/ })).toHaveAttribute('aria-pressed', 'true');
   await fireEvent.click(rail.getByRole('button', { name: /not set/ }));
   expect(facetAction).toHaveBeenCalledWith({ name: 'facet.filter', input: { signal: 'traces', column: 'service_name', value: null } });
+  expect(rail.getByText('Click a value to add it to WHERE')).toBeInTheDocument();
   rail.unmount();
+  // A facet shows five values; "+ N more" counts the hidden values read, with "+" when the read found more than it returns.
+  const names = { ...facet, rows: Array.from({ length: 11 }, (_, index) => [`span ${index + 1}`, 200 - index]) };
+  const longRail = render(FacetRail, {
+    input: { signal: 'spans', facets: ['name', 'status_code'] },
+    result: { state: 'populated', data: { facets: [{ column: 'name', values: names }, { column: 'status_code', values: { ...facet, rows: [[1, 9], [2, 3]] } }] } },
+    onaction: facetAction
+  });
+  expect(longRail.queryByText('span 6')).toBeNull();
+  await fireEvent.click(longRail.getByRole('button', { name: '+ 5+ more' }));
+  expect(longRail.getByText('span 10')).toBeInTheDocument();
+  expect(longRail.queryByText('span 11')).toBeNull();
+  expect(longRail.getByText('More values exist; filter to narrow them.')).toBeInTheDocument();
+  expect(longRail.getByText('error')).toHaveClass('error');
+  expect(longRail.getByText('ok')).not.toHaveClass('error');
+  longRail.unmount();
 
   // RecordTable: typed cells, counts per trace, row open; a held live list offers new rows instead of moving.
   const openAction = vi.fn();
@@ -1317,7 +1339,7 @@ test('TASK-004: Canonical signal interactions', async () => {
   const newer = { ...traces, rows: [['2026-10-20T11:59:00.000000000+00:00', 'new root', 'agent-api', 1_000_000, 0, 'ffffffffffffffffffffffffffffffff', '1111111111111111'], ...traces.rows] };
   await list.rerender({ input: { signal: 'traces', live: true }, result: { state: 'populated', data: { rows: newer } }, onaction: openAction });
   expect(list.queryByText('new root')).toBeNull();
-  await fireEvent.click(list.getByRole('button', { name: '↑ 1 new traces' }));
+  await fireEvent.click(list.getByRole('button', { name: /↑ 1 new traces/ }));
   expect(list.getByText('new root')).toBeInTheDocument();
   // Opening a record holds the list, counts included, until the reader resumes.
   await fireEvent.mouseLeave(list.getByRole('region'));
@@ -1327,10 +1349,50 @@ test('TASK-004: Canonical signal interactions', async () => {
   await list.rerender({ input: { signal: 'traces', live: true }, result: { state: 'populated', data: { rows: newer } }, onaction: openAction });
   expect(list.queryByText('new root')).toBeNull();
   expect(list.getAllByRole('row')[1]).not.toHaveTextContent('…');
-  await fireEvent.click(list.getByRole('button', { name: '↑ 1 new traces' }));
-  expect(list.getByRole('status')).toHaveTextContent('Live');
+  await fireEvent.click(list.getByRole('button', { name: /^Live paused while a record is open · ↑ 1 new traces$/ }));
+  expect(list.getByRole('status')).toHaveTextContent(/^Live$/);
   expect(list.getByText('new root')).toBeInTheDocument();
   list.unmount();
+  // The footer states the returned extent, never an unread total; a service is a chip.
+  const footed = render(RecordTable, { input: { signal: 'traces' }, result: populated });
+  expect(footed.getByText(/^Showing 3\s+traces$/)).toBeInTheDocument();
+  expect(footed.getAllByText('agent-api')[0]).toHaveClass('chip');
+  footed.unmount();
+  const full = render(RecordTable, { input: { signal: 'traces', limit: 3 }, result: populated });
+  expect(full.getByText(/newest 3 read, older traces not read/)).toBeInTheDocument();
+  full.unmount();
+  // A log list pages through the rows it read, wraps lines and hides columns without another read.
+  const logList = render(RecordTable, { input: { signal: 'logs', limit: 120 }, result: { state: 'populated', data: { rows: logs } } });
+  expect(logList.getByText('120 records · newest first')).toBeInTheDocument();
+  expect(logList.getAllByRole('row')).toHaveLength(51);
+  expect(logList.getByText('newest 120 read · older records not read')).toBeInTheDocument();
+  expect(logList.getAllByRole('row')[1]).toHaveTextContent(String(logs.rows[0][3]));
+  await fireEvent.click(logList.getByRole('button', { name: 'Next page' }));
+  expect(logList.getAllByRole('row')[1]).toHaveTextContent(String(logs.rows[50][3]));
+  expect(logList.getByRole('button', { name: '2' })).toHaveAttribute('aria-current', 'page');
+  await fireEvent.change(logList.getByRole('combobox'), { target: { value: '100' } });
+  expect(logList.getAllByRole('row')).toHaveLength(101);
+  expect(logList.getByRole('button', { name: '1' })).toHaveAttribute('aria-current', 'page');
+  await fireEvent.click(logList.getByRole('button', { name: 'Wrap lines' }));
+  expect(logList.getByRole('button', { name: 'Wrap lines' })).toHaveAttribute('aria-pressed', 'true');
+  await fireEvent.click(logList.getByRole('checkbox', { name: 'Message' }));
+  expect(logList.queryByRole('columnheader', { name: 'Message' })).toBeNull();
+  expect(logList.getByRole('columnheader', { name: 'Severity' })).toBeInTheDocument();
+  logList.unmount();
+  // Groups are typed values: unset and the text "∅" stay apart, as do durations that both read "1ms".
+  const byService = render(RecordTable, { input: { signal: 'spans', groupBy: 'service_name' }, result: { state: 'populated', data: { rows: spans } } });
+  expect(byService.getAllByRole('rowheader').map((group) => group.textContent)).toEqual([
+    'Service = search · 1',
+    'Service = agent-api · 2',
+    'Service = ∅ ("∅") · 1',
+    'Service = ∅ (null) · 1'
+  ]);
+  byService.unmount();
+  const byDuration = render(RecordTable, { input: { signal: 'spans', groupBy: 'duration_nano' }, result: { state: 'populated', data: { rows: spans } } });
+  expect(byDuration.getAllByRole('rowheader').map((group) => group.textContent)).toContain('Duration = 1ms (1000000) · 1');
+  expect(byDuration.getAllByRole('rowheader').map((group) => group.textContent)).toContain('Duration = 1ms (1000400) · 1');
+  expect(byDuration.getAllByRole('rowheader')).toHaveLength(5);
+  byDuration.unmount();
   // Refused counts say why and never read as still loading.
   const refusedCounts = render(RecordTable, { input: { signal: 'traces' }, result: { state: 'populated', data: { rows: traces, counts: { state: 'denied', problem: denied } } } });
   expect(refusedCounts.getByRole('note')).toHaveTextContent('Span and error counts unavailable');
@@ -1342,6 +1404,10 @@ test('TASK-004: Canonical signal interactions', async () => {
   const selectAction = vi.fn();
   const fall = render(TraceWaterfall, { input: { traceId: TRACE }, result: { state: 'populated', data: trace }, onaction: selectAction });
   expect(fall.queryByText('GET /search')).toBeNull();
+  // The caption says what is collapsed; a collapsed span counts its children; the axis runs from 0 to the trace's end.
+  expect(fall.getByText('Waterfall · collapsed below 2 levels · selected path stays open')).toBeInTheDocument();
+  expect(fall.getByTitle('1 child spans collapsed')).toHaveTextContent('+1');
+  expect([...fall.container.querySelectorAll('.ticks span')].map((tick) => tick.textContent)).toEqual(['0s', '1s', '2s', '2.84s']);
   await fireEvent.click(fall.getByRole('button', { name: 'Expand all' }));
   expect(fall.getByText('GET /search')).toBeInTheDocument();
   await fireEvent.click(fall.getByRole('button', { name: 'Errors only' }));
@@ -1359,6 +1425,18 @@ test('TASK-004: Canonical signal interactions', async () => {
   const detailAction = vi.fn();
   const span = render(RecordDetail, { input: { traceId: TRACE, spanId: 'b9c7c989f97918e1' }, result: { state: 'populated', data: spanRow }, onaction: detailAction });
   expect(span.getByRole('tabpanel')).toHaveTextContent('refund?');
+  // Messages read as recorded roles and parts beside the other attributes; tabs count what was recorded.
+  expect(span.getAllByRole('tab').map((tab) => tab.textContent)).toEqual(['Messages 3', 'Attributes 6', 'Events 1', 'Exception', 'Raw']);
+  expect([...span.getByRole('tabpanel').querySelectorAll('h4')].map((role) => role.textContent)).toEqual(['system instructions', 'user', 'tool']);
+  expect(span.getByRole('tabpanel')).toHaveTextContent('"days_since": 20');
+  expect(span.getByRole('tabpanel')).not.toHaveTextContent('"role"');
+  const side = span.getByLabelText('Other attributes');
+  expect(side).toHaveTextContent('gen_ai.request.model');
+  expect(side).not.toHaveTextContent('gen_ai.input.messages');
+  expect(span.container.querySelector('.exception')).toHaveTextContent('TimeoutError: search timed out');
+  expect(span.getByRole('button', { name: 'Filter = execute_tool search' })).toBeInTheDocument();
+  await fireEvent.click(span.getByRole('tab', { name: 'Raw' }));
+  expect(span.getByRole('tabpanel')).toHaveTextContent('gen_ai.input.messages');
   await fireEvent.click(span.getByRole('tab', { name: 'Exception' }));
   expect(span.getByRole('tabpanel')).toHaveTextContent('TimeoutError');
   await fireEvent.click(span.getByRole('button', { name: 'Exclude' }));
@@ -1367,10 +1445,26 @@ test('TASK-004: Canonical signal interactions', async () => {
     { name: 'record.filter', input: { signal: 'spans', column: 'name', value: 'execute_tool search', not: true } },
     { name: 'record.logs', input: { trace_id: TRACE, span_id: 'b9c7c989f97918e1' } }
   ]);
-  await span.rerender({ input: { traceId: TRACE, spanId: 'b9c7c989f97918e1' }, result: { state: 'populated', data: { ...spanRow, rows: [[...spanRow.rows[0].slice(0, 4), {}, [], null, null, null]] } }, onaction: detailAction });
+  await span.rerender({ input: { traceId: TRACE, spanId: 'b9c7c989f97918e1' }, result: { state: 'populated', data: bareSpan }, onaction: detailAction });
   await fireEvent.click(span.getByRole('tab', { name: 'Messages' }));
   expect(span.getByRole('tabpanel')).toHaveTextContent('gen_ai.input.messages');
+  expect(span.getAllByRole('tab').map((tab) => tab.textContent)).toEqual(['Messages', 'Attributes', 'Events', 'Exception', 'Raw']);
+  expect(span.container.querySelector('.exception')).toBeNull();
   span.unmount();
+  // A log record reads as severity, body and attributes; it filters by its service and opens its trace.
+  const logAction = vi.fn();
+  const record = render(RecordDetail, { input: { log: LOG }, result: { state: 'populated', data: logRow }, onaction: logAction });
+  expect(record.getByRole('heading', { name: 'ERROR' })).toHaveAttribute('data-tone', 'danger');
+  expect(record.container.querySelector('.body')).toHaveTextContent('search timed out');
+  expect(record.getByText('latency_ms').nextElementSibling).toHaveTextContent('1412');
+  await fireEvent.click(record.getByRole('button', { name: 'Filter = search' }));
+  await fireEvent.click(record.getByRole('button', { name: /Open trace/ }));
+  expect(logAction.mock.calls.map(([intent]) => intent)).toEqual([
+    { name: 'record.filter', input: { signal: 'logs', column: 'service_name', value: 'search' } },
+    { name: 'record.open', input: { trace_id: TRACE, span_id: 'b9c7c989f97918e1' } }
+  ]);
+  expect(record.getByText('Raw')).toBeInTheDocument();
+  record.unmount();
   // Without a host to act, the detail offers no dead controls.
   const passive = render(RecordDetail, { input: { traceId: TRACE, spanId: 'b9c7c989f97918e1' }, result: { state: 'populated', data: spanRow } });
   expect(passive.queryByRole('button', { name: 'Exclude' })).toBeNull();
@@ -1381,6 +1475,20 @@ test('TASK-004: Canonical signal interactions', async () => {
   ] as const)
     expect(validateIntent(name === 'facet.filter' ? 'FacetRail' : 'TraceWaterfall', { name, input })).toEqual({ name, input });
   expect(validateIntent('TraceWaterfall', { name: 'trace.select', input: { trace_id: TRACE } })).toMatchObject({ code: 'WYRD_SPEC_400_VALIDATION' });
+
+  // Metrics series: latest, largest and mean of the plotted values; unticking a series hides only its line.
+  const summarized = render(Chart, { input: timeseries, result: { state: 'populated', data: series } });
+  const seriesRows = () => [...summarized.container.querySelectorAll('.legend tbody tr')].map((row) => [...row.querySelectorAll('th, td')].map((cell) => cell.textContent?.trim()));
+  expect(seriesRows()).toEqual([['', 'a', '140', '140', '130'], ['', 'b', '80', '80', '80']]);
+  const stroke = () => [...summarized.container.querySelectorAll('svg.plot polyline')].map((line) => line.getAttribute('stroke'));
+  const strokes = stroke();
+  await fireEvent.click(summarized.getByRole('checkbox', { name: 'Show a' }));
+  expect(stroke()).toEqual([strokes[1]]);
+  expect(summarized.getByRole('application')).toHaveAccessibleName('Latency: b');
+  expect(summarized.getByText(/2 series · 1 shown/)).toBeInTheDocument();
+  await fireEvent.click(summarized.getByRole('button', { name: 'Show all' }));
+  expect(stroke()).toEqual(strokes);
+  summarized.unmount();
 
   // A view renders every Observe panel, and a live panel re-reads on its interval until the view leaves.
   vi.useFakeTimers({ toFake: ['setInterval', 'clearInterval'] });
@@ -1418,4 +1526,96 @@ test('TASK-004: Canonical signal interactions', async () => {
   } finally {
     vi.useRealTimers();
   }
+});
+
+test('TASK-004: Authored query aliases do not declare telemetry semantics', async () => {
+  // An authored query names its own columns; matching a telemetry name gives it no telemetry meaning.
+  const sql = render(RecordTable, { input: { sql: AUTHORED_SQL }, result: { state: 'populated', data: { rows: authored } } });
+  expect(sql.getAllByRole('columnheader').map((heading) => heading.textContent)).toEqual(['name', 'status_code', 'duration_nano']);
+  expect(sql.container.querySelector('.pill, .bar, time, .chip, tr.error')).toBeNull();
+  expect(sql.getAllByRole('row')[1]).toHaveTextContent(/^refund policy cited21500000000$/);
+  expect(sql.getAllByRole('row')[2]).toHaveTextContent(/^answer grounded03$/);
+  sql.unmount();
+  // The same values under a signal list are canonical columns and read as telemetry.
+  const signal = render(RecordTable, { input: { signal: 'spans' }, result: { state: 'populated', data: { rows: spans } } });
+  expect(signal.getByRole('columnheader', { name: 'Status' })).toBeInTheDocument();
+  expect(signal.getAllByRole('row')[1].querySelector('.pill')).toHaveAttribute('data-tone', 'danger');
+  expect(signal.getAllByRole('row')[1].querySelector('time')).toBeInTheDocument();
+  signal.unmount();
+  // Through a view the authored query keeps its raw headings and text.
+  const view = render(WyrdView, {
+    doc: { version: 'wyrd.view/v1', catalogId: 'wyrd.ui/v1', range: RANGE, panels: [{ id: 'q', component: 'RecordTable', input: { sql: AUTHORED_SQL } }] },
+    executor: fixtureExecutor
+  });
+  await waitFor(() => expect(view.container.querySelector('[data-panel="q"]')).toHaveTextContent('refund policy cited'));
+  const panel = view.container.querySelector('[data-panel="q"]')!;
+  expect([...panel.querySelectorAll('th')].map((heading) => heading.textContent)).toEqual(['name', 'status_code', 'duration_nano']);
+  expect(panel.querySelector('.pill, .bar, time, tr.error')).toBeNull();
+  view.unmount();
+});
+
+test('TASK-004: Telemetry presentation is independent of record names', async () => {
+  const tones = (rendered: { container: HTMLElement }) =>
+    [...rendered.container.querySelectorAll('tbody tr')].map((row) => [row.classList.contains('error'), row.querySelector('.pill')?.getAttribute('data-tone')]);
+  // Status comes from status_code alone: "status.error" with status ok is ok; an HTTP route with status error is an error.
+  const list = render(RecordTable, { input: { signal: 'spans' }, result: { state: 'populated', data: { rows: spans } } });
+  const original = tones(list);
+  expect(original[0]).toEqual([true, 'danger']);
+  expect(original[3]).toEqual([false, 'ok']);
+  // Renaming every span leaves every tone; changing one recorded status changes only that row.
+  const renamed = { ...spans, rows: spans.rows.map((row, index) => [row[0], index === 0 ? 'status.ok' : `error ${index}`, ...row.slice(2)]) };
+  await list.rerender({ input: { signal: 'spans' }, result: { state: 'populated', data: { rows: renamed } } });
+  expect(tones(list)).toEqual(original);
+  const restated = { ...spans, rows: spans.rows.map((row, index) => (index === 3 ? [...row.slice(0, 4), 2, ...row.slice(5)] : row)) };
+  await list.rerender({ input: { signal: 'spans' }, result: { state: 'populated', data: { rows: restated } } });
+  expect(tones(list)[3]).toEqual([true, 'danger']);
+  list.unmount();
+  // Facets and row opens carry the exact typed values read.
+  const facetAction = vi.fn();
+  const rail = render(FacetRail, {
+    input: { signal: 'spans', facets: ['status_code', 'duration_nano'] },
+    result: { state: 'populated', data: { facets: [{ column: 'status_code', values: { ...facet, rows: [[1, 9], [2, 3]] } }, { column: 'duration_nano', values: { ...facet, rows: [[1_000_000, 1], [1_000_400, 1]] } }] } },
+    onaction: facetAction
+  });
+  await fireEvent.click(rail.getByText('error'));
+  await fireEvent.click(rail.getByText('1000400'));
+  expect(facetAction.mock.calls.map(([intent]) => intent.input.value)).toEqual([2, 1_000_400]);
+  rail.unmount();
+  const openAction = vi.fn();
+  const opened = render(RecordTable, { input: { signal: 'spans' }, result: { state: 'populated', data: { rows: spans } }, onaction: openAction });
+  await fireEvent.click(opened.getAllByRole('row')[4]);
+  expect(openAction).toHaveBeenCalledWith({ name: 'record.open', input: { trace_id: 'a3ce929d0e0e47364bf92f3577b34da6', span_id: '53995c3f42cd8ad9' } });
+  opened.unmount();
+  // A series named like a status draws in its index's style, not a status colour.
+  const strokes = (data: typeof series) => {
+    const chart = render(Chart, { input: timeseries, result: { state: 'populated', data } });
+    const drawn = [...chart.container.querySelectorAll('svg.plot polyline')].map((line) => [line.getAttribute('stroke'), line.getAttribute('stroke-dasharray')]);
+    chart.unmount();
+    return drawn;
+  };
+  expect(strokes({ ...series, rows: series.rows.map((row) => [row[0], row[1] === 'a' ? 'error' : 'ok', row[2]]) })).toEqual(strokes(series));
+  // The waterfall marks errors by status, whatever the span is called.
+  const waterfall = (data: typeof trace) => {
+    const fall = render(TraceWaterfall, { input: { traceId: TRACE }, result: { state: 'populated', data } });
+    const marked = [...fall.container.querySelectorAll('[role="treeitem"]')].map((row) => row.classList.contains('error'));
+    fall.unmount();
+    return marked;
+  };
+  expect(waterfall({ ...trace, rows: trace.rows.map((row, index) => [row[0], row[1], index % 2 ? 'ok span' : 'error span', ...row.slice(3)]) })).toEqual(waterfall(trace));
+  // A span with only HTTP attributes has no messages; no role is synthesized from attribute names.
+  const http = { ...spanRow, rows: [[...spanRow.rows[0].slice(0, 7), { 'http.route': '/search', 'http.response.status_code': 500, role: 'user' }, [], null, null, null]] };
+  const detail = render(RecordDetail, { input: { traceId: TRACE, spanId: 'b9c7c989f97918e1' }, result: { state: 'populated', data: http } });
+  expect(detail.getByRole('tabpanel')).toHaveTextContent('No GenAI messages recorded');
+  expect(detail.getByRole('tabpanel').querySelector('h4')).toBeNull();
+  detail.unmount();
+  // Through a view, an ok span named "status.error" still reads ok.
+  const view = render(WyrdView, {
+    doc: { version: 'wyrd.view/v1', catalogId: 'wyrd.ui/v1', range: RANGE, panels: [{ id: 's', component: 'RecordTable', input: { signal: 'spans' } }] },
+    executor: fixtureExecutor
+  });
+  await waitFor(() => expect(view.container.querySelector('[data-panel="s"]')).toHaveTextContent('status.error'));
+  const row = [...view.container.querySelectorAll('[data-panel="s"] tbody tr')].find((each) => each.textContent?.includes('status.error'))!;
+  expect(row).not.toHaveClass('error');
+  expect(row.querySelector('.pill')).toHaveAttribute('data-tone', 'ok');
+  view.unmount();
 });

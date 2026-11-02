@@ -1,6 +1,6 @@
 # TASK-004 — Observe component family
 
-Spec: [revision 11, approved](../spec.md). Status: Proposed; platform prerequisite holds completion.
+Spec: [revision 18, approved](../spec.md). Status: In progress; revision 18 live Observe closure is outstanding.
 Dependencies: [TASK-003](TASK-003-shared-ui-foundation.md).
 Mapped obligations: REQ-030, REQ-022, REQ-028, REQ-020, AC-008, AC-011, AC-010; all INV-001–INV-007 apply, with TASK-001-specific exclusions only in TASK-001.
 
@@ -118,3 +118,21 @@ Limits: Int64 values above 2^53 lose precision in JSON transport; spans have no 
 Non-goals confirmed: no Observe routes, no ingest schema, no new transport or lifecycle owner, no dependency added; only the UI package, gallery, fixtures and tests changed.
 
 Human visual checkpoint: not reached. The components do not match their canvas boards and the gallery does not label each component with its board; the task is not IMPLEMENTED.
+
+## Current closure — revision 18, 2026-11-02
+
+The implementation and historical evidence above are retained. The caller now
+requires a standard live development workflow and working shell/Traces/Spans/
+Logs/Metrics before TASK-004 can complete. Current tasks:
+
+1. [TASK-004-REV-01 — MockServer](TASK-004-revision/TASK-01-mockserver.md).
+2. [TASK-004-REV-02 — Live Observe workflow](TASK-004-revision/TASK-02-live-observe-workflow.md).
+
+All remaining R1 component findings, states, truthful signal behavior and visual
+checkpoints transfer to Task 02 alongside the full TASK-012/020/021/022 scope.
+The old [R1/R2/R3 records](../references/retired-task-004/) are retired historical
+evidence. No old PASS claim or source edit establishes independent task review,
+real-browser success or human acceptance. Task 02 depends on the existing
+foundation/Observe implementation, not on this parent being complete: its
+independent PASS and required individual live/component acceptance close this
+parent. Preserve code and caller cleanup; do not restore rejected mocking.

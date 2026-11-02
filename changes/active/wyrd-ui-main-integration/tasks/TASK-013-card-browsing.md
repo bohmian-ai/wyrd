@@ -1,7 +1,8 @@
 # TASK-013 — Registry browsing and exact Card detail
 
-Spec: [revision 11, approved](../spec.md). Status: Proposed.
-Dependencies: [TASK-012](TASK-012-canvas-shell.md), [TASK-005](TASK-005-card-components.md).
+Spec: [revision 15, approved](../spec.md). Status: Proposed; listed dependencies and required evidence govern completion.
+Dependencies: [TASK-004-REV-02](TASK-004-revision/TASK-02-live-observe-workflow.md), [TASK-005](TASK-005-card-components.md).
+Approved revision 18 assigns the shell/browser dependency to TASK-004-REV-02; original page outcomes and remaining delivery gates are preserved.
 Mapped obligations: REQ-008, REQ-009, REQ-020, AC-006, AC-010, REQ-034, AC-013; all INV-001–INV-007 apply, with TASK-001-specific exclusions only in TASK-001.
 
 ## Outcome and Value
@@ -12,14 +13,20 @@ A user searches and pages through Cards, opens an exact version, and follows exa
 
 Assemble only this outcome from completed CardInventory, CardHeader, CardFacts, RelationshipList and ArtifactTable. Page/server load functions invoke shared loaders; no SQL, joins, dependent-read sequencing or domain shaping in pages. Reuse session-bound Node executor and shell. Current fourteen native kinds, labels/annotations and server status drive inventory; version changes and relationship/artifact links never switch subject silently. Deliver two sequential visual checkpoints: inventory first, exact generic detail second. Kind-specific workspaces remain later tasks. No historical components/layouts/types or fixture production fallback.
 
-Use committed main `8651b96fd`, the approved spec and current canvas. Historical `wyrd-server-ui` at `7bfc3a8a` supplies read/state/test evidence only. Current uncommitted trace changes are unrelated and must be preserved. Package components render typed props; portable loaders plan/shape; executor/host boundaries own credentials, authorized IO and action execution. Preserve tenant isolation, stable errors and server audit behavior. No speculative framework, test-only configuration or replacement selectors.
+Use approved spec revision 15, the current canvas and current source contracts. `8651b96fd` is the historical migration baseline, not the current schema authority. Historical `wyrd-server-ui` at `7bfc3a8a` supplies read/state/test evidence only. Package components render typed props; portable loaders plan/shape; executor/host boundaries own credentials, authorized IO and action execution. Preserve tenant isolation, stable errors and server audit behavior. No speculative framework, test-only configuration or replacement selectors.
 
 | Capability | Existing owner/symbol | Inspected callers/tests | Missing behavior | Selected extension | New machinery justification |
 |---|---|---|---|---|---|
 | Exact Card reads | `sdks/wyrd-sdk-ts/wyrd/src/index.ts::Cards.get`, `Cards.list`; server `src/mcp/cards.rs::GET_BY_REF` | `sdks/wyrd-sdk-ts/wyrd/tests/support/server.ts::registered`; current Card envelopes | No portable UI projection | Extend the approved component loaders over these reads | No new registry, identity lookup or lineage owner |
 | Page composition | TASK-003–011 proposed public package/renderer/executors and TASK-012 shell; current `crates/wyrd/wyrd-server/wyrd-ui/src/hooks.server.ts::handle` and BrowserSessions own auth | Current retained login/settings loads; SDK tests/support/server.ts and existing production-auth driver own real server/BFF setup | Approved page absent on committed main | Add layout/loader consumer and focused T6 journey | No new transport, state controller or duplicate component owner |
 
-Paths under `src/mcp`, `src/query` or `tests/integration` described as server owners are rooted at `crates/wyrd/wyrd-server/`. Proposed TASK dependencies are not capabilities already present on main.
+Paths under `src/mcp`, `src/query` or `tests/integration` described as server owners are rooted at `crates/wyrd/wyrd-server/`. Revalidate source-map availability against the current checkout; historical missing-behavior claims do not override delivered contracts or completed dependencies.
+
+## Required Board Coverage
+
+Cards inventory has no dedicated approved PNG. Record the missing reference and obtain an approved reference or explicit visual acceptance before declaring fidelity. Generic detail uses shared header/version/YAML/facts/relationships regions on Agent/Prompt/Model/Data/Service; kind-specific content remains in its own task.
+
+Record reference region, implementation screenshot, state, theme and viewport. Distinguish behavioral proof, visual comparison and individual human acceptance. Every difference needs a fix or an explicitly approved exception. See the [audit and evidence rules](../references/task-audit-2026-10-29.md).
 
 ## Approach
 
@@ -48,7 +55,7 @@ mise exec -- pnpm --dir crates/wyrd/wyrd-server/wyrd-ui test src/lib/ui-pages.te
 
 **Behavior.** T6 launches a real browser against the running production BFF and Rust server, signs in through public auth, navigates to this task's route, performs its page workflow and inspects visible results backed by actual SDK/server reads. Cover populated, empty, denied/error and cross-tenant cases; required actions and links preserve exact identity. On time-aware pages, change the range and verify requested bounds, updated results and no stale overwrite; other pages exercise their actual filters/version/navigation controls. Imported handlers, jsdom, fixture page props and HTTP-client cookie simulation alone cannot satisfy REQ-034.
 
-**RED.** Extend the focused page journey with TASK-011/012 real-browser support over repository-managed server/Postgres and the production BFF. The absent browser/page workflow must fail; fixture props or imported handlers cannot supply GREEN. Run this exact focused command (new Vitest title where applicable):
+**RED.** Extend the focused page journey with TASK-004-REV-02 (under approved revision 15) real-browser support over repository-managed server/Postgres and the production BFF. The absent browser/page workflow must fail; fixture props or imported handlers cannot supply GREEN. Run this exact focused command (new Vitest title where applicable):
 
 ```bash
 mise exec -- scripts/postgres/with-test-postgres.sh -- bash -lc 'mise run db:migrate:inner && WYRD_UI_INTEGRATION=1 pnpm --dir crates/wyrd/wyrd-server/wyrd-ui test src/lib/ui-pages.integration.test.ts -t "^TASK-013: Real authenticated page journey$"'
@@ -72,7 +79,7 @@ Only relevant app route/layout/server load, host action/navigation adapters and 
 
 Run the exact scenario commands above. [Verification setup](../references/verification.md) defines the current test owners and repository-managed prerequisites. New Vitest titles are planned additions to the existing runner, not claims of existing tests. Select actual running tests; skipped/no-selected cases are not proof. Do not add dependencies or environment settings to make selection convenient.
 
-Run `mise exec -- pnpm --dir crates/wyrd/wyrd-server/wyrd-ui check` and `mise exec -- pnpm --dir crates/wyrd/wyrd-server/wyrd-ui build` after focused tests. Run `mise run codegen:check` when catalog/generated inputs change. Record T1 states, T2 actual requests/shape, T3 view validation/render, T4 actual built AppBridge HTML, T5 real authorized Node/server data and real-browser T6 for this assembled page. Reuse TASK-011/012 browser and deployed-process support; retain source/browser identity, sanitized screenshots/traces, actual requests and visible results. A skipped browser case is not a pass. Data-free primitives have no invented loader/live proof. Preserve per-component fixture provenance and interaction/action-host evidence.
+Run `mise exec -- pnpm --dir crates/wyrd/wyrd-server/wyrd-ui check` and `mise exec -- pnpm --dir crates/wyrd/wyrd-server/wyrd-ui build` after focused tests. Run `mise run codegen:check` when catalog/generated inputs change. Record T1 states, T2 actual requests/shape, T3 view validation/render, T4 actual built AppBridge HTML, T5 real authorized Node/server data and real-browser T6 for this assembled page. Reuse TASK-004-REV-02 (under approved revision 15) browser and deployed-process support; retain source/browser identity, sanitized screenshots/traces, actual requests and visible results. A skipped browser case is not a pass. Data-free primitives have no invented loader/live proof. Preserve per-component fixture provenance and interaction/action-host evidence.
 
 ### Human visual checkpoint
 

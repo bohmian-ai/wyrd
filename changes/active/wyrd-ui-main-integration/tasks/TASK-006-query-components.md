@@ -1,8 +1,8 @@
 # TASK-006 — Query component family
 
-Spec: [revision 11, approved](../spec.md). Status: Proposed.
+Spec: [revision 15, approved](../spec.md). Status: Proposed; listed dependencies and required evidence govern completion.
 Dependencies: [TASK-003](TASK-003-shared-ui-foundation.md), [TASK-004](TASK-004-observe-components.md).
-Mapped obligations: REQ-030, REQ-014, REQ-022, REQ-020, AC-008, AC-011, AC-010; all INV-001–INV-007 apply, with TASK-001-specific exclusions only in TASK-001.
+Mapped obligations: REQ-030, REQ-014, REQ-022, REQ-020, AC-008, AC-011, AC-010, AC-016; all INV-001–INV-007 apply, with TASK-001-specific exclusions only in TASK-001.
 
 ## Outcome and Value
 
@@ -12,14 +12,20 @@ A complete read-only query workbench can be composed from reusable components in
 
 Own QueryEditor, TableCatalog and QueryDetails; reuse Chart and RecordTable. Include catalog discovery/description, explicit typed query parameters, cancel/rerun, table/chart presentation and exact Open in Query reproduction. No Service chart persistence or page-owned query shaping.
 
-Use committed main `8651b96fd`, the approved spec and current canvas. Historical `wyrd-server-ui` at `7bfc3a8a` supplies read/state/test evidence only. Current uncommitted trace changes are unrelated and must be preserved. Package components render typed props; portable loaders plan/shape; executor/host boundaries own credentials, authorized IO and action execution. Preserve tenant isolation, stable errors and server audit behavior. No speculative framework, test-only configuration or replacement selectors.
+Use approved spec revision 15, the current canvas and current source contracts. `8651b96fd` is the historical migration baseline, not the current schema authority. Historical `wyrd-server-ui` at `7bfc3a8a` supplies read/state/test evidence only. Package components render typed props; portable loaders plan/shape; executor/host boundaries own credentials, authorized IO and action execution. Preserve tenant isolation, stable errors and server audit behavior. No speculative framework, test-only configuration or replacement selectors.
 
 | Capability | Existing owner/symbol | Inspected callers/tests | Missing behavior | Selected extension | New machinery justification |
 |---|---|---|---|---|---|
 | Bounded analytical reads | `sdks/wyrd-sdk-ts/wyrd/src/index.ts::Bifrost.stream`; `crates/wyrd/wyrd-server/src/query/collect.rs::BoundedQuery` | `sdks/wyrd-sdk-ts/wyrd/tests/integration/query-bifrost.test.ts`, `query-results.test.ts`; MCP `bifrost.rs::query_tool` | UI props and host parity missing | Consume foundation normalization and shared query owner | No second query service or transport |
 | Historical query workflow | 7bfc3a8a `features/query/reads.server.ts::runQuery/readCatalog/describeTable` | Historical query routes and production-auth integration cases | Old object-row/truncation projection conflicts with current normalized contract | Reference authorized catalog/read flow; implement new pure loaders on foundation shape | No copy of old response/types or range injection |
 
-Paths under `src/mcp`, `src/query` or `tests/integration` described as server owners are rooted at `crates/wyrd/wyrd-server/`. Proposed TASK dependencies are not capabilities already present on main.
+Paths under `src/mcp`, `src/query` or `tests/integration` described as server owners are rooted at `crates/wyrd/wyrd-server/`. Revalidate source-map availability against the current checkout; historical missing-behavior claims do not override delivered contracts or completed dependencies.
+
+## Required Board Coverage
+
+TableCatalog → Query catalog/search/description; QueryEditor → SQL/parameters/run/cancel; QueryDetails → executed query details; reused RecordTable/Chart → results. Prove canonical SDK/MCP discovery, resolved schema/layout/revisions and unchanged obsolete authored SQL failing visibly (AC-016). Query History has no established source or lifetime in this packet; resolve that obligation before claiming full board coverage without inventing persistence.
+
+Record reference region, implementation screenshot, state, theme and viewport. Distinguish behavioral proof, visual comparison and individual human acceptance. Every difference needs a fix or an explicitly approved exception. See the [audit and evidence rules](../references/task-audit-2026-10-29.md).
 
 ## Approach
 
@@ -32,7 +38,7 @@ Paths under `src/mcp`, `src/query` or `tests/integration` described as server ow
 
 ### Scenario 1 — Authored query is reproduced exactly
 
-**Behavior.** Catalog selection, explicit binds, execute/cancel/rerun and chart/table views preserve SQL and typed inputs; range controls act only on declared range binds.
+**Behavior.** Catalog selection, explicit binds, execute/cancel/rerun and chart/table views preserve SQL and typed inputs; range controls act only on declared range binds. Exercise canonical table discovery/descriptions, resolved schema/layout/revisions and unavailable metadata through Node and MCP; obsolete authored SQL fails unchanged and shipped examples/fixtures use bifrost (AC-016).
 
 **RED.** Add query-family interaction and loader assertions; new components are absent. Run this exact focused command (new Vitest title where applicable):
 

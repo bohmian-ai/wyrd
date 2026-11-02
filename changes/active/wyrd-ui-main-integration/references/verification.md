@@ -101,8 +101,9 @@ proof in TASK-011 supplements (and is not replaced by) AppBridge fixture tests.
 retain their existing exact `ui-pages.integration.test.ts` Vitest selector but
 must drive a real browser against the production BFF/server. Calling a page
 load/POST function or simulating cookies over HTTP is supporting proof only.
-TASK-011 supplies the first real-browser test tooling; TASK-012 closes deployed
-page lifecycle and auth integration, and each page owns its workflow and
+Approved revision 18 assigns the first real-browser test tooling and deployed
+page lifecycle/auth integration to TASK-004-REV-02, absorbing TASK-012. TASK-011
+and later pages reuse that owner; each page retains its workflow and
 applicable range/identity/negative assertions. Browser automation may be headless;
 record actual engine/version, navigation, interactions and visible/server results.
 Minimal test-only browser dependencies are authorized; no new production/test
@@ -158,3 +159,58 @@ Final change review owns combined evidence for both primary journeys. The
 live lane remains opt-in and outside unattended CI/`gate`; absence of its proof
 blocks AC-014 even when the aggregate passes. Other in-scope platform and human
 inspection dependencies remain unchanged. Ask/REQ-031 are deferred.
+
+## Integrated development proof — approved revision 16 mock correction
+
+TASK-004-REV-02 is the single in-progress, staged assignment for the internal gateway mock,
+canonical source/current-production-wheel workflow and first live trace page.
+Its exact focused commands and source-backed test ownership are recorded once
+in that task. Existing gateway dispatch, public gateway/server, Python
+local-development/Bifrost and UI runners remain owners; the newly listed
+selectors are planned until implemented. The canonical pin has no
+`gateway.json`, so the old standalone-example test's skip cannot prove this
+workflow. Normal dev data must use the real launcher/production SDK and public
+flush/readback, not test-only server flushes or a second WyrdTestServer.
+
+The final normal development run records exactly 1,000 dispatched app requests,
+separate expected/actual workflow and terminal verification counts, retained
+spans/metrics/logs, source/patch and wheel identity, and the caller's browser
+inspection. Only the model answers/usage are fixture-controlled; authorization,
+tools, verifier execution and retained telemetry are real. Full library and
+production MCP App completion remain separate later gates.
+
+The old mock-deployment V1/V2 results at `d87d24882`/`930a2de96` remain
+historical evidence only. Revision 16 requires runtime scope proof on the same
+tenant/key/deployment/model, unchanged OpenAI auth hooks and native SDK paths,
+plus frozen accepted execution context across queue reconstruction/config change.
+Use R2 V1/V2 and V11–V14; stage completion awaits those actual results and the
+affected owner checks. Planning ran no application tests or services.
+
+## Provider-only correction — TASK-004-R3
+
+The caller rejected revision-16 Stage 1 despite its recorded test passes.
+TASK-004-R3 C1–C9 replace its mock proof: runtime dispatch and language scopes,
+unchanged routing/credentials, existing attempt provider identity and no calls
+schema or verification-persistence expansion. V14 queued snapshot proof and new
+mock_fixture columns are superseded obligations. Old results stay historical.
+No new test/build/service execution occurred during correction planning.
+
+## Revision 18 local-development and Observe ownership
+
+The two current tasks are [MockServer](../tasks/TASK-004-revision/TASK-01-mockserver.md)
+and [live Observe workflow](../tasks/TASK-004-revision/TASK-02-live-observe-workflow.md).
+R1/R2/R3 are [retired evidence](retired-task-004/), not runnable instructions.
+Task 02 absorbs TASK-012/020/021/022 in full: shell, Traces/Spans, Logs, Metrics
+and their real-browser T6/visual proof. Current planned selectors/setup are in
+those two tasks; older task-specific selectors are historical guidance only.
+
+Normal dev uses the production SDK and Rust server plus an optional local
+MockServer through existing endpoint configuration. Queued judges use that
+same endpoint; no paid model credentials, runtime scope, snapshot or queue
+propagation. Default batch: 3,000 real app HTTP requests at concurrency 8,
+public terminal verification waits and actual spans/logs/metrics readback.
+Image/fixture/source/wheel identities and expected/actual counts are evidence.
+Do not equate a response count with completed observations. Real-browser
+proof uses the production BFF/server with the existing Vitest integration
+runner and minimal test-only Playwright Node API; jsdom/HTTP-only auth is
+supporting proof. Independent review and individual human inspection remain.

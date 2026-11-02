@@ -38,7 +38,7 @@ use wyrd_spec::gateway::{
     CurrencyCode, GatewayAccountingEntryId, GatewayAccountingEntryV1, GatewayBudget,
     GatewayBudgetPeriod, GatewayBudgetReservationId, GatewayCallId, GatewayGovernancePolicy,
     GatewayLimit, GatewayLimitSubject, GatewayPolicySubject, GatewayPolicyTarget,
-    GatewayUsageAmount, ModelRef, ProviderAdapter, UnknownCostPolicy,
+    GatewayUsageAmount, ModelRef, UnknownCostPolicy,
 };
 use wyrd_sql::WyrdPostgres;
 use wyrd_sql::queries::gateway_admission::{
@@ -135,8 +135,7 @@ impl Accounted {
     /// of `admission`.
     ///
     /// Billable attempts are priced with the pricing version selected at
-    /// admission; a non-billable attempt, including every mock attempt,
-    /// carries unknown normalized usage and cost and is charged nothing. The
+    /// admission; a non-billable attempt carries unknown usage and cost. The
     /// call's usage is the per-dimension sum and its cost the sum of attempt
     /// costs, each known only when every billable attempt's value is known.
     ///
@@ -300,7 +299,7 @@ impl<'p> GatewayLedger<'p> {
     ///    bound's tokens per covered attempt) is unbounded;
     /// 2. when a budget applies or unknown cost is rejected, drops candidates
     ///    whose cost cannot be bounded from active pricing and the usage
-    ///    bound, a mock candidate's bound being zero; and
+    ///    bound; and
     /// 3. sums the bounded cost of every remaining candidate as the reserve
     ///    of each applicable budget.
     ///
@@ -349,20 +348,7 @@ impl<'p> GatewayLedger<'p> {
         let exposure = |plan: &CallPlan, target| {
             attempt_tokens.map(|tokens| tokens.saturating_mul(covered_attempts(plan, target)))
         };
-        // A mock candidate reaches no provider, so its bounded cost is zero
-        // rather than any configured provider price.
-        let mocks: Vec<ModelRef> = plan
-            .candidates
-            .iter()
-            .filter(|candidate| {
-                matches!(candidate.deployment.adapter, ProviderAdapter::Mock { .. })
-            })
-            .map(|candidate| candidate.model.clone())
-            .collect();
         let bound = |model: &ModelRef| {
-            if mocks.contains(model) {
-                return Some(GatewayCost::zero());
-            }
             PricedModel::select(call.governance, model, now)?.cost(call.usage_bound?)
         };
 

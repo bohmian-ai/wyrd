@@ -976,20 +976,6 @@ value with `WYRD_GATEWAY_400_INVALID_REQUEST` naming `fallback` before any
 dispatch, and consumes the header without forwarding it to a provider. Without
 the header, tenant fallback policy applies unchanged.
 
-A tenant provider deployment may use the internal `mock` adapter,
-`{"mock": {"rules": [...]}}` with `auth: none`, in every deployment profile.
-Ordinary authorization, routing, admission, limits, deadlines, capture and
-accounting apply; the attempt runs at the gateway's Rust dispatch boundary and
-answers a buffered OpenAI Chat Completions call with the unchanged `response`
-of the first rule whose `model` equals the selected model and whose optional
-`last_message_role` and literal `contains` text match. Rules are stateless
-fixture data. An unmatched or streamed call, another ingress dialect, and a
-plan mixing mock and network deployments are refused with
-`WYRD_GATEWAY_400_INVALID_REQUEST` before any attempt; other operations are not
-served. Evidence names provider `mock`; fixture usage stays on the attempt as
-provider usage, and the attempt is never billable, so it is unpriced and
-charges no budget.
-
 ```
 POST /charge HTTP/1.1
 Host: billing-svc.acme.svc.cluster.local

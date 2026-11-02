@@ -1,10 +1,43 @@
 ---
 id: SPEC-wyrd-ui-main-integration
-revision: 14
+revision: 18
 status: approved
 ---
 
 # Migrate the Wyrd UI onto current main
+
+## Revision 18 — Local MockServer and a working live Observe UI
+
+The caller explicitly directed this scope on 2026-11-02: retire the old
+TASK-004 revision assignments, create two replacements, and make `mise run
+dev:full` run the canonical Python application with a mock LLM service so the
+user can navigate the real shell and see traces, spans, logs and metrics.
+This records approval of those requested outcomes, not implementation,
+readiness, review PASS or human visual acceptance.
+
+The mock is optional local development tooling. Use official MockServer and
+the gateway's existing OpenAI endpoint override, including for independent
+queued judges. Provider identity, credentials, routing, capture and settlement
+retain their ordinary behavior. No Rust mock provider, runtime SDK/header
+selection, nonbillable policy, schema change or verification propagation is
+required. The earlier internal-mock designs are retired, not prerequisites.
+
+[TASK-004-REV-01](tasks/TASK-004-revision/TASK-01-mockserver.md) owns the local
+fixture service. [TASK-004-REV-02](tasks/TASK-004-revision/TASK-02-live-observe-workflow.md)
+owns the canonical current-SDK batch and complete shell/Observe delivery,
+including the former TASK-012/020/021/022 outcomes and outstanding TASK-004/R1
+component acceptance. TASK-004 stays incomplete until that live workflow,
+independent task review and individual human acceptance are complete. The
+[retired revisions](references/retired-task-004/) preserve old evidence only.
+Preserve the caller's cleanup deletions and unrelated component/UI work.
+
+The development batch defaults to 3,000 requests at concurrency 8. Its model
+responses are scripted; its HTTP requests, tools, Runs, verification execution
+and retained telemetry use the real application and server. MockServer adds
+one local container dependency and no paid inference requirement. The existing
+ephemeral environment retains evidence during a running session, not across
+restart. Full-library and later MCP shipping obligations remain unchanged;
+only this Observe slice has the existing early-live ordering exception.
 
 ## Objective and authority
 
@@ -368,7 +401,8 @@ implementor never sees two versions of anything.
   Pause before beginning the next dependent slice until the human has inspected
   the current slice. Every in-scope inventory component must be fully implemented, tested,
   and visually accepted on desktop and mobile before the library ships or
-  conventional pages begin. Fixture-only progress cannot satisfy that gate.
+  conventional pages begin, except the early live slice in REQ-039.
+  Fixture-only progress cannot satisfy that gate.
 
 ### UI design decisions — canvas revision (caller, 2026-10-19)
 
@@ -990,11 +1024,18 @@ not protocol authority.
   `WyrdView` from the fixture view documents, each labeled with the canvas
   board it must match. The human inspects every component against
   `references/canvas/png/` on desktop and mobile, in light and dark, before
-  pages are built. Record component-level acceptance with the task evidence;
+  pages are built, except REQ-039's early live slice. Record component-level acceptance with the task evidence;
   accepting a family does not waive inspection of its individual components.
   Automated checks supplement human visual inspection rather than replace it.
 
-  **Build order (caller, 2026-10-19).**
+  **Build order (caller, 2026-10-19; early live exception in revision 15).**
+  REQ-037–040 and TASK-004-REV-02 may run after the existing foundation and Observe
+  implementation, before the remaining families and step 4. The slice's actual
+  browser workflow supplies its contextual visual checkpoint; existing required
+  trace-component implementation is a prerequisite, but unrelated family or
+  StatStrip gallery acceptance is not. Required correctness/review still applies.
+  The gallery remains supporting state/visual evidence. This exception does not waive the
+  full-library shipping gate, remaining family proof or final MCP App journey.
   1. REQ-032 deletes the old UI. TASK-001 (packaging, install, launch, login)
      runs in parallel and is independent of the component library.
   2. Foundation: `wyrd-ai-ui` package and workspace, generated prop types,
@@ -1098,7 +1139,7 @@ not protocol authority.
   `ServiceSpec.charts` (REQ-025), where it is versioned and reviewed in Change
   Requests.
 
-- **REQ-034 — Primary conventional UI journey.** TASK-012 establishes real
+- **REQ-034 — Primary conventional UI journey.** TASK-004-REV-02 establishes real
   browser automation of the deployed production BFF and Rust server using
   repository-managed Postgres, public login and session boundaries. Each
   assembled page extends it with its actual user workflow: sign in, navigate,
@@ -1152,6 +1193,126 @@ not protocol authority.
   untested commercial client. Host wiring/runner layout are reversible test
   choices; missing supported integration blocks the live journey rather than
   authorizing a replacement production harness or security bypass.
+
+### Live local development and Observe delivery — revision 18
+
+- **REQ-037 — Optional local MockServer.** Task 01 starts official MockServer
+  with static OpenAI-compatible application/tool/judge expectations, bounded
+  initializer-aware readiness and owned cleanup. Use the existing development
+  OpenAI endpoint override and ordinary dummy credentials. All app and queued
+  judge model routes in this workflow resolve there; no external inference or
+  real-provider fallback is configured. Unmatched requests fail visibly.
+  Expectations are repeatable under concurrent requests, not consumed scripts.
+  Retain ordinary provider identity (`openai`), usage/pricing/budget behavior,
+  authentication, authorization, routing, admission, capture and settlement.
+  This is optional dev tooling, not a new provider enum, mock deployment/key/
+  tenant, SDK scope/header, billing policy, evidence field, migration or queue
+  feature. Production endpoint restrictions stay intact. Existing real-provider
+  development remains available outside this fixture-backed workflow.
+
+- **REQ-038 — Canonical development workload.** `mise run dev:full` starts the
+  existing real server/database/UI lifecycle, Task 01's fixture service and
+  canonical `bohmian-ai/wyrd-example-py`, provisions normal tenant/Cards/provider
+  configuration, and runs 3,000 application HTTP requests at concurrency 8 by
+  default. Allow smaller bounded runs and `dev:batch` against the same running
+  environment. No paid model key, synthetic server, fabricated evidence rows,
+  benchmark framework or direct writes to protected Bifrost tables are required.
+
+  Pin canonical source initially to `03428e1a4a35c8f23f71a95cae08e956ca317c9b`.
+  Deliver application/batch/telemetry changes as a reviewable patch outside the
+  active change packet, apply it to a clean pinned checkout and record effective
+  source identity. Do not copy a second app into Wyrd or silently follow a dirty
+  checkout/mutable branch. Local patch delivery needs no upstream publication.
+  Build/import this checkout's host-compatible production SDK wheel through
+  the canonical vendor source and prove artifact origin/digest, not just version.
+
+  The default workload is 2,400 shipping asks, 300 refund asks, 150 model-free
+  GET /openapi.json requests and 150 unknown-order asks returning HTTP 404.
+  Actual application tools run; direct refund checks fail as expected and still
+  submit queued checks. The local judge returns a valid scripted passed verdict
+  with a reachable order /price citation, not a claim of evaluation quality.
+  No driver retries enlarge the denominator. Report HTTP outcomes, Runs,
+  immediate/queued checks, attempts and retained spans/logs/metrics separately.
+  Public bounded execution waits and signal readback determine completion;
+  missing evidence, unexpected errors or nonterminal work fail the batch.
+
+  Emit observations through existing SDK-installed OTel providers, including
+  ordinary HTTP-only/error traces and application logs/metrics. Keep one app
+  Run owner; missing attribution stays null. Use normal export while running
+  and graceful public shutdown drain, not a development flush endpoint.
+  Start the batch once per backend lifecycle; Vite reload does not rerun it.
+  Preserve/disclose current ephemeral reset and credential replacement, keep
+  healthy services available after setup/batch failure, and clean up only owned
+  children on interruption. Add no new reset/schema-repair/persistence workflow.
+
+- **REQ-039 — Fully usable live Observe slice.** Task 02 owns the complete
+  shell, Traces/Spans, Logs and Metrics outcomes formerly assigned to
+  TASK-012/020/021/022. Use `/t/[tenantKey]/observe` with shareable
+  `signal=traces|logs|metrics`, plus `mode=traces|spans` for traces. Default to
+  traces. Preserve real login/logout, tenant/settings, theme and honest disabled
+  future navigation; no gallery/fixture fallback in production data paths.
+
+  Range/timezone, applied SQL predicate/facets, grouping, mode, selected exact
+  record and return state remain shareable/restorable. One resolved range and
+  predicate drives the selected signal's charts/facets/list. Supersession and
+  cancellation cannot overwrite newer state. Live hold/pause/resume/new-row
+  behavior preserves investigation. Traces retain root versus flat semantics,
+  exact counts, waterfall/selected span/recorded messages/attributes/exceptions,
+  and authorized untagged/out-of-list-range evidence. Logs include actual
+  severity/body/attributes, timeline, wrap/paging/columns and attribute filter/
+  exclude/open-trace actions. Metrics include selector/grouping/chart/legend,
+  selectable series summaries and line visibility with truthful recorded kinds,
+  units, temporality, precision, histogram/summary shapes and missing values.
+  Unsupported plots/aggregates remain unavailable; no fabricated percentiles.
+
+  Reuse shared components/loaders through authenticated BFF/executors; pages own
+  host/layout state, not SQL or domain aggregation. Extend missing shared
+  Metrics semantics without a second data service or wire encoding. Preserve
+  exact displayed integer values through existing query projection/result
+  capabilities; approximate geometry cannot silently replace exact evidence.
+  Complete chart Open in Query at `/t/[tenantKey]/query` with exact SQL/typed
+  binds, authorized bounded rerun/cancel and truthful terminal/error states.
+  Full Query catalog/History/chart authoring remains outside this task.
+
+  Carry all TASK-004/R1 obligations and proof into Task 02, including generic
+  names/aliases, typed grouping, component fidelity, reusable Logs/Metrics and
+  StatStrip presentation. Real-browser automation and individual desktop/mobile,
+  light/dark human acceptance cover Traces, Spans, Logs, Metrics and named
+  components. Gallery proof supplements, never substitutes for live data.
+  This slice precedes unrelated families/production MCP registration without
+  waiving their final obligations. TASK-004 is incomplete until this delivery
+  and its independent review/visual acceptance finish.
+
+- **REQ-040 — SQL predicate filtering with trace semantics.** WHERE accepts an
+  optional single SQL predicate over the selected signal table's described columns, not a replacement
+  SELECT. It supports parentheses, AND/OR/NOT, scalar comparisons, IS NULL /
+  IS NOT NULL, IN, BETWEEN and LIKE/ILIKE with literals. Statements, subqueries,
+  relation changes, parameters supplied inside the predicate, comments and
+  unsupported constructs fail visibly. Empty input means no extra predicate.
+  Applying invalid input retains the last successful data with an explicit
+  validation error; the draft is not marked applied. The predicate cannot
+  escape the selected range, tenant/table authorization or read/result bounds.
+
+  Add one narrow read to the existing query/catalog owner:
+  `POST /v1/query/predicate` and MCP `bifrost.validate_predicate`, projected
+  through `wyrd-client::Bifrost` and the three first-class SDKs. Request fields
+  are `namespace`, `name`, `expression`; response is normalized `expression`.
+  The expression has an 8 KiB UTF-8 ceiling. Table visibility/query permission
+  is checked before schema details are exposed. The server reuses its installed
+  SQL parser, requires expression-end-of-input and validates column references
+  against the described table. It returns canonical expression SQL or the
+  existing stable validation/denial error, not an executable result or token.
+  This adds no durable state or second query service. Full queries still pass
+  existing canonical execution authorization/validation on every execution.
+
+  Shared signal inputs carry optional `where_sql` beside existing structured
+  `where` filters. Portable loaders validate the expression through that read
+  before composing dependent chart/facet/list requests; parenthesized SQL
+  composition retains the fixed template, typed binds and bounds. A failed
+  validation issues no dependent reads. Node/custom-app and MCP executors
+  project the same contract. Generic `RecordTable.sql` remains generic; it is
+  not a substitute for trace-mode filtering/navigation/counts. Literal values
+  in facet filters remain bound and do not rewrite the author's SQL text.
 
 ## Invariants, constraints, and non-goals
 
@@ -1259,15 +1420,19 @@ not protocol authority.
 | AC-008 | Query, traces, logs, and metrics each read current canonical data, respect authorization/time bounds, and do not present failed/partial reads as success | Existing Bifrost/identity fixtures and narrow UI consumer journeys, terminal/cancellation regressions, separate page inspections |
 | AC-009 | Verification screens show generic requirements/verdicts/evidence and correct subject/Verifier/execution identities; summaries agree with those retained facts | Real generic verification-to-UI journey and focused projection tests; separate verification and summary checkpoints |
 | AC-010 | All original draft/reference bytes remain available with provenance; every task is self-contained, source-backed, narrowly verified, and visually inspectable; independent task readiness findings are resolved or surfaced | Preservation hashes, evidence inventory, obligation/task map and independent plan-readiness-reviewer findings/dispositions |
-| AC-011 | Every in-scope inventory component (excluding deferred Ask/saved views) is fully implemented, tested, and individually accepted on desktop/mobile in light/dark before library shipment and conventional page work; unmet platform prerequisites block completion rather than disappear behind fixtures | Per-component interaction/accessibility/state evidence, applicable live authorization journeys, and recorded human gallery acceptance |
+| AC-011 | Every in-scope inventory component (excluding deferred Ask/saved views) is fully implemented, tested, and individually accepted on desktop/mobile in light/dark before library shipment; REQ-039 permits one early live slice with contextual individual inspection before other conventional page work; unmet platform prerequisites block completion rather than disappear behind fixtures | Per-component interaction/accessibility/state evidence, applicable live authorization journeys, gallery evidence and the early slice's individual live-page acceptance |
 | AC-012 | Rust-owned opaque sessions support SSO and recovery, reject tampering/expiry/revocation/tenant mismatch and CSRF, preserve safe metadata/settings/chooser/logout, continue across two replicas/restarts, and require no additional deploy secret/env/service; old credential cookies require re-login | Real two-replica native and nginx browser journey, SQL/session negative tests, served cookie-auth contract, source/config audit and unchanged bearer/device/platform regressions |
-| AC-013 | Conventional UI users complete each page's real workflow in a browser against deployed BFF/server, with truthful range/identity, failure and tenant behavior | REQ-034; TASK-012 browser foundation and TASK-013–026 focused real-browser journeys, plus per-page human acceptance |
+| AC-013 | Conventional UI users complete each page's real workflow in a browser against deployed BFF/server, with truthful range/identity, failure and tenant behavior | REQ-034; TASK-004-REV-02 browser foundation/Observe journeys and remaining page journeys, plus per-page human acceptance |
 | AC-014 | A real agent conversation produces an MCP App view, refines it on follow-up, and supports in-app range reloads under the viewer's permissions without opening Wyrd UI or building an app | REQ-035; TASK-011 gated live agent plus real-browser host evidence and deterministic deployed-host negatives; missing credentials/host are BLOCKED |
 | AC-015 | A view document places panels on the 12-column grid; with a host layout handler a reader resizes and moves panels by pointer and keyboard with grid snapping and no overlap, the handler receives the whole updated document, charts fill their resized panels, narrow views stack, and a document without `layout` renders as before; out-of-range layouts fail validation | REQ-036; unit tests for schema bounds, collision resolution and handler output; real-browser gallery and AppBridge artifact evidence at desktop and mobile in light and dark; recorded human gallery acceptance |
 | AC-016 | After the upstream cutover, discovery, descriptions, built-in SQL and shipped examples/fixtures agree on the `bifrost` catalog and canonical fields in each in-scope host; obsolete authored SQL fails visibly without rewriting or fallback | REQ-014/030; focused SDK/MCP/BFF query and description journeys, example smoke and affected foundation proof, including denied and obsolete-reference cases |
 | AC-017 | Two releases sharing a component and stable account remain distinct by workload; component and account queries select their own dimensions; rootless/subjectless rows keep truthful nulls and correlations grant no read access | REQ-023/024/028; real accepted telemetry/results with different workload, subject and account identities, exact-release queries, null cases and existing tenant/table-denial proof |
 | AC-018 | Observe preserves signal-specific types, event/admission time, integer precision, missing values and returned exception semantics after schema adoption | REQ-022/028/030; recorded typed signal fixtures and live reads covering distinct timestamp units, integer/double points, histogram/summary/exemplar data, nullable promotions and exception-versus-error cases |
 | AC-019 | Verification renders waiting separately from recorded outcomes, keeps selected results and workload-scoped membership exact, opens authorized cross-workload/untagged trace citations beyond originating list filters, and preserves completed judgments after late spans arrive | REQ-018/026/027; real queued-arrival, direct-absence and late-arrival consumer journeys plus focused citation/read-denial and pinned-membership checks; no client-owned retry or presumed trace snapshot |
+| AC-020 | Initialized local MockServer serves ordinary gateway app/tool/judge calls concurrently with explicit unmatched/setup failures, existing provider/accounting behavior and no external inference | REQ-037; real gateway fixture journeys, startup/readiness/cleanup and static unchanged-contract proof |
+| AC-021 | Normal dev:full runs the pinned canonical example with this checkout's production SDK, dispatches 3,000 requests and confirms actual retained spans, logs, metrics and terminal checks while UI remains usable | REQ-038; source/wheel identity, exact case accounting, public waits/readback and lifecycle/failure proof |
+| AC-022 | A signed-in user investigates the batch through the real shell and Traces/Spans, Logs and Metrics, including range/SQL/facets, live holds, exact details/links and truthful metric semantics | REQ-039; production-BFF/server real-browser journeys, all transferred page/component scope and individual desktop/mobile light/dark acceptance |
+| AC-023 | The same valid SQL predicate governs signal charts/facets/lists in Node and MCP without losing counts/navigation; malformed, injected, unauthorized or out-of-schema input fails before dependent reads | REQ-040; pure parser and portable-loader regressions plus real first-class validation/read journeys and adversarial browser cases |
 
 Task planning must choose exact focused commands from inspected current owners;
 the evidence document identifies known commands and coverage gaps. No build,
@@ -1275,6 +1440,12 @@ test, or runtime success is claimed by this specification. Final integrated revi
 combined proof and cross-task seams; task gates remain bounded to their owners.
 
 ## Open material decisions and approval
+
+The caller's 2026-11-02 instruction approves revision 18's replacement local
+MockServer and complete live Observe outcomes. New implementation tasks remain
+proposed; no implementation, review or visual PASS is implied. There is no open
+mock-selection/judge-propagation decision: the existing dev endpoint override
+serves both. The full Logs/Metrics pages are explicitly included in this slice.
 
 Revision 14 approves the catalog/schema consumer alignment,
 managed attribution and Workload labels, signal fidelity, and verification
@@ -1441,6 +1612,16 @@ reported live-proof blocker, never an assumed capability or silent pass.
   Approved by the caller on 2026-10-29, after main shipped the service
   packet's schemas and `workload_card_uid` was confirmed to name a Service only.
 
+- Revision 15 (2026-10-30): approved by the caller after readiness review and
+  the addition of five separately invoked execution stages. Follows the request for one
+  remediation delivering an internal gateway mock, a canonical 1,000-request
+  dev:full workflow using the current SDK, and a fully functional live Traces
+  workbench. Fixes the minimal mock and SQL predicate contracts, transfers
+  shell/trace/browser-tooling ownership to TASK-004-R2, and allows that live
+  review before unrelated component families and the production MCP journey.
+  Existing component work, tenant/security boundaries and final library/MCP
+  obligations remain; approval makes no implementation or visual acceptance claim.
+
 Authorities: `AGENTS.md`; `agent_docs/index.md`;
 `architecture/wyrd-design.md`;
 `architecture/bifrost-design.md`; `architecture/wyrd-security-posture.md`;
@@ -1449,3 +1630,22 @@ Authorities: `AGENTS.md`; `agent_docs/index.md`;
 `TESTING.md`; repository `wyrd-ui`
 guidance for styling. These are repository-relative authority paths, not copies
 of skill instructions.
+
+- Revision 16 (2026-10-30): caller-approved correction of rejected deployment-based mocking.
+  Runtime SDK scope selects dispatch fixtures in the same tenant/deployment;
+  direct/queued verification snapshots and retained provenance close the path.
+  Existing TASK-004-R2 and its five stages are revised, not replaced.
+
+- Revision 17: draft following the caller's rejection of all extra machinery.
+  Only client runtime selection and provider dispatch remain; no calls-schema,
+  verification-persistence, routing-policy or ledger-policy additions.
+  TASK-004-R3 corrects Stage 1; old results remain historical evidence.
+
+- **Revision 18 (2026-11-02, caller-directed scope approved):** retire R1/R2/R3
+  as execution assignments; use optional external MockServer through existing
+  endpoint configuration; create TASK-004-REV-01 and TASK-004-REV-02. Expand the
+  early live slice to complete shell/Traces/Spans/Logs/Metrics and a default
+  3,000-request canonical batch. Preserve all transferred component/page proof,
+  no-paid-inference development and existing ephemeral lifecycle. No internal
+  mock, SDK scope/header, ledger/schema change or verification propagation.
+  Historical revisions 15–17 below/above record superseded decisions only.

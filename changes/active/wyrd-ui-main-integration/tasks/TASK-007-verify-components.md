@@ -1,8 +1,8 @@
 # TASK-007 — Generic verification component family
 
-Spec: [revision 11, approved](../spec.md). Status: Proposed; platform prerequisite holds completion.
+Spec: [revision 15, approved](../spec.md). Status: Proposed; listed dependencies and required evidence govern completion.
 Dependencies: [TASK-003](TASK-003-shared-ui-foundation.md), [TASK-004](TASK-004-observe-components.md), [TASK-005](TASK-005-card-components.md).
-Mapped obligations: REQ-030, REQ-018, REQ-026, REQ-027, REQ-020, AC-009, AC-011, AC-010; all INV-001–INV-007 apply, with TASK-001-specific exclusions only in TASK-001.
+Mapped obligations: REQ-030, REQ-018, REQ-026, REQ-027, REQ-020, AC-009, AC-011, AC-010, AC-016, AC-017, AC-019; all INV-001–INV-007 apply, with TASK-001-specific exclusions only in TASK-001.
 
 External dependency: Separately specified non-sensitive requirement-outcome read contract; REQ-029 for AttentionList CR rows. Current sensitive outcome is not reclassified here. This task does not authorize implementation of that platform prerequisite. Contract-independent work may proceed, but fixtures/unavailable controls cannot close it.
 
@@ -14,14 +14,20 @@ Generic Verifier definitions and authoritative recorded run/session/drift result
 
 Own VerifierGraph, VerificationResult, RequirementDetail, DriftFeatureTable, VerificationBindings and AttentionList. Resolve selected result through execution readback before coloring its exact Verifier definition. Separate `subject_card_uid`, `verifier_card_uid`, `execution_id`, application `run_id` and binding root `workload_card_uid`. No new session model, evidence upload read or frontend judgment calculation.
 
-Use committed main `8651b96fd`, the approved spec and current canvas. Historical `wyrd-server-ui` at `7bfc3a8a` supplies read/state/test evidence only. Current uncommitted trace changes are unrelated and must be preserved. Package components render typed props; portable loaders plan/shape; executor/host boundaries own credentials, authorized IO and action execution. Preserve tenant isolation, stable errors and server audit behavior. No speculative framework, test-only configuration or replacement selectors.
+Use approved spec revision 15, the current canvas and current source contracts. `8651b96fd` is the historical migration baseline, not the current schema authority. Historical `wyrd-server-ui` at `7bfc3a8a` supplies read/state/test evidence only. Package components render typed props; portable loaders plan/shape; executor/host boundaries own credentials, authorized IO and action execution. Preserve tenant isolation, stable errors and server audit behavior. No speculative framework, test-only configuration or replacement selectors.
 
 | Capability | Existing owner/symbol | Inspected callers/tests | Missing behavior | Selected extension | New machinery justification |
 |---|---|---|---|---|---|
 | Recorded verification | `sdks/wyrd-sdk-ts/wyrd/src/index.ts::verify.Execution.status`; `crates/wyrd-spec/src/verification/execution.rs::VerificationExecutionState`; `crates/vala/vala-bifrost-redux/src/tables/verification/results.rs::ResultsTable` | `sdks/wyrd-sdk-ts/wyrd/tests/integration/verify-in-real-time.test.ts`; server `tests/integration/pg_verification_groups.rs` | Component presentation and selected-result resolution missing | Existing execution readback, exact Verifier Card and retained results | No group lifecycle, judgment computation or evidence-upload read |
 | Drift detail | `crates/vala/vala-bifrost-redux/src/tables/drift/result_features.rs::ResultFeaturesTable`; `crates/wyrd-spec/src/card/verifier/mod.rs::VerifierSpec` | SDK verifier-building-blocks/verify-in-real-time sources; results table sensitive outcome policy | Reusable graph, feature projection and requirement detail missing | Join by result_id/requirement_id and exact baseline_ref; preserve sensitive reads until approved prerequisite | No baseline distribution or new drift Card |
 
-Paths under `src/mcp`, `src/query` or `tests/integration` described as server owners are rooted at `crates/wyrd/wyrd-server/`. Proposed TASK dependencies are not capabilities already present on main.
+Paths under `src/mcp`, `src/query` or `tests/integration` described as server owners are rooted at `crates/wyrd/wyrd-server/`. Revalidate source-map availability against the current checkout; historical missing-behavior claims do not override delivered contracts or completed dependencies.
+
+## Required Board Coverage
+
+VerifierGraph → Verifier definition and Verify drawer graph; VerificationResult → Verify/VerifySession/VerifyDrift drawer bodies; RequirementDetail → selected requirement; DriftFeatureTable → VerifyDrift feature table; VerificationBindings → Agent/Service bound Verifiers; AttentionList → Home/Service attention. Use approved Workload ownership labels.
+
+Record reference region, implementation screenshot, state, theme and viewport. Distinguish behavioral proof, visual comparison and individual human acceptance. Every difference needs a fix or an explicitly approved exception. See the [audit and evidence rules](../references/task-audit-2026-10-29.md).
 
 ## Approach
 
@@ -34,7 +40,7 @@ Paths under `src/mcp`, `src/query` or `tests/integration` described as server ow
 
 ### Scenario 1 — Definition and result identities
 
-**Behavior.** Plain graph and result-colored graph share exact VerifierSpec; later group reviews remain distinct, scoped to owner/tenant, and pinned membership excludes abandoned results and unrelated same-key groups.
+**Behavior.** Plain graph and result-colored graph share exact VerifierSpec; later group reviews remain distinct, scoped to owner/tenant, and pinned membership excludes abandoned results and unrelated same-key groups. An addressed pending/running/retrying execution with no selected result shows waiting. Direct missing evidence and exhausted queued evidence display the server-recorded inconclusive outcome; the UI computes no verdict. Late-arriving spans never rewrite the selected completed judgment. Exact trace/span citations read authorized cross-workload, untagged and out-of-list-range evidence while preserving source filters/position; denied or truncated reads remain visible. Exercise each case in this scenario and in the real authorized-host/page journey using existing execution status readback, not a new list API or retry controller.
 
 **RED.** Add family graph/identity loader tests; shared result components are absent. Run this exact focused command (new Vitest title where applicable):
 

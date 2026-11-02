@@ -3,7 +3,6 @@
 use std::collections::BTreeSet;
 
 use serde::{Deserialize, Deserializer, Serialize};
-use skald_spec::wire::openai_chat::OpenAiChatResponse;
 
 use super::{
     BUILTIN_PROVIDER_IDS, GatewayContractError, GatewayOperation, ProviderCredentialView,
@@ -47,8 +46,7 @@ const RESERVED_HEADER_PREFIXES: [&str; 4] = ["proxy-", "x-forwarded-", "sec-", "
 /// The built-in variants use Skald's typed provider protocols and authenticate
 /// with a credential of their reserved provider identity. `OpenAiCompatible`
 /// uses the standard OpenAI routes under `base_url` with a credential of any
-/// non-reserved provider identity. `Mock` answers inside the gateway from
-/// explicit fixture rules, contacts no upstream, and takes no credential.
+/// non-reserved provider identity.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 #[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
 pub enum ProviderAdapter {
@@ -78,68 +76,6 @@ pub enum ProviderAdapter {
         /// Absolute base URL whose standard OpenAI routes the deployment uses.
         base_url: AbsoluteUrl,
     },
-    /// Internal mock answering buffered OpenAI Chat Completions from fixture
-    /// rules; the first matching rule's response is the answer.
-    #[serde(rename = "mock")]
-    Mock {
-        /// Ordered fixture rules; nonempty.
-        rules: Vec<MockRule>,
-    },
-}
-
-/// One stateless fixture rule of the [`ProviderAdapter::Mock`] adapter.
-///
-/// Every supplied condition must match a call for the rule to answer it.
-/// Rules never consume state, so concurrent calls see the same rules.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
-#[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
-#[serde(deny_unknown_fields)]
-pub struct MockRule {
-    /// Selected model identifier the call must name exactly.
-    pub model: ModelId,
-    /// Protocol role the conversation's last message must have, such as
-    /// `user` or `tool`.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub last_message_role: Option<String>,
-    /// Literal text some textual message content must contain; nonempty.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub contains: Option<String>,
-    /// Buffered OpenAI Chat Completions response returned unchanged.
-    #[schemars(with = "skald_spec::wire::openai_chat::OpenAiChatResponse")]
-    #[cfg_attr(feature = "server", schema(value_type = Object))]
-    pub response: serde_json::Value,
-}
-
-impl MockRule {
-    /// Rejects a rule with an empty or invalid condition, or a response that
-    /// is not a buffered Chat Completions answer with at least one choice.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`GatewayContractError`] naming `last_message_role`,
-    /// `contains`, or `response`.
-    fn validate(&self) -> Result<(), GatewayContractError> {
-        if let Some(role) = &self.last_message_role {
-            super::validate_text("last_message_role", role)?;
-        }
-        if self.contains.as_deref() == Some("") {
-            return Err(GatewayContractError::new(
-                "contains",
-                "must be omitted or nonempty",
-            ));
-        }
-        let buffered = OpenAiChatResponse::deserialize(&self.response).is_ok_and(|response| {
-            response.object == "chat.completion" && !response.choices.is_empty()
-        });
-        if buffered {
-            Ok(())
-        } else {
-            Err(GatewayContractError::new(
-                "response",
-                "must be a buffered chat.completion response with at least one choice",
-            ))
-        }
-    }
 }
 
 impl ProviderAdapter {
@@ -153,33 +89,20 @@ impl ProviderAdapter {
             Self::Gemini => Some("gemini"),
             Self::Vertex { .. } => Some("vertex"),
             Self::Jev => Some("jev"),
-            Self::OpenAiCompatible { .. } | Self::Mock { .. } => None,
-        }
-    }
-
-    /// GenAI provider name evidence records for this adapter: its built-in
-    /// provider, `openai_compatible`, or `mock`.
-    #[must_use]
-    pub const fn provider_name(&self) -> &'static str {
-        match (self, self.builtin_provider()) {
-            (_, Some(provider)) => provider,
-            (Self::Mock { .. }, None) => "mock",
-            (_, None) => "openai_compatible",
+            Self::OpenAiCompatible { .. } => None,
         }
     }
 
     /// Whether a credential of `provider` may authenticate this adapter.
     ///
-    /// A built-in adapter accepts only its reserved provider identity,
-    /// `OpenAiCompatible` only a non-reserved one, and `Mock` none. The
-    /// deployment name never takes part, so naming a deployment cannot widen
-    /// credential matching.
+    /// A built-in adapter accepts only its reserved provider identity, and
+    /// `OpenAiCompatible` only a non-reserved one. The deployment name never
+    /// takes part, so naming a deployment cannot widen credential matching.
     #[must_use]
     pub fn accepts_credential_provider(&self, provider: &ProviderId) -> bool {
-        match (self, self.builtin_provider()) {
-            (Self::Mock { .. }, _) => false,
-            (_, Some(reserved)) => reserved == provider.as_str(),
-            (_, None) => !BUILTIN_PROVIDER_IDS.contains(&provider.as_str()),
+        match self.builtin_provider() {
+            Some(reserved) => reserved == provider.as_str(),
+            None => !BUILTIN_PROVIDER_IDS.contains(&provider.as_str()),
         }
     }
 
@@ -191,15 +114,14 @@ impl ProviderAdapter {
     /// Anthropic and Google adapters carry Chat Completions only. Jev alone
     /// carries [`GatewayOperation::SystemOne`], plus Chat Completions as a
     /// pass-through whose last user message is the typed Jev request; it
-    /// never streams, embeds, or calls tools. `Mock` carries Chat Completions
-    /// only.
+    /// never streams, embeds, or calls tools.
     #[must_use]
     pub const fn serves(&self, operation: GatewayOperation) -> bool {
         match self {
             Self::OpenAi | Self::OpenAiCompatible { .. } => {
                 !matches!(operation, GatewayOperation::SystemOne)
             }
-            Self::Anthropic | Self::Gemini | Self::Vertex { .. } | Self::Mock { .. } => {
+            Self::Anthropic | Self::Gemini | Self::Vertex { .. } => {
                 matches!(operation, GatewayOperation::ChatCompletions)
             }
             Self::Jev => matches!(
@@ -393,43 +315,19 @@ pub struct ProviderDeployment {
 }
 
 impl ProviderDeployment {
-    /// Rejects a deployment whose model allowlist, capabilities, or mock
-    /// rules are invalid.
+    /// Rejects a deployment whose model allowlist or capabilities are invalid.
     ///
     /// A present `models` list must be nonempty and unique, and a present
     /// `capabilities` set nonempty with every operation one the adapter
-    /// [serves](ProviderAdapter::serves). A `Mock` adapter takes `auth: none`
-    /// and a nonempty list of [valid](MockRule) rules. Credential existence,
-    /// tenancy, and provider matching are enforced by the server against
-    /// persisted credentials.
+    /// [serves](ProviderAdapter::serves). Credential existence, tenancy, and
+    /// provider matching are enforced by the server against persisted
+    /// credentials.
     ///
     /// # Errors
     ///
-    /// Returns [`GatewayContractError`] naming `models`, `capabilities`,
-    /// `auth`, or `adapter.mock.rules[i]` for the violated rule.
+    /// Returns [`GatewayContractError`] naming `models` or `capabilities` for
+    /// the violated rule.
     pub fn validate(&self) -> Result<(), GatewayContractError> {
-        if let ProviderAdapter::Mock { rules } = &self.adapter {
-            if self.auth != ProviderAuth::None {
-                return Err(GatewayContractError::new(
-                    "auth",
-                    "must be none for the mock adapter",
-                ));
-            }
-            if rules.is_empty() {
-                return Err(GatewayContractError::new(
-                    "adapter.mock.rules",
-                    "must list at least one rule",
-                ));
-            }
-            for (index, rule) in rules.iter().enumerate() {
-                rule.validate().map_err(|error| {
-                    GatewayContractError::new(
-                        format!("adapter.mock.rules[{index}].{}", error.field),
-                        error.reason,
-                    )
-                })?;
-            }
-        }
         if let Some(models) = &self.models {
             if models.is_empty() {
                 return Err(GatewayContractError::new(
@@ -739,73 +637,6 @@ mod tests {
         for reserved in ["openai", "jev", "gemini"] {
             assert!(!compatible.accepts_credential_provider(&provider(reserved)));
         }
-    }
-
-    /// Proves a mock deployment round-trips, serves Chat Completions only,
-    /// accepts no credential, and rejects authentication, empty rules, empty
-    /// conditions, and non-buffered responses at the rule's path.
-    ///
-    /// # Panics
-    /// Panics when a valid mock fails or an invalid one validates.
-    #[test]
-    fn mock_deployment_requires_no_auth_and_buffered_rules() {
-        let answer = json!({
-            "id": "chatcmpl-fixture", "object": "chat.completion", "created": 0,
-            "model": "support-model",
-            "choices": [{"index": 0, "message": {"role": "assistant", "content": "hi"}, "finish_reason": "stop"}],
-        });
-        let document = json!({
-            "name": "local-mock",
-            "adapter": {"mock": {"rules": [{"model": "support-model", "last_message_role": "user", "contains": "order", "response": answer}]}},
-            "auth": "none",
-            "access": "open",
-        });
-        let mock = decode(document.clone());
-        mock.validate().expect("valid");
-        assert_eq!(serde_json::to_value(&mock).expect("encodes"), document);
-        assert_eq!(mock.adapter.provider_name(), "mock");
-        assert!(mock.serves(GatewayOperation::ChatCompletions));
-        assert!(!mock.serves(GatewayOperation::Embeddings));
-        assert!(!mock.serves(GatewayOperation::Responses));
-        assert!(
-            !mock
-                .adapter
-                .accepts_credential_provider(&ProviderId::new("mock").expect("provider"))
-        );
-        let field = |change: &dyn Fn(&mut serde_json::Value)| {
-            let mut value = document.clone();
-            change(&mut value);
-            decode(value).validate().map_err(|error| error.field)
-        };
-        assert_eq!(
-            field(&|value| value["auth"] = json!({"bearer": {"credential": "key"}})),
-            Err("auth".to_owned())
-        );
-        assert_eq!(
-            field(&|value| value["adapter"]["mock"]["rules"] = json!([])),
-            Err("adapter.mock.rules".to_owned())
-        );
-        assert_eq!(
-            field(&|value| value["adapter"]["mock"]["rules"][0]["contains"] = json!("")),
-            Err("adapter.mock.rules[0].contains".to_owned())
-        );
-        assert_eq!(
-            field(&|value| value["adapter"]["mock"]["rules"][0]["last_message_role"] = json!("")),
-            Err("adapter.mock.rules[0].last_message_role".to_owned())
-        );
-        for response in [
-            json!({"choices": []}),
-            json!({"id": "c", "object": "chat.completion.chunk", "created": 0, "model": "m", "choices": [{"index": 0, "message": {"role": "assistant"}}]}),
-            json!({"id": "c", "object": "chat.completion", "created": 0, "model": "m", "choices": []}),
-        ] {
-            assert_eq!(
-                field(&|value| value["adapter"]["mock"]["rules"][0]["response"] = response.clone()),
-                Err("adapter.mock.rules[0].response".to_owned())
-            );
-        }
-        let mut unknown = document;
-        unknown["adapter"]["mock"]["rules"][0]["queue"] = json!(true);
-        assert!(serde_json::from_value::<ProviderDeployment>(unknown).is_err());
     }
 
     /// Proves an apply document refuses an empty deployment list, repeated

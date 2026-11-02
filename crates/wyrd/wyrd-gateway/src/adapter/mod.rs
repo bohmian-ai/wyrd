@@ -8,9 +8,7 @@
 //! is rejected before dispatch rather than dropped. Jev speaks only its own
 //! `systemone` question protocol, carried as typed Skald [`JevRequest`] and
 //! answers; Chat Completions reach it only as a pass-through of that typed
-//! request in the last user message. The internal `mock` adapter answers
-//! buffered Chat Completions from its fixture rules without any upstream.
-//! [`complete`] maps the provider's answer back to the ingress
+//! request in the last user message. [`complete`] maps the provider's answer back to the ingress
 //! dialect and extracts usage; streamed answers relay through
 //! [`stream::relay`].
 
@@ -20,7 +18,6 @@ mod google;
 mod http;
 mod jev;
 mod media;
-mod mock;
 mod stream;
 
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -96,7 +93,7 @@ impl UnsupportedRequest {
 /// Upstream protocol family of a deployment.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Wire {
-    /// `OpenAI` routes, built-in or compatible, and the internal mock.
+    /// `OpenAI` routes, built-in or compatible.
     OpenAi,
     /// Anthropic Messages.
     Anthropic,
@@ -110,9 +107,7 @@ impl Wire {
     /// Protocol family `adapter` speaks.
     pub(crate) const fn of(adapter: &ProviderAdapter) -> Self {
         match adapter {
-            ProviderAdapter::OpenAi
-            | ProviderAdapter::OpenAiCompatible { .. }
-            | ProviderAdapter::Mock { .. } => Self::OpenAi,
+            ProviderAdapter::OpenAi | ProviderAdapter::OpenAiCompatible { .. } => Self::OpenAi,
             ProviderAdapter::Anthropic => Self::Anthropic,
             ProviderAdapter::Gemini | ProviderAdapter::Vertex { .. } => Self::Google,
             ProviderAdapter::Jev => Self::Jev,
@@ -136,8 +131,6 @@ pub(crate) enum Prepared {
     /// answer returns as Jev's own response. Boxed so the variant does not
     /// inflate every `Native`.
     Jev(Box<JevRequest>),
-    /// The buffered Chat Completions answer a mock rule selected.
-    Mock(Value),
 }
 
 /// Builds the upstream request of `body` for `model` on `deployment`.
@@ -154,8 +147,7 @@ pub(crate) enum Prepared {
 /// without a faithful target representation. Images and Audio pass through
 /// only to `OpenAI`-protocol adapters, as do Batches lifecycle bodies. Jev
 /// `systemone` bodies reach only Jev deployments; a Chat Completions body
-/// reaches Jev only as the typed Jev request in its last user message. A mock
-/// deployment answers only buffered `OpenAI` Chat Completions a rule matches.
+/// reaches Jev only as the typed Jev request in its last user message.
 pub(crate) fn prepare(
     ingress: IngressDialect,
     operation: GatewayOperation,
@@ -204,12 +196,6 @@ pub(crate) fn prepare(
                 Err(unsupported_operation(operation, &deployment.adapter))
             }
         },
-        (IngressDialect::OpenAi, ProviderAdapter::Mock { .. }) if chat && stream => Err(
-            UnsupportedRequest::new("stream", "the mock adapter answers buffered calls only"),
-        ),
-        (IngressDialect::OpenAi, ProviderAdapter::Mock { rules }) if chat => {
-            Ok(Prepared::Mock(mock::answer(body, model, rules)?))
-        }
         (IngressDialect::Jev, ProviderAdapter::Jev) if operation == GatewayOperation::SystemOne => {
             Ok(Prepared::Jev(Box::new(jev::request(body, model)?)))
         }
@@ -523,8 +509,8 @@ pub fn google_error_body(status: u16, message: &str, code: &str) -> Value {
 }
 
 /// Name of `adapter` as it appears on the wire.
-pub(crate) const fn adapter_name(adapter: &ProviderAdapter) -> &'static str {
-    adapter.provider_name()
+pub(crate) fn adapter_name(adapter: &ProviderAdapter) -> &'static str {
+    adapter.builtin_provider().unwrap_or("openai_compatible")
 }
 
 /// Rejection of `operation` on `adapter`.

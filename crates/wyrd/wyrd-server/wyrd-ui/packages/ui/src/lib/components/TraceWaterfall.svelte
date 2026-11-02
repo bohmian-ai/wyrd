@@ -1,8 +1,10 @@
 <!--
   Every retained span of one trace as a tree against the trace's timeline.
   Levels below the second start collapsed, except the path to the selected
-  span; "Expand all" opens every level and
-  "Errors only" keeps error spans and their ancestors. Names come from data.
+  span; a collapsed span shows how many children it holds. "Expand all" opens
+  every level and "Errors only" keeps error spans and their ancestors. An axis
+  marks round offsets from the trace start up to its end. Names come from
+  data; only the recorded status colours a span.
 -->
 <script lang="ts">
   import type { ActionProps } from '../contract.js';
@@ -55,6 +57,19 @@
     opened = next;
   }
 
+  /** An axis offset: milliseconds below a second, else seconds without trailing zeros. */
+  const axisText = (ms: number) => (ms > 0 && ms < 1000 ? `${Math.round(ms)}ms` : `${Number((ms / 1000).toFixed(2))}s`);
+  /** Round offsets from the start, about four of them, then the trace's end. */
+  const ticks = $derived.by(() => {
+    if (total <= 0) return [];
+    const rough = total / 4;
+    const power = 10 ** Math.floor(Math.log10(rough));
+    const step = ([1, 2, 5, 10].find((each) => each * power >= rough) ?? 10) * power;
+    const marks = [];
+    for (let at = 0; at < total * 0.9; at += step) marks.push(at);
+    return [...marks, total];
+  });
+
   const selectState = $derived(actions['trace.select']);
   const blocked = $derived(!onaction || selectState?.state === 'pending' || selectState?.state === 'unavailable');
 </script>
@@ -62,7 +77,7 @@
 {#if result.state === 'populated'}
   <div class="waterfall">
     <div class="tools">
-      <span class="meta">{spans.length} spans · {fmtDuration(Math.round(total))}</span>
+      <span class="caption">Waterfall · collapsed below 2 levels · selected path stays open</span>
       <button
         type="button"
         aria-pressed={allOpen}
@@ -71,16 +86,27 @@
       <button type="button" aria-pressed={errorsOnly} disabled={erring.size === 0} onclick={() => (errorsOnly = !errorsOnly)}>Errors only</button>
       <ActionNote state={selectState} />
     </div>
+    <div class="row axis" aria-hidden="true">
+      <span></span><span class="service"></span>
+      <span class="ticks">
+        {#each ticks as at, index (index)}
+          <span class:first={index === 0} class:last={index === ticks.length - 1} style:left="{(at / total) * 100}%">{axisText(at)}</span>
+        {/each}
+      </span>
+      <span></span>
+    </div>
     <ol role="tree" aria-label="Spans of trace {input.traceId}">
       {#each visible as span (span.spanId)}
         <li
           role="treeitem"
+          class="row"
           aria-level={span.depth + 1}
           aria-expanded={span.children > 0 ? open(span) : undefined}
           aria-selected={span.spanId === input.spanId}
           class:error={span.error}
         >
-          <span class="name" style:padding-left="{span.depth * 14}px">
+          <span class="name">
+            {#each { length: span.depth } as _, level (level)}<span class="guide" aria-hidden="true"></span>{/each}
             {#if span.children > 0}
               <button type="button" class="twisty" aria-label="{open(span) ? 'Collapse' : 'Expand'} {span.name}" onclick={() => toggle(span.spanId)}
                 >{open(span) ? '▾' : '▸'}</button
@@ -96,6 +122,7 @@
               {#if span.error}<span aria-label="error">✕</span>{/if}
               {span.name}
             </button>
+            {#if span.children > 0 && !open(span) && !errorsOnly}<span class="collapsed" title="{span.children} child spans collapsed">+{span.children}</span>{/if}
           </span>
           <span class="service">{span.service ?? '∅'}</span>
           <span class="track" aria-hidden="true">
@@ -123,7 +150,6 @@
     container-type: inline-size;
     display: flex;
     flex-direction: column;
-    gap: 8px;
     min-width: 0;
     color: var(--text);
     font-family: var(--font-sans);
@@ -132,21 +158,28 @@
     display: flex;
     flex-wrap: wrap;
     align-items: center;
-    gap: 8px;
+    gap: 6px;
+    padding: 8px 0;
   }
-  .meta {
+  .caption {
     margin-right: auto;
     color: var(--muted);
-    font: 11.5px var(--font-mono);
+    font: 11px var(--font-mono);
+    letter-spacing: 0.06em;
+    text-transform: uppercase;
   }
   .tools button {
+    height: 26px;
     border: 1px solid var(--border);
     border-radius: var(--r);
-    padding: 3px 9px;
-    background: var(--surface-2);
+    padding: 0 10px;
+    background: var(--surface);
     color: var(--text);
     font: 12px var(--font-sans);
     cursor: pointer;
+  }
+  .tools button:enabled:hover {
+    background: var(--surface-hover);
   }
   .tools button[aria-pressed='true'] {
     border-color: var(--declare);
@@ -159,30 +192,58 @@
   ol {
     margin: 0;
     padding: 0;
-    border: 1px solid var(--border);
-    border-radius: var(--r);
-    background: var(--surface);
     list-style: none;
   }
-  li {
+  .row {
     display: grid;
-    grid-template-columns: minmax(160px, 3fr) minmax(60px, 1fr) minmax(80px, 3fr) 56px;
+    grid-template-columns: minmax(0, 300px) 110px minmax(80px, 1fr) 64px;
     align-items: center;
     gap: 10px;
-    padding: 4px 10px;
-    border-top: 1px solid var(--border-soft);
+    height: 28px;
+    padding: 0 16px 0 14px;
+    border-left: 2px solid transparent;
     font: 12px var(--font-mono);
   }
-  li:first-child {
-    border-top: 0;
+  li:hover {
+    background: var(--surface-hover);
   }
   li[aria-selected='true'] {
+    border-left-color: var(--declare);
     background: var(--declare-soft);
+  }
+  .axis {
+    height: 20px;
+    color: var(--muted);
+    font-size: 11px;
+  }
+  .ticks {
+    position: relative;
+    height: 100%;
+  }
+  .ticks span {
+    position: absolute;
+    top: 3px;
+    transform: translateX(-50%);
+    white-space: nowrap;
+  }
+  .ticks .first {
+    transform: none;
+  }
+  .ticks .last {
+    transform: translateX(-100%);
   }
   .name {
     display: flex;
     align-items: center;
+    height: 100%;
     min-width: 0;
+    white-space: nowrap;
+  }
+  .guide {
+    flex: none;
+    align-self: stretch;
+    width: 14px;
+    border-left: 1px solid var(--border-soft);
   }
   .twisty {
     flex: none;
@@ -210,18 +271,25 @@
   .select:disabled {
     cursor: default;
   }
-  .error .select {
+  .collapsed {
+    flex: none;
+    margin-left: 6px;
+    color: var(--muted);
+  }
+  .error .select,
+  .error .duration {
     color: var(--danger);
   }
   .service {
     color: var(--muted);
+    font-size: 11px;
     overflow: hidden;
     text-overflow: ellipsis;
     white-space: nowrap;
   }
   .track {
     position: relative;
-    height: 8px;
+    height: 6px;
     background: var(--surface-2);
   }
   .bar {
@@ -234,6 +302,7 @@
     background: var(--danger);
   }
   .duration {
+    color: var(--muted);
     text-align: right;
     font-variant-numeric: tabular-nums;
   }
@@ -243,7 +312,7 @@
   }
   /* A narrow panel keeps the tree and timeline and drops the service; a phone keeps the tree. */
   @container (max-width: 560px) {
-    li {
+    .row {
       grid-template-columns: minmax(110px, 3fr) minmax(50px, 2fr) 56px;
     }
     .service {
@@ -251,10 +320,11 @@
     }
   }
   @container (max-width: 280px) {
-    li {
+    .row {
       grid-template-columns: minmax(0, 1fr) 56px;
     }
-    .track {
+    .track,
+    .ticks {
       display: none;
     }
   }

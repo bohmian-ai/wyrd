@@ -2,7 +2,9 @@
   One chart over read-only SQL: timeseries, bar, stat or table. A non-populated
   state renders EmptyState in place of the plot and never a value; a degraded
   terminal draws the plot with its partial notice. The footer names the exact
-  SQL and offers Open in Query with the executed binds.
+  SQL and offers Open in Query with the executed binds. A timeseries lists its
+  series with their latest, largest and mean plotted values; unticking a series
+  hides its line, and the series keeps its style while hidden.
 -->
 <script lang="ts">
   import type { ActionProps } from '../contract.js';
@@ -43,8 +45,22 @@
     data && input.type === 'timeseries' && result.state === 'populated' ? timeSeries(data, input.x, input.y, input.series) : []
   );
   const xs = $derived([...new Set(lines.flatMap((line) => line.points.map((point) => point.x)))].sort((a, b) => a - b));
+  /** Series the reader unticked, by caption; captions are unique per result. */
+  let hidden = $state.raw<ReadonlySet<string>>(new Set());
+  const drawn = $derived(lines.filter((line) => !hidden.has(line.label)));
+  /** Latest, largest and mean of the values a series plotted; it has at least one. */
+  const summary = (points: readonly { y: number }[]) => ({
+    latest: points[points.length - 1].y,
+    max: Math.max(...points.map((point) => point.y)),
+    mean: points.reduce((sum, point) => sum + point.y, 0) / points.length
+  });
+  function toggle(label: string) {
+    const next = new Set(hidden);
+    if (!next.delete(label)) next.add(label);
+    hidden = next;
+  }
   const bounds = $derived.by(() => {
-    const ys = lines.flatMap((line) => line.points.map((point) => point.y));
+    const ys = drawn.flatMap((line) => line.points.map((point) => point.y));
     const [low, high] = [Math.min(0, ...ys), Math.max(0, ...ys)];
     // Zero always shows; each signed side rounds outward, and an all-zero plot still spans one unit.
     const y0 = low < 0 ? -niceCeil(-low) : 0;
@@ -207,7 +223,7 @@
             role="application"
             aria-roledescription="chart"
             tabindex="0"
-            aria-label="{input.title ?? 'Time series'}: {lines.map((line) => line.label).join(', ')}"
+            aria-label="{input.title ?? 'Time series'}: {drawn.map((line) => line.label).join(', ')}"
             onfocus={() => (focused ??= xs.length - 1)}
             onblur={() => (focused = undefined)}
             {onkeydown}
@@ -233,6 +249,7 @@
             {/each}
             {#each lines as line, index (line.label)}
               {@const look = style(index)}
+              {#if !hidden.has(line.label)}
               <polyline
                 points={line.points.map((point) => `${sx(point.x)},${sy(point.y)}`).join(' ')}
                 stroke={look.stroke}
@@ -241,6 +258,7 @@
               {#each line.points.length <= 60 ? line.points : [] as point (point.x)}
                 <path class="marker" d={marker(look.marker, sx(point.x), sy(point.y))} fill={look.stroke} />
               {/each}
+              {/if}
             {/each}
             {#if focused !== undefined && xs[focused] !== undefined}
               <line class="cursor" x1={sx(xs[focused])} x2={sx(xs[focused])} y1={PAD.top} y2={H - PAD.bottom} />
@@ -254,24 +272,42 @@
           {@const at = xs[focused]}
           <p class="tooltip" role="status">
             <time datetime={new Date(at).toISOString()}>{fmtInstant(at)}</time>
-            {#each lines as line (line.label)}
+            {#each drawn as line (line.label)}
               {@const point = line.points.find((each) => each.x === at)}
               <span>{line.label}: {point ? `${fmtNumber(point.y)}${unitLabel}` : '—'}</span>
             {/each}
           </p>
         {/if}
-        <ul class="legend">
-          {#each lines as line, index (line.label)}
-            {@const look = style(index)}
-            <li>
-              <svg viewBox="0 0 24 8" width="24" height="8" aria-hidden="true">
-                <line x1="0" x2="24" y1="4" y2="4" stroke={look.stroke} stroke-dasharray={look.dash} />
-                <path d={marker(look.marker, 12, 4)} fill={look.stroke} />
-              </svg>
-              {line.label}
-            </li>
-          {/each}
-        </ul>
+        <div class="series">
+          <p>
+            {lines.length} series{hidden.size ? ` · ${lines.length - hidden.size} shown` : ''}
+            {#if hidden.size}<button type="button" onclick={() => (hidden = new Set())}>Show all</button>{/if}
+          </p>
+          <table class="legend">
+            <thead>
+              <tr><th scope="col"><span class="quiet">Shown</span></th><th scope="col">{input.series ?? 'series'}</th><th scope="col">Latest</th><th scope="col">Max</th><th scope="col">Mean</th></tr>
+            </thead>
+            <tbody>
+              {#each lines as line, index (line.label)}
+                {@const look = style(index)}
+                {@const values = summary(line.points)}
+                <tr class:off={hidden.has(line.label)}>
+                  <td><input type="checkbox" checked={!hidden.has(line.label)} aria-label="Show {line.label}" onchange={() => toggle(line.label)} /></td>
+                  <th scope="row">
+                    <svg viewBox="0 0 24 8" width="24" height="8" aria-hidden="true">
+                      <line x1="0" x2="24" y1="4" y2="4" stroke={look.stroke} stroke-dasharray={look.dash} />
+                      <path d={marker(look.marker, 12, 4)} fill={look.stroke} />
+                    </svg>
+                    {line.label}
+                  </th>
+                  <td>{fmtNumber(values.latest)}</td>
+                  <td>{fmtNumber(values.max)}</td>
+                  <td>{fmtNumber(values.mean)}</td>
+                </tr>
+              {/each}
+            </tbody>
+          </table>
+        </div>
       {:else if input.type === 'bar'}
         <div class="box" bind:clientWidth={boxWidth} bind:clientHeight={boxHeight}>
           <svg
@@ -420,20 +456,77 @@
     margin: 0;
     font: 11px var(--font-mono);
   }
-  .legend {
-    display: flex;
-    flex-wrap: wrap;
-    gap: 4px 12px;
-    margin: 0;
-    padding: 0;
-    list-style: none;
-    color: var(--muted);
-    font: 11px var(--font-mono);
+  .series {
+    max-height: 220px;
+    overflow: auto;
   }
-  .legend li {
-    display: inline-flex;
+  .series p {
+    display: flex;
+    justify-content: space-between;
     align-items: center;
-    gap: 6px;
+    gap: 8px;
+    margin: 0 0 4px;
+    font: 12px var(--font-mono);
+  }
+  .series button {
+    border: 1px solid var(--border);
+    border-radius: var(--r);
+    padding: 2px 8px;
+    background: var(--surface);
+    color: var(--text);
+    font: 12px var(--font-sans);
+    cursor: pointer;
+  }
+  .legend {
+    width: 100%;
+    border-collapse: collapse;
+    color: var(--text);
+    font: 12px var(--font-mono);
+    font-variant-numeric: tabular-nums;
+  }
+  .legend th,
+  .legend td {
+    height: 26px;
+    padding: 0 6px;
+    border-top: 1px solid var(--border-soft);
+    text-align: right;
+    white-space: nowrap;
+  }
+  .legend thead th {
+    border-top: 0;
+    color: var(--muted);
+    font-size: 11px;
+    font-weight: normal;
+    letter-spacing: 0.06em;
+    text-transform: uppercase;
+  }
+  .legend th:nth-child(2),
+  .legend td:first-child {
+    width: 100%;
+    text-align: left;
+  }
+  .legend td:first-child {
+    width: 1%;
+  }
+  .legend tbody th {
+    font-weight: normal;
+    letter-spacing: normal;
+    text-transform: none;
+  }
+  .legend tbody th svg {
+    display: inline-block;
+    margin-right: 6px;
+    vertical-align: middle;
+  }
+  .off {
+    color: var(--muted);
+  }
+  .quiet {
+    position: absolute;
+    width: 1px;
+    height: 1px;
+    overflow: hidden;
+    clip-path: inset(50%);
   }
   .stat {
     margin: 0;

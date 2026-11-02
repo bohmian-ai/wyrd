@@ -1,8 +1,8 @@
 # TASK-011 — Production MCP App and catalog discovery
 
-Spec: [revision 11, approved](../spec.md). Status: Proposed.
-Dependencies: [TASK-003](TASK-003-shared-ui-foundation.md), [TASK-004](TASK-004-observe-components.md), [TASK-005](TASK-005-card-components.md), [TASK-006](TASK-006-query-components.md), [TASK-007](TASK-007-verify-components.md), [TASK-008](TASK-008-service-components.md), [TASK-009](TASK-009-change-repository-components.md).
-Mapped obligations: REQ-030, REQ-020, AC-011, AC-010, REQ-035, AC-014; all INV-001–INV-007 apply, with TASK-001-specific exclusions only in TASK-001.
+Spec: [revision 15, approved](../spec.md). Status: Proposed; listed dependencies and required evidence govern completion.
+Dependencies: [TASK-003](TASK-003-shared-ui-foundation.md), [TASK-004](TASK-004-observe-components.md), [TASK-005](TASK-005-card-components.md), [TASK-006](TASK-006-query-components.md), [TASK-007](TASK-007-verify-components.md), [TASK-008](TASK-008-service-components.md), [TASK-009](TASK-009-change-repository-components.md), [TASK-027](TASK-027-view-layout.md), [TASK-004-REV-02](TASK-004-revision/TASK-02-live-observe-workflow.md) (approved revision-15 browser foundation).
+Mapped obligations: REQ-030, REQ-020, AC-011, AC-010, REQ-035, AC-014, REQ-036, AC-015, AC-016; all INV-001–INV-007 apply, with TASK-001-specific exclusions only in TASK-001.
 
 ## Outcome and Value
 
@@ -12,16 +12,26 @@ The existing MCP endpoint serves the complete UI App resource, validates and sho
 
 Full-library gate first: every component/action/live prerequisite and individual visual acceptance in the in-scope TASK-003–009 is complete. TASK-010/Ask/saved views are deferred and not prerequisites. Own resources capability, ui://wyrd/view, ui.show_view, ui.catalog, embedded artifact/catalog and production host verification. Reuse earlier built artifact and MCP executor; do not recreate them. Current MCP protocol/auth remain unchanged.
 
-Use committed main `8651b96fd`, the approved spec and current canvas. Historical `wyrd-server-ui` at `7bfc3a8a` supplies read/state/test evidence only. Current uncommitted trace changes are unrelated and must be preserved. Package components render typed props; portable loaders plan/shape; executor/host boundaries own credentials, authorized IO and action execution. Preserve tenant isolation, stable errors and server audit behavior. No speculative framework, production test switches or replacement selectors. REQ-035 permits the minimal test-only real-browser driver and connected App host plus an explicit UI journey choice on the existing readiness CLI; no generic harness framework.
+Use approved spec revision 15, the current canvas and current source contracts. `8651b96fd` is the historical migration baseline, not the current schema authority. Historical `wyrd-server-ui` at `7bfc3a8a` supplies read/state/test evidence only. Package components render typed props; portable loaders plan/shape; executor/host boundaries own credentials, authorized IO and action execution. Preserve tenant isolation, stable errors and server audit behavior. No speculative framework, production test switches or replacement selectors. REQ-035 permits the minimal test-only real-browser driver and connected App host plus an explicit UI journey choice on the existing readiness CLI; no generic harness framework.
 
 | Capability | Existing owner/symbol | Inspected callers/tests | Missing behavior | Selected extension | New machinery justification |
 |---|---|---|---|---|---|
 | MCP adapter | `crates/wyrd/wyrd-server/src/mcp/mod.rs::WyrdMcpHandler.get_info/catalog/call_tool`; server Cargo.toml existing jsonschema | Existing cards/bifrost/verification descriptors and dispatch; TASK-003 T4 artifact host | Main advertises tools only and has no UI resource/tools | Extend handler and embed scripts/build.sh outputs | No second MCP endpoint, alternate auth or duplicated catalog/renderer |
 | Live agent/session lifecycle | `sdks/wyrd-sdk-python/tests/agent_readiness/live.py::run_agent/exercise/main/preflight/agent_environment/Redactor`, `observe.py::Observer.observe` | `tests/unit/test_agent_readiness.py` exit/deadline/cancellation/redaction checks; `test:agent-readiness:smoke:live` | One objective then stdin closes; no continuation or browser-linked App lifecycle | Extend this owner with a bounded UI journey and actual follow-up/session continuation, preserving default coding-readiness semantics | Conversation proof is required; no new production agent service or second environment controller |
 | Owned deployment/docs | `live.py::wyrd_served/docs_served`, `tests/integration/test_local_development.py::local_deployment` | `exercise` reuses local deployment; existing installed-CLI journeys and local-dev mise lane | UI proof does not yet record a connected browser/agent session | Reuse current deployment, checkout docs, local credentials and artifact/redaction owners | No new server lifecycle, local secret format or credential store |
-| Real-browser App host | UI `src/lib/ui-library.integration.test.ts::appBridgeView/mcpOver`, `vite.config.ts`, current UI manifests | Existing TASK-003 built artifact fixture and separate authenticated MCP read tests | jsdom patches message sources and uses fixture App replies; no browser driver is installed | Extend existing ext-apps bridge into a real browser with real MCP forwarding and live agent result delivery | Actual rendering/session interaction needs a test-only browser driver; do not assume CLI agents display Apps |
+| Real-browser App host | UI `src/lib/ui-library.integration.test.ts::appBridgeView/mcpOver`, `vite.config.ts`, current UI manifests | Existing TASK-003 built artifact fixture and separate authenticated MCP read tests | jsdom patches message sources and uses fixture App replies; no browser driver is installed | Reuse TASK-004-REV-02’s real-browser lifecycle and extend the ext-apps bridge with real MCP forwarding and live agent result delivery | TASK-004-REV-02 supplies the first browser driver/lifecycle under approved revision 15; do not assume CLI agents display Apps |
 
-Paths under `src/mcp`, `src/query` or `tests/integration` described as server owners are rooted at `crates/wyrd/wyrd-server/`. Proposed TASK dependencies are not capabilities already present on main.
+Paths under `src/mcp`, `src/query` or `tests/integration` described as server owners are rooted at `crates/wyrd/wyrd-server/`. Revalidate source-map availability against the current checkout; historical missing-behavior claims do not override delivered contracts or completed dependencies.
+
+## Required Board Coverage
+
+The production embedded ui://wyrd/view host renders the individually accepted component checkpoints and preserves TASK-027 REQ-036 placed/resizable layout, keyboard behavior and narrow stacking. Prove canonical discovery/query results under the viewer permissions (AC-016).
+
+Record reference region, implementation screenshot, state, theme and viewport. Distinguish behavioral proof, visual comparison and individual human acceptance. Every difference needs a fix or an explicitly approved exception. See the [audit and evidence rules](../references/task-audit-2026-10-29.md).
+
+## Browser ownership — approved revision 15
+
+TASK-004-REV-02 supplies the first actual browser/BFF lifecycle before this task. Reuse it for production MCP forwarding and host-specific proof; production MCP registration does not block the early live trace slice. The full-library gate still applies to this task. The caller approved this transfer on 2026-10-30.
 
 ## Approach
 

@@ -60,9 +60,8 @@ pub(crate) const PROVIDER_KEY: &str = "sk-native-upstream";
 
 /// Deployments the journeys deploy, and so the only ones the invoking principal
 /// is granted. It holds no administration permission at all.
-const INVOKED_DEPLOYMENTS: [&str; 8] = [
+const INVOKED_DEPLOYMENTS: [&str; 7] = [
     "openai",
-    "local-mock",
     "anthropic",
     "gemini",
     "acme-first",

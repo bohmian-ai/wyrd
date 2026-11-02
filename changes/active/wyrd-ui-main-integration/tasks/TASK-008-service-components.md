@@ -1,8 +1,8 @@
 # TASK-008 — Service signal and chart authoring component family
 
-Spec: [revision 11, approved](../spec.md). Status: Proposed; platform prerequisite holds completion.
+Spec: [revision 15, approved](../spec.md). Status: Proposed; listed dependencies and required evidence govern completion.
 Dependencies: [TASK-003](TASK-003-shared-ui-foundation.md), [TASK-004](TASK-004-observe-components.md), [TASK-005](TASK-005-card-components.md), [TASK-006](TASK-006-query-components.md).
-Mapped obligations: REQ-030, REQ-023, REQ-025, REQ-020, AC-011, AC-010; all INV-001–INV-007 apply, with TASK-001-specific exclusions only in TASK-001.
+Mapped obligations: REQ-030, REQ-023, REQ-025, REQ-020, AC-011, AC-010, AC-017; all INV-001–INV-007 apply, with TASK-001-specific exclusions only in TASK-001.
 
 External dependency: REQ-025 Service charts, with separately approved platform implementation and actual SDK/MCP read/action projections. This task does not authorize implementation of that platform prerequisite. Contract-independent work may proceed, but fixtures/unavailable controls cannot close it.
 
@@ -14,17 +14,23 @@ Service signal breakdown and versioned chart editing work from real Service iden
 
 Own SignalBreakdownTable and ChartEditor. Use `workload_card_uid` for release scope and `subject_card_uid` for component breakdown; never use service_name or component UID lists. Save chart emits an intent whose authorized host registers a new Service version. REQ-023 is delivered on main; REQ-025 is external platform work, not UI schema invention.
 
-Use committed main `8651b96fd`, the approved spec and current canvas. Historical `wyrd-server-ui` at `7bfc3a8a` supplies read/state/test evidence only. Current uncommitted trace changes are unrelated and must be preserved. Package components render typed props; portable loaders plan/shape; executor/host boundaries own credentials, authorized IO and action execution. Preserve tenant isolation, stable errors and server audit behavior. No speculative framework, test-only configuration or replacement selectors.
+Use approved spec revision 15, the current canvas and current source contracts. `8651b96fd` is the historical migration baseline, not the current schema authority. Historical `wyrd-server-ui` at `7bfc3a8a` supplies read/state/test evidence only. Package components render typed props; portable loaders plan/shape; executor/host boundaries own credentials, authorized IO and action execution. Preserve tenant isolation, stable errors and server audit behavior. No speculative framework, test-only configuration or replacement selectors.
 
 | Capability | Existing owner/symbol | Inspected callers/tests | Missing behavior | Selected extension | New machinery justification |
 |---|---|---|---|---|---|
-| Service sources | `crates/wyrd-spec/src/card/service.rs::ServiceSpec` currently has tables but no charts; `crates/vala/vala-bifrost-redux/src/tables/gateway/calls.rs::CallsTable` and canonical signal owners lack required service_card_uid | Existing Cards registration/SDK query workflows; TASK-003/004/006 adapters | Service correlation and chart contracts not shipped | Consume separately shipped generated schemas and existing registration/query owners | No new durable UI state or guessed platform fields |
+| Service sources | `crates/wyrd-spec/src/card/service.rs::ServiceSpec` currently has tables but no charts; `crates/vala/vala-bifrost-redux/src/tables/gateway/calls.rs::CallsTable` and canonical signal owners supply workload_card_uid and subject_card_uid | Existing Cards registration/SDK query workflows; TASK-003/004/006 adapters | Portable breakdown consumer missing; chart persistence contract remains unshipped | Consume separately shipped generated schemas and existing registration/query owners | No new durable UI state or guessed platform fields |
 
-Paths under `src/mcp`, `src/query` or `tests/integration` described as server owners are rooted at `crates/wyrd/wyrd-server/`. Proposed TASK dependencies are not capabilities already present on main.
+Paths under `src/mcp`, `src/query` or `tests/integration` described as server owners are rooted at `crates/wyrd/wyrd-server/`. Revalidate source-map availability against the current checkout; historical missing-behavior claims do not override delivered contracts or completed dependencies.
+
+## Required Board Coverage
+
+SignalBreakdownTable → Service By component and Home Services; ChartEditor → ServiceCharts Edit chart. Workload/subject attribution is delivered; REQ-025 chart persistence and its SDK/MCP action projections remain external prerequisites.
+
+Record reference region, implementation screenshot, state, theme and viewport. Distinguish behavioral proof, visual comparison and individual human acceptance. Every difference needs a fix or an explicitly approved exception. See the [audit and evidence rules](../references/task-audit-2026-10-29.md).
 
 ## Approach
 
-1. Confirm external correlation and chart contracts and their host projections before live integration.
+1. Consume delivered workload/subject correlation and confirm the separate chart contract and host projections before chart live integration.
 2. Complete signal breakdown plus chart SQL/bind/schema editing and preview from reused Query/Chart components.
 3. Complete new-version save actions and pending/error/denied handling per host.
 4. Pass T1–T5 and inspect both components separately.

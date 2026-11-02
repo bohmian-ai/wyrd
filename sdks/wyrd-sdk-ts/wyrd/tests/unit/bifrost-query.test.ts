@@ -22,6 +22,9 @@ function fakeStream(steps: Partial<NativeStep>[], terminalJson: string | null = 
       const step = steps[Math.min(index++, steps.length - 1)];
       return { ipc: undefined, terminalJson: undefined, ...step } as NativeStep;
     },
+    async collect() {
+      throw new Error("these tests drive the streaming path");
+    },
     async close() {
       state.closed = true;
       if (state.closeError) {

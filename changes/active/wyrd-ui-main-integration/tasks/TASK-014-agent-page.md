@@ -1,8 +1,9 @@
 # TASK-014 — Agent workspace
 
-Spec: [revision 11, approved](../spec.md). Status: Proposed.
-Dependencies: [TASK-012](TASK-012-canvas-shell.md), [TASK-013](TASK-013-card-browsing.md), [TASK-004](TASK-004-observe-components.md), [TASK-005](TASK-005-card-components.md), [TASK-007](TASK-007-verify-components.md).
-Mapped obligations: REQ-010, REQ-024, REQ-020, AC-007, AC-010, REQ-034, AC-013; all INV-001–INV-007 apply, with TASK-001-specific exclusions only in TASK-001.
+Spec: [revision 15, approved](../spec.md). Status: Proposed; listed dependencies and required evidence govern completion.
+Dependencies: [TASK-004-REV-02](TASK-004-revision/TASK-02-live-observe-workflow.md), [TASK-013](TASK-013-card-browsing.md), [TASK-004](TASK-004-observe-components.md), [TASK-005](TASK-005-card-components.md), [TASK-007](TASK-007-verify-components.md).
+Approved revision 18 assigns the shell/browser dependency to TASK-004-REV-02; original page outcomes and remaining delivery gates are preserved.
+Mapped obligations: REQ-010, REQ-024, REQ-020, AC-007, AC-010, REQ-034, AC-013, AC-017; all INV-001–INV-007 apply, with TASK-001-specific exclusions only in TASK-001.
 
 ## Outcome and Value
 
@@ -12,7 +13,7 @@ The exact Agent version shows its registered Prompt, execution route, runtime to
 
 Assemble only this outcome from completed CardHeader, CardFacts, CompositionGraph, RelationshipList, VerificationBindings, StatStrip, Chart and RecordTable. Page/server load functions invoke shared loaders; no SQL, joins, dependent-read sequencing or domain shaping in pages. Reuse session-bound Node executor and shell. Use current AgentSpec.prompt/execution_route/tool_names/verified_by. Activity uses invoke_agent spans and gateway calls attributed to this Agent's `subject_card_uid`; absence explains attribution instead of synthesizing activity. No historical components/layouts/types or fixture production fallback.
 
-Use committed main `8651b96fd`, the approved spec and current canvas. Historical `wyrd-server-ui` at `7bfc3a8a` supplies read/state/test evidence only. Current uncommitted trace changes are unrelated and must be preserved. Package components render typed props; portable loaders plan/shape; executor/host boundaries own credentials, authorized IO and action execution. Preserve tenant isolation, stable errors and server audit behavior. No speculative framework, test-only configuration or replacement selectors.
+Use approved spec revision 15, the current canvas and current source contracts. `8651b96fd` is the historical migration baseline, not the current schema authority. Historical `wyrd-server-ui` at `7bfc3a8a` supplies read/state/test evidence only. Package components render typed props; portable loaders plan/shape; executor/host boundaries own credentials, authorized IO and action execution. Preserve tenant isolation, stable errors and server audit behavior. No speculative framework, test-only configuration or replacement selectors.
 
 | Capability | Existing owner/symbol | Inspected callers/tests | Missing behavior | Selected extension | New machinery justification |
 |---|---|---|---|---|---|
@@ -20,7 +21,13 @@ Use committed main `8651b96fd`, the approved spec and current canvas. Historical
 | Bounded analytical reads | `sdks/wyrd-sdk-ts/wyrd/src/index.ts::Bifrost.stream`; `crates/wyrd/wyrd-server/src/query/collect.rs::BoundedQuery` | `sdks/wyrd-sdk-ts/wyrd/tests/integration/query-bifrost.test.ts`, `query-results.test.ts`; MCP `bifrost.rs::query_tool` | UI props and host parity missing | Consume foundation normalization and shared query owner | No second query service or transport |
 | Agent contract | `crates/wyrd-spec/src/card/agent.rs::AgentSpec` | Historical server/card-live.ts::liveAgent at 7bfc3a8a and current SDK observed-agent journeys | Old workspace layout is stale | Compose approved Agent canvas from finished projections | No old Agent workspace or invented agent.invoke span |
 
-Paths under `src/mcp`, `src/query` or `tests/integration` described as server owners are rooted at `crates/wyrd/wyrd-server/`. Proposed TASK dependencies are not capabilities already present on main.
+Paths under `src/mcp`, `src/query` or `tests/integration` described as server owners are rooted at `crates/wyrd/wyrd-server/`. Revalidate source-map availability against the current checkout; historical missing-behavior claims do not override delivered contracts or completed dependencies.
+
+## Required Board Coverage
+
+Agent → composition; invocation/model-usage statistics; bound Verifiers; recent invocations; relationships/metadata. The Agent-specific invoke_agent statistic is approved by REQ-024 and does not authorize name-based rules in generic trace components.
+
+Record reference region, implementation screenshot, state, theme and viewport. Distinguish behavioral proof, visual comparison and individual human acceptance. Every difference needs a fix or an explicitly approved exception. See the [audit and evidence rules](../references/task-audit-2026-10-29.md).
 
 ## Approach
 
@@ -49,7 +56,7 @@ mise exec -- pnpm --dir crates/wyrd/wyrd-server/wyrd-ui test src/lib/ui-pages.te
 
 **Behavior.** T6 launches a real browser against the running production BFF and Rust server, signs in through public auth, navigates to this task's route, performs its page workflow and inspects visible results backed by actual SDK/server reads. Cover populated, empty, denied/error and cross-tenant cases; required actions and links preserve exact identity. On time-aware pages, change the range and verify requested bounds, updated results and no stale overwrite; other pages exercise their actual filters/version/navigation controls. Imported handlers, jsdom, fixture page props and HTTP-client cookie simulation alone cannot satisfy REQ-034.
 
-**RED.** Extend the focused page journey with TASK-011/012 real-browser support over repository-managed server/Postgres and the production BFF. The absent browser/page workflow must fail; fixture props or imported handlers cannot supply GREEN. Run this exact focused command (new Vitest title where applicable):
+**RED.** Extend the focused page journey with TASK-004-REV-02 (under approved revision 15) real-browser support over repository-managed server/Postgres and the production BFF. The absent browser/page workflow must fail; fixture props or imported handlers cannot supply GREEN. Run this exact focused command (new Vitest title where applicable):
 
 ```bash
 mise exec -- scripts/postgres/with-test-postgres.sh -- bash -lc 'mise run db:migrate:inner && WYRD_UI_INTEGRATION=1 pnpm --dir crates/wyrd/wyrd-server/wyrd-ui test src/lib/ui-pages.integration.test.ts -t "^TASK-014: Real authenticated page journey$"'
@@ -73,7 +80,7 @@ Only relevant app route/layout/server load, host action/navigation adapters and 
 
 Run the exact scenario commands above. [Verification setup](../references/verification.md) defines the current test owners and repository-managed prerequisites. New Vitest titles are planned additions to the existing runner, not claims of existing tests. Select actual running tests; skipped/no-selected cases are not proof. Do not add dependencies or environment settings to make selection convenient.
 
-Run `mise exec -- pnpm --dir crates/wyrd/wyrd-server/wyrd-ui check` and `mise exec -- pnpm --dir crates/wyrd/wyrd-server/wyrd-ui build` after focused tests. Run `mise run codegen:check` when catalog/generated inputs change. Record T1 states, T2 actual requests/shape, T3 view validation/render, T4 actual built AppBridge HTML, T5 real authorized Node/server data and real-browser T6 for this assembled page. Reuse TASK-011/012 browser and deployed-process support; retain source/browser identity, sanitized screenshots/traces, actual requests and visible results. A skipped browser case is not a pass. Data-free primitives have no invented loader/live proof. Preserve per-component fixture provenance and interaction/action-host evidence.
+Run `mise exec -- pnpm --dir crates/wyrd/wyrd-server/wyrd-ui check` and `mise exec -- pnpm --dir crates/wyrd/wyrd-server/wyrd-ui build` after focused tests. Run `mise run codegen:check` when catalog/generated inputs change. Record T1 states, T2 actual requests/shape, T3 view validation/render, T4 actual built AppBridge HTML, T5 real authorized Node/server data and real-browser T6 for this assembled page. Reuse TASK-004-REV-02 (under approved revision 15) browser and deployed-process support; retain source/browser identity, sanitized screenshots/traces, actual requests and visible results. A skipped browser case is not a pass. Data-free primitives have no invented loader/live proof. Preserve per-component fixture provenance and interaction/action-host evidence.
 
 ### Human visual checkpoint
 

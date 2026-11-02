@@ -1,18 +1,19 @@
 # UI migration task order
 
-Approved authority: [spec revision 11](spec.md), committed baseline `8651b96fd`.
-Revision 10's browser-session/remediation authority is preserved. Revision 11
-records the caller-approved primary conventional-browser and agent/MCP App
-journeys, with Ask/saved views deferred. This edit plans; it does not execute
-or accept implementation. Newly inspected test ownership is at `cbd4e97c8`;
-the original migration baseline and immutable review subjects are unchanged.
+Last approved scope revision: 18 (caller direction, 2026-11-02).
+The active TASK-004 replacement has exactly two proposed tasks: optional local
+MockServer, then the complete canonical dev workflow and shell/Traces/Spans/
+Logs/Metrics UI. Retired R1/R2/R3 retain evidence only. No implementation or
+acceptance is implied. Preserve current source/cleanup and unrelated UI work.
+Historical migration baseline and immutable review subjects remain unchanged.
 
 TASK-001 is the independent distribution/login outcome. TASK-002 deletes the old
 UI before component work. TASK-003 establishes the reusable foundation with
 complete Chart, CardHeader and primitives. TASK-004–009 complete the in-scope component
 families; TASK-010 is deferred and is not a shipping dependency; individual component checks stay inside each family task. TASK-011
 registers the production MCP App only after the **entire in-scope library** is complete, then proves the real-agent MCP App journey.
-Conventional pages start after that gate and retain their own visual checkpoints.
+Except for the revision-18 early Observe slice, conventional pages start after
+that gate and retain their own visual checkpoints.
 
 | Task | Observable outcome | Real task dependencies | External completion dependency |
 |---|---|---|---|
@@ -20,29 +21,31 @@ Conventional pages start after that gate and retain their own visual checkpoints
 | [TASK-001-R1](review/tasks-001-002-843484f6c/TASK-001-R1-installation-browser-sessions.md) | Correct installation eligibility, implement Rust-owned opaque browser sessions and prove official nginx login | TASK-001 and TASK-002 integrated at `843484f6c`; approved revision 10 | Supported native/Linux image runtime and human inspection remain required acceptance evidence |
 | [TASK-002](tasks/TASK-002-remove-old-ui.md) | Remove obsolete UI while retaining login — **complete** | None | None |
 | [TASK-003](tasks/TASK-003-shared-ui-foundation.md) | Reusable UI foundation across the four hosts — **complete** | TASK-002 | None |
-| [TASK-004](tasks/TASK-004-observe-components.md) | Observe component family | TASK-003 | None; REQ-023 `workload_card_uid` correlation is delivered on main. |
+| [TASK-004](tasks/TASK-004-observe-components.md) | Observe implementation retained; **incomplete until replacement live workflow and individual acceptance close** | TASK-003 implementation; closure by TASK-004-REV-01/02 | No historical PASS substitutes for real data/browser/visual proof. |
+| [TASK-004-REV-01](tasks/TASK-004-revision/TASK-01-mockserver.md) | Optional local MockServer via existing OpenAI endpoint configuration; proposed | None | Container runtime; official pinned amd64/arm64 image; real gateway fixture proof. |
+| [TASK-004-REV-02](tasks/TASK-004-revision/TASK-02-live-observe-workflow.md) | Canonical 3,000-request dev:full batch and real shell/Traces/Spans/Logs/Metrics; proposed | TASK-003, TASK-027, TASK-004-REV-01; retain existing Observe code | Current production SDK/source patch, independent review and individual human live/component inspection. |
 | [TASK-005](tasks/TASK-005-card-components.md) | Card browsing and definition component family | TASK-003 | Only if required ArtifactTable actions lack a current SDK/MCP projection: obtain approved platform action contract before calling that action complete. |
-| [TASK-006](tasks/TASK-006-query-components.md) | Query component family | TASK-003, TASK-004 | None |
+| [TASK-006](tasks/TASK-006-query-components.md) | Query component family | TASK-003, TASK-004 | Query History source/lifetime unresolved; independent work may proceed. |
 | [TASK-007](tasks/TASK-007-verify-components.md) | Generic verification component family | TASK-003, TASK-004, TASK-005 | Separately specified non-sensitive requirement-outcome read contract; REQ-029 for AttentionList CR rows. Current sensitive outcome is not reclassified here. |
 | [TASK-008](tasks/TASK-008-service-components.md) | Service signal and chart authoring component family | TASK-003, TASK-004, TASK-005, TASK-006 | REQ-025 Service charts, with separately approved platform implementation and actual SDK/MCP read/action projections. |
 | [TASK-009](tasks/TASK-009-change-repository-components.md) | Change Request and repository component family | TASK-003, TASK-005, TASK-007 | REQ-029 separately approved and shipped CR/repository/webhook/verifier-folder read/write contracts with SDK/MCP projections. |
 | [TASK-010](tasks/TASK-010-ask-component.md) | Deferred: Ask and saved-view interaction | None; superseded from active execution | Separate future approved scope; blocks no task here. |
-| [TASK-011](tasks/TASK-011-mcp-app.md) | Production MCP App, catalog discovery and connected multi-turn agent/browser journey | TASK-003, TASK-004, TASK-005, TASK-006, TASK-007, TASK-008, TASK-009, TASK-027 | Actual supported session/App-host integration and local live credentials; scenario 3 is blocked if absent |
-| [TASK-012](tasks/TASK-012-canvas-shell.md) | Canvas shell/navigation and deployed real-browser page foundation | TASK-011 | None |
-| [TASK-013](tasks/TASK-013-card-browsing.md) | Registry browsing and exact Card detail | TASK-012, TASK-005 | None |
-| [TASK-014](tasks/TASK-014-agent-page.md) | Agent workspace | TASK-012, TASK-013, TASK-004, TASK-005, TASK-007 | None |
-| [TASK-015](tasks/TASK-015-prompt-page.md) | Prompt workspace | TASK-012, TASK-013, TASK-005 | None |
-| [TASK-016](tasks/TASK-016-model-page.md) | Model workspace | TASK-012, TASK-013, TASK-004, TASK-005, TASK-007 | None |
-| [TASK-017](tasks/TASK-017-data-page.md) | Data workspace | TASK-012, TASK-013, TASK-005, TASK-007 | None |
-| [TASK-018](tasks/TASK-018-service-page.md) | Service workspace and charts | TASK-012, TASK-013, TASK-008, TASK-007 | REQ-025 delivered and TASK-008 production-complete; no Service inference from component lists. |
-| [TASK-019](tasks/TASK-019-query-page.md) | Query workbench page | TASK-012, TASK-006 | None |
-| [TASK-020](tasks/TASK-020-traces-page.md) | Traces and span investigation page | TASK-012, TASK-004 | None; filter Services by `workload_card_uid`, never `service_name`. |
-| [TASK-021](tasks/TASK-021-logs-page.md) | Logs investigation page | TASK-012, TASK-004 | None; filter Services by `workload_card_uid`, never inferred identity. |
-| [TASK-022](tasks/TASK-022-metrics-page.md) | Metrics page | TASK-012, TASK-004 | None; scope Services by `workload_card_uid` where exposed. |
-| [TASK-023](tasks/TASK-023-verify-pages.md) | Verify results workbench and Verifier definition | TASK-012, TASK-007, TASK-004 | Non-sensitive per-requirement outcome contract is shipped; TASK-007 is production-complete. |
-| [TASK-024](tasks/TASK-024-home-page.md) | Home summary page | TASK-012, TASK-005, TASK-007, TASK-008, TASK-004 | Applicable REQ-029 attention contracts; all supporting library tasks complete. |
-| [TASK-025](tasks/TASK-025-change-pages.md) | Change Request collaboration pages | TASK-012, TASK-009 | REQ-029 platform contract and TASK-009 production-complete, including actual read/write host projections. |
-| [TASK-026](tasks/TASK-026-repositories-page.md) | Repository connections page | TASK-012, TASK-009 | REQ-029 repository/webhook/configuration platform contract and TASK-009 production-complete. |
+| [TASK-011](tasks/TASK-011-mcp-app.md) | Production MCP App, catalog discovery and connected multi-turn agent/browser journey | TASK-003, TASK-004, TASK-005, TASK-006, TASK-007, TASK-008, TASK-009, TASK-027, TASK-004-REV-02 | Actual supported session/App-host integration and local live credentials; scenario 3 is blocked if absent |
+| [TASK-012](tasks/TASK-012-canvas-shell.md) | Superseded: complete shell and browser foundation assigned to TASK-004-REV-02 | TASK-004-REV-02 | Historical scope reference only; all proof transferred. |
+| [TASK-013](tasks/TASK-013-card-browsing.md) | Registry browsing and exact Card detail | TASK-004-REV-02, TASK-005 | Missing inventory reference/visual acceptance recorded in the audit. |
+| [TASK-014](tasks/TASK-014-agent-page.md) | Agent workspace | TASK-004-REV-02, TASK-013, TASK-004, TASK-005, TASK-007 | None |
+| [TASK-015](tasks/TASK-015-prompt-page.md) | Prompt workspace | TASK-004-REV-02, TASK-013, TASK-005 | None |
+| [TASK-016](tasks/TASK-016-model-page.md) | Model workspace | TASK-004-REV-02, TASK-013, TASK-004, TASK-005, TASK-007 | None |
+| [TASK-017](tasks/TASK-017-data-page.md) | Data workspace | TASK-004-REV-02, TASK-013, TASK-005, TASK-007 | None |
+| [TASK-018](tasks/TASK-018-service-page.md) | Service workspace and charts | TASK-004-REV-02, TASK-013, TASK-008, TASK-007, TASK-005, TASK-009 | Requires delivered REQ-025 and production-complete TASK-008; REQ-029/TASK-009 for its Change Requests region; no Service inference from component lists. |
+| [TASK-019](tasks/TASK-019-query-page.md) | Query workbench page | TASK-004-REV-02, TASK-006 | Query History source/lifetime unresolved. |
+| [TASK-020](tasks/TASK-020-traces-page.md) | Superseded: complete Traces/Spans investigation assigned to TASK-004-REV-02 | TASK-004-REV-02 | Historical scope reference only; all proof transferred. |
+| [TASK-021](tasks/TASK-021-logs-page.md) | Superseded: complete Logs investigation assigned to TASK-004-REV-02 | TASK-004-REV-02 | Historical scope reference only; all proof transferred. |
+| [TASK-022](tasks/TASK-022-metrics-page.md) | Superseded: complete Metrics investigation assigned to TASK-004-REV-02 | TASK-004-REV-02 | Historical scope reference only; all proof transferred. |
+| [TASK-023](tasks/TASK-023-verify-pages.md) | Verify results workbench and Verifier definition | TASK-004-REV-02, TASK-007, TASK-004 | Non-sensitive per-requirement outcome contract is shipped; TASK-007 is production-complete. |
+| [TASK-024](tasks/TASK-024-home-page.md) | Home summary page | TASK-004-REV-02, TASK-005, TASK-007, TASK-008, TASK-004 | Applicable REQ-029 attention contracts; all supporting library tasks complete. |
+| [TASK-025](tasks/TASK-025-change-pages.md) | Change Request collaboration pages | TASK-004-REV-02, TASK-009 | REQ-029 platform contract and TASK-009 production-complete, including actual read/write host projections. |
+| [TASK-026](tasks/TASK-026-repositories-page.md) | Repository connections page | TASK-004-REV-02, TASK-009 | REQ-029 repository/webhook/configuration platform contract and TASK-009 production-complete. |
 | [TASK-027](tasks/TASK-027-view-layout.md) | Placed, resizable view panels (revision 12) — **complete** | TASK-003 | None |
 
 TASK-001, TASK-002 (with TASK-001-R1 to R3), TASK-003 and TASK-027 are complete:
@@ -50,6 +53,53 @@ the caller accepted them on 2026-10-23 after inspecting the gallery. The
 remaining TASK-003 review findings were either fixed (FIND-003-16/17 at
 `a9be77a51`) or dropped as unneeded complexity ([simplify record](review/simplify-2026-10-23.md)).
 Native/image runtime and nginx evidence for TASK-001 stay with final change review.
+
+## Current assignment — two replacement TASK-004 tasks
+
+Execute [Task 01](tasks/TASK-004-revision/TASK-01-mockserver.md), then
+[Task 02](tasks/TASK-004-revision/TASK-02-live-observe-workflow.md).
+Task 01 adds local development fixtures, not a Wyrd provider feature. Task 02
+is the complete user-visible outcome: `mise run dev:full`, canonical current-SDK
+application, bounded 3,000-request workload, actual retained signals and usable
+authenticated shell/Traces/Spans/Logs/Metrics. It carries all outstanding R1
+component obligations and absorbs TASK-012/020/021/022 completely. These old
+page tasks are superseded, not completed proof. TASK-019 retains full Query
+workbench scope; Task 02 closes only exact-query inspection/replay navigation.
+
+The caller explicitly replaced internal runtime mocking with optional local
+MockServer. Existing endpoint configuration reaches both application and queued
+judge calls, so no SDK scope/header, custom Rust provider, verification snapshot,
+new retained fields or special billing policy is required. Do not execute old
+keep/remove lists or interfere with caller cleanup.
+
+Retired assignments, including their old implementation claims, are preserved:
+[R1](references/retired-task-004/TASK-004-R1-canvas-fidelity.md),
+[R2](references/retired-task-004/TASK-004-R2-live-dev-workbench.md),
+[R3](references/retired-task-004/TASK-004-R3-minimal-runtime-mock.md).
+They are not active dependencies or approvals. Task 02 depends on existing
+Observe code, not on TASK-004 already being complete; it closes the parent.
+
+This Observe slice retains the early-live exception to unrelated family/MCP
+ordering. Full-library/MCP shipping and later domain-page gates are unchanged.
+Independent review and separate human desktop/mobile light/dark acceptance
+remain required; neither reorganizing tasks nor dispatching HTTP establishes PASS.
+
+## Remaining-task audit and execution limits
+
+The [2026-10-29 audit](references/task-audit-2026-10-29.md) preserves historical
+source findings and evidence limits. Task 02 carries the outstanding Observe
+component obligations and the complete Logs/Metrics page, host and T6 proof.
+Other tasks retain their board regions and applicable component scenarios;
+this reorganization marks none of them implemented, reviewed or accepted.
+
+Query History source/lifetime (TASK-006/019) and the missing Cards inventory
+reference (TASK-005/013) remain explicit external decisions. StatStrip
+presentation remains a verification/acceptance obligation of Task 02 and its
+consumers: use existing recorded inputs/approved invocation semantics and
+identify the relevant board region, without inventing a statistic or public
+prop contract. Existing platform prerequisites remain blocking. Independent
+work may proceed; affected regions cannot be silently omitted or redesigned.
+Completed records and deferred scope are preserved.
 
 ## Active remediation and revision authority
 
@@ -88,10 +138,10 @@ mock success satisfies production completion.
 
 TASK-011 requires full T1–T5 and action closure plus individual human desktop/mobile
 light/dark acceptance for every in-scope inventory component (TASK-003–009). It owns real production MCP
-resource/tools and host-specific security proof. T4 artifact tests are already
+resource/tools and host-specific security proof, reusing R2's browser lifecycle under approved revision 15. T4 artifact tests are already
 built/run in foundation and each family; they do not wait for production registration.
 The in-scope library shipping gate is held by every missing component/prerequisite; deferred Ask/saved views are excluded, not fixture-completed.
-TASK-012–026 cannot start simply because one family has finished.
+Revision 14 required the full-library/MCP gate before all conventional pages. Approved revision 18 makes only TASK-004-REV-02’s absorbed shell/Observe slice an early exception; remaining page work retains that gate.
 
 ## Obligation ownership
 
@@ -100,19 +150,20 @@ TASK-012–026 cannot start simply because one family has finished.
 | REQ-001–006/033; AC-001–005/012; INV-003/005 | TASK-001 plus TASK-001-R1: signed install/lifecycle, Rust-owned browser sessions and native/nginx auth; distinct native and image runner evidence |
 | REQ-032 | TASK-002: exact delete/keep inventory, removed imports/settings, retained login regression |
 | REQ-030; AC-011 | TASK-003 foundation; TASK-004–009 in-scope inventory families; TASK-011 production MCP and package/custom-app regression |
-| REQ-007/021 | TASK-012: canvas shell controls and navigation |
+| REQ-007/021 | TASK-004-REV-02 under approved revision 15, absorbing TASK-012: canvas shell controls and navigation |
 | REQ-008/009; AC-006 | TASK-013: inventory and exact-detail workflow with separate checkpoints; TASK-003/005 component proof |
 | REQ-010/011/012/013/024; AC-007 | TASK-014 Agent, TASK-015 Prompt, TASK-016 Model, TASK-017 Data, TASK-018 Service; TASK-023 Verifier definition |
-| REQ-014–017/028; AC-008 | TASK-019 Query, TASK-020 Traces, TASK-021 Logs, TASK-022 Metrics; TASK-003/004/006 component and read parity proof |
+| REQ-014–017/028; AC-008 | TASK-019 full Query; TASK-004-REV-02 owns exact-query inspection and complete Traces/Spans/Logs/Metrics, absorbing TASK-012/020/021/022; shared component and first-class read proof retained |
 | REQ-018/026/027; AC-009 | TASK-007 components; TASK-023 run/session/drift/definition workflow; TASK-024 summaries of same recorded facts |
 | REQ-019 | TASK-024 Home, no bundled extra summary pages |
 | REQ-023/025 | REQ-023 is delivered on main and TASK-004/008/018/020–024 consume its `workload_card_uid`/`subject_card_uid`; REQ-025 is external, consumed by TASK-008/018 |
 | REQ-029 | External platform delivery; TASK-009 components, TASK-025 Change Requests and TASK-026 Repos; TASK-007/024 consume attention rows |
 | REQ-031 and Ask | Deferred from this change; TASK-010 superseded; no shell controls or shipping dependency |
-| REQ-034; AC-013 | TASK-012 establishes real-browser page proof; TASK-013–026 each own their route/workflow, applicable range changes and negative flows |
+| REQ-034; AC-013 | TASK-004-REV-02 establishes real-browser page proof under approved revision 15; TASK-013–026 each own their route/workflow, applicable range changes and negative flows |
 | REQ-035; AC-014 | TASK-011 extends existing agent-readiness ownership for a connected live-agent/browser MCP App investigation, follow-up and range reload; deterministic host negatives supplement it |
 | REQ-020; AC-010 | Every task: runnable named visual checkpoint, per-component acceptance and source-backed reuse; existing preservation hashes/source inventory remain intact; independent task readiness review before handoff |
 | REQ-022; INV-001/002/004/006/007 | Every consuming task: current contracts, recorded data, credential/tenant boundary, small existing-owner integration, honest errors and focused proof; task acceptance and integrated diff review |
+| REQ-037–040; AC-020–023 | TASK-004-REV-01: local initialized MockServer. TASK-004-REV-02: canonical current-SDK batch, full authenticated shell/Observe and safe shared predicate consumers; revision 18 |
 
 ## Verification ownership
 
@@ -128,9 +179,11 @@ live authorized consumer or claim other-platform success from a local check.
 TASK-003's existing foundation scope, exact scenarios and individual human
 checkpoints remain intact. Do not reopen it to implement a browser harness,
 Ask or a live agent; correct actual foundation defects only if discovered.
-TASK-011 owns the new real-browser App proof and minimal browser tooling needed
-for it; TASK-012 reuses that tooling for the conventional shell, and page tasks
-extend their existing exact T6 selectors rather than creating another runner.
+Under revision 11, TASK-011 owned the first browser tooling and TASK-012 reused
+it. Approved revision 15 supersedes that sequencing: TASK-004-REV-02 owns the first
+real-browser/BFF lifecycle, and TASK-011 plus later pages reuse it. TASK-011
+retains production App-specific proof; page tasks extend their focused T6
+selectors rather than creating another runner.
 An installed browser driver is test infrastructure, not an optional production
 setting. No existing jsdom or HTTP-only check is relabeled as real-browser proof.
 

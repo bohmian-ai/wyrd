@@ -31,10 +31,10 @@ index 35ad80e..1675042 100644
  
 diff --git a/scripts/batch.py b/scripts/batch.py
 new file mode 100644
-index 0000000..fbd5efe
+index 0000000..1c71416
 --- /dev/null
 +++ b/scripts/batch.py
-@@ -0,0 +1,257 @@
+@@ -0,0 +1,292 @@
 +"""Send a bounded batch of real requests to the running support API, wait for
 +every queued verdict, and check Wyrd retained what the app sent.
 +
@@ -50,8 +50,11 @@ index 0000000..fbd5efe
 +| `unknown`  | 5 %   | `POST /ask` for order `Z-9`     | 404 before any Run or model call  |
 +
 +Rounding goes to `shipping`, so exactly ``--requests`` calls are sent, never
-+retried. The app starts each call's trace. The report is JSON on stdout; any
-+unexpected reply, missing verdict, or missing telemetry exits 1.
++retried. The app starts each call's trace and names it in the response's W3C
++``traceresponse`` header; every retained span, log, model call, and verdict is
++matched to the call it belongs to, so other traffic can never stand in for it.
++The report is JSON on stdout; any unexpected reply, missing verdict, or missing
++telemetry exits 1.
 +"""
 +
 +from __future__ import annotations
@@ -91,6 +94,8 @@ index 0000000..fbd5efe
 +
 +    case: str
 +    status: int = 0
++    trace_id: str | None = None
++    span_id: str | None = None
 +    request_id: str | None = None
 +    verdict: str | None = None
 +    execution_id: str | None = None
@@ -119,6 +124,12 @@ index 0000000..fbd5efe
 +            call.problems.append(f"{type(error).__name__}: {error}")
 +            return call
 +    call.status = response.status_code
++    # `traceresponse: 00-<trace id>-<server span id>-<flags>`
++    parts = response.headers.get("traceresponse", "").split("-")
++    if len(parts) == 4:
++        call.trace_id, call.span_id = parts[1], parts[2]
++    else:
++        call.problems.append("no traceresponse header")
 +    want = 404 if case == "unknown" else 200
 +    if call.status != want:
 +        call.problems.append(f"HTTP {call.status}, want {want}: {response.text[:200]}")
@@ -152,59 +163,81 @@ index 0000000..fbd5efe
 +    return {row["k"]: row["n"] for row in rows if row["k"] is not None}
 +
 +
-+# One trace per request: those holding the app's HTTP server span (OTLP kind 2).
 +SPANS = """SELECT encode(trace_id, 'hex') AS k, count(*) AS n FROM bifrost.traces.spans
-+WHERE start_time_unix_nano >= to_timestamp_nanos($1) AND service_name = 'support-desk'
-+GROUP BY 1 HAVING bool_or(kind = 2)"""
++WHERE start_time_unix_nano >= to_timestamp_nanos($1) GROUP BY 1"""
++# Root spans by span id: each call's HTTP server span must be one.
++ROOTS = """SELECT encode(span_id, 'hex') AS k, count(*) AS n FROM bifrost.traces.spans
++WHERE start_time_unix_nano >= to_timestamp_nanos($1) AND parent_span_id IS NULL GROUP BY 1"""
 +LOGS = """SELECT encode(trace_id, 'hex') AS k, count(*) AS n FROM bifrost.logs.records
-+WHERE time_unix_nano >= to_timestamp_nanos($1) AND service_name = 'support-desk' GROUP BY 1"""
++WHERE time_unix_nano >= to_timestamp_nanos($1) GROUP BY 1"""
 +POINTS = """SELECT metric_name AS k, count(*) AS n FROM bifrost.metrics.points
 +WHERE time_unix_nano >= to_timestamp_nanos($1) GROUP BY 1"""
++# The judge's gateway calls carry the Run they judge.
 +CALLS = """SELECT run_id AS k, count(*) AS n FROM bifrost.gateway.calls
 +WHERE started_at >= to_timestamp_nanos($1) AND requested_model['model'] NOT LIKE '%gpt-6-luna'
 +GROUP BY 1"""
-+JUDGE = """SELECT 'judge' AS k, count(*) AS n FROM bifrost.gateway.calls
-+WHERE started_at >= to_timestamp_nanos($1) AND requested_model['model'] LIKE '%gpt-6-luna'"""
++JUDGE = """SELECT run_id AS k, count(*) AS n FROM bifrost.gateway.calls
++WHERE started_at >= to_timestamp_nanos($1) AND requested_model['model'] LIKE '%gpt-6-luna'
++GROUP BY 1"""
 +RESULTS = """SELECT run_id AS k, count(*) AS n FROM bifrost.verification.results
 +WHERE started_at >= to_timestamp_nanos($1) GROUP BY 1"""
 +
 +
-+def readback(calls: list[Call], since_ns: int, client: WyrdClient | None) -> dict[str, Any]:
-+    """Counts of what Wyrd retained for this batch, by trace and Run ID."""
++def readback(since_ns: int, client: WyrdClient | None) -> dict[str, dict[str, int]]:
++    """What Wyrd retained since the batch started, keyed by trace, span, metric or Run ID.
++
++    Other traffic is retained too; only `missing` decides which rows belong to the batch.
++    """
 +    bifrost = Bifrost(client=client)
-+    spans, logs = counts(bifrost, SPANS, since_ns), counts(bifrost, LOGS, since_ns)
-+    gateway, results = counts(bifrost, CALLS, since_ns), counts(bifrost, RESULTS, since_ns)
-+    runs = [c for c in calls if c.request_id]
++    queries = {"spans": SPANS, "roots": ROOTS, "logs": LOGS, "points": POINTS}
++    queries |= {"app_calls": CALLS, "judge_calls": JUDGE, "results": RESULTS}
++    return {name: counts(bifrost, sql, since_ns) for name, sql in queries.items()}
++
++
++def retained(calls: list[Call], evidence: dict[str, dict[str, int]]) -> dict[str, Any]:
++    """Totals of the batch's own evidence: rows of other traces and Runs are not counted."""
++    traces = [c.trace_id for c in calls if c.trace_id]
++    asks = [c.trace_id for c in calls if c.trace_id and c.case != "openapi"]
++    runs = [c.request_id for c in calls if c.request_id]
 +    return {
-+        "traces_with_spans": len(spans),
-+        "spans": sum(spans.values()),
-+        "asks_with_logs": len(logs),
-+        "logs": sum(logs.values()),
-+        "metric_points": counts(bifrost, POINTS, since_ns),
-+        "app_model_calls": sum(gateway.get(c.request_id or "", 0) for c in runs),
-+        "judge_model_calls": counts(bifrost, JUDGE, since_ns).get("judge", 0),
-+        "runs_with_two_verdicts": sum(results.get(c.request_id or "", 0) >= 2 for c in runs),
++        "traces_with_spans": sum(t in evidence["spans"] for t in traces),
++        "spans": sum(evidence["spans"].get(t, 0) for t in traces),
++        "root_spans": sum(c.span_id in evidence["roots"] for c in calls if c.span_id),
++        "asks_with_logs": sum(t in evidence["logs"] for t in asks),
++        "logs": sum(evidence["logs"].get(t, 0) for t in asks),
++        # Points are observations of the batch's time window, never one per request.
++        "metric_points": evidence["points"],
++        "app_model_calls": sum(evidence["app_calls"].get(r, 0) for r in runs),
++        "judge_model_calls": sum(evidence["judge_calls"].get(r, 0) for r in runs),
++        "runs_with_two_verdicts": sum(evidence["results"].get(r, 0) >= 2 for r in runs),
 +    }
 +
 +
-+def missing(calls: list[Call], retained: dict[str, Any]) -> list[str]:
-+    """Which expected observations have not been retained yet."""
-+    runs = sum(c.request_id is not None for c in calls)
-+    asked = sum(c.case != "openapi" for c in calls)
++def missing(calls: list[Call], evidence: dict[str, dict[str, int]]) -> list[str]:
++    """Each expected observation of each call that has not been retained yet."""
 +    gaps = []
-+    if retained["traces_with_spans"] < len(calls):
-+        gaps.append(f"spans for {retained['traces_with_spans']} of {len(calls)} requests")
-+    if retained["asks_with_logs"] < asked:
-+        gaps.append(f"logs for {retained['asks_with_logs']} of {asked} asks")
-+    absent = [m for m in METRICS if not retained["metric_points"].get(m)]
-+    if runs and absent:
++    for i, c in enumerate(calls):
++        name = f"{c.case} #{i} trace {c.trace_id}"
++        if c.trace_id is None:
++            continue  # its send already reported the missing traceresponse
++        if c.trace_id not in evidence["spans"]:
++            gaps.append(f"{name}: no spans")
++        elif c.span_id not in evidence["roots"]:
++            gaps.append(f"{name}: HTTP server span {c.span_id} is not a retained root")
++        if c.case != "openapi" and c.trace_id not in evidence["logs"]:
++            gaps.append(f"{name}: no log records")
++        if c.request_id is None:
++            continue
++        run = f"{c.case} #{i} Run {c.request_id}"
++        if evidence["app_calls"].get(c.request_id, 0) < 2:
++            gaps.append(f"{run}: {evidence['app_calls'].get(c.request_id, 0)} of 2 app model calls")
++        if evidence["judge_calls"].get(c.request_id, 0) < 1:
++            gaps.append(f"{run}: no judge model call")
++        if evidence["results"].get(c.request_id, 0) < 2:
++            gaps.append(f"{run}: {evidence['results'].get(c.request_id, 0)} of 2 verdicts")
++    absent = [m for m in METRICS if not evidence["points"].get(m)]
++    if any(c.request_id for c in calls) and absent:
 +        gaps.append(f"no points for {', '.join(absent)}")
-+    if retained["app_model_calls"] < 2 * runs:
-+        gaps.append(f"{retained['app_model_calls']} of {2 * runs} app model calls")
-+    if retained["judge_model_calls"] < runs:
-+        gaps.append(f"{retained['judge_model_calls']} of {runs} judge model calls")
-+    if retained["runs_with_two_verdicts"] < runs:
-+        gaps.append(f"both verdicts for {retained['runs_with_two_verdicts']} of {runs} Runs")
 +    return gaps
 +
 +
@@ -243,11 +276,12 @@ index 0000000..fbd5efe
 +    settled = time.monotonic()
 +    deadline = settled + timeout
 +    while True:
-+        retained = readback(calls, since_ns, client)
-+        gaps = missing(calls, retained)
++        evidence = readback(since_ns, client)
++        gaps = missing(calls, evidence)
 +        if not gaps or time.monotonic() >= deadline:
 +            break
 +        time.sleep(2)
++    totals = retained(calls, evidence)
 +    problems = [f"{c.case} #{i}: {p}" for i, c in enumerate(calls) for p in c.problems]
 +    runs = sum(c.request_id is not None for c in calls)
 +    return {
@@ -261,13 +295,14 @@ index 0000000..fbd5efe
 +        "immediate_verdicts": dict(Counter(c.verdict for c in calls if c.verdict)),
 +        "queued_verdicts": dict(Counter(c.queued_verdict for c in calls if c.queued_verdict)),
 +        "expected": {"app_model_calls": 2 * runs, "judge_model_calls": runs},
-+        "retained": retained,
++        "retained": totals,
 +        # Gateway attempts beyond the logical flow are retries, reported, never hidden.
 +        "retries": {
-+            "app_model_calls": max(0, retained["app_model_calls"] - 2 * runs),
-+            "judge_model_calls": max(0, retained["judge_model_calls"] - runs),
++            "app_model_calls": max(0, totals["app_model_calls"] - 2 * runs),
++            "judge_model_calls": max(0, totals["judge_model_calls"] - runs),
 +        },
-+        "missing": gaps,
++        "missing": gaps[:50],
++        "missing_count": len(gaps),
 +        "problems": problems[:50],
 +        "problem_count": len(problems),
 +        "seconds": {
@@ -293,10 +328,10 @@ index 0000000..fbd5efe
 +if __name__ == "__main__":
 +    main()
 diff --git a/src/app.py b/src/app.py
-index e96a6c4..5d96ec8 100644
+index e96a6c4..6528b21 100644
 --- a/src/app.py
 +++ b/src/app.py
-@@ -12,27 +12,40 @@ Run it with ``uv run uvicorn src.app:app``.
+@@ -12,27 +12,46 @@ Run it with ``uv run uvicorn src.app:app``.
  
  from __future__ import annotations
  
@@ -309,6 +344,10 @@ index e96a6c4..5d96ec8 100644
  from fastapi.responses import JSONResponse
 +from opentelemetry import metrics
 +from opentelemetry.instrumentation.asgi import OpenTelemetryMiddleware
++from opentelemetry.instrumentation.propagators import (
++    TraceResponsePropagator,
++    set_global_response_propagator,
++)
  from pydantic import BaseModel
  from wyrd import WyrdError
  
@@ -336,10 +375,12 @@ index e96a6c4..5d96ec8 100644
  app = FastAPI(title="support-desk", lifespan=lifespan)
 +# One HTTP span per request; `Desk.handle` still owns the Run.
 +app.add_middleware(OpenTelemetryMiddleware)
++# Each response names its trace in a W3C `traceresponse` header, so a client can find it in Wyrd.
++set_global_response_propagator(TraceResponsePropagator())
  
  
  class Ask(BaseModel):
-@@ -49,5 +62,17 @@ async def wyrd_error(request: Request, error: WyrdError) -> JSONResponse:
+@@ -49,5 +68,17 @@ async def wyrd_error(request: Request, error: WyrdError) -> JSONResponse:
  @app.post("/ask")
  async def ask(body: Ask, request: Request) -> dict[str, Any]:
      if body.order_id not in ORDERS:
@@ -449,10 +490,10 @@ index 71bffb5..5a04890 100644
          yield client
 diff --git a/test/test_dev_workload.py b/test/test_dev_workload.py
 new file mode 100644
-index 0000000..a5089bc
+index 0000000..af0c455
 --- /dev/null
 +++ b/test/test_dev_workload.py
-@@ -0,0 +1,123 @@
+@@ -0,0 +1,166 @@
 +"""The workload batch against the API served by uvicorn, as in development."""
 +
 +from __future__ import annotations
@@ -471,7 +512,7 @@ index 0000000..a5089bc
 +from wyrd.bifrost import Bifrost
 +from wyrd.testing import WyrdTestServer
 +
-+from scripts.batch import plan, run_batch
++from scripts.batch import Call, missing, plan, readback, retained, run_batch
 +from src.desk import ROOT
 +
 +
@@ -538,8 +579,26 @@ index 0000000..a5089bc
 +    served: tuple[str, subprocess.Popen[bytes]], publishing: None
 +) -> None:
 +    url, app = served
++    since = time.time_ns()
++    # Other traffic on the same app while the batch runs: it is retained, never counted for the batch.
++    stray: list[tuple[str, str]] = []
++    done = threading.Event()
 +
-+    report = run_batch(url, 20, 2, timeout=120)
++    def unrelated() -> None:
++        while not done.is_set():
++            for method, body in (("GET", None), ("POST", {"question": "Where is it?", "order_id": "Z-9"})):
++                path = "/openapi.json" if body is None else "/ask"
++                response = httpx.request(method, f"{url}{path}", json=body)
++                stray.append((path, response.headers["traceresponse"].split("-")[1]))
++            done.wait(0.5)
++
++    traffic = threading.Thread(target=unrelated, daemon=True)
++    traffic.start()
++    try:
++        report = run_batch(url, 20, 2, timeout=120)
++    finally:
++        done.set()
++        traffic.join()
 +
 +    assert report["ok"], report
 +    assert report["dispatched"] == 20
@@ -548,17 +607,42 @@ index 0000000..a5089bc
 +    assert report["runs"] == 18
 +    assert report["immediate_verdicts"] == {"passed": 16, "failed": 2}
 +    assert report["queued_verdicts"] == {"passed": 18}
-+    retained = report["retained"]
++    totals = report["retained"]
 +    # Read while the API is still running: every signal was exported in batches.
 +    assert app.poll() is None
-+    assert retained["traces_with_spans"] == 20
-+    assert retained["asks_with_logs"] == 19
-+    assert retained["app_model_calls"] == 36 and retained["judge_model_calls"] == 18
++    assert totals["traces_with_spans"] == 20 and totals["root_spans"] == 20
++    assert totals["asks_with_logs"] == 19
++    assert totals["app_model_calls"] == 36 and totals["judge_model_calls"] == 18
 +    assert {"support_desk.asks", "support_desk.ask.duration", "support_desk.asks.in_flight"} <= set(
-+        retained["metric_points"]
++        totals["metric_points"]
 +    )
 +    unknown = next(c for c in report["calls"] if c["case"] == "unknown")
 +    assert unknown["status"] == 404 and unknown["request_id"] is None
++    calls = [Call(**c) for c in report["calls"]]
++    assert all(c.trace_id and c.span_id for c in calls)
++
++    # Unrelated traffic was retained, yet one workload request's missing evidence is still named.
++    def landed(evidence: dict[str, dict[str, int]]) -> bool:
++        spans = all(trace in evidence["spans"] for _, trace in stray)
++        return spans and all(trace in evidence["logs"] for path, trace in stray if path == "/ask")
++
++    deadline = time.monotonic() + 60
++    while not landed(evidence := readback(since, None)):
++        assert time.monotonic() < deadline, "the unrelated traffic was not retained"
++        time.sleep(1)
++    assert stray
++    assert missing(calls, evidence) == []
++    shipping = next(i for i, c in enumerate(calls) if c.case == "shipping")
++    lost = calls[shipping]
++    for table in ("spans", "logs"):
++        del evidence[table][lost.trace_id]
++    del evidence["judge_calls"][lost.request_id]
++    assert missing(calls, evidence) == [
++        f"shipping #{shipping} trace {lost.trace_id}: no spans",
++        f"shipping #{shipping} trace {lost.trace_id}: no log records",
++        f"shipping #{shipping} Run {lost.request_id}: no judge model call",
++    ]
++    assert retained(calls, evidence)["traces_with_spans"] == 19
 +
 +    # A graceful stop drains what the API logged on its way out.
 +    stopping = time.time_ns()

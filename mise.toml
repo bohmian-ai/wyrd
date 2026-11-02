@@ -1320,24 +1320,30 @@ until curl -sf http://127.0.0.1:1080/mockserver/ready >/dev/null; do
   kill -0 "${pids[0]}" 2>/dev/null || { echo "MockServer exited before it was ready" >&2; exit 1; }
   sleep 1
 done
-scripts/dev/example-app.sh setup
-scripts/dev/example-app.sh serve &
-app=$!
-until curl -sf -o /dev/null http://127.0.0.1:${WYRD_EXAMPLE_PORT:-8000}/docs; do
-  kill -0 "$app" 2>/dev/null || { echo "wyrd-example-py exited before it was ready" >&2; exit 1; }
-  sleep 1
-done
-if scripts/dev/example-app.sh batch --requests "$usage_requests" --concurrency "$usage_concurrency"; then
-  batch="passed"
+# A failed setup or batch leaves the server, UI and MockServer running for diagnosis.
+if scripts/dev/example-app.sh setup; then
+  scripts/dev/example-app.sh serve &
+  app=$!
+  until curl -sf -o /dev/null http://127.0.0.1:${WYRD_EXAMPLE_PORT:-8000}/docs; do
+    kill -0 "$app" 2>/dev/null || { echo "wyrd-example-py exited before it was ready" >&2; exit 1; }
+    sleep 1
+  done
+  example="http://127.0.0.1:${WYRD_EXAMPLE_PORT:-8000}/docs"
+  if scripts/dev/example-app.sh batch --requests "$usage_requests" --concurrency "$usage_concurrency"; then
+    batch="passed; send another with mise run dev:batch -- --requests 20 --concurrency 2"
+  else
+    batch="FAILED (see the report above); every service is still running for diagnosis"
+  fi
 else
-  batch="FAILED (see the report above); every service is still running for diagnosis"
+  example="not started: setup FAILED (see above)"
+  batch="not sent: setup FAILED; the server, UI and MockServer are still running for diagnosis"
 fi
 printf '\nwyrd-server  http://127.0.0.1:8080 (fresh database; tenant dev key replaced %s)\n' "$credentials"
 printf 'UI           http://127.0.0.1:%s/t/dev/login/api-key (sign in with that api_key)\n' "${WYRD_UI_PORT:-3000}"
-printf 'example app  http://127.0.0.1:%s/docs\n' "${WYRD_EXAMPLE_PORT:-8000}"
+printf 'example app  %s\n' "$example"
 printf 'MockServer   http://127.0.0.1:1080/mockserver/dashboard\n'
-printf 'batch        %s; send another with mise run dev:batch -- --requests 20 --concurrency 2\n\n' "$batch"
-wait -n "${pids[@]}" "$app"
+printf 'batch        %s\n\n' "$batch"
+wait -n "${pids[@]}" ${app:+"$app"}
 """
 
 [tasks."dev:batch"]

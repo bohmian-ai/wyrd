@@ -312,23 +312,55 @@ async function traceTotal(page: Page): Promise<number> {
   return Number(/Traces\s*(\d[\d,]*)/.exec(text)?.[1].replaceAll(',', '') ?? NaN);
 }
 
-base('development environment lifecycle', { timeout: 1_800_000 }, async () => {
-  // The launcher's ports are fixed; another service on one would be mistaken for this environment.
-  for (const port of [8080, 3000, 8000, 1080]) expect(await answers(port), `port ${port} is already serving; stop that service first`).toBe(false);
-  // A config home of its own: startup replaces the dev key there, never in the developer's.
-  const config = mkdtempSync(join(tmpdir(), 'wyrd-dev-'));
+/** Starts `mise run dev:full` in its own process group, writing to a log file in `config`. */
+function devFull(config: string, env: Record<string, string> = {}) {
   // Output goes to a file, never a pipe this process must drain: a blocked test would stall every service writing to it.
-  const log = join(config, 'dev-full.log');
+  const log = join(config, `dev-full-${Date.now()}.log`);
   const out = openSync(log, 'w');
   const child = spawn('mise', ['run', 'dev:full', '--requests', '20', '--concurrency', '2'], {
     cwd: REPO,
-    env: { ...process.env, WYRD_CONFIG_HOME: config },
+    env: { ...process.env, WYRD_CONFIG_HOME: config, ...env },
     detached: true,
     stdio: ['ignore', out, out]
   });
   closeSync(out);
-  const output = () => readFileSync(log, 'utf8');
   const exited = new Promise<number | null>((done) => child.once('exit', (code) => done(code)));
+  return {
+    log,
+    output: () => readFileSync(log, 'utf8'),
+    /** Ctrl-C, as a developer stops it. */
+    async interrupt() {
+      if (child.exitCode === null) process.kill(-child.pid!, 'SIGINT');
+      await exited;
+    }
+  };
+}
+
+base('development environment lifecycle', { timeout: 2_400_000 }, async () => {
+  // The launcher's ports are fixed; another service on one would be mistaken for this environment.
+  for (const port of [8080, 3000, 8000, 1080]) expect(await answers(port), `port ${port} is already serving; stop that service first`).toBe(false);
+  // A config home of its own: startup replaces the dev key there, never in the developer's.
+  const config = mkdtempSync(join(tmpdir(), 'wyrd-dev-'));
+
+  // A setup refused after the services are ready leaves them running for diagnosis and starts nothing that depends on it.
+  const refused = devFull(config, { WYRD_API_KEY: 'wyrd_not_a_key' });
+  try {
+    await vi.waitFor(() => expect(refused.output()).toMatch(/batch {8}(not sent|passed|FAILED)/), { timeout: 1_500_000, interval: 1_000 });
+    expect(refused.output(), refused.log).toContain('example app  not started: setup FAILED');
+    expect(refused.output()).toContain('batch        not sent: setup FAILED');
+    expect(refused.output()).not.toContain('scripts.batch');
+    expect(await answers(8000), 'example app after a failed setup').toBe(false);
+    expect((await fetch('http://127.0.0.1:8080/readyz')).ok).toBe(true);
+    expect((await fetch('http://127.0.0.1:3000/t/dev/login/api-key')).ok).toBe(true);
+    expect((await fetch('http://127.0.0.1:1080/mockserver/ready')).ok).toBe(true);
+  } finally {
+    await refused.interrupt();
+  }
+  for (const port of [8080, 3000, 8000]) expect(await answers(port), `port ${port} after Ctrl-C`).toBe(false);
+
+  const child = devFull(config);
+  const output = child.output;
+  const log = child.log;
   const browser = await chromium.launch();
   try {
     // One command reaches readiness, runs the batch to terminal evidence and reports usable URLs.
@@ -364,8 +396,7 @@ base('development environment lifecycle', { timeout: 1_800_000 }, async () => {
   } finally {
     await browser.close();
     // Ctrl-C stops every owned child: the app first, so its telemetry drains.
-    if (child.exitCode === null) process.kill(-child.pid!, 'SIGINT');
-    await exited;
+    await child.interrupt();
   }
   for (const port of [8080, 3000, 8000]) expect(await answers(port), `port ${port} after Ctrl-C`).toBe(false);
 });

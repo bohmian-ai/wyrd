@@ -5,7 +5,7 @@
  * evidence exported over stock OTLP. Nothing here mocks the server or the BFF.
  */
 import { execFileSync, spawn } from 'node:child_process';
-import { mkdtempSync, readFileSync } from 'node:fs';
+import { closeSync, mkdtempSync, openSync, readFileSync } from 'node:fs';
 import { createServer } from 'node:net';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
@@ -306,10 +306,10 @@ async function answers(port: number): Promise<boolean> {
   );
 }
 
-/** The `Traces` total the overview shows. */
+/** The `Traces` total the overview shows, or NaN while it loads. */
 async function traceTotal(page: Page): Promise<number> {
   const text = (await page.locator('[data-panel="overview"]').textContent()) ?? '';
-  return Number(/Traces\s*([\d,]+)/.exec(text)?.[1].replaceAll(',', '') ?? NaN);
+  return Number(/Traces\s*(\d[\d,]*)/.exec(text)?.[1].replaceAll(',', '') ?? NaN);
 }
 
 base('development environment lifecycle', { timeout: 1_800_000 }, async () => {
@@ -317,21 +317,24 @@ base('development environment lifecycle', { timeout: 1_800_000 }, async () => {
   for (const port of [8080, 3000, 8000, 1080]) expect(await answers(port), `port ${port} is already serving; stop that service first`).toBe(false);
   // A config home of its own: startup replaces the dev key there, never in the developer's.
   const config = mkdtempSync(join(tmpdir(), 'wyrd-dev-'));
+  // Output goes to a file, never a pipe this process must drain: a blocked test would stall every service writing to it.
+  const log = join(config, 'dev-full.log');
+  const out = openSync(log, 'w');
   const child = spawn('mise', ['run', 'dev:full', '--requests', '20', '--concurrency', '2'], {
     cwd: REPO,
     env: { ...process.env, WYRD_CONFIG_HOME: config },
     detached: true,
-    stdio: ['ignore', 'pipe', 'pipe']
+    stdio: ['ignore', out, out]
   });
-  let output = '';
-  for (const stream of [child.stdout, child.stderr]) stream.on('data', (chunk: Buffer) => (output += chunk.toString()));
+  closeSync(out);
+  const output = () => readFileSync(log, 'utf8');
   const exited = new Promise<number | null>((done) => child.once('exit', (code) => done(code)));
   const browser = await chromium.launch();
   try {
     // One command reaches readiness, runs the batch to terminal evidence and reports usable URLs.
-    await vi.waitFor(() => expect(output).toMatch(/batch {8}(passed|FAILED)/), { timeout: 1_500_000, interval: 1_000 });
-    expect(output).toContain('batch        passed');
-    expect(output).toContain('UI           http://127.0.0.1:3000/t/dev/login/api-key');
+    await vi.waitFor(() => expect(output()).toMatch(/batch {8}(passed|FAILED)/), { timeout: 1_500_000, interval: 1_000 });
+    expect(output(), log).toContain('batch        passed');
+    expect(output()).toContain('UI           http://127.0.0.1:3000/t/dev/login/api-key');
     for (const port of [8080, 3000, 8000, 1080]) expect(await answers(port), `port ${port}`).toBe(true);
     const key = /api_key = "([^"]+)"/.exec(readFileSync(join(config, 'credentials.toml'), 'utf8'))?.[1];
     expect(key).toBeDefined();
@@ -349,9 +352,15 @@ base('development environment lifecycle', { timeout: 1_800_000 }, async () => {
     await expect.poll(() => traceTotal(page), { timeout: 60_000 }).toBeGreaterThan(0);
     const before = await traceTotal(page);
     execFileSync('mise', ['run', 'dev:batch', '--requests', '4', '--concurrency', '2'], { cwd: REPO, env: { ...process.env, WYRD_CONFIG_HOME: config }, stdio: 'inherit' });
-    await expect
-      .poll(async () => (await page.reload(), traceTotal(page)), { timeout: 120_000, interval: 2_000 })
-      .toBeGreaterThan(before);
+    // Each reload is read only once its overview has loaded.
+    await vi.waitFor(
+      async () => {
+        await page.reload();
+        await expect.poll(() => traceTotal(page), { timeout: 30_000 }).not.toBeNaN();
+        expect(await traceTotal(page)).toBeGreaterThan(before);
+      },
+      { timeout: 180_000, interval: 2_000 }
+    );
   } finally {
     await browser.close();
     // Ctrl-C stops every owned child: the app first, so its telemetry drains.

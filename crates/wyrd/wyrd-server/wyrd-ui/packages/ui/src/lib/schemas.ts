@@ -169,6 +169,13 @@ export const FilterSchema = z.object({ column: z.string().min(1), value: queryPa
 /** Clauses ANDed into every read of one signal. */
 const where = z.array(FilterSchema).max(32);
 
+/**
+ * One SQL predicate over the signal table's own columns, ANDed with `where`.
+ * The server validates and normalizes it before any read that uses it; blank
+ * means no extra predicate.
+ */
+const whereSql = z.string().max(8192);
+
 /** Refuse a column the signal does not offer, naming the field. */
 function knownColumns(signal: Signal, names: readonly string[], allowed: readonly string[], path: PropertyKey[], context: z.RefinementCtx) {
   names.forEach((name, index) => {
@@ -182,7 +189,13 @@ const spanId = z.string().regex(/^[0-9a-f]{16}$/, '16 lowercase hex digits');
 
 /** The input of `FacetRail`: value counts of `facets` under the list's own WHERE and range. */
 export const FacetRailInputSchema = z
-  .object({ signal: SignalSchema, where: where.optional(), facets: z.array(z.string().min(1)).min(1).max(12), range: RangeSchema.optional() })
+  .object({
+    signal: SignalSchema,
+    where: where.optional(),
+    where_sql: whereSql.optional(),
+    facets: z.array(z.string().min(1)).min(1).max(12),
+    range: RangeSchema.optional()
+  })
   .strict()
   .superRefine((input, context) => {
     knownColumns(input.signal, input.facets, SIGNALS[input.signal].filters, ['facets'], context);
@@ -203,7 +216,13 @@ const listFields = {
  */
 export const RecordTableInputSchema = z.union([
   z
-    .object({ signal: SignalSchema, where: where.optional(), columns: z.array(z.string().min(1)).min(1).max(24).optional(), ...listFields })
+    .object({
+      signal: SignalSchema,
+      where: where.optional(),
+      where_sql: whereSql.optional(),
+      columns: z.array(z.string().min(1)).min(1).max(24).optional(),
+      ...listFields
+    })
     .strict()
     .superRefine((input, context) => {
       const columns = signalColumns(input.signal);
@@ -238,13 +257,17 @@ export const StatStripInputSchema = z
     stats: z.array(z.enum(STATS)).min(1).max(5),
     scope: z.object({ column: z.enum(['workload_card_uid', 'subject_card_uid']), uid: z.string().min(1) }).strict().optional(),
     where: where.optional(),
+    where_sql: whereSql.optional(),
     range: RangeSchema.optional()
   })
   .strict()
   .superRefine((input, context) => {
     knownColumns('spans', (input.where ?? []).map((each) => each.column), SIGNALS.spans.filters, ['where'], context);
-    if (input.where?.length && input.stats.some((stat) => stat === 'tokens' || stat === 'calls' || stat === 'cost'))
+    const gateway = input.stats.some((stat) => stat === 'tokens' || stat === 'calls' || stat === 'cost');
+    if (input.where?.length && gateway)
       context.addIssue({ code: 'custom', path: ['where'], message: 'span filters do not apply to gateway tokens, calls or cost' });
+    if (input.where_sql?.trim() && gateway)
+      context.addIssue({ code: 'custom', path: ['where_sql'], message: 'span predicates do not apply to gateway tokens, calls or cost' });
   });
 
 /** A filter a facet or detail field asks the host to apply. */

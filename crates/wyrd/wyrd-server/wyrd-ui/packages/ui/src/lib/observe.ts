@@ -93,6 +93,12 @@ class Binds {
     return binds;
   }
 
+  /** AND one server-normalized predicate; it binds nothing and names only the table's own columns. */
+  predicate(sql: string | undefined): this {
+    if (sql) this.clauses.push(`(${sql})`);
+    return this;
+  }
+
   /** AND each WHERE clause; the column is already one of the signal's allowlisted names. */
   where(filters: readonly Filter[] = []): this {
     for (const { column, value, not } of filters) {
@@ -129,6 +135,23 @@ function query(sql: string, params: readonly QueryParam[], max_rows?: number): E
   return { op: 'bifrost.query', sql, params: [...params], ...(max_rows === undefined ? {} : { max_rows }) };
 }
 
+/**
+ * Validate a panel's `where_sql` against its signal table before any read
+ * uses it: the normalized predicate, `undefined` for none, or the refusal
+ * that stops the panel with no dependent read.
+ */
+async function predicateFor(table: string, whereSql: string | undefined, context: LoadContext): Promise<{ sql?: string } | Loaded<never>> {
+  if (!whereSql?.trim()) return {};
+  const dot = table.lastIndexOf('.');
+  const [checked] = await context.executor.run(
+    [{ op: 'bifrost.validate_predicate', namespace: table.slice(0, dot), name: table.slice(dot + 1), expression: whereSql }],
+    context.signal
+  );
+  if (!checked.ok) return failed(checked.problem);
+  context.signal?.throwIfAborted();
+  return { sql: checked.value.expression || undefined };
+}
+
 /** The first refused or failed result of a batch, as the component's state. */
 function firstFailure(results: readonly { ok: boolean; problem?: Problem }[]): Loaded<never> | undefined {
   const failure = results.find((each) => !each.ok);
@@ -156,7 +179,7 @@ const STAT_SOURCES: Record<Stat, { table: string; time: string; value: string; f
 };
 
 /** The total and per-bucket reads of one stat. */
-export function statQueries(stat: Stat, input: StatStripInput, range: AbsoluteRange, bucket: string): [Executed, Executed] {
+export function statQueries(stat: Stat, input: StatStripInput, range: AbsoluteRange, bucket: string, predicate?: string): [Executed, Executed] {
   const source = STAT_SOURCES[stat];
   const span = source.table === SIGNALS.spans.table;
   const plan = (series: boolean) => {
@@ -164,7 +187,7 @@ export function statQueries(stat: Stat, input: StatStripInput, range: AbsoluteRa
     const bin = series ? `date_bin(${binds.bind(bucket)}::interval, ${source.time})` : '';
     if (source.filter) binds.clauses.push(source.filter);
     if (input.scope) binds.clauses.push(`${input.scope.column} = ${binds.bind(input.scope.uid)}`);
-    if (span) binds.where(input.where);
+    if (span) binds.where(input.where).predicate(predicate);
     if (source.roots) binds.roots(source.table);
     const currency = source.byCurrency ? ', currency' : '';
     const sql = series
@@ -179,7 +202,9 @@ export function statQueries(stat: Stat, input: StatStripInput, range: AbsoluteRa
 export async function loadStatStrip(input: StatStripInput, context: LoadContext): Promise<StatStripProps> {
   const range = rangeOf(input.range, context);
   if ('code' in range) return { input, result: { state: 'error', problem: range } };
-  const plans = input.stats.map((stat) => statQueries(stat, input, range, bucketFor(range)));
+  const predicate = await predicateFor(SIGNALS.spans.table, input.where_sql, context);
+  if ('state' in predicate) return { input, result: predicate };
+  const plans = input.stats.map((stat) => statQueries(stat, input, range, bucketFor(range), predicate.sql));
   const results = await context.executor.run(plans.flatMap(([total, series]) => [query(total.sql, total.params), query(series.sql, series.params)]), context.signal);
   const failure = firstFailure(results);
   if (failure) return { input, result: failure };
@@ -209,10 +234,10 @@ function emptyList(signal: Signal, where: readonly Filter[] = []): string {
 }
 
 /** Facet counts of one column under the list's own WHERE and range. */
-export function facetQuery(input: FacetRailInput, column: string, range: AbsoluteRange): Executed {
+export function facetQuery(input: FacetRailInput, column: string, range: AbsoluteRange, predicate?: string): Executed {
   const signal = SIGNALS[input.signal];
   const binds = Binds.over(signal.time, range);
-  binds.where(input.where);
+  binds.where(input.where).predicate(predicate);
   // A trace facet counts the traces with a span of each value, under the same span-level WHERE.
   const n = input.signal === 'traces' ? 'count(DISTINCT trace_id)' : 'count(*)';
   return {
@@ -225,7 +250,9 @@ export function facetQuery(input: FacetRailInput, column: string, range: Absolut
 export async function loadFacetRail(input: FacetRailInput, context: LoadContext): Promise<FacetRailProps> {
   const range = rangeOf(input.range, context);
   if ('code' in range) return { input, result: { state: 'error', problem: range } };
-  const plans = input.facets.map((column) => facetQuery(input, column, range));
+  const predicate = await predicateFor(SIGNALS[input.signal].table, input.where_sql, context);
+  if ('state' in predicate) return { input, result: predicate };
+  const plans = input.facets.map((column) => facetQuery(input, column, range, predicate.sql));
   const results = await context.executor.run(plans.map((plan) => query(plan.sql, plan.params)), context.signal);
   const failure = firstFailure(results);
   if (failure) return { input, result: failure };
@@ -249,10 +276,10 @@ export function shownColumns(input: Extract<RecordTableInput, { signal: Signal }
 }
 
 /** The newest rows of one signal, shown columns first and then its identity columns as lowercase hex. */
-export function listQuery(input: Extract<RecordTableInput, { signal: Signal }>, range: AbsoluteRange): Executed {
+export function listQuery(input: Extract<RecordTableInput, { signal: Signal }>, range: AbsoluteRange, predicate?: string): Executed {
   const signal = SIGNALS[input.signal];
   const binds = Binds.over(signal.time, range);
-  binds.where(input.where);
+  binds.where(input.where).predicate(predicate);
   if (input.signal === 'traces') binds.roots(signal.table);
   const keys = KEY_COLUMNS[input.signal].map((key) => (key.endsWith('_id') && key !== 'wyrd_request_id' ? `encode(${key}, 'hex') AS ${key}` : key));
   return {
@@ -288,7 +315,9 @@ export async function loadRecordTable(input: RecordTableInput, context: LoadCont
   } else {
     const range = rangeOf(input.range, context);
     if ('code' in range) return { input, result: { state: 'error', problem: range } };
-    executed = listQuery(input, range);
+    const predicate = await predicateFor(SIGNALS[input.signal].table, input.where_sql, context);
+    if ('state' in predicate) return { input, result: predicate };
+    executed = listQuery(input, range, predicate.sql);
   }
   const [read] = await context.executor.run([query(executed.sql, executed.params, 'sql' in input ? (input.limit ?? 500) : undefined)], context.signal);
   if (!read.ok) return { input, executed, result: failed(read.problem) };

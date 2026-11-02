@@ -57,6 +57,8 @@ export function nodeExecutor(client: WyrdClient): Executor {
         const { table_version, ...table } = await (await bifrost()).describeTable(request.namespace, request.name);
         return { ...table, table_version: String(table_version) };
       }
+      case 'bifrost.validate_predicate':
+        return { expression: await (await bifrost()).validatePredicate(request.namespace, request.name, request.expression) };
       case 'verification.get_execution':
         return (await verify.Execution.connect(request.execution_id, { client })).status();
     }

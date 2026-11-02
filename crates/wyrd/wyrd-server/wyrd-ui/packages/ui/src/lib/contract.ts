@@ -56,6 +56,7 @@ export type WireRequest =
     }
   | { readonly op: 'bifrost.list_tables' }
   | { readonly op: 'bifrost.describe_table'; readonly namespace: string; readonly name: string }
+  | { readonly op: 'bifrost.validate_predicate'; readonly namespace: string; readonly name: string; readonly expression: string }
   | { readonly op: 'verification.get_execution'; readonly execution_id: string };
 
 /** A complete bounded query result: positional rows, returned only after a valid terminal. */
@@ -76,6 +77,7 @@ export interface WireResponses {
   'bifrost.query': QueryResult;
   'bifrost.list_tables': TableListing;
   'bifrost.describe_table': TableDescriptionWire;
+  'bifrost.validate_predicate': { readonly expression: string };
   'verification.get_execution': VerificationExecutionState;
 }
 

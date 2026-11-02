@@ -17,6 +17,7 @@ function tool(request: WireRequest): { name: string; arguments: Record<string, u
     case 'bifrost.query':
     case 'bifrost.list_tables':
     case 'bifrost.describe_table':
+    case 'bifrost.validate_predicate':
       return { name: op, arguments: JSON.parse(JSON.stringify(rest)) as Record<string, unknown> };
   }
 }

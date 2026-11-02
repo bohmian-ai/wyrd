@@ -808,6 +808,10 @@
               "additionalProperties": false
             }
           },
+          "where_sql": {
+            "type": "string",
+            "maxLength": 8192
+          },
           "range": {
             "anyOf": [
               {
@@ -903,6 +907,10 @@
               ],
               "additionalProperties": false
             }
+          },
+          "where_sql": {
+            "type": "string",
+            "maxLength": 8192
           },
           "facets": {
             "minItems": 1,
@@ -1053,6 +1061,10 @@
                   ],
                   "additionalProperties": false
                 }
+              },
+              "where_sql": {
+                "type": "string",
+                "maxLength": 8192
               },
               "columns": {
                 "minItems": 1,

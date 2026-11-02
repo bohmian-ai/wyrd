@@ -306,3 +306,111 @@ consumers against the original task and cumulative candidate; it does not restar
 unrelated discovery. The UI remains unaccepted until the separate required
 human visual checkpoints are actually recorded. Do not commit or push unless
 asked.
+
+## Remediation evidence
+
+Commits: `8d1ed2d35` (F7–F10), `38698d61b` (F5–F6), `f30cc7219` (F1–F4
+implementation), `1015bc024` (F1–F4 journeys), `7aeaa7f7d` (lifecycle headline
+read), `566dca7e6` (narrow-screen layout). Status: `IMPLEMENTED` with one
+recorded material stop condition (exemplar integer precision, below). Human
+visual acceptance is pending for every board; the implementor has not granted it.
+
+| Acceptance criterion | Implementation evidence | Verification evidence | Result |
+|---|---|---|---|
+| F1 canvas shell and boards from existing components | `routes/t/[tenantKey]/+layout.svelte` left rail (undelivered destinations and Ask disabled, identity menu); `observe/+layout.svelte` tabs, toolbar, Traces overview/listbar/facets/RecordTable, Logs timeline, Metrics rail/series/list; `observe/+page.svelte` Drawer + TraceWaterfall, log RecordDetail aside | integration `^authenticated (traces and spans\|logs investigation\|metrics investigation)$`; screenshots below | PASS (visual acceptance pending) |
+| F1 one reusable TimePicker for all signals | `src/lib/TimePicker.svelte` (presets, custom From/To with `now`/`now-2h`/`yesterday`/ISO, UTC/Local, validation, Recent) | `ui-pages.test.ts` readInstant/presetLabel/rangeLabel; journeys: invalid, custom, preset paths on traces/logs/metrics | PASS |
+| F1 series selection agrees with chart lines | `Chart.svelte` host-owned `shown`/`onseries`, checkbox reset to drawn state | `ui-library.test.ts` `^TASK-004: Canonical signal interactions$` | PASS |
+| F2 permitted content or terminal state in first HTML | `observe/+layout.server.ts`, `observe/+page.server.ts` conventional loads | journeys read `serverHtml` before JS for list, exact trace and log URLs | PASS |
+| F2 one range/predicate per refresh; no stale overwrite | layout load resolves one range per `depends('wyrd:observe')` run; SvelteKit discards superseded navigations; Live invalidates | journeys: zoom 03:00→09:00, reset, Back, reload, signal switch, Live append | PASS |
+| F2 malformed range refused | `RangeSchema.safeParse` → `inputProblem`; `zonedText` handles invalid instants | journey: `WYRD_SPEC_400_VALIDATION` visible, no 500 | PASS |
+| F3 recorded series identity, NULL vs string, mixed int/double, >20 series | `observe.ts` `metricQueries` identity + exact Latest/Max/Mean SQL; `recordedSeries` without fold | `ui-library.test.ts` 24-series, NULL/`not set`/`{}`, 9007199254740993 summary; journey legend 5 series, `max` → 2, `by service_name` | PASS |
+| F3 generic Chart consumers unchanged | Chart identity props optional; authored-query path untouched | `ui-library.test.ts` full file | PASS |
+| F4 exact nested counts and all structures reachable | `observe.ts` `NESTED_EXACT` (`CAST(... AS VARCHAR[])`, `named_struct`); Metrics `signalColumns` + RecordTable `oncolumns` → URL | journey seeds unsafe ints, explicit/exponential histograms, summary quantiles/sum, exemplar; columns revealed via URL and Columns menu | PASS except exemplar `int_value` precision (stop condition) |
+| F5 setup failure keeps services | `mise.toml` dev:full guarded setup status | integration `^development environment lifecycle$` asserts `setup FAILED`, app not started, batch not sent | PASS |
+| F6 per-request membership | `scripts/dev/wyrd-example-py.patch` `traceresponse` + `missing()` | `scripts/dev/example-app.sh test -q test/test_dev_workload.py::test_batch_reports_all_outcomes_and_retained_signals` | PASS |
+| F7–F9 stub, `# Errors`, scrubbed instrument | `bifrost.pyi`, `query/floor.rs`, `query/routes.rs` | `py:typecheck`, `py:lints`, `lints`, source inspection | PASS |
+| F10 configured PermissionCheck | `query/service.rs` | `wyrd-ai` `query_bifrost::predicates_are_typed_bounded_and_tenant_scoped`; `wyrd-mcp` `query::pg_tests::predicates_are_typed_bounded_and_tenant_scoped` | PASS |
+| Affected Node/MCP loader parity | unchanged loaders | `ui-library.integration.test.ts` `^TASK-004: Authorized Observe across hosts$` | PASS |
+| Write-set checks | — | `pnpm check` (package, app), UI build, `fmt:check`, `lints`, `codegen:check`, `py:lints`, `py:typecheck`, `git diff --check` | PASS |
+
+Non-goals stayed excluded: no new schema, migration, wire encoding, dependency,
+component kit, query service, Ask or saved views. Overview and GenAI tabs and
+Cards/Verify/Changes destinations are visible and disabled.
+
+### Failure diagnoses
+
+- **SSR 500 on malformed `to`.** Symptom: `?to=bad` returned 500. Cause: the
+  TimePicker trigger label called `toISOString()` on `NaN`. Fix site:
+  `zonedText`, the one formatter all labels use; it now reads "invalid time" and
+  the load's typed refusal renders.
+- **Native checkbox desync.** Symptom: a refused or host-owned toggle left the box
+  checked while the line or column was hidden. Cause: browsers flip `checked`
+  before the handler runs. Fix sites: `Chart.svelte` resets to the drawn state;
+  `RecordTable.svelte` reverts only a refused toggle (the last column).
+- **Lifecycle trace total.** Symptom: lifecycle journey could not read a total.
+  Cause: the regex matched the removed StatStrip text. Fix: read the overview
+  headline `N traces`; no assertion weakened.
+- **Batch pytest under the production wheel.** Symptom: `wyrd.testing` import
+  error. Cause: the remediation command runs the production wheel; the test
+  harness lives in the testing wheel. Fix: run through
+  `scripts/dev/example-app.sh test`, which installs the testing wheel; production
+  wheel pinning unchanged.
+- **Integration locators.** Columns is `<details><summary>`; disabled destinations
+  are `[aria-disabled="true"]`; group selects carry explicit `aria-label` because
+  a wrapping label includes the selected value; after Back the test waits for
+  rows. Each corrected the locator, not the assertion.
+- **Narrow layout.** Screenshots showed the rail widened by a long subject id,
+  wrapped signal tabs, wrapped metric types and the Calculation control
+  overflowing 390px. Cause: missing `min-width: 0`/`nowrap`/wrap rules. Fixed in
+  the owning layouts; every mobile capture is exactly 390px wide.
+
+### Material stop condition: exemplar integer precision
+
+`exemplars` is `List<Struct<time_unix_nano, int_value Int64, double_value,
+filtered_attributes Variant, trace_id, span_id>>`. Through existing SQL:
+
+- `exemplars` as-is: `filtered_attributes` reads correctly; `int_value` crosses
+  as a JSON number and loses values above 2^53.
+- `CAST(exemplars AS VARCHAR)` / `arrow_cast` to `int_value Utf8`: `int_value`
+  exact, but `filtered_attributes` becomes raw Variant `metadata`/`value` binary.
+- `arrow_cast` with `filtered_attributes Utf8`: refused (Variant to Utf8 is not
+  castable).
+- `unnest` + per-field cast: exact, but loses the per-point list structure the
+  task requires to stay intact.
+
+No existing SQL capability returns exact exemplar `int_value` with readable
+attributes and the structure kept. Per F4 the projection stays unchanged (shape
+and attributes visible, exemplar integers above 2^53 not exact) and this is
+reported, not hidden. Closing it needs a server-side Variant-to-JSON or exact
+nested int64 projection, which is outside this remediation.
+
+### Visual evidence
+
+Candidate captures are in `candidate/` beside this file:
+`{Main,Spans,TraceDrawer,TimePicker,Logs,Metrics,State-empty,State-error}-{desktop,mobile}-{dark,light}.png`
+(desktop 1440×1000 viewport, mobile 390 full page), against
+`references/canvas/png/{Main,Spans,TraceDrawer,Logs,Metrics}.png`. They come from
+`dev:full` with a 40-request batch. Denied, partial, keyboard/focus and long-content
+states are proven by the journeys, not captured.
+
+Recorded differences from the reference:
+
+- Columns/CSV/Wrap sit in the RecordTable header (the existing component), not the
+  listbar row.
+- Metric legend captions show the recorded identity cells verbatim (JSON
+  attributes); long identities truncate.
+- The metric rail lists one row per name + type + unit.
+- On mobile the trace Drawer is viewport-fixed; full-page captures show it partway
+  down the page.
+- p50/p90/p99 calculations are visible but disabled (no fabricated percentiles).
+
+| Board | Component proof | Human acceptance |
+|---|---|---|
+| Shell / rail | journeys (destinations, identity menu) | pending |
+| Main (Traces) | traces journey | pending |
+| Spans | traces journey | pending |
+| TraceDrawer | traces journey (exact URL, SSR) | pending |
+| TimePicker | unit + three journeys | pending |
+| Logs | logs journey | pending |
+| Metrics | metrics journey + library test | pending |
+| States | malformed range, empty range, denied viewer journeys | pending |

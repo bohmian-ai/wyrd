@@ -316,7 +316,7 @@ index 0000000..1c71416
 +def main() -> None:
 +    parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
 +    parser.add_argument("--base-url", default="http://127.0.0.1:8000")
-+    parser.add_argument("--requests", type=int, default=3000)
++    parser.add_argument("--requests", type=int, default=500)
 +    parser.add_argument("--concurrency", type=int, default=8)
 +    parser.add_argument("--timeout", type=float, default=300, help="seconds per wait phase")
 +    args = parser.parse_args()
@@ -517,11 +517,11 @@ index 0000000..af0c455
 +
 +
 +def test_plan_keeps_the_proportions_and_the_total() -> None:
-+    assert {case: plan(3000).count(case) for case in set(plan(3000))} == {
-+        "shipping": 2400,
-+        "refund": 300,
-+        "openapi": 150,
-+        "unknown": 150,
++    assert {case: plan(500).count(case) for case in set(plan(500))} == {
++        "shipping": 400,
++        "refund": 50,
++        "openapi": 25,
++        "unknown": 25,
 +    }
 +    small = plan(20)
 +    assert len(small) == 20

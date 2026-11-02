@@ -207,7 +207,7 @@ those two tasks; older task-specific selectors are historical guidance only.
 Normal dev uses the production SDK and Rust server plus an optional local
 MockServer through existing endpoint configuration. Queued judges use that
 same endpoint; no paid model credentials, runtime scope, snapshot or queue
-propagation. Default batch: 3,000 real app HTTP requests at concurrency 8,
+propagation. Default batch: 500 real app HTTP requests at concurrency 8,
 public terminal verification waits and actual spans/logs/metrics readback.
 Image/fixture/source/wheel identities and expected/actual counts are evidence.
 Do not equate a response count with completed observations. Real-browser

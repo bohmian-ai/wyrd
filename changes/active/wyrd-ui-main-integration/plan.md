@@ -23,7 +23,7 @@ that gate and retain their own visual checkpoints.
 | [TASK-003](tasks/TASK-003-shared-ui-foundation.md) | Reusable UI foundation across the four hosts — **complete** | TASK-002 | None |
 | [TASK-004](tasks/TASK-004-observe-components.md) | Observe implementation retained; **incomplete until replacement live workflow and individual acceptance close** | TASK-003 implementation; closure by TASK-004-REV-01/02 | No historical PASS substitutes for real data/browser/visual proof. |
 | [TASK-004-REV-01](tasks/TASK-004-revision/TASK-01-mockserver.md) | Optional local MockServer via existing OpenAI endpoint configuration; proposed | None | Container runtime; official pinned amd64/arm64 image; real gateway fixture proof. |
-| [TASK-004-REV-02](tasks/TASK-004-revision/TASK-02-live-observe-workflow.md) | Canonical 3,000-request dev:full batch and real shell/Traces/Spans/Logs/Metrics; proposed | TASK-003, TASK-027, TASK-004-REV-01; retain existing Observe code | Current production SDK/source patch, independent review and individual human live/component inspection. |
+| [TASK-004-REV-02](tasks/TASK-004-revision/TASK-02-live-observe-workflow.md) | Canonical 500-request dev:full batch and real shell/Traces/Spans/Logs/Metrics; proposed | TASK-003, TASK-027, TASK-004-REV-01; retain existing Observe code | Current production SDK/source patch, independent review and individual human live/component inspection. |
 | [TASK-005](tasks/TASK-005-card-components.md) | Card browsing and definition component family | TASK-003 | Only if required ArtifactTable actions lack a current SDK/MCP projection: obtain approved platform action contract before calling that action complete. |
 | [TASK-006](tasks/TASK-006-query-components.md) | Query component family | TASK-003, TASK-004 | Query History source/lifetime unresolved; independent work may proceed. |
 | [TASK-007](tasks/TASK-007-verify-components.md) | Generic verification component family | TASK-003, TASK-004, TASK-005 | Separately specified non-sensitive requirement-outcome read contract; REQ-029 for AttentionList CR rows. Current sensitive outcome is not reclassified here. |
@@ -60,7 +60,7 @@ Execute [Task 01](tasks/TASK-004-revision/TASK-01-mockserver.md), then
 [Task 02](tasks/TASK-004-revision/TASK-02-live-observe-workflow.md).
 Task 01 adds local development fixtures, not a Wyrd provider feature. Task 02
 is the complete user-visible outcome: `mise run dev:full`, canonical current-SDK
-application, bounded 3,000-request workload, actual retained signals and usable
+application, bounded 500-request workload, actual retained signals and usable
 authenticated shell/Traces/Spans/Logs/Metrics. It carries all outstanding R1
 component obligations and absorbs TASK-012/020/021/022 completely. These old
 page tasks are superseded, not completed proof. TASK-019 retains full Query

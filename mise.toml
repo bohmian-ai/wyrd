@@ -1280,7 +1280,7 @@ printf "\nMockServer ready on http://127.0.0.1:1080 with %s OpenAI expectations\
 [tasks."dev:full"]
 description = "Boot MockServer, wyrd-server, the UI on :3000 and the canonical wyrd-example-py app on :8000, then send one workload batch"
 usage = """
-flag "--requests <n>" default="3000" help="Workload requests in the startup batch"
+flag "--requests <n>" default="500" help="Workload requests in the startup batch"
 flag "--concurrency <n>" default="8" help="Requests in flight at once"
 """
 shell = "bash -c"
@@ -1349,7 +1349,7 @@ wait -n "${pids[@]}" ${app:+"$app"}
 [tasks."dev:batch"]
 description = "Send one more workload batch to the running dev:full canonical app"
 usage = """
-flag "--requests <n>" default="3000" help="Workload requests in the batch"
+flag "--requests <n>" default="500" help="Workload requests in the batch"
 flag "--concurrency <n>" default="8" help="Requests in flight at once"
 """
 run = 'scripts/dev/example-app.sh batch --requests "$usage_requests" --concurrency "$usage_concurrency"'

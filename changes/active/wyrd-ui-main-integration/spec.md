@@ -31,8 +31,8 @@ independent task review and individual human acceptance are complete. The
 [retired revisions](references/retired-task-004/) preserve old evidence only.
 Preserve the caller's cleanup deletions and unrelated component/UI work.
 
-The development batch defaults to 3,000 requests at concurrency 8. Its model
-responses are scripted; its HTTP requests, tools, Runs, verification execution
+The development batch defaults to 500 requests at concurrency 8 (caller
+amendment, 2026-11-02). Its model responses are scripted; its HTTP requests, tools, Runs, verification execution
 and retained telemetry use the real application and server. MockServer adds
 one local container dependency and no paid inference requirement. The existing
 ephemeral environment retains evidence during a running session, not across
@@ -1213,7 +1213,7 @@ not protocol authority.
 - **REQ-038 — Canonical development workload.** `mise run dev:full` starts the
   existing real server/database/UI lifecycle, Task 01's fixture service and
   canonical `bohmian-ai/wyrd-example-py`, provisions normal tenant/Cards/provider
-  configuration, and runs 3,000 application HTTP requests at concurrency 8 by
+  configuration, and runs 500 application HTTP requests at concurrency 8 by
   default. Allow smaller bounded runs and `dev:batch` against the same running
   environment. No paid model key, synthetic server, fabricated evidence rows,
   benchmark framework or direct writes to protected Bifrost tables are required.
@@ -1226,8 +1226,8 @@ not protocol authority.
   Build/import this checkout's host-compatible production SDK wheel through
   the canonical vendor source and prove artifact origin/digest, not just version.
 
-  The default workload is 2,400 shipping asks, 300 refund asks, 150 model-free
-  GET /openapi.json requests and 150 unknown-order asks returning HTTP 404.
+  The default workload is 400 shipping asks, 50 refund asks, 25 model-free
+  GET /openapi.json requests and 25 unknown-order asks returning HTTP 404.
   Actual application tools run; direct refund checks fail as expected and still
   submit queued checks. The local judge returns a valid scripted passed verdict
   with a reachable order /price citation, not a claim of evaluation quality.
@@ -1430,7 +1430,7 @@ not protocol authority.
 | AC-018 | Observe preserves signal-specific types, event/admission time, integer precision, missing values and returned exception semantics after schema adoption | REQ-022/028/030; recorded typed signal fixtures and live reads covering distinct timestamp units, integer/double points, histogram/summary/exemplar data, nullable promotions and exception-versus-error cases |
 | AC-019 | Verification renders waiting separately from recorded outcomes, keeps selected results and workload-scoped membership exact, opens authorized cross-workload/untagged trace citations beyond originating list filters, and preserves completed judgments after late spans arrive | REQ-018/026/027; real queued-arrival, direct-absence and late-arrival consumer journeys plus focused citation/read-denial and pinned-membership checks; no client-owned retry or presumed trace snapshot |
 | AC-020 | Initialized local MockServer serves ordinary gateway app/tool/judge calls concurrently with explicit unmatched/setup failures, existing provider/accounting behavior and no external inference | REQ-037; real gateway fixture journeys, startup/readiness/cleanup and static unchanged-contract proof |
-| AC-021 | Normal dev:full runs the pinned canonical example with this checkout's production SDK, dispatches 3,000 requests and confirms actual retained spans, logs, metrics and terminal checks while UI remains usable | REQ-038; source/wheel identity, exact case accounting, public waits/readback and lifecycle/failure proof |
+| AC-021 | Normal dev:full runs the pinned canonical example with this checkout's production SDK, dispatches 500 requests and confirms actual retained spans, logs, metrics and terminal checks while UI remains usable | REQ-038; source/wheel identity, exact case accounting, public waits/readback and lifecycle/failure proof |
 | AC-022 | A signed-in user investigates the batch through the real shell and Traces/Spans, Logs and Metrics, including range/SQL/facets, live holds, exact details/links and truthful metric semantics | REQ-039; production-BFF/server real-browser journeys, all transferred page/component scope and individual desktop/mobile light/dark acceptance |
 | AC-023 | The same valid SQL predicate governs signal charts/facets/lists in Node and MCP without losing counts/navigation; malformed, injected, unauthorized or out-of-schema input fails before dependent reads | REQ-040; pure parser and portable-loader regressions plus real first-class validation/read journeys and adversarial browser cases |
 

@@ -16,7 +16,7 @@ remediates: []
 
 `mise run dev:full` starts Wyrd, its real authenticated UI, the canonical
 `bohmian-ai/wyrd-example-py` application and Task 01's local fixture service.
-It runs a bounded 3,000-request batch, then leaves everything available for
+It runs a bounded 500-request batch, then leaves everything available for
 investigation. A developer signs in and sees actual retained traces, spans,
 logs and metrics, opens their details, and observes new data without a reset.
 
@@ -34,7 +34,7 @@ scope/evidence references, not parallel execution assignments.
   Start the real production Rust server, local Postgres, Task 01 MockServer,
   ordinary SvelteKit development UI, and canonical app. Build/run dependencies
   in readiness order; keep Vite reload independent from backend/batch startup.
-- Default batch size is 3,000 and concurrency is 8. Support the same workflow
+- Default batch size is 500 and concurrency is 8. Support the same workflow
   with a smaller bounded workload via `mise run dev:full -- --requests 20
   --concurrency 2`. Add `mise run dev:batch -- --requests 20 --concurrency 2`
   to append another batch to the running environment without restarting it.
@@ -96,10 +96,10 @@ separately and never counted as workload. Use the existing three order IDs.
 
 | Default case | Count | Expected observation |
 |---|---:|---|
-| Shipping `POST /ask` | 2,400 | HTTP 200, real tool exchange, immediate verdict passed, queued execution returned. |
-| Refund `POST /ask` | 300 | HTTP 200, real tool exchange, immediate verdict failed, queued execution still returned. |
-| HTTP-only `GET /openapi.json` | 150 | HTTP 200 and actual HTTP telemetry without a model call or Run. |
-| Unknown-order `POST /ask` with `Z-9` | 150 | HTTP 404 before Desk/Run/model execution, retained HTTP error evidence. |
+| Shipping `POST /ask` | 400 | HTTP 200, real tool exchange, immediate verdict passed, queued execution returned. |
+| Refund `POST /ask` | 50 | HTTP 200, real tool exchange, immediate verdict failed, queued execution still returned. |
+| HTTP-only `GET /openapi.json` | 25 | HTTP 200 and actual HTTP telemetry without a model call or Run. |
+| Unknown-order `POST /ask` with `Z-9` | 25 | HTTP 404 before Desk/Run/model execution, retained HTTP error evidence. |
 
 For smaller counts, allocate cases deterministically in those proportions,
 rounding remaining slots into shipping; the dispatched total must equal the
@@ -109,8 +109,8 @@ verdict, and `submit.execution_id` where present. Do not create grouping metadat
 
 Wait through the public queued-execution API with bounded deadlines and check
 retained observations through public Bifrost reads after normal export. The
-full default flow expects 2,700 Runs, 2,700 immediate evaluations, 2,700 queued
-executions, 5,400 app model exchanges and 2,700 judge exchanges in the no-retry
+full default flow expects 450 Runs, 450 immediate evaluations, 450 queued
+executions, 900 app model exchanges and 450 judge exchanges in the no-retry
 case. Compare logical flow counts with actual captured attempts and disclose
 any retries rather than conflating them. Task 01's uniform queued verdict is
 `passed` with valid `/price` evidence; that is scripted fixture behavior, not a
@@ -431,7 +431,7 @@ mise exec -- scripts/postgres/with-test-postgres.sh -- bash -lc 'mise run db:mig
 mise run dev:full
 ```
 
-Use the default 3,000-request run on final source, followed by an appended batch
+Use the default 500-request run on final source, followed by an appended batch
 through `dev:batch` while investigating live. Record source/patch/image/wheel
 identity, URLs, actual counts/terminal outcomes, public retained readback and
 browser screenshots/interactions for Traces, Spans, Logs and Metrics. No special

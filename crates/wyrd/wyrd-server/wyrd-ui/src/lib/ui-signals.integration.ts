@@ -7,7 +7,7 @@
 /** An OTLP/HTTP JSON attribute list. */
 const attrs = (values: Record<string, string>) => Object.entries(values).map(([key, value]) => ({ key, value: { stringValue: value } }));
 /** Nanoseconds since the epoch of an instant, as OTLP JSON spells them. */
-const nanos = (iso: string, extra = 0n) => String(BigInt(Date.parse(iso)) * 1_000_000n + extra);
+export const nanos = (iso: string, extra = 0n) => String(BigInt(Date.parse(iso)) * 1_000_000n + extra);
 
 /**
  * Export one trace (a root, a child, an erroring grandchild), one log record
@@ -86,13 +86,16 @@ export async function seedSignals(server: { baseUrl: string; flushBifrost(): voi
       ]
     }
   };
-  for (const [path, body] of Object.entries(exports)) {
-    const response = await fetch(new URL(path, server.baseUrl), {
-      method: 'POST',
-      headers: { 'content-type': 'application/json', 'x-wyrd-api-key': apiKey },
-      body: JSON.stringify(body)
-    });
-    if (response.status !== 200) throw new Error(`${path} answered ${response.status}: ${await response.text()}`);
-  }
+  for (const [path, body] of Object.entries(exports)) await exportOtlp(server, apiKey, path, body);
   server.flushBifrost();
+}
+
+/** POST one OTLP/HTTP JSON export as `apiKey`; anything but 200 throws with the server's answer. */
+export async function exportOtlp(server: { baseUrl: string }, apiKey: string, path: string, body: unknown) {
+  const response = await fetch(new URL(path, server.baseUrl), {
+    method: 'POST',
+    headers: { 'content-type': 'application/json', 'x-wyrd-api-key': apiKey },
+    body: JSON.stringify(body)
+  });
+  if (response.status !== 200) throw new Error(`${path} answered ${response.status}: ${await response.text()}`);
 }

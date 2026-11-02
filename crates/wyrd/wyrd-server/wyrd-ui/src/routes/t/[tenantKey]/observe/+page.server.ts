@@ -3,7 +3,22 @@ import { SIGNALS } from 'wyrd-ai-ui/loaders';
 import { nodeExecutor } from 'wyrd-ai-ui/node';
 import { reject } from '$lib/server/auth/session';
 import { closed, listSignal, readState, writeState } from '$lib/observe-host';
-import type { Actions } from './$types';
+import type { Actions, PageServerLoad } from './$types';
+
+/**
+ * A selected metric's chart and summary embed the applied predicate, so the
+ * server normalizes it as this session first; `null` marks it refused, and
+ * the shared panels then report that refusal themselves.
+ */
+export const load: PageServerLoad = async ({ locals, url, request }) => {
+  const state = readState(url.searchParams);
+  if (state.signal !== 'metrics' || !state.where_sql.trim() || !locals.browserSession) return { predicate: undefined };
+  const [result] = await nodeExecutor(locals.browserSession.client()).run(
+    [{ op: 'bifrost.validate_predicate', namespace: 'bifrost.metrics', name: 'points', expression: state.where_sql }],
+    request.signal
+  );
+  return { predicate: result.ok ? result.value.expression : null };
+};
 
 export const actions: Actions = {
   /**

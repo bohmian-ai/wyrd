@@ -1,7 +1,8 @@
 /**
  * Observe loaders: built-in reads of the canonical signal tables. Every SQL
  * text is assembled only from the fixed tables and column allowlists in
- * `SIGNALS`; every value, range bound and identity is a typed `$n` bind.
+ * `SIGNALS`; every value, range bound and identity is a typed `$n` bind,
+ * except in `metricPanels`, whose Chart and authored-SQL reads bind only the range.
  */
 import { failed, wyrdProblem, type Loaded, type Problem, type QueryParam, type QueryResult, type WireRequest } from './contract.js';
 import { fmtDuration } from './format.js';
@@ -11,6 +12,7 @@ import {
   SIGNALS,
   logStats,
   type AbsoluteRange,
+  type ChartInput,
   type FacetRailInput,
   type Filter,
   type Range,
@@ -286,9 +288,76 @@ export function listQuery(input: Extract<RecordTableInput, { signal: Signal }>, 
   binds.where(input.where).predicate(predicate);
   if (input.signal === 'traces') binds.roots(signal.table);
   const keys = KEY_COLUMNS[input.signal].map((key) => (key.endsWith('_id') && key !== 'wyrd_request_id' ? `encode(${key}, 'hex') AS ${key}` : key));
+  const shown = shownColumns(input).map((column) => (input.signal === 'metrics' && EXACT.includes(column) ? `CAST(${column} AS VARCHAR) AS ${column}` : column));
   return {
-    sql: `SELECT ${[...shownColumns(input), ...keys].join(', ')} FROM ${signal.table} WHERE ${binds.sql} ORDER BY ${signal.time} DESC LIMIT ${input.limit ?? LIST_LIMIT}`,
+    sql: `SELECT ${[...shown, ...keys].join(', ')} FROM ${signal.table} WHERE ${binds.sql} ORDER BY ${signal.time} DESC LIMIT ${input.limit ?? LIST_LIMIT}`,
     params: binds.params
+  };
+}
+
+/**
+ * Metric integer columns a list reads as exact decimal text: JSON numbers
+ * cannot carry every int64 or uint64, so the server spells them.
+ */
+const EXACT: readonly string[] = ['int_value', 'histogram_count', 'summary_count', 'exponential_zero_count'];
+
+/** Metric types a series chart plots; histogram and summary points are listed, never plotted. */
+const PLOTTED = "metric_type IN ('gauge', 'sum')";
+
+/**
+ * One series per recorded meaning: the grouping value, then the type, unit,
+ * temporality and monotonicity, so incompatible points never share a line.
+ */
+function seriesLabel(groupBy?: string): string {
+  const temporality = "CASE aggregation_temporality WHEN 1 THEN 'delta' WHEN 2 THEN 'cumulative' ELSE NULL END";
+  const monotonic = "CASE WHEN is_monotonic THEN 'monotonic' ELSE NULL END";
+  const group = groupBy ? `COALESCE(CAST(${groupBy} AS VARCHAR), 'not set'), ` : '';
+  return `concat_ws(' · ', ${group}metric_type, unit, ${temporality}, ${monotonic})`;
+}
+
+/** A SQL literal of one filter value; strings double their quotes. */
+function literal(value: QueryParam): string {
+  if (typeof value === 'string') return `'${value.replaceAll("'", "''")}'`;
+  if (typeof value === 'number' && Number.isFinite(value)) return String(value);
+  if (typeof value === 'boolean') return String(value);
+  throw new Error(`a metric filter value must be a string, finite number or boolean, not ${String(value)}`);
+}
+
+/**
+ * The selected metric's series chart and exact series summary. Chart and
+ * authored-SQL lists bind only the range, so the metric name and WHERE values
+ * enter as escaped literals over allowlisted columns, and `predicate` must
+ * already be server-normalized. The chart plots doubles and says so; the
+ * summary's Latest, Max and Mean are the server's exact decimal text.
+ */
+export function metricPanels(metric: string, where: readonly Filter[], groupBy?: string, predicate?: string): { chart: ChartInput; summary: string } {
+  const clauses = [`${SIGNALS.metrics.time} >= $1::timestamptz AND ${SIGNALS.metrics.time} < $2::timestamptz`, `metric_name = ${literal(metric)}`, PLOTTED];
+  for (const { column, value, not } of where) {
+    if (!(SIGNALS.metrics.filters as readonly string[]).includes(column)) throw new Error(`${column} is not a metrics column`);
+    if (column === 'metric_name' && !not) continue;
+    clauses.push(value === null ? `${column} IS ${not ? 'NOT ' : ''}NULL` : `${column} ${not ? 'IS DISTINCT FROM' : '='} ${literal(value)}`);
+  }
+  if (predicate) clauses.push(`(${predicate})`);
+  const from = `FROM ${SIGNALS.metrics.table} WHERE ${clauses.join(' AND ')}`;
+  if (groupBy !== undefined && !(SIGNALS.metrics.filters as readonly string[]).includes(groupBy)) throw new Error(`${groupBy} is not a metrics column`);
+  const label = seriesLabel(groupBy);
+  const value = 'CASE WHEN int_value IS NOT NULL THEN CAST(int_value AS DOUBLE) ELSE double_value END';
+  const text = 'COALESCE(CAST(int_value AS VARCHAR), CAST(double_value AS VARCHAR))';
+  return {
+    chart: {
+      type: 'timeseries',
+      title: `${metric} · gauge and sum points only, plotted as double precision; exact values in the summary`,
+      sql: `SELECT ${SIGNALS.metrics.time} AS at, ${label} AS series, ${value} AS value ${from} ORDER BY at, series`,
+      x: 'at',
+      y: ['value'],
+      series: 'series'
+    },
+    summary:
+      `SELECT ${label} AS series, count(*) AS points, ` +
+      `last_value(${text} ORDER BY ${SIGNALS.metrics.time}) AS latest, ` +
+      `COALESCE(CAST(max(int_value) AS VARCHAR), CAST(max(double_value) AS VARCHAR)) AS max, ` +
+      `COALESCE(CAST(avg(CAST(int_value AS DECIMAL(38, 0))) AS VARCHAR), CAST(avg(double_value) AS VARCHAR)) AS mean ` +
+      `${from} GROUP BY ${label} ORDER BY series`
   };
 }
 

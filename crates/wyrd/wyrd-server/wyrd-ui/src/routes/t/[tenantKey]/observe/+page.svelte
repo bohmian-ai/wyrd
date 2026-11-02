@@ -5,8 +5,7 @@
   import { Drawer } from 'wyrd-ai-ui';
   import { WyrdView, remoteLoader } from 'wyrd-ai-ui/view';
   import type { ActionIntent } from 'wyrd-ai-ui';
-  import { signalColumns } from 'wyrd-ai-ui/loaders';
-  import { OBSERVE_SIGNALS, PRESETS, closed, detailView, listSignal, observeView, readState, step, writeState, type ObserveState } from '$lib/observe-host';
+    import { OBSERVE_SIGNALS, PRESETS, closed, detailView, groupColumns, observeView, readState, step, writeState, type ObserveState } from '$lib/observe-host';
   import type { PageProps } from './$types';
 
   let { data, form }: PageProps = $props();
@@ -14,7 +13,7 @@
   const load = $derived(remoteLoader(`${base}/ui/load`));
   const state = $derived(readState(page.url.searchParams));
   // The list's view never names the open record, so opening one never reloads the list.
-  const view = $derived(observeView(closed(state)));
+  const view = $derived(observeView(closed(state), data.predicate));
   const detail = $derived(detailView(state));
   const LABELS = { traces: 'Traces', logs: 'Logs', metrics: 'Metrics' } as const;
 
@@ -80,7 +79,7 @@
     Group
     <select aria-label="Group by" value={state.group ?? ''} onchange={(event) => go({ ...closed(state), group: event.currentTarget.value || undefined })}>
       <option value="">None</option>
-      {#each signalColumns(listSignal(state)).slice(0, 16) as column (column)}<option value={column}>{column}</option>{/each}
+      {#each groupColumns(state) as column (column)}<option value={column}>{column}</option>{/each}
     </select>
   </label>
   <label class="live"><input type="checkbox" checked={state.live} onchange={(event) => go({ ...state, live: event.currentTarget.checked })} /> Live</label>

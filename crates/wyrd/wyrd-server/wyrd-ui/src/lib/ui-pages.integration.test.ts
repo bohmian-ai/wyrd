@@ -9,7 +9,7 @@ import { createServer } from 'node:net';
 import { chromium, type Browser, type Page } from 'playwright';
 import { expect, vi } from 'vitest';
 import { serverTest } from '../../../../../../sdks/wyrd-sdk-ts/wyrd/tests/support/server';
-import { seedSignals } from '$lib/ui-signals.integration';
+import { exportOtlp, nanos, seedSignals } from '$lib/ui-signals.integration';
 
 vi.setConfig({ testTimeout: 300_000 });
 
@@ -55,7 +55,7 @@ async function signIn(browser: Browser, base: string, tenant: string, apiKey: st
 }
 
 /** The built BFF, a browser, and a tenant holding one trace; the default tenant holds another. */
-const test = serverTest().extend<{ ui: { base: string; browser: Browser; adminKey: string; readerKey: string } }>({
+const test = serverTest().extend<{ ui: { base: string; browser: Browser; adminKey: string; readerKey: string; serverUrl: string } }>({
   ui: [
     async ({ server }, use) => {
       execFileSync('pnpm', ['exec', 'vite', 'build'], { stdio: 'inherit', env: { ...process.env, VITEST: '' } });
@@ -67,7 +67,7 @@ const test = serverTest().extend<{ ui: { base: string; browser: Browser; adminKe
       const bff = await startBff(server.baseUrl);
       const browser = await chromium.launch();
       try {
-        await use({ base: bff.url, browser, adminKey, readerKey });
+        await use({ base: bff.url, browser, adminKey, readerKey, serverUrl: server.baseUrl });
       } finally {
         await browser.close();
         bff.stop();
@@ -209,4 +209,85 @@ test('authenticated logs investigation', async ({ ui }) => {
   const viewer = await signIn(ui.browser, ui.base, TENANT, ui.readerKey);
   await viewer.goto(logs);
   await expect.poll(() => viewer.locator('[data-panel="overview"]').textContent()).toContain('WYRD_PERMISSION_403_DENIED_RBAC');
+});
+
+/** Integers past 2^53, which a JSON number cannot carry exactly. */
+const UNSAFE = ['9007199254740993', '9007199254740995'] as const;
+
+test('authenticated metrics investigation', async ({ server, ui }) => {
+  // One metric name recorded with two meanings, unsafe integers, and a histogram.
+  const point = (at: string, value: Record<string, unknown>) => ({ timeUnixNano: nanos(at), ...value });
+  const scope = { name: 'wyrd-ui-metrics' };
+  const resource = (service: string) => ({ attributes: [{ key: 'service.name', value: { stringValue: service } }] });
+  await exportOtlp(server, ui.adminKey, '/v1/metrics', {
+    resourceMetrics: [
+      {
+        resource: resource('ui-agent'),
+        scopeMetrics: [
+          {
+            scope,
+            metrics: [
+              {
+                name: 'ui.queue',
+                unit: '1',
+                sum: {
+                  aggregationTemporality: 2,
+                  isMonotonic: true,
+                  dataPoints: [point('2026-10-19T04:00:00Z', { asInt: UNSAFE[0] }), point('2026-10-19T04:01:00Z', { asInt: UNSAFE[1] })]
+                }
+              },
+              {
+                name: 'ui.latency',
+                unit: 's',
+                histogram: {
+                  aggregationTemporality: 1,
+                  dataPoints: [point('2026-10-19T04:00:00Z', { count: '3', sum: 1.5, bucketCounts: ['1', '2'], explicitBounds: [1] })]
+                }
+              }
+            ]
+          }
+        ]
+      },
+      { resource: resource('ui-worker'), scopeMetrics: [{ scope, metrics: [{ name: 'ui.queue', unit: 'By', gauge: { dataPoints: [point('2026-10-19T04:00:00Z', { asDouble: 2.5 })] } }] }] }
+    ]
+  });
+  server.flushBifrost();
+
+  const page = await signIn(ui.browser, ui.base, TENANT, ui.adminKey);
+  await page.goto(`${ui.base}/t/${TENANT}/observe?signal=metrics&from=${RANGE.from}&to=${RANGE.to}`);
+  const list = page.locator('[data-panel="list"]');
+
+  // Points list exact integers and recorded structures; no chart until a metric is selected.
+  await expect.poll(() => list.textContent(), { timeout: 30_000 }).toContain(UNSAFE[1]);
+  expect(await list.textContent()).toContain(UNSAFE[0]);
+  expect(await list.textContent()).toContain('histogram');
+  expect(await page.locator('[data-panel="series"]').count()).toBe(0);
+
+  // Selecting the metric charts one line per recorded meaning and summarizes each exactly.
+  await page.locator('[data-panel="facets"]').getByRole('button', { name: /ui\.queue/ }).click();
+  const chart = page.locator('[data-panel="series"]');
+  await expect.poll(() => chart.locator('table.legend tbody tr').count(), { timeout: 30_000 }).toBe(2);
+  expect(await chart.textContent()).toContain('plotted as double precision');
+  const summary = page.locator('[data-panel="summary"]');
+  await expect.poll(() => summary.locator('tbody tr').count()).toBe(2);
+  const rows = await summary.locator('tbody tr').allTextContents();
+  const sum = rows.find((row) => row.includes('sum'));
+  expect(sum).toContain('cumulative');
+  expect(sum).toContain('monotonic');
+  expect(sum).toContain(UNSAFE[1]);
+  expect(sum).toContain('9007199254740994');
+  expect(rows.find((row) => row.includes('gauge'))).toContain('2.5');
+
+  // Unticking a series hides its line, and grouping by a recorded dimension keeps the meanings apart.
+  await chart.getByRole('checkbox').first().uncheck();
+  await expect.poll(() => chart.textContent()).toContain('1 shown');
+  await page.getByLabel('Group by').selectOption('service_name');
+  await expect.poll(() => summary.textContent()).toContain('ui-worker');
+  expect(new URL(page.url()).searchParams.get('group')).toBe('service_name');
+
+  // A histogram is listed with its recorded structure and explicitly not plotted.
+  await page.getByRole('link', { name: 'Remove metric_name' }).click();
+  await page.locator('[data-panel="facets"]').getByRole('button', { name: /ui\.latency/ }).click();
+  await expect.poll(() => page.locator('[data-panel="series"]').textContent(), { timeout: 30_000 }).toContain('gauge and sum points only');
+  await expect.poll(() => list.textContent()).toContain('[1,2]');
 });

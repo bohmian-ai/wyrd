@@ -3,6 +3,8 @@ import {
   loadFacetRail,
   loadRecordTable,
   loadStatStrip,
+  listQuery,
+  metricPanels,
   validatePanel,
   wyrdProblem,
   type Executor,
@@ -10,7 +12,7 @@ import {
   type WireResult
 } from 'wyrd-ai-ui/loaders';
 import { validateView } from 'wyrd-ai-ui/view';
-import { closed, detailView, observeView, readState, step, writeState } from './observe-host';
+import { closed, detailView, groupColumns, observeView, readState, selectedMetric, step, writeState } from './observe-host';
 
 const RANGE = { from: '2026-10-20T00:00:00Z', to: '2026-10-21T00:00:00Z' };
 const EMPTY = { columns: [], rows: [], terminal: { outcome: 'success', row_count: 0, warnings: [] } };
@@ -92,7 +94,7 @@ test('observe signal planning and interactions', async () => {
   const blank = recording(normalizing(''));
   const plain = await loadRecordTable({ signal: 'metrics', where_sql: '   ' }, { executor: blank.executor, range: RANGE });
   expect(blank.calls.map((call) => call.op)).toEqual(['bifrost.query']);
-  expect(plain.executed?.sql).not.toContain('(');
+  expect(plain.executed?.sql).not.toContain('AND (');
 
   // The panel schemas bound the predicate and keep it off gateway stats.
   expect(validatePanel('RecordTable', { signal: 'logs', where_sql: 'x'.repeat(8193) })).toMatchObject({ code: 'WYRD_SPEC_400_VALIDATION' });
@@ -154,4 +156,28 @@ test('observe signal planning and interactions', async () => {
   const inspect = step(traces, { name: 'record.open_in_query', input: { sql: 'SELECT $1', params: ['x'] } }, '/t/acme/observe?live=1');
   expect('query' in inspect && Object.fromEntries(inspect.query)).toEqual({ sql: 'SELECT $1', params: '["x"]', back: '/t/acme/observe?live=1' });
   expect(step(traces, { name: 'record.logs', input: {} }, '/')).toHaveProperty('unavailable');
+
+  // Metric points list integers as exact decimal text; doubles and structures keep their recorded columns.
+  expect(listQuery({ signal: 'metrics', columns: ['metric_name', 'int_value', 'double_value', 'histogram_count', 'bucket_counts'] }, RANGE).sql).toMatch(
+    /^SELECT metric_name, CAST\(int_value AS VARCHAR\) AS int_value, double_value, CAST\(histogram_count AS VARCHAR\) AS histogram_count, bucket_counts FROM/
+  );
+  // A selected metric charts one line per recorded meaning and summarizes it exactly; values are escaped literals.
+  const { chart, summary } = metricPanels("o'clock", [{ column: 'metric_name', value: "o'clock" }, { column: 'unit', value: 'ms', not: true }], 'service_name', 'service_name IS NOT NULL');
+  expect(chart.sql).toContain("metric_name = 'o''clock' AND metric_type IN ('gauge', 'sum') AND unit IS DISTINCT FROM 'ms' AND (service_name IS NOT NULL)");
+  expect(chart.sql).toContain("concat_ws(' · ', COALESCE(CAST(service_name AS VARCHAR), 'not set'), metric_type, unit, CASE aggregation_temporality");
+  expect(chart.title).toContain('plotted as double precision');
+  expect(summary).toMatch(/last_value\(COALESCE\(CAST\(int_value AS VARCHAR\), CAST\(double_value AS VARCHAR\)\) ORDER BY time_unix_nano\) AS latest/);
+  expect(summary).toContain('CAST(avg(CAST(int_value AS DECIMAL(38, 0))) AS VARCHAR)');
+  expect(() => metricPanels('m', [{ column: 'body_text', value: 'x' }])).toThrow('body_text is not a metrics column');
+  expect(() => metricPanels('m', [], 'nope')).toThrow('nope is not a metrics column');
+  // The host plans them only for one selected metric, and leaves them out when the predicate was refused.
+  const metrics = readState(new URLSearchParams({ signal: 'metrics', where: JSON.stringify([{ column: 'metric_name', value: 'ui.requests' }]), group: 'service_name' }));
+  expect(selectedMetric(metrics)).toBe('ui.requests');
+  expect(groupColumns(metrics)).toContain('service_name');
+  const charted = observeView(metrics);
+  expect(charted.panels.map((panel) => panel.id)).toEqual(['series', 'summary', 'facets', 'list']);
+  for (const panel of charted.panels) expect(validatePanel(panel.component, panel.input)).not.toHaveProperty('code');
+  expect(charted.panels[3].input).toMatchObject({ groupBy: 'service_name', columns: expect.arrayContaining(['service_name', 'int_value']) });
+  expect(observeView(metrics, null).panels.map((panel) => panel.id)).toEqual(['facets', 'list']);
+  expect(observeView({ ...metrics, where: [] }).panels.map((panel) => panel.id)).toEqual(['facets', 'list']);
 });

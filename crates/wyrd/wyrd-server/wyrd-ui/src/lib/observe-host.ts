@@ -5,6 +5,7 @@
  * loaders, and maps each component intent to the next URL.
  */
 import type { ActionIntent, QueryParam } from 'wyrd-ai-ui';
+import { SIGNALS, metricPanels } from 'wyrd-ai-ui/loaders';
 
 /** The Observe signals the host offers. */
 export const OBSERVE_SIGNALS = ['traces', 'logs', 'metrics'] as const;
@@ -45,6 +46,9 @@ export interface ObserveState {
 
 /** The view-document header every Observe view carries. */
 const VIEW = { version: 'wyrd.view/v1', catalogId: 'wyrd.ui/v1' } as const;
+
+/** Recorded histogram and summary columns a metrics list shows beside the scalar values. */
+const STRUCTURES = ['histogram_count', 'histogram_sum', 'bucket_counts', 'explicit_bounds', 'summary_count', 'quantile_values'] as const;
 
 /** Facets each signal's rail counts. */
 const FACETS = {
@@ -115,6 +119,18 @@ export function listSignal(state: ObserveState): 'traces' | 'spans' | 'logs' | '
   return state.signal === 'traces' ? state.mode : state.signal;
 }
 
+/** Columns a list of the state's signal may group by: its shown columns, then its scalar filters. */
+export function groupColumns(state: ObserveState): readonly string[] {
+  const signal = SIGNALS[listSignal(state)];
+  return [...new Set<string>([...signal.columns, ...signal.filters])];
+}
+
+/** The metric the WHERE selects: its one `metric_name =` clause. */
+export function selectedMetric(state: ObserveState): string | undefined {
+  const chosen = state.where.filter((each) => each.column === 'metric_name' && !each.not && typeof each.value === 'string');
+  return chosen.length === 1 ? String(chosen[0].value) : undefined;
+}
+
 /** The view range: the absolute bounds, or the relative preset. */
 function range(state: ObserveState) {
   return state.from !== undefined && state.to !== undefined ? { from: state.from, to: state.to } : { last: state.last ?? '1h' };
@@ -122,11 +138,17 @@ function range(state: ObserveState) {
 
 /**
  * The main view: overview, facets and the list, all under one range, one
- * WHERE and one predicate. A blank predicate is left out.
+ * WHERE and one predicate. A blank predicate is left out. A selected metric
+ * adds its series chart and exact summary, which embed `predicate`: the
+ * server-normalized `where_sql`, or `null` when it was refused, which leaves
+ * them out while the other panels report the refusal.
  */
-export function observeView(state: ObserveState) {
+export function observeView(state: ObserveState, predicate?: string | null) {
   const signal = listSignal(state);
   const filter = { where: state.where, ...(state.where_sql.trim() ? { where_sql: state.where_sql } : {}) };
+  const group = state.group && groupColumns(state).includes(state.group) ? state.group : undefined;
+  // Metric points also show their recorded histogram and summary structures, which no chart plots.
+  const columns: readonly string[] = signal === 'metrics' ? [...SIGNALS.metrics.columns, ...STRUCTURES] : SIGNALS[signal].columns;
   const panels: { id: string; component: string; input: unknown; layout?: unknown }[] = [];
   if (state.signal === 'traces')
     panels.push({ id: 'overview', component: 'StatStrip', input: { stats: ['traces', 'errors', 'duration_p95'], ...filter } });
@@ -136,10 +158,21 @@ export function observeView(state: ObserveState) {
     {
       id: 'list',
       component: 'RecordTable',
-      input: { signal, ...filter, ...(state.group ? { groupBy: state.group } : {}), ...(state.live ? { live: true } : {}) },
+      input: {
+        signal,
+        ...filter,
+        ...(group && !columns.includes(group) ? { columns: [...columns, group] } : signal === 'metrics' ? { columns } : {}),
+        ...(group ? { groupBy: group } : {}),
+        ...(state.live ? { live: true } : {})
+      },
       layout: { x: 3, y: 0, w: 9, h: 14 }
     }
   );
+  const metric = state.signal === 'metrics' ? selectedMetric(state) : undefined;
+  if (metric && predicate !== null) {
+    const { chart, summary } = metricPanels(metric, state.where, group, predicate);
+    panels.splice(0, 0, { id: 'series', component: 'Chart', input: chart }, { id: 'summary', component: 'RecordTable', input: { sql: summary } });
+  }
   return { ...VIEW, range: range(state), panels };
 }
 

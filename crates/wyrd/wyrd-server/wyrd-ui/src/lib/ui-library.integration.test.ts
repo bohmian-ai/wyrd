@@ -369,11 +369,11 @@ test('TASK-004: Authorized Observe across hosts', async ({ server, seeded }) => 
       expect(logs.result.state === 'populated' && logs.result.data.rows.rows[0].slice(1, 7)).toEqual(['ERROR', 'ui-agent', 'search timed out', null, TRACE, 'b9c7c989f97918e1']);
       const log = await loadRecordDetail({ log: { time_unix_nano: String(time), observed_time_unix_nano: String(observed), wyrd_request_id: String(request) } }, context);
       expect(log.result).toMatchObject({ state: 'populated', data: { rows: [expect.anything()] } });
-      // Metrics keep their recorded type: the sum is integer-valued, the gauge double-valued, neither zero-filled.
+      // Metrics keep their recorded type: the sum is integer-valued as exact decimal text, the gauge double-valued, neither zero-filled.
       const metrics = await loadRecordTable({ signal: 'metrics', columns: ['metric_name', 'metric_type', 'int_value', 'double_value', 'histogram_count'] }, context);
       expect(metrics.result.state === 'populated' && [...metrics.result.data.rows.rows].sort((a, b) => String(a[0]).localeCompare(String(b[0])))).toEqual([
         ['ui.load', 'gauge', null, 0.5, null],
-        ['ui.requests', 'sum', 7, null, null]
+        ['ui.requests', 'sum', '7', null, null]
       ]);
       // Facets and stats count this tenant's evidence only.
       expect((await loadFacetRail({ signal: 'spans', facets: ['service_name'] }, context)).result).toMatchObject({ state: 'populated', data: { facets: [{ values: { rows: [['ui-agent', 3]] } }] } });

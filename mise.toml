@@ -1289,9 +1289,18 @@ set -Eeuo pipefail
 cargo build -p wyrd-server
 scripts/dev/example-app.sh prepare
 # Each service runs in its own process group, so stopping one stops all of its children.
+# The app stops first so its telemetry drains into a still-running server.
 set -m
 pids=()
-trap 'for pid in "${pids[@]}"; do kill -TERM -- "-$pid" 2>/dev/null || true; done; wait' EXIT INT TERM
+app=
+stop() {
+  trap "" INT TERM
+  trap - EXIT
+  if [[ -n $app ]]; then kill -TERM -- "-$app" 2>/dev/null && wait "$app" || true; fi
+  for pid in "${pids[@]}"; do kill -TERM -- "-$pid" 2>/dev/null || true; done
+  wait
+}
+trap stop EXIT INT TERM
 mise run dev:mockserver &
 pids+=($!)
 credentials=${WYRD_CONFIG_HOME:-${XDG_CONFIG_HOME:-$HOME/.config}/wyrd}/credentials.toml
@@ -1314,7 +1323,6 @@ done
 scripts/dev/example-app.sh setup
 scripts/dev/example-app.sh serve &
 app=$!
-pids+=($app)
 until curl -sf -o /dev/null http://127.0.0.1:${WYRD_EXAMPLE_PORT:-8000}/docs; do
   kill -0 "$app" 2>/dev/null || { echo "wyrd-example-py exited before it was ready" >&2; exit 1; }
   sleep 1
@@ -1329,7 +1337,7 @@ printf 'UI           http://127.0.0.1:%s/t/dev/login/api-key (sign in with that 
 printf 'example app  http://127.0.0.1:%s/docs\n' "${WYRD_EXAMPLE_PORT:-8000}"
 printf 'MockServer   http://127.0.0.1:1080/mockserver/dashboard\n'
 printf 'batch        %s; send another with mise run dev:batch -- --requests 20 --concurrency 2\n\n' "$batch"
-wait -n "${pids[@]}"
+wait -n "${pids[@]}" "$app"
 """
 
 [tasks."dev:batch"]

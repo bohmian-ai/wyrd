@@ -16,7 +16,7 @@ use wyrd_spec::request_id::RequestId;
 use wyrd_spec::vala::api::{
     BifrostQueryRequest, BifrostTableDescription, BifrostTableEntry, CancelRunningQueryResponse,
     ListRunningQueriesResponse, QueryStreamFrame, QueryTerminalFrame, QueryTerminalOutcome,
-    RunningQuerySummary,
+    RunningQuerySummary, ValidatePredicateRequest, ValidatePredicateResponse,
 };
 use wyrd_spec::vala::error::BifrostError;
 use wyrd_tonic::frame_codec::FrameDecoder;
@@ -356,6 +356,38 @@ impl QueryClient {
                 None,
             )
             .await
+            .map_err(Into::into)
+    }
+
+    /// Validates one `WHERE` predicate over a table and returns its normalized text.
+    ///
+    /// Sends `POST /v1/query/predicate`. Nothing runs; a blank predicate
+    /// normalizes to the empty string, meaning no extra filter.
+    ///
+    /// # Errors
+    ///
+    /// Returns stable authentication, authorization, not-found, invalid-SQL,
+    /// availability, or protocol errors.
+    pub async fn validate_predicate(
+        &self,
+        namespace: &str,
+        name: &str,
+        expression: &str,
+    ) -> Result<String, BifrostClientError> {
+        let request = ValidatePredicateRequest {
+            namespace: namespace.to_owned(),
+            name: name.to_owned(),
+            expression: expression.to_owned(),
+        };
+        self.client
+            .http
+            .request_json::<_, ValidatePredicateResponse>(
+                reqwest::Method::POST,
+                "/v1/query/predicate",
+                Some(&request),
+            )
+            .await
+            .map(|response| response.expression)
             .map_err(Into::into)
     }
 

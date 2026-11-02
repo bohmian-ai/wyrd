@@ -29,10 +29,11 @@ mod pg_tests {
     /// caller that also holds tenant administration (`*`), `verifier:run`,
     /// `operators:write`, `gateway:write`, and `gateway:delete`: every read
     /// tool, then that caller's write tools.
-    const ADVERTISED_TOOLS: [&str; 37] = [
+    const ADVERTISED_TOOLS: [&str; 38] = [
         "bifrost.list_tables",
         "bifrost.describe_table",
         "bifrost.query",
+        "bifrost.validate_predicate",
         "principals.list_credentials",
         "cards.get",
         "cards.list",

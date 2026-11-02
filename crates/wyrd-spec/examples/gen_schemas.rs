@@ -81,7 +81,8 @@ use wyrd_spec::vala::api::{
     GetRunningQueryRequest, ListRunningQueriesResponse, NullOrderWire, PhysicalLayoutWire,
     QueryTerminalFrame, RegisterOutcome, RegisterTableRequest, RegisterTableResponse,
     RunningQueryLifecycleState, RunningQueryProgress, RunningQuerySummary, SortDirectionWire,
-    SortKeyWire, TableStatus, TimeGranularityWire, TimeUnit,
+    SortKeyWire, TableStatus, TimeGranularityWire, TimeUnit, ValidatePredicateRequest,
+    ValidatePredicateResponse,
 };
 use wyrd_spec::vala::trace::SpanRecord;
 use wyrd_spec::verification::VerificationBindingStatus;
@@ -291,6 +292,8 @@ fn contracts() -> Value {
         GetRunningQueryRequest,
         CancelRunningQueryRequest,
         CancelRunningQueryResponse,
+        ValidatePredicateRequest,
+        ValidatePredicateResponse,
         QueryTerminalFrame,
         AuditEvent,
         AuthMethod,

@@ -1083,6 +1083,32 @@ class Bifrost(_BifrostBase):
 
         return _description(self._native.describe_table(namespace, name))
 
+    def validate_predicate(self, namespace: str, name: str, expression: str) -> str:
+        """Check one ``WHERE`` predicate over ``namespace.name`` without running a query.
+
+        Only the table's columns, literals, comparisons, ``AND``/``OR``/``NOT``,
+        ``IS [NOT] NULL``, ``IN``, ``BETWEEN``, ``LIKE``, and ``ILIKE`` are
+        allowed, up to 8 KiB.
+
+        Args:
+            namespace: the table namespace, such as ``bifrost.logs``.
+            name: the table name, such as ``records``.
+            expression: the predicate without the ``WHERE`` keyword.
+
+        Returns:
+            The normalized predicate; ``""`` for a blank one.
+
+        Raises:
+            WyrdError: ``WYRD_VALA_400_QUERY_INVALID_SQL`` for a predicate
+                outside the grammar or the table's columns,
+                ``WYRD_VALA_403_QUERY_FORBIDDEN`` for a table the caller may
+                not query, ``WYRD_VALA_404_BIFROST_TABLE_NOT_FOUND``, or an
+                authorization or transport failure.
+
+        """
+
+        return self._native.validate_predicate(namespace, name, expression)
+
     def alter_table(
         self,
         namespace: str,
@@ -1391,6 +1417,25 @@ class AsyncBifrost(_BifrostBase):
         """
 
         return _description(await asyncio.to_thread(self._native.describe_table, namespace, name))
+
+    async def validate_predicate(self, namespace: str, name: str, expression: str) -> str:
+        """Check one ``WHERE`` predicate over ``namespace.name`` without running a query.
+
+        Args:
+            namespace: the table namespace.
+            name: the table name.
+            expression: the predicate without the ``WHERE`` keyword.
+
+        Returns:
+            The normalized predicate; ``""`` for a blank one.
+
+        Raises:
+            WyrdError: As for ``Bifrost.validate_predicate()``.
+        """
+
+        return await asyncio.to_thread(
+            self._native.validate_predicate, namespace, name, expression
+        )
 
     async def alter_table(
         self,

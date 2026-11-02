@@ -11,10 +11,15 @@ use std::time::Duration;
 
 use datafusion::sql::parser::{DFParser, Statement as DfStatement};
 use datafusion::sql::sqlparser::ast::{
-    Expr, ObjectName, ObjectNamePart, Statement as SqlStatement, Visit, Visitor,
+    BinaryOperator, Expr, Ident, ObjectName, ObjectNamePart, Statement as SqlStatement,
+    UnaryOperator, Value, Visit, Visitor,
 };
+use datafusion::sql::sqlparser::dialect::GenericDialect;
+use datafusion::sql::sqlparser::parser::Parser;
+use datafusion::sql::sqlparser::tokenizer::{Token, Tokenizer, Whitespace};
 use wyrd_spec::error::WyrdError;
 use wyrd_spec::vala::BifrostError as ValaError;
+use wyrd_spec::vala::api::MAX_PREDICATE_BYTES;
 
 /// Wall-clock budget for a sync query before the floor rejects it with 504.
 pub const SYNC_QUERY_TIMEOUT: Duration = Duration::from_secs(30);
@@ -226,6 +231,200 @@ pub fn validate_query_sql(sql: &str) -> Result<(), WyrdError> {
     Ok(())
 }
 
+/// Validate one `WHERE` predicate and return it in canonical SQL.
+///
+/// The predicate is parsed by the same SQL parser queries use, as exactly one
+/// expression ending the input. It may hold only column references `column`
+/// admits, literals, comparisons, `AND`/`OR`/`NOT`, `IS [NOT] NULL` and the
+/// boolean `IS` tests, literal `IN` lists, `BETWEEN`, and `[NOT] LIKE`/`ILIKE`.
+/// Comments, placeholders, statements, subqueries, functions, casts, and every
+/// other construct are refused, so the predicate can neither reach another
+/// relation nor carry its own parameters. Blank input is no predicate and
+/// normalizes to the empty string.
+///
+/// `column` receives each referenced name as the engine resolves it: unquoted
+/// names lowercased, quoted names exact.
+///
+/// # Errors
+/// Returns [`WyrdError::Vala`] carrying `WYRD_VALA_400_QUERY_INVALID_SQL` when
+/// the predicate exceeds [`MAX_PREDICATE_BYTES`], does not parse as one
+/// expression, uses a refused construct, or names a column `column` refuses.
+pub fn normalize_predicate(
+    expression: &str,
+    column: impl Fn(&str) -> bool,
+) -> Result<String, WyrdError> {
+    if expression.len() > MAX_PREDICATE_BYTES {
+        return Err(invalid_sql(format!(
+            "the predicate is {} bytes; the limit is {MAX_PREDICATE_BYTES}",
+            expression.len()
+        )));
+    }
+    if expression.trim().is_empty() {
+        return Ok(String::new());
+    }
+    let dialect = GenericDialect {};
+    let tokens = Tokenizer::new(&dialect, expression)
+        .tokenize()
+        .map_err(|error| invalid_sql(format!("parse error: {error}")))?;
+    for token in &tokens {
+        match token {
+            Token::Whitespace(
+                Whitespace::SingleLineComment { .. } | Whitespace::MultiLineComment(_),
+            ) => {
+                return Err(invalid_sql(
+                    "a predicate cannot contain comments".to_owned(),
+                ));
+            }
+            Token::Placeholder(_) => {
+                return Err(invalid_sql(
+                    "a predicate cannot contain parameters".to_owned(),
+                ));
+            }
+            Token::SemiColon => {
+                return Err(invalid_sql(
+                    "a predicate is one expression, not a statement".to_owned(),
+                ));
+            }
+            _ => {}
+        }
+    }
+    let mut parser = Parser::new(&dialect).with_tokens(tokens);
+    let parsed = parser
+        .parse_expr()
+        .map_err(|error| invalid_sql(format!("parse error: {error}")))?;
+    let rest = parser.peek_token();
+    if rest.token != Token::EOF {
+        return Err(invalid_sql(format!(
+            "unexpected `{}` after the predicate",
+            rest.token
+        )));
+    }
+    check_predicate(&parsed, &column)?;
+    Ok(parsed.to_string())
+}
+
+/// Refuse every construct a predicate may not hold, and unknown columns.
+fn check_predicate(expr: &Expr, column: &impl Fn(&str) -> bool) -> Result<(), WyrdError> {
+    match expr {
+        Expr::Identifier(ident) => check_column(ident, column),
+        Expr::Value(value) if matches!(value.value, Value::Placeholder(_)) => Err(invalid_sql(
+            "a predicate cannot contain parameters".to_owned(),
+        )),
+        Expr::Value(_) | Expr::TypedString(_) => Ok(()),
+        Expr::BinaryOp { left, op, right } => {
+            if !matches!(
+                op,
+                BinaryOperator::Eq
+                    | BinaryOperator::NotEq
+                    | BinaryOperator::Lt
+                    | BinaryOperator::LtEq
+                    | BinaryOperator::Gt
+                    | BinaryOperator::GtEq
+                    | BinaryOperator::And
+                    | BinaryOperator::Or
+            ) {
+                return Err(refused(expr));
+            }
+            check_predicate(left, column)?;
+            check_predicate(right, column)
+        }
+        Expr::UnaryOp { op, expr: operand } => {
+            if !matches!(
+                op,
+                UnaryOperator::Not | UnaryOperator::Minus | UnaryOperator::Plus
+            ) {
+                return Err(refused(expr));
+            }
+            check_predicate(operand, column)
+        }
+        Expr::Nested(inner)
+        | Expr::IsNull(inner)
+        | Expr::IsNotNull(inner)
+        | Expr::IsTrue(inner)
+        | Expr::IsNotTrue(inner)
+        | Expr::IsFalse(inner)
+        | Expr::IsNotFalse(inner) => check_predicate(inner, column),
+        Expr::InList {
+            expr: tested, list, ..
+        } => {
+            check_predicate(tested, column)?;
+            for item in list {
+                if !is_literal(item) {
+                    return Err(invalid_sql(format!(
+                        "`IN` lists hold literals only, not `{item}`"
+                    )));
+                }
+            }
+            Ok(())
+        }
+        Expr::Between {
+            expr: tested,
+            low,
+            high,
+            ..
+        } => {
+            check_predicate(tested, column)?;
+            check_predicate(low, column)?;
+            check_predicate(high, column)
+        }
+        Expr::Like {
+            any: false,
+            expr: tested,
+            pattern,
+            escape_char,
+            ..
+        }
+        | Expr::ILike {
+            any: false,
+            expr: tested,
+            pattern,
+            escape_char,
+            ..
+        } => {
+            check_predicate(tested, column)?;
+            check_predicate(pattern, column)?;
+            escape_char
+                .as_deref()
+                .map_or(Ok(()), |escape| check_predicate(escape, column))
+        }
+        _ => Err(refused(expr)),
+    }
+}
+
+/// Whether `expr` is a literal, optionally signed.
+fn is_literal(expr: &Expr) -> bool {
+    match expr {
+        Expr::Value(value) => !matches!(value.value, Value::Placeholder(_)),
+        Expr::TypedString(_) => true,
+        Expr::UnaryOp {
+            op: UnaryOperator::Minus | UnaryOperator::Plus,
+            expr,
+        } => is_literal(expr),
+        _ => false,
+    }
+}
+
+/// Refuse a column reference the table does not describe.
+fn check_column(ident: &Ident, column: &impl Fn(&str) -> bool) -> Result<(), WyrdError> {
+    let name = if ident.quote_style.is_some() {
+        ident.value.clone()
+    } else {
+        ident.value.to_ascii_lowercase()
+    };
+    if column(&name) {
+        Ok(())
+    } else {
+        Err(invalid_sql(format!(
+            "`{name}` is not a column of this table"
+        )))
+    }
+}
+
+/// The refusal for a construct a predicate may not hold.
+fn refused(expr: &Expr) -> WyrdError {
+    invalid_sql(format!("`{expr}` is not permitted in a predicate"))
+}
+
 /// Best-effort list of the fully-qualified table names referenced by an
 /// already-validated query, used by the sync handler to build only the providers
 /// the query needs. Names that are not resolvable Bifrost tables (CTEs, aliases,
@@ -412,5 +611,96 @@ mod tests {
     #[test]
     fn query_referenced_tables_empty_for_tableless_select() {
         assert!(referenced_tables("SELECT 1").is_empty());
+    }
+
+    /// The columns the predicate tests below may reference.
+    fn span_column(name: &str) -> bool {
+        [
+            "name",
+            "status_code",
+            "duration_nano",
+            "service_name",
+            "Mixed",
+        ]
+        .contains(&name)
+    }
+
+    /// Proves every permitted construct is accepted and comes back in the
+    /// parser's canonical spelling.
+    ///
+    /// # Panics
+    ///
+    /// Panics when a permitted predicate is refused or normalizes differently.
+    #[test]
+    fn predicate_accepts_and_normalizes_permitted_constructs() {
+        for (expression, canonical) in [
+            ("name='a'", "name = 'a'"),
+            (
+                "(status_code = 2 OR duration_nano >= 1e6) and not service_name is null",
+                "(status_code = 2 OR duration_nano >= 1e6) AND NOT service_name IS NULL",
+            ),
+            ("NAME in ('a', 'b') ", "NAME IN ('a', 'b')"),
+            ("status_code not in (-1, 0)", "status_code NOT IN (-1, 0)"),
+            (
+                "duration_nano between 1 and 2",
+                "duration_nano BETWEEN 1 AND 2",
+            ),
+            ("name ilike 'GET %'", "name ILIKE 'GET %'"),
+            (
+                "name not like 'a\\_%' escape '\\'",
+                "name NOT LIKE 'a\\_%' ESCAPE '\\'",
+            ),
+            ("\"Mixed\" is not null", "\"Mixed\" IS NOT NULL"),
+            (
+                "(service_name = 'x') is true",
+                "(service_name = 'x') IS TRUE",
+            ),
+        ] {
+            assert_eq!(
+                normalize_predicate(expression, span_column).expect(expression),
+                canonical
+            );
+        }
+        assert_eq!(normalize_predicate("  \n", span_column).expect("blank"), "");
+    }
+
+    /// Proves statements, injection, comments, parameters, subqueries,
+    /// functions, unknown columns, and oversized input are each refused with the
+    /// invalid-SQL code.
+    ///
+    /// # Panics
+    ///
+    /// Panics when any refused predicate is accepted or refused with another code.
+    #[test]
+    fn predicate_refuses_everything_else() {
+        let oversized = format!("name = '{}'", "x".repeat(MAX_PREDICATE_BYTES));
+        for expression in [
+            "name = 'a'; DROP TABLE t",
+            "name = 'a' -- trailing",
+            "name = 'a' /* hidden */",
+            "name = $1",
+            "name = ?",
+            "name IN (SELECT name FROM \"bifrost.traces.spans\")",
+            "EXISTS (SELECT 1)",
+            "lower(name) = 'a'",
+            "CAST(status_code AS VARCHAR) = '2'",
+            "status_code + 1 = 2",
+            "name IN (service_name)",
+            "secret = 1",
+            "\"mixed\" = 1",
+            "spans.name = 'a'",
+            "name = 'a' ORDER BY name",
+            "name = 'a') OR (1 = 1",
+            "SELECT 1",
+            oversized.as_str(),
+        ] {
+            let error = normalize_predicate(expression, span_column)
+                .expect_err(&expression[..expression.len().min(60)]);
+            assert_eq!(
+                error.code(),
+                "WYRD_VALA_400_QUERY_INVALID_SQL",
+                "{expression}"
+            );
+        }
     }
 }

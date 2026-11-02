@@ -1218,6 +1218,39 @@ impl Bifrost {
         self.query.describe_table(namespace, name).await
     }
 
+    /// Validate one `WHERE` predicate over a table and return its normalized text.
+    ///
+    /// The server checks the caller may query the table before its columns
+    /// decide what the predicate may name, and permits only scalar comparisons,
+    /// boolean combinations, `NULL` tests, `IN`, `BETWEEN`, `LIKE`, and `ILIKE`,
+    /// up to 8 KiB. A blank predicate normalizes to the empty string.
+    ///
+    /// # Arguments
+    /// * `namespace` - The table's namespace, such as `bifrost.logs`.
+    /// * `name` - The table's name within `namespace`, such as `records`.
+    /// * `expression` - The predicate, without the `WHERE` keyword.
+    ///
+    /// # Errors
+    ///
+    /// Returns `WYRD_VALA_400_QUERY_INVALID_SQL` for a predicate outside the
+    /// grammar or the table's columns, and the stable not-found,
+    /// authentication, authorization, availability, or protocol error the
+    /// server reported.
+    ///
+    /// # Cancellation
+    ///
+    /// Abandoning the future leaves no server state behind; validation is a read.
+    pub async fn validate_predicate(
+        &self,
+        namespace: &str,
+        name: &str,
+        expression: &str,
+    ) -> Result<String, BifrostClientError> {
+        self.query
+            .validate_predicate(namespace, name, expression)
+            .await
+    }
+
     /// Alter one registered table's definition at its observed table version.
     ///
     /// Sends `PATCH /v1/bifrost/tables/{namespace}/{name}`: the server

@@ -224,6 +224,11 @@ fn response(topic: GuideTopic) -> GuideResponse {
                     "Read telemetry fields and types",
                     json!({ "namespace": "bifrost.traces", "name": "spans" }),
                 ),
+                example(
+                    "bifrost.validate_predicate",
+                    "Check a WHERE filter before using it",
+                    json!({ "namespace": "bifrost.logs", "name": "records", "expression": "severity_number >= 17" }),
+                ),
                 sql_example(
                     "Correlate an error log to its trace span",
                     "SELECT l.severity_text, l.event_name, s.name, s.status_code FROM bifrost.logs.records l JOIN bifrost.traces.spans s ON l.trace_id = s.trace_id AND l.span_id = s.span_id WHERE s.trace_id = X'<trace_id>' AND s.start_time_unix_nano >= TIMESTAMP '2026-01-01T00:00:00Z' AND s.start_time_unix_nano < TIMESTAMP '2027-01-01T00:00:00Z' LIMIT 20",

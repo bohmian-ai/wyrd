@@ -271,6 +271,7 @@ mod pg_tests {
                 "bifrost.list_tables",
                 "bifrost.describe_table",
                 "bifrost.query",
+                "bifrost.validate_predicate",
                 "principals.list_credentials",
                 "cards.get",
                 "cards.list",

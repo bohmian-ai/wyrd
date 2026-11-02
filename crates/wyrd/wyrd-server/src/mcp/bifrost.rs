@@ -1,4 +1,4 @@
-//! The three read-only Bifrost capabilities Wyrd advertises over MCP.
+//! The four read-only Bifrost capabilities Wyrd advertises over MCP.
 //!
 //! The adapter owns exactly three things: parsing a closed request, projecting
 //! the answer an agent can act on, and translating failure onto the protocol.
@@ -28,16 +28,25 @@ pub(super) const LIST_TABLES: &str = "bifrost.list_tables";
 /// Wire name of the full schema and physical-layout description.
 pub(super) const DESCRIBE_TABLE: &str = "bifrost.describe_table";
 
+/// Wire name of the `WHERE`-predicate validation.
+pub(super) const VALIDATE_PREDICATE: &str = "bifrost.validate_predicate";
+
 /// Wire name of the bounded read-only query.
 pub(super) const QUERY: &str = crate::query::collect::QUERY;
 
 /// The exact catalog every ordinary Wyrd server advertises.
 ///
 /// Order is part of the contract an agent reads: discovery, then description,
-/// then the query those two exist to make writable.
+/// then the query those two exist to make writable, then the predicate check
+/// a query filter can be held to.
 #[must_use]
 pub(crate) fn descriptors() -> Vec<Tool> {
-    vec![list_tables_tool(), describe_table_tool(), query_tool()]
+    vec![
+        list_tables_tool(),
+        describe_table_tool(),
+        query_tool(),
+        validate_predicate_tool(),
+    ]
 }
 
 /// Build one read-only tool descriptor from its static input schema.
@@ -111,6 +120,37 @@ fn query_tool() -> Tool {
         "Run one bounded read-only SELECT against this caller's authorized Bifrost tables and \
          return the complete result. Wyrd selects the execution path; the caller cannot.",
         input_schema(),
+    )
+}
+
+/// Descriptor for the `WHERE`-predicate validation.
+fn validate_predicate_tool() -> Tool {
+    read_tool(
+        VALIDATE_PREDICATE,
+        "Validate a Bifrost predicate",
+        "Check one WHERE predicate over an authorized Bifrost table without running a query, and \
+         return it normalized. Only the table's columns, literals, comparisons, AND/OR/NOT, IS \
+         [NOT] NULL, IN, BETWEEN, LIKE, and ILIKE are allowed, up to 8 KiB; a blank predicate \
+         normalizes to an empty string.",
+        serde_json::json!({
+            "type": "object",
+            "properties": {
+                "namespace": {
+                    "type": "string",
+                    "description": "Fully qualified Bifrost namespace, e.g. `bifrost.logs`."
+                },
+                "name": {
+                    "type": "string",
+                    "description": "Table name within the namespace."
+                },
+                "expression": {
+                    "type": "string",
+                    "description": "The predicate without the WHERE keyword, e.g. `severity_number >= 17`."
+                }
+            },
+            "required": ["namespace", "name", "expression"],
+            "additionalProperties": false
+        }),
     )
 }
 
@@ -215,6 +255,29 @@ impl WyrdMcpHandler {
         Ok(result.unwrap_or_else(|error: WyrdError| {
             CallToolResult::structured_error(error.as_problem_json())
         }))
+    }
+
+    /// Validate one predicate through the query service and return its normalized text.
+    ///
+    /// # Errors
+    ///
+    /// Returns MCP invalid params for malformed arguments. Authorization,
+    /// catalog, and predicate failures become canonical structured tool errors.
+    pub(super) async fn validate_predicate(
+        &self,
+        caller: Caller,
+        arguments: Option<serde_json::Map<String, JsonValue>>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let arguments = parse_arguments(VALIDATE_PREDICATE, arguments)?;
+        let result = crate::query::service::validate_predicate(&self.state, &caller, arguments)
+            .await
+            .map(|response| {
+                CallToolResult::structured(serde_json::json!({ "expression": response.expression }))
+            });
+        Ok(
+            result
+                .unwrap_or_else(|error| CallToolResult::structured_error(error.as_problem_json())),
+        )
     }
 
     /// Run a bounded query through the authenticated service and collect its result.

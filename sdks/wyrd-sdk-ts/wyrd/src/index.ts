@@ -1542,6 +1542,26 @@ export class Bifrost {
   }
 
   /**
+   * Check one `WHERE` predicate over a table without running a query.
+   *
+   * Only the table's columns, literals, comparisons, `AND`/`OR`/`NOT`,
+   * `IS [NOT] NULL`, `IN`, `BETWEEN`, `LIKE`, and `ILIKE` are allowed, up to
+   * 8 KiB.
+   *
+   * @param namespace - The table's namespace, such as `bifrost.logs`.
+   * @param name - The table's name within `namespace`, such as `records`.
+   * @param expression - The predicate without the `WHERE` keyword.
+   * @returns The normalized predicate; `""` for a blank one.
+   * @throws {@link WyrdError} `WYRD_VALA_400_QUERY_INVALID_SQL` for a predicate
+   * outside the grammar or the table's columns, `WYRD_VALA_403_QUERY_FORBIDDEN`
+   * for a table the caller may not query, or a not-found, authorization, or
+   * transport failure.
+   */
+  async validatePredicate(namespace: string, name: string, expression: string): Promise<string> {
+    return lifecycleValue<string>(await this.#native.validatePredicate(namespace, name, expression));
+  }
+
+  /**
    * Edit one registered table's layout or custom columns.
    *
    * @param namespace - The table's namespace, such as `bifrost.datasets`.

@@ -970,6 +970,27 @@ impl Bifrost {
         to_python_json(py, serde_json::to_value(description))
     }
 
+    /// Validates one `WHERE` predicate over a table and returns its normalized text.
+    ///
+    /// # Errors
+    ///
+    /// Raises `WyrdError` carrying the server's invalid-SQL, authorization,
+    /// not-found, or transport code.
+    fn validate_predicate(
+        &self,
+        py: Python<'_>,
+        namespace: &str,
+        name: &str,
+        expression: &str,
+    ) -> WyrdPyResult<String> {
+        crate::trace::block_on(
+            py,
+            self.handle(py)?
+                .validate_predicate(namespace, name, expression),
+        )
+        .map_err(client_error)
+    }
+
     /// Alters one registered table's definition at its observed table version
     /// and returns the committed description.
     ///

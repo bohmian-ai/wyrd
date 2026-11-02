@@ -941,6 +941,37 @@ pub struct CancelRunningQueryResponse {
     pub cancellation_started: bool,
 }
 
+/// Largest predicate `POST /v1/query/predicate` accepts, in UTF-8 bytes.
+pub const MAX_PREDICATE_BYTES: usize = 8 * 1024;
+
+/// `POST /v1/query/predicate`: check one SQL `WHERE` expression against one table.
+///
+/// The expression is a predicate, never a statement: the server accepts only
+/// column references to the table's described columns, literals, comparisons,
+/// `AND`/`OR`/`NOT`, `IS [NOT] NULL`, `IN` lists, `BETWEEN` and
+/// `[NOT] LIKE`/`ILIKE`. It is validated, never executed; every query that
+/// later embeds it is authorized and validated again on its own.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
+#[serde(deny_unknown_fields)]
+pub struct ValidatePredicateRequest {
+    /// The table's namespace, such as `bifrost.traces`.
+    pub namespace: String,
+    /// The table's name within `namespace`, such as `spans`.
+    pub name: String,
+    /// The predicate, at most [`MAX_PREDICATE_BYTES`] UTF-8 bytes; empty or
+    /// blank means no predicate.
+    pub expression: String,
+}
+
+/// The accepted predicate in the server's canonical SQL spelling.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
+pub struct ValidatePredicateResponse {
+    /// The normalized expression; empty when the request held no predicate.
+    pub expression: String,
+}
+
 /// Exact private role identity accepted for one immutable Oracle participant cut.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 #[cfg_attr(feature = "server", derive(utoipa::ToSchema))]

@@ -369,6 +369,10 @@ impl WyrdMcpHandler {
                 let caller = Self::caller(&context).map_err(wyrd_error_to_mcp)?;
                 self.query(caller, request.arguments, &context).await
             }
+            bifrost::VALIDATE_PREDICATE => {
+                let caller = Self::caller(&context).map_err(wyrd_error_to_mcp)?;
+                self.validate_predicate(caller, request.arguments).await
+            }
             principals::LIST_CREDENTIALS => {
                 let caller = Self::caller(&context).map_err(wyrd_error_to_mcp)?;
                 self.mcp_list_credentials(caller, request.arguments)

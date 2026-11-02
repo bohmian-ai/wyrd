@@ -1253,6 +1253,35 @@ impl NativeBifrost {
         })
     }
 
+    /// Validates one `WHERE` predicate over a table and resolves to its
+    /// normalized text, as a JSON string.
+    ///
+    /// # Errors
+    ///
+    /// Returns a napi error only when the native result cannot be projected;
+    /// Wyrd control failures are returned in [`NativeLifecycleResult`].
+    #[napi]
+    pub fn validate_predicate<'env>(
+        &self,
+        env: &'env Env,
+        namespace: String,
+        name: String,
+        expression: String,
+    ) -> napi::Result<PromiseRaw<'env, NativeLifecycleResult>> {
+        let client = self.client.clone();
+        crate::trace::spawn(env, async move {
+            match client
+                .validate_predicate(&namespace, &name, &expression)
+                .await
+            {
+                Ok(expression) => {
+                    NativeLifecycleResult::success(&serde_json::Value::String(expression))
+                }
+                Err(error) => Ok(NativeLifecycleResult::failure(&error)),
+            }
+        })
+    }
+
     /// Alters one registered table's definition at its observed table version
     /// and resolves to the committed description.
     ///

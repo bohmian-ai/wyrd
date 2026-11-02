@@ -1,12 +1,11 @@
 /**
  * Observe loaders: built-in reads of the canonical signal tables. Every SQL
  * text is assembled only from the fixed tables and column allowlists in
- * `SIGNALS`; every value, range bound and identity is a typed `$n` bind,
- * except in `metricPanels`, whose Chart and authored-SQL reads bind only the range.
+ * `SIGNALS`; every value, range bound and identity is a typed `$n` bind.
  */
 import { failed, wyrdProblem, type Loaded, type Problem, type QueryParam, type QueryResult, type WireRequest } from './contract.js';
 import { fmtDuration } from './format.js';
-import { bucketFor, chartParams, resolveRange, type LoadContext } from './loaders.js';
+import { bucketFor, chartParams, resolveRange, shapeChart, type ChartProps, type LoadContext } from './loaders.js';
 import { columnIndex } from './plot.js';
 import {
   SIGNALS,
@@ -288,7 +287,11 @@ export function listQuery(input: Extract<RecordTableInput, { signal: Signal }>, 
   binds.where(input.where).predicate(predicate);
   if (input.signal === 'traces') binds.roots(signal.table);
   const keys = KEY_COLUMNS[input.signal].map((key) => (key.endsWith('_id') && key !== 'wyrd_request_id' ? `encode(${key}, 'hex') AS ${key}` : key));
-  const shown = shownColumns(input).map((column) => (input.signal === 'metrics' && EXACT.includes(column) ? `CAST(${column} AS VARCHAR) AS ${column}` : column));
+  const shown = shownColumns(input).map((column) => {
+    if (input.signal !== 'metrics') return column;
+    if (EXACT.includes(column)) return `CAST(${column} AS VARCHAR) AS ${column}`;
+    return NESTED_EXACT[column] ? `${NESTED_EXACT[column]} AS ${column}` : column;
+  });
   return {
     sql: `SELECT ${[...shown, ...keys].join(', ')} FROM ${signal.table} WHERE ${binds.sql} ORDER BY ${signal.time} DESC LIMIT ${input.limit ?? LIST_LIMIT}`,
     params: binds.params
@@ -301,64 +304,270 @@ export function listQuery(input: Extract<RecordTableInput, { signal: Signal }>, 
  */
 const EXACT: readonly string[] = ['int_value', 'histogram_count', 'summary_count', 'exponential_zero_count'];
 
+/**
+ * Nested metric counts a list reads as exact decimal text with their
+ * structure kept: OTLP counts are uint64, which JSON numbers cannot carry.
+ */
+const NESTED_EXACT: Readonly<Record<string, string>> = {
+  bucket_counts: 'CAST(bucket_counts AS VARCHAR[])',
+  positive_buckets:
+    "CASE WHEN positive_buckets IS NULL THEN NULL ELSE named_struct('offset', positive_buckets['offset'], 'bucket_counts', CAST(positive_buckets['bucket_counts'] AS VARCHAR[])) END",
+  negative_buckets:
+    "CASE WHEN negative_buckets IS NULL THEN NULL ELSE named_struct('offset', negative_buckets['offset'], 'bucket_counts', CAST(negative_buckets['bucket_counts'] AS VARCHAR[])) END"
+};
+
 /** Metric types a series chart plots; histogram and summary points are listed, never plotted. */
 const PLOTTED = "metric_type IN ('gauge', 'sum')";
 
-/**
- * One series per recorded meaning: the grouping value, then the type, unit,
- * temporality and monotonicity, so incompatible points never share a line.
- */
-function seriesLabel(groupBy?: string): string {
-  const temporality = "CASE aggregation_temporality WHEN 1 THEN 'delta' WHEN 2 THEN 'cumulative' ELSE NULL END";
-  const monotonic = "CASE WHEN is_monotonic THEN 'monotonic' ELSE NULL END";
-  const group = groupBy ? `COALESCE(CAST(${groupBy} AS VARCHAR), 'not set'), ` : '';
-  return `concat_ws(' · ', ${group}metric_type, unit, ${temporality}, ${monotonic})`;
+/** Aggregations a metric chart may apply across series at each recorded instant. Percentiles are not offered. */
+export const METRIC_AGGREGATIONS = ['sum', 'mean', 'min', 'max'] as const;
+/** One offered metric aggregation. */
+export type MetricAggregation = (typeof METRIC_AGGREGATIONS)[number];
+
+/** SQL of each aggregation over exact integers. */
+const AGGREGATE: Record<MetricAggregation, string> = { sum: 'sum', mean: 'avg', min: 'min', max: 'max' };
+
+/** A point's recorded meaning: points that differ in any of these never share a series. */
+const MEANING = ['metric_type', 'unit', 'aggregation_temporality', 'is_monotonic'] as const;
+
+/** The recorded resource, scope and point dimensions that identify an unaggregated series; Variants read as their JSON text. */
+const DIMENSIONS: readonly (readonly [string, string])[] = [
+  ['resource', 'to_json(resource_attributes)'],
+  ['scope_name', 'scope_name'],
+  ['scope_version', 'scope_version'],
+  ['scope', 'to_json(scope_attributes)'],
+  ['attributes', 'to_json(attributes)']
+];
+
+/** The read of one metric's series and their exact summary. */
+export interface MetricInput {
+  readonly metric: string;
+  readonly where?: readonly Filter[];
+  readonly where_sql?: string;
+  /** Apply this aggregation across series at each recorded instant; without it every recorded series stays separate. */
+  readonly aggregation?: MetricAggregation;
+  /** With an aggregation, keep one series per value of this metrics column. */
+  readonly by?: string;
+  readonly range?: Range;
 }
 
-/** A SQL literal of one filter value; strings double their quotes. */
-function literal(value: QueryParam): string {
-  if (typeof value === 'string') return `'${value.replaceAll("'", "''")}'`;
-  if (typeof value === 'number' && Number.isFinite(value)) return String(value);
-  if (typeof value === 'boolean') return String(value);
-  throw new Error(`a metric filter value must be a string, finite number or boolean, not ${String(value)}`);
+/**
+ * Props of one metric: the Chart of its series, the typed identity columns
+ * that key them, and the exact per-series summary under the same identity
+ * and sample set.
+ */
+export interface MetricProps {
+  readonly input: MetricInput;
+  readonly chart: ChartProps;
+  readonly identity: readonly string[];
+  readonly summary: Loaded<QueryResult>;
 }
 
 /**
- * The selected metric's series chart and exact series summary. Chart and
- * authored-SQL lists bind only the range, so the metric name and WHERE values
- * enter as escaped literals over allowlisted columns, and `predicate` must
- * already be server-normalized. The chart plots doubles and says so; the
- * summary's Latest, Max and Mean are the server's exact decimal text.
+ * The chart and summary reads of one metric. Both select the same samples:
+ * `at`, the identity columns, `i` (exact integers as DECIMAL) and `d`
+ * (doubles). With an aggregation, the samples are first aggregated once per
+ * instant and identity; integers stay exact unless a double shares the group.
+ * The summary's Latest, Max and Mean are server text: Max orders by numeric
+ * value and then by the exact integer, and Mean is the exact decimal mean
+ * unless a double is present.
  */
-export function metricPanels(metric: string, where: readonly Filter[], groupBy?: string, predicate?: string): { chart: ChartInput; summary: string } {
-  const clauses = [`${SIGNALS.metrics.time} >= $1::timestamptz AND ${SIGNALS.metrics.time} < $2::timestamptz`, `metric_name = ${literal(metric)}`, PLOTTED];
-  for (const { column, value, not } of where) {
-    if (!(SIGNALS.metrics.filters as readonly string[]).includes(column)) throw new Error(`${column} is not a metrics column`);
-    if (column === 'metric_name' && !not) continue;
-    clauses.push(value === null ? `${column} IS ${not ? 'NOT ' : ''}NULL` : `${column} ${not ? 'IS DISTINCT FROM' : '='} ${literal(value)}`);
+export function metricQueries(input: MetricInput, range: AbsoluteRange, predicate?: string): { identity: readonly string[]; chart: Executed; summary: Executed } {
+  const filters = SIGNALS.metrics.filters as readonly string[];
+  for (const { column } of input.where ?? []) if (!filters.includes(column)) throw new Error(`${column} is not a metrics column`);
+  if (input.by !== undefined && (!filters.includes(input.by) || !input.aggregation))
+    throw new Error(`grouping by ${input.by} needs an aggregation over a metrics column`);
+  const binds = Binds.over(SIGNALS.metrics.time, range);
+  binds.clauses.push(`metric_name = ${binds.bind(input.metric)}`, PLOTTED);
+  binds.where((input.where ?? []).filter(({ column, not }) => column !== 'metric_name' || not)).predicate(predicate);
+  const dimensions: (readonly [string, string])[] = input.aggregation
+    ? [...MEANING.map((name) => [name, name] as const), ...(input.by ? [[input.by, input.by] as const] : [])]
+    : [...MEANING.map((name) => [name, name] as const), ...DIMENSIONS];
+  const identity = dimensions.map(([name]) => name);
+  const names = identity.join(', ');
+  let samples =
+    `SELECT ${SIGNALS.metrics.time} AS at, ${dimensions.map(([name, sql]) => (name === sql ? name : `${sql} AS ${name}`)).join(', ')}, ` +
+    `CAST(int_value AS DECIMAL(38, 0)) AS i, double_value AS d FROM ${SIGNALS.metrics.table} WHERE ${binds.sql}`;
+  if (input.aggregation) {
+    const f = AGGREGATE[input.aggregation];
+    samples =
+      `SELECT at, ${names}, CASE WHEN count(d) = 0 THEN ${f}(i) END AS i, CASE WHEN count(d) > 0 THEN ${f}(COALESCE(CAST(i AS DOUBLE), d)) END AS d ` +
+      `FROM (${samples}) GROUP BY at, ${names}`;
   }
-  if (predicate) clauses.push(`(${predicate})`);
-  const from = `FROM ${SIGNALS.metrics.table} WHERE ${clauses.join(' AND ')}`;
-  if (groupBy !== undefined && !(SIGNALS.metrics.filters as readonly string[]).includes(groupBy)) throw new Error(`${groupBy} is not a metrics column`);
-  const label = seriesLabel(groupBy);
-  const value = 'CASE WHEN int_value IS NOT NULL THEN CAST(int_value AS DOUBLE) ELSE double_value END';
-  const text = 'COALESCE(CAST(int_value AS VARCHAR), CAST(double_value AS VARCHAR))';
+  const valued = `SELECT *, COALESCE(CAST(i AS DOUBLE), d) AS v, COALESCE(CAST(i AS VARCHAR), CAST(d AS VARCHAR)) AS t FROM (${samples})`;
   return {
-    chart: {
-      type: 'timeseries',
-      title: `${metric} · gauge and sum points only, plotted as double precision; exact values in the summary`,
-      sql: `SELECT ${SIGNALS.metrics.time} AS at, ${label} AS series, ${value} AS value ${from} ORDER BY at, series`,
-      x: 'at',
-      y: ['value'],
-      series: 'series'
-    },
-    summary:
-      `SELECT ${label} AS series, count(*) AS points, ` +
-      `last_value(${text} ORDER BY ${SIGNALS.metrics.time}) AS latest, ` +
-      `COALESCE(CAST(max(int_value) AS VARCHAR), CAST(max(double_value) AS VARCHAR)) AS max, ` +
-      `COALESCE(CAST(avg(CAST(int_value AS DECIMAL(38, 0))) AS VARCHAR), CAST(avg(double_value) AS VARCHAR)) AS mean ` +
-      `${from} GROUP BY ${label} ORDER BY series`
+    identity,
+    chart: { sql: `SELECT at, ${names}, v AS value FROM (${valued}) ORDER BY at`, params: binds.params },
+    summary: {
+      sql:
+        `SELECT ${names}, count(*) AS points, last_value(t ORDER BY at) AS latest, first_value(t ORDER BY v DESC, i DESC NULLS LAST) AS max, ` +
+        `CASE WHEN count(d) = 0 THEN CAST(avg(i) AS VARCHAR) ELSE CAST(avg(v) AS VARCHAR) END AS mean ` +
+        `FROM (${valued}) GROUP BY ${names} ORDER BY ${names}`,
+      params: binds.params
+    }
   };
+}
+
+/** Series a metric summary reads; past it the summary reports a partial result. */
+const METRIC_SERIES = 1000;
+
+/**
+ * Load one metric's chart and exact summary in one batch over one range and
+ * one validated predicate; a refused predicate issues neither read.
+ */
+export async function loadMetric(input: MetricInput, context: LoadContext): Promise<MetricProps> {
+  const stopped = (state: Loaded<never>): MetricProps => ({ input, identity: [], summary: state, chart: { input: metricChart(input), result: state } });
+  const range = rangeOf(input.range, context);
+  if ('code' in range) return stopped({ state: 'error', problem: range });
+  const predicate = await predicateFor(SIGNALS.metrics.table, input.where_sql, context);
+  if ('state' in predicate) return stopped(predicate);
+  const plan = metricQueries(input, range, predicate.sql);
+  const [chart, summary] = await context.executor.run(
+    [query(plan.chart.sql, plan.chart.params), query(plan.summary.sql, plan.summary.params, METRIC_SERIES)],
+    context.signal
+  );
+  const reason = `No gauge or sum point of ${input.metric} in ${SIGNALS.metrics.table} in this range.`;
+  const loaded = (read: (typeof chart)): Loaded<QueryResult> =>
+    !read.ok ? failed(read.problem) : read.value.rows.length ? { state: 'populated', data: read.value } : { state: 'empty', data: read.value, reason };
+  return {
+    input,
+    identity: plan.identity,
+    chart: { input: { ...metricChart(input), sql: plan.chart.sql }, executed: plan.chart, result: loaded(chart) },
+    summary: loaded(summary)
+  };
+}
+
+/** The metric's chart definition before its SQL is planned. */
+function metricChart(input: MetricInput): Extract<ChartInput, { type: 'timeseries' }> {
+  const how = input.aggregation ? `${input.aggregation} per instant${input.by ? ` by ${input.by}` : ''}` : 'each recorded series';
+  return { type: 'timeseries', title: `${input.metric} · ${how} · plotted as double precision`, sql: '-', x: 'at', y: ['value'] };
+}
+
+/** The metrics the rail offers under the view's WHERE: name, type and unit of each, by name. */
+export function metricNamesQuery(where: readonly Filter[], range: AbsoluteRange, predicate?: string): Executed {
+  const binds = Binds.over(SIGNALS.metrics.time, range);
+  binds.where(where.filter(({ column }) => column !== 'metric_name')).predicate(predicate);
+  return {
+    sql: `SELECT metric_name, metric_type, unit, count(*) AS points FROM ${SIGNALS.metrics.table} WHERE ${binds.sql} GROUP BY metric_name, metric_type, unit ORDER BY metric_name, metric_type, unit`,
+    params: binds.params
+  };
+}
+
+/** Load the metric rail's names; a refused predicate issues no read. */
+export async function loadMetricNames(input: { readonly where?: readonly Filter[]; readonly where_sql?: string; readonly range?: Range }, context: LoadContext): Promise<Loaded<QueryResult>> {
+  const range = rangeOf(input.range, context);
+  if ('code' in range) return { state: 'error', problem: range };
+  const predicate = await predicateFor(SIGNALS.metrics.table, input.where_sql, context);
+  if ('state' in predicate) return predicate;
+  const plan = metricNamesQuery(input.where ?? [], range, predicate.sql);
+  const [read] = await context.executor.run([query(plan.sql, plan.params, 500)], context.signal);
+  if (!read.ok) return failed(read.problem);
+  return read.value.rows.length ? { state: 'populated', data: read.value } : { state: 'empty', data: read.value, reason: emptyList('metrics', input.where) };
+}
+
+/** The three overview charts of Traces and Spans, and the totals their headlines read. */
+export interface TraceOverviewProps {
+  readonly spans: ChartProps;
+  readonly errors: ChartProps;
+  readonly duration: ChartProps;
+  /** `spans, traces, error_traces, p95_ms, p50_ms` over the whole range, or the state that stopped them. */
+  readonly totals: Loaded<QueryResult>;
+}
+
+/**
+ * The trace overview reads: spans and error spans per bucket, root duration
+ * p95 and p50 per bucket, and the range totals, all under one range, WHERE
+ * and predicate. Durations read in milliseconds.
+ */
+export function traceOverviewQueries(input: { readonly where?: readonly Filter[] }, range: AbsoluteRange, bucket: string, predicate?: string) {
+  const spans = SIGNALS.spans;
+  const plan = (select: string, roots: boolean, series: boolean) => {
+    const binds = Binds.over(spans.time, range);
+    const bin = series ? `date_bin(${binds.bind(bucket)}::interval, ${spans.time})` : '';
+    binds.where(input.where).predicate(predicate);
+    if (roots) binds.roots(spans.table);
+    const sql = series
+      ? `SELECT ${bin} AS at, ${select} FROM ${spans.table} WHERE ${binds.sql} GROUP BY ${bin} ORDER BY at`
+      : `SELECT ${select} FROM ${spans.table} WHERE ${binds.sql}`;
+    return { sql, params: binds.params };
+  };
+  const p = (share: number) => `approx_percentile_cont(duration_nano, ${share}) / 1e6`;
+  return {
+    spans: plan('count(*) AS spans', false, true),
+    errors: plan(`count(*) FILTER (WHERE status_code = ${STATUS_ERROR}) AS errors`, false, true),
+    duration: plan(`${p(0.95)} AS p95, ${p(0.5)} AS p50`, true, true),
+    totals: plan(`count(*) AS spans, count(DISTINCT trace_id) AS traces, count(DISTINCT trace_id) FILTER (WHERE status_code = ${STATUS_ERROR}) AS error_traces`, false, false),
+    durations: plan(`${p(0.95)} AS p95_ms, ${p(0.5)} AS p50_ms`, true, false)
+  };
+}
+
+/** Load the trace overview in one batch; one refused predicate refuses every chart with no dependent read. */
+export async function loadTraceOverview(input: { readonly where?: readonly Filter[]; readonly where_sql?: string; readonly range?: Range }, context: LoadContext): Promise<TraceOverviewProps> {
+  const charts: Record<'spans' | 'errors' | 'duration', ChartInput> = {
+    spans: { type: 'timeseries', title: 'Spans', sql: '-', x: 'at', y: ['spans'] },
+    errors: { type: 'timeseries', title: 'Errors', sql: '-', x: 'at', y: ['errors'] },
+    duration: { type: 'timeseries', title: 'Duration', sql: '-', x: 'at', y: ['p95', 'p50'], unit: 'ms' }
+  };
+  const all = (state: Loaded<never>): TraceOverviewProps => ({
+    spans: { input: charts.spans, result: state },
+    errors: { input: charts.errors, result: state },
+    duration: { input: charts.duration, result: state },
+    totals: state
+  });
+  const range = rangeOf(input.range, context);
+  if ('code' in range) return all({ state: 'error', problem: range });
+  const predicate = await predicateFor(SIGNALS.spans.table, input.where_sql, context);
+  if ('state' in predicate) return all(predicate);
+  const plans = traceOverviewQueries(input, range, bucketFor(range), predicate.sql);
+  const order = ['spans', 'errors', 'duration', 'totals', 'durations'] as const;
+  const results = await context.executor.run(order.map((name) => query(plans[name].sql, plans[name].params)), context.signal);
+  const [spans, errors, duration, totals, durations] = results;
+  const chart = (name: 'spans' | 'errors' | 'duration', read: (typeof results)[number]): ChartProps => ({
+    input: { ...charts[name], sql: plans[name].sql },
+    executed: plans[name],
+    result: read.ok ? shapeChart({ ...charts[name], sql: plans[name].sql }, read.value) : failed(read.problem)
+  });
+  const joined: Loaded<QueryResult> =
+    !totals.ok ? failed(totals.problem)
+    : !durations.ok ? failed(durations.problem)
+    : { state: 'populated', data: { ...totals.value, columns: [...totals.value.columns, ...durations.value.columns], rows: [[...totals.value.rows[0], ...durations.value.rows[0]]] } };
+  return { spans: chart('spans', spans), errors: chart('errors', errors), duration: chart('duration', duration), totals: joined };
+}
+
+/** Log levels by OTLP severity number: 17 and up error, 13 and up warn, 1 and up info, else unset. */
+const LEVEL = "CASE WHEN severity_number >= 17 THEN 'error' WHEN severity_number >= 13 THEN 'warn' WHEN severity_number >= 1 THEN 'info' ELSE 'unset' END";
+
+/** Records per bucket and level under the list's range, WHERE and predicate. */
+export function logTimelineQuery(input: { readonly where?: readonly Filter[] }, range: AbsoluteRange, bucket: string, predicate?: string): Executed {
+  const logs = SIGNALS.logs;
+  const binds = Binds.over(logs.time, range);
+  const bin = `date_bin(${binds.bind(bucket)}::interval, ${logs.time})`;
+  binds.where(input.where).predicate(predicate);
+  return {
+    sql: `SELECT ${bin} AS at, ${LEVEL} AS level, count(*) AS records FROM ${logs.table} WHERE ${binds.sql} GROUP BY ${bin}, ${LEVEL} ORDER BY at`,
+    params: binds.params
+  };
+}
+
+/** Load the Logs severity timeline; a refused predicate issues no read. */
+export async function loadLogTimeline(input: { readonly where?: readonly Filter[]; readonly where_sql?: string; readonly range?: Range }, context: LoadContext): Promise<ChartProps> {
+  const bucket = (range: AbsoluteRange) => bucketFor(range);
+  const chartInput = (sql: string, range?: AbsoluteRange): ChartInput => ({
+    type: 'timeseries',
+    title: `Records per ${range ? bucket(range) : 'bucket'}`,
+    sql,
+    x: 'at',
+    y: ['records'],
+    series: 'level'
+  });
+  const range = rangeOf(input.range, context);
+  if ('code' in range) return { input: chartInput('-'), result: { state: 'error', problem: range } };
+  const predicate = await predicateFor(SIGNALS.logs.table, input.where_sql, context);
+  if ('state' in predicate) return { input: chartInput('-', range), result: predicate };
+  const plan = logTimelineQuery(input, range, bucket(range), predicate.sql);
+  const [read] = await context.executor.run([query(plan.sql, plan.params)], context.signal);
+  const chart = chartInput(plan.sql, range);
+  return { input: chart, executed: plan, result: read.ok ? shapeChart(chart, read.value) : failed(read.problem) };
 }
 
 /** Span and error counts of exactly these traces, whatever their time. */

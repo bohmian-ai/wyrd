@@ -1,23 +1,35 @@
 import { fail, redirect } from '@sveltejs/kit';
-import { SIGNALS } from 'wyrd-ai-ui/loaders';
+import { SIGNALS, loadPanel, type Problem, type RecordDetailProps, type TraceWaterfallProps } from 'wyrd-ai-ui/loaders';
 import { nodeExecutor } from 'wyrd-ai-ui/node';
 import { reject } from '$lib/server/auth/session';
-import { closed, listSignal, readState, writeState } from '$lib/observe-host';
+import { DETAIL_PARAMS, closed, listSignal, readState, writeState } from '$lib/observe-host';
 import type { Actions, PageServerLoad } from './$types';
 
 /**
- * A selected metric's chart and summary embed the applied predicate, so the
- * server normalizes it as this session first; `null` marks it refused, and
- * the shared panels then report that refusal themselves.
+ * The open record as this tenant's browser session: the exact trace and its
+ * selected span, or the exact log record. Only the record's own params are
+ * read, so opening, switching or closing a record reloads nothing else. Each
+ * input passes its catalog schema; a malformed id is refused with no read.
  */
 export const load: PageServerLoad = async ({ locals, url, request }) => {
-  const state = readState(url.searchParams);
-  if (state.signal !== 'metrics' || !state.where_sql.trim() || !locals.browserSession) return { predicate: undefined };
-  const [result] = await nodeExecutor(locals.browserSession.client()).run(
-    [{ op: 'bifrost.validate_predicate', namespace: 'bifrost.metrics', name: 'points', expression: state.where_sql }],
-    request.signal
-  );
-  return { predicate: result.ok ? result.value.expression : null };
+  const [trace, span, log] = DETAIL_PARAMS.map((name) => url.searchParams.get(name));
+  if (!trace && !log) return {};
+  const session = locals.browserSession ?? reject('unauthenticated');
+  const context = { executor: nodeExecutor(session.client()), signal: request.signal };
+  if (log) {
+    let key: unknown = log;
+    try {
+      key = JSON.parse(log);
+    } catch {
+      // The catalog schema refuses the malformed key below.
+    }
+    return { record: (await loadPanel('RecordDetail', { log: key }, context)) as RecordDetailProps | Problem };
+  }
+  const [waterfall, record] = (await Promise.all([
+    loadPanel('TraceWaterfall', { traceId: trace, ...(span ? { spanId: span } : {}) }, context),
+    span ? loadPanel('RecordDetail', { traceId: trace, spanId: span }, context) : undefined
+  ])) as [TraceWaterfallProps | Problem, RecordDetailProps | Problem | undefined];
+  return { waterfall, record };
 };
 
 export const actions: Actions = {

@@ -1490,6 +1490,92 @@ test('TASK-004: Canonical signal interactions', async () => {
   expect(stroke()).toEqual(strokes);
   summarized.unmount();
 
+  // A recorded metric keeps every typed series apart: same instant, NULL versus 'not set', past twenty, never summed or folded.
+  const metricColumns = [
+    { name: 'at', data_type: 'Timestamp(Nanosecond, Some("UTC"))', nullable: false },
+    { name: 'metric_type', data_type: 'Utf8', nullable: false },
+    { name: 'attributes', data_type: 'Utf8', nullable: true },
+    { name: 'value', data_type: 'Float64', nullable: true }
+  ];
+  const identity = ['metric_type', 'attributes'];
+  const attributeSets = ['{"route":"not set"}', null, '{}', ...Array.from({ length: 21 }, (_, index) => `{"route":"/r${index}"}`)];
+  const recorded = {
+    columns: metricColumns,
+    rows: attributeSets.flatMap((attributes, index) => [
+      ['2026-10-20T10:00:00Z', 'gauge', attributes, index],
+      ['2026-10-20T11:00:00Z', 'gauge', attributes, index + 1]
+    ]),
+    terminal: { outcome: 'success', row_count: attributeSets.length * 2, warnings: [] }
+  };
+  const exactSummary = {
+    columns: [...metricColumns.slice(1, 3), { name: 'points', data_type: 'Int64', nullable: false }, ...['latest', 'max', 'mean'].map((name) => ({ name, data_type: 'Utf8', nullable: true }))],
+    rows: attributeSets.map((attributes, index) => ['gauge', attributes, 2, index === 0 ? '9007199254740993' : String(index + 1), index === 0 ? '9007199254740993' : String(index + 1), `${index}.5`]),
+    terminal: { outcome: 'success', row_count: attributeSets.length, warnings: [] }
+  };
+  const metricInput = { type: 'timeseries', title: 'm', sql: '-', x: 'at', y: ['value'] } as const;
+  let picked: ReadonlySet<string> | undefined;
+  const metricChart = render(Chart, {
+    input: metricInput,
+    result: { state: 'populated', data: recorded },
+    identity,
+    summary: { state: 'populated', data: exactSummary },
+    onseries: (next: ReadonlySet<string>) => (picked = next)
+  } as never);
+  const metricRows = () => [...metricChart.container.querySelectorAll('.legend tbody tr')].map((row) => [...row.querySelectorAll('th, td')].map((cell) => cell.textContent?.trim()));
+  expect(metricRows()).toHaveLength(24);
+  expect(metricRows().slice(0, 3)).toEqual([
+    ['', '{"route":"not set"}', '9007199254740993', '9007199254740993', '0.5'],
+    ['', '∅', '2', '2', '1.5'],
+    ['', '{}', '3', '3', '2.5']
+  ]);
+  expect(metricChart.container.textContent).not.toMatch(/\bother\b/);
+  expect(metricChart.getByText(/24 series · 20 shown · exact Latest, Max and Mean/)).toBeInTheDocument();
+  expect(metricChart.container.querySelectorAll('svg.plot polyline')).toHaveLength(20);
+  // The host owns the selection: a tick reports the next set, and the host's set is what draws.
+  await fireEvent.click(metricChart.getByRole('checkbox', { name: 'Show ∅' }));
+  const nullKey = JSON.stringify(['gauge', null]);
+  expect(picked?.has(nullKey)).toBe(false);
+  expect(picked?.size).toBe(19);
+  await metricChart.rerender({ shown: new Set([nullKey, JSON.stringify(['gauge', '{"route":"not set"}'])]) } as never);
+  expect(metricChart.container.querySelectorAll('svg.plot polyline')).toHaveLength(2);
+  expect(metricChart.getByRole('checkbox', { name: 'Show ∅' })).toBeChecked();
+  expect(metricChart.getByRole('checkbox', { name: 'Show {}' })).not.toBeChecked();
+  // A refused exact summary is said, never replaced by plotted doubles.
+  await metricChart.rerender({ summary: { state: 'denied', problem: denied } } as never);
+  expect(metricChart.getByText('Not authorized')).toBeInTheDocument();
+  expect(metricRows()[0].slice(2)).toEqual(['—', '—', '—']);
+  metricChart.unmount();
+
+  // A host that owns the list's columns is offered every column of the signal, and a toggle reports the next set.
+  let chosenColumns: readonly string[] | undefined;
+  const pointList = render(RecordTable, {
+    input: { signal: 'metrics', columns: ['metric_name', 'int_value'] },
+    result: {
+      state: 'populated',
+      data: {
+        rows: {
+          columns: [
+            { name: 'metric_name', data_type: 'Utf8', nullable: false },
+            { name: 'int_value', data_type: 'Utf8', nullable: true },
+            { name: 'time_unix_nano', data_type: 'Timestamp(Nanosecond, Some("UTC"))', nullable: false },
+            { name: 'wyrd_request_id', data_type: 'Utf8', nullable: false }
+          ],
+          rows: [['ui.requests', '9007199254740993', '2026-10-20T10:00:00Z', 'r,"1"']],
+          terminal: { outcome: 'success', row_count: 1, warnings: [] }
+        }
+      }
+    },
+    oncolumns: (next: readonly string[]) => (chosenColumns = next)
+  } as never);
+  await fireEvent.click(pointList.getByText('Columns'));
+  await fireEvent.click(pointList.getByRole('checkbox', { name: /positive/i }));
+  expect(chosenColumns).toEqual(['metric_name', 'int_value', 'positive_buckets']);
+  // CSV downloads the rows on screen with each cell as its exact returned text.
+  const csvLink = pointList.getByRole('link', { name: /CSV/ });
+  expect(csvLink).toHaveAttribute('download', 'metrics.csv');
+  expect(decodeURIComponent(csvLink.getAttribute('href')!.split(',').slice(1).join(','))).toBe('metric_name,int_value\r\nui.requests,9007199254740993');
+  pointList.unmount();
+
   // A view renders every Observe panel, and a live panel re-reads on its interval until the view leaves.
   vi.useFakeTimers({ toFake: ['setInterval', 'clearInterval'] });
   try {

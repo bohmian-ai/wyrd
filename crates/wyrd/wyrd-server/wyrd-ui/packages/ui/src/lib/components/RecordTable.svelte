@@ -12,10 +12,14 @@
   reader resumes, or while the host pauses it; it offers "↑ N new" instead of
   moving rows under the pointer. The footer states the returned extent and
   never a total it did not read. A log list pages through its returned rows.
+
+  Columns hides read columns; a host that passes `oncolumns` instead offers
+  every column the signal may show and reads the reader's choice again. CSV
+  saves the rows and columns on screen.
 -->
 <script lang="ts">
   import type { ActionProps, QueryResult } from '../contract.js';
-  import { KEY_COLUMNS, LIST_LIMIT, STATUS_NAMES, cellText, columnLabel, shownColumns, type RecordTableProps } from '../loaders.js';
+  import { KEY_COLUMNS, LIST_LIMIT, STATUS_NAMES, cellText, columnLabel, shownColumns, signalColumns, type RecordTableProps } from '../loaders.js';
   import { fmtCount } from '../format.js';
   import { columnIndex, numeric } from '../plot.js';
   import ActionButton from './ActionButton.svelte';
@@ -24,7 +28,15 @@
   import EmptyState from './EmptyState.svelte';
   import StatusPill, { type Tone } from './StatusPill.svelte';
 
-  let { input, executed, result, actions = {}, onaction, paused = false }: RecordTableProps & ActionProps & { paused?: boolean } = $props();
+  let {
+    input,
+    executed,
+    result,
+    actions = {},
+    onaction,
+    paused = false,
+    oncolumns
+  }: RecordTableProps & ActionProps & { paused?: boolean; oncolumns?: (columns: readonly string[]) => void } = $props();
 
   const TONES: Record<number, Tone> = { 0: 'neutral', 1: 'ok', 2: 'danger' };
   const NOUNS = { traces: 'traces', spans: 'spans', logs: 'records', metrics: 'points' } as const;
@@ -137,11 +149,28 @@
   function onscroll(event: Event) {
     reading = (event.currentTarget as HTMLElement).scrollTop > 0;
   }
+  /** The columns Columns offers: every column of the signal when the host reads the choice, else the read ones. */
+  const offeredColumns = $derived(oncolumns && signal ? signalColumns(signal) : columns);
+  const isShown = (column: string) => visible.includes(column);
   function toggle(column: string) {
+    if (oncolumns && signal) {
+      const next = offeredColumns.filter((each) => (each === column ? !isShown(each) : isShown(each)));
+      if (next.length) oncolumns(next);
+      return;
+    }
     const next = new Set(hidden);
     if (!next.delete(column)) next.add(column);
     hidden = next;
   }
+  /** The rows on screen as RFC 4180 CSV, cells as their exact returned text. */
+  const csv = $derived.by(() => {
+    if (!rows) return '';
+    const quote = (value: unknown) => {
+      const text = value === null || value === undefined ? '' : typeof value === 'object' ? JSON.stringify(value) : String(value);
+      return /[",\r\n]/.test(text) ? `"${text.replaceAll('"', '""')}"` : text;
+    };
+    return [visible.map(quote).join(','), ...rows.rows.map((row) => visible.map((column) => quote(row[columnIndex(rows, column)])).join(','))].join('\r\n');
+  });
 </script>
 
 {#if rows && rows.rows.length > 0}
@@ -161,7 +190,7 @@
       <p class="note" role="note">Span and error counts unavailable: {counts.problem.title} ({counts.problem.code})</p>
     {/if}
     <div class="frame">
-      {#if signal === 'logs'}
+      {#if signal}
         <div class="bar">
           <span>{fmtCount(rows.rows.length)} {noun} · newest first</span>
           <span class="tools">
@@ -170,11 +199,20 @@
               <summary>Columns</summary>
               <fieldset>
                 <legend>Shown columns</legend>
-                {#each columns as column (column)}
-                  <label title={column}><input type="checkbox" checked={!hidden.has(column)} onchange={() => toggle(column)} /> {heading(column)}</label>
+                {#each offeredColumns as column (column)}
+                  <label title={column}><input
+                      type="checkbox"
+                      checked={isShown(column)}
+                      onchange={(event) => {
+                        toggle(column);
+                        // The box shows what is listed; a host applies the choice by navigating.
+                        event.currentTarget.checked = isShown(column);
+                      }}
+                    /> {heading(column)}</label>
                 {/each}
               </fieldset>
             </details>
+            <a class="csv" href="data:text/csv;charset=utf-8,{encodeURIComponent(csv)}" download="{signal}.csv">CSV</a>
           </span>
         </div>
       {/if}
@@ -323,6 +361,7 @@
     gap: 6px;
   }
   .tools button,
+  .csv,
   summary {
     display: inline-flex;
     align-items: center;

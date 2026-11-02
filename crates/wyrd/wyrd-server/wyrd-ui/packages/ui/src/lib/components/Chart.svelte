@@ -5,17 +5,51 @@
   SQL and offers Open in Query with the executed binds. A timeseries lists its
   series with their latest, largest and mean plotted values; unticking a series
   hides its line, and the series keeps its style while hidden.
+
+  A host may key the series by typed `identity` columns instead: every
+  recorded point stays on its own series, nothing is summed or folded, and the
+  series table shows the exact `summary` rows under the same identity. Past
+  twenty series only the first twenty start shown, and the table says so. A
+  host that passes `shown` owns which series are drawn and hears each change
+  through `onseries`. `compact` draws a headline overview tile without the
+  table and footer; `bars` stacks a timeseries' series as bars, coloured by
+  `colors` when the host names a colour per caption.
 -->
 <script lang="ts">
   import type { ActionProps } from '../contract.js';
   import type { ChartProps } from '../loaders.js';
   import { fmtInstant, fmtNumber } from '../format.js';
-  import { barRows, columnIndex, numeric, timeSeries } from '../plot.js';
+  import type { Loaded, QueryResult } from '../contract.js';
+  import { MAX_SERIES, barRows, columnIndex, identityKey, numeric, recordedSeries, timeSeries } from '../plot.js';
   import ActionButton from './ActionButton.svelte';
   import EmptyState from './EmptyState.svelte';
   import StatusPill from './StatusPill.svelte';
 
-  let { input, executed, result, actions = {}, onaction }: ChartProps & ActionProps = $props();
+  let {
+    input,
+    executed,
+    result,
+    actions = {},
+    onaction,
+    identity,
+    summary: exact,
+    shown,
+    onseries,
+    compact = false,
+    headline,
+    bars: stacked = false,
+    colors = {}
+  }: ChartProps &
+    ActionProps & {
+      identity?: readonly string[];
+      summary?: Loaded<QueryResult>;
+      shown?: ReadonlySet<string>;
+      onseries?: (shown: ReadonlySet<string>) => void;
+      compact?: boolean;
+      headline?: string;
+      bars?: boolean;
+      colors?: Readonly<Record<string, string>>;
+    } = $props();
 
   /**
    * Rendered plot box. The plot draws in CSS pixels at the box's size, so text
@@ -25,7 +59,7 @@
   let boxWidth = $state(0);
   let boxHeight = $state(0);
   const W = $derived(boxWidth > 64 ? boxWidth : 560);
-  const H = $derived(Math.max(160, boxHeight));
+  const H = $derived(Math.max(compact ? 64 : 160, boxHeight));
   /** Tick labels sit above their gridline at the left; the gutter keeps the first points clear of them. */
   const PAD = { left: 32, right: 6, top: 16, bottom: 22 };
   const STROKES = ['var(--declare)', 'var(--observe)', 'var(--text)', 'var(--muted)'] as const;
@@ -36,31 +70,71 @@
    * five, so every one of the twenty series pairs a dash with a marker no other
    * series has, and series stay distinct without colour.
    */
-  const style = (index: number) => ({ stroke: STROKES[index % 4], marker: MARKERS[index % 4], dash: DASHES[index % 5] });
+  const style = (index: number, label?: string) => ({
+    stroke: (label !== undefined && colors[label]) || STROKES[index % 4],
+    marker: MARKERS[index % 4],
+    dash: DASHES[index % 5]
+  });
 
   const data = $derived(result.state === 'populated' || result.state === 'empty' ? result.data : undefined);
   const degraded = $derived(data?.terminal.outcome === 'degraded');
 
-  const lines = $derived(
-    data && input.type === 'timeseries' && result.state === 'populated' ? timeSeries(data, input.x, input.y, input.series) : []
+  /** Exact summary rows by series key, in the summary's order. */
+  const exactRows = $derived(
+    identity && exact?.state === 'populated' ? new Map(exact.data.rows.map((row) => [identityKey(exact.data, row, identity), row])) : undefined
   );
+  const lines = $derived.by(() => {
+    if (!data || input.type !== 'timeseries' || result.state !== 'populated') return [];
+    if (!identity) return timeSeries(data, input.x, input.y, input.series);
+    const recorded = recordedSeries(data, input.x, input.y[0], identity);
+    const order = exactRows ? [...exactRows.keys()] : [];
+    const at = (key: string) => (order.includes(key) ? order.indexOf(key) : order.length);
+    return recorded.sort((a, b) => at(a.key) - at(b.key));
+  });
   const xs = $derived([...new Set(lines.flatMap((line) => line.points.map((point) => point.x)))].sort((a, b) => a - b));
-  /** Series the reader unticked, by caption; captions are unique per result. */
-  let hidden = $state.raw<ReadonlySet<string>>(new Set());
-  const drawn = $derived(lines.filter((line) => !hidden.has(line.label)));
+  /** Series the reader chose to draw, by key, when the host does not own the choice; unset draws the first twenty. */
+  let chosen = $state.raw<ReadonlySet<string>>();
+  const visible = $derived(shown ?? chosen ?? new Set(lines.slice(0, MAX_SERIES).map((line) => line.key)));
+  const drawn = $derived(lines.filter((line) => visible.has(line.key)));
   /** Latest, largest and mean of the values a series plotted; it has at least one. */
   const summary = (points: readonly { y: number }[]) => ({
     latest: points[points.length - 1].y,
     max: Math.max(...points.map((point) => point.y)),
     mean: points.reduce((sum, point) => sum + point.y, 0) / points.length
   });
-  function toggle(label: string) {
-    const next = new Set(hidden);
-    if (!next.delete(label)) next.add(label);
-    hidden = next;
+  /** The exact Latest, Max and Mean text of a keyed series, when the host supplied them. */
+  const exactOf = (key: string) => {
+    const row = exactRows?.get(key);
+    if (!row || exact?.state !== 'populated') return undefined;
+    const cell = (name: string) => row[columnIndex(exact.data, name)];
+    return { latest: cell('latest'), max: cell('max'), mean: cell('mean') };
+  };
+  function choose(next: ReadonlySet<string>) {
+    if (onseries) onseries(next);
+    else chosen = next;
   }
+  function toggle(key: string) {
+    const next = new Set(visible);
+    if (!next.delete(key)) next.add(key);
+    choose(next);
+  }
+  /** Stacked bar geometry: per instant, each drawn series' segment from its running base. */
+  const columns = $derived.by(() => {
+    if (!stacked) return [];
+    const step = xs.length > 1 ? Math.min(...xs.slice(1).map((x, index) => x - xs[index])) : 0;
+    return xs.map((x) => {
+      let base = 0;
+      const segments = drawn.map((line) => {
+        const y = line.points.filter((point) => point.x === x).reduce((sum, point) => sum + point.y, 0);
+        const segment = { label: line.label, from: base, to: base + y, index: lines.indexOf(line) };
+        base += y;
+        return segment;
+      });
+      return { x, step, segments, total: base };
+    });
+  });
   const bounds = $derived.by(() => {
-    const ys = drawn.flatMap((line) => line.points.map((point) => point.y));
+    const ys = stacked ? columns.map((column) => column.total) : drawn.flatMap((line) => line.points.map((point) => point.y));
     const [low, high] = [Math.min(0, ...ys), Math.max(0, ...ys)];
     // Zero always shows; each signed side rounds outward, and an all-zero plot still spans one unit.
     const y0 = low < 0 ? -niceCeil(-low) : 0;
@@ -190,12 +264,14 @@
   const unitLabel = $derived(input.unit ? ` ${input.unit}` : '');
 </script>
 
-<section class="chart" aria-label={input.title ?? 'Chart'}>
+<section class="chart" class:compact aria-label={input.title ?? 'Chart'}>
   <header>
-    <h3>{input.title ?? 'Chart'}{#if input.unit}{' '}<span class="unit">· {input.unit}</span>{/if}</h3>
+    <h3>{input.title ?? 'Chart'}{#if input.unit && !compact}{' '}<span class="unit">· {input.unit}</span>{/if}</h3>
+    {#if headline}<span class="headline">{headline}</span>{/if}
     {#if degraded && data}
       <span title={data.terminal.warnings.join(', ')}><StatusPill tone="warn" label="Partial result" /></span>
     {/if}
+    {#if !compact}
     <span class="open">
       <ActionButton
         variant="link"
@@ -206,6 +282,7 @@
         onclick={() => executed && onaction?.({ name: 'chart.open_in_query', input: executed })}
       />
     </span>
+    {/if}
   </header>
 
   <div class="body" class:centered={input.type === 'stat' && result.state === 'populated'} >
@@ -247,9 +324,19 @@
             {#each xLabels as label (label.at)}
               <text class="axis" x={sx(label.at)} y={H - 4} text-anchor={label.anchor}>{label.text}</text>
             {/each}
-            {#each lines as line, index (line.label)}
-              {@const look = style(index)}
-              {#if !hidden.has(line.label)}
+            {#each columns as column (column.x)}
+              {@const width = Math.max(1, ((W - PAD.left - PAD.right) / Math.max(1, xs.length)) * 0.8)}
+              {#each column.segments as segment (segment.label)}
+                {#if segment.to > segment.from}
+                  <rect class="segment" x={Math.min(sx(column.x), W - PAD.right - width)} y={sy(segment.to)} {width} height={sy(segment.from) - sy(segment.to)} fill={style(segment.index, segment.label).stroke}>
+                    <title>{segment.label}: {fmtNumber(segment.to - segment.from)}{unitLabel}</title>
+                  </rect>
+                {/if}
+              {/each}
+            {/each}
+            {#each stacked ? [] : lines as line, index (line.key)}
+              {@const look = style(index, line.label)}
+              {#if visible.has(line.key)}
               <polyline
                 points={line.points.map((point) => `${sx(point.x)},${sy(point.y)}`).join(' ')}
                 stroke={look.stroke}
@@ -272,42 +359,60 @@
           {@const at = xs[focused]}
           <p class="tooltip" role="status">
             <time datetime={new Date(at).toISOString()}>{fmtInstant(at)}</time>
-            {#each drawn as line (line.label)}
+            {#each drawn as line (line.key)}
               {@const point = line.points.find((each) => each.x === at)}
               <span>{line.label}: {point ? `${fmtNumber(point.y)}${unitLabel}` : '—'}</span>
             {/each}
           </p>
         {/if}
+        {#if !compact}
         <div class="series">
           <p>
-            {lines.length} series{hidden.size ? ` · ${lines.length - hidden.size} shown` : ''}
-            {#if hidden.size}<button type="button" onclick={() => (hidden = new Set())}>Show all</button>{/if}
+            {lines.length} series{drawn.length < lines.length ? ` · ${drawn.length} shown` : ''}{identity ? ' · exact Latest, Max and Mean' : ''}
+            {#if drawn.length < lines.length}<button type="button" onclick={() => choose(new Set(lines.map((line) => line.key)))}>Show all</button>{/if}
           </p>
+          {#if identity && (exact?.state === 'denied' || exact?.state === 'error')}
+            <EmptyState state={exact.state} problem={exact.problem} />
+          {:else if identity && exact?.state === 'loading'}
+            <EmptyState state="loading" title="Reading the exact summary" />
+          {/if}
           <table class="legend">
             <thead>
               <tr><th scope="col"><span class="quiet">Shown</span></th><th scope="col">{input.series ?? 'series'}</th><th scope="col">Latest</th><th scope="col">Max</th><th scope="col">Mean</th></tr>
             </thead>
             <tbody>
-              {#each lines as line, index (line.label)}
-                {@const look = style(index)}
-                {@const values = summary(line.points)}
-                <tr class:off={hidden.has(line.label)}>
-                  <td><input type="checkbox" checked={!hidden.has(line.label)} aria-label="Show {line.label}" onchange={() => toggle(line.label)} /></td>
-                  <th scope="row">
+              {#each lines as line, index (line.key)}
+                {@const look = style(index, line.label)}
+                {@const values = exactOf(line.key)}
+                {@const plotted = summary(line.points)}
+                <tr class:off={!visible.has(line.key)}>
+                  <td><input type="checkbox" checked={visible.has(line.key)} aria-label="Show {line.label}" onchange={(event) => {
+                        toggle(line.key);
+                        // The box shows what is drawn; a host may not accept the change.
+                        event.currentTarget.checked = visible.has(line.key);
+                      }} /></td>
+                  <th scope="row" title={identity ? line.key : undefined}>
                     <svg viewBox="0 0 24 8" width="24" height="8" aria-hidden="true">
                       <line x1="0" x2="24" y1="4" y2="4" stroke={look.stroke} stroke-dasharray={look.dash} />
                       <path d={marker(look.marker, 12, 4)} fill={look.stroke} />
                     </svg>
                     {line.label}
                   </th>
-                  <td>{fmtNumber(values.latest)}</td>
-                  <td>{fmtNumber(values.max)}</td>
-                  <td>{fmtNumber(values.mean)}</td>
+                  {#if identity}
+                    <td>{values ? String(values.latest ?? '∅') : '—'}</td>
+                    <td>{values ? String(values.max ?? '∅') : '—'}</td>
+                    <td>{values ? String(values.mean ?? '∅') : '—'}</td>
+                  {:else}
+                    <td>{fmtNumber(plotted.latest)}</td>
+                    <td>{fmtNumber(plotted.max)}</td>
+                    <td>{fmtNumber(plotted.mean)}</td>
+                  {/if}
                 </tr>
               {/each}
             </tbody>
           </table>
         </div>
+        {/if}
       {:else if input.type === 'bar'}
         <div class="box" bind:clientWidth={boxWidth} bind:clientHeight={boxHeight}>
           <svg
@@ -351,10 +456,12 @@
     {/if}
   </div>
 
+  {#if !compact}
   <footer>
     <span>source</span>
     <code title={input.sql}>{input.sql}</code>
   </footer>
+  {/if}
 </section>
 
 <style>
@@ -386,6 +493,28 @@
   }
   .open {
     margin-left: auto;
+  }
+  .headline {
+    color: var(--text);
+    font: 12px var(--font-mono);
+    font-variant-numeric: tabular-nums;
+  }
+  .compact {
+    border: 0;
+    background: transparent;
+  }
+  .compact header {
+    border: 0;
+    padding: 0 0 4px;
+  }
+  .compact .body {
+    padding: 0;
+  }
+  .compact .box {
+    min-height: 64px;
+  }
+  .segment {
+    opacity: 0.85;
   }
   .body {
     display: flex;

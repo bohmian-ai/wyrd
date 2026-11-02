@@ -1,0 +1,691 @@
+<!--
+  Observe: the breadcrumb and signal tabs, the WHERE/zoom/range/Live toolbar,
+  and each signal's board composed from the shared components with the props
+  the server load returned. Every control navigates, so the investigation
+  survives reload, Back and a shared link; Live re-runs the same load.
+-->
+<script lang="ts">
+  import { enhance } from '$app/forms';
+  import { goto, invalidate } from '$app/navigation';
+  import { page } from '$app/state';
+  import { Chart, EmptyState, FacetRail, RecordTable, fmtDuration, fmtNumber, type ActionIntent, type ActionState, type Problem } from 'wyrd-ai-ui';
+  import { METRIC_AGGREGATIONS, SIGNALS, columnLabel, validateIntent, type ComponentName } from 'wyrd-ai-ui/loaders';
+  import TimePicker, { type PickedRange, type Zone } from '$lib/TimePicker.svelte';
+  import { PRESETS, appliedRange, closed, groupColumns, readState, selectedMetric, step, writeState, zoomed, type HostFilter, type ObserveState } from '$lib/observe-host';
+  import type { LayoutProps } from './$types';
+
+  let { data, children }: LayoutProps = $props();
+  const LABELS = { traces: 'Traces', logs: 'Logs', metrics: 'Metrics' } as const;
+  /** The signal tabs in the boards' order. */
+  const TABS = ['logs', 'metrics', 'traces'] as const;
+  /** How often Live re-runs the view's load. */
+  const LIVE_MS = 10_000;
+  const LEVELS = { info: 'var(--declare)', warn: 'var(--warn)', error: 'var(--danger)', unset: 'var(--muted)' } as const;
+  const PERCENTILES = ['p50', 'p90', 'p99'] as const;
+
+  const base = $derived(`/t/${encodeURIComponent(data.tenant.key)}`);
+  const current = $derived(readState(page.url.searchParams));
+  const observe = $derived(data.observe);
+  const view = $derived('problem' in observe ? undefined : observe);
+  const form = $derived(page.form as { draft?: string; problem?: Problem } | null);
+
+  /** The URL of `next`. */
+  const href = (next: ObserveState) => `${base}/observe?${writeState(next)}`;
+  const go = (next: ObserveState) => goto(href(next), { keepFocus: true, noScroll: true });
+  /** `next` on another signal: its own filters and choices start empty; range, zone and Live carry over. */
+  const onSignal = (signal: ObserveState['signal']): ObserveState => ({
+    ...closed(current),
+    signal,
+    where: [],
+    where_sql: '',
+    group: undefined,
+    columns: undefined,
+    agg: undefined,
+    by: undefined
+  });
+
+  /** Host-reported action states, by action name. */
+  let actions = $state<Record<string, ActionState>>({});
+  /** Each component's intents: validated against its catalog entry, then mapped to the next URL. */
+  function onaction(component: ComponentName) {
+    return (intent: ActionIntent) => {
+      const valid = validateIntent(component, intent);
+      if ('code' in valid) return void (actions[intent.name] = { state: 'error', problem: valid });
+      const next = step(current, valid, `${page.url.pathname}${page.url.search}`);
+      if ('unavailable' in next) return void (actions[valid.name] = { state: 'unavailable', reason: next.unavailable });
+      delete actions[valid.name];
+      if ('query' in next) return void goto(`${base}/query?${next.query}`);
+      void go(next.state);
+    };
+  }
+
+  $effect(() => {
+    if (!current.live) return;
+    const timer = setInterval(() => invalidate('wyrd:observe'), LIVE_MS);
+    return () => clearInterval(timer);
+  });
+
+  /** Zoom the applied range around its centre by `factor`: ½ zooms in, 2 out. */
+  function zoom(factor: number) {
+    if (!data.range) return;
+    const [from, to] = [Date.parse(data.range.from), Date.parse(data.range.to)];
+    const [centre, half] = [(from + to) / 2, ((to - from) * factor) / 2];
+    void go(zoomed(current, centre - half, centre + half));
+  }
+  const zoomedIn = $derived(current.from !== undefined);
+  const reset = () => go({ ...closed(current), from: undefined, to: undefined });
+  function apply(range: PickedRange, tz: Zone) {
+    void go({ ...closed(current), tz, ...('last' in range ? { last: range.last, from: undefined, to: undefined } : range) });
+  }
+
+  let whereInput = $state<HTMLInputElement>();
+  function slash(event: KeyboardEvent) {
+    const target = event.target as HTMLElement;
+    if (event.key !== '/' || target.closest('input, textarea, select, [contenteditable]')) return;
+    event.preventDefault();
+    whereInput?.focus();
+  }
+
+  /** The current with `column`'s clauses replaced by one `= value`, or removed when `value` is undefined. */
+  const only = (column: string, value?: HostFilter['value']): ObserveState => ({
+    ...closed(current),
+    where: [...current.where.filter((each) => each.column !== column), ...(value === undefined ? [] : [{ column, value }])]
+  });
+
+  // Traces.
+  let filtersOpen = $state(true);
+  const totals = $derived.by(() => {
+    const read = view?.overview?.totals;
+    if (read?.state !== 'populated' || !data.range) return undefined;
+    const row = read.data.rows[0];
+    const at = (name: string) => Number(row[read.data.columns.findIndex((column) => column.name === name)] ?? 0);
+    const traces = at('traces');
+    return {
+      spans: at('spans'),
+      traces,
+      errorTraces: at('error_traces'),
+      errorShare: traces ? (at('error_traces') / traces) * 100 : 0,
+      p95: Math.round(at('p95_ms')),
+      minutes: (Date.parse(data.range.to) - Date.parse(data.range.from)) / 60_000
+    };
+  });
+
+  // Metrics.
+  const metric = $derived(current.signal === 'metrics' ? selectedMetric(current) : undefined);
+  let find = $state('');
+  const metricRows = $derived.by(() => {
+    const read = view?.metrics;
+    if (read?.state !== 'populated') return [];
+    return read.data.rows.map(([name, type, unit]) => ({ name: String(name), type: String(type ?? ''), unit: unit ? String(unit) : '' }));
+  });
+  const metricRow = $derived(metricRows.find((row) => row.name === metric));
+  const facetValues = (column: string): readonly unknown[] => {
+    const read = view?.facets.result;
+    if (read?.state !== 'populated') return [];
+    return read.data.facets.find((facet) => facet.column === column)?.values.rows.map(([value]) => value) ?? [];
+  };
+  const appliedValue = (column: string) => {
+    const clause = current.where.find((each) => each.column === column && !each.not);
+    return clause ? JSON.stringify(clause.value) : '';
+  };
+  /** The reader's visible series, per metric view; absent shows the Chart's default. */
+  let picks = $state<Record<string, ReadonlySet<string>>>({});
+  const seriesKey = $derived(view?.series ? JSON.stringify(view.series.input) : '');
+  const byColumns = SIGNALS.metrics.filters.filter((column) => column !== 'metric_name');
+</script>
+
+<svelte:window onkeydown={slash} />
+<svelte:head><title>Observe · {LABELS[current.signal]} · {data.tenant.name} · Wyrd</title></svelte:head>
+
+<header class="top">
+  <p class="crumbs"><span>{data.tenant.name}</span> / <span>Observe</span> / <strong>{LABELS[current.signal]}</strong></p>
+  <nav class="tabs" aria-label="Signal">
+    <span aria-disabled="true" title="Overview is not available yet">Overview</span>
+    {#each TABS as signal (signal)}
+      <a href={href(onSignal(signal))} aria-current={current.signal === signal ? 'page' : undefined}>{LABELS[signal]}</a>
+    {/each}
+    <span aria-disabled="true" title="GenAI is not available yet">GenAI</span>
+  </nav>
+</header>
+
+<div class="board">
+  <div class="toolbar">
+    <form
+      class="where"
+      method="POST"
+      action="?/where{page.url.search ? `&${page.url.search.slice(1)}` : ''}"
+      use:enhance={() =>
+        async ({ update }) =>
+          update({ reset: false })}
+    >
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><circle cx="11" cy="11" r="7"></circle><path d="M20 20l-4-4"></path></svg>
+      <label for="where_sql">WHERE</label>
+      <input
+        bind:this={whereInput}
+        id="where_sql"
+        name="where_sql"
+        value={form?.draft ?? current.where_sql}
+        placeholder={current.signal === 'logs' ? "severity_number >= 13 AND body LIKE '%slow%'" : "service_name = 'support-desk'"}
+        aria-invalid={form?.problem ? 'true' : undefined}
+        aria-describedby={form?.problem ? 'where-problem' : undefined}
+        autocomplete="off"
+        spellcheck="false"
+      />
+      <kbd aria-hidden="true">/</kbd>
+    </form>
+    <span class="group" role="group" aria-label="Zoom">
+      <button type="button" class="icon" aria-label="Zoom out" disabled={!data.range} onclick={() => zoom(2)}>−</button>
+      <button type="button" class="icon" aria-label="Zoom in" disabled={!data.range} onclick={() => zoom(0.5)}>+</button>
+    </span>
+    <button type="button" class="icon" aria-label="Reset zoom" disabled={!zoomedIn} onclick={reset}>
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><path d="M3 12a9 9 0 1 0 3-6.7L3 8M3 3v5h5"></path></svg>
+    </button>
+    <TimePicker range={appliedRange(current)} zone={current.tz} presets={PRESETS} onapply={apply} />
+    <button type="button" class="live" aria-pressed={current.live} onclick={() => go({ ...closed(current), live: !current.live })}>
+      <span class="dot" aria-hidden="true"></span>Live
+    </button>
+  </div>
+  {#if form?.problem}
+    <p id="where-problem" class="draft" role="alert">Not applied: {form.problem.detail ?? form.problem.title} <code>{form.problem.code}</code></p>
+  {/if}
+  {#if current.where.length}
+    <ul class="chips" aria-label="Applied filters">
+      {#each current.where as clause, index (index)}
+        <li>
+          <code>{clause.column} {clause.not ? '≠' : '='} {JSON.stringify(clause.value)}</code>
+          <a aria-label="Remove {clause.column}" href={href({ ...closed(current), where: current.where.filter((_, at) => at !== index) })}>✕</a>
+        </li>
+      {/each}
+    </ul>
+  {/if}
+
+  {#if 'problem' in observe}
+    <EmptyState state="error" problem={observe.problem} />
+  {:else if current.signal === 'traces'}
+    {#if observe.overview}
+      {@const overview = observe.overview}
+      <section class="panel overview" aria-label="Overview">
+        <header>
+          <p class="h">Drag across any chart to zoom all three</p>
+          {#if zoomedIn && data.range}
+            <button type="button" class="badge" onclick={reset} aria-label="Reset zoom">Zoomed {data.range.from.slice(11, 19)} – {data.range.to.slice(11, 19)} ✕</button>
+          {/if}
+        </header>
+        <div class="trio">
+          <Chart
+            {...overview.spans}
+            compact
+            bars
+            headline={totals ? `${fmtNumber(totals.spans / totals.minutes)} / min · ${fmtNumber(totals.traces)} traces` : undefined}
+            {actions}
+            onaction={onaction('Chart')}
+          />
+          <Chart
+            {...overview.errors}
+            compact
+            bars
+            colors={{ errors: 'var(--danger)' }}
+            headline={totals ? `${fmtNumber(totals.errorTraces)} · ${fmtNumber(totals.errorShare)}% of traces` : undefined}
+            {actions}
+            onaction={onaction('Chart')}
+          />
+          <Chart {...overview.duration} compact headline={totals ? `p95 ${fmtDuration(totals.p95)}` : undefined} {actions} onaction={onaction('Chart')} />
+        </div>
+      </section>
+    {/if}
+    <div class="listbar">
+      <span class="segmented" role="group" aria-label="Rows">
+        <a href={href({ ...closed(current), mode: 'traces', group: undefined, columns: undefined })} aria-current={current.mode === 'traces' ? 'true' : undefined}>Traces</a>
+        <a href={href({ ...closed(current), mode: 'spans', group: undefined, columns: undefined })} aria-current={current.mode === 'spans' ? 'true' : undefined}>Spans</a>
+      </span>
+      <button type="button" class="filters" aria-expanded={filtersOpen} aria-controls="facets" onclick={() => (filtersOpen = !filtersOpen)}>
+        Filters{current.where.length ? ` · ${current.where.length}` : ''}
+      </button>
+      {#if totals}
+        <span class="counts">{fmtNumber(totals.traces)} traces · <span class:bad={totals.errorShare > 0}>{fmtNumber(totals.errorShare)}% error</span> · p95 {fmtDuration(totals.p95)}</span>
+      {/if}
+      {@render grouping()}
+    </div>
+    <div class="split" class:folded={!filtersOpen}>
+      {#if filtersOpen}<div id="facets"><FacetRail {...observe.facets} {actions} onaction={onaction('FacetRail')} /></div>{/if}
+      <RecordTable {...observe.list} {actions} onaction={onaction('RecordTable')} oncolumns={(columns) => go({ ...closed(current), columns })} />
+    </div>
+    {@render children()}
+  {:else if current.signal === 'logs'}
+    {#if observe.timeline}
+      <section class="panel" aria-label="Timeline">
+        <Chart {...observe.timeline} bars colors={LEVELS} {actions} onaction={onaction('Chart')} />
+      </section>
+    {/if}
+    <div class="listbar">{@render grouping()}</div>
+    <div class="split">
+      <FacetRail {...observe.facets} {actions} onaction={onaction('FacetRail')} />
+      <RecordTable {...observe.list} {actions} onaction={onaction('RecordTable')} oncolumns={(columns) => go({ ...closed(current), columns })} />
+    </div>
+    {@render children()}
+  {:else}
+    <div class="metrics">
+      <aside class="panel rail" aria-label="Metrics">
+        <input class="find" type="search" bind:value={find} placeholder="find a metric…" aria-label="Find a metric" />
+        {#each [['service_name', 'Service'], ['subject_card_uid', 'Card']] as const as [column, label] (column)}
+          <label class="h">
+            {label}
+            <select value={appliedValue(column)} onchange={(event) => go(only(column, event.currentTarget.value ? JSON.parse(event.currentTarget.value) : undefined))}>
+              <option value="">any</option>
+              {#each facetValues(column) as value (JSON.stringify(value))}
+                <option value={JSON.stringify(value)}>{value === null ? 'not set' : String(value)}</option>
+              {/each}
+            </select>
+          </label>
+        {/each}
+        {#if view?.metrics && view.metrics.state !== 'populated'}
+          <EmptyState state={view.metrics.state} problem={'problem' in view.metrics ? view.metrics.problem : undefined} detail={'reason' in view.metrics ? view.metrics.reason : undefined} />
+        {:else}
+          <ul aria-label="Metric names">
+            {#each metricRows.filter((row) => row.name.toLowerCase().includes(find.trim().toLowerCase())) as row (`${row.name} ${row.type} ${row.unit}`)}
+              <li>
+                <a href={href({ ...only('metric_name', row.name), agg: undefined, by: undefined })} aria-current={row.name === metric ? 'true' : undefined}>
+                  <span>{row.name}</span><span class="type">{row.type}{row.unit ? ` · ${row.unit}` : ''}</span>
+                </a>
+              </li>
+            {/each}
+          </ul>
+        {/if}
+      </aside>
+      <div class="main">
+        {#if view?.series}
+          {@const series = view.series}
+          <section class="panel">
+            <header class="metric">
+              <div>
+                <h2>{metric}</h2>
+                <p class="type">{metricRow ? `${metricRow.type}${metricRow.unit ? ` · ${metricRow.unit}` : ''}` : ''}</p>
+              </div>
+              <span class="segmented" role="group" aria-label="Calculation">
+                <a href={href({ ...closed(current), agg: undefined, by: undefined })} aria-current={current.agg === undefined ? 'true' : undefined}>each series</a>
+                {#each METRIC_AGGREGATIONS as aggregation (aggregation)}
+                  <a href={href({ ...closed(current), agg: aggregation })} aria-current={current.agg === aggregation ? 'true' : undefined}>{aggregation}</a>
+                {/each}
+                {#each PERCENTILES as percentile (percentile)}
+                  <span aria-disabled="true" title="Percentiles of recorded points are not available">{percentile}</span>
+                {/each}
+              </span>
+              <label class="by">
+                by
+                <select
+                  value={current.by ?? ''}
+                  disabled={!current.agg}
+                  title={current.agg ? undefined : 'Choose an aggregation to group by'}
+                  onchange={(event) => go({ ...closed(current), by: event.currentTarget.value || undefined })}
+                >
+                  <option value="">all series</option>
+                  {#each byColumns as column (column)}<option value={column}>{columnLabel(column)}</option>{/each}
+                </select>
+              </label>
+            </header>
+            <Chart
+              {...series.chart}
+              identity={series.identity}
+              summary={series.summary}
+              shown={picks[seriesKey]}
+              onseries={(shown) => (picks[seriesKey] = shown)}
+              {actions}
+              onaction={onaction('Chart')}
+            />
+          </section>
+        {:else}
+          <EmptyState state="empty" title="Choose a metric" detail="Pick a metric on the left to plot its recorded series." />
+        {/if}
+        <RecordTable {...observe.list} {actions} onaction={onaction('RecordTable')} oncolumns={(columns) => go({ ...closed(current), columns })} />
+      </div>
+    </div>
+  {/if}
+</div>
+
+{#snippet grouping()}
+  <label class="by">
+    Group by
+    <select value={current.group ?? ''} onchange={(event) => go({ ...closed(current), group: event.currentTarget.value || undefined })}>
+      <option value="">none</option>
+      {#each groupColumns(current) as column (column)}<option value={column}>{columnLabel(column)}</option>{/each}
+    </select>
+  </label>
+{/snippet}
+
+<style>
+  .top {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 8px 48px;
+    min-height: 58px;
+    box-sizing: border-box;
+    padding: 0 24px;
+    border-bottom: 1px solid var(--border);
+  }
+  .crumbs {
+    margin: 0;
+    color: var(--muted);
+    font: 13px var(--font-mono);
+  }
+  .crumbs strong {
+    color: var(--text);
+    font-weight: var(--weight-strong);
+  }
+  .tabs {
+    display: flex;
+    flex-wrap: wrap;
+    align-self: stretch;
+  }
+  .tabs a,
+  .tabs span {
+    display: flex;
+    align-items: center;
+    padding: 0 14px;
+    color: var(--muted);
+    font: 13px var(--font-mono);
+    text-decoration: none;
+  }
+  .tabs a[aria-current='page'] {
+    box-shadow: inset 0 -2px 0 var(--declare);
+    color: var(--text);
+  }
+  [aria-disabled='true'] {
+    cursor: not-allowed;
+    opacity: 0.5;
+  }
+  .board {
+    display: flex;
+    flex-direction: column;
+    gap: 16px;
+    padding: 16px 24px 24px;
+  }
+  .toolbar {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 8px;
+  }
+  .where {
+    display: flex;
+    flex: 1 1 360px;
+    align-items: center;
+    gap: 10px;
+    height: 34px;
+    box-sizing: border-box;
+    padding: 0 10px;
+    border: 1px solid var(--declare);
+    border-radius: var(--r);
+    background: var(--surface);
+    color: var(--muted);
+    font: 12px var(--font-mono);
+  }
+  .where input {
+    flex: 1;
+    min-width: 0;
+    border: 0;
+    background: transparent;
+    color: var(--text);
+    font: 12px var(--font-mono);
+    outline: none;
+  }
+  .where:focus-within {
+    box-shadow: 0 0 0 2px var(--declare-soft);
+  }
+  kbd {
+    padding: 0 5px;
+    border: 1px solid var(--border);
+    border-radius: var(--r);
+    font: 11px var(--font-mono);
+  }
+  .group {
+    display: inline-flex;
+  }
+  .group .icon + .icon {
+    margin-left: -1px;
+  }
+  .icon,
+  .live,
+  .filters,
+  .badge {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    gap: 6px;
+    min-width: 34px;
+    height: 34px;
+    box-sizing: border-box;
+    padding: 0 10px;
+    border: 1px solid var(--border);
+    border-radius: var(--r);
+    background: var(--surface);
+    color: var(--text);
+    font: 13px var(--font-sans);
+    text-decoration: none;
+    cursor: pointer;
+  }
+  .icon:disabled {
+    color: var(--muted);
+    cursor: not-allowed;
+  }
+  .dot {
+    width: 8px;
+    height: 8px;
+    border: 1px solid var(--muted);
+    border-radius: 50%;
+  }
+  .live[aria-pressed='true'] .dot {
+    border-color: var(--ok);
+    background: var(--ok);
+  }
+  .draft {
+    margin: -8px 0 0;
+    color: var(--danger);
+    font: 12px var(--font-sans);
+  }
+  .chips {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 6px;
+    margin: -8px 0 0;
+    padding: 0;
+    list-style: none;
+  }
+  .chips li {
+    display: flex;
+    gap: 6px;
+    padding: 2px 8px;
+    border: 1px solid var(--border);
+    border-radius: var(--r);
+    font: 12px var(--font-mono);
+  }
+  .chips a {
+    color: var(--muted);
+    text-decoration: none;
+  }
+  .panel {
+    border: 1px solid var(--border);
+    border-radius: var(--r);
+    background: var(--surface);
+  }
+  .overview {
+    padding: 12px 14px;
+  }
+  .overview header {
+    display: flex;
+    flex-wrap: wrap;
+    justify-content: space-between;
+    gap: 8px;
+  }
+  .h {
+    margin: 0;
+    color: var(--muted);
+    font: 11px var(--font-mono);
+    letter-spacing: 0.06em;
+    text-transform: uppercase;
+  }
+  .badge {
+    height: 22px;
+    border-color: var(--declare);
+    background: var(--declare-soft);
+    font: 11px var(--font-mono);
+  }
+  .trio {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(240px, 1fr));
+    gap: 16px;
+  }
+  .listbar {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 8px 12px;
+    font: 13px var(--font-mono);
+  }
+  .segmented {
+    display: inline-flex;
+  }
+  .segmented a,
+  .segmented span {
+    display: inline-flex;
+    align-items: center;
+    height: 30px;
+    padding: 0 12px;
+    border: 1px solid var(--border);
+    color: var(--muted);
+    font: 12px var(--font-mono);
+    text-decoration: none;
+  }
+  .segmented > * + * {
+    margin-left: -1px;
+  }
+  .segmented [aria-current='true'] {
+    position: relative;
+    border-color: var(--declare);
+    background: var(--declare-soft);
+    color: var(--text);
+  }
+  .filters[aria-expanded='true'] {
+    border-color: var(--declare);
+    background: var(--declare-soft);
+  }
+  .counts {
+    color: var(--muted);
+  }
+  .bad {
+    color: var(--danger);
+  }
+  .by {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    margin-left: auto;
+    color: var(--muted);
+    font: 12px var(--font-mono);
+  }
+  select {
+    height: 30px;
+    border: 1px solid var(--border);
+    border-radius: var(--r);
+    background: var(--bg);
+    color: var(--text);
+    font: 12px var(--font-mono);
+  }
+  .split {
+    display: grid;
+    grid-template-columns: 220px minmax(0, 1fr);
+    gap: 16px;
+    align-items: start;
+  }
+  .split.folded {
+    grid-template-columns: minmax(0, 1fr);
+  }
+  .metrics {
+    display: grid;
+    grid-template-columns: 240px minmax(0, 1fr);
+    gap: 16px;
+    align-items: start;
+  }
+  .rail {
+    display: flex;
+    flex-direction: column;
+    gap: 10px;
+    padding: 10px;
+  }
+  .rail label {
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+  }
+  .find {
+    height: 30px;
+    box-sizing: border-box;
+    padding: 0 8px;
+    border: 1px solid var(--border);
+    background: var(--bg);
+    color: var(--text);
+    font: 12px var(--font-mono);
+  }
+  .rail ul {
+    margin: 0 -10px -10px;
+    padding: 0;
+    border-top: 1px solid var(--border);
+    list-style: none;
+  }
+  .rail li a {
+    display: flex;
+    justify-content: space-between;
+    gap: 8px;
+    padding: 8px 12px;
+    color: var(--text);
+    font: 12px var(--font-mono);
+    text-decoration: none;
+  }
+  .rail li a:hover {
+    background: var(--surface-hover);
+  }
+  .rail li a[aria-current='true'] {
+    background: var(--declare-soft);
+    box-shadow: inset 2px 0 0 var(--declare);
+  }
+  .type {
+    margin: 0;
+    color: var(--muted);
+    font: 11px var(--font-mono);
+  }
+  .main {
+    display: flex;
+    flex-direction: column;
+    gap: 16px;
+    min-width: 0;
+  }
+  .metric {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 8px 12px;
+    padding: 12px 14px;
+    border-bottom: 1px solid var(--border);
+  }
+  .metric > div {
+    margin-right: auto;
+  }
+  .metric h2 {
+    margin: 0;
+    font: 14px var(--font-mono);
+  }
+  .metric .by {
+    margin-left: 0;
+  }
+  @media (max-width: 899px) {
+    .split,
+    .metrics {
+      grid-template-columns: minmax(0, 1fr);
+    }
+  }
+  @media (max-width: 767px) {
+    .top,
+    .board {
+      padding-inline: 16px;
+    }
+  }
+</style>

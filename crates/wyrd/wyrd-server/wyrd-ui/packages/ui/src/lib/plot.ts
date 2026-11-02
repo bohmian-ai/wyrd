@@ -5,8 +5,9 @@
 import type { QueryResult } from './contract.js';
 import { parseInstant } from './format.js';
 
-/** One plotted series. */
+/** One plotted series. `key` identifies it across reads; `label` only captions it. */
 export interface Series {
+  readonly key: string;
   readonly label: string;
   readonly points: readonly { readonly x: number; readonly y: number }[];
 }
@@ -62,8 +63,45 @@ export function timeSeries(result: QueryResult, x: string, ys: readonly string[]
   // An authored series may already be called "other"; the aggregate's caption must still name only itself.
   if (other) plotted.push([labels.includes('other') ? 'other (aggregate)' : 'other', other]);
   return plotted.map(([label, points]) => ({
+    key: label,
     label,
     points: [...points].sort(([a], [b]) => a - b).map(([x, y]) => ({ x, y }))
+  }));
+}
+
+/** The typed identity of a row: the JSON of its `identity` cells, so null never meets the text "null" or "not set". */
+export function identityKey(result: QueryResult, row: readonly unknown[], identity: readonly string[]): string {
+  return JSON.stringify(identity.map((name) => row[columnIndex(result, name)] ?? null));
+}
+
+/**
+ * Build one series per typed identity, in first-seen order, with every
+ * recorded point kept: no instant is summed and no series is folded. Each
+ * caption names only the identity cells that differ between series (`∅` for
+ * null); a single series is captioned by all its non-null cells.
+ */
+export function recordedSeries(result: QueryResult, x: string, y: string, identity: readonly string[]): Series[] {
+  const [xi, yi] = [columnIndex(result, x), columnIndex(result, y)];
+  const lines = new Map<string, { cells: unknown[]; points: { x: number; y: number }[] }>();
+  for (const row of result.rows) {
+    const at = parseInstant(row[xi]);
+    if (row[yi] === null || Number.isNaN(at)) continue;
+    const key = identityKey(result, row, identity);
+    const line = lines.get(key) ?? { cells: identity.map((name) => row[columnIndex(result, name)] ?? null), points: [] };
+    line.points.push({ x: at, y: numeric(row[yi]) });
+    lines.set(key, line);
+  }
+  const entries = [...lines];
+  const varies = identity.map((_, index) => new Set(entries.map(([, { cells }]) => JSON.stringify(cells[index]))).size > 1);
+  const text = (cell: unknown) => (cell === null ? '∅' : String(cell));
+  const labels = entries.map(([, { cells }]) =>
+    (entries.length > 1 ? cells.filter((_, index) => varies[index]) : cells.filter((cell) => cell !== null)).map(text).join(' · ')
+  );
+  return entries.map(([key, { points }], index) => ({
+    key,
+    // Two captions that read alike fall back to the identity's JSON spelling.
+    label: labels.indexOf(labels[index]) === labels.lastIndexOf(labels[index]) ? labels[index] : key,
+    points: points.sort((a, b) => a.x - b.x)
   }));
 }
 

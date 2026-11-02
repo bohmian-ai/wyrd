@@ -4,15 +4,15 @@ import {
   loadRecordTable,
   loadStatStrip,
   listQuery,
-  metricPanels,
+  metricQueries,
   validatePanel,
   wyrdProblem,
   type Executor,
   type WireRequest,
   type WireResult
 } from 'wyrd-ai-ui/loaders';
-import { validateView } from 'wyrd-ai-ui/view';
-import { closed, detailView, groupColumns, observeView, readState, selectedMetric, step, writeState } from './observe-host';
+import { presetLabel, rangeLabel, readInstant } from './TimePicker.svelte';
+import { DETAIL_PARAMS, closed, groupColumns, listInputs, listParams, readState, selectedMetric, step, writeState, zoomed } from './observe-host';
 
 const RANGE = { from: '2026-10-20T00:00:00Z', to: '2026-10-21T00:00:00Z' };
 const EMPTY = { columns: [], rows: [], terminal: { outcome: 'success', row_count: 0, warnings: [] } };
@@ -102,82 +102,109 @@ test('observe signal planning and interactions', async () => {
     detail: 'StatStrip input.where_sql: span predicates do not apply to gateway tokens, calls or cost'
   });
 
-  // The host keeps the whole investigation in the URL and plans valid views from it.
+  // The host keeps the whole investigation in the URL and plans valid shared loader inputs from it.
   const shared = new URLSearchParams({
     signal: 'logs',
     last: '6h',
+    tz: 'local',
     where: JSON.stringify([{ column: 'service_name', value: 'support-desk' }]),
     where_sql: 'severity_number >= 17',
     group: 'severity_text',
+    columns: JSON.stringify(['body_text', 'severity_text']),
     live: '1'
   });
   const state = readState(shared);
   expect(readState(writeState(state))).toEqual(state);
-  expect(readState(new URLSearchParams())).toMatchObject({ signal: 'traces', mode: 'traces', last: '1h', where: [], where_sql: '', live: false });
-  expect(readState(new URLSearchParams({ signal: 'nope', where: '{bad' }))).toMatchObject({ signal: 'traces', where: [] });
-  const main = observeView(state);
-  expect(validateView(main)).not.toHaveProperty('code');
-  for (const panel of main.panels) expect(validatePanel(panel.component, panel.input)).not.toHaveProperty('code');
-  expect(main.panels.map((panel) => panel.component)).toEqual(['StatStrip', 'FacetRail', 'RecordTable']);
-  expect(main.panels[2].input).toEqual({
+  expect(readState(new URLSearchParams())).toMatchObject({ signal: 'traces', mode: 'traces', last: '1h', tz: 'utc', where: [], where_sql: '', live: false });
+  expect(readState(new URLSearchParams({ signal: 'nope', where: '{bad', columns: '[1]', by: 'unit' }))).toMatchObject({ signal: 'traces', where: [], columns: undefined, by: undefined });
+  // An absolute range needs both bounds; it applies over the preset, which a reset returns to.
+  expect(readState(new URLSearchParams({ from: RANGE.from }))).toMatchObject({ from: undefined, to: undefined });
+  const inputs = listInputs(state);
+  for (const [component, input] of [['FacetRail', inputs.facets], ['RecordTable', inputs.list]] as const)
+    expect(validatePanel(component, input)).not.toHaveProperty('code');
+  expect(inputs.list).toEqual({
     signal: 'logs',
     where: [{ column: 'service_name', value: 'support-desk' }],
     where_sql: 'severity_number >= 17',
+    columns: ['body_text', 'severity_text'],
     groupBy: 'severity_text',
     live: true
   });
-  const spanView = observeView(readState(new URLSearchParams({ mode: 'spans' })));
-  expect(spanView.panels.map((panel) => [panel.component, (panel.input as { signal?: string }).signal])).toEqual([
-    ['StatStrip', undefined],
-    ['FacetRail', 'spans'],
-    ['RecordTable', 'spans']
-  ]);
-  expect(spanView.range).toEqual({ last: '1h' });
+  expect(inputs.facets).toMatchObject({ signal: 'logs', where_sql: 'severity_number >= 17' });
+  expect(inputs.series).toBeUndefined();
+  // A column the signal does not have is dropped; grouping by an unshown column also reads it.
+  expect(listInputs({ ...state, columns: ['nope'], group: 'event_name' }).list).toMatchObject({ columns: expect.arrayContaining(['event_name']), groupBy: 'event_name' });
+  expect(listInputs(readState(new URLSearchParams({ mode: 'spans' }))).list).toEqual({ signal: 'spans', where: [] });
 
-  // Intents become URL steps: filters dedupe, records open in the drawer, queries open in Query.
+  // The time picker reads now, now-2h, yesterday and ISO times in the chosen zone, and refuses anything else.
+  const now = Date.parse('2026-10-20T12:30:00Z');
+  expect(readInstant('now', 'utc', now)).toBe(now);
+  expect(readInstant('now-2h', 'utc', now)).toBe(now - 7_200_000);
+  expect(readInstant('yesterday', 'utc', now)).toBe(Date.parse('2026-10-19T00:00:00Z'));
+  expect(readInstant('2026-10-13 19:02:10', 'utc', now)).toBe(Date.parse('2026-10-13T19:02:10Z'));
+  expect(readInstant('2026-10-13T19:02:10+02:00', 'local', now)).toBe(Date.parse('2026-10-13T17:02:10Z'));
+  expect(readInstant('2026-10-13 19:02', 'local', now)).toBe(new Date(2026, 9, 13, 19, 2).getTime());
+  for (const bad of ['', 'later', 'now+1h', '2026-13-45']) expect(readInstant(bad, 'utc', now)).toBeUndefined();
+  expect(presetLabel('1h')).toBe('Last 1 hour');
+  expect(presetLabel('30d')).toBe('Last 30 days');
+  expect(rangeLabel({ from: '2026-10-13T19:02:10Z', to: '2026-10-13T19:14:40Z' }, 'utc')).toBe('19:02:10 → 19:14:40');
+
+  // The list load never reads the open record's params, so opening one reloads nothing else.
+  const withRecord = new URLSearchParams(writeState({ ...state, trace: 'a'.repeat(32), span: 'b'.repeat(16) }));
+  const listOnly = listParams(withRecord);
+  for (const name of DETAIL_PARAMS) expect(listOnly.get(name)).toBeNull();
+  expect(readState(listOnly)).toEqual(closed(readState(withRecord)));
+
+  // Intents become URL steps: filters dedupe, a brush zooms every panel, records open, queries open in Query.
   const traces = readState(new URLSearchParams());
   const facet = { name: 'facet.filter', input: { signal: 'traces', column: 'service_name', value: 'api' } };
   const filtered = step((step(traces, facet, '/') as { state: ReturnType<typeof readState> }).state, facet, '/') as { state: ReturnType<typeof readState> };
   expect(filtered.state.where).toEqual([{ column: 'service_name', value: 'api' }]);
   const excluded = step(traces, { name: 'record.filter', input: { signal: 'traces', column: 'kind', value: 2, not: true } }, '/');
   expect('state' in excluded && excluded.state.where).toEqual([{ column: 'kind', value: 2, not: true }]);
+  const brushed = step({ ...traces, last: '6h' }, { name: 'chart.range', input: { from: '2026-10-20T01:00:00.000Z', to: '2026-10-20T02:00:00.000Z' } }, '/');
+  expect('state' in brushed && brushed.state).toMatchObject({ last: '6h', from: '2026-10-20T01:00:00.000Z', to: '2026-10-20T02:00:00.000Z' });
+  expect(readState(writeState((brushed as { state: ReturnType<typeof readState> }).state))).toEqual((brushed as { state: ReturnType<typeof readState> }).state);
+  expect(zoomed(traces, Date.parse(RANGE.from), Date.parse(RANGE.to))).toMatchObject({ from: '2026-10-20T00:00:00.000Z', to: '2026-10-21T00:00:00.000Z' });
   const trace = 'a'.repeat(32);
   const opened = step(traces, { name: 'record.open', input: { trace_id: trace, span_id: 'b'.repeat(16) } }, '/') as { state: ReturnType<typeof readState> };
-  expect(detailView(opened.state)?.panels.map((panel) => panel.component)).toEqual(['TraceWaterfall', 'RecordDetail']);
-  // Opening a record never changes the list's view, so the list is not reloaded.
-  expect(observeView(closed(opened.state))).toEqual(observeView(traces));
-  expect(detailView(traces)).toBeUndefined();
+  expect(opened.state).toMatchObject({ trace, span: 'b'.repeat(16) });
+  expect(closed(opened.state)).toEqual(traces);
   const fromLogs = step(state, { name: 'record.open', input: { trace_id: trace } }, '/') as { state: ReturnType<typeof readState> };
-  expect(fromLogs.state).toMatchObject({ signal: 'traces', trace, where: [], where_sql: '' });
+  expect(fromLogs.state).toMatchObject({ signal: 'traces', trace, where: [], where_sql: '', columns: undefined, last: '6h', tz: 'local' });
   const log = { time_unix_nano: '1', observed_time_unix_nano: '2', wyrd_request_id: 'r' };
   const record = step(state, { name: 'record.open', input: { log } }, '/') as { state: ReturnType<typeof readState> };
-  expect(detailView(record.state)?.panels).toEqual([{ id: 'detail', component: 'RecordDetail', input: { log } }]);
   expect(readState(writeState(record.state)).log).toEqual(log);
   const inspect = step(traces, { name: 'record.open_in_query', input: { sql: 'SELECT $1', params: ['x'] } }, '/t/acme/observe?live=1');
   expect('query' in inspect && Object.fromEntries(inspect.query)).toEqual({ sql: 'SELECT $1', params: '["x"]', back: '/t/acme/observe?live=1' });
   expect(step(traces, { name: 'record.logs', input: {} }, '/')).toHaveProperty('unavailable');
 
-  // Metric points list integers as exact decimal text; doubles and structures keep their recorded columns.
-  expect(listQuery({ signal: 'metrics', columns: ['metric_name', 'int_value', 'double_value', 'histogram_count', 'bucket_counts'] }, RANGE).sql).toMatch(
-    /^SELECT metric_name, CAST\(int_value AS VARCHAR\) AS int_value, double_value, CAST\(histogram_count AS VARCHAR\) AS histogram_count, bucket_counts FROM/
-  );
-  // A selected metric charts one line per recorded meaning and summarizes it exactly; values are escaped literals.
-  const { chart, summary } = metricPanels("o'clock", [{ column: 'metric_name', value: "o'clock" }, { column: 'unit', value: 'ms', not: true }], 'service_name', 'service_name IS NOT NULL');
-  expect(chart.sql).toContain("metric_name = 'o''clock' AND metric_type IN ('gauge', 'sum') AND unit IS DISTINCT FROM 'ms' AND (service_name IS NOT NULL)");
-  expect(chart.sql).toContain("concat_ws(' · ', COALESCE(CAST(service_name AS VARCHAR), 'not set'), metric_type, unit, CASE aggregation_temporality");
-  expect(chart.title).toContain('plotted as double precision');
-  expect(summary).toMatch(/last_value\(COALESCE\(CAST\(int_value AS VARCHAR\), CAST\(double_value AS VARCHAR\)\) ORDER BY time_unix_nano\) AS latest/);
-  expect(summary).toContain('CAST(avg(CAST(int_value AS DECIMAL(38, 0))) AS VARCHAR)');
-  expect(() => metricPanels('m', [{ column: 'body_text', value: 'x' }])).toThrow('body_text is not a metrics column');
-  expect(() => metricPanels('m', [], 'nope')).toThrow('nope is not a metrics column');
-  // The host plans them only for one selected metric, and leaves them out when the predicate was refused.
-  const metrics = readState(new URLSearchParams({ signal: 'metrics', where: JSON.stringify([{ column: 'metric_name', value: 'ui.requests' }]), group: 'service_name' }));
+  // Metric points list integers as exact decimal text, nested counts as exact text with their structure kept.
+  const points = listQuery({ signal: 'metrics', columns: ['metric_name', 'int_value', 'double_value', 'histogram_count', 'bucket_counts', 'positive_buckets'] }, RANGE).sql;
+  expect(points).toMatch(/^SELECT metric_name, CAST\(int_value AS VARCHAR\) AS int_value, double_value, CAST\(histogram_count AS VARCHAR\) AS histogram_count, CAST\(bucket_counts AS VARCHAR\[\]\) AS bucket_counts, /);
+  expect(points).toContain("named_struct('offset', positive_buckets['offset'], 'bucket_counts', CAST(positive_buckets['bucket_counts'] AS VARCHAR[])) END AS positive_buckets");
+  // Each recorded series keeps its typed identity: meaning plus resource, scope and point dimensions, Variants as JSON text.
+  const each = metricQueries({ metric: "o'clock", where: [{ column: 'unit', value: 'ms', not: true }] }, RANGE, 'service_name IS NOT NULL');
+  expect(each.identity).toEqual(['metric_type', 'unit', 'aggregation_temporality', 'is_monotonic', 'resource', 'scope_name', 'scope_version', 'scope', 'attributes']);
+  expect(each.chart.params).toContain("o'clock");
+  expect(each.chart.sql).toContain('to_json(attributes) AS attributes');
+  expect(each.chart.sql).toContain('AND (service_name IS NOT NULL)');
+  expect(each.chart.sql).not.toMatch(/GROUP BY|COALESCE\(CAST\(service_name/);
+  // The summary reads exact text: Max orders by value then exact integer; Mean stays decimal unless a double is present.
+  expect(each.summary.sql).toContain('last_value(t ORDER BY at) AS latest, first_value(t ORDER BY v DESC, i DESC NULLS LAST) AS max');
+  expect(each.summary.sql).toContain('CASE WHEN count(d) = 0 THEN CAST(avg(i) AS VARCHAR) ELSE CAST(avg(v) AS VARCHAR) END AS mean');
+  expect(each.summary.sql).toContain('FROM (SELECT *, COALESCE(CAST(i AS DOUBLE), d) AS v');
+  // An explicit aggregation applies once per instant, kept apart by `by`.
+  const summed = metricQueries({ metric: 'm', aggregation: 'max', by: 'service_name' }, RANGE);
+  expect(summed.identity).toEqual(['metric_type', 'unit', 'aggregation_temporality', 'is_monotonic', 'service_name']);
+  expect(summed.chart.sql).toContain('CASE WHEN count(d) = 0 THEN max(i) END AS i, CASE WHEN count(d) > 0 THEN max(COALESCE(CAST(i AS DOUBLE), d)) END AS d');
+  expect(() => metricQueries({ metric: 'm', where: [{ column: 'body_text', value: 'x' }] }, RANGE)).toThrow('body_text is not a metrics column');
+  expect(() => metricQueries({ metric: 'm', by: 'service_name' }, RANGE)).toThrow('needs an aggregation');
+  // The host plans a series only for one selected metric, with the aggregation and grouping the URL names.
+  const metrics = readState(new URLSearchParams({ signal: 'metrics', where: JSON.stringify([{ column: 'metric_name', value: 'ui.requests' }]), agg: 'sum', by: 'service_name' }));
   expect(selectedMetric(metrics)).toBe('ui.requests');
   expect(groupColumns(metrics)).toContain('service_name');
-  const charted = observeView(metrics);
-  expect(charted.panels.map((panel) => panel.id)).toEqual(['series', 'summary', 'facets', 'list']);
-  for (const panel of charted.panels) expect(validatePanel(panel.component, panel.input)).not.toHaveProperty('code');
-  expect(charted.panels[3].input).toMatchObject({ groupBy: 'service_name', columns: expect.arrayContaining(['service_name', 'int_value']) });
-  expect(observeView(metrics, null).panels.map((panel) => panel.id)).toEqual(['facets', 'list']);
-  expect(observeView({ ...metrics, where: [] }).panels.map((panel) => panel.id)).toEqual(['facets', 'list']);
+  expect(listInputs(metrics).series).toEqual({ metric: 'ui.requests', where: [{ column: 'metric_name', value: 'ui.requests' }], aggregation: 'sum', by: 'service_name' });
+  expect(listInputs({ ...metrics, agg: undefined, by: undefined }).series).toEqual({ metric: 'ui.requests', where: [{ column: 'metric_name', value: 'ui.requests' }] });
+  expect(listInputs({ ...metrics, where: [] }).series).toBeUndefined();
 });

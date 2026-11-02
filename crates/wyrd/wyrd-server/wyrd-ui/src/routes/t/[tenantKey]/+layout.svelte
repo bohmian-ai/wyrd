@@ -8,7 +8,7 @@
 
 <header>
   <a class="brand" href={base}><img src={logo} alt="" width="28" height="28" />Wyrd</a>
-  <nav aria-label="Primary"><a href={base}>Home</a><a href={`${base}/settings`}>Settings</a></nav>
+  <nav aria-label="Primary"><a href={base}>Home</a><a href={`${base}/observe`}>Observe</a><a href={`${base}/settings`}>Settings</a></nav>
   <div class="identity">
     {#if data.session.tenants.length > 1}
       <details>

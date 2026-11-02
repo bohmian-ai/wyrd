@@ -275,6 +275,9 @@ const filterIntent = z.object({ signal: SignalSchema, column: z.string().min(1),
 /** One exact span, as a navigation target. */
 const spanRef = z.object({ trace_id: traceId, span_id: spanId.optional() }).strict();
 
+/** Exact executed SQL and its typed binds, as a navigation target. */
+const executedQuery = z.object({ sql: z.string().min(1), params: z.array(queryParam) }).strict();
+
 /** How an action's completion becomes observable. */
 type Completion = 'host-navigation' | 'view-range';
 
@@ -309,7 +312,7 @@ export const components = {
       },
       'chart.open_in_query': {
         description: 'Open the exact executed SQL and its typed binds in Query.',
-        input: z.object({ sql: z.string().min(1), params: z.array(queryParam) }).strict(),
+        input: executedQuery,
         completion: 'host-navigation'
       }
     }
@@ -367,6 +370,11 @@ export const components = {
       'record.open': {
         description: 'Open one trace or span, or one log record by its exact identity.',
         input: z.union([spanRef, z.object({ log: LogKeySchema }).strict()]),
+        completion: 'host-navigation'
+      },
+      'record.open_in_query': {
+        description: "Open the list's exact executed SQL and its typed binds in Query.",
+        input: executedQuery,
         completion: 'host-navigation'
       }
     }

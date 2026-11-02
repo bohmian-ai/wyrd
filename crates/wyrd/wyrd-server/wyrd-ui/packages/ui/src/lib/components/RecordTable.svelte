@@ -18,12 +18,13 @@
   import { KEY_COLUMNS, LIST_LIMIT, STATUS_NAMES, cellText, columnLabel, shownColumns, type RecordTableProps } from '../loaders.js';
   import { fmtCount } from '../format.js';
   import { columnIndex, numeric } from '../plot.js';
+  import ActionButton from './ActionButton.svelte';
   import ActionNote from './ActionNote.svelte';
   import DurationBar from './DurationBar.svelte';
   import EmptyState from './EmptyState.svelte';
   import StatusPill, { type Tone } from './StatusPill.svelte';
 
-  let { input, result, actions = {}, onaction, paused = false }: RecordTableProps & ActionProps & { paused?: boolean } = $props();
+  let { input, executed, result, actions = {}, onaction, paused = false }: RecordTableProps & ActionProps & { paused?: boolean } = $props();
 
   const TONES: Record<number, Tone> = { 0: 'neutral', 1: 'ok', 2: 'danger' };
   const NOUNS = { traces: 'traces', spans: 'spans', logs: 'records', metrics: 'points' } as const;
@@ -267,6 +268,17 @@
       {/if}
     </div>
     <ActionNote state={openState} />
+    {#if executed}
+      <span class="query">
+        <ActionButton
+          variant="link"
+          label="Open in Query"
+          icon="↗"
+          state={onaction ? actions['record.open_in_query'] : { state: 'unavailable', reason: 'This host has no Query' }}
+          onclick={() => onaction?.({ name: 'record.open_in_query', input: executed })}
+        />
+      </span>
+    {/if}
   </div>
 {:else if result.state === 'empty'}
   <EmptyState state="empty" title={result.reason} />
@@ -277,6 +289,9 @@
 {/if}
 
 <style>
+  .query {
+    align-self: flex-end;
+  }
   .table {
     display: flex;
     flex-direction: column;

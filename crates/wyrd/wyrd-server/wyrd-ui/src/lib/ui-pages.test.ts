@@ -9,6 +9,8 @@ import {
   type WireRequest,
   type WireResult
 } from 'wyrd-ai-ui/loaders';
+import { validateView } from 'wyrd-ai-ui/view';
+import { closed, detailView, observeView, readState, step, writeState } from './observe-host';
 
 const RANGE = { from: '2026-10-20T00:00:00Z', to: '2026-10-21T00:00:00Z' };
 const EMPTY = { columns: [], rows: [], terminal: { outcome: 'success', row_count: 0, warnings: [] } };
@@ -83,4 +85,59 @@ test('observe signal planning and interactions', async () => {
   expect(validatePanel('StatStrip', { stats: ['calls'], where_sql: 'name = 1' })).toMatchObject({
     detail: 'StatStrip input.where_sql: span predicates do not apply to gateway tokens, calls or cost'
   });
+
+  // The host keeps the whole investigation in the URL and plans valid views from it.
+  const shared = new URLSearchParams({
+    signal: 'logs',
+    last: '6h',
+    where: JSON.stringify([{ column: 'service_name', value: 'support-desk' }]),
+    where_sql: 'severity_number >= 17',
+    group: 'severity_text',
+    live: '1'
+  });
+  const state = readState(shared);
+  expect(readState(writeState(state))).toEqual(state);
+  expect(readState(new URLSearchParams())).toMatchObject({ signal: 'traces', mode: 'traces', last: '1h', where: [], where_sql: '', live: false });
+  expect(readState(new URLSearchParams({ signal: 'nope', where: '{bad' }))).toMatchObject({ signal: 'traces', where: [] });
+  const main = observeView(state);
+  expect(validateView(main)).not.toHaveProperty('code');
+  for (const panel of main.panels) expect(validatePanel(panel.component, panel.input)).not.toHaveProperty('code');
+  expect(main.panels.map((panel) => panel.component)).toEqual(['FacetRail', 'RecordTable']);
+  expect(main.panels[1].input).toEqual({
+    signal: 'logs',
+    where: [{ column: 'service_name', value: 'support-desk' }],
+    where_sql: 'severity_number >= 17',
+    groupBy: 'severity_text',
+    live: true
+  });
+  const spanView = observeView(readState(new URLSearchParams({ mode: 'spans' })));
+  expect(spanView.panels.map((panel) => [panel.component, (panel.input as { signal?: string }).signal])).toEqual([
+    ['StatStrip', undefined],
+    ['FacetRail', 'spans'],
+    ['RecordTable', 'spans']
+  ]);
+  expect(spanView.range).toEqual({ last: '1h' });
+
+  // Intents become URL steps: filters dedupe, records open in the drawer, queries open in Query.
+  const traces = readState(new URLSearchParams());
+  const facet = { name: 'facet.filter', input: { signal: 'traces', column: 'service_name', value: 'api' } };
+  const filtered = step((step(traces, facet, '/') as { state: ReturnType<typeof readState> }).state, facet, '/') as { state: ReturnType<typeof readState> };
+  expect(filtered.state.where).toEqual([{ column: 'service_name', value: 'api' }]);
+  const excluded = step(traces, { name: 'record.filter', input: { signal: 'traces', column: 'kind', value: 2, not: true } }, '/');
+  expect('state' in excluded && excluded.state.where).toEqual([{ column: 'kind', value: 2, not: true }]);
+  const trace = 'a'.repeat(32);
+  const opened = step(traces, { name: 'record.open', input: { trace_id: trace, span_id: 'b'.repeat(16) } }, '/') as { state: ReturnType<typeof readState> };
+  expect(detailView(opened.state)?.panels.map((panel) => panel.component)).toEqual(['TraceWaterfall', 'RecordDetail']);
+  // Opening a record never changes the list's view, so the list is not reloaded.
+  expect(observeView(closed(opened.state))).toEqual(observeView(traces));
+  expect(detailView(traces)).toBeUndefined();
+  const fromLogs = step(state, { name: 'record.open', input: { trace_id: trace } }, '/') as { state: ReturnType<typeof readState> };
+  expect(fromLogs.state).toMatchObject({ signal: 'traces', trace, where: [], where_sql: '' });
+  const log = { time_unix_nano: '1', observed_time_unix_nano: '2', wyrd_request_id: 'r' };
+  const record = step(state, { name: 'record.open', input: { log } }, '/') as { state: ReturnType<typeof readState> };
+  expect(detailView(record.state)?.panels).toEqual([{ id: 'detail', component: 'RecordDetail', input: { log } }]);
+  expect(readState(writeState(record.state)).log).toEqual(log);
+  const inspect = step(traces, { name: 'record.open_in_query', input: { sql: 'SELECT $1', params: ['x'] } }, '/t/acme/observe?live=1');
+  expect('query' in inspect && Object.fromEntries(inspect.query)).toEqual({ sql: 'SELECT $1', params: '["x"]', back: '/t/acme/observe?live=1' });
+  expect(step(traces, { name: 'record.logs', input: {} }, '/')).toHaveProperty('unavailable');
 });

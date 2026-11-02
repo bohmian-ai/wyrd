@@ -1262,6 +1262,37 @@
             ]
           },
           "completion": "host-navigation"
+        },
+        {
+          "name": "record.open_in_query",
+          "description": "Open the list's exact executed SQL and its typed binds in Query.",
+          "input": {
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "type": "object",
+            "properties": {
+              "sql": {
+                "type": "string",
+                "minLength": 1
+              },
+              "params": {
+                "type": "array",
+                "items": {
+                  "type": [
+                    "null",
+                    "boolean",
+                    "number",
+                    "string"
+                  ]
+                }
+              }
+            },
+            "required": [
+              "sql",
+              "params"
+            ],
+            "additionalProperties": false
+          },
+          "completion": "host-navigation"
         }
       ]
     },

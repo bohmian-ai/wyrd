@@ -1026,6 +1026,24 @@ pub enum WyrdError {
         /// Structured detail payload.
         details: serde_json::Value,
     },
+    /// The process Scribe outbox had no capture slot for a capturing call
+    /// before its deadline.
+    ///
+    /// Admission is refused before anything is charged or dispatched, so the
+    /// identical call may be retried whole.
+    #[error("[WYRD_GATEWAY_429_CAPTURE_STAGING_FULL] {message}")]
+    #[wyrd_error(
+        code = "WYRD_GATEWAY_429_CAPTURE_STAGING_FULL",
+        status = 429,
+        title = "Gateway capture staging is full",
+        remediation = "Nothing of the refused call was charged or sent upstream: retry the identical call after `details.retry_after_seconds`, or lower the request rate."
+    )]
+    GatewayCaptureStagingFull {
+        /// Human-readable error message.
+        message: String,
+        /// Structured detail payload.
+        details: serde_json::Value,
+    },
     /// Every eligible upstream attempt failed.
     #[error("[WYRD_GATEWAY_502_UPSTREAM_UNAVAILABLE] {message}")]
     #[wyrd_error(
@@ -3798,6 +3816,7 @@ impl WyrdError {
             | Self::GatewayCostUnbounded { message, details }
             | Self::GatewayLimitExceeded { message, details }
             | Self::GatewayBudgetExceeded { message, details }
+            | Self::GatewayCaptureStagingFull { message, details }
             | Self::GatewayUpstreamUnavailable { message, details }
             | Self::GatewayDeadlineExceeded { message, details }
             | Self::AuthVerifyUnavailable { message, details }

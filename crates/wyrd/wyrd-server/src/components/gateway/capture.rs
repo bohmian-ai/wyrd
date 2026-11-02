@@ -85,8 +85,8 @@ const SECRET_KEY_FRAGMENTS: &[&str] = &[
 /// Why one call's capture was not staged; the call itself is unaffected.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum CaptureDrop {
-    /// A selected payload could not be canonicalized within the fixed ceiling,
-    /// so it is dropped rather than persisted unreviewed.
+    /// A selected payload could not be encoded within the fixed ceiling, so it
+    /// is dropped rather than persisted unreviewed.
     Payload,
     /// The projected record violated its public contract.
     Invalid,
@@ -176,8 +176,15 @@ pub struct CallCapture {
     tenant: DataTenantId,
     /// Operation, which names the GenAI spans.
     operation: GatewayOperation,
-    /// The `bifrost.gateway.calls` row.
+    /// The `bifrost.gateway.calls` row's scalar fields; both payload texts
+    /// stay `None` because [`Self::request`] and [`Self::response`] hold them
+    /// encoded.
     payload: GatewayCallPayloadV1,
+    /// The selected request payload, redacted and encoded as a Variant on the
+    /// capturing task so the Scribe lane appends it without re-encoding.
+    request: Option<EncodedVariant>,
+    /// The selected response payload, encoded as [`Self::request`] is.
+    response: Option<EncodedVariant>,
     /// Bytes of every object the row references, persisted before delivery.
     objects: PayloadObjects,
     /// One span's admitted-adapter provider and fields per attempt, in
@@ -197,28 +204,28 @@ impl CallCapture {
     ///
     /// Usage, cost, and pricing come only from the appended ledger entries, so
     /// unknown values stay null. `Metadata` writes both payload columns null;
-    /// `Payload` writes only the selected fields, each redacted and
-    /// canonicalized. Arrow rows are built later by [`Self::project`], for
-    /// many captures at once.
+    /// `Payload` writes only the selected fields, each redacted and encoded as
+    /// a Variant here, on the capturing task. Arrow rows are
+    /// built later by [`Self::project`], for many captures at once.
     ///
     /// # Errors
     ///
     /// Returns [`CaptureDrop::Payload`] when a selected payload cannot be
-    /// canonicalized within [`GATEWAY_JSON_MAX_BYTES`] or the facts carry that
+    /// encoded within [`GATEWAY_JSON_MAX_BYTES`] or the facts carry that
     /// drop for the response, and
     /// [`CaptureDrop::Invalid`] when the row or a span violates its contract.
     pub(crate) fn from_facts(facts: CallFacts) -> Result<Self, CaptureDrop> {
         let selected = |field| selects(&facts.policy, field);
         let mut objects = facts.objects;
-        let request_payload_json = selected(GatewayPayloadField::Request)
+        let request = selected(GatewayPayloadField::Request)
             .then_some(facts.request)
             .flatten()
-            .map(|value| redacted_canonical_json(value, &mut objects))
+            .map(|value| redacted_payload(value, &mut objects))
             .transpose()?;
-        let response_payload_json = selected(GatewayPayloadField::Response)
+        let response = selected(GatewayPayloadField::Response)
             .then_some(facts.response?)
             .flatten()
-            .map(|value| redacted_canonical_json(value, &mut objects))
+            .map(|value| redacted_payload(value, &mut objects))
             .transpose()?;
         let (usage, cost, currency, pricing_versions) = facts
             .entries
@@ -273,8 +280,8 @@ impl CallCapture {
             currency,
             pricing_versions,
             capture_policy_version: facts.policy.version,
-            request_payload_json,
-            response_payload_json,
+            request_payload_json: None,
+            response_payload_json: None,
             payload_object_refs: objects.refs(),
         };
         payload.validate().map_err(|_| CaptureDrop::Invalid)?;
@@ -285,6 +292,8 @@ impl CallCapture {
             tenant: facts.tenant,
             operation: facts.operation,
             payload,
+            request,
+            response,
             objects,
             spans,
             attribution: facts.attribution,
@@ -299,18 +308,14 @@ impl CallCapture {
         self.payload.request_id.as_str()
     }
 
-    /// Bytes of captured content this capture holds: both payload columns'
-    /// texts and every referenced object, which the Scribe outbox accounts
-    /// against its byte limit.
+    /// Bytes of captured content this capture holds: both encoded payloads
+    /// and every referenced object, which the Scribe outbox accounts against
+    /// its byte limit.
     pub(crate) fn content_bytes(&self) -> usize {
-        let payloads = [
-            &self.payload.request_payload_json,
-            &self.payload.response_payload_json,
-        ];
-        payloads
+        [&self.request, &self.response]
             .into_iter()
             .flatten()
-            .map(String::len)
+            .map(EncodedVariant::encoded_bytes)
             .sum::<usize>()
             + self.objects.bytes()
     }
@@ -327,14 +332,12 @@ impl CallCapture {
     ///
     /// The scalar columns decode from the serialized payloads in one decoder
     /// pass; the `request_payload` and `response_payload` Variant columns
-    /// encode the payloads' redacted canonical JSON texts, keeping their JSON
-    /// types. Every batch shares one schema `Arc`.
+    /// append the payloads already encoded by [`Self::from_facts`]. Every
+    /// batch shares one schema `Arc`.
     ///
     /// # Errors
     ///
-    /// Returns [`CaptureDrop::Projection`] when Arrow cannot decode the rows
-    /// and [`CaptureDrop::Payload`] when a selected payload exceeds a Variant
-    /// limit.
+    /// Returns [`CaptureDrop::Projection`] when Arrow cannot decode the rows.
     pub(crate) fn calls_batch(captures: &[&Self]) -> Result<RecordBatch, CaptureDrop> {
         let (schema, scalars) = &*CALLS_SCHEMAS;
         let mut decoder = ReaderBuilder::new(Arc::clone(scalars))
@@ -360,20 +363,32 @@ impl CallCapture {
                     .map(|capture| capture.subject.as_ref().and_then(pick)),
             ))
         };
+        let payload = |pick: fn(&CallCapture) -> Option<&EncodedVariant>| -> ArrayRef {
+            let (metadata_bytes, value_bytes) = captures
+                .iter()
+                .filter_map(|capture| pick(capture))
+                .fold((0, 0), |(metadata, value), encoded| {
+                    (
+                        metadata + encoded.metadata().len(),
+                        value + encoded.value().len(),
+                    )
+                });
+            let mut column = VariantColumnBuilder::with_byte_capacity(
+                captures.len(),
+                metadata_bytes,
+                value_bytes,
+            );
+            for capture in captures {
+                column.append_option(pick(capture));
+            }
+            column.finish()
+        };
         let columns = schema
             .fields()
             .iter()
             .map(|field| match field.name().as_str() {
-                REQUEST_PAYLOAD => payload_column(
-                    captures
-                        .iter()
-                        .map(|capture| capture.payload.request_payload_json.as_deref()),
-                ),
-                RESPONSE_PAYLOAD => payload_column(
-                    captures
-                        .iter()
-                        .map(|capture| capture.payload.response_payload_json.as_deref()),
-                ),
+                REQUEST_PAYLOAD => Ok(payload(|capture| capture.request.as_ref())),
+                RESPONSE_PAYLOAD => Ok(payload(|capture| capture.response.as_ref())),
                 WORKLOAD_CARD_UID => Ok(subject(|context| {
                     context.workload_card_uid.as_ref().map(CardUid::as_str)
                 })),
@@ -605,12 +620,12 @@ pub(crate) fn record(call_id: GatewayCallId, result: Result<(), CaptureDrop>) {
 ///
 /// Returns the IO error of a spooled upload that cannot be reread.
 pub(crate) async fn request_content(
-    body: &Value,
+    body: Value,
     media: Option<&MediaRequest>,
     objects: &mut PayloadObjects,
 ) -> std::io::Result<Value> {
     let Some(media) = media else {
-        return Ok(body.clone());
+        return Ok(body);
     };
     let mut files = Vec::with_capacity(media.files.len());
     for file in &media.files {
@@ -798,35 +813,22 @@ fn is_payload_column(name: &str) -> bool {
     name == REQUEST_PAYLOAD || name == RESPONSE_PAYLOAD
 }
 
-/// Encodes optional canonical JSON payload texts as a Variant column, one row
-/// per text; an unselected payload is a null row.
-///
-/// # Errors
-///
-/// Returns [`CaptureDrop::Payload`] when a text is not JSON or exceeds a
-/// Variant limit, so the captures are dropped rather than stored partially.
-fn payload_column<'a>(
-    texts: impl IntoIterator<Item = Option<&'a str>>,
-) -> Result<ArrayRef, CaptureDrop> {
-    VariantColumnBuilder::encode("payload", texts, EncodedVariant::from_json_text)
-        .map_err(|_| CaptureDrop::Payload)
-}
-
-/// Redacts `value`, collecting substituted binary content into `objects`, and
-/// returns its RFC 8785 canonical JSON.
+/// Redacts `value` in place, collecting substituted binary content into
+/// `objects`, and encodes it as the stored Variant in one pass, with no JSON
+/// text in between.
 ///
 /// # Errors
 ///
 /// Returns [`CaptureDrop::Payload`] when inline binary content is malformed,
-/// or when canonicalization fails or exceeds [`GATEWAY_JSON_MAX_BYTES`].
-fn redacted_canonical_json(
+/// or when the encoding exceeds a Variant limit or [`GATEWAY_JSON_MAX_BYTES`].
+fn redacted_payload(
     mut value: Value,
     objects: &mut PayloadObjects,
-) -> Result<String, CaptureDrop> {
+) -> Result<EncodedVariant, CaptureDrop> {
     redact(&mut value, objects)?;
-    serde_jcs::to_string(&value)
+    EncodedVariant::from_serialize(&value)
         .ok()
-        .filter(|text| text.len() <= GATEWAY_JSON_MAX_BYTES)
+        .filter(|encoded| encoded.encoded_bytes() <= GATEWAY_JSON_MAX_BYTES)
         .ok_or(CaptureDrop::Payload)
 }
 
@@ -1131,6 +1133,7 @@ pub(crate) mod tests {
         AttemptRecord, AttemptUsage, IngressDialect, MediaRequest, OpenAiMediaRoute, UploadContent,
         UploadFile,
     };
+    use wyrd_queue::variant::variant_bytes_to_json;
     use wyrd_spec::DataTenantId;
     use wyrd_spec::auth::{Attribution, PrincipalId};
     use wyrd_spec::gateway::{
@@ -1222,8 +1225,8 @@ pub(crate) mod tests {
     fn metadata_capture_projects_row_and_linked_spans() {
         let capture = CallCapture::from_facts(facts(policy(GatewayCaptureMode::Metadata, &[])))
             .expect("metadata projects");
-        assert_eq!(capture.payload.request_payload_json, None);
-        assert_eq!(capture.payload.response_payload_json, None);
+        assert_eq!(capture.request, None);
+        assert_eq!(capture.response, None);
         assert_eq!(capture.payload.capture_policy_version.get(), 3);
         assert_eq!(capture.payload.ingress_dialect, "openai_chat_completions");
         assert_eq!(capture.payload.attempt_count, 1);
@@ -1380,11 +1383,10 @@ pub(crate) mod tests {
             &[GatewayPayloadField::Request],
         )))
         .expect("payload projects");
-        let request = capture
-            .payload
-            .request_payload_json
-            .as_deref()
-            .expect("request selected");
+        let request = capture.request.as_ref().expect("request selected");
+        let request = variant_bytes_to_json(request.metadata(), request.value())
+            .expect("the encoded request renders")
+            .to_string();
         assert!(!request.contains(CANARY), "{request}");
         assert!(!request.contains(IMAGE_B64), "{request}");
         assert!(request.contains("image/png"), "{request}");
@@ -1411,7 +1413,7 @@ pub(crate) mod tests {
             !request.contains("payload-objects") && !request.contains(&capture.tenant.to_string()),
             "no storage path or backend locator reaches the row: {request}"
         );
-        assert_eq!(capture.payload.response_payload_json, None);
+        assert_eq!(capture.response, None);
     }
 
     /// Proves a selected upload becomes the typed reference shape while its
@@ -1432,7 +1434,7 @@ pub(crate) mod tests {
             }],
         };
         let mut objects = PayloadObjects::default();
-        let content = request_content(&json!({"prompt": "draw"}), Some(&media), &mut objects)
+        let content = request_content(json!({"prompt": "draw"}), Some(&media), &mut objects)
             .await
             .expect("the upload resolves");
         let files = content["files"].as_array().expect("files");
@@ -1569,7 +1571,7 @@ pub(crate) mod recording {
     use wyrd_spec::ids::CardUid;
     use wyrd_spec::vala::{ACT_PRINCIPAL_ID, SUB_PRINCIPAL_ID};
 
-    use crate::scribe_outbox::{ScribeSink, ScribeTable};
+    use crate::scribe_outbox::{ScribeSink, ScribeTable, payload_ipc};
     use crate::state::AppState;
 
     /// One authorization decision the recording Scribe acknowledged on
@@ -1617,10 +1619,14 @@ pub(crate) mod recording {
         pub(crate) card_scope: Vec<CardUid>,
         /// Fully qualified destination table.
         pub(crate) table: String,
-        /// Rows the frame's IPC stream carries.
+        /// Rows the frame carries.
         pub(crate) rows: usize,
-        /// The frame's IPC stream.
+        /// The frame's rows as one IPC stream: the stream it carried, or its
+        /// canonical batches encoded.
         pub(crate) ipc: Bytes,
+        /// Whether the frame carried canonical batches rather than an IPC
+        /// stream for Scribe to decode.
+        pub(crate) canonical: bool,
         /// Batch identity the frame was submitted under.
         pub(crate) batch_id: uuid::Uuid,
     }
@@ -1640,6 +1646,7 @@ pub(crate) mod recording {
                 table: frame.table.fqn(),
                 rows,
                 ipc,
+                canonical: matches!(frame.payload, IngressPayload::Canonical(_)),
                 batch_id: frame.batch_id,
             }
         }
@@ -1894,12 +1901,10 @@ pub(crate) mod recording {
         ///
         /// # Panics
         ///
-        /// Panics when the frame is not one Arrow IPC stream of the audit
-        /// content columns or the audit lock is poisoned.
+        /// Panics when the frame does not hold the audit content columns or
+        /// the audit lock is poisoned.
         fn acknowledge_audit(&self, frame: &ScribeIngressFrame) -> FrameAdmission {
-            let IngressPayload::ArrowIpc(ipc) = &frame.payload else {
-                panic!("audit submits Arrow IPC");
-            };
+            let ipc = &payload_ipc(&frame.payload);
             let decisions: Vec<AuditDecision> =
                 StreamReader::try_new(std::io::Cursor::new(ipc.clone()), None)
                     .expect("the audit stream opens")
@@ -1937,8 +1942,8 @@ pub(crate) mod recording {
         ///
         /// # Panics
         ///
-        /// Panics when the frame is not one readable Arrow IPC stream or a
-        /// lock is poisoned.
+        /// Panics when the frame's rows do not encode and decode or a lock
+        /// is poisoned.
         async fn ingest_frame(
             &self,
             frame: ScribeIngressFrame,
@@ -1953,10 +1958,7 @@ pub(crate) mod recording {
             if let Some(error) = self.refusals.lock().expect("refusals").pop_front() {
                 return Err(error);
             }
-            let IngressPayload::ArrowIpc(ipc) = &frame.payload else {
-                panic!("capture submits Arrow IPC");
-            };
-            let ipc = ipc.clone();
+            let ipc = payload_ipc(&frame.payload);
             let rows = StreamReader::try_new(std::io::Cursor::new(ipc.clone()), None)
                 .expect("the capture stream opens")
                 .map(|batch| batch.expect("the capture batch decodes").num_rows())

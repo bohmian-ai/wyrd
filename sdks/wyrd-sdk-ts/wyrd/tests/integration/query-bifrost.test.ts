@@ -83,7 +83,7 @@ test("bound sql text is treated as data", async ({ bifrost }) => {
 
 test("unwritten builtin table reads as empty", async ({ bifrost }) => {
   const rows = await bifrost.sql(
-    "SELECT COUNT(*) AS n FROM bifrost.drift.result_features",
+    "SELECT COUNT(*) AS n FROM bifrost.verification.execution_outputs",
     [],
     z.object({ n: z.bigint() }),
   );

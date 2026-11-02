@@ -1042,6 +1042,91 @@ mod pg_tests {
         }
     }
 
+    /// An Artifact file declared through the CLI still completes through the
+    /// shared upload lifecycle beside verification Files: it pulls back with
+    /// its exact bytes, and its Card-file record never stands in for a
+    /// verification File of identical content.
+    ///
+    /// # Panics
+    /// Panics when the server fails to start, a CLI command fails, the pulled
+    /// bytes differ, or the evidence plan reuses the Card file.
+    #[tokio::test]
+    async fn artifact_upload_keeps_shared_completion() {
+        let temp = tempfile::tempdir().expect("tempdir creates");
+        let path = write_prompt(&temp);
+        let (server, base_url, _storage_root, shutdown, serve_handle) = start_cli_server().await;
+        let Bootstrap::User { jwt, .. } = server
+            .bootstrap_user("cli-artifact-writer", &["editor"])
+            .await
+            .expect("writer bootstraps")
+        else {
+            panic!("writer bootstrap returned a non-user principal");
+        };
+        let receipt = run_cli_json(
+            vec![
+                "declare".to_owned(),
+                path.to_str().expect("prompt path is UTF-8").to_owned(),
+                "--server".to_owned(),
+                base_url.clone(),
+                "--format".to_owned(),
+                "json".to_owned(),
+            ],
+            &jwt,
+        )
+        .await
+        .expect("the Prompt declares");
+        let uid = receipt["root"]["uid"]
+            .as_str()
+            .expect("receipt names a UID");
+        let pulled = temp.path().join("pulled");
+        run_cli_json(
+            vec![
+                "pull".to_owned(),
+                "--kind".to_owned(),
+                "Prompt".to_owned(),
+                "--uid".to_owned(),
+                uid.to_owned(),
+                "--output-dir".to_owned(),
+                pulled.to_str().expect("pull path is UTF-8").to_owned(),
+                "--server".to_owned(),
+                base_url.clone(),
+                "--format".to_owned(),
+                "json".to_owned(),
+            ],
+            &jwt,
+        )
+        .await
+        .expect("the Prompt pulls");
+        assert_eq!(
+            std::fs::read(pulled.join("cards/root/artifacts/prompt.txt"))
+                .expect("pulled artifact reads"),
+            b"cli-card-artifact"
+        );
+
+        let artifact = b"cli-card-artifact";
+        let planned: Value = reqwest::Client::new()
+            .post(format!("{base_url}/v1/verification/evidence"))
+            .header("x-wyrd-access-token", format!("Bearer {jwt}"))
+            .json(&serde_json::json!({ "files": [{
+                "sha256": format!("{:x}", sha2::Sha256::digest(artifact)),
+                "size_bytes": artifact.len(),
+            }] }))
+            .send()
+            .await
+            .expect("the server answers")
+            .error_for_status()
+            .expect("the plan is admitted")
+            .json()
+            .await
+            .expect("the plan decodes");
+        assert_eq!(
+            planned["uploads"].as_array().map(Vec::len),
+            Some(1),
+            "a Card file never supplies a verification File: {planned}"
+        );
+        stop_cli_server(server, shutdown, serve_handle).await;
+    }
+
     #[tokio::test]
     async fn card_lifecycle_cli_journey() {
         let temp = tempfile::tempdir().expect("tempdir creates");
@@ -1371,14 +1456,13 @@ mod pg_tests {
             .superuser_pool()
             .expect("superuser pool opens");
         let original_storage_path: String = sqlx::query_scalar(
-            "SELECT storage_path FROM wyrd.storage_artifact_metadata WHERE card_uid = $1",
+            "SELECT storage_path FROM wyrd.storage_multipart_uploads \
+              WHERE card_uid = $1 AND status = 'completed'",
         )
         .bind(&uid)
         .fetch_one(&superuser)
         .await
         .expect("artifact storage path reads");
-        let correct_digest = base64::engine::general_purpose::STANDARD
-            .encode(sha2::Sha256::digest(b"cli-card-artifact"));
         // Corrupt the stored bytes, not the inventory row: the server refuses a
         // row that disagrees with the committed Card's artifact hash before any
         // download, so only tampered bytes reach client-side verification.
@@ -1440,15 +1524,16 @@ mod pg_tests {
         assert!(!temp.path().join("size-mismatch").exists());
         std::fs::write(&artifact_path, b"cli-card-artifact").expect("artifact bytes restore");
 
+        // Corrupt the manifest path so it escapes its Card; a read refuses it
+        // rather than serving a path outside the Card.
         sqlx::query(
-            "UPDATE wyrd.storage_artifact_metadata SET size_bytes = $1, storage_path = $2 WHERE card_uid = $3",
+            "UPDATE wyrd.card_artifact_manifest SET relative_path = $1 WHERE card_uid = $2::uuid",
         )
-        .bind(i64::try_from(b"cli-card-artifact".len()).expect("a short literal length fits i64"))
         .bind("../escape")
         .bind(&uid)
         .execute(&superuser)
         .await
-        .expect("artifact path corrupts");
+        .expect("manifest path corrupts");
         let unsafe_path = run_cli_async_with_token!(
             &jwt,
             "pull",
@@ -1472,16 +1557,6 @@ mod pg_tests {
             "WYRD_REGISTRY_400_INVALID_CARD_SPEC"
         );
         assert!(!temp.path().join("unsafe-path").exists());
-        sqlx::query(
-            "UPDATE wyrd.storage_artifact_metadata SET size_bytes = $1, sha256 = $2, storage_path = $3 WHERE card_uid = $4",
-        )
-        .bind(i64::try_from(b"cli-card-artifact".len()).expect("a short literal length fits i64"))
-        .bind(&correct_digest)
-        .bind(&original_storage_path)
-        .bind(&uid)
-        .execute(&superuser)
-        .await
-        .expect("artifact metadata restores");
 
         let deleted = run_cli_async_with_token!(
             &jwt, "delete", "--kind", "Prompt", "--uid", &uid, "--server", &base_url, "--format",
@@ -2625,7 +2700,8 @@ mod pg_tests {
             .superuser_pool()
             .expect("superuser pool opens");
         let storage_path: String = sqlx::query_scalar(
-            "SELECT storage_path FROM wyrd.storage_artifact_metadata WHERE card_uid = $1",
+            "SELECT storage_path FROM wyrd.storage_multipart_uploads \
+              WHERE card_uid = $1 AND status = 'completed'",
         )
         .bind(&uid)
         .fetch_one(&superuser)

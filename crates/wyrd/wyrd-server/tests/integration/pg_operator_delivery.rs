@@ -123,7 +123,7 @@ impl Delivery {
             .await
             .expect("bound server starts");
         let tenant = server.pg_fixture().data_tenant_id();
-        let seed = VerificationFixture::provision(server.state().postgres.wyrd(), tenant)
+        let seed = VerificationFixture::provision(server.state(), tenant)
             .await
             .expect("tenant provisions");
         let verifier = seed
@@ -289,7 +289,7 @@ impl Delivery {
             .ensure_builtin_tables_for_test(tenant)
             .await
             .expect("second tenant receives every built-in table");
-        let seed = VerificationFixture::provision(self.server.state().postgres.wyrd(), tenant)
+        let seed = VerificationFixture::provision(self.server.state(), tenant)
             .await
             .expect("second tenant provisions");
         let verifier = seed.drift_verifier("drift").await.expect("verifier seeds");

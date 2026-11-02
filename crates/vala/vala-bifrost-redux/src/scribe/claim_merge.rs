@@ -24,8 +24,11 @@ use arrow::datatypes::SchemaRef;
 use arrow::row::{Row, RowConverter, Rows, SortField};
 use parquet::arrow::arrow_reader::{ParquetRecordBatchReader, ParquetRecordBatchReaderBuilder};
 
+use wyrd_spec::DataTenantId;
+
 use crate::catalog::layout::PhysicalLayout;
 use crate::contracts::ScribeError;
+use crate::parquet::footer::{footer_schema_fingerprint, verify_footer_tenant};
 use crate::schema::SchemaFingerprint;
 
 /// One staged run positioned on the row it currently offers to the merge.
@@ -64,8 +67,10 @@ impl RunCursor {
 /// readers, their decoded batches, and the row encoder across calls: each
 /// [`Self::next_batch`] resumes exactly where the previous one stopped.
 pub struct StagedRunMerge {
-    /// Physical schema every run and every emitted batch shares.
+    /// Logical schema every emitted batch carries.
     schema: SchemaRef,
+    /// Tenant whose footer a run must carry before its physical layout may differ.
+    tenant: DataTenantId,
     /// Encoder turning sort-key columns into byte-comparable rows.
     converter: RowConverter,
     /// Sort-key column indices in key order, the stable tie-breaker last.
@@ -80,18 +85,24 @@ impl StagedRunMerge {
     /// Opens every run of one claim and positions it on its first row.
     ///
     /// The schema is taken from the caller rather than from the first run so a
-    /// member encoded under a different physical schema is refused here, before
-    /// its rows can reach an object that claims the key's fingerprint.
+    /// member encoded under a different schema is refused here, before its rows
+    /// can reach an object that claims the key's fingerprint. A run may hold
+    /// shredded Variant columns — its generation's layout — and is then
+    /// accepted only when its footer names the claim's logical schema
+    /// fingerprint and `tenant`; its rows are reconstructed to the logical
+    /// schema as they are decoded, so every cursor offers one schema.
     ///
     /// # Errors
     ///
     /// Returns [`ScribeError::Internal`] when a run cannot be opened or read,
-    /// a run's schema is not the claim's schema, a sort key or stable
+    /// a run's schema is not the claim's schema, a shredded run's footer names
+    /// another logical schema or tenant, a sort key or stable
     /// tie-breaker is missing from that schema, the row encoder cannot be built
     /// for the key's types, or `batch_rows` is zero.
     pub fn open(
         runs: &[PathBuf],
         schema: SchemaRef,
+        tenant: DataTenantId,
         layout: &PhysicalLayout,
         batch_rows: usize,
     ) -> Result<Self, ScribeError> {
@@ -118,6 +129,7 @@ impl StagedRunMerge {
         })?;
         let mut merge = Self {
             schema,
+            tenant,
             converter,
             key_columns,
             cursors: Vec::with_capacity(runs.len()),
@@ -218,6 +230,7 @@ impl StagedRunMerge {
             self.cursors[cursor].drained = true;
             return Ok(());
         };
+        let batch = self.logical(batch)?;
         if !self.is_claim_schema(batch.schema_ref()) {
             return Err(ScribeError::Internal {
                 detail: "staged run changed schema between batches".to_owned(),
@@ -230,7 +243,55 @@ impl StagedRunMerge {
         Ok(())
     }
 
-    /// Reports whether a decoded run carries the claim's physical schema.
+    /// Reconstructs a decoded batch's shredded Variant columns to the claim's logical schema.
+    ///
+    /// A batch already in the claim's schema is returned as is.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ScribeError::Internal`] when a column cannot be reconstructed
+    /// to its logical type.
+    fn logical(&self, batch: RecordBatch) -> Result<RecordBatch, ScribeError> {
+        if self.is_claim_schema(batch.schema_ref()) {
+            return Ok(batch);
+        }
+        crate::schema::logical_batch(&batch, &self.schema).map_err(|detail| ScribeError::Internal {
+            detail: format!("reconstruct a shredded staged run: {detail}"),
+        })
+    }
+
+    /// Proves a run whose physical schema differs was sealed for this claim's logical schema and tenant.
+    ///
+    /// The footer fingerprint is the logical schema the writer sealed under,
+    /// whatever layout it shredded with, so a matching fingerprint and tenant
+    /// make the difference a layout rather than another table's rows.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ScribeError::Internal`] naming the run when its footer lacks
+    /// either field or names another logical schema or tenant.
+    fn verify_layout_footer(
+        &self,
+        run: &Path,
+        footer: &parquet::file::metadata::FileMetaData,
+    ) -> Result<(), ScribeError> {
+        let refuse = |detail: String| ScribeError::Internal {
+            detail: format!(
+                "staged run `{}` was encoded under a different physical schema: {detail}",
+                run.display()
+            ),
+        };
+        let expected = hex::encode(SchemaFingerprint::from_arrow_schema_exact(&self.schema).0);
+        if footer_schema_fingerprint(footer).map_err(refuse)? != expected {
+            return Err(refuse(format!(
+                "its footer names another logical schema than the claim's [{}]",
+                field_names(&self.schema)
+            )));
+        }
+        verify_footer_tenant(footer, self.tenant).map_err(refuse)
+    }
+
+    /// Reports whether a decoded run carries the claim's logical schema.
     ///
     /// The comparison is the same decode-side identity ingress admitted the
     /// batch under, so a run cannot be refused here for a difference admission
@@ -258,16 +319,22 @@ impl StagedRunMerge {
     /// # Errors
     ///
     /// Returns [`ScribeError::Internal`] when the run cannot be opened or
-    /// decoded, it does not carry the claim's physical schema, or its sort key
+    /// decoded, it does not carry the claim's logical schema, a run in another
+    /// physical layout fails [`Self::verify_layout_footer`], or its sort key
     /// cannot be encoded.
     fn open_cursor(&mut self, run: &Path) -> Result<Option<RunCursor>, ScribeError> {
         let file = std::fs::File::open(run).map_err(|error| ScribeError::Internal {
             detail: format!("open the staged run for merge: {error}"),
         })?;
-        let mut reader = ParquetRecordBatchReaderBuilder::try_new(file)
-            .map_err(|error| ScribeError::Internal {
+        let builder = ParquetRecordBatchReaderBuilder::try_new(file).map_err(|error| {
+            ScribeError::Internal {
                 detail: format!("build the staged run merge reader: {error}"),
-            })?
+            }
+        })?;
+        if !self.is_claim_schema(builder.schema()) {
+            self.verify_layout_footer(run, builder.metadata().file_metadata())?;
+        }
+        let mut reader = builder
             .with_batch_size(self.batch_rows)
             .build()
             .map_err(|error| ScribeError::Internal {
@@ -276,6 +343,7 @@ impl StagedRunMerge {
         let Some(batch) = decode_next(&mut reader)? else {
             return Ok(None);
         };
+        let batch = self.logical(batch)?;
         if !self.is_claim_schema(batch.schema_ref()) {
             return Err(ScribeError::Internal {
                 detail: format!(
@@ -513,8 +581,14 @@ mod tests {
         let layout = crate::tables::hourly_test_layout(schema.as_ref());
         let runs = vec![second, first];
 
-        let mut merge =
-            StagedRunMerge::open(&runs, Arc::clone(&schema), &layout, 2).expect("merge opens");
+        let mut merge = StagedRunMerge::open(
+            &runs,
+            Arc::clone(&schema),
+            DataTenantId::new_v7(),
+            &layout,
+            2,
+        )
+        .expect("merge opens");
         let merged = drain(&mut merge);
         assert_eq!(
             merged,
@@ -532,8 +606,14 @@ mod tests {
             "a layout tie keeps claim run order, then position within a run"
         );
 
-        let mut replay =
-            StagedRunMerge::open(&runs, Arc::clone(&schema), &layout, 3).expect("merge reopens");
+        let mut replay = StagedRunMerge::open(
+            &runs,
+            Arc::clone(&schema),
+            DataTenantId::new_v7(),
+            &layout,
+            3,
+        )
+        .expect("merge reopens");
         assert_eq!(
             drain(&mut replay),
             merged,
@@ -560,7 +640,7 @@ mod tests {
         foreign_fields.push(Arc::new(Field::new("later_column", DataType::Int32, true)));
         let foreign = Arc::new(Schema::new(foreign_fields));
 
-        let refusal = StagedRunMerge::open(&[run], foreign, &layout, 8)
+        let refusal = StagedRunMerge::open(&[run], foreign, DataTenantId::new_v7(), &layout, 8)
             .expect_err("a foreign schema is refused");
         assert!(
             refusal.to_string().contains("physical schema"),

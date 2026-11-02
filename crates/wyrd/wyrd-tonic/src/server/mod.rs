@@ -17,7 +17,7 @@ use tokio_stream::StreamExt as _;
 use tokio_util::sync::{CancellationToken, WaitForCancellationFutureOwned};
 use tonic::codegen::http::Request as HttpRequest;
 use tonic::service::interceptor::InterceptedService;
-use tonic::transport::server::{Connected, Router as TonicRouter, TcpConnectInfo};
+use tonic::transport::server::{Connected, Router as TonicRouter, TcpConnectInfo, TcpIncoming};
 use tonic::transport::{Certificate, Identity, Server, ServerTlsConfig};
 use tonic_health::pb::health_server::{Health, HealthServer};
 use tonic_health::server::HealthReporter;
@@ -223,7 +223,10 @@ where
 /// leaves the span the root of a new trace. The span carries the RPC service
 /// and method from the request path, never metadata values. A continued
 /// trace stages its tenant span copies on the serving server's
-/// `tenant_spans` sink.
+/// `tenant_spans` sink. A benchmark server attaches its declared benchmark
+/// metadata to the span as it opens
+/// ([`wyrd_telemetry::timing::label_request`]); it selects a timing series
+/// only and carries no authority.
 fn request_span(
     request: &HttpRequest<()>,
     tenant_spans: Option<&Arc<dyn wyrd_telemetry::TenantSpanSink>>,
@@ -246,6 +249,7 @@ fn request_span(
         wyrd_telemetry::inbound_context(request.headers()).as_ref(),
         tenant_spans,
     );
+    wyrd_telemetry::timing::label_request(&span, request.headers());
     span
 }
 
@@ -269,14 +273,18 @@ pub async fn serve_grpc(
 /// The caller binds the [`TcpListener`] (e.g. on an OS-assigned `:0` port) and
 /// reads its `local_addr` before serving, so the served address is known with
 /// no bind-then-rebind race — the same listener the address was read from is
-/// the one served. Returns once `shutdown.cancelled()` resolves.
+/// the one served. Every accepted connection disables Nagle's algorithm, as
+/// tonic does only for listeners it binds itself: a unary response ends in a
+/// small trailers write that Nagle holds until the client acknowledges the
+/// previous one, which a delayed ACK stretches to about 40 ms per call.
+/// Returns once `shutdown.cancelled()` resolves.
 #[tracing::instrument(skip(router, listener, shutdown))]
 pub async fn serve_grpc_with_listener(
     router: TonicRouter,
     listener: TcpListener,
     shutdown: CancellationToken,
 ) -> Result<(), GrpcError> {
-    let incoming = tokio_stream::wrappers::TcpListenerStream::new(listener);
+    let incoming = TcpIncoming::from(listener).with_nodelay(Some(true));
     router
         .serve_with_incoming_shutdown(incoming, async move { shutdown.cancelled().await })
         .await
@@ -285,8 +293,8 @@ pub async fn serve_grpc_with_listener(
 
 /// Drive a private peer tonic server on a pre-bound listener to completion.
 ///
-/// Serves like [`serve_grpc_with_listener`], but every accepted connection is
-/// wrapped in [`StoppingIo`], so cancelling `shutdown` fails each connection's
+/// Serves like [`serve_grpc_with_listener`], Nagle included, but every
+/// accepted connection is wrapped in [`StoppingIo`], so cancelling `shutdown` fails each connection's
 /// socket IO. Graceful tonic shutdown alone cannot end a response whose reader
 /// stopped granting HTTP/2 window credit: hyper waits on send capacity and never
 /// polls the body again, so the connection — and every stream, fragment, and
@@ -305,7 +313,8 @@ pub async fn serve_peer_grpc_with_listener(
     shutdown: CancellationToken,
 ) -> Result<(), GrpcError> {
     let connections = shutdown.clone();
-    let incoming = tokio_stream::wrappers::TcpListenerStream::new(listener)
+    let incoming = TcpIncoming::from(listener)
+        .with_nodelay(Some(true))
         .map(move |accepted| accepted.map(|io| StoppingIo::new(io, connections.clone())));
     router
         .serve_with_incoming_shutdown(incoming, async move { shutdown.cancelled().await })

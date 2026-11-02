@@ -47,7 +47,9 @@ use datafusion::physical_expr::expressions::Column;
 use datafusion::physical_plan::ExecutionPlan;
 use datafusion::physical_plan::aggregates::AggregateExec;
 use datafusion::physical_plan::joins::{HashJoinExec, SortMergeJoinExec};
-use datafusion::physical_plan::metrics::{ExecutionPlanMetricsSet, MetricValue, MetricsSet};
+use datafusion::physical_plan::metrics::{
+    Count, ExecutionPlanMetricsSet, MetricBuilder, MetricType, MetricValue, MetricsSet,
+};
 use datafusion::physical_plan::projection::ProjectionExec;
 use datafusion::physical_plan::sorts::sort::SortExec;
 use datafusion::physical_plan::union::UnionExec;
@@ -56,12 +58,13 @@ use datafusion_distributed::{
     DistributedLeafExec, WorkerPlanRewriteEvent, WorkerPlanRewriteEventResponse,
     WorkerPlanRewriteHandler,
 };
+use futures_util::FutureExt;
 use futures_util::future::BoxFuture;
-use futures_util::{FutureExt, TryFutureExt};
 use futures_util::{StreamExt as _, TryStreamExt};
 use iceberg::scan::FileScanTask;
 use iceberg_datafusion::IcebergStaticTableProvider;
 use iceberg_datafusion::physical_plan::IcebergTableScan;
+use object_store::{ObjectStore, ObjectStoreExt as _};
 use parquet::arrow::arrow_reader::ArrowReaderOptions;
 use parquet::arrow::async_reader::AsyncFileReader;
 use parquet::errors::ParquetError;
@@ -72,7 +75,7 @@ use wyrd_spec::vala::BifrostError;
 use crate::catalog::iceberg_storage::BifrostIcebergStorage;
 use crate::catalog::{TimeAxis, TimePrecision};
 use crate::scribe::hot_source::StagedSourceLease;
-use crate::storage::error_chain_contains_not_found;
+use crate::storage::{RangeCache, error_chain_contains_not_found};
 use wyrd_spec::vala::api::{QueryClass, WorkerScanStats};
 
 use super::live::LiveScribeExec;
@@ -272,6 +275,10 @@ impl RemoteScanMetrics {
 pub(crate) struct OracleQueryScanStats {
     /// Physical bytes reported by `DataFusion`'s Parquet scan metric.
     pub(crate) physical_bytes_scanned: Option<u64>,
+    /// Rows the executed local file scans produced, from their `output_rows`
+    /// metric; `None` when no local scan reported it or a remote scan, whose
+    /// participants report no rows, also ran.
+    pub(crate) physical_rows_scanned: Option<u64>,
     /// Number of distinct files executed file scan nodes were planned to read,
     /// less what `DataFusion`'s `FilePruner` skipped when opening them.
     pub(crate) files_scanned: u64,
@@ -308,7 +315,8 @@ impl OracleQueryScanStats {
         stats
     }
 
-    /// Reads the pinned `DataFusion` scan metric once after physical execution.
+    /// Reads the pinned `DataFusion` scan metrics, bytes and output rows, once
+    /// after physical execution.
     ///
     /// Files are counted from the plan before execution, and `DataFusion`
     /// skips files whose statistics exclude them only as it opens each one,
@@ -322,9 +330,13 @@ impl OracleQueryScanStats {
         self.finalized = true;
         let mut total = 0_u64;
         let mut available = false;
+        let mut rows: Option<u64> = None;
         for metrics in &self.physical_metrics {
             let metrics = metrics.clone_inner();
             self.pruning.add(parquet_pruning(&metrics));
+            if let Some(output) = metrics.output_rows() {
+                rows = Some(rows.unwrap_or(0).saturating_add(output as u64));
+            }
             let Some(MetricValue::Count { count, .. }) = metrics.sum_by_name("bytes_scanned")
             else {
                 continue;
@@ -335,6 +347,7 @@ impl OracleQueryScanStats {
         if available {
             self.physical_bytes_scanned = Some(total);
         }
+        self.physical_rows_scanned = rows.filter(|_| self.remote_handles.is_empty());
         for handle in &self.remote_handles {
             let (bytes, files, partitions) = handle.terminal_values();
             self.files_scanned = self.files_scanned.saturating_add(files);
@@ -761,14 +774,19 @@ pub(crate) fn is_stale_iceberg_object_error(error: &DataFusionError) -> bool {
 /// Opens every object an Oracle Parquet scan reads through `DataFusion`'s own
 /// reader factory, and proves each footer's tenant before a row is decoded.
 ///
-/// This is the one Wyrd-specific step of a hot or staged scan; the reads,
-/// footer caching, pruning, and decoding are all `DataFusion`'s.
+/// This and the node's byte-range cache are the Wyrd-specific steps of a hot
+/// or staged scan; the reads, footer caching, pruning, and decoding are all
+/// `DataFusion`'s.
 #[derive(Debug)]
 struct TenantParquetReaderFactory {
     /// `DataFusion`'s reader factory the objects are opened through.
     inner: Arc<dyn ParquetFileReaderFactory>,
     /// Authenticated tenant every footer must name.
     tenant: DataTenantId,
+    /// The node's byte-range cache and the warehouse store it caches, for
+    /// warehouse objects only: a staged scratch path can be reused, so staged
+    /// scans read uncached.
+    ranges: Option<(Arc<RangeCache>, Arc<dyn ObjectStore>)>,
 }
 
 impl ParquetFileReaderFactory for TenantParquetReaderFactory {
@@ -784,11 +802,22 @@ impl ParquetFileReaderFactory for TenantParquetReaderFactory {
         metadata_size_hint: Option<usize>,
         metrics: &ExecutionPlanMetricsSet,
     ) -> DataFusionResult<Box<dyn AsyncFileReader + Send>> {
+        let ranges = self.ranges.as_ref().map(|(cache, store)| CachedRanges {
+            cache: Arc::clone(cache),
+            store: Arc::clone(store),
+            path: file.object_meta.location.clone(),
+            scanned: MetricBuilder::new(metrics)
+                .with_new_label("filename", file.object_meta.location.to_string())
+                .with_type(MetricType::Summary)
+                .bytes_counter("bytes_scanned", partition_index),
+            present: false,
+        });
         Ok(Box::new(TenantParquetReader {
             inner: self
                 .inner
                 .create_reader(partition_index, file, metadata_size_hint, metrics)?,
             tenant: self.tenant,
+            ranges,
         }))
     }
 }
@@ -799,6 +828,53 @@ struct TenantParquetReader {
     inner: Box<dyn AsyncFileReader + Send>,
     /// Authenticated tenant the footer must name.
     tenant: DataTenantId,
+    /// This object's view of the node's byte-range cache, when the object is
+    /// a warehouse object on a node with the cache.
+    ranges: Option<CachedRanges>,
+}
+
+/// One warehouse object's reads through the node's byte-range cache.
+///
+/// A cache hit reads no store, so this keeps the two things a store read
+/// would have done: it counts the hit's bytes in the scan's `bytes_scanned`,
+/// as `DataFusion`'s reader counts every byte it reads, and before its first
+/// hit it confirms the object still exists, so a pinned object that vanished
+/// still fails the scan as stale instead of being answered from the cache.
+struct CachedRanges {
+    /// The node's byte-range cache.
+    cache: Arc<RangeCache>,
+    /// The warehouse store the object lives in.
+    store: Arc<dyn ObjectStore>,
+    /// The object's path in `store` and in `cache`.
+    path: object_store::path::Path,
+    /// The scan's `bytes_scanned` for this object, which hits add to.
+    scanned: Count,
+    /// Whether this reader has confirmed the object exists.
+    present: bool,
+}
+
+impl CachedRanges {
+    /// Returns the cached bytes of `range`, counting them as scanned, once
+    /// the object is confirmed to exist.
+    ///
+    /// # Errors
+    ///
+    /// Returns the store's error, marked stale when the object no longer
+    /// exists.
+    async fn get(&mut self, range: &Range<u64>) -> parquet::errors::Result<Option<Bytes>> {
+        let Some(bytes) = self.cache.get(&self.path, range) else {
+            return Ok(None);
+        };
+        if !self.present {
+            self.store
+                .head(&self.path)
+                .await
+                .map_err(|error| mark_stale(ParquetError::External(Box::new(error))))?;
+            self.present = true;
+        }
+        self.scanned.add(bytes.len());
+        Ok(Some(bytes))
+    }
 }
 
 /// Marks a read failure caused by a vanished object as stale.
@@ -818,30 +894,80 @@ fn mark_stale(error: ParquetError) -> ParquetError {
 }
 
 impl AsyncFileReader for TenantParquetReader {
-    /// Reads one byte range through the inner reader.
+    /// Reads one byte range from the range cache, else through the inner
+    /// reader, caching what it read.
     ///
     /// # Errors
     ///
     /// The returned future fails with the inner reader's error, marked stale
     /// when the object no longer exists.
     fn get_bytes(&mut self, range: Range<u64>) -> BoxFuture<'_, parquet::errors::Result<Bytes>> {
-        self.inner.get_bytes(range).map_err(mark_stale).boxed()
+        async move {
+            if let Some(ranges) = &mut self.ranges
+                && let Some(bytes) = ranges.get(&range).await?
+            {
+                return Ok(bytes);
+            }
+            let bytes = self
+                .inner
+                .get_bytes(range.clone())
+                .await
+                .map_err(mark_stale)?;
+            if let Some(ranges) = &self.ranges {
+                ranges.cache.put(&ranges.path, range, &bytes);
+            }
+            Ok(bytes)
+        }
+        .boxed()
     }
 
-    /// Reads several byte ranges through the inner reader.
+    /// Reads several byte ranges, each from the range cache when it holds
+    /// it; the rest are read together through the inner reader, so its
+    /// coalescing still applies, and cached.
     ///
     /// # Errors
     ///
     /// The returned future fails with the inner reader's error, marked stale
-    /// when the object no longer exists.
+    /// when the object no longer exists, or a general error when the inner
+    /// reader returns fewer ranges than it was asked for.
     fn get_byte_ranges(
         &mut self,
         ranges: Vec<Range<u64>>,
     ) -> BoxFuture<'_, parquet::errors::Result<Vec<Bytes>>> {
-        self.inner
-            .get_byte_ranges(ranges)
-            .map_err(mark_stale)
-            .boxed()
+        async move {
+            let Some(cached) = &mut self.ranges else {
+                return self.inner.get_byte_ranges(ranges).await.map_err(mark_stale);
+            };
+            let mut found: Vec<Option<Bytes>> = Vec::with_capacity(ranges.len());
+            for range in &ranges {
+                found.push(cached.get(range).await?);
+            }
+            let missing: Vec<Range<u64>> = ranges
+                .iter()
+                .zip(&found)
+                .filter(|(_, bytes)| bytes.is_none())
+                .map(|(range, _)| range.clone())
+                .collect();
+            if !missing.is_empty() {
+                let read = self
+                    .inner
+                    .get_byte_ranges(missing.clone())
+                    .await
+                    .map_err(mark_stale)?;
+                let mut read = missing.into_iter().zip(read);
+                for slot in found.iter_mut().filter(|slot| slot.is_none()) {
+                    let (range, bytes) = read.next().ok_or_else(|| {
+                        ParquetError::General(
+                            "the object store returned fewer byte ranges than requested".to_owned(),
+                        )
+                    })?;
+                    cached.cache.put(&cached.path, range, &bytes);
+                    *slot = Some(bytes);
+                }
+            }
+            Ok(found.into_iter().flatten().collect())
+        }
+        .boxed()
     }
 
     /// Loads the footer through the inner reader and proves its tenant.
@@ -891,8 +1017,9 @@ impl TenantWarehouseReads {
         Self { objects, tenant }
     }
 
-    /// Builds `DataFusion`'s warehouse reader factory — cached when the node
-    /// has a footer cache — behind the tenant proof.
+    /// Builds `DataFusion`'s warehouse reader factory — footer-cached when the
+    /// node has a footer cache — behind the tenant proof and the node's
+    /// byte-range cache, when it has one.
     fn reader_factory(&self) -> Arc<dyn ParquetFileReaderFactory> {
         let store = Arc::clone(self.objects.storage().objects());
         let inner: Arc<dyn ParquetFileReaderFactory> = match self.objects.storage().metadata_cache()
@@ -906,6 +1033,12 @@ impl TenantWarehouseReads {
         Arc::new(TenantParquetReaderFactory {
             inner,
             tenant: self.tenant,
+            ranges: self.objects.storage().data_cache().map(|cache| {
+                (
+                    Arc::clone(cache),
+                    Arc::clone(self.objects.storage().objects()),
+                )
+            }),
         })
     }
 
@@ -1035,6 +1168,7 @@ pub(super) fn hot_parquet_scan(
                     LocalFileSystem::new(),
                 ))),
                 tenant,
+                ranges: None,
             }),
             None,
             lease,
@@ -1105,8 +1239,9 @@ pub(super) fn hot_parquet_scan(
 /// as sources [`hot_parquet_scan`] reads exactly like hot files.
 ///
 /// Iceberg only lists the files, planned with the scan's pushed predicate so
-/// manifest statistics drop files. A scan of a table with no snapshot returns
-/// no file without building an Iceberg scan.
+/// manifest statistics drop files, reading at most `concurrency` manifests and
+/// entries at once. A scan of a table with no snapshot returns no file without
+/// building an Iceberg scan.
 ///
 /// Wyrd writes no delete file and no encrypted file. A planned file with
 /// either is refused: the reader would ignore its deletes, and an encrypted
@@ -1119,9 +1254,9 @@ pub(super) fn hot_parquet_scan(
 /// file with key metadata, and a not-implemented error for a file with deletes.
 pub(super) async fn published_files(
     scan: &IcebergTableScan,
+    concurrency: usize,
 ) -> DataFusionResult<Vec<HotFileSource>> {
-    // A scan of a table with no snapshot plans no file; skip building
-    // Iceberg's scan, which probes the host's parallelism each time.
+    // A scan of a table with no snapshot plans no file.
     if scan.snapshot_id().is_none() && scan.table().metadata().current_snapshot().is_none() {
         return Ok(Vec::new());
     }
@@ -1131,7 +1266,8 @@ pub(super) async fn published_files(
     let mut builder = scan
         .table()
         .scan()
-        .with_schema_id(scan.table().metadata().current_schema_id());
+        .with_schema_id(scan.table().metadata().current_schema_id())
+        .with_concurrency_limit(concurrency);
     if let Some(snapshot_id) = scan.snapshot_id() {
         builder = builder.snapshot_id(snapshot_id);
     }
@@ -1302,13 +1438,30 @@ pub(crate) struct OracleTableProvider {
     /// own scope; the routes are set once, before the physical plan reads
     /// them in [`TableProvider::scan`].
     live: std::sync::OnceLock<super::live::LiveTableRoutes>,
-    /// The published files Iceberg last listed and the pushed filters it
-    /// listed them with.
+    /// The files last planned and the pushed filters they were planned with.
     ///
-    /// Sizing lists a scan's files before the physical plan does; the scan
-    /// with the same filters reuses that listing instead of reading the
-    /// manifests twice.
-    listed: std::sync::Mutex<Option<(Vec<Expr>, Vec<HotFileSource>)>>,
+    /// Sizing plans a scan's files before the physical plan does; the scan
+    /// with the same filters reuses them instead of listing the manifests,
+    /// rebuilding every file's statistics, and looking every footer up in
+    /// the node's footer cache again.
+    planned: std::sync::Mutex<Option<(Vec<Expr>, Arc<PlannedFiles>)>>,
+}
+
+/// One scan's files as planned for its pushed filters, shared by sizing and
+/// the physical scan.
+///
+/// Each kept file's statistics are built and its footer looked up once per
+/// query here rather than once per caller.
+#[derive(Debug)]
+struct PlannedFiles {
+    /// Every file the scan reads: the published files Iceberg keeps under the
+    /// pushed filters, then the hot files.
+    files: Vec<HotFileSource>,
+    /// The files whose declared bounds leave them possibly matching the
+    /// pushed filters; a footer is read only for these.
+    kept: Vec<HotFileSource>,
+    /// Each kept file's footer in `kept` order, `None` for one not read.
+    footers: Vec<Option<Arc<ParquetMetaData>>>,
 }
 
 impl fmt::Debug for OracleTableProvider {
@@ -1396,7 +1549,7 @@ impl OracleTableProvider {
             context,
             table: table_name,
             live: live.map(std::sync::OnceLock::from).unwrap_or_default(),
-            listed: std::sync::Mutex::new(None),
+            planned: std::sync::Mutex::new(None),
         })
     }
 }
@@ -1460,24 +1613,29 @@ impl OracleTableProvider {
             .await
     }
 
+    /// Plans the files one scan under the pushed `filters` reads, reusing
+    /// the previous plan when it was made with the same filters.
+    ///
     /// Lists the pinned snapshot's published files Iceberg keeps under
-    /// `filters`, reusing the previous listing when it was made with the same
-    /// filters.
+    /// `filters` and appends the hot files, keeps those [`Self::keep`] cannot
+    /// rule out under `filters`, and loads the kept files' footers through
+    /// [`Self::cache_footers`]. Sizing and the physical scan both call this,
+    /// so one query lists, prunes, and looks its footers up once.
     ///
     /// # Errors
     ///
     /// Returns a `DataFusion` error when Iceberg cannot list the snapshot's
     /// files or a listed file is refused (see [`published_files`]).
-    async fn listed_files(
+    async fn planned_files(
         &self,
         state: &dyn Session,
         filters: &[Expr],
-    ) -> DataFusionResult<Vec<HotFileSource>> {
-        if let Ok(listed) = self.listed.lock()
-            && let Some((listed_filters, files)) = listed.as_ref()
-            && listed_filters.as_slice() == filters
+    ) -> DataFusionResult<Arc<PlannedFiles>> {
+        if let Ok(planned) = self.planned.lock()
+            && let Some((planned_filters, files)) = planned.as_ref()
+            && planned_filters.as_slice() == filters
         {
-            return Ok(files.clone());
+            return Ok(Arc::clone(files));
         }
         let published = self.iceberg.scan(state, None, filters, None).await?;
         let published = published
@@ -1485,11 +1643,32 @@ impl OracleTableProvider {
             .ok_or_else(|| {
                 DataFusionError::Plan("Oracle requires the pinned IcebergTableScan".to_owned())
             })?;
-        let files = published_files(published).await?;
-        if let Ok(mut listed) = self.listed.lock() {
-            *listed = Some((filters.to_vec(), files.clone()));
+        let mut files = published_files(published, state.config().target_partitions()).await?;
+        files.extend(self.hot_files.iter().cloned());
+        let pushed = crate::scan_sizing::ScanScope {
+            columns: Vec::new(),
+            filters: filters.to_vec(),
+        };
+        let keep = self.keep(
+            &files,
+            &crate::scan_sizing::ScanSizer::new(&pushed, &self.physical_schema),
+        );
+        let kept: Vec<HotFileSource> = files
+            .iter()
+            .zip(keep)
+            .filter(|(_, keep)| *keep)
+            .map(|(file, _)| file.clone())
+            .collect();
+        let footers = self.cache_footers(&kept, state.config().options()).await;
+        let planned = Arc::new(PlannedFiles {
+            files,
+            kept,
+            footers,
+        });
+        if let Ok(mut memo) = self.planned.lock() {
+            *memo = Some((filters.to_vec(), Arc::clone(&planned)));
         }
-        Ok(files)
+        Ok(planned)
     }
 
     /// Returns the canonical name of the table this provider reads.
@@ -1506,11 +1685,12 @@ impl OracleTableProvider {
     /// Estimates what one scan of this table reads, before its physical plan
     /// exists: the bytes, and the row groups of its Parquet files.
     ///
-    /// The files are the published ones Iceberg keeps under `pushed` plus the
-    /// hot files, the same files [`Self::persisted_input`] scans, less those
-    /// [`Self::kept_files`] rules out by their declared bounds. Each kept
-    /// file is sized by [`crate::scan_sizing::ScanSizer::file_size`] from
-    /// its cached footer, and the live routes count the bytes Scribe reported
+    /// The files are those [`Self::planned_files`] keeps under `pushed`, the
+    /// same files [`Self::persisted_input`] scans, less those [`Self::keep`]
+    /// rules out under the scope's filters, which may add conjuncts evaluated
+    /// above the scan. Each remaining file is sized by
+    /// [`crate::scan_sizing::ScanSizer::file_size`] from the footer planning
+    /// already loaded, and the live routes count the bytes Scribe reported
     /// for the same scope; live data has no row groups.
     ///
     /// # Errors
@@ -1524,12 +1704,14 @@ impl OracleTableProvider {
         scope: &crate::scan_sizing::ScanScope,
     ) -> DataFusionResult<crate::scan_sizing::ScanSize> {
         let sizer = crate::scan_sizing::ScanSizer::new(scope, &self.physical_schema);
-        let files = self.kept_files(&self.scanned_files(state, pushed).await?, &sizer);
-        let footers = self.cache_footers(&files, state.config().options()).await;
-        let persisted = files
+        let planned = self.planned_files(state, pushed).await?;
+        let persisted = planned
+            .kept
             .iter()
-            .zip(&footers)
-            .map(|(file, footer)| {
+            .zip(&planned.footers)
+            .zip(self.keep(&planned.kept, &sizer))
+            .filter(|(_, keep)| *keep)
+            .map(|((file, footer), _)| {
                 sizer.file_size(
                     footer.as_deref(),
                     u64::try_from(file.size_bytes).unwrap_or(u64::MAX),
@@ -1550,17 +1732,18 @@ impl OracleTableProvider {
         }))
     }
 
-    /// Returns the `files` whose declared bounds leave them possibly matching
-    /// `sizer`'s filters, by [`crate::scan_sizing::ScanSizer::keep`].
+    /// Returns, in `files` order, whether each file's declared bounds leave
+    /// it possibly matching `sizer`'s filters, by
+    /// [`crate::scan_sizing::ScanSizer::keep`].
     ///
     /// These are the bounds the scan's file pruner excludes a file by before
     /// its footer is opened, so a footer is fetched only for a file the scan
     /// may read.
-    fn kept_files(
+    fn keep(
         &self,
         files: &[HotFileSource],
         sizer: &crate::scan_sizing::ScanSizer<'_>,
-    ) -> Vec<HotFileSource> {
+    ) -> Vec<bool> {
         let statistics: Vec<_> = files
             .iter()
             .map(|file| {
@@ -1570,30 +1753,7 @@ impl OracleTableProvider {
                 )
             })
             .collect();
-        let keep = sizer.keep(&statistics, files.len());
-        files
-            .iter()
-            .zip(keep)
-            .filter(|(_, keep)| *keep)
-            .map(|(file, _)| file.clone())
-            .collect()
-    }
-
-    /// Returns the files one persisted scan reads: the published files
-    /// Iceberg keeps under `filters`, then the hot files.
-    ///
-    /// # Errors
-    ///
-    /// Returns a `DataFusion` error when Iceberg cannot list the snapshot's
-    /// files or a listed file is refused (see [`published_files`]).
-    async fn scanned_files(
-        &self,
-        state: &dyn Session,
-        filters: &[Expr],
-    ) -> DataFusionResult<Vec<HotFileSource>> {
-        let mut files = self.listed_files(state, filters).await?;
-        files.extend(self.hot_files.iter().cloned());
-        Ok(files)
+        sizer.keep(&statistics, files.len())
     }
 
     /// Builds this cut's persisted leaf: one `DataFusion` Parquet scan over
@@ -1615,26 +1775,17 @@ impl OracleTableProvider {
         filters: &[Expr],
     ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
         let options = state.config().options();
-        let files = self.scanned_files(state, filters).await?;
+        let planned = self.planned_files(state, filters).await?;
         // The row groups of the files the pushed filters keep, whose footers
-        // were cached when the scan was sized; one not read leaves the row
+        // were loaded when the scan was sized; one not read leaves the row
         // groups unknown and the scan every partition.
-        let pushed = crate::scan_sizing::ScanScope {
-            columns: Vec::new(),
-            filters: filters.to_vec(),
-        };
-        let kept = self.kept_files(
-            &files,
-            &crate::scan_sizing::ScanSizer::new(&pushed, &self.physical_schema),
-        );
-        let max_partitions = self
-            .cache_footers(&kept, options)
-            .await
+        let max_partitions = planned
+            .footers
             .iter()
             .map(|footer| footer.as_ref().map(|footer| footer.num_row_groups()))
             .sum();
         hot_parquet_scan(
-            files,
+            planned.files.clone(),
             HotObjects::Warehouse(Arc::clone(&self.objects)),
             self.context.data_tenant_id,
             required_schema,
@@ -1915,6 +2066,10 @@ pub(super) fn project_plan_by_name(
 
 /// Projects one physical batch to the pinned schema by field name.
 ///
+/// Each field is first matched at its own position and found by name only
+/// when that position holds a different field, so a batch already in the
+/// pinned order costs no per-field schema scan.
+///
 /// The row count is carried explicitly rather than inferred from the columns,
 /// because a projected schema is legitimately allowed to be empty: an output
 /// projection for `count(*)` has zero columns and a real row count. Arrow
@@ -1929,16 +2084,23 @@ pub(super) fn project_batch(
     batch: &RecordBatch,
     schema: SchemaRef,
 ) -> DataFusionResult<RecordBatch> {
+    let source = batch.schema_ref().fields();
     let columns = schema
         .fields()
         .iter()
-        .map(|field| {
-            let index = batch.schema().index_of(field.name()).map_err(|_| {
-                DataFusionError::Execution(format!(
-                    "hot file is missing required field `{}`",
-                    field.name()
-                ))
-            })?;
+        .enumerate()
+        .map(|(position, field)| {
+            // Hot batches normally arrive already projected in the target
+            // order, so the same position is checked before a name scan.
+            let index = match source.get(position) {
+                Some(candidate) if candidate.name() == field.name() => position,
+                _ => batch.schema_ref().index_of(field.name()).map_err(|_| {
+                    DataFusionError::Execution(format!(
+                        "hot file is missing required field `{}`",
+                        field.name()
+                    ))
+                })?,
+            };
             let column = batch.column(index);
             if column.data_type() == field.data_type() {
                 Ok(Arc::clone(column))
@@ -2072,6 +2234,45 @@ pub(super) mod tests {
         stats.finalize();
         assert_eq!(stats.physical_bytes_scanned, Some(18));
         assert_eq!(stats.files_scanned, 2);
+    }
+
+    /// Local file scans' output rows sum across partitions and scans, and
+    /// are unavailable when no scan reported them or a remote scan also ran.
+    ///
+    /// # Panics
+    ///
+    /// Panics when a summed or unavailable row count is wrong.
+    #[test]
+    fn scan_stats_sum_local_output_rows() {
+        use datafusion::physical_plan::metrics::{ExecutionPlanMetricsSet, MetricBuilder};
+        let scan = |rows: &[usize]| {
+            let set = ExecutionPlanMetricsSet::new();
+            for (partition, rows) in rows.iter().enumerate() {
+                MetricBuilder::new(&set).output_rows(partition).add(*rows);
+            }
+            set
+        };
+        let mut stats = OracleQueryScanStats {
+            physical_metrics: vec![scan(&[3, 4]), scan(&[5])],
+            ..OracleQueryScanStats::default()
+        };
+        stats.finalize();
+        assert_eq!(stats.physical_rows_scanned, Some(12));
+
+        let mut unreported = OracleQueryScanStats {
+            physical_metrics: vec![ExecutionPlanMetricsSet::new()],
+            ..OracleQueryScanStats::default()
+        };
+        unreported.finalize();
+        assert_eq!(unreported.physical_rows_scanned, None);
+
+        let mut mixed = OracleQueryScanStats {
+            physical_metrics: vec![scan(&[3])],
+            remote_handles: vec![Arc::new(RemoteScanMetrics::default())],
+            ..OracleQueryScanStats::default()
+        };
+        mixed.finalize();
+        assert_eq!(mixed.physical_rows_scanned, None);
     }
 
     /// Terminal aggregation is monotonic and emits exactly once after a drop.
@@ -3687,6 +3888,94 @@ pub(super) mod tests {
     /// # Panics
     /// Panics if provider construction, scan planning, or execution violates
     /// the closure contract this owner pins.
+    /// A batch is projected to the pinned schema by name whether its fields
+    /// already sit at their pinned positions or not.
+    ///
+    /// The positional match is taken only when the field at a position has
+    /// the pinned name; a reordered batch falls back to the name lookup, and a
+    /// missing field is still refused.
+    ///
+    /// # Panics
+    ///
+    /// Panics if a fixture batch cannot be built or a projection picks a
+    /// column other than the one its name names.
+    #[test]
+    fn project_batch_matches_positions_then_names() {
+        let pinned = Arc::new(Schema::new(vec![
+            Field::new("duration_ms", DataType::Int64, true),
+            Field::new("status_code", DataType::Utf8, true),
+        ]));
+        let durations = Arc::new(Int64Array::from(vec![41_i64])) as ArrayRef;
+        let statuses = Arc::new(StringArray::from(vec!["STATUS_CODE_OK"])) as ArrayRef;
+        let ordered = RecordBatch::try_new(
+            Arc::clone(&pinned),
+            vec![Arc::clone(&durations), Arc::clone(&statuses)],
+        )
+        .expect("ordered batch");
+        let reordered = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![
+                Field::new("status_code", DataType::Utf8, true),
+                Field::new("duration_ms", DataType::Int64, true),
+            ])),
+            vec![Arc::clone(&statuses), Arc::clone(&durations)],
+        )
+        .expect("reordered batch");
+        for batch in [&ordered, &reordered] {
+            let projected = project_batch(batch, Arc::clone(&pinned)).expect("projects");
+            assert_eq!(projected.schema(), pinned);
+            assert!(Arc::ptr_eq(projected.column(0), &durations));
+            assert!(Arc::ptr_eq(projected.column(1), &statuses));
+        }
+        let missing = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![Field::new(
+                "duration_ms",
+                DataType::Int64,
+                true,
+            )])),
+            vec![durations],
+        )
+        .expect("narrow batch");
+        assert!(project_batch(&missing, pinned).is_err());
+    }
+
+    /// Sizing and the physical scan share one file plan per pushed filters.
+    ///
+    /// A second plan under the same filters returns the memoized plan rather
+    /// than listing, pruning, and looking footers up again; different filters
+    /// plan afresh and replace it.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the fixture provider cannot plan its files or the memo is
+    /// not reused exactly when the filters match.
+    #[tokio::test]
+    async fn planned_files_are_reused_for_the_same_pushed_filters() {
+        use datafusion::execution::context::SessionContext;
+        use datafusion::logical_expr::{col, lit};
+
+        let (provider, _) = projection_closure_provider(DataTenantId::new_v7(), None).await;
+        let session = SessionContext::new_with_config(
+            crate::resources::OracleSessionShape::for_test().session_config(),
+        )
+        .state();
+        let error = [col("status_code").eq(lit("STATUS_CODE_ERROR"))];
+        let first = provider
+            .planned_files(&session, &error)
+            .await
+            .expect("first plan");
+        let again = provider
+            .planned_files(&session, &error)
+            .await
+            .expect("same filters plan");
+        assert!(Arc::ptr_eq(&first, &again));
+        let ok = [col("status_code").eq(lit("STATUS_CODE_OK"))];
+        let other = provider
+            .planned_files(&session, &ok)
+            .await
+            .expect("other filters plan");
+        assert!(!Arc::ptr_eq(&first, &other));
+    }
+
     #[tokio::test]
     async fn projected_leaf_union_outputs_the_requested_closure() {
         use datafusion::execution::context::SessionContext;
@@ -4051,6 +4340,145 @@ pub(super) mod tests {
         assert_eq!(
             column.max_value,
             Precision::Exact(ScalarValue::TimestampNanosecond(Some(2_999), zone))
+        );
+    }
+
+    /// An object reader over fixed bytes that records every range batch it
+    /// is asked for.
+    struct RecordingReader {
+        /// The object's bytes.
+        data: Bytes,
+        /// Each batch of ranges read, in call order.
+        reads: Arc<std::sync::Mutex<Vec<Vec<Range<u64>>>>>,
+    }
+
+    impl RecordingReader {
+        /// Records `ranges` and returns their bytes.
+        ///
+        /// # Panics
+        ///
+        /// Panics if the record's lock is poisoned or a range is outside the data.
+        fn read(&self, ranges: Vec<Range<u64>>) -> Vec<Bytes> {
+            let bytes = ranges
+                .iter()
+                .map(|range| {
+                    self.data.slice(
+                        usize::try_from(range.start).expect("in range")
+                            ..usize::try_from(range.end).expect("in range"),
+                    )
+                })
+                .collect();
+            self.reads.lock().expect("unpoisoned").push(ranges);
+            bytes
+        }
+    }
+
+    impl AsyncFileReader for RecordingReader {
+        /// Reads one recorded range.
+        ///
+        /// # Errors
+        ///
+        /// Never fails.
+        fn get_bytes(
+            &mut self,
+            range: Range<u64>,
+        ) -> BoxFuture<'_, parquet::errors::Result<Bytes>> {
+            let mut bytes = self.read(vec![range]);
+            futures_util::future::ready(Ok(bytes.remove(0))).boxed()
+        }
+
+        /// Reads one recorded batch of ranges.
+        ///
+        /// # Errors
+        ///
+        /// Never fails.
+        fn get_byte_ranges(
+            &mut self,
+            ranges: Vec<Range<u64>>,
+        ) -> BoxFuture<'_, parquet::errors::Result<Vec<Bytes>>> {
+            futures_util::future::ready(Ok(self.read(ranges))).boxed()
+        }
+
+        /// Has no footer.
+        ///
+        /// # Errors
+        ///
+        /// Always fails.
+        fn get_metadata<'a>(
+            &'a mut self,
+            _options: Option<&'a ArrowReaderOptions>,
+        ) -> BoxFuture<'a, parquet::errors::Result<Arc<ParquetMetaData>>> {
+            futures_util::future::ready(Err(ParquetError::General("no footer".to_owned()))).boxed()
+        }
+    }
+
+    /// Proves a warehouse reader serves cached ranges without a store read,
+    /// reads only the uncached ones of a batch together, and returns every
+    /// range's bytes in request order.
+    ///
+    /// # Panics
+    ///
+    /// Panics when a cached range reaches the store, an uncached one does
+    /// not, or a range's bytes differ from the object's.
+    #[tokio::test]
+    async fn warehouse_reads_serve_cached_ranges_and_read_only_the_rest() {
+        let data = Bytes::from_static(b"0123456789abcdef");
+        let path = object_store::path::Path::from("tenant/spans/a.parquet");
+        let store: Arc<dyn ObjectStore> = Arc::new(object_store::memory::InMemory::new());
+        store
+            .put(&path, data.clone().into())
+            .await
+            .expect("the object is stored");
+        let cache = Arc::new(RangeCache::new(1 << 20));
+        let reads = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let reader = |scanned: &Count| TenantParquetReader {
+            inner: Box::new(RecordingReader {
+                data: data.clone(),
+                reads: Arc::clone(&reads),
+            }),
+            tenant: DataTenantId::new_v7(),
+            ranges: Some(CachedRanges {
+                cache: Arc::clone(&cache),
+                store: Arc::clone(&store),
+                path: path.clone(),
+                scanned: scanned.clone(),
+                present: false,
+            }),
+        };
+        let scanned = Count::new();
+        let mut first = reader(&scanned);
+        let read = first
+            .get_byte_ranges(vec![0..4, 8..12])
+            .await
+            .expect("the first read succeeds");
+        assert_eq!(read, [data.slice(0..4), data.slice(8..12)]);
+        let read = first
+            .get_byte_ranges(vec![0..4, 4..8, 8..12])
+            .await
+            .expect("the second read succeeds");
+        assert_eq!(
+            read,
+            [data.slice(0..4), data.slice(4..8), data.slice(8..12)]
+        );
+        assert_eq!(
+            first.get_bytes(4..8).await.expect("a cached read succeeds"),
+            data.slice(4..8)
+        );
+        assert_eq!(
+            *reads.lock().expect("unpoisoned"),
+            [vec![0..4, 8..12], std::iter::once(4..8).collect()],
+            "only uncached ranges reach the store"
+        );
+        assert_eq!(scanned.value(), 12, "cache hits count as scanned bytes");
+
+        store.delete(&path).await.expect("the object is removed");
+        let error = reader(&Count::new())
+            .get_bytes(0..4)
+            .await
+            .expect_err("a vanished object is not answered from the cache");
+        assert!(
+            matches!(&error, ParquetError::External(source) if source.is::<OracleIcebergStaleObject>()),
+            "a vanished object fails as stale: {error}"
         );
     }
 }

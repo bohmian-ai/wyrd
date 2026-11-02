@@ -1,7 +1,12 @@
-//! WAL manifest — atomic per-seal-key `sealed_lsn` tracking.
+//! WAL manifest — atomic per-seal-key `sealed_lsn` tracking for one shard lane.
 //!
-//! The manifest records, per seal-key, the highest LSN fully committed to
-//! `file_list` (`sealed_lsn`). Replay skips WAL records at or below this watermark.
+//! Each shard lane's WAL directory holds its own manifest recording, per
+//! seal-key, an LSN at or below which every record that lane wrote is durable
+//! elsewhere (`sealed_lsn`). Staging does not write it: a staged member's own
+//! record carries its WAL range, and that range is folded in only when the
+//! record is about to be removed and once at startup, before replay reads the
+//! manifest. Replay retirements fold theirs in before their segments retire.
+//! Replay skips that lane's WAL records at or below this watermark.
 //! Written atomically via write-fsync-rename-fsync-parent.
 
 use std::collections::HashMap;
@@ -136,6 +141,40 @@ pub fn write_atomic(path: impl AsRef<Path>, manifest: &Manifest) -> Result<(), S
     }
 
     Ok(())
+}
+
+/// Serializes every manifest read-modify-write in this process, so two
+/// advances of one shard manifest never lose each other's watermark.
+// ponytail: one process-wide lock; per-path locks if manifest advances contend.
+static ADVANCE_GUARD: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// Raises one shard manifest's watermarks, never lowering any, and writes it
+/// atomically.
+///
+/// Callers fold a durable fact (a staged record, a replay retirement) into
+/// the manifest before they remove the evidence that implied it. A manifest
+/// whose shard directory is absent has no WAL left to suppress, so nothing
+/// is written.
+///
+/// # Errors
+/// Returns [`ScribeError::Internal`] when the manifest cannot be read, parsed,
+/// or atomically replaced.
+pub fn advance(
+    path: &Path,
+    stream: StreamIdentity,
+    watermarks: impl IntoIterator<Item = (SealKey, WalLsn)>,
+) -> Result<(), ScribeError> {
+    if path.parent().is_some_and(|parent| !parent.exists()) {
+        return Ok(());
+    }
+    let _guard = ADVANCE_GUARD
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let mut manifest = read_manifest(path)?.unwrap_or_else(|| Manifest::new(stream));
+    for (seal_key, lsn) in watermarks {
+        manifest.update_sealed_lsn(&seal_key, lsn);
+    }
+    write_atomic(path, &manifest)
 }
 
 /// Read the manifest from the given path.

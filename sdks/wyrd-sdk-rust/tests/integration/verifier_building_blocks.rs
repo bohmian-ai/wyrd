@@ -33,8 +33,7 @@ use wyrd_ai::state::WyrdState;
 use wyrd_ai::verify::{Execution, File, Input, Inputs, Submission};
 use wyrd_ai::{
     Bifrost, CallProvenance, Citation, Locator, MediaFormat, RequirementOutcome, RequirementResult,
-    StepResult, StepStatus, VerificationOutcome, VerificationResult, VerificationVerdict,
-    WyrdClient,
+    StepResult, StepStatus, VerificationResult, VerificationVerdict, WyrdClient,
 };
 use wyrd_spec::auth::TokenAudience;
 use wyrd_testing::server::WyrdTestServer;
@@ -898,6 +897,52 @@ async fn submitted_review_is_judged_in_the_background() {
     desk.deployment.shutdown().await;
 }
 
+/// A submitted File's settled status reads back the result wait returned,
+/// with the original File declaration as its evidence.
+///
+/// # Panics
+/// Panics when the submission is refused or the readback differs.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires the repository-managed Postgres journey lifecycle"]
+async fn stored_evidence_readback_uses_canonical_records() {
+    let desk = PolicyDesk::start().await;
+    let bytes = b"a,b\n5,6".to_vec();
+    let Submission::Queued(execution) = desk
+        .state
+        .run()
+        .observe()
+        .submit(
+            "document-formats",
+            File::bytes(bytes.clone()).with_format(MediaFormat::Csv),
+        )
+        .await
+        .expect("the File is submitted")
+    else {
+        panic!("Run evidence queues an execution");
+    };
+    let result = execution.wait(WAIT).await.expect("the File settles");
+    let status = execution.status().await.expect("the settled status reads");
+
+    assert_eq!(status.result.as_ref(), Some(&result));
+    let evidence = serde_json::to_value(&result.outcome.evidence).expect("evidence encodes");
+    let declarations: Vec<&Value> = evidence
+        .as_object()
+        .expect("evidence is by slot")
+        .values()
+        .collect();
+    assert_eq!(
+        declarations,
+        [&json!({
+            "kind": "file",
+            "sha256": wyrd_spec::auth::Sha256Hex::digest(&bytes).to_string(),
+            "size_bytes": bytes.len(),
+            "format": "csv",
+        })],
+        "{evidence}"
+    );
+    desk.deployment.shutdown().await;
+}
+
 /// Each of the nine extractable formats extracts into its exact locked
 /// output, which the downstream assertion consumes.
 ///
@@ -1366,11 +1411,18 @@ enum Scored {
     },
 }
 
-/// One retained result's outcome, read back as JSON text.
+/// One retained execution's output, read back as JSON text.
 #[derive(Debug, Deserialize)]
-struct RetainedOutcome {
-    /// The stored outcome Variant as JSON text.
-    outcome: String,
+struct RetainedOutput {
+    /// The stored output Variant as JSON text.
+    output: String,
+}
+
+/// The requirements a retained output Variant holds.
+#[derive(Debug, Deserialize)]
+struct RetainedRequirements {
+    /// Every retained requirement, step requirements included.
+    requirements: Vec<RequirementResult>,
 }
 
 /// Assert `result` carries `scored-review`'s readback for a four-word answer:
@@ -1445,8 +1497,8 @@ async fn custom_verdict_data_survives_readback() {
 
     assert_eq!(
         retained(&desk, &waited).await,
-        waited.outcome,
-        "the retained outcome keeps its data"
+        waited.outcome.requirements,
+        "the retained output keeps its data"
     );
 
     for (marker, data) in exact_data() {
@@ -1472,32 +1524,32 @@ async fn custom_verdict_data_survives_readback() {
         assert_eq!(status.result.as_ref(), Some(&waited), "{marker}: status");
         assert_eq!(
             retained(&desk, &waited).await,
-            waited.outcome,
+            waited.outcome.requirements,
             "{marker}: retained"
         );
     }
     desk.deployment.shutdown().await;
 }
 
-/// The retained outcome of `result`'s execution, read back from Bifrost
+/// The retained requirements of `result`'s execution, read back from Bifrost
 /// after publishing pending rows.
 ///
 /// # Panics
 /// Panics when rows do not publish or the execution has not exactly one
-/// decodable retained outcome.
-async fn retained(desk: &PolicyDesk, result: &VerificationResult) -> VerificationOutcome {
+/// decodable retained output.
+async fn retained(desk: &PolicyDesk, result: &VerificationResult) -> Vec<RequirementResult> {
     desk.deployment
         .server()
         .flush_bifrost()
         .await
         .expect("rows publish");
-    let retained: Vec<RetainedOutcome> =
+    let retained: Vec<RetainedOutput> =
         Bifrost::connect_with(&desk.deployment.admin(), BifrostOptions::default())
             .await
             .expect("Bifrost connects")
             .sql_as(
-                "SELECT to_json(outcome) AS outcome \
-                   FROM bifrost.verification.results WHERE execution_id = $1",
+                "SELECT to_json(output) AS output \
+                   FROM bifrost.verification.execution_outputs WHERE execution_id = $1",
                 &[QueryParam::String(result.execution_id.to_string())],
             )
             .await
@@ -1505,7 +1557,9 @@ async fn retained(desk: &PolicyDesk, result: &VerificationResult) -> Verificatio
     let [retained] = retained.as_slice() else {
         panic!("one retained result: {retained:?}");
     };
-    serde_json::from_str(&retained.outcome).expect("the outcome decodes")
+    serde_json::from_str::<RetainedRequirements>(&retained.output)
+        .expect("the output decodes")
+        .requirements
 }
 
 /// The `well-formed` code check's data at its inclusive bounds, by answer
@@ -1970,4 +2024,72 @@ async fn uploaded_artifacts_are_reused_by_service_judges() {
         );
     }
     deployment.shutdown().await;
+}
+
+/// A path-backed and an in-memory File each travel the shared upload and
+/// completion and are read back by the Verifier; each is then a completed
+/// File the server's next evidence plan reuses instead of uploading again.
+///
+/// # Panics
+/// Panics when a verify or plan is refused, or an output or plan differs.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires the repository-managed Postgres journey lifecycle"]
+async fn file_inputs_use_shared_uploads() {
+    let desk = PolicyDesk::start().await;
+    let path = fixture("cards/verifier_building_blocks/samples/sample.csv");
+    let in_memory = b"a,b\n3,4".to_vec();
+    for (file, rows) in [
+        (File::path(path.clone()), json!([["a", "b"], ["1", "2"]])),
+        (
+            File::bytes(in_memory.clone()).with_format(MediaFormat::Csv),
+            json!([["a", "b"], ["3", "4"]]),
+        ),
+    ] {
+        let result = desk
+            .state
+            .run()
+            .observe()
+            .verify("document-formats", file)
+            .await
+            .expect("the File is uploaded and read");
+        assert_eq!(
+            step(&result, "read").output.as_ref(),
+            Some(&json!({"format": "csv", "rows": rows}))
+        );
+    }
+
+    let token = desk
+        .client
+        .access_token()
+        .await
+        .expect("access token mints");
+    let base_url = desk
+        .deployment
+        .server()
+        .base_url()
+        .expect("bound server has a URL");
+    for bytes in [std::fs::read(&path).expect("the sample reads"), in_memory] {
+        let files = json!({ "files": [{
+            "sha256": wyrd_spec::auth::Sha256Hex::digest(&bytes).to_string(),
+            "size_bytes": bytes.len(),
+        }] });
+        let planned: Value = reqwest::Client::new()
+            .post(format!("{base_url}/v1/verification/evidence"))
+            .header("x-wyrd-access-token", format!("Bearer {}", token.expose()))
+            .json(&files)
+            .send()
+            .await
+            .expect("the server answers")
+            .error_for_status()
+            .expect("the plan is admitted")
+            .json()
+            .await
+            .expect("the plan decodes");
+        assert_eq!(
+            planned["uploads"],
+            json!([]),
+            "the completed File is reused"
+        );
+    }
+    desk.deployment.shutdown().await;
 }

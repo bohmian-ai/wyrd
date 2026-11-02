@@ -1,223 +1,143 @@
-//! One measured step: open-loop Drift emission through a fresh `WyrdState`,
-//! then drain, durable read-back, and the server's own accounting.
+//! One client-queue lane: open-loop Drift emission through a fresh
+//! `WyrdState` until a deadline, then drain, durable read-back, and the
+//! client-owned byte trend.
 //!
 //! Every observation carries [`FEATURES`] numeric features and so lands
 //! [`FEATURES`] rows under one `record_id`. Admission is all-or-none per
 //! observation, so a `QUEUE_FULL` refusal admitted no row; open-loop pacing
-//! counts it and moves on rather than resubmitting.
+//! records when it happened and moves on rather than resubmitting.
 
 use std::time::Duration;
 
 use num_traits::ToPrimitive;
-use serde::Serialize;
 use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
+use tokio_util::task::AbortOnDropHandle;
 use wyrd_client::QueueConfig;
 use wyrd_client::state::WyrdState;
-use wyrd_testing::capacity::driver_cpu_seconds;
-use wyrd_testing::release_server::{LocalServer, Metrics};
 
 use crate::client_queue::Result;
-use crate::client_queue::fixture::DRIFT_VERIFIER;
-use crate::client_queue::fixture::Tenant;
+use crate::client_queue::fixture::{DRIFT_VERIFIER, Tenant};
 use crate::client_queue::proxy::DelayProxy;
 
-/// Numeric features, and so durable rows, of one observation (AC-041).
+/// Numeric features, and so durable rows, of one observation.
 pub const FEATURES: usize = 100;
 
 /// Client-owned byte sampling interval.
 const SAMPLE_EVERY: Duration = Duration::from_millis(250);
 
-/// Trailing window whose byte slope decides growth.
+/// Trailing window whose byte slope decides growth, seconds.
 const SLOPE_WINDOW: f64 = 10.0;
 
-/// The longest drain AC-041 accepts after load stops.
-const DRAIN_LIMIT: f64 = 1.0;
-
-/// How long admitted rows may take to become queryable before the step
-/// records what it found; generous because Scribe publishes on its own
-/// cadence, and a miss is reported, never hidden.
-const DURABLE_WAIT: Duration = Duration::from_secs(300);
+/// How long admitted rows may take to become queryable before the lane
+/// records what it found; a shortfall is a mismatch, never hidden.
+const DURABLE_WAIT: Duration = Duration::from_secs(60);
 
 /// Refusal code of a saturated producer.
 const QUEUE_FULL: &str = "WYRD_CLIENT_429_QUEUE_FULL";
 
-/// What one step offers.
-pub struct Plan {
-    /// Report label.
-    pub name: String,
+/// The server's default gRPC listener, which the delay proxy fronts.
+const GRPC_TARGET: ([u8; 4], u16) = ([127, 0, 0, 1], 50051);
+
+/// One lane's declared shape.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Lane {
+    /// Stable lane id, used in metric ids.
+    pub name: &'static str,
     /// Offered observations per second.
     pub rate: f64,
-    /// Arrival window, seconds.
-    pub seconds: f64,
-    /// The producer's in-flight sends; the queue default otherwise.
-    pub max_in_flight: usize,
-    /// Injected server→client delay, when the step runs through the proxy.
+    /// The producer's in-flight sends, or `None` for the queue default.
+    pub max_in_flight: Option<usize>,
+    /// Injected server→client delay, when the lane runs through the proxy.
     pub ack_delay: Option<Duration>,
-    /// Whether the step's AC-041 checks decide the run.
-    pub gating: bool,
 }
 
-/// One step's measurements and the AC-041 checks applied to them.
-#[derive(Debug, Serialize)]
-pub struct Record {
-    /// Report label.
-    pub name: String,
-    /// Whether the checks decide the run.
-    pub gating: bool,
-    /// Offered observations per second.
-    pub rate: f64,
-    /// Arrival window, seconds.
-    pub seconds: f64,
-    /// The producer's in-flight sends.
-    pub max_in_flight: usize,
-    /// Injected server→client delay, milliseconds; zero without the proxy.
-    pub ack_delay_ms: u64,
-    /// Observations offered.
-    pub offered: u64,
-    /// Observations admitted.
-    pub admitted: u64,
-    /// Observations refused with `QUEUE_FULL`.
-    pub refusals: u64,
+/// The lanes every L2 repetition runs: headroom above the sustained rate,
+/// late acknowledgements, and a single in-flight send.
+pub const LANES: [Lane; 3] = [
+    Lane {
+        name: "headroom",
+        rate: 1_000.0,
+        max_in_flight: None,
+        ack_delay: None,
+    },
+    Lane {
+        name: "ack-delay",
+        rate: 500.0,
+        max_in_flight: None,
+        ack_delay: Some(Duration::from_millis(50)),
+    },
+    Lane {
+        name: "in-flight",
+        rate: 500.0,
+        max_in_flight: Some(1),
+        ack_delay: None,
+    },
+];
+
+/// What one lane observed.
+#[derive(Debug)]
+pub struct Emitted {
+    /// When each `QUEUE_FULL` refusal answered, for the caller's phase
+    /// classification.
+    pub refusals: Vec<Instant>,
     /// Admitted observations per second of emission.
     pub achieved_rate: f64,
-    /// Largest sampled client-owned byte count.
-    pub max_client_bytes: usize,
-    /// Least-squares client-owned byte slope over the trailing window, bytes/s.
-    pub client_bytes_slope: f64,
-    /// Seconds `flush` took once load stopped.
+    /// Least-squares growth of client-owned bytes over the trailing
+    /// [`SLOPE_WINDOW`], bytes.
+    pub bytes_growth: f64,
+    /// Seconds `flush` took once emission stopped.
     pub drain_seconds: f64,
-    /// Rows the admitted observations land.
-    pub expected_rows: u64,
-    /// Rows durable under the step's own `run_id`.
-    pub durable_rows: u64,
-    /// The step's `record_id`s whose row count is not [`FEATURES`].
-    pub uneven_records: u64,
-    /// Frames the server's Gate accepted during the step.
-    pub batches: f64,
-    /// Mean durable rows per accepted frame.
-    pub mean_batch_rows: Option<f64>,
-    /// Mean Arrow IPC bytes per frame the Gate received.
-    pub mean_batch_bytes: Option<f64>,
-    /// Gate write duration p50 bucket bound, seconds.
-    pub send_p50_seconds: Option<f64>,
-    /// Gate write duration p99 bucket bound, seconds.
-    pub send_p99_seconds: Option<f64>,
-    /// Client process CPU per durable row, microseconds.
-    pub client_cpu_us_per_row: Option<f64>,
-    /// Server CPU per durable row, microseconds.
-    pub server_cpu_us_per_row: Option<f64>,
-    /// Every failed AC-041 check, empty when the step passes.
-    pub failures: Vec<String>,
+    /// `|durable − expected|` rows under the lane's `run_id`, plus every
+    /// `record_id` without exactly [`FEATURES`] rows.
+    pub row_mismatch: u64,
 }
 
-/// The Gate counters one `/metrics` scrape reports, and the server's CPU.
-struct ServerSnapshot {
-    /// Frames the Gate accepted.
-    frames: f64,
-    /// Arrow IPC bytes the Gate received.
-    frame_bytes: f64,
-    /// Cumulative Gate write-duration buckets.
-    buckets: Vec<(f64, f64)>,
-    /// Server CPU, microseconds.
-    cpu_usec: u64,
-}
-
-impl ServerSnapshot {
-    /// Scrapes `server`.
+impl Lane {
+    /// Emits at [`Self::rate`] through a fresh `WyrdState` of `tenant` until
+    /// `until`, then flushes, shuts down, and reads the lane's rows back.
     ///
     /// # Errors
     ///
-    /// Returns the scrape failure.
-    async fn take(server: &LocalServer) -> Result<Self> {
-        let metrics: Metrics = server.metrics().await?;
-        Ok(Self {
-            frames: metrics.sum("bifrost_gate_frames_total", &["status=\"accepted\""]),
-            frame_bytes: metrics.sum("bifrost_gate_frame_bytes_total", &[]),
-            buckets: metrics.buckets(
-                "bifrost_gate_request_duration_seconds",
-                &["operation=\"write\""],
-            ),
-            cpu_usec: server.cpu_usec(),
-        })
-    }
-
-    /// The smallest bucket bound holding quantile `q` of the writes between
-    /// `before` and `self`.
-    fn quantile(&self, before: &Self, q: f64) -> Option<f64> {
-        let delta: Vec<(f64, f64)> = self
-            .buckets
-            .iter()
-            .map(|(bound, count)| {
-                let earlier = before
-                    .buckets
-                    .iter()
-                    .find(|(other, _)| other.total_cmp(bound).is_eq())
-                    .map_or(0.0, |(_, count)| *count);
-                (*bound, count - earlier)
-            })
-            .collect();
-        let total = delta.last()?.1;
-        (total > 0.0)
-            .then(|| delta.iter().find(|(_, count)| *count >= q * total))
-            .flatten()
-            .map(|(bound, _)| *bound)
-    }
-}
-
-/// The server and tenant every step measures.
-pub struct Bench<'a> {
-    /// The release server.
-    pub server: &'a LocalServer,
-    /// The provisioned tenant.
-    pub tenant: &'a Tenant,
-}
-
-impl Bench<'_> {
-    /// Runs `plan`: emits, drains, waits for durability, and judges.
-    ///
-    /// # Errors
-    ///
-    /// Returns a client start, emit (other than `QUEUE_FULL`), flush,
-    /// shutdown, query, or scrape failure.
-    pub async fn run(&self, plan: &Plan) -> Result<Record> {
-        let proxy = match plan.ack_delay {
-            Some(delay) => Some(DelayProxy::start(grpc_target(), delay).await?),
+    /// Returns a proxy, client start, emit (other than `QUEUE_FULL`), flush,
+    /// shutdown, or query failure.
+    pub async fn run(&self, tenant: &Tenant, until: Instant) -> Result<Emitted> {
+        let proxy = match self.ack_delay {
+            Some(delay) => Some(DelayProxy::start(GRPC_TARGET.into(), delay).await?),
             None => None,
         };
-        let client = self
-            .tenant
-            .service(proxy.as_ref().map(DelayProxy::url).as_deref())?;
-        let state = WyrdState::from_path_with(&self.tenant.bundle, client)?;
+        let client = tenant.service(proxy.as_ref().map(DelayProxy::url).as_deref())?;
+        let state = WyrdState::from_path_with(&tenant.bundle, client)?;
+        let defaults = QueueConfig::default();
         state
             .start_bifrost_with_config(
                 None,
                 QueueConfig {
-                    max_in_flight: plan.max_in_flight,
-                    ..QueueConfig::default()
+                    max_in_flight: self.max_in_flight.unwrap_or(defaults.max_in_flight),
+                    ..defaults
                 },
             )
             .await?;
         let model = state.run_for_card("model")?;
-
-        let server_before = ServerSnapshot::take(self.server).await?;
-        let client_cpu_before = driver_cpu_seconds();
         let stop = CancellationToken::new();
-        let sampler = tokio::spawn(sample(state.clone(), stop.clone()));
+        // Owned, so a cancelled lane leaves no sampler polling its state.
+        let sampler = AbortOnDropHandle::new(tokio::spawn(sample(state.clone(), stop.clone())));
 
-        let offered = (plan.rate * plan.seconds).round().to_u64().unwrap_or(0);
         let mut features: serde_json::Map<String, serde_json::Value> = (0..FEATURES)
             .map(|feature| (format!("f{feature}"), 0.0.into()))
             .collect();
-        let (mut admitted, mut refusals) = (0_u64, 0_u64);
+        let mut admitted = 0_u64;
+        let mut refusals = Vec::new();
         let began = Instant::now();
-        for sequence in 0..offered {
-            let due = began + Duration::from_secs_f64(sequence as f64 / plan.rate);
-            if Instant::now() < due {
-                tokio::time::sleep_until(due).await;
+        for sequence in 0_u64.. {
+            let due =
+                began + Duration::from_secs_f64(sequence.to_f64().unwrap_or(f64::MAX) / self.rate);
+            if due >= until {
+                break;
             }
-            for (feature, value) in features.values_mut().enumerate() {
-                *value = ((sequence + feature as u64 * 7) % 100)
+            tokio::time::sleep_until(due).await;
+            for (feature, value) in (0_u64..).zip(features.values_mut()) {
+                *value = ((sequence + feature * 7) % 100)
                     .to_f64()
                     .unwrap_or(0.0)
                     .into();
@@ -228,7 +148,7 @@ impl Bench<'_> {
                 .await
             {
                 Ok(_) => admitted += 1,
-                Err(error) if error.code() == QUEUE_FULL => refusals += 1,
+                Err(error) if error.code() == QUEUE_FULL => refusals.push(Instant::now()),
                 Err(error) => return Err(error.into()),
             }
         }
@@ -239,112 +159,43 @@ impl Bench<'_> {
         let draining = Instant::now();
         state.flush().await?;
         let drain_seconds = draining.elapsed().as_secs_f64();
-        let client_cpu = driver_cpu_seconds() - client_cpu_before;
         state.shutdown().await?;
         drop(proxy);
 
         let own_rows = format!("run_id = '{}'", model.run_id().as_str());
-        let expected_rows = admitted * FEATURES as u64;
-        let durable_rows = self.durable(&own_rows, expected_rows).await?;
-        let uneven_records = self
-            .tenant
+        let expected = admitted * FEATURES as u64;
+        let durable = durable(tenant, &own_rows, expected).await?;
+        let uneven = tenant
             .count(&format!(
                 "SELECT COUNT(*) AS n FROM (SELECT record_id FROM bifrost.drift.observations \
                  WHERE {own_rows} GROUP BY record_id HAVING COUNT(*) <> {FEATURES}) AS uneven"
             ))
             .await?;
-        let server_after = ServerSnapshot::take(self.server).await?;
-
-        let batches = server_after.frames - server_before.frames;
-        let per_row = |total: f64| (durable_rows > 0).then(|| total / durable_rows as f64);
-        let mut record = Record {
-            name: plan.name.clone(),
-            gating: plan.gating,
-            rate: plan.rate,
-            seconds: plan.seconds,
-            max_in_flight: plan.max_in_flight,
-            ack_delay_ms: plan.ack_delay.map_or(0, |delay| {
-                u64::try_from(delay.as_millis()).unwrap_or(u64::MAX)
-            }),
-            offered,
-            admitted,
+        Ok(Emitted {
             refusals,
-            achieved_rate: admitted as f64 / emitted,
-            max_client_bytes: samples.iter().map(|(_, bytes)| *bytes).max().unwrap_or(0),
-            client_bytes_slope: slope(&samples),
+            achieved_rate: admitted.to_f64().unwrap_or(0.0) / emitted,
+            bytes_growth: slope(&samples) * SLOPE_WINDOW,
             drain_seconds,
-            expected_rows,
-            durable_rows,
-            uneven_records,
-            batches,
-            mean_batch_rows: (batches > 0.0).then(|| durable_rows as f64 / batches),
-            mean_batch_bytes: (batches > 0.0)
-                .then(|| (server_after.frame_bytes - server_before.frame_bytes) / batches),
-            send_p50_seconds: server_after.quantile(&server_before, 0.5),
-            send_p99_seconds: server_after.quantile(&server_before, 0.99),
-            client_cpu_us_per_row: per_row(client_cpu * 1e6),
-            server_cpu_us_per_row: per_row(
-                server_after.cpu_usec.saturating_sub(server_before.cpu_usec) as f64,
-            ),
-            failures: Vec::new(),
-        };
-        record.failures = record.judge();
-        Ok(record)
-    }
-
-    /// Polls the rows durable in `filter` until they reach `expected` or
-    /// [`DURABLE_WAIT`] passes, returning the last count.
-    ///
-    /// # Errors
-    ///
-    /// Returns the query failure.
-    async fn durable(&self, filter: &str, expected: u64) -> Result<u64> {
-        let sql = format!("SELECT COUNT(*) AS n FROM bifrost.drift.observations WHERE {filter}");
-        let deadline = Instant::now() + DURABLE_WAIT;
-        loop {
-            let rows = self.tenant.count(&sql).await?;
-            if rows >= expected || Instant::now() > deadline {
-                return Ok(rows);
-            }
-            tokio::time::sleep(Duration::from_millis(500)).await;
-        }
+            row_mismatch: durable.abs_diff(expected) + uneven,
+        })
     }
 }
 
-impl Record {
-    /// The AC-041 checks this step fails: any refusal, client bytes growing
-    /// over the trailing window by more than one message, a drain over one
-    /// second, or durable rows that are not exactly [`FEATURES`] per admitted
-    /// observation.
-    fn judge(&self) -> Vec<String> {
-        let mut failures = Vec::new();
-        if self.refusals > 0 {
-            failures.push(format!("{} QUEUE_FULL refusals", self.refusals));
+/// Polls the rows durable under `filter` until they reach `expected` or
+/// [`DURABLE_WAIT`] passes, returning the last count.
+///
+/// # Errors
+///
+/// Returns the query failure.
+async fn durable(tenant: &Tenant, filter: &str, expected: u64) -> Result<u64> {
+    let sql = format!("SELECT COUNT(*) AS n FROM bifrost.drift.observations WHERE {filter}");
+    let deadline = Instant::now() + DURABLE_WAIT;
+    loop {
+        let rows = tenant.count(&sql).await?;
+        if rows >= expected || Instant::now() > deadline {
+            return Ok(rows);
         }
-        // Sealing works in message-sized steps, so growth below one message
-        // over the window is batching noise, not accumulation.
-        let growth = self.client_bytes_slope * SLOPE_WINDOW;
-        if growth > QueueConfig::default().max_message_bytes as f64 {
-            failures.push(format!(
-                "client bytes grew {growth:.0} B over the last {SLOPE_WINDOW} s"
-            ));
-        }
-        if self.drain_seconds > DRAIN_LIMIT {
-            failures.push(format!("drain took {:.3} s", self.drain_seconds));
-        }
-        if self.durable_rows != self.expected_rows {
-            failures.push(format!(
-                "{} durable rows, expected {}",
-                self.durable_rows, self.expected_rows
-            ));
-        }
-        if self.uneven_records > 0 {
-            failures.push(format!(
-                "{} record_ids without {FEATURES} rows",
-                self.uneven_records
-            ));
-        }
-        failures
+        tokio::time::sleep(Duration::from_millis(500)).await;
     }
 }
 
@@ -375,12 +226,12 @@ fn slope(samples: &[(f64, usize)]) -> f64 {
     let tail: Vec<(f64, f64)> = samples
         .iter()
         .filter(|(time, _)| *time >= last - SLOPE_WINDOW)
-        .map(|(time, bytes)| (*time, *bytes as f64))
+        .map(|(time, bytes)| (*time, bytes.to_f64().unwrap_or(f64::MAX)))
         .collect();
-    let count = tail.len() as f64;
     if tail.len() < 2 {
         return 0.0;
     }
+    let count = tail.len().to_f64().unwrap_or(f64::MAX);
     let mean_t = tail.iter().map(|(time, _)| time).sum::<f64>() / count;
     let mean_b = tail.iter().map(|(_, bytes)| bytes).sum::<f64>() / count;
     let covariance: f64 = tail
@@ -393,11 +244,6 @@ fn slope(samples: &[(f64, usize)]) -> f64 {
     } else {
         covariance / variance
     }
-}
-
-/// The server's default gRPC listener, which the delay proxy fronts.
-fn grpc_target() -> std::net::SocketAddr {
-    std::net::SocketAddr::from(([127, 0, 0, 1], 50051))
 }
 
 #[cfg(test)]

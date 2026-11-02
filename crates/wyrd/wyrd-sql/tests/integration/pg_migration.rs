@@ -1367,6 +1367,13 @@ mod pg_tests {
             .expect("RLS test rows clean up");
     }
 
+    /// The tenant-bound storage upload queries round-trip one Card upload
+    /// under its tenant's connection: insert, pending dedupe lookup, and the
+    /// lifecycle transitions read back what was written.
+    ///
+    /// # Panics
+    /// Panics when Postgres setup, a query, or a commit fails, or a read-back
+    /// row differs from what was written.
     #[tokio::test]
     async fn storage_queries_round_trip_under_tenant_conn() {
         let Some(migrator_url) = database_url() else {
@@ -1400,7 +1407,7 @@ mod pg_tests {
                 &mut conn,
                 storage::multipart_uploads::NewMultipartUpload {
                     id: upload_id,
-                    card_uid: &card_uid,
+                    card_uid: Some(&card_uid),
                     relative_path: "model.bin",
                     storage_path: &storage_path,
                     backend: StorageBackendKind::S3,
@@ -1427,7 +1434,7 @@ mod pg_tests {
 
             let pending = storage::multipart_uploads::find_pending_for_dedupe(
                 &mut conn,
-                &card_uid,
+                Some(&card_uid),
                 "model.bin",
                 &sha,
             )
@@ -1445,28 +1452,6 @@ mod pg_tests {
             storage::multipart_uploads::mark_completed(&mut conn, upload_id)
                 .await
                 .expect("storage completion accepts the already completed upload");
-
-            storage::artifact_metadata::insert(
-                &mut conn,
-                storage::artifact_metadata::NewArtifactMetadata {
-                    storage_path: &storage_path,
-                    card_uid: &card_uid,
-                    size_bytes: 5_242_880,
-                    sha256: &sha,
-                    content_type: Some("application/octet-stream"),
-                    sse_marker: Some("aws:kms"),
-                    backend: StorageBackendKind::S3,
-                },
-            )
-            .await
-            .expect("artifact metadata inserts");
-
-            let metadata = storage::artifact_metadata::get(&mut conn, &storage_path)
-                .await
-                .expect("artifact metadata query succeeds")
-                .expect("artifact metadata row exists");
-            assert_eq!(metadata.backend, StorageBackendKind::S3);
-            assert_eq!(metadata.sha256, sha);
 
             storage::idempotency::store(
                 &mut conn,
@@ -1505,67 +1490,41 @@ mod pg_tests {
             .expect("storage test rows clean up");
     }
 
+    /// A fresh installation keeps upload sessions and Card manifests in
+    /// Postgres but no completed-object inventory: that lives only in
+    /// `bifrost.storage.objects`.
+    ///
+    /// # Panics
+    /// Panics when the database DSNs are absent or invalid, migrations fail,
+    /// the removed inventory table exists, or a coordination table is
+    /// missing.
     #[tokio::test]
-    async fn storage_rls_hides_artifact_metadata_across_tenants() {
-        let Some(migrator_url) = database_url() else {
-            return;
-        };
-        let Some(app_url) = app_database_url() else {
-            return;
-        };
-
-        let store = owner_pool(&migrator_url).await.expect("migrator connects");
+    async fn fresh_install_has_no_postgres_object_inventory() {
+        let url = database_url().expect("the fresh-install proof requires database DSNs");
+        let store = owner_pool(&url).await.expect("migrator connects");
         migrate_under_lease(store.pool())
             .await
             .expect("migrations apply");
-
-        let app_pool = build_app_pool(&app_url).await.expect("app pool connects");
-        let tenant_a = DataTenantId::new_v7();
-        let tenant_b = DataTenantId::new_v7();
-        let suffix = tenant_a.as_uuid().to_string();
-        insert_tenant(store.pool(), tenant_a, &format!("stor-a-{suffix}")).await;
-        insert_tenant(store.pool(), tenant_b, &format!("stor-b-{suffix}")).await;
-
-        let card_uid = DataTenantId::new_v7().as_uuid().to_string();
-        let sha = "B".repeat(43) + "=";
-        let storage_path = format!("{tenant_a}/cards/{card_uid}/x.bin");
-
-        {
-            let mut conn = TenantConn::acquire(&app_pool, tenant_a)
+        for (table, present) in [
+            ("wyrd.storage_artifact_metadata", false),
+            ("wyrd.storage_multipart_uploads", true),
+            ("wyrd.card_artifact_manifest", true),
+        ] {
+            let found: Option<String> = sqlx::query_scalar("SELECT to_regclass($1)::text")
+                .bind(table)
+                .fetch_one(store.pool())
                 .await
-                .expect("tenant_a conn acquired");
-            storage::artifact_metadata::insert(
-                &mut conn,
-                storage::artifact_metadata::NewArtifactMetadata {
-                    storage_path: &storage_path,
-                    card_uid: &card_uid,
-                    size_bytes: 4,
-                    sha256: &sha,
-                    content_type: None,
-                    sse_marker: None,
-                    backend: StorageBackendKind::Local,
-                },
-            )
-            .await
-            .expect("tenant_a artifact metadata inserts");
-            conn.commit().await.expect("tenant_a commit succeeds");
+                .expect("catalog lookup succeeds");
+            assert_eq!(found.is_some(), present, "{table} presence");
         }
-
-        {
-            let mut conn = TenantConn::acquire(&app_pool, tenant_b)
-                .await
-                .expect("tenant_b conn acquired");
-            let hidden = storage::artifact_metadata::get(&mut conn, &storage_path)
-                .await
-                .expect("tenant_b artifact lookup succeeds");
-            assert!(hidden.is_none(), "RLS must hide tenant_a storage rows");
-        }
-
-        cleanup_storage_test_rows(store.pool(), &[tenant_a, tenant_b])
-            .await
-            .expect("storage RLS test rows clean up");
     }
 
+    /// The operator sweep query selects an expired pending upload with its
+    /// persisted owning Card, and the tenant-bound abort retires it.
+    ///
+    /// # Panics
+    /// Panics when Postgres setup, a query, or a commit fails, or the expired
+    /// upload is not selected with its owner or is still completable.
     #[tokio::test]
     async fn storage_admin_queries_find_and_abort_expired_uploads() {
         let Some(url) = database_url() else {
@@ -1612,9 +1571,12 @@ mod pg_tests {
         )
         .await
         .expect("expired upload query succeeds");
-        assert!(
-            rows.iter().any(|row| row.id == upload_id),
-            "expired upload must be selected for sweeping"
+        assert_eq!(
+            rows.iter()
+                .find(|row| row.id == upload_id)
+                .map(|row| row.card_uid.as_deref()),
+            Some(Some(card_uid.as_str())),
+            "expired upload must be selected for sweeping with its owner"
         );
 
         let mut conn = TenantConn::acquire(store.pool(), tenant)
@@ -2627,10 +2589,6 @@ mod pg_tests {
             .collect::<Vec<_>>();
 
         sqlx::query("DELETE FROM wyrd.storage_idempotency_keys WHERE data_tenant_id = ANY($1)")
-            .bind(&tenant_ids)
-            .execute(pool)
-            .await?;
-        sqlx::query("DELETE FROM wyrd.storage_artifact_metadata WHERE data_tenant_id = ANY($1)")
             .bind(&tenant_ids)
             .execute(pool)
             .await?;

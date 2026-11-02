@@ -178,7 +178,7 @@ function spanOf(call: z.infer<typeof JudgeCall>, spans: Awaited<ReturnType<typeo
   return spans.find((span) => span.attributes.gateway_call_id === call.call_id);
 }
 
-test("agent answer passes its verifier", async ({ state }) => {
+test("agent answer passes its verifier", async ({ server, state }) => {
   const run = state.run("agent");
 
   const result = await run.observe.verify("answer-check", { answer: "yes" });
@@ -188,6 +188,9 @@ test("agent answer passes its verifier", async ({ state }) => {
   expect(result.subject).toEqual(state.cardRef("agent"));
   expect(result.run_id).toBe(run.runId);
   expect(result.outcome.requirements.map((each) => [each.id, each.outcome])).toEqual([["says-yes", "passed"]]);
+  server.flushBifrost();
+  const resumed = await (await verify.Execution.connect(result.execution_id)).wait({ timeoutMs: WAIT_MS });
+  expect(resumed, "the direct execution reads back by its ID").toEqual(result);
 });
 
 test("agent answer fails its verifier", async ({ state }) => {
@@ -997,8 +1000,8 @@ test("grouped conversations coexist with drift", async ({ server, state: drift }
   }
 });
 
-/** Scribe outbox capacity of the staging-pressure story: its reserved three quarters, four writes, is what two direct judgments reserve. */
-const STAGING_CAPACITY = 6;
+/** Scribe outbox capacity of the staging-pressure story: its reserved three quarters, six writes, is what two direct judgments reserve, two result writes and one gateway capture each. */
+const STAGING_CAPACITY = 8;
 
 /** How long the staging-pressure story's judge holds each call. */
 const JUDGE_DELAY_MS = 15_000;
@@ -1109,5 +1112,5 @@ stagingTest("verification_staging_refuses_and_recovers", async ({ server, state 
     [],
     z.object({ n: z.coerce.number() }),
   );
-  expect(rows).toEqual([{ n: 4 + offered }]);
+  expect(rows).toEqual([{ n: 5 + offered }]);
 });

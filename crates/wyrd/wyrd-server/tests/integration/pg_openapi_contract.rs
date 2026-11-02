@@ -1513,15 +1513,14 @@ async fn card_contract_publishes_typed_lifecycle_and_problem_shapes() {
     server.shutdown().await.expect("server shuts down");
 }
 
-/// The Verification surface is exactly five typed operations, plus the
-/// local evidence upload on the local storage backend.
+/// The Verification surface is exactly five typed operations.
 ///
 /// Binding status, evidence planning, direct execution, enqueue, and
 /// execution status publish their typed request and response schemas,
 /// enqueue answers `202 Accepted`, direct execution answers `200` with its
 /// result and documents its stable refusals, and no other Verification
-/// operation is routed. The in-process server uses local storage, so its
-/// evidence plans target the digest-keyed local upload route. The served
+/// operation is routed: evidence plans target the shared storage upload
+/// routes. The served
 /// document names no retired evaluation identifier — neither an abbreviation
 /// (`Eval…`, `…_EVAL_…`) nor an expanded product name (`EvaluationRun`,
 /// `evaluation_runs`, `/evaluations`), while descriptive `Evaluation` prose
@@ -1556,7 +1555,6 @@ async fn verification_contract_publishes_five_typed_operations_and_the_local_upl
             ("/v1/verification/bindings/{binding_id}", "get"),
             ("/v1/verification/enqueue", "post"),
             ("/v1/verification/evidence", "post"),
-            ("/v1/verification/evidence/local/{sha256}", "put"),
             ("/v1/verification/execute", "post"),
             ("/v1/verification/executions/{execution_id}", "get"),
         ])

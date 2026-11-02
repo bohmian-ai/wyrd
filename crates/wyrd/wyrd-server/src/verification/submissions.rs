@@ -1,20 +1,26 @@
-//! The batched queue writer of acknowledged Verifier submissions.
+//! The batched queue writer of acknowledged Verifier executions.
 //!
-//! A submitted execution's inputs row is staged on the Scribe outbox with its
-//! [`Submission`]; once Scribe acknowledges the row, the Scribe sink stages
-//! the submission here without waiting. The generic [`Outbox`] owns the
-//! bounded queue, per-lane batching, retry with backoff, and shutdown;
-//! [`SubmissionSink`] is its one durable write. Each tenant's submissions are
-//! spread over [`SubmissionSink::LANES`] lanes that commit concurrently, and
-//! every submission under one idempotency key shares a lane, so its retries
-//! and conflicts are decided in arrival order. Each write is one tenant
-//! transaction that resolves each distinct target through
-//! [`VerifierCardCache::resolve`], the one read route every Verifier
-//! execution shares, and accepts the batch through
-//! [`VerifierExecutionQueue::accept_submissions`].
+//! Every queued execution, a caller's submission or a scheduled or group
+//! candidate, has its input record staged on the Scribe outbox with its
+//! [`Queued`] admission; once Scribe acknowledges that row, and only then,
+//! the Scribe sink stages it here as [`Acknowledged`] work without waiting.
+//! No queue row exists before that acknowledgement. The generic [`Outbox`]
+//! owns the bounded queue, per-lane batching, retry with backoff, and
+//! shutdown; [`SubmissionSink`] is its one durable write. Each tenant's work
+//! is spread over [`SubmissionSink::LANES`] lanes that commit concurrently;
+//! every submission under one idempotency key shares a lane, and every
+//! scheduled and group candidate of a tenant shares lane 0, so their
+//! retries, conflicts, and source transitions are decided in arrival order. Each write is one tenant transaction: submissions resolve
+//! each distinct target through [`VerifierCardCache::resolve`], the one read
+//! route every Verifier execution shares, and are accepted through
+//! [`VerifierExecutionQueue::accept_submissions`]; candidates are admitted
+//! with their frozen identities through
+//! [`VerifierExecutionQueue::accept_scheduled`] and
+//! [`VerifierExecutionQueue::accept_grouped`], which move the expected
+//! cursor or consume the selected pending activity in the same transaction.
 //! Replay, idempotency conflicts, and refusals are decided there, so a
 //! repeated batch accepts nothing twice. The writer grants no authority: each
-//! execution runs under the authority accepted with its submission. Losses
+//! execution runs under the authority accepted or frozen with it. Losses
 //! are counted in `outbox_events_lost_total{outbox="verifier_submissions"}`.
 //! A commit that queued a new execution notifies [`SubmissionSink::accepted`],
 //! which wakes this process's idle Verifier runner instead of leaving the
@@ -26,14 +32,17 @@ use std::sync::Arc;
 
 use tokio::sync::Notify;
 
+use uuid::Uuid;
 use wyrd_runtime::outbox::{Outbox, OutboxLimits, OutboxSink};
 use wyrd_spec::DataTenantId;
 use wyrd_sql::queries::verifier_executions::{
-    Submission, SubmissionOutcome, VerifierExecutionQueue,
+    Admission, EnqueueOutcome, SubmissionOutcome, VerifierExecutionQueue,
 };
 use wyrd_sql::{SqlError, WyrdPostgres};
 
 use super::cache::{Db, VerifierCardCache};
+use super::scheduler::InFlight;
+pub use crate::scribe_outbox::Acknowledged;
 
 /// Wyrd pool connections the queue writer holds at once across every
 /// tenant, and the lanes of each tenant; one busy tenant may use all of them.
@@ -47,6 +56,19 @@ const SUBMISSION_CAPACITY: usize = 16_384;
 /// The process outbox of acknowledged submissions: the generic outbox over
 /// [`SubmissionSink`].
 pub type SubmissionOutbox = Outbox<SubmissionSink>;
+
+/// One queued execution staged with its input record: the admission its
+/// acknowledgement authorizes and, for a scheduled or group candidate, the
+/// producer's in-flight claim on its source, held until the admission is
+/// written or lost.
+#[derive(Debug, Clone)]
+pub struct Queued {
+    /// The execution to admit.
+    pub admission: Admission,
+    /// The producer's claim on the candidate's due occurrence or group;
+    /// `None` for a submission.
+    pub claim: Option<Arc<InFlight>>,
+}
 
 /// Queue destination of the outbox: one tenant's submissions, one
 /// transaction.
@@ -95,31 +117,17 @@ impl SubmissionSink {
         Arc::clone(&self.accepted)
     }
 
-    /// The target resolution this writer refuses submissions through, which
-    /// the process shares as `AppState::verifier_cards`.
-    #[must_use]
-    pub fn verifier_cards(&self) -> Arc<VerifierCardCache> {
-        Arc::clone(&self.verifier_cards)
-    }
-}
-
-impl OutboxSink for SubmissionSink {
-    /// One accepted caller submission, staged once Scribe acknowledged its
-    /// pinned inputs and written into its tenant's execution queue.
-    type Item = Submission;
-    /// The Postgres failure of one tenant batch; the outbox retries the
-    /// batch, and replay makes the retry idempotent.
-    type Error = SqlError;
-    /// The outbox name in logs, metrics, and `Debug` output.
-    const NAME: &'static str = "verifier_submissions";
-
-    /// Wyrd pool connections the writer holds per tenant at once.
-    const LANES: usize = SUBMISSION_WRITER_CONNECTIONS;
-
-    /// A keyed submission's lane is the hash of its (subject, actor, key), so
-    /// every request under one key is decided in arrival order; an unkeyed
-    /// one has no order to keep and hashes its execution ID.
-    fn lane(submission: &Submission) -> u64 {
+    /// The lane of one queued execution. A keyed submission's lane is the
+    /// hash of its (subject, actor, key), so every request under one key is
+    /// decided in arrival order; an unkeyed one has no order to keep and
+    /// hashes its execution ID. Scheduled and group candidates share lane 0,
+    /// so a tenant's background admissions are admitted in arrival order and
+    /// batched together, with one writer moving their cursors and pending
+    /// rows at a time.
+    pub(crate) fn admission_lane(admission: &Admission) -> u64 {
+        let Admission::Submitted(submission) = admission else {
+            return 0;
+        };
         let mut hasher = DefaultHasher::new();
         match &submission.key {
             Some(key) => {
@@ -136,32 +144,78 @@ impl OutboxSink for SubmissionSink {
         hasher.finish()
     }
 
-    /// Accept `submissions` into the tenant's queue in one transaction and
-    /// commit it.
+    /// The target resolution this writer refuses submissions through, which
+    /// the process shares as `AppState::verifier_cards`.
+    #[must_use]
+    pub fn verifier_cards(&self) -> Arc<VerifierCardCache> {
+        Arc::clone(&self.verifier_cards)
+    }
+}
+
+impl OutboxSink for SubmissionSink {
+    /// One queued execution, staged once Scribe acknowledged its input
+    /// record and written into its tenant's execution queue.
+    type Item = Acknowledged;
+    /// The Postgres failure of one tenant batch; the outbox retries the
+    /// batch, and replay makes the retry idempotent.
+    type Error = SqlError;
+    /// The outbox name in logs, metrics, and `Debug` output.
+    const NAME: &'static str = "verifier_submissions";
+
+    /// Wyrd pool connections the writer holds per tenant at once.
+    const LANES: usize = SUBMISSION_WRITER_CONNECTIONS;
+
+    /// See [`Self::admission_lane`].
+    fn lane(item: &Acknowledged) -> u64 {
+        Self::admission_lane(&item.queued().admission)
+    }
+
+    /// Admit `items` into the tenant's queue in one transaction and commit
+    /// it.
     ///
-    /// A refused or conflicting submission is logged; it settled `errored`
-    /// in the same transaction, so its status says why. When any submission
-    /// was newly accepted, [`SubmissionSink::accepted`] is notified after the
-    /// commit.
+    /// Submissions are accepted after their targets resolve; scheduled and
+    /// group candidates are admitted in binding order, the one lock order
+    /// every writer uses, with their frozen identities, moving the expected
+    /// cursor or consuming the selected pending activity. A refused or
+    /// conflicting item is logged; a refused or conflicting submission
+    /// settled `errored` in the same transaction, so its status says why.
+    /// When any execution was newly admitted, [`SubmissionSink::accepted`] is
+    /// notified after the commit, a latency hint only: every runner finds
+    /// committed work by polling the queue.
     ///
     /// # Errors
     /// Returns the connection, write, or commit failure; the outbox retries
-    /// the batch, which replays every submission that did commit.
+    /// the batch, which replays every item that did commit.
     ///
     /// # Cancellation
     /// The outbox's shutdown deadline may drop this future mid-write.
     /// Cancelled before `commit` is sent, the transaction rolls back and no
     /// execution exists; cancelled while `commit` resolves, the executions
     /// may already be durable. Either way the outbox counts the batch lost.
-    #[tracing::instrument(name = "verification.submissions", skip_all, fields(%tenant))]
+    #[tracing::instrument(name = "verification.submissions", skip_all)]
     async fn write(
         &self,
         tenant: DataTenantId,
-        submissions: &[Submission],
+        _slice: Uuid,
+        items: &[Acknowledged],
     ) -> Result<(), SqlError> {
+        let mut submissions = Vec::new();
+        let mut candidates = Vec::new();
+        for item in items {
+            match &item.queued().admission {
+                Admission::Submitted(submission) => submissions.push(submission.clone()),
+                candidate @ Admission::Scheduled(admission) => {
+                    candidates.push((admission.binding_id, candidate));
+                }
+                candidate @ Admission::Grouped(admission) => {
+                    candidates.push((admission.binding_id, candidate));
+                }
+            }
+        }
+        candidates.sort_by_key(|(binding_id, _)| *binding_id);
         let mut conn = self.postgres.tenant_conn(tenant).await?;
         let mut refusals = HashMap::new();
-        for submission in submissions {
+        for submission in &submissions {
             let request = &submission.request;
             let pair = (
                 request.verifier_card_uid.as_uuid(),
@@ -185,13 +239,29 @@ impl OutboxSink for SubmissionSink {
         }
         let outcomes = self
             .queue
-            .accept_submissions(&mut conn, submissions, &refusals)
+            .accept_submissions(&mut conn, &submissions, &refusals)
             .await
             .map_err(SqlError::Query)?;
+        let mut admitted = Vec::with_capacity(candidates.len());
+        for (_, candidate) in &candidates {
+            let outcome = match candidate {
+                Admission::Scheduled(admission) => {
+                    self.queue.accept_scheduled(&mut conn, admission).await
+                }
+                Admission::Grouped(admission) => {
+                    self.queue.accept_grouped(&mut conn, admission).await
+                }
+                Admission::Submitted(_) => continue,
+            };
+            admitted.push(outcome.map_err(SqlError::Query)?);
+        }
         conn.commit().await?;
         if outcomes
             .iter()
             .any(|outcome| matches!(outcome, SubmissionOutcome::Accepted))
+            || admitted
+                .iter()
+                .any(|outcome| matches!(outcome, EnqueueOutcome::Enqueued(_)))
         {
             self.accepted.notify_one();
         }
@@ -212,6 +282,16 @@ impl OutboxSink for SubmissionSink {
                 ),
             }
         }
+        for ((_, candidate), outcome) in candidates.iter().zip(admitted) {
+            if let EnqueueOutcome::Refused(refusal) = outcome {
+                tracing::info!(
+                    %tenant,
+                    execution_id = %candidate.execution_id(),
+                    code = %refusal.error().code,
+                    "scheduled or group candidate refused at admission"
+                );
+            }
+        }
         Ok(())
     }
 }
@@ -222,12 +302,12 @@ mod tests {
 
     use std::collections::{BTreeMap, HashSet};
 
-    use uuid::Uuid;
     use wyrd_runtime::AcceptedAuthority;
     use wyrd_runtime::permission::PermissionSet;
     use wyrd_runtime::principal::{Principal, PrincipalId, PrincipalKind};
     use wyrd_spec::ids::CardUid;
     use wyrd_spec::verification::execution::VerificationRequest;
+    use wyrd_sql::queries::verifier_executions::Submission;
 
     use super::*;
 
@@ -283,14 +363,17 @@ mod tests {
         let mut homes: HashMap<String, u64> = HashMap::new();
         let mut keyed_lanes = HashSet::new();
         for submission in submissions(1_024, Some(63)) {
-            let lane = SubmissionSink::lane(&submission) % lanes;
+            let lane =
+                SubmissionSink::admission_lane(&Admission::Submitted(submission.clone())) % lanes;
             let key = submission.key.as_ref().expect("keyed").key.clone();
             assert_eq!(*homes.entry(key).or_insert(lane), lane, "a key was split");
             keyed_lanes.insert(lane);
         }
         let unkeyed_lanes: HashSet<u64> = submissions(1_024, None)
             .iter()
-            .map(|submission| SubmissionSink::lane(submission) % lanes)
+            .map(|submission| {
+                SubmissionSink::admission_lane(&Admission::Submitted(submission.clone())) % lanes
+            })
             .collect();
         assert_eq!(keyed_lanes.len(), SubmissionSink::LANES);
         assert_eq!(unkeyed_lanes.len(), SubmissionSink::LANES);

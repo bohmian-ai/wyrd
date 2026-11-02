@@ -1,9 +1,10 @@
 //! Ranged-read probe over a test server's Bifrost object store.
 //!
 //! Oracle's `DataFusion` scans read Parquet footers and pages through ranged
-//! gets. Journeys that must hold a query at its first object read, or prove a
-//! pruned object was never opened, observe those reads here instead of through
-//! a production seam.
+//! gets, and a scan answered from the byte-range cache first confirms its
+//! object with a head. Journeys that must hold a query at its first object
+//! read, or prove a pruned object was never opened, observe those reads here
+//! instead of through a production seam.
 
 use std::fmt;
 use std::ops::Range;
@@ -22,8 +23,8 @@ use object_store::{
 /// Delegating store that counts ranged reads and can stall the next one.
 ///
 /// Every operation runs against the wrapped production store unchanged; only
-/// ranged gets are counted, and at most one armed stall holds a read until
-/// the journey releases it.
+/// ranged gets are counted, and at most one armed stall holds the next ranged
+/// get or head until the journey releases it.
 #[derive(Debug)]
 pub struct ObjectReadProbe {
     /// The production store every call delegates to.
@@ -71,6 +72,14 @@ impl ObjectReadProbe {
     /// Panics when the stall lock is poisoned.
     async fn observe_ranged_read(&self) {
         self.ranged_reads.fetch_add(1, Ordering::AcqRel);
+        self.hold_armed().await;
+    }
+
+    /// Holds the calling read at the armed stall, if any, consuming it.
+    ///
+    /// # Panics
+    /// Panics when the stall lock is poisoned.
+    async fn hold_armed(&self) {
         let stall = self
             .armed
             .lock()
@@ -116,13 +125,16 @@ impl ObjectStore for ObjectReadProbe {
         self.inner.put_multipart_opts(location, opts).await
     }
 
-    /// Delegates a get, counting and possibly stalling it when it is ranged.
+    /// Delegates a get, counting and possibly stalling it when it is ranged,
+    /// and possibly stalling it when it is a head.
     ///
     /// # Errors
     /// Returns the wrapped store's error.
     async fn get_opts(&self, location: &Path, options: GetOptions) -> Result<GetResult> {
         if options.range.is_some() {
             self.observe_ranged_read().await;
+        } else if options.head {
+            self.hold_armed().await;
         }
         self.inner.get_opts(location, options).await
     }

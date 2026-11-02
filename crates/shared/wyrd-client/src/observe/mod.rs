@@ -508,9 +508,9 @@ impl Observe<'_> {
     }
 
     /// The execution target of `bound` for this view's Run.
-    fn target<'a>(&self, bound: &'a BoundVerifier) -> Target<'a> {
+    fn target<'a>(&self, bound: &BoundVerifier<'a>) -> Target<'a> {
         Target {
-            spec: &bound.spec,
+            spec: bound.spec,
             verifier_card_uid: bound.verifier_card_uid.clone(),
             card_uid: bound.card_uid.clone(),
             run_id: self.run.run_id.clone(),

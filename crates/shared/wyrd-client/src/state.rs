@@ -405,15 +405,16 @@ impl HydratedStateIndex {
 /// The alias of the root Service view `WyrdState::run` opens.
 const ROOT_ALIAS: &str = "root";
 
-/// A Verifier bound to a subject, resolved for one execution.
+/// A Verifier bound to a subject, resolved for one execution, borrowing its
+/// spec from the hydrated state.
 #[derive(Debug)]
-pub(crate) struct BoundVerifier {
+pub(crate) struct BoundVerifier<'a> {
     /// The exact Verifier Card version.
     pub(crate) verifier_card_uid: CardUid,
     /// The exact subject Card version it judges.
     pub(crate) card_uid: CardUid,
     /// The building-block Verifier, whose slots fix each input's projection.
-    pub(crate) spec: VerifierSpec,
+    pub(crate) spec: &'a VerifierSpec,
 }
 
 /// The server-resolved UID a hydrated reference carries.
@@ -888,7 +889,7 @@ impl WyrdState {
         &self,
         subject: &CardRef,
         name: &str,
-    ) -> Result<BoundVerifier, WyrdError> {
+    ) -> Result<BoundVerifier<'_>, WyrdError> {
         let subject_key = subject.to_string();
         let mut bindings: Vec<&VerificationBinding> = Vec::new();
         if let Spec::Service(service) = &self.service().spec {
@@ -918,19 +919,6 @@ impl WyrdState {
                     json!({ "verifier": verifier_ref }),
                 ));
             };
-            // Staged switch point: until the hydrated `Spec::Verifier`
-            // carries building blocks, an implementation-kind Verifier has
-            // no slots to project onto and is refused here. The cutover
-            // replaces this conversion with a borrow.
-            let spec = serde_json::to_value(spec)
-                .ok()
-                .and_then(|value| serde_json::from_value(value).ok())
-                .ok_or_else(|| {
-                    state_bundle_error(
-                        "a bound Verifier does not declare building-block inputs and requirements",
-                        json!({ "verifier": verifier_ref }),
-                    )
-                })?;
             return Ok(BoundVerifier {
                 verifier_card_uid: required_uid(verifier_ref)?,
                 card_uid: required_uid(subject)?,

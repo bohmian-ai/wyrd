@@ -15,6 +15,9 @@ pub struct ExpiredUpload {
     pub id: Uuid,
     /// Tenant isolation key.
     pub data_tenant_id: Uuid,
+    /// Owning Card UID; `None` marks a verification File upload, whose path
+    /// has the evidence shape rather than a Card file's.
+    pub card_uid: Option<String>,
     /// Full tenant-scoped storage path.
     pub storage_path: String,
     /// Configured backend as stored in SQL.
@@ -50,6 +53,7 @@ pub async fn expired_uploads_batch(
         SELECT
             id,
             data_tenant_id,
+            card_uid,
             storage_path,
             backend,
             wire_protocol,

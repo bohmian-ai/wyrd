@@ -9,13 +9,11 @@ use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use vala_bifrost_redux::catalog::{TableRef, TableUid};
-use vala_bifrost_redux::contracts::{
-    FrameAdmission, IngressPayload, Scribe, ScribeError, ScribeIngressFrame,
-};
+use vala_bifrost_redux::contracts::{FrameAdmission, Scribe, ScribeError, ScribeIngressFrame};
 use wyrd_spec::DataTenantId;
 use wyrd_sql::WyrdPostgres;
 
-use crate::scribe_outbox::{ScribeOutbox, ScribeSink};
+use crate::scribe_outbox::{ScribeOutbox, ScribeSink, payload_ipc};
 
 /// One-shot faults on result writes, plus a record of every submitted batch.
 ///
@@ -39,7 +37,8 @@ pub struct SentBatch {
     pub table: String,
     /// The batch ID Scribe deduplicates on.
     pub batch_id: uuid::Uuid,
-    /// The Arrow IPC stream.
+    /// The batch's rows as one Arrow IPC stream: the stream it carried, or
+    /// its in-process rows encoded.
     pub bytes: Vec<u8>,
 }
 
@@ -112,13 +111,10 @@ impl Scribe for FaultScribe {
     /// Panics when the fault lock is poisoned.
     async fn ingest_frame(&self, frame: ScribeIngressFrame) -> Result<FrameAdmission, ScribeError> {
         let table = frame.table.fqn();
-        let IngressPayload::ArrowIpc(bytes) = &frame.payload else {
-            return self.inner.ingest_frame(frame).await;
-        };
         self.fault.sent.lock().expect("fault lock").push(SentBatch {
             table: table.clone(),
             batch_id: frame.batch_id,
-            bytes: bytes.to_vec(),
+            bytes: payload_ipc(&frame.payload).to_vec(),
         });
         let admission = self.inner.ingest_frame(frame).await?;
         if take_if(&self.fault.lose_ack_on, &table) {

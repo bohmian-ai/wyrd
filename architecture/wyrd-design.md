@@ -687,14 +687,16 @@ Wyrd principals are UUID-backed runtime identities that exist independently of
 any credential: issuing, rotating, revoking, or losing a credential never
 creates, destroys, or alters a principal or its role grants. Gateway capture
 is a server-internal write holding no token, role, or grant; Scribe stamps
-each captured row with the verified pair the call ran under. Each `wyrd-server` process owns one capture writer,
-chosen from pod topology (`WYRD_TARGET`): it submits in-process when Scribe
-runs in the pod, and otherwise over the peer plane through a capture-only RPC
-to a live, ready Scribe. A capture is delivered when Scribe acknowledges it
-before the call's deadline; backpressure and an unavailable Scribe are retried
-with bounded backoff until then, and anything else drops the capture with a
-counted reason without changing the call. No per-tenant client, queue, or
-backlog outlives the call. The same writer submits Verifier results to the
+each captured row with the verified pair the call ran under. Each `wyrd-server` process stages captures on its one
+Scribe outbox, which submits in-process when Scribe runs in the pod
+(`WYRD_TARGET`) and otherwise over the peer plane to a live, ready Scribe,
+retrying Scribe backpressure. A capturing call reserves its outbox slot during
+admission, before it is charged or dispatched; while the outbox is full,
+admission backs off and retries until the call's deadline, and then refuses the
+call with the retryable `WYRD_GATEWAY_429_CAPTURE_STAGING_FULL`. A reserved
+capture is never shed. Payload, storage, or deadline failures while the
+capture is projected drop it with a counted reason without changing the
+answered call. The same outbox submits Verifier results to the
 three result tables, attributed to the pair the result was produced under —
 the caller's verified pair for a realtime invocation, and the run's subject
 with the tenant's `System` principal as actor for a queued run — which Scribe
@@ -1027,9 +1029,17 @@ than becoming its children.
 
 Server spans export twice from one tracer provider:
 
-- The operator's configured trace backend receives every server span under
-  the server's own sampler. No client-supplied field, including the inbound
-  sampled flag and `tracestate`, changes what the operator receives.
+- The operator's configured trace backend (`WYRD_OTLP_ENDPOINT`) receives
+  the server spans its own sampler samples: 1% of traces by default, or the
+  validated `WYRD_OTLP_SAMPLE_RATIO` in `[0, 1]`, where `0` exports none and
+  `1` exports all. Without an endpoint nothing is exported to an operator.
+  No client-supplied field, including the inbound sampled flag, trace id,
+  and `tracestate`, changes what the operator receives. The operator's span
+  verbosity is `WYRD_TRACE_FILTER` (default `info`), separate from the log
+  filter `WYRD_LOG`/`RUST_LOG`; neither filter nor the ratio can remove a
+  tenant copy, because catalog spans and events at `info` or above always
+  record. Logs are written whatever the sampling decision, so an error in
+  an unsampled request is still logged inside its request span.
 - A server span whose parent or one of whose links is a sampled client span
   also writes, with its catalog descendants, to the requesting tenant's
   `bifrost.traces.spans` on the process Scribe outbox, with the same trace,
@@ -1051,7 +1061,19 @@ Server spans export twice from one tracer provider:
   attributes (`wyrd.*`, `gen_ai.*`, and HTTP, RPC, and error semantic
   conventions); the tenant id is never a span attribute. The copy is
   non-blocking and never fails the request, and it works with or without an
-  operator endpoint.
+  operator endpoint and at operator ratio `0`.
+
+Operator export uses the stock OpenTelemetry batch processor and its bounded,
+non-blocking queue; a full queue drops spans rather than delaying requests.
+The SDK logs one `BatchSpanProcessor.SpanDroppingStarted` warning at the
+first drop and the exact lifetime `dropped_span_count` at orderly shutdown.
+There is no live dropped-span count; filtering `opentelemetry_sdk` warnings
+or abrupt termination removes these signals. Each export call that fails
+increments `wyrd_trace_export_failed_batches_total`; a failed batch is not a
+count of lost spans. Export failure, stall, or saturation never changes a
+request's result or its tenant copy, whose loss is counted separately by the
+Scribe outbox. Head sampling cannot promise a trace for every failing
+request.
 
 `Bifrost::trace_timeline` (and its Python and TypeScript projections) reads
 one trace's spans from `bifrost.traces.spans`, plus traces linking directly to
@@ -1096,7 +1118,8 @@ alias. `run.observe.verify(verifier, inputs)` and
 resolves the named Verifier among those bound in `verified_by` to that subject
 in the hydrated graph, validates named inputs against its slots, hashes
 files, obtains plans for missing ones from `POST /v1/verification/evidence`
-and sends each missing body to its plan's target, and calls
+sends each missing body to its plan's target and completes it through
+`POST /v1/cards/upload/{upload_id}/complete`, and calls
 `POST /v1/verification/execute` (once, without replay, returning the typed
 `VerificationResult`) or `POST /v1/verification/enqueue` (returning a
 `VerificationExecution` handle). `submit` on a Window Verifier records its
@@ -1606,10 +1629,26 @@ capacity used by the runner (default 64). Full capacity leaves pending rows in
 PostgreSQL; no new concurrency option or distributed quota is introduced.
 
 A group item is claimed with `FOR UPDATE SKIP LOCKED`. While holding that
-scheduling-row lock, one bounded Bifrost snapshot query selects the currently
-visible source inputs/results. The same tenant transaction pins/enqueues the
-ordinary execution and deletes its scheduling row. An unchanged snapshot's
-content-identity conflict also consumes the pending row. Retryable runtime,
+scheduling-row lock, one bounded Bifrost query selects the group's settled
+history: the declared source inputs and results with `wyrd_ingested_at`
+before the claimed row's PostgreSQL `due_at`, its exclusive range end. The
+range start is the earliest selected admission time, equal to the end when
+nothing is selected. Each run selects cumulative history of its `group_id`
+and exact source scope through its own cutoff, never a disjoint next
+interval, so later-visible earlier evidence and later results join the next
+run. A new selection is a prepared candidate: the preparation transaction
+writes nothing and rolls back, releasing the row lock, and the selection
+itself — range, per-slot authored references, ordered source execution IDs
+and selected result IDs — is staged as the execution's `group` input record
+in Bifrost on capacity reserved before the claim. Only after Scribe
+acknowledges that record does the batched queue writer, in one tenant
+transaction, insert the ordinary execution holding only the selection's
+content digest and delete the pending row while it still holds the
+generation the candidate was selected from. The digest covers binding,
+group, membership, selected results and order, never the cutoff; a
+selection whose digest the binding and group already hold is settled during
+preparation and consumes the pending row in that transaction, and a
+conflicting admission returns the existing execution. Retryable runtime,
 capacity, database and query failures retain pending and are traced. Genuine auth
 or owner-activity rejection, including an inactive/retired owner, records one
 terminal errored group execution and consumes pending atomically. Recording
@@ -1620,16 +1659,19 @@ actor remain attributable. Every runnable execution keeps its accepted-authority
 and input invariants. Missing issuer/SYSTEM/attribution infrastructure is retryable
 Wyrd failure, not proof of rejected owner authority. Existing latest binding
 execution status then execution readback exposes the terminal error; it is not a
-new group-history API. Concurrent activity waits only in
-the background on the row lock and recreates a pending row after successful
-handoff. Release the transaction and preparation permit before Verifier/provider
-execution. With no new activity, there is no pending row and no further Bifrost
+new group-history API. Every activity upsert draws a fresh generation, so
+activity acknowledged after a candidate's selection keeps the pending row,
+and a row recreated after consumption starts a new one; that activity joins a
+later snapshot. While a candidate awaits acknowledgement, the process skips
+its group so it is not prepared twice. Release the preparation permit before
+Verifier/provider execution. With no new activity, there is no pending row and no further Bifrost
 read for that group. Distinct later snapshots may overlap earlier executions.
 
 Source lists share execution ordering, with null for a missing outcome or an
-absent selected value. A visible result whose execution's input is not visible
-is an input not yet readable: the snapshot pins nothing and the pending row
-remains for retry. More than five minutes past the current due time, by
+absent selected value. A source result admitted after the cutoff is absent
+from that run even when its input was selected. A visible result whose
+execution's input or output is not visible is publication-incomplete: the
+selection records nothing and the pending row remains for retry. More than five minutes past the current due time, by
 PostgreSQL's `statement_timestamp()`, the scheduler instead records one terminal
 `WYRD_VERIFICATION_409_SNAPSHOT_INCOMPLETE` group execution through the refusal
 path and consumes the pending row in the same transaction: no accepted
@@ -1644,14 +1686,20 @@ input later refused by the queue can participate. Ordinary source authorization
 and pre-staging pressure refusal still apply.
 
 The pending table contains scheduling metadata only, never source evidence,
-readiness inventories or revision state. Existing execution records hold the
-snapshot digest, pinned values and source identities. Ordinary queue claims and
-retries remain; no additional group crash-recovery protocol exists. Query
+readiness inventories or revision state. The execution row holds the
+selection digest; the Bifrost input record holds the selection, which every
+attempt and read resolves to the same values: source declarations from
+`execution_inputs`, requirement outcomes from the selected results'
+`execution_outputs`, and a group source's own values by resolving its
+selection in turn. Every group execution has its own input record, so another
+group can consume it. Ordinary queue claims and retries remain; no additional
+group crash-recovery protocol exists. Query
 admission/output/deadline bounds apply; failed or incomplete queries defer
 execution without truncated inputs or synthetic source-ceiling verdicts.
 
 Scribe acknowledgement schedules work but is not a query-completeness checkpoint.
-A snapshot uses what is visible when read; a later visibility change alone does
+A selection uses what is visible when read; `wyrd_ingested_at` is an admission
+time, not a completeness watermark, and a later visibility change alone does
 not schedule another execution. A process death between ACK and scheduling commit
 can lose the notification; there is no repair/history scan. Background retries
 can postpone expiration. Retention and outbox loss limit available evidence.
@@ -1673,40 +1721,62 @@ execution; scheduled executions have no `run_id`.
 
 | Route | Contract |
 |---|---|
-| `POST /v1/verification/evidence` | Declare files by digest, length, and format; receive single-PUT plans for missing ones under the tenant's `evidence/sha256/<digest>` namespace |
-| `PUT /v1/verification/evidence/local/{sha256}` | Local storage backend only: store one evidence body under the caller's tenant → `204` |
+| `POST /v1/verification/evidence` | Declare files by digest and length; receive an `upload_id` and shared upload plan for each one with no completed File record, under the tenant's `evidence/sha256/<digest>` namespace |
 | `POST /v1/verification/execute` | Exact Verifier and subject, optional Run and `group_id`, named input declarations, optional route overrides → `200 VerificationResult` |
 | `POST /v1/verification/enqueue` | The same Run evidence with `Idempotency-Key` → `202 { execution_id }` |
-| `GET /v1/verification/executions/{execution_id}` | Status, terminal error, result when visible, and a group execution's `group_id`, owner, and pinned source snapshot |
+| `GET /v1/verification/executions/{execution_id}` | Status, terminal error, result when visible, and a group execution's `group_id`, owner, and source selection once its input record is visible; a direct execution's completed status once its records are visible |
 | `GET /v1/verification/bindings/{binding_id}` | Readiness, cadence, `last_execution_id`, and a `group_end` binding's frozen settings and source bindings |
 
 File contents never pass through Postgres or a verification request body; an
-uploaded file does not become a Card. Remote storage backends return direct
-single-PUT plans to tenant object storage and do not mount the local route.
-The local filesystem backend has no presigned target, so its plans point at
-`PUT /v1/verification/evidence/local/{sha256}`: the server takes the tenant
-from the authenticated caller, never the path; refuses a body over
-`WYRD_VERIFICATION_FILE_MAX_MIB` or one that hashes to another digest before
-the object becomes readable; and writes the same tenant-qualified
-`evidence/sha256/<digest>` key with no metadata row. A repeated upload of one
-digest is idempotent. `ArtifactRef` selects a declared Artifact under its
-own authorization.
+uploaded file does not become a Card. A File upload is a Card-less record in
+the shared storage upload lifecycle: it plans with the same planner policy as
+a Card file (single PUT, multipart, Azure block blob, or the local upload
+capability), transfers through the same client, and is ready only once
+`POST /v1/cards/upload/{upload_id}/complete` verifies its stored digest and
+length and records a `file_upload` fact in `bifrost.storage.objects`. Each
+upload session owns its own object, `evidence/sha256/<digest>/<upload_id>`,
+so concurrent uploads of one File never revoke one another, and an abandoned
+File session expires through the same storage sweeper as a Card upload. That
+completion returns only after the fact is acknowledged; it is the one
+completion guarantee for Card files and Files alike. Planning reuses a File
+only when a completed, undeleted same-tenant `file_upload` fact matches its
+digest and length; object presence, a Card file, or another tenant's record
+never stands in for one. Verification reads a File from its recorded storage
+location and re-checks its length and digest. Each execution resolves its File
+and Artifact metadata once, at admission, and reuses it for every read; each
+Artifact use still authorizes its own `card:read`. A File with no visible
+completed record, or an unreadable inventory, is not ready: direct execution
+answers `WYRD_SERVER_503_SERVICE_UNAVAILABLE`, and a queued attempt ends
+`retrying` with `evidence_unavailable` under the queue's ordinary attempt
+bounds, the last ending `errored`. Per-file and aggregate limits
+(`WYRD_VERIFICATION_FILE_MAX_MIB`, `WYRD_VERIFICATION_FILES_MAX_MIB`) are
+enforced at planning. `ArtifactRef` selects a declared Artifact under its own
+authorization.
 
 Public invocation checks `verifier:run` against the selected Verifier's exact
 Card UID. `PermissionScope::Verifier(CardUid)` names one UID; `All` covers
 every Verifier in the tenant. Permission is checked before execution and the
 decision is audited. A binding does not replace the invocation permission.
-Both evidence routes stage bytes and select no Verifier, so they require only
-operation-level `verifier:run` admission: any `verifier:run` grant, exact or
-`All`, admits them, and the decision is audited the same way.
+Planning and every follow-up operation on a File upload (part URL, local
+transfer, completion, abort) stage bytes and select no Verifier, so they
+require only operation-level `verifier:run` admission: any `verifier:run`
+grant, exact or `All`, admits them, and the decision is audited the same way.
+A follow-up operation derives its permission from the upload's persisted
+owner, never the request: a Card upload requires `cards:write`, a File
+upload `verifier:run`, and an upload of another tenant is not found.
 
 Neither Run entry point writes Postgres on the request path. `verify` runs
 inline and stages its pinned inputs and result on the process Scribe outbox.
 `submit` stages its inputs; only after Scribe acknowledges them does the
 batched request outbox insert the queued `wyrd.verifier_executions` row. A
 server-owned `queue_execution` marker on the input record (false for
-`verify`, true for `submit`) is the only thing that activates queued work, so
-replaying input persistence never re-executes `verify`. The batched writer
+`verify`, true for `submit` and for scheduled and group executions) is the
+only thing that activates queued work, so replaying input persistence never
+re-executes `verify`. Scheduled and group executions follow the same
+pipeline: the scheduler prepares the execution and its input without writing
+the queue, stages the input, and on its acknowledgement the same batched
+writer admits the execution, moving the expected schedule cursor or
+consuming the selected pending group generation in that transaction. The batched writer
 decides `Idempotency-Key` replay and conflict per tenant, subject, actor, and
 key: a matching retry returns the same execution ID; a conflicting one settles
 `errored` with `WYRD_REGISTRY_409_IDEMPOTENCY_CONFLICT`, never runs, and leaves
@@ -1758,9 +1828,18 @@ A `VerificationResult` carries `execution_id`, optional `run_id`, the exact
 `duration_ms`, `reason`, `provenance`, `tool_calls`), and pinned `evidence`.
 Provenance records code hash and runtime, extraction version, Agent and Prompt
 versions, effective routes, drift baselines and windows, and input digests.
-`bifrost.verification.results` is the canonical analytical result surface and
-`bifrost.verification.execution_inputs` holds pinned input declarations and
-queued activation context.
+`bifrost.verification.results` is the canonical payload-free result summary,
+`bifrost.verification.execution_outputs` holds each result's `requirements`
+and `steps`, and `bifrost.verification.execution_inputs` holds each
+execution's one input record: declarations for direct and submitted work, a
+selector for group and schedule work, and queued activation context. A
+returned `VerificationResult` is assembled from the three by one reader:
+verdict from the summary, breakdown from outputs by result ID, evidence from
+inputs by execution ID (a group's resolved slot lists; an empty map for
+scheduled Drift). PostgreSQL stores no input values; a queued execution's
+selected `result_id` stays authoritative. A direct execution has no queue
+row: its status is read from records whose input origin is `direct`, and is
+`completed` once they are visible. Unknown IDs remain not found.
 
 Every work record names who the work was for (`sub_principal_id`) and who
 performed it (`act_principal_id`). A direct caller A records A/A and a
@@ -1773,8 +1852,8 @@ authority. Wyrd performs model calls, tool calls, input reads, and result
 writes as the tenant SYSTEM executor, recording the subject with SYSTEM as
 actor; SYSTEM is never a subject and authorizes nothing extra. The runtime's
 own reads that prepare an execution never depend on owner credentials. These
-are scheduled Drift observation reads and a group's snapshot of its recorded
-verification inputs and results. They run as the tenant's credentialless,
+are scheduled Drift observation reads and a group's selection of its recorded
+verification inputs, outputs, and results. They run as the tenant's credentialless,
 role-free internal read principal, which holds `bifrost_query:read` only on
 the tables that read needs, with owner and source filters in the statement.
 The owner's activity and authority are checked before such work starts. Gateway spend
@@ -2027,7 +2106,12 @@ group once it ends (see Grouped verification under Verifier).
 For `schedule`, each due occurrence creates one
 execution per active binding over that binding's subject window
 `[previous boundary, due)`, filling each `samples` slot from its own
-`features`. Missed occurrences are skipped, not backfilled. A Trigger never
+`features`. The scheduler freezes the window's observation `record_id`s for
+the subject when it prepares the occurrence and records them, with the
+window, as the execution's `schedule` input record; every requirement and
+retry reads exactly that population, an empty window is a real empty
+selector, and later observations never change a prepared run. Missed
+occurrences are skipped, not backfilled. A Trigger never
 fires on its own: nothing runs merely because a Trigger Card is declared,
 and one schedule occurrence shared by two subjects creates two subject-scoped
 executions, never one mixed-subject execution.
@@ -2260,6 +2344,15 @@ complicates recovery for negligible authoring benefit, so v1 refuses
 it. Presigned upload URLs are tenant-scoped, `PUT`-only,
 single-artifact, and expire after 3600s.
 
+PostgreSQL coordinates manifests and upload sessions. Every completed
+artifact, envelope, and deletion is also a row in `bifrost.storage.objects`
+(see the Bifrost authority), the durable object record. Card reads never
+query Bifrost: Card listing, hydration, downloads, verifier Card resolution,
+workspace Artifact files, and drift baseline fitting serve a Card's
+declared files that storage completed, from its PostgreSQL manifest, read in
+the Card's own tenant transaction. Activation re-verifies each declared
+upload and records it before the Card turns `Active`.
+
 ### Idempotency
 
 Idempotency is a client responsibility. The `Idempotency-Key` header is
@@ -2279,7 +2372,10 @@ Key derivation (client-side):
 Server-side behavior:
 
 - Same key, same `request_hash` → `IdempotentNoop` replay, returns the
-  original response.
+  original outcomes with a re-minted plan, under the same upload, for every
+  declared upload not yet completed. A declaration that failed after its
+  commit, in upload initialization or inline completion, leaves its Cards
+  Pending; this replay or the reconcile sweep finishes them.
 - Same key, different `request_hash` →
   `WYRD_REGISTRY_409_IDEMPOTENCY_CONFLICT`.
 - Key not seen → normal processing; key + hash stored on completion.

@@ -271,14 +271,14 @@ The tables you can read besides your own:
 
 | Namespace | Holds |
 | --- | --- |
-| `vala.drift` | Drift samples |
-| `vala.verification` | One row per verdict, and the pinned inputs of each execution |
-| `vala.traces`, `vala.metrics`, `vala.logs` | OpenTelemetry data |
-| `vala.gateway` | AI Gateway calls. Request and response payload columns also need `gateway_payload:read` |
-| `vala.system` | The audit log |
-| `vala.datasets` | Your own tables |
+| `bifrost.drift` | Drift samples |
+| `bifrost.verification` | One row per verdict, and the pinned inputs of each execution |
+| `bifrost.traces`, `bifrost.metrics`, `bifrost.logs` | OpenTelemetry data |
+| `bifrost.gateway` | AI Gateway calls. Request and response payload columns also need `gateway_payload:read` |
+| `bifrost.system` | The audit log |
+| `bifrost.datasets` | Your own tables |
 
-Only `vala.datasets` accepts writes from you.
+Only `bifrost.datasets` accepts writes from you.
 
 ## What can go wrong
 

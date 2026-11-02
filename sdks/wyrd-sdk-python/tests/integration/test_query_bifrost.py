@@ -54,7 +54,7 @@ def test_unwritten_builtin_table_reads_as_empty() -> None:
     # A fresh server, since the session server's journeys write and publish Verifier results.
     with WyrdTestServer(mutate_env=False) as server:
         [counted] = Bifrost(client=client_of(server)).sql(
-            "SELECT COUNT(*) AS n FROM bifrost.drift.result_features", model=Count
+            "SELECT COUNT(*) AS n FROM bifrost.verification.execution_outputs", model=Count
         )
     assert counted.n == 0
 

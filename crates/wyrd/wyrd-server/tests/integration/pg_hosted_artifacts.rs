@@ -170,7 +170,10 @@ impl Registered {
 }
 
 /// A fresh user of `tenant` holding exactly `permissions`.
-fn user(tenant: DataTenantId, permissions: impl IntoIterator<Item = Permission>) -> Caller {
+pub(crate) fn user(
+    tenant: DataTenantId,
+    permissions: impl IntoIterator<Item = Permission>,
+) -> Caller {
     Caller {
         data_tenant_id: tenant,
         principal: Principal::new(
@@ -387,6 +390,175 @@ async fn artifact_reads_refuse_before_use() {
             .expect("tamper");
         refused(readable.artifact(card, Some("notes.txt")).await);
     }
+}
+
+/// One execution resolves each input's metadata once: an uploaded File's
+/// recorded location is read from the object inventory, and an exact
+/// Artifact's files from its Card manifest, a single time each, at
+/// admission, and every later selection, read, citation, native media, and
+/// workspace reuses them.
+///
+/// The one inventory read runs as the execution's SYSTEM executor, here a
+/// fresh principal the tenant registry never named, so it does not look the
+/// SYSTEM principal up in Postgres; the Artifact never reads the inventory.
+/// Every Artifact use still makes its own
+/// `card:read` decision: a caller without the grant or in another tenant is
+/// refused before any object is read, and a foreign tenant's caller finds
+/// no completed File for the same digest.
+///
+/// # Panics
+/// Panics when the server, upload, or a read fails, a refused read
+/// succeeds, or the inventory is read other than once per input.
+#[tokio::test]
+async fn evidence_metadata_is_resolved_once() {
+    let registered = Registered::start().await;
+    let server = &registered.server;
+    let tenant = server.data_tenant_id();
+    let Bootstrap::User { jwt, .. } = server
+        .bootstrap_user("hosted-metadata-writer", &["editor"])
+        .await
+        .expect("writer bootstraps")
+    else {
+        panic!("user bootstrap returned a non-user principal");
+    };
+    let document = br#"{"answer":1}"#;
+    crate::pg_verification_routes::upload_file(server, &jwt, document).await;
+    let doc = SlotName::new("doc").expect("slot");
+    let file = InputDeclaration::File {
+        sha256: Sha256Hex::digest(document),
+        size_bytes: document.len() as u64,
+        format: skald_spec::MediaFormat::Json,
+        filename: None,
+    };
+    let declared = BTreeMap::from([
+        (doc.clone(), file.clone()),
+        (notes(), registered.file("notes.txt")),
+    ]);
+    let executor = PrincipalId::new(uuid::Uuid::now_v7());
+    let caller = Caller {
+        executed_by: Some(executor),
+        ..user(tenant, [Permission::card_read()])
+    };
+    let evidence = TenantEvidence::new(
+        server.state().clone(),
+        caller,
+        BTreeMap::new(),
+        HostedLimits::default(),
+    );
+    let before = server
+        .bifrost_read_decision_count()
+        .await
+        .expect("read decisions count");
+
+    evidence
+        .admit(&BTreeMap::new(), &declared)
+        .await
+        .expect("both inputs are admitted");
+    for _ in 0..2 {
+        let (bytes, _) = evidence.read(&file).await.expect("the File reads");
+        assert_eq!(bytes, document);
+        let (bytes, _) = evidence
+            .artifact(&registered.card, Some("notes.txt"))
+            .await
+            .expect("the Artifact file reads");
+        assert_eq!(bytes, NOTES);
+    }
+    assert_eq!(
+        evidence
+            .select(&registered.card, None)
+            .await
+            .expect("the Artifact selects"),
+        ["check.py", "notes.txt"]
+    );
+    evidence
+        .media(&registered.file("notes.txt"))
+        .await
+        .expect("text is native media");
+    let cited = Citation {
+        slot: doc.clone(),
+        locator: Locator::Lines { start: 1, end: 1 },
+    };
+    assert_eq!(
+        evidence
+            .cited(&BTreeSet::from([doc.clone()]), vec![cited.clone()])
+            .await
+            .expect("citations check"),
+        vec![cited]
+    );
+    let mounted = |value: InputDeclaration, slot: &SlotName| CallInput {
+        value: CallValue::Evidence(value),
+        sources: BTreeSet::from([slot.clone()]),
+    };
+    let workspace = Workspaces::new(HostedLimits::default())
+        .open(
+            &BTreeMap::from([
+                ("/inputs/doc.json".to_owned(), mounted(file.clone(), &doc)),
+                (
+                    "/inputs/notes.txt".to_owned(),
+                    mounted(registered.file("notes.txt"), &notes()),
+                ),
+            ]),
+            &evidence,
+        )
+        .await
+        .expect("the workspace opens");
+    for path in ["/inputs/doc.json", "/inputs/notes.txt"] {
+        workspace.read(path, 0).expect("the input mounts");
+    }
+
+    let after = server
+        .bifrost_read_decision_count()
+        .await
+        .expect("read decisions count");
+    assert_eq!(
+        after - before,
+        1,
+        "one inventory read for the File and none for the Artifact"
+    );
+    let executed = server
+        .retained_audit_records(
+            tenant,
+            "operation",
+            &format!(
+                "operation = 'bifrost.query.read_decision' AND sub_principal_id = '{executor}'"
+            ),
+        )
+        .await
+        .expect("retained audit reads");
+    assert_eq!(
+        executed.len(),
+        1,
+        "the File read ran as the executor: {executed:?}"
+    );
+
+    let other = server
+        .seed_tenant("hosted-metadata-other")
+        .await
+        .expect("the other tenant seeds");
+    for (tenant, permissions) in [(tenant, Vec::new()), (other, vec![Permission::card_read()])] {
+        let refused = registered.evidence(
+            tenant,
+            permissions,
+            BTreeMap::new(),
+            HostedLimits::default(),
+        );
+        let error = refused
+            .artifact(&registered.card, Some("notes.txt"))
+            .await
+            .expect_err("the Card read is refused");
+        assert!(matches!(error, BlockError::Terminal { .. }), "{error}");
+    }
+    let foreign = registered.evidence(
+        other,
+        [Permission::card_read()],
+        BTreeMap::new(),
+        HostedLimits::default(),
+    );
+    let error = foreign
+        .read(&file)
+        .await
+        .expect_err("another tenant holds no such File");
+    assert!(matches!(error, BlockError::Retryable { .. }), "{error}");
 }
 
 /// Refuses every registry lookup; the Agent here is authored inline.
@@ -948,15 +1120,15 @@ async fn capacity_refusal_is_busy_at_every_hosted_consumer() {
 /// A queued execution refused the only Python worker returns to the queue
 /// with its attempt refunded and runs once capacity frees.
 ///
-/// The runtime hosts a one-worker pool with no waiters. The first queued
-/// execution's code spins for the whole code timeout, holding the worker;
-/// the second, claimed meanwhile, is refused busy and deferred rather than
-/// failed, retried, or judged. Once the spinner ends, the second completes
+/// The runtime hosts a one-worker pool with no waiters, whose one admission
+/// the test holds. The queued execution is refused busy and deferred rather
+/// than failed, retried, or judged; once the admission drops, it completes
 /// on its first counted attempt with its real verdict.
 ///
 /// # Panics
-/// Panics when the server, seeding, or runtime fails, the second execution
-/// is never deferred, or it settles other than `completed` on one attempt.
+/// Panics when the server, seeding, or runtime fails, the execution is never
+/// deferred, settles while the admission is held, or settles other than
+/// `completed` on one attempt.
 #[tokio::test]
 async fn busy_queued_execution_is_deferred_until_capacity_frees() {
     let logs = LogCapture::install();
@@ -971,7 +1143,7 @@ async fn busy_queued_execution_is_deferred_until_capacity_frees() {
         .await
         .expect("tenant receives every built-in table");
     let state = registered.server.state().clone();
-    let seed = VerificationFixture::provision(state.postgres.wyrd(), tenant)
+    let seed = VerificationFixture::provision(&state, tenant)
         .await
         .expect("tenant provisions");
     let (subject, _) = seed
@@ -991,13 +1163,6 @@ async fn busy_queued_execution_is_deferred_until_capacity_frees() {
             }]
         })
     };
-    let spinner = seed
-        .verifier(
-            "busy-spinner",
-            &code("spin", "def f(x):\n    while True:\n        pass", json!(0)),
-        )
-        .await
-        .expect("spinner registers");
     let adder = seed
         .verifier(
             "busy-adder",
@@ -1011,10 +1176,21 @@ async fn busy_queued_execution_is_deferred_until_capacity_frees() {
             InputDeclaration::Json { value: json!(1) },
         )])
     };
-    let spinning = seed
-        .submit(&spinner, &subject, one())
-        .await
-        .expect("spinner queues");
+    let none = serde_json::Map::new();
+    let far = Instant::now() + Duration::from_secs(30);
+    let sandbox = Arc::clone(
+        state
+            .verification
+            .blocks()
+            .expect("blocks are hosted")
+            .sandbox(),
+    );
+    // One admitted operation holds the only worker admission while pending.
+    let mut held = Box::pin(sandbox.run("def f():\n    return 1", "f", &none, Vec::new(), far));
+    assert!(
+        futures_util::FutureExt::now_or_never(&mut held).is_none(),
+        "the held operation waits for its worker"
+    );
     let deferred = seed
         .submit(&adder, &subject, one())
         .await
@@ -1032,6 +1208,18 @@ async fn busy_queued_execution_is_deferred_until_capacity_frees() {
     let stop = CancellationToken::new();
     let task = tokio::spawn(runtime.run(stop.clone()));
     let deadline = Instant::now() + Duration::from_mins(1);
+    while !logs.text().lines().any(|line| {
+        line.contains("deferred by admission backpressure") && line.contains(&deferred.to_string())
+    }) {
+        assert!(Instant::now() < deadline, "the adder was never deferred");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    let waiting = seed.execution(deferred).await.expect("execution reads");
+    assert_eq!(
+        waiting.result_id, None,
+        "a deferral judges nothing: {waiting:?}"
+    );
+    drop(held);
     let settled = loop {
         let row = seed.execution(deferred).await.expect("execution reads");
         if !matches!(row.status.as_str(), "pending" | "running" | "retrying") {
@@ -1046,21 +1234,12 @@ async fn busy_queued_execution_is_deferred_until_capacity_frees() {
     stop.cancel();
     task.await.expect("the runtime stops");
 
-    let text = logs.text();
-    assert!(
-        text.lines()
-            .any(|line| line.contains("deferred by admission backpressure")
-                && line.contains(&deferred.to_string())),
-        "the adder was refused the busy worker and deferred:\n{text}"
-    );
     assert_eq!(
         (settled.status.as_str(), settled.attempts),
         ("completed", 1),
         "a deferral spends no attempt: {settled:?}"
     );
     assert!(settled.result_id.is_some(), "{settled:?}");
-    let spun = seed.execution(spinning).await.expect("spinner reads");
-    assert_eq!(spun.status, "completed", "{spun:?}");
 }
 
 /// Hosted limits whose individual input-file bound admits the 11-byte notes
@@ -1246,7 +1425,7 @@ async fn nonconforming_queued_evidence_errors_without_a_verdict() {
         .await
         .expect("tenant receives every built-in table");
     let state = registered.server.state().clone();
-    let seed = VerificationFixture::provision(state.postgres.wyrd(), tenant)
+    let seed = VerificationFixture::provision(&state, tenant)
         .await
         .expect("tenant provisions");
     let (subject, _) = seed

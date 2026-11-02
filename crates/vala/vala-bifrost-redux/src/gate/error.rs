@@ -329,15 +329,22 @@ impl IngestError {
     /// The Gate's native gRPC adapter has no endpoint table argument, so only
     /// errors carrying their own table retain one here; OTLP/HTTP supplies its
     /// endpoint table to [`Self::to_wyrd_error`] before response rendering.
+    ///
+    /// Ingest saturation also carries `google.rpc.RetryInfo`: the OTLP
+    /// specification retries `RESOURCE_EXHAUSTED` only when the server sends
+    /// it, so without it a standard exporter would drop the refused batch.
     #[must_use]
     pub fn into_status(self) -> Status {
         let public = self.to_wyrd_error("unknown");
         let retryable_busy = public.code() == "WYRD_VALA_429_INGEST_BUSY";
-        let details = ErrorDetails::with_error_info(
+        let mut details = ErrorDetails::with_error_info(
             public.code(),
             WYRD_ERROR_DOMAIN,
             [] as [(String, String); 0],
         );
+        if retryable_busy {
+            details.set_retry_info(Some(std::time::Duration::from_secs(1)));
+        }
         let code = grpc_code_for_wyrd(&public);
         let message = public.to_string();
         let metadata = wyrd_error_to_status(public, None).metadata().clone();
@@ -632,7 +639,8 @@ mod tests {
     /// # Panics
     ///
     /// Panics when `IngestBusy` is not `ResourceExhausted` with a `retry-after-ms`
-    /// of `1000`, or a permanent capacity refusal carries that marker.
+    /// of `1000` and a one-second `RetryInfo`, or a permanent capacity refusal
+    /// carries either marker.
     #[test]
     fn ingest_busy_grpc_retry_metadata() {
         let busy = IngestError::IngestBusy {
@@ -646,15 +654,15 @@ mod tests {
                 .and_then(|value| value.to_str().ok()),
             Some("1000")
         );
-        for permanent in capacity_cases() {
-            assert!(
-                permanent
-                    .0
-                    .into_status()
-                    .metadata()
-                    .get("retry-after-ms")
-                    .is_none()
-            );
+        assert_eq!(
+            busy.get_details_retry_info()
+                .and_then(|retry| retry.retry_delay),
+            Some(std::time::Duration::from_secs(1))
+        );
+        for (permanent, _, _, _) in capacity_cases() {
+            let status = permanent.into_status();
+            assert!(status.metadata().get("retry-after-ms").is_none());
+            assert!(status.get_details_retry_info().is_none());
         }
     }
 

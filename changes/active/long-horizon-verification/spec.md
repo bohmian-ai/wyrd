@@ -6,6 +6,16 @@ status: approved
 
 # Long-horizon and heavy verification
 
+> **Superseded storage wording.** SPEC-benchmark-experiments revision 14
+> (TASK-006-R1) owns verification storage. A group execution records its
+> selection — a settled `wyrd_ingested_at` range of cumulative group history,
+> per-slot source references, ordered execution IDs and selected result IDs —
+> as its own `bifrost.verification.execution_inputs` record instead of pinning
+> values in a PostgreSQL snapshot, and its values are resolved from the source
+> records on each execution and read. Results are stored in three tables:
+> `execution_inputs`, `execution_outputs`, and the payload-free `results`.
+> Where this specification says otherwise, revision 14 governs.
+
 > **Superseded in part.** [bifrost-source-consistency revision 2](../../completed/2026/bifrost-source-consistency.md)
 > replaces this revision's accepted publication-overlap tradeoff for Bifrost
 > reads and REQ-015/AC-009's direct-overhead target (now p99 at or under
@@ -121,7 +131,7 @@ Traces continue to be exported using today's telemetry path.
 
 **Pre-release schema constraint.** Wyrd has never shipped, so no deployment
 holds retained state that must survive this change. Built-in Bifrost tables
-(`execution_inputs`, `results`) change their definitions in place; an existing
+(`execution_inputs`, `execution_outputs`, `results`) change their definitions in place; an existing
 development deployment is reset (fresh Postgres catalog and object storage), not
 upgraded. The fingerprint and physical-schema checks stay unchanged, and a
 server started against old-schema tables keeps refusing at startup with the

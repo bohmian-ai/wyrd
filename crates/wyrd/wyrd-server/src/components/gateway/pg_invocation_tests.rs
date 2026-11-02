@@ -833,6 +833,14 @@ async fn gateway_invocation_authorizes_each_model_and_accounts_attempts() {
     capture_metadata(&state, tenant).await;
     let invocation = GatewayInvocation::new(&state);
     let decision = |outcome: &str| ("gateway.invoke".to_owned(), outcome.to_owned());
+    // Setup's policy write is another request on another outbox lane, so only
+    // invoke decisions, each drained before the next request, have an order.
+    let invokes = || {
+        audit_decisions(&scribe, tenant)
+            .into_iter()
+            .filter(|(operation, _)| operation == "gateway.invoke")
+            .collect::<Vec<_>>()
+    };
 
     let refused = super::routes::chat_completions(
         State(state.clone()),
@@ -852,10 +860,7 @@ async fn gateway_invocation_authorizes_each_model_and_accounts_attempts() {
     );
     assert!(dispatch.seen().is_empty(), "a denial never dispatches");
     drain_gateway(&state).await;
-    assert_eq!(
-        audit_decisions(&scribe, tenant).last(),
-        Some(&decision("denied"))
-    );
+    assert_eq!(invokes(), [decision("denied")]);
 
     dispatch.push(Step::Return(failed(1000, 0)));
     let narrow = invoker(tenant, 1, [model_access("dep-a/a")]);
@@ -873,10 +878,9 @@ async fn gateway_invocation_authorizes_each_model_and_accounts_attempts() {
         "unauthorized dep-b/b is never dispatched"
     );
     drain_gateway(&state).await;
-    let decisions = audit_decisions(&scribe, tenant);
     assert_eq!(
-        decisions[decisions.len() - 2..],
-        [decision("allowed"), decision("denied")]
+        invokes(),
+        [decision("denied"), decision("allowed"), decision("denied")]
     );
 
     dispatch.push(Step::Return(failed(1000, 0)));
@@ -3402,6 +3406,87 @@ async fn gateway_capture_follows_policy_and_never_affects_the_call() {
         .expect("a pod reaching no Scribe never fails the call");
     assert_eq!(answered.status, 200);
     drain_gateway(&unavailable).await;
+}
+
+/// Proves a capturing call waits for a Scribe outbox capture slot during
+/// admission instead of having its capture shed.
+///
+/// While every reservable slot is held, a call with a short deadline is
+/// refused with `WYRD_GATEWAY_429_CAPTURE_STAGING_FULL` after waiting out
+/// that deadline, before any provider sees it and with nothing captured. A
+/// call admitted while the slots are held waits, is admitted once they are
+/// released, answers, and its capture row is written.
+///
+/// # Panics
+/// Panics when the Postgres fixture, a seed or call, or an assertion fails.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn capturing_call_waits_for_a_capture_slot_and_refuses_at_its_deadline() {
+    let fixture = PgFixture::start().await.expect("fixture starts");
+    let tenant = fixture.data_tenant_id();
+    let dispatch = Scripted::shared();
+    let (state, scribe) = RecordingScribe::attach(replica(&fixture, dispatch.clone()).await);
+    configure(&state, tenant, json!([]), json!([]), "allow_unpriced").await;
+    GatewayAdministration::new(&state)
+        .put_capture(
+            &admin(tenant),
+            GatewayCapturePolicyWrite {
+                mode: GatewayCaptureMode::Metadata,
+                payload_fields: BTreeSet::new(),
+            },
+        )
+        .await
+        .expect("metadata policy stores");
+    let caller = invoker(tenant, 1, [open_access()]);
+    let reservable = crate::scribe_outbox::SCRIBE_CAPACITY * wyrd_runtime::outbox::RESERVED_SHARE.0
+        / wyrd_runtime::outbox::RESERVED_SHARE.1;
+    let held = state
+        .bifrost
+        .scribe_outbox()
+        .reserve(reservable)
+        .expect("every reservable slot is held");
+
+    let started = tokio::time::Instant::now();
+    let refused = GatewayInvocation::new(&state)
+        .invoke(
+            &caller,
+            request("dep-a/a", Some((1000, 500)), Duration::from_millis(200)),
+        )
+        .await
+        .expect_err("no capture slot frees before the deadline");
+    assert!(
+        matches!(refused, WyrdError::GatewayCaptureStagingFull { .. }),
+        "{refused:?}"
+    );
+    assert!(
+        started.elapsed() >= Duration::from_millis(200),
+        "the call waited for its deadline before refusing"
+    );
+    assert!(
+        dispatch.seen().is_empty(),
+        "a refused call reaches no provider"
+    );
+
+    let release = tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        drop(held);
+    });
+    dispatch.push(Step::Return(completed(100, 50)));
+    let answered = GatewayInvocation::new(&state)
+        .invoke(
+            &caller,
+            request("dep-a/a", Some((1000, 500)), Duration::from_secs(10)),
+        )
+        .await
+        .expect("a call waiting for a freed slot is admitted");
+    release.await.expect("release task");
+    assert_eq!(answered.status, 200);
+    drain_gateway(&state).await;
+    assert_eq!(
+        scribe.calls().len(),
+        1,
+        "only the admitted call is captured"
+    );
+    captured(&scribe, answered.call_id);
 }
 
 /// Proves a call's Run and Card UID attribution is authorized before

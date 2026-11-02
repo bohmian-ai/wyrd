@@ -29,6 +29,13 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 /// operative bound.
 const REQUEST_TIMEOUT: Duration = Duration::from_mins(10);
 
+/// Idle connections kept per provider host: unbounded, as reqwest's own
+/// default is. A gateway sends as many concurrent calls to one provider as its
+/// callers make, so any lower cap closes the connections above it on return
+/// and pays a new TCP and TLS handshake on the next call. Unused connections
+/// still close after reqwest's idle timeout.
+const POOL_MAX_IDLE_PER_HOST: usize = usize::MAX;
+
 /// Network policy for tenant-controlled endpoints.
 ///
 /// Cloud-metadata, link-local, broadcast, and documentation addresses are
@@ -99,7 +106,8 @@ impl EndpointPolicy {
     /// Every hostname resolves once under a bounded timeout and is refused
     /// when any answer is blocked; redirects are returned as answers rather
     /// than followed; no proxy is consulted. The transport is shared by every
-    /// attempt, so connections are pooled per resolved endpoint.
+    /// attempt, so connections are pooled per resolved endpoint with no idle
+    /// cap; see [`POOL_MAX_IDLE_PER_HOST`].
     ///
     /// # Errors
     ///
@@ -109,6 +117,7 @@ impl EndpointPolicy {
         let config = TransportConfig {
             timeout: REQUEST_TIMEOUT,
             connect_timeout: CONNECT_TIMEOUT,
+            pool_max_idle_per_host: POOL_MAX_IDLE_PER_HOST,
             ..TransportConfig::default()
         };
         HttpTransport::customized(config, |builder| self.screened(builder))

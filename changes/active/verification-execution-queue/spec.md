@@ -6,6 +6,13 @@ status: approved
 
 # Durable verification admission, execution queue, and retention
 
+> **Superseded storage wording.** SPEC-benchmark-experiments revision 14
+> (TASK-006-R1) owns verification storage: producer request handlers add no
+> PostgreSQL IO, queue rows hold no `inputs`, `route_overrides`, or grouped
+> source arrays, and the runner resolves inputs and accepted routes from the
+> execution's `bifrost.verification.execution_inputs` record. Where this
+> specification says otherwise, revision 14 governs.
+
 ## Objective and approval boundary
 
 A successful Run `submit` durably queues work before returning. Narrow live

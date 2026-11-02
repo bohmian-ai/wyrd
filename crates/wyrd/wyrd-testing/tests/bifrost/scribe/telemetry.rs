@@ -20,8 +20,8 @@ use wyrd_testing::bifrost::{
 };
 
 use super::support::{
-    append_values, await_persistence_drained, endpoint_client, published_rows, register_table,
-    sorted_values, tenant_client, tenant_key, unique_table,
+    append_batch, append_values, await_persistence_drained, endpoint_client, published_rows,
+    register_table, sorted_values, tenant_client, tenant_key, unique_table,
 };
 
 /// Longest a settled pod may take to retire the members its publication replaced.
@@ -632,6 +632,10 @@ async fn scribe_hot_path_telemetry_reconciles() {
         expected,
         "the table holds each acknowledged row once"
     );
+    server
+        .settle_bifrost_outbox()
+        .await
+        .expect("the read's audit row reaches Scribe before the freeze");
 
     // Freeze, publication not yet requested: the staged backlog is visible
     // and equals the staging owner, while acknowledged rows stay readable.
@@ -845,4 +849,390 @@ async fn scribe_hot_path_telemetry_reconciles() {
 
     print_family_inventory(&telemetry);
     server.shutdown().await.expect("the server drains cleanly");
+}
+
+/// One acknowledged Variant batch of `(value, document)` rows.
+///
+/// # Panics
+///
+/// Panics when the append is refused.
+async fn append_documents(client: &wyrd_client::WyrdClient, table: &str, rows: &[(i64, String)]) {
+    let borrowed: Vec<(i64, &str)> = rows
+        .iter()
+        .map(|(value, json)| (*value, json.as_str()))
+        .collect();
+    append_batch(
+        client,
+        table,
+        uuid::Uuid::now_v7(),
+        &super::recovery::variant_batch(&borrowed),
+    )
+    .await
+    .expect("the Variant append is acknowledged");
+}
+
+/// Forty `(value, document)` rows from `first` mixing typed, mistyped, null,
+/// list, nested, and missing Variant keys.
+fn variant_cohort(first: i64) -> Vec<(i64, String)> {
+    (first..first + 40)
+        .map(|value| {
+            let document = match value % 4 {
+                0 => format!(r#"{{"a":{value},"b":"s{value}"}}"#),
+                1 => format!(r#"{{"a":{value},"c":[1,{value}]}}"#),
+                2 => format!(r#"{{"a":"text{value}","b":null}}"#),
+                _ => format!(r#"{{"a":{value},"d":{{"e":{value}}}}}"#),
+            };
+            (value, document)
+        })
+        .collect()
+}
+
+/// Learned Variant layouts keep every value exact from memory through
+/// staging, publication, and a cold restart.
+///
+/// The cold process publishes a first cohort canonically, and its claim
+/// teaches the process a layout for the table. A second cohort then opens a
+/// generation that pins that layout, so its rows are retained shredded, and
+/// they read back exactly from memory, from their native staged runs, and —
+/// after a restart that empties the advisory cache — from the restored staged
+/// runs and their publication. A cohort written after the restart opens a
+/// canonical generation: a cold cache never blocks writes or recovery. Every
+/// read returns each row once.
+///
+/// # Panics
+///
+/// Panics when the server cannot start or restart, an append, freeze, read, or
+/// publication fails, the layout evidence disagrees, or any read differs from
+/// the acknowledged documents.
+#[tokio::test]
+#[ignore = "requires Postgres and object storage"]
+async fn variant_layouts_survive_memory_stage_publication_and_restart() {
+    use super::recovery::read_documents;
+    use arrow::datatypes::{DataType, Field};
+    use vala_bifrost_redux::catalog::{CreateTableRequest, TableRef};
+
+    let data_root = tempfile::tempdir().expect("durable Bifrost data root");
+    let builder =
+        || WyrdTestServer::builder().with_durable_bifrost_data_root(data_root.path().to_path_buf());
+    let server = builder()
+        .start_bound()
+        .await
+        .expect("the pod starts on a durable data root");
+    let tenant = server.data_tenant_id();
+    let name = unique_table("variant_layouts");
+    let table_ref = TableRef::new(BifrostNamespace::Datasets, &name);
+    server
+        .create_bifrost_table_for_test(CreateTableRequest {
+            table: table_ref.clone(),
+            user_fields: vec![
+                Field::new("value", DataType::Int64, false),
+                wyrd_types::variant::variant_field("v", true),
+            ],
+            tenant,
+            attribution: wyrd_spec::auth::Attribution::unresolved(),
+            physical_layout: None,
+        })
+        .await
+        .expect("the catalog registers the Variant table");
+    let table = format!("{}.{name}", BifrostNamespace::Datasets.as_str());
+    let client = tenant_client(&server, tenant).await;
+    let scribe = server.bifrost_scribe().expect("the pod owns a Scribe");
+    let layouts = |scribe: &vala_bifrost_redux::scribe::ScribeImpl| {
+        scribe
+            .writable_variant_layouts_for_test(tenant, &table_ref)
+            .expect("writable layouts are inspectable")
+    };
+
+    let mut expected = variant_cohort(0);
+    append_documents(&client, &table, &expected).await;
+    assert_eq!(
+        layouts(&scribe),
+        [false],
+        "a cold process opens a canonical generation"
+    );
+    assert_eq!(
+        read_documents(&client, &table).await,
+        expected,
+        "cold memory"
+    );
+    server
+        .flush_bifrost()
+        .await
+        .expect("the cold cohort publishes");
+    let learned = scribe
+        .learned_variant_layout_for_test(tenant, &table_ref)
+        .expect("the published claim teaches the process a layout");
+    let shredded = learned.field_with_name("v").expect("v").data_type().clone();
+    eprintln!("evidence variant_layouts learned_v={shredded:?}");
+    assert_ne!(
+        shredded,
+        wyrd_types::variant::variant_storage_type(),
+        "the learned layout shreds `v`"
+    );
+
+    let learned_rows = variant_cohort(40);
+    append_documents(&client, &table, &learned_rows).await;
+    expected.extend(learned_rows);
+    assert_eq!(
+        layouts(&scribe),
+        [true],
+        "a generation opened after learning pins the learned layout"
+    );
+    assert_eq!(
+        read_documents(&client, &table).await,
+        expected,
+        "learned memory unions with the published cohort"
+    );
+    scribe
+        .flush_writable_for_test()
+        .await
+        .expect("every writable bucket freezes");
+    await_persistence_drained(&scribe).await;
+    assert_eq!(
+        read_documents(&client, &table).await,
+        expected,
+        "native staged runs read exactly"
+    );
+    drop(scribe);
+
+    let server = Box::pin(server.restart_bound(builder()))
+        .await
+        .expect("the pod restarts on its retained data root");
+    let client = tenant_client(&server, tenant).await;
+    let scribe = server.bifrost_scribe().expect("the pod owns a Scribe");
+    assert!(
+        scribe
+            .learned_variant_layout_for_test(tenant, &table_ref)
+            .is_none(),
+        "a restart empties the advisory cache"
+    );
+    assert_eq!(
+        read_documents(&client, &table).await,
+        expected,
+        "restored shredded staging reads exactly"
+    );
+    let cold_rows = variant_cohort(80);
+    append_documents(&client, &table, &cold_rows).await;
+    expected.extend(cold_rows);
+    assert_eq!(
+        layouts(&scribe),
+        [false],
+        "a cold cache opens a canonical generation"
+    );
+    server
+        .flush_bifrost()
+        .await
+        .expect("the restored and cold rows publish");
+    assert_eq!(
+        published_rows(&server, tenant, &name).await,
+        expected.len() as u64,
+        "every row publishes exactly once"
+    );
+    assert_eq!(
+        read_documents(&client, &table).await,
+        expected,
+        "published rows read exactly"
+    );
+    drop(scribe);
+    server.shutdown().await.expect("the server drains cleanly");
+}
+
+/// The benchmark control moves rows only when the platform administrator asks.
+///
+/// A cohort stays in the memtable until a stage request moves it into staged
+/// runs, which answer it exactly and publish nothing. A publish request then
+/// publishes it through the production claim path, teaching the process a
+/// layout, so the next cohort opens a generation in that layout. A caller with
+/// no credential or a tenant credential is refused, and each request the
+/// platform administrator makes is audited as a platform decision.
+///
+/// # Panics
+///
+/// Panics when the server cannot start, a refusal is not `401`, an append,
+/// control request, or read fails, a cohort is not where the control put it,
+/// or a control request is not audited.
+#[tokio::test]
+#[ignore = "requires Postgres and object storage"]
+async fn benchmark_control_stages_and_publishes_on_request() {
+    use super::recovery::read_documents;
+    use arrow::datatypes::{DataType, Field};
+    use vala_bifrost_redux::catalog::{CreateTableRequest, TableRef};
+
+    let data_root = tempfile::tempdir().expect("durable Bifrost data root");
+    let server = WyrdTestServer::builder()
+        .with_durable_bifrost_data_root(data_root.path().to_path_buf())
+        .start_bound()
+        .await
+        .expect("the pod starts on a durable data root");
+    let tenant = server.data_tenant_id();
+    let name = unique_table("benchmark_control");
+    let table_ref = TableRef::new(BifrostNamespace::Datasets, &name);
+    server
+        .create_bifrost_table_for_test(CreateTableRequest {
+            table: table_ref.clone(),
+            user_fields: vec![
+                Field::new("value", DataType::Int64, false),
+                wyrd_types::variant::variant_field("v", true),
+            ],
+            tenant,
+            attribution: wyrd_spec::auth::Attribution::unresolved(),
+            physical_layout: None,
+        })
+        .await
+        .expect("the catalog registers the Variant table");
+    let table = format!("{}.{name}", BifrostNamespace::Datasets.as_str());
+    let key = tenant_key(&server, tenant).await;
+    let client = endpoint_client(&server, &key);
+    let scribe = server.bifrost_scribe().expect("the pod owns a Scribe");
+    let layouts = || {
+        scribe
+            .writable_variant_layouts_for_test(tenant, &table_ref)
+            .expect("writable layouts are inspectable")
+    };
+
+    let stage_url = format!(
+        "{}/platform/benchmark/scribe/stage",
+        server.base_url().expect("bound HTTP URL")
+    );
+    let http = reqwest::Client::new();
+    let tenant_token = server
+        .exchange_api_key(&key)
+        .await
+        .expect("the tenant key exchanges");
+    for (caller, request) in [
+        ("no credential", http.post(&stage_url)),
+        (
+            "a tenant credential",
+            http.post(&stage_url)
+                .header("x-wyrd-access-token", format!("Bearer {tenant_token}")),
+        ),
+    ] {
+        let refused = request.send().await.expect("the control answers");
+        assert_eq!(refused.status(), 401, "{caller} is refused");
+        let problem: serde_json::Value = refused.json().await.expect("a problem body");
+        assert_eq!(problem["code"], "WYRD_AUTH_401_UNAUTHENTICATED", "{caller}");
+    }
+    let platform_credential = server
+        .initialize_platform_root()
+        .await
+        .expect("the platform root initializes");
+    let platform =
+        wyrd_client::Platform::connect_with(&endpoint_client(&server, &platform_credential))
+            .await
+            .expect("the platform session exchanges");
+
+    let mut expected = variant_cohort(0);
+    append_documents(&client, &table, &expected).await;
+    assert_eq!(layouts(), [false], "the cohort is in the memtable");
+    let staged = platform.stage_scribe().await.expect("the cohort stages");
+    assert!(
+        staged >= 40,
+        "the stage moved the cohort, reported {staged}"
+    );
+    assert!(layouts().is_empty(), "no writable generation remains");
+    assert_eq!(
+        published_rows(&server, tenant, &name).await,
+        0,
+        "staging publishes nothing"
+    );
+    assert_eq!(
+        read_documents(&client, &table).await,
+        expected,
+        "staged runs answer the cohort exactly"
+    );
+    assert_eq!(
+        control_decisions(&server).await,
+        1,
+        "the stage request is audited as a platform decision"
+    );
+
+    let claims = platform
+        .publish_scribe()
+        .await
+        .expect("the cohort publishes");
+    assert!(claims >= 1, "the publish claimed the staged cohort");
+    assert_eq!(
+        published_rows(&server, tenant, &name).await,
+        expected.len() as u64,
+        "every staged row publishes exactly once"
+    );
+    let learned = scribe
+        .learned_variant_layout_for_test(tenant, &table_ref)
+        .expect("the published claim teaches the process a layout");
+    assert_ne!(
+        learned.field_with_name("v").expect("v").data_type(),
+        &wyrd_types::variant::variant_storage_type(),
+        "the learned layout shreds `v`"
+    );
+
+    let learned_rows = variant_cohort(40);
+    append_documents(&client, &table, &learned_rows).await;
+    expected.extend(learned_rows);
+    assert_eq!(
+        layouts(),
+        [true],
+        "the next cohort opens in the learned layout"
+    );
+    platform
+        .stage_scribe()
+        .await
+        .expect("the learned cohort stages");
+    assert!(layouts().is_empty(), "the learned cohort left the memtable");
+    assert_eq!(
+        read_documents(&client, &table).await,
+        expected,
+        "learned staged runs union with the published cohort"
+    );
+    drop(scribe);
+    server.shutdown().await.expect("the server drains cleanly");
+}
+
+/// Counts the benchmark control's audited platform decisions in the WAL.
+///
+/// A platform decision is retained under the system owner; until publication
+/// retires it, the acknowledged WAL holds every one.
+///
+/// # Panics
+///
+/// Panics when audit retention does not settle or the WAL cannot replay.
+async fn control_decisions(server: &WyrdTestServer) -> usize {
+    server
+        .await_audit_retained()
+        .await
+        .expect("audit retention settles");
+    let replayed = vala_bifrost_redux::scribe::replay::replay_wal_directory(
+        server
+            .scribe_wal_root_for_test()
+            .expect("the in-process server owns a WAL root"),
+    )
+    .expect("acknowledged WAL replays");
+    let mut decisions = 0;
+    for stream in replayed.values().filter(|stream| {
+        stream.seal_key.tenant == wyrd_spec::DataTenantId::SYSTEM_OWNER
+            && vala_bifrost_redux::tables::AuditLogTable::admits_system_owner(
+                &stream.seal_key.table,
+            )
+    }) {
+        for record in &stream.data_records {
+            let reader =
+                arrow::ipc::reader::StreamReader::try_new(std::io::Cursor::new(record), None)
+                    .expect("a WAL record is an Arrow IPC stream");
+            for batch in reader {
+                let batch = batch.expect("a WAL record decodes");
+                let text = |column: &str, row: usize| {
+                    batch.column_by_name(column).and_then(|column| {
+                        arrow::util::display::array_value_to_string(column, row).ok()
+                    })
+                };
+                decisions += (0..batch.num_rows())
+                    .filter(|row| {
+                        text("operation", *row).as_deref() == Some("platform.authz")
+                            && text("resource", *row).as_deref() == Some("platform:tenants")
+                            && text("permission", *row).as_deref() == Some("tenants:suspend")
+                    })
+                    .count();
+            }
+        }
+    }
+    decisions
 }

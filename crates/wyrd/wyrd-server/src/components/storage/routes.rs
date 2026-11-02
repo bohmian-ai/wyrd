@@ -4,11 +4,14 @@
 //! middleware. These handlers add the operation-specific `card_read` or
 //! `card_write` permission before calling storage services; keeping that check
 //! beside the route makes the capability required by each operation explicit.
+//! Operations on an existing upload select the permission from its persisted
+//! owner: `card_write` for a Card file, any `verifier:run` grant for a
+//! verification File upload opened by `POST /v1/verification/evidence`.
 
 use std::str::FromStr;
 
 use axum::Json;
-use axum::body::{Body, Bytes};
+use axum::body::Body;
 use axum::extract::rejection::{PathRejection, QueryRejection};
 use axum::extract::{Path, Query, State};
 use axum::http::{HeaderMap, StatusCode, header};
@@ -23,10 +26,15 @@ use wyrd_spec::storage::{
     PartUrlResponse, UploadCompleteRequest, UploadId, UploadInitRequest,
 };
 use wyrd_storage::BackendConfig;
-use wyrd_storage::service::{self, StorageCaller};
+use wyrd_storage::service::{self, StorageCaller, UploadOwner};
 
 use crate::audit;
 use crate::components::auth::Caller;
+use crate::components::cards::service::card_file;
+use crate::components::storage::inventory::{
+    ObjectFact, ObjectInventory, ObjectOrigin, ObjectState,
+};
+use crate::components::verification::service::VerificationControl;
 use crate::http::error::WyrdErrorResponse;
 use crate::state::AppState;
 use utoipa_axum::router::OpenApiRouter;
@@ -113,6 +121,14 @@ struct PartUrlQuery {
 }
 
 /// Mint a URL or equivalent protocol data for one upload part.
+///
+/// The permission is selected by the upload's persisted owner. Minting is
+/// read-only, so a retry mints a fresh URL for the same part.
+///
+/// # Errors
+/// Returns the upload-id and owner-selected authorization refusals,
+/// `WYRD_STORAGE_404_UPLOAD_NOT_FOUND` for an unknown or foreign upload, and
+/// the storage service's part-URL errors.
 #[utoipa::path(
     post,
     path = "/cards/upload/{id}/part-url",
@@ -127,8 +143,8 @@ struct PartUrlQuery {
         (status = 401, description = "The request carried no usable access token \
           (WYRD_AUTH_401_UNAUTHENTICATED, WYRD_AUTH_401_INVALID_TOKEN, \
           WYRD_AUTH_401_TOKEN_EXPIRED)", body = WyrdProblem),
-        (status = 403, description = "The principal lacks card write, or the object belongs to \
-          another tenant (WYRD_PERMISSION_403_DENIED_RBAC, WYRD_STORAGE_403_UPLOAD_FOREIGN_TENANT)", body = WyrdProblem),
+        (status = 403, description = "The principal lacks card write for a Card upload or any \
+          `verifier:run` grant for a verification File upload, or the object belongs to another tenant (WYRD_PERMISSION_403_DENIED_RBAC, WYRD_STORAGE_403_UPLOAD_FOREIGN_TENANT)", body = WyrdProblem),
         (status = 404, description = "No such upload (WYRD_STORAGE_404_UPLOAD_NOT_FOUND)",
          body = WyrdProblem),
         (status = 409, description = "The upload is already terminal \
@@ -142,6 +158,7 @@ struct PartUrlQuery {
     ),
     tag = "Storage"
 )]
+#[tracing::instrument(skip(state, caller), fields(operation = "storage.upload.part_url"))]
 async fn part_url(
     State(state): State<AppState>,
     caller: Caller,
@@ -149,12 +166,7 @@ async fn part_url(
     Query(query): Query<PartUrlQuery>,
 ) -> Result<Json<PartUrlResponse>, WyrdErrorResponse> {
     let upload_id = parse_upload_id(&id)?;
-    authorize_card_write(
-        &state,
-        &caller,
-        "storage.upload.part_url",
-        &format!("upload:{upload_id}"),
-    )?;
+    authorize_upload(&state, &caller, "storage.upload.part_url", &upload_id).await?;
     let storage_caller = storage_caller(&caller);
     service::upload_part_url(
         &state.storage,
@@ -172,7 +184,18 @@ async fn part_url(
 ///
 /// The optional `Idempotency-Key` is forwarded to the storage service so a
 /// retried client completion keeps the same request context. The service
-/// verifies the backend object before persisting its artifact metadata.
+/// verifies the backend object and commits the upload's completion; the
+/// handler then records the completed object in `bifrost.storage.objects`
+/// and responds only once that row is acknowledged. An unacknowledged
+/// record leaves the completion committed with its outcome unknown, and a
+/// retried completion records the same object again.
+///
+/// # Errors
+/// Returns the idempotency, upload-id, and authorization refusals, the
+/// storage service's completion errors, an internal error when the stored
+/// path or size cannot be recorded, and
+/// `WYRD_VALA_503_BIFROST_WRITER_UNAVAILABLE` when the inventory does not
+/// acknowledge the completed object in time.
 #[utoipa::path(
     post,
     path = "/cards/upload/{id}/complete",
@@ -192,8 +215,8 @@ async fn part_url(
         (status = 401, description = "The request carried no usable access token \
           (WYRD_AUTH_401_UNAUTHENTICATED, WYRD_AUTH_401_INVALID_TOKEN, \
           WYRD_AUTH_401_TOKEN_EXPIRED)", body = WyrdProblem),
-        (status = 403, description = "The principal lacks card write, or the object belongs to \
-          another tenant (WYRD_PERMISSION_403_DENIED_RBAC, WYRD_STORAGE_403_UPLOAD_FOREIGN_TENANT)", body = WyrdProblem),
+        (status = 403, description = "The principal lacks card write for a Card upload or any \
+          `verifier:run` grant for a verification File upload, or the object belongs to another tenant (WYRD_PERMISSION_403_DENIED_RBAC, WYRD_STORAGE_403_UPLOAD_FOREIGN_TENANT)", body = WyrdProblem),
         (status = 404, description = "No such upload, or its object never reached the backend \
           (WYRD_STORAGE_404_UPLOAD_NOT_FOUND, WYRD_STORAGE_404_OBJECT_NOT_FOUND)",
          body = WyrdProblem),
@@ -203,12 +226,17 @@ async fn part_url(
           WYRD_SPEC_409_CONFLICT)", body = WyrdProblem),
         (status = 500, description = "The storage backend or the platform store failed \
           (WYRD_STORAGE_500_BACKEND, WYRD_SPEC_500_INTERNAL)", body = WyrdProblem),
-        (status = 503, description = "No verifier is configured for the access token, or \
-          the storage backend is transiently unavailable \
-          (WYRD_AUTH_503_VERIFY_UNAVAILABLE, \
-          WYRD_STORAGE_503_BACKEND_UNAVAILABLE)", body = WyrdProblem)
+        (status = 503, description = "No verifier is configured for the access token, the \
+          storage backend is transiently unavailable, or the object inventory did not \
+          acknowledge the completion in time; retry the completion \
+          (WYRD_AUTH_503_VERIFY_UNAVAILABLE, WYRD_STORAGE_503_BACKEND_UNAVAILABLE, \
+          WYRD_VALA_503_BIFROST_WRITER_UNAVAILABLE)", body = WyrdProblem)
     ),
     tag = "Storage"
+)]
+#[tracing::instrument(
+    skip(state, caller, headers, body),
+    fields(operation = "storage.upload.complete")
 )]
 async fn complete(
     State(state): State<AppState>,
@@ -219,24 +247,52 @@ async fn complete(
 ) -> Result<Json<wyrd_spec::storage::UploadCompleteResponse>, WyrdErrorResponse> {
     let idempotency_key = extract_idempotency_key(&headers)?;
     let upload_id = parse_upload_id(&id)?;
-    authorize_card_write(
-        &state,
-        &caller,
-        "storage.upload.complete",
-        &format!("upload:{upload_id}"),
-    )?;
+    let (owner, _) =
+        authorize_upload(&state, &caller, "storage.upload.complete", &upload_id).await?;
     let storage_caller = storage_caller(&caller);
-    service::upload_complete(
+    let response = service::upload_complete(
         &state.storage,
         state.postgres.wyrd(),
         &storage_caller,
-        upload_id,
+        upload_id.clone(),
         idempotency_key,
         body,
     )
-    .await
-    .map(Json)
-    .map_err(WyrdErrorResponse::from)
+    .await?;
+    let stored = &response.stored;
+    let (origin, card_uid, relative_path) = match owner {
+        UploadOwner::Card(card_uid) => {
+            let path =
+                wyrd_storage::tenant_path::validate(&stored.storage_path, caller.data_tenant_id)
+                    .map_err(|error| {
+                        WyrdError::internal(format!("completed object path: {error}"))
+                    })?;
+            (
+                ObjectOrigin::CardFile,
+                Some(card_uid),
+                Some(path.relative_path),
+            )
+        }
+        UploadOwner::File => (ObjectOrigin::FileUpload, None, None),
+    };
+    let fact = ObjectFact {
+        storage_path: stored.storage_path.clone(),
+        upload_id: Some(upload_id.to_string()),
+        backend: state.storage.backend().to_string(),
+        sha256: Some(stored.sha256.clone()),
+        size_bytes: i64::try_from(stored.size_bytes)
+            .map_err(|_| WyrdError::internal("completed object size overflows"))?,
+        content_type: stored.content_type.clone(),
+        sse_marker: stored.sse_marker.clone(),
+        origin,
+        card_uid,
+        relative_path,
+        state: ObjectState::Completed,
+    };
+    ObjectInventory::new(&state)
+        .record(caller.data_tenant_id, caller.attribution(), &[fact])
+        .await?;
+    Ok(Json(response))
 }
 
 /// Abort an upload and release its pending storage state.
@@ -244,6 +300,11 @@ async fn complete(
 /// Aborts are safe to retry: the server treats an already completed or
 /// already aborted upload as a no-op, while the idempotency key remains
 /// available to the service for request correlation.
+///
+/// # Errors
+/// Returns the idempotency, upload-id, and owner-selected authorization
+/// refusals, `WYRD_STORAGE_404_UPLOAD_NOT_FOUND` for an unknown or foreign
+/// upload, and the storage service's abort errors.
 #[utoipa::path(
     post,
     path = "/cards/upload/{id}/abort",
@@ -260,8 +321,8 @@ async fn complete(
         (status = 401, description = "The request carried no usable access token \
           (WYRD_AUTH_401_UNAUTHENTICATED, WYRD_AUTH_401_INVALID_TOKEN, \
           WYRD_AUTH_401_TOKEN_EXPIRED)", body = WyrdProblem),
-        (status = 403, description = "The principal lacks card write, or the object belongs to \
-          another tenant (WYRD_PERMISSION_403_DENIED_RBAC, WYRD_STORAGE_403_UPLOAD_FOREIGN_TENANT)", body = WyrdProblem),
+        (status = 403, description = "The principal lacks card write for a Card upload or any \
+          `verifier:run` grant for a verification File upload, or the object belongs to another tenant (WYRD_PERMISSION_403_DENIED_RBAC, WYRD_STORAGE_403_UPLOAD_FOREIGN_TENANT)", body = WyrdProblem),
         (status = 404, description = "No such upload (WYRD_STORAGE_404_UPLOAD_NOT_FOUND)",
          body = WyrdProblem),
         (status = 409, description = "The upload is already terminal \
@@ -275,6 +336,10 @@ async fn complete(
     ),
     tag = "Storage"
 )]
+#[tracing::instrument(
+    skip(state, caller, headers),
+    fields(operation = "storage.upload.abort")
+)]
 async fn abort(
     State(state): State<AppState>,
     caller: Caller,
@@ -283,12 +348,7 @@ async fn abort(
 ) -> Result<Json<AbortResponse>, WyrdErrorResponse> {
     let idempotency_key = extract_idempotency_key(&headers)?;
     let upload_id = parse_upload_id(&id)?;
-    authorize_card_write(
-        &state,
-        &caller,
-        "storage.upload.abort",
-        &format!("upload:{upload_id}"),
-    )?;
+    authorize_upload(&state, &caller, "storage.upload.abort", &upload_id).await?;
     let storage_caller = storage_caller(&caller);
     service::upload_abort(
         &state.storage,
@@ -310,8 +370,8 @@ async fn abort(
 ///
 /// # Errors
 /// Returns a stable storage error when the identifier is undecodable,
-/// malformed, or unknown, the upload is terminal, the bytes disagree with the declaration,
-/// the caller lacks card write, or the backend fails.
+/// malformed, or unknown, the upload is terminal, the body exceeds or disagrees with the declaration,
+/// the caller lacks the upload owner's permission, or the backend fails.
 #[utoipa::path(
     put,
     path = "/cards/upload/local/{id}",
@@ -328,12 +388,14 @@ async fn abort(
         (status = 401, description = "The request carried no usable access token \
           (WYRD_AUTH_401_UNAUTHENTICATED, WYRD_AUTH_401_INVALID_TOKEN, \
           WYRD_AUTH_401_TOKEN_EXPIRED)", body = WyrdProblem),
-        (status = 403, description = "The principal lacks card write, or the object belongs to \
-          another tenant (WYRD_PERMISSION_403_DENIED_RBAC, WYRD_STORAGE_403_UPLOAD_FOREIGN_TENANT)", body = WyrdProblem),
+        (status = 403, description = "The principal lacks card write for a Card upload or any \
+          `verifier:run` grant for a verification File upload, or the object belongs to another tenant (WYRD_PERMISSION_403_DENIED_RBAC, WYRD_STORAGE_403_UPLOAD_FOREIGN_TENANT)", body = WyrdProblem),
         (status = 404, description = "No such upload (WYRD_STORAGE_404_UPLOAD_NOT_FOUND)",
          body = WyrdProblem),
         (status = 409, description = "The upload is already terminal \
           (WYRD_STORAGE_409_UPLOAD_NOT_PENDING)", body = WyrdProblem),
+        (status = 413, description = "The body exceeds the declared size \
+          (WYRD_SPEC_413_PAYLOAD_TOO_LARGE)", body = WyrdProblem),
         (status = 500, description = "The storage backend or the platform store failed \
           (WYRD_STORAGE_500_BACKEND, WYRD_SPEC_500_INTERNAL)", body = WyrdProblem),
         (status = 503, description = "No verifier is configured for the access token, or \
@@ -343,11 +405,15 @@ async fn abort(
     ),
     tag = "Storage"
 )]
+#[tracing::instrument(
+    skip(state, caller, body),
+    fields(operation = "storage.upload.local_blob")
+)]
 async fn local_blob(
     State(state): State<AppState>,
     caller: Caller,
     id: Result<Path<String>, PathRejection>,
-    body: Bytes,
+    body: Body,
 ) -> Result<Json<LocalBlobUploadResponse>, WyrdErrorResponse> {
     let Path(id) = id.map_err(|rejection| {
         WyrdErrorResponse::from(WyrdError::from(WyrdStorageError::InvalidUploadId {
@@ -355,12 +421,16 @@ async fn local_blob(
         }))
     })?;
     let upload_id = parse_upload_id(&id)?;
-    authorize_card_write(
-        &state,
-        &caller,
-        "storage.upload.local_blob",
-        &format!("upload:{upload_id}"),
-    )?;
+    let (_, size_bytes) =
+        authorize_upload(&state, &caller, "storage.upload.local_blob", &upload_id).await?;
+    let too_large = || WyrdError::PayloadTooLarge {
+        message: format!("the body exceeds the declared {size_bytes} bytes"),
+        details: serde_json::json!({ "max_bytes": size_bytes }),
+    };
+    let limit = usize::try_from(size_bytes).map_err(|_| too_large())?;
+    let body = axum::body::to_bytes(body, limit)
+        .await
+        .map_err(|_| too_large())?;
     let storage_caller = storage_caller(&caller);
     service::upload_local_blob(
         &state.storage,
@@ -375,6 +445,13 @@ async fn local_blob(
 }
 
 /// Create a signed or local download plan for a stored artifact.
+///
+/// The artifact must be a completed file of the Card's manifest after
+/// card-read authorization.
+///
+/// # Errors
+/// Returns the authorization refusal, the Card and manifest lookup errors,
+/// and the storage service's planning errors.
 #[utoipa::path(
     post,
     path = "/cards/download/init",
@@ -391,17 +468,19 @@ async fn local_blob(
         (status = 403, description = "The principal lacks card read, or the object belongs to \
           another tenant (WYRD_PERMISSION_403_DENIED_RBAC, WYRD_STORAGE_403_UPLOAD_FOREIGN_TENANT)", body = WyrdProblem),
         (status = 404, description = "No such card artifact, or its object is gone from the \
-          backend (WYRD_SPEC_404_NOT_FOUND, WYRD_STORAGE_404_OBJECT_NOT_FOUND)",
+          backend (WYRD_SPEC_404_NOT_FOUND, WYRD_REGISTRY_404_CARD_NOT_FOUND, \
+          WYRD_STORAGE_404_OBJECT_NOT_FOUND)",
          body = WyrdProblem),
         (status = 500, description = "The storage backend or the platform store failed \
           (WYRD_STORAGE_500_BACKEND, WYRD_SPEC_500_INTERNAL)", body = WyrdProblem),
-        (status = 503, description = "No verifier is configured for the access token, or \
-          the storage backend is transiently unavailable \
-          (WYRD_AUTH_503_VERIFY_UNAVAILABLE, \
-          WYRD_STORAGE_503_BACKEND_UNAVAILABLE, WYRD_STORAGE_503_PRESIGN_EXPIRED)", body = WyrdProblem)
+        (status = 503, description = "No verifier is configured for the access token, or the \
+          storage backend is transiently unavailable; retry the download \
+          (WYRD_AUTH_503_VERIFY_UNAVAILABLE, WYRD_STORAGE_503_BACKEND_UNAVAILABLE, \
+          WYRD_STORAGE_503_PRESIGN_EXPIRED)", body = WyrdProblem)
     ),
     tag = "Storage"
 )]
+#[tracing::instrument(skip(state, caller, body), fields(operation = "storage.download.init"))]
 async fn download_init(
     State(state): State<AppState>,
     caller: Caller,
@@ -413,8 +492,8 @@ async fn download_init(
         "storage.download.init",
         &format!("card:{}", body.card_uid),
     )?;
-    let storage_caller = storage_caller(&caller);
-    service::download_init(&state.storage, state.postgres.wyrd(), &storage_caller, body)
+    let stored = card_file(&state, &caller, &body.card_uid, &body.relative_path).await?;
+    service::download_init(&state.storage, &storage_caller(&caller), body, stored)
         .await
         .map(Json)
         .map_err(WyrdErrorResponse::from)
@@ -541,6 +620,35 @@ pub(crate) fn extract_idempotency_key(
         })
         .transpose()
         .map_err(WyrdErrorResponse::from)
+}
+
+/// Authorize one follow-up operation on `upload_id` by its persisted owner.
+///
+/// The owner is read under the caller's tenant before any decision, so a
+/// foreign or unknown upload is refused as not found. A Card upload needs
+/// `card:write`; a verification File upload needs any `verifier:run` grant,
+/// the permission that admitted its planning. Either decision is staged on
+/// the audit outbox without waiting for its commit.
+///
+/// # Errors
+/// Returns the owner lookup's not-found or SQL error, and the public
+/// permission error for the owner's missing permission.
+async fn authorize_upload(
+    state: &AppState,
+    caller: &Caller,
+    operation: &str,
+    upload_id: &UploadId,
+) -> Result<(UploadOwner, u64), WyrdErrorResponse> {
+    let (owner, size_bytes) =
+        service::upload_owner(state.postgres.wyrd(), &storage_caller(caller), upload_id).await?;
+    let resource = format!("upload:{upload_id}");
+    match owner {
+        UploadOwner::Card(_) => authorize_card_write(state, caller, operation, &resource)?,
+        UploadOwner::File => {
+            VerificationControl::new(state).authorize_evidence(caller, operation, &resource)?;
+        }
+    }
+    Ok((owner, size_bytes))
 }
 
 /// Evaluate and audit the card-write permission for one storage mutation.

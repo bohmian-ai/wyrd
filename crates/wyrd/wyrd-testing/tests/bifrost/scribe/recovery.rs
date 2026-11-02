@@ -19,7 +19,7 @@ use super::support::{
 /// # Panics
 ///
 /// Panics when a document is not JSON or the batch cannot be assembled.
-fn variant_batch(rows: &[(i64, &str)]) -> RecordBatch {
+pub(super) fn variant_batch(rows: &[(i64, &str)]) -> RecordBatch {
     let json: ArrayRef = Arc::new(StringArray::from(
         rows.iter().map(|(_, json)| *json).collect::<Vec<_>>(),
     ));
@@ -48,7 +48,10 @@ fn variant_batch(rows: &[(i64, &str)]) -> RecordBatch {
 /// # Panics
 ///
 /// Panics when the query fails or does not settle successfully.
-async fn read_documents(client: &wyrd_client::WyrdClient, table: &str) -> Vec<(i64, String)> {
+pub(super) async fn read_documents(
+    client: &wyrd_client::WyrdClient,
+    table: &str,
+) -> Vec<(i64, String)> {
     let sql = format!("SELECT value, to_json(v) AS v FROM {table} ORDER BY value");
     let mut stream = wyrd_client::Bifrost::query_only(client)
         .query(&wyrd_spec::vala::api::BifrostQueryRequest {

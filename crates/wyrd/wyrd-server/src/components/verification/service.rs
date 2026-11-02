@@ -8,9 +8,7 @@
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
-use std::time::Duration;
 
-use arrow::record_batch::RecordBatch;
 use chrono::Utc;
 use tokio_util::sync::CancellationToken;
 use tracing::Instrument as _;
@@ -18,29 +16,29 @@ use vala_verify::blocks::{DriftChecks, EngineError};
 use wyrd_runtime::outbox::{OutboxFull, Reservation};
 use wyrd_runtime::permission::{Action, Resource};
 use wyrd_runtime::{AcceptedAuthority, CardAttribution, Permission};
-use wyrd_spec::auth::Sha256Hex;
 use wyrd_spec::card::verifier::CheckEvidence;
 use wyrd_spec::error::WyrdError;
-use wyrd_spec::error::storage::WyrdStorageError;
-use wyrd_spec::ids::{BindingId, CardUid, ExecutionId, IdempotencyKey, VerificationResultId};
-use wyrd_spec::vala::api::{AuditOutcome, BifrostQueryRequest};
-use wyrd_spec::vala::ids::{RunId, SpanId, TraceId};
+use wyrd_spec::ids::{BindingId, CardUid, ExecutionId, IdempotencyKey};
+use wyrd_spec::vala::api::AuditOutcome;
+use wyrd_spec::vala::ids::{SpanId, TraceId};
 use wyrd_spec::verification::execution::{
     EnqueueVerificationResponse, EvidencePlanRequest, EvidencePlanResponse, EvidenceUpload,
     VerificationExecutionState, VerificationOutcome, VerificationRequest, VerificationResult,
 };
-use wyrd_spec::verification::{VerificationBindingStatus, VerifierReadiness};
+use wyrd_spec::verification::{
+    VerificationBindingStatus, VerificationExecutionStatus, VerifierReadiness,
+};
 use wyrd_sql::queries::cards::get_card_by_uid;
 use wyrd_sql::queries::verifier_executions::{
-    Cause, EnqueueRefusal, Submission, VerifierExecutionQueue,
+    Admission, Cause, EnqueueRefusal, Submission, VerifierExecutionQueue,
 };
 use wyrd_sql::{ParsedCardRow, TenantConn};
-use wyrd_storage::StorageError;
-use wyrd_storage::tenant_path;
 
 use crate::audit;
 use crate::components::auth::Caller;
 use crate::components::gateway::GatewayCallContext;
+use crate::components::storage::inventory::ObjectInventory;
+use crate::components::storage::routes::storage_caller;
 use crate::http::error::permission_deny_reason_to_wyrd;
 use crate::http::middleware::edge_timeout::EdgeTimer;
 use crate::http::middleware::metrics::RequestArrival;
@@ -49,7 +47,11 @@ use crate::scribe_outbox::{ScribeSink, ScribeWrite};
 use crate::state::{AppState, registry_db_error};
 use crate::verification::cache::{Db, Target, exact_ref};
 use crate::verification::hosted::blocks::{Execution, HostedBlocks};
-use crate::verification::results::{ResultPayloadBuilder, ResultPayloadError, ResultRun};
+use crate::verification::inputs::InputResolver;
+use crate::verification::results::{
+    InputRecord, ResultPayloadBuilder, ResultPayloadError, ResultRun,
+};
+use crate::verification::submissions::Queued;
 use crate::verification::telemetry::{ExecutionMode, ExecutionTelemetry, Phase};
 
 /// Audit operation of a binding status read.
@@ -61,20 +63,11 @@ const GET_EXECUTION: &str = "verification.execution.read";
 /// Audit operation of an evidence upload plan.
 const EVIDENCE: &str = "verification.evidence";
 
-/// Audit operation of a local-backend evidence body upload.
-const EVIDENCE_UPLOAD: &str = "verification.evidence.upload";
-
 /// Audit operation of a direct execution.
 const EXECUTE: &str = "verification.execute";
 
 /// Audit operation of a background submission.
 const ENQUEUE: &str = "verification.enqueue";
-
-/// Lifetime of one evidence upload URL.
-const EVIDENCE_UPLOAD_TTL: Duration = Duration::from_mins(10);
-
-/// Stable query error of a tenant result table no result has created yet.
-const RESULTS_NOT_CREATED: &str = "WYRD_VALA_404_BIFROST_TABLE_NOT_FOUND";
 
 /// Map an inputs or result encoding failure to its public error.
 ///
@@ -197,9 +190,13 @@ impl<'a> VerificationControl<'a> {
     ///
     /// Authorizes and audits `cards:read` standalone, reads the status and
     /// both exact Cards in one tenant transaction, then — for a completed
-    /// execution — reads its result from `bifrost.verification.results` as the
-    /// caller through the ordinary Bifrost query entry. A result Scribe has
-    /// not yet published leaves `result` absent, so the caller polls again.
+    /// execution — reads its PostgreSQL-selected result through the one
+    /// result reader as the caller, through the ordinary Bifrost query entry.
+    /// A group execution's source selection is read from its input record. A
+    /// direct execution has no queue row: its ID resolves only through a
+    /// published result whose input record has the `direct` origin, and reads
+    /// as completed. A result Scribe has not yet published leaves `result`
+    /// absent, so the caller polls again.
     ///
     /// # Errors
     /// Returns [`WyrdError::PermissionDeniedRbac`] without `cards:read`,
@@ -219,6 +216,12 @@ impl<'a> VerificationControl<'a> {
             GET_EXECUTION,
             &resource,
         )?;
+        let query = ScheduledQueryCaller::authenticated(
+            self.state.clone(),
+            caller.clone(),
+            CancellationToken::new(),
+        )?;
+        let records = InputResolver::new(&query, None);
         let mut conn = self
             .state
             .registry_tenant_conn(caller.data_tenant_id)
@@ -227,116 +230,132 @@ impl<'a> VerificationControl<'a> {
             .queue
             .execution_status(&mut conn, execution_id)
             .await
-            .map_err(registry_db_error)?
-            .ok_or_else(|| WyrdError::VerificationExecutionNotFound {
-                message: "no verification execution with this ID in the caller's tenant".to_owned(),
-                details: serde_json::json!({ "execution_id": execution_id }),
-            })?;
-        let mut state = status.state;
-        let Some(result_id) = status.result_id else {
-            return Ok(state);
+            .map_err(registry_db_error)?;
+        let Some(status) = status else {
+            drop(conn);
+            return self
+                .direct_execution(caller, &records, execution_id)
+                .await?
+                .ok_or_else(|| WyrdError::VerificationExecutionNotFound {
+                    message: "no verification execution with this ID in the caller's tenant"
+                        .to_owned(),
+                    details: serde_json::json!({ "execution_id": execution_id }),
+                });
         };
+        let mut state = status.state;
         let verifier = Self::card(&mut conn, &status.verifier_card_uid).await?;
         let subject = Self::card(&mut conn, &status.card_uid).await?;
         drop(conn);
-        let (Some(verifier), Some(subject)) = (verifier, subject) else {
+        if state.group_id.is_some() && state.owner_card_uid.is_some() {
+            state.group = match records.record(execution_id).await? {
+                Some(record) => record.group()?.map(|selector| selector.snapshot()),
+                None => None,
+            };
+        }
+        let (Some(result_id), Some(verifier), Some(subject)) =
+            (status.result_id, verifier, subject)
+        else {
             return Ok(state);
         };
-        state.result = self
-            .read_result(caller, result_id)
-            .await?
-            .map(|(run_id, outcome)| VerificationResult {
+        state.result =
+            records
+                .result(result_id)
+                .await?
+                .map(|(run_id, outcome)| VerificationResult {
+                    execution_id,
+                    run_id,
+                    verifier: exact_ref(&verifier),
+                    subject: exact_ref(&subject),
+                    outcome,
+                    deployment_environment: status.deployment_environment,
+                });
+        Ok(state)
+    }
+
+    /// The completed status of direct execution `execution_id`, `None` until
+    /// its result, output, and input records are visible or when no direct
+    /// execution has this ID. A caller who may not query the verification
+    /// tables sees no direct execution, so the lookup answers `None` rather
+    /// than refusing an ID that may belong to a queued execution.
+    ///
+    /// # Errors
+    /// Returns a query failure, a registry error when a Card read fails, and
+    /// an internal error when a stored record is malformed.
+    async fn direct_execution(
+        &self,
+        caller: &Caller,
+        records: &InputResolver<'_>,
+        execution_id: ExecutionId,
+    ) -> Result<Option<VerificationExecutionState>, WyrdError> {
+        let direct = match records.direct(execution_id).await {
+            Err(WyrdError::PermissionDeniedRbac { .. }) => return Ok(None),
+            read => read?,
+        };
+        let Some(direct) = direct else {
+            return Ok(None);
+        };
+        let Some((run_id, outcome)) = records.result(direct.result_id).await? else {
+            return Ok(None);
+        };
+        let mut conn = self
+            .state
+            .registry_tenant_conn(caller.data_tenant_id)
+            .await?;
+        let verifier = Self::card(&mut conn, &direct.verifier_card_uid).await?;
+        let subject = Self::card(&mut conn, &direct.card_uid).await?;
+        drop(conn);
+        let (Some(verifier), Some(subject)) = (verifier, subject) else {
+            return Ok(None);
+        };
+        Ok(Some(VerificationExecutionState {
+            execution_id,
+            status: VerificationExecutionStatus::Completed,
+            error: None,
+            result: Some(VerificationResult {
                 execution_id,
                 run_id,
                 verifier: exact_ref(&verifier),
                 subject: exact_ref(&subject),
                 outcome,
-                deployment_environment: status.deployment_environment,
-            });
-        Ok(state)
+                deployment_environment: direct.deployment_environment,
+            }),
+            dispatches: Vec::new(),
+            group_id: direct.group_id,
+            owner_card_uid: None,
+            group: None,
+        }))
     }
 
-    /// Read one published result's application Run and outcome as `caller`.
+    /// Plan uploads of the caller's evidence files that are not completed
+    /// File uploads.
     ///
-    /// `Ok(None)` when no row is visible yet, including a tenant whose result
-    /// table no result has created.
-    ///
-    /// # Errors
-    /// Returns the query refusal or failure, and an internal error when the
-    /// stored outcome does not decode.
-    async fn read_result(
-        &self,
-        caller: &Caller,
-        result_id: VerificationResultId,
-    ) -> Result<Option<(Option<RunId>, VerificationOutcome)>, WyrdError> {
-        let query = ScheduledQueryCaller::authenticated(
-            self.state.clone(),
-            caller.clone(),
-            CancellationToken::new(),
-        )?;
-        let mut batches: Vec<RecordBatch> = Vec::new();
-        let request = BifrostQueryRequest {
-            params: Vec::new(),
-            sql: format!(
-                "SELECT outcome, run_id FROM bifrost.verification.results \
-                 WHERE result_id = '{result_id}' LIMIT 1"
-            ),
-            deadline_ms: None,
-        };
-        let read = query.run_with(request, |batch| {
-            batches.push(batch);
-            Ok(())
-        });
-        match read.await {
-            Err(error) if error.code() == RESULTS_NOT_CREATED => return Ok(None),
-            Err(error) => return Err(error),
-            Ok(_) => {}
-        }
-        let Some(batch) = batches.iter().find(|batch| batch.num_rows() > 0) else {
-            return Ok(None);
-        };
-        let decode =
-            |error: String| WyrdError::internal(format!("stored result is invalid: {error}"));
-        let column = |name: &str| {
-            batch
-                .column_by_name(name)
-                .ok_or_else(|| decode(format!("no {name} column")))
-        };
-        let outcome = wyrd_queue::variant::variant_cell_to_json(column("outcome")?.as_ref(), 0)
-            .map_err(|error| decode(format!("{error:?}")))?;
-        let outcome = serde_json::from_value(outcome).map_err(|error| decode(error.to_string()))?;
-        let run = column("run_id")?;
-        let run_id = if run.is_null(0) {
-            None
-        } else {
-            let run = arrow::util::display::array_value_to_string(run, 0)
-                .map_err(|error| decode(error.to_string()))?;
-            Some(RunId::from_string(run))
-        };
-        Ok(Some((run_id, outcome)))
-    }
-
-    /// Plan uploads of the caller's evidence files that storage lacks.
-    ///
-    /// Admits and audits any `verifier:run` grant, refuses a file
-    /// or request larger than the Deployment limits, and returns one
-    /// single-PUT plan for each digest whose object
-    /// `<tenant>/evidence/sha256/<digest>` is absent or of another length.
-    /// Writes nothing: the bytes go straight to tenant storage, and readers
-    /// check digest and length again.
+    /// Admits and audits any `verifier:run` grant, refuses a file or request
+    /// larger than the Deployment limits, and opens one shared storage upload
+    /// session for each digest the tenant's inventory holds no completed File
+    /// upload of that size for. A Card file of identical content does not
+    /// qualify. The bytes go straight to tenant storage through the shared
+    /// lifecycle, whose completion records the File in the inventory.
     ///
     /// # Errors
     /// Returns [`WyrdError::PermissionDeniedRbac`] without any `verifier:run` grant,
     /// [`WyrdError::VerificationInputTooLarge`] past a limit,
     /// [`WyrdError::ServiceUnavailable`] when this process hosts no Verifier
-    /// blocks, and the storage error when a lookup or signature fails.
+    /// blocks, `WYRD_VALA_503_QUERY_VISIBILITY_UNAVAILABLE` when the
+    /// inventory cannot be read now, and the storage error when an upload
+    /// cannot be initialized.
+    ///
+    /// # Cancellation
+    /// Sessions are opened one file at a time and each commits as it opens,
+    /// so a later failure or cancellation leaves the earlier sessions open
+    /// without returning them; the storage sweeper reclaims them on expiry.
+    /// A retry opens new, independent sessions and never revokes them.
     pub(crate) async fn evidence(
         &self,
         caller: &Caller,
         request: &EvidencePlanRequest,
     ) -> Result<EvidencePlanResponse, WyrdError> {
         let limits = *self.blocks()?.limits();
-        self.authorize_evidence(caller, EVIDENCE)?;
+        self.authorize_evidence(caller, EVIDENCE, "verification.evidence")?;
         let total: u64 = request.files.iter().map(|file| file.size_bytes).sum();
         if let Some(file) = request
             .files
@@ -360,69 +379,31 @@ impl<'a> VerificationControl<'a> {
                 details: serde_json::json!({ "max_bytes": limits.files_max_bytes }),
             });
         }
-        let storage_error = |error: StorageError| WyrdError::from(WyrdStorageError::from(error));
+        let inventory = ObjectInventory::new(self.state);
         let mut uploads = Vec::new();
         for file in &request.files {
-            let path = tenant_path::evidence(caller.data_tenant_id, &file.sha256);
-            match self.state.storage.object_len(&path).await {
-                Ok(len) if len == file.size_bytes => continue,
-                Ok(_) | Err(StorageError::ObjectNotFound { .. }) => {}
-                Err(error) => return Err(storage_error(error)),
+            if inventory
+                .file_object(caller.data_tenant_id, &file.sha256, file.size_bytes)
+                .await?
+                .is_some()
+            {
+                continue;
             }
-            let plan = wyrd_storage::service::evidence_upload_plan(
+            let init = wyrd_storage::service::file_upload_init(
                 &self.state.storage,
-                &path,
+                self.state.postgres.wyrd(),
+                &storage_caller(caller),
                 &file.sha256,
                 file.size_bytes,
-                EVIDENCE_UPLOAD_TTL,
             )
-            .await
-            .map_err(storage_error)?;
+            .await?;
             uploads.push(EvidenceUpload {
                 sha256: file.sha256,
-                plan,
+                upload_id: init.upload_id,
+                plan: init.plan,
             });
         }
         Ok(EvidencePlanResponse { uploads })
-    }
-
-    /// Store one evidence body on the local backend, where an evidence plan
-    /// is the authenticated route rather than a presigned URL.
-    ///
-    /// Admits and audits any `verifier:run` grant like
-    /// [`Self::evidence`], reads at most the Deployment `file_max_bytes`, and
-    /// writes the body to `<tenant>/evidence/sha256/<digest>` only when it
-    /// hashes to `sha256`. Writes nothing to Postgres.
-    ///
-    /// # Errors
-    /// Returns [`WyrdError::PermissionDeniedRbac`] without any `verifier:run` grant,
-    /// [`WyrdError::VerificationInputTooLarge`] past `file_max_bytes`,
-    /// [`WyrdError::ServiceUnavailable`] when this process hosts no Verifier
-    /// blocks, the storage `Sha256Mismatch` error for a body of another
-    /// digest, and the storage error when the write fails.
-    pub(crate) async fn upload_local_evidence(
-        &self,
-        caller: &Caller,
-        sha256: &Sha256Hex,
-        body: axum::body::Body,
-    ) -> Result<(), WyrdError> {
-        let max_bytes = self.blocks()?.limits().file_max_bytes;
-        self.authorize_evidence(caller, EVIDENCE_UPLOAD)?;
-        let too_large = || WyrdError::VerificationInputTooLarge {
-            message: format!("evidence files may be at most {max_bytes} bytes"),
-            details: serde_json::json!({ "sha256": sha256, "max_bytes": max_bytes }),
-        };
-        let limit = usize::try_from(max_bytes).map_err(|_| too_large())?;
-        let body = axum::body::to_bytes(body, limit)
-            .await
-            .map_err(|_| too_large())?;
-        wyrd_storage::service::upload_local_evidence(
-            &self.state.storage,
-            caller.data_tenant_id,
-            sha256,
-            &body,
-        )
-        .await
     }
 
     /// Execute one exact Verifier over supplied evidence and return its
@@ -757,8 +738,13 @@ impl<'a> VerificationControl<'a> {
             now,
             now,
         )
-        .inputs(&submission.request.inputs, Some(&submission))
+        .inputs(InputRecord::Submitted(&submission))
         .map_err(|error| payload_error(&error))?;
+        // The staged row is the one store of the submission's values; the
+        // acknowledged handoff carries only its coordination identity.
+        let mut submission = submission;
+        std::mem::take(&mut submission.request.inputs);
+        std::mem::take(&mut submission.request.execution_route_overrides);
         let queued = submissions.reserve(1).map_err(staging_full)?;
         let staged = self
             .state
@@ -772,7 +758,13 @@ impl<'a> VerificationControl<'a> {
             ScribeWrite::ExecutionInputs {
                 row,
                 attribution: caller.attribution(),
-                queued: Some((queued, Box::new(submission))),
+                queued: Some((
+                    queued,
+                    Box::new(Queued {
+                        admission: Admission::Submitted(submission),
+                        claim: None,
+                    }),
+                )),
             },
         );
         Ok(EnqueueVerificationResponse { execution_id })
@@ -820,7 +812,7 @@ impl<'a> VerificationControl<'a> {
             Utc::now(),
         );
         let built = builder
-            .inputs(&request.inputs, None)
+            .inputs(InputRecord::Direct(&request.inputs))
             .and_then(|row| Ok((row, builder.build(outcome)?)));
         match built {
             Ok((row, payload)) => {
@@ -988,18 +980,25 @@ impl<'a> VerificationControl<'a> {
         decision
     }
 
-    /// Admit evidence staging for `operation` and stage the single allow or
-    /// deny decision without waiting for its commit.
+    /// Admit evidence staging for `operation` on `resource` and stage the
+    /// single allow or deny decision without waiting for its commit.
     ///
     /// Staging selects no Verifier and cannot execute one, so any
     /// `verifier:run` grant admits it, including one scoped to a single
-    /// Verifier UID. The exact Verifier is authorized later by
-    /// [`Self::authorize_run`] when execute or enqueue names it.
+    /// Verifier UID. Planning and every shared storage operation on a File
+    /// upload session are admitted this way. The exact Verifier is
+    /// authorized later by [`Self::authorize_run`] when execute or enqueue
+    /// names it.
     ///
     /// # Errors
     /// Returns [`WyrdError::PermissionDeniedRbac`] when the caller holds no
     /// `verifier:run` grant of any scope.
-    fn authorize_evidence(&self, caller: &Caller, operation: &str) -> Result<(), WyrdError> {
+    pub(crate) fn authorize_evidence(
+        &self,
+        caller: &Caller,
+        operation: &str,
+        resource: &str,
+    ) -> Result<(), WyrdError> {
         let required = Permission::verifier_run_any();
         let allowed = caller
             .principal
@@ -1012,13 +1011,7 @@ impl<'a> VerificationControl<'a> {
         };
         self.state.bifrost.scribe_outbox().stage(
             caller.data_tenant_id,
-            audit::audit_event(
-                caller,
-                operation,
-                "verification.evidence",
-                &required.to_string(),
-                outcome,
-            ),
+            audit::audit_event(caller, operation, resource, &required.to_string(), outcome),
         );
         if allowed {
             Ok(())

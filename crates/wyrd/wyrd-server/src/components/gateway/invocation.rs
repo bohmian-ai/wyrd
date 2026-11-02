@@ -26,6 +26,7 @@ use wyrd_gateway::{
     GatewayTenantSnapshot, IngressDialect, MediaRequest, ResponseBody, ResponseCapture, StreamEnd,
     UnsupportedRequest, outcome_error_code, outcome_name,
 };
+use wyrd_runtime::outbox::Reservation;
 use wyrd_runtime::principal::CardAttribution;
 use wyrd_runtime::{Permission, PermissionDenyReason, Principal};
 use wyrd_spec::DataTenantId;
@@ -58,6 +59,7 @@ use crate::app::metrics::{
 use crate::audit;
 use crate::components::auth::Caller;
 use crate::http::error::permission_deny_reason_to_wyrd;
+use crate::scribe_outbox::ScribeSink;
 use crate::state::AppState;
 
 /// Audited operation name of every invocation decision.
@@ -66,6 +68,9 @@ pub(crate) const OPERATION: &str = "gateway.invoke";
 /// Time past the caller deadline before an unsettled reservation or lease may
 /// be reclaimed by another admission.
 const RECLAIM_GRACE: TimeDelta = TimeDelta::minutes(1);
+
+/// `retry_after_seconds` of a call refused for want of a capture slot.
+const CAPTURE_RETRY_AFTER_SECONDS: u64 = 1;
 
 /// One governed call as a verified caller submits it.
 #[derive(Debug, Clone)]
@@ -252,6 +257,10 @@ struct AdmittedCall {
     /// Context of the call's `gateway.call` span when the call continues a
     /// caller's trace; its captured attempt spans are children of that span.
     trace: Option<TraceContext>,
+    /// The Scribe outbox slot admission reserved for the call's capture;
+    /// `None` when the admitted policy captures nothing. Dropping it unused
+    /// returns the slot.
+    capture_slot: Option<Reservation<ScribeSink>>,
 }
 
 impl AdmittedCall {
@@ -511,7 +520,9 @@ impl<'a> GatewayInvocation<'a> {
     ///
     /// Latency: on the request path. The tenant snapshot is served from the
     /// process cache, and [`Self::admit`] costs one Postgres statement only
-    /// when a limit or budget covers the call. Every invoke-decision audit, here and per fallback
+    /// when a limit or budget covers the call. A capturing call first waits
+    /// for a Scribe outbox capture slot ([`Self::capture_slot`]), which is
+    /// immediate unless the outbox is full. Every invoke-decision audit, here and per fallback
     /// model in [`Self::route`], is staged on the process audit outbox and is
     /// not a request-path round trip.
     ///
@@ -519,8 +530,8 @@ impl<'a> GatewayInvocation<'a> {
     /// Returns `ServiceUnavailable` while the server drains,
     /// `GatewayInvalidRequest` for an invalid fallback override or
     /// out-of-range timeout, the mapped permission denial of the requested
-    /// model, and every error of the snapshot load, [`Self::route`], and
-    /// [`Self::admit`]. Every one is undispatched.
+    /// model, and every error of the snapshot load, [`Self::route`],
+    /// [`Self::capture_slot`], and [`Self::admit`]. Every one is undispatched.
     ///
     /// The snapshot, authorize, route, and admit phases are recorded on
     /// `telemetry` as each completes.
@@ -586,6 +597,15 @@ impl<'a> GatewayInvocation<'a> {
         let mut plan = self.route(caller, &request, &snapshot, call_id).await?;
         telemetry.since(Phase::Route, started);
 
+        // Admission is the capture-slot wait and the ledger statement.
+        let deadline = Instant::now() + request.timeout;
+        let started = std::time::Instant::now();
+        let capture_slot = if snapshot.capture.mode == GatewayCaptureMode::Disabled {
+            None
+        } else {
+            Some(self.capture_slot(deadline).await?)
+        };
+
         let admitted_at = Utc::now();
         let call = AdmittedCall {
             call_id,
@@ -600,15 +620,46 @@ impl<'a> GatewayInvocation<'a> {
             usage_bound: request.usage_bound,
             admitted_at,
             expires_at: admitted_at + grace,
-            deadline: Instant::now() + request.timeout,
+            deadline,
             requested: request.model,
             subject,
             trace,
+            capture_slot,
         };
-        let started = std::time::Instant::now();
         let admission = self.admit(&call, &mut plan).await?;
         telemetry.since(Phase::Admit, started);
         Ok((call, plan, admission))
+    }
+
+    /// Reserves one Scribe outbox slot for a capturing call's capture,
+    /// waiting while the outbox is full.
+    ///
+    /// This is the call's capture backpressure: a reserved capture is never
+    /// shed, so a full outbox slows admission instead. Waiting calls are
+    /// admitted in arrival order as Scribe writes free capacity, until
+    /// `deadline`.
+    ///
+    /// # Errors
+    /// Returns `GatewayCaptureStagingFull` with `retry_after_seconds` when no
+    /// slot is admitted before `deadline`; nothing was charged or dispatched.
+    async fn capture_slot(&self, deadline: Instant) -> Result<Reservation<ScribeSink>, WyrdError> {
+        let outbox = self.state.bifrost.scribe_outbox();
+        outbox
+            .reserve_until(1, deadline.into_std())
+            .await
+            .map_err(|full| {
+                tracing::warn!(
+                    outbox = full.outbox,
+                    admitted = full.admitted,
+                    limit = full.limit,
+                    unit = full.unit,
+                    "gateway call refused: no capture slot before its deadline"
+                );
+                WyrdError::GatewayCaptureStagingFull {
+                    message: "this server had no gateway capture staging capacity before the call's deadline".to_owned(),
+                    details: json!({ "retry_after_seconds": CAPTURE_RETRY_AFTER_SECONDS }),
+                }
+            })
     }
 
     /// Plans the candidate routes of one call inside a `gateway.route` span.
@@ -1031,15 +1082,17 @@ impl<'a> GatewayInvocation<'a> {
     /// read-back are bounded by the admitted call's absolute deadline, so a
     /// hung dependency cannot hold facts, object bytes, or this task past the
     /// call; work still running when it passes is dropped, releasing what it
-    /// held, and one [`CaptureDrop::Unavailable`] is recorded. Staging itself
-    /// never waits: the outbox owns encoding and delivery.
-    async fn capture(state: &AppState, call: &AdmittedCall, facts: Option<CallFacts>) {
+    /// held, and one [`CaptureDrop::Unavailable`] is recorded. Staging never
+    /// waits and is never shed: it spends the slot admission reserved, and
+    /// the outbox owns encoding and delivery. `body` is the call's request
+    /// body, moved in so capture redacts and encodes it without a copy.
+    async fn capture(state: &AppState, call: &AdmittedCall, body: Value, facts: Option<CallFacts>) {
         let Some(mut facts) = facts else {
             return;
         };
         let work = async {
             if selects(&facts.policy, GatewayPayloadField::Request) {
-                request_content(&call.body, call.media.as_ref(), &mut facts.objects)
+                request_content(body, call.media.as_ref(), &mut facts.objects)
                     .await
                     .map(|content| facts.request = Some(content))
                     .map_err(|_| CaptureDrop::Payload)?;
@@ -1051,10 +1104,13 @@ impl<'a> GatewayInvocation<'a> {
         .instrument(tracing::info_span!("gateway.capture"));
         let result = match tokio::time::timeout_at(call.deadline, work).await {
             Ok(Ok(capture)) => {
-                state
-                    .bifrost
-                    .scribe_outbox()
-                    .stage(capture.tenant(), capture);
+                match &call.capture_slot {
+                    Some(slot) => slot.stage(capture.tenant(), capture),
+                    None => state
+                        .bifrost
+                        .scribe_outbox()
+                        .stage(capture.tenant(), capture),
+                }
                 Ok(())
             }
             Ok(Err(drop)) => Err(drop),
@@ -1239,7 +1295,7 @@ impl CallTask {
     /// while attempt and routing evidence keep the provider's outcome.
     /// Capture runs after the answer is sent and never delays it.
     async fn settle_buffered(
-        self,
+        mut self,
         mut execution: CallExecution,
         dispatched: bool,
         head: oneshot::Sender<Answer>,
@@ -1293,7 +1349,8 @@ impl CallTask {
         })
         .ok();
         let started = std::time::Instant::now();
-        GatewayInvocation::capture(&self.state, &self.call, facts).await;
+        let body = std::mem::take(&mut self.call.body);
+        GatewayInvocation::capture(&self.state, &self.call, body, facts).await;
         self.telemetry.since(Phase::Capture, started);
     }
 
@@ -1310,7 +1367,7 @@ impl CallTask {
     /// final frame was taken; this wait is bounded by the call's deadline
     /// and cancellation and never delays accounting or capture.
     async fn settle_stream(
-        self,
+        mut self,
         mut execution: CallExecution,
         end: oneshot::Receiver<StreamEnd>,
         handed_off: Option<oneshot::Receiver<Option<std::time::Instant>>>,
@@ -1390,7 +1447,8 @@ impl CallTask {
         );
         GatewayInvocation::observe(operation, self.received, end.outcome, &accounted, entries);
         let started = std::time::Instant::now();
-        GatewayInvocation::capture(&self.state, &self.call, facts).await;
+        let body = std::mem::take(&mut self.call.body);
+        GatewayInvocation::capture(&self.state, &self.call, body, facts).await;
         self.telemetry.since(Phase::Capture, started);
         if let Some(handed_off) = handed_off {
             let handed = tokio::select! {

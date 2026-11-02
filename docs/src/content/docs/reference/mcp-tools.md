@@ -40,7 +40,7 @@ Tool names contain dots, which many model providers refuse, so each framework fo
 | `cards.get` | `cards:read` | `{card_ref}` or `{kind, card_uid}` → `{card, created_at, updated_at}` | Read one Card; pass exactly one form |
 | `verification.get_binding` | `cards:read` | `{binding_id}` → binding status | Read one binding |
 | `verification.get_execution` | `cards:read` | `{execution_id}` → execution status | Read one execution |
-| `verification.evidence` | `verifier:run` | `{files: [{sha256, size_bytes}]}` → `{uploads}` | Plan uploads for files the tenant lacks |
+| `verification.evidence` | `verifier:run` | `{files: [{sha256, size_bytes}]}` → `{uploads: [{sha256, upload_id, plan}]}` | Plan uploads for files the tenant lacks; complete each with `POST /v1/cards/upload/{upload_id}/complete` |
 | `verification.execute` | `verifier:run` on exact Verifier | Verifier, subject, optional `run_id`, and named input declarations → `VerificationResult` | Verify now and store the result; no Operator dispatch |
 | `verification.enqueue` | `verifier:run` on exact Verifier | The `verification.execute` arguments plus optional `idempotency_key` → `{execution_id}` | Queue a verification; poll `verification.get_execution` |
 

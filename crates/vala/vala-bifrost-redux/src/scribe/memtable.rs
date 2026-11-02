@@ -326,16 +326,94 @@ impl Memtable {
         meta: ScribeAppendMeta,
         batch: RecordBatch,
     ) -> Result<(), ScribeError> {
+        self.insert_with_layout(seal_key, meta, batch, None)
+    }
+
+    /// Inserts an append whose rows are already in `layout`, or canonical when `None`.
+    ///
+    /// A new generation pins `layout` for its whole life and keeps the
+    /// layout's logical schema as its table schema, while its batches hold the
+    /// physical rows. Every later append to that generation must carry the
+    /// same layout; the shard chose it from [`Self::generation_layout`] before
+    /// converting, so a difference is an ownership bug and is refused.
+    ///
+    /// # Errors
+    /// Returns [`ScribeError::Internal`] if the bucket lock is poisoned or the
+    /// append's layout is not the generation's pinned layout.
+    pub(crate) fn insert_with_layout(
+        &self,
+        seal_key: &SealKey,
+        meta: ScribeAppendMeta,
+        batch: RecordBatch,
+        layout: Option<Arc<crate::scribe::layout_cache::LearnedLayout>>,
+    ) -> Result<(), ScribeError> {
         let mut buckets = self.writable.write().map_err(|e| ScribeError::Internal {
             detail: format!("memtable bucket lock poisoned: {e}"),
         })?;
 
-        let bucket = buckets
-            .entry(seal_key.clone())
-            .or_insert_with(|| MemtableBucket::new(seal_key.clone(), batch.schema()));
+        let bucket = buckets.entry(seal_key.clone()).or_insert_with(|| {
+            let schema = layout
+                .as_ref()
+                .map_or_else(|| batch.schema(), |layout| Arc::clone(layout.logical()));
+            MemtableBucket::new(seal_key.clone(), schema).with_layout(layout.clone())
+        });
+        let same_layout = match (&bucket.layout, &layout) {
+            (None, None) => true,
+            (Some(pinned), Some(layout)) => Arc::ptr_eq(pinned, layout),
+            _ => false,
+        };
+        if !same_layout {
+            return Err(ScribeError::Internal {
+                detail: format!("append to {seal_key} is not in its generation's pinned layout"),
+            });
+        }
 
         bucket.append(meta, batch);
         Ok(())
+    }
+
+    /// Returns the Variant layout rows of `seal_key` must take; `None` is canonical.
+    ///
+    /// An open generation keeps the layout it pinned. With none open, the
+    /// generation the rows will open takes `fresh()`, which is called with
+    /// the bucket lock released.
+    ///
+    /// # Errors
+    /// Returns [`ScribeError::Internal`] if the bucket lock is poisoned.
+    pub(crate) fn generation_layout(
+        &self,
+        seal_key: &SealKey,
+        fresh: impl FnOnce() -> Option<Arc<crate::scribe::layout_cache::LearnedLayout>>,
+    ) -> Result<Option<Arc<crate::scribe::layout_cache::LearnedLayout>>, ScribeError> {
+        let pinned = self
+            .writable
+            .read()
+            .map_err(|e| ScribeError::Internal {
+                detail: format!("memtable bucket lock poisoned: {e}"),
+            })?
+            .get(seal_key)
+            .map(|bucket| bucket.layout.clone());
+        Ok(pinned.unwrap_or_else(fresh))
+    }
+
+    /// Reports, per writable bucket of `tenant`'s `table`, whether it pinned a learned layout.
+    ///
+    /// # Errors
+    /// Returns [`ScribeError::Internal`] if the bucket lock is poisoned.
+    #[cfg(any(test, feature = "test-support"))]
+    pub(crate) fn writable_layouts_for_test(
+        &self,
+        tenant: DataTenantId,
+        table: &crate::catalog::TableRef,
+    ) -> Result<Vec<bool>, ScribeError> {
+        let buckets = self.writable.read().map_err(|e| ScribeError::Internal {
+            detail: format!("memtable bucket lock poisoned: {e}"),
+        })?;
+        Ok(buckets
+            .iter()
+            .filter(|(key, _)| key.tenant == tenant && &key.table == table)
+            .map(|(_, bucket)| bucket.layout.is_some())
+            .collect())
     }
 
     /// Return the row count for a batch that is still retained in the active
@@ -496,8 +574,8 @@ impl Memtable {
             shard_id: 0,
             seal_key: replayed.seal_key.clone(),
             schema,
-            batches,
-            statistics,
+            batches: batches.into(),
+            statistics: statistics.into(),
             metas,
             opened_at: Instant::now(),
             closed_at: Instant::now(),
@@ -896,7 +974,7 @@ impl Memtable {
     ) -> Result<Vec<ReadableBatch>, ScribeError> {
         let mut batches = Vec::new();
         for source in self.readable_sources(tenant, table, partitions)? {
-            source.project(required, &mut batches)?;
+            source.project(required, None, &mut batches)?;
         }
         Ok(batches)
     }
@@ -974,7 +1052,7 @@ impl Memtable {
                     if matches!(entry.state, ImmutableState::Durable { .. }) {
                         continue;
                     }
-                    sources.push(entry.frozen.readable_source(self.ordinal(entry.seal_id)));
+                    sources.push(entry.readable_source(self.ordinal(entry.seal_id)));
                 }
             }
         }
@@ -1026,9 +1104,10 @@ impl Memtable {
     /// Retire all committed immutable generations at the current sweep.
     ///
     /// A generation is retirement-eligible the moment its state is
-    /// [`ImmutableState::Durable`]. `Committed` is only reached after the
-    /// fenced `vala.file_list` transaction commits, so retired data is
-    /// always readable from published parquet. The returned WAL ranges are the
+    /// [`ImmutableState::Durable`], which is reached once its rows are a staged
+    /// member on the staging volume, so retired data is always readable from
+    /// that member or, after publication, from published Parquet. The
+    /// returned WAL ranges are the
     /// only ranges eligible for WAL retirement on this sweep.
     ///
     /// # Errors
@@ -1337,10 +1416,18 @@ impl Default for Memtable {
 #[derive(Debug)]
 pub(crate) struct MemtableBucket {
     seal_key: SealKey,
+    /// Logical table schema of the generation's rows.
     schema: SchemaRef,
-    batches: Vec<RecordBatch>,
-    /// Exact column bounds of each batch, index-aligned with `batches`.
-    statistics: Vec<Arc<Statistics>>,
+    /// Variant layout the generation pinned when it opened; `None` is canonical.
+    ///
+    /// Every batch is in this layout's physical schema, which may differ from
+    /// `schema` only in shredded Variant storage.
+    layout: Option<Arc<crate::scribe::layout_cache::LearnedLayout>>,
+    /// Sealed runs of [`APPEND_RUN_LEN`] appends each, oldest first, shared
+    /// by reference with every live capture.
+    runs: Vec<AppendRun>,
+    /// The appends after the last sealed run, copied by a live capture.
+    tail: AppendTail,
     metas: Vec<ScribeAppendMeta>,
     row_count: usize,
     bytes_accumulated: usize,
@@ -1357,8 +1444,9 @@ impl MemtableBucket {
         Self {
             seal_key,
             schema,
-            batches: Vec::new(),
-            statistics: Vec::new(),
+            layout: None,
+            runs: Vec::new(),
+            tail: AppendTail::default(),
             metas: Vec::new(),
             row_count: 0,
             bytes_accumulated: 0,
@@ -1368,16 +1456,30 @@ impl MemtableBucket {
         }
     }
 
+    /// Pins the Variant layout this generation's rows are retained in.
+    fn with_layout(
+        mut self,
+        layout: Option<Arc<crate::scribe::layout_cache::LearnedLayout>>,
+    ) -> Self {
+        self.layout = layout;
+        self
+    }
+
     /// Retains one append batch with its metadata and exact column bounds.
     ///
     /// The bounds are computed here, once per batch, so a live read prunes
-    /// the batch without scanning its rows.
+    /// the batch without scanning its rows. The tail seals into a shared run
+    /// once it holds [`APPEND_RUN_LEN`] appends.
     fn append(&mut self, meta: ScribeAppendMeta, batch: RecordBatch) {
         self.row_count += batch.num_rows();
         self.bytes_accumulated += estimate_batch_bytes(&batch);
-        self.statistics.push(batch_statistics(&batch));
-        self.batches.push(batch);
+        self.tail.statistics.push(batch_statistics(&batch));
+        self.tail.batches.push(batch);
+        self.tail.wal_lsns.push(meta.wal_lsn_max);
         self.metas.push(meta);
+        if self.tail.batches.len() == APPEND_RUN_LEN {
+            self.runs.push(self.tail.seal());
+        }
         self.last_insert_at = Instant::now();
     }
 
@@ -1415,8 +1517,22 @@ impl MemtableBucket {
     /// `(shard_id, seal_id)` pair is what the memtable registers in the
     /// hot-source registry. Producing both from one value is what keeps a
     /// published member's ordinal equal to its registered one.
-    fn freeze(self, seal_id: u64, shard_id: usize) -> FrozenMemtable {
-        let batches = self.batches;
+    ///
+    /// The generation's batches and bounds are concatenated from the sealed
+    /// runs and the tail once here, so the generation is shared by reference
+    /// from then on.
+    fn freeze(mut self, seal_id: u64, shard_id: usize) -> FrozenMemtable {
+        self.runs.push(self.tail.seal());
+        let batches = self
+            .runs
+            .iter()
+            .flat_map(|run| run.batches.iter().cloned())
+            .collect();
+        let statistics = self
+            .runs
+            .iter()
+            .flat_map(|run| run.statistics.iter().cloned())
+            .collect();
 
         let opened_at = self.first_insert_at;
         let closed_at = Instant::now();
@@ -1428,7 +1544,7 @@ impl MemtableBucket {
             seal_key: self.seal_key,
             schema: self.schema,
             batches,
-            statistics: self.statistics,
+            statistics,
             metas: self.metas,
             opened_at,
             closed_at,
@@ -1438,12 +1554,18 @@ impl MemtableBucket {
     }
 
     /// Captures this active bucket's batches for projection outside the lock.
+    ///
+    /// The sealed runs are shared by reference; only the tail's fewer than
+    /// [`APPEND_RUN_LEN`] appends are copied.
     fn readable_source(&self) -> ReadableSource {
+        let mut runs = Vec::with_capacity(self.runs.len() + 1);
+        runs.extend(self.runs.iter().cloned());
+        if !self.tail.batches.is_empty() {
+            runs.push(self.tail.run());
+        }
         ReadableSource::capture(
             &self.schema,
-            &self.batches,
-            &self.statistics,
-            &self.metas,
+            runs,
             self.seal_key.clone(),
             None,
             &self.charge,
@@ -1509,6 +1631,9 @@ pub struct ImmutableEntry {
     pub wal_lsn_max: crate::scribe::wal::WalLsn,
     /// Lifecycle state.
     pub state: ImmutableState,
+    /// The frozen generation's appends as one run, built once so every live
+    /// capture shares it and its alignment is checked at insertion.
+    run: AppendRun,
 }
 
 impl ImmutableEntry {
@@ -1530,6 +1655,12 @@ impl ImmutableEntry {
         }
     }
 
+    /// Tracks `frozen` as a generation awaiting its durable commit.
+    ///
+    /// # Panics
+    ///
+    /// Panics when `frozen` does not carry one append meta per batch (see
+    /// [`AppendRun::new`]).
     fn pending(frozen: FrozenMemtable) -> Self {
         Self {
             seal_id: frozen.seal_id,
@@ -1545,9 +1676,33 @@ impl ImmutableEntry {
                 .map(|meta| meta.wal_lsn_max)
                 .max()
                 .unwrap_or_else(|| crate::scribe::wal::WalLsn::new(0)),
+            run: AppendRun::new(
+                Arc::clone(&frozen.batches),
+                Arc::clone(&frozen.statistics),
+                frozen.metas.iter().map(|meta| meta.wal_lsn_max).collect(),
+            ),
             frozen,
             state: ImmutableState::PendingCommit,
         }
+    }
+
+    /// Captures this immutable generation's batches for projection outside
+    /// the lock, sharing its batches, bounds, and WAL positions by reference.
+    ///
+    /// Every batch is tagged with `generation`, the registry identity of this
+    /// generation, so a caller can tell which generations the cut served and
+    /// must not also read from their staged runs.
+    fn readable_source(
+        &self,
+        generation: crate::scribe::hot_source::GenerationOrdinal,
+    ) -> ReadableSource {
+        ReadableSource::capture(
+            &self.frozen.schema,
+            vec![self.run.clone()],
+            self.frozen.seal_key.clone(),
+            Some(generation),
+            &self.frozen.charge,
+        )
     }
 
     fn is_pending(&self) -> bool {
@@ -1629,15 +1784,20 @@ pub struct FrozenMemtable {
     /// the same value its hot-source ordinals carry. Post-commit routing MUST
     /// use this field rather than recomputing the route from `seal_key`.
     pub shard_id: usize,
-    /// Arrow schema shared by all append batches.
+    /// Logical table schema of every append batch.
     pub schema: SchemaRef,
-    /// Original append batches, preserved for LSN-granular live tail reads.
-    pub batches: Vec<RecordBatch>,
+    /// Original append batches, preserved for LSN-granular live tail reads
+    /// and shared by reference with every live capture.
+    ///
+    /// All batches share one physical schema: `schema` for a canonical
+    /// generation, or the layout the generation pinned when it opened, which
+    /// differs from `schema` only in shredded Variant storage.
+    pub batches: Arc<[RecordBatch]>,
     /// Exact column bounds of each batch, index-aligned with `batches`.
     ///
     /// A batch without an entry, as in a hand-built test generation, reads
     /// with unknown bounds and is never pruned.
-    pub statistics: Vec<Arc<Statistics>>,
+    pub statistics: Arc<[Arc<Statistics>]>,
     /// Per-append metadata derived from WAL record headers.
     pub metas: Vec<ScribeAppendMeta>,
     /// Monotonic time at which the active generation first received a row.
@@ -1657,27 +1817,6 @@ impl FrozenMemtable {
     #[must_use]
     pub fn row_count(&self) -> usize {
         self.batches.iter().map(RecordBatch::num_rows).sum()
-    }
-
-    /// Captures this immutable generation's batches for projection outside
-    /// the lock.
-    ///
-    /// Every batch is tagged with `generation`, the registry identity of this
-    /// generation, so a caller can tell which generations the cut served and
-    /// must not also read from their staged runs.
-    fn readable_source(
-        &self,
-        generation: crate::scribe::hot_source::GenerationOrdinal,
-    ) -> ReadableSource {
-        ReadableSource::capture(
-            &self.schema,
-            &self.batches,
-            &self.statistics,
-            &self.metas,
-            self.seal_key.clone(),
-            Some(generation),
-            &self.charge,
-        )
     }
 }
 
@@ -1821,10 +1960,17 @@ impl LiveCapture {
         partitions.into_iter().collect()
     }
 
-    /// Reads one partition range of the capture: its memory batches projected
-    /// to `required`, the accounting owners of those batches, its
-    /// staged run paths in merge order, and the lease that keeps those runs on
-    /// disk.
+    /// Reads one partition range of the capture: its memory batches `pruning`
+    /// keeps, projected to `required`, the accounting owners of those
+    /// batches, its staged run paths in merge order, and the lease that keeps
+    /// those runs on disk.
+    ///
+    /// The batch list is sized once from the in-range sources, so a read
+    /// never regrows it.
+    ///
+    /// Pruning never changes which generations the read serves: the staged
+    /// half was fixed when the capture was taken, so a generation whose every
+    /// batch is pruned is still not read again from its staged runs.
     ///
     /// Projection shares the captured Arrow buffers, so the caller must hold
     /// the returned charges for as long as any returned batch lives, and the
@@ -1838,14 +1984,21 @@ impl LiveCapture {
         &self,
         partitions: &std::ops::RangeInclusive<crate::catalog::layout::TimePartition>,
         required: &[FieldRef],
+        pruning: Option<&crate::scan_sizing::BatchPruning>,
     ) -> Result<CapturedRead, ScribeError> {
-        let mut batches = Vec::new();
-        let mut charges = Vec::new();
-        for source in &self.memory {
-            if partitions.contains(&source.seal_key.partition.time()) {
-                source.project(required, &mut batches)?;
-                charges.push(Arc::clone(&source.charge));
-            }
+        let in_range: Vec<&ReadableSource> = self
+            .memory
+            .iter()
+            .filter(|source| partitions.contains(&source.seal_key.partition.time()))
+            .collect();
+        // Sized once: growing one batch at a time reallocates into fresh
+        // pages on every query while writes keep many batches live.
+        let mut batches =
+            Vec::with_capacity(in_range.iter().map(|source| source.batch_count()).sum());
+        let mut charges = Vec::with_capacity(in_range.len());
+        for source in in_range {
+            source.project(required, pruning, &mut batches)?;
+            charges.push(Arc::clone(&source.charge));
         }
         let runs = self
             .staged
@@ -1892,23 +2045,102 @@ pub(crate) struct CapturedRead {
     pub(crate) lease: Option<Arc<crate::scribe::hot_source::StagedSourceLease>>,
 }
 
+/// Most appends a writable bucket's tail holds before it seals into a shared
+/// [`AppendRun`].
+///
+/// A live capture shares every sealed run and copies only the tail, so this
+/// bounds the per-capture copy while keeping a bucket's run count small.
+const APPEND_RUN_LEN: usize = 64;
+
+/// Consecutive appends shared by reference between the bucket or generation
+/// that retains them and every live capture of them.
+///
+/// Cloning a run clones three handles, never a batch, so a capture taken
+/// under the memtable read locks costs a few pointer copies per run.
+#[derive(Debug, Clone)]
+struct AppendRun {
+    /// The appended batches, in append order.
+    batches: Arc<[RecordBatch]>,
+    /// Exact bounds of each batch, index-aligned with `batches`; a batch
+    /// without an entry reads with unknown bounds.
+    statistics: Arc<[Arc<Statistics>]>,
+    /// Maximum WAL LSN of each append, index-aligned with `batches`.
+    wal_lsns: Arc<[crate::scribe::wal::WalLsn]>,
+}
+
+impl AppendRun {
+    /// Builds a run over index-aligned appends.
+    ///
+    /// `statistics` may be shorter than `batches`, as in a hand-built test
+    /// generation; those batches read with unknown bounds.
+    ///
+    /// # Panics
+    ///
+    /// Panics when `wal_lsns` does not carry exactly one WAL position per
+    /// batch. A live read pairs batches with positions run by run, so a
+    /// mismatch would misalign every later run's bounds and pruning.
+    fn new(
+        batches: Arc<[RecordBatch]>,
+        statistics: Arc<[Arc<Statistics>]>,
+        wal_lsns: Arc<[crate::scribe::wal::WalLsn]>,
+    ) -> Self {
+        assert_eq!(
+            batches.len(),
+            wal_lsns.len(),
+            "an append run carries exactly one WAL position per batch"
+        );
+        Self {
+            batches,
+            statistics,
+            wal_lsns,
+        }
+    }
+}
+
+/// A writable bucket's appends after its last sealed [`AppendRun`].
+#[derive(Debug, Default)]
+struct AppendTail {
+    /// The appended batches, in append order.
+    batches: Vec<RecordBatch>,
+    /// Exact bounds of each batch, index-aligned with `batches`.
+    statistics: Vec<Arc<Statistics>>,
+    /// Maximum WAL LSN of each append, index-aligned with `batches`.
+    wal_lsns: Vec<crate::scribe::wal::WalLsn>,
+}
+
+impl AppendTail {
+    /// Copies the tail into a run a capture holds while the bucket keeps
+    /// appending.
+    fn run(&self) -> AppendRun {
+        AppendRun::new(
+            self.batches.as_slice().into(),
+            self.statistics.as_slice().into(),
+            self.wal_lsns.as_slice().into(),
+        )
+    }
+
+    /// Moves the tail into a sealed run, leaving it empty.
+    fn seal(&mut self) -> AppendRun {
+        AppendRun::new(
+            std::mem::take(&mut self.batches).into(),
+            std::mem::take(&mut self.statistics).into(),
+            std::mem::take(&mut self.wal_lsns).into(),
+        )
+    }
+}
+
 /// One bucket's or generation's batches, captured under the memtable read
 /// locks and projected only after they are released.
 ///
-/// Capturing copies reference-counted batches and bounds and each append's
-/// WAL position, never row data, so the locks are held for a few pointer
-/// copies per batch.
+/// Capturing shares each [`AppendRun`] by reference and copies only a
+/// writable bucket's tail, never row data, so the locks are held for a few
+/// pointer copies per run.
 #[derive(Debug)]
 struct ReadableSource {
     /// Arrow schema shared by every batch.
     schema: SchemaRef,
-    /// The captured append batches.
-    batches: Vec<RecordBatch>,
-    /// Exact bounds of each batch, index-aligned with `batches`; a batch
-    /// without an entry reads with unknown bounds.
-    statistics: Vec<Arc<Statistics>>,
-    /// Maximum WAL LSN of each append, index-aligned with `batches`.
-    wal_lsns: Vec<crate::scribe::wal::WalLsn>,
+    /// The captured appends, in append order.
+    runs: Vec<AppendRun>,
     /// Complete seal key owning every batch; its generation ordinals are
     /// unique only within it.
     seal_key: SealKey,
@@ -1920,36 +2152,41 @@ struct ReadableSource {
 }
 
 impl ReadableSource {
-    /// Captures `batches` and their bounds and WAL positions by reference,
-    /// sharing `charge`, the accounting owner of those batches.
+    /// Captures `runs`, sharing `charge`, the accounting owner of their
+    /// batches.
     fn capture(
         schema: &SchemaRef,
-        batches: &[RecordBatch],
-        statistics: &[Arc<Statistics>],
-        metas: &[ScribeAppendMeta],
+        runs: Vec<AppendRun>,
         seal_key: SealKey,
         generation: Option<crate::scribe::hot_source::GenerationOrdinal>,
         charge: &Arc<crate::scribe::memory::RetainedArrowCharge>,
     ) -> Self {
         Self {
             schema: Arc::clone(schema),
-            batches: batches.to_vec(),
-            statistics: statistics.to_vec(),
-            wal_lsns: metas.iter().map(|meta| meta.wal_lsn_max).collect(),
+            runs,
             seal_key,
             generation,
             charge: Arc::clone(charge),
         }
     }
 
-    /// Returns the bytes `scope` reads from the captured batches, measured by
-    /// [`crate::scan_sizing::ScanSizer::batch_bytes`].
-    fn scoped_bytes(&self, scope: &crate::scan_sizing::ScanScope) -> u64 {
-        crate::scan_sizing::ScanSizer::new(scope, &self.schema).batch_bytes(&self.statistics)
+    /// Returns how many batches the source captured.
+    fn batch_count(&self) -> usize {
+        self.runs.iter().map(|run| run.batches.len()).sum()
     }
 
-    /// Appends each captured batch, projected to `required`, to `output`,
-    /// with its bounds projected like its columns.
+    /// Returns the bytes `scope` reads from the captured batches, measured by
+    /// [`crate::scan_sizing::ScanSizer::batch_bytes`] run by run.
+    fn scoped_bytes(&self, scope: &crate::scan_sizing::ScanScope) -> u64 {
+        let sizer = crate::scan_sizing::ScanSizer::new(scope, &self.schema);
+        self.runs
+            .iter()
+            .map(|run| sizer.batch_bytes(&run.statistics))
+            .fold(0_u64, u64::saturating_add)
+    }
+
+    /// Appends each captured batch `pruning` keeps, projected to `required`,
+    /// to `output`, with its bounds projected like its columns.
     ///
     /// Each required field resolves by field id (see [`projection_indices`]),
     /// so rows admitted under an earlier schema revision are emitted under the
@@ -1957,13 +2194,33 @@ impl ReadableSource {
     /// predates is filled with nulls and has unknown bounds. An empty
     /// `required` keeps every column.
     ///
+    /// `pruning` is planned over `required` and runs on the projected bounds
+    /// of every captured batch before any batch is projected, so a batch the
+    /// query's predicate rules out is never cast or assembled. `None` keeps
+    /// every batch. Bounds are shared unchanged when the projection reads
+    /// every written column, in order and uncast.
+    ///
+    /// A generation retained in a learned Variant layout is emitted in its
+    /// logical schema: each projected shredded Variant column is reconstructed
+    /// from its typed leaves and residual, so a capture never exposes a
+    /// physical layout and memory unions with staged and published rows value
+    /// for value. Before reconstruction such a batch is filtered by `pruning`'s
+    /// predicate, adapted to the physical layout by DataFusion's
+    /// [`DefaultPhysicalExprAdapterFactory`], so only matching rows are
+    /// reconstructed and Variant functions can read typed leaves. A filtered
+    /// batch's bounds become inexact. A predicate that does not adapt or
+    /// evaluate filters nothing here; the query's own filter still runs.
+    ///
+    /// [`DefaultPhysicalExprAdapterFactory`]: datafusion::physical_expr_adapter::DefaultPhysicalExprAdapterFactory
+    ///
     /// # Errors
     ///
     /// Returns the column-selection error unchanged, or an internal error
-    /// when Arrow cast or batch assembly fails.
+    /// when Variant reconstruction, Arrow cast, or batch assembly fails.
     fn project(
         &self,
         required: &[FieldRef],
+        pruning: Option<&crate::scan_sizing::BatchPruning>,
         output: &mut Vec<ReadableBatch>,
     ) -> Result<(), ScribeError> {
         let internal = |error: arrow::error::ArrowError| ScribeError::Internal {
@@ -1977,57 +2234,111 @@ impl ReadableSource {
                 .collect::<Vec<_>>(),
             self.schema.metadata().clone(),
         ));
-        for (index, (batch, wal_lsn_max)) in self
-            .batches
+        // A source column keeps its recorded bounds only when it is read
+        // unchanged; a cast or null-filled column's bounds are unknown.
+        let kept: Vec<Option<usize>> = projection
             .iter()
-            .zip(self.wal_lsns.iter().copied())
+            .map(|(field, source)| {
+                source.filter(|column| self.schema.field(*column).data_type() == field.data_type())
+            })
+            .collect();
+        let whole = kept.len() == self.schema.fields().len()
+            && kept
+                .iter()
+                .enumerate()
+                .all(|(at, column)| *column == Some(at));
+        let statistics: Vec<Arc<Statistics>> = self
+            .runs
+            .iter()
+            .flat_map(|run| (0..run.batches.len()).map(|index| run.statistics.get(index)))
+            .map(|recorded| match recorded {
+                Some(bounds) if whole => Arc::clone(bounds),
+                Some(bounds) => Arc::new(Statistics {
+                    num_rows: bounds.num_rows,
+                    total_byte_size: Precision::Absent,
+                    column_statistics: kept
+                        .iter()
+                        .map(|column| {
+                            column.map_or_else(ColumnStatistics::new_unknown, |column| {
+                                bounds.column_statistics[column].clone()
+                            })
+                        })
+                        .collect(),
+                }),
+                None => Arc::new(Statistics::new_unknown(&schema)),
+            })
+            .collect();
+        let keep = pruning.map(|pruning| pruning.keep(&statistics, statistics.len()));
+        // One generation pins one layout, so the predicate adapts once to the
+        // first physical batch and serves them all.
+        let mut adapted: Option<Option<Arc<dyn datafusion::physical_expr::PhysicalExpr>>> = None;
+        for (index, ((batch, wal_lsn_max), mut statistics)) in self
+            .runs
+            .iter()
+            .flat_map(|run| run.batches.iter().zip(run.wal_lsns.iter().copied()))
+            .zip(statistics)
             .enumerate()
         {
-            let rows = batch.num_rows();
-            // A source column keeps its recorded bounds only when it is read
-            // unchanged; a cast or null-filled column's bounds are unknown.
-            let mut kept = Vec::with_capacity(projection.len());
+            if keep.as_ref().is_some_and(|keep| !keep[index]) {
+                continue;
+            }
+            let shredded = projection.iter().any(|(_, source)| {
+                source.is_some_and(|column| {
+                    batch.column(column).data_type() != self.schema.field(column).data_type()
+                })
+            });
+            let mut physical = physical_projection(batch, &schema, &projection);
+            if let Some(pruning) = pruning.filter(|_| shredded) {
+                let predicate = adapted.get_or_insert_with(|| {
+                    use datafusion::physical_expr_adapter::PhysicalExprAdapterFactory as _;
+                    datafusion::physical_expr_adapter::DefaultPhysicalExprAdapterFactory
+                        .create(Arc::clone(&schema), physical.schema())
+                        .ok()?
+                        .rewrite(Arc::clone(pruning.predicate().orig_expr()))
+                        .ok()
+                });
+                if let Some(kept) = predicate.as_ref().and_then(|predicate| {
+                    datafusion::physical_plan::filter::batch_filter(&physical, predicate).ok()
+                }) {
+                    if kept.num_rows() == 0 {
+                        continue;
+                    }
+                    if kept.num_rows() != physical.num_rows() {
+                        statistics = Arc::new(statistics.as_ref().clone().to_inexact());
+                    }
+                    physical = kept;
+                }
+            }
+            let rows = physical.num_rows();
             let columns = projection
                 .iter()
-                .map(|(field, source)| match source {
-                    Some(column) if batch.column(*column).data_type() == field.data_type() => {
-                        kept.push(Some(*column));
-                        Ok(Arc::clone(batch.column(*column)))
+                .zip(physical.schema_ref().fields())
+                .zip(physical.columns())
+                .map(|(((field, source), stored), column)| match source {
+                    Some(source) => {
+                        let logical = crate::schema::logical_column(
+                            stored,
+                            column,
+                            self.schema.field(*source),
+                        )
+                        .map_err(|detail| ScribeError::Internal {
+                            detail: format!("live-tail Variant reconstruction failed: {detail}"),
+                        })?;
+                        if logical.data_type() == field.data_type() {
+                            Ok(logical)
+                        } else {
+                            arrow::compute::cast(&logical, field.data_type()).map_err(internal)
+                        }
                     }
-                    Some(column) => {
-                        kept.push(None);
-                        arrow::compute::cast(batch.column(*column), field.data_type())
-                    }
-                    None => {
-                        kept.push(None);
-                        Ok(arrow::array::new_null_array(field.data_type(), rows))
-                    }
+                    None => Ok(Arc::clone(column)),
                 })
-                .collect::<Result<Vec<_>, _>>()
-                .map_err(internal)?;
+                .collect::<Result<Vec<_>, _>>()?;
             let batch = RecordBatch::try_new_with_options(
                 Arc::clone(&schema),
                 columns,
                 &arrow::array::RecordBatchOptions::new().with_row_count(Some(rows)),
             )
             .map_err(internal)?;
-            let statistics = Arc::new(self.statistics.get(index).map_or_else(
-                || Statistics::new_unknown(batch.schema_ref()),
-                |bounds| {
-                    Statistics {
-                        num_rows: bounds.num_rows,
-                        total_byte_size: Precision::Absent,
-                        column_statistics: kept
-                            .iter()
-                            .map(|column| {
-                                column.map_or_else(ColumnStatistics::new_unknown, |column| {
-                                    bounds.column_statistics[column].clone()
-                                })
-                            })
-                            .collect(),
-                    }
-                },
-            ));
             output.push(ReadableBatch {
                 partition_day: self.seal_key.partition.time(),
                 wal_lsn_max,
@@ -2038,6 +2349,47 @@ impl ReadableSource {
         }
         Ok(())
     }
+}
+
+/// Returns `batch`'s columns `projection` reads, unconverted, under the names
+/// of `schema`, with a projected field the batch predates filled with nulls:
+/// the stored layout a capture filters before reconstructing it in `schema`.
+///
+/// # Panics
+///
+/// Never in practice: every column comes from `batch` or is built at its row
+/// count, under its own field.
+fn physical_projection(
+    batch: &RecordBatch,
+    schema: &SchemaRef,
+    projection: &[(FieldRef, Option<usize>)],
+) -> RecordBatch {
+    let (fields, columns): (Vec<_>, Vec<_>) = projection
+        .iter()
+        .zip(schema.fields())
+        .map(|((field, source), named)| match source {
+            Some(column) => (
+                Arc::new(
+                    batch
+                        .schema_ref()
+                        .field(*column)
+                        .clone()
+                        .with_name(named.name()),
+                ),
+                Arc::clone(batch.column(*column)),
+            ),
+            None => (
+                Arc::clone(named),
+                arrow::array::new_null_array(field.data_type(), batch.num_rows()),
+            ),
+        })
+        .unzip();
+    RecordBatch::try_new_with_options(
+        Arc::new(Schema::new(fields)),
+        columns,
+        &arrow::array::RecordBatchOptions::new().with_row_count(Some(batch.num_rows())),
+    )
+    .expect("columns taken from one batch share its row count and their own fields")
 }
 
 /// Computes one append batch's exact row count, every column's byte size,
@@ -2215,6 +2567,251 @@ mod tests {
         .expect("named projection");
         assert_eq!(by_name[0].0.data_type(), &DataType::Utf8);
         assert!(projection_indices(&captured, &[with_id("a", "2"), with_id("b", "2")]).is_err());
+    }
+
+    /// A capture read prunes its memory batches by the query's predicate,
+    /// planned over the required fields, before projecting them: a batch
+    /// whose bounds exclude the key is never returned, the matching one is,
+    /// and every batch is kept without a predicate.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the capture cannot be taken or read, the excluded batch is
+    /// kept, or the matching batch is dropped.
+    #[test]
+    fn capture_read_prunes_batches_before_projecting() {
+        let memtable = Memtable::new();
+        let key = make_test_seal_key();
+        memtable
+            .insert(&key, make_test_meta(1), make_test_batch(2))
+            .expect("generation insert");
+        memtable.freeze(&key).expect("frozen generation");
+        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
+        let matching = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![Arc::new(Int64Array::from(vec![50_i64]))],
+        )
+        .expect("matching batch");
+        memtable
+            .insert(&key, make_test_meta(2), matching)
+            .expect("active insert");
+        let pruning = crate::scan_sizing::BatchPruning::try_new(
+            &schema,
+            Arc::new(datafusion::physical_expr::expressions::BinaryExpr::new(
+                datafusion::physical_expr::expressions::col("id", &schema).expect("id column"),
+                datafusion::logical_expr::Operator::Eq,
+                datafusion::physical_expr::expressions::lit(50_i64),
+            )),
+        )
+        .expect("pruning plans");
+        let capture = LiveCapture::take([&memtable], key.tenant, &key.table, None)
+            .expect("locks")
+            .expect("no registry to wait on");
+        let partitions = key.partition.time()..=key.partition.time();
+        let lsns = |pruning| {
+            let mut lsns = capture
+                .read(&partitions, schema.fields(), pruning)
+                .expect("capture read")
+                .batches
+                .iter()
+                .map(|batch| batch.wal_lsn_max.as_u64())
+                .collect::<Vec<_>>();
+            lsns.sort_unstable();
+            lsns
+        };
+
+        assert_eq!(lsns(Some(&pruning)), vec![2]);
+        assert_eq!(lsns(None), vec![1, 2]);
+    }
+
+    /// A capture shares a bucket's sealed runs and a generation's batches by
+    /// reference and copies only the bucket's unsealed tail; every read and
+    /// freeze keeps each append's rows paired with its WAL position, in order.
+    ///
+    /// Each append's single `id` row equals its LSN, so a reordered or
+    /// misaligned batch is caught. The bucket is captured at exactly one full
+    /// run (no tail), then again after more appends span two sealed runs and
+    /// a tail; the earlier capture keeps its rows. Pruning keeps exactly the
+    /// batches whose bounds match across a run boundary, and freezing shares
+    /// one concatenated generation with all its bounds.
+    ///
+    /// # Panics
+    ///
+    /// Panics when a capture copies a sealed run or a frozen generation, or a
+    /// read, prune, or freeze loses, reorders, or misaligns an append.
+    #[test]
+    fn captures_share_sealed_runs_and_frozen_generations() {
+        use arrow::array::Array as _;
+
+        let memtable = Memtable::new();
+        let key = make_test_seal_key();
+        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
+        let insert = |lsns: std::ops::RangeInclusive<u64>| {
+            for lsn in lsns {
+                let value = i64::try_from(lsn).expect("lsn value");
+                let batch = RecordBatch::try_new(
+                    Arc::clone(&schema),
+                    vec![Arc::new(Int64Array::from(vec![value]))],
+                )
+                .expect("valued batch");
+                memtable
+                    .insert(&key, make_test_meta(lsn), batch)
+                    .expect("active insert");
+            }
+        };
+        let partitions = key.partition.time()..=key.partition.time();
+        let lsns = |capture: &LiveCapture, pruning| -> Vec<u64> {
+            capture
+                .read(&partitions, schema.fields(), pruning)
+                .expect("capture read")
+                .batches
+                .iter()
+                .map(|readable| {
+                    let lsn = readable.wal_lsn_max.as_u64();
+                    let ids = readable
+                        .batch
+                        .column(0)
+                        .as_any()
+                        .downcast_ref::<Int64Array>()
+                        .expect("id column");
+                    assert_eq!(ids.len(), 1);
+                    assert_eq!(
+                        u64::try_from(ids.value(0)).ok(),
+                        Some(lsn),
+                        "rows follow their LSN"
+                    );
+                    lsn
+                })
+                .collect()
+        };
+        let take = || {
+            LiveCapture::take([&memtable], key.tenant, &key.table, None)
+                .expect("locks")
+                .expect("no registry to wait on")
+        };
+        let shares_sealed = |capture: &LiveCapture, sealed: usize| {
+            let writable = memtable.writable.read().expect("writable lock");
+            let bucket = &writable[&key];
+            assert_eq!(bucket.runs.len(), sealed);
+            for (captured, owned) in capture.memory[0].runs.iter().zip(&bucket.runs) {
+                assert!(Arc::ptr_eq(&captured.batches, &owned.batches));
+                assert!(Arc::ptr_eq(&captured.statistics, &owned.statistics));
+                assert!(Arc::ptr_eq(&captured.wal_lsns, &owned.wal_lsns));
+            }
+        };
+        let full = u64::try_from(APPEND_RUN_LEN).expect("run length");
+        let total = 2 * full + 2;
+
+        insert(1..=full);
+        let exact = take();
+        assert_eq!(exact.memory[0].runs.len(), 1, "a full run leaves no tail");
+        shares_sealed(&exact, 1);
+        assert_eq!(lsns(&exact, None), (1..=full).collect::<Vec<_>>());
+
+        insert(full + 1..=total);
+        let active = take();
+        assert_eq!(
+            active.memory[0].runs.len(),
+            3,
+            "two sealed runs and the tail"
+        );
+        shares_sealed(&active, 2);
+        assert_eq!(active.memory[0].runs[2].batches.len(), 2);
+        assert_eq!(lsns(&active, None), (1..=total).collect::<Vec<_>>());
+        assert_eq!(
+            lsns(&exact, None),
+            (1..=full).collect::<Vec<_>>(),
+            "an earlier capture keeps its rows"
+        );
+
+        let bound = |operator, value: u64| {
+            Arc::new(datafusion::physical_expr::expressions::BinaryExpr::new(
+                datafusion::physical_expr::expressions::col("id", &schema).expect("id column"),
+                operator,
+                datafusion::physical_expr::expressions::lit(
+                    i64::try_from(value).expect("bound value"),
+                ),
+            ))
+        };
+        let pruning = crate::scan_sizing::BatchPruning::try_new(
+            &schema,
+            Arc::new(datafusion::physical_expr::expressions::BinaryExpr::new(
+                bound(datafusion::logical_expr::Operator::GtEq, full - 2),
+                datafusion::logical_expr::Operator::And,
+                bound(datafusion::logical_expr::Operator::LtEq, full + 3),
+            )),
+        )
+        .expect("pruning plans");
+        assert_eq!(
+            lsns(&active, Some(&pruning)),
+            (full - 2..=full + 3).collect::<Vec<_>>(),
+            "pruning keeps exactly the matching batches across the run boundary"
+        );
+
+        let frozen = memtable.freeze(&key).expect("freeze");
+        let appended = usize::try_from(total).expect("append count");
+        assert_eq!(frozen.batches.len(), appended);
+        assert_eq!(frozen.statistics.len(), appended);
+        let captured = take();
+        assert!(Arc::ptr_eq(
+            &captured.memory[0].runs[0].batches,
+            &frozen.batches
+        ));
+        assert_eq!(lsns(&captured, None), (1..=total).collect::<Vec<_>>());
+        assert_eq!(
+            lsns(&captured, Some(&pruning)),
+            (full - 2..=full + 3).collect::<Vec<_>>()
+        );
+        assert_eq!(lsns(&active, None), (1..=total).collect::<Vec<_>>());
+        assert_eq!(lsns(&exact, None), (1..=full).collect::<Vec<_>>());
+    }
+
+    /// A capture read that projects every written column, in order and
+    /// uncast, shares each batch's recorded bounds instead of copying them,
+    /// and a narrower projection copies only its columns' bounds. Either read
+    /// sizes its batch list exactly to the captured batches.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the capture cannot be taken or read, or the whole read
+    /// does not share the recorded bounds.
+    #[test]
+    fn whole_schema_capture_read_shares_recorded_bounds() {
+        let memtable = Memtable::new();
+        let key = make_test_seal_key();
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("other", DataType::Int64, false),
+        ]));
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(Int64Array::from(vec![1_i64])),
+                Arc::new(Int64Array::from(vec![2_i64])),
+            ],
+        )
+        .expect("two-column batch");
+        memtable
+            .insert(&key, make_test_meta(1), batch)
+            .expect("active insert");
+        let capture = LiveCapture::take([&memtable], key.tenant, &key.table, None)
+            .expect("locks")
+            .expect("no registry to wait on");
+        let partitions = key.partition.time()..=key.partition.time();
+        let recorded = Arc::clone(&capture.memory[0].runs[0].statistics[0]);
+        let read = |fields: &[FieldRef]| {
+            let mut batches = capture
+                .read(&partitions, fields, None)
+                .expect("capture read")
+                .batches;
+            assert_eq!(batches.capacity(), 1, "the batch list is sized once");
+            batches.remove(0).statistics
+        };
+
+        assert!(Arc::ptr_eq(&read(schema.fields()), &recorded));
+        let narrow = read(&schema.fields()[..1]);
+        assert!(!Arc::ptr_eq(&narrow, &recorded));
+        assert_eq!(narrow.column_statistics.len(), 1);
     }
 
     /// An append batch's bounds are exact for a primitive column and unknown
@@ -2996,7 +3593,7 @@ mod tests {
             let memory: Vec<_> = capture
                 .memory
                 .iter()
-                .map(|source| (source.seal_key.clone(), source.batches.len()))
+                .map(|source| (source.seal_key.clone(), source.batch_count()))
                 .collect();
             let staged: Vec<_> = capture
                 .staged

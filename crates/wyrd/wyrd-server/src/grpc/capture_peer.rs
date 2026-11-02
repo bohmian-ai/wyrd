@@ -1,13 +1,14 @@
 //! Private tonic adapter for server-internal writes submitted by a pod without
-//! Scribe: audit decisions, gateway capture, Verifier results, and tenant
-//! copies of server spans.
+//! Scribe: audit decisions, gateway capture, Verifier results, tenant
+//! copies of server spans, and storage object inventory facts.
 //!
 //! Mounted only on the mutually authenticated peer listener of a pod that runs
 //! Scribe, so every caller already presented the cluster `wyrd-peer`
 //! certificate. That admits a trusted cluster process, not a tenant: the
 //! request names its tenant and destination explicitly and carries no token.
 //! The service accepts only the audit log, the two capture destinations, and
-//! the Verifier result and execution input tables, whose rows carry the subject and actor
+//! the Verifier result and execution input tables, and the storage object
+//! inventory, whose rows carry the subject and actor
 //! Scribe stamps, and the reserved system tenant only for audit history,
 //! then submits through the same frame the in-process Scribe outbox route
 //! uses.
@@ -25,7 +26,7 @@ use wyrd_tonic::wyrd::v1::scribe_capture_peer_service_server::{
 };
 use wyrd_tonic::wyrd::v1::{IngestCaptureRequest, IngestCaptureResponse};
 
-use crate::scribe_outbox::{ScribeBatch, ScribeTable};
+use crate::scribe_outbox::{FramePayload, ScribeBatch, ScribeTable};
 
 /// Private gRPC adapter writing peer-submitted capture into this pod's Scribe.
 pub struct ScribeCapturePeerGrpc {
@@ -56,7 +57,7 @@ impl ScribeCapturePeerGrpc {
     ///
     /// Returns `InvalidArgument` for a malformed tenant, batch, or request id,
     /// and `PermissionDenied` for the reserved
-    /// system tenant outside audit history or any table other than the six
+    /// system tenant outside audit history or any table other than the seven
     /// server-internal destinations.
     fn batch(request: IngestCaptureRequest) -> Result<ScribeBatch, Status> {
         let tenant = request
@@ -65,7 +66,7 @@ impl ScribeCapturePeerGrpc {
             .map_err(|_| Status::invalid_argument("capture tenant_id is not a tenant id"))?;
         let table = ScribeTable::from_fqn(&request.table).ok_or_else(|| {
             Status::permission_denied(format!(
-                "the peer writer accepts only the audit, gateway capture, and Verifier result and input tables, not {}",
+                "the peer writer accepts only the audit, gateway capture, Verifier result and input, and storage object tables, not {}",
                 request.table
             ))
         })?;
@@ -87,7 +88,7 @@ impl ScribeCapturePeerGrpc {
             table,
             batch_id,
             request_id,
-            ipc: request.arrow_ipc,
+            payload: FramePayload::Ipc(request.arrow_ipc),
         })
     }
 }
@@ -174,7 +175,7 @@ mod tests {
             (tenant, "bifrost.gateway.calls"),
             (tenant, "bifrost.traces.spans"),
             (tenant, "bifrost.verification.results"),
-            (tenant, "bifrost.drift.result_features"),
+            (tenant, "bifrost.verification.execution_outputs"),
             (tenant, "bifrost.verification.execution_inputs"),
         ] {
             let batch = ScribeCapturePeerGrpc::batch(request(tenant, table)).expect("accepted");

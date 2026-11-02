@@ -37,7 +37,7 @@ pub fn drift_verifier_yaml(features: usize) -> String {
         .collect::<Vec<_>>()
         .join(", ");
     format!(
-        "apiVersion: wyrd/v1\nkind: Verifier\nmetadata:\n  name: {DRIFT_VERIFIER}\n  version: 1.0.0\nspec:\n  inputs:\n    samples: {{type: samples, features: [{names}]}}\n  requirements:\n    - id: f0-bounded\n      statement: f0 stays bounded.\n      check: {{kind: drift, on: inputs.samples, method: Custom, signal: {{kind: Metric, name: f0}}, condition: {{kind: Above, limit: 1000.0}}}}\n"
+        "apiVersion: wyrd/v1\nkind: Verifier\nmetadata:\n  name: {DRIFT_VERIFIER}\n  version: 1.0.0\nspec:\n  inputs:\n    samples: {{type: samples, features: [{names}]}}\n  requirements:\n    - id: f0-bounded\n      statement: f0 stays bounded.\n      check: {{kind: drift, on: inputs.samples, method: Custom, signal: {{kind: Metric, name: f0}}, condition: {{kind: Statistical}}, profile: {{kind: Custom, metric_name: f0, baseline_value: 0.0, alert_threshold: 1000.0}}}}\n"
     )
 }
 
@@ -147,4 +147,31 @@ fn connect(credential: &SecretString, grpc: Option<&str>) -> Result<WyrdClient> 
         credential: Some(SecretString::from(credential.expose_secret().to_owned())),
         ..ClientConfig::from_global_with_overrides(&GlobalConfig::default(), Some(SERVER_URL), grpc)
     })?)
+}
+
+#[cfg(test)]
+mod tests {
+    use wyrd_spec::envelope::{Card, Spec};
+    use wyrd_spec::format;
+
+    use super::drift_verifier_yaml;
+    use crate::client_queue::step::FEATURES;
+
+    /// The provisioned drift Verifier decodes and passes the Card
+    /// validation the loader applies before declaration.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the generated YAML does not decode as a valid Verifier.
+    #[test]
+    fn drift_verifier_is_a_valid_card() {
+        let card: Card = format::yaml::from_str(&drift_verifier_yaml(FEATURES))
+            .expect("the drift Verifier YAML decodes");
+        let Spec::Verifier(verifier) = &card.spec else {
+            panic!("expected a Verifier spec, got {:?}", card.spec);
+        };
+        verifier
+            .validate()
+            .expect("the drift Verifier passes Card validation");
+    }
 }

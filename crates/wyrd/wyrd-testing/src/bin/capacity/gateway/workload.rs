@@ -23,8 +23,10 @@ use wyrd_client::config::ClientConfig;
 use wyrd_client::gateway_admin::{
     GatewayCaptureMode, GatewayCapturePolicyWrite, GatewayPayloadField,
 };
+use wyrd_client::transport::trace::benchmark_headers;
 use wyrd_client::{Bifrost, Gateway, GlobalConfig, Principals, WyrdClient};
 use wyrd_spec::auth::CreateServicePrincipalRequest;
+use wyrd_testing::gateway_capture::GatewayCapture;
 use wyrd_testing::release_server::{SERVER_URL, SetupTenant};
 
 use crate::gateway::Result;
@@ -58,16 +60,21 @@ pub struct Tenant {
 }
 
 impl Tenant {
-    /// Configures `setup`'s tenant against `upstream`: one deployment per
-    /// [`PREFIXES`] entry and `keys` invoking principals.
+    /// Configures `setup`'s tenant: one deployment per [`PREFIXES`] entry,
+    /// each against the upstream base URL at the same position in
+    /// `upstreams`, and `keys` invoking principals.
     ///
     /// # Errors
     ///
     /// Returns a client, administration, or principal failure.
-    pub async fn provision(setup: &SetupTenant, upstream: &str, keys: usize) -> Result<Self> {
+    pub async fn provision(
+        setup: &SetupTenant,
+        upstreams: [&str; PREFIXES.len()],
+        keys: usize,
+    ) -> Result<Self> {
         let admin = connect(&setup.api_key)?;
         let gateway = Gateway::connect_with(&admin).await?;
-        for prefix in PREFIXES {
+        for (prefix, upstream) in PREFIXES.into_iter().zip(upstreams) {
             let deployment = serde_json::from_value(json!({
                 "name": format!("bench-{prefix}"),
                 "adapter": {"openai_compatible": {"base_url": format!("{upstream}/{prefix}/v1")}},
@@ -191,7 +198,7 @@ impl Shape {
             "max_completion_tokens": 64,
             "messages": [
                 {"role": "system", "content": marker},
-                {"role": "user", "content": "x".repeat(self.request_bytes)},
+                {"role": "user", "content": GatewayCapture::prose(self.request_bytes)},
             ],
         });
         if self.stream {
@@ -232,8 +239,6 @@ impl Outcome {
 pub struct Timed {
     /// Just before the request was sent.
     pub sent: Instant,
-    /// When the response headers arrived.
-    pub headers: Option<Instant>,
     /// When each complete stream data event carrying a choice arrived.
     pub events: Vec<Instant>,
     /// When the answer was complete and validated, or the call ended.
@@ -248,7 +253,6 @@ pub async fn call(http: &Client, key: &SecretString, shape: &Shape, body: Bytes)
     let sent = Instant::now();
     let mut timed = Timed {
         sent,
-        headers: None,
         events: Vec::new(),
         done: sent,
         outcome: Outcome::Answered,
@@ -266,8 +270,8 @@ pub async fn call(http: &Client, key: &SecretString, shape: &Shape, body: Bytes)
     timed
 }
 
-/// Sends the request and reads its answer into `timed`, returning how it
-/// ended.
+/// Sends the request, with the benchmark labels scoped on this task, and
+/// reads its answer into `timed`, returning how it ended.
 async fn exchange(
     http: &Client,
     key: &SecretString,
@@ -275,8 +279,11 @@ async fn exchange(
     body: Bytes,
     timed: &mut Timed,
 ) -> Outcome {
-    let response = match http
-        .post(format!("{SERVER_URL}/v1/chat/completions"))
+    let request = benchmark_headers().into_iter().fold(
+        http.post(format!("{SERVER_URL}/v1/chat/completions")),
+        |request, (name, value)| request.header(name, value),
+    );
+    let response = match request
         .bearer_auth(key.expose_secret())
         .header("content-type", "application/json")
         .body(body)
@@ -287,7 +294,6 @@ async fn exchange(
         Err(error) if error.is_timeout() => return Outcome::TimedOut,
         Err(error) => return Outcome::Failed(format!("transport: {error}")),
     };
-    timed.headers = Some(Instant::now());
     let status = response.status();
     if !status.is_success() {
         let text = response.text().await.unwrap_or_default();
@@ -454,6 +460,11 @@ mod tests {
         let mut erroring = EventReader::default();
         let error = "data: {\"error\":{\"code\":\"WYRD_GATEWAY_502_UPSTREAM_UNAVAILABLE\"}}\n\ndata: [DONE]\n\n";
         assert!(erroring.push(error.as_bytes(), &mut Vec::new()).is_err());
+
+        let prose = GatewayCapture::prose(65_536);
+        assert_eq!(prose.len(), 65_536);
+        assert_eq!(prose, GatewayCapture::prose(65_536));
+        assert!(prose.split(' ').count() > 10_000, "sized text is words");
 
         let answer = GatewayCapture::sized_completion(800).to_string();
         assert_eq!(buffered(answer.as_bytes(), 800), Outcome::Answered);

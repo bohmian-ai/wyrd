@@ -27,6 +27,23 @@ tokio::task_local! {
     static PRODUCER: Box<dyn Fn(&str) -> Option<TraceContext>>;
 }
 
+#[cfg(feature = "test-support")]
+tokio::task_local! {
+    /// The closed benchmark case and phase a benchmark driver classifies
+    /// this task's requests with.
+    static BENCHMARK: (&'static str, &'static str);
+}
+
+/// Header carrying a benchmark driver's closed case, which a benchmark-mode
+/// server uses only to choose a timing series.
+#[cfg(feature = "test-support")]
+const BENCHMARK_CASE_HEADER: &str = "x-wyrd-benchmark-case";
+
+/// Header carrying a benchmark driver's closed phase: the repetition or
+/// admission phase the request was admitted in.
+#[cfg(feature = "test-support")]
+const BENCHMARK_PHASE_HEADER: &str = "x-wyrd-benchmark-phase";
+
 /// W3C header carrying the caller's trace and parent span.
 pub(crate) const TRACEPARENT: &str = "traceparent";
 /// W3C header carrying vendor trace state.
@@ -44,6 +61,21 @@ pub async fn with_caller_trace<F: Future>(context: Option<TraceContext>, future:
         Some(context) => CALLER.scope(context, future).await,
         None => future.await,
     }
+}
+
+/// Run `future` with every Wyrd request it sends on this task, and every
+/// retry of one, classified as the benchmark `case` admitted in `phase`, so
+/// a benchmark-mode server keeps its timings apart from other classes and
+/// phases it serves at the same time and a late completion stays in the
+/// phase that admitted it. Requests a background producer sends on another
+/// task are not classified.
+#[cfg(feature = "test-support")]
+pub async fn with_benchmark_labels<F: Future>(
+    case: &'static str,
+    phase: &'static str,
+    future: F,
+) -> F::Output {
+    BENCHMARK.scope((case, phase), future).await
 }
 
 /// Run the synchronous `call` with `open` as the opener of every queued
@@ -97,15 +129,40 @@ pub(crate) fn producer(table: &str) -> Option<TraceContext> {
 }
 
 /// The W3C headers the current request carries: `traceparent`, plus
-/// `tracestate` when non-empty; none without an [`outbound`] context.
+/// `tracestate` when non-empty; none without an [`outbound`] context. With
+/// `test-support`, labels scoped by [`with_benchmark_labels`] add their
+/// case and phase headers.
 pub(crate) fn headers() -> Vec<(&'static str, String)> {
-    outbound().map_or_else(Vec::new, |context| {
+    let headers = outbound().map_or_else(Vec::new, |context| {
         let mut headers = vec![(TRACEPARENT, context.to_traceparent())];
         if !context.trace_state.is_empty() {
             headers.push((TRACESTATE, context.trace_state));
         }
         headers
-    })
+    });
+    #[cfg(feature = "test-support")]
+    let headers = {
+        let mut headers = headers;
+        headers.extend(benchmark_headers());
+        headers
+    };
+    headers
+}
+
+/// The case and phase headers scoped by [`with_benchmark_labels`] on this
+/// task, for a benchmark driver that sends a request outside a Wyrd client;
+/// none outside a scope.
+#[cfg(feature = "test-support")]
+#[must_use]
+pub fn benchmark_headers() -> Vec<(&'static str, String)> {
+    BENCHMARK
+        .try_with(|(case, phase)| {
+            vec![
+                (BENCHMARK_CASE_HEADER, (*case).to_owned()),
+                (BENCHMARK_PHASE_HEADER, (*phase).to_owned()),
+            ]
+        })
+        .unwrap_or_default()
 }
 
 /// The current `tracing` span's valid OpenTelemetry span context as W3C
@@ -136,6 +193,27 @@ mod tests {
     #[test]
     fn no_active_context_sends_none() {
         assert_eq!(outbound(), None);
+    }
+
+    /// Scoped benchmark labels classify the task's requests by case and
+    /// admission phase, and no request outside the scope carries them.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the scoped headers differ or leak outside the scope.
+    #[cfg(feature = "test-support")]
+    #[tokio::test]
+    async fn scoped_benchmark_labels_are_sent() {
+        let sent =
+            super::with_benchmark_labels("full-scan", "capacity", async { super::headers() }).await;
+        assert_eq!(
+            sent,
+            [
+                ("x-wyrd-benchmark-case", "full-scan".to_owned()),
+                ("x-wyrd-benchmark-phase", "capacity".to_owned()),
+            ]
+        );
+        assert!(super::headers().is_empty());
     }
 
     /// A scoped foreign caller context is the outbound context, and `None`

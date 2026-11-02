@@ -7,16 +7,18 @@
 //! 2. Per stage: the caller's `prepare` classifies each task synchronously
 //!    (no IO) against the ledger of earlier stages, settling skips without
 //!    running and handing back runnable futures.
-//! 3. Fans the runnable tasks out concurrently on one `tokio::JoinSet`.
+//! 3. Polls the runnable tasks concurrently inside the caller's task, so
+//!    each stage costs no runtime spawn or wake-up hop.
 //! 4. At the stage barrier: appends the stage's settlements to the ledger in
 //!    declaration order.
 
+use std::any::Any;
 use std::collections::HashMap;
-use std::future::Future;
+use std::future::{Future, poll_fn};
+use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::pin::Pin;
+use std::task::Poll;
 
-use tokio::task::{JoinError, JoinSet};
-use tracing::Instrument as _;
 use wyrd_spec::verification::{Stage, TaskId};
 
 /// Per-run state shared by every stage-walking execution: each settled task
@@ -70,7 +72,7 @@ impl<O> IntoIterator for RunLedger<O> {
     }
 }
 
-/// A pending task future spawned by [`walk`].
+/// A pending task future polled by [`walk`].
 pub(crate) type Running<O, E> = Pin<Box<dyn Future<Output = Result<O, E>> + Send>>;
 
 /// How one planned task proceeds, decided before its stage fans out.
@@ -86,23 +88,24 @@ pub(crate) enum Prepared<O, E> {
 /// This is the single stage lifecycle of `vala-verify`: per stage, `prepare`
 /// sees the ledger of every earlier stage and returns one [`Prepared`] per
 /// stage task, in declaration order; settled tasks are recorded as is, and
-/// runnable ones are spawned on one `JoinSet` inside the caller's current
-/// span, so a task's work stays in the caller's trace. At the stage barrier
+/// runnable ones are polled together inside the caller's task and span, so
+/// their waits overlap, their work stays in the caller's trace, and no task
+/// is spawned or woken through the runtime. At the stage barrier
 /// the settlements are appended in declaration order. Contract-specific
 /// classification, budgets and results stay in `prepare`.
 ///
 /// # Errors
 /// Returns the first `prepare` error, the first task error in completion
-/// order, or `joined` applied to a task that panicked or was aborted.
+/// order, or `panicked` applied to the message of a task that panicked.
 ///
 /// # Cancellation
-/// Returning early or dropping the future drops the `JoinSet`, which aborts
-/// every task of the stage still running; the stage yields no partial
-/// settlements. Work an aborted task already performed is not rolled back.
+/// Returning early or dropping the future drops every task of the stage
+/// still running; the stage yields no partial settlements. Work a dropped
+/// task already performed is not rolled back.
 pub(crate) async fn walk<'s, O, E>(
     stages: impl IntoIterator<Item = &'s Stage>,
     mut prepare: impl FnMut(&RunLedger<O>, &Stage) -> Result<Vec<Prepared<O, E>>, E>,
-    joined: fn(JoinError) -> E,
+    panicked: fn(String) -> E,
 ) -> Result<RunLedger<O>, E>
 where
     O: Send + 'static,
@@ -111,22 +114,33 @@ where
     let mut ledger = RunLedger::default();
     for stage in stages {
         let mut settled = HashMap::new();
-        let mut running = JoinSet::new();
+        let mut running = Vec::new();
         for (at, prepared) in prepare(&ledger, stage)?.into_iter().enumerate() {
             match prepared {
                 Prepared::Settled(done) => {
                     settled.insert(at, done);
                 }
-                Prepared::Run(task) => {
-                    running.spawn(
-                        async move { (at, task.await) }.instrument(tracing::Span::current()),
-                    );
-                }
+                Prepared::Run(task) => running.push((at, task)),
             }
         }
-        while let Some(done) = running.join_next().await {
-            let (at, done) = done.map_err(joined)?;
-            settled.insert(at, done?);
+        while !running.is_empty() {
+            let (at, done) = poll_fn(|cx| {
+                let ready = running
+                    .iter_mut()
+                    .enumerate()
+                    .find_map(|(index, (_, task))| {
+                        match catch_unwind(AssertUnwindSafe(|| task.as_mut().poll(cx))) {
+                            Ok(Poll::Pending) => None,
+                            Ok(Poll::Ready(done)) => Some((index, Ok(done))),
+                            Err(payload) => Some((index, Err(message(payload.as_ref())))),
+                        }
+                    });
+                ready.map_or(Poll::Pending, |(index, done)| {
+                    Poll::Ready((running.swap_remove(index).0, done))
+                })
+            })
+            .await;
+            settled.insert(at, done.map_err(panicked)??);
         }
         for (at, task) in stage.tasks.iter().enumerate() {
             if let Some(done) = settled.remove(&at) {
@@ -135,4 +149,13 @@ where
         }
     }
     Ok(ledger)
+}
+
+/// The text of a panic `payload`, or a fixed note when it carries none.
+fn message(payload: &(dyn Any + Send)) -> String {
+    payload
+        .downcast_ref::<&str>()
+        .map(|text| (*text).to_owned())
+        .or_else(|| payload.downcast_ref::<String>().cloned())
+        .unwrap_or_else(|| "a verification block panicked".to_owned())
 }

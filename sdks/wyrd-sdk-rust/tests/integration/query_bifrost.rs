@@ -175,7 +175,7 @@ async fn unwritten_builtin_table_reads_as_empty() {
         .await
         .expect("Bifrost connects")
         .sql_as(
-            "SELECT COUNT(*) AS n FROM bifrost.drift.result_features",
+            "SELECT COUNT(*) AS n FROM bifrost.verification.execution_outputs",
             &[],
         )
         .await

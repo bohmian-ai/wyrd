@@ -171,9 +171,6 @@ pub struct CanonicalIngress {
     pub batches: Vec<RecordBatch>,
     /// Move-only reservation that already covers `batches`, when Gate held one.
     pub(crate) owner: Option<OtlpDecodeOwner>,
-    /// The logical identity Gate already computed over the one batch, so
-    /// Scribe reuses it for slices that still hold that batch's buffers.
-    pub(crate) logical_identity: Option<crate::scribe::preprocess::LogicalIdentity>,
 }
 
 impl CanonicalIngress {
@@ -183,7 +180,6 @@ impl CanonicalIngress {
         Self {
             batches,
             owner: Some(owner),
-            logical_identity: None,
         }
     }
 
@@ -196,18 +192,7 @@ impl CanonicalIngress {
         Self {
             batches,
             owner: None,
-            logical_identity: None,
         }
-    }
-
-    /// Attaches the logical identity Gate computed over the one batch.
-    #[must_use]
-    pub(crate) fn with_logical_identity(
-        mut self,
-        identity: crate::scribe::preprocess::LogicalIdentity,
-    ) -> Self {
-        self.logical_identity = Some(identity);
-        self
     }
 }
 

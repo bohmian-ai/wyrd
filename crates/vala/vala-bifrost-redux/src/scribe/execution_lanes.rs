@@ -9,7 +9,6 @@ use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use arrow::array::{Array, ArrayRef, AsArray, StringArray, TimestampMicrosecondArray};
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use arrow::record_batch::RecordBatch;
-use bytes::Bytes;
 use iceberg::spec::Schema as IcebergSchema;
 use tokio::sync::{Notify, Semaphore, mpsc, oneshot};
 
@@ -19,7 +18,6 @@ use crate::resources::ScribeResources;
 use crate::schema::fingerprint::SchemaFingerprint;
 use crate::scribe::memtable::FrozenMemtable;
 use crate::scribe::replay::ReplayedSealKey;
-use crate::scribe::seal_key::SealKey;
 use crate::scribe::stream_identity::StreamIdentity;
 use crate::scribe::wal::{
     PreparedWalAppend, WalAppendResult, WalHandle, WalSegment, WalSegmentRef,
@@ -1955,33 +1953,26 @@ impl ScribePersistenceCpuPool {
 /// Closed set of filesystem work permitted on the WAL IO lane.
 #[derive(Debug)]
 pub(crate) enum ScribeWalIoOp {
-    /// Writes one current ingress slice while retaining its complete root owner.
-    WriteIngressSlice {
-        /// Fixed shard WAL handle receiving the prepared slice.
+    /// Writes one group's ingress slices, in order, in one WAL IO operation
+    /// while retaining every root owner whose payloads it holds.
+    WriteIngressSlices {
+        /// Fixed shard WAL handle receiving the prepared slices.
         wal: WalHandle,
-        /// Move-only current IPC payload and framing facts.
-        append: PreparedWalAppend,
-        /// Root lease retained until the detached WAL write returns.
-        memory: crate::resources::ScribeMemoryLease,
+        /// Move-only current IPC payloads and framing facts, in WAL order.
+        appends: Vec<PreparedWalAppend>,
+        /// Root leases retained until the detached WAL writes return.
+        memory: Vec<crate::resources::ScribeMemoryLease>,
     },
+    /// Writes one group's prepared records, in order, in one WAL IO operation.
     WritePrepared {
+        /// Fixed shard WAL handle receiving the records.
         wal: WalHandle,
-        append: PreparedWalAppend,
+        /// Prepared records in WAL order.
+        appends: Vec<PreparedWalAppend>,
     },
     SyncWal {
         wal: WalHandle,
         segments: Vec<Arc<WalSegment>>,
-    },
-    #[expect(
-        dead_code,
-        reason = "manifest replacement persistence submits through this closed operation"
-    )]
-    ReplaceManifest { path: PathBuf, contents: Bytes },
-    AdvanceManifest {
-        path: PathBuf,
-        stream: StreamIdentity,
-        seal_key: SealKey,
-        sealed_lsn: crate::scribe::wal::WalLsn,
     },
     /// Replays one recovery inventory while pinning the current segment in the
     /// existing WAL owner; an error or cancellation retains unread source bytes.
@@ -2008,15 +1999,17 @@ pub(crate) enum ScribeWalIoOp {
 /// Results produced by [`ScribeWalIoPool`].
 #[derive(Debug)]
 pub(crate) enum ScribeWalIoResult {
-    /// One ingress slice was accepted by its WAL owner.
-    IngressSliceWritten {
-        /// Durable WAL append identity.
-        result: WalAppendResult,
-        /// Root lease returned after detached WAL work completed.
-        memory: crate::resources::ScribeMemoryLease,
+    /// Every ingress slice of one group was accepted by its WAL owner.
+    IngressSlicesWritten {
+        /// WAL append identities, in the submitted order.
+        results: Vec<WalAppendResult>,
+        /// Root leases returned after detached WAL work completed.
+        memory: Vec<crate::resources::ScribeMemoryLease>,
     },
+    /// Every prepared record of one operation was written, in submitted order.
     WalWritten {
-        result: WalAppendResult,
+        /// WAL append identities, in the submitted order.
+        results: Vec<WalAppendResult>,
     },
     WalSynced,
     Completed,
@@ -2061,6 +2054,9 @@ pub struct ScribeWalIoPool {
     /// Sync operations submitted through the production lane in unit tests.
     #[cfg(test)]
     sync_submissions: Arc<AtomicU64>,
+    /// Record write operations submitted through the production lane in unit tests.
+    #[cfg(test)]
+    write_submissions: Arc<AtomicU64>,
 }
 
 impl ScribeWalIoPool {
@@ -2121,6 +2117,8 @@ impl ScribeWalIoPool {
             retire_submissions: Arc::new(AtomicU64::new(0)),
             #[cfg(test)]
             sync_submissions: Arc::new(AtomicU64::new(0)),
+            #[cfg(test)]
+            write_submissions: Arc::new(AtomicU64::new(0)),
         })
     }
 
@@ -2135,6 +2133,13 @@ impl ScribeWalIoPool {
         #[cfg(test)]
         if matches!(&operation, ScribeWalIoOp::SyncWal { .. }) {
             self.sync_submissions.fetch_add(1, Ordering::AcqRel);
+        }
+        #[cfg(test)]
+        if matches!(
+            &operation,
+            ScribeWalIoOp::WriteIngressSlices { .. } | ScribeWalIoOp::WritePrepared { .. }
+        ) {
+            self.write_submissions.fetch_add(1, Ordering::AcqRel);
         }
         let permit = match self.permits.clone().try_acquire_owned() {
             Ok(permit) => permit,
@@ -2236,6 +2241,12 @@ impl ScribeWalIoPool {
     pub(crate) fn sync_submissions_for_test(&self) -> u64 {
         self.sync_submissions.load(Ordering::Acquire)
     }
+
+    /// Returns record write submissions observed at the production WAL lane boundary.
+    #[cfg(test)]
+    pub(crate) fn write_submissions_for_test(&self) -> u64 {
+        self.write_submissions.load(Ordering::Acquire)
+    }
 }
 
 /// Executes one detached WAL operation while retaining its admitted owners.
@@ -2249,17 +2260,23 @@ fn execute_wal_io(
     delay: std::time::Duration,
 ) -> Result<ScribeWalIoResult, ScribeError> {
     match operation {
-        ScribeWalIoOp::WriteIngressSlice {
+        ScribeWalIoOp::WriteIngressSlices {
             wal,
-            append,
+            appends,
             memory,
         } => {
-            let result = wal.append_prepared(append)?;
-            Ok(ScribeWalIoResult::IngressSliceWritten { result, memory })
+            let results = appends
+                .into_iter()
+                .map(|append| wal.append_prepared(append))
+                .collect::<Result<Vec<_>, _>>()?;
+            Ok(ScribeWalIoResult::IngressSlicesWritten { results, memory })
         }
-        ScribeWalIoOp::WritePrepared { wal, append } => {
-            let result = wal.append_prepared(append)?;
-            Ok(ScribeWalIoResult::WalWritten { result })
+        ScribeWalIoOp::WritePrepared { wal, appends } => {
+            let results = appends
+                .into_iter()
+                .map(|append| wal.append_prepared(append))
+                .collect::<Result<Vec<_>, _>>()?;
+            Ok(ScribeWalIoResult::WalWritten { results })
         }
         ScribeWalIoOp::SyncWal { wal, segments } => {
             if !delay.is_zero() {
@@ -2267,23 +2284,6 @@ fn execute_wal_io(
             }
             wal.sync_segments(&segments)?;
             Ok(ScribeWalIoResult::WalSynced)
-        }
-        ScribeWalIoOp::ReplaceManifest { path, contents } => {
-            replace_manifest(&path, &contents)?;
-            Ok(ScribeWalIoResult::Completed)
-        }
-        ScribeWalIoOp::AdvanceManifest {
-            path,
-            stream,
-            seal_key,
-            sealed_lsn,
-        } => {
-            let mut manifest = crate::scribe::manifest::read_manifest(&path)?
-                .unwrap_or_else(|| crate::scribe::manifest::Manifest::new(stream));
-            manifest.update_sealed_lsn(&seal_key, sealed_lsn);
-            let contents = manifest.serialize()?;
-            replace_manifest(&path, &contents)?;
-            Ok(ScribeWalIoResult::Completed)
         }
         ScribeWalIoOp::ReplayDirectoryStream {
             path,
@@ -2378,8 +2378,11 @@ fn execute_replay_directory_stream(
                 .map_err(|_| ScribeError::Internal {
                     detail: "replay owner dropped its completion response".to_owned(),
                 })??;
+            let recorded_shard = u8::try_from(shard).map_err(|_| ScribeError::Internal {
+                detail: "replay chunk recorded shard exceeds the WAL header width".to_owned(),
+            })?;
             for retirement in &outcome.retirements {
-                retirement_settlement.settle(retirement)?;
+                retirement_settlement.settle(retirement, recorded_shard)?;
             }
             restored = restored.saturating_add(state_count);
             Ok(crate::scribe::replay::ReplayChunkSettlement {
@@ -2416,8 +2419,11 @@ impl<'a> ReplayRetirementSettlement<'a> {
 
     /// Durably advances one replay watermark before releasing its generation references.
     ///
-    /// The replay reader pins its current segment independently, so releasing a
-    /// completed generation cannot unlink a segment that still has unread records.
+    /// The watermark lands in the manifest of `recorded_shard`, the lane whose
+    /// WAL segments held the replayed records, so it never covers another
+    /// lane's records. The replay reader pins its current segment
+    /// independently, so releasing a completed generation cannot unlink a
+    /// segment that still has unread records.
     ///
     /// # Errors
     ///
@@ -2425,19 +2431,21 @@ impl<'a> ReplayRetirementSettlement<'a> {
     fn settle(
         &mut self,
         retirement: &crate::scribe::shards::ReplayRetirement,
+        recorded_shard: u8,
     ) -> Result<(), ScribeError> {
         self.pending = self.pending.saturating_add(1);
         self.high_water = self.high_water.max(self.pending);
-        let manifest_path =
-            crate::scribe::replay::stream_directory(self.wal_dir, retirement.stream)
-                .join("manifest");
-        let result = (|| {
-            let mut manifest = crate::scribe::manifest::read_manifest(&manifest_path)?
-                .unwrap_or_else(|| crate::scribe::manifest::Manifest::new(retirement.stream));
-            manifest.update_sealed_lsn(&retirement.seal_key, retirement.sealed_lsn);
-            replace_manifest(&manifest_path, &manifest.serialize()?)?;
-            retirement.wal.retire_segments(&retirement.segments)
-        })();
+        let manifest_path = crate::scribe::replay::shard_manifest_path(
+            self.wal_dir,
+            retirement.stream,
+            recorded_shard,
+        );
+        let result = crate::scribe::manifest::advance(
+            &manifest_path,
+            retirement.stream,
+            [(retirement.seal_key.clone(), retirement.sealed_lsn)],
+        )
+        .and_then(|()| retirement.wal.retire_segments(&retirement.segments));
         self.pending = self.pending.saturating_sub(1);
         result
     }
@@ -2447,33 +2455,6 @@ impl<'a> ReplayRetirementSettlement<'a> {
     const fn high_water(&self) -> usize {
         self.high_water
     }
-}
-
-fn replace_manifest(path: &PathBuf, contents: &[u8]) -> Result<(), ScribeError> {
-    let temporary = path.with_extension("tmp");
-    std::fs::write(&temporary, contents).map_err(|error| ScribeError::Internal {
-        detail: format!("manifest write failed: {error}"),
-    })?;
-    let file = std::fs::File::open(&temporary).map_err(|error| ScribeError::Internal {
-        detail: format!("manifest reopen failed: {error}"),
-    })?;
-    file.sync_all().map_err(|error| ScribeError::Internal {
-        detail: format!("manifest sync failed: {error}"),
-    })?;
-    std::fs::rename(&temporary, path).map_err(|error| ScribeError::Internal {
-        detail: format!("manifest replace failed: {error}"),
-    })?;
-    if let Some(parent) = path.parent() {
-        let parent_file = std::fs::File::open(parent).map_err(|error| ScribeError::Internal {
-            detail: format!("manifest parent reopen failed: {error}"),
-        })?;
-        parent_file
-            .sync_all()
-            .map_err(|error| ScribeError::Internal {
-                detail: format!("manifest parent sync failed: {error}"),
-            })?;
-    }
-    Ok(())
 }
 
 #[cfg(test)]
@@ -2965,9 +2946,11 @@ mod tests {
             "cards:read".to_owned(),
             wyrd_spec::vala::api::AuditOutcome::Allowed,
         );
-        let rows =
-            crate::tables::audit::projection::project_audit_event(&event, chrono::Utc::now())
-                .expect("valid projection");
+        let rows = crate::tables::staged::StagedRow::project(&[
+            crate::tables::audit::projection::stage_audit_event(&event, chrono::Utc::now())
+                .expect("valid projection"),
+        ])
+        .expect("one row builds");
 
         let decoded = decode(
             ipc_payload(&rows),
@@ -3034,9 +3017,11 @@ mod tests {
             "cards:read".to_owned(),
             wyrd_spec::vala::api::AuditOutcome::Allowed,
         );
-        let projected =
-            crate::tables::audit::projection::project_audit_event(&event, chrono::Utc::now())
-                .expect("valid projection");
+        let projected = crate::tables::staged::StagedRow::project(&[
+            crate::tables::audit::projection::stage_audit_event(&event, chrono::Utc::now())
+                .expect("valid projection"),
+        ])
+        .expect("one row builds");
         let uid = || CardUid::new(Uuid::now_v7().to_string()).expect("card uid");
         let (subject, checkout, billing) = (uid(), uid(), uid());
         // Two rows, each naming its own workload and subject; every other
@@ -3634,21 +3619,21 @@ mod tests {
                 replayed: Box::new(replayed),
             })
             .await;
-        let manifest = tempfile::tempdir().expect("manifest directory");
+        let root = tempfile::tempdir().expect("WAL root");
+        let writer = crate::scribe::wal::WalWriter::new(
+            root.path(),
+            *crate::scribe::stream_identity::NodeId::generate().as_bytes(),
+            1,
+            crate::scribe::wal::WalConfig::default(),
+        )
+        .expect("WAL writer");
         wal_io
-            .submit(
-                crate::scribe::execution_lanes::ScribeWalIoOp::AdvanceManifest {
-                    path: manifest.path().join("manifest"),
-                    stream: StreamIdentity::new(
-                        crate::scribe::stream_identity::NodeId::generate(),
-                        crate::scribe::stream_identity::WriterEpoch::new(1),
-                    ),
-                    seal_key: idle_seal_key(),
-                    sealed_lsn: crate::scribe::wal::WalLsn::ZERO,
-                },
-            )
+            .submit(crate::scribe::execution_lanes::ScribeWalIoOp::SyncWal {
+                wal: writer.handle_for_shard(0).expect("WAL handle"),
+                segments: Vec::new(),
+            })
             .await
-            .expect("WAL manifest replacement");
+            .expect("WAL sync");
         ingress.drain().await;
         persistence.drain().await;
         wal_io.drain().await;
@@ -3677,12 +3662,13 @@ mod tests {
         )
         .expect("WAL writer");
         let wal = writer.handle_for_shard(0).expect("WAL handle");
-        let stream_dir = crate::scribe::replay::stream_directory(root.path(), stream);
-        std::fs::create_dir_all(&stream_dir).expect("stream directory");
+        let manifest_path = crate::scribe::replay::shard_manifest_path(root.path(), stream, 0);
+        let shard_dir = manifest_path.parent().expect("shard directory");
+        std::fs::create_dir_all(shard_dir).expect("shard directory");
         let seal_key = idle_seal_key();
         let mut settlement = ReplayRetirementSettlement::new(root.path());
         for index in 1_u64..=2 {
-            let path = stream_dir.join(format!("retirement-{index}.wal"));
+            let path = shard_dir.join(format!("retirement-{index}.wal"));
             std::fs::write(&path, index.to_le_bytes()).expect("retirement fixture");
             let segment = crate::scribe::wal::WalSegmentRef { path };
             wal.retain_segments(std::slice::from_ref(&segment))
@@ -3694,15 +3680,15 @@ mod tests {
                 seal_key: seal_key.clone(),
                 sealed_lsn: crate::scribe::wal::WalLsn::new(index),
             };
-            settlement.settle(&retirement).expect("settlement");
+            settlement.settle(&retirement, 0).expect("settlement");
             assert!(!segment.path.exists(), "settled segment retires");
             settlement
-                .settle(&retirement)
+                .settle(&retirement, 0)
                 .expect("settlement retry is idempotent");
         }
         assert_eq!(settlement.high_water(), 1);
         assert_eq!(
-            crate::scribe::manifest::read_manifest(stream_dir.join("manifest"))
+            crate::scribe::manifest::read_manifest(&manifest_path)
                 .expect("manifest read")
                 .expect("manifest")
                 .get_sealed_lsn(&seal_key),

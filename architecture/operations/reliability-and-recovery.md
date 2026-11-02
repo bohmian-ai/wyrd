@@ -47,11 +47,37 @@ At minimum, deployments measure:
 - Postgres saturation, replication health, migration state, transaction
   failures, and RLS/role verification;
 - object-store latency, throttling, integrity failure, and capacity; and
-- backup age, backup verification, restore duration, and recovery-point age.
+- backup age, backup verification, restore duration, and recovery-point age;
+  and
+- operator trace export: `wyrd_trace_export_failed_batches_total` and the
+  OpenTelemetry SDK's `BatchSpanProcessor.SpanDroppingStarted` warning.
 
 Tenant, table, query, object path, task, attempt, and principal identities do
 not become metric labels. They belong in redacted structured logs, traces, or
 audited diagnostic records.
+
+## Operator tracing
+
+Normal operation exports 1% of traces to `WYRD_OTLP_ENDPOINT` at
+`WYRD_TRACE_FILTER=info`, with logs at `WYRD_LOG=info`. The trace contract
+is [Trace context](../wyrd-design.md#trace-context--w3c-traceparent-and-tracestate).
+Tenant timelines do not depend on any of these settings, and no setting lets
+a client raise operator sampling.
+
+Alert on the first `BatchSpanProcessor.SpanDroppingStarted` warning from
+`opentelemetry_sdk`: the export queue is full and spans are being dropped
+until shutdown, when the SDK logs the lifetime `dropped_span_count`. The log
+filter must keep `opentelemetry_sdk` warnings, and an abrupt termination
+logs no total. Alert separately on a rising
+`wyrd_trace_export_failed_batches_total`: the backend is refusing or timing
+out export calls. It counts failed calls, not permanently lost spans.
+
+To investigate one request path in detail, restart one selected server
+instance with `WYRD_OTLP_SAMPLE_RATIO=1` and, for function-level spans,
+`WYRD_TRACE_FILTER=info,<crate>=debug`. Its CPU and export volume rise, so
+measurements taken there are diagnostic, not baselines. Restore the normal
+settings and restart the instance afterwards. Logs, traces, and diagnostic
+artifacts carry scrubbed fields only; never add secrets or payloads to them.
 
 ## Capacity and overload
 

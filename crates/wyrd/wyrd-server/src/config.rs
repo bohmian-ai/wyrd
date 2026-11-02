@@ -319,7 +319,8 @@ pub struct ScribeRuntimeConfig {
     /// Persistence CPU worker count for Parquet preparation and bounded replay work.
     #[serde(default = "default_scribe_persistence_cpu_threads")]
     pub persistence_cpu_threads: usize,
-    /// WAL IO worker count.
+    /// WAL IO worker count. Boot runs at least one worker per shard; see
+    /// [`Self::wal_io_workers`].
     #[serde(default = "default_scribe_wal_io_threads")]
     pub wal_io_threads: usize,
     /// Maximum encoded bytes accepted for one native or OTLP request.
@@ -333,6 +334,7 @@ pub struct ScribeRuntimeConfig {
     /// retrying, and in flight. Verifier calls that would take reservations
     /// past three quarters of it are refused with retryable pressure; past
     /// all of it, unreserved writes such as audit decisions are counted lost.
+    /// Default 1,048,576, so `outbox_bytes` is the bound that normally binds.
     #[serde(default = "default_outbox_capacity")]
     pub outbox_capacity: usize,
     /// Most accounted bytes this process's Scribe outbox admits at once,
@@ -344,9 +346,11 @@ pub struct ScribeRuntimeConfig {
     pub outbox_bytes: usize,
     /// Number of Scribe shards, each with its own WAL and memtable.
     ///
-    /// `WYRD_MEM_TABLE_BUCKET_NUM` overrides the file value. Default 1.
-    #[serde(default = "default_scribe_mem_table_bucket_num")]
-    pub mem_table_bucket_num: usize,
+    /// Each shard syncs its own WAL, so more shards mean more syncs per
+    /// acknowledged request. `WYRD_SCRIBE_SHARD_COUNT` overrides the file
+    /// value. Default 1.
+    #[serde(default = "default_scribe_shard_count")]
+    pub shard_count: usize,
     /// Megabytes one shard's WAL segment holds before the shard rotates.
     ///
     /// `WYRD_MAX_FILE_SIZE_ON_DISK` overrides the file value. Default 512. It
@@ -1335,6 +1339,9 @@ pub struct BifrostStorageIoConfig {
     /// Decoded Parquet metadata cache budget in bytes; zero disables it.
     #[serde(default)]
     pub metadata_cache_bytes: Option<u64>,
+    /// Parquet byte-range cache budget in bytes; zero disables it.
+    #[serde(default)]
+    pub data_cache_bytes: Option<u64>,
 }
 
 impl BifrostStorageIoConfig {
@@ -1351,6 +1358,7 @@ impl BifrostStorageIoConfig {
             max_retry_elapsed_ms: self.max_retry_elapsed_ms,
             max_concurrent_requests: self.max_concurrent_requests,
             metadata_cache_bytes: self.metadata_cache_bytes,
+            data_cache_bytes: self.data_cache_bytes,
         }
     }
 }
@@ -1478,8 +1486,8 @@ fn default_outbox_bytes() -> usize {
 /// Bytes in one megabyte of the megabyte-valued Scribe size settings.
 const SCRIBE_MEGABYTE: u64 = 1024 * 1024;
 
-/// Returns the default for [`ScribeRuntimeConfig::mem_table_bucket_num`].
-fn default_scribe_mem_table_bucket_num() -> usize {
+/// Returns the default for [`ScribeRuntimeConfig::shard_count`].
+fn default_scribe_shard_count() -> usize {
     vala_bifrost_redux::scribe::geometry::DEFAULT_SHARD_COUNT
 }
 
@@ -1518,7 +1526,7 @@ impl Default for ScribeRuntimeConfig {
             ingest_request_bytes: default_ingest_request_bytes(),
             outbox_capacity: default_outbox_capacity(),
             outbox_bytes: default_outbox_bytes(),
-            mem_table_bucket_num: default_scribe_mem_table_bucket_num(),
+            shard_count: default_scribe_shard_count(),
             max_file_size_on_disk: default_scribe_max_file_size_on_disk(),
             max_file_size_in_memory: default_scribe_max_file_size_in_memory(),
             max_file_retention_time: default_scribe_max_file_retention_time(),
@@ -1531,6 +1539,16 @@ impl Default for ScribeRuntimeConfig {
 }
 
 impl ScribeRuntimeConfig {
+    /// WAL IO workers boot starts: `wal_io_threads`, raised to one per shard.
+    ///
+    /// Each shard's group commit holds a worker for its blocking append and
+    /// `fdatasync`, so fewer workers than shards queue one shard's append
+    /// behind another shard's sync.
+    #[must_use]
+    pub fn wal_io_workers(&self) -> usize {
+        self.wal_io_threads.max(self.shard_count)
+    }
+
     /// Validate that every configured bound can provide bounded operation.
     ///
     /// # Errors
@@ -1552,8 +1570,8 @@ impl ScribeRuntimeConfig {
         }
         let rotation_values = [
             (
-                "mem_table_bucket_num",
-                u64::try_from(self.mem_table_bucket_num).unwrap_or(u64::MAX),
+                "shard_count",
+                u64::try_from(self.shard_count).unwrap_or(u64::MAX),
             ),
             ("max_file_size_on_disk", self.max_file_size_on_disk),
             ("max_file_size_in_memory", self.max_file_size_in_memory),
@@ -1650,7 +1668,7 @@ impl ScribeRuntimeConfig {
     ) -> Result<ScribeGeometry, ScribeGeometryError> {
         let on_disk_bytes = self.max_file_size_on_disk.saturating_mul(SCRIBE_MEGABYTE);
         ScribeGeometry::new(
-            self.mem_table_bucket_num,
+            self.shard_count,
             on_disk_bytes,
             self.max_file_size_in_memory.saturating_mul(SCRIBE_MEGABYTE),
             Duration::from_secs(self.max_file_retention_time),
@@ -1691,6 +1709,12 @@ pub struct MetricsConfig {
     /// stays on loopback rather than inheriting the (possibly public) HTTP IP.
     #[serde(default)]
     pub bind: Option<SocketAddr>,
+    /// Whether the metrics listener also serves the read-only benchmark
+    /// timing snapshot, `GET /benchmark/timings`, and the process records
+    /// benchmark timing histograms. Defaults to false; only a
+    /// benchmark-owned server enables it, and it requires a loopback bind.
+    #[serde(default)]
+    pub benchmark_snapshot: bool,
 }
 
 fn default_metrics_enabled() -> bool {
@@ -1702,6 +1726,7 @@ impl Default for MetricsConfig {
         Self {
             enabled: default_metrics_enabled(),
             bind: None,
+            benchmark_snapshot: false,
         }
     }
 }
@@ -3021,11 +3046,9 @@ impl WyrdServerConfig {
         )?
         .unwrap_or(self.bifrost.oracle.max_query_deadline_ms);
         let scribe = &mut self.bifrost.scribe;
-        scribe.mem_table_bucket_num = parse_optional_env(
-            "WYRD_MEM_TABLE_BUCKET_NUM",
-            Some(scribe.mem_table_bucket_num),
-        )?
-        .unwrap_or(scribe.mem_table_bucket_num);
+        scribe.shard_count =
+            parse_optional_env("WYRD_SCRIBE_SHARD_COUNT", Some(scribe.shard_count))?
+                .unwrap_or(scribe.shard_count);
         scribe.max_file_size_on_disk = parse_optional_env(
             "WYRD_MAX_FILE_SIZE_ON_DISK",
             Some(scribe.max_file_size_on_disk),
@@ -3223,6 +3246,11 @@ impl WyrdServerConfig {
             self.metrics.enabled = parse_flag(&val, "WYRD_METRICS_ENABLED")?;
         }
 
+        // metrics.benchmark_snapshot
+        if let Some(val) = env_opt("WYRD_METRICS_BENCHMARK_SNAPSHOT")? {
+            self.metrics.benchmark_snapshot = parse_flag(&val, "WYRD_METRICS_BENCHMARK_SNAPSHOT")?;
+        }
+
         // metrics.bind
         if let Some(val) = env_opt("WYRD_METRICS_BIND")? {
             self.metrics.bind =
@@ -3402,6 +3430,18 @@ impl WyrdServerConfig {
             }
         }
 
+        // 1c. The benchmark snapshot is served only on an enabled loopback
+        // metrics listener: it is an unauthenticated local readout.
+        if self.metrics.benchmark_snapshot
+            && (!self.metrics.enabled || self.metrics.is_public_bind(self.http.bind))
+        {
+            return Err(ConfigError::Invalid {
+                message: "metrics.benchmark_snapshot requires metrics.enabled and a loopback \
+                          metrics.bind"
+                    .to_owned(),
+            });
+        }
+
         // 2. pools.max_connections >= 2
         if self.pools.max_connections < 2 {
             return Err(ConfigError::Invalid {
@@ -3521,13 +3561,9 @@ impl WyrdServerConfig {
         }
 
         // 15. telemetry.sample_ratio, when set, must be in [0.0, 1.0].
-        if let Some(ratio) = self.telemetry.sample_ratio
-            && !(0.0..=1.0).contains(&ratio)
-        {
-            return Err(ConfigError::Invalid {
-                message: format!("telemetry.sample_ratio must be in [0.0, 1.0], got {ratio}"),
-            });
-        }
+        self.telemetry
+            .operator_sample_ratio()
+            .map_err(|message| ConfigError::Invalid { message })?;
 
         // 16. Each trusted_issuers entry must have non-empty required fields and
         //     coherent client_auth (secret present iff secret_basic/secret_post).
@@ -4188,14 +4224,14 @@ maintenance_interval_secs = 45
     fn file_target_environment_overrides_win_and_refuse_nonpositive_values() {
         let _guard = ENV_LOCK.lock().expect("environment test lock");
         let file = from_toml_str_with_dev_oracle_opt_in(
-            "[forge]\ntarget_file_size_bytes = 268435456\n\n[bifrost.scribe]\nmem_table_bucket_num = 2\nmax_file_size_on_disk = 128\nmax_file_size_in_memory = 64\nmax_file_retention_time = 30\n",
+            "[forge]\ntarget_file_size_bytes = 268435456\n\n[bifrost.scribe]\nshard_count = 2\nmax_file_size_on_disk = 128\nmax_file_size_in_memory = 64\nmax_file_retention_time = 30\n",
         )
         .expect("file targets parse");
         assert_eq!(file.forge.target_file_size_bytes, Some(268_435_456));
         let scribe = &file.bifrost.scribe;
         assert_eq!(
             (
-                scribe.mem_table_bucket_num,
+                scribe.shard_count,
                 scribe.max_file_size_on_disk,
                 scribe.max_file_size_in_memory,
                 scribe.max_file_retention_time,
@@ -4208,7 +4244,7 @@ maintenance_interval_secs = 45
                     "WYRD_BIFROST_FORGE_TARGET_FILE_SIZE_BYTES",
                     Some("2147483648"),
                 ),
-                ("WYRD_MEM_TABLE_BUCKET_NUM", Some("8")),
+                ("WYRD_SCRIBE_SHARD_COUNT", Some("8")),
                 ("WYRD_MAX_FILE_SIZE_ON_DISK", Some("256")),
                 ("WYRD_MAX_FILE_SIZE_IN_MEMORY", Some("32")),
                 ("WYRD_MAX_FILE_RETENTION_TIME", Some("60")),
@@ -4220,7 +4256,7 @@ maintenance_interval_secs = 45
                 let scribe = &config.bifrost.scribe;
                 assert_eq!(
                     (
-                        scribe.mem_table_bucket_num,
+                        scribe.shard_count,
                         scribe.max_file_size_on_disk,
                         scribe.max_file_size_in_memory,
                         scribe.max_file_retention_time,
@@ -4232,7 +4268,7 @@ maintenance_interval_secs = 45
         );
         for key in [
             "WYRD_BIFROST_FORGE_TARGET_FILE_SIZE_BYTES",
-            "WYRD_MEM_TABLE_BUCKET_NUM",
+            "WYRD_SCRIBE_SHARD_COUNT",
             "WYRD_MAX_FILE_SIZE_ON_DISK",
             "WYRD_MAX_FILE_SIZE_IN_MEMORY",
             "WYRD_MAX_FILE_RETENTION_TIME",
@@ -4950,7 +4986,7 @@ minimum_slots = 2
             cfg.ingest_request_bytes,
             vala_bifrost_redux::gate::limits::BIFROST_INGEST_REQUEST_LIMIT_BYTES
         );
-        assert_eq!(cfg.mem_table_bucket_num, 1);
+        assert_eq!(cfg.shard_count, 1);
         assert_eq!(cfg.max_file_size_on_disk, 512);
         assert_eq!(cfg.max_file_size_in_memory, 512);
         assert_eq!(cfg.max_file_retention_time, 600);
@@ -4995,7 +5031,7 @@ minimum_slots = 2
         );
 
         // Each setting moves only its own geometry field.
-        config.mem_table_bucket_num = 4;
+        config.shard_count = 4;
         config.max_file_size_in_memory = 64;
         let narrowed = config
             .scribe_geometry(1024 * MIB)
@@ -5011,6 +5047,19 @@ minimum_slots = 2
             .validate()
             .expect_err("an early seal above the shard memtable limit must be refused");
         assert!(error.contains("seal_key_early_seal_bytes"), "{error}");
+    }
+
+    /// Boot runs one WAL IO worker per shard when the configured count is lower.
+    #[test]
+    fn wal_io_workers_cover_every_shard() {
+        let mut config = ScribeRuntimeConfig {
+            wal_io_threads: 4,
+            shard_count: 16,
+            ..ScribeRuntimeConfig::default()
+        };
+        assert_eq!(config.wal_io_workers(), 16);
+        config.shard_count = 1;
+        assert_eq!(config.wal_io_workers(), 4);
     }
 
     /// Rejects every independently configurable Scribe bound before boot.
@@ -5035,7 +5084,7 @@ minimum_slots = 2
         assert_rejected!(ingress_cpu_threads, 0);
         assert_rejected!(persistence_cpu_threads, 0);
         assert_rejected!(wal_io_threads, 0);
-        assert_rejected!(mem_table_bucket_num, 0);
+        assert_rejected!(shard_count, 0);
         assert_rejected!(max_file_size_on_disk, 0);
         assert_rejected!(max_file_size_in_memory, 0);
         assert_rejected!(max_file_retention_time, 0);
@@ -5827,6 +5876,7 @@ minimum_slots = 2
         let explicit_public = MetricsConfig {
             enabled: true,
             bind: Some("0.0.0.0:9000".parse().unwrap()),
+            benchmark_snapshot: false,
         };
         assert!(
             explicit_public.is_public_bind(http_bind),
@@ -5852,6 +5902,38 @@ minimum_slots = 2
             matches!(err, ConfigError::BindCollision { .. }),
             "expected BindCollision, got {err:?}"
         );
+    }
+
+    // ── 40b. Benchmark snapshot requires a loopback metrics listener ────────
+
+    /// The benchmark snapshot is refused on an exposed or disabled metrics
+    /// listener and accepted on a loopback one.
+    ///
+    /// # Panics
+    ///
+    /// Panics when a configuration does not parse, or validation accepts an
+    /// exposed or absent listener or refuses a loopback one.
+    #[test]
+    fn benchmark_snapshot_requires_a_loopback_metrics_listener() {
+        for toml in [
+            "[metrics]\nbenchmark_snapshot = true\nbind = \"0.0.0.0:9000\"",
+            "[metrics]\nbenchmark_snapshot = true\nenabled = false",
+        ] {
+            let cfg = from_toml_str_with_dev_oracle_opt_in(toml).expect("parses ok");
+            let err = cfg
+                .validate()
+                .expect_err("an exposed or absent snapshot listener must fail");
+            assert!(
+                err.to_string().contains("benchmark_snapshot"),
+                "expected the snapshot refusal, got {err:?}"
+            );
+        }
+        let cfg = from_toml_str_with_dev_oracle_opt_in(
+            "[metrics]\nbenchmark_snapshot = true\nbind = \"127.0.0.1:9000\"",
+        )
+        .expect("parses ok");
+        cfg.validate()
+            .expect("a loopback snapshot listener is valid");
     }
 
     // ── 41. ServeMode truth table ─────────────────────────────────────────────

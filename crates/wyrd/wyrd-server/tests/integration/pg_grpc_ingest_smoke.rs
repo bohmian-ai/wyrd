@@ -28,7 +28,6 @@ use vala_bifrost_redux::scribe::{replay::replay_wal_directory, tail_rpc::TonicTa
 use vala_bifrost_redux::tables::{DomainTable, verification::ResultsTable};
 use vala_sql::TenantConn;
 use wyrd_auth_verify::TokenPrincipalRef;
-use wyrd_queue::variant::{EncodedVariant, VariantColumnBuilder};
 use wyrd_runtime::{
     BifrostPermissionScope, BifrostTableScope, PermissionScope, PermissionSet, Principal,
     PrincipalId, PrincipalKind, RoleRef,
@@ -867,7 +866,7 @@ async fn scribe_tail_listing_trusts_the_peer_and_scopes_to_the_table() {
 ///
 /// Carries every authored column of the built-in result table, taken from
 /// [`ResultsTable::arrow_fields`] so the row tracks the canonical declaration:
-/// a completed passing result with an empty outcome, every optional column
+/// a completed passing result, every optional column
 /// null, and `subject_card_uid` in the correlation column.
 ///
 /// # Panics
@@ -890,12 +889,6 @@ fn verification_result_ipc(subject_card_uid: &str) -> Vec<u8> {
                 TimestampMicrosecondArray::from(vec![now]).with_data_type(data_type.clone()),
             ),
             ("subject_card_uid", _) => Arc::new(StringArray::from(vec![subject_card_uid])),
-            ("outcome", _) => {
-                VariantColumnBuilder::encode("outcome", [Some(serde_json::json!({}))], |value| {
-                    EncodedVariant::from_json(&value)
-                })
-                .expect("empty outcome encodes")
-            }
             (_, data_type) => arrow::array::new_null_array(data_type, 1),
         })
         .collect();
@@ -1066,8 +1059,7 @@ impl ResultTableHarness {
     /// # Panics
     ///
     /// Panics when the retained decisions differ from `expected` or the
-    /// acknowledged WAL replays any `results`, `result_features`, or
-    /// `result_items` record.
+    /// acknowledged WAL replays any `results` or `execution_outputs` record.
     async fn assert_only_denials_and_no_durable_result(
         &self,
         expected: Vec<(String, String, String)>,
@@ -1082,8 +1074,7 @@ impl ResultTableHarness {
         let durable_results = replayed
             .values()
             .filter(|stream| {
-                ["results", "result_features", "result_items"]
-                    .contains(&stream.seal_key.table.name.as_str())
+                ["results", "execution_outputs"].contains(&stream.seal_key.table.name.as_str())
             })
             .map(|stream| stream.data_records.len())
             .sum::<usize>();
@@ -1170,7 +1161,7 @@ async fn public_result_writes_are_refused_over_grpc() {
     let mut expected = Vec::new();
     for table in [
         "bifrost.verification.results",
-        "bifrost.drift.result_features",
+        "bifrost.verification.execution_outputs",
     ] {
         for (kind, jwt) in &writers {
             let refused = insert_as(

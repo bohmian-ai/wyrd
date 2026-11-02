@@ -4,7 +4,7 @@ use std::time::Duration;
 
 use crate::storage::error::BifrostStorageError;
 
-/// One mebibyte, for the metadata-cache bounds below.
+/// One mebibyte, for the Oracle cache bounds below.
 const MIB: u64 = 1024 * 1024;
 
 /// The configured, still-unvalidated storage-I/O scalars.
@@ -29,11 +29,14 @@ pub struct BifrostStorageConfig {
     /// which for an Oracle-serving node is a share of managed memory and for
     /// every other node is nothing at all.
     pub metadata_cache_bytes: Option<u64>,
+    /// Charged-byte ceiling for cached Parquet byte ranges, resolved exactly
+    /// as `metadata_cache_bytes` is.
+    pub data_cache_bytes: Option<u64>,
 }
 
 /// One storage policy, immutable for the owner's lifetime.
 ///
-/// `Copy` rather than `Arc`-shared: it is five scalars, it never changes after
+/// `Copy` rather than `Arc`-shared: it is six scalars, it never changes after
 /// boot, and every read path wants it without an indirection.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct BifrostStoragePolicy {
@@ -47,6 +50,8 @@ pub struct BifrostStoragePolicy {
     max_concurrent_requests: usize,
     /// Charged-byte ceiling for decoded metadata; zero disables retention.
     metadata_cache_bytes: u64,
+    /// Charged-byte ceiling for cached Parquet byte ranges; zero disables it.
+    data_cache_bytes: u64,
 }
 
 impl BifrostStoragePolicy {
@@ -104,48 +109,59 @@ impl BifrostStoragePolicy {
                 "storage request concurrency must be between 1 and 1024",
             ));
         }
-        let metadata_cache_bytes =
-            Self::resolve_cache_bytes(config.metadata_cache_bytes, managed_bytes, serves_oracle)?;
+        let metadata_cache_bytes = Self::resolve_cache_bytes(
+            "decoded-metadata cache",
+            config.metadata_cache_bytes,
+            managed_bytes,
+            serves_oracle,
+        )?;
+        let data_cache_bytes = Self::resolve_cache_bytes(
+            "byte-range cache",
+            config.data_cache_bytes,
+            managed_bytes,
+            serves_oracle,
+        )?;
         Ok(Self {
             request_timeout: Duration::from_millis(request_timeout_ms),
             max_retries,
             max_retry_elapsed: Duration::from_millis(max_retry_elapsed_ms),
             max_concurrent_requests,
             metadata_cache_bytes,
+            data_cache_bytes,
         })
     }
 
-    /// Resolves the decoded-metadata ceiling against managed memory.
+    /// Resolves one Oracle cache's ceiling, named `cache` in refusals, against
+    /// managed memory.
     ///
     /// The one-eighth share is the hard rule in both directions: it caps what
     /// an operator may ask for and what an absent value derives to, so no
-    /// configuration produces a node whose footers can crowd out its queries.
+    /// configuration produces a node whose cache can crowd out its queries.
     ///
     /// # Errors
     /// Returns [`BifrostStorageError::InvalidConfiguration`] when a requested
     /// ceiling is outside 1 MiB..=1 GiB, exceeds the managed-memory share, or
     /// when an Oracle node's managed memory cannot fund the minimum cache.
     fn resolve_cache_bytes(
+        cache: &str,
         requested: Option<u64>,
         managed_bytes: u64,
         serves_oracle: bool,
     ) -> Result<u64, BifrostStorageError> {
-        let invalid = |detail: &str| BifrostStorageError::InvalidConfiguration {
-            detail: detail.to_owned(),
-        };
+        let invalid = |detail: String| BifrostStorageError::InvalidConfiguration { detail };
         let share = managed_bytes / 8;
         match requested {
             Some(0) => Ok(0),
             Some(bytes) => {
                 if !(MIB..=1024 * MIB).contains(&bytes) {
-                    return Err(invalid(
-                        "decoded-metadata cache must be between 1MiB and 1GiB, or zero",
-                    ));
+                    return Err(invalid(format!(
+                        "{cache} must be between 1MiB and 1GiB, or zero"
+                    )));
                 }
                 if bytes > share {
-                    return Err(invalid(
-                        "decoded-metadata cache must not exceed an eighth of managed memory",
-                    ));
+                    return Err(invalid(format!(
+                        "{cache} must not exceed an eighth of managed memory"
+                    )));
                 }
                 Ok(bytes)
             }
@@ -153,9 +169,9 @@ impl BifrostStoragePolicy {
             None => {
                 let derived = (managed_bytes / 20).clamp(32 * MIB, 512 * MIB).min(share);
                 if derived < MIB {
-                    return Err(invalid(
-                        "managed memory cannot fund an Oracle decoded-metadata cache",
-                    ));
+                    return Err(invalid(format!(
+                        "managed memory cannot fund an Oracle {cache}"
+                    )));
                 }
                 Ok(derived)
             }
@@ -193,6 +209,15 @@ impl BifrostStoragePolicy {
     #[must_use]
     pub const fn metadata_cache_bytes(self) -> u64 {
         self.metadata_cache_bytes
+    }
+
+    /// Returns the charged-byte ceiling for cached Parquet byte ranges.
+    ///
+    /// Zero is the explicit disabled composition: the owner constructs no
+    /// range cache and every scan reads the store.
+    #[must_use]
+    pub const fn data_cache_bytes(self) -> u64 {
+        self.data_cache_bytes
     }
 }
 
@@ -232,6 +257,7 @@ mod tests {
         // A twentieth of 8GiB is 409MiB, inside the 32MiB..=512MiB band and
         // well under the one-eighth share.
         assert_eq!(defaults.metadata_cache_bytes(), managed / 20);
+        assert_eq!(defaults.data_cache_bytes(), managed / 20);
 
         let huge =
             BifrostStoragePolicy::resolve(BifrostStorageConfig::default(), 512 * 1024 * MIB, true)
@@ -265,6 +291,10 @@ mod tests {
             // Inside the absolute band, but more than an eighth of a 4MiB node.
             BifrostStorageConfig {
                 metadata_cache_bytes: Some(4 * MIB),
+                ..BifrostStorageConfig::default()
+            },
+            BifrostStorageConfig {
+                data_cache_bytes: Some(MIB - 1),
                 ..BifrostStorageConfig::default()
             },
             BifrostStorageConfig {

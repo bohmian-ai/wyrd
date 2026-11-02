@@ -4,6 +4,5 @@
 //! operations are isolated under [`admin`] and take an admin [`sqlx::PgPool`].
 
 pub mod admin;
-pub mod artifact_metadata;
 pub mod idempotency;
 pub mod multipart_uploads;

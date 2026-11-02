@@ -11,7 +11,7 @@ use std::collections::HashSet;
 use std::io::Cursor;
 use std::str::FromStr;
 
-use arrow::array::{Array, StringArray};
+use arrow::array::{Array, AsArray as _, RecordBatch, StringArray};
 use arrow::ipc::reader::StreamReader;
 use wyrd_runtime::Principal;
 use wyrd_runtime::principal::CardAttribution;
@@ -134,15 +134,51 @@ impl CardRegistry {
         tenant: DataTenantId,
         ipc: &[u8],
     ) -> Result<FrameDimensions, IngestError> {
-        let uids = native_uids(ipc, WORKLOAD_CARD_UID);
+        self.carried_dimensions(
+            tenant,
+            native_uids(ipc, WORKLOAD_CARD_UID),
+            native_card_uids(ipc),
+        )
+        .await
+    }
+
+    /// [`Self::row_dimensions`] of one trusted row-attributed frame the
+    /// server built in process, read from its `rows` without encoding them.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`IngestError::Internal`] when the tenant registry cannot be
+    /// read.
+    pub async fn batch_row_dimensions(
+        &self,
+        tenant: DataTenantId,
+        rows: &RecordBatch,
+    ) -> Result<FrameDimensions, IngestError> {
+        self.carried_dimensions(
+            tenant,
+            batch_uids(rows, WORKLOAD_CARD_UID),
+            batch_card_uids(rows),
+        )
+        .await
+    }
+
+    /// Describes the `workloads` and `subjects` a row-attributed frame
+    /// carries, each row keeping its own carried environment.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`IngestError::Internal`] when the tenant registry cannot be
+    /// read.
+    async fn carried_dimensions(
+        &self,
+        tenant: DataTenantId,
+        workloads: Vec<CardUid>,
+        subjects: Vec<CardUid>,
+    ) -> Result<FrameDimensions, IngestError> {
         Ok(FrameDimensions {
             environment: None,
             cards: self
-                .described(
-                    tenant,
-                    uids.iter().chain(&native_card_uids(ipc)),
-                    Lookup::Retained,
-                )
+                .described(tenant, workloads.iter().chain(&subjects), Lookup::Retained)
                 .await?,
         })
     }
@@ -311,6 +347,20 @@ pub fn native_card_uids(ipc: &[u8]) -> Vec<CardUid> {
     native_uids(ipc, SUBJECT_CARD_UID)
 }
 
+/// [`native_card_uids`] of one in-process batch, read from `rows`.
+#[must_use]
+pub fn batch_card_uids(rows: &RecordBatch) -> Vec<CardUid> {
+    batch_uids(rows, SUBJECT_CARD_UID)
+}
+
+/// Collects the distinct parseable UIDs of `rows`' text `column`; none when
+/// the batch lacks it or it is not UTF-8.
+fn batch_uids(rows: &RecordBatch, column: &str) -> Vec<CardUid> {
+    rows.column_by_name(column)
+        .and_then(|values| values.as_string_opt::<i32>())
+        .map_or_else(Vec::new, |values| parse_distinct(values.iter().flatten()))
+}
+
 /// Collects the distinct parseable UIDs of a native frame's `column`,
 /// projecting only that column out of the stream.
 fn native_uids(ipc: &[u8], column: &str) -> Vec<CardUid> {
@@ -473,5 +523,23 @@ mod tests {
         assert_eq!(collected, vec![CardUid::from_str(model).expect("parses")]);
         assert!(native_card_uids(&frame(None)).is_empty());
         assert!(native_card_uids(b"not arrow").is_empty());
+    }
+
+    /// An in-process batch yields exactly the UIDs its encoded stream does.
+    ///
+    /// # Panics
+    /// Panics when the batch and stream collections differ.
+    #[test]
+    fn batch_card_uids_match_the_encoded_stream() {
+        let model = "01890f28-7c4a-7cc3-98e7-4f4a3c2d1b01";
+        for cards in [Some(vec![Some(model), None, Some(model), Some("x")]), None] {
+            let ipc = frame(cards);
+            let rows = StreamReader::try_new(Cursor::new(&ipc), None)
+                .expect("stream opens")
+                .next()
+                .expect("one batch")
+                .expect("batch decodes");
+            assert_eq!(batch_card_uids(&rows), native_card_uids(&ipc));
+        }
     }
 }

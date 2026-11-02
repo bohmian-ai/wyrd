@@ -20,7 +20,7 @@ const UNMATCHED_PATH: &str = "__unmatched__";
 /// at arrival and accounts for the middleware and body decode before the
 /// handler too.
 #[derive(Debug, Clone, Copy)]
-pub struct RequestArrival(Instant);
+pub struct RequestArrival(pub(crate) Instant);
 
 impl RequestArrival {
     /// The arrival instant.

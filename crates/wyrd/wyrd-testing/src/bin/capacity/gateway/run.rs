@@ -1,36 +1,41 @@
-//! The closed-loop overhead steps, and what every gateway window measures.
+//! Gateway L1 `overhead`: closed-loop calls through the real server, and
+//! what every gateway window measures.
 //!
-//! Every overhead step is one [`Bench::run`]: N closed-loop clients, each on
-//! its own keep-alive connection and key, sending the next call as soon as
-//! the last one is validated, for [`WINDOW`] after [`WARMUP`]. The warmup is
-//! settled before the baseline scrape, the traffic window closes when the
-//! last client stops, and a separate drain interval then waits for every
-//! in-flight call, capture, and outbox write before the final correctness
-//! scrape, so neither warmup work nor post-answer work is misattributed.
-//! Each step is profiled at [`PROFILE_HERTZ`] unless profiling is off.
+//! Every repetition of a step is N closed-loop clients, each on its own
+//! keep-alive connection and key, sending the next call as soon as the last
+//! one is validated, for the window the lifecycle asks, each labelled with
+//! its case and phase. Work, seconds, and CPU stop at the window's end;
+//! calls then in flight drain into the cohort and count late, and a
+//! separate drain then waits for every capture and outbox write before the
+//! final correctness scrape, so neither warmup work nor post-answer work is
+//! misattributed. The
+//! server's per-call timings land in its benchmark histograms, read as a
+//! [`Population`] between two snapshots; overhead is each call's elapsed
+//! time less the union of its own provider waits, before any percentile. The warmup runs the same calls
+//! and is discarded; each repetition starts from the settled server the
+//! previous one left.
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
+use wyrd_testing::release_server::PEAK_SAMPLE_INTERVAL_MS;
 
+use async_trait::async_trait;
 use tokio::task::JoinSet;
-use wyrd_testing::capacity::{HistogramKey, Readings, Selection, Telemetry, Usage, Window};
-use wyrd_testing::profile::{Capture, Profile};
+use wyrd_client::transport::trace::with_benchmark_labels;
+use wyrd_testing::capacity::{
+    Expected, NANOS_PER_MS, Population, Selection, Usage, Window, release_binary,
+};
+use wyrd_testing::experiment::{ExperimentError, Phase, Reading, Repetition, Step, Workload};
+use wyrd_testing::gateway_capture::{PacedUpstream, Pacing};
 use wyrd_testing::release_server::{LocalServer, Metrics};
 
-use crate::gateway::Result;
-use crate::gateway::workload::{Outcome, Shape, Tenant, Timed, call, http};
-
-/// Untimed load before each window, so connections, key exchanges, and
-/// first-use caches are not measured.
-pub const WARMUP: Duration = Duration::from_secs(2);
-
-/// Measured traffic window of each overhead step.
-pub const WINDOW: Duration = Duration::from_secs(10);
-
-/// Sampling frequency of every profiled window, hertz.
-pub const PROFILE_HERTZ: u32 = 999;
+use crate::gateway::workload::{
+    CapturePolicy, Outcome, PREFIXES, Shape, Tenant, Timed, call, http,
+};
+use crate::gateway::{
+    CLIENTS, Case, LARGE_BYTES, PROCESS, Result, SMALL_BYTES, STREAM_CHUNKS, shutdown,
+};
 
 /// How long in-flight calls, captures, and outbox writes may take to settle
 /// once arrivals stop.
@@ -39,108 +44,29 @@ pub const DRAIN_LIMIT: Duration = Duration::from_secs(60);
 /// How often a drain reads `/metrics` again.
 const POLL: Duration = Duration::from_millis(100);
 
-/// The call's server duration, arrival to a handoff point.
-pub const DURATION: &str = "wyrd_gateway_duration_seconds";
+/// The server timing of a buffered call: arrival until its answer handoff.
+pub const BUFFERED: &str = "gateway.buffered";
 
-/// The server duration less the provider exchange time it waited on.
-pub const OVERHEAD: &str = "wyrd_gateway_overhead_seconds";
+/// The server timing of a stream's head: arrival until it is handed to the
+/// response body.
+pub const STREAM_HEAD: &str = "gateway.stream.head";
 
-/// The provider exchange time a call waited on until a point.
-pub const UPSTREAM: &str = "wyrd_gateway_upstream_seconds";
+/// The server timing of a stream's end: arrival until its consumer took the
+/// final frame.
+pub const STREAM_END: &str = "gateway.stream.end";
 
-/// Series filter of the benchmarked operation.
-const CHAT: &str = "operation=\"chat_completions\"";
+/// The outcome of every judged gateway timing.
+pub const SUCCEEDED: &str = "succeeded";
 
-/// Series filter of a buffered call.
-const BUFFERED: &str = "stream=\"false\"";
-
-/// Series filter of a streamed call.
-const STREAMED: &str = "stream=\"true\"";
-
-/// Series filter of a successful call.
-const SUCCEEDED: &str = "outcome=\"succeeded\"";
-
-/// One server handoff point a step judges: its overhead, total duration,
-/// and upstream wait histograms.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct Point {
-    /// How the report names it.
-    pub name: &'static str,
-    /// Overhead histogram key.
-    pub overhead: HistogramKey,
-    /// Server duration histogram key.
-    pub duration: HistogramKey,
-    /// Upstream wait histogram key.
-    pub upstream: HistogramKey,
+/// The server timings each call records, its answer handoff first.
+#[must_use]
+pub const fn boundaries(stream: bool) -> &'static [&'static str] {
+    if stream {
+        &[STREAM_HEAD, STREAM_END]
+    } else {
+        &[BUFFERED]
+    }
 }
-
-/// A buffered call's answer handoff.
-pub const BUFFERED_ANSWER: Point = Point {
-    name: "answer",
-    overhead: (OVERHEAD, &[CHAT, BUFFERED, "point=\"answer\"", SUCCEEDED]),
-    duration: (DURATION, &[CHAT, BUFFERED, "point=\"answer\"", SUCCEEDED]),
-    upstream: (UPSTREAM, &[CHAT, BUFFERED, "point=\"end\""]),
-};
-
-/// A stream's head handoff.
-pub const STREAM_ANSWER: Point = Point {
-    name: "stream answer",
-    overhead: (OVERHEAD, &[CHAT, STREAMED, "point=\"answer\"", SUCCEEDED]),
-    duration: (DURATION, &[CHAT, STREAMED, "point=\"answer\"", SUCCEEDED]),
-    upstream: (UPSTREAM, &[CHAT, STREAMED, "point=\"headers\""]),
-};
-
-/// A stream's final frame handoff.
-pub const STREAM_END: Point = Point {
-    name: "stream end",
-    overhead: (OVERHEAD, &[CHAT, STREAMED, "point=\"end\"", SUCCEEDED]),
-    duration: (DURATION, &[CHAT, STREAMED, "point=\"end\"", SUCCEEDED]),
-    upstream: (UPSTREAM, &[CHAT, STREAMED, "point=\"end\""]),
-};
-
-/// Every histogram a gateway window differences whole.
-const HISTOGRAMS: [HistogramKey; 9] = [
-    BUFFERED_ANSWER.overhead,
-    BUFFERED_ANSWER.duration,
-    BUFFERED_ANSWER.upstream,
-    STREAM_ANSWER.overhead,
-    STREAM_ANSWER.duration,
-    STREAM_ANSWER.upstream,
-    STREAM_END.overhead,
-    STREAM_END.duration,
-    STREAM_END.upstream,
-];
-
-/// The gateway's component histograms a window differences, each with the
-/// label naming its components: request-path phases, overhead and duration
-/// by point, the provider wait, the whole request, each attempt, first byte,
-/// queue delay, each outbox's writes, the Scribe acknowledgement and WAL,
-/// and the app-pool connection wait.
-const BREAKDOWN: [(&str, &str); 13] = [
-    ("wyrd_gateway_phase_duration_seconds", "phase"),
-    (OVERHEAD, "point"),
-    (DURATION, "point"),
-    (UPSTREAM, "point"),
-    ("wyrd_gateway_request_duration_seconds", "outcome"),
-    ("wyrd_gateway_attempt_duration_seconds", "outcome"),
-    ("wyrd_gateway_time_to_first_byte_seconds", "operation"),
-    ("wyrd_gateway_queue_delay_seconds", "operation"),
-    ("outbox_write_seconds", "outbox"),
-    ("bifrost_scribe_ack_seconds", ""),
-    ("bifrost_scribe_wal_append_seconds", "outcome"),
-    ("bifrost_scribe_wal_fsync_seconds", "outcome"),
-    ("wyrd_postgres_pool_acquire_seconds", "outcome"),
-];
-
-/// Everything a gateway window reads from `/metrics`.
-pub const SELECTION: Selection = Selection {
-    histograms: &HISTOGRAMS,
-    breakdown: &BREAKDOWN,
-    prefix: "wyrd_gateway_",
-};
-
-/// Component rows printed per window, largest total first.
-const PARETO_ROWS: usize = 25;
 
 /// Client samples of one window, microseconds from just before each send.
 #[derive(Debug, Default, Clone)]
@@ -149,24 +75,25 @@ pub struct Samples {
     pub arrivals: u64,
     /// Validated answers: until the complete answer (a stream's EOF).
     pub completion_us: Vec<u64>,
-    /// Validated streams: until the response headers.
-    pub headers_us: Vec<u64>,
     /// Validated streams: until the first complete data event.
     pub first_event_us: Vec<u64>,
     /// Calls that did not end validated, by outcome.
     pub errors: BTreeMap<String, u64>,
+    /// Validated answers that ended at or after the admission stop; still
+    /// in `completion_us`.
+    pub late: u64,
 }
 
 impl Samples {
-    /// Records one call.
-    pub fn record(&mut self, timed: &Timed) {
+    /// Records one call, late when it was validated at or after `stop`.
+    pub fn record(&mut self, timed: &Timed, stop: Option<Instant>) {
         self.arrivals += 1;
         let since = |at: Instant| micros(at.saturating_duration_since(timed.sent));
         match &timed.outcome {
             Outcome::Answered => {
                 self.completion_us.push(since(timed.done));
-                if let (Some(headers), Some(first)) = (timed.headers, timed.events.first()) {
-                    self.headers_us.push(since(headers));
+                self.late += u64::from(stop.is_some_and(|stop| timed.done >= stop));
+                if let Some(first) = timed.events.first() {
                     self.first_event_us.push(since(*first));
                 }
             }
@@ -177,8 +104,8 @@ impl Samples {
     /// Folds another client's samples into these.
     fn merge(&mut self, other: Self) {
         self.arrivals += other.arrivals;
+        self.late += other.late;
         self.completion_us.extend(other.completion_us);
-        self.headers_us.extend(other.headers_us);
         self.first_event_us.extend(other.first_event_us);
         for (key, count) in other.errors {
             *self.errors.entry(key).or_default() += count;
@@ -186,6 +113,7 @@ impl Samples {
     }
 
     /// Calls that did not end validated.
+    #[must_use]
     pub fn error_count(&self) -> u64 {
         self.errors.values().sum()
     }
@@ -193,6 +121,7 @@ impl Samples {
 
 /// The bounded error key of a call outcome: the refusal code, `timed_out`,
 /// or the failure's class before any detail.
+#[must_use]
 pub fn outcome_key(outcome: &Outcome) -> String {
     match outcome {
         Outcome::Answered => "answered".to_owned(),
@@ -202,7 +131,7 @@ pub fn outcome_key(outcome: &Outcome) -> String {
     }
 }
 
-/// Integrity counters between a step's baseline and its final scrape.
+/// Integrity counters between two scrapes.
 #[derive(Debug, Clone, Copy, Default, PartialEq)]
 pub struct Integrity {
     /// Events every outbox counted lost, for every reason.
@@ -223,14 +152,14 @@ pub struct Integrity {
 
 impl Integrity {
     /// The integrity counters `after` added to `before`.
+    #[must_use]
     pub fn between(before: &Metrics, after: &Metrics) -> Self {
         let delta =
             |family: &str, labels: &[&str]| after.sum(family, labels) - before.sum(family, labels);
-        let captures = |metrics: &Metrics| metrics.sum("wyrd_gateway_capture_total", &[]);
         let staged = delta("wyrd_gateway_capture_total", &["outcome=\"staged\""]);
+        let total = delta("wyrd_gateway_capture_total", &[]);
         let lost = delta("outbox_events_lost_total", &[]);
         let shed = delta("outbox_events_lost_total", &["reason=\"shed\""]);
-        let total = captures(after) - captures(before);
         let written = delta("outbox_write_seconds_count", &["outbox=\"scribe\""]);
         let written_items = delta("outbox_items_written_total", &["outbox=\"scribe\""]);
         let counters = [lost, shed, staged, total, written, written_items];
@@ -246,20 +175,16 @@ impl Integrity {
         }
     }
 
-    /// These counters with shed items forgiven: `lost` keeps only loss for
-    /// another reason, for a window where shedding at the outbox limit is
-    /// reported rather than judged.
-    pub fn without_shed(&self) -> Self {
-        Self {
-            lost: self.lost - self.shed,
-            shed: 0.0,
-            ..*self
-        }
+    /// Items lost for any reason but accounted shedding.
+    #[must_use]
+    pub fn unshed_loss(&self) -> f64 {
+        self.lost - self.shed
     }
 
     /// The fraction of items handed to the outbox that were shed: shed
     /// items over written and lost ones, or zero when nothing was handed
     /// over.
+    #[must_use]
     pub fn shed_fraction(&self) -> f64 {
         let handed = self.written_items + self.lost;
         if handed > 0.0 {
@@ -268,10 +193,29 @@ impl Integrity {
             0.0
         }
     }
+
+    /// Why these counters cannot prove capture staged work and the Scribe
+    /// writer ran for it, or `None` when they can; every case captures, so
+    /// a window that staged nothing measured no capture.
+    #[must_use]
+    pub fn unwritten(&self) -> Option<String> {
+        if self.reset {
+            None
+        } else if self.staged <= 0.0 {
+            Some("no capture was staged in the window".to_owned())
+        } else {
+            (self.written <= 0.0).then(|| {
+                format!(
+                    "{} captures were staged but no Scribe outbox write completed",
+                    self.staged
+                )
+            })
+        }
+    }
 }
 
 /// Items and accounted bytes the Scribe outbox wrote during a traffic
-/// window, the durable capture throughput a saturated row reports.
+/// window.
 #[derive(Debug, Clone, Copy, Default, PartialEq)]
 pub struct Durable {
     /// Items written.
@@ -282,6 +226,7 @@ pub struct Durable {
 
 impl Durable {
     /// What the Scribe outbox wrote between `before` and `after`.
+    #[must_use]
     pub fn between(before: &Metrics, after: &Metrics) -> Self {
         let delta = |family: &str| {
             after.sum(family, &["outbox=\"scribe\""]) - before.sum(family, &["outbox=\"scribe\""])
@@ -293,309 +238,625 @@ impl Durable {
     }
 }
 
-/// What one overhead step measured.
-#[derive(Debug, Default, Clone)]
-pub struct Step {
-    /// Step name.
-    pub name: String,
-    /// Concurrent clients.
-    pub clients: usize,
-    /// Whether its calls stream.
-    pub stream: bool,
-    /// Client samples.
-    pub samples: Samples,
-    /// Server and driver usage over the traffic window alone.
-    pub traffic: Usage,
-    /// Seconds the drain took, or `None` when it did not settle within
-    /// [`DRAIN_LIMIT`].
-    pub drain: Option<f64>,
-    /// Server and driver usage over the drain alone.
-    pub drained: Usage,
-    /// Selected telemetry from the baseline to the final scrape.
-    pub telemetry: Telemetry,
-    /// Integrity counters from the baseline to the final scrape.
-    pub integrity: Integrity,
-    /// What the Scribe outbox wrote during the traffic window alone.
-    pub durable: Durable,
-    /// `None` without profiling; otherwise every missing evidence class.
-    pub profile_gaps: Option<Vec<String>>,
+/// What settling after arrivals stopped found.
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct Drain {
+    /// Seconds it waited.
+    pub seconds: f64,
+    /// Active calls plus pending outbox items left when it ended: zero when
+    /// it settled, positive when [`DRAIN_LIMIT`] passed first.
+    pub remaining: f64,
 }
 
-/// Numbers and starts each window's profile, or none without profiling.
-pub struct Profiler<'a> {
-    /// The profiled server, for its PID.
-    server: &'a LocalServer,
-    /// Where each window's profile lands, or `None` without profiling.
-    profiles: Option<PathBuf>,
-    /// Windows profiled so far; numbers each profile's directory.
-    windows: AtomicUsize,
-}
-
-impl<'a> Profiler<'a> {
-    /// Profiles `server`'s windows under `profiles`, or none when it is
-    /// `None`.
-    pub const fn new(server: &'a LocalServer, profiles: Option<PathBuf>) -> Self {
-        Self {
-            server,
-            profiles,
-            windows: AtomicUsize::new(0),
-        }
-    }
-
-    /// Starts window `name`'s profile under `profiles/NN-<name>/`, unless
-    /// profiling is off.
-    ///
-    /// # Errors
-    ///
-    /// Returns the profiler start failure or a server that has exited.
-    pub fn start(&self, name: &str) -> Result<Option<Capture>> {
-        let Some(profiles) = &self.profiles else {
-            return Ok(None);
-        };
-        let number = self.windows.fetch_add(1, Ordering::Relaxed);
-        let pid = self.server.pid().ok_or("the profiled server has exited")?;
-        let directory = profiles.join(format!("{number:02}-{}", name.replace(' ', "-")));
-        Ok(Some(Capture::start(pid, 0, PROFILE_HERTZ, &directory)?))
-    }
-}
-
-/// One tenant's closed-loop calls through the real server, profiled per
-/// window.
-pub struct Bench<'a> {
-    /// The server, for `/metrics` and resources.
-    server: &'a LocalServer,
-    /// The provisioned tenant, holding one key per client.
-    tenant: &'a Tenant,
-    /// Each window's profile.
-    profiler: Profiler<'a>,
-}
-
-impl<'a> Bench<'a> {
-    /// The benchmark over `server`'s provisioned `tenant`, profiling every
-    /// window under `profiles` unless it is `None`.
-    pub const fn new(
-        server: &'a LocalServer,
-        tenant: &'a Tenant,
-        profiles: Option<PathBuf>,
-    ) -> Self {
-        Self {
-            server,
-            tenant,
-            profiler: Profiler::new(server, profiles),
-        }
-    }
-
-    /// Runs `clients` closed-loop clients making `shape` calls: warmup,
-    /// settle, baseline, traffic window, drain, final scrape, each window
-    /// profiled, and prints the runtime and CPU Pareto.
-    ///
-    /// # Errors
-    ///
-    /// Returns a scrape, client, or profiler start/finish failure, or a
-    /// warmup that does not settle.
-    pub async fn run(&self, name: &str, shape: &Shape, clients: usize) -> Result<Step> {
-        if clients > self.tenant.keys.len() {
-            return Err(format!("{clients} clients need as many keys").into());
-        }
-        self.drive(shape, clients, WARMUP).await?;
-        if settle(self.server).await?.is_none() {
-            return Err(format!("{name}: warmup did not settle within 60 s").into());
-        }
-        let capture = self.profiler.start(name)?;
-        let (traffic, baseline) = Window::open(self.server, SELECTION).await?;
-        let samples = self.drive(shape, clients, WINDOW).await?;
-        let (traffic, ended) = traffic.close(self.server).await?;
-        let (draining, _) = Window::open(self.server, Selection::RESOURCES).await?;
-        let drain = settle(self.server).await?;
-        let (drained, last) = draining.close(self.server).await?;
-        let mut step = Step {
-            name: name.to_owned(),
-            clients,
-            stream: shape.stream,
-            samples,
-            traffic,
-            drain,
-            drained,
-            telemetry: Readings::read(&baseline, SELECTION).since(&last),
-            integrity: Integrity::between(&baseline, &last),
-            durable: Durable::between(&baseline, &ended),
-            profile_gaps: None,
-        };
-        let metadata = serde_json::json!({"step": name, "clients": clients});
-        let profile = record(capture, &step.telemetry, &metadata)?;
-        pareto(
-            &Evidence {
-                name,
-                calls: step.samples.arrivals,
-                errors: step.samples.error_count(),
-                traffic: &step.traffic,
-                drain: step.drain,
-                telemetry: &step.telemetry,
-            },
-            profile.as_ref(),
-        );
-        step.profile_gaps = profile.as_ref().map(gaps);
-        Ok(step)
-    }
-
-    /// Runs `clients` closed-loop clients, each with its own connection and
-    /// key, making `shape` calls for `duration`.
-    ///
-    /// # Errors
-    ///
-    /// Returns the HTTP client build failure.
-    async fn drive(&self, shape: &Shape, clients: usize, duration: Duration) -> Result<Samples> {
-        let deadline = Instant::now() + duration;
-        let body = shape.body("overhead");
-        let mut tasks = JoinSet::new();
-        for key in self.tenant.keys.iter().take(clients) {
-            let (http, key, shape, body) = (http()?, key.clone(), shape.clone(), body.clone());
-            tasks.spawn(async move {
-                let mut samples = Samples::default();
-                while Instant::now() < deadline {
-                    samples.record(&call(&http, &key, &shape, body.clone()).await);
-                }
-                samples
-            });
-        }
-        let mut total = Samples::default();
-        while let Some(joined) = tasks.join_next().await {
-            match joined {
-                Ok(samples) => total.merge(samples),
-                Err(_) => *total.errors.entry("panicked".to_owned()).or_default() += 1,
-            }
-        }
-        Ok(total)
-    }
-}
-
-/// What one measured window's Pareto reads.
-pub struct Evidence<'a> {
-    /// Window name.
-    pub name: &'a str,
-    /// Calls the window sent.
-    pub calls: u64,
-    /// Calls that did not end validated.
-    pub errors: u64,
-    /// Server and driver usage over its traffic.
-    pub traffic: &'a Usage,
-    /// Seconds its drain took, or `None` when it did not settle.
-    pub drain: Option<f64>,
-    /// Server telemetry from its baseline to its final scrape.
-    pub telemetry: &'a Telemetry,
-}
-
-/// Finishes `capture`, when profiling, writing `metadata` plus the
-/// `telemetry` breakdown beside its files.
-///
-/// Blocking: it waits for `perf` to flush and report.
-///
-/// # Errors
-///
-/// Returns the profiler finish failure.
-pub fn record(
-    capture: Option<Capture>,
-    telemetry: &Telemetry,
-    metadata: &serde_json::Value,
-) -> Result<Option<Profile>> {
-    let Some(capture) = capture else {
-        return Ok(None);
-    };
-    let mut metadata = metadata.clone();
-    metadata["breakdown"] = serde_json::json!(telemetry.breakdown);
-    Ok(Some(capture.finish(&metadata)?))
-}
-
-/// Every evidence class `profile` could not collect.
-pub fn gaps(profile: &Profile) -> Vec<String> {
-    [&profile.failure, &profile.off_cpu_failure]
-        .into_iter()
-        .flatten()
-        .cloned()
-        .collect()
-}
-
-/// Waits until no gateway call is active and every outbox is empty, and
-/// returns the seconds it took, or `None` after [`DRAIN_LIMIT`].
+/// Waits until no gateway call is active and every outbox is empty, or
+/// [`DRAIN_LIMIT`] passes.
 ///
 /// # Errors
 ///
 /// Returns scrape failures.
-pub async fn settle(server: &LocalServer) -> Result<Option<f64>> {
+pub async fn settle(server: &LocalServer) -> Result<Drain> {
     let started = Instant::now();
-    while started.elapsed() < DRAIN_LIMIT {
+    loop {
         let metrics = server.metrics().await?;
         let busy =
             metrics.sum("wyrd_gateway_active_calls", &[]) + metrics.sum("outbox_pending", &[]);
-        if busy <= 0.0 {
-            return Ok(Some(started.elapsed().as_secs_f64()));
+        if busy <= 0.0 || started.elapsed() >= DRAIN_LIMIT {
+            return Ok(Drain {
+                seconds: started.elapsed().as_secs_f64(),
+                remaining: busy.max(0.0),
+            });
         }
         tokio::time::sleep(POLL).await;
     }
-    Ok(None)
 }
 
 /// Microseconds in `elapsed`.
+#[must_use]
 pub fn micros(elapsed: Duration) -> u64 {
     u64::try_from(elapsed.as_micros()).unwrap_or(u64::MAX)
 }
 
-/// Prints one window's runtime Pareto and, when profiled, its CPU Pareto and
-/// off-CPU stacks, or why each is not usable evidence.
-///
-/// Component rows are the server's own histograms: total time over the
-/// window per call beside the mean per observation. Components nest and
-/// overlap, so they are read beside client latency, never summed.
-pub fn pareto(evidence: &Evidence<'_>, profile: Option<&Profile>) {
-    let calls = evidence.calls.max(1) as f64;
-    eprintln!(
-        "runtime pareto, {}: {:.0}/s, {} errors, drain {}",
-        evidence.name,
-        evidence.calls as f64 / evidence.traffic.seconds.max(f64::EPSILON),
-        evidence.errors,
-        evidence
-            .drain
-            .map_or("timed out".to_owned(), |seconds| format!("{seconds:.1} s")),
-    );
-    let mut components: Vec<(&String, &(f64, f64))> = evidence.telemetry.breakdown.iter().collect();
-    components.sort_by(|left, right| right.1.0.total_cmp(&left.1.0));
-    for (component, (seconds, count)) in components.iter().take(PARETO_ROWS) {
-        eprintln!(
-            "  {:9.4} ms/call {:9.4} ms mean x{:<9.0} {component}",
-            seconds * 1e3 / calls,
-            seconds * 1e3 / count.max(f64::EPSILON),
-            count
+/// What one L1 repetition observed, before it becomes a [`Repetition`].
+#[derive(Debug, Clone, Default)]
+pub struct Observed {
+    /// Whether its calls streamed.
+    pub stream: bool,
+    /// Client samples.
+    pub samples: Samples,
+    /// Server and driver usage over the traffic window alone.
+    pub usage: Usage,
+    /// The server timings of every call the window sent.
+    pub population: Population,
+    /// Integrity counters from the baseline to the post-drain scrape.
+    pub integrity: Integrity,
+    /// What the Scribe outbox wrote during the traffic window alone.
+    pub durable: Durable,
+    /// The drain after arrivals stopped.
+    pub drain: Drain,
+}
+
+impl Observed {
+    /// The repetition's readings by declared metric id. Every reading is a
+    /// measurement or carries why it is missing or inapplicable; a reset
+    /// counter leaves the capture readings missing, so their criteria are
+    /// INVALID rather than a favorable zero.
+    #[must_use]
+    pub fn repetition(&self) -> Repetition {
+        let usage = &self.usage;
+        let samples = &self.samples;
+        let integrity = &self.integrity;
+        let mut repetition = Repetition {
+            seconds: usage.seconds,
+            processes: vec![PROCESS.to_owned()],
+            server_cpu_seconds: usage.server_cpu_seconds,
+            peak_memory_bytes: usage.peak_memory_bytes,
+            memory_interval_ms: PEAK_SAMPLE_INTERVAL_MS,
+            driver_cpu_seconds: usage.driver_cpu_seconds,
+            ..Repetition::default()
+        };
+        repetition.set(
+            "requests",
+            Reading::count(samples.completion_us.len() as u64 - samples.late),
         );
-    }
-    let Some(profile) = profile else {
-        eprintln!("cpu pareto, {}: not profiled (--no-profile)", evidence.name);
-        return;
-    };
-    let cpu_ms = evidence.traffic.server_cpu_seconds * 1e3 / calls;
-    eprintln!(
-        "cpu pareto, {}: {cpu_ms:.3} ms server CPU per call ({})",
-        evidence.name,
-        profile.directory.display()
-    );
-    if let Some(failure) = &profile.failure {
-        eprintln!("  profile INCOMPLETE: {failure}");
-    } else {
-        for (owner, percent) in &profile.crates {
-            eprintln!(
-                "  {:8.4} ms {percent:5.1}%  {owner}",
-                cpu_ms * percent / 100.0
+        repetition.set("late_requests", Reading::count(samples.late));
+        repetition.set("drain_seconds", Reading::exact(usage.drain_seconds));
+        repetition.set("arrivals", Reading::count(samples.arrivals));
+        repetition.set("errors", Reading::count(samples.error_count()));
+        for (id, q) in [
+            ("client_p50_ms", 0.5),
+            ("client_p95_ms", 0.95),
+            ("client_p99_ms", 0.99),
+        ] {
+            repetition.set(id, Reading::percentile(&samples.completion_us, q, 1e3));
+        }
+        let population = &self.population;
+        population.validate(&mut repetition, "measured");
+        let answer = boundaries(self.stream)[0];
+        population.percentiles(
+            &mut repetition,
+            answer,
+            SUCCEEDED,
+            false,
+            &[("p50_ms", 0.5), ("p95_ms", 0.95), ("p99_ms", 0.99)],
+        );
+        population.percentiles(
+            &mut repetition,
+            answer,
+            SUCCEEDED,
+            true,
+            &[("overhead_p50_ms", 0.5), ("overhead_p99_ms", 0.99)],
+        );
+        repetition.set(
+            "upstream_p99_ms",
+            population.excluded(answer, SUCCEEDED).map_or_else(
+                || Reading::missing("no succeeded call has a provider wait"),
+                |upstream| Reading::quantile(&upstream, 0.99, NANOS_PER_MS),
+            ),
+        );
+        let failures: u64 = boundaries(self.stream)
+            .iter()
+            .map(|boundary| population.others(boundary, SUCCEEDED))
+            .sum();
+        repetition.set("server_failures", Reading::count(failures));
+        if self.stream {
+            population.percentiles(
+                &mut repetition,
+                STREAM_END,
+                SUCCEEDED,
+                true,
+                &[("overhead_end_p50_ms", 0.5), ("overhead_end_p99_ms", 0.99)],
+            );
+            repetition.set(
+                "first_event_p99_ms",
+                Reading::percentile(&samples.first_event_us, 0.99, 1e3),
+            );
+        } else {
+            for metric in ["overhead_end_p50_ms", "overhead_end_p99_ms"] {
+                repetition.set(
+                    metric,
+                    Reading::missing("inapplicable: a buffered call has no final stream frame"),
+                );
+            }
+            repetition.set(
+                "first_event_p99_ms",
+                Reading::missing("inapplicable: a buffered call has no stream events"),
             );
         }
+        let capture = |value: f64| {
+            if integrity.reset {
+                Reading::missing("a capture or outbox counter reset during the window")
+            } else {
+                Reading::exact(value)
+            }
+        };
+        repetition.set("capture_staged", capture(integrity.staged));
+        repetition.set(
+            "capture_unstaged",
+            capture((integrity.staged - samples.arrivals as f64).abs()),
+        );
+        repetition.set("capture_dropped", capture(integrity.dropped));
+        repetition.set("capture_lost", capture(integrity.unshed_loss()));
+        repetition.set("capture_shed", capture(integrity.shed));
+        repetition.set(
+            "capture_bytes",
+            if integrity.reset || self.durable.bytes < 0.0 {
+                Reading::missing("an outbox counter reset during the window")
+            } else {
+                Reading::exact(self.durable.bytes)
+            },
+        );
+        repetition.set("drain_s", Reading::exact(self.drain.seconds));
+        repetition.set("undrained", Reading::exact(self.drain.remaining));
+        if samples.arrivals == 0 {
+            repetition
+                .invalid
+                .push("no call was sent in the window".to_owned());
+        }
+        repetition.invalid.extend(integrity.unwritten());
+        if integrity.shed > 0.0 && !integrity.reset {
+            let seconds = usage.seconds.max(f64::EPSILON);
+            repetition.observations.push(format!(
+                "capture saturated: {} items shed at the outbox limit ({:.1}% of outbox items); durable capture {:.0} items/s, {:.1} MiB/s",
+                integrity.shed,
+                integrity.shed_fraction() * 100.0,
+                self.durable.items / seconds,
+                self.durable.bytes / seconds / 1_048_576.0,
+            ));
+        }
+        repetition
     }
-    eprintln!(
-        "off-cpu pareto ({}/offcpu.folded):",
-        profile.directory.display()
-    );
-    if let Some(failure) = &profile.off_cpu_failure {
-        eprintln!("  off-cpu INCOMPLETE: {failure}");
-        return;
+}
+
+/// The L1 workload: one server, one tenant holding a key per client, and
+/// the instant upstream.
+pub struct Overhead {
+    /// The server, once prepared.
+    server: Option<LocalServer>,
+    /// The instant upstreams, once prepared; held so they keep answering.
+    upstream: Option<[PacedUpstream; 2]>,
+    /// The provisioned tenant, once prepared.
+    tenant: Option<Tenant>,
+    /// The capture policy the tenant has now.
+    policy: Option<CapturePolicy>,
+    /// Where the server log is copied when it stops.
+    log: PathBuf,
+}
+
+impl Overhead {
+    /// An unprepared workload that will copy the server log to `log`.
+    #[must_use]
+    pub const fn new(log: PathBuf) -> Self {
+        Self {
+            server: None,
+            upstream: None,
+            tenant: None,
+            policy: None,
+            log,
+        }
     }
-    for (stack, seconds) in &profile.off_cpu {
-        eprintln!("  {:10.4} ms  {stack}", seconds * 1e3 / calls);
+
+    /// Starts the release server with one tenant, the instant upstream, and
+    /// a key per client of the largest step.
+    ///
+    /// # Errors
+    ///
+    /// Returns a server, upstream, or provisioning failure.
+    async fn start(&mut self) -> Result<()> {
+        let binary = release_binary()?;
+        let server = LocalServer::start(&binary, &["bench"], &[]).await?;
+        let [setup] = server.tenants() else {
+            return Err("setup provisioned one tenant".into());
+        };
+        let [small, large] = upstreams().await?;
+        let (small_uri, large_uri) = (small.uri(), large.uri());
+        let bases = PREFIXES.map(|prefix| {
+            if prefix == Case::Buffered64KibCapturePayload.prefix() {
+                large_uri.as_str()
+            } else {
+                small_uri.as_str()
+            }
+        });
+        let keys = CLIENTS.iter().copied().max().unwrap_or(1);
+        self.tenant = Some(Tenant::provision(setup, bases, keys).await?);
+        self.upstream = Some([small, large]);
+        self.server = Some(server);
+        Ok(())
+    }
+
+    /// Runs `phase` of `step` for `window`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an undeclared step, a capture policy, scrape, or client
+    /// failure.
+    async fn step(&mut self, step: &Step, phase: Phase, window: Duration) -> Result<Repetition> {
+        let case = step
+            .text("case")
+            .and_then(Case::named)
+            .ok_or_else(|| format!("step `{}` declares no known case", step.id))?;
+        let clients = step
+            .number("clients")
+            .and_then(|clients| usize::try_from(clients).ok())
+            .ok_or_else(|| format!("step `{}` declares no client count", step.id))?;
+        let (Some(server), Some(tenant)) = (&self.server, &self.tenant) else {
+            return Err("the workload was not prepared".into());
+        };
+        if clients > tenant.keys.len() {
+            return Err(format!("{clients} clients need as many keys").into());
+        }
+        if self.policy != Some(case.capture()) {
+            tenant.capture(case.capture()).await?;
+            self.policy = Some(case.capture());
+        }
+        let shape = case.shape();
+        let labels = (case.id(), phase.label());
+        if phase == Phase::Warmup {
+            drive(tenant, &shape, clients, Instant::now() + window, labels).await?;
+            settle(server).await?;
+            return Ok(Repetition::default());
+        }
+        let before = server.timings().await?;
+        let (traffic, baseline) = Window::open(server, Selection::RESOURCES).await?;
+        let stop = Instant::now() + window;
+        let (samples, usage, stopped) = traffic
+            .measure(server, stop, drive(tenant, &shape, clients, stop, labels))
+            .await?;
+        let samples = samples?;
+        let drain = settle(server).await?;
+        let last = server.metrics().await?;
+        let expected: Vec<Expected<'_>> = boundaries(shape.stream)
+            .iter()
+            .map(|boundary| Expected {
+                boundary,
+                outcome: SUCCEEDED,
+                case: labels.0,
+                phase: labels.1,
+                count: samples.completion_us.len() as u64,
+            })
+            .collect();
+        let population = Population::collect(server, &before, &expected).await;
+        let observed = Observed {
+            stream: shape.stream,
+            samples,
+            usage,
+            population,
+            integrity: Integrity::between(&baseline, &last),
+            durable: Durable::between(&baseline, &stopped),
+            drain,
+        };
+        Ok(observed.repetition())
+    }
+}
+
+#[async_trait]
+impl Workload for Overhead {
+    /// Starts the server, upstream, and tenant.
+    ///
+    /// # Errors
+    ///
+    /// Returns a server, upstream, or provisioning failure.
+    async fn prepare(&mut self) -> std::result::Result<(), ExperimentError> {
+        self.start().await.map_err(ExperimentError::workload)
+    }
+
+    /// The server's PID while it runs.
+    fn processes(&self) -> Vec<u32> {
+        self.server.iter().filter_map(LocalServer::pid).collect()
+    }
+
+    /// Runs `phase` of `step` for `window`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an undeclared step, a capture policy, scrape, or client
+    /// failure.
+    async fn measure(
+        &mut self,
+        step: &Step,
+        phase: Phase,
+        window: Duration,
+    ) -> std::result::Result<Repetition, ExperimentError> {
+        self.step(step, phase, window)
+            .await
+            .map_err(ExperimentError::workload)
+    }
+
+    /// Settles and stops the server loss-free.
+    ///
+    /// # Errors
+    ///
+    /// Returns every reason the stop was not loss-free.
+    async fn finish(&mut self) -> std::result::Result<(), ExperimentError> {
+        let Some(server) = self.server.take() else {
+            return Ok(());
+        };
+        shutdown(server, &self.log)
+            .await
+            .map_err(ExperimentError::workload)
+    }
+}
+
+/// Runs `clients` closed-loop clients of `tenant`, each with its own
+/// connection and key, making `shape` calls labelled `(case, phase)`
+/// admitted until `stop`; a call validated at or after `stop` is late.
+///
+/// # Errors
+///
+/// Returns the HTTP client build failure.
+async fn drive(
+    tenant: &Tenant,
+    shape: &Shape,
+    clients: usize,
+    stop: Instant,
+    (case, phase): (&'static str, &'static str),
+) -> Result<Samples> {
+    let body = shape.body("overhead");
+    let mut tasks = JoinSet::new();
+    for key in tenant.keys.iter().take(clients) {
+        let (http, key, shape, body) = (http()?, key.clone(), shape.clone(), body.clone());
+        tasks.spawn(async move {
+            let mut samples = Samples::default();
+            while Instant::now() < stop {
+                let timed =
+                    with_benchmark_labels(case, phase, call(&http, &key, &shape, body.clone()))
+                        .await;
+                samples.record(&timed, Some(stop));
+            }
+            samples
+        });
+    }
+    let mut total = Samples::default();
+    while let Some(joined) = tasks.join_next().await {
+        match joined {
+            Ok(samples) => total.merge(samples),
+            Err(_) => *total.errors.entry("panicked".to_owned()).or_default() += 1,
+        }
+    }
+    Ok(total)
+}
+
+/// The instant L1 upstreams: one answering 1 KiB completions and whole
+/// streams of [`STREAM_CHUNKS`] events, one answering 64 KiB completions,
+/// both with no delay and recording no call, so their memory stays bounded
+/// however many calls a run makes.
+///
+/// # Errors
+///
+/// Returns a bind failure.
+async fn upstreams() -> std::io::Result<[PacedUpstream; 2]> {
+    let instant = |buffered_bytes| Pacing {
+        buffered_delay: Duration::ZERO,
+        buffered_bytes,
+        stream_delay: Duration::ZERO,
+        chunks: STREAM_CHUNKS,
+        chunk_interval: Duration::ZERO,
+    };
+    Ok([
+        PacedUpstream::start(instant(SMALL_BYTES), 0).await?,
+        PacedUpstream::start(instant(LARGE_BYTES), 0).await?,
+    ])
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::BTreeMap;
+
+    use wyrd_telemetry::timing::{Distribution, IntervalSeries};
+    use wyrd_testing::capacity::{Population, UNLABELLED, Usage};
+    use wyrd_testing::experiment::Reading;
+
+    use super::{BUFFERED, Drain, Integrity, Observed, STREAM_END, STREAM_HEAD, Samples};
+
+    /// The successful server timings at `boundary` of `calls`, each
+    /// `(elapsed_ns, excluded_ns)` of provider wait.
+    ///
+    /// # Panics
+    ///
+    /// Panics when a duration is outside the histogram's trackable range or
+    /// a wait exceeds its elapsed time.
+    fn timing(boundary: &str, calls: &[(u64, u64)]) -> IntervalSeries {
+        let durations =
+            |samples: Vec<u64>| Distribution::of_durations(&samples).expect("in-range samples");
+        IntervalSeries {
+            boundary: boundary.to_owned(),
+            outcome: "succeeded".to_owned(),
+            case: UNLABELLED.to_owned(),
+            phase: UNLABELLED.to_owned(),
+            count: calls.len() as u64,
+            elapsed: durations(calls.iter().map(|(elapsed, _)| *elapsed).collect()),
+            excluded: Some(durations(calls.iter().map(|(_, wait)| *wait).collect())),
+            residual: Some(durations(
+                calls.iter().map(|(elapsed, wait)| elapsed - wait).collect(),
+            )),
+            missing_excluded: 0,
+            out_of_range: 0,
+            negative_residual: 0,
+        }
+    }
+
+    /// A clean repetition of `arrivals` calls, each with one server timing
+    /// per handoff of 1 ms waiting `wait_ns` on the provider, `slow` of
+    /// them adding `slow_ns` of overhead.
+    ///
+    /// # Panics
+    ///
+    /// Panics when [`timing`] does.
+    fn observed(stream: bool, arrivals: u64, wait_ns: u64, slow: usize, slow_ns: u64) -> Observed {
+        let calls = usize::try_from(arrivals).unwrap_or(0);
+        let boundaries: &[&str] = if stream {
+            &[STREAM_HEAD, STREAM_END]
+        } else {
+            &[BUFFERED]
+        };
+        let series = if calls == 0 {
+            Vec::new()
+        } else {
+            boundaries
+                .iter()
+                .map(|boundary| {
+                    let calls: Vec<(u64, u64)> = (0..calls)
+                        .map(|index| {
+                            let extra = if index < slow { slow_ns } else { 0 };
+                            (wait_ns + 100_000 + extra, wait_ns)
+                        })
+                        .collect();
+                    timing(boundary, &calls)
+                })
+                .collect()
+        };
+        Observed {
+            stream,
+            samples: Samples {
+                arrivals,
+                completion_us: vec![400; calls],
+                first_event_us: if stream { vec![200; calls] } else { Vec::new() },
+                errors: BTreeMap::new(),
+                late: 0,
+            },
+            usage: Usage {
+                seconds: 10.0,
+                server_cpu_seconds: Some(5.0),
+                peak_memory_bytes: Some(1 << 30),
+                driver_cpu_seconds: Some(2.0),
+                ..Usage::default()
+            },
+            population: Population {
+                series,
+                ..Population::default()
+            },
+            integrity: Integrity {
+                staged: arrivals as f64,
+                written: 1.0,
+                written_items: arrivals as f64,
+                ..Integrity::default()
+            },
+            drain: Drain {
+                seconds: 0.2,
+                remaining: 0.0,
+            },
+            ..Observed::default()
+        }
+    }
+
+    /// A reading's exact value.
+    fn exact(reading: &Reading) -> Option<f64> {
+        reading.above.is_none().then_some(reading.value).flatten()
+    }
+
+    /// Whether `value` lies in a reading's bucket bounds: its exclusive
+    /// lower bound and inclusive upper bound, or its exact value.
+    fn holds(reading: &Reading, value: f64) -> bool {
+        match (reading.above, reading.value) {
+            (Some(above), Some(upper)) => above < value && value <= upper,
+            (None, Some(exact)) => (exact - value).abs() < 1e-9,
+            _ => false,
+        }
+    }
+
+    /// An L1 repetition reads overhead as each call's server elapsed time
+    /// less its own provider wait, at the nearest-rank p99's bucket; server
+    /// latency comes from server timings, never the client round trip; it
+    /// counts errors and every capture class separately (shedding apart
+    /// from loss), leaves inapplicable and reset readings missing with a
+    /// reason, and observes saturation without judging it.
+    ///
+    /// # Panics
+    ///
+    /// Panics when a reading is wrong.
+    #[test]
+    fn overhead_repetition_subtracts_waits_per_call_and_counts_capture() {
+        let clean = observed(false, 1_000, 2_000_000, 5, 400_000).repetition();
+        let overhead = clean.reading("overhead_p99_ms");
+        assert!(
+            holds(&overhead, 0.1) && overhead.samples == Some(1_000),
+            "rank 990 of 1,000 residuals is a fast call's 100 µs: {overhead:?}"
+        );
+        assert!(holds(&clean.reading("upstream_p99_ms"), 2.0));
+        assert!(holds(&clean.reading("p99_ms"), 2.1));
+        assert_eq!(exact(&clean.reading("client_p99_ms")), Some(0.4));
+        let slow = observed(false, 1_000, 2_000_000, 20, 400_000).repetition();
+        assert!(holds(&slow.reading("overhead_p99_ms"), 0.5));
+        assert_eq!(exact(&clean.reading("requests")), Some(1_000.0));
+        assert_eq!(exact(&clean.reading("capture_unstaged")), Some(0.0));
+        assert!(clean.reading("overhead_end_p99_ms").reason.is_some());
+        assert!(clean.invalid.is_empty(), "{:?}", clean.invalid);
+        assert_eq!(
+            clean.observations,
+            [observed(false, 1_000, 2_000_000, 5, 400_000)
+                .population
+                .health()],
+            "a clean window observes only its collection health"
+        );
+        let stream = observed(true, 1_000, 2_000_000, 5, 400_000).repetition();
+        assert!(holds(&stream.reading("overhead_end_p99_ms"), 0.1));
+        assert_eq!(exact(&stream.reading("first_event_p99_ms")), Some(0.2));
+
+        let mut broken = observed(false, 1_000, 2_000_000, 5, 400_000);
+        broken.samples.errors.insert("timed_out".to_owned(), 2);
+        broken.integrity.staged = 998.0;
+        broken.integrity.dropped = 1.0;
+        broken.integrity.lost = 7.0;
+        broken.integrity.shed = 4.0;
+        broken.drain.remaining = 3.0;
+        let broken = broken.repetition();
+        for (id, value) in [
+            ("errors", 2.0),
+            ("capture_unstaged", 2.0),
+            ("capture_dropped", 1.0),
+            ("capture_lost", 3.0),
+            ("capture_shed", 4.0),
+            ("undrained", 3.0),
+        ] {
+            assert_eq!(exact(&broken.reading(id)), Some(value), "{id}");
+        }
+        assert_eq!(broken.observations.len(), 2, "{:?}", broken.observations);
+        assert!(broken.observations[1].starts_with("capture saturated"));
+
+        let mut reset = observed(false, 1_000, 2_000_000, 5, 400_000);
+        reset.integrity.reset = true;
+        let reset = reset.repetition();
+        assert!(!reset.reading("capture_lost").is_present());
+        assert!(!reset.reading("capture_bytes").is_present());
+        let mut unwritten = observed(false, 1_000, 2_000_000, 5, 400_000);
+        unwritten.integrity.written = 0.0;
+        assert_eq!(unwritten.repetition().invalid.len(), 1);
+        assert_eq!(
+            observed(false, 0, 0, 0, 0).repetition().invalid,
+            [
+                "no `gateway.buffered` timing observation has outcome `succeeded`",
+                "no `gateway.buffered` timing observation has outcome `succeeded`",
+                "no call was sent in the window",
+                "no capture was staged in the window",
+            ]
+        );
+        let mut missing = observed(false, 1_000, 2_000_000, 5, 400_000);
+        missing.population.series.clear();
+        missing.population.invalid.push(
+            "0 `gateway.buffered` timing observations of case none were recorded for 1000 requests"
+                .to_owned(),
+        );
+        let missing = missing.repetition();
+        assert!(!missing.reading("overhead_p99_ms").is_present());
+        assert!(missing.invalid[0].contains("recorded for 1000 requests"));
     }
 }

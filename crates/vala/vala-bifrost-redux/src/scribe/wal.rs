@@ -1,6 +1,6 @@
 //! Write-Ahead Log (WAL) for Scribe — crash-consistent framed records.
 //!
-//! Every prepared partition slice emits one self-describing v7 `SLICE` record.
+//! Every prepared partition slice emits one self-describing v8 `SLICE` record.
 //! After
 //! all ordered slices are durable, one `COMMIT` record authenticates their
 //! complete digest before replay may restore any of them.
@@ -10,11 +10,14 @@
 //! - Fixed 72-byte framed-record headers plus payload and CRC32C trailers
 //! - `SLICE` records carrying tenant/batch/ordinal identity and payload
 //! - `COMMIT` records carrying the closed slice-set digest
-//! - Atomic segment rollover: write-fsync-rename-fsync-parent
+//! - Atomic segment rollover: write-fsync-rename-fsync-parent; a retired
+//!   segment is recycled into the next one, overwritten in place
+//! - Every record header names its segment, so a recycled file's stale
+//!   records end the chain like any other bad record
 //! - Torn-tail truncation only for incomplete final writes; CRC, structure, and
 //!   monotonicity failures in a committed prefix fail closed
 //!
-//! Version 4 is the only accepted format. Earlier segment versions are rejected
+//! Version 8 is the only accepted format. Earlier segment versions are rejected
 //! before replay.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
@@ -132,7 +135,7 @@ impl std::fmt::Display for WalLsn {
 pub struct SegmentHeader {
     /// Magic bytes: 0x57415257 ("WRAW" — Wyrd Redux Arrow Wal).
     pub magic: u32,
-    /// Format version (4 is the only accepted implementation).
+    /// Format version (8 is the only accepted implementation).
     pub version: u16,
     /// Reserved field (must be zero).
     pub reserved: u16,
@@ -150,19 +153,19 @@ pub struct SegmentHeader {
 
 const WAL_MAGIC: u32 = 0x5741_5257; // "WRAW"
 /// The only persisted WAL version accepted by this Scribe.
-const WAL_VERSION: u16 = 7;
+const WAL_VERSION: u16 = 8;
 const SEGMENT_HEADER_SIZE: usize = 64;
 #[cfg(test)]
 const APPEND_FRAME_MAGIC_V3: [u8; 4] = *b"SWF3";
-/// Fixed byte length of every v7 record header before its payload and CRC.
+/// Fixed byte length of every v8 record header before its payload and CRC.
 const RECORD_HEADER_SIZE: usize = 72;
-/// `u16` wire encoding of the immutable v7 record-header length.
+/// `u16` wire encoding of the immutable v8 record-header length.
 const RECORD_HEADER_SIZE_U16: u16 = 72;
-/// Exact v7 record magic.
-const RECORD_MAGIC: [u8; 8] = *b"WYRDWAL7";
-/// Exact magic prefixing every v7 COMMIT payload.
+/// Exact v8 record magic.
+const RECORD_MAGIC: [u8; 8] = *b"WYRDWAL8";
+/// Exact magic prefixing every v8 COMMIT payload.
 const COMMIT_PAYLOAD_MAGIC: [u8; 4] = *b"S7CM";
-/// Exact encoded width of a v7 COMMIT payload.
+/// Exact encoded width of a v8 COMMIT payload.
 ///
 /// The layout is fixed and total: magic, WAL digest, logical digest, request
 /// identity. A COMMIT record whose declared payload is any other length is
@@ -170,7 +173,7 @@ const COMMIT_PAYLOAD_MAGIC: [u8; 4] = *b"S7CM";
 /// can never be read as a truncated or extended identity.
 const COMMIT_PAYLOAD_BYTES: usize = COMMIT_PAYLOAD_MAGIC.len() + 32 + 32 + 16;
 
-/// Complete batch identity carried by one terminal v7 COMMIT record.
+/// Complete batch identity carried by one terminal v8 COMMIT record.
 ///
 /// A batch has two distinct identities and the terminal record persists both,
 /// because each answers a question the other cannot.
@@ -217,19 +220,19 @@ impl WalCommitIdentity {
     /// # Errors
     ///
     /// Returns [`ScribeError::Internal`] when the payload is not exactly
-    /// [`COMMIT_PAYLOAD_BYTES`] long or does not carry the v7 COMMIT magic.
+    /// [`COMMIT_PAYLOAD_BYTES`] long or does not carry the v8 COMMIT magic.
     pub fn decode(payload: &[u8]) -> Result<Self, ScribeError> {
         if payload.len() != COMMIT_PAYLOAD_BYTES {
             return Err(ScribeError::Internal {
                 detail: format!(
-                    "WAL v7 COMMIT payload is {} bytes, expected {COMMIT_PAYLOAD_BYTES}",
+                    "WAL v8 COMMIT payload is {} bytes, expected {COMMIT_PAYLOAD_BYTES}",
                     payload.len()
                 ),
             });
         }
         if payload[0..4] != COMMIT_PAYLOAD_MAGIC {
             return Err(ScribeError::Internal {
-                detail: "WAL v7 COMMIT payload magic mismatch".to_owned(),
+                detail: "WAL v8 COMMIT payload magic mismatch".to_owned(),
             });
         }
         let mut wal_digest = [0_u8; 32];
@@ -252,10 +255,26 @@ const RECORD_FLAG_SLICE: u32 = 1;
 const RECORD_FLAG_COMMIT: u32 = 2;
 /// Maximum number of eligible WAL files considered during one V1 recovery.
 const WAL_RECOVERY_FILE_LIMIT: usize = 4_096;
+/// Retired segment files one shard keeps to recycle into its next segments.
+///
+/// ponytail: fixed at two, the most a shard's alternating rollover and
+/// retirement consume; each costs up to one segment of disk.
+const FREE_SEGMENTS_PER_SHARD: usize = 2;
+
 /// Maximum UTF-8 path length accepted for one eligible recovery file.
 const WAL_RECOVERY_PATH_LIMIT: usize = 4_096;
 
 impl SegmentHeader {
+    /// The low 32 bits of `seg_seq`, written into every record of this segment.
+    ///
+    /// A recycled file still holds an older segment's records past the new
+    /// tail; their tag differs, so replay reads them as bad records.
+    #[must_use]
+    pub fn record_tag(&self) -> u32 {
+        let bytes = self.seg_seq.to_le_bytes();
+        u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]])
+    }
+
     /// Construct a new segment header.
     #[must_use]
     pub fn new(node_id: [u8; 16], writer_epoch: i64, seg_seq: u64, shard_id: u8) -> Self {
@@ -293,7 +312,7 @@ impl SegmentHeader {
     /// # Errors
     ///
     /// Returns [`ScribeError::Internal`] when the magic, version, reserved
-    /// fields, or header checksum violates WAL v7 framing.
+    /// fields, or header checksum violates WAL v8 framing.
     pub fn decode(buf: &[u8; SEGMENT_HEADER_SIZE]) -> Result<Self, ScribeError> {
         let magic = u32::from_le_bytes([buf[0], buf[1], buf[2], buf[3]]);
         if magic != WAL_MAGIC {
@@ -367,7 +386,7 @@ impl SegmentHeader {
     }
 }
 
-/// WAL record — a v7 slice or commit framed entry.
+/// WAL record — a v8 slice or commit framed entry.
 ///
 /// Its fixed 72-byte little-endian header is followed by its declared payload
 /// and a CRC32C trailer over both. A record never carries a mixed flag set.
@@ -390,7 +409,7 @@ pub struct WalRecord {
     pub payload: Vec<u8>,
 }
 
-/// Validated fixed v7 record header retained while replay selects the next LSN.
+/// Validated fixed v8 record header retained while replay selects the next LSN.
 ///
 /// The header contains no scalable payload allocation. Replay can therefore
 /// peek across the fixed shard set, choose the stream-wide next record, and
@@ -504,7 +523,7 @@ impl PreparedWalAppend {
         }
     }
 
-    /// Builds a terminal v7 commit record carrying the batch's complete identity.
+    /// Builds a terminal v8 commit record carrying the batch's complete identity.
     ///
     /// `identity` is computed once on the live path and is the only place the
     /// batch's logical row identity becomes durable in the WAL. Replay reads it
@@ -555,7 +574,7 @@ impl PreparedWalAppend {
     /// # Errors
     ///
     /// Returns an internal invariant error when the prepared slice lacks its
-    /// self-describing key or a fixed-width WAL-v7 field cannot represent it.
+    /// self-describing key or a fixed-width WAL-v8 field cannot represent it.
     pub(crate) fn payload_identity(&self) -> Result<ScribeAppendPayloadIdentity, ScribeError> {
         if self.commit_identity.is_some() {
             return Err(ScribeError::Internal {
@@ -596,7 +615,7 @@ impl PreparedWalAppend {
         }
         if let Some(identity) = self.commit_identity {
             let tenant_id = self.commit_tenant.ok_or_else(|| ScribeError::Internal {
-                detail: "WAL v7 commit is missing its authenticated tenant".to_owned(),
+                detail: "WAL v8 commit is missing its authenticated tenant".to_owned(),
             })?;
             return Ok(WalRecord::commit(
                 self.lsn,
@@ -637,7 +656,7 @@ impl PreparedWalAppend {
             })
     }
 
-    /// Returns the exact uncompressed v7 packet payload length.
+    /// Returns the exact uncompressed v8 packet payload length.
     ///
     /// This includes the self-describing seal-key, schema, and Arrow fields
     /// that are part of the durable packet. Rotation must use this value
@@ -647,7 +666,7 @@ impl PreparedWalAppend {
     /// # Errors
     ///
     /// Returns [`ScribeError::Internal`] when a self-describing field exceeds
-    /// its v7 width or checked packet-length arithmetic overflows.
+    /// its v8 width or checked packet-length arithmetic overflows.
     pub(crate) fn uncompressed_len(&self) -> Result<usize, ScribeError> {
         self.payload_len()
     }
@@ -671,10 +690,10 @@ impl PreparedWalAppend {
         let table_len =
             u16::try_from(seal_key.table.namespace.as_str().len() + 1 + seal_key.table.name.len())
                 .map_err(|_| ScribeError::Internal {
-                    detail: "WAL table FQN exceeds v7 payload limits".to_owned(),
+                    detail: "WAL table FQN exceeds v8 payload limits".to_owned(),
                 })?;
         let data_len = u32::try_from(self.data.len()).map_err(|_| ScribeError::Internal {
-            detail: "WAL Arrow payload exceeds v7 payload limits".to_owned(),
+            detail: "WAL Arrow payload exceeds v8 payload limits".to_owned(),
         })?;
         let payload_len = 58usize
             .saturating_add(usize::from(table_len))
@@ -696,10 +715,11 @@ fn append_prepared_borrowed(
     segment: &WalSegment,
     prepared: &PreparedWalAppend,
     encoded_len: usize,
+    offset: u64,
 ) -> Result<([u8; 32], u32), ScribeError> {
     let payload_len =
         u32::try_from(prepared.payload_len()?).map_err(|_| ScribeError::Internal {
-            detail: "WAL v7 payload exceeds its u32 record bound".to_owned(),
+            detail: "WAL v8 payload exceeds its u32 record bound".to_owned(),
         })?;
     let (flags, tenant_id) = if prepared.commit_identity.is_some() {
         (
@@ -707,7 +727,7 @@ fn append_prepared_borrowed(
             prepared
                 .commit_tenant
                 .ok_or_else(|| ScribeError::Internal {
-                    detail: "WAL v7 commit is missing its authenticated tenant".to_owned(),
+                    detail: "WAL v8 commit is missing its authenticated tenant".to_owned(),
                 })?,
         )
     } else {
@@ -719,7 +739,7 @@ fn append_prepared_borrowed(
             })?;
         (RECORD_FLAG_SLICE, *seal_key.tenant.as_uuid().as_bytes())
     };
-    let header = encode_record_header(
+    let mut header = encode_record_header(
         prepared.lsn,
         flags,
         tenant_id,
@@ -728,6 +748,7 @@ fn append_prepared_borrowed(
         prepared.slice_count,
         payload_len,
     );
+    header[68..72].copy_from_slice(&segment.header.record_tag().to_le_bytes());
     let write_parts = |parts: &[&[u8]]| -> Result<[u8; 32], ScribeError> {
         let mut digest = Sha256::new();
         let mut crc = crc32c::crc32c(&header);
@@ -735,7 +756,7 @@ fn append_prepared_borrowed(
             digest.update(part);
             crc = crc32c::crc32c_append(crc, part);
         }
-        segment.append_borrowed(&header, parts, crc.to_le_bytes(), encoded_len)?;
+        segment.append_borrowed(&header, parts, crc.to_le_bytes(), encoded_len, offset)?;
         Ok(digest.finalize().into())
     };
     let payload_digest = if let Some(identity) = prepared.commit_identity.as_ref() {
@@ -752,18 +773,18 @@ fn append_prepared_borrowed(
         let tenant_id = *seal_key.tenant.as_uuid().as_bytes();
         let table_len = u16::try_from(namespace.len() + 1 + name.len())
             .map_err(|_| ScribeError::Internal {
-                detail: "WAL table FQN exceeds v7 payload limits".to_owned(),
+                detail: "WAL table FQN exceeds v8 payload limits".to_owned(),
             })?
             .to_le_bytes();
         let partition = seal_key.partition.to_bytes();
         let partition_len = u16::try_from(partition.len())
             .map_err(|_| ScribeError::Internal {
-                detail: "WAL partition identity exceeds v7 payload limits".to_owned(),
+                detail: "WAL partition identity exceeds v8 payload limits".to_owned(),
             })?
             .to_le_bytes();
         let data_len = u32::try_from(prepared.data.len())
             .map_err(|_| ScribeError::Internal {
-                detail: "WAL Arrow payload exceeds v7 payload limits".to_owned(),
+                detail: "WAL Arrow payload exceeds v8 payload limits".to_owned(),
             })?
             .to_le_bytes();
         let table_version = seal_key.table_version.get().to_be_bytes();
@@ -791,11 +812,11 @@ const SLICE_PAYLOAD_MAGIC: [u8; 4] = *b"S9SL";
 /// Encoded width of a slice's [`TableVersion`]: one big-endian `i64`.
 const TABLE_VERSION_BYTES: usize = 8;
 
-/// Encodes one slice payload for `seal_key`, the test entry to the v7 codec.
+/// Encodes one slice payload for `seal_key`, the test entry to the v8 codec.
 ///
 /// # Errors
 ///
-/// Returns [`ScribeError::Internal`] when a field exceeds v7 payload limits.
+/// Returns [`ScribeError::Internal`] when a field exceeds v8 payload limits.
 #[cfg(test)]
 fn encode_slice_payload(
     seal_key: &SealKey,
@@ -818,7 +839,7 @@ fn encode_slice_payload(
 /// # Errors
 ///
 /// Returns [`ScribeError::Internal`] when the table FQN, partition or Arrow
-/// payload exceeds v7 payload limits.
+/// payload exceeds v8 payload limits.
 #[cfg(test)]
 fn encode_slice_payload_parts(
     tenant: &[u8; 16],
@@ -829,14 +850,14 @@ fn encode_slice_payload_parts(
     data: &[u8],
 ) -> Result<Vec<u8>, ScribeError> {
     let table_len = u16::try_from(table_fqn.len()).map_err(|_| ScribeError::Internal {
-        detail: "WAL table FQN exceeds v7 payload limits".to_owned(),
+        detail: "WAL table FQN exceeds v8 payload limits".to_owned(),
     })?;
     let data_len = u32::try_from(data.len()).map_err(|_| ScribeError::Internal {
-        detail: "WAL Arrow payload exceeds v7 payload limits".to_owned(),
+        detail: "WAL Arrow payload exceeds v8 payload limits".to_owned(),
     })?;
     let partition = partition.to_bytes();
     let partition_len = u16::try_from(partition.len()).map_err(|_| ScribeError::Internal {
-        detail: "WAL partition identity exceeds v7 payload limits".to_owned(),
+        detail: "WAL partition identity exceeds v8 payload limits".to_owned(),
     })?;
     let capacity = 4usize
         .saturating_add(16)
@@ -987,7 +1008,7 @@ fn decode_slice_table(table_fqn: &str) -> Result<TableRef, ScribeError> {
 /// Returns [`ScribeError::Internal`] when the identity is malformed.
 fn decode_slice_partition(encoded: &[u8]) -> Result<PhysicalPartition, ScribeError> {
     PhysicalPartition::decode(encoded).map_err(|error| ScribeError::Internal {
-        detail: format!("WAL v7 slice partition is invalid: {error}"),
+        detail: format!("WAL v8 slice partition is invalid: {error}"),
     })
 }
 
@@ -997,7 +1018,7 @@ struct DecodedSliceMetadata {
     schema_fingerprint: [u8; 32],
 }
 
-/// Validate the v7 marker and decode the tenant/table/partition/schema identity.
+/// Validate the v8 marker and decode the tenant/table/partition/schema identity.
 ///
 /// # Errors
 ///
@@ -1008,7 +1029,7 @@ fn decode_slice_metadata(
 ) -> Result<DecodedSliceMetadata, ScribeError> {
     if reader.take(SLICE_PAYLOAD_MAGIC.len())? != SLICE_PAYLOAD_MAGIC {
         return Err(ScribeError::Internal {
-            detail: "WAL v7 slice magic mismatch".to_owned(),
+            detail: "WAL v8 slice magic mismatch".to_owned(),
         });
     }
     let tenant = decode_slice_tenant(reader.take(16)?)?;
@@ -1069,7 +1090,7 @@ pub(crate) fn decode_slice_payload(payload: &[u8]) -> Result<DecodedSlicePayload
 }
 
 impl WalRecord {
-    /// Construct a one-slice v7 record for a test or low-level caller.
+    /// Construct a one-slice v8 record for a test or low-level caller.
     ///
     /// Production writers use [`Self::slice`] with the authenticated tenant.
     #[must_use]
@@ -1152,7 +1173,7 @@ impl WalRecord {
     /// Panics only if an internal caller violates the configured `u32` WAL
     /// payload bound before this record is encoded.
     #[must_use]
-    pub fn encode(&self) -> Vec<u8> {
+    pub fn encode(&self, segment_tag: u32) -> Vec<u8> {
         let payload_len = u32::try_from(self.payload.len())
             .expect("invariant: WAL payload is bounded by the configured Scribe request ceiling");
         let mut buf = Vec::with_capacity(RECORD_HEADER_SIZE + self.payload.len() + 4);
@@ -1166,10 +1187,10 @@ impl WalRecord {
         buf.extend_from_slice(&self.slice_index.to_le_bytes());
         buf.extend_from_slice(&self.slice_count.to_le_bytes());
         buf.extend_from_slice(&payload_len.to_le_bytes());
-        buf.extend_from_slice(&0_u32.to_le_bytes());
+        buf.extend_from_slice(&segment_tag.to_le_bytes());
         buf.extend_from_slice(&self.payload);
 
-        // Compute CRC over the complete v7 header followed by payload.
+        // Compute CRC over the complete v8 header followed by payload.
         let crc = crc32c_hash(&buf);
         buf.extend_from_slice(&crc.to_le_bytes());
 
@@ -1184,13 +1205,16 @@ impl WalRecord {
     /// # Errors
     ///
     /// Returns [`ScribeError`] for a torn final write, a CRC mismatch, an
-    /// unsupported version, or any invalid v7 header or payload bound.
+    /// unsupported version, or any invalid v8 header or payload bound.
     ///
     /// # Panics
     ///
     /// Panics only if the fixed-size local header slicing invariant is broken.
-    pub fn decode_from<R: Read>(reader: &mut R) -> Result<Option<Self>, ScribeError> {
-        let Some(header) = Self::decode_header_from(reader)? else {
+    pub fn decode_from<R: Read>(
+        reader: &mut R,
+        segment_tag: u32,
+    ) -> Result<Option<Self>, ScribeError> {
+        let Some(header) = Self::decode_header_from(reader, segment_tag)? else {
             return Ok(None);
         };
         Self::decode_payload_from(reader, &header).map(Some)
@@ -1201,13 +1225,15 @@ impl WalRecord {
     /// # Errors
     ///
     /// Returns [`ScribeError`] for a torn header, unsupported version, invalid
-    /// flags, non-zero reserved field, or inconsistent slice bounds.
+    /// flags, a segment tag other than `segment_tag`, or inconsistent slice
+    /// bounds.
     ///
     /// # Panics
     ///
     /// Panics only if the fixed-size local header slicing invariant is broken.
     fn decode_header_from<R: Read>(
         reader: &mut R,
+        segment_tag: u32,
     ) -> Result<Option<DecodedWalRecordHeader>, ScribeError> {
         let mut header = [0_u8; RECORD_HEADER_SIZE];
         match reader.read(&mut header[..1]) {
@@ -1216,7 +1242,7 @@ impl WalRecord {
                 reader
                     .read_exact(&mut header[1..])
                     .map_err(|error| ScribeError::Internal {
-                        detail: format!("WAL torn v7 record header: {error}"),
+                        detail: format!("WAL torn v8 record header: {error}"),
                     })?;
             }
             Ok(_) => {
@@ -1232,7 +1258,7 @@ impl WalRecord {
         }
         if header[..8] != RECORD_MAGIC {
             return Err(ScribeError::Internal {
-                detail: "invalid WAL v7 record magic".to_owned(),
+                detail: "invalid WAL v8 record magic".to_owned(),
             });
         }
         let version = u16::from_le_bytes([header[8], header[9]]);
@@ -1242,13 +1268,13 @@ impl WalRecord {
         let header_len = u16::from_le_bytes([header[10], header[11]]);
         if usize::from(header_len) != RECORD_HEADER_SIZE {
             return Err(ScribeError::Internal {
-                detail: "invalid WAL v7 record header length".to_owned(),
+                detail: "invalid WAL v8 record header length".to_owned(),
             });
         }
         let flags = u32::from_le_bytes(header[12..16].try_into().expect("fixed record header"));
         if !matches!(flags, RECORD_FLAG_SLICE | RECORD_FLAG_COMMIT) {
             return Err(ScribeError::Internal {
-                detail: "invalid WAL v7 record flags".to_owned(),
+                detail: "invalid WAL v8 record flags".to_owned(),
             });
         }
         let lsn = WalLsn::new(u64::from_le_bytes(
@@ -1264,9 +1290,13 @@ impl WalRecord {
             u32::from_le_bytes(header[60..64].try_into().expect("fixed record header"));
         let payload_len =
             u32::from_le_bytes(header[64..68].try_into().expect("fixed record header"));
-        let reserved = u32::from_le_bytes(header[68..72].try_into().expect("fixed record header"));
-        if reserved != 0
-            || slice_count == 0
+        let tag = u32::from_le_bytes(header[68..72].try_into().expect("fixed record header"));
+        if tag != segment_tag {
+            return Err(ScribeError::Internal {
+                detail: "invalid WAL v8 record segment tag".to_owned(),
+            });
+        }
+        if slice_count == 0
             || slice_index > slice_count
             || (flags == RECORD_FLAG_SLICE && slice_index >= slice_count)
             || (flags == RECORD_FLAG_COMMIT
@@ -1274,7 +1304,7 @@ impl WalRecord {
                     || usize::try_from(payload_len).ok() != Some(COMMIT_PAYLOAD_BYTES)))
         {
             return Err(ScribeError::Internal {
-                detail: "invalid WAL v7 record bounds".to_owned(),
+                detail: "invalid WAL v8 record bounds".to_owned(),
             });
         }
         Ok(Some(DecodedWalRecordHeader {
@@ -1312,7 +1342,7 @@ impl WalRecord {
         reader
             .read_exact(&mut payload)
             .map_err(|e| ScribeError::Internal {
-                detail: format!("WAL torn v7 record payload: {e}"),
+                detail: format!("WAL torn v8 record payload: {e}"),
             })?;
 
         // Read CRC
@@ -1320,7 +1350,7 @@ impl WalRecord {
         reader
             .read_exact(&mut crc_buf)
             .map_err(|e| ScribeError::Internal {
-                detail: format!("WAL torn v7 record CRC: {e}"),
+                detail: format!("WAL torn v8 record CRC: {e}"),
             })?;
         let expected_crc = u32::from_le_bytes(crc_buf);
 
@@ -1345,7 +1375,8 @@ impl WalRecord {
     }
 }
 
-/// Encodes the fixed WAL record header into caller-owned stack storage.
+/// Encodes the fixed WAL record header into caller-owned stack storage; the
+/// appending segment writes its record tag into bytes 68..72.
 fn encode_record_header(
     lsn: WalLsn,
     flags: u32,
@@ -1428,6 +1459,20 @@ pub struct WalSegment {
     path: PathBuf,
     file: Mutex<File>,
     header: SegmentHeader,
+    /// Whether this file was recycled from a retired segment, so bytes past
+    /// the logical end are an older segment's records until [`Self::trim`].
+    recycled: bool,
+    /// Second descriptor for the same open file, so `fdatasync` runs without
+    /// holding `file` and appends continue while a sync is in flight.
+    sync_file: File,
+    /// Count of appends whose bytes are fully written, bumped under `file`
+    /// after the write returns.
+    appended: AtomicU64,
+    /// Highest `appended` count a successful `fdatasync` covered. Holding
+    /// this lock serializes syncs, not appends: a sync that finds its own
+    /// append already covered by a finished sync skips its `fdatasync`. This
+    /// is the WAL's group commit.
+    synced: Mutex<u64>,
 }
 
 /// Stable filesystem identity for one closed WAL segment.
@@ -1492,16 +1537,102 @@ impl WalSegment {
                 .map_err(|error| wal_io_error("failed to fsync WAL segment parent dir", &error))?;
         }
 
-        let file = OpenOptions::new()
+        let mut file = OpenOptions::new()
             .read(true)
-            .append(true)
+            .write(true)
             .open(path)
             .map_err(|error| wal_io_error("failed to open WAL segment for append", &error))?;
+        file.seek(SeekFrom::End(0))
+            .map_err(|error| wal_io_error("failed to position WAL segment for append", &error))?;
 
+        Self::from_file(path, file, header, false)
+    }
+
+    /// Turns a retired segment file at `free` into the new segment `path`.
+    ///
+    /// Appends then overwrite blocks the filesystem already allocated, so a
+    /// group's `fdatasync` writes data without the inode size or allocation
+    /// change that otherwise commits a filesystem journal transaction. The
+    /// new header is durable before the rename names the file; until a later
+    /// append overwrites them, the old records past the logical end carry
+    /// another segment tag and read as bad records.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ScribeError::WalDiskFull`] or [`ScribeError::Internal`] when
+    /// the header write, its sync, the rename, or the directory sync fails.
+    pub fn recycle(
+        free: impl AsRef<Path>,
+        path: impl AsRef<Path>,
+        header: SegmentHeader,
+    ) -> Result<Self, ScribeError> {
+        let path = path.as_ref();
+        let mut file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(free.as_ref())
+            .map_err(|error| wal_io_error("failed to open recycled WAL segment", &error))?;
+        header
+            .write_to(&mut file)
+            .map_err(|error| wal_io_error("failed to write recycled WAL segment header", &error))?;
+        file.sync_data()
+            .map_err(|error| wal_io_error("failed to fsync recycled WAL segment header", &error))?;
+        std::fs::rename(free.as_ref(), path)
+            .map_err(|error| wal_io_error("failed to rename recycled WAL segment", &error))?;
+        if let Some(parent) = path.parent() {
+            File::open(parent)
+                .and_then(|directory| directory.sync_all())
+                .map_err(|error| wal_io_error("failed to fsync WAL segment parent dir", &error))?;
+        }
+        Self::from_file(path, file, header, true)
+    }
+
+    /// Cuts a recycled segment's stale bytes off at `logical_len` and syncs it.
+    ///
+    /// Called before the segment stops being the stream's current one, so
+    /// only the chain's last segment can ever end in stale records, where
+    /// replay's fence check decides them. A segment created fresh has no
+    /// stale bytes and this is a no-op.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ScribeError::Internal`] when the lock is poisoned or the
+    /// truncation or its sync fails.
+    fn trim(&self, logical_len: u64) -> Result<(), ScribeError> {
+        if !self.recycled {
+            return Ok(());
+        }
+        let file = self.file.lock().map_err(|_| ScribeError::Internal {
+            detail: "WAL segment file lock poisoned (trim)".to_owned(),
+        })?;
+        file.set_len(logical_len)
+            .map_err(|error| wal_io_error("failed to trim recycled WAL segment", &error))?;
+        file.sync_all()
+            .map_err(|error| wal_io_error("failed to sync trimmed WAL segment", &error))
+    }
+
+    /// Wraps an open segment file with the second descriptor its syncs use.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ScribeError::Internal`] when the descriptor cannot be cloned.
+    fn from_file(
+        path: &Path,
+        file: File,
+        header: SegmentHeader,
+        recycled: bool,
+    ) -> Result<Self, ScribeError> {
+        let sync_file = file
+            .try_clone()
+            .map_err(|error| wal_io_error("failed to clone WAL segment descriptor", &error))?;
         Ok(Self {
             path: path.to_path_buf(),
             file: Mutex::new(file),
             header,
+            recycled,
+            sync_file,
+            appended: AtomicU64::new(0),
+            synced: Mutex::new(0),
         })
     }
 
@@ -1524,11 +1655,7 @@ impl WalSegment {
 
         let header = SegmentHeader::decode(&header_buf)?;
 
-        Ok(Self {
-            path: path.to_path_buf(),
-            file: Mutex::new(file),
-            header,
-        })
+        Self::from_file(path, file, header, false)
     }
 
     /// Append a record to the segment without forcing it to stable storage.
@@ -1542,7 +1669,7 @@ impl WalSegment {
         let span =
             tracing::debug_span!("bifrost.scribe.wal.append", outcome = tracing::field::Empty);
         let _entered = span.enter();
-        let encoded = record.encode();
+        let encoded = record.encode(self.header.record_tag());
         let mut file = self.file.lock().map_err(|_| ScribeError::Internal {
             detail: "WAL segment file lock poisoned (append)".to_string(),
         })?;
@@ -1557,12 +1684,14 @@ impl WalSegment {
                 }
             }
         });
+        self.appended.fetch_add(1, Ordering::Release);
         record_wal_append(&result, encoded.len(), started);
         span.record("outcome", if result.is_ok() { "success" } else { "failed" });
         result
     }
 
-    /// Streams one fixed header and borrowed payload parts without a frame copy.
+    /// Streams one fixed header and borrowed payload parts at `offset`, the
+    /// segment's logical end, without a frame copy.
     ///
     /// # Errors
     ///
@@ -1574,6 +1703,7 @@ impl WalSegment {
         payload_parts: &[&[u8]],
         crc: [u8; 4],
         encoded_len: usize,
+        offset: u64,
     ) -> Result<(), ScribeError> {
         let span =
             tracing::debug_span!("bifrost.scribe.wal.append", outcome = tracing::field::Empty);
@@ -1581,6 +1711,8 @@ impl WalSegment {
         let mut file = self.file.lock().map_err(|_| ScribeError::Internal {
             detail: "WAL segment file lock poisoned (borrowed append)".to_owned(),
         })?;
+        file.seek(SeekFrom::Start(offset))
+            .map_err(|error| wal_io_error("WAL record seek failed", &error))?;
         #[cfg(test)]
         if WAL_PARTIAL_WRITE.with(|flag| flag.replace(false)) {
             let started = Instant::now();
@@ -1608,6 +1740,7 @@ impl WalSegment {
             file.write_all(&crc)
                 .map_err(|error| wal_io_error("WAL record CRC write failed", &error))
         })();
+        self.appended.fetch_add(1, Ordering::Release);
         record_wal_append(&result, encoded_len, started);
         span.record("outcome", if result.is_ok() { "success" } else { "failed" });
         result
@@ -1629,15 +1762,31 @@ impl WalSegment {
     }
 
     /// Force all appended data for this segment to stable storage.
+    ///
+    /// The sync covers every append whose write finished before it started;
+    /// appends that land during the `fdatasync` wait for the next sync. A
+    /// sync that finds its caller's appends already covered by a finished
+    /// sync returns without an `fdatasync`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ScribeError::WalDiskFull`] or [`ScribeError::Internal`] when
+    /// the data sync fails or the sync lock is poisoned.
     pub fn sync_data(&self) -> Result<(), ScribeError> {
         let span =
             tracing::debug_span!("bifrost.scribe.wal.fsync", outcome = tracing::field::Empty);
         let _entered = span.enter();
-        let file = self.file.lock().map_err(|_| ScribeError::Internal {
-            detail: "WAL segment file lock poisoned (sync_data)".to_string(),
+        let target = self.appended.load(Ordering::Acquire);
+        let mut synced = self.synced.lock().map_err(|_| ScribeError::Internal {
+            detail: "WAL segment sync lock poisoned (sync_data)".to_string(),
         })?;
+        if *synced >= target {
+            span.record("outcome", "covered");
+            return Ok(());
+        }
+        let covered = self.appended.load(Ordering::Acquire);
         let started = Instant::now();
-        let result = file.sync_data().map_err(|e| {
+        let result = self.sync_file.sync_data().map_err(|e| {
             if e.kind() == io::ErrorKind::StorageFull || e.raw_os_error() == Some(28) {
                 ScribeError::WalDiskFull
             } else {
@@ -1647,6 +1796,9 @@ impl WalSegment {
             }
         });
         record_wal_fsync(&result, started);
+        if result.is_ok() {
+            *synced = covered;
+        }
         span.record("outcome", if result.is_ok() { "success" } else { "failed" });
         result
     }
@@ -1681,7 +1833,7 @@ impl WalSegment {
     /// # Errors
     ///
     /// Returns [`ScribeError`] when the segment cannot be read or synced, the
-    /// visitor fails, or a committed prefix violates the v7 frame or LSN
+    /// visitor fails, or a committed prefix violates the v8 frame or LSN
     /// invariants. A short final record is the sole truncation case.
     pub(crate) fn for_each_record<F>(&self, mut visit: F) -> Result<(), ScribeError>
     where
@@ -1702,11 +1854,11 @@ impl WalSegment {
                 .map_err(|error| ScribeError::Internal {
                     detail: format!("WAL record position failed: {error}"),
                 })?;
-            match WalRecord::decode_from(&mut *file) {
+            match WalRecord::decode_from(&mut *file, self.header.record_tag()) {
                 Ok(Some(record)) => {
                     if previous_lsn.is_some_and(|previous| record.lsn <= previous) {
                         return Err(ScribeError::Internal {
-                            detail: "WAL v7 contains non-monotonic committed LSNs".to_owned(),
+                            detail: "WAL v8 contains non-monotonic committed LSNs".to_owned(),
                         });
                     }
                     previous_lsn = Some(record.lsn);
@@ -1782,14 +1934,14 @@ pub(crate) type FenceLookup<'a> =
 /// corruption.
 fn is_bad_record_error(error: &ScribeError) -> bool {
     matches!(error, ScribeError::Internal { detail }
-        if detail.starts_with("invalid WAL v7 record") || detail.starts_with("WAL record CRC mismatch"))
+        if detail.starts_with("invalid WAL v8 record") || detail.starts_with("WAL record CRC mismatch"))
 }
 
 /// A partially written final header, payload, or CRC is a recoverable torn
 /// tail. Structural violations and CRC mismatches in a complete frame are
 /// durable corruption and must fail-stop rather than silently discard data.
 fn is_torn_tail_error(error: &ScribeError) -> bool {
-    matches!(error, ScribeError::Internal { detail } if detail.starts_with("WAL torn v7"))
+    matches!(error, ScribeError::Internal { detail } if detail.starts_with("WAL torn v8"))
 }
 
 /// WAL writer — owns one fixed set of shard streams with automatic rollover.
@@ -1812,6 +1964,11 @@ pub struct WalWriter {
     /// failed; every later deletion pass retries it, so releasing the last
     /// reference never loses the only record that the file must be removed.
     deferred_deletes: Arc<Mutex<BTreeSet<PathBuf>>>,
+    /// Retired segment files of this stream kept for reuse, by shard directory.
+    ///
+    /// They exist only while this writer lives: construction deletes every
+    /// leftover one, since no replay reads them.
+    free_segments: Arc<Mutex<HashMap<PathBuf, Vec<PathBuf>>>>,
     /// Scribe-local fault raised when the WAL no longer matches what the
     /// writer reported; shared by every handle and never reset in process.
     fault: tokio_util::sync::CancellationToken,
@@ -1911,6 +2068,7 @@ impl WalHandle {
         if state.current_segment_records == 0 {
             return Ok(None);
         }
+        segment.trim(state.current_segment_size)?;
         segment.sync_data()?;
         let reference = segment.reference();
         state.current_segment = None;
@@ -2082,8 +2240,14 @@ impl WalWriter {
             faults: Arc::default(),
             retirement_refs: Arc::new(Mutex::new(HashMap::new())),
             deferred_deletes: Arc::new(Mutex::new(BTreeSet::new())),
+            free_segments: Arc::new(Mutex::new(HashMap::new())),
             fault: tokio_util::sync::CancellationToken::new(),
         };
+        remove_free_segments(
+            &writer
+                .base_dir
+                .join(Uuid::from_bytes(node_id).simple().to_string()),
+        )?;
         writer.initialize_existing_stream()?;
         Ok(writer)
     }
@@ -2195,11 +2359,12 @@ impl WalWriter {
             faults: Arc::clone(&self.faults),
             retirement_refs: Arc::clone(&self.retirement_refs),
             deferred_deletes: Arc::clone(&self.deferred_deletes),
+            free_segments: Arc::clone(&self.free_segments),
             fault: self.fault.clone(),
         }
     }
 
-    /// Append one self-describing v7 slice record for test-tier probes.
+    /// Append one self-describing v8 slice record for test-tier probes.
     #[cfg(any(test, feature = "test-support"))]
     pub fn append_and_fsync_for_test(
         &self,
@@ -2210,7 +2375,7 @@ impl WalWriter {
         self.append_and_fsync_for_key(seal_key, batch_id, data_payload)
     }
 
-    /// Append, commit, and fsync one one-slice v7 batch for replay tests.
+    /// Append, commit, and fsync one one-slice v8 batch for replay tests.
     ///
     /// This test-only helper deliberately models the production `SLICE` then
     /// `COMMIT` ordering without changing lower-level WAL tests that need to
@@ -2299,7 +2464,7 @@ impl WalWriter {
         self.append_and_commit_for_replay_test(seal_key, decoded.batch_id, decoded.data)
     }
 
-    /// Append one prepared v7 record without syncing it.
+    /// Append one prepared v8 record without syncing it.
     ///
     /// # Errors
     ///
@@ -2338,6 +2503,9 @@ impl WalWriter {
         let lsn = WalLsn::new(self.next_lsn.fetch_add(1, Ordering::SeqCst));
         prepared.assign_lsn(lsn);
         if rolls_segment {
+            if let Some(segment) = &state.current_segment {
+                segment.trim(state.current_segment_size)?;
+            }
             state.current_segment = None;
             state.current_segment_size = 0;
             state.current_segment_records = 0;
@@ -2348,13 +2516,13 @@ impl WalWriter {
                 detail: "invalid WAL shard index".to_owned(),
             })?,
         )?;
-        let prior_file_len = std::fs::metadata(segment.path())
-            .map_err(|error| wal_io_error("failed to measure WAL before append", &error))?
-            .len();
+        // The logical end, not the file length: a recycled file is longer.
+        let prior_file_len = state.current_segment_size;
         let encoded_len = usize::try_from(encoded_bytes).map_err(|_| ScribeError::Internal {
             detail: "encoded WAL record length does not fit memory addressing".to_owned(),
         })?;
-        let append_result = append_prepared_borrowed(&segment, &prepared, encoded_len);
+        let append_result =
+            append_prepared_borrowed(&segment, &prepared, encoded_len, prior_file_len);
         let (payload_digest, payload_len) = match append_result {
             Ok(identity) => identity,
             Err(error) => {
@@ -2396,11 +2564,18 @@ impl WalWriter {
     ///
     /// A failed sync leaves written record bytes whose durability the writer
     /// cannot state, so the WAL is faulted rather than retried in process.
+    /// A faulted writer refuses every later sync: a retried `fdatasync` can
+    /// report success for pages the failed one already dropped, so no shard
+    /// may treat a sync after the fault as proof of durability.
     ///
     /// # Errors
     ///
-    /// Returns the segment sync error, or the injected sync failure.
+    /// Returns [`ScribeError::IngressClosed`] once the writer is faulted, the
+    /// segment sync error, or the injected sync failure.
     fn sync_segments_with_fault(&self, segments: &[Arc<WalSegment>]) -> Result<(), ScribeError> {
+        if self.is_faulted() {
+            return Err(ScribeError::IngressClosed);
+        }
         #[cfg(any(test, feature = "test-support"))]
         if self.faults.sync_failure.swap(false, Ordering::AcqRel) {
             let result = Err(ScribeError::Internal {
@@ -2439,12 +2614,16 @@ impl WalWriter {
     ///
     /// # Errors
     /// Returns [`ScribeError::Internal`] when a shard WAL-state lock is
-    /// poisoned. States closed before the poisoned shard remain closed.
+    /// poisoned or a recycled segment cannot be trimmed. States closed before
+    /// the failing shard remain closed.
     pub(crate) fn close_all_streams(&self) -> Result<(), ScribeError> {
         for state in self.states.iter() {
             let mut state = state.lock().map_err(|_| ScribeError::Internal {
                 detail: "WAL state lock poisoned (shutdown close)".to_owned(),
             })?;
+            if let Some(segment) = &state.current_segment {
+                segment.trim(state.current_segment_size)?;
+            }
             state.current_segment = None;
             state.current_segment_size = 0;
             state.current_segment_records = 0;
@@ -2683,6 +2862,7 @@ impl WalWriter {
                 continue;
             };
             if candidates.contains(segment.path()) {
+                segment.trim(state.current_segment_size)?;
                 segment.sync_data()?;
                 state.current_segment = None;
                 state.current_segment_size = 0;
@@ -2741,7 +2921,7 @@ impl WalWriter {
             if active.iter().any(|active_path| active_path == &path) {
                 continue;
             }
-            match Self::delete_segment_file(&path) {
+            match self.retire_segment_file(&path) {
                 Ok(()) => {
                     self.deferred_deletes
                         .lock()
@@ -2759,6 +2939,47 @@ impl WalWriter {
         first_error.map_or(Ok(()), Err)
     }
 
+    /// Keeps one closed segment of this stream for reuse, or deletes it.
+    ///
+    /// A shard keeps at most [`FREE_SEGMENTS_PER_SHARD`] files; a segment of
+    /// an older stream, which this writer never appends to, is deleted. A
+    /// segment already gone was retired by a concurrent caller, which is
+    /// success.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ScribeError::Internal`] when the free-segment lock is
+    /// poisoned, or the rename, removal, or directory sync fails.
+    fn retire_segment_file(&self, path: &Path) -> Result<(), ScribeError> {
+        if let Some(directory) = path.parent()
+            && directory.starts_with(self.stream_dir())
+            && path.exists()
+        {
+            let mut free = self
+                .free_segments
+                .lock()
+                .map_err(|_| ScribeError::Internal {
+                    detail: "WAL free segment lock poisoned".to_owned(),
+                })?;
+            let pool = free.entry(directory.to_path_buf()).or_default();
+            if pool.len() < FREE_SEGMENTS_PER_SHARD {
+                let target = path.with_extension("free");
+                match std::fs::rename(path, &target) {
+                    // Another retirement of the same segment won the race.
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+                    renamed => renamed
+                        .and_then(|()| File::open(directory)?.sync_all())
+                        .map_err(|error| ScribeError::Internal {
+                            detail: format!("WAL segment recycling failed: {error}"),
+                        })?,
+                }
+                pool.push(target);
+                return Ok(());
+            }
+        }
+        Self::delete_segment_file(path)
+    }
+
     /// Removes one closed segment file and syncs its parent directory.
     ///
     /// A missing file is already deleted; after a sync failure the next pass
@@ -2769,12 +2990,12 @@ impl WalWriter {
     /// Returns [`ScribeError::Internal`] when the file cannot be removed or
     /// its directory cannot be synced.
     fn delete_segment_file(path: &Path) -> Result<(), ScribeError> {
-        if !path.exists() {
-            return Ok(());
+        match std::fs::remove_file(path) {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            removed => removed.map_err(|error| ScribeError::Internal {
+                detail: format!("WAL segment retirement failed: {error}"),
+            })?,
         }
-        std::fs::remove_file(path).map_err(|error| ScribeError::Internal {
-            detail: format!("WAL segment retirement failed: {error}"),
-        })?;
         if let Some(parent) = path.parent() {
             let directory = File::open(parent).map_err(|error| ScribeError::Internal {
                 detail: format!("failed to open retired WAL directory: {error}"),
@@ -2811,8 +3032,19 @@ impl WalWriter {
         })?;
         let path = shard_dir.join(format!("{seq}.wal"));
         let header = SegmentHeader::new(self.node_id, self.writer_epoch, seq, shard_id);
+        let free = self
+            .free_segments
+            .lock()
+            .map_err(|_| ScribeError::Internal {
+                detail: "WAL free segment lock poisoned".to_owned(),
+            })?
+            .get_mut(&shard_dir)
+            .and_then(Vec::pop);
 
-        let segment = Arc::new(WalSegment::create(&path, header)?);
+        let segment = Arc::new(match free {
+            Some(free) => WalSegment::recycle(free, &path, header)?,
+            None => WalSegment::create(&path, header)?,
+        });
         state.current_segment = Some(Arc::clone(&segment));
 
         // Initialize segment size to header size
@@ -2865,6 +3097,8 @@ struct ShardRecordCursor {
     path: Option<PathBuf>,
     /// Byte offset at which the peeked record begins.
     record_offset: u64,
+    /// Record tag of the current segment; a record carrying another is stale.
+    segment_tag: u32,
     /// Validated header waiting for stream-wide LSN selection.
     header: Option<DecodedWalRecordHeader>,
     /// Last consumed LSN, spanning every ordered segment in this shard chain.
@@ -2930,6 +3164,7 @@ impl ShardRecordCursor {
             file: None,
             path: None,
             record_offset: SEGMENT_HEADER_SIZE as u64,
+            segment_tag: 0,
             header: None,
             previous_lsn: None,
             pin_wal: wal,
@@ -3005,7 +3240,7 @@ impl ShardRecordCursor {
             .is_some_and(|previous| record.lsn <= previous)
         {
             return Err(ScribeError::Internal {
-                detail: "WAL v7 contains non-monotonic committed LSNs across ordered segments"
+                detail: "WAL v8 contains non-monotonic committed LSNs across ordered segments"
                     .to_owned(),
             });
         }
@@ -3035,7 +3270,7 @@ impl ShardRecordCursor {
                 .map_err(|error| ScribeError::Internal {
                     detail: format!("WAL record position failed: {error}"),
                 })?;
-            match WalRecord::decode_header_from(file) {
+            match WalRecord::decode_header_from(file, self.segment_tag) {
                 Ok(Some(header)) => self.header = Some(header),
                 Ok(None) => {
                     self.file = None;
@@ -3098,7 +3333,7 @@ impl ShardRecordCursor {
         if let Some(fence) = acknowledged {
             return Err(ScribeError::Internal {
                 detail: format!(
-                    "WAL v7 bad record precedes acknowledged COMMIT LSN {} in segment {}: {error}",
+                    "WAL v8 bad record precedes acknowledged COMMIT LSN {} in segment {}: {error}",
                     fence.lsn, fence.segment_sequence
                 ),
             });
@@ -3125,6 +3360,7 @@ impl ShardRecordCursor {
         };
         self.next_segment = self.next_segment.saturating_add(1);
         self.segment_retirement_safe = false;
+        self.segment_tag = segment.header().record_tag();
         if let Some(wal) = self.pin_wal.as_ref() {
             self.segment_pin = Some(ReplaySegmentPin::acquire(wal.clone(), segment.reference())?);
         }
@@ -3149,7 +3385,7 @@ impl ShardRecordCursor {
     fn repair_torn_tail(&mut self) -> Result<(), ScribeError> {
         if self.next_segment < self.segments.len() {
             return Err(ScribeError::Internal {
-                detail: "WAL v7 contains a torn record before a later shard segment".to_owned(),
+                detail: "WAL v8 contains a torn record before a later shard segment".to_owned(),
             });
         }
         let file = self.file.as_mut().ok_or_else(|| ScribeError::Internal {
@@ -3469,7 +3705,7 @@ impl WalReader {
                 };
                 if previous_lsn.is_some_and(|previous| record.lsn <= previous) {
                     return Err(ScribeError::Internal {
-                        detail: "WAL v7 contains non-monotonic stream-wide committed LSNs"
+                        detail: "WAL v8 contains non-monotonic stream-wide committed LSNs"
                             .to_owned(),
                     });
                 }
@@ -3501,6 +3737,45 @@ fn collect_segment_paths(dir: &Path, paths: &mut Vec<PathBuf>) -> Result<(), Scr
             collect_segment_paths(&path, paths)?;
         } else if path.extension().and_then(|extension| extension.to_str()) == Some("wal") {
             paths.push(path);
+        }
+    }
+    Ok(())
+}
+
+/// Deletes every retired segment file kept for reuse under `dir`.
+///
+/// A `.free` file is never replayed, so a writer that did not create it
+/// removes it rather than reuse a file it cannot account for.
+///
+/// # Errors
+///
+/// Returns [`ScribeError::Internal`] when a directory cannot be read or a
+/// file cannot be removed.
+fn remove_free_segments(dir: &Path) -> Result<(), ScribeError> {
+    let entries = match std::fs::read_dir(dir) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => {
+            return Err(ScribeError::Internal {
+                detail: format!("failed to read WAL directory: {error}"),
+            });
+        }
+    };
+    for entry in entries {
+        let path = entry
+            .map_err(|error| ScribeError::Internal {
+                detail: format!("failed to read WAL directory entry: {error}"),
+            })?
+            .path();
+        if path.is_dir() {
+            remove_free_segments(&path)?;
+        } else if path
+            .extension()
+            .is_some_and(|extension| extension == "free")
+        {
+            std::fs::remove_file(&path).map_err(|error| ScribeError::Internal {
+                detail: format!("failed to remove free WAL segment: {error}"),
+            })?;
         }
     }
     Ok(())
@@ -3556,9 +3831,9 @@ pub struct ScribeAppendMeta {
     pub data_digest: [u8; 32],
     /// Canonical Arrow data length, excluding managed correlation columns.
     pub data_len: u32,
-    /// SHA-256 digest of the exact WAL-v7 slice payload.
+    /// SHA-256 digest of the exact WAL-v8 slice payload.
     pub payload_digest: [u8; 32],
-    /// Exact WAL-v7 slice payload length.
+    /// Exact WAL-v8 slice payload length.
     pub payload_len: u32,
     /// Zero-based ordinal in the committed batch slice set.
     pub slice_index: u32,
@@ -3799,7 +4074,7 @@ mod tests {
         assert!(matches!(
             error,
             ScribeError::Internal { detail }
-                if detail == "WAL v7 contains non-monotonic stream-wide committed LSNs"
+                if detail == "WAL v8 contains non-monotonic stream-wide committed LSNs"
         ));
     }
 
@@ -3842,7 +4117,7 @@ mod tests {
         assert!(matches!(
             error,
             ScribeError::Internal { detail }
-                if detail == "WAL v7 contains a torn record before a later shard segment"
+                if detail == "WAL v8 contains a torn record before a later shard segment"
         ));
         assert_eq!(
             std::fs::metadata(first_path)
@@ -3853,7 +4128,7 @@ mod tests {
         );
     }
 
-    /// The system owner decodes like any v7 tenant; nil and non-v7 ids fail.
+    /// The system owner decodes like any v8 tenant; nil and non-v8 ids fail.
     #[test]
     fn slice_tenant_decoder_admits_system_owner_and_rejects_non_v7() {
         assert!(matches!(
@@ -3886,7 +4161,7 @@ mod tests {
         assert_eq!(decoded.shard_id, 3);
     }
 
-    /// Proves both reserved byte ranges in the v7 segment prologue fail closed.
+    /// Proves both reserved byte ranges in the v8 segment prologue fail closed.
     #[test]
     fn segment_header_rejects_nonzero_reserved_byte_ranges() {
         for reserved_index in [33_usize, 39, 48, 59] {
@@ -3921,15 +4196,15 @@ mod tests {
         ));
     }
 
-    /// Proves the v7 record header carries the required slice identity.
+    /// Proves the v8 record header carries the required slice identity.
     #[test]
     fn wal_record_roundtrip() {
         let batch_id = [42u8; 16];
         let record = WalRecord::new(WalLsn::new(5), 2, batch_id, b"test data".to_vec());
-        let encoded = record.encode();
+        let encoded = record.encode(0);
 
         let mut cursor = std::io::Cursor::new(encoded);
-        let decoded = WalRecord::decode_from(&mut cursor)
+        let decoded = WalRecord::decode_from(&mut cursor, 0)
             .expect("decode record")
             .expect("non-empty");
 
@@ -3939,7 +4214,7 @@ mod tests {
         assert_eq!(decoded.payload, b"test data");
     }
 
-    /// Proves a v7 commit has the exact fixed header fields and identity payload.
+    /// Proves a v8 commit has the exact fixed header fields and identity payload.
     ///
     /// The terminal record is the only durable carrier of the batch's logical
     /// row identity, so this pins both digests surviving a round trip rather
@@ -3952,11 +4227,11 @@ mod tests {
             request_id: [13; 16],
         };
         let record = WalRecord::commit(WalLsn::new(9), [7; 16], [8; 16], 3, identity);
-        let encoded = record.encode();
+        let encoded = record.encode(0);
 
-        assert_eq!(&encoded[..8], b"WYRDWAL7");
+        assert_eq!(&encoded[..8], b"WYRDWAL8");
         assert_eq!(encoded.len(), RECORD_HEADER_SIZE + COMMIT_PAYLOAD_BYTES + 4);
-        let decoded = WalRecord::decode_from(&mut std::io::Cursor::new(encoded))
+        let decoded = WalRecord::decode_from(&mut std::io::Cursor::new(encoded), 0)
             .expect("decode terminal record")
             .expect("terminal record exists");
         assert!(decoded.is_commit());
@@ -3972,7 +4247,7 @@ mod tests {
 
     /// Proves a COMMIT payload of any other shape is refused, not interpreted.
     ///
-    /// The v7 identity is fixed-width and total. A record written under a
+    /// The v8 identity is fixed-width and total. A record written under a
     /// different layout must fail closed rather than be read as a truncated or
     /// extended identity, which is what makes the version bump load-bearing.
     #[test]
@@ -4165,6 +4440,38 @@ mod tests {
         );
     }
 
+    /// Appends proceed while a sync holds the sync lock, and a sync covers
+    /// only appends finished before it, so a covered sync skips its fsync.
+    #[test]
+    fn appends_proceed_during_sync_and_syncs_coalesce() {
+        let recorder = wyrd_bench::BenchmarkRecorder::default();
+        metrics::with_local_recorder(&recorder, || {
+            let directory = TempDir::new().expect("temporary WAL directory");
+            let segment = WalSegment::create(
+                directory.path().join("0.wal"),
+                SegmentHeader::new([34_u8; 16], 1, 0, 0),
+            )
+            .expect("WAL segment");
+            let record = |lsn| WalRecord::new(WalLsn::new(lsn), 0, [3_u8; 16], vec![3_u8]);
+            let in_flight_sync = segment.synced.lock().expect("sync lock");
+            segment
+                .append(&record(0))
+                .expect("append while a sync is in flight");
+            drop(in_flight_sync);
+            segment.sync_data().expect("first sync");
+            segment.sync_data().expect("covered sync");
+            segment.append(&record(1)).expect("later append");
+            segment.sync_data().expect("later sync");
+        });
+        assert_eq!(
+            recorder
+                .snapshot()
+                .counters
+                .get("bifrost_scribe_wal_fsync_total{outcome=\"success\"}"),
+            Some(&2)
+        );
+    }
+
     #[test]
     fn wal_handles_share_stream_lsn_allocation() {
         let temp_dir = TempDir::new().expect("temp dir");
@@ -4307,6 +4614,78 @@ mod tests {
             .expect("retire closed segment");
         assert!(!first.path.exists());
         assert!(current.path.exists());
+    }
+
+    /// A retired segment is recycled into the next one; its stale records end
+    /// replay only when no acknowledged batch lies beyond them, and rolling
+    /// out of the recycled segment trims them away.
+    #[test]
+    fn retired_segment_is_recycled_and_its_stale_tail_ends_replay() {
+        let temp_dir = TempDir::new().expect("temp dir");
+        let writer = WalWriter::new(
+            temp_dir.path(),
+            [10_u8; 16],
+            1,
+            WalConfig {
+                segment_bytes: 1200,
+            },
+        )
+        .expect("writer");
+        let key = test_seal_key(crate::test_support::tenant());
+        let append = |fill: u8| {
+            writer
+                .append_and_fsync_for_test(&key, [1_u8; 16], &[fill; 300])
+                .expect("append")
+        };
+        // Two equal records fill a segment, so segments 0 and 1 hold A B and C D.
+        for fill in 0..4 {
+            append(fill);
+        }
+        let reader = WalReader::open_directory_unfiltered(temp_dir.path()).expect("reader");
+        let first = reader.segments[0].reference();
+        let free = first.path.with_extension("free");
+        writer.retire_segments(&[first]).expect("retire");
+        assert!(free.exists(), "the retired segment waits for reuse");
+
+        // E rolls into segment 2, recycled from segment 0: E overwrites A and
+        // B remains whole after it, CRC intact but tagged for segment 0.
+        append(4);
+        assert!(!free.exists(), "the next segment reused the retired file");
+        let stream_lsns = |fences: Option<FenceLookup<'_>>| {
+            let reader = WalReader::open_directory_unfiltered(temp_dir.path()).expect("reader");
+            let mut lsns = Vec::new();
+            reader
+                .for_each_stream_record_accounted(None, None, fences, |_, _, accounted| {
+                    lsns.push(accounted.into_parts().1.lsn.as_u64());
+                    Ok(false)
+                })
+                .map(|()| lsns)
+        };
+        stream_lsns(None).expect_err("without fences a stale record fails closed");
+        let acknowledged_beyond = |_: StreamIdentity, _: u8| {
+            Ok(Some(NewestFence {
+                segment_sequence: 2,
+                lsn: WalLsn::new(9),
+            }))
+        };
+        stream_lsns(Some(&acknowledged_beyond))
+            .expect_err("an acknowledged batch past the stale record fails closed");
+        let unacknowledged = |_: StreamIdentity, _: u8| Ok(None);
+        assert_eq!(
+            stream_lsns(Some(&unacknowledged)).expect("the stale tail ends the chain"),
+            vec![2, 3, 4]
+        );
+
+        // F lands after E and G rolls into a fresh segment 3, trimming
+        // segment 2 so no stale record precedes a later segment.
+        writer
+            .append_and_fsync_for_test(&key, [1_u8; 16], &[5; 10])
+            .expect("append");
+        append(6);
+        assert_eq!(
+            stream_lsns(None).expect("no stale bytes remain"),
+            vec![2, 3, 4, 5, 6]
+        );
     }
 
     #[test]
@@ -4573,18 +4952,13 @@ mod tests {
         );
         let mut manifest = crate::scribe::manifest::Manifest::new(stream);
         manifest.update_sealed_lsn(&seal_key, sealed_lsn);
-        crate::scribe::manifest::write_atomic(
-            crate::scribe::replay::stream_directory(temp_dir.path(), stream).join("manifest"),
-            &manifest,
-        )
-        .expect("sealed manifest");
+        let manifest_path = segment.path.with_file_name("manifest");
+        crate::scribe::manifest::write_atomic(&manifest_path, &manifest).expect("sealed manifest");
         assert_eq!(
-            crate::scribe::manifest::read_manifest(
-                crate::scribe::replay::stream_directory(temp_dir.path(), stream).join("manifest")
-            )
-            .expect("manifest read")
-            .expect("manifest exists")
-            .get_sealed_lsn(&seal_key),
+            crate::scribe::manifest::read_manifest(&manifest_path)
+                .expect("manifest read")
+                .expect("manifest exists")
+                .get_sealed_lsn(&seal_key),
             Some(sealed_lsn)
         );
         assert!(
@@ -4759,7 +5133,7 @@ mod tests {
             let prepared =
                 PreparedWalAppend::new(WalLsn::ZERO, [7; 16], Bytes::from(vec![2; size]))
                     .for_slice(key.clone(), [3; 32]);
-            let actual = prepared.record().expect("record").encode().len();
+            let actual = prepared.record().expect("record").encode(0).len();
             assert_eq!(prepared.encoded_len().expect("encoded len"), actual);
         }
     }

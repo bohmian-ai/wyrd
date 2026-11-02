@@ -14,7 +14,9 @@ use datafusion::physical_optimizer::PhysicalOptimizerRule as _;
 use datafusion::physical_optimizer::filter_pushdown::FilterPushdown;
 use datafusion::physical_plan::{ExecutionPlan, SendableRecordBatchStream, execute_stream};
 use datafusion_proto::bytes::physical_plan_from_bytes_with_extension_codec;
-use datafusion_proto::protobuf::{PhysicalPlanNode, physical_plan_node::PhysicalPlanType};
+use datafusion_proto::protobuf::{
+    PhysicalExprNode, PhysicalPlanNode, physical_plan_node::PhysicalPlanType,
+};
 use prost::Message;
 use thiserror::Error;
 use wyrd_spec::DataTenantId;
@@ -130,6 +132,11 @@ pub trait FollowerSourceResolver: Send + Sync {
     /// Resolves exactly one validated assignment for the signed target role
     /// and the authenticated query it belongs to.
     ///
+    /// `filter` is the encoded predicate of the `FilterExec` the signed plan
+    /// places directly above this assignment's placeholder, if any. A
+    /// resolver may narrow its source by it before reading; the decoded plan
+    /// still applies the filter, so ignoring it is always correct.
+    ///
     /// The returned plan must expose exactly the signed closure, and the
     /// returned `full_schema` must be the authenticated schema that closure was
     /// projected out of; `decode` revalidates both. Cancellation may discard a
@@ -145,6 +152,7 @@ pub trait FollowerSourceResolver: Send + Sync {
         target_role: ClusterRole,
         query_id: uuid::Uuid,
         assignment: &FollowerScanAssignment,
+        filter: Option<&PhysicalExprNode>,
         session: &SessionState,
     ) -> Result<ResolvedFollowerSource, FollowerResolutionError>;
 }
@@ -166,10 +174,11 @@ where
         target_role: ClusterRole,
         query_id: uuid::Uuid,
         assignment: &FollowerScanAssignment,
+        filter: Option<&PhysicalExprNode>,
         session: &SessionState,
     ) -> Result<ResolvedFollowerSource, FollowerResolutionError> {
         self.as_ref()
-            .resolve(target_role, query_id, assignment, session)
+            .resolve(target_role, query_id, assignment, filter, session)
             .await
     }
 }
@@ -215,6 +224,9 @@ fn require_scannable_work(
 struct PreflightRequest {
     /// Assignments keyed by exact encoded scan identity.
     assignments: HashMap<String, FollowerScanAssignment>,
+    /// The encoded predicate of the `FilterExec` directly above a scan's
+    /// placeholder, keyed by the scan identity it filters.
+    filters: HashMap<String, PhysicalExprNode>,
 }
 
 /// Checked peer-context and local-incarnation facts used by IO-free preflight.
@@ -577,6 +589,7 @@ where
         target_role: ClusterRole,
         query_id: uuid::Uuid,
         assignment: &FollowerScanAssignment,
+        filter: Option<&PhysicalExprNode>,
         session: &SessionState,
     ) -> Result<ResolvedFollowerSource, FollowerResolutionError> {
         if target_role != ClusterRole::Scribe {
@@ -653,6 +666,22 @@ where
         }
         let start_partition = TimePartition::from_wire(cut.start_partition);
         let end_partition = TimePartition::from_wire(cut.end_partition);
+        // The signed filter over the closure. One that does not decode or
+        // plan prunes nothing: the decoded plan applies it regardless, and
+        // refuses a filter that does not decode.
+        let pruning = filter
+            .and_then(|filter| {
+                datafusion_proto::physical_plan::from_proto::parse_physical_expr(
+                    filter,
+                    &session.task_ctx(),
+                    &required_schema,
+                    &OraclePhysicalExtensionCodec::encoder(),
+                )
+                .ok()
+            })
+            .and_then(|predicate| {
+                crate::scan_sizing::BatchPruning::try_new(&required_schema, predicate)
+            });
         let read = self
             .tail
             .open(FetchLiveTailRequest {
@@ -668,6 +697,7 @@ where
                 // leaf schema below is the same closure — the serialized
                 // plan's `Column` indices are closure indices.
                 required_fields: required_schema.fields().clone(),
+                pruning,
             })
             .await?;
         let plan = self
@@ -772,9 +802,12 @@ where
         session: &SessionState,
         context: &TaskContext,
     ) -> Result<Arc<dyn ExecutionPlan>, PhysicalPlanFollowerError> {
-        let preflight = self.preflight(request, &authenticated)?;
-        let mut providers = HashMap::with_capacity(preflight.assignments.len());
-        for (scan_id, assignment) in preflight.assignments {
+        let PreflightRequest {
+            assignments,
+            mut filters,
+        } = self.preflight(request, &authenticated)?;
+        let mut providers = HashMap::with_capacity(assignments.len());
+        for (scan_id, assignment) in assignments {
             self.effects.resolver.fetch_add(1, Ordering::SeqCst);
             let resolved = self
                 .resolver
@@ -782,6 +815,7 @@ where
                     request.target_fence.role,
                     authenticated.query_id,
                     &assignment,
+                    filters.remove(&scan_id).as_ref(),
                     session,
                 )
                 .await
@@ -970,7 +1004,8 @@ where
         let root = PhysicalPlanNode::decode(request.physical_plan_bytes.as_slice())
             .map_err(|error| PhysicalPlanFollowerError::Preflight(error.to_string()))?;
         let mut encoded = HashMap::new();
-        Self::collect_extensions(&root, &mut encoded)?;
+        let mut filters = HashMap::new();
+        Self::collect_extensions(&root, None, &mut encoded, &mut filters)?;
         let mut assignments = HashMap::with_capacity(request.assignments.len());
         for assignment in &request.assignments {
             if assignment.scan_id.is_empty()
@@ -1005,22 +1040,34 @@ where
                 "encoded scan set differs from assignments".to_owned(),
             ));
         }
-        Ok(PreflightRequest { assignments })
+        Ok(PreflightRequest {
+            assignments,
+            filters,
+        })
     }
 
     /// Walks every child of follower-permitted native operators and leaf extensions.
+    ///
+    /// Each extension's scan identity is recorded in `encoded` with its schema
+    /// fingerprint, and `above`, the predicate of the `FilterExec` that is
+    /// the extension's direct parent, in `filters`.
     ///
     /// # Errors
     /// Returns a preflight error for missing inputs, unsupported operators,
     /// malformed extensions, or duplicate scan identities.
     fn collect_extensions(
         node: &PhysicalPlanNode,
+        above: Option<&PhysicalExprNode>,
         encoded: &mut HashMap<String, String>,
+        filters: &mut HashMap<String, PhysicalExprNode>,
     ) -> Result<(), PhysicalPlanFollowerError> {
         let children: Vec<&PhysicalPlanNode> = match node.physical_plan_type.as_ref() {
             Some(PhysicalPlanType::Extension(extension)) => {
                 let payload = OraclePhysicalExtensionCodec::preflight_extension(&extension.node)
                     .map_err(|error| PhysicalPlanFollowerError::Preflight(error.to_string()))?;
+                if let Some(above) = above {
+                    filters.insert(payload.scan_id.clone(), above.clone());
+                }
                 if !extension.inputs.is_empty()
                     || payload.scan_id.is_empty()
                     || payload.schema_fingerprint.is_empty()
@@ -1081,8 +1128,12 @@ where
                 "native operator is missing its input".to_owned(),
             ));
         }
+        let above = match node.physical_plan_type.as_ref() {
+            Some(PhysicalPlanType::Filter(filter)) => filter.expr.as_ref(),
+            _ => None,
+        };
         for child in children {
-            Self::collect_extensions(child, encoded)?;
+            Self::collect_extensions(child, above, encoded, filters)?;
         }
         Ok(())
     }
@@ -1112,6 +1163,7 @@ pub fn authenticated_preflight(
             _target_role: ClusterRole,
             _query_id: uuid::Uuid,
             _assignment: &FollowerScanAssignment,
+            _filter: Option<&PhysicalExprNode>,
             _session: &SessionState,
         ) -> Result<ResolvedFollowerSource, FollowerResolutionError> {
             Err(FollowerResolutionError::Fault(
@@ -1282,6 +1334,7 @@ pub(crate) mod tests {
             _target_role: ClusterRole,
             _query_id: uuid::Uuid,
             assignment: &FollowerScanAssignment,
+            _filter: Option<&PhysicalExprNode>,
             _session: &SessionState,
         ) -> Result<ResolvedFollowerSource, FollowerResolutionError> {
             self.calls.fetch_add(1, Ordering::SeqCst);
@@ -1293,6 +1346,55 @@ pub(crate) mod tests {
                 full_schema: Arc::clone(&self.schema),
             })
         }
+    }
+
+    /// Preflight records the predicate of the `FilterExec` directly above a
+    /// placeholder under that placeholder's scan identity, which the Scribe
+    /// resolver prunes memtable batches by before projecting them.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the plan cannot be encoded, preflight refuses it, or the
+    /// filter is not recorded for the scan.
+    #[test]
+    fn preflight_records_the_filter_above_each_placeholder() {
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "value",
+            DataType::Int64,
+            true,
+        )]));
+        let predicate = Arc::new(datafusion::physical_expr::expressions::BinaryExpr::new(
+            datafusion::physical_expr::expressions::col("value", &schema).expect("value column"),
+            datafusion::logical_expr::Operator::Eq,
+            datafusion::physical_expr::expressions::lit(2_i64),
+        ));
+        let placeholder = Arc::new(RemoteSourcePlaceholderExec::new(
+            "scan",
+            super::super::assignment_schema_fingerprint(schema.as_ref()),
+            schema,
+        ));
+        let bytes = physical_plan_to_bytes_with_extension_codec(
+            Arc::new(
+                datafusion::physical_plan::filter::FilterExec::try_new(predicate, placeholder)
+                    .expect("filter over the placeholder"),
+            ),
+            &OraclePhysicalExtensionCodec::encoder(),
+        )
+        .expect("encoded plan");
+        let root = PhysicalPlanNode::decode(bytes.as_ref()).expect("decoded plan node");
+        let mut encoded = HashMap::new();
+        let mut filters = HashMap::new();
+
+        PhysicalPlanFollower::<CountingResolver>::collect_extensions(
+            &root,
+            None,
+            &mut encoded,
+            &mut filters,
+        )
+        .expect("preflight accepts the filtered placeholder");
+
+        assert!(encoded.contains_key("scan"));
+        assert!(filters.contains_key("scan"));
     }
 
     /// Creates one valid Scribe-role request and its exact authenticated facts.
@@ -1418,6 +1520,7 @@ pub(crate) mod tests {
                 ClusterRole::Scribe,
                 test_query_id(),
                 &assignment(local_scribe_scan_id(&binding, stream)),
+                None,
                 &session,
             )
             .await
@@ -1439,6 +1542,7 @@ pub(crate) mod tests {
                 ClusterRole::Scribe,
                 test_query_id(),
                 &assignment(sibling),
+                None,
                 &session,
             )
             .await
@@ -1509,7 +1613,13 @@ pub(crate) mod tests {
         );
         for (refused, expected) in [(other_epoch, "source loss"), (other_schema, "fault")] {
             let class = match resolver
-                .resolve(ClusterRole::Scribe, test_query_id(), &refused, &session)
+                .resolve(
+                    ClusterRole::Scribe,
+                    test_query_id(),
+                    &refused,
+                    None,
+                    &session,
+                )
                 .await
             {
                 Err(FollowerResolutionError::SourceLoss(_)) => "source loss",
@@ -1845,6 +1955,7 @@ pub(crate) mod tests {
                     },
                 )
                 .await,
+                None,
                 &session,
             )
             .await
@@ -2060,6 +2171,7 @@ pub(crate) mod tests {
                     ),
                 )
                 .await,
+                None,
                 &session,
             )
             .await
@@ -2104,6 +2216,7 @@ pub(crate) mod tests {
                     closure.clone(),
                     fingerprint.clone(),
                 ),
+                None,
                 &session,
             )
             .await
@@ -2134,7 +2247,13 @@ pub(crate) mod tests {
             fingerprint,
         );
         recording
-            .resolve(ClusterRole::Scribe, test_query_id(), &assignment, &session)
+            .resolve(
+                ClusterRole::Scribe,
+                test_query_id(),
+                &assignment,
+                None,
+                &session,
+            )
             .await
             .expect("the recording source resolves the same signed closure");
         let recorded = requests
@@ -2150,6 +2269,75 @@ pub(crate) mod tests {
                 .collect::<Vec<_>>(),
             closure,
             "the fetch request forwards the signed closure unchanged"
+        );
+    }
+
+    /// The Scribe resolver plans the signed filter over the closure and hands
+    /// it to the live read as its pruning; without a filter it asks for none.
+    ///
+    /// # Panics
+    ///
+    /// Panics when resolution fails or the recorded requests carry the wrong
+    /// pruning.
+    #[tokio::test]
+    async fn scribe_provider_forwards_the_signed_filter_as_pruning() {
+        let (tenant_id, schema, stream, _) = closure_fixture_resolver();
+        let session = SessionContext::new_with_config(
+            crate::resources::OracleSessionShape::for_test().session_config(),
+        )
+        .state();
+        let binding = closure_fixture_binding(tenant_id);
+        let requests = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let recording = ScribeTailResolver::with_schema(
+            Arc::new(RecordingTail {
+                stream,
+                requests: Arc::clone(&requests),
+                batches: Vec::new(),
+            }),
+            Arc::clone(&schema),
+        );
+        let assignment = closure_assignment(
+            local_scribe_scan_id(&binding, stream),
+            binding,
+            schema.as_ref(),
+            signed_closure(),
+            super::super::assignment_schema_fingerprint(schema.as_ref()),
+        );
+        let closure = signed_closure_schema(schema.as_ref(), &assignment).expect("closure");
+        let filter = datafusion_proto::physical_plan::to_proto::serialize_physical_expr(
+            &(Arc::new(datafusion::physical_expr::expressions::BinaryExpr::new(
+                datafusion::physical_expr::expressions::col("duration_ms", &closure)
+                    .expect("duration column"),
+                datafusion::logical_expr::Operator::Eq,
+                datafusion::physical_expr::expressions::lit(97_i64),
+            )) as Arc<dyn datafusion::physical_expr::PhysicalExpr>),
+            &OraclePhysicalExtensionCodec::encoder(),
+        )
+        .expect("encoded filter");
+
+        for filter in [Some(&filter), None] {
+            recording
+                .resolve(
+                    ClusterRole::Scribe,
+                    test_query_id(),
+                    &assignment,
+                    filter,
+                    &session,
+                )
+                .await
+                .expect("the recording source resolves");
+        }
+        let recorded = requests
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+
+        assert_eq!(
+            recorded
+                .iter()
+                .map(|request| request.pruning.is_some())
+                .collect::<Vec<_>>(),
+            vec![true, false]
         );
     }
 
@@ -2197,6 +2385,7 @@ pub(crate) mod tests {
                         closure,
                         "sha256:wrong".to_owned(),
                     ),
+                    None,
                     &session,
                 )
                 .await
@@ -2264,7 +2453,13 @@ pub(crate) mod tests {
             required_columns: vec!["value".to_owned()],
         };
         let plan = resolver
-            .resolve(ClusterRole::Scribe, test_query_id(), &assignment, session)
+            .resolve(
+                ClusterRole::Scribe,
+                test_query_id(),
+                &assignment,
+                None,
+                session,
+            )
             .await
             .expect("the staged assignment resolves")
             .plan;
@@ -2460,7 +2655,13 @@ pub(crate) mod tests {
         )
         .await;
         let plan = resolver
-            .resolve(ClusterRole::Scribe, test_query_id(), &assignment, &session)
+            .resolve(
+                ClusterRole::Scribe,
+                test_query_id(),
+                &assignment,
+                None,
+                &session,
+            )
             .await
             .expect("the one-batch cut resolves")
             .plan;
@@ -2486,7 +2687,13 @@ pub(crate) mod tests {
             Arc::clone(&schema),
         );
         let plan = empty
-            .resolve(ClusterRole::Scribe, test_query_id(), &assignment, &session)
+            .resolve(
+                ClusterRole::Scribe,
+                test_query_id(),
+                &assignment,
+                None,
+                &session,
+            )
             .await
             .expect("the empty cut resolves")
             .plan;

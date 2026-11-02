@@ -169,7 +169,11 @@ async fn run_forge_worker_process(
             .ok_or_else(|| BootExit::Other("metrics recorder handle is unavailable".into()))?;
         set.spawn(fallible_task(
             TaskId::Metrics,
-            serve_metrics(metrics_router(handle), listener, shutdown.clone()),
+            serve_metrics(
+                metrics_router(handle, config.metrics.benchmark_snapshot),
+                listener,
+                shutdown.clone(),
+            ),
         ));
     }
     set.spawn(worker_task(

@@ -14,7 +14,7 @@ use wyrd_spec::error::WyrdError;
 use wyrd_spec::reference::CardRef;
 
 use crate::components::auth::Caller;
-use crate::components::cards::routes::get_card_by_ref_for;
+use crate::components::cards::routes::get_card_spec_by_ref_for;
 use crate::state::AppState;
 
 /// Resolves Agent and Prompt Cards as one accepted caller.
@@ -48,8 +48,9 @@ impl TenantRegistry {
         let caller = self.caller.as_ref().ok_or_else(|| BlockError::Terminal {
             reason: format!("no accepted caller may read card {reference}"),
         })?;
-        let response = get_card_by_ref_for(&self.state, caller, reference).await;
-        Ok(response.map_err(|error| refusal(&error))?.card.spec)
+        get_card_spec_by_ref_for(&self.state, caller, reference)
+            .await
+            .map_err(|error| refusal(&error))
     }
 }
 

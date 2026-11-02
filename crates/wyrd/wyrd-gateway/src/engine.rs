@@ -433,8 +433,8 @@ pub struct ExecutionTiming {
     pub credential: Duration,
     /// Dispatch time outside every provider exchange, summed across attempts.
     pub translate: Duration,
-    /// Send to fully-read body, or to failure, of every ended exchange,
-    /// summed across attempts and retries.
+    /// Send to fully-read body, or to failure, of every ended exchange: the
+    /// union of each attempt's retries, summed across sequential attempts.
     pub upstream: Duration,
     /// Send and header instants of the opened stream's exchange, whose body
     /// the relay reads; `None` for a buffered call.
@@ -444,26 +444,29 @@ pub struct ExecutionTiming {
 impl ExecutionTiming {
     /// Folds one attempt whose dispatch took `dispatch` and sent `exchanges`.
     ///
-    /// An ended exchange adds its send-to-end time to [`Self::upstream`]; an
-    /// open one becomes [`Self::open`] and counts as waited only until its
-    /// headers. Dispatch time not waited on any exchange is adapter work.
+    /// Ended exchanges add the union of their send-to-end intervals to
+    /// [`Self::upstream`], so retries that overlap are waited once; an open
+    /// one becomes [`Self::open`] and counts as waited only until its
+    /// headers. Dispatch time outside that union is adapter work. Attempts
+    /// run one after another, so summing them keeps the call's union.
     fn attempt(&mut self, dispatch: Duration, exchanges: &[Exchange]) {
-        let mut waited = Duration::ZERO;
+        let mut ended = Vec::new();
+        let mut waited = Vec::new();
         for exchange in exchanges {
             match (exchange.ended, exchange.headers) {
-                (Some(ended), _) => {
-                    let elapsed = ended.saturating_duration_since(exchange.sent);
-                    self.upstream += elapsed;
-                    waited += elapsed;
+                (Some(end), _) => {
+                    ended.push((exchange.sent, end));
+                    waited.push((exchange.sent, end));
                 }
                 (None, Some(headers)) => {
                     self.open = Some((exchange.sent, headers));
-                    waited += headers.saturating_duration_since(exchange.sent);
+                    waited.push((exchange.sent, headers));
                 }
                 (None, None) => {}
             }
         }
-        self.translate += dispatch.saturating_sub(waited);
+        self.upstream += union(&mut ended);
+        self.translate += dispatch.saturating_sub(union(&mut waited));
     }
 
     /// Provider wait until the call's answer head: every ended exchange plus
@@ -486,6 +489,25 @@ impl ExecutionTiming {
                 last_byte.unwrap_or(headers).saturating_duration_since(sent)
             })
     }
+}
+
+/// Total length of the union of `intervals`, each `(start, end)`; an empty
+/// or inverted interval adds nothing.
+fn union(intervals: &mut [(std::time::Instant, std::time::Instant)]) -> Duration {
+    intervals.sort_unstable();
+    let mut total = Duration::ZERO;
+    let mut covered: Option<(std::time::Instant, std::time::Instant)> = None;
+    for &(start, end) in intervals.iter().filter(|(start, end)| end > start) {
+        covered = match covered {
+            Some((from, to)) if start <= to => Some((from, to.max(end))),
+            Some((from, to)) => {
+                total += to - from;
+                Some((start, end))
+            }
+            None => Some((start, end)),
+        };
+    }
+    total + covered.map_or(Duration::ZERO, |(from, to)| to - from)
 }
 
 /// Inputs of one admitted call.
@@ -1350,7 +1372,7 @@ mod tests {
     /// Provider wait is subtracted exchange by exchange: a prior attempt's
     /// whole exchange and an opened stream's send-to-headers, while dispatch
     /// time outside every exchange stays adapter work, and the stream's end
-    /// adds its send-to-last-byte.
+    /// adds its send-to-last-byte. Overlapping retries are waited once.
     ///
     /// # Panics
     ///
@@ -1399,5 +1421,26 @@ mod tests {
             (Duration::from_millis(2), Duration::from_millis(1))
         );
         assert_eq!(failed.open, None);
+
+        let mut retried = ExecutionTiming::default();
+        retried.attempt(
+            Duration::from_millis(50),
+            &[
+                Exchange {
+                    sent: at(0),
+                    headers: Some(at(10)),
+                    ended: Some(at(30)),
+                },
+                Exchange {
+                    sent: at(20),
+                    headers: Some(at(25)),
+                    ended: Some(at(40)),
+                },
+            ],
+        );
+        assert_eq!(
+            (retried.upstream, retried.translate),
+            (Duration::from_millis(40), Duration::from_millis(10))
+        );
     }
 }

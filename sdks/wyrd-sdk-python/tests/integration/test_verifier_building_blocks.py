@@ -26,6 +26,7 @@ selected mounts so each journey asserts exactly what the tools returned.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import secrets
 import time
@@ -33,6 +34,7 @@ from collections.abc import Callable, Iterator, Sequence
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, cast
 
+import httpx
 import pytest
 from opentelemetry import trace
 from opentelemetry.sdk.trace import TracerProvider
@@ -276,10 +278,10 @@ class Numbers(RootModel[dict[str, float]]):
     """Numbers only, which the scores' text categories do not fit."""
 
 
-class RetainedOutcome(BaseModel):
-    """One retained result's outcome as JSON text."""
+class RetainedOutput(BaseModel):
+    """One retained result's output record as JSON text."""
 
-    outcome: str
+    output: str
 
 
 def scored_review(desk: WyrdState, text: str = SCORED_TEXT) -> verify.VerificationResult:
@@ -571,6 +573,50 @@ def test_every_format_extracts_its_locked_output(desk: WyrdState) -> None:
         assert requirement(result, "extracted")["outcome"] == "passed", name
 
 
+def test_file_inputs_use_shared_uploads(desk: WyrdState, wyrd_server: WyrdTestServer) -> None:
+    path = FIXTURES / "cards/verifier_building_blocks/samples/sample.csv"
+    in_memory = b"a,b\n3,4"
+    for file, rows in [
+        (verify.File(path), [["a", "b"], ["1", "2"]]),
+        (verify.File(in_memory, format="csv"), [["a", "b"], ["3", "4"]]),
+    ]:
+        result = desk.run().observe.verify("document-formats", file)
+        assert step(result, "read")["output"] == {"format": "csv", "rows": rows}
+
+    for content in [path.read_bytes(), in_memory]:
+        planned = httpx.post(
+            f"{wyrd_server.base_url}/v1/verification/evidence",
+            headers={"x-wyrd-access-token": f"Bearer {wyrd_server.access_token()}"},
+            json={
+                "files": [
+                    {"sha256": hashlib.sha256(content).hexdigest(), "size_bytes": len(content)}
+                ]
+            },
+        )
+        assert planned.status_code == 200, planned.text
+        assert planned.json()["uploads"] == []
+
+
+def test_stored_evidence_readback_uses_canonical_records(desk: WyrdState) -> None:
+    content = b"a,b\n5,6"
+    execution = desk.run().observe.submit("document-formats", verify.File(content, format="csv"))
+    assert isinstance(execution, verify.Execution)
+
+    result = execution.wait(WAIT_SECONDS)
+    status = execution.status()
+
+    assert status["result"]["execution_id"] == execution.id
+    assert status["result"]["outcome"]["verdict"] == result.verdict
+    assert list(status["result"]["outcome"]["evidence"].values()) == [
+        {
+            "kind": "file",
+            "sha256": hashlib.sha256(content).hexdigest(),
+            "size_bytes": len(content),
+            "format": "csv",
+        }
+    ]
+
+
 def test_failed_reader_leaves_its_dependents_inconclusive(isolated_desk: WyrdState) -> None:
     # PROVIDER-DOWN runs last: its failure starts the deployment's cooldown.
     for marker in ("OFF-SCHEMA", "SLOW-READER", "PROVIDER-DOWN"):
@@ -710,7 +756,7 @@ def test_custom_verdict_data_survives_readback(
     status = execution.status()
     assert status["result"]["outcome"]["requirements"] == waited.requirements
 
-    assert retained(wyrd_server, waited.execution_id) == status["result"]["outcome"]
+    assert retained(wyrd_server, waited.execution_id) == status["result"]["outcome"]["requirements"]
 
     for marker, data in EXACT_DATA.items():
         text = f"{marker} refunds"
@@ -720,18 +766,18 @@ def test_custom_verdict_data_survives_readback(
         assert requirement(waited, "well-formed")["data"] == data, marker
         status = execution.status()
         assert status["result"]["outcome"]["requirements"] == waited.requirements, marker
-        assert retained(wyrd_server, waited.execution_id) == status["result"]["outcome"], marker
+        assert retained(wyrd_server, waited.execution_id) == waited.requirements, marker
 
 
 def retained(wyrd_server: WyrdTestServer, execution_id: str) -> object:
-    """The retained outcome of ``execution_id``, read back from Bifrost after publishing."""
+    """The retained requirements of ``execution_id``, read back from Bifrost after publishing."""
     wyrd_server.flush_bifrost()
     [row] = Bifrost(client=client_of(wyrd_server)).sql(
-        "SELECT to_json(outcome) AS outcome FROM bifrost.verification.results WHERE execution_id = $1",
+        "SELECT to_json(output) AS output FROM bifrost.verification.execution_outputs WHERE execution_id = $1",
         [execution_id],
-        model=RetainedOutcome,
+        model=RetainedOutput,
     )
-    return json.loads(row.outcome)
+    return json.loads(row.output)["requirements"]
 
 
 def deep(containers: int) -> object:

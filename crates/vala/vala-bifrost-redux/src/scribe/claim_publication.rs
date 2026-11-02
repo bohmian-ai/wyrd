@@ -537,12 +537,11 @@ impl ClaimPublisher {
     /// Records the commit on every member, then deletes their local files.
     ///
     /// `records` are the members' `Publishing` records, which carry each
-    /// member's WAL range. The claim moves through each state as one step (see
-    /// [`Self::move_each`]): every member is durably `Published` before any is
-    /// `CleanupPending`, and every member is `CleanupPending` before any local
-    /// file is deleted. A crash between steps therefore leaves members that
-    /// name the object serving their rows, rather than rows with no authority
-    /// at all. After every member's readers drain, the members are removed
+    /// member's WAL range. The claim moves to `CleanupPending` as one step (see
+    /// [`Self::move_each`]): every member durably names the committed object
+    /// before any local file is deleted, so a crash leaves members that name
+    /// the object serving their rows, rather than rows with no authority at
+    /// all. After every member's readers drain, the members are removed
     /// together with one sync of their key directory and their authority is
     /// released.
     ///
@@ -569,7 +568,7 @@ impl ClaimPublisher {
             records.iter().map(|record| {
                 (
                     record.member(),
-                    StagedMemberState::Published {
+                    StagedMemberState::CleanupPending {
                         claim_id: claim_id.clone(),
                         file_list_commit_key: file_list_commit_key.clone(),
                         published_object_identities: object_identities.to_vec(),
@@ -587,21 +586,6 @@ impl ClaimPublisher {
                 ),
             });
         }
-        self.move_each(
-            key,
-            records.iter().map(|record| {
-                (
-                    record.member(),
-                    StagedMemberState::CleanupPending {
-                        claim_id: claim_id.clone(),
-                        file_list_commit_key: file_list_commit_key.clone(),
-                        published_object_identities: object_identities.to_vec(),
-                        persisted_lsn_ranges: vec![record.wal_range()],
-                    },
-                )
-            }),
-        )
-        .await?;
         let members: Vec<_> = records
             .iter()
             .map(StagedHotSourceRecordV1::member)
@@ -632,8 +616,8 @@ impl ClaimPublisher {
     ///
     /// The members' durable records decide. A member whose record is gone was
     /// removed by retirement, which starts only once every member is
-    /// `CleanupPending`; a `Published` or `CleanupPending` member names the
-    /// commit itself. Either proves the claim committed, and the survivors are
+    /// `CleanupPending`; a `CleanupPending` member names the commit itself.
+    /// Either proves the claim committed, and the survivors are
     /// then driven through the same terminal cleanup startup uses, in the
     /// same order: `CleanupPending`, lease drain, removal, authority release.
     /// Directories a removal left without their record are deleted, and their
@@ -678,12 +662,9 @@ impl ClaimPublisher {
                 None => retired.push(member.id()),
             }
         }
-        let recorded_commit = surviving.iter().any(|record| {
-            matches!(
-                record.state(),
-                StagedMemberState::Published { .. } | StagedMemberState::CleanupPending { .. }
-            )
-        });
+        let recorded_commit = surviving
+            .iter()
+            .any(|record| matches!(record.state(), StagedMemberState::CleanupPending { .. }));
         if retired.is_empty() && !recorded_commit {
             return Ok(false);
         }
@@ -693,8 +674,7 @@ impl ClaimPublisher {
                 || match record.state() {
                     StagedMemberState::Ready | StagedMemberState::Claimed { .. } => true,
                     StagedMemberState::Publishing { .. } => !recorded_commit,
-                    StagedMemberState::Published { .. }
-                    | StagedMemberState::CleanupPending { .. } => false,
+                    StagedMemberState::CleanupPending { .. } => false,
                 }
         }) {
             return Err(ScribeError::Internal {
@@ -758,8 +738,9 @@ impl ClaimPublisher {
 
     /// Drives recovered published members through terminal cleanup.
     ///
-    /// `Published` records first persist the complete `CleanupPending` facts;
-    /// already-pending records continue idempotently. In both cases the owner
+    /// `Publishing` records with a committed sibling first persist the
+    /// complete `CleanupPending` facts; already-pending records continue
+    /// idempotently. In both cases the owner
     /// prevents new leases through the restored published authority, drains
     /// existing leases, removes member storage, and releases registry authority.
     ///
@@ -792,7 +773,7 @@ impl ClaimPublisher {
     /// Drives one recovered member to the end of its terminal cleanup.
     ///
     /// A member whose durable record does not yet name the committed
-    /// publication is first advanced through `Published` so the facts survive a
+    /// publication is first advanced to `CleanupPending` so the facts survive a
     /// crash inside this sweep; a member already in `CleanupPending` skips
     /// straight to draining, deletion, and authority release.
     ///
@@ -807,21 +788,6 @@ impl ClaimPublisher {
         id: StagedMemberId,
         plan: TerminalMemberPlan,
     ) -> Result<(), ScribeError> {
-        if plan.records_publication {
-            self.stage
-                .transition(
-                    key,
-                    id,
-                    StagedMemberState::Published {
-                        claim_id: plan.facts.claim_id.clone(),
-                        file_list_commit_key: plan.facts.file_list_commit_key.clone(),
-                        published_object_identities: plan.facts.published_object_identities.clone(),
-                        persisted_lsn_ranges: plan.persisted_lsn_ranges.clone(),
-                    },
-                )
-                .await
-                .map_err(transition_failure(id))?;
-        }
         if plan.needs_cleanup_transition {
             self.stage
                 .transition(
@@ -882,8 +848,6 @@ struct TerminalMemberPlan {
     facts: PublishedFacts,
     /// WAL ranges to record, which for a resumed member are its own.
     persisted_lsn_ranges: Vec<crate::scribe::hot_stage::StagedLsnRange>,
-    /// Whether the record still has to name its committed publication.
-    records_publication: bool,
     /// Whether the record still has to be advanced to `CleanupPending`.
     needs_cleanup_transition: bool,
 }
@@ -894,13 +858,7 @@ impl TerminalPublicationFacts {
         let facts = records
             .iter()
             .filter_map(|record| match record.state() {
-                StagedMemberState::Published {
-                    claim_id,
-                    file_list_commit_key,
-                    published_object_identities,
-                    persisted_lsn_ranges,
-                }
-                | StagedMemberState::CleanupPending {
+                StagedMemberState::CleanupPending {
                     claim_id,
                     file_list_commit_key,
                     published_object_identities,
@@ -929,36 +887,24 @@ impl TerminalPublicationFacts {
 
     /// Decides what one member of the cohort still owes terminal cleanup.
     ///
-    /// A `Published` member owes the `CleanupPending` transition, a
-    /// `CleanupPending` member owes only the drain and deletion, and a
+    /// A `CleanupPending` member owes only the drain and deletion, and a
     /// `Publishing` member owes the full sequence under its sibling's committed
     /// facts — but only when such a sibling exists, because nothing else proves
     /// its claim committed. A member is never transitioned onto the state it is
     /// already in; the stage refuses that as a lifecycle contradiction.
     fn plan_for(&self, record: &StagedHotSourceRecordV1) -> Option<TerminalMemberPlan> {
         match record.state() {
-            StagedMemberState::Published { claim_id, .. } => {
-                let facts = self.facts_for(claim_id)?;
-                Some(TerminalMemberPlan {
-                    persisted_lsn_ranges: facts.persisted_lsn_ranges.clone(),
-                    facts,
-                    records_publication: false,
-                    needs_cleanup_transition: true,
-                })
-            }
             StagedMemberState::CleanupPending { claim_id, .. } => {
                 let facts = self.facts_for(claim_id)?;
                 Some(TerminalMemberPlan {
                     persisted_lsn_ranges: facts.persisted_lsn_ranges.clone(),
                     facts,
-                    records_publication: false,
                     needs_cleanup_transition: false,
                 })
             }
             StagedMemberState::Publishing { claim_id, .. } => Some(TerminalMemberPlan {
                 facts: self.facts_for(claim_id)?,
                 persisted_lsn_ranges: vec![record.wal_range()],
-                records_publication: true,
                 needs_cleanup_transition: true,
             }),
             StagedMemberState::Ready | StagedMemberState::Claimed { .. } => None,

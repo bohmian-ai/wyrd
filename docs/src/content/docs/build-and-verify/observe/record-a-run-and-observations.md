@@ -12,7 +12,7 @@ Wrap each request your app handles in a Run. Everything inside it (the model cal
 You need the support-desk Service from [Write a Verifier](/build-and-verify/verify/author-a-verifier/) and a running server from [Set up Wyrd](/get-started/setup/). Install the SDK with its telemetry and gateway extras, and the OpenAI client:
 
 ```bash
-uv add "wyrd-ai[otel,gateway]==0.4.0" openai
+uv add "wyrd-ai[otel,gateway]==0.4.1" openai
 ```
 
 ## 1. Connect at startup

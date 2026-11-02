@@ -100,7 +100,25 @@ impl Phase {
             Self::Settlement => "settlement",
         }
     }
+
+    /// The benchmark timing boundary of this phase of a direct execution,
+    /// recorded as a part of its `verification.direct` observation.
+    const fn direct_boundary(self) -> &'static str {
+        match self {
+            Self::Admit => "verification.direct.admit",
+            Self::Load => "verification.direct.load",
+            Self::InputRead => "verification.direct.input_read",
+            Self::Prepare => "verification.direct.prepare",
+            Self::Engine => "verification.direct.engine",
+            Self::Stage => "verification.direct.stage",
+            Self::Settlement => "verification.direct.settlement",
+        }
+    }
 }
+
+/// The benchmark timing boundary of a direct execution's time outside
+/// every phase: its HTTP decode, middleware, and any wait between phases.
+const DIRECT_OUTSIDE_BOUNDARY: &str = "verification.direct.outside";
 
 /// Measured intervals per phase, indexed like [`Phase::ALL`].
 type Ledger = [Vec<Interval>; 7];
@@ -108,8 +126,10 @@ type Ledger = [Vec<Interval>; 7];
 /// Owner of one verification execution's metrics lifetime.
 ///
 /// Created when a direct request reaches the server or a queued attempt is
-/// claimed; it counts the attempt and raises the active gauge at once and
-/// lowers the gauge exactly once on drop. A direct execution dropped before
+/// claimed; it raises the active gauge at once and lowers it exactly once on
+/// drop. The attempt is counted when its outcome is emitted, so a queued
+/// claim dropped without [`finish`](Self::finish) — a deferral that spends
+/// no attempt — emits no attempt series. A direct execution dropped before
 /// [`finish`](Self::finish), a client disconnect, finishes as `cancelled`.
 #[derive(Debug)]
 pub struct ExecutionTelemetry {
@@ -128,11 +148,9 @@ pub struct ExecutionTelemetry {
 impl ExecutionTelemetry {
     /// Start accounting for one `mode` execution from `since` — a direct
     /// request's HTTP arrival at this server, or a queued run's claim — or
-    /// from now when there is neither (an MCP call): count the attempt and
-    /// raise the active gauge.
+    /// from now when there is neither (an MCP call): raise the active gauge.
     #[must_use]
     pub fn start(mode: ExecutionMode, since: Option<Instant>) -> Self {
-        metrics::counter!(VERIFICATION_RUN_ATTEMPTS_TOTAL, "mode" => mode.as_str()).increment(1);
         metrics::gauge!(VERIFICATION_ACTIVE_RUNS, "mode" => mode.as_str()).increment(1.0);
         Self {
             mode,
@@ -203,23 +221,50 @@ impl ExecutionTelemetry {
         self.finished = true;
     }
 
-    /// Emit the outcome families of [`finish`](Self::finish): each phase,
-    /// the whole execution, the Verifier's block time, and the overhead.
+    /// Emit the outcome families of [`finish`](Self::finish): the attempt
+    /// count, each phase, the whole execution, the Verifier's block time,
+    /// and the overhead.
+    ///
+    /// A direct execution's duration and block union are also recorded
+    /// through [`wyrd_telemetry::record_timing_parts`] under the current
+    /// span's benchmark classification at boundary `verification.direct`,
+    /// with each measured phase at its [`Phase::direct_boundary`] and the
+    /// time outside every phase at [`DIRECT_OUTSIDE_BOUNDARY`]; no benchmark
+    /// reads a queued execution's, so it records none.
     fn emit(&self, outcome: &'static str, failed: bool) {
         let total = self.started.elapsed();
         let ledger = self.lock();
         let mode = self.mode.as_str();
+        metrics::counter!(VERIFICATION_RUN_ATTEMPTS_TOTAL, "mode" => mode).increment(1);
+        let mut parts = Vec::with_capacity(Phase::ALL.len() + 1);
         for (phase, intervals) in Phase::ALL.iter().zip(ledger.iter()) {
             if !intervals.is_empty() {
+                let length = union(intervals);
                 metrics::histogram!(
                     VERIFICATION_PHASE_DURATION_SECONDS,
                     "mode" => mode,
                     "phase" => phase.as_str()
                 )
-                .record(union(intervals).as_secs_f64());
+                .record(length.as_secs_f64());
+                parts.push((phase.direct_boundary(), length));
             }
         }
         let verifier = union(&self.clock.intervals());
+        if self.mode == ExecutionMode::Direct {
+            let phased: Vec<Interval> = ledger.iter().flatten().copied().collect();
+            parts.push((
+                DIRECT_OUTSIDE_BOUNDARY,
+                total.saturating_sub(union(&phased)),
+            ));
+            wyrd_telemetry::record_timing_parts(
+                &tracing::Span::current(),
+                "verification.direct",
+                outcome,
+                total,
+                Some(verifier),
+                &parts,
+            );
+        }
         metrics::histogram!(VERIFICATION_VERIFIER_SECONDS, "mode" => mode, "outcome" => outcome)
             .record(verifier.as_secs_f64());
         metrics::histogram!(VERIFICATION_OVERHEAD_SECONDS, "mode" => mode, "outcome" => outcome)

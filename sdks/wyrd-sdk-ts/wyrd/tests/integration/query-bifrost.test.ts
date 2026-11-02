@@ -207,3 +207,51 @@ test("unauthorized table refusal reveals no columns", async ({ server, live }) =
   expect(refused?.detail).not.toMatch(/verdcit|verdict/);
   await reader.shutdown();
 });
+
+test("predicates are typed bounded and tenant scoped", async ({ server, bifrost, live }) => {
+  const [namespace, name] = [live.slice(0, live.lastIndexOf(".")), live.slice(live.lastIndexOf(".") + 1)];
+  expect(await bifrost.validatePredicate(namespace, name, "id >= 2 and value like 't%'")).toBe(
+    "id >= 2 AND value LIKE 't%'",
+  );
+  expect(await bifrost.validatePredicate(namespace, name, "run_id is not null")).toBe("run_id IS NOT NULL");
+  expect(await bifrost.validatePredicate(namespace, name, " ")).toBe("");
+  for (const expression of [
+    "id = 1; DROP TABLE live_query_rows",
+    `id IN (SELECT id FROM ${live})`,
+    "id = $1",
+    "id = 1 -- comment",
+    "verdict = 'passed'",
+    `value = '${"x".repeat(8192)}'`,
+  ]) {
+    await expect(bifrost.validatePredicate(namespace, name, expression), expression).rejects.toMatchObject({
+      code: "WYRD_VALA_400_QUERY_INVALID_SQL",
+    });
+  }
+
+  const datasetsOnly = {
+    resource: "bifrost_query",
+    action: "read",
+    scope: { bifrost: { schema: { catalog: "bifrost", schema: "datasets" } } },
+  };
+  const reader = await Bifrost.connect({
+    client: WyrdClient.connect({ credential: server.scopedApiKey("predicate_reader", [datasetsOnly]) }),
+  });
+  expect(await reader.validatePredicate(namespace, name, "id = 1")).toBe("id = 1");
+  const forbidden = await reader.validatePredicate("bifrost.verification", "results", "verdcit = 'passed'").then(
+    () => undefined,
+    (error: unknown) => error as { code: string; detail: string },
+  );
+  expect(forbidden?.code).toBe("WYRD_VALA_403_QUERY_FORBIDDEN");
+  expect(forbidden?.detail).not.toMatch(/verdcit|verdict/);
+  await reader.shutdown();
+
+  const other = await Bifrost.connect({
+    client: WyrdClient.connect({
+      credential: server.bootstrapServiceInTenant(server.seedTenant("predicate-other"), ["admin"], "predicate-other"),
+    }),
+  });
+  await expect(other.validatePredicate(namespace, name, "id = 1")).rejects.toMatchObject({
+    code: "WYRD_VALA_404_BIFROST_TABLE_NOT_FOUND",
+  });
+  await other.shutdown();
+});

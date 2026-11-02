@@ -217,6 +217,16 @@ export declare class NativeBifrost {
    */
   describeTable(namespace: string, name: string): Promise<NativeLifecycleResult>
   /**
+   * Validates one `WHERE` predicate over a table and resolves to its
+   * normalized text, as a JSON string.
+   *
+   * # Errors
+   *
+   * Returns a napi error only when the native result cannot be projected;
+   * Wyrd control failures are returned in [`NativeLifecycleResult`].
+   */
+  validatePredicate(namespace: string, name: string, expression: string): Promise<NativeLifecycleResult>
+  /**
    * Alters one registered table's definition at its observed table version
    * and resolves to the committed description.
    *

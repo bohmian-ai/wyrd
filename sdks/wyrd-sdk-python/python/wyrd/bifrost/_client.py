@@ -1433,9 +1433,7 @@ class AsyncBifrost(_BifrostBase):
             WyrdError: As for ``Bifrost.validate_predicate()``.
         """
 
-        return await asyncio.to_thread(
-            self._native.validate_predicate, namespace, name, expression
-        )
+        return await asyncio.to_thread(self._native.validate_predicate, namespace, name, expression)
 
     async def alter_table(
         self,

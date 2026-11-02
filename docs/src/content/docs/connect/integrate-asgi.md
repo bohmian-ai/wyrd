@@ -21,7 +21,7 @@ Add `WyrdMiddleware` to any ASGI app, such as FastAPI, Starlette, Django, or Lit
 ## Install
 
 ```bash
-uv add "wyrd-ai[otel]==0.4.0" uvicorn
+uv add "wyrd-ai[otel]==0.4.1" uvicorn
 ```
 
 Add your framework too, such as `uv add fastapi`. Then pull the Service into the app's directory, at build or deploy time rather than when the app starts:

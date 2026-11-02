@@ -436,7 +436,7 @@ async function answers(port: number): Promise<boolean> {
 /** The `Traces` total the overview shows, or NaN while it loads. */
 async function traceTotal(page: Page): Promise<number> {
   const text = (await page.locator('[data-panel="overview"]').textContent()) ?? '';
-  return Number(/Traces\s*(\d[\d,]*)/.exec(text)?.[1].replaceAll(',', '') ?? NaN);
+  return Number(/(\d[\d,]*) traces/.exec(text)?.[1].replaceAll(',', '') ?? NaN);
 }
 
 /** Starts `mise run dev:full` in its own process group, writing to a log file in `config`. */

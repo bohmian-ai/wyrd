@@ -25,6 +25,7 @@
     "@wyrd/testing": "link:../../../../sdks/wyrd-sdk-ts/testing",
     "autoprefixer": "latest",
     "jsdom": "latest",
+    "playwright": "1.64.1",
     "postcss": "latest",
     "svelte": "latest",
     "svelte-check": "latest",

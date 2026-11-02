@@ -31,10 +31,10 @@ index 35ad80e..1675042 100644
  
 diff --git a/scripts/batch.py b/scripts/batch.py
 new file mode 100644
-index 0000000..680dc42
+index 0000000..fbd5efe
 --- /dev/null
 +++ b/scripts/batch.py
-@@ -0,0 +1,260 @@
+@@ -0,0 +1,257 @@
 +"""Send a bounded batch of real requests to the running support API, wait for
 +every queued verdict, and check Wyrd retained what the app sent.
 +
@@ -50,9 +50,8 @@ index 0000000..680dc42
 +| `unknown`  | 5 %   | `POST /ask` for order `Z-9`     | 404 before any Run or model call  |
 +
 +Rounding goes to `shipping`, so exactly ``--requests`` calls are sent, never
-+retried. Each call carries its own W3C ``traceparent``, so its spans and logs
-+are found by that trace ID. The report is JSON on stdout; any unexpected
-+reply, missing verdict, or missing telemetry exits 1.
++retried. The app starts each call's trace. The report is JSON on stdout; any
++unexpected reply, missing verdict, or missing telemetry exits 1.
 +"""
 +
 +from __future__ import annotations
@@ -61,7 +60,6 @@ index 0000000..680dc42
 +import asyncio
 +import json
 +import random
-+import secrets
 +import sys
 +import time
 +from collections import Counter
@@ -92,7 +90,6 @@ index 0000000..680dc42
 +    """One workload request and what it returned."""
 +
 +    case: str
-+    trace_id: str
 +    status: int = 0
 +    request_id: str | None = None
 +    verdict: str | None = None
@@ -113,12 +110,11 @@ index 0000000..680dc42
 +
 +
 +async def send(http: httpx.AsyncClient, gate: asyncio.Semaphore, case: str, index: int) -> Call:
-+    call = Call(case, secrets.token_hex(16))
++    call = Call(case)
 +    method, path, body = request(case, index)
-+    headers = {"traceparent": f"00-{call.trace_id}-{secrets.token_hex(8)}-01"}
 +    async with gate:
 +        try:
-+            response = await http.request(method, path, json=body, headers=headers)
++            response = await http.request(method, path, json=body)
 +        except httpx.HTTPError as error:
 +            call.problems.append(f"{type(error).__name__}: {error}")
 +            return call
@@ -156,10 +152,12 @@ index 0000000..680dc42
 +    return {row["k"]: row["n"] for row in rows if row["k"] is not None}
 +
 +
++# One trace per request: those holding the app's HTTP server span (OTLP kind 2).
 +SPANS = """SELECT encode(trace_id, 'hex') AS k, count(*) AS n FROM bifrost.traces.spans
-+WHERE start_time_unix_nano >= to_timestamp_nanos($1) GROUP BY 1"""
++WHERE start_time_unix_nano >= to_timestamp_nanos($1) AND service_name = 'support-desk'
++GROUP BY 1 HAVING bool_or(kind = 2)"""
 +LOGS = """SELECT encode(trace_id, 'hex') AS k, count(*) AS n FROM bifrost.logs.records
-+WHERE time_unix_nano >= to_timestamp_nanos($1) GROUP BY 1"""
++WHERE time_unix_nano >= to_timestamp_nanos($1) AND service_name = 'support-desk' GROUP BY 1"""
 +POINTS = """SELECT metric_name AS k, count(*) AS n FROM bifrost.metrics.points
 +WHERE time_unix_nano >= to_timestamp_nanos($1) GROUP BY 1"""
 +CALLS = """SELECT run_id AS k, count(*) AS n FROM bifrost.gateway.calls
@@ -177,12 +175,11 @@ index 0000000..680dc42
 +    spans, logs = counts(bifrost, SPANS, since_ns), counts(bifrost, LOGS, since_ns)
 +    gateway, results = counts(bifrost, CALLS, since_ns), counts(bifrost, RESULTS, since_ns)
 +    runs = [c for c in calls if c.request_id]
-+    asked = [c for c in calls if c.case != "openapi"]
 +    return {
-+        "traces_with_spans": sum(c.trace_id in spans for c in calls),
-+        "spans": sum(spans.get(c.trace_id, 0) for c in calls),
-+        "asks_with_logs": sum(c.trace_id in logs for c in asked),
-+        "logs": sum(logs.get(c.trace_id, 0) for c in asked),
++        "traces_with_spans": len(spans),
++        "spans": sum(spans.values()),
++        "asks_with_logs": len(logs),
++        "logs": sum(logs.values()),
 +        "metric_points": counts(bifrost, POINTS, since_ns),
 +        "app_model_calls": sum(gateway.get(c.request_id or "", 0) for c in runs),
 +        "judge_model_calls": counts(bifrost, JUDGE, since_ns).get("judge", 0),
@@ -251,7 +248,7 @@ index 0000000..680dc42
 +        if not gaps or time.monotonic() >= deadline:
 +            break
 +        time.sleep(2)
-+    problems = [f"{c.case} {c.trace_id}: {p}" for c in calls for p in c.problems]
++    problems = [f"{c.case} #{i}: {p}" for i, c in enumerate(calls) for p in c.problems]
 +    runs = sum(c.request_id is not None for c in calls)
 +    return {
 +        "ok": not problems and not gaps,

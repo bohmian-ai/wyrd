@@ -513,13 +513,13 @@ ordinary local service recovery stay implementation-owned.
 
 ## Execution Evidence
 
-Implementation `4a7633111..bb524ffc9` on `task/wyrd-ui-main-integration/TASK-004`.
+Implementation `4a7633111..HEAD` on `task/wyrd-ui-main-integration/TASK-004`.
 Independent review and human acceptance are still pending.
 
 | Acceptance criterion | Implementation evidence | Verification evidence | Result |
 |---|---|---|---|
 | REQ-038; AC-021: canonical source, current production wheel, batch accounting, retained signals | `mise.toml` `dev:full`/`dev:batch`; `scripts/dev/example-app.sh`; `scripts/dev/wyrd-example-py.patch` | V2 `test_batch_reports_all_outcomes_and_retained_signals` | PASS |
-| REQ-038: one command reaches readiness, appended batch, Ctrl-C cleanup | `src/lib/ui-pages.integration.test.ts` `development environment lifecycle` | V1: refused before startup, because 8080/3000/8000 are held by an unrelated local service (`gif-guard-demo` wyrd-server 0.4.1, its UI, uvicorn) | NOT RUN |
+| REQ-038: one command reaches readiness, appended batch, Ctrl-C cleanup | `src/lib/ui-pages.integration.test.ts` `development environment lifecycle` | V1: startup, 20-request batch, browser login, all three signals populated, appended `dev:batch` raises the Traces total without restart, Ctrl-C frees 8080/3000/8000 | PASS |
 | REQ-040; AC-023: permission-first fragment validation on every surface | `wyrd-server/src/query/{service,routes,floor}.rs`, `mcp/bifrost.rs`, `wyrd-client` Bifrost, Python/TS SDKs | V10, V11, V12, V13 `predicates_are_typed_bounded_and_tenant_scoped` | PASS |
 | REQ-040: same predicate across charts/facets/list, no dependent read after refusal | `packages/ui/src/lib/observe.ts::predicateFor`; `schemas.ts` `where_sql` | V3 `observe signal planning and interactions` | PASS |
 | REQ-007/021/039; AC-022: shell, Observe tabs, URL state, drawer, Query inspector | `src/lib/observe-host.ts`; `routes/t/[tenantKey]/{observe,query}/`; `+layout.svelte` nav | V3; V4 `authenticated traces and spans` | PASS |
@@ -527,7 +527,7 @@ Independent review and human acceptance are still pending.
 | REQ-016; AC-008/018: Logs timeline/severity, wrap/columns/paging, detail, Exclude into WHERE, Open trace and Back | `STATS` `logs`/`log_errors`; host Logs view | V3; V5 `authenticated logs investigation` | PASS |
 | REQ-017; AC-008/018: Metrics series per recorded meaning, exact Latest/Max/Mean, unsafe integers, histogram listed and not plotted | `observe.ts::metricPanels`, exact `CAST … AS VARCHAR` projection; observe `+page.server.ts` predicate load | V3; V6 `authenticated metrics investigation` (mean `9007199254740994` from real SQL) | PASS |
 | Shared Observe regressions | Moved OTLP seeding to `src/lib/ui-signals.integration.ts`; int metrics now decimal text | V7 `TASK-004: Canonical signal interactions`; V8 `TASK-004: Authorized Observe across hosts` | PASS |
-| V9 final `dev:full` replay with screenshots | — | Not run: same port conflict as V1 | NOT RUN |
+| V9 final `dev:full` replay with screenshots | `scripts/batch.py` in the patch sends plain requests; the app starts each trace | V9: base `03428e1a` + patch `ad6584e0a503`, wheel `51a5d5cb3cde`; 3000 requests passed, `traces_with_spans` 3000, spans 40098, asks with logs 2850, logs 3150, 7 metrics, 5400 app + 2700 judge model calls, 2700 Runs with both verdicts, 0 problems. Browser: Traces 4,653 → 4,681 after an appended 20-request `dev:batch`; `POST /ask` roots listed; Spans, Logs (3,150), Metrics and a selected metric's chart/summary, trace drawer captured | PASS |
 | INV-001–007 static checks | — | `mise run fmt`, `lints`, `py:lints`, `codegen:check`, `check:py-wheel-no-testing`, `pnpm run check`, full UI vitest (45), `git diff --check` (with `*.patch -whitespace`) | PASS |
 
 Diagnoses:
@@ -535,6 +535,22 @@ Diagnoses:
   the normalizer preserves identifier spelling. **Cause:** the expectation was
   wrong; DataFusion folds unquoted identifiers at execution. **Fix site:** the
   test expectation.
+- **Symptom:** V1 timed out after the appended batch, reading a Traces total of
+  0. **Evidence:** a manual probe against the same `dev:full` read 8 → 10 within
+  250 ms of each reload; while loading, the overview reads `Loading Traces, Error
+  spans…`. **Cause:** the test's `/Traces\s*([\d,]+)/` captured the comma, so a
+  loading overview read as 0, never NaN. Separately, `execFileSync` blocked the
+  test's event loop while services wrote to its pipe (app `BlockingIOError`).
+  **Fix site:** the test: the total needs a leading digit, and `dev:full` logs to
+  a file.
+- **Symptom:** V9 Trace roots listed 1,700 Wyrd `verification.attempt` roots and
+  none of the app's 3,000 requests. **Evidence:** every `POST /ask` and
+  `GET /openapi.json` span had a `parent_span_id` that no retained span held.
+  **Cause:** `scripts/batch.py` sent each request a `traceparent` with an
+  invented parent span id, only so readback could find it by a trace id it chose.
+  **Fix site:** the batch driver: plain requests, and readback counts the
+  traces holding the app's HTTP server span. The Agents SDK starts traces of its
+  own, so counting every support-desk trace would overcount (V2 read 36 for 20).
 - **Symptom:** UI vitest failed to load `examples/ui-app/.svelte-kit/tsconfig.json`.
   **Cause:** the example had never been synced. **Fix:** `svelte-kit sync`;
   environmental, no source change.
@@ -549,5 +565,9 @@ Limits and decisions:
   `bucket_counts` stay JSON numbers.
 - `record.logs` (span → logs) answers `unavailable`, because the logs filters
   have no trace or span column.
+- Review risk: the metric chart keeps one point per timestamp, so a series
+  with several attribute sets at one instant shows a legend mean (1.333 for
+  `http.server.active_requests`) that differs from the exact summary (0.6666).
+  The exact summary is the authority. The chart was not changed in this task.
 - Non-goals stayed excluded: no new wire encoding, no new query authority, no
   schema change, no page-owned data service.

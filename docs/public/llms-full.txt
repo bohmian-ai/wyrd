@@ -173,7 +173,7 @@ Wyrd verifies your system; your code runs it. Your app owns its code, models, an
 
 Page: /wyrd/get-started/setup/
 
-> Install the Wyrd 0.4.0 CLI and SDK for Python, Rust, or TypeScript, then let your coding agent start a local server and run a first verification, or do it by hand.
+> Install the Wyrd 0.4.1 CLI and SDK for Python, Rust, or TypeScript, then let your coding agent start a local server and run a first verification, or do it by hand.
 
 Install Wyrd, then set up the rest with your coding agent or by hand. Either way you end with a local server running and your code connected to it.
 
@@ -191,7 +191,7 @@ Install Wyrd, then set up the rest with your coding agent or by hand. Either way
 
 ```bash
 uv init quickstart && cd quickstart
-uv add "wyrd-ai==0.4.0"
+uv add "wyrd-ai==0.4.1"
 ```
 
 Run the CLI as `uv run wyrd`.
@@ -199,9 +199,9 @@ Run the CLI as `uv run wyrd`.
 **Rust**
 
 ```bash
-cargo install wyrd-cli --version 0.4.0 --locked
+cargo install wyrd-cli --version 0.4.1 --locked
 cargo new quickstart && cd quickstart
-cargo add wyrd-ai@0.4.0 tokio --features tokio/full
+cargo add wyrd-ai@0.4.1 tokio --features tokio/full
 ```
 
 **TypeScript**
@@ -209,7 +209,7 @@ cargo add wyrd-ai@0.4.0 tokio --features tokio/full
 ```bash
 mkdir quickstart && cd quickstart
 pnpm init && pnpm pkg set type=module
-pnpm add wyrd-ai@0.4.0
+pnpm add wyrd-ai@0.4.1
 ```
 
 Run the CLI as `pnpm wyrd`.
@@ -932,7 +932,7 @@ Wrap each request your app handles in a Run. Everything inside it (the model cal
 You need the support-desk Service from [Write a Verifier](/wyrd/build-and-verify/verify/author-a-verifier/) and a running server from [Set up Wyrd](/wyrd/get-started/setup/). Install the SDK with its telemetry and gateway extras, and the OpenAI client:
 
 ```bash
-uv add "wyrd-ai[otel,gateway]==0.4.0" openai
+uv add "wyrd-ai[otel,gateway]==0.4.1" openai
 ```
 
 ## 1. Connect at startup
@@ -1902,7 +1902,7 @@ Calls made before this step are never recorded.
 ## 4. Make a request
 
 ```bash
-uv add "wyrd-ai[gateway]==0.4.0" openai
+uv add "wyrd-ai[gateway]==0.4.1" openai
 ```
 
 ```python title="call.py"
@@ -1994,7 +1994,7 @@ Add `WyrdMiddleware` to any ASGI app, such as FastAPI, Starlette, Django, or Lit
 ## Install
 
 ```bash
-uv add "wyrd-ai[otel]==0.4.0" uvicorn
+uv add "wyrd-ai[otel]==0.4.1" uvicorn
 ```
 
 Add your framework too, such as `uv add fastapi`. Then pull the Service into the app's directory, at build or deploy time rather than when the app starts:

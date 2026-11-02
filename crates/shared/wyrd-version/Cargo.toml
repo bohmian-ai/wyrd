@@ -1,6 +1,7 @@
 [package]
 name = "wyrd-version"
 version = { workspace = true }
+description = "Semantic version newtype shared by Wyrd crates."
 edition = { workspace = true }
 license = { workspace = true }
 rust-version = { workspace = true }

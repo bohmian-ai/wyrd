@@ -51,7 +51,7 @@ Calls made before this step are never recorded.
 ## 4. Make a request
 
 ```bash
-uv add "wyrd-ai[gateway]==0.4.0" openai
+uv add "wyrd-ai[gateway]==0.4.1" openai
 ```
 
 ```python title="call.py"

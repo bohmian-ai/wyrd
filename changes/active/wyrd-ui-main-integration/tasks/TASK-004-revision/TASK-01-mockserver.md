@@ -1,7 +1,7 @@
 ---
 id: TASK-004-REV-01
 kind: implementation
-status: proposed
+status: review
 spec: SPEC-wyrd-ui-main-integration
 spec_revision: 18
 requirements: [REQ-037, AC-020, INV-001, INV-002, INV-004, INV-005]
@@ -220,4 +220,41 @@ container setup are implementation-owned; preserve fail-closed behavior.
 
 ## Execution Evidence
 
-Planning only. No service, gateway journey or implementation PASS is recorded.
+Implemented as dev tooling only, per the caller's constraint: "this is just for
+a dev workflow only ... all we need is an automatic way to stand the
+mockserver up so dev:full can run against a mock server".
+
+Owner revalidation: `mise.toml::dev:full` owns the dev processes;
+`scripts/postgres/dev-server.sh` already honors `WYRD_CONFIG_PATH` and
+`WYRD_SEALING_KEY_BASE64` through `WyrdServerConfig::load`;
+`GatewayConfig.endpoints.openai` is the existing override. Gap: no fixture
+service, no config pointing the override at it, and no sealing key, without
+which a tenant `managed_secret` provider credential is refused ("gateway
+credential protection is unavailable"). Added a `mockserver` service to
+`docker-compose.yml` (the existing dev container owner, beside Keycloak and
+Dex), fixtures in `tests/fixtures/mockserver/` (`expectations.json`,
+`server.toml`), a `dev:mockserver` task that owns a per-invocation Compose
+project and its readiness, and wired `dev:full` to it (per-run random sealing
+key; the database is discarded per run).
+`dev:both`, `dev:backend` and production config are unchanged.
+
+| Acceptance criterion | Implementation evidence | Verification evidence | Result |
+|---|---|---|---|
+| REQ-037/AC-020 fixture exchange through the real gateway | `tests/fixtures/mockserver/expectations.json`, `server.toml`, `mise.toml::dev:full` | V3: `dev:full` up; tenant `openai` deployment with dummy `sk-mockserver`; `POST :8080/v1/chat/completions` returned `lookup_order` call (A-1001), `You have a guaranteed refund.`, and the `gpt-6-luna` verdict; MockServer recorded 4 × `/v1/chat/completions` with `Bearer sk-mockserver`. Direct: shipping/refund/A-1001..3 matched; 20 concurrent repeats all identical. | PASS |
+| REQ-037/INV-002/004 explicit failures, no fallback, owned cleanup | `docker-compose.yml::mockserver` (`MOCKSERVER_ATTEMPT_TO_PROXY_IF_NO_MATCHING_EXPECTATION=false`, loopback publish); `mise.toml::dev:mockserver` (per-pid project, one bounded 60s loop requiring `/mockserver/ready` and every expectation active, `down` on exit) | Unmatched model/body → 404 direct and via gateway; occupied :1080 → Compose "port is already allocated", exit 1, other instance untouched; truncated expectations → "loaded 0 of 1 expectations within 60s", exit 1, no container left; SIGINT of `dev:mockserver` and `dev:full` → no containers, :1080/:8080/:3000 closed. | PASS |
+| INV-001/005 image identity/platform | `docker-compose.yml::mockserver` pinned digest | Pulled digest `sha256:016f7d16…df1`; index lists linux/amd64 and linux/arm64; ran on Linux x86_64 under colima. No OS-gated code. | PASS |
+| Existing contracts | diff: `docker-compose.yml`, `mise.toml`, `tests/fixtures/mockserver/*` only | No Rust, schema, provider, pricing, queue or SDK change; `git diff --check` clean. | PASS |
+
+Diagnosis, one `dev:full` run: "MockServer loaded 0 of 6". Symptom: the
+earlier check counted active expectations once, right after the first ready
+answer, so a slow JVM start under `dev:full` load could not be told apart
+from a broken file. Cause not isolated (timeout versus counting before load).
+Fix: a single bounded loop requiring ready and the full count together;
+later `dev:full` and `dev:mockserver` runs passed and a broken file still fails.
+
+Not done, by caller constraint: V1/V2 Rust journeys in `wyrd-testing --test
+gateway` (`dev_mockserver` module). The V3 runtime smoke above covers the same
+observations for this dev-only workflow. Provisioning the tenant's OpenAI
+credential/deployment on `dev:full` startup is left to Task 02 (it owns tenant
+initialization); the commands used are `wyrd gateway credential put` with
+`managed_secret` and `wyrd gateway deployment put`.

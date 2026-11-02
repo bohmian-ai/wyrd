@@ -1258,16 +1258,38 @@ trap 'kill $BACKEND_PID $FRONTEND_PID 2>/dev/null' EXIT INT TERM
 wait $BACKEND_PID $FRONTEND_PID
 """
 
+[tasks."dev:mockserver"]
+description = "Serve the checked-in OpenAI fixtures from MockServer on 127.0.0.1:1080"
+shell = "bash -c"
+run = """
+set -Eeuo pipefail
+compose=(docker compose --project-name "wyrd-dev-mockserver-$$" --file docker-compose.yml)
+trap '"${compose[@]}" down --remove-orphans >/dev/null 2>&1' EXIT INT TERM
+"${compose[@]}" up --detach mockserver
+want=$(grep -c '"priority"' tests/fixtures/mockserver/expectations.json)
+for _ in $(seq 1 60); do
+  got=$(curl -sf http://127.0.0.1:1080/mockserver/ready >/dev/null && curl -sf -X PUT 'http://127.0.0.1:1080/mockserver/retrieve?type=ACTIVE_EXPECTATIONS&format=JSON' | grep -c '"priority"' || true)
+  [[ ${got:-0} -eq $want ]] && break
+  sleep 1
+done
+[[ ${got:-0} -eq $want ]] || { echo "MockServer loaded ${got:-0} of $want expectations within 60s" >&2; exit 1; }
+printf "\nMockServer ready on http://127.0.0.1:1080 with %s OpenAI expectations\n\n" "$got"
+"${compose[@]}" logs --follow mockserver
+"""
+
 [tasks."dev:full"]
-description = "Boot wyrd-server and UI on :3000"
+description = "Boot MockServer, wyrd-server (OpenAI calls go to MockServer) and UI on :3000"
+shell = "bash -c"
 run = """
 cargo build -p wyrd-server
-scripts/postgres/dev-server.sh &
+mise run dev:mockserver &
+MOCK_PID=$!
+WYRD_CONFIG_PATH="$PWD/tests/fixtures/mockserver/server.toml" WYRD_SEALING_KEY_BASE64=$(openssl rand -base64 32) scripts/postgres/dev-server.sh &
 SERVER_PID=$!
 cd crates/wyrd/wyrd-server/wyrd-ui && pnpm install --frozen-lockfile && pnpm run dev --host 0.0.0.0 --port ${WYRD_UI_PORT:-3000} &
 UI_PID=$!
-trap 'kill $SERVER_PID $UI_PID 2>/dev/null' EXIT INT TERM
-wait $SERVER_PID $UI_PID
+trap 'kill $MOCK_PID $SERVER_PID $UI_PID 2>/dev/null' EXIT INT TERM
+wait -n $MOCK_PID $SERVER_PID $UI_PID
 """
 
 [tasks.check]

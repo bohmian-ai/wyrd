@@ -104,6 +104,22 @@ class Bifrost:
         """
         ...
 
+    def validate_predicate(self, namespace: str, name: str, expression: str) -> str:
+        """Validate one ``WHERE`` predicate over a table and return its normalized text.
+
+        Args:
+            namespace: the table's namespace.
+            name: the table's name.
+            expression: the predicate, without the ``WHERE`` keyword.
+
+        Returns:
+            The server-normalized predicate.
+
+        Raises:
+            WyrdError: the server's invalid-SQL, authorization, not-found, or transport code.
+        """
+        ...
+
     def __getattr__(self, name: str) -> Any: ...
 
 def __getattr__(name: str) -> Any: ...

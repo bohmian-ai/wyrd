@@ -304,6 +304,17 @@ pub fn normalize_predicate(
 }
 
 /// Refuse every construct a predicate may not hold, and unknown columns.
+///
+/// Walks the parsed expression once; only column references, literals, and
+/// the comparison, boolean, `IN`, `BETWEEN`, `LIKE`/`ILIKE`, and `IS` forms matched
+/// below are admitted, so a validated predicate can never read another table
+/// or call a function.
+///
+/// # Errors
+///
+/// Returns [`ValaError::QueryInvalidSql`] naming the
+/// first refused construct: a parameter, an operator or expression outside the
+/// grammar, or a column `column` does not accept.
 fn check_predicate(expr: &Expr, column: &impl Fn(&str) -> bool) -> Result<(), WyrdError> {
     match expr {
         Expr::Identifier(ident) => check_column(ident, column),
@@ -405,6 +416,14 @@ fn is_literal(expr: &Expr) -> bool {
 }
 
 /// Refuse a column reference the table does not describe.
+///
+/// A quoted identifier is matched exactly; an unquoted one is folded to lower
+/// case first, as SQL resolves it.
+///
+/// # Errors
+///
+/// Returns [`ValaError::QueryInvalidSql`] naming the
+/// column when `column` rejects it.
 fn check_column(ident: &Ident, column: &impl Fn(&str) -> bool) -> Result<(), WyrdError> {
     let name = if ident.quote_style.is_some() {
         ident.value.clone()

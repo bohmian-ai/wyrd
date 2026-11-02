@@ -188,6 +188,10 @@ pub fn router() -> OpenApiRouter<AppState> {
 /// Returns `WYRD_SPEC_400_VALIDATION` when the body does not decode as a
 /// `ValidatePredicateRequest`; otherwise the authorization, catalog, or
 /// predicate errors of [`service::validate_predicate`].
+///
+/// The `vala.query.validate_predicate` span skips state, the caller's
+/// credentials, and the body, so the predicate never enters a trace.
+#[tracing::instrument(name = "vala.query.validate_predicate", level = "debug", skip_all)]
 pub(crate) async fn validate_predicate(
     State(state): State<AppState>,
     caller: Caller,

@@ -343,8 +343,13 @@ pub async fn validate_predicate(
         .table_uid(&table, caller.data_tenant_id)
         .await
         .map_err(|error| WyrdError::from(error.into_public()))?;
-    let granted =
-        |permission: &Permission| caller.principal.effective_permissions.contains(permission);
+    let granted = |permission: &Permission| {
+        state
+            .auth
+            .permission_check
+            .check(&caller.principal, permission)
+            == PermissionVerdict::Allow
+    };
     if !granted(&Permission {
         resource: Resource::BifrostQuery,
         action: Action::Read,

@@ -110,6 +110,7 @@
     position: sticky;
     top: 0;
     flex: 0 0 212px;
+    min-width: 0;
     box-sizing: border-box;
     height: 100vh;
     display: flex;
@@ -218,6 +219,7 @@
     border-top: 1px solid var(--border-soft);
   }
   summary {
+    min-width: 0;
     display: flex;
     align-items: center;
     gap: 8px;

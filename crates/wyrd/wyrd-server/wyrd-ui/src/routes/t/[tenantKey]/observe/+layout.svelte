@@ -375,8 +375,9 @@
   }
   .tabs {
     display: flex;
-    flex-wrap: wrap;
     align-self: stretch;
+    max-width: 100%;
+    overflow-x: auto;
   }
   .tabs a,
   .tabs span {
@@ -386,6 +387,7 @@
     color: var(--muted);
     font: 13px var(--font-mono);
     text-decoration: none;
+    white-space: nowrap;
   }
   .tabs a[aria-current='page'] {
     box-shadow: inset 0 -2px 0 var(--declare);
@@ -544,6 +546,8 @@
   }
   .segmented {
     display: inline-flex;
+    flex-wrap: wrap;
+    max-width: 100%;
   }
   .segmented a,
   .segmented span {
@@ -555,6 +559,7 @@
     color: var(--muted);
     font: 12px var(--font-mono);
     text-decoration: none;
+    white-space: nowrap;
   }
   .segmented > * + * {
     margin-left: -1px;
@@ -634,8 +639,10 @@
   }
   .rail li a {
     display: flex;
+    flex-wrap: wrap;
     justify-content: space-between;
-    gap: 8px;
+    gap: 2px 8px;
+    overflow-wrap: anywhere;
     padding: 8px 12px;
     color: var(--text);
     font: 12px var(--font-mono);
@@ -647,6 +654,10 @@
   .rail li a[aria-current='true'] {
     background: var(--declare-soft);
     box-shadow: inset 2px 0 0 var(--declare);
+  }
+  .rail .type {
+    margin-left: auto;
+    white-space: nowrap;
   }
   .type {
     margin: 0;

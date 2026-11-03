@@ -304,3 +304,90 @@ intact; do not weaken Wyrd's documented scope or fabricate comparative proof.
 [agent surfaces](../../../../agent_docs/agent-surfaces.md),
 [execution](../../../implementation-execution.md), and
 [testing](../../../../TESTING.md).
+
+## Implementation evidence
+
+Spec revision 2 was still `draft` when this was implemented at the maintainer's
+direct request. It only narrows revision 1 by removing benchmark publication.
+
+### Reuse and gap
+
+| Need | Existing owner reused | Gap closed |
+| --- | --- | --- |
+| Use-case hub and comparison | `get-started/` section, frontmatter-derived nav, landing `startPages` | One thin page `get-started/what-can-i-build.md` (order 4; coding-agent page moved to 5) |
+| Machine onboarding | `generate_llms_txt.py` `START` list, published-only filter | Third `START` step; no new discovery logic |
+| Agent onboarding | `setup-prompt.md` step 7, `GuideTopic::Start` docs step | Real hub link replaces "Choose your path"; guide names the hub after quickstart; wire contract unchanged |
+| Policy workflow | Recipes Uploaded files, `fixtures/cards/uploaded_artifacts/handbook-*.yaml` | Added binding, Python call, citation inspection, `fs.read` grant, deterministic-rule and verify/submit guidance |
+| Check selection | Recipes opening table | One row reworded to name policy decisions; no second table |
+| Architecture / Bifrost | `understand/how-verification-works`, `bifrost`, `architecture` | Linked only; no new architecture section, no benchmarks |
+
+### Acceptance
+
+| Acceptance criterion | Implementation evidence | Verification evidence | Result |
+|---|---|---|---|
+| REQ-001, INV-001 | `README.md` opening, `get-started/introduction.md`, hub intro: production verification across AI/ML and workflows; app owns execution/enforcement | Source review; readers 1–4 state Wyrd does not orchestrate/enforce | PASS |
+| REQ-002 | Six grey (`555555`) shields badges with `Use case: …` alt text, each linking a hub anchor | Shields SVG titles fetched (`Policy verification`, `Long-horizon workflows`); `docs:check` link and a11y pass | PASS |
+| REQ-003, INV-002 | Hub `## How Wyrd compares`: Platform / Main focus / Why choose Wyrd?, six rows, no OPA/status/checkmarks; MLflow coexistence and "no built-in MLflow connector"; Phoenix vs Arize AX separated; sources dated 2026-11-03 (recorded check the same day) | Source review; readers 3 and 4 report no connector and coexistence | PASS |
+| REQ-004, INV-002 | Comparison rows name exact versions, composed checks, cited verdicts, grouped/scheduled checks; links to how-verification-works, bifrost, architecture; no figures | `git diff 5aaa38937` review: no benchmark/throughput content | PASS |
+| REQ-005, INV-003 | `START` step 3, landing CTA, quickstart "simplest" + Next, coding-agent Next, intro Next, MCP guide, setup prompt link | RED: `indexes.test.ts` start-route and omission tests failed before the page existed; GREEN: focused vitest 62/62; `docs:check` 100/100 incl. draft exclusion; prompt URL `https://docs.bohmian.ai/wyrd/get-started/what-can-i-build/` is the published route | PASS |
+| REQ-006, INV-001 | Recipes Uploaded files completion reusing tested fixtures | `uploaded_artifacts_are_reused_by_service_judges` journey PASS (scripted model) | PASS |
+| REQ-007 | Eight fresh-context readers, below | Answers recorded below | PASS |
+
+### Commands
+
+| Command | Result |
+| --- | --- |
+| `mise exec -- pnpm --dir docs exec vitest run src/lib/derived-nav.test.ts src/lib/content.test.ts src/lib/indexes.test.ts src/routes/shell-links.test.ts src/lib/readme.test.ts` | RED 2 failed before page; then 62 passed |
+| `mise exec -- cargo nextest run --locked -p wyrd-spec --lib -E 'test(=mcp::tests::setup_prompt_names_its_release_and_holds_no_secret)'` | 1 passed |
+| `... wyrd-mcp --test mcp -P journey ... test(=discovery::pg_tests::agent_discovers_mcp_guide_and_sql_examples)` | 1 passed |
+| `... wyrd-ai --test integration -P journey ... test(=verifier_building_blocks::uploaded_artifacts_are_reused_by_service_judges)` | 1 passed |
+| `mise run docs:generate && mise run docs:check` | exit 0 after committing generated output (100 tests, links, build, a11y 31 pages) |
+| `cargo fmt --check -p wyrd-server`, `git diff --check` | clean |
+
+### Reader exercises
+
+Model `claude-sonnet-5-5` via fresh `general-purpose` subagents, docs revision
+`fb7db48c3`, 2026-11-03. Entry points: **public** = rendered `docs/build` HTML
+only (no llms files), start at `index.html`; **MCP** = `wyrd.guide`
+`start` text extracted verbatim from `GuideTopic::Start`, the setup prompt,
+`llms.txt`, `llms-full.txt`. Each prompt restricted reads to that directory,
+no web, no Wyrd execution, and asked for ≤300 words plus files read.
+
+Questions: (1) "Our payment service approves refunds and payouts. Every payment
+event must follow a policy document our compliance team maintains. How do we use
+Wyrd to verify each payment decision against that policy?" (2) "We run an AI
+coding and code-review workflow that runs for several hours across many steps.
+How can Wyrd verify it?" (3) "Our models and experiment results already live in
+MLflow. Can we use Wyrd, and how would it fit with MLflow?" (4) "We already run a
+tracing/evaluation tool (Langfuse) and an LLM gateway in production. Should we
+use Wyrd, and how would it fit with what we have?"
+
+| Problem | Entry | Sources read | Answer summary | Rubric |
+| --- | --- | --- | --- | --- |
+| 1 Payment policy | public | index → what-can-i-build → verifier-recipes → how-verification-works → runtime limits | Upload policy Artifact `--extract`; Agent check mounts pinned version, `fs.read`, cites line; `assert`/`code` for limits; send decision facts; app approves/holds/escalates; `tool:invoke` grant; Wyrd does not enforce | PASS |
+| 1 Payment policy | MCP | guide start → llms-full What can I build?, Recipes Uploaded files, How verification works | Same composition; `decide` combines; inconclusive ≠ approved; new Verifier version for new policy | PASS |
+| 2 Long workflow | public | index → what-can-i-build → limits → verifier-card → recipes → record-a-run → bind-a-verifier → how-verification-works | Per-step verify with one `group_id`, grouped-session `group_end`, trace order check; verify/submit/scheduled; code/framework runs workflow. Missed that `after:` sets the quiet window | PASS |
+| 2 Long workflow | MCP | guide start → llms-full hub, Recipes Grouped session/Trace, How verification works | Same, including `after: 10m`; Wyrd records and judges, does not orchestrate | PASS |
+| 3 MLflow | public | grep → what-can-i-build | Keep MLflow as record; send chosen evidence with MLflow ID; no built-in connector, Wyrd reads nothing from MLflow | PASS |
+| 3 MLflow | MCP | guide start → llms-full hub | Same; suggests an ID column in a custom table (labelled as its own suggestion) | PASS |
+| 4 Existing tools | MCP | guide start → llms-full hub, LLM gateway, ASGI | Overlap in tracing/eval; broader verification role; nothing replaced; OTLP ingest; no Langfuse/gateway connector, no trace import | PASS |
+| 4 Existing tools | public | index → introduction → set-up-the-llm-gateway → architecture → bifrost → runs-and-evidence → integrate-asgi → what-can-i-build | Overlap in tracing/eval and gateway; broader verification role; nothing replaced; OTLP ingest; no Langfuse/gateway connector; dual export or carrying trace IDs labelled undocumented/untested | PASS |
+
+All eight answers meet their rubric; none invented a connector or made Wyrd the
+workflow executor or enforcer. Only one omission (2/public: missed that `after:`
+sets the quiet window) remained, and the recipe already states it, so no repair
+was needed.
+
+### Limits and non-goals
+
+- The MCP entry was simulated from the exact `wyrd.guide start` source and the
+  generated indexes, because the session's Wyrd MCP server failed to connect.
+- The policy workflow is proven by the scripted-model SDK journey, not by a run
+  against a real provider at the documented release (no provider key was
+  available). Real-model judgment quality is not established.
+- Vendor facts rely on the task's 2026-11-03 official-source check (same day);
+  they were not re-fetched.
+- Excluded, as required: runtime, schema, MCP tool, and CLI changes; benchmarks;
+  new architecture sections; vendor integrations; draft-page publication. No
+  unrelated files changed. `review/TASK-001-review-02/` belongs to TASK-001 and
+  is left untouched.

@@ -224,15 +224,22 @@ pub async fn check_password(
 
 /// Run one derivation under a process permit on the blocking pool.
 ///
+/// The permit moves into the blocking job, so a cancelled caller (a request
+/// timeout drops its future) cannot free capacity while the derivation still
+/// runs.
+///
 /// # Errors
 /// Returns [`WyrdError::Internal`] when the permit or blocking task fails.
 async fn bounded<T: Send + 'static>(
     work: impl FnOnce() -> T + Send + 'static,
 ) -> Result<T, WyrdError> {
-    let _permit = KDF.acquire().await.map_err(|_| kdf_failed())?;
-    tokio::task::spawn_blocking(work)
-        .await
-        .map_err(|_| kdf_failed())
+    let permit = KDF.acquire().await.map_err(|_| kdf_failed())?;
+    tokio::task::spawn_blocking(move || {
+        let _permit = permit;
+        work()
+    })
+    .await
+    .map_err(|_| kdf_failed())
 }
 
 /// Derive a PHC verifier synchronously.
@@ -778,9 +785,74 @@ mod tests {
     use secrecy::{ExposeSecret as _, SecretString};
     use wyrd_spec::error::WyrdError;
 
-    use super::{PasswordCheck, canonical_username, check_password, hash_password, new_password};
+    use super::{
+        KDF, KDF_PERMITS, PasswordCheck, bounded, canonical_username, check_password,
+        hash_password, new_password,
+    };
+
+    /// Cancelling the callers of running derivations keeps their capacity held
+    /// until the derivations themselves finish.
+    ///
+    /// # Panics
+    /// Panics when a job fails to start or finish, or capacity is freed early.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn cancelled_callers_keep_derivation_capacity() {
+        let (started, starts) = std::sync::mpsc::channel();
+        let mut releases = Vec::new();
+        let mut callers = Vec::new();
+        for _ in 0..KDF_PERMITS {
+            let (release, wait) = std::sync::mpsc::channel::<()>();
+            releases.push(release);
+            let started = started.clone();
+            callers.push(tokio::spawn(bounded(move || {
+                started.send(()).expect("test receives starts");
+                wait.recv().expect("test releases the job");
+            })));
+        }
+        for _ in 0..KDF_PERMITS {
+            starts.recv().expect("job starts");
+        }
+        for caller in callers {
+            caller.abort();
+            assert!(
+                caller
+                    .await
+                    .expect_err("caller is cancelled")
+                    .is_cancelled()
+            );
+        }
+        assert_eq!(
+            KDF.available_permits(),
+            0,
+            "cancelled callers freed capacity"
+        );
+
+        let fifth = started.clone();
+        let queued = tokio::spawn(bounded(move || {
+            fifth.send(()).expect("test receives starts");
+        }));
+        assert!(
+            starts.try_recv().is_err(),
+            "a fifth job started beside four"
+        );
+        releases
+            .pop()
+            .expect("one job")
+            .send(())
+            .expect("job waits");
+        starts
+            .recv()
+            .expect("the fifth job starts once one finishes");
+        queued.await.expect("fifth caller").expect("fifth job");
+        for release in releases {
+            release.send(()).expect("job waits");
+        }
+    }
 
     /// Usernames trim and lowercase, and keep only the canonical handle shape.
+    ///
+    /// # Panics
+    /// Panics when a valid handle is refused or an invalid one accepted.
     #[test]
     fn usernames_canonicalize_or_refuse() {
         assert_eq!(canonical_username("  Dev.User_1 ").unwrap(), "dev.user_1");
@@ -790,6 +862,9 @@ mod tests {
     }
 
     /// New passwords are NFC, length-bounded, control-free and uncommon.
+    ///
+    /// # Panics
+    /// Panics when a valid password is refused or an invalid one accepted.
     #[test]
     fn new_passwords_follow_the_policy() {
         let ok = |raw: &str| new_password(&SecretString::from(raw.to_owned()), "password");
@@ -812,6 +887,9 @@ mod tests {
     }
 
     /// A verifier matches only its password and needs no rehash at baseline.
+    ///
+    /// # Panics
+    /// Panics when hashing fails or a verifier matches the wrong password.
     #[tokio::test]
     async fn verifiers_match_only_their_password() {
         let password = SecretString::from("Correct Horse Battery".to_owned());

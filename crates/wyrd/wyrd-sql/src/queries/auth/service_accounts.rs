@@ -398,7 +398,7 @@ pub async fn insert_api_key(
 /// # Errors
 /// Returns the database error when the insert fails, including when `prefix`
 /// collides or `user_id` names no User.
-#[allow(
+#[expect(
     clippy::too_many_arguments,
     reason = "this mirrors one table's column list on a single-row insert, as `upsert_platform_oidc_connection` does."
 )]

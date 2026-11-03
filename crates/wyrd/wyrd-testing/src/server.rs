@@ -3159,6 +3159,45 @@ impl WyrdTestServer {
         ))
     }
 
+    /// Store `count` more keys owned by User `user`, all created at one
+    /// instant so every page boundary between them is a creation-time tie;
+    /// returns their ids. The keys hold no usable secret: they exist to page
+    /// metadata, never to exchange.
+    ///
+    /// # Errors
+    /// Returns an error when the tenant connection or the insert fails,
+    /// including when `user` names no User in the fixture tenant.
+    pub async fn seed_user_keys(
+        &self,
+        user: PrincipalId,
+        count: usize,
+    ) -> Result<Vec<Uuid>, WyrdTestServerError> {
+        let count = i32::try_from(count)
+            .map_err(|_| WyrdTestServerError::Auth("too many keys".to_owned()))?;
+        let mut conn = self.tenant_conn().await?;
+        let ids: Vec<Uuid> = sqlx::query_scalar(
+            r#"
+            INSERT INTO wyrd.auth_api_keys (
+                id, data_tenant_id, principal_id, user_id, prefix, key_hash,
+                sub_principal_id, act_principal_id, name, permission_ceiling, expires_at
+            )
+            SELECT gen_random_uuid(), $1, $2, $2, 'wyrd_sk_seed_' || gen_random_uuid(),
+                   md5(gen_random_uuid()::text), $2, $2, 'seeded-' || n, '["cards:read"]',
+                   statement_timestamp() + interval '1 hour'
+              FROM generate_series(1, $3) AS n
+            RETURNING id
+            "#,
+        )
+        .bind(conn.data_tenant_id().as_uuid())
+        .bind(user.as_uuid())
+        .bind(count)
+        .fetch_all(&mut **conn.transaction())
+        .await
+        .map_err(sql)?;
+        conn.commit().await.map_err(sql)?;
+        Ok(ids)
+    }
+
     /// POST `body` to `uri` as a same-origin browser with `cookie`; returns the
     /// response headers and JSON body of a success.
     ///

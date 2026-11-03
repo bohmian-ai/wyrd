@@ -7,6 +7,8 @@
 //! inactive-authority sessions all refuse; logout ends only its own session;
 //! and a store outage is unavailable rather than any fallback.
 
+use std::collections::BTreeSet;
+
 use axum::body::{Body, to_bytes};
 use axum::http::{HeaderMap, Method, Request, StatusCode, header};
 use secrecy::{ExposeSecret as _, SecretString};
@@ -906,6 +908,21 @@ async fn admin_bearer(server: &WyrdTestServer, tenant: wyrd_spec::DataTenantId) 
         .expect("admin exchanges")
 }
 
+/// Assert `response` carries a one-time secret no cache may keep.
+///
+/// # Panics
+/// Panics when `Cache-Control: no-store` is absent.
+fn assert_no_store(response: &BrowserResponse) {
+    assert_eq!(
+        response
+            .headers
+            .get(header::CACHE_CONTROL)
+            .map(axum::http::HeaderValue::as_bytes),
+        Some(&b"no-store"[..]),
+        "a secret-bearing response must be no-store"
+    );
+}
+
 /// Issue an invitation for the built-in `role` with `bearer`; returns the
 /// response.
 async fn invite(
@@ -1205,6 +1222,58 @@ async fn local_signup_login_and_password_lifecycle() {
     );
 }
 
+/// Malformed and schema-invalid bodies on every password route are the
+/// canonical validation problem and never echo the submitted secret.
+///
+/// # Panics
+/// Panics when the server fails to start or any expectation fails.
+#[tokio::test(flavor = "current_thread")]
+async fn password_routes_refuse_invalid_bodies() {
+    let server = WyrdTestServer::start_in_process()
+        .await
+        .expect("test server starts");
+    let secret = "invalid-body-secret-0451";
+    for operation in ["signup", "login", "change", "reset"] {
+        let malformed = server
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri(format!("/auth/browser/password/{operation}"))
+                    .header(header::HOST, "wyrd.test")
+                    .header(header::ORIGIN, ORIGIN)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(format!("{{\"password\":\"{secret}\"")))
+                    .expect("request builds"),
+            )
+            .await
+            .expect("request responds");
+        let status = malformed.status();
+        let kind = malformed.headers().get(header::CONTENT_TYPE).cloned();
+        let bytes = to_bytes(malformed.into_body(), 1 << 20)
+            .await
+            .expect("response body reads");
+        let body: Value = serde_json::from_slice(&bytes).expect("problem is JSON");
+        let invalid = password(&server, operation, json!({ "password": secret })).await;
+        for (status, kind, body) in [
+            (status, kind, body),
+            (
+                invalid.status,
+                invalid.headers.get(header::CONTENT_TYPE).cloned(),
+                invalid.body,
+            ),
+        ] {
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{operation}: {body}");
+            assert_eq!(body["code"], "WYRD_SPEC_400_VALIDATION", "{operation}");
+            assert_eq!(
+                kind.as_ref().map(axum::http::HeaderValue::as_bytes),
+                Some(&b"application/problem+json"[..]),
+                "{operation}"
+            );
+            assert!(!body.to_string().contains(secret), "{operation} echoes");
+        }
+    }
+}
+
 /// Enrollment and sign-in are bound to one tenant and one live invitation,
 /// concurrent use enrolls once with no partial User, administration is
 /// required to invite, and password failures are counted per account until
@@ -1468,6 +1537,7 @@ async fn user_keys_preserve_owner_scope_and_credential_lifecycle() {
     )
     .await;
     assert_eq!(issued.status, StatusCode::OK, "{}", issued.body);
+    assert_no_store(&issued);
     let key = SecretString::from(issued.body["credential"].as_str().expect("key").to_owned());
     let key_id = Uuid::parse_str(issued.body["id"].as_str().expect("id")).expect("uuid");
     let (owner, account, name, ceiling, expires): (
@@ -1624,13 +1694,59 @@ async fn user_keys_preserve_owner_scope_and_credential_lifecycle() {
     .await;
     assert_eq!(overflow.status, StatusCode::BAD_REQUEST);
 
+    // More than a full page of keys created at one instant pages exactly once.
+    let mut expected: BTreeSet<String> = server
+        .seed_user_keys(
+            wyrd_runtime::PrincipalId::new(Uuid::parse_str(&user).expect("uuid")),
+            105,
+        )
+        .await
+        .expect("keys seed")
+        .iter()
+        .map(Uuid::to_string)
+        .collect();
+    let mut seen = Vec::new();
+    let mut cursor: Option<String> = None;
+    loop {
+        let uri = match &cursor {
+            Some(cursor) => format!("{keys}?limit=100&cursor={cursor}"),
+            None => format!("{keys}?limit=100"),
+        };
+        let page = as_browser(&server, Method::GET, &uri, &acme, &fresh, None).await;
+        assert_eq!(page.status, StatusCode::OK, "{}", page.body);
+        let rows = page.body["credentials"].as_array().expect("credentials");
+        assert!(rows.len() <= 100);
+        seen.extend(
+            rows.iter()
+                .map(|row| row["id"].as_str().expect("id").to_owned()),
+        );
+        match page.body.get("next_cursor").and_then(Value::as_str) {
+            Some(next) => cursor = Some(next.to_owned()),
+            None => break,
+        }
+    }
+    let unique: BTreeSet<String> = seen.iter().cloned().collect();
+    assert_eq!(unique.len(), seen.len(), "a key was listed twice");
+    expected.extend(
+        first.body["credentials"]
+            .as_array()
+            .expect("credentials")
+            .iter()
+            .chain(rest.body["credentials"].as_array().expect("credentials"))
+            .map(|row| row["id"].as_str().expect("id").to_owned()),
+    );
+    assert_eq!(unique, expected);
+
     // Administrators keep the complete listing and the account shapes.
     let complete = as_bearer(&server, Method::GET, &keys, &admin, None).await;
     assert_eq!(complete.status, StatusCode::OK, "{}", complete.body);
-    assert_eq!(
-        complete.body["credentials"].as_array().map(Vec::len),
-        Some(3)
-    );
+    let listed: BTreeSet<String> = complete.body["credentials"]
+        .as_array()
+        .expect("credentials")
+        .iter()
+        .map(|row| row["id"].as_str().expect("id").to_owned())
+        .collect();
+    assert_eq!(listed, expected);
     let account_keys = format!("/v1/principals/{service_id}/credentials");
     let with_body = as_bearer(&server, Method::POST, &account_keys, &admin, body.clone()).await;
     assert_eq!(
@@ -1641,6 +1757,7 @@ async fn user_keys_preserve_owner_scope_and_credential_lifecycle() {
     );
     let plain = as_bearer(&server, Method::POST, &account_keys, &admin, None).await;
     assert_eq!(plain.status, StatusCode::OK, "{}", plain.body);
+    assert_no_store(&plain);
     let listed = as_bearer(&server, Method::GET, &account_keys, &admin, None).await;
     assert!(
         listed.body["credentials"][0].get("name").is_none(),
@@ -1649,6 +1766,7 @@ async fn user_keys_preserve_owner_scope_and_credential_lifecycle() {
     );
     let for_user = as_bearer(&server, Method::POST, &keys, &admin, body.clone()).await;
     assert_eq!(for_user.status, StatusCode::OK, "{}", for_user.body);
+    assert_no_store(&for_user);
     let service_me = as_bearer(&server, Method::GET, "/v1/principals/me", &admin, None).await;
     assert_eq!(service_me.status, StatusCode::FORBIDDEN);
 

@@ -22,6 +22,7 @@
 use std::net::{IpAddr, SocketAddr};
 
 use axum::Json;
+use axum::extract::rejection::JsonRejection;
 use axum::extract::{ConnectInfo, Extension, Query, State};
 use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
 use axum::response::{IntoResponse, Response};
@@ -39,7 +40,7 @@ use wyrd_spec::ids::TenantSlug;
 use wyrd_spec::request_id::RequestId;
 
 use crate::auth::{RequestOrigin, auth_not_configured};
-use crate::http::error::WyrdErrorResponse;
+use crate::http::error::{WyrdErrorResponse, body_rejection};
 use crate::state::AppState;
 
 /// Request extension marking recent human sign-in proof: the request was
@@ -225,8 +226,9 @@ pub async fn login(
     State(state): State<AppState>,
     RequestOrigin(origin): RequestOrigin,
     headers: HeaderMap,
-    Json(request): Json<BrowserLoginRequest>,
+    request: Result<Json<BrowserLoginRequest>, JsonRejection>,
 ) -> Result<Response, WyrdErrorResponse> {
+    let Json(request) = request.map_err(|rejection| body_rejection(&rejection))?;
     require_same_origin(&headers, &origin)?;
     let begun = browser_sessions(&state)?
         .begin(&request.tenant, &origin)
@@ -388,8 +390,9 @@ pub async fn api_key(
     RequestOrigin(origin): RequestOrigin,
     headers: HeaderMap,
     id: Option<Extension<RequestId>>,
-    Json(request): Json<BrowserApiKeyRequest>,
+    request: Result<Json<BrowserApiKeyRequest>, JsonRejection>,
 ) -> Result<Response, WyrdErrorResponse> {
+    let Json(request) = request.map_err(|rejection| body_rejection(&rejection))?;
     require_same_origin(&headers, &origin)?;
     let sessions = browser_sessions(&state)?;
     let api_key = request.api_key.into_secret_string();
@@ -519,8 +522,9 @@ pub async fn logout(
     State(state): State<AppState>,
     RequestOrigin(origin): RequestOrigin,
     headers: HeaderMap,
-    Json(request): Json<BrowserLogoutRequest>,
+    request: Result<Json<BrowserLogoutRequest>, JsonRejection>,
 ) -> Result<Response, WyrdErrorResponse> {
+    let Json(request) = request.map_err(|rejection| body_rejection(&rejection))?;
     require_same_origin(&headers, &origin)?;
     let sessions = browser_sessions(&state)?;
     for (label, value) in session_cookies(&headers) {
@@ -576,8 +580,9 @@ pub async fn password_signup(
     RequestOrigin(origin): RequestOrigin,
     headers: HeaderMap,
     id: Option<Extension<RequestId>>,
-    Json(request): Json<PasswordSignupRequest>,
+    request: Result<Json<PasswordSignupRequest>, JsonRejection>,
 ) -> Result<Response, WyrdErrorResponse> {
+    let Json(request) = request.map_err(|rejection| body_rejection(&rejection))?;
     require_same_origin(&headers, &origin)?;
     let sessions = browser_sessions(&state)?;
     let created = sessions
@@ -622,8 +627,9 @@ pub async fn password_login(
     headers: HeaderMap,
     id: Option<Extension<RequestId>>,
     connect: Option<Extension<ConnectInfo<SocketAddr>>>,
-    Json(request): Json<PasswordLoginRequest>,
+    request: Result<Json<PasswordLoginRequest>, JsonRejection>,
 ) -> Result<Response, WyrdErrorResponse> {
+    let Json(request) = request.map_err(|rejection| body_rejection(&rejection))?;
     require_same_origin(&headers, &origin)?;
     let sessions = browser_sessions(&state)?;
     let created = sessions
@@ -672,8 +678,9 @@ pub async fn password_change(
     RequestOrigin(origin): RequestOrigin,
     headers: HeaderMap,
     connect: Option<Extension<ConnectInfo<SocketAddr>>>,
-    Json(request): Json<PasswordChangeRequest>,
+    request: Result<Json<PasswordChangeRequest>, JsonRejection>,
 ) -> Result<Response, WyrdErrorResponse> {
+    let Json(request) = request.map_err(|rejection| body_rejection(&rejection))?;
     require_same_origin(&headers, &origin)?;
     let sessions = browser_sessions(&state)?;
     let tenant = request.tenant.clone();
@@ -726,8 +733,9 @@ pub async fn password_reset(
     State(state): State<AppState>,
     RequestOrigin(origin): RequestOrigin,
     headers: HeaderMap,
-    Json(request): Json<PasswordResetRequest>,
+    request: Result<Json<PasswordResetRequest>, JsonRejection>,
 ) -> Result<Response, WyrdErrorResponse> {
+    let Json(request) = request.map_err(|rejection| body_rejection(&rejection))?;
     require_same_origin(&headers, &origin)?;
     browser_sessions(&state)?.password_reset(request).await?;
     Ok(with_cookies(StatusCode::NO_CONTENT, Vec::new(), ()))

@@ -400,7 +400,7 @@ async fn issue_credential(
     recent: Option<Extension<RecentHumanLogin>>,
     principal_id: Result<Path<Uuid>, PathRejection>,
     request: Result<Option<Json<CreateUserCredentialRequest>>, JsonRejection>,
-) -> Result<Json<IssuedCredential>, WyrdErrorResponse> {
+) -> Result<axum::response::Response, WyrdErrorResponse> {
     let Path(principal_id) = principal_id.map_err(|rejection| path_rejection(&rejection))?;
     let request = request
         .map_err(|rejection| body_rejection(&rejection))?
@@ -466,7 +466,8 @@ async fn issue_credential(
         (false, None) => mint_credential(&mut conn, principal_id, caller.attribution()).await?,
     };
     conn.commit().await.map_err(internal)?;
-    Ok(Json(issued))
+    // The plaintext appears once, in this response; no cache may keep it.
+    Ok(crate::auth::oauth::no_store(StatusCode::OK, Json(issued)))
 }
 
 /// List a principal's credential metadata.

@@ -1,7 +1,7 @@
 ---
 id: SPEC-local-init-cleanup
 revision: 1
-status: draft
+status: approved
 ---
 
 # Local setup and verification documentation cleanup
@@ -22,9 +22,9 @@ is actually ready, configured and saved.
 
 On 2026-11-03 the maintainer approved the documentation direction, then asked
 to keep both tasks in the existing change packet and create one shared spec.
-This draft consolidates those recorded decisions and the existing setup task.
-It awaits approval as a combined revision; prior discussion is not presented
-as approval of this new document. Only the two bounded tasks below are in scope:
+This revision consolidates those recorded decisions and the existing setup task.
+The maintainer explicitly approved spec revision 1 when requesting TASK-001
+review on 2026-11-03. Only the two bounded tasks below are in scope:
 
 - [TASK-001 — local setup cleanup](tasks/TASK-001-local-setup-cleanup.md).
 - [TASK-002 — verification documentation](tasks/TASK-002-document-verification-scope.md).
@@ -208,3 +208,5 @@ Authorities: [repository rules](../../../AGENTS.md),
   and documentation tasks into one change specification at the maintainer's
   request. Recorded the previously agreed documentation direction and the
   bounded startup/reporting outcomes. Combined revision awaits human approval.
+- Revision 1 approved, 2026-11-03: explicit maintainer approval recorded with
+  the TASK-001 review request; no requirement or acceptance behavior changed.

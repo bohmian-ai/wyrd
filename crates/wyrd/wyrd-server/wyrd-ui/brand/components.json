@@ -522,7 +522,7 @@
       "rules": [
         "inline SVG 300x148, multi-series, dashed gridlines",
         "series take no colour prop: stroke, stroke-dasharray and marker shape are chosen by series position from a fixed four-style table; more than four series are rejected, so a serialized view can never name a token",
-        "each series MUST carry a distinct dash and marker (solid square, '6 3' circle, '2 3' triangle, '8 2 2 2' diamond) in --declare, --observe, --text, --muted, and the legend MUST mirror both as a line sample, not a block swatch. Hue alone cannot separate two percentiles.",
+        "each series MUST carry a distinct dash and marker (solid square, '6 3' circle, '2 3' triangle, '8 2 2 2' diamond) in --declare, --observe, --series-3, --series-4, --series-5 by position (a host may name a semantic series explicitly, e.g. p95 --observe and p50 --declare), and the legend MUST mirror both as a line sample, not a block swatch. Hue alone cannot separate two percentiles.",
         "a threshold is drawn as a labeled dashed rule plus a positional tick on the axis — never an unlabeled red line",
         "values are reported by a tooltip pinned to the point under the cursor. It is not pointer-only: focusing the plot opens it on the most recent point and arrow/Home/End walk it, so a keyboard or touch reader reaches every value. It anchors inward at the ends of the range and never takes pointer events."
       ]

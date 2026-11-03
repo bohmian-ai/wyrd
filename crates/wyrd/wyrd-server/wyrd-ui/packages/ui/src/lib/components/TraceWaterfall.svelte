@@ -4,12 +4,15 @@
   span; a collapsed span shows how many children it holds. "Expand all" opens
   every level and "Errors only" keeps error spans and their ancestors. An axis
   marks round offsets from the trace start up to its end. Names come from
-  data; only the recorded status colours a span.
+  data and never colour a span: each recorded service takes the series
+  palette's colour by first appearance, named in the Services key, and an
+  error span takes the failure colour beside its ✕ by recorded status alone.
 -->
 <script lang="ts">
   import type { ActionProps } from '../contract.js';
   import { spanTree, type TraceWaterfallProps } from '../loaders.js';
   import { fmtDuration } from '../format.js';
+  import { SERIES_COLORS } from '../plot.js';
   import ActionNote from './ActionNote.svelte';
   import EmptyState from './EmptyState.svelte';
 
@@ -17,6 +20,9 @@
 
   const spans = $derived(result.state === 'populated' ? spanTree(result.data) : []);
   const total = $derived(Math.max(0, ...spans.map((span) => span.startMs + span.durationMs)));
+  /** Each recorded service, in order of first appearance; an unrecorded service is its own entry. */
+  const services = $derived([...new Set(spans.map((span) => span.service ?? null))]);
+  const serviceColor = (service: string | null | undefined) => SERIES_COLORS[services.indexOf(service ?? null) % SERIES_COLORS.length];
   /** Spans whose children show; `undefined` until the reader toggles one, meaning the first level only. */
   let opened = $state.raw<ReadonlySet<string> | undefined>();
   let errorsOnly = $state(false);
@@ -86,6 +92,10 @@
       <button type="button" aria-pressed={errorsOnly} disabled={erring.size === 0} onclick={() => (errorsOnly = !errorsOnly)}>Errors only</button>
       <ActionNote state={selectState} />
     </div>
+    <ul class="key" aria-label="Services">
+      {#each services as service (service)}<li><i style:background={serviceColor(service)}></i>{service ?? '∅'}</li>{/each}
+      {#if spans.some((span) => span.error)}<li><i style:background="var(--danger)"></i>✕ error</li>{/if}
+    </ul>
     <div class="row axis" aria-hidden="true">
       <span></span><span class="service"></span>
       <span class="ticks">
@@ -128,6 +138,7 @@
           <span class="track" aria-hidden="true">
             <span
               class="bar"
+              style:background={span.error ? 'var(--danger)' : serviceColor(span.service)}
               style:left="{total > 0 ? (span.startMs / total) * 100 : 0}%"
               style:width="{total > 0 ? Math.max(0.5, (span.durationMs / total) * 100) : 100}%"
             ></span>
@@ -296,10 +307,22 @@
     position: absolute;
     top: 0;
     bottom: 0;
-    background: var(--declare);
   }
-  .error .bar {
-    background: var(--danger);
+  .key {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 4px 12px;
+    margin: 0 0 6px;
+    padding: 0;
+    list-style: none;
+    color: var(--muted);
+    font: 11px var(--font-mono);
+  }
+  .key i {
+    display: inline-block;
+    width: 8px;
+    height: 8px;
+    margin-right: 6px;
   }
   .duration {
     color: var(--muted);
@@ -316,6 +339,10 @@
       grid-template-columns: minmax(110px, 3fr) minmax(50px, 2fr) 56px;
     }
     .service {
+      display: none;
+    }
+    /* A short track keeps only its two end labels, so the ticks never overprint. */
+    .ticks span:not(.first, .last) {
       display: none;
     }
   }

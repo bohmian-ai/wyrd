@@ -32,6 +32,12 @@
   --color-code-keyword: var(--code-keyword);
   --color-code-string: var(--code-string);
   --color-code-number: var(--code-number);
+  --color-nav-surface: var(--nav-surface);
+  --color-selected-border: var(--selected-border);
+  --color-level-info: var(--level-info);
+  --color-series-3: var(--series-3);
+  --color-series-4: var(--series-4);
+  --color-series-5: var(--series-5);
 }
 
 :root {
@@ -79,6 +85,14 @@
   --code-string: #c5f23b;
   --code-number: #f0a13c;
 
+  /* observe-canvas */
+  --nav-surface: #eef0f4;
+  --selected-border: #4d5ef0;
+  --level-info: #4d5ef0;
+  --series-3: #7a8cff;
+  --series-4: #4d5ef0;
+  --series-5: #8fae2a;
+
   /* type */
   --weight-strong: 700;
 
@@ -124,6 +138,14 @@
   --code-keyword: #7a8cff;
   --code-string: #c5f23b;
   --code-number: #f0a13c;
+
+  /* observe-canvas */
+  --nav-surface: #0e1017;
+  --selected-border: #3a4170;
+  --level-info: #3a4170;
+  --series-3: #4d5ef0;
+  --series-4: #a9b4ff;
+  --series-5: #8fae2a;
 
   /* type */
   --weight-strong: 600;

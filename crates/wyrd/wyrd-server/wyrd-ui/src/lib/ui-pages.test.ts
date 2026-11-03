@@ -117,6 +117,14 @@ test('observe signal planning and interactions', async () => {
   expect(readState(writeState(state))).toEqual(state);
   expect(readState(new URLSearchParams())).toMatchObject({ signal: 'traces', mode: 'traces', last: '1h', tz: 'utc', where: [], where_sql: '', live: false });
   expect(readState(new URLSearchParams({ signal: 'nope', where: '{bad', columns: '[1]', by: 'unit' }))).toMatchObject({ signal: 'traces', where: [], columns: undefined, by: undefined });
+  // The Metrics recorded-points inspector is reader-opened URL state; no other signal carries it.
+  const inspecting = readState(new URLSearchParams({ signal: 'metrics', points: '1' }));
+  expect(inspecting.points).toBe(true);
+  expect(writeState(inspecting).get('points')).toBe('1');
+  expect(readState(writeState(closed(inspecting))).points).toBe(true);
+  expect(readState(new URLSearchParams({ signal: 'metrics' })).points).toBe(false);
+  expect(readState(new URLSearchParams({ signal: 'logs', points: '1' })).points).toBe(false);
+  expect(writeState({ ...inspecting, signal: 'logs' }).has('points')).toBe(false);
   // An absolute range needs both bounds; it applies over the preset, which a reset returns to.
   expect(readState(new URLSearchParams({ from: RANGE.from }))).toMatchObject({ from: undefined, to: undefined });
   const inputs = listInputs(state);

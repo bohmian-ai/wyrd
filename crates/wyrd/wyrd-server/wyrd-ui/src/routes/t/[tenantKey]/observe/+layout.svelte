@@ -8,7 +8,7 @@
   import { enhance } from '$app/forms';
   import { goto, invalidate } from '$app/navigation';
   import { page } from '$app/state';
-  import { Chart, EmptyState, FacetRail, RecordTable, fmtDuration, fmtNumber, type ActionIntent, type ActionState, type Problem } from 'wyrd-ai-ui';
+  import { Chart, Drawer, EmptyState, FacetRail, RecordTable, fmtDuration, fmtNumber, type ActionIntent, type ActionState, type Problem } from 'wyrd-ai-ui';
   import { METRIC_AGGREGATIONS, SIGNALS, columnLabel, validateIntent, type ComponentName } from 'wyrd-ai-ui/loaders';
   import TimePicker, { type PickedRange, type Zone } from '$lib/TimePicker.svelte';
   import { PRESETS, appliedRange, closed, groupColumns, readState, selectedMetric, step, writeState, zoomed, type HostFilter, type ObserveState } from '$lib/observe-host';
@@ -20,7 +20,9 @@
   const TABS = ['logs', 'metrics', 'traces'] as const;
   /** How often Live re-runs the view's load. */
   const LIVE_MS = 10_000;
-  const LEVELS = { info: 'var(--declare)', warn: 'var(--warn)', error: 'var(--danger)', unset: 'var(--muted)' } as const;
+  const LEVELS = { info: 'var(--level-info)', warn: 'var(--warn)', error: 'var(--danger)', unset: 'var(--muted)' } as const;
+  /** The approved duration roles: p95 lime, p50 periwinkle. */
+  const DURATIONS = { p95: 'var(--observe)', p50: 'var(--declare)' } as const;
   const PERCENTILES = ['p50', 'p90', 'p99'] as const;
 
   const base = $derived(`/t/${encodeURIComponent(data.tenant.key)}`);
@@ -41,7 +43,8 @@
     group: undefined,
     columns: undefined,
     agg: undefined,
-    by: undefined
+    by: undefined,
+    points: false
   });
 
   /** Host-reported action states, by action name. */
@@ -218,6 +221,7 @@
             {...overview.spans}
             compact
             bars
+            colors={{ spans: 'var(--series-3)' }}
             headline={totals ? `${fmtNumber(totals.spans / totals.minutes)} / min · ${fmtNumber(totals.traces)} traces` : undefined}
             {actions}
             onaction={onaction('Chart')}
@@ -231,7 +235,7 @@
             {actions}
             onaction={onaction('Chart')}
           />
-          <Chart {...overview.duration} compact headline={totals ? `p95 ${fmtDuration(totals.p95)}` : undefined} {actions} onaction={onaction('Chart')} />
+          <Chart {...overview.duration} compact colors={DURATIONS} headline={totals ? `p95 ${fmtDuration(totals.p95)}` : undefined} {actions} onaction={onaction('Chart')} />
         </div>
       </section>
     {/if}
@@ -252,7 +256,7 @@
     <div class="split" class:folded={!filtersOpen}>
       {#if filtersOpen}<div id="facets" data-panel="facets"><FacetRail {...observe.facets} {actions} onaction={onaction('FacetRail')} /></div>{/if}
       <div data-panel="list">
-        <RecordTable {...observe.list} {actions} onaction={onaction('RecordTable')} oncolumns={(columns) => go({ ...closed(current), columns })} controls={listTools} />
+        {#if observe.list}<RecordTable {...observe.list} {actions} onaction={onaction('RecordTable')} oncolumns={(columns) => go({ ...closed(current), columns })} controls={listTools} />{/if}
       </div>
     </div>
     {@render children()}
@@ -267,11 +271,12 @@
       </section>
     {/if}
     <div class="listbar">{@render grouping()}</div>
-    <div class="split">
+    <!-- The records work region: fields, records and the selected record side by side, wrapping on a narrow screen. -->
+    <div class="work">
       <div data-panel="facets"><FacetRail {...observe.facets} {actions} onaction={onaction('FacetRail')} /></div>
-      <div data-panel="list"><RecordTable {...observe.list} {actions} onaction={onaction('RecordTable')} oncolumns={(columns) => go({ ...closed(current), columns })} /></div>
+      <div data-panel="list">{#if observe.list}<RecordTable {...observe.list} {actions} onaction={onaction('RecordTable')} oncolumns={(columns) => go({ ...closed(current), columns })} />{/if}</div>
+      {@render children()}
     </div>
-    {@render children()}
   {:else}
     <div class="metrics">
       <aside class="panel rail" aria-label="Metrics" data-panel="metrics">
@@ -300,39 +305,12 @@
             {/each}
           </ul>
         {/if}
+        <a class="points" href={href({ ...closed(current), points: true })} aria-current={current.points ? 'true' : undefined}>Recorded points</a>
       </aside>
       <div class="main">
         {#if view?.series}
           {@const series = view.series}
-          <section class="panel" data-panel="series">
-            <header class="metric">
-              <div>
-                <h2>{metric}</h2>
-                <p class="type">{metricRow ? `${metricRow.type}${metricRow.unit ? ` · ${metricRow.unit}` : ''}` : ''}</p>
-              </div>
-              <span class="segmented" role="group" aria-label="Calculation">
-                <a href={href({ ...closed(current), agg: undefined, by: undefined })} aria-current={current.agg === undefined ? 'true' : undefined}>each series</a>
-                {#each METRIC_AGGREGATIONS as aggregation (aggregation)}
-                  <a href={href({ ...closed(current), agg: aggregation })} aria-current={current.agg === aggregation ? 'true' : undefined}>{aggregation}</a>
-                {/each}
-                {#each PERCENTILES as percentile (percentile)}
-                  <span aria-disabled="true" title="Percentiles of recorded points are not available">{percentile}</span>
-                {/each}
-              </span>
-              <label class="by">
-                by
-                <select
-                  aria-label="Group series by"
-                  value={current.by ?? ''}
-                  disabled={!current.agg}
-                  title={current.agg ? undefined : 'Choose an aggregation to group by'}
-                  onchange={(event) => go({ ...closed(current), by: event.currentTarget.value || undefined })}
-                >
-                  <option value="">all series</option>
-                  {#each byColumns as column (column)}<option value={column}>{columnLabel(column)}</option>{/each}
-                </select>
-              </label>
-            </header>
+          <div data-panel="series">
             <Chart
               {...series.chart}
               identity={series.identity}
@@ -341,14 +319,51 @@
               onseries={(shown) => (picks[seriesKey] = shown)}
               {actions}
               onaction={onaction('Chart')}
-            />
-          </section>
+            >
+              {#snippet heading()}
+                <div class="metric">
+                  <h2>{metric}</h2>
+                  <!-- The chart title's calculation and precision caveat stay visible under the metric name. -->
+                  <p class="type">{metricRow ? `${metricRow.type}${metricRow.unit ? ` · ${metricRow.unit}` : ''} · ` : ''}{series.chart.input.title?.replace(`${metric} · `, '')}</p>
+                </div>
+                <span class="choices">
+                  <span class="segmented" role="group" aria-label="Calculation">
+                    <a href={href({ ...closed(current), agg: undefined, by: undefined })} aria-current={current.agg === undefined ? 'true' : undefined}>each series</a>
+                    {#each METRIC_AGGREGATIONS as aggregation (aggregation)}
+                      <a href={href({ ...closed(current), agg: aggregation })} aria-current={current.agg === aggregation ? 'true' : undefined}>{aggregation}</a>
+                    {/each}
+                    {#each PERCENTILES as percentile (percentile)}
+                      <span aria-disabled="true" title="Percentiles of recorded points are not available">{percentile}</span>
+                    {/each}
+                  </span>
+                  <label class="by">
+                    by
+                    <select
+                      aria-label="Group series by"
+                      value={current.by ?? ''}
+                      disabled={!current.agg}
+                      title={current.agg ? undefined : 'Choose an aggregation to group by'}
+                      onchange={(event) => go({ ...closed(current), by: event.currentTarget.value || undefined })}
+                    >
+                      <option value="">all series</option>
+                      {#each byColumns as column (column)}<option value={column}>{columnLabel(column)}</option>{/each}
+                    </select>
+                  </label>
+                </span>
+              {/snippet}
+            </Chart>
+          </div>
         {:else}
           <EmptyState state="empty" title="Choose a metric" detail="Pick a metric on the left to plot its recorded series." />
         {/if}
-        <div data-panel="list"><RecordTable {...observe.list} {actions} onaction={onaction('RecordTable')} oncolumns={(columns) => go({ ...closed(current), columns })} /></div>
       </div>
     </div>
+    <!-- Recorded points open only on request: the same bounded list read, under the same range and filters. -->
+    {#if current.points && observe.list}
+      <Drawer open title="Recorded points" width="884px" onclose={() => go({ ...closed(current), points: false })}>
+        <div data-panel="list"><RecordTable {...observe.list} {actions} onaction={onaction('RecordTable')} oncolumns={(columns) => go({ ...closed(current), columns })} /></div>
+      </Drawer>
+    {/if}
   {/if}
 </div>
 
@@ -425,7 +440,7 @@
     height: 34px;
     box-sizing: border-box;
     padding: 0 10px;
-    border: 1px solid var(--declare);
+    border: 1px solid var(--selected-border);
     border-radius: var(--r);
     background: var(--surface);
     color: var(--muted);
@@ -545,7 +560,7 @@
   }
   .badge {
     height: 22px;
-    border-color: var(--declare);
+    border-color: var(--selected-border);
     background: var(--declare-soft);
     font: 11px var(--font-mono);
   }
@@ -553,6 +568,11 @@
     display: grid;
     grid-template-columns: repeat(auto-fit, minmax(240px, 1fr));
     gap: 16px;
+  }
+  /* The Logs board's severity timeline is one 64px band; the Traces trio stays 56px. */
+  [data-panel='timeline'] :global(.chart.compact .box) {
+    height: 64px;
+    min-height: 64px;
   }
   .listbar {
     display: flex;
@@ -583,12 +603,12 @@
   }
   .segmented [aria-current='true'] {
     position: relative;
-    border-color: var(--declare);
+    border-color: var(--selected-border);
     background: var(--declare-soft);
     color: var(--text);
   }
   .filters[aria-expanded='true'] {
-    border-color: var(--declare);
+    border-color: var(--selected-border);
     background: var(--declare-soft);
   }
   .counts {
@@ -625,6 +645,19 @@
   .split.folded {
     grid-template-columns: minmax(0, 1fr);
   }
+  .work {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: flex-start;
+    gap: 16px;
+  }
+  .work > [data-panel='facets'] {
+    flex: 0 0 220px;
+  }
+  .work > [data-panel='list'] {
+    flex: 999 1 560px;
+    min-width: 0;
+  }
   .metrics {
     display: grid;
     grid-template-columns: 240px minmax(0, 1fr);
@@ -652,7 +685,7 @@
     font: 12px var(--font-mono);
   }
   .rail ul {
-    margin: 0 -10px -10px;
+    margin: 0 -10px;
     padding: 0;
     border-top: 1px solid var(--border);
     list-style: none;
@@ -691,27 +724,42 @@
     min-width: 0;
   }
   .metric {
-    display: flex;
-    flex-wrap: wrap;
-    align-items: center;
-    gap: 8px 12px;
-    padding: 12px 14px;
-    border-bottom: 1px solid var(--border);
-  }
-  .metric > div {
     margin-right: auto;
   }
   .metric h2 {
     margin: 0;
     font: 14px var(--font-mono);
   }
-  .metric .by {
+  .choices {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 8px 12px;
+    min-width: 0;
+  }
+  .choices .by {
     margin-left: 0;
+  }
+  .choices .segmented a,
+  .choices .segmented span {
+    height: 28px;
+  }
+  .points {
+    display: block;
+    margin: 0 -10px -10px;
+    padding: 8px 12px;
+    border-top: 1px solid var(--border);
+    color: var(--declare);
+    font: 12px var(--font-mono);
+    text-decoration: none;
   }
   @media (max-width: 899px) {
     .split,
     .metrics {
       grid-template-columns: minmax(0, 1fr);
+    }
+    .work > [data-panel='facets'] {
+      flex-basis: 100%;
     }
   }
   @media (max-width: 767px) {

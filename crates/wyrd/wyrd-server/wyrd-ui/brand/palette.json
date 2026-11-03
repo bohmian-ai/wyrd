@@ -42,6 +42,13 @@
     "--code-string":   { "group": "code", "light": "#c5f23b", "dark": "#c5f23b", "role": "Code string and literal-value ink (lime, the evidence hue)." },
     "--code-number":   { "group": "code", "light": "#f0a13c", "dark": "#f0a13c", "role": "Code number, constant, function-name, and control-keyword ink (amber)." },
 
+    "--nav-surface":     { "group": "observe-canvas", "light": "#eef0f4", "dark": "#0e1017", "role": "Navigation surface — the primary navigation rail, set apart from the panel surface." },
+    "--selected-border": { "group": "observe-canvas", "light": "#4d5ef0", "dark": "#3a4170", "role": "Selected/filter border — the one-pixel border of an applied WHERE, a pressed segment, an open filter control, and a zoom badge." },
+    "--level-info":      { "group": "observe-canvas", "light": "#4d5ef0", "dark": "#3a4170", "role": "Log info fill — the info segment of a severity timeline and its key; warn and error use --warn and --danger." },
+    "--series-3":        { "group": "observe-canvas", "light": "#7a8cff", "dark": "#4d5ef0", "role": "Third chart and waterfall series after --declare and --observe; always paired with a dash, marker, or label." },
+    "--series-4":        { "group": "observe-canvas", "light": "#4d5ef0", "dark": "#a9b4ff", "role": "Fourth chart and waterfall series; always paired with a dash, marker, or label." },
+    "--series-5":        { "group": "observe-canvas", "light": "#8fae2a", "dark": "#8fae2a", "role": "Fifth chart and waterfall series; always paired with a dash, marker, or label." },
+
     "--weight-strong": { "group": "type", "light": "700", "dark": "600", "role": "Strong weight — headings, labels, and emphasis. Capped at 600 in dark mode, where light-on-dark text renders heavier." },
     "--r":             { "group": "geometry", "light": "2px", "dark": "2px", "role": "Radius — restrained two-pixel corners (true circles only for dots/avatars)." }
   },
@@ -71,6 +78,10 @@
     { "ink": "--evidence", "fill": "--code-bg", "min": 3.0, "role": "retained-evidence signal on a code/terminal block (non-text)" },
 
     { "ink": "--text", "fill": "--danger-soft", "min": 7.0, "role": "text in a failure context field" },
+
+    { "ink": "--text", "fill": "--nav-surface", "min": 7.0, "role": "navigation labels on the rail" },
+    { "ink": "--muted", "fill": "--nav-surface", "min": 4.5, "role": "inactive navigation labels on the rail" },
+    { "ink": "--selected-border", "fill": "--surface", "min": 1.2, "role": "selected/filter border on a panel — separation only; the selected state also carries --declare-soft or a label" },
 
     { "ink": "--code-text", "fill": "--code-bg", "min": 7.0, "role": "code and terminal text" },
     { "ink": "--code-muted", "fill": "--code-bg", "min": 4.5, "role": "code comments and punctuation" },

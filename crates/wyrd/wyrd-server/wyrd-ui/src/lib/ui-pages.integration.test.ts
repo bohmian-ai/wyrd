@@ -387,19 +387,29 @@ test('authenticated metrics investigation', async ({ server, ui }) => {
   const list = page.locator('[data-panel="list"]');
   const rail = page.locator('[data-panel="metrics"]');
 
+  // No raw points by default; Recorded points opens the bounded list on request, and closing it leaves the board.
+  const names = rail.getByRole('list', { name: 'Metric names' }).getByRole('link');
+  await expect.poll(() => names.count(), { timeout: 30_000 }).toBeGreaterThan(0);
+  expect(await list.count()).toBe(0);
+  await rail.getByRole('link', { name: 'Recorded points' }).click();
+  await expect.poll(() => new URL(page.url()).searchParams.get('points')).toBe('1');
+  const points = page.getByRole('dialog', { name: 'Recorded points' });
   // Points list exact integers; the rail lists each recorded metric with its type and unit; no chart until one is chosen.
-  await expect.poll(() => list.textContent(), { timeout: 30_000 }).toContain(UNSAFE[1]);
+  await expect.poll(() => points.locator('[data-panel="list"]').textContent(), { timeout: 30_000 }).toContain(UNSAFE[1]);
   expect(await list.textContent()).toContain(UNSAFE[0]);
-  expect(await rail.getByRole('link').allTextContents()).toEqual(
+  await page.getByRole('button', { name: 'Close Recorded points' }).click();
+  await expect.poll(() => new URL(page.url()).searchParams.has('points')).toBe(false);
+  expect(await list.count()).toBe(0);
+  expect(await names.allTextContents()).toEqual(
     expect.arrayContaining([expect.stringMatching(/ui\.latency\s*histogram · s/), expect.stringMatching(/ui\.queue\s*gauge · By/), expect.stringMatching(/ui\.queue\s*sum · 1/)])
   );
   expect(await page.locator('[data-panel="series"]').count()).toBe(0);
   await rail.getByRole('searchbox', { name: 'Find a metric' }).fill('spr');
-  expect(await rail.getByRole('link').allTextContents()).toEqual([expect.stringContaining('ui.spread')]);
+  expect(await names.allTextContents()).toEqual([expect.stringContaining('ui.spread')]);
   await rail.getByRole('searchbox', { name: 'Find a metric' }).fill('');
 
   // Selecting the metric charts every recorded series apart and summarizes each exactly, in the first response too.
-  await rail.getByRole('link', { name: /ui\.queue/ }).first().click();
+  await names.filter({ hasText: /ui\.queue/ }).first().click();
   const chart = page.locator('[data-panel="series"]');
   const legend = chart.locator('table.legend tbody tr');
   await expect.poll(() => legend.count(), { timeout: 30_000 }).toBe(5);
@@ -448,11 +458,12 @@ test('authenticated metrics investigation', async ({ server, ui }) => {
 
   // Histogram, exponential histogram and summary points are listed with exact nested counts and explicitly not plotted.
   const structures = ['metric_name', 'histogram_count', 'bucket_counts', 'explicit_bounds', 'positive_buckets', 'negative_buckets', 'summary_count', 'summary_sum', 'quantile_values', 'exemplars'];
-  await page.goto(`${metrics}&where=${encodeURIComponent(JSON.stringify([{ column: 'metric_name', value: 'ui.latency' }]))}&columns=${encodeURIComponent(JSON.stringify(structures))}`);
+  await page.goto(`${metrics}&where=${encodeURIComponent(JSON.stringify([{ column: 'metric_name', value: 'ui.latency' }]))}&columns=${encodeURIComponent(JSON.stringify(structures))}&points=1`);
   await expect.poll(() => chart.textContent(), { timeout: 30_000 }).toContain('No gauge or sum point of ui.latency');
   await expect.poll(() => list.textContent()).toContain(`["${UNSAFE[0]}","2"]`);
   expect(await list.textContent()).toContain('9007199254740995');
-  await page.getByRole('link', { name: 'Remove metric_name' }).click();
+  // Without the metric filter the inspector lists every recorded structure.
+  await page.goto(`${metrics}&columns=${encodeURIComponent(JSON.stringify(structures))}&points=1`);
   await expect.poll(() => list.textContent()).toContain(`"bucket_counts":["${UNSAFE[0]}","1"]`);
   const all = await list.textContent();
   expect(all).toContain('"offset":-1');
@@ -464,6 +475,153 @@ test('authenticated metrics investigation', async ({ server, ui }) => {
   await list.locator('summary', { hasText: 'Columns' }).click();
   await list.locator('label[title="exponential_zero_count"] input').check();
   await expect.poll(() => JSON.parse(new URL(page.url()).searchParams.get('columns') ?? '[]')).toContain('exponential_zero_count');
+});
+
+/** The canonical palette, resolved per mode to the `rgb(r, g, b)` a computed style reports. */
+const PALETTE = JSON.parse(readFileSync(resolve(import.meta.dirname, '../../brand/palette.json'), 'utf8')) as { tokens: Record<string, { light: string; dark: string }> };
+const rgb = (mode: 'light' | 'dark', token: string) => {
+  const hex = PALETTE.tokens[token][mode];
+  return `rgb(${[1, 3, 5].map((at) => parseInt(hex.slice(at, at + 2), 16)).join(', ')})`;
+};
+
+/** Every box of `locator`, in document order. */
+const boxes = async (locator: ReturnType<Page['locator']>) =>
+  Promise.all((await locator.all()).map(async (each) => (await each.boundingBox()) ?? { x: NaN, y: NaN, width: NaN, height: NaN }));
+/** One computed style property of every element `locator` matches. */
+const computed = (locator: ReturnType<Page['locator']>, property: string) =>
+  locator.evaluateAll((elements, name) => elements.map((element) => getComputedStyle(element).getPropertyValue(name)), property);
+
+test('observe boards match approved canvas', async ({ server, ui }) => {
+  // Two recorded services on one gauge, so the Metrics board plots the first two series roles.
+  await exportOtlp(server, ui.adminKey, '/v1/metrics', {
+    resourceMetrics: ['ui-agent', 'ui-worker'].map((service, index) => ({
+      resource: { attributes: [{ key: 'service.name', value: { stringValue: service } }] },
+      scopeMetrics: [{ scope: { name: 'wyrd-ui-canvas' }, metrics: [{ name: 'ui.canvas', unit: '1', gauge: { dataPoints: [0, 1].map((minute) => ({ timeUnixNano: nanos(`2026-10-19T05:0${minute}:00Z`), asDouble: index + minute })) } }] }]
+    }))
+  });
+  server.flushBifrost();
+  const page = await signIn(ui.browser, ui.base, TENANT, ui.adminKey);
+  const observe = `${ui.base}/t/${TENANT}/observe?from=${RANGE.from}&to=${RANGE.to}`;
+  const capture = async (board: string, mode: string, width: number) =>
+    process.env.WYRD_UI_CAPTURE_DIR && page.screenshot({ path: join(process.env.WYRD_UI_CAPTURE_DIR, `${board}-${mode}-${width}.png`), fullPage: true });
+
+  for (const mode of ['dark', 'light'] as const) {
+    await page.context().addCookies([{ name: 'wyrd-mode', value: mode, url: ui.base }]);
+    const token = (name: string) => rgb(mode, name);
+    for (const width of [1440, 390]) {
+      await page.setViewportSize({ width, height: 900 });
+      const desktop = width === 1440;
+
+      // Traces. The selected theme is the rendered one, and light is really light, before any colour is compared.
+      await page.goto(observe);
+      const list = page.locator('[data-panel="list"]');
+      await expect.poll(() => list.textContent(), { timeout: 30_000 }).toContain('invoke_agent support');
+      expect(await page.locator('.app-root').getAttribute('data-mode')).toBe(mode);
+      const canvas = await computed(page.locator('.app-root'), 'background-color');
+      expect(canvas).toEqual([token('--bg')]);
+      const lightness = canvas[0].match(/\d+/g)?.map(Number) ?? [];
+      expect(lightness.every((channel) => (mode === 'light' ? channel > 200 : channel < 40))).toBe(true);
+      expect(await page.evaluate(() => document.documentElement.scrollWidth)).toBeLessThanOrEqual(width);
+
+      // The navigation rail and the applied WHERE carry their own canvas roles.
+      const nav = page.getByRole('complementary', { name: 'Primary' });
+      expect(await computed(nav, 'background-color')).toEqual([token('--nav-surface')]);
+      expect((await nav.boundingBox())?.width).toBe(desktop ? 212 : width);
+      expect(await computed(page.locator('form.where'), 'border-top-color')).toEqual([token('--selected-border')]);
+
+      // Overview, list bar, then list; three 56px plots on one baseline on desktop, stacked inside the screen on mobile.
+      const overview = page.locator('[data-panel="overview"]');
+      const [top, bar, rows] = await boxes(page.locator('[data-panel="overview"], .listbar, [data-panel="list"]'));
+      expect(top.y < bar.y && bar.y < rows.y).toBe(true);
+      const plots = await boxes(overview.locator('.box'));
+      expect(plots.map((plot) => plot.height)).toEqual([56, 56, 56]);
+      const bottoms = plots.map((plot) => plot.y + plot.height);
+      if (desktop) expect(new Set(bottoms).size).toBe(1);
+      else expect(bottoms[0] < bottoms[1] && bottoms[1] < bottoms[2]).toBe(true);
+      expect(plots.every((plot) => plot.x >= 0 && plot.x + plot.width <= width)).toBe(true);
+      const [spans, errors, duration] = await overview.locator('.chart').all();
+      expect(new Set(await computed(spans.locator('rect.segment'), 'fill'))).toEqual(new Set([token('--series-3')]));
+      expect(new Set(await computed(errors.locator('rect.segment'), 'fill'))).toEqual(new Set([token('--danger')]));
+      expect(new Set(await computed(overview.locator('rect.segment'), 'opacity'))).toEqual(new Set(['1']));
+      expect(await computed(duration.locator('svg.plot polyline'), 'stroke')).toEqual([token('--observe'), token('--declare')]);
+      expect(await duration.getByLabel('Key').textContent()).toMatch(/p95.*p50/);
+      await capture('traces', mode, width);
+
+      // The time picker opens on the panel surface, inside the screen.
+      await page.getByRole('button', { name: /^Time range/ }).click();
+      const picker = page.getByRole('dialog', { name: 'Time range' });
+      expect(await computed(picker, 'background-color')).toEqual([token('--surface')]);
+      const panel = await picker.boundingBox();
+      expect(panel && panel.x >= 0 && panel.x + panel.width <= width).toBe(true);
+      await capture('timepicker', mode, width);
+      await picker.press('Escape');
+
+      // The waterfall: 884px drawer (the screen on mobile), 28px rows on the 300/110/flex/64 grid, bars by recorded service and error.
+      await page.goto(`${observe}&trace=${TRACE}`);
+      const drawer = page.getByRole('dialog', { name: 'Trace' });
+      const spanRows = drawer.getByRole('tree').getByRole('treeitem');
+      await drawer.getByRole('button', { name: 'Expand all' }).click({ timeout: 30_000 });
+      await expect.poll(() => spanRows.count(), { timeout: 30_000 }).toBe(3);
+      expect((await drawer.boundingBox())?.width).toBe(Math.min(884, width));
+      expect(new Set((await boxes(spanRows)).map((row) => row.height))).toEqual(new Set([28]));
+      if (desktop) {
+        const grid = (await computed(spanRows.first(), 'grid-template-columns'))[0].split(' ').map((column) => Math.round(parseFloat(column)));
+        expect([grid[0], grid[1], grid[3]]).toEqual([300, 110, 64]);
+      }
+      const bars = Object.fromEntries(
+        await spanRows.evaluateAll((items) => items.map((item) => [item.querySelector('.select')?.getAttribute('title'), getComputedStyle(item.querySelector('.bar') as Element).backgroundColor]))
+      );
+      expect(bars).toEqual({ 'invoke_agent support': token('--declare'), 'chat ranker': token('--declare'), 'execute_tool search': token('--danger') });
+      const key = drawer.getByRole('list', { name: 'Services' });
+      expect((await key.locator('li').allTextContents()).map((item) => item.trim())).toEqual(['ui-agent', '✕ error']);
+      expect(await computed(key.locator('i'), 'background-color')).toEqual([token('--declare'), token('--danger')]);
+      await capture('waterfall', mode, width);
+
+      // Logs: one 64px severity band in the named fills, then facets, records and the record side by side (stacked on mobile).
+      await page.goto(`${observe}&signal=logs`);
+      const timeline = page.locator('[data-panel="timeline"]');
+      await expect.poll(() => list.textContent(), { timeout: 30_000 }).toContain('search timed out');
+      expect((await timeline.locator('.box').boundingBox())?.height).toBe(64);
+      expect(await computed(timeline.locator('rect.segment'), 'fill')).toEqual([token('--danger')]);
+      expect(new Set(await computed(timeline.locator('rect.segment'), 'opacity'))).toEqual(new Set(['1']));
+      expect(await computed(timeline.getByLabel('Key').locator('i'), 'background-color')).toEqual([token('--level-info'), token('--warn'), token('--danger'), token('--muted')]);
+      await list.locator('tbody tr').first().click();
+      const aside = page.getByRole('complementary', { name: 'Log record' });
+      await expect.poll(() => aside.textContent(), { timeout: 30_000 }).toContain('search timed out');
+      const [facets, records, record] = await boxes(page.locator('.work > [data-panel="facets"], .work > [data-panel="list"], .work > aside'));
+      if (desktop) {
+        expect(facets.x + facets.width <= records.x && records.x + records.width <= record.x).toBe(true);
+        expect(Math.abs(records.y - record.y)).toBeLessThan(1);
+        expect(record.width).toBeLessThanOrEqual(400);
+      } else expect(facets.y < records.y && records.y + records.height <= record.y).toBe(true);
+      expect([facets, records, record].every((region) => region.x >= 0 && region.x + region.width <= width)).toBe(true);
+      expect(await page.evaluate(() => document.documentElement.scrollWidth)).toBeLessThanOrEqual(width);
+      await capture('logs', mode, width);
+
+      // Metrics: a 240px rail, then the chart card above the series card; no raw points until asked for.
+      await page.goto(`${observe}&signal=metrics&where=${encodeURIComponent(JSON.stringify([{ column: 'metric_name', value: 'ui.canvas' }]))}`);
+      const series = page.locator('[data-panel="series"]');
+      await expect.poll(() => series.locator('table.legend tbody tr').count(), { timeout: 30_000 }).toBe(2);
+      if (desktop) expect((await page.locator('[data-panel="metrics"]').boundingBox())?.width).toBe(240);
+      const [plotCard, seriesCard] = await series.locator('.chart > .frame').all();
+      const [plotBox, seriesBox] = [await plotCard.boundingBox(), await seriesCard.boundingBox()];
+      expect(plotBox && seriesBox && plotBox.y + plotBox.height <= seriesBox.y).toBe(true);
+      expect(await plotCard.locator('table.legend').count()).toBe(0);
+      expect(new Set((await boxes(seriesCard.locator('table.legend tbody tr'))).map((row) => row.height))).toEqual(new Set([28]));
+      expect(await computed(plotCard.locator('svg.plot polyline'), 'stroke')).toEqual([token('--declare'), token('--observe')]);
+      expect(await computed(series.getByRole('group', { name: 'Calculation' }).locator('[aria-current="true"]'), 'border-top-color')).toEqual([token('--selected-border')]);
+      expect(await page.locator('[data-panel="list"]').count()).toBe(0);
+      expect(await page.evaluate(() => document.documentElement.scrollWidth)).toBeLessThanOrEqual(width);
+      await capture('metrics', mode, width);
+      await page.getByRole('link', { name: 'Recorded points' }).click();
+      const inspector = page.getByRole('dialog', { name: 'Recorded points' });
+      await expect.poll(() => inspector.locator('[data-panel="list"] tbody tr').count(), { timeout: 30_000 }).toBe(4);
+      expect((await inspector.boundingBox())?.width).toBe(Math.min(884, width));
+      await capture('metrics-points', mode, width);
+      await inspector.press('Escape');
+      await expect.poll(() => new URL(page.url()).searchParams.has('points')).toBe(false);
+    }
+  }
 });
 
 /** The repository root, where `mise run dev:full` runs. */

@@ -758,3 +758,57 @@ serialization to satisfy a UI display preference.
 
 Planning changes no code, migration, authentication behavior, credentials or
 visual acceptance. Do not commit/push unless explicitly asked for this packet.
+
+### Evidence — Scenario 5 (Observe visual)
+
+Implemented on branch `task/wyrd-ui-main-integration/TASK-004-observe-visual`
+(commits 527b67587, a2b0989b3, 296117b72). Browser proofs ran against the
+production BFF build, `WyrdTestServer` and repository Postgres, with real
+OTLP-seeded evidence. Sign-in used the file's existing API-key `signIn` helper.
+No secrets were captured. Captures were written to the session scratchpad
+through `WYRD_UI_CAPTURE_DIR` and are not tracked.
+
+| Acceptance criterion | Implementation evidence | Verification evidence | Result |
+|---|---|---|---|
+| Metrics chart and series cards (audit row 1) | `Chart` takes a host `heading` snippet. With it, the plot frame and a separate series-summary frame render, with no generic header or SQL footer. The Observe route supplies the metric heading with Calculation and `by`. The default raw RecordTable was removed. **Recorded points** (URL `points=1`, Metrics only) opens the same bounded list read in the existing `Drawer` (884px) with `RecordTable`. The precision caveat stays in the heading's type line. | Unit: `Observe canvas colour roles and series composition` checks two `.chart > .frame`, the legend only in the second frame, and no footer. V10 checks the plot card above the series card, 28px legend rows, no default `[data-panel=list]`, and the inspector opening at `min(884, viewport)` and closing on Escape. V11 metrics opens Recorded points before the list and structure assertions. | Closed |
+| Selected Log detail (row 2) | The `.work` flex-wrap region holds facets (`0 0 220px`), records (`999 1 560px`) and the record aside (`1 1 360px`, max 400px). Below 899px the regions stack. The aside body is padded. | V10 at 1440px: facets, records and record are side by side with equal tops and the record at most 400px. At 390px they stack in that order, inside the viewport, with no page overflow. V11 logs passes. | Closed |
+| Traces duration colours (row 3) | `DURATIONS = { p95: var(--observe), p50: var(--declare) }`. Explicit host colours override position. | Unit checks the polyline strokes and key swatches. V10 checks the computed p95 and p50 strokes against the palette values per mode. | Closed |
+| Overview density (row 4) | The compact Chart plot is exactly 56px. There is no SVG axis text, a baseline sits on the bottom edge, and HTML time labels sit below the plot. The Logs band is 64px through a host rule. | V10 checks heights `[56, 56, 56]` with one shared bottom at 1440px, stacked inside the viewport at 390px, and the Logs band at 64px. | Closed |
+| Logs severity colours (row 5) | `--level-info` was added. warn and error use `--warn` and `--danger`; unset uses `--muted`. Segment opacity blending was removed. | Unit checks the fills and the absence of opacity attributes. V10 checks the computed fill (`--danger`), opacity `1`, and the key swatches info, warn, error, unset. | Closed |
+| Waterfall bars (row 6) | Bars are coloured by recorded `service_name` through the series roles, and errors by status (`--danger`) with the existing `✕`. A Services key lists real services and the error cue. At narrow widths only the end axis labels show. | Unit checks two services plus errors. V10 checks the computed bar colours by recorded service and error, and the key `['ui-agent', '✕ error']`. | Closed |
+| Navigation surface and selected borders (row 7) | `--nav-surface` and `--selected-border` were added to `brand/palette.json` and projected by `gen-theme.mjs`. The tenant rail, WHERE, badge, pressed segments and open Filters consume the tokens. | `node --test brand/gen-theme.test.mjs` went RED on the missing `--nav-surface` light role, then GREEN. V10 checks the computed rail background (212px desktop), the WHERE border and the pressed Calculation border per mode. | Closed |
+| Extra series hues (row 8) | `SERIES_COLORS` is declare, observe, `--series-3/4/5` (dark `#4d5ef0`/`#a9b4ff`/`#8fae2a`, with the stated light counterparts). Spans bars use `--series-3`. | Unit checks the six-series stroke order; it was RED against the earlier cycle. V10 checks the Spans fill `--series-3` and the Metrics strokes declare then observe. | Closed |
+| Drawer and waterfall grid (row 9) | Unchanged 884px drawer, header, Link, Expand and Escape. The grid is still 300/110/flex/64 with 28px rows. | V10 checks the drawer at `min(884, viewport)`, every row at 28px, and the columns `[300, 110, …, 64]` at 1440px. V11 traces passes. | Closed |
+| Trace list controls (row 10) | No change. Columns and CSV stay in the trace listbar, and Logs keeps Wrap and Columns in its records header. | V11 traces and logs pass. | Closed |
+| Light theme (row 11) | Light counterparts for every new role are in the palette. | Before any colour check, V10 sets the `wyrd-mode` cookie and asserts `.app-root[data-mode]` and that the computed `--bg` equals the palette value, with every channel above 200 in light and below 40 in dark. All boards are checked in both modes at 1440px and 390px. | Closed pending human acceptance |
+| V10 | `observe boards match approved canvas` | `… -t "^observe boards match approved canvas$"`: 1 passed. It was authored after the GREEN component change, so its first runs failed only on test authoring (collapsed tree, unset key). Executable RED for design came from the unit and palette tests. | Pass |
+| V11 | Localized edits to the metrics journey only | `… -t "^authenticated (traces and spans\|logs investigation\|metrics investigation)$"`: 3 passed. | Pass |
+| Unit | `ui-pages.test.ts`, `ui-library.test.ts` | 16 passed. | Pass |
+| Check and build | `pnpm check`, `pnpm build` | 0 errors and 0 warnings; build exit 0. | Pass |
+| Codegen | `mise run codegen:check` | exit 0. | Pass |
+
+Per-board observations (inspected real captures):
+
+- **Shell / TimePicker.**
+  - Dark and light, 1440px: the rail is 212px on `--nav-surface`, with the selected destination on `--declare-soft`. The picker panel is on `--surface`.
+  - 390px: the rail becomes a top bar. The picker presets, the custom fields, UTC/Local and Apply range all fit inside the viewport.
+- **Traces / Spans.**
+  - Dark and light, 1440px: the three 56px tiles share one baseline. Spans are cobalt `--series-3`, errors are red, and the duration key reads p95 lime / p50 periwinkle. With the single seeded bucket, duration draws as a short mark.
+  - 390px: the tiles stack, and the controls wrap inside the screen. The list table scrolls horizontally inside its own panel.
+- **Waterfall.**
+  - Dark and light, 1440px: 884px drawer, Services key, `ui-agent` bars in `--declare`, and the error span red with `✕`.
+  - 390px: full-width drawer showing tree, track and duration. The overprinted middle tick was fixed so only the end ticks show.
+- **Logs.**
+  - Dark and light, 1440px: the 64px severity band in `--danger`, with the key info / warn / error / unset. Facets, records and detail sit in one row. The unpadded detail body was fixed.
+  - 390px: the regions stack in order. The detail fits the screen.
+- **Metrics.**
+  - Dark and light, 1440px: a 240px rail ending in Recorded points, then the chart card above the series card. Lines are declare then observe, with distinct markers.
+  - 390px: the rail, chart and series cards stack. Calculation wraps, and the summary names truncate inside their cells.
+  - The Recorded points drawer lists the four seeded points at 884px, or at the viewport width on mobile.
+
+Remaining notes:
+
+- The Recorded points rail link is an addition to the Metrics board, needed for the required explicit inspector.
+- Compact tiles each draw their own time labels rather than one shared Main time row.
+- Exemplar precision stays deferred.
+- Human acceptance of every board in dark and light, at desktop and mobile, remains pending.

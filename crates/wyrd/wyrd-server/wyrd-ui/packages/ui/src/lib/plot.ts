@@ -15,6 +15,13 @@ export interface Series {
 /** Series past this count fold into one summed "other" series (REQ-025). */
 export const MAX_SERIES = 20;
 
+/**
+ * The series palette, in order: every chart line and waterfall service takes
+ * the colour at its position modulo five, always beside a dash, marker or
+ * label so colour never carries identity alone.
+ */
+export const SERIES_COLORS = ['var(--declare)', 'var(--observe)', 'var(--series-3)', 'var(--series-4)', 'var(--series-5)'] as const;
+
 /** Position of the first column named `name`. */
 export function columnIndex(result: QueryResult, name: string): number {
   return result.columns.findIndex((column) => column.name === name);

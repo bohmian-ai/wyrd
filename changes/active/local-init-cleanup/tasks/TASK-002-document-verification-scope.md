@@ -309,12 +309,14 @@ intact; do not weaken Wyrd's documented scope or fabricate comparative proof.
 
 Spec revision 2 was still `draft` when this was implemented at the maintainer's
 direct request. It only narrows revision 1 by removing benchmark publication.
+Spec revision 3 (draft) moves the comparison to the README; where this task's
+body describes the six-platform hub comparison, revision 3 governs.
 
 ### Reuse and gap
 
 | Need | Existing owner reused | Gap closed |
 | --- | --- | --- |
-| Use-case hub and comparison | `get-started/` section, frontmatter-derived nav, landing `startPages` | One thin page `get-started/what-can-i-build.md` (order 4; coding-agent page moved to 5) |
+| Use-case hub | `get-started/` section, frontmatter-derived nav, landing `startPages` | One thin page `get-started/what-can-i-build.md` (order 4; coding-agent page moved to 5) |
 | Machine onboarding | `generate_llms_txt.py` `START` list, published-only filter | Third `START` step; no new discovery logic |
 | Agent onboarding | `setup-prompt.md` step 7, `GuideTopic::Start` docs step | Real hub link replaces "Choose your path"; guide names the hub after quickstart; wire contract unchanged |
 | Policy workflow | Recipes Uploaded files, `fixtures/cards/uploaded_artifacts/handbook-*.yaml` | Added binding, Python call, citation inspection, `fs.read` grant, deterministic-rule and verify/submit guidance |
@@ -327,11 +329,11 @@ direct request. It only narrows revision 1 by removing benchmark publication.
 |---|---|---|---|
 | REQ-001, INV-001 | `README.md` opening, `get-started/introduction.md`, hub intro: production verification across AI/ML and workflows; app owns execution/enforcement | Source review; readers 1–4 state Wyrd does not orchestrate/enforce | PASS |
 | REQ-002 | Six grey (`555555`) shields badges with `Use case: …` alt text, each linking a hub anchor | Shields SVG titles fetched (`Policy verification`, `Long-horizon workflows`); `docs:check` link and a11y pass | PASS |
-| REQ-003, INV-002 | Hub `## How Wyrd compares`: Platform / Main focus / Why choose Wyrd?, six rows, no OPA/status/checkmarks; MLflow coexistence and "no built-in MLflow connector"; Phoenix vs Arize AX separated; sources dated 2026-11-03 (recorded check the same day) | Source review; readers 3 and 4 report no connector and coexistence | PASS |
-| REQ-004, INV-002 | Comparison rows name exact versions, composed checks, cited verdicts, grouped/scheduled checks; links to how-verification-works, bifrost, architecture; no figures | `git diff 5aaa38937` review: no benchmark/throughput content | PASS |
+| REQ-003, INV-002 | Spec revision 3: README `## Why Wyrd` (You get / So you don't have to, before Install) and `## Already have tools?` (You use / Keep it for / Add Wyrd for, seven category rows, after Example); hub comparison removed | Maintainer review of `comparison-table-review.md`; `docs:check` pass; readers 3–4 rerun, below | PASS |
+| REQ-004, INV-002 | Why Wyrd rows name composed primitives, versioned checks run in CI and production, one data plane, whole-service versioning, gateway identity, self-hosted OTLP ingest; links to how-verification-works, bifrost, architecture; no figures | Source review: no benchmark or throughput content | PASS |
 | REQ-005, INV-003 | `START` step 3, landing CTA, quickstart "simplest" + Next, coding-agent Next, intro Next, MCP guide, setup prompt link | RED: `indexes.test.ts` start-route and omission tests failed before the page existed; GREEN: focused vitest 62/62; `docs:check` 100/100 incl. draft exclusion; prompt URL `https://docs.bohmian.ai/wyrd/get-started/what-can-i-build/` is the published route | PASS |
 | REQ-006, INV-001 | Recipes Uploaded files completion reusing tested fixtures | `uploaded_artifacts_are_reused_by_service_judges` journey PASS (scripted model) | PASS |
-| REQ-007 | Eight fresh-context readers, below | Answers recorded below | PASS |
+| REQ-007 | Eight fresh-context readers, below; scenarios 3–4 rerun for revision 3 | Rerun: MCP 3 FAIL, MCP 4 and public 3 PARTIAL | FAIL |
 
 ### Commands
 
@@ -378,6 +380,24 @@ workflow executor or enforcer. Only one omission (2/public: missed that `after:`
 sets the quiet window) remained, and the recipe already states it, so no repair
 was needed.
 
+### Revision 3 reader rerun
+
+Scenarios 3 and 4 were rerun after the comparison moved to the README. Model
+`claude-sonnet-5-5`, docs revision `8b2ae1e69`, same prompts and restrictions.
+The public entry was README plus the rendered build. The MCP entry was
+unchanged: the README is not in it.
+
+| Problem | Entry | Sources read | Answer summary | Rubric |
+| --- | --- | --- | --- | --- |
+| 3 MLflow | public | README → index → grep | Keep MLflow for training, experiments, registry; add Wyrd for runtime monitoring and verification of the deployed version; no connector invented; could not say how to link an MLflow model to a Model Card | PARTIAL |
+| 3 MLflow | MCP | guide start → llms → setup prompt → llms-full (no MLflow match) | Inferred Wyrd's verification role and guessed a run-ID column, labelled unconfirmed | FAIL |
+| 4 Existing tools | public | README → index → llms-full | Keep Langfuse and gateway; add Wyrd for composed verification; OTLP ingest, `telemetry=False`, gateway optional; no connector invented | PASS |
+| 4 Existing tools | MCP | guide start → llms → llms-full → setup prompt | Same fit, by inference; found no comparison | PARTIAL |
+
+REQ-007 fails for MCP onboarding. Agents read `llms.txt`, `llms-full.txt` and the
+docs, not the README, so the comparison is invisible to them. The README row also
+dropped the hub's "send evidence with the MLflow run ID" guidance.
+
 ### Limits and non-goals
 
 - The MCP entry was simulated from the exact `wyrd.guide start` source and the
@@ -386,7 +406,7 @@ was needed.
   against a real provider at the documented release (no provider key was
   available). Real-model judgment quality is not established.
 - Vendor facts rely on the task's 2026-11-03 official-source check (same day);
-  they were not re-fetched.
+  they were not re-fetched. Revision 3 publishes no vendor citations.
 - Excluded, as required: runtime, schema, MCP tool, and CLI changes; benchmarks;
   new architecture sections; vendor integrations; draft-page publication. No
   unrelated files changed. `review/TASK-001-review-02/` belongs to TASK-001 and

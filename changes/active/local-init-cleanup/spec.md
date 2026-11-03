@@ -1,6 +1,6 @@
 ---
 id: SPEC-local-init-cleanup
-revision: 2
+revision: 3
 status: draft
 ---
 
@@ -25,8 +25,8 @@ to keep both tasks in the existing change packet and create one shared spec.
 This revision consolidates those recorded decisions and the existing setup task.
 The maintainer explicitly approved spec revision 1 when requesting TASK-001
 review on 2026-11-03. Revision 2 records the subsequent direction to omit
-public benchmark material and reuse existing architecture explanations; it
-remains draft. TASK-001's revision-1 obligations are unchanged. Only the two
+public benchmark material and reuse existing architecture explanations.
+Revision 3 moves the comparison into the README. Both remain draft. TASK-001's revision-1 obligations are unchanged. Only the two
 bounded tasks below are in scope:
 
 - [TASK-001 — local setup cleanup](tasks/TASK-001-local-setup-cleanup.md).
@@ -55,22 +55,25 @@ Introduce them with a concise statement covering outputs, policy decisions,
 tool calls, and complete workflows. They are navigation, not certification or
 passing-test indicators.
 
-### Keep the comparison simple and give Wyrd full credit
+### Compare in the README, by reader job
 
-**REQ-003.** Publish a three-column comparison: **Platform**, **Main focus**,
-and **Why choose Wyrd?** Include Wyrd, MLflow, Langfuse, LangSmith, Braintrust,
-and Arize Phoenix. State that the latter four compete with Wyrd in the
-LLM/agent observability/evaluation portion of its scope. Explain Wyrd's
-broader integrated verification model using concrete capabilities, not a
-generic list of evaluator features. MLflow covers conventional ML lifecycle
-and GenAI tooling; explain both the overlap and keeping MLflow authoritative
-for models/experiments while Wyrd verifies supplied evidence.
+**REQ-003.** Put the comparison in the README as two sections, one per reader
+job. **Why Wyrd**, before Install, serves a reader choosing between tools: a
+two-column table, **You get** and **So you don't have to**, that names Wyrd's
+capabilities and no other product. **Already have tools?**, after the Example,
+serves a reader fitting Wyrd into an existing stack: a three-column table,
+**You use**, **Keep it for**, and **Add Wyrd for**, with one row per tool
+category and its common products: experiment tracking (MLflow, Weights &
+Biases), LLM observability (Langfuse, Arize Phoenix, LangSmith), eval
+frameworks (promptfoo, DeepEval, Ragas), ML monitoring (Evidently, Fiddler),
+AI gateways (LiteLLM, Portkey), observability platforms (Datadog, Grafana,
+Honeycomb), and AI governance (Credo AI, IBM watsonx.governance). Every row
+keeps the existing tool.
 
-No OPA row, integration-status taxonomy, exhaustive feature-checkmark grid,
-or larger vendor catalogue is included. LiteLLM and Guardrails AI are deferred
-from this initial matrix. Do not equate Phoenix with the entire Arize AX
-offering. Separate competitor feature documentation from evidence about
-relative implementation depth, performance, or production reliability.
+The use-case hub carries no comparison. No OPA row, integration-status labels,
+feature-checkmark grid, or claim about another product's depth, performance,
+or reliability is included. Each claim about another product matches that
+product's public documentation at publication; citations are not published.
 
 **REQ-004.** Make Wyrd's concrete differentiators easy to find from the
 comparison and use cases: heterogeneous evidence, composed checks, exact
@@ -183,7 +186,7 @@ setup reporting.
 | Acceptance | Obligations | Expected observation and evidence |
 | --- | --- | --- |
 | AC-001 | REQ-001, REQ-002, INV-001 | README presents Wyrd's full scope and six accessible use-case links; rendered review confirms relevant published destinations. |
-| AC-002 | REQ-003, INV-002 | Simple six-platform comparison gives Wyrd full credit, dates its primary evidence, and omits OPA, status labels and unsupported claims. |
+| AC-002 | REQ-003, INV-002 | README Why Wyrd and Already have tools? match REQ-003; product claims match public documentation; the hub has no comparison; OPA, status labels and unsupported claims are absent. |
 | AC-003 | REQ-004, INV-002 | Differentiators match source owners and link to existing explanations; no new architecture exposition or benchmark publication is added. |
 | AC-004 | REQ-005, INV-003 | Public and machine discovery reach the richer workflows, preserve setup/quickstart order and draft exclusion, and contain no nonexistent next-step link. |
 | AC-005 | REQ-006, REQ-007, INV-001 | Existing policy workflow completes with cited evidence; all four reader scenarios succeed through both public docs and MCP onboarding. |
@@ -222,3 +225,7 @@ Authorities: [repository rules](../../../AGENTS.md),
 - Revision 2, draft, 2026-11-03: recorded the maintainer's rejection of public
   benchmark material and clarification that existing architecture documentation
   should be linked rather than duplicated. TASK-001 runtime scope is unchanged.
+- Revision 3, draft, 2026-11-03: moved the comparison from the hub to the README
+  as Why Wyrd and Already have tools?, per the maintainer's review of the
+  comparison table; replaced the six-platform list with tool categories and
+  dropped published, dated vendor citations. TASK-001 scope is unchanged.

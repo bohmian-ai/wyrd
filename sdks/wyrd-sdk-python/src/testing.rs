@@ -398,6 +398,30 @@ impl WyrdTestServer {
         Ok(bootstrap.id().to_string())
     }
 
+    /// Create a local password User `name` holding the built-in `roles`, sign
+    /// them in, and create one of their own keys limited to `ceiling` through
+    /// the production routes; returns the principal id and the key. Must be
+    /// called inside the context manager.
+    ///
+    /// # Errors
+    /// Raises a Wyrd Python error when the context manager is inactive or a
+    /// route refuses.
+    #[pyo3(signature = (roles, name, ceiling))]
+    fn bootstrap_user_key(
+        &self,
+        roles: Vec<String>,
+        name: &str,
+        ceiling: Vec<String>,
+    ) -> WyrdPyResult<(String, String)> {
+        let server = self.started()?;
+        let roles: Vec<&str> = roles.iter().map(String::as_str).collect();
+        let ceiling: Vec<&str> = ceiling.iter().map(String::as_str).collect();
+        let (id, key) = wyrd_runtime::runtime()
+            .block_on(server.bootstrap_user_key(name, &roles, &ceiling))
+            .map_err(py_error)?;
+        Ok((id.to_string(), key.expose_secret().to_owned()))
+    }
+
     /// Issue an API key for a registered Service Card's family runtime account.
     ///
     /// A credential fixture: the account restricted to the Card's family is

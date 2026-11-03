@@ -126,6 +126,43 @@ def test_direct_and_idp_user_assignments_coexist(server: WyrdTestServer) -> None
     assert revoked["roles"] == [{"role": "viewer", "source": "idp"}]
 
 
+def test_users_manage_personal_keys(server: WyrdTestServer) -> None:
+    ceiling = ["personal_credentials:write", "cards:read", "personal_credentials:read"]
+    user, key = server.bootstrap_user_key(["editor"], "keeper", ceiling)
+    own = Principals(client_of(server, key))
+
+    me = own.me()
+    assert me["principal_id"] == user
+    assert me["principal_kind"] == "user"
+    assert me["username"] == "keeper"
+    assert me["authentication"] == "password"
+    assert me["permissions"] == sorted(ceiling)
+
+    page = own.list_credentials_page(user, limit=10)
+    assert "next_cursor" not in page
+    [listed] = page["credentials"]
+    assert listed["name"] == "keeper"
+    assert listed["permission_ceiling"] == sorted(ceiling)
+    assert listed["expires_at"] is not None
+    with pytest.raises(WyrdError) as unpaged:
+        own.list_credentials(user)
+    assert unpaged.value.code == "WYRD_SPEC_400_VALIDATION"
+    with pytest.raises(WyrdError) as issued:
+        own.issue_credential(user)
+    assert issued.value.code == "WYRD_SPEC_400_VALIDATION"
+
+    admin = Principals(client_of(server))
+    assert len(admin.list_credentials(user)["credentials"]) == 1
+    with pytest.raises(WyrdError) as service:
+        admin.me()
+    assert service.value.code == DENIED
+
+    own.revoke_credential(user, listed["id"])
+    with pytest.raises(WyrdError) as revoked:
+        Principals(client_of(server, key)).me()
+    assert revoked.value.code.startswith("WYRD_AUTH_401_")
+
+
 FAMILY = "observed-service"
 """The Service family whose two checked-in releases share one runtime account."""
 

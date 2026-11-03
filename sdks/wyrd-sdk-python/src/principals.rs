@@ -9,7 +9,7 @@ use pyo3::prelude::*;
 use pyo3::types::PyModule;
 use serde_json::Value;
 use wyrd_client::principals::{
-    CreateServicePrincipalRequest, PrincipalId, PrincipalQuery, Principals as NativePrincipals,
+    CreateServicePrincipalRequest, CredentialListQuery, PrincipalId, PrincipalQuery, Principals as NativePrincipals,
     RevokePrincipalRequest, WorkloadRestriction,
 };
 use wyrd_utils::py::{WyrdPyResult, pyobject_to_json};
@@ -138,6 +138,41 @@ impl Principals {
         let id = self::principal_id(principal_id)?;
         let listed = crate::trace::block_on(py, self.handle(py)?.list_credentials(&id))?;
         to_python(py, &listed)
+    }
+
+    /// Read one page of a principal's credential metadata, newest first; an
+    /// omitted `limit` reads 50. Pass a page's `next_cursor` as `cursor` with
+    /// the same principal to read the following page.
+    ///
+    /// # Errors
+    /// Raises `WyrdError` when an argument does not match the wire contract,
+    /// the caller may not read these credentials, the cursor names another
+    /// principal, or the request fails.
+    #[pyo3(signature = (principal_id, *, limit=None, cursor=None))]
+    fn list_credentials_page(
+        &self,
+        py: Python<'_>,
+        principal_id: &str,
+        limit: Option<u32>,
+        cursor: Option<&str>,
+    ) -> WyrdPyResult<Py<PyAny>> {
+        let id = self::principal_id(principal_id)?;
+        let query: CredentialListQuery = decode(
+            "query",
+            serde_json::json!({ "limit": limit, "cursor": cursor }),
+        )?;
+        let page =
+            crate::trace::block_on(py, self.handle(py)?.list_credentials_page(&id, query))?;
+        to_python(py, &page)
+    }
+
+    /// The calling User's safe profile.
+    ///
+    /// # Errors
+    /// Raises `WyrdError` when the caller is not a User or the request fails.
+    fn me(&self, py: Python<'_>) -> WyrdPyResult<Py<PyAny>> {
+        let profile = crate::trace::block_on(py, self.handle(py)?.me())?;
+        to_python(py, &profile)
     }
 
     /// Revoke one credential of a principal.

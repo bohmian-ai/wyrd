@@ -1,7 +1,7 @@
 ---
 id: SPEC-local-init-cleanup
 revision: 3
-status: draft
+status: approved
 ---
 
 # Local setup and verification documentation cleanup
@@ -26,7 +26,8 @@ This revision consolidates those recorded decisions and the existing setup task.
 The maintainer explicitly approved spec revision 1 when requesting TASK-001
 review on 2026-11-03. Revision 2 records the subsequent direction to omit
 public benchmark material and reuse existing architecture explanations.
-Revision 3 moves the comparison into the README. Both remain draft. TASK-001's revision-1 obligations are unchanged. Only the two
+Revision 3 moves the comparison into the README. The maintainer approved
+revision 3, which includes revision 2, on 2026-11-03. TASK-001's revision-1 obligations are unchanged. Only the two
 bounded tasks below are in scope:
 
 - [TASK-001 — local setup cleanup](tasks/TASK-001-local-setup-cleanup.md).
@@ -230,3 +231,5 @@ Authorities: [repository rules](../../../AGENTS.md),
   as Why Wyrd and Already have tools?, per the maintainer's review of the
   comparison table; replaced the six-platform list with tool categories and
   dropped published, dated vendor citations. TASK-001 scope is unchanged.
+- Revision 3 approved, 2026-11-03: explicit maintainer approval; includes
+  revision 2. No requirement or acceptance behavior changed.

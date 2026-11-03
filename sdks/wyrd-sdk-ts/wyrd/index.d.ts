@@ -643,6 +643,25 @@ export declare class NativePrincipals {
    */
   listCredentials(principalId: string): Promise<NativeLifecycleResult>
   /**
+   * Reads one page of a principal's credential metadata from a serialized
+   * `CredentialListQuery`; an omitted limit reads 50.
+   *
+   * # Errors
+   *
+   * Returns a napi error only when the page cannot be serialized; a
+   * malformed id or query, or a server refusal, is returned in the result.
+   */
+  listCredentialsPage(principalId: string, queryJson: string): Promise<NativeLifecycleResult>
+  /**
+   * Reads the calling User's safe profile.
+   *
+   * # Errors
+   *
+   * Returns a napi error only when the profile cannot be serialized; a
+   * server refusal is returned in the result.
+   */
+  me(): Promise<NativeLifecycleResult>
+  /**
    * Revokes one credential of a principal.
    *
    * # Errors

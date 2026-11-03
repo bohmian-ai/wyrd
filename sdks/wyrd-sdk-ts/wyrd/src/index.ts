@@ -19,8 +19,11 @@ import type {
   CreateOperatorConnectionRequest,
   CreateServicePrincipalRequest,
   CreateServicePrincipalResponse,
+  AccountAuthentication,
+  CredentialListQuery,
   CredentialListResponse as CredentialList,
   CredentialMetadata,
+  CurrentUserProfile,
   DataTypeSpec,
   FallbackRule,
   FallbackScope,
@@ -159,8 +162,11 @@ export type {
   CreateOperatorConnectionRequest,
   CreateServicePrincipalRequest,
   CreateServicePrincipalResponse,
+  AccountAuthentication,
+  CredentialListQuery,
   CredentialList,
   CredentialMetadata,
+  CurrentUserProfile,
   DataTypeSpec,
   FallbackRule,
   FallbackScope,
@@ -2172,6 +2178,30 @@ export class Principals {
    */
   async listCredentials(principalId: string): Promise<CredentialList> {
     return lifecycleValue(await this.#native.listCredentials(principalId));
+  }
+
+  /**
+   * Read one page of a principal's credential metadata, newest first; an
+   * omitted `limit` reads 50. Pass a page's `next_cursor` as `cursor` with
+   * the same principal to read the following page.
+   *
+   * @param principalId - The principal whose credentials to list.
+   * @param query - Page size (1–100) and the previous page's continuation.
+   * @returns One page, with `next_cursor` only when more rows remain.
+   * @throws {@link WyrdError} for a bad limit, another principal's cursor, or a transport or authorization failure.
+   */
+  async listCredentialsPage(principalId: string, query: CredentialListQuery = {}): Promise<CredentialList> {
+    return lifecycleValue(await this.#native.listCredentialsPage(principalId, JSON.stringify(query)));
+  }
+
+  /**
+   * Read the calling User's safe profile; `permissions` are informational.
+   *
+   * @returns The tenant, username, account authentication and effective permissions.
+   * @throws {@link WyrdError} when the caller is not a User, or a transport failure.
+   */
+  async me(): Promise<CurrentUserProfile> {
+    return lifecycleValue(await this.#native.me());
   }
 
   /**

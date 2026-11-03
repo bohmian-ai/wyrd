@@ -136,6 +136,16 @@ export declare class NativeWyrdTestServer {
    */
   bootstrapUser(roles: Array<string>, name: string): string
   /**
+   * Create a local password User `name` holding the built-in `roles`, sign
+   * them in, and create one of their own keys limited to `ceiling` through
+   * the production routes; returns `[principalId, key]`.
+   *
+   * # Errors
+   *
+   * Returns a napi error when the harness is closed or a route refuses.
+   */
+  bootstrapUserKey(roles: Array<string>, name: string, ceiling: Array<string>): Array<string>
+  /**
    * Bootstrap a service principal holding `roles` in tenant `tenant_id` and
    * return its API key.
    *

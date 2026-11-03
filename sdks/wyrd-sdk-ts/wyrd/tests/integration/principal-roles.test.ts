@@ -93,6 +93,40 @@ test("direct and idp user assignments coexist", async ({ server }) => {
   expect(revoked.roles).toEqual([{ role: "viewer", source: "idp" }]);
 });
 
+test("users manage personal keys", async ({ server }) => {
+  const ceiling = ["personal_credentials:write", "cards:read", "personal_credentials:read"];
+  const [user, key] = server.bootstrapUserKey(["editor"], "keeper", ceiling) as [string, string];
+  const own = await Principals.connect({ client: WyrdClient.connect({ credential: key }) });
+
+  const me = await own.me();
+  expect(me).toMatchObject({
+    principal_id: user,
+    principal_kind: "user",
+    username: "keeper",
+    authentication: "password",
+  });
+  expect(me.permissions).toEqual([...ceiling].sort());
+
+  const page = await own.listCredentialsPage(user, { limit: 10 });
+  expect(page.next_cursor).toBeUndefined();
+  expect(page.credentials).toHaveLength(1);
+  const [listed] = page.credentials;
+  expect(listed?.name).toBe("keeper");
+  expect(listed?.permission_ceiling).toEqual([...ceiling].sort());
+  expect(listed?.expires_at).not.toBeNull();
+  await expect(own.listCredentials(user)).rejects.toMatchObject({ code: "WYRD_SPEC_400_VALIDATION" });
+  await expect(own.issueCredential(user)).rejects.toMatchObject({ code: "WYRD_SPEC_400_VALIDATION" });
+
+  const admin = await Principals.connect();
+  expect((await admin.listCredentials(user)).credentials).toHaveLength(1);
+  await expect(admin.me()).rejects.toMatchObject(DENIED);
+
+  await own.revokeCredential(user, listed?.id ?? "");
+  await expect(
+    Principals.connect({ client: WyrdClient.connect({ credential: key }) }).then((revoked) => revoked.me()),
+  ).rejects.toMatchObject(KEY_REFUSED);
+});
+
 /** The second release of the observed Service, sharing its Agent and Model. */
 const RELEASE_2 = fixture("cards/observe_a_run/observed-service-2.yaml");
 

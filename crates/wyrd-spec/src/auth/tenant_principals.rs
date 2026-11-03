@@ -77,10 +77,12 @@ pub struct CredentialMetadata {
     /// Normalized name of a User key; absent for Service, Admin and platform
     /// credentials, whose authority is their principal's.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(schema_with = "crate::schema::skipped_option::<String>")]
     pub name: Option<String>,
     /// Permission ceiling of a User key in canonical sorted order; absent for
     /// Service, Admin and platform credentials, which carry none.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(schema_with = "crate::schema::skipped_option::<Vec<String>>")]
     pub permission_ceiling: Option<Vec<String>>,
 }
 
@@ -93,6 +95,7 @@ pub struct CredentialListResponse {
     /// Continuation of a paged listing; present only when more rows remain
     /// and never on a complete (unpaged) listing.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(schema_with = "crate::schema::skipped_option::<String>")]
     pub next_cursor: Option<String>,
 }
 
@@ -189,6 +192,7 @@ pub struct CurrentUserProfile {
     /// Always `user`.
     pub principal_kind: PrincipalKindTag,
     /// Canonical local username; `null` for an SSO-only account.
+    #[serde(default)]
     pub username: Option<String>,
     /// How the account authenticates, independent of this request's credential.
     pub authentication: AccountAuthentication,

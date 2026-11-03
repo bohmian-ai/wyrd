@@ -10,8 +10,8 @@ use napi::Env;
 use napi::bindgen_prelude::PromiseRaw;
 use napi_derive::napi;
 use wyrd_client::principals::{
-    CreateServicePrincipalRequest, PrincipalId, PrincipalQuery, Principals, RevokePrincipalRequest,
-    WorkloadRestriction,
+    CreateServicePrincipalRequest, CredentialListQuery, PrincipalId, PrincipalQuery, Principals,
+    RevokePrincipalRequest, WorkloadRestriction,
 };
 use wyrd_spec::error::WyrdError;
 
@@ -143,6 +143,50 @@ impl NativePrincipals {
                 Err(error) => Err(error),
             };
             NativeLifecycleResult::outcome(result)
+        })
+    }
+
+    /// Reads one page of a principal's credential metadata from a serialized
+    /// `CredentialListQuery`; an omitted limit reads 50.
+    ///
+    /// # Errors
+    ///
+    /// Returns a napi error only when the page cannot be serialized; a
+    /// malformed id or query, or a server refusal, is returned in the result.
+    #[napi]
+    pub fn list_credentials_page<'env>(
+        &self,
+        env: &'env Env,
+        principal_id: String,
+        query_json: String,
+    ) -> napi::Result<PromiseRaw<'env, NativeLifecycleResult>> {
+        let principals = self.principals.clone();
+        crate::trace::spawn(env, async move {
+            let result = match (
+                self::principal_id(principal_id),
+                decode::<CredentialListQuery>("query", &query_json),
+            ) {
+                (Ok(id), Ok(query)) => principals.list_credentials_page(&id, query).await,
+                (Err(error), _) | (_, Err(error)) => Err(error),
+            };
+            NativeLifecycleResult::outcome(result)
+        })
+    }
+
+    /// Reads the calling User's safe profile.
+    ///
+    /// # Errors
+    ///
+    /// Returns a napi error only when the profile cannot be serialized; a
+    /// server refusal is returned in the result.
+    #[napi]
+    pub fn me<'env>(
+        &self,
+        env: &'env Env,
+    ) -> napi::Result<PromiseRaw<'env, NativeLifecycleResult>> {
+        let principals = self.principals.clone();
+        crate::trace::spawn(env, async move {
+            NativeLifecycleResult::outcome(principals.me().await)
         })
     }
 

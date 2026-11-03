@@ -9,8 +9,8 @@ use pyo3::prelude::*;
 use pyo3::types::PyModule;
 use serde_json::Value;
 use wyrd_client::principals::{
-    CreateServicePrincipalRequest, CredentialListQuery, PrincipalId, PrincipalQuery, Principals as NativePrincipals,
-    RevokePrincipalRequest, WorkloadRestriction,
+    CreateServicePrincipalRequest, CredentialListQuery, PrincipalId, PrincipalQuery,
+    Principals as NativePrincipals, RevokePrincipalRequest, WorkloadRestriction,
 };
 use wyrd_utils::py::{WyrdPyResult, pyobject_to_json};
 
@@ -161,8 +161,7 @@ impl Principals {
             "query",
             serde_json::json!({ "limit": limit, "cursor": cursor }),
         )?;
-        let page =
-            crate::trace::block_on(py, self.handle(py)?.list_credentials_page(&id, query))?;
+        let page = crate::trace::block_on(py, self.handle(py)?.list_credentials_page(&id, query))?;
         to_python(py, &page)
     }
 

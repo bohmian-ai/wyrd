@@ -14,9 +14,10 @@ use schemars::SchemaGenerator;
 use serde_json::{Map, Value, json, to_string_pretty};
 use wyrd_spec::auth::{
     AbsoluteUrl, CallbackQuery, CreateServicePrincipalRequest, CreateServicePrincipalResponse,
-    CredentialListResponse, GatewayAccess, IssuedCredential, IssuerUrl, LoginInitResponse,
-    PrincipalKindTag, PrincipalPage, PrincipalQuery, PrincipalRoles, RevokePrincipalRequest,
-    RoleAssignmentChange, TokenAudience, TokenRequest, TokenResponse,
+    CredentialListQuery, CredentialListResponse, CurrentUserProfile, GatewayAccess,
+    IssuedCredential, IssuerUrl, LoginInitResponse, PrincipalKindTag, PrincipalPage,
+    PrincipalQuery, PrincipalRoles, RevokePrincipalRequest, RoleAssignmentChange, TokenAudience,
+    TokenRequest, TokenResponse,
 };
 use wyrd_spec::card::agent::AgentSpec;
 use wyrd_spec::card::artifact::{ArtifactSpec, FrameworkAdapterRef};
@@ -251,6 +252,8 @@ fn contracts() -> Value {
         CreateServicePrincipalResponse,
         IssuedCredential,
         CredentialListResponse,
+        CredentialListQuery,
+        CurrentUserProfile,
         PrincipalRoles,
         RoleAssignmentChange,
         PrincipalPage,

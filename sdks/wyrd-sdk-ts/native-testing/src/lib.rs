@@ -336,6 +336,35 @@ impl NativeWyrdTestServer {
         result
     }
 
+    /// Create a local password User `name` holding the built-in `roles`, sign
+    /// them in, and create one of their own keys limited to `ceiling` through
+    /// the production routes; returns `[principalId, key]`.
+    ///
+    /// # Errors
+    ///
+    /// Returns a napi error when the harness is closed or a route refuses.
+    #[napi]
+    pub fn bootstrap_user_key(
+        &self,
+        roles: Vec<String>,
+        name: String,
+        ceiling: Vec<String>,
+    ) -> Result<Vec<String>> {
+        let result = self.with_server(|server| {
+            let roles: Vec<&str> = roles.iter().map(String::as_str).collect();
+            let ceiling: Vec<&str> = ceiling.iter().map(String::as_str).collect();
+            let (id, key) = wyrd_runtime::runtime()
+                .block_on(server.bootstrap_user_key(&name, &roles, &ceiling))
+                .map_err(reason)?;
+            Ok(vec![
+                id.to_string(),
+                secrecy::ExposeSecret::expose_secret(&key).to_owned(),
+            ])
+        });
+        drop((roles, name, ceiling));
+        result
+    }
+
     /// Bootstrap a service principal holding `roles` in tenant `tenant_id` and
     /// return its API key.
     ///

@@ -4,6 +4,7 @@
 //! principals for automation, their roles, and the credentials that authenticate
 //! them. Everything is scoped to the authenticated caller's tenant.
 
+pub mod accounts;
 pub mod routes;
 
 pub use routes::principals_router;

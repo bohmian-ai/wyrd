@@ -138,6 +138,11 @@ async fn authenticate_browser_session(
     };
     match sessions.resolve(cookie).await {
         Ok(session) => {
+            if session.recent {
+                request
+                    .extensions_mut()
+                    .insert(crate::auth::browser::RecentHumanLogin);
+            }
             request
                 .extensions_mut()
                 .insert(AuthenticatedPrincipal::from_verified(Arc::new(

@@ -884,29 +884,30 @@ impl TenantTokenIssuer {
         })
     }
 
-    /// Whether `principal_id` — a User or a Service/Admin account — is
-    /// active in an admitting tenant and currently holds `required`.
+    /// The current permissions of `principal_id` — a User or a
+    /// Service/Admin account — when it is active in an admitting tenant;
+    /// `None` for a missing or inactive principal. A User's include its self
+    /// credential capabilities.
     ///
-    /// Revalidates an earlier issuer's authority at the moment it is spent,
-    /// such as an enrollment invitation's.
+    /// Revalidates authority at the moment it is spent, such as an
+    /// enrollment invitation issuer's or a new User key's ceiling.
     ///
     /// # Errors
-    /// As [`Self::issue`], less the signing and Card-context errors, except
-    /// that a missing or inactive principal is `false`.
-    pub async fn currently_holds(
+    /// As [`Self::issue`], less the signing and Card-context errors and the
+    /// inactive-principal refusal.
+    pub async fn current_permissions(
         &self,
         conn: &mut TenantConn<'_>,
         principal_id: Uuid,
-        required: &Permission,
-    ) -> Result<bool, IssuanceError> {
+    ) -> Result<Option<PermissionSet>, IssuanceError> {
         for human in [true, false] {
             match self.resolve(conn, principal_id, human).await {
-                Ok(resolved) => return Ok(resolved.permissions.contains(required)),
+                Ok(resolved) => return Ok(Some(resolved.permissions)),
                 Err(IssuanceError::PrincipalInactive) => {}
                 Err(error) => return Err(error),
             }
         }
-        Ok(false)
+        Ok(None)
     }
 
     /// Establish or renew a human session: an access token from

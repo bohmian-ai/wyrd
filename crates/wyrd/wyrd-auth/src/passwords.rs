@@ -481,15 +481,11 @@ impl BrowserSessions {
             .await
             .map_err(store_error)?
             .ok_or_else(one_time_code_invalid)?;
-        if !self
+        let issuer_permissions = self
             .issuer
-            .currently_holds(
-                &mut conn,
-                invitation.issuer_principal_id,
-                &Permission::wildcard(),
-            )
-            .await?
-        {
+            .current_permissions(&mut conn, invitation.issuer_principal_id)
+            .await?;
+        if !issuer_permissions.is_some_and(|held| held.contains(&Permission::wildcard())) {
             tracing::info!("invitation issuer no longer holds tenant administration");
             return Err(one_time_code_invalid());
         }

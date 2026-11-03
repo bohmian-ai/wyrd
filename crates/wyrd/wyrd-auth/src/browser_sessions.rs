@@ -486,7 +486,7 @@ fn cookie_key(cookie: &str) -> Result<(DataTenantId, Sha256Hex), WyrdError> {
 
 /// The `resource:action` names of a permission set, with composite resources
 /// and actions expanded to their members.
-fn permission_names(permissions: &PermissionSet) -> Vec<String> {
+pub fn permission_names(permissions: &PermissionSet) -> Vec<String> {
     /// The single resources a resource names.
     fn resources(resource: &Resource) -> Vec<&'static str> {
         match resource {

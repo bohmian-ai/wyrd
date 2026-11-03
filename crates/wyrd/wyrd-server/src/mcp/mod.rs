@@ -379,6 +379,12 @@ impl WyrdMcpHandler {
                     .await
                     .map_err(wyrd_error_to_mcp)
             }
+            principals::ME => {
+                let caller = Self::caller(&context).map_err(wyrd_error_to_mcp)?;
+                self.mcp_me(caller, request.arguments)
+                    .await
+                    .map_err(wyrd_error_to_mcp)
+            }
             principals::REVOKE_CREDENTIAL => {
                 let caller = Self::caller(&context).map_err(wyrd_error_to_mcp)?;
                 // No scope check here. The operation this dispatches to

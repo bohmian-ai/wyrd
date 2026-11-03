@@ -673,10 +673,13 @@ mod tests {
 
     /// Becoming ready logs INFO, losing readiness logs WARN with the failing
     /// checks, and staying unready logs nothing.
+    ///
+    /// # Panics
+    /// Panics when a transition logs at the wrong level, omits the failing
+    /// checks, or staying unready logs anything.
     #[test]
     fn readiness_transitions_are_logged() {
-        let logs = crate::test_support::CapturedLogs::default();
-        let _guard = logs.capture();
+        let logs = wyrd_testing::logs::LogCapture::install();
 
         log_transition(&ReadinessSnapshot::initial(), &ReadinessSnapshot::initial());
         assert_eq!(logs.text(), "");

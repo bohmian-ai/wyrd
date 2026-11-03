@@ -383,6 +383,9 @@ impl GatewaySummary {
 
 impl serde::Serialize for GatewaySummary {
     /// The status and detail as one string.
+    ///
+    /// # Errors
+    /// Returns the serializer's error when it cannot write the string.
     fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
         serializer.collect_str(&format_args!("{}: {}", self.status(), self.detail()))
     }
@@ -1909,6 +1912,10 @@ mod tests {
 
     /// Stored names are existing, an empty read is not configured, and a
     /// failed read is unknown rather than absent; JSON carries the text facts.
+    ///
+    /// # Panics
+    /// Panics when a read maps to the wrong summary, the status or detail
+    /// text differs, or serialization fails or differs from the text.
     #[test]
     fn gateway_summary_distinguishes_empty_and_failed_reads() {
         let existing = GatewaySummary::read::<()>(Ok(vec!["openai".to_owned()]));

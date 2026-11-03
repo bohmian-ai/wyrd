@@ -369,7 +369,7 @@ mod tests {
     use tower::ServiceExt as _;
 
     use super::*;
-    use crate::test_support::CapturedLogs;
+    use wyrd_testing::logs::LogCapture;
 
     /// Send `GET path` through `router` and return the response status.
     ///
@@ -399,8 +399,7 @@ mod tests {
                 .route("/v1/cards", get(unavailable)),
             None,
         );
-        let logs = CapturedLogs::default();
-        let _guard = logs.capture();
+        let logs = LogCapture::install();
 
         assert_eq!(
             status_of(&router, "/readyz").await,

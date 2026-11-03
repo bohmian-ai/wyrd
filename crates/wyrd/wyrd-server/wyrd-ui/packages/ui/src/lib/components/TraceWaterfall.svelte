@@ -341,6 +341,10 @@
     .service {
       display: none;
     }
+    /* A short track keeps only its two end labels, so the ticks never overprint. */
+    .ticks span:not(.first, .last) {
+      display: none;
+    }
   }
   @container (max-width: 280px) {
     .row {

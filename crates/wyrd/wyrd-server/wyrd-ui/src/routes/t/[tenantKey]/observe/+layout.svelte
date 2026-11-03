@@ -323,7 +323,8 @@
               {#snippet heading()}
                 <div class="metric">
                   <h2>{metric}</h2>
-                  <p class="type">{metricRow ? `${metricRow.type}${metricRow.unit ? ` · ${metricRow.unit}` : ''}` : ''}</p>
+                  <!-- The chart title's calculation and precision caveat stay visible under the metric name. -->
+                  <p class="type">{metricRow ? `${metricRow.type}${metricRow.unit ? ` · ${metricRow.unit}` : ''} · ` : ''}{series.chart.input.title?.replace(`${metric} · `, '')}</p>
                 </div>
                 <span class="choices">
                   <span class="segmented" role="group" aria-label="Calculation">
@@ -567,6 +568,11 @@
     display: grid;
     grid-template-columns: repeat(auto-fit, minmax(240px, 1fr));
     gap: 16px;
+  }
+  /* The Logs board's severity timeline is one 64px band; the Traces trio stays 56px. */
+  [data-panel='timeline'] :global(.chart.compact .box) {
+    height: 64px;
+    min-height: 64px;
   }
   .listbar {
     display: flex;

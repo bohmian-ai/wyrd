@@ -84,7 +84,7 @@
       <p>Log record</p>
       <a href={`${base}/observe?${writeState(closed(current))}`} aria-label="Close log record" data-sveltekit-noscroll>✕</a>
     </header>
-    {@render record()}
+    <div class="body">{@render record()}</div>
   </aside>
 {/if}
 
@@ -146,6 +146,9 @@
   header a {
     color: var(--muted);
     text-decoration: none;
+  }
+  .record .body {
+    padding: 12px 14px;
   }
   @media (max-width: 899px) {
     .record {

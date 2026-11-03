@@ -6,7 +6,7 @@ section: Get started
 order: 1
 ---
 
-Wyrd is production verification infrastructure for AI/ML systems and the application workflows around them. You ship a support agent, a payment workflow, a model behind an API, or a coding agent that runs for hours. Wyrd checks its outputs, policy decisions, tool calls, and complete workflows against the rules you set, such as "never promise a refund" or "follow the payment policy document", before you release a change and while it serves real traffic. When a rule fails, Wyrd tells you which rule, why, and which version of your system broke it.
+Wyrd is open-source infrastructure for building your own verification system for AI/ML in production. You ship a support agent, a payment workflow, a model behind an API, or a coding agent that runs for hours. You compose Wyrd's primitives into checks on its outputs, tool calls, and complete workflows against the rules you set, such as "never promise a refund" or "follow the payment policy document", before you release a change and while it serves real traffic. When a rule fails, Wyrd tells you which rule, why, and which version of your system broke it.
 
 ## How Wyrd fits your stack
 

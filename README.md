@@ -16,9 +16,9 @@
   <a href="https://discord.gg/K5bf23yPNb">Discord</a>
 </p>
 
-Wyrd is open-source production verification infrastructure for AI/ML systems and the application workflows around them. Know whether your system does what you said it would, before release and in production.
+Wyrd is open-source infrastructure for building your own verification system for AI/ML in production. Register what you ship at exact versions, record what it does, and judge that behavior with checks you compose: a one-line assertion, a model judge that cites your policy document, or a check across a six-hour agent run.
 
-You declare what your system must do as requirements. Your app sends Wyrd what it did, and Wyrd returns a verdict for each requirement, keeping it with the exact versions it judged. Verify model outputs, policy decisions, tool calls, and complete workflows:
+Your app sends Wyrd what it did. Wyrd returns a verdict for each requirement, with a reason, and keeps it beside the exact versions it judged. Start from a use case:
 
 <p align="center">
   <a href="https://docs.bohmian.ai/wyrd/get-started/what-can-i-build/#policy-verification"><img src="https://img.shields.io/badge/Policy%20verification-555555" alt="Use case: Policy verification"></a>

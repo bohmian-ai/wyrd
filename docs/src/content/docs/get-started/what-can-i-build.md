@@ -1,12 +1,12 @@
 ---
 title: What can I build?
-description: Match a verification problem to the Wyrd workflow for it - policy documents, agent evaluation, long-running workflows, runtime checks, observability, and drift.
+description: Match a verification problem to the Wyrd workflow you build for it - policy documents, agent evaluation, long-running workflows, runtime checks, observability, and drift.
 pillar: wyrd
 section: Get started
 order: 4
 ---
 
-Wyrd verifies production behavior across AI/ML systems and the application workflows around them: model outputs, policy decisions, tool calls, and complete multi-step runs. [Run your first verification](/get-started/quickstart/) is the simplest case, one assertion. Each section below names a larger problem, the workflow that solves it, and the page that shows how.
+Wyrd gives you the primitives, and you build the verification system your problem needs. [Run your first verification](/get-started/quickstart/) builds the smallest one: a single assertion. Each section below names a larger problem, the workflow that solves it, and the page that shows how.
 
 Every workflow uses the same parts. Cards declare exact versions of what you ship: Services, Agents, Prompts, Models, Data, and uploaded Artifacts. A Verifier composes deterministic checks (`assert`, `trace`, `code`) with model judgments (`agent`) and scheduled `drift`. Each verdict cites its evidence and is stored in Bifrost with the exact versions it judged. Your application runs the workflow and decides what a verdict means; Wyrd does not orchestrate or enforce it.
 

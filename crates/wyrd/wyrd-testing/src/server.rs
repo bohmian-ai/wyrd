@@ -3108,20 +3108,18 @@ impl WyrdTestServer {
         roles: &[&str],
         ceiling: &[&str],
     ) -> Result<(PrincipalId, SecretString), WyrdTestServerError> {
-        let tenant = self.data_tenant_id();
         let password = format!("fixture user {}", Uuid::now_v7());
         let verifier = wyrd_auth::passwords::hash_password(SecretString::from(password.clone()))
             .await
             .map_err(|error| WyrdTestServerError::Auth(error.to_string()))?;
-        let role_ids = roles
+        let roles = roles
             .iter()
-            .map(|role| wyrd_runtime::builtin_roles::builtin_role_uuid(tenant, role))
+            .map(|role| (*role).to_owned())
             .collect::<Vec<_>>();
         let mut conn = self.tenant_conn().await?;
-        let user_id =
-            wyrd_auth::passwords::create_local_user(&mut conn, name, &verifier, &role_ids)
-                .await
-                .map_err(|error| WyrdTestServerError::Auth(error.to_string()))?;
+        let user_id = wyrd_auth::passwords::create_local_user(&mut conn, name, &verifier, &roles)
+            .await
+            .map_err(|error| WyrdTestServerError::Auth(error.to_string()))?;
         conn.commit().await.map_err(sql)?;
         let slug = self.pg_fixture().tenant_slug();
         let (headers, _) = self

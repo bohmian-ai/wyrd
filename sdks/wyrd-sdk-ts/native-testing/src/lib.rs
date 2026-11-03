@@ -423,20 +423,6 @@ impl NativeWyrdTestServer {
         result
     }
 
-    /// The id of built-in Role `role` in tenant `tenant_id`, as a User
-    /// invitation names it; no read surface returns Role ids.
-    ///
-    /// # Errors
-    ///
-    /// Returns a napi error when `tenant_id` is not a tenant ID.
-    #[napi]
-    pub fn builtin_role_id(&self, tenant_id: String, role: String) -> Result<String> {
-        let tenant = tenant_id
-            .parse::<wyrd_spec::DataTenantId>()
-            .map_err(reason)?;
-        Ok(wyrd_runtime::builtin_roles::builtin_role_uuid(tenant, &role).to_string())
-    }
-
     /// Issue a key for the fixture tenant's unbound administrator: the key
     /// `wyrd setup` prints, bound to no Card.
     ///

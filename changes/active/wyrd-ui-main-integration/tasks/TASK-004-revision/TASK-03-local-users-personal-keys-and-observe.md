@@ -429,8 +429,9 @@ Explicit closure work:
   cycling/opacity that reverses or blends the named reference colors. Keep
   bundled fonts and canonical mark assets, current schema fields and real data.
 
-There is no approved light canvas board. Use the approved canonical light-token
-mapping and obtain separate human acceptance. Every light proof must first
+The approved light reference is the UI's `_gallery` route: the shared
+components rendered with the canonical light tokens. Build the boards from
+those components and obtain separate human acceptance. Every light proof must first
 assert the selected and computed theme is light; a dark image named light is
 failure. Generated captures/diffs stay outside the tracked repository. Never
 capture password/API-key/enrollment/reset secrets.

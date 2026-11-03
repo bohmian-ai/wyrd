@@ -127,13 +127,10 @@ users and no parallel Node credential/session service is introduced.
   expiry. Deliver code plus a fixed tenant signup/reset URL separately; codes,
   passwords and API keys never enter URLs, logs or screenshots. Operator-created
   invitations cannot grant roles beyond the existing administrator grant owner.
-- **Dev workflow.** Existing setup/bootstrap owners seed username `dev` with a
-  new20-character random password and an existing tenant-administrator grant in
-  the ephemeral dev tenant, through normal local-user creation/hashing owners.
-  Print usable UI URL, username/password and reset warning to the deliberate dev
-  console before batch dispatch; store test-readable development credentials
-  only in the existing private configuration directory with 0600 permissions.
-  Production setup never creates that default account/password automatically.
+- **Dev workflow.** The dev scripts run `wyrd-server setup --tenant dev` as
+  `wyrd init` does, then create the admin User `development` with password
+  `development` through `wyrd principal user create`, and wait until both exist
+  before dispatching the batch. Production setup creates no User.
   Disable inherited fixture auth in dev:full; local login must not require
   Keycloak. Keep optional SSO fixtures and the existing500-request/concurrency8,
   production wheel/source pin, failed-batch inspectability and app-first drain.
@@ -229,12 +226,12 @@ redacted secret handling, never debug/loggable raw values.
 
 | Route | Input / authority | Success |
 |---|---|---|
-| Operator CLI: wyrd-server setup --tenant <slug> --local-user <username> --local-password-stdin | optional controlled initial-human bootstrap; password through stdin only, existing platform/tenant setup authority | existing setup plus real local User/admin grant through the same auth creation owner; no printed password or implicit default production user |
+| POST /v1/principals/users (CLI `wyrd principal user create`, password on stdin) | username, password, Role names; User management plus tenant administration | 201 principal id and canonical username |
 | POST /auth/browser/password/signup | tenant, invitation_code, username, password; invitation authority, no role/User input | 201 BrowserSessionView plus the existing opaque session cookie; BFF redirects to the fixed tenant Observe entry |
 | POST /auth/browser/password/login | tenant, username, password | 200 BrowserSessionView plus fresh cookie |
 | POST /auth/browser/password/change | tenant, current_password, new_password; selected local User session | 204, revoke local revision sessions and clear selected cookie; ordinary login required |
 | POST /auth/browser/password/reset | tenant, reset_code, new_password; code authority | 204, invalidate reset/local sessions; no automatic login |
-| POST /v1/principals/users/invitations | selected existing Role IDs; users:write and existing grant authority | 201 invitation metadata, one-time code, fixed signup URL; default 24-hour expiry |
+| POST /v1/principals/users/invitations (CLI `wyrd principal user invite`) | existing Role names; users:write and existing grant authority | 201 invitation metadata, one-time code, fixed signup URL; default 24-hour expiry |
 | DELETE /v1/principals/users/invitations/{id} | tenant-bound user administration | 204 revocation |
 | POST /v1/principals/users/{id}/password-reset | local User target; users:write plus existing tenant-admin grant authority | 201 reset metadata, one-time code, fixed reset URL; 15-minute expiry |
 | GET /v1/principals/me | actual authenticated User, not a caller-selected subject | safe own profile and effective self capabilities; no password verifier/key secret |

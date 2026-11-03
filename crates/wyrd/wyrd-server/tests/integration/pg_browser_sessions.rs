@@ -925,19 +925,13 @@ fn assert_no_store(response: &BrowserResponse) {
 
 /// Issue an invitation for the built-in `role` with `bearer`; returns the
 /// response.
-async fn invite(
-    server: &WyrdTestServer,
-    tenant: wyrd_spec::DataTenantId,
-    bearer: &str,
-    role: &str,
-) -> BrowserResponse {
-    let role_id = wyrd_runtime::builtin_roles::builtin_role_uuid(tenant, role);
+async fn invite(server: &WyrdTestServer, bearer: &str, role: &str) -> BrowserResponse {
     as_bearer(
         server,
         Method::POST,
         "/v1/principals/users/invitations",
         bearer,
-        Some(json!({ "role_ids": [role_id] })),
+        Some(json!({ "roles": [role] })),
     )
     .await
 }
@@ -954,7 +948,7 @@ async fn enroll(
     username: &str,
     secret: &str,
 ) -> BrowserResponse {
-    let issued = invite(server, server.data_tenant_id(), bearer, role).await;
+    let issued = invite(server, bearer, role).await;
     assert_eq!(issued.status, StatusCode::CREATED, "{}", issued.body);
     password(
         server,
@@ -1003,7 +997,7 @@ async fn local_signup_login_and_password_lifecycle() {
         .expect("superuser pool opens");
 
     // The invitation code is returned once, no-store, beside a fixed URL.
-    let issued = invite(&server, server.data_tenant_id(), &admin, "viewer").await;
+    let issued = invite(&server, &admin, "viewer").await;
     assert_eq!(issued.status, StatusCode::CREATED, "{}", issued.body);
     assert_eq!(
         issued
@@ -1333,7 +1327,7 @@ async fn local_signup_is_tenant_bound_and_rate_limited() {
     };
 
     // An invitation names its own tenant only.
-    let issued = invite(&server, server.data_tenant_id(), &admin, "viewer").await;
+    let issued = invite(&server, &admin, "viewer").await;
     let code = issued.body["invitation_code"].clone();
     let elsewhere = password(
         &server,
@@ -1360,7 +1354,7 @@ async fn local_signup_is_tenant_bound_and_rate_limited() {
         malformed.body["code"],
         json!("WYRD_AUTH_401_ONE_TIME_CODE_INVALID")
     );
-    let revocable = invite(&server, server.data_tenant_id(), &admin, "viewer").await;
+    let revocable = invite(&server, &admin, "viewer").await;
     let revoke_uri = format!(
         "/v1/principals/users/invitations/{}",
         revocable.body["invitation"]["id"].as_str().expect("id")
@@ -1371,7 +1365,7 @@ async fn local_signup_is_tenant_bound_and_rate_limited() {
             .status,
         StatusCode::NO_CONTENT
     );
-    let expiring = invite(&server, server.data_tenant_id(), &admin, "viewer").await;
+    let expiring = invite(&server, &admin, "viewer").await;
     sqlx::query(
         "UPDATE wyrd.auth_user_invitations \
             SET created_at = created_at - interval '25 hours', \
@@ -1414,7 +1408,7 @@ async fn local_signup_is_tenant_bound_and_rate_limited() {
     };
 
     // A taken username refuses without consuming the invitation.
-    let fresh = invite(&server, server.data_tenant_id(), &admin, "viewer").await;
+    let fresh = invite(&server, &admin, "viewer").await;
     let taken = password(
         &server,
         "signup",
@@ -1439,14 +1433,13 @@ async fn local_signup_is_tenant_bound_and_rate_limited() {
     .await;
     assert_eq!(other_tenant.status, StatusCode::UNAUTHORIZED);
     let viewer = reused.cookie_value(&cookie_name(&acme));
-    let role_id = wyrd_runtime::builtin_roles::builtin_role_uuid(server.data_tenant_id(), "viewer");
     let forbidden = as_browser(
         &server,
         Method::POST,
         "/v1/principals/users/invitations",
         &acme,
         &viewer,
-        Some(json!({ "role_ids": [role_id] })),
+        Some(json!({ "roles": ["viewer"] })),
     )
     .await;
     assert_eq!(
@@ -1456,12 +1449,12 @@ async fn local_signup_is_tenant_bound_and_rate_limited() {
         forbidden.body
     );
     let beta_admin = admin_bearer(&server, beta_id).await;
-    let foreign_role = invite(&server, server.data_tenant_id(), &beta_admin, "viewer").await;
+    let unknown_role = invite(&server, &beta_admin, "no-such-role").await;
     assert_eq!(
-        foreign_role.status,
+        unknown_role.status,
         StatusCode::BAD_REQUEST,
         "{}",
-        foreign_role.body
+        unknown_role.body
     );
 
     // Oversized input refuses before derivation and is not counted.

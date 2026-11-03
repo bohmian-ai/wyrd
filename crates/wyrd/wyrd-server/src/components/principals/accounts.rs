@@ -25,15 +25,18 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 use wyrd_auth::browser_sessions::permission_names;
 use wyrd_auth::issue_api_key::WyrdApiKey;
-use wyrd_auth::passwords::{issue_invitation, issue_password_reset};
+use wyrd_auth::passwords::{
+    canonical_username, create_local_user, hash_password, issue_invitation, issue_password_reset,
+    new_password,
+};
 use wyrd_runtime::{Permission, PrincipalKind};
 use wyrd_spec::auth::{
     AbsoluteUrl, AccountAuthentication, CREDENTIAL_CURSOR_MAX_BYTES, CREDENTIAL_PAGE_DEFAULT,
     CREDENTIAL_PAGE_MAX, CreateUserCredentialRequest, CreateUserInvitationRequest,
-    CredentialListQuery, CredentialListResponse, CurrentUserProfile, IssuedCredential,
-    IssuedUserInvitation, IssuedUserPasswordReset, PrincipalId, PrincipalKindTag, SecretBearer,
-    USER_CREDENTIAL_MAX_LIFETIME_SECONDS, USER_CREDENTIAL_NAME_MAX_CHARS, UserInvitationView,
-    UserPasswordResetView,
+    CreateUserRequest, CreatedUser, CredentialListQuery, CredentialListResponse,
+    CurrentUserProfile, IssuedCredential, IssuedUserInvitation, IssuedUserPasswordReset,
+    PrincipalId, PrincipalKindTag, SecretBearer, USER_CREDENTIAL_MAX_LIFETIME_SECONDS,
+    USER_CREDENTIAL_NAME_MAX_CHARS, UserInvitationView, UserPasswordResetView,
 };
 use wyrd_spec::error::{WyrdError, WyrdProblem};
 use wyrd_spec::ids::TenantSlug;
@@ -366,12 +369,64 @@ pub(crate) async fn current_user_profile(
     })
 }
 
+/// Create a local password User directly, holding the named Roles.
+///
+/// The password meets the same policy as signup and is stored only as its
+/// verifier; derivation runs before the tenant transaction opens.
+///
+/// # Errors
+/// Returns a stable Wyrd error when the caller lacks User management and
+/// tenant administration, the username or password is outside policy, the
+/// username is taken, the Role names are empty, repeated or unknown, or a
+/// write fails.
+#[utoipa::path(
+    post,
+    path = "/principals/users",
+    request_body = CreateUserRequest,
+    responses(
+        (status = 201, description = "User created", body = CreatedUser),
+        (status = 400, description = "The username or password is outside policy, the \
+          username is taken, or the Role names are empty, repeated or unknown \
+          (WYRD_SPEC_400_VALIDATION)", body = WyrdProblem),
+        (status = 401, description = "The request carried no usable credential \
+          (WYRD_AUTH_401_UNAUTHENTICATED, WYRD_AUTH_401_INVALID_TOKEN, \
+          WYRD_AUTH_401_TOKEN_EXPIRED)", body = WyrdProblem),
+        (status = 403, description = "User management and tenant administration required \
+          (WYRD_PERMISSION_403_DENIED_RBAC)", body = WyrdProblem),
+        (status = 500, description = "A tenant store read or write failed \
+          (WYRD_SPEC_500_INTERNAL)", body = WyrdProblem)
+    ),
+    tag = "Principals"
+)]
+#[tracing::instrument(level = "info", skip(state, caller, request))]
+pub(crate) async fn create_user(
+    State(state): State<AppState>,
+    caller: Caller,
+    request: Result<Json<CreateUserRequest>, JsonRejection>,
+) -> Result<(StatusCode, Json<CreatedUser>), WyrdErrorResponse> {
+    let Json(request) = request.map_err(|rejection| body_rejection(&rejection))?;
+    authorize_user_admin(&state, &caller, "auth.user.create", "users")?;
+    let username = canonical_username(&request.username)?;
+    let password = new_password(&request.password.into_secret_string(), "password")?;
+    let verifier = hash_password(password).await?;
+    let mut conn = tenant_conn(&state, &caller).await?;
+    let user_id = create_local_user(&mut conn, &username, &verifier, &request.roles).await?;
+    conn.commit().await.map_err(internal)?;
+    Ok((
+        StatusCode::CREATED,
+        Json(CreatedUser {
+            principal_id: PrincipalId::new(user_id),
+            username,
+        }),
+    ))
+}
+
 /// Issue a one-use, twenty-four-hour local enrollment invitation.
 ///
 /// # Errors
 /// Returns a stable Wyrd error when the caller lacks User management and
-/// tenant administration, a Role id is empty, repeated or unknown, or a
-/// write fails.
+/// tenant administration, the Role names are empty, repeated or unknown, or
+/// a write fails.
 #[utoipa::path(
     post,
     path = "/principals/users/invitations",
@@ -379,7 +434,7 @@ pub(crate) async fn current_user_profile(
     responses(
         (status = 201, description = "Invitation issued; its code is returned once",
           body = IssuedUserInvitation),
-        (status = 400, description = "Role ids are empty, repeated or unknown \
+        (status = 400, description = "The Role names are empty, repeated or unknown \
           (WYRD_SPEC_400_VALIDATION)", body = WyrdProblem),
         (status = 401, description = "The request carried no usable credential \
           (WYRD_AUTH_401_UNAUTHENTICATED, WYRD_AUTH_401_INVALID_TOKEN, \
@@ -403,7 +458,7 @@ pub(crate) async fn create_user_invitation(
     let tenant = tenant_slug(&state, &caller).await?;
     let mut conn = tenant_conn(&state, &caller).await?;
     let (row, code) =
-        issue_invitation(&mut conn, caller.principal.id.as_uuid(), &request.role_ids).await?;
+        issue_invitation(&mut conn, caller.principal.id.as_uuid(), &request.roles).await?;
     conn.commit().await.map_err(internal)?;
     let issued = IssuedUserInvitation {
         signup_url: tenant_page(&origin, &tenant, "signup")?,

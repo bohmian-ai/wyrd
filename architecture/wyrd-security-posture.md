@@ -352,7 +352,7 @@ credential.
   session and clears its cookie. Recovery logout never revokes the API key or
   other browser sessions; logout does not end the IdP session.
 - Local password login (`POST /auth/browser/password/login`), invitation
-  signup, password change and code reset run in Rust. Passwords are 15–128
+  signup, password change and code reset run in Rust. Passwords are 8–128
   characters, NFC-normalized and blocklist-checked, stored only as an
   Argon2id verifier, and never logged, echoed or relayed through Node storage.
   Ten failures per tenant and username, or one hundred per source, refuse

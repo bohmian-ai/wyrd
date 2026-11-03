@@ -5,8 +5,9 @@ use std::sync::Arc;
 use reqwest::Method;
 use uuid::Uuid;
 use wyrd_spec::auth::{
-    CreateServicePrincipalRequest, CreateServicePrincipalResponse, CredentialListQuery,
-    CredentialListResponse, CurrentUserProfile, IssuedCredential, PrincipalId, PrincipalPage,
+    CreateServicePrincipalRequest, CreateServicePrincipalResponse, CreateUserInvitationRequest,
+    CreateUserRequest, CreatedUser, CredentialListQuery, CredentialListResponse,
+    CurrentUserProfile, IssuedCredential, IssuedUserInvitation, PrincipalId, PrincipalPage,
     PrincipalQuery, PrincipalRoles, PrincipalSummary, RevokePrincipalRequest, RoleAssignmentChange,
     WorkloadRestriction,
 };
@@ -93,6 +94,45 @@ impl Principals {
         self.client
             .http
             .request_json(Method::POST, "/v1/principals", Some(request))
+            .await
+    }
+
+    /// Create a local password User holding the named tenant Roles.
+    ///
+    /// # Arguments
+    /// * `request` - The username, password and Role names.
+    ///
+    /// # Errors
+    /// Returns a Wyrd error when the caller lacks User management and tenant
+    /// administration, the username or password is outside policy, the
+    /// username is taken, or a Role does not exist in the tenant.
+    pub async fn create_user(&self, request: &CreateUserRequest) -> Result<CreatedUser, WyrdError> {
+        self.client
+            .http
+            .request_json(Method::POST, "/v1/principals/users", Some(request))
+            .await
+    }
+
+    /// Invite a person to sign up as a local User holding the named Roles;
+    /// the one-time code is returned once.
+    ///
+    /// # Arguments
+    /// * `request` - The Role names the enrolled User receives.
+    ///
+    /// # Errors
+    /// Returns a Wyrd error when the caller lacks User management and tenant
+    /// administration or a Role does not exist in the tenant.
+    pub async fn invite_user(
+        &self,
+        request: &CreateUserInvitationRequest,
+    ) -> Result<IssuedUserInvitation, WyrdError> {
+        self.client
+            .http
+            .request_json(
+                Method::POST,
+                "/v1/principals/users/invitations",
+                Some(request),
+            )
             .await
     }
 

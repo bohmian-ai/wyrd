@@ -37,7 +37,8 @@ use wyrd_sql::queries::auth::{
     AttemptScope, BrowserSessionAuthority, InvitationRow, PasswordResetRow, attempt_refusal,
     consume_invitation, consume_password_reset, grant_role_to_user, insert_invitation,
     insert_local_user, insert_password_reset, local_credential_by_username,
-    local_credential_for_update, record_attempt_failure, role_by_id, set_password_hash,
+    local_credential_for_update, record_attempt_failure, role_by_id, role_by_name,
+    set_password_hash,
 };
 
 use crate::browser_sessions::{
@@ -52,7 +53,7 @@ use crate::issuance::TenantGrant;
 pub const PASSWORD_INPUT_MAX_BYTES: usize = 1024;
 
 /// Fewest characters in a new password, after NFC normalization.
-pub const PASSWORD_MIN_CHARS: usize = 15;
+pub const PASSWORD_MIN_CHARS: usize = 8;
 
 /// Most characters in a new password, after NFC normalization.
 pub const PASSWORD_MAX_CHARS: usize = 128;
@@ -140,7 +141,7 @@ pub fn new_password(raw: &SecretString, field: &str) -> Result<SecretString, Wyr
     let text = password.expose_secret();
     let chars = text.chars().count();
     if !(PASSWORD_MIN_CHARS..=PASSWORD_MAX_CHARS).contains(&chars) {
-        return Err(refuse("password must be 15-128 characters"));
+        return Err(refuse("password must be 8-128 characters"));
     }
     if text.chars().any(char::is_control) {
         return Err(refuse("password must not contain control characters"));
@@ -343,27 +344,58 @@ fn enrollment_error(error: sqlx::Error) -> WyrdError {
 }
 
 /// Create an active local User named by the canonical `username` with the
-/// verifier of `password`, holding the direct Roles `role_ids`, on `conn`;
+/// verifier of `password`, holding the direct Roles named `roles`, on `conn`;
 /// returns the new User id.
 ///
-/// The one creation owner behind signup and operator setup. The caller owns
-/// authority for the grants and commits `conn`.
+/// The administrator's direct creation path. The caller owns authority for
+/// the grants and commits `conn`.
 ///
 /// # Errors
-/// Returns [`WyrdError::Validation`] for a taken username or a missing Role,
-/// and [`WyrdError::AuthVerifyUnavailable`] when the store fails.
+/// Returns [`WyrdError::Validation`] for a taken username or an empty,
+/// repeated or missing Role, and [`WyrdError::AuthVerifyUnavailable`] when
+/// the store fails.
 pub async fn create_local_user(
     conn: &mut TenantConn<'_>,
     username: &str,
     verifier: &str,
-    role_ids: &[Uuid],
+    roles: &[String],
 ) -> Result<Uuid, WyrdError> {
+    let role_ids = role_ids(conn, roles).await?;
     let user_id = Uuid::now_v7();
     insert_local_user(conn, user_id, username, verifier)
         .await
         .map_err(enrollment_error)?;
-    grant_roles(conn, user_id, role_ids).await?;
+    grant_roles(conn, user_id, &role_ids).await?;
     Ok(user_id)
+}
+
+/// The ids of the existing tenant Roles named `roles`, in order.
+///
+/// # Errors
+/// Returns [`WyrdError::Validation`] for an empty or repeated list or a name
+/// that is no Role in this tenant, and [`WyrdError::AuthVerifyUnavailable`]
+/// when the store fails.
+async fn role_ids(conn: &mut TenantConn<'_>, roles: &[String]) -> Result<Vec<Uuid>, WyrdError> {
+    let mut distinct = roles.to_vec();
+    distinct.sort_unstable();
+    distinct.dedup();
+    if roles.is_empty() || distinct.len() != roles.len() {
+        return Err(WyrdError::Validation {
+            message: "roles must be a nonempty list of distinct Role names".to_owned(),
+            details: json!({ "field": "roles" }),
+        });
+    }
+    let mut ids = Vec::with_capacity(roles.len());
+    for role in roles {
+        let Some(row) = role_by_name(conn, role).await.map_err(store_error)? else {
+            return Err(WyrdError::Validation {
+                message: "a Role does not exist in this tenant".to_owned(),
+                details: json!({ "role": role }),
+            });
+        };
+        ids.push(row.id);
+    }
+    Ok(ids)
 }
 
 /// Grant `user_id` each existing Role in `role_ids` directly.
@@ -394,40 +426,22 @@ async fn grant_roles(
     Ok(())
 }
 
-/// Record a one-use enrollment invitation for the existing `role_ids`,
-/// issued by `issuer`, on `conn`; returns it with its code, shown once.
+/// Record a one-use enrollment invitation for the existing Roles named
+/// `roles`, issued by `issuer`, on `conn`; returns it with its code, shown
+/// once.
 ///
 /// The caller has authorized the issuer to grant those Roles and commits.
 ///
 /// # Errors
-/// Returns [`WyrdError::Validation`] for an empty, repeated or missing Role
-/// id, and [`WyrdError::AuthVerifyUnavailable`] when the store fails.
+/// Returns [`WyrdError::Validation`] for an empty, repeated or missing Role,
+/// and [`WyrdError::AuthVerifyUnavailable`] when the store fails.
 pub async fn issue_invitation(
     conn: &mut TenantConn<'_>,
     issuer: Uuid,
-    role_ids: &[Uuid],
+    roles: &[String],
 ) -> Result<(InvitationRow, SecretBearer), WyrdError> {
-    let mut distinct = role_ids.to_vec();
+    let mut distinct = role_ids(conn, roles).await?;
     distinct.sort_unstable();
-    distinct.dedup();
-    if role_ids.is_empty() || distinct.len() != role_ids.len() {
-        return Err(WyrdError::Validation {
-            message: "role_ids must be a nonempty list of distinct Role ids".to_owned(),
-            details: json!({ "field": "role_ids" }),
-        });
-    }
-    for role_id in &distinct {
-        if role_by_id(conn, *role_id)
-            .await
-            .map_err(store_error)?
-            .is_none()
-        {
-            return Err(WyrdError::Validation {
-                message: "a Role does not exist in this tenant".to_owned(),
-                details: json!({ "role_id": role_id }),
-            });
-        }
-    }
     let code = SecretBearer::new(random_secret());
     let row = insert_invitation(
         conn,
@@ -900,7 +914,7 @@ mod tests {
         assert!(composed.expose_secret().contains('\u{e9}'));
         assert!(ok("Correct Horse Battery").is_ok());
         for bad in [
-            "short pass",
+            "short",
             &"x".repeat(129),
             "fifteen chars\u{7}ok",
             "Password123456789",

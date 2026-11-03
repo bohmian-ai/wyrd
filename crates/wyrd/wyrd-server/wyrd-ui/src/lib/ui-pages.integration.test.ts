@@ -5,7 +5,7 @@
  * evidence exported over stock OTLP. Nothing here mocks the server or the BFF.
  */
 import { execFileSync, spawn } from 'node:child_process';
-import { closeSync, existsSync, mkdtempSync, openSync, readFileSync, statSync } from 'node:fs';
+import { closeSync, mkdtempSync, openSync, readFileSync, statSync } from 'node:fs';
 import { createServer } from 'node:net';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
@@ -59,14 +59,14 @@ async function signIn(browser: Browser, base: string, tenant: string, apiKey: st
 }
 
 /** An invitation code for the built-in `role` of `tenant`, issued through the server by its administrator `adminKey`. */
-async function invitation(server: { builtinRoleId(tenant: string, role: string): string }, serverUrl: string, tenant: string, adminKey: string, role: string): Promise<string> {
+async function invitation(serverUrl: string, adminKey: string, role: string): Promise<string> {
   const issued = await fetch(`${serverUrl}/v1/principals/users/invitations`, {
     method: 'POST',
     headers: {
       'x-wyrd-access-token': `Bearer ${await WyrdClient.connect({ serverUrl, credential: adminKey }).accessToken()}`,
       'content-type': 'application/json'
     },
-    body: JSON.stringify({ role_ids: [server.builtinRoleId(tenant, role)] })
+    body: JSON.stringify({ roles: [role] })
   });
   expect(issued.status).toBe(201);
   return ((await issued.json()) as { invitation_code: string }).invitation_code;
@@ -538,7 +538,7 @@ test('observe boards match approved canvas', async ({ server, ui }) => {
     }))
   });
   server.flushBifrost();
-  const page = await humanSignIn(ui.browser, ui.base, TENANT, await invitation(server, ui.serverUrl, ui.tenant, ui.adminKey, 'admin'));
+  const page = await humanSignIn(ui.browser, ui.base, TENANT, await invitation(ui.serverUrl, ui.adminKey, 'admin'));
   const observe = `${ui.base}/t/${TENANT}/observe?from=${RANGE.from}&to=${RANGE.to}`;
   const capture = async (board: string, mode: string, width: number) =>
     process.env.WYRD_UI_CAPTURE_DIR && page.screenshot({ path: join(process.env.WYRD_UI_CAPTURE_DIR, `${board}-${mode}-${width}.png`), fullPage: true });
@@ -705,7 +705,7 @@ test('local signup and personal settings', async ({ server, ui }) => {
   const tenantKey = 'ui-local';
   const tenant = server.seedTenant(tenantKey);
   const adminKey = server.bootstrapServiceInTenant(tenant, ['admin'], 'ui-local-admin');
-  const code = await invitation(server, ui.serverUrl, tenant, adminKey, 'editor');
+  const code = await invitation(ui.serverUrl, adminKey, 'editor');
   const login = `${ui.base}/t/${tenantKey}/login`;
   // Longer than 128 UTF-16 units, decomposed: the server counts NFC characters, so the form must not cut it.
   const password = `${'𝒜'.repeat(64)} cafe\u0301 ${crypto.randomUUID().slice(0, 8)}`;
@@ -903,7 +903,6 @@ base('development environment lifecycle', { timeout: 2_400_000 }, async () => {
     await broken.interrupt();
   }
   for (const port of [8080, 1080]) expect(await answers(port), `port ${port} after a failed UI start`).toBe(false);
-  expect(existsSync(join(config, 'dev-login.toml')), 'the dev login after a failed UI start').toBe(false);
 
   // A setup refused after the services are ready leaves them running for diagnosis and starts nothing that depends on it.
   const refused = devFull(config, { WYRD_API_KEY: 'wyrd_not_a_key' });
@@ -920,7 +919,6 @@ base('development environment lifecycle', { timeout: 2_400_000 }, async () => {
     await refused.interrupt();
   }
   for (const port of [8080, 3000, 8000]) expect(await answers(port), `port ${port} after Ctrl-C`).toBe(false);
-  expect(existsSync(join(config, 'dev-login.toml')), 'the dev login after Ctrl-C').toBe(false);
 
   const child = devFull(config);
   const output = child.output;
@@ -928,18 +926,15 @@ base('development environment lifecycle', { timeout: 2_400_000 }, async () => {
   const browser = await chromium.launch();
   try {
     // The UI's sign-in is reported ready before the example app is set up or its batch sent.
-    await vi.waitFor(() => expect(output()).toContain('UI ready     http://127.0.0.1:3000/t/dev/login'), { timeout: 1_500_000, interval: 1_000 });
+    await vi.waitFor(() => expect(output()).toContain('UI ready     http://127.0.0.1:3000/t/dev/login (sign in as development / development)'), { timeout: 1_500_000, interval: 1_000 });
     expect(output()).not.toMatch(/batch {8}/);
-    const record = join(config, 'dev-login.toml');
-    expect(statSync(record).mode & 0o777).toBe(0o600);
-    const password = /password = "([^"]+)"/.exec(readFileSync(record, 'utf8'))?.[1];
-    expect(password).toHaveLength(20);
+    expect(statSync(join(config, 'credentials.toml')).mode & 0o777).toBe(0o600);
 
-    // The seeded local User signs in normally and reaches personal Settings.
+    // The seeded development User signs in normally and reaches personal Settings.
     const page = await (await browser.newContext()).newPage();
     await page.goto('http://127.0.0.1:3000/t/dev/login');
-    await page.getByLabel('Username').fill('dev');
-    await page.getByLabel('Password').fill(password!);
+    await page.getByLabel('Username').fill('development');
+    await page.getByLabel('Password').fill('development');
     await page.getByRole('button', { name: 'Sign in', exact: true }).click();
     await page.waitForURL('http://127.0.0.1:3000/t/dev');
     await page.goto('http://127.0.0.1:3000/t/dev/settings/account');
@@ -948,7 +943,7 @@ base('development environment lifecycle', { timeout: 2_400_000 }, async () => {
     // One command runs the batch to terminal evidence and reports usable URLs.
     await vi.waitFor(() => expect(output()).toMatch(/batch {8}(passed|FAILED)/), { timeout: 1_500_000, interval: 1_000 });
     expect(output(), log).toContain('batch        passed');
-    expect(output()).toContain('UI           http://127.0.0.1:3000/t/dev/login (sign in as dev');
+    expect(output()).toContain('UI           http://127.0.0.1:3000/t/dev/login (sign in as development / development)');
     expect(output()).not.toContain('/login/api-key');
     for (const port of [8080, 3000, 8000, 1080]) expect(await answers(port), `port ${port}`).toBe(true);
 
@@ -985,5 +980,4 @@ base('development environment lifecycle', { timeout: 2_400_000 }, async () => {
     await child.interrupt();
   }
   for (const port of [8080, 3000, 8000]) expect(await answers(port), `port ${port} after Ctrl-C`).toBe(false);
-  expect(existsSync(join(config, 'dev-login.toml')), 'the dev login after Ctrl-C').toBe(false);
 });

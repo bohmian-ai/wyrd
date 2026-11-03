@@ -4,12 +4,12 @@
 # The wrapper creates a platform login that owns the database and a separate
 # tenant login, as a DBA would; `wyrd-server migrate` then runs as the platform
 # login exactly as a deployment does, and the server serves with both URLs.
-# Once it is ready, `wyrd-server setup` creates the `dev` tenant, its admin
-# key and the local admin User `dev` with a new random password. The key
-# replaces the Wyrd config directory's `credentials.toml`, where every SDK and
-# CLI process finds it; the client's default URLs reach this server. The
-# password is printed once and kept in the private `dev-login.toml` beside it,
-# which is removed on exit with the database it belongs to.
+# Once it is ready, `wyrd-server setup` creates the `dev` tenant and its admin
+# key, as `wyrd init` does, and that key creates the admin User `development`
+# with password `development` through `wyrd principal user create`. The key
+# then replaces the Wyrd config directory's `credentials.toml`, where every SDK
+# and CLI process finds it; the client's default URLs reach this server. It is
+# written last, so a fresh file means the tenant and User both exist.
 # The database is discarded on exit, and the server's `.wyrd` data is removed
 # before each start so a fresh database never replays an old Bifrost log.
 set -Eeuo pipefail
@@ -19,25 +19,22 @@ exec "$root/scripts/postgres/with-test-postgres.sh" -- bash -c '
   set -Eeuo pipefail
   rm -rf .wyrd
   config=${WYRD_CONFIG_HOME:-${XDG_CONFIG_HOME:-$HOME/.config}/wyrd}
-  login="$config/dev-login.toml"
   ./target/debug/wyrd-server migrate
   ./target/debug/wyrd-server "$@" &
   server=$!
-  trap "rm -f \"$login\"; kill -INT $server 2>/dev/null; wait $server" EXIT INT TERM
+  trap "kill -INT $server 2>/dev/null; wait $server" EXIT INT TERM
   until curl -sf http://127.0.0.1:8080/readyz >/dev/null; do
     kill -0 "$server" 2>/dev/null || exit 1
     sleep 1
   done
-  password=$(openssl rand -hex 10)
-  key=$(printf "%s" "$password" | ./target/debug/wyrd-server setup --tenant dev --local-user dev --local-password-stdin | sed -n "s/^admin_credential: //p")
+  key=$(./target/debug/wyrd-server setup --tenant dev | sed -n "s/^admin_credential: //p")
+  printf development | WYRD_API_KEY="$key" ./target/debug/wyrd principal user create --username development --role admin >/dev/null
   # SDKs and the CLI refuse a saved credential others can read.
   mkdir -p "$config"
   chmod 700 "$config"
   printf "[default]\napi_key = \"%s\"\n" "$key" > "$config/credentials.toml"
-  printf "tenant = \"dev\"\nusername = \"dev\"\npassword = \"%s\"\n" "$password" > "$login"
-  chmod 600 "$config/credentials.toml" "$login"
+  chmod 600 "$config/credentials.toml"
   printf "\nwyrd-server ready on http://127.0.0.1:8080; tenant dev key saved to %s\n" "$config/credentials.toml"
-  printf "Sign in to tenant dev as dev with password %s (kept in %s).\n" "$password" "$login"
-  printf "The database is discarded on exit; every start creates a new password.\n\n"
+  printf "Sign in to tenant dev as development / development.\n\n"
   wait "$server"
 ' _ "$@"

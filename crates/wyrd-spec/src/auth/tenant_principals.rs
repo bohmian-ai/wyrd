@@ -277,9 +277,35 @@ pub struct CredentialRevoked {
 #[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
 #[serde(deny_unknown_fields)]
 pub struct CreateUserInvitationRequest {
-    /// Distinct existing tenant Role ids the enrolled User receives; nonempty,
-    /// and each one the issuer may grant.
-    pub role_ids: Vec<Uuid>,
+    /// Distinct existing tenant Role names the enrolled User receives, such
+    /// as `editor`; nonempty.
+    pub roles: Vec<String>,
+}
+
+/// Body of `POST /v1/principals/users`: an administrator creates a local
+/// password User directly, without an invitation.
+#[derive(Debug, Serialize, Deserialize, schemars::JsonSchema)]
+#[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
+#[serde(deny_unknown_fields)]
+pub struct CreateUserRequest {
+    /// The tenant-local username, canonicalized by the server.
+    pub username: String,
+    /// The User's password, checked against the local password policy.
+    #[schemars(with = "String")]
+    pub password: SecretBearer,
+    /// Distinct existing tenant Role names the User receives, such as `admin`.
+    pub roles: Vec<String>,
+}
+
+/// The local User created by `POST /v1/principals/users`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
+#[serde(deny_unknown_fields)]
+pub struct CreatedUser {
+    /// The new User's principal id.
+    pub principal_id: PrincipalId,
+    /// The canonical username the User signs in with.
+    pub username: String,
 }
 
 /// Safe metadata of one enrollment invitation; never its code.

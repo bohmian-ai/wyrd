@@ -925,18 +925,19 @@ Deployed Services and Agents keep their own API keys or workload assertions;
 human SSO never replaces or disables them.
 
 Local password sign-in is the provider-free human path. An administrator
-holding User management and tenant administration provisions an invitation
-(`POST /v1/principals/users/invitations`, 24-hour single-use code returned
-once) and, for recovery, a reset code (`POST
+holding User management and tenant administration creates a User directly
+(`POST /v1/principals/users`: username, password and Role names; `wyrd
+principal user create`), provisions an invitation by Role names (`POST
+/v1/principals/users/invitations`, 24-hour single-use code returned once;
+`wyrd principal user invite`) and, for recovery, a reset code (`POST
 /v1/principals/users/{principal_id}/password-reset`, 15 minutes); codes are
 delivered out of band and never appear in URLs. `POST
 /auth/browser/password/signup` redeems an invitation into a tenant User with
 a canonical tenant-local username; `/login`, `/change` and `/reset` verify,
 replace or reset the password. Rust stores only an Argon2id verifier,
 bounds failures per account and per source, and ends every local session of
-the User on change or reset; reset never signs in. The operator bootstrap is
-`wyrd-server setup --local-user <name> --local-password-stdin`, granting the
-tenant `admin` Role. SSO-only Users have no password and are never linked to a
+the User on change or reset; reset never signs in. `wyrd-server setup`
+creates no User. SSO-only Users have no password and are never linked to a
 local account by email or username. There is no OAuth password grant and no
 email delivery.
 

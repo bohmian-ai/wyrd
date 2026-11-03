@@ -15,7 +15,7 @@
     <p>3–64 characters: letters, digits, dot, underscore or hyphen, starting with a letter or digit. Stored in lowercase.</p>
     <label for="password">Password</label>
     <PasswordInput id="password" name="password" required autocomplete="new-password" />
-    <p>15–128 characters. A passphrase works well; common passwords are refused.</p>
+    <p>8–128 characters. A passphrase works well; common passwords are refused.</p>
     <button class="app-control primary wide" type="submit">Create account</button>
   </form>
   <nav class="links"><a href="/t/{encodeURIComponent(data.tenant.key)}/login">Back to sign-in</a></nav>

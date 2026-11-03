@@ -169,15 +169,6 @@ export declare class NativeWyrdTestServer {
    */
   bootstrapServiceInTenant(tenantId: string, roles: Array<string>, name: string): string
   /**
-   * The id of built-in Role `role` in tenant `tenant_id`, as a User
-   * invitation names it; no read surface returns Role ids.
-   *
-   * # Errors
-   *
-   * Returns a napi error when `tenant_id` is not a tenant ID.
-   */
-  builtinRoleId(tenantId: string, role: string): string
-  /**
    * Issue a key for the fixture tenant's unbound administrator: the key
    * `wyrd setup` prints, bound to no Card.
    *

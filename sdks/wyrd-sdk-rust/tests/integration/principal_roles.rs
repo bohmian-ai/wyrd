@@ -10,9 +10,10 @@ use secrecy::ExposeSecret as _;
 use serde::Deserialize;
 use serde_json::json;
 use wyrd_ai::auth::{
-    AccountAuthentication, CreateServicePrincipalRequest, CredentialListQuery, PrincipalId,
-    PrincipalKindTag, PrincipalQuery, Principals, RevokePrincipalRequest, RoleAssignment,
-    RoleSource, WorkloadFamily, WorkloadKind, WorkloadRestriction,
+    AccountAuthentication, CreateServicePrincipalRequest, CreateUserInvitationRequest,
+    CreateUserRequest, CredentialListQuery, PrincipalId, PrincipalKindTag, PrincipalQuery,
+    Principals, RevokePrincipalRequest, RoleAssignment, RoleSource, SecretBearer, WorkloadFamily,
+    WorkloadKind, WorkloadRestriction,
 };
 use wyrd_ai::bifrost::{BifrostOptions, QueryParam};
 use wyrd_ai::cards::Cards;
@@ -171,6 +172,81 @@ async fn only_a_tenant_admin_assigns_roles() {
 
     assert_eq!(granted.code(), "WYRD_PERMISSION_403_DENIED_RBAC");
     assert_eq!(revoked.code(), "WYRD_PERMISSION_403_DENIED_RBAC");
+    deployment.shutdown().await;
+}
+
+/// A tenant administrator creates a local User holding the named Role and
+/// invites another by Role name; policy, duplicate and unknown-Role inputs are
+/// refused, and a workload that is no administrator can do neither.
+///
+/// # Panics
+/// Panics when a step fails or an outcome differs.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires the repository-managed Postgres journey lifecycle"]
+async fn administrators_create_and_invite_users() {
+    let (deployment, _, key) = service_principal().await;
+    let admin = Principals::connect_with(&deployment.admin())
+        .await
+        .expect("handle connects");
+    let request = |username: &str, password: &str, role: &str| CreateUserRequest {
+        username: username.to_owned(),
+        password: SecretBearer::new(password.to_owned()),
+        roles: vec![role.to_owned()],
+    };
+
+    let created = admin
+        .create_user(&request("Development", "development", "admin"))
+        .await
+        .expect("an administrator creates a User");
+    assert_eq!(created.username, "development");
+    let roles = admin
+        .roles(&created.principal_id)
+        .await
+        .expect("roles read");
+    assert_eq!(roles.roles, vec![assignment("admin", RoleSource::Direct)]);
+    for (refused, why) in [
+        (
+            request("development", "development", "admin"),
+            "a taken username",
+        ),
+        (
+            request("short", "seven77", "admin"),
+            "a password under eight characters",
+        ),
+        (
+            request("unknown", "development", "no-such-role"),
+            "an unknown Role",
+        ),
+    ] {
+        let error = admin.create_user(&refused).await.expect_err(why);
+        assert_eq!(error.code(), "WYRD_SPEC_400_VALIDATION", "{why}");
+    }
+
+    let invited = admin
+        .invite_user(&CreateUserInvitationRequest {
+            roles: vec!["editor".to_owned()],
+        })
+        .await
+        .expect("an administrator invites");
+    assert_eq!(invited.invitation_code.expose().len(), 43);
+    assert_eq!(invited.invitation.role_ids.len(), 1);
+    assert!(invited.signup_url.as_str().ends_with("/signup"));
+
+    let workload = Principals::connect_with(&deployment.client(&key))
+        .await
+        .expect("handle connects");
+    let create = workload
+        .create_user(&request("intruder", "development", "admin"))
+        .await
+        .expect_err("a workload cannot create Users");
+    let invite = workload
+        .invite_user(&CreateUserInvitationRequest {
+            roles: vec!["admin".to_owned()],
+        })
+        .await
+        .expect_err("a workload cannot invite");
+    assert_eq!(create.code(), "WYRD_PERMISSION_403_DENIED_RBAC");
+    assert_eq!(invite.code(), "WYRD_PERMISSION_403_DENIED_RBAC");
     deployment.shutdown().await;
 }
 

@@ -58,12 +58,12 @@ pub use tenant_admin::{
 pub use tenant_principals::{
     AccountAuthentication, CREDENTIAL_CURSOR_MAX_BYTES, CREDENTIAL_PAGE_DEFAULT,
     CREDENTIAL_PAGE_MAX, CreateServicePrincipalRequest, CreateServicePrincipalResponse,
-    CreateUserCredentialRequest, CreateUserInvitationRequest, CredentialListQuery,
-    CredentialListResponse, CredentialMetadata, CredentialRevoked, CurrentUserArgs,
-    CurrentUserProfile, IssuedCredential, IssuedUserInvitation, IssuedUserPasswordReset,
-    ListCredentialsArgs, PrincipalPage, PrincipalQuery, PrincipalRoles, PrincipalStatus,
-    PrincipalSummary, RevokeCredentialArgs, RoleAssignment, RoleAssignmentChange, RoleSource,
-    SetWorkloadRestrictionArgs, USER_CREDENTIAL_MAX_LIFETIME_SECONDS,
+    CreateUserCredentialRequest, CreateUserInvitationRequest, CreateUserRequest, CreatedUser,
+    CredentialListQuery, CredentialListResponse, CredentialMetadata, CredentialRevoked,
+    CurrentUserArgs, CurrentUserProfile, IssuedCredential, IssuedUserInvitation,
+    IssuedUserPasswordReset, ListCredentialsArgs, PrincipalPage, PrincipalQuery, PrincipalRoles,
+    PrincipalStatus, PrincipalSummary, RevokeCredentialArgs, RoleAssignment, RoleAssignmentChange,
+    RoleSource, SetWorkloadRestrictionArgs, USER_CREDENTIAL_MAX_LIFETIME_SECONDS,
     USER_CREDENTIAL_NAME_MAX_CHARS, UserInvitationView, UserPasswordResetView,
 };
 pub use token::{

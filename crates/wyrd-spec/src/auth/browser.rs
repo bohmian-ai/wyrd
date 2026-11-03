@@ -168,6 +168,10 @@ pub struct BrowserSessionView {
     pub principal_id: PrincipalId,
     /// That principal's kind.
     pub principal_kind: PrincipalKindTag,
+    /// The principal's canonical local username; `null` for an SSO-only User
+    /// or a Service.
+    #[serde(default)]
+    pub username: Option<String>,
     /// How the session was created.
     pub credential: BrowserCredential,
     /// The principal's current operations as `resource:action` names,

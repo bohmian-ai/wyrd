@@ -13,6 +13,7 @@ type View = {
   tenant_id: string;
   tenant_name: string;
   principal_id: string;
+  username: string | null;
   permissions: string[];
   expires_at: string;
 };
@@ -113,6 +114,7 @@ export class BrowserSession {
     this.#url = url;
     this.tenantName = view.tenant_name;
     this.principalId = view.principal_id;
+    this.name = view.username ?? view.principal_id;
     this.tenantId = view.tenant_id;
     this.permissions = view.permissions;
     this.expiresAt = Date.parse(view.expires_at);
@@ -120,6 +122,8 @@ export class BrowserSession {
 
   readonly tenantName: string;
   readonly principalId: string;
+  /** The local username, else the principal id. */
+  readonly name: string;
   readonly tenantId: string;
   readonly permissions: string[];
   readonly expiresAt: number;
@@ -133,7 +137,7 @@ export class BrowserSession {
         tenantId: this.tenantId,
         permissions: this.permissions
       },
-      subject: { id: this.principalId, name: this.principalId },
+      subject: { id: this.principalId, name: this.name },
       permissions: this.permissions
     };
   }
@@ -331,7 +335,7 @@ export class BrowserSessions {
     const current = sessions.find((view) => view.tenant === session.tenantKey);
     if (!current) reject('unauthenticated');
     return {
-      subject: { id: current.principal_id, name: current.principal_id },
+      subject: { id: current.principal_id, name: current.username ?? current.principal_id },
       expiresAt: Date.parse(current.expires_at),
       tenants: [current, ...sessions.filter((view) => view !== current)].map((view) => ({
         key: view.tenant,

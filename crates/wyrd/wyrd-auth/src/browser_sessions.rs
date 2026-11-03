@@ -33,7 +33,7 @@ use wyrd_spec::vala::api::AuditOutcome;
 use wyrd_sql::TenantConn;
 use wyrd_sql::queries::auth::{
     BrowserSessionAuthority, LiveBrowserSession, human_connection_is_active,
-    insert_browser_session, live_browser_session, revoke_browser_session,
+    insert_browser_session, live_browser_session, local_username, revoke_browser_session,
 };
 
 use crate::audit::{LOGIN_OPERATION, principal_event};
@@ -348,7 +348,8 @@ impl BrowserSessions {
     }
 
     /// The safe metadata of a resolved session, with the tenant's route key
-    /// and display name from the tenant directory.
+    /// and display name from the tenant directory and the principal's local
+    /// username, when it has one.
     ///
     /// # Errors
     /// Returns [`WyrdError::InvalidToken`] when the tenant is no longer in the
@@ -362,11 +363,22 @@ impl BrowserSessions {
             .await
             .map_err(store_error)?
             .ok_or_else(session_invalid)?;
+        let mut conn = self
+            .connections
+            .postgres()
+            .tenant_conn(principal.tenant_id)
+            .await
+            .map_err(store_error)?;
+        let username = local_username(&mut conn, principal.id.as_uuid())
+            .await
+            .map_err(store_error)?;
+        conn.commit().await.map_err(store_error)?;
         Ok(BrowserSessionView {
             tenant,
             tenant_id: principal.tenant_id,
             tenant_name,
             principal_id: principal.id,
+            username,
             principal_kind: principal.kind.tag(),
             credential: session.credential,
             permissions: permission_names(&principal.effective_permissions),

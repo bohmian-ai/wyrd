@@ -740,7 +740,8 @@ test('local signup and personal settings', async ({ server, ui }) => {
     await page.waitForURL(`${ui.base}/t/${tenantKey}`);
     expect(page.url()).not.toContain(code);
 
-    // The identity menu leads to personal Settings, which an editor without SSO administration may open.
+    // The sidebar names the person by username, and the identity menu leads to personal Settings, which an editor without SSO administration may open.
+    expect(await page.locator('details.identity .who > span').first().textContent()).toBe('ui-person');
     await page.locator('details.identity summary').click();
     await page.getByRole('link', { name: 'Account' }).click();
     const account = `${ui.base}/t/${tenantKey}/settings/account`;

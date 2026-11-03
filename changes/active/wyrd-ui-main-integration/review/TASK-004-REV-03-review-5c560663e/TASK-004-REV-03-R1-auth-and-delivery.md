@@ -220,8 +220,8 @@ Remaining differences from the PNGs: fixture data (one trace, no tokens or
 messages, date-qualified start times, parent shown as span id), deliberately
 kept items (NAME label, Group by in the Traces/Spans bar, Open in Query below
 lists, `unset` severity key, metric `each series` grouping with raw attribute
-labels), and the account footer showing the principal id because
-`BrowserSessionView` carries no display name.
+labels). The account footer names the person by username:
+`BrowserSessionView.username` (V4 asserts it; `null` for a Service, V3).
 
 | Board | Human decision |
 |---|---|

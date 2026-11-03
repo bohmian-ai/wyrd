@@ -321,6 +321,11 @@ async fn browser_session_authority_is_tenant_bound_and_revocable() {
         live.body["sessions"][0]["tenant_id"],
         created.body["tenant_id"]
     );
+    assert_eq!(
+        live.body["sessions"][0]["username"],
+        json!(null),
+        "a Service has no username"
+    );
     let filtered = read(&server, &format!("?tenant={acme}"), acme_cookie(&session)).await;
     assert_eq!(filtered.status, StatusCode::OK);
     let other = read(&server, "?tenant=beta", acme_cookie(&session)).await;
@@ -1034,6 +1039,7 @@ async fn local_signup_login_and_password_lifecycle() {
     assert_eq!(created.status, StatusCode::CREATED, "{}", created.body);
     assert_eq!(created.body["credential"], json!("password"));
     assert_eq!(created.body["principal_kind"], json!("user"));
+    assert_eq!(created.body["username"], json!("ada.lovelace"));
     assert!(!created.body.to_string().contains(&strong(1)));
     let user = Uuid::parse_str(created.body["principal_id"].as_str().expect("id")).expect("uuid");
     let first = created.cookie_value(&cookie_name(&acme));

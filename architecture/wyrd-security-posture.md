@@ -206,6 +206,18 @@ credential.
   verifies token exchange, and then revokes the old key.
 - The deployment secret provider, never a Card, supplies `WYRD_API_KEY` to an
   SDK or workload.
+- A credential has exactly one tenant owner, a Service account or a User.
+  Personal User keys carry a normalized name, a nonempty permission ceiling
+  and an explicit expiry of at most 365 days; each exchange issues the
+  intersection of the ceiling with the User's current grants, so a later
+  grant never widens an old key. `personal_credentials:read` lists and
+  `personal_credentials:write` revokes only the caller's own keys, both
+  derived from the verified caller rather than a submitted principal;
+  Service principals hold neither. Creation additionally requires a browser
+  or SSO session created by a human login within five minutes; API-key
+  recovery is not such proof. A restricted key needs the matching ceiling to
+  list or revoke. Credential lists page at 50 by default, at most 100, with an
+  opaque cursor. Other-User issuance still needs tenant administration.
 
 ### Access and refresh tokens
 
@@ -337,6 +349,16 @@ credential.
   unavailability. `POST /auth/browser/logout` revokes only the selected tenant
   session and clears its cookie. Recovery logout never revokes the API key or
   other browser sessions; logout does not end the IdP session.
+- Local password login (`POST /auth/browser/password/login`), invitation
+  signup, password change and code reset run in Rust. Passwords are 15–128
+  characters, NFC-normalized and blocklist-checked, stored only as an
+  Argon2id verifier, and never logged, echoed or relayed through Node storage.
+  Ten failures per tenant and username, or one hundred per source, refuse
+  further attempts with `429` and `Retry-After` until the window passes;
+  unknown users and wrong passwords are indistinguishable. Invitation and
+  reset codes are 256-bit, single-use, stored by SHA-256 verifier and bound to
+  tenant and purpose. Change and reset advance the User's password revision,
+  which ends every local session; API keys stay valid until revoked.
 - Every browser-session request checks current tenant/principal authority.
   Human sessions require the exact Active connection revision. API-key-backed
   sessions require a still-valid originating credential and preserve all its

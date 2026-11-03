@@ -895,7 +895,7 @@ tokens are never Wyrd authority.
 
 | Client | OAuth client | Grant | Session holder |
 |---|---|---|---|
-| Web app | First-party browser session, not a separate OAuth client | Rust-owned OIDC login or API-key recovery under `/auth/browser` | Opaque HttpOnly session cookie; only its digest and bound authority persist in Postgres; fixed 12-hour absolute lifetime |
+| Web app | First-party browser session, not a separate OAuth client | Rust-owned OIDC login, local password login or API-key recovery under `/auth/browser` | Opaque HttpOnly session cookie; only its digest and bound authority persist in Postgres; fixed 12-hour absolute lifetime |
 | CLI and SDKs | `wyrd-cli`, public | Device authorization (RFC 8628) | `credentials.toml`, owned by `wyrd-client`; refresh token rotates on every use |
 
 Rust owns browser login transactions, callbacks, session creation, validation,
@@ -923,6 +923,32 @@ device and provider-test completions retain their own behavior. There is no
 separate Node `/login/callback` OAuth-code exchange or UI refresh-token flow.
 Deployed Services and Agents keep their own API keys or workload assertions;
 human SSO never replaces or disables them.
+
+Local password sign-in is the provider-free human path. An administrator
+holding User management and tenant administration provisions an invitation
+(`POST /v1/principals/users/invitations`, 24-hour single-use code returned
+once) and, for recovery, a reset code (`POST
+/v1/principals/users/{principal_id}/password-reset`, 15 minutes); codes are
+delivered out of band and never appear in URLs. `POST
+/auth/browser/password/signup` redeems an invitation into a tenant User with
+a canonical tenant-local username; `/login`, `/change` and `/reset` verify,
+replace or reset the password. Rust stores only an Argon2id verifier,
+bounds failures per account and per source, and ends every local session of
+the User on change or reset; reset never signs in. The operator bootstrap is
+`wyrd-server setup --local-user <name> --local-password-stdin`, granting the
+tenant `admin` Role. SSO-only Users have no password and are never linked to a
+local account by email or username. There is no OAuth password grant and no
+email delivery.
+
+`GET /v1/principals/me` returns the calling User's safe profile: principal,
+tenant, username, authentication method and effective permissions. Users
+list, create and revoke their own keys through the existing
+`/v1/principals/{principal_id}/credentials` routes under
+`personal_credentials:read|write`; creation requires a human login in the last
+five minutes, a name, a nonempty permission ceiling and an explicit expiry of
+at most 365 days. The UI page `/t/{tenant}/settings/account` and the SDK
+`Principals.me` / `list_credentials_page` projections use these routes; MCP
+exposes own-key metadata and revoke but never issues a secret.
 
 Browser session cookies contain only random identifiers. Records store their
 digests, tenant/principal, absolute expiry/revocation and either the exact

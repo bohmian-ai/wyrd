@@ -23,6 +23,7 @@ use wyrd_spec::error::WyrdProblem;
 use wyrd_spec::vala::api::{BifrostQueryRequest, QueryClass};
 use wyrd_spec::vala::error::BifrostError;
 use wyrd_testing::WyrdTestServer;
+use wyrd_testing::bifrost::canonical_signals::{Cell, Row, attributes, batch, spans};
 use wyrd_testing::bifrost::telemetry::BifrostMetricKind;
 use wyrd_testing::bifrost::{BifrostClusterSpec, ScribeCacheMode, WyrdTestCluster};
 
@@ -1768,12 +1769,16 @@ async fn observe_predicates_preserve_rows_across_live_and_persisted_sources() {
 /// Returns a cluster, provisioning, describe, ingest, flush, or query error,
 /// or an error naming the case whose rows, reads, or warnings differ.
 async fn prove_observe_predicates() -> Result<(), JourneyError> {
-    use wyrd_testing::bifrost::canonical_signals::{Cell, Row, attributes, batch, spans};
-
+    /// Canonical span table every case writes and queries.
     const SPANS: &str = "bifrost.traces.spans";
-    // Ingest stamps each span's service from the principal that wrote it.
+    /// Owner tenant's writer principal; ingest stamps it as each owner span's
+    /// service, so the service predicate filters by it.
     const OWNER: &str = "observe-owner";
+    /// Neighbour tenant's writer principal and service; its reader sees only
+    /// its own chat span.
     const NEIGHBOUR: &str = "observe-neighbour";
+    /// One hour: the spacing between the persisted, neighbouring, and live
+    /// spans, and the margin that pads or misses the queried windows.
     const HOUR_NANOS: i64 = 3_600_000_000_000;
     let persisted = 1_760_000_400_000_000_000_i64;
     let neighbouring = persisted + HOUR_NANOS;

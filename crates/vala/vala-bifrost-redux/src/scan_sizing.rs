@@ -586,9 +586,10 @@ impl BatchPruning {
     /// Returns, per batch of `batches` many, whether its `statistics` leave it
     /// possibly matching.
     ///
-    /// No batch keeps nothing without evaluating the predicate. Bounds not
-    /// index-aligned with the batches, as in a hand-built test generation, or
-    /// bounds that cannot be evaluated keep every batch.
+    /// Zero batches with zero aligned bounds reach the predicate like any
+    /// other input and keep nothing. Bounds not index-aligned with the
+    /// batches, as in a hand-built test generation, or bounds that cannot be
+    /// evaluated keep every batch.
     #[must_use]
     pub(crate) fn keep(
         &self,
@@ -664,6 +665,9 @@ fn null_free(side: &Arc<dyn datafusion::physical_expr::PhysicalExpr>) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use arrow::array::{Array as _, RecordBatch, TimestampNanosecondArray};
+    use arrow::datatypes::{Field, Schema};
+    use datafusion::common::pruning::{PrunableStatistics, PruningStatistics as _};
 
     /// Partitions follow the CPU/locality tuples and ignore memory.
     #[test]
@@ -852,10 +856,6 @@ mod tests {
     /// nanosecond array, or the keep mask differs.
     #[test]
     fn nanosecond_pruning_preserves_unknown_container_bounds() {
-        use arrow::array::{Array as _, RecordBatch, TimestampNanosecondArray};
-        use arrow::datatypes::{Field, Schema};
-        use datafusion::common::pruning::{PrunableStatistics, PruningStatistics as _};
-
         let instant = arrow::datatypes::DataType::Timestamp(
             arrow::datatypes::TimeUnit::Nanosecond,
             Some(iceberg::arrow::UTC_TIME_ZONE.into()),

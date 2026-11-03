@@ -1139,11 +1139,14 @@ impl LiveFrameDecoder {
 #[cfg(test)]
 mod tests {
     use arrow::array::Int64Array;
-    use arrow::datatypes::{DataType, Field, Schema};
+    use arrow::datatypes::{DataType, Field, Schema, TimeUnit};
+    use datafusion::physical_optimizer::PhysicalOptimizerRule as _;
+    use datafusion::physical_optimizer::filter_pushdown::FilterPushdown;
     use wyrd_spec::vala::api::WorkerScanStats;
 
     use super::*;
     use crate::oracle::dispatcher::{NativeCompletion, NativeOutputTally};
+    use crate::oracle::exec::tests::FIXTURE_TIME_COLUMN;
 
     /// A query filter pushed to the live leaf ships on every fragment above
     /// the placeholder, while the leader keeps its own `FilterExec`.
@@ -1608,11 +1611,6 @@ mod tests {
     /// selection keeps the wrong routes, or any warning is captured.
     #[test]
     fn empty_live_route_selections_do_not_warn() {
-        use super::super::exec::tests::FIXTURE_TIME_COLUMN;
-        use arrow::datatypes::TimeUnit;
-        use datafusion::physical_optimizer::PhysicalOptimizerRule as _;
-        use datafusion::physical_optimizer::filter_pushdown::FilterPushdown;
-
         let (_telemetry, traces) =
             wyrd_telemetry::init_test_capture(wyrd_telemetry::TelemetryConfig::default())
                 .expect("trace capture installs once per test process");

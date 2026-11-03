@@ -1,9 +1,18 @@
 # UI migration task order
 
-Last approved scope revision: 18 (caller direction, 2026-11-02).
-The active TASK-004 replacement has exactly two proposed tasks: optional local
-MockServer, then the complete canonical dev workflow and shell/Traces/Spans/
-Logs/Metrics UI. Retired R1/R2/R3 retain evidence only. No implementation or
+Last approved scope revision: 19 (explicit caller approval, 2026-11-02).
+Revision 19 authorizes Task 03: real local signup/login, User-owned personal
+keys, a seeded local-human dev workflow and exact Observe alignment. Task 03 is
+ready for implementation with its approved provision-then-enroll admission,
+typed public contracts and security/visual contracts.
+The current source/reference audit and researched decisions are in
+[auth research](references/task-03-auth-research.md) and
+[Observe audit](references/task-03-observe-audit.md).
+
+The TASK-004 replacement contains Task 01 (optional local MockServer), Task 02
+(canonical dev workflow and Observe), and Task 03 (approved account/dev and
+remaining Observe closure). Task 03 now owns unfinished Task02/R1/R2 functional
+and visual obligations. Retired R1/R2/R3 retain evidence only. No implementation or
 acceptance is implied. Preserve current source/cleanup and unrelated UI work.
 Historical migration baseline and immutable review subjects remain unchanged.
 
@@ -24,6 +33,7 @@ that gate and retain their own visual checkpoints.
 | [TASK-004](tasks/TASK-004-observe-components.md) | Observe implementation retained; **incomplete until replacement live workflow and individual acceptance close** | TASK-003 implementation; closure by TASK-004-REV-01/02 | No historical PASS substitutes for real data/browser/visual proof. |
 | [TASK-004-REV-01](tasks/TASK-004-revision/TASK-01-mockserver.md) | Optional local MockServer via existing OpenAI endpoint configuration; proposed | None | Container runtime; official pinned amd64/arm64 image; real gateway fixture proof. |
 | [TASK-004-REV-02](tasks/TASK-004-revision/TASK-02-live-observe-workflow.md) | Canonical 500-request dev:full batch and real shell/Traces/Spans/Logs/Metrics; proposed | TASK-003, TASK-027, TASK-004-REV-01; retain existing Observe code | Current production SDK/source patch, independent review and individual human live/component inspection. |
+| [TASK-004-REV-03](tasks/TASK-004-revision/TASK-03-local-users-personal-keys-and-observe.md) | Ready: local human signup/login, personal Settings/API keys, seeded dev:full and exact Observe layout/color closure | TASK-003, TASK-027, TASK-004-REV-01 source; retain current Task02/R1/R2 implementation and evidence | Revision 19 approved 2026-11-02. Unfinished Task02 visual/delivery obligations transfer here; Task02 PASS is not a circular prerequisite. Separate rendered human acceptance remains required. |
 | [TASK-005](tasks/TASK-005-card-components.md) | Card browsing and definition component family | TASK-003 | Only if required ArtifactTable actions lack a current SDK/MCP projection: obtain approved platform action contract before calling that action complete. |
 | [TASK-006](tasks/TASK-006-query-components.md) | Query component family | TASK-003, TASK-004 | Query History source/lifetime unresolved; independent work may proceed. |
 | [TASK-007](tasks/TASK-007-verify-components.md) | Generic verification component family | TASK-003, TASK-004, TASK-005 | Separately specified non-sensitive requirement-outcome read contract; REQ-029 for AttentionList CR rows. Current sensitive outcome is not reclassified here. |
@@ -54,7 +64,7 @@ remaining TASK-003 review findings were either fixed (FIND-003-16/17 at
 `a9be77a51`) or dropped as unneeded complexity ([simplify record](review/simplify-2026-10-23.md)).
 Native/image runtime and nginx evidence for TASK-001 stay with final change review.
 
-## Current assignment — two replacement TASK-004 tasks
+## Revision 18 baseline and approved Task 03 closure
 
 Execute [Task 01](tasks/TASK-004-revision/TASK-01-mockserver.md), then
 [Task 02](tasks/TASK-004-revision/TASK-02-live-observe-workflow.md).

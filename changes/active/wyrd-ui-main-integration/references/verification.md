@@ -214,3 +214,16 @@ Do not equate a response count with completed observations. Real-browser
 proof uses the production BFF/server with the existing Vitest integration
 runner and minimal test-only Playwright Node API; jsdom/HTTP-only auth is
 supporting proof. Independent review and individual human inspection remain.
+
+## Approved revision 19 / Task 03
+
+Task03's exact focused commands and planned selectors are in
+[tasks/TASK-004-revision/TASK-03-local-users-personal-keys-and-observe.md](../tasks/TASK-004-revision/TASK-03-local-users-personal-keys-and-observe.md).
+They cover genuine local signup/login/session/reset, ordinary User-owned key
+identity/permissions, seeded dev:full readiness before its500-request batch and
+actual reference/theme/geometry proof. They are planned, not executed PASS
+results; no password/API-key shortcut can replace the normal human journey.
+Current audit results and external research are linked from that task. The caller
+approved spec19, its provision-then-enroll admission and Task03's typed contracts
+on 2026-11-02; Task03 is ready for implementation. Existing accepted
+regressions carry forward where unaffected.

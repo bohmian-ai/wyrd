@@ -1,10 +1,282 @@
 ---
 id: SPEC-wyrd-ui-main-integration
-revision: 18
+revision: 19
 status: approved
 ---
 
 # Migrate the Wyrd UI onto current main
+
+## Revision 19 — Local humans, personal credentials and aligned Observe delivery
+
+**Approved by the caller on 2026-11-02.** The caller requested a third Task 004 revision on
+2026-11-02: Wyrd-owned username/password signup and login, personal API-key
+Settings for local and SSO users, and a complete `dev:full` journey with seeded
+human credentials and the exact approved Observe composition. These requested
+outcomes and the admission, credential, persisted and visual contracts below,
+including Task 03's typed public contracts, are explicitly approved. This
+records scope approval, not implementation or rendered visual acceptance.
+Revision 18's delivered owners and prior acceptance records remain context.
+Task 03 owns the new account/dev delivery
+and the remaining Task02/R1/R2 functional/visual obligations. Their implementation
+is retained and their acceptance evidence remains context; do not run conflicting
+parallel assignments or require Task02 PASS before fixing its remaining gaps.
+
+
+Today `dev:full` provisions an administrator API key and no human password.
+The ordinary SSO route has no provider configured. Personal Settings does not
+exist, and current credential SQL/issuer paths cannot support real User-owned
+keys. The [current audit](references/task-03-observe-audit.md) also identifies
+remaining Metrics, Logs, Traces and waterfall layout/color differences.
+
+The intended outcome is one command, a usable browser URL and local username/
+password before the 500-request batch finishes, normal Rust-owned login, an
+account Settings page and real evidence in the agreed UI. Passwords and keys
+extend existing auth/SQL/client owners; no external IdP is required for local
+users and no parallel Node credential/session service is introduced.
+
+### Approved security and product decisions
+
+- **Admission — provision a workspace, then enroll its people.**
+  Self-hosted operator setup provisions the usual single tenant through the
+  existing TenantProvisioning owner and authorizes initial human-owner
+  enrollment. SaaS onboarding uses the same protected platform API to provision
+  a distinct tenant for each team and authorize its initial owner. Both then
+  use one 24-hour, one-use enrollment/invitation workflow: code, username and
+  password enroll a User with administrator-selected roles. Later teammates
+  join by invitation. Dev:full automates the self-hosted bootstrap and seeds its
+  local human; an anonymous first visitor never becomes administrator.
+  Tenant creation remains a platform capability: password signup cannot
+  fabricate PlatformCaller, receive tenants:write or choose an arbitrary
+  existing tenant/role. Public anonymous SaaS workspace creation, verified-email
+  delivery and billing/onboarding orchestration are separate platform-product
+  work, not silently added by this local-auth task. It may use this same
+  enrollment API after protected provisioning. No separate self-host/SaaS auth
+  implementation or misuse of Development/Production profile is introduced.
+- **Local identity.** Use a tenant-local username3–64 ASCII characters:
+  first character alphanumeric, remaining alphanumeric/dot/underscore/hyphen;
+  trim surrounding whitespace and ASCII-lowercase once at input. Store that
+  canonical form with tenant-local uniqueness for local credentials. The
+  immutable User ID remains identity; username rename is outside this slice.
+  Optional email/SSO claims remain metadata and never identify/link accounts.
+- **Passwords.** Adopt15–128 Unicode characters after consistent NFC
+  normalization, preserving case/spaces and rejecting control characters; limit raw input to1024 UTF-8
+  bytes before expensive work. Use a local common-password blocklist,
+  password-manager/paste support and no composition rule or periodic rotation.
+  Store an Argon2id PHC verifier with a fresh random salt, initially memory
+  19456 KiB/iterations 2/parallelism 1; reuse workspace Argon2/password-hash and
+  library verification, bounded hashing work and rehash-on-success. Never store
+  recoverable passwords. Unicode normalization's installed transitive crate
+  needs a declared narrow dependency if used; no auth framework is needed.
+- **Abuse and recovery.** Generic unknown-user/wrong-password/disabled failure,
+  including a dummy-verifier path; bounded attempts across replicas use tenant
+  auth/SQL state and PostgreSQL time. Proposed baseline:10 failures per
+  tenant/normalized-username in15 minutes,100 per trusted source in15 minutes,
+  retry only after the fixed window expires; cap concurrent KDF jobs at4 per
+  process. Use the existing auth maintenance owner for expiry cleanup. Initial
+  recovery is operator-assisted: an authorized users:write administrator with the existing
+  tenant-admin grant authority issues a 15-minute single-use reset code; the person chooses their own new password.
+  No unimplemented email recovery is promised. Password change verifies the
+  current password; reset requires the code; both bump credential revision and
+  end local password sessions. Account suspension/deletion refuses all sessions
+  and new key exchanges. Keys remain independently revocable credentials.
+- **One session authority.** Extend existing BrowserSessions and its SQL rows
+  with exactly-one local-password authority binding to User/credential revision,
+  alongside existing SSO connection revision and recovery-key authority.
+  Preserve fixed12-hour sessions, opaque host-only HttpOnly cookies, production
+  Secure/SameSite=Lax, exact Origin/tenant/bearer-precedence rules and no-store.
+  SSO identity remains issuer+subject; no same-email/username merge and no
+  setting a local password on an SSO-only User through an ordinary session.
+- **Personal keys.** Any active User may manage only their own personal keys;
+  server-derived tenant/User identity grants that explicit self capability,
+  without service_accounts:write or tenant OIDC administration. Define
+  personal_credentials:read/write as authenticated-User self-only capabilities
+  in the existing permission owner; include them in real User authority before
+  credential ceiling intersection, never in Service authority. Read lists own
+  metadata; write creates/revokes own credentials, with the separate recent
+  human-login requirement for creation. Enforce both capability and ownership
+  through the configured authorization owner. Extend existing principal
+  credential owners; no page-level permission bypass. Named keys
+  have a nonempty explicit permission ceiling and expiry; the UI explicitly
+  selects30 days initially, permits shorter durations and caps at365 days.
+  Ceiling must be within the caller's effective authority and current User
+  authority; future exchanges intersect stored ceiling with current User
+  grants. No privilege is inherited beyond that ceiling after role growth.
+- **Persisted key ownership and exchange.** Extend the existing credential
+  table with exactly-one tenant-bound relational owner: existing User or
+  existing Service/Admin account. Preserve existing credential IDs, verifiers,
+  prefixes, expiry and attribution in a forward migration; no surrogate Service
+  or new identity store. Lookup/verification must return the verified owner
+  kind, and TenantTokenIssuer must resolve that owner rather than infer kind
+  solely from OAuth grant family. Retain current short-lived JWT snapshot and
+  revoke-at-next-exchange semantics, and existing automation behavior.
+- **One-time key secret.** Reuse256-bit generation/SHA-256 verifier storage and
+  SecretBearer. Personal creation is a no-store authenticated response shown
+  once for deliberate copy, never recoverable later. Metadata includes name,
+  safe prefix, scopes, created/expiry/last-used and revocation. Require a human
+  login/session no older than5 minutes for creation; local and SSO users can
+  repeat their normal login. Freshness means Rust session creation after a
+  successful password verification or normal bound SSO completion; an existing
+  IdP session may satisfy that SSO completion. Merely reusing a Wyrd cookie/API
+  key does not refresh it. No forced provider password entry, new auth_time
+  profile or MFA assurance is claimed. Existing administrator issuance remains distinct; ordinary personal creation is an
+  interactive browser-auth HTTP operation, not an API-key-to-master-key chain.
+  SDKs retain normal use/exchange and expose own metadata/revoke; MCP creation
+  remains absent to prevent secrets entering model transcripts.
+- **Recovery boundaries.** Enrollment/reset codes are random256-bit one-use
+  secrets with verifier-only storage, purpose/tenant/issuer binding and database
+  expiry. Deliver code plus a fixed tenant signup/reset URL separately; codes,
+  passwords and API keys never enter URLs, logs or screenshots. Operator-created
+  invitations cannot grant roles beyond the existing administrator grant owner.
+- **Dev workflow.** Existing setup/bootstrap owners seed username `dev` with a
+  new20-character random password and an existing tenant-administrator grant in
+  the ephemeral dev tenant, through normal local-user creation/hashing owners.
+  Print usable UI URL, username/password and reset warning to the deliberate dev
+  console before batch dispatch; store test-readable development credentials
+  only in the existing private configuration directory with 0600 permissions.
+  Production setup never creates that default account/password automatically.
+  Disable inherited fixture auth in dev:full; local login must not require
+  Keycloak. Keep optional SSO fixtures and the existing500-request/concurrency8,
+  production wheel/source pin, failed-batch inspectability and app-first drain.
+
+### Required additions
+
+- **REQ-041 — First-class local human signup/login.** Approved admission creates
+  a real tenant User with the chosen local credential, supports normal login,
+  logout, password change and operator-assisted reset, and enforces current
+  membership/credential revision across replicas. Use the same browser session
+  owner as SSO; add typed browser HTTP contracts, SQL migrations and truthful
+  server-rendered SvelteKit forms.
+- **REQ-042 — Personal account Settings and credentials.** Local and SSO User
+  sessions share an ordinary account Settings page showing identity/auth method,
+  local password-change where applicable and own-key create/list/revoke.
+  Tenant SSO administration stays a separate authorized section. A User's key
+  must actually exchange/use the public SDK as that User; ownership, permissions,
+  expiry and revocation must be enforced by the existing shared backend chain.
+- **REQ-043 — Inspectable normal development workflow.** One dev:full command
+  reaches real UI/local-login readiness and displays seeded human access before
+  workload completion; the signed-in user sees retained real Traces/Spans, Logs,
+  Metrics and waterfall, can use Settings and logout, and sees new data from an
+  appended dev:batch. No recovery-key login or test fixture identity substitutes
+  for the primary journey. Existing recovery remains separately available.
+- **REQ-044 — Exact approved Observe visual composition.** Main, Metrics, Logs,
+  Spans, TraceDrawer and TimePicker define the layout/region/spacing/type/color
+  target, using current shared components. Close every source-backed difference
+  in task-03-observe-audit.md; do not treat current screenshots, generic Chart
+  defaults or a difference list as a newly approved design. Preserve current
+  fields/real data, existing mark assets/local fonts and truthful unavailable
+  percentile choices. Metrics retains its two-card default board; an explicit
+  recorded-points inspector may reuse existing Drawer/RecordTable and the metric
+  list loader for required retained structures, rather than adding a default
+  third table or a new detail service. The unsafe exemplar integer limitation
+  remains explicitly deferred by the caller; no DataFusion/Bifrost encoding
+  work is revived.
+
+### Canonical color reconciliation
+
+Keep one palette/generator and update its owning brand guidance to adopt the
+reference roles. Proposed role mapping fixes values instead of permitting an
+implementor to invent a near match:
+
+| Role | Dark value from canvas | Approved light counterpart |
+|---|---|---|
+| Navigation surface | #0e1017 | existing secondary surface #eef0f4 |
+| Selected/filter border | #3a4170 | existing declaration stroke #4d5ef0 |
+| Log info fill | #3a4170 | #4d5ef0 |
+| Log warning/error fill | #f0a13c / #e2484d | same status fills, existing text/glyph safeguards |
+| p95 / p50 | #c5f23b / #7a8cff | #c5f23b / #4d5ef0 |
+| Additional chart/waterfall series | #a9b4ff, #8fae2a, #4d5ef0 | #4d5ef0, #8fae2a, #7a8cff with noncolor cues |
+
+Reference fills must not be changed by unapproved opacity blending. Retain
+canonical text/surface/rule/font tokens where the canvas already matches. New
+semantic tokens are authored only in brand/palette.json, with appropriate
+contrast pairs and regeneration; never duplicate hex in page/component CSS.
+Waterfall distinctions use actual recorded identity/role where present and
+consistent legend-backed series identity otherwise; no invented span-name
+semantics. Dark canvas mapping is exact; because no light canvas board exists,
+the stated light mapping and its actual browser result require human acceptance.
+
+### Authority amendments required with implementation
+
+Amend architecture/wyrd-design.md Human sign-in/Client model and
+architecture/wyrd-security-posture.md API keys/First-party browser sessions/
+Permission check to include local credentials, exactly-one local session
+binding, owner-bound personal rights/permission ceilings and the deliberate
+one-time Settings secret response. Those existing sections remain authoritative
+until their approved revision-19 amendments land with the behavior.
+No bearer revalidation model, machine OAuth password grant, external IdP,
+permission shortcut, durable Node session, SSO linking, email system or duplicate
+credential service is authorized.
+
+The one-time key-creation response is the sole narrow exception to INV-002's
+no-browser-page-secret rule: deliberate no-store POST response/transient display
+only, never initial SSR load/PageData, browser storage/history, URL, logs,
+telemetry or captures. Enrollment/reset forms similarly transmit supplied
+secrets only in scrubbed POST bodies. No new production credential exposure
+is justified by development console seeding.
+
+### Approved public contract additions
+
+The normative field/type definitions, required/optional/null rules, repeated
+password route table, profile projection and explicit credential paging/client
+compatibility contract are packet-local in [Task 03 — Public contracts](tasks/TASK-004-revision/TASK-03-local-users-personal-keys-and-observe.md#public-contracts).
+That section elaborates the approved revision-19 contract below; implementations must
+not select different shapes independently in HTTP, MCP or an SDK.
+
+Browser password operations keep the existing JSON/problem+json auth protocol,
+strict request schemas, exact Origin check and cookie/no-store response owner;
+they are not OAuth password grants. Password fields are JSON strings with
+redacted secret handling, never debug/loggable raw values.
+
+| Route | Input / authority | Success |
+|---|---|---|
+| Operator CLI: wyrd-server setup --tenant <slug> --local-user <username> --local-password-stdin | optional controlled initial-human bootstrap; password through stdin only, existing platform/tenant setup authority | existing setup plus real local User/admin grant through the same auth creation owner; no printed password or implicit default production user |
+| POST /auth/browser/password/signup | tenant, invitation_code, username, password; invitation authority, no role/User input | 201 BrowserSessionView plus the existing opaque session cookie; BFF redirects to the fixed tenant Observe entry |
+| POST /auth/browser/password/login | tenant, username, password | 200 BrowserSessionView plus fresh cookie |
+| POST /auth/browser/password/change | tenant, current_password, new_password; selected local User session | 204, revoke local revision sessions and clear selected cookie; ordinary login required |
+| POST /auth/browser/password/reset | tenant, reset_code, new_password; code authority | 204, invalidate reset/local sessions; no automatic login |
+| POST /v1/principals/users/invitations | selected existing Role IDs; users:write and existing grant authority | 201 invitation metadata, one-time code, fixed signup URL; default 24-hour expiry |
+| DELETE /v1/principals/users/invitations/{id} | tenant-bound user administration | 204 revocation |
+| POST /v1/principals/users/{id}/password-reset | local User target; users:write plus existing tenant-admin grant authority | 201 reset metadata, one-time code, fixed reset URL; 15-minute expiry |
+| GET /v1/principals/me | actual authenticated User, not a caller-selected subject | safe own profile and effective self capabilities; no password verifier/key secret |
+| GET/POST /v1/principals/{principal_id}/credentials and DELETE credential subroute | extend existing routes with explicit real-User self case and required personal-credential capability; other targets retain administrative checks | existing metadata/IssuedCredential/revoke shapes extended for named scoped User keys; POST own creation additionally needs recent human login |
+
+Reuse existing targeted credential routes, clients and MCP metadata/revoke tools;
+do not add synonymous /me/credentials aliases. UI derives its principal target
+from the Rust session, and the server compares it with verified caller ownership;
+a target supplied by a client is never authority. Existing Service/Admin
+administrator issuance keeps its no-body behavior. Newly usable User-target
+issuance must require name/ceiling/expiry rather than silently mint an
+unrestricted User key. Other-User issuance requires tenant-admin grant authority;
+self-service rights alone can never issue for someone else.
+
+Own-key metadata reads are bounded: default 50, maximum 100 records with an
+opaque continuation cursor; no key secret in any list page. The existing key
+creation response retains SecretBearer; the User additions are normalized name,
+permission ceiling and expiry metadata, not a parallel key format.
+
+Only the bootstrap/dev credential-delivery exception may retain the generated
+initial development password in a private 0600 ephemeral record for the live
+session and test owner; remove it during owned cleanup and never copy it into
+review/CI artifacts or client credential caches. Production User/password
+stores retain PHC verifiers only. Production setup does not seed a default
+human password. Apply rate admission to every password verification path,
+including password change/recent local login, not only the login page.
+
+### Acceptance for revision 19
+
+| Criterion | Required observation |
+|---|---|
+| AC-024 | Real server/BFF local signup and login obey approved admission and password policy; unknown/disabled/incorrect/throttled/expired/reused/cross-tenant flows refuse without leaked credentials or partial membership; reset/change revokes local sessions across replicas and SSO remains unchanged. |
+| AC-025 | Ordinary local and SSO Users create a scoped expiring own key once, list metadata, use it through first-class clients as the actual User, and revoke it; other-user/tenant access, scope escalation and service-surrogate identity are refused. Existing administrator/workload keys remain usable. |
+| AC-026 | Normal dev:full seeds a usable local human and exposes UI/login readiness before its 500-request batch completes; a real browser logs in, inspects all signals/waterfall, manages own keys, appends evidence and logs out, then Ctrl-C cleans owned children. |
+| AC-027 | Actual six-board comparison plus geometry/computed-token/interaction checks on desktop/mobile and verified light/dark themes match the approved reference contract; all named audit gaps are closed and each component/board has separate human acceptance. Generated captures/diffs stay outside the repository. |
+
+Costs: new forward auth migrations and local credential/recovery/abuse lifecycle,
+shared User-key issuance/projection work and bounded shared presentation seams.
+Reuse of existing owners is mandatory but cannot substitute for missing
+functionality. No readiness, implemented verdict or visual approval is granted
+by this scope approval. Task 03 is ready for implementation; review and rendered
+visual acceptance remain separate requirements.
 
 ## Revision 18 — Local MockServer and a working live Observe UI
 
@@ -1324,7 +1596,10 @@ not protocol authority.
 - **INV-002 — Server and credential boundary.** Rust retains durable behavior,
   authorization, tenant isolation, storage, policy, audit and browser-session
   authority. Node retains only the request-scoped opaque cookie required for
-  server-side forwarding. Never emit token/API-key material in browser cookies,
+  server-side forwarding. Revision 19 proposes only the explicitly described
+  transient no-store personal-key creation response and deliberate ephemeral
+  development-password delivery exceptions; no general credential cache.
+  Otherwise never emit token/API-key material in browser cookies,
   page data, browser storage, logs, URLs, screenshots, or fixtures; session
   identifiers appear only in their protected cookie and transport. A failed
   or denied live request
@@ -1441,6 +1716,13 @@ combined proof and cross-task seams; task gates remain bounded to their owners.
 
 ## Open material decisions and approval
 
+Revision19 is draft. The caller has approved the requested outcomes but has
+not yet approved the concrete workspace-provisioning/enrollment, security,
+persisted-key/session and light-palette proposals above. Task03 is proposed,
+not ready. Existing revision18/earlier approval records below remain historical
+and do not approve revision19. Approve the proposed admission/security/visual contract as a complete
+revision before implementation; no user/admin role may be inferred at signup.
+
 The caller's 2026-11-02 instruction approves revision 18's replacement local
 MockServer and complete live Observe outcomes. New implementation tasks remain
 proposed; no implementation, review or visual PASS is implied. There is no open
@@ -1514,6 +1796,11 @@ review verdicts are not rewritten. A host lacking supported integration is a
 reported live-proof blocker, never an assumed capability or silent pass.
 
 ## Revision history and authorities
+
+- Revision19 draft (2026-11-02): proposed local signup/login, User-owned scoped
+  personal keys, real seeded dev human and exact Observe alignment, based on
+  caller direction and recorded auth/UI research. Awaiting approval of the provision-then-enroll admission and new security/visual
+  contracts.
 
 - Revision 1: invalid prior draft; archived byte-for-byte, including its invalid
   approval claim. Not implementation authority.

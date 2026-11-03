@@ -68,7 +68,8 @@ Biases), LLM observability (Langfuse, Arize Phoenix, LangSmith), eval
 frameworks (promptfoo, DeepEval, Ragas), ML monitoring (Evidently, Fiddler),
 AI gateways (LiteLLM, Portkey), observability platforms (Datadog, Grafana,
 Honeycomb), and AI governance (Credo AI, IBM watsonx.governance). Every row
-keeps the existing tool.
+keeps the existing tool. The docs introduction repeats the Already have
+tools? section, so coding agents reading the docs and `llms-full.txt` find it.
 
 The use-case hub carries no comparison. No OPA row, integration-status labels,
 feature-checkmark grid, or claim about another product's depth, performance,
@@ -186,7 +187,7 @@ setup reporting.
 | Acceptance | Obligations | Expected observation and evidence |
 | --- | --- | --- |
 | AC-001 | REQ-001, REQ-002, INV-001 | README presents Wyrd's full scope and six accessible use-case links; rendered review confirms relevant published destinations. |
-| AC-002 | REQ-003, INV-002 | README Why Wyrd and Already have tools? match REQ-003; product claims match public documentation; the hub has no comparison; OPA, status labels and unsupported claims are absent. |
+| AC-002 | REQ-003, INV-002 | README Why Wyrd and Already have tools? match REQ-003, and the introduction repeats Already have tools?; product claims match public documentation; the hub has no comparison; OPA, status labels and unsupported claims are absent. |
 | AC-003 | REQ-004, INV-002 | Differentiators match source owners and link to existing explanations; no new architecture exposition or benchmark publication is added. |
 | AC-004 | REQ-005, INV-003 | Public and machine discovery reach the richer workflows, preserve setup/quickstart order and draft exclusion, and contain no nonexistent next-step link. |
 | AC-005 | REQ-006, REQ-007, INV-001 | Existing policy workflow completes with cited evidence; all four reader scenarios succeed through both public docs and MCP onboarding. |

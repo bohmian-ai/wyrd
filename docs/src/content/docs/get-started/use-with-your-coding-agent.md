@@ -3,7 +3,7 @@ title: Use with your coding agent
 description: Give your coding agent the Wyrd docs through llms.txt and Wyrd's tools through MCP with wyrd mcp install.
 pillar: wyrd
 section: Get started
-order: 4
+order: 5
 ---
 
 Point your coding agent at the Wyrd docs, then connect it to your Wyrd server so it can read your declarations, verdicts, and evidence.
@@ -75,4 +75,4 @@ The URL is stored in that agent's entry only. Remote servers must use `https://`
 
 ## Next
 
-[Run your first verification](/get-started/quickstart/), then ask your agent to explain its verdicts.
+[Run your first verification](/get-started/quickstart/), then ask your agent to explain its verdicts. [What can I build?](/get-started/what-can-i-build/) helps it choose the workflow your project needs.

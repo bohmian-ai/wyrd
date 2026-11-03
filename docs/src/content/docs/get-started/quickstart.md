@@ -8,7 +8,7 @@ order: 3
 
 You write two small YAML files and one short program in Python, Rust, or TypeScript. The program declares them to your server, then asks Wyrd to verify two support answers against one requirement: the answer never promises a guaranteed refund. One answer passes and one fails, and each verdict names the exact versions that produced it.
 
-No model, provider key, or application is involved: you supply each answer as text.
+This is the simplest Verifier Wyrd runs. No model, provider key, or application is involved: you supply each answer as text.
 
 ## Prerequisites
 
@@ -120,4 +120,4 @@ To change the requirement, give it a new version: set `version: 1.1.0` in `no-re
 
 ## Next
 
-[How verification works](/understand/how-verification-works/) explains requirements, checks, and verdicts. The [Verifier reference](/reference/verifier-card/) lists every field you can declare.
+[What can I build?](/get-started/what-can-i-build/) matches your problem to a larger workflow, such as a policy document judged by an Agent or a long-running workflow verified step by step. [How verification works](/understand/how-verification-works/) explains requirements, checks, and verdicts. The [Verifier reference](/reference/verifier-card/) lists every field you can declare.

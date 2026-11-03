@@ -98,5 +98,6 @@ write a machine-specific path into a project file.
 
 7. Report the Service identity
    `Service/support-reply@1.0.0#<uid>`, the `run_id`, and both
-   verdicts. Then point the person to the Wyrd documentation's
-   "Choose your path" page for the next step.
+   verdicts. Then point the person to
+   https://docs.bohmian.ai/wyrd/get-started/what-can-i-build/ to choose the
+   workflow their project needs next.

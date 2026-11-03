@@ -40,6 +40,7 @@ SITE = f"{ORIGIN}{BASE}"
 START = [
     ("get-started/setup", "install Wyrd and start a local server you keep running"),
     ("get-started/quickstart", "declare a Verifier in YAML and verify a passing and a failing support answer from Python, Rust, or TypeScript"),
+    ("get-started/what-can-i-build", "choose the workflow for your problem: policy documents, agent evaluation, long-running workflows, runtime checks, observability, or drift"),
 ]
 
 SUMMARY = (
@@ -146,7 +147,7 @@ def render_start() -> list[str]:
     return [
         "## Start here",
         "",
-        "Set up a local server, then run one verification, in this order. "
+        "Set up a local server, run one verification, then choose what to build, in this order. "
         "A connected Wyrd MCP server teaches the same route through "
         '`wyrd.guide {"topic":"start"}`.',
         "",

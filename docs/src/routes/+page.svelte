@@ -29,6 +29,7 @@
   // The CTA opens setup, the first step a reader can complete, else the first Get started page.
   const start = startPages.find((item) => item.path === '/get-started/setup/') ?? firstPage('Get started');
   const agent = startPages.find((item) => item.path === '/get-started/use-with-your-coding-agent/');
+  const build = startPages.find((item) => item.path === '/get-started/what-can-i-build/');
 </script>
 
 <svelte:head>
@@ -49,6 +50,7 @@
     <div class="cta">
       {#if start}
         <a class="button primary" href={`${base}${start.path}`}>Get started →</a>
+        {#if build}<a class="button" href={`${base}${build.path}`}>What can I build?</a>{/if}
         {#if agent}<a class="button" href={`${base}${agent.path}`}>Use with your coding agent</a>{/if}
         <a class="button" href={GITHUB_URL} rel="noreferrer" target="_blank">GitHub</a>
       {:else}

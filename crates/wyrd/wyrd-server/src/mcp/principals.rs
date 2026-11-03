@@ -87,15 +87,15 @@ pub(super) fn may_administer_tenant(caller: &Caller) -> bool {
         .contains(&Permission::wildcard())
 }
 
-/// Whether this caller holds tenant principal administration.
+/// Whether this caller may revoke a credential: tenant principal
+/// administration, or a User's own-key `personal_credentials:write`.
 ///
-/// Reads the same permission the HTTP surface requires, from the verified
+/// Reads the same permissions the HTTP surface requires, from the verified
 /// token, so the two cannot disagree about who may write.
 pub(super) fn may_administer(caller: &Caller) -> bool {
-    caller
-        .principal
-        .effective_permissions
-        .contains(&Permission::service_accounts_write())
+    let held = &caller.principal.effective_permissions;
+    held.contains(&Permission::service_accounts_write())
+        || held.contains(&Permission::personal_credentials_write())
 }
 
 /// Derive one tool schema from the Rust type the tool actually speaks.
@@ -181,7 +181,7 @@ fn revoke_credential_tool() -> Tool {
         "Retire one credential belonging to a principal in this caller's tenant. The credential \
          can mint no further token; a token it already minted lapses within five minutes. The \
          principal, its roles, and its other credentials are untouched. Requires \
-         service_accounts:write.",
+         service_accounts:write, or personal_credentials:write for a User's own key.",
         false,
     )
 }

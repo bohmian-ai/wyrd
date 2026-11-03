@@ -411,7 +411,9 @@ impl NativeWyrdTestServer {
     /// Returns a napi error when `tenant_id` is not a tenant ID.
     #[napi]
     pub fn builtin_role_id(&self, tenant_id: String, role: String) -> Result<String> {
-        let tenant = tenant_id.parse::<wyrd_spec::DataTenantId>().map_err(reason)?;
+        let tenant = tenant_id
+            .parse::<wyrd_spec::DataTenantId>()
+            .map_err(reason)?;
         Ok(wyrd_runtime::builtin_roles::builtin_role_uuid(tenant, &role).to_string())
     }
 

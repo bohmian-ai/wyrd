@@ -562,6 +562,17 @@ async fn init_first_run_is_client_ready() {
     assert_eq!(ready["ui"], format!("http://{}", local.ui));
     assert_eq!(ready["log"], log.to_str().expect("UTF-8 log"));
     assert_eq!(ready["mcp"], serde_json::Value::Null);
+    assert_eq!(
+        ready["gateway"],
+        "not configured: configure it later with wyrd gateway deployment put --file"
+    );
+    let startup = fs::read_to_string(&log).expect("diagnostic log");
+    assert!(
+        !startup
+            .lines()
+            .any(|line| line.contains("ERROR") && line.contains("/readyz")),
+        "startup readiness polls log no ERROR: {startup}"
+    );
     let global = GlobalConfig::load_in(&local.environment()).expect("saved config");
     let dev = &global.dev;
     assert_eq!(dev.tenant.as_deref(), Some("local"));

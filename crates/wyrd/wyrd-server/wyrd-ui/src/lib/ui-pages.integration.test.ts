@@ -859,8 +859,10 @@ async function answers(port: number): Promise<boolean> {
 
 /** The `Traces` total the overview shows, or NaN while it loads. */
 async function traceTotal(page: Page): Promise<number> {
-  const text = (await page.locator('[data-panel="overview"]').textContent()) ?? '';
-  return Number(/(\d[\d,]*) traces/.exec(text)?.[1].replaceAll(',', '') ?? NaN);
+  // The count is a headline's own detail; the panel's whole text runs the headline value into it.
+  const details = await page.locator('[data-panel="overview"] .detail').allTextContents();
+  const count = details.map((text) => /^(\d[\d,]*) traces?$/.exec(text)?.[1]).find(Boolean);
+  return Number(count?.replaceAll(',', '') ?? NaN);
 }
 
 /** Starts `mise run dev:full` in its own process group, writing to a log file in `config`. */

@@ -243,7 +243,7 @@ environment signs in as `development` / `development`.
 | Admin invites by Role name | `CreateUserInvitationRequest.roles` (names, tenant-scoped through `role_by_name`), `Principals::invite_user`, `wyrd principal user invite` | same two tests; `pg_browser_sessions` (unknown Role 400, viewer 403); V4, V10 | PASS |
 | Non-administrators are refused | `authorize_user_admin` | workload key and viewer get `WYRD_PERMISSION_403_DENIED_RBAC` on create and invite (SDK, CLI) | PASS |
 | Passwords are 8–128 characters | `PASSWORD_MIN_CHARS = 8`; posture, signup copy | `passwords::tests::new_passwords_follow_the_policy`; seven-character create refused | PASS |
-| Dev startup follows `wyrd init` and waits for the tenant and User | `dev-server.sh`: `wyrd-server setup --tenant dev`, `wyrd principal user create`, then `credentials.toml`; `dev:full` waits on `/readyz`, a fresh `credentials.toml` and the login page | V5 `development environment lifecycle` | NOT RUN: a local `dev:full` holds 8080/3000 |
+| Dev startup follows `wyrd init` and waits for the tenant and User | `dev-server.sh`: `wyrd-server setup --tenant dev`, `wyrd principal user create`, then `credentials.toml`; `dev:full` waits on `/readyz`, a fresh `credentials.toml` and the login page | V5 `development environment lifecycle` (first run failed: the CLI call lacked `--server`, and the trace count reader ran the new spans-per-minute headline into the count) | PASS |
 | No setup-created User, no dev-login file | `--local-user` setup flags and `dev-login.toml` removed; `builtinRoleId` test helper removed (no caller once invitations name Roles) | source; `ts:build:testing` regenerates `native.d.cts` | PASS |
 
 Checks: `mise run fmt`, `mise run lints`, `codegen:check`, `docs:check`,

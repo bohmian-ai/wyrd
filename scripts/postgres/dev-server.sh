@@ -28,7 +28,7 @@ exec "$root/scripts/postgres/with-test-postgres.sh" -- bash -c '
     sleep 1
   done
   key=$(./target/debug/wyrd-server setup --tenant dev | sed -n "s/^admin_credential: //p")
-  printf development | WYRD_API_KEY="$key" ./target/debug/wyrd principal user create --username development --role admin >/dev/null
+  printf development | WYRD_API_KEY="$key" ./target/debug/wyrd principal user create --username development --role admin --server http://127.0.0.1:8080 >/dev/null
   # SDKs and the CLI refuse a saved credential others can read.
   mkdir -p "$config"
   chmod 700 "$config"

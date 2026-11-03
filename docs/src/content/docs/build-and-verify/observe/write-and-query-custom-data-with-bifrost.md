@@ -20,7 +20,7 @@ Bifrost is Wyrd's analytical warehouse, and you can use it directly: register a 
 
 ## 1. Register a table
 
-Tables live in `vala.datasets`. Declare one from a type, and the type's fields become the columns:
+Tables live in `bifrost.datasets`. Declare one from a type, and the type's fields become the columns:
 
 <LangTabs langs={['python', 'rust', 'typescript']}>
 <LangTab lang="python">
@@ -245,21 +245,21 @@ Bifrost is read-only from SQL: `INSERT`, `UPDATE`, `DELETE`, and DDL are refused
 <LangTab lang="python">
 
 ```python
-print(bifrost.describe_table("vala.datasets", "ticket_outcomes"))
+print(bifrost.describe_table("bifrost.datasets", "ticket_outcomes"))
 ```
 
 </LangTab>
 <LangTab lang="rust">
 
 ```rust
-let description = bifrost.describe_table("vala.datasets", "ticket_outcomes").await?;
+let description = bifrost.describe_table("bifrost.datasets", "ticket_outcomes").await?;
 ```
 
 </LangTab>
 <LangTab lang="typescript">
 
 ```typescript
-console.log(await bifrost.describeTable("vala.datasets", "ticket_outcomes"));
+console.log(await bifrost.describeTable("bifrost.datasets", "ticket_outcomes"));
 ```
 
 </LangTab>

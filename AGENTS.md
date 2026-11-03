@@ -72,8 +72,8 @@ These are not open for discussion in a task or review.
 
 - **Verification model.** Cards and Specs identify what is verified;
   bindings attach Verifiers; Runs and Observations record behavior; Verifiers
-  judge; lineage ties evidence to exact versions; Bifrost retains it; Policy
-  governs; Audit records accountability; Operators react to failures. Wyrd is
+  judge; lineage ties evidence to exact versions; Bifrost retains it; Audit
+  records accountability; Operators react to failures. Wyrd is
   not a passive catalog, observability product, or general agent runtime.
 - **Client/server.** The Rust server owns durable behavior. Contracts live on
   the wire (typed schemas, HTTP/MCP payloads, stable error codes). Rust,
@@ -95,9 +95,8 @@ These are not open for discussion in a task or review.
   careful, literal reader who cannot ask for clarification.
 - **Cards.** Envelope `apiVersion: wyrd/v1`, `metadata`, `kind`, `spec`,
   server-derived `relationships`, server-managed `status`; no outer
-  `kind: Card`. 14 kinds: `Data`, `Model`, `Artifact`, `Experiment`, `Prompt`,
-  `Agent`, `Mcp`, `Service`, `Policy`, `Audit`, `Verifier`, `Source`,
-  `Trigger`, `Operator`. Drift and Agent judging are Verifier check kinds.
+  `kind: Card`. 12 kinds: `Data`, `Model`, `Artifact`, `Experiment`, `Prompt`,
+  `Agent`, `Mcp`, `Service`, `Audit`, `Verifier`, `Trigger`, `Operator`. Drift and Agent judging are Verifier check kinds.
   `CardKind::External` is not registrable. `Tool`, `Skill`, and `SubAgent` are
   not Card kinds. `CardRef` is `kind`, `name`, one `version`, optional
   `uid`; Card identity is tenant, kind, name, and version.

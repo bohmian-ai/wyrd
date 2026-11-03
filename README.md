@@ -16,9 +16,20 @@
   <a href="https://discord.gg/K5bf23yPNb">Discord</a>
 </p>
 
-Wyrd is open-source verification infrastructure for AI systems. Know whether your AI system does what you said it would, before release and in production.
+Wyrd is open-source infrastructure for building your own verification system for AI/ML in production. Register what you ship at exact versions, record what it does, and judge that behavior with checks you compose: a one-line assertion, a model judge that cites your policy document, or a check across a six-hour agent run.
 
-You declare what your system must do as requirements. Your app sends Wyrd what it did, and Wyrd returns a verdict for each requirement, keeping it with the exact versions it judged. Check a support agent's answers, an uploaded document against your policy, or every step of a long-running workflow.
+Your app sends Wyrd what it did. Wyrd returns a verdict for each requirement, with a reason, and keeps it beside the exact versions it judged. Start from a use case:
+
+<p align="center">
+  <a href="https://docs.bohmian.ai/wyrd/get-started/what-can-i-build/#policy-verification"><img src="https://img.shields.io/badge/Policy%20verification-555555" alt="Use case: Policy verification"></a>
+  <a href="https://docs.bohmian.ai/wyrd/get-started/what-can-i-build/#agent-evaluation"><img src="https://img.shields.io/badge/Agent%20evaluation-555555" alt="Use case: Agent evaluation"></a>
+  <a href="https://docs.bohmian.ai/wyrd/get-started/what-can-i-build/#long-horizon-workflows"><img src="https://img.shields.io/badge/Long--horizon%20workflows-555555" alt="Use case: Long-horizon workflows"></a>
+  <a href="https://docs.bohmian.ai/wyrd/get-started/what-can-i-build/#runtime-verification"><img src="https://img.shields.io/badge/Runtime%20verification-555555" alt="Use case: Runtime verification"></a>
+  <a href="https://docs.bohmian.ai/wyrd/get-started/what-can-i-build/#observability"><img src="https://img.shields.io/badge/Observability-555555" alt="Use case: Observability"></a>
+  <a href="https://docs.bohmian.ai/wyrd/get-started/what-can-i-build/#drift-monitoring"><img src="https://img.shields.io/badge/Drift%20monitoring-555555" alt="Use case: Drift monitoring"></a>
+</p>
+
+[What can I build?](https://docs.bohmian.ai/wyrd/get-started/what-can-i-build/) walks through each one. They are examples: the same primitives build any verification you need.
 
 ## How Wyrd fits your stack
 
@@ -32,6 +43,21 @@ You declare what your system must do as requirements. Your app sends Wyrd what i
 3. **Verify.** Your app sends a result to a Verifier and gets a verdict for each requirement, with a reason.
 
 The Python, Rust, and TypeScript SDKs, the CLI, MCP, and HTTP all call one server, so a verdict reads the same from each. [Architecture](https://docs.bohmian.ai/wyrd/understand/architecture/) shows what a team deployment runs.
+
+## Why Wyrd
+
+Most AI tools hand you their evaluators, their UI, and their datastore. Your checks end up shaped by what the product supports, and your evidence lives where the product keeps it.
+
+Wyrd gives you the primitives instead, and you build the verification layer your system needs: a code reviewer that reads the diff and your style guide, a payment check that cites your policy document, drift on a classical model, a check across a six-hour agent run.
+
+| You get | So you don't have to |
+| --- | --- |
+| Verification primitives you compose into steps and checks | Fit your rules into one vendor's evaluator types |
+| Checks as versioned YAML in your repo, run in CI, inline, in the background, per session, or on a schedule | Keep one set of evals for CI and another for production |
+| One data plane for telemetry, model calls, your app's rows, and verdicts, as Iceberg tables in your object store, queried with SQL | Join evidence across four tools' stores and APIs |
+| Registration and versioning for the whole service: agents, prompts, models, data, MCP servers | Guess which version produced a result |
+| An LLM gateway and service identity, so every call and verdict names the account and release behind it | Bolt attribution on after the fact |
+| Apache 2.0 and self-hosted, ingesting standard OpenTelemetry (OTLP) from any exporter | Re-instrument your app with a vendor SDK, or send your data to someone else's cloud |
 
 ## Install
 
@@ -190,7 +216,21 @@ failed: operator NotContains returned false
   verifier: default/Verifier/no-refund-promise@1.0.0#<uid>
 ```
 
-[Run your first verification](https://docs.bohmian.ai/wyrd/get-started/quickstart/) walks through it. A check can also run Python or ask a model to judge; see [Write a Verifier](https://docs.bohmian.ai/wyrd/build-and-verify/verify/author-a-verifier/).
+[Run your first verification](https://docs.bohmian.ai/wyrd/get-started/quickstart/) walks through it. This assertion is the simplest check. A Verifier can also run Python, judge with an Agent that reads your uploaded policy files and cites them, judge a whole session, or watch for drift on a schedule; see [What can I build?](https://docs.bohmian.ai/wyrd/get-started/what-can-i-build/) and [Recipes](https://docs.bohmian.ai/wyrd/build-and-verify/verify/verifier-recipes/).
+
+## Already have tools?
+
+Keep them. Add Wyrd where they stop.
+
+| You use | Keep it for | Add Wyrd for |
+| --- | --- | --- |
+| MLflow, W&B | Training, experiments, model registry | Runtime monitoring and verification of the model you deployed, at its exact version |
+| Langfuse, Phoenix, LangSmith | Trace exploration, prompt iteration | Your own verification layer: checks you compose, judges with tools and your files, verdicts your app acts on |
+| promptfoo, DeepEval, Ragas | Test suites and red-teaming in CI | Running the same checks on live traffic, and keeping every result |
+| Evidently, Fiddler | Drift reports and dashboards | Drift judged next to traces, model calls, and app data, in one SQL store |
+| LiteLLM, Portkey | Model routing, inline guardrails | Tying every call to an account, a release, and a verdict |
+| Datadog, Grafana, Honeycomb | Infrastructure monitoring and alerts | Pass/fail verdicts on the same OpenTelemetry data |
+| Credo AI, watsonx.governance | AI inventory, policy programs | Proof from production for each control |
 
 ## Where Wyrd stops
 

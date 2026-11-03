@@ -16,7 +16,7 @@ Pick the check you need, bind its Verifier under `verified_by` to what it checks
 | Logic an operator cannot express | [Python check](#python-check) | `code` |
 | Meaning, tone, or policy | [Model judge](#model-judge) | `agent` |
 | An answer against a document | [Multi-step](#multi-step) | `extract` and `code` steps, then `assert` |
-| An answer against files you upload once | [Uploaded files](#uploaded-files) | `agent` with a workspace |
+| An answer or decision against a policy you upload once | [Uploaded files](#uploaded-files) | `agent` with a workspace |
 | A whole conversation, not one reply | [Grouped session](#grouped-session) | `assert` over a group |
 | Inputs or outputs shifting over time | [Drift](#drift) | `drift` |
 
@@ -428,6 +428,30 @@ Mount the uploaded files by exact reference in an Agent's `workspace`, here the 
 </Tabs>
 
 Without `path`, every file of the version is mounted. The judge reads with `fs.read` and cites the `attachment_<n>` slot the tool reports. Uploading a new version never changes what this Verifier mounts. [Agent tools and authorization](/reference/agent-tools-and-authorization/) lists the file tools and the grants each call needs.
+
+Bind the Verifier to the Service it checks:
+
+```yaml
+verified_by:
+  - verifier: ./handbook-review.yaml
+```
+
+Then call it with the evidence the judgment rests on, here the question:
+
+```python
+from wyrd import WyrdState
+
+run = WyrdState.declare("support-reply.yaml").run()
+
+# The judge's fs.read call runs as your credential, which needs a tool:invoke grant for fs.read.
+result = run.observe.verify("handbook-review", question="How do outages escalate?")
+judged = result.requirements[0]
+print(judged["outcome"], judged["reason"])  # the reason quotes the handbook line it found
+for citation in judged.get("citations", []):
+    print(citation["slot"], citation["locator"])  # attachment_<n> and the cited lines
+```
+
+A pass without a citation counts as `inconclusive`. Put exact rules, such as an amount limit, in `assert` or `code` requirements of the same Verifier, so they never depend on the model; `decide` combines every requirement's verdict. Your application reads the verdict and decides what to do, such as holding a payment. `verify` waits for the judge; `submit` queues it instead, as [verify and submit](/understand/how-verification-works/#verify-and-submit) explains.
 
 ## Grouped session
 

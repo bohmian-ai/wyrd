@@ -1150,7 +1150,7 @@ def test_installed_cli_guided_setup() -> None:
             assert b"openai from OPENAI_API_KEY" in shown
             assert b"gemini from GOOGLE_API_KEY" in shown
             assert b"WYRD_STORAGE_URL is unset" in shown
-            assert b"configured deployments gemini-local" in shown
+            assert b"[configured] Gateway: gemini-local" in shown
 
             def listed(resource: str) -> list[str]:
                 fresh = subprocess.run(

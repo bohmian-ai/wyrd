@@ -1901,7 +1901,7 @@ Bifrost does not provide:
 - cross-pod Scribe assembly or coordination of one append across ingest pods;
 - a second compaction planner, a managed-core catalog commit, or global Forge
   serialization;
-- external-system writes through `Source` or any Bifrost path;
+- external-system writes through any Bifrost path;
 - compatibility routes, legacy storage names, or alternate durable formats.
 
 ## Platform audit sentinel

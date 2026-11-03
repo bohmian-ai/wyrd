@@ -22,12 +22,12 @@ drift, not permission for code and documentation to diverge.
 
 - [Doctrine](#doctrine) — 21 design principles
 - [Client model](#client-model) — language-agnostic protocol and first-class SDKs
-- [Kind catalog](#kind-catalog) — 14 registrable kinds + External discriminator
+- [Kind catalog](#kind-catalog) — 12 registrable kinds + External discriminator
 - [Per-kind specs](#per-kind-specs) — field shapes per kind
   - [Data](#data) · [Model](#model) · [Artifact](#artifact) · [Experiment](#experiment)
   - [Prompt](#prompt) · [Agent](#agent) · [Mcp](#mcp)
-  - [Service](#service) · [Policy](#policy) · [Audit](#audit)
-  - [Verifier](#verifier) · [Source](#source) · [Bifrost](#bifrost)
+  - [Service](#service) · [Audit](#audit)
+  - [Verifier](#verifier) · [Bifrost](#bifrost)
   - [Trigger](#trigger) · [Operator](#operator)
 - [Registry lifecycle](#registry-lifecycle) — composite declaration, card blob, idempotency
 - [Bifrost design](./bifrost-design.md) — OLAP warehouse: tables, Scribe ingest, Oracle admission, Forge, public surface
@@ -46,7 +46,7 @@ Its primary product outcome is verification: evaluating observed behavior
 against declared expectations for exact, versioned system components. Assurance
 is the confidence supported by durable evidence that makes those judgments
 attributable, reproducible, governable, and auditable. Cards, observations,
-lineage, policy, audit, and analytical storage are the verification substrate,
+lineage, audit, and analytical storage are the verification substrate,
 not a passive integration or inventory product.
 
 Wyrd does not become the user's application runtime, training framework,
@@ -64,13 +64,13 @@ Cards and Specs declare the system
   -> Runs and Observations record measured behavior
   -> Verifiers produce judgments
   -> Bifrost, lineage, and audit preserve the evidence
-  -> Policy governs decisions and Operators react
+  -> Operators react
 ```
 
 | Term | Meaning |
 |---|---|
 | Verification | Evaluating observed behavior against declared criteria and producing a judgment. |
-| Assurance | Confidence supported by durable verification evidence, provenance, policy decisions, and audit history. |
+| Assurance | Confidence supported by durable verification evidence, provenance, and audit history. |
 | Observation | A measured fact. An observation is evidence, not a judgment. |
 | Verifier | A reusable, subject-less declaration that interprets observations and produces judgments. |
 
@@ -93,50 +93,41 @@ services.
    reusable Verifier Card to that exact owner version and subject occurrence.
    Runtime observations supply subject identity; the binding supplies the
    Verifier, Trigger activation, and optional failure Operators.
-4. **Reactions are Operators; activation is Triggers.** Verifier/Policy never
+4. **Reactions are Operators; activation is Triggers.** Verifiers never
    inline reaction logic.
 5. **Service composes deployment and subscription wiring, not monitor
-   definitions.** Verifier/Trigger/Operator/Audit/Source are peer cards, not
+   definitions.** Verifier/Trigger/Operator/Audit are peer cards, not
    Service components; component verification bindings point to those peers.
-6. **Enforcement is composed at the enforcing surface.** Service
-   composes Policy for runtime gates.
-7. **Native observation first; external data by reading only.** AI services
-   record runtime behavior through Wyrd's native observation system
-   (`wyrd.observe` → `vala`, linked to declared cards) — this is the
-   primary path. When data already lives in an external system (Prometheus,
-   Snowflake, object storage), `Source` cards let Wyrd query it. Wyrd never
-   writes to external data stores and never requires external systems to push
-   data in.
-8. **Lineage is server-derived.** Derived from `*_refs`. Never authored. Never edited.
-9. **Status is server-managed.** Authors never write `status:`.
-10. **Every cross-card pointer is a `CardRef`.** No string-typed parents or
+6. **Lineage is server-derived.** Derived from `*_refs`. Never authored. Never edited.
+7. **Status is server-managed.** Authors never write `status:`.
+8. **Every cross-card pointer is a `CardRef`.** No string-typed parents or
     path-typed lookups in the protocol. Co-location is expressed by the
     deployment directory, not by a path field on any card.
-11. **Sub-agency is a relationship, not a noun.** An Agent invoking another
+9. **Sub-agency is a relationship, not a noun.** An Agent invoking another
     Agent is the sub-agent call. The callee is an `AgentCard`. The caller's
     prompt / runtime expresses the invocation. No `SubAgent` kind.
-12. **Tools are runtime names, not cards.** `AgentSpec.tool_names: Vec<String>`
+10. **Tools are runtime names, not cards.** `AgentSpec.tool_names: Vec<String>`
     resolves through the runtime tool registry. MCP servers auto-register
     their tools by name; host tools register themselves. No `Tool` kind.
-13. **No event vocabulary on the wire.** Evidence comes from typed Verifier input slots;
+11. **No event vocabulary on the wire.** Evidence comes from typed Verifier input slots;
     "activation" comes from the closed `TriggerSpec` activation. Free-form
     event-name strings are doctrine drift.
-14. **Host config stays off Cards.** Permission modes,
+12. **Host config stays off Cards.** Permission modes,
     sandboxes, isolation, effort, and per-CLI compatibility are properties of
     the host that runs the Agent, not of the Agent contract.
-15. **Verifiers are pure judgment producers.** A Verifier declares its evidence,
+13. **Verifiers are pure judgment producers.** A Verifier declares its evidence,
     preparation, and requirements. It does not carry
     scheduling and they do not carry dispatch. Scheduling lives on
     `Trigger.schedule`. Dispatch lives on `Operator`. There is no `Alert`
     kind — alerting is an Operator with a notification adapter.
-16. **Heavy cards anchor lineage; light cards are spec-only.** Model, Data, and
+14. **Heavy cards anchor lineage; light cards are spec-only.** Model, Data, and
     Experiment carry durable artifact bytes and MUST be pre-declared before
     anything else can point at them — they're the lineage anchors. Every other
-    kind (Prompt, Agent, Verifier, Policy, Trigger, Operator, Source, Mcp,
-    Audit, Service) is spec-only: `wyrd declare file.yaml` reads
+    kind (Prompt, Agent, Verifier, Trigger, Operator, Mcp, Audit, Service)
+    is spec-only: `wyrd declare file.yaml` reads
     and declares in one move. No separate storage step, no programmatic
     declaration prerequisite.
-17. **Light cards may inline in place of a `CardRef`.** Wherever a spec slot
+15. **Light cards may inline in place of a `CardRef`.** Wherever a spec slot
     permits an embedded child, it uses `InlineableRef<T>`. Inline definitions
     have no card identity, are not declared standalone, and cannot be
     referenced from outside their parent. To reuse a child, declare it as a
@@ -146,7 +137,7 @@ services.
     Agent's tenant, versioned on its own registry line, and persists the Agent
     with that Card's exact UID-bearing reference. Identical inline content in
     differently named Agents is never shared.
-18. **Auth and Policy are two distinct planes.** Emit is **not** a third
+16. **Auth is the only authorization plane.** Emit is **not** a second
     plane: a deployed service's observation/ingest writes are ordinary
     Auth-plane routes, authorized by the same JWT and a
     `Permission { resource, action, scope }` like every other call. The legacy
@@ -157,9 +148,9 @@ services.
     declared in that root's spec. A card
     enters the scope only if its kind is an observation target — a kind a client
     (`wyrd.observer`, Bifrost, drift samples) attributes records to: `Data`,
-    `Model`, `Experiment`, `Prompt`, `Agent`, `Service`, `Mcp`, `Artifact`,
-    `Source`. `Verifier` and control-plane kinds (`Policy`,
-    `Audit`, `Operator`, `Trigger`) may be referenced for governance or
+    `Model`, `Experiment`, `Prompt`, `Agent`, `Service`, `Mcp`, `Artifact`.
+    `Verifier` and control-plane kinds (`Audit`, `Operator`, `Trigger`)
+    may be referenced for governance or
     verification but never enter the emit scope. A Service root therefore
     includes declared `Service.components` and their reachable observation targets.
     Workload roots are Services only; Agents remain component subjects. Every token mint — including the re-exchange a machine performs
@@ -181,16 +172,10 @@ services.
       other route. Wyrd RBAC is the standard operation/object model: `resource`
       and `action` name the operation and the typed `PermissionScope` names the
       objects, so a static role grant over one Bifrost schema or table is still
-      RBAC and never enters the Policy plane. The rejected legacy vocabulary was
+      RBAC. The rejected legacy vocabulary was
       a free-form OAuth-style `Scope` *string*; a typed closed object scope
       inside `Permission` is the sanctioned model — see
       [Permission model](wyrd-security-posture.md#permission-model).
-    - **Policy** gates card states (`classify` at declare-time, `gate` at
-      deploy-time). There is no runtime cross-service invoke gate: the
-      `PolicyAction::Invoke` enum member and the `POST /v1/authz/check`
-      runtime evaluation surface it referenced were removed and have no
-      replacement in this design.
-
     Runtime identity is a `Principal { id: PrincipalId, kind: PrincipalKind,
     tenant_id, roles, effective_permissions, credential_id, card_access,
     workload_uid }`. `PrincipalId`
@@ -385,7 +370,7 @@ and ingest clients or implement their own HTTP or gRPC transports.
 
 ## Kind catalog
 
-Wyrd registers 14 native Card kinds. `CardKind::External` is a non-registrable
+Wyrd registers 12 native Card kinds. `CardKind::External` is a non-registrable
 discriminator used when reading foreign or unknown kind metadata. The foreign
 payload remains opaque and source-specific; it is not a Wyrd Card. There is no
 `ExternalSpec` and no External Card declaration path.
@@ -395,8 +380,8 @@ payload remains opaque and source-specific; it is not a Wyrd Card. There is no
 | Data plane    | Data, Model, Artifact, Experiment |
 | Agent plane   | Prompt, Agent, Mcp |
 | Composition   | Service |
-| Governance    | Policy, Audit |
-| Observability | Verifier, Source |
+| Governance    | Audit |
+| Observability | Verifier |
 | Reaction      | Trigger, Operator |
 
 `Tool` (a Skald runtime registry name), `SubAgent` (an Agent-to-Agent
@@ -406,7 +391,7 @@ Every Card uses one envelope: `apiVersion: wyrd/v1`, `metadata`, `kind`,
 `spec`, server-derived `relationships`, and server-managed `status`. There is
 no outer `kind: Card` wrapper and no `spec.type` discriminator.
 `metadata.labels` are short indexed classification fields that humans,
-agents, policy, and inventory views filter on; `metadata.annotations` carry
+agents, and inventory views filter on; `metadata.annotations` carry
 longer descriptive context that travels with the Card but is not indexed.
 `tags` are not part of the public metadata contract.
 
@@ -425,7 +410,7 @@ longer descriptive context that travels with the Card but is not indexed.
 - Live runtime objects in specs, untyped strings where Wyrd has a domain type,
   or runtime plugins where a closed enum is the real contract.
 - Public event-shaped payloads where `card`, `run`, `observation`,
-  `relationship`, `status`, `policy`, or `audit` names the concept.
+  `relationship`, `status`, or `audit` names the concept.
 - Hidden side effects during local Card construction.
 
 ---
@@ -552,8 +537,7 @@ Agent's own `<agent-name>-prompt` Prompt Card (doctrine 17).
 
 ### Agent
 Agent contract: prompt + tools + run config. Tool names resolve through the
-runtime tool registry (host tools + MCP server registrations). Approval,
-per-tool blocks, and hook gates live on `Policy`, not here.
+runtime tool registry (host tools + MCP server registrations).
 ```yaml
 spec:
   prompt: InlineableRef<Prompt>  # Ref (→ Prompt), authored Path, or inline Prompt
@@ -608,7 +592,7 @@ spec:
 
 ### Service
 Runtime composition for deployment. **Components are runtime-aliased only.**
-Verifier/Trigger/Operator/Audit/Source are peer cards in the deployment
+Verifier/Trigger/Operator/Audit are peer cards in the deployment
 directory, not Service components.
 ```yaml
 spec:
@@ -622,42 +606,6 @@ spec:
 
 Identity is derived from the Service's `card_ref` and bound on first deploy
 contact — no `service_account` field on the spec. See "Runtime identity".
-
-### Policy
-Declarative governance rules. CEL-evaluated. Three lifecycle phases share one
-rule shape; the `action` field on each rule says when it fires:
-
-  - `classify` (declare-time): rule derives attrs onto the card (e.g.
-                                `risk.tier = "high"`). Never blocks.
-  - `gate`     (deploy-time):   rule allows/denies the card's deploy-time
-                                deployment, and thus its emit eligibility.
-                                Blocks when Deny.
-  - `invoke`   (runtime, per cross-service call): declared but unenforced.
-                                The runtime evaluation surface this action
-                                referenced (`POST /v1/authz/check`) was
-                                removed with no replacement gate.
-
-Composition: `org_global ∪ service_local`, deny-overrides. Service-local can
-only tighten. CEL parse and evaluation are owned by the Policy engine;
-`wyrd-spec` enforces only `CelExpression` transport invariants
-(non-empty, ≤4096 chars, no control chars).
-
-```yaml
-spec:
-  description?: string
-  rules: [PolicyRule]            # { name, expression: CelExpression, action: PolicyAction, metadata }
-  enforcement?: Enforcement       # active | inert. Default: active.
-  scope: PolicyScope              # org_global | service_local. Default: service_local.
-  target?: PolicyTarget           # selector for org_global; absent for service_local
-  details: { string: NonSecretValue }
-```
-
-Closed enums:
-- `PolicyAction = Classify | Gate | Invoke`
-- `Enforcement = Active | Inert`
-- `PolicyScope = OrgGlobal | ServiceLocal`
-- `PolicyTarget = { kinds: [CardKind], actions: [PolicyAction] }`
-- `PolicyDecision = Allow | Deny { reason: string }`
 
 ### Runtime identity
 
@@ -1214,8 +1162,8 @@ Consequences, stated so they stop drifting:
   **observation-target** cards reachable through the transitive card-ref graph
   declared in that root's spec. A card is in scope only if its kind is an
   observation target (`Data`, `Model`, `Experiment`, `Prompt`, `Agent`,
-  `Service`, `Mcp`, `Artifact`, `Source`); `Verifier` and
-  control-plane kinds (`Policy`, `Audit`, `Operator`, `Trigger`) never enter the
+  `Service`, `Mcp`, `Artifact`); `Verifier` and
+  control-plane kinds (`Audit`, `Operator`, `Trigger`) never enter the
   emit scope. Service cards contribute `Service.components`; other reachable
   specs contribute their declared card refs according to the shared card-ref
   extraction rules. A `card_uid` outside that set is rejected: a principal may
@@ -1979,88 +1927,10 @@ requirement ID. Existing threshold, minimum-sample, baseline-readiness, and
 insufficient-data rules apply; per-feature statistics, thresholds, counts,
 flags, and window identity are in the requirement `detail`.
 
-### Source
-Read-side reference to an external data system. **Wyrd reads, never writes.**
-
-`source` is a **read-shape bucket**, not a vendor. The top-level discriminator is
-the shape of data a consuming Verifier check sees — a row set, a time
-series, blobs — so a consumer binds to the shape and never to a vendor. The
-vendor (BigQuery vs Snowflake, Prometheus vs Datadog, GCS vs S3) is a
-**connection detail nested below the bucket**. This is the same axis `object_store`
-already used: `source.kind` was never `gcs` or `s3`; the vendor was the URI scheme.
-
-The bucket set is derived from what consumers read, not from a vendor taxonomy —
-which keeps it small, closed, and stable (Doctrine #2). Adding a vendor is a new
-`*Connection` variant plus a runtime read adapter in `vala`; it never grows the
-bucket set and never touches a consuming Card.
-
-```yaml
-spec:
-  description?: string
-  source:                         # SourceKind — the read-shape bucket; vendor nested below
-    kind: <bucket>
-  defaults: { string: NonSecretValue }   # non-secret read hints (projection, page size)
-```
-
-`SourceKind` is a closed tagged union keyed by **bucket** (`kind` discriminator).
-Each bucket carries one uniform read contract; the vendor is a nested
-`*Connection` union keyed by `vendor`:
-
-| Bucket (`kind`)  | Read contract (uniform within bucket) | Vendor union (`vendor`)                 |
-|------------------|---------------------------------------|------------------------------------------|
-| `object_store`   | blobs at `uri` → records by `format`  | URI scheme (`gs://`/`s3://`/`az://`/`file://`) |
-| `sql_warehouse`  | SQL → row set                         | `bigquery` \| `snowflake` \| `postgres`  |
-| `metrics`        | query → labeled time series           | `prometheus` \| `datadog` \| `cloudwatch`|
-| `logs`           | query → log records                   | `loki` \| `elasticsearch` \| `splunk`    |
-| `traces`         | query → spans                         | `tempo` \| `datadog_apm` \| `jaeger`     |
-
-The bucket set lines up with what Verifier checks already read:
-`object_store`/`sql_warehouse` feed `DriftSignal::Distribution` (rows),
-`metrics` feeds `DriftSignal::Metric`, `traces` feeds `trace` checks.
-
-**Secrets never live on the Card** (Doctrine #7). Every vendor connection carries
-a `SourceAuth` whose secret material is a **named server-side env var**, resolved
-at read time — only the env-var *name* is on the Card, exactly like
-`Operator.Http.auth.env`. `SourceAuth` is a closed tagged union (`scheme`
-discriminator): `None`, `Env { env }`, `Basic { username, password_env }`,
-`MultiEnv { vars: { logical_name: env_var } }` (covers multi-key vendors like
-Datadog's api-key + app-key), `SecretStore { provider, name }` (Vault / AWS SSM /
-GCP Secret Manager — carries the store identifier and secret path, never the value).
-
-```yaml
-# sql_warehouse — vendor + non-secret coordinates + env ref for the secret
-source:
-  kind: sql_warehouse
-  connection:
-    vendor: snowflake
-    account: acme-prod
-    warehouse: analytics
-    database: telemetry
-    schema: public
-    role: reader
-    auth:
-      scheme: multi_env
-      vars:
-        user: SNOWFLAKE_USER
-        private_key: SNOWFLAKE_PRIVATE_KEY   # names only; never values
-
-# object_store — vendor implied by URI scheme; auth defaults to None (ambient IAM)
-source:
-  kind: object_store
-  uri: gs://acme-telemetry/runs
-  format: parquet
-```
-
-**Runtime read adapter.** `vala` owns the read driver, keyed on
-`(kind, vendor)`. The three connection families (object/blob list-and-read, SQL
-query, HTTP query) are different drivers behind one read trait; the Card schema
-never declares strategy — `vala` chooses it from the bucket and vendor, the same
-way it chooses a drift check's evaluation strategy.
-
 ### Bifrost
 
 Bifrost is Wyrd's public OLAP warehouse surface and the analytical substrate
-used by Vala. It is server state, not a Card kind, external Source, deployment
+used by Vala. It is server state, not a Card kind, deployment
 role, or client-side runtime. Its physical analytical identity is
 `(tenant, logical table)`; there are no shared physical analytical tables.
 
@@ -2164,8 +2034,7 @@ flushes it before its dependencies close. A hard kill loses
 only unwritten requests, and every loss the process observes is counted and
 logged.
 
-External pushes are deliberately not an activation — Rule 7 ("Wyrd reads, it
-does not push") means external data enters through a `Source`.
+External pushes are deliberately not an activation.
 
 ### Operator
 A failure reaction. Performs exactly one action — a typed notification or a
@@ -2446,7 +2315,7 @@ one move, and reference slots accept `Ref` or `InlineableRef<T>`. A path string 
 loader-only authoring syntax projected to a Ref/Sibling before send; inline
 is available only at `InlineableRef<T>` slots.
 
-### Pre-declaration matrix (Rule 16)
+### Pre-declaration matrix (Rule 14)
 
 | Kind | Must pre-declare? | Why |
 |------|---------------------|-----|
@@ -2456,7 +2325,7 @@ is available only at `InlineableRef<T>` slots.
 | `Artifact`     | **Yes** (typically derived from heavy cards) | Pointer to durable bytes. |
 | `Prompt`       | Optional | Light. Inlineable as `InlineableRef<Prompt>` inside `Agent.prompt`; declaration materializes it as `<agent-name>-prompt`. |
 | `Agent`        | Optional | Light. Spec-only; `wyrd declare` declares it. Verifier `agent` actions and checks take `InlineableRef<AgentSpec>`. |
-| `Verifier`, `Policy`, `Trigger`, `Operator`, `Source`, `Mcp`, `Audit`, `Service` | Optional | Light. Spec-only; `wyrd declare` declares each card as it's read. |
+| `Verifier`, `Trigger`, `Operator`, `Mcp`, `Audit`, `Service` | Optional | Light. Spec-only; `wyrd declare` declares each card as it's read. |
 
 A single YAML file may contain many `---`-separated card documents — `wyrd
 declare verification-suite.yaml` declares all of them in dependency order. The Agent
@@ -2611,9 +2480,6 @@ domain = "customer"
 # Per-kind override; PascalCase keys match CardKind serialization.
 [kind.Model.annotations]
 "acme.com/owner" = "ml-platform"
-
-[kind.Policy.labels]
-tier = "governance"
 ```
 
 - Defaultable fields: `labels`, `annotations`. `space` is not a field and
@@ -2686,12 +2552,10 @@ foreign-card content pinning are not supported workflows.
 | Verifier| `agent` actions and checks, `code` Artifact sources, drift `signal.baseline_ref` | `*.verified_by[].verifier` |
 | Audit   | `subject_refs`, `query` (roots), `lineage` (nodes), `investigator` (Agent variant) | — |
 | Service | `components[].ref`, `components[].verified_by`, `verified_by` | — |
-| Policy  | `rules`                              | `Service.components.ref` |
 | Trigger | `schedule` activation | `*.verified_by[].runs_on` |
 | Operator| `action` (typed `channel` shape \| tenant connection) | `*.verified_by[].on_failure` |
-| Source  | `kind` (bucket), `connection` (vendor + `*_env`) | — |
 
-`Service.components` accepts: Agent, Prompt, Model, Mcp, Policy. No
+`Service.components` accepts: Agent, Prompt, Model, Mcp. No
 other kinds are runtime-aliased into a Service.
 
 ---
@@ -2703,9 +2567,6 @@ A deployment is a folder. `wyrd declare <dir>` declares every card.
 ```
 services/ops-copilot/
 ├── service.yaml                 # runtime composition only
-├── sources/
-│   ├── run-archive.yaml         # object_store Source — vala archive
-│   └── audit-log.yaml           # object_store Source — audit dump
 ├── agents/
 │   ├── incident-triage.yaml
 │   └── runbook-executor.yaml
@@ -2714,10 +2575,6 @@ services/ops-copilot/
 │   ├── runbook.yaml
 │   ├── judge-agent.yaml
 │   └── judge-prompt.yaml
-├── policies/
-│   ├── triage-policy.yaml
-│   ├── runbook-policy.yaml
-│   └── service-policy.yaml
 ├── observability/
 │   ├── triage-verifier.yaml       # agent steps and checks
 │   ├── runbook-verifier.yaml
@@ -2736,14 +2593,6 @@ services/ops-copilot/
 ## Decisions
 
 The following choices constrain every implementation:
-
-- **Source vendor read adapters.** `SourceKind` is a closed, bucket-keyed tagged
-  union (`object_store`, `sql_warehouse`, `metrics`, `logs`, `traces`); each
-  bucket nests a `vendor`-keyed `*Connection` union, and secrets are server-side
-  env-var names (`SourceAuth`), never card values. Adding a vendor is a new
-  `*Connection` variant plus a `vala` read adapter — no bucket or consumer churn.
-  Runtime uses the `vala` read trait keyed on `(kind, vendor)` and exposes the
-  connectivity preflight as `wyrd source check <ref>`.
 
 - **One declarative Verifier.** A Verifier is inputs, steps, requirements,
   and decide; drift and agent judging are check kinds, not Verifier kinds.

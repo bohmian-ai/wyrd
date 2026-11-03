@@ -184,6 +184,10 @@ impl ReadinessSnapshot {
 }
 
 /// Background readiness publisher. Runs every `tick` until `shutdown` fires.
+///
+/// `/readyz` answers 503 quietly while not ready, so this loop owns the
+/// transition log: INFO when the process becomes ready and WARN, with the
+/// failing checks, when a ready process loses readiness.
 #[tracing::instrument(skip(state, shutdown))]
 pub async fn readiness_loop(
     state: AppState,
@@ -193,11 +197,24 @@ pub async fn readiness_loop(
 ) {
     loop {
         let snapshot = compute_snapshot(&state, probe_timeout).await;
+        log_transition(&state.health.readiness.load(), &snapshot);
         state.health.readiness.store(Arc::new(snapshot));
         tokio::select! {
             () = shutdown.cancelled() => return,
             () = tokio::time::sleep(tick) => {}
         }
+    }
+}
+
+/// Logs a readiness change between the published `previous` snapshot and `next`.
+fn log_transition(previous: &ReadinessSnapshot, next: &ReadinessSnapshot) {
+    match (previous.all_ok(), next.all_ok()) {
+        (false, true) => tracing::info!("server is ready"),
+        (true, false) => tracing::warn!(
+            checks = %serde_json::json!(PublicReadinessReport::from_snapshot(next, "not_ready").checks),
+            "server lost readiness"
+        ),
+        _ => {}
     }
 }
 
@@ -652,6 +669,29 @@ mod tests {
             verification: None,
             scribe_fault_is_role_local: false,
         }
+    }
+
+    /// Becoming ready logs INFO, losing readiness logs WARN with the failing
+    /// checks, and staying unready logs nothing.
+    ///
+    /// # Panics
+    /// Panics when a transition logs at the wrong level, omits the failing
+    /// checks, or staying unready logs anything.
+    #[test]
+    fn readiness_transitions_are_logged() {
+        let logs = wyrd_testing::logs::LogCapture::install();
+
+        log_transition(&ReadinessSnapshot::initial(), &ReadinessSnapshot::initial());
+        assert_eq!(logs.text(), "");
+
+        log_transition(&ReadinessSnapshot::initial(), &all_ok_snapshot());
+        assert!(logs.text().contains("INFO"), "{}", logs.text());
+
+        log_transition(&all_ok_snapshot(), &failing_snapshot());
+        let text = logs.text();
+        assert!(text.contains("WARN"), "{text}");
+        assert!(text.contains("server lost readiness"), "{text}");
+        assert!(text.contains("pool_acquire"), "{text}");
     }
 
     #[test]

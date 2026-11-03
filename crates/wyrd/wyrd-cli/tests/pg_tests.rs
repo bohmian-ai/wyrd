@@ -562,6 +562,17 @@ async fn init_first_run_is_client_ready() {
     assert_eq!(ready["ui"], format!("http://{}", local.ui));
     assert_eq!(ready["log"], log.to_str().expect("UTF-8 log"));
     assert_eq!(ready["mcp"], serde_json::Value::Null);
+    assert_eq!(
+        ready["gateway"],
+        "not configured: configure it later with wyrd gateway deployment put --file"
+    );
+    let startup = fs::read_to_string(&log).expect("diagnostic log");
+    assert!(
+        !startup
+            .lines()
+            .any(|line| line.contains("ERROR") && line.contains("/readyz")),
+        "startup readiness polls log no ERROR: {startup}"
+    );
     let global = GlobalConfig::load_in(&local.environment()).expect("saved config");
     let dev = &global.dev;
     assert_eq!(dev.tenant.as_deref(), Some("local"));
@@ -1319,7 +1330,7 @@ async fn init_saved_settings_survive_working_directory_change() {
     assert_eq!(card.metadata.name.as_str(), "ask-prompt");
     assert!(!elsewhere.path().join(".wyrd").exists());
     let output = local.stop("-INT").await;
-    assert!(output.contains("Gateway: skipped"), "{output}");
+    assert!(output.contains("[not configured] Gateway: "), "{output}");
 
     // A listener override of the same deployment is accepted: the saved key
     // authenticates against the newly selected listener, which is resaved.
@@ -1924,7 +1935,14 @@ async fn init_keeps_the_gateway_managed_secret_key() {
             assert_eq!(status.as_u16(), 200, "{source} {run}: {body}");
             assert!(body.contains("chatcmpl-local"), "{source} {run}: {body}");
             printed.push_str(&body);
-            printed.push_str(&local.stop("-INT").await);
+            let stopped = local.stop("-INT").await;
+            if run == "rerun" {
+                assert!(
+                    stopped.contains("[configured] Gateway: local-mock (existing)"),
+                    "{source} {run}: {stopped}"
+                );
+            }
+            printed.push_str(&stopped);
         }
         assert_eq!(fs::read(&credentials).expect("credentials"), saved);
 

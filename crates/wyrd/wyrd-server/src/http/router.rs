@@ -8,6 +8,10 @@ use axum::extract::Request;
 use axum::middleware;
 use tower::ServiceBuilder;
 use tower_http::catch_panic::CatchPanicLayer;
+use tower_http::classify::{
+    ClassifiedResponse, ClassifyResponse, MakeClassifier, NeverClassifyEos, ServerErrorsAsFailures,
+    ServerErrorsFailureClass,
+};
 use tower_http::trace::{DefaultOnResponse, OnResponse as _, TraceLayer};
 use tracing::Span;
 use utoipa::{Modify, OpenApi};
@@ -142,7 +146,7 @@ pub fn build_router(state: AppState) -> Router {
 
     let protected = apply_protected_edge(routed.merge(mcp_route), &state);
 
-    Router::new()
+    let router = Router::new()
         .merge(unprotected)
         .route(
             "/openapi.json",
@@ -158,14 +162,22 @@ pub fn build_router(state: AppState) -> Router {
         ))
         .layer(axum::middleware::from_fn(
             crate::http::middleware::trace_context::attach_trace_context,
-        ))
-        .layer(
-            TraceLayer::new_for_http()
-                .make_span_with(move |request: &Request| {
-                    request_span(request, tenant_spans.as_ref())
-                })
-                .on_response(record_response),
-        )
+        ));
+    traced(router, tenant_spans)
+}
+
+/// Wraps `router` in the per-request trace span and response log.
+///
+/// A 5xx response or a handler error logs as a request failure at ERROR,
+/// except a not-ready `/readyz`, whose 503 is the probe's expected answer
+/// while dependencies start; readiness transitions are logged by the
+/// readiness loop instead.
+fn traced(router: Router, tenant_spans: Option<Arc<dyn wyrd_telemetry::TenantSpanSink>>) -> Router {
+    router.layer(
+        TraceLayer::new(RequestFailures::default())
+            .make_span_with(move |request: &Request| request_span(request, tenant_spans.as_ref()))
+            .on_response(record_response),
+    )
 }
 
 /// Opens the SERVER span of one HTTP request.
@@ -209,6 +221,52 @@ pub(crate) fn request_span(
     );
     wyrd_telemetry::timing::label_request(&span, request.headers());
     span
+}
+
+/// Classifies request outcomes for the trace layer's failure log.
+///
+/// As a [`MakeClassifier`] it marks a `/readyz` request; as the per-request
+/// [`ClassifyResponse`] it treats that request's 503 as a successful probe
+/// answer and classifies everything else as [`ServerErrorsAsFailures`] does.
+#[derive(Clone, Copy, Default)]
+struct RequestFailures {
+    /// Whether the request is the readiness probe.
+    readiness_probe: bool,
+}
+
+impl MakeClassifier for RequestFailures {
+    type Classifier = Self;
+    type FailureClass = ServerErrorsFailureClass;
+    type ClassifyEos = NeverClassifyEos<ServerErrorsFailureClass>;
+
+    /// The classifier for one request, marked when it targets `/readyz`.
+    fn make_classifier<B>(&self, request: &axum::http::Request<B>) -> Self {
+        Self {
+            readiness_probe: request.uri().path() == "/readyz",
+        }
+    }
+}
+
+impl ClassifyResponse for RequestFailures {
+    type FailureClass = ServerErrorsFailureClass;
+    type ClassifyEos = NeverClassifyEos<ServerErrorsFailureClass>;
+
+    /// A readiness 503 succeeds; any other response is classified by status.
+    fn classify_response<B>(
+        self,
+        response: &axum::http::Response<B>,
+    ) -> ClassifiedResponse<Self::FailureClass, Self::ClassifyEos> {
+        if self.readiness_probe && response.status() == axum::http::StatusCode::SERVICE_UNAVAILABLE
+        {
+            return ClassifiedResponse::Ready(Ok(()));
+        }
+        ServerErrorsAsFailures::new().classify_response(response)
+    }
+
+    /// A handler error is always a failure.
+    fn classify_error<E: std::fmt::Display + 'static>(self, error: &E) -> Self::FailureClass {
+        ServerErrorsAsFailures::new().classify_error(error)
+    }
 }
 
 /// Records the response status on the request span, then logs the response
@@ -299,4 +357,63 @@ async fn v1_not_found(
         details: serde_json::json!({ "path": request.uri().path() }),
     }
     .into())
+}
+
+#[cfg(test)]
+mod tests {
+    //! Request trace failure logging.
+
+    use axum::body::Body;
+    use axum::http::StatusCode;
+    use axum::routing::get;
+    use tower::ServiceExt as _;
+
+    use super::*;
+    use wyrd_testing::logs::LogCapture;
+
+    /// Send `GET path` through `router` and return the response status.
+    ///
+    /// # Panics
+    /// Panics when the request cannot be built or the router fails.
+    async fn status_of(router: &Router, path: &str) -> StatusCode {
+        let request = Request::get(path).body(Body::empty()).expect("request");
+        router
+            .clone()
+            .oneshot(request)
+            .await
+            .expect("router")
+            .status()
+    }
+
+    /// A not-ready `/readyz` 503 is the probe's answer, logged below ERROR,
+    /// while the same 503 from any other route still logs as a failure.
+    ///
+    /// # Panics
+    /// Panics when the readiness 503 logs at ERROR or the control does not.
+    #[tokio::test]
+    async fn readiness_503_is_not_logged_as_a_failure() {
+        let unavailable = || async { StatusCode::SERVICE_UNAVAILABLE };
+        let router = traced(
+            Router::new()
+                .route("/readyz", get(unavailable))
+                .route("/v1/cards", get(unavailable)),
+            None,
+        );
+        let logs = LogCapture::install();
+
+        assert_eq!(
+            status_of(&router, "/readyz").await,
+            StatusCode::SERVICE_UNAVAILABLE
+        );
+        let readiness = logs.text();
+        assert!(!readiness.contains("ERROR"), "{readiness}");
+        assert!(readiness.contains("DEBUG"), "{readiness}");
+
+        assert_eq!(
+            status_of(&router, "/v1/cards").await,
+            StatusCode::SERVICE_UNAVAILABLE
+        );
+        let control = logs.text();
+        assert!(control.contains("ERROR"), "{control}");
+    }
 }

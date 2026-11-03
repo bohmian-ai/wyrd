@@ -660,7 +660,7 @@ pub enum Check {
     },
     /// Trace assertion over a trace slot.
     Trace(TraceCheck),
-    /// A tool-less Agent returning the Verdict schema.
+    /// An Agent, with any tools it declares, returning the Verdict schema.
     Agent(AgentCall),
     /// Sandboxed code returning the Verdict schema.
     Code(CodeCheck),

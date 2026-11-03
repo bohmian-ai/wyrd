@@ -40,8 +40,8 @@ const kindByStatus: Record<number, ProblemKind> = {
 /** Map a Wyrd problem response to a known safe problem kind: by code, then by status. */
 export async function problemKind(response: Response): Promise<ProblemKind> {
   const known = safeProblem(await response.json().catch(() => null));
-  const byCode = Object.entries(kindByStatus).find(
-    ([, kind]) => problem(kind).code === known.code
-  )?.[1];
+  const byCode = (Object.keys(examples) as ProblemKind[]).find(
+    (kind) => kind !== 'internal' && problem(kind).code === known.code
+  );
   return byCode ?? kindByStatus[response.status] ?? 'upstream';
 }

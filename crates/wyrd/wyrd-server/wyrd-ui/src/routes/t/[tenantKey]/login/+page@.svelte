@@ -1,83 +1,24 @@
 <script lang="ts">
+  import Entry from '$lib/Entry.svelte';
   import type { PageProps } from './$types';
-  import logo from '../../../../../brand/logo.svg?inline';
   let { data, form }: PageProps = $props();
-  let issue = $derived(form?.problem ?? data.problem);
+  const tenant = $derived(encodeURIComponent(data.tenant.key));
 </script>
 
 <svelte:head><title>Sign in · {data.tenant.key} · Wyrd</title></svelte:head>
-<main class="entry">
-  <div class="card">
-    <header>
-      <img src={logo} alt="" width="28" height="28" /><span class="wordmark">Wyrd</span>
-      <span class="product">WYRD</span>
-    </header>
-    <h1>Sign in to {data.tenant.key}</h1>
-    {#if issue}
-      <div role="alert">
-        <div class="app-problem" data-state={issue.status >= 500 ? 'error' : 'unauthorized'}>
-          <strong>{issue.status >= 500 ? '✕ Sign-in unavailable' : `⊘ ${issue.title}`}</strong>
-          <p>{issue.status >= 500 ? 'Please try again later.' : issue.remediation}</p>
-          <code>{issue.code}</code>
-        </div>
-      </div>
-    {/if}
-    {#if !issue || issue.status < 500}
-      <form method="POST" action="?/sso"><button class="app-control primary wide" type="submit">Sign in with SSO</button></form>
-    {/if}
-    <a class="recovery" href="/t/{encodeURIComponent(data.tenant.key)}/login/api-key">Sign in with an API key</a>
-  </div>
-</main>
-
-<style>
-  .entry {
-    min-height: 100dvh;
-    display: grid;
-    grid-template-columns: minmax(0, 1fr);
-    place-items: center;
-    padding: 64px 24px;
-    background: var(--bg);
-  }
-  .card {
-    width: 100%;
-    max-width: 420px;
-    display: grid;
-    gap: 20px;
-    padding: 32px;
-    background: var(--surface);
-    border: 2px solid var(--border);
-    border-top: 4px solid var(--declare);
-    border-radius: var(--r);
-  }
-  header {
-    display: flex;
-    align-items: center;
-    justify-content: center;
-    gap: 10px;
-  }
-  .wordmark {
-    font: 600 18px var(--font-sans);
-  }
-  .product {
-    font: var(--weight-strong) 10px var(--font-mono);
-    border: 2px solid var(--border);
-    border-radius: var(--r);
-    padding: 4px 12px;
-    background: var(--declare);
-    color: var(--declare-ink);
-  }
-  h1 {
-    font: var(--weight-strong) 24px var(--font-sans);
-    text-align: center;
-    overflow-wrap: anywhere;
-  }
-  .recovery {
-    justify-self: center;
-    font: 12px var(--font-sans);
-    color: var(--muted);
-  }
-  .wide {
-    width: 100%;
-    padding: 12px 16px;
-  }
-</style>
+<Entry heading="Sign in to {data.tenant.key}" issue={form?.problem ?? data.problem}>
+  {#if data.reset}<p role="status">Password set. Sign in with your new password.</p>{/if}
+  <form class="fields" method="POST" action="?/password">
+    <label for="username">Username</label>
+    <input id="username" class="app-input" name="username" required autocomplete="username" value={form && 'username' in form ? form.username : ''} />
+    <label for="password">Password</label>
+    <input id="password" class="app-input" type="password" name="password" required autocomplete="current-password" />
+    <button class="app-control primary wide" type="submit">Sign in</button>
+  </form>
+  <form method="POST" action="?/sso"><button class="app-control wide" type="submit">Sign in with SSO</button></form>
+  <nav class="links" aria-label="Other sign-in">
+    <a href="/t/{tenant}/signup">Sign up with an invitation</a>
+    <a href="/t/{tenant}/reset">Reset with a code</a>
+    <a class="recovery" href="/t/{tenant}/login/api-key">Sign in with an API key</a>
+  </nav>
+</Entry>

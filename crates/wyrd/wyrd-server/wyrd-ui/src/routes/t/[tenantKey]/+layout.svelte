@@ -89,6 +89,7 @@
               {/each}
             </form>
           {/if}
+          <a class="app-control" href={`${base}/settings/account`}>Account</a>
           <button class="app-control" type="button" onclick={toggleMode} aria-label={`Switch to ${theme.mode === 'dark' ? 'light' : 'dark'} mode`}>◐ {theme.mode === 'dark' ? 'Light' : 'Dark'} mode</button>
           <form method="POST" action="/?/logout">
             <input type="hidden" name="tenantKey" value={data.tenant.key} />

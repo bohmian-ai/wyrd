@@ -44,6 +44,42 @@
     "title": "Resource not found",
     "type": "https://wyrd.dev/problems/WYRD_SPEC_404_NOT_FOUND"
   },
+  "oneTimeCodeInvalid": {
+    "code": "WYRD_AUTH_401_ONE_TIME_CODE_INVALID",
+    "detail": "One-time code not accepted",
+    "details": {},
+    "remediation": "Ask a tenant administrator for a new invitation or reset code; each code is single-use and expires.",
+    "status": 401,
+    "title": "One-time code not accepted",
+    "type": "https://wyrd.dev/problems/WYRD_AUTH_401_ONE_TIME_CODE_INVALID"
+  },
+  "passwordAttempts": {
+    "code": "WYRD_AUTH_429_PASSWORD_ATTEMPTS",
+    "detail": "Too many password attempts",
+    "details": {},
+    "remediation": "Wait `details.retry_after_seconds` until the fixed attempt window ends, then try again.",
+    "status": 429,
+    "title": "Too many password attempts",
+    "type": "https://wyrd.dev/problems/WYRD_AUTH_429_PASSWORD_ATTEMPTS"
+  },
+  "passwordInvalid": {
+    "code": "WYRD_AUTH_401_PASSWORD_INVALID",
+    "detail": "Username or password not accepted",
+    "details": {},
+    "remediation": "Check the tenant, username and password and try again; a forgotten password is reset with a code from a tenant administrator.",
+    "status": 401,
+    "title": "Username or password not accepted",
+    "type": "https://wyrd.dev/problems/WYRD_AUTH_401_PASSWORD_INVALID"
+  },
+  "recentLogin": {
+    "code": "WYRD_AUTH_403_RECENT_LOGIN_REQUIRED",
+    "detail": "Recent sign-in required",
+    "details": {},
+    "remediation": "Sign in again with your password or SSO, then create the key within five minutes; an API key or recovery session cannot create one.",
+    "status": 403,
+    "title": "Recent sign-in required",
+    "type": "https://wyrd.dev/problems/WYRD_AUTH_403_RECENT_LOGIN_REQUIRED"
+  },
   "unauthenticated": {
     "code": "WYRD_AUTH_401_UNAUTHENTICATED",
     "detail": "Not authenticated",

@@ -4,6 +4,7 @@ use std::io::Write;
 use clap::{Args, Parser, Subcommand};
 use mimalloc::MiMalloc;
 use secrecy::{ExposeSecret, SecretString};
+use wyrd_auth::passwords::{canonical_username, create_local_user, hash_password, new_password};
 use wyrd_client::config::ClientConfig;
 use wyrd_client::transport::HttpConfig;
 use wyrd_client::{Platform, WyrdClient};
@@ -150,6 +151,13 @@ struct SetupArgs {
     /// Running Wyrd server that provisions the tenant through its platform API.
     #[arg(long, env = "WYRD_SERVER_URL", default_value = "http://127.0.0.1:8080")]
     server: String,
+    /// Also create this local password User holding the tenant `admin` Role;
+    /// refused when the username is already taken.
+    #[arg(long, requires = "local_password_stdin")]
+    local_user: Option<String>,
+    /// Read the local User's password from standard input.
+    #[arg(long, requires = "local_user")]
+    local_password_stdin: bool,
 }
 
 /// Run the binary as a Monty pool worker when the pool spawned it with
@@ -329,7 +337,11 @@ const PLATFORM_CREDENTIAL_ENV: &str = "WYRD_PLATFORM_CREDENTIAL";
 /// inside its transaction, and the tenant is provisioned through the running
 /// server's authenticated platform API, so authorization and audit are the
 /// same as for any platform client. An already-active tenant with the slug
-/// ends the command successfully without disclosing anything. When the root
+/// ends the command successfully without disclosing anything. With
+/// `--local-user` and `--local-password-stdin`, the password is checked
+/// before anything is provisioned, and a local password User holding the
+/// tenant `admin` Role is then created through the signup owner; a taken
+/// username is refused rather than overwritten. When the root
 /// already exists, the credential to act with comes from
 /// `WYRD_PLATFORM_CREDENTIAL`.
 ///
@@ -344,7 +356,9 @@ async fn setup(args: SetupArgs) -> Result<(), BootExit> {
         .tenant
         .parse()
         .map_err(|e| BootExit::Config(Box::new(e)))?;
-    let pool = operator_pool().await?;
+    let local_user = args.local_user.as_deref().map(local_user).transpose()?;
+    let postgres = postgres().await?;
+    let pool = operator_pool_of(&postgres)?;
     let existing = list_tenants(&pool)
         .await
         .map_err(|e| BootExit::Other(Box::new(e)))?
@@ -352,9 +366,14 @@ async fn setup(args: SetupArgs) -> Result<(), BootExit> {
         .find(|row| row.slug == args.tenant && row.status == "active");
     if let Some(row) = existing {
         println!(
-            "Tenant `{}` ({}) is already set up; nothing to do.",
+            "Tenant `{}` ({}) is already set up.",
             row.slug, row.data_tenant_id
         );
+        if let Some(user) = local_user {
+            let tenant = wyrd_spec::DataTenantId::new(row.data_tenant_id)
+                .map_err(|e| BootExit::Other(Box::new(e)))?;
+            create_local_admin(&postgres, tenant, user).await?;
+        }
         return Ok(());
     }
 
@@ -382,6 +401,64 @@ async fn setup(args: SetupArgs) -> Result<(), BootExit> {
     println!("admin_principal_id: {}", created.admin.principal_id);
     println!("admin_credential: {}", created.admin.credential.expose());
     println!("This is the only time the tenant credential is shown. Store it now.");
+    if let Some(user) = local_user {
+        create_local_admin(&postgres, created.tenant.id, user).await?;
+    }
+    Ok(())
+}
+
+/// Canonicalize `username` and read and check the password from standard
+/// input, before anything is provisioned.
+///
+/// One trailing line ending is removed; the rest of the input is the password.
+///
+/// # Errors
+/// Returns [`BootExit::Config`] when standard input cannot be read or the
+/// username or password breaks the local account policy.
+fn local_user(username: &str) -> Result<(String, SecretString), BootExit> {
+    let mut input = String::new();
+    std::io::Read::read_to_string(&mut std::io::stdin().lock(), &mut input)
+        .map_err(|e| BootExit::Config(Box::new(e)))?;
+    let raw = SecretString::from(
+        input
+            .strip_suffix('\n')
+            .map_or(input.as_str(), |line| {
+                line.strip_suffix('\r').unwrap_or(line)
+            })
+            .to_owned(),
+    );
+    let username = canonical_username(username).map_err(|e| BootExit::Config(Box::new(e)))?;
+    let password = new_password(&raw, "password").map_err(|e| BootExit::Config(Box::new(e)))?;
+    Ok((username, password))
+}
+
+/// Create the local password User `user` holding the tenant `admin` Role
+/// through the same owner signup uses.
+///
+/// # Errors
+/// Returns [`BootExit::Other`] when hashing or the database write fails, or
+/// the username is already taken in the tenant.
+async fn create_local_admin(
+    postgres: &WyrdPostgres,
+    tenant: wyrd_spec::DataTenantId,
+    (username, password): (String, SecretString),
+) -> Result<(), BootExit> {
+    let verifier = hash_password(password)
+        .await
+        .map_err(|e| BootExit::Other(Box::new(e)))?;
+    let mut conn = postgres
+        .tenant_conn(tenant)
+        .await
+        .map_err(|e| BootExit::Other(Box::new(e)))?;
+    let admin = wyrd_runtime::builtin_roles::builtin_role_uuid(tenant, "admin");
+    let user_id = create_local_user(&mut conn, &username, &verifier, &[admin])
+        .await
+        .map_err(|e| BootExit::Other(Box::new(e)))?;
+    conn.commit()
+        .await
+        .map_err(|e| BootExit::Other(Box::new(e)))?;
+    println!("local_user: {username}");
+    println!("local_user_principal_id: {user_id}");
     Ok(())
 }
 
@@ -467,6 +544,16 @@ impl<W: Write> Write for Tee<W> {
 /// and [`BootExit::Other`] when the connection cannot be established or the
 /// schema has not been migrated by `wyrd-server migrate`.
 async fn operator_pool() -> Result<OperatorPool, BootExit> {
+    operator_pool_of(&postgres().await?)
+}
+
+/// Connect the deployment's Postgres from the environment and validate its
+/// schema.
+///
+/// # Errors
+/// Returns [`BootExit::Config`] for unresolved DSNs and [`BootExit::Other`]
+/// when connecting or validation fails.
+async fn postgres() -> Result<WyrdPostgres, BootExit> {
     let dsns = ResolvedDsns::from_env().map_err(|e| BootExit::Config(Box::new(e)))?;
     let postgres = WyrdPostgres::connect_from_dsns(&dsns)
         .await
@@ -475,6 +562,14 @@ async fn operator_pool() -> Result<OperatorPool, BootExit> {
         .validate_schema()
         .await
         .map_err(|e| BootExit::Other(Box::new(e)))?;
+    Ok(postgres)
+}
+
+/// The cross-tenant platform boundary of `postgres`.
+///
+/// # Errors
+/// Returns [`BootExit::Config`] when no platform-admin DSN is configured.
+fn operator_pool_of(postgres: &WyrdPostgres) -> Result<OperatorPool, BootExit> {
     postgres.operator_pool().ok_or_else(|| {
         BootExit::Config(Box::new(std::io::Error::other(
             "platform control plane is not configured; set the platform-admin DSN",

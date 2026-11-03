@@ -17,7 +17,7 @@ type View = {
   expires_at: string;
 };
 
-type Call = { method: 'GET' | 'POST'; cookie?: string; body?: unknown };
+type Call = { method: 'GET' | 'POST' | 'DELETE'; cookie?: string; body?: unknown };
 
 /**
  * Call one Rust `/auth/browser/*` or `/v1` operation server to server as the
@@ -202,6 +202,60 @@ export class BrowserSessions {
     if (!response.ok) await refuse(response);
     relayCookies(response, cookies);
     return `/t/${encodeURIComponent(tenantKey)}`;
+  }
+
+  /**
+   * Local password sign-in or invitation signup: the server verifies the
+   * password (the BFF never does), creates the session and sets its cookie.
+   * `fields` are the typed request's fields besides the tenant.
+   */
+  async password(
+    operation: 'login' | 'signup',
+    tenantKey: string,
+    fields: Record<string, string>,
+    url: URL,
+    cookies: Cookies
+  ): Promise<string> {
+    this.cookieName(tenantKey);
+    const response = await call(`/auth/browser/password/${operation}`, url, {
+      method: 'POST',
+      body: { tenant: tenantKey, ...fields }
+    });
+    if (!response.ok) await refuse(response);
+    relayCookies(response, cookies);
+    return `/t/${encodeURIComponent(tenantKey)}`;
+  }
+
+  /** Set a new password with an operator-issued reset code; signs nothing in. */
+  async resetPassword(tenantKey: string, resetCode: string, newPassword: string, url: URL): Promise<void> {
+    this.cookieName(tenantKey);
+    const response = await call('/auth/browser/password/reset', url, {
+      method: 'POST',
+      body: { tenant: tenantKey, reset_code: resetCode, new_password: newPassword }
+    });
+    if (!response.ok) await refuse(response);
+  }
+
+  /**
+   * Change this session's local password; the server ends every local
+   * session of the User and clears this tenant's cookie.
+   */
+  async changePassword(
+    tenantKey: string,
+    currentPassword: string,
+    newPassword: string,
+    url: URL,
+    cookies: Cookies
+  ): Promise<void> {
+    const name = this.cookieName(tenantKey);
+    const value = cookies.get(name);
+    const response = await call('/auth/browser/password/change', url, {
+      method: 'POST',
+      cookie: value ? `${name}=${value}` : undefined,
+      body: { tenant: tenantKey, current_password: currentPassword, new_password: newPassword }
+    });
+    if (!response.ok) await refuse(response);
+    relayCookies(response, cookies);
   }
 
   /**

@@ -394,6 +394,34 @@ fn write_problem_examples(out: &Path) -> Result<(), Box<dyn StdError>> {
             },
         ),
         (
+            "passwordInvalid",
+            WyrdError::PasswordInvalid {
+                message: String::new(),
+                details: json!({}),
+            },
+        ),
+        (
+            "passwordAttempts",
+            WyrdError::PasswordAttempts {
+                message: String::new(),
+                details: json!({}),
+            },
+        ),
+        (
+            "oneTimeCodeInvalid",
+            WyrdError::OneTimeCodeInvalid {
+                message: String::new(),
+                details: json!({}),
+            },
+        ),
+        (
+            "recentLogin",
+            WyrdError::RecentLoginRequired {
+                message: String::new(),
+                details: json!({}),
+            },
+        ),
+        (
             "internal",
             WyrdError::Internal {
                 message: String::new(),

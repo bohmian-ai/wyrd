@@ -5,7 +5,12 @@ import { sessionCookie, sessions } from '$lib/server/auth/session';
 import { browserSessions } from '$lib/server/auth/browser-sessions';
 import { problem } from '$lib/server/problem';
 
-const loginRoutes = ['/t/[tenantKey]/login', '/t/[tenantKey]/login/api-key'];
+const loginRoutes = [
+  '/t/[tenantKey]/login',
+  '/t/[tenantKey]/login/api-key',
+  '/t/[tenantKey]/signup',
+  '/t/[tenantKey]/reset'
+];
 
 export const handle: Handle = async ({ event, resolve }) => {
   // The browser's leg of Wyrd's authorization server, served on this public origin.

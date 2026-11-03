@@ -12,6 +12,7 @@ import { join, resolve } from 'node:path';
 import { chromium, type Browser, type Page } from 'playwright';
 import { test as base, expect, vi } from 'vitest';
 import { serverTest } from '../../../../../../sdks/wyrd-sdk-ts/wyrd/tests/support/server';
+import { Principals, WyrdClient } from 'wyrd-ai';
 import { exportOtlp, nanos, seedSignals } from '$lib/ui-signals.integration';
 
 vi.setConfig({ testTimeout: 300_000 });
@@ -621,6 +622,122 @@ test('observe boards match approved canvas', async ({ server, ui }) => {
       await inspector.press('Escape');
       await expect.poll(() => new URL(page.url()).searchParams.has('points')).toBe(false);
     }
+  }
+});
+
+/** A password the server's policy accepts, unique per call. */
+const strongPassword = () => `correct horse ${crypto.randomUUID()}`;
+
+/** The profile `key` resolves to, read through the SDK straight from the server. */
+const meWith = async (serverUrl: string, key: string) =>
+  (await Principals.connect({ client: WyrdClient.connect({ serverUrl, credential: key }) })).me();
+
+test('local signup and personal settings', async ({ server, ui }) => {
+  const tenantKey = 'ui-local';
+  const tenant = server.seedTenant(tenantKey);
+  const adminKey = server.bootstrapServiceInTenant(tenant, ['admin'], 'ui-local-admin');
+  const issued = await fetch(`${ui.serverUrl}/v1/principals/users/invitations`, {
+    method: 'POST',
+    headers: {
+      'x-wyrd-access-token': `Bearer ${await WyrdClient.connect({ serverUrl: ui.serverUrl, credential: adminKey }).accessToken()}`,
+      'content-type': 'application/json'
+    },
+    body: JSON.stringify({ role_ids: [server.builtinRoleId(tenant, 'editor')] })
+  });
+  expect(issued.status).toBe(201);
+  const { invitation_code: code } = (await issued.json()) as { invitation_code: string };
+  const login = `${ui.base}/t/${tenantKey}/login`;
+  const password = strongPassword();
+
+  const context = await ui.browser.newContext();
+  const page = await context.newPage();
+  const logged: string[] = [];
+  page.on('console', (message) => logged.push(message.text()));
+  try {
+    // A wrong invitation code is refused without creating the account.
+    await page.goto(login);
+    await page.getByRole('link', { name: 'Sign up with an invitation' }).click();
+    await page.getByLabel('Invitation code').fill('A'.repeat(43));
+    await page.getByLabel('Username').fill('ui-person');
+    await page.getByLabel('Password').fill(password);
+    await page.getByRole('button', { name: 'Create account' }).click();
+    await expect.poll(() => page.getByRole('alert').count()).toBe(1);
+    expect(page.url()).toContain('/signup');
+
+    await page.getByLabel('Invitation code').fill(code);
+    await page.getByLabel('Password').fill(password);
+    await page.getByRole('button', { name: 'Create account' }).click();
+    await page.waitForURL(`${ui.base}/t/${tenantKey}`);
+    expect(page.url()).not.toContain(code);
+
+    // The identity menu leads to personal Settings, which an editor without SSO administration may open.
+    await page.locator('details.identity summary').click();
+    await page.getByRole('link', { name: 'Account' }).click();
+    const account = `${ui.base}/t/${tenantKey}/settings/account`;
+    await page.waitForURL(account);
+    await expect.poll(() => page.locator('dl').textContent()).toContain('ui-person');
+    expect(await page.locator('dl').textContent()).toContain('Username and password');
+    await expect.poll(() => page.getByText('No keys yet').count()).toBe(1);
+    expect(await page.getByLabel('Expires after (days)').inputValue()).toBe('30');
+    expect(await page.locator('input[name=permission]:checked').count()).toBe(0);
+
+    // A key with no permissions chosen is refused; one with a ceiling is shown once.
+    await page.getByLabel('Name').fill('laptop');
+    await page.getByRole('button', { name: 'Create key' }).click();
+    await expect.poll(() => page.getByRole('alert').count()).toBe(1);
+    await page.getByLabel('Name').fill('laptop');
+    await page.locator('input[name=permission][value="cards:read"]').check();
+    await page.getByRole('button', { name: 'Create key' }).click();
+    const shown = page.locator('[data-secret]');
+    await expect.poll(() => shown.count()).toBe(1);
+    const secret = (await shown.textContent()) ?? '';
+    expect(secret.length).toBeGreaterThan(40);
+    expect((await meWith(ui.serverUrl, secret)).permissions).toEqual(['cards:read']);
+
+    await page.getByRole('button', { name: 'Dismiss' }).click();
+    expect(await shown.count()).toBe(0);
+    await page.goto(account);
+    expect(await page.content()).not.toContain(secret);
+    expect(await serverHtml(page, account)).not.toContain(secret);
+    const row = page.locator('tbody tr', { hasText: 'laptop' });
+    expect(await row.textContent()).toContain('✓ active');
+    expect(await row.textContent()).toContain('cards:read');
+
+    // Revoke reports success and the key stops working.
+    await row.getByRole('button', { name: 'Revoke laptop' }).click();
+    await expect.poll(() => page.getByText('Key revoked.').count()).toBe(1);
+    expect(await page.locator('tbody tr', { hasText: 'laptop' }).textContent()).toContain('⊘ revoked');
+    await expect(meWith(ui.serverUrl, secret)).rejects.toMatchObject({ code: 'WYRD_AUTH_401_API_KEY_INVALID' });
+
+    // A password change ends the session; only the new password signs in.
+    const next = strongPassword();
+    await page.getByLabel('Current password').fill(password);
+    await page.getByLabel('New password').fill(next);
+    await page.getByRole('button', { name: 'Change password' }).click();
+    await page.waitForURL(login);
+    expect((await page.request.get(account, { maxRedirects: 0 })).status()).toBe(303);
+    await page.getByLabel('Username').fill('ui-person');
+    await page.getByLabel('Password').fill(password);
+    await page.getByRole('button', { name: 'Sign in', exact: true }).click();
+    await expect.poll(() => page.getByRole('alert').count()).toBe(1);
+    expect(await page.getByLabel('Username').inputValue()).toBe('ui-person');
+    expect(await page.getByLabel('Password').inputValue()).toBe('');
+    await page.getByLabel('Password').fill(next);
+    await page.getByRole('button', { name: 'Sign in', exact: true }).click();
+    await page.waitForURL(`${ui.base}/t/${tenantKey}`);
+
+    // Another tenant's sign-in does not admit this User.
+    const foreign = await (await ui.browser.newContext()).newPage();
+    await foreign.goto(`${ui.base}/t/${TENANT}/login`);
+    await foreign.getByLabel('Username').fill('ui-person');
+    await foreign.getByLabel('Password').fill(next);
+    await foreign.getByRole('button', { name: 'Sign in', exact: true }).click();
+    await expect.poll(() => foreign.getByRole('alert').count()).toBe(1);
+    expect(foreign.url()).toContain('/login');
+
+    for (const value of [code, password, next, secret]) expect(logged.join('\n')).not.toContain(value);
+  } finally {
+    await context.close();
   }
 });
 

@@ -295,8 +295,8 @@ struct DevReady {
     bifrost_data_dir: PathBuf,
     /// Directory of the saved `config.toml` and protected `credentials.toml`.
     config_dir: Option<PathBuf>,
-    /// Gateway setup outcome.
-    gateway: String,
+    /// The tenant's gateway configuration once setup settles.
+    gateway: GatewaySummary,
     /// Selected MCP hosts' outcomes; `None` when host setup was skipped.
     mcp: Option<McpInstallReport>,
     /// The diagnostic log of JSON and guided mode.
@@ -306,25 +306,85 @@ struct DevReady {
 }
 
 impl DevReady {
-    /// Print the readiness message for a person.
+    /// Print the readiness checklist for a person.
     fn print_text(&self) {
         let files = self
             .config_dir
             .as_deref()
             .map_or_else(String::new, |dir| dir.display().to_string());
         println!(
-            "Local Wyrd ready at {} for tenant {}.\n  gRPC: {}\n  UI: {}\n  Storage: {}\n  Bifrost data: {}\n  Saved settings: {files}/config.toml ([client], [dev]); key and database URLs: {files}/credentials.toml\n  Gateway: {}\nFresh SDK and CLI processes use these saved settings without exporting a key or endpoint. Press Ctrl-C to stop.",
+            "Local Wyrd ready at {} for tenant {}.\n  [ready] HTTP: {}\n  [ready] gRPC: {}\n  [ready] UI: {}\n  [configured] Storage: {}\n  [configured] Bifrost data: {}\n  [saved] Client settings: {files}/config.toml ([client], [dev])\n  [saved] Key and database URLs: {files}/credentials.toml\n  [{}] Gateway: {}\nFresh SDK and CLI processes use these saved settings without exporting a key or endpoint. Press Ctrl-C to stop.",
             self.endpoint,
             self.tenant,
+            self.endpoint,
             self.grpc,
             self.ui,
             self.storage_url,
             self.bifrost_data_dir.display(),
-            self.gateway,
+            self.gateway.status(),
+            self.gateway.detail(),
         );
         if let Some(log) = &self.log {
             println!("  Server output: {}", log.display());
         }
+    }
+}
+
+/// The tenant's gateway deployments as setup leaves them.
+///
+/// "Configured" means stored deployments, never a working provider key.
+/// Serialized as `"<status>: <detail>"`, the same facts the text checklist
+/// prints.
+#[derive(Debug, PartialEq, Eq)]
+enum GatewaySummary {
+    /// This run applied these deployments.
+    Applied(Vec<String>),
+    /// These deployments were already stored.
+    Existing(Vec<String>),
+    /// A successful read found no deployments.
+    NotConfigured,
+    /// The deployments could not be read, so their presence is not known.
+    Unknown,
+}
+
+impl GatewaySummary {
+    /// Summarize a read of the stored deployment names.
+    fn read<E>(names: Result<Vec<String>, E>) -> Self {
+        match names {
+            Ok(names) if names.is_empty() => Self::NotConfigured,
+            Ok(names) => Self::Existing(names),
+            Err(_) => Self::Unknown,
+        }
+    }
+
+    /// The checklist marker.
+    fn status(&self) -> &'static str {
+        match self {
+            Self::Applied(_) | Self::Existing(_) => "configured",
+            Self::NotConfigured => "not configured",
+            Self::Unknown => "unknown",
+        }
+    }
+
+    /// The deployments, or what to do next.
+    fn detail(&self) -> String {
+        match self {
+            Self::Applied(names) => names.join(", "),
+            Self::Existing(names) => format!("{} (existing)", names.join(", ")),
+            Self::NotConfigured => {
+                "configure it later with wyrd gateway deployment put --file".to_owned()
+            }
+            Self::Unknown => {
+                "the deployments could not be read; inspect wyrd gateway deployment list".to_owned()
+            }
+        }
+    }
+}
+
+impl serde::Serialize for GatewaySummary {
+    /// The status and detail as one string.
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.collect_str(&format_args!("{}: {}", self.status(), self.detail()))
     }
 }
 
@@ -1595,10 +1655,12 @@ impl DevInputs {
     /// Apply the explicitly requested gateway document, or on a fresh
     /// interactive setup the approved offer, through the same atomic owner as
     /// `wyrd gateway deployment put`, then confirm every applied deployment
-    /// reads back through the redacted administration surface.
+    /// reads back through the redacted administration surface. Without a
+    /// document to apply, it reads the tenant's stored deployments instead.
     ///
-    /// Returns the summary line. No provider is called; key validity is not
-    /// claimed.
+    /// Returns the gateway summary; a failed read of stored deployments is
+    /// [`GatewaySummary::Unknown`], never absence. No provider is called; key
+    /// validity is not claimed.
     ///
     /// # Errors
     /// Returns terminal failures, an invalid offered document, the apply
@@ -1609,23 +1671,13 @@ impl DevInputs {
         &self,
         client: WyrdClient,
         diagnostics: &Diagnostics,
-    ) -> Result<String, WyrdCliError> {
-        let offered;
-        let apply = match &self.gateway {
-            Some(apply) => apply,
-            None if self.offer_gateway => match offer_gateway().await? {
-                Some(apply) => {
-                    offered = apply;
-                    &offered
-                }
-                None => return Ok("skipped".to_owned()),
-            },
-            None => {
-                return Ok(
-                    "skipped; configure it later with wyrd gateway deployment put --file"
-                        .to_owned(),
-                );
-            }
+    ) -> Result<GatewaySummary, WyrdCliError> {
+        let offered = match &self.gateway {
+            None if self.offer_gateway => offer_gateway().await?,
+            _ => None,
+        };
+        let Some(apply) = self.gateway.as_ref().or(offered.as_ref()) else {
+            return Ok(GatewaySummary::read(stored_deployments(&client).await));
         };
         let gateway = Gateway::connect_with(&client).await?;
         let names: Vec<String> = apply
@@ -1650,8 +1702,22 @@ impl DevInputs {
                 "the applied deployments could not be read back; inspect wyrd gateway deployment list and rerun",
             ));
         }
-        Ok(format!("configured deployments {}", names.join(", ")))
+        Ok(GatewaySummary::Applied(names))
     }
+}
+
+/// The names of the tenant's stored gateway deployments.
+///
+/// # Errors
+/// Returns the connection or read failure.
+async fn stored_deployments(
+    client: &WyrdClient,
+) -> Result<Vec<String>, wyrd_spec::error::WyrdError> {
+    let deployments = Gateway::connect_with(client).await?.deployments().await?;
+    Ok(deployments
+        .into_iter()
+        .map(|deployment| deployment.name.to_string())
+        .collect())
 }
 
 /// Offer detected provider keys on the terminal and build the approved
@@ -1833,4 +1899,29 @@ async fn interruption() -> std::io::Result<()> {
     }
     #[cfg(not(unix))]
     tokio::signal::ctrl_c().await
+}
+
+#[cfg(test)]
+mod tests {
+    //! Gateway summary classification.
+
+    use super::*;
+
+    /// Stored names are existing, an empty read is not configured, and a
+    /// failed read is unknown rather than absent; JSON carries the text facts.
+    #[test]
+    fn gateway_summary_distinguishes_empty_and_failed_reads() {
+        let existing = GatewaySummary::read::<()>(Ok(vec!["openai".to_owned()]));
+        assert_eq!(existing.status(), "configured");
+        assert_eq!(existing.detail(), "openai (existing)");
+        assert_eq!(
+            serde_json::to_value(&existing).expect("serializes"),
+            serde_json::json!("configured: openai (existing)")
+        );
+        assert_eq!(
+            GatewaySummary::read::<()>(Ok(Vec::new())),
+            GatewaySummary::NotConfigured
+        );
+        assert_eq!(GatewaySummary::read(Err(())), GatewaySummary::Unknown);
+    }
 }

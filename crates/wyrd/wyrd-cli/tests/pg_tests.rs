@@ -1319,7 +1319,7 @@ async fn init_saved_settings_survive_working_directory_change() {
     assert_eq!(card.metadata.name.as_str(), "ask-prompt");
     assert!(!elsewhere.path().join(".wyrd").exists());
     let output = local.stop("-INT").await;
-    assert!(output.contains("Gateway: skipped"), "{output}");
+    assert!(output.contains("[not configured] Gateway: "), "{output}");
 
     // A listener override of the same deployment is accepted: the saved key
     // authenticates against the newly selected listener, which is resaved.
@@ -1924,7 +1924,14 @@ async fn init_keeps_the_gateway_managed_secret_key() {
             assert_eq!(status.as_u16(), 200, "{source} {run}: {body}");
             assert!(body.contains("chatcmpl-local"), "{source} {run}: {body}");
             printed.push_str(&body);
-            printed.push_str(&local.stop("-INT").await);
+            let stopped = local.stop("-INT").await;
+            if run == "rerun" {
+                assert!(
+                    stopped.contains("[configured] Gateway: local-mock (existing)"),
+                    "{source} {run}: {stopped}"
+                );
+            }
+            printed.push_str(&stopped);
         }
         assert_eq!(fs::read(&credentials).expect("credentials"), saved);
 

@@ -812,3 +812,39 @@ Remaining notes:
 - Compact tiles each draw their own time labels rather than one shared Main time row.
 - Exemplar precision stays deferred.
 - Human acceptance of every board in dark and light, at desktop and mobile, remains pending.
+
+### Evidence — Scenarios 1–4 and 6 (local users, personal keys, dev login, SSO parity)
+
+Implemented on branch `task/wyrd-ui-main-integration/TASK-004` (commits
+e1f1ef19d through the closing evidence commit). Every browser proof ran
+against the real BFF, Wyrd server and repository Postgres. No password, API
+key, invitation code or reset code appears in evidence, logs or captures. The
+dev login mechanism is the local User `dev`, signed in on the normal password
+form at `http://127.0.0.1:3000/t/dev/login`.
+
+| Acceptance criterion | Implementation evidence | Verification evidence | Result |
+|---|---|---|---|
+| Local signup, login, change and reset; verifier-only storage; sessions end on change/reset | `wyrd-auth/src/passwords.rs`, `wyrd-server/src/auth/browser.rs` `/auth/browser/password/*`, `wyrd-sql` local password queries and migration | V1 `pg_browser_sessions::local_signup_login_and_password_lifecycle` | PASS |
+| Tenant binding, admission and abuse limits (10 per account → 429 + Retry-After) | same owners | V2 `pg_browser_sessions::local_signup_is_tenant_bound_and_rate_limited` | PASS |
+| User keys: one owner, ceiling ∩ current grants, recent-login creation, metadata pages, revoke | `components/principals/{routes,accounts}.rs`, `wyrd-runtime` `personal_credentials:*` | V3 `pg_browser_sessions::user_keys_preserve_owner_scope_and_credential_lifecycle` | PASS |
+| UI: login, signup, reset and `/t/[tenantKey]/settings/account`; secret only in the no-store action result; 30-day default, no ceiling preselected, paged list, revoke; identity menu "Account"; no identity_connections:write needed | `wyrd-ui/src/routes/t/[tenantKey]/{login,signup,reset,settings/account}`, `lib/Entry.svelte`, `lib/server/form.ts`, `browser-sessions.ts` `password`/`resetPassword`/`changePassword` | V4 `local signup and personal settings` (editor User; the secret is absent from SSR, reload and console; wrong code, empty ceiling, old password and foreign tenant are refused) | PASS |
+| Dev seeding: `wyrd-server setup --local-user --local-password-stdin`; `dev` with a random 20-character password; 0600 `dev-login.toml` removed on exit; login printed before the batch; fixture auth forced off | `wyrd-server/src/main.rs` `setup`/`local_user`/`create_local_admin`, `scripts/postgres/dev-server.sh`, `mise.toml` `dev:full` | V5 `development environment lifecycle`: "UI ready" before any batch line, record mode 0600, password login → Account → batch → traces/logs/metrics points → appended batch → sign-out, record removed after Ctrl-C | PASS |
+| SDK profile and own-key pages (Rust, Python, TypeScript) | `wyrd-client` `Principals::{me,list_credentials_page}`, PyO3 and napi projections, authored `.pyi`, `WyrdTestServer::bootstrap_user_key` | V6 `principal_roles::users_manage_personal_keys`; V7 `test_users_manage_personal_keys`; V8 `users manage personal keys` | PASS |
+| MCP own-key metadata and revoke, no secret issuance | `wyrd-server/src/mcp/principals.rs` | V9 `principals::pg_tests::users_manage_personal_key_metadata` | PASS |
+| Observe regressions after the shell change | identity menu link only | V10 `observe boards match approved canvas`; V11 three journeys plus `ui-pages.test.ts`/`ui-library.test.ts` (16) | PASS |
+| SSO User parity: Account Settings and key creation after a real Keycloak login | `production-auth.integration.test.ts` `production SSO account settings` (Playwright, viewer `bob`) | V12 `mise run test:identity:ui` (5 passed) | PASS |
+| Architecture amended | `architecture/wyrd-design.md` Human sign-in; `architecture/wyrd-security-posture.md` API keys and browser sessions | review of the diff | PASS |
+| Checks | — | `pnpm check`, `pnpm build`, `fmt`, `lints`, `py:format`, `py:lints`, `py:typecheck`, `ts:typecheck`, `ts:napi:check`, `codegen:check`, `check:tenant-isolation`, `check:deps` | PASS |
+
+Diagnosis (V5, first run). **Symptom:** the Observe list poll timed out for
+`signal=metrics` only. **Evidence:** the page text showed the metric-name rail
+with retained metrics. The route loads points only when `points=1`
+(`observe/+layout.server.ts:51`) and renders them only in the Recorded points
+drawer (`+layout.svelte:362`). **Cause:** a stale assertion from a2b0989b3,
+which moved raw points into the inspector. **Fix site:** the lifecycle test now
+opens `signal=metrics&points=1`, the same way the metrics journey does. An
+independent read-only diagnostician confirmed this.
+
+- The test harness gained `builtinRoleId`, because invitations name Role ids and no read surface returns them.
+- The rail Settings link still opens tenant SSO administration. The identity menu's "Account" link opens personal Settings.
+- The default 500-request `dev:full` run is left for integrated change review, as the task directs.

@@ -13,6 +13,8 @@ use crate::connectivity::{
 mod pg_tests {
     use super::{McpJourneyError, discover, principals, problem, refusal, structured, transport};
 
+    use std::collections::BTreeSet;
+
     use jsonschema::Validator;
     use rmcp::ClientServiceExt as _;
     use rmcp::model::CallToolRequestParams;
@@ -719,6 +721,63 @@ mod pg_tests {
                 .await,
         )?;
         assert!(unpaged.contains("WYRD_SPEC_400_VALIDATION"), "{unpaged}");
+
+        // More than a page of keys created in one instant pages exactly once.
+        let mut expected: BTreeSet<String> = server
+            .seed_user_keys(user, 105)
+            .await?
+            .into_iter()
+            .map(|id| id.to_string())
+            .collect();
+        expected.insert(credentials[0]["id"].as_str().ok_or("id")?.to_owned());
+        let mut seen = BTreeSet::new();
+        let mut cursor = None;
+        loop {
+            let mut args = serde_json::json!({ "principal_id": user.to_string(), "limit": 100 });
+            if let Some(cursor) = cursor.take() {
+                args["cursor"] = cursor;
+            }
+            let page = structured(client.call_tool(call(LIST_CREDENTIALS, args)?).await?)?;
+            let listed = page["credentials"]
+                .as_array()
+                .ok_or("credentials are a list")?;
+            assert!(listed.len() <= 100, "{page}");
+            for key in listed {
+                let id = key["id"].as_str().ok_or("id")?.to_owned();
+                assert!(seen.insert(id.clone()), "{id} listed twice");
+            }
+            let Some(next) = page.get("next_cursor") else {
+                break;
+            };
+            cursor = Some(next.clone());
+        }
+        assert_eq!(seen, expected);
+        let administrator = ()
+            .serve_with_lifecycle(
+                transport(
+                    &server,
+                    ResolvedCredential::ApiKey(admin.api_key().ok_or("admin key")?.clone()),
+                    None,
+                )?,
+                discover(),
+            )
+            .await?;
+        let complete = structured(
+            administrator
+                .call_tool(call(
+                    LIST_CREDENTIALS,
+                    serde_json::json!({ "principal_id": user.to_string() }),
+                )?)
+                .await?,
+        )?;
+        let complete: BTreeSet<String> = complete["credentials"]
+            .as_array()
+            .ok_or("credentials are a list")?
+            .iter()
+            .filter_map(|key| key["id"].as_str().map(str::to_owned))
+            .collect();
+        assert_eq!(complete, expected);
+        administrator.cancel().await?;
         let foreign = refusal(
             client
                 .call_tool(call(

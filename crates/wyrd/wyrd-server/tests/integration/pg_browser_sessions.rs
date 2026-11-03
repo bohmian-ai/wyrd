@@ -15,7 +15,7 @@ use secrecy::{ExposeSecret as _, SecretString};
 use serde_json::{Value, json};
 use sha2::{Digest as _, Sha256};
 use uuid::Uuid;
-use wyrd_testing::{Bootstrap, WyrdTestServer};
+use wyrd_testing::{Bootstrap, WyrdTestServer, WyrdTestServerBuilder};
 
 /// The origin every browser request in this module arrives at.
 const ORIGIN: &str = "http://wyrd.test";
@@ -985,7 +985,8 @@ async fn login(server: &WyrdTestServer, username: &str, secret: &str) -> Browser
 
 /// Invitation signup creates a verifier-only local User with its Roles and a
 /// password session; login, change and operator reset follow the password
-/// revision, ending every local session and spending stale codes.
+/// revision, ending every local session at every replica and spending stale
+/// codes.
 ///
 /// # Panics
 /// Panics when the server fails to start or any expectation fails.
@@ -1113,6 +1114,25 @@ async fn local_signup_login_and_password_lifecycle() {
     let second = second.cookie_value(&cookie_name(&acme));
     assert_ne!(second, first);
 
+    // A second replica over the same database serves the same sessions.
+    let replica = server
+        .start_replica(WyrdTestServerBuilder::default())
+        .await
+        .expect("replica starts");
+    let live = read(&replica, "", vec![(cookie_name(&acme), second.clone())]).await;
+    assert_eq!(live.status, StatusCode::OK, "{}", live.body);
+    let key = as_browser(
+        &server,
+        Method::POST,
+        &format!("/v1/principals/{user}/credentials"),
+        &acme,
+        &second,
+        Some(json!({ "name": "laptop", "permission_ceiling": ["cards:read"], "expires_in": 3600 })),
+    )
+    .await;
+    assert_eq!(key.status, StatusCode::OK, "{}", key.body);
+    let key = SecretString::from(key.body["credential"].as_str().expect("key").to_owned());
+
     // Change needs the current password and ends every local session.
     let change = |current: String, next: String| json!({ "tenant": acme, "current_password": current, "new_password": next });
     let wrong = as_browser(
@@ -1140,15 +1160,17 @@ async fn local_signup_login_and_password_lifecycle() {
             .set_cookie(&cookie_name(&acme))
             .is_some_and(|cookie| cookie.contains("Max-Age=0"))
     );
-    for dead in [&first, &second] {
-        let read = read(&server, "", vec![(cookie_name(&acme), dead.clone())]).await;
-        assert_eq!(read.status, StatusCode::UNAUTHORIZED, "{}", read.body);
+    for at in [&server, &replica] {
+        for dead in [&first, &second] {
+            let read = read(at, "", vec![(cookie_name(&acme), dead.clone())]).await;
+            assert_eq!(read.status, StatusCode::UNAUTHORIZED, "{}", read.body);
+        }
     }
     assert_eq!(
-        login(&server, "ada.lovelace", &strong(1)).await.status,
+        login(&replica, "ada.lovelace", &strong(1)).await.status,
         StatusCode::UNAUTHORIZED
     );
-    let third = login(&server, "ada.lovelace", &strong(3)).await;
+    let third = login(&replica, "ada.lovelace", &strong(3)).await;
     assert_eq!(third.status, StatusCode::OK, "{}", third.body);
     let third = third.cookie_value(&cookie_name(&acme));
 
@@ -1199,15 +1221,19 @@ async fn local_signup_login_and_password_lifecycle() {
     .await;
     assert_eq!(again.status, StatusCode::UNAUTHORIZED);
     assert_eq!(
-        read(&server, "", vec![(cookie_name(&acme), session)])
+        read(&replica, "", vec![(cookie_name(&acme), session)])
             .await
             .status,
         StatusCode::UNAUTHORIZED
     );
     assert_eq!(
-        login(&server, "ada.lovelace", &strong(6)).await.status,
+        login(&replica, "ada.lovelace", &strong(6)).await.status,
         StatusCode::OK
     );
+    replica
+        .exchange_api_key(&key)
+        .await
+        .expect("the personal key survives change and reset");
 
     // A suspended User cannot sign in.
     superuser(

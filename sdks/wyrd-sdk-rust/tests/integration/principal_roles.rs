@@ -3,6 +3,7 @@
 //! One stable Service account runs every release of its family, each run
 //! keeping its own exact root.
 
+use std::collections::BTreeSet;
 use std::time::Duration;
 
 use secrecy::ExposeSecret as _;
@@ -231,6 +232,9 @@ async fn direct_and_idp_user_assignments_coexist() {
 /// A local User reads their own profile and key metadata, page by page,
 /// through their own restricted key, and revokes it; the key never carries
 /// more than its ceiling and a Service is never given a human profile.
+///
+/// # Panics
+/// Panics when the deployment fails to start or any expectation fails.
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "requires the repository-managed Postgres journey lifecycle"]
 async fn users_manage_personal_keys() {
@@ -288,6 +292,37 @@ async fn users_manage_personal_keys() {
         .expect_err("a User key is created only from a recent sign-in");
     assert_eq!(issued.status(), 400);
 
+    // More than a page of keys created in one instant pages exactly once.
+    let mut expected: BTreeSet<_> = deployment
+        .server()
+        .seed_user_keys(user, 105)
+        .await
+        .expect("keys seed")
+        .into_iter()
+        .collect();
+    expected.insert(listed.id);
+    let mut seen = BTreeSet::new();
+    let mut cursor = None;
+    loop {
+        let page = own
+            .list_credentials_page(
+                &user,
+                CredentialListQuery {
+                    limit: Some(100),
+                    cursor,
+                },
+            )
+            .await
+            .expect("the User pages their keys");
+        assert!(page.credentials.len() <= 100);
+        for key in &page.credentials {
+            assert!(seen.insert(key.id), "{} listed twice", key.id);
+        }
+        let Some(next) = page.next_cursor else { break };
+        cursor = Some(next);
+    }
+    assert_eq!(seen, expected);
+
     let admin = Principals::connect_with(&deployment.admin())
         .await
         .expect("handle connects");
@@ -295,7 +330,14 @@ async fn users_manage_personal_keys() {
         .list_credentials(&user)
         .await
         .expect("an administrator lists completely");
-    assert_eq!(complete.credentials.len(), 1);
+    assert_eq!(
+        complete
+            .credentials
+            .iter()
+            .map(|key| key.id)
+            .collect::<BTreeSet<_>>(),
+        expected
+    );
     let service = admin
         .me()
         .await

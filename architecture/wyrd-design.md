@@ -951,11 +951,13 @@ at most 365 days. The UI page `/t/{tenant}/settings/account` and the SDK
 exposes own-key metadata and revoke but never issues a secret.
 
 Browser session cookies contain only random identifiers. Records store their
-digests, tenant/principal, absolute expiry/revocation and either the exact
-human-connection revision or recovery-credential reference, not recoverable
-credentials. Recovery logout revokes only its browser session. Rust checks
-current authority on browser requests; existing tenant access-token snapshot
-semantics remain unchanged. Login transactions expire in five minutes and
+digests, tenant/principal, absolute expiry/revocation and exactly one anchor,
+not recoverable credentials: the exact human-connection revision of an SSO
+session, the recovery-credential reference of a recovery session, or the
+local User's password revision of a password session. Recovery logout revokes
+only its browser session. Rust checks current authority on browser requests
+against that anchor; only SSO sessions check the connection. Existing tenant
+access-token snapshot semantics remain unchanged. Login transactions expire in five minutes and
 sessions in twelve hours, with no sliding renewal. Protected tenant `/v1`
 HTTP APIs accept exactly one selected browser cookie through the existing
 principal/permission/audit boundary; ambiguous multiple session cookies are
@@ -966,7 +968,10 @@ back to a cookie after refusal. Cookie-authenticated mutations require exact
 trusted Origin checks; provider callback correlation remains transaction-bound.
 Production cookies are host-only, HttpOnly, Secure and SameSite=Lax, with the
 existing loopback-development exception. No API key or OAuth token reaches
-browser cookies, page data, URLs or JavaScript. Store failure is unavailable,
+browser cookies, page data, URLs or JavaScript, with one exception: a
+personal key the User just created is shown once from the authenticated,
+no-store POST action result and is never in the initial page load, history,
+storage, URLs, logs, telemetry, captures or cookies. Store failure is unavailable,
 not anonymous success. Prior credential-bearing UI cookies require re-login;
 no plaintext-cookie compatibility path is retained.
 

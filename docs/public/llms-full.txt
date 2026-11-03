@@ -3856,6 +3856,7 @@ Tool names contain dots, which many model providers refuse, so each framework fo
 | `bifrost.list_tables` | `bifrost_table:read` | `{}` → `{tables}` | List readable tables |
 | `bifrost.describe_table` | `bifrost_table:read` | `{namespace, name}` → table description | Read one table's schema and layout |
 | `bifrost.query` | scoped `bifrost_query:read` | `{sql, deadline_ms?, max_rows?, max_bytes?}` → `{columns, rows, terminal}` | Run one bounded `SELECT` |
+| `bifrost.validate_predicate` | scoped `bifrost_query:read` | `{namespace, name, expression}` → `{expression}` | Check one `WHERE` filter over a table's columns, up to 8 KiB, and return it normalized |
 
 Gateway request and response payload columns also need `gateway_payload:read`.
 
@@ -3994,6 +3995,8 @@ This page is generated from the error definitions in the Wyrd source.
 | `WYRD_AUTH_401_DELEGATION_DEPTH_EXCEEDED` | 401 | Delegation chain in token exceeds maximum depth | The presented JWT's `act` chain exceeds the verifier's maximum delegation depth. Re-issue from a shorter chain. |
 | `WYRD_AUTH_401_INVALID_CARD_REF` | 401 | Non-User token card_ref claim absent or malformed | Re-issue the token via `POST /auth/token`; ensure the bound non-human principal has a valid structured card_ref. |
 | `WYRD_AUTH_401_INVALID_TOKEN` | 401 | Invalid token | Re-authenticate to obtain a valid token signed by the current issuer key. |
+| `WYRD_AUTH_401_ONE_TIME_CODE_INVALID` | 401 | One-time code not accepted | Ask a tenant administrator for a new invitation or reset code; each code is single-use and expires. |
+| `WYRD_AUTH_401_PASSWORD_INVALID` | 401 | Username or password not accepted | Check the tenant, username and password and try again; a forgotten password is reset with a code from a tenant administrator. |
 | `WYRD_AUTH_401_REFRESH_REUSED` | 401 | Refresh token reused | Re-authenticate. The refresh token family has been revoked because a rotated token was reused. |
 | `WYRD_AUTH_401_REFRESH_REVOKED` | 401 | Refresh token revoked | Re-authenticate to obtain a new refresh token. |
 | `WYRD_AUTH_401_TOKEN_EXPIRED` | 401 | Token expired | Re-authenticate to obtain a fresh token. |
@@ -4001,6 +4004,7 @@ This page is generated from the error definitions in the Wyrd source.
 | `WYRD_AUTH_401_WORKLOAD_UID_REFUSED` | 401 | Workload root refused | `workload_uid` is optional. When supplied it must name an active, registered Service Card version in this tenant that the account's workload restriction allows; unknown and foreign roots are refused identically. Omit it to authenticate the account without workload context, or register the release and pass its exact Card UID. |
 | `WYRD_AUTH_403_ORIGIN_REFUSED` | 403 | Request origin refused | Send browser-session requests from the Wyrd application's own origin; cross-site and origin-less browser-session mutations are refused. |
 | `WYRD_AUTH_403_PRINCIPAL_ORPHANED` | 403 | The backing Service or Agent card has been soft-deleted | Re-declare the card or use a different principal to obtain a token. |
+| `WYRD_AUTH_403_RECENT_LOGIN_REQUIRED` | 403 | Recent sign-in required | Sign in again with your password or SSO, then create the key within five minutes; an API key or recovery session cannot create one. |
 | `WYRD_AUTH_403_UNREPRESENTABLE_DELEGATION` | 403 | Delegated permissions cannot be represented | The subject's and actor's shared permissions cannot be represented by token scopes, so the exchange issued no token. Exchange with grants whose exact shared authority fits the supported scopes, such as both parties holding the same explicit gateway deployment or model grant. |
 | `WYRD_AUTH_403_WORKLOAD_CONTEXT_REQUIRED` | 403 | Workload context required | This account is restricted to one workload family, so Card-attributed emission and verification need the exact release root. Exchange the key with `workload_uid`, send `x-wyrd-workload-uid`, or use the WyrdState loaded for that release. Generic authorized calls do not need a root. |
 | `WYRD_AUTH_404_ADMIN_NOT_FOUND` | 404 | Admin resource not found in tenant | Confirm the issuer URL (and subject for bindings) and that the resource exists in the current tenant. |
@@ -4010,6 +4014,7 @@ This page is generated from the error definitions in the Wyrd source.
 | `WYRD_AUTH_409_CONNECTION_NOT_TESTED` | 409 | Tenant OIDC candidate is not freshly tested | Run POST /v1/identity/oidc/candidate/test against this exact candidate revision, complete the provider sign-in at the returned authorization_url, and activate within 15 minutes of that successful test. |
 | `WYRD_AUTH_409_WORKLOAD_BINDING_CONFLICT` | 409 | Workload family already has a runtime account | Each Service family has at most one family-restricted runtime account. Issue another credential on that account for rotation or concurrent releases, or first set the existing account's restriction to `unrestricted`. |
 | `WYRD_AUTH_413_CARD_SCOPE_TOO_LARGE` | 413 | Card scope too large | Reduce or split the selected root's declared Card graph so its transitive observation-target scope fits the token size limit, or select a root with a smaller graph. |
+| `WYRD_AUTH_429_PASSWORD_ATTEMPTS` | 429 | Too many password attempts | Wait `details.retry_after_seconds` until the fixed attempt window ends, then try again. |
 | `WYRD_AUTH_503_DISCOVERY_UNAVAILABLE` | 503 | OIDC discovery unavailable | Retry with backoff. Do not re-authenticate; this is an infrastructure or issuer-discovery failure. |
 | `WYRD_AUTH_503_VERIFY_UNAVAILABLE` | 503 | Auth verify backend unavailable | Retry with backoff. Do not re-authenticate; this is an infrastructure failure, not a credential failure. |
 

@@ -333,8 +333,10 @@ credential.
   Cookies are Secure in production; only the existing loopback-development
   HTTP exception is permitted. Raw identifiers never enter database rows,
   metadata, URLs, logs or traces. The record stores a one-way digest, tenant,
-  principal, twelve-hour absolute expiry, revocation and either the exact
-  human-connection revision or originating credential reference. There is
+  principal, twelve-hour absolute expiry, revocation and exactly one anchor:
+  the exact human-connection revision of an SSO session, the originating
+  credential reference of a recovery session, or the local User's password
+  revision of a password session. There is
   no sliding renewal and no recoverable credential vault. Database-owned
   timestamps and tenant RLS govern the record; existing auth maintenance owns
   expiry cleanup.
@@ -360,7 +362,9 @@ credential.
   tenant and purpose. Change and reset advance the User's password revision,
   which ends every local session; API keys stay valid until revoked.
 - Every browser-session request checks current tenant/principal authority.
-  Human sessions require the exact Active connection revision. API-key-backed
+  SSO sessions require the exact Active connection revision; password
+  sessions require the User's current password revision and never consult a
+  connection. API-key-backed
   sessions require a still-valid originating credential and preserve all its
   effective-permission restrictions. Existing grant resolution, credential
   attribution, permission checks and non-blocking audit are reused; no Node
@@ -383,7 +387,10 @@ credential.
   than replace, Rust enforcement. Read-only GETs never mutate settings or log
   out a session.
 - Session metadata and credential-bearing responses use
-  `Cache-Control: no-store`. Existing Wyrd error codes distinguish refused authority from
+  `Cache-Control: no-store`. The one browser-visible secret is a personal key
+  shown once from its authenticated no-store POST action result; it is never
+  part of the initial page data, history, storage, URLs, logs, telemetry,
+  captures or cookies. Existing Wyrd error codes distinguish refused authority from
   unavailable storage; a database outage cannot become anonymous, cached or
   mock success. Cookie authentication is documented alongside bearer
   authentication in served OpenAPI. UI-only OAuth issuance/renewal is retired

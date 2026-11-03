@@ -6,7 +6,7 @@ section: Get started
 order: 1
 ---
 
-You ship a support agent, a Q&A bot, or a model behind an API. Wyrd checks what it says against the rules you set, such as "never promise a refund" or "answer from the policy document", before you release a change and while it serves real traffic. When a rule fails, Wyrd tells you which rule, why, and which version of your system broke it.
+Wyrd is open-source infrastructure for building your own verification system for AI/ML in production. You ship a support agent, a payment workflow, a model behind an API, or a coding agent that runs for hours. You compose Wyrd's primitives into checks on its outputs, tool calls, and complete workflows against the rules you set, such as "never promise a refund" or "follow the payment policy document", before you release a change and while it serves real traffic. When a rule fails, Wyrd tells you which rule, why, and which version of your system broke it.
 
 ## How Wyrd fits your stack
 
@@ -64,7 +64,21 @@ failed: operator NotContains returned false
   verifier: default/Verifier/no-refund-promise@1.0.0#<uid>
 ```
 
-In CI, `wyrd declare support-reply.yaml` declares the same files from the command line. A check can also ask a model to judge, such as whether a letter follows your refund policy.
+In CI, `wyrd declare support-reply.yaml` declares the same files from the command line. This assertion is the simplest check. A Verifier can also run Python, judge with an Agent that reads your uploaded policy files and cites them, judge a whole session, or compare samples with a baseline on a schedule; [What can I build?](/get-started/what-can-i-build/) matches each to a problem.
+
+## Already have tools?
+
+Keep them. Add Wyrd where they stop.
+
+| You use | Keep it for | Add Wyrd for |
+| --- | --- | --- |
+| MLflow, W&B | Training, experiments, model registry | Runtime monitoring and verification of the model you deployed, at its exact version |
+| Langfuse, Phoenix, LangSmith | Trace exploration, prompt iteration | Your own verification layer: checks you compose, judges with tools and your files, verdicts your app acts on |
+| promptfoo, DeepEval, Ragas | Test suites and red-teaming in CI | Running the same checks on live traffic, and keeping every result |
+| Evidently, Fiddler | Drift reports and dashboards | Drift judged next to traces, model calls, and app data, in one SQL store |
+| LiteLLM, Portkey | Model routing, inline guardrails | Tying every call to an account, a release, and a verdict |
+| Datadog, Grafana, Honeycomb | Infrastructure monitoring and alerts | Pass/fail verdicts on the same OpenTelemetry data |
+| Credo AI, watsonx.governance | AI inventory, policy programs | Proof from production for each control |
 
 ## Where Wyrd stops
 
@@ -72,4 +86,4 @@ Wyrd verifies your system; your code runs it. Your app owns its code, models, an
 
 ## Next
 
-[Set up Wyrd](/get-started/setup/) starts a local server. [Run your first verification](/get-started/quickstart/) then declares a Verifier and verifies one passing and one failing reply.
+[Set up Wyrd](/get-started/setup/) starts a local server. [Run your first verification](/get-started/quickstart/) then declares a Verifier and verifies one passing and one failing reply. [What can I build?](/get-started/what-can-i-build/) shows the larger workflows.

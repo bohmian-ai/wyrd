@@ -6,10 +6,11 @@ Every published docs page in sidebar order, generated from the docs content tree
 
 ## Start here
 
-Set up a local server, then run one verification, in this order. A connected Wyrd MCP server teaches the same route through `wyrd.guide {"topic":"start"}`.
+Set up a local server, run one verification, then choose what to build, in this order. A connected Wyrd MCP server teaches the same route through `wyrd.guide {"topic":"start"}`.
 
 - [Set up Wyrd](/wyrd/get-started/setup/): install Wyrd and start a local server you keep running.
 - [Run your first verification](/wyrd/get-started/quickstart/): declare a Verifier in YAML and verify a passing and a failing support answer from Python, Rust, or TypeScript.
+- [What can I build?](/wyrd/get-started/what-can-i-build/): example workflows built from the primitives, not a complete list: policy documents, agent evaluation, long-running workflows, runtime checks, observability, or drift.
 
 # What Wyrd does
 
@@ -17,7 +18,7 @@ Page: /wyrd/get-started/introduction/
 
 > Wyrd verifies what your AI system does against the requirements you declare, and records which versions produced each result.
 
-You ship a support agent, a Q&A bot, or a model behind an API. Wyrd checks what it says against the rules you set, such as "never promise a refund" or "answer from the policy document", before you release a change and while it serves real traffic. When a rule fails, Wyrd tells you which rule, why, and which version of your system broke it.
+Wyrd is open-source infrastructure for building your own verification system for AI/ML in production. You ship a support agent, a payment workflow, a model behind an API, or a coding agent that runs for hours. You compose Wyrd's primitives into checks on its outputs, tool calls, and complete workflows against the rules you set, such as "never promise a refund" or "follow the payment policy document", before you release a change and while it serves real traffic. When a rule fails, Wyrd tells you which rule, why, and which version of your system broke it.
 
 ## How Wyrd fits your stack
 
@@ -159,7 +160,21 @@ failed: operator NotContains returned false
   verifier: default/Verifier/no-refund-promise@1.0.0#<uid>
 ```
 
-In CI, `wyrd declare support-reply.yaml` declares the same files from the command line. A check can also ask a model to judge, such as whether a letter follows your refund policy.
+In CI, `wyrd declare support-reply.yaml` declares the same files from the command line. This assertion is the simplest check. A Verifier can also run Python, judge with an Agent that reads your uploaded policy files and cites them, judge a whole session, or compare samples with a baseline on a schedule; [What can I build?](/wyrd/get-started/what-can-i-build/) matches each to a problem.
+
+## Already have tools?
+
+Keep them. Add Wyrd where they stop.
+
+| You use | Keep it for | Add Wyrd for |
+| --- | --- | --- |
+| MLflow, W&B | Training, experiments, model registry | Runtime monitoring and verification of the model you deployed, at its exact version |
+| Langfuse, Phoenix, LangSmith | Trace exploration, prompt iteration | Your own verification layer: checks you compose, judges with tools and your files, verdicts your app acts on |
+| promptfoo, DeepEval, Ragas | Test suites and red-teaming in CI | Running the same checks on live traffic, and keeping every result |
+| Evidently, Fiddler | Drift reports and dashboards | Drift judged next to traces, model calls, and app data, in one SQL store |
+| LiteLLM, Portkey | Model routing, inline guardrails | Tying every call to an account, a release, and a verdict |
+| Datadog, Grafana, Honeycomb | Infrastructure monitoring and alerts | Pass/fail verdicts on the same OpenTelemetry data |
+| Credo AI, watsonx.governance | AI inventory, policy programs | Proof from production for each control |
 
 ## Where Wyrd stops
 
@@ -167,7 +182,7 @@ Wyrd verifies your system; your code runs it. Your app owns its code, models, an
 
 ## Next
 
-[Set up Wyrd](/wyrd/get-started/setup/) starts a local server. [Run your first verification](/wyrd/get-started/quickstart/) then declares a Verifier and verifies one passing and one failing reply.
+[Set up Wyrd](/wyrd/get-started/setup/) starts a local server. [Run your first verification](/wyrd/get-started/quickstart/) then declares a Verifier and verifies one passing and one failing reply. [What can I build?](/wyrd/get-started/what-can-i-build/) shows the larger workflows.
 
 # Set up Wyrd
 
@@ -302,7 +317,7 @@ Page: /wyrd/get-started/quickstart/
 
 You write two small YAML files and one short program in Python, Rust, or TypeScript. The program declares them to your server, then asks Wyrd to verify two support answers against one requirement: the answer never promises a guaranteed refund. One answer passes and one fails, and each verdict names the exact versions that produced it.
 
-No model, provider key, or application is involved: you supply each answer as text.
+This is the simplest Verifier Wyrd runs. No model, provider key, or application is involved: you supply each answer as text.
 
 ## Prerequisites
 
@@ -507,7 +522,61 @@ To change the requirement, give it a new version: set `version: 1.1.0` in `no-re
 
 ## Next
 
-[How verification works](/wyrd/understand/how-verification-works/) explains requirements, checks, and verdicts. The [Verifier reference](/wyrd/reference/verifier-card/) lists every field you can declare.
+[What can I build?](/wyrd/get-started/what-can-i-build/) matches your problem to a larger workflow, such as a policy document judged by an Agent or a long-running workflow verified step by step. [How verification works](/wyrd/understand/how-verification-works/) explains requirements, checks, and verdicts. The [Verifier reference](/wyrd/reference/verifier-card/) lists every field you can declare.
+
+# What can I build?
+
+Page: /wyrd/get-started/what-can-i-build/
+
+> Example verification workflows built from Wyrd's primitives - policy documents, agent evaluation, long-running workflows, runtime checks, observability, and drift.
+
+Wyrd gives you primitives, and you compose them into whatever verification your system needs. The workflows below are examples, not a complete list. Each names a problem, the composition that solves it, and the page that shows how. [Run your first verification](/wyrd/get-started/quickstart/) builds the smallest one: a single assertion.
+
+Every workflow uses the same parts. Cards declare exact versions of what you ship: Services, Agents, Prompts, Models, Data, and uploaded Artifacts. A Verifier composes deterministic checks (`assert`, `trace`, `code`) with model judgments (`agent`) and scheduled `drift`. Each verdict cites its evidence and is stored in Bifrost with the exact versions it judged. Your application runs the workflow and decides what a verdict means; Wyrd does not orchestrate or enforce it.
+
+## Policy verification
+
+**Problem.** Payments, refunds, or other decisions must follow a written policy document.
+
+**Workflow.** Upload the policy once as a versioned Artifact. A Verifier mounts the exact files an Agent check reads, and the judge cites the line it relied on. Put exact rules, such as an amount limit or a required field, in `assert` or `code` checks beside it, so they never depend on a model. Send the facts the decision rests on as evidence, then act on the verdict in your application: approve, hold, or escalate.
+
+[Uploaded files](/wyrd/build-and-verify/verify/verifier-recipes/#uploaded-files) walks through the upload, the Service, the call, and the cited result. [Steps and checks](/wyrd/understand/how-verification-works/#steps-and-checks) explains which kind decides which rule.
+
+## Agent evaluation
+
+**Problem.** An agent's answers must be correct and within policy, and you need to know before a new prompt or model ships.
+
+**Workflow.** Bind a Verifier to the Agent or its Service. Combine assertions with a [model judge](/wyrd/build-and-verify/verify/verifier-recipes/#model-judge) that returns a cited verdict and, if you declare one, a score or label. Run the same Verifier from tests before release and on live traffic after. Each verdict names the exact Service and Verifier versions, so a regression points at the change that caused it.
+
+[Write a Verifier](/wyrd/build-and-verify/verify/author-a-verifier/) builds one step by step.
+
+## Long-horizon workflows
+
+**Problem.** A coding, review, or support workflow runs for minutes or hours across many steps.
+
+**Workflow.** Verify each step as it finishes, with one `group_id` for the whole workflow. A [grouped session](/wyrd/build-and-verify/verify/verifier-recipes/#grouped-session) Verifier then judges the accumulated evidence and outcomes once the group goes quiet. A [trace](/wyrd/build-and-verify/verify/verifier-recipes/#trace) check confirms the steps ran in the order the workflow requires. Your code or agent framework runs the workflow; Wyrd records and judges it.
+
+## Runtime verification
+
+**Problem.** A request must be checked before your application acts on it, or checked in the background without delaying it.
+
+**Workflow.** `verify` returns the verdict to the caller, so your code can act on it before it responds. `submit` queues the check and returns an execution that any process can wait on. [verify and submit](/wyrd/understand/how-verification-works/#verify-and-submit) explains both. An `agent` check adds a model call to the wait; an `assert` check needs none.
+
+## Observability
+
+**Problem.** You need to see what the system did, not only whether a check passed.
+
+**Workflow.** Wrap each request in a Run, export OpenTelemetry spans, record your own rows, and send model calls through the [LLM gateway](/wyrd/connect/set-up-the-llm-gateway/). Bifrost keeps traces, logs, gateway calls, rows, and verdicts queryable with SQL, joined on the Run. [Runs and observations](/wyrd/build-and-verify/observe/record-a-run-and-observations/) records one Run and reads it back; [Bifrost](/wyrd/understand/bifrost/) explains the data plane.
+
+## Drift monitoring
+
+**Problem.** Inputs, outputs, or model behavior shift slowly, and no single request fails.
+
+**Workflow.** Declare a baseline as a Data Card, record samples from your code, and run a [drift](/wyrd/build-and-verify/verify/verifier-recipes/#drift) Verifier on a schedule. An Operator on that binding can notify Slack or PagerDuty when a window fails; [React to a failure](/wyrd/build-and-verify/declare/bind-a-verifier/#3-react-to-a-failure) adds one.
+
+## Next
+
+[Recipes](/wyrd/build-and-verify/verify/verifier-recipes/) has a copyable Verifier for each check. [Use with your coding agent](/wyrd/get-started/use-with-your-coding-agent/) gives your agent these pages and your server's evidence.
 
 # Use with your coding agent
 
@@ -584,7 +653,7 @@ The URL is stored in that agent's entry only. Remote servers must use `https://`
 
 ## Next
 
-[Run your first verification](/wyrd/get-started/quickstart/), then ask your agent to explain its verdicts.
+[Run your first verification](/wyrd/get-started/quickstart/), then ask your agent to explain its verdicts. [What can I build?](/wyrd/get-started/what-can-i-build/) helps it choose the workflow your project needs.
 
 # Services
 
@@ -1314,7 +1383,7 @@ Pick the check you need, bind its Verifier under `verified_by` to what it checks
 | Logic an operator cannot express | [Python check](#python-check) | `code` |
 | Meaning, tone, or policy | [Model judge](#model-judge) | `agent` |
 | An answer against a document | [Multi-step](#multi-step) | `extract` and `code` steps, then `assert` |
-| An answer against files you upload once | [Uploaded files](#uploaded-files) | `agent` with a workspace |
+| An answer or decision against a policy you upload once | [Uploaded files](#uploaded-files) | `agent` with a workspace |
 | A whole conversation, not one reply | [Grouped session](#grouped-session) | `assert` over a group |
 | Inputs or outputs shifting over time | [Drift](#drift) | `drift` |
 
@@ -1734,6 +1803,30 @@ spec:
 ```
 
 Without `path`, every file of the version is mounted. The judge reads with `fs.read` and cites the `attachment_<n>` slot the tool reports. Uploading a new version never changes what this Verifier mounts. [Agent tools and authorization](/wyrd/reference/agent-tools-and-authorization/) lists the file tools and the grants each call needs.
+
+Bind the Verifier to the Service it checks:
+
+```yaml
+verified_by:
+  - verifier: ./handbook-review.yaml
+```
+
+Then call it with the evidence the judgment rests on, here the question:
+
+```python
+from wyrd import WyrdState
+
+run = WyrdState.declare("support-reply.yaml").run()
+
+# The judge's fs.read call runs as your credential, which needs a tool:invoke grant for fs.read.
+result = run.observe.verify("handbook-review", question="How do outages escalate?")
+judged = result.requirements[0]
+print(judged["outcome"], judged["reason"])  # the reason quotes the handbook line it found
+for citation in judged.get("citations", []):
+    print(citation["slot"], citation["locator"])  # attachment_<n> and the cited lines
+```
+
+A pass without a citation counts as `inconclusive`. Put exact rules, such as an amount limit, in `assert` or `code` requirements of the same Verifier, so they never depend on the model; `decide` combines every requirement's verdict. Your application reads the verdict and decides what to do, such as holding a payment. `verify` waits for the judge; `submit` queues it instead, as [verify and submit](/wyrd/understand/how-verification-works/#verify-and-submit) explains.
 
 ## Grouped session
 
@@ -3238,7 +3331,7 @@ _Diagram `bifrost-parts`: see the web page._
 
 One server runs all four.
 
-Tables are Apache Iceberg tables of Parquet files in the deployment's object store, with the catalog in Postgres. The `vala.datasets` namespace holds caller-owned tables. Wyrd writes every other namespace.
+Tables are Apache Iceberg tables of Parquet files in the deployment's object store, with the catalog in Postgres. The `bifrost.datasets` namespace holds caller-owned tables. Wyrd writes every other namespace.
 
 ## Where each part runs
 

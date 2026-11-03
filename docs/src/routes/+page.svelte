@@ -29,13 +29,14 @@
   // The CTA opens setup, the first step a reader can complete, else the first Get started page.
   const start = startPages.find((item) => item.path === '/get-started/setup/') ?? firstPage('Get started');
   const agent = startPages.find((item) => item.path === '/get-started/use-with-your-coding-agent/');
+  const build = startPages.find((item) => item.path === '/get-started/what-can-i-build/');
 </script>
 
 <svelte:head>
   <title>Wyrd docs</title>
   <meta
     name="description"
-    content="Wyrd is open-source verification and assurance infrastructure for AI systems. Verify AI systems before and after release, with verdicts you can trace, reproduce, and audit."
+    content="Wyrd is open-source infrastructure for building your own verification system for AI systems, with verdicts kept beside the exact versions they judged."
   />
 </svelte:head>
 
@@ -45,10 +46,11 @@
     <p class="eyebrow">Open-source verification infrastructure for AI systems · v{__WYRD_VERSION__}</p>
     <h1><span class="d">Declare.</span><br /><span class="o">Observe.</span><br />Verify.</h1>
     <p class="tagline">Know whether your AI system does what you said it would, before release and in production.</p>
-    <p class="lede">Verify a single API response or a multi-hour agent coding session. Check a support agent's answers, an uploaded document against your policy, or every step of a long-running workflow.</p>
+    <p class="lede">Build the verification your system needs from primitives you compose: an assertion on one API response, a model judge that cites your policy document, or a check on every step of a multi-hour agent session.</p>
     <div class="cta">
       {#if start}
         <a class="button primary" href={`${base}${start.path}`}>Get started →</a>
+        {#if build}<a class="button" href={`${base}${build.path}`}>What can I build?</a>{/if}
         {#if agent}<a class="button" href={`${base}${agent.path}`}>Use with your coding agent</a>{/if}
         <a class="button" href={GITHUB_URL} rel="noreferrer" target="_blank">GitHub</a>
       {:else}

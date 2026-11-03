@@ -36,7 +36,11 @@ describe('machine-readable indexes follow published pages', () => {
     for (const name of ['llms.txt', 'llms-full.txt']) {
       const text = read(name);
       const start = text.slice(text.indexOf('## Start here'));
-      expect(sitePaths(start).slice(0, 2)).toEqual(['/get-started/setup/', '/get-started/quickstart/']);
+      expect(sitePaths(start).slice(0, 3)).toEqual([
+        '/get-started/setup/',
+        '/get-started/quickstart/',
+        '/get-started/what-can-i-build/'
+      ]);
       expect(text).toContain('wyrd.guide {"topic":"start"}');
       expect(text).not.toContain('](https://docs.bohmian.ai');
     }
@@ -95,8 +99,8 @@ function publishedRoutes(dir: string): Set<string> {
 describe('machine-readable indexes follow published pages', () => {
   it('tolerates omitted onboarding and reference pages', () => {
     const cases = [
-      fixtureCorpus(['get-started/setup.md', 'get-started/quickstart.md', 'api/errors.md']),
-      fixtureCorpus([], ['get-started/setup.md', 'get-started/quickstart.md', 'api/errors.md'])
+      fixtureCorpus(['get-started/setup.md', 'get-started/quickstart.md', 'get-started/what-can-i-build.md', 'api/errors.md']),
+      fixtureCorpus([], ['get-started/setup.md', 'get-started/quickstart.md', 'get-started/what-can-i-build.md', 'api/errors.md'])
     ];
     const empty = mkdtempSync(path.join(tmpdir(), 'wyrd-docs-'));
     for (const dir of [...cases, empty]) {

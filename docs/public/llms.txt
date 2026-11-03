@@ -8,7 +8,7 @@ Set up a local server, run one verification, then choose what to build, in this 
 
 - [Set up Wyrd](/wyrd/get-started/setup/): install Wyrd and start a local server you keep running.
 - [Run your first verification](/wyrd/get-started/quickstart/): declare a Verifier in YAML and verify a passing and a failing support answer from Python, Rust, or TypeScript.
-- [What can I build?](/wyrd/get-started/what-can-i-build/): choose the workflow for your problem: policy documents, agent evaluation, long-running workflows, runtime checks, observability, or drift.
+- [What can I build?](/wyrd/get-started/what-can-i-build/): example workflows built from the primitives, not a complete list: policy documents, agent evaluation, long-running workflows, runtime checks, observability, or drift.
 
 ## Home
 
@@ -19,7 +19,7 @@ Set up a local server, run one verification, then choose what to build, in this 
 - [What Wyrd does](/wyrd/get-started/introduction/): Wyrd verifies what your AI system does against the requirements you declare, and records which versions produced each result.
 - [Set up Wyrd](/wyrd/get-started/setup/): Install the Wyrd 0.4.1 CLI and SDK for Python, Rust, or TypeScript, then let your coding agent start a local server and run a first verification, or do it by hand.
 - [Run your first verification](/wyrd/get-started/quickstart/): Declare a Verifier and the Service it checks in two YAML files, then verify a passing and a failing support answer from one Python, Rust, or TypeScript program.
-- [What can I build?](/wyrd/get-started/what-can-i-build/): Match a verification problem to the Wyrd workflow you build for it - policy documents, agent evaluation, long-running workflows, runtime checks, observability, and drift.
+- [What can I build?](/wyrd/get-started/what-can-i-build/): Example verification workflows built from Wyrd's primitives - policy documents, agent evaluation, long-running workflows, runtime checks, observability, and drift.
 - [Use with your coding agent](/wyrd/get-started/use-with-your-coding-agent/): Give your coding agent the Wyrd docs through llms.txt and Wyrd's tools through MCP with wyrd mcp install.
 
 ## Build and verify

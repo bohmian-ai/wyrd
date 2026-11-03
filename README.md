@@ -29,7 +29,7 @@ Your app sends Wyrd what it did. Wyrd returns a verdict for each requirement, wi
   <a href="https://docs.bohmian.ai/wyrd/get-started/what-can-i-build/#drift-monitoring"><img src="https://img.shields.io/badge/Drift%20monitoring-555555" alt="Use case: Drift monitoring"></a>
 </p>
 
-[What can I build?](https://docs.bohmian.ai/wyrd/get-started/what-can-i-build/) matches each use case to its workflow.
+[What can I build?](https://docs.bohmian.ai/wyrd/get-started/what-can-i-build/) walks through each one. They are examples: the same primitives build any verification you need.
 
 ## How Wyrd fits your stack
 

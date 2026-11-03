@@ -40,7 +40,7 @@ SITE = f"{ORIGIN}{BASE}"
 START = [
     ("get-started/setup", "install Wyrd and start a local server you keep running"),
     ("get-started/quickstart", "declare a Verifier in YAML and verify a passing and a failing support answer from Python, Rust, or TypeScript"),
-    ("get-started/what-can-i-build", "choose the workflow for your problem: policy documents, agent evaluation, long-running workflows, runtime checks, observability, or drift"),
+    ("get-started/what-can-i-build", "example workflows built from the primitives, not a complete list: policy documents, agent evaluation, long-running workflows, runtime checks, observability, or drift"),
 ]
 
 SUMMARY = (

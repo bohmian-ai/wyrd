@@ -10,7 +10,7 @@ Set up a local server, run one verification, then choose what to build, in this 
 
 - [Set up Wyrd](/wyrd/get-started/setup/): install Wyrd and start a local server you keep running.
 - [Run your first verification](/wyrd/get-started/quickstart/): declare a Verifier in YAML and verify a passing and a failing support answer from Python, Rust, or TypeScript.
-- [What can I build?](/wyrd/get-started/what-can-i-build/): choose the workflow for your problem: policy documents, agent evaluation, long-running workflows, runtime checks, observability, or drift.
+- [What can I build?](/wyrd/get-started/what-can-i-build/): example workflows built from the primitives, not a complete list: policy documents, agent evaluation, long-running workflows, runtime checks, observability, or drift.
 
 # What Wyrd does
 
@@ -528,9 +528,9 @@ To change the requirement, give it a new version: set `version: 1.1.0` in `no-re
 
 Page: /wyrd/get-started/what-can-i-build/
 
-> Match a verification problem to the Wyrd workflow you build for it - policy documents, agent evaluation, long-running workflows, runtime checks, observability, and drift.
+> Example verification workflows built from Wyrd's primitives - policy documents, agent evaluation, long-running workflows, runtime checks, observability, and drift.
 
-Wyrd gives you the primitives, and you build the verification system your problem needs. [Run your first verification](/wyrd/get-started/quickstart/) builds the smallest one: a single assertion. Each section below names a larger problem, the workflow that solves it, and the page that shows how.
+Wyrd gives you primitives, and you compose them into whatever verification your system needs. The workflows below are examples, not a complete list. Each names a problem, the composition that solves it, and the page that shows how. [Run your first verification](/wyrd/get-started/quickstart/) builds the smallest one: a single assertion.
 
 Every workflow uses the same parts. Cards declare exact versions of what you ship: Services, Agents, Prompts, Models, Data, and uploaded Artifacts. A Verifier composes deterministic checks (`assert`, `trace`, `code`) with model judgments (`agent`) and scheduled `drift`. Each verdict cites its evidence and is stored in Bifrost with the exact versions it judged. Your application runs the workflow and decides what a verdict means; Wyrd does not orchestrate or enforce it.
 

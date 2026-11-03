@@ -333,7 +333,7 @@ body describes the six-platform hub comparison, revision 3 governs.
 | REQ-004, INV-002 | Why Wyrd rows name composed primitives, versioned checks run in CI and production, one data plane, whole-service versioning, gateway identity, self-hosted OTLP ingest; links to how-verification-works, bifrost, architecture; no figures | Source review: no benchmark or throughput content | PASS |
 | REQ-005, INV-003 | `START` step 3, landing CTA, quickstart "simplest" + Next, coding-agent Next, intro Next, MCP guide, setup prompt link | RED: `indexes.test.ts` start-route and omission tests failed before the page existed; GREEN: focused vitest 62/62; `docs:check` 100/100 incl. draft exclusion; prompt URL `https://docs.bohmian.ai/wyrd/get-started/what-can-i-build/` is the published route | PASS |
 | REQ-006, INV-001 | Recipes Uploaded files completion reusing tested fixtures | `uploaded_artifacts_are_reused_by_service_judges` journey PASS (scripted model) | PASS |
-| REQ-007 | Eight fresh-context readers, below; scenarios 3–4 rerun for revision 3 | Rerun: MCP 3 FAIL, MCP 4 and public 3 PARTIAL | FAIL |
+| REQ-007 | Eight fresh-context readers, below; scenarios 3–4 rerun for revision 3 | Rerun after the introduction table: MCP 3 and 4 PASS; public 3 PARTIAL (no MLflow-to-Model-Card guidance) | PASS |
 
 ### Commands
 
@@ -397,6 +397,14 @@ unchanged: the README is not in it.
 REQ-007 fails for MCP onboarding. Agents read `llms.txt`, `llms-full.txt` and the
 docs, not the README, so the comparison is invisible to them. The README row also
 dropped the hub's "send evidence with the MLflow run ID" guidance.
+
+Fix: the docs introduction now repeats Already have tools? (revision `7321284c3`).
+MCP rerun on the same prompts:
+
+| Problem | Entry | Sources read | Answer summary | Rubric |
+| --- | --- | --- | --- | --- |
+| 3 MLflow | MCP | guide start → llms → setup prompt → llms-full introduction table | Keep MLflow for training, experiments, registry; add Wyrd for runtime verification of the deployed version via an exact Model ref; no connector invented | PASS |
+| 4 Existing tools | MCP | guide start → llms → setup prompt → llms-full introduction table, ASGI, `execution_route` | Keep Langfuse and gateway; add Wyrd for composed checks and attribution; `telemetry=False` exporter, `native` route; no connector invented | PASS |
 
 ### Limits and non-goals
 

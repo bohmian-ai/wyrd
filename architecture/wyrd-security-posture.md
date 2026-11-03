@@ -25,8 +25,6 @@ controls required to operate those boundaries.
 - Secrets are resolved from a deployment secret provider at runtime. They are
   never Card fields, generated artifacts, logs, traces, errors, or audit
   payloads.
-- Authentication establishes who may call a Wyrd route. Policy governs Card
-  state (classify, gate). These are separate decision planes.
 
 ## Trust boundaries
 
@@ -37,7 +35,6 @@ controls required to operate those boundaries.
 | `wyrd-server` replica to replica | Mutual TLS from one dedicated cluster CA with the fixed `wyrd-peer` identity; the receiver checks every operation's context against its own state |
 | Application to Postgres | Tenant traffic runs under RLS through `TenantConn` or the named single-statement owners; the operator pool is excluded from handlers by construction. Operators supply the logins; boot refuses superuser and `BYPASSRLS` logins. Production uses a separate tenant login that does not own Wyrd's objects, so RLS confines it even if compromised. One ordinary login (local and small self-hosted) keeps RLS per pool, but a process compromise could set the operator flag and reach every tenant |
 | Application to object storage | Workload identity or short-lived credentials; tenant-qualified prefixes; encryption in transit and at rest |
-| Server to a Source endpoint | Credential indirection, DNS resolution and SSRF screening, address pinning, bounded IO |
 
 ## Principal and credential lifecycle
 
@@ -508,7 +505,7 @@ resolve.
 `Permission { resource: Resource, action: Action, scope: PermissionScope }` is
 the one authorization vocabulary. `resource` and `action` name the operation;
 `scope` names the objects it may reach. A static role-derived grant over a
-named object is RBAC, not ABAC, and never enters the Policy plane. Handlers
+named object is RBAC, not ABAC. Handlers
 require a typed `Permission`, never a flat string; `resource:action` names an
 operation only and the object axis has no string spelling.
 
@@ -649,10 +646,9 @@ and opens no private listener.
 - Public client authentication and authorization are unchanged by peer mode;
   peer TLS is not public TLS and grants nothing on public listeners.
 
-## Source credentials and SSRF defense
+## Outbound credentials and SSRF defense
 
-`SourceAuth` carries secret-provider keys or environment-variable names, never
-secret bytes. Operator Cards instead carry a tenant Operator-connection name;
+Operator Cards carry a tenant Operator-connection name;
 the server resolves its envelope-encrypted Postgres credential under the exact
 tenant, provider, HTTP origin, and auth authority immediately before delivery.
 Multi-tenant Operator credentials never use process environment selectors.
@@ -838,7 +834,7 @@ history cannot feed itself. A legacy direct-Iceberg relay and
 `platform.audit_log` are not alternate historical authorities.
 
 Audit schemas minimize personal data. They store typed identities and decisions,
-not credentials, raw prompts, request bodies, Source payloads, or unnecessary
+not credentials, raw prompts, request bodies, or unnecessary
 personal attributes. Classification determines field retention and export
 controls. Where a legal erasure obligation applies, encrypted supplemental
 personal fields use tenant- or subject-scoped envelope keys that can be

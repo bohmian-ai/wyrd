@@ -27,7 +27,7 @@ GROUP BY verdict
 
 One server runs all four.
 
-Tables are Apache Iceberg tables of Parquet files in the deployment's object store, with the catalog in Postgres. The `vala.datasets` namespace holds caller-owned tables. Wyrd writes every other namespace.
+Tables are Apache Iceberg tables of Parquet files in the deployment's object store, with the catalog in Postgres. The `bifrost.datasets` namespace holds caller-owned tables. Wyrd writes every other namespace.
 
 ## Where each part runs
 

@@ -3,7 +3,7 @@ id: TASK-002
 kind: implementation
 status: proposed
 spec: SPEC-local-init-cleanup
-spec_revision: 1
+spec_revision: 2
 requirements: [REQ-001, REQ-002, REQ-003, REQ-004, REQ-005, REQ-006, REQ-007, INV-001, INV-002, INV-003]
 acceptance: [AC-001, AC-002, AC-003, AC-004, AC-005]
 depends_on: []
@@ -28,14 +28,16 @@ without the author conversation.
 ## What Changes and What Must Stay True
 
 Add the six approved README badges, one use-case hub, the simple six-platform
-comparison, a source-backed engine/production/performance explanation, and a
-prominent policy-artifact worked path. Connect existing entry points to these
-pages and keep the first quickstart minimal. Reuse existing docs sections,
+comparison, links to existing engine/production explanations, and a
+prominent route to the completed existing policy-artifact recipe. Connect
+existing entry points to these canonical destinations and keep the first
+quickstart minimal. Reuse existing docs sections,
 frontmatter and components; a new top-level section or navigation engine is
 not required. Use existing tested source for copyable examples.
 
-The hub gives each badge a concrete problem, evidence needed, suitable checks,
-an existing worked path, and application responsibilities. Cover policy
+The hub gives each badge a short problem-to-workflow description and canonical
+links. It does not reproduce check tables, technical explanations or tutorials.
+Cover policy
 judgments, agent evaluation, extended workflows, runtime decisions,
 observability and scheduled drift. Include model/data/artifact/experiment
 registration as part of Wyrd's broader substrate rather than reducing the
@@ -60,10 +62,13 @@ names, the CLI lifecycle, or existing deployment expectations.
 
 1. Revalidate the source evidence below and current official vendor facts;
    record their checked date beside the comparison's supporting references.
-2. Write the use-case hub and promote the existing policy-artifact workflow;
-   provide the compact check-selection table and grouped/drift links.
-3. Add the simple comparison and explain engine composition, production
-   mechanisms and measured performance with their original context.
+2. Write thin use-case routing. Reuse/update and link the existing Recipes
+   selection table; promote and complete Uploaded files in its current owner
+   with Service declaration, invocation and cited-result inspection. Link the
+   published grouped/drift sections rather than reproducing them.
+3. Add the simple comparison, make Wyrd's concrete differentiators visible,
+   and link existing verification/Bifrost/operational explanations. Do not add
+   a new architecture section or publish benchmarks.
 4. Add accessible README badges and connect the shared prompt, MCP start
    guide, coding-agent page, docs landing/navigation and index onboarding.
 5. Prove changed discovery behavior, regenerate owned outputs, run the bounded
@@ -98,7 +103,7 @@ existing structure. Preserve passing regression checks.
 
 ## Proof Strategy for Content
 
-Badges, explanatory prose, comparison copy, prompt wording and benchmark
+Badges, explanatory prose, comparison copy, prompt wording and source
 references are static obligations: no artificial RED or string-pinning tests.
 Review rendered pages, links, source provenance and generated text. Existing
 journeys establish runtime behavior; they do not establish real-model judgment
@@ -129,7 +134,7 @@ release. Reuse the uploaded-Artifact journey below as regression evidence.
 | REQ-001, INV-001 | README and docs open with production verification across AI/ML and application workflows. Source review confirms substantive coverage beyond agents, while orchestration/enforcement responsibilities remain clear. |
 | REQ-002 | All six named badges are legible, accessible links to published relevant content; visual/link inspection confirms they do not imply certification. |
 | REQ-003, INV-002 | Six-platform, three-column comparison gives Wyrd full scope, accurately represents vendor focus and overlap, and contains no OPA/status taxonomy or invented integrations/parity. Official references are dated. |
-| REQ-004, INV-002 | Engine, durability, isolation, admission, gateway and Bifrost claims link to owners. Published benchmark numbers reproduce the specified records, units and workload; no unrelated/invalid measurement is relabelled. |
+| REQ-004, INV-002 | Concrete differentiators link to existing verification, Bifrost and operational explanations. No duplicated architecture section, benchmark tables, figures or numerical speedup claims are published. |
 | REQ-005, INV-003 | Focused discovery regressions plus generated/rendered inspection establish every entry route, onboarding order and draft exclusion. The nonexistent next-step instruction is replaced by a working link. |
 | REQ-006, INV-001 | The promoted policy path reuses tested fixtures/examples, explains exact selected files/tools/citations, and completes the existing public workflow. Group and drift routes and check-selection guidance are discoverable. |
 | REQ-007 | All four reader problems meet their rubric through both entry paths in fresh contexts; recorded evidence supports comprehension without access to this packet or private source. |
@@ -138,6 +143,20 @@ release. Reuse the uploaded-Artifact journey below as regression evidence.
 
 Reuse these inspected owners; paths guide the implementation, not a file
 allowlist:
+
+| Content | Canonical owner and minimum edit |
+| --- | --- |
+| Check selection | `build-and-verify/verify/verifier-recipes.md`, existing opening table: update only if needed, then link. No second selection table. |
+| Policy Artifact workflow | The same page's Uploaded files section: retain upload/version/mount guidance; add the missing Service declaration → invocation → cited-result public steps from existing tested material. No parallel policy tutorial. |
+| Check semantics, workspaces, versions, verdicts and inline/queued behavior | `understand/how-verification-works.md` and `reference/verifier-card.md`: link existing explanations. |
+| Grouped evidence and drift | Published Grouped session and Drift sections in Recipes: link them. Existing draft guides are not prerequisites and must not be published merely to create badge destinations. |
+| Architecture and Bifrost | `understand/architecture.md` and `understand/bifrost.md`: link existing explanations; add no new architecture/performance section. |
+| Use cases and vendor comparison | Thin routing descriptions and one maintained three-column comparison, which may share an existing page or one thin new page. README, prompts and other entry points link to those owners rather than copying them. |
+
+Paths in this table are relative to `docs/src/content/docs/`. The new content
+is navigation and the requested comparison, plus completion of the missing
+public steps in the existing Artifact recipe. Shared generated projections
+remain generated from these sources.
 
 - **README:** `README.md` already mentions documents/long workflows but its
   worked example emphasizes an assertion. Add badges and richer routing;
@@ -198,33 +217,20 @@ Official sources checked on 2026-11-03; refresh before publication:
   custom scoring is absent. [Arize AX](https://arize.com/products/ml-cv-observability/)
   includes conventional ML monitoring and must not be conflated with Phoenix.
 
-### Recorded performance evidence
+### Recorded decision: reuse architecture docs; do not publish benchmarks
 
-Use the actual records at immutable benchmark-history commit `274cbfb83`,
-measured source `92b62f9c0`, and the methodology in `benchmarks/README.md`:
+The maintainer explicitly rejected including OTLP benchmark material in this
+documentation change. Existing docs already explain verification and Bifrost;
+link those pages rather than introducing another architecture explanation.
+Keep the simple comparison and use cases focused on what readers can build
+and why to choose Wyrd. Mention concrete differentiators briefly and direct
+readers to existing detail.
 
-| Workload | Recorded result approved for contextual publication |
-| --- | --- |
-| OTLP spans approximately 338 bytes, 64 clients | Approximately 267,603 spans/s; derived median 8,362.598 spans/s/vCPU × 32. |
-| OTLP spans approximately 1,054 bytes, 64 clients | Approximately 130,298 spans/s; derived median 4,071.810 spans/s/vCPU × 32. |
-| Published Parquet trace-ID lookup, one client | 4.551 ms server p99. |
-| Published Parquet trace-ID lookup, 64 clients | 24.609 ms server p99; approximately 4,067 queries/s. |
-
-[Write record](https://github.com/bohmian-ai/wyrd/blob/274cbfb83/bifrost/writes-parquet/20261031T125731Z-92b62f9c0.json)
-and [query record](https://github.com/bohmian-ai/wyrd/blob/274cbfb83/bifrost/parquet/20261031T130839Z-92b62f9c0.json)
-are VALID. Recheck exact fields and arithmetic before publishing. Context:
-Linux, Ryzen 9950X, 32 logical CPUs, approximately 92 GiB RAM, local file
-storage, three repetitions. Writes are short durable-ack windows, not sustained
-publication throughput; trace lookup uses a settled 1.5-million-span fixture.
-Retain payload, concurrency, server-latency scope, storage and source revision
-near the figures or in an immediately linked methodology table.
-
-Do not call the separate 2.206-million native rows/s result OTLP throughput;
-do not call the 4.981-ms hot point lookup a trace lookup; do not promote the
-driver-saturated INVALID direct-verification result as validated. No matched
-vendor benchmark was found. Explain architectural distinctions and Wyrd's
-measurements rather than inventing a numeric ranking. No rerun is required by
-this documentation task.
+Do not publish OTLP measurements, benchmark tables, throughput/latency
+figures, methodology sections or numerical vendor rankings. Internal benchmark
+records remain untouched; they are not a deliverable or an acceptance target
+for this task. Do not replace the removed material with vague unsupported
+superiority claims.
 
 ## Verification and Evidence
 
@@ -283,12 +289,12 @@ Stop for a proposed runtime, wire, permissions, persisted-data or integration
 change; a necessary capability that is only a contract rather than implemented
 behavior; or contradictory Operator dispatch semantics not resolvable from
 the owning contract and runtime. Keep discovered runtime work separate. Correct
-stale vendor facts and metric labels locally when the approved intent remains
+stale vendor facts locally when the recorded intent remains
 intact; do not weaken Wyrd's documented scope or fabricate comparative proof.
 
 ## Authority Links
 
-[Shared spec revision 1 (draft)](../spec.md), [AGENTS.md](../../../../AGENTS.md),
+[Shared spec revision 2 (draft)](../spec.md), [AGENTS.md](../../../../AGENTS.md),
 [docs rules](../../../../docs/AGENTS.md),
 [docs contributing](../../../../docs/CONTRIBUTING.md),
 [docs product](../../../../docs/PRODUCT.md),

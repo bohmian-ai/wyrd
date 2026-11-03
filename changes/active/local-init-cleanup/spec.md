@@ -1,7 +1,7 @@
 ---
 id: SPEC-local-init-cleanup
-revision: 1
-status: approved
+revision: 2
+status: draft
 ---
 
 # Local setup and verification documentation cleanup
@@ -24,7 +24,10 @@ On 2026-11-03 the maintainer approved the documentation direction, then asked
 to keep both tasks in the existing change packet and create one shared spec.
 This revision consolidates those recorded decisions and the existing setup task.
 The maintainer explicitly approved spec revision 1 when requesting TASK-001
-review on 2026-11-03. Only the two bounded tasks below are in scope:
+review on 2026-11-03. Revision 2 records the subsequent direction to omit
+public benchmark material and reuse existing architecture explanations; it
+remains draft. TASK-001's revision-1 obligations are unchanged. Only the two
+bounded tasks below are in scope:
 
 - [TASK-001 — local setup cleanup](tasks/TASK-001-local-setup-cleanup.md).
 - [TASK-002 — verification documentation](tasks/TASK-002-document-verification-scope.md).
@@ -69,13 +72,14 @@ from this initial matrix. Do not equate Phoenix with the entire Arize AX
 offering. Separate competitor feature documentation from evidence about
 relative implementation depth, performance, or production reliability.
 
-**REQ-004.** Follow the matrix with a clear explanation of why Wyrd's engine
-differs: heterogeneous evidence; extraction/Agent/Code preparation; five check
-kinds; dependencies, conditions, parallelism, retries and timeouts; structured
-verdict data and citations; exact versions; individual and grouped evidence.
-Explain relevant durable execution, isolation, admission and analytical
-storage mechanisms, and publish the measured tracing results with context.
-Keep implementation details where they help a reader choose Wyrd.
+**REQ-004.** Make Wyrd's concrete differentiators easy to find from the
+comparison and use cases: heterogeneous evidence, composed checks, exact
+versions, cited structured verdicts, and individual/grouped evidence. Link to
+the existing verification, Bifrost and operational explanations for engine and
+architecture detail. Do not add another architecture section or duplicate
+those explanations. No OTLP figures, benchmark tables, throughput/latency
+numbers, benchmark methodology sections or vendor speedup rankings are to be
+published as part of this documentation change.
 
 ### Make the richer workflows discoverable
 
@@ -87,15 +91,19 @@ Keep setup then quickstart as the first two machine onboarding steps; make
 capability selection the explicit next step. Replace the nonexistent
 "Choose your path" instruction with a real link. The assertion quickstart
 remains small and explicitly identifies itself as the simplest example.
+The hub is short problem-to-workflow routing, whether added to an existing
+page or published as one thin page; it does not repeat technical explanations.
 
 **REQ-006.** Promote the existing policy Artifact → exact selected workspace
 files → Agent check → Service-bound verification workflow into an obvious
-worked path. Explain upload/extraction, policy versions, declared tools and
-grants, supplied transaction/execution evidence, citations, and inline versus
-queued evaluation. Link the existing grouped-session and drift workflows.
-Add a compact selection table for Assert/Code, Agent, Trace, grouped evidence,
-and scheduled Drift. Reuse existing tested examples and fixtures rather than
-inventing a parallel tutorial implementation.
+worked path by completing its existing Uploaded files recipe with Service
+declaration, invocation with evidence, and inspection of the cited result.
+Reuse the recipe's upload/version/workspace/tool explanations and link existing
+concepts for check semantics and inline versus queued evaluation. Reuse/update
+and link the existing Recipes selection table for Assert/Code, Agent, Trace,
+grouped evidence, and scheduled Drift. Link the published grouped-session and
+drift sections. No second policy tutorial or selection table is required;
+reuse tested examples and fixtures rather than inventing parallel material.
 
 **REQ-007.** Verify reader comprehension with four scenarios: a payment
 workflow governed by a policy document; a multi-hour coding/review workflow;
@@ -144,7 +152,7 @@ consistent with text. Checklist wording and markers remain implementation-owned.
   Policy-document judgments do not assert an unverified general Policy Card
   enforcement runtime.
 - **INV-002 — Evidence-backed claims.** Lead positively with implemented
-  capabilities and recorded measurements. Do not invent native MLflow/other
+  capabilities and source-backed differentiators. Do not invent native MLflow/other
   vendor connectors, arbitrary external reads, experiment-tracker feature
   parity, adoption, or head-to-head speedups. A competitor's product focus
   does not prove it cannot run custom code. Wyrd's bounded Code checks are not
@@ -176,7 +184,7 @@ setup reporting.
 | --- | --- | --- |
 | AC-001 | REQ-001, REQ-002, INV-001 | README presents Wyrd's full scope and six accessible use-case links; rendered review confirms relevant published destinations. |
 | AC-002 | REQ-003, INV-002 | Simple six-platform comparison gives Wyrd full credit, dates its primary evidence, and omits OPA, status labels and unsupported claims. |
-| AC-003 | REQ-004, INV-002 | Engine/production claims match source owners; published metrics reproduce the correct records, units and workloads without invented vendor speedups. |
+| AC-003 | REQ-004, INV-002 | Differentiators match source owners and link to existing explanations; no new architecture exposition or benchmark publication is added. |
 | AC-004 | REQ-005, INV-003 | Public and machine discovery reach the richer workflows, preserve setup/quickstart order and draft exclusion, and contain no nonexistent next-step link. |
 | AC-005 | REQ-006, REQ-007, INV-001 | Existing policy workflow completes with cited evidence; all four reader scenarios succeed through both public docs and MCP onboarding. |
 | AC-006 | REQ-008, INV-003 | Static inspection and generated-output checks find the current docs origin throughout active onboarding. No new URL-string test is required. |
@@ -210,3 +218,7 @@ Authorities: [repository rules](../../../AGENTS.md),
   bounded startup/reporting outcomes. Combined revision awaits human approval.
 - Revision 1 approved, 2026-11-03: explicit maintainer approval recorded with
   the TASK-001 review request; no requirement or acceptance behavior changed.
+
+- Revision 2, draft, 2026-11-03: recorded the maintainer's rejection of public
+  benchmark material and clarification that existing architecture documentation
+  should be linked rather than duplicated. TASK-001 runtime scope is unchanged.

@@ -1593,6 +1593,147 @@ mod tests {
         );
     }
 
+    /// Live-route selections that leave nothing are quiet: a predicate that
+    /// prunes every route at planning, and the output partitions a single
+    /// kept route is not dealt to, resolve to no routes, so no fragment is
+    /// built or dispatched, and statistics conversion logs no warning.
+    ///
+    /// The predicate is the Observe shape over the span columns: a
+    /// nanosecond time window, a service, a numeric kind, and a GenAI
+    /// operation. `DataFusion` logs through `log`, which the production
+    /// subscriber forwards into the captured span.
+    ///
+    /// # Panics
+    /// Panics when the trace capture does not install, pushdown fails, a
+    /// selection keeps the wrong routes, or any warning is captured.
+    #[test]
+    fn empty_live_route_selections_do_not_warn() {
+        use super::super::exec::tests::FIXTURE_TIME_COLUMN;
+        use arrow::datatypes::TimeUnit;
+        use datafusion::physical_optimizer::PhysicalOptimizerRule as _;
+        use datafusion::physical_optimizer::filter_pushdown::FilterPushdown;
+
+        let (_telemetry, traces) =
+            wyrd_telemetry::init_test_capture(wyrd_telemetry::TelemetryConfig::default())
+                .expect("trace capture installs once per test process");
+        let schema: SchemaRef = Arc::new(Schema::new(vec![
+            Field::new(
+                FIXTURE_TIME_COLUMN,
+                DataType::Timestamp(TimeUnit::Nanosecond, Some("UTC".into())),
+                false,
+            ),
+            Field::new("service_name", DataType::Utf8, false),
+            Field::new("kind", DataType::Int32, false),
+            Field::new("gen_ai_operation_name", DataType::Utf8, true),
+        ]));
+        let routes = crate::oracle::exec::tests::one_live_route(wyrd_spec::DataTenantId::new_v7());
+        let route_hour_nanos = 1_787_493_600_000_000_000_i64;
+        let observe = |start_nanos: i64| {
+            datafusion::prelude::SessionContext::new()
+                .create_physical_expr(
+                    datafusion::prelude::col(FIXTURE_TIME_COLUMN)
+                        .gt_eq(datafusion::prelude::lit(
+                            datafusion::scalar::ScalarValue::TimestampNanosecond(
+                                Some(start_nanos),
+                                Some("UTC".into()),
+                            ),
+                        ))
+                        .and(
+                            datafusion::prelude::col("service_name")
+                                .eq(datafusion::prelude::lit("checkout")),
+                        )
+                        .and(datafusion::prelude::col("kind").eq(datafusion::prelude::lit(2_i32)))
+                        .and(
+                            datafusion::prelude::col("gen_ai_operation_name")
+                                .eq(datafusion::prelude::lit("chat")),
+                        ),
+                    &datafusion::common::DFSchema::try_from(schema.as_ref().clone())
+                        .expect("span schema"),
+                )
+                .expect("observe predicate plans")
+        };
+        let pushed = |predicate: Arc<dyn PhysicalExpr>| {
+            let leaf = Arc::new(LiveScribeExec::new(
+                routes.clone(),
+                crate::catalog::TimeAxis::new(
+                    FIXTURE_TIME_COLUMN,
+                    crate::catalog::TimeGranularity::Hour,
+                ),
+                "f".repeat(64),
+                schema.fields().iter().map(|f| f.name().clone()).collect(),
+                Arc::clone(&schema),
+                4,
+            ));
+            let plan = FilterPushdown::new()
+                .optimize(
+                    Arc::new(FilterExec::try_new(predicate, leaf).expect("filter plans")),
+                    &ConfigOptions::default(),
+                )
+                .expect("pushdown runs");
+            plan.downcast_ref::<FilterExec>()
+                .expect("the leader keeps its filter")
+                .input()
+                .downcast_ref::<LiveScribeExec>()
+                .expect("the live leaf stays under the filter")
+                .clone()
+        };
+        let dealt = |live: &LiveScribeExec| {
+            (0..4)
+                .map(|partition| {
+                    live.resolved(partition)
+                        .expect("static predicate resolves")
+                        .1
+                        .len()
+                })
+                .collect::<Vec<_>>()
+        };
+
+        // Planned outside the captured span: session setup logs enough to
+        // exhaust a span's event budget before the selection runs.
+        let after_the_hour = observe(route_hour_nanos + 3_600_000_000_000);
+        let within_the_hour = observe(route_hour_nanos);
+        let checkpoint = traces.checkpoint();
+        let (after_the_hour, within_the_hour) =
+            tracing::info_span!("empty_live_routes").in_scope(|| {
+                let after_the_hour = pushed(after_the_hour);
+                let within_the_hour = pushed(within_the_hour);
+                (
+                    (after_the_hour.routes.routes.len(), dealt(&after_the_hour)),
+                    (within_the_hour.routes.routes.len(), dealt(&within_the_hour)),
+                )
+            });
+        let events = traces
+            .finished_since(checkpoint)
+            .into_iter()
+            .flat_map(|span| span.events)
+            .collect::<Vec<_>>();
+        // OpenTelemetry keeps at most 128 events per span; a full span could
+        // have dropped a warning.
+        assert!(events.len() < 128, "the span kept every event");
+        let warnings = events
+            .into_iter()
+            .filter(|event| {
+                event
+                    .attributes
+                    .get("level")
+                    .is_some_and(|level| level == "WARN")
+            })
+            .map(|event| event.name)
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            after_the_hour,
+            (0, vec![0; 4]),
+            "planning prunes every route"
+        );
+        assert_eq!(
+            within_the_hour,
+            (1, vec![1, 0, 0, 0]),
+            "the kept route is dealt to one partition"
+        );
+        assert_eq!(warnings, Vec::<String>::new(), "empty selections are quiet");
+    }
+
     /// Encodes `rows` through the Scribe's own attempt encoder.
     fn frames(fingerprint: &str, rows: &[i64]) -> Vec<WorkerAttemptFrame> {
         let schema = Arc::new(Schema::new(vec![Field::new("v", DataType::Int64, false)]));

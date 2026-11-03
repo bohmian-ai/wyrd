@@ -661,6 +661,143 @@ mod tests {
         assert_eq!(exact, Some(false));
     }
 
+    /// Partial bounds keep their exact batches useful without claiming more
+    /// than they prove: beside an unknown and an inexact batch, the exact
+    /// batch below `id >= 15` is excluded from the scan and from sizing, only
+    /// the exact batch above it is proven fully matching, and the rows equal
+    /// those of an unpruned filter over every batch.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the source cannot be built, a batch is kept, sized, or
+    /// classified wrongly, or the answer differs from the reference rows.
+    #[tokio::test]
+    async fn partial_statistics_preserve_conservative_filtering() {
+        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
+        let recorded = |values: &[i64]| {
+            let batch = RecordBatch::try_new(
+                Arc::clone(&schema),
+                vec![Arc::new(Int64Array::from(values.to_vec()))],
+            )
+            .expect("fixture batch");
+            let bounds = crate::scribe::memtable::batch_statistics(&batch);
+            (batch, bounds)
+        };
+        let below = recorded(&[0, 1, 2]);
+        let (unknown_batch, mut unknown) = recorded(&[3, 16]);
+        for column in &mut Arc::make_mut(&mut unknown).column_statistics {
+            column.min_value = Precision::Absent;
+            column.max_value = Precision::Absent;
+        }
+        let (inexact_batch, inexact) = recorded(&[14, 15]);
+        let inexact = Arc::new(inexact.as_ref().clone().to_inexact());
+        let above = recorded(&[20, 21, 22]);
+        let batches = vec![
+            below.clone(),
+            (unknown_batch, unknown),
+            (inexact_batch, inexact),
+            above.clone(),
+        ];
+        let statistics = batches
+            .iter()
+            .map(|(_, bounds)| Arc::clone(bounds))
+            .collect::<Vec<_>>();
+        let predicate = Arc::new(BinaryExpr::new(
+            col("id", &schema).expect("id column"),
+            Operator::GtEq,
+            lit(15_i64),
+        ));
+        let reference = datafusion::physical_plan::filter::batch_filter(
+            &arrow::compute::concat_batches(&schema, batches.iter().map(|(batch, _)| batch))
+                .expect("reference batch"),
+            &(Arc::clone(&predicate) as Arc<dyn datafusion::physical_expr::PhysicalExpr>),
+        )
+        .expect("reference rows");
+        let ids = |rows: &[RecordBatch]| {
+            let mut ids = rows
+                .iter()
+                .flat_map(|batch| {
+                    batch
+                        .column(0)
+                        .as_any()
+                        .downcast_ref::<Int64Array>()
+                        .expect("ids")
+                        .values()
+                        .to_vec()
+                })
+                .collect::<Vec<_>>();
+            ids.sort_unstable();
+            ids
+        };
+        let scope = crate::scan_sizing::ScanScope {
+            columns: vec!["id".to_owned()],
+            filters: vec![datafusion::prelude::col("id").gt_eq(datafusion::prelude::lit(15_i64))],
+        };
+        let sized = crate::scan_sizing::ScanSizer::new(&scope, &schema).batch_bytes(&statistics);
+        let bytes = |bounds: &Statistics| {
+            *bounds.column_statistics[0]
+                .byte_size
+                .get_value()
+                .expect("recorded byte size") as u64
+        };
+        let source = MemtableSource::try_new(
+            batches,
+            Arc::from(Vec::new()),
+            crate::scan_sizing::OraclePartitioning::new(
+                1,
+                crate::scan_sizing::ORACLE_PARTITION_SCAN_BYTES,
+            ),
+            1,
+            Arc::clone(&schema),
+        )
+        .expect("memtable source");
+        let plan: Arc<dyn ExecutionPlan> = Arc::new(
+            FilterExec::try_new(
+                Arc::clone(&predicate) as _,
+                Arc::new(DataSourceExec::new(Arc::new(source))),
+            )
+            .expect("filter over the memtable"),
+        );
+
+        let (plan, source) = pushed_down(plan);
+        let rows = collect(
+            plan,
+            Arc::new(datafusion::execution::TaskContext::default()),
+        )
+        .await
+        .expect("execute the pruned scan");
+
+        assert_eq!(
+            source
+                .inner
+                .partitions()
+                .iter()
+                .map(Vec::len)
+                .collect::<Vec<_>>(),
+            vec![3],
+            "only the exact batch below the range is excluded"
+        );
+        assert_eq!(source.matched, vec![vec![false, false, true]]);
+        assert_eq!(
+            sized,
+            statistics[1..]
+                .iter()
+                .map(|bounds| bytes(bounds))
+                .sum::<u64>(),
+            "sizing counts the unknown and inexact batches and not the excluded one"
+        );
+        assert_ne!(bytes(&below.1), 0);
+        assert_eq!(
+            crate::scan_sizing::BatchPruning::try_new(&schema, Arc::clone(&predicate) as _)
+                .expect("the range is a pruning predicate")
+                .keep(&[], 0),
+            Vec::<bool>::new(),
+            "no batches keep nothing"
+        );
+        assert_eq!(ids(&rows), ids(&[reference]));
+        assert_eq!(ids(&rows), vec![15, 16, 20, 21, 22]);
+    }
+
     /// The source reports Scribe's recorded bounds merged per partition and
     /// in total, not statistics recomputed from the batches, a bound whose
     /// type is not the source schema's column type is not reported, and a

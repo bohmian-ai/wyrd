@@ -1366,7 +1366,7 @@ impl HotFileSource {
 /// contain every stored value. A `schema` whose `time_column` is absent or not
 /// a time-column type, or an interval not representable at its precision,
 /// leaves `statistics` unchanged, so the container is kept.
-pub(super) fn set_time_bounds(
+pub(crate) fn set_time_bounds(
     statistics: &mut Statistics,
     schema: &Schema,
     time_column: &str,

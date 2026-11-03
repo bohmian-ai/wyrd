@@ -117,8 +117,20 @@ test("users manage personal keys", async ({ server }) => {
   await expect(own.listCredentials(user)).rejects.toMatchObject({ code: "WYRD_SPEC_400_VALIDATION" });
   await expect(own.issueCredential(user)).rejects.toMatchObject({ code: "WYRD_SPEC_400_VALIDATION" });
 
+  const expected = new Set([...server.seedUserKeys(user, 105), listed?.id]);
+  const seen: string[] = [];
+  let cursor: string | undefined;
+  do {
+    const next = await own.listCredentialsPage(user, { limit: 100, cursor });
+    expect(next.credentials.length).toBeLessThanOrEqual(100);
+    seen.push(...next.credentials.map((credential) => credential.id));
+    cursor = next.next_cursor;
+  } while (cursor !== undefined);
+  expect(new Set(seen).size).toBe(seen.length);
+  expect(new Set(seen)).toEqual(expected);
+
   const admin = await Principals.connect();
-  expect((await admin.listCredentials(user)).credentials).toHaveLength(1);
+  expect(new Set((await admin.listCredentials(user)).credentials.map((credential) => credential.id))).toEqual(expected);
   await expect(admin.me()).rejects.toMatchObject(DENIED);
 
   await own.revokeCredential(user, listed?.id ?? "");

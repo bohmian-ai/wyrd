@@ -365,6 +365,26 @@ impl NativeWyrdTestServer {
         result
     }
 
+    /// Store `count` valid keys for User `user` sharing one creation time, so
+    /// their listing pages across timestamp ties; returns their ids.
+    ///
+    /// # Errors
+    ///
+    /// Returns a napi error when the harness is closed, `user` is not a
+    /// principal id, or the write fails.
+    #[napi]
+    pub fn seed_user_keys(&self, user: String, count: u32) -> Result<Vec<String>> {
+        self.with_server(|server| {
+            let user = user
+                .parse::<wyrd_runtime::PrincipalId>()
+                .map_err(|error| reason(format!("invalid principal id: {error}")))?;
+            let ids = wyrd_runtime::runtime()
+                .block_on(server.seed_user_keys(user, count as usize))
+                .map_err(reason)?;
+            Ok(ids.iter().map(ToString::to_string).collect())
+        })
+    }
+
     /// Bootstrap a service principal holding `roles` in tenant `tenant_id` and
     /// return its API key.
     ///

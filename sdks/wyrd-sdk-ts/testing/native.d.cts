@@ -146,6 +146,16 @@ export declare class NativeWyrdTestServer {
    */
   bootstrapUserKey(roles: Array<string>, name: string, ceiling: Array<string>): Array<string>
   /**
+   * Store `count` valid keys for User `user` sharing one creation time, so
+   * their listing pages across timestamp ties; returns their ids.
+   *
+   * # Errors
+   *
+   * Returns a napi error when the harness is closed, `user` is not a
+   * principal id, or the write fails.
+   */
+  seedUserKeys(user: string, count: number): Array<string>
+  /**
    * Bootstrap a service principal holding `roles` in tenant `tenant_id` and
    * return its API key.
    *

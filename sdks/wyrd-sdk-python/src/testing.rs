@@ -422,6 +422,23 @@ impl WyrdTestServer {
         Ok((id.to_string(), key.expose_secret().to_owned()))
     }
 
+    /// Store `count` valid keys for User `user` sharing one creation time,
+    /// so their listing pages across timestamp ties; returns their ids.
+    ///
+    /// # Errors
+    /// Raises a harness error for an invalid principal id, and a Wyrd
+    /// Python error when the context manager is inactive or the write fails.
+    fn seed_user_keys(&self, user: &str, count: usize) -> WyrdPyResult<Vec<String>> {
+        let server = self.started()?;
+        let user = user
+            .parse::<wyrd_runtime::PrincipalId>()
+            .map_err(|error| harness_error(format!("invalid principal id: {error}")))?;
+        let ids = wyrd_runtime::runtime()
+            .block_on(server.seed_user_keys(user, count))
+            .map_err(py_error)?;
+        Ok(ids.iter().map(ToString::to_string).collect())
+    }
+
     /// Issue an API key for a registered Service Card's family runtime account.
     ///
     /// A credential fixture: the account restricted to the Card's family is

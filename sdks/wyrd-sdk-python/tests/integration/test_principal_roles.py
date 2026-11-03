@@ -151,8 +151,23 @@ def test_users_manage_personal_keys(server: WyrdTestServer) -> None:
         own.issue_credential(user)
     assert issued.value.code == "WYRD_SPEC_400_VALIDATION"
 
+    expected = {*server.seed_user_keys(user, 105), listed["id"]}
+    seen: list[str] = []
+    cursor = None
+    while True:
+        page = own.list_credentials_page(user, limit=100, cursor=cursor)
+        assert len(page["credentials"]) <= 100
+        seen += [credential["id"] for credential in page["credentials"]]
+        if "next_cursor" not in page:
+            break
+        cursor = page["next_cursor"]
+    assert len(seen) == len(set(seen))
+    assert set(seen) == expected
+
     admin = Principals(client_of(server))
-    assert len(admin.list_credentials(user)["credentials"]) == 1
+    assert {
+        credential["id"] for credential in admin.list_credentials(user)["credentials"]
+    } == expected
     with pytest.raises(WyrdError) as service:
         admin.me()
     assert service.value.code == DENIED

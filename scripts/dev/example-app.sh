@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Prepare and run the canonical wyrd-example-py application for `dev:full`.
 #
-#   example-app.sh prepare   pinned checkout + patch + this checkout's production wheel
+#   example-app.sh prepare   pinned checkout + this checkout's production wheel
 #   example-app.sh setup     gateway deployment to MockServer, Cards, capture policy
 #   example-app.sh serve     the API on 127.0.0.1:${WYRD_EXAMPLE_PORT:-8000}
 #   example-app.sh batch ARGS   one bounded workload batch (scripts/batch.py)
@@ -9,16 +9,15 @@
 #                               in an environment kept apart from the development one
 #
 # The checkout at target/dev/wyrd-example-py is the pinned upstream commit
-# with scripts/dev/wyrd-example-py.patch applied. A checkout holding anything
-# else is refused, never overwritten. The wheel is built from this repository
+# (wyrd-example-py's dev-workload branch). A checkout holding uncommitted
+# changes is refused, never overwritten. The wheel is built from this repository
 # without the testing feature, is the only file in the app's vendor index, and
 # the installed native module must match its digest.
 set -Eeuo pipefail
 
 readonly root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 readonly repo=https://github.com/bohmian-ai/wyrd-example-py
-readonly base=03428e1a4a35c8f23f71a95cae08e956ca317c9b
-readonly patch="$root/scripts/dev/wyrd-example-py.patch"
+readonly base=49bba61725ae48586afb3b00afbb45acd27aa6cc
 readonly app="$root/target/dev/wyrd-example-py"
 readonly port=${WYRD_EXAMPLE_PORT:-8000}
 
@@ -31,33 +30,23 @@ worktree_tree() {
   rm -f "$index"
 }
 
-# The tree id the pinned base with the patch applied must have.
-patched_tree() {
-  local index
-  index=$(mktemp -u)
-  GIT_INDEX_FILE=$index git -C "$app" read-tree "$base"
-  GIT_INDEX_FILE=$index git -C "$app" apply --cached "$patch"
-  GIT_INDEX_FILE=$index git -C "$app" write-tree
-  rm -f "$index"
-}
-
 checkout() {
   if [[ ! -d $app/.git ]]; then
     git clone --quiet "$repo" "$app"
   fi
   git -C "$app" cat-file -e "$base^{commit}" 2>/dev/null || git -C "$app" fetch --quiet origin "$base"
-  local want current
-  want=$(patched_tree)
+  local current
   current=$(worktree_tree)
-  if [[ $current == "$want" ]]; then
+  # Files identical to the pin (such as an old base-plus-patch checkout) only move HEAD.
+  if [[ $current == "$(git -C "$app" rev-parse "$base^{tree}")" ]]; then
+    git -C "$app" -c advice.detachedHead=false checkout --quiet --force "$base"
     return
   fi
-  if [[ $current != "$(git -C "$app" rev-parse "$base^{tree}")" ]]; then
-    echo "$app has changes that are not $base plus $(basename "$patch"); move them aside and rerun" >&2
+  if [[ $current != "$(git -C "$app" rev-parse HEAD^{tree})" ]]; then
+    echo "$app has uncommitted changes; move them aside and rerun" >&2
     exit 1
   fi
   git -C "$app" -c advice.detachedHead=false checkout --quiet "$base"
-  git -C "$app" apply "$patch"
 }
 
 wheel() {
@@ -80,8 +69,8 @@ wheel() {
     echo "the app imports a testing-enabled Wyrd SDK" >&2
     exit 1
   fi
-  printf 'wyrd-example-py %s + %s (sha256 %s), source tree %s, wheel %s (sha256 %s)\n' \
-    "$base" "$(basename "$patch")" "$(sha256sum "$patch" | cut -c1-12)" "$(worktree_tree)" \
+  printf 'wyrd-example-py %s, source tree %s, wheel %s (sha256 %s)\n' \
+    "$base" "$(worktree_tree)" \
     "$(basename "$built")" "$(sha256sum "$built" | cut -c1-12)"
 }
 

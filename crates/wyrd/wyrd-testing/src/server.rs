@@ -3094,6 +3094,109 @@ impl WyrdTestServer {
         })
     }
 
+    /// Create a local password User `name` holding the built-in `roles`, sign
+    /// them in through the production password login, and create one of
+    /// their own keys limited to `ceiling` through the production personal
+    /// key route; returns the User and the key, which the caller exchanges.
+    ///
+    /// # Errors
+    /// Returns an error when the User cannot be created or either route
+    /// refuses.
+    pub async fn bootstrap_user_key(
+        &self,
+        name: &str,
+        roles: &[&str],
+        ceiling: &[&str],
+    ) -> Result<(PrincipalId, SecretString), WyrdTestServerError> {
+        let tenant = self.data_tenant_id();
+        let password = format!("fixture user {}", Uuid::now_v7());
+        let verifier = wyrd_auth::passwords::hash_password(SecretString::from(password.clone()))
+            .await
+            .map_err(|error| WyrdTestServerError::Auth(error.to_string()))?;
+        let role_ids = roles
+            .iter()
+            .map(|role| wyrd_runtime::builtin_roles::builtin_role_uuid(tenant, role))
+            .collect::<Vec<_>>();
+        let mut conn = self.tenant_conn().await?;
+        let user_id =
+            wyrd_auth::passwords::create_local_user(&mut conn, name, &verifier, &role_ids)
+                .await
+                .map_err(|error| WyrdTestServerError::Auth(error.to_string()))?;
+        conn.commit().await.map_err(sql)?;
+        let slug = self.pg_fixture().tenant_slug();
+        let (headers, _) = self
+            .browser_json(
+                "/auth/browser/password/login",
+                None,
+                &serde_json::json!({ "tenant": slug, "username": name, "password": password }),
+            )
+            .await?;
+        let cookie = headers
+            .get_all(header::SET_COOKIE)
+            .iter()
+            .filter_map(|value| value.to_str().ok())
+            .find_map(|value| {
+                value
+                    .split(';')
+                    .next()
+                    .filter(|pair| pair.starts_with("wyrd_session_"))
+            })
+            .ok_or_else(|| WyrdTestServerError::Auth("login set no session cookie".to_owned()))?
+            .to_owned();
+        let (_, issued) = self
+            .browser_json(
+                &format!("/v1/principals/{user_id}/credentials"),
+                Some(&cookie),
+                &serde_json::json!({ "name": name, "permission_ceiling": ceiling, "expires_in": 3600 }),
+            )
+            .await?;
+        let key = issued["credential"]
+            .as_str()
+            .ok_or_else(|| WyrdTestServerError::Auth("issuance returned no key".to_owned()))?;
+        Ok((
+            PrincipalId::new(user_id),
+            SecretString::from(key.to_owned()),
+        ))
+    }
+
+    /// POST `body` to `uri` as a same-origin browser with `cookie`; returns the
+    /// response headers and JSON body of a success.
+    ///
+    /// # Errors
+    /// Returns an error when the route fails or refuses.
+    async fn browser_json(
+        &self,
+        uri: &str,
+        cookie: Option<&str>,
+        body: &serde_json::Value,
+    ) -> Result<(axum::http::HeaderMap, serde_json::Value), WyrdTestServerError> {
+        let mut request = Request::post(uri)
+            .header(header::HOST, "wyrd.test")
+            .header(header::ORIGIN, "http://wyrd.test")
+            .header(header::CONTENT_TYPE, "application/json");
+        if let Some(cookie) = cookie {
+            request = request.header(header::COOKIE, cookie);
+        }
+        let request = request
+            .body(Body::from(body.to_string()))
+            .map_err(|error| WyrdTestServerError::Io(error.to_string()))?;
+        let response = self.raw_call(request).await?;
+        let status = response.status();
+        let headers = response.headers().clone();
+        let bytes = to_bytes(response.into_body(), 1 << 20)
+            .await
+            .map_err(|error| WyrdTestServerError::Io(error.to_string()))?;
+        if !status.is_success() {
+            return Err(WyrdTestServerError::Auth(format!(
+                "{uri} answered {status}: {}",
+                String::from_utf8_lossy(&bytes)
+            )));
+        }
+        let body = serde_json::from_slice(&bytes)
+            .map_err(|error| WyrdTestServerError::Io(error.to_string()))?;
+        Ok((headers, body))
+    }
+
     /// Bootstrap a Service principal through fixture SQL.
     ///
     /// # Errors

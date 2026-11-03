@@ -5,12 +5,13 @@
 
 use std::time::Duration;
 
+use secrecy::ExposeSecret as _;
 use serde::Deserialize;
 use serde_json::json;
 use wyrd_ai::auth::{
-    CreateServicePrincipalRequest, PrincipalId, PrincipalKindTag, PrincipalQuery, Principals,
-    RevokePrincipalRequest, RoleAssignment, RoleSource, WorkloadFamily, WorkloadKind,
-    WorkloadRestriction,
+    AccountAuthentication, CreateServicePrincipalRequest, CredentialListQuery, PrincipalId,
+    PrincipalKindTag, PrincipalQuery, Principals, RevokePrincipalRequest, RoleAssignment,
+    RoleSource, WorkloadFamily, WorkloadKind, WorkloadRestriction,
 };
 use wyrd_ai::bifrost::{BifrostOptions, QueryParam};
 use wyrd_ai::cards::Cards;
@@ -224,6 +225,90 @@ async fn direct_and_idp_user_assignments_coexist() {
         .expect("the administrator revokes viewer");
     assert!(revoked.changed);
     assert_eq!(revoked.roles, [assignment("viewer", RoleSource::Idp)]);
+    deployment.shutdown().await;
+}
+
+/// A local User reads their own profile and key metadata, page by page,
+/// through their own restricted key, and revokes it; the key never carries
+/// more than its ceiling and a Service is never given a human profile.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires the repository-managed Postgres journey lifecycle"]
+async fn users_manage_personal_keys() {
+    let deployment = Deployment::start().await;
+    let ceiling = [
+        "personal_credentials:write",
+        "cards:read",
+        "personal_credentials:read",
+    ];
+    let (user, key) = deployment
+        .server()
+        .bootstrap_user_key("keeper", &["editor"], &ceiling)
+        .await
+        .expect("a local User creates a key");
+    let own = Principals::connect_with(&deployment.client(key.expose_secret()))
+        .await
+        .expect("handle connects");
+
+    let me = own.me().await.expect("the User reads their profile");
+    assert_eq!(me.principal_id, user);
+    assert_eq!(me.principal_kind, PrincipalKindTag::User);
+    assert_eq!(me.username.as_deref(), Some("keeper"));
+    assert_eq!(me.authentication, AccountAuthentication::Password);
+    assert_eq!(
+        me.permissions,
+        [
+            "cards:read",
+            "personal_credentials:read",
+            "personal_credentials:write"
+        ]
+    );
+
+    let page = own
+        .list_credentials_page(&user, CredentialListQuery::default())
+        .await
+        .expect("the User pages their keys");
+    assert_eq!(page.next_cursor, None);
+    let [listed] = page.credentials.as_slice() else {
+        panic!("one key: {page:?}");
+    };
+    assert_eq!(listed.name.as_deref(), Some("keeper"));
+    assert_eq!(
+        listed.permission_ceiling.as_deref(),
+        Some(&me.permissions[..])
+    );
+    assert!(listed.expires_at.is_some());
+    let unpaged = own
+        .list_credentials(&user)
+        .await
+        .expect_err("a User lists their keys page by page");
+    assert_eq!(unpaged.code(), "WYRD_SPEC_400_VALIDATION");
+    let issued = own
+        .issue_credential(&user)
+        .await
+        .expect_err("a User key is created only from a recent sign-in");
+    assert_eq!(issued.status(), 400);
+
+    let admin = Principals::connect_with(&deployment.admin())
+        .await
+        .expect("handle connects");
+    let complete = admin
+        .list_credentials(&user)
+        .await
+        .expect("an administrator lists completely");
+    assert_eq!(complete.credentials.len(), 1);
+    let service = admin
+        .me()
+        .await
+        .expect_err("a Service has no human profile");
+    assert_eq!(service.code(), "WYRD_PERMISSION_403_DENIED_RBAC");
+
+    own.revoke_credential(&user, listed.id)
+        .await
+        .expect("the User revokes their key");
+    let revoked = Principals::connect_with(&deployment.client(key.expose_secret()))
+        .await
+        .expect_err("a revoked key no longer exchanges");
+    assert_eq!(revoked.status(), 401);
     deployment.shutdown().await;
 }
 

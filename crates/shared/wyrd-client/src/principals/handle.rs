@@ -5,9 +5,10 @@ use std::sync::Arc;
 use reqwest::Method;
 use uuid::Uuid;
 use wyrd_spec::auth::{
-    CreateServicePrincipalRequest, CreateServicePrincipalResponse, CredentialListResponse,
-    IssuedCredential, PrincipalId, PrincipalPage, PrincipalQuery, PrincipalRoles, PrincipalSummary,
-    RevokePrincipalRequest, RoleAssignmentChange, WorkloadRestriction,
+    CreateServicePrincipalRequest, CreateServicePrincipalResponse, CredentialListQuery,
+    CredentialListResponse, CurrentUserProfile, IssuedCredential, PrincipalId, PrincipalPage,
+    PrincipalQuery, PrincipalRoles, PrincipalSummary, RevokePrincipalRequest, RoleAssignmentChange,
+    WorkloadRestriction,
 };
 use wyrd_spec::error::WyrdError;
 
@@ -142,6 +143,56 @@ impl Principals {
                 &format!("/v1/principals/{principal_id}/credentials"),
                 None,
             )
+            .await
+    }
+
+    /// Read one page of a principal's credential metadata, newest first.
+    ///
+    /// Sends exactly one request: an omitted `limit` is sent as 50, and the
+    /// response's `next_cursor`, when present, continues with the same
+    /// `principal_id`. A User reads their own keys only this way.
+    ///
+    /// # Arguments
+    /// * `principal_id` - The principal whose credentials are listed.
+    /// * `query` - Page size and the previous page's continuation.
+    ///
+    /// # Errors
+    /// Returns a Wyrd error when the caller is unauthorized, the cursor is
+    /// malformed or names another principal, or the read fails.
+    ///
+    /// # Panics
+    /// Never in practice: a query of optional scalar fields always
+    /// URL-encodes.
+    pub async fn list_credentials_page(
+        &self,
+        principal_id: &PrincipalId,
+        query: CredentialListQuery,
+    ) -> Result<CredentialListResponse, WyrdError> {
+        let query = CredentialListQuery {
+            limit: Some(query.limit.unwrap_or(50)),
+            ..query
+        };
+        let query = serde_urlencoded::to_string(&query)
+            .expect("a credential page query of optional scalars always URL-encodes");
+        self.client
+            .http
+            .request_json::<(), _>(
+                Method::GET,
+                &format!("/v1/principals/{principal_id}/credentials?{query}"),
+                None,
+            )
+            .await
+    }
+
+    /// Read the calling User's safe profile: tenant, username, account
+    /// authentication method and informational effective permissions.
+    ///
+    /// # Errors
+    /// Returns a Wyrd error when the caller is not a User or is suspended.
+    pub async fn me(&self) -> Result<CurrentUserProfile, WyrdError> {
+        self.client
+            .http
+            .request_json::<(), _>(Method::GET, "/v1/principals/me", None)
             .await
     }
 

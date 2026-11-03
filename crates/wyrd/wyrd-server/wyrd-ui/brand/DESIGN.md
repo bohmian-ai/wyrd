@@ -46,6 +46,9 @@ designed but not yet built.
   and red are the same hue in both modes; only the primary accent and the neutrals shift.
   Code blocks sit on the dark panel field in both modes, lifted above the dark canvas.
   Layout, type, geometry, and interaction behavior remain shared.
+- The Observe canvas roles (navigation surface, selected/filter border, log info fill and
+  series 3–5) were adopted on 2026-11-02 from the approved Observe boards: their dark values
+  are the boards' exact values and their light values are the approved counterparts.
 - The workbench applies mode via `data-mode="light|dark"`; the docs site via
   `data-theme="light|dark"` on `:root`. Both are projections of the same values.
 
@@ -78,6 +81,12 @@ designed but not yet built.
 | Code keyword | `--code-keyword` | `#7a8cff` | `#7a8cff` | keywords and storage |
 | Code string | `--code-string` | `#c5f23b` | `#c5f23b` | strings and literal values |
 | Code number | `--code-number` | `#f0a13c` | `#f0a13c` | numbers, constants, function names |
+| Navigation surface | `--nav-surface` | `#eef0f4` | `#0e1017` | the primary navigation rail |
+| Selected/filter border | `--selected-border` | `#4d5ef0` | `#3a4170` | applied WHERE, pressed segment, open filter control, zoom badge |
+| Log info fill | `--level-info` | `#4d5ef0` | `#3a4170` | info segment of a severity timeline; warn and error use `--warn` and `--danger` |
+| Series 3 | `--series-3` | `#7a8cff` | `#4d5ef0` | third chart/waterfall series, with a dash, marker or label |
+| Series 4 | `--series-4` | `#4d5ef0` | `#a9b4ff` | fourth chart/waterfall series, with a dash, marker or label |
+| Series 5 | `--series-5` | `#8fae2a` | `#8fae2a` | fifth chart/waterfall series, with a dash, marker or label |
 | Strong weight | `--weight-strong` | `700` | `600` | headings, labels, emphasis; lighter in dark, where light ink renders heavier |
 
 ### Color semantics
@@ -165,8 +174,13 @@ non-chromatic channel**:
 - **Status carries a glyph and a word.** `Badge` renders `✓` / `!` / `✕` / `●` before its
   label; state blocks write the state out.
 - **Thresholds carry a tick.** A threshold is a labeled dashed rule plus a positional tick.
-- **Chart series carry a dash and marker.** Series use `--declare`, `--observe`, `--text`,
-  `--muted` with distinct dash patterns and markers, mirrored in the legend.
+- **Chart series carry a dash and marker.** Series use `--declare`, `--observe`, `--series-3`,
+  `--series-4`, `--series-5` in that order with distinct dash patterns and markers, mirrored in
+  the legend. A host that names a semantic series maps it explicitly: duration p95 is
+  `--observe`, p50 is `--declare`; log severity is `--level-info`, `--warn`, `--danger`. Fills
+  are drawn at full strength, never blended by opacity. Waterfall bars take the same series
+  order by recorded service, with errors in `--danger` plus a `✕` glyph and a legend naming
+  each service.
 - **Evidence connectors are real.** A thread between Declaration, Observation, Verifier,
   Judgment, and Evidence is drawn only when the interface shows a real causal path from
   server data — never as decoration, serial numbers, or custody marks.

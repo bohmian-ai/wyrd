@@ -47,6 +47,14 @@
   --code-string: #c5f23b;
   --code-number: #f0a13c;
 
+  /* observe-canvas */
+  --nav-surface: #eef0f4;
+  --selected-border: #4d5ef0;
+  --level-info: #4d5ef0;
+  --series-3: #7a8cff;
+  --series-4: #4d5ef0;
+  --series-5: #8fae2a;
+
   /* type */
   --weight-strong: 700;
 
@@ -96,6 +104,14 @@
   --code-keyword: #7a8cff;
   --code-string: #c5f23b;
   --code-number: #f0a13c;
+
+  /* observe-canvas */
+  --nav-surface: #0e1017;
+  --selected-border: #3a4170;
+  --level-info: #3a4170;
+  --series-3: #4d5ef0;
+  --series-4: #a9b4ff;
+  --series-5: #8fae2a;
 
   /* type */
   --weight-strong: 600;

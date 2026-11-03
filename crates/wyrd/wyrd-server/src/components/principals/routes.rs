@@ -471,6 +471,7 @@ pub(crate) async fn list_credentials_for(
 
     Ok(CredentialListResponse {
         credentials: rows.into_iter().map(metadata).collect(),
+        next_cursor: None,
     })
 }
 
@@ -1148,6 +1149,8 @@ fn metadata(row: ApiKeyMetadataRow) -> CredentialMetadata {
         expires_at: row.expires_at.map(|at| at.to_rfc3339()),
         revoked_at: row.revoked_at.map(|at| at.to_rfc3339()),
         last_used_at: row.last_used_at.map(|at| at.to_rfc3339()),
+        name: row.name,
+        permission_ceiling: row.permission_ceiling.map(|ceiling| ceiling.0),
     }
 }
 

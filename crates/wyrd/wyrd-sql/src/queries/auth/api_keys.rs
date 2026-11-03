@@ -48,6 +48,10 @@ pub struct ApiKeyMetadataRow {
     pub revoked_at: Option<DateTime<Utc>>,
     /// Last successful use.
     pub last_used_at: Option<DateTime<Utc>>,
+    /// Name of a User key.
+    pub name: Option<String>,
+    /// Permission ceiling of a User key, in canonical order.
+    pub permission_ceiling: Option<sqlx::types::Json<Vec<String>>>,
 }
 
 /// List a principal's credential metadata, newest first.
@@ -67,13 +71,46 @@ pub async fn list_api_key_metadata(
 ) -> Result<Vec<ApiKeyMetadataRow>, SqlxError> {
     sqlx::query_as::<_, ApiKeyMetadataRow>(
         r"
-        SELECT id, prefix, created_at, expires_at, revoked_at, last_used_at
+        SELECT id, prefix, created_at, expires_at, revoked_at, last_used_at,
+               name, permission_ceiling
           FROM wyrd.auth_api_keys
          WHERE principal_id = $1
-         ORDER BY created_at DESC
+         ORDER BY created_at DESC, id DESC
         ",
     )
     .bind(principal_id)
+    .fetch_all(&mut **conn.transaction())
+    .await
+}
+
+/// One page of a principal's credential metadata, newest first with the id
+/// descending as tie-break, resuming strictly after `after` (the last row of
+/// the previous page) and returning at most `limit` rows.
+///
+/// # Errors
+/// Returns the database error when the read fails.
+pub async fn page_api_key_metadata(
+    conn: &mut TenantConn<'_>,
+    principal_id: Uuid,
+    after: Option<(DateTime<Utc>, Uuid)>,
+    limit: u32,
+) -> Result<Vec<ApiKeyMetadataRow>, SqlxError> {
+    let (after_created, after_id) = after.unzip();
+    sqlx::query_as::<_, ApiKeyMetadataRow>(
+        r"
+        SELECT id, prefix, created_at, expires_at, revoked_at, last_used_at,
+               name, permission_ceiling
+          FROM wyrd.auth_api_keys
+         WHERE principal_id = $1
+           AND ($2::timestamptz IS NULL OR (created_at, id) < ($2, $3))
+         ORDER BY created_at DESC, id DESC
+         LIMIT $4
+        ",
+    )
+    .bind(principal_id)
+    .bind(after_created)
+    .bind(after_id)
+    .bind(i64::from(limit))
     .fetch_all(&mut **conn.transaction())
     .await
 }

@@ -76,9 +76,9 @@ pub struct ApiKeyLookupRow {
     pub api_key_id: Uuid,
     /// Stored SHA-256 hex verifier.
     pub key_hash: String,
-    /// Service account id.
+    /// The owning Service/Admin account or User.
     pub principal_id: Uuid,
-    /// Principal kind label.
+    /// Principal kind label; `user` for a User key.
     pub principal_kind: String,
     /// Restricting family kind, for a family-restricted Service account.
     pub restriction_kind: Option<String>,
@@ -341,7 +341,8 @@ pub async fn tenant_admin_principal_id(
     .await
 }
 
-/// Insert a hashed credential row for a tenant-scope principal.
+/// Insert a hashed credential row owned by a tenant-scope Service or Admin
+/// account.
 ///
 /// Stores only the SHA-256 verifier and non-secret lookup metadata; the
 /// plaintext is returned once by the issuing caller and never persisted.
@@ -368,9 +369,9 @@ pub async fn insert_api_key(
     sqlx::query_as(
         r"
         INSERT INTO wyrd.auth_api_keys (
-            id, data_tenant_id, principal_id, prefix, key_hash,
+            id, data_tenant_id, principal_id, service_account_id, prefix, key_hash,
             sub_principal_id, act_principal_id, expires_at
-        ) VALUES ($1, $2, $3, $4, $5, $6, $7,
+        ) VALUES ($1, $2, $3, $3, $4, $5, $6, $7,
                   CASE WHEN $8::double precision IS NULL THEN NULL
                        ELSE statement_timestamp() + ($8 * interval '1 second')
                   END)
@@ -389,6 +390,93 @@ pub async fn insert_api_key(
     .await
 }
 
+/// Insert a hashed personal credential owned by User `user_id`, named `name`
+/// with the canonical `permission_ceiling` (sorted, distinct expressions), and
+/// expiring `lifetime` after `PostgreSQL`'s statement time; returns the stored
+/// creation and expiry.
+///
+/// # Errors
+/// Returns the database error when the insert fails, including when `prefix`
+/// collides or `user_id` names no User.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "this mirrors one table's column list on a single-row insert, as `upsert_platform_oidc_connection` does."
+)]
+pub async fn insert_user_api_key(
+    conn: &mut TenantConn<'_>,
+    id: Uuid,
+    user_id: Uuid,
+    prefix: &str,
+    key_hash: &str,
+    attribution: Attribution,
+    name: &str,
+    permission_ceiling: &[String],
+    lifetime: Duration,
+) -> Result<(DateTime<Utc>, DateTime<Utc>), sqlx::Error> {
+    sqlx::query_as(
+        r"
+        INSERT INTO wyrd.auth_api_keys (
+            id, data_tenant_id, principal_id, user_id, prefix, key_hash,
+            sub_principal_id, act_principal_id, name, permission_ceiling, expires_at
+        ) VALUES ($1, $2, $3, $3, $4, $5, $6, $7, $8, $9,
+                  statement_timestamp() + ($10 * interval '1 second'))
+        RETURNING created_at, expires_at
+        ",
+    )
+    .bind(id)
+    .bind(conn.data_tenant_id().as_uuid())
+    .bind(user_id)
+    .bind(prefix)
+    .bind(key_hash)
+    .bind(attribution.sub_principal_id.as_uuid())
+    .bind(attribution.act_principal_id.as_uuid())
+    .bind(name)
+    .bind(sqlx::types::Json(permission_ceiling))
+    .bind(lifetime.as_secs_f64())
+    .fetch_one(&mut **conn.transaction())
+    .await
+}
+
+/// A User key's stored permission ceiling.
+type StoredCeiling = sqlx::types::Json<Vec<String>>;
+
+/// The owner of credential `id` as token issuance resolves it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ApiKeyOwner {
+    /// A Service or Admin account, with that account's own authority.
+    Account,
+    /// A User, bounded by the key's stored permission ceiling.
+    User {
+        /// The stored ceiling's permission expressions.
+        permission_ceiling: Vec<String>,
+    },
+}
+
+/// The owner kind and ceiling of credential `id`, in any lifecycle state;
+/// `None` when no such credential exists in the tenant.
+///
+/// # Errors
+/// Returns a SQLx error when Postgres rejects the read, and
+/// [`sqlx::Error::Decode`] for a stored ceiling that is not a string array.
+pub async fn api_key_owner(
+    conn: &mut TenantConn<'_>,
+    id: Uuid,
+) -> Result<Option<ApiKeyOwner>, sqlx::Error> {
+    let row: Option<(Option<Uuid>, Option<StoredCeiling>)> =
+        sqlx::query_as("SELECT user_id, permission_ceiling FROM wyrd.auth_api_keys WHERE id = $1")
+            .bind(id)
+            .fetch_optional(&mut **conn.transaction())
+            .await?;
+    row.map(|(user, ceiling)| match (user, ceiling) {
+        (None, None) => Ok(ApiKeyOwner::Account),
+        (Some(_), Some(ceiling)) => Ok(ApiKeyOwner::User {
+            permission_ceiling: ceiling.0,
+        }),
+        _ => Err(sqlx::Error::Decode("User key without a ceiling".into())),
+    })
+    .transpose()
+}
+
 /// Lookup an unexpired, unrevoked API key by prefix.
 ///
 /// # Errors
@@ -403,16 +491,20 @@ pub async fn api_key_by_prefix(
         r"
         SELECT k.id AS api_key_id,
                k.key_hash,
-               sa.id AS principal_id,
-               sa.principal_kind,
+               k.principal_id,
+               COALESCE(sa.principal_kind, 'user') AS principal_kind,
                sa.restriction_kind,
                sa.restriction_name,
-               sa.status
+               COALESCE(sa.status, u.status) AS status
           FROM wyrd.auth_api_keys k
-          JOIN wyrd.auth_service_accounts sa
+          LEFT JOIN wyrd.auth_service_accounts sa
             ON sa.data_tenant_id = k.data_tenant_id
-           AND sa.id = k.principal_id
+           AND sa.id = k.service_account_id
+          LEFT JOIN wyrd.auth_users u
+            ON u.data_tenant_id = k.data_tenant_id
+           AND u.id = k.user_id
          WHERE k.data_tenant_id = $1
+           AND COALESCE(sa.id, u.id) IS NOT NULL
            AND k.prefix = $2
            AND k.revoked_at IS NULL
            AND (k.expires_at IS NULL OR k.expires_at > statement_timestamp())

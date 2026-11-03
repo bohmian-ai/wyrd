@@ -74,6 +74,14 @@ pub struct CredentialMetadata {
     /// Last successful use.
     #[serde(default)]
     pub last_used_at: Option<String>,
+    /// Normalized name of a User key; absent for Service, Admin and platform
+    /// credentials, whose authority is their principal's.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    /// Permission ceiling of a User key in canonical sorted order; absent for
+    /// Service, Admin and platform credentials, which carry none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub permission_ceiling: Option<Vec<String>>,
 }
 
 /// A principal's credential metadata.
@@ -82,6 +90,111 @@ pub struct CredentialMetadata {
 pub struct CredentialListResponse {
     /// Credentials, newest first. Never any secret material.
     pub credentials: Vec<CredentialMetadata>,
+    /// Continuation of a paged listing; present only when more rows remain
+    /// and never on a complete (unpaged) listing.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub next_cursor: Option<String>,
+}
+
+/// Largest page of `GET /v1/principals/{principal_id}/credentials`.
+pub const CREDENTIAL_PAGE_MAX: u32 = 100;
+
+/// Page size a paged credential listing uses when it names none.
+pub const CREDENTIAL_PAGE_DEFAULT: u32 = 50;
+
+/// Longest credential continuation cursor accepted, in bytes.
+pub const CREDENTIAL_CURSOR_MAX_BYTES: usize = 2048;
+
+/// Query of `GET /v1/principals/{principal_id}/credentials`.
+///
+/// Supplying `limit` or `cursor` selects one bounded page, newest first with
+/// the credential id as a stable tie-break; supplying neither keeps the
+/// complete administrator listing. A cursor resumes strictly after the last
+/// row it was issued for and binds the tenant and principal; it confers no
+/// authority, which every page re-checks.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[cfg_attr(feature = "server", derive(utoipa::IntoParams, utoipa::ToSchema))]
+#[cfg_attr(feature = "server", into_params(parameter_in = Query))]
+#[serde(deny_unknown_fields)]
+pub struct CredentialListQuery {
+    /// Page size, 1–100; a cursor alone pages by 50.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(range(min = 1, max = 100))]
+    pub limit: Option<u32>,
+    /// Opaque continuation from the previous page's `next_cursor`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(length(min = 1, max = 2048))]
+    pub cursor: Option<String>,
+}
+
+impl CredentialListQuery {
+    /// Whether this query selects page mode rather than the complete listing.
+    #[must_use]
+    pub const fn is_paged(&self) -> bool {
+        self.limit.is_some() || self.cursor.is_some()
+    }
+}
+
+/// Longest User credential name, in characters.
+pub const USER_CREDENTIAL_NAME_MAX_CHARS: usize = 64;
+
+/// Longest User credential lifetime: 365 days, in seconds.
+pub const USER_CREDENTIAL_MAX_LIFETIME_SECONDS: u64 = 31_536_000;
+
+/// Body of `POST /v1/principals/{principal_id}/credentials` for a User target.
+///
+/// A User key always carries a name, a nonempty explicit permission ceiling
+/// and a bounded lifetime; there is no unrestricted User key. Service and
+/// Admin targets keep their bodiless issuance and refuse this body.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
+#[serde(deny_unknown_fields)]
+pub struct CreateUserCredentialRequest {
+    /// Display name; trimmed, 1–64 characters.
+    pub name: String,
+    /// Distinct `resource:action` permission expressions bounding the key;
+    /// each exchange grants their intersection with the User's current
+    /// authority.
+    pub permission_ceiling: Vec<String>,
+    /// Lifetime in seconds, 1–31536000.
+    #[schemars(range(min = 1, max = 31_536_000))]
+    pub expires_in: u64,
+}
+
+/// How a User account authenticates.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum AccountAuthentication {
+    /// A Wyrd-owned local username and password.
+    Password,
+    /// The tenant's identity provider.
+    Sso,
+}
+
+/// Response of `GET /v1/principals/me`: the calling User's safe profile.
+///
+/// Derived from the verified caller and current User state; never an email,
+/// password verifier, provider subject, session identifier or key secret.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
+#[serde(deny_unknown_fields)]
+pub struct CurrentUserProfile {
+    /// The tenant's route key.
+    pub tenant: crate::ids::TenantSlug,
+    /// The tenant's isolation key.
+    pub tenant_id: crate::DataTenantId,
+    /// The User.
+    pub principal_id: PrincipalId,
+    /// Always `user`.
+    pub principal_kind: PrincipalKindTag,
+    /// Canonical local username; `null` for an SSO-only account.
+    pub username: Option<String>,
+    /// How the account authenticates, independent of this request's credential.
+    pub authentication: AccountAuthentication,
+    /// Sorted, distinct caller-effective `resource:action` names;
+    /// informational only, never authority.
+    pub permissions: Vec<String>,
 }
 
 /// Arguments naming the principal whose credentials to list.
@@ -97,7 +210,20 @@ pub struct ListCredentialsArgs {
     /// Principal whose credentials to list. Advertised as a UUID string, so a
     /// schema-valid argument is always one the server can act on.
     pub principal_id: PrincipalId,
+    /// Page size, 1–100; with `cursor`, selects page mode.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(range(min = 1, max = 100))]
+    pub limit: Option<u32>,
+    /// Continuation from the previous page's `next_cursor`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(length(min = 1, max = 2048))]
+    pub cursor: Option<String>,
 }
+
+/// Empty input of the read-only `principals.me` MCP tool.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct CurrentUserArgs {}
 
 /// Arguments replacing one Service account's workload restriction.
 ///
@@ -137,6 +263,83 @@ pub struct CredentialRevoked {
     pub revoked: bool,
     /// The credential that was retired.
     pub credential_id: Uuid,
+}
+
+/// Body of `POST /v1/principals/users/invitations`.
+///
+/// The issuer's tenant is the invitation's tenant, and its lifetime is a fixed
+/// twenty-four hours; neither is caller-selected.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
+#[serde(deny_unknown_fields)]
+pub struct CreateUserInvitationRequest {
+    /// Distinct existing tenant Role ids the enrolled User receives; nonempty,
+    /// and each one the issuer may grant.
+    pub role_ids: Vec<Uuid>,
+}
+
+/// Safe metadata of one enrollment invitation; never its code.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
+#[serde(deny_unknown_fields)]
+pub struct UserInvitationView {
+    /// Invitation id, used to revoke it.
+    pub id: Uuid,
+    /// The tenant's route key.
+    pub tenant: crate::ids::TenantSlug,
+    /// Role ids granted at enrollment, ordered by UUID.
+    pub role_ids: Vec<Uuid>,
+    /// Creation time.
+    pub created_at: chrono::DateTime<chrono::Utc>,
+    /// Absolute expiry, twenty-four hours after creation.
+    pub expires_at: chrono::DateTime<chrono::Utc>,
+}
+
+/// A newly issued invitation and its one-time code, returned once.
+#[derive(Debug, Serialize, Deserialize, schemars::JsonSchema)]
+#[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
+#[serde(deny_unknown_fields)]
+pub struct IssuedUserInvitation {
+    /// Invitation metadata.
+    pub invitation: UserInvitationView,
+    /// The 43-character base64url enrollment code; delivered separately from
+    /// the URL and never recoverable.
+    #[schemars(with = "String")]
+    pub invitation_code: SecretBearer,
+    /// The fixed tenant signup page; it contains no code.
+    pub signup_url: crate::auth::AbsoluteUrl,
+}
+
+/// Safe metadata of one operator-issued password reset; never its code.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
+#[serde(deny_unknown_fields)]
+pub struct UserPasswordResetView {
+    /// Reset id.
+    pub id: Uuid,
+    /// The tenant's route key.
+    pub tenant: crate::ids::TenantSlug,
+    /// The local User the reset is for.
+    pub principal_id: PrincipalId,
+    /// Creation time.
+    pub created_at: chrono::DateTime<chrono::Utc>,
+    /// Absolute expiry, fifteen minutes after creation.
+    pub expires_at: chrono::DateTime<chrono::Utc>,
+}
+
+/// A newly issued password reset and its one-time code, returned once.
+#[derive(Debug, Serialize, Deserialize, schemars::JsonSchema)]
+#[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
+#[serde(deny_unknown_fields)]
+pub struct IssuedUserPasswordReset {
+    /// Reset metadata.
+    pub reset: UserPasswordResetView,
+    /// The 43-character base64url reset code; delivered separately from the
+    /// URL and never recoverable.
+    #[schemars(with = "String")]
+    pub reset_code: SecretBearer,
+    /// The fixed tenant reset page; it contains no code.
+    pub reset_url: crate::auth::AbsoluteUrl,
 }
 
 /// Where one of a principal's Role assignments came from.

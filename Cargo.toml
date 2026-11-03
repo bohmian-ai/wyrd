@@ -169,6 +169,7 @@ serial_test = "3"
 aes-gcm = "0.10"
 argon2 = "0.5"
 password-hash = { version = "0.5", features = ["getrandom"] }
+unicode-normalization = "0.1"
 secrecy = "0.10"
 subtle = "2.6"
 zeroize = "1"

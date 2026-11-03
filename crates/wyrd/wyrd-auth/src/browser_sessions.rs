@@ -57,6 +57,9 @@ pub struct BrowserSession {
     pub credential: BrowserCredential,
     /// The session's absolute expiry.
     pub expires_at: DateTime<Utc>,
+    /// Whether this is recent human sign-in proof: a password or provider
+    /// session created in the last five minutes. A recovery session never is.
+    pub recent: bool,
 }
 
 /// A session just created, with the cookie value returned exactly once.
@@ -107,9 +110,9 @@ impl std::fmt::Debug for BegunBrowserLogin {
 #[derive(Clone)]
 pub struct BrowserSessions {
     /// Resolves the principal's current authority on every request.
-    issuer: TenantTokenIssuer,
+    pub(crate) issuer: TenantTokenIssuer,
     /// Begins provider logins and supplies the runtime store.
-    connections: HumanConnections,
+    pub(crate) connections: HumanConnections,
 }
 
 impl std::fmt::Debug for BrowserSessions {
@@ -398,17 +401,23 @@ impl BrowserSessions {
                 TenantGrant::BrowserRecovery { credential_id },
                 BrowserCredential::ApiKey,
             ),
+            // The lookup already required this revision to be the User's
+            // current one.
+            BrowserSessionAuthority::Password(_) => {
+                (TenantGrant::PasswordLogin, BrowserCredential::Password)
+            }
         };
         let verified = self.issuer.verify(conn, live.principal_id, grant).await?;
         Ok(BrowserSession {
             verified,
             credential,
             expires_at: live.expires_at,
+            recent: live.recent && credential != BrowserCredential::ApiKey,
         })
     }
 
     /// Stage the allowed `auth.login` event for a session just created.
-    fn stage_login(&self, session: &BrowserSession, request_id: &str) {
+    pub(crate) fn stage_login(&self, session: &BrowserSession, request_id: &str) {
         let principal = &session.verified.principal;
         self.issuer.audit().stage(
             principal.tenant_id,
@@ -450,6 +459,7 @@ pub(crate) async fn create_session(
     let credential = match authority {
         BrowserSessionAuthority::Connection(_) => BrowserCredential::Sso,
         BrowserSessionAuthority::ApiKey(_) => BrowserCredential::ApiKey,
+        BrowserSessionAuthority::Password(_) => BrowserCredential::Password,
     };
     Ok(CreatedBrowserSession {
         cookie,
@@ -457,6 +467,7 @@ pub(crate) async fn create_session(
             verified,
             credential,
             expires_at,
+            recent: credential != BrowserCredential::ApiKey,
         },
     })
 }
@@ -510,7 +521,7 @@ fn permission_names(permissions: &PermissionSet) -> Vec<String> {
 }
 
 /// A fresh unguessable secret: 32 random bytes, base64url without padding.
-fn random_secret() -> String {
+pub(crate) fn random_secret() -> String {
     let mut bytes = [0_u8; 32];
     rand::rng().fill_bytes(&mut bytes);
     base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes)
@@ -518,7 +529,7 @@ fn random_secret() -> String {
 
 /// The one refusal for a session that does not resolve, so a malformed,
 /// unknown, expired, revoked, and other tenant's value are indistinguishable.
-fn session_invalid() -> WyrdError {
+pub(crate) fn session_invalid() -> WyrdError {
     WyrdError::InvalidToken {
         message: "the browser session is missing, expired, or revoked; sign in again".to_owned(),
         details: json!({ "reason": "browser_session_invalid" }),

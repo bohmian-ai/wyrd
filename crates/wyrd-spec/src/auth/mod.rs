@@ -25,6 +25,7 @@ pub use attribution::Attribution;
 pub use browser::{
     BrowserApiKeyRequest, BrowserCredential, BrowserLoginRequest, BrowserLoginResponse,
     BrowserLogoutRequest, BrowserSessionQuery, BrowserSessionView, BrowserSessionsResponse,
+    PasswordChangeRequest, PasswordLoginRequest, PasswordResetRequest, PasswordSignupRequest,
 };
 pub use device::{DeviceAuthorization, DeviceAuthorizationRequest, TokenRevocationRequest};
 pub use human_connection::{
@@ -55,10 +56,15 @@ pub use tenant_admin::{
     RecoverTenantAdminRequest, SetTenantStatusRequest, TenantListResponse,
 };
 pub use tenant_principals::{
-    CreateServicePrincipalRequest, CreateServicePrincipalResponse, CredentialListResponse,
-    CredentialMetadata, CredentialRevoked, IssuedCredential, ListCredentialsArgs, PrincipalPage,
-    PrincipalQuery, PrincipalRoles, PrincipalStatus, PrincipalSummary, RevokeCredentialArgs,
-    RoleAssignment, RoleAssignmentChange, RoleSource, SetWorkloadRestrictionArgs,
+    AccountAuthentication, CREDENTIAL_CURSOR_MAX_BYTES, CREDENTIAL_PAGE_DEFAULT,
+    CREDENTIAL_PAGE_MAX, CreateServicePrincipalRequest, CreateServicePrincipalResponse,
+    CreateUserCredentialRequest, CreateUserInvitationRequest, CredentialListQuery,
+    CredentialListResponse, CredentialMetadata, CredentialRevoked, CurrentUserArgs,
+    CurrentUserProfile, IssuedCredential, IssuedUserInvitation, IssuedUserPasswordReset,
+    ListCredentialsArgs, PrincipalPage, PrincipalQuery, PrincipalRoles, PrincipalStatus,
+    PrincipalSummary, RevokeCredentialArgs, RoleAssignment, RoleAssignmentChange, RoleSource,
+    SetWorkloadRestrictionArgs, USER_CREDENTIAL_MAX_LIFETIME_SECONDS,
+    USER_CREDENTIAL_NAME_MAX_CHARS, UserInvitationView, UserPasswordResetView,
 };
 pub use token::{
     AuthorizationServerMetadata, ExchangeTokenType, OAuthClientId, OAuthErrorCode,

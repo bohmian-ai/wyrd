@@ -1229,7 +1229,7 @@ test('TASK-004: Canonical signal interactions', async () => {
   expect(detail.calls[0].request).toMatchObject({ params: [LOG.time_unix_nano, LOG.observed_time_unix_nano, LOG.wyrd_request_id] });
   expect(facetQuery({ signal: 'logs', facets: ['severity_text'], where: [{ column: 'service_name', value: 'search' }] }, 'severity_text', RANGE)).toEqual({
     sql:
-      'SELECT severity_text AS value, count(*) AS n FROM bifrost.logs.records WHERE time_unix_nano >= $1::timestamptz AND time_unix_nano < $2::timestamptz ' +
+      'SELECT severity_text AS value, count(*) AS n, max(severity_number) AS severity_number FROM bifrost.logs.records WHERE time_unix_nano >= $1::timestamptz AND time_unix_nano < $2::timestamptz ' +
       'AND service_name = $3 GROUP BY severity_text ORDER BY n DESC, value LIMIT 11',
     params: [RANGE.from, RANGE.to, 'search']
   });

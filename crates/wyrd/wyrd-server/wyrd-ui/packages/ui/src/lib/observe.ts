@@ -245,8 +245,10 @@ export function facetQuery(input: FacetRailInput, column: string, range: Absolut
   binds.where(input.where).predicate(predicate);
   // A trace facet counts the traces with a span of each value, under the same span-level WHERE.
   const n = input.signal === 'traces' ? 'count(DISTINCT trace_id)' : 'count(*)';
+  // A severity text value reads the highest severity number recorded with it, so its level comes from the number.
+  const level = input.signal === 'logs' && column === 'severity_text' ? ', max(severity_number) AS severity_number' : '';
   return {
-    sql: `SELECT ${column} AS value, ${n} AS n FROM ${signal.table} WHERE ${binds.sql} GROUP BY ${column} ORDER BY n DESC, value LIMIT ${FACET_VALUES + 1}`,
+    sql: `SELECT ${column} AS value, ${n} AS n${level} FROM ${signal.table} WHERE ${binds.sql} GROUP BY ${column} ORDER BY n DESC, value LIMIT ${FACET_VALUES + 1}`,
     params: binds.params
   };
 }
@@ -267,11 +269,14 @@ export async function loadFacetRail(input: FacetRailInput, context: LoadContext)
   return { input, result: { state: 'populated', data: { facets } } };
 }
 
-/** Identity columns a list reads after its shown columns, by signal. */
+/**
+ * Columns a list reads after its shown columns, by signal: the row's identity
+ * and the cues its cells read, a span's parent and a record's severity number.
+ */
 export const KEY_COLUMNS: Record<Signal, readonly string[]> = {
   traces: ['trace_id', 'span_id'],
-  spans: ['trace_id', 'span_id'],
-  logs: ['trace_id', 'span_id', 'observed_time_unix_nano', 'wyrd_request_id'],
+  spans: ['trace_id', 'span_id', 'parent_span_id'],
+  logs: ['trace_id', 'span_id', 'observed_time_unix_nano', 'wyrd_request_id', 'severity_number'],
   metrics: []
 };
 
@@ -280,13 +285,13 @@ export function shownColumns(input: Extract<RecordTableInput, { signal: Signal }
   return input.columns ?? SIGNALS[input.signal].columns;
 }
 
-/** The newest rows of one signal, shown columns first and then its identity columns as lowercase hex. */
+/** The newest rows of one signal, shown columns first and then its other key columns, ids as lowercase hex. */
 export function listQuery(input: Extract<RecordTableInput, { signal: Signal }>, range: AbsoluteRange, predicate?: string): Executed {
   const signal = SIGNALS[input.signal];
   const binds = Binds.over(signal.time, range);
   binds.where(input.where).predicate(predicate);
   if (input.signal === 'traces') binds.roots(signal.table);
-  const keys = KEY_COLUMNS[input.signal].map((key) => (key.endsWith('_id') && key !== 'wyrd_request_id' ? `encode(${key}, 'hex') AS ${key}` : key));
+  const keys = KEY_COLUMNS[input.signal].filter((key) => !shownColumns(input).includes(key)).map((key) => (key.endsWith('_id') && key !== 'wyrd_request_id' ? `encode(${key}, 'hex') AS ${key}` : key));
   const shown = shownColumns(input).map((column) => {
     if (input.signal !== 'metrics') return column;
     if (EXACT.includes(column)) return `CAST(${column} AS VARCHAR) AS ${column}`;
@@ -471,7 +476,7 @@ export interface TraceOverviewProps {
   readonly spans: ChartProps;
   readonly errors: ChartProps;
   readonly duration: ChartProps;
-  /** `spans, traces, error_traces, p95_ms, p50_ms` over the whole range, or the state that stopped them. */
+  /** `spans, traces, error_traces, span_p95_ms, p95_ms, p50_ms` over the whole range, or the state that stopped them; `span_p95_ms` is over every span, the others over roots. */
   readonly totals: Loaded<QueryResult>;
 }
 
@@ -497,7 +502,7 @@ export function traceOverviewQueries(input: { readonly where?: readonly Filter[]
     spans: plan('count(*) AS spans', false, true),
     errors: plan(`count(*) FILTER (WHERE status_code = ${STATUS_ERROR}) AS errors`, false, true),
     duration: plan(`${p(0.95)} AS p95, ${p(0.5)} AS p50`, true, true),
-    totals: plan(`count(*) AS spans, count(DISTINCT trace_id) AS traces, count(DISTINCT trace_id) FILTER (WHERE status_code = ${STATUS_ERROR}) AS error_traces`, false, false),
+    totals: plan(`count(*) AS spans, count(DISTINCT trace_id) AS traces, count(DISTINCT trace_id) FILTER (WHERE status_code = ${STATUS_ERROR}) AS error_traces, ${p(0.95)} AS span_p95_ms`, false, false),
     durations: plan(`${p(0.95)} AS p95_ms, ${p(0.5)} AS p50_ms`, true, false)
   };
 }
@@ -706,6 +711,17 @@ const LABELS: Readonly<Record<string, string>> = {
 /** A column's heading; the column name itself stays available as its title for writing WHERE. */
 export function columnLabel(column: string): string {
   return LABELS[column] ?? column;
+}
+
+/** The log level of an OTLP severity number: 17 and up error, 13 and up warn, 1 and up info, else unset. */
+export function severityLevel(number: unknown): 'error' | 'warn' | 'info' | 'unset' {
+  const n = Number(number ?? 0);
+  return n >= 17 ? 'error' : n >= 13 ? 'warn' : n >= 1 ? 'info' : 'unset';
+}
+
+/** A hex id as its first and last four characters. */
+export function shortId(id: string): string {
+  return id.length > 10 ? `${id.slice(0, 4)}…${id.slice(-4)}` : id;
 }
 
 /** OTLP span status codes by name. */

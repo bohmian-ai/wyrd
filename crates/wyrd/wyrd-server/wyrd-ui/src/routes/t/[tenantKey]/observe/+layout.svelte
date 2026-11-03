@@ -111,6 +111,7 @@
       errorTraces: at('error_traces'),
       errorShare: traces ? (at('error_traces') / traces) * 100 : 0,
       p95: Math.round(at('p95_ms')),
+      spanP95: Math.round(at('span_p95_ms')),
       minutes: (Date.parse(data.range.to) - Date.parse(data.range.from)) / 60_000
     };
   });
@@ -137,6 +138,8 @@
   let picks = $state<Record<string, ReadonlySet<string>>>({});
   const seriesKey = $derived(view?.series ? JSON.stringify(view.series.input) : '');
   const byColumns = SIGNALS.metrics.filters.filter((column) => column !== 'metric_name');
+  /** `n` `noun`s in words: "1 trace", "2 traces". */
+  const plural = (n: number, noun: string) => `${fmtNumber(n)} ${noun}${n === 1 ? '' : 's'}`;
 </script>
 
 <svelte:window onkeydown={slash} />
@@ -219,10 +222,11 @@
         <div class="trio">
           <Chart
             {...overview.spans}
+            input={{ ...overview.spans.input, title: 'Spans / min' }}
             compact
             bars
             colors={{ spans: 'var(--series-3)' }}
-            headline={totals ? `${fmtNumber(totals.spans / totals.minutes)} / min · ${fmtNumber(totals.traces)} traces` : undefined}
+            headline={totals ? { value: fmtNumber(totals.spans / totals.minutes), detail: plural(totals.traces, 'trace') } : undefined}
             {actions}
             onaction={onaction('Chart')}
           />
@@ -231,11 +235,11 @@
             compact
             bars
             colors={{ errors: 'var(--danger)' }}
-            headline={totals ? `${fmtNumber(totals.errorTraces)} · ${fmtNumber(totals.errorShare)}% of traces` : undefined}
+            headline={totals ? { value: fmtNumber(totals.errorTraces), detail: `${fmtNumber(totals.errorShare)}% of traces`, tone: 'var(--danger)' } : undefined}
             {actions}
             onaction={onaction('Chart')}
           />
-          <Chart {...overview.duration} compact colors={DURATIONS} headline={totals ? `p95 ${fmtDuration(totals.p95)}` : undefined} {actions} onaction={onaction('Chart')} />
+          <Chart {...overview.duration} compact colors={DURATIONS} headline={totals ? { value: `p95 ${fmtDuration(totals.p95)}` } : undefined} {actions} onaction={onaction('Chart')} />
         </div>
       </section>
     {/if}
@@ -245,10 +249,13 @@
         <a href={href({ ...closed(current), mode: 'spans', group: undefined, columns: undefined })} aria-current={current.mode === 'spans' ? 'true' : undefined}>Spans</a>
       </span>
       <button type="button" class="filters" aria-expanded={filtersOpen} aria-controls="facets" onclick={() => (filtersOpen = !filtersOpen)}>
+        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><path d="M3 5h18l-7 8v6l-4 2v-8z"></path></svg>
         Filters{current.where.length ? ` · ${current.where.length}` : ''}
       </button>
-      {#if totals}
-        <span class="counts">{fmtNumber(totals.traces)} traces · <span class:bad={totals.errorShare > 0}>{fmtNumber(totals.errorShare)}% error</span> · p95 {fmtDuration(totals.p95)}</span>
+      {#if totals && current.mode === 'spans'}
+        <span class="counts">{plural(totals.spans, 'span')} match · p95 {fmtDuration(totals.spanP95)}</span>
+      {:else if totals}
+        <span class="counts">{plural(totals.traces, 'trace')} · <span class:bad={totals.errorShare > 0}>{fmtNumber(totals.errorShare)}% error</span> · p95 {fmtDuration(totals.p95)}</span>
       {/if}
       {@render grouping()}
       <span class="listtools" bind:this={listTools}></span>
@@ -264,17 +271,15 @@
     {#if observe.timeline}
       {@const timeline = observe.timeline}
       <section class="panel overview" aria-label="Timeline" data-panel="timeline">
-        <Chart {...timeline} compact bars colors={LEVELS} {actions} onaction={onaction('Chart')} />
-        {#if timeline.executed}
-          <button type="button" class="query" onclick={() => timeline.executed && onaction('Chart')({ name: 'chart.open_in_query', input: timeline.executed })}>Open in Query ↗</button>
-        {/if}
+        <Chart {...timeline} input={{ ...timeline.input, title: `${timeline.input.title} · drag to zoom` }} compact bars colors={LEVELS} {actions} onaction={onaction('Chart')} />
       </section>
     {/if}
-    <div class="listbar">{@render grouping()}</div>
     <!-- The records work region: fields, records and the selected record side by side, wrapping on a narrow screen. -->
     <div class="work">
       <div data-panel="facets"><FacetRail {...observe.facets} {actions} onaction={onaction('FacetRail')} /></div>
-      <div data-panel="list">{#if observe.list}<RecordTable {...observe.list} {actions} onaction={onaction('RecordTable')} oncolumns={(columns) => go({ ...closed(current), columns })} />{/if}</div>
+      <div data-panel="list">
+        {#if observe.list}<RecordTable {...observe.list} {actions} onaction={onaction('RecordTable')} oncolumns={(columns) => go({ ...closed(current), columns })} tools={grouping} />{/if}
+      </div>
       {@render children()}
     </div>
   {:else}
@@ -315,6 +320,7 @@
               {...series.chart}
               identity={series.identity}
               summary={series.summary}
+              note="Drag across the chart to zoom every Observe view to that window."
               shown={picks[seriesKey]}
               onseries={(shown) => (picks[seriesKey] = shown)}
               {actions}
@@ -543,14 +549,6 @@
     justify-content: space-between;
     gap: 8px;
   }
-  .query {
-    border: 0;
-    padding: 0;
-    background: transparent;
-    color: var(--declare);
-    font: 11px var(--font-mono);
-    cursor: pointer;
-  }
   .h {
     margin: 0;
     color: var(--muted);
@@ -627,6 +625,10 @@
     margin-left: auto;
     color: var(--muted);
     font: 12px var(--font-mono);
+  }
+  /* A choice is as wide as a short column name; a long attribute name truncates in the closed control. */
+  .by select {
+    max-width: 10em;
   }
   select {
     height: 30px;
@@ -723,8 +725,10 @@
     gap: 16px;
     min-width: 0;
   }
+  /* The metric name gives way first, so the calculation and by choices share its header row. */
   .metric {
-    margin-right: auto;
+    flex: 1 1 0;
+    min-width: 160px;
   }
   .metric h2 {
     margin: 0;

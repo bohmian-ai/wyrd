@@ -3,11 +3,13 @@
   Choosing a value asks the host to filter by it; a null value reads "not set"
   and filters by IS NULL. Values already in the WHERE render pressed. A facet
   shows its first values and expands to every value read; when the read found
-  more than it returns, the count of hidden values says so with "+".
+  more than it returns, the count of hidden values says so with "+". A
+  severity text value reads in the colour of the highest severity number
+  recorded with it.
 -->
 <script lang="ts">
   import type { ActionProps } from '../contract.js';
-  import { FACET_VALUES, STATUS_NAMES, columnLabel, type FacetRailProps } from '../loaders.js';
+  import { FACET_VALUES, STATUS_NAMES, columnLabel, severityLevel, type FacetRailProps } from '../loaders.js';
   import { fmtCount } from '../format.js';
   import { numeric } from '../plot.js';
   import ActionNote from './ActionNote.svelte';
@@ -38,7 +40,7 @@
           <p class="none">No {column} recorded in this range.</p>
         {:else}
           <ul>
-            {#each open ? read : read.slice(0, FIRST) as [value, n], index (index)}
+            {#each open ? read : read.slice(0, FIRST) as [value, n, number], index (index)}
               <li>
                 <button
                   type="button"
@@ -50,7 +52,8 @@
                   <span
                     class="value"
                     class:unset={value === null}
-                    class:error={column === 'status_code' && value !== null && numeric(value) === 2}
+                    class:error={(column === 'status_code' && value !== null && numeric(value) === 2) || (column === 'severity_text' && severityLevel(number) === 'error')}
+                    class:warn={column === 'severity_text' && severityLevel(number) === 'warn'}
                     >{value === null ? 'not set' : column === 'status_code' ? (STATUS_NAMES[Number(value)] ?? String(value)) : String(value)}</span
                   >
                   <span class="count">{fmtCount(numeric(n))}</span>
@@ -146,6 +149,9 @@
   }
   .error {
     color: var(--danger);
+  }
+  .warn {
+    color: var(--warn);
   }
   .unset {
     padding-right: 2px;

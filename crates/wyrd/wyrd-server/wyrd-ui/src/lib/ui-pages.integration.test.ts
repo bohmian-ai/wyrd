@@ -58,8 +58,44 @@ async function signIn(browser: Browser, base: string, tenant: string, apiKey: st
   return page;
 }
 
+/** An invitation code for the built-in `role` of `tenant`, issued through the server by its administrator `adminKey`. */
+async function invitation(server: { builtinRoleId(tenant: string, role: string): string }, serverUrl: string, tenant: string, adminKey: string, role: string): Promise<string> {
+  const issued = await fetch(`${serverUrl}/v1/principals/users/invitations`, {
+    method: 'POST',
+    headers: {
+      'x-wyrd-access-token': `Bearer ${await WyrdClient.connect({ serverUrl, credential: adminKey }).accessToken()}`,
+      'content-type': 'application/json'
+    },
+    body: JSON.stringify({ role_ids: [server.builtinRoleId(tenant, role)] })
+  });
+  expect(issued.status).toBe(201);
+  return ((await issued.json()) as { invitation_code: string }).invitation_code;
+}
+
+/** A new browser signed in to `tenantKey` the normal human way: invitation signup, then the username and password form. */
+async function humanSignIn(browser: Browser, base: string, tenantKey: string, code: string): Promise<Page> {
+  const username = `person-${crypto.randomUUID().slice(0, 8)}`;
+  const password = `correct horse ${crypto.randomUUID()}`;
+  const enrolled = await browser.newContext();
+  const signup = await enrolled.newPage();
+  await signup.goto(`${base}/t/${tenantKey}/signup`);
+  await signup.getByLabel('Invitation code').fill(code);
+  await signup.getByLabel('Username').fill(username);
+  await signup.getByLabel('Password').fill(password);
+  await signup.getByRole('button', { name: 'Create account' }).click();
+  await signup.waitForURL(`${base}/t/${tenantKey}`);
+  await enrolled.close();
+  const page = await (await browser.newContext()).newPage();
+  await page.goto(`${base}/t/${tenantKey}/login`);
+  await page.getByLabel('Username').fill(username);
+  await page.getByLabel('Password').fill(password);
+  await page.getByRole('button', { name: 'Sign in', exact: true }).click();
+  await page.waitForURL(`${base}/t/${tenantKey}`);
+  return page;
+}
+
 /** The built BFF, a browser, and a tenant holding one trace; the default tenant holds another. */
-const test = serverTest().extend<{ ui: { base: string; browser: Browser; adminKey: string; readerKey: string; serverUrl: string } }>({
+const test = serverTest().extend<{ ui: { base: string; browser: Browser; tenant: string; adminKey: string; readerKey: string; serverUrl: string } }>({
   ui: [
     async ({ server }, use) => {
       execFileSync('pnpm', ['exec', 'vite', 'build'], { stdio: 'inherit', env: { ...process.env, VITEST: '' } });
@@ -71,7 +107,7 @@ const test = serverTest().extend<{ ui: { base: string; browser: Browser; adminKe
       const bff = await startBff(server.baseUrl);
       const browser = await chromium.launch();
       try {
-        await use({ base: bff.url, browser, adminKey, readerKey, serverUrl: server.baseUrl });
+        await use({ base: bff.url, browser, tenant, adminKey, readerKey, serverUrl: server.baseUrl });
       } finally {
         await browser.close();
         bff.stop();
@@ -115,7 +151,7 @@ test('authenticated traces and spans', async ({ ui }) => {
   await expect.poll(() => list.textContent(), { timeout: 30_000 }).toContain('invoke_agent support');
   expect(await list.textContent()).not.toContain('foreign-agent');
   expect(await overview.getByRole('region').count()).toBe(3);
-  await expect.poll(() => overview.textContent()).toMatch(/1 traces/);
+  await expect.poll(() => overview.textContent()).toMatch(/1 trace(?!s)/);
   expect(await list.locator('tbody tr').count()).toBe(1);
   // Wrap, Columns and CSV sit in the list bar, once.
   const listbar = page.locator('.listbar');
@@ -160,7 +196,8 @@ test('authenticated traces and spans', async ({ ui }) => {
   expect(new URL(page.url()).searchParams.get('trace')).toBe(TRACE);
   expect(await serverHtml(page, page.url())).toContain('role="treeitem"');
   // The drawer is the wide trace surface: root and totals head it, beside Link, Expand and Close.
-  expect(await drawer.locator('header').first().textContent()).toMatch(/trace [0-9a-f]{32}.*3 spans/s);
+  expect(await drawer.locator('header').first().textContent()).toMatch(/trace [0-9a-f]{4}…[0-9a-f]{4}.*3 spans/s);
+  expect(await drawer.locator('header').first().getByTitle(TRACE).count()).toBe(1);
   expect((await drawer.boundingBox())?.width).toBe(884);
   await drawer.getByRole('button', { name: /^Expand ↗$/ }).click();
   expect((await drawer.boundingBox())?.width).toBe(page.viewportSize()?.width);
@@ -266,7 +303,7 @@ test('authenticated logs investigation', async ({ ui }) => {
   await expect.poll(() => timeline.textContent()).toMatch(/Records per/);
   expect(await timeline.getByLabel('Key').textContent()).toMatch(/info.*warn.*error/);
   expect(await timeline.getByRole('application').getAttribute('aria-label')).toMatch(/: error$/);
-  expect(await timeline.getByRole('button', { name: /Open in Query/ }).count()).toBe(1);
+  expect(await timeline.getByRole('button', { name: /Open in Query/ }).count()).toBe(0);
 
   // Severity facets filter the timeline and the records alike.
   await page.locator('[data-panel="facets"]').getByRole('button', { name: /ERROR/ }).click();
@@ -501,7 +538,7 @@ test('observe boards match approved canvas', async ({ server, ui }) => {
     }))
   });
   server.flushBifrost();
-  const page = await signIn(ui.browser, ui.base, TENANT, ui.adminKey);
+  const page = await humanSignIn(ui.browser, ui.base, TENANT, await invitation(server, ui.serverUrl, ui.tenant, ui.adminKey, 'admin'));
   const observe = `${ui.base}/t/${TENANT}/observe?from=${RANGE.from}&to=${RANGE.to}`;
   const capture = async (board: string, mode: string, width: number) =>
     process.env.WYRD_UI_CAPTURE_DIR && page.screenshot({ path: join(process.env.WYRD_UI_CAPTURE_DIR, `${board}-${mode}-${width}.png`), fullPage: true });
@@ -546,6 +583,8 @@ test('observe boards match approved canvas', async ({ server, ui }) => {
       expect(new Set(await computed(overview.locator('rect.segment'), 'opacity'))).toEqual(new Set(['1']));
       expect(await computed(duration.locator('svg.plot polyline'), 'stroke')).toEqual([token('--observe'), token('--declare')]);
       expect(await duration.getByLabel('Key').textContent()).toMatch(/p95.*p50/);
+      expect(await computed(errors.locator('.headline'), 'color')).toEqual([token('--danger')]);
+      expect(await page.locator('.listbar .counts').textContent()).toMatch(/^1 trace · /);
       await capture('traces', mode, width);
 
       // The time picker opens on the panel surface, inside the screen.
@@ -556,6 +595,17 @@ test('observe boards match approved canvas', async ({ server, ui }) => {
       expect(panel && panel.x >= 0 && panel.x + panel.width <= width).toBe(true);
       await capture('timepicker', mode, width);
       await picker.press('Escape');
+
+      // Spans: every matching span of the range, filters open.
+      await page.goto(`${observe}&mode=spans`);
+      await expect.poll(() => list.locator('tbody tr').count(), { timeout: 30_000 }).toBe(3);
+      expect(await page.locator('[data-panel="facets"]').count()).toBe(1);
+      expect(await page.locator('.listbar .counts').textContent()).toMatch(/^3 spans match · p95 /);
+      expect(await list.locator('th').allTextContents()).toEqual(['Start', 'Name', 'Service', 'Trace', 'Parent', 'Duration', 'Status', 'Kind']);
+      expect(await list.getByTitle(TRACE).first().textContent()).toBe(`${TRACE.slice(0, 4)}…${TRACE.slice(-4)}`);
+      expect(await list.locator('.foot').textContent()).toMatch(/Showing 3 spans · a trace id opens that trace/);
+      expect(await page.evaluate(() => document.documentElement.scrollWidth)).toBeLessThanOrEqual(width);
+      await capture('spans', mode, width);
 
       // The waterfall: 884px drawer (the screen on mobile), 28px rows on the 300/110/flex/64 grid, bars by recorded service and error.
       await page.goto(`${observe}&trace=${TRACE}`);
@@ -576,6 +626,10 @@ test('observe boards match approved canvas', async ({ server, ui }) => {
       const key = drawer.getByRole('list', { name: 'Services' });
       expect((await key.locator('li').allTextContents()).map((item) => item.trim())).toEqual(['ui-agent', '✕ error']);
       expect(await computed(key.locator('i'), 'background-color')).toEqual([token('--declare'), token('--danger')]);
+      // The header shortens the trace id and keeps it whole as its title; the selected error span opens its detail.
+      expect(await drawer.locator('.facts').getByTitle(TRACE).textContent()).toBe(`${TRACE.slice(0, 4)}…${TRACE.slice(-4)}`);
+      await drawer.locator('button.select[title="execute_tool search"]').click();
+      await expect.poll(() => drawer.locator('.span').textContent(), { timeout: 30_000 }).toContain('execute_tool search');
       await capture('waterfall', mode, width);
 
       // Logs: one 64px severity band in the named fills, then facets, records and the record side by side (stacked on mobile).
@@ -586,6 +640,12 @@ test('observe boards match approved canvas', async ({ server, ui }) => {
       expect(await computed(timeline.locator('rect.segment'), 'fill')).toEqual([token('--danger')]);
       expect(new Set(await computed(timeline.locator('rect.segment'), 'opacity'))).toEqual(new Set(['1']));
       expect(await computed(timeline.getByLabel('Key').locator('i'), 'background-color')).toEqual([token('--level-info'), token('--warn'), token('--danger'), token('--muted')]);
+      expect(await timeline.locator('h3').textContent()).toMatch(/· drag to zoom$/);
+      expect(await timeline.getByRole('button', { name: /Open in Query/ }).count()).toBe(0);
+      // Group by sits in the records header with Wrap lines, Columns and CSV; severities read in their level's colour.
+      expect(await list.locator('.bar').getByLabel('Group by').count()).toBe(1);
+      expect(await computed(list.locator('tbody td .level-error'), 'color')).toEqual([token('--danger')]);
+      expect(await computed(page.locator('[data-panel="facets"] .value.error'), 'color')).toEqual([token('--danger')]);
       await list.locator('tbody tr').first().click();
       const aside = page.getByRole('complementary', { name: 'Log record' });
       await expect.poll(() => aside.textContent(), { timeout: 30_000 }).toContain('search timed out');
@@ -611,6 +671,12 @@ test('observe boards match approved canvas', async ({ server, ui }) => {
       expect(new Set((await boxes(seriesCard.locator('table.legend tbody tr'))).map((row) => row.height))).toEqual(new Set([28]));
       expect(await computed(plotCard.locator('svg.plot polyline'), 'stroke')).toEqual([token('--declare'), token('--observe')]);
       expect(await computed(series.getByRole('group', { name: 'Calculation' }).locator('[aria-current="true"]'), 'border-top-color')).toEqual([token('--selected-border')]);
+      // The calculation choices share the metric name's header row on desktop; the zoom hint reads under the plot.
+      if (desktop) {
+        const [name, calculation] = [await series.locator('.metric').boundingBox(), await series.getByRole('group', { name: 'Calculation' }).boundingBox()];
+        expect(name && calculation && calculation.y < name.y + name.height && calculation.x > name.x + name.width - 1).toBe(true);
+      }
+      expect(await plotCard.locator('.note').textContent()).toBe('Drag across the chart to zoom every Observe view to that window.');
       expect(await page.locator('[data-panel="list"]').count()).toBe(0);
       expect(await page.evaluate(() => document.documentElement.scrollWidth)).toBeLessThanOrEqual(width);
       await capture('metrics', mode, width);
@@ -636,16 +702,7 @@ test('local signup and personal settings', async ({ server, ui }) => {
   const tenantKey = 'ui-local';
   const tenant = server.seedTenant(tenantKey);
   const adminKey = server.bootstrapServiceInTenant(tenant, ['admin'], 'ui-local-admin');
-  const issued = await fetch(`${ui.serverUrl}/v1/principals/users/invitations`, {
-    method: 'POST',
-    headers: {
-      'x-wyrd-access-token': `Bearer ${await WyrdClient.connect({ serverUrl: ui.serverUrl, credential: adminKey }).accessToken()}`,
-      'content-type': 'application/json'
-    },
-    body: JSON.stringify({ role_ids: [server.builtinRoleId(tenant, 'editor')] })
-  });
-  expect(issued.status).toBe(201);
-  const { invitation_code: code } = (await issued.json()) as { invitation_code: string };
+  const code = await invitation(server, ui.serverUrl, tenant, adminKey, 'editor');
   const login = `${ui.base}/t/${tenantKey}/login`;
   // Longer than 128 UTF-16 units, decomposed: the server counts NFC characters, so the form must not cut it.
   const password = `${'𝒜'.repeat(64)} cafe\u0301 ${crypto.randomUUID().slice(0, 8)}`;

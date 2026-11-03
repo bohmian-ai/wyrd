@@ -11,7 +11,8 @@
   series table shows the exact `summary` rows under the same identity. Past
   twenty series only the first twenty start shown, and the table says so. A
   host that passes `shown` owns which series are drawn and hears each change
-  through `onseries`. `compact` draws a headline overview tile without the
+  through `onseries`. A `headline` sets its value beside the title with a
+  muted detail, and a `note` reads under the plot. `compact` draws a headline overview tile without the
   table and footer: a 56px plot with no axis text, its time labels beneath,
   and a key when the host names several `colors`; `bars` stacks a
   timeseries' series as bars, coloured by `colors` when the host names a
@@ -48,7 +49,8 @@
     headline,
     bars: stacked = false,
     colors = {},
-    heading
+    heading,
+    note
   }: ChartProps &
     ActionProps & {
       identity?: readonly string[];
@@ -56,7 +58,8 @@
       shown?: ReadonlySet<string>;
       onseries?: (shown: ReadonlySet<string>) => void;
       compact?: boolean;
-      headline?: string;
+      headline?: { value: string; detail?: string; tone?: string };
+      note?: string;
       bars?: boolean;
       colors?: Readonly<Record<string, string>>;
       heading?: Snippet;
@@ -287,7 +290,7 @@
       {@render heading()}
     {:else}
     <h3>{input.title ?? 'Chart'}{#if input.unit && !compact}{' '}<span class="unit">· {input.unit}</span>{/if}</h3>
-    {#if headline}<span class="headline">{headline}</span>{/if}
+    {#if headline}<span class="headline" style:color={headline.tone}>{headline.value}</span>{#if headline.detail}<span class="detail">{headline.detail}</span>{/if}{/if}
     {#if compact && Object.keys(colors).length > 1}
       <span class="key" aria-label="Key">{#each Object.entries(colors) as [label, color] (label)}<span><i class:line={!stacked} style:background={color}></i>{label}</span>{/each}</span>
     {/if}
@@ -438,6 +441,7 @@
     {:else}
       <EmptyState state={result.state} problem={result.problem} />
     {/if}
+    {#if note && result.state === 'populated'}<p class="note">{note}</p>{/if}
   </div>
 
   {#if !compact && !heading}
@@ -575,14 +579,21 @@
   }
   .headline {
     color: var(--text);
-    font: 12px var(--font-mono);
+    font: 15px var(--font-mono);
     font-variant-numeric: tabular-nums;
+  }
+  .detail,
+  .note {
+    margin: 0;
+    color: var(--muted);
+    font: 11px var(--font-mono);
   }
   .compact .frame {
     border: 0;
     background: transparent;
   }
   .compact header {
+    align-items: baseline;
     border: 0;
     padding: 0 0 4px;
   }

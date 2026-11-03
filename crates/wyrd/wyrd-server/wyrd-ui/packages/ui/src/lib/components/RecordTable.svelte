@@ -17,11 +17,16 @@
   every column the signal may show and reads the reader's choice again. CSV
   saves the rows and columns on screen. A host that passes `controls` places
   Wrap, Columns and CSV in that element, such as its list bar, instead of
-  above the table.
+  above the table; a host `tools` snippet renders before them.
+
+  Span rows show their shortened trace and parent span ids before Duration,
+  and trace rows their counts before Status; a log record's severity reads in
+  its level's colour, decided by the recorded severity number.
 -->
 <script lang="ts">
+  import type { Snippet } from 'svelte';
   import type { ActionProps, QueryResult } from '../contract.js';
-  import { KEY_COLUMNS, LIST_LIMIT, STATUS_NAMES, cellText, columnLabel, shownColumns, signalColumns, type RecordTableProps } from '../loaders.js';
+  import { KEY_COLUMNS, LIST_LIMIT, STATUS_NAMES, cellText, columnLabel, severityLevel, shortId, shownColumns, signalColumns, type RecordTableProps } from '../loaders.js';
   import { fmtCount } from '../format.js';
   import { columnIndex, numeric } from '../plot.js';
   import ActionButton from './ActionButton.svelte';
@@ -38,8 +43,10 @@
     onaction,
     paused = false,
     oncolumns,
-    controls
-  }: RecordTableProps & ActionProps & { paused?: boolean; oncolumns?: (columns: readonly string[]) => void; controls?: HTMLElement } = $props();
+    controls,
+    tools: hostTools
+  }: RecordTableProps &
+    ActionProps & { paused?: boolean; oncolumns?: (columns: readonly string[]) => void; controls?: HTMLElement; tools?: Snippet } = $props();
 
   /** Keep `node` inside `target` while it is mounted. */
   const placeIn = (target: HTMLElement) => (node: HTMLElement) => {
@@ -48,9 +55,15 @@
   };
 
   const TONES: Record<number, Tone> = { 0: 'neutral', 1: 'ok', 2: 'danger' };
-  const NOUNS = { traces: 'traces', spans: 'spans', logs: 'records', metrics: 'points' } as const;
+  const NOUNS = { traces: ['trace', 'traces'], spans: ['span', 'spans'], logs: ['record', 'records'], metrics: ['point', 'points'] } as const;
   const signal = $derived('signal' in input ? input.signal : undefined);
-  const noun = $derived(signal ? NOUNS[signal] : 'rows');
+  const nouns = $derived(signal ? NOUNS[signal] : (['row', 'rows'] as const));
+  const noun = $derived(nouns[1]);
+  /** `n` rows in words: "1 trace", "2 traces". */
+  const counted = (n: number) => `${fmtCount(n)} ${nouns[n === 1 ? 0 : 1]}`;
+  /** The columns before which a span row's ids and a trace row's counts render; absent from the view, they end the row. */
+  const extrasBefore = $derived(signal === 'spans' ? 'duration_nano' : 'status_code');
+  const extraCount = $derived(signal === 'traces' || signal === 'spans' ? 2 : 0);
   const loaded = $derived(result.state === 'populated' ? result.data : result.state === 'empty' ? { rows: result.data.rows } : undefined);
   const latest = $derived(loaded?.rows);
 
@@ -86,6 +99,7 @@
   /** Columns the reader hid with Columns; reads are unchanged. */
   let hidden = $state.raw<ReadonlySet<string>>(new Set());
   const visible = $derived(columns.filter((column) => !hidden.has(column)));
+  const extrasLast = $derived(!visible.includes(extrasBefore));
   let wrap = $state(false);
   const heading = (column: string) => (signal ? columnLabel(column) : column);
   const text = (column: string, value: unknown) => cellText(signal ? column : '', value);
@@ -212,11 +226,11 @@
     {/if}
     <div class="frame">
       {#if signal && controls}
-        <span class="tools" {@attach placeIn(controls)}>{@render tools()}</span>
+        <span class="tools" {@attach placeIn(controls)}>{@render hostTools?.()}{@render tools()}</span>
       {:else if signal}
         <div class="bar">
-          <span>{fmtCount(rows.rows.length)} {noun} · newest first</span>
-          <span class="tools">{@render tools()}</span>
+          <span>{counted(rows.rows.length)} · newest first</span>
+          <span class="tools">{@render hostTools?.()}{@render tools()}</span>
         </div>
       {/if}
       <div
@@ -233,14 +247,16 @@
         <table>
           <thead>
             <tr>
-              {#each visible as column (column)}<th scope="col" title={column}>{heading(column)}</th>{/each}
-              {#if signal === 'traces'}<th scope="col" class="number">spans</th><th scope="col" class="number">errors</th>{/if}
+              {#each visible as column (column)}
+                {#if column === extrasBefore}{@render extraHeads()}{/if}<th scope="col" title={column}>{heading(column)}</th>
+              {/each}
+              {#if extrasLast}{@render extraHeads()}{/if}
             </tr>
           </thead>
           <tbody>
             {#each groups as { key, caption, members } (key)}
               {#if input.groupBy}
-                <tr class="group"><th scope="rowgroup" colspan={visible.length + (signal === 'traces' ? 2 : 0)}>{heading(input.groupBy)} = {caption} · {members.length}</th></tr>
+                <tr class="group"><th scope="rowgroup" colspan={visible.length + extraCount}>{heading(input.groupBy)} = {caption} · {members.length}</th></tr>
               {/if}
               {#each members as row, index (index)}
                 {@const traceCounts = byTrace.get(String(row[columnIndex(rows, 'trace_id')]))}
@@ -253,13 +269,15 @@
                 >
                   {#each visible as column (column)}
                     {@const value = row[columnIndex(rows, column)]}
-                    <td class:name={signal && column === 'name'}>
+                    {#if column === extrasBefore}{@render extras(rows, row, traceCounts)}{/if}<td class:name={signal && column === 'name'}>
                       {#if !signal || value === null}
                         <span class:null={value === null} title={typeof value === 'string' && value.length > 40 ? value : undefined}>{text(column, value)}</span>
                       {:else if column === 'duration_nano'}
                         <DurationBar ms={Math.round(numeric(value) / 1e6)} max={longest} />
                       {:else if column === 'status_code' && STATUS_NAMES[numeric(value)]}
                         <StatusPill tone={TONES[numeric(value)]} label={STATUS_NAMES[numeric(value)]} />
+                      {:else if signal === 'logs' && column === 'severity_text'}
+                        <span class="level-{severityLevel(row[columnIndex(rows, 'severity_number')])}">{text(column, value)}</span>
                       {:else if column === 'service_name'}
                         <span class="chip" title={String(value)}>{String(value)}</span>
                       {:else if column.endsWith('_unix_nano')}
@@ -269,10 +287,7 @@
                       {/if}
                     </td>
                   {/each}
-                  {#if signal === 'traces'}
-                    <td class="number">{traceCounts ? fmtCount(traceCounts[0]) : pending}</td>
-                    <td class="number" class:errors={(traceCounts?.[1] ?? 0) > 0}>{traceCounts ? fmtCount(traceCounts[1]) : pending}</td>
-                  {/if}
+                  {#if extrasLast}{@render extras(rows, row, traceCounts)}{/if}
                 </tr>
               {/each}
             {/each}
@@ -303,8 +318,7 @@
         </nav>
       {:else}
         <p class="foot">
-          Showing {fmtCount(rows.rows.length)}
-          {noun}{#if limited}{' '}· newest {fmtCount(rows.rows.length)} read, older {noun} not read{/if}
+          Showing {counted(rows.rows.length)}{#if limited}{' '}· newest {fmtCount(rows.rows.length)} read, older {noun} not read{/if}{#if signal === 'spans' && openable}{' '}· a trace id opens that trace{/if}
         </p>
       {/if}
     </div>
@@ -328,6 +342,23 @@
 {:else if result.state === 'denied' || result.state === 'error'}
   <EmptyState state={result.state} problem={result.problem} />
 {/if}
+
+{#snippet extraHeads()}
+  {#if signal === 'traces'}<th scope="col" class="number">spans</th><th scope="col" class="number">errors</th>{/if}
+  {#if signal === 'spans'}<th scope="col" title="trace_id">Trace</th><th scope="col" title="parent_span_id">Parent</th>{/if}
+{/snippet}
+
+{#snippet extras(data: QueryResult, row: readonly unknown[], traceCounts: number[] | undefined)}
+  {#if signal === 'traces'}
+    <td class="number">{traceCounts ? fmtCount(traceCounts[0]) : pending}</td>
+    <td class="number" class:errors={(traceCounts?.[1] ?? 0) > 0}>{traceCounts ? fmtCount(traceCounts[1]) : pending}</td>
+  {:else if signal === 'spans'}
+    {@const trace = String(row[columnIndex(data, 'trace_id')])}
+    {@const parent = row[columnIndex(data, 'parent_span_id')]}
+    <td><span class="id" title={trace}>{shortId(trace)}</span></td>
+    <td>{#if parent === null}<span class="null">root</span>{:else}<span title={String(parent)}>{shortId(String(parent))}</span>{/if}</td>
+  {/if}
+{/snippet}
 
 {#snippet tools()}
   <button type="button" aria-pressed={wrap} onclick={() => (wrap = !wrap)}>Wrap lines</button>
@@ -382,7 +413,9 @@
   }
   .tools {
     display: flex;
+    flex-wrap: wrap;
     gap: 6px;
+    min-width: 0;
   }
   .tools button,
   .csv,
@@ -485,6 +518,10 @@
   [data-signal='spans'] td {
     height: 34px;
   }
+  [data-signal='logs'] th,
+  [data-signal='logs'] td {
+    padding: 0 10px;
+  }
   [data-signal='logs'] td,
   [data-signal='metrics'] td,
   [data-signal='sql'] td {
@@ -535,8 +572,15 @@
   .null {
     color: var(--muted);
   }
-  .errors {
+  .errors,
+  .level-error {
     color: var(--danger);
+  }
+  .level-warn {
+    color: var(--warn);
+  }
+  .id {
+    color: var(--declare);
   }
   .foot {
     display: flex;

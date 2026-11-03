@@ -6,7 +6,7 @@
   import { goto } from '$app/navigation';
   import { page } from '$app/state';
   import { Drawer, EmptyState, RecordDetail, StatusPill, TraceWaterfall, fmtCount, fmtDuration, type ActionIntent, type ActionState } from 'wyrd-ai-ui';
-  import { cellText, spanTree, validateIntent, type ComponentName } from 'wyrd-ai-ui/loaders';
+  import { cellText, shortId, spanTree, validateIntent, type ComponentName } from 'wyrd-ai-ui/loaders';
   import { closed, readState, step, writeState, type ObserveState } from '$lib/observe-host';
   import type { PageProps } from './$types';
 
@@ -67,7 +67,7 @@
           {#if trace?.root?.service}<span class="chip">{trace.root.service}</span>{/if}
         </p>
         <p class="facts">
-          trace {current.trace}{#if trace}{#if trace.start} · {trace.start}{/if} · {fmtDuration(Math.round(trace.duration))} · {fmtCount(trace.spans)} spans · {fmtCount(trace.errors)} {trace.errors === 1 ? 'error' : 'errors'}{/if}
+          trace <span title={current.trace}>{shortId(current.trace ?? '')}</span>{#if trace}{#if trace.start}{' '}· {trace.start}{/if} · {fmtDuration(Math.round(trace.duration))} · {fmtCount(trace.spans)} spans · {fmtCount(trace.errors)} {trace.errors === 1 ? 'error' : 'errors'}{/if}
         </p>
       </div>
     {/snippet}

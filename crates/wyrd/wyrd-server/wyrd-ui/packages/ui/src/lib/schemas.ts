@@ -130,7 +130,7 @@ export const SIGNALS = {
   spans: {
     table: 'bifrost.traces.spans',
     time: 'start_time_unix_nano',
-    columns: ['start_time_unix_nano', 'name', 'service_name', 'duration_nano', 'status_code', 'kind'],
+    columns: ['start_time_unix_nano', 'name', 'service_name', 'duration_nano', 'status_code'],
     filters: SPAN_FILTERS,
     more: []
   },

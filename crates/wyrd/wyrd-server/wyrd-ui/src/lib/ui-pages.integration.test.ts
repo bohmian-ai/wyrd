@@ -601,7 +601,7 @@ test('observe boards match approved canvas', async ({ server, ui }) => {
       await expect.poll(() => list.locator('tbody tr').count(), { timeout: 30_000 }).toBe(3);
       expect(await page.locator('[data-panel="facets"]').count()).toBe(1);
       expect(await page.locator('.listbar .counts').textContent()).toMatch(/^3 spans match · p95 /);
-      expect(await list.locator('th').allTextContents()).toEqual(['Start', 'Name', 'Service', 'Trace', 'Parent', 'Duration', 'Status', 'Kind']);
+      expect(await list.locator('th').allTextContents()).toEqual(['Start', 'Name', 'Service', 'Trace', 'Parent', 'Duration', 'Status']);
       expect(await list.getByTitle(TRACE).first().textContent()).toBe(`${TRACE.slice(0, 4)}…${TRACE.slice(-4)}`);
       expect(await list.locator('.foot').textContent()).toMatch(/Showing 3 spans · a trace id opens that trace/);
       expect(await page.evaluate(() => document.documentElement.scrollWidth)).toBeLessThanOrEqual(width);
@@ -654,6 +654,9 @@ test('observe boards match approved canvas', async ({ server, ui }) => {
         expect(facets.x + facets.width <= records.x && records.x + records.width <= record.x).toBe(true);
         expect(Math.abs(records.y - record.y)).toBeLessThan(1);
         expect(record.width).toBeLessThanOrEqual(400);
+        // Beside the open record, the count and its tools still share one header row.
+        const [count, tools] = await boxes(list.locator('.bar > span'));
+        expect(Math.abs(count.y + count.height / 2 - (tools.y + tools.height / 2))).toBeLessThan(2);
       } else expect(facets.y < records.y && records.y + records.height <= record.y).toBe(true);
       expect([facets, records, record].every((region) => region.x >= 0 && region.x + region.width <= width)).toBe(true);
       expect(await page.evaluate(() => document.documentElement.scrollWidth)).toBeLessThanOrEqual(width);

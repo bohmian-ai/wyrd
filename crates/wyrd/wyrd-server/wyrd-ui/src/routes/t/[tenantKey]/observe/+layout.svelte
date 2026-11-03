@@ -628,7 +628,7 @@
   }
   /* A choice is as wide as a short column name; a long attribute name truncates in the closed control. */
   .by select {
-    max-width: 10em;
+    max-width: 7em;
   }
   select {
     height: 30px;

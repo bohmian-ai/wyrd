@@ -76,13 +76,13 @@ export const traces = result(
  * durations that both read "1ms".
  */
 export const spans = result(
-  [col('start_time_unix_nano', NS, false), col('name', 'Utf8', false), col('service_name'), col('duration_nano', 'Int64', false), col('status_code', 'Int32', false), col('kind', 'Int32', false), col('trace_id', 'Utf8', false), col('span_id', 'Utf8', false)],
+  [col('start_time_unix_nano', NS, false), col('name', 'Utf8', false), col('service_name'), col('duration_nano', 'Int64', false), col('status_code', 'Int32', false), col('trace_id', 'Utf8', false), col('span_id', 'Utf8', false)],
   [
-    ['2026-10-20T11:58:02.450000001+00:00', 'GET /search', 'search', 1_000_000, 2, 3, TRACE, 'c1d2e3f405060708'],
-    ['2026-10-20T11:58:02.400000000+00:00', 'execute_tool search', 'agent-api', 900_000_000, 2, 1, TRACE, 'b9c7c989f97918e1'],
-    ['2026-10-20T11:58:01.130000000+00:00', 'chat gpt-5', 'agent-api', 1_200_000_000, 1, 3, TRACE, '53995c3f42cd8ad8'],
-    ['2026-10-20T11:57:44.004000000+00:00', 'status.error', '∅', 1_000_400, 1, 2, 'a3ce929d0e0e47364bf92f3577b34da6', '53995c3f42cd8ad9'],
-    ['2026-10-20T11:57:40.000000000+00:00', 'POST /v1/checkout/orders/{order_id}/payment-intents/confirm-with-a-very-long-route', null, 612_000_000, 0, 2, '0e0e47364bf92f3577b34da6a3ce929d', 'b9c7c989f97918e2']
+    ['2026-10-20T11:58:02.450000001+00:00', 'GET /search', 'search', 1_000_000, 2, TRACE, 'c1d2e3f405060708'],
+    ['2026-10-20T11:58:02.400000000+00:00', 'execute_tool search', 'agent-api', 900_000_000, 2, TRACE, 'b9c7c989f97918e1'],
+    ['2026-10-20T11:58:01.130000000+00:00', 'chat gpt-5', 'agent-api', 1_200_000_000, 1, TRACE, '53995c3f42cd8ad8'],
+    ['2026-10-20T11:57:44.004000000+00:00', 'status.error', '∅', 1_000_400, 1, 'a3ce929d0e0e47364bf92f3577b34da6', '53995c3f42cd8ad9'],
+    ['2026-10-20T11:57:40.000000000+00:00', 'POST /v1/checkout/orders/{order_id}/payment-intents/confirm-with-a-very-long-route', null, 612_000_000, 0, '0e0e47364bf92f3577b34da6a3ce929d', 'b9c7c989f97918e2']
   ]
 );
 
@@ -193,7 +193,7 @@ export const costs = result([col('value', 'Decimal128(38, 12)'), col('currency')
 /** The fixture answering one Observe read, chosen by its fixed SQL shape. */
 export function observeAnswer(sql: string): QueryResult | undefined {
   if (sql === AUTHORED_SQL) return authored;
-  if (sql.includes("kind, encode(trace_id, 'hex')")) return spans;
+  if (sql.includes("AS parent_span_id FROM bifrost.traces.spans")) return spans;
   if (sql.includes("encode(span_id, 'hex') AS span_id FROM bifrost.traces.spans")) return traces;
   if (sql.includes('wyrd_request_id FROM bifrost.logs.records')) return logs;
   if (sql.includes('FROM bifrost.metrics.points') && !sql.includes(' AS n FROM')) return points;
@@ -232,7 +232,7 @@ export function liveExecutor(): Executor {
           const { sql = '', params = [] } = requests[index] as { sql?: string; params?: unknown[] };
           if (each.ok && sql.includes('AS spans'))
             return { ok: true, value: { ...traceCounts, rows: params.map((id) => traceCounts.rows.find((row) => row[0] === id) ?? [id, 1, 0]) } };
-          if (!each.ok || !sql.includes("AS span_id FROM bifrost.traces.spans") || sql.includes('kind,')) return each;
+          if (!each.ok || !sql.includes("AS span_id FROM bifrost.traces.spans") || sql.includes('AS parent_span_id FROM bifrost.traces.spans')) return each;
           const fresh = Array.from({ length: reads++ }, (_, n) => ['2026-10-20T11:59:30.000000000+00:00', `GET /health ${n + 1}`, 'agent-api', 4_000_000, 1, (n + 1).toString(16).padStart(32, 'f'), (n + 1).toString(16).padStart(16, 'e')]);
           return { ok: true, value: { ...traces, rows: [...fresh, ...traces.rows] } };
         })

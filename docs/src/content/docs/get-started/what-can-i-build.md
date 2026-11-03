@@ -1,6 +1,6 @@
 ---
 title: What can I build?
-description: Match a verification problem to the Wyrd workflow for it - policy documents, agent evaluation, long-running workflows, runtime checks, observability, and drift - and see how Wyrd compares with MLflow, Langfuse, LangSmith, Braintrust, and Arize Phoenix.
+description: Match a verification problem to the Wyrd workflow for it - policy documents, agent evaluation, long-running workflows, runtime checks, observability, and drift.
 pillar: wyrd
 section: Get started
 order: 4
@@ -49,25 +49,6 @@ Every workflow uses the same parts. Cards declare exact versions of what you shi
 **Problem.** Inputs, outputs, or model behavior shift slowly, and no single request fails.
 
 **Workflow.** Declare a baseline as a Data Card, record samples from your code, and run a [drift](/build-and-verify/verify/verifier-recipes/#drift) Verifier on a schedule. An Operator on that binding can notify Slack or PagerDuty when a window fails; [React to a failure](/build-and-verify/declare/bind-a-verifier/#3-react-to-a-failure) adds one.
-
-## How Wyrd compares
-
-Langfuse, LangSmith, Braintrust, and Arize Phoenix compete with Wyrd in LLM and agent observability and evaluation, which is one part of what Wyrd verifies. MLflow overlaps with Wyrd on GenAI evaluation and owns model and experiment lifecycle, which Wyrd does not replace.
-
-| Platform | Main focus | Why choose Wyrd? |
-| --- | --- | --- |
-| Wyrd | Production verification across AI/ML systems and application workflows | One self-hosted server pins what you ship to exact versions, composes deterministic checks with Agent judges, and keeps each cited verdict beside the traces, gateway calls, and rows it judged |
-| MLflow | Model and experiment lifecycle for classical ML, plus GenAI tracing and evaluation | Keep MLflow as the record for models and experiments. Send a Verifier the evidence you choose with the MLflow run or model ID in it, and the stored verdict keeps that ID. Wyrd has no built-in MLflow connector |
-| Langfuse | Open-source LLM tracing, prompt management, and evaluation | A Wyrd Verifier version fixes its checks, its judge, and the exact policy files it mounts, so a stored verdict names everything that judged it |
-| LangSmith | Tracing, evaluation, and monitoring for LLM applications and agents | The same Verifier runs before release and inline at runtime, returning a verdict your application can act on, and also covers classical ML drift and uploaded documents |
-| Braintrust | Evaluation, experiments, and logging for AI products | Verifiers bind to exact versions of the Services, Agents, Models, and Data they judge, and verdicts join your own rows and traces in one SQL store |
-| Arize Phoenix | Open-source tracing and evaluation for LLM applications, built on OpenTelemetry | Wyrd ingests OpenTelemetry too, and adds versioned Verifiers, policy Artifacts, grouped and scheduled checks, and Operators that react to failures |
-
-Wyrd does not read data from these tools. Your application sends Wyrd the evidence to verify, so an existing tracer, gateway, or experiment tracker can stay in place beside it.
-
-[How verification works](/understand/how-verification-works/) explains composed checks, workspaces, and cited verdicts. [Bifrost](/understand/bifrost/) explains how evidence is stored and queried, and [Architecture](/understand/architecture/) what a team deployment runs.
-
-Vendor descriptions were checked on 2026-11-03 against each product's own documentation: [MLflow GenAI](https://mlflow.org/docs/latest/genai/), [MLflow evaluation](https://mlflow.org/docs/latest/ml/evaluation), [Langfuse](https://langfuse.com/docs), [Langfuse LLM-as-a-judge](https://langfuse.com/docs/evaluation/evaluation-methods/llm-as-a-judge), [LangSmith](https://docs.langchain.com/langsmith/observability), [Braintrust](https://docs.braintrust.dev/), and [Arize Phoenix](https://arize.com/docs/phoenix/). Arize AX, Arize's commercial platform, is a separate product and is not compared here.
 
 ## Next
 

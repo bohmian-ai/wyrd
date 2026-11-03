@@ -72,4 +72,4 @@ Wyrd verifies your system; your code runs it. Your app owns its code, models, an
 
 ## Next
 
-[Set up Wyrd](/get-started/setup/) starts a local server. [Run your first verification](/get-started/quickstart/) then declares a Verifier and verifies one passing and one failing reply. [What can I build?](/get-started/what-can-i-build/) shows the larger workflows and how Wyrd compares with other tools.
+[Set up Wyrd](/get-started/setup/) starts a local server. [Run your first verification](/get-started/quickstart/) then declares a Verifier and verifies one passing and one failing reply. [What can I build?](/get-started/what-can-i-build/) shows the larger workflows.

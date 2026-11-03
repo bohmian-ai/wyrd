@@ -5,7 +5,7 @@
  * evidence exported over stock OTLP. Nothing here mocks the server or the BFF.
  */
 import { execFileSync, spawn } from 'node:child_process';
-import { closeSync, mkdtempSync, openSync, readFileSync } from 'node:fs';
+import { closeSync, existsSync, mkdtempSync, openSync, readFileSync, statSync } from 'node:fs';
 import { createServer } from 'node:net';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
@@ -797,31 +797,49 @@ base('development environment lifecycle', { timeout: 2_400_000 }, async () => {
     expect(refused.output()).not.toContain('scripts.batch');
     expect(await answers(8000), 'example app after a failed setup').toBe(false);
     expect((await fetch('http://127.0.0.1:8080/readyz')).ok).toBe(true);
-    expect((await fetch('http://127.0.0.1:3000/t/dev/login/api-key')).ok).toBe(true);
+    expect((await fetch('http://127.0.0.1:3000/t/dev/login')).ok).toBe(true);
     expect((await fetch('http://127.0.0.1:1080/mockserver/ready')).ok).toBe(true);
   } finally {
     await refused.interrupt();
   }
   for (const port of [8080, 3000, 8000]) expect(await answers(port), `port ${port} after Ctrl-C`).toBe(false);
+  expect(existsSync(join(config, 'dev-login.toml')), 'the dev login after Ctrl-C').toBe(false);
 
   const child = devFull(config);
   const output = child.output;
   const log = child.log;
   const browser = await chromium.launch();
   try {
-    // One command reaches readiness, runs the batch to terminal evidence and reports usable URLs.
+    // The UI's sign-in is reported ready before the example app is set up or its batch sent.
+    await vi.waitFor(() => expect(output()).toContain('UI ready     http://127.0.0.1:3000/t/dev/login'), { timeout: 1_500_000, interval: 1_000 });
+    expect(output()).not.toMatch(/batch {8}/);
+    const record = join(config, 'dev-login.toml');
+    expect(statSync(record).mode & 0o777).toBe(0o600);
+    const password = /password = "([^"]+)"/.exec(readFileSync(record, 'utf8'))?.[1];
+    expect(password).toHaveLength(20);
+
+    // The seeded local User signs in normally and reaches personal Settings.
+    const page = await (await browser.newContext()).newPage();
+    await page.goto('http://127.0.0.1:3000/t/dev/login');
+    await page.getByLabel('Username').fill('dev');
+    await page.getByLabel('Password').fill(password!);
+    await page.getByRole('button', { name: 'Sign in', exact: true }).click();
+    await page.waitForURL('http://127.0.0.1:3000/t/dev');
+    await page.goto('http://127.0.0.1:3000/t/dev/settings/account');
+    await expect.poll(() => page.locator('dl').textContent()).toContain('Username and password');
+
+    // One command runs the batch to terminal evidence and reports usable URLs.
     await vi.waitFor(() => expect(output()).toMatch(/batch {8}(passed|FAILED)/), { timeout: 1_500_000, interval: 1_000 });
     expect(output(), log).toContain('batch        passed');
-    expect(output()).toContain('UI           http://127.0.0.1:3000/t/dev/login/api-key');
+    expect(output()).toContain('UI           http://127.0.0.1:3000/t/dev/login (sign in as dev');
+    expect(output()).not.toContain('/login/api-key');
     for (const port of [8080, 3000, 8000, 1080]) expect(await answers(port), `port ${port}`).toBe(true);
-    const key = /api_key = "([^"]+)"/.exec(readFileSync(join(config, 'credentials.toml'), 'utf8'))?.[1];
-    expect(key).toBeDefined();
 
-    // Normal browser login reaches the batch's retained traces, logs and metrics.
-    const page = await signIn(browser, 'http://127.0.0.1:3000', 'dev', key!);
+    // The signed-in browser reaches the batch's retained traces, logs and metrics.
     const observe = 'http://127.0.0.1:3000/t/dev/observe';
-    for (const signal of ['traces', 'logs', 'metrics']) {
-      await page.goto(`${observe}?signal=${signal}&last=1h`);
+    // Metrics lists raw points only in its Recorded points inspector.
+    for (const view of ['signal=traces', 'signal=logs', 'signal=metrics&points=1']) {
+      await page.goto(`${observe}?${view}&last=1h`);
       await expect.poll(() => page.locator('[data-panel="list"] tbody tr').count(), { timeout: 120_000 }).toBeGreaterThan(0);
     }
 
@@ -839,10 +857,16 @@ base('development environment lifecycle', { timeout: 2_400_000 }, async () => {
       },
       { timeout: 180_000, interval: 2_000 }
     );
+
+    // Sign-out ends the session.
+    await page.locator('details.identity summary').click();
+    await page.getByRole('button', { name: 'Sign out' }).click();
+    await page.waitForURL(/\/login$/);
   } finally {
     await browser.close();
     // Ctrl-C stops every owned child: the app first, so its telemetry drains.
     await child.interrupt();
   }
   for (const port of [8080, 3000, 8000]) expect(await answers(port), `port ${port} after Ctrl-C`).toBe(false);
+  expect(existsSync(join(config, 'dev-login.toml')), 'the dev login after Ctrl-C').toBe(false);
 });

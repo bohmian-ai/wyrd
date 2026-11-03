@@ -1303,19 +1303,23 @@ stop() {
 trap stop EXIT INT TERM
 mise run dev:mockserver &
 pids+=($!)
-credentials=${WYRD_CONFIG_HOME:-${XDG_CONFIG_HOME:-$HOME/.config}/wyrd}/credentials.toml
+config=${WYRD_CONFIG_HOME:-${XDG_CONFIG_HOME:-$HOME/.config}/wyrd}
+credentials=$config/credentials.toml
+ui=http://127.0.0.1:${WYRD_UI_PORT:-3000}
 started=$(mktemp)
 WYRD_CONFIG_PATH="$PWD/tests/fixtures/mockserver/server.toml" WYRD_SEALING_KEY_BASE64=$(openssl rand -base64 32) scripts/postgres/dev-server.sh &
 server=$!
 pids+=($server)
-(cd crates/wyrd/wyrd-server/wyrd-ui && pnpm install --frozen-lockfile && exec pnpm run dev --host 0.0.0.0 --port ${WYRD_UI_PORT:-3000}) &
+# Sign-in is the real local User login, never the UI's fixture identity.
+(cd crates/wyrd/wyrd-server/wyrd-ui && pnpm install --frozen-lockfile && WYRD_UI_LOCAL_AUTH=false exec pnpm run dev --host 0.0.0.0 --port ${WYRD_UI_PORT:-3000}) &
 pids+=($!)
-# Ready means serving and holding this start's new tenant key.
-until curl -sf http://127.0.0.1:8080/readyz >/dev/null && [[ $credentials -nt $started ]]; do
+# Ready means serving, holding this start's new tenant key and local User login, and the UI's sign-in page answering.
+until curl -sf http://127.0.0.1:8080/readyz >/dev/null && [[ $config/dev-login.toml -nt $started ]] && curl -sf -o /dev/null "$ui/t/dev/login"; do
   kill -0 "$server" 2>/dev/null || { echo "wyrd-server exited before it was ready" >&2; exit 1; }
   sleep 1
 done
 rm -f "$started"
+printf '\nUI ready     %s/t/dev/login (sign in as dev with the password above, also in %s)\n\n' "$ui" "$config/dev-login.toml"
 until curl -sf http://127.0.0.1:1080/mockserver/ready >/dev/null; do
   kill -0 "${pids[0]}" 2>/dev/null || { echo "MockServer exited before it was ready" >&2; exit 1; }
   sleep 1
@@ -1339,7 +1343,7 @@ else
   batch="not sent: setup FAILED; the server, UI and MockServer are still running for diagnosis"
 fi
 printf '\nwyrd-server  http://127.0.0.1:8080 (fresh database; tenant dev key replaced %s)\n' "$credentials"
-printf 'UI           http://127.0.0.1:%s/t/dev/login/api-key (sign in with that api_key)\n' "${WYRD_UI_PORT:-3000}"
+printf 'UI           %s/t/dev/login (sign in as dev; password in %s)\n' "$ui" "$config/dev-login.toml"
 printf 'example app  %s\n' "$example"
 printf 'MockServer   http://127.0.0.1:1080/mockserver/dashboard\n'
 printf 'batch        %s\n\n' "$batch"

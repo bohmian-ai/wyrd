@@ -21,7 +21,8 @@ import type { LayoutServerLoad } from './$types';
 /**
  * The main Observe view as this tenant's browser session: the signal's
  * overview, facets and list, and on Metrics the metric rail and the selected
- * metric's series. The range resolves once, so every read of one refresh
+ * metric's series; Metrics reads its recorded points only while the reader
+ * has the points inspector open. The range resolves once, so every read of one refresh
  * shares its bounds and predicate; Live refreshes by invalidating
  * `wyrd:observe`. The open record's params are never read here, so opening
  * one never reloads the list. The facet and list inputs pass their catalog
@@ -47,7 +48,7 @@ export const load: LayoutServerLoad = async ({ locals, url, request, depends }) 
     state.signal === 'traces' ? loadTraceOverview(filter, context) : undefined,
     state.signal === 'logs' ? loadLogTimeline(filter, context) : undefined,
     loadFacetRail(checked, context),
-    loadPanel('RecordTable', listed.input, context) as Promise<RecordTableProps>,
+    state.signal !== 'metrics' || state.points ? (loadPanel('RecordTable', listed.input, context) as Promise<RecordTableProps>) : undefined,
     state.signal === 'metrics' ? loadMetricNames(filter, context) : undefined,
     inputs.series ? loadMetric(inputs.series, context) : undefined
   ]);

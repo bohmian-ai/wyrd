@@ -1756,3 +1756,94 @@ test('TASK-004: Telemetry presentation is independent of record names', async ()
   expect(row.querySelector('.pill')).toHaveAttribute('data-tone', 'ok');
   view.unmount();
 });
+
+test('Observe canvas colour roles and series composition', async () => {
+  // Lines take the canonical series order by position, with no status meaning and no blending.
+  const six: QueryResult = { ...series, rows: Array.from({ length: 6 }, (_, index) => ['2026-10-20T10:00:00Z', `s${index}`, 10 - index]), terminal: terminal(6) };
+  const lines = render(Chart, { input: timeseries, result: { state: 'populated', data: six } });
+  expect([...lines.container.querySelectorAll('.legend tbody line')].map((line) => line.getAttribute('stroke'))).toEqual([
+    'var(--declare)',
+    'var(--observe)',
+    'var(--series-3)',
+    'var(--series-4)',
+    'var(--series-5)',
+    'var(--declare)'
+  ]);
+  lines.unmount();
+
+  // A host's named colours win over position: p95 lime and p50 periwinkle, whatever order the columns read.
+  const at = { name: 'at', data_type: 'Timestamp(Nanosecond, Some("UTC"))', nullable: false };
+  const durations: QueryResult = {
+    columns: [at, { name: 'p95', data_type: 'Float64', nullable: true }, { name: 'p50', data_type: 'Float64', nullable: true }],
+    rows: [['2026-10-20T10:00:00Z', 9, 4], ['2026-10-20T10:05:00Z', 8, 3]],
+    terminal: terminal(2)
+  };
+  const duration = render(Chart, {
+    input: { type: 'timeseries', title: 'Duration', sql: 'SELECT 1', x: 'at', y: ['p95', 'p50'] } as ChartInput,
+    result: { state: 'populated', data: durations },
+    compact: true,
+    colors: { p95: 'var(--observe)', p50: 'var(--declare)' }
+  });
+  expect([...duration.container.querySelectorAll('svg.plot polyline')].map((line) => line.getAttribute('stroke'))).toEqual(['var(--observe)', 'var(--declare)']);
+  // A compact tile keys each named series and keeps its time labels below the plot, not inside it.
+  expect([...duration.getByLabelText('Key').querySelectorAll('i')].map((swatch) => (swatch as HTMLElement).style.background)).toEqual(['var(--observe)', 'var(--declare)']);
+  expect(duration.container.querySelectorAll('svg.plot text')).toHaveLength(0);
+  expect(duration.container.querySelector('.times')).toHaveTextContent('10:00');
+  duration.unmount();
+
+  // Stacked severity bars fill with the exact named role, never an opacity blend.
+  const levels: QueryResult = {
+    columns: [at, { name: 'level', data_type: 'Utf8', nullable: false }, { name: 'records', data_type: 'Int64', nullable: false }],
+    rows: [['2026-10-20T10:00:00Z', 'info', 3], ['2026-10-20T10:00:00Z', 'warn', 2], ['2026-10-20T10:00:00Z', 'error', 1]],
+    terminal: terminal(3)
+  };
+  const timeline = render(Chart, {
+    input: { type: 'timeseries', title: 'Records', sql: 'SELECT 1', x: 'at', y: ['records'], series: 'level' } as ChartInput,
+    result: { state: 'populated', data: levels },
+    compact: true,
+    bars: true,
+    colors: { info: 'var(--level-info)', warn: 'var(--warn)', error: 'var(--danger)' }
+  });
+  const segments = [...timeline.container.querySelectorAll('rect.segment')];
+  expect(segments.map((segment) => segment.getAttribute('fill')).toSorted()).toEqual(['var(--danger)', 'var(--level-info)', 'var(--warn)']);
+  expect(segments.every((segment) => !segment.hasAttribute('opacity') && !segment.hasAttribute('fill-opacity'))).toBe(true);
+  timeline.unmount();
+
+  // With a host heading, the chart is two cards: the plot under the heading, then the selectable series summary.
+  const heading = createRawSnippet(() => ({ render: () => '<h2>sim.latency</h2>' }));
+  const cards = render(Chart, { input: timeseries, result: { state: 'populated', data: series }, heading });
+  const frames = cards.container.querySelectorAll('.chart > .frame');
+  expect(frames).toHaveLength(2);
+  expect(frames[0].querySelector('h2')).toHaveTextContent('sim.latency');
+  expect(frames[0].querySelector('svg.plot')).not.toBeNull();
+  expect(frames[0].querySelector('table.legend')).toBeNull();
+  expect(frames[1].querySelector('table.legend')).not.toBeNull();
+  expect(frames[1].querySelectorAll('input[type="checkbox"]')).toHaveLength(2);
+  expect(frames[1].querySelector('button')?.textContent).toMatch(/Show all|Open in Query/);
+  expect([...frames[1].querySelectorAll('button')].some((button) => /Open in Query/.test(button.textContent ?? ''))).toBe(true);
+  // The plot card carries no second header and the summary replaces the SQL footer.
+  expect(cards.queryByRole('heading', { name: /Latency/ })).toBeNull();
+  expect(cards.container.querySelector('footer')).toBeNull();
+  cards.unmount();
+
+  // The waterfall colours each recorded service by series position, errors by status, and keys every service.
+  const fall = render(TraceWaterfall, { input: { traceId: TRACE }, result: { state: 'populated', data: trace } });
+  await fireEvent.click(fall.getByRole('button', { name: 'Expand all' }));
+  const bars = Object.fromEntries(
+    [...fall.container.querySelectorAll('[role="treeitem"]')].map((row) => [row.querySelector('.select')?.getAttribute('title'), (row.querySelector('.bar') as HTMLElement).style.background])
+  );
+  expect(bars).toEqual({
+    'invoke_agent support': 'var(--danger)',
+    'chat gpt-5': 'var(--declare)',
+    'execute_tool search': 'var(--danger)',
+    'GET /search': 'var(--danger)',
+    'late span': 'var(--observe)'
+  });
+  const key = fall.getByRole('list', { name: 'Services' });
+  expect([...key.querySelectorAll('li')].map((item) => [item.textContent?.trim(), (item.querySelector('i') as HTMLElement).style.background])).toEqual([
+    ['agent-api', 'var(--declare)'],
+    ['search', 'var(--observe)'],
+    ['✕ error', 'var(--danger)']
+  ]);
+  fall.unmount();
+});

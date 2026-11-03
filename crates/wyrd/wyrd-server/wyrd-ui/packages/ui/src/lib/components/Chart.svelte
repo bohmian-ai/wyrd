@@ -12,18 +12,24 @@
   twenty series only the first twenty start shown, and the table says so. A
   host that passes `shown` owns which series are drawn and hears each change
   through `onseries`. `compact` draws a headline overview tile without the
-  table and footer, with a key when the host names several `colors`; `bars`
-  stacks a timeseries' series as bars, coloured by `colors` when the host
-  names a colour per caption. A keyed series' caption stays one line; opening
+  table and footer: a 56px plot with no axis text, its time labels beneath,
+  and a key when the host names several `colors`; `bars` stacks a
+  timeseries' series as bars, coloured by `colors` when the host names a
+  colour per caption. Series take the palette's series order by position
+  unless the host names a colour, and every fill is drawn at full strength.
+  A host `heading` replaces the chart's own header and splits it into two
+  cards: the plot under that heading, then the selectable series summary
+  with Show all and Open in Query in place of the SQL footer. A keyed series' caption stays one line; opening
   it lists every recorded identity cell, and an equal-instant sample keeps its
   own marker and tooltip value.
 -->
 <script lang="ts">
+  import type { Snippet } from 'svelte';
   import type { ActionProps } from '../contract.js';
   import type { ChartProps } from '../loaders.js';
   import { fmtInstant, fmtNumber } from '../format.js';
   import type { Loaded, QueryResult } from '../contract.js';
-  import { MAX_SERIES, barRows, columnIndex, identityKey, numeric, recordedSeries, timeSeries } from '../plot.js';
+  import { MAX_SERIES, SERIES_COLORS, barRows, columnIndex, identityKey, numeric, recordedSeries, timeSeries } from '../plot.js';
   import ActionButton from './ActionButton.svelte';
   import EmptyState from './EmptyState.svelte';
   import StatusPill from './StatusPill.svelte';
@@ -41,7 +47,8 @@
     compact = false,
     headline,
     bars: stacked = false,
-    colors = {}
+    colors = {},
+    heading
   }: ChartProps &
     ActionProps & {
       identity?: readonly string[];
@@ -52,6 +59,7 @@
       headline?: string;
       bars?: boolean;
       colors?: Readonly<Record<string, string>>;
+      heading?: Snippet;
     } = $props();
 
   /**
@@ -62,19 +70,22 @@
   let boxWidth = $state(0);
   let boxHeight = $state(0);
   const W = $derived(boxWidth > 64 ? boxWidth : 560);
-  const H = $derived(Math.max(compact ? 64 : 160, boxHeight));
-  /** Tick labels sit above their gridline at the left; the gutter keeps the first points clear of them. */
-  const PAD = { left: 32, right: 6, top: 16, bottom: 22 };
-  const STROKES = ['var(--declare)', 'var(--observe)', 'var(--text)', 'var(--muted)'] as const;
+  const H = $derived(Math.max(compact ? 56 : 160, boxHeight));
+  /**
+   * Tick labels sit above their gridline at the left; the gutter keeps the
+   * first points clear of them. A compact tile draws no axis text, so its
+   * plot fills the box and its baseline is the box's bottom edge.
+   */
+  const PAD = $derived(compact ? { left: 0, right: 0, top: 2, bottom: 0 } : { left: 32, right: 6, top: 16, bottom: 22 });
   const MARKERS = ['square', 'circle', 'triangle', 'diamond'] as const;
   const DASHES = ['', '6 3', '2 3', '8 2 2 2', '1 4'] as const;
   /**
-   * The style of series `index`. Colour and marker cycle by four and dash by
-   * five, so every one of the twenty series pairs a dash with a marker no other
+   * The style of series `index`. Colour and dash cycle by five and marker by
+   * four, so every one of the twenty series pairs a dash with a marker no other
    * series has, and series stay distinct without colour.
    */
   const style = (index: number, label?: string) => ({
-    stroke: (label !== undefined && colors[label]) || STROKES[index % 4],
+    stroke: (label !== undefined && colors[label]) || SERIES_COLORS[index % SERIES_COLORS.length],
     marker: MARKERS[index % 4],
     dash: DASHES[index % 5]
   });
@@ -269,17 +280,22 @@
   const unitLabel = $derived(input.unit ? ` ${input.unit}` : '');
 </script>
 
-<section class="chart" class:compact aria-label={input.title ?? 'Chart'}>
+<section class="chart" class:compact class:cards={heading} aria-label={input.title ?? 'Chart'}>
+  <div class="frame">
   <header>
+    {#if heading}
+      {@render heading()}
+    {:else}
     <h3>{input.title ?? 'Chart'}{#if input.unit && !compact}{' '}<span class="unit">· {input.unit}</span>{/if}</h3>
     {#if headline}<span class="headline">{headline}</span>{/if}
     {#if compact && Object.keys(colors).length > 1}
-      <span class="key" aria-label="Key">{#each Object.entries(colors) as [label, color] (label)}<span><i style:background={color}></i>{label}</span>{/each}</span>
+      <span class="key" aria-label="Key">{#each Object.entries(colors) as [label, color] (label)}<span><i class:line={!stacked} style:background={color}></i>{label}</span>{/each}</span>
+    {/if}
     {/if}
     {#if degraded && data}
       <span title={data.terminal.warnings.join(', ')}><StatusPill tone="warn" label="Partial result" /></span>
     {/if}
-    {#if !compact}
+    {#if !compact && !heading}
     <span class="open">
       <ActionButton
         variant="link"
@@ -325,13 +341,17 @@
             onpointerup={release}
             onpointerleave={() => (brush ? undefined : (focused = undefined))}
           >
-            {#each ticks as tick (tick)}
-              <line class="grid" x1="0" x2={W} y1={sy(tick)} y2={sy(tick)} />
-              <text class="axis" x="0" y={sy(tick) - 4}>{fmtNumber(tick)}</text>
-            {/each}
-            {#each xLabels as label (label.at)}
-              <text class="axis" x={sx(label.at)} y={H - 4} text-anchor={label.anchor}>{label.text}</text>
-            {/each}
+            {#if compact}
+              <line class="baseline" x1="0" x2={W} y1={H - 0.5} y2={H - 0.5} />
+            {:else}
+              {#each ticks as tick (tick)}
+                <line class="grid" x1="0" x2={W} y1={sy(tick)} y2={sy(tick)} />
+                <text class="axis" x="0" y={sy(tick) - 4}>{fmtNumber(tick)}</text>
+              {/each}
+              {#each xLabels as label (label.at)}
+                <text class="axis" x={sx(label.at)} y={H - 4} text-anchor={label.anchor}>{label.text}</text>
+              {/each}
+            {/if}
             {#each columns as column (column.x)}
               {@const width = Math.max(1, ((W - PAD.left - PAD.right) / Math.max(1, xs.length)) * 0.8)}
               {#each column.segments as segment (segment.label)}
@@ -363,6 +383,9 @@
             {/if}
           </svg>
         </div>
+        {#if compact}
+          <p class="times" aria-hidden="true">{#each xLabels as label (label.at)}<span>{label.text}</span>{/each}</p>
+        {/if}
         {#if focused !== undefined && xs[focused] !== undefined}
           {@const at = xs[focused]}
           <p class="tooltip" role="status">
@@ -373,11 +396,78 @@
             {/each}
           </p>
         {/if}
-        {#if !compact}
+        {#if !compact && !heading}{@render legend()}{/if}
+      {:else if input.type === 'bar'}
+        <div class="box" bind:clientWidth={boxWidth} bind:clientHeight={boxHeight}>
+          <svg
+            class="plot bars"
+            viewBox="0 0 {W} {H}"
+            role="img"
+            aria-label="{input.title ?? 'Bar chart'}: {barCells.map((cell) => `${cell.label} ${cell.value === null ? 'no value' : cell.shown}${unitLabel}`).join(', ')}"
+          >
+            <line class="grid" x1="0" x2={W} y1={barY(0)} y2={barY(0)} />
+            {#each barCells as cell, index (index)}
+              <rect class="bar" x={cell.x} y={cell.y} width={cell.width} height={cell.height}><title>{cell.label}: {cell.shown}{unitLabel}</title></rect>
+              {#if cell.values}<text class="value" x={cell.x + cell.width / 2} y={cell.valueY} text-anchor="middle">{cell.shown}</text>{/if}
+              {#if cell.labelX !== undefined}<text class="axis" x={cell.labelX} y={H - 4} text-anchor="middle">{cell.text}</text>{/if}
+            {/each}
+          </svg>
+        </div>
+      {:else if input.type === 'stat'}
+        <p class="stat">{stat === undefined ? '—' : fmtNumber(stat)}{#if input.unit}<span class="unit">{input.unit}</span>{/if}</p>
+      {:else if data}
+        <!-- A wide result scrolls; the focusable region lets a keyboard reader pan it. -->
+        <!-- svelte-ignore a11y_no_noninteractive_tabindex -->
+        <div class="scroller" role="region" aria-label="{input.title ?? 'Result'} table" tabindex="0">
+          <table>
+            <thead>
+              <tr>{#each data.columns as column, index (index)}<th scope="col" title={column.data_type}>{column.name}</th>{/each}</tr>
+            </thead>
+            <tbody>
+              {#each data.rows as row, index (index)}
+                <tr>{#each row as cell, position (position)}<td>{cell === null ? '∅' : typeof cell === 'object' ? JSON.stringify(cell) : String(cell)}</td>{/each}</tr>
+              {/each}
+            </tbody>
+          </table>
+        </div>
+      {/if}
+    {:else if result.state === 'empty'}
+      <EmptyState state="empty" title="No data" detail={result.reason} />
+    {:else if result.state === 'loading'}
+      <EmptyState state="loading" title="Running query" />
+    {:else}
+      <EmptyState state={result.state} problem={result.problem} />
+    {/if}
+  </div>
+
+  {#if !compact && !heading}
+  <footer>
+    <span>source</span>
+    <code title={input.sql}>{input.sql}</code>
+  </footer>
+  {/if}
+  </div>
+  {#if heading && input.type === 'timeseries' && result.state === 'populated'}
+    <div class="frame summary">{@render legend()}</div>
+  {/if}
+</section>
+
+{#snippet legend()}
         <div class="series">
           <p>
             {lines.length} series{drawn.length < lines.length ? ` · ${drawn.length} shown` : ''}{identity ? ' · exact Latest, Max and Mean' : ''}
-            {#if drawn.length < lines.length}<button type="button" onclick={() => choose(new Set(lines.map((line) => line.key)))}>Show all</button>{/if}
+            <span class="actions">
+              {#if drawn.length < lines.length}<button type="button" onclick={() => choose(new Set(lines.map((line) => line.key)))}>Show all</button>{/if}
+              {#if heading}
+                <ActionButton
+                  label="Open in Query"
+                  icon="↗"
+                  state={onaction ? actions['chart.open_in_query'] : { state: 'unavailable', reason: 'This host has no Query' }}
+                  disabled={!executed}
+                  onclick={() => executed && onaction?.({ name: 'chart.open_in_query', input: executed })}
+                />
+              {/if}
+            </span>
           </p>
           {#if identity && (exact?.state === 'denied' || exact?.state === 'error')}
             <EmptyState state={exact.state} problem={exact.problem} />
@@ -386,7 +476,7 @@
           {/if}
           <table class="legend">
             <thead>
-              <tr><th scope="col"><span class="quiet">Shown</span></th><th scope="col">{input.series ?? 'series'}</th><th scope="col">Latest</th><th scope="col">Max</th><th scope="col">Mean</th></tr>
+              <tr><th scope="col"><span class="quiet">Shown</span></th><th scope="col">{(input.type === 'timeseries' && input.series) || 'series'}</th><th scope="col">Latest</th><th scope="col">Max</th><th scope="col">Mean</th></tr>
             </thead>
             <tbody>
               {#each lines as line, index (line.key)}
@@ -434,68 +524,35 @@
             </tbody>
           </table>
         </div>
-        {/if}
-      {:else if input.type === 'bar'}
-        <div class="box" bind:clientWidth={boxWidth} bind:clientHeight={boxHeight}>
-          <svg
-            class="plot bars"
-            viewBox="0 0 {W} {H}"
-            role="img"
-            aria-label="{input.title ?? 'Bar chart'}: {barCells.map((cell) => `${cell.label} ${cell.value === null ? 'no value' : cell.shown}${unitLabel}`).join(', ')}"
-          >
-            <line class="grid" x1="0" x2={W} y1={barY(0)} y2={barY(0)} />
-            {#each barCells as cell, index (index)}
-              <rect class="bar" x={cell.x} y={cell.y} width={cell.width} height={cell.height}><title>{cell.label}: {cell.shown}{unitLabel}</title></rect>
-              {#if cell.values}<text class="value" x={cell.x + cell.width / 2} y={cell.valueY} text-anchor="middle">{cell.shown}</text>{/if}
-              {#if cell.labelX !== undefined}<text class="axis" x={cell.labelX} y={H - 4} text-anchor="middle">{cell.text}</text>{/if}
-            {/each}
-          </svg>
-        </div>
-      {:else if input.type === 'stat'}
-        <p class="stat">{stat === undefined ? '—' : fmtNumber(stat)}{#if input.unit}<span class="unit">{input.unit}</span>{/if}</p>
-      {:else if data}
-        <!-- A wide result scrolls; the focusable region lets a keyboard reader pan it. -->
-        <!-- svelte-ignore a11y_no_noninteractive_tabindex -->
-        <div class="scroller" role="region" aria-label="{input.title ?? 'Result'} table" tabindex="0">
-          <table>
-            <thead>
-              <tr>{#each data.columns as column, index (index)}<th scope="col" title={column.data_type}>{column.name}</th>{/each}</tr>
-            </thead>
-            <tbody>
-              {#each data.rows as row, index (index)}
-                <tr>{#each row as cell, position (position)}<td>{cell === null ? '∅' : typeof cell === 'object' ? JSON.stringify(cell) : String(cell)}</td>{/each}</tr>
-              {/each}
-            </tbody>
-          </table>
-        </div>
-      {/if}
-    {:else if result.state === 'empty'}
-      <EmptyState state="empty" title="No data" detail={result.reason} />
-    {:else if result.state === 'loading'}
-      <EmptyState state="loading" title="Running query" />
-    {:else}
-      <EmptyState state={result.state} problem={result.problem} />
-    {/if}
-  </div>
-
-  {#if !compact}
-  <footer>
-    <span>source</span>
-    <code title={input.sql}>{input.sql}</code>
-  </footer>
-  {/if}
-</section>
+{/snippet}
 
 <style>
   .chart {
     display: flex;
     flex-direction: column;
+    gap: 16px;
+    min-width: 0;
+    color: var(--text);
+    font-family: var(--font-sans);
+  }
+  .frame {
+    display: flex;
+    flex: 1;
+    flex-direction: column;
     min-width: 0;
     border: 1px solid var(--border);
     border-radius: var(--r);
     background: var(--surface);
-    color: var(--text);
-    font-family: var(--font-sans);
+  }
+  .summary {
+    flex: none;
+  }
+  .cards header {
+    justify-content: space-between;
+    padding: 12px 14px;
+  }
+  .cards .body {
+    padding: 14px;
   }
   header {
     display: flex;
@@ -521,7 +578,7 @@
     font: 12px var(--font-mono);
     font-variant-numeric: tabular-nums;
   }
-  .compact {
+  .compact .frame {
     border: 0;
     background: transparent;
   }
@@ -532,11 +589,23 @@
   .compact .body {
     padding: 0;
   }
-  .compact .box {
-    min-height: 64px;
+  .compact .body {
+    gap: 4px;
   }
-  .segment {
-    opacity: 0.85;
+  .compact .box {
+    flex: none;
+    height: 56px;
+    min-height: 56px;
+  }
+  .baseline {
+    stroke: var(--border);
+  }
+  .times {
+    display: flex;
+    justify-content: space-between;
+    margin: 0;
+    color: var(--muted);
+    font: 10px var(--font-mono);
   }
   .body {
     display: flex;
@@ -613,11 +682,29 @@
   }
   .series p {
     display: flex;
+    flex-wrap: wrap;
     justify-content: space-between;
     align-items: center;
     gap: 8px;
     margin: 0 0 4px;
     font: 12px var(--font-mono);
+  }
+  .actions {
+    display: flex;
+    gap: 6px;
+  }
+  .summary .series {
+    max-height: none;
+  }
+  .summary .series p {
+    margin: 0;
+    padding: 10px 14px;
+    border-bottom: 1px solid var(--border);
+  }
+  .summary .legend th,
+  .summary .legend td {
+    height: 28px;
+    padding: 0 14px;
   }
   .series p button {
     border: 1px solid var(--border);
@@ -710,6 +797,11 @@
     width: 8px;
     height: 8px;
     margin-right: 6px;
+  }
+  .key i.line {
+    width: 10px;
+    height: 2px;
+    vertical-align: middle;
   }
   .legend td:first-child {
     width: 1%;

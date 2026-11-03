@@ -118,7 +118,7 @@
     gap: 2px;
     padding: 14px 10px;
     border-right: 1px solid var(--border);
-    background: var(--surface);
+    background: var(--nav-surface);
   }
   .collapsed aside {
     flex-basis: 56px;

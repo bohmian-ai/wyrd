@@ -49,6 +49,8 @@ export interface ObserveState {
   /** The metric aggregation across series, and the metrics column it keeps apart. */
   readonly agg?: MetricAggregation;
   readonly by?: string;
+  /** Metrics' recorded-points inspector is open; only then is the points list read. */
+  readonly points?: boolean;
   readonly trace?: string;
   readonly span?: string;
   readonly log?: HostLogKey;
@@ -102,6 +104,7 @@ export function readState(params: Params): ObserveState {
     columns: Array.isArray(columns) && columns.every((each) => typeof each === 'string') ? columns : undefined,
     agg,
     by: agg ? (params.get('by') ?? undefined) : undefined,
+    points: signal === 'metrics' && params.get('points') === '1',
     trace: params.get('trace') ?? undefined,
     span: params.get('span') ?? undefined,
     log: log && typeof log === 'object' ? (log as HostLogKey) : undefined
@@ -126,6 +129,7 @@ export function writeState(state: ObserveState): URLSearchParams {
   if (state.columns) params.set('columns', JSON.stringify(state.columns));
   if (state.agg) params.set('agg', state.agg);
   if (state.agg && state.by) params.set('by', state.by);
+  if (state.signal === 'metrics' && state.points) params.set('points', '1');
   if (state.trace) params.set('trace', state.trace);
   if (state.span) params.set('span', state.span);
   if (state.log) params.set('log', JSON.stringify(state.log));

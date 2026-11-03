@@ -1,6 +1,6 @@
 <!--
   The open record of the Observe view: a trace's waterfall and selected span
-  in the drawer, or a log record beside the list.
+  in the drawer, or a log record beside the list inside the Logs work region.
 -->
 <script lang="ts">
   import { goto } from '$app/navigation';
@@ -121,8 +121,11 @@
     color: var(--muted);
     font: 12px var(--font-mono);
   }
+  /* Beside the records in the Logs work region; alone on its own line when the screen is narrow. */
   .record {
-    max-width: 640px;
+    flex: 1 1 360px;
+    min-width: 0;
+    max-width: 400px;
     border: 1px solid var(--border);
     border-radius: var(--r);
     background: var(--surface);
@@ -143,5 +146,10 @@
   header a {
     color: var(--muted);
     text-decoration: none;
+  }
+  @media (max-width: 899px) {
+    .record {
+      max-width: none;
+    }
   }
 </style>

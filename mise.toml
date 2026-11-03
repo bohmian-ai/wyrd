@@ -1312,10 +1312,12 @@ server=$!
 pids+=($server)
 # Sign-in is the real local User login, never the UI's fixture identity.
 (cd crates/wyrd/wyrd-server/wyrd-ui && pnpm install --frozen-lockfile && WYRD_UI_LOCAL_AUTH=false exec pnpm run dev --host 0.0.0.0 --port ${WYRD_UI_PORT:-3000}) &
-pids+=($!)
+ui_pid=$!
+pids+=($ui_pid)
 # Ready means serving, holding this start's new tenant key and local User login, and the UI's sign-in page answering.
 until curl -sf http://127.0.0.1:8080/readyz >/dev/null && [[ $config/dev-login.toml -nt $started ]] && curl -sf -o /dev/null "$ui/t/dev/login"; do
   kill -0 "$server" 2>/dev/null || { echo "wyrd-server exited before it was ready" >&2; exit 1; }
+  kill -0 "$ui_pid" 2>/dev/null || { echo "the UI exited before it was ready" >&2; exit 1; }
   sleep 1
 done
 rm -f "$started"

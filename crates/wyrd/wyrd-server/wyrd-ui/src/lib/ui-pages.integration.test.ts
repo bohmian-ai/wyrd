@@ -817,6 +817,7 @@ function devFull(config: string, env: Record<string, string> = {}) {
   const exited = new Promise<number | null>((done) => child.once('exit', (code) => done(code)));
   return {
     log,
+    exited,
     output: () => readFileSync(log, 'utf8'),
     /** Ctrl-C, as a developer stops it. */
     async interrupt() {
@@ -831,6 +832,18 @@ base('development environment lifecycle', { timeout: 2_400_000 }, async () => {
   for (const port of [8080, 3000, 8000, 1080]) expect(await answers(port), `port ${port} is already serving; stop that service first`).toBe(false);
   // A config home of its own: startup replaces the dev key there, never in the developer's.
   const config = mkdtempSync(join(tmpdir(), 'wyrd-dev-'));
+
+  // A UI that cannot start ends startup with an error and stops everything it started.
+  const broken = devFull(config, { WYRD_UI_PORT: '70000' });
+  try {
+    expect(await broken.exited, broken.log).not.toBe(0);
+    expect(broken.output(), broken.log).toContain('the UI exited before it was ready');
+    expect(broken.output()).not.toContain('UI ready');
+  } finally {
+    await broken.interrupt();
+  }
+  for (const port of [8080, 1080]) expect(await answers(port), `port ${port} after a failed UI start`).toBe(false);
+  expect(existsSync(join(config, 'dev-login.toml')), 'the dev login after a failed UI start').toBe(false);
 
   // A setup refused after the services are ready leaves them running for diagnosis and starts nothing that depends on it.
   const refused = devFull(config, { WYRD_API_KEY: 'wyrd_not_a_key' });

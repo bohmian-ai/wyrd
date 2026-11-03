@@ -273,17 +273,17 @@ datafusion-distributed = { git = "https://github.com/bohmian-ai/datafusion-distr
 # Monty worker, hard-depends on the ty/ruff type checker; Wyrd never type checks,
 # so a stand-in with the same API refuses every check and keeps the checker out.
 monty-type-checking = { path = "crates/patches/monty-type-checking" }
-datafusion = { git = "https://github.com/bohmian-ai/datafusion", rev = "9c724e501b613ea1e3de6a7e8d9fb700eed65b25" }
-datafusion-common = { git = "https://github.com/bohmian-ai/datafusion", rev = "9c724e501b613ea1e3de6a7e8d9fb700eed65b25" }
-datafusion-datasource = { git = "https://github.com/bohmian-ai/datafusion", rev = "9c724e501b613ea1e3de6a7e8d9fb700eed65b25" }
-datafusion-datasource-parquet = { git = "https://github.com/bohmian-ai/datafusion", rev = "9c724e501b613ea1e3de6a7e8d9fb700eed65b25" }
-datafusion-expr = { git = "https://github.com/bohmian-ai/datafusion", rev = "9c724e501b613ea1e3de6a7e8d9fb700eed65b25" }
-datafusion-functions = { git = "https://github.com/bohmian-ai/datafusion", rev = "9c724e501b613ea1e3de6a7e8d9fb700eed65b25" }
-datafusion-functions-variant = { git = "https://github.com/bohmian-ai/datafusion", rev = "9c724e501b613ea1e3de6a7e8d9fb700eed65b25" }
-datafusion-physical-expr = { git = "https://github.com/bohmian-ai/datafusion", rev = "9c724e501b613ea1e3de6a7e8d9fb700eed65b25" }
-datafusion-physical-expr-adapter = { git = "https://github.com/bohmian-ai/datafusion", rev = "9c724e501b613ea1e3de6a7e8d9fb700eed65b25" }
-datafusion-proto = { git = "https://github.com/bohmian-ai/datafusion", rev = "9c724e501b613ea1e3de6a7e8d9fb700eed65b25" }
-datafusion-pruning = { git = "https://github.com/bohmian-ai/datafusion", rev = "9c724e501b613ea1e3de6a7e8d9fb700eed65b25" }
+datafusion = { git = "https://github.com/bohmian-ai/datafusion", rev = "b669163b78a7692a9a381d4d13dceeae632c5c34" }
+datafusion-common = { git = "https://github.com/bohmian-ai/datafusion", rev = "b669163b78a7692a9a381d4d13dceeae632c5c34" }
+datafusion-datasource = { git = "https://github.com/bohmian-ai/datafusion", rev = "b669163b78a7692a9a381d4d13dceeae632c5c34" }
+datafusion-datasource-parquet = { git = "https://github.com/bohmian-ai/datafusion", rev = "b669163b78a7692a9a381d4d13dceeae632c5c34" }
+datafusion-expr = { git = "https://github.com/bohmian-ai/datafusion", rev = "b669163b78a7692a9a381d4d13dceeae632c5c34" }
+datafusion-functions = { git = "https://github.com/bohmian-ai/datafusion", rev = "b669163b78a7692a9a381d4d13dceeae632c5c34" }
+datafusion-functions-variant = { git = "https://github.com/bohmian-ai/datafusion", rev = "b669163b78a7692a9a381d4d13dceeae632c5c34" }
+datafusion-physical-expr = { git = "https://github.com/bohmian-ai/datafusion", rev = "b669163b78a7692a9a381d4d13dceeae632c5c34" }
+datafusion-physical-expr-adapter = { git = "https://github.com/bohmian-ai/datafusion", rev = "b669163b78a7692a9a381d4d13dceeae632c5c34" }
+datafusion-proto = { git = "https://github.com/bohmian-ai/datafusion", rev = "b669163b78a7692a9a381d4d13dceeae632c5c34" }
+datafusion-pruning = { git = "https://github.com/bohmian-ai/datafusion", rev = "b669163b78a7692a9a381d4d13dceeae632c5c34" }
 # Arrow-rs 60.0.0 with the unshred_variant buffer pre-size fix and path-only Variant
 # validation in variant_get, the same revision the DataFusion fork pins.
 arrow = { git = "https://github.com/bohmian-ai/arrow-rs", rev = "ca5feff3b1c523640a03acaa437096b8934c3749" }

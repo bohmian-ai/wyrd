@@ -52,26 +52,12 @@ Wyrd gives you the primitives instead, and you build the verification layer your
 
 | You get | So you don't have to |
 | --- | --- |
-| Verification primitives (`assert`, `trace`, `code`, `agent`, `extract`, `drift`) you compose into steps and checks | Fit your rules into one vendor's evaluator types |
+| Verification primitives you compose into steps and checks | Fit your rules into one vendor's evaluator types |
 | Checks as versioned YAML in your repo, run in CI, inline, in the background, per session, or on a schedule | Keep one set of evals for CI and another for production |
 | One data plane for telemetry, model calls, your app's rows, and verdicts, as Iceberg tables in your object store, queried with SQL | Join evidence across four tools' stores and APIs |
 | Registration and versioning for the whole service: agents, prompts, models, data, MCP servers | Guess which version produced a result |
 | An LLM gateway and service identity, so every call and verdict names the account and release behind it | Bolt attribution on after the fact |
 | Apache 2.0 and self-hosted, ingesting standard OpenTelemetry (OTLP) from any exporter | Re-instrument your app with a vendor SDK, or send your data to someone else's cloud |
-
-## Already have tools?
-
-Keep them. Add Wyrd where they stop.
-
-| You use | Keep it for | Add Wyrd for |
-| --- | --- | --- |
-| MLflow, W&B | Training, experiments, model registry | Runtime monitoring and verification of the model you deployed, at its exact version |
-| Langfuse, Phoenix, LangSmith | Trace exploration, prompt iteration | Your own verification layer: checks you compose, judges with tools and your files, verdicts your app acts on |
-| promptfoo, DeepEval, Ragas | Test suites and red-teaming in CI | Running the same checks on live traffic, and keeping every result |
-| Evidently, Fiddler | Drift reports and dashboards | Drift judged next to traces, model calls, and app data, in one SQL store |
-| LiteLLM, Portkey | Model routing, inline guardrails | Tying every call to an account, a release, and a verdict |
-| Datadog, Grafana, Honeycomb | Infrastructure monitoring and alerts | Pass/fail verdicts on the same OpenTelemetry data |
-| Credo AI, watsonx.governance | AI inventory, policy programs | Proof from production for each control |
 
 ## Install
 
@@ -231,6 +217,20 @@ failed: operator NotContains returned false
 ```
 
 [Run your first verification](https://docs.bohmian.ai/wyrd/get-started/quickstart/) walks through it. This assertion is the simplest check. A Verifier can also run Python, judge with an Agent that reads your uploaded policy files and cites them, judge a whole session, or watch for drift on a schedule; see [What can I build?](https://docs.bohmian.ai/wyrd/get-started/what-can-i-build/) and [Recipes](https://docs.bohmian.ai/wyrd/build-and-verify/verify/verifier-recipes/).
+
+## Already have tools?
+
+Keep them. Add Wyrd where they stop.
+
+| You use | Keep it for | Add Wyrd for |
+| --- | --- | --- |
+| MLflow, W&B | Training, experiments, model registry | Runtime monitoring and verification of the model you deployed, at its exact version |
+| Langfuse, Phoenix, LangSmith | Trace exploration, prompt iteration | Your own verification layer: checks you compose, judges with tools and your files, verdicts your app acts on |
+| promptfoo, DeepEval, Ragas | Test suites and red-teaming in CI | Running the same checks on live traffic, and keeping every result |
+| Evidently, Fiddler | Drift reports and dashboards | Drift judged next to traces, model calls, and app data, in one SQL store |
+| LiteLLM, Portkey | Model routing, inline guardrails | Tying every call to an account, a release, and a verdict |
+| Datadog, Grafana, Honeycomb | Infrastructure monitoring and alerts | Pass/fail verdicts on the same OpenTelemetry data |
+| Credo AI, watsonx.governance | AI inventory, policy programs | Proof from production for each control |
 
 ## Where Wyrd stops
 

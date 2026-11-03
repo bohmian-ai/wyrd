@@ -3,9 +3,20 @@
   page: the mark, the page heading, the safe problem when there is one, and
   the page's forms. A server-side refusal (5xx) hides the forms.
 -->
+<script lang="ts" module>
+  import type { WyrdProblem } from '$lib/server/problem';
+
+  /** What the person should do about `issue`: when to retry a throttled attempt, else its remediation. */
+  export function guidance(issue: WyrdProblem): string {
+    const wait = (issue.details as { retry_after_seconds?: number } | null)?.retry_after_seconds;
+    if (!wait) return issue.remediation;
+    const minutes = Math.ceil(wait / 60);
+    return `Try again in ${wait < 60 ? `${wait} seconds` : `${minutes} minute${minutes === 1 ? '' : 's'}`}.`;
+  }
+</script>
+
 <script lang="ts">
   import type { Snippet } from 'svelte';
-  import type { WyrdProblem } from '$lib/server/problem';
   import logo from '../../brand/logo.svg?inline';
   let { heading, issue, children }: { heading: string; issue: WyrdProblem | null; children: Snippet } = $props();
 </script>
@@ -21,7 +32,7 @@
       <div role="alert">
         <div class="app-problem" data-state={issue.status >= 500 ? 'error' : 'unauthorized'}>
           <strong>{issue.status >= 500 ? '✕ Sign-in unavailable' : `⊘ ${issue.title}`}</strong>
-          <p>{issue.status >= 500 ? 'Please try again later.' : issue.remediation}</p>
+          <p>{issue.status >= 500 ? 'Please try again later.' : guidance(issue)}</p>
           <code>{issue.code}</code>
         </div>
       </div>

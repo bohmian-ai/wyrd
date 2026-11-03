@@ -1,5 +1,6 @@
 <script lang="ts">
   import Entry from '$lib/Entry.svelte';
+  import PasswordInput from '$lib/PasswordInput.svelte';
   import type { PageProps } from './$types';
   let { data, form }: PageProps = $props();
 </script>
@@ -13,7 +14,7 @@
     <input id="username" class="app-input" name="username" required minlength="3" maxlength="64" autocomplete="username" value={form?.username ?? ''} />
     <p>3–64 characters: letters, digits, dot, underscore or hyphen, starting with a letter or digit. Stored in lowercase.</p>
     <label for="password">Password</label>
-    <input id="password" class="app-input" type="password" name="password" required minlength="15" maxlength="128" autocomplete="new-password" />
+    <PasswordInput id="password" name="password" required autocomplete="new-password" />
     <p>15–128 characters. A passphrase works well; common passwords are refused.</p>
     <button class="app-control primary wide" type="submit">Create account</button>
   </form>

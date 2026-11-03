@@ -647,7 +647,8 @@ test('local signup and personal settings', async ({ server, ui }) => {
   expect(issued.status).toBe(201);
   const { invitation_code: code } = (await issued.json()) as { invitation_code: string };
   const login = `${ui.base}/t/${tenantKey}/login`;
-  const password = strongPassword();
+  // Longer than 128 UTF-16 units, decomposed: the server counts NFC characters, so the form must not cut it.
+  const password = `${'𝒜'.repeat(64)} cafe\u0301 ${crypto.randomUUID().slice(0, 8)}`;
 
   const context = await ui.browser.newContext();
   const page = await context.newPage();
@@ -666,6 +667,15 @@ test('local signup and personal settings', async ({ server, ui }) => {
 
     await page.getByLabel('Invitation code').fill(code);
     await page.getByLabel('Password').fill(password);
+    // The keyboard reveals and conceals the password without changing it.
+    const field = page.getByLabel('Password');
+    await page.getByRole('button', { name: 'Show password' }).focus();
+    await page.keyboard.press('Enter');
+    expect(await field.getAttribute('type')).toBe('text');
+    expect(await field.inputValue()).toBe(password);
+    await page.keyboard.press('Space');
+    expect(await field.getAttribute('type')).toBe('password');
+    expect(await field.inputValue()).toBe(password);
     await page.getByRole('button', { name: 'Create account' }).click();
     await page.waitForURL(`${ui.base}/t/${tenantKey}`);
     expect(page.url()).not.toContain(code);
@@ -735,7 +745,41 @@ test('local signup and personal settings', async ({ server, ui }) => {
     await expect.poll(() => foreign.getByRole('alert').count()).toBe(1);
     expect(foreign.url()).toContain('/login');
 
-    for (const value of [code, password, next, secret]) expect(logged.join('\n')).not.toContain(value);
+    // Repeated wrong guesses are throttled: sign-in and password change both say when to try again.
+    const guess = strongPassword();
+    const guesser = await (await ui.browser.newContext()).newPage();
+    await guesser.goto(login);
+    const throttled = async (target: Page, submit: () => Promise<void>) => {
+      const [response] = await Promise.all([target.waitForResponse((r) => r.request().method() === 'POST'), submit()]);
+      return response;
+    };
+    let refused = await throttled(guesser, async () => {
+      await guesser.getByLabel('Username').fill('ui-person');
+      await guesser.getByLabel('Password').fill(guess);
+      await guesser.getByRole('button', { name: 'Sign in', exact: true }).click();
+    });
+    for (let attempt = 0; refused.status() !== 429 && attempt < 10; attempt++) {
+      refused = await throttled(guesser, async () => {
+        await guesser.getByLabel('Password').fill(guess);
+        await guesser.getByRole('button', { name: 'Sign in', exact: true }).click();
+      });
+    }
+    expect(refused.status()).toBe(429);
+    expect(Number(refused.headers()['retry-after'])).toBeGreaterThan(0);
+    await expect.poll(() => guesser.getByRole('alert').textContent()).toMatch(/Try again in \d+ (seconds|minutes?)\./);
+    expect(await guesser.content()).not.toContain(guess);
+    await page.goto(account);
+    const change = await throttled(page, async () => {
+      await page.getByLabel('Current password').fill(next);
+      await page.getByLabel('New password').fill(strongPassword());
+      await page.getByRole('button', { name: 'Change password' }).click();
+    });
+    expect(change.status()).toBe(429);
+    expect(Number(change.headers()['retry-after'])).toBeGreaterThan(0);
+    await expect.poll(() => page.getByRole('alert').textContent()).toMatch(/Try again in \d+ (seconds|minutes?)\./);
+    expect(await page.content()).not.toContain(next);
+
+    for (const value of [code, password, next, secret, guess]) expect(logged.join('\n')).not.toContain(value);
   } finally {
     await context.close();
   }

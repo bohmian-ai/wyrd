@@ -1,5 +1,6 @@
 <script lang="ts">
   import Entry from '$lib/Entry.svelte';
+  import PasswordInput from '$lib/PasswordInput.svelte';
   import type { PageProps } from './$types';
   let { data, form }: PageProps = $props();
   const tenant = $derived(encodeURIComponent(data.tenant.key));
@@ -12,7 +13,7 @@
     <label for="username">Username</label>
     <input id="username" class="app-input" name="username" required autocomplete="username" value={form && 'username' in form ? form.username : ''} />
     <label for="password">Password</label>
-    <input id="password" class="app-input" type="password" name="password" required autocomplete="current-password" />
+    <PasswordInput id="password" name="password" required autocomplete="current-password" />
     <button class="app-control primary wide" type="submit">Sign in</button>
   </form>
   <form method="POST" action="?/sso"><button class="app-control wide" type="submit">Sign in with SSO</button></form>

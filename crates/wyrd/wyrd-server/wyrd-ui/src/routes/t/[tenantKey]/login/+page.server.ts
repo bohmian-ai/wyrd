@@ -3,7 +3,7 @@ import { localAuthEnabled } from '$lib/server/development';
 import { reject } from '$lib/server/auth/session';
 import { browserSessions } from '$lib/server/auth/browser-sessions';
 import { field } from '$lib/server/form';
-import { problem, safeProblem } from '$lib/server/problem';
+import { problem, retryAfter, safeProblem } from '$lib/server/problem';
 import type { Actions, PageServerLoad } from './$types';
 
 export const load: PageServerLoad = async ({ params, cookies, url }) => {
@@ -27,7 +27,7 @@ export const load: PageServerLoad = async ({ params, cookies, url }) => {
 
 export const actions: Actions = {
   /** Local password sign-in; the Rust server verifies the password and sets the session cookie. */
-  password: async ({ params, request, cookies, url }) => {
+  password: async ({ params, request, cookies, url, setHeaders }) => {
     let target: string;
     let username = '';
     try {
@@ -43,7 +43,10 @@ export const actions: Actions = {
       );
     } catch (cause) {
       if (!isHttpError(cause)) throw cause;
-      return fail(cause.status, { problem: safeProblem(cause), username });
+      const value = safeProblem(cause);
+      const wait = retryAfter(value);
+      if (wait) setHeaders({ 'retry-after': String(wait) });
+      return fail(value.status, { problem: value, username });
     }
     redirect(303, target);
   },

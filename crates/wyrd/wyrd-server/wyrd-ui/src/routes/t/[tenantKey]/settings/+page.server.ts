@@ -1,7 +1,7 @@
 import { fail, isHttpError, redirect } from '@sveltejs/kit';
 import { reject } from '$lib/server/auth/session';
 import type { BrowserSession } from '$lib/server/auth/browser-sessions';
-import { problem, problemKind, safeProblem } from '$lib/server/problem';
+import { problem, upstreamProblem, safeProblem } from '$lib/server/problem';
 import type { Actions, PageServerLoad, RequestEvent } from './$types';
 
 /** Redacted connection projection of `GET /v1/identity/oidc/connections`. */
@@ -32,7 +32,7 @@ async function call(
   body?: unknown
 ): Promise<Response> {
   const response = await session.api(method, path, body);
-  if (!response.ok) reject(await problemKind(response));
+  if (!response.ok) reject(await upstreamProblem(response));
   return response;
 }
 

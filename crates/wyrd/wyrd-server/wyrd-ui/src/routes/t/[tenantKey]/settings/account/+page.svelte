@@ -1,5 +1,7 @@
 <script lang="ts">
   import { page } from '$app/state';
+  import PasswordInput from '$lib/PasswordInput.svelte';
+  import { guidance } from '$lib/Entry.svelte';
   import type { PageProps } from './$types';
   let { data, form }: PageProps = $props();
   let dismissed = $state<string | null>(null);
@@ -24,7 +26,7 @@
 {#if problem}
   <div class="app-problem" role="alert" data-state={problem.status === 403 ? 'unauthorized' : 'error'}>
     <strong>{problem.status === 403 ? '⊘' : '✕'} {problem.title}</strong>
-    <p>{problem.remediation}</p>
+    <p>{guidance(problem)}</p>
     <code>{problem.code}</code>
   </div>
 {/if}
@@ -59,9 +61,9 @@
         <h2 id="password">Password</h2>
         <form class="stack" method="POST" action="?/password">
           <label for="current-password">Current password</label>
-          <input id="current-password" class="app-input" type="password" name="currentPassword" required autocomplete="current-password" />
+          <PasswordInput id="current-password" name="currentPassword" required autocomplete="current-password" />
           <label for="new-password">New password</label>
-          <input id="new-password" class="app-input" type="password" name="newPassword" required minlength="15" maxlength="128" autocomplete="new-password" />
+          <PasswordInput id="new-password" name="newPassword" required autocomplete="new-password" />
           <p>Changing it signs you out everywhere you use this password.</p>
           <button class="app-control" type="submit">Change password</button>
         </form>

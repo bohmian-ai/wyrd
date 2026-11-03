@@ -3,7 +3,7 @@ import type { CredentialList, CurrentUserProfile } from 'wyrd-ai';
 import { reject } from '$lib/server/auth/session';
 import { browserSessions, type BrowserSession } from '$lib/server/auth/browser-sessions';
 import { field } from '$lib/server/form';
-import { problem, problemKind, safeProblem } from '$lib/server/problem';
+import { problem, retryAfter, safeProblem, upstreamProblem } from '$lib/server/problem';
 import type { Actions, PageServerLoad, RequestEvent } from './$types';
 
 /** The longest User key lifetime the server accepts, in days. */
@@ -12,7 +12,7 @@ const MAX_DAYS = 365;
 /** Call `/v1` as the signed-in principal; a non-2xx answer becomes its safe problem. */
 async function call(session: BrowserSession, method: string, path: string, body?: unknown): Promise<Response> {
   const response = await session.api(method, path, body);
-  if (!response.ok) reject(await problemKind(response));
+  if (!response.ok) reject(await upstreamProblem(response));
   return response;
 }
 
@@ -51,6 +51,8 @@ async function act<T>(event: RequestEvent, run: (form: FormData, session: Browse
   } catch (cause) {
     if (!isHttpError(cause)) throw cause;
     const value = safeProblem(cause);
+    const wait = retryAfter(value);
+    if (wait) event.setHeaders({ 'retry-after': String(wait) });
     return fail(value.status, { problem: value });
   }
 }

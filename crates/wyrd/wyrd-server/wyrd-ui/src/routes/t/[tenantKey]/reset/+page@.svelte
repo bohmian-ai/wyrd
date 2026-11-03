@@ -1,5 +1,6 @@
 <script lang="ts">
   import Entry from '$lib/Entry.svelte';
+  import PasswordInput from '$lib/PasswordInput.svelte';
   import type { PageProps } from './$types';
   let { data, form }: PageProps = $props();
 </script>
@@ -11,7 +12,7 @@
     <input id="reset-code" class="app-input" type="password" name="resetCode" required autocomplete="off" />
     <p>Ask a tenant administrator for a reset code; it works once, for fifteen minutes.</p>
     <label for="new-password">New password</label>
-    <input id="new-password" class="app-input" type="password" name="newPassword" required minlength="15" maxlength="128" autocomplete="new-password" />
+    <PasswordInput id="new-password" name="newPassword" required autocomplete="new-password" />
     <button class="app-control primary wide" type="submit">Set password</button>
   </form>
   <nav class="links"><a href="/t/{encodeURIComponent(data.tenant.key)}/login">Back to sign-in</a></nav>

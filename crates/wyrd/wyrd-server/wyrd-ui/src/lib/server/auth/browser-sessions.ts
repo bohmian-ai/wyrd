@@ -1,7 +1,7 @@
 import type { Cookies } from '@sveltejs/kit';
 import { WyrdClient } from 'wyrd-ai';
 import { serverUrl } from '../upstream';
-import { problemKind } from '../problem';
+import { upstreamProblem } from '../problem';
 import { reject, type SessionMetadata, type TenantContext } from './session';
 
 const sessionPrefix = 'wyrd_session_';
@@ -47,7 +47,7 @@ async function call(path: string, url: URL, { method, cookie, body }: Call): Pro
 
 /** Refuse with the safe problem a non-2xx Wyrd answer maps to. */
 async function refuse(response: Response): Promise<never> {
-  reject(await problemKind(response));
+  reject(await upstreamProblem(response));
 }
 
 /**

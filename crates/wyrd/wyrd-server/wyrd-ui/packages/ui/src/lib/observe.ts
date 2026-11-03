@@ -438,7 +438,7 @@ export async function loadMetric(input: MetricInput, context: LoadContext): Prom
   return {
     input,
     identity: plan.identity,
-    chart: { input: { ...metricChart(input), sql: plan.chart.sql }, executed: plan.chart, result: loaded(chart) },
+    chart: { input: { ...metricChart(input), sql: plan.chart.sql, range }, executed: plan.chart, result: loaded(chart) },
     summary: loaded(summary)
   };
 }
@@ -529,9 +529,9 @@ export async function loadTraceOverview(input: { readonly where?: readonly Filte
   const results = await context.executor.run(order.map((name) => query(plans[name].sql, plans[name].params)), context.signal);
   const [spans, errors, duration, totals, durations] = results;
   const chart = (name: 'spans' | 'errors' | 'duration', read: (typeof results)[number]): ChartProps => ({
-    input: { ...charts[name], sql: plans[name].sql },
+    input: { ...charts[name], sql: plans[name].sql, range },
     executed: plans[name],
-    result: read.ok ? shapeChart({ ...charts[name], sql: plans[name].sql }, read.value) : failed(read.problem)
+    result: read.ok ? shapeChart({ ...charts[name], sql: plans[name].sql, range }, read.value) : failed(read.problem)
   });
   const joined: Loaded<QueryResult> =
     !totals.ok ? failed(totals.problem)
@@ -564,7 +564,8 @@ export async function loadLogTimeline(input: { readonly where?: readonly Filter[
     sql,
     x: 'at',
     y: ['records'],
-    series: 'level'
+    series: 'level',
+    ...(range ? { range } : {})
   });
   const range = rangeOf(input.range, context);
   if ('code' in range) return { input: chartInput('-'), result: { state: 'error', problem: range } };

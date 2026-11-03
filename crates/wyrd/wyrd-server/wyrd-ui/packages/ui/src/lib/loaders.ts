@@ -107,9 +107,19 @@ const BUCKETS: readonly [string, number][] = [
 ];
 
 /** The finest bucket that keeps `range` at or under 200 points. */
-export function bucketFor(range: AbsoluteRange): string {
+function bucketOf(range: AbsoluteRange): readonly [string, number] {
   const span = Date.parse(range.to) - Date.parse(range.from);
-  return (BUCKETS.find(([, width]) => span / width <= 200) ?? BUCKETS[BUCKETS.length - 1])[0];
+  return BUCKETS.find(([, width]) => span / width <= 200) ?? BUCKETS[BUCKETS.length - 1];
+}
+
+/** The interval `range` binds as `$3`. */
+export function bucketFor(range: AbsoluteRange): string {
+  return bucketOf(range)[0];
+}
+
+/** The width in milliseconds of `range`'s `$3` bucket. */
+export function bucketWidth(range: AbsoluteRange): number {
+  return bucketOf(range)[1];
 }
 
 /**

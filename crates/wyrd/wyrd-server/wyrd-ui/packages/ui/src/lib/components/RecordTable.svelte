@@ -124,7 +124,14 @@
   const longest = $derived(
     rows && signal && columns.includes('duration_nano') ? Math.max(0, ...rows.rows.map((row) => numeric(row[columnIndex(rows, 'duration_nano')]) / 1e6)) : 0
   );
-  /** A canonical span row whose recorded status is OTLP error. */
+  const durationMs = (data: QueryResult, row: readonly unknown[]) => numeric(row[columnIndex(data, 'duration_nano')]) / 1e6;
+  /** The listed rows' 95th-percentile duration; a row above it draws its bar in the p95 colour. */
+  const p95 = $derived.by(() => {
+    if (!longest || !rows) return Infinity;
+    const sorted = rows.rows.map((row) => durationMs(rows, row)).sort((a, b) => a - b);
+    return sorted[Math.ceil(sorted.length * 0.95) - 1];
+  });
+  /** A canonical span row whose recorded status is OTLP error; a listed trace also reads as an error when it counts any error span. */
   const erring = (data: QueryResult, row: readonly unknown[]) =>
     (signal === 'traces' || signal === 'spans') && columnIndex(data, 'status_code') >= 0 && numeric(row[columnIndex(data, 'status_code')]) === 2;
 
@@ -262,7 +269,8 @@
                 {@const traceCounts = byTrace.get(String(row[columnIndex(rows, 'trace_id')]))}
                 <tr
                   class:openable
-                  class:error={erring(rows, row)}
+                  class:error={erring(rows, row) || (traceCounts?.[1] ?? 0) > 0}
+                  class:slow={longest > 0 && durationMs(rows, row) > p95}
                   tabindex={openable ? 0 : undefined}
                   onclick={() => open(rows, row)}
                   onkeydown={(event) => event.key === 'Enter' && open(rows, row)}
@@ -541,6 +549,13 @@
   .error .name,
   .error :global(.duration .value) {
     color: var(--danger);
+  }
+  /* Ordinary, p95-or-slower and error durations, as in the Duration chart's key. */
+  tr :global(.duration .bar) {
+    background: var(--series-3);
+  }
+  .slow :global(.duration .bar) {
+    background: var(--observe);
   }
   .error :global(.duration .bar) {
     background: var(--danger);

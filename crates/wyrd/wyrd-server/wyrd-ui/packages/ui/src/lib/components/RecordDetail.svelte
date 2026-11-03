@@ -101,9 +101,7 @@
 {/snippet}
 
 {#snippet raw()}
-  <dl>
-    {#each data?.columns ?? [] as column, index (column.name)}<dt>{column.name}</dt><dd>{row?.[index] === null ? '∅' : json(row?.[index])}</dd>{/each}
-  </dl>
+  <pre class="raw">{JSON.stringify(Object.fromEntries((data?.columns ?? []).map((column, index) => [column.name, row?.[index] ?? null])), null, 2)}</pre>
 {/snippet}
 
 {#if result.state === 'populated' && data && row}
@@ -330,9 +328,10 @@
   .msg.mono {
     font: 12px/1.5 var(--font-mono);
   }
+  /* Keys take what they need up to 40%, so a long key never squeezes its value. */
   dl {
     display: grid;
-    grid-template-columns: minmax(120px, max-content) 1fr;
+    grid-template-columns: fit-content(40%) minmax(0, 1fr);
     gap: 6px 14px;
     margin: 0;
     font: 12px var(--font-mono);
@@ -373,6 +372,11 @@
     background: var(--bg);
     color: var(--text);
     font-size: 13px;
+  }
+  .raw {
+    max-height: 480px;
+    overflow: auto;
+    white-space: pre;
   }
   dd pre {
     border: 0;

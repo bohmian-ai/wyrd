@@ -230,6 +230,26 @@ test('authenticated traces and spans', async ({ ui }) => {
   await page.goBack();
   await page.waitForURL(observed);
 
+  // Hovering a chart floats its tooltip without moving the page; a drag across the middle half
+  // zooms every panel to that half of the applied range, and the Zoomed badge resets it.
+  await page.goto(observed);
+  const plot = overview.locator('svg.plot').first();
+  const box = (await plot.boundingBox())!;
+  const tall = (await overview.boundingBox())!.height;
+  await page.mouse.move(box.x + box.width / 2, box.y + box.height / 2);
+  await expect.poll(() => overview.locator('.tooltip').count()).toBeGreaterThan(0);
+  expect((await overview.boundingBox())!.height).toBe(tall);
+  await page.mouse.move(box.x + box.width * 0.25, box.y + box.height / 2);
+  await page.mouse.down();
+  await page.mouse.move(box.x + box.width * 0.75, box.y + box.height / 2, { steps: 5 });
+  await page.mouse.up();
+  await expect.poll(() => new URL(page.url()).searchParams.get('from')).not.toBe(RANGE.from);
+  const near = (name: string, at: string) => Math.abs(Date.parse(new URL(page.url()).searchParams.get(name)!) - Date.parse(at)) < 10 * 60_000;
+  expect(near('from', '2026-10-19T03:00:00Z') && near('to', '2026-10-19T09:00:00Z')).toBe(true);
+  await overview.getByRole('button', { name: 'Reset zoom' }).click();
+  await expect.poll(() => new URL(page.url()).searchParams.has('from')).toBe(false);
+  await page.goto(observed);
+
   // The time picker commits a preset or a validated custom range, in the chosen zone.
   const picker = page.getByRole('button', { name: /^Time range/ });
   await picker.click();

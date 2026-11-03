@@ -27,7 +27,7 @@
 <script lang="ts">
   import type { Snippet } from 'svelte';
   import type { ActionProps } from '../contract.js';
-  import type { ChartProps } from '../loaders.js';
+  import { bucketWidth, type ChartProps } from '../loaders.js';
   import { fmtInstant, fmtNumber } from '../format.js';
   import type { Loaded, QueryResult } from '../contract.js';
   import { MAX_SERIES, SERIES_COLORS, barRows, columnIndex, identityKey, numeric, recordedSeries, timeSeries } from '../plot.js';
@@ -152,28 +152,45 @@
       return { x, step, segments, total: base };
     });
   });
+  /**
+   * The chart's absolute range and its bucket width: the time axis spans the
+   * whole range, so a quiet stretch reads as empty time and a brush maps to
+   * real instants even when every point falls in one bucket.
+   */
+  const queried = $derived.by(() => {
+    const range = input.range && 'from' in input.range ? input.range : undefined;
+    const [x0, x1] = range ? [Date.parse(range.from), Date.parse(range.to)] : [NaN, NaN];
+    return range && x0 < x1 ? { x0, x1, bucket: bucketWidth(range) } : undefined;
+  });
   const bounds = $derived.by(() => {
     const ys = stacked ? columns.map((column) => column.total) : drawn.flatMap((line) => line.points.map((point) => point.y));
     const [low, high] = [Math.min(0, ...ys), Math.max(0, ...ys)];
     // Zero always shows; each signed side rounds outward, and an all-zero plot still spans one unit.
     const y0 = low < 0 ? -niceCeil(-low) : 0;
-    return { x0: xs[0], x1: xs[xs.length - 1], y0, y1: high > 0 ? niceCeil(high) : y0 < 0 ? 0 : 1 };
+    const [x0, x1] = queried ? [Math.min(queried.x0, xs[0] ?? queried.x0), Math.max(queried.x1, xs[xs.length - 1] ?? queried.x1)] : [xs[0], xs[xs.length - 1]];
+    return { x0, x1, y0, y1: high > 0 ? niceCeil(high) : y0 < 0 ? 0 : 1 };
   });
   const sx = (x: number) =>
     PAD.left + (bounds.x1 > bounds.x0 ? ((x - bounds.x0) / (bounds.x1 - bounds.x0)) * (W - PAD.left - PAD.right) : 0);
   const sy = (y: number) => H - PAD.bottom - ((y - bounds.y0) / (bounds.y1 - bounds.y0)) * (H - PAD.top - PAD.bottom);
   const ticks = $derived([0, 0.5, 1].map((share) => bounds.y0 + share * (bounds.y1 - bounds.y0)));
-  /** Up to four x labels on observed instants: clock time within a day and a half, else the date. */
+  /** Up to four x labels across the axis: clock time within a day and a half, else the date. */
   const xLabels = $derived.by(() => {
     if (xs.length === 0) return [];
     const short = bounds.x1 - bounds.x0 <= 36 * 3_600_000;
     const label = (ms: number) => new Date(ms).toISOString().slice(short ? 11 : 5, short ? 16 : 10);
-    const picks = [...new Set([0, 1, 2, 3].map((share) => Math.round((share / 3) * (xs.length - 1))))];
-    return picks.map((index, position) => ({
-      at: xs[index],
-      text: label(xs[index]),
+    const picks = bounds.x1 > bounds.x0 ? [0, 1, 2, 3].map((share) => bounds.x0 + (share / 3) * (bounds.x1 - bounds.x0)) : [bounds.x0];
+    return picks.map((at, position) => ({
+      at,
+      text: label(at),
       anchor: position === 0 ? 'start' : position === picks.length - 1 ? 'end' : 'middle'
     }));
+  });
+  /** One bar's width: its bucket's share of the axis, else an equal share per instant. */
+  const barWidth = $derived.by(() => {
+    const plot = W - PAD.left - PAD.right;
+    const step = queried?.bucket ?? columns[0]?.step;
+    return Math.max(1, (step && bounds.x1 > bounds.x0 ? (step / (bounds.x1 - bounds.x0)) * plot : plot / Math.max(1, xs.length)) * 0.8);
   });
 
   /** The smallest round step × 10ⁿ at or above a positive `value`, so the halfway gridline lands on a round number too. */
@@ -356,7 +373,7 @@
               {/each}
             {/if}
             {#each columns as column (column.x)}
-              {@const width = Math.max(1, ((W - PAD.left - PAD.right) / Math.max(1, xs.length)) * 0.8)}
+              {@const width = barWidth}
               {#each column.segments as segment (segment.label)}
                 {#if segment.to > segment.from}
                   <rect class="segment" x={Math.min(sx(column.x), W - PAD.right - width)} y={sy(segment.to)} {width} height={sy(segment.from) - sy(segment.to)} fill={style(segment.index, segment.label).stroke}>
@@ -385,19 +402,20 @@
               <rect class="brush" x={Math.min(brush.from, brush.to)} y={PAD.top} width={Math.abs(brush.to - brush.from)} height={H - PAD.top - PAD.bottom} />
             {/if}
           </svg>
+          {#if focused !== undefined && xs[focused] !== undefined}
+            {@const at = xs[focused]}
+            <!-- Floats beside the cursor over the plot, so hovering never moves the page. -->
+            <p class="tooltip" role="status" class:flip={sx(at) > W / 2} style:left="{(sx(at) / W) * 100}%">
+              <time datetime={new Date(at).toISOString()}>{fmtInstant(at)}</time>
+              {#each drawn as line (line.key)}
+                {@const points = line.points.filter((each) => each.x === at)}
+                <span>{line.label}: {points.length ? points.map((point) => `${fmtNumber(point.y)}${unitLabel}`).join(', ') : '—'}</span>
+              {/each}
+            </p>
+          {/if}
         </div>
         {#if compact}
           <p class="times" aria-hidden="true">{#each xLabels as label (label.at)}<span>{label.text}</span>{/each}</p>
-        {/if}
-        {#if focused !== undefined && xs[focused] !== undefined}
-          {@const at = xs[focused]}
-          <p class="tooltip" role="status">
-            <time datetime={new Date(at).toISOString()}>{fmtInstant(at)}</time>
-            {#each drawn as line (line.key)}
-              {@const points = line.points.filter((each) => each.x === at)}
-              <span>{line.label}: {points.length ? points.map((point) => `${fmtNumber(point.y)}${unitLabel}`).join(', ') : '—'}</span>
-            {/each}
-          </p>
         {/if}
         {#if !compact && !heading}{@render legend()}{/if}
       {:else if input.type === 'bar'}
@@ -681,11 +699,24 @@
     opacity: 0.6;
   }
   .tooltip {
+    position: absolute;
+    top: 0;
+    z-index: 1;
     display: flex;
-    flex-wrap: wrap;
-    gap: 4px 12px;
-    margin: 0;
+    flex-direction: column;
+    gap: 2px;
+    margin: 0 0 0 8px;
+    border: 1px solid var(--border);
+    border-radius: var(--r);
+    padding: 6px 8px;
+    background: var(--surface);
     font: 11px var(--font-mono);
+    white-space: nowrap;
+    pointer-events: none;
+  }
+  .tooltip.flip {
+    margin: 0 0 0 -8px;
+    transform: translateX(-100%);
   }
   .series {
     max-height: 220px;

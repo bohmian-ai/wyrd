@@ -1,6 +1,7 @@
 <!--
   A side panel on the native modal <dialog>: focus trapping, Escape and the
-  backdrop come from the platform. The host owns `open`; closing reports through `onclose`.
+  backdrop come from the platform, and a click on the backdrop closes it like
+  Escape. The host owns `open`; closing reports through `onclose`.
   A host may widen it with `width` (never past the viewport), replace the
   title text with a `heading` (the title stays its accessible name) and add
   header `tools` before Close.
@@ -26,9 +27,15 @@
     if (open && !dialog.open) dialog.showModal();
     if (!open && dialog.open) dialog.close();
   });
+  /** A backdrop click lands on the dialog itself but outside its box. */
+  function backdrop(event: MouseEvent) {
+    const box = dialog?.getBoundingClientRect();
+    if (event.target === dialog && box && (event.clientX < box.left || event.clientX > box.right || event.clientY < box.top || event.clientY > box.bottom)) onclose();
+  }
 </script>
 
-<dialog bind:this={dialog} aria-label={title} {onclose} style:width="min({width}, 100vw)">
+<!-- svelte-ignore a11y_click_events_have_key_events, a11y_no_noninteractive_element_interactions -- Escape is the keyboard equivalent. -->
+<dialog bind:this={dialog} aria-label={title} {onclose} onclick={backdrop} style:width="min({width}, 100vw)">
   <header>
     <div class="heading">{#if heading}{@render heading()}{:else}<h2>{title}</h2>{/if}</div>
     <span class="tools">

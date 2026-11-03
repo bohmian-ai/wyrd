@@ -828,3 +828,859 @@ async fn browser_session_requests_enforce_origin_and_bearer_precedence() {
         .expect("audit rows read");
     assert_eq!(decisions, vec![vec![Some("allowed".to_owned())]]);
 }
+
+/// A password meeting the local policy, distinct per `n`.
+fn strong(n: u32) -> String {
+    format!("Quiet harbor lantern {n}")
+}
+
+/// Send `body` to `uri` as `method` with `bearer`, from this origin.
+async fn as_bearer(
+    server: &WyrdTestServer,
+    method: Method,
+    uri: &str,
+    bearer: &str,
+    body: Option<Value>,
+) -> BrowserResponse {
+    send_with(
+        server,
+        BrowserRequest {
+            method,
+            uri,
+            origin: Some(ORIGIN),
+            cookies: Vec::new(),
+            body,
+        },
+        Some(bearer),
+    )
+    .await
+}
+
+/// Send `body` to `uri` as `method` with one tenant session `cookie`, from
+/// this origin.
+async fn as_browser(
+    server: &WyrdTestServer,
+    method: Method,
+    uri: &str,
+    tenant: &str,
+    cookie: &str,
+    body: Option<Value>,
+) -> BrowserResponse {
+    send(
+        server,
+        BrowserRequest {
+            method,
+            uri,
+            origin: Some(ORIGIN),
+            cookies: vec![(cookie_name(tenant), cookie.to_owned())],
+            body,
+        },
+    )
+    .await
+}
+
+/// POST an anonymous `/auth/browser/password/{operation}` request.
+async fn password(server: &WyrdTestServer, operation: &str, body: Value) -> BrowserResponse {
+    send(
+        server,
+        BrowserRequest {
+            method: Method::POST,
+            uri: &format!("/auth/browser/password/{operation}"),
+            origin: Some(ORIGIN),
+            cookies: Vec::new(),
+            body: Some(body),
+        },
+    )
+    .await
+}
+
+/// An administrator bearer for `tenant`.
+///
+/// # Panics
+/// Panics when bootstrapping or the exchange fails.
+async fn admin_bearer(server: &WyrdTestServer, tenant: wyrd_spec::DataTenantId) -> String {
+    let (_, key) = service(server, tenant, &format!("admin-{}", Uuid::now_v7())).await;
+    server
+        .exchange_api_key(&key)
+        .await
+        .expect("admin exchanges")
+}
+
+/// Issue an invitation for the built-in `role` with `bearer`; returns the
+/// response.
+async fn invite(
+    server: &WyrdTestServer,
+    tenant: wyrd_spec::DataTenantId,
+    bearer: &str,
+    role: &str,
+) -> BrowserResponse {
+    let role_id = wyrd_runtime::builtin_roles::builtin_role_uuid(tenant, role);
+    as_bearer(
+        server,
+        Method::POST,
+        "/v1/principals/users/invitations",
+        bearer,
+        Some(json!({ "role_ids": [role_id] })),
+    )
+    .await
+}
+
+/// Enroll `username` with `secret` through a fresh `role` invitation in the
+/// fixture tenant; returns the signup response.
+///
+/// # Panics
+/// Panics when the invitation is refused.
+async fn enroll(
+    server: &WyrdTestServer,
+    bearer: &str,
+    role: &str,
+    username: &str,
+    secret: &str,
+) -> BrowserResponse {
+    let issued = invite(server, server.data_tenant_id(), bearer, role).await;
+    assert_eq!(issued.status, StatusCode::CREATED, "{}", issued.body);
+    password(
+        server,
+        "signup",
+        json!({
+            "tenant": server.pg_fixture().tenant_slug(),
+            "invitation_code": issued.body["invitation_code"],
+            "username": username,
+            "password": secret,
+        }),
+    )
+    .await
+}
+
+/// Sign `username` in with `secret` to the fixture tenant.
+async fn login(server: &WyrdTestServer, username: &str, secret: &str) -> BrowserResponse {
+    password(
+        server,
+        "login",
+        json!({
+            "tenant": server.pg_fixture().tenant_slug(),
+            "username": username,
+            "password": secret,
+        }),
+    )
+    .await
+}
+
+/// Invitation signup creates a verifier-only local User with its Roles and a
+/// password session; login, change and operator reset follow the password
+/// revision, ending every local session and spending stale codes.
+///
+/// # Panics
+/// Panics when the server fails to start or any expectation fails.
+#[tokio::test(flavor = "current_thread")]
+async fn local_signup_login_and_password_lifecycle() {
+    let server = WyrdTestServer::start_in_process()
+        .await
+        .expect("test server starts");
+    let acme = server.pg_fixture().tenant_slug().to_owned();
+    let admin = admin_bearer(&server, server.data_tenant_id()).await;
+    let pool = server
+        .pg_fixture()
+        .superuser_pool()
+        .expect("superuser pool opens");
+
+    // The invitation code is returned once, no-store, beside a fixed URL.
+    let issued = invite(&server, server.data_tenant_id(), &admin, "viewer").await;
+    assert_eq!(issued.status, StatusCode::CREATED, "{}", issued.body);
+    assert_eq!(
+        issued
+            .headers
+            .get(header::CACHE_CONTROL)
+            .map(|v| v.as_bytes()),
+        Some(b"no-store".as_slice())
+    );
+    let code = issued.body["invitation_code"]
+        .as_str()
+        .expect("code")
+        .to_owned();
+    assert_eq!(code.len(), 43);
+    assert_eq!(
+        issued.body["signup_url"],
+        json!(format!("{ORIGIN}/t/{acme}/signup"))
+    );
+    let signup = |username: &str, secret: &str| json!({ "tenant": acme, "invitation_code": code, "username": username, "password": secret });
+
+    // Policy refusals spend nothing.
+    for (username, secret) in [
+        ("x", strong(1)),
+        ("ada", "short".to_owned()),
+        ("ada", "password123456789".to_owned()),
+        ("ada", format!("{}\u{7}", strong(1))),
+    ] {
+        let refused = password(&server, "signup", signup(username, &secret)).await;
+        assert_eq!(refused.status, StatusCode::BAD_REQUEST, "{}", refused.body);
+        assert_eq!(refused.body["code"], json!("WYRD_SPEC_400_VALIDATION"));
+    }
+
+    // Signup enrolls and signs in; the username is canonical.
+    let created = password(&server, "signup", signup("  Ada.Lovelace ", &strong(1))).await;
+    assert_eq!(created.status, StatusCode::CREATED, "{}", created.body);
+    assert_eq!(created.body["credential"], json!("password"));
+    assert_eq!(created.body["principal_kind"], json!("user"));
+    assert!(!created.body.to_string().contains(&strong(1)));
+    let user = Uuid::parse_str(created.body["principal_id"].as_str().expect("id")).expect("uuid");
+    let first = created.cookie_value(&cookie_name(&acme));
+    let (username, verifier, revision): (String, String, i64) = sqlx::query_as(
+        "SELECT username, password_hash, password_revision FROM wyrd.auth_users WHERE id = $1",
+    )
+    .bind(user)
+    .fetch_one(&pool)
+    .await
+    .expect("user stored");
+    assert_eq!(username, "ada.lovelace");
+    assert!(
+        verifier.starts_with("$argon2id$v=19$m=19456,t=2,p=1$"),
+        "{verifier}"
+    );
+    assert!(!verifier.contains(&strong(1)));
+    assert_eq!(revision, 0);
+    let roles: Vec<(String,)> = sqlx::query_as(
+        "SELECT r.name FROM wyrd.auth_user_roles ur JOIN wyrd.auth_roles r ON r.id = ur.role_id \
+          WHERE ur.user_id = $1",
+    )
+    .bind(user)
+    .fetch_all(&pool)
+    .await
+    .expect("roles read");
+    assert_eq!(roles, vec![("viewer".to_owned(),)]);
+
+    // The code is single-use.
+    let reused = password(&server, "signup", signup("grace", &strong(2))).await;
+    assert_eq!(reused.status, StatusCode::UNAUTHORIZED, "{}", reused.body);
+    assert_eq!(
+        reused.body["code"],
+        json!("WYRD_AUTH_401_ONE_TIME_CODE_INVALID")
+    );
+
+    // The profile is the local account.
+    let me = as_browser(
+        &server,
+        Method::GET,
+        "/v1/principals/me",
+        &acme,
+        &first,
+        None,
+    )
+    .await;
+    assert_eq!(me.status, StatusCode::OK, "{}", me.body);
+    assert_eq!(me.body["username"], json!("ada.lovelace"));
+    assert_eq!(me.body["authentication"], json!("password"));
+    let permissions = me.body["permissions"].as_array().expect("permissions");
+    for held in [
+        "cards:read",
+        "personal_credentials:read",
+        "personal_credentials:write",
+    ] {
+        assert!(
+            permissions.contains(&json!(held)),
+            "{held} missing: {permissions:?}"
+        );
+    }
+
+    // Login: one refusal for every bad pair, then a fresh session.
+    for (name, secret) in [("ada.lovelace", strong(9)), ("nobody", strong(1))] {
+        let refused = login(&server, name, &secret).await;
+        assert_eq!(refused.status, StatusCode::UNAUTHORIZED, "{}", refused.body);
+        assert_eq!(
+            refused.body["code"],
+            json!("WYRD_AUTH_401_PASSWORD_INVALID")
+        );
+    }
+    let second = login(&server, "ADA.LOVELACE", &strong(1)).await;
+    assert_eq!(second.status, StatusCode::OK, "{}", second.body);
+    let second = second.cookie_value(&cookie_name(&acme));
+    assert_ne!(second, first);
+
+    // Change needs the current password and ends every local session.
+    let change = |current: String, next: String| json!({ "tenant": acme, "current_password": current, "new_password": next });
+    let wrong = as_browser(
+        &server,
+        Method::POST,
+        "/auth/browser/password/change",
+        &acme,
+        &second,
+        Some(change(strong(9), strong(3))),
+    )
+    .await;
+    assert_eq!(wrong.status, StatusCode::UNAUTHORIZED, "{}", wrong.body);
+    let changed = as_browser(
+        &server,
+        Method::POST,
+        "/auth/browser/password/change",
+        &acme,
+        &second,
+        Some(change(strong(1), strong(3))),
+    )
+    .await;
+    assert_eq!(changed.status, StatusCode::NO_CONTENT, "{}", changed.body);
+    assert!(
+        changed
+            .set_cookie(&cookie_name(&acme))
+            .is_some_and(|cookie| cookie.contains("Max-Age=0"))
+    );
+    for dead in [&first, &second] {
+        let read = read(&server, "", vec![(cookie_name(&acme), dead.clone())]).await;
+        assert_eq!(read.status, StatusCode::UNAUTHORIZED, "{}", read.body);
+    }
+    assert_eq!(
+        login(&server, "ada.lovelace", &strong(1)).await.status,
+        StatusCode::UNAUTHORIZED
+    );
+    let third = login(&server, "ada.lovelace", &strong(3)).await;
+    assert_eq!(third.status, StatusCode::OK, "{}", third.body);
+    let third = third.cookie_value(&cookie_name(&acme));
+
+    // A reset issued before a change is spent by it.
+    let reset_uri = format!("/v1/principals/users/{user}/password-reset");
+    let stale = as_bearer(&server, Method::POST, &reset_uri, &admin, None).await;
+    assert_eq!(stale.status, StatusCode::CREATED, "{}", stale.body);
+    assert_eq!(
+        stale.body["reset_url"],
+        json!(format!("{ORIGIN}/t/{acme}/reset"))
+    );
+    let changed = as_browser(
+        &server,
+        Method::POST,
+        "/auth/browser/password/change",
+        &acme,
+        &third,
+        Some(change(strong(3), strong(4))),
+    )
+    .await;
+    assert_eq!(changed.status, StatusCode::NO_CONTENT, "{}", changed.body);
+    let reset = |code: &Value, next: String| json!({ "tenant": acme, "reset_code": code, "new_password": next });
+    let refused = password(
+        &server,
+        "reset",
+        reset(&stale.body["reset_code"], strong(5)),
+    )
+    .await;
+    assert_eq!(refused.status, StatusCode::UNAUTHORIZED, "{}", refused.body);
+
+    // A current reset sets the password, signs nothing in and is single-use.
+    let session = login(&server, "ada.lovelace", &strong(4)).await;
+    let session = session.cookie_value(&cookie_name(&acme));
+    let issued = as_bearer(&server, Method::POST, &reset_uri, &admin, None).await;
+    let done = password(
+        &server,
+        "reset",
+        reset(&issued.body["reset_code"], strong(6)),
+    )
+    .await;
+    assert_eq!(done.status, StatusCode::NO_CONTENT, "{}", done.body);
+    assert!(done.set_cookie(&cookie_name(&acme)).is_none());
+    let again = password(
+        &server,
+        "reset",
+        reset(&issued.body["reset_code"], strong(7)),
+    )
+    .await;
+    assert_eq!(again.status, StatusCode::UNAUTHORIZED);
+    assert_eq!(
+        read(&server, "", vec![(cookie_name(&acme), session)])
+            .await
+            .status,
+        StatusCode::UNAUTHORIZED
+    );
+    assert_eq!(
+        login(&server, "ada.lovelace", &strong(6)).await.status,
+        StatusCode::OK
+    );
+
+    // A suspended User cannot sign in.
+    superuser(
+        &server,
+        "UPDATE wyrd.auth_users SET status = 'suspended' WHERE id = $1",
+        user,
+    )
+    .await;
+    assert_eq!(
+        login(&server, "ada.lovelace", &strong(6)).await.status,
+        StatusCode::UNAUTHORIZED
+    );
+}
+
+/// Enrollment and sign-in are bound to one tenant and one live invitation,
+/// concurrent use enrolls once with no partial User, administration is
+/// required to invite, and password failures are counted per account until
+/// the window refuses with its retry time.
+///
+/// # Panics
+/// Panics when the server fails to start or any expectation fails.
+#[tokio::test(flavor = "current_thread")]
+async fn local_signup_is_tenant_bound_and_rate_limited() {
+    let server = WyrdTestServer::start_in_process()
+        .await
+        .expect("test server starts");
+    let acme = server.pg_fixture().tenant_slug().to_owned();
+    let beta_id = server.seed_tenant("beta").await.expect("tenant seeds");
+    let admin = admin_bearer(&server, server.data_tenant_id()).await;
+    let pool = server
+        .pg_fixture()
+        .superuser_pool()
+        .expect("superuser pool opens");
+    let users_named = |name: &'static str| {
+        let pool = pool.clone();
+        async move {
+            let (count,): (i64,) =
+                sqlx::query_as("SELECT count(*) FROM wyrd.auth_users WHERE username = $1")
+                    .bind(name)
+                    .fetch_one(&pool)
+                    .await
+                    .expect("count reads");
+            count
+        }
+    };
+
+    // An invitation names its own tenant only.
+    let issued = invite(&server, server.data_tenant_id(), &admin, "viewer").await;
+    let code = issued.body["invitation_code"].clone();
+    let elsewhere = password(
+        &server,
+        "signup",
+        json!({ "tenant": "beta", "invitation_code": code, "username": "mallory", "password": strong(1) }),
+    )
+    .await;
+    assert_eq!(
+        elsewhere.status,
+        StatusCode::UNAUTHORIZED,
+        "{}",
+        elsewhere.body
+    );
+    assert_eq!(users_named("mallory").await, 0, "no partial User");
+
+    // Malformed, revoked and expired invitations refuse.
+    let malformed = password(
+        &server,
+        "signup",
+        json!({ "tenant": acme, "invitation_code": "short", "username": "mallory", "password": strong(1) }),
+    )
+    .await;
+    assert_eq!(
+        malformed.body["code"],
+        json!("WYRD_AUTH_401_ONE_TIME_CODE_INVALID")
+    );
+    let revocable = invite(&server, server.data_tenant_id(), &admin, "viewer").await;
+    let revoke_uri = format!(
+        "/v1/principals/users/invitations/{}",
+        revocable.body["invitation"]["id"].as_str().expect("id")
+    );
+    assert_eq!(
+        as_bearer(&server, Method::DELETE, &revoke_uri, &admin, None)
+            .await
+            .status,
+        StatusCode::NO_CONTENT
+    );
+    let expiring = invite(&server, server.data_tenant_id(), &admin, "viewer").await;
+    sqlx::query(
+        "UPDATE wyrd.auth_user_invitations \
+            SET created_at = created_at - interval '25 hours', \
+                expires_at = expires_at - interval '25 hours' WHERE id = $1",
+    )
+    .bind(Uuid::parse_str(expiring.body["invitation"]["id"].as_str().expect("id")).expect("uuid"))
+    .execute(&pool)
+    .await
+    .expect("invitation ages");
+    for dead in [&revocable, &expiring] {
+        let refused = password(
+            &server,
+            "signup",
+            json!({ "tenant": acme, "invitation_code": dead.body["invitation_code"], "username": "mallory", "password": strong(1) }),
+        )
+        .await;
+        assert_eq!(refused.status, StatusCode::UNAUTHORIZED, "{}", refused.body);
+    }
+    assert_eq!(users_named("mallory").await, 0);
+
+    // Two concurrent enrollments with one code: exactly one User.
+    let body = |name: &str| json!({ "tenant": acme, "invitation_code": code, "username": name, "password": strong(1) });
+    let (left, right) = tokio::join!(
+        password(&server, "signup", body("racer-a")),
+        password(&server, "signup", body("racer-b")),
+    );
+    let statuses = [left.status, right.status];
+    assert!(
+        statuses.contains(&StatusCode::CREATED) && statuses.contains(&StatusCode::UNAUTHORIZED),
+        "{statuses:?}"
+    );
+    assert_eq!(
+        users_named("racer-a").await + users_named("racer-b").await,
+        1
+    );
+    let winner = if left.status == StatusCode::CREATED {
+        "racer-a"
+    } else {
+        "racer-b"
+    };
+
+    // A taken username refuses without consuming the invitation.
+    let fresh = invite(&server, server.data_tenant_id(), &admin, "viewer").await;
+    let taken = password(
+        &server,
+        "signup",
+        json!({ "tenant": acme, "invitation_code": fresh.body["invitation_code"], "username": winner, "password": strong(2) }),
+    )
+    .await;
+    assert_eq!(taken.status, StatusCode::BAD_REQUEST, "{}", taken.body);
+    let reused = password(
+        &server,
+        "signup",
+        json!({ "tenant": acme, "invitation_code": fresh.body["invitation_code"], "username": "late", "password": strong(2) }),
+    )
+    .await;
+    assert_eq!(reused.status, StatusCode::CREATED, "{}", reused.body);
+
+    // Accounts are tenant-local; a viewer cannot invite.
+    let other_tenant = password(
+        &server,
+        "login",
+        json!({ "tenant": "beta", "username": winner, "password": strong(1) }),
+    )
+    .await;
+    assert_eq!(other_tenant.status, StatusCode::UNAUTHORIZED);
+    let viewer = reused.cookie_value(&cookie_name(&acme));
+    let role_id = wyrd_runtime::builtin_roles::builtin_role_uuid(server.data_tenant_id(), "viewer");
+    let forbidden = as_browser(
+        &server,
+        Method::POST,
+        "/v1/principals/users/invitations",
+        &acme,
+        &viewer,
+        Some(json!({ "role_ids": [role_id] })),
+    )
+    .await;
+    assert_eq!(
+        forbidden.status,
+        StatusCode::FORBIDDEN,
+        "{}",
+        forbidden.body
+    );
+    let beta_admin = admin_bearer(&server, beta_id).await;
+    let foreign_role = invite(&server, server.data_tenant_id(), &beta_admin, "viewer").await;
+    assert_eq!(
+        foreign_role.status,
+        StatusCode::BAD_REQUEST,
+        "{}",
+        foreign_role.body
+    );
+
+    // Oversized input refuses before derivation and is not counted.
+    let oversized = login(&server, winner, &"x".repeat(2000)).await;
+    assert_eq!(oversized.status, StatusCode::UNAUTHORIZED);
+
+    // Ten failures per account, then the window refuses even the right
+    // password, with its retry time.
+    for _ in 0..10 {
+        assert_eq!(
+            login(&server, winner, &strong(9)).await.status,
+            StatusCode::UNAUTHORIZED
+        );
+    }
+    let limited = login(&server, winner, &strong(1)).await;
+    assert_eq!(
+        limited.status,
+        StatusCode::TOO_MANY_REQUESTS,
+        "{}",
+        limited.body
+    );
+    assert_eq!(
+        limited.body["code"],
+        json!("WYRD_AUTH_429_PASSWORD_ATTEMPTS")
+    );
+    let retry: u64 = limited
+        .headers
+        .get(header::RETRY_AFTER)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.parse().ok())
+        .expect("Retry-After seconds");
+    assert!((1..=900).contains(&retry), "{retry}");
+    assert_eq!(
+        login(&server, "late", &strong(2)).await.status,
+        StatusCode::OK,
+        "another account is unaffected"
+    );
+}
+
+/// A User key has one User owner, a stored sorted ceiling and an expiry;
+/// creating one for oneself needs a recent password session; its exchange
+/// carries the User's current grants narrowed to the ceiling; own listing
+/// pages with a bound cursor; and revocation and suspension end it.
+///
+/// # Panics
+/// Panics when the server fails to start or any expectation fails.
+#[tokio::test(flavor = "current_thread")]
+async fn user_keys_preserve_owner_scope_and_credential_lifecycle() {
+    let server = WyrdTestServer::start_in_process()
+        .await
+        .expect("test server starts");
+    let acme = server.pg_fixture().tenant_slug().to_owned();
+    let admin = admin_bearer(&server, server.data_tenant_id()).await;
+    let pool = server
+        .pg_fixture()
+        .superuser_pool()
+        .expect("superuser pool opens");
+    let created = enroll(&server, &admin, "viewer", "keyholder", &strong(1)).await;
+    assert_eq!(created.status, StatusCode::CREATED, "{}", created.body);
+    let user = created.body["principal_id"]
+        .as_str()
+        .expect("id")
+        .to_owned();
+    let cookie = created.cookie_value(&cookie_name(&acme));
+    let keys = format!("/v1/principals/{user}/credentials");
+    let key_body = |ceiling: Value| json!({ "name": " laptop ", "permission_ceiling": ceiling, "expires_in": 3600 });
+
+    // A User target needs a valid body within both parties' authority.
+    for (body, status) in [
+        (None, StatusCode::BAD_REQUEST),
+        (Some(key_body(json!([]))), StatusCode::BAD_REQUEST),
+        (
+            Some(key_body(json!(["cards:read", "cards:read"]))),
+            StatusCode::BAD_REQUEST,
+        ),
+        (
+            Some(key_body(json!(["service_accounts:write"]))),
+            StatusCode::BAD_REQUEST,
+        ),
+        (
+            Some(
+                json!({ "name": "x", "permission_ceiling": ["cards:read"], "expires_in": 31_536_001 }),
+            ),
+            StatusCode::BAD_REQUEST,
+        ),
+    ] {
+        let refused = as_browser(&server, Method::POST, &keys, &acme, &cookie, body).await;
+        assert_eq!(refused.status, status, "{}", refused.body);
+    }
+
+    // A recent password session creates the key; the stored row is User-owned.
+    let issued = as_browser(
+        &server,
+        Method::POST,
+        &keys,
+        &acme,
+        &cookie,
+        Some(key_body(json!(["personal_credentials:read", "cards:read"]))),
+    )
+    .await;
+    assert_eq!(issued.status, StatusCode::OK, "{}", issued.body);
+    let key = SecretString::from(issued.body["credential"].as_str().expect("key").to_owned());
+    let key_id = Uuid::parse_str(issued.body["id"].as_str().expect("id")).expect("uuid");
+    let (owner, account, name, ceiling, expires): (
+        Option<Uuid>,
+        Option<Uuid>,
+        String,
+        Value,
+        bool,
+    ) = sqlx::query_as(
+        "SELECT user_id, service_account_id, name, permission_ceiling, expires_at IS NOT NULL \
+               FROM wyrd.auth_api_keys WHERE id = $1",
+    )
+    .bind(key_id)
+    .fetch_one(&pool)
+    .await
+    .expect("key stored");
+    assert_eq!(owner.map(|id| id.to_string()), Some(user.clone()));
+    assert_eq!(account, None);
+    assert_eq!(name, "laptop");
+    assert_eq!(ceiling, json!(["cards:read", "personal_credentials:read"]));
+    assert!(expires);
+
+    // The key acts as the User, narrowed to its ceiling.
+    let token = server
+        .exchange_api_key(&key)
+        .await
+        .expect("user key exchanges");
+    let me = as_bearer(&server, Method::GET, "/v1/principals/me", &token, None).await;
+    assert_eq!(me.status, StatusCode::OK, "{}", me.body);
+    assert_eq!(me.body["principal_id"], json!(user));
+    assert_eq!(
+        me.body["permissions"],
+        json!(["cards:read", "personal_credentials:read"])
+    );
+    let unpaged = as_bearer(&server, Method::GET, &keys, &token, None).await;
+    assert_eq!(unpaged.status, StatusCode::BAD_REQUEST, "{}", unpaged.body);
+    let paged = as_bearer(
+        &server,
+        Method::GET,
+        &format!("{keys}?limit=10"),
+        &token,
+        None,
+    )
+    .await;
+    assert_eq!(paged.status, StatusCode::OK, "{}", paged.body);
+    assert_eq!(paged.body["credentials"][0]["name"], json!("laptop"));
+    let revoke_uri = format!("{keys}/{key_id}");
+    assert_eq!(
+        as_bearer(&server, Method::DELETE, &revoke_uri, &token, None)
+            .await
+            .status,
+        StatusCode::FORBIDDEN,
+        "the ceiling withholds personal_credentials:write"
+    );
+
+    // A later role never widens the key.
+    let editor = wyrd_runtime::builtin_roles::builtin_role_uuid(server.data_tenant_id(), "editor");
+    sqlx::query(
+        "INSERT INTO wyrd.auth_user_roles (data_tenant_id, user_id, role_id, source) \
+         SELECT data_tenant_id, id, $2, 'direct' FROM wyrd.auth_users WHERE id = $1",
+    )
+    .bind(Uuid::parse_str(&user).expect("uuid"))
+    .bind(editor)
+    .execute(&pool)
+    .await
+    .expect("role granted");
+    let token = server.exchange_api_key(&key).await.expect("exchanges");
+    let me = as_bearer(&server, Method::GET, "/v1/principals/me", &token, None).await;
+    assert_eq!(
+        me.body["permissions"],
+        json!(["cards:read", "personal_credentials:read"])
+    );
+
+    // Recovery with the key and a stale session are not recent proof.
+    let recovered = recover(&server, &acme, key.expose_secret(), Some(ORIGIN)).await;
+    assert_eq!(recovered.status, StatusCode::OK, "{}", recovered.body);
+    let recovered = recovered.cookie_value(&cookie_name(&acme));
+    let body = Some(key_body(json!(["cards:read"])));
+    let refused = as_browser(
+        &server,
+        Method::POST,
+        &keys,
+        &acme,
+        &recovered,
+        body.clone(),
+    )
+    .await;
+    assert_eq!(refused.status, StatusCode::FORBIDDEN, "{}", refused.body);
+    sqlx::query(
+        "UPDATE wyrd.auth_browser_sessions SET created_at = created_at - interval '6 minutes', \
+                expires_at = expires_at - interval '6 minutes' WHERE session_hash = $1",
+    )
+    .bind(Sha256::digest(cookie.as_bytes()).to_vec())
+    .execute(&pool)
+    .await
+    .expect("session ages");
+    let stale = as_browser(&server, Method::POST, &keys, &acme, &cookie, body.clone()).await;
+    assert_eq!(stale.status, StatusCode::FORBIDDEN, "{}", stale.body);
+    assert_eq!(
+        stale.body["code"],
+        json!("WYRD_AUTH_403_RECENT_LOGIN_REQUIRED")
+    );
+
+    // Pages are newest first and complete; a cursor is bound to its principal.
+    let fresh = login(&server, "keyholder", &strong(1))
+        .await
+        .cookie_value(&cookie_name(&acme));
+    for _ in 0..2 {
+        let made = as_browser(&server, Method::POST, &keys, &acme, &fresh, body.clone()).await;
+        assert_eq!(made.status, StatusCode::OK, "{}", made.body);
+    }
+    let first = as_browser(
+        &server,
+        Method::GET,
+        &format!("{keys}?limit=2"),
+        &acme,
+        &fresh,
+        None,
+    )
+    .await;
+    assert_eq!(first.status, StatusCode::OK, "{}", first.body);
+    assert_eq!(first.body["credentials"].as_array().map(Vec::len), Some(2));
+    let cursor = first.body["next_cursor"].as_str().expect("more").to_owned();
+    let rest = as_browser(
+        &server,
+        Method::GET,
+        &format!("{keys}?limit=2&cursor={cursor}"),
+        &acme,
+        &fresh,
+        None,
+    )
+    .await;
+    assert_eq!(rest.body["credentials"].as_array().map(Vec::len), Some(1));
+    assert_eq!(rest.body["credentials"][0]["id"], json!(key_id.to_string()));
+    assert!(rest.body.get("next_cursor").is_none(), "{}", rest.body);
+    let (service_id, _) = service(&server, server.data_tenant_id(), "cursor-target").await;
+    let foreign = as_bearer(
+        &server,
+        Method::GET,
+        &format!("/v1/principals/{service_id}/credentials?cursor={cursor}"),
+        &admin,
+        None,
+    )
+    .await;
+    assert_eq!(foreign.status, StatusCode::BAD_REQUEST, "{}", foreign.body);
+    let overflow = as_browser(
+        &server,
+        Method::GET,
+        &format!("{keys}?limit=101"),
+        &acme,
+        &fresh,
+        None,
+    )
+    .await;
+    assert_eq!(overflow.status, StatusCode::BAD_REQUEST);
+
+    // Administrators keep the complete listing and the account shapes.
+    let complete = as_bearer(&server, Method::GET, &keys, &admin, None).await;
+    assert_eq!(complete.status, StatusCode::OK, "{}", complete.body);
+    assert_eq!(
+        complete.body["credentials"].as_array().map(Vec::len),
+        Some(3)
+    );
+    let account_keys = format!("/v1/principals/{service_id}/credentials");
+    let with_body = as_bearer(&server, Method::POST, &account_keys, &admin, body.clone()).await;
+    assert_eq!(
+        with_body.status,
+        StatusCode::BAD_REQUEST,
+        "{}",
+        with_body.body
+    );
+    let plain = as_bearer(&server, Method::POST, &account_keys, &admin, None).await;
+    assert_eq!(plain.status, StatusCode::OK, "{}", plain.body);
+    let listed = as_bearer(&server, Method::GET, &account_keys, &admin, None).await;
+    assert!(
+        listed.body["credentials"][0].get("name").is_none(),
+        "{}",
+        listed.body
+    );
+    let for_user = as_bearer(&server, Method::POST, &keys, &admin, body.clone()).await;
+    assert_eq!(for_user.status, StatusCode::OK, "{}", for_user.body);
+    let service_me = as_bearer(&server, Method::GET, "/v1/principals/me", &admin, None).await;
+    assert_eq!(service_me.status, StatusCode::FORBIDDEN);
+
+    // Own revocation ends the key; another User's keys stay out of reach.
+    let revoked = as_browser(&server, Method::DELETE, &revoke_uri, &acme, &fresh, None).await;
+    assert_eq!(revoked.status, StatusCode::NO_CONTENT, "{}", revoked.body);
+    assert!(server.exchange_api_key(&key).await.is_err());
+    let other = enroll(&server, &admin, "viewer", "neighbor", &strong(2)).await;
+    let other = other.cookie_value(&cookie_name(&acme));
+    let probe = as_browser(
+        &server,
+        Method::GET,
+        &format!("{keys}?limit=5"),
+        &acme,
+        &other,
+        None,
+    )
+    .await;
+    assert_eq!(probe.status, StatusCode::FORBIDDEN, "{}", probe.body);
+
+    // Suspension ends every key of the User.
+    let live = SecretString::from(
+        for_user.body["credential"]
+            .as_str()
+            .expect("key")
+            .to_owned(),
+    );
+    superuser(
+        &server,
+        "UPDATE wyrd.auth_users SET status = 'suspended' WHERE id = $1",
+        Uuid::parse_str(&user).expect("uuid"),
+    )
+    .await;
+    assert!(server.exchange_api_key(&live).await.is_err());
+}

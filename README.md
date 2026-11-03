@@ -16,9 +16,20 @@
   <a href="https://discord.gg/K5bf23yPNb">Discord</a>
 </p>
 
-Wyrd is open-source verification infrastructure for AI systems. Know whether your AI system does what you said it would, before release and in production.
+Wyrd is open-source production verification infrastructure for AI/ML systems and the application workflows around them. Know whether your system does what you said it would, before release and in production.
 
-You declare what your system must do as requirements. Your app sends Wyrd what it did, and Wyrd returns a verdict for each requirement, keeping it with the exact versions it judged. Check a support agent's answers, an uploaded document against your policy, or every step of a long-running workflow.
+You declare what your system must do as requirements. Your app sends Wyrd what it did, and Wyrd returns a verdict for each requirement, keeping it with the exact versions it judged. Verify model outputs, policy decisions, tool calls, and complete workflows:
+
+<p align="center">
+  <a href="https://docs.bohmian.ai/wyrd/get-started/what-can-i-build/#policy-verification"><img src="https://img.shields.io/badge/Policy%20verification-555555" alt="Use case: Policy verification"></a>
+  <a href="https://docs.bohmian.ai/wyrd/get-started/what-can-i-build/#agent-evaluation"><img src="https://img.shields.io/badge/Agent%20evaluation-555555" alt="Use case: Agent evaluation"></a>
+  <a href="https://docs.bohmian.ai/wyrd/get-started/what-can-i-build/#long-horizon-workflows"><img src="https://img.shields.io/badge/Long--horizon%20workflows-555555" alt="Use case: Long-horizon workflows"></a>
+  <a href="https://docs.bohmian.ai/wyrd/get-started/what-can-i-build/#runtime-verification"><img src="https://img.shields.io/badge/Runtime%20verification-555555" alt="Use case: Runtime verification"></a>
+  <a href="https://docs.bohmian.ai/wyrd/get-started/what-can-i-build/#observability"><img src="https://img.shields.io/badge/Observability-555555" alt="Use case: Observability"></a>
+  <a href="https://docs.bohmian.ai/wyrd/get-started/what-can-i-build/#drift-monitoring"><img src="https://img.shields.io/badge/Drift%20monitoring-555555" alt="Use case: Drift monitoring"></a>
+</p>
+
+[What can I build?](https://docs.bohmian.ai/wyrd/get-started/what-can-i-build/) matches each use case to its workflow and compares Wyrd with MLflow, Langfuse, LangSmith, Braintrust, and Arize Phoenix.
 
 ## How Wyrd fits your stack
 
@@ -190,7 +201,7 @@ failed: operator NotContains returned false
   verifier: default/Verifier/no-refund-promise@1.0.0#<uid>
 ```
 
-[Run your first verification](https://docs.bohmian.ai/wyrd/get-started/quickstart/) walks through it. A check can also run Python or ask a model to judge; see [Write a Verifier](https://docs.bohmian.ai/wyrd/build-and-verify/verify/author-a-verifier/).
+[Run your first verification](https://docs.bohmian.ai/wyrd/get-started/quickstart/) walks through it. This assertion is the simplest check. A Verifier can also run Python, judge with an Agent that reads your uploaded policy files and cites them, judge a whole session, or watch for drift on a schedule; see [What can I build?](https://docs.bohmian.ai/wyrd/get-started/what-can-i-build/) and [Recipes](https://docs.bohmian.ai/wyrd/build-and-verify/verify/verifier-recipes/).
 
 ## Where Wyrd stops
 

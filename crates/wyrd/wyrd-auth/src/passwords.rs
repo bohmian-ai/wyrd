@@ -23,7 +23,7 @@ use argon2::password_hash::{PasswordHash, PasswordHasher as _, PasswordVerifier 
 use argon2::{Argon2, Params};
 use secrecy::{ExposeSecret as _, SecretString};
 use serde_json::json;
-use tokio::sync::Semaphore;
+use tokio::sync::{Semaphore, SemaphorePermit};
 use unicode_normalization::UnicodeNormalization as _;
 use uuid::Uuid;
 use wyrd_runtime::Permission;
@@ -182,7 +182,8 @@ pub enum PasswordCheck {
 }
 
 /// Check `password` against `verifier`, or against a dummy verifier when
-/// there is none, so an unknown user costs the same derivation.
+/// there is none, so an unknown user costs the same derivation, on the
+/// already acquired `permit`.
 ///
 /// # Errors
 /// Returns [`WyrdError::Internal`] when derivation cannot run.
@@ -190,11 +191,12 @@ pub enum PasswordCheck {
 /// # Panics
 /// Never in practice: only the dummy verifier's one-time derivation of a
 /// random secret uses `expect`, and baseline derivation cannot fail.
-pub async fn check_password(
+async fn check_password(
+    permit: SemaphorePermit<'static>,
     password: SecretString,
     verifier: Option<String>,
 ) -> Result<PasswordCheck, WyrdError> {
-    bounded(move || {
+    run(permit, move || {
         let known = verifier.is_some();
         let stored = verifier.unwrap_or_else(|| DUMMY_VERIFIER.clone());
         let Ok(parsed) = PasswordHash::new(&stored) else {
@@ -233,7 +235,29 @@ pub async fn check_password(
 async fn bounded<T: Send + 'static>(
     work: impl FnOnce() -> T + Send + 'static,
 ) -> Result<T, WyrdError> {
-    let permit = KDF.acquire().await.map_err(|_| kdf_failed())?;
+    run(capacity().await?, work).await
+}
+
+/// Wait for one process derivation permit.
+///
+/// Password checks take the permit before their admission read, so a
+/// comparison that queued here is admitted against the failure windows as
+/// they are when it may actually run.
+///
+/// # Errors
+/// Returns [`WyrdError::Internal`] when the semaphore is closed.
+async fn capacity() -> Result<SemaphorePermit<'static>, WyrdError> {
+    KDF.acquire().await.map_err(|_| kdf_failed())
+}
+
+/// Run `work` on the blocking pool, holding `permit` until it finishes.
+///
+/// # Errors
+/// Returns [`WyrdError::Internal`] when the blocking task fails.
+async fn run<T: Send + 'static>(
+    permit: SemaphorePermit<'static>,
+    work: impl FnOnce() -> T + Send + 'static,
+) -> Result<T, WyrdError> {
     tokio::task::spawn_blocking(move || {
         let _permit = permit;
         work()
@@ -507,8 +531,8 @@ impl BrowserSessions {
 
     /// Sign a local User in with username and password.
     ///
-    /// The tenant's account and source windows are checked before any
-    /// derivation; an unknown tenant, malformed or unknown username, missing
+    /// The tenant's account and source windows are checked once derivation
+    /// capacity is held, immediately before the comparison; an unknown tenant, malformed or unknown username, missing
     /// local credential, inactive User and wrong password all cost one
     /// derivation and give the one [`WyrdError::PasswordInvalid`] refusal,
     /// and each counts one failure in both windows. The admission read and
@@ -533,11 +557,12 @@ impl BrowserSessions {
             .await
             .map_err(store_error)?
         else {
-            check_password(password, None).await?;
+            check_password(capacity().await?, password, None).await?;
             return Err(password_invalid());
         };
         let username = canonical_username(&request.username).unwrap_or_default();
         let windows = Windows::new(&username, source);
+        let permit = capacity().await?;
         let stored = {
             let mut conn = postgres.tenant_conn(tenant).await.map_err(store_error)?;
             windows.admit(&mut conn).await?;
@@ -549,6 +574,7 @@ impl BrowserSessions {
             stored
         };
         let check = check_password(
+            permit,
             password,
             stored.as_ref().map(|row| row.password_hash.clone()),
         )
@@ -612,6 +638,7 @@ impl BrowserSessions {
         let current = presented_password(&request.current_password.into_secret_string())?;
         let replacement = new_password(&request.new_password.into_secret_string(), "new_password")?;
         let user_id = principal.id.as_uuid();
+        let permit = capacity().await?;
         let stored = {
             let mut conn = postgres
                 .tenant_conn(principal.tenant_id)
@@ -628,7 +655,7 @@ impl BrowserSessions {
             stored
         };
         let windows = Windows::new(&stored.username, source);
-        let check = check_password(current, Some(stored.password_hash.clone())).await?;
+        let check = check_password(permit, current, Some(stored.password_hash.clone())).await?;
         let mut conn = postgres
             .tenant_conn(principal.tenant_id)
             .await
@@ -786,7 +813,7 @@ mod tests {
     use wyrd_spec::error::WyrdError;
 
     use super::{
-        KDF, KDF_PERMITS, PasswordCheck, bounded, canonical_username, check_password,
+        KDF, KDF_PERMITS, PasswordCheck, bounded, canonical_username, capacity, check_password,
         hash_password, new_password,
     };
 
@@ -896,19 +923,124 @@ mod tests {
         let stored = hash_password(password.clone()).await.unwrap();
         assert!(stored.starts_with("$argon2id$v=19$m=19456,t=2,p=1$"));
         assert_eq!(
-            check_password(password.clone(), Some(stored.clone()))
-                .await
-                .unwrap(),
+            check_password(
+                capacity().await.unwrap(),
+                password.clone(),
+                Some(stored.clone())
+            )
+            .await
+            .unwrap(),
             PasswordCheck::Matched { rehash: None }
         );
         let wrong = SecretString::from("Incorrect Horse Battery".to_owned());
         assert_eq!(
-            check_password(wrong, Some(stored)).await.unwrap(),
+            check_password(capacity().await.unwrap(), wrong, Some(stored))
+                .await
+                .unwrap(),
             PasswordCheck::Refused
         );
         assert_eq!(
-            check_password(password, None).await.unwrap(),
+            check_password(capacity().await.unwrap(), password, None)
+                .await
+                .unwrap(),
             PasswordCheck::Refused
         );
+    }
+}
+
+/// Password admission against a real tenant store.
+#[cfg(test)]
+mod pg_tests {
+    use std::sync::Arc;
+
+    use secrecy::SecretString;
+    use wyrd_auth_issue::IssuingKey;
+    use wyrd_auth_oidc::ScreenedHttp;
+    use wyrd_auth_verify::Kid;
+    use wyrd_dev_fixtures::pg::PgFixture;
+    use wyrd_spec::TenantSlug;
+    use wyrd_spec::auth::{PasswordLoginRequest, SecretBearer};
+    use wyrd_spec::error::WyrdError;
+    use wyrd_sql::queries::auth::{AttemptScope, record_attempt_failure};
+
+    use super::{ACCOUNT_ATTEMPTS, KDF, KDF_PERMITS, create_local_user, hash_password};
+    use crate::audit::test_audit::RecordedAudit;
+    use crate::browser_sessions::BrowserSessions;
+    use crate::connections::HumanConnections;
+    use crate::issuance::{TenantTokenIssuer, TokenExchangeSettings};
+
+    /// A login queued behind full derivation capacity is admitted against
+    /// the account window as it is when capacity frees, so a window
+    /// exhausted while it waited refuses it before any comparison.
+    ///
+    /// # Panics
+    /// Panics when the fixture cannot be seeded or the queued login is not
+    /// refused for attempts.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn queued_logins_see_windows_exhausted_while_waiting() {
+        let fixture = PgFixture::start().await.expect("fixture starts");
+        let verifier = hash_password(SecretString::from("queued-user-password".to_owned()))
+            .await
+            .expect("verifier derives");
+        let mut conn = fixture.tenant_conn().await.expect("tenant conn opens");
+        create_local_user(&mut conn, "queued", &verifier, &[])
+            .await
+            .expect("user creates");
+        conn.commit().await.expect("user commits");
+        let audit = RecordedAudit::new();
+        let sessions = BrowserSessions::new(
+            TenantTokenIssuer::new(
+                Arc::new(
+                    IssuingKey::from_ed_pem(
+                        SecretString::from(
+                            "-----BEGIN PRIVATE KEY-----\nMC4CAQAwBQYDK2VwBCIEID78cHNjuFihX8aWPytQRoR2iUKHVXgdh92bcTcjQTYV\n-----END PRIVATE KEY-----\n",
+                        ),
+                        Kid::new("k1").expect("kid"),
+                        "wyrd",
+                    )
+                    .expect("key loads"),
+                ),
+                TokenExchangeSettings::default(),
+                Arc::clone(&audit) as _,
+            ),
+            HumanConnections::new(
+                fixture.wyrd_postgres().clone(),
+                None,
+                ScreenedHttp::allowing_internal(),
+                audit,
+            ),
+        );
+        let held = KDF
+            .acquire_many(u32::try_from(KDF_PERMITS).expect("permits fit"))
+            .await
+            .expect("capacity held");
+        let tenant = TenantSlug::new(fixture.tenant_slug()).expect("slug is valid");
+        let queued = tokio::spawn(async move {
+            sessions
+                .password_login(
+                    PasswordLoginRequest {
+                        tenant,
+                        username: "queued".to_owned(),
+                        password: SecretBearer::new("a-wrong-guess-1234".to_owned()),
+                    },
+                    None,
+                    "queued-request",
+                )
+                .await
+        });
+        let mut conn = fixture.tenant_conn().await.expect("tenant conn opens");
+        for _ in 0..ACCOUNT_ATTEMPTS {
+            record_attempt_failure(&mut conn, AttemptScope::Account, "queued")
+                .await
+                .expect("failure records");
+        }
+        conn.commit().await.expect("failures commit");
+        drop(held);
+        match queued.await.expect("login task joins") {
+            Err(WyrdError::PasswordAttempts { details, .. }) => {
+                assert!(details["retry_after_seconds"].as_u64() > Some(0));
+            }
+            other => panic!("queued login was not refused for attempts: {other:?}"),
+        }
     }
 }

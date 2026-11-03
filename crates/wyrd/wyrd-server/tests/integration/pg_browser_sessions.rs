@@ -991,7 +991,7 @@ async fn local_signup_login_and_password_lifecycle() {
         issued
             .headers
             .get(header::CACHE_CONTROL)
-            .map(|v| v.as_bytes()),
+            .map(axum::http::HeaderValue::as_bytes),
         Some(b"no-store".as_slice())
     );
     let code = issued.body["invitation_code"]

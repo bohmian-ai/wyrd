@@ -1,10 +1,39 @@
 ---
 id: SPEC-wyrd-ui-main-integration
-revision: 22
+revision: 23
 status: approved
 ---
 
 # Migrate the Wyrd UI onto current main
+
+## Revision 23 — Sorting and paging Observe lists
+
+**Approved by the caller on 2026-11-04.** A signal list read only its newest
+50 rows: Traces and Spans said "older traces not read" with no way to read
+them, and Logs paged only inside those rows. No column could be sorted.
+Conventional trace and log viewers sort on the server by a clicked column and
+page through the whole range.
+
+- **Header sort.** On Traces, Spans and Logs, clicking a sortable column
+  heading reads the range again ordered by that column, then event time
+  newest first, then the row's identity. A second click reverses the
+  direction; an empty value sorts last either way. The default stays newest
+  first. Sortable columns are the signal's default columns and its filter
+  columns, except trace and span ids; Traces-mode span and error counts are
+  read per visible row and are not sortable.
+- **Keyset pages.** Older and Newer read the next or previous page after the
+  first or last row shown, in the same order, so rows sharing a value or a
+  timestamp are never skipped or repeated. Offsets are not used: each read
+  sees the newest published data, so offset pages would shift. Logs' in-page
+  pager is replaced by these controls. The header keeps the range totals.
+- **URL state.** The sort and the page cursor live in the URL. Changing the
+  signal, range, WHERE or predicate returns to the first page.
+- **Filter-only WHERE.** The WHERE bar stays filter-only; an ORDER BY of the
+  reader's own goes in Query through "Open in Query".
+- **Authored SQL** sorts in the page, since the server refuses an authored
+  read past its row cap rather than truncating it, so shown rows are complete.
+- **No wire change.** Sorting and paging are SQL over the existing
+  `bifrost.query` path. Metric point lists are unchanged.
 
 ## Revision 22 — DEBUG logs show by default
 
@@ -1084,7 +1113,8 @@ not protocol authority.
   into WHERE, and include Workload (`workload_card_uid`) and Card
   (`subject_card_uid`), with nullable attribution preserved. These filter the
   list; opening an exact trace follows REQ-026's evidence-navigation rules.
-  There is no trace-summary table.
+  There is no trace-summary table. Traces, Spans and Logs lists sort on the
+  server by a clicked column and page with keyset cursors (revision 23).
   - Signal fields follow the upstream telemetry supplement and returned table
     descriptions. Keep resource-service/environment labels separate from Wyrd
     ownership, expose the new resource/URL/exception fields through applicable
@@ -2029,6 +2059,8 @@ review verdicts are not rewritten. A host lacking supported integration is a
 reported live-proof blocker, never an assumed capability or silent pass.
 
 ## Revision history and authorities
+
+- Revision 23 approved (2026-11-04): server-side header sorting and keyset Older/Newer paging for Traces, Spans and Logs, with the sort and cursor in the URL; WHERE stays filter-only; authored SQL sorts in the page.
 
 - Revision 22 approved (2026-11-04): REQ-048 corrected; DEBUG logs show by default and chart as their own level, since no default severity filter exists or is added.
 

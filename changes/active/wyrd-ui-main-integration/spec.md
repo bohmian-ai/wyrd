@@ -1,10 +1,223 @@
 ---
 id: SPEC-wyrd-ui-main-integration
-revision: 19
+revision: 20
 status: approved
 ---
 
 # Migrate the Wyrd UI onto current main
+
+## Revision 20 — A realistic development workload and plotted histograms
+
+**Approved by the caller on 2026-11-03,** as written: estimated percentiles are offered (open decision 1 resolved to the recommendation) and publishing `dev-workload` is authorized. This records scope approval, not implementation or visual acceptance. The caller asked for two things. First, the
+`dev:full` workload should exercise every span status (`unset`, `ok` and
+`error`) along with realistic production metrics and logs. Second, Observe
+should plot histograms as part of Task 004, using reusable
+`packages/ui` components that every UI host can use. Revision 19's approved
+decisions are unchanged unless this section amends them.
+
+### Problem
+
+The development workload is too clean to test Observe:
+
+- **Status.** Every span is `unset`. A 404 for an unknown order is not an
+  error under OpenTelemetry server semantics, so `ok` and `error` never appear.
+- **Provider.** MockServer answers every model call with an instant 200. There
+  are no provider failures, timeouts or latency variance, so error counts,
+  p95 and the slow-row highlight never show anything.
+- **Metrics.** Observe plots only gauges and sums (`PLOTTED` in the shared
+  metric loader). Histograms are only listed. Real latency metrics, such as
+  the standard `http.server.request.duration` and `gen_ai.client.*`
+  histograms and the app's `support_desk.ask.duration`, are histograms.
+- **Logs.** The app writes INFO lines and one WARN case. There is no ERROR or
+  exception, and the severity filter has nothing to hide.
+
+**Before:** the Errors chart is flat at zero, and every status pill reads
+`unset`. A histogram metric's chart says it is not plotted.
+
+**After:** the same 500-request batch yields known shares of `ok`, `unset` and
+`error` traces. Failed traces carry exception events and trace-correlated
+ERROR logs. The duration charts show a real latency spread with a slow tail.
+Selecting `http.server.request.duration` plots request rate, mean and
+estimated percentiles over time, plus the bucket distribution. The same Chart
+component and metric loader draw this in the conventional UI and in an MCP App
+view.
+
+### Required additions
+
+- **REQ-045 — Failures come from the provider, not the app.** MockServer
+  expectations owned by Wyrd's development fixtures answer the application's
+  chat request according to the order id in the ask. Reserved order ids select
+  the outcome:
+  - HTTP 500;
+  - HTTP 429 with `Retry-After: 1`;
+  - a 3 s delay, longer than the application's 2 s model-call timeout;
+  - a success. Successes are spread over a fixed set of delays (80, 150, 250
+    and 400 ms) by order id, and about 5% get a 1.2 s slow tail.
+
+  There is no randomness and no new marker. An order id is ordinary request
+  content, visible in Observe like any other ask. Expectations stay
+  repeatable under concurrency and across repeated `dev:batch` runs, as
+  REQ-037 requires. Judge and tool expectations are unchanged. Failing asks
+  produce no answer, so they never reach a judge.
+
+  The application's model client retries 500, 429 and timeouts twice, which
+  is the OpenAI client's default, and honors `Retry-After`. A failed request
+  therefore makes three provider calls. The gateway, provider identity,
+  credentials, capture and settlement keep their ordinary behavior. Unmatched
+  requests still fail visibly.
+- **REQ-046 — Span status follows OpenTelemetry semantics.** The root span of
+  each request is the ASGI server span:
+  - **`ok`:** set by the application on that span when it returns an answer.
+    The OTel spec reserves `ok` for an application's explicit success, which
+    instrumentation never sets.
+  - **`error`:** set by the instrumentation for a 5xx response. A model call
+    that fails after its retries, or times out, returns 502 or 504
+    respectively, and the application records the exception as an event on
+    its own ask span, which is also `error`.
+  - **`unset`:** everything else, such as `GET /openapi.json` and
+    unknown-order 404s, because the HTTP semantic conventions keep a server
+    span's 4xx `unset`.
+
+  Status never depends on verification results. Refund asks whose checks fail
+  stay `ok`, and Observe and Verify stay separate (REQ-028). The UI shows
+  recorded status and never infers it.
+- **REQ-047 — Realistic metrics.** The app opts in to the stable HTTP
+  semantic conventions, so the instrumentation emits
+  `http.server.request.duration` in seconds. The app also emits:
+  - its `support_desk.ask.duration` histogram;
+  - counters: asks by outcome, and provider failures by kind (one per failed
+    request, after retries);
+  - the existing in-flight gauge.
+
+  `gen_ai.client.*` histograms appear only if the installed instrumentation
+  emits them, and no acceptance depends on them. Metrics use the SDK's
+  ordinary providers and default (cumulative) temporality. Nothing is
+  fabricated or written directly to Bifrost.
+- **REQ-048 — Logs across severities.** The app writes:
+  - INFO for each answered request;
+  - WARN for each unknown order, and for each model call slower than 1 s;
+  - ERROR with exception type, message and stack trace for each failed
+    request;
+  - DEBUG detail, which the default UI severity filter hides.
+
+  Every record emitted inside a request carries its trace and span ids, so
+  Open trace works from any of them. No secret or credential is logged.
+- **REQ-049 — The batch reconciles outcomes.** The default mix keeps REQ-038's
+  500 requests at concurrency 8. It reserves 35 of the 400 shipping asks for
+  injected failures:
+
+  | Count | Request | Root status | HTTP |
+  |---|---|---|---|
+  | 365 | shipping ask, successful model calls | `ok` | 200 |
+  | 15 | shipping ask, provider 500 | `error` | 502 |
+  | 10 | shipping ask, provider 429 | `error` | 502 |
+  | 10 | shipping ask, provider timeout | `error` | 504 |
+  | 50 | refund ask (queued checks unchanged) | `ok` | 200 |
+  | 25 | unknown order | `unset` | 404 |
+  | 25 | `GET /openapi.json` | `unset` | 200 |
+
+  Smaller bounded runs scale every row proportionally and keep at least one of
+  each. Each batch tags its requests with its own batch id. For that batch id,
+  the report gives expected and observed counts of:
+  - root statuses;
+  - ERROR logs;
+  - slow-call WARN logs.
+
+  Counter reconciliation uses the difference between readings taken before
+  and after the batch, so repeated `dev:batch` runs against the same app
+  reconcile independently. Readback uses the existing public bounded waits.
+  Any mismatch, or any error outside the injected rows, fails the batch. This
+  replaces REQ-038's default mix and narrows its unexpected-error rule.
+- **REQ-050 — Observe plots explicit-bucket histograms.** Selecting a
+  histogram metric shows:
+  - its count rate and its mean (sum ÷ count) over time;
+  - p50, p95 and p99 estimated from the buckets;
+  - a bar chart of bucket counts over the applied range, with one categorical
+    bar per bucket, labeled by its bounds (for example, `0.25–0.5 s`).
+
+  Windows are the chart's existing time buckets for the applied range. For
+  each series and window, the loader works as follows:
+  - **Cumulative series:** use the increase between consecutive points. A
+    start-time change or a decreasing count is a reset, and the post-reset
+    point counts from zero.
+  - **Delta series:** sum the points.
+  - **Merging:** within a group, buckets merge only across series with
+    identical bounds, unit and temporality. Other series stay separate.
+
+  Percentiles use the conventional linear interpolation within the bucket
+  that holds the rank, as Prometheus `histogram_quantile` does. The first
+  bucket's lower bound is 0. A rank that falls in the unbounded last bucket
+  shows `≥` the last finite bound. A window with no counts is a gap.
+  Grouping and series selection keep the gauge and sum identity rules.
+  Exponential histograms and summaries stay listed, with a statement that
+  they are not plotted.
+
+  This replaces REQ-028's and REQ-039's "no percentiles" rule for
+  explicit-bucket histograms only. It still applies to summaries and to
+  every other metric kind. Span duration percentiles remain exact.
+- **REQ-051 — Reusable across hosts.** Histogram plots use the existing
+  `Chart` component:
+  - `timeseries` for rate, mean and percentiles;
+  - `bar`, which is categorical, for the distribution, so bucket widths that
+    are not uniform need no new chart form.
+
+  They are driven by the shared metric loader in `packages/ui`, through the
+  existing authenticated BFF/executor path. The page owns only host and layout
+  state. The conventional Metrics page, the gallery and the MCP App metrics
+  view render the same component from the same loader output. No new
+  component, `ChartInput` schema change, server service, table or wire
+  encoding is planned. If one proves necessary, it returns to this spec for
+  approval.
+
+### Delivery and ownership
+
+- **`bohmian-ai/wyrd-example-py`:** the application's status, logs and
+  metrics, the batch mix and the reconciliation. They are delivered on its
+  `dev-workload` branch. Wyrd pins one exact commit of that branch in place of
+  REQ-038's `03428e1a…` pin and its patch kept in this repository. Wyrd keeps
+  no copy of the example's code. `dev:full` clones the pinned commit, so the
+  branch must be published to the example repository.
+- **Wyrd:** only the MockServer expectations and the Observe histogram
+  support.
+- **Owner:** TASK-004-REV-03 owns all of it, including the conventional and
+  MCP App metric views, as revision 19 already assigns it the remaining
+  Observe and dev workflow obligations.
+
+### Invariants
+
+- **INV-008 — Injected failures are ordinary provider failures.** No
+  test-only header, mode, mock provider type or app branch decides an outcome.
+  Only the order id that MockServer matches does.
+- **INV-009 — No unlabeled estimate.** Every interpolated percentile, and
+  every `≥ bound` result, says "estimated" wherever it is shown: chart titles,
+  tooltips, summaries and agent-readable output. Exact values are never
+  labeled as estimates.
+
+### Non-goals
+
+- Exponential-histogram and summary plotting.
+- Random fault injection and chaos tooling.
+- Log-scale axes.
+- Changes to retained histogram encoding.
+- New Bifrost tables.
+
+### Acceptance for revision 20
+
+| Criterion | Required observation |
+|---|---|
+| AC-028 | A default `dev:full` batch reports expected and observed counts that match for every REQ-049 row, log class and counter; Observe shows `ok`, `unset` and `error` traces; each failed trace has an exception event and a linked ERROR log; a second `dev:batch` reconciles on its own batch id. |
+| AC-029 | Shared loader unit fixtures cover cumulative and delta temporality, resets, mismatched bounds, empty windows, interpolation and unbounded-bucket results. A live `http.server.request.duration` selection plots rate, mean, labeled estimated percentiles and the distribution. |
+| AC-030 | The same histogram plot renders from the same loader output on the conventional Metrics page and in the MCP App metrics view, in a real browser, in light and dark themes, with human visual acceptance. |
+
+### Resolved decisions
+
+1. **Estimated percentiles.** Resolved: offered. Recommended: offer them, labeled (REQ-050,
+   INV-009). The alternative is to plot only rate, mean and the distribution.
+   That keeps REQ-028's rule unchanged, removes the percentile clause of
+   REQ-050, INV-009 and AC-029, and leaves latency histograms without a p95.
+2. **Publishing `dev-workload`.** Resolved: authorized. A fresh `dev:full` needs that branch pushed
+   to `bohmian-ai/wyrd-example-py`. Approving this revision authorizes that
+   push.
 
 ## Revision 19 — Local humans, personal credentials and aligned Observe delivery
 
@@ -1793,6 +2006,8 @@ review verdicts are not rewritten. A host lacking supported integration is a
 reported live-proof blocker, never an assumed capability or silent pass.
 
 ## Revision history and authorities
+
+- Revision 20 approved (2026-11-03): realistic dev workload (provider-injected failures, OTel span status, production metrics and logs, reconciled batch), plotted explicit-bucket histograms through the shared Chart and metric loader for every UI host, and the example delivered as a pinned wyrd-example-py commit instead of a patch. Approved as written, with estimated percentiles and publication of dev-workload.
 
 - Revision19 draft (2026-11-02): proposed local signup/login, User-owned scoped
   personal keys, real seeded dev human and exact Observe alignment, based on

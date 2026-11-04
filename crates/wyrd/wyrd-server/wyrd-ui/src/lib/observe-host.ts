@@ -103,7 +103,7 @@ export function readState(params: Params): ObserveState {
     live: params.get('live') === '1',
     columns: Array.isArray(columns) && columns.every((each) => typeof each === 'string') ? columns : undefined,
     agg,
-    by: agg ? (params.get('by') ?? undefined) : undefined,
+    by: params.get('by') ?? undefined,
     points: signal === 'metrics' && params.get('points') === '1',
     trace: params.get('trace') ?? undefined,
     span: params.get('span') ?? undefined,
@@ -128,7 +128,7 @@ export function writeState(state: ObserveState): URLSearchParams {
   if (state.live) params.set('live', '1');
   if (state.columns) params.set('columns', JSON.stringify(state.columns));
   if (state.agg) params.set('agg', state.agg);
-  if (state.agg && state.by) params.set('by', state.by);
+  if (state.by) params.set('by', state.by);
   if (state.signal === 'metrics' && state.points) params.set('points', '1');
   if (state.trace) params.set('trace', state.trace);
   if (state.span) params.set('span', state.span);
@@ -181,7 +181,7 @@ export function listInputs(state: ObserveState) {
   const columns = chosen?.length ? chosen : undefined;
   const metric = state.signal === 'metrics' ? selectedMetric(state) : undefined;
   const by = state.by && (SIGNALS.metrics.filters as readonly string[]).includes(state.by) ? state.by : undefined;
-  const series: MetricInput | undefined = metric ? { metric, ...filter(state), ...(state.agg ? { aggregation: state.agg, ...(by ? { by } : {}) } : {}) } : undefined;
+  const series: MetricInput | undefined = metric ? { metric, ...filter(state), ...(state.agg ? { aggregation: state.agg } : {}), ...(by ? { by } : {}) } : undefined;
   return {
     filter: filter(state),
     facets: { signal, facets: [...FACETS[signal]], ...filter(state) },

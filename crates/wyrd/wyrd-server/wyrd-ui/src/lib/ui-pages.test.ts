@@ -4,6 +4,9 @@ import {
   loadRecordTable,
   loadStatStrip,
   listQuery,
+  bucketPercentile,
+  histogramQuery,
+  histogramWindows,
   metricQueries,
   validatePanel,
   wyrdProblem,
@@ -116,7 +119,7 @@ test('observe signal planning and interactions', async () => {
   const state = readState(shared);
   expect(readState(writeState(state))).toEqual(state);
   expect(readState(new URLSearchParams())).toMatchObject({ signal: 'traces', mode: 'traces', last: '1h', tz: 'utc', where: [], where_sql: '', live: false });
-  expect(readState(new URLSearchParams({ signal: 'nope', where: '{bad', columns: '[1]', by: 'unit' }))).toMatchObject({ signal: 'traces', where: [], columns: undefined, by: undefined });
+  expect(readState(new URLSearchParams({ signal: 'nope', where: '{bad', columns: '[1]' }))).toMatchObject({ signal: 'traces', where: [], columns: undefined, by: undefined });
   // The Metrics recorded-points inspector is reader-opened URL state; no other signal carries it.
   const inspecting = readState(new URLSearchParams({ signal: 'metrics', points: '1' }));
   expect(inspecting.points).toBe(true);
@@ -208,12 +211,82 @@ test('observe signal planning and interactions', async () => {
   expect(summed.identity).toEqual(['metric_type', 'unit', 'aggregation_temporality', 'is_monotonic', 'service_name']);
   expect(summed.chart.sql).toContain('CASE WHEN count(d) = 0 THEN max(i) END AS i, CASE WHEN count(d) > 0 THEN max(COALESCE(CAST(i AS DOUBLE), d)) END AS d');
   expect(() => metricQueries({ metric: 'm', where: [{ column: 'body_text', value: 'x' }] }, RANGE)).toThrow('body_text is not a metrics column');
-  expect(() => metricQueries({ metric: 'm', by: 'service_name' }, RANGE)).toThrow('needs an aggregation');
+  // Without an aggregation a gauge or sum keeps every recorded series; `by` groups only a histogram then.
+  expect(metricQueries({ metric: 'm', by: 'service_name' }, RANGE).identity).toEqual(each.identity);
+  expect(() => metricQueries({ metric: 'm', by: 'body_text' }, RANGE)).toThrow('body_text is not a metrics column');
   // The host plans a series only for one selected metric, with the aggregation and grouping the URL names.
   const metrics = readState(new URLSearchParams({ signal: 'metrics', where: JSON.stringify([{ column: 'metric_name', value: 'ui.requests' }]), agg: 'sum', by: 'service_name' }));
   expect(selectedMetric(metrics)).toBe('ui.requests');
   expect(groupColumns(metrics)).toContain('service_name');
   expect(listInputs(metrics).series).toEqual({ metric: 'ui.requests', where: [{ column: 'metric_name', value: 'ui.requests' }], aggregation: 'sum', by: 'service_name' });
   expect(listInputs({ ...metrics, agg: undefined, by: undefined }).series).toEqual({ metric: 'ui.requests', where: [{ column: 'metric_name', value: 'ui.requests' }] });
+  expect(listInputs({ ...metrics, agg: undefined }).series).toEqual({ metric: 'ui.requests', where: [{ column: 'metric_name', value: 'ui.requests' }], by: 'service_name' });
   expect(listInputs({ ...metrics, where: [] }).series).toBeUndefined();
+});
+
+test('histogram percentiles interpolate inside the bucket holding the rank', () => {
+  // Bounds 0.1, 0.5, 1 and an unbounded top bucket.
+  const bounds = [0.1, 0.5, 1];
+  // 10 counts: rank 5 of p50 falls in the second bucket, halfway through its 4 counts after 3 below.
+  expect(bucketPercentile(bounds, [3, 4, 2, 1], 50)).toEqual({ value: 0.1 + 0.4 * (2 / 4), atLeast: false });
+  // The first bucket starts at 0.
+  expect(bucketPercentile(bounds, [10, 0, 0, 0], 50)).toEqual({ value: 0.05, atLeast: false });
+  // A rank in the unbounded bucket reports its lower bound, at least.
+  expect(bucketPercentile(bounds, [0, 0, 1, 9], 99)).toEqual({ value: 1, atLeast: true });
+  expect(bucketPercentile([], [5], 50)).toBeUndefined();
+  expect(bucketPercentile(bounds, [0, 0, 0, 0], 50)).toBeUndefined();
+});
+
+test('histogram windows count cumulative increases, resets and delta points, merging only equal bounds', () => {
+  const range = { from: '2026-10-20T00:00:00Z', to: '2026-10-20T01:00:00Z' };
+  const read = (rows: unknown[][]) => ({
+    columns: ['at', 'started', 'metric_type', 'unit', 'aggregation_temporality', 'is_monotonic', 'resource', 'scope_name', 'scope_version', 'scope', 'attributes', 'count', 'sum', 'bounds', 'buckets'].map(
+      (name) => ({ name, data_type: 'Utf8', nullable: true })
+    ),
+    rows,
+    terminal: { outcome: 'success', row_count: rows.length, warnings: [] }
+  }) as never;
+  const point = (at: string, started: string, temporality: number, attributes: string, count: number, sum: number, bounds: number[], buckets: number[]) => [
+    `2026-10-20T00:${at}Z`, `2026-10-20T00:${started}Z`, 'histogram', 's', temporality, null, '{}', 'app', '', '{}', attributes, String(count), sum, bounds, buckets.map(String)
+  ];
+  const windows = histogramWindows(
+    read([
+      // A cumulative series that started inside the range counts its first point in full, then each increase.
+      point('00:30', '00:00', 2, '{"a":1}', 4, 0.8, [0.5, 1], [4, 0, 0]),
+      point('01:30', '00:00', 2, '{"a":1}', 6, 2.0, [0.5, 1], [4, 2, 0]),
+      // A changed start is a reset: the point counts from zero.
+      point('02:30', '02:00', 2, '{"a":1}', 1, 2.0, [0.5, 1], [0, 0, 1]),
+      // Another series of the same meaning and bounds merges into the same window.
+      point('00:40', '00:00', 2, '{"a":2}', 2, 0.2, [0.5, 1], [2, 0, 0]),
+      // Different bounds never merge; a delta point counts as recorded.
+      point('00:50', '00:00', 1, '{"a":3}', 1, 0.3, [0.25], [0, 1])
+    ]),
+    range
+  );
+  const rows = (result: { rows: readonly (readonly unknown[])[] }, series: string) => result.rows.filter((row) => row[1] === series).map((row) => [row[0], row[2]]);
+  // Two groups: the shared bounds and the other bounds, named apart.
+  expect(rows(windows.rate, 'per second · bounds 1')).toEqual([
+    ['2026-10-20T00:00:00.000Z', 6 / 60],
+    ['2026-10-20T00:01:00.000Z', 2 / 60],
+    ['2026-10-20T00:02:00.000Z', 1 / 60]
+  ]);
+  expect(rows(windows.latency, 'mean · bounds 1')[0]).toEqual(['2026-10-20T00:00:00.000Z', 1 / 6]);
+  expect(rows(windows.latency, 'p99 estimated · bounds 1').at(-1)).toEqual(['2026-10-20T00:02:00.000Z', 1]);
+  expect(windows.atLeast).toBe(true);
+  expect(windows.distribution.rows).toEqual([
+    ['bounds 1 ≤ 0.5', 6],
+    ['bounds 1 0.5–1', 2],
+    ['bounds 1 > 1', 1],
+    ['bounds 2 ≤ 0.25', 0],
+    ['bounds 2 > 0.25', 1]
+  ]);
+  // A cumulative series that started before the range has its first point as a baseline only.
+  const before = histogramWindows(read([point('00:30', '00:00', 2, '{}', 4, 0.8, [1], [4, 0]), point('01:30', '00:00', 2, '{}', 5, 1.0, [1], [4, 1])]), { from: '2026-10-20T00:00:10Z', to: '2026-10-20T01:00:00Z' });
+  expect(before.rate.rows.map((row) => row[2])).toEqual([1 / 60]);
+  expect(histogramWindows(read([]), range).latency.rows).toEqual([]);
+  // The read keeps only explicit-bucket histogram points of the metric and their exact bucket counts.
+  const sql = histogramQuery({ metric: 'm', by: 'service_name' }, range).sql;
+  expect(sql).toContain("metric_type = 'histogram'");
+  expect(sql).toContain('CAST(bucket_counts AS VARCHAR[]) AS buckets');
+  expect(sql).toContain('aggregation_temporality, is_monotonic, service_name');
 });

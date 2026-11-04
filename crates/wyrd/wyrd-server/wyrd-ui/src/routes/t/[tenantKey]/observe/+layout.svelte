@@ -313,7 +313,32 @@
         <a class="points" href={href({ ...closed(current), points: true })} aria-current={current.points ? 'true' : undefined}>Recorded points</a>
       </aside>
       <div class="main">
-        {#if view?.series}
+        {#if view?.series?.histogram && view.series.chart.result.state === 'empty'}
+          {@const histogram = view.series.histogram}
+          <div data-panel="series">
+            <Chart {...histogram.latency} note="Percentiles are estimated from the recorded buckets. Drag across the chart to zoom every Observe view to that window." {actions} onaction={onaction('Chart')}>
+              {#snippet heading()}
+                <div class="metric">
+                  <h2>{metric}</h2>
+                  <p class="type">{metricRow ? `${metricRow.type}${metricRow.unit ? ` · ${metricRow.unit}` : ''} · ` : ''}{histogram.latency.input.title?.replace(`${metric} · `, '')}</p>
+                </div>
+                <span class="choices">
+                  <label class="by">
+                    by
+                    <select aria-label="Group histogram by" value={current.by ?? ''} onchange={(event) => go({ ...closed(current), agg: undefined, by: event.currentTarget.value || undefined })}>
+                      <option value="">all series</option>
+                      {#each byColumns as column (column)}<option value={column}>{columnLabel(column)}</option>{/each}
+                    </select>
+                  </label>
+                </span>
+              {/snippet}
+            </Chart>
+          </div>
+          <div class="histogram">
+            <div data-panel="rate"><Chart {...histogram.rate} {actions} onaction={onaction('Chart')} /></div>
+            <div data-panel="distribution"><Chart {...histogram.distribution} {actions} onaction={onaction('Chart')} /></div>
+          </div>
+        {:else if view?.series}
           {@const series = view.series}
           <div data-panel="series">
             <Chart
@@ -719,6 +744,11 @@
     color: var(--muted);
     font: 11px var(--font-mono);
   }
+  .histogram {
+    display: grid;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    gap: 16px;
+  }
   .main {
     display: flex;
     flex-direction: column;
@@ -758,6 +788,9 @@
     text-decoration: none;
   }
   @media (max-width: 899px) {
+    .histogram {
+      grid-template-columns: minmax(0, 1fr);
+    }
     .split,
     .metrics {
       grid-template-columns: minmax(0, 1fr);

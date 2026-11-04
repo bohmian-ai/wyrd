@@ -1,10 +1,25 @@
 ---
 id: SPEC-wyrd-ui-main-integration
-revision: 20
+revision: 21
 status: approved
 ---
 
 # Migrate the Wyrd UI onto current main
+
+## Revision 21 — Histograms on the conventional Metrics page only
+
+**Approved by the caller on 2026-11-03.** Revision 20 assumed an MCP App
+metrics view. None exists: the `ui://wyrd/view` bundle renders only authored
+view documents, and the Wyrd MCP server does not yet serve that resource or
+any tool that returns a view document (step 4 of the delivery order). An MCP
+App histogram would need a new `ChartInput` variant for a surface no host can
+reach yet.
+
+- REQ-051 and AC-030 now cover the conventional Metrics page only.
+- MCP App histograms are deferred to the MCP App delivery (step 4), which
+  decides how a view document plots metrics. The shared histogram loader is
+  exported from `packages/ui` for that work; no `ChartInput` change is made now.
+- Everything else in revision 20 stands.
 
 ## Revision 20 — A realistic development workload and plotted histograms
 
@@ -39,8 +54,8 @@ The development workload is too clean to test Observe:
 ERROR logs. The duration charts show a real latency spread with a slow tail.
 Selecting `http.server.request.duration` plots request rate, mean and
 estimated percentiles over time, plus the bucket distribution. The same Chart
-component and metric loader draw this in the conventional UI and in an MCP App
-view.
+component and shared metric loader draw this in the conventional UI; MCP App
+histograms are deferred (revision 21).
 
 ### Required additions
 
@@ -163,8 +178,8 @@ view.
 
   They are driven by the shared metric loader in `packages/ui`, through the
   existing authenticated BFF/executor path. The page owns only host and layout
-  state. The conventional Metrics page, the gallery and the MCP App metrics
-  view render the same component from the same loader output. No new
+  state. The conventional Metrics page renders it from that loader output. MCP App
+  histograms are deferred to the MCP App delivery (revision 21). No new
   component, `ChartInput` schema change, server service, table or wire
   encoding is planned. If one proves necessary, it returns to this spec for
   approval.
@@ -179,8 +194,7 @@ view.
   branch must be published to the example repository.
 - **Wyrd:** only the MockServer expectations and the Observe histogram
   support.
-- **Owner:** TASK-004-REV-03 owns all of it, including the conventional and
-  MCP App metric views, as revision 19 already assigns it the remaining
+- **Owner:** TASK-004-REV-03 owns all of it, including the conventional metric view, as revision 19 already assigns it the remaining
   Observe and dev workflow obligations.
 
 ### Invariants
@@ -207,7 +221,7 @@ view.
 |---|---|
 | AC-028 | A default `dev:full` batch reports expected and observed counts that match for every REQ-049 row, log class and counter; Observe shows `ok`, `unset` and `error` traces; each failed trace has an exception event and a linked ERROR log; a second `dev:batch` reconciles on its own batch id. |
 | AC-029 | Shared loader unit fixtures cover cumulative and delta temporality, resets, mismatched bounds, empty windows, interpolation and unbounded-bucket results. A live `http.server.request.duration` selection plots rate, mean, labeled estimated percentiles and the distribution. |
-| AC-030 | The same histogram plot renders from the same loader output on the conventional Metrics page and in the MCP App metrics view, in a real browser, in light and dark themes, with human visual acceptance. |
+| AC-030 | The histogram plots render from the shared loader output on the conventional Metrics page, in a real browser, in light and dark themes, with human visual acceptance. |
 
 ### Resolved decisions
 
@@ -2006,6 +2020,8 @@ review verdicts are not rewritten. A host lacking supported integration is a
 reported live-proof blocker, never an assumed capability or silent pass.
 
 ## Revision history and authorities
+
+- Revision 21 approved (2026-11-03): REQ-051 and AC-030 narrowed to the conventional Metrics page; MCP App histograms deferred to the MCP App delivery because no MCP App metrics view or served `ui://wyrd/view` exists yet.
 
 - Revision 20 approved (2026-11-03): realistic dev workload (provider-injected failures, OTel span status, production metrics and logs, reconciled batch), plotted explicit-bucket histograms through the shared Chart and metric loader for every UI host, and the example delivered as a pinned wyrd-example-py commit instead of a patch. Approved as written, with estimated percentiles and publication of dev-workload.
 

@@ -17,7 +17,7 @@ set -Eeuo pipefail
 
 readonly root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 readonly repo=https://github.com/bohmian-ai/wyrd-example-py
-readonly base=49bba61725ae48586afb3b00afbb45acd27aa6cc
+readonly base=ee83b2559fb66a89b673786d3bcbe7e65cd26c17
 readonly app="$root/target/dev/wyrd-example-py"
 readonly port=${WYRD_EXAMPLE_PORT:-8000}
 

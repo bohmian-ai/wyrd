@@ -405,7 +405,7 @@
 </div>
 
 {#snippet keys()}
-  <!-- Up to three group keys: a promoted column, or one attributes., resource. or scope. key read on its own. -->
+  <!-- Up to three group keys: a promoted column, or one attributes., resource. or scope. key read on its own; the list offers the keys the metric's series record. -->
   <span class="by keys" role="group" aria-label="Group series by">
     by
     {#each current.by ?? [] as key (key)}
@@ -423,7 +423,7 @@
       >
         <input name="key" list="group-keys" placeholder="attributes.http.route" aria-label="Add a group key" />
       </form>
-      <datalist id="group-keys">{#each METRIC_GROUP_KEYS as key (key)}<option value={key}></option>{/each}</datalist>
+      <datalist id="group-keys">{#each view?.series?.keys ?? METRIC_GROUP_KEYS as key (key)}<option value={key}></option>{/each}</datalist>
     {/if}
   </span>
 {/snippet}

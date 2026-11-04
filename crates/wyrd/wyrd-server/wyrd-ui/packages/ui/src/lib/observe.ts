@@ -105,6 +105,17 @@ class Binds {
     return binds;
   }
 
+  /**
+   * Start a read of {@link SERIES_TABLE} with the hours `range` overlaps as
+   * `$1`/`$2`: a series row covers its whole hour, so the hour holding `from`
+   * is read too.
+   */
+  static hours(range: AbsoluteRange): Binds {
+    const binds = new Binds();
+    binds.clauses.push(`hour_unix_nano >= date_bin(INTERVAL '1 hour', ${binds.bind(range.from)}::timestamptz) AND hour_unix_nano < ${binds.bind(range.to)}::timestamptz`);
+    return binds;
+  }
+
   /** AND one server-normalized predicate; it binds nothing and names only the table's own columns. */
   predicate(sql: string | undefined): this {
     if (sql) this.clauses.push(`(${sql})`);
@@ -452,6 +463,8 @@ export interface MetricProps {
   readonly summary: Loaded<QueryResult>;
   /** Present when the metric records explicit-bucket histogram points in the range. */
   readonly histogram?: HistogramProps;
+  /** The keys offered to group by: the promoted columns, then the keys the metric's series record. */
+  readonly keys: readonly string[];
 }
 
 /**
@@ -517,20 +530,60 @@ export function metricQueries(input: MetricInput, range: AbsoluteRange, predicat
   return { identity: [...MEANING, ...(input.apart ? ['series'] : keys)], chart: { sql, params: binds.params } };
 }
 
+/** One metric's series in {@link SERIES_TABLE} over the hours `range` overlaps, under the WHERE and predicate. */
+function metricSeriesBinds(input: MetricInput, range: AbsoluteRange, predicate?: string): Binds {
+  const filters = SIGNALS.metrics.filters as readonly string[];
+  for (const { column } of input.where ?? []) if (!filters.includes(column)) throw new Error(`${column} is not a metrics column`);
+  const binds = Binds.hours(range);
+  binds.clauses.push(`metric_name = ${binds.bind(input.metric)}`);
+  return binds.where((input.where ?? []).filter(({ column, not }) => column !== 'metric_name' || not)).predicate(predicate);
+}
+
 /**
  * The recorded resource, scope and attributes of `series`, by `series_id`,
- * each as its JSON text from the series' newest point in the range: the only
- * read of whole attribute sets, and only for the plotted series.
+ * each as its JSON text from the series index's newest hour in the range:
+ * the only read of whole attribute sets for a chart, and only for the
+ * plotted series.
  */
 export function seriesLabelsQuery(input: MetricInput, range: AbsoluteRange, series: readonly string[], predicate?: string): Executed {
-  const { binds } = metricBinds({ ...input, apart: true }, range, PLOTTED, predicate);
+  const binds = metricSeriesBinds(input, range, predicate);
   binds.clauses.push(`series_id IN (${series.map((id) => `decode(${binds.bind(id)}, 'hex')`).join(', ')})`);
   return {
     sql:
       `SELECT encode(series_id, 'hex') AS series, to_json(resource_attributes) AS resource, scope_name, scope_version, to_json(scope_attributes) AS scope, to_json(attributes) AS attributes ` +
-      `FROM (SELECT *, row_number() OVER (PARTITION BY series_id ORDER BY ${SIGNALS.metrics.time} DESC) AS newest FROM ${SIGNALS.metrics.table} WHERE ${binds.sql}) WHERE newest = 1`,
+      `FROM (SELECT *, row_number() OVER (PARTITION BY series_id ORDER BY hour_unix_nano DESC) AS newest FROM ${SERIES_TABLE} WHERE ${binds.sql}) WHERE newest = 1`,
     params: binds.params
   };
+}
+
+/** Most series whose attribute sets suggest group keys. */
+const KEY_SAMPLE = 100;
+
+/** The attribute sets of at most {@link KEY_SAMPLE} of the metric's series in range, whose keys the view offers to group by. */
+export function groupKeysQuery(input: MetricInput, range: AbsoluteRange, predicate?: string): Executed {
+  const binds = metricSeriesBinds(input, range, predicate);
+  return {
+    sql: `SELECT to_json(attributes) AS attributes, to_json(resource_attributes) AS resource, to_json(scope_attributes) AS scope FROM ${SERIES_TABLE} WHERE ${binds.sql} LIMIT ${KEY_SAMPLE}`,
+    params: binds.params
+  };
+}
+
+/** The promoted group keys, then each `attributes.`, `resource.` or `scope.` key `read`'s sets record, once each and sorted. */
+function offeredKeys(read: QueryResult): readonly string[] {
+  const found = new Set<string>();
+  read.columns.forEach(({ name }, index) => {
+    for (const row of read.rows) {
+      if (typeof row[index] !== 'string') continue;
+      let set: unknown;
+      try {
+        set = JSON.parse(row[index]);
+      } catch {
+        continue;
+      }
+      if (set && typeof set === 'object' && !Array.isArray(set)) for (const key of Object.keys(set)) found.add(`${name}.${key}`);
+    }
+  });
+  return [...METRIC_GROUP_KEYS, ...[...found].sort()];
 }
 
 /** Rows one windowed plot reads: {@link MAX_SERIES} series or groups by the at most 201 windows a range spans. */
@@ -585,21 +638,23 @@ const SERIES_LABELS = ['resource', 'scope_name', 'scope_version', 'scope', 'attr
  * the plotted series. A refused predicate issues no read.
  */
 export async function loadMetric(input: MetricInput, context: LoadContext): Promise<MetricProps> {
-  const stopped = (state: Loaded<never>): MetricProps => ({ input, identity: [], summary: state, chart: { input: metricChart(input), result: state } });
+  const stopped = (state: Loaded<never>): MetricProps => ({ input, identity: [], summary: state, chart: { input: metricChart(input), result: state }, keys: METRIC_GROUP_KEYS });
   const range = rangeOf(input.range, context);
   if ('code' in range) return stopped({ state: 'error', problem: range });
   const predicate = await predicateFor(SIGNALS.metrics.table, input.where_sql, context);
   if ('state' in predicate) return stopped(predicate);
   let plan: ReturnType<typeof metricQueries>;
   let points: Executed;
+  let keyed: Executed;
   try {
     plan = metricQueries(input, range, predicate.sql);
     points = histogramQuery(input, range, predicate.sql);
+    keyed = groupKeysQuery(input, range, predicate.sql);
   } catch (error) {
     return stopped({ state: 'error', problem: inputProblem('Metric', { path: ['by'], message: (error as Error).message }) });
   }
-  const [chart, histogram] = await context.executor.run(
-    [query(plan.chart.sql, plan.chart.params, PLOT_ROWS, PLOT_BYTES), query(points.sql, points.params, PLOT_ROWS, PLOT_BYTES)],
+  const [chart, histogram, sampled] = await context.executor.run(
+    [query(plan.chart.sql, plan.chart.params, PLOT_ROWS, PLOT_BYTES), query(points.sql, points.params, PLOT_ROWS, PLOT_BYTES), query(keyed.sql, keyed.params, KEY_SAMPLE, PLOT_BYTES)],
     context.signal
   );
   let read = chart;
@@ -625,6 +680,8 @@ export async function loadMetric(input: MetricInput, context: LoadContext): Prom
     identity,
     chart: { input: { ...metricChart(input), title, sql: plan.chart.sql, range }, executed: plan.chart, result: read.ok ? loaded(read.value) : failed(read.problem) },
     summary: read.ok ? loaded(plottedSummary(read.value, identity)) : failed(read.problem),
+    // A failed sample offers the promoted columns alone; any key can still be typed.
+    keys: sampled.ok ? offeredKeys(sampled.value) : METRIC_GROUP_KEYS,
     ...(!histogram.ok ? { histogram: histogramProps(input, range, points, failed(histogram.problem)) } : histogram.value.rows.length ? { histogram: histogramProps(input, range, points, named(histogram.value, input.by ?? [])) } : {})
   };
 }
@@ -819,21 +876,25 @@ function histogramProps(input: MetricInput, range: AbsoluteRange, executed: Exec
   };
 }
 
+/** The metric series index: one row per series per hour it has points in, read wherever only series matter. */
+const SERIES_TABLE = 'bifrost.metrics.series';
+
 /** Most metric names the rail lists; one more is read to tell that more match. */
 export const METRIC_NAMES = 50;
 
 /**
- * The metrics the rail offers under the view's WHERE: name, type and unit of
- * each, by name, at most {@link METRIC_NAMES} plus one. `search` keeps names
- * holding it, ignoring case.
+ * The metrics the rail offers under the view's WHERE, read from the series
+ * index so its cost follows series, not points: name, type and unit of each,
+ * by name, at most {@link METRIC_NAMES} plus one. `search` keeps names
+ * holding it, ignoring case. The WHERE's columns are the series' own; a
+ * predicate naming a point-only column is refused by the server.
  */
 export function metricNamesQuery(where: readonly Filter[], range: AbsoluteRange, predicate?: string, search?: string): Executed {
-  const binds = Binds.over(SIGNALS.metrics.time, range);
+  const binds = Binds.hours(range);
   binds.where(where.filter(({ column }) => column !== 'metric_name')).predicate(predicate);
   if (search?.trim()) binds.clauses.push(`strpos(lower(metric_name), lower(${binds.bind(search.trim())})) > 0`);
-  // ponytail: scans the range's name columns; a metric-name catalog kept at ingest if that grows slow.
   return {
-    sql: `SELECT metric_name, metric_type, unit FROM ${SIGNALS.metrics.table} WHERE ${binds.sql} GROUP BY metric_name, metric_type, unit ORDER BY metric_name, metric_type, unit LIMIT ${METRIC_NAMES + 1}`,
+    sql: `SELECT metric_name, metric_type, unit FROM ${SERIES_TABLE} WHERE ${binds.sql} GROUP BY metric_name, metric_type, unit ORDER BY metric_name, metric_type, unit LIMIT ${METRIC_NAMES + 1}`,
     params: binds.params
   };
 }

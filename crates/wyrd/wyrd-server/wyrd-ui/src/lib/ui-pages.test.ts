@@ -1,7 +1,9 @@
 import { expect, test } from 'vitest';
 import {
   loadFacetRail,
+  loadMetric,
   loadMetricNames,
+  METRIC_GROUP_KEYS,
   METRIC_NAMES,
   loadRecordTable,
   loadStatStrip,
@@ -234,7 +236,8 @@ test('observe signal planning and interactions', async () => {
   expect(apart.chart.sql).not.toContain('g1');
   const labels = seriesLabelsQuery({ metric: 'm' }, RANGE, ['0a', '0b']);
   expect(labels.sql).toContain("series_id IN (decode($4, 'hex'), decode($5, 'hex'))");
-  expect(labels.sql).toContain('to_json(attributes) AS attributes FROM (SELECT *, row_number() OVER (PARTITION BY series_id ORDER BY time_unix_nano DESC) AS newest');
+  expect(labels.sql).toContain("to_json(attributes) AS attributes FROM (SELECT *, row_number() OVER (PARTITION BY series_id ORDER BY hour_unix_nano DESC) AS newest FROM bifrost.metrics.series WHERE hour_unix_nano >= date_bin(INTERVAL '1 hour', $1::timestamptz)");
+  expect(labels.sql).not.toContain('bifrost.metrics.points');
   expect(labels.params).toEqual([RANGE.from, RANGE.to, 'm', '0a', '0b']);
   // The host plans a series only for one selected metric, with the aggregation, keys or every-series view the URL names.
   const metrics = readState(new URLSearchParams({ signal: 'metrics', where: JSON.stringify([{ column: 'metric_name', value: 'ui.requests' }]), agg: 'sum', by: JSON.stringify(['service_name']) }));
@@ -306,12 +309,23 @@ test('the metric rail searches names on the server and reads at most one past it
   const [read] = calls;
   expect(read.op).toBe('bifrost.query');
   if (read.op !== 'bifrost.query') return;
-  expect(read.sql).toContain('service_name = $3 AND strpos(lower(metric_name), lower($4)) > 0');
+  // The rail reads the series index over the hours the range overlaps, never the points.
+  expect(read.sql).toContain("FROM bifrost.metrics.series WHERE hour_unix_nano >= date_bin(INTERVAL '1 hour', $1::timestamptz) AND hour_unix_nano < $2::timestamptz AND service_name = $3 AND strpos(lower(metric_name), lower($4)) > 0");
+  expect(read.sql).not.toContain('bifrost.metrics.points');
   expect(read.sql).not.toContain('metric_name = ');
   expect(read.sql).toMatch(new RegExp(`LIMIT ${METRIC_NAMES + 1}$`));
   expect(read.params).toEqual([RANGE.from, RANGE.to, 'checkout', 'Duration']);
   expect(read.max_rows).toBe(METRIC_NAMES + 1);
   expect(loaded).toMatchObject({ state: 'empty', reason: 'No metric names hold “Duration”.' });
+});
+
+test('group keys are offered from at most 100 of the metric series index rows', async () => {
+  const sets = { columns: ['attributes', 'resource', 'scope'].map((name) => ({ name, data_type: 'Utf8', nullable: true })), rows: [['{"http.route":"/a","code":200}', '{"host.name":"h"}', null], ['{"http.route":"/b"}', 'not json', '[1]']], terminal: EMPTY.terminal };
+  const { executor, calls } = recording((request) => ({ ok: true, value: request.op === 'bifrost.query' && request.sql.includes('LIMIT 100') ? sets : EMPTY }) as never);
+  const loaded = await loadMetric({ metric: 'm' }, { executor, range: RANGE });
+  const sample = calls.find((call) => call.op === 'bifrost.query' && call.sql.includes('LIMIT 100'));
+  expect(sample?.op === 'bifrost.query' && sample.sql).toContain("FROM bifrost.metrics.series WHERE hour_unix_nano >= date_bin(INTERVAL '1 hour', $1::timestamptz) AND hour_unix_nano < $2::timestamptz AND metric_name = $3");
+  expect(loaded.keys).toEqual([...METRIC_GROUP_KEYS, 'attributes.code', 'attributes.http.route', 'resource.host.name']);
 });
 
 test('histogram percentiles interpolate inside the bucket holding the rank', () => {

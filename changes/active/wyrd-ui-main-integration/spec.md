@@ -1,10 +1,180 @@
 ---
 id: SPEC-wyrd-ui-main-integration
-revision: 23
+revision: 24
 status: approved
 ---
 
 # Migrate the Wyrd UI onto current main
+
+## Revision 24 — Metrics that stay fast at production volume
+
+**Approved by the caller on 2026-11-04**, with SHA-256 as the hash.
+
+### Problem
+
+The Metrics page is slow on a few thousand points, and it gets slower as data
+grows. The cause is how it reads, not the build:
+
+- **It reads every point's full attribute sets.** A point's `attributes`,
+  `resource_attributes` and `scope_attributes` are Variants, stored shredded:
+  each key is its own column. To tell series apart, the chart groups by the
+  whole Variant, so Bifrost rebuilds all three sets for every point. That takes
+  0.7–0.9 s per 42,000 points. Reading one key with
+  `variant_get(attributes, 'http.route', 'Utf8')` reads only that key's column,
+  in about 0.2 s for the same points. Histogram charts take 2.5–3.4 s.
+- **It splits every series by default.** A series is all the points of one
+  metric that share the same resource, scope and attributes. For example, one
+  service instance's `http.server.request.duration` for
+  `GET /users 200` is one series, and the same metric for `POST /users 500` is
+  another. One service can have thousands of series per metric. The page plots
+  up to 20 of them apart and reads labels for up to 1,000, so the read grows
+  with the number of series.
+- **No column names a series.** Counter and histogram points are often
+  cumulative: each point holds the running total since the process started.
+  To chart a rate, the page must subtract each point from the previous point
+  of the *same series*, then add the series together. Bifrost has no series
+  column, so the page can only find a point's series by comparing all three
+  attribute sets, which is the expensive read above.
+- **The rail lists every metric.** The left rail lists up to 500 metric names
+  across all services in the range, with no search. A team with a few hundred
+  services has tens of thousands of metric names.
+
+Conventional metric tools (Prometheus, Grafana, Datadog) default to one line per
+metric, aggregated across series. A user splits it by chosen labels and asks
+for raw series only on purpose. They also identify each series with a stored
+id, computed once at ingest.
+
+### Before and after
+
+Before: opening `http.server.request.duration` for one service reads every
+point's three attribute sets, builds up to 20 lines and a 1,000-row label
+summary, and takes about 3 s.
+
+After: the page reads the metric's value columns plus `series_id` and draws
+the request rate, mean and p50/p95/p99 across all series, one line each.
+Choosing "Group by `attributes.http.route`" adds
+`variant_get(attributes, 'http.route', 'Utf8')` to the read and draws one line
+per route, at most 20. Rows read grow with the
+points in range; no attribute set is rebuilt.
+
+### Terms
+
+- **WHERE** is the Observe filter bar's list of column filters (for example
+  `service_name = checkout` or a Card's `subject_name`) plus its optional
+  predicate. Every read on the page applies it.
+- **Measure** is the value that ranks groups and series: the increase for
+  monotonic sums and histogram counts, the sum for delta sums, and the mean of
+  the windows' values for gauges and non-monotonic sums. "Largest" means the
+  largest measure over the whole range.
+
+### Required changes
+
+- **REQ-052 — Aggregate by default.** A selected metric is aggregated across
+  its series by default, and the page states the aggregation it applied:
+  - **Monotonic sums:** each series' increase per window (REQ-050's reset
+    rule), added across series and shown as a rate.
+  - **Non-monotonic sums and gauges:** each series' last value per window, then
+    the sum across series for sums and the mean across series for gauges.
+  - **Delta sums:** the points are added up.
+  - **Histograms:** REQ-050's plots, computed across series.
+
+  REQ-050's merge rule still applies. Series with different bounds, unit or
+  temporality are separate groups, so a default view may hold more than one
+  group.
+- **REQ-053 — Group by chosen keys.** "Group by" takes up to three keys at
+  once, each named with its source:
+  - every promoted column of the table, such as `service_name`,
+    `service_instance_id`, `deployment_environment` and `scope_name`;
+  - `attributes.<key>`, `resource.<key>` or `scope.<key>`.
+
+  A Variant key is read on that key alone with `variant_get`, as its text form
+  (an integer as its decimal digits, a boolean as `true` or `false`). A point
+  without the key falls in an `(absent)` group. Key suggestions come from the
+  attribute sets of at most 200 of the metric's newest points in range; a
+  reader can also type a key. The 20 groups with the largest measure are
+  plotted, and the title says how many groups there were in all.
+- **REQ-054 — Every series, on request.** "Every series apart" is an opt-in
+  view. It plots the 20 series with the largest measure. It names how many
+  series there were in all, by counting distinct `series_id`. Full attribute
+  sets are read only for the points of those 20 series, selected by
+  `series_id`, and never for more than those 20.
+- **REQ-055 — A searched, scoped rail.** The rail lists metrics only under the
+  WHERE. Each entry is one name, type and unit, as today. A search box filters
+  names on the server, case-insensitively by substring, as the reader types.
+  The rail shows at most 50 entries, in name order. If more match, it says
+  "More than 50 match — type to narrow". It never lists all metrics.
+- **REQ-056 — A stored series id.** `bifrost.metrics.points` gains
+  `series_id`, a nullable `FixedSizeBinary(16)` column with a Bloom filter.
+  Bifrost computes it once per point at admission, from the point's series
+  identity:
+  - metric name, metric type, unit, aggregation temporality and monotonicity;
+  - histogram explicit bounds;
+  - resource attributes;
+  - scope name, scope version and scope attributes;
+  - point attributes.
+
+  Description, `metadata`, schema URLs, `resource_entity_refs`, exemplars,
+  flags, values and times are not part of it.
+
+  The id is the first 16 bytes of SHA-256 over this encoding:
+  - a version byte `1`, then each identity field in the order listed above;
+  - each field as a one-byte type tag, followed by a big-endian `u32` byte
+    length and the bytes;
+  - an absent value as the null tag with length 0;
+  - attribute sets as objects whose keys are sorted bytewise at every depth,
+    with arrays kept in order;
+  - integers as big-endian `i64`;
+  - floats as IEEE-754 bits, with `-0.0` written as `0.0` and every NaN written
+    as one canonical NaN.
+
+  The same identity therefore gives the same id on every replica, platform,
+  tenant and release. A new encoding takes a new version byte. Admission always
+  computes the column and overwrites any `series_id` a raw Arrow writer
+  supplies; OTLP has no such field. The id is not a security boundary.
+  Points stored before this column carry null.
+- **REQ-057 — Series id in the charts.** Every per-series step groups by
+  `series_id`: last values, increases, resets and the top-20 choice. Points
+  without one are left out of the chart, and the page says how many were left
+  out. Grouping them by fewer fields would merge different series and make the
+  increases wrong. REQ-050's reset rule applies only to monotonic sums and
+  histogram counts.
+
+### Constraints and invariants
+
+- No Metrics read rebuilds a whole attribute set except REQ-054's read for at
+  most 20 series and REQ-053's 200-point key sample.
+- Every Metrics read keeps an explicit ceiling: 20 groups × 201 windows of
+  rows, and 16 MiB. Hitting a ceiling shows the in-chart error naming it, never
+  a partial chart.
+- Exactness rules of REQ-028, REQ-039 and REQ-050 stand: no percentiles except
+  explicit-bucket estimates, absent is not zero, and integer precision is
+  preserved.
+- `series_id` is part of the built-in table schema in
+  `architecture/bifrost-design.md`, which is updated with the implementation.
+  Adding it is an Iceberg schema evolution with a new field id. Existing files
+  read it as null. No file is rewritten and no backfill runs.
+- Bloom pruning for `series_id IN (…)` lists of 4 or more values depends on the
+  Bifrost IN-list fix that is being investigated separately. Until it lands,
+  REQ-054's 20-id read scans the range's point files for that metric.
+
+### Non-goals and known limits
+
+- The rail still scans the range's `metric_name`, `metric_type` and `unit`
+  columns to list names. A metric-name catalog maintained at ingest is the
+  upgrade path if that scan becomes slow. It is not in this revision.
+- No new table, service, wire encoding or `ChartInput` change. Exponential
+  histograms and summaries remain listed and not plotted.
+
+### Acceptance
+
+| ID | Situation | Expected observation |
+|---|---|---|
+| AC-031 | Open a sum, a gauge and a histogram with default settings | Each is aggregated across its series, and the aggregation is stated. No read touches a whole attribute set: the SQL has no `to_json` and no bare Variant column. |
+| AC-032 | Group a histogram by `http.route`; then choose "every series apart" | At most 20 lines each; the titles state the totals; labels are read only for the 20 plotted series. |
+| AC-033 | Type in the rail's search under a service WHERE | Only that service's matching names, at most 50, with the "more" notice when more match. |
+| AC-034 | Ingest the same series twice, across server restarts and replicas, with attribute keys in a different order | Identical `series_id`; a changed attribute value or bound gives a different id; a `series_id` sent by a raw Arrow writer is overwritten. |
+| AC-035 | A range spanning points from before and after the column | New points chart correctly; old points are left out and counted in the notice. |
+| AC-036 | Live dev data over 24 hours, in a real browser, in light and dark themes | Every Metrics read (rail, default chart, group by, every series) returns within 500 ms on the server, with times and rows read recorded in the task evidence, and the human accepts it visually. |
 
 ## Revision 23 — Sorting and paging Observe lists
 
@@ -2060,6 +2230,7 @@ reported live-proof blocker, never an assumed capability or silent pass.
 
 ## Revision history and authorities
 
+- Revision 24 approved (2026-11-04): Metrics aggregate by default, group by chosen keys read with `variant_get`, opt-in capped every-series view, a server-searched rail scoped to the WHERE, and a server-computed `series_id` column with a Bloom on `bifrost.metrics.points`, hashed with SHA-256.
 - Revision 23 approved (2026-11-04): server-side header sorting and keyset Older/Newer paging for Traces, Spans and Logs, with the sort and cursor in the URL; WHERE stays filter-only; authored SQL sorts in the page.
 
 - Revision 22 approved (2026-11-04): REQ-048 corrected; DEBUG logs show by default and chart as their own level, since no default severity filter exists or is added.

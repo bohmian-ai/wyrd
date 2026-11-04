@@ -1285,7 +1285,7 @@ fn with_runs(rows: &RecordBatch, runs: &[&str]) -> RecordBatch {
 }
 
 /// `tenant`'s rows of metrics `table` over the hours `first_hour_nanos`
-/// through `last_hour_nanos`, each as its hex `series_id` then its `run_id`,
+/// through `last_hour_nanos`, read from writer `epoch`'s stream, each as its hex `series_id` then its `run_id`,
 /// `deployment_environment`, `service_name` and `workload_card_uid`, sorted.
 ///
 /// # Panics
@@ -1296,6 +1296,7 @@ async fn series_contexts(
     tenant: DataTenantId,
     table: &str,
     (first_hour_nanos, last_hour_nanos): (u64, u64),
+    epoch: i64,
 ) -> Vec<(String, [Option<String>; 4])> {
     const CONTEXT: [&str; 4] = [
         "run_id",
@@ -1319,7 +1320,7 @@ async fn series_contexts(
                 TableRef::new(BifrostNamespace::Metrics, table),
             ))
             .expect("binding"),
-            target_stream: StreamIdentity::new(NodeId::new(Uuid::nil()), WriterEpoch::new(1)),
+            target_stream: StreamIdentity::new(NodeId::new(Uuid::nil()), WriterEpoch::new(epoch)),
             start_partition: hour(first_hour_nanos),
             end_partition: hour(last_hour_nanos),
             required_fields: crate::scribe::tail_rpc::tests::named_fields(
@@ -1457,11 +1458,11 @@ async fn a_series_has_one_row_per_accepted_context_in_an_hour() {
     ];
     expected.sort();
     assert_eq!(
-        series_contexts(&scribe, tenant, "series", (at, at)).await,
+        series_contexts(&scribe, tenant, "series", (at, at), 1).await,
         expected,
         "one series row per context, none for a repeated context"
     );
-    let mut points = series_contexts(&scribe, tenant, "points", (at, at)).await;
+    let mut points = series_contexts(&scribe, tenant, "points", (at, at), 1).await;
     points.dedup();
     assert_eq!(
         points, expected,
@@ -1522,6 +1523,189 @@ async fn a_failed_series_admission_fails_the_points_admission() {
             .await
             .len(),
         4
+    );
+    scribe
+        .shutdown(std::time::Instant::now() + std::time::Duration::from_secs(1))
+        .await;
+}
+
+/// Drives `ingest` until the WAL under `wal_dir` holds a terminal commit for
+/// metrics `table`'s batch `batch_id`, then drops it unanswered, as a crash
+/// would.
+///
+/// # Panics
+///
+/// Panics when the WAL cannot be read or `ingest` answers first.
+async fn crash_once_durable(
+    wal_dir: &std::path::Path,
+    table: &str,
+    batch_id: Option<Uuid>,
+    ingest: impl std::future::Future<Output = Result<crate::contracts::FrameAdmission, ScribeError>>,
+) {
+    let durable = || {
+        crate::scribe::replay::replay_wal_directory(wal_dir)
+            .expect("read the WAL")
+            .values()
+            .any(|state| {
+                state.seal_key.table.name == table
+                    && !state.commits.is_empty()
+                    && batch_id.is_none_or(|batch_id| {
+                        state
+                            .append_metas
+                            .iter()
+                            .any(|meta| meta.append_slice_id.batch_id == batch_id)
+                    })
+            })
+    };
+    tokio::pin!(ingest);
+    while !durable() {
+        tokio::select! {
+            biased;
+            result = &mut ingest => panic!("the held admission answered: {result:?}"),
+            () = tokio::task::yield_now() => {}
+        }
+    }
+}
+
+/// One embedded Scribe at writer `epoch` over the WAL under `wal_dir`, after
+/// ordinary WAL replay; a restart is the next epoch over the same directory.
+///
+/// # Panics
+///
+/// Panics when the WAL writer cannot be built or replay fails.
+async fn restarted_scribe(wal_dir: &std::path::Path, epoch: i64) -> (Arc<WalWriter>, ScribeImpl) {
+    let wal = Arc::new(
+        WalWriter::new(
+            wal_dir,
+            *Uuid::nil().as_bytes(),
+            epoch,
+            WalConfig::default(),
+        )
+        .expect("WAL writer"),
+    );
+    let operator = Arc::new(object_store::memory::InMemory::new());
+    let scribe = ScribeImpl::new_for_embedded_with_deps(
+        operator,
+        Arc::clone(&wal),
+        &Uuid::nil().to_string(),
+        epoch,
+    );
+    scribe
+        .replay_wal_async()
+        .await
+        .expect("ordinary WAL replay");
+    (wal, scribe)
+}
+
+/// A process that stops after a points batch's series rows are durable,
+/// before its points are dispatched, recovers the series row and no point
+/// through ordinary WAL replay, and the writer's retry of that batch is
+/// admitted with every point indexed by its series row.
+///
+/// The WAL's post-sync fault holds the series admission past its durable
+/// commit, unanswered, where the process is dropped without shutdown.
+///
+/// # Panics
+///
+/// Panics when the held admission answers, replay fails, a point is
+/// recovered, the series row is not, or the retry is refused or leaves a
+/// point without its series row for its hour and context.
+#[tokio::test]
+async fn a_stop_after_durable_series_rows_recovers_them_and_admits_the_retry() {
+    let temp_dir = TempDir::new().expect("WAL temp dir");
+    let tenant = DataTenantId::new_v7();
+    let at = FIXTURE_POINT_TIME_NANOS;
+    let rows = with_runs(&projected_metric_batch_at(at), &["run-a"; 4]);
+    let batch_id = Uuid::now_v7();
+
+    let (wal, scribe) = restarted_scribe(temp_dir.path(), 1).await;
+    wal.trip_post_sync_failure_for_test();
+    crash_once_durable(
+        temp_dir.path(),
+        "series",
+        None,
+        Scribe::ingest_frame(&scribe, points_frame(tenant, batch_id, &rows, true)),
+    )
+    .await;
+    drop((scribe, wal));
+
+    let (_wal, scribe) = restarted_scribe(temp_dir.path(), 2).await;
+    let series = series_contexts(&scribe, tenant, "series", (at, at), 2).await;
+    assert_eq!(series.len(), 1, "the durable series row is recovered");
+    assert!(
+        series_contexts(&scribe, tenant, "points", (at, at), 2)
+            .await
+            .is_empty(),
+        "no point was dispatched"
+    );
+    Scribe::ingest_frame(&scribe, points_frame(tenant, batch_id, &rows, true))
+        .await
+        .expect("the writer's retry of the interrupted batch is admitted");
+    let points = series_contexts(&scribe, tenant, "points", (at, at), 2).await;
+    assert_eq!(points.len(), 4, "the retried points are durable");
+    assert!(
+        points.iter().all(|point| series.contains(point)),
+        "every point has its series row for its hour and context"
+    );
+    assert_eq!(
+        series_contexts(&scribe, tenant, "series", (at, at), 2).await,
+        series,
+        "the retry adds no second series row"
+    );
+    scribe
+        .shutdown(std::time::Instant::now() + std::time::Duration::from_secs(1))
+        .await;
+}
+
+/// A process that stops after points are durable but before they are
+/// answered recovers them through ordinary WAL replay, each with its series
+/// row for its hour and context.
+///
+/// The first batch is answered with its series row; the WAL's post-sync
+/// fault then holds a later batch of the same series past its durable commit,
+/// unanswered, where the process is dropped without shutdown.
+///
+/// # Panics
+///
+/// Panics when the held admission answers, replay fails, the unanswered
+/// points are not recovered, or a recovered point lacks its series row.
+#[tokio::test]
+async fn a_stop_after_durable_unanswered_points_recovers_every_point_indexed() {
+    let temp_dir = TempDir::new().expect("WAL temp dir");
+    let tenant = DataTenantId::new_v7();
+    let at = FIXTURE_POINT_TIME_NANOS;
+    let (rows, later) = (
+        with_runs(&projected_metric_batch_at(at), &["run-a"; 4]),
+        with_runs(&projected_metric_batch_at(at + 100), &["run-a"; 4]),
+    );
+    let unanswered = Uuid::now_v7();
+
+    let (wal, scribe) = restarted_scribe(temp_dir.path(), 1).await;
+    Scribe::ingest_frame(&scribe, points_frame(tenant, Uuid::now_v7(), &rows, true))
+        .await
+        .expect("the first batch and its series row are durable");
+    wal.trip_post_sync_failure_for_test();
+    crash_once_durable(
+        temp_dir.path(),
+        "points",
+        Some(unanswered),
+        Scribe::ingest_frame(&scribe, points_frame(tenant, unanswered, &later, true)),
+    )
+    .await;
+    drop((scribe, wal));
+
+    let (_wal, scribe) = restarted_scribe(temp_dir.path(), 2).await;
+    let series = series_contexts(&scribe, tenant, "series", (at, at), 2).await;
+    let points = series_contexts(&scribe, tenant, "points", (at, at), 2).await;
+    assert_eq!(series.len(), 1, "the series row is recovered");
+    assert_eq!(
+        points.len(),
+        8,
+        "the answered and the unanswered points are recovered"
+    );
+    assert!(
+        points.iter().all(|point| series.contains(point)),
+        "every recovered point has its series row for its hour and context"
     );
     scribe
         .shutdown(std::time::Instant::now() + std::time::Duration::from_secs(1))

@@ -2,7 +2,7 @@ import { fail, redirect } from '@sveltejs/kit';
 import { SIGNALS, loadPanel, type Problem, type RecordDetailProps, type TraceWaterfallProps } from 'wyrd-ai-ui/loaders';
 import { nodeExecutor } from 'wyrd-ai-ui/node';
 import { reject } from '$lib/server/auth/session';
-import { DETAIL_PARAMS, closed, listSignal, readState, writeState } from '$lib/observe-host';
+import { DETAIL_PARAMS, closed, listSignal, moved, readState, writeState } from '$lib/observe-host';
 import type { Actions, PageServerLoad } from './$types';
 
 /**
@@ -43,7 +43,7 @@ export const actions: Actions = {
     const form = await request.formData();
     const draft = String(form.get('where_sql') ?? '');
     const state = closed(readState(url.searchParams));
-    if (!draft.trim()) redirect(303, `${url.pathname}?${writeState({ ...state, where_sql: '' })}`);
+    if (!draft.trim()) redirect(303, `${url.pathname}?${writeState(moved(state, { ...state, where_sql: '' }))}`);
     const table = SIGNALS[listSignal(state)].table;
     const at = table.lastIndexOf('.');
     const [result] = await nodeExecutor(session.client()).run(
@@ -51,6 +51,6 @@ export const actions: Actions = {
       request.signal
     );
     if (!result.ok) return fail(result.problem.status ?? 400, { draft, problem: result.problem });
-    redirect(303, `${url.pathname}?${writeState({ ...state, where_sql: result.value.expression })}`);
+    redirect(303, `${url.pathname}?${writeState(moved(state, { ...state, where_sql: result.value.expression }))}`);
   }
 };

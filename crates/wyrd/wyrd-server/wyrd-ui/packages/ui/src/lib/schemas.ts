@@ -166,6 +166,39 @@ export function signalColumns(signal: Signal): readonly string[] {
   return [...new Set([...SIGNALS[signal].columns, ...SIGNALS[signal].filters, ...SIGNALS[signal].more])];
 }
 
+/** Columns that order a list's rows sharing the sort value and event time: each row's identity. A metric point list has none and is not sorted or paged. */
+export const TIES: Record<Signal, readonly string[]> = {
+  traces: ['trace_id', 'span_id'],
+  spans: ['trace_id', 'span_id'],
+  logs: ['observed_time_unix_nano', 'wyrd_request_id'],
+  metrics: []
+};
+
+/** Columns a list of `signal` sorts by on the server: its default and filter columns but its ids. */
+export function sortColumns(signal: Signal): readonly string[] {
+  if (!TIES[signal].length) return [];
+  return [...new Set<string>([...SIGNALS[signal].columns, ...SIGNALS[signal].filters])].filter((column) => !(IDS as readonly string[]).includes(column));
+}
+
+/** A list's server order: one sortable column and its direction; absent, event time newest first. */
+export const ListSortSchema = z.object({ column: z.string().min(1), desc: z.boolean() }).strict();
+export type ListSort = z.infer<typeof ListSortSchema>;
+
+/** The list's applied order: the sort, else event time newest first. */
+export function listSort(signal: Signal, sort?: ListSort): ListSort {
+  return sort ?? { column: SIGNALS[signal].time, desc: true };
+}
+
+/** The columns a page cursor holds, in order: the sort column, event time, then the ties. */
+export function cursorColumns(signal: Signal, sort?: ListSort): readonly string[] {
+  const { column } = listSort(signal, sort);
+  const time = SIGNALS[signal].time;
+  return [...(column === time ? [] : [column]), time, ...TIES[signal]];
+}
+
+/** One page cursor: the cursor columns' values of the row a page starts after or ends before. */
+const cursor = z.array(queryParam).min(1).max(8);
+
 /** One WHERE clause: a column equal to a bound value, or with `not`, distinct from it. A null value matches an unset column. */
 export const FilterSchema = z.object({ column: z.string().min(1), value: queryParam, not: z.boolean().optional() }).strict();
 
@@ -224,11 +257,21 @@ export const RecordTableInputSchema = z.union([
       where: where.optional(),
       where_sql: whereSql.optional(),
       columns: z.array(z.string().min(1)).min(1).max(24).optional(),
+      sort: ListSortSchema.optional(),
+      after: cursor.optional(),
+      before: cursor.optional(),
       ...listFields
     })
     .strict()
     .superRefine((input, context) => {
       const columns = signalColumns(input.signal);
+      if (input.sort) knownColumns(input.signal, [input.sort.column], sortColumns(input.signal), ['sort', 'column'], context);
+      if (input.after && input.before) context.addIssue({ code: 'custom', path: ['before'], message: 'a page reads after or before one row, not both' });
+      const page = input.after ? 'after' : 'before';
+      const keys = input.after ?? input.before;
+      if (keys && !TIES[input.signal].length) context.addIssue({ code: 'custom', path: [page], message: `a ${input.signal} list is not paged` });
+      else if (keys && keys.length !== cursorColumns(input.signal, input.sort).length)
+        context.addIssue({ code: 'custom', path: [page], message: `a cursor holds ${cursorColumns(input.signal, input.sort).join(', ')}` });
       knownColumns(input.signal, input.columns ?? [], columns, ['columns'], context);
       knownColumns(input.signal, (input.where ?? []).map((each) => each.column), SIGNALS[input.signal].filters, ['where'], context);
       if (input.groupBy !== undefined) knownColumns(input.signal, [input.groupBy], input.columns ?? SIGNALS[input.signal].columns, ['groupBy'], context);
@@ -374,7 +417,7 @@ export const components = {
   RecordTable: {
     description:
       'Typed rows of one signal (traces as root spans with span and error counts, spans, logs or metric points) ' +
-      'or of authored SQL, newest first, with optional grouping and live mode that pauses while inspected.',
+      'or of authored SQL, newest first or sorted by a column, paged by keyset cursor, with optional grouping and live mode that pauses while inspected.',
     input: RecordTableInputSchema,
     states: ['populated', 'empty', 'denied', 'error', 'loading', 'live'],
     emits: {
@@ -386,6 +429,16 @@ export const components = {
       'record.open_in_query': {
         description: "Open the list's exact executed SQL and its typed binds in Query.",
         input: executedQuery,
+        completion: 'host-navigation'
+      },
+      'record.sort': {
+        description: 'Read the list again ordered by this column, from its first page.',
+        input: ListSortSchema,
+        completion: 'host-navigation'
+      },
+      'record.page': {
+        description: 'Read the page after the last row shown, or before the first, in the same order.',
+        input: z.union([z.object({ after: cursor }).strict(), z.object({ before: cursor }).strict()]),
         completion: 'host-navigation'
       }
     }

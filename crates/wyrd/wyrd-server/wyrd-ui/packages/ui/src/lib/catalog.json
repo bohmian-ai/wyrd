@@ -1019,7 +1019,7 @@
       ]
     },
     "RecordTable": {
-      "description": "Typed rows of one signal (traces as root spans with span and error counts, spans, logs or metric points) or of authored SQL, newest first, with optional grouping and live mode that pauses while inspected.",
+      "description": "Typed rows of one signal (traces as root spans with span and error counts, spans, logs or metric points) or of authored SQL, newest first or sorted by a column, paged by keyset cursor, with optional grouping and live mode that pauses while inspected.",
       "input": {
         "$schema": "https://json-schema.org/draft/2020-12/schema",
         "anyOf": [
@@ -1075,6 +1075,49 @@
                 "items": {
                   "type": "string",
                   "minLength": 1
+                }
+              },
+              "sort": {
+                "type": "object",
+                "properties": {
+                  "column": {
+                    "type": "string",
+                    "minLength": 1
+                  },
+                  "desc": {
+                    "type": "boolean"
+                  }
+                },
+                "required": [
+                  "column",
+                  "desc"
+                ],
+                "additionalProperties": false
+              },
+              "after": {
+                "minItems": 1,
+                "maxItems": 8,
+                "type": "array",
+                "items": {
+                  "type": [
+                    "null",
+                    "boolean",
+                    "number",
+                    "string"
+                  ]
+                }
+              },
+              "before": {
+                "minItems": 1,
+                "maxItems": 8,
+                "type": "array",
+                "items": {
+                  "type": [
+                    "null",
+                    "boolean",
+                    "number",
+                    "string"
+                  ]
                 }
               },
               "range": {
@@ -1293,6 +1336,83 @@
               "params"
             ],
             "additionalProperties": false
+          },
+          "completion": "host-navigation"
+        },
+        {
+          "name": "record.sort",
+          "description": "Read the list again ordered by this column, from its first page.",
+          "input": {
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "type": "object",
+            "properties": {
+              "column": {
+                "type": "string",
+                "minLength": 1
+              },
+              "desc": {
+                "type": "boolean"
+              }
+            },
+            "required": [
+              "column",
+              "desc"
+            ],
+            "additionalProperties": false
+          },
+          "completion": "host-navigation"
+        },
+        {
+          "name": "record.page",
+          "description": "Read the page after the last row shown, or before the first, in the same order.",
+          "input": {
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "anyOf": [
+              {
+                "type": "object",
+                "properties": {
+                  "after": {
+                    "minItems": 1,
+                    "maxItems": 8,
+                    "type": "array",
+                    "items": {
+                      "type": [
+                        "null",
+                        "boolean",
+                        "number",
+                        "string"
+                      ]
+                    }
+                  }
+                },
+                "required": [
+                  "after"
+                ],
+                "additionalProperties": false
+              },
+              {
+                "type": "object",
+                "properties": {
+                  "before": {
+                    "minItems": 1,
+                    "maxItems": 8,
+                    "type": "array",
+                    "items": {
+                      "type": [
+                        "null",
+                        "boolean",
+                        "number",
+                        "string"
+                      ]
+                    }
+                  }
+                },
+                "required": [
+                  "before"
+                ],
+                "additionalProperties": false
+              }
+            ]
           },
           "completion": "host-navigation"
         }

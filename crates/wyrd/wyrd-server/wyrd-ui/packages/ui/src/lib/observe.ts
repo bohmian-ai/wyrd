@@ -10,6 +10,9 @@ import { columnIndex, numeric } from './plot.js';
 import {
   IDS,
   SIGNALS,
+  TIES,
+  cursorColumns,
+  listSort,
   logStats,
   type AbsoluteRange,
   type ChartInput,
@@ -50,7 +53,13 @@ export interface FacetRailProps {
 export interface RecordTableProps {
   readonly input: RecordTableInput;
   readonly executed?: Executed;
-  readonly result: Loaded<{ readonly rows: QueryResult; readonly counts?: Loaded<QueryResult> }>;
+  readonly result: Loaded<{ readonly rows: QueryResult; readonly counts?: Loaded<QueryResult>; readonly page?: Page }>;
+}
+
+/** The cursors of the pages beside a signal list's page; an absent side has no rows. */
+export interface Page {
+  readonly older?: readonly QueryParam[];
+  readonly newer?: readonly QueryParam[];
 }
 
 /** Props of `TraceWaterfall`: every retained span of the trace, in start order. */
@@ -287,22 +296,80 @@ export function shownColumns(input: Extract<RecordTableInput, { signal: Signal }
   return input.columns ?? SIGNALS[input.signal].columns;
 }
 
-/** The newest rows of one signal, shown columns first and then its other key columns, ids as lowercase hex. */
+/** One column of a list's order, as the query reads it. */
+interface OrderKey {
+  readonly column: string;
+  readonly desc: boolean;
+  /** Only the sort column may be empty; it sorts last, so first when a page reads backward. */
+  readonly nullable: boolean;
+}
+
+/** A column as the order compares it: an id by its lowercase hex, which orders as its bytes. */
+const ordered = (column: string) => ((IDS as readonly string[]).includes(column) ? `encode(${column}, 'hex')` : column);
+
+/**
+ * A list's order: the sort column, event time newest first, then the ties
+ * ascending. A page before a row reads the reverse order.
+ */
+function orderKeys(signal: Signal, input: Extract<RecordTableInput, { signal: Signal }>): readonly OrderKey[] {
+  const sort = listSort(signal, input.sort);
+  const backward = input.before !== undefined;
+  return cursorColumns(signal, input.sort).map((column, index) => {
+    const desc = column === sort.column ? sort.desc : column === SIGNALS[signal].time;
+    return { column, desc: desc !== backward, nullable: index === 0 && column !== SIGNALS[signal].time };
+  });
+}
+
+/**
+ * The rows strictly beyond `values` in the order of `keys`, as a keyset
+ * predicate: beyond the first key, or equal to it and beyond the rest. An
+ * empty value sorts last forward and first backward.
+ */
+function beyond(binds: Binds, keys: readonly OrderKey[], values: readonly QueryParam[], backward: boolean): string {
+  const placeholders = keys.map(({ column }, index) =>
+    values[index] === null ? '' : column.endsWith('_unix_nano') ? `${binds.bind(values[index])}::timestamptz` : binds.bind(values[index])
+  );
+  let rest = '';
+  for (let index = keys.length - 1; index >= 0; index -= 1) {
+    const { column, desc, nullable } = keys[index];
+    const value = values[index];
+    const left = ordered(column);
+    const placeholder = placeholders[index];
+    const past = value === null ? (nullable && backward ? `${left} IS NOT NULL` : '') : `${left} ${desc ? '<' : '>'} ${placeholder}${nullable && !backward ? ` OR ${left} IS NULL` : ''}`;
+    const equal = value === null ? `${left} IS NULL` : `${left} = ${placeholder}`;
+    rest = `(${[past, rest ? `(${equal} AND ${rest})` : ''].filter(Boolean).join(' OR ') || 'FALSE'})`;
+  }
+  return rest;
+}
+
+/**
+ * One page of one signal, shown columns first and then its other key and
+ * cursor columns, ids as lowercase hex. Traces, spans and logs read in their
+ * sort order one row past the page, which says whether another page
+ * follows; metric points read their newest rows.
+ */
 export function listQuery(input: Extract<RecordTableInput, { signal: Signal }>, range: AbsoluteRange, predicate?: string): Executed {
   const signal = SIGNALS[input.signal];
+  const paged = TIES[input.signal].length > 0;
   const binds = Binds.over(signal.time, range);
   binds.where(input.where).predicate(predicate);
   if (input.signal === 'traces') binds.roots(signal.table);
-  const keys = KEY_COLUMNS[input.signal].filter((key) => !shownColumns(input).includes(key)).map((key) => (key.endsWith('_id') && key !== 'wyrd_request_id' ? `encode(${key}, 'hex') AS ${key}` : key));
+  const keys = orderKeys(input.signal, input);
+  const cursor = input.after ?? input.before;
+  if (paged && cursor) binds.clauses.push(beyond(binds, keys, cursor, input.before !== undefined));
+  const read = [...new Set([...KEY_COLUMNS[input.signal], ...(paged ? cursorColumns(input.signal, input.sort) : [])])]
+    .filter((key) => !shownColumns(input).includes(key))
+    .map((key) => ((IDS as readonly string[]).includes(key) || key === 'parent_span_id' ? `encode(${key}, 'hex') AS ${key}` : key));
   const shown = shownColumns(input).map((column) => {
     if (input.signal !== 'metrics') return column;
     if (EXACT.includes(column)) return `CAST(${column} AS VARCHAR) AS ${column}`;
     return NESTED_EXACT[column] ? `${NESTED_EXACT[column]} AS ${column}` : column;
   });
-  return {
-    sql: `SELECT ${[...shown, ...keys].join(', ')} FROM ${signal.table} WHERE ${binds.sql} ORDER BY ${signal.time} DESC LIMIT ${input.limit ?? LIST_LIMIT}`,
-    params: binds.params
-  };
+  const order = paged
+    ? keys.map(({ column, desc, nullable }) => `${ordered(column)} ${desc ? 'DESC' : 'ASC'}${nullable ? ` NULLS ${input.before ? 'FIRST' : 'LAST'}` : ''}`).join(', ')
+    : `${signal.time} DESC`;
+  const limit = (input.limit ?? LIST_LIMIT) + (paged ? 1 : 0);
+  return { sql: `SELECT ${[...shown, ...read].join(', ')} FROM ${signal.table} WHERE ${binds.sql} ORDER BY ${order} LIMIT ${limit}`, params: binds.params };
 }
 
 /**
@@ -820,18 +887,29 @@ export async function loadRecordTable(input: RecordTableInput, context: LoadCont
   }
   const [read] = await context.executor.run([query(executed.sql, executed.params, 'sql' in input ? (input.limit ?? 500) : undefined)], context.signal);
   if (!read.ok) return { input, executed, result: failed(read.problem) };
-  const rows = read.value;
+  let rows = read.value;
+  let page: Page | undefined;
+  if ('signal' in input && TIES[input.signal].length) {
+    const limit = input.limit ?? LIST_LIMIT;
+    const more = rows.rows.length > limit;
+    // The first page reached backward reads again forward, so it is full.
+    if (input.before && !more) return loadRecordTable({ ...input, before: undefined }, context);
+    const kept = rows.rows.slice(0, limit);
+    rows = { ...rows, rows: input.before ? kept.reverse() : kept };
+    const at = (row: readonly unknown[] | undefined) => (row ? cursorColumns(input.signal, input.sort).map((column) => row[columnIndex(rows, column)] as QueryParam) : undefined);
+    page = { older: more || input.before ? at(rows.rows.at(-1)) : undefined, newer: input.after || input.before ? at(rows.rows[0]) : undefined };
+  }
   if (rows.rows.length === 0) {
     const reason = 'sql' in input ? 'The SQL returned no rows in this range.' : emptyList(input.signal, input.where);
     return { input, executed, result: { state: 'empty', data: { rows }, reason } };
   }
-  if (!('signal' in input) || input.signal !== 'traces') return { input, executed, result: { state: 'populated', data: { rows } } };
+  if (!('signal' in input) || input.signal !== 'traces') return { input, executed, result: { state: 'populated', data: { rows, page } } };
   context.signal?.throwIfAborted();
   const at = shownColumns(input).length;
   const counted = countsQuery([...new Set(rows.rows.map((row) => String(row[at])))]);
   const [counts] = await context.executor.run([query(counted.sql, counted.params)], context.signal);
   const loaded: Loaded<QueryResult> = counts.ok ? { state: 'populated', data: counts.value } : failed(counts.problem);
-  return { input, executed, result: { state: 'populated', data: { rows, counts: loaded } } };
+  return { input, executed, result: { state: 'populated', data: { rows, counts: loaded, page } } };
 }
 
 /** Every retained span of one trace; past the ceiling the read is refused, never truncated. */

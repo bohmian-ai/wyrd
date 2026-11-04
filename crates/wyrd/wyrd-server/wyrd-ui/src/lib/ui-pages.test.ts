@@ -15,7 +15,7 @@ import {
   type WireResult
 } from 'wyrd-ai-ui/loaders';
 import { presetLabel, rangeLabel, readInstant } from './TimePicker.svelte';
-import { DETAIL_PARAMS, closed, groupColumns, listInputs, listParams, readState, selectedMetric, step, writeState, zoomed } from './observe-host';
+import { DETAIL_PARAMS, closed, groupColumns, listInputs, listParams, moved, readState, selectedMetric, step, writeState, zoomed } from './observe-host';
 
 const RANGE = { from: '2026-10-20T00:00:00Z', to: '2026-10-21T00:00:00Z' };
 const EMPTY = { columns: [], rows: [], terminal: { outcome: 'success', row_count: 0, warnings: [] } };
@@ -228,6 +228,59 @@ test('observe signal planning and interactions', async () => {
   expect(listInputs({ ...metrics, agg: undefined, by: undefined }).series).toEqual({ metric: 'ui.requests', where: [{ column: 'metric_name', value: 'ui.requests' }] });
   expect(listInputs({ ...metrics, agg: undefined }).series).toEqual({ metric: 'ui.requests', where: [{ column: 'metric_name', value: 'ui.requests' }], by: 'service_name' });
   expect(listInputs({ ...metrics, where: [] }).series).toBeUndefined();
+});
+
+test('lists sort by a column on the server and page by keyset cursor', async () => {
+  // Forward past a row: beyond its service, an empty service last, else the same service and older, else the same instant and a later id.
+  const after = listQuery({ signal: 'spans', sort: { column: 'service_name', desc: false }, after: ['api', '2026-10-20T01:00:00.000000001Z', 'aa', 'bb'] }, RANGE);
+  expect(after.sql).toContain(
+    "WHERE start_time_unix_nano >= $1::timestamptz AND start_time_unix_nano < $2::timestamptz AND " +
+      "(service_name > $3 OR service_name IS NULL OR (service_name = $3 AND (start_time_unix_nano < $4::timestamptz OR " +
+      "(start_time_unix_nano = $4::timestamptz AND (encode(trace_id, 'hex') > $5 OR (encode(trace_id, 'hex') = $5 AND (encode(span_id, 'hex') > $6))))))) " +
+      "ORDER BY service_name ASC NULLS LAST, start_time_unix_nano DESC, encode(trace_id, 'hex') ASC, encode(span_id, 'hex') ASC LIMIT 51"
+  );
+  expect(after.params).toEqual([RANGE.from, RANGE.to, 'api', '2026-10-20T01:00:00.000000001Z', 'aa', 'bb']);
+  // Backward before an empty value: every non-empty value precedes it, and the order reverses with empty values first.
+  const before = listQuery({ signal: 'spans', sort: { column: 'service_name', desc: false }, before: [null, '2026-10-20T01:00:00Z', 'aa', 'bb'] }, RANGE);
+  expect(before.sql).toContain('(service_name IS NOT NULL OR (service_name IS NULL AND (start_time_unix_nano > $3::timestamptz OR');
+  expect(before.sql).toContain("ORDER BY service_name DESC NULLS FIRST, start_time_unix_nano ASC, encode(trace_id, 'hex') DESC, encode(span_id, 'hex') DESC LIMIT 51");
+  // A list whose columns omit the cursor columns still reads them.
+  expect(listQuery({ signal: 'logs', columns: ['body_text'], sort: { column: 'severity_number', desc: true } }, RANGE).sql).toMatch(
+    /^SELECT body_text, encode\(trace_id, 'hex'\) AS trace_id, encode\(span_id, 'hex'\) AS span_id, observed_time_unix_nano, wyrd_request_id, severity_number, time_unix_nano FROM/
+  );
+  // Ids and counts are not sortable, a cursor matches its sort, and metric points do not page.
+  expect(validatePanel('RecordTable', { signal: 'traces', sort: { column: 'trace_id', desc: true } })).toMatchObject({ code: 'WYRD_SPEC_400_VALIDATION' });
+  expect(validatePanel('RecordTable', { signal: 'traces', after: ['2026-10-20T01:00:00Z', 'aa'] })).toMatchObject({ code: 'WYRD_SPEC_400_VALIDATION' });
+  expect(validatePanel('RecordTable', { signal: 'metrics', after: ['2026-10-20T01:00:00Z'] })).toMatchObject({ code: 'WYRD_SPEC_400_VALIDATION' });
+  expect(validatePanel('RecordTable', { signal: 'traces', sort: { column: 'duration_nano', desc: true }, after: [5, '2026-10-20T01:00:00Z', 'aa', 'bb'] })).not.toHaveProperty('code');
+
+  // One row past the limit says an older page exists; its cursor is the last row shown.
+  const columns = ['start_time_unix_nano', 'name', 'service_name', 'duration_nano', 'status_code', 'trace_id', 'span_id'].map((name) => ({ name, data_type: 'Utf8', nullable: true }));
+  const rows = (n: number) => ({ ...EMPTY, columns, rows: Array.from({ length: n }, (_, at) => [`t${at}`, 'n', 's', at, 0, `trace${at}`, `span${at}`]) });
+  const answer = (n: number) => (request: WireRequest): WireResult => ({ ok: true, value: (request as { sql: string }).sql.includes('AS spans') ? EMPTY : rows(n) }) as never;
+  const first = await loadRecordTable({ signal: 'spans', limit: 2 }, { executor: recording(answer(3)).executor, range: RANGE });
+  expect(first.result).toMatchObject({ state: 'populated', data: { page: { older: ['t1', 'trace1', 'span1'], newer: undefined } } });
+  expect((first.result as { data: { rows: { rows: readonly unknown[] } } }).data.rows.rows).toHaveLength(2);
+  // A page read backward shows in list order; at the start it reads the first page again forward.
+  const back = await loadRecordTable({ signal: 'spans', limit: 2, before: ['t9', 'x', 'y'] }, { executor: recording(answer(3)).executor, range: RANGE });
+  expect(back.result).toMatchObject({ data: { rows: { rows: [['t1'], ['t0']].map(([t]) => expect.arrayContaining([t])) }, page: { older: ['t0', 'trace0', 'span0'], newer: ['t1', 'trace1', 'span1'] } } });
+  const start = recording(answer(1));
+  const restarted = await loadRecordTable({ signal: 'spans', limit: 2, before: ['t9', 'x', 'y'] }, { executor: start.executor, range: RANGE });
+  expect(start.calls).toHaveLength(2);
+  expect((start.calls[1] as { sql: string }).sql).toContain('ORDER BY start_time_unix_nano DESC');
+  expect(restarted.result).toMatchObject({ data: { page: { older: undefined, newer: undefined } } });
+
+  // The sort and cursor round-trip through the URL; sorting and another list return to the first page, opening a record keeps it.
+  const paged = readState(new URLSearchParams({ sort: 'duration_nano:desc', after: JSON.stringify([5, 't', 'a', 'b']) }));
+  expect(paged).toMatchObject({ sort: { column: 'duration_nano', desc: true }, page: { after: [5, 't', 'a', 'b'] } });
+  expect(readState(writeState(paged))).toEqual(paged);
+  expect(listInputs(paged).list).toMatchObject({ sort: { column: 'duration_nano', desc: true }, after: [5, 't', 'a', 'b'] });
+  expect(listInputs({ ...paged, sort: { column: 'trace_id', desc: true } }).list).not.toHaveProperty('after');
+  const resorted = step(paged, { name: 'record.sort', input: { column: 'name', desc: false } }, '/');
+  expect(resorted).toEqual({ state: { ...paged, sort: { column: 'name', desc: false }, page: undefined } });
+  expect(step(paged, { name: 'record.page', input: { before: [1, 't', 'a', 'b'] } }, '/')).toEqual({ state: { ...paged, page: { before: [1, 't', 'a', 'b'] } } });
+  expect(moved(paged, { ...paged, where: [{ column: 'name', value: 'x' }] }).page).toBeUndefined();
+  expect(moved(paged, { ...paged, trace: 'aa' }).page).toEqual(paged.page);
 });
 
 test('histogram percentiles interpolate inside the bucket holding the rank', () => {

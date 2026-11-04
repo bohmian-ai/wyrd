@@ -88,7 +88,7 @@ export const spans = result(
 
 /** Log records as the logs list reads them: shown columns, then the record key; 120 rows so pages and the read limit show. */
 export const logs = result(
-  [col('time_unix_nano', NS, false), col('severity_text'), col('service_name'), col('body_text'), col('exception_type'), col('trace_id'), col('span_id'), col('observed_time_unix_nano', NS, false), col('wyrd_request_id', 'Utf8', false)],
+  [col('time_unix_nano', NS, false), col('severity_text'), col('service_name'), col('body_text'), col('exception_type'), col('trace_id'), col('span_id'), col('observed_time_unix_nano', NS, false), col('wyrd_request_id', 'Utf8', false), col('severity_number', 'Int32')],
   Array.from({ length: 120 }, (_, index) => {
     const at = `2026-10-20T11:${String(59 - Math.floor(index / 2)).padStart(2, '0')}:${index % 2 ? '10' : '40'}.518000000+00:00`;
     const error = index % 9 === 4;
@@ -101,7 +101,8 @@ export const logs = result(
       index % 5 === 0 ? null : TRACE,
       index % 5 === 0 ? null : 'b9c7c989f97918e1',
       at,
-      `req_${index}`
+      `req_${index}`,
+      error ? 17 : index % 3 === 0 ? 13 : 9
     ];
   })
 );

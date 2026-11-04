@@ -11,7 +11,12 @@
   reader hovers, focuses or scrolls it, after it opens a record until the
   reader resumes, or while the host pauses it; it offers "↑ N new" instead of
   moving rows under the pointer. The footer states the returned extent and
-  never a total it did not read. A log list pages through its returned rows.
+  never a total it did not read.
+
+  A trace, span or log list sorts on the server: a sortable heading asks the
+  host to read it again in that column's order, and Newer and Older ask for
+  the page before the first row or after the last. Authored SQL is refused
+  rather than truncated, so its rows are complete and sort in the page.
 
   Columns hides read columns; a host that passes `oncolumns` instead offers
   every column the signal may show and reads the reader's choice again. CSV
@@ -26,7 +31,7 @@
 <script lang="ts">
   import type { Snippet } from 'svelte';
   import type { ActionProps, QueryResult } from '../contract.js';
-  import { KEY_COLUMNS, LIST_LIMIT, STATUS_NAMES, cellText, columnLabel, severityLevel, shortId, shownColumns, signalColumns, type RecordTableProps } from '../loaders.js';
+  import { KEY_COLUMNS, LIST_LIMIT, STATUS_NAMES, cellText, columnLabel, listSort, severityLevel, shortId, shownColumns, signalColumns, sortColumns, type ListSort, type RecordTableProps } from '../loaders.js';
   import { fmtCount } from '../format.js';
   import { columnIndex, numeric } from '../plot.js';
   import ActionButton from './ActionButton.svelte';
@@ -135,21 +140,35 @@
   const erring = (data: QueryResult, row: readonly unknown[]) =>
     (signal === 'traces' || signal === 'spans') && columnIndex(data, 'status_code') >= 0 && numeric(row[columnIndex(data, 'status_code')]) === 2;
 
-  /** A log list pages through the rows it read; other lists scroll. */
-  const PAGE_SIZES = [25, 50, 100] as const;
-  let pageSize = $state<number>(50);
-  let page = $state(0);
-  const pages = $derived(signal === 'logs' && rows ? Math.max(1, Math.ceil(rows.rows.length / pageSize)) : 1);
-  const current = $derived(Math.min(page, pages - 1));
-  const paged = $derived(rows ? (signal === 'logs' ? rows.rows.slice(current * pageSize, (current + 1) * pageSize) : rows.rows) : []);
-  /** Page numbers to offer: every page up to seven, else the ends and the current page's neighbours. */
-  const offered = $derived.by(() => {
-    const all = Array.from({ length: pages }, (_, index) => index);
-    if (pages <= 7) return all;
-    return all.filter((index) => index === 0 || index === pages - 1 || Math.abs(index - current) <= 1);
+  const page = $derived(shown?.page);
+  /** A metric point list that returned its whole limit may have older rows it did not read. */
+  const limited = $derived(signal === 'metrics' && rows !== undefined && rows.rows.length >= (input.limit ?? LIST_LIMIT));
+
+  /** Authored SQL's in-page order, until the reader picks another. */
+  let local = $state<ListSort>();
+  /** The applied order: the list's server sort, or authored SQL's in-page one. */
+  const order = $derived(signal ? listSort(signal, 'signal' in input ? input.sort : undefined) : local);
+  /** The column a heading sorts by: a log's severity by its number, so levels order by rank. */
+  const sortKey = (column: string) => (signal === 'logs' && column === 'severity_text' ? 'severity_number' : column);
+  const sortable = (column: string) => (signal ? onaction !== undefined && sortColumns(signal).includes(sortKey(column)) : true);
+  /** Sort by `column`: the other direction when it is the sort, else newest or largest first for times and numbers, A to Z otherwise. */
+  function sort(heading: string) {
+    if (!rows) return;
+    const column = sortKey(heading);
+    const value = rows.rows.map((row) => row[columnIndex(rows, column)]).find((each) => each !== null);
+    const next = { column, desc: order?.column === column ? !order.desc : column.endsWith('_unix_nano') || typeof value === 'number' };
+    if (signal) onaction?.({ name: 'record.sort', input: next });
+    else local = next;
+  }
+  /** Rows in their order: as read for a signal list, else sorted in the page with empty values last. */
+  const sorted = $derived.by(() => {
+    if (!rows) return [];
+    if (signal || !local) return rows.rows;
+    const { column, desc } = local;
+    const at = columnIndex(rows, column);
+    const compare = (a: unknown, b: unknown) => (typeof a === 'number' && typeof b === 'number' ? a - b : String(a).localeCompare(String(b)));
+    return [...rows.rows].sort((a, b) => (a[at] === null ? (b[at] === null ? 0 : 1) : b[at] === null ? -1 : (desc ? -1 : 1) * compare(a[at], b[at])));
   });
-  /** A signal list that returned its whole limit may have older rows it did not read. */
-  const limited = $derived(signal !== undefined && rows !== undefined && rows.rows.length >= (input.limit ?? LIST_LIMIT));
 
   /**
    * Rows split by the groupBy column, groups in first-seen order. Groups are
@@ -160,7 +179,7 @@
     if (!rows) return [];
     const at = input.groupBy ? columnIndex(rows, input.groupBy) : -1;
     const grouped = new Map<string, { value: unknown; members: (readonly unknown[])[] }>();
-    for (const row of paged) {
+    for (const row of sorted) {
       const key = at < 0 ? '' : JSON.stringify(row[at] ?? null);
       const group = grouped.get(key) ?? { value: row[at] ?? null, members: [] };
       group.members.push(row);
@@ -236,7 +255,7 @@
         <span class="tools" {@attach placeIn(controls)}>{@render hostTools?.()}{@render tools()}</span>
       {:else if signal}
         <div class="bar">
-          <span>{counted(rows.rows.length)} · newest first</span>
+          <span>{counted(rows.rows.length)} · {'sort' in input && input.sort ? `by ${heading(input.sort.column)} ${input.sort.desc ? '↓' : '↑'}` : 'newest first'}</span>
           <span class="tools">{@render hostTools?.()}{@render tools()}</span>
         </div>
       {/if}
@@ -255,7 +274,11 @@
           <thead>
             <tr>
               {#each visible as column (column)}
-                {#if column === extrasBefore}{@render extraHeads()}{/if}<th scope="col" title={column}>{heading(column)}</th>
+                {#if column === extrasBefore}{@render extraHeads()}{/if}<th scope="col" title={column} aria-sort={order?.column === sortKey(column) ? (order.desc ? 'descending' : 'ascending') : undefined}
+                  >{#if sortable(column)}<button type="button" class="sort" onclick={() => sort(column)}
+                      >{heading(column)}{#if order?.column === sortKey(column)}<span aria-hidden="true">{order.desc ? ' ↓' : ' ↑'}</span>{/if}</button
+                    >{:else}{heading(column)}{/if}</th
+                >
               {/each}
               {#if extrasLast}{@render extraHeads()}{/if}
             </tr>
@@ -302,31 +325,19 @@
           </tbody>
         </table>
       </div>
-      {#if signal === 'logs'}
+      {#if page}
         <nav class="foot pager" aria-label="Pages">
-          <button type="button" aria-label="Previous page" disabled={current === 0} onclick={() => (page = current - 1)}>‹</button>
-          {#each offered as index, position (index)}
-            {#if position > 0 && index - offered[position - 1] > 1}<span aria-hidden="true">…</span>{/if}
-            <button type="button" aria-current={index === current ? 'page' : undefined} onclick={() => (page = index)}>{index + 1}</button>
-          {/each}
-          <button type="button" aria-label="Next page" disabled={current >= pages - 1} onclick={() => (page = current + 1)}>›</button>
-          {#if limited}<span>newest {fmtCount(rows.rows.length)} read · older records not read</span>{/if}
-          <label class="size">
-            <select
-              value={pageSize}
-              onchange={(event) => {
-                pageSize = Number(event.currentTarget.value);
-                page = 0;
-              }}
-            >
-              {#each PAGE_SIZES as size (size)}<option value={size}>{size}</option>{/each}
-            </select>
-            per page
-          </label>
+          <span>Showing {counted(rows.rows.length)}{#if signal === 'spans' && openable}{' '}· a trace id opens that trace{/if}</span>
+          {#if onaction}
+            <span class="pages">
+              <button type="button" disabled={!page.newer} onclick={() => page.newer && onaction?.({ name: 'record.page', input: { before: page.newer } })}>‹ Newer</button>
+              <button type="button" disabled={!page.older} onclick={() => page.older && onaction?.({ name: 'record.page', input: { after: page.older } })}>Older ›</button>
+            </span>
+          {/if}
         </nav>
       {:else}
         <p class="foot">
-          Showing {counted(rows.rows.length)}{#if limited}{' '}· newest {fmtCount(rows.rows.length)} read, older {noun} not read{/if}{#if signal === 'spans' && openable}{' '}· a trace id opens that trace{/if}
+          Showing {counted(rows.rows.length)}{#if limited}{' '}· newest {fmtCount(rows.rows.length)} read, older {noun} not read{/if}
         </p>
       {/if}
     </div>
@@ -610,34 +621,31 @@
   .pager {
     border-top: 1px solid var(--border);
   }
-  .pager button {
+  .pages {
+    display: flex;
+    gap: 12px;
+    margin-left: auto;
+  }
+  .pager button,
+  .sort {
     border: 0;
-    padding: 0 2px;
+    padding: 0;
     background: none;
     color: var(--declare);
     font: inherit;
+    letter-spacing: inherit;
+    text-transform: inherit;
     cursor: pointer;
+  }
+  .sort {
+    color: inherit;
+  }
+  .sort:hover {
+    color: var(--declare);
   }
   .pager button:disabled {
     color: var(--muted);
     cursor: default;
-  }
-  .pager [aria-current='page'] {
-    color: var(--text);
-    text-decoration: underline;
-  }
-  .size {
-    display: flex;
-    align-items: center;
-    gap: 6px;
-    margin-left: auto;
-  }
-  select {
-    border: 1px solid var(--border);
-    border-radius: var(--r);
-    background: var(--surface);
-    color: var(--text);
-    font: inherit;
   }
   .live,
   .note {
@@ -674,8 +682,7 @@
     color: var(--warn);
   }
   button:focus-visible,
-  summary:focus-visible,
-  select:focus-visible {
+  summary:focus-visible {
     outline: 2px solid var(--declare);
     outline-offset: 1px;
   }

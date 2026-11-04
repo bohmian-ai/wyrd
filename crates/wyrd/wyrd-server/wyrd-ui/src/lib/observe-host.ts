@@ -5,7 +5,7 @@
  * maps each component intent to the next URL.
  */
 import type { ActionIntent, QueryParam } from 'wyrd-ai-ui';
-import { METRIC_AGGREGATIONS, SIGNALS, signalColumns, type MetricAggregation, type MetricInput } from 'wyrd-ai-ui/loaders';
+import { METRIC_AGGREGATIONS, SIGNALS, signalColumns, sortColumns, type ListSort, type MetricAggregation, type MetricInput } from 'wyrd-ai-ui/loaders';
 
 /** The Observe signals the host offers. */
 export const OBSERVE_SIGNALS = ['traces', 'logs', 'metrics'] as const;
@@ -46,6 +46,10 @@ export interface ObserveState {
   readonly live: boolean;
   /** The list columns the reader chose; absent shows the signal's defaults. */
   readonly columns?: readonly string[];
+  /** The list's server order; absent, newest first. */
+  readonly sort?: ListSort;
+  /** The list page: after or before one row's cursor values; absent, the first page. */
+  readonly page?: { readonly after: readonly QueryParam[] } | { readonly before: readonly QueryParam[] };
   /** The metric aggregation across series, and the metrics column it keeps apart. */
   readonly agg?: MetricAggregation;
   readonly by?: string;
@@ -90,6 +94,9 @@ export function readState(params: Params): ObserveState {
   const to = params.get('to') ?? undefined;
   const absolute = from !== undefined && to !== undefined;
   const agg = METRIC_AGGREGATIONS.find((each) => each === params.get('agg'));
+  const [column, direction] = (params.get('sort') ?? '').split(':');
+  const after = json(params.get('after'));
+  const before = json(params.get('before'));
   return {
     signal,
     mode: params.get('mode') === 'spans' ? 'spans' : 'traces',
@@ -102,6 +109,8 @@ export function readState(params: Params): ObserveState {
     group: params.get('group') ?? undefined,
     live: params.get('live') === '1',
     columns: Array.isArray(columns) && columns.every((each) => typeof each === 'string') ? columns : undefined,
+    sort: column && (direction === 'asc' || direction === 'desc') ? { column, desc: direction === 'desc' } : undefined,
+    page: Array.isArray(after) ? { after } : Array.isArray(before) ? { before } : undefined,
     agg,
     by: params.get('by') ?? undefined,
     points: signal === 'metrics' && params.get('points') === '1',
@@ -127,6 +136,9 @@ export function writeState(state: ObserveState): URLSearchParams {
   if (state.group) params.set('group', state.group);
   if (state.live) params.set('live', '1');
   if (state.columns) params.set('columns', JSON.stringify(state.columns));
+  if (state.sort) params.set('sort', `${state.sort.column}:${state.sort.desc ? 'desc' : 'asc'}`);
+  if (state.page && 'after' in state.page) params.set('after', JSON.stringify(state.page.after));
+  if (state.page && 'before' in state.page) params.set('before', JSON.stringify(state.page.before));
   if (state.agg) params.set('agg', state.agg);
   if (state.by) params.set('by', state.by);
   if (state.signal === 'metrics' && state.points) params.set('points', '1');
@@ -180,6 +192,7 @@ export function listInputs(state: ObserveState) {
   const chosen = state.columns?.filter((column) => offered.includes(column));
   const columns = chosen?.length ? chosen : undefined;
   const metric = state.signal === 'metrics' ? selectedMetric(state) : undefined;
+  const sort = state.sort && sortColumns(signal).includes(state.sort.column) ? state.sort : undefined;
   const by = state.by && (SIGNALS.metrics.filters as readonly string[]).includes(state.by) ? state.by : undefined;
   const series: MetricInput | undefined = metric ? { metric, ...filter(state), ...(state.agg ? { aggregation: state.agg } : {}), ...(by ? { by } : {}) } : undefined;
   return {
@@ -190,10 +203,21 @@ export function listInputs(state: ObserveState) {
       ...filter(state),
       ...(group && !(columns ?? (SIGNALS[signal].columns as readonly string[])).includes(group) ? { columns: [...(columns ?? SIGNALS[signal].columns), group] } : columns ? { columns } : {}),
       ...(group ? { groupBy: group } : {}),
+      ...(sort ? { sort } : {}),
+      ...(sort || !state.sort ? (state.page ?? {}) : {}),
       ...(state.live ? { live: true } : {})
     },
     series
   };
+}
+
+/**
+ * `next`, back on the list's first page when it reads another list than
+ * `state`: another signal, mode, range, WHERE, predicate or sort.
+ */
+export function moved(state: ObserveState, next: ObserveState): ObserveState {
+  const list = (each: ObserveState) => JSON.stringify([listSignal(each), each.last, each.from, each.to, each.where, each.where_sql, each.sort]);
+  return list(state) === list(next) ? next : { ...next, page: undefined };
 }
 
 /** The state with nothing open in the drawer. */
@@ -249,6 +273,10 @@ export function step(state: ObserveState, intent: ActionIntent, back: string): H
           columns: undefined
         }
       };
+    case 'record.sort':
+      return { state: { ...closed(state), sort: { column: String(input.column), desc: input.desc === true }, page: undefined } };
+    case 'record.page':
+      return { state: { ...closed(state), page: input.after ? { after: input.after as QueryParam[] } : { before: input.before as QueryParam[] } } };
     case 'trace.select':
       return { state: { ...state, trace: String(input.trace_id), span: String(input.span_id) } };
     case 'record.open_in_query':

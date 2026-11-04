@@ -7,13 +7,13 @@
   import { page } from '$app/state';
   import { Drawer, EmptyState, RecordDetail, StatusPill, TraceWaterfall, fmtCount, fmtDuration, type ActionIntent, type ActionState } from 'wyrd-ai-ui';
   import { cellText, shortId, spanTree, validateIntent, type ComponentName } from 'wyrd-ai-ui/loaders';
-  import { closed, readState, step, writeState, type ObserveState } from '$lib/observe-host';
+  import { closed, moved, readState, step, writeState, type ObserveState } from '$lib/observe-host';
   import type { PageProps } from './$types';
 
   let { data }: PageProps = $props();
   const base = $derived(`/t/${encodeURIComponent(data.tenant.key)}`);
   const current = $derived(readState(page.url.searchParams));
-  const go = (next: ObserveState) => goto(`${base}/observe?${writeState(next)}`, { keepFocus: true, noScroll: true });
+  const go = (next: ObserveState) => goto(`${base}/observe?${writeState(moved(current, next))}`, { keepFocus: true, noScroll: true });
 
   let actions = $state<Record<string, ActionState>>({});
   function onaction(component: ComponentName) {

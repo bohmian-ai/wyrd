@@ -11,7 +11,7 @@
   import { Chart, Drawer, EmptyState, FacetRail, RecordTable, fmtDuration, fmtNumber, type ActionIntent, type ActionState, type Problem } from 'wyrd-ai-ui';
   import { METRIC_AGGREGATIONS, SIGNALS, columnLabel, validateIntent, type ComponentName } from 'wyrd-ai-ui/loaders';
   import TimePicker, { type PickedRange, type Zone } from '$lib/TimePicker.svelte';
-  import { PRESETS, appliedRange, closed, groupColumns, readState, selectedMetric, step, writeState, zoomed, type HostFilter, type ObserveState } from '$lib/observe-host';
+  import { PRESETS, appliedRange, closed, groupColumns, moved, readState, selectedMetric, step, writeState, zoomed, type HostFilter, type ObserveState } from '$lib/observe-host';
   import type { LayoutProps } from './$types';
 
   let { data, children }: LayoutProps = $props();
@@ -31,8 +31,8 @@
   const view = $derived('problem' in observe ? undefined : observe);
   const form = $derived(page.form as { draft?: string; problem?: Problem } | null);
 
-  /** The URL of `next`. */
-  const href = (next: ObserveState) => `${base}/observe?${writeState(next)}`;
+  /** The URL of `next`, on its first page when it reads another list. */
+  const href = (next: ObserveState) => `${base}/observe?${writeState(moved(current, next))}`;
   const go = (next: ObserveState) => goto(href(next), { keepFocus: true, noScroll: true });
   /** `next` on another signal: its own filters and choices start empty; range, zone and Live carry over. */
   const onSignal = (signal: ObserveState['signal']): ObserveState => ({
@@ -42,6 +42,7 @@
     where_sql: '',
     group: undefined,
     columns: undefined,
+    sort: undefined,
     agg: undefined,
     by: undefined,
     points: false

@@ -43,7 +43,7 @@ test('TASK-002: Retained pages without mocks', () => {
   expect(layout.getByText('child')).toBeInTheDocument();
 });
 
-import { fireEvent, waitFor } from '@testing-library/svelte';
+import { fireEvent, waitFor, within } from '@testing-library/svelte';
 import { tick } from 'svelte';
 import { vi } from 'vitest';
 import {
@@ -1194,7 +1194,7 @@ test('TASK-004: Canonical signal interactions', async () => {
         "SELECT start_time_unix_nano, name, service_name, duration_nano, status_code, encode(trace_id, 'hex') AS trace_id, encode(span_id, 'hex') AS span_id " +
         'FROM bifrost.traces.spans WHERE start_time_unix_nano >= $1::timestamptz AND start_time_unix_nano < $2::timestamptz AND parent_span_id IS NULL ' +
         'AND trace_id IN (SELECT trace_id FROM bifrost.traces.spans WHERE start_time_unix_nano >= $1::timestamptz AND start_time_unix_nano < $2::timestamptz ' +
-        'AND service_name = $3 AND http_route IS NOT NULL) ORDER BY start_time_unix_nano DESC LIMIT 50',
+        "AND service_name = $3 AND http_route IS NOT NULL) ORDER BY start_time_unix_nano DESC, encode(trace_id, 'hex') ASC, encode(span_id, 'hex') ASC LIMIT 51",
       params: [RANGE.from, RANGE.to, 'agent-api']
     },
     {
@@ -1386,21 +1386,32 @@ test('TASK-004: Canonical signal interactions', async () => {
   expect(footed.getByText(/^Showing 3\s+traces$/)).toBeInTheDocument();
   expect(footed.getAllByText('agent-api')[0]).toHaveClass('chip');
   footed.unmount();
-  const full = render(RecordTable, { input: { signal: 'traces', limit: 3 }, result: populated });
-  expect(full.getByText(/newest 3 read, older traces not read/)).toBeInTheDocument();
-  full.unmount();
-  // A log list pages through the rows it read, wraps lines and hides columns without another read.
+  // A sortable heading asks for the list in its order, the other way when it is the sort; Newer and Older ask for the pages beside it.
+  const pageAction = vi.fn();
+  const pagedResult = { state: 'populated', data: { ...populated.data, page: { older: ['t2', 'a', 'b'] } } } as const;
+  const pagedList = render(RecordTable, { input: { signal: 'traces' }, result: pagedResult, onaction: pageAction });
+  expect(pagedList.getByRole('columnheader', { name: /Start/ })).toHaveAttribute('aria-sort', 'descending');
+  expect(within(pagedList.getAllByRole('columnheader').find((heading) => heading.textContent === 'spans')!).queryByRole('button')).toBeNull();
+  await fireEvent.click(pagedList.getByRole('button', { name: /Start/ }));
+  expect(pageAction).toHaveBeenLastCalledWith({ name: 'record.sort', input: { column: 'start_time_unix_nano', desc: false } });
+  await fireEvent.click(pagedList.getByRole('button', { name: 'Service' }));
+  expect(pageAction).toHaveBeenLastCalledWith({ name: 'record.sort', input: { column: 'service_name', desc: false } });
+  await fireEvent.click(pagedList.getByRole('button', { name: 'Duration' }));
+  expect(pageAction).toHaveBeenLastCalledWith({ name: 'record.sort', input: { column: 'duration_nano', desc: true } });
+  expect(pagedList.getByRole('button', { name: '‹ Newer' })).toBeDisabled();
+  await fireEvent.click(pagedList.getByRole('button', { name: 'Older ›' }));
+  expect(pageAction).toHaveBeenLastCalledWith({ name: 'record.page', input: { after: ['t2', 'a', 'b'] } });
+  pagedList.unmount();
+  // A log's severity sorts by its number, so levels order by rank.
+  const bySeverity = render(RecordTable, { input: { signal: 'logs' }, result: { state: 'populated', data: { rows: logs } }, onaction: pageAction });
+  await fireEvent.click(bySeverity.getByRole('button', { name: 'Severity' }));
+  expect(pageAction).toHaveBeenLastCalledWith({ name: 'record.sort', input: { column: 'severity_number', desc: true } });
+  bySeverity.unmount();
+  // A log list shows every row it read; it wraps lines and hides columns without another read.
   const logList = render(RecordTable, { input: { signal: 'logs', limit: 120 }, result: { state: 'populated', data: { rows: logs } } });
   expect(logList.getByText('120 records · newest first')).toBeInTheDocument();
-  expect(logList.getAllByRole('row')).toHaveLength(51);
-  expect(logList.getByText('newest 120 read · older records not read')).toBeInTheDocument();
+  expect(logList.getAllByRole('row')).toHaveLength(121);
   expect(logList.getAllByRole('row')[1]).toHaveTextContent(String(logs.rows[0][3]));
-  await fireEvent.click(logList.getByRole('button', { name: 'Next page' }));
-  expect(logList.getAllByRole('row')[1]).toHaveTextContent(String(logs.rows[50][3]));
-  expect(logList.getByRole('button', { name: '2' })).toHaveAttribute('aria-current', 'page');
-  await fireEvent.change(logList.getByRole('combobox'), { target: { value: '100' } });
-  expect(logList.getAllByRole('row')).toHaveLength(101);
-  expect(logList.getByRole('button', { name: '1' })).toHaveAttribute('aria-current', 'page');
   await fireEvent.click(logList.getByRole('button', { name: 'Wrap lines' }));
   expect(logList.getByRole('button', { name: 'Wrap lines' })).toHaveAttribute('aria-pressed', 'true');
   await fireEvent.click(logList.getByRole('checkbox', { name: 'Message' }));
@@ -1672,6 +1683,11 @@ test('TASK-004: Authored query aliases do not declare telemetry semantics', asyn
   expect(sql.container.querySelector('.pill, .bar, time, .chip, tr.error')).toBeNull();
   expect(sql.getAllByRole('row')[1]).toHaveTextContent(/^refund policy cited21500000000$/);
   expect(sql.getAllByRole('row')[2]).toHaveTextContent(/^answer grounded03$/);
+  // Authored rows are complete, so a heading sorts them in the page: numbers largest first, then the other way.
+  await fireEvent.click(sql.getByRole('button', { name: 'duration_nano' }));
+  expect(sql.getAllByRole('row')[1]).toHaveTextContent(/^refund policy cited21500000000$/);
+  await fireEvent.click(sql.getByRole('button', { name: /duration_nano/ }));
+  expect(sql.getAllByRole('row')[1]).toHaveTextContent(/^answer grounded03$/);
   sql.unmount();
   // The same values under a signal list are canonical columns and read as telemetry.
   const signal = render(RecordTable, { input: { signal: 'spans' }, result: { state: 'populated', data: { rows: spans } } });

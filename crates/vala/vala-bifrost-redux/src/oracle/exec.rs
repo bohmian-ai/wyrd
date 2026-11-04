@@ -3150,6 +3150,263 @@ pub(super) mod tests {
         }
     }
 
+    /// A filter on a column whose file field carries metadata the table field
+    /// lacks prunes exactly as it does on an untagged file.
+    ///
+    /// Each file is written with `service_name` untagged, tagged with the
+    /// historical `wyrd:sensitive` key, or tagged with a neutral key, and is
+    /// read through the production hot scan against the untagged table
+    /// schema. Absent `IN` lists of 1, 3, 4, 8 and 32 values, each value
+    /// inside the group's min/max and proven absent by its Bloom filter, must
+    /// return nothing and be excluded by the Bloom filter alone, with no
+    /// statistics exclusion. A present four-value list returns its exact rows,
+    /// duplicates included. On a nullable file, `IN` and `NOT IN` lists
+    /// holding NULL keep SQL's three-valued results, and `IS NULL` /
+    /// `IS NOT NULL` exclude the group their null counts rule out.
+    ///
+    /// # Panics
+    ///
+    /// Panics when a fixture cannot be written or read, a probe is not
+    /// Bloom-negative, or any result or pruning count differs.
+    #[tokio::test]
+    async fn metadata_only_schema_differences_preserve_pruning() {
+        let table: SchemaRef = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("service_name", DataType::Utf8, true),
+        ]));
+        let root = tempfile::tempdir().expect("metadata fixture directory");
+        for tag in [None, Some("wyrd:sensitive"), Some("fixture:note")] {
+            let file = Arc::new(Schema::new(vec![
+                table.field(0).clone(),
+                table.field(1).clone().with_metadata(
+                    tag.map(|key| HashMap::from([(key.to_owned(), "true".to_owned())]))
+                        .unwrap_or_default(),
+                ),
+            ]));
+            let label = tag.unwrap_or("untagged");
+
+            // One row group of `svc-000`, `svc-010`, ... `svc-400`, with
+            // `svc-040` written twice.
+            let services = (0..=40)
+                .map(|step| Some(format!("svc-{:03}", step * 10)))
+                .chain([Some("svc-040".to_owned())])
+                .collect::<Vec<_>>();
+            let bloom_name = format!("bloom-{label}.parquet");
+            let bloom = write_service_groups(root.path(), &bloom_name, &file, &[&services]);
+            let probes = (1..400)
+                .filter(|value| value % 10 != 0)
+                .map(|value| format!("svc-{value:03}"))
+                .filter(|probe| !bloom_may_contain(&bloom.1, 0, probe))
+                .take(32)
+                .collect::<Vec<_>>();
+            assert_eq!(probes.len(), 32, "{label}: 32 Bloom-negative probes");
+            for size in [1, 3, 4, 8, 32] {
+                let list = probes[..size]
+                    .iter()
+                    .map(|probe| lit(probe.clone()))
+                    .collect();
+                let (ids, pruning) = scan_service_ids(
+                    root.path(),
+                    &bloom_name,
+                    bloom.0,
+                    &table,
+                    &col("service_name").in_list(list, false),
+                )
+                .await;
+                assert_eq!(ids, Vec::<i64>::new(), "{label}: absent {size}");
+                assert_eq!(
+                    (pruning.row_groups_pruned_bloom, pruning.row_groups_pruned),
+                    (1, 1),
+                    "{label}: absent {size} must fall to the Bloom filter alone"
+                );
+            }
+            let present = ["svc-040", "svc-100", "svc-999", "svc-005"]
+                .map(lit)
+                .to_vec();
+            let (ids, _) = scan_service_ids(
+                root.path(),
+                &bloom_name,
+                bloom.0,
+                &table,
+                &col("service_name").in_list(present, false),
+            )
+            .await;
+            assert_eq!(ids, vec![4, 10, 41], "{label}: present four-value list");
+
+            // Groups of mixed, all-null, and null-free values.
+            let nulls_name = format!("nulls-{label}.parquet");
+            let nulls = write_service_groups(
+                root.path(),
+                &nulls_name,
+                &file,
+                &[
+                    &[Some("svc-000".to_owned()), None, Some("svc-010".to_owned())],
+                    &[None, None],
+                    &[Some("svc-020".to_owned()), Some("svc-030".to_owned())],
+                ],
+            );
+            let null = || lit(datafusion::common::ScalarValue::Utf8(None));
+            for (predicate, expected, pruned) in [
+                (
+                    col("service_name").in_list(vec![lit("svc-000"), null()], false),
+                    vec![0],
+                    None,
+                ),
+                (
+                    col("service_name").in_list(vec![lit("svc-000"), null()], true),
+                    vec![],
+                    None,
+                ),
+                (col("service_name").is_null(), vec![1, 3, 4], Some(1)),
+                (col("service_name").is_not_null(), vec![0, 2, 5, 6], Some(1)),
+            ] {
+                let (ids, pruning) =
+                    scan_service_ids(root.path(), &nulls_name, nulls.0, &table, &predicate).await;
+                assert_eq!(ids, expected, "{label}: {predicate}");
+                if let Some(pruned) = pruned {
+                    assert_eq!(
+                        (pruning.row_groups_pruned, pruning.row_groups_pruned_bloom),
+                        (pruned, 0),
+                        "{label}: {predicate} must prune by null counts"
+                    );
+                }
+            }
+        }
+    }
+
+    /// Writes one `id`/`service_name` file of one row group per entry of
+    /// `groups` under `root`, numbering ids from zero across groups, with a
+    /// Bloom filter on `service_name`. Returns its size and bytes.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the file cannot be written.
+    fn write_service_groups(
+        root: &std::path::Path,
+        name: &str,
+        schema: &SchemaRef,
+        groups: &[&[Option<String>]],
+    ) -> (usize, Bytes) {
+        let mut sink = Vec::new();
+        let mut writer = parquet::arrow::ArrowWriter::try_new(
+            &mut sink,
+            Arc::clone(schema),
+            Some(fixture_writer_properties(&["service_name".to_owned()])),
+        )
+        .expect("service fixture writer");
+        let mut next = 0_i64;
+        for group in groups {
+            let ids = next..next + i64::try_from(group.len()).expect("group fits i64");
+            next = ids.end;
+            let batch = RecordBatch::try_new(
+                Arc::clone(schema),
+                vec![
+                    Arc::new(Int64Array::from_iter_values(ids)) as ArrayRef,
+                    Arc::new(StringArray::from(group.to_vec())) as ArrayRef,
+                ],
+            )
+            .expect("service fixture batch");
+            writer.write(&batch).expect("service fixture write");
+            writer.flush().expect("service fixture row-group flush");
+        }
+        writer.close().expect("service fixture close");
+        std::fs::write(root.join(name), &sink).expect("service fixture file");
+        (sink.len(), Bytes::from(sink))
+    }
+
+    /// Whether row group `group`'s `service_name` Bloom filter may contain
+    /// `value`.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the file or its Bloom filter cannot be read.
+    fn bloom_may_contain(bytes: &Bytes, group: usize, value: &str) -> bool {
+        use parquet::file::reader::FileReader as _;
+
+        let reader = parquet::file::serialized_reader::SerializedFileReader::new_with_options(
+            bytes.clone(),
+            parquet::file::serialized_reader::ReadOptionsBuilder::new()
+                .with_reader_properties(
+                    parquet::file::properties::ReaderProperties::builder()
+                        .set_read_bloom_filter(true)
+                        .build(),
+                )
+                .build(),
+        )
+        .expect("Bloom fixture reader");
+        reader
+            .get_row_group(group)
+            .expect("Bloom fixture group")
+            .get_column_bloom_filter(1)
+            .expect("service_name carries a Bloom filter")
+            .check(&value)
+    }
+
+    /// Runs `filter`, simplified as the logical optimizer simplifies a query's
+    /// filter, through the production hot scan of fixture `name` read as
+    /// `schema`, returning the sorted ids and the scan's pruning evidence.
+    ///
+    /// The simplifier is what rewrites an `IN` list of at most three values
+    /// into equalities, so the scan sees the shape a SQL query plans.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the filter does not simplify or the scan fails.
+    async fn scan_service_ids(
+        root: &std::path::Path,
+        name: &str,
+        size: usize,
+        schema: &SchemaRef,
+        filter: &Expr,
+    ) -> (Vec<i64>, PruningEvidence) {
+        let filter = datafusion::optimizer::simplify_expressions::ExprSimplifier::new(
+            datafusion::logical_expr::simplify::SimplifyContext::builder()
+                .with_schema(Arc::new(
+                    datafusion::common::DFSchema::try_from(schema.as_ref().clone())
+                        .expect("filter schema"),
+                ))
+                .build(),
+        )
+        .simplify(filter.clone())
+        .expect("filter simplifies");
+        let filter = &filter;
+        let options = crate::resources::OracleSessionShape::for_test().config_options();
+        let plan = pushed_filter(
+            fixture_hot_scan(
+                root,
+                vec![split_file(name, size)],
+                *FIXTURE_TENANT,
+                schema,
+                &options,
+            ),
+            filter,
+            &options,
+        );
+        let batches =
+            datafusion::physical_plan::collect(Arc::clone(&plan), Arc::new(TaskContext::default()))
+                .await
+                .expect("service fixture scan");
+        let mut ids = batches
+            .iter()
+            .flat_map(|batch| {
+                batch
+                    .column(0)
+                    .as_any()
+                    .downcast_ref::<Int64Array>()
+                    .expect("id is Int64")
+                    .values()
+                    .to_vec()
+            })
+            .collect::<Vec<_>>();
+        ids.sort_unstable();
+        let mut leaf = plan;
+        while let Some(child) = leaf.children().first().map(|child| Arc::clone(*child)) {
+            leaf = child;
+        }
+        let metrics = leaf.metrics().expect("the hot scan records metrics");
+        (ids, parquet_pruning(&metrics))
+    }
+
     /// One retained plan reads its batch size and bound sources only from the
     /// task it is executed with.
     ///

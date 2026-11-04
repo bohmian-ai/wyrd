@@ -2300,6 +2300,120 @@ mod tests {
         assert_truncated_arrow_fails_closed(&decode_replayed_slice(&state.data_records[0]));
     }
 
+    /// A WAL acknowledged before canonical schemas dropped their sensitivity
+    /// labels replays unchanged.
+    ///
+    /// The fixture under `fixtures/tagged-spans-wal` was written by the
+    /// pre-change Scribe: one two-span `traces.spans` batch whose Arrow schema
+    /// carries `wyrd:sensitive` on every field. Replay must keep that schema as
+    /// inert metadata, restore the original batch and request identity, accept
+    /// the fence because its digest still authenticates the recovered slice,
+    /// and leave the WAL bytes untouched.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the fixture cannot be copied or replayed, or when any
+    /// recovered value, field ID, identity or WAL byte differs.
+    #[test]
+    fn tagged_wal_replays_without_identity_changes() {
+        const SEGMENT: &str = "00000000000000000000000000000000/1/shard-00/0.wal";
+        let fixture = std::fs::read(
+            Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("fixtures/tagged-spans-wal")
+                .join(SEGMENT),
+        )
+        .expect("baseline WAL fixture");
+        let temp_dir = TempDir::new().expect("temp dir");
+        let segment = temp_dir.path().join(SEGMENT);
+        std::fs::create_dir_all(segment.parent().expect("segment directory"))
+            .expect("segment directory");
+        std::fs::write(&segment, &fixture).expect("copy fixture");
+
+        let replayed = replay_wal_directory(temp_dir.path()).expect("replay");
+        let state = replayed
+            .values()
+            .find(|state| !state.commits.is_empty())
+            .expect("one committed seal key");
+        assert_eq!((state.commits.len(), state.append_metas.len()), (1, 1));
+        let commit = &state.commits[0];
+        let meta = &state.append_metas[0];
+        assert_eq!(
+            uuid::Uuid::from_bytes(commit.batch_id).to_string(),
+            "01900000-0000-7000-8000-000000000004"
+        );
+        assert_eq!(
+            commit.request_id.to_string(),
+            "01900000-0000-7000-8000-000000000003"
+        );
+        assert_eq!(meta.rows_accepted, 2);
+
+        let rows = decode_replayed_slice(&state.data_records[0]);
+        let mut logical = crate::scribe::preprocess::LogicalBatchDigest::new();
+        let (data_digest, data_len) =
+            crate::scribe::preprocess::logical_data_identity(&rows).expect("logical identity");
+        logical.push_slice(
+            meta.append_slice_id.slice_index,
+            &meta.schema_fingerprint,
+            &data_digest,
+            data_len,
+        );
+        assert_eq!(
+            logical.finish(),
+            commit.slice_set_digest,
+            "the original fence authenticates the recovered slice"
+        );
+
+        let physical = (crate::tables::builtin_table("traces", "spans")
+            .expect("the spans built-in resolves")
+            .schema)();
+        assert_eq!(rows.schema().fields().len(), physical.fields().len());
+        for (recovered, current) in rows.schema().fields().iter().zip(physical.fields()) {
+            assert_eq!(recovered.name(), current.name());
+            assert_eq!(
+                recovered.metadata().get("PARQUET:field_id"),
+                current.metadata().get("PARQUET:field_id"),
+                "{} keeps its field ID",
+                current.name()
+            );
+            assert!(
+                recovered.metadata().contains_key("wyrd:sensitive"),
+                "{} keeps its historical label as inert metadata",
+                current.name()
+            );
+        }
+        let column = |name: &str| {
+            rows.column_by_name(name)
+                .unwrap_or_else(|| panic!("{name} recovered"))
+                .clone()
+        };
+        let trace_ids = column("trace_id");
+        let trace_ids = trace_ids
+            .as_any()
+            .downcast_ref::<arrow::array::FixedSizeBinaryArray>()
+            .expect("trace_id is fixed-size binary");
+        assert_eq!(
+            trace_ids.iter().collect::<Vec<_>>(),
+            vec![Some([7_u8; 16].as_slice()), Some([9_u8; 16].as_slice())]
+        );
+        let names = arrow::compute::cast(&column("name"), &arrow::datatypes::DataType::Utf8)
+            .expect("name casts to Utf8");
+        let names = names
+            .as_any()
+            .downcast_ref::<arrow::array::StringArray>()
+            .expect("Utf8 names");
+        assert_eq!(
+            names.iter().collect::<Vec<_>>(),
+            vec![Some("span-7"), Some("span-9")]
+        );
+
+        assert_replay_is_idempotent(temp_dir.path(), state, commit);
+        assert_eq!(
+            std::fs::read(&segment).expect("replayed segment"),
+            fixture,
+            "replay does not rewrite the acknowledged WAL"
+        );
+    }
+
     /// Assert every recovered slice authenticates the fence and its schema.
     ///
     /// The fence digest is the *logical* identity, distinct from the WAL

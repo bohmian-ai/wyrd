@@ -26,7 +26,7 @@ mod tests {
 
     use super::spans::SPAN_FIELDS;
     use super::{canonical_span_schema, project_resource_spans};
-    use crate::tables::fields::{PARQUET_FIELD_ID, WYRD_SENSITIVE};
+    use crate::tables::fields::PARQUET_FIELD_ID;
     use crate::tables::signal::{validate_canonical_user_batch, without_correlation_columns};
 
     /// Build one attribute entry with the supplied protocol value.
@@ -240,7 +240,7 @@ mod tests {
     /// # Panics
     ///
     /// Panics when any canonical value, order, presence distinction, declared field id,
-    /// sensitivity marker, or name-bound validation result differs.
+    /// or name-bound validation result differs.
     #[test]
     fn maximal_span_projection_is_lossless_and_identity_mapped() {
         let attributes = maximal_span_attributes();
@@ -317,12 +317,6 @@ mod tests {
                 field.metadata().get(PARQUET_FIELD_ID),
                 None,
                 "{} declares no id; the registered table assigns it",
-                declared.name
-            );
-            assert_eq!(
-                field.metadata().get(WYRD_SENSITIVE),
-                Some(&declared.class.is_sensitive().to_string()),
-                "{} carries its sensitivity",
                 declared.name
             );
         }

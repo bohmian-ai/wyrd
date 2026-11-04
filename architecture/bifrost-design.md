@@ -516,6 +516,17 @@ schema/layout hashing, not required casts or trust-boundary validation.
 Reuse the existing conformance-plan cache by version/descriptor and actual
 source shape; do not hash layout JSON or resolve current metadata per batch.
 
+A canonical signal table's physical Arrow schema carries no field-class
+label. The ledger owns each column's projection and permission class, and
+payload authorization reads table and column policy, never Arrow metadata.
+Without the label, sealed Parquet field metadata equals the registered Iceberg
+schema, so filters reach statistics and Bloom filters uncast. The version-3
+canonical physical fingerprint commits names, types, nullability, nested
+children and semantic metadata other than field ids and extension keys; it
+has no class byte. Data accepted under an earlier labelled schema is not
+restamped: replay keeps its original schema, fence and digest, and the label
+is inert metadata on those files.
+
 Bifrost has three timestamp types, named as Snowflake names them:
 
 - `TIMESTAMP_NTZ`: a wall-clock reading with no instant, stored as a naive
@@ -899,7 +910,12 @@ columns resolve by field id, file pruning is re-planned against each file's own
 schema, and the live tail carries the required fields so memtable rows admitted
 under an earlier table version project by id. A column a source predates reads
 null,
-so filters on it stay exact. There is no caller-selected source
+so filters on it stay exact. Where a file column differs from the table
+column only in field metadata, with the same scalar Arrow type and no
+extension type on either, the adapted predicate references the file column
+bare instead of casting it, so an `IN` list of any length or a null test
+still prunes by statistics and Bloom filters; projection still adapts the
+column to the table field. There is no caller-selected source
 mode, freshness policy, or query class.
 
 Oracle plans every query once through the pinned `datafusion-distributed`

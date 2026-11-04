@@ -2622,8 +2622,9 @@ const CUSTOM_BLOOM_COLUMN: &str = "label";
 ///   every file but exclude the other files' only row groups by footer
 ///   statistics, with no Bloom exclusion;
 /// - **Bloom** — an absent `trace_id`, verified Bloom-negative and inside its
-///   file's min/max, and an absent custom label inside every file's bounds,
-///   are excluded by the Bloom filter after statistics kept the group;
+///   file's min/max, alone and in a four-value `IN` list, and an absent custom
+///   label inside every file's bounds, are excluded by the Bloom filter after
+///   statistics kept the group;
 /// - **page index** — the custom key lookup skips rows of its retained
 ///   multi-page row group.
 ///
@@ -2697,9 +2698,10 @@ const REWRITE_ROW_GROUP_BYTES: u64 = 768 * 1024;
 /// - **row-group min/max** — the rewritten custom file holds several row
 ///   groups, and the key, slice, and request-id lookups exclude the groups
 ///   whose disjoint ranges cannot match;
-/// - **Bloom** — the absent `trace_id` and custom label, re-verified
-///   Bloom-negative against each cut's own filters and inside its bounds, are
-///   excluded by the Bloom filter after statistics kept the group;
+/// - **Bloom** — the absent `trace_id`, alone and in a four-value `IN` list,
+///   and custom label, re-verified Bloom-negative against each cut's own
+///   filters and inside its bounds, are excluded by the Bloom filter after
+///   statistics kept the group;
 /// - **page index** — the custom key lookup skips rows of its retained
 ///   multi-page row group in both Iceberg cuts.
 ///
@@ -3999,6 +4001,27 @@ impl FilteringFixture {
                 })
             })
             .ok_or("no unwritten trace id inside file 1's bounds is Bloom-negative")?;
+        // A four-value list keeps its `IN` shape through planning, where three
+        // values become equalities: the in-bounds probe plus unwritten ids
+        // between file 1's largest and file 2's smallest trace, all
+        // Bloom-negative, so statistics keep file 1's group alone.
+        let span_list = std::iter::once(span_probe)
+            .chain(
+                (2 * SIGNAL_ROWS_PER_FILE..i64::from(u8::MAX))
+                    .map(|ordinal| fixture_trace_id(1, ordinal))
+                    .filter(|candidate| {
+                        spans.iter().all(|object| {
+                            object
+                                .may_contain("trace_id", candidate)
+                                .is_ok_and(|hit| !hit)
+                        })
+                    }),
+            )
+            .take(4)
+            .collect::<Vec<_>>();
+        if span_list.len() != 4 {
+            return Err("fewer than four unwritten trace ids are Bloom-negative".into());
+        }
         // Odd labels lie between every file's `label-00` and `label-14`.
         let label_probe = (0..7)
             .map(|index| format!("label-{:02}", 2 * index + 1))
@@ -4021,6 +4044,7 @@ impl FilteringFixture {
             .collect::<Result<Vec<_>, _>>()?;
         Ok(FilterProbes {
             span_probe,
+            span_list,
             label_probe,
             request_ids,
             custom_groups: custom.iter().map(SealedObject::row_groups).sum(),
@@ -4371,6 +4395,36 @@ impl FilteringFixture {
         )?;
         expect_measure("spans absent trace", "bloom", absent.bloom_pruned, 1.0)?;
 
+        let absent_list = run_case(
+            cluster,
+            reader,
+            FilterCase {
+                name: "spans absent four-trace list".to_owned(),
+                sql: format!(
+                    "SELECT CAST(start_time_unix_nano AS BIGINT) AS id FROM bifrost.traces.spans \
+                     WHERE trace_id IN ({}) ORDER BY id",
+                    probes
+                        .span_list
+                        .iter()
+                        .map(|id| format!("X'{}'", hex::encode(id)))
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                ),
+                expected: Vec::new(),
+            },
+        )
+        .await?;
+        // Statistics drop the groups the single probe's case drops and keep
+        // file 1's group for the in-bounds probe; its Bloom filter excludes it.
+        expect_measure("spans absent list", "files", absent_list.files, files)?;
+        expect_measure(
+            "spans absent list",
+            "pruned",
+            absent_list.row_groups_pruned,
+            pruned,
+        )?;
+        expect_measure("spans absent list", "bloom", absent_list.bloom_pruned, 1.0)?;
+
         let spans_time = |file| self.slice_filter("start_time_unix_nano", file);
         let signal_time = |file| self.slice_filter("time_unix_nano", file);
         for (name, table, time, filter, expected) in [
@@ -4481,6 +4535,9 @@ struct FilterProbes {
     /// An unwritten trace id inside file 1's `trace_id` bounds whose Bloom
     /// filter answers absent.
     span_probe: [u8; 16],
+    /// Four unwritten trace ids, the first [`Self::span_probe`] and the rest
+    /// beyond file 1's bounds yet below file 2's, every one Bloom-negative.
+    span_list: Vec<[u8; 16]>,
     /// An unwritten label inside every custom file's bounds whose Bloom
     /// filters all answer absent.
     label_probe: String,

@@ -574,7 +574,7 @@ pub trait DomainTable: Send + Sync + 'static {
     /// The canonical signal ledger, when this table owns an `OTel` signal.
     ///
     /// Returning `Some` makes the table canonical: its physical schema,
-    /// sensitivity metadata, and canonical physical fingerprint are all derived
+    /// field classes, and canonical physical fingerprint are all derived
     /// from the returned declaration rather than from a separately maintained
     /// Arrow field list. Pre-declared tables return `None` and keep their
     /// user-schema fingerprint. Field ids are never declared here: every table
@@ -610,7 +610,7 @@ pub trait DomainTable: Send + Sync + 'static {
     /// Full physical schema.
     ///
     /// A canonical table derives its whole physical schema, including the
-    /// Observation envelope's sensitivity tags, from its ledger. Every other table
+    /// Observation envelope, from its ledger. Every other table
     /// keeps the existing managed-column append.
     fn schema() -> SchemaRef {
         match Self::canonical_fields() {
@@ -628,8 +628,8 @@ pub trait DomainTable: Send + Sync + 'static {
     /// This is a different identity from [`Self::schema_fingerprint`], which
     /// keeps its user-schema meaning for catalog rows. The canonical physical
     /// fingerprint covers the complete physical schema — envelope included —
-    /// with every ordered name, type, nested child, nullability, sensitivity,
-    /// and metadata entry other than a registered field id, and is what the Arrow validator, the Gate validation
+    /// with every ordered name, type, nested child, nullability, and metadata
+    /// entry other than a registered field id, and is what the Arrow validator, the Gate validation
     /// proof, the Parquet/Iceberg checks, and recovery compare.
     ///
     /// # Panics
@@ -663,8 +663,8 @@ pub trait DomainTable: Send + Sync + 'static {
 /// keeps its existing user-schema meaning for `BifrostTableEntry.fingerprint`
 /// and dynamic-table catalog rows. A canonical physical fingerprint commits to
 /// the *whole* physical schema — envelope fields included — plus every ordered
-/// name, physical type, nested child, nullability, sensitivity, and semantic
-/// metadata entry, so a canonical built-in cannot drift in any of those
+/// name, physical type, nested child, nullability, and semantic metadata
+/// entry, so a canonical built-in cannot drift in any of those
 /// dimensions without the fingerprint changing. Numeric field ids are not part
 /// of the identity: the registered Iceberg table assigns them, so a schema
 /// stamped with those ids fingerprints the same as the bare declaration.
@@ -676,9 +676,8 @@ impl CanonicalPhysicalFingerprint {
     ///
     /// # Errors
     ///
-    /// Returns [`TableError::Internal`] when a field carries no
-    /// `wyrd:sensitive` marker or an Arrow type outside the closed canonical
-    /// set.
+    /// Returns [`TableError::Internal`] when a field carries an Arrow type
+    /// outside the closed canonical set.
     pub fn from_physical_fields(fields: &Fields) -> Result<Self, TableError> {
         let mut hasher = Sha256::new();
         hasher.update(canonical_physical_fingerprint_bytes(fields)?);
@@ -1015,7 +1014,7 @@ fn with_registered_id(field: &Field, registered: &NestedField) -> Result<Field, 
 /// Re-stamp one column's declared type with the table's own field identity.
 ///
 /// A writer supplies buffers; nested element names and the `PARQUET:field_id`
-/// and `wyrd:sensitive` tags are the table layer's, assigned at registration
+/// tags are the table layer's, assigned at registration
 /// and re-derived on every stamp. When the two agree in shape, this replaces
 /// the array's declared type - recursively, because a list or struct array's
 /// child data carries its own declared type - so the assembled batch is
@@ -1070,14 +1069,16 @@ fn retype(
 /// Version byte prefixing every canonical physical fingerprint encoding.
 ///
 /// Any change to the encoding below must take the next unused version byte so
-/// an old and a new encoding can never collide.
-const CANONICAL_FINGERPRINT_VERSION: u8 = 2;
+/// an old and a new encoding can never collide. Version 3 dropped the
+/// per-field sensitivity byte: field classes live in the ledger, not on the
+/// Arrow schema.
+const CANONICAL_FINGERPRINT_VERSION: u8 = 3;
 
 /// Encode one canonical physical schema into its pre-hash fingerprint bytes.
 ///
 /// The encoding is a version byte, the top-level field count, and then each
 /// field in declared order as: length-prefixed name, type bytes, nullability,
-/// sensitivity, its metadata entries other than `PARQUET:field_id` and the
+/// its metadata entries other than `PARQUET:field_id` and the
 /// Arrow extension keys in ascending raw key-byte order, and finally its
 /// nested child count followed depth-first by the same record for each child.
 /// A Variant field writes the single tag `0x0d` and a zero child count, so
@@ -1091,8 +1092,7 @@ const CANONICAL_FINGERPRINT_VERSION: u8 = 2;
 ///
 /// # Errors
 ///
-/// Returns [`TableError::Internal`] for a missing sensitivity marker or an
-/// Arrow type with no pinned type tag.
+/// Returns [`TableError::Internal`] for an Arrow type with no pinned type tag.
 pub fn canonical_physical_fingerprint_bytes(fields: &Fields) -> Result<Vec<u8>, TableError> {
     let mut bytes = vec![CANONICAL_FINGERPRINT_VERSION];
     encode_field_sequence(fields, &mut bytes)?;
@@ -1116,8 +1116,7 @@ fn encode_field_sequence(fields: &Fields, out: &mut Vec<u8>) -> Result<(), Table
 ///
 /// # Errors
 ///
-/// Returns [`TableError::Internal`] when the field lacks a sensitivity marker
-/// or its type has no pinned tag.
+/// Returns [`TableError::Internal`] when the field's type has no pinned tag.
 fn encode_field(field: &Field, out: &mut Vec<u8>) -> Result<(), TableError> {
     let variant = is_variant(field);
     encode_len_prefixed(field.name().as_bytes(), out)?;
@@ -1127,7 +1126,6 @@ fn encode_field(field: &Field, out: &mut Vec<u8>) -> Result<(), TableError> {
         encode_data_type(field.data_type(), out)?;
     }
     out.push(u8::from(field.is_nullable()));
-    out.push(u8::from(sensitivity(field)?));
 
     let mut entries: Vec<(&String, &String)> = field
         .metadata()
@@ -1219,27 +1217,6 @@ fn child_fields(data_type: &DataType) -> Option<Fields> {
         DataType::List(child) => Some(Fields::from(vec![child.as_ref().clone()])),
         DataType::Struct(children) => Some(children.clone()),
         _ => None,
-    }
-}
-
-/// Read one field's declared sensitivity from its Arrow metadata.
-///
-/// # Errors
-///
-/// Returns [`TableError::Internal`] when the marker is absent or is not
-/// `true`/`false`.
-pub fn sensitivity(field: &Field) -> Result<bool, TableError> {
-    match field
-        .metadata()
-        .get(fields::WYRD_SENSITIVE)
-        .map(String::as_str)
-    {
-        Some("true") => Ok(true),
-        Some("false") => Ok(false),
-        _ => Err(TableError::Internal(format!(
-            "field {} carries no sensitivity marker",
-            field.name()
-        ))),
     }
 }
 
@@ -2505,10 +2482,72 @@ mod tests {
         }
     }
 
+    /// No canonical physical schema, stamped or not, carries sensitivity
+    /// metadata at any depth, and each still fingerprints.
+    ///
+    /// Sensitivity is a permission class the table definition owns: each
+    /// canonical table's sensitive payload columns are exactly its ledger's
+    /// sensitive declarations.
+    ///
+    /// # Panics
+    ///
+    /// Panics when any field or nested child of a canonical schema carries a
+    /// `wyrd:sensitive` entry, a schema does not fingerprint, or a table's
+    /// sensitive columns differ from its ledger's.
+    #[test]
+    fn canonical_schemas_do_not_carry_sensitivity_metadata() {
+        fn assert_untagged(field: &Field, table: &str) {
+            assert!(
+                !field.metadata().contains_key("wyrd:sensitive"),
+                "{table}.{} carries sensitivity metadata",
+                field.name()
+            );
+            for child in child_fields(field.data_type()).iter().flatten() {
+                assert_untagged(child, table);
+            }
+        }
+
+        for (namespace, name) in [
+            ("traces", "spans"),
+            ("logs", "records"),
+            ("metrics", "points"),
+        ] {
+            let definition = builtin_table(namespace, name).expect("canonical definition");
+            let physical = (definition.schema)();
+            let registered = iceberg::arrow::arrow_schema_to_schema_auto_assign_ids(&physical)
+                .expect("the physical schema has an Iceberg projection");
+            let stamped = stamp_registered_field_ids(
+                &RecordBatch::new_empty(Arc::clone(&physical)),
+                &registered,
+            )
+            .expect("every physical field is registered")
+            .schema();
+            for schema in [&physical, &stamped] {
+                for field in schema.fields() {
+                    assert_untagged(field, name);
+                }
+                CanonicalPhysicalFingerprint::from_physical_fields(schema.fields())
+                    .expect("an untagged canonical schema fingerprints");
+            }
+
+            let ledger = (definition.canonical_fields)().expect("canonical ledger");
+            let mut sensitive = ledger
+                .iter()
+                .filter(|field| field.class.is_sensitive())
+                .map(|field| field.name)
+                .collect::<Vec<_>>();
+            let mut declared = definition.sensitive_payload_columns.to_vec();
+            sensitive.sort_unstable();
+            declared.sort_unstable();
+            assert_eq!(declared, sensitive, "{name} sensitive payload columns");
+        }
+    }
+
     /// The canonical fingerprint encoding is byte-stable and ignores field ids.
     ///
     /// The fixture carries `PARQUET:field_id` entries, as a schema stamped
-    /// from a registered table does, to pin that the ids contribute nothing.
+    /// from a registered table does, to pin that the ids contribute nothing,
+    /// and semantic metadata entries, to pin their sorted encoding.
     ///
     /// # Panics
     ///
@@ -2517,44 +2556,34 @@ mod tests {
     /// or when stripping the ids changes the encoding.
     #[test]
     fn canonical_physical_fingerprint_bytes_are_stable() {
-        let child = Field::new("item", DataType::Utf8, true).with_metadata(HashMap::from([
-            (fields::WYRD_SENSITIVE.to_owned(), "true".to_owned()),
-            (fields::PARQUET_FIELD_ID.to_owned(), "3".to_owned()),
-        ]));
+        let field_id =
+            |id: &str| HashMap::from([(fields::PARQUET_FIELD_ID.to_owned(), id.to_owned())]);
+        let child = Field::new("item", DataType::Utf8, true).with_metadata(field_id("3"));
         let naive = Field::new(
             "naive",
             DataType::Timestamp(ArrowTimeUnit::Microsecond, None),
             false,
         )
-        .with_metadata(HashMap::from([
-            (fields::WYRD_SENSITIVE.to_owned(), "false".to_owned()),
-            (fields::PARQUET_FIELD_ID.to_owned(), "2".to_owned()),
-        ]));
+        .with_metadata(field_id("2"));
         let zoned = Field::new(
             "zoned",
             DataType::Timestamp(ArrowTimeUnit::Microsecond, Some("".into())),
             true,
         )
         .with_metadata(HashMap::from([
+            ("b".to_owned(), "2".to_owned()),
             (fields::PARQUET_FIELD_ID.to_owned(), "4".to_owned()),
-            (fields::WYRD_SENSITIVE.to_owned(), "false".to_owned()),
+            ("a".to_owned(), "1".to_owned()),
         ]));
         let nested = Field::new(
             "nested",
             DataType::Struct(Fields::from(vec![
-                Field::new("values", DataType::List(Arc::new(child)), false).with_metadata(
-                    HashMap::from([
-                        (fields::WYRD_SENSITIVE.to_owned(), "true".to_owned()),
-                        (fields::PARQUET_FIELD_ID.to_owned(), "5".to_owned()),
-                    ]),
-                ),
+                Field::new("values", DataType::List(Arc::new(child)), false)
+                    .with_metadata(field_id("5")),
             ])),
             true,
         )
-        .with_metadata(HashMap::from([
-            (fields::PARQUET_FIELD_ID.to_owned(), "1".to_owned()),
-            (fields::WYRD_SENSITIVE.to_owned(), "false".to_owned()),
-        ]));
+        .with_metadata(field_id("1"));
 
         let schema = Fields::from(vec![nested, naive, zoned]);
         let bytes = canonical_physical_fingerprint_bytes(&schema).expect("the schema encodes");
@@ -2573,13 +2602,13 @@ mod tests {
         });
         assert_eq!(
             hex,
-            "0200000003000000066e65737465640c0100000000010000000e777972643a73656e7369746976650000000566616c7365000000010000000676616c7565730b0001000000010000000e777972643a73656e736974697665000000047472756500000001000000046974656d070101000000010000000e777972643a73656e736974697665000000047472756500000000000000056e616976650a02000000000000010000000e777972643a73656e7369746976650000000566616c736500000000000000057a6f6e65640a0201000000000100000000010000000e777972643a73656e7369746976650000000566616c736500000000"
+            "0300000003000000066e65737465640c0100000000000000010000000676616c7565730b000000000000000001000000046974656d07010000000000000000000000056e616976650a0200000000000000000000000000057a6f6e65640a0201000000000100000002000000016100000001310000000162000000013200000000"
         );
         assert_eq!(
             CanonicalPhysicalFingerprint::from_physical_fields(&schema)
                 .expect("the schema fingerprints")
                 .to_hex(),
-            "82ca36c7a0512f207912abdb53c086b17f98b0c5ab9dd0e191120557d927d9a9"
+            "f7a36a07c324e57f61d58c8a274a24cdc1066684d925807c2aa425471c5cfbeb"
         );
     }
 
@@ -2998,7 +3027,7 @@ mod tests {
     ///
     /// # Panics
     ///
-    /// Panics when a widened type, a changed timezone spelling, a lost nested
+    /// Panics when a widened type, a changed timezone spelling, a gained nested
     /// metadata entry, an unknown `wyrd_*` field, or a duplicated reserved
     /// field leaves the canonical physical fingerprint unchanged, or when a
     /// registered field id changes it.
@@ -3023,15 +3052,16 @@ mod tests {
             Fields::from(fields)
         };
 
-        let nested_metadata_dropped = mutate_first(
+        let nested_metadata_gained = mutate_first(
             |field| matches!(field.data_type(), DataType::List(_)),
             &|field| match field.data_type() {
                 DataType::List(element) => Field::new(
                     field.name(),
-                    DataType::List(Arc::new(Field::new(
-                        element.name(),
-                        element.data_type().clone(),
-                        element.is_nullable(),
+                    DataType::List(Arc::new(element.as_ref().clone().with_metadata(
+                        std::collections::HashMap::from([(
+                            "fixture:note".to_owned(),
+                            "drift".to_owned(),
+                        )]),
                     ))),
                     field.is_nullable(),
                 )
@@ -3040,9 +3070,9 @@ mod tests {
             },
         );
         assert!(
-            !CanonicalPhysicalFingerprint::from_physical_fields(&nested_metadata_dropped)
+            !CanonicalPhysicalFingerprint::from_physical_fields(&nested_metadata_gained)
                 .is_ok_and(|drifted| drifted == baseline),
-            "a nested child that loses its metadata drifts the canonical physical identity"
+            "a nested child that gains semantic metadata drifts the canonical physical identity"
         );
 
         let field_id_stamped = mutate_first(|_| true, &|field| {
@@ -3059,14 +3089,7 @@ mod tests {
         );
 
         let mut unknown: Vec<Arc<Field>> = physical.fields().iter().map(Arc::clone).collect();
-        unknown.push(Arc::new(
-            Field::new("wyrd_unknown", DataType::Utf8, true).with_metadata(
-                std::collections::HashMap::from([(
-                    fields::WYRD_SENSITIVE.to_owned(),
-                    "false".to_owned(),
-                )]),
-            ),
-        ));
+        unknown.push(Arc::new(Field::new("wyrd_unknown", DataType::Utf8, true)));
         assert_ne!(
             CanonicalPhysicalFingerprint::from_physical_fields(&Fields::from(unknown))
                 .expect("an extra field still fingerprints"),
@@ -3247,22 +3270,16 @@ mod tests {
 
         // A Variant commits its name, tag, and zero children; neither the
         // storage children nor the extension keys enter the identity.
-        let payload = variant_field("payload", true);
-        let mut metadata = payload.metadata().clone();
-        metadata.insert(fields::WYRD_SENSITIVE.to_owned(), "false".to_owned());
-        let bytes = canonical_physical_fingerprint_bytes(&Fields::from(vec![
-            payload.with_metadata(metadata),
-        ]))
+        let bytes = canonical_physical_fingerprint_bytes(&Fields::from(vec![variant_field(
+            "payload", true,
+        )]))
         .expect("a Variant schema encodes");
         let hex = bytes.iter().fold(String::new(), |mut hex, byte| {
             use std::fmt::Write as _;
             let _ = write!(hex, "{byte:02x}");
             hex
         });
-        assert_eq!(
-            hex,
-            "0200000001000000077061796c6f61640d0100000000010000000e777972643a73656e7369746976650000000566616c736500000000"
-        );
+        assert_eq!(hex, "0300000001000000077061796c6f61640d010000000000000000");
 
         for (violation, code, detail_keys) in [
             (

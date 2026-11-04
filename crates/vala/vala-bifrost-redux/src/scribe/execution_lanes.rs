@@ -944,8 +944,8 @@ fn enforce_dynamic_variants(
 /// `wyrd_*` field first, and afterwards requires its user block to match
 /// `(definition.arrow_fields)()` in order, so no structurally different Arrow
 /// spelling reaches the physical schema. Field metadata is not compared: the
-/// field id and sensitivity tag are the server's own physical identity,
-/// stamped downstream from the registered table and the definition, so a
+/// field id is the server's own physical identity, stamped downstream from
+/// the registered table, and the declared metadata from the definition, so a
 /// writer building from the published description neither supplies them nor
 /// can be wrong about them.
 ///
@@ -1085,7 +1085,7 @@ fn refuse_supplied_dimensions(rows: &RecordBatch) -> Result<(), ScribeError> {
 /// Confirms a stamped canonical batch still carries its table-owned identity.
 ///
 /// The stamped batch is built from `(definition.schema)()`, so its correlation
-/// and managed `Field`s — sensitivity metadata, nullability — are
+/// and managed `Field`s — metadata, nullability — are
 /// the table's own rather than locally reconstructed. This re-derives the
 /// canonical physical fingerprint from the stamped schema and compares it with
 /// the definition's resolved identity, so any future divergence between the
@@ -1293,7 +1293,7 @@ fn stamp_correlation_columns(
     fields.extend(ensure_managed_columns(Vec::new()));
     columns.extend(managed);
     // A canonical built-in constructs only the arrays here: every correlation
-    // and managed `Field` — with its sensitivity metadata — is
+    // and managed `Field` — with its metadata — is
     // cloned from the table's own physical schema, and the locally assembled
     // field list is compared against it first so a drifting stamping order is
     // refused rather than silently relabelled.
@@ -1319,8 +1319,8 @@ fn stamp_correlation_columns(
     }
     // The arrays are the writer's; the identity on them is the table's. Every
     // column is re-typed onto the physical field it fills, so the stamped
-    // batch carries the table layer's sensitivity tags whether or not the
-    // writer echoed them.
+    // batch carries the table layer's nested field identity whether or not
+    // the writer echoed it.
     let columns = physical
         .fields()
         .iter()

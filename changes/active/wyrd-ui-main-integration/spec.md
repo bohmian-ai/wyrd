@@ -1,10 +1,18 @@
 ---
 id: SPEC-wyrd-ui-main-integration
-revision: 21
+revision: 22
 status: approved
 ---
 
 # Migrate the Wyrd UI onto current main
+
+## Revision 22 — DEBUG logs show by default
+
+**Approved by the caller on 2026-11-04.** REQ-048 said a default UI severity
+filter hides DEBUG. The Logs page has no such filter. Like conventional log
+viewers, it lists every severity by default, and the records chart shows
+TRACE and DEBUG (severity 1–8) as their own `debug` level. REQ-048 now says
+so. No default severity filter is added.
 
 ## Revision 21 — Histograms on the conventional Metrics page only
 
@@ -44,7 +52,7 @@ The development workload is too clean to test Observe:
   the standard `http.server.request.duration` and `gen_ai.client.*`
   histograms and the app's `support_desk.ask.duration`, are histograms.
 - **Logs.** The app writes INFO lines and one WARN case. There is no ERROR or
-  exception, and the severity filter has nothing to hide.
+  exception, and nothing below INFO is written.
 
 **Before:** the Errors chart is flat at zero, and every status pill reads
 `unset`. A histogram metric's chart says it is not plotted.
@@ -113,7 +121,8 @@ histograms are deferred (revision 21).
   - WARN for each unknown order, and for each model call slower than 1 s;
   - ERROR with exception type, message and stack trace for each failed
     request;
-  - DEBUG detail, which the default UI severity filter hides.
+  - DEBUG detail, which Observe lists by default with every other severity
+    and charts as its own `debug` level.
 
   Every record emitted inside a request carries its trace and span ids, so
   Open trace works from any of them. No secret or credential is logged.
@@ -2020,6 +2029,8 @@ review verdicts are not rewritten. A host lacking supported integration is a
 reported live-proof blocker, never an assumed capability or silent pass.
 
 ## Revision history and authorities
+
+- Revision 22 approved (2026-11-04): REQ-048 corrected; DEBUG logs show by default and chart as their own level, since no default severity filter exists or is added.
 
 - Revision 21 approved (2026-11-03): REQ-051 and AC-030 narrowed to the conventional Metrics page; MCP App histograms deferred to the MCP App delivery because no MCP App metrics view or served `ui://wyrd/view` exists yet.
 

@@ -285,7 +285,7 @@ export async function loadFacetRail(input: FacetRailInput, context: LoadContext)
  * and the cues its cells read, a span's parent and a record's severity number.
  */
 export const KEY_COLUMNS: Record<Signal, readonly string[]> = {
-  traces: ['trace_id', 'span_id'],
+  traces: ['trace_id', 'span_id', 'duration_nano'],
   spans: ['trace_id', 'span_id', 'parent_span_id'],
   logs: ['trace_id', 'span_id', 'observed_time_unix_nano', 'wyrd_request_id', 'severity_number'],
   metrics: []
@@ -895,14 +895,24 @@ export async function loadLogTimeline(input: { readonly where?: readonly Filter[
   return { input: chart, executed: plan, result: read.ok ? shapeChart(chart, read.value) : failed(read.problem) };
 }
 
-/** Span and error counts of exactly these traces, whatever their time. */
-export function countsQuery(traceIds: readonly string[]): Executed {
-  const binds = new Binds();
+/** How far a trace's spans may start outside its root's own start and end: clock skew between services, and work that outlives the root. */
+const TRACE_SLACK_MS = 3_600_000;
+
+/**
+ * Span and error counts of exactly these traces. `roots` is the time their
+ * root spans cover, from the earliest start to the latest end; the read keeps
+ * spans starting within it, widened by {@link TRACE_SLACK_MS} each side, so
+ * it opens only those partitions. Blooms prune an id list of more than three
+ * values no further than its min/max statistics, so the time bound carries it.
+ */
+export function countsQuery(traceIds: readonly string[], roots: { readonly from: number; readonly to: number }): Executed {
+  const binds = Binds.over(SIGNALS.spans.time, { from: new Date(roots.from - TRACE_SLACK_MS).toISOString(), to: new Date(roots.to + TRACE_SLACK_MS).toISOString() });
   const ids = traceIds.map((id) => `decode(${binds.bind(id)}, 'hex')`).join(', ');
+  // ponytail: a span starting over an hour outside its root's start and end goes uncounted; widen the slack if traces do that.
   return {
     sql:
       `SELECT encode(trace_id, 'hex') AS trace_id, count(*) AS spans, count(*) FILTER (WHERE status_code = ${STATUS_ERROR}) AS errors ` +
-      `FROM ${SIGNALS.spans.table} WHERE trace_id IN (${ids}) GROUP BY trace_id`,
+      `FROM ${SIGNALS.spans.table} WHERE ${binds.sql} AND trace_id IN (${ids}) GROUP BY trace_id`,
     params: binds.params
   };
 }
@@ -947,7 +957,10 @@ export async function loadRecordTable(input: RecordTableInput, context: LoadCont
   if (!('signal' in input) || input.signal !== 'traces') return { input, executed, result: { state: 'populated', data: { rows, page } } };
   context.signal?.throwIfAborted();
   const at = shownColumns(input).length;
-  const counted = countsQuery([...new Set(rows.rows.map((row) => String(row[at])))]);
+  const [ti, di] = [columnIndex(rows, SIGNALS.traces.time), columnIndex(rows, 'duration_nano')];
+  const starts = rows.rows.map((row) => parseInstant(row[ti]));
+  const ends = rows.rows.map((row, index) => starts[index] + Math.ceil(numeric(row[di] ?? 0) / 1e6));
+  const counted = countsQuery([...new Set(rows.rows.map((row) => String(row[at])))], { from: Math.min(...starts), to: Math.max(...ends) });
   const [counts] = await context.executor.run([query(counted.sql, counted.params)], context.signal);
   const loaded: Loaded<QueryResult> = counts.ok ? { state: 'populated', data: counts.value } : failed(counts.problem);
   return { input, executed, result: { state: 'populated', data: { rows, counts: loaded, page } } };

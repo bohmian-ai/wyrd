@@ -1183,7 +1183,8 @@ test('TASK-004: Canonical signal interactions', async () => {
   expect(validatePanel('TraceWaterfall', { traceId: "x' OR 1=1" })).toMatchObject({ code: 'WYRD_SPEC_400_VALIDATION' });
   expect(validatePanel('StatStrip', { stats: ['cost'], where: [{ column: 'name', value: 'x' }] })).toMatchObject({ code: 'WYRD_SPEC_400_VALIDATION' });
 
-  // Traces: root spans of traces with any span matching the bound WHERE, then counts for exactly the visible traces.
+  // Traces: root spans of traces with any span matching the bound WHERE, then counts for exactly the visible traces,
+  // over the time their roots cover widened by an hour each side, so only those partitions open.
   const where = [{ column: 'service_name', value: 'agent-api' }, { column: 'http_route', value: null, not: true }];
   const listed = recording((request) => ({ ok: true, value: observeAnswer((request as { sql: string }).sql)! }));
   const table = await loadRecordTable({ signal: 'traces', where }, { executor: listed.executor, range: RANGE });
@@ -1201,8 +1202,9 @@ test('TASK-004: Canonical signal interactions', async () => {
       op: 'bifrost.query',
       sql:
         "SELECT encode(trace_id, 'hex') AS trace_id, count(*) AS spans, count(*) FILTER (WHERE status_code = 2) AS errors FROM bifrost.traces.spans " +
-        "WHERE trace_id IN (decode($1, 'hex'), decode($2, 'hex'), decode($3, 'hex')) GROUP BY trace_id",
-      params: traces.rows.map((row) => row[5])
+        'WHERE start_time_unix_nano >= $1::timestamptz AND start_time_unix_nano < $2::timestamptz ' +
+        "AND trace_id IN (decode($3, 'hex'), decode($4, 'hex'), decode($5, 'hex')) GROUP BY trace_id",
+      params: ['2026-10-20T10:56:12.500Z', '2026-10-20T12:58:03.960Z', ...traces.rows.map((row) => row[5])]
     }
   ]);
   expect(table.result).toMatchObject({ state: 'populated', data: { counts: { state: 'populated' } } });

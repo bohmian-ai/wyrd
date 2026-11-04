@@ -1,10 +1,82 @@
 ---
 id: SPEC-wyrd-ui-main-integration
-revision: 25
+revision: 26
 status: approved
 ---
 
 # Migrate the Wyrd UI onto current main
+
+## Revision 26 — A metric series table, so Metrics performs like Grafana
+
+**Approved by the caller on 2026-11-04.** The caller expects Observe Metrics to
+perform like Grafana. Grafana's metrics stores keep a **series index** apart
+from **samples**:
+- The metric list, label pickers and legends read only the index, so their
+  cost follows the number of series, not the number of points.
+- Charts read only samples, by series id and time, aggregated on the server.
+
+Revision 24 delivers the samples side (`series_id`, server windows, no
+whole-attribute reads). Its rail, key suggestions and "every series" labels
+still scan points, so they slow down as volume grows. This revision adds the
+index and replaces revision 24's rail limit and 200-point key sample.
+
+### Required changes
+
+- **REQ-058 — `bifrost.metrics.series`.** A new built-in table holds one row per
+  series per hour in which the series has points. Its columns:
+  - **Identity:** `series_id` and `hour_unix_nano` (the UTC hour, hourly
+    partitioned).
+  - **Series fields of the point:** `metric_name`, `metric_type`, `unit`,
+    `aggregation_temporality`, `is_monotonic` and `explicit_bounds`.
+  - **Promoted and attribution columns:** the promoted resource columns and
+    the attribution columns, with the same names and meaning as on the point.
+  - **Attribute sets:** `scope_name`, `scope_version`, `resource_attributes`,
+    `scope_attributes` and `attributes`, as Variants.
+
+  Every column there is fixed for a series, because Card and run correlation
+  come from the point's own attributes. Blooms: `series_id`, `metric_name` and
+  the attribution defaults. Retention is that of `bifrost.metrics.points`. The
+  table is creation-only, like every built-in (revision 25).
+- **REQ-059 — Written at ingest, never after its points.** Scribe derives the
+  series rows from each admitted point batch, using the same per-point
+  `series_id`. It admits them in the same acknowledged admission as the
+  points, so a durable point always has its series row for that hour.
+  - A per-process set of series already written in each hour suppresses
+    repeats. An entry joins it only after its row is durable.
+  - The set is bounded. Overflow or a restart only writes a row again; it never
+    drops one.
+  - Rows may therefore repeat across replicas and restarts. Readers aggregate
+    by `series_id` and never count rows as series.
+  - The series table is never written from a client.
+- **REQ-060 — Index reads.** The rail (REQ-055), "Group by" key suggestions
+  (REQ-053) and the "every series" totals and labels (REQ-054) read
+  `bifrost.metrics.series`, never `bifrost.metrics.points`. They read the hours
+  that overlap the applied range, under the same WHERE: its columns exist on
+  both tables with the same meaning.
+  - Key suggestions are the distinct keys of the matching series' attribute
+    sets, at most 100 series read per suggestion list.
+  - Charts read `bifrost.metrics.points` by metric, `series_id` and time only,
+    and never its attribute sets except through `variant_get` for a chosen key.
+- **REQ-061 — Grafana-class latency.** On the dev workload, every rail and
+  picker read returns within 200 ms on the server, and every chart read within
+  500 ms, for any range up to 24 hours. The rail's and pickers' rows read
+  follow the number of series in range, not the number of points; the task
+  evidence records times and rows read for 1 h and 24 h.
+
+### Revision 24 changes
+
+- REQ-053's 200-point key sample and revision 24's known rail limit are
+  replaced by REQ-060.
+- AC-036's 500 ms target is tightened to REQ-061.
+
+### Acceptance
+
+| ID | Situation | Expected observation |
+|---|---|---|
+| AC-037 | Ingest the same series in two batches in one hour, then in the next hour | Its series row is present for each hour; repeats, if any, aggregate to one series. |
+| AC-038 | Kill a server between point admission and acknowledgement, then read | No durable point lacks its series row for its hour. |
+| AC-039 | Rail, pickers and every-series labels on live data | The SQL names only `bifrost.metrics.series`; times meet REQ-061. |
+| AC-040 | Ten times the dev workload's points with the same series | Rail and picker rows read do not grow. |
 
 ## Revision 24 — Metrics that stay fast at production volume
 
@@ -2229,6 +2301,7 @@ reported live-proof blocker, never an assumed capability or silent pass.
 
 ## Revision history and authorities
 
+- Revision 26 approved (2026-11-04): a `bifrost.metrics.series` index table written at ingest in the same admission as its points; the rail, pickers and every-series labels read it, so their cost follows series, not points; Grafana-class latency targets.
 - Revision 25 approved (2026-11-04): `series_id` is creation-only, like earlier built-in column additions; warehouses that predate it are rebuilt rather than evolved, so every stored point has a series id and the null-id fallback and AC-035 are removed.
 - Revision 24 approved (2026-11-04): Metrics aggregate by default, group by chosen keys read with `variant_get`, opt-in capped every-series view, a server-searched rail scoped to the WHERE, and a server-computed `series_id` column with a Bloom on `bifrost.metrics.points`, hashed with SHA-256.
 - Revision 23 approved (2026-11-04): server-side header sorting and keyset Older/Newer paging for Traces, Spans and Logs, with the sort and cursor in the URL; WHERE stays filter-only; authored SQL sorts in the page.

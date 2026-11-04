@@ -1490,6 +1490,9 @@ struct WalFaults {
     sync_failure: std::sync::atomic::AtomicBool,
     /// Fails the next step after sync and before memtable insertion.
     post_sync_failure: std::sync::atomic::AtomicBool,
+    /// The slices of the last group that fault left retained after its
+    /// completed sync, unanswered; empty until one is.
+    post_sync_held: tokio::sync::watch::Sender<Vec<crate::scribe::preprocess::AppendSliceId>>,
     /// Refuses every append as a full device until cleared.
     storage_full: std::sync::atomic::AtomicBool,
 }
@@ -2086,6 +2089,16 @@ impl WalHandle {
         self.writer.take_post_sync_failure_for_test()
     }
 
+    /// Publish `held`, the slices of a group the post-sync fault retained
+    /// after its completed sync, to [`WalWriter::post_sync_held_for_test`].
+    #[cfg(any(test, feature = "test-support"))]
+    pub(crate) fn hold_post_sync_for_test(
+        &self,
+        held: Vec<crate::scribe::preprocess::AppendSliceId>,
+    ) {
+        self.writer.faults.post_sync_held.send_replace(held);
+    }
+
     /// Releases this handle's retained references to closed WAL segments.
     ///
     /// # Errors
@@ -2328,6 +2341,18 @@ impl WalWriter {
     #[cfg(any(test, feature = "test-support"))]
     pub fn trip_post_sync_failure_for_test(&self) {
         self.faults.post_sync_failure.store(true, Ordering::Release);
+    }
+
+    /// Watch the slices the post-sync fault left retained after their
+    /// completed sync, unanswered.
+    ///
+    /// The value is published by the shard owner once it holds the group, so
+    /// a slice seen here is durable and its admission has no response yet.
+    #[cfg(test)]
+    pub(crate) fn post_sync_held_for_test(
+        &self,
+    ) -> tokio::sync::watch::Receiver<Vec<crate::scribe::preprocess::AppendSliceId>> {
+        self.faults.post_sync_held.subscribe()
     }
 
     /// Return the single WAL handle owned by one fixed shard task.

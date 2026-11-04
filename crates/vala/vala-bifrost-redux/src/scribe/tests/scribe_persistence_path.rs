@@ -1298,6 +1298,8 @@ async fn series_contexts(
     (first_hour_nanos, last_hour_nanos): (u64, u64),
     epoch: i64,
 ) -> Vec<(String, [Option<String>; 4])> {
+    /// The accepted-context columns a series row is indexed under: a point
+    /// matches its row only when every one of them agrees.
     const CONTEXT: [&str; 4] = [
         "run_id",
         "deployment_environment",
@@ -1529,42 +1531,31 @@ async fn a_failed_series_admission_fails_the_points_admission() {
         .await;
 }
 
-/// Drives `ingest` until the WAL under `wal_dir` holds a terminal commit for
-/// metrics `table`'s batch `batch_id`, then drops it unanswered, as a crash
-/// would.
+/// Drives `ingest` until the WAL's post-sync fault holds a group with a slice
+/// `target` matches, retained after its completed sync, then drops `ingest`
+/// unanswered and stops `scribe` as a crash would, returning once its owners
+/// and WAL IO have finished.
 ///
 /// # Panics
 ///
-/// Panics when the WAL cannot be read or `ingest` answers first.
-async fn crash_once_durable(
-    wal_dir: &std::path::Path,
-    table: &str,
-    batch_id: Option<Uuid>,
+/// Panics when `ingest` answers first or the fault's watch closes.
+async fn crash_once_held(
+    scribe: &ScribeImpl,
+    wal: &WalWriter,
+    target: impl Fn(&crate::scribe::preprocess::AppendSliceId) -> bool,
     ingest: impl std::future::Future<Output = Result<crate::contracts::FrameAdmission, ScribeError>>,
 ) {
-    let durable = || {
-        crate::scribe::replay::replay_wal_directory(wal_dir)
-            .expect("read the WAL")
-            .values()
-            .any(|state| {
-                state.seal_key.table.name == table
-                    && !state.commits.is_empty()
-                    && batch_id.is_none_or(|batch_id| {
-                        state
-                            .append_metas
-                            .iter()
-                            .any(|meta| meta.append_slice_id.batch_id == batch_id)
-                    })
-            })
-    };
-    tokio::pin!(ingest);
-    while !durable() {
-        tokio::select! {
-            biased;
-            result = &mut ingest => panic!("the held admission answered: {result:?}"),
-            () = tokio::task::yield_now() => {}
+    let mut held = wal.post_sync_held_for_test();
+    let mut ingest = Box::pin(ingest);
+    tokio::select! {
+        biased;
+        result = &mut ingest => panic!("the held admission answered: {result:?}"),
+        held = held.wait_for(|slices| slices.iter().any(&target)) => {
+            drop(held.expect("the WAL's faults outlive its Scribe"));
         }
     }
+    drop(ingest);
+    scribe.abort_and_settle_for_test().await;
 }
 
 /// One embedded Scribe at writer `epoch` over the WAL under `wal_dir`, after
@@ -1602,8 +1593,9 @@ async fn restarted_scribe(wal_dir: &std::path::Path, epoch: i64) -> (Arc<WalWrit
 /// through ordinary WAL replay, and the writer's retry of that batch is
 /// admitted with every point indexed by its series row.
 ///
-/// The WAL's post-sync fault holds the series admission past its durable
-/// commit, unanswered, where the process is dropped without shutdown.
+/// The WAL's post-sync fault holds the series admission retained after its
+/// completed sync, unanswered; the process is then aborted without graceful
+/// flush, and its owners and WAL IO finish before the next writer opens.
 ///
 /// # Panics
 ///
@@ -1620,10 +1612,10 @@ async fn a_stop_after_durable_series_rows_recovers_them_and_admits_the_retry() {
 
     let (wal, scribe) = restarted_scribe(temp_dir.path(), 1).await;
     wal.trip_post_sync_failure_for_test();
-    crash_once_durable(
-        temp_dir.path(),
-        "series",
-        None,
+    crash_once_held(
+        &scribe,
+        &wal,
+        |slice| slice.seal_key.table.name == "series",
         Scribe::ingest_frame(&scribe, points_frame(tenant, batch_id, &rows, true)),
     )
     .await;
@@ -1662,8 +1654,9 @@ async fn a_stop_after_durable_series_rows_recovers_them_and_admits_the_retry() {
 /// row for its hour and context.
 ///
 /// The first batch is answered with its series row; the WAL's post-sync
-/// fault then holds a later batch of the same series past its durable commit,
-/// unanswered, where the process is dropped without shutdown.
+/// fault then holds a later batch of the same series retained after its
+/// completed sync, unanswered; the process is then aborted without graceful
+/// flush, and its owners and WAL IO finish before the next writer opens.
 ///
 /// # Panics
 ///
@@ -1685,10 +1678,10 @@ async fn a_stop_after_durable_unanswered_points_recovers_every_point_indexed() {
         .await
         .expect("the first batch and its series row are durable");
     wal.trip_post_sync_failure_for_test();
-    crash_once_durable(
-        temp_dir.path(),
-        "points",
-        Some(unanswered),
+    crash_once_held(
+        &scribe,
+        &wal,
+        |slice| slice.batch_id == unanswered,
         Scribe::ingest_frame(&scribe, points_frame(tenant, unanswered, &later, true)),
     )
     .await;

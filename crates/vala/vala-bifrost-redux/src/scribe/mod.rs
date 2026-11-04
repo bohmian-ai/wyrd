@@ -1546,6 +1546,22 @@ impl ScribeImpl {
         self.ingress_cpu.close();
     }
 
+    /// Stops this Scribe as a crash would: [`Self::abort_shutdown`] without
+    /// graceful flush, then waits until every shard owner has terminated and
+    /// every job already submitted to the WAL IO lane has finished.
+    ///
+    /// Once this returns nothing this Scribe started can still write its WAL,
+    /// so another writer may open the directory.
+    #[cfg(test)]
+    pub(crate) async fn abort_and_settle_for_test(&self) {
+        let owners = self.shards.take_owners_for_test().await;
+        self.abort_shutdown();
+        for owner in owners {
+            let _ = owner.await;
+        }
+        self.wal_io.drain().await;
+    }
+
     /// Installs one retained never-completing shard task for shutdown-bound tests.
     ///
     /// The returned abort handle lets the production-owner test prove the real

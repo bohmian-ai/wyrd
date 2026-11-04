@@ -498,7 +498,7 @@ test('authenticated metrics investigation', async ({ server, ui }) => {
   await expect.poll(() => chart.textContent()).toContain('4 shown');
   expect(await lines()).toBe(4);
 
-  // An explicit aggregation applies once per instant; grouping keeps a recorded dimension apart; percentiles are unavailable.
+  // An explicit aggregation applies across series; grouping keeps a recorded dimension apart; percentiles are unavailable.
   const calculation = chart.getByRole('group', { name: 'Calculation' });
   expect(await calculation.getByText('p90').getAttribute('aria-disabled')).toBe('true');
   expect(await chart.getByLabel('Group series by').isDisabled()).toBe(true);

@@ -207,7 +207,14 @@ test('observe signal planning and interactions', async () => {
   expect(each.chart.params).toContain("o'clock");
   expect(each.chart.sql).toContain('to_json(attributes) AS attributes');
   expect(each.chart.sql).toContain('AND (service_name IS NOT NULL)');
-  expect(each.chart.sql).not.toMatch(/GROUP BY|COALESCE\(CAST\(service_name/);
+  // The chart reads one value per window per series, in the range's bucket, for at most twenty series.
+  expect(each.chart.params.at(-1)).toBe('15 minutes');
+  expect(each.chart.sql).toContain(`date_bin($${each.chart.params.length}::interval, time_unix_nano) AS w`);
+  expect(each.chart.sql).toContain('CASE WHEN aggregation_temporality = 1 THEN sum(v) ELSE last_value(v ORDER BY t) END AS v');
+  expect(each.chart.sql).toContain('WHERE rank <= 20 ORDER BY at');
+  // Variants group raw and render as JSON only on aggregated rows.
+  expect(each.summary.sql).toMatch(/^SELECT metric_type, unit, aggregation_temporality, is_monotonic, to_json\(resource\) AS resource, /);
+  expect(each.summary.params).toEqual(each.chart.params.slice(0, -1));
   // The summary reads exact text: Max orders by value and breaks a rounded tie exactly; Mean stays decimal unless a double is present.
   expect(each.summary.sql).toContain('last_value(t ORDER BY at) AS latest, first_value(t ORDER BY v DESC, COALESCE(i, CASE WHEN abs(d) < 1e19 THEN CAST(d AS DECIMAL(38, 0)) END) DESC NULLS LAST) AS max');
   expect(each.summary.sql).toContain('CASE WHEN count(d) = 0 THEN CAST(avg(i) AS VARCHAR) ELSE CAST(avg(v) AS VARCHAR) END AS mean');
@@ -215,7 +222,9 @@ test('observe signal planning and interactions', async () => {
   // An explicit aggregation applies once per instant, kept apart by `by`.
   const summed = metricQueries({ metric: 'm', aggregation: 'max', by: 'service_name' }, RANGE);
   expect(summed.identity).toEqual(['metric_type', 'unit', 'aggregation_temporality', 'is_monotonic', 'service_name']);
-  expect(summed.chart.sql).toContain('CASE WHEN count(d) = 0 THEN max(i) END AS i, CASE WHEN count(d) > 0 THEN max(COALESCE(CAST(i AS DOUBLE), d)) END AS d');
+  expect(summed.summary.sql).toContain('CASE WHEN count(d) = 0 THEN max(i) END AS i, CASE WHEN count(d) > 0 THEN max(COALESCE(CAST(i AS DOUBLE), d)) END AS d');
+  // The chart applies it across series to each series' window value.
+  expect(summed.chart.sql).toContain('SELECT w, metric_type, unit, aggregation_temporality, is_monotonic, service_name, max(v) AS v FROM (');
   expect(() => metricQueries({ metric: 'm', where: [{ column: 'body_text', value: 'x' }] }, RANGE)).toThrow('body_text is not a metrics column');
   // Without an aggregation a gauge or sum keeps every recorded series; `by` groups only a histogram then.
   expect(metricQueries({ metric: 'm', by: 'service_name' }, RANGE).identity).toEqual(each.identity);
@@ -296,34 +305,25 @@ test('histogram percentiles interpolate inside the bucket holding the rank', () 
   expect(bucketPercentile(bounds, [0, 0, 0, 0], 50)).toBeUndefined();
 });
 
-test('histogram windows count cumulative increases, resets and delta points, merging only equal bounds', () => {
+test('histograms fold on the server into the chart windows and shape into plots per group', () => {
   const range = { from: '2026-10-20T00:00:00Z', to: '2026-10-20T01:00:00Z' };
   const read = (rows: unknown[][]) => ({
-    columns: ['at', 'started', 'metric_type', 'unit', 'aggregation_temporality', 'is_monotonic', 'resource', 'scope_name', 'scope_version', 'scope', 'attributes', 'count', 'sum', 'bounds', 'buckets'].map(
-      (name) => ({ name, data_type: 'Utf8', nullable: true })
-    ),
+    columns: ['at', 'metric_type', 'unit', 'aggregation_temporality', 'is_monotonic', 'bounds', 'count', 'sum', 'buckets'].map((name) => ({ name, data_type: 'Utf8', nullable: true })),
     rows,
     terminal: { outcome: 'success', row_count: rows.length, warnings: [] }
   }) as never;
-  const point = (at: string, started: string, temporality: number, attributes: string, count: number, sum: number, bounds: number[], buckets: number[]) => [
-    `2026-10-20T00:${at}Z`, `2026-10-20T00:${started}Z`, 'histogram', 's', temporality, null, '{}', 'app', '', '{}', attributes, String(count), sum, bounds, buckets.map(String)
-  ];
+  const window = (at: string, count: number, sum: number, bounds: number[], buckets: number[]) => [`2026-10-20T00:${at}Z`, 'histogram', 's', 2, null, bounds, String(count), sum, buckets.map(String)];
   const windows = histogramWindows(
     read([
-      // A cumulative series that started inside the range counts its first point in full, then each increase.
-      point('00:30', '00:00', 2, '{"a":1}', 4, 0.8, [0.5, 1], [4, 0, 0]),
-      point('01:30', '00:00', 2, '{"a":1}', 6, 2.0, [0.5, 1], [4, 2, 0]),
-      // A changed start is a reset: the point counts from zero.
-      point('02:30', '02:00', 2, '{"a":1}', 1, 2.0, [0.5, 1], [0, 0, 1]),
-      // Another series of the same meaning and bounds merges into the same window.
-      point('00:40', '00:00', 2, '{"a":2}', 2, 0.2, [0.5, 1], [2, 0, 0]),
-      // Different bounds never merge; a delta point counts as recorded.
-      point('00:50', '00:00', 1, '{"a":3}', 1, 0.3, [0.25], [0, 1])
+      window('00:00', 6, 1.0, [0.5, 1], [6, 0, 0]),
+      window('01:00', 2, 2.0, [0.5, 1], [0, 2, 0]),
+      window('02:00', 1, 2.0, [0.5, 1], [0, 0, 1]),
+      // Different bounds are another group, named apart.
+      window('00:00', 1, 0.3, [0.25], [0, 1])
     ]),
     range
   );
   const rows = (result: { rows: readonly (readonly unknown[])[] }, series: string) => result.rows.filter((row) => row[1] === series).map((row) => [row[0], row[2]]);
-  // Two groups: the shared bounds and the other bounds, named apart.
   expect(rows(windows.rate, 'per second · bounds 1')).toEqual([
     ['2026-10-20T00:00:00.000Z', 6 / 60],
     ['2026-10-20T00:01:00.000Z', 2 / 60],
@@ -339,13 +339,17 @@ test('histogram windows count cumulative increases, resets and delta points, mer
     ['bounds 2 ≤ 0.25', 0],
     ['bounds 2 > 0.25', 1]
   ]);
-  // A cumulative series that started before the range has its first point as a baseline only.
-  const before = histogramWindows(read([point('00:30', '00:00', 2, '{}', 4, 0.8, [1], [4, 0]), point('01:30', '00:00', 2, '{}', 5, 1.0, [1], [4, 1])]), { from: '2026-10-20T00:00:10Z', to: '2026-10-20T01:00:00Z' });
-  expect(before.rate.rows.map((row) => row[2])).toEqual([1 / 60]);
   expect(histogramWindows(read([]), range).latency.rows).toEqual([]);
-  // The read keeps only explicit-bucket histogram points of the metric and their exact bucket counts.
-  const sql = histogramQuery({ metric: 'm', by: 'service_name' }, range).sql;
+  // The read keeps only explicit-bucket histogram points and folds them per series and window on the server.
+  const { sql, params } = histogramQuery({ metric: 'm', by: 'service_name' }, range);
+  expect(params).toEqual([range.from, range.to, 'm', '1 minute']);
   expect(sql).toContain("metric_type = 'histogram'");
-  expect(sql).toContain('CAST(bucket_counts AS VARCHAR[]) AS buckets');
-  expect(sql).toContain('aggregation_temporality, is_monotonic, service_name');
+  expect(sql).toContain('date_bin($4::interval, time_unix_nano) AS w');
+  // A cumulative series counts its increase over its previous window, or over its first point when it started before the range.
+  expect(sql).toContain('lag(n1) OVER series AS np');
+  expect(sql).toContain('CASE WHEN np IS NOT NULL AND sp = s1 AND n1 >= np THEN np WHEN np IS NULL AND s0 = s1 AND n1 >= n0 AND s1 < $1::timestamptz THEN n0 ELSE 0 END AS nb');
+  // Delta points count as recorded; groups are recorded meaning, the grouping value and bounds, at most twenty.
+  expect(sql).toContain('FROM pts WHERE aggregation_temporality <> 2');
+  expect(sql).toContain('GROUP BY w, metric_type, unit, aggregation_temporality, is_monotonic, service_name, bounds)');
+  expect(sql).toContain('WHERE rank <= 20 AND count > 0 ORDER BY at');
 });

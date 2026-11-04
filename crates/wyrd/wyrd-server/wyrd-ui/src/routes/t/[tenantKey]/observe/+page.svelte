@@ -1,6 +1,9 @@
 <!--
   The open record of the Observe view: a trace's waterfall and selected span
   in the drawer, or a log record beside the list inside the Logs work region.
+  The log record's left edge drags, or with the arrow keys steps, its width
+  between 320px and leaving the list 320px; it keeps that width
+  while the page stays open.
 -->
 <script lang="ts">
   import { goto } from '$app/navigation';
@@ -14,6 +17,30 @@
   const base = $derived(`/t/${encodeURIComponent(data.tenant.key)}`);
   const current = $derived(readState(page.url.searchParams));
   const go = (next: ObserveState) => goto(`${base}/observe?${writeState(moved(current, next))}`, { keepFocus: true, noScroll: true });
+
+  /** The log record's dragged width in pixels; absent, its default width. */
+  let width = $state<number>();
+  /** The widest the log record may be: its right edge less the list's left edge, 320px of list and the 16px gap. */
+  function widest(aside: HTMLElement) {
+    const list = aside.previousElementSibling?.getBoundingClientRect();
+    return list ? aside.getBoundingClientRect().right - list.left - 336 : Infinity;
+  }
+  function drag(event: PointerEvent) {
+    const handle = event.currentTarget as HTMLElement;
+    const aside = handle.parentElement as HTMLElement;
+    const { right } = aside.getBoundingClientRect();
+    const most = widest(aside);
+    handle.setPointerCapture(event.pointerId);
+    handle.onpointermove = (move) => (width = Math.round(Math.max(320, Math.min(right - move.clientX, most))));
+    handle.onpointerup = () => (handle.onpointermove = handle.onpointerup = null);
+  }
+  function nudge(event: KeyboardEvent) {
+    const aside = (event.currentTarget as HTMLElement).parentElement as HTMLElement;
+    const by = event.key === 'ArrowLeft' ? 32 : event.key === 'ArrowRight' ? -32 : 0;
+    if (!by) return;
+    event.preventDefault();
+    width = Math.round(Math.max(320, Math.min(aside.getBoundingClientRect().width + by, widest(aside))));
+  }
 
   let actions = $state<Record<string, ActionState>>({});
   function onaction(component: ComponentName) {
@@ -79,7 +106,9 @@
     <div class="span">{@render record()}</div>
   </Drawer>
 {:else if data.record}
-  <aside class="record" aria-label="Log record">
+  <aside class="record" class:sized={width} aria-label="Log record" style:flex={width ? `0 0 ${width}px` : undefined} style:max-width={width ? 'none' : undefined}>
+    <!-- svelte-ignore a11y_no_noninteractive_tabindex, a11y_no_noninteractive_element_interactions -- a focusable separator is the ARIA window splitter. -->
+    <div class="resize" role="separator" aria-orientation="vertical" aria-label="Resize log record" aria-valuenow={width} tabindex="0" onpointerdown={drag} onkeydown={nudge}></div>
     <header>
       <p>Log record</p>
       <a href={`${base}/observe?${writeState(closed(current))}`} aria-label="Close log record" data-sveltekit-noscroll>✕</a>
@@ -146,6 +175,29 @@
   header a {
     color: var(--muted);
     text-decoration: none;
+  }
+  .record {
+    position: relative;
+  }
+  /* The draggable left edge: a rule that turns Declare on hover, focus or drag. */
+  .resize {
+    position: absolute;
+    inset: 0 auto 0 -4px;
+    z-index: 1;
+    width: 8px;
+    cursor: col-resize;
+    touch-action: none;
+  }
+  .resize:focus-visible {
+    outline: none;
+  }
+  .resize:hover::after,
+  .resize:focus-visible::after,
+  .resize:active::after {
+    content: '';
+    position: absolute;
+    inset: 0 3px;
+    background: var(--declare);
   }
   .record .body {
     padding: 12px 14px;

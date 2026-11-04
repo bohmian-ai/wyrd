@@ -60,6 +60,10 @@
 
   /* geometry */
   --r: 2px;
+
+  /* native controls */
+  color-scheme: light;
+  scrollbar-color: var(--muted) transparent;
 }
 [data-mode="dark"] {
   /* surface */
@@ -114,4 +118,8 @@
 
   /* geometry */
   --r: 2px;
+
+  /* native controls */
+  color-scheme: dark;
+  scrollbar-color: var(--muted) transparent;
 }

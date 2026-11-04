@@ -124,7 +124,11 @@ export function contrastFailures({ modes, tokens, pairs = [] }) {
 
 // ── CSS projections ────────────────────────────────────────────────────────
 
-/** The per-mode custom property lines, grouped by role family. */
+/**
+ * The per-mode custom property lines, grouped by role family, then the mode's
+ * native control rendering: the browser draws scrollbars and form controls in
+ * the mode's scheme, with a muted thumb on a clear track.
+ */
 function tokenLines(tokens, mode) {
   const lines = [];
   let current = null;
@@ -135,6 +139,7 @@ function tokenLines(tokens, mode) {
     }
     lines.push(`  ${name}: ${def[mode]};`);
   }
+  lines.push('', '  /* native controls */', `  color-scheme: ${mode};`, '  scrollbar-color: var(--muted) transparent;');
   return lines;
 }
 

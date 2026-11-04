@@ -60,6 +60,10 @@
 
   /* geometry */
   --r: 2px;
+
+  /* native controls */
+  color-scheme: light;
+  scrollbar-color: var(--muted) transparent;
 }
 [data-theme='wyrd'].theme-dark {
   /* fonts */
@@ -118,4 +122,8 @@
 
   /* geometry */
   --r: 2px;
+
+  /* native controls */
+  color-scheme: dark;
+  scrollbar-color: var(--muted) transparent;
 }

@@ -68,6 +68,18 @@ test('both application projections carry every approved role value in both modes
   }
 });
 
+test('each mode block draws native scrollbars and controls in its own scheme', () => {
+  for (const path of ['brand/theme.css', 'packages/ui/src/lib/theme.css']) {
+    for (const mode of ['light', 'dark']) {
+      const css = byName(path);
+      const start = css.indexOf(`[data-mode="${mode}"] {`);
+      const body = css.slice(start, css.indexOf('}', start));
+      assert.match(body, new RegExp(`color-scheme: ${mode};`), `${path} ${mode}`);
+      assert.match(body, /scrollbar-color: var\(--muted\) transparent;/, `${path} ${mode}`);
+    }
+  }
+});
+
 test('projections emit no retired hard-shadow, arcade, or superseded font contract', () => {
   for (const { path, content } of targets) {
     assert.doesNotMatch(content, /box-shadow|--shadow/, `${path} emits a shadow`);

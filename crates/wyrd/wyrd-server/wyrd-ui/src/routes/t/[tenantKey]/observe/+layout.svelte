@@ -686,6 +686,10 @@
     flex: 999 1 560px;
     min-width: 0;
   }
+  /* A log record dragged wider takes the list's room down to 320px, rather than wrapping below it. */
+  .work:has(> :global(.record.sized)) > [data-panel='list'] {
+    flex-basis: 320px;
+  }
   .metrics {
     display: grid;
     grid-template-columns: 240px minmax(0, 1fr);

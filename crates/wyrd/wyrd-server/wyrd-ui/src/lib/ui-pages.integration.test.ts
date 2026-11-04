@@ -557,8 +557,34 @@ test('authenticated metrics investigation', async ({ server, ui }) => {
   await page.goto(`${metrics}&where=${encodeURIComponent(JSON.stringify([{ column: 'metric_name', value: 'ui.latency' }]))}`);
   await expect.poll(() => chart.textContent(), { timeout: 30_000 }).toContain('mean of recorded sums and percentiles estimated from buckets');
   expect(await calculation.getByRole('link').allTextContents()).toEqual(['default', 'every series']);
+  // A hidden line belongs to one plot of one view: rate keeps its lines, and regrouping or every series draws the new view's lines.
+  const rate = page.locator('[data-panel="rate"]');
+  const plotted = (panel: typeof chart) => panel.locator('svg.plot polyline').count();
+  await expect.poll(() => plotted(chart), { timeout: 30_000 }).toBeGreaterThan(1);
+  const [latencyLines, rateLines] = [await plotted(chart), await plotted(rate)];
+  expect(rateLines).toBeGreaterThan(0);
+  await chart.getByRole('checkbox').first().uncheck();
+  await expect.poll(() => plotted(chart)).toBe(latencyLines - 1);
+  expect(await plotted(rate)).toBe(rateLines);
+  await keys.getByLabel('Add a group key').fill('service_name');
+  await keys.getByLabel('Add a group key').press('Enter');
+  await expect.poll(() => new URL(page.url()).searchParams.get('by')).toBe(JSON.stringify(['service_name']));
+  // The one recorded series is one group, so the new view draws every line of both plots.
+  await expect.poll(() => plotted(chart), { timeout: 30_000 }).toBe(latencyLines);
+  expect(await plotted(rate)).toBe(rateLines);
   await calculation.getByRole('link', { name: 'every series' }).click();
   await expect.poll(() => new URL(page.url()).searchParams.get('apart')).toBe('1');
+  await expect.poll(() => chart.textContent(), { timeout: 30_000 }).toContain('each series apart');
+  await expect.poll(() => plotted(chart)).toBe(latencyLines);
+  expect(await plotted(rate)).toBe(rateLines);
+  // Returning to the first view keeps the reader's choice there.
+  await page.goBack();
+  await page.goBack();
+  await expect.poll(() => new URL(page.url()).searchParams.get('by')).toBeNull();
+  await expect.poll(() => plotted(chart), { timeout: 30_000 }).toBe(latencyLines - 1);
+  expect(await plotted(rate)).toBe(rateLines);
+  await page.goForward();
+  await page.goForward();
   await expect.poll(() => chart.textContent(), { timeout: 30_000 }).toContain('each series apart');
   await legend.first().getByRole('button').click();
   expect(await legend.first().locator('dl').textContent()).toContain('ui-agent');

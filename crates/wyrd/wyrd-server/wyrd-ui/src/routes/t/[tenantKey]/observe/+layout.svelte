@@ -159,7 +159,7 @@
     const clause = current.where.find((each) => each.column === column && !each.not);
     return clause ? JSON.stringify(clause.value) : '';
   };
-  /** The reader's visible series, per metric view; absent shows the Chart's default. */
+  /** The reader's visible series, per metric view and histogram plot; absent shows the Chart's default. */
   let picks = $state<Record<string, ReadonlySet<string>>>({});
   const seriesKey = $derived(view?.series ? JSON.stringify(view.series.input) : '');
   /** `n` `noun`s in words: "1 trace", "2 traces". */
@@ -343,6 +343,8 @@
           <div data-panel="series">
             <Chart
               {...histogram.latency}
+              shown={picks[`latency ${seriesKey}`]}
+              onseries={(shown) => (picks[`latency ${seriesKey}`] = shown)}
               note="Percentiles are estimated from the recorded buckets; ≥ marks a percentile in the unbounded top bucket, at least that bucket's lower bound. Drag across the chart to zoom every Observe view to that window."
               {actions}
               onaction={onaction('Chart')}
@@ -363,7 +365,7 @@
             </Chart>
           </div>
           <div class="histogram">
-            <div data-panel="rate"><Chart {...histogram.rate} {actions} onaction={onaction('Chart')} /></div>
+            <div data-panel="rate"><Chart {...histogram.rate} shown={picks[`rate ${seriesKey}`]} onseries={(shown) => (picks[`rate ${seriesKey}`] = shown)} {actions} onaction={onaction('Chart')} /></div>
             <div data-panel="distribution"><Chart {...histogram.distribution} {actions} onaction={onaction('Chart')} /></div>
           </div>
         {:else if view?.series}

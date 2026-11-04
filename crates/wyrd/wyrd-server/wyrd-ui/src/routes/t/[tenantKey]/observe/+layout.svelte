@@ -651,9 +651,9 @@
     color: var(--muted);
     font: 12px var(--font-mono);
   }
-  /* A choice is as wide as a short column name; a long attribute name truncates in the closed control. */
+  /* A choice fits "all series" or a short column name; a long attribute name truncates in the closed control. */
   .by select {
-    max-width: 7em;
+    max-width: 11em;
   }
   select {
     height: 30px;

@@ -22,6 +22,7 @@
 </script>
 
 <svelte:head><title>Query · {data.tenant.name} · Wyrd</title></svelte:head>
+<div class="app-page">
 <h1>Query</h1>
 <p><a href={back}>← Back to Observe</a></p>
 
@@ -77,6 +78,7 @@
     <RecordTable input={{ sql }} result={form.result.rows.length ? { state: 'populated', data: { rows: form.result } } : { state: 'empty', data: { rows: form.result }, reason: 'The SQL returned no rows.' }} />
   {/if}
 {/if}
+</div>
 
 <style>
   h1 {

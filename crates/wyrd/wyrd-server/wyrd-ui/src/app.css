@@ -25,6 +25,15 @@ body {
   min-width: 0;
   max-width: 100%;
 }
+/* A page's content inside the shell, inset as Observe's board: 24px, 16px on a narrow screen. */
+.app-page {
+  padding: 24px;
+}
+@media (max-width: 767px) {
+  .app-page {
+    padding: 16px;
+  }
+}
 .app-control {
   cursor: pointer;
 }

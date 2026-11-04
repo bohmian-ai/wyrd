@@ -18,6 +18,7 @@
 </script>
 
 <svelte:head><title>Account · {data.tenant.name} · Wyrd</title></svelte:head>
+<div class="app-page">
 <div class="heading">
   <h1>Account</h1>
   <p>Your identity in {data.tenant.name} and your own API keys.</p>
@@ -132,6 +133,7 @@
     </section>
   </div>
 {/if}
+</div>
 
 <style>
   .heading {

@@ -767,26 +767,36 @@ function histogramProps(input: MetricInput, range: AbsoluteRange, executed: Exec
   };
 }
 
-/** The metrics the rail offers under the view's WHERE: name, type and unit of each, by name. */
-export function metricNamesQuery(where: readonly Filter[], range: AbsoluteRange, predicate?: string): Executed {
+/** Most metric names the rail lists; one more is read to tell that more match. */
+export const METRIC_NAMES = 50;
+
+/**
+ * The metrics the rail offers under the view's WHERE: name, type and unit of
+ * each, by name, at most {@link METRIC_NAMES} plus one. `search` keeps names
+ * holding it, ignoring case.
+ */
+export function metricNamesQuery(where: readonly Filter[], range: AbsoluteRange, predicate?: string, search?: string): Executed {
   const binds = Binds.over(SIGNALS.metrics.time, range);
   binds.where(where.filter(({ column }) => column !== 'metric_name')).predicate(predicate);
+  if (search?.trim()) binds.clauses.push(`strpos(lower(metric_name), lower(${binds.bind(search.trim())})) > 0`);
+  // ponytail: scans the range's name columns; a metric-name catalog kept at ingest if that grows slow.
   return {
-    sql: `SELECT metric_name, metric_type, unit, count(*) AS points FROM ${SIGNALS.metrics.table} WHERE ${binds.sql} GROUP BY metric_name, metric_type, unit ORDER BY metric_name, metric_type, unit`,
+    sql: `SELECT metric_name, metric_type, unit FROM ${SIGNALS.metrics.table} WHERE ${binds.sql} GROUP BY metric_name, metric_type, unit ORDER BY metric_name, metric_type, unit LIMIT ${METRIC_NAMES + 1}`,
     params: binds.params
   };
 }
 
 /** Load the metric rail's names; a refused predicate issues no read. */
-export async function loadMetricNames(input: { readonly where?: readonly Filter[]; readonly where_sql?: string; readonly range?: Range }, context: LoadContext): Promise<Loaded<QueryResult>> {
+export async function loadMetricNames(input: { readonly where?: readonly Filter[]; readonly where_sql?: string; readonly range?: Range; readonly search?: string }, context: LoadContext): Promise<Loaded<QueryResult>> {
   const range = rangeOf(input.range, context);
   if ('code' in range) return { state: 'error', problem: range };
   const predicate = await predicateFor(SIGNALS.metrics.table, input.where_sql, context);
   if ('state' in predicate) return predicate;
-  const plan = metricNamesQuery(input.where ?? [], range, predicate.sql);
-  const [read] = await context.executor.run([query(plan.sql, plan.params, 500)], context.signal);
+  const plan = metricNamesQuery(input.where ?? [], range, predicate.sql, input.search);
+  const [read] = await context.executor.run([query(plan.sql, plan.params, METRIC_NAMES + 1)], context.signal);
   if (!read.ok) return failed(read.problem);
-  return read.value.rows.length ? { state: 'populated', data: read.value } : { state: 'empty', data: read.value, reason: emptyList('metrics', input.where) };
+  const reason = input.search?.trim() ? `No metric names hold “${input.search.trim()}”.` : emptyList('metrics', input.where);
+  return read.value.rows.length ? { state: 'populated', data: read.value } : { state: 'empty', data: read.value, reason };
 }
 
 /** The three overview charts of Traces and Spans, and the totals their headlines read. */

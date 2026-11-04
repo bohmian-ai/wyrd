@@ -1,6 +1,8 @@
 import { expect, test } from 'vitest';
 import {
   loadFacetRail,
+  loadMetricNames,
+  METRIC_NAMES,
   loadRecordTable,
   loadStatStrip,
   listQuery,
@@ -290,6 +292,20 @@ test('lists sort by a column on the server and page by keyset cursor', async () 
   expect(step(paged, { name: 'record.page', input: { before: [1, 't', 'a', 'b'] } }, '/')).toEqual({ state: { ...paged, page: { before: [1, 't', 'a', 'b'] } } });
   expect(moved(paged, { ...paged, where: [{ column: 'name', value: 'x' }] }).page).toBeUndefined();
   expect(moved(paged, { ...paged, trace: 'aa' }).page).toEqual(paged.page);
+});
+
+test('the metric rail searches names on the server and reads at most one past its cap', async () => {
+  const { executor, calls } = recording(normalizing(''));
+  const loaded = await loadMetricNames({ where: [{ column: 'service_name', value: 'checkout' }, { column: 'metric_name', value: 'old' }], search: '  Duration ' }, { executor, range: RANGE });
+  const [read] = calls;
+  expect(read.op).toBe('bifrost.query');
+  if (read.op !== 'bifrost.query') return;
+  expect(read.sql).toContain('service_name = $3 AND strpos(lower(metric_name), lower($4)) > 0');
+  expect(read.sql).not.toContain('metric_name = ');
+  expect(read.sql).toMatch(new RegExp(`LIMIT ${METRIC_NAMES + 1}$`));
+  expect(read.params).toEqual([RANGE.from, RANGE.to, 'checkout', 'Duration']);
+  expect(read.max_rows).toBe(METRIC_NAMES + 1);
+  expect(loaded).toMatchObject({ state: 'empty', reason: 'No metric names hold “Duration”.' });
 });
 
 test('histogram percentiles interpolate inside the bucket holding the rank', () => {

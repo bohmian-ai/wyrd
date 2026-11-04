@@ -462,9 +462,13 @@ test('authenticated metrics investigation', async ({ server, ui }) => {
     expect.arrayContaining([expect.stringMatching(/ui\.latency\s*histogram · s/), expect.stringMatching(/ui\.queue\s*gauge · By/), expect.stringMatching(/ui\.queue\s*sum · 1/)])
   );
   expect(await page.locator('[data-panel="series"]').count()).toBe(0);
-  await rail.getByRole('searchbox', { name: 'Find a metric' }).fill('spr');
-  expect(await names.allTextContents()).toEqual([expect.stringContaining('ui.spread')]);
+  // The rail searches on the server, ignoring case, and says so when nothing holds the text.
+  await rail.getByRole('searchbox', { name: 'Find a metric' }).fill('SPR');
+  await expect.poll(() => names.allTextContents(), { timeout: 30_000 }).toEqual([expect.stringContaining('ui.spread')]);
+  await rail.getByRole('searchbox', { name: 'Find a metric' }).fill('no-such-metric');
+  await expect.poll(() => rail.textContent(), { timeout: 30_000 }).toContain('No metric names hold “no-such-metric”.');
   await rail.getByRole('searchbox', { name: 'Find a metric' }).fill('');
+  await expect.poll(() => names.count(), { timeout: 30_000 }).toBeGreaterThan(1);
 
   // Selecting the metric charts every recorded series apart and summarizes each exactly, in the first response too.
   await names.filter({ hasText: /ui\.queue/ }).first().click();
@@ -514,10 +518,10 @@ test('authenticated metrics investigation', async ({ server, ui }) => {
   const services = (await legend.locator('th[scope="row"]').allTextContents()).map((caption) => caption.trim().split(' · ').at(-1));
   expect(services.toSorted()).toEqual(['not set', 'ui-agent', 'ui-worker', '∅']);
 
-  // Histogram, exponential histogram and summary points are listed with exact nested counts and explicitly not plotted.
+  // An explicit-bucket histogram plots estimated percentiles; every structure's points list exact nested counts.
   const structures = ['metric_name', 'histogram_count', 'bucket_counts', 'explicit_bounds', 'positive_buckets', 'negative_buckets', 'summary_count', 'summary_sum', 'quantile_values', 'exemplars'];
   await page.goto(`${metrics}&where=${encodeURIComponent(JSON.stringify([{ column: 'metric_name', value: 'ui.latency' }]))}&columns=${encodeURIComponent(JSON.stringify(structures))}&points=1`);
-  await expect.poll(() => chart.textContent(), { timeout: 30_000 }).toContain('No gauge or sum point of ui.latency');
+  await expect.poll(() => chart.textContent(), { timeout: 30_000 }).toContain('mean and percentiles estimated from buckets');
   await expect.poll(() => list.textContent()).toContain(`["${UNSAFE[0]}","2"]`);
   expect(await list.textContent()).toContain('9007199254740995');
   // Without the metric filter the inspector lists every recorded structure.

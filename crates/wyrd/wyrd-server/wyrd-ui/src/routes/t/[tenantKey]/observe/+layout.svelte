@@ -9,7 +9,7 @@
   import { goto, invalidate } from '$app/navigation';
   import { page } from '$app/state';
   import { Chart, Drawer, EmptyState, FacetRail, RecordTable, fmtDuration, fmtNumber, type ActionIntent, type ActionState, type Problem } from 'wyrd-ai-ui';
-  import { METRIC_AGGREGATIONS, SIGNALS, columnLabel, validateIntent, type ComponentName } from 'wyrd-ai-ui/loaders';
+  import { METRIC_AGGREGATIONS, METRIC_NAMES, SIGNALS, columnLabel, validateIntent, type ComponentName } from 'wyrd-ai-ui/loaders';
   import TimePicker, { type PickedRange, type Zone } from '$lib/TimePicker.svelte';
   import { PRESETS, appliedRange, closed, groupColumns, moved, readState, selectedMetric, step, writeState, zoomed, type HostFilter, type ObserveState } from '$lib/observe-host';
   import type { LayoutProps } from './$types';
@@ -120,10 +120,33 @@
   // Metrics.
   const metric = $derived(current.signal === 'metrics' ? selectedMetric(current) : undefined);
   let find = $state('');
+  /** The names the server found for `find`; absent while the search is blank, so the view's own read shows. */
+  let searched = $state<{ for: string; read: NonNullable<typeof view>['metrics'] }>();
+  const names = $derived(find.trim() && searched?.for === find.trim() ? searched.read : view?.metrics);
   const metricRows = $derived.by(() => {
-    const read = view?.metrics;
-    if (read?.state !== 'populated') return [];
-    return read.data.rows.map(([name, type, unit]) => ({ name: String(name), type: String(type ?? ''), unit: unit ? String(unit) : '' }));
+    if (names?.state !== 'populated') return [];
+    return names.data.rows.slice(0, METRIC_NAMES).map(([name, type, unit]) => ({ name: String(name), type: String(type ?? ''), unit: unit ? String(unit) : '' }));
+  });
+  const moreNames = $derived(names?.state === 'populated' && names.data.rows.length > METRIC_NAMES);
+  // Search the rail on the server a moment after the reader stops typing; a newer search cancels the older one.
+  $effect(() => {
+    const q = find.trim();
+    if (!q || !data.range || current.signal !== 'metrics') return;
+    const params = new URLSearchParams(page.url.searchParams);
+    params.set('from', data.range.from);
+    params.set('to', data.range.to);
+    params.set('q', q);
+    const abort = new AbortController();
+    const timer = setTimeout(async () => {
+      const response = await fetch(`${base}/observe/metrics?${params}`, { signal: abort.signal }).catch(() => undefined);
+      if (!response) return;
+      const body = await response.json().catch(() => undefined);
+      searched = { for: q, read: response.ok ? body : { state: 'error', problem: body } };
+    }, 200);
+    return () => {
+      clearTimeout(timer);
+      abort.abort();
+    };
   });
   const metricRow = $derived(metricRows.find((row) => row.name === metric));
   const facetValues = (column: string): readonly unknown[] => {
@@ -298,11 +321,11 @@
             </select>
           </label>
         {/each}
-        {#if view?.metrics && view.metrics.state !== 'populated'}
-          <EmptyState state={view.metrics.state} problem={'problem' in view.metrics ? view.metrics.problem : undefined} detail={'reason' in view.metrics ? view.metrics.reason : undefined} />
+        {#if names && names.state !== 'populated'}
+          <EmptyState state={names.state} problem={'problem' in names ? names.problem : undefined} detail={'reason' in names ? names.reason : undefined} />
         {:else}
           <ul aria-label="Metric names">
-            {#each metricRows.filter((row) => row.name.toLowerCase().includes(find.trim().toLowerCase())) as row (`${row.name} ${row.type} ${row.unit}`)}
+            {#each metricRows as row (`${row.name} ${row.type} ${row.unit}`)}
               <li>
                 <a href={href({ ...only('metric_name', row.name), agg: undefined, by: undefined })} aria-current={row.name === metric ? 'true' : undefined}>
                   <span>{row.name}</span><span class="type">{row.type}{row.unit ? ` · ${row.unit}` : ''}</span>
@@ -310,6 +333,7 @@
               </li>
             {/each}
           </ul>
+          {#if moreNames}<p class="more">More than {METRIC_NAMES} match — type to narrow</p>{/if}
         {/if}
         <a class="points" href={href({ ...closed(current), points: true })} aria-current={current.points ? 'true' : undefined}>Recorded points</a>
       </aside>
@@ -739,6 +763,11 @@
   .rail li a[aria-current='true'] {
     background: var(--declare-soft);
     box-shadow: inset 2px 0 0 var(--declare);
+  }
+  .more {
+    margin: 0;
+    color: var(--muted);
+    font: 11px var(--font-mono);
   }
   .rail .type {
     margin-left: auto;

@@ -677,9 +677,13 @@ impl ScribeImpl {
     /// is charged, before dispatch, for every allocation the prepared slices
     /// do not alias, and holds that charge until its owner drops it.
     ///
+    /// A new `bifrost.metrics.points` batch is dispatched only after
+    /// [`Self::admit_series_first`] has made its series rows durable.
+    ///
     /// # Errors
     ///
-    /// Returns the failures [`Self::prepare_and_dispatch`] documents.
+    /// Returns the failures [`Self::prepare_and_dispatch`] documents, and a
+    /// points batch's series admission failure.
     async fn prepare_and_dispatch_under(
         &self,
         mut frame: ScribeIngressFrame,
@@ -714,6 +718,7 @@ impl ScribeImpl {
                 detail: format!("Scribe request identity is not a UUID: {error}"),
             }
         })?;
+        let series = super::series_index::SeriesFrame::for_points(&frame);
         let rows = match self
             .prepare_admitted_rows(
                 frame.payload,
@@ -794,6 +799,9 @@ impl ScribeImpl {
                 receipt_micros,
                 first_commit: false,
             }));
+        }
+        if let Some(series) = series {
+            self.admit_series_first(series, &prepared).await?;
         }
         self.shards
             .try_send(prepared)

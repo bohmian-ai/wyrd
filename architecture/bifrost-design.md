@@ -67,9 +67,9 @@ The request ID is the existing request/batch-fence correlator. The ingestion
 instant is taken once at admission from the PostgreSQL-anchored clock and
 retained across retry. Callers never supply managed identity as user fields.
 
-The ten system tables (spans, logs, metrics, gateway calls, drift
-observations, verification results, execution inputs, drift result features,
-storage objects and audit) additionally share six nullable Utf8 dimensions:
+The eleven system tables (spans, logs, metric points, metric series, gateway
+calls, drift observations, verification results, execution inputs, drift
+result features, storage objects and audit) additionally share six nullable Utf8 dimensions:
 service_name, service_version, deployment_environment, subject_kind,
 subject_name and subject_version. Registered UIDs determine identity labels;
 accepted workload context determines environment. Existing signal columns occur
@@ -82,7 +82,8 @@ Time-only partitions remain hourly for telemetry/gateway and daily for
 verification/drift. Creation defaults combine service_name, subject_name,
 workload_card_uid, subject_card_uid and run_id Blooms with signal-specific lookup
 keys; audit retains its accountability defaults. `bifrost.metrics.points`
-adds `metric_name` and `series_id`. Ten result Blooms include
+adds `metric_name` and `series_id`; `bifrost.metrics.series` adds `series_id`
+and `metric_name`. Ten result Blooms include
 result_id, execution_id, verifier_card_uid, binding_id and group_id. These are
 complete replaceable creation defaults, never a hidden validation floor.
 No environment/kind/version Bloom or identity partition is implied. The exact
@@ -379,6 +380,33 @@ typed columns:
   exemplars, flags, values, and times are excluded. A new encoding takes a new
   version byte. The id groups points into series; it is not a security
   boundary.
+- `bifrost.metrics.series` is the series index: one row per series per UTC
+  hour in which the series has points, partitioned hourly on
+  `hour_unix_nano`. Its columns are `series_id`, `hour_unix_nano`,
+  `metric_name`, `metric_type`, `unit`, `aggregation_temporality`,
+  `is_monotonic`, `explicit_bounds`, `scope_name`, `scope_version`,
+  `resource_attributes`, `scope_attributes`, `attributes`, the promoted
+  resource columns, and the attribution columns, each declared and meaning
+  exactly as on the point, then the managed columns. Every one is fixed for a
+  series, because Card and run correlation come from the point's own
+  attributes. Its retention is that of `bifrost.metrics.points`.
+  - Scribe writes it, and nothing else may: Gate refuses every client write.
+    From each new points batch it derives the first point of each series and
+    hour not yet durable in this process, and admits those rows as one
+    `bifrost.metrics.series` batch, with a batch id derived from the points
+    batch's own and the rows it needs, before the points. The points are
+    dispatched only after that batch is durable, and acknowledged only after
+    both, so a durable point always has its series row for its hour. Bifrost
+    has no cross-table admission; this order is the guarantee.
+  - A failed or unacknowledged series admission fails the points admission;
+    the writer retries the whole batch.
+  - A bounded per-process set of the series rows already durable for each
+    hour suppresses repeats: a key joins only once its row is durable, and a
+    points batch whose series are all in it admits no series batch and costs
+    no extra sync. Overflow clears the set and a restart empties it; either
+    only writes a row again. Rows therefore repeat across replicas and
+    restarts, and readers aggregate by `series_id`, never counting rows as
+    series.
 - Three tables hold each verification fact once. A result read assembles the
   public `VerificationResult` from them: the verdict from `results`,
   `requirements` and `steps` from `execution_outputs` by `result_id`, and
@@ -1834,8 +1862,9 @@ Permissions are scoped through `BifrostTable`, `BifrostRecord`, and
 `BifrostQuery`. Generic writes cannot target reserved or system-managed tables;
 `bifrost.gateway.calls`, the three verification tables
 (`bifrost.verification.results`, `bifrost.verification.execution_inputs`, and
-`bifrost.verification.execution_outputs`), and the `bifrost.storage.objects`
-inventory accept no public write at all: Gate refuses every principal. Only
+`bifrost.verification.execution_outputs`), the `bifrost.storage.objects`
+inventory, and the `bifrost.metrics.series` index, which Scribe derives from
+admitted points, accept no public write at all: Gate refuses every principal. Only
 the server-internal capture writer writes them, together with
 the capture spans in `bifrost.traces.spans`, and the tenant copies of server
 spans join them there through the same outbox; result rows carry the verified

@@ -1,4 +1,4 @@
-//! Canonical metric-signal table definition and its table-owned projection.
+//! Canonical metric-signal table definitions and their table-owned projection.
 
 pub mod points;
 pub mod projection;
@@ -8,6 +8,7 @@ pub use points::PointsTable;
 pub use projection::{
     MetricOutputWidths, canonical_metric_schema, project_resource_metrics, validate_metric_points,
 };
+pub use series::SeriesTable;
 
 #[cfg(test)]
 mod tests {

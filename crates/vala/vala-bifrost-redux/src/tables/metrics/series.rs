@@ -1,4 +1,5 @@
-//! The `series_id` column of `bifrost.metrics.points`.
+//! The `series_id` column of `bifrost.metrics.points` and the
+//! `bifrost.metrics.series` table indexed by it.
 //!
 //! A series is one metric's identity fields plus its resource, scope, and
 //! point attribute sets. [`with_series_ids`] derives each row's id from the
@@ -22,15 +23,22 @@ use std::sync::Arc;
 
 use arrow::array::{
     Array, ArrayRef, AsArray, BooleanArray, FixedSizeBinaryBuilder, Float64Array, Int32Array,
-    StringArray,
+    StringArray, UInt32Array,
 };
+use arrow::datatypes::{Field, Schema, TimestampNanosecondType};
 use arrow::record_batch::RecordBatch;
 use chrono::{Datelike as _, Timelike as _};
 use parquet_variant::Variant;
 use sha2::{Digest, Sha256};
 use wyrd_spec::vala::BifrostError;
 
-use crate::tables::signal::stored_variant;
+use super::points::EXPLICIT_BOUND_ELEMENT;
+use crate::tables::fields::{
+    CanonicalField, CanonicalField as F, CanonicalType as T, canonical_arrow_fields,
+};
+use crate::tables::signal::{self, stored_variant};
+use crate::tables::{DomainTable, PayloadClass, attributed_layout, hourly_layout};
+use wyrd_spec::vala::api::PhysicalLayoutWire;
 
 /// Name of the derived series identity column.
 pub const SERIES_ID: &str = "series_id";
@@ -408,6 +416,166 @@ fn length(len: usize) -> Result<u32, BifrostError> {
     u32::try_from(len).map_err(|_| BifrostError::SchemaParse {
         detail: "a series identity value exceeds a u32 length".to_owned(),
     })
+}
+
+/// Name of the series table's UTC hour, its time and partition column.
+pub const HOUR_UNIX_NANO: &str = "hour_unix_nano";
+
+/// Nanoseconds in one hour.
+const HOUR_NANOS: i64 = 3_600_000_000_000;
+
+/// The `bifrost.metrics.series` ledger.
+///
+/// Every column but [`HOUR_UNIX_NANO`] is declared exactly as on
+/// `bifrost.metrics.points`, so a series row is a copy of one point's series
+/// columns: the identity fields, the attribute sets, and the promoted and
+/// attribution columns, each fixed for a series because Card and run
+/// correlation come from the point's own attributes.
+pub static SERIES_FIELDS: &[CanonicalField] = &[
+    F::meta(SERIES_ID, T::FixedSizeBinary(16), true),
+    F::meta(HOUR_UNIX_NANO, signal::OTLP_INSTANT, false),
+    F::meta("metric_name", T::Utf8, false),
+    F::meta("metric_type", T::Utf8, false),
+    F::meta("unit", T::Utf8, false),
+    F::meta("aggregation_temporality", T::Int32, true),
+    F::meta("is_monotonic", T::Bool, true),
+    F::payload("explicit_bounds", T::List(&EXPLICIT_BOUND_ELEMENT), true),
+    F::meta("scope_name", T::Utf8, false),
+    F::meta("scope_version", T::Utf8, false),
+    F::sensitive("resource_attributes", T::Variant, false),
+    F::sensitive("scope_attributes", T::Variant, false),
+    F::sensitive("attributes", T::Variant, false),
+    F::meta("service_name", T::Utf8, true),
+    F::meta("service_version", T::Utf8, true),
+    F::meta("deployment_environment", T::Utf8, true),
+    F::meta("service_namespace", T::Utf8, true),
+    F::meta("service_instance_id", T::Utf8, true),
+    F::meta("process_pid", T::Int64, true),
+    F::meta("telemetry_sdk_name", T::Utf8, true),
+    F::meta("telemetry_sdk_language", T::Utf8, true),
+    F::meta("telemetry_sdk_version", T::Utf8, true),
+    F::meta("subject_kind", T::Utf8, true),
+    F::meta("subject_name", T::Utf8, true),
+    F::meta("subject_version", T::Utf8, true),
+];
+
+/// `bifrost.metrics.series`: one row per series per UTC hour it has points in.
+///
+/// Scribe alone writes it, deriving each row from an admitted points batch
+/// with [`series_rows`] and making it durable before those points; no client
+/// may write it. Rows repeat across replicas and restarts, so a reader
+/// aggregates by `series_id` and never counts rows as series.
+pub struct SeriesTable;
+
+impl DomainTable for SeriesTable {
+    const NAMESPACE: &'static str = "metrics";
+    const NAME: &'static str = "series";
+    const PAYLOAD_CLASS: PayloadClass = PayloadClass::Sensitive;
+    const SENSITIVE_PAYLOAD_COLUMNS: &'static [&'static str] =
+        &["resource_attributes", "scope_attributes", "attributes"];
+
+    fn canonical_fields() -> Option<&'static [CanonicalField]> {
+        Some(SERIES_FIELDS)
+    }
+
+    fn arrow_fields() -> Vec<Field> {
+        canonical_arrow_fields(SERIES_FIELDS)
+    }
+
+    /// Hourly on [`HOUR_UNIX_NANO`], with Blooms on the attribution defaults,
+    /// `series_id`, and `metric_name`.
+    fn physical_layout() -> PhysicalLayoutWire {
+        attributed_layout(hourly_layout, HOUR_UNIX_NANO, &[SERIES_ID, "metric_name"])
+    }
+}
+
+/// One series row's identity: its UTC hour in Unix nanoseconds and its id.
+pub type SeriesKey = (i64, [u8; 16]);
+
+/// Derive the series rows of one admitted points batch.
+///
+/// `points` is a stamped `bifrost.metrics.points` batch whose `series_id`
+/// Scribe derived at admission. The first row of each [`SeriesKey`] for which
+/// `wanted` holds becomes one series row: the [`SERIES_FIELDS`] columns
+/// copied from that point with their point fields, its hour, then the
+/// `carried` columns copied the same way. `wanted` is asked once per distinct
+/// key, in row order. Returns `None` when no row is wanted, else the rows and
+/// their keys in row order.
+///
+/// # Errors
+///
+/// Returns [`BifrostError::SchemaParse`] when `points` lacks a copied column,
+/// `time_unix_nano` is not a nanosecond timestamp, a `series_id` is null, or
+/// the rows do not assemble.
+pub fn series_rows(
+    points: &RecordBatch,
+    carried: &[&str],
+    mut wanted: impl FnMut(SeriesKey) -> bool,
+) -> Result<Option<(RecordBatch, Vec<SeriesKey>)>, BifrostError> {
+    let column = |name: &str| {
+        points
+            .schema()
+            .index_of(name)
+            .map(|at| (points.schema().field(at).clone(), points.column(at)))
+            .map_err(|_| missing(name))
+    };
+    let times = column("time_unix_nano")?
+        .1
+        .as_primitive_opt::<TimestampNanosecondType>()
+        .ok_or_else(|| missing("time_unix_nano"))?
+        .clone();
+    let ids = column(SERIES_ID)?
+        .1
+        .as_fixed_size_binary_opt()
+        .ok_or_else(|| missing(SERIES_ID))?
+        .clone();
+    let mut asked = std::collections::HashSet::new();
+    let (mut rows, mut keys, mut hours) = (Vec::new(), Vec::new(), Vec::new());
+    for row in 0..points.num_rows() {
+        let id: [u8; 16] = ids
+            .is_valid(row)
+            .then(|| ids.value(row).try_into().ok())
+            .flatten()
+            .ok_or_else(|| missing(SERIES_ID))?;
+        let hour = times.value(row) - times.value(row).rem_euclid(HOUR_NANOS);
+        if asked.insert((hour, id)) && wanted((hour, id)) {
+            rows.push(u32::try_from(row).map_err(|_| missing(SERIES_ID))?);
+            keys.push((hour, id));
+            hours.push(hour);
+        }
+    }
+    if rows.is_empty() {
+        return Ok(None);
+    }
+    let rows = UInt32Array::from(rows);
+    let mut fields = Vec::with_capacity(SERIES_FIELDS.len() + carried.len());
+    let mut columns = Vec::with_capacity(fields.capacity());
+    for name in SERIES_FIELDS
+        .iter()
+        .map(|field| field.name)
+        .chain(carried.iter().copied())
+    {
+        if name == HOUR_UNIX_NANO {
+            fields.push(SERIES_FIELDS[1].to_arrow());
+            columns.push(signal::otlp_instant_column(std::mem::take(&mut hours)));
+            continue;
+        }
+        let (field, values) = column(name)?;
+        columns.push(
+            arrow::compute::take(values.as_ref(), &rows, None).map_err(|error| {
+                BifrostError::SchemaParse {
+                    detail: format!("series column {name} does not assemble: {error}"),
+                }
+            })?,
+        );
+        fields.push(field);
+    }
+    let batch = RecordBatch::try_new(Arc::new(Schema::new(fields)), columns).map_err(|error| {
+        BifrostError::SchemaParse {
+            detail: format!("series rows do not assemble: {error}"),
+        }
+    })?;
+    Ok(Some((batch, keys)))
 }
 
 #[cfg(test)]

@@ -43,7 +43,7 @@ pub use drift::ObservationsTable;
 pub use drift::ObservationsTable as DriftObservationsTable;
 pub use gateway::CallsTable;
 pub use logs::RecordsTable;
-pub use metrics::PointsTable;
+pub use metrics::{PointsTable, SeriesTable};
 pub use storage::ObjectsTable;
 pub use traces::SpansTable;
 pub use verification::{ExecutionInputsTable, ExecutionOutputsTable, ResultsTable};
@@ -1291,10 +1291,11 @@ const fn definition<T: DomainTable>() -> BuiltinTableDefinition {
     }
 }
 
-/// The single canonical list of ten server-owned built-in tables.
-pub static BUILTIN_TABLES: [BuiltinTableDefinition; 10] = [
+/// The single canonical list of eleven server-owned built-in tables.
+pub static BUILTIN_TABLES: [BuiltinTableDefinition; 11] = [
     definition::<SpansTable>(),
     definition::<PointsTable>(),
+    definition::<SeriesTable>(),
     definition::<RecordsTable>(),
     definition::<DriftObservationsTable>(),
     definition::<ResultsTable>(),
@@ -1307,7 +1308,7 @@ pub static BUILTIN_TABLES: [BuiltinTableDefinition; 10] = [
 
 /// Return all immutable built-in definitions.
 #[must_use]
-pub const fn builtin_tables() -> &'static [BuiltinTableDefinition; 10] {
+pub const fn builtin_tables() -> &'static [BuiltinTableDefinition; 11] {
     &BUILTIN_TABLES
 }
 
@@ -1319,7 +1320,7 @@ pub fn builtin_table(namespace: &str, name: &str) -> Option<&'static BuiltinTabl
         .find(|definition| definition.namespace == namespace && definition.name == name)
 }
 
-/// Return the ten built-in logical FQNs in canonical order.
+/// Return the eleven built-in logical FQNs in canonical order.
 #[must_use]
 pub fn builtin_fqns() -> Vec<String> {
     BUILTIN_TABLES
@@ -1484,6 +1485,11 @@ mod tests {
                         "time_unix_nano",
                         PartitionTransformWire::Hour,
                         &["metric_name", "series_id"],
+                    ),
+                    ("metrics", "series") => (
+                        "hour_unix_nano",
+                        PartitionTransformWire::Hour,
+                        &["series_id", "metric_name"],
                     ),
                     ("gateway", "calls") => {
                         ("started_at", PartitionTransformWire::Hour, &["call_id"])

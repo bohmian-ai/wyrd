@@ -588,12 +588,10 @@ pub fn series_rows(
             .flatten()
             .ok_or_else(|| missing(SERIES_ID))?;
         let hour = times.value(row) - times.value(row).rem_euclid(HOUR_NANOS);
-        let digest = Sha256::digest(contexts.row(row).as_ref());
-        let key = (
-            hour,
-            id,
-            digest[..16].try_into().expect("sixteen digest bytes"),
-        );
+        let digest: [u8; 32] = Sha256::digest(contexts.row(row).as_ref()).into();
+        let mut context = [0; 16];
+        context.copy_from_slice(&digest[..16]);
+        let key = (hour, id, context);
         if asked.insert(key) && wanted(key) {
             rows.push(u32::try_from(row).map_err(|_| missing(SERIES_ID))?);
             keys.push(key);
@@ -692,6 +690,10 @@ mod tests {
     }
 
     /// One cumulative histogram point with the supplied attributes and bounds.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the bucket count does not fit `u64`.
     fn point(attributes: Vec<KeyValue>, explicit_bounds: Vec<f64>) -> Vec<ResourceMetrics> {
         let bucket_counts = vec![1; explicit_bounds.len() + 1];
         let count = u64::try_from(bucket_counts.len()).expect("small bucket count");
@@ -736,6 +738,11 @@ mod tests {
     }
 
     /// Project `request` and return its one accepted user block.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the projection fails, rejects a point, or cannot split off
+    /// its correlation columns.
     fn projected(request: &[ResourceMetrics]) -> RecordBatch {
         let (batch, outcome) =
             project_resource_metrics(request, None, usize::MAX).expect("the fixture projects");
@@ -744,6 +751,11 @@ mod tests {
     }
 
     /// The hex series id of row 0 of `batch`.
+    ///
+    /// # Panics
+    ///
+    /// Panics when `batch` has no `FixedSizeBinary` `series_id` or row 0's is
+    /// null.
     fn id(batch: &RecordBatch) -> String {
         let ids = batch
             .column_by_name(SERIES_ID)
@@ -754,11 +766,20 @@ mod tests {
     }
 
     /// The hex series id the OTLP projection derives for `request`.
+    ///
+    /// # Panics
+    ///
+    /// Panics as [`projected`] and [`id`] do.
     fn otlp_id(request: &[ResourceMetrics]) -> String {
         id(&projected(request))
     }
 
     /// `batch` with column `name` replaced by `column`.
+    ///
+    /// # Panics
+    ///
+    /// Panics when `batch` has no column `name` or `column` does not fit its
+    /// schema.
     fn replaced(batch: &RecordBatch, name: &str, column: Arc<dyn Array>) -> RecordBatch {
         let at = batch.schema().index_of(name).expect("column exists");
         let mut columns = batch.columns().to_vec();
@@ -768,6 +789,10 @@ mod tests {
 
     /// The fixture point's encoding is pinned, so a change to the encoding can
     /// never silently re-identify stored series.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the fixture's id differs from the pinned one.
     #[test]
     fn golden_series_id_is_pinned() {
         assert_eq!(
@@ -777,6 +802,10 @@ mod tests {
     }
 
     /// Attribute keys in another order, at every depth, are the same series.
+    ///
+    /// # Panics
+    ///
+    /// Panics when reordered keys reach another id.
     #[test]
     fn attribute_key_order_keeps_the_series_id() {
         assert_eq!(
@@ -786,6 +815,10 @@ mod tests {
     }
 
     /// A changed attribute value or a changed bound is a different series.
+    ///
+    /// # Panics
+    ///
+    /// Panics when a changed value or bound keeps the id.
     #[test]
     fn changed_attribute_value_or_bound_changes_the_series_id() {
         let base = otlp_id(&point(fixture_attributes(false), vec![0.0, 5.0]));
@@ -799,6 +832,10 @@ mod tests {
     }
 
     /// `-0.0` and `0.0` encode alike, in a bound and in an attribute.
+    ///
+    /// # Panics
+    ///
+    /// Panics when `-0.0` and `0.0` reach different ids.
     #[test]
     fn negative_zero_and_zero_share_the_series_id() {
         assert_eq!(
@@ -816,6 +853,10 @@ mod tests {
     /// A raw Arrow writer that builds the same point from JSON, keys in
     /// another order and with a forged `series_id`, is admitted with the id
     /// the OTLP projection derives.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the raw point fails validation or keeps its forged id.
     #[test]
     fn raw_arrow_point_gets_the_otlp_series_id_and_loses_its_own() {
         let otlp = projected(&point(fixture_attributes(false), vec![0.0, 5.0, 10.0]));

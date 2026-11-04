@@ -2502,6 +2502,12 @@ mod tests {
     /// sensitive columns differ from its ledger's.
     #[test]
     fn canonical_schemas_do_not_carry_sensitivity_metadata() {
+        /// Asserts `field` of `table`, and every nested child, carries no
+        /// `wyrd:sensitive` metadata.
+        ///
+        /// # Panics
+        ///
+        /// Panics when `field` or any descendant carries that entry.
         fn assert_untagged(field: &Field, table: &str) {
             assert!(
                 !field.metadata().contains_key("wyrd:sensitive"),

@@ -213,19 +213,28 @@ test('observe signal planning and interactions', async () => {
   expect(aggregated.chart.sql).toContain('AND (service_name IS NOT NULL)');
   expect(aggregated.chart.sql).toContain('date_bin($5::interval, time_unix_nano) AS w');
   expect(aggregated.chart.sql).toContain('WINDOW series AS (PARTITION BY series_id ORDER BY w)');
-  expect(aggregated.chart.sql).toContain("CASE WHEN metric_type = 'sum' THEN sum(v) ELSE avg(v) END / CASE WHEN metric_type = 'sum' AND (is_monotonic OR aggregation_temporality = 1) THEN $6 ELSE 1 END AS value");
+  expect(aggregated.chart.sql).toContain("CAST(CASE WHEN count(vi) = count(*) THEN CASE WHEN metric_type = 'sum' THEN sum(vi) ELSE avg(vi) END END AS DECIMAL(38, 4)) AS gi, CASE WHEN metric_type = 'sum' THEN sum(v) ELSE avg(v) END AS gv");
+  expect(aggregated.chart.sql).toContain("COALESCE(CAST(gi AS DOUBLE), gv) / CASE WHEN metric_type = 'sum' AND (is_monotonic OR aggregation_temporality = 1) THEN $6 ELSE 1 END AS value");
+  // Integer points stay exact decimals while a window holds only integers, so increases past 2^53 are exact.
+  expect(aggregated.chart.sql).toContain('CAST(int_value AS DECIMAL(38, 0)) AS i');
+  expect(aggregated.chart.sql).toContain('CASE WHEN exact AND ep IS NOT FALSE THEN CASE WHEN aggregation_temporality = 1 THEN it WHEN metric_type = \'sum\' AND is_monotonic THEN i1 - CASE WHEN ip IS NOT NULL');
   // A monotonic cumulative sum counts its increase; a reset counts from zero, and a series begun before the range counts from its first point.
   expect(aggregated.chart.sql).toContain('x1 - CASE WHEN xp IS NOT NULL AND sp = s1 AND x1 >= xp THEN xp WHEN xp IS NULL AND s0 = s1 AND x1 >= x0 AND s1 < $1::timestamptz THEN x0 ELSE 0 END');
   // The twenty groups with the largest measure are read, each row naming how many there were; no read rebuilds a whole attribute set.
   expect(aggregated.chart.sql).toContain('dense_rank() OVER (ORDER BY measure DESC NULLS LAST, metric_type, unit, aggregation_temporality, is_monotonic) AS rank');
-  expect(aggregated.chart.sql).toMatch(/SELECT w AS at, metric_type, unit, aggregation_temporality, is_monotonic, value, groups FROM \(SELECT \*, max\(rank\) OVER \(\) AS groups FROM ranked\) WHERE rank <= 20 ORDER BY at$/);
+  expect(aggregated.chart.sql).toContain('FROM (SELECT *, max(rank) OVER () AS groups FROM ranked) WHERE rank <= 20)');
+  expect(aggregated.chart.sql).toContain('COALESCE(exact, CASE WHEN abs(value) < 1e19 THEN CAST(value AS DECIMAL(38, 0)) END) AS tie');
+  // Latest, Max and Mean are server text per plotted group: exact decimals for integer gauges, Max broken exactly on a rounded tie.
+  expect(aggregated.chart.sql).toContain('SELECT w AS at, metric_type, unit, aggregation_temporality, is_monotonic, value, groups, last_value(text) OVER (PARTITION BY metric_type, unit, aggregation_temporality, is_monotonic ORDER BY w ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING) AS latest');
+  expect(aggregated.chart.sql).toContain('first_value(text) OVER (PARTITION BY metric_type, unit, aggregation_temporality, is_monotonic ORDER BY value DESC NULLS LAST, tie DESC NULLS LAST) AS max');
+  expect(aggregated.chart.sql).toMatch(/THEN CAST\(avg\(exact\) OVER \(PARTITION BY [^)]*\) AS VARCHAR\) ELSE CAST\(avg\(value\) OVER \(PARTITION BY [^)]*\) AS VARCHAR\) END AS mean FROM plotted ORDER BY at$/);
   expect(aggregated.chart.sql).not.toMatch(/to_json|\battributes\b(?!\))/);
   // Group keys read one key each, bound as text; a promoted column reads as itself.
   const keyed = metricQueries({ metric: 'm', aggregation: 'max', by: ['service_name', 'attributes.http.route', 'resource.host.name'] }, RANGE);
   expect(keyed.identity).toEqual(['metric_type', 'unit', 'aggregation_temporality', 'is_monotonic', 'service_name', 'attributes.http.route', 'resource.host.name']);
   expect(keyed.chart.sql).toContain('service_name AS g1, variant_get_text(attributes, $4) AS g2, variant_get_text(resource_attributes, $5) AS g3');
   expect(keyed.chart.params.slice(2, 5)).toEqual(['m', 'http.route', 'host.name']);
-  expect(keyed.chart.sql).toContain('max(v) / CASE WHEN');
+  expect(keyed.chart.sql).toContain('THEN max(vi) END AS DECIMAL(38, 4)) AS gi, max(v) AS gv');
   expect(() => metricQueries({ metric: 'm', where: [{ column: 'body_text', value: 'x' }] }, RANGE)).toThrow('body_text is not a metrics column');
   for (const key of ['body_text', 'attributes.', 'links.x', 'metric_type']) expect(() => metricQueries({ metric: 'm', by: [key] }, RANGE)).toThrow(`${key} is not a metrics group key`);
   expect(() => metricQueries({ metric: 'm', by: ['service_name', 'scope_name', 'service_version', 'run_id'] }, RANGE)).toThrow('at most 3 group keys');

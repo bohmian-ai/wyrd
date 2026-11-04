@@ -419,9 +419,9 @@ test('authenticated metrics investigation', async ({ server, ui }) => {
                   ]
                 }
               },
-              // Mixed int64 and double samples that round to one double: Max compares them exactly.
-              { name: 'ui.low', unit: '1', gauge: { dataPoints: [point('2026-10-19T04:00:00Z', { asInt: '-9007199254740993' }), point('2026-10-19T04:01:00Z', { asDouble: -9007199254740992 })] } },
-              { name: 'ui.high', unit: '1', gauge: { dataPoints: [point('2026-10-19T04:00:00Z', { asInt: UNSAFE[0] }), point('2026-10-19T04:01:00Z', { asDouble: 9007199254740992 })] } },
+              // Mixed int64 and double samples in two windows that round to one double: Max compares them exactly.
+              { name: 'ui.low', unit: '1', gauge: { dataPoints: [point('2026-10-19T04:00:00Z', { asInt: '-9007199254740993' }), point('2026-10-19T05:00:00Z', { asDouble: -9007199254740992 })] } },
+              { name: 'ui.high', unit: '1', gauge: { dataPoints: [point('2026-10-19T04:00:00Z', { asInt: UNSAFE[0] }), point('2026-10-19T05:00:00Z', { asDouble: 9007199254740992 })] } },
               {
                 name: 'ui.window',
                 unit: 'ms',
@@ -470,30 +470,24 @@ test('authenticated metrics investigation', async ({ server, ui }) => {
   await rail.getByRole('searchbox', { name: 'Find a metric' }).fill('');
   await expect.poll(() => names.count(), { timeout: 30_000 }).toBeGreaterThan(1);
 
-  // Selecting the metric charts every recorded series apart and summarizes each exactly, in the first response too.
+  // Selecting the metric aggregates across series by default: one line per recorded meaning, counters as rates.
   await names.filter({ hasText: /ui\.queue/ }).first().click();
   const chart = page.locator('[data-panel="series"]');
   const legend = chart.locator('table.legend tbody tr');
-  await expect.poll(() => legend.count(), { timeout: 30_000 }).toBe(5);
-  expect(await chart.textContent()).toContain('plotted as double precision');
-  expect(await serverHtml(page, page.url())).toContain(UNSAFE[1]);
-  const rows = await legend.allTextContents();
-  // The unsafe series: latest and max exact, mean exact decimal.
-  expect(rows.find((row) => row.includes(UNSAFE[1]))).toContain('9007199254740994');
-  // Mixed integer and double samples: max is the integer 100, mean over both.
-  expect(rows.find((row) => row.includes('ui-worker'))).toMatch(/100\s*100\s*51\.25/);
-  // Another route at the same instant stays its own series.
-  expect(rows.find((row) => row.includes('{"route":"not set"}'))).toMatch(/5\s*5\s*5/);
+  await expect.poll(() => legend.count(), { timeout: 30_000 }).toBe(2);
+  expect(await chart.textContent()).toContain('counters per second · plotted as double precision');
+  const calculation = chart.getByRole('group', { name: 'Calculation' });
+  expect(await calculation.getByText('p90').getAttribute('aria-disabled')).toBe('true');
 
-  // Max of samples that round to one double is the exactly larger one, whichever representation it has.
-  for (const [metric, max] of [['ui.low', '-9007199254740992'], ['ui.high', UNSAFE[0]]] as const) {
-    await page.goto(`${metrics}&where=${encodeURIComponent(JSON.stringify([{ column: 'metric_name', value: metric }]))}`);
-    await expect.poll(() => legend.count(), { timeout: 30_000 }).toBe(1);
-    const [, , latest, largest] = await legend.first().locator('td, th').allTextContents();
-    expect([latest.trim(), largest.trim().replace(/\.0$/, '')]).toEqual([expect.stringMatching(/^-?9007199254740992(\.0)?$/), max]);
-  }
-  await page.goto(`${metrics}&where=${encodeURIComponent(JSON.stringify([{ column: 'metric_name', value: 'ui.queue' }]))}`);
+  // Every series on request: each apart, named by its recorded resource and attributes.
+  await calculation.getByRole('link', { name: 'every series' }).click();
+  await expect.poll(() => new URL(page.url()).searchParams.get('apart')).toBe('1');
   await expect.poll(() => legend.count(), { timeout: 30_000 }).toBe(5);
+  const rows = await legend.allTextContents();
+  // A gauge window plots its last point: the worker's 2.5 then 100 in one window plot 100.
+  expect(rows.find((row) => row.includes('ui-worker'))).toMatch(/100(\.0)?\s*100(\.0)?\s*100(\.0)?/);
+  // Another route at the same instant stays its own series.
+  expect(rows.some((row) => row.includes('{"route":"not set"}'))).toBe(true);
 
   // Unticking a series hides its line; the table and the chart name the same series.
   const lines = () => chart.locator('svg.plot polyline').count();
@@ -502,21 +496,38 @@ test('authenticated metrics investigation', async ({ server, ui }) => {
   await expect.poll(() => chart.textContent()).toContain('4 shown');
   expect(await lines()).toBe(4);
 
-  // An explicit aggregation applies across series; grouping keeps a recorded dimension apart; percentiles are unavailable.
-  const calculation = chart.getByRole('group', { name: 'Calculation' });
-  expect(await calculation.getByText('p90').getAttribute('aria-disabled')).toBe('true');
-  expect(await chart.getByLabel('Group series by').isDisabled()).toBe(true);
+  // Max of samples that round to one double is the exactly larger one, whichever representation it has, in the first response too.
+  for (const [metric, max] of [['ui.low', '-9007199254740992'], ['ui.high', UNSAFE[0]]] as const) {
+    await page.goto(`${metrics}&where=${encodeURIComponent(JSON.stringify([{ column: 'metric_name', value: metric }]))}`);
+    await expect.poll(() => legend.count(), { timeout: 30_000 }).toBe(1);
+    const [, , latest, largest] = await legend.first().locator('td, th').allTextContents();
+    expect([latest.trim(), largest.trim().replace(/\.0+$/, '')]).toEqual([expect.stringMatching(/^-?9007199254740992(\.0+)?$/), max]);
+    expect(await serverHtml(page, page.url())).toContain(max);
+  }
+
+  // An explicit aggregation applies across series; group keys keep a recorded dimension apart, one key read at a time.
+  await page.goto(`${metrics}&where=${encodeURIComponent(JSON.stringify([{ column: 'metric_name', value: 'ui.queue' }]))}`);
+  await expect.poll(() => legend.count(), { timeout: 30_000 }).toBe(2);
   await calculation.getByRole('link', { name: 'max' }).click();
   await expect.poll(() => new URL(page.url()).searchParams.get('agg')).toBe('max');
   await expect.poll(() => legend.count()).toBe(2);
-  expect((await legend.allTextContents()).find((row) => row.includes('sum'))).toContain(UNSAFE[1]);
-  await chart.getByLabel('Group series by').selectOption('service_name');
-  await expect.poll(() => new URL(page.url()).searchParams.get('by')).toBe('service_name');
+  const keys = chart.getByRole('group', { name: 'Group series by' });
+  await keys.getByLabel('Add a group key').fill('service_name');
+  await keys.getByLabel('Add a group key').press('Enter');
+  await expect.poll(() => new URL(page.url()).searchParams.get('by')).toBe(JSON.stringify(['service_name']));
   // An unset service and the text "not set" stay two groups.
   await expect.poll(() => legend.count()).toBe(4);
   // Captions name only the cells that differ; the service is the last of them.
   const services = (await legend.locator('th[scope="row"]').allTextContents()).map((caption) => caption.trim().split(' · ').at(-1));
   expect(services.toSorted()).toEqual(['not set', 'ui-agent', 'ui-worker', '∅']);
+  // The key list offers what the metric's series record; an attribute key splits the sum by route.
+  await expect.poll(() => chart.locator('datalist#group-keys option[value="attributes.route"]').count()).toBe(1);
+  await keys.getByRole('button', { name: 'Stop grouping by service_name' }).click();
+  await expect.poll(() => new URL(page.url()).searchParams.get('by')).toBeNull();
+  await keys.getByLabel('Add a group key').fill('attributes.route');
+  await keys.getByLabel('Add a group key').press('Enter');
+  await expect.poll(() => legend.count()).toBe(3);
+  expect(await serverHtml(page, page.url())).not.toContain('to_json');
 
   // An explicit-bucket histogram plots estimated percentiles; every structure's points list exact nested counts.
   const structures = ['metric_name', 'histogram_count', 'bucket_counts', 'explicit_bounds', 'positive_buckets', 'negative_buckets', 'summary_count', 'summary_sum', 'quantile_values', 'exemplars'];

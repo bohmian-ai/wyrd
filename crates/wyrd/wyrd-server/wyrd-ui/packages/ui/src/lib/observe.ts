@@ -503,30 +503,48 @@ function metricBinds(input: MetricInput, range: AbsoluteRange, kind: string, pre
  * stays its own group. The {@link MAX_SERIES} groups with the largest measure
  * over the range are read (total for rates, mean otherwise), each row naming
  * how many groups there were.
+ *
+ * Integer points stay exact decimals through every step while a window holds
+ * only integers, so an increase past 2^53 is exact; `value` is that result as
+ * double precision for plotting. Each row also carries its group's `latest`,
+ * `max` and `mean` over the plotted windows as server text: exact decimals for
+ * integer gauges and sums, the double otherwise, with Max ordered by the
+ * double and a rounded tie broken exactly (a double that ties an integer is
+ * integral). A rate is a double.
  */
 export function metricQueries(input: MetricInput, range: AbsoluteRange, predicate?: string): { identity: readonly string[]; chart: Executed } {
   const { binds, keys, groups } = metricBinds(input, range, PLOTTED, predicate);
   const bucket = binds.bind(bucketFor(range));
   const seconds = binds.bind(bucketWidth(range) / 1000);
   const meaning = MEANING.join(', ');
+  const kept = groups.map(([name]) => `, ${name}`).join('');
   const group = [meaning, ...(input.apart ? ['series'] : groups.map(([name]) => name))].join(', ');
-  const counter = 'metric_type = \'sum\' AND (is_monotonic OR aggregation_temporality = 1)';
-  const across = input.aggregation ? AGGREGATE[input.aggregation] : undefined;
+  const counter = "metric_type = 'sum' AND (is_monotonic OR aggregation_temporality = 1)";
+  const across = (x: string) => (input.aggregation ? `${AGGREGATE[input.aggregation]}(${x})` : `CASE WHEN metric_type = 'sum' THEN sum(${x}) ELSE avg(${x}) END`);
+  // One window's value of a series from its values `x0`/`x1`/`xt` and the prior window's `xp`, read as `x` or as the exact `i`.
+  const step = (x: 'x' | 'i') =>
+    `CASE WHEN aggregation_temporality = 1 THEN ${x}t ` +
+    `WHEN metric_type = 'sum' AND is_monotonic THEN ${x}1 - CASE WHEN ${x}p IS NOT NULL AND sp = s1 AND ${x}1 >= ${x}p THEN ${x}p WHEN ${x}p IS NULL AND s0 = s1 AND ${x}1 >= ${x}0 AND s1 < $1::timestamptz THEN ${x}0 ELSE 0 END ` +
+    `ELSE ${x}1 END`;
+  const by = `PARTITION BY ${group}`;
   // ponytail: a reset inside one window loses that window's increase before the reset; per-point deltas if that matters.
   const sql =
     `WITH pts AS (SELECT date_bin(${bucket}::interval, ${SIGNALS.metrics.time}) AS w, ${SIGNALS.metrics.time} AS t, start_time_unix_nano AS s, series_id, ${meaning}, ` +
-    `${groups.map(([name, sql]) => `${sql} AS ${name}, `).join('')}COALESCE(CAST(int_value AS DOUBLE), double_value) AS x FROM ${SIGNALS.metrics.table} WHERE ${binds.sql}), ` +
-    `ends AS (SELECT w, series_id, ${meaning}${groups.map(([name]) => `, ${name}`).join('')}, first_value(s ORDER BY t) AS s0, last_value(s ORDER BY t) AS s1, ` +
-    `first_value(x ORDER BY t) AS x0, last_value(x ORDER BY t) AS x1, sum(x) AS xs FROM pts GROUP BY w, series_id, ${meaning}${groups.map(([name]) => `, ${name}`).join('')}), ` +
-    `prior AS (SELECT *, lag(s1) OVER series AS sp, lag(x1) OVER series AS xp FROM ends WINDOW series AS (PARTITION BY series_id ORDER BY w)), ` +
-    `per AS (SELECT w, encode(series_id, 'hex') AS series, ${meaning}${groups.map(([name]) => `, ${name}`).join('')}, CASE ` +
-    `WHEN aggregation_temporality = 1 THEN xs ` +
-    `WHEN metric_type = 'sum' AND is_monotonic THEN x1 - CASE WHEN xp IS NOT NULL AND sp = s1 AND x1 >= xp THEN xp WHEN xp IS NULL AND s0 = s1 AND x1 >= x0 AND s1 < $1::timestamptz THEN x0 ELSE 0 END ` +
-    `ELSE x1 END AS v FROM prior), ` +
-    `grouped AS (SELECT w, ${group}, ${across ? `${across}(v)` : `CASE WHEN metric_type = 'sum' THEN sum(v) ELSE avg(v) END`} / CASE WHEN ${counter} THEN ${seconds} ELSE 1 END AS value FROM per GROUP BY w, ${group}), ` +
-    `measured AS (SELECT *, CASE WHEN ${counter} THEN sum(value) OVER (PARTITION BY ${group}) ELSE avg(value) OVER (PARTITION BY ${group}) END AS measure FROM grouped), ` +
-    `ranked AS (SELECT *, dense_rank() OVER (ORDER BY measure DESC NULLS LAST, ${group}) AS rank FROM measured) ` +
-    `SELECT w AS at, ${group}, value, groups FROM (SELECT *, max(rank) OVER () AS groups FROM ranked) WHERE rank <= ${MAX_SERIES} ORDER BY at`;
+    `${groups.map(([name, sql]) => `${sql} AS ${name}, `).join('')}CAST(int_value AS DECIMAL(38, 0)) AS i, COALESCE(CAST(int_value AS DOUBLE), double_value) AS x FROM ${SIGNALS.metrics.table} WHERE ${binds.sql}), ` +
+    `ends AS (SELECT w, series_id, ${meaning}${kept}, first_value(s ORDER BY t) AS s0, last_value(s ORDER BY t) AS s1, ` +
+    `first_value(x ORDER BY t) AS x0, last_value(x ORDER BY t) AS x1, sum(x) AS xt, first_value(i ORDER BY t) AS i0, last_value(i ORDER BY t) AS i1, sum(i) AS it, ` +
+    `count(i) = count(*) AS exact FROM pts GROUP BY w, series_id, ${meaning}${kept}), ` +
+    `prior AS (SELECT *, lag(s1) OVER series AS sp, lag(x1) OVER series AS xp, lag(i1) OVER series AS ip, lag(exact) OVER series AS ep FROM ends WINDOW series AS (PARTITION BY series_id ORDER BY w)), ` +
+    `per AS (SELECT w, encode(series_id, 'hex') AS series, ${meaning}${kept}, ${step('x')} AS v, CASE WHEN exact AND ep IS NOT FALSE THEN ${step('i')} END AS vi FROM prior), ` +
+    `grouped AS (SELECT w, ${group}, CAST(CASE WHEN count(vi) = count(*) THEN ${across('vi')} END AS DECIMAL(38, 4)) AS gi, ${across('v')} AS gv FROM per GROUP BY w, ${group}), ` +
+    `valued AS (SELECT w, ${group}, COALESCE(CAST(gi AS DOUBLE), gv) / CASE WHEN ${counter} THEN ${seconds} ELSE 1 END AS value, CASE WHEN NOT (${counter}) THEN gi END AS exact FROM grouped), ` +
+    `measured AS (SELECT *, CASE WHEN ${counter} THEN sum(value) OVER (${by}) ELSE avg(value) OVER (${by}) END AS measure FROM valued), ` +
+    `ranked AS (SELECT *, dense_rank() OVER (ORDER BY measure DESC NULLS LAST, ${group}) AS rank FROM measured), ` +
+    `plotted AS (SELECT *, COALESCE(CAST(exact AS VARCHAR), CAST(value AS VARCHAR)) AS text, COALESCE(exact, CASE WHEN abs(value) < 1e19 THEN CAST(value AS DECIMAL(38, 0)) END) AS tie FROM (SELECT *, max(rank) OVER () AS groups FROM ranked) WHERE rank <= ${MAX_SERIES}) ` +
+    `SELECT w AS at, ${group}, value, groups, last_value(text) OVER (${by} ORDER BY w ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING) AS latest, ` +
+    `first_value(text) OVER (${by} ORDER BY value DESC NULLS LAST, tie DESC NULLS LAST) AS max, ` +
+    `CASE WHEN count(exact) OVER (${by}) = count(*) OVER (${by}) THEN CAST(avg(exact) OVER (${by}) AS VARCHAR) ELSE CAST(avg(value) OVER (${by}) AS VARCHAR) END AS mean ` +
+    `FROM plotted ORDER BY at`;
   return { identity: [...MEANING, ...(input.apart ? ['series'] : keys)], chart: { sql, params: binds.params } };
 }
 
@@ -591,28 +609,19 @@ const PLOT_ROWS = MAX_SERIES * 201;
 /** Bytes one windowed plot reads. */
 const PLOT_BYTES = 16 * 1024 * 1024;
 
-/** Each plotted group's Latest, Max and Mean of its plotted values, as text, keyed by `identity`. */
+/** The summary columns every chart row carries for its group, computed on the server. */
+const SUMMARY = ['latest', 'max', 'mean'] as const;
+
+/** Each plotted group's server-computed Latest, Max and Mean, once per group, keyed by `identity`. */
 function plottedSummary(chart: QueryResult, identity: readonly string[]): QueryResult {
-  const groups = new Map<string, { cells: unknown[]; values: number[] }>();
-  const value = columnIndex(chart, 'value');
+  const groups = new Map<string, unknown[]>();
+  const columns = [...identity, ...SUMMARY].map((name) => columnIndex(chart, name));
   for (const row of chart.rows) {
-    const cells = identity.map((name) => row[columnIndex(chart, name)]);
-    const key = JSON.stringify(cells);
-    const group = groups.get(key) ?? { cells, values: [] };
-    groups.set(key, group);
-    if (row[value] !== null) group.values.push(numeric(row[value]));
+    const cells = columns.map((index) => row[index]);
+    const key = JSON.stringify(cells.slice(0, identity.length));
+    if (!groups.has(key)) groups.set(key, cells);
   }
-  const text = (n: number | undefined) => (n === undefined ? null : String(n));
-  return {
-    columns: [...identity.map((name) => chart.columns[columnIndex(chart, name)]), ...['latest', 'max', 'mean'].map((name) => ({ name, data_type: 'Utf8', nullable: true }))],
-    rows: [...groups.values()].map(({ cells, values }) => [
-      ...cells,
-      text(values.at(-1)),
-      text(values.length ? Math.max(...values) : undefined),
-      text(values.length ? values.reduce((sum, each) => sum + each, 0) / values.length : undefined)
-    ]),
-    terminal: chart.terminal
-  };
+  return { columns: columns.map((index) => chart.columns[index]), rows: [...groups.values()], terminal: chart.terminal };
 }
 
 /** Name the read's `g1`… columns by their group keys, and with `labels` replace each series id by its recorded resource, scope and attributes. */

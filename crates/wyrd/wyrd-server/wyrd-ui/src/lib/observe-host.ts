@@ -5,7 +5,7 @@
  * maps each component intent to the next URL.
  */
 import type { ActionIntent, QueryParam } from 'wyrd-ai-ui';
-import { METRIC_AGGREGATIONS, SIGNALS, signalColumns, sortColumns, type ListSort, type MetricAggregation, type MetricInput } from 'wyrd-ai-ui/loaders';
+import { MAX_GROUP_KEYS, METRIC_AGGREGATIONS, SIGNALS, signalColumns, sortColumns, type ListSort, type MetricAggregation, type MetricInput } from 'wyrd-ai-ui/loaders';
 
 /** The Observe signals the host offers. */
 export const OBSERVE_SIGNALS = ['traces', 'logs', 'metrics'] as const;
@@ -50,9 +50,10 @@ export interface ObserveState {
   readonly sort?: ListSort;
   /** The list page: after or before one row's cursor values; absent, the first page. */
   readonly page?: { readonly after: readonly QueryParam[] } | { readonly before: readonly QueryParam[] };
-  /** The metric aggregation across series, and the metrics column it keeps apart. */
+  /** The metric aggregation across series, replacing the default; the group keys; every series apart instead. */
   readonly agg?: MetricAggregation;
-  readonly by?: string;
+  readonly by?: readonly string[];
+  readonly apart?: boolean;
   /** Metrics' recorded-points inspector is open; only then is the points list read. */
   readonly points?: boolean;
   readonly trace?: string;
@@ -97,6 +98,7 @@ export function readState(params: Params): ObserveState {
   const [column, direction] = (params.get('sort') ?? '').split(':');
   const after = json(params.get('after'));
   const before = json(params.get('before'));
+  const by = json(params.get('by'));
   return {
     signal,
     mode: params.get('mode') === 'spans' ? 'spans' : 'traces',
@@ -112,7 +114,8 @@ export function readState(params: Params): ObserveState {
     sort: column && (direction === 'asc' || direction === 'desc') ? { column, desc: direction === 'desc' } : undefined,
     page: Array.isArray(after) ? { after } : Array.isArray(before) ? { before } : undefined,
     agg,
-    by: params.get('by') ?? undefined,
+    by: Array.isArray(by) && by.every((each) => typeof each === 'string') && by.length ? by : undefined,
+    apart: params.get('apart') === '1',
     points: signal === 'metrics' && params.get('points') === '1',
     trace: params.get('trace') ?? undefined,
     span: params.get('span') ?? undefined,
@@ -140,7 +143,8 @@ export function writeState(state: ObserveState): URLSearchParams {
   if (state.page && 'after' in state.page) params.set('after', JSON.stringify(state.page.after));
   if (state.page && 'before' in state.page) params.set('before', JSON.stringify(state.page.before));
   if (state.agg) params.set('agg', state.agg);
-  if (state.by) params.set('by', state.by);
+  if (state.by?.length) params.set('by', JSON.stringify(state.by));
+  if (state.apart) params.set('apart', '1');
   if (state.signal === 'metrics' && state.points) params.set('points', '1');
   if (state.trace) params.set('trace', state.trace);
   if (state.span) params.set('span', state.span);
@@ -193,8 +197,10 @@ export function listInputs(state: ObserveState) {
   const columns = chosen?.length ? chosen : undefined;
   const metric = state.signal === 'metrics' ? selectedMetric(state) : undefined;
   const sort = state.sort && sortColumns(signal).includes(state.sort.column) ? state.sort : undefined;
-  const by = state.by && (SIGNALS.metrics.filters as readonly string[]).includes(state.by) ? state.by : undefined;
-  const series: MetricInput | undefined = metric ? { metric, ...filter(state), ...(state.agg ? { aggregation: state.agg } : {}), ...(by ? { by } : {}) } : undefined;
+  const by = state.by?.slice(0, MAX_GROUP_KEYS);
+  const series: MetricInput | undefined = metric
+    ? { metric, ...filter(state), ...(state.apart ? { apart: true } : { ...(state.agg ? { aggregation: state.agg } : {}), ...(by?.length ? { by } : {}) }) }
+    : undefined;
   return {
     filter: filter(state),
     facets: { signal, facets: [...FACETS[signal]], ...filter(state) },

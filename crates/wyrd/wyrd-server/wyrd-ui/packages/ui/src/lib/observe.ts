@@ -5,7 +5,7 @@
  */
 import { failed, wyrdProblem, type Loaded, type Problem, type QueryParam, type QueryResult, type WireRequest } from './contract.js';
 import { fmtDuration, fmtNumber, parseInstant } from './format.js';
-import { bucketFor, bucketWidth, chartParams, resolveRange, shapeChart, type ChartProps, type LoadContext } from './loaders.js';
+import { bucketFor, bucketWidth, chartParams, inputProblem, resolveRange, shapeChart, type ChartProps, type LoadContext } from './loaders.js';
 import { MAX_SERIES, columnIndex, numeric } from './plot.js';
 import {
   IDS,
@@ -401,46 +401,49 @@ export type MetricAggregation = (typeof METRIC_AGGREGATIONS)[number];
 /** SQL of each aggregation over exact integers. */
 const AGGREGATE: Record<MetricAggregation, string> = { sum: 'sum', mean: 'avg', min: 'min', max: 'max' };
 
-/** A point's recorded meaning: points that differ in any of these never share a series. */
+/** A point's recorded meaning: points that differ in any of these never share a group. */
 const MEANING = ['metric_type', 'unit', 'aggregation_temporality', 'is_monotonic'] as const;
 
-/**
- * The recorded resource, scope and point dimensions that identify an
- * unaggregated series. Reads group by the raw Variants and render each as its
- * JSON text only on the aggregated rows, since rendering every point is the
- * read's dominant cost.
- */
-const DIMENSIONS: readonly (readonly [string, string])[] = [
-  ['resource', 'resource_attributes'],
-  ['scope_name', 'scope_name'],
-  ['scope_version', 'scope_version'],
-  ['scope', 'scope_attributes'],
-  ['attributes', 'attributes']
-];
-/** The dimensions that are Variants. */
-const VARIANTS: ReadonlySet<string> = new Set(['resource', 'scope', 'attributes']);
+/** Most keys one metric view groups by at once. */
+export const MAX_GROUP_KEYS = 3;
+/** The Variant each group-key source reads one key of. */
+const KEY_SOURCES = { attributes: 'attributes', resource: 'resource_attributes', scope: 'scope_attributes' } as const;
+/** Promoted metrics columns a view may group by: every filter column but the metric and its meaning. Variant keys are typed. */
+export const METRIC_GROUP_KEYS: readonly string[] = (SIGNALS.metrics.filters as readonly string[]).filter((column) => column !== 'metric_name' && !(MEANING as readonly string[]).includes(column));
 
-/** Select `names` from an aggregated read, each Variant as its JSON text. */
-function rendered(names: readonly string[]): string {
-  return names.map((name) => (VARIANTS.has(name) ? `to_json(${name}) AS ${name}` : name)).join(', ');
+/**
+ * The SQL that reads one group key, binding a Variant key as text: a promoted
+ * column as itself, or `attributes.<key>`, `resource.<key>` or `scope.<key>`
+ * as that one key's text form, so no read rebuilds a whole attribute set.
+ *
+ * @throws when `key` names neither a promoted column nor a Variant key.
+ */
+function groupKey(key: string, binds: Binds): string {
+  if (METRIC_GROUP_KEYS.includes(key)) return key;
+  const dot = key.indexOf('.');
+  const source = KEY_SOURCES[key.slice(0, dot) as keyof typeof KEY_SOURCES];
+  const name = key.slice(dot + 1);
+  if (dot < 0 || !source || !name || name.length > 256) throw new Error(`${key} is not a metrics group key`);
+  return `variant_get_text(${source}, ${binds.bind(name)})`;
 }
 
-/** The read of one metric's series and their exact summary. */
+/** The read of one metric's plotted groups. */
 export interface MetricInput {
   readonly metric: string;
   readonly where?: readonly Filter[];
   readonly where_sql?: string;
-  /** Apply this aggregation across series at each recorded instant; without it every recorded series stays separate. */
+  /** Replace the default aggregation across series: sum for sums, mean for gauges. */
   readonly aggregation?: MetricAggregation;
-  /** Keep one series per value of this metrics column: with an aggregation for gauges and sums, on its own for a histogram. */
-  readonly by?: string;
+  /** Keep one group per value of each key, at most {@link MAX_GROUP_KEYS}: promoted columns or `attributes.`, `resource.` or `scope.` keys. */
+  readonly by?: readonly string[];
+  /** Plot every series apart, at most {@link MAX_SERIES}, instead of aggregating across them. */
+  readonly apart?: boolean;
   readonly range?: Range;
 }
 
 /**
- * Props of one metric: the Chart of its series, the typed identity columns
- * that key them, and the exact per-series summary under the same identity
- * and sample set.
+ * Props of one metric: the Chart of its groups, the typed identity columns
+ * that key them, and each group's Latest, Max and Mean of its plotted values.
  */
 export interface MetricProps {
   readonly input: MetricInput;
@@ -462,85 +465,124 @@ export interface HistogramProps {
   readonly distribution: ChartProps;
 }
 
-/**
- * The chart and summary reads of one metric, both aggregated on the server.
- *
- * The chart reads one value per chart window per series: each recorded
- * series' last value in the window, or the sum of its delta points, as double
- * precision. With an aggregation those values are then aggregated across the
- * series of each recorded meaning and grouping value. At most
- * {@link MAX_SERIES} series are read, the first in the summary's order, so a
- * chart is at most that many series by about 200 windows.
- *
- * The summary selects every recorded sample: `at`, the identity columns, `i`
- * (exact integers as DECIMAL) and `d` (doubles). With an aggregation, the
- * samples are first aggregated once per instant and identity; integers stay
- * exact unless a double shares the group. Its Latest, Max and Mean are server
- * text: Max orders by double value and breaks a rounded tie exactly,
- * comparing the integer with the double as decimals (a double that ties an
- * int64 is integral), and Mean is the exact decimal mean unless a double is
- * present.
- */
-export function metricQueries(input: MetricInput, range: AbsoluteRange, predicate?: string): { identity: readonly string[]; chart: Executed; summary: Executed } {
+/** The range's binds, the metric, the WHERE and predicate, and the group keys as `g1`… of one metric read. */
+function metricBinds(input: MetricInput, range: AbsoluteRange, kind: string, predicate?: string) {
   const filters = SIGNALS.metrics.filters as readonly string[];
   for (const { column } of input.where ?? []) if (!filters.includes(column)) throw new Error(`${column} is not a metrics column`);
-  if (input.by !== undefined && !filters.includes(input.by)) throw new Error(`${input.by} is not a metrics column`);
+  const keys = input.apart ? [] : (input.by ?? []);
+  if (keys.length > MAX_GROUP_KEYS) throw new Error(`at most ${MAX_GROUP_KEYS} group keys`);
   const binds = Binds.over(SIGNALS.metrics.time, range);
-  binds.clauses.push(`metric_name = ${binds.bind(input.metric)}`, PLOTTED);
+  binds.clauses.push(`metric_name = ${binds.bind(input.metric)}`, kind);
   binds.where((input.where ?? []).filter(({ column, not }) => column !== 'metric_name' || not)).predicate(predicate);
-  const meaning: (readonly [string, string])[] = [...new Set<string>([...MEANING, ...(input.aggregation && input.by ? [input.by] : [])])].map((name) => [name, name] as const);
-  const dimensions = input.aggregation ? meaning : [...meaning, ...DIMENSIONS];
-  const identity = dimensions.map(([name]) => name);
-  const names = identity.join(', ');
-  const selected = (columns: readonly (readonly [string, string])[]) => columns.map(([name, sql]) => (name === sql ? name : `${sql} AS ${name}`)).join(', ');
-  let samples =
-    `SELECT ${SIGNALS.metrics.time} AS at, ${selected(dimensions)}, ` +
-    `CAST(int_value AS DECIMAL(38, 0)) AS i, double_value AS d FROM ${SIGNALS.metrics.table} WHERE ${binds.sql}`;
-  if (input.aggregation) {
-    const f = AGGREGATE[input.aggregation];
-    samples =
-      `SELECT at, ${names}, CASE WHEN count(d) = 0 THEN ${f}(i) END AS i, CASE WHEN count(d) > 0 THEN ${f}(COALESCE(CAST(i AS DOUBLE), d)) END AS d ` +
-      `FROM (${samples}) GROUP BY at, ${names}`;
-  }
-  const valued = `SELECT *, COALESCE(CAST(i AS DOUBLE), d) AS v, COALESCE(CAST(i AS VARCHAR), CAST(d AS VARCHAR)) AS t FROM (${samples})`;
-  // The chart's bucket is its own last bind, so the summary binds only what it references.
-  const params = [...binds.params, bucketFor(range)];
-  const series = [...meaning, ...DIMENSIONS];
-  const recorded = series.map(([name]) => name).join(', ');
-  let windowed =
-    `SELECT w, ${recorded}, CASE WHEN aggregation_temporality = 1 THEN sum(v) ELSE last_value(v ORDER BY t) END AS v FROM (` +
-    `SELECT date_bin($${params.length}::interval, ${SIGNALS.metrics.time}) AS w, ${SIGNALS.metrics.time} AS t, ${selected(series)}, ` +
-    `COALESCE(CAST(int_value AS DOUBLE), double_value) AS v FROM ${SIGNALS.metrics.table} WHERE ${binds.sql}) GROUP BY w, ${recorded}`;
-  if (input.aggregation) windowed = `SELECT w, ${names}, ${AGGREGATE[input.aggregation]}(v) AS v FROM (${windowed}) GROUP BY w, ${names}`;
+  const groups = keys.map((key, index) => [`g${index + 1}`, groupKey(key, binds)] as const);
+  return { binds, keys, groups };
+}
+
+/**
+ * The chart read of one metric, aggregated on the server into the chart's
+ * windows. Each series, by `series_id`, gives one value per window:
+ * - a monotonic cumulative sum its increase over its last point in the
+ *   previous window (a changed start or a smaller value is a reset, counted
+ *   from zero), and a delta sum its points added up, both per second;
+ * - a gauge or non-monotonic cumulative sum its last value.
+ * Series then aggregate per recorded meaning and group: sums add up and
+ * gauges average, unless `aggregation` replaces it; with `apart` every series
+ * stays its own group. The {@link MAX_SERIES} groups with the largest measure
+ * over the range are read (total for rates, mean otherwise), each row naming
+ * how many groups there were.
+ */
+export function metricQueries(input: MetricInput, range: AbsoluteRange, predicate?: string): { identity: readonly string[]; chart: Executed } {
+  const { binds, keys, groups } = metricBinds(input, range, PLOTTED, predicate);
+  const bucket = binds.bind(bucketFor(range));
+  const seconds = binds.bind(bucketWidth(range) / 1000);
+  const meaning = MEANING.join(', ');
+  const group = [meaning, ...(input.apart ? ['series'] : groups.map(([name]) => name))].join(', ');
+  const counter = 'metric_type = \'sum\' AND (is_monotonic OR aggregation_temporality = 1)';
+  const across = input.aggregation ? AGGREGATE[input.aggregation] : undefined;
+  // ponytail: a reset inside one window loses that window's increase before the reset; per-point deltas if that matters.
+  const sql =
+    `WITH pts AS (SELECT date_bin(${bucket}::interval, ${SIGNALS.metrics.time}) AS w, ${SIGNALS.metrics.time} AS t, start_time_unix_nano AS s, series_id, ${meaning}, ` +
+    `${groups.map(([name, sql]) => `${sql} AS ${name}, `).join('')}COALESCE(CAST(int_value AS DOUBLE), double_value) AS x FROM ${SIGNALS.metrics.table} WHERE ${binds.sql}), ` +
+    `ends AS (SELECT w, series_id, ${meaning}${groups.map(([name]) => `, ${name}`).join('')}, first_value(s ORDER BY t) AS s0, last_value(s ORDER BY t) AS s1, ` +
+    `first_value(x ORDER BY t) AS x0, last_value(x ORDER BY t) AS x1, sum(x) AS xs FROM pts GROUP BY w, series_id, ${meaning}${groups.map(([name]) => `, ${name}`).join('')}), ` +
+    `prior AS (SELECT *, lag(s1) OVER series AS sp, lag(x1) OVER series AS xp FROM ends WINDOW series AS (PARTITION BY series_id ORDER BY w)), ` +
+    `per AS (SELECT w, encode(series_id, 'hex') AS series, ${meaning}${groups.map(([name]) => `, ${name}`).join('')}, CASE ` +
+    `WHEN aggregation_temporality = 1 THEN xs ` +
+    `WHEN metric_type = 'sum' AND is_monotonic THEN x1 - CASE WHEN xp IS NOT NULL AND sp = s1 AND x1 >= xp THEN xp WHEN xp IS NULL AND s0 = s1 AND x1 >= x0 AND s1 < $1::timestamptz THEN x0 ELSE 0 END ` +
+    `ELSE x1 END AS v FROM prior), ` +
+    `grouped AS (SELECT w, ${group}, ${across ? `${across}(v)` : `CASE WHEN metric_type = 'sum' THEN sum(v) ELSE avg(v) END`} / CASE WHEN ${counter} THEN ${seconds} ELSE 1 END AS value FROM per GROUP BY w, ${group}), ` +
+    `measured AS (SELECT *, CASE WHEN ${counter} THEN sum(value) OVER (PARTITION BY ${group}) ELSE avg(value) OVER (PARTITION BY ${group}) END AS measure FROM grouped), ` +
+    `ranked AS (SELECT *, dense_rank() OVER (ORDER BY measure DESC NULLS LAST, ${group}) AS rank FROM measured) ` +
+    `SELECT w AS at, ${group}, value, groups FROM (SELECT *, max(rank) OVER () AS groups FROM ranked) WHERE rank <= ${MAX_SERIES} ORDER BY at`;
+  return { identity: [...MEANING, ...(input.apart ? ['series'] : keys)], chart: { sql, params: binds.params } };
+}
+
+/**
+ * The recorded resource, scope and attributes of `series`, by `series_id`,
+ * each as its JSON text from the series' newest point in the range: the only
+ * read of whole attribute sets, and only for the plotted series.
+ */
+export function seriesLabelsQuery(input: MetricInput, range: AbsoluteRange, series: readonly string[], predicate?: string): Executed {
+  const { binds } = metricBinds({ ...input, apart: true }, range, PLOTTED, predicate);
+  binds.clauses.push(`series_id IN (${series.map((id) => `decode(${binds.bind(id)}, 'hex')`).join(', ')})`);
   return {
-    identity,
-    chart: {
-      sql:
-        `SELECT w AS at, ${names}, v AS value FROM (SELECT *, dense_rank() OVER (ORDER BY ${names}) AS rank FROM (SELECT w, ${rendered(identity)}, v FROM (${windowed}))) ` +
-        `WHERE rank <= ${MAX_SERIES} ORDER BY at`,
-      params
-    },
-    summary: {
-      sql:
-        `SELECT ${rendered(identity)}, points, latest, max, mean FROM (` +
-        `SELECT ${names}, count(*) AS points, last_value(t ORDER BY at) AS latest, first_value(t ORDER BY v DESC, COALESCE(i, CASE WHEN abs(d) < 1e19 THEN CAST(d AS DECIMAL(38, 0)) END) DESC NULLS LAST) AS max, ` +
-        `CASE WHEN count(d) = 0 THEN CAST(avg(i) AS VARCHAR) ELSE CAST(avg(v) AS VARCHAR) END AS mean ` +
-        `FROM (${valued}) GROUP BY ${names}) ORDER BY ${names}`,
-      params: binds.params
-    }
+    sql:
+      `SELECT encode(series_id, 'hex') AS series, to_json(resource_attributes) AS resource, scope_name, scope_version, to_json(scope_attributes) AS scope, to_json(attributes) AS attributes ` +
+      `FROM (SELECT *, row_number() OVER (PARTITION BY series_id ORDER BY ${SIGNALS.metrics.time} DESC) AS newest FROM ${SIGNALS.metrics.table} WHERE ${binds.sql}) WHERE newest = 1`,
+    params: binds.params
   };
 }
 
-/** Series a metric summary reads; past it the summary reports a partial result. */
-const METRIC_SERIES = 1000;
 /** Rows one windowed plot reads: {@link MAX_SERIES} series or groups by the at most 201 windows a range spans. */
 const PLOT_ROWS = MAX_SERIES * 201;
-/** Bytes one windowed plot reads; a series identity carries its resource and attribute JSON on every row. */
+/** Bytes one windowed plot reads. */
 const PLOT_BYTES = 16 * 1024 * 1024;
 
+/** Each plotted group's Latest, Max and Mean of its plotted values, as text, keyed by `identity`. */
+function plottedSummary(chart: QueryResult, identity: readonly string[]): QueryResult {
+  const groups = new Map<string, { cells: unknown[]; values: number[] }>();
+  const value = columnIndex(chart, 'value');
+  for (const row of chart.rows) {
+    const cells = identity.map((name) => row[columnIndex(chart, name)]);
+    const key = JSON.stringify(cells);
+    const group = groups.get(key) ?? { cells, values: [] };
+    groups.set(key, group);
+    if (row[value] !== null) group.values.push(numeric(row[value]));
+  }
+  const text = (n: number | undefined) => (n === undefined ? null : String(n));
+  return {
+    columns: [...identity.map((name) => chart.columns[columnIndex(chart, name)]), ...['latest', 'max', 'mean'].map((name) => ({ name, data_type: 'Utf8', nullable: true }))],
+    rows: [...groups.values()].map(({ cells, values }) => [
+      ...cells,
+      text(values.at(-1)),
+      text(values.length ? Math.max(...values) : undefined),
+      text(values.length ? values.reduce((sum, each) => sum + each, 0) / values.length : undefined)
+    ]),
+    terminal: chart.terminal
+  };
+}
+
+/** Name the read's `g1`… columns by their group keys, and with `labels` replace each series id by its recorded resource, scope and attributes. */
+function named(read: QueryResult, keys: readonly string[], labels?: QueryResult): QueryResult {
+  const columns = read.columns.map((column) => (/^g\d+$/.test(column.name) ? { ...column, name: keys[Number(column.name.slice(1)) - 1] } : column));
+  if (!labels) return { ...read, columns };
+  const at = columnIndex(read, 'series');
+  const recorded = new Map(labels.rows.map((row) => [row[0], row.slice(1)]));
+  const empty = labels.columns.slice(1).map(() => null);
+  return {
+    columns: [...columns.slice(0, at), ...labels.columns.slice(1), ...columns.slice(at + 1)],
+    rows: read.rows.map((row) => [...row.slice(0, at), ...(recorded.get(row[at]) ?? empty), ...row.slice(at + 1)]),
+    terminal: read.terminal
+  };
+}
+
+/** The recorded columns an `apart` series is identified by in place of its id. */
+const SERIES_LABELS = ['resource', 'scope_name', 'scope_version', 'scope', 'attributes'] as const;
+
 /**
- * Load one metric's chart and exact summary in one batch over one range and
- * one validated predicate; a refused predicate issues neither read.
+ * Load one metric's chart and its histogram plots in one batch over one
+ * range and one validated predicate; with `apart`, a second read labels only
+ * the plotted series. A refused predicate issues no read.
  */
 export async function loadMetric(input: MetricInput, context: LoadContext): Promise<MetricProps> {
   const stopped = (state: Loaded<never>): MetricProps => ({ input, identity: [], summary: state, chart: { input: metricChart(input), result: state } });
@@ -548,37 +590,52 @@ export async function loadMetric(input: MetricInput, context: LoadContext): Prom
   if ('code' in range) return stopped({ state: 'error', problem: range });
   const predicate = await predicateFor(SIGNALS.metrics.table, input.where_sql, context);
   if ('state' in predicate) return stopped(predicate);
-  const plan = metricQueries(input, range, predicate.sql);
-  const points = histogramQuery(input, range, predicate.sql);
-  const [chart, summary, histogram] = await context.executor.run(
-    [
-      query(plan.chart.sql, plan.chart.params, PLOT_ROWS, PLOT_BYTES),
-      query(plan.summary.sql, plan.summary.params, METRIC_SERIES),
-      query(points.sql, points.params, PLOT_ROWS, PLOT_BYTES)
-    ],
+  let plan: ReturnType<typeof metricQueries>;
+  let points: Executed;
+  try {
+    plan = metricQueries(input, range, predicate.sql);
+    points = histogramQuery(input, range, predicate.sql);
+  } catch (error) {
+    return stopped({ state: 'error', problem: inputProblem('Metric', { path: ['by'], message: (error as Error).message }) });
+  }
+  const [chart, histogram] = await context.executor.run(
+    [query(plan.chart.sql, plan.chart.params, PLOT_ROWS, PLOT_BYTES), query(points.sql, points.params, PLOT_ROWS, PLOT_BYTES)],
     context.signal
   );
+  let read = chart;
+  let identity = plan.identity;
+  if (chart.ok && input.apart && chart.value.rows.length) {
+    const ids = [...new Set(chart.value.rows.map((row) => String(row[columnIndex(chart.value, 'series')])))];
+    const labels = seriesLabelsQuery(input, range, ids, predicate.sql);
+    const [labelled] = await context.executor.run([query(labels.sql, labels.params, MAX_SERIES)], context.signal);
+    if (!labelled.ok) read = labelled;
+    else {
+      read = { ok: true, value: named(chart.value, [], labelled.value) };
+      identity = [...MEANING, ...SERIES_LABELS];
+    }
+  } else if (chart.ok) read = { ok: true, value: named(chart.value, plan.identity.slice(MEANING.length)) };
   const reason = `No gauge or sum point of ${input.metric} in ${SIGNALS.metrics.table} in this range.`;
-  const loaded = (read: (typeof chart)): Loaded<QueryResult> =>
-    !read.ok ? failed(read.problem) : read.value.rows.length ? { state: 'populated', data: read.value } : { state: 'empty', data: read.value, reason };
-  const total = summary.ok ? summary.value.rows.length : 0;
-  const capped = total > MAX_SERIES ? ` · first ${MAX_SERIES} of ${total} series plotted` : '';
+  const loaded = (data: QueryResult): Loaded<QueryResult> => (data.rows.length ? { state: 'populated', data } : { state: 'empty', data, reason });
+  const total = read.ok && read.value.rows.length ? numeric(read.value.rows[0][columnIndex(read.value, 'groups')]) : 0;
+  const noun = input.apart ? 'series' : 'groups';
+  const capped = total > MAX_SERIES ? ` · the ${MAX_SERIES} largest of ${total} ${noun} plotted` : '';
   const title = `${metricChart(input).title}${capped}`;
   return {
     input,
-    identity: plan.identity,
-    chart: { input: { ...metricChart(input), title, sql: plan.chart.sql, range }, executed: plan.chart, result: loaded(chart) },
-    summary: loaded(summary),
-    ...(!histogram.ok ? { histogram: histogramProps(input, range, points, failed(histogram.problem)) } : histogram.value.rows.length ? { histogram: histogramProps(input, range, points, histogram.value) } : {})
+    identity,
+    chart: { input: { ...metricChart(input), title, sql: plan.chart.sql, range }, executed: plan.chart, result: read.ok ? loaded(read.value) : failed(read.problem) },
+    summary: read.ok ? loaded(plottedSummary(read.value, identity)) : failed(read.problem),
+    ...(!histogram.ok ? { histogram: histogramProps(input, range, points, failed(histogram.problem)) } : histogram.value.rows.length ? { histogram: histogramProps(input, range, points, named(histogram.value, input.by ?? [])) } : {})
   };
 }
 
 /** The metric's chart definition before its SQL is planned. */
 function metricChart(input: MetricInput): Extract<ChartInput, { type: 'timeseries' }> {
-  const how = input.aggregation
-    ? `${input.aggregation} across series per window${input.by ? ` by ${input.by}` : ''}`
-    : 'each recorded series, its last value per window or its delta points summed';
-  return { type: 'timeseries', title: `${input.metric} · ${how} · plotted as double precision`, sql: '-', x: 'at', y: ['value'] };
+  const across = input.aggregation ?? 'sum of sums, mean of gauges';
+  const how = input.apart
+    ? 'each series apart'
+    : `${across} across series${input.by?.length ? ` by ${input.by.join(', ')}` : ''}`;
+  return { type: 'timeseries', title: `${input.metric} · ${how} · counters per second · plotted as double precision`, sql: '-', x: 'at', y: ['value'] };
 }
 
 /** Explicit-bucket histogram points, the only histogram kind plotted; exponential histograms and summaries stay listed. */
@@ -599,15 +656,10 @@ export const HISTOGRAM_PERCENTILES = [50, 95, 99] as const;
  * the range, and in full otherwise. Delta points count as recorded.
  */
 export function histogramQuery(input: MetricInput, range: AbsoluteRange, predicate?: string): Executed {
-  const filters = SIGNALS.metrics.filters as readonly string[];
-  for (const { column } of input.where ?? []) if (!filters.includes(column)) throw new Error(`${column} is not a metrics column`);
-  if (input.by !== undefined && !filters.includes(input.by)) throw new Error(`${input.by} is not a metrics column`);
-  const binds = Binds.over(SIGNALS.metrics.time, range);
-  binds.clauses.push(`metric_name = ${binds.bind(input.metric)}`, HISTOGRAM);
-  binds.where((input.where ?? []).filter(({ column, not }) => column !== 'metric_name' || not)).predicate(predicate);
+  const { binds, groups: keyed } = metricBinds({ ...input, apart: false }, range, HISTOGRAM, predicate);
   const bucket = binds.bind(bucketFor(range));
-  const group = [...new Set<string>([...MEANING, ...(input.by ? [input.by] : [])]), 'bounds'].join(', ');
-  const series = `${group}, ${DIMENSIONS.map(([name]) => name).join(', ')}`;
+  const group = [...MEANING, ...keyed.map(([name]) => name), 'bounds'].join(', ');
+  const series = `${group}, series_id`;
   // $1 is the range's start: a series that started before it has its first point as the baseline.
   const base = (prior: string, first: string) =>
     `CASE WHEN np IS NOT NULL AND sp = s1 AND n1 >= np THEN ${prior} WHEN np IS NULL AND s0 = s1 AND n1 >= n0 AND s1 < $1::timestamptz THEN ${first}${prior === 'bp' ? '' : ' ELSE 0'} END`;
@@ -619,7 +671,7 @@ export function histogramQuery(input: MetricInput, range: AbsoluteRange, predica
   // ponytail: a reset inside one window loses that window's counts before the reset; per-point deltas if that matters.
   const sql =
     `WITH pts AS (SELECT date_bin(${bucket}::interval, ${SIGNALS.metrics.time}) AS w, ${SIGNALS.metrics.time} AS t, start_time_unix_nano AS started, ` +
-    `${[...new Set<string>([...MEANING, ...(input.by ? [input.by] : [])])].join(', ')}, explicit_bounds AS bounds, ${DIMENSIONS.map(([name, sql]) => `${sql} AS ${name}`).join(', ')}, ` +
+    `${MEANING.join(', ')}, ${keyed.map(([name, sql]) => `${sql} AS ${name}, `).join('')}explicit_bounds AS bounds, series_id, ` +
     `CAST(histogram_count AS BIGINT) AS n, histogram_sum AS v, CAST(bucket_counts AS BIGINT[]) AS b FROM ${SIGNALS.metrics.table} WHERE ${binds.sql}), ` +
     `ends AS (SELECT w, ${series}, ${ends.join(', ')} FROM pts WHERE aggregation_temporality = 2 GROUP BY w, ${series}), ` +
     `prior AS (SELECT *, lag(s1) OVER series AS sp, lag(n1) OVER series AS np, lag(v1) OVER series AS vp, lag(b1) OVER series AS bp ` +
@@ -695,17 +747,17 @@ export interface HistogramWindows {
  * mean and estimated percentiles and the count rate per window, and the
  * bucket counts over the whole range. A window with no counts is a gap.
  */
-export function histogramWindows(read: QueryResult, range: AbsoluteRange, by?: string): HistogramWindows {
+export function histogramWindows(read: QueryResult, range: AbsoluteRange, by: readonly string[] = []): HistogramWindows {
   const at = (name: string) => columnIndex(read, name);
   const [ti, ci, sumi, bi, ki] = ['at', 'count', 'sum', 'bounds', 'buckets'].map(at);
-  const groupIndexes = [...new Set<string>([...MEANING, ...(by ? [by] : [])])].map(at);
+  const groupIndexes = [...MEANING, ...by].map(at);
   const seconds = bucketWidth(range) / 1000;
   const groups = new Map<string, Group>();
   for (const row of read.rows) {
     const bounds = ((row[bi] ?? []) as unknown[]).map(numeric);
     const tally = { count: numeric(row[ci] ?? 0), sum: numeric(row[sumi] ?? 0), buckets: ((row[ki] ?? []) as unknown[]).map(numeric) };
     const key = JSON.stringify([groupIndexes.map((index) => row[index]), bounds]);
-    const group = groups.get(key) ?? { label: by ? String(row[at(by)] ?? '∅') : '', bounds, windows: [], total: { count: 0, sum: 0, buckets: [] } };
+    const group = groups.get(key) ?? { label: by.map((key) => String(row[at(key)] ?? '∅')).join(' · '), bounds, windows: [], total: { count: 0, sum: 0, buckets: [] } };
     groups.set(key, group);
     group.windows.push([new Date(parseInstant(row[ti])).toISOString(), tally]);
     group.total.count += tally.count;
@@ -746,7 +798,7 @@ export function histogramWindows(read: QueryResult, range: AbsoluteRange, by?: s
 
 /** The three histogram Charts of one read, or one shared failure. */
 function histogramProps(input: MetricInput, range: AbsoluteRange, executed: Executed, read: QueryResult | Loaded<never>): HistogramProps {
-  const how = `${input.by ? `by ${input.by} · ` : ''}explicit-bucket histogram`;
+  const how = `${input.by?.length ? `by ${input.by.join(', ')} · ` : ''}explicit-bucket histogram`;
   const charts = {
     latency: { type: 'timeseries', title: `${input.metric} · mean and percentiles estimated from buckets · ${how}`, sql: executed.sql, x: 'at', y: ['value'], series: 'series', range },
     rate: { type: 'timeseries', title: `${input.metric} · recordings per second · ${how}`, sql: executed.sql, x: 'at', y: ['value'], series: 'series', range },

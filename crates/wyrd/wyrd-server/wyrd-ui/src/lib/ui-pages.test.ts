@@ -10,6 +10,7 @@ import {
   histogramQuery,
   histogramWindows,
   metricQueries,
+  seriesLabelsQuery,
   validatePanel,
   wyrdProblem,
   type Executor,
@@ -203,41 +204,46 @@ test('observe signal planning and interactions', async () => {
   const points = listQuery({ signal: 'metrics', columns: ['metric_name', 'int_value', 'double_value', 'histogram_count', 'bucket_counts', 'positive_buckets'] }, RANGE).sql;
   expect(points).toMatch(/^SELECT metric_name, CAST\(int_value AS VARCHAR\) AS int_value, double_value, CAST\(histogram_count AS VARCHAR\) AS histogram_count, CAST\(bucket_counts AS VARCHAR\[\]\) AS bucket_counts, /);
   expect(points).toContain("named_struct('offset', positive_buckets['offset'], 'bucket_counts', CAST(positive_buckets['bucket_counts'] AS VARCHAR[])) END AS positive_buckets");
-  // Each recorded series keeps its typed identity: meaning plus resource, scope and point dimensions, Variants as JSON text.
-  const each = metricQueries({ metric: "o'clock", where: [{ column: 'unit', value: 'ms', not: true }] }, RANGE, 'service_name IS NOT NULL');
-  expect(each.identity).toEqual(['metric_type', 'unit', 'aggregation_temporality', 'is_monotonic', 'resource', 'scope_name', 'scope_version', 'scope', 'attributes']);
-  expect(each.chart.params).toContain("o'clock");
-  expect(each.chart.sql).toContain('to_json(attributes) AS attributes');
-  expect(each.chart.sql).toContain('AND (service_name IS NOT NULL)');
-  // The chart reads one value per window per series, in the range's bucket, for at most twenty series.
-  expect(each.chart.params.at(-1)).toBe('15 minutes');
-  expect(each.chart.sql).toContain(`date_bin($${each.chart.params.length}::interval, time_unix_nano) AS w`);
-  expect(each.chart.sql).toContain('CASE WHEN aggregation_temporality = 1 THEN sum(v) ELSE last_value(v ORDER BY t) END AS v');
-  expect(each.chart.sql).toContain('WHERE rank <= 20 ORDER BY at');
-  // Variants group raw and render as JSON only on aggregated rows.
-  expect(each.summary.sql).toMatch(/^SELECT metric_type, unit, aggregation_temporality, is_monotonic, to_json\(resource\) AS resource, /);
-  expect(each.summary.params).toEqual(each.chart.params.slice(0, -1));
-  // The summary reads exact text: Max orders by value and breaks a rounded tie exactly; Mean stays decimal unless a double is present.
-  expect(each.summary.sql).toContain('last_value(t ORDER BY at) AS latest, first_value(t ORDER BY v DESC, COALESCE(i, CASE WHEN abs(d) < 1e19 THEN CAST(d AS DECIMAL(38, 0)) END) DESC NULLS LAST) AS max');
-  expect(each.summary.sql).toContain('CASE WHEN count(d) = 0 THEN CAST(avg(i) AS VARCHAR) ELSE CAST(avg(v) AS VARCHAR) END AS mean');
-  expect(each.summary.sql).toContain('FROM (SELECT *, COALESCE(CAST(i AS DOUBLE), d) AS v');
-  // An explicit aggregation applies once per instant, kept apart by `by`.
-  const summed = metricQueries({ metric: 'm', aggregation: 'max', by: 'service_name' }, RANGE);
-  expect(summed.identity).toEqual(['metric_type', 'unit', 'aggregation_temporality', 'is_monotonic', 'service_name']);
-  expect(summed.summary.sql).toContain('CASE WHEN count(d) = 0 THEN max(i) END AS i, CASE WHEN count(d) > 0 THEN max(COALESCE(CAST(i AS DOUBLE), d)) END AS d');
-  // The chart applies it across series to each series' window value.
-  expect(summed.chart.sql).toContain('SELECT w, metric_type, unit, aggregation_temporality, is_monotonic, service_name, max(v) AS v FROM (');
+  // By default series aggregate across their meaning: per series by series_id, then sums add up and gauges average.
+  const aggregated = metricQueries({ metric: "o'clock", where: [{ column: 'unit', value: 'ms', not: true }] }, RANGE, 'service_name IS NOT NULL');
+  expect(aggregated.identity).toEqual(['metric_type', 'unit', 'aggregation_temporality', 'is_monotonic']);
+  expect(aggregated.chart.params).toEqual([RANGE.from, RANGE.to, "o'clock", 'ms', '15 minutes', 900]);
+  expect(aggregated.chart.sql).toContain('AND (service_name IS NOT NULL)');
+  expect(aggregated.chart.sql).toContain('date_bin($5::interval, time_unix_nano) AS w');
+  expect(aggregated.chart.sql).toContain('WINDOW series AS (PARTITION BY series_id ORDER BY w)');
+  expect(aggregated.chart.sql).toContain("CASE WHEN metric_type = 'sum' THEN sum(v) ELSE avg(v) END / CASE WHEN metric_type = 'sum' AND (is_monotonic OR aggregation_temporality = 1) THEN $6 ELSE 1 END AS value");
+  // A monotonic cumulative sum counts its increase; a reset counts from zero, and a series begun before the range counts from its first point.
+  expect(aggregated.chart.sql).toContain('x1 - CASE WHEN xp IS NOT NULL AND sp = s1 AND x1 >= xp THEN xp WHEN xp IS NULL AND s0 = s1 AND x1 >= x0 AND s1 < $1::timestamptz THEN x0 ELSE 0 END');
+  // The twenty groups with the largest measure are read, each row naming how many there were; no read rebuilds a whole attribute set.
+  expect(aggregated.chart.sql).toContain('dense_rank() OVER (ORDER BY measure DESC NULLS LAST, metric_type, unit, aggregation_temporality, is_monotonic) AS rank');
+  expect(aggregated.chart.sql).toMatch(/SELECT w AS at, metric_type, unit, aggregation_temporality, is_monotonic, value, groups FROM \(SELECT \*, max\(rank\) OVER \(\) AS groups FROM ranked\) WHERE rank <= 20 ORDER BY at$/);
+  expect(aggregated.chart.sql).not.toMatch(/to_json|\battributes\b(?!\))/);
+  // Group keys read one key each, bound as text; a promoted column reads as itself.
+  const keyed = metricQueries({ metric: 'm', aggregation: 'max', by: ['service_name', 'attributes.http.route', 'resource.host.name'] }, RANGE);
+  expect(keyed.identity).toEqual(['metric_type', 'unit', 'aggregation_temporality', 'is_monotonic', 'service_name', 'attributes.http.route', 'resource.host.name']);
+  expect(keyed.chart.sql).toContain('service_name AS g1, variant_get_text(attributes, $4) AS g2, variant_get_text(resource_attributes, $5) AS g3');
+  expect(keyed.chart.params.slice(2, 5)).toEqual(['m', 'http.route', 'host.name']);
+  expect(keyed.chart.sql).toContain('max(v) / CASE WHEN');
   expect(() => metricQueries({ metric: 'm', where: [{ column: 'body_text', value: 'x' }] }, RANGE)).toThrow('body_text is not a metrics column');
-  // Without an aggregation a gauge or sum keeps every recorded series; `by` groups only a histogram then.
-  expect(metricQueries({ metric: 'm', by: 'service_name' }, RANGE).identity).toEqual(each.identity);
-  expect(() => metricQueries({ metric: 'm', by: 'body_text' }, RANGE)).toThrow('body_text is not a metrics column');
-  // The host plans a series only for one selected metric, with the aggregation and grouping the URL names.
-  const metrics = readState(new URLSearchParams({ signal: 'metrics', where: JSON.stringify([{ column: 'metric_name', value: 'ui.requests' }]), agg: 'sum', by: 'service_name' }));
+  for (const key of ['body_text', 'attributes.', 'links.x', 'metric_type']) expect(() => metricQueries({ metric: 'm', by: [key] }, RANGE)).toThrow(`${key} is not a metrics group key`);
+  expect(() => metricQueries({ metric: 'm', by: ['service_name', 'scope_name', 'service_version', 'run_id'] }, RANGE)).toThrow('at most 3 group keys');
+  // Every series apart keys by series id and ignores group keys; only the plotted ids' attribute sets are read, newest point first.
+  const apart = metricQueries({ metric: 'm', apart: true, by: ['service_name'] }, RANGE);
+  expect(apart.identity).toEqual(['metric_type', 'unit', 'aggregation_temporality', 'is_monotonic', 'series']);
+  expect(apart.chart.sql).toContain("encode(series_id, 'hex') AS series");
+  expect(apart.chart.sql).not.toContain('g1');
+  const labels = seriesLabelsQuery({ metric: 'm' }, RANGE, ['0a', '0b']);
+  expect(labels.sql).toContain("series_id IN (decode($4, 'hex'), decode($5, 'hex'))");
+  expect(labels.sql).toContain('to_json(attributes) AS attributes FROM (SELECT *, row_number() OVER (PARTITION BY series_id ORDER BY time_unix_nano DESC) AS newest');
+  expect(labels.params).toEqual([RANGE.from, RANGE.to, 'm', '0a', '0b']);
+  // The host plans a series only for one selected metric, with the aggregation, keys or every-series view the URL names.
+  const metrics = readState(new URLSearchParams({ signal: 'metrics', where: JSON.stringify([{ column: 'metric_name', value: 'ui.requests' }]), agg: 'sum', by: JSON.stringify(['service_name']) }));
   expect(selectedMetric(metrics)).toBe('ui.requests');
   expect(groupColumns(metrics)).toContain('service_name');
-  expect(listInputs(metrics).series).toEqual({ metric: 'ui.requests', where: [{ column: 'metric_name', value: 'ui.requests' }], aggregation: 'sum', by: 'service_name' });
+  expect(readState(writeState(metrics))).toEqual(metrics);
+  expect(listInputs(metrics).series).toEqual({ metric: 'ui.requests', where: [{ column: 'metric_name', value: 'ui.requests' }], aggregation: 'sum', by: ['service_name'] });
   expect(listInputs({ ...metrics, agg: undefined, by: undefined }).series).toEqual({ metric: 'ui.requests', where: [{ column: 'metric_name', value: 'ui.requests' }] });
-  expect(listInputs({ ...metrics, agg: undefined }).series).toEqual({ metric: 'ui.requests', where: [{ column: 'metric_name', value: 'ui.requests' }], by: 'service_name' });
+  expect(listInputs({ ...metrics, apart: true }).series).toEqual({ metric: 'ui.requests', where: [{ column: 'metric_name', value: 'ui.requests' }], apart: true });
   expect(listInputs({ ...metrics, where: [] }).series).toBeUndefined();
 });
 
@@ -357,15 +363,19 @@ test('histograms fold on the server into the chart windows and shape into plots 
   ]);
   expect(histogramWindows(read([]), range).latency.rows).toEqual([]);
   // The read keeps only explicit-bucket histogram points and folds them per series and window on the server.
-  const { sql, params } = histogramQuery({ metric: 'm', by: 'service_name' }, range);
-  expect(params).toEqual([range.from, range.to, 'm', '1 minute']);
+  const { sql, params } = histogramQuery({ metric: 'm', by: ['service_name', 'attributes.http.route'] }, range);
+  expect(params).toEqual([range.from, range.to, 'm', 'http.route', '1 minute']);
   expect(sql).toContain("metric_type = 'histogram'");
-  expect(sql).toContain('date_bin($4::interval, time_unix_nano) AS w');
+  expect(sql).toContain('date_bin($5::interval, time_unix_nano) AS w');
+  // Series are told apart by series_id; group keys read one key each.
+  expect(sql).toContain('service_name AS g1, variant_get_text(attributes, $4) AS g2, explicit_bounds AS bounds, series_id');
+  expect(sql).toContain('PARTITION BY metric_type, unit, aggregation_temporality, is_monotonic, g1, g2, bounds, series_id ORDER BY w');
+  expect(sql).not.toContain('to_json');
   // A cumulative series counts its increase over its previous window, or over its first point when it started before the range.
   expect(sql).toContain('lag(n1) OVER series AS np');
   expect(sql).toContain('CASE WHEN np IS NOT NULL AND sp = s1 AND n1 >= np THEN np WHEN np IS NULL AND s0 = s1 AND n1 >= n0 AND s1 < $1::timestamptz THEN n0 ELSE 0 END AS nb');
   // Delta points count as recorded; groups are recorded meaning, the grouping value and bounds, at most twenty.
   expect(sql).toContain('FROM pts WHERE aggregation_temporality <> 2');
-  expect(sql).toContain('GROUP BY w, metric_type, unit, aggregation_temporality, is_monotonic, service_name, bounds)');
+  expect(sql).toContain('GROUP BY w, metric_type, unit, aggregation_temporality, is_monotonic, g1, g2, bounds)');
   expect(sql).toContain('WHERE rank <= 20 AND count > 0 ORDER BY at');
 });

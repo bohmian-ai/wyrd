@@ -9,7 +9,7 @@
   import { goto, invalidate } from '$app/navigation';
   import { page } from '$app/state';
   import { Chart, Drawer, EmptyState, FacetRail, RecordTable, fmtDuration, fmtNumber, type ActionIntent, type ActionState, type Problem } from 'wyrd-ai-ui';
-  import { METRIC_AGGREGATIONS, METRIC_NAMES, SIGNALS, columnLabel, validateIntent, type ComponentName } from 'wyrd-ai-ui/loaders';
+  import { MAX_GROUP_KEYS, METRIC_AGGREGATIONS, METRIC_GROUP_KEYS, METRIC_NAMES, SIGNALS, columnLabel, validateIntent, type ComponentName } from 'wyrd-ai-ui/loaders';
   import TimePicker, { type PickedRange, type Zone } from '$lib/TimePicker.svelte';
   import { PRESETS, appliedRange, closed, groupColumns, moved, readState, selectedMetric, step, writeState, zoomed, type HostFilter, type ObserveState } from '$lib/observe-host';
   import type { LayoutProps } from './$types';
@@ -45,6 +45,7 @@
     sort: undefined,
     agg: undefined,
     by: undefined,
+    apart: undefined,
     points: false
   });
 
@@ -161,7 +162,6 @@
   /** The reader's visible series, per metric view; absent shows the Chart's default. */
   let picks = $state<Record<string, ReadonlySet<string>>>({});
   const seriesKey = $derived(view?.series ? JSON.stringify(view.series.input) : '');
-  const byColumns = SIGNALS.metrics.filters.filter((column) => column !== 'metric_name');
   /** `n` `noun`s in words: "1 trace", "2 traces". */
   const plural = (n: number, noun: string) => `${fmtNumber(n)} ${noun}${n === 1 ? '' : 's'}`;
 </script>
@@ -327,7 +327,7 @@
           <ul aria-label="Metric names">
             {#each metricRows as row (`${row.name} ${row.type} ${row.unit}`)}
               <li>
-                <a href={href({ ...only('metric_name', row.name), agg: undefined, by: undefined })} aria-current={row.name === metric ? 'true' : undefined}>
+                <a href={href({ ...only('metric_name', row.name), agg: undefined, by: undefined, apart: undefined })} aria-current={row.name === metric ? 'true' : undefined}>
                   <span>{row.name}</span><span class="type">{row.type}{row.unit ? ` · ${row.unit}` : ''}</span>
                 </a>
               </li>
@@ -347,15 +347,7 @@
                   <h2>{metric}</h2>
                   <p class="type">{metricRow ? `${metricRow.type}${metricRow.unit ? ` · ${metricRow.unit}` : ''} · ` : ''}{histogram.latency.input.title?.replace(`${metric} · `, '')}</p>
                 </div>
-                <span class="choices">
-                  <label class="by">
-                    by
-                    <select aria-label="Group histogram by" value={current.by ?? ''} onchange={(event) => go({ ...closed(current), agg: undefined, by: event.currentTarget.value || undefined })}>
-                      <option value="">all series</option>
-                      {#each byColumns as column (column)}<option value={column}>{columnLabel(column)}</option>{/each}
-                    </select>
-                  </label>
-                </span>
+                <span class="choices">{@render keys()}</span>
               {/snippet}
             </Chart>
           </div>
@@ -384,27 +376,16 @@
                 </div>
                 <span class="choices">
                   <span class="segmented" role="group" aria-label="Calculation">
-                    <a href={href({ ...closed(current), agg: undefined, by: undefined })} aria-current={current.agg === undefined ? 'true' : undefined}>each series</a>
+                    <a href={href({ ...closed(current), agg: undefined, apart: undefined })} aria-current={!current.agg && !current.apart ? 'true' : undefined} title="Sums add up and gauges average across series">default</a>
                     {#each METRIC_AGGREGATIONS as aggregation (aggregation)}
-                      <a href={href({ ...closed(current), agg: aggregation })} aria-current={current.agg === aggregation ? 'true' : undefined}>{aggregation}</a>
+                      <a href={href({ ...closed(current), agg: aggregation, apart: undefined })} aria-current={current.agg === aggregation && !current.apart ? 'true' : undefined}>{aggregation}</a>
                     {/each}
+                    <a href={href({ ...closed(current), agg: undefined, by: undefined, apart: true })} aria-current={current.apart ? 'true' : undefined} title="The 20 largest series, each apart">every series</a>
                     {#each PERCENTILES as percentile (percentile)}
                       <span aria-disabled="true" title="Percentiles of recorded points are not available">{percentile}</span>
                     {/each}
                   </span>
-                  <label class="by">
-                    by
-                    <select
-                      aria-label="Group series by"
-                      value={current.by ?? ''}
-                      disabled={!current.agg}
-                      title={current.agg ? undefined : 'Choose an aggregation to group by'}
-                      onchange={(event) => go({ ...closed(current), by: event.currentTarget.value || undefined })}
-                    >
-                      <option value="">all series</option>
-                      {#each byColumns as column (column)}<option value={column}>{columnLabel(column)}</option>{/each}
-                    </select>
-                  </label>
+                  {#if !current.apart}{@render keys()}{/if}
                 </span>
               {/snippet}
             </Chart>
@@ -422,6 +403,30 @@
     {/if}
   {/if}
 </div>
+
+{#snippet keys()}
+  <!-- Up to three group keys: a promoted column, or one attributes., resource. or scope. key read on its own. -->
+  <span class="by keys" role="group" aria-label="Group series by">
+    by
+    {#each current.by ?? [] as key (key)}
+      <button type="button" class="key" aria-label="Stop grouping by {key}" onclick={() => go({ ...closed(current), by: current.by?.filter((each) => each !== key) })}>{key} ✕</button>
+    {:else}
+      <span class="quiet">all series</span>
+    {/each}
+    {#if (current.by?.length ?? 0) < MAX_GROUP_KEYS}
+      <form
+        onsubmit={(event) => {
+          event.preventDefault();
+          const key = new FormData(event.currentTarget).get('key')?.toString().trim();
+          if (key && !current.by?.includes(key)) go({ ...closed(current), by: [...(current.by ?? []), key] });
+        }}
+      >
+        <input name="key" list="group-keys" placeholder="attributes.http.route" aria-label="Add a group key" />
+      </form>
+      <datalist id="group-keys">{#each METRIC_GROUP_KEYS as key (key)}<option value={key}></option>{/each}</datalist>
+    {/if}
+  </span>
+{/snippet}
 
 {#snippet grouping()}
   <label class="by">
@@ -679,6 +684,33 @@
   /* A choice fits "all series" or a short column name; a long attribute name truncates in the closed control. */
   .by select {
     max-width: 11em;
+  }
+  .keys {
+    flex-wrap: wrap;
+  }
+  .keys .key {
+    height: 26px;
+    padding: 0 8px;
+    border: 1px solid var(--declare);
+    border-radius: var(--r);
+    background: var(--declare-soft);
+    color: var(--text);
+    font: 12px var(--font-mono);
+    cursor: pointer;
+  }
+  .keys input {
+    width: 16em;
+    height: 26px;
+    box-sizing: border-box;
+    padding: 0 8px;
+    border: 1px solid var(--border);
+    border-radius: var(--r);
+    background: var(--bg);
+    color: var(--text);
+    font: 12px var(--font-mono);
+  }
+  .quiet {
+    color: var(--muted);
   }
   select {
     height: 30px;

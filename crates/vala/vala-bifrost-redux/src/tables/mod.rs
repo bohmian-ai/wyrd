@@ -321,6 +321,11 @@ pub struct BuiltinTableDefinition {
     pub canonical_physical_fingerprint: fn() -> Option<CanonicalPhysicalFingerprint>,
     /// Value validator Scribe runs over every supplied user block.
     pub canonical_validator: CanonicalBatchValidator,
+    /// User columns the validator recomputes from each row's other fields.
+    ///
+    /// Scribe admits the validator's value for each and discards the
+    /// writer's, so a raw Arrow writer can never set one.
+    pub derived_columns: &'static [&'static str],
     /// Engine-owned physical-layout declaration.
     ///
     /// This is the built-in's single statement of partition granularity, sort
@@ -584,6 +589,14 @@ pub trait DomainTable: Send + Sync + 'static {
     /// ledger and value-level rules; a pre-declared table keeps the Variant
     /// contract over its declared Arrow fields.
     const CANONICAL_VALIDATOR: CanonicalBatchValidator = validate_predeclared::<Self>;
+
+    /// User columns [`Self::CANONICAL_VALIDATOR`] recomputes from each row's
+    /// other fields.
+    ///
+    /// Scribe replaces each supplied column with the validator's output before
+    /// admission, so the stored value is always the derived one. Empty for
+    /// every table whose columns are all writer-owned.
+    const DERIVED_COLUMNS: &'static [&'static str] = &[];
 
     /// Nullable Struct columns whose value is wholly present or wholly absent.
     ///
@@ -1273,6 +1286,7 @@ const fn definition<T: DomainTable>() -> BuiltinTableDefinition {
         canonical_fields: T::canonical_fields,
         canonical_physical_fingerprint: T::canonical_physical_fingerprint,
         canonical_validator: T::CANONICAL_VALIDATOR,
+        derived_columns: T::DERIVED_COLUMNS,
         physical_layout: T::physical_layout,
     }
 }
@@ -1469,7 +1483,7 @@ mod tests {
                     ("metrics", "points") => (
                         "time_unix_nano",
                         PartitionTransformWire::Hour,
-                        &["metric_name"],
+                        &["metric_name", "series_id"],
                     ),
                     ("gateway", "calls") => {
                         ("started_at", PartitionTransformWire::Hour, &["call_id"])
@@ -2151,7 +2165,7 @@ mod tests {
         for (fields, width) in [
             (traces::spans::SPAN_FIELDS, 65),
             (logs::records::LOG_FIELDS, 46),
-            (metrics::points::METRIC_FIELDS, 58),
+            (metrics::points::METRIC_FIELDS, 59),
         ] {
             assert_eq!(
                 managed_columns::canonical_physical_fields(fields).len(),

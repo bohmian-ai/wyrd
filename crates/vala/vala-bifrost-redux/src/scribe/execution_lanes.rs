@@ -603,18 +603,27 @@ fn decode_rows(
         }
         None => rows,
     };
-    if let Some(definition) = context.definition {
-        enforce_builtin_source_contract(
+    let derived;
+    let rows = match context.definition {
+        Some(definition) => match enforce_builtin_source_contract(
             rows,
             definition,
             trusted,
             context.attribution == StampedAttribution::Rows,
-        )?;
-        if matches!(context.attribution, StampedAttribution::Frame(_))
-            && (definition.canonical_fields)().is_none()
-        {
-            refuse_supplied_dimensions(rows)?;
-        }
+        )? {
+            Some(admitted) => {
+                derived = admitted;
+                &derived
+            }
+            None => rows,
+        },
+        None => rows,
+    };
+    if let Some(definition) = context.definition
+        && matches!(context.attribution, StampedAttribution::Frame(_))
+        && (definition.canonical_fields)().is_none()
+    {
+        refuse_supplied_dimensions(rows)?;
     }
     if let Some(expected) = context.expected_schema_fingerprint
         && source_schema_fingerprint(rows.schema().as_ref()) != expected
@@ -951,9 +960,16 @@ fn enforce_dynamic_variants(
 /// every other field against the environment the resource derives. A public
 /// frame supplies neither.
 ///
+/// Returns `Some` batch to admit in place of `rows` when the table declares
+/// [`derived_columns`](crate::tables::BuiltinTableDefinition::derived_columns):
+/// `rows` with each derived column replaced by the validator's value, so a
+/// writer-supplied value is never stored. Trusted rows derived theirs when
+/// they were built and return `None`, as does every table without one.
+///
 /// # Errors
 ///
-/// Returns [`ScribeError::InvalidFrame`] for an unknown reserved column,
+/// Returns [`ScribeError::InvalidFrame`] for an unknown reserved column or a
+/// derived column the batch or the validator output lacks,
 /// and [`ScribeError::ContractViolation`] carrying the validator's
 /// catalogued refusal. Column order is not judged here: callers reorder by
 /// name first, and the fingerprint check that follows owns the rest.
@@ -962,7 +978,7 @@ fn enforce_builtin_source_contract(
     definition: &'static crate::tables::BuiltinTableDefinition,
     trusted: bool,
     carried: bool,
-) -> Result<(), ScribeError> {
+) -> Result<Option<RecordBatch>, ScribeError> {
     let canonical = (definition.canonical_fields)().is_some();
     let schema = rows.schema();
     if canonical
@@ -973,7 +989,7 @@ fn enforce_builtin_source_contract(
         return Err(ScribeError::InvalidFrame);
     }
     if trusted {
-        return Ok(());
+        return Ok(None);
     }
     let fields = user_fields(rows);
     let mut columns = user_columns(rows);
@@ -988,8 +1004,22 @@ fn enforce_builtin_source_contract(
     }
     let user = RecordBatch::try_new(Arc::new(Schema::new(fields)), columns)
         .map_err(|_| ScribeError::InvalidFrame)?;
-    (definition.canonical_validator)(&user).map_err(ScribeError::ContractViolation)?;
-    Ok(())
+    let validated =
+        (definition.canonical_validator)(&user).map_err(ScribeError::ContractViolation)?;
+    if definition.derived_columns.is_empty() {
+        return Ok(None);
+    }
+    let mut admitted = rows.columns().to_vec();
+    for column in definition.derived_columns {
+        let (Ok(at), Some(derived)) = (schema.index_of(column), validated.column_by_name(column))
+        else {
+            return Err(ScribeError::InvalidFrame);
+        };
+        admitted[at] = Arc::clone(derived);
+    }
+    RecordBatch::try_new(schema, admitted)
+        .map(Some)
+        .map_err(|_| ScribeError::InvalidFrame)
 }
 
 /// The `deployment_environment` each row of a canonical signal batch derives
@@ -2915,6 +2945,91 @@ mod tests {
             ),
             "{refusal:?}"
         );
+    }
+
+    /// A raw Arrow writer's `series_id` is replaced by the one the point's
+    /// identity derives, so admission stores the OTLP path's id.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the point does not project or decode, or the decoded id
+    /// is the forged one rather than the projected one.
+    #[test]
+    fn a_raw_metric_series_id_is_overwritten_at_admission() {
+        use arrow::array::FixedSizeBinaryArray;
+        use wyrd_tonic::otlp::common::v1::{AnyValue, KeyValue, any_value};
+        use wyrd_tonic::otlp::metrics::v1::{
+            Gauge, Metric, NumberDataPoint, ResourceMetrics, ScopeMetrics, metric,
+            number_data_point,
+        };
+
+        let request = [ResourceMetrics {
+            scope_metrics: vec![ScopeMetrics {
+                metrics: vec![Metric {
+                    name: "queue.depth".to_owned(),
+                    data: Some(metric::Data::Gauge(Gauge {
+                        data_points: vec![NumberDataPoint {
+                            attributes: vec![KeyValue {
+                                key: "queue".to_owned(),
+                                value: Some(AnyValue {
+                                    value: Some(any_value::Value::StringValue("jobs".to_owned())),
+                                }),
+                            }],
+                            time_unix_nano: 20,
+                            value: Some(number_data_point::Value::AsInt(4)),
+                            ..NumberDataPoint::default()
+                        }],
+                    })),
+                    ..Metric::default()
+                }],
+                ..ScopeMetrics::default()
+            }],
+            ..ResourceMetrics::default()
+        }];
+        let (projected, _) =
+            crate::tables::metrics::project_resource_metrics(&request, None, usize::MAX)
+                .expect("the gauge projects");
+        let projected = crate::tables::signal::without_correlation_columns(&projected)
+            .expect("correlation columns split off");
+        let series_ids = |batch: &RecordBatch| {
+            batch
+                .column_by_name("series_id")
+                .and_then(|column| column.as_any().downcast_ref::<FixedSizeBinaryArray>())
+                .expect("series_id is FixedSizeBinary(16)")
+                .value(0)
+                .to_vec()
+        };
+        let expected = series_ids(&projected);
+        let at = projected.schema().index_of("series_id").expect("series_id");
+        let mut columns = projected.columns().to_vec();
+        columns[at] = Arc::new(
+            FixedSizeBinaryArray::try_from_iter([[0xab_u8; 16]].into_iter()).expect("forged id"),
+        );
+        let raw = RecordBatch::try_new(projected.schema(), columns).expect("raw batch");
+        let definition =
+            crate::tables::builtin_table("metrics", "points").expect("points is built in");
+
+        let decoded = decode(
+            ipc_payload(&raw),
+            &DecodeContext {
+                attribution: Attribution::direct(principal().id).into(),
+                workload: None,
+                card_scope: principal().card_scope(),
+                dimensions: None,
+                expected_schema_fingerprint: Some(SchemaFingerprint((definition
+                    .schema_fingerprint)(
+                ))),
+                request_id: &RequestId::now_v7(),
+                receipt_micros: receipt_now(),
+                definition: Some(definition),
+                registered_schema: None,
+                conform: None,
+            },
+        )
+        .expect("the raw point decodes");
+
+        assert_eq!(series_ids(&decoded), expected);
+        assert_ne!(series_ids(&decoded), vec![0xab_u8; 16]);
     }
 
     /// A decision projected for the audit log decodes, row-attributed, with

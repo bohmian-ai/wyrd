@@ -81,7 +81,8 @@ Service version ASC NULLS FIRST and their existing time axis DESC NULLS LAST.
 Time-only partitions remain hourly for telemetry/gateway and daily for
 verification/drift. Creation defaults combine service_name, subject_name,
 workload_card_uid, subject_card_uid and run_id Blooms with signal-specific lookup
-keys; audit retains its accountability defaults. Ten result Blooms include
+keys; audit retains its accountability defaults. `bifrost.metrics.points`
+adds `metric_name` and `series_id`. Ten result Blooms include
 result_id, execution_id, verifier_card_uid, binding_id and group_id. These are
 complete replaceable creation defaults, never a hidden validation floor.
 No environment/kind/version Bloom or identity partition is implied. The exact
@@ -134,7 +135,14 @@ consume no committed version. Data, snapshot and housekeeping commits preserve
 it. There is no parallel configuration counter, composite layout revision,
 accepted-recipe JSON or definition fingerprint standing in for this version.
 Native Iceberg schema/spec/order IDs remain physical descriptors, not Bifrost
-definition versions. Snapshot IDs and Scribe publication progress describe
+definition versions.
+
+A built-in's schema is creation-only. Tenant provisioning and server startup
+create a missing built-in from its current definition and refuse, aborting
+boot, one whose stored definition differs; a definition edit never adds,
+renames, or retypes a built-in column, though its layout may change. A
+warehouse whose built-in predates a changed built-in schema is therefore
+rebuilt: there is no built-in schema migration, backfill, or alias. Snapshot IDs and Scribe publication progress describe
 visibility and do not select the definition of accepted data.
 
 The domain is `1..=9223372036854775807`, represented by Rust `i64`, SQL
@@ -354,6 +362,23 @@ typed columns:
   `http_response_status_code`, `url_full`, and the `exception_*` columns of the
   span's last `exception` event on spans; the record's own `exception_*`
   attributes and `body_text` (the body when it is a string) on logs.
+- `bifrost.metrics.points` carries `series_id`, a nullable
+  `FixedSizeBinary(16)` column with a Bloom filter, derived at admission from
+  the point's series identity and never taken from a writer: Scribe replaces
+  any value a raw Arrow writer supplies, and the OTLP projection derives the
+  same id with the same function over the same canonical columns. The id is
+  the first 16 bytes of SHA-256 over a version byte `1` followed by
+  `metric_name`, `metric_type`, `unit`, `aggregation_temporality`,
+  `is_monotonic`, `explicit_bounds`, `resource_attributes`, `scope_name`,
+  `scope_version`, `scope_attributes`, and `attributes`, each as a one-byte
+  type tag, a big-endian `u32` length, and the bytes. An absent value is the
+  null tag with length 0; object keys are sorted bytewise at every depth and
+  arrays keep their order; every integer width is a big-endian `i64`; floats
+  are IEEE-754 bits with `-0.0` written as `0.0` and every NaN as one
+  canonical NaN. Description, `metadata`, schema URLs, `resource_entity_refs`,
+  exemplars, flags, values, and times are excluded. A new encoding takes a new
+  version byte. The id groups points into series; it is not a security
+  boundary.
 - Three tables hold each verification fact once. A result read assembles the
   public `VerificationResult` from them: the verdict from `results`,
   `requirements` and `steps` from `execution_outputs` by `result_id`, and

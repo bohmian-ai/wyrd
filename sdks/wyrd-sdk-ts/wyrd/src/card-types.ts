@@ -647,7 +647,7 @@ export interface CatboostMeta {
 export type Check = CheckAssert | CheckTrace | CheckAgent | CheckCode | CheckDrift;
 
 /**
- * A tool-less Agent returning the Verdict schema.
+ * An Agent, with any tools it declares, returning the Verdict schema.
  */
 export interface CheckAgent {
   /**

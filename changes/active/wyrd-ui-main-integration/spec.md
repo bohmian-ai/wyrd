@@ -1,10 +1,34 @@
 ---
 id: SPEC-wyrd-ui-main-integration
-revision: 26
+revision: 27
 status: approved
 ---
 
 # Migrate the Wyrd UI onto current main
+
+## Revision 27 — Series rows become durable before their points
+
+**Approved by the caller on 2026-11-04.** Revision 26 asked for a point and
+its series row in one acknowledged admission. Bifrost cannot do that: an
+ingress frame names one table, each batch is routed to its own Scribe shard,
+and each batch has its own sync and durable commit. A shared commit would be
+a new cross-table durability mechanism in the write-ahead log. The caller chose
+ordering instead, using only what exists.
+
+### Required changes
+
+- **REQ-059 is amended.** Its sentence "It admits them in the same
+  acknowledged admission as the points" is replaced by: Scribe admits the
+  derived series batch first, with a batch id derived from the points batch's
+  own, and admits the points batch only after the series batch is durable.
+  The points are acknowledged only after both are durable. A durable point
+  therefore always has its series row for that hour.
+  - A failed or unacknowledged series admission fails the points admission;
+    the writer retries the whole batch, and a repeated series row is allowed.
+  - A points batch whose series are all in the per-process set for their hour
+    admits no series batch and costs no extra sync.
+- **AC-038 is unchanged:** after a kill between the two admissions, no durable
+  point lacks its series row for its hour.
 
 ## Revision 26 — A metric series table, so Metrics performs like Grafana
 
@@ -2301,6 +2325,7 @@ reported live-proof blocker, never an assumed capability or silent pass.
 
 ## Revision history and authorities
 
+- Revision 27 approved (2026-11-04): series rows are admitted and durable before their points, in two ordered admissions, because Bifrost has no cross-table admission; a batch of already-written series admits no series batch.
 - Revision 26 approved (2026-11-04): a `bifrost.metrics.series` index table written at ingest in the same admission as its points; the rail, pickers and every-series labels read it, so their cost follows series, not points; Grafana-class latency targets.
 - Revision 25 approved (2026-11-04): `series_id` is creation-only, like earlier built-in column additions; warehouses that predate it are rebuilt rather than evolved, so every stored point has a series id and the null-id fallback and AC-035 are removed.
 - Revision 24 approved (2026-11-04): Metrics aggregate by default, group by chosen keys read with `variant_get`, opt-in capped every-series view, a server-searched rail scoped to the WHERE, and a server-computed `series_id` column with a Bloom on `bifrost.metrics.points`, hashed with SHA-256.

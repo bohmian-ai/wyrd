@@ -167,3 +167,41 @@ Record focused proof/results and update the current task evidence to cover this 
 ## Next review boundary
 
 Retain the original task, this verdict/ledger, this remediation task and prior candidate. Next review checks finding closure, `ed82f63bf35ca124c0a2980c160f0d64535eebd1..<new-candidate>` and affected consumers/invariants, with the original cumulative range available. Carry accepted unchanged Bloom/WAL/dependency/dev/sort behavior forward unless changed dependencies or new evidence invalidate it. No convergence assessment is needed for this first review. Implementation does not imply permission to commit, push, merge or deploy.
+
+## Implementation evidence
+
+Candidate: `ed82f63bf..e214d8505` (`4e01ce94f` review packet, `dcb890a09` F1–F5, `fb2880fb5` F6, `4db3d9b3e` F7, `1a44fe064` F8, `e214d8505` F6 journey).
+
+| Acceptance criterion | Implementation evidence | Verification evidence | Result |
+|---|---|---|---|
+| FIND-TASK-004-1 histogram typed identity, no summed/folded `other` | `packages/ui/src/lib/observe.ts` `histogramWindows` identity `[...keys, bounds, measure]`, `KeyedChartProps`; `plot.ts` `recordedSeries`/`identityCaptions` | `ui-pages.test.ts` "histograms fold on the server into the chart windows…"; `ui-library.test.ts` "TASK-004: Canonical signal interactions" (6 groups → 24 series, 20 shown, no `other`) | PASS |
+| FIND-TASK-004-2 busiest-first top 20, all-group total, every-series labels and control | `histogramQuery` `dense_rank` by window count, `groups` total, `apart` series ids; `+layout.svelte` Calculation group `default`/`every series`; `loadMetric` one labels read | `ui-library.integration.test.ts` "TASK-004: Metric windows count every recorded value" (h.routes: 20 of 21 plotted, /r20 kept, /r19 dropped; h.apart api 0.5 / worker 1.5); `ui-pages.test.ts` "every histogram series apart is labelled from the series index, plotted ids only"; journey clicks every series | PASS |
+| FIND-TASK-004-3 missing sum → unavailable mean; recorded zero → 0 | `histogramQuery` `CASE WHEN sum(kv) = sum(kn) THEN sum(dv) END`, cumulative baseline `base(...)` | integration h.nosum/h.mixed/h.baseline mean null, h.zero mean 0; unit absent/zero sums | PASS |
+| FIND-TASK-004-4 censored percentile keeps `≥` in tooltip, summary, loader; accurate mean label | `histogramWindows` `text` column and summary prefix; `Chart.svelte` `point.text`; latency title | `ui-library.test.ts` tooltip and status `≥ 1`; `ui-pages.test.ts` p99 `≥ 1`; journey title assertion | PASS |
+| FIND-TASK-004-5 reset-aware per-point increments in both SQL paths | `metricQueries` `increase()`/`lag` steps; `histogramQuery` `dn`/`dv` with baseline on restart | integration m.requests 15/60, m.dropped 14/60, m.delta 7/60, h.reset rate 15/60, mean 0.1, distribution `≤ 1` 8 / `> 1` 7, gauge latest exact; RED on prior code (0.0833 vs 0.25) | PASS |
+| FIND-TASK-004-6 series index per hour and accepted context, `series_id` unchanged; spec/Bifrost reconciled | `tables/metrics/series.rs` `CONTEXT_COLUMNS`, `SeriesKey`; `scribe/series_index.rs` v2 batch id; `architecture/bifrost-design.md`, `spec.md` REQ-058 | `scribe::scribe_persistence_path::a_series_has_one_row_per_accepted_context_in_an_hour` (7 rows: runs within/across batches, environments, workloads; repeats suppressed; RED on prior key); `scribe::series_index::tests::*`; journey: one OTLP series under `observed-service` 1.0.0 and 2.0.0 lists on the rail under each `workload_card_uid` | PASS |
+| FIND-TASK-004-7 retained-volume interruption/restart/read | `scribe/tests/scribe_persistence_path.rs` `crash_once_durable`, `restarted_scribe` (WAL post-sync fault holds the admission past its durable commit; process dropped without shutdown; next writer epoch replays the same WAL directory) | `a_stop_after_durable_series_rows_recovers_them_and_admits_the_retry`: series row recovered, 0 points, retry admitted with 4 points all indexed, no second series row; `a_stop_after_durable_unanswered_points_recovers_every_point_indexed`: 8 points recovered (4 unanswered), every point's hour/series/context has its series row | PASS |
+| FIND-TASK-004-8 rustdoc `# Panics` on listed items | `series.rs` `point`, `projected`, `id`, `otlp_id`, `replaced` and the five identity tests; `tables/mod.rs` nested `assert_untagged` | clippy `-D warnings` (also removed a panicking `expect` from `series_rows`) | PASS |
+
+Commands (all passed):
+
+```bash
+mise exec -- pnpm --dir crates/wyrd/wyrd-server/wyrd-ui test src/lib/ui-pages.test.ts src/lib/ui-library.test.ts   # 22 passed
+mise exec -- cargo nextest run --locked -p vala-bifrost-redux --lib -E '(test(/^scribe::scribe_persistence_path::/) & !test(/pg_tests/)) | test(/^scribe::series_index::/) | test(/^tables::metrics::series::/) | test(=tables::tests::canonical_schemas_do_not_carry_sensitivity_metadata)'   # 17 passed
+mise exec -- cargo nextest run --locked -p vala-bifrost-redux --lib -E 'test(=scribe::scribe_persistence_path::a_stop_after_durable_series_rows_recovers_them_and_admits_the_retry) | test(=scribe::scribe_persistence_path::a_stop_after_durable_unanswered_points_recovers_every_point_indexed) | test(=scribe::scribe_persistence_path::a_series_has_one_row_per_accepted_context_in_an_hour)'
+mise exec -- scripts/postgres/with-test-postgres.sh -- bash -lc 'mise run db:migrate:inner && WYRD_UI_INTEGRATION=1 pnpm --dir crates/wyrd/wyrd-server/wyrd-ui test src/lib/ui-library.integration.test.ts -t "TASK-004: Metric windows count every recorded value"'
+mise run ts:build && mise run ts:build:testing && mise run build:server
+mise exec -- scripts/postgres/with-test-postgres.sh -- bash -lc 'mise run db:migrate:inner && WYRD_UI_INTEGRATION=1 pnpm --dir crates/wyrd/wyrd-server/wyrd-ui test src/lib/ui-pages.integration.test.ts -t "^authenticated metrics investigation$"'   # 1 passed
+mise exec -- pnpm --dir crates/wyrd/wyrd-server/wyrd-ui check   # 0 errors, 0 warnings
+mise exec -- pnpm --dir crates/wyrd/wyrd-server/wyrd-ui build
+mise exec -- cargo fmt --all -- --check
+mise exec -- cargo clippy --locked -p vala-bifrost-redux --all-features --all-targets -- -D warnings
+git diff --check
+```
+
+Limits:
+- The embedded recovery fixture has no persistence tier; its replay retires a restored generation without staging it, so each interruption is proven across one restart of the retained WAL directory, not a second restart.
+- `codegen:check` was not run: no catalog or generated contract input changed.
+- `pg_tests::stale_table_version_is_refused_without_residue` needs Postgres and is outside this write set.
+- The 24h latency miss, absent visual acceptance and AC-040 limits stated above are unchanged.
+- Non-goals stayed excluded; no file outside the remediation write set changed.

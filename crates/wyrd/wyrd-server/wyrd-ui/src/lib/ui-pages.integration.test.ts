@@ -11,8 +11,8 @@ import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { chromium, type Browser, type Page } from 'playwright';
 import { test as base, expect, vi } from 'vitest';
-import { serverTest } from '../../../../../../sdks/wyrd-sdk-ts/wyrd/tests/support/server';
-import { Principals, WyrdClient } from 'wyrd-ai';
+import { declared, fixture, runtimeAccount, serverTest } from '../../../../../../sdks/wyrd-sdk-ts/wyrd/tests/support/server';
+import { Cards, Principals, WyrdClient } from 'wyrd-ai';
 import { exportOtlp, nanos, seedSignals } from '$lib/ui-signals.integration';
 
 vi.setConfig({ testTimeout: 300_000 });
@@ -468,6 +468,30 @@ test('authenticated metrics investigation', async ({ server, ui }) => {
   await rail.getByRole('searchbox', { name: 'Find a metric' }).fill('no-such-metric');
   await expect.poll(() => rail.textContent(), { timeout: 30_000 }).toContain('No metric names hold “no-such-metric”.');
   await rail.getByRole('searchbox', { name: 'Find a metric' }).fill('');
+
+  // One series exported under two Service releases is indexed under each accepted context, so the rail lists it under either.
+  const client = WyrdClient.connect({ serverUrl: ui.serverUrl, credential: ui.adminKey });
+  const cards = await Cards.connect({ client });
+  await cards.declareFromPath(fixture('cards/observe_a_run/observed-model.yaml'));
+  const releases = [
+    declared(await cards.declareFromPath(fixture('cards/observe_a_run/observed-service.yaml'))),
+    declared(await cards.declareFromPath(fixture('cards/observe_a_run/observed-service-2.yaml')))
+  ];
+  const { key } = await runtimeAccount({ kind: 'Service', name: 'observed-service' }, client);
+  for (const release of releases)
+    await exportOtlp(
+      server,
+      key,
+      '/v1/metrics',
+      { resourceMetrics: [{ resource: resource('ui-rooted'), scopeMetrics: [{ scope, metrics: [{ name: 'ui.rooted', unit: '1', gauge: { dataPoints: [point('2026-10-19T04:00:00Z', { asInt: '3' })] } }] }] }] },
+      { 'x-wyrd-workload-uid': release.uid }
+    );
+  server.flushBifrost();
+  for (const release of releases) {
+    await page.goto(`${metrics}&where=${encodeURIComponent(JSON.stringify([{ column: 'workload_card_uid', value: release.uid }]))}`);
+    await expect.poll(() => names.allTextContents(), { timeout: 30_000 }).toEqual([expect.stringContaining('ui.rooted')]);
+  }
+  await page.goto(metrics);
   await expect.poll(() => names.count(), { timeout: 30_000 }).toBeGreaterThan(1);
 
   // Selecting the metric aggregates across series by default: one line per recorded meaning, counters as rates.

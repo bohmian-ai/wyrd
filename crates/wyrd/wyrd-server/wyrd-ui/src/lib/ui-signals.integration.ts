@@ -91,10 +91,10 @@ export async function seedSignals(server: { baseUrl: string; flushBifrost(): voi
 }
 
 /** POST one OTLP/HTTP JSON export as `apiKey`; anything but 200 throws with the server's answer. */
-export async function exportOtlp(server: { baseUrl: string }, apiKey: string, path: string, body: unknown) {
+export async function exportOtlp(server: { baseUrl: string }, apiKey: string, path: string, body: unknown, headers: Record<string, string> = {}) {
   const response = await fetch(new URL(path, server.baseUrl), {
     method: 'POST',
-    headers: { 'content-type': 'application/json', 'x-wyrd-api-key': apiKey },
+    headers: { 'content-type': 'application/json', 'x-wyrd-api-key': apiKey, ...headers },
     body: JSON.stringify(body)
   });
   if (response.status !== 200) throw new Error(`${path} answered ${response.status}: ${await response.text()}`);

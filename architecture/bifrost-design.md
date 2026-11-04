@@ -381,18 +381,25 @@ typed columns:
   version byte. The id groups points into series; it is not a security
   boundary.
 - `bifrost.metrics.series` is the series index: one row per series per UTC
-  hour in which the series has points, partitioned hourly on
+  hour and accepted context in which the series has points, partitioned hourly on
   `hour_unix_nano`. Its columns are `series_id`, `hour_unix_nano`,
   `metric_name`, `metric_type`, `unit`, `aggregation_temporality`,
   `is_monotonic`, `explicit_bounds`, `scope_name`, `scope_version`,
   `resource_attributes`, `scope_attributes`, `attributes`, the promoted
   resource columns, and the attribution columns, each declared and meaning
-  exactly as on the point, then the managed columns. Every one is fixed for a
-  series, because Card and run correlation come from the point's own
-  attributes. Its retention is that of `bifrost.metrics.points`.
+  exactly as on the point, then the managed columns. The identity fields and
+  attribute sets are fixed for a series. The promoted and attribution columns
+  are the point's accepted context and are not: a native writer names its own
+  `run_id`, and Gate stamps the accepted workload's Service and the accepted
+  environment over the observed values. The context is the promoted Service,
+  environment, SDK and subject columns, `subject_card_uid`, `run_id`,
+  `workload_card_uid`, `sub_principal_id` and `act_principal_id`; the request
+  id and admission instant are not part of it. Each distinct context of a
+  series in an hour is its own row, so a scoped read finds every series a
+  matching point has. Its retention is that of `bifrost.metrics.points`.
   - Scribe writes it, and nothing else may: Gate refuses every client write.
-    From each new points batch it derives the first point of each series and
-    hour not yet durable in this process, and admits those rows as one
+    From each new points batch it derives the first point of each series,
+    hour and context not yet durable in this process, and admits those rows as one
     `bifrost.metrics.series` batch, with a batch id derived from the points
     batch's own and the rows it needs, before the points. The points are
     dispatched only after that batch is durable, and acknowledged only after
@@ -401,7 +408,7 @@ typed columns:
   - A failed or unacknowledged series admission fails the points admission;
     the writer retries the whole batch.
   - A bounded per-process set of the series rows already durable for each
-    hour suppresses repeats: a key joins only once its row is durable, and a
+    hour and context suppresses repeats: a key joins only once its row is durable, and a
     points batch whose series are all in it admits no series batch and costs
     no extra sync. Overflow clears the set and a restart empties it; either
     only writes a row again. Rows therefore repeat across replicas and

@@ -27,10 +27,14 @@ use arrow::array::{
 };
 use arrow::datatypes::{Field, Schema, TimestampNanosecondType};
 use arrow::record_batch::RecordBatch;
+use arrow::row::{RowConverter, SortField};
 use chrono::{Datelike as _, Timelike as _};
 use parquet_variant::Variant;
 use sha2::{Digest, Sha256};
 use wyrd_spec::vala::BifrostError;
+use wyrd_spec::vala::managed_columns::{
+    ACT_PRINCIPAL_ID, RUN_ID, SUB_PRINCIPAL_ID, SUBJECT_CARD_UID, WORKLOAD_CARD_UID,
+};
 
 use super::points::EXPLICIT_BOUND_ELEMENT;
 use crate::tables::fields::{
@@ -429,8 +433,11 @@ const HOUR_NANOS: i64 = 3_600_000_000_000;
 /// Every column but [`HOUR_UNIX_NANO`] is declared exactly as on
 /// `bifrost.metrics.points`, so a series row is a copy of one point's series
 /// columns: the identity fields, the attribute sets, and the promoted and
-/// attribution columns, each fixed for a series because Card and run
-/// correlation come from the point's own attributes.
+/// attribution columns. The promoted and attribution columns are the point's
+/// accepted context, which its attribute sets do not fix: a native writer
+/// names its own run, and Gate stamps the accepted workload's Service and
+/// environment. A series has one row per hour for each [`CONTEXT_COLUMNS`]
+/// context its points were admitted under.
 pub static SERIES_FIELDS: &[CanonicalField] = &[
     F::meta(SERIES_ID, T::FixedSizeBinary(16), true),
     F::meta(HOUR_UNIX_NANO, signal::OTLP_INSTANT, false),
@@ -489,8 +496,35 @@ impl DomainTable for SeriesTable {
     }
 }
 
-/// One series row's identity: its UTC hour in Unix nanoseconds and its id.
-pub type SeriesKey = (i64, [u8; 16]);
+/// The stamped point columns a series row's context is: the promoted
+/// Service, environment, SDK and subject columns, then the Card, run, workload
+/// and principal correlation. They can vary for one `series_id`, so each
+/// distinct context is its own series row; the request id and admission
+/// instant are per admission and never part of it.
+pub const CONTEXT_COLUMNS: &[&str] = &[
+    "service_name",
+    "service_version",
+    "deployment_environment",
+    "service_namespace",
+    "service_instance_id",
+    "process_pid",
+    "telemetry_sdk_name",
+    "telemetry_sdk_language",
+    "telemetry_sdk_version",
+    "subject_kind",
+    "subject_name",
+    "subject_version",
+    SUBJECT_CARD_UID,
+    RUN_ID,
+    WORKLOAD_CARD_UID,
+    SUB_PRINCIPAL_ID,
+    ACT_PRINCIPAL_ID,
+];
+
+/// One series row's identity: its UTC hour in Unix nanoseconds, its id, and
+/// the first 16 bytes of SHA-256 over its [`CONTEXT_COLUMNS`] values in Arrow
+/// row encoding.
+pub type SeriesKey = (i64, [u8; 16], [u8; 16]);
 
 /// Derive the series rows of one admitted points batch.
 ///
@@ -504,9 +538,10 @@ pub type SeriesKey = (i64, [u8; 16]);
 ///
 /// # Errors
 ///
-/// Returns [`BifrostError::SchemaParse`] when `points` lacks a copied column,
-/// `time_unix_nano` is not a nanosecond timestamp, a `series_id` is null, or
-/// the rows do not assemble.
+/// Returns [`BifrostError::SchemaParse`] when `points` lacks a copied or
+/// context column, `time_unix_nano` is not a nanosecond timestamp, a
+/// `series_id` is null, the context does not encode, or the rows do not
+/// assemble.
 pub fn series_rows(
     points: &RecordBatch,
     carried: &[&str],
@@ -529,6 +564,21 @@ pub fn series_rows(
         .as_fixed_size_binary_opt()
         .ok_or_else(|| missing(SERIES_ID))?
         .clone();
+    let context = CONTEXT_COLUMNS
+        .iter()
+        .map(|name| column(name).map(|(_, values)| Arc::clone(values)))
+        .collect::<Result<Vec<_>, _>>()?;
+    let unencodable = |error: arrow::error::ArrowError| BifrostError::SchemaParse {
+        detail: format!("series context does not encode: {error}"),
+    };
+    let contexts = RowConverter::new(
+        context
+            .iter()
+            .map(|values| SortField::new(values.data_type().clone()))
+            .collect(),
+    )
+    .and_then(|converter| converter.convert_columns(&context))
+    .map_err(unencodable)?;
     let mut asked = std::collections::HashSet::new();
     let (mut rows, mut keys, mut hours) = (Vec::new(), Vec::new(), Vec::new());
     for row in 0..points.num_rows() {
@@ -538,9 +588,15 @@ pub fn series_rows(
             .flatten()
             .ok_or_else(|| missing(SERIES_ID))?;
         let hour = times.value(row) - times.value(row).rem_euclid(HOUR_NANOS);
-        if asked.insert((hour, id)) && wanted((hour, id)) {
+        let digest = Sha256::digest(contexts.row(row).as_ref());
+        let key = (
+            hour,
+            id,
+            digest[..16].try_into().expect("sixteen digest bytes"),
+        );
+        if asked.insert(key) && wanted(key) {
             rows.push(u32::try_from(row).map_err(|_| missing(SERIES_ID))?);
-            keys.push((hour, id));
+            keys.push(key);
             hours.push(hour);
         }
     }

@@ -33,13 +33,14 @@ use crate::tables::{DomainTable, PointsTable, SeriesTable};
 /// Series keys one process remembers before it forgets them all.
 const SEEN_CAPACITY: usize = 262_144;
 
-/// The series rows this process has made durable, per tenant and hour.
+/// The series rows this process has made durable, per tenant, hour and
+/// context.
 ///
 /// A points batch whose series are all here admits no series batch. An entry
 /// joins only after its row is durable, so the set never hides a missing row;
 /// forgetting one, on overflow or restart, only writes that row again.
 pub(crate) struct SeriesSeen {
-    /// Durable series rows, keyed by tenant, hour, and series id.
+    /// Durable series rows, keyed by tenant, hour, series id, and context.
     entries: Mutex<HashSet<(DataTenantId, SeriesKey)>>,
     /// Entries held before the set is cleared.
     capacity: usize,
@@ -125,15 +126,17 @@ impl SeriesFrame {
 
 /// The batch id of the series rows `keys` derived from points batch `points`.
 ///
-/// The same points batch needing the same rows always reaches the same id, so
-/// a retry deduplicates; needing other rows is another batch.
+/// The same points batch needing the same rows, contexts included, always
+/// reaches the same id, so a retry deduplicates; needing other rows is
+/// another batch.
 fn series_batch_id(points: Uuid, keys: &[SeriesKey]) -> Uuid {
     let mut digest = Sha256::new();
-    digest.update(b"bifrost.metrics.series.batch-id.v1");
+    digest.update(b"bifrost.metrics.series.batch-id.v2");
     digest.update(points.as_bytes());
-    for (hour, id) in keys {
+    for (hour, id, context) in keys {
         digest.update(hour.to_be_bytes());
         digest.update(id);
+        digest.update(context);
     }
     let digest: [u8; 32] = digest.finalize().into();
     let mut bytes: [u8; 16] = digest[..16].try_into().expect("sixteen digest bytes");
@@ -146,8 +149,8 @@ impl ScribeImpl {
     /// Make the series rows `points` needs durable, before `points` is
     /// dispatched.
     ///
-    /// The rows are the first point of each series and hour in `points` that
-    /// this process has not already made durable. With none, nothing is
+    /// The rows are the first point of each series, hour and context in
+    /// `points` that this process has not already made durable. With none, nothing is
     /// admitted and no sync is spent. Otherwise they are admitted as one
     /// canonical `bifrost.metrics.series` batch through the ordinary ingress
     /// path, and their keys join [`SeriesSeen`] once it is durable.
@@ -203,25 +206,33 @@ impl ScribeImpl {
 mod tests {
     use super::*;
 
-    /// A remembered series is seen; overflow forgets every series, so the
-    /// next batch writes its row again rather than losing it.
+    /// A remembered series is seen, per tenant, hour and context; overflow
+    /// forgets every series, so the next batch writes its row again rather
+    /// than losing it.
     ///
     /// # Panics
     ///
-    /// Panics when a remembered key is not seen, another tenant sees it, or a
-    /// key survives an overflow.
+    /// Panics when a remembered key is not seen, another tenant, hour or
+    /// context sees it, or a key survives an overflow.
     #[test]
     fn the_seen_set_suppresses_repeats_up_to_its_bound() {
         let seen = SeriesSeen::new(2);
         let tenant = DataTenantId::new_v7();
-        let key = |n: u8| (0, [n; 16]);
+        let key = |n: u8| (0, [n; 16], [0; 16]);
         seen.remember(tenant, &[key(1), key(2)]);
         assert!(seen.has(tenant, key(1)) && seen.has(tenant, key(2)));
         assert!(
             !seen.has(DataTenantId::new_v7(), key(1)),
             "the set is per tenant"
         );
-        assert!(!seen.has(tenant, (1, [1; 16])), "the set is per hour");
+        assert!(
+            !seen.has(tenant, (1, [1; 16], [0; 16])),
+            "the set is per hour"
+        );
+        assert!(
+            !seen.has(tenant, (0, [1; 16], [1; 16])),
+            "the set is per context"
+        );
 
         seen.remember(tenant, &[key(3)]);
         assert!(seen.has(tenant, key(3)));
@@ -235,11 +246,12 @@ mod tests {
     ///
     /// # Panics
     ///
-    /// Panics when the same inputs reach another id or other rows the same id.
+    /// Panics when the same inputs reach another id, or other rows or
+    /// contexts the same id.
     #[test]
     fn the_series_batch_id_follows_its_points_batch_and_rows() {
         let points = Uuid::now_v7();
-        let rows = [(0, [1; 16]), (0, [2; 16])];
+        let rows = [(0, [1; 16], [0; 16]), (0, [2; 16], [0; 16])];
         assert_eq!(
             series_batch_id(points, &rows),
             series_batch_id(points, &rows)
@@ -251,6 +263,10 @@ mod tests {
         assert_ne!(
             series_batch_id(points, &rows),
             series_batch_id(Uuid::now_v7(), &rows)
+        );
+        assert_ne!(
+            series_batch_id(points, &rows),
+            series_batch_id(points, &[rows[0], (0, [2; 16], [1; 16])])
         );
     }
 }

@@ -1099,14 +1099,21 @@ fn embedded_scribe(wal_dir: &std::path::Path) -> ScribeImpl {
     ScribeImpl::new_for_embedded_with_deps(operator, wal, &Uuid::nil().to_string(), 1)
 }
 
-/// The `bifrost.metrics.points` frame carrying `rows` in `payload` form.
+/// The `bifrost.metrics.points` frame carrying `rows` in `payload` form,
+/// written by one principal per tenant, as one writer's batches are.
 fn points_frame(
     tenant: DataTenantId,
     batch_id: Uuid,
     rows: &RecordBatch,
     native: bool,
 ) -> ScribeIngressFrame {
-    let principal = principal(tenant);
+    let principal = Principal::new(
+        PrincipalId::new(tenant.as_uuid()),
+        PrincipalKind::User,
+        tenant,
+        Vec::new(),
+        PermissionSet::new(),
+    );
     ScribeIngressFrame {
         attributed_cards: None,
         dimensions: None,
@@ -1256,6 +1263,209 @@ async fn a_series_has_one_row_per_hour_and_repeats_are_suppressed() {
             .len(),
         12,
         "every point is durable"
+    );
+    scribe
+        .shutdown(std::time::Instant::now() + std::time::Duration::from_secs(1))
+        .await;
+}
+
+/// `rows` with its `run_id` correlation column set to `runs`, one per row.
+///
+/// # Panics
+///
+/// Panics when `rows` has no `run_id` column or `runs` is not one per row.
+fn with_runs(rows: &RecordBatch, runs: &[&str]) -> RecordBatch {
+    let at = rows
+        .schema()
+        .index_of("run_id")
+        .expect("projected points carry run_id");
+    let mut columns = rows.columns().to_vec();
+    columns[at] = Arc::new(arrow::array::StringArray::from(runs.to_vec()));
+    RecordBatch::try_new(rows.schema(), columns).expect("the runs are one per row")
+}
+
+/// `tenant`'s rows of metrics `table` over the hours `first_hour_nanos`
+/// through `last_hour_nanos`, each as its hex `series_id` then its `run_id`,
+/// `deployment_environment`, `service_name` and `workload_card_uid`, sorted.
+///
+/// # Panics
+///
+/// Panics when the read fails or a column is absent or not UTF-8.
+async fn series_contexts(
+    scribe: &ScribeImpl,
+    tenant: DataTenantId,
+    table: &str,
+    (first_hour_nanos, last_hour_nanos): (u64, u64),
+) -> Vec<(String, [Option<String>; 4])> {
+    const CONTEXT: [&str; 4] = [
+        "run_id",
+        "deployment_environment",
+        "service_name",
+        "workload_card_uid",
+    ];
+    let hour = |nanos: u64| {
+        crate::catalog::TimeGranularity::Hour
+            .bucket(chrono::DateTime::from_timestamp_nanos(
+                i64::try_from(nanos).expect("the fixed instant fits i64"),
+            ))
+            .expect("a fixed instant buckets into an hour")
+    };
+    let stored = live_rows(
+        scribe,
+        &FetchLiveTailRequest {
+            pruning: None,
+            binding: TenantTableBinding::resolve((
+                tenant,
+                TableRef::new(BifrostNamespace::Metrics, table),
+            ))
+            .expect("binding"),
+            target_stream: StreamIdentity::new(NodeId::new(Uuid::nil()), WriterEpoch::new(1)),
+            start_partition: hour(first_hour_nanos),
+            end_partition: hour(last_hour_nanos),
+            required_fields: crate::scribe::tail_rpc::tests::named_fields(
+                std::iter::once("series_id").chain(CONTEXT),
+            ),
+            query_id: Uuid::new_v4(),
+            capture_id: Uuid::nil(),
+        },
+        "series context snapshot",
+    )
+    .await;
+    let mut rows = Vec::new();
+    for batch in &stored {
+        let ids = batch
+            .column_by_name("series_id")
+            .and_then(|column| column.as_fixed_size_binary_opt())
+            .expect("series_id is FixedSizeBinary");
+        let texts = CONTEXT.map(|name| {
+            batch
+                .column_by_name(name)
+                .and_then(|column| column.as_string_opt::<i32>())
+                .expect("the context column is UTF-8")
+        });
+        for row in 0..batch.num_rows() {
+            rows.push((
+                hex::encode(ids.value(row)),
+                texts.map(|text| text.is_valid(row).then(|| text.value(row).to_owned())),
+            ));
+        }
+    }
+    rows.sort();
+    rows
+}
+
+/// One series in one hour has a series row for each accepted context its
+/// points carry: each native run, within one batch and across batches, and
+/// each accepted environment and workload Service across batches. A batch
+/// repeating a context already durable writes no row, and every row keeps the
+/// points' own `series_id`.
+///
+/// # Panics
+///
+/// Panics when a points batch is refused, a context has no series row, a
+/// repeated context writes another, a row carries another `series_id`, or a
+/// durable point's context differs from the series rows'.
+#[tokio::test]
+async fn a_series_has_one_row_per_accepted_context_in_an_hour() {
+    use crate::tables::{CardDescriptor, FrameDimensions};
+    use wyrd_spec::envelope::CardKind;
+    use wyrd_spec::ids::CardUid;
+
+    let temp_dir = TempDir::new().expect("WAL temp dir");
+    let scribe = embedded_scribe(temp_dir.path());
+    let tenant = DataTenantId::new_v7();
+    let at = FIXTURE_POINT_TIME_NANOS;
+    let rows = projected_metric_batch_at(at);
+    let id = hex::encode(single_series_id(&rows));
+    let ingest = |frame: ScribeIngressFrame| {
+        let scribe = &scribe;
+        async move {
+            Scribe::ingest_frame(scribe, frame)
+                .await
+                .expect("the points batch and its series rows are durable");
+        }
+    };
+    // Two runs in one native batch, a third in the next, then the first again.
+    ingest(points_frame(
+        tenant,
+        Uuid::now_v7(),
+        &with_runs(&rows, &["run-a", "run-a", "run-b", "run-b"]),
+        true,
+    ))
+    .await;
+    ingest(points_frame(
+        tenant,
+        Uuid::now_v7(),
+        &with_runs(&rows, &["run-c"; 4]),
+        true,
+    ))
+    .await;
+    ingest(points_frame(
+        tenant,
+        Uuid::now_v7(),
+        &with_runs(&rows, &["run-a"; 4]),
+        true,
+    ))
+    .await;
+    // Two accepted environments, then two workloads whose Services Gate described.
+    let accepted = |environment: Option<&str>, workload: Option<(&CardUid, &str)>| {
+        let mut frame = points_frame(tenant, Uuid::now_v7(), &rows, false);
+        frame.workload = workload.map(|(uid, _)| uid.clone());
+        frame.dimensions = Some(FrameDimensions {
+            environment: environment.map(str::to_owned),
+            cards: workload
+                .map(|(uid, service)| {
+                    (
+                        uid.clone(),
+                        CardDescriptor {
+                            kind: CardKind::Service,
+                            name: service.to_owned(),
+                            version: "1.0.0".to_owned(),
+                        },
+                    )
+                })
+                .into_iter()
+                .collect(),
+        });
+        frame
+    };
+    ingest(accepted(Some("dev"), None)).await;
+    ingest(accepted(Some("prod"), None)).await;
+    ingest(accepted(Some("prod"), None)).await;
+    let (checkout, billing) = (
+        CardUid::new(Uuid::now_v7().to_string()).expect("card uid"),
+        CardUid::new(Uuid::now_v7().to_string()).expect("card uid"),
+    );
+    ingest(accepted(None, Some((&checkout, "checkout")))).await;
+    ingest(accepted(None, Some((&billing, "billing")))).await;
+
+    let text = |value: &str| Some(value.to_owned());
+    let mut expected = vec![
+        (id.clone(), [text("run-a"), None, None, None]),
+        (id.clone(), [text("run-b"), None, None, None]),
+        (id.clone(), [text("run-c"), None, None, None]),
+        (id.clone(), [None, text("dev"), None, None]),
+        (id.clone(), [None, text("prod"), None, None]),
+        (
+            id.clone(),
+            [None, None, text("checkout"), text(checkout.as_str())],
+        ),
+        (
+            id.clone(),
+            [None, None, text("billing"), text(billing.as_str())],
+        ),
+    ];
+    expected.sort();
+    assert_eq!(
+        series_contexts(&scribe, tenant, "series", (at, at)).await,
+        expected,
+        "one series row per context, none for a repeated context"
+    );
+    let mut points = series_contexts(&scribe, tenant, "points", (at, at)).await;
+    points.dedup();
+    assert_eq!(
+        points, expected,
+        "every durable point keeps its context, and each has its series row"
     );
     scribe
         .shutdown(std::time::Instant::now() + std::time::Duration::from_secs(1))

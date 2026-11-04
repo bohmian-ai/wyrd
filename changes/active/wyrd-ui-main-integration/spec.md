@@ -47,7 +47,7 @@ index and replaces revision 24's rail limit and 200-point key sample.
 ### Required changes
 
 - **REQ-058 — `bifrost.metrics.series`.** A new built-in table holds one row per
-  series per hour in which the series has points. Its columns:
+  series per hour and accepted context in which the series has points. Its columns:
   - **Identity:** `series_id` and `hour_unix_nano` (the UTC hour, hourly
     partitioned).
   - **Series fields of the point:** `metric_name`, `metric_type`, `unit`,
@@ -57,16 +57,20 @@ index and replaces revision 24's rail limit and 200-point key sample.
   - **Attribute sets:** `scope_name`, `scope_version`, `resource_attributes`,
     `scope_attributes` and `attributes`, as Variants.
 
-  Every column there is fixed for a series, because Card and run correlation
-  come from the point's own attributes. Blooms: `series_id`, `metric_name` and
+  The series fields and attribute sets are fixed for a series. The promoted
+  and attribution columns are the point's accepted context and are not: a
+  native writer names its own run, and Gate stamps the accepted workload's
+  Service and environment. Each distinct context of a series in an hour is its
+  own row (`architecture/bifrost-design.md` owns the context's columns), so a
+  scoped read finds every series a matching point has. Blooms: `series_id`, `metric_name` and
   the attribution defaults. Retention is that of `bifrost.metrics.points`. The
   table is creation-only, like every built-in (revision 25).
 - **REQ-059 — Written at ingest, never after its points.** Scribe derives the
   series rows from each admitted point batch, using the same per-point
   `series_id`. It admits them in the same acknowledged admission as the
   points, so a durable point always has its series row for that hour.
-  - A per-process set of series already written in each hour suppresses
-    repeats. An entry joins it only after its row is durable.
+  - A per-process set of series already written in each hour and context
+    suppresses repeats. An entry joins it only after its row is durable.
   - The set is bounded. Overflow or a restart only writes a row again; it never
     drops one.
   - Rows may therefore repeat across replicas and restarts. Readers aggregate
@@ -2325,6 +2329,7 @@ reported live-proof blocker, never an assumed capability or silent pass.
 
 ## Revision history and authorities
 
+- Revision 27 reconciled under the caller's deviation authorization (2026-11-04, TASK-004-R1): a series has one index row per hour and accepted context, because native runs and Gate-stamped Service and environment vary independently of a series' attributes.
 - Revision 27 approved (2026-11-04): series rows are admitted and durable before their points, in two ordered admissions, because Bifrost has no cross-table admission; a batch of already-written series admits no series batch.
 - Revision 26 approved (2026-11-04): a `bifrost.metrics.series` index table written at ingest in the same admission as its points; the rail, pickers and every-series labels read it, so their cost follows series, not points; Grafana-class latency targets.
 - Revision 25 approved (2026-11-04): `series_id` is creation-only, like earlier built-in column additions; warehouses that predate it are rebuilt rather than evolved, so every stored point has a series id and the null-id fallback and AC-035 are removed.

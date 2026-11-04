@@ -95,7 +95,11 @@
     <EmptyState state="empty" title="No attributes recorded" detail="Recorded in the attributes column." />
   {:else}
     <dl>
-      {#each entries as [key, value] (key)}<dt>{key}</dt><dd>{json(value)}</dd>{/each}
+      {#each entries as [key, value] (key)}
+        <!-- A multi-line value, such as a stack trace, keeps its lines across the full width. -->
+        {#if typeof value === 'string' && value.includes('\n')}<dt class="wide">{key}</dt><dd class="wide"><pre class="lines">{value}</pre></dd>
+        {:else}<dt>{key}</dt><dd>{json(value)}</dd>{/if}
+      {/each}
     </dl>
   {/if}
 {/snippet}
@@ -372,6 +376,19 @@
     background: var(--bg);
     color: var(--text);
     font-size: 13px;
+  }
+  .wide {
+    grid-column: 1 / -1;
+  }
+  dd pre.lines {
+    max-height: 320px;
+    overflow: auto;
+    border: 1px solid var(--border);
+    padding: 10px;
+    background: var(--code-bg);
+    color: var(--code-text);
+    white-space: pre;
+    overflow-wrap: normal;
   }
   .raw {
     max-height: 480px;

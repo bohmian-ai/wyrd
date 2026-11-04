@@ -748,8 +748,8 @@ export async function loadTraceOverview(input: { readonly where?: readonly Filte
   return { spans: chart('spans', spans), errors: chart('errors', errors), duration: chart('duration', duration), totals: joined };
 }
 
-/** Log levels by OTLP severity number: 17 and up error, 13 and up warn, 1 and up info, else unset. */
-const LEVEL = "CASE WHEN severity_number >= 17 THEN 'error' WHEN severity_number >= 13 THEN 'warn' WHEN severity_number >= 1 THEN 'info' ELSE 'unset' END";
+/** Log levels by OTLP severity number: 17 and up error, 13 and up warn, 9 and up info, 1 and up debug (TRACE and DEBUG), else unset. */
+const LEVEL = "CASE WHEN severity_number >= 17 THEN 'error' WHEN severity_number >= 13 THEN 'warn' WHEN severity_number >= 9 THEN 'info' WHEN severity_number >= 1 THEN 'debug' ELSE 'unset' END";
 
 /** Records per bucket and level under the list's range, WHERE and predicate. */
 export function logTimelineQuery(input: { readonly where?: readonly Filter[] }, range: AbsoluteRange, bucket: string, predicate?: string): Executed {

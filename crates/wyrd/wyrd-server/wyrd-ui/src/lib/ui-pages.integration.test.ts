@@ -659,7 +659,7 @@ test('observe boards match approved canvas', async ({ server, ui }) => {
       expect((await timeline.locator('.box').boundingBox())?.height).toBe(64);
       expect(await computed(timeline.locator('rect.segment'), 'fill')).toEqual([token('--danger')]);
       expect(new Set(await computed(timeline.locator('rect.segment'), 'opacity'))).toEqual(new Set(['1']));
-      expect(await computed(timeline.getByLabel('Key').locator('i'), 'background-color')).toEqual([token('--level-info'), token('--warn'), token('--danger'), token('--muted')]);
+      expect(await computed(timeline.getByLabel('Key').locator('i'), 'background-color')).toEqual([token('--border'), token('--level-info'), token('--warn'), token('--danger'), token('--muted')]);
       expect(await timeline.locator('h3').textContent()).toMatch(/· drag to zoom$/);
       expect(await timeline.getByRole('button', { name: /Open in Query/ }).count()).toBe(0);
       // Group by sits in the records header with Wrap lines, Columns and CSV; severities read in their level's colour.

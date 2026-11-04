@@ -20,7 +20,7 @@
   const TABS = ['logs', 'metrics', 'traces'] as const;
   /** How often Live re-runs the view's load. */
   const LIVE_MS = 10_000;
-  const LEVELS = { info: 'var(--level-info)', warn: 'var(--warn)', error: 'var(--danger)', unset: 'var(--muted)' } as const;
+  const LEVELS = { debug: 'var(--border)', info: 'var(--level-info)', warn: 'var(--warn)', error: 'var(--danger)', unset: 'var(--muted)' } as const;
   /** The approved duration roles: p95 lime, p50 periwinkle. */
   const DURATIONS = { p95: 'var(--observe)', p50: 'var(--declare)' } as const;
   const PERCENTILES = ['p50', 'p90', 'p99'] as const;

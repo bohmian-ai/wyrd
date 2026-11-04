@@ -105,7 +105,9 @@ pub static EXEMPLAR_ELEMENT: F = F::sensitive(
 /// resource columns copy well-known semantic-convention values out of
 /// `resource_attributes` so they can be filtered without decoding; each is
 /// null when its source is absent or carries the wrong type, and the last
-/// duplicate key wins. The three subject columns are reserved for server
+/// duplicate key wins. `series_id` is derived at admission from the row's
+/// series identity by [`super::series::with_series_ids`]; a supplied value is
+/// always replaced. The three subject columns are reserved for server
 /// attribution and stay null on projection.
 pub static METRIC_FIELDS: &[CanonicalField] = &[
     F::meta("metric_name", T::Utf8, false),
@@ -151,6 +153,7 @@ pub static METRIC_FIELDS: &[CanonicalField] = &[
     F::sensitive("scope_attributes", T::Variant, false),
     F::meta("scope_dropped_attributes_count", T::Int64, false),
     F::meta("scope_schema_url", T::Utf8, false),
+    F::meta(super::series::SERIES_ID, T::FixedSizeBinary(16), true),
     F::meta("service_name", T::Utf8, true),
     F::meta("service_version", T::Utf8, true),
     F::meta("deployment_environment", T::Utf8, true),
@@ -184,6 +187,8 @@ impl DomainTable for PointsTable {
     const CANONICAL_VALIDATOR: CanonicalBatchValidator =
         crate::tables::metrics::projection::validate_metric_points;
 
+    const DERIVED_COLUMNS: &'static [&'static str] = &[super::series::SERIES_ID];
+
     fn canonical_fields() -> Option<&'static [CanonicalField]> {
         Some(METRIC_FIELDS)
     }
@@ -194,9 +199,13 @@ impl DomainTable for PointsTable {
 
     /// Declares the attributed hourly layout on `time_unix_nano`: rows sort by
     /// environment, Service name, and Service version, then newest first, and
-    /// the Bloom set is the attribution columns plus
-    /// `metric_name` so a per-metric lookup prunes point files.
+    /// the Bloom set is the attribution columns plus `metric_name` and
+    /// `series_id`, so a per-metric or per-series lookup prunes point files.
     fn physical_layout() -> PhysicalLayoutWire {
-        attributed_layout(hourly_layout, "time_unix_nano", &["metric_name"])
+        attributed_layout(
+            hourly_layout,
+            "time_unix_nano",
+            &["metric_name", super::series::SERIES_ID],
+        )
     }
 }

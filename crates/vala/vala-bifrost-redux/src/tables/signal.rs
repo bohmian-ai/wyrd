@@ -1169,7 +1169,7 @@ pub fn stored_text(column: &dyn Array, row: usize) -> Result<Option<String>, Bif
 ///
 /// Returns [`BifrostError::SchemaParse`] when the column is not Variant
 /// storage or the row does not decode.
-fn stored_variant<T>(
+pub(crate) fn stored_variant<T>(
     column: &dyn Array,
     row: usize,
     read: impl FnOnce(&Variant<'_, '_>) -> T,

@@ -2,6 +2,7 @@
 
 pub mod points;
 pub mod projection;
+pub mod series;
 
 pub use points::PointsTable;
 pub use projection::{

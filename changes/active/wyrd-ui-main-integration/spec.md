@@ -1,6 +1,6 @@
 ---
 id: SPEC-wyrd-ui-main-integration
-revision: 24
+revision: 25
 status: approved
 ---
 
@@ -130,14 +130,11 @@ points in range; no attribute set is rebuilt.
   The same identity therefore gives the same id on every replica, platform,
   tenant and release. A new encoding takes a new version byte. Admission always
   computes the column and overwrites any `series_id` a raw Arrow writer
-  supplies; OTLP has no such field. The id is not a security boundary.
-  Points stored before this column carry null.
+  supplies; OTLP has no such field, so every stored point carries one. The id
+  is not a security boundary.
 - **REQ-057 — Series id in the charts.** Every per-series step groups by
-  `series_id`: last values, increases, resets and the top-20 choice. Points
-  without one are left out of the chart, and the page says how many were left
-  out. Grouping them by fewer fields would merge different series and make the
-  increases wrong. REQ-050's reset rule applies only to monotonic sums and
-  histogram counts.
+  `series_id`: last values, increases, resets and the top-20 choice. REQ-050's
+  reset rule applies only to monotonic sums and histogram counts.
 
 ### Constraints and invariants
 
@@ -151,8 +148,11 @@ points in range; no attribute set is rebuilt.
   preserved.
 - `series_id` is part of the built-in table schema in
   `architecture/bifrost-design.md`, which is updated with the implementation.
-  Adding it is an Iceberg schema evolution with a new field id. Existing files
-  read it as null. No file is rewritten and no backfill runs.
+  Like earlier built-in column additions, it is creation-only. A warehouse
+  whose `bifrost.metrics.points` predates the column is rebuilt, because
+  startup refuses a built-in whose stored definition differs. There is no
+  migration, backfill or alias. Corrected in revision 25: revision 24 promised
+  an Iceberg schema evolution that built-in reconciliation does not perform.
 - Bloom pruning for `series_id IN (…)` lists of 4 or more values depends on the
   Bifrost IN-list fix that is being investigated separately. Until it lands,
   REQ-054's 20-id read scans the range's point files for that metric.
@@ -173,7 +173,6 @@ points in range; no attribute set is rebuilt.
 | AC-032 | Group a histogram by `http.route`; then choose "every series apart" | At most 20 lines each; the titles state the totals; labels are read only for the 20 plotted series. |
 | AC-033 | Type in the rail's search under a service WHERE | Only that service's matching names, at most 50, with the "more" notice when more match. |
 | AC-034 | Ingest the same series twice, across server restarts and replicas, with attribute keys in a different order | Identical `series_id`; a changed attribute value or bound gives a different id; a `series_id` sent by a raw Arrow writer is overwritten. |
-| AC-035 | A range spanning points from before and after the column | New points chart correctly; old points are left out and counted in the notice. |
 | AC-036 | Live dev data over 24 hours, in a real browser, in light and dark themes | Every Metrics read (rail, default chart, group by, every series) returns within 500 ms on the server, with times and rows read recorded in the task evidence, and the human accepts it visually. |
 
 ## Revision 23 — Sorting and paging Observe lists
@@ -2230,6 +2229,7 @@ reported live-proof blocker, never an assumed capability or silent pass.
 
 ## Revision history and authorities
 
+- Revision 25 approved (2026-11-04): `series_id` is creation-only, like earlier built-in column additions; warehouses that predate it are rebuilt rather than evolved, so every stored point has a series id and the null-id fallback and AC-035 are removed.
 - Revision 24 approved (2026-11-04): Metrics aggregate by default, group by chosen keys read with `variant_get`, opt-in capped every-series view, a server-searched rail scoped to the WHERE, and a server-computed `series_id` column with a Bloom on `bifrost.metrics.points`, hashed with SHA-256.
 - Revision 23 approved (2026-11-04): server-side header sorting and keyset Older/Newer paging for Traces, Spans and Logs, with the sort and cursor in the URL; WHERE stays filter-only; authored SQL sorts in the page.
 

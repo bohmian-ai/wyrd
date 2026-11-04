@@ -2103,8 +2103,18 @@ async fn prove_source_transitions() -> Result<(), JourneyError> {
     let pause = Arc::new(vala_bifrost_redux::oracle::OraclePreparationPause::new(
         context.request_id.clone(),
     ));
-    // Forge keeps promoting case 1's files for a moment, and each promotion
-    // moves the cut; wait until a query is served from the warm cache.
+    // Forge promotes case 1's file on the publication hint; its settlement
+    // marks the file compacted and evicts every Oracle's cached cut in the
+    // same commit. Wait for it, then until a query is served from the warm
+    // cache.
+    tokio::time::timeout(SOURCE_TRANSITION_BOUND, async {
+        while file_tier_counts(&cluster, tenant, &table).await?.1 != 0 {
+            tokio::time::sleep(crate::distributed::SETTLEMENT_INTERVAL).await;
+        }
+        Ok::<_, JourneyError>(())
+    })
+    .await
+    .map_err(|_| "published during acquisition: case 1's file was never promoted")??;
     tokio::time::timeout(SOURCE_TRANSITION_BOUND, async {
         loop {
             vala_bifrost_redux::catalog::reset_cut_reads_for_test();

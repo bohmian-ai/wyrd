@@ -104,6 +104,9 @@ const OWNERSHIP = ['workload_card_uid', 'subject_card_uid', 'run_id'] as const;
 /** Resource labels the signal tables promote; kept apart from Wyrd ownership. */
 const RESOURCE = ['service_name', 'service_version', 'service_namespace', 'deployment_environment', 'scope_name'] as const;
 
+/** Trace and span ids, filtered by their lowercase hex text. */
+export const IDS = ['trace_id', 'span_id'] as const;
+
 /** Span columns a filter may name. */
 const SPAN_FILTERS = [
   'name', 'kind', 'status_code', ...RESOURCE, 'gen_ai_operation_name', 'gen_ai_provider_name', 'gen_ai_request_model',
@@ -138,7 +141,7 @@ export const SIGNALS = {
     table: 'bifrost.logs.records',
     time: 'time_unix_nano',
     columns: ['time_unix_nano', 'severity_text', 'service_name', 'body_text', 'exception_type'],
-    filters: ['severity_number', 'severity_text', 'event_name', ...RESOURCE, 'exception_type', 'is_exception', ...OWNERSHIP],
+    filters: ['severity_number', 'severity_text', 'event_name', ...RESOURCE, 'exception_type', 'is_exception', ...OWNERSHIP, ...IDS],
     more: []
   },
   metrics: {

@@ -8,6 +8,7 @@ import { fmtDuration, fmtNumber, parseInstant } from './format.js';
 import { bucketFor, bucketWidth, chartParams, resolveRange, shapeChart, type ChartProps, type LoadContext } from './loaders.js';
 import { columnIndex, numeric } from './plot.js';
 import {
+  IDS,
   SIGNALS,
   logStats,
   type AbsoluteRange,
@@ -101,11 +102,12 @@ class Binds {
     return this;
   }
 
-  /** AND each WHERE clause; the column is already one of the signal's allowlisted names. */
+  /** AND each WHERE clause; the column is already one of the signal's allowlisted names, and an id binds as hex. */
   where(filters: readonly Filter[] = []): this {
     for (const { column, value, not } of filters) {
+      const bound = () => ((IDS as readonly string[]).includes(column) ? `decode(${this.bind(value)}, 'hex')` : this.bind(value));
       if (value === null) this.clauses.push(`${column} IS ${not ? 'NOT ' : ''}NULL`);
-      else this.clauses.push(`${column} ${not ? 'IS DISTINCT FROM' : '='} ${this.bind(value)}`);
+      else this.clauses.push(`${column} ${not ? 'IS DISTINCT FROM' : '='} ${bound()}`);
     }
     return this;
   }

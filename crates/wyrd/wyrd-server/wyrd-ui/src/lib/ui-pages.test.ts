@@ -189,7 +189,13 @@ test('observe signal planning and interactions', async () => {
   expect(readState(writeState(record.state)).log).toEqual(log);
   const inspect = step(traces, { name: 'record.open_in_query', input: { sql: 'SELECT $1', params: ['x'] } }, '/t/acme/observe?live=1');
   expect('query' in inspect && Object.fromEntries(inspect.query)).toEqual({ sql: 'SELECT $1', params: '["x"]', back: '/t/acme/observe?live=1' });
-  expect(step(traces, { name: 'record.logs', input: {} }, '/')).toHaveProperty('unavailable');
+  const spanStep = step(opened.state, { name: 'record.logs', input: { trace_id: trace, span_id: 'b'.repeat(16) } }, '/') as { state: ReturnType<typeof readState> };
+  expect(spanStep.state).toMatchObject({ signal: 'logs', trace: undefined, span: undefined, last: opened.state.last, where: [{ column: 'trace_id', value: trace }, { column: 'span_id', value: 'b'.repeat(16) }] });
+  // Ids are binary columns, so the filter binds their hex text through decode.
+  const spanLogs = listQuery({ signal: 'logs', where: [...spanStep.state.where] }, RANGE);
+  expect(spanLogs.sql).toContain("trace_id = decode($3, 'hex') AND span_id = decode($4, 'hex')");
+  expect(spanLogs.params.slice(2)).toEqual([trace, 'b'.repeat(16)]);
+  expect(step(traces, { name: 'card.open', input: {} }, '/')).toHaveProperty('unavailable');
 
   // Metric points list integers as exact decimal text, nested counts as exact text with their structure kept.
   const points = listQuery({ signal: 'metrics', columns: ['metric_name', 'int_value', 'double_value', 'histogram_count', 'bucket_counts', 'positive_buckets'] }, RANGE).sql;

@@ -213,7 +213,8 @@ export type HostStep = { readonly state: ObserveState } | { readonly query: URLS
  * Map one validated component intent to the next step. Filters dedupe by
  * column and value; a brush applies its range to every panel; opening a
  * record from Logs switches to its trace with the Logs state still in
- * history, so Back returns to it.
+ * history, so Back returns to it; a span's logs open Logs filtered to that
+ * span over the same range.
  */
 export function step(state: ObserveState, intent: ActionIntent, back: string): HostStep {
   const input = intent.input as Record<string, unknown>;
@@ -235,6 +236,17 @@ export function step(state: ObserveState, intent: ActionIntent, back: string): H
           log: undefined,
           trace: String(input.trace_id),
           span: input.span_id === undefined ? undefined : String(input.span_id)
+        }
+      };
+    case 'record.logs':
+      return {
+        state: {
+          ...closed(state),
+          signal: 'logs',
+          where: [{ column: 'trace_id', value: String(input.trace_id) }, { column: 'span_id', value: String(input.span_id) }],
+          where_sql: '',
+          group: undefined,
+          columns: undefined
         }
       };
     case 'trace.select':

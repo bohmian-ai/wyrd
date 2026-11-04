@@ -9,7 +9,7 @@ import { parseInstant } from './format.js';
 export interface Series {
   readonly key: string;
   readonly label: string;
-  readonly points: readonly { readonly x: number; readonly y: number }[];
+  readonly points: readonly { readonly x: number; readonly y: number; readonly text?: string }[];
 }
 
 /** Series past this count fold into one summed "other" series (REQ-025). */
@@ -84,32 +84,36 @@ export function identityKey(result: QueryResult, row: readonly unknown[], identi
 /**
  * Build one series per typed identity, in first-seen order, with every
  * recorded point kept: no instant is summed and no series is folded. Each
- * caption names only the identity cells that differ between series (`∅` for
- * null); a single series is captioned by all its non-null cells.
+ * series is captioned by {@link identityCaptions}. A `text` column, when the
+ * result has one, spells each point's value as the host qualified it.
  */
 export function recordedSeries(result: QueryResult, x: string, y: string, identity: readonly string[]): Series[] {
-  const [xi, yi] = [columnIndex(result, x), columnIndex(result, y)];
-  const lines = new Map<string, { cells: unknown[]; points: { x: number; y: number }[] }>();
+  const [xi, yi, ti] = [columnIndex(result, x), columnIndex(result, y), columnIndex(result, 'text')];
+  const lines = new Map<string, { cells: unknown[]; points: { x: number; y: number; text?: string }[] }>();
   for (const row of result.rows) {
     const at = parseInstant(row[xi]);
     if (row[yi] === null || Number.isNaN(at)) continue;
     const key = identityKey(result, row, identity);
     const line = lines.get(key) ?? { cells: identity.map((name) => row[columnIndex(result, name)] ?? null), points: [] };
-    line.points.push({ x: at, y: numeric(row[yi]) });
+    line.points.push({ x: at, y: numeric(row[yi]), ...(ti >= 0 && typeof row[ti] === 'string' ? { text: row[ti] } : {}) });
     lines.set(key, line);
   }
   const entries = [...lines];
-  const varies = identity.map((_, index) => new Set(entries.map(([, { cells }]) => JSON.stringify(cells[index]))).size > 1);
+  const labels = identityCaptions(entries.map(([, { cells }]) => cells));
+  return entries.map(([key, { points }], index) => ({ key, label: labels[index], points: points.sort((a, b) => a.x - b.x) }));
+}
+
+/**
+ * Captions for groups by their typed identity cells: each names only the
+ * cells that differ between groups (`∅` for null); a single group is
+ * captioned by all its non-null cells. Two captions that read alike fall
+ * back to the cells' JSON spelling.
+ */
+export function identityCaptions(groups: readonly (readonly unknown[])[]): string[] {
+  const varies = (groups[0] ?? []).map((_, index) => new Set(groups.map((cells) => JSON.stringify(cells[index] ?? null))).size > 1);
   const text = (cell: unknown) => (cell === null ? '∅' : String(cell));
-  const labels = entries.map(([, { cells }]) =>
-    (entries.length > 1 ? cells.filter((_, index) => varies[index]) : cells.filter((cell) => cell !== null)).map(text).join(' · ')
-  );
-  return entries.map(([key, { points }], index) => ({
-    key,
-    // Two captions that read alike fall back to the identity's JSON spelling.
-    label: labels.indexOf(labels[index]) === labels.lastIndexOf(labels[index]) ? labels[index] : key,
-    points: points.sort((a, b) => a.x - b.x)
-  }));
+  const labels = groups.map((cells) => (groups.length > 1 ? cells.filter((_, index) => varies[index]) : cells.filter((cell) => cell !== null)).map(text).join(' · '));
+  return labels.map((label, index) => (labels.indexOf(label) === labels.lastIndexOf(label) ? label : JSON.stringify(groups[index])));
 }
 
 /**

@@ -15,6 +15,7 @@ import {
   loadCardHeader,
   loadChart,
   loadFacetRail,
+  loadMetric,
   loadRecordDetail,
   loadRecordTable,
   loadStatStrip,
@@ -29,7 +30,7 @@ import { nodeExecutor } from 'wyrd-ai-ui/node';
 import { env } from '$env/dynamic/private';
 import { browserSessions } from '$lib/server/auth/browser-sessions';
 import { card, observeAnswer, registered, series, summary, timeseries } from '$lib/ui-fixtures';
-import { seedSignals } from '$lib/ui-signals.integration';
+import { exportOtlp, nanos, seedSignals } from '$lib/ui-signals.integration';
 import { POST as loadPanel } from '../routes/t/[tenantKey]/ui/load/+server';
 import { declared, fixture, serverTest, type DeclaredRef } from '../../../../../../sdks/wyrd-sdk-ts/wyrd/tests/support/server';
 import { load as loadExamplePage } from '../../../../../../examples/ui-app/src/routes/+page.server';
@@ -420,4 +421,102 @@ test('TASK-004: Authorized Observe across hosts', async ({ server, seeded }) => 
   expect(app.document.querySelector('[data-panel="list"]')?.textContent).toContain('invoke_agent support');
   expect(app.calls.map((call) => call.name)).toEqual(['bifrost.query', 'bifrost.query', 'bifrost.query']);
   expect(app.calls.find((call) => String(call.arguments.sql).includes("trace_id = decode($1, 'hex')"))?.arguments).toMatchObject({ params: [TRACE], max_rows: 10_000 });
+});
+
+test('TASK-004: Metric windows count every recorded value', async ({ server }) => {
+  // One hour plots one-minute windows. Every series started before it, so its first point counts nothing.
+  const range = { from: '2026-10-19T04:00:00Z', to: '2026-10-19T05:00:00Z' };
+  const started = nanos('2026-10-19T03:00:00Z');
+  const at = (time: string, value: Record<string, unknown>, start = started) => ({ startTimeUnixNano: start, timeUnixNano: nanos(`2026-10-19T04:${time}Z`), ...value });
+  const route = (value: string) => [{ key: 'route', value: { stringValue: value } }];
+  const histogram = (name: string, aggregationTemporality: number, dataPoints: unknown[]) => ({ name, unit: 's', histogram: { aggregationTemporality, dataPoints } });
+  const resource = (service: string, metrics: unknown[]) => ({ resource: { attributes: [{ key: 'service.name', value: { stringValue: service } }] }, scopeMetrics: [{ scope: { name: 'ui-math' }, metrics }] });
+  const tenant = 'ui-metric-math';
+  const key = server.bootstrapServiceInTenant(server.seedTenant(tenant), ['admin'], 'ui-metric-math-admin');
+  await exportOtlp(server, key, '/v1/metrics', {
+    resourceMetrics: [
+      resource('api', [
+        // 100 in one window, then 110 and a restart counting 5 in the next: that window counts 10 + 5.
+        {
+          name: 'm.requests',
+          unit: '1',
+          sum: {
+            aggregationTemporality: 2,
+            isMonotonic: true,
+            dataPoints: [at('10:00', { asInt: '100' }), at('11:10', { asInt: '110' }), at('11:40', { asInt: '5' }, nanos('2026-10-19T04:11:30Z'))]
+          }
+        },
+        // A smaller value under the same start is a reset too: 50, then 60 and 4 count 10 + 4.
+        { name: 'm.dropped', unit: '1', sum: { aggregationTemporality: 2, isMonotonic: true, dataPoints: [at('10:00', { asInt: '50' }), at('11:10', { asInt: '60' }), at('11:40', { asInt: '4' })] } },
+        // Delta points add up; a gauge plots its last value exactly.
+        { name: 'm.delta', unit: '1', sum: { aggregationTemporality: 1, isMonotonic: true, dataPoints: [at('11:10', { asInt: '3' }), at('11:40', { asInt: '4' })] } },
+        { name: 'm.gauge', unit: '1', gauge: { dataPoints: [at('11:10', { asInt: '1' }), at('11:40', { asInt: '9007199254740993' })] } },
+        histogram('h.reset', 2, [
+          at('10:00', { count: '100', sum: 10, bucketCounts: ['60', '40'], explicitBounds: [1] }),
+          at('11:10', { count: '110', sum: 11, bucketCounts: ['65', '45'], explicitBounds: [1] }),
+          at('11:40', { count: '5', sum: 0.5, bucketCounts: ['3', '2'], explicitBounds: [1] }, nanos('2026-10-19T04:11:30Z'))
+        ]),
+        // Twenty-one routes; the lexically last counted most.
+        histogram('h.routes', 1, Array.from({ length: 21 }, (_, index) => at('11:10', { count: index === 20 ? '50' : '1', sum: 1, bucketCounts: [index === 20 ? '50' : '1', '0'], explicitBounds: [1], attributes: route(`/r${String(index).padStart(2, '0')}`) }))),
+        // No sum at all, a sum missing beside a recorded one, a recorded zero, and a cumulative baseline without its sum.
+        histogram('h.nosum', 1, [at('11:10', { count: '4', bucketCounts: ['4', '0'], explicitBounds: [1] })]),
+        histogram('h.mixed', 1, [at('11:10', { count: '4', sum: 2, bucketCounts: ['4', '0'], explicitBounds: [1], attributes: route('/a') }), at('11:10', { count: '4', bucketCounts: ['4', '0'], explicitBounds: [1], attributes: route('/b') })]),
+        histogram('h.zero', 1, [at('11:10', { count: '4', sum: 0, bucketCounts: ['4', '0'], explicitBounds: [1] })]),
+        histogram('h.baseline', 2, [at('10:00', { count: '10', bucketCounts: ['10', '0'], explicitBounds: [1] }), at('11:10', { count: '12', sum: 5, bucketCounts: ['12', '0'], explicitBounds: [1] })]),
+        histogram('h.apart', 1, [at('11:10', { count: '2', sum: 1, bucketCounts: ['2', '0'], explicitBounds: [1] })])
+      ]),
+      resource('worker', [histogram('h.apart', 1, [at('11:10', { count: '2', sum: 3, bucketCounts: ['2', '0'], explicitBounds: [1] })])])
+    ]
+  });
+  server.flushBifrost();
+  const context = { executor: nodeExecutor(WyrdClient.connect({ credential: key })), range };
+  const cells = (result: { state: string; data?: { columns: readonly { name: string }[]; rows: readonly (readonly unknown[])[] } }, ...names: string[]) => {
+    expect(result.state, JSON.stringify(result)).toBe('populated');
+    const index = names.map((name) => result.data!.columns.findIndex((column) => column.name === name));
+    return result.data!.rows.map((row) => index.map((at) => row[at]));
+  };
+  const window = '2026-10-19T04:11:00';
+  const inWindow = (rows: unknown[][]) => rows.filter(([instant]) => String(instant).startsWith(window)).map(([, ...rest]) => rest);
+
+  // A counter's window adds each point's increase, so a reset inside it keeps the increase before it.
+  await vi.waitFor(async () => expect(inWindow(cells((await loadMetric({ metric: 'm.requests' }, context)).chart.result, 'at', 'value'))).toEqual([[15 / 60]]), { timeout: 30_000 });
+  expect(cells((await loadMetric({ metric: 'm.requests' }, context)).chart.result, 'at', 'value').map(([, value]) => value)).toEqual([0, 15 / 60]);
+  expect(inWindow(cells((await loadMetric({ metric: 'm.dropped' }, context)).chart.result, 'at', 'value'))).toEqual([[14 / 60]]);
+  expect(inWindow(cells((await loadMetric({ metric: 'm.delta' }, context)).chart.result, 'at', 'value'))).toEqual([[7 / 60]]);
+  expect(cells((await loadMetric({ metric: 'm.gauge' }, context)).chart.result, 'latest')).toEqual([[expect.stringMatching(/^9007199254740993(\.0+)?$/)]]);
+
+  // A histogram window counts the same way, its buckets and sum included.
+  const reset = (await loadMetric({ metric: 'h.reset' }, context)).histogram!;
+  expect(inWindow(cells(reset.rate.result, 'at', 'value'))).toEqual([[15 / 60]]);
+  expect(inWindow(cells(reset.latency.result, 'at', 'measure', 'value')).filter(([measure]) => measure === 'mean')).toEqual([['mean', 1.5 / 15]]);
+  expect(cells(reset.distribution.result, 'bucket', 'count')).toEqual([['≤ 1', 8], ['> 1', 7]]);
+
+  // The twenty routes that counted most are read, the busiest first; the title says how many there were.
+  const routes = (await loadMetric({ metric: 'h.routes', by: ['attributes.route'] }, context)).histogram!;
+  const plotted = new Set(cells(routes.rate.result, 'attributes.route').map(([value]) => value));
+  expect(plotted.size).toBe(20);
+  expect(plotted.has('/r20')).toBe(true);
+  expect(plotted.has('/r19')).toBe(false);
+  expect(routes.rate.input.title).toContain('the 20 that counted most of 21 groups plotted');
+
+  // A mean needs every merged sum: none, a missing one or a missing baseline leave it unavailable, and a recorded zero is zero.
+  const mean = async (metric: string) =>
+    cells((await loadMetric({ metric }, context)).histogram!.latency.result, 'at', 'measure', 'value').filter(([instant, measure]) => String(instant).startsWith(window) && measure === 'mean').map(([, , value]) => value);
+  expect(await mean('h.nosum')).toEqual([null]);
+  expect(await mean('h.mixed')).toEqual([null]);
+  expect(await mean('h.baseline')).toEqual([null]);
+  expect(await mean('h.zero')).toEqual([0]);
+  // Counts and estimates stay whatever the sum.
+  const nosum = (await loadMetric({ metric: 'h.nosum' }, context)).histogram!;
+  expect(inWindow(cells(nosum.rate.result, 'at', 'value'))).toEqual([[4 / 60]]);
+  expect(cells(nosum.latency.result, 'measure').map(([measure]) => measure)).toContain('p50 estimated');
+
+  // Every series apart: each compatible series its own line, labelled from the series index.
+  const apart = (await loadMetric({ metric: 'h.apart', apart: true }, context)).histogram!;
+  expect(
+    cells(apart.latency.result, 'resource', 'measure', 'value')
+      .filter(([, measure]) => measure === 'mean')
+      .map(([resource, , value]) => [JSON.parse(String(resource))['service.name'], value])
+      .sort()
+  ).toEqual([['api', 0.5], ['worker', 1.5]]);
 });

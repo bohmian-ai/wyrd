@@ -22,7 +22,9 @@
   cards: the plot under that heading, then the selectable series summary
   with Show all and Open in Query in place of the SQL footer. A keyed series' caption stays one line; opening
   it lists every recorded identity cell, and an equal-instant sample keeps its
-  own marker and tooltip value.
+  own marker and tooltip value. A keyed result's `text` column, when present,
+  is the tooltip's spelling of each value, so a host-qualified value such as
+  a lower bound reads `≥`.
 -->
 <script lang="ts">
   import type { Snippet } from 'svelte';
@@ -409,7 +411,7 @@
               <time datetime={new Date(at).toISOString()}>{fmtInstant(at)}</time>
               {#each drawn as line (line.key)}
                 {@const points = line.points.filter((each) => each.x === at)}
-                <span>{line.label}: {points.length ? points.map((point) => `${fmtNumber(point.y)}${unitLabel}`).join(', ') : '—'}</span>
+                <span>{line.label}: {points.length ? points.map((point) => `${point.text ?? fmtNumber(point.y)}${unitLabel}`).join(', ') : '—'}</span>
               {/each}
             </p>
           {/if}

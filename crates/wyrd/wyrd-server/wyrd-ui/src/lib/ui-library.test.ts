@@ -71,6 +71,7 @@ import {
 import {
   chartParams,
   facetQuery,
+  histogramWindows,
   loadCardHeader,
   loadChart,
   loadRecordDetail,
@@ -1609,6 +1610,34 @@ test('TASK-004: Canonical signal interactions', async () => {
   await fireEvent.focus(twin.getByRole('application'));
   expect(twin.getByRole('status')).toHaveTextContent('gauge · {}: 1, 3');
   twin.unmount();
+
+  // Histogram lines keep each group's typed identity through the shared Chart: six groups plot twenty-four whole lines, twenty drawn,
+  // never summed into "other"; a percentile in the unbounded top bucket reads at least its bound in the tooltip and the summary.
+  const histogramRead = {
+    columns: ['at', 'metric_type', 'unit', 'aggregation_temporality', 'is_monotonic', 'service_name', 'bounds', 'count', 'sum', 'buckets', 'groups'].map((name) => ({ name, data_type: 'Utf8', nullable: true })),
+    rows: Array.from({ length: 6 }, (_, index) => ['2026-10-20T10:00:00Z', 'histogram', 's', 2, null, `s${index}`, [1], '2', index + 1, index === 5 ? ['0', '2'] : ['2', '0'], 6]),
+    terminal: { outcome: 'success', row_count: 6, warnings: [] }
+  };
+  const shaped = histogramWindows(histogramRead as never, { from: '2026-10-20T10:00:00Z', to: '2026-10-20T11:00:00Z' }, ['metric_type', 'unit', 'aggregation_temporality', 'is_monotonic', 'service_name']);
+  const latencyChart = render(Chart, {
+    input: metricInput,
+    result: { state: 'populated', data: shaped.latency },
+    identity: shaped.identity,
+    summary: { state: 'populated', data: shaped.latencySummary }
+  } as never);
+  expect(latencyChart.getByText(/24 series · 20 shown/)).toBeInTheDocument();
+  expect(latencyChart.container.querySelectorAll('svg.plot polyline')).toHaveLength(20);
+  expect(latencyChart.container.textContent).not.toMatch(/\bother\b/);
+  const latencyRows = [...latencyChart.container.querySelectorAll('.legend tbody tr')].map((row) => [...row.querySelectorAll('th, td')].map((cell) => cell.textContent?.trim()));
+  expect(latencyRows.filter(([, caption]) => caption?.endsWith('· mean')).map(([, caption, latest]) => [caption, latest])).toEqual(
+    Array.from({ length: 6 }, (_, index) => [`s${index} · mean`, String((index + 1) / 2)])
+  );
+  expect(latencyRows.find(([, caption]) => caption === 's5 · p99 estimated')?.slice(2)).toEqual(['≥ 1', '≥ 1', '≥ 1']);
+  await fireEvent.click(latencyChart.getByRole('button', { name: 'Show all' }));
+  await fireEvent.focus(latencyChart.getByRole('application'));
+  expect(latencyChart.getByRole('status')).toHaveTextContent('s5 · p99 estimated: ≥ 1');
+  expect(latencyChart.getByRole('status')).toHaveTextContent('s0 · p99 estimated: 0.99');
+  latencyChart.unmount();
 
   // A host that owns the list's columns is offered every column of the signal, and a toggle reports the next set.
   let chosenColumns: readonly string[] | undefined;

@@ -341,13 +341,24 @@
         {#if view?.series?.histogram && view.series.chart.result.state === 'empty'}
           {@const histogram = view.series.histogram}
           <div data-panel="series">
-            <Chart {...histogram.latency} note="Percentiles are estimated from the recorded buckets. Drag across the chart to zoom every Observe view to that window." {actions} onaction={onaction('Chart')}>
+            <Chart
+              {...histogram.latency}
+              note="Percentiles are estimated from the recorded buckets; ≥ marks a percentile in the unbounded top bucket, at least that bucket's lower bound. Drag across the chart to zoom every Observe view to that window."
+              {actions}
+              onaction={onaction('Chart')}
+            >
               {#snippet heading()}
                 <div class="metric">
                   <h2>{metric}</h2>
                   <p class="type">{metricRow ? `${metricRow.type}${metricRow.unit ? ` · ${metricRow.unit}` : ''} · ` : ''}{histogram.latency.input.title?.replace(`${metric} · `, '')}</p>
                 </div>
-                <span class="choices">{@render keys()}</span>
+                <span class="choices">
+                  <span class="segmented" role="group" aria-label="Calculation">
+                    <a href={href({ ...closed(current), agg: undefined, apart: undefined })} aria-current={!current.apart ? 'true' : undefined} title="Compatible series merge their buckets">default</a>
+                    <a href={href({ ...closed(current), agg: undefined, by: undefined, apart: true })} aria-current={current.apart ? 'true' : undefined} title="The 20 series that counted most, each apart">every series</a>
+                  </span>
+                  {#if !current.apart}{@render keys()}{/if}
+                </span>
               {/snippet}
             </Chart>
           </div>

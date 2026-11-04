@@ -529,10 +529,20 @@ test('authenticated metrics investigation', async ({ server, ui }) => {
   await expect.poll(() => legend.count()).toBe(3);
   expect(await serverHtml(page, page.url())).not.toContain('to_json');
 
+  // An explicit-bucket histogram offers its default merge or every series apart, each line keyed by its recorded identity.
+  await page.goto(`${metrics}&where=${encodeURIComponent(JSON.stringify([{ column: 'metric_name', value: 'ui.latency' }]))}`);
+  await expect.poll(() => chart.textContent(), { timeout: 30_000 }).toContain('mean of recorded sums and percentiles estimated from buckets');
+  expect(await calculation.getByRole('link').allTextContents()).toEqual(['default', 'every series']);
+  await calculation.getByRole('link', { name: 'every series' }).click();
+  await expect.poll(() => new URL(page.url()).searchParams.get('apart')).toBe('1');
+  await expect.poll(() => chart.textContent(), { timeout: 30_000 }).toContain('each series apart');
+  await legend.first().getByRole('button').click();
+  expect(await legend.first().locator('dl').textContent()).toContain('ui-agent');
+
   // An explicit-bucket histogram plots estimated percentiles; every structure's points list exact nested counts.
   const structures = ['metric_name', 'histogram_count', 'bucket_counts', 'explicit_bounds', 'positive_buckets', 'negative_buckets', 'summary_count', 'summary_sum', 'quantile_values', 'exemplars'];
   await page.goto(`${metrics}&where=${encodeURIComponent(JSON.stringify([{ column: 'metric_name', value: 'ui.latency' }]))}&columns=${encodeURIComponent(JSON.stringify(structures))}&points=1`);
-  await expect.poll(() => chart.textContent(), { timeout: 30_000 }).toContain('mean and percentiles estimated from buckets');
+  await expect.poll(() => chart.textContent(), { timeout: 30_000 }).toContain('mean of recorded sums and percentiles estimated from buckets');
   await expect.poll(() => list.textContent()).toContain(`["${UNSAFE[0]}","2"]`);
   expect(await list.textContent()).toContain('9007199254740995');
   // Without the metric filter the inspector lists every recorded structure.

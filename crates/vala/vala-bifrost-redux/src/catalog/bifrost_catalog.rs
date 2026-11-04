@@ -1881,8 +1881,8 @@ impl BifrostCatalog {
             .await?
             .ok_or_else(|| BifrostCatalogError::TableNotFound(fqn.clone()))?;
         // A canonical built-in is described from its own declaration, not from
-        // the Iceberg round trip: the stored schema drops the ledger's
-        // sensitivity markers and renames nested list elements, and it is the
+        // the Iceberg round trip: the stored schema renames nested list
+        // elements, and it is the
         // ledger's shape that Scribe enforces on every canonical batch. The
         // registered field ids are the table's and Scribe stamps them itself,
         // so the description carries none.

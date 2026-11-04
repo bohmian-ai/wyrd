@@ -12,8 +12,6 @@
 //! the registered Iceberg table assigns them, and Scribe stamps the table's
 //! ids onto every batch it accepts for that table.
 
-use std::collections::HashMap;
-
 use arrow::datatypes::{DataType, Field, TimeUnit};
 use parquet_variant_compute::VariantType;
 use wyrd_types::variant::variant_storage_type;
@@ -24,14 +22,6 @@ use wyrd_types::variant::variant_storage_type;
 /// key: Scribe stamps them from the table on admission, so every Parquet object
 /// it seals carries exactly the ids Forge and Oracle resolve columns by.
 pub const PARQUET_FIELD_ID: &str = "PARQUET:field_id";
-
-/// Arrow field metadata key carrying the declared sensitivity of a field.
-///
-/// Sensitivity is semantic metadata, not a physical type property, so it
-/// travels on the schema itself. That keeps the canonical Arrow validator and
-/// the canonical physical fingerprint computable from a supplied schema alone
-/// rather than requiring the reader to hold the ledger.
-pub const WYRD_SENSITIVE: &str = "wyrd:sensitive";
 
 pub fn utf8(name: &str, nullable: bool) -> Field {
     Field::new(name, DataType::Utf8, nullable)
@@ -76,8 +66,9 @@ pub fn fixed_binary(name: &str, size: i32, nullable: bool) -> Field {
 ///
 /// The class is declared once per ledger entry and drives two separate
 /// downstream decisions: whether a reader may project the column without the
-/// payload-read permission ([`Self::SensitivePayload`] may not), and the
-/// sensitivity byte the canonical physical fingerprint commits to. Bulk
+/// payload-read permission ([`Self::SensitivePayload`] may not), and which
+/// columns a metadata-only projection skips. Neither is stored on the Arrow
+/// schema: both are read from the ledger. Bulk
 /// numeric payload — histogram buckets, explicit bounds, quantile values — is
 /// [`Self::Payload`] rather than sensitive: it is large enough that a metadata
 /// query should skip reading it, but it carries no caller content.
@@ -94,9 +85,8 @@ pub enum FieldClass {
 impl FieldClass {
     /// Report whether this class requires the payload-read permission.
     ///
-    /// This is the single definition of the sensitivity bit committed to by
-    /// [`crate::tables::CanonicalPhysicalFingerprint`], so a class change is a
-    /// fingerprint change.
+    /// This is the single definition of which ledger columns
+    /// [`crate::tables::TableDefinition::sensitive_payload_columns`] gates.
     #[must_use]
     pub const fn is_sensitive(self) -> bool {
         matches!(self, Self::SensitivePayload)
@@ -145,8 +135,8 @@ pub enum CanonicalType {
 impl CanonicalType {
     /// Project this declaration into its Arrow type, recursing into children.
     ///
-    /// Nested children carry their own sensitivity metadata, so every
-    /// schema-only consumer sees the whole tree's classification.
+    /// Nested children are bare fields, as [`CanonicalField::to_arrow`]
+    /// projects them.
     #[must_use]
     pub fn to_arrow(&self) -> DataType {
         match self {
@@ -240,23 +230,17 @@ impl CanonicalField {
         }
     }
 
-    /// Project this entry into its Arrow field, stamping its semantic metadata.
+    /// Project this entry into its Arrow field.
     ///
-    /// A Variant entry also carries the `arrow.parquet.variant` extension
-    /// marker, which is what distinguishes it from a plain storage struct.
-    ///
-    /// The `wyrd:sensitive` metadata is written on this field and, through
-    /// [`CanonicalType::to_arrow`], on every nested child, so the whole tree
-    /// carries its sensitivity into every schema-only consumer. No field id is
-    /// written: the registered Iceberg table owns ids.
+    /// A Variant entry carries the `arrow.parquet.variant` extension marker,
+    /// which is what distinguishes it from a plain storage struct. No other
+    /// metadata is written: the class stays in the ledger, so the Parquet
+    /// schema matches the Iceberg table schema and filters reach row-group
+    /// statistics and Bloom filters without a cast. No field id is written
+    /// either: the registered Iceberg table owns ids.
     #[must_use]
     pub fn to_arrow(&self) -> Field {
-        let field = Field::new(self.name, self.ty.to_arrow(), self.nullable).with_metadata(
-            HashMap::from([(
-                WYRD_SENSITIVE.to_owned(),
-                self.class.is_sensitive().to_string(),
-            )]),
-        );
+        let field = Field::new(self.name, self.ty.to_arrow(), self.nullable);
         match self.ty {
             CanonicalType::Variant => field.with_extension_type(VariantType),
             _ => field,
@@ -278,14 +262,13 @@ pub fn canonical_arrow_fields(declared: &[CanonicalField]) -> Vec<Field> {
 mod tests {
     use super::*;
 
-    /// Nested children carry their own sensitivity and no declared field id.
+    /// Nested declarations project bare fields: no field id, no class label.
     ///
     /// # Panics
     ///
-    /// Panics when a nested child loses its sensitivity marker or any level of
-    /// the tree declares a field id.
+    /// Panics when any level of the tree carries metadata.
     #[test]
-    fn nested_declarations_carry_sensitivity_and_no_field_id() {
+    fn nested_declarations_carry_no_metadata() {
         /// Sensitive list element, the nested level under test.
         static CHILD: CanonicalField =
             CanonicalField::sensitive("item", CanonicalType::UInt64, false);
@@ -294,21 +277,13 @@ mod tests {
             CanonicalField::payload("counts", CanonicalType::List(&CHILD), true);
 
         let field = ROOT.to_arrow();
-        assert_eq!(field.metadata().get(PARQUET_FIELD_ID), None);
-        assert_eq!(
-            field.metadata().get(WYRD_SENSITIVE),
-            Some(&"false".to_owned())
-        );
+        assert!(field.metadata().is_empty());
         let DataType::List(child) = field.data_type() else {
             panic!("list declaration must project an Arrow list");
         };
         assert_eq!(child.name(), "item");
         assert!(!child.is_nullable());
-        assert_eq!(child.metadata().get(PARQUET_FIELD_ID), None);
-        assert_eq!(
-            child.metadata().get(WYRD_SENSITIVE),
-            Some(&"true".to_owned())
-        );
+        assert!(child.metadata().is_empty());
     }
 
     /// Only caller content is access-gated; bulk numeric payload is not.

@@ -28,7 +28,7 @@ mod tests {
 
     use super::records::LOG_FIELDS;
     use super::{canonical_log_schema, project_resource_logs};
-    use crate::tables::fields::{PARQUET_FIELD_ID, WYRD_SENSITIVE};
+    use crate::tables::fields::PARQUET_FIELD_ID;
     use crate::tables::signal::{
         any_value_variant, validate_canonical_user_batch, without_correlation_columns,
     };
@@ -225,7 +225,7 @@ mod tests {
     ///
     /// Panics when any canonical body Variant byte, event name, raw flag word,
     /// nanosecond timestamp, optional correlation id, presence distinction,
-    /// field-id absence, or sensitivity marker differs, when a malformed
+    /// field-id absence, or metadata differs, when a malformed
     /// canonical payload is accepted, or when caller-supplied schema identity
     /// survives validation instead of being restamped from the ledger.
     #[test]
@@ -446,8 +446,8 @@ mod tests {
     ///
     /// # Panics
     ///
-    /// Panics when a declared field is missing, declares a field id, carries a
-    /// different sensitivity marker, or fails canonical validation.
+    /// Panics when a declared field is missing, carries metadata other than
+    /// its declaration's, or fails canonical validation.
     fn assert_schema_identity(batch: &RecordBatch) {
         for declared in LOG_FIELDS {
             let field = batch
@@ -456,15 +456,9 @@ mod tests {
                 .expect("every declared log field is present")
                 .clone();
             assert_eq!(
-                field.metadata().get(PARQUET_FIELD_ID),
-                None,
-                "field {} declares no id; the registered table assigns it",
-                declared.name
-            );
-            assert_eq!(
-                field.metadata().get(WYRD_SENSITIVE),
-                Some(&declared.class.is_sensitive().to_string()),
-                "field {} carries its sensitivity",
+                field.metadata(),
+                declared.to_arrow().metadata(),
+                "field {} carries only its declaration's metadata; the registered table assigns ids",
                 declared.name
             );
         }
@@ -478,8 +472,8 @@ mod tests {
     /// # Panics
     ///
     /// Panics when invalid attribute Variant bytes validate successfully, or when
-    /// a caller-supplied field id survives validation or a caller-supplied
-    /// sensitivity marker is not replaced by the ledger's.
+    /// a caller-supplied field id or metadata entry survives validation instead
+    /// of the ledger's metadata.
     fn assert_non_canonical_inputs_are_rejected(batch: &RecordBatch) {
         let malformed = RecordBatch::try_new(
             canonical_log_schema(),
@@ -520,18 +514,11 @@ mod tests {
             "the refusal is the catalogued Variant error"
         );
 
-        let declared_body = LOG_FIELDS
-            .iter()
-            .find(|field| field.name == "body")
-            .expect("the ledger declares the body column");
         let body_variant = variant_field("body", true);
         let mut drifted_metadata = body_variant.metadata().clone();
         drifted_metadata.extend([
             (PARQUET_FIELD_ID.to_owned(), "999".to_owned()),
-            (
-                WYRD_SENSITIVE.to_owned(),
-                (!declared_body.class.is_sensitive()).to_string(),
-            ),
+            ("fixture:note".to_owned(), "caller".to_owned()),
         ]);
         let drifted_field = body_variant.with_metadata(drifted_metadata);
         let drifted_fields: Vec<_> = batch
@@ -559,14 +546,9 @@ mod tests {
             .expect("the validated batch keeps its body column")
             .clone();
         assert_eq!(
-            body.metadata().get(PARQUET_FIELD_ID),
-            None,
-            "the server drops a caller-supplied field id"
-        );
-        assert_eq!(
-            body.metadata().get(WYRD_SENSITIVE),
-            Some(&declared_body.class.is_sensitive().to_string()),
-            "a caller cannot relabel a column's sensitivity"
+            body.metadata(),
+            variant_field("body", true).metadata(),
+            "the server replaces caller-supplied field ids and metadata with the ledger's"
         );
     }
 

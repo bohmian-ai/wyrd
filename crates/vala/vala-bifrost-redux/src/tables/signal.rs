@@ -745,7 +745,7 @@ fn correlation_text<'a>(
 
 /// The two nullable correlation fields every canonical signal projection appends.
 ///
-/// They are not ledger fields and carry no sensitivity tag: Scribe relinquishes
+/// They are not ledger fields: Scribe relinquishes
 /// `card_uid` and `run_id` before stamping the canonical envelope, and the
 /// source schema fingerprint excludes both, so appending them here cannot
 /// perturb a table's catalog or canonical physical identity.
@@ -951,7 +951,7 @@ pub fn f64_opt_column(values: Vec<Option<f64>>) -> ArrayRef {
 
 /// Assemble one `List` column from flattened child values and row lengths.
 ///
-/// `element` is the declared element field, complete with its sensitivity
+/// `element` is the declared element field, complete with its declared
 /// metadata, so the produced column matches the ledger exactly.
 /// `lengths` holds one entry per row; a null row is expressed by `None`.
 ///
@@ -1046,10 +1046,10 @@ pub fn f64_column(values: Vec<f64>) -> ArrayRef {
 /// supplied field must agree on Arrow type shape and nullability, recursively
 /// through every nested child, and every Variant, top level or nested, must
 /// carry the `arrow.parquet.variant` extension. Other field metadata is deliberately not
-/// compared: the sensitivity tag is the server's own physical identity,
-/// re-derived here when the validated columns are reassembled under the
-/// declared schema, and any caller-supplied field id is dropped, so a writer
-/// neither supplies nor can be wrong about either.
+/// compared: the declared metadata is re-derived here when the validated
+/// columns are reassembled under the declared schema, and any caller-supplied
+/// field id or metadata entry is dropped, so a writer neither supplies nor can
+/// be wrong about either.
 ///
 /// Checks run in the locked write order: an undeclared column first, then
 /// each declared field's presence, type, and nullability, then the Variant

@@ -271,8 +271,7 @@ fn hash_decimal(hasher: &mut Sha256, tag: &str, precision: u8, scale: i8) {
 ///
 /// A nested type's `Debug` includes its children's metadata maps, whose
 /// `HashMap` iteration order is not stable, so they are removed; the
-/// sensitivity markers they carry are committed by the canonical physical
-/// fingerprint instead. Names, nullability, and types stay exact: registration
+/// canonical physical fingerprint commits nested metadata instead. Names, nullability, and types stay exact: registration
 /// stores and ingest casts to Iceberg's own Arrow form, so there is no second
 /// spelling to normalize.
 fn strip_metadata(data_type: &DataType) -> DataType {

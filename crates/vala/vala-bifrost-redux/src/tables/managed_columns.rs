@@ -57,18 +57,6 @@ impl ManagedColumn {
             scope: ManagedScope::Time,
         }
     }
-
-    /// Project this column into an Arrow field without field metadata.
-    ///
-    /// Dynamic and pre-declared tables carry no sensitivity ledger, so their
-    /// managed fields carry no metadata either.
-    fn untagged_arrow(&self) -> Field {
-        Field::new(
-            self.field.name,
-            self.field.ty.to_arrow(),
-            self.field.nullable,
-        )
-    }
 }
 
 /// Every server-managed column, in physical order; every table appends all
@@ -145,16 +133,15 @@ pub fn is_correlation_column(name: &str) -> bool {
 /// appending them never perturbs it.
 #[must_use]
 pub fn ensure_managed_columns(mut user_fields: Vec<Field>) -> Vec<Field> {
-    user_fields.extend(MANAGED_COLUMNS.iter().map(ManagedColumn::untagged_arrow));
+    user_fields.extend(MANAGED_COLUMNS.iter().map(|column| column.field.to_arrow()));
     user_fields
 }
 
 /// Build one canonical signal table's complete physical Arrow fields.
 ///
 /// The declared signal ledger comes first in declaration order, then the
-/// managed columns. Every field — ledger and managed, at every
-/// nesting depth — carries its sensitivity metadata, which is what lets the
-/// canonical physical fingerprint cover the whole schema.
+/// managed columns. No field carries a field id or class label: ids come
+/// from the registered Iceberg table and classes stay in the ledger.
 #[must_use]
 pub fn canonical_physical_fields(declared: &[CanonicalField]) -> Vec<Field> {
     let mut physical = canonical_arrow_fields(declared);
@@ -241,32 +228,16 @@ mod tests {
         assert!(!is_correlation_column(WYRD_INGESTED_AT));
     }
 
-    /// Canonical tables tag the managed columns with sensitivity and no id.
+    /// Canonical tables declare the managed columns with no metadata.
     ///
     /// # Panics
     ///
-    /// Panics when a canonical managed field declares a field id or loses its
-    /// sensitivity marker.
+    /// Panics when a canonical managed field declares a field id or any other
+    /// metadata entry.
     #[test]
     fn canonical_physical_fields_declare_no_managed_field_ids() {
         for field in canonical_physical_fields(&[]) {
-            assert_eq!(
-                field
-                    .metadata()
-                    .get(crate::tables::fields::PARQUET_FIELD_ID),
-                None,
-                "{}",
-                field.name()
-            );
-            assert_eq!(
-                field
-                    .metadata()
-                    .get(crate::tables::fields::WYRD_SENSITIVE)
-                    .map(String::as_str),
-                Some("false"),
-                "{}",
-                field.name()
-            );
+            assert!(field.metadata().is_empty(), "{}", field.name());
         }
     }
 }

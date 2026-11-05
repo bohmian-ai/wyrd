@@ -33,6 +33,7 @@ pub use capture::CallCapture;
 #[cfg(test)]
 pub(crate) use capture::{recording, tests as capture_tests};
 pub use ingress::gateway_ingress_router;
+pub(crate) use invocation::ADMITTED_CALL_BYTES;
 pub use invocation::{
     GatewayCallAttribution, GatewayCallContext, GatewayCallRequest, GatewayCallResponse,
     GatewayInvocation,

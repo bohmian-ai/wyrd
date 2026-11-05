@@ -279,6 +279,30 @@ pub struct SystemResourceSnapshot {
     pub cpu_source: ResourceSource,
 }
 
+impl SystemResourceSnapshot {
+    /// Observes this process's memory, CPU, and the filesystem holding
+    /// `scratch_root`, once.
+    ///
+    /// Server boot calls this exactly once and composes every startup grant,
+    /// Bifrost's included, from the returned value, so no consumer probes the
+    /// host a second time. `memory_override` stands in for memory only when
+    /// the host probe is unavailable. No floor is applied here; the caller
+    /// that composes the process allocation owns the pod floor.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BifrostResourceError::Unavailable`] when memory cannot be
+    /// probed and no override is given, CPU detection fails, or the scratch
+    /// filesystem cannot be inspected, and [`BifrostResourceError::Poisoned`]
+    /// when a filesystem byte count overflows.
+    pub fn detect(
+        scratch_root: &Path,
+        memory_override: Option<usize>,
+    ) -> Result<Self, BifrostResourceError> {
+        detect_snapshot(scratch_root, memory_override)
+    }
+}
+
 /// Explicit physical roots registered once during Bifrost boot.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BifrostVolumeRoots {

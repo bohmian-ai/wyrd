@@ -10,7 +10,7 @@ use crate::config::ForgeRuntimeConfig;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
-use vala_bifrost_redux::resources::ResourcePlan;
+use vala_bifrost_redux::resources::{ResourcePlan, SystemResourceSnapshot};
 
 use secrecy::{ExposeSecret, SecretString};
 use tokio_util::sync::CancellationToken;
@@ -63,7 +63,9 @@ use crate::components::auth::ServerAuth;
 use crate::components::gateway::Gateway;
 use crate::components::health::Health;
 use crate::components::operators::keys::{KeyError, KeyFailure, OperatorKeys};
-use crate::config::{BifrostRuntimeRole, WorkloadBindingEntry, WyrdServerConfig};
+use crate::config::{
+    BifrostRuntimeRole, ConnectionBudget, ServerAllocation, WorkloadBindingEntry, WyrdServerConfig,
+};
 use crate::mcp::Mcp;
 use crate::oracle::{OraclePeerAuthority, PostgresPeerSecurityAudit};
 use crate::postgres::ServerPostgres;
@@ -139,6 +141,14 @@ pub enum ServerBootError {
     /// The one local Bifrost data root could not be prepared or is owned elsewhere.
     #[error(transparent)]
     BifrostDataRoot(#[from] BifrostDataRootError),
+    /// The startup resource observation or the allocation derived from it
+    /// is invalid: a cap above detection, a zero or overflowing budget, or an
+    /// owner left without one legal item.
+    #[error(transparent)]
+    Allocation(#[from] crate::config::ConfigError),
+    /// Process resources could not be detected.
+    #[error("process resource detection failed: {0}")]
+    ResourceDetection(String),
     /// Runtime pool construction failed.
     #[error("database pool construction failed")]
     PoolConnect(#[source] sqlx::Error),
@@ -323,16 +333,23 @@ fn validate_scribe_expanded_request(
 
 /// Constructs the external dependency graph injected into Bifrost composition.
 ///
+/// Bifrost composes from `snapshot`, the one startup observation, with the
+/// server envelope `allocation` already carved out of it, so its shared cap
+/// never overlaps the server grants.
+///
 /// # Errors
-/// Returns a boot error when Postgres readiness, storage, catalog, resource
-/// detection, or volume-root preparation fails.
+/// Returns a boot error when Postgres readiness, storage, catalog, or the
+/// Bifrost resource plan fails.
 async fn build_bifrost_external_dependencies(
     dsns: &ResolvedDsns,
-    config: &crate::config::BifrostRuntimeConfig,
-    forge: &ForgeRuntimeConfig,
-    target: crate::config::BifrostTarget,
+    server: &WyrdServerConfig,
+    data_root: BifrostDataRoot,
+    snapshot: SystemResourceSnapshot,
+    allocation: &ServerAllocation,
 ) -> Result<BifrostExternalDependencies, ServerBootError> {
-    let data_root = BifrostDataRoot::prepare(config.data_dir())?;
+    let config = &server.bifrost;
+    let forge = &server.forge;
+    let target = server.role;
     let postgres = Arc::new(ServerPostgres::connect_from_dsns(dsns).await?);
     let storage_settings = load_storage_settings()?;
     // Refused before any role row is reserved, so a misconfigured peer never
@@ -389,8 +406,10 @@ async fn build_bifrost_external_dependencies(
             BifrostRuntimeRole::Oracle => BifrostRole::Oracle,
         })
         .collect();
-    let runtime_resources = BifrostRuntimeResources::detect_with_transport_message_limit(
+    let runtime_resources = BifrostRuntimeResources::from_snapshot_with_transport_message_limit(
+        allocation.bifrost_snapshot(snapshot),
         config.resources.policy(
+            allocation,
             resource_roles,
             Some(data_root.oracle_spill().to_path_buf()),
             Some(data_root.volume_roots()),
@@ -478,6 +497,7 @@ pub async fn compose_bifrost(
         advertise_addr,
         data_root,
         shutdown,
+        allocation,
         #[cfg(feature = "test-support")]
         test_controls,
     } = inputs;
@@ -584,14 +604,14 @@ pub async fn compose_bifrost(
         // coordination task: the configured shard-owner lanes plus the
         // reconciliation and persistence loops. It is deliberately separate from
         // the request runtime so a saturated ingest path cannot starve shard
-        // progress, and its thread count derives from
-        // `default_scribe_coordination_threads` (available parallelism,
-        // floored at two). Only the `Handle` is handed to
+        // progress, and its thread count is the startup allocation's
+        // coordination grant (effective CPU, floored at two). Only the
+        // `Handle` is handed to
         // consumers; the `Runtime` value itself is moved into the single
         // non-`Clone` `ScribeCoordinationRuntime` owner returned below, which must
         // outlive Scribe role drain and releases the executor without blocking.
         let runtime = tokio::runtime::Builder::new_multi_thread()
-            .worker_threads(scribe_config.coordination_threads)
+            .worker_threads(allocation.scribe_coordination)
             .thread_name_fn(|| {
                 static THREAD_INDEX: std::sync::atomic::AtomicUsize =
                     std::sync::atomic::AtomicUsize::new(0);
@@ -612,17 +632,13 @@ pub async fn compose_bifrost(
             .as_ref()
             .map_or(Duration::ZERO, |controls| controls.scribe_wal_sync_delay);
         let execution_pools = ScribeExecutionPools::new(
-            ScribeIngressCpuPool::try_new_with_capacity(scribe_config.ingress_cpu_threads, 256)
+            ScribeIngressCpuPool::try_new_with_capacity(allocation.scribe_ingress, 256).map_err(
+                |error| ServerBootError::Scribe(format!("ingress CPU pool failed: {error}")),
+            )?,
+            ScribePersistenceCpuPool::try_new_with_capacity(allocation.scribe_persistence, 64)
                 .map_err(|error| {
-                    ServerBootError::Scribe(format!("ingress CPU pool failed: {error}"))
+                    ServerBootError::Scribe(format!("persistence CPU pool failed: {error}"))
                 })?,
-            ScribePersistenceCpuPool::try_new_with_capacity(
-                scribe_config.persistence_cpu_threads,
-                64,
-            )
-            .map_err(|error| {
-                ServerBootError::Scribe(format!("persistence CPU pool failed: {error}"))
-            })?,
             ScribeWalIoPool::try_new_with_capacity_and_delay(
                 scribe_config.wal_io_workers(),
                 256,
@@ -652,7 +668,7 @@ pub async fn compose_bifrost(
             immutable_limit_bytes: geometry
                 .shard_generation_rotation_usize()
                 .saturating_mul(2)
-                .saturating_mul(scribe_config.persistence_cpu_threads)
+                .saturating_mul(allocation.scribe_persistence)
                 .min(pod_memory_limit / 2),
         };
         #[cfg(feature = "test-support")]
@@ -669,7 +685,7 @@ pub async fn compose_bifrost(
         let persistence = ScribePersistenceConfig::new(
             Arc::new(postgres.vala().clone()),
             64,
-            scribe_config.persistence_cpu_threads,
+            allocation.scribe_persistence,
         )
         .with_operator_pool(postgres.operator_pool().ok_or_else(|| {
             ServerBootError::Scribe(
@@ -898,9 +914,10 @@ pub async fn compose_bifrost(
             Some(cards.clone()),
         ),
         scribe_config.ingest_request_bytes,
+        allocation.outbox_writers,
         wyrd_runtime::outbox::OutboxLimits {
-            items: scribe_config.outbox_capacity,
-            bytes: scribe_config.outbox_bytes,
+            items: allocation.outbox_items,
+            bytes: allocation.outbox_item_bytes,
         },
         Some(postgres.wyrd().clone()),
     );
@@ -1141,12 +1158,62 @@ pub fn production_guards(config: &WyrdServerConfig) {
     }
 }
 
+/// The one startup resource observation of a serving process and the
+/// allocation derived from it.
+///
+/// Prepared synchronously before the serving runtime exists, so that runtime
+/// is built with the allocation's worker count and boot never probes again.
+pub struct ServerResources {
+    /// Locked local Bifrost data root; its spill directory is the observed
+    /// scratch filesystem.
+    pub data_root: BifrostDataRoot,
+    /// The single host observation.
+    pub snapshot: SystemResourceSnapshot,
+    /// Startup grants derived from `snapshot` and the configuration.
+    pub allocation: ServerAllocation,
+}
+
+impl ServerResources {
+    /// Locks the data root, observes process resources once, and derives the
+    /// startup allocation for a process that owns its serving runtime.
+    ///
+    /// # Errors
+    /// Returns [`ServerBootError::BifrostDataRoot`] when the data root cannot
+    /// be prepared, [`ServerBootError::ResourceDetection`] when detection
+    /// fails, and [`ServerBootError::Allocation`] when the observation and
+    /// configuration admit no valid allocation.
+    pub fn prepare(config: &WyrdServerConfig) -> Result<Self, ServerBootError> {
+        let data_root = BifrostDataRoot::prepare(config.bifrost.data_dir())?;
+        let resources = &config.bifrost.resources;
+        let memory_override = config.resources.memory_limit_bytes.or_else(|| {
+            resources.memory_limit_bytes.map(|cap| {
+                cap.saturating_add(
+                    resources
+                        .server_memory_min_bytes
+                        .unwrap_or(vala_bifrost_redux::resources::DEFAULT_SERVER_MEMORY_MIN_BYTES),
+                )
+            })
+        });
+        let snapshot = SystemResourceSnapshot::detect(data_root.oracle_spill(), memory_override)
+            .map_err(|error| ServerBootError::ResourceDetection(error.to_string()))?;
+        let allocation = config.server_allocation(&snapshot, ConnectionBudget::from_env(), true)?;
+        Ok(Self {
+            data_root,
+            snapshot,
+            allocation,
+        })
+    }
+}
+
 /// Everything [`AppState::start`] composes the process from besides its
 /// configuration: the dependency graph, key material, and the engine
 /// settings the test harness substitutes.
 pub struct StartInputs {
     /// External dependencies Bifrost and the state compose over.
     pub dependencies: BifrostExternalDependencies,
+    /// Startup grants every owner is constructed with; Bifrost in
+    /// `dependencies` was composed from the same allocation.
+    pub allocation: ServerAllocation,
     /// Wyrd workload signing key PEM; see [`resolve_signing_key`].
     pub signing_key: SecretString,
     /// Deployment sealing keyring, or `None` for a secret-free deployment.
@@ -1173,23 +1240,31 @@ pub struct StartInputs {
 }
 
 impl StartInputs {
-    /// The production inputs for `config`: dependencies from the
-    /// environment's DSNs and storage settings, the configured key material,
-    /// default auth settings and RBAC, and this executable as the sandbox
-    /// worker.
+    /// The production inputs for `config` over the prepared `resources`:
+    /// dependencies from the environment's DSNs and storage settings, the
+    /// configured key material, default auth settings and RBAC, and this
+    /// executable as the sandbox worker.
     ///
     /// # Errors
     /// Returns [`ServerBootError`] when the database URLs, storage, catalog,
-    /// resource detection, data root, sealing or signing key, or peer TLS
-    /// bundle is invalid or unavailable, or this executable's path is not
-    /// available.
-    pub async fn production(config: &WyrdServerConfig) -> Result<Self, ServerBootError> {
+    /// Bifrost resource plan, sealing or signing key, or peer TLS bundle is
+    /// invalid or unavailable, or this executable's path is not available.
+    pub async fn production(
+        config: &WyrdServerConfig,
+        resources: ServerResources,
+    ) -> Result<Self, ServerBootError> {
         let dsns = ResolvedDsns::from_env()?;
+        let ServerResources {
+            data_root,
+            snapshot,
+            allocation,
+        } = resources;
         let dependencies =
-            build_bifrost_external_dependencies(&dsns, &config.bifrost, &config.forge, config.role)
+            build_bifrost_external_dependencies(&dsns, config, data_root, snapshot, &allocation)
                 .await?;
         Ok(Self {
             dependencies,
+            allocation,
             signing_key: resolve_signing_key(config)?,
             sealing_key: build_sealing_keyring(config)?,
             verify_settings: WyrdAuthVerifySettings::default(),
@@ -1232,6 +1307,7 @@ impl AppState {
     ) -> Result<BootedServer, ServerBootError> {
         let StartInputs {
             dependencies,
+            allocation,
             signing_key,
             sealing_key,
             verify_settings,
@@ -1244,6 +1320,10 @@ impl AppState {
             #[cfg(feature = "test-support")]
             test_hooks,
         } = inputs;
+        tracing::info!(
+            startup_allocation = %serde_json::to_string(&allocation).unwrap_or_default(),
+            "startup allocation"
+        );
         let shutdown = CancellationToken::new();
         let mut auth = install_auth(
             dependencies.postgres.as_ref(),
@@ -1283,6 +1363,7 @@ impl AppState {
             advertise_addr: dependencies.advertise_addr,
             data_root: dependencies.data_root,
             shutdown: shutdown.clone(),
+            allocation,
             #[cfg(feature = "test-support")]
             test_controls: bifrost_test_controls,
         })
@@ -1328,6 +1409,7 @@ impl AppState {
                 deployment_profile: config.deployment_profile,
                 role: config.role,
                 limits: config.limits.into_state(),
+                allocation,
             },
             postgres: dependencies.postgres,
             storage: dependencies.storage,

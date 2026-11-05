@@ -221,6 +221,10 @@ pub struct GatewayInvocation<'a> {
     arrival: Option<std::time::Instant>,
 }
 
+/// Fixed owner bytes one admitted call retains besides its request body, which
+/// startup adds to the JSON request ceiling when it sizes gateway call slots.
+pub(crate) const ADMITTED_CALL_BYTES: usize = size_of::<AdmittedCall>();
+
 /// Everything admission fixed for one call, owned so execution and accounting
 /// can outlive the caller's future.
 struct AdmittedCall {

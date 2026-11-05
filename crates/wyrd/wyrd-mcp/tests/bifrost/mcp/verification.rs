@@ -2552,10 +2552,7 @@ mod pg_tests {
         let offered = agent_client.list_all_tools().await?;
         server.flush_bifrost().await?;
         let (numerator, denominator) = wyrd_runtime::outbox::RESERVED_SHARE;
-        let capacity = wyrd_server::WyrdServerConfig::default()
-            .bifrost
-            .scribe
-            .outbox_capacity;
+        let capacity = server.state().bifrost.scribe_outbox().limits().items;
         let share = server
             .state()
             .bifrost

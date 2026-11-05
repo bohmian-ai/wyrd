@@ -105,21 +105,25 @@ use crate::verification::submissions::{Queued, SubmissionSink};
 /// The process's one non-blocking outbox for every Scribe-bound write.
 pub type ScribeOutbox = Outbox<ScribeSink>;
 
-/// Most slices written at once, across every tenant and lane.
+/// Most slices written at once by an outbox built without a startup
+/// allocation; a serving process uses its allocation's writer count.
+#[cfg(any(test, feature = "test-support"))]
 const SCRIBE_WRITERS: usize = 4;
 
 /// Lanes each tenant's Scribe writes spread over; see
 /// [`ScribeSink::lane`].
 const SCRIBE_LANES: usize = 4;
 
-/// Default of `scribe.outbox_capacity`: the most writes the process Scribe
-/// outbox admits at once, queued, retrying, or in flight.
+/// Most writes an outbox built without a startup allocation admits at once,
+/// queued, retrying, or in flight; a serving process derives its item limit
+/// from its allocation instead.
 ///
 /// Every write is weighed by the bytes it owns, so [`SCRIBE_BYTES`] bounds
 /// the outbox's memory, as a Kafka producer's `buffer.memory` does; this
 /// count only stops a flood of near-empty writes, and is set high enough
 /// that small audit decisions are bounded by their bytes rather than shed
 /// by count during a short Scribe stall.
+#[cfg(any(test, feature = "test-support"))]
 pub(crate) const SCRIBE_CAPACITY: usize = 1 << 20;
 
 /// Longest a lane's oldest staged write waits for others to join its Scribe
@@ -148,11 +152,13 @@ const SCRIBE_BATCH_WRITES: usize = 4_096;
 /// acknowledgements.
 const SCRIBE_BATCH_BYTES: usize = 32 << 20;
 
-/// Default of `scribe.outbox_bytes`: the most accounted bytes the process
-/// Scribe outbox admits at once, as [`ScribeSink::weight`]. Reserved writes,
-/// gateway captures, may hold three quarters of it, which bounds the
-/// captured content a saturated gateway keeps in memory; the remaining
-/// 256 MiB holds unreserved writes such as audit decisions and server spans.
+/// Most accounted bytes, as [`ScribeSink::weight`], an outbox built without a
+/// startup allocation admits at once; a serving process admits its
+/// allocation's retained-write grant instead. Reserved writes, gateway
+/// captures, may hold three quarters of it, which bounds the captured
+/// content a saturated gateway keeps in memory; the remaining quarter holds
+/// unreserved writes such as audit decisions and server spans.
+#[cfg(any(test, feature = "test-support"))]
 pub(crate) const SCRIBE_BYTES: usize = 1 << 30;
 
 /// Longest a peer Scribe may take to acknowledge one frame.
@@ -912,7 +918,7 @@ impl ScribeRoute {
 
 /// Most tenant span copies one process holds unwritten at once.
 ///
-/// The outbox admits at most [`SCRIBE_CAPACITY`] writes, a quarter of them
+/// The outbox admits at most its allocation's item limit, a quarter of them
 /// unreserved; this smaller cap on the span producer keeps a sustained Scribe
 /// outage's span copies from filling that unreserved share ahead of audit and
 /// capture writes.
@@ -998,13 +1004,19 @@ impl ScribeSink {
     #[cfg(any(test, feature = "test-support"))]
     #[must_use]
     pub(crate) fn outbox(route: Option<ScribeRoute>, request_bytes: usize) -> Arc<ScribeOutbox> {
-        Self::bounded_outbox(route, request_bytes, Self::DEFAULT_LIMITS, None)
+        Self::bounded_outbox(
+            route,
+            request_bytes,
+            SCRIBE_WRITERS,
+            Self::DEFAULT_LIMITS,
+            None,
+        )
     }
 
-    /// Starts an outbox like [`Self::outbox`] admitting at most `limits`
-    /// writes and bytes (`scribe.outbox_capacity` and `scribe.outbox_bytes`)
-    /// and recording acknowledged grouped activity through `groups`, when
-    /// given.
+    /// Starts an outbox like [`Self::outbox`] running at most `writers`
+    /// writes at once and admitting at most `limits` writes and bytes, the
+    /// startup allocation's outbox writers, items, and retained bytes, and
+    /// recording acknowledged grouped activity through `groups`, when given.
     ///
     /// # Panics
     /// Panics when called outside a Tokio runtime, because the writer task is
@@ -1013,6 +1025,7 @@ impl ScribeSink {
     pub(crate) fn bounded_outbox(
         route: Option<ScribeRoute>,
         request_bytes: usize,
+        writers: usize,
         limits: OutboxLimits,
         groups: Option<WyrdPostgres>,
     ) -> Arc<ScribeOutbox> {
@@ -1023,7 +1036,7 @@ impl ScribeSink {
                 frame_budget: frame_budget(request_bytes),
                 groups,
             },
-            SCRIBE_WRITERS,
+            writers,
             limits,
         )
     }
@@ -1044,6 +1057,7 @@ impl ScribeSink {
                 groups.clone().map(CardRegistry::new),
             )),
             vala_bifrost_redux::gate::limits::BIFROST_INGEST_REQUEST_LIMIT_BYTES,
+            SCRIBE_WRITERS,
             Self::DEFAULT_LIMITS,
             groups,
         )

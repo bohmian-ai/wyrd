@@ -60,8 +60,8 @@ use wyrd_server::boot::data_root::BifrostDataRoot;
 use wyrd_server::boot::{BifrostExternalDependencies, BootedServer, StartInputs};
 use wyrd_server::components::platform::builtins::BuiltinTables;
 use wyrd_server::config::{
-    BifrostRuntimeRole, BifrostTarget, ForgeRuntimeConfig, GatewayConfig, IssuerEntry,
-    OperatorKeySource, OperatorKeysConfig, ServeMode, WorkloadBindingEntry,
+    BifrostRuntimeRole, BifrostTarget, ConnectionBudget, ForgeRuntimeConfig, GatewayConfig,
+    IssuerEntry, OperatorKeySource, OperatorKeysConfig, ServeMode, WorkloadBindingEntry,
 };
 use wyrd_server::postgres::ServerPostgres;
 use wyrd_server::query::scheduled::ScheduledQueryCaller;
@@ -474,6 +474,8 @@ pub struct WyrdTestServerBuilder {
     /// Optional `scribe.outbox_capacity` the bound server's Scribe outbox admits.
     scribe_outbox_capacity: Option<usize>,
     scribe_persistence_cpu_threads: Option<usize>,
+    /// Optional `resources.memory_limit_bytes` reducing the observed memory.
+    process_memory_limit: Option<usize>,
     /// Optional projection of production Scribe rotation limits for real-server journeys.
     scribe_geometry_for_test: Option<vala_bifrost_redux::scribe::geometry::ScribeGeometry>,
     /// Optional faults installed in the real Scribe persistence graph for journeys.
@@ -655,6 +657,7 @@ impl Default for WyrdTestServerBuilder {
             scribe_ingest_limits: IngestLimits::default(),
             scribe_outbox_capacity: None,
             scribe_persistence_cpu_threads: None,
+            process_memory_limit: None,
             scribe_geometry_for_test: None,
             scribe_persistence_faults_for_test: None,
             role_timing: None,
@@ -4743,6 +4746,14 @@ impl WyrdTestServerBuilder {
         self
     }
 
+    /// Sets `resources.memory_limit_bytes`, the process memory cap the
+    /// startup allocation partitions instead of the observed memory.
+    #[must_use]
+    pub const fn with_process_memory_limit_for_test(mut self, bytes: usize) -> Self {
+        self.process_memory_limit = Some(bytes);
+        self
+    }
+
     /// Sets `scribe.persistence_cpu_threads`, which also sizes the staging
     /// workers and the publication claim budget, so a journey can pin that
     /// budget instead of inheriting the host's parallelism.
@@ -4831,10 +4842,7 @@ impl WyrdTestServerBuilder {
     /// Tests vary raw observations through this seam; all server-minimum,
     /// shared-cap, lease, and partition calculations remain production-owned.
     #[must_use]
-    pub(crate) fn with_system_resources_for_test(
-        mut self,
-        snapshot: SystemResourceSnapshot,
-    ) -> Self {
+    pub fn with_system_resources_for_test(mut self, snapshot: SystemResourceSnapshot) -> Self {
         self.system_resources = Some(snapshot);
         self
     }
@@ -5071,6 +5079,63 @@ impl WyrdTestServerBuilder {
                 .map_err(|error| WyrdTestServerError::Start(error.to_string()))?;
         let scratch_root = data_root.oracle_spill().to_path_buf();
         let volume_roots = (!self.bifrost_roles.is_empty()).then(|| data_root.volume_roots());
+        let mut config = WyrdServerConfig {
+            role: self.forge_process_role,
+            ..WyrdServerConfig::default()
+        };
+        config.bifrost.scribe.ingest_request_bytes = self.scribe_ingest_limits.max_frame_bytes;
+        config.resources.memory_limit_bytes = self.process_memory_limit;
+        if let Some(capacity) = self.scribe_outbox_capacity {
+            config.bifrost.scribe.outbox_capacity = Some(capacity);
+        }
+        if let Some(threads) = self.scribe_persistence_cpu_threads {
+            config.bifrost.scribe.persistence_cpu_threads = Some(threads);
+        }
+        config.bifrost.storage = self.bifrost_storage_io;
+        if let Some(oracle) = self.oracle_runtime.clone() {
+            config.bifrost.oracle = oracle;
+        }
+        config.forge = ForgeRuntimeConfig {
+            maintenance_interval_secs: Some(self.forge_interval.as_secs()),
+            ..ForgeRuntimeConfig::default()
+        };
+        config.gateway = test_gateway_config(tenant_id, self.gateway_vault_backend.clone())?;
+        if let Some(endpoints) = self.gateway_endpoints {
+            config.gateway.endpoints = endpoints;
+        }
+        if let Some(limits) = self.limits {
+            config.limits = wyrd_server::config::LimitsConfig {
+                body_bytes: limits.body_bytes,
+                audio_upload_bytes: limits.audio_upload_bytes,
+                timeout_ms: u64::try_from(limits.timeout.as_millis()).unwrap_or(u64::MAX),
+                concurrency: Some(limits.concurrency),
+            };
+        }
+        // Hosted blocks always start, so direct verification runs; only an
+        // opted-in server runs the queued runtime over them.
+        config.verification.enabled = true;
+        config.verification.limits = self.verification_limits.unwrap_or(HostedLimits {
+            monty_min_workers: 0,
+            ..HostedLimits::default()
+        });
+        let (operator_keys, operator_keys_dir) = match self.operator_keys.take() {
+            Some(config) => (config, None),
+            None => generated_operator_keys()?,
+        };
+        config.verification.operator_keys = operator_keys;
+        config.auth.tenant_slug = Some(
+            fixture
+                .tenant_slug()
+                .parse()
+                .map_err(|error: wyrd_spec::ids::IdError| start(error.to_string()))?,
+        );
+        config.trusted_issuers = self.trusted_issuer_configs.clone();
+        config.workload_bindings = self.workload_binding_configs.clone();
+        if let Some(drain) = self.shutdown_drain_for_test {
+            config.shutdown.drain_ms = u64::try_from(drain.as_millis()).unwrap_or(u64::MAX);
+        }
+        config.metrics.enabled = false;
+        config.serve.mode = ServeMode::Both;
         let snapshot = self.system_resources.unwrap_or(SystemResourceSnapshot {
             memory_limit_bytes: HARNESS_NODE_MEMORY_LIMIT_BYTES,
             effective_cpu: 4,
@@ -5079,12 +5144,17 @@ impl WyrdTestServerBuilder {
             memory_source: ResourceSource::Injected,
             cpu_source: ResourceSource::Injected,
         });
+        // The harness owns no serving runtime; every other grant is the one
+        // production derives from this same observation.
+        let allocation = config
+            .server_allocation(&snapshot, ConnectionBudget::from_env(), false)
+            .map_err(|error| start(error.to_string()))?;
         let runtime_resources =
             BifrostRuntimeResources::from_snapshot_with_transport_message_limit(
-                snapshot,
+                allocation.bifrost_snapshot(snapshot),
                 BifrostResourcePolicy {
                     roles: resource_roles,
-                    server_memory_min_bytes: None,
+                    server_memory_min_bytes: Some(allocation.server_bytes),
                     bifrost_memory_limit_bytes: None,
                     scratch_limit_bytes: None,
                     effective_cpu: None,
@@ -5125,7 +5195,6 @@ impl WyrdTestServerBuilder {
         }
         let bifrost_storage = Arc::new(bifrost_storage);
         let bifrost = test_catalog(&fixture, Arc::clone(&bifrost_storage)).await?;
-        let target = self.forge_process_role;
         // Mirrors production: a Scribe-bearing node reclaims the identity stored
         // beside its durable volume, so a restarted child is the same node
         // rather than a new one holding another node's WAL.
@@ -5194,62 +5263,6 @@ impl WyrdTestServerBuilder {
             .as_ref()
             .map(TestBifrostPeerTls::bifrost_peer_tls)
             .transpose()?;
-        let mut config = WyrdServerConfig {
-            role: target,
-            ..WyrdServerConfig::default()
-        };
-        config.bifrost.scribe.ingest_request_bytes = self.scribe_ingest_limits.max_frame_bytes;
-        if let Some(capacity) = self.scribe_outbox_capacity {
-            config.bifrost.scribe.outbox_capacity = capacity;
-        }
-        if let Some(threads) = self.scribe_persistence_cpu_threads {
-            config.bifrost.scribe.persistence_cpu_threads = threads;
-        }
-        config.bifrost.storage = self.bifrost_storage_io;
-        if let Some(oracle) = self.oracle_runtime.clone() {
-            config.bifrost.oracle = oracle;
-        }
-        config.forge = ForgeRuntimeConfig {
-            maintenance_interval_secs: Some(self.forge_interval.as_secs()),
-            ..ForgeRuntimeConfig::default()
-        };
-        config.gateway = test_gateway_config(tenant_id, self.gateway_vault_backend.clone())?;
-        if let Some(endpoints) = self.gateway_endpoints {
-            config.gateway.endpoints = endpoints;
-        }
-        if let Some(limits) = self.limits {
-            config.limits = wyrd_server::config::LimitsConfig {
-                body_bytes: limits.body_bytes,
-                audio_upload_bytes: limits.audio_upload_bytes,
-                timeout_ms: u64::try_from(limits.timeout.as_millis()).unwrap_or(u64::MAX),
-                concurrency: limits.concurrency,
-            };
-        }
-        // Hosted blocks always start, so direct verification runs; only an
-        // opted-in server runs the queued runtime over them.
-        config.verification.enabled = true;
-        config.verification.limits = self.verification_limits.unwrap_or(HostedLimits {
-            monty_min_workers: 0,
-            ..HostedLimits::default()
-        });
-        let (operator_keys, operator_keys_dir) = match self.operator_keys.take() {
-            Some(config) => (config, None),
-            None => generated_operator_keys()?,
-        };
-        config.verification.operator_keys = operator_keys;
-        config.auth.tenant_slug = Some(
-            fixture
-                .tenant_slug()
-                .parse()
-                .map_err(|error: wyrd_spec::ids::IdError| start(error.to_string()))?,
-        );
-        config.trusted_issuers = self.trusted_issuer_configs.clone();
-        config.workload_bindings = self.workload_binding_configs.clone();
-        if let Some(drain) = self.shutdown_drain_for_test {
-            config.shutdown.drain_ms = u64::try_from(drain.as_millis()).unwrap_or(u64::MAX);
-        }
-        config.metrics.enabled = false;
-        config.serve.mode = ServeMode::Both;
         let query_stream_fault = QueryStreamFaultController::default();
         let BootedServer {
             state,
@@ -5260,6 +5273,7 @@ impl WyrdTestServerBuilder {
         } = Box::pin(AppState::start(
             &config,
             StartInputs {
+                allocation,
                 dependencies: BifrostExternalDependencies {
                     postgres,
                     storage,

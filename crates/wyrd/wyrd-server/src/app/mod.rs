@@ -12,7 +12,10 @@ use crate::app::metrics::{WyrdTelemetryRuntime, metrics_router, serve_metrics};
 use crate::app::supervise::{
     TaskExit, TaskId, fallible_task, restarting_worker, supervise, worker_task,
 };
-use crate::boot::{BootedServer, StartInputs, production_guards, spawn_forge_worker};
+use crate::boot::{
+    BootedServer, ServerBootError, ServerResources, StartInputs, production_guards,
+    spawn_forge_worker,
+};
 use crate::config::{ServeMode, WyrdServerConfig};
 use crate::state::AppState;
 
@@ -40,10 +43,45 @@ pub enum BootExit {
 ///
 /// `mode` is `None` to use the configured default (`config.serve.mode`), or
 /// `Some(_)` to override it (the binary passes the `--mode` flag through here).
-pub async fn run(mode: Option<ServeMode>) -> Result<(), BootExit> {
+///
+/// Resources are observed once, before any runtime exists, so the serving
+/// runtime is built with exactly the allocation's HTTP worker grant and no
+/// later owner probes the host again.
+///
+/// # Errors
+/// Returns [`BootExit::Config`] when configuration loading fails or the
+/// observation and configuration admit no startup allocation, and
+/// [`BootExit::Other`] when the data root, resource detection, the serving
+/// runtime, boot, or serving fails.
+pub fn run(mode: Option<ServeMode>) -> Result<(), BootExit> {
     let config = WyrdServerConfig::load().map_err(|e| BootExit::Config(Box::new(e)))?;
     production_guards(&config);
+    let resources = ServerResources::prepare(&config).map_err(|error| match error {
+        ServerBootError::Allocation(error) => BootExit::Config(Box::new(error)),
+        error => BootExit::Other(Box::new(error)),
+    })?;
+    let workers = resources
+        .allocation
+        .http_workers
+        .ok_or_else(|| BootExit::Other("serving allocation grants no HTTP workers".into()))?;
+    tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(workers)
+        .enable_all()
+        .build()
+        .map_err(|error| BootExit::Other(Box::new(error)))?
+        .block_on(Box::pin(serve_process(config, resources, mode)))
+}
 
+/// Boots and serves one process over its prepared `resources` inside the
+/// serving runtime [`run`] built for them.
+///
+/// # Errors
+/// Returns [`BootExit::Other`] when telemetry, boot, or serving fails.
+async fn serve_process(
+    config: WyrdServerConfig,
+    resources: ServerResources,
+    mode: Option<ServeMode>,
+) -> Result<(), BootExit> {
     let telemetry_runtime = WyrdTelemetryRuntime::install(config.telemetry.clone())
         .map_err(|error| BootExit::Other(Box::new(error)))?;
     let telemetry: Arc<TelemetryGuard> = telemetry_runtime.guard();
@@ -67,8 +105,8 @@ pub async fn run(mode: Option<ServeMode>) -> Result<(), BootExit> {
     // the serving future, so they outlive both the Bifrost drain that
     // `BoundServer::run` performs and the supervised Forge worker, and are
     // released only once serving has returned. Their drops are non-blocking,
-    // which is required because this frame is inside `#[tokio::main]`.
-    let inputs = StartInputs::production(&config)
+    // which is required because this frame runs inside the serving runtime.
+    let inputs = StartInputs::production(&config, resources)
         .await
         .map_err(|e| BootExit::Other(Box::new(e)))?;
     let BootedServer {
@@ -170,7 +208,13 @@ async fn run_forge_worker_process(
         set.spawn(fallible_task(
             TaskId::Metrics,
             serve_metrics(
-                metrics_router(handle, config.metrics.benchmark_snapshot),
+                metrics_router(
+                    handle,
+                    config
+                        .metrics
+                        .benchmark_snapshot
+                        .then_some(state.settings.allocation),
+                ),
                 listener,
                 shutdown.clone(),
             ),

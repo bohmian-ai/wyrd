@@ -248,6 +248,8 @@ pub struct Outbox<S: OutboxSink> {
     admission: Arc<Admission>,
     /// Most items and bytes this outbox admits at once.
     limits: OutboxLimits,
+    /// Most writes the writer runs at once, as clamped at construction.
+    concurrency: usize,
     /// Per tenant, items shed since the last shed record and when that record
     /// was written; see [`SHED_LOG_INTERVAL`].
     // ponytail: one small entry per tenant that ever shed, never pruned;
@@ -306,6 +308,7 @@ impl<S: OutboxSink> Outbox<S> {
         let abandon = CancellationToken::new();
         let writer = TaskTracker::new();
         let sink = Arc::new(sink);
+        let concurrency = concurrency.max(1);
         writer.spawn(
             OutboxWriter {
                 sink: Arc::clone(&sink),
@@ -317,7 +320,7 @@ impl<S: OutboxSink> Outbox<S> {
                 writing: JoinSet::new(),
                 in_flight: HashMap::new(),
                 retry_at: HashMap::new(),
-                concurrency: concurrency.max(1),
+                concurrency,
                 pending: Arc::clone(&pending),
                 admission: Arc::clone(&admission),
                 idle: Arc::clone(&idle),
@@ -331,6 +334,7 @@ impl<S: OutboxSink> Outbox<S> {
             pending,
             admission,
             limits,
+            concurrency,
             shed: Mutex::default(),
             idle,
             waiters: Mutex::default(),
@@ -338,6 +342,18 @@ impl<S: OutboxSink> Outbox<S> {
             writer,
             sink,
         })
+    }
+
+    /// The item and byte limits this outbox was constructed with.
+    #[must_use]
+    pub const fn limits(&self) -> OutboxLimits {
+        self.limits
+    }
+
+    /// The most writes this outbox runs at once.
+    #[must_use]
+    pub const fn concurrency(&self) -> usize {
+        self.concurrency
     }
 
     /// Borrows the sink this outbox writes through.

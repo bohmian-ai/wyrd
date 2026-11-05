@@ -372,6 +372,17 @@ impl LocalServer {
         Ok(reqwest::get(url).await?.error_for_status()?.json().await?)
     }
 
+    /// Reads the server's startup allocation, the `startup_allocation` object
+    /// boot logged, from the loopback metrics listener.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the endpoint does not answer 200 with JSON.
+    pub async fn allocation(&self) -> Result<serde_json::Value> {
+        let url = format!("http://127.0.0.1:{METRICS_PORT}/benchmark/allocation");
+        Ok(reqwest::get(url).await?.error_for_status()?.json().await?)
+    }
+
     /// Microseconds of user plus system CPU the server process has used so
     /// far, or `None` once it is gone or unreadable, so a lost process never
     /// reads as idle.

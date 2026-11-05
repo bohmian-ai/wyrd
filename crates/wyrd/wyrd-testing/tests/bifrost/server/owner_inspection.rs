@@ -588,3 +588,130 @@ async fn unready_roles_heartbeat_until_teardown_ends_membership_tasks()
     server.shutdown().await?;
     Ok(())
 }
+
+/// A server booted under a reducing process memory cap partitions that cap,
+/// not the observed memory, and every owner is constructed with the grant
+/// its one reported allocation names.
+///
+/// The injected node observes 32 GiB and 8 CPUs; the 16-GiB process cap
+/// makes `M` 16 GiB, so the server envelope is a quarter of it (4 GiB) and
+/// Bifrost composes from the remaining 12 GiB. A fixed 1-GiB server headroom
+/// would hand Bifrost 15 GiB, and a consumer that probed the host for CPUs
+/// would disagree with the injected eight. An embedded server owns no
+/// serving runtime, so it reports no HTTP worker grant. An ordinary SDK call
+/// then succeeds and the server shuts down cleanly.
+///
+/// # Panics
+///
+/// Panics when the server cannot start, the allocation disagrees with the
+/// cap or the constructed owners, the SDK call fails, or shutdown fails.
+#[tokio::test]
+#[ignore = "requires Postgres and object storage"]
+async fn composed_server_reports_effective_allocations() {
+    use secrecy::ExposeSecret as _;
+    use vala_bifrost_redux::resources::{ResourceSource, SystemResourceSnapshot};
+    use wyrd_testing::{Bootstrap, WyrdTestServer};
+
+    const GIB: usize = 1024 * 1024 * 1024;
+    let server = Box::pin(
+        WyrdTestServer::builder()
+            .with_system_resources_for_test(SystemResourceSnapshot {
+                memory_limit_bytes: 32 * GIB,
+                effective_cpu: 8,
+                scratch_capacity_bytes: 4 * GIB as u64,
+                scratch_available_bytes: 4 * GIB as u64,
+                memory_source: ResourceSource::Injected,
+                cpu_source: ResourceSource::Injected,
+            })
+            .with_process_memory_limit_for_test(16 * GIB)
+            .start_bound(),
+    )
+    .await
+    .expect("the capped server starts");
+    let state = server.state();
+    let allocation = state.settings.allocation;
+    assert_eq!(
+        (
+            allocation.process_bytes,
+            allocation.server_bytes,
+            allocation.gateway_bytes,
+            allocation.outbox_bytes,
+            allocation.bifrost_bytes,
+            allocation.effective_cpu,
+            allocation.http_workers,
+        ),
+        (16 * GIB, 4 * GIB, GIB, GIB, 12 * GIB, 8, None)
+    );
+    assert_eq!(
+        allocation.server_bytes + allocation.bifrost_bytes,
+        allocation.process_bytes
+    );
+
+    let plan = state
+        .bifrost_resources()
+        .expect("the server composes Bifrost resources")
+        .plan();
+    assert_eq!(
+        (
+            plan.memory_limit_bytes,
+            plan.server_memory_min_bytes,
+            plan.managed_memory_bytes,
+            plan.effective_cpu,
+        ),
+        (
+            allocation.process_bytes,
+            allocation.server_bytes,
+            allocation.bifrost_bytes,
+            allocation.effective_cpu,
+        ),
+        "Bifrost composes from the same allocation"
+    );
+    let outbox = state.bifrost.scribe_outbox();
+    assert_eq!(
+        (
+            outbox.limits().items,
+            outbox.limits().bytes,
+            outbox.concurrency()
+        ),
+        (
+            allocation.outbox_items,
+            allocation.outbox_item_bytes,
+            allocation.outbox_writers
+        ),
+        "the process outbox is constructed with its grant"
+    );
+
+    let key = match server
+        .bootstrap_service("allocation-reader", &["admin"])
+        .await
+        .expect("the reader bootstraps")
+    {
+        Bootstrap::Machine { api_key, .. } => api_key.expose_secret().to_owned(),
+        Bootstrap::User { .. } => panic!("expected a machine principal"),
+    };
+    let client = wyrd_client::bifrost::client_from_options(
+        Some(server.base_url().expect("the bound server has a URL")),
+        Some(&key),
+        server.grpc_url().as_deref(),
+    )
+    .expect("the client builds");
+    wyrd_client::cards::Cards::connect_with(&client)
+        .await
+        .expect("the Cards handle connects")
+        .list(wyrd_spec::registry::ListCardsRequest {
+            kind: None,
+            name: None,
+            version_range: None,
+            status: None,
+            filter: None,
+            include_prerelease: false,
+            limit: Some(1),
+            cursor: None,
+        })
+        .await
+        .expect("an ordinary SDK read succeeds under the capped allocation");
+    server
+        .shutdown()
+        .await
+        .expect("the server shuts down cleanly");
+}

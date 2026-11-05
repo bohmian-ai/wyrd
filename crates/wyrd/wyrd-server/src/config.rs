@@ -13,8 +13,11 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use secrecy::{ExposeSecret, SecretString};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use url::Url;
+use vala_bifrost_redux::resources::{
+    DEFAULT_SERVER_MEMORY_MIN_BYTES, MIN_POD_MEMORY_BYTES, ResourceSource, SystemResourceSnapshot,
+};
 use vala_bifrost_redux::scribe::geometry::{ScribeGeometry, ScribeGeometryError};
 use wyrd_auth_oidc::{AddressPolicy, ScreenedHttp};
 use wyrd_crypt::SealingKeyring;
@@ -310,15 +313,20 @@ pub struct ServeConfig {
 #[derive(Debug, Clone, Copy, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ScribeRuntimeConfig {
-    /// Tokio coordination worker count.
-    #[serde(default = "default_scribe_coordination_threads")]
-    pub coordination_threads: usize,
-    /// Ingress CPU worker count.
-    #[serde(default = "default_scribe_ingress_cpu_threads")]
-    pub ingress_cpu_threads: usize,
-    /// Persistence CPU worker count for Parquet preparation and bounded replay work.
-    #[serde(default = "default_scribe_persistence_cpu_threads")]
-    pub persistence_cpu_threads: usize,
+    /// Explicit Tokio coordination worker count.
+    ///
+    /// Unset, startup derives `max(C, 2)` from the resolved effective CPU `C`
+    /// (see [`ServerAllocation`]), so a single-core node still has a second
+    /// thread to progress on while one shard lane blocks in `COMMIT`.
+    #[serde(default)]
+    pub coordination_threads: Option<usize>,
+    /// Explicit ingress CPU worker count; unset derives it from `C`.
+    #[serde(default)]
+    pub ingress_cpu_threads: Option<usize>,
+    /// Explicit persistence CPU worker count for Parquet preparation and
+    /// bounded replay work; unset derives it from `C`.
+    #[serde(default)]
+    pub persistence_cpu_threads: Option<usize>,
     /// WAL IO worker count. Boot runs at least one worker per shard; see
     /// [`Self::wal_io_workers`].
     #[serde(default = "default_scribe_wal_io_threads")]
@@ -330,20 +338,23 @@ pub struct ScribeRuntimeConfig {
     /// capacity decision rather than only a validation bound.
     #[serde(default = "default_ingest_request_bytes")]
     pub ingest_request_bytes: usize,
-    /// Most writes this process's Scribe outbox admits at once: queued,
-    /// retrying, and in flight. Verifier calls that would take reservations
-    /// past three quarters of it are refused with retryable pressure; past
-    /// all of it, unreserved writes such as audit decisions are counted lost.
-    /// Default 1,048,576, so `outbox_bytes` is the bound that normally binds.
-    #[serde(default = "default_outbox_capacity")]
-    pub outbox_capacity: usize,
-    /// Most accounted bytes this process's Scribe outbox admits at once,
-    /// counting at least every captured payload and object a write holds.
-    /// The same three-quarter reservation share applies: unreserved writes
-    /// such as gateway captures are shed past a quarter of it, and Verifier
-    /// calls are refused once reserved writes hold the rest. Default 1 GiB.
-    #[serde(default = "default_outbox_bytes")]
-    pub outbox_bytes: usize,
+    /// Optional ceiling on the writes this process's Scribe outbox admits at
+    /// once: queued, retrying, and in flight. Verifier calls that would take
+    /// reservations past three quarters of it are refused with retryable
+    /// pressure; past all of it, unreserved writes such as audit decisions
+    /// are counted lost. Unset, startup derives the item limit from the
+    /// outbox's retained-byte grant; a value only lowers it.
+    #[serde(default)]
+    pub outbox_capacity: Option<usize>,
+    /// Optional ceiling on the accounted bytes this process's Scribe outbox
+    /// admits at once, counting at least every captured payload and object a
+    /// write holds. The same three-quarter reservation share applies:
+    /// unreserved writes such as gateway captures are shed past a quarter of
+    /// it, and Verifier calls are refused once reserved writes hold the rest.
+    /// Unset, startup admits half the outbox memory grant; a value only
+    /// lowers it.
+    #[serde(default)]
+    pub outbox_bytes: Option<usize>,
     /// Number of Scribe shards, each with its own WAL and memtable.
     ///
     /// Each shard syncs its own WAL, so more shards mean more syncs per
@@ -1409,18 +1420,21 @@ impl BifrostResourceConfig {
     ///
     /// This is the only translation from server configuration to Bifrost
     /// resource planning, so boot and tests resolve the same shared cap from
-    /// the same fields. Validation happens where the policy meets an
-    /// observation, never here.
+    /// the same fields. The server envelope comes from `allocation`, so the
+    /// Bifrost cap is the process memory less the same `H` every other
+    /// startup grant is carved from. Validation happens where the policy
+    /// meets an observation, never here.
     #[must_use]
     pub fn policy(
         &self,
+        allocation: &ServerAllocation,
         roles: std::collections::BTreeSet<vala_bifrost_redux::resources::BifrostRole>,
         scratch_root: Option<PathBuf>,
         volume_roots: Option<vala_bifrost_redux::resources::BifrostVolumeRoots>,
     ) -> vala_bifrost_redux::resources::BifrostResourcePolicy {
         vala_bifrost_redux::resources::BifrostResourcePolicy {
             roles,
-            server_memory_min_bytes: self.server_memory_min_bytes,
+            server_memory_min_bytes: Some(allocation.server_bytes),
             bifrost_memory_limit_bytes: self.memory_limit_bytes,
             scratch_limit_bytes: self.scratch_limit_bytes,
             effective_cpu: self.effective_cpu,
@@ -1432,36 +1446,518 @@ impl BifrostResourceConfig {
     }
 }
 
-/// Derives the dedicated Scribe coordination-runtime worker count.
-///
-/// The coordination runtime hosts one long-lived task per Scribe shard lane
-/// plus the reconciliation and persistence loops. Those shard owners are not
-/// pure channel-awaiters: each performs synchronous Arrow memtable insertion
-/// inline and awaits a Postgres `COMMIT`, so a thread count well below the
-/// lane count serializes independent lanes.
-///
-/// The derivation therefore starts from detected parallelism — matching the
-/// sibling ingress and persistence derivations, including their `map_or(4, ..)`
-/// fallback for platforms that cannot report it — floored at two so a
-/// single-core box still gets a second thread to make progress on while one
-/// lane blocks in `COMMIT`.
-fn default_scribe_coordination_threads() -> usize {
-    std::thread::available_parallelism()
-        .map_or(4, std::num::NonZeroUsize::get)
-        .max(2)
+/// Optional process-wide resource caps applied before any startup grant.
+#[derive(Debug, Clone, Copy, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProcessResourceConfig {
+    /// Optional cap reducing the detected process-visible memory `M` that
+    /// every startup grant divides, Bifrost's included.
+    ///
+    /// `WYRD_PROCESS_MEMORY_LIMIT_BYTES` overrides it. It may only lower
+    /// detection: zero or a value above the detected memory refuses boot. It
+    /// is a software budget, not an operating-system memory quota.
+    #[serde(default)]
+    pub memory_limit_bytes: Option<usize>,
 }
 
-fn default_scribe_ingress_cpu_threads() -> usize {
-    let available = std::thread::available_parallelism().map_or(4, std::num::NonZeroUsize::get);
-    (available.saturating_sub(2).max(2) / 3).max(1)
+/// Database connection maxima of the pools a serving process opens.
+///
+/// Recorded beside the startup allocation so a deployment's connection total
+/// is visible; only the app pool feeds a grant, as the ceiling on outbox
+/// writers. Connections are operator budgets and never grow with CPU.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub struct ConnectionBudget {
+    /// Tenant app pool maximum.
+    pub app: u32,
+    /// Vala/Bifrost runtime pool maximum.
+    pub vala: u32,
+    /// Platform-admin operator pool maximum.
+    pub platform_admin: u32,
 }
 
-fn default_scribe_persistence_cpu_threads() -> usize {
-    let available = std::thread::available_parallelism().map_or(4, std::num::NonZeroUsize::get);
-    let budget = available.saturating_sub(2).max(2);
-    budget
-        .saturating_sub(default_scribe_ingress_cpu_threads())
-        .max(1)
+impl ConnectionBudget {
+    /// The maxima the production pools will open with, read from the same
+    /// `WYRD_DB_*` settings the pool builders read.
+    #[must_use]
+    pub fn from_env() -> Self {
+        Self {
+            app: wyrd_sql::PoolConfig::app_from_env().max_connections,
+            vala: vala_sql::postgres::vala_pool_config().max_connections,
+            platform_admin: wyrd_sql::PoolConfig::platform_admin_from_env().max_connections,
+        }
+    }
+}
+
+/// Requested inputs and detected observations one allocation was derived from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub struct AllocationInputs {
+    /// Detected process-visible memory before any cap.
+    pub detected_memory_bytes: usize,
+    /// Source of the detected memory.
+    pub memory_source: &'static str,
+    /// Detected CPU before any cap.
+    pub detected_cpu: usize,
+    /// Source of the detected CPU.
+    pub cpu_source: &'static str,
+    /// `resources.memory_limit_bytes`, when configured.
+    pub process_memory_limit_bytes: Option<usize>,
+    /// `bifrost.resources.effective_cpu`, when configured.
+    pub effective_cpu_limit: Option<usize>,
+    /// Configured or default server memory minimum.
+    pub server_memory_min_bytes: usize,
+    /// `bifrost.resources.memory_limit_bytes`, when configured.
+    pub bifrost_memory_limit_bytes: Option<usize>,
+    /// `scribe.outbox_bytes`, when configured.
+    pub outbox_bytes_limit: Option<usize>,
+    /// `scribe.outbox_capacity`, when configured.
+    pub outbox_capacity_limit: Option<usize>,
+    /// `limits.concurrency`, when configured.
+    pub gateway_concurrency_limit: Option<usize>,
+    /// `scribe.coordination_threads`, when configured.
+    pub scribe_coordination_threads: Option<usize>,
+    /// `scribe.ingress_cpu_threads`, when configured.
+    pub scribe_ingress_cpu_threads: Option<usize>,
+    /// `scribe.persistence_cpu_threads`, when configured.
+    pub scribe_persistence_cpu_threads: Option<usize>,
+    /// Scribe ingest request ceiling `I`.
+    pub ingest_request_bytes: usize,
+    /// Provider response ceiling `P`.
+    pub provider_response_bytes: usize,
+    /// JSON request ceiling `J`.
+    pub json_request_bytes: usize,
+}
+
+/// Which startup-composed owners this process runs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub struct AllocationRoles {
+    /// The gateway, composed only by an API-serving target.
+    pub gateway: bool,
+    /// The process Scribe outbox, composed by every target.
+    pub outbox: bool,
+    /// The Scribe role.
+    pub scribe: bool,
+    /// The Oracle role.
+    pub oracle: bool,
+    /// The Forge coordinator or worker role.
+    pub forge: bool,
+}
+
+/// The term that bound each `min`-derived grant.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub struct AllocationLimits {
+    /// `cpu`, `app_pool`, or `frame_slots`.
+    pub outbox_writers: &'static str,
+    /// `cpu`, `memory`, `configured`, or `disabled`.
+    pub gateway_slots: &'static str,
+}
+
+/// One immutable, non-overlapping CPU and memory allocation for this process.
+///
+/// Startup derives it once from the single resource observation and the
+/// configuration, before any owner exists, and passes it to every consumer:
+/// the serving runtime, Bifrost, the Scribe lanes, the process outbox, and
+/// the gateway. Byte grants partition the process memory `M`: the server
+/// envelope `H` holds the gateway grant `G`, the outbox grant `O`, and other
+/// server headroom; Bifrost governs `M - H` or a smaller configured cap. No
+/// owner borrows across another's grant, and none probes the host again.
+/// Grants are software budgets, not operating-system quotas or an RSS cap.
+/// Explicitly configured counts and bytes are ceilings on the derived value.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub struct ServerAllocation {
+    /// Inputs the allocation was derived from.
+    pub inputs: AllocationInputs,
+    /// Owners this process composes.
+    pub roles: AllocationRoles,
+    /// Pool maxima of this process.
+    pub connections: ConnectionBudget,
+    /// Which term bound each `min`-derived grant.
+    pub limited_by: AllocationLimits,
+    /// Effective CPU `C`.
+    pub effective_cpu: usize,
+    /// Process memory `M` after the process cap.
+    pub process_bytes: usize,
+    /// Server envelope `H`.
+    pub server_bytes: usize,
+    /// Gateway retained-work grant `G`; zero without a gateway.
+    pub gateway_bytes: usize,
+    /// Process outbox grant `O`.
+    pub outbox_bytes: usize,
+    /// `H - G - O`, including any disabled owner's share.
+    pub other_server_bytes: usize,
+    /// Bifrost managed ceiling `B`.
+    pub bifrost_bytes: usize,
+    /// App pool maximum `A`, the ceiling on outbox writers.
+    pub serving_connections: usize,
+    /// Serving runtime workers, `C`; `None` when the embedder owns the runtime.
+    pub http_workers: Option<usize>,
+    /// Scribe coordination runtime workers.
+    pub scribe_coordination: usize,
+    /// Scribe ingress CPU workers.
+    pub scribe_ingress: usize,
+    /// Scribe persistence CPU workers.
+    pub scribe_persistence: usize,
+    /// Admitted retained outbox write bytes `U`.
+    pub outbox_item_bytes: usize,
+    /// Outbox encoding workspace `X`, inside `O`.
+    pub outbox_work_bytes: usize,
+    /// Admitted outbox items.
+    pub outbox_items: usize,
+    /// Concurrent outbox writes `W`.
+    pub outbox_writers: usize,
+    /// Ordered lanes per tenant, fixed for the process lifetime.
+    pub tenant_lanes: usize,
+    /// Aggregate frame submissions in flight `F`.
+    pub frame_slots: usize,
+    /// Accounted bytes at which one lane write commits.
+    pub batch_bytes: usize,
+    /// Concurrent gateway calls `N`.
+    pub gateway_slots: usize,
+    /// Gateway call data bytes `V - T`.
+    pub gateway_retained_bytes: usize,
+    /// Gateway pre-authentication and pending-fill control bytes `T`.
+    pub gateway_control_bytes: usize,
+    /// Shared provider-decode and capture workspace `K`.
+    pub capture_work_bytes: usize,
+    /// Concurrent capture CPU jobs.
+    pub capture_jobs: usize,
+}
+
+/// Largest accounted bytes one outbox lane write takes.
+const OUTBOX_BATCH_BYTES_CEILING: usize = 32 * 1024 * 1024;
+
+impl ServerAllocation {
+    /// The observation Bifrost composes from: `detected` with memory reduced
+    /// to `M`, so the Bifrost cap is carved from the same process memory.
+    #[must_use]
+    pub fn bifrost_snapshot(&self, detected: SystemResourceSnapshot) -> SystemResourceSnapshot {
+        SystemResourceSnapshot {
+            memory_limit_bytes: self.process_bytes,
+            memory_source: if self.process_bytes < detected.memory_limit_bytes {
+                ResourceSource::Override
+            } else {
+                detected.memory_source
+            },
+            ..detected
+        }
+    }
+
+    /// An allocation derived from a fixed 8-CPU, 32-GiB observation for
+    /// fixtures that assemble state without booting.
+    ///
+    /// # Panics
+    /// Panics if the default configuration cannot allocate that observation,
+    /// which is an authoring error.
+    #[cfg(any(test, feature = "test-support"))]
+    #[must_use]
+    pub fn for_test() -> Self {
+        WyrdServerConfig::default()
+            .server_allocation(
+                &SystemResourceSnapshot {
+                    memory_limit_bytes: 32 << 30,
+                    effective_cpu: 8,
+                    scratch_capacity_bytes: 4 << 30,
+                    scratch_available_bytes: 4 << 30,
+                    memory_source: ResourceSource::Injected,
+                    cpu_source: ResourceSource::Injected,
+                },
+                ConnectionBudget {
+                    app: 32,
+                    vala: 16,
+                    platform_admin: 2,
+                },
+                false,
+            )
+            .expect("the default configuration allocates the fixture observation")
+    }
+}
+
+/// Stable label of a resource observation's source.
+const fn resource_source_label(source: ResourceSource) -> &'static str {
+    match source {
+        ResourceSource::Override => "override",
+        ResourceSource::Container => "container",
+        ResourceSource::Host => "host",
+        ResourceSource::Filesystem => "filesystem",
+        ResourceSource::Injected => "injected",
+    }
+}
+
+/// The smallest labelled term; the first wins a tie.
+fn least(terms: &[(&'static str, usize)]) -> (&'static str, usize) {
+    terms.iter().copied().fold(
+        terms[0],
+        |best, term| if term.1 < best.1 { term } else { best },
+    )
+}
+
+impl WyrdServerConfig {
+    /// Derives this process's one startup allocation from `snapshot`.
+    ///
+    /// `connections` are the pool maxima the process opens; `owns_runtime`
+    /// is false for an embedder that supplies its own Tokio runtime, which
+    /// then records no serving worker count. Every step is checked integer
+    /// arithmetic. A cap above detection, a zero or overflowing budget, an
+    /// envelope `H >= M`, a Bifrost cap above `M - H`, or a composed owner
+    /// left without one legal item, frame, or slot refuses rather than
+    /// clamps. Live observations below [`MIN_POD_MEMORY_BYTES`] refuse; an
+    /// injected test observation skips only that floor.
+    ///
+    /// # Errors
+    /// Returns [`ConfigError::Invalid`] naming the failed calculation.
+    #[expect(
+        clippy::too_many_lines,
+        reason = "one table of checked formulas reads best in one place"
+    )]
+    pub fn server_allocation(
+        &self,
+        snapshot: &SystemResourceSnapshot,
+        connections: ConnectionBudget,
+        owns_runtime: bool,
+    ) -> Result<ServerAllocation, ConfigError> {
+        let invalid = |message: String| ConfigError::Invalid { message };
+        let overflow = |what: &str| ConfigError::Invalid {
+            message: format!("startup allocation overflows computing {what}"),
+        };
+        let reduce = |detected: usize, cap: Option<usize>, name: &str| match cap {
+            None => Ok(detected),
+            Some(0) => Err(invalid(format!("{name} must be positive"))),
+            Some(cap) if cap > detected => Err(invalid(format!(
+                "{name} {cap} exceeds the detected {detected}; it may only lower detection"
+            ))),
+            Some(cap) => Ok(cap),
+        };
+        let scribe = &self.bifrost.scribe;
+        let resources = &self.bifrost.resources;
+        let process_bytes = reduce(
+            snapshot.memory_limit_bytes,
+            self.resources.memory_limit_bytes,
+            "resources.memory_limit_bytes",
+        )?;
+        let effective_cpu = reduce(
+            snapshot.effective_cpu,
+            resources.effective_cpu,
+            "bifrost.resources.effective_cpu",
+        )?;
+        if process_bytes == 0 || effective_cpu == 0 {
+            return Err(invalid(
+                "no positive process memory or CPU was detected".to_owned(),
+            ));
+        }
+        if snapshot.memory_source != ResourceSource::Injected
+            && process_bytes < MIN_POD_MEMORY_BYTES
+        {
+            return Err(invalid(format!(
+                "process memory {process_bytes} bytes is below the \
+                 {MIN_POD_MEMORY_BYTES}-byte Wyrd minimum"
+            )));
+        }
+        let server_memory_min_bytes = resources
+            .server_memory_min_bytes
+            .unwrap_or(DEFAULT_SERVER_MEMORY_MIN_BYTES);
+        if server_memory_min_bytes < DEFAULT_SERVER_MEMORY_MIN_BYTES {
+            return Err(invalid(format!(
+                "bifrost.resources.server_memory_min_bytes {server_memory_min_bytes} is below \
+                 {DEFAULT_SERVER_MEMORY_MIN_BYTES}"
+            )));
+        }
+        let server_bytes = server_memory_min_bytes.max(process_bytes / 4);
+        let available = process_bytes
+            .checked_sub(server_bytes)
+            .filter(|available| *available > 0)
+            .ok_or_else(|| {
+                invalid(format!(
+                    "server envelope {server_bytes} leaves no Bifrost memory in process \
+                     memory {process_bytes}"
+                ))
+            })?;
+        let bifrost_bytes = match resources.memory_limit_bytes {
+            None => available,
+            Some(cap) if cap > 0 && cap <= available => cap,
+            Some(cap) => {
+                return Err(invalid(format!(
+                    "bifrost.resources.memory_limit_bytes {cap} must be positive and at most \
+                     the {available} bytes process memory {process_bytes} leaves above the \
+                     {server_bytes}-byte server envelope"
+                )));
+            }
+        };
+        let roles = self.bifrost_roles();
+        let roles = AllocationRoles {
+            gateway: self.role.serves_api(),
+            outbox: true,
+            scribe: roles.contains(&BifrostRuntimeRole::Scribe),
+            oracle: roles.contains(&BifrostRuntimeRole::Oracle),
+            forge: roles.contains(&BifrostRuntimeRole::ForgeCoordinator)
+                || roles.contains(&BifrostRuntimeRole::ForgeWorker),
+        };
+        let gateway_bytes = if roles.gateway { server_bytes / 4 } else { 0 };
+        let outbox_bytes = server_bytes / 4;
+        let other_server_bytes = server_bytes
+            .checked_sub(gateway_bytes)
+            .and_then(|rest| rest.checked_sub(outbox_bytes))
+            .ok_or_else(|| overflow("other server headroom"))?;
+
+        let cpu_budget = effective_cpu.saturating_sub(2).max(2);
+        let derived_ingress = (cpu_budget / 3).max(1);
+        let scribe_coordination = scribe.coordination_threads.unwrap_or(effective_cpu.max(2));
+        let scribe_ingress = scribe.ingress_cpu_threads.unwrap_or(derived_ingress);
+        let scribe_persistence = scribe
+            .persistence_cpu_threads
+            .unwrap_or_else(|| cpu_budget.saturating_sub(derived_ingress).max(1));
+
+        let ingest_request_bytes = scribe.ingest_request_bytes;
+        let derived_item_bytes = outbox_bytes / 2;
+        let outbox_item_bytes = scribe
+            .outbox_bytes
+            .map_or(derived_item_bytes, |cap| cap.min(derived_item_bytes));
+        let outbox_work_bytes = outbox_bytes - derived_item_bytes;
+        let derived_items = outbox_item_bytes / size_of::<crate::scribe_outbox::ScribeWrite>();
+        let outbox_items = scribe
+            .outbox_capacity
+            .map_or(derived_items, |cap| cap.min(derived_items));
+        let frame_pair_bytes = ingest_request_bytes
+            .checked_mul(2)
+            .filter(|bytes| *bytes > 0)
+            .ok_or_else(|| overflow("the outbox frame workspace"))?;
+        let frame_slots = effective_cpu
+            .checked_mul(2)
+            .ok_or_else(|| overflow("outbox frame slots"))?
+            .min(outbox_work_bytes / frame_pair_bytes);
+        let serving_connections =
+            usize::try_from(connections.app).map_err(|_| overflow("app pool connections"))?;
+        let (writers_limited_by, outbox_writers) = least(&[
+            ("cpu", effective_cpu),
+            ("app_pool", serving_connections),
+            ("frame_slots", frame_slots),
+        ]);
+        let batch_bytes = outbox_item_bytes
+            .checked_div(outbox_writers)
+            .unwrap_or(0)
+            .min(OUTBOX_BATCH_BYTES_CEILING);
+
+        let provider_response_bytes =
+            skald_providers::TransportConfig::default().max_response_bytes;
+        let json_request_bytes = self.limits.body_bytes;
+        let gateway_concurrency_limit = self.limits.concurrency;
+        let retained = gateway_bytes / 2;
+        let gateway_control_bytes = retained / 16;
+        let gateway_retained_bytes = retained - gateway_control_bytes;
+        let capture_work_bytes = gateway_bytes - retained;
+        let (slots_limited_by, gateway_slots) = if roles.gateway {
+            let call_bytes = json_request_bytes
+                .checked_add(crate::components::gateway::ADMITTED_CALL_BYTES)
+                .ok_or_else(|| overflow("one gateway call"))?;
+            let mut terms = vec![
+                (
+                    "cpu",
+                    effective_cpu
+                        .checked_mul(8)
+                        .ok_or_else(|| overflow("gateway slots"))?,
+                ),
+                ("memory", gateway_retained_bytes / call_bytes),
+            ];
+            terms.extend(gateway_concurrency_limit.map(|limit| ("configured", limit)));
+            least(&terms)
+        } else {
+            ("disabled", 0)
+        };
+        let capture_jobs = if roles.gateway {
+            let decode_pair_bytes = provider_response_bytes
+                .checked_mul(2)
+                .filter(|bytes| *bytes > 0)
+                .ok_or_else(|| overflow("capture workspace"))?;
+            (effective_cpu / 4)
+                .max(1)
+                .min(capture_work_bytes / decode_pair_bytes)
+        } else {
+            0
+        };
+
+        let mut required = vec![
+            ("outbox items", outbox_items),
+            (
+                "outbox frame slots (encoding workspace below two ingest requests)",
+                frame_slots,
+            ),
+            ("outbox writers", outbox_writers),
+            ("outbox batch bytes", batch_bytes),
+        ];
+        if roles.scribe {
+            required.extend([
+                ("scribe coordination threads", scribe_coordination),
+                ("scribe ingress threads", scribe_ingress),
+                ("scribe persistence threads", scribe_persistence),
+            ]);
+        }
+        if roles.gateway {
+            required.extend([
+                ("gateway slots", gateway_slots),
+                ("gateway control bytes", gateway_control_bytes),
+                (
+                    "capture jobs (workspace below two provider responses)",
+                    capture_jobs,
+                ),
+            ]);
+        }
+        if let Some((name, _)) = required.iter().find(|(_, value)| *value == 0) {
+            return Err(invalid(format!(
+                "startup allocation leaves zero {name} in a {server_bytes}-byte server \
+                 envelope at {effective_cpu} CPUs"
+            )));
+        }
+
+        Ok(ServerAllocation {
+            inputs: AllocationInputs {
+                detected_memory_bytes: snapshot.memory_limit_bytes,
+                memory_source: resource_source_label(snapshot.memory_source),
+                detected_cpu: snapshot.effective_cpu,
+                cpu_source: resource_source_label(snapshot.cpu_source),
+                process_memory_limit_bytes: self.resources.memory_limit_bytes,
+                effective_cpu_limit: resources.effective_cpu,
+                server_memory_min_bytes,
+                bifrost_memory_limit_bytes: resources.memory_limit_bytes,
+                outbox_bytes_limit: scribe.outbox_bytes,
+                outbox_capacity_limit: scribe.outbox_capacity,
+                gateway_concurrency_limit,
+                scribe_coordination_threads: scribe.coordination_threads,
+                scribe_ingress_cpu_threads: scribe.ingress_cpu_threads,
+                scribe_persistence_cpu_threads: scribe.persistence_cpu_threads,
+                ingest_request_bytes,
+                provider_response_bytes,
+                json_request_bytes,
+            },
+            roles,
+            connections,
+            limited_by: AllocationLimits {
+                outbox_writers: writers_limited_by,
+                gateway_slots: slots_limited_by,
+            },
+            effective_cpu,
+            process_bytes,
+            server_bytes,
+            gateway_bytes,
+            outbox_bytes,
+            other_server_bytes,
+            bifrost_bytes,
+            serving_connections,
+            http_workers: owns_runtime.then_some(effective_cpu),
+            scribe_coordination,
+            scribe_ingress,
+            scribe_persistence,
+            outbox_item_bytes,
+            outbox_work_bytes,
+            outbox_items,
+            outbox_writers,
+            tenant_lanes: outbox_writers,
+            frame_slots,
+            batch_bytes,
+            gateway_slots,
+            gateway_retained_bytes,
+            gateway_control_bytes,
+            capture_work_bytes,
+            capture_jobs,
+        })
+    }
 }
 
 fn default_scribe_wal_io_threads() -> usize {
@@ -1471,16 +1967,6 @@ fn default_scribe_wal_io_threads() -> usize {
 /// Returns the default for [`ScribeRuntimeConfig::ingest_request_bytes`].
 fn default_ingest_request_bytes() -> usize {
     vala_bifrost_redux::gate::limits::BIFROST_INGEST_REQUEST_LIMIT_BYTES
-}
-
-/// Returns the default for [`ScribeRuntimeConfig::outbox_capacity`].
-fn default_outbox_capacity() -> usize {
-    crate::scribe_outbox::SCRIBE_CAPACITY
-}
-
-/// Returns the default for [`ScribeRuntimeConfig::outbox_bytes`].
-fn default_outbox_bytes() -> usize {
-    crate::scribe_outbox::SCRIBE_BYTES
 }
 
 /// Bytes in one megabyte of the megabyte-valued Scribe size settings.
@@ -1519,13 +2005,13 @@ fn default_ingest_wal_workspace_bytes() -> usize {
 impl Default for ScribeRuntimeConfig {
     fn default() -> Self {
         Self {
-            coordination_threads: default_scribe_coordination_threads(),
-            ingress_cpu_threads: default_scribe_ingress_cpu_threads(),
-            persistence_cpu_threads: default_scribe_persistence_cpu_threads(),
+            coordination_threads: None,
+            ingress_cpu_threads: None,
+            persistence_cpu_threads: None,
             wal_io_threads: default_scribe_wal_io_threads(),
             ingest_request_bytes: default_ingest_request_bytes(),
-            outbox_capacity: default_outbox_capacity(),
-            outbox_bytes: default_outbox_bytes(),
+            outbox_capacity: None,
+            outbox_bytes: None,
             shard_count: default_scribe_shard_count(),
             max_file_size_on_disk: default_scribe_max_file_size_on_disk(),
             max_file_size_in_memory: default_scribe_max_file_size_in_memory(),
@@ -1563,9 +2049,12 @@ impl ScribeRuntimeConfig {
             ("coordination_threads", self.coordination_threads),
             ("ingress_cpu_threads", self.ingress_cpu_threads),
             ("persistence_cpu_threads", self.persistence_cpu_threads),
-            ("wal_io_threads", self.wal_io_threads),
+            ("wal_io_threads", Some(self.wal_io_threads)),
         ];
-        if let Some((name, _value)) = thread_values.into_iter().find(|(_, value)| *value == 0) {
+        if let Some((name, _value)) = thread_values
+            .into_iter()
+            .find(|(_, value)| *value == Some(0))
+        {
             return Err(format!("scribe.{name} must be at least 1"));
         }
         let rotation_values = [
@@ -1594,10 +2083,10 @@ impl ScribeRuntimeConfig {
         if self.ingest_request_bytes == 0 {
             return Err("scribe.ingest_request_bytes must be at least 1".to_owned());
         }
-        if self.outbox_capacity == 0 {
+        if self.outbox_capacity == Some(0) {
             return Err("scribe.outbox_capacity must be at least 1".to_owned());
         }
-        if self.outbox_bytes == 0 {
+        if self.outbox_bytes == Some(0) {
             return Err("scribe.outbox_bytes must be at least 1".to_owned());
         }
         if self
@@ -2277,6 +2766,9 @@ pub struct WyrdServerConfig {
     /// Transport-selection configuration.
     #[serde(default)]
     pub serve: ServeConfig,
+    /// Process-wide resource caps applied before any startup grant.
+    #[serde(default)]
+    pub resources: ProcessResourceConfig,
     /// Role-aware Bifrost runtime configuration.
     #[serde(default)]
     pub bifrost: BifrostRuntimeConfig,
@@ -2375,9 +2867,13 @@ pub struct LimitsConfig {
     /// Per-request processing timeout in milliseconds.
     #[serde(default = "default_timeout_ms")]
     pub timeout_ms: u64,
-    /// Maximum number of in-flight concurrent requests.
-    #[serde(default = "default_concurrency")]
-    pub concurrency: usize,
+    /// Optional ceiling on in-flight concurrent requests.
+    ///
+    /// Unset, the HTTP edge admits [`DEFAULT_HTTP_CONCURRENCY`] requests and
+    /// gateway call slots derive from the startup allocation alone; set, it
+    /// also caps those slots.
+    #[serde(default)]
+    pub concurrency: Option<usize>,
 }
 
 impl LimitsConfig {
@@ -2388,7 +2884,7 @@ impl LimitsConfig {
             body_bytes: self.body_bytes,
             audio_upload_bytes: self.audio_upload_bytes,
             timeout: Duration::from_millis(self.timeout_ms),
-            concurrency: self.concurrency,
+            concurrency: self.concurrency.unwrap_or(DEFAULT_HTTP_CONCURRENCY),
         }
     }
 }
@@ -2824,9 +3320,8 @@ fn default_timeout_ms() -> u64 {
     30_000
 }
 
-fn default_concurrency() -> usize {
-    1_024
-}
+/// HTTP edge concurrency when `limits.concurrency` is unset.
+pub const DEFAULT_HTTP_CONCURRENCY: usize = 1_024;
 
 /// Serde default for [`ShutdownConfig::drain_ms`].
 ///
@@ -2881,7 +3376,7 @@ impl Default for LimitsConfig {
             body_bytes: default_body_bytes(),
             audio_upload_bytes: default_audio_upload_bytes(),
             timeout_ms: default_timeout_ms(),
-            concurrency: default_concurrency(),
+            concurrency: None,
         }
     }
 }
@@ -3002,6 +3497,10 @@ impl WyrdServerConfig {
                 }
             };
         }
+        self.resources.memory_limit_bytes = parse_optional_env(
+            "WYRD_PROCESS_MEMORY_LIMIT_BYTES",
+            self.resources.memory_limit_bytes,
+        )?;
         self.bifrost.resources.memory_limit_bytes = parse_optional_env(
             "WYRD_BIFROST_MEMORY_LIMIT_BYTES",
             self.bifrost.resources.memory_limit_bytes,
@@ -3212,10 +3711,11 @@ impl WyrdServerConfig {
 
         // limits.concurrency
         if let Some(val) = env_opt("WYRD_HTTP_CONCURRENCY_LIMIT")? {
-            self.limits.concurrency = val.parse::<usize>().map_err(|e| ConfigError::BadEnvVar {
-                key: "WYRD_HTTP_CONCURRENCY_LIMIT".to_string(),
-                message: e.to_string(),
-            })?;
+            self.limits.concurrency =
+                Some(val.parse::<usize>().map_err(|e| ConfigError::BadEnvVar {
+                    key: "WYRD_HTTP_CONCURRENCY_LIMIT".to_string(),
+                    message: e.to_string(),
+                })?);
         }
 
         // shutdown.drain_ms
@@ -3494,11 +3994,12 @@ impl WyrdServerConfig {
             }
 
             // 6. limits.concurrency in [1, 1_048_576]
-            if self.limits.concurrency < 1 || self.limits.concurrency > 1_048_576 {
+            if let Some(concurrency) = self.limits.concurrency
+                && !(1..=1_048_576).contains(&concurrency)
+            {
                 return Err(ConfigError::Invalid {
                     message: format!(
-                        "limits.concurrency must be in [1, 1048576], got {}",
-                        self.limits.concurrency
+                        "limits.concurrency must be in [1, 1048576], got {concurrency}"
                     ),
                 });
             }
@@ -3916,6 +4417,376 @@ mod tests {
     /// Serialize env-var tests so concurrent test threads cannot interfere.
     static ENV_LOCK: Mutex<()> = Mutex::new(());
 
+    /// Pool maxima the allocation tests derive from: the documented app pool
+    /// of 16 bounds outbox writers.
+    const TEST_CONNECTIONS: ConnectionBudget = ConnectionBudget {
+        app: 16,
+        vala: 16,
+        platform_admin: 2,
+    };
+    const MIB: usize = 1024 * 1024;
+    const GIB: usize = 1024 * MIB;
+
+    /// One startup observation of `cpu` CPUs and `memory` bytes from `source`.
+    fn observation(cpu: usize, memory: usize, source: ResourceSource) -> SystemResourceSnapshot {
+        SystemResourceSnapshot {
+            memory_limit_bytes: memory,
+            effective_cpu: cpu,
+            scratch_capacity_bytes: 64 * GIB as u64,
+            scratch_available_bytes: 64 * GIB as u64,
+            memory_source: source,
+            cpu_source: source,
+        }
+    }
+
+    /// Allocates `config` over an injected observation.
+    fn allocate(
+        config: &WyrdServerConfig,
+        cpu: usize,
+        memory: usize,
+    ) -> Result<ServerAllocation, ConfigError> {
+        config.server_allocation(
+            &observation(cpu, memory, ResourceSource::Injected),
+            TEST_CONNECTIONS,
+            true,
+        )
+    }
+
+    /// One startup observation partitions into disjoint server and Bifrost
+    /// envelopes, and every pool, worker, and gateway grant follows the
+    /// documented formula at each CPU and memory step.
+    ///
+    /// # Panics
+    ///
+    /// Panics when a grant drifts from its formula, the envelopes overlap or
+    /// leave memory unassigned, or a non-gateway target keeps a gateway share.
+    #[test]
+    fn server_allocations_partition_one_snapshot() {
+        let item = size_of::<crate::scribe_outbox::ScribeWrite>();
+        let config = WyrdServerConfig::default();
+        let example = allocate(&config, 8, 32 * GIB).expect("the documented example allocates");
+        assert_eq!(
+            (
+                example.process_bytes,
+                example.server_bytes,
+                example.gateway_bytes,
+                example.outbox_bytes,
+                example.other_server_bytes,
+                example.bifrost_bytes,
+            ),
+            (32 * GIB, 8 * GIB, 2 * GIB, 2 * GIB, 4 * GIB, 24 * GIB)
+        );
+        assert_eq!(
+            (
+                example.http_workers,
+                example.scribe_coordination,
+                example.scribe_ingress,
+                example.scribe_persistence,
+            ),
+            (Some(8), 8, 2, 4)
+        );
+        assert_eq!(
+            (
+                example.outbox_item_bytes,
+                example.outbox_work_bytes,
+                example.outbox_items,
+                example.frame_slots,
+                example.outbox_writers,
+                example.tenant_lanes,
+                example.batch_bytes,
+            ),
+            (GIB, GIB, GIB / item, 16, 8, 8, 32 * MIB)
+        );
+        assert_eq!(
+            (
+                example.gateway_retained_bytes,
+                example.gateway_control_bytes,
+                example.capture_work_bytes,
+                example.gateway_slots,
+                example.capture_jobs,
+            ),
+            (GIB - 64 * MIB, 64 * MIB, GIB, 64, 2)
+        );
+        assert_eq!(
+            (
+                example.limited_by.outbox_writers,
+                example.limited_by.gateway_slots
+            ),
+            ("cpu", "cpu")
+        );
+        let bifrost = example.bifrost_snapshot(observation(8, 32 * GIB, ResourceSource::Injected));
+        assert_eq!(bifrost.memory_limit_bytes, 32 * GIB);
+        assert_eq!(bifrost.memory_source, ResourceSource::Injected);
+
+        // (cpu, memory) -> (H, G, B, coordination, ingress, persistence,
+        // frames, writers, batch, slots, capture jobs)
+        for (cpu, memory, expected) in [
+            (
+                4,
+                32 * GIB,
+                (8 * GIB, 2 * GIB, 24 * GIB, 4, 1, 1, 8, 4, 32 * MIB, 32, 1),
+            ),
+            (
+                16,
+                32 * GIB,
+                (
+                    8 * GIB,
+                    2 * GIB,
+                    24 * GIB,
+                    16,
+                    4,
+                    10,
+                    32,
+                    16,
+                    32 * MIB,
+                    128,
+                    4,
+                ),
+            ),
+            (
+                8,
+                8 * GIB,
+                (2 * GIB, 512 * MIB, 6 * GIB, 8, 2, 4, 8, 8, 32 * MIB, 64, 2),
+            ),
+            (
+                8,
+                16 * GIB,
+                (4 * GIB, GIB, 12 * GIB, 8, 2, 4, 16, 8, 32 * MIB, 64, 2),
+            ),
+        ] {
+            let grant = allocate(&config, cpu, memory).expect("the table step allocates");
+            assert_eq!(
+                (
+                    grant.server_bytes,
+                    grant.gateway_bytes,
+                    grant.bifrost_bytes,
+                    grant.scribe_coordination,
+                    grant.scribe_ingress,
+                    grant.scribe_persistence,
+                    grant.frame_slots,
+                    grant.outbox_writers,
+                    grant.batch_bytes,
+                    grant.gateway_slots,
+                    grant.capture_jobs,
+                ),
+                expected,
+                "{cpu} CPUs, {memory} bytes"
+            );
+            assert_eq!(grant.server_bytes + grant.bifrost_bytes, memory);
+            assert_eq!(
+                grant.gateway_bytes + grant.outbox_bytes + grant.other_server_bytes,
+                grant.server_bytes
+            );
+            assert_eq!(grant.http_workers, Some(cpu));
+        }
+
+        for target in [BifrostTarget::ForgeWorker, BifrostTarget::Scribe] {
+            let config = WyrdServerConfig {
+                role: target,
+                ..WyrdServerConfig::default()
+            };
+            let grant = allocate(&config, 8, 32 * GIB).expect("every target allocates");
+            assert_eq!(grant.roles.gateway, target.serves_api());
+            let gateway = if target.serves_api() { 2 * GIB } else { 0 };
+            assert_eq!(grant.gateway_bytes, gateway, "{target:?}");
+            assert_eq!(grant.other_server_bytes, 6 * GIB - gateway, "{target:?}");
+            assert_eq!(
+                grant.outbox_bytes,
+                2 * GIB,
+                "{target:?} still composes the outbox"
+            );
+            assert_eq!(grant.bifrost_bytes, 24 * GIB);
+        }
+        let embedded = config
+            .server_allocation(
+                &observation(8, 32 * GIB, ResourceSource::Injected),
+                TEST_CONNECTIONS,
+                false,
+            )
+            .expect("an embedded server allocates");
+        assert_eq!(embedded.http_workers, None);
+    }
+
+    /// Explicit settings only lower detected or derived grants, explicit
+    /// values equal to the derived ones change nothing, the process cap reads
+    /// from the file and then the environment, and every impossible plan
+    /// refuses with a named configuration error instead of clamping.
+    ///
+    /// # Panics
+    ///
+    /// Panics when an override raises a grant, changes an equal derivation,
+    /// loses its environment precedence, or an impossible plan allocates.
+    #[test]
+    fn server_allocation_overrides_reject_impossible_plans() {
+        let item = size_of::<crate::scribe_outbox::ScribeWrite>();
+        let derived = allocate(&WyrdServerConfig::default(), 8, 32 * GIB).expect("default");
+
+        let mut explicit = WyrdServerConfig::default();
+        explicit.bifrost.scribe.outbox_bytes = Some(GIB);
+        explicit.bifrost.scribe.outbox_capacity = Some(GIB / item);
+        explicit.bifrost.scribe.coordination_threads = Some(8);
+        explicit.bifrost.scribe.ingress_cpu_threads = Some(2);
+        explicit.bifrost.scribe.persistence_cpu_threads = Some(4);
+        explicit.limits.concurrency = Some(64);
+        explicit.resources.memory_limit_bytes = Some(32 * GIB);
+        explicit.bifrost.resources.effective_cpu = Some(8);
+        let same = allocate(&explicit, 8, 32 * GIB).expect("explicit equal values allocate");
+        assert_eq!(
+            ServerAllocation {
+                inputs: derived.inputs,
+                limited_by: derived.limited_by,
+                ..same
+            },
+            derived
+        );
+
+        let mut lowered = WyrdServerConfig::default();
+        lowered.bifrost.scribe.outbox_bytes = Some(64 * MIB);
+        lowered.bifrost.scribe.outbox_capacity = Some(10);
+        lowered.bifrost.resources.effective_cpu = Some(4);
+        lowered.limits.concurrency = Some(5);
+        let grant = allocate(&lowered, 8, 32 * GIB).expect("lower caps allocate");
+        assert_eq!(
+            (
+                grant.effective_cpu,
+                grant.outbox_item_bytes,
+                grant.outbox_work_bytes,
+                grant.outbox_items,
+                grant.outbox_writers,
+                grant.batch_bytes,
+                grant.gateway_slots,
+                grant.limited_by.gateway_slots,
+            ),
+            (4, 64 * MIB, GIB, 10, 4, 16 * MIB, 5, "configured")
+        );
+        let mut large = WyrdServerConfig::default();
+        large.bifrost.scribe.outbox_bytes = Some(8 * GIB);
+        large.bifrost.scribe.outbox_capacity = Some(usize::MAX);
+        let grant = allocate(&large, 8, 32 * GIB).expect("caps above derivation allocate");
+        assert_eq!(
+            (grant.outbox_item_bytes, grant.outbox_items),
+            (GIB, GIB / item)
+        );
+
+        {
+            let _guard = ENV_LOCK.lock().expect("environment test lock");
+            let file = from_toml_str_with_dev_oracle_opt_in(
+                "[resources]\nmemory_limit_bytes = 8589934592\n",
+            )
+            .expect("the process cap parses");
+            let grant = allocate(&file, 8, 32 * GIB).expect("the file cap allocates");
+            assert_eq!(
+                (grant.process_bytes, grant.server_bytes),
+                (8 * GIB, 2 * GIB)
+            );
+            temp_env::with_vars(
+                [("WYRD_PROCESS_MEMORY_LIMIT_BYTES", Some("17179869184"))],
+                || {
+                    let mut config = file.clone();
+                    config.apply_env_overrides().expect("the env cap applies");
+                    let grant = allocate(&config, 8, 32 * GIB).expect("the env cap allocates");
+                    assert_eq!(
+                        (grant.process_bytes, grant.server_bytes, grant.bifrost_bytes),
+                        (16 * GIB, 4 * GIB, 12 * GIB)
+                    );
+                },
+            );
+        }
+
+        let refuse = |name: &str, config: &WyrdServerConfig, snapshot: SystemResourceSnapshot| {
+            assert!(
+                matches!(
+                    config.server_allocation(&snapshot, TEST_CONNECTIONS, true),
+                    Err(ConfigError::Invalid { .. })
+                ),
+                "{name} must refuse"
+            );
+        };
+        let host = observation(8, 32 * GIB, ResourceSource::Injected);
+        let with = |edit: fn(&mut WyrdServerConfig)| {
+            let mut config = WyrdServerConfig::default();
+            edit(&mut config);
+            config
+        };
+        refuse(
+            "zero process cap",
+            &with(|c| c.resources.memory_limit_bytes = Some(0)),
+            host,
+        );
+        refuse(
+            "process cap above detection",
+            &with(|c| c.resources.memory_limit_bytes = Some(64 * GIB)),
+            host,
+        );
+        refuse(
+            "zero CPU cap",
+            &with(|c| c.bifrost.resources.effective_cpu = Some(0)),
+            host,
+        );
+        refuse(
+            "CPU cap above detection",
+            &with(|c| c.bifrost.resources.effective_cpu = Some(16)),
+            host,
+        );
+        refuse(
+            "server minimum below the floor",
+            &with(|c| c.bifrost.resources.server_memory_min_bytes = Some(GIB - 1)),
+            host,
+        );
+        refuse(
+            "server envelope consuming all memory",
+            &with(|c| c.bifrost.resources.server_memory_min_bytes = Some(32 * GIB)),
+            host,
+        );
+        refuse(
+            "zero Bifrost cap",
+            &with(|c| c.bifrost.resources.memory_limit_bytes = Some(0)),
+            host,
+        );
+        refuse(
+            "Bifrost cap above M - H",
+            &with(|c| c.bifrost.resources.memory_limit_bytes = Some(24 * GIB + 1)),
+            host,
+        );
+        refuse(
+            "overflowing ingest frames",
+            &with(|c| c.bifrost.scribe.ingest_request_bytes = usize::MAX),
+            host,
+        );
+        refuse(
+            "ingest frames larger than the workspace",
+            &with(|c| c.bifrost.scribe.ingest_request_bytes = GIB),
+            host,
+        );
+        refuse(
+            "overflowing gateway calls",
+            &with(|c| c.limits.body_bytes = usize::MAX),
+            host,
+        );
+        refuse(
+            "gateway calls larger than the retained share",
+            &with(|c| c.limits.body_bytes = 2 * GIB),
+            host,
+        );
+        refuse(
+            "zero explicit Scribe threads",
+            &with(|c| c.bifrost.scribe.persistence_cpu_threads = Some(0)),
+            host,
+        );
+        refuse(
+            "overflowing CPU",
+            &WyrdServerConfig::default(),
+            observation(usize::MAX, 32 * GIB, ResourceSource::Injected),
+        );
+        refuse(
+            "live memory below the pod floor",
+            &WyrdServerConfig::default(),
+            observation(8, 2 * GIB, ResourceSource::Host),
+        );
+        allocate(&WyrdServerConfig::default(), 8, 2 * GIB)
+            .expect("an injected test observation skips only the pod floor");
+    }
+
     // ── helpers ──────────────────────────────────────────────────────────────
 
     /// Parse a TOML test fixture and explicitly allow an unapproved development Oracle profile.
@@ -3969,14 +4840,14 @@ mod tests {
             role: BifrostTarget::ForgeWorker,
             ..WyrdServerConfig::default()
         };
-        config.bifrost.scribe.coordination_threads = 0;
+        config.bifrost.scribe.coordination_threads = Some(0);
         config.bifrost.oracle.admission_waiters = 0;
         config.bifrost.oracle.calibration_profile = PathBuf::from("/\0malformed");
         config.http.bind = config.grpc.bind;
         config.grpc.reflection_enabled = true;
         config.limits.body_bytes = 0;
         config.limits.timeout_ms = 0;
-        config.limits.concurrency = 0;
+        config.limits.concurrency = Some(0);
         config.readiness.tick_ms = 0;
         config.readiness.probe_timeout_ms = 0;
         config.metrics.enabled = false;
@@ -3995,11 +4866,11 @@ mod tests {
                 role,
                 ..WyrdServerConfig::default()
             };
-            config.bifrost.scribe.coordination_threads = 0;
+            config.bifrost.scribe.coordination_threads = Some(0);
             config.grpc.reflection_enabled = true;
             config.limits.body_bytes = 0;
             config.limits.timeout_ms = 0;
-            config.limits.concurrency = 0;
+            config.limits.concurrency = Some(0);
             config.readiness.tick_ms = 0;
             config.readiness.probe_timeout_ms = 0;
             config.metrics.enabled = false;
@@ -4079,8 +4950,9 @@ maintenance_interval_secs = 45
     /// The server memory minimum and the shared Bifrost cap resolve to one
     /// boot plan or one boot error, and the removed settings have no alias.
     ///
-    /// An 8-GiB observation yields 1-GiB server headroom and a 7-GiB cap by
-    /// default; the file and `WYRD_SERVER_MEMORY_MIN_BYTES` raise the minimum,
+    /// An 8-GiB observation yields a 2-GiB server envelope (a quarter of
+    /// memory, above the 1-GiB minimum) and a 6-GiB cap by default; the file
+    /// and `WYRD_SERVER_MEMORY_MIN_BYTES` raise the minimum,
     /// `WYRD_BIFROST_MEMORY_LIMIT_BYTES` lowers the cap, and an impossible
     /// combination refuses. The deleted unmanaged-reserve and Forge-budget
     /// settings are rejected by `deny_unknown_fields`, and their environment
@@ -4093,22 +4965,26 @@ maintenance_interval_secs = 45
     #[test]
     fn server_memory_minimum_rejects_impossible_plan() {
         use vala_bifrost_redux::resources::{
-            BifrostResourceError, BifrostRole, BifrostRuntimeResources, ResourceSource,
-            SystemResourceSnapshot,
+            BifrostRole, BifrostRuntimeResources, ResourceSource, SystemResourceSnapshot,
         };
         const GIB: usize = 1024 * 1024 * 1024;
         let _guard = ENV_LOCK.lock().expect("environment test lock");
         let resolve = |config: &WyrdServerConfig| {
+            let snapshot = SystemResourceSnapshot {
+                memory_limit_bytes: 8 * GIB,
+                effective_cpu: 4,
+                scratch_capacity_bytes: 64 * GIB as u64,
+                scratch_available_bytes: 64 * GIB as u64,
+                memory_source: ResourceSource::Injected,
+                cpu_source: ResourceSource::Injected,
+            };
+            let allocation = config
+                .server_allocation(&snapshot, TEST_CONNECTIONS, false)
+                .map_err(|error| error.to_string())?;
             BifrostRuntimeResources::from_snapshot(
-                SystemResourceSnapshot {
-                    memory_limit_bytes: 8 * GIB,
-                    effective_cpu: 4,
-                    scratch_capacity_bytes: 64 * GIB as u64,
-                    scratch_available_bytes: 64 * GIB as u64,
-                    memory_source: ResourceSource::Injected,
-                    cpu_source: ResourceSource::Injected,
-                },
+                allocation.bifrost_snapshot(snapshot),
                 config.bifrost.resources.policy(
+                    &allocation,
                     [BifrostRole::Scribe, BifrostRole::Oracle, BifrostRole::Forge]
                         .into_iter()
                         .collect(),
@@ -4120,23 +4996,24 @@ maintenance_interval_secs = 45
                 let plan = runtime.plan();
                 (plan.server_memory_min_bytes, plan.managed_memory_bytes)
             })
+            .map_err(|error| error.to_string())
         };
 
         let bare = from_toml_str_with_dev_oracle_opt_in("").expect("empty config parses");
-        assert_eq!(resolve(&bare).expect("default plan"), (GIB, 7 * GIB));
+        assert_eq!(resolve(&bare).expect("default plan"), (2 * GIB, 6 * GIB));
         let raised = from_toml_str_with_dev_oracle_opt_in(
-            "[bifrost.resources]\nserver_memory_min_bytes = 2147483648\n",
+            "[bifrost.resources]\nserver_memory_min_bytes = 3221225472\n",
         )
         .expect("the minimum parses from the resource section");
         assert_eq!(
             resolve(&raised).expect("raised minimum"),
-            (2 * GIB, 6 * GIB)
+            (3 * GIB, 5 * GIB)
         );
 
         temp_env::with_vars(
             [
-                ("WYRD_SERVER_MEMORY_MIN_BYTES", Some("3221225472")),
-                ("WYRD_BIFROST_MEMORY_LIMIT_BYTES", Some("4294967296")),
+                ("WYRD_SERVER_MEMORY_MIN_BYTES", Some("4294967296")),
+                ("WYRD_BIFROST_MEMORY_LIMIT_BYTES", Some("3221225472")),
                 ("WYRD_BIFROST_UNMANAGED_RESERVE_BYTES", Some("1")),
                 (
                     "WYRD_BIFROST_FORGE_COMPACTION_MEMORY_LIMIT_BYTES",
@@ -4148,7 +5025,7 @@ maintenance_interval_secs = 45
                 config
                     .apply_env_overrides()
                     .expect("the documented overrides apply and removed ones are inert");
-                assert_eq!(resolve(&config).expect("env plan"), (3 * GIB, 4 * GIB));
+                assert_eq!(resolve(&config).expect("env plan"), (4 * GIB, 3 * GIB));
             },
         );
 
@@ -4156,19 +5033,13 @@ maintenance_interval_secs = 45
             "server_memory_min_bytes = 1073741823",
             "server_memory_min_bytes = 8589934592",
             "memory_limit_bytes = 0",
-            "memory_limit_bytes = 7516192769",
+            "memory_limit_bytes = 6442450945",
         ] {
             let config = from_toml_str_with_dev_oracle_opt_in(&format!(
                 "[bifrost.resources]\n{impossible}\n"
             ))
             .expect("an impossible value still parses");
-            assert!(
-                matches!(
-                    resolve(&config),
-                    Err(BifrostResourceError::InvalidPlan { .. })
-                ),
-                "{impossible} must refuse boot"
-            );
+            assert!(resolve(&config).is_err(), "{impossible} must refuse boot");
         }
         for removed in [
             "unmanaged_reserve_bytes = 268435456",
@@ -4977,10 +5848,16 @@ minimum_slots = 2
     #[test]
     fn scribe_runtime_defaults_match_configured_ingest_contract() {
         let cfg = ScribeRuntimeConfig::default();
-        assert!(
-            cfg.coordination_threads >= 2,
-            "coordination threads {} must keep the two-thread floor",
-            cfg.coordination_threads
+        assert_eq!(
+            (
+                cfg.coordination_threads,
+                cfg.ingress_cpu_threads,
+                cfg.persistence_cpu_threads,
+                cfg.outbox_capacity,
+                cfg.outbox_bytes,
+            ),
+            (None, None, None, None, None),
+            "omitted worker and outbox settings derive from the startup allocation"
         );
         assert_eq!(
             cfg.ingest_request_bytes,
@@ -5080,9 +5957,9 @@ minimum_slots = 2
                 assert!(error.contains(stringify!($field)), "{error}");
             }};
         }
-        assert_rejected!(coordination_threads, 0);
-        assert_rejected!(ingress_cpu_threads, 0);
-        assert_rejected!(persistence_cpu_threads, 0);
+        assert_rejected!(coordination_threads, Some(0));
+        assert_rejected!(ingress_cpu_threads, Some(0));
+        assert_rejected!(persistence_cpu_threads, Some(0));
         assert_rejected!(wal_io_threads, 0);
         assert_rejected!(shard_count, 0);
         assert_rejected!(max_file_size_on_disk, 0);

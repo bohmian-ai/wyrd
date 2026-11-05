@@ -171,20 +171,28 @@ fn main() -> std::process::ExitCode {
 /// default serve path stays exactly what it was before the administrative
 /// subcommands existed; each subcommand owns its own exit code.
 ///
+/// Serving builds its own runtime from the startup allocation; each
+/// administrative subcommand runs on a default runtime.
+///
 /// # Panics
 /// Panics when argument parsing fails, which `clap` reports to the terminal
 /// before exiting.
-#[tokio::main]
-async fn server_main() {
-    // Parse the CLI before any telemetry/serve init so the serve path on the
-    // `None` arm stays byte-for-byte today's `run()`.
+fn server_main() {
     let cli = Cli::parse();
     let result = match cli.command {
-        None => Box::pin(run(cli.mode)).await,
-        Some(Command::Init) => init().await,
-        Some(Command::RecoverRoot) => recover_root().await,
-        Some(Command::Migrate) => migrate().await,
-        Some(Command::Setup(args)) => setup(args).await,
+        None => run(cli.mode),
+        Some(command) => tokio::runtime::Runtime::new()
+            .map_err(|error| BootExit::Other(Box::new(error)))
+            .and_then(|runtime| {
+                runtime.block_on(async {
+                    match command {
+                        Command::Init => init().await,
+                        Command::RecoverRoot => recover_root().await,
+                        Command::Migrate => migrate().await,
+                        Command::Setup(args) => setup(args).await,
+                    }
+                })
+            }),
     };
 
     let exit_code = match result {

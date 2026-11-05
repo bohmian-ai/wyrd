@@ -364,6 +364,9 @@ pub(crate) fn test_prometheus_handle() -> PrometheusHandle {
 /// The metrics listener's read-only benchmark timing snapshot route.
 pub const BENCHMARK_TIMINGS_PATH: &str = "/benchmark/timings";
 
+/// Loopback route serving the process's startup allocation as JSON.
+pub const BENCHMARK_ALLOCATION_PATH: &str = "/benchmark/allocation";
+
 /// Build the metrics router: `GET /metrics` renders the Prometheus snapshot.
 ///
 /// With `benchmark_snapshot`, which configuration allows only on a loopback
@@ -371,17 +374,28 @@ pub const BENCHMARK_TIMINGS_PATH: &str = "/benchmark/timings";
 /// `GET` [`BENCHMARK_TIMINGS_PATH`] returns their cumulative
 /// [`wyrd_telemetry::timing::TimingSnapshot`] as JSON: bounded aggregate
 /// distributions and counters only, with no request identity, tenant,
-/// payload, query, or reset. The Prometheus recorder is untouched.
-pub fn metrics_router(handle: PrometheusHandle, benchmark_snapshot: bool) -> Router {
+/// payload, query, or reset. `GET` [`BENCHMARK_ALLOCATION_PATH`] returns the
+/// carried startup allocation, the same value boot logged as
+/// `startup_allocation`; it holds only counts, bytes, and source labels. The
+/// Prometheus recorder is untouched.
+pub fn metrics_router(
+    handle: PrometheusHandle,
+    benchmark_snapshot: Option<crate::config::ServerAllocation>,
+) -> Router {
     let router = Router::new().route("/metrics", get(move || ready(handle.render())));
-    if !benchmark_snapshot {
+    let Some(allocation) = benchmark_snapshot else {
         return router;
-    }
+    };
     wyrd_telemetry::timing::enable();
-    router.route(
-        BENCHMARK_TIMINGS_PATH,
-        get(|| ready(axum::Json(wyrd_telemetry::timing::snapshot()))),
-    )
+    router
+        .route(
+            BENCHMARK_TIMINGS_PATH,
+            get(|| ready(axum::Json(wyrd_telemetry::timing::snapshot()))),
+        )
+        .route(
+            BENCHMARK_ALLOCATION_PATH,
+            get(move || ready(axum::Json(allocation))),
+        )
 }
 
 /// Serve the metrics router on an already-bound `listener` until `shutdown`.
@@ -511,7 +525,7 @@ mod tests {
     #[tokio::test]
     async fn metrics_router_serves_metrics() {
         let handle = get_handle();
-        let router = metrics_router(handle.clone(), false);
+        let router = metrics_router(handle.clone(), None);
 
         let response = router
             .oneshot(
@@ -591,7 +605,10 @@ mod tests {
     #[tokio::test]
     async fn benchmark_timings_preserve_server_boundaries() {
         use std::time::Duration;
-        let router = metrics_router(get_handle().clone(), true);
+        let router = metrics_router(
+            get_handle().clone(),
+            Some(crate::config::ServerAllocation::for_test()),
+        );
         let before = timings(&router).await;
         let record = |boundary, elapsed: u64, excluded: Option<u64>| {
             wyrd_telemetry::record_timing(
@@ -681,12 +698,23 @@ mod tests {
     #[tokio::test]
     async fn benchmark_snapshots_are_local_read_only_and_opt_in() {
         let handle = get_handle();
-        let ordinary = metrics_router(handle.clone(), false);
+        let ordinary = metrics_router(handle.clone(), None);
+        for path in [BENCHMARK_TIMINGS_PATH, BENCHMARK_ALLOCATION_PATH] {
+            assert_eq!(fetch(&ordinary, "GET", path).await.0, StatusCode::NOT_FOUND);
+        }
+        let allocation = crate::config::ServerAllocation::for_test();
+        let router = metrics_router(handle.clone(), Some(allocation));
+        let (status, body) = fetch(&router, "GET", BENCHMARK_ALLOCATION_PATH).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
         assert_eq!(
-            fetch(&ordinary, "GET", BENCHMARK_TIMINGS_PATH).await.0,
-            StatusCode::NOT_FOUND
+            serde_json::from_str::<serde_json::Value>(&body).expect("the allocation is JSON"),
+            serde_json::to_value(allocation).expect("the allocation serializes"),
+            "the readout is the carried startup allocation"
         );
-        let router = metrics_router(handle.clone(), true);
+        assert_eq!(
+            fetch(&router, "POST", BENCHMARK_ALLOCATION_PATH).await.0,
+            StatusCode::METHOD_NOT_ALLOWED
+        );
         let secret = "tenant-7f3a-trace-4bf92f3577b34da6a3ce929d0e0e4736";
         let span = tracing::info_span!("request", tenant = secret);
         wyrd_telemetry::record_timing(

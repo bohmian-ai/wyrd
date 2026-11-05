@@ -162,6 +162,7 @@ pub fn shell_owners(
             deployment_profile: DeploymentProfile::Development,
             role: BifrostTarget::All,
             limits: LimitsConfig::default(),
+            allocation: crate::config::ServerAllocation::for_test(),
         },
         postgres,
         storage,

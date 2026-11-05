@@ -101,6 +101,8 @@ pub struct BifrostBuildInputs {
     pub data_root: BifrostDataRoot,
     /// Process shutdown signal injected into every selected owner.
     pub shutdown: CancellationToken,
+    /// Startup grants that size the Scribe pools and the process outbox.
+    pub allocation: crate::config::ServerAllocation,
     /// Focused production-control overrides consumed only by the shared test composer.
     #[cfg(feature = "test-support")]
     pub test_controls: Option<BifrostTestControls>,
@@ -2207,6 +2209,8 @@ pub struct ServerSettings {
     pub role: BifrostTarget,
     /// Request-shaping limits for the router middleware stack.
     pub limits: LimitsConfig,
+    /// Startup grants every owner was constructed with, kept for diagnostics.
+    pub allocation: crate::config::ServerAllocation,
 }
 
 impl ServerSettings {

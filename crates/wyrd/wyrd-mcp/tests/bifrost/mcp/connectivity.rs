@@ -273,6 +273,7 @@ mod pg_tests {
                 "bifrost.query",
                 "bifrost.validate_predicate",
                 "principals.list_credentials",
+                "principals.me",
                 "cards.get",
                 "cards.list",
                 "verification.get_binding",

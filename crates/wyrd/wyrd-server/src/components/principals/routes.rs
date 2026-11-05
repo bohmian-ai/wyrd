@@ -394,18 +394,15 @@ async fn create_service_principal(
     ),
     tag = "Principals"
 )]
-#[tracing::instrument(level = "info", skip(state, caller, recent, request))]
+#[tracing::instrument(level = "info", skip(state, caller, recent, body))]
 async fn issue_credential(
     State(state): State<AppState>,
     caller: Caller,
     recent: Option<Extension<RecentHumanLogin>>,
     principal_id: Result<Path<Uuid>, PathRejection>,
-    request: Result<Option<Json<CreateUserCredentialRequest>>, JsonRejection>,
+    body: axum::body::Bytes,
 ) -> Result<axum::response::Response, WyrdErrorResponse> {
     let Path(principal_id) = principal_id.map_err(|rejection| path_rejection(&rejection))?;
-    let request = request
-        .map_err(|rejection| body_rejection(&rejection))?
-        .map(|Json(request)| request);
     let resource = format!("principal:{principal_id}");
     let own = is_self(&caller, principal_id);
     let conn = if own && !is_principal_admin(&caller) {
@@ -432,6 +429,12 @@ async fn issue_credential(
         .await
         .map_err(internal)?
         .is_some();
+    // The body is parsed only once the caller may reach this principal.
+    let request = (!body.is_empty())
+        .then(|| Json::<CreateUserCredentialRequest>::from_bytes(&body))
+        .transpose()
+        .map_err(|rejection| body_rejection(&rejection))?
+        .map(|Json(request)| request);
     let issued = match (user_target, request) {
         (true, None) => {
             return Err(invalid(

@@ -997,7 +997,10 @@ mod pg_tests {
             .await
             .expect("verifier derives");
         let mut conn = fixture.tenant_conn().await.expect("tenant conn opens");
-        create_local_user(&mut conn, "queued", &verifier, &[])
+        crate::seed::seed_builtin_roles_for_tenant(&mut conn, fixture.data_tenant_id())
+            .await
+            .expect("builtin roles seed");
+        create_local_user(&mut conn, "queued", &verifier, &["viewer".to_owned()])
             .await
             .expect("user creates");
         conn.commit().await.expect("user commits");

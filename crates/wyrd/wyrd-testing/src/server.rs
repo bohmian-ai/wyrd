@@ -6190,7 +6190,7 @@ mod tests {
 
     /// Python members that start, address, or credential the server and so
     /// neither steer nor inspect its state.
-    const PYTHON_SETUP: [&str; 21] = [
+    const PYTHON_SETUP: [&str; 23] = [
         "__init__",
         "__enter__",
         "__exit__",
@@ -6212,10 +6212,12 @@ mod tests {
         "saved_login_is_stale",
         "revoke_saved_login",
         "tenant_admin_key",
+        "bootstrap_user_key",
+        "seed_user_keys",
     ];
 
     /// TypeScript members that start, address, or credential the server.
-    const TYPESCRIPT_SETUP: [&str; 19] = [
+    const TYPESCRIPT_SETUP: [&str; 21] = [
         "baseUrl",
         "grpcUrl",
         "token",
@@ -6235,6 +6237,8 @@ mod tests {
         "revokeSavedLogin",
         "shutdown",
         "tenantAdminKey",
+        "bootstrapUserKey",
+        "seedUserKeys",
     ];
 
     /// Member names declared in the body of `class` in `source`.

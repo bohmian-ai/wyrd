@@ -64,7 +64,8 @@ use crate::components::gateway::Gateway;
 use crate::components::health::Health;
 use crate::components::operators::keys::{KeyError, KeyFailure, OperatorKeys};
 use crate::config::{
-    BifrostRuntimeRole, ConnectionBudget, ServerAllocation, WorkloadBindingEntry, WyrdServerConfig,
+    BifrostRuntimeRole, ConnectionBudget, PooledListeners, ServerAllocation, WorkloadBindingEntry,
+    WyrdServerConfig,
 };
 use crate::mcp::Mcp;
 use crate::oracle::{OraclePeerAuthority, PostgresPeerSecurityAudit};
@@ -1320,10 +1321,6 @@ impl AppState {
             #[cfg(feature = "test-support")]
             test_hooks,
         } = inputs;
-        tracing::info!(
-            startup_allocation = %serde_json::to_string(&allocation).unwrap_or_default(),
-            "startup allocation"
-        );
         let shutdown = CancellationToken::new();
         let mut auth = install_auth(
             dependencies.postgres.as_ref(),
@@ -1404,6 +1401,15 @@ impl AppState {
                 return Err(error);
             }
         };
+        let allocation = allocation.with_listeners(PooledListeners::new(
+            config.role.serves_api(),
+            verification.blocks().is_some(),
+            bifrost.catalog().is_some(),
+        ));
+        tracing::info!(
+            startup_allocation = %serde_json::to_string(&allocation).unwrap_or_default(),
+            "startup allocation"
+        );
         let state = Self::assembled(crate::state::AppStateInner {
             settings: ServerSettings {
                 deployment_profile: config.deployment_profile,

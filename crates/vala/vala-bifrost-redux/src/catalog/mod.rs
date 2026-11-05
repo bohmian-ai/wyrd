@@ -9,6 +9,14 @@
 /// of trusting a literal repeated at each call site.
 pub const BIFROST_CATALOG_NAME: &str = "wyrd-redux";
 
+/// Maximum connections of the Iceberg SQL catalog's own pool, separate from
+/// the app, Vala, and admin pools.
+///
+/// The catalog builder applies it and a serving process reports it beside its
+/// other pool maxima, so a deployment's connection total counts this pool once
+/// per process.
+pub const CATALOG_POOL_MAX_CONNECTIONS: u32 = 10;
+
 mod alteration;
 mod bifrost_catalog;
 mod cut_cache;

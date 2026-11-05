@@ -1464,7 +1464,9 @@ pub struct ProcessResourceConfig {
 ///
 /// Recorded beside the startup allocation so a deployment's connection total
 /// is visible; only the app pool feeds a grant, as the ceiling on outbox
-/// writers. Connections are operator budgets and never grow with CPU.
+/// writers. Connections are operator budgets and never grow with CPU. The
+/// process maximum is the sum of the four pool maxima: pooled listeners hold
+/// connections inside those pools and add none.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 pub struct ConnectionBudget {
     /// Tenant app pool maximum.
@@ -1473,17 +1475,54 @@ pub struct ConnectionBudget {
     pub vala: u32,
     /// Platform-admin operator pool maximum.
     pub platform_admin: u32,
+    /// Iceberg SQL catalog pool maximum.
+    pub catalog: u32,
+    /// Notification listeners occupying connections of the pools above.
+    pub listeners: PooledListeners,
 }
 
 impl ConnectionBudget {
     /// The maxima the production pools will open with, read from the same
-    /// `WYRD_DB_*` settings the pool builders read.
+    /// `WYRD_DB_*` settings and catalog constant the pool builders read.
+    ///
+    /// Listener membership is unknown until the owners are composed, so it
+    /// starts empty; see [`ServerAllocation::with_listeners`].
     #[must_use]
     pub fn from_env() -> Self {
         Self {
             app: wyrd_sql::PoolConfig::app_from_env().max_connections,
             vala: vala_sql::postgres::vala_pool_config().max_connections,
             platform_admin: wyrd_sql::PoolConfig::platform_admin_from_env().max_connections,
+            catalog: vala_bifrost_redux::catalog::CATALOG_POOL_MAX_CONNECTIONS,
+            listeners: PooledListeners::default(),
+        }
+    }
+}
+
+/// Which notification listeners a composed process runs, each holding one
+/// connection of the pool its field names for as long as it listens.
+///
+/// Occupancy, not capacity: the connections are already inside
+/// [`ConnectionBudget`]'s maxima and are never added to them again.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
+pub struct PooledListeners {
+    /// Gateway snapshot invalidations, in an API-serving process.
+    pub app_gateway_snapshots: bool,
+    /// Verifier target invalidations, where Verifier blocks are hosted.
+    pub app_verifier_targets: bool,
+    /// Catalog cut invalidations, where a Scribe or Oracle holds the catalog.
+    pub vala_catalog_cuts: bool,
+}
+
+impl PooledListeners {
+    /// The listeners a process starts from its composed owners: whether it
+    /// serves the API, hosts Verifier blocks, and holds a catalog.
+    #[must_use]
+    pub const fn new(serves_api: bool, hosts_blocks: bool, holds_catalog: bool) -> Self {
+        Self {
+            app_gateway_snapshots: serves_api,
+            app_verifier_targets: serves_api && hosts_blocks,
+            vala_catalog_cuts: holds_catalog,
         }
     }
 }
@@ -1625,6 +1664,14 @@ pub struct ServerAllocation {
 const OUTBOX_BATCH_BYTES_CEILING: usize = 32 * 1024 * 1024;
 
 impl ServerAllocation {
+    /// This allocation with the pooled listeners its composed owners run
+    /// recorded in [`ConnectionBudget::listeners`]; no grant changes.
+    #[must_use]
+    pub const fn with_listeners(mut self, listeners: PooledListeners) -> Self {
+        self.connections.listeners = listeners;
+        self
+    }
+
     /// The observation Bifrost composes from: `detected` with memory reduced
     /// to `M`, so the Bifrost cap is carved from the same process memory.
     #[must_use]
@@ -1663,6 +1710,8 @@ impl ServerAllocation {
                     app: 32,
                     vala: 16,
                     platform_admin: 2,
+                    catalog: vala_bifrost_redux::catalog::CATALOG_POOL_MAX_CONNECTIONS,
+                    listeners: PooledListeners::default(),
                 },
                 false,
             )
@@ -1682,6 +1731,9 @@ const fn resource_source_label(source: ResourceSource) -> &'static str {
 }
 
 /// The smallest labelled term; the first wins a tie.
+///
+/// # Panics
+/// Panics when `terms` is empty; every caller passes a fixed nonempty list.
 fn least(terms: &[(&'static str, usize)]) -> (&'static str, usize) {
     terms.iter().copied().fold(
         terms[0],
@@ -1997,6 +2049,9 @@ fn default_ingest_wal_workspace_bytes() -> usize {
     vala_bifrost_redux::gate::limits::BIFROST_WAL_WORKSPACE_LIMIT_BYTES
 }
 
+/// Defaults with every worker-thread and outbox setting omitted, so
+/// [`WyrdServerConfig::server_allocation`] derives them from the startup
+/// observation; set, each may only lower its derived value.
 impl Default for ScribeRuntimeConfig {
     fn default() -> Self {
         Self {
@@ -3365,6 +3420,9 @@ impl Default for PoolsConfig {
     }
 }
 
+/// Defaults with `concurrency` omitted, so the startup allocation derives the
+/// gateway's concurrent-call slots from the observation; set, it may only
+/// lower them.
 impl Default for LimitsConfig {
     fn default() -> Self {
         Self {
@@ -4418,8 +4476,12 @@ mod tests {
         app: 16,
         vala: 16,
         platform_admin: 2,
+        catalog: vala_bifrost_redux::catalog::CATALOG_POOL_MAX_CONNECTIONS,
+        listeners: PooledListeners::new(false, false, false),
     };
+    /// One mebibyte.
     const MIB: usize = 1024 * 1024;
+    /// One gibibyte.
     const GIB: usize = 1024 * MIB;
 
     /// One startup observation of `cpu` CPUs and `memory` bytes from `source`.
@@ -4434,7 +4496,12 @@ mod tests {
         }
     }
 
-    /// Allocates `config` over an injected observation.
+    /// Allocates `config` over an injected observation of `cpu` CPUs and
+    /// `memory` bytes with the test pool maxima.
+    ///
+    /// # Errors
+    /// Returns the [`ConfigError`] [`WyrdServerConfig::server_allocation`]
+    /// refuses the plan with.
     fn allocate(
         config: &WyrdServerConfig,
         cpu: usize,
@@ -4600,6 +4667,42 @@ mod tests {
             )
             .expect("an embedded server allocates");
         assert_eq!(embedded.http_workers, None);
+
+        assert_eq!(
+            ConnectionBudget::from_env().catalog,
+            10,
+            "the catalog pool keeps its maximum of ten"
+        );
+        // (serves API, hosts blocks, holds catalog) -> (app snapshots, app
+        // targets, Vala cuts)
+        for (facts, expected) in [
+            ((true, false, true), (true, false, true)),
+            ((true, true, true), (true, true, true)),
+            ((true, true, false), (true, true, false)),
+            ((false, true, true), (false, false, true)),
+            ((false, false, false), (false, false, false)),
+        ] {
+            let listeners = PooledListeners::new(facts.0, facts.1, facts.2);
+            assert_eq!(
+                (
+                    listeners.app_gateway_snapshots,
+                    listeners.app_verifier_targets,
+                    listeners.vala_catalog_cuts,
+                ),
+                expected,
+                "{facts:?}"
+            );
+            let recorded = example.with_listeners(listeners);
+            assert_eq!(recorded.connections.listeners, listeners);
+            assert_eq!(
+                ServerAllocation {
+                    connections: example.connections,
+                    ..recorded
+                },
+                example,
+                "recording listeners changes no grant or pool maximum"
+            );
+        }
     }
 
     /// Explicit settings only lower detected or derived grants, explicit
@@ -4858,6 +4961,11 @@ mod tests {
 
     /// Proves a dedicated Forge worker ignores malformed settings for services
     /// it does not own while retaining its local concurrency guard.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the Forge worker's validation rejects a setting it does
+    /// not own.
     #[test]
     fn forge_worker_validation_ignores_api_only_settings() {
         let mut config = WyrdServerConfig {
@@ -4883,6 +4991,10 @@ mod tests {
     }
 
     /// Proves API-owning roles reject the same malformed service settings.
+    ///
+    /// # Panics
+    ///
+    /// Panics when an API-owning role validates a malformed service setting.
     #[test]
     fn api_roles_reject_forge_worker_only_validation_bypass() {
         for role in [BifrostTarget::All, BifrostTarget::Server] {
@@ -5870,6 +5982,14 @@ minimum_slots = 2
         assert!(config.validate().is_err());
     }
 
+    /// Omitted Scribe worker and outbox settings stay unset for the startup
+    /// allocation to derive, while ingest, shard, file, and limit defaults
+    /// keep their configured contract.
+    ///
+    /// # Panics
+    ///
+    /// Panics when a default resolves before the observation or drifts from
+    /// its contract value.
     #[test]
     fn scribe_runtime_defaults_match_configured_ingest_contract() {
         let cfg = ScribeRuntimeConfig::default();

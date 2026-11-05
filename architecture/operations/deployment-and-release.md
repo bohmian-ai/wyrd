@@ -125,7 +125,7 @@ development exception does not authorize public plaintext deployment.
 The deployment connection budget is:
 
 ```text
-replicas * (app_max + platform_admin_max)
+max_replicas * (app_max + vala_max + platform_admin_max + catalog_max)
   + concurrent_migrator_max
   + database_reserved
   <= postgres_max_connections
@@ -136,10 +136,19 @@ replication, monitoring, failover, and extension roles. Capacity validation
 uses the maximum replicas permitted by autoscaling or rollout surge, not the
 steady replica count.
 
+`catalog_max` is the Iceberg SQL catalog's own pool, fixed at 10 per process.
+Each pool counts once per process. Pooled notification listeners hold one
+connection inside an existing pool for as long as they listen and add nothing
+to the total: gateway snapshots use an app connection in an API-serving
+process, Verifier targets use another where Verifier blocks are hosted, and
+catalog cuts use a Vala connection where a Scribe or Oracle holds the catalog.
+That occupancy reduces the pool's capacity for request work; it never
+justifies raising a maximum.
+
 Pool maxima are operator budgets: startup never grows them with CPU or memory.
 The app pool maximum caps the process Scribe outbox's concurrent writers, and
-each process records its app, Vala, and platform-admin maxima in its
-`startup_allocation`.
+each process records its app, Vala, platform-admin, and catalog maxima, and
+which pooled listeners it runs, in its `startup_allocation`.
 
 Transaction-mode PgBouncer requires statement-cache capacity `0` on every pool
 routed through it. Tenant binding remains transaction-local. Session-scoped

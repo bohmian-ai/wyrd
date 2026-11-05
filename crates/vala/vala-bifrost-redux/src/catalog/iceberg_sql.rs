@@ -17,9 +17,13 @@ const CATALOG_POOL_TEST_IDLE_AFTER_MS: &str = "pool.test-idle-after-ms";
 /// pinged before use; hotter reuse skips the round trip.
 const CATALOG_POOL_IDLE_PING_THRESHOLD_MS: &str = "1000";
 
+/// Catalog pool property naming the pool's connection maximum.
+const CATALOG_POOL_MAX_CONNECTIONS_PROPERTY: &str = "pool.max-connections";
+
 /// Build the Iceberg SQL catalog used by Redux Gate, Forge, and Oracle.
 ///
-/// Uses `DollarNumeric` binds for Postgres and gates the pool's pre-checkout
+/// Uses `DollarNumeric` binds for Postgres, bounds the pool at
+/// [`super::CATALOG_POOL_MAX_CONNECTIONS`], and gates the pool's pre-checkout
 /// health ping on idle time, so hot connection reuse costs no extra round trip.
 ///
 /// # Errors
@@ -48,6 +52,10 @@ pub async fn build_catalog<S: std::hash::BuildHasher>(
     properties.insert(
         CATALOG_POOL_TEST_IDLE_AFTER_MS.to_owned(),
         CATALOG_POOL_IDLE_PING_THRESHOLD_MS.to_owned(),
+    );
+    properties.insert(
+        CATALOG_POOL_MAX_CONNECTIONS_PROPERTY.to_owned(),
+        super::CATALOG_POOL_MAX_CONNECTIONS.to_string(),
     );
 
     SqlCatalogBuilder::default()

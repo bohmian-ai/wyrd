@@ -598,13 +598,16 @@ async fn unready_roles_heartbeat_until_teardown_ends_membership_tasks()
 /// Bifrost composes from the remaining 12 GiB. A fixed 1-GiB server headroom
 /// would hand Bifrost 15 GiB, and a consumer that probed the host for CPUs
 /// would disagree with the injected eight. An embedded server owns no
-/// serving runtime, so it reports no HTTP worker grant. An ordinary SDK call
-/// then succeeds and the server shuts down cleanly.
+/// serving runtime, so it reports no HTTP worker grant. Its connection
+/// readout carries the catalog pool's maximum of ten and the pooled
+/// listeners this API-serving, catalog-holding server runs. An ordinary SDK
+/// call then succeeds and the server shuts down cleanly.
 ///
 /// # Panics
 ///
 /// Panics when the server cannot start, the allocation disagrees with the
-/// cap or the constructed owners, the SDK call fails, or shutdown fails.
+/// cap, the constructed owners, or the listeners they run, the SDK call
+/// fails, or shutdown fails.
 #[tokio::test]
 #[ignore = "requires Postgres and object storage"]
 async fn composed_server_reports_effective_allocations() {
@@ -612,6 +615,7 @@ async fn composed_server_reports_effective_allocations() {
     use vala_bifrost_redux::resources::{ResourceSource, SystemResourceSnapshot};
     use wyrd_testing::{Bootstrap, WyrdTestServer};
 
+    /// One gibibyte.
     const GIB: usize = 1024 * 1024 * 1024;
     let server = Box::pin(
         WyrdTestServer::builder()
@@ -645,6 +649,21 @@ async fn composed_server_reports_effective_allocations() {
     assert_eq!(
         allocation.server_bytes + allocation.bifrost_bytes,
         allocation.process_bytes
+    );
+    assert_eq!(
+        (
+            allocation.connections.catalog,
+            allocation.connections.listeners,
+        ),
+        (
+            10,
+            wyrd_server::config::PooledListeners::new(
+                true,
+                state.verification.blocks().is_some(),
+                true,
+            ),
+        ),
+        "the readout carries the catalog pool and the listeners this server runs"
     );
 
     let plan = state

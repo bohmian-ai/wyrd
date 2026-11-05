@@ -522,6 +522,13 @@ mod tests {
         }
     }
 
+    /// An ordinary metrics router answers `GET /metrics` with Prometheus
+    /// text.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the router does not respond 200 with UTF-8 Prometheus
+    /// text or an empty body.
     #[tokio::test]
     async fn metrics_router_serves_metrics() {
         let handle = get_handle();
@@ -702,14 +709,32 @@ mod tests {
         for path in [BENCHMARK_TIMINGS_PATH, BENCHMARK_ALLOCATION_PATH] {
             assert_eq!(fetch(&ordinary, "GET", path).await.0, StatusCode::NOT_FOUND);
         }
-        let allocation = crate::config::ServerAllocation::for_test();
+        let allocation = crate::config::ServerAllocation::for_test()
+            .with_listeners(crate::config::PooledListeners::new(true, true, true));
         let router = metrics_router(handle.clone(), Some(allocation));
         let (status, body) = fetch(&router, "GET", BENCHMARK_ALLOCATION_PATH).await;
         assert_eq!(status, StatusCode::OK, "{body}");
+        let readout: serde_json::Value =
+            serde_json::from_str(&body).expect("the allocation is JSON");
         assert_eq!(
-            serde_json::from_str::<serde_json::Value>(&body).expect("the allocation is JSON"),
+            readout,
             serde_json::to_value(allocation).expect("the allocation serializes"),
             "the readout is the carried startup allocation"
+        );
+        assert_eq!(
+            (
+                &readout["connections"]["catalog"],
+                &readout["connections"]["listeners"],
+            ),
+            (
+                &serde_json::json!(vala_bifrost_redux::catalog::CATALOG_POOL_MAX_CONNECTIONS),
+                &serde_json::json!({
+                    "app_gateway_snapshots": true,
+                    "app_verifier_targets": true,
+                    "vala_catalog_cuts": true,
+                }),
+            ),
+            "the readout names the catalog pool and each listener's pool"
         );
         assert_eq!(
             fetch(&router, "POST", BENCHMARK_ALLOCATION_PATH).await.0,

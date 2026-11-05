@@ -301,8 +301,8 @@ pub struct Workspace {
     /// Bytes the materialized inputs take from the scratch limit.
     inputs_bytes: u64,
     /// Held by one `/work` writer at a time, so each sees the space the
-    /// others left.
-    writer: tokio::sync::Mutex<()>,
+    /// others left; shared so blocking work can own its turn.
+    writer: Arc<tokio::sync::Mutex<()>>,
     /// Limits in force.
     limits: HostedLimits,
     /// Admission held until drop.
@@ -328,7 +328,7 @@ impl Workspace {
             root,
             inputs: BTreeMap::new(),
             inputs_bytes: 0,
-            writer: tokio::sync::Mutex::new(()),
+            writer: Arc::new(tokio::sync::Mutex::new(())),
             limits,
             _permit: permit.into(),
         };
@@ -545,9 +545,10 @@ impl Workspace {
     }
 
     /// Wait to be the only `/work` writer; dropping the guard lets the next
-    /// one in. Cancelling the wait gives up the turn.
-    pub async fn writer(&self) -> tokio::sync::MutexGuard<'_, ()> {
-        self.writer.lock().await
+    /// one in. Cancelling the wait gives up the turn. The guard is owned, so
+    /// blocking work moved to another thread keeps the turn until it ends.
+    pub async fn writer(&self) -> tokio::sync::OwnedMutexGuard<()> {
+        Arc::clone(&self.writer).lock_owned().await
     }
 
     /// Freeze `/work` file or directory `path` for publication, read while
@@ -566,8 +567,8 @@ impl Workspace {
     /// special file, `publication_tree` for an entry the tree rules refuse,
     /// `work_budget` for content over the byte limit; and an invocation
     /// failure for an unreadable entry.
-    pub async fn freeze(&self, path: &str) -> Result<Frozen, ToolError> {
-        let Some(rest) = relative(path, "/work/") else {
+    pub async fn freeze(self: &Arc<Self>, path: &str) -> Result<Frozen, ToolError> {
+        if relative(path, "/work/").is_none() {
             return Err(invalid(
                 "publication_path",
                 "path",
@@ -575,8 +576,27 @@ impl Workspace {
                 format!("{path} is not a file or directory this invocation wrote under /work"),
                 "a path under /work without empty, . or .. segments",
             ));
-        };
-        let _writer = self.writer().await;
+        }
+        let writer = self.writer().await;
+        let workspace = Arc::clone(self);
+        let path = path.to_owned();
+        // The blocking read owns the writer turn, so a cancelled caller
+        // never lets a writer in while the read still runs.
+        tokio::task::spawn_blocking(move || {
+            let _writer = writer;
+            workspace.snapshot(&path)
+        })
+        .await
+        .map_err(|error| invocation(error.to_string()))?
+    }
+
+    /// [`Self::freeze`]'s read of `/work` path `path`; the caller holds
+    /// [`Self::writer`] and runs it on the blocking pool.
+    ///
+    /// # Errors
+    /// Returns [`Self::freeze`]'s refusals and failures.
+    fn snapshot(&self, path: &str) -> Result<Frozen, ToolError> {
+        let rest = relative(path, "/work/").ok_or_else(|| outside(path))?;
         let host = self.work_dir().join(rest);
         if !host.symlink_metadata().map_err(|_| missing(path))?.is_dir() {
             let (host, _) = self.file(path)?;

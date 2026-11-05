@@ -252,15 +252,17 @@ impl Invocation {
             BuiltinTool::FsList | BuiltinTool::FsRead | BuiltinTool::FsExtract => {
                 let workspace = Arc::clone(self.workspace()?);
                 let args: FsArgs = parse(args)?;
-                let held = Arc::clone(&workspace);
-                let _writer = match tool {
-                    BuiltinTool::FsExtract => Some(held.writer().await),
+                let writer = match tool {
+                    BuiltinTool::FsExtract => Some(workspace.writer().await),
                     _ => None,
                 };
-                tokio::task::spawn_blocking(move || match tool {
-                    BuiltinTool::FsList => workspace.list(&args.path),
-                    BuiltinTool::FsRead => workspace.read(&args.path, args.start),
-                    _ => workspace.extract(&args.path, &args.output_path),
+                tokio::task::spawn_blocking(move || {
+                    let _writer = writer;
+                    match tool {
+                        BuiltinTool::FsList => workspace.list(&args.path),
+                        BuiltinTool::FsRead => workspace.read(&args.path, args.start),
+                        _ => workspace.extract(&args.path, &args.output_path),
+                    }
                 })
                 .await
                 .map_err(|error| invocation(error.to_string()))?

@@ -722,7 +722,7 @@ impl VerificationFixture {
         let limits = HostedLimits::default();
         let backend = Publications::new(state, &caller, lease, limits);
         let workspace =
-            Workspace::materialize(Vec::new(), limits, None).map_err(|e| refused(&e))?;
+            Arc::new(Workspace::materialize(Vec::new(), limits, None).map_err(|e| refused(&e))?);
         for (at, (step, name, content)) in publications.iter().enumerate() {
             let call = PublishCall {
                 id: format!("fixture-{at}"),

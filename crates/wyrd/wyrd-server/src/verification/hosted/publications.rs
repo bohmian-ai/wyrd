@@ -13,6 +13,8 @@
 //! locate its bytes without rediscovery. Every refusal is a [`ToolError`]
 //! the calling Agent can read and correct.
 
+use std::sync::Arc;
+
 use serde_json::Value;
 use skald_tool::ToolError;
 use wyrd_spec::auth::Sha256Hex;
@@ -125,7 +127,7 @@ impl<'a> Publications<'a> {
     pub async fn path(
         &self,
         call: &PublishCall,
-        workspace: &Workspace,
+        workspace: &Arc<Workspace>,
         path: &str,
     ) -> Result<PublicationKind, ToolError> {
         let arguments = serde_json::json!({ "name": call.name, "path": path });

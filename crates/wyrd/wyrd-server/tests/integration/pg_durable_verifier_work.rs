@@ -6,6 +6,7 @@
 //! [`Publications`]; no public endpoint accepts arbitrary paths.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::sync::Arc;
 
 use serde_json::{Value, json};
 use skald_spec::MediaFormat;
@@ -193,7 +194,7 @@ async fn file_and_json_publications_are_immutable() {
         ..HostedLimits::default()
     };
     let caller = user(leased.server.data_tenant_id(), []);
-    let workspace = Workspace::materialize(Vec::new(), limits, None).expect("workspace");
+    let workspace = Arc::new(Workspace::materialize(Vec::new(), limits, None).expect("workspace"));
     let report = "# Review\n\nThe answer holds.\n";
     std::fs::create_dir_all(workspace.work_dir().join("notes")).expect("directory");
     std::fs::write(workspace.work_dir().join("notes/report one.md"), report).expect("write");
@@ -344,7 +345,7 @@ async fn directory_snapshot_is_complete_or_rejected() {
         ..HostedLimits::default()
     };
     let caller = user(leased.server.data_tenant_id(), []);
-    let workspace = Workspace::materialize(Vec::new(), limits, None).expect("workspace");
+    let workspace = Arc::new(Workspace::materialize(Vec::new(), limits, None).expect("workspace"));
     let publications = Publications::new(leased.server.state(), &caller, leased.lease, limits);
     let producer = Producer {
         step_id: TaskId::new("review").expect("task"),
@@ -450,7 +451,8 @@ async fn directory_snapshot_is_complete_or_rejected() {
             refused.push(("unreadable", "/work/unreadable", "workspace IO failed"));
         }
     }
-    let deep = Workspace::materialize(Vec::new(), HostedLimits::default(), None).expect("deep");
+    let deep =
+        Arc::new(Workspace::materialize(Vec::new(), HostedLimits::default(), None).expect("deep"));
     put(&deep, &format!("depth/{}x", "d/".repeat(33)), b"x");
     let mut cases: Vec<_> = refused
         .into_iter()
@@ -526,7 +528,7 @@ async fn publication_replay_preserves_attempt_identity() {
     let leased = Leased::start().await;
     let limits = HostedLimits::default();
     let caller = user(leased.server.data_tenant_id(), []);
-    let workspace = Workspace::materialize(Vec::new(), limits, None).expect("workspace");
+    let workspace = Arc::new(Workspace::materialize(Vec::new(), limits, None).expect("workspace"));
     let publications = Publications::new(leased.server.state(), &caller, leased.lease, limits);
     let first = Producer {
         step_id: TaskId::new("review").expect("task"),
@@ -676,7 +678,7 @@ async fn publication_limits_survive_reclaim() {
         ..HostedLimits::default()
     };
     let caller = user(leased.server.data_tenant_id(), []);
-    let workspace = Workspace::materialize(Vec::new(), limits, None).expect("workspace");
+    let workspace = Arc::new(Workspace::materialize(Vec::new(), limits, None).expect("workspace"));
     let publications = Publications::new(leased.server.state(), &caller, leased.lease, limits);
     let producer = Producer {
         step_id: TaskId::new("review").expect("task"),
@@ -823,7 +825,7 @@ async fn publication_mounts_preserve_status_and_lineage() {
         producer("review", 2),
         producer("broken", 1),
     );
-    let scratch = Workspace::materialize(Vec::new(), limits, None).expect("workspace");
+    let scratch = Arc::new(Workspace::materialize(Vec::new(), limits, None).expect("workspace"));
     put(&scratch, "draft.md", b"early draft");
     put(&scratch, "report/summary.md", b"# Summary\nagrees\n");
     put(&scratch, "report/manifest.json", b"{\"forged\": true}");

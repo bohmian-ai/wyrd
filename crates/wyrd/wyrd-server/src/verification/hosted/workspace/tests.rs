@@ -646,3 +646,37 @@ fn workspace_refuses_bad_paths_and_limits() {
         invalid("extractable_document")
     );
 }
+
+/// A snapshot whose caller is cancelled keeps the `/work` writer turn until
+/// its blocking read ends, so no writer changes the tree mid-read.
+///
+/// # Panics
+/// Panics when the runtime cannot build, the file cannot be written, or the
+/// turn is released before the read ends.
+#[test]
+fn cancelled_snapshot_keeps_writer_exclusion() {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .max_blocking_threads(1)
+        .build()
+        .expect("runtime");
+    runtime.block_on(async {
+        let workspace = Arc::new(
+            Workspace::materialize(Vec::new(), HostedLimits::default(), None).expect("workspace"),
+        );
+        std::fs::write(workspace.work_dir().join("notes.md"), b"x").expect("write");
+        let (release, held) = std::sync::mpsc::channel::<()>();
+        let blocker = tokio::task::spawn_blocking(move || held.recv());
+        let mut freeze = Box::pin(workspace.freeze("/work/notes.md"));
+        let polled =
+            std::future::poll_fn(|cx| std::task::Poll::Ready(freeze.as_mut().poll(cx))).await;
+        assert!(polled.is_pending(), "the read waits for the blocking pool");
+        drop(freeze);
+        assert!(
+            workspace.writer.try_lock().is_err(),
+            "the queued read still owns the turn"
+        );
+        release.send(()).expect("release");
+        blocker.await.expect("blocker").expect("released");
+        let _turn = workspace.writer().await;
+    });
+}

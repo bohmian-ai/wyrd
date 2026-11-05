@@ -759,6 +759,7 @@ env = { WYRD_KEYCLOAK_ISSUER = "http://localhost:8180/realms/wyrd-test", WYRD_DE
 run = """
 set -e
 pnpm --dir crates/wyrd/wyrd-server/wyrd-ui install --frozen-lockfile
+pnpm --dir crates/wyrd/wyrd-server/wyrd-ui exec playwright install --only-shell chromium
 pnpm --dir crates/wyrd/wyrd-server/wyrd-ui build
 cargo nextest run --locked -p wyrd-server --test integration --run-ignored=all --no-capture -E 'test(=identity_ui_e2e::production_ui_bff_journey)'
 """

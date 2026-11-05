@@ -17,7 +17,8 @@ use wyrd_spec::card::verifier::{PathSegment, Reference, ReferenceRoot, Requireme
 use wyrd_spec::ids::SlotName;
 use wyrd_spec::verification::TaskId;
 use wyrd_spec::verification::execution::{
-    InputDeclaration, RequirementOutcome, RequirementResult, StepResult, StepStatus,
+    InputDeclaration, Producer, ProducerInvocation, PublicationCollection, RequirementOutcome,
+    RequirementResult, Speculation, StepResult, StepStatus,
 };
 
 use super::{CallInput, CallValue};
@@ -146,8 +147,13 @@ impl<'a> Scope<'a> {
 
     /// Returns a settled step's state.
     pub(super) fn step(&self, step: &TaskId) -> Option<&Settled> {
+        self.settled(step).map(|(_, state)| state)
+    }
+
+    /// Returns a settled step's reported result and state.
+    fn settled(&self, step: &TaskId) -> Option<(&StepResult, &Settled)> {
         match self.ledger.get(step) {
-            Some(Done::Step { state, .. }) => Some(state),
+            Some(Done::Step { result, state }) => Some((result, state)),
             _ => None,
         }
     }
@@ -259,6 +265,43 @@ impl<'a> Scope<'a> {
                 };
                 Ok(json_input(value, BTreeSet::new()))
             }
+            ReferenceRoot::StepPublications { step, name } => {
+                let (result, settled) = self.settled(step).ok_or_else(unresolved)?;
+                match (name, settled) {
+                    (Some(name), Settled::Succeeded { sources, .. }) => Ok(CallInput {
+                        value: CallValue::Publication {
+                            producer: Producer {
+                                step_id: step.clone(),
+                                item_index: None,
+                                iteration_index: None,
+                                attempt: result.attempts,
+                            },
+                            name: name.clone(),
+                        },
+                        sources: sources.clone(),
+                    }),
+                    (Some(_), Settled::NoOutput { gap, .. }) => Err(Missing {
+                        cause: gap.cause,
+                        reason: format!(
+                            "step `{}` has no successful attempt to publish: {}",
+                            step.as_str(),
+                            gap.reason
+                        ),
+                    }),
+                    (None, settled) => Ok(CallInput {
+                        value: CallValue::Publications {
+                            step: step.clone(),
+                            collection: collection(result),
+                        },
+                        // Partial work of a failed step derives from no
+                        // recorded sources, so it can cite none.
+                        sources: match settled {
+                            Settled::Succeeded { sources, .. } => sources.clone(),
+                            Settled::NoOutput { .. } => BTreeSet::new(),
+                        },
+                    }),
+                }
+            }
             ReferenceRoot::RequirementId => {
                 requirement.map_or_else(|| Err(unresolved()), |req| constant(req.id.as_str()))
             }
@@ -266,6 +309,43 @@ impl<'a> Scope<'a> {
                 requirement.map_or_else(|| Err(unresolved()), |req| constant(&req.statement))
             }
         }
+    }
+}
+
+/// The reason a collection reports for an attempt that failed and was
+/// retried; the retried failure itself is not recorded.
+pub(super) const RETRIED: &str = "the attempt failed and was retried";
+
+/// The collection of the settled step `result`, with no entries: its status
+/// and one record per attempt, each attempt before the last having failed
+/// and been retried.
+fn collection(result: &StepResult) -> PublicationCollection {
+    let invocations = (1..=result.attempts)
+        .map(|attempt| {
+            let last = attempt == result.attempts;
+            ProducerInvocation {
+                item_index: None,
+                iteration_index: None,
+                attempt,
+                status: if last {
+                    result.status
+                } else {
+                    StepStatus::Failed
+                },
+                reason: if last {
+                    result.reason.clone()
+                } else {
+                    Some(RETRIED.to_owned())
+                },
+            }
+        })
+        .collect();
+    PublicationCollection {
+        status: result.status,
+        reason: result.reason.clone(),
+        speculation: Speculation::None,
+        invocations,
+        entries: Vec::new(),
     }
 }
 

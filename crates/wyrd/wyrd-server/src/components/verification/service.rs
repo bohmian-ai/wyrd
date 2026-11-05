@@ -560,6 +560,7 @@ impl<'a> VerificationControl<'a> {
                 defer_unlanded_traces: false,
                 drift: DriftChecks::new(None, BTreeMap::new(), BTreeMap::new()),
                 clock: telemetry.clock(),
+                execution: None,
             },
         ) {
             Ok(engine) => engine,

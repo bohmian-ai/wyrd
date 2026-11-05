@@ -522,6 +522,74 @@ pub struct Publication {
     pub content: PublicationContent,
 }
 
+/// The `manifest.json` of a mounted `steps.<id>.publications` collection.
+///
+/// It reports the producer step's terminal status, every invocation attempt
+/// with its status, and every admitted publication with the path its content
+/// is mounted at beneath the collection root, so a consumer reads failed or
+/// skipped producers honestly instead of inferring them from absent files.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
+pub struct PublicationCollection {
+    /// The producer step's terminal status.
+    pub status: StepStatus,
+    /// Why the step failed or was skipped; `null` when it succeeded.
+    pub reason: Option<String>,
+    /// The step's speculative disposition.
+    pub speculation: Speculation,
+    /// Every invocation attempt, ordered by item, iteration, then attempt;
+    /// empty when the step never ran.
+    pub invocations: Vec<ProducerInvocation>,
+    /// Every admitted publication, grouped like `invocations` and in
+    /// acceptance order within an attempt.
+    pub entries: Vec<CollectionEntry>,
+}
+
+/// A step's speculative disposition, as a collection manifest reports it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum Speculation {
+    /// The step is not speculative.
+    None,
+}
+
+/// One invocation attempt of a collection's producer step.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
+pub struct ProducerInvocation {
+    /// Zero-based fanout item; `null` without fanout.
+    pub item_index: Option<u32>,
+    /// Zero-based repeat iteration; `null` without repeat.
+    pub iteration_index: Option<u32>,
+    /// One-based attempt.
+    pub attempt: u32,
+    /// How the attempt ended: a retried attempt failed.
+    pub status: StepStatus,
+    /// Why the attempt failed; `null` when it succeeded.
+    pub reason: Option<String>,
+}
+
+/// One admitted publication of a mounted collection.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
+pub struct CollectionEntry {
+    /// The logical name.
+    pub name: PublicationName,
+    /// Whether it mounts as a file, a directory, or a JSON file.
+    pub kind: PublicationKind,
+    /// The mounted file, JSON file, or directory root, relative to the
+    /// collection root and always beneath `content/`. Its segments are
+    /// opaque: read them here rather than constructing them.
+    pub path: String,
+    /// Zero-based fanout item of the producer; `null` without fanout.
+    pub item_index: Option<u32>,
+    /// Zero-based repeat iteration of the producer; `null` without repeat.
+    pub iteration_index: Option<u32>,
+    /// One-based producer attempt.
+    pub attempt: u32,
+}
+
 /// One tool call an Agent action made.
 ///
 /// Records what the model received, never the raw tool output: the digest

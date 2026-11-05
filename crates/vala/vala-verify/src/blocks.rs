@@ -31,11 +31,11 @@ use tokio::time::Instant;
 
 use wyrd_spec::card::verifier::{Action, Check};
 use wyrd_spec::ids::SlotName;
-use wyrd_spec::verification::TaskId;
 use wyrd_spec::verification::execution::{
-    CallProvenance, InputDeclaration, InvocationSettlement, RequirementDetail, ToolCallRecord,
-    Verdict,
+    CallProvenance, InputDeclaration, InvocationSettlement, Producer, PublicationCollection,
+    RequirementDetail, ToolCallRecord, Verdict,
 };
+use wyrd_spec::verification::{PublicationName, TaskId};
 
 mod drift;
 mod engine;
@@ -65,6 +65,23 @@ pub enum CallValue {
     Json(Value),
     /// Pinned original evidence a media slot names; executors fetch bytes.
     Evidence(InputDeclaration),
+    /// `steps.<id>.publications.<name>`: what `producer`, the step's
+    /// successful attempt, published under `name`. The host mounts it, or
+    /// refuses the call before it runs when no such publication exists.
+    Publication {
+        /// The successful producer attempt.
+        producer: Producer,
+        /// The logical name.
+        name: PublicationName,
+    },
+    /// `steps.<id>.publications`: the settled step's collection, whose
+    /// `entries` the host fills from the execution's admitted publications.
+    Publications {
+        /// The producer step.
+        step: TaskId,
+        /// Its status and attempts, with no entries yet.
+        collection: PublicationCollection,
+    },
 }
 
 /// A resolved binding plus the original input slots it derives from, so

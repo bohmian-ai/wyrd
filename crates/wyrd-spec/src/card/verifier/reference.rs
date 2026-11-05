@@ -2,7 +2,8 @@
 //!
 //! A reference names one value in the execution scope document:
 //! `inputs.<slot>`, `steps.<id>.output`, `steps.<id>.status`,
-//! `steps.<id>.requirements.<requirement>.outcome|reason`, or
+//! `steps.<id>.requirements.<requirement>.outcome|reason`,
+//! `steps.<id>.publications[.<name>]`, or
 //! `requirement.id|statement`. Input and step-output roots accept dotted
 //! child fields and `[n]` array indexes; `[*]` wildcards parse here and are
 //! refused by validation everywhere except an assertion's `each`.
@@ -13,7 +14,7 @@ use std::str::FromStr;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
 use crate::ids::{CardName, SlotName};
-use crate::verification::TaskId;
+use crate::verification::{PublicationName, TaskId};
 
 /// One parsed scope reference.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -42,6 +43,15 @@ pub enum ReferenceRoot {
         requirement: TaskId,
         /// Verdict field read.
         field: VerdictField,
+    },
+    /// `steps.<id>.publications`: the step's settled publication collection,
+    /// or with `.<name>` the publication its successful attempt made under
+    /// that logical name. Mountable only as an Agent workspace source.
+    StepPublications {
+        /// Step that published.
+        step: TaskId,
+        /// The selected member; `None` mounts the whole collection.
+        name: Option<PublicationName>,
     },
     /// `requirement.id`: the current requirement's ID during its check.
     RequirementId,
@@ -87,7 +97,8 @@ impl Reference {
         match &self.root {
             ReferenceRoot::StepOutput(step)
             | ReferenceRoot::StepStatus(step)
-            | ReferenceRoot::StepVerdict { step, .. } => Some(step),
+            | ReferenceRoot::StepVerdict { step, .. }
+            | ReferenceRoot::StepPublications { step, .. } => Some(step),
             ReferenceRoot::Input(_)
             | ReferenceRoot::RequirementId
             | ReferenceRoot::RequirementStatement => None,
@@ -152,7 +163,25 @@ impl Reference {
                             field,
                         }
                     }
-                    _ => return Err(fail("expected .output, .status, or .requirements")),
+                    Some("publications") => ReferenceRoot::StepPublications {
+                        step,
+                        name: if tokens.rest.is_empty() {
+                            None
+                        } else {
+                            let name = tokens
+                                .dotted()
+                                .ok_or_else(|| fail("expected publications.<name>"))?;
+                            Some(
+                                PublicationName::new(name)
+                                    .map_err(|_| fail("invalid publication name"))?,
+                            )
+                        },
+                    },
+                    _ => {
+                        return Err(fail(
+                            "expected .output, .status, .requirements, or .publications",
+                        ));
+                    }
                 }
             }
             "requirement" => match tokens.dotted() {
@@ -231,6 +260,13 @@ impl utoipa::PartialSchema for SourceText {
 impl utoipa::ToSchema for SourceText {}
 
 /// Generated-schema description of a source declaration.
+/// The schema description of an authored scope reference.
+const REFERENCE_DESCRIPTION: &str = "Scope reference: inputs.<slot>, steps.<id>.output, \
+     steps.<id>.status, steps.<id>.requirements.<id>.outcome|reason, requirement.id, or \
+     requirement.statement, with .field, [n], and (in assert each) [*] selectors below inputs \
+     and step outputs; an Agent workspace source may also mount steps.<id>.publications or \
+     steps.<id>.publications.<name>.";
+
 const SOURCE_DESCRIPTION: &str = "Group source reference: verifiers.<name>.inputs.<slot> or \
      verifiers.<name>.requirements.<requirement>.outcome, selecting one whole slot or \
      requirement outcome per source execution.";
@@ -415,6 +451,12 @@ impl fmt::Display for Reference {
                     requirement.as_str()
                 )?;
             }
+            ReferenceRoot::StepPublications { step, name } => {
+                write!(f, "steps.{}.publications", step.as_str())?;
+                if let Some(name) = name {
+                    write!(f, ".{}", name.as_str())?;
+                }
+            }
             ReferenceRoot::RequirementId => f.write_str("requirement.id")?,
             ReferenceRoot::RequirementStatement => f.write_str("requirement.statement")?,
         }
@@ -475,10 +517,7 @@ impl schemars::JsonSchema for Reference {
     /// and selectors.
     fn json_schema(_generator: &mut schemars::SchemaGenerator) -> schemars::Schema {
         schemars::json_schema!({
-            "description": "Scope reference: inputs.<slot>, steps.<id>.output, steps.<id>.status, \
-                steps.<id>.requirements.<id>.outcome|reason, requirement.id, or \
-                requirement.statement, with .field, [n], and (in assert each) [*] \
-                selectors below inputs and step outputs.",
+            "description": REFERENCE_DESCRIPTION,
             "type": "string"
         })
     }
@@ -490,12 +529,7 @@ impl utoipa::PartialSchema for Reference {
     fn schema() -> utoipa::openapi::RefOr<utoipa::openapi::schema::Schema> {
         utoipa::openapi::schema::ObjectBuilder::new()
             .schema_type(utoipa::openapi::schema::Type::String)
-            .description(Some(
-                "Scope reference: inputs.<slot>, steps.<id>.output, steps.<id>.status, \
-                 steps.<id>.requirements.<id>.outcome|reason, requirement.id, or \
-                 requirement.statement, with .field, [n], and (in assert each) [*] \
-                 selectors below inputs and step outputs.",
-            ))
+            .description(Some(REFERENCE_DESCRIPTION))
             .into()
     }
 }
@@ -647,6 +681,8 @@ mod tests {
             "steps.scope.status",
             "steps.scope.requirements.reviewable-size.outcome",
             "steps.scope.requirements.reviewable-size.reason",
+            "steps.review.publications",
+            "steps.review.publications.report_1",
             "requirement.id",
             "requirement.statement",
         ] {
@@ -679,6 +715,10 @@ mod tests {
             "steps.a.requirements.b.verdict",
             "steps.a.status.x",
             "steps.a.requirements.b.outcome.x",
+            "steps.a.publications.",
+            "steps.a.publications[0]",
+            "steps.a.publications.report.x",
+            "steps.a.publications.report[0]",
             "requirement.statement.x",
             "requirement.other",
             "inputs.a.",

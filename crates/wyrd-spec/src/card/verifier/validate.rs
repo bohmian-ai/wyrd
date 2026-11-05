@@ -333,13 +333,13 @@ where
         }) = &step.when
         {
             let when_path = format!("{path}.when");
-            self.validate_reference(when, position, false, &when_path)?;
+            self.validate_reference(when, position, false, false, &when_path)?;
             validate_operator(operator, &when_path)?;
         }
         let action_path = format!("{path}.action");
         match &step.action {
             Action::Extract { from } => {
-                self.validate_reference(from, position, false, &action_path)?;
+                self.validate_reference(from, position, false, false, &action_path)?;
                 let Some(InputSlot::Media { formats, .. }) = self.whole_slot(from) else {
                     return Err(invalid(
                         "extract_source",
@@ -394,11 +394,11 @@ where
                         ));
                     }
                 };
-                self.validate_reference(reference, position, wildcard, &path)?;
+                self.validate_reference(reference, position, wildcard, false, &path)?;
                 validate_operator(operator, &path)
             }
             Check::Trace(trace) => {
-                self.validate_reference(&trace.on, position, false, &path)?;
+                self.validate_reference(&trace.on, position, false, false, &path)?;
                 if !matches!(self.whole_slot(&trace.on), Some(InputSlot::Trace { .. })) {
                     return Err(invalid(
                         "trace_source",
@@ -491,7 +491,7 @@ where
             ));
         }
         for reference in call.inputs.values() {
-            self.validate_reference(reference, position, false, path)?;
+            self.validate_reference(reference, position, false, false, path)?;
         }
         Ok(())
     }
@@ -524,12 +524,15 @@ where
                 "agent must reference an Agent Card",
             ));
         }
-        for reference in call.inputs.values().chain(
-            call.workspace
-                .values()
-                .filter_map(WorkspaceSource::reference),
-        ) {
-            self.validate_reference(reference, position, false, path)?;
+        for reference in call.inputs.values() {
+            self.validate_reference(reference, position, false, false, path)?;
+        }
+        for reference in call
+            .workspace
+            .values()
+            .filter_map(WorkspaceSource::reference)
+        {
+            self.validate_reference(reference, position, false, true, path)?;
         }
         validate_workspace(&call.workspace, path)?;
         let Some(resolved) = (self.resolve)(&call.agent) else {
@@ -665,17 +668,19 @@ where
         Ok(())
     }
 
-    /// Validates one reference in its position.
+    /// Validates one reference in its position; `mount` admits publication
+    /// references, which only an Agent workspace source may name.
     ///
     /// # Errors
     /// Returns [`WyrdError::Validation`] with rule `wildcard_position`,
-    /// `unknown_reference`, `missing_field`, `requirement_position`,
-    /// `verdict_position`, or `step_position`.
+    /// `publication_position`, `unknown_reference`, `missing_field`,
+    /// `requirement_position`, `verdict_position`, or `step_position`.
     fn validate_reference(
         &self,
         reference: &Reference,
         position: Position<'a>,
         wildcard: bool,
+        mount: bool,
         path: &str,
     ) -> Result<(), WyrdError> {
         let refuse =
@@ -684,6 +689,12 @@ where
             return refuse(
                 "wildcard_position",
                 "[*] is allowed only in an assertion's each",
+            );
+        }
+        if matches!(reference.root, ReferenceRoot::StepPublications { .. }) && !mount {
+            return refuse(
+                "publication_position",
+                "publications mount only as an Agent workspace source",
             );
         }
         match &reference.root {
@@ -712,10 +723,21 @@ where
             }
             ReferenceRoot::StepOutput(step)
             | ReferenceRoot::StepStatus(step)
-            | ReferenceRoot::StepVerdict { step, .. } => {
+            | ReferenceRoot::StepVerdict { step, .. }
+            | ReferenceRoot::StepPublications { step, .. } => {
                 let Some(target) = self.spec.steps.iter().find(|s| &s.id == step) else {
                     return refuse("unknown_reference", "unknown step");
                 };
+                if matches!(
+                    reference.root,
+                    ReferenceRoot::StepPublications { name: Some(_), .. }
+                ) && !matches!(target.action, Action::Agent(_))
+                {
+                    return refuse(
+                        "unknown_reference",
+                        "only an Agent step publishes named content",
+                    );
+                }
                 if let ReferenceRoot::StepVerdict { requirement, .. } = &reference.root {
                     if self.owners.get(requirement) != Some(&step) {
                         return refuse("unknown_reference", "the step has no such requirement");
@@ -1698,6 +1720,77 @@ mod tests {
         unknown["requirements"][2]["check"]["workspace"]["/inputs/kit"]["artifact"]["extra"] =
             json!(1);
         assert!(serde_json::from_value::<VerifierSpec>(unknown).is_err());
+    }
+
+    /// Publication references mount only as Agent workspace sources, name a
+    /// declared step, and select a named member only from an Agent step;
+    /// collections of any step mount.
+    ///
+    /// # Panics
+    /// Panics when a publication reference rule is not enforced.
+    #[test]
+    fn verifier_spec_mounts_publications_only_in_workspaces() {
+        let mut consumer = review();
+        consumer["steps"]
+            .as_array_mut()
+            .expect("steps")
+            .push(json!({
+                "id": "consolidate",
+                "action": {"kind": "agent",
+                    "agent": agent(&["fs.read"], json!("Consolidate"), None),
+                    "workspace": {
+                        "/inputs/reviews": "steps.findings.publications",
+                        "/inputs/report": "steps.findings.publications.report",
+                        "/inputs/structure": "steps.structure.publications"
+                    }}
+            }));
+        parse(&consumer)
+            .validate()
+            .expect("publications mount as workspace sources");
+        let cases = [
+            (
+                with(
+                    review(),
+                    "/steps/2/action/inputs/text",
+                    json!("steps.findings.publications.report"),
+                ),
+                "publication_position",
+            ),
+            (
+                with(
+                    review(),
+                    "/requirements/0/check/path",
+                    json!("steps.findings.publications"),
+                ),
+                "publication_position",
+            ),
+            (
+                with(
+                    review(),
+                    "/steps/1/action/inputs/outline",
+                    json!("steps.structure.publications"),
+                ),
+                "publication_position",
+            ),
+        ];
+        let mount = |destination: &str, reference: &str| {
+            let mut body = consumer.clone();
+            body["steps"][3]["action"]["workspace"][destination] = json!(reference);
+            body
+        };
+        let cases = cases.into_iter().chain([
+            (
+                mount("/inputs/structure", "steps.structure.publications.evidence"),
+                "unknown_reference",
+            ),
+            (
+                mount("/inputs/report", "steps.missing.publications.report"),
+                "unknown_reference",
+            ),
+        ]);
+        for (body, expected) in cases {
+            assert_eq!(rule(&body), expected, "{body}");
+        }
     }
 
     /// Every built-in tool validates on a step Agent, with a workspace only

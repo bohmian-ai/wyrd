@@ -1484,6 +1484,22 @@ unknown references, checks that read another requirement's verdict, and
 fields absent from a known output schema. Independent steps run concurrently;
 a step's requirements run before its dependents start.
 
+An Agent workspace source may also name `steps.<id>.publications.<name>` or
+`steps.<id>.publications`; no other position accepts them, and only an Agent
+step publishes named content. A named member mounts what the step's
+successful attempt published under that logical name at the destination: a
+file, a directory with its empty directories, or JSON as a UTF-8 JSON file.
+It never falls back to an earlier attempt; a step with no successful attempt
+leaves the consumer's binding missing, and a missing name refuses the
+consumer before it runs. A collection mounts once the step settles, whatever
+its status, as `manifest.json` (`status`, `reason`, `speculation`, every
+attempt's `invocations` record, and `entries` naming each admitted
+publication, its kind, its mounted `path`, and its producer item, iteration,
+and attempt) plus `content/<opaque invocation segment>/<name>`, so failed
+attempts' accepted partial work stays readable and distinct. Mounted content
+cites only its producer's original slots; a failed step's partial work and
+the manifest cite none. Direct verify accepts no publications.
+
 Requirement outcomes are `passed`, `failed`, `inconclusive`, or
 `not_applicable`. An intentional skip (false `when`) makes dependent
 requirements `not_applicable`; a failed or timed-out step makes them

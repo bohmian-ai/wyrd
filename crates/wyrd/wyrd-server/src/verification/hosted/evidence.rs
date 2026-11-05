@@ -14,7 +14,9 @@
 //! evidence also only when its sniffed format matches, so a mismatched file
 //! can never feed a pass. Extraction, workspaces, citations, and native media all read through
 //! it; it is also the Agent executor's [`EvidenceReader`] and the `extract`
-//! action's [`ActionExecutor`].
+//! action's [`ActionExecutor`]. Bound to a queued execution, it also reads
+//! the publications that execution's steps accepted, which workspaces mount
+//! through `steps.<id>.publications` references.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::{Arc, Mutex, PoisonError};
@@ -29,10 +31,14 @@ use wyrd_loader::{EXTRACT_VERSION, Extraction, lines, locates, units};
 use wyrd_spec::auth::Sha256Hex;
 use wyrd_spec::card::verifier::{Action, InputSlot};
 use wyrd_spec::envelope::CardKind;
-use wyrd_spec::ids::{CardUid, SlotName};
+use wyrd_spec::ids::{CardUid, ExecutionId, SlotName};
 use wyrd_spec::reference::{CardRef, CardRefIdentity};
 use wyrd_spec::registry::StoredArtifactEntry;
-use wyrd_spec::verification::execution::{CallProvenance, Citation, InputDeclaration, Locator};
+use wyrd_spec::verification::TaskId;
+use wyrd_spec::verification::execution::{
+    CallProvenance, Citation, InputDeclaration, Locator, Publication, PublicationFile,
+};
+use wyrd_sql::queries::verifier_executions::VerifierExecutionQueue;
 use wyrd_storage::error::StorageError;
 use wyrd_storage::tenant_path::{self, ValidatedPath};
 
@@ -61,6 +67,9 @@ pub struct TenantEvidence {
     artifacts: Mutex<BTreeMap<ArtifactKey, Arc<ArtifactInventory>>>,
     /// File limits in force.
     limits: HostedLimits,
+    /// The queued execution whose publications are readable; `None` for
+    /// direct verify, which accepts none.
+    execution: Option<ExecutionId>,
 }
 
 /// An exact Artifact reference: its identity and optional pinned UID.
@@ -83,7 +92,52 @@ impl TenantEvidence {
             files: Mutex::default(),
             artifacts: Mutex::default(),
             limits,
+            execution: None,
         }
+    }
+
+    /// This reader, bound to read the publications `execution` accepted.
+    #[must_use]
+    pub const fn with_execution(mut self, execution: ExecutionId) -> Self {
+        self.execution = Some(execution);
+        self
+    }
+
+    /// Every publication `step` accepted in the bound execution, grouped by
+    /// item, iteration, and attempt and in acceptance order within an
+    /// attempt; none without a bound execution.
+    ///
+    /// # Errors
+    /// Returns [`BlockError::Retryable`] when the publications cannot be
+    /// read now.
+    pub async fn publications(&self, step: &TaskId) -> Result<Vec<Publication>, BlockError> {
+        let Some(execution) = self.execution else {
+            return Ok(Vec::new());
+        };
+        let unavailable = |error: &dyn std::fmt::Display| BlockError::Retryable {
+            reason: format!("the step's publications cannot be read: {error}"),
+        };
+        let mut conn = self
+            .state
+            .postgres
+            .tenant_conn(self.caller.data_tenant_id)
+            .await
+            .map_err(|error| unavailable(&error))?;
+        VerifierExecutionQueue::default()
+            .publications(&mut conn, execution, step)
+            .await
+            .map_err(|error| unavailable(&error))
+    }
+
+    /// The verified bytes of one file a publication retains.
+    ///
+    /// # Errors
+    /// As reading a declared File: [`BlockError::Retryable`] while its
+    /// completed record is not yet visible or storage is unavailable, and
+    /// [`BlockError::Terminal`] for bytes that do not match its manifest.
+    pub async fn published(&self, file: &PublicationFile) -> Result<Vec<u8>, BlockError> {
+        let path = self.file_object(&file.sha256, file.size_bytes).await?;
+        self.stored(&path, file.size_bytes, &file.sha256).await
     }
 
     /// The located units of pinned slot `declaration`, or `None` when it

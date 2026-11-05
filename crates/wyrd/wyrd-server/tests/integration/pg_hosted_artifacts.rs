@@ -1325,6 +1325,7 @@ async fn artifact_evidence_is_admitted_against_its_slot_and_the_combined_limit()
                         defer_unlanded_traces: false,
                         drift: DriftChecks::new(None, BTreeMap::new(), BTreeMap::new()),
                         clock: BlockClock::default(),
+                        execution: None,
                     },
                 )
                 .expect("engine builds")

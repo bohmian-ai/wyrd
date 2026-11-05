@@ -5,17 +5,19 @@
 //! A trusted hosted caller inside one leased execution publishes through
 //! [`Publications`]; no public endpoint accepts arbitrary paths.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use serde_json::{Value, json};
 use skald_spec::MediaFormat;
+use vala_verify::blocks::{CallInput, CallValue};
 use wyrd_server::verification::hosted::HostedLimits;
 use wyrd_server::verification::hosted::evidence::TenantEvidence;
 use wyrd_server::verification::hosted::publications::{Publications, PublishCall};
-use wyrd_server::verification::hosted::workspace::Workspace;
+use wyrd_server::verification::hosted::workspace::{Workspace, Workspaces};
+use wyrd_spec::ids::SlotName;
 use wyrd_spec::verification::execution::{
-    InputDeclaration, Producer, PublicationContent, PublicationFile, PublicationKind,
-    PublicationManifest,
+    InputDeclaration, Producer, ProducerInvocation, PublicationCollection, PublicationContent,
+    PublicationFile, PublicationKind, PublicationManifest, Speculation, StepStatus,
 };
 use wyrd_spec::verification::{PublicationName, TaskId};
 use wyrd_sql::queries::verifier_executions::{ExecutionLease, VerifierExecutionQueue};
@@ -86,18 +88,14 @@ impl Leased {
             .await
             .expect("tenant connection opens");
         VerifierExecutionQueue::default()
-            .publication(
-                &mut conn,
-                self.lease.execution_id,
-                producer,
-                &PublicationName::new(name).expect("name"),
-            )
+            .publications(&mut conn, self.lease.execution_id, &producer.step_id)
             .await
-            .expect("the publication reads")
-            .map(|publication| {
-                assert_eq!(&publication.producer, producer);
-                publication.content
+            .expect("the publications read")
+            .into_iter()
+            .find(|publication| {
+                &publication.producer == producer && publication.name.as_str() == name
             })
+            .map(|publication| publication.content)
     }
 }
 
@@ -624,6 +622,260 @@ async fn publication_replay_preserves_attempt_identity() {
         ],
         "one entry per accepted call, none for the failed upload or stale lease"
     );
+    leased
+        .server
+        .shutdown()
+        .await
+        .expect("test server shuts down");
+}
+
+/// Workspaces mount retained evidence through the hosted evidence owner: a
+/// named member only from its successful attempt, at its destination, and a
+/// collection as an honest manifest of every producer status and attempt
+/// with its admitted publications, partial work of failed attempts included,
+/// under `content/`. Mounted files cite only their producer's original
+/// slots, and a missing name refuses the consumer before it runs.
+///
+/// # Panics
+/// Panics when a mounted path, byte, source, manifest field, or refusal
+/// differs.
+#[tokio::test(flavor = "multi_thread")]
+async fn publication_mounts_preserve_status_and_lineage() {
+    let leased = Leased::start().await;
+    let limits = HostedLimits::default();
+    let caller = user(leased.server.data_tenant_id(), []);
+    let publications = Publications::new(leased.server.state(), &caller, leased.lease, limits);
+    let producer = |step: &str, attempt| Producer {
+        step_id: TaskId::new(step).expect("task"),
+        item_index: None,
+        iteration_index: None,
+        attempt,
+    };
+    let (first, second, broken) = (
+        producer("review", 1),
+        producer("review", 2),
+        producer("broken", 1),
+    );
+    let scratch = Workspace::materialize(Vec::new(), limits, None).expect("workspace");
+    put(&scratch, "draft.md", b"early draft");
+    put(&scratch, "report/summary.md", b"# Summary\nagrees\n");
+    put(&scratch, "report/manifest.json", b"{\"forged\": true}");
+    std::fs::create_dir_all(scratch.work_dir().join("report/empty")).expect("mkdir");
+    put(&scratch, "partial.md", b"half a review");
+    publications
+        .path(&call("d", &first, "draft"), &scratch, "/work/draft.md")
+        .await
+        .expect("the failed attempt publishes partial work");
+    publications
+        .path(&call("r", &second, "report"), &scratch, "/work/report")
+        .await
+        .expect("the successful attempt publishes its report");
+    publications
+        .json(&call("a", &second, "assessment"), json!({"agrees": true}))
+        .await
+        .expect("the successful attempt publishes JSON");
+    publications
+        .path(&call("p", &broken, "partial"), &scratch, "/work/partial.md")
+        .await
+        .expect("the failed step publishes partial work");
+    leased
+        .server
+        .flush_bifrost()
+        .await
+        .expect("the File inventory publishes");
+
+    let evidence = TenantEvidence::new(
+        leased.server.state().clone(),
+        caller.clone(),
+        BTreeMap::new(),
+        limits,
+    )
+    .with_execution(leased.lease.execution_id);
+    let answer = BTreeSet::from([SlotName::new("answer").expect("slot")]);
+    let named = |producer: &Producer, name: &str| CallInput {
+        value: CallValue::Publication {
+            producer: producer.clone(),
+            name: PublicationName::new(name).expect("name"),
+        },
+        sources: answer.clone(),
+    };
+    let invocation = |attempt, status, reason: Option<&str>| ProducerInvocation {
+        item_index: None,
+        iteration_index: None,
+        attempt,
+        status,
+        reason: reason.map(str::to_owned),
+    };
+    let collection = |step: &str, status, reason: Option<&str>, invocations, sources| CallInput {
+        value: CallValue::Publications {
+            step: TaskId::new(step).expect("task"),
+            collection: PublicationCollection {
+                status,
+                reason: reason.map(str::to_owned),
+                speculation: Speculation::None,
+                invocations,
+                entries: Vec::new(),
+            },
+        },
+        sources,
+    };
+    let files = BTreeMap::from([
+        ("/inputs/report".to_owned(), named(&second, "report")),
+        (
+            "/inputs/assessment.json".to_owned(),
+            named(&second, "assessment"),
+        ),
+        (
+            "/inputs/reviews".to_owned(),
+            collection(
+                "review",
+                StepStatus::Succeeded,
+                None,
+                vec![
+                    invocation(
+                        1,
+                        StepStatus::Failed,
+                        Some("the attempt failed and was retried"),
+                    ),
+                    invocation(2, StepStatus::Succeeded, None),
+                ],
+                answer.clone(),
+            ),
+        ),
+        (
+            "/inputs/broken".to_owned(),
+            collection(
+                "broken",
+                StepStatus::Failed,
+                Some("broken"),
+                vec![invocation(1, StepStatus::Failed, Some("broken"))],
+                BTreeSet::new(),
+            ),
+        ),
+        (
+            "/inputs/gated".to_owned(),
+            collection(
+                "gated",
+                StepStatus::Skipped,
+                Some("when `inputs.answer.go` was false"),
+                Vec::new(),
+                BTreeSet::new(),
+            ),
+        ),
+    ]);
+    let workspaces = Workspaces::new(limits);
+    let mounted = workspaces
+        .open(&files, &evidence)
+        .await
+        .expect("the publications mount");
+    let inputs = mounted.inputs_dir();
+    let text = |relative: &str| {
+        std::fs::read_to_string(inputs.join(relative))
+            .unwrap_or_else(|error| panic!("{relative}: {error}"))
+    };
+    assert_eq!(text("report/summary.md"), "# Summary\nagrees\n");
+    assert_eq!(text("report/manifest.json"), "{\"forged\": true}");
+    assert!(
+        inputs.join("report/empty").is_dir(),
+        "empty directories mount"
+    );
+    assert_eq!(
+        serde_json::from_str::<Value>(&text("assessment.json")).expect("JSON"),
+        json!({"agrees": true})
+    );
+    let manifest = |relative: &str| {
+        serde_json::from_str::<Value>(&text(relative)).expect("the manifest is JSON")
+    };
+    assert_eq!(
+        manifest("reviews/manifest.json"),
+        json!({
+            "status": "succeeded", "reason": null, "speculation": "none",
+            "invocations": [
+                {"item_index": null, "iteration_index": null, "attempt": 1, "status": "failed", "reason": "the attempt failed and was retried"},
+                {"item_index": null, "iteration_index": null, "attempt": 2, "status": "succeeded", "reason": null},
+            ],
+            "entries": [
+                {"name": "draft", "kind": "file", "path": "content/attempt-1/draft", "item_index": null, "iteration_index": null, "attempt": 1},
+                {"name": "report", "kind": "directory", "path": "content/attempt-2/report", "item_index": null, "iteration_index": null, "attempt": 2},
+                {"name": "assessment", "kind": "json", "path": "content/attempt-2/assessment", "item_index": null, "iteration_index": null, "attempt": 2},
+            ],
+        })
+    );
+    assert_eq!(text("reviews/content/attempt-1/draft"), "early draft");
+    assert_eq!(
+        text("reviews/content/attempt-2/report/manifest.json"),
+        "{\"forged\": true}",
+        "a published manifest.json stays beneath content/"
+    );
+    assert!(
+        inputs
+            .join("reviews/content/attempt-2/report/empty")
+            .is_dir()
+    );
+    assert_eq!(
+        manifest("broken/manifest.json")["entries"],
+        json!([{"name": "partial", "kind": "file", "path": "content/attempt-1/partial", "item_index": null, "iteration_index": null, "attempt": 1}])
+    );
+    assert_eq!(manifest("broken/manifest.json")["status"], "failed");
+    assert_eq!(text("broken/content/attempt-1/partial"), "half a review");
+    assert_eq!(
+        manifest("gated/manifest.json"),
+        json!({"status": "skipped", "reason": "when `inputs.answer.go` was false", "speculation": "none", "invocations": [], "entries": []})
+    );
+
+    let listed = mounted.list("/inputs").expect("the inputs list");
+    let sources: BTreeMap<&str, &Value> = listed["files"]
+        .as_array()
+        .expect("files")
+        .iter()
+        .map(|file| (file["path"].as_str().expect("path"), &file["sources"]))
+        .collect();
+    assert_eq!(sources["/inputs/report/summary.md"], &json!(["answer"]));
+    assert_eq!(
+        sources["/inputs/reviews/content/attempt-1/draft"],
+        &json!(["answer"])
+    );
+    assert_eq!(
+        sources["/inputs/reviews/manifest.json"],
+        &json!([]),
+        "the host manifest cites nothing"
+    );
+    assert_eq!(
+        sources["/inputs/broken/content/attempt-1/partial"],
+        &json!([]),
+        "partial work of a failed step cites no original slot"
+    );
+    drop(mounted);
+
+    for (producer, name) in [(&first, "report"), (&second, "draft"), (&second, "missing")] {
+        let error = workspaces
+            .open(
+                &BTreeMap::from([("/inputs/x".to_owned(), named(producer, name))]),
+                &evidence,
+            )
+            .await
+            .err()
+            .expect("a missing named publication refuses the consumer");
+        assert!(
+            error
+                .to_string()
+                .contains(&format!("published no `{name}`")),
+            "{error}"
+        );
+    }
+    let direct = TenantEvidence::new(
+        leased.server.state().clone(),
+        caller,
+        BTreeMap::new(),
+        limits,
+    );
+    let unbound = workspaces
+        .open(
+            &BTreeMap::from([("/inputs/x".to_owned(), named(&second, "report"))]),
+            &direct,
+        )
+        .await;
+    assert!(unbound.is_err(), "direct verify accepts no publications");
     leased
         .server
         .shutdown()

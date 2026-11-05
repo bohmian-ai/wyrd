@@ -4761,7 +4761,7 @@ export interface RefSibling {
 }
 
 /**
- * Scope reference: inputs.<slot>, steps.<id>.output, steps.<id>.status, steps.<id>.requirements.<id>.outcome|reason, requirement.id, or requirement.statement, with .field, [n], and (in assert each) [*] selectors below inputs and step outputs.
+ * Scope reference: inputs.<slot>, steps.<id>.output, steps.<id>.status, steps.<id>.requirements.<id>.outcome|reason, requirement.id, or requirement.statement, with .field, [n], and (in assert each) [*] selectors below inputs and step outputs; an Agent workspace source may also mount steps.<id>.publications or steps.<id>.publications.<name>.
  */
 export type Reference = string;
 

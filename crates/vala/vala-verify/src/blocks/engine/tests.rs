@@ -14,7 +14,10 @@ use tokio::sync::{Barrier, Notify};
 use wyrd_spec::vala::ids::{SpanId, TraceId};
 use wyrd_spec::vala::trace::{InstrumentationScope, Resource, SpanKind, SpanRecord, SpanStatus};
 use wyrd_spec::verification::DriftWindow;
-use wyrd_spec::verification::execution::Verdict;
+use wyrd_spec::verification::PublicationName;
+use wyrd_spec::verification::execution::{
+    Producer, ProducerInvocation, PublicationCollection, Speculation, Verdict,
+};
 
 use super::*;
 use crate::InMemoryTraceSource;
@@ -105,8 +108,8 @@ struct Script {
     log: Mutex<Vec<String>>,
     /// Attempts made per step.
     attempts: Mutex<HashMap<String, usize>>,
-    /// Each call's workspace paths and their sources, by block ID.
-    mounts: Mutex<HashMap<String, BTreeMap<String, BTreeSet<SlotName>>>>,
+    /// Each call's workspace by block ID.
+    mounts: Mutex<HashMap<String, BTreeMap<String, CallInput>>>,
 }
 
 impl Script {
@@ -133,13 +136,10 @@ impl Script {
     /// Panics when another recording call panicked while holding the
     /// mounts lock.
     fn mount(&self, id: &TaskId, workspace: &BTreeMap<String, CallInput>) {
-        self.mounts.lock().expect("mounts").insert(
-            id.as_str().to_owned(),
-            workspace
-                .iter()
-                .map(|(path, input)| (path.clone(), input.sources.clone()))
-                .collect(),
-        );
+        self.mounts
+            .lock()
+            .expect("mounts")
+            .insert(id.as_str().to_owned(), workspace.clone());
     }
 }
 
@@ -2089,7 +2089,19 @@ async fn fixed_attachments_mount_selected_files_as_pinned_slots() {
         .await
         .expect("outcome");
     let slot = |name: &str| BTreeSet::from([SlotName::new(name).expect("slot")]);
-    let mounts = script.mounts.lock().expect("mounts").clone();
+    let mounts: HashMap<String, BTreeMap<String, BTreeSet<SlotName>>> = script
+        .mounts
+        .lock()
+        .expect("mounts")
+        .iter()
+        .map(|(id, workspace)| {
+            let sources = workspace
+                .iter()
+                .map(|(path, input)| (path.clone(), input.sources.clone()))
+                .collect();
+            (id.clone(), sources)
+        })
+        .collect();
     assert_eq!(
         mounts["read"],
         BTreeMap::from([
@@ -2134,6 +2146,154 @@ async fn fixed_attachments_mount_selected_files_as_pinned_slots() {
         run(&hosted, &missing, json!({})).await,
         Err(EngineError::InputInvalid(_))
     ));
+}
+
+/// Publication references resolve to typed host mounts: a named member to
+/// the successful attempt and its sources, a collection to every settled
+/// producer's honest status and attempts, and a named member of a step with
+/// no successful attempt to a gap that skips its consumer before it runs.
+///
+/// # Panics
+/// Panics when a resolved mount, attempt record, or gap differs.
+#[tokio::test(start_paused = true)]
+async fn publication_references_resolve_to_attempts_and_statuses() {
+    let spec = verifier(json!({
+        "inputs": {"answer": {"type": "json"}},
+        "steps": [
+            {"id": "review", "retries": 1, "action": reader_agent(json!({"/inputs/a.json": "inputs.answer"}))},
+            {"id": "broken", "action": reader_agent(json!({"/inputs/a.json": "inputs.answer"}))},
+            {"id": "gated", "when": {"path": "inputs.answer.go", "operator": "equals", "expected": true},
+             "action": reader_agent(json!({"/inputs/a.json": "inputs.answer"}))},
+            {"id": "consume", "action": reader_agent(json!({
+                "/inputs/report": "steps.review.publications.report",
+                "/inputs/reviews": "steps.review.publications",
+                "/inputs/broken": "steps.broken.publications",
+                "/inputs/gated": "steps.gated.publications",
+            }))},
+            {"id": "blocked", "action": reader_agent(json!({"/inputs/report": "steps.broken.publications.report"}))},
+        ],
+        "requirements": [{"id": "ran", "statement": "s", "check": {"kind": "assert", "path": "inputs.answer", "operator": "is_not_null"}}],
+    }));
+    let flaky = BlockError::Retryable {
+        reason: "flaky".to_owned(),
+    };
+    let broken = BlockError::Terminal {
+        reason: "broken".to_owned(),
+    };
+    let script = Arc::new(Script {
+        actions: HashMap::from([
+            ("review", Behavior::Attempts(vec![flaky], json!({}))),
+            ("broken", Behavior::Attempts(vec![broken], json!({}))),
+        ]),
+        ..Script::default()
+    });
+    let outcome = run(
+        &engine(&script, InMemoryTraceSource::new(), 4),
+        &spec,
+        json!({"answer": {"go": false}}),
+    )
+    .await
+    .expect("outcome");
+    let consumed = script.mounts.lock().expect("mounts")["consume"].clone();
+    let collection = |status, reason: Option<&str>, invocations: Vec<ProducerInvocation>| {
+        CallValue::Publications {
+            step: TaskId::new("x").expect("task"),
+            collection: PublicationCollection {
+                status,
+                reason: reason.map(str::to_owned),
+                speculation: Speculation::None,
+                invocations,
+                entries: Vec::new(),
+            },
+        }
+    };
+    let invocation = |attempt, status, reason: Option<&str>| ProducerInvocation {
+        item_index: None,
+        iteration_index: None,
+        attempt,
+        status,
+        reason: reason.map(str::to_owned),
+    };
+    let answer = BTreeSet::from([SlotName::new("answer").expect("slot")]);
+    let observed: BTreeMap<&str, (CallValue, BTreeSet<SlotName>)> = consumed
+        .iter()
+        .map(|(path, input)| {
+            let value = match &input.value {
+                CallValue::Publications { collection, .. } => CallValue::Publications {
+                    step: TaskId::new("x").expect("task"),
+                    collection: collection.clone(),
+                },
+                value => value.clone(),
+            };
+            (path.as_str(), (value, input.sources.clone()))
+        })
+        .collect();
+    assert_eq!(
+        observed,
+        BTreeMap::from([
+            (
+                "/inputs/report",
+                (
+                    CallValue::Publication {
+                        producer: Producer {
+                            step_id: TaskId::new("review").expect("task"),
+                            item_index: None,
+                            iteration_index: None,
+                            attempt: 2,
+                        },
+                        name: PublicationName::new("report").expect("name"),
+                    },
+                    answer.clone(),
+                ),
+            ),
+            (
+                "/inputs/reviews",
+                (
+                    collection(
+                        StepStatus::Succeeded,
+                        None,
+                        vec![
+                            invocation(1, StepStatus::Failed, Some(crate::blocks::scope::RETRIED)),
+                            invocation(2, StepStatus::Succeeded, None),
+                        ],
+                    ),
+                    answer,
+                ),
+            ),
+            (
+                "/inputs/broken",
+                (
+                    collection(
+                        StepStatus::Failed,
+                        Some("broken"),
+                        vec![invocation(1, StepStatus::Failed, Some("broken"))],
+                    ),
+                    BTreeSet::new(),
+                ),
+            ),
+            (
+                "/inputs/gated",
+                (
+                    collection(
+                        StepStatus::Skipped,
+                        Some("when `inputs.answer.go` was false"),
+                        Vec::new(),
+                    ),
+                    BTreeSet::new(),
+                ),
+            ),
+        ])
+    );
+    let blocked = step(&outcome, "blocked");
+    assert_eq!(blocked.status, StepStatus::Skipped);
+    assert!(
+        blocked
+            .reason
+            .as_deref()
+            .is_some_and(|reason| reason.contains("no successful attempt to publish")),
+        "{blocked:?}"
+    );
+    assert!(!script.calls().contains(&"action:blocked".to_owned()));
 }
 
 /// An in-memory invocation record keyed by task and attempt.

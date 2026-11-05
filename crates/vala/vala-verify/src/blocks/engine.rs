@@ -1470,12 +1470,15 @@ fn requirement_at(spec: &VerifierSpec, (step, at): Key) -> &Requirement {
 }
 
 /// The JSON a comparison reads: evidence compares as its declaration.
+/// Publications never reach a comparison, since validation admits them only
+/// as workspace sources.
 fn json(input: &CallInput) -> Value {
     match &input.value {
         CallValue::Json(value) => value.clone(),
         CallValue::Evidence(declaration) => {
             serde_json::to_value(declaration).unwrap_or(Value::Null)
         }
+        CallValue::Publication { .. } | CallValue::Publications { .. } => Value::Null,
     }
 }
 

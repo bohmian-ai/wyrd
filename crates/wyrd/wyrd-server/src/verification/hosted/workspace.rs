@@ -10,7 +10,11 @@
 //! UTF-8 lines of a file, and only `fs.extract` runs the extractor, on
 //! request, into a new `/work` file. Every `/inputs` file keeps the
 //! original slots it came from, so tool output stays citable against
-//! original evidence. Dropping the [`Workspace`] removes the directory and
+//! original evidence. A `steps.<id>.publications` reference mounts what the
+//! execution's step published: a named member at its destination, or the
+//! whole collection as `manifest.json` plus `content/` beneath it; derived
+//! files keep only their producer's original slots, so a generated opinion
+//! can never be cited as original evidence. Dropping the [`Workspace`] removes the directory and
 //! releases its admission, on success, failure, or cancellation alike.
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -28,7 +32,9 @@ use vala_verify::blocks::{BlockError, CallInput, CallValue};
 use wyrd_loader::{EXTRACT_VERSION, Extraction, lines, zip_guard};
 use wyrd_spec::error::WyrdError;
 use wyrd_spec::ids::SlotName;
-use wyrd_spec::verification::execution::InputDeclaration;
+use wyrd_spec::verification::execution::{
+    CollectionEntry, InputDeclaration, Producer, Publication, PublicationContent,
+};
 
 use super::evidence::TenantEvidence;
 use super::tools::{invocation, structured};
@@ -59,13 +65,15 @@ impl Workspaces {
     /// the execution is deferred instead. Evidence is read and verified
     /// first, then written on the blocking pool. An Artifact file keeps its
     /// stored content type only as a hint for `fs.extract`; it is never
-    /// unpacked.
+    /// unpacked. A named publication must exist for its successful producer
+    /// attempt, so a missing one refuses the call before it runs.
     ///
     /// # Errors
     /// Returns [`BlockError::Busy`] when every workspace is taken, the
     /// evidence reader's errors, [`BlockError::Terminal`] for an invalid
-    /// path, combined input bytes over the limit, or any materialization
-    /// refusal, and [`BlockError::Retryable`] when the blocking task fails.
+    /// path, a missing named publication, combined input bytes over the
+    /// limit, or any materialization refusal, and [`BlockError::Retryable`]
+    /// when the blocking task fails.
     pub async fn open(
         &self,
         files: &BTreeMap<String, CallInput>,
@@ -77,44 +85,187 @@ impl Workspaces {
                 .map_err(|_| BlockError::Busy {
                     reason: "every workspace is in use".to_owned(),
                 })?;
-        let mut staged = Vec::with_capacity(files.len());
-        let mut total = 0_u64;
+        let mut mount = Mount::default();
         for (path, input) in files {
-            let (bytes, format) = match &input.value {
-                CallValue::Json(value) => (
-                    serde_json::to_vec_pretty(value).unwrap_or_default(),
-                    Some(MediaFormat::Json),
-                ),
-                CallValue::Evidence(InputDeclaration::Artifact { artifact, path }) => {
-                    let (bytes, format) = evidence.artifact(artifact, path.as_deref()).await?;
-                    (bytes, format.filter(|format| !format.is_archive()))
+            let sources = &input.sources;
+            match &input.value {
+                CallValue::Json(value) => mount.json(path.clone(), value, sources),
+                CallValue::Evidence(InputDeclaration::Artifact {
+                    artifact,
+                    path: file,
+                }) => {
+                    let (bytes, format) = evidence.artifact(artifact, file.as_deref()).await?;
+                    mount.file(
+                        path.clone(),
+                        bytes,
+                        format.filter(|format| !format.is_archive()),
+                        sources,
+                    );
                 }
                 CallValue::Evidence(declaration) => {
                     let (bytes, format) = evidence.read(declaration).await?;
-                    (bytes, Some(format))
+                    mount.file(path.clone(), bytes, Some(format), sources);
                 }
-            };
-            total = total.saturating_add(u64::try_from(bytes.len()).unwrap_or(u64::MAX));
-            if total > self.limits.files_max_bytes {
+                CallValue::Publication { producer, name } => {
+                    let publication = evidence
+                        .publications(&producer.step_id)
+                        .await?
+                        .into_iter()
+                        .find(|publication| {
+                            &publication.producer == producer && &publication.name == name
+                        })
+                        .ok_or_else(|| {
+                            terminal(format!(
+                                "{path}: the successful attempt of step `{}` published no `{}`",
+                                producer.step_id.as_str(),
+                                name.as_str()
+                            ))
+                        })?;
+                    mount
+                        .publication(evidence, path, &publication, sources)
+                        .await?;
+                }
+                CallValue::Publications { step, collection } => {
+                    let mut manifest = collection.clone();
+                    for publication in evidence.publications(step).await? {
+                        let relative = format!(
+                            "content/{}/{}",
+                            segment(&publication.producer),
+                            publication.name.as_str()
+                        );
+                        mount
+                            .publication(
+                                evidence,
+                                &format!("{path}/{relative}"),
+                                &publication,
+                                sources,
+                            )
+                            .await?;
+                        manifest.entries.push(CollectionEntry {
+                            kind: publication.content.kind(),
+                            name: publication.name,
+                            path: relative,
+                            item_index: publication.producer.item_index,
+                            iteration_index: publication.producer.iteration_index,
+                            attempt: publication.producer.attempt,
+                        });
+                    }
+                    let manifest = serde_json::to_value(&manifest).unwrap_or(Value::Null);
+                    mount.json(format!("{path}/manifest.json"), &manifest, &BTreeSet::new());
+                    mount.directories.push(path.clone());
+                }
+            }
+            if mount.bytes > self.limits.files_max_bytes {
                 return Err(terminal(format!(
                     "workspace inputs exceed the {}-byte combined file limit",
                     self.limits.files_max_bytes
                 )));
             }
-            staged.push(Staged {
-                path: path.clone(),
-                bytes,
-                format,
-                sources: input.sources.clone(),
-            });
         }
         let limits = self.limits;
-        tokio::task::spawn_blocking(move || Workspace::materialize(staged, limits, permit))
-            .await
-            .map_err(|error| BlockError::Retryable {
-                reason: format!("workspace materialization stopped: {error}"),
-            })?
+        tokio::task::spawn_blocking(move || {
+            let workspace = Workspace::materialize(mount.staged, limits, permit)?;
+            for directory in &mount.directories {
+                let host = workspace.host(directory).ok_or_else(|| {
+                    terminal(format!("{directory} is not under /inputs or /work"))
+                })?;
+                std::fs::create_dir_all(host).map_err(io)?;
+            }
+            Ok(workspace)
+        })
+        .await
+        .map_err(|error| BlockError::Retryable {
+            reason: format!("workspace materialization stopped: {error}"),
+        })?
     }
+}
+
+/// The files and directories one open stages.
+#[derive(Default)]
+struct Mount {
+    /// Files to place.
+    staged: Vec<Staged>,
+    /// Directories to create, empty ones included.
+    directories: Vec<String>,
+    /// Combined bytes of the staged files.
+    bytes: u64,
+}
+
+impl Mount {
+    /// Stage `bytes` at `path`.
+    fn file(
+        &mut self,
+        path: String,
+        bytes: Vec<u8>,
+        format: Option<MediaFormat>,
+        sources: &BTreeSet<SlotName>,
+    ) {
+        self.bytes = self
+            .bytes
+            .saturating_add(u64::try_from(bytes.len()).unwrap_or(u64::MAX));
+        self.staged.push(Staged {
+            path,
+            bytes,
+            format,
+            sources: sources.clone(),
+        });
+    }
+
+    /// Stage `value` as a UTF-8 JSON file at `path`.
+    fn json(&mut self, path: String, value: &Value, sources: &BTreeSet<SlotName>) {
+        let bytes = serde_json::to_vec_pretty(value).unwrap_or_default();
+        self.file(path, bytes, Some(MediaFormat::Json), sources);
+    }
+
+    /// Stage `publication` at `path`: a file there, a JSON file there, or a
+    /// directory there with its files and empty directories beneath it.
+    ///
+    /// # Errors
+    /// Returns [`TenantEvidence::published`]'s errors.
+    async fn publication(
+        &mut self,
+        evidence: &TenantEvidence,
+        path: &str,
+        publication: &Publication,
+        sources: &BTreeSet<SlotName>,
+    ) -> Result<(), BlockError> {
+        match &publication.content {
+            PublicationContent::Json { value } => self.json(path.to_owned(), value, sources),
+            PublicationContent::File { manifest } => {
+                for file in &manifest.files {
+                    let bytes = evidence.published(file).await?;
+                    self.file(path.to_owned(), bytes, None, sources);
+                }
+            }
+            PublicationContent::Directory { manifest } => {
+                self.directories.push(path.to_owned());
+                self.directories.extend(
+                    manifest
+                        .directories
+                        .iter()
+                        .map(|directory| format!("{path}/{directory}")),
+                );
+                for file in &manifest.files {
+                    let bytes = evidence.published(file).await?;
+                    self.file(format!("{path}/{}", file.path), bytes, None, sources);
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+/// The opaque collection segment of `producer`'s invocation attempt.
+fn segment(producer: &Producer) -> String {
+    let item = producer
+        .item_index
+        .map(|item| format!("item-{item}."))
+        .unwrap_or_default();
+    let iteration = producer
+        .iteration_index
+        .map(|iteration| format!("iteration-{iteration}."))
+        .unwrap_or_default();
+    format!("{item}{iteration}attempt-{}", producer.attempt)
 }
 
 /// One file to place under `/inputs`.

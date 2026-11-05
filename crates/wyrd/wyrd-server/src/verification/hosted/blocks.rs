@@ -27,7 +27,7 @@ use vala_verify::blocks::{
 use wyrd_spec::card::agent::ExecutionRoute;
 use wyrd_spec::card::verifier::{Action, Check};
 use wyrd_spec::error::WyrdError;
-use wyrd_spec::ids::SlotName;
+use wyrd_spec::ids::{ExecutionId, SlotName};
 use wyrd_spec::verification::TaskId;
 use wyrd_spec::verification::execution::InputDeclaration;
 
@@ -77,6 +77,9 @@ pub struct Execution<'a> {
     /// The execution's block clock (`ExecutionTelemetry::clock`), on which
     /// the engine records every block's run interval.
     pub clock: BlockClock,
+    /// The queued execution whose publications workspaces mount; `None` for
+    /// direct verify, which accepts none.
+    pub execution: Option<ExecutionId>,
 }
 
 impl HostedBlocks {
@@ -134,12 +137,16 @@ impl HostedBlocks {
         execution: Execution<'_>,
     ) -> Result<VerificationEngine, WyrdError> {
         let caller = execution.caller;
-        let evidence = Arc::new(TenantEvidence::new(
+        let evidence = TenantEvidence::new(
             state.clone(),
             caller.clone(),
             execution.evidence.clone(),
             self.limits,
-        ));
+        );
+        let evidence = Arc::new(match execution.execution {
+            Some(id) => evidence.with_execution(id),
+            None => evidence,
+        });
         let registry = Arc::new(TenantRegistry::new(state.clone(), Some(caller.clone())));
         let agent = AgentExecutor::new(
             Arc::default(),

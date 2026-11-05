@@ -674,14 +674,13 @@ const ACCEPT_PUBLICATION_SQL: &str = r"
                         AND p.attempt = $6 AND p.name = $7), FALSE) AS same_call
 ";
 
-/// Read one publication of an execution by its producer attempt and name.
-const PUBLICATION_SQL: &str = r"
+/// Read one step's publications in an execution, grouped by item,
+/// iteration, and attempt, in acceptance order within an attempt.
+const PUBLICATIONS_SQL: &str = r"
     SELECT task_id, item_index, iteration_index, attempt, name, kind, value, manifest
       FROM wyrd.verifier_execution_publications
      WHERE execution_id = $1 AND task_id = $2
-       AND item_index IS NOT DISTINCT FROM $3
-       AND iteration_index IS NOT DISTINCT FROM $4
-       AND attempt = $5 AND name = $6
+     ORDER BY item_index NULLS FIRST, iteration_index NULLS FIRST, attempt, sequence
 ";
 
 /// Read one execution's control-plane status.
@@ -3367,30 +3366,28 @@ impl VerifierExecutionQueue {
         .await
     }
 
-    /// Read the publication `name` that `producer` accepted in `execution`;
-    /// `None` when it accepted none under that name.
+    /// Read every publication `step` accepted in `execution`, across its
+    /// items, iterations, and attempts, grouped in that order and in
+    /// acceptance order within an attempt.
     ///
     /// # Errors
     /// Returns the database error when the read fails, or a decode error when
-    /// the stored row is malformed.
-    pub async fn publication(
+    /// a stored row is malformed.
+    pub async fn publications(
         &self,
         conn: &mut TenantConn<'_>,
         execution: ExecutionId,
-        producer: &Producer,
-        name: &PublicationName,
-    ) -> Result<Option<Publication>, SqlxError> {
-        timed("publication", async {
-            let row: Option<PublicationRow> = sqlx::query_as(PUBLICATION_SQL)
+        step: &TaskId,
+    ) -> Result<Vec<Publication>, SqlxError> {
+        // ponytail: unpaged; one step's publications are bounded by its
+        // attempts' workspace budgets. Page when public listing reads them.
+        timed("publications", async {
+            let rows: Vec<PublicationRow> = sqlx::query_as(PUBLICATIONS_SQL)
                 .bind(execution.as_uuid())
-                .bind(producer.step_id.as_str())
-                .bind(producer.item_index.map(column).transpose()?)
-                .bind(producer.iteration_index.map(column).transpose()?)
-                .bind(column(producer.attempt)?)
-                .bind(name.as_str())
-                .fetch_optional(&mut **conn.transaction())
+                .bind(step.as_str())
+                .fetch_all(&mut **conn.transaction())
                 .await?;
-            row.map(PublicationRow::decode).transpose()
+            rows.into_iter().map(PublicationRow::decode).collect()
         })
         .await
     }

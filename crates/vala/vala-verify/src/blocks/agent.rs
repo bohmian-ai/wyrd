@@ -307,6 +307,9 @@ impl AgentExecutor {
                         reason: format!("text placeholder {name} cannot bind media"),
                     });
                 }
+                (CallValue::Publication { .. } | CallValue::Publications { .. }, _) => {
+                    return Err(terminal("publications mount only in a workspace"));
+                }
             }
         }
         if !slots.is_empty() {

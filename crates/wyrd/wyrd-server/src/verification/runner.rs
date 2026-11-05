@@ -498,6 +498,7 @@ impl VerifierRunner {
                 defer_unlanded_traces: run.attempt < run.max_attempts,
                 drift,
                 clock: telemetry.clock(),
+                execution: Some(run.lease.execution_id),
             },
         ) {
             Ok(engine) => engine,

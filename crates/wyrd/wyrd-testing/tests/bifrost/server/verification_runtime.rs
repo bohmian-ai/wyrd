@@ -39,22 +39,22 @@ use vala_bifrost_redux::catalog::{TableRef, TableUid};
 use vala_bifrost_redux::contracts::{FrameAdmission, Scribe, ScribeError, ScribeIngressFrame};
 use vala_bifrost_redux::oracle::AuthorizedQueryContext;
 use vala_bifrost_redux::scribe::ScribeImpl;
-use wyrd_client::Bifrost;
 use wyrd_client::bifrost::TableConfig;
+use wyrd_client::{Bifrost, Principals};
 use wyrd_queue::variant::{EncodedVariant, WyrdJsonEncoderFactory};
 use wyrd_runtime::permission::PermissionSet;
 use wyrd_runtime::{Permission, Principal, PrincipalKind};
 use wyrd_server::query::scheduled::ScheduledQueryCaller;
 use wyrd_server::scribe_outbox::{ScribeSink, ScribeWrite};
 use wyrd_server::state::LimitsConfig;
-use wyrd_server::verification::VerificationRuntime;
 use wyrd_server::verification::engines::EngineOutcome;
 use wyrd_server::verification::health::RuntimeCapability;
 use wyrd_server::verification::hosted::HostedLimits;
 use wyrd_server::verification::results::{InputRecord, ResultPayloadBuilder, ResultRun};
 use wyrd_server::verification::runner::EngineScript;
+use wyrd_server::verification::{RuntimeLimits, VerificationRuntime};
 use wyrd_spec::DataTenantId;
-use wyrd_spec::auth::{Attribution, PrincipalId, PrincipalKindTag};
+use wyrd_spec::auth::{Attribution, PrincipalId, PrincipalKindTag, RevokePrincipalRequest};
 use wyrd_spec::card::verifier::Check;
 use wyrd_spec::error::WyrdError;
 use wyrd_spec::ids::{BindingId, CardUid, ExecutionId, SlotName, VerificationResultId};
@@ -3350,6 +3350,192 @@ async fn queued_subject_authority_survives_restart() -> Result<(), ServerJourney
     if rows != 1 {
         return Err(format!("expected one A/SYSTEM result, read {rows}").into());
     }
+    server.shutdown().await?;
+    Ok(())
+}
+
+/// Role a fenced submitter enqueues with.
+const FENCED_RUNNER: &str = "fenced_runner";
+
+/// Role allowed to revoke tenant principals.
+const PRINCIPAL_ADMIN: &str = "principal_admin";
+
+/// Cancellation and revocation fence unfinished queued work and leave
+/// settled work alone.
+///
+/// A Service enqueues three executions over the public route against a
+/// runtime with one execution slot. The first completes; cancelling it
+/// afterwards changes nothing. The second is cancelled while its engine is
+/// held: once released, its late completion is refused and it stays
+/// `cancelled` with no result. With the third held running and a fourth
+/// waiting behind it, an administrator revokes the Service through the
+/// public principal route: both are cancelled `principal_revoked` in the
+/// revocation's commit, the released third writes nothing, and the
+/// completed execution keeps its result.
+///
+/// # Errors
+/// Returns server, exchange, route, runtime, or fixture errors, or a
+/// description of the first execution whose state differs.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires the serialized Postgres-backed journey lane"]
+async fn cancel_and_revocation_fence_unfinished_work() -> Result<(), ServerJourneyError> {
+    let server = WyrdTestServer::builder().start_bound().await?;
+    let tenant = server.data_tenant_id();
+    let seed = VerificationFixture::provision(server.state(), tenant).await?;
+    let (subject, _) = seed.service("fenced-subject").await?;
+    let verifier = assert_verifier(&seed, "fenced-assert").await?;
+    server
+        .seed_role(
+            FENCED_RUNNER,
+            &[Permission::card_read(), Permission::verifier_run_any()],
+        )
+        .await?;
+    server
+        .seed_role(PRINCIPAL_ADMIN, &[Permission::service_accounts_write()])
+        .await?;
+    let submitter = server
+        .bootstrap_service("fenced-submitter", &[FENCED_RUNNER])
+        .await?;
+    let admin = server
+        .bootstrap_service("fenced-admin", &[PRINCIPAL_ADMIN])
+        .await?;
+    let client = super::query::client_for(
+        &server,
+        submitter
+            .api_key()
+            .ok_or("the submitter carries an API key")?,
+    )?
+    .for_workload(subject.clone());
+    let enqueue = async || -> Result<ExecutionId, ServerJourneyError> {
+        let accepted: Value = client
+            .request_json(
+                reqwest::Method::POST,
+                "/v1/verification/enqueue",
+                Some(&enqueue_body(
+                    &verifier,
+                    &subject,
+                    json!({ "x": { "kind": "json", "value": true } }),
+                )),
+            )
+            .await?;
+        await_queued(&seed, &accepted).await
+    };
+    let reached =
+        async |execution: ExecutionId, status: &str| -> Result<ExecutionRow, ServerJourneyError> {
+            let deadline = tokio::time::Instant::now() + WAIT;
+            loop {
+                let row = seed.execution(execution).await?;
+                if row.status == status {
+                    return Ok(row);
+                }
+                if tokio::time::Instant::now() >= deadline {
+                    return Err(format!("the execution never reached {status}: {row:?}").into());
+                }
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        };
+    let entered = async |script: &EngineScript, count: usize| -> Result<(), ServerJourneyError> {
+        let deadline = tokio::time::Instant::now() + WAIT;
+        while script.entered() < count {
+            if tokio::time::Instant::now() >= deadline {
+                return Err(format!("the engine was never entered {count} times").into());
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        Ok(())
+    };
+    let cancel = async |execution: ExecutionId| -> Result<bool, ServerJourneyError> {
+        let mut conn = server.tenant_conn_for(tenant).await?;
+        let cancelled = wyrd_sql::queries::verifier_executions::VerifierExecutionQueue::default()
+            .cancel(&mut conn, execution)
+            .await?;
+        conn.commit().await?;
+        Ok(cancelled)
+    };
+    // A released engine settles within one renewal tick; give a late
+    // completion two before reading the state it must not have changed.
+    let lease = Duration::from_secs(3);
+    let settle = || tokio::time::sleep(lease / 3);
+
+    let script = EngineScript::default();
+    let runtime = VerificationRuntime::builder(server.state())
+        .limits(RuntimeLimits {
+            execution_slots: 1,
+            lease,
+            poll_interval: Duration::from_millis(100),
+            ..RuntimeLimits::default()
+        })
+        .engine_script(script.clone())
+        .build()
+        .ok_or("the runtime did not compose")?;
+    let stop = CancellationToken::new();
+    let task = tokio::spawn(runtime.run(stop.clone()));
+
+    script.push_unheld(EngineOutcome::Completed(drift_outcome(None)?));
+    let done = enqueue().await?;
+    let completed = reached(done, "completed").await?;
+    if cancel(done).await? || seed.execution(done).await? != completed {
+        return Err(format!("cancelling a completed execution changed it: {completed:?}").into());
+    }
+
+    script.hold();
+    script.push(EngineOutcome::Completed(drift_outcome(None)?));
+    let stopped = enqueue().await?;
+    entered(&script, 2).await?;
+    if !cancel(stopped).await? || cancel(stopped).await? {
+        return Err("only the first cancel of running work applies".into());
+    }
+    script.release();
+    settle().await;
+    let row = seed.execution(stopped).await?;
+    if (
+        row.status.as_str(),
+        row.result_id,
+        row.error_code.as_deref(),
+    ) != ("cancelled", None, Some("cancelled"))
+    {
+        return Err(format!("the cancelled execution committed late work: {row:?}").into());
+    }
+
+    script.hold();
+    script.push(EngineOutcome::Completed(drift_outcome(None)?));
+    let active = enqueue().await?;
+    entered(&script, 3).await?;
+    let waiting = enqueue().await?;
+    reached(waiting, "pending").await?;
+    Principals::connect_with(&super::query::client_for(
+        &server,
+        admin
+            .api_key()
+            .ok_or("the administrator carries an API key")?,
+    )?)
+    .await?
+    .revoke_principal(
+        &submitter.id(),
+        &RevokePrincipalRequest {
+            principal_kind: PrincipalKindTag::Service,
+            reason: "the submitter retires".to_owned(),
+        },
+    )
+    .await?;
+    script.release();
+    settle().await;
+    for execution in [active, waiting] {
+        let row = seed.execution(execution).await?;
+        if (
+            row.status.as_str(),
+            row.result_id,
+            row.error_code.as_deref(),
+        ) != ("cancelled", None, Some("principal_revoked"))
+        {
+            return Err(format!("revocation left {execution} running: {row:?}").into());
+        }
+    }
+    if seed.execution(done).await? != completed {
+        return Err("revocation rewrote a completed execution".into());
+    }
+    stop.cancel();
+    tokio::time::timeout(WAIT, task).await??;
     server.shutdown().await?;
     Ok(())
 }

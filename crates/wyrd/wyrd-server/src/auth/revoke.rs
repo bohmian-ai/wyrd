@@ -20,7 +20,8 @@ use wyrd_sql::TenantConn;
 /// Revoke one principal under the caller's tenant.
 ///
 /// Revocation suspends the principal, so every tenant issuance path refuses its
-/// next token; a token it already holds lapses at its five-minute expiry.
+/// next token; a token it already holds lapses at its five-minute expiry. Its
+/// unfinished Verifier executions are cancelled in the same commit.
 ///
 /// Revocation is an administrative authorization boundary: the
 /// `service_accounts:write` verdict is audited for both outcomes. Either
@@ -50,8 +51,8 @@ use wyrd_sql::TenantConn;
     params(("id" = PrincipalId, Path, description = "Principal whose tokens stop working")),
     request_body = RevokePrincipalRequest,
     responses(
-        (status = 200, description = "Principal suspended; it can mint no new token, and tokens \
-          it already holds lapse at expiry"),
+        (status = 200, description = "Principal suspended; it can mint no new token, tokens it \
+          already holds lapse at expiry, and its unfinished Verifier executions are cancelled"),
         (status = 400, description = "A path identifier is not a valid UUID, or the revocation \
           reason is missing, oversized, or secret-like (WYRD_SPEC_400_VALIDATION, \
           WYRD_VALIDATION_400_MISSING_REQUIRED_FIELD)", body = WyrdProblem),

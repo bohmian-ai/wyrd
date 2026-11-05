@@ -15,12 +15,15 @@ use wyrd_server::verification::hosted::evidence::TenantEvidence;
 use wyrd_server::verification::hosted::publications::{Publications, PublishCall};
 use wyrd_server::verification::hosted::workspace::{Workspace, Workspaces};
 use wyrd_spec::ids::SlotName;
+use wyrd_spec::verification::VerificationError;
 use wyrd_spec::verification::execution::{
     InputDeclaration, Producer, ProducerInvocation, PublicationCollection, PublicationContent,
     PublicationFile, PublicationKind, PublicationManifest, Speculation, StepStatus,
 };
 use wyrd_spec::verification::{PublicationName, TaskId};
-use wyrd_sql::queries::verifier_executions::{ExecutionLease, VerifierExecutionQueue};
+use wyrd_sql::queries::verifier_executions::{
+    ExecutionLease, Settlement, TerminalStatus, VerifierExecutionQueue,
+};
 use wyrd_testing::WyrdTestServer;
 use wyrd_testing::verification::VerificationFixture;
 
@@ -876,6 +879,157 @@ async fn publication_mounts_preserve_status_and_lineage() {
         )
         .await;
     assert!(unbound.is_err(), "direct verify accepts no publications");
+    leased
+        .server
+        .shutdown()
+        .await
+        .expect("test server shuts down");
+}
+
+/// Cancelling leased work after a checkpoint and a publication fences the
+/// worker: its next invocation, publication, settlement, and renewal are all
+/// stale, the recorded checkpoint and publication survive unchanged, and the
+/// execution is never claimed again. A repeated cancel changes nothing. A
+/// record of a newer worker format is not claimable by this worker even
+/// once its lease expires.
+///
+/// # Panics
+/// Panics when a stale write lands, a checkpoint or publication changes, or
+/// a cancelled or newer-format execution is claimed.
+#[tokio::test(flavor = "multi_thread")]
+async fn cancelled_work_keeps_checkpoints_and_fences_stale_writes() {
+    let leased = Leased::start().await;
+    let state = leased.server.state();
+    let tenant = leased.server.data_tenant_id();
+    let queue = VerifierExecutionQueue::default();
+    let limits = HostedLimits::default();
+    let caller = user(tenant, []);
+    let publications = Publications::new(state, &caller, leased.lease, limits);
+    let task = TaskId::new("review").expect("task");
+    let producer = Producer {
+        step_id: task.clone(),
+        item_index: None,
+        iteration_index: None,
+        attempt: 1,
+    };
+    let execution = leased.lease.execution_id;
+    let conn = async || {
+        leased
+            .server
+            .tenant_conn_for(tenant)
+            .await
+            .expect("tenant connection opens")
+    };
+
+    let mut tx = conn().await;
+    assert_eq!(
+        queue
+            .begin_invocation(&mut tx, leased.lease, &task, 1)
+            .await
+            .expect("begin runs"),
+        Settlement::Applied
+    );
+    tx.commit().await.expect("the checkpoint commits");
+    publications
+        .json(&call("c1", &producer, "report"), json!({"v": 1}))
+        .await
+        .expect("the live lease publishes");
+
+    let mut tx = conn().await;
+    sqlx::query(
+        "UPDATE wyrd.verifier_executions SET worker_format = 2, \
+                lease_expires_at = statement_timestamp() WHERE execution_id = $1",
+    )
+    .bind(execution.as_uuid())
+    .execute(&mut **tx.transaction())
+    .await
+    .expect("the record moves to a newer format");
+    let claimed = queue
+        .claim(
+            &mut tx,
+            chrono::Duration::minutes(5),
+            chrono::Duration::minutes(5),
+            1,
+        )
+        .await
+        .expect("claim runs");
+    assert!(claimed.is_empty(), "an older worker claims a newer record");
+    tx.rollback().await.expect("the format change rolls back");
+
+    let mut tx = conn().await;
+    assert!(queue.cancel(&mut tx, execution).await.expect("cancel runs"));
+    tx.commit().await.expect("the cancel commits");
+    let mut tx = conn().await;
+    assert!(
+        !queue.cancel(&mut tx, execution).await.expect("cancel runs"),
+        "a repeated cancel writes nothing"
+    );
+    let stale = (
+        queue
+            .begin_invocation(&mut tx, leased.lease, &task, 2)
+            .await
+            .expect("begin runs"),
+        queue
+            .terminate(
+                &mut tx,
+                leased.lease,
+                TerminalStatus::Errored,
+                &VerificationError {
+                    code: "late".to_owned(),
+                    message: "a late settlement".to_owned(),
+                },
+            )
+            .await
+            .expect("terminate runs"),
+        queue
+            .renew(&mut tx, &[leased.lease.token], chrono::Duration::minutes(5))
+            .await
+            .expect("renew runs"),
+        queue
+            .claim(
+                &mut tx,
+                chrono::Duration::minutes(5),
+                chrono::Duration::minutes(5),
+                1,
+            )
+            .await
+            .expect("claim runs")
+            .len(),
+    );
+    assert_eq!(
+        stale,
+        (
+            Settlement::StaleLease,
+            Settlement::StaleLease,
+            Vec::new(),
+            0
+        )
+    );
+    let invocations = queue
+        .invocations(&mut tx, execution)
+        .await
+        .expect("invocations read");
+    let status: (String, Option<String>) = sqlx::query_as(
+        "SELECT status, error->>'code' FROM wyrd.verifier_executions WHERE execution_id = $1",
+    )
+    .bind(execution.as_uuid())
+    .fetch_one(&mut **tx.transaction())
+    .await
+    .expect("status reads");
+    tx.commit().await.expect("the reads commit");
+    assert_eq!(
+        (invocations.len(), invocations[0].attempt, status),
+        (1, 1, ("cancelled".to_owned(), Some("cancelled".to_owned())))
+    );
+    publications
+        .json(&call("c2", &producer, "late"), json!(null))
+        .await
+        .expect_err("a cancelled lease publishes nothing");
+    assert_eq!(
+        leased.entries().await,
+        [("review".to_owned(), 1, "report".to_owned())],
+        "the accepted publication survives and the late one is refused"
+    );
     leased
         .server
         .shutdown()

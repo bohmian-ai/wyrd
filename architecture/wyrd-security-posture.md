@@ -254,7 +254,10 @@ credential.
   tenant, or changing grants refuses the next issuance immediately. A tenant
   token already issued keeps its snapshot authority until its five-minute
   expiry; there is no revocation list or authorization epoch. The platform
-  plane instead revalidates current state on every request.
+  plane instead revalidates current state on every request. Revoking a
+  principal also cancels, in the same commit, every unfinished Verifier
+  execution it submitted or accepted, so queued work never outlives the
+  authority it was accepted under.
 - Bearer access tokens remain replayable until expiry. TLS, short lifetime,
   token-family replay detection, least privilege, and audit are the required
   replay controls. Logs and traces never record bearer material.

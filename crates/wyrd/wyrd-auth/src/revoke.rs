@@ -12,6 +12,7 @@ use wyrd_sql::queries::auth::{
     lock_refresh_family, revoke_refresh_family, service_account_by_id,
     suspend_service_account_principal, suspend_user_principal, user_by_id,
 };
+use wyrd_sql::queries::verifier_executions::VerifierExecutionQueue;
 
 /// Revoke `target_id` in the table the caller's declared `kind` names.
 ///
@@ -26,6 +27,10 @@ use wyrd_sql::queries::auth::{
 /// revocation's snapshot includes it. The lock is transaction-scoped and is
 /// released only by the caller's commit or rollback. No connection lock is
 /// taken, so the family-before-connection order rotation uses is preserved.
+///
+/// Every unfinished Verifier execution the principal submitted or accepted is
+/// cancelled on the same connection, so no queued or running work keeps
+/// acting on authority the commit retires.
 ///
 /// The kind is a selector, not a hint: principal ids are unique only within
 /// their table, so revoking on the caller's claim rather than on whichever
@@ -66,7 +71,7 @@ pub async fn revoke_principal_in_conn(
         revoke_refresh_family(conn, "user", id_uuid, "principal_revoked")
             .await
             .map_err(internal_error)?;
-        return Ok(());
+        return cancel_executions(conn, target_id).await;
     }
 
     let Some(row) = service_account_by_id(conn, id_uuid)
@@ -85,6 +90,18 @@ pub async fn revoke_principal_in_conn(
         return Err(not_found(target_id, tenant));
     }
     suspend_service_account_principal(conn, id_uuid)
+        .await
+        .map_err(internal_error)?;
+    cancel_executions(conn, target_id).await
+}
+
+/// Cancel the revoked principal's unfinished Verifier executions.
+async fn cancel_executions(
+    conn: &mut TenantConn<'_>,
+    target_id: PrincipalId,
+) -> Result<(), WyrdError> {
+    VerifierExecutionQueue::default()
+        .cancel_principal(conn, target_id)
         .await
         .map_err(internal_error)?;
     Ok(())

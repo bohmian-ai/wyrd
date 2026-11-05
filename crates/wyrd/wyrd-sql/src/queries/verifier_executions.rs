@@ -373,6 +373,13 @@ const ADVANCE_EXPECTED_CURSOR_SQL: &str = r"
      WHERE binding_id = $1 AND next_run_at = $3
 ";
 
+/// Execution record format this worker understands.
+///
+/// A claim skips any execution whose `worker_format` is newer, so a record
+/// written for newer checkpoint semantics is left for a worker that can run
+/// it instead of being misread during a rolling upgrade.
+const WORKER_FORMAT: i32 = 1;
+
 /// Claim up to `$3` of the oldest due, retry-due, or lease-expired executions,
 /// each under its own fresh lease, in one statement.
 ///
@@ -397,7 +404,9 @@ const ADVANCE_EXPECTED_CURSOR_SQL: &str = r"
 /// Availability, expiry, and the new lease deadline are all PostgreSQL's
 /// statement time; `$2` is only the lease length in milliseconds, so a pod
 /// whose clock differs from the database can neither claim early nor hold a
-/// lease the database believes already expired. Each claim also returns the
+/// lease the database believes already expired. Only executions whose
+/// `worker_format` is at most `$5`, this worker's [`WORKER_FORMAT`], are
+/// claimed. Each claim also returns the
 /// Verifier's ready fitted Drift baselines keyed by requirement, so the drift
 /// engine opens no connection to read them; the Verifier, subject, and SYSTEM
 /// principal are resolved by the caller through `wyrd.verification_target`.
@@ -415,6 +424,7 @@ const CLAIM_SQL: &str = r"
         SELECT execution_id, next_attempt_at AS due_at
           FROM wyrd.verifier_executions
          WHERE status IN ('pending', 'retrying') AND next_attempt_at <= statement_timestamp()
+           AND worker_format <= $5
          ORDER BY next_attempt_at, execution_id
          LIMIT $3
            FOR UPDATE SKIP LOCKED
@@ -423,7 +433,7 @@ const CLAIM_SQL: &str = r"
         SELECT execution_id, lease_expires_at AS due_at
           FROM wyrd.verifier_executions
          WHERE status = 'running' AND lease_expires_at <= statement_timestamp()
-           AND attempts < max_attempts
+           AND attempts < max_attempts AND worker_format <= $5
          ORDER BY lease_expires_at, execution_id
          LIMIT $3
            FOR UPDATE SKIP LOCKED
@@ -595,6 +605,28 @@ const RELEASE_SQL: &str = r"
            next_attempt_at = statement_timestamp() + ($3::bigint * INTERVAL '1 millisecond'),
            updated_at = statement_timestamp()
      WHERE execution_id = $1 AND lease_token = $2 AND status = 'running'
+";
+
+/// Cancel one unfinished execution; a settled one is left as it is.
+///
+/// Clearing the lease and leaving `running` fences the worker holding it: every
+/// later write it attempts is fenced on `status = 'running'` and its lease.
+const CANCEL_SQL: &str = r"
+    UPDATE wyrd.verifier_executions
+       SET status = 'cancelled', error = $2, lease_expires_at = NULL,
+           next_attempt_at = NULL, settled_at = statement_timestamp(),
+           updated_at = statement_timestamp()
+     WHERE execution_id = $1 AND status IN ('pending', 'retrying', 'running')
+";
+
+/// Cancel every unfinished execution a principal submitted or accepted.
+const CANCEL_PRINCIPAL_SQL: &str = r"
+    UPDATE wyrd.verifier_executions
+       SET status = 'cancelled', error = $2, lease_expires_at = NULL,
+           next_attempt_at = NULL, settled_at = statement_timestamp(),
+           updated_at = statement_timestamp()
+     WHERE (sub_principal_id = $1 OR act_principal_id = $1)
+       AND status IN ('pending', 'retrying', 'running')
 ";
 
 /// Read every recorded invocation attempt of one execution, settled or not,
@@ -2902,6 +2934,7 @@ impl VerifierExecutionQueue {
                 .bind(lease_for.num_milliseconds())
                 .bind(i64::from(limit))
                 .bind(deadline_for.num_milliseconds())
+                .bind(WORKER_FORMAT)
                 .fetch_all(&mut **conn.transaction())
                 .await?;
             rows.into_iter().map(ClaimedRow::into_claimed).collect()
@@ -3198,6 +3231,70 @@ impl VerifierExecutionQueue {
                 .execute(&mut **conn.transaction())
                 .await?;
             Ok(settlement(result.rows_affected()))
+        })
+        .await
+    }
+
+    /// Cancel `execution` if it is still unfinished.
+    ///
+    /// The execution settles `cancelled` with no result and keeps its recorded
+    /// invocations and publications. A worker holding its lease is fenced:
+    /// its renewal, checkpoints, publications, and settlement all report
+    /// [`Settlement::StaleLease`] and it stops. Cancelling a settled or
+    /// unknown execution writes nothing, so repeating a cancel is harmless.
+    /// Returns whether this call cancelled it. The caller authorizes first
+    /// and commits.
+    ///
+    /// # Errors
+    /// Returns the database error when the update fails.
+    #[tracing::instrument(skip(self, conn), fields(operation = "verification.executions.cancel", execution_id = %execution))]
+    pub async fn cancel(
+        &self,
+        conn: &mut TenantConn<'_>,
+        execution: ExecutionId,
+    ) -> Result<bool, SqlxError> {
+        timed("cancel", async {
+            let error = VerificationError {
+                code: "cancelled".to_owned(),
+                message: "the execution was cancelled".to_owned(),
+            };
+            let result = sqlx::query(CANCEL_SQL)
+                .bind(execution.as_uuid())
+                .bind(Json(&error))
+                .execute(&mut **conn.transaction())
+                .await?;
+            Ok(result.rows_affected() > 0)
+        })
+        .await
+    }
+
+    /// Cancel every unfinished execution `principal` is the subject or the
+    /// accepting actor of, because its authority was revoked.
+    ///
+    /// Runs on the revocation's own connection so the suspension and the
+    /// cancellations commit together; each settles `cancelled` with the
+    /// `principal_revoked` code and fences its worker as [`Self::cancel`]
+    /// does. Returns how many executions were cancelled.
+    ///
+    /// # Errors
+    /// Returns the database error when the update fails.
+    #[tracing::instrument(skip(self, conn), fields(operation = "verification.executions.cancel_principal", principal_id = %principal))]
+    pub async fn cancel_principal(
+        &self,
+        conn: &mut TenantConn<'_>,
+        principal: PrincipalId,
+    ) -> Result<u64, SqlxError> {
+        timed("cancel_principal", async {
+            let error = VerificationError {
+                code: "principal_revoked".to_owned(),
+                message: "the principal the execution acts for was revoked".to_owned(),
+            };
+            let result = sqlx::query(CANCEL_PRINCIPAL_SQL)
+                .bind(principal.as_uuid())
+                .bind(Json(&error))
+                .execute(&mut **conn.transaction())
+                .await?;
+            Ok(result.rows_affected())
         })
         .await
     }

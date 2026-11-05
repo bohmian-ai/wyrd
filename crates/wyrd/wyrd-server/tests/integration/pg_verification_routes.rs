@@ -521,8 +521,8 @@ async fn input_rows(server: &WyrdTestServer, execution: ExecutionId) -> (usize, 
 /// accepted request, none for the refused attempt.
 ///
 /// Scribe ingest is stalled so the two unkeyed enqueues ahead of it stay
-/// unwritten and hold the whole reserved share (two of three slots)
-/// deterministically.
+/// unwritten, and so unacknowledged, and hold the whole reserved share (two
+/// of three slots) deterministically.
 ///
 /// Both counts are ordered after the requests before them through
 /// [`Fixture::queued_before_sentinel`], whose first sentinel remains a
@@ -544,17 +544,31 @@ async fn staging_refusal_recovers_the_same_enqueue_identity() {
 
     let stall = server.stall_next_bifrost_write().expect("Scribe stalls");
     let body = fixture.request(&fixture.assertion, json!(1));
-    let (status, ahead) = enqueue(&server, &jwt, &body, None).await;
-    assert_eq!(status, StatusCode::ACCEPTED, "{ahead}");
-    stall.wait_entered().await;
-    let (status, behind) = enqueue(&server, &jwt, &body, None).await;
-    assert_eq!(status, StatusCode::ACCEPTED, "{behind}");
-    let (status, refused) = enqueue(&server, &jwt, &body, Some("vr-pressure-0001")).await;
+    let outbox = std::sync::Arc::clone(server.state().bifrost.scribe_outbox());
+    let fills = async {
+        tokio::join!(
+            enqueue(&server, &jwt, &body, None),
+            enqueue(&server, &jwt, &body, None)
+        )
+    };
+    let refusal = async {
+        stall.wait_entered().await;
+        while outbox.pending() < 2 {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let refused = enqueue(&server, &jwt, &body, Some("vr-pressure-0001")).await;
+        stall.release();
+        refused
+    };
+    let (((ahead, a), (behind, b)), (status, refused)) = tokio::join!(fills, refusal);
     assert_eq!(status, StatusCode::TOO_MANY_REQUESTS, "{refused}");
     assert_eq!(refused["code"], "WYRD_VERIFICATION_429_STAGING_FULL");
     assert_eq!(refused["details"]["retry_after_seconds"], json!(1));
-
-    stall.release();
+    assert_eq!(
+        (ahead, behind),
+        (StatusCode::ACCEPTED, StatusCode::ACCEPTED),
+        "the fills are acknowledged once admitted: {a} {b}"
+    );
     stall.wait_completed().await;
     server.flush_bifrost().await.expect("the share drains");
     assert_eq!(
@@ -2018,12 +2032,14 @@ async fn send(
     uri: &str,
     body: Option<&Value>,
 ) -> (StatusCode, Value) {
-    let request = Request::builder()
-        .method(method)
-        .uri(uri)
-        .header(header::CONTENT_TYPE, "application/json")
-        .body(body.map_or_else(Body::empty, |body| Body::from(body.to_string())))
-        .expect("request builds");
+    let request = Request::builder().method(method).uri(uri);
+    let request = match body {
+        Some(body) => request
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(body.to_string())),
+        None => request.body(Body::empty()),
+    }
+    .expect("request builds");
     let response = server
         .oneshot_authenticated(jwt, request)
         .await

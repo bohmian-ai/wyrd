@@ -1,0 +1,11 @@
+apiVersion: wyrd/v1
+kind: Prompt
+metadata:
+  name: reviewer-prompt
+  version: 1.0.0
+spec:
+  provider: openai
+  model: gpt-4o
+  messages:
+  - role: user
+    content: "Review the answer: {{answer}}"

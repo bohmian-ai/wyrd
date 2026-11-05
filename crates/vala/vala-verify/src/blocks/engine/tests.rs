@@ -2135,3 +2135,175 @@ async fn fixed_attachments_mount_selected_files_as_pinned_slots() {
         Err(EngineError::InputInvalid(_))
     ));
 }
+
+/// An in-memory invocation record keyed by task and attempt.
+#[derive(Default)]
+struct Ledger(Mutex<BTreeMap<(String, u32), Option<InvocationSettlement>>>);
+
+impl Ledger {
+    /// Every recorded attempt, as a reclaimed execution reads it back.
+    ///
+    /// # Panics
+    /// Panics when a recording call panicked while holding the lock.
+    fn recorded(&self) -> Vec<(TaskId, u32, Option<InvocationSettlement>)> {
+        self.0
+            .lock()
+            .expect("ledger")
+            .iter()
+            .map(|((task, attempt), settled)| {
+                (TaskId::new(task).expect("task"), *attempt, settled.clone())
+            })
+            .collect()
+    }
+
+    /// Each recorded attempt and whether it settled.
+    ///
+    /// # Panics
+    /// Panics when a recording call panicked while holding the lock.
+    fn attempts(&self) -> Vec<(String, u32, bool)> {
+        self.0
+            .lock()
+            .expect("ledger")
+            .iter()
+            .map(|((task, attempt), settled)| (task.clone(), *attempt, settled.is_some()))
+            .collect()
+    }
+}
+
+#[async_trait]
+impl Checkpoints for Ledger {
+    /// Record the attempt unsettled.
+    ///
+    /// # Panics
+    /// Panics when another call panicked while holding the lock.
+    async fn begin(&self, task: &TaskId, attempt: u32) -> Result<(), String> {
+        self.0
+            .lock()
+            .expect("ledger")
+            .insert((task.as_str().to_owned(), attempt), None);
+        Ok(())
+    }
+
+    /// Remove the attempt.
+    ///
+    /// # Panics
+    /// Panics when another call panicked while holding the lock.
+    async fn forget(&self, task: &TaskId, attempt: u32) -> Result<(), String> {
+        self.0
+            .lock()
+            .expect("ledger")
+            .remove(&(task.as_str().to_owned(), attempt));
+        Ok(())
+    }
+
+    /// Record the attempt's settlement.
+    ///
+    /// # Panics
+    /// Panics when another call panicked while holding the lock.
+    async fn settle(
+        &self,
+        task: &TaskId,
+        attempt: u32,
+        settled: &InvocationSettlement,
+    ) -> Result<(), String> {
+        self.0
+            .lock()
+            .expect("ledger")
+            .insert((task.as_str().to_owned(), attempt), Some(settled.clone()));
+        Ok(())
+    }
+}
+
+/// A reclaimed execution restores a settled action and its requirement
+/// without calling them again, retries an interrupted attempt within the
+/// step's remaining retries, and fails a step whose interrupted attempts
+/// spent them without dispatching it.
+///
+/// # Panics
+/// Panics when a block runs again, an attempt is replenished, or a restored
+/// result differs.
+#[tokio::test(start_paused = true)]
+async fn checkpoints_restore_settled_blocks_and_count_interrupted_attempts() {
+    let spec = verifier(json!({
+        "inputs": {"answer": {"type": "json"}},
+        "steps": [
+            {"id": "review", "action": code_action(json!({"x": "inputs.answer"})),
+             "requirements": [{"id": "agrees", "statement": "the review agrees",
+                 "check": code_check(json!({"review": "steps.review.output"}))}]},
+            {"id": "late", "retries": 1, "depends_on": ["review"],
+             "action": code_action(json!({"x": "inputs.answer"}))},
+            {"id": "stuck", "depends_on": ["review"],
+             "action": code_action(json!({"x": "inputs.answer"}))}
+        ]
+    }));
+    let passes = || Ok(verdict(VerificationVerdict::Passed, json!([])));
+    let hung = Arc::new(Notify::new());
+    let crashed = Arc::new(Script {
+        actions: HashMap::from([
+            ("review", Behavior::Attempts(Vec::new(), json!("reviewed"))),
+            ("late", Behavior::Hang(Arc::clone(&hung))),
+            ("stuck", Behavior::Hang(Arc::clone(&hung))),
+        ]),
+        checks: HashMap::from([("agrees", passes())]),
+        ..Script::default()
+    });
+    let ledger = Arc::new(Ledger::default());
+    let first = engine(&crashed, InMemoryTraceSource::new(), 4)
+        .with_checkpoints(Arc::clone(&ledger) as Arc<dyn Checkpoints>, Vec::new());
+    assert!(matches!(
+        run(&first, &spec, json!({"answer": 1})).await,
+        Err(EngineError::DeadlineExceeded)
+    ));
+    let settled = |task: &str, attempt| (task.to_owned(), attempt, true);
+    let open = |task: &str, attempt| (task.to_owned(), attempt, false);
+    assert_eq!(
+        ledger.attempts(),
+        vec![
+            settled("agrees", 1),
+            open("late", 1),
+            settled("review", 1),
+            open("stuck", 1)
+        ]
+    );
+
+    let recovered = Arc::new(Script {
+        actions: HashMap::from([("late", Behavior::Attempts(Vec::new(), json!("late")))]),
+        ..Script::default()
+    });
+    let second = engine(&recovered, InMemoryTraceSource::new(), 4).with_checkpoints(
+        Arc::clone(&ledger) as Arc<dyn Checkpoints>,
+        ledger.recorded(),
+    );
+    let outcome = run(&second, &spec, json!({"answer": 1}))
+        .await
+        .expect("outcome");
+    assert_eq!(recovered.calls(), vec!["action:late"]);
+    assert_eq!(step(&outcome, "review").output, Some(json!("reviewed")));
+    assert_eq!(step(&outcome, "review").attempts, 1);
+    assert_eq!(
+        requirement(&outcome, "agrees").step,
+        Some(step(&outcome, "review").id.clone())
+    );
+    assert_eq!(
+        (
+            step(&outcome, "late").status,
+            step(&outcome, "late").attempts
+        ),
+        (StepStatus::Succeeded, 2)
+    );
+    let stuck = step(&outcome, "stuck");
+    assert_eq!(
+        (stuck.status, stuck.attempts, stuck.reason.as_deref()),
+        (StepStatus::Failed, 1, Some(ATTEMPTS_INTERRUPTED))
+    );
+    assert_eq!(
+        ledger.attempts(),
+        vec![
+            settled("agrees", 1),
+            open("late", 1),
+            settled("late", 2),
+            settled("review", 1),
+            settled("stuck", 1)
+        ]
+    );
+}

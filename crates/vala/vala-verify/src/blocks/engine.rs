@@ -15,6 +15,12 @@
 //! check-isolated failures become step failures or inconclusive requirements,
 //! never subject failures; only the execution-wide deadline and orchestration
 //! faults surface as [`EngineError`].
+//!
+//! A queued execution runs with [`Checkpoints`]: each action or check attempt
+//! is recorded before it is dispatched and each settled block is committed
+//! before its dependents run, so a reclaimed execution restores every
+//! settled block instead of running it again and counts every attempt that
+//! never settled against the step's retries.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::num::NonZeroUsize;
@@ -35,8 +41,8 @@ use wyrd_spec::ids::SlotName;
 use wyrd_spec::verification::ContextCapture;
 use wyrd_spec::verification::VerificationVerdict;
 use wyrd_spec::verification::execution::{
-    CallProvenance, Citation, InputDeclaration, RequirementDetail, RequirementOutcome,
-    RequirementResult, StepResult, StepStatus, VerificationOutcome,
+    CallProvenance, Citation, InputDeclaration, InvocationSettlement, RequirementDetail,
+    RequirementOutcome, RequirementResult, StepResult, StepStatus, VerificationOutcome,
 };
 use wyrd_spec::verification::{ExecutionPlan, Stage, TaskId};
 
@@ -44,7 +50,7 @@ use super::drift::DriftChecks;
 use super::scope::{Cause, Done, Missing, Scope, Settled};
 use super::{
     ActionExecutor, ActionOutput, BlockCall, BlockError, CallInput, CallValue, CheckExecutor,
-    CheckOutput, EvidenceReader, Position,
+    CheckOutput, Checkpoints, EvidenceReader, Position,
 };
 use crate::assertion::capture_actual;
 use crate::assertion::{Compared, evaluate_item_mode, evaluate_single};
@@ -59,6 +65,9 @@ use wyrd_spec::vala::trace::SpanRecord;
 
 /// Requirement reason of an `each` assertion whose selector matched nothing.
 const EMPTY_SELECTION: &str = "empty_selection";
+
+/// Step reason when interrupted attempts already spent every retry.
+const ATTEMPTS_INTERRUPTED: &str = "the step's attempts were spent by interrupted calls";
 
 /// Histogram of every action attempt and check the engine runs, seconds,
 /// labelled `block` (`action` or `check`), `kind` (the block kind), and
@@ -184,6 +193,11 @@ pub enum EngineError {
     /// exists, so the host may run the whole execution again later.
     #[error("a verification block was refused process capacity: {0}")]
     Busy(String),
+    /// A block's invocation record or settlement could not commit, so its
+    /// work is not durable; unfinished work was cancelled and the host may
+    /// run the execution again.
+    #[error("a verification checkpoint cannot commit: {0}")]
+    Checkpoint(String),
     /// The supplied evidence does not conform to the Verifier's declared
     /// input slots: an undeclared slot, a declaration of another kind, a
     /// JSON value violating its slot schema, a file in a format its media
@@ -234,6 +248,18 @@ pub struct VerificationEngine {
     /// The current run's fixed workspace attachments; [`Self::run`] selects
     /// them afresh each run.
     attached: Arc<Attached>,
+    /// The queued execution's invocation record; `None` runs without one.
+    checkpoints: Option<Arc<Checkpointed>>,
+}
+
+/// One queued execution's invocation record and what it already holds.
+struct Checkpointed {
+    /// Where attempts and settlements commit.
+    store: Arc<dyn Checkpoints>,
+    /// Every settled block by task.
+    settled: HashMap<TaskId, InvocationSettlement>,
+    /// Attempts already recorded per task, settled or not.
+    attempts: HashMap<TaskId, u32>,
 }
 
 /// Each fixed Artifact selection of a run with its selected files: the path
@@ -275,7 +301,123 @@ impl VerificationEngine {
             defer_unlanded: false,
             reads: TraceReads::default(),
             attached: Arc::default(),
+            checkpoints: None,
         }
+    }
+
+    /// Record every block invocation of this queued execution in `store`,
+    /// which already holds the `recorded` attempts: each task, one-based
+    /// attempt, and settlement when it committed one. A settled block is
+    /// restored instead of running again; an unsettled attempt counts as
+    /// spent.
+    #[must_use]
+    pub fn with_checkpoints(
+        mut self,
+        store: Arc<dyn Checkpoints>,
+        recorded: impl IntoIterator<Item = (TaskId, u32, Option<InvocationSettlement>)>,
+    ) -> Self {
+        let mut checkpointed = Checkpointed {
+            store,
+            settled: HashMap::new(),
+            attempts: HashMap::new(),
+        };
+        for (task, attempt, settlement) in recorded {
+            let seen = checkpointed.attempts.entry(task.clone()).or_default();
+            *seen = (*seen).max(attempt);
+            if let Some(settlement) = settlement {
+                checkpointed.settled.insert(task, settlement);
+            }
+        }
+        self.checkpoints = Some(Arc::new(checkpointed));
+        self
+    }
+
+    /// The restored settlement of `task`, when an earlier attempt of this
+    /// execution committed one.
+    fn restored(&self, task: &TaskId) -> Option<Done> {
+        let settled = self.checkpoints.as_ref()?.settled.get(task)?;
+        Some(match settled.clone() {
+            InvocationSettlement::Action { result, sources } => {
+                let state = match (&result.status, &result.output) {
+                    (StepStatus::Succeeded, Some(output)) => Settled::Succeeded {
+                        output: output.clone(),
+                        sources,
+                    },
+                    (status, _) => Settled::NoOutput {
+                        status: *status,
+                        gap: Missing::failed(result.reason.clone().unwrap_or_default()),
+                    },
+                };
+                Done::Step { result, state }
+            }
+            InvocationSettlement::Requirement { result } => Done::Requirement(result),
+        })
+    }
+
+    /// Attempts of `task` already recorded by earlier runs of this execution.
+    fn recorded(&self, task: &TaskId) -> u32 {
+        self.checkpoints
+            .as_ref()
+            .and_then(|checkpointed| checkpointed.attempts.get(task).copied())
+            .unwrap_or(0)
+    }
+
+    /// Record that `task` starts `attempt`, before it is dispatched.
+    ///
+    /// # Errors
+    /// Returns [`EngineError::Checkpoint`] when the record cannot commit.
+    async fn begin(&self, task: &TaskId, attempt: u32) -> Result<(), EngineError> {
+        match &self.checkpoints {
+            Some(checkpointed) => checkpointed
+                .store
+                .begin(task, attempt)
+                .await
+                .map_err(EngineError::Checkpoint),
+            None => Ok(()),
+        }
+    }
+
+    /// Forget `task`'s `attempt`, refused process capacity before it ran.
+    ///
+    /// # Errors
+    /// Returns [`EngineError::Checkpoint`] when the record cannot be removed.
+    async fn forget(&self, task: &TaskId, attempt: u32) -> Result<(), EngineError> {
+        match &self.checkpoints {
+            Some(checkpointed) => checkpointed
+                .store
+                .forget(task, attempt)
+                .await
+                .map_err(EngineError::Checkpoint),
+            None => Ok(()),
+        }
+    }
+
+    /// Commit `done` as the settlement of `task`'s `attempt`, before its
+    /// dependents run.
+    ///
+    /// # Errors
+    /// Returns [`EngineError::Checkpoint`] when the settlement cannot commit.
+    async fn commit(&self, task: &TaskId, attempt: u32, done: &Done) -> Result<(), EngineError> {
+        let Some(checkpointed) = &self.checkpoints else {
+            return Ok(());
+        };
+        let settled = match done {
+            Done::Step { result, state } => InvocationSettlement::Action {
+                result: result.clone(),
+                sources: match state {
+                    Settled::Succeeded { sources, .. } => sources.clone(),
+                    Settled::NoOutput { .. } => BTreeSet::new(),
+                },
+            },
+            Done::Requirement(result) => InvocationSettlement::Requirement {
+                result: result.clone(),
+            },
+        };
+        checkpointed
+            .store
+            .settle(task, attempt, &settled)
+            .await
+            .map_err(EngineError::Checkpoint)
     }
 
     /// Stop a run whose declared trace has not landed yet with
@@ -560,6 +702,9 @@ impl VerificationEngine {
         deadline: Instant,
     ) -> Prepared<Done, EngineError> {
         let step = &spec.steps[index];
+        if let Some(done) = self.restored(&step.id) {
+            return Prepared::Settled(done);
+        }
         match prepare(scope, &self.attached, step) {
             Err(gap) => Prepared::Settled(skipped(step, gap)),
             Ok(bindings) => {
@@ -568,7 +713,10 @@ impl VerificationEngine {
                 Prepared::Run(Box::pin(async move {
                     let step = &spec.steps[index];
                     let attempted = engine.attempt(step, &bindings, deadline).await?;
-                    Ok(attempted.settle(step, bindings.sources()))
+                    let attempt = attempted.attempts;
+                    let done = attempted.settle(step, bindings.sources());
+                    engine.commit(&step.id, attempt, &done).await?;
+                    Ok(done)
                 }))
             }
         }
@@ -597,6 +745,9 @@ impl VerificationEngine {
         deadline: Instant,
     ) -> Result<Prepared<Done, EngineError>, EngineError> {
         let requirement = requirement_at(spec, key);
+        if let Some(done) = self.restored(&requirement.id) {
+            return Ok(Prepared::Settled(done));
+        }
         let owner = key
             .0
             .and_then(|index| match scope.step(&spec.steps[index].id) {
@@ -613,9 +764,19 @@ impl VerificationEngine {
                 let spec = Arc::clone(spec);
                 Ok(Prepared::Run(Box::pin(async move {
                     let requirement = requirement_at(&spec, key);
+                    let attempt = engine.recorded(&requirement.id) + 1;
+                    engine.begin(&requirement.id, attempt).await?;
                     let step = key.0.map(|index| &spec.steps[index].id);
-                    let judged = engine.judge(requirement, step, inputs, deadline).await?;
-                    judged.report(&spec, key)
+                    let judged = match engine.judge(requirement, step, inputs, deadline).await {
+                        Err(EngineError::Busy(reason)) => {
+                            engine.forget(&requirement.id, attempt).await?;
+                            return Err(EngineError::Busy(reason));
+                        }
+                        judged => judged?,
+                    };
+                    let done = judged.report(&spec, key)?;
+                    engine.commit(&requirement.id, attempt, &done).await?;
+                    Ok(done)
                 })))
             }
             (gap, _) => {
@@ -637,9 +798,15 @@ impl VerificationEngine {
     /// Each attempt is timed into [`BLOCK_DURATION_SECONDS`] after the
     /// permit is held, inside a debug `verification.block` span.
     ///
+    /// On a checkpointed execution every attempt is recorded before it is
+    /// dispatched and counts with the attempts earlier runs recorded, so a
+    /// step whose interrupted attempts already spent its retries fails
+    /// without dispatching again.
+    ///
     /// # Errors
     /// Returns [`EngineError::Busy`] as soon as an attempt is refused process
-    /// capacity, without spending the step's retries or settling the step.
+    /// capacity, without spending the step's retries or settling the step,
+    /// and [`EngineError::Checkpoint`] when an attempt cannot be recorded.
     #[tracing::instrument(
         name = "verification.block",
         level = "debug",
@@ -652,11 +819,19 @@ impl VerificationEngine {
         bindings: &Bindings,
         deadline: Instant,
     ) -> Result<Attempted, EngineError> {
+        let mut attempts = self.recorded(&step.id);
+        if attempts > step.retries {
+            return Ok(Attempted {
+                attempts,
+                duration: Duration::ZERO,
+                result: Err(ATTEMPTS_INTERRUPTED.to_owned()),
+            });
+        }
         let _permit = self.permits.acquire().await;
         let started = Instant::now();
-        let mut attempts = 0;
         loop {
             attempts += 1;
+            self.begin(&step.id, attempts).await?;
             let timeout = step
                 .timeout_seconds
                 .map(|seconds| Instant::now() + Duration::from_secs(u64::from(seconds)))
@@ -682,7 +857,10 @@ impl VerificationEngine {
             };
             timer.finish(result.is_ok());
             match result {
-                Err(BlockError::Busy { reason }) => return Err(EngineError::Busy(reason)),
+                Err(BlockError::Busy { reason }) => {
+                    self.forget(&step.id, attempts).await?;
+                    return Err(EngineError::Busy(reason));
+                }
                 Err(error) if error.is_retryable() && attempts <= step.retries => {
                     tracing::debug!(step = step.id.as_str(), attempts, %error, "retrying step");
                 }

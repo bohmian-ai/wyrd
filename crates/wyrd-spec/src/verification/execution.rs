@@ -392,6 +392,30 @@ pub enum StepStatus {
     Skipped,
 }
 
+/// The committed settlement of one queued block invocation attempt.
+///
+/// A queued execution checkpoints each action and requirement it runs as
+/// soon as the block settles, before the block's dependents run, so a
+/// reclaimed execution restores the settlement instead of running the block
+/// again. Skipped steps and requirements settled by a missing value perform
+/// no IO and are never checkpointed.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum InvocationSettlement {
+    /// A step action succeeded or failed after its attempts.
+    Action {
+        /// The reported step result, its output uncaptured.
+        result: Box<StepResult>,
+        /// Original slots the action read.
+        sources: BTreeSet<SlotName>,
+    },
+    /// A requirement's check was judged.
+    Requirement {
+        /// The reported requirement result.
+        result: Box<RequirementResult>,
+    },
+}
+
 /// One tool call an Agent action made.
 ///
 /// Records what the model received, never the raw tool output: the digest

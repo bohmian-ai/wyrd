@@ -352,7 +352,7 @@ impl Support {
     async fn claim(&self) -> ClaimedExecution {
         let mut conn = self.conn().await;
         let claimed = VerifierExecutionQueue::default()
-            .claim(&mut conn, LEASE, 1)
+            .claim(&mut conn, LEASE, LEASE, 1)
             .await
             .expect("claim runs")
             .pop()

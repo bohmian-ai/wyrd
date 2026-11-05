@@ -33,7 +33,8 @@ use wyrd_spec::card::verifier::{Action, Check};
 use wyrd_spec::ids::SlotName;
 use wyrd_spec::verification::TaskId;
 use wyrd_spec::verification::execution::{
-    CallProvenance, InputDeclaration, RequirementDetail, ToolCallRecord, Verdict,
+    CallProvenance, InputDeclaration, InvocationSettlement, RequirementDetail, ToolCallRecord,
+    Verdict,
 };
 
 mod drift;
@@ -180,6 +181,41 @@ pub trait CheckExecutor: Send + Sync {
     /// Returns a [`BlockError`] when no verdict was produced; the engine
     /// records the requirement as inconclusive with the error as reason.
     async fn execute(&self, call: BlockCall<'_, Check>) -> Result<CheckOutput, BlockError>;
+}
+
+/// The durable record of one queued execution's block invocations.
+///
+/// The engine records each action or check attempt before dispatching it and
+/// commits the block's settlement before its dependents run, so a reclaimed
+/// execution restores what settled and counts what never did. The host fences
+/// both writes with the execution's lease; direct verify runs without one.
+#[async_trait]
+pub trait Checkpoints: Send + Sync {
+    /// Record that `task` starts its one-based `attempt`.
+    ///
+    /// # Errors
+    /// Returns a bounded reason when the record cannot commit, such as a lost
+    /// lease; the attempt is then not dispatched.
+    async fn begin(&self, task: &TaskId, attempt: u32) -> Result<(), String>;
+
+    /// Forget `task`'s unsettled `attempt`, which was refused process
+    /// capacity before it ran, so it spends nothing.
+    ///
+    /// # Errors
+    /// Returns a bounded reason when the record cannot be removed.
+    async fn forget(&self, task: &TaskId, attempt: u32) -> Result<(), String>;
+
+    /// Commit `settled` as the outcome of `task`'s `attempt`.
+    ///
+    /// # Errors
+    /// Returns a bounded reason when the settlement cannot commit; the block's
+    /// dependents then do not run.
+    async fn settle(
+        &self,
+        task: &TaskId,
+        attempt: u32,
+        settled: &InvocationSettlement,
+    ) -> Result<(), String>;
 }
 
 /// Decodes a check's raw `response` as the Verdict its declared `schema`

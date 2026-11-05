@@ -24,7 +24,10 @@ use wyrd_spec::envelope::{Card, CardKind};
 use wyrd_spec::ids::{BindingId, CardUid, ExecutionId, GroupId, SlotName, VerificationResultId};
 use wyrd_spec::registry::DeclarationOperationId;
 use wyrd_spec::vala::ids::{RunId, SpanId, TraceId};
-use wyrd_spec::verification::execution::{InputDeclaration, VerificationRequest};
+use wyrd_spec::verification::TaskId;
+use wyrd_spec::verification::execution::{
+    InputDeclaration, InvocationSettlement, StepResult, StepStatus, VerificationRequest,
+};
 use wyrd_spec::verification::{
     DriftWindow, GroupEndSettings, GroupSource, OperatorDispatchStatus, VerificationError,
     VerificationExecutionStatus, VerificationVerdict, VerifierReadiness,
@@ -625,7 +628,7 @@ fn engine_error() -> VerificationError {
 /// Panics when the claim fails or nothing is runnable.
 async fn claim(queue: &VerifierExecutionQueue, conn: &mut TenantConn<'_>) -> ClaimedExecution {
     queue
-        .claim(conn, Duration::minutes(5), 1)
+        .claim(conn, Duration::minutes(5), Duration::minutes(5), 1)
         .await
         .expect("claim runs")
         .pop()
@@ -793,7 +796,7 @@ async fn unrunnable_targets_are_refused() {
     }
     assert!(
         queue
-            .claim(&mut conn, Duration::minutes(5), 1)
+            .claim(&mut conn, Duration::minutes(5), Duration::minutes(5), 1)
             .await
             .expect("claim runs")
             .is_empty(),
@@ -1391,7 +1394,7 @@ async fn reclaimed_lease_fences_the_stale_token() {
     );
     assert!(
         queue
-            .claim(&mut conn, Duration::minutes(5), 1)
+            .claim(&mut conn, Duration::minutes(5), Duration::minutes(5), 1)
             .await
             .expect("claim runs")
             .is_empty(),
@@ -1464,6 +1467,135 @@ async fn reclaimed_lease_fences_the_stale_token() {
     assert_eq!(status.state.status, VerificationExecutionStatus::Completed);
     assert_eq!(status.result_id, Some(result));
     assert_eq!(status.state.error, None);
+}
+
+/// Invocation checkpoints commit only under the live lease, a settlement
+/// commits once, and an unsettled attempt can be forgotten; a reclaim keeps
+/// every checkpoint and the deadline the first claim fixed.
+///
+/// # Panics
+/// Panics when a stale lease writes a checkpoint, a settlement is replaced,
+/// or a reclaim replenishes the deadline.
+#[tokio::test]
+async fn invocation_checkpoints_are_fenced_and_survive_reclaim() {
+    let fixture = PgFixture::start().await.expect("fixture starts");
+    let actor = actor(fixture.data_tenant_id());
+    let queue = VerifierExecutionQueue::default();
+    let mut conn = fixture
+        .tenant_conn()
+        .await
+        .expect("tenant connection opens");
+    let (owner, _) = declare_service(&mut conn, &actor, "svc").await;
+    let verifier = register_verifier(&mut conn, &actor, "drift", custom_drift()).await;
+    let binding = bind(&mut conn, &owner, &verifier, Vec::new()).await;
+    let execution = scheduled(&queue, &mut conn, binding).await;
+    let (review, judge) = (
+        TaskId::new("review").expect("task id"),
+        TaskId::new("judge").expect("task id"),
+    );
+    let settled = InvocationSettlement::Action {
+        result: Box::new(StepResult {
+            id: review.clone(),
+            status: StepStatus::Succeeded,
+            output: Some(json!("ok")),
+            attempts: 1,
+            duration_ms: 1,
+            reason: None,
+            provenance: None,
+            tool_calls: Vec::new(),
+        }),
+        sources: BTreeSet::new(),
+    };
+
+    let stale = claim(&queue, &mut conn).await;
+    let applied = [
+        queue
+            .begin_invocation(&mut conn, stale.lease, &review, 1)
+            .await,
+        queue
+            .settle_invocation(&mut conn, stale.lease, &review, 1, &settled)
+            .await,
+        queue
+            .settle_invocation(&mut conn, stale.lease, &review, 1, &settled)
+            .await,
+        queue
+            .begin_invocation(&mut conn, stale.lease, &judge, 1)
+            .await,
+    ]
+    .map(|write| write.expect("checkpoint answers"));
+    assert_eq!(
+        applied,
+        [
+            Settlement::Applied,
+            Settlement::Applied,
+            Settlement::StaleLease,
+            Settlement::Applied
+        ],
+        "a settlement commits once"
+    );
+
+    expire_deadlines(&mut conn, execution).await;
+    let current = queue
+        .claim(&mut conn, Duration::minutes(5), Duration::hours(1), 1)
+        .await
+        .expect("claim runs")
+        .pop()
+        .expect("the expired lease is reclaimable");
+    assert!(
+        current.remaining <= stale.remaining,
+        "a reclaim never replenishes the deadline"
+    );
+    let fenced = [
+        queue
+            .begin_invocation(&mut conn, stale.lease, &judge, 2)
+            .await,
+        queue
+            .settle_invocation(&mut conn, stale.lease, &judge, 1, &settled)
+            .await,
+        queue
+            .forget_invocation(&mut conn, stale.lease, &judge, 1)
+            .await,
+    ]
+    .map(|write| write.expect("stale checkpoint answers"));
+    assert_eq!(fenced, [Settlement::StaleLease; 3]);
+    let recorded = queue
+        .invocations(&mut conn, execution)
+        .await
+        .expect("checkpoints read");
+    let mut recorded: Vec<_> = recorded
+        .into_iter()
+        .map(|invocation| {
+            (
+                invocation.task.as_str().to_owned(),
+                invocation.attempt,
+                invocation.settlement.is_some(),
+            )
+        })
+        .collect();
+    recorded.sort();
+    assert_eq!(
+        recorded,
+        [
+            ("judge".to_owned(), 1, false),
+            ("review".to_owned(), 1, true)
+        ],
+        "a reclaim restores every committed checkpoint"
+    );
+    assert_eq!(
+        queue
+            .forget_invocation(&mut conn, current.lease, &judge, 1)
+            .await
+            .expect("forget answers"),
+        Settlement::Applied
+    );
+    assert_eq!(
+        queue
+            .forget_invocation(&mut conn, current.lease, &review, 1)
+            .await
+            .expect("forget answers"),
+        Settlement::StaleLease,
+        "a settled checkpoint is never forgotten"
+    );
 }
 
 /// A submission's enqueuing cause, including the caller's sampling
@@ -1565,7 +1697,7 @@ async fn retries_back_off_then_exhaust_to_errored() {
         assert_eq!(status.state.error, Some(engine_error()));
         assert!(
             queue
-                .claim(&mut conn, Duration::minutes(5), 1)
+                .claim(&mut conn, Duration::minutes(5), Duration::minutes(5), 1)
                 .await
                 .expect("early claim runs")
                 .is_empty(),
@@ -1658,7 +1790,7 @@ async fn terminal_failures_and_expired_final_attempts_carry_no_verdict() {
     }
     assert!(
         queue
-            .claim(&mut conn, Duration::minutes(5), 1)
+            .claim(&mut conn, Duration::minutes(5), Duration::minutes(5), 1)
             .await
             .expect("claim runs")
             .is_empty(),
@@ -1966,7 +2098,7 @@ async fn queue_state_is_tenant_isolated() {
     );
     assert!(
         queue
-            .claim(&mut foreign, Duration::minutes(5), 1)
+            .claim(&mut foreign, Duration::minutes(5), Duration::minutes(5), 1)
             .await
             .expect("foreign claim runs")
             .is_empty()
@@ -2186,7 +2318,7 @@ async fn database_clock_owns_verifier_queue_deadlines() {
     );
     assert!(
         queue
-            .claim(&mut conn, Duration::minutes(5), 1)
+            .claim(&mut conn, Duration::minutes(5), Duration::minutes(5), 1)
             .await
             .expect("early claim runs")
             .is_empty(),
@@ -3038,7 +3170,7 @@ async fn group_snapshots_are_idempotent_and_react_in_settlement_order() {
     );
     assert!(
         queue
-            .claim(&mut conn, Duration::minutes(5), 1)
+            .claim(&mut conn, Duration::minutes(5), Duration::minutes(5), 1)
             .await
             .expect("claim runs")
             .is_empty(),
@@ -3194,15 +3326,15 @@ async fn a_claim_takes_up_to_its_limit_in_one_statement() {
     }
 
     let first = queue
-        .claim(&mut conn, Duration::minutes(5), 2)
+        .claim(&mut conn, Duration::minutes(5), Duration::minutes(5), 2)
         .await
         .expect("claim runs");
     let rest = queue
-        .claim(&mut conn, Duration::minutes(5), 5)
+        .claim(&mut conn, Duration::minutes(5), Duration::minutes(5), 5)
         .await
         .expect("claim runs");
     let drained = queue
-        .claim(&mut conn, Duration::minutes(5), 5)
+        .claim(&mut conn, Duration::minutes(5), Duration::minutes(5), 5)
         .await
         .expect("claim runs");
 

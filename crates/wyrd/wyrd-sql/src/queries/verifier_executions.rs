@@ -36,7 +36,9 @@ use wyrd_spec::ids::{
 };
 use wyrd_spec::vala::ids::{RunId, SpanId, TraceId};
 use wyrd_spec::verification::TaskId;
-use wyrd_spec::verification::execution::{VerificationExecutionState, VerificationRequest};
+use wyrd_spec::verification::execution::{
+    InvocationSettlement, VerificationExecutionState, VerificationRequest,
+};
 use wyrd_spec::verification::{
     DriftWindow, FrozenTarget, GroupEndSettings, OperatorDispatchState, VerificationBindingStatus,
     VerificationError, VerificationVerdict, VerifierReadiness,
@@ -387,6 +389,10 @@ const ADVANCE_EXPECTED_CURSOR_SQL: &str = r"
 /// either scan but not claimed stay locked only until the claim commits,
 /// and concurrent claims skip them.
 ///
+/// The first claim fixes the execution deadline `$4` milliseconds after its
+/// statement time and every claim returns what remains of it, so a reclaim
+/// never replenishes it.
+///
 /// Availability, expiry, and the new lease deadline are all PostgreSQL's
 /// statement time; `$2` is only the lease length in milliseconds, so a pod
 /// whose clock differs from the database can neither claim early nor hold a
@@ -431,6 +437,8 @@ const CLAIM_SQL: &str = r"
     UPDATE wyrd.verifier_executions e
        SET status = 'running', attempts = e.attempts + 1, lease_token = gen_random_uuid(),
            lease_expires_at = statement_timestamp() + ($2::bigint * INTERVAL '1 millisecond'),
+           deadline_at = COALESCE(e.deadline_at,
+                                  statement_timestamp() + ($4::bigint * INTERVAL '1 millisecond')),
            next_attempt_at = NULL, updated_at = statement_timestamp()
       FROM candidate
      WHERE e.execution_id = candidate.execution_id
@@ -445,6 +453,8 @@ const CLAIM_SQL: &str = r"
                            * 1000)::bigint) AS queue_wait_ms,
               GREATEST(0, (EXTRACT(EPOCH FROM statement_timestamp() - e.created_at)
                            * 1000)::bigint) AS age_ms,
+              GREATEST(0, (EXTRACT(EPOCH FROM e.deadline_at - statement_timestamp())
+                           * 1000)::bigint) AS remaining_ms,
               (SELECT jsonb_object_agg(f.requirement_id, f.fitted)
                  FROM wyrd.drift_baselines f
                 WHERE f.verifier_uid = e.verifier_card_uid
@@ -584,6 +594,52 @@ const RELEASE_SQL: &str = r"
            next_attempt_at = statement_timestamp() + ($3::bigint * INTERVAL '1 millisecond'),
            updated_at = statement_timestamp()
      WHERE execution_id = $1 AND lease_token = $2 AND status = 'running'
+";
+
+/// Read every recorded invocation attempt of one execution, settled or not,
+/// in task and attempt order, through the invocation identity index.
+const INVOCATIONS_SQL: &str = r"
+    SELECT task_id, attempt, settlement
+      FROM wyrd.verifier_execution_invocations
+     WHERE execution_id = $1
+     ORDER BY task_id, attempt
+";
+
+/// Record that task `$3` starts attempt `$4` of a leased execution, before
+/// the attempt is dispatched. The execution row is share-locked, so a
+/// concurrent reclaim either waits for this insert or makes it insert nothing.
+const BEGIN_INVOCATION_SQL: &str = r"
+    INSERT INTO wyrd.verifier_execution_invocations
+        (data_tenant_id, execution_id, task_id, attempt, started_at)
+    SELECT e.data_tenant_id, e.execution_id, $3, $4, statement_timestamp()
+      FROM wyrd.verifier_executions e
+     WHERE e.execution_id = $1 AND e.lease_token = $2 AND e.status = 'running'
+       FOR SHARE
+";
+
+/// Remove unsettled attempt `$4` of task `$3`, refused capacity before it ran,
+/// under the execution's lease, share-locked as [`BEGIN_INVOCATION_SQL`] does.
+const FORGET_INVOCATION_SQL: &str = r"
+    DELETE FROM wyrd.verifier_execution_invocations i
+     USING (SELECT execution_id FROM wyrd.verifier_executions
+             WHERE execution_id = $1 AND lease_token = $2 AND status = 'running'
+               FOR SHARE) e
+     WHERE i.execution_id = e.execution_id AND i.task_id = $3 AND i.attempt = $4
+       AND i.item_index IS NULL AND i.iteration_index IS NULL
+       AND i.settlement IS NULL
+";
+
+/// Settle attempt `$4` of task `$3` with `$5`, once, under the execution's
+/// lease, share-locked as [`BEGIN_INVOCATION_SQL`] does.
+const SETTLE_INVOCATION_SQL: &str = r"
+    UPDATE wyrd.verifier_execution_invocations i
+       SET settlement = $5, settled_at = statement_timestamp()
+      FROM (SELECT execution_id FROM wyrd.verifier_executions
+             WHERE execution_id = $1 AND lease_token = $2 AND status = 'running'
+               FOR SHARE) e
+     WHERE i.execution_id = e.execution_id AND i.task_id = $3 AND i.attempt = $4
+       AND i.item_index IS NULL AND i.iteration_index IS NULL
+       AND i.settlement IS NULL
 ";
 
 /// Read one execution's control-plane status.
@@ -1517,6 +1573,10 @@ pub struct ClaimedExecution {
     /// statement's PostgreSQL instant less `created_at`. Telemetry, and the
     /// runner's bound on waiting for the execution's input record to publish.
     pub age: std::time::Duration,
+    /// What remains of the execution deadline its first claim fixed, as of
+    /// this claim's PostgreSQL instant; zero once it has passed. A reclaim
+    /// never replenishes it.
+    pub remaining: std::time::Duration,
     /// The Verifier's ready fitted Drift baselines keyed by requirement ID,
     /// read in the claim transaction; empty when it has none.
     pub fitted_baselines: BTreeMap<TaskId, Value>,
@@ -1524,6 +1584,18 @@ pub struct ClaimedExecution {
     /// unchanged to its result rows; `None` when it carried none. Never an
     /// execution input.
     pub deployment_environment: Option<String>,
+}
+
+/// One recorded attempt of one block invocation of an execution.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Invocation {
+    /// The step or requirement invoked.
+    pub task: TaskId,
+    /// The one-based attempt.
+    pub attempt: u32,
+    /// Its committed settlement; `None` when the attempt was dispatched and
+    /// never settled, so its outcome is unknown.
+    pub settlement: Option<InvocationSettlement>,
 }
 
 /// Outcome of a token-fenced settlement.
@@ -2684,8 +2756,10 @@ impl VerifierExecutionQueue {
     /// PostgreSQL's statement time, or `running` executions whose lease the
     /// database considers expired, with `SKIP LOCKED`; marks each `running`
     /// with its own lease token expiring `lease_for` after that same database
-    /// instant; and counts the attempt. Returns nothing when nothing is
-    /// runnable, and never more than `limit`; the order is unspecified. The
+    /// instant; counts the attempt; and fixes the execution deadline
+    /// `deadline_for` after its first claim, which a reclaim keeps. Returns
+    /// nothing when nothing is runnable, and never more than `limit`; the
+    /// order is unspecified. The
     /// caller commits before executing. The statement opens no span of its
     /// own: the runner records it on each attempt's `claim` span once the
     /// claimed row names the attempt's cause.
@@ -2697,6 +2771,7 @@ impl VerifierExecutionQueue {
         &self,
         conn: &mut TenantConn<'_>,
         lease_for: Duration,
+        deadline_for: Duration,
         limit: u32,
     ) -> Result<Vec<ClaimedExecution>, SqlxError> {
         timed("claim", async {
@@ -2708,6 +2783,7 @@ impl VerifierExecutionQueue {
                 .bind(Json(&exhausted))
                 .bind(lease_for.num_milliseconds())
                 .bind(i64::from(limit))
+                .bind(deadline_for.num_milliseconds())
                 .fetch_all(&mut **conn.transaction())
                 .await?;
             rows.into_iter().map(ClaimedRow::into_claimed).collect()
@@ -3001,6 +3077,118 @@ impl VerifierExecutionQueue {
                 .bind(lease.execution_id.as_uuid())
                 .bind(lease.token.0)
                 .bind(delay.num_milliseconds())
+                .execute(&mut **conn.transaction())
+                .await?;
+            Ok(settlement(result.rows_affected()))
+        })
+        .await
+    }
+
+    /// Every recorded invocation attempt of `execution`, settled or not, in
+    /// task and attempt order.
+    ///
+    /// # Errors
+    /// Returns the database error when the read fails, or a decode error when
+    /// a stored task identity, attempt, or settlement is malformed.
+    pub async fn invocations(
+        &self,
+        conn: &mut TenantConn<'_>,
+        execution: ExecutionId,
+    ) -> Result<Vec<Invocation>, SqlxError> {
+        timed("invocations", async {
+            let rows: Vec<(String, i32, Option<Json<InvocationSettlement>>)> =
+                sqlx::query_as(INVOCATIONS_SQL)
+                    .bind(execution.as_uuid())
+                    .fetch_all(&mut **conn.transaction())
+                    .await?;
+            rows.into_iter()
+                .map(|(task, attempt, settlement)| {
+                    Ok(Invocation {
+                        task: stored(TaskId::new(task))?,
+                        attempt: stored(u32::try_from(attempt))?,
+                        settlement: settlement.map(|settlement| settlement.0),
+                    })
+                })
+                .collect()
+        })
+        .await
+    }
+
+    /// Record that `task` starts its one-based `attempt` under `lease`,
+    /// before the attempt is dispatched.
+    ///
+    /// # Errors
+    /// Returns the database error when the insert fails, including a unique
+    /// violation when the attempt was already recorded.
+    #[tracing::instrument(skip(self, conn), fields(operation = "verification.executions.begin_invocation", execution_id = %lease.execution_id))]
+    pub async fn begin_invocation(
+        &self,
+        conn: &mut TenantConn<'_>,
+        lease: ExecutionLease,
+        task: &TaskId,
+        attempt: u32,
+    ) -> Result<Settlement, SqlxError> {
+        timed("begin_invocation", async {
+            let result = sqlx::query(BEGIN_INVOCATION_SQL)
+                .bind(lease.execution_id.as_uuid())
+                .bind(lease.token.0)
+                .bind(task.as_str())
+                .bind(i64::from(attempt))
+                .execute(&mut **conn.transaction())
+                .await?;
+            Ok(settlement(result.rows_affected()))
+        })
+        .await
+    }
+
+    /// Remove `task`'s unsettled `attempt` under `lease`, because it was
+    /// refused capacity before it was dispatched and spends nothing.
+    ///
+    /// # Errors
+    /// Returns the database error when the delete fails.
+    #[tracing::instrument(skip(self, conn), fields(operation = "verification.executions.forget_invocation", execution_id = %lease.execution_id))]
+    pub async fn forget_invocation(
+        &self,
+        conn: &mut TenantConn<'_>,
+        lease: ExecutionLease,
+        task: &TaskId,
+        attempt: u32,
+    ) -> Result<Settlement, SqlxError> {
+        timed("forget_invocation", async {
+            let result = sqlx::query(FORGET_INVOCATION_SQL)
+                .bind(lease.execution_id.as_uuid())
+                .bind(lease.token.0)
+                .bind(task.as_str())
+                .bind(i64::from(attempt))
+                .execute(&mut **conn.transaction())
+                .await?;
+            Ok(settlement(result.rows_affected()))
+        })
+        .await
+    }
+
+    /// Commit `settled` as the outcome of `task`'s `attempt` under `lease`.
+    /// An attempt settles once; a stale lease or an already settled attempt
+    /// changes nothing and is [`Settlement::StaleLease`].
+    ///
+    /// # Errors
+    /// Returns the database error when the update fails.
+    #[tracing::instrument(skip(self, conn, settled), fields(operation = "verification.executions.settle_invocation", execution_id = %lease.execution_id))]
+    pub async fn settle_invocation(
+        &self,
+        conn: &mut TenantConn<'_>,
+        lease: ExecutionLease,
+        task: &TaskId,
+        attempt: u32,
+        settled: &InvocationSettlement,
+    ) -> Result<Settlement, SqlxError> {
+        timed("settle_invocation", async {
+            let result = sqlx::query(SETTLE_INVOCATION_SQL)
+                .bind(lease.execution_id.as_uuid())
+                .bind(lease.token.0)
+                .bind(task.as_str())
+                .bind(i64::from(attempt))
+                .bind(Json(settled))
                 .execute(&mut **conn.transaction())
                 .await?;
             Ok(settlement(result.rows_affected()))
@@ -3393,6 +3581,8 @@ struct ClaimedRow {
     queue_wait_ms: i64,
     /// Milliseconds since the execution was admitted.
     age_ms: i64,
+    /// Milliseconds left before the execution deadline.
+    remaining_ms: i64,
     /// The Verifier's ready fitted baselines by requirement; `None` when none.
     fitted_baselines: Option<Json<BTreeMap<TaskId, Value>>>,
 }
@@ -3468,6 +3658,7 @@ impl ClaimedRow {
                 self.queue_wait_ms,
             ))?),
             age: std::time::Duration::from_millis(stored(u64::try_from(self.age_ms))?),
+            remaining: std::time::Duration::from_millis(stored(u64::try_from(self.remaining_ms))?),
             fitted_baselines: self
                 .fitted_baselines
                 .map(|Json(fitted)| fitted)

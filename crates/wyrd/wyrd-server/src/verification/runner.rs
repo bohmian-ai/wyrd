@@ -42,7 +42,7 @@ use tracing::Instrument as _;
 use tracing::field::Empty;
 use vala_bifrost_redux::catalog::TableRef;
 use vala_bifrost_redux::namespaces::BifrostNamespace;
-use vala_verify::blocks::{DriftChecks, EngineError};
+use vala_verify::blocks::{Checkpoints, DriftChecks, EngineError};
 use wyrd_runtime::outbox::Reservation;
 use wyrd_spec::DataTenantId;
 use wyrd_spec::auth::{Attribution, PrincipalId};
@@ -51,12 +51,14 @@ use wyrd_spec::card::operator::DriftCounts;
 use wyrd_spec::card::verifier::VerifierSpec;
 use wyrd_spec::error::WyrdError;
 use wyrd_spec::ids::{SlotName, VerificationResultId};
-use wyrd_spec::verification::execution::{InputDeclaration, VerificationOutcome};
+use wyrd_spec::verification::execution::{
+    InputDeclaration, InvocationSettlement, VerificationOutcome,
+};
 use wyrd_spec::verification::{TaskId, VerifierReadiness};
 use wyrd_spec::verification::{VerificationError, VerificationVerdict};
 use wyrd_sql::queries::verifier_executions::{
-    ClaimedExecution, Completion, EnqueueRefusal, ExecutionInput, RetryOutcome, TerminalStatus,
-    VerifierExecutionQueue,
+    ClaimedExecution, Completion, EnqueueRefusal, ExecutionInput, ExecutionLease, RetryOutcome,
+    Settlement, TerminalStatus, VerifierExecutionQueue,
 };
 use wyrd_sql::{OperatorPool, SqlError, TenantConn, WyrdPostgres};
 
@@ -384,7 +386,7 @@ impl VerifierRunner {
             );
         };
         let started_at = Utc::now();
-        let deadline = tokio::time::Instant::now() + self.limits.execution_timeout;
+        let deadline = tokio::time::Instant::now() + run.remaining;
         let executed = telemetry
             .phase(
                 Phase::Engine,
@@ -507,6 +509,30 @@ impl VerifierRunner {
                 ));
             }
         };
+        let mut conn = match self.postgres.tenant_conn(tenant).await {
+            Ok(conn) => conn,
+            Err(error) => return checkpoints_unreadable(run, &error),
+        };
+        let recorded = match self
+            .queue
+            .invocations(&mut conn, run.lease.execution_id)
+            .await
+        {
+            Ok(recorded) => recorded,
+            Err(error) => return checkpoints_unreadable(run, &error),
+        };
+        drop(conn);
+        let engine = engine.with_checkpoints(
+            Arc::new(ExecutionCheckpoints {
+                postgres: self.postgres.clone(),
+                queue: self.queue,
+                tenant,
+                lease: run.lease,
+            }),
+            recorded
+                .into_iter()
+                .map(|invocation| (invocation.task, invocation.attempt, invocation.settlement)),
+        );
         match engine.run(Arc::clone(spec), evidence, deadline).await {
             Ok(outcome) => EngineOutcome::Completed(outcome),
             Err(error) => engine_failure(run, &error),
@@ -754,7 +780,9 @@ impl LeasedWork for VerifierRunner {
         let lease = chrono::Duration::from_std(self.limits.lease)
             .unwrap_or_else(|_| chrono::Duration::minutes(10));
         let resolving = Instant::now();
-        let claimed = self.queue.claim(conn, lease, limit).await?;
+        let deadline = chrono::Duration::from_std(self.limits.execution_timeout)
+            .unwrap_or_else(|_| chrono::Duration::minutes(5));
+        let claimed = self.queue.claim(conn, lease, deadline, limit).await?;
         let statement_us = u64::try_from(resolving.elapsed().as_micros()).unwrap_or(u64::MAX);
         let batch = claimed.len();
         let mut claims = Vec::with_capacity(batch);
@@ -1057,6 +1085,96 @@ fn engine_failure(run: &ClaimedExecution, error: &EngineError) -> EngineOutcome 
             EVIDENCE_UNAVAILABLE,
             "the verification evidence cannot be admitted now",
         )),
+        EngineError::Checkpoint(_) => EngineOutcome::Retry(failure(
+            EXECUTION_INTERRUPTED,
+            "a verification checkpoint cannot commit",
+        )),
+    }
+}
+
+/// The retry of an execution whose invocation record cannot be read.
+fn checkpoints_unreadable(run: &ClaimedExecution, error: &dyn std::fmt::Display) -> EngineOutcome {
+    tracing::warn!(execution_id = %run.lease.execution_id, %error, "the execution's invocation record cannot be read");
+    EngineOutcome::Retry(failure(
+        EXECUTION_INTERRUPTED,
+        "the execution's invocation record cannot be read",
+    ))
+}
+
+/// The invocation record of one claimed execution, every write fenced by its
+/// lease in its own tenant transaction, so no transaction spans block IO.
+struct ExecutionCheckpoints {
+    /// Opens each write's tenant transaction.
+    postgres: WyrdPostgres,
+    /// The fenced invocation statements.
+    queue: VerifierExecutionQueue,
+    /// The execution's tenant.
+    tenant: DataTenantId,
+    /// The claim every write is fenced by.
+    lease: ExecutionLease,
+}
+
+impl ExecutionCheckpoints {
+    /// Run `write` in one tenant transaction and commit it when it applied.
+    ///
+    /// # Errors
+    /// Returns a bounded reason when the transaction fails or the lease is
+    /// no longer held.
+    async fn fenced(
+        &self,
+        write: impl AsyncFnOnce(&mut TenantConn<'_>) -> Result<Settlement, sqlx::Error>,
+    ) -> Result<(), String> {
+        let unavailable = |error: &dyn std::fmt::Display| {
+            tracing::warn!(execution_id = %self.lease.execution_id, %error, "the invocation record cannot commit");
+            "the invocation record cannot commit".to_owned()
+        };
+        let mut conn = self
+            .postgres
+            .tenant_conn(self.tenant)
+            .await
+            .map_err(|error| unavailable(&error))?;
+        match write(&mut conn)
+            .await
+            .map_err(|error| unavailable(&error))?
+        {
+            Settlement::Applied => conn.commit().await.map_err(|error| unavailable(&error)),
+            Settlement::StaleLease => Err("the execution's lease is no longer held".to_owned()),
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl Checkpoints for ExecutionCheckpoints {
+    async fn begin(&self, task: &TaskId, attempt: u32) -> Result<(), String> {
+        self.fenced(async |conn| {
+            self.queue
+                .begin_invocation(conn, self.lease, task, attempt)
+                .await
+        })
+        .await
+    }
+
+    async fn forget(&self, task: &TaskId, attempt: u32) -> Result<(), String> {
+        self.fenced(async |conn| {
+            self.queue
+                .forget_invocation(conn, self.lease, task, attempt)
+                .await
+        })
+        .await
+    }
+
+    async fn settle(
+        &self,
+        task: &TaskId,
+        attempt: u32,
+        settled: &InvocationSettlement,
+    ) -> Result<(), String> {
+        self.fenced(async |conn| {
+            self.queue
+                .settle_invocation(conn, self.lease, task, attempt, settled)
+                .await
+        })
+        .await
     }
 }
 

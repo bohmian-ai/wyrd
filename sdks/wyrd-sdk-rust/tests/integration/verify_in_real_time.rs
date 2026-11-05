@@ -52,7 +52,7 @@ pub(crate) struct Assistant {
     /// The deployment.
     pub(crate) deployment: Deployment,
     /// The local judge the `answer-judged` Agent check calls.
-    judge: MockServer,
+    pub(crate) judge: MockServer,
     /// The hydrated assistant bundle.
     bundle: TempDir,
     /// The registered assistant Service.

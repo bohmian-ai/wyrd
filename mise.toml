@@ -754,6 +754,7 @@ run = "scripts/identity/with-identity-providers.sh -- mise run test:identity:ui:
 [tasks."test:identity:ui:suite"]
 hide = true
 description = "Build the UI and run the production UI journey against already-running Postgres, Keycloak, and Dex."
+depends = ["ts:build"]
 env = { WYRD_KEYCLOAK_ISSUER = "http://localhost:8180/realms/wyrd-test", WYRD_DEX_ISSUER = "http://localhost:5556" }
 run = """
 set -e

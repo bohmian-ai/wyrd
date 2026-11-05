@@ -9,23 +9,27 @@
 //! execution progresses, and never loads publication content.
 
 use base64::Engine as _;
+use bytes::Bytes;
+use futures_util::stream::BoxStream;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 use wyrd_runtime::Permission;
 use wyrd_runtime::permission::{Action, PermissionScope, Resource};
 use wyrd_spec::error::WyrdError;
 use wyrd_spec::ids::ExecutionId;
-use wyrd_spec::storage::DownloadInitResponse;
+use wyrd_spec::storage::{DownloadInitResponse, StorageBackendKind};
 use wyrd_spec::vala::error::BifrostError;
 use wyrd_spec::verification::execution::{
     CancelExecutionResponse, EXECUTION_PAGE_DEFAULT, EXECUTION_PAGE_MAX, ExecutionInvocation,
     ExecutionPageQuery, HistoryProjection, InvocationPage, InvocationProgress,
-    InvocationSettlement, Publication, PublicationContent, PublicationPage, PublicationSelector,
-    PublicationSummary, Speculation,
+    InvocationSettlement, Publication, PublicationContent, PublicationFile, PublicationPage,
+    PublicationSelector, PublicationSummary, Speculation,
 };
 use wyrd_spec::verification::{PublicationName, TaskId};
 use wyrd_sql::TenantConn;
 use wyrd_sql::queries::verifier_executions::{ExecutionStatus, InvocationEntry, PagePosition};
+use wyrd_storage::error::StorageError;
+use wyrd_storage::tenant_path::ValidatedPath;
 
 use super::VerificationControl;
 use crate::audit;
@@ -44,6 +48,9 @@ const READ_PUBLICATION: &str = "verification.execution.publication";
 
 /// Audit operation of one publication file download plan.
 const DOWNLOAD_PUBLICATION: &str = "verification.execution.publication.download";
+
+/// Audit operation of one publication file's local bytes.
+const READ_PUBLICATION_CONTENT: &str = "verification.execution.publication.content";
 
 /// Audit operation of a cancellation.
 const CANCEL: &str = "verification.execution.cancel";
@@ -371,12 +378,13 @@ impl<'a> VerificationControl<'a> {
     /// file publication's only file, or the directory's regular file at
     /// `selector.path`.
     ///
+    /// Cloud backends answer with a presigned URL. The local backend has
+    /// none, so its plan points at [`Self::content`]'s root-relative route,
+    /// which authorizes `verifier:read` again rather than the Card read the
+    /// local blob route requires.
+    ///
     /// # Errors
-    /// Returns [`WyrdError::Validation`] for a JSON publication, a path on a
-    /// file publication, or a directory path its manifest does not list;
-    /// `WYRD_VALA_503_QUERY_VISIBILITY_UNAVAILABLE` while the file's completed
-    /// upload is not yet visible; the storage planning error; and the errors
-    /// of [`Self::publication`].
+    /// The errors of [`Self::file`] and the storage planning error.
     pub(crate) async fn download(
         &self,
         caller: &Caller,
@@ -385,8 +393,8 @@ impl<'a> VerificationControl<'a> {
         name: &PublicationName,
         selector: &PublicationSelector,
     ) -> Result<DownloadInitResponse, WyrdError> {
-        let publication = self
-            .select(
+        let (object, file) = self
+            .file(
                 caller,
                 execution_id,
                 step,
@@ -395,25 +403,90 @@ impl<'a> VerificationControl<'a> {
                 DOWNLOAD_PUBLICATION,
             )
             .await?;
+        let mut plan = wyrd_storage::service::download_plan(
+            &self.state.storage,
+            &object,
+            self.state.storage.presign_ttl_secs(),
+            file.size_bytes,
+            base64::engine::general_purpose::STANDARD.encode(file.sha256.as_bytes()),
+        )
+        .await?;
+        if self.state.storage.backend() == StorageBackendKind::Local {
+            plan.plan.get_url = content_url(execution_id, step, name, selector);
+        }
+        Ok(plan)
+    }
+
+    /// The bytes of the publication file `selector` names, streamed from the
+    /// local backend; the URL of a local download plan.
+    ///
+    /// # Errors
+    /// The errors of [`Self::file`], and the storage error when the object
+    /// cannot be opened or the backend is not local.
+    pub(crate) async fn content(
+        &self,
+        caller: &Caller,
+        execution_id: ExecutionId,
+        step: &TaskId,
+        name: &PublicationName,
+        selector: &PublicationSelector,
+    ) -> Result<(BoxStream<'static, Result<Bytes, StorageError>>, u64), WyrdError> {
+        let (object, _) = self
+            .file(
+                caller,
+                execution_id,
+                step,
+                name,
+                selector,
+                READ_PUBLICATION_CONTENT,
+            )
+            .await?;
+        wyrd_storage::service::download_local_object(&self.state.storage, &object).await
+    }
+
+    /// Authorize `operation` on the publication `selector` names and locate
+    /// its one file: the file publication's only file, or the directory's
+    /// regular file at `selector.path`.
+    ///
+    /// # Errors
+    /// Returns [`WyrdError::Validation`] for a JSON publication, a path on a
+    /// file publication, or a directory path its manifest does not list;
+    /// `WYRD_VALA_503_QUERY_VISIBILITY_UNAVAILABLE` while the file's completed
+    /// upload is not yet visible; and the errors of [`Self::publication`].
+    async fn file(
+        &self,
+        caller: &Caller,
+        execution_id: ExecutionId,
+        step: &TaskId,
+        name: &PublicationName,
+        selector: &PublicationSelector,
+        operation: &str,
+    ) -> Result<(ValidatedPath, PublicationFile), WyrdError> {
+        let publication = self
+            .select(caller, execution_id, step, name, selector, operation)
+            .await?;
         let path = selector.path.as_deref();
-        let file = match (&publication.content, path) {
-            (PublicationContent::File { manifest }, None) => manifest.files.first(),
-            (PublicationContent::File { .. }, Some(_)) => {
+        let file = match publication.content {
+            PublicationContent::File { manifest } if path.is_none() => {
+                manifest.files.into_iter().next()
+            }
+            PublicationContent::File { .. } => {
                 return Err(invalid(
                     "a file publication downloads without a path",
                     "path",
                 ));
             }
-            (PublicationContent::Directory { manifest }, Some(path)) => {
-                manifest.files.iter().find(|file| file.path == path)
-            }
-            (PublicationContent::Directory { .. }, None) => {
+            PublicationContent::Directory { manifest } if path.is_some() => manifest
+                .files
+                .into_iter()
+                .find(|file| Some(file.path.as_str()) == path),
+            PublicationContent::Directory { .. } => {
                 return Err(invalid(
                     "a directory publication download names one of its manifest's files",
                     "path",
                 ));
             }
-            (PublicationContent::Json { .. }, _) => {
+            PublicationContent::Json { .. } => {
                 return Err(invalid(
                     "a JSON publication is read through its value, not downloaded",
                     "name",
@@ -425,14 +498,7 @@ impl<'a> VerificationControl<'a> {
             .file_object(caller.data_tenant_id, &file.sha256, file.size_bytes)
             .await?
             .ok_or_else(|| WyrdError::from(BifrostError::QueryVisibilityUnavailable))?;
-        wyrd_storage::service::download_plan(
-            &self.state.storage,
-            &object,
-            self.state.storage.presign_ttl_secs(),
-            file.size_bytes,
-            base64::engine::general_purpose::STANDARD.encode(file.sha256.as_bytes()),
-        )
-        .await
+        Ok((object, file))
     }
 
     /// Read and authorize the publication `selector` names for `operation`.
@@ -515,4 +581,32 @@ impl<'a> VerificationControl<'a> {
             status: status.state.status,
         })
     }
+}
+
+/// The root-relative content route of the publication file `selector` names,
+/// which a local download plan hands out. Step and name are URL-safe by
+/// validation; the selector is form-encoded.
+fn content_url(
+    execution_id: ExecutionId,
+    step: &TaskId,
+    name: &PublicationName,
+    selector: &PublicationSelector,
+) -> String {
+    let mut query = url::form_urlencoded::Serializer::new(String::new());
+    query.append_pair("attempt", &selector.attempt.to_string());
+    if let Some(item) = selector.item_index {
+        query.append_pair("item_index", &item.to_string());
+    }
+    if let Some(iteration) = selector.iteration_index {
+        query.append_pair("iteration_index", &iteration.to_string());
+    }
+    if let Some(path) = &selector.path {
+        query.append_pair("path", path);
+    }
+    format!(
+        "/v1/verification/executions/{execution_id}/publications/{}/{}/content?{}",
+        step.as_str(),
+        name.as_str(),
+        query.finish()
+    )
 }

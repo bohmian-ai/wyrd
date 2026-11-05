@@ -10,7 +10,8 @@
 use axum::body::Body;
 use axum::extract::rejection::{PathRejection, QueryRejection};
 use axum::extract::{Path, Query, State};
-use axum::http::{HeaderMap, StatusCode};
+use axum::http::{HeaderMap, StatusCode, header};
+use axum::response::{IntoResponse, Response};
 use axum::{Extension, Json};
 use wyrd_spec::error::{WyrdError, WyrdProblem};
 use wyrd_spec::ids::{BindingId, ExecutionId};
@@ -47,6 +48,7 @@ pub fn verification_router() -> OpenApiRouter<AppState> {
         .routes(routes!(list_publications))
         .routes(routes!(get_publication))
         .routes(routes!(download_publication))
+        .routes(routes!(publication_content))
         .routes(routes!(cancel_execution))
 }
 
@@ -478,6 +480,78 @@ async fn download_publication(
             .download(&caller, execution_id, &step, &name, &selector)
             .await?,
     ))
+}
+
+/// Stream the bytes of one publication file on the local storage backend.
+///
+/// This is the `get_url` a local publication download plan hands out; cloud
+/// backends hand out presigned URLs instead. It selects and authorizes
+/// exactly as the download plan does, `verifier:read` on the execution's
+/// Verifier, so a caller who may plan the download may fetch it.
+///
+/// # Errors
+/// Returns the stable Wyrd errors of the download plan, and a storage error
+/// when the object is missing, the backend fails, or the backend is not local.
+#[utoipa::path(
+    get,
+    path = "/verification/executions/{execution_id}/publications/{step_id}/{name}/content",
+    params(
+        ("execution_id" = ExecutionId, Path, description = "Execution ID returned by \
+          POST /v1/verification/enqueue"),
+        ("step_id" = TaskId, Path, description = "The producer step"),
+        ("name" = PublicationName, Path, description = "The logical publication name"),
+        PublicationSelector
+    ),
+    responses(
+        (status = 200, description = "The stored bytes", body = [u8],
+         content_type = "application/octet-stream"),
+        (status = 400, description = "A path identifier, the producer selector, or the file \
+          path is invalid, or the publication is JSON (WYRD_SPEC_400_VALIDATION)",
+         body = WyrdProblem),
+        (status = 401, description = "The request carried no usable access token \
+          (WYRD_AUTH_401_UNAUTHENTICATED, WYRD_AUTH_401_INVALID_TOKEN, \
+          WYRD_AUTH_401_TOKEN_EXPIRED)", body = WyrdProblem),
+        (status = 403, description = "The principal lacks verifier:read on the execution's \
+          Verifier (WYRD_PERMISSION_403_DENIED_RBAC)", body = WyrdProblem),
+        (status = 404, description = "No such queued execution in the caller's tenant, no \
+          such publication of the producer attempt, or no such stored object \
+          (WYRD_VERIFICATION_404_EXECUTION_NOT_FOUND, \
+          WYRD_VERIFICATION_404_PUBLICATION_NOT_FOUND, WYRD_STORAGE_404_OBJECT_NOT_FOUND)",
+         body = WyrdProblem),
+        (status = 500, description = "The storage backend failed or is not local \
+          (WYRD_STORAGE_500_BACKEND, WYRD_SPEC_500_INTERNAL)", body = WyrdProblem),
+        (status = 503, description = "The file's completed upload is not visible yet, storage \
+          or the registry is unavailable, or no verifier is configured for the access token; \
+          retry (WYRD_VALA_503_QUERY_VISIBILITY_UNAVAILABLE, \
+          WYRD_STORAGE_503_BACKEND_UNAVAILABLE, WYRD_REGISTRY_503_REGISTRY_UNAVAILABLE, \
+          WYRD_AUTH_503_VERIFY_UNAVAILABLE)", body = WyrdProblem)
+    ),
+    tag = "Verification"
+)]
+#[tracing::instrument(
+    skip(state, caller, path, query),
+    fields(operation = "verification.execution.publication.content")
+)]
+async fn publication_content(
+    State(state): State<AppState>,
+    caller: Caller,
+    path: Result<Path<(ExecutionId, TaskId, PublicationName)>, PathRejection>,
+    query: Result<Query<PublicationSelector>, QueryRejection>,
+) -> Result<Response, WyrdErrorResponse> {
+    let Path((execution_id, step, name)) = path.map_err(|rejection| path_rejection(&rejection))?;
+    let Query(selector) = query.map_err(|rejection| query_rejection(&rejection))?;
+    let (stream, len) = VerificationControl::new(&state)
+        .content(&caller, execution_id, &step, &name, &selector)
+        .await?;
+    Ok((
+        StatusCode::OK,
+        [
+            (header::CONTENT_TYPE, "application/octet-stream"),
+            (header::CONTENT_LENGTH, &len.to_string()),
+        ],
+        Body::from_stream(stream),
+    )
+        .into_response())
 }
 
 /// Cancel a queued execution and answer its status after the fence commits.

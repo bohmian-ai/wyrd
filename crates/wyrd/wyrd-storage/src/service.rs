@@ -876,6 +876,20 @@ pub async fn download_local_blob(
     path: String,
 ) -> Result<(BoxStream<'static, Result<Bytes, StorageError>>, u64), WyrdError> {
     let validated = tenant_path::validate(&path, data_tenant_id).map_err(map_tenant_path)?;
+    download_local_object(storage, &validated).await
+}
+
+/// Open an already validated local-mode object for streaming through an
+/// authenticated server route, as [`download_local_blob`] does once it has
+/// validated its caller's path.
+///
+/// # Errors
+/// Returns an internal error on a non-local backend, and the mapped storage
+/// error when the object is absent or cannot be opened.
+pub async fn download_local_object(
+    storage: &StorageHandle,
+    validated: &ValidatedPath,
+) -> Result<(BoxStream<'static, Result<Bytes, StorageError>>, u64), WyrdError> {
     if storage.backend() != StorageBackendKind::Local {
         return Err(internal_error(
             "local download route mounted for non-local backend",
@@ -883,7 +897,7 @@ pub async fn download_local_blob(
         ));
     }
     storage
-        .get_object_stream(&validated)
+        .get_object_stream(validated)
         .await
         .map_err(map_storage_error)
 }

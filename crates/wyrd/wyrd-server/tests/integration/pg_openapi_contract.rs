@@ -1513,11 +1513,12 @@ async fn card_contract_publishes_typed_lifecycle_and_problem_shapes() {
     server.shutdown().await.expect("server shuts down");
 }
 
-/// The Verification surface is exactly ten typed operations.
+/// The Verification surface is exactly eleven typed operations.
 ///
 /// Binding status, evidence planning, direct execution, enqueue, execution
-/// status, invocation and publication pages, publication read and download,
-/// and cancellation publish their typed request and response schemas,
+/// status, invocation and publication pages, publication read, download, and
+/// local content, and cancellation publish their typed request and response
+/// schemas; local content answers `application/octet-stream` bytes,
 /// enqueue answers `202 Accepted`, direct execution answers `200` with its
 /// result and documents its stable refusals, and no other Verification
 /// operation is routed: evidence plans target the shared storage upload
@@ -1532,7 +1533,7 @@ async fn card_contract_publishes_typed_lifecycle_and_problem_shapes() {
 /// method, status, or schema reference differs, or when the document names a
 /// retired evaluation identifier.
 #[tokio::test]
-async fn verification_contract_publishes_ten_typed_operations_and_the_local_upload() {
+async fn verification_contract_publishes_eleven_typed_operations_and_the_local_upload() {
     let server = WyrdTestServer::start_in_process()
         .await
         .expect("test server starts");
@@ -1569,6 +1570,10 @@ async fn verification_contract_publishes_ten_typed_operations_and_the_local_uplo
             ),
             (
                 "/v1/verification/executions/{execution_id}/publications/{step_id}/{name}",
+                "get"
+            ),
+            (
+                "/v1/verification/executions/{execution_id}/publications/{step_id}/{name}/content",
                 "get"
             ),
             (
@@ -1618,6 +1623,12 @@ async fn verification_contract_publishes_ten_typed_operations_and_the_local_uplo
         Some("#/components/schemas/VerificationExecutionState")
     );
     let publication = "/v1/verification/executions/{execution_id}/publications/{step_id}/{name}";
+    assert!(
+        paths[format!("{publication}/content").as_str()]["get"]["responses"]["200"]["content"]
+            ["application/octet-stream"]
+            .is_object(),
+        "local content answers bytes"
+    );
     for (path, method, schema) in [
         (
             "/v1/verification/executions/{execution_id}/invocations",

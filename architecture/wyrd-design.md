@@ -1724,7 +1724,8 @@ execution; scheduled executions have no `run_id`.
 | `GET /v1/verification/executions/{execution_id}/invocations` | One page of a queued execution's invocation attempts in insertion order — producer, progress, reason, speculation — with its status and history projection counts |
 | `GET /v1/verification/executions/{execution_id}/publications` | One page of its publications' names, kinds, and producers, without content |
 | `GET /v1/verification/executions/{execution_id}/publications/{step_id}/{name}` | One publication of the exact producer attempt with its JSON value or manifest |
-| `POST /v1/verification/executions/{execution_id}/publications/{step_id}/{name}/download` | The shared download plan of a file publication's file or a directory publication's listed `path` |
+| `POST /v1/verification/executions/{execution_id}/publications/{step_id}/{name}/download` | The shared download plan of a file publication's file or a directory publication's listed `path`. A cloud backend's plan is presigned; the local backend's points at `.../content` |
+| `GET /v1/verification/executions/{execution_id}/publications/{step_id}/{name}/content` | The local backend's bytes of that same file, selected and authorized as its download plan is |
 | `POST /v1/verification/executions/{execution_id}/cancel` | `{ execution_id, status }` after the cancellation fence commits; settled work keeps its status |
 | `GET /v1/verification/bindings/{binding_id}` | Readiness, cadence, `last_execution_id`, and a `group_end` binding's frozen settings and source bindings |
 
@@ -1755,7 +1756,7 @@ enforced at planning. `ArtifactRef` selects a declared Artifact under its own
 authorization.
 
 Execution reads — status, invocation and publication pages, publication
-reads, and download plans — check `verifier:read` against the execution's
+reads, download plans, and local publication content — check `verifier:read` against the execution's
 exact Verifier UID, and cancellation checks `verifier:run`; neither falls back
 to `cards:read`. A caller with no grant of the action at any scope is refused
 before the execution is looked up, and an absent or other-tenant execution is

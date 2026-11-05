@@ -257,7 +257,9 @@ credential.
   `execution_outputs` table UIDs, serving the caller, with fixed statements
   filtered to that execution. Invocation and publication inspection read the
   tenant's Postgres execution records under forced RLS; a publication
-  download plan resolves its File through the object inventory's SYSTEM read.
+  download plan, and the local backend's publication content route, resolve
+  its File through the object inventory's SYSTEM read; local publication
+  bytes are never served through the `cards:read` local blob route.
   No caller SQL runs under this authority.
 - Revoking a credential, suspending or deleting a principal, suspending a
   tenant, or changing grants refuses the next issuance immediately. A tenant

@@ -10,7 +10,8 @@
 //! enqueue. Verification Files travel the shared `/v1/cards/upload/*`
 //! lifecycle under their persisted File ownership and are reused only from a
 //! completed File inventory record. It also proves the tenant's internal SYSTEM result writer is
-//! unreachable through the public principal and credential routes.
+//! unreachable through the public principal and credential routes, and that a
+//! local publication download plan is redeemed under `verifier:read` alone.
 
 use std::time::Duration;
 
@@ -26,7 +27,7 @@ use wyrd_server::components::storage::inventory::{
 use wyrd_spec::auth::{Attribution, PrincipalId, Sha256Hex, TokenAudience};
 use wyrd_spec::ids::{BindingId, CardUid, DataTenantId, ExecutionId};
 use wyrd_spec::reference::CardRef;
-use wyrd_testing::verification::VerificationFixture;
+use wyrd_testing::verification::{Published, VerificationFixture};
 use wyrd_testing::{Bootstrap, WyrdTestServer};
 
 /// How long an acknowledged submission may take to become readable.
@@ -2397,4 +2398,117 @@ async fn custom_verdict_data_is_tenant_isolated() {
     assert_eq!(status, StatusCode::NOT_FOUND, "{problem}");
     assert!(!problem.to_string().contains("score"), "{problem}");
     server.shutdown().await.expect("test server shuts down");
+}
+
+/// A local publication download plan is redeemed through its Verifier's own
+/// content route, under `verifier:read` on that Verifier and nothing else.
+///
+/// The fixture holds the execution's lease and publishes a file and a
+/// directory. A caller holding only `verifier:read` on the execution's
+/// Verifier plans both downloads, and each plan's root-relative URL answers
+/// exactly the published bytes. A grant on another Verifier, or `cards:read`
+/// alone, is refused at that URL.
+///
+/// # Panics
+/// Panics when a plan, its URL, its bytes, or a refusal differs.
+#[tokio::test(flavor = "multi_thread")]
+async fn local_publication_downloads_redeem_under_verifier_read() {
+    let server = WyrdTestServer::start_in_process()
+        .await
+        .expect("test server starts");
+    let fixture = VerificationFixture::provision(server.state(), server.data_tenant_id())
+        .await
+        .expect("the tenant provisions");
+    let (subject, _) = fixture.service("local-subject").await.expect("service");
+    let verifier = fixture
+        .drift_verifier("local-plans")
+        .await
+        .expect("verifier");
+    let other = fixture
+        .drift_verifier("local-other")
+        .await
+        .expect("verifier");
+    fixture
+        .submit(&verifier, &subject, std::collections::BTreeMap::new())
+        .await
+        .expect("the execution is admitted");
+    let id = fixture
+        .publish(
+            server.state(),
+            &[
+                ("draft", "report", Published::File(b"# Report\n".to_vec())),
+                (
+                    "draft",
+                    "tree",
+                    Published::Directory(vec![("nested/b.md".to_owned(), b"beta".to_vec())]),
+                ),
+            ],
+        )
+        .await
+        .expect("the held execution publishes");
+    for (role, permission) in [
+        ("lp_exact", Permission::verifier_read(verifier)),
+        ("lp_elsewhere", Permission::verifier_read(other)),
+        ("lp_cards", Permission::card_read()),
+    ] {
+        server
+            .seed_role(role, &[permission])
+            .await
+            .expect("role seeds");
+    }
+    let (_, exact) = user(&server, "lp-exact", &["lp_exact"]).await;
+    let (_, elsewhere) = user(&server, "lp-elsewhere", &["lp_elsewhere"]).await;
+    let (_, cards) = user(&server, "lp-cards", &["lp_cards"]).await;
+
+    for (name, selector, bytes) in [
+        ("report", "attempt=1", b"# Report\n".as_slice()),
+        ("tree", "attempt=1&path=nested%2Fb.md", b"beta".as_slice()),
+    ] {
+        let publication = format!("/v1/verification/executions/{id}/publications/draft/{name}");
+        let (status, plan) = post(
+            &server,
+            &exact,
+            &format!("{publication}/download?{selector}"),
+            String::new(),
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{plan}");
+        let url = plan["plan"]["get_url"]
+            .as_str()
+            .expect("the plan has a URL");
+        assert_eq!(url, format!("{publication}/content?{selector}"));
+        let response = server
+            .oneshot_authenticated(
+                &exact,
+                Request::builder()
+                    .method(Method::GET)
+                    .uri(url)
+                    .body(Body::empty())
+                    .expect("content request builds"),
+            )
+            .await
+            .expect("content request responds");
+        let status = response.status();
+        let fetched = to_bytes(response.into_body(), 1 << 20)
+            .await
+            .expect("content body reads");
+        assert_eq!(
+            (status, fetched.as_ref()),
+            (StatusCode::OK, bytes),
+            "{}",
+            String::from_utf8_lossy(&fetched)
+        );
+        for refused in [&elsewhere, &cards] {
+            let (status, problem) = get(&server, refused, url).await;
+            assert_eq!(
+                (status, problem["code"].as_str()),
+                (
+                    StatusCode::FORBIDDEN,
+                    Some("WYRD_PERMISSION_403_DENIED_RBAC")
+                ),
+                "{name}"
+            );
+        }
+    }
 }

@@ -9939,6 +9939,7 @@ version = "0.4.1"
 dependencies = [
  "arrow",
  "async-trait",
+ "base64 0.22.1",
  "chrono",
  "opentelemetry",
  "opentelemetry-http",

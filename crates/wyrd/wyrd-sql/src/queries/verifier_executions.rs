@@ -46,8 +46,10 @@ use wyrd_spec::verification::{
 use wyrd_spec::verification::{PublicationName, TaskId};
 
 mod events;
+mod inspection;
 
 pub use events::{EventBatch, ExecutionEvent, ProjectionPosition};
+pub use inspection::{InvocationEntry, Page, PagePosition, PublicationEntry};
 
 use crate::queries::verification::{BindingSchedule, InactivityTimeout, binding_activity};
 use crate::{OperatorPool, TenantConn};
@@ -1720,7 +1722,6 @@ impl PublicationRow {
     /// Returns a decode error when an identity, index, kind, or content
     /// column is malformed.
     fn decode(self) -> Result<Publication, SqlxError> {
-        let index = |index: Option<i32>| index.map(u32::try_from).transpose();
         let content = match (self.kind.as_str(), self.value, self.manifest) {
             ("json", Some(Json(value)), None) => PublicationContent::Json { value },
             ("file", None, Some(Json(manifest))) => PublicationContent::File { manifest },
@@ -1733,15 +1734,34 @@ impl PublicationRow {
         };
         Ok(Publication {
             name: stored(PublicationName::new(self.name))?,
-            producer: Producer {
-                step_id: stored(TaskId::new(self.task_id))?,
-                item_index: stored(index(self.item_index))?,
-                iteration_index: stored(index(self.iteration_index))?,
-                attempt: stored(u32::try_from(self.attempt))?,
-            },
+            producer: producer(
+                self.task_id,
+                self.item_index,
+                self.iteration_index,
+                self.attempt,
+            )?,
             content,
         })
     }
+}
+
+/// A stored producer identity.
+///
+/// # Errors
+/// Returns a decode error when an identity or index is malformed.
+fn producer(
+    task: String,
+    item: Option<i32>,
+    iteration: Option<i32>,
+    attempt: i32,
+) -> Result<Producer, SqlxError> {
+    let index = |index: Option<i32>| index.map(u32::try_from).transpose();
+    Ok(Producer {
+        step_id: stored(TaskId::new(task))?,
+        item_index: stored(index(item))?,
+        iteration_index: stored(index(iteration))?,
+        attempt: stored(u32::try_from(attempt))?,
+    })
 }
 
 /// A producer's zero-based index or one-based attempt as its SQL integer.

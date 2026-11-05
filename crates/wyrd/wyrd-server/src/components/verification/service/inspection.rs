@@ -1,0 +1,518 @@
+//! Inspection and cancellation of queued executions.
+//!
+//! Every operation reads the execution's Verifier from its queue row, then
+//! authorizes `verifier:read` (or `verifier:run` to cancel) on exactly that
+//! Verifier, so a grant scoped to one Verifier inspects only its
+//! executions. An absent or other-tenant execution is the same not-found.
+//! Invocation and publication pages read the queue records at a cut their
+//! first page fixes, so a listing neither skips nor repeats entries while the
+//! execution progresses, and never loads publication content.
+
+use base64::Engine as _;
+use serde::{Deserialize, Serialize};
+use uuid::Uuid;
+use wyrd_runtime::Permission;
+use wyrd_runtime::permission::{Action, PermissionScope, Resource};
+use wyrd_spec::error::WyrdError;
+use wyrd_spec::ids::ExecutionId;
+use wyrd_spec::storage::DownloadInitResponse;
+use wyrd_spec::vala::error::BifrostError;
+use wyrd_spec::verification::execution::{
+    CancelExecutionResponse, EXECUTION_PAGE_DEFAULT, EXECUTION_PAGE_MAX, ExecutionInvocation,
+    ExecutionPageQuery, HistoryProjection, InvocationPage, InvocationProgress,
+    InvocationSettlement, Publication, PublicationContent, PublicationPage, PublicationSelector,
+    PublicationSummary, Speculation,
+};
+use wyrd_spec::verification::{PublicationName, TaskId};
+use wyrd_sql::TenantConn;
+use wyrd_sql::queries::verifier_executions::{ExecutionStatus, InvocationEntry, PagePosition};
+
+use super::VerificationControl;
+use crate::audit;
+use crate::components::auth::Caller;
+use crate::components::storage::inventory::ObjectInventory;
+use crate::state::registry_db_error;
+
+/// Audit operation of an invocation page read.
+const LIST_INVOCATIONS: &str = "verification.execution.invocations";
+
+/// Audit operation of a publication page read.
+const LIST_PUBLICATIONS: &str = "verification.execution.publications";
+
+/// Audit operation of one publication read.
+const READ_PUBLICATION: &str = "verification.execution.publication";
+
+/// Audit operation of one publication file download plan.
+const DOWNLOAD_PUBLICATION: &str = "verification.execution.publication.download";
+
+/// Audit operation of a cancellation.
+const CANCEL: &str = "verification.execution.cancel";
+
+/// Longest cursor accepted, in bytes.
+const CURSOR_MAX_BYTES: usize = 2048;
+
+/// The position a page resumes at, bound to its tenant, execution, and
+/// listing.
+#[derive(Serialize, Deserialize)]
+struct Cursor {
+    /// Tenant the listing was read in.
+    t: Uuid,
+    /// Execution listed.
+    e: Uuid,
+    /// The listing: `invocations` or `publications`.
+    l: String,
+    /// The listing's cut.
+    c: i64,
+    /// Sequence of the last entry returned.
+    a: i64,
+}
+
+/// The validation refusal naming `field`.
+fn invalid(message: &str, field: &str) -> WyrdError {
+    WyrdError::Validation {
+        message: message.to_owned(),
+        details: serde_json::json!({ "field": field }),
+    }
+}
+
+/// The page size and resume position `query` asks for in `listing` of
+/// `execution` in `tenant`; `None` starts a new listing.
+///
+/// # Errors
+/// Returns [`WyrdError::Validation`] for a limit outside 1–200 or a cursor
+/// that is empty, oversized, malformed, or bound to another tenant,
+/// execution, or listing.
+fn position(
+    query: &ExecutionPageQuery,
+    tenant: Uuid,
+    execution: ExecutionId,
+    listing: &str,
+) -> Result<(u32, Option<PagePosition>), WyrdError> {
+    let limit = query.limit.unwrap_or(EXECUTION_PAGE_DEFAULT);
+    if !(1..=EXECUTION_PAGE_MAX).contains(&limit) {
+        return Err(invalid("limit must be between 1 and 200", "limit"));
+    }
+    let position = query
+        .cursor
+        .as_deref()
+        .map(|raw| {
+            (!raw.is_empty() && raw.len() <= CURSOR_MAX_BYTES)
+                .then(|| {
+                    base64::engine::general_purpose::URL_SAFE_NO_PAD
+                        .decode(raw)
+                        .ok()
+                })
+                .flatten()
+                .and_then(|bytes| serde_json::from_slice::<Cursor>(&bytes).ok())
+                .filter(|cursor| {
+                    cursor.t == tenant && cursor.e == execution.as_uuid() && cursor.l == listing
+                })
+                .map(|cursor| PagePosition {
+                    through: cursor.c,
+                    after: cursor.a,
+                })
+                .ok_or_else(|| invalid("cursor is not a continuation of this listing", "cursor"))
+        })
+        .transpose()?;
+    Ok((limit, position))
+}
+
+/// Keep at most `limit` of `entries`, read one past it, and the cursor
+/// continuing after them when more remain.
+fn page<T>(
+    mut entries: Vec<(i64, T)>,
+    limit: u32,
+    through: i64,
+    tenant: Uuid,
+    execution: ExecutionId,
+    listing: &str,
+) -> (Vec<T>, Option<String>) {
+    let limit = limit as usize;
+    let more = entries.len() > limit;
+    entries.truncate(limit);
+    let next_cursor = entries.last().filter(|_| more).map(|(after, _)| {
+        let cursor = Cursor {
+            t: tenant,
+            e: execution.as_uuid(),
+            l: listing.to_owned(),
+            c: through,
+            a: *after,
+        };
+        base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .encode(serde_json::to_vec(&cursor).unwrap_or_default())
+    });
+    (
+        entries.into_iter().map(|(_, entry)| entry).collect(),
+        next_cursor,
+    )
+}
+
+/// One invocation attempt's public progress.
+fn invocation(entry: InvocationEntry) -> ExecutionInvocation {
+    let (progress, reason) = match entry.settlement {
+        None => (InvocationProgress::Started, None),
+        Some(InvocationSettlement::Action { result, .. }) => (
+            InvocationProgress::Action {
+                status: result.status,
+            },
+            result.reason,
+        ),
+        Some(InvocationSettlement::Requirement { result }) => (
+            InvocationProgress::Requirement {
+                outcome: result.outcome,
+            },
+            Some(result.reason),
+        ),
+    };
+    ExecutionInvocation {
+        producer: entry.producer,
+        progress,
+        reason,
+        speculation: Speculation::None,
+    }
+}
+
+/// The not-found refusal of an execution the caller's tenant does not hold.
+pub(super) fn execution_not_found(execution_id: ExecutionId) -> WyrdError {
+    WyrdError::VerificationExecutionNotFound {
+        message: "no verification execution with this ID in the caller's tenant".to_owned(),
+        details: serde_json::json!({ "execution_id": execution_id }),
+    }
+}
+
+impl<'a> VerificationControl<'a> {
+    /// Refuse, and audit the refusal, when `caller` holds no Verifier grant
+    /// for `action` at any scope, before anything is read.
+    ///
+    /// A caller who may never inspect or cancel cannot learn which
+    /// execution IDs exist.
+    ///
+    /// # Errors
+    /// Returns [`WyrdError::PermissionDeniedRbac`] without any such grant.
+    pub(super) fn require_verifier(
+        &self,
+        caller: &Caller,
+        action: Action,
+        operation: &str,
+        resource: &str,
+    ) -> Result<(), WyrdError> {
+        if caller
+            .principal
+            .effective_permissions
+            .covers_operation(&Resource::Verifier, &action)
+        {
+            return Ok(());
+        }
+        let any = Permission {
+            resource: Resource::Verifier,
+            action,
+            scope: PermissionScope::All,
+        };
+        audit::authorize(self.state, caller, &any, operation, resource)
+    }
+
+    /// Open the caller's tenant transaction, read queued `execution_id`, and
+    /// authorize Verifier `action` on its Verifier for `operation`.
+    ///
+    /// # Errors
+    /// Returns [`WyrdError::PermissionDeniedRbac`] without the grant,
+    /// [`WyrdError::VerificationExecutionNotFound`] when the tenant has no
+    /// such queued execution, and a registry error when a read fails.
+    async fn authorized(
+        &self,
+        caller: &Caller,
+        execution_id: ExecutionId,
+        action: Action,
+        operation: &str,
+    ) -> Result<(TenantConn<'a>, ExecutionStatus), WyrdError> {
+        let resource = format!("verification.execution:{execution_id}");
+        self.require_verifier(caller, action.clone(), operation, &resource)?;
+        let mut conn = self
+            .state
+            .registry_tenant_conn(caller.data_tenant_id)
+            .await?;
+        let status = self
+            .queue
+            .execution_status(&mut conn, execution_id)
+            .await
+            .map_err(registry_db_error)?
+            .ok_or_else(|| execution_not_found(execution_id))?;
+        let required = Permission {
+            resource: Resource::Verifier,
+            action,
+            scope: PermissionScope::Verifier(status.verifier_card_uid.clone()),
+        };
+        audit::authorize(self.state, caller, &required, operation, &resource)?;
+        Ok((conn, status))
+    }
+
+    /// One page of queued `execution_id`'s invocation attempts, its status,
+    /// and its history projection position.
+    ///
+    /// Progress is read from the execution records, so it is current while
+    /// history projection lags.
+    ///
+    /// # Errors
+    /// Returns [`WyrdError::Validation`] for a bad limit or cursor, and the
+    /// errors of [`Self::authorized`].
+    pub(crate) async fn invocations(
+        &self,
+        caller: &Caller,
+        execution_id: ExecutionId,
+        query: &ExecutionPageQuery,
+    ) -> Result<InvocationPage, WyrdError> {
+        let tenant = caller.data_tenant_id.as_uuid();
+        let (limit, position) = position(query, tenant, execution_id, "invocations")?;
+        let (mut conn, status) = self
+            .authorized(caller, execution_id, Action::Read, LIST_INVOCATIONS)
+            .await?;
+        let read = self
+            .queue
+            .invocation_page(&mut conn, execution_id, position, limit + 1)
+            .await
+            .map_err(registry_db_error)?;
+        let history = self
+            .queue
+            .projection_position(&mut conn, execution_id)
+            .await
+            .map_err(registry_db_error)?;
+        conn.commit().await.map_err(registry_db_error)?;
+        let (items, next_cursor) = page(
+            read.entries,
+            limit,
+            read.through,
+            tenant,
+            execution_id,
+            "invocations",
+        );
+        let count = |value: i64| u64::try_from(value).unwrap_or_default();
+        Ok(InvocationPage {
+            execution_id,
+            status: status.state.status,
+            items: items.into_iter().map(invocation).collect(),
+            next_cursor,
+            history: HistoryProjection {
+                acknowledged: count(history.acknowledged),
+                pending: count(history.pending),
+                failed: count(history.failed),
+            },
+        })
+    }
+
+    /// One page of queued `execution_id`'s publication names, without content.
+    ///
+    /// # Errors
+    /// Returns [`WyrdError::Validation`] for a bad limit or cursor, and the
+    /// errors of [`Self::authorized`].
+    pub(crate) async fn publications(
+        &self,
+        caller: &Caller,
+        execution_id: ExecutionId,
+        query: &ExecutionPageQuery,
+    ) -> Result<PublicationPage, WyrdError> {
+        let tenant = caller.data_tenant_id.as_uuid();
+        let (limit, position) = position(query, tenant, execution_id, "publications")?;
+        let (mut conn, _) = self
+            .authorized(caller, execution_id, Action::Read, LIST_PUBLICATIONS)
+            .await?;
+        let read = self
+            .queue
+            .publication_page(&mut conn, execution_id, position, limit + 1)
+            .await
+            .map_err(registry_db_error)?;
+        conn.commit().await.map_err(registry_db_error)?;
+        let (items, next_cursor) = page(
+            read.entries,
+            limit,
+            read.through,
+            tenant,
+            execution_id,
+            "publications",
+        );
+        Ok(PublicationPage {
+            execution_id,
+            items: items
+                .into_iter()
+                .map(|entry| PublicationSummary {
+                    name: entry.name,
+                    kind: entry.kind,
+                    producer: entry.producer,
+                    speculation: Speculation::None,
+                })
+                .collect(),
+            next_cursor,
+        })
+    }
+
+    /// The publication `name` of `step`'s invocation attempt `selector`
+    /// names, with its value or manifest.
+    ///
+    /// # Errors
+    /// Returns [`WyrdError::Validation`] for a zero attempt or a `path`, which
+    /// only a download takes,
+    /// [`WyrdError::VerificationPublicationNotFound`] when the attempt
+    /// published no such name, and the errors of [`Self::authorized`].
+    pub(crate) async fn publication(
+        &self,
+        caller: &Caller,
+        execution_id: ExecutionId,
+        step: &TaskId,
+        name: &PublicationName,
+        selector: &PublicationSelector,
+    ) -> Result<Publication, WyrdError> {
+        if selector.path.is_some() {
+            return Err(invalid("only a publication download takes a path", "path"));
+        }
+        self.select(caller, execution_id, step, name, selector, READ_PUBLICATION)
+            .await
+    }
+
+    /// A download plan for one file of a file or directory publication: the
+    /// file publication's only file, or the directory's regular file at
+    /// `selector.path`.
+    ///
+    /// # Errors
+    /// Returns [`WyrdError::Validation`] for a JSON publication, a path on a
+    /// file publication, or a directory path its manifest does not list;
+    /// `WYRD_VALA_503_QUERY_VISIBILITY_UNAVAILABLE` while the file's completed
+    /// upload is not yet visible; the storage planning error; and the errors
+    /// of [`Self::publication`].
+    pub(crate) async fn download(
+        &self,
+        caller: &Caller,
+        execution_id: ExecutionId,
+        step: &TaskId,
+        name: &PublicationName,
+        selector: &PublicationSelector,
+    ) -> Result<DownloadInitResponse, WyrdError> {
+        let publication = self
+            .select(
+                caller,
+                execution_id,
+                step,
+                name,
+                selector,
+                DOWNLOAD_PUBLICATION,
+            )
+            .await?;
+        let path = selector.path.as_deref();
+        let file = match (&publication.content, path) {
+            (PublicationContent::File { manifest }, None) => manifest.files.first(),
+            (PublicationContent::File { .. }, Some(_)) => {
+                return Err(invalid(
+                    "a file publication downloads without a path",
+                    "path",
+                ));
+            }
+            (PublicationContent::Directory { manifest }, Some(path)) => {
+                manifest.files.iter().find(|file| file.path == path)
+            }
+            (PublicationContent::Directory { .. }, None) => {
+                return Err(invalid(
+                    "a directory publication download names one of its manifest's files",
+                    "path",
+                ));
+            }
+            (PublicationContent::Json { .. }, _) => {
+                return Err(invalid(
+                    "a JSON publication is read through its value, not downloaded",
+                    "name",
+                ));
+            }
+        }
+        .ok_or_else(|| invalid("the publication manifest lists no such file", "path"))?;
+        let object = ObjectInventory::new(self.state)
+            .file_object(caller.data_tenant_id, &file.sha256, file.size_bytes)
+            .await?
+            .ok_or_else(|| WyrdError::from(BifrostError::QueryVisibilityUnavailable))?;
+        wyrd_storage::service::download_plan(
+            &self.state.storage,
+            &object,
+            self.state.storage.presign_ttl_secs(),
+            file.size_bytes,
+            base64::engine::general_purpose::STANDARD.encode(file.sha256.as_bytes()),
+        )
+        .await
+    }
+
+    /// Read and authorize the publication `selector` names for `operation`.
+    ///
+    /// # Errors
+    /// The errors of [`Self::publication`].
+    async fn select(
+        &self,
+        caller: &Caller,
+        execution_id: ExecutionId,
+        step: &TaskId,
+        name: &PublicationName,
+        selector: &PublicationSelector,
+        operation: &str,
+    ) -> Result<Publication, WyrdError> {
+        if selector.attempt == 0 {
+            return Err(invalid("attempt is one-based", "attempt"));
+        }
+        let (mut conn, _) = self
+            .authorized(caller, execution_id, Action::Read, operation)
+            .await?;
+        let publications = self
+            .queue
+            .publications(&mut conn, execution_id, step)
+            .await
+            .map_err(registry_db_error)?;
+        conn.commit().await.map_err(registry_db_error)?;
+        publications
+            .into_iter()
+            .find(|publication| {
+                publication.name == *name
+                    && publication.producer.attempt == selector.attempt
+                    && publication.producer.item_index == selector.item_index
+                    && publication.producer.iteration_index == selector.iteration_index
+            })
+            .ok_or_else(|| WyrdError::VerificationPublicationNotFound {
+                message: "the execution has no such publication of this producer attempt"
+                    .to_owned(),
+                details: serde_json::json!({
+                    "execution_id": execution_id,
+                    "step_id": step,
+                    "name": name,
+                    "attempt": selector.attempt,
+                    "item_index": selector.item_index,
+                    "iteration_index": selector.iteration_index,
+                }),
+            })
+    }
+
+    /// Cancel queued `execution_id` and answer its status after the
+    /// cancellation fence commits.
+    ///
+    /// Unfinished work settles `cancelled`; settled work keeps its status,
+    /// result, and publications, so a repeat answers the current status.
+    ///
+    /// # Errors
+    /// The errors of [`Self::authorized`] for `verifier:run`, and a registry
+    /// error when the update or commit fails.
+    pub(crate) async fn cancel(
+        &self,
+        caller: &Caller,
+        execution_id: ExecutionId,
+    ) -> Result<CancelExecutionResponse, WyrdError> {
+        let (mut conn, _) = self
+            .authorized(caller, execution_id, Action::Run, CANCEL)
+            .await?;
+        self.queue
+            .cancel(&mut conn, execution_id)
+            .await
+            .map_err(registry_db_error)?;
+        let status = self
+            .queue
+            .execution_status(&mut conn, execution_id)
+            .await
+            .map_err(registry_db_error)?
+            .ok_or_else(|| execution_not_found(execution_id))?;
+        conn.commit().await.map_err(registry_db_error)?;
+        Ok(CancelExecutionResponse {
+            execution_id,
+            status: status.state.status,
+        })
+    }
+}

@@ -685,7 +685,7 @@ async fn enqueue_refusals_fail_before_staging() {
 }
 
 /// A rooted caller may enqueue only a subject its signed Card scope carries:
-/// holding `verifier:run` on exactly the selected Verifier, the subject
+/// holding `verifier:run` and `verifier:read` on exactly the selected Verifier, the subject
 /// family's runtime account rooted at the subject is accepted, while an
 /// unrelated Service rooted at its own Card, and an editor Service acting on
 /// its behalf, are refused with one audited denial each before anything is
@@ -707,6 +707,7 @@ async fn enqueue_admits_only_signed_scope_subjects() {
             &[
                 Permission::card_read(),
                 Permission::verifier_run(fixture.assertion.clone()),
+                Permission::verifier_read(fixture.assertion.clone()),
             ],
         )
         .await
@@ -1563,16 +1564,17 @@ async fn file_upload_authority_and_validation_are_preserved() {
     server.shutdown().await.expect("test server shuts down");
 }
 
-/// Binding and execution status reads each authorize and audit `cards:read`:
-/// a reader is allowed and stages one allowed decision per read, while a
-/// principal whose only role lacks `cards:read` is refused with the stable
-/// RBAC code and stages one denied decision per read, before any lookup.
+/// A binding status read authorizes and audits `cards:read` and an execution
+/// status read `verifier:read`: a viewer is allowed and stages one allowed
+/// decision per read, while a principal with no role is refused with the
+/// stable RBAC code and stages one denied decision per read, before any
+/// lookup.
 ///
 /// # Panics
 /// Panics when the server fails to start, a fixture write fails, a route fails
 /// to respond, or any status, code, or audit expectation fails.
 #[tokio::test(flavor = "current_thread")]
-async fn status_reads_audit_cards_read_decisions() {
+async fn status_reads_audit_their_decisions() {
     let server = WyrdTestServer::start_in_process()
         .await
         .expect("test server starts");
@@ -1596,14 +1598,15 @@ async fn status_reads_audit_cards_read_decisions() {
         let (status, body) = get(&server, &reader_jwt, uri).await;
         assert_eq!(status, StatusCode::OK, "{uri}: {body}");
     }
-    let allowed = vec![("cards:read".to_owned(), "allowed".to_owned())];
+    let decision =
+        |permission: &str, outcome: &str| vec![(permission.to_owned(), outcome.to_owned())];
     assert_eq!(
         decisions(&server, "verification.binding.read", reader).await,
-        allowed
+        decision("cards:read", "allowed")
     );
     assert_eq!(
         decisions(&server, "verification.execution.read", reader).await,
-        allowed
+        decision("verifier:read", "allowed")
     );
 
     let (outsider, outsider_jwt) = user(&server, "vr-status-outsider", &[]).await;
@@ -1618,14 +1621,13 @@ async fn status_reads_audit_cards_read_decisions() {
             "{uri}"
         );
     }
-    let denied = vec![("cards:read".to_owned(), "denied".to_owned())];
     assert_eq!(
         decisions(&server, "verification.binding.read", outsider).await,
-        denied
+        decision("cards:read", "denied")
     );
     assert_eq!(
         decisions(&server, "verification.execution.read", outsider).await,
-        denied
+        decision("verifier:read", "denied")
     );
     server.shutdown().await.expect("test server shuts down");
 }

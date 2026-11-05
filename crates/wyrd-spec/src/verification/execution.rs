@@ -590,6 +590,168 @@ pub struct CollectionEntry {
     pub attempt: u32,
 }
 
+/// Page size an execution listing uses when `limit` is omitted.
+pub const EXECUTION_PAGE_DEFAULT: u32 = 50;
+
+/// Most entries one execution listing page returns.
+pub const EXECUTION_PAGE_MAX: u32 = 200;
+
+/// Query of the paginated execution listings,
+/// `GET /v1/verification/executions/{execution_id}/invocations` and
+/// `/publications`.
+///
+/// The first page fixes the listing's cut: every page of one listing,
+/// followed through `next_cursor`, reads exactly the entries committed
+/// before the first page was read, in commit order, with no gap or
+/// duplicate. Entries committed later appear when a new listing is started.
+/// A cursor binds its tenant, execution, and listing and confers no
+/// authority, which every page re-checks.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[cfg_attr(feature = "server", derive(utoipa::IntoParams, utoipa::ToSchema))]
+#[cfg_attr(feature = "server", into_params(parameter_in = Query))]
+#[serde(deny_unknown_fields)]
+pub struct ExecutionPageQuery {
+    /// Page size, 1–200; 50 when omitted.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(range(min = 1, max = 200))]
+    pub limit: Option<u32>,
+    /// Opaque continuation from the previous page's `next_cursor`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(length(min = 1, max = 2048))]
+    pub cursor: Option<String>,
+}
+
+/// How one invocation attempt stands.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
+#[serde(tag = "state", rename_all = "snake_case")]
+pub enum InvocationProgress {
+    /// Dispatched and not settled: still running, or abandoned when its
+    /// execution is terminal.
+    Started,
+    /// A step action settled.
+    Action {
+        /// How the action ended.
+        status: StepStatus,
+    },
+    /// A requirement was judged.
+    Requirement {
+        /// The judgment.
+        outcome: RequirementOutcome,
+    },
+}
+
+/// One checkpointed invocation attempt of a queued execution.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
+pub struct ExecutionInvocation {
+    /// The step or requirement, item, iteration, and attempt.
+    pub producer: Producer,
+    /// Whether the attempt is running or how it settled.
+    #[serde(flatten)]
+    pub progress: InvocationProgress,
+    /// Why a settled attempt failed, was skipped, or was judged as it was;
+    /// `null` otherwise.
+    pub reason: Option<String>,
+    /// The attempt's speculative disposition.
+    pub speculation: Speculation,
+}
+
+/// How far one execution's history has been projected into
+/// `bifrost.verification.execution_events`.
+///
+/// Projection lag delays history only: invocation progress and publications
+/// read from the execution's records whatever this reports.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
+pub struct HistoryProjection {
+    /// Events Scribe acknowledged.
+    pub acknowledged: u64,
+    /// Events not yet submitted.
+    pub pending: u64,
+    /// Events submitted without an acknowledgement, to be resubmitted under
+    /// the same batch identity.
+    pub failed: u64,
+}
+
+/// `GET /v1/verification/executions/{execution_id}/invocations` response.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
+pub struct InvocationPage {
+    /// The execution.
+    pub execution_id: ExecutionId,
+    /// Its current lifecycle status.
+    pub status: VerificationExecutionStatus,
+    /// The page's invocation attempts, in commit order.
+    pub items: Vec<ExecutionInvocation>,
+    /// Continuation of this listing; `null` on its last page.
+    pub next_cursor: Option<String>,
+    /// The execution's history projection position.
+    pub history: HistoryProjection,
+}
+
+/// One accepted publication as a listing names it, without its content.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
+pub struct PublicationSummary {
+    /// The logical name, unique within its producer attempt.
+    pub name: PublicationName,
+    /// The content kind retained.
+    pub kind: PublicationKind,
+    /// The invocation attempt that accepted it.
+    pub producer: Producer,
+    /// Its producer's speculative disposition.
+    pub speculation: Speculation,
+}
+
+/// `GET /v1/verification/executions/{execution_id}/publications` response.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
+pub struct PublicationPage {
+    /// The execution.
+    pub execution_id: ExecutionId,
+    /// The page's publications, in acceptance order.
+    pub items: Vec<PublicationSummary>,
+    /// Continuation of this listing; `null` on its last page.
+    pub next_cursor: Option<String>,
+}
+
+/// Producer selection of one publication read or download, the query of
+/// `GET` and `POST /v1/verification/executions/{execution_id}/publications/{step_id}/{name}[/download]`.
+///
+/// It names the exact producer attempt a listing reports, never the latest
+/// attempt.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[cfg_attr(feature = "server", derive(utoipa::IntoParams, utoipa::ToSchema))]
+#[cfg_attr(feature = "server", into_params(parameter_in = Query))]
+#[serde(deny_unknown_fields)]
+pub struct PublicationSelector {
+    /// One-based producer attempt.
+    #[schemars(range(min = 1))]
+    pub attempt: u32,
+    /// Zero-based fanout item; omitted without fanout.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub item_index: Option<u32>,
+    /// Zero-based repeat iteration; omitted without repeat.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub iteration_index: Option<u32>,
+    /// For a directory download, the regular file's path relative to the
+    /// publication root, as its manifest lists it; omitted otherwise.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub path: Option<String>,
+}
+
+/// `POST /v1/verification/executions/{execution_id}/cancel` response.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
+pub struct CancelExecutionResponse {
+    /// The execution.
+    pub execution_id: ExecutionId,
+    /// Its status after the cancellation fence: `cancelled` for work that
+    /// was unfinished, otherwise the terminal status it already had.
+    pub status: VerificationExecutionStatus,
+}
+
 /// One tool call an Agent action made.
 ///
 /// Records what the model received, never the raw tool output: the digest

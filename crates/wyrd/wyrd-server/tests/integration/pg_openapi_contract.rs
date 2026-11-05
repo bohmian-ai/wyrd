@@ -1513,10 +1513,11 @@ async fn card_contract_publishes_typed_lifecycle_and_problem_shapes() {
     server.shutdown().await.expect("server shuts down");
 }
 
-/// The Verification surface is exactly five typed operations.
+/// The Verification surface is exactly ten typed operations.
 ///
-/// Binding status, evidence planning, direct execution, enqueue, and
-/// execution status publish their typed request and response schemas,
+/// Binding status, evidence planning, direct execution, enqueue, execution
+/// status, invocation and publication pages, publication read and download,
+/// and cancellation publish their typed request and response schemas,
 /// enqueue answers `202 Accepted`, direct execution answers `200` with its
 /// result and documents its stable refusals, and no other Verification
 /// operation is routed: evidence plans target the shared storage upload
@@ -1531,7 +1532,7 @@ async fn card_contract_publishes_typed_lifecycle_and_problem_shapes() {
 /// method, status, or schema reference differs, or when the document names a
 /// retired evaluation identifier.
 #[tokio::test]
-async fn verification_contract_publishes_five_typed_operations_and_the_local_upload() {
+async fn verification_contract_publishes_ten_typed_operations_and_the_local_upload() {
     let server = WyrdTestServer::start_in_process()
         .await
         .expect("test server starts");
@@ -1557,6 +1558,23 @@ async fn verification_contract_publishes_five_typed_operations_and_the_local_upl
             ("/v1/verification/evidence", "post"),
             ("/v1/verification/execute", "post"),
             ("/v1/verification/executions/{execution_id}", "get"),
+            ("/v1/verification/executions/{execution_id}/cancel", "post"),
+            (
+                "/v1/verification/executions/{execution_id}/invocations",
+                "get"
+            ),
+            (
+                "/v1/verification/executions/{execution_id}/publications",
+                "get"
+            ),
+            (
+                "/v1/verification/executions/{execution_id}/publications/{step_id}/{name}",
+                "get"
+            ),
+            (
+                "/v1/verification/executions/{execution_id}/publications/{step_id}/{name}/download",
+                "post"
+            ),
         ])
     );
 
@@ -1599,6 +1617,36 @@ async fn verification_contract_publishes_five_typed_operations_and_the_local_upl
         .as_deref(),
         Some("#/components/schemas/VerificationExecutionState")
     );
+    let publication = "/v1/verification/executions/{execution_id}/publications/{step_id}/{name}";
+    for (path, method, schema) in [
+        (
+            "/v1/verification/executions/{execution_id}/invocations",
+            "get",
+            "InvocationPage",
+        ),
+        (
+            "/v1/verification/executions/{execution_id}/publications",
+            "get",
+            "PublicationPage",
+        ),
+        (publication, "get", "Publication"),
+        (
+            &format!("{publication}/download"),
+            "post",
+            "DownloadInitResponse",
+        ),
+        (
+            "/v1/verification/executions/{execution_id}/cancel",
+            "post",
+            "CancelExecutionResponse",
+        ),
+    ] {
+        assert_eq!(
+            schema_ref(&paths[path][method], "200").as_deref(),
+            Some(format!("#/components/schemas/{schema}").as_str()),
+            "{method} {path}"
+        );
+    }
     let execute = &paths["/v1/verification/execute"]["post"];
     assert_eq!(
         execute["requestBody"]["content"]["application/json"]["schema"]["$ref"],

@@ -5,7 +5,9 @@
 //! Cards, projected bindings, and queued executions — through the same
 //! tenant queries registration and the queue writer use, and reads execution
 //! state back.
-//! It never executes, publishes, or settles work; that is the runtime's job.
+//! It never executes or settles work; that is the runtime's job. Only
+//! [`VerificationFixture::publish`] stands in for a worker, holding one
+//! execution's lease and accepting publications through the hosted backend.
 
 use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
@@ -18,7 +20,11 @@ use uuid::Uuid;
 use wyrd_runtime::principal::{Principal, PrincipalId, PrincipalKind};
 use wyrd_runtime::{AcceptedAuthority, PermissionSet};
 use wyrd_server::AppState;
+use wyrd_server::components::auth::Caller;
 use wyrd_server::scribe_outbox::{ScribeOutbox, ScribeWrite};
+use wyrd_server::verification::hosted::HostedLimits;
+use wyrd_server::verification::hosted::publications::{Publications, PublishCall};
+use wyrd_server::verification::hosted::workspace::Workspace;
 use wyrd_server::verification::results::{InputRecord, ResultPayloadBuilder, ResultRun};
 use wyrd_spec::DataTenantId;
 use wyrd_spec::auth::Attribution;
@@ -26,7 +32,9 @@ use wyrd_spec::card::verifier::{OWNER_OCCURRENCE_KEY, VerifierSpec};
 use wyrd_spec::envelope::{Card, CardKind};
 use wyrd_spec::ids::{BindingId, CardUid, ExecutionId, SlotName};
 use wyrd_spec::registry::DeclarationOperationId;
-use wyrd_spec::verification::execution::{InputDeclaration, VerificationRequest};
+use wyrd_spec::request_id::RequestId;
+use wyrd_spec::verification::execution::{InputDeclaration, Producer, VerificationRequest};
+use wyrd_spec::verification::{PublicationName, TaskId};
 use wyrd_sql::queries::cards::{
     NewCardRow, NewDeclarationOperation, insert_card_row, insert_declaration_operation,
 };
@@ -56,6 +64,17 @@ pub enum VerificationFixtureError {
     /// accept.
     #[error("submission was not accepted: {0}")]
     NotEnqueued(String),
+}
+
+/// Content [`VerificationFixture::publish`] accepts under one name.
+#[derive(Debug, Clone)]
+pub enum Published {
+    /// One bounded JSON value, `null` included.
+    Json(Value),
+    /// One regular file's bytes.
+    File(Vec<u8>),
+    /// A directory of regular files, by `/`-separated relative path.
+    Directory(Vec<(String, Vec<u8>)>),
 }
 
 /// One execution's durable control-plane state.
@@ -642,6 +661,105 @@ impl VerificationFixture {
             [SubmissionOutcome::Accepted] => Ok(submission.execution_id),
             other => Err(VerificationFixtureError::NotEnqueued(format!("{other:?}"))),
         }
+    }
+
+    /// Claim the tenant's next due execution as a worker would, begin
+    /// attempt 1 of each named step in first-use order, and accept each
+    /// `(step, name, content)` through the hosted publication backend of
+    /// `state`, leaving the execution leased and unfinished.
+    ///
+    /// Only for a server running no verification runtime, which would race
+    /// for the claim.
+    ///
+    /// # Errors
+    /// Returns [`VerificationFixtureError::NotEnqueued`] when nothing is
+    /// claimable, [`VerificationFixtureError::Card`] when a name, workspace
+    /// write, or publication is refused, or a connection or statement error.
+    pub async fn publish(
+        &self,
+        state: &AppState,
+        publications: &[(&str, &str, Published)],
+    ) -> Result<ExecutionId, VerificationFixtureError> {
+        let refused =
+            |error: &dyn std::fmt::Debug| VerificationFixtureError::Card(format!("{error:?}"));
+        let queue = VerifierExecutionQueue::default();
+        let mut conn = self.postgres.tenant_conn(self.tenant).await?;
+        let lease = queue
+            .claim(
+                &mut conn,
+                chrono::Duration::minutes(30),
+                chrono::Duration::minutes(30),
+                1,
+            )
+            .await?
+            .pop()
+            .ok_or_else(|| {
+                VerificationFixtureError::NotEnqueued("nothing is claimable".to_owned())
+            })?
+            .lease;
+        let mut steps: Vec<&str> = Vec::new();
+        for (step, ..) in publications {
+            if !steps.contains(step) {
+                queue
+                    .begin_invocation(
+                        &mut conn,
+                        lease,
+                        &TaskId::new(*step).map_err(|e| refused(&e))?,
+                        1,
+                    )
+                    .await?;
+                steps.push(step);
+            }
+        }
+        conn.commit().await?;
+        let caller = Caller {
+            data_tenant_id: self.tenant,
+            principal: self.actor.clone(),
+            request_id: RequestId::now_v7(),
+            delegation_chain: Vec::new(),
+            executed_by: None,
+        };
+        let limits = HostedLimits::default();
+        let backend = Publications::new(state, &caller, lease, limits);
+        let workspace =
+            Workspace::materialize(Vec::new(), limits, None).map_err(|e| refused(&e))?;
+        for (at, (step, name, content)) in publications.iter().enumerate() {
+            let call = PublishCall {
+                id: format!("fixture-{at}"),
+                producer: Producer {
+                    step_id: TaskId::new(*step).map_err(|e| refused(&e))?,
+                    item_index: None,
+                    iteration_index: None,
+                    attempt: 1,
+                },
+                name: PublicationName::new(*name).map_err(|e| refused(&e))?,
+            };
+            let root = workspace.work_dir().join(name);
+            match content {
+                Published::Json(value) => {
+                    backend
+                        .json(&call, value.clone())
+                        .await
+                        .map_err(|e| refused(&e))?;
+                    continue;
+                }
+                Published::File(bytes) => std::fs::write(&root, bytes).map_err(|e| refused(&e))?,
+                Published::Directory(files) => {
+                    for (path, bytes) in files {
+                        let file = root.join(path);
+                        if let Some(parent) = file.parent() {
+                            std::fs::create_dir_all(parent).map_err(|e| refused(&e))?;
+                        }
+                        std::fs::write(file, bytes).map_err(|e| refused(&e))?;
+                    }
+                }
+            }
+            backend
+                .path(&call, &workspace, &format!("/work/{name}"))
+                .await
+                .map_err(|e| refused(&e))?;
+        }
+        Ok(lease.execution_id)
     }
 
     /// Read one execution's durable state.

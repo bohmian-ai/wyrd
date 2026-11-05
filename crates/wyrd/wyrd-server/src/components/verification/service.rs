@@ -12,14 +12,18 @@ use std::sync::Arc;
 use chrono::Utc;
 use tokio_util::sync::CancellationToken;
 use tracing::Instrument as _;
+use vala_bifrost_redux::catalog::TableRef;
+use vala_bifrost_redux::namespaces::BifrostNamespace;
 use vala_verify::blocks::{DriftChecks, EngineError};
 use wyrd_runtime::outbox::{OutboxFull, Reservation};
 use wyrd_runtime::permission::{Action, Resource};
+use wyrd_runtime::principal::PrincipalId;
 use wyrd_runtime::{AcceptedAuthority, CardAttribution, Permission};
 use wyrd_spec::card::verifier::CheckEvidence;
 use wyrd_spec::error::WyrdError;
 use wyrd_spec::ids::{BindingId, CardUid, ExecutionId, IdempotencyKey};
 use wyrd_spec::vala::api::AuditOutcome;
+use wyrd_spec::vala::error::BifrostError;
 use wyrd_spec::vala::ids::{SpanId, TraceId};
 use wyrd_spec::verification::execution::{
     EnqueueVerificationResponse, EvidencePlanRequest, EvidencePlanResponse, EvidenceUpload,
@@ -28,6 +32,7 @@ use wyrd_spec::verification::execution::{
 use wyrd_spec::verification::{
     VerificationBindingStatus, VerificationExecutionStatus, VerifierReadiness,
 };
+use wyrd_sql::queries::auth::service_accounts::system_principal_id;
 use wyrd_sql::queries::cards::get_card_by_uid;
 use wyrd_sql::queries::verifier_executions::{
     Admission, Cause, EnqueueRefusal, Submission, SubmissionOutcome, VerifierExecutionQueue,
@@ -45,6 +50,7 @@ use crate::http::middleware::metrics::RequestArrival;
 use crate::query::scheduled::ScheduledQueryCaller;
 use crate::scribe_outbox::{ScribeSink, ScribeWrite};
 use crate::state::{AppState, registry_db_error};
+use crate::verification::authority::SystemReadAuthority;
 use crate::verification::cache::{Db, Target, exact_ref};
 use crate::verification::hosted::blocks::{Execution, HostedBlocks};
 use crate::verification::inputs::InputResolver;
@@ -53,6 +59,8 @@ use crate::verification::results::{
 };
 use crate::verification::submissions::{AdmissionReply, Queued};
 use crate::verification::telemetry::{ExecutionMode, ExecutionTelemetry, Phase};
+
+mod inspection;
 
 /// Audit operation of a binding status read.
 const GET_BINDING: &str = "verification.binding.read";
@@ -188,44 +196,38 @@ impl<'a> VerificationControl<'a> {
 
     /// Read one execution's status, dispatches, and result once visible.
     ///
-    /// Authorizes and audits `cards:read` standalone, reads the status and
-    /// both exact Cards in one tenant transaction, then — for a completed
-    /// execution — reads its PostgreSQL-selected result through the one
-    /// result reader as the caller, through the ordinary Bifrost query entry.
-    /// A group execution's source selection is read from its input record. A
-    /// direct execution has no queue row: its ID resolves only through a
-    /// published result whose input record has the `direct` origin, and reads
-    /// as completed. A result Scribe has not yet published leaves `result`
-    /// absent, so the caller polls again.
+    /// Authorizes and audits `verifier:read` on the execution's exact
+    /// Verifier, reads the status and both exact Cards in one tenant
+    /// transaction, then — for a completed execution — reads its
+    /// PostgreSQL-selected result through the one result reader. Records are
+    /// read by the tenant's SYSTEM principal granted only the three
+    /// verification record tables, serving the caller, so a reader needs no
+    /// Bifrost table grant. A group execution's source selection is read
+    /// from its input record. A direct execution has no queue row: its ID
+    /// resolves only through a published result whose input record has the
+    /// `direct` origin, and reads as completed. A result Scribe has not yet
+    /// published leaves `result` absent, so the caller polls again.
     ///
     /// # Errors
-    /// Returns [`WyrdError::PermissionDeniedRbac`] without `cards:read`,
+    /// Returns [`WyrdError::PermissionDeniedRbac`] without `verifier:read` on
+    /// the execution's Verifier,
     /// [`WyrdError::VerificationExecutionNotFound`] when the tenant has no
-    /// such execution, a registry unavailability error when a read fails, and
-    /// the query error when the result read is refused or fails.
+    /// such execution, a registry unavailability error when a read fails,
+    /// `WYRD_VALA_503_QUERY_VISIBILITY_UNAVAILABLE` when the record reader is
+    /// unavailable, and the query error when a record read fails.
     pub(crate) async fn get_execution(
         &self,
         caller: &Caller,
         execution_id: ExecutionId,
     ) -> Result<VerificationExecutionState, WyrdError> {
         let resource = format!("verification.execution:{execution_id}");
-        audit::authorize(
-            self.state,
-            caller,
-            &Permission::card_read(),
-            GET_EXECUTION,
-            &resource,
-        )?;
-        let query = ScheduledQueryCaller::authenticated(
-            self.state.clone(),
-            caller.clone(),
-            CancellationToken::new(),
-        )?;
-        let records = InputResolver::new(&query, None);
+        self.require_verifier(caller, Action::Read, GET_EXECUTION, &resource)?;
         let mut conn = self
             .state
             .registry_tenant_conn(caller.data_tenant_id)
             .await?;
+        let query = self.records(&mut conn, caller).await?;
+        let records = InputResolver::new(&query, None);
         let status = self
             .queue
             .execution_status(&mut conn, execution_id)
@@ -234,14 +236,17 @@ impl<'a> VerificationControl<'a> {
         let Some(status) = status else {
             drop(conn);
             return self
-                .direct_execution(caller, &records, execution_id)
+                .direct_execution(caller, &records, execution_id, &resource)
                 .await?
-                .ok_or_else(|| WyrdError::VerificationExecutionNotFound {
-                    message: "no verification execution with this ID in the caller's tenant"
-                        .to_owned(),
-                    details: serde_json::json!({ "execution_id": execution_id }),
-                });
+                .ok_or_else(|| inspection::execution_not_found(execution_id));
         };
+        audit::authorize(
+            self.state,
+            caller,
+            &Permission::verifier_read(status.verifier_card_uid.clone()),
+            GET_EXECUTION,
+            &resource,
+        )?;
         let mut state = status.state;
         let verifier = Self::card(&mut conn, &status.verifier_card_uid).await?;
         let subject = Self::card(&mut conn, &status.card_uid).await?;
@@ -274,26 +279,30 @@ impl<'a> VerificationControl<'a> {
 
     /// The completed status of direct execution `execution_id`, `None` until
     /// its result, output, and input records are visible or when no direct
-    /// execution has this ID. A caller who may not query the verification
-    /// tables sees no direct execution, so the lookup answers `None` rather
-    /// than refusing an ID that may belong to a queued execution.
+    /// execution has this ID; a found one is authorized and audited as
+    /// `verifier:read` on its Verifier for `resource`.
     ///
     /// # Errors
-    /// Returns a query failure, a registry error when a Card read fails, and
-    /// an internal error when a stored record is malformed.
+    /// Returns [`WyrdError::PermissionDeniedRbac`] without that grant, a query
+    /// failure, a registry error when a Card read fails, and an internal
+    /// error when a stored record is malformed.
     async fn direct_execution(
         &self,
         caller: &Caller,
         records: &InputResolver<'_>,
         execution_id: ExecutionId,
+        resource: &str,
     ) -> Result<Option<VerificationExecutionState>, WyrdError> {
-        let direct = match records.direct(execution_id).await {
-            Err(WyrdError::PermissionDeniedRbac { .. }) => return Ok(None),
-            read => read?,
-        };
-        let Some(direct) = direct else {
+        let Some(direct) = records.direct(execution_id).await? else {
             return Ok(None);
         };
+        audit::authorize(
+            self.state,
+            caller,
+            &Permission::verifier_read(direct.verifier_card_uid.clone()),
+            GET_EXECUTION,
+            resource,
+        )?;
         let Some((run_id, outcome)) = records.result(direct.result_id).await? else {
             return Ok(None);
         };
@@ -1050,6 +1059,42 @@ impl<'a> VerificationControl<'a> {
                 details: serde_json::json!({ "required": required, "principal": caller.principal.id.to_string() }),
             })
         }
+    }
+
+    /// The record reader of an execution read: the tenant's SYSTEM
+    /// principal granted only `bifrost.verification.execution_inputs`,
+    /// `results`, and `execution_outputs`, serving `caller`.
+    ///
+    /// # Errors
+    /// Returns a registry error when the SYSTEM principal cannot be read, and
+    /// `WYRD_VALA_503_QUERY_VISIBILITY_UNAVAILABLE` when the read authority
+    /// cannot be built.
+    async fn records(
+        &self,
+        conn: &mut TenantConn<'_>,
+        caller: &Caller,
+    ) -> Result<ScheduledQueryCaller, WyrdError> {
+        let system = system_principal_id(conn)
+            .await
+            .map_err(registry_db_error)?
+            .map(PrincipalId::new);
+        let tables = ["execution_inputs", "results", "execution_outputs"]
+            .map(|name| TableRef::new(BifrostNamespace::Verification, name));
+        let read = SystemReadAuthority::resolve(self.state, caller.data_tenant_id, system, &tables)
+            .await
+            .map_err(|error| {
+                tracing::warn!(%error, "the execution record reader is unavailable");
+                WyrdError::from(BifrostError::QueryVisibilityUnavailable)
+            })?
+            .serving(&AcceptedAuthority::new(
+                &caller.principal,
+                &caller.delegation_chain,
+            ));
+        Ok(ScheduledQueryCaller::new(
+            self.state.clone(),
+            read.into_context(),
+            CancellationToken::new(),
+        ))
     }
 
     /// Read one Card of the caller's tenant, or `None` when it is absent.

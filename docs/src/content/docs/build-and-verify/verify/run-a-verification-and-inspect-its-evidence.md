@@ -13,7 +13,7 @@ draft: true
 ## Prerequisites
 
 - A Verifier bound to the run's Card. Here `my-review` takes one file slot, `document`.
-- `verifier:run` to submit, and the same principal or `cards:read` plus `bifrost_query:read` to inspect.
+- `verifier:run` to submit or cancel, `verifier:read` to read an execution's status, invocations, and publications, and `bifrost_query:read` to query its Bifrost evidence.
 
 ## 1. Submit and keep the ID
 

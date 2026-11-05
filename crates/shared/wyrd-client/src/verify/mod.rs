@@ -40,6 +40,17 @@ mod execution;
 use crate::storage::upload::sha256_file;
 use crate::storage::{FileSource, WyrdStorageClient};
 pub use execution::Execution;
+/// The download plan [`Execution::download`] returns.
+pub use wyrd_spec::storage::DownloadInitResponse;
+/// The wire shapes [`Execution`]'s inspection and cancellation exchange.
+pub use wyrd_spec::verification::execution::{
+    CancelExecutionResponse, ExecutionInvocation, ExecutionPageQuery, HistoryProjection,
+    InvocationPage, InvocationProgress, Producer, Publication, PublicationContent, PublicationFile,
+    PublicationKind, PublicationManifest, PublicationPage, PublicationSelector, PublicationSummary,
+    Speculation,
+};
+/// The identities a publication read selects, and an execution's status.
+pub use wyrd_spec::verification::{PublicationName, TaskId, VerificationExecutionStatus};
 
 /// Time an execute response may take to arrive after the server's
 /// [`EXECUTION_DEADLINE`] elapses: upload, audit, and the 504 answer itself.

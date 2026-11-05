@@ -2009,6 +2009,21 @@ pub enum WyrdError {
         /// Structured detail payload.
         details: Value,
     },
+    /// The execution is visible, but it has no publication with this name
+    /// for the selected producer step, item, iteration, and attempt.
+    #[error("[WYRD_VERIFICATION_404_PUBLICATION_NOT_FOUND] {message}")]
+    #[wyrd_error(
+        code = "WYRD_VERIFICATION_404_PUBLICATION_NOT_FOUND",
+        status = 404,
+        title = "Verification publication not found",
+        remediation = "List GET /v1/verification/executions/{execution_id}/publications and select a listed name with its exact producer attempt, item_index, and iteration_index."
+    )]
+    VerificationPublicationNotFound {
+        /// Human-readable error message.
+        message: String,
+        /// Structured detail payload.
+        details: Value,
+    },
     /// A manual run's target cannot run the requested input.
     #[error("[WYRD_VERIFICATION_400_INVALID_TARGET] {message}")]
     #[wyrd_error(
@@ -4004,6 +4019,7 @@ impl WyrdError {
             | Self::SpecDuplicateBindingOperator { message, details }
             | Self::VerificationBindingNotFound { message, details }
             | Self::VerificationExecutionNotFound { message, details }
+            | Self::VerificationPublicationNotFound { message, details }
             | Self::VerificationInvalidTarget { message, details }
             | Self::VerificationInvalidWindow { message, details }
             | Self::VerificationNotReady { message, details }

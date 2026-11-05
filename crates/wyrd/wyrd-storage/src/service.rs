@@ -818,26 +818,44 @@ pub async fn download_init(
     stored: StoredArtifactEntry,
 ) -> Result<DownloadInitResponse, WyrdError> {
     let validated = validated_download_path(caller, &body)?;
-    let request_ttl_secs = compute_download_ttl(&body, storage.presign_ttl_secs());
-    let get_url = download_url(storage, &validated, request_ttl_secs).await?;
+    let size_bytes = u64::try_from(stored.size_bytes).map_err(|_| {
+        internal_error(
+            "stored artifact size is negative",
+            serde_json::json!({
+                "storage_path": validated.full,
+                "size_bytes": stored.size_bytes,
+            }),
+        )
+    })?;
+    let ttl_secs = compute_download_ttl(&body, storage.presign_ttl_secs());
+    download_plan(storage, &validated, ttl_secs, size_bytes, stored.sha256).await
+}
+
+/// Plan a download of one validated, completed object of `size_bytes` whose
+/// base64 SHA-256 is `sha256`, presigned for `ttl_secs` on a cloud backend.
+///
+/// Every download plan is built here, whichever owner authorized and
+/// resolved the object.
+///
+/// # Errors
+/// Returns the mapped storage error when the backend cannot presign the GET.
+pub async fn download_plan(
+    storage: &StorageHandle,
+    validated: &ValidatedPath,
+    ttl_secs: u32,
+    size_bytes: u64,
+    sha256: String,
+) -> Result<DownloadInitResponse, WyrdError> {
+    let get_url = download_url(storage, validated, ttl_secs).await?;
     let ttl_secs = if storage.backend() == StorageBackendKind::Local {
         0
     } else {
-        request_ttl_secs
+        ttl_secs
     };
-
     Ok(DownloadInitResponse {
         plan: DownloadPlan { get_url, ttl_secs },
-        size_bytes: u64::try_from(stored.size_bytes).map_err(|_| {
-            internal_error(
-                "stored artifact size is negative",
-                serde_json::json!({
-                    "storage_path": validated.full,
-                    "size_bytes": stored.size_bytes,
-                }),
-            )
-        })?,
-        sha256: stored.sha256,
+        size_bytes,
+        sha256,
     })
 }
 

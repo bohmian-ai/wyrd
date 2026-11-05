@@ -1721,6 +1721,11 @@ execution; scheduled executions have no `run_id`.
 | `POST /v1/verification/execute` | Exact Verifier and subject, optional Run and `group_id`, named input declarations, optional route overrides → `200 VerificationResult` |
 | `POST /v1/verification/enqueue` | The same Run evidence with `Idempotency-Key` → `202 { execution_id }` after durable admission |
 | `GET /v1/verification/executions/{execution_id}` | Status, terminal error, result when visible, and a group execution's `group_id`, owner, and source selection once its input record is visible; a direct execution's completed status once its records are visible |
+| `GET /v1/verification/executions/{execution_id}/invocations` | One page of a queued execution's invocation attempts in insertion order — producer, progress, reason, speculation — with its status and history projection counts |
+| `GET /v1/verification/executions/{execution_id}/publications` | One page of its publications' names, kinds, and producers, without content |
+| `GET /v1/verification/executions/{execution_id}/publications/{step_id}/{name}` | One publication of the exact producer attempt with its JSON value or manifest |
+| `POST /v1/verification/executions/{execution_id}/publications/{step_id}/{name}/download` | The shared download plan of a file publication's file or a directory publication's listed `path` |
+| `POST /v1/verification/executions/{execution_id}/cancel` | `{ execution_id, status }` after the cancellation fence commits; settled work keeps its status |
 | `GET /v1/verification/bindings/{binding_id}` | Readiness, cadence, `last_execution_id`, and a `group_end` binding's frozen settings and source bindings |
 
 File contents never pass through Postgres or a verification request body; an
@@ -1748,6 +1753,18 @@ bounds, the last ending `errored`. Per-file and aggregate limits
 (`WYRD_VERIFICATION_FILE_MAX_MIB`, `WYRD_VERIFICATION_FILES_MAX_MIB`) are
 enforced at planning. `ArtifactRef` selects a declared Artifact under its own
 authorization.
+
+Execution reads — status, invocation and publication pages, publication
+reads, and download plans — check `verifier:read` against the execution's
+exact Verifier UID, and cancellation checks `verifier:run`; neither falls back
+to `cards:read`. A caller with no grant of the action at any scope is refused
+before the execution is looked up, and an absent or other-tenant execution is
+not found. Pages default to 50 and hold at most 200 entries; a cursor fixes
+its listing's insertion-sequence cut and is bound to the tenant, execution,
+and listing, so a page neither skips nor repeats entries while the execution
+progresses. Execution status reads its records through the tenant's SYSTEM
+read authority granted only `execution_inputs`, `results`, and
+`execution_outputs`; public Bifrost SQL keeps the caller's own table grants.
 
 Public invocation checks `verifier:run` against the selected Verifier's exact
 Card UID. `PermissionScope::Verifier(CardUid)` names one UID; `All` covers

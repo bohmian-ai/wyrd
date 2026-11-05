@@ -250,6 +250,15 @@ credential.
   the registered `bifrost.drift.observations` table UID; a missing SYSTEM
   principal or unreadable table identity fails closed before any row is
   returned.
+- An execution status read, once `verifier:read` on the execution's exact
+  Verifier is authorized and audited, reads that execution's records through
+  the same SYSTEM read authority granted `bifrost_query:read` only on the
+  registered `bifrost.verification.execution_inputs`, `results`, and
+  `execution_outputs` table UIDs, serving the caller, with fixed statements
+  filtered to that execution. Invocation and publication inspection read the
+  tenant's Postgres execution records under forced RLS; a publication
+  download plan resolves its File through the object inventory's SYSTEM read.
+  No caller SQL runs under this authority.
 - Revoking a credential, suspending or deleting a principal, suspending a
   tenant, or changing grants refuses the next issuance immediately. A tenant
   token already issued keeps its snapshot authority until its five-minute

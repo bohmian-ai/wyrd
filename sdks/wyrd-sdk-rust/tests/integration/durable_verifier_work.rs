@@ -219,3 +219,365 @@ async fn action_checkpoint_survives_unfinished_requirements() {
     );
     assistant.deployment.shutdown().await;
 }
+
+/// The `code` of a refused call.
+///
+/// # Panics
+/// Panics when the call succeeded.
+fn refused<T: std::fmt::Debug>(result: Result<T, wyrd_ai::WyrdError>) -> String {
+    result.expect_err("the call is refused").code().to_owned()
+}
+
+/// A queued execution's invocations and publications read back as stable,
+/// authorized pages, each publication by its exact producer attempt, and
+/// cancelling it is durable and repeatable.
+///
+/// With no runtime, the fixture holds the execution's lease, begins two
+/// steps, and accepts a JSON value, JSON `null`, a file, and a directory.
+/// Pages of one entry follow their cursors in insertion order to the end;
+/// a cursor is refused on another listing, and a limit outside 1–200 is
+/// refused. Each publication reads back with its value or manifest, a file
+/// and a listed directory file plan their downloads with the manifest's size
+/// and digest, and a JSON or unlisted download, a path on a read, and
+/// another attempt are refused. A caller with `cards:read` but no `verifier:read`, or
+/// with it for another Verifier only, is refused; one scoped to this Verifier reads.
+/// Another tenant sees no such execution. A viewer cannot cancel; the
+/// administrator's cancel and its repeat both answer `cancelled`, and the
+/// publications stay listed.
+///
+/// # Panics
+/// Panics when any read, refusal, or cancellation differs.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires the repository-managed Postgres journey lane"]
+async fn execution_pages_are_stable_and_tenant_scoped() {
+    use wyrd_ai::verify::{
+        ExecutionPageQuery, InvocationProgress, PublicationContent, PublicationKind,
+        PublicationName, PublicationSelector, TaskId, VerificationExecutionStatus,
+    };
+    use wyrd_testing::verification::Published;
+
+    let deployment = crate::support::Deployment::start().await;
+    let server = deployment.server();
+    let fixture = VerificationFixture::provision(server.state(), server.data_tenant_id())
+        .await
+        .expect("the tenant provisions");
+    let (subject, _) = fixture.service("pages-subject").await.expect("service");
+    let verifier = fixture.drift_verifier("pages").await.expect("verifier");
+    let other = fixture
+        .drift_verifier("pages-other")
+        .await
+        .expect("verifier");
+    fixture
+        .submit(&verifier, &subject, std::collections::BTreeMap::new())
+        .await
+        .expect("the execution is admitted");
+    let tree = vec![
+        ("a.md".to_owned(), b"alpha".to_vec()),
+        ("nested/b.md".to_owned(), b"beta".to_vec()),
+    ];
+    let id = fixture
+        .publish(
+            server.state(),
+            &[
+                ("review", "verdict", Published::Json(json!({"ok": true}))),
+                (
+                    "review",
+                    "nothing",
+                    Published::Json(serde_json::Value::Null),
+                ),
+                ("draft", "report", Published::File(b"# Report\n".to_vec())),
+                ("draft", "tree", Published::Directory(tree)),
+            ],
+        )
+        .await
+        .expect("the held execution publishes");
+    let admin = deployment.admin();
+    let execution = Execution::connect_with(id, &admin)
+        .await
+        .expect("the execution handle connects");
+
+    let page = |cursor: Option<String>| ExecutionPageQuery {
+        limit: Some(1),
+        cursor,
+    };
+    let mut invocations = Vec::new();
+    let mut cursor = None;
+    loop {
+        let read = execution
+            .invocations(&page(cursor))
+            .await
+            .expect("an invocation page reads");
+        assert_eq!(read.execution_id, id);
+        assert_eq!(read.status, VerificationExecutionStatus::Running);
+        invocations.extend(read.items);
+        cursor = read.next_cursor;
+        if cursor.is_none() {
+            break;
+        }
+    }
+    let steps: Vec<_> = invocations
+        .iter()
+        .map(|item| {
+            (
+                item.producer.step_id.as_str(),
+                item.producer.attempt,
+                item.progress,
+            )
+        })
+        .collect();
+    assert_eq!(
+        steps,
+        [
+            ("review", 1, InvocationProgress::Started),
+            ("draft", 1, InvocationProgress::Started),
+        ]
+    );
+
+    let mut publications = Vec::new();
+    let mut cursor = None;
+    loop {
+        let read = execution
+            .publications(&page(cursor))
+            .await
+            .expect("a publication page reads");
+        publications.extend(read.items);
+        cursor = read.next_cursor;
+        if cursor.is_none() {
+            break;
+        }
+    }
+    let listed: Vec<_> = publications
+        .iter()
+        .map(|item| {
+            (
+                item.producer.step_id.as_str(),
+                item.name.as_str(),
+                item.kind,
+            )
+        })
+        .collect();
+    assert_eq!(
+        listed,
+        [
+            ("review", "verdict", PublicationKind::Json),
+            ("review", "nothing", PublicationKind::Json),
+            ("draft", "report", PublicationKind::File),
+            ("draft", "tree", PublicationKind::Directory),
+        ]
+    );
+    let first = execution
+        .invocations(&page(None))
+        .await
+        .expect("an invocation page reads");
+    let foreign_cursor = ExecutionPageQuery {
+        limit: Some(1),
+        cursor: first.next_cursor,
+    };
+    assert_eq!(
+        refused(execution.publications(&foreign_cursor).await),
+        "WYRD_SPEC_400_VALIDATION",
+        "an invocation cursor does not continue the publication listing"
+    );
+    for limit in [0, 201] {
+        let query = ExecutionPageQuery {
+            limit: Some(limit),
+            cursor: None,
+        };
+        assert_eq!(
+            refused(execution.invocations(&query).await),
+            "WYRD_SPEC_400_VALIDATION"
+        );
+    }
+
+    let step = |name: &str| TaskId::new(name).expect("step");
+    let name = |name: &str| PublicationName::new(name).expect("name");
+    let attempt = |path: Option<&str>| PublicationSelector {
+        attempt: 1,
+        item_index: None,
+        iteration_index: None,
+        path: path.map(str::to_owned),
+    };
+    let content = |publication: wyrd_ai::verify::Publication| publication.content;
+    assert_eq!(
+        content(
+            execution
+                .publication(&step("review"), &name("verdict"), &attempt(None))
+                .await
+                .expect("the JSON publication reads")
+        ),
+        PublicationContent::Json {
+            value: json!({"ok": true})
+        }
+    );
+    assert_eq!(
+        content(
+            execution
+                .publication(&step("review"), &name("nothing"), &attempt(None))
+                .await
+                .expect("the null publication reads")
+        ),
+        PublicationContent::Json {
+            value: serde_json::Value::Null
+        }
+    );
+    let PublicationContent::File { manifest: file } = content(
+        execution
+            .publication(&step("draft"), &name("report"), &attempt(None))
+            .await
+            .expect("the file publication reads"),
+    ) else {
+        panic!("the report is a file publication");
+    };
+    let PublicationContent::Directory {
+        manifest: directory,
+    } = content(
+        execution
+            .publication(&step("draft"), &name("tree"), &attempt(None))
+            .await
+            .expect("the directory publication reads"),
+    )
+    else {
+        panic!("the tree is a directory publication");
+    };
+    let paths: Vec<_> = directory
+        .files
+        .iter()
+        .map(|file| file.path.as_str())
+        .collect();
+    assert_eq!(paths, ["a.md", "nested/b.md"]);
+
+    let digest = |file: &wyrd_ai::verify::PublicationFile| {
+        use base64::Engine as _;
+        base64::engine::general_purpose::STANDARD.encode(file.sha256.as_bytes())
+    };
+    let plan = execution
+        .download(&step("draft"), &name("report"), &attempt(None))
+        .await
+        .expect("the file download plans");
+    assert_eq!(
+        (plan.size_bytes, plan.sha256),
+        (file.files[0].size_bytes, digest(&file.files[0]))
+    );
+    let plan = execution
+        .download(&step("draft"), &name("tree"), &attempt(Some("nested/b.md")))
+        .await
+        .expect("the directory file download plans");
+    assert_eq!(
+        (plan.size_bytes, plan.sha256),
+        (directory.files[1].size_bytes, digest(&directory.files[1]))
+    );
+    for (publication, selector) in [
+        ("verdict", attempt(None)),
+        ("tree", attempt(None)),
+        ("tree", attempt(Some("missing.md"))),
+        ("report", attempt(Some("a.md"))),
+    ] {
+        let step = if publication == "verdict" {
+            "review"
+        } else {
+            "draft"
+        };
+        assert_eq!(
+            refused(
+                execution
+                    .download(
+                        &TaskId::new(step).expect("step"),
+                        &name(publication),
+                        &selector
+                    )
+                    .await
+            ),
+            "WYRD_SPEC_400_VALIDATION",
+            "{publication} {selector:?}"
+        );
+    }
+    assert_eq!(
+        refused(
+            execution
+                .publication(&step("review"), &name("verdict"), &attempt(Some("a.md")))
+                .await
+        ),
+        "WYRD_SPEC_400_VALIDATION"
+    );
+    let second = PublicationSelector {
+        attempt: 2,
+        ..attempt(None)
+    };
+    assert_eq!(
+        refused(
+            execution
+                .publication(&step("review"), &name("verdict"), &second)
+                .await
+        ),
+        "WYRD_VERIFICATION_404_PUBLICATION_NOT_FOUND"
+    );
+
+    let grant = |uid: &dyn std::fmt::Display| json!({"resource": "verifier", "action": "read", "scope": {"verifier": uid.to_string()}});
+    let session = &deployment;
+    let as_key = |key: String| async move {
+        Execution::connect_with(id, &session.client(&key))
+            .await
+            .expect("the execution handle connects")
+    };
+    let cards_only = json!({"resource": "cards", "action": "read", "scope": "all"});
+    let nobody = as_key(deployment.granted_key("pages_cards", &[cards_only]).await).await;
+    assert_eq!(
+        refused(nobody.invocations(&ExecutionPageQuery::default()).await),
+        "WYRD_PERMISSION_403_DENIED_RBAC"
+    );
+    let elsewhere = as_key(
+        deployment
+            .granted_key("pages_elsewhere", &[grant(&other)])
+            .await,
+    )
+    .await;
+    assert_eq!(
+        refused(elsewhere.publications(&ExecutionPageQuery::default()).await),
+        "WYRD_PERMISSION_403_DENIED_RBAC"
+    );
+    let exact = as_key(
+        deployment
+            .granted_key("pages_exact", &[grant(&verifier)])
+            .await,
+    )
+    .await;
+    assert_eq!(
+        exact
+            .publications(&ExecutionPageQuery::default())
+            .await
+            .expect("an exact verifier:read grant reads")
+            .items,
+        publications
+    );
+    let foreign = as_key(deployment.other_tenant_admin("pages-foreign").await).await;
+    assert_eq!(
+        refused(foreign.invocations(&ExecutionPageQuery::default()).await),
+        "WYRD_VERIFICATION_404_EXECUTION_NOT_FOUND"
+    );
+    let viewer = as_key(deployment.key("pages_viewer", &["viewer"]).await).await;
+    viewer
+        .invocations(&ExecutionPageQuery::default())
+        .await
+        .expect("a viewer reads");
+    assert_eq!(
+        refused(viewer.cancel().await),
+        "WYRD_PERMISSION_403_DENIED_RBAC"
+    );
+
+    for _ in 0..2 {
+        let cancelled = execution.cancel().await.expect("the cancel commits");
+        assert_eq!(
+            (cancelled.execution_id, cancelled.status),
+            (id, VerificationExecutionStatus::Cancelled)
+        );
+    }
+    assert_eq!(
+        execution
+            .publications(&ExecutionPageQuery::default())
+            .await
+            .expect("a cancelled execution's publications read")
+            .items,
+        publications
+    );
+    deployment.shutdown().await;
+}

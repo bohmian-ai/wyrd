@@ -91,6 +91,13 @@ import type {
   VerificationOutcome as WireVerificationOutcome,
   VerificationResult as WireVerificationResult,
   WorkloadRestriction,
+  CancelExecutionResponse,
+  DownloadInitResponse,
+  ExecutionPageQuery,
+  InvocationPage,
+  Publication,
+  PublicationPage,
+  PublicationSelector,
 } from "./card-types.js";
 
 import type {
@@ -215,6 +222,13 @@ export type {
   RoleSource,
   SortKey,
   TableEntry,
+  CancelExecutionResponse,
+  DownloadInitResponse,
+  ExecutionPageQuery,
+  InvocationPage,
+  Publication,
+  PublicationPage,
+  PublicationSelector,
   TokenAudience,
   UpdateOperatorConnectionRequest,
 };
@@ -227,7 +241,13 @@ export type {
   DataSpec,
   DriftBaselineState,
   DriftBaselineStatus,
+  ExecutionInvocation,
   ExecutionRoute,
+  HistoryProjection,
+  Producer,
+  PublicationKind,
+  PublicationManifest,
+  PublicationSummary,
   Metadata as CardMetadata,
   ModelSpec,
   OperatorSpec,
@@ -2647,6 +2667,63 @@ export namespace verify {
       parser: VerdictDataParser<T>,
     ): Promise<VerificationResult<T>> {
       return typedResult(await this.wait(options), parser);
+    }
+
+    /**
+     * Read one stable page of the execution's invocation attempts, with its
+     * status and history projection position.
+     *
+     * @param page - `limit` (1–200, default 50) and the previous page's `cursor`.
+     * @throws {@link WyrdError} validation for a bad limit or cursor, not-found
+     * for an execution not visible to the caller, and `verifier:read` denial.
+     */
+    async invocations(page: ExecutionPageQuery = {}): Promise<InvocationPage> {
+      return lifecycleValue(await this.#native.invocations(JSON.stringify(page)));
+    }
+
+    /**
+     * Read one stable page of the execution's accepted publications, without content.
+     *
+     * @param page - As for {@link Execution.invocations}.
+     * @throws {@link WyrdError} the errors of {@link Execution.invocations}.
+     */
+    async publications(page: ExecutionPageQuery = {}): Promise<PublicationPage> {
+      return lifecycleValue(await this.#native.publications(JSON.stringify(page)));
+    }
+
+    /**
+     * Read publication `name` of `stepId`'s exact producer attempt: a JSON
+     * value, or a file or directory manifest.
+     *
+     * @throws {@link WyrdError} validation for a zero attempt or a `path`,
+     * `WYRD_VERIFICATION_404_PUBLICATION_NOT_FOUND` when that attempt published
+     * no such name, and the errors of {@link Execution.invocations}.
+     */
+    async publication(stepId: string, name: string, selector: PublicationSelector): Promise<Publication> {
+      return lifecycleValue(await this.#native.publication(stepId, name, JSON.stringify(selector)));
+    }
+
+    /**
+     * Plan the download of a file publication, or of the directory publication
+     * file `selector.path` names.
+     *
+     * @throws {@link WyrdError} validation for a JSON publication, a path on a
+     * file, or a missing or unlisted directory path, and the errors of
+     * {@link Execution.publication}.
+     */
+    async download(stepId: string, name: string, selector: PublicationSelector): Promise<DownloadInitResponse> {
+      return lifecycleValue(await this.#native.download(stepId, name, JSON.stringify(selector)));
+    }
+
+    /**
+     * Cancel the execution durably; a terminal execution keeps its status, so
+     * a repeated cancel answers the same.
+     *
+     * @throws {@link WyrdError} not-found for an execution not visible to the
+     * caller, and `verifier:run` denial.
+     */
+    async cancel(): Promise<CancelExecutionResponse> {
+      return lifecycleValue(await this.#native.cancel());
     }
   }
 }

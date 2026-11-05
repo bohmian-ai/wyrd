@@ -421,6 +421,47 @@ export declare class NativeExecution {
    * in [`NativeLifecycleResult`].
    */
   wait(timeoutMs: number): Promise<NativeLifecycleResult>
+  /**
+   * Reads one stable page of the execution's invocation attempts.
+   *
+   * # Errors
+   * Returns a napi error only when the page cannot be projected; a
+   * malformed `page_json` and read failures are returned in
+   * [`NativeLifecycleResult`].
+   */
+  invocations(pageJson: string): Promise<NativeLifecycleResult>
+  /**
+   * Reads one stable page of the execution's accepted publications.
+   *
+   * # Errors
+   * As [`Self::invocations`].
+   */
+  publications(pageJson: string): Promise<NativeLifecycleResult>
+  /**
+   * Reads publication `name` of `step_id`'s exact producer attempt.
+   *
+   * # Errors
+   * Returns a napi error only when the publication cannot be projected; a
+   * malformed step, name, or selector and read failures are returned in
+   * [`NativeLifecycleResult`].
+   */
+  publication(stepId: string, name: string, selectorJson: string): Promise<NativeLifecycleResult>
+  /**
+   * Plans the download of a file publication, or of one listed file of a
+   * directory publication.
+   *
+   * # Errors
+   * As [`Self::publication`].
+   */
+  download(stepId: string, name: string, selectorJson: string): Promise<NativeLifecycleResult>
+  /**
+   * Cancels the execution durably; a terminal execution keeps its status.
+   *
+   * # Errors
+   * Returns a napi error only when the response cannot be projected;
+   * refusals are returned in [`NativeLifecycleResult`].
+   */
+  cancel(): Promise<NativeLifecycleResult>
 }
 
 /**

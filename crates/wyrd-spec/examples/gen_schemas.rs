@@ -89,8 +89,8 @@ use wyrd_spec::vala::trace::SpanRecord;
 use wyrd_spec::verification::VerificationBindingStatus;
 use wyrd_spec::verification::execution::{
     CancelExecutionResponse, EnqueueVerificationResponse, EvidencePlanRequest,
-    EvidencePlanResponse, InvocationPage, Publication, PublicationPage, VerificationExecutionState,
-    VerificationRequest, VerificationResult,
+    EvidencePlanResponse, ExecutionPageQuery, InvocationPage, Publication, PublicationPage,
+    PublicationSelector, VerificationExecutionState, VerificationRequest, VerificationResult,
 };
 
 /// Writes the consumed generated outputs, or prints the transient contract bundle.
@@ -314,6 +314,8 @@ fn contracts() -> Value {
         PublicationPage,
         Publication,
         CancelExecutionResponse,
+        ExecutionPageQuery,
+        PublicationSelector,
         CreateOperatorConnectionRequest,
         UpdateOperatorConnectionRequest,
         OperatorConnectionView,

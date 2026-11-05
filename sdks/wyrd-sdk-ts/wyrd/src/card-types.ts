@@ -477,6 +477,21 @@ export interface CallProvenanceExtract {
 }
 
 /**
+ * `POST /v1/verification/executions/{execution_id}/cancel` response.
+ */
+export interface CancelExecutionResponse {
+  /**
+   * The execution.
+   */
+  readonly execution_id: ExecutionId;
+  /**
+   * Its status after the cancellation fence: `cancelled` for work that
+   * was unfinished, otherwise the terminal status it already had.
+   */
+  readonly status: VerificationExecutionStatus;
+}
+
+/**
  * Idempotent cancellation result for one active Oracle query.
  */
 export interface CancelRunningQueryResponse {
@@ -1769,6 +1784,42 @@ export interface DimFixed {
 export type DivergenceMetric = "kl" | "js" | "wasserstein";
 
 /**
+ * Server response to a download-init request.
+ */
+export interface DownloadInitResponse {
+  /**
+   * Backend-specific download plan.
+   */
+  readonly plan: DownloadPlan;
+  /**
+   * Expected base64-encoded SHA-256 digest.
+   */
+  readonly sha256: string;
+  /**
+   * Expected object size in bytes.
+   */
+  readonly size_bytes: number;
+}
+
+/**
+ * Presigned GET plan for any backend.
+ */
+export interface DownloadPlan {
+  /**
+   * Presigned GET URL or local server route URL.
+   */
+  readonly get_url: string;
+  /**
+   * URL time-to-live in seconds.
+   *
+   * For presigned URL backends (S3, GCS, Azure) this is the URL expiry in
+   * seconds. For the local filesystem backend this field is `0` (the server
+   * route does not expire).
+   */
+  readonly ttl_secs: number;
+}
+
+/**
  * Lifecycle of one PSI or SPC Verifier's server-fitted baseline.
  *
  * Registration creates it `pending`; the fitter claims it `building` and
@@ -1994,6 +2045,103 @@ export interface DriftWindow {
  * lease reclaims keep it.
  */
 export type ExecutionId = string;
+
+/**
+ * One checkpointed invocation attempt of a queued execution.
+ */
+export type ExecutionInvocation = ExecutionInvocationStarted | ExecutionInvocationAction | ExecutionInvocationRequirement;
+
+/**
+ * A step action settled.
+ */
+export interface ExecutionInvocationAction {
+  /**
+   * The step or requirement, item, iteration, and attempt.
+   */
+  readonly producer: Producer;
+  /**
+   * Why a settled attempt failed, was skipped, or was judged as it was;
+   * `null` otherwise.
+   */
+  readonly reason?: string | null;
+  /**
+   * The attempt's speculative disposition.
+   */
+  readonly speculation: Speculation;
+  readonly state: "action";
+  /**
+   * How the action ended.
+   */
+  readonly status: StepStatus;
+}
+
+/**
+ * A requirement was judged.
+ */
+export interface ExecutionInvocationRequirement {
+  /**
+   * The judgment.
+   */
+  readonly outcome: RequirementOutcome;
+  /**
+   * The step or requirement, item, iteration, and attempt.
+   */
+  readonly producer: Producer;
+  /**
+   * Why a settled attempt failed, was skipped, or was judged as it was;
+   * `null` otherwise.
+   */
+  readonly reason?: string | null;
+  /**
+   * The attempt's speculative disposition.
+   */
+  readonly speculation: Speculation;
+  readonly state: "requirement";
+}
+
+/**
+ * Dispatched and not settled: still running, or abandoned when its
+ * execution is terminal.
+ */
+export interface ExecutionInvocationStarted {
+  /**
+   * The step or requirement, item, iteration, and attempt.
+   */
+  readonly producer: Producer;
+  /**
+   * Why a settled attempt failed, was skipped, or was judged as it was;
+   * `null` otherwise.
+   */
+  readonly reason?: string | null;
+  /**
+   * The attempt's speculative disposition.
+   */
+  readonly speculation: Speculation;
+  readonly state: "started";
+}
+
+/**
+ * Query of the paginated execution listings,
+ * `GET /v1/verification/executions/{execution_id}/invocations` and
+ * `/publications`.
+ *
+ * The first page fixes the listing's cut: every page of one listing,
+ * followed through `next_cursor`, reads exactly the entries committed
+ * before the first page was read, in commit order, with no gap or
+ * duplicate. Entries committed later appear when a new listing is started.
+ * A cursor binds its tenant, execution, and listing and confers no
+ * authority, which every page re-checks.
+ */
+export interface ExecutionPageQuery {
+  /**
+   * Opaque continuation from the previous page's `next_cursor`.
+   */
+  readonly cursor?: string | null;
+  /**
+   * Page size, 1–200; 50 when omitted.
+   */
+  readonly limit?: number | null;
+}
 
 /**
  * Where an Agent's model calls go.
@@ -2553,6 +2701,29 @@ export interface GroupSourceSnapshot {
 }
 
 /**
+ * How far one execution's history has been projected into
+ * `bifrost.verification.execution_events`.
+ *
+ * Projection lag delays history only: invocation progress and publications
+ * read from the execution's records whatever this reports.
+ */
+export interface HistoryProjection {
+  /**
+   * Events Scribe acknowledged.
+   */
+  readonly acknowledged: number;
+  /**
+   * Events submitted without an acknowledgement, to be resubmitted under
+   * the same batch identity.
+   */
+  readonly failed: number;
+  /**
+   * Events not yet submitted.
+   */
+  readonly pending: number;
+}
+
+/**
  * Credential authority of an HTTP action, bound to a tenant `http` connection.
  *
  * The scheme and custom header name must equal the named connection's stored
@@ -2938,6 +3109,32 @@ export interface InstrumentationScope {
    * Instrumentation library version, when known.
    */
   readonly version?: string | null;
+}
+
+/**
+ * `GET /v1/verification/executions/{execution_id}/invocations` response.
+ */
+export interface InvocationPage {
+  /**
+   * The execution.
+   */
+  readonly execution_id: ExecutionId;
+  /**
+   * The execution's history projection position.
+   */
+  readonly history: HistoryProjection;
+  /**
+   * The page's invocation attempts, in commit order.
+   */
+  readonly items: readonly ExecutionInvocation[];
+  /**
+   * Continuation of this listing; `null` on its last page.
+   */
+  readonly next_cursor?: string | null;
+  /**
+   * Its current lifecycle status.
+   */
+  readonly status: VerificationExecutionStatus;
 }
 
 /**
@@ -4253,6 +4450,32 @@ export interface PrincipalSummary {
 }
 
 /**
+ * The producer invocation attempt that accepted a publication.
+ *
+ * This is the host-assigned logical invocation identity: the step, its
+ * zero-based fanout item and repeat iteration when those constructs exist,
+ * and its one-based attempt. Authors never supply it.
+ */
+export interface Producer {
+  /**
+   * One-based attempt.
+   */
+  readonly attempt: number;
+  /**
+   * Zero-based fanout item; `None` without fanout.
+   */
+  readonly item_index?: number | null;
+  /**
+   * Zero-based repeat iteration; `None` without repeat.
+   */
+  readonly iteration_index?: number | null;
+  /**
+   * The producing step.
+   */
+  readonly step_id: TaskId;
+}
+
+/**
  * The authored Prompt: provider and model once, plus portable content or
  * one native protocol body.
  *
@@ -4633,6 +4856,179 @@ export interface PsiThresholdNormal {
    */
   readonly alpha: number;
   readonly kind: "Normal";
+}
+
+/**
+ * One accepted, immutable execution publication.
+ */
+export type Publication = PublicationFile2 | PublicationDirectory | PublicationJson;
+
+/**
+ * One directory tree.
+ */
+export interface PublicationDirectory {
+  readonly kind: "directory";
+  /**
+   * The retained tree.
+   */
+  readonly manifest: PublicationManifest;
+  /**
+   * The logical name, unique within its producer attempt.
+   */
+  readonly name: PublicationName;
+  /**
+   * The invocation attempt that accepted it.
+   */
+  readonly producer: Producer;
+}
+
+/**
+ * One regular file a file or directory publication retains.
+ */
+export interface PublicationFile {
+  /**
+   * Path relative to the publication root; a file publication's one entry
+   * is its basename.
+   */
+  readonly path: string;
+  /**
+   * SHA-256 of the file's bytes, the verification File that holds them.
+   */
+  readonly sha256: Sha256Hex;
+  /**
+   * File size in bytes.
+   */
+  readonly size_bytes: number;
+}
+
+/**
+ * One regular file; its manifest holds exactly one entry.
+ */
+export interface PublicationFile2 {
+  readonly kind: "file";
+  /**
+   * The retained file.
+   */
+  readonly manifest: PublicationManifest;
+  /**
+   * The logical name, unique within its producer attempt.
+   */
+  readonly name: PublicationName;
+  /**
+   * The invocation attempt that accepted it.
+   */
+  readonly producer: Producer;
+}
+
+/**
+ * One JSON value, `null` included.
+ */
+export interface PublicationJson {
+  readonly kind: "json";
+  /**
+   * The logical name, unique within its producer attempt.
+   */
+  readonly name: PublicationName;
+  /**
+   * The invocation attempt that accepted it.
+   */
+  readonly producer: Producer;
+  /**
+   * The retained value.
+   */
+  readonly value: JsonValue;
+}
+
+/**
+ * The content kind one execution publication retains.
+ */
+export type PublicationKind = "file" | "directory" | "json";
+
+/**
+ * The immutable manifest of a file or directory publication.
+ *
+ * Every byte it names was completed as a verification File before the
+ * manifest committed, so a manifest never names partial content.
+ */
+export interface PublicationManifest {
+  /**
+   * Every directory below a directory publication's root, empty ones
+   * included, sorted; empty for a file.
+   */
+  readonly directories: readonly string[];
+  /**
+   * Every regular file, sorted by path.
+   */
+  readonly files: readonly PublicationFile[];
+}
+
+export type PublicationName = string;
+
+/**
+ * `GET /v1/verification/executions/{execution_id}/publications` response.
+ */
+export interface PublicationPage {
+  /**
+   * The execution.
+   */
+  readonly execution_id: ExecutionId;
+  /**
+   * The page's publications, in acceptance order.
+   */
+  readonly items: readonly PublicationSummary[];
+  /**
+   * Continuation of this listing; `null` on its last page.
+   */
+  readonly next_cursor?: string | null;
+}
+
+/**
+ * Producer selection of one publication read or download, the query of
+ * `GET` and `POST /v1/verification/executions/{execution_id}/publications/{step_id}/{name}[/download]`.
+ *
+ * It names the exact producer attempt a listing reports, never the latest
+ * attempt.
+ */
+export interface PublicationSelector {
+  /**
+   * One-based producer attempt.
+   */
+  readonly attempt: number;
+  /**
+   * Zero-based fanout item; omitted without fanout.
+   */
+  readonly item_index?: number | null;
+  /**
+   * Zero-based repeat iteration; omitted without repeat.
+   */
+  readonly iteration_index?: number | null;
+  /**
+   * For a directory download, the regular file's path relative to the
+   * publication root, as its manifest lists it; omitted otherwise.
+   */
+  readonly path?: string | null;
+}
+
+/**
+ * One accepted publication as a listing names it, without its content.
+ */
+export interface PublicationSummary {
+  /**
+   * The content kind retained.
+   */
+  readonly kind: PublicationKind;
+  /**
+   * The logical name, unique within its producer attempt.
+   */
+  readonly name: PublicationName;
+  /**
+   * The invocation attempt that accepted it.
+   */
+  readonly producer: Producer;
+  /**
+   * Its producer's speculative disposition.
+   */
+  readonly speculation: Speculation;
 }
 
 /**
@@ -5974,6 +6370,11 @@ export interface SpanStatusUnset {
  * Wire form: 64 lowercase hex characters (BLAKE3-256 digest).
  */
 export type SpecHash = string;
+
+/**
+ * A step's speculative disposition, as a collection manifest reports it.
+ */
+export type Speculation = "none";
 
 /**
  * DataCard split label.

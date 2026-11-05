@@ -336,6 +336,9 @@ pub struct BuiltinTableDefinition {
     /// row, the Parquet Bloom recipe, and every partition identity — is derived
     /// from that one canonical layout.
     pub physical_layout: fn() -> PhysicalLayoutWire,
+    /// Whether every write records one revision of a keyed state; see
+    /// [`DomainTable::STATE_FENCED`].
+    pub state_fenced: bool,
 }
 
 /// Enforce the Variant contract over one supplied batch at the trust boundary.
@@ -605,6 +608,15 @@ pub trait DomainTable: Send + Sync + 'static {
     /// The pre-declared validator refuses a row that sets only some children
     /// of one of these columns; see [`refuse_partial_structs`].
     const WHOLE_STRUCTS: &'static [&'static str] = &[];
+
+    /// Whether every write records one revision of a keyed state.
+    ///
+    /// Scribe then requires each batch to carry its
+    /// [`ScribeStateAdvance`](crate::contracts::ScribeStateAdvance) and
+    /// accepts it only from the state's current writer at the next revision,
+    /// with its durable fence; replay never restores an unfenced batch of the
+    /// table, because its revision was never accepted.
+    const STATE_FENCED: bool = false;
 
     /// User-owned fields, excluding correlation and system fields.
     fn arrow_fields() -> Vec<Field>;
@@ -1267,6 +1279,7 @@ const fn definition<T: DomainTable>() -> BuiltinTableDefinition {
         canonical_validator: T::CANONICAL_VALIDATOR,
         derived_columns: T::DERIVED_COLUMNS,
         physical_layout: T::physical_layout,
+        state_fenced: T::STATE_FENCED,
     }
 }
 

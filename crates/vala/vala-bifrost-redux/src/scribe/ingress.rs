@@ -713,6 +713,11 @@ impl ScribeImpl {
         let decode = profile.decode.timer();
         let tenant = frame.principal.tenant_id;
         let builtin_definition = Self::builtin_definition(&frame.table);
+        if builtin_definition.is_some_and(|definition| definition.state_fenced)
+            != frame.state.is_some()
+        {
+            return Err(ScribeError::InvalidFrame);
+        }
         let request_id = uuid::Uuid::parse_str(frame.request_id.as_str()).map_err(|error| {
             ScribeError::Internal {
                 detail: format!("Scribe request identity is not a UUID: {error}"),
@@ -751,6 +756,7 @@ impl ScribeImpl {
             batch_id: frame.batch_id,
             request_id,
             ingested_at_micros: receipt_micros,
+            state: frame.state,
             rows,
             measured_wire_bytes: frame.measured_wire_bytes,
             reservation,
@@ -1152,6 +1158,7 @@ fn unclaimed_retry(frame: &ScribeIngressFrame) -> ScribeIngressFrame {
         table: frame.table.clone(),
         expected_schema_fingerprint: frame.expected_schema_fingerprint,
         table_version: None,
+        state: frame.state,
         request_id: frame.request_id.clone(),
         batch_id: frame.batch_id,
         measured_wire_bytes: frame.measured_wire_bytes,
@@ -1473,6 +1480,7 @@ mod tests {
             table: TableRef::new(BifrostNamespace::Bifrost, "decoded_size_bound"),
             expected_schema_fingerprint: Some(projected_source_schema_fingerprint(schema.as_ref())),
             table_version: None,
+            state: None,
             request_id: request_id.clone(),
             batch_id: uuid::Uuid::now_v7(),
             measured_wire_bytes: 0,

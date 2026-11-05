@@ -123,6 +123,7 @@ mod pg_tests {
                 wal_lsn_min: lsn - 1,
                 wal_lsn_max: lsn,
                 request_id: Uuid::now_v7(),
+                state: None,
             };
             let mut conn = vala_sql::TenantConn::acquire(fixture.app_pool(), tenant)
                 .await

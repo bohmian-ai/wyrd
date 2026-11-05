@@ -1,9 +1,8 @@
-//! `bifrost.verification.execution_events` — the progress history of queued
-//! Verifier executions.
+//! `bifrost.verification.execution_events` — the accepted recoverable state
+//! of every Verifier execution, one row per accepted revision.
 //!
 //! Owns the table's authored schema and physical layout only; the server
-//! commits each event with the execution transition it records and projects
-//! it here through Scribe.
+//! writes each revision through Scribe as a state-fenced write.
 
 use arrow::datatypes::Field;
 
@@ -15,26 +14,23 @@ use crate::tables::{
 };
 use wyrd_spec::vala::api::PhysicalLayoutWire;
 
-/// `bifrost.verification.execution_events` — one row per committed
-/// execution, invocation, or publication transition.
+/// `bifrost.verification.execution_events` — one row per accepted revision
+/// of one execution's recoverable state.
 ///
-/// `event_id` is the server-assigned identity of the event and `sequence`
-/// its position in its tenant's committed history, so ordering never rests
-/// on `occurred_at`. `event` is `execution` for an execution status change,
-/// with `status` the new status and `reason` its error code; `invocation`
-/// for a started (`status` `started`) or settled invocation attempt, with
-/// `status` the step status or requirement outcome and `reason` the
-/// recorded reason; `invocation_abandoned` for an attempt whose unfinished
-/// checkpoint was forgotten; and `publication` for an accepted publication,
-/// with `publication_name`, `publication_kind`, its total `size_bytes`,
-/// `file_count`, a file's `sha256`, and a JSON publication's bounded
-/// [`VALUE`]. Producer identity is `step_id`, `item_index`,
-/// `iteration_index`, and `attempt`. Bytes never appear here: files stay in
-/// verification File storage, named by digest. The managed columns attribute
-/// the row to the execution's subject and actor.
+/// The table is state-fenced: `execution_id` is the state key and `sequence`
+/// its revision, so a row exists only once Scribe accepted that revision from
+/// the execution's current writer, and replay never restores a refused one.
+/// `event` is `checkpoint`, `status` the execution status the revision
+/// records, and [`VALUE`] the complete versioned logical state: pinned
+/// inputs, attempts, settlements, accepted publications with their exact
+/// File descriptors, and the selected terminal outcome. Producer, publication,
+/// and size columns stay null. `event_id` identifies the revision. Bytes never
+/// appear here: files stay in verification File storage, named by digest.
+/// The managed columns attribute the row to the execution's subject and
+/// actor.
 pub struct ExecutionEventsTable;
 
-/// Variant column holding a JSON publication's value.
+/// Variant column holding the complete versioned execution state.
 pub const VALUE: &str = "value";
 
 impl DomainTable for ExecutionEventsTable {
@@ -47,6 +43,8 @@ impl DomainTable for ExecutionEventsTable {
     const PAYLOAD_CLASS: PayloadClass = PayloadClass::Sensitive;
     /// The value column gated behind the elevated payload permission.
     const SENSITIVE_PAYLOAD_COLUMNS: &'static [&'static str] = &[VALUE];
+    /// Each row is one accepted revision of an execution's state.
+    const STATE_FENCED: bool = true;
 
     /// Authored columns in order; managed correlation and system columns are appended by the catalog.
     fn arrow_fields() -> Vec<Field> {

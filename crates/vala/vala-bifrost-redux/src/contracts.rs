@@ -80,6 +80,8 @@ impl From<Attribution> for StampedAttribution {
     }
 }
 
+pub use vala_sql::queries::scribe_state_heads::ScribeStateAdvance;
+
 /// One logical batch crossing the Gate-to-Scribe boundary.
 #[derive(Debug)]
 pub struct ScribeIngressFrame {
@@ -138,6 +140,14 @@ pub struct ScribeIngressFrame {
     pub request_id: RequestId,
     /// The client idempotency identifier for this batch.
     pub batch_id: uuid::Uuid,
+    /// The keyed-state revision the batch records, required exactly for a
+    /// state-fenced table.
+    ///
+    /// Scribe accepts the batch only when its writer owns the state and its
+    /// revision directly follows the accepted one, atomically with the
+    /// batch's durable fence; otherwise the batch is refused with
+    /// [`ScribeError::StateRefused`] and never becomes durable or visible.
+    pub state: Option<ScribeStateAdvance>,
     /// Server-measured bytes after transport decompression.
     pub measured_wire_bytes: usize,
     /// Native Arrow IPC, engine-only projected Arrow, or a fixed-capacity
@@ -363,6 +373,12 @@ pub enum ScribeError {
         actual: StreamIdentity,
     },
 
+    /// The batch's keyed-state revision was refused: its writer no longer
+    /// owns the state, the revision does not directly follow the accepted
+    /// one, or the writer's bound passed. The batch is not durable.
+    #[error("keyed state revision refused")]
+    StateRefused,
+
     #[error("internal scribe failure: {detail}")]
     Internal { detail: String },
 }
@@ -402,6 +418,7 @@ impl ScribeError {
                 requested: *requested,
                 actual: *actual,
             },
+            Self::StateRefused => Self::StateRefused,
             Self::Internal { detail } => Self::Internal {
                 detail: detail.clone(),
             },

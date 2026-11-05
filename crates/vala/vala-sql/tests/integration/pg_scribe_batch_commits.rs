@@ -8,6 +8,8 @@
 //!   caller can roll back the fresh fences before comparing it
 //! - uncertain-commit resolution classifies a whole offered set in one read
 //! - a fence offered for another tenant is refused
+//! - a keyed-state write is accepted with its fence only from the claimed
+//!   writer at the next revision, and a claim answers the accepted position
 
 mod pg_tests {
     use std::sync::{Mutex, OnceLock};
@@ -20,6 +22,9 @@ mod pg_tests {
     use vala_sql::TenantConn;
     use vala_sql::queries::scribe_batch_commits::{
         ScribeBatchCommit, ScribeBatchCommitResolution, accepted_version, record, resolve,
+    };
+    use vala_sql::queries::scribe_state_heads::{
+        ScribeStateAdvance, ScribeStateClaim, ScribeStateHead, claim,
     };
     use wyrd_dev_fixtures::pg::PgFixture;
     use wyrd_spec::DataTenantId;
@@ -122,6 +127,7 @@ mod pg_tests {
             wal_lsn_min: lsn,
             wal_lsn_max: lsn + 1,
             request_id: Uuid::now_v7(),
+            state: None,
         }
     }
 
@@ -390,5 +396,146 @@ mod pg_tests {
         resolve(&mut conn, std::iter::once(&foreign))
             .await
             .expect_err("a foreign fence does not resolve");
+    }
+    /// Claims `key` of `bifrost.state` for `writer` in one committed
+    /// transaction.
+    async fn claim_state(
+        fixture: &PgFixture,
+        tenant: DataTenantId,
+        key: Uuid,
+        writer: Uuid,
+        generation: i64,
+    ) -> ScribeStateClaim {
+        let mut conn = TenantConn::acquire(fixture.app_pool(), tenant)
+            .await
+            .expect("tenant connection");
+        let claimed = claim(&mut conn, "bifrost.state", key, writer, generation)
+            .await
+            .expect("the claim runs");
+        conn.commit().await.expect("the claim commits");
+        claimed
+    }
+
+    /// A fence of `bifrost.state` recording `revision` of `key` by `writer`.
+    fn state_fence(
+        tenant: DataTenantId,
+        key: Uuid,
+        writer: Uuid,
+        revision: i64,
+        lsn: i64,
+    ) -> ScribeBatchCommit {
+        ScribeBatchCommit {
+            state: Some(ScribeStateAdvance {
+                key,
+                writer,
+                revision,
+                not_after: None,
+            }),
+            ..fence(tenant, "bifrost.state", Uuid::now_v7(), lsn)
+        }
+    }
+
+    /// Proves a keyed-state write is accepted only from the claimed writer at
+    /// the next revision before its bound, in the same transaction as its
+    /// fence, and that a claim answers the accepted position, installs a new
+    /// writer, and refuses an older generation.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the fixture cannot start or a claim, write, or refusal is
+    /// misclassified.
+    #[tokio::test]
+    async fn a_state_write_is_accepted_only_from_the_claimed_writer_at_the_next_revision() {
+        let fixture = PgFixture::start().await.expect("fixture");
+        let tenant = fixture.data_tenant_id();
+        let key = Uuid::now_v7();
+        let (first, second) = (Uuid::now_v7(), Uuid::now_v7());
+        let absent = ScribeStateClaim::Claimed(ScribeStateHead {
+            revision: 0,
+            batch_id: None,
+        });
+        assert_eq!(claim_state(&fixture, tenant, key, first, 1).await, absent);
+
+        let accepted = state_fence(tenant, key, first, 1, 10);
+        assert_eq!(
+            commit_group(&fixture, &[(accepted.clone(), Utc::now())]).await,
+            [ScribeBatchCommitResolution::Committed]
+        );
+        assert_eq!(
+            commit_group(&fixture, &[(accepted.clone(), Utc::now())]).await,
+            [ScribeBatchCommitResolution::Committed],
+            "an accepted write retries as committed without advancing again"
+        );
+        let skipped = state_fence(tenant, key, first, 3, 20);
+        let expired = ScribeBatchCommit {
+            state: Some(ScribeStateAdvance {
+                not_after: Some(Utc::now() - chrono::Duration::seconds(1)),
+                ..state_fence(tenant, key, first, 2, 30).state.expect("state")
+            }),
+            ..state_fence(tenant, key, first, 2, 30)
+        };
+        let mut conn = TenantConn::acquire(fixture.app_pool(), tenant)
+            .await
+            .expect("tenant connection");
+        assert_eq!(
+            record(
+                &mut conn,
+                &[(skipped.clone(), Utc::now()), (expired.clone(), Utc::now())]
+            )
+            .await
+            .expect("the group records"),
+            [ScribeBatchCommitResolution::StateRefused; 2],
+            "a skipped revision and a passed bound are refused"
+        );
+        drop(conn);
+
+        assert_eq!(
+            claim_state(&fixture, tenant, key, second, 2).await,
+            ScribeStateClaim::Claimed(ScribeStateHead {
+                revision: 1,
+                batch_id: Some(accepted.batch_id),
+            }),
+            "a takeover inherits the accepted revision"
+        );
+        assert_eq!(
+            claim_state(&fixture, tenant, key, first, 1).await,
+            ScribeStateClaim::Superseded,
+            "a delayed older claim cannot displace the new writer"
+        );
+        let stale = state_fence(tenant, key, first, 2, 40);
+        let current = state_fence(tenant, key, second, 2, 50);
+        let mut conn = TenantConn::acquire(fixture.app_pool(), tenant)
+            .await
+            .expect("tenant connection");
+        assert_eq!(
+            record(&mut conn, &[(stale.clone(), Utc::now())])
+                .await
+                .expect("the stale write records"),
+            [ScribeBatchCommitResolution::StateRefused],
+            "the replaced writer cannot advance the state"
+        );
+        drop(conn);
+        assert_eq!(
+            commit_group(&fixture, &[(current.clone(), Utc::now())]).await,
+            [ScribeBatchCommitResolution::Committed]
+        );
+        let mut conn = TenantConn::acquire(fixture.app_pool(), tenant)
+            .await
+            .expect("tenant connection");
+        assert_eq!(
+            resolve(&mut conn, [&skipped, &expired, &stale].into_iter())
+                .await
+                .expect("fences resolve"),
+            [ScribeBatchCommitResolution::Absent; 3],
+            "no refused write left a durable fence"
+        );
+        drop(conn);
+        assert_eq!(
+            claim_state(&fixture, tenant, key, second, 2).await,
+            ScribeStateClaim::Claimed(ScribeStateHead {
+                revision: 2,
+                batch_id: Some(current.batch_id),
+            })
+        );
     }
 }

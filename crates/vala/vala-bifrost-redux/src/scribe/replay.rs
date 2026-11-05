@@ -2178,6 +2178,7 @@ mod tests {
                 crate::contracts::projected_source_schema_fingerprint(rows.schema().as_ref()),
             ),
             table_version: None,
+            state: None,
             request_id,
             batch_id,
             measured_wire_bytes: 0,

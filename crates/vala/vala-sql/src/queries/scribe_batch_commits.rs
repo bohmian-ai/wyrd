@@ -14,6 +14,7 @@ use chrono::{DateTime, Utc};
 use wyrd_spec::DataTenantId;
 use wyrd_spec::vala::ids::TableVersion;
 
+use super::scribe_state_heads::{ScribeStateAdvance, advance};
 use crate::{OperatorPool, SqlError, TenantConn};
 
 /// Immutable WAL identity that must match exactly for a replayed batch.
@@ -53,6 +54,12 @@ pub struct ScribeBatchCommit {
     pub wal_lsn_max: i64,
     /// Request correlation persisted with the durable fence.
     pub request_id: uuid::Uuid,
+    /// The keyed-state write the batch records, accepted together with this
+    /// fence; `None` for a batch of a table that is not state-fenced.
+    ///
+    /// Not part of the identity: an accepted fence already accepted its
+    /// write, and replay never needs it.
+    pub state: Option<ScribeStateAdvance>,
 }
 
 /// Tenant-visible durable identity loaded after an idempotency conflict.
@@ -191,6 +198,14 @@ pub enum ScribeBatchCommitResolution {
     /// is decided by preparing them under that version, never by comparing a
     /// digest computed under a different definition.
     AcceptedUnder(TableVersion),
+    /// The batch's keyed-state write was refused: its writer no longer owns
+    /// the state, its revision does not follow the accepted one, or its bound
+    /// passed.
+    ///
+    /// Like [`Self::AcceptedUnder`], the caller must drop the transaction
+    /// without COMMIT and offer the group's other fences again, so the
+    /// refused batch never becomes durable or visible.
+    StateRefused,
 }
 
 /// Durable replay decision for one tenant/table/batch identity.
@@ -381,7 +396,10 @@ pub async fn ingest_instant(conn: &mut TenantConn<'_>) -> Result<DateTime<Utc>, 
 /// [`ScribeBatchCommitResolution::AlreadyCommitted`] and the caller must not
 /// make them visible again, a fence of another table version is
 /// [`ScribeBatchCommitResolution::AcceptedUnder`] that version, and different
-/// rows under the same version are a contradiction. `Absent` is never returned.
+/// rows under the same version are a contradiction. A fresh fence whose
+/// keyed-state write [`advance`] refuses is
+/// [`ScribeBatchCommitResolution::StateRefused`], and the caller must not
+/// commit. `Absent` is never returned.
 ///
 /// A fence is keyed by tenant, table, and batch id, never by its position:
 /// `RETURNING` does not preserve input order, and one batch id may name
@@ -455,10 +473,37 @@ pub async fn record(
     } else {
         load(conn, conflicted).await?
     };
+    let advances: Vec<_> = commits
+        .iter()
+        .zip(&fresh)
+        .filter(|(_, fresh)| **fresh)
+        .filter_map(|((commit, _), _)| {
+            commit
+                .state
+                .map(|state| (commit.logical_table_fqn.as_str(), commit.batch_id, state))
+        })
+        .collect();
+    let refused: Vec<(String, uuid::Uuid)> = if advances.is_empty() {
+        Vec::new()
+    } else {
+        advances
+            .iter()
+            .zip(advance(conn, &advances).await?)
+            .filter(|(_, accepted)| !accepted)
+            .map(|((fqn, batch, _), _)| ((*fqn).to_owned(), *batch))
+            .collect()
+    };
     commits
         .iter()
         .zip(fresh)
         .map(|((commit, _), fresh)| {
+            if fresh
+                && refused.iter().any(|(fqn, batch)| {
+                    *fqn == commit.logical_table_fqn && *batch == commit.batch_id
+                })
+            {
+                return Ok(ScribeBatchCommitResolution::StateRefused);
+            }
             if fresh {
                 return Ok(ScribeBatchCommitResolution::Committed);
             }
@@ -631,6 +676,7 @@ mod tests {
             wal_lsn_min: 10,
             wal_lsn_max: 12,
             request_id: uuid::Uuid::now_v7(),
+            state: None,
         };
         let existing = ExistingScribeBatchCommit {
             logical_table_fqn: commit.logical_table_fqn.clone(),

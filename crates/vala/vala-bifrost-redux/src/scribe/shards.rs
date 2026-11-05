@@ -1879,9 +1879,30 @@ impl ShardOwner {
             });
         }
         let commits = replayed.commits.clone();
+        let state_fenced = crate::tables::builtin_table(
+            replayed
+                .seal_key
+                .table
+                .namespace
+                .as_str()
+                .strip_prefix("bifrost.")
+                .unwrap_or_default(),
+            &replayed.seal_key.table.name,
+        )
+        .is_some_and(|definition| definition.state_fenced);
         let mut suppressed = Vec::new();
         for commit in &commits {
             match self.resolve_replayed_commit(replayed, commit).await? {
+                // A keyed-state revision is accepted only with its fence, so
+                // an unfenced one was never accepted and was never ACKed.
+                vala_sql::queries::scribe_batch_commits::ScribeBatchReplayResolution::Unfenced
+                    if state_fenced =>
+                {
+                    suppressed.push((
+                        commit.batch_id,
+                        commit.wal_lsn_min.as_u64()..=commit.wal_lsn_max.as_u64(),
+                    ));
+                }
                 vala_sql::queries::scribe_batch_commits::ScribeBatchReplayResolution::Suppress => {
                     suppressed.push((
                         commit.batch_id,
@@ -2008,6 +2029,7 @@ impl ShardOwner {
             wal_node_id: replayed.stream.node_id.as_uuid(),
             wal_writer_epoch: replayed.stream.writer_epoch.as_i64(),
             wal_shard_id: i16::from(replayed.shard_id),
+            state: None,
             wal_segment_sequence: i64::try_from(commit.segment_sequence).map_err(|_| {
                 ScribeError::Internal {
                     detail: "WAL replay segment sequence exceeds SQL bigint range".to_owned(),
@@ -3195,6 +3217,12 @@ struct GroupWalState {
     /// Their waiters learn that version instead of an acknowledgement, and
     /// the pod-wide index never records the version they were prepared at.
     accepted_under: HashMap<[u8; 16], wyrd_spec::vala::ids::TableVersion>,
+    /// Spent batch identities whose keyed-state revision was refused.
+    ///
+    /// Their waiters learn [`ScribeError::StateRefused`], their slices never
+    /// become visible, and the pod-wide index never records them, so a retry
+    /// is judged by the fence again.
+    refused_states: HashSet<[u8; 16]>,
     /// Batch identities at least one of whose slices this group made visible.
     ///
     /// A batch absent here was a replay: the fence spent it or the memtable
@@ -3345,6 +3373,7 @@ impl ShardOwner {
             if state
                 .accepted_under
                 .contains_key(append.batch_id.as_bytes())
+                || state.refused_states.contains(append.batch_id.as_bytes())
             {
                 continue;
             }
@@ -3847,6 +3876,11 @@ impl ShardOwner {
         sync.done();
         let _fence = stages.fence.timer();
         let Some(postgres) = self.control_postgres.clone() else {
+            if state.prepared.iter().any(|append| append.state.is_some()) {
+                return Err(ScribeError::Internal {
+                    detail: "a keyed-state write needs control Postgres to be accepted".to_owned(),
+                });
+            }
             return Ok(());
         };
         let mut fences = Vec::<(
@@ -3886,6 +3920,31 @@ impl ShardOwner {
                 let resolved = self
                     .commit_batch_control_fences(&postgres, tenant, &offered)
                     .await?;
+                let refused: Vec<usize> = resolved
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, resolution)| {
+                        **resolution == ScribeBatchCommitResolution::StateRefused
+                    })
+                    .map(|(position, _)| position)
+                    .collect();
+                if !refused.is_empty() {
+                    for &position in &refused {
+                        let append = &mut state.prepared[indices[position]];
+                        Self::refuse_state(append);
+                        let batch_id = *append.batch_id.as_bytes();
+                        state.refused_states.insert(batch_id);
+                        state.spent_batch_ids.insert(batch_id);
+                    }
+                    for &position in refused.iter().rev() {
+                        indices.remove(position);
+                        offered.remove(position);
+                    }
+                    if offered.is_empty() {
+                        break Vec::new();
+                    }
+                    continue;
+                }
                 let unproved: Vec<(usize, wyrd_spec::vala::ids::TableVersion)> = resolved
                     .iter()
                     .enumerate()
@@ -3919,7 +3978,8 @@ impl ShardOwner {
                 let batch_id = *append.batch_id.as_bytes();
                 match resolution {
                     ScribeBatchCommitResolution::AlreadyCommitted => {}
-                    ScribeBatchCommitResolution::AcceptedUnder(_) => {
+                    ScribeBatchCommitResolution::AcceptedUnder(_)
+                    | ScribeBatchCommitResolution::StateRefused => {
                         return Err(ScribeError::Internal {
                             detail: "a committed fence group held an unproved batch".to_owned(),
                         });
@@ -3987,6 +4047,23 @@ impl ShardOwner {
         })
     }
 
+    /// Answers one append's waiter that its keyed-state revision was refused.
+    ///
+    /// The waiter is consumed here, so the group's eventual ACK never
+    /// reaches it; the batch's synced slices stay invisible and replay
+    /// suppresses them, since no fence accepted them.
+    fn refuse_state(append: &mut PreparedAppend) {
+        tracing::debug!(
+            tenant = %append.tenant,
+            table = %append.table.fqn(),
+            batch_id = %append.batch_id,
+            "Scribe refused a keyed-state revision"
+        );
+        if let Some(waiter) = append.durable_ack.take() {
+            let _ = waiter.send(Err(ScribeError::StateRefused));
+        }
+    }
+
     /// Builds the durable batch-control fence for one synced batch COMMIT.
     ///
     /// The fence carries the batch's logical identity, the WAL coordinates
@@ -4032,6 +4109,7 @@ impl ShardOwner {
                 detail: "WAL commit LSN exceeds SQL bigint range".to_owned(),
             })?,
             request_id: first.request_id,
+            state: append.state,
         };
         let ingested_at = chrono::DateTime::from_timestamp_micros(append.ingested_at_micros)
             .ok_or_else(|| ScribeError::Internal {
@@ -4085,7 +4163,11 @@ impl ShardOwner {
             let mut conn = postgres.tenant_conn(tenant).await?;
             let recorded = record(&mut conn, offered).await?;
             if recorded.iter().any(|resolution| {
-                matches!(resolution, ScribeBatchCommitResolution::AcceptedUnder(_))
+                matches!(
+                    resolution,
+                    ScribeBatchCommitResolution::AcceptedUnder(_)
+                        | ScribeBatchCommitResolution::StateRefused
+                )
             }) {
                 return Ok(recorded);
             }
@@ -4284,6 +4366,7 @@ impl ShardOwner {
             rows_by_append,
             spent_batch_ids: HashSet::new(),
             accepted_under: HashMap::new(),
+            refused_states: HashSet::new(),
             inserted_batch_ids: HashSet::new(),
             fenced: Vec::new(),
         })
@@ -7281,6 +7364,7 @@ mod tests {
                 batch_id,
                 request_id: uuid::Uuid::now_v7(),
                 ingested_at_micros: 0,
+                state: None,
                 rows: crate::scribe::preprocess::AdmittedRows::Projected(rows),
                 measured_wire_bytes: initial_bytes,
                 reservation,

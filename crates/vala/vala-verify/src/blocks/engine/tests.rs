@@ -2467,3 +2467,53 @@ async fn checkpoints_restore_settled_blocks_and_count_interrupted_attempts() {
         ]
     );
 }
+
+/// An unavailable exact definition stops the whole execution: the action is
+/// not retried or settled, and the check is never judged inconclusive.
+///
+/// # Panics
+/// Panics when an unavailable block is retried, judged, or settled.
+#[tokio::test(start_paused = true)]
+async fn unavailable_definition_stops_the_execution_without_judging() {
+    let gone = || BlockError::Unavailable {
+        reason: "agent/reviewer@1 is unavailable".to_owned(),
+    };
+    let stepped = verifier(json!({
+        "inputs": {"answer": {"type": "json"}},
+        "steps": [{"id": "draft", "action": code_action(json!({"x": "inputs.answer"})), "retries": 2}]
+    }));
+    let script = Arc::new(Script {
+        actions: HashMap::from([("draft", Behavior::Attempts(vec![gone(), gone()], json!({})))]),
+        ..Script::default()
+    });
+    let refused = run(
+        &engine(&script, InMemoryTraceSource::new(), 1),
+        &stepped,
+        json!({"answer": "a"}),
+    )
+    .await;
+    assert!(
+        matches!(refused, Err(EngineError::DefinitionUnavailable(ref reason)) if reason.contains("agent/reviewer@1")),
+        "{refused:?}"
+    );
+    assert_eq!(script.calls(), ["action:draft"], "it is not retried");
+
+    let checked = verifier(json!({
+        "inputs": {"answer": {"type": "json"}},
+        "requirements": [{"id": "judged", "statement": "Judged", "check": code_check(json!({"x": "inputs.answer"}))}]
+    }));
+    let script = Arc::new(Script {
+        checks: HashMap::from([("judged", Err(gone()))]),
+        ..Script::default()
+    });
+    let refused = run(
+        &engine(&script, InMemoryTraceSource::new(), 1),
+        &checked,
+        json!({"answer": "a"}),
+    )
+    .await;
+    assert!(
+        matches!(refused, Err(EngineError::DefinitionUnavailable(_))),
+        "it is not judged: {refused:?}"
+    );
+}

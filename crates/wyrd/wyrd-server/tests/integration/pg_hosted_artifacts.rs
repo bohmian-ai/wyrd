@@ -891,15 +891,18 @@ async fn recovered_authority_bounds_every_agent_tool() {
     assert!(matches!(refused, BlockError::Terminal { .. }), "{refused}");
 }
 
-/// Agent and Prompt Card resolution is the caller's audited `card:read`:
-/// a caller with the grant reaches the Card (and is then told it is not an
-/// Agent or Prompt), while no grant, another tenant, or no caller at all
-/// refuses before the Card is read.
+/// Agent and Prompt Card resolution is the caller's audited `verifier:run`
+/// on the executing Verifier, never `cards:read`: a caller holding only that
+/// grant resolves the exact Agent and its Prompt, which it could not read as
+/// Cards. Another kind, a mismatched UID, a `cards:read`-only caller,
+/// another tenant, or a deleted Agent is unavailable, and no caller at all
+/// refuses.
 ///
 /// # Panics
-/// Panics when a lookup reads a Card its caller may not read.
+/// Panics when a lookup resolves what its caller may not run, or refuses
+/// what it may.
 #[tokio::test]
-async fn card_resolution_is_the_callers_read() {
+async fn card_resolution_is_the_verifier_run() {
     let registered = Registered::start().await;
     let state = registered.server.state().clone();
     let tenant = registered.server.data_tenant_id();
@@ -908,40 +911,88 @@ async fn card_resolution_is_the_callers_read() {
         .seed_tenant("hosted-registry-other")
         .await
         .expect("the other tenant seeds");
-    let card = &registered.card;
-    let registry = |caller: Option<Caller>| TenantRegistry::new(state.clone(), caller);
-    let reason = |error: BlockError| match error {
-        BlockError::Terminal { reason } => reason,
-        BlockError::Retryable { reason } => panic!("retryable: {reason}"),
-        BlockError::Busy { reason } => panic!("busy: {reason}"),
+    let Bootstrap::User { jwt, .. } = registered
+        .server
+        .bootstrap_user("hosted-registry-writer", &["editor"])
+        .await
+        .expect("writer bootstraps")
+    else {
+        panic!("user bootstrap returned a non-user principal");
     };
-
-    let readable = registry(Some(user(tenant, [Permission::card_read()])));
-    let read = reason(
-        AgentCardResolver::resolve(&readable, card)
-            .await
-            .expect_err("an Artifact is not an Agent"),
+    let uid = crate::pg_principal_roles::register_agent(&registered.server, &jwt, "reviewer").await;
+    let exact = |kind: &str, name: &str, uid: Option<&CardUid>| -> CardRef {
+        serde_json::from_value(json!({"kind": kind, "name": name, "version": "1.0.0", "uid": uid}))
+            .expect("reference")
+    };
+    let agent = exact("Agent", "reviewer", Some(&uid));
+    let prompt = exact("Prompt", "reviewer-prompt", None);
+    let verifier = CardUid::from_uuid(uuid::Uuid::now_v7()).expect("uid");
+    let registry =
+        |caller: Option<Caller>| TenantRegistry::new(state.clone(), caller, verifier.clone());
+    let runner = user(tenant, [Permission::verifier_run(verifier.clone())]);
+    assert!(
+        state
+            .auth
+            .permission_check
+            .check(&runner.principal, &Permission::card_read())
+            .into_result()
+            .is_err(),
+        "the runner may not read Cards"
     );
-    assert!(read.contains("is not an Agent"), "{read}");
-    let read = reason(
-        PromptCardResolver::resolve(&readable, card)
-            .await
-            .expect_err("an Artifact is not a Prompt"),
-    );
-    assert!(read.contains("is not a Prompt"), "{read}");
+    AgentCardResolver::resolve(&registry(Some(runner.clone())), &agent)
+        .await
+        .expect("the exact Agent resolves");
+    PromptCardResolver::resolve(&registry(Some(runner.clone())), &prompt)
+        .await
+        .expect("its exact Prompt resolves");
 
-    for caller in [
-        Some(user(tenant, [])),
-        Some(user(other, [Permission::card_read()])),
-        None,
+    let mismatched = exact("Agent", "reviewer", registered.card.uid.as_ref());
+    for (caller, reference) in [
+        (Some(runner.clone()), &registered.card),
+        (Some(runner), &mismatched),
+        (Some(user(tenant, [Permission::card_read()])), &agent),
+        (
+            Some(user(other, [Permission::verifier_run(verifier.clone())])),
+            &agent,
+        ),
     ] {
-        let refused = reason(
-            AgentCardResolver::resolve(&registry(caller), card)
-                .await
-                .expect_err("refused"),
+        let refused = AgentCardResolver::resolve(&registry(caller), reference)
+            .await
+            .expect_err("unavailable");
+        assert!(
+            matches!(&refused, BlockError::Unavailable { reason } if reason.contains("is unavailable")),
+            "{refused}"
         );
-        assert!(!refused.contains("is not an Agent"), "{refused}");
     }
+    let refused = AgentCardResolver::resolve(&registry(None), &agent)
+        .await
+        .expect_err("no caller");
+    assert!(matches!(refused, BlockError::Terminal { .. }), "{refused}");
+
+    let mut conn = registered
+        .server
+        .tenant_conn_for(tenant)
+        .await
+        .expect("tenant connection");
+    sqlx::query("UPDATE wyrd.cards SET status = 'deleted' WHERE card_uid = $1")
+        .bind(uid.as_uuid())
+        .execute(&mut **conn.transaction())
+        .await
+        .expect("the Agent is deleted");
+    conn.commit().await.expect("deletion commits");
+    let deleted = AgentCardResolver::resolve(
+        &registry(Some(user(
+            tenant,
+            [Permission::verifier_run(verifier.clone())],
+        ))),
+        &agent,
+    )
+    .await
+    .expect_err("a deleted Agent is unavailable");
+    assert!(
+        matches!(deleted, BlockError::Unavailable { .. }),
+        "{deleted}"
+    );
 }
 
 /// Hosted limits of a one-worker pool with no waiters and one workspace, so
@@ -1314,11 +1365,13 @@ async fn artifact_evidence_is_admitted_against_its_slot_and_the_combined_limit()
         let (caller, state) = (&caller, registered.server.state());
         async move {
             let routes = BTreeMap::new();
+            let verifier = CardUid::from_uuid(uuid::Uuid::now_v7()).expect("uid");
             blocks
                 .engine(
                     state,
                     Execution {
                         caller,
+                        verifier: &verifier,
                         evidence: &evidence,
                         routes: &routes,
                         subject: GatewayCallContext::default(),

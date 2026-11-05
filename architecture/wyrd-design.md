@@ -1781,6 +1781,11 @@ Public invocation checks `verifier:run` against the selected Verifier's exact
 Card UID. `PermissionScope::Verifier(CardUid)` names one UID; `All` covers
 every Verifier in the tenant. Permission is checked before execution and the
 decision is audited. A binding does not replace the invocation permission.
+The engine loads the executing Verifier's exact Agent and Prompt Cards under
+the same audited `verifier:run`, never `cards:read`; a referenced definition
+that is deleted, mismatched, or otherwise unreadable when its work starts ends
+the execution errored with `capability_unavailable` instead of judging the
+work, and its committed checkpoints stay readable.
 Planning and every follow-up operation on a File upload (part URL, local
 transfer, completion, abort) stage bytes and select no Verifier, so they
 require only operation-level `verifier:run` admission: any `verifier:run`

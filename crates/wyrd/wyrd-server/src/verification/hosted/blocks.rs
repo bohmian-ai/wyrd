@@ -27,7 +27,7 @@ use vala_verify::blocks::{
 use wyrd_spec::card::agent::ExecutionRoute;
 use wyrd_spec::card::verifier::{Action, Check};
 use wyrd_spec::error::WyrdError;
-use wyrd_spec::ids::{ExecutionId, SlotName};
+use wyrd_spec::ids::{CardUid, ExecutionId, SlotName};
 use wyrd_spec::verification::TaskId;
 use wyrd_spec::verification::execution::InputDeclaration;
 
@@ -62,6 +62,9 @@ pub struct Execution<'a> {
     /// The accepted authority every Card, evidence, query, tool, and model
     /// call is authorized and audited as.
     pub caller: &'a Caller,
+    /// The executing Verifier, whose `verifier:run` authorizes loading its
+    /// Agent and Prompt definitions.
+    pub verifier: &'a CardUid,
     /// The execution's pinned evidence, the only citable sources.
     pub evidence: &'a BTreeMap<SlotName, InputDeclaration>,
     /// Per-requirement or per-step Agent route overrides.
@@ -124,7 +127,8 @@ impl HostedBlocks {
     /// gateway caller are all bound to `execution.caller`; the evidence
     /// reader also admits the pinned evidence before any block runs, and
     /// every block's run interval is recorded on `execution.clock`; Agent and Prompt
-    /// Cards resolve through the caller's audited `card:read`, and every
+    /// Cards resolve through the caller's audited `verifier:run` on
+    /// `execution.verifier`, and every
     /// model call goes through the in-process gateway as that caller,
     /// attributed to `execution.subject`.
     ///
@@ -147,7 +151,11 @@ impl HostedBlocks {
             Some(id) => evidence.with_execution(id),
             None => evidence,
         });
-        let registry = Arc::new(TenantRegistry::new(state.clone(), Some(caller.clone())));
+        let registry = Arc::new(TenantRegistry::new(
+            state.clone(),
+            Some(caller.clone()),
+            execution.verifier.clone(),
+        ));
         let agent = AgentExecutor::new(
             Arc::default(),
             Arc::clone(&registry) as Arc<dyn AgentCardResolver>,

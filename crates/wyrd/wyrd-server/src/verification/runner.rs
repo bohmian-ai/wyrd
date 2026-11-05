@@ -108,6 +108,9 @@ pub const INPUT_INVALID: &str = "input_invalid";
 /// Stable error code when the evidence metadata admission needs could not
 /// be read, so no block ran.
 pub const EVIDENCE_UNAVAILABLE: &str = "evidence_unavailable";
+/// Stable error code when an exact Agent or Prompt Card the Verifier
+/// requires is unavailable, such as deleted before its work started.
+pub const CAPABILITY_UNAVAILABLE: &str = "capability_unavailable";
 /// Stable error code when the tenant has no active `UUIDv7` SYSTEM principal
 /// to execute and attribute the result as.
 pub const SYSTEM_PRINCIPAL_MISSING: &str = "system_principal_missing";
@@ -504,6 +507,7 @@ impl VerifierRunner {
             &self.state,
             Execution {
                 caller: &caller,
+                verifier: &run.verifier_card_uid,
                 evidence: &evidence,
                 routes: &routes,
                 subject: GatewayCallContext {
@@ -1103,6 +1107,10 @@ fn engine_failure(run: &ClaimedExecution, error: &EngineError) -> EngineOutcome 
             RUNTIME_BUSY,
             "a verification block was refused process capacity",
         )),
+        EngineError::DefinitionUnavailable(reason) => EngineOutcome::Terminal(
+            TerminalStatus::Errored,
+            failure(CAPABILITY_UNAVAILABLE, reason),
+        ),
         EngineError::InputInvalid(reason) | EngineError::InputTooLarge(reason) => {
             EngineOutcome::Terminal(TerminalStatus::Errored, failure(INPUT_INVALID, reason))
         }

@@ -193,6 +193,11 @@ pub enum EngineError {
     /// exists, so the host may run the whole execution again later.
     #[error("a verification block was refused process capacity: {0}")]
     Busy(String),
+    /// An exact definition a block requires is unavailable
+    /// ([`BlockError::Unavailable`]); unfinished work was cancelled, no
+    /// verdict exists, and the execution cannot run as declared.
+    #[error("a required verification definition is unavailable: {0}")]
+    DefinitionUnavailable(String),
     /// A block's invocation record or settlement could not commit, so its
     /// work is not durable; unfinished work was cancelled and the host may
     /// run the execution again.
@@ -480,7 +485,8 @@ impl VerificationEngine {
     /// the verdict, [`EngineError::Capture`] when an actual value cannot be
     /// hashed, [`EngineError::Join`] when a block task panics, and
     /// [`EngineError::Busy`] when any action or check is refused process
-    /// capacity.
+    /// capacity, and [`EngineError::DefinitionUnavailable`] when one's exact
+    /// definition is unavailable.
     ///
     /// # Cancellation
     /// Dropping the future, or the deadline expiring, aborts every running
@@ -633,8 +639,8 @@ impl VerificationEngine {
     /// share one ledger.
     ///
     /// # Errors
-    /// Returns [`EngineError::Capture`], [`EngineError::Join`], or
-    /// [`EngineError::Busy`].
+    /// Returns [`EngineError::Capture`], [`EngineError::Join`],
+    /// [`EngineError::Busy`], or [`EngineError::DefinitionUnavailable`].
     ///
     /// # Panics
     /// Panics when `plan` names a step `spec` does not declare.
@@ -690,7 +696,8 @@ impl VerificationEngine {
     /// Prepare one step: a step whose bindings or `when` leave a gap is
     /// skipped with that gap, otherwise its action runs under the
     /// concurrency bound. A running action refused process capacity fails the
-    /// stage with [`EngineError::Busy`].
+    /// stage with [`EngineError::Busy`], and one whose exact definition is
+    /// unavailable with [`EngineError::DefinitionUnavailable`].
     ///
     /// # Panics
     /// Panics when `index` is not a declared step of `spec`.
@@ -733,7 +740,8 @@ impl VerificationEngine {
     /// # Errors
     /// Returns [`EngineError::Capture`] when an actual value cannot be
     /// hashed; the prepared check fails with [`EngineError::Busy`] when it is
-    /// refused process capacity.
+    /// refused process capacity and [`EngineError::DefinitionUnavailable`]
+    /// when its exact definition is unavailable.
     ///
     /// # Panics
     /// Panics when `key` does not name a requirement of `spec`.
@@ -768,9 +776,11 @@ impl VerificationEngine {
                     engine.begin(&requirement.id, attempt).await?;
                     let step = key.0.map(|index| &spec.steps[index].id);
                     let judged = match engine.judge(requirement, step, inputs, deadline).await {
-                        Err(EngineError::Busy(reason)) => {
+                        Err(
+                            error @ (EngineError::Busy(_) | EngineError::DefinitionUnavailable(_)),
+                        ) => {
                             engine.forget(&requirement.id, attempt).await?;
-                            return Err(EngineError::Busy(reason));
+                            return Err(error);
                         }
                         judged => judged?,
                     };
@@ -805,8 +815,10 @@ impl VerificationEngine {
     ///
     /// # Errors
     /// Returns [`EngineError::Busy`] as soon as an attempt is refused process
-    /// capacity, without spending the step's retries or settling the step,
-    /// and [`EngineError::Checkpoint`] when an attempt cannot be recorded.
+    /// capacity and [`EngineError::DefinitionUnavailable`] as soon as its
+    /// exact definition is unavailable, either without spending the step's
+    /// retries or settling the step, and [`EngineError::Checkpoint`] when an
+    /// attempt cannot be recorded.
     #[tracing::instrument(
         name = "verification.block",
         level = "debug",
@@ -861,6 +873,10 @@ impl VerificationEngine {
                     self.forget(&step.id, attempts).await?;
                     return Err(EngineError::Busy(reason));
                 }
+                Err(BlockError::Unavailable { reason }) => {
+                    self.forget(&step.id, attempts).await?;
+                    return Err(EngineError::DefinitionUnavailable(reason));
+                }
                 Err(error) if error.is_retryable() && attempts <= step.retries => {
                     tracing::debug!(step = step.id.as_str(), attempts, %error, "retrying step");
                 }
@@ -888,7 +904,8 @@ impl VerificationEngine {
     ///
     /// # Errors
     /// Returns [`EngineError::Busy`] when an Agent or code check is refused
-    /// process capacity, which is never judged, and
+    /// process capacity and [`EngineError::DefinitionUnavailable`] when its
+    /// exact definition is unavailable, neither of which is judged, and
     /// [`EngineError::EvidenceUnavailable`] when a deferring engine's trace
     /// has not landed yet.
     #[tracing::instrument(
@@ -953,6 +970,10 @@ impl VerificationEngine {
                     Err(BlockError::Busy { reason }) => {
                         timer.finish(false);
                         return Err(EngineError::Busy(reason));
+                    }
+                    Err(BlockError::Unavailable { reason }) => {
+                        timer.finish(false);
+                        return Err(EngineError::DefinitionUnavailable(reason));
                     }
                     Err(error) => (Judged::inconclusive(reason(&error)), false),
                 }
@@ -1487,7 +1508,8 @@ fn reason(error: &BlockError) -> String {
     match error {
         BlockError::Retryable { reason }
         | BlockError::Terminal { reason }
-        | BlockError::Busy { reason } => reason.clone(),
+        | BlockError::Busy { reason }
+        | BlockError::Unavailable { reason } => reason.clone(),
     }
 }
 

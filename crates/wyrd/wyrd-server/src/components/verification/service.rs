@@ -554,6 +554,7 @@ impl<'a> VerificationControl<'a> {
             self.state,
             Execution {
                 caller: &executor,
+                verifier: &request.verifier_card_uid,
                 evidence: &request.inputs,
                 routes: &request.execution_route_overrides,
                 subject: GatewayCallContext {
@@ -625,6 +626,9 @@ impl<'a> VerificationControl<'a> {
                         details: serde_json::json!({ "reason": reason }),
                     }),
                 );
+            }
+            Err(EngineError::DefinitionUnavailable(reason)) => {
+                return ("errored", Err(WyrdError::registry_card_not_found(reason)));
             }
             Err(EngineError::EvidenceUnavailable(reason)) => {
                 return (

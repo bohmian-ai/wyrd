@@ -168,6 +168,17 @@ pub enum BlockError {
         /// Bounded, secret-free cause.
         reason: String,
     },
+    /// An exact definition the block requires, such as its Agent or Prompt
+    /// Card, is unavailable.
+    ///
+    /// The block cannot run as declared, so it is never judged and spends
+    /// no authored retry: the engine stops the whole execution with
+    /// [`EngineError::DefinitionUnavailable`].
+    #[error("a required definition is unavailable: {reason}")]
+    Unavailable {
+        /// Bounded, secret-free cause naming the definition.
+        reason: String,
+    },
 }
 
 impl BlockError {

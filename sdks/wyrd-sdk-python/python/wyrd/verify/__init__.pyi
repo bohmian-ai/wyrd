@@ -464,6 +464,8 @@ class DownloadPlan(TypedDict):
     """Where to fetch the bytes."""
 
     get_url: str
+    ttl_secs: int
+    """URL lifetime in seconds; ``0`` for the local server route, which does not expire."""
 
 class DownloadInit(TypedDict):
     """``Execution.download()``: the plan, size, and base64 SHA-256 of one retained file."""

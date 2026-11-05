@@ -19,6 +19,7 @@ if TYPE_CHECKING:
     from wyrd.cards import JsonValue
     from wyrd.verify import (
         Check,
+        DownloadInit,
         ExecutionState,
         InputDeclaration,
         RequirementResult,
@@ -37,6 +38,17 @@ def returned_records_are_typed(execution: Execution, result: VerificationResult)
     if "result" in state:
         assert_type(state["result"], VerificationResultWire)
         assert_type(state["result"]["outcome"]["verdict"], VerificationVerdict)
+
+
+def the_actual_download_shape_is_accepted(execution: Execution) -> int:
+    local: DownloadInit = {
+        "plan": {"get_url": "/v1/verifier-executions/content", "ttl_secs": 0},
+        "size_bytes": 4,
+        "sha256": "n4bQgYhMfWWaL+qgxVrQFaO/TxsrC4Is0V1sFbDwCgg=",
+    }
+    expiry = execution.download({"step_id": "review", "attempt": 1}, "report")["plan"]["ttl_secs"]
+    assert_type(expiry, int)
+    return local["plan"]["ttl_secs"] + expiry
 
 
 class Judge(BaseModel):

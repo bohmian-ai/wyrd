@@ -27,7 +27,8 @@ use serde_json::Error as JsonError;
 use vala_bifrost_redux::tables::DomainTable;
 use vala_bifrost_redux::tables::staged::{Cell, StagedRow};
 use vala_bifrost_redux::tables::verification::{
-    ACTIVATION, ExecutionInputsTable, ExecutionOutputsTable, INPUTS, OUTPUT, ResultsTable,
+    ACTIVATION, ExecutionEventsTable, ExecutionInputsTable, ExecutionOutputsTable, INPUTS, OUTPUT,
+    ResultsTable, VALUE,
 };
 use wyrd_queue::variant::EncodedVariant;
 use wyrd_runtime::request_context::AcceptedAuthority;
@@ -44,7 +45,7 @@ use wyrd_spec::verification::execution::{
     InputDeclaration, RequirementResult, StepResult, VerificationOutcome,
 };
 use wyrd_spec::verification::{DriftWindow, FrozenTarget, VerificationVerdict};
-use wyrd_sql::queries::verifier_executions::Submission;
+use wyrd_sql::queries::verifier_executions::{ExecutionEvent, Submission};
 
 use super::inputs::{GroupSelector, InputOrigin, ScheduleSelector};
 
@@ -89,7 +90,7 @@ type NamedColumn = (&'static str, Cell);
 /// Each result row is staged on its own until the Scribe outbox builds a
 /// slice of them into one batch, so one shared schema lets the outbox group
 /// rows by pointer and spares every row its own field allocations.
-static SCHEMAS: LazyLock<[(TypeId, String, SchemaRef); 3]> = LazyLock::new(|| {
+static SCHEMAS: LazyLock<[(TypeId, String, SchemaRef); 4]> = LazyLock::new(|| {
     /// `T`'s name and fields followed by the correlation columns, keyed by `T`.
     fn schema<T: DomainTable + 'static>() -> (TypeId, String, SchemaRef) {
         let mut fields = T::arrow_fields();
@@ -104,6 +105,7 @@ static SCHEMAS: LazyLock<[(TypeId, String, SchemaRef); 3]> = LazyLock::new(|| {
         schema::<ResultsTable>(),
         schema::<ExecutionOutputsTable>(),
         schema::<ExecutionInputsTable>(),
+        schema::<ExecutionEventsTable>(),
     ]
 });
 
@@ -408,6 +410,49 @@ impl<'a> ResultPayloadBuilder<'a> {
             (INPUTS, inputs),
             (ACTIVATION, variant(ACTIVATION, activation.as_ref())?),
             ("recorded_at", time(Some(self.started_at))),
+        ])
+    }
+
+    /// One committed execution event's
+    /// `bifrost.verification.execution_events` row, carrying the run's
+    /// shared dimensions and correlation columns.
+    ///
+    /// # Errors
+    /// Returns a Variant error when a JSON publication's value cannot be
+    /// encoded, and the [`Self::finish`] errors.
+    pub fn event(&self, event: &ExecutionEvent) -> Result<ResultRow, ResultPayloadError> {
+        let int = |value: Option<i32>| Cell::Int(value.map(i64::from));
+        self.finish::<ExecutionEventsTable>(vec![
+            ("event_id", Cell::text(Some(event.event_id.to_string()))),
+            (
+                "execution_id",
+                Cell::text(Some(self.run.execution_id.to_string())),
+            ),
+            ("sequence", Cell::Int(Some(event.sequence))),
+            ("event", Cell::text(Some(event.event.as_str()))),
+            ("status", Cell::text(event.status.as_deref())),
+            (
+                "verifier_card_uid",
+                Cell::text(Some(self.verifier_uid.as_str())),
+            ),
+            ("step_id", Cell::text(event.task_id.as_deref())),
+            ("item_index", int(event.item_index)),
+            ("iteration_index", int(event.iteration_index)),
+            ("attempt", int(event.attempt)),
+            (
+                "publication_name",
+                Cell::text(event.publication_name.as_deref()),
+            ),
+            (
+                "publication_kind",
+                Cell::text(event.publication_kind.as_deref()),
+            ),
+            ("size_bytes", Cell::Int(event.size_bytes)),
+            ("file_count", int(event.file_count)),
+            ("sha256", Cell::text(event.sha256.as_deref())),
+            ("reason", Cell::text(event.reason.as_deref())),
+            (VALUE, variant(VALUE, event.value.as_ref())?),
+            ("occurred_at", time(Some(event.occurred_at))),
         ])
     }
 

@@ -42,8 +42,8 @@ use crate::oracle::{AuthorizedQueryContext, OracleQueryStream, QueryStreamLifecy
 pub use crate::otlp_contract::{IngestOutcome, LogsOutcome, MetricsOutcome};
 use crate::scribe::preprocess::logical_data_identity;
 use crate::tables::{
-    CallsTable, DomainTable, ExecutionInputsTable, ExecutionOutputsTable, ObjectsTable,
-    ResultsTable, SeriesTable, TableError,
+    CallsTable, DomainTable, ExecutionEventsTable, ExecutionInputsTable, ExecutionOutputsTable,
+    ObjectsTable, ResultsTable, SeriesTable, TableError,
 };
 use wyrd_runtime::principal::CardAttribution;
 use wyrd_spec::auth::Attribution;
@@ -1132,8 +1132,8 @@ impl<A: GateAudit + 'static> Gate<A> {
     }
 }
 
-/// Whether `table` is one of the verification result or input tables only the
-/// server's internal writer writes.
+/// Whether `table` is one of the verification result, input, or event tables
+/// only the server's internal writer writes.
 ///
 /// The set is closed and owned by the table definitions themselves, so a
 /// renamed result table cannot silently fall out of the reservation.
@@ -1145,6 +1145,7 @@ fn is_verification_result_table(table: &TableRef) -> bool {
             ExecutionOutputsTable::NAMESPACE,
             ExecutionOutputsTable::NAME,
         ),
+        (ExecutionEventsTable::NAMESPACE, ExecutionEventsTable::NAME),
     ]
     .into_iter()
     .any(|(namespace, name)| {
@@ -2770,6 +2771,7 @@ mod tests {
             "bifrost.verification.results",
             "bifrost.verification.execution_inputs",
             "bifrost.verification.execution_outputs",
+            "bifrost.verification.execution_events",
             "bifrost.metrics.series",
         ] {
             for (label, auth) in &principals {

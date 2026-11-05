@@ -20,6 +20,7 @@ pub mod fault;
 pub mod fitter;
 pub mod groups;
 pub mod health;
+mod history;
 pub mod hosted;
 pub mod inputs;
 mod leases;

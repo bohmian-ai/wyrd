@@ -23,8 +23,8 @@ pub enum Cell {
     Text(Option<Box<str>>),
     /// A boolean value.
     Flag(bool),
-    /// A 64-bit integer value.
-    Int(i64),
+    /// A 64-bit integer value, or null.
+    Int(Option<i64>),
     /// A microsecond timestamp, or null; the column's declared type carries
     /// its time zone.
     Micros(Option<i64>),
@@ -43,7 +43,7 @@ impl Cell {
     fn is_null(&self) -> bool {
         matches!(
             self,
-            Self::Text(None) | Self::Micros(None) | Self::Variant(None)
+            Self::Text(None) | Self::Int(None) | Self::Micros(None) | Self::Variant(None)
         )
     }
 
@@ -202,7 +202,7 @@ impl StagedRow {
                 let mut column = Int64Builder::with_capacity(rows.len());
                 for cell in cells {
                     if let Cell::Int(value) = cell {
-                        column.append_value(*value);
+                        column.append_option(*value);
                     }
                 }
                 Arc::new(column.finish())
@@ -281,21 +281,21 @@ mod tests {
                 Cell::Flag(true),
                 Cell::Micros(Some(7)),
                 Cell::Variant(Some(detail.clone())),
-                Cell::Int(-3),
+                Cell::Int(Some(-3)),
             ],
             vec![
                 Cell::text(None::<&str>),
                 Cell::Flag(false),
                 Cell::Micros(None),
                 Cell::Variant(None),
-                Cell::Int(0),
+                Cell::Int(Some(0)),
             ],
             vec![
                 Cell::text(Some("")),
                 Cell::Flag(true),
                 Cell::Micros(Some(9)),
                 Cell::Variant(None),
-                Cell::Int(i64::MAX),
+                Cell::Int(Some(i64::MAX)),
             ],
         ]
         .map(|cells| StagedRow::new(Arc::clone(&schema), cells).expect("row stages"));
@@ -340,7 +340,7 @@ mod tests {
                     Cell::Flag(true),
                     Cell::Micros(None),
                     Cell::Variant(None),
-                    Cell::Int(0)
+                    Cell::Int(Some(0))
                 ],
             )
             .is_err(),
@@ -354,11 +354,41 @@ mod tests {
                     Cell::Micros(None),
                     Cell::Micros(None),
                     Cell::Variant(None),
-                    Cell::Int(0)
+                    Cell::Int(Some(0))
                 ],
             )
             .is_err(),
             "a null in a required column is refused"
+        );
+        let counts = Arc::new(Schema::new(vec![Field::new(
+            "count",
+            DataType::Int64,
+            true,
+        )]));
+        let counted = [Some(4), None].map(|count| {
+            StagedRow::new(Arc::clone(&counts), vec![Cell::Int(count)]).expect("row stages")
+        });
+        let projected = StagedRow::project(&counted).expect("rows project");
+        assert_eq!(
+            projected
+                .column(0)
+                .as_primitive::<arrow::datatypes::Int64Type>()
+                .iter()
+                .collect::<Vec<_>>(),
+            [Some(4), None],
+            "a nullable integer keeps its null"
+        );
+        assert!(
+            StagedRow::new(
+                Arc::new(Schema::new(vec![Field::new(
+                    "size",
+                    DataType::Int64,
+                    false
+                )])),
+                vec![Cell::Int(None)]
+            )
+            .is_err(),
+            "a null integer in a required column is refused"
         );
     }
 }

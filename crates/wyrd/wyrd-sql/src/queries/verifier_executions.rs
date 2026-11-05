@@ -45,6 +45,10 @@ use wyrd_spec::verification::{
 };
 use wyrd_spec::verification::{PublicationName, TaskId};
 
+mod events;
+
+pub use events::{EventBatch, ExecutionEvent, ProjectionPosition};
+
 use crate::queries::verification::{BindingSchedule, InactivityTimeout, binding_activity};
 use crate::{OperatorPool, TenantConn};
 

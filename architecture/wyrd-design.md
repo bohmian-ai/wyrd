@@ -1840,7 +1840,10 @@ inputs by execution ID (a group's resolved slot lists; an empty map for
 scheduled Drift). PostgreSQL stores no input values; a queued execution's
 selected `result_id` stays authoritative. A direct execution has no queue
 row: its status is read from records whose input origin is `direct`, and is
-`completed` once they are visible. Unknown IDs remain not found.
+`completed` once they are visible. Unknown IDs remain not found. A queued
+execution's progress history is projected into
+`bifrost.verification.execution_events` (see the Bifrost design); it is
+history only, never an input to a result.
 
 Every work record names who the work was for (`sub_principal_id`) and who
 performed it (`act_principal_id`). A direct caller A records A/A and a

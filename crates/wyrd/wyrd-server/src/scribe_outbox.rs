@@ -1,5 +1,6 @@
 //! The process's one Scribe-bound outbox: audit decisions, gateway capture,
-//! Verifier execution inputs and results, and tenant copies of server spans.
+//! Verifier execution inputs, results, and history, and tenant copies of
+//! server spans.
 //!
 //! Producers stage logical [`ScribeWrite`] values on [`ScribeOutbox`] and
 //! return at once. The outbox writer hands each tenant's pending slice to
@@ -35,6 +36,12 @@
 //! row acknowledged, the sink stages it as [`Acknowledged`] work on the
 //! [`SubmissionOutbox`] that admits it into the durable queue, so no
 //! execution is queued before its inputs are durable.
+//!
+//! A batch of Verifier execution events is the one write whose frame is not
+//! derived from its slice: it travels alone under the batch identity the
+//! execution queue persisted before staging it, so a resubmission from any
+//! process is deduplicated, and its acknowledgement is reported back to the
+//! projector that persisted it.
 //!
 //! A sink given the Wyrd Postgres owner also schedules grouped verification:
 //! once a slice's frames are acknowledged, every grouped inputs or result row
@@ -76,8 +83,8 @@ use vala_bifrost_redux::tables::staged::StagedRow;
 use vala_bifrost_redux::tables::storage::ObjectsTable;
 use vala_bifrost_redux::tables::traces::project_resource_spans;
 use vala_bifrost_redux::tables::{
-    AuditLogTable, DomainTable, ExecutionInputsTable, ExecutionOutputsTable, ResultsTable,
-    SpansTable,
+    AuditLogTable, DomainTable, ExecutionEventsTable, ExecutionInputsTable, ExecutionOutputsTable,
+    ResultsTable, SpansTable,
 };
 use wyrd_runtime::outbox::{LossReason, Outbox, OutboxLimits, OutboxSink, Reservation, count_lost};
 use wyrd_runtime::{PermissionSet, Principal, PrincipalKind};
@@ -245,6 +252,23 @@ pub enum ScribeWrite {
         /// sender instead. Firing never blocks, so the waiting caller holds
         /// no other write. Taken under its lock because the sink sees the
         /// slice by reference.
+        acked: Mutex<Option<oneshot::Sender<()>>>,
+    },
+    /// One persisted batch of a tenant's Verifier execution events, staged
+    /// as `bifrost.verification.execution_events` rows.
+    ///
+    /// The batch is its own frame, identified by `batch` rather than by the
+    /// slice, so every submission of it, by any process, carries one batch
+    /// identity and Scribe's batch-id dedup absorbs a resubmission.
+    ExecutionEvents {
+        /// The persisted batch identity.
+        batch: Uuid,
+        /// Each event's row and the execution's subject and actor, which
+        /// Scribe stamps on it, in sequence order.
+        rows: Vec<(StagedRow, Attribution)>,
+        /// Fired once Scribe acknowledges the whole batch, and only then; a
+        /// rejected, unprojectable, or dropped write drops the sender
+        /// instead.
         acked: Mutex<Option<oneshot::Sender<()>>>,
     },
 }
@@ -433,6 +457,14 @@ impl ScribeWrite {
                 attribution: *attribution,
                 part: Part::Row(row.clone()),
             }]),
+            Self::ExecutionEvents { rows, .. } => Ok(rows
+                .iter()
+                .map(|(row, attribution)| Rows {
+                    table: ScribeTable::ExecutionEvents,
+                    attribution: *attribution,
+                    part: Part::Row(row.clone()),
+                })
+                .collect()),
         }
     }
 
@@ -454,7 +486,11 @@ impl ScribeWrite {
                 .iter()
                 .find(|row| ScribeTable::from_fqn(row.table) == Some(ScribeTable::Results))
                 .map(|row| &row.row)?,
-            Self::Audit(_) | Self::Capture(_) | Self::ServerSpans { .. } | Self::Object { .. } => {
+            Self::Audit(_)
+            | Self::Capture(_)
+            | Self::ServerSpans { .. }
+            | Self::Object { .. }
+            | Self::ExecutionEvents { .. } => {
                 return None;
             }
         };
@@ -470,7 +506,7 @@ impl ScribeWrite {
 }
 
 /// The destinations the Scribe outbox writes: retained audit history, the two
-/// gateway capture tables, the three Verifier tables, and the storage object
+/// gateway capture tables, the four Verifier tables, and the storage object
 /// inventory.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ScribeTable {
@@ -489,11 +525,13 @@ pub enum ScribeTable {
     ExecutionInputs,
     /// `bifrost.storage.objects`, one row per completed or deleted object.
     Objects,
+    /// `bifrost.verification.execution_events`, one row per execution event.
+    ExecutionEvents,
 }
 
 impl ScribeTable {
     /// Every destination, in a fixed order.
-    const ALL: [Self; 7] = [
+    const ALL: [Self; 8] = [
         Self::AuditLog,
         Self::Calls,
         Self::Spans,
@@ -501,6 +539,7 @@ impl ScribeTable {
         Self::ExecutionOutputs,
         Self::ExecutionInputs,
         Self::Objects,
+        Self::ExecutionEvents,
     ];
 
     /// Fully qualified table name, which the peer RPC carries.
@@ -514,6 +553,7 @@ impl ScribeTable {
             Self::ExecutionOutputs => "bifrost.verification.execution_outputs",
             Self::ExecutionInputs => "bifrost.verification.execution_inputs",
             Self::Objects => "bifrost.storage.objects",
+            Self::ExecutionEvents => "bifrost.verification.execution_events",
         }
     }
 
@@ -542,6 +582,9 @@ impl ScribeTable {
                 TableRef::new(BifrostNamespace::Verification, ExecutionInputsTable::NAME)
             }
             Self::Objects => TableRef::new(BifrostNamespace::Storage, ObjectsTable::NAME),
+            Self::ExecutionEvents => {
+                TableRef::new(BifrostNamespace::Verification, ExecutionEventsTable::NAME)
+            }
         }
     }
 }
@@ -1107,6 +1150,10 @@ pub(crate) type Owner = (usize, Attribution);
 
 /// One frame being assembled from consecutive rows of one destination.
 struct Frame {
+    /// Persisted identity of a frame that is one write's own batch, which
+    /// replaces the slice's idempotency key and position in its batch ids;
+    /// `None` for a frame shared by the slice's writes.
+    key: Option<Uuid>,
     /// Destination table.
     table: ScribeTable,
     /// The rows, all of one schema.
@@ -1133,6 +1180,7 @@ impl Frame {
                 frame.owners.extend(owners);
             }
             None => frames.push(Self {
+                key: None,
                 table,
                 parts: vec![part],
                 owners,
@@ -1143,7 +1191,7 @@ impl Frame {
     /// Whether `part`, bound for `table`, shares this frame's destination
     /// and schema, so one Scribe frame can carry both.
     fn shares(&self, table: ScribeTable, part: &Part) -> bool {
-        self.table == table && {
+        self.key.is_none() && self.table == table && {
             let (ours, theirs) = (self.parts[0].schema(), part.schema());
             Arc::ptr_eq(ours, theirs) || ours == theirs
         }
@@ -1184,6 +1232,20 @@ impl ScribeSink {
         for (index, item) in items.iter().enumerate() {
             if let ScribeWrite::Capture(capture) = item {
                 captures.push((index, capture));
+                continue;
+            }
+            if let ScribeWrite::ExecutionEvents { batch, rows, .. } = item {
+                if !rows.is_empty() {
+                    frames.push(Frame {
+                        key: Some(*batch),
+                        table: ScribeTable::ExecutionEvents,
+                        parts: rows.iter().map(|(row, _)| Part::Row(row.clone())).collect(),
+                        owners: rows
+                            .iter()
+                            .map(|(_, attribution)| (index, *attribution))
+                            .collect(),
+                    });
+                }
                 continue;
             }
             let rows = match item.rows() {
@@ -1516,10 +1578,11 @@ impl ScribeSink {
         let mut in_flight = FuturesUnordered::new();
         let mut refused = None;
         let chunks = frames.iter().enumerate().flat_map(|(index, frame)| {
+            let (key, place) = frame.key.map_or((slice, first + index), |key| (key, 0));
             Self::chunks(frame, budget)
                 .into_iter()
                 .enumerate()
-                .map(move |(chunk, rows)| ((slice, first + index, chunk), rows))
+                .map(move |(chunk, rows)| ((key, place, chunk), rows))
         });
         for (origin, chunk) in chunks {
             if in_flight.len() == FRAMES_IN_FLIGHT
@@ -1673,7 +1736,9 @@ impl OutboxSink for ScribeSink {
             } => return SubmissionSink::admission_lane(&queued.admission),
             ScribeWrite::ExecutionInputs { row, .. } => row.row.text("execution_id"),
             ScribeWrite::Object { row, .. } => row.text("storage_path"),
-            ScribeWrite::Audit(None) | ScribeWrite::ServerSpans { .. } => None,
+            ScribeWrite::Audit(None)
+            | ScribeWrite::ServerSpans { .. }
+            | ScribeWrite::ExecutionEvents { .. } => None,
         };
         key.map_or(0, |key| {
             let mut hasher = DefaultHasher::new();
@@ -1695,6 +1760,9 @@ impl OutboxSink for ScribeSink {
             }
             ScribeWrite::ExecutionInputs { row, .. } => row.owned_bytes(),
             ScribeWrite::Object { row, .. } => row.owned_bytes(),
+            ScribeWrite::ExecutionEvents { rows, .. } => {
+                rows.iter().map(|(row, _)| row.owned_bytes()).sum()
+            }
             ScribeWrite::ServerSpans { spans, .. } => spans.encoded_len(),
         }
     }
@@ -1758,6 +1826,16 @@ impl OutboxSink for ScribeSink {
                 && !lost.contains(&index)
             {
                 reserved.stage(tenant, Acknowledged((**queued).clone()));
+            }
+            if let ScribeWrite::ExecutionEvents { acked, .. } = item
+                && !lost.contains(&index)
+                && let Some(sender) = acked
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .take()
+            {
+                // The projector may have given up; it resubmits the batch.
+                let _ = sender.send(());
             }
         }
         Ok(())

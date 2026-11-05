@@ -80,6 +80,9 @@ const RESULTS: &str = "bifrost.verification.results";
 /// Output table every completed result's summary follows.
 const OUTPUTS: &str = "bifrost.verification.execution_outputs";
 
+/// History table execution events are projected into beside results.
+const EVENTS: &str = "bifrost.verification.execution_events";
+
 /// One bound server, one seeded tenant, and the controls a runtime is built with.
 struct Harness {
     /// The production bound server whose Scribe receives results.
@@ -273,12 +276,15 @@ impl Harness {
 
     /// The destination table of every result batch the runtime submitted to
     /// Scribe once its outbox settles, in submission order, resends included.
+    /// Execution history batches are projected independently of results and
+    /// are left out.
     async fn writes(&self) -> Vec<String> {
         self.fault
             .sent()
             .await
             .into_iter()
             .map(|sent| sent.table)
+            .filter(|table| table != EVENTS)
             .collect()
     }
 

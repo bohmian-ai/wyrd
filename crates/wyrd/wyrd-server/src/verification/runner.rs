@@ -72,6 +72,7 @@ use super::completions::{self, Completions, SharedResult};
 use super::drift::DriftEngine;
 use super::engines::{self, EngineOutcome};
 use super::health::RuntimeCapability;
+use super::history::EventProjector;
 use super::hosted::blocks::{Execution, HostedBlocks};
 use super::inputs::{InputResolver, InputRow};
 use super::leases::LeaseRenewal;
@@ -192,6 +193,8 @@ pub struct VerifierRunner {
     drift: DriftEngine,
     /// Renewal of every in-flight run's lease.
     renewal: Arc<LeaseRenewal>,
+    /// Projection of committed execution events into Bifrost history.
+    history: EventProjector,
     /// Group commit of completed runs.
     completions: Completions,
     /// Runtime bounds.
@@ -257,6 +260,13 @@ impl VerifierRunner {
             ),
             renewal: Arc::new(LeaseRenewal::new(postgres.clone(), queue, limits.lease)),
             completions: Completions::new(&postgres, queue),
+            history: EventProjector::new(
+                postgres.clone(),
+                operator.clone(),
+                queue,
+                outbox.clone(),
+                limits.poll_interval,
+            ),
             drift: DriftEngine::new(state.clone(), limits.execution_timeout),
             state,
             blocks,
@@ -294,7 +304,8 @@ impl VerifierRunner {
     /// and a claim committed after `stop` is released unexecuted), executions
     /// spawned before `stop` get the drain grace to settle, and any still
     /// running are then cancelled and release their leases before this
-    /// returns. Lease renewal runs beside the loop and stops once it returns.
+    /// returns. Lease renewal and event projection run beside the loop and
+    /// stop once it returns.
     ///
     /// # Panics
     /// Panics under `test-support` when a test armed a runner crash. The
@@ -306,7 +317,11 @@ impl VerifierRunner {
             self.claims.run(&self, stop).await;
             renewing.cancel();
         };
-        tokio::join!(claims, self.renewal.run(renewing.clone()));
+        tokio::join!(
+            claims,
+            self.renewal.run(renewing.clone()),
+            self.history.run(renewing.clone())
+        );
     }
 
     /// Resolve the claimed execution's target inside the claim transaction,

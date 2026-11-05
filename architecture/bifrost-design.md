@@ -452,6 +452,20 @@ typed columns:
   Its published input timestamp is `recorded_at`, the server-recorded input
   time, distinct from execution timing or sample/window time. It uses the
   same execution/binding/application-Run correlation names where applicable.
+- `bifrost.verification.execution_events` is a queued execution's progress
+  history: one row per execution status or attempt change, invocation start,
+  settlement, or abandonment, and accepted publication, with its
+  server-assigned `event_id`, tenant-ordered `sequence`, execution, step,
+  item, iteration, and attempt, status, bounded reason, and a publication's
+  name, kind, total size, file count, file digest, and, for a JSON
+  publication, its value as the sensitive `value` Variant. It never holds
+  bytes, results, or evidence, and its `occurred_at` is not ordering. Each
+  event commits in Postgres with its transition; a projector stages it
+  through the Scribe outbox under a batch identity committed before
+  submission, so an ambiguous outcome resubmits the same batch and Scribe's
+  batch dedup absorbs it. Live progress reads from the execution records,
+  which report each execution's pending, failed, and acknowledged projection
+  position; projection lag delays history only.
 - Every nullable built-in Struct — the `bifrost.metrics.points` bucket sets and
   `bifrost.gateway.calls` `resolved_model` — has nullable children, because a
   required Parquet leaf under a null parent reads back as another row's value
@@ -461,7 +475,8 @@ typed columns:
   refuses a batch with a partial Struct before ACK with
   `WYRD_VALA_400_SCHEMA_PARSE` naming the row and child.
 - The `bifrost.verification.execution_outputs` output, the
-  `bifrost.verification.execution_inputs` inputs and activation,
+  `bifrost.verification.execution_inputs` inputs and activation, the
+  `bifrost.verification.execution_events` value,
   `bifrost.gateway.calls` `request_payload` and `response_payload`, and
   `bifrost.system.audit_log` `detail` are Variant.
 
@@ -1406,11 +1421,12 @@ to: one row per authorized request rather than continuous high-rate ingest,
 date-range rather than recent-window queries, and retention measured in years
 rather than days.
 
-The four verification tables — `bifrost.drift.observations`,
+The five verification tables — `bifrost.drift.observations`,
 `bifrost.verification.execution_inputs`, `bifrost.verification.execution_outputs`,
-and `bifrost.verification.results` — also partition by UTC day on each table's
-time column — `created_at` for observations, `recorded_at` for execution
-inputs, and `ended_at` for execution outputs and results —
+`bifrost.verification.execution_events`, and `bifrost.verification.results` —
+also partition by UTC day on each table's time column — `created_at` for
+observations, `recorded_at` for execution inputs, `occurred_at` for execution
+events, and `ended_at` for execution outputs and results —
 never by Verifier, subject, binding, or tenant ID. A Drift schedule window does
 not determine partition size. `bifrost.storage.objects` partitions by UTC day
 on `recorded_at`.
@@ -1883,9 +1899,10 @@ the namespace does not create another storage or authorization model.
 
 Permissions are scoped through `BifrostTable`, `BifrostRecord`, and
 `BifrostQuery`. Generic writes cannot target reserved or system-managed tables;
-`bifrost.gateway.calls`, the three verification tables
-(`bifrost.verification.results`, `bifrost.verification.execution_inputs`, and
-`bifrost.verification.execution_outputs`), the `bifrost.storage.objects`
+`bifrost.gateway.calls`, the four verification tables
+(`bifrost.verification.results`, `bifrost.verification.execution_inputs`,
+`bifrost.verification.execution_outputs`, and
+`bifrost.verification.execution_events`), the `bifrost.storage.objects`
 inventory, and the `bifrost.metrics.series` index, which Scribe derives from
 admitted points, accept no public write at all: Gate refuses every principal. Only
 the server-internal capture writer writes them, together with

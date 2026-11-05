@@ -45,9 +45,9 @@ use wyrd_sql::queries::verification_target::VerificationTargets;
 use wyrd_sql::queries::verifier_executions::{
     Cause, ClaimedExecution, Completion, DueSettlement, EnqueueOutcome, EnqueueRefusal,
     ExecutionAuthority, ExecutionInput, ExecutionLease, ExecutionOrigin, ExecutionStatus,
-    GroupActivity, GroupSelection, PinnedGroup, Prepared, QueueCounts, RetryOutcome,
-    ScheduleOutcome, ScheduleSkip, ScheduleTick, ScheduledAdmission, Settlement, Submission,
-    SubmissionOutcome, TerminalStatus, VerifierExecutionQueue,
+    GroupActivity, GroupSelection, InvocationEntry, Page, PagePosition, PinnedGroup, Prepared,
+    QueueCounts, RetryOutcome, ScheduleOutcome, ScheduleSkip, ScheduleTick, ScheduledAdmission,
+    Settlement, Submission, SubmissionOutcome, TerminalStatus, VerifierExecutionQueue,
 };
 use wyrd_sql::row_types::cards::CardStatus;
 
@@ -4015,4 +4015,66 @@ async fn queued_admission_preserves_tenant_and_input_identity() {
     );
     assert_eq!(pending_groups(&mut conn, group_binding).await, 0);
     conn.commit().await.expect("writer commits");
+}
+
+/// A listing keeps the cut its first page fixed: its continuation returns
+/// the next attempt in insertion order and never one begun after the first
+/// page, which a new listing does return.
+///
+/// # Panics
+/// Panics when a page skips, repeats, or reads past its cut.
+#[tokio::test]
+async fn invocation_pages_keep_their_first_cut() {
+    let fixture = PgFixture::start().await.expect("fixture starts");
+    let actor = actor(fixture.data_tenant_id());
+    let queue = VerifierExecutionQueue::default();
+    let mut conn = fixture
+        .tenant_conn()
+        .await
+        .expect("tenant connection opens");
+    let (owner, _) = declare_service(&mut conn, &actor, "svc").await;
+    let verifier = register_verifier(&mut conn, &actor, "drift", custom_drift()).await;
+    let binding = bind(&mut conn, &owner, &verifier, Vec::new()).await;
+    let execution = scheduled(&queue, &mut conn, binding).await;
+    let claimed = claim(&queue, &mut conn).await;
+    let task = |name: &str| TaskId::new(name).expect("task id");
+    for step in ["review", "judge"] {
+        queue
+            .begin_invocation(&mut conn, claimed.lease, &task(step), 1)
+            .await
+            .expect("the attempt begins");
+    }
+    let steps = |page: &Page<InvocationEntry>| -> Vec<String> {
+        page.entries
+            .iter()
+            .map(|(_, entry)| entry.producer.step_id.as_str().to_owned())
+            .collect()
+    };
+
+    let first = queue
+        .invocation_page(&mut conn, execution, None, 1)
+        .await
+        .expect("the first page reads");
+    assert_eq!(steps(&first), ["review"]);
+    queue
+        .begin_invocation(&mut conn, claimed.lease, &task("late"), 1)
+        .await
+        .expect("a later attempt begins");
+    let position = PagePosition {
+        through: first.through,
+        after: first.entries[0].0,
+    };
+    let rest = queue
+        .invocation_page(&mut conn, execution, Some(position), 10)
+        .await
+        .expect("the continuation reads");
+    assert_eq!(
+        (rest.through, steps(&rest)),
+        (first.through, vec!["judge".to_owned()])
+    );
+    let fresh = queue
+        .invocation_page(&mut conn, execution, None, 10)
+        .await
+        .expect("a new listing reads");
+    assert_eq!(steps(&fresh), ["review", "judge", "late"]);
 }

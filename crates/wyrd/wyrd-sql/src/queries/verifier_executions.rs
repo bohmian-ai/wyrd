@@ -638,6 +638,25 @@ const CANCEL_PRINCIPAL_SQL: &str = r"
        AND status IN ('pending', 'retrying', 'running')
 ";
 
+/// Which of principals `$1` are no longer active, read once every listed
+/// principal row is share-locked in a stable order.
+///
+/// The share lock conflicts with the suspension a revocation writes, so it
+/// waits out a revocation in flight and reads its committed status, and a
+/// later revocation waits for the admitting commit and then cancels what it
+/// admitted. An id with no principal row is never inactive.
+const INACTIVE_PRINCIPALS_SQL: &str = r"
+    WITH users AS (
+        SELECT id, status FROM wyrd.auth_users WHERE id = ANY($1) ORDER BY id FOR SHARE
+    ), machines AS (
+        SELECT id, status FROM wyrd.auth_service_accounts
+         WHERE id = ANY($1) ORDER BY id FOR SHARE
+    )
+    SELECT id FROM users WHERE status <> 'active'
+    UNION
+    SELECT id FROM machines WHERE status <> 'active'
+";
+
 /// Read every recorded invocation attempt of one execution, settled or not,
 /// in task and attempt order, through the invocation identity index.
 const INVOCATIONS_SQL: &str = r"
@@ -1851,7 +1870,9 @@ impl VerifierExecutionQueue {
     /// accepted submission stores its key, digest, optional Run, inputs,
     /// route overrides, cause, and accepted authority on a `pending` row due
     /// at PostgreSQL's statement time. Conflicting and refused rows never
-    /// execute or dispatch. The caller commits.
+    /// execute or dispatch. A row whose subject or accepting actor is no
+    /// longer active is cancelled before the commit, as its revocation does
+    /// (see [`Self::fence_principals`]). The caller commits.
     ///
     /// # Errors
     /// Returns the database error when a lock, read, or insert fails, or an
@@ -2106,6 +2127,43 @@ impl VerifierExecutionQueue {
             )
             .execute(&mut **conn.transaction())
             .await?;
+        self.fence_principals(conn, attributions.iter().copied())
+            .await
+    }
+
+    /// Order admissions just written for `attributions` against principal
+    /// revocation, before the caller commits.
+    ///
+    /// Share-locks every subject and accepting actor through
+    /// [`INACTIVE_PRINCIPALS_SQL`], then cancels the unfinished executions of
+    /// any no longer active, exactly as their revocation does, so a revoked
+    /// principal's delayed admission never commits runnable work. Every
+    /// submitted, scheduled, and group admission calls it after its insert.
+    ///
+    /// # Errors
+    /// Returns the database error when the lock, read, or cancellation fails.
+    async fn fence_principals(
+        &self,
+        conn: &mut TenantConn<'_>,
+        attributions: impl IntoIterator<Item = Attribution>,
+    ) -> Result<(), SqlxError> {
+        let ids: Vec<Uuid> = attributions
+            .into_iter()
+            .flat_map(|attribution| {
+                [
+                    attribution.sub_principal_id.as_uuid(),
+                    attribution.act_principal_id.as_uuid(),
+                ]
+            })
+            .collect();
+        let inactive: Vec<Uuid> = sqlx::query_scalar(INACTIVE_PRINCIPALS_SQL)
+            .bind(&ids)
+            .fetch_all(&mut **conn.transaction())
+            .await?;
+        for principal in inactive {
+            self.cancel_principal(conn, PrincipalId::new(principal))
+                .await?;
+        }
         Ok(())
     }
 
@@ -2152,7 +2210,8 @@ impl VerifierExecutionQueue {
     /// transaction and move its expected cursor.
     ///
     /// Inserts a `pending` execution under the prepared ID and frozen
-    /// identities, due at PostgreSQL's statement time. An occurrence that
+    /// identities, due at PostgreSQL's statement time, then fenced against
+    /// revocation by [`Self::fence_principals`]. An occurrence that
     /// already has an execution, including an earlier admission of this
     /// candidate, returns it as [`EnqueueOutcome::AlreadyEnqueued`]; a binding
     /// deleted since preparation is [`EnqueueRefusal::BindingNotFound`]. The
@@ -2200,6 +2259,7 @@ impl VerifierExecutionQueue {
                 .await?;
             let outcome = match inserted {
                 Some(execution_id) => {
+                    self.fence_principals(conn, [attribution]).await?;
                     EnqueueOutcome::Enqueued(stored(ExecutionId::new(execution_id))?)
                 }
                 None => {
@@ -2701,7 +2761,8 @@ impl VerifierExecutionQueue {
     /// and consume the pending activity it was selected from.
     ///
     /// Inserts a `pending` execution under the prepared ID and frozen
-    /// identities, due at PostgreSQL's statement time. A snapshot the binding
+    /// identities, due at PostgreSQL's statement time, then fenced against
+    /// revocation by [`Self::fence_principals`]. A snapshot the binding
     /// and group already hold, including an earlier admission of this
     /// candidate, returns that execution as
     /// [`EnqueueOutcome::AlreadyEnqueued`]; a binding deleted since
@@ -2751,6 +2812,7 @@ impl VerifierExecutionQueue {
                 .await?;
             let outcome = match inserted {
                 Some(execution_id) => {
+                    self.fence_principals(conn, [attribution]).await?;
                     EnqueueOutcome::Enqueued(stored(ExecutionId::new(execution_id))?)
                 }
                 None => match Self::existing_snapshot(

@@ -30,7 +30,10 @@ use wyrd_sql::queries::verifier_executions::VerifierExecutionQueue;
 ///
 /// Every unfinished Verifier execution the principal submitted or accepted is
 /// cancelled on the same connection, so no queued or running work keeps
-/// acting on authority the commit retires.
+/// acting on authority the commit retires. Every admission share-locks its
+/// principals' rows before it commits, so the suspension either waits for an
+/// admission in flight and then cancels its row, or commits first and the
+/// admission cancels its own row.
 ///
 /// The kind is a selector, not a hint: principal ids are unique only within
 /// their table, so revoking on the caller's claim rather than on whichever
@@ -96,6 +99,9 @@ pub async fn revoke_principal_in_conn(
 }
 
 /// Cancel the revoked principal's unfinished Verifier executions.
+///
+/// # Errors
+/// Returns [`WyrdError::Internal`] when the cancellation fails.
 async fn cancel_executions(
     conn: &mut TenantConn<'_>,
     target_id: PrincipalId,

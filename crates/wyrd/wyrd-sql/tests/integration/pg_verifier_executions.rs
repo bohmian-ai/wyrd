@@ -34,7 +34,9 @@ use wyrd_spec::verification::{
 };
 use wyrd_spec::verification::{PublicationName, TaskId};
 use wyrd_sql::TenantConn;
-use wyrd_sql::queries::auth::{insert_service_account, provision_system_principal};
+use wyrd_sql::queries::auth::{
+    insert_service_account, provision_system_principal, suspend_service_account_principal,
+};
 use wyrd_sql::queries::cards::{
     NewCardRow, NewDeclarationOperation, insert_card_row, insert_declaration_operation,
 };
@@ -1088,6 +1090,213 @@ async fn concurrent_keyed_writers_serialize_on_the_key() {
             }
         ]
     );
+}
+
+/// Revoke `principal` the way its revocation does: suspend the account, then
+/// cancel its unfinished executions, returning how many were cancelled.
+///
+/// # Panics
+/// Panics when the suspension or cancellation fails.
+async fn revoke(
+    queue: &VerifierExecutionQueue,
+    conn: &mut TenantConn<'_>,
+    principal: PrincipalId,
+) -> u64 {
+    assert!(
+        suspend_service_account_principal(conn, principal.as_uuid())
+            .await
+            .expect("account suspends"),
+        "the account exists"
+    );
+    queue
+        .cancel_principal(conn, principal)
+        .await
+        .expect("executions cancel")
+}
+
+/// Assert that `execution` is cancelled because its principal was revoked.
+///
+/// # Panics
+/// Panics when the execution is runnable or settled otherwise.
+async fn assert_revoked(
+    queue: &VerifierExecutionQueue,
+    conn: &mut TenantConn<'_>,
+    execution: ExecutionId,
+) {
+    let state = status(queue, conn, execution).await.state;
+    assert_eq!(state.status, VerificationExecutionStatus::Cancelled);
+    assert_eq!(
+        state.error.map(|error| error.code),
+        Some("principal_revoked".to_owned())
+    );
+}
+
+/// A submission and its principal's revocation order on the principal row
+/// whichever commits first: an admission racing an uncommitted revocation
+/// waits for it and commits cancelled, and a revocation racing an
+/// uncommitted admission waits for it and cancels the committed execution.
+/// Neither order leaves runnable work for a revoked principal.
+///
+/// # Panics
+/// Panics when either contender does not wait, or a revoked principal's
+/// execution stays runnable.
+#[tokio::test]
+async fn revocation_and_admission_order_on_the_principal() {
+    let fixture = PgFixture::start().await.expect("fixture starts");
+    let tenant = fixture.data_tenant_id();
+    let alice = actor(tenant);
+    let queue = VerifierExecutionQueue::default();
+    let mut setup = fixture
+        .tenant_conn()
+        .await
+        .expect("tenant connection opens");
+    let (first_card, first) = declare_service(&mut setup, &alice, "first").await;
+    let (second_card, second) = declare_service(&mut setup, &alice, "second").await;
+    let custom = register_verifier(&mut setup, &alice, "custom", custom_drift()).await;
+    setup.commit().await.expect("setup commits");
+    let mut probe = fixture.tenant_conn().await.expect("probe opens");
+
+    let mut revoker = fixture.tenant_conn().await.expect("revoker opens");
+    assert_eq!(revoke(&queue, &mut revoker, first).await, 0);
+    let late = submission(
+        tenant,
+        owner_authority(tenant, first),
+        request(&custom, &first_card),
+        None,
+    );
+    let mut admitter = fixture.tenant_conn().await.expect("admitter opens");
+    let admission = async {
+        let outcome = accept(&queue, &mut admitter, &late).await;
+        admitter.commit().await.expect("admission commits");
+        outcome
+    };
+    tokio::pin!(admission);
+    let raced = tokio::select! {
+        outcome = &mut admission => Some(outcome),
+        () = await_blocked_backend(&mut probe) => None,
+    };
+    assert_eq!(
+        raced, None,
+        "an admission waits for an uncommitted revocation"
+    );
+    revoker.commit().await.expect("revocation commits");
+    assert_eq!(admission.await, SubmissionOutcome::Accepted);
+    let mut reader = fixture.tenant_conn().await.expect("reader opens");
+    assert_revoked(&queue, &mut reader, late.execution_id).await;
+    reader.rollback().await.expect("reader rolls back");
+
+    let early = submission(
+        tenant,
+        owner_authority(tenant, second),
+        request(&custom, &second_card),
+        None,
+    );
+    let mut admitter = fixture.tenant_conn().await.expect("admitter opens");
+    submitted(&queue, &mut admitter, &early).await;
+    let mut revoker = fixture.tenant_conn().await.expect("revoker opens");
+    let revocation = async {
+        let cancelled = revoke(&queue, &mut revoker, second).await;
+        revoker.commit().await.expect("revocation commits");
+        cancelled
+    };
+    tokio::pin!(revocation);
+    let raced = tokio::select! {
+        cancelled = &mut revocation => Some(cancelled),
+        () = await_blocked_backend(&mut probe) => None,
+    };
+    assert_eq!(
+        raced, None,
+        "a revocation waits for an uncommitted admission"
+    );
+    admitter.commit().await.expect("admission commits");
+    assert_eq!(
+        revocation.await,
+        1,
+        "the revocation cancels the admitted execution"
+    );
+    let mut reader = fixture.tenant_conn().await.expect("reader opens");
+    assert_revoked(&queue, &mut reader, early.execution_id).await;
+}
+
+/// A scheduled occurrence and a group end prepared before their owner's
+/// revocation are admitted cancelled once it is suspended, so a delayed
+/// background admission never revives a revoked owner's work.
+///
+/// # Panics
+/// Panics when either admission is refused or its execution stays runnable.
+#[tokio::test]
+async fn background_admission_of_a_revoked_owner_is_cancelled() {
+    let fixture = PgFixture::start().await.expect("fixture starts");
+    let actor = actor(fixture.data_tenant_id());
+    let queue = VerifierExecutionQueue::default();
+    let mut conn = fixture
+        .tenant_conn()
+        .await
+        .expect("tenant connection opens");
+    provision_system_principal(&mut conn, Attribution::unresolved())
+        .await
+        .expect("the tenant SYSTEM principal provisions");
+    let (owner, principal) = declare_service(&mut conn, &actor, "svc").await;
+    let verifier = register_verifier(&mut conn, &actor, "drift", custom_drift()).await;
+    let binding = bind(&mut conn, &owner, &verifier, Vec::new()).await;
+    record_machine_authentication(&mut conn, principal, &owner)
+        .await
+        .expect("owner activates");
+    let due = database_now(&mut conn).await - SCHEDULE_CLAIM_DELAY;
+    set_cursor(&mut conn, binding, Some(due)).await;
+    let (group_binding, activity) = group_end(&mut conn, &actor, &owner).await;
+    let authority = background(&mut conn, principal).await;
+    queue
+        .record_group_activity(&mut conn, &[activity])
+        .await
+        .expect("activity records");
+    sqlx::query(
+        "UPDATE wyrd.verification_group_pending
+            SET due_at = statement_timestamp() - INTERVAL '1 second'
+          WHERE binding_id = $1",
+    )
+    .bind(group_binding.as_uuid())
+    .execute(&mut **conn.transaction())
+    .await
+    .expect("group expires");
+    let occurrence = scheduled_candidate(&queue, &mut conn, principal).await;
+    let group = queue
+        .claim_due_group(&mut conn, &[])
+        .await
+        .expect("group claims")
+        .expect("an expired group is due");
+    let snapshot = pinned(group_binding, "order-1", &[(ExecutionId::new_v7(), None)]);
+    let Prepared::Candidate(group) = queue
+        .prepare_group(
+            &mut conn,
+            group_binding,
+            &snapshot,
+            &authority,
+            Some(group.generation),
+        )
+        .await
+        .expect("group prepares")
+    else {
+        panic!("expected a group candidate");
+    };
+
+    assert_eq!(revoke(&queue, &mut conn, principal).await, 0);
+    assert_eq!(
+        queue
+            .accept_scheduled(&mut conn, &occurrence)
+            .await
+            .expect("occurrence admits"),
+        EnqueueOutcome::Enqueued(occurrence.execution_id)
+    );
+    assert_eq!(
+        queue
+            .accept_grouped(&mut conn, &group)
+            .await
+            .expect("group admits"),
+        EnqueueOutcome::Enqueued(group.execution_id)
+    );
+    assert_revoked(&queue, &mut conn, occurrence.execution_id).await;
+    assert_revoked(&queue, &mut conn, group.execution_id).await;
 }
 
 /// Wait until some backend of this fixture's database is blocked behind

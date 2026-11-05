@@ -1507,6 +1507,70 @@ async fn cancellation_and_deadline_settle_without_a_verdict() {
     runtime.stop().await;
 }
 
+/// Target loading spends the claimed deadline: a run whose Verifier read
+/// waits past its remaining time times out without dispatching its engine.
+///
+/// # Panics
+/// Panics when the Card lock, cache flush, or deadline wait fails, or the run
+/// dispatches or reaches another state.
+#[tokio::test]
+async fn target_loading_spends_the_claimed_deadline() {
+    let harness = Harness::start().await;
+    let script = EngineScript::default();
+    script.push(EngineOutcome::Completed(unscored_report()));
+    let run = harness.submit().await;
+    let cache = harness.server.state().verification.verifier_cards();
+    let before = cache.invalidations();
+    sqlx::query("NOTIFY wyrd_verification_target, 'flush'")
+        .execute(&harness.assertion)
+        .await
+        .expect("the target cache is flushed");
+    wait_until("the flush reaches the cache", || {
+        cache.invalidations() != before
+    })
+    .await;
+    let mut cards = harness.assertion.begin().await.expect("lock transaction");
+    sqlx::query("LOCK TABLE wyrd.cards IN ACCESS EXCLUSIVE MODE")
+        .execute(&mut *cards)
+        .await
+        .expect("Card reads wait");
+    let runtime = harness.spawn(
+        &RuntimeLimits {
+            execution_timeout: Duration::from_millis(300),
+            ..Harness::limits()
+        },
+        &script,
+    );
+    // The claim statement ran before the blocked Card read began, so its
+    // deadline has passed once the database clock is a budget past it.
+    let wait = tokio::time::Instant::now() + WAIT;
+    while !sqlx::query_scalar::<_, bool>(
+        "SELECT coalesce(bool_or(statement_timestamp() > a.query_start + INTERVAL '300 milliseconds'), false) \
+           FROM pg_locks l JOIN pg_stat_activity a USING (pid) \
+          WHERE NOT l.granted AND l.relation = 'wyrd.cards'::regclass",
+    )
+    .fetch_one(&harness.assertion)
+    .await
+    .expect("blocked read")
+    {
+        assert!(tokio::time::Instant::now() < wait, "the Verifier read never waits");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    cards.commit().await.expect("Card reads resume");
+
+    let row = harness
+        .wait_execution(run, |row| {
+            ["completed", "timed_out"].contains(&row.status.as_str())
+        })
+        .await;
+    assert_eq!(
+        (row.status.as_str(), row.error_code.as_deref()),
+        ("timed_out", Some("execution_timed_out"))
+    );
+    assert_eq!(script.entered(), 0, "nothing dispatches after the deadline");
+    runtime.stop().await;
+}
+
 /// Verifier claims exceed the former process and tenant ceilings while held,
 /// and another tenant's work also starts before any execution is released.
 ///

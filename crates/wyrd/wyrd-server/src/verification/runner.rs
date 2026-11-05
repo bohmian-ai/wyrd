@@ -166,7 +166,8 @@ pub struct AttemptClaim {
     /// The exact Verifier, or the error a run without one terminates with.
     verifier: Result<Arc<Target>, VerificationError>,
     /// When the claim transaction started and finished resolving the
-    /// Verifier, recorded as the attempt's `load` phase.
+    /// Verifier, recorded as the attempt's `load` phase. The start anchors
+    /// the claimed remaining deadline, so loading and handoff spend it.
     loaded: (Instant, Instant),
     /// The attempt's root span.
     span: tracing::Span,
@@ -371,7 +372,8 @@ impl VerifierRunner {
     /// terminates. One outbox slot is then reserved for its result; when the
     /// reserved share is full the execution defers without spending an
     /// attempt, so a full outbox backs claims off instead of losing results.
-    /// Otherwise the engine runs within the execution deadline and a
+    /// An execution whose `deadline` has already passed times out without
+    /// dispatching anything. Otherwise the engine runs until `deadline` and a
     /// completed outcome is built into its result write, which
     /// [`settle`](Self::settle) stages inside the lease-fenced transaction
     /// that completes the execution. Never fails: every failure becomes the
@@ -381,6 +383,7 @@ impl VerifierRunner {
         tenant: DataTenantId,
         run: &ClaimedExecution,
         verifier: Result<Arc<Target>, VerificationError>,
+        deadline: tokio::time::Instant,
         telemetry: &ExecutionTelemetry,
     ) -> (Transition, Option<StagedResult>) {
         let verifier = match verifier {
@@ -401,18 +404,21 @@ impl VerifierRunner {
             );
         };
         let started_at = Utc::now();
-        let deadline = tokio::time::Instant::now() + run.remaining;
-        let executed = telemetry
-            .phase(
-                Phase::Engine,
-                tokio::time::timeout_at(
-                    deadline,
-                    self.dispatch(tenant, run, &verifier.spec, system, deadline, telemetry),
+        let outcome = if deadline <= tokio::time::Instant::now() {
+            timed_out()
+        } else {
+            telemetry
+                .phase(
+                    Phase::Engine,
+                    tokio::time::timeout_at(
+                        deadline,
+                        self.dispatch(tenant, run, &verifier.spec, system, deadline, telemetry),
+                    )
+                    .instrument(tracing::info_span!("verification.engine")),
                 )
-                .instrument(tracing::info_span!("verification.engine")),
-            )
-            .await;
-        let outcome = executed.unwrap_or_else(|_| timed_out());
+                .await
+                .unwrap_or_else(|_| timed_out())
+        };
         match outcome {
             EngineOutcome::Completed(outcome) => {
                 let (transition, write) = result(run, &outcome, system, started_at);
@@ -927,6 +933,9 @@ impl VerifierRunner {
         abandon: &CancellationToken,
     ) -> bool {
         let started = Instant::now();
+        // `remaining` was read by the claim statement, which began after
+        // `loaded.0`; target loading and handoff spend it.
+        let deadline = tokio::time::Instant::from_std(loaded.0) + run.remaining;
         let telemetry = ExecutionTelemetry::start(ExecutionMode::Queued, Some(loaded.0));
         telemetry.record_phase(Phase::Load, loaded.0, loaded.1);
         let origin = run.origin.as_str();
@@ -936,7 +945,7 @@ impl VerifierRunner {
             biased;
             () = abandon.cancelled() => (Transition::Release, None),
             () = lost.cancelled() => (Transition::LeaseLost, None),
-            executed = self.execute(tenant, run, verifier, &telemetry) => executed,
+            executed = self.execute(tenant, run, verifier, deadline, &telemetry) => executed,
         };
         let transition = match transition {
             Transition::LeaseLost if abandon.is_cancelled() => Transition::Release,

@@ -2913,4 +2913,369 @@ mod pg_tests {
         server.shutdown().await?;
         Ok(())
     }
+
+    /// An agent pages a queued execution's invocations and publications over
+    /// MCP, reads each publication by its exact producer attempt, plans its
+    /// downloads, and cancels it durably and repeatably.
+    ///
+    /// With no runtime, the fixture holds the execution's lease, begins two
+    /// steps, and accepts a JSON value, JSON `null`, a file, and a directory.
+    /// Pages of one entry follow their cursors in insertion order to the end;
+    /// a cursor is refused on another listing, and a limit outside 1–200 is
+    /// refused. A file and a listed directory file plan their downloads with
+    /// the manifest's size and digest; a JSON or unlisted download, a path on
+    /// a read, and another attempt are refused. A caller holding `cards:read`
+    /// but no `verifier:read`, or `verifier:read` for another Verifier only, is
+    /// refused; one scoped to this Verifier reads. Another tenant sees no such
+    /// execution. A viewer is not offered `verification.cancel` and is refused
+    /// it; the administrator's cancel and its repeat both answer `cancelled`,
+    /// and the publications stay listed.
+    ///
+    /// # Errors
+    ///
+    /// Returns server startup, fixture, bootstrap, MCP transport, tool-call,
+    /// or decode failures.
+    ///
+    /// # Panics
+    ///
+    /// Panics when any page, read, refusal, or cancellation differs.
+    #[tokio::test(flavor = "multi_thread")]
+    #[ignore = "requires the Postgres-backed Bifrost journey lane"]
+    async fn durable_verifier_work_execution_pages_are_stable_and_tenant_scoped()
+    -> Result<(), McpJourneyError> {
+        use base64::Engine as _;
+        use wyrd_spec::storage::DownloadInitResponse;
+        use wyrd_spec::verification::VerificationExecutionStatus;
+        use wyrd_spec::verification::execution::{
+            CancelExecutionResponse, InvocationPage, InvocationProgress, Publication,
+            PublicationContent, PublicationKind, PublicationManifest, PublicationPage,
+        };
+        use wyrd_testing::verification::{Published, VerificationFixture};
+
+        const LIST_INVOCATIONS: &str = "verification.list_invocations";
+        const LIST_PUBLICATIONS: &str = "verification.list_publications";
+        const GET_PUBLICATION: &str = "verification.get_publication";
+        const DOWNLOAD_PUBLICATION: &str = "verification.download_publication";
+        const CANCEL: &str = "verification.cancel";
+
+        /// The validation code every malformed selector, cursor, or limit
+        /// answers.
+        const INVALID: &str = "WYRD_SPEC_400_VALIDATION";
+        /// The authorization code every denied read or write answers.
+        const DENIED: &str = "WYRD_PERMISSION_403_DENIED_RBAC";
+
+        let server = WyrdTestServer::builder().start_bound().await?;
+        let fixture =
+            VerificationFixture::provision(server.state(), server.data_tenant_id()).await?;
+        let (subject, _) = fixture.service("mcp-pages-subject").await?;
+        let verifier = fixture.drift_verifier("mcp-pages").await?;
+        let other = fixture.drift_verifier("mcp-pages-other").await?;
+        fixture
+            .submit(&verifier, &subject, std::collections::BTreeMap::new())
+            .await?;
+        let tree = vec![
+            ("a.md".to_owned(), b"alpha".to_vec()),
+            ("nested/b.md".to_owned(), b"beta".to_vec()),
+        ];
+        let id = fixture
+            .publish(
+                server.state(),
+                &[
+                    (
+                        "review",
+                        "verdict",
+                        Published::Json(serde_json::json!({"ok": true})),
+                    ),
+                    ("review", "nothing", Published::Json(JsonValue::Null)),
+                    ("draft", "report", Published::File(b"# Report\n".to_vec())),
+                    ("draft", "tree", Published::Directory(tree)),
+                ],
+            )
+            .await?
+            .to_string();
+
+        let admin = server
+            .bootstrap_service("mcp-pages-admin", &["admin"])
+            .await?;
+        let agent = connect(&server, &admin).await?;
+        let page = |cursor: Option<&str>| serde_json::json!({ "execution_id": id, "limit": 1, "cursor": cursor });
+
+        let mut invocations = Vec::new();
+        let mut cursor: Option<String> = None;
+        loop {
+            let read: InvocationPage = serde_json::from_value(structured(
+                agent
+                    .call_tool(call(LIST_INVOCATIONS, page(cursor.as_deref()))?)
+                    .await?,
+            )?)?;
+            assert_eq!(read.execution_id.to_string(), id);
+            assert_eq!(read.status, VerificationExecutionStatus::Running);
+            invocations.extend(read.items);
+            cursor = read.next_cursor;
+            if cursor.is_none() {
+                break;
+            }
+        }
+        let steps: Vec<_> = invocations
+            .iter()
+            .map(|item| {
+                (
+                    item.producer.step_id.as_str(),
+                    item.producer.attempt,
+                    &item.progress,
+                )
+            })
+            .collect();
+        assert_eq!(
+            steps,
+            [
+                ("review", 1, &InvocationProgress::Started),
+                ("draft", 1, &InvocationProgress::Started),
+            ]
+        );
+
+        let mut publications = Vec::new();
+        let mut cursor: Option<String> = None;
+        loop {
+            let read: PublicationPage = serde_json::from_value(structured(
+                agent
+                    .call_tool(call(LIST_PUBLICATIONS, page(cursor.as_deref()))?)
+                    .await?,
+            )?)?;
+            publications.extend(read.items);
+            cursor = read.next_cursor;
+            if cursor.is_none() {
+                break;
+            }
+        }
+        let listed: Vec<_> = publications
+            .iter()
+            .map(|item| {
+                (
+                    item.producer.step_id.as_str(),
+                    item.name.as_str(),
+                    item.kind,
+                )
+            })
+            .collect();
+        assert_eq!(
+            listed,
+            [
+                ("review", "verdict", PublicationKind::Json),
+                ("review", "nothing", PublicationKind::Json),
+                ("draft", "report", PublicationKind::File),
+                ("draft", "tree", PublicationKind::Directory),
+            ]
+        );
+
+        let first: InvocationPage = serde_json::from_value(structured(
+            agent.call_tool(call(LIST_INVOCATIONS, page(None))?).await?,
+        )?)?;
+        let foreign_cursor = refusal(
+            agent
+                .call_tool(call(LIST_PUBLICATIONS, page(first.next_cursor.as_deref()))?)
+                .await,
+        )?;
+        assert!(
+            foreign_cursor.contains(INVALID),
+            "an invocation cursor does not continue the publication listing: {foreign_cursor}"
+        );
+        for arguments in [
+            serde_json::json!({ "execution_id": id, "limit": 0 }),
+            serde_json::json!({ "execution_id": id, "limit": 201 }),
+            serde_json::json!({ "execution_id": id, "cursor": "not-a-cursor" }),
+        ] {
+            let refused = refusal(
+                agent
+                    .call_tool(call(LIST_INVOCATIONS, arguments.clone())?)
+                    .await,
+            )?;
+            assert!(refused.contains(INVALID), "{arguments}: {refused}");
+        }
+
+        let select = |step: &str, name: &str, path: Option<&str>| {
+            let mut arguments = serde_json::json!({
+                "execution_id": id, "step_id": step, "name": name, "attempt": 1
+            });
+            if let Some(path) = path {
+                arguments["path"] = path.into();
+            }
+            arguments
+        };
+        let read = |arguments: JsonValue| {
+            let agent = &agent;
+            async move {
+                let publication: Publication = serde_json::from_value(structured(
+                    agent.call_tool(call(GET_PUBLICATION, arguments)?).await?,
+                )?)?;
+                Ok::<_, McpJourneyError>(publication.content)
+            }
+        };
+        assert_eq!(
+            read(select("review", "verdict", None)).await?,
+            PublicationContent::Json {
+                value: serde_json::json!({"ok": true})
+            }
+        );
+        assert_eq!(
+            read(select("review", "nothing", None)).await?,
+            PublicationContent::Json {
+                value: JsonValue::Null
+            }
+        );
+        let PublicationContent::File { manifest: file } =
+            read(select("draft", "report", None)).await?
+        else {
+            return Err("the report is a file publication".into());
+        };
+        let PublicationContent::Directory {
+            manifest: directory,
+        } = read(select("draft", "tree", None)).await?
+        else {
+            return Err("the tree is a directory publication".into());
+        };
+        let paths: Vec<_> = directory
+            .files
+            .iter()
+            .map(|file| file.path.as_str())
+            .collect();
+        assert_eq!(paths, ["a.md", "nested/b.md"]);
+
+        let planned = |manifest: &PublicationManifest, index: usize| {
+            let file = &manifest.files[index];
+            (
+                file.size_bytes,
+                base64::engine::general_purpose::STANDARD.encode(file.sha256.as_bytes()),
+            )
+        };
+        for (arguments, expected) in [
+            (select("draft", "report", None), planned(&file, 0)),
+            (
+                select("draft", "tree", Some("nested/b.md")),
+                planned(&directory, 1),
+            ),
+        ] {
+            let plan: DownloadInitResponse = serde_json::from_value(structured(
+                agent
+                    .call_tool(call(DOWNLOAD_PUBLICATION, arguments)?)
+                    .await?,
+            )?)?;
+            assert_eq!((plan.size_bytes, plan.sha256), expected);
+        }
+        for (tool, arguments) in [
+            (DOWNLOAD_PUBLICATION, select("review", "verdict", None)),
+            (DOWNLOAD_PUBLICATION, select("draft", "tree", None)),
+            (
+                DOWNLOAD_PUBLICATION,
+                select("draft", "tree", Some("missing.md")),
+            ),
+            (
+                DOWNLOAD_PUBLICATION,
+                select("draft", "report", Some("a.md")),
+            ),
+            (GET_PUBLICATION, select("review", "verdict", Some("a.md"))),
+        ] {
+            let refused = refusal(agent.call_tool(call(tool, arguments.clone())?).await)?;
+            assert!(refused.contains(INVALID), "{tool} {arguments}: {refused}");
+        }
+        let mut second = select("review", "verdict", None);
+        second["attempt"] = 2.into();
+        let absent = refusal(agent.call_tool(call(GET_PUBLICATION, second)?).await)?;
+        assert!(
+            absent.contains("WYRD_VERIFICATION_404_PUBLICATION_NOT_FOUND"),
+            "{absent}"
+        );
+
+        let listing = serde_json::json!({ "execution_id": id });
+        server
+            .seed_role("mcp_pages_cards", &[Permission::card_read()])
+            .await?;
+        server
+            .seed_role("mcp_pages_elsewhere", &[Permission::verifier_read(other)])
+            .await?;
+        server
+            .seed_role("mcp_pages_exact", &[Permission::verifier_read(verifier)])
+            .await?;
+        for role in ["mcp_pages_cards", "mcp_pages_elsewhere"] {
+            let caller = server.bootstrap_service(role, &[role]).await?;
+            let caller = connect(&server, &caller).await?;
+            let refused = refusal(
+                caller
+                    .call_tool(call(LIST_PUBLICATIONS, listing.clone())?)
+                    .await,
+            )?;
+            assert!(refused.contains(DENIED), "{role}: {refused}");
+            caller.cancel().await?;
+        }
+        let exact = server
+            .bootstrap_service("mcp_pages_exact", &["mcp_pages_exact"])
+            .await?;
+        let exact = connect(&server, &exact).await?;
+        let read: PublicationPage = serde_json::from_value(structured(
+            exact
+                .call_tool(call(LIST_PUBLICATIONS, listing.clone())?)
+                .await?,
+        )?)?;
+        assert_eq!(
+            read.items, publications,
+            "an exact verifier:read grant reads"
+        );
+        exact.cancel().await?;
+
+        let other_tenant = server.seed_tenant("mcp-pages-other").await?;
+        let foreign = server
+            .bootstrap_service_in_tenant(other_tenant, "mcp-pages-foreign", &["admin"])
+            .await?;
+        let foreign = connect(&server, &foreign).await?;
+        let refused = refusal(
+            foreign
+                .call_tool(call(LIST_INVOCATIONS, listing.clone())?)
+                .await,
+        )?;
+        assert!(
+            refused.contains("WYRD_VERIFICATION_404_EXECUTION_NOT_FOUND"),
+            "another tenant sees no such execution: {refused}"
+        );
+        foreign.cancel().await?;
+
+        let viewer = server
+            .bootstrap_service("mcp-pages-viewer", &["viewer"])
+            .await?;
+        let viewer = connect(&server, &viewer).await?;
+        let offered: BTreeSet<String> = viewer
+            .list_all_tools()
+            .await?
+            .into_iter()
+            .map(|tool| tool.name.into_owned())
+            .collect();
+        assert!(offered.contains(LIST_INVOCATIONS), "{offered:?}");
+        assert!(!offered.contains(CANCEL), "{offered:?}");
+        viewer
+            .call_tool(call(LIST_INVOCATIONS, listing.clone())?)
+            .await?;
+        let refused = refusal(viewer.call_tool(call(CANCEL, listing.clone())?).await)?;
+        assert!(
+            refused.contains(DENIED),
+            "a viewer cannot cancel: {refused}"
+        );
+        viewer.cancel().await?;
+
+        for _ in 0..2 {
+            let cancelled: CancelExecutionResponse = serde_json::from_value(structured(
+                agent.call_tool(call(CANCEL, listing.clone())?).await?,
+            )?)?;
+            assert_eq!(cancelled.execution_id.to_string(), id);
+            assert_eq!(cancelled.status, VerificationExecutionStatus::Cancelled);
+        }
+        let read: PublicationPage = serde_json::from_value(structured(
+            agent.call_tool(call(LIST_PUBLICATIONS, listing)?).await?,
+        )?)?;
+        assert_eq!(
+            read.items, publications,
+            "a cancelled execution's publications stay"
+        );
+        agent.cancel().await?;
+        server.shutdown().await?;
+        Ok(())
+    }
 }

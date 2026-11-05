@@ -10359,6 +10359,7 @@ name = "wyrd-mcp"
 version = "0.4.1"
 dependencies = [
  "arrow",
+ "base64 0.22.1",
  "chrono",
  "futures-util",
  "http",

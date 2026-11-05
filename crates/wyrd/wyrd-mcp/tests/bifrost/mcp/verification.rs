@@ -2952,10 +2952,15 @@ mod pg_tests {
         };
         use wyrd_testing::verification::{Published, VerificationFixture};
 
+        /// The invocation page read tool.
         const LIST_INVOCATIONS: &str = "verification.list_invocations";
+        /// The publication page read tool.
         const LIST_PUBLICATIONS: &str = "verification.list_publications";
+        /// The single publication read tool.
         const GET_PUBLICATION: &str = "verification.get_publication";
+        /// The File publication download plan tool.
         const DOWNLOAD_PUBLICATION: &str = "verification.download_publication";
+        /// The execution cancellation write tool.
         const CANCEL: &str = "verification.cancel";
 
         /// The validation code every malformed selector, cursor, or limit

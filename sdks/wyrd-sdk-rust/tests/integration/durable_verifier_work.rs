@@ -130,7 +130,10 @@ async fn calls(assistant: &Assistant, marker: &str) -> usize {
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "requires the repository-managed Postgres journey lane"]
 async fn action_checkpoint_survives_unfinished_requirements() {
+    /// Text only the review action's model request carries, counting its calls.
     const REVIEW: &str = "Review the answer";
+    /// Text only the judge's model request carries, holding and counting its
+    /// calls.
     const JUDGE: &str = "Claim: The review agrees";
     let assistant = Assistant::start().await;
     let reviewed = declare(

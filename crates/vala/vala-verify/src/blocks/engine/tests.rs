@@ -2334,6 +2334,9 @@ impl Ledger {
 impl Checkpoints for Ledger {
     /// Record the attempt unsettled.
     ///
+    /// # Errors
+    /// Never returns an error.
+    ///
     /// # Panics
     /// Panics when another call panicked while holding the lock.
     async fn begin(&self, task: &TaskId, attempt: u32) -> Result<(), String> {
@@ -2346,6 +2349,9 @@ impl Checkpoints for Ledger {
 
     /// Remove the attempt.
     ///
+    /// # Errors
+    /// Never returns an error.
+    ///
     /// # Panics
     /// Panics when another call panicked while holding the lock.
     async fn forget(&self, task: &TaskId, attempt: u32) -> Result<(), String> {
@@ -2357,6 +2363,9 @@ impl Checkpoints for Ledger {
     }
 
     /// Record the attempt's settlement.
+    ///
+    /// # Errors
+    /// Never returns an error.
     ///
     /// # Panics
     /// Panics when another call panicked while holding the lock.

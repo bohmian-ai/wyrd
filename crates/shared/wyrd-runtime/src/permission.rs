@@ -1406,6 +1406,10 @@ mod tests {
     /// Proves `verifier:run` and `verifier:read` parse, cover only their exact
     /// Verifier UID or their unscoped grant, never each other, and refuse a
     /// Verifier scope on any other operation.
+    ///
+    /// # Panics
+    /// Panics when a grant fails to parse or covers the wrong operation or
+    /// Verifier.
     #[test]
     fn verifier_run_is_uid_scoped() {
         use wyrd_spec::ids::CardUid;

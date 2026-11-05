@@ -161,6 +161,9 @@ impl Leased {
 }
 
 /// A call of `producer` publishing under `name`.
+///
+/// # Panics
+/// Panics when `name` is not a valid publication name.
 fn call(id: &str, producer: &Producer, name: &str) -> PublishCall {
     PublishCall {
         id: id.to_owned(),
@@ -170,6 +173,9 @@ fn call(id: &str, producer: &Producer, name: &str) -> PublishCall {
 }
 
 /// The refusal rule of a structured tool error.
+///
+/// # Panics
+/// Panics when `error` carries no structured refusal details.
 fn rule(error: &skald_tool::ToolError) -> Value {
     error
         .safe_details()

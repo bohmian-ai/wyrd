@@ -104,12 +104,23 @@ impl PublicationName {
 impl FromStr for PublicationName {
     type Err = WyrdError;
 
+    /// Parses and validates a publication name, as [`PublicationName::new`].
+    ///
+    /// # Errors
+    /// Returns the [`PublicationName::new`] error when `value` is not 1 to 64
+    /// ASCII letters, digits, `_`, or `-`.
     fn from_str(value: &str) -> Result<Self, Self::Err> {
         Self::new(value)
     }
 }
 
 impl<'de> Deserialize<'de> for PublicationName {
+    /// Deserializes a string and validates it, so no invalid name crosses the
+    /// wire.
+    ///
+    /// # Errors
+    /// Returns the deserializer's error when the value is not a string or is
+    /// not a valid publication name.
     fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
         let value = String::deserialize(deserializer)?;
         Self::new(value).map_err(serde::de::Error::custom)
@@ -117,10 +128,12 @@ impl<'de> Deserialize<'de> for PublicationName {
 }
 
 impl schemars::JsonSchema for PublicationName {
+    /// Names the schema `PublicationName`.
     fn schema_name() -> std::borrow::Cow<'static, str> {
         "PublicationName".into()
     }
 
+    /// The string grammar [`PublicationName::new`] enforces.
     fn json_schema(_generator: &mut schemars::SchemaGenerator) -> schemars::Schema {
         schemars::json_schema!({ "type": "string", "minLength": 1, "maxLength": 64, "pattern": r"^[A-Za-z0-9_-]{1,64}$" })
     }
@@ -266,6 +279,9 @@ mod tests {
     use super::{JsonPath, PublicationName, TaskId};
 
     /// Publication names are one bounded ASCII segment, never a path.
+    ///
+    /// # Panics
+    /// Panics when a valid name is refused or an invalid one accepted.
     #[test]
     fn publication_name_is_one_bounded_segment() {
         for valid in ["report", "0-review_A", &"a".repeat(64)] {

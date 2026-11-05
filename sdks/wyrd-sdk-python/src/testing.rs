@@ -671,6 +671,24 @@ impl WyrdTestServer {
             .map_err(py_error)
     }
 
+    /// Admit one execution of a fresh Drift Verifier named `name` and hold it
+    /// running with the harness's four fixed publications.
+    ///
+    /// Returns the execution ID and the Verifier Card UID. Only for a server
+    /// started without `verification_runtime`, which would race the claim.
+    ///
+    /// # Errors
+    /// Raises a Wyrd Python error when the context manager is inactive,
+    /// `name` is not a Card name, or the submission or a publication is
+    /// refused.
+    fn hold_publications(&self, py: Python<'_>, name: &str) -> WyrdPyResult<(String, String)> {
+        let server = self.started()?;
+        let (execution, verifier) = py
+            .detach(|| wyrd_runtime::runtime().block_on(server.hold_publications(name)))
+            .map_err(py_error)?;
+        Ok((execution.to_string(), verifier.to_string()))
+    }
+
     /// Wait until Drift Verifier `verifier`'s fitted baseline is ready.
     ///
     /// `verifier` is the Verifier Card UID and `timeout` is in seconds. The

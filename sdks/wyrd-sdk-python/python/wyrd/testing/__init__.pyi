@@ -4,14 +4,14 @@ from typing import Literal
 class WyrdTestServer:
     """Wyrd in-process test server context manager (testing feature only).
 
-    Journeys steer the server through exactly three test controls, each backed
-    by the production code path: ``flush_bifrost``, ``wait_for_baseline``, and
-    ``make_binding_due``. Keys that need Roles come from the credential
-    fixtures, which stand in for the operator who grants Roles in a
-    deployment: ``bootstrap_service``, ``bootstrap_service_in_tenant``, and
-    ``credential_registered_service``. Accounts without added Roles come from
-    ``wyrd.auth.Principals``. The remaining members start or address the
-    server.
+    Journeys steer the server through exactly four test controls, each backed
+    by the production code path: ``flush_bifrost``, ``wait_for_baseline``,
+    ``make_binding_due``, and ``hold_publications``. Keys that need Roles come
+    from the credential fixtures, which stand in for the operator who grants
+    Roles in a deployment: ``bootstrap_service``,
+    ``bootstrap_service_in_tenant``, and ``credential_registered_service``.
+    Accounts without added Roles come from ``wyrd.auth.Principals``. The
+    remaining members start or address the server.
 
     Starts a real Wyrd server bound to a loopback TCP socket backed by an
     embedded Postgres fixture. Use as a context manager; ``bootstrap_service``
@@ -263,6 +263,29 @@ class WyrdTestServer:
         Raises:
             WyrdError: ``WYRD_TESTING_500_HARNESS_START`` for an invalid ID or
                 a failed update.
+
+        """
+        ...
+
+    def hold_publications(self, name: str) -> tuple[str, str]:
+        """Admit one execution of a fresh Drift Verifier ``name`` and hold it running with four publications.
+
+        Attempt 1 of step ``review`` publishes JSON ``verdict`` ``{"ok": true}``
+        and JSON ``nothing`` ``null``; attempt 1 of step ``draft`` publishes
+        file ``report`` (``# Report`` and a newline) and directory ``tree``
+        (``a.md`` is ``alpha``, ``nested/b.md`` is ``beta``). Only for a server started
+        without ``verification_runtime``, which would race for the execution.
+
+        Args:
+            name: the new Drift Verifier's Card name; its subject Service is
+                ``{name}-subject``.
+
+        Returns:
+            The execution ID and the Verifier Card UID.
+
+        Raises:
+            WyrdError: ``WYRD_TESTING_500_HARNESS_START`` for an invalid
+                ``name`` or a refused submission or publication.
 
         """
         ...

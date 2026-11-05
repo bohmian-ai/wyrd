@@ -3,10 +3,10 @@
 /**
  * In-process server handle used only by TypeScript integration tests.
  *
- * Journeys steer the server through exactly three test controls, each backed
- * by the production code path: `flushBifrost`, `waitForBaseline`, and
- * `makeBindingDue`. The remaining members start, address, or credential the
- * server.
+ * Journeys steer the server through exactly four test controls, each backed
+ * by the production code path: `flushBifrost`, `waitForBaseline`,
+ * `makeBindingDue`, and `holdPublications`. The remaining members start,
+ * address, or credential the server.
  */
 export declare class NativeWyrdTestServer {
   /** Returns the bound HTTP base URL. */
@@ -178,6 +178,22 @@ export declare class NativeWyrdTestServer {
    */
   tenantAdminKey(): string
   /**
+   * Admit one execution of a fresh Drift Verifier named `name` and hold it
+   * running with the harness's four fixed publications.
+   *
+   * Attempt 1 of step `review` publishes JSON `verdict` `{"ok": true}` and
+   * JSON `nothing` `null`; attempt 1 of step `draft` publishes file
+   * `report` (`# Report` and a newline) and directory `tree` (`a.md` is
+   * `alpha`, `nested/b.md` is `beta`). Only for a server started without
+   * `verificationRuntime`, which would race for the execution.
+   *
+   * # Errors
+   *
+   * Returns a napi error when the harness is closed, `name` is not a Card
+   * name, or the submission or a publication is refused.
+   */
+  holdPublications(name: string): HeldPublications
+  /**
    * Activate the identity lane's Keycloak sign-in for one tenant and
    * return its id: the fixture tenant when `tenantSlug` is absent, else a
    * newly seeded tenant of that slug with its own administrator.
@@ -328,6 +344,17 @@ export declare function cliPutProviderCredential(write: any, connection?: Native
  * name, client, or server failure is returned in the outcome.
  */
 export declare function cliRevokeProviderCredential(name: string, connection?: NativeCliConnection | undefined | null): Promise<NativeCliOutcome>
+
+/**
+ * The execution [`NativeWyrdTestServer::hold_publications`] holds and the
+ * Verifier it runs.
+ */
+export interface HeldPublications {
+  /** The held execution's ID. */
+  executionId: string
+  /** The held execution's Verifier Card UID. */
+  verifier: string
+}
 
 /**
  * Card selector for `get` and `pull`: a `uid` with `kind`, or `kind` and

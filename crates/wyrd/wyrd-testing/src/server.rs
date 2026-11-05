@@ -4167,6 +4167,68 @@ impl WyrdTestServer {
             .map_err(|error| WyrdTestServerError::Sql(error.to_string()))
     }
 
+    /// Admit one execution of a fresh Drift Verifier named `name` and hold it
+    /// unfinished with four accepted publications, so a language journey can
+    /// read successful publications through its public SDK without a
+    /// production upload route.
+    ///
+    /// Delegates to [`VerificationFixture::submit`] and
+    /// [`VerificationFixture::publish`]: attempt 1 of step `review` publishes
+    /// JSON `verdict` `{"ok": true}` and JSON `nothing` `null`; attempt 1 of
+    /// step `draft` publishes file `report` (`# Report` and a newline) and
+    /// directory `tree` (`a.md` = `alpha`, `nested/b.md` = `beta`). The execution stays
+    /// leased and running. Returns the execution and its Verifier Card UID.
+    ///
+    /// Only for a server built without the verification runtime, which would
+    /// race the fixture for the claim.
+    ///
+    /// # Errors
+    /// Returns [`WyrdTestServerError::Sql`] when the tenant cannot be
+    /// provisioned, `name` is not a Card name, or the submission or a
+    /// publication is refused.
+    pub async fn hold_publications(
+        &self,
+        name: &str,
+    ) -> Result<(wyrd_spec::ids::ExecutionId, CardUid), WyrdTestServerError> {
+        use crate::verification::Published;
+        let sql = |error: VerificationFixtureError| WyrdTestServerError::Sql(error.to_string());
+        let fixture = self.verification_fixture().await.map_err(sql)?;
+        let (subject, _) = fixture
+            .service(&format!("{name}-subject"))
+            .await
+            .map_err(sql)?;
+        let verifier = fixture.drift_verifier(name).await.map_err(sql)?;
+        fixture
+            .submit(&verifier, &subject, std::collections::BTreeMap::new())
+            .await
+            .map_err(sql)?;
+        let tree = vec![
+            ("a.md".to_owned(), b"alpha".to_vec()),
+            ("nested/b.md".to_owned(), b"beta".to_vec()),
+        ];
+        let execution = fixture
+            .publish(
+                &self.inner.state,
+                &[
+                    (
+                        "review",
+                        "verdict",
+                        Published::Json(serde_json::json!({"ok": true})),
+                    ),
+                    (
+                        "review",
+                        "nothing",
+                        Published::Json(serde_json::Value::Null),
+                    ),
+                    ("draft", "report", Published::File(b"# Report\n".to_vec())),
+                    ("draft", "tree", Published::Directory(tree)),
+                ],
+            )
+            .await
+            .map_err(sql)?;
+        Ok((execution, verifier))
+    }
+
     /// Cancel and drain a partially started bound server while preserving the
     /// startup error that caused rollback.
     async fn rollback_bound_startup(

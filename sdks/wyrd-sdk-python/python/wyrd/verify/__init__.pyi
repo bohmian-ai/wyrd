@@ -383,6 +383,101 @@ class GroupSnapshot(TypedDict):
 
     sources: dict[str, GroupSourceSnapshot]
 
+class Producer(TypedDict):
+    """The exact invocation attempt of a step: zero-based item and iteration, one-based attempt.
+
+    Pages always carry ``item_index`` and ``iteration_index``, ``None``
+    without fanout or repeat; a selector may omit them.
+    """
+
+    step_id: str
+    item_index: NotRequired[int | None]
+    iteration_index: NotRequired[int | None]
+    attempt: int
+
+class ExecutionInvocation(TypedDict):
+    """One invocation attempt and its progress."""
+
+    producer: Producer
+    state: Literal["started", "action", "requirement"]
+    status: NotRequired[Literal["succeeded", "failed", "skipped"]]
+    outcome: NotRequired[RequirementOutcome]
+    reason: str | None
+    speculation: Literal["none"]
+
+class HistoryProjection(TypedDict):
+    """How many of the execution's history batches Bifrost acknowledged, holds, or failed."""
+
+    acknowledged: int
+    pending: int
+    failed: int
+
+class InvocationPage(TypedDict):
+    """``Execution.invocations()``: one page of invocation attempts in commit order."""
+
+    execution_id: str
+    status: ExecutionStatus
+    items: list[ExecutionInvocation]
+    next_cursor: str | None
+    history: HistoryProjection
+
+PublicationKind: TypeAlias = Literal["file", "directory", "json"]
+
+class PublicationSummary(TypedDict):
+    """One accepted publication's name, kind, and producer, never its content."""
+
+    name: str
+    kind: PublicationKind
+    producer: Producer
+    speculation: Literal["none"]
+
+class PublicationPage(TypedDict):
+    """``Execution.publications()``: one page of accepted publications in commit order."""
+
+    execution_id: str
+    items: list[PublicationSummary]
+    next_cursor: str | None
+
+class PublicationFile(TypedDict):
+    """One retained regular file."""
+
+    path: str
+    sha256: str
+    size_bytes: int
+
+class PublicationManifest(TypedDict):
+    """The immutable files and directories of a file or directory publication."""
+
+    files: list[PublicationFile]
+    directories: list[str]
+
+class Publication(TypedDict):
+    """``Execution.publication()``: a JSON ``value`` or a file or directory ``manifest``."""
+
+    name: str
+    producer: Producer
+    kind: PublicationKind
+    value: NotRequired[JsonValue]
+    manifest: NotRequired[PublicationManifest]
+
+class DownloadPlan(TypedDict):
+    """Where to fetch the bytes."""
+
+    get_url: str
+
+class DownloadInit(TypedDict):
+    """``Execution.download()``: the plan, size, and base64 SHA-256 of one retained file."""
+
+    plan: DownloadPlan
+    size_bytes: int
+    sha256: str
+
+class CancelledExecution(TypedDict):
+    """``Execution.cancel()``: the execution and its status after the cancel."""
+
+    execution_id: str
+    status: ExecutionStatus
+
 class ExecutionState(TypedDict, Generic[DataT]):
     """``Execution.status()``: the lifecycle, terminal error, visible result, and grouping."""
 
@@ -619,6 +714,96 @@ class Execution:
                 passes first; ``WYRD_SPEC_400_VALIDATION`` for a negative
                 ``timeout``; the client's connection error on first use; and
                 any other status-read error.
+        """
+        ...
+
+    def invocations(self, limit: int | None = None, cursor: str | None = None) -> InvocationPage:
+        """Read one page of the execution's invocation attempts.
+
+        The first page fixes the listing's cut; ``next_cursor`` continues it
+        without gaps or duplicates and is ``None`` on its last page.
+
+        Args:
+            limit: entries per page, 1–200; 50 when omitted.
+            cursor: a previous page's ``next_cursor`` of this listing.
+
+        Returns:
+            The page, the execution's status, and its history projection.
+
+        Raises:
+            WyrdError: ``WYRD_SPEC_400_VALIDATION`` for a ``limit`` outside
+                1–200 or another listing's cursor;
+                ``WYRD_VERIFICATION_404_EXECUTION_NOT_FOUND`` for an absent or
+                foreign execution; the ``verifier:read`` authorization error;
+                and the client's connection or transport error.
+        """
+        ...
+
+    def publications(self, limit: int | None = None, cursor: str | None = None) -> PublicationPage:
+        """Read one page of the execution's accepted publications, without content.
+
+        Args:
+            limit: entries per page, 1–200; 50 when omitted.
+            cursor: a previous page's ``next_cursor`` of this listing.
+
+        Returns:
+            The page of names, kinds, and producers.
+
+        Raises:
+            WyrdError: As ``invocations``.
+        """
+        ...
+
+    def publication(self, producer: Producer, name: str) -> Publication:
+        """Read publication ``name`` of the exact ``producer`` attempt.
+
+        Args:
+            producer: a page item's ``producer``, or a ``step_id`` and
+                ``attempt`` with optional ``item_index`` and
+                ``iteration_index``.
+            name: the publication name.
+
+        Returns:
+            Its JSON ``value``, ``None`` included, or its file or directory
+            ``manifest``.
+
+        Raises:
+            WyrdError: ``WYRD_SPEC_400_VALIDATION`` for a malformed producer
+                or name or a zero attempt;
+                ``WYRD_VERIFICATION_404_PUBLICATION_NOT_FOUND`` when that
+                attempt published no such name; and as ``invocations``.
+        """
+        ...
+
+    def download(self, producer: Producer, name: str, path: str | None = None) -> DownloadInit:
+        """Plan the download of a file publication, or of one file of a directory publication.
+
+        Args:
+            producer: as ``publication``.
+            name: the publication name.
+            path: a directory publication's manifest path; ``None`` for a file.
+
+        Returns:
+            The download plan with the file's size and base64 SHA-256.
+
+        Raises:
+            WyrdError: ``WYRD_SPEC_400_VALIDATION`` for a JSON publication, a
+                ``path`` on a file, or a directory ``path`` its manifest does
+                not list; and as ``publication``.
+        """
+        ...
+
+    def cancel(self) -> CancelledExecution:
+        """Cancel the execution durably; an already terminal execution keeps its status.
+
+        Returns:
+            The execution and its status after the cancel.
+
+        Raises:
+            WyrdError: ``WYRD_VERIFICATION_404_EXECUTION_NOT_FOUND`` for an
+                absent or foreign execution; the ``verifier:run``
+                authorization error; and the client's connection or
+                transport error.
         """
         ...
 

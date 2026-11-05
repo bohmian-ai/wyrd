@@ -356,8 +356,10 @@ async fn readyz_returns_ok_when_all_probes_pass() {
     server.shutdown().await.expect("server shuts down");
 }
 
-/// A body past the configured ceiling must be refused as 413 problem+json by
-/// the edge layer, before any handler or credential check consumes it.
+/// A body past the configured ceiling, whether its length is known or only
+/// discovered while streaming, must be refused as 413 problem+json with its
+/// request id by the edge layer, before any handler or credential check
+/// consumes it.
 #[tokio::test]
 async fn oversized_body_returns_413_problem_json() {
     let server = WyrdTestServer::builder()
@@ -371,29 +373,41 @@ async fn oversized_body_returns_413_problem_json() {
         .await
         .expect("test server starts");
 
-    let response = server
-        .oneshot(
-            Request::builder()
-                .method("POST")
-                .uri("/v1/cards/upload/init")
-                .header("content-type", "application/json")
-                .header("x-wyrd-access-token", "Bearer invalid.token.here")
-                .body(axum::body::Body::from("a".repeat(100)))
-                .expect("request builds"),
-        )
-        .await
-        .expect("router responds");
+    // A sized body and a streamed one of unknown length are both refused.
+    let streamed = || {
+        axum::body::Body::from_stream(tokio_stream::iter(
+            (0..10).map(|_| Ok::<_, std::io::Error>("a".repeat(10))),
+        ))
+    };
+    for body in [axum::body::Body::from("a".repeat(100)), streamed()] {
+        let response = server
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/cards/upload/init")
+                    .header("content-type", "application/json")
+                    .header("x-wyrd-access-token", "Bearer invalid.token.here")
+                    .body(body)
+                    .expect("request builds"),
+            )
+            .await
+            .expect("router responds");
 
-    assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
-    assert_eq!(
-        response
-            .headers()
-            .get(axum::http::header::CONTENT_TYPE)
-            .and_then(|value| value.to_str().ok()),
-        Some("application/problem+json")
-    );
-    let problem = problem_json(response).await;
-    assert_eq!(problem["code"], "WYRD_SPEC_413_PAYLOAD_TOO_LARGE");
+        assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+        assert_eq!(
+            response
+                .headers()
+                .get(axum::http::header::CONTENT_TYPE)
+                .and_then(|value| value.to_str().ok()),
+            Some("application/problem+json")
+        );
+        assert!(
+            response.headers().contains_key("wyrd-request-id"),
+            "the refusal carries its request id"
+        );
+        let problem = problem_json(response).await;
+        assert_eq!(problem["code"], "WYRD_SPEC_413_PAYLOAD_TOO_LARGE");
+    }
 
     server.shutdown().await.expect("server shuts down");
 }

@@ -1500,6 +1500,74 @@ async fn local_signup_is_tenant_bound_and_rate_limited() {
     );
 }
 
+/// A User key request is bounded by Wyrd's configured body limit alone: under
+/// a 4 MiB limit, a valid request padded to 3 MiB with JSON whitespace is
+/// issued, past Axum's 2 MiB extraction default.
+///
+/// # Panics
+/// Panics when the server fails to start, the User cannot be enrolled, or the
+/// request is not issued with a no-store response.
+#[tokio::test(flavor = "current_thread")]
+async fn a_user_key_request_within_the_configured_body_limit_is_issued() {
+    let server = WyrdTestServerBuilder::default()
+        .with_limits_for_test(wyrd_server::state::LimitsConfig {
+            body_bytes: 4 * 1024 * 1024,
+            audio_upload_bytes: 26_214_400,
+            timeout: std::time::Duration::from_secs(30),
+            concurrency: 1024,
+        })
+        .start_in_process()
+        .await
+        .expect("test server starts");
+    let acme = server.pg_fixture().tenant_slug().to_owned();
+    let admin = admin_bearer(&server, server.data_tenant_id()).await;
+    let created = enroll(&server, &admin, "viewer", "padded", &strong(1)).await;
+    assert_eq!(created.status, StatusCode::CREATED, "{}", created.body);
+    let user = created.body["principal_id"].as_str().expect("id");
+    let mut body =
+        json!({ "name": "padded", "permission_ceiling": ["cards:read"], "expires_in": 3600 })
+            .to_string();
+    body.insert_str(1, &" ".repeat(3 * 1024 * 1024));
+    let response = server
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri(format!("/v1/principals/{user}/credentials"))
+                .header(header::HOST, "wyrd.test")
+                .header(header::ORIGIN, ORIGIN)
+                .header(
+                    header::COOKIE,
+                    format!(
+                        "{}={}",
+                        cookie_name(&acme),
+                        created.cookie_value(&cookie_name(&acme))
+                    ),
+                )
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(body))
+                .expect("request builds"),
+        )
+        .await
+        .expect("request responds");
+    let status = response.status();
+    let cache = response.headers().get(header::CACHE_CONTROL).cloned();
+    let bytes = to_bytes(response.into_body(), usize::MAX)
+        .await
+        .expect("body reads");
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "{}",
+        String::from_utf8_lossy(&bytes)
+    );
+    let issued: Value = serde_json::from_slice(&bytes).expect("JSON body");
+    assert_eq!(
+        cache.as_ref().map(axum::http::HeaderValue::as_bytes),
+        Some(&b"no-store"[..])
+    );
+    assert!(issued["credential"].is_string(), "the key is returned once");
+}
+
 /// A User key has one User owner, a stored sorted ceiling and an expiry;
 /// creating one for oneself needs a recent password session; its exchange
 /// carries the User's current grants narrowed to the ceiling; own listing

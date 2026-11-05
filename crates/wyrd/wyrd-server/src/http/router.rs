@@ -299,7 +299,9 @@ fn record_response(response: &axum::response::Response, latency: std::time::Dura
 ///   6. EdgeTimeout — enforces the per-request deadline; `POST /v1/query`
 ///      hands its remaining wait to the Oracle query deadline after admission
 ///   7. WyrdBodyLimit — enforces max body size
-///   8. handler
+///   8. DefaultBodyLimit::disable — leaves WyrdBodyLimit as the only size
+///      policy for extractors and explicit route readers
+///   9. handler
 pub(crate) fn apply_protected_edge<S>(router: Router<S>, state: &AppState) -> Router<S>
 where
     S: Clone + Send + Sync + 'static,
@@ -330,6 +332,9 @@ where
                 .then(|| state.bifrost.transport_admission()),
         ));
     router
+        // Wyrd's body limit above is the one request-size policy here; Axum's
+        // own 2 MiB extraction default would silently cap it.
+        .layer(axum::extract::DefaultBodyLimit::disable())
         .layer(inner_stack)
         .layer(CatchPanicLayer::custom(
             crate::http::error::wyrd_panic_response,

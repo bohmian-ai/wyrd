@@ -1819,6 +1819,124 @@ async fn invocation_checkpoints_are_fenced_and_survive_reclaim() {
     );
 }
 
+/// Rewrite `execution`'s record format and attempts as a newer or restored
+/// worker would find them.
+///
+/// # Panics
+/// Panics when the update fails.
+async fn set_record(conn: &mut TenantConn<'_>, execution: ExecutionId, format: i32, attempts: i32) {
+    sqlx::query(
+        "UPDATE wyrd.verifier_executions SET worker_format = $2, attempts = $3
+          WHERE execution_id = $1",
+    )
+    .bind(execution.as_uuid())
+    .bind(format)
+    .bind(attempts)
+    .execute(&mut **conn.transaction())
+    .await
+    .expect("record rewrites");
+}
+
+/// A worker never claims, reclaims, or exhausts a record of a newer format:
+/// an expired lease with attempts left and one with none are both left
+/// `running` with their attempts and checkpoints. Once a compatible worker
+/// owns the record again, its reclaim restores the same committed
+/// checkpoints.
+///
+/// # Panics
+/// Panics when an incompatible record is claimed or settled, or a compatible
+/// reclaim loses a checkpoint.
+#[tokio::test]
+async fn worker_formats_preserve_checkpoint_custody() {
+    let fixture = PgFixture::start().await.expect("fixture starts");
+    let actor = actor(fixture.data_tenant_id());
+    let queue = VerifierExecutionQueue::default();
+    let mut conn = fixture
+        .tenant_conn()
+        .await
+        .expect("tenant connection opens");
+    let (owner, _) = declare_service(&mut conn, &actor, "svc").await;
+    let verifier = register_verifier(&mut conn, &actor, "drift", custom_drift()).await;
+    let binding = bind(&mut conn, &owner, &verifier, Vec::new()).await;
+    let execution = scheduled(&queue, &mut conn, binding).await;
+    let (review, judge) = (
+        TaskId::new("review").expect("task id"),
+        TaskId::new("judge").expect("task id"),
+    );
+    let settled = InvocationSettlement::Action {
+        result: Box::new(StepResult {
+            id: review.clone(),
+            status: StepStatus::Succeeded,
+            output: Some(json!("ok")),
+            attempts: 1,
+            duration_ms: 1,
+            reason: None,
+            provenance: None,
+            tool_calls: Vec::new(),
+        }),
+        sources: BTreeSet::new(),
+    };
+    let first = claim(&queue, &mut conn).await;
+    for write in [
+        queue
+            .begin_invocation(&mut conn, first.lease, &review, 1)
+            .await,
+        queue
+            .settle_invocation(&mut conn, first.lease, &review, 1, &settled)
+            .await,
+        queue
+            .begin_invocation(&mut conn, first.lease, &judge, 1)
+            .await,
+    ] {
+        assert_eq!(write.expect("checkpoint answers"), Settlement::Applied);
+    }
+    let checkpoints = async |conn: &mut TenantConn<'_>| {
+        let mut recorded: Vec<_> = queue
+            .invocations(conn, execution)
+            .await
+            .expect("checkpoints read")
+            .into_iter()
+            .map(|invocation| {
+                (
+                    invocation.task.as_str().to_owned(),
+                    invocation.attempt,
+                    invocation.settlement.is_some(),
+                )
+            })
+            .collect();
+        recorded.sort();
+        recorded
+    };
+    let committed = checkpoints(&mut conn).await;
+
+    expire_deadlines(&mut conn, execution).await;
+    for attempts in [1, first.max_attempts] {
+        set_record(&mut conn, execution, 2, attempts).await;
+        let claimed = queue
+            .claim(&mut conn, Duration::minutes(5), Duration::hours(1), 1)
+            .await
+            .expect("claim runs");
+        assert!(claimed.is_empty(), "a newer record is never claimed");
+        let state = status(&queue, &mut conn, execution).await.state;
+        assert_eq!(
+            (state.status, state.error),
+            (VerificationExecutionStatus::Running, None),
+            "a newer record with {attempts} attempts is left as it is"
+        );
+        assert_eq!(checkpoints(&mut conn).await, committed);
+    }
+
+    set_record(&mut conn, execution, 1, 1).await;
+    let reclaimed = claim(&queue, &mut conn).await;
+    assert_eq!(reclaimed.lease.execution_id, execution);
+    assert_eq!(reclaimed.attempt, 2, "the reclaim is the next attempt");
+    assert_eq!(
+        checkpoints(&mut conn).await,
+        committed,
+        "a compatible reclaim restores every committed checkpoint"
+    );
+}
+
 /// A submission's enqueuing cause, including the caller's sampling
 /// decision, is returned unchanged by its first claim and by the reclaim of
 /// an expired lease, so every attempt links back to the same caller.

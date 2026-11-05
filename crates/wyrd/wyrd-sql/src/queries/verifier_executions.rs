@@ -415,7 +415,8 @@ const WORKER_FORMAT: i32 = 1;
 /// whose clock differs from the database can neither claim early nor hold a
 /// lease the database believes already expired. Only executions whose
 /// `worker_format` is at most `$5`, this worker's [`WORKER_FORMAT`], are
-/// claimed. Each claim also returns the
+/// claimed or exhausted, so a newer record keeps its attempts and checkpoints
+/// for a worker that understands it. Each claim also returns the
 /// Verifier's ready fitted Drift baselines keyed by requirement, so the drift
 /// engine opens no connection to read them; the Verifier, subject, and SYSTEM
 /// principal are resolved by the caller through `wyrd.verification_target`.
@@ -427,7 +428,7 @@ const CLAIM_SQL: &str = r"
                updated_at = statement_timestamp()
          WHERE x.status = 'running'
            AND x.lease_expires_at <= statement_timestamp()
-           AND x.attempts >= x.max_attempts
+           AND x.attempts >= x.max_attempts AND x.worker_format <= $5
     ),
     due AS (
         SELECT execution_id, next_attempt_at AS due_at

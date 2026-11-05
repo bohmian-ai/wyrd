@@ -136,6 +136,11 @@ replication, monitoring, failover, and extension roles. Capacity validation
 uses the maximum replicas permitted by autoscaling or rollout surge, not the
 steady replica count.
 
+Pool maxima are operator budgets: startup never grows them with CPU or memory.
+The app pool maximum caps the process Scribe outbox's concurrent writers, and
+each process records its app, Vala, and platform-admin maxima in its
+`startup_allocation`.
+
 Transaction-mode PgBouncer requires statement-cache capacity `0` on every pool
 routed through it. Tenant binding remains transaction-local. Session-scoped
 state, session advisory locks, and `LISTEN`/`NOTIFY` are not used on a

@@ -1168,16 +1168,24 @@ charge an idle role holds nothing, and every charge returns when its owner
 ends. Aggregate governed reservations therefore cannot sum above
 the Bifrost cap.
 
-The cap comes from the detected process or pod memory limit. `wyrd-server`
-keeps at least 1 GiB of that limit outside governed Bifrost memory
-(`WYRD_SERVER_MEMORY_MIN_BYTES` raises the minimum); the cap defaults to the
-limit less that minimum, and `WYRD_BIFROST_MEMORY_LIMIT_BYTES` may only lower
-it. The minimum is accounting headroom, not preallocated memory and not a
-ceiling on other server work. A plan that cannot leave both the minimum and a
-positive Bifrost cap fails boot, so an 8-GiB pod defaults to a 7-GiB cap.
-Every Wyrd pod has at least 4 GiB of memory; boot refuses a detected limit
-below that floor, so the smallest supported pod has a 3-GiB cap and a
-1.5-GiB query grant.
+The cap comes from one startup observation of process memory `M`: the
+detected process or pod limit, which `WYRD_PROCESS_MEMORY_LIMIT_BYTES`
+(`[resources].memory_limit_bytes`) may only lower. `wyrd-server` keeps a
+server envelope `H = max(minimum, M / 4)` outside governed Bifrost memory; the
+minimum is 1 GiB and `WYRD_SERVER_MEMORY_MIN_BYTES` raises it. Of `H`, an
+API-serving target grants a quarter to the gateway and every target a quarter
+to the process Scribe outbox; the rest, and the gateway share of a target that
+serves no API, is other server headroom. The cap defaults to `M - H`, and
+`WYRD_BIFROST_MEMORY_LIMIT_BYTES` may only lower it. These are software
+budgets, not preallocated memory, operating-system quotas, or an RSS cap. A
+plan that cannot leave both the envelope and a positive Bifrost cap fails
+boot, so an 8-GiB pod has a 2-GiB envelope and a 6-GiB cap, and a 32-GiB pod
+an 8-GiB envelope and a 24-GiB cap. Every Wyrd pod has at least 4 GiB of
+memory; boot refuses a detected limit below that floor, so the smallest
+supported pod has a 3-GiB cap and a 1.5-GiB query grant. Boot logs the
+resolved partition and every grant derived from it as one
+`startup_allocation` object, which the loopback benchmark listener also
+serves.
 
 Only fallible cooperative reservation is hard-limited. Growth DataFusion does
 not let fail is still real memory, so it is charged to an explicit process

@@ -800,8 +800,9 @@ engine mechanics. Permissions are blocking; audits are non-blocking. Every
 audited surface stages its decision in memory on the one process Scribe outbox
 once the decision is known, outside the operation's transaction, and never
 waits for the write. The outbox admits a finite process capacity, by writes
-(`scribe.outbox_capacity`, default 1,048,576, so bytes normally bind) and by accounted bytes
-(`scribe.outbox_bytes`, default 1 GiB, counting at least every captured
+(`scribe.outbox_capacity`, an optional ceiling on the count the outbox's
+startup memory grant holds, so bytes normally bind) and by accounted bytes
+(`scribe.outbox_bytes`, an optional ceiling on half that grant, counting at least every captured
 payload and object a write holds and the Arrow memory its staged rows own,
 with an immutable column every write shares resident once for the process),
 covering queued, waiting, retrying, and in-flight writes. An audit decision or gateway capture staged past its share

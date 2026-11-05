@@ -183,7 +183,7 @@ impl ServeMode {
 }
 
 /// Internal process composition for the Forge maintenance topology.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Default, clap::ValueEnum)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default, clap::ValueEnum)]
 #[serde(rename_all = "kebab-case")]
 #[clap(rename_all = "kebab-case")]
 pub enum BifrostTarget {
@@ -1528,18 +1528,17 @@ pub struct AllocationInputs {
 }
 
 /// Which startup-composed owners this process runs.
+///
+/// The process Scribe outbox is composed by every target; the target names
+/// the full Bifrost role set, which the Bifrost plan also reports.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 pub struct AllocationRoles {
+    /// The process target the roles derive from.
+    pub target: BifrostTarget,
     /// The gateway, composed only by an API-serving target.
     pub gateway: bool,
-    /// The process Scribe outbox, composed by every target.
-    pub outbox: bool,
-    /// The Scribe role.
+    /// The Scribe role, whose pools take the Scribe thread grants.
     pub scribe: bool,
-    /// The Oracle role.
-    pub oracle: bool,
-    /// The Forge coordinator or worker role.
-    pub forge: bool,
 }
 
 /// The term that bound each `min`-derived grant.
@@ -1781,14 +1780,10 @@ impl WyrdServerConfig {
                 )));
             }
         };
-        let roles = self.bifrost_roles();
         let roles = AllocationRoles {
+            target: self.role,
             gateway: self.role.serves_api(),
-            outbox: true,
-            scribe: roles.contains(&BifrostRuntimeRole::Scribe),
-            oracle: roles.contains(&BifrostRuntimeRole::Oracle),
-            forge: roles.contains(&BifrostRuntimeRole::ForgeCoordinator)
-                || roles.contains(&BifrostRuntimeRole::ForgeWorker),
+            scribe: self.bifrost_roles().contains(&BifrostRuntimeRole::Scribe),
         };
         let gateway_bytes = if roles.gateway { server_bytes / 4 } else { 0 };
         let outbox_bytes = server_bytes / 4;

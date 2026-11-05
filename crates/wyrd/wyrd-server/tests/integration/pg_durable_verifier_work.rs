@@ -101,6 +101,62 @@ impl Leased {
     }
 }
 
+impl Leased {
+    /// Expire the lease on the database clock and claim the execution again,
+    /// returning the new lease; the old one is stale from then on.
+    ///
+    /// # Panics
+    /// Panics when the update or claim fails.
+    async fn reclaim(&self) -> ExecutionLease {
+        let mut conn = self
+            .server
+            .tenant_conn_for(self.server.data_tenant_id())
+            .await
+            .expect("tenant connection opens");
+        sqlx::query(
+            "UPDATE wyrd.verifier_executions SET lease_expires_at = statement_timestamp() \
+             WHERE execution_id = $1",
+        )
+        .bind(self.lease.execution_id.as_uuid())
+        .execute(&mut **conn.transaction())
+        .await
+        .expect("the lease expires");
+        let claimed = VerifierExecutionQueue::default()
+            .claim(
+                &mut conn,
+                chrono::Duration::minutes(5),
+                chrono::Duration::minutes(5),
+                1,
+            )
+            .await
+            .expect("claim runs")
+            .pop()
+            .expect("the expired lease is reclaimable");
+        conn.commit().await.expect("the reclaim commits");
+        claimed.lease
+    }
+
+    /// Every accepted publication of the execution as (task, attempt, name).
+    ///
+    /// # Panics
+    /// Panics when the read fails.
+    async fn entries(&self) -> Vec<(String, i32, String)> {
+        let mut conn = self
+            .server
+            .tenant_conn_for(self.server.data_tenant_id())
+            .await
+            .expect("tenant connection opens");
+        sqlx::query_as(
+            "SELECT task_id, attempt, name FROM wyrd.verifier_execution_publications \
+             WHERE execution_id = $1 ORDER BY attempt, sequence",
+        )
+        .bind(self.lease.execution_id.as_uuid())
+        .fetch_all(&mut **conn.transaction())
+        .await
+        .expect("the publications read")
+    }
+}
+
 /// A call of `producer` publishing under `name`.
 fn call(id: &str, producer: &Producer, name: &str) -> PublishCall {
     PublishCall {
@@ -445,6 +501,128 @@ async fn directory_snapshot_is_complete_or_rejected() {
             },
         }),
         "the snapshot waits for the writer and freezes the tree it left"
+    );
+    leased
+        .server
+        .shutdown()
+        .await
+        .expect("test server shuts down");
+}
+
+/// A replay of the same call and arguments recovers its one receipt; the
+/// same name from another call, or from that call with other arguments,
+/// conflicts; a fresh attempt publishes the name again with its own
+/// attribution. An upload that fails, or a publication under a lease since
+/// reclaimed, leaves nothing readable.
+///
+/// # Panics
+/// Panics when a replay adds an entry, a conflict is accepted, attempts
+/// merge, or a failed or stale publication becomes readable.
+#[tokio::test(flavor = "multi_thread")]
+async fn publication_replay_preserves_attempt_identity() {
+    let leased = Leased::start().await;
+    let limits = HostedLimits::default();
+    let caller = user(leased.server.data_tenant_id(), []);
+    let workspace = Workspace::materialize(Vec::new(), limits, None).expect("workspace");
+    let publications = Publications::new(leased.server.state(), &caller, leased.lease, limits);
+    let first = Producer {
+        step_id: TaskId::new("review").expect("task"),
+        item_index: None,
+        iteration_index: None,
+        attempt: 1,
+    };
+    let second = Producer {
+        attempt: 2,
+        ..first.clone()
+    };
+    put(&workspace, "notes.md", b"notes");
+
+    for _ in 0..2 {
+        assert_eq!(
+            publications
+                .json(&call("c1", &first, "report"), json!({"v": 1}))
+                .await
+                .expect("the call and its replay answer one receipt"),
+            PublicationKind::Json
+        );
+        publications
+            .path(&call("f1", &first, "notes"), &workspace, "/work/notes.md")
+            .await
+            .expect("the file call and its replay answer one receipt");
+    }
+    for (id, value) in [("c1", json!({"v": 2})), ("c2", json!({"v": 1}))] {
+        let error = publications
+            .json(&call(id, &first, "report"), value)
+            .await
+            .expect_err("another call or argument set conflicts");
+        assert_eq!(rule(&error), "publication_name");
+    }
+    publications
+        .json(&call("c3", &second, "report"), json!({"v": 3}))
+        .await
+        .expect("a fresh attempt publishes the name again");
+    assert_eq!(
+        (
+            leased.read(&first, "report").await,
+            leased.read(&second, "report").await
+        ),
+        (
+            Some(PublicationContent::Json {
+                value: json!({"v": 1})
+            }),
+            Some(PublicationContent::Json {
+                value: json!({"v": 3})
+            })
+        ),
+        "each attempt keeps its own attribution"
+    );
+
+    let wyrd_storage::BackendConfig::Local { root } =
+        leased.server.state().storage.backend_config()
+    else {
+        panic!("the test server stores locally");
+    };
+    let evidence = root
+        .join(leased.server.data_tenant_id().to_string())
+        .join("evidence/sha256");
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        put(&workspace, "tree/kept.md", b"kept");
+        put(&workspace, "tree/new.md", b"never stored");
+        std::fs::set_permissions(&evidence, std::fs::Permissions::from_mode(0o555)).expect("chmod");
+        let failed = publications
+            .path(&call("t1", &first, "tree"), &workspace, "/work/tree")
+            .await;
+        std::fs::set_permissions(&evidence, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+        failed.expect_err("an upload that fails publishes nothing");
+    }
+
+    let current = leased.reclaim().await;
+    let stale = publications
+        .json(&call("c4", &second, "late"), json!(null))
+        .await
+        .expect_err("a reclaimed lease publishes nothing");
+    assert!(
+        stale.to_string().contains("no longer holds its lease"),
+        "{stale}"
+    );
+    publications
+        .json(&call("c1", &first, "report"), json!({"v": 1}))
+        .await
+        .expect_err("a replay under the stale lease is fenced too");
+    Publications::new(leased.server.state(), &caller, current, limits)
+        .json(&call("c5", &second, "late"), json!(null))
+        .await
+        .expect("the current lease publishes");
+    assert_eq!(
+        leased.entries().await,
+        [
+            ("review".to_owned(), 1, "report".to_owned()),
+            ("review".to_owned(), 1, "notes".to_owned()),
+            ("review".to_owned(), 2, "report".to_owned()),
+            ("review".to_owned(), 2, "late".to_owned()),
+        ],
+        "one entry per accepted call, none for the failed upload or stale lease"
     );
     leased
         .server

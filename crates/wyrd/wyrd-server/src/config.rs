@@ -1805,7 +1805,7 @@ impl WyrdServerConfig {
         let outbox_item_bytes = scribe
             .outbox_bytes
             .map_or(derived_item_bytes, |cap| cap.min(derived_item_bytes));
-        let outbox_work_bytes = outbox_bytes - derived_item_bytes;
+        let outbox_work_bytes = outbox_bytes - outbox_item_bytes;
         let derived_items = outbox_item_bytes / size_of::<crate::scribe_outbox::ScribeWrite>();
         let outbox_items = scribe
             .outbox_capacity
@@ -4652,8 +4652,38 @@ mod tests {
                 grant.gateway_slots,
                 grant.limited_by.gateway_slots,
             ),
-            (4, 64 * MIB, GIB, 10, 4, 16 * MIB, 5, "configured")
+            (
+                4,
+                64 * MIB,
+                2 * GIB - 64 * MIB,
+                10,
+                4,
+                16 * MIB,
+                5,
+                "configured"
+            )
         );
+        assert_eq!(
+            grant.outbox_item_bytes + grant.outbox_work_bytes,
+            grant.outbox_bytes
+        );
+        let mut capped = WyrdServerConfig::default();
+        capped.bifrost.scribe.outbox_bytes = Some(64 * MIB);
+        let grant = allocate(&capped, 8, 4 * GIB).expect("a capped 4 GiB plan allocates");
+        assert_eq!(
+            (
+                grant.outbox_bytes,
+                grant.outbox_item_bytes,
+                grant.outbox_work_bytes,
+                grant.frame_slots,
+                grant.outbox_writers,
+            ),
+            (256 * MIB, 64 * MIB, 192 * MIB, 6, 6)
+        );
+        capped.bifrost.scribe.ingest_request_bytes = 80 * MIB;
+        let grant = allocate(&capped, 8, 4 * GIB)
+            .expect("80 MiB frames fit the workspace the retained cap leaves");
+        assert_eq!((grant.frame_slots, grant.outbox_writers), (1, 1));
         let mut large = WyrdServerConfig::default();
         large.bifrost.scribe.outbox_bytes = Some(8 * GIB);
         large.bifrost.scribe.outbox_capacity = Some(usize::MAX);

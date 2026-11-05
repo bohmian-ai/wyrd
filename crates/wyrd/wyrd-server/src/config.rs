@@ -2049,9 +2049,11 @@ fn default_ingest_wal_workspace_bytes() -> usize {
     vala_bifrost_redux::gate::limits::BIFROST_WAL_WORKSPACE_LIMIT_BYTES
 }
 
-/// Defaults with every worker-thread and outbox setting omitted, so
+/// Defaults with the coordination, ingress-CPU, and persistence-CPU worker
+/// counts and the outbox item and byte limits omitted, so
 /// [`WyrdServerConfig::server_allocation`] derives them from the startup
-/// observation; set, each may only lower its derived value.
+/// observation. A set worker count replaces its derived value; a set outbox
+/// limit only lowers its derived value.
 impl Default for ScribeRuntimeConfig {
     fn default() -> Self {
         Self {

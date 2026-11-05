@@ -10,5 +10,6 @@
     "target": "ES2023",
     "types": ["node"]
   },
-  "include": ["*/*.ts"]
+  "include": ["*/*.ts"],
+  "exclude": ["ui-app"]
 }

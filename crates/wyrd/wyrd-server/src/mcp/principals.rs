@@ -27,8 +27,9 @@ use serde::de::DeserializeOwned;
 use serde_json::Value as JsonValue;
 use wyrd_runtime::Permission;
 use wyrd_spec::auth::{
-    CredentialListResponse, CredentialRevoked, ListCredentialsArgs, PrincipalSummary,
-    RevokeCredentialArgs, SetWorkloadRestrictionArgs,
+    CredentialListQuery, CredentialListResponse, CredentialRevoked, CurrentUserArgs,
+    CurrentUserProfile, ListCredentialsArgs, PrincipalSummary, RevokeCredentialArgs,
+    SetWorkloadRestrictionArgs,
 };
 use wyrd_spec::error::WyrdError;
 
@@ -38,6 +39,9 @@ use crate::http::error::internal_failure;
 
 /// Wire name of the credential-metadata listing.
 pub(super) const LIST_CREDENTIALS: &str = "principals.list_credentials";
+
+/// Wire name of the calling User's safe profile.
+pub(super) const ME: &str = "principals.me";
 
 /// Wire name of the credential revocation.
 pub(super) const REVOKE_CREDENTIAL: &str = "principals.revoke_credential";
@@ -51,7 +55,7 @@ pub(super) const SET_WORKLOAD_RESTRICTION: &str = "principals.set_workload_restr
 /// discover and observe. Nothing here returns secret material.
 #[must_use]
 pub(super) fn descriptors_unscoped() -> Vec<Tool> {
-    vec![list_credentials_tool()]
+    vec![list_credentials_tool(), me_tool()]
 }
 
 /// The tools shown only to a caller holding principal administration.
@@ -83,15 +87,15 @@ pub(super) fn may_administer_tenant(caller: &Caller) -> bool {
         .contains(&Permission::wildcard())
 }
 
-/// Whether this caller holds tenant principal administration.
+/// Whether this caller may revoke a credential: tenant principal
+/// administration, or a User's own-key `personal_credentials:write`.
 ///
-/// Reads the same permission the HTTP surface requires, from the verified
+/// Reads the same permissions the HTTP surface requires, from the verified
 /// token, so the two cannot disagree about who may write.
 pub(super) fn may_administer(caller: &Caller) -> bool {
-    caller
-        .principal
-        .effective_permissions
-        .contains(&Permission::service_accounts_write())
+    let held = &caller.principal.effective_permissions;
+    held.contains(&Permission::service_accounts_write())
+        || held.contains(&Permission::personal_credentials_write())
 }
 
 /// Derive one tool schema from the Rust type the tool actually speaks.
@@ -148,7 +152,23 @@ fn list_credentials_tool() -> Tool {
         "List the non-secret credential metadata for one principal in this caller's tenant: \
          identifier, lookup prefix, creation, expiry, revocation, and last use. Never returns \
          secret material. Includes revoked and expired credentials, so a rotation can be \
-         confirmed complete.",
+         confirmed complete. Without limit or cursor an administrator reads the complete \
+         listing; either selects one page (limit 1-100, default 50) whose next_cursor, when \
+         present, continues it. A User listing its own keys without principal administration \
+         must page.",
+        true,
+    )
+}
+
+/// Descriptor for the calling User's safe profile.
+fn me_tool() -> Tool {
+    tool::<CurrentUserArgs, CurrentUserProfile>(
+        ME,
+        "Read my profile",
+        "Read the calling User's safe profile in this tenant: route key, ids, canonical local \
+         username (null for an SSO-only account), whether the account signs in by password or \
+         SSO, and the caller's effective permission names. Takes an empty object. Refused for \
+         a caller that is not a User.",
         true,
     )
 }
@@ -161,7 +181,7 @@ fn revoke_credential_tool() -> Tool {
         "Retire one credential belonging to a principal in this caller's tenant. The credential \
          can mint no further token; a token it already minted lapses within five minutes. The \
          principal, its roles, and its other credentials are untouched. Requires \
-         service_accounts:write.",
+         service_accounts:write, or personal_credentials:write for a User's own key.",
         false,
     )
 }
@@ -216,6 +236,10 @@ impl WyrdMcpHandler {
             &self.state,
             &caller,
             args.principal_id.as_uuid(),
+            &CredentialListQuery {
+                limit: args.limit,
+                cursor: args.cursor,
+            },
         )
         .await?;
 
@@ -223,6 +247,26 @@ impl WyrdMcpHandler {
             serde_json::to_value(listing).map_err(|error| {
                 internal_failure("credential listing could not be projected", &error)
             })?,
+        ))
+    }
+
+    /// Read the calling User's safe profile.
+    ///
+    /// # Errors
+    /// Returns a Wyrd error when the arguments are not an empty object, the
+    /// caller is not a User, or the read fails.
+    pub(super) async fn mcp_me(
+        &self,
+        caller: Caller,
+        arguments: Option<JsonMap<String, JsonValue>>,
+    ) -> Result<CallToolResult, WyrdError> {
+        let CurrentUserArgs {} = parse_args(Some(arguments.unwrap_or_default()), ME)?;
+        let profile =
+            crate::components::principals::accounts::current_user_profile(&self.state, &caller)
+                .await?;
+        Ok(CallToolResult::structured(
+            serde_json::to_value(profile)
+                .map_err(|error| internal_failure("profile could not be projected", &error))?,
         ))
     }
 

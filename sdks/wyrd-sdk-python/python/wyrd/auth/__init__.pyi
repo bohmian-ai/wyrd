@@ -1,4 +1,4 @@
-from typing import Literal, TypeAlias, TypedDict
+from typing import Literal, NotRequired, TypeAlias, TypedDict
 
 from ..client import WyrdClient
 
@@ -106,11 +106,28 @@ class CredentialMetadata(TypedDict):
     expires_at: str | None
     revoked_at: str | None
     last_used_at: str | None
+    name: NotRequired[str]
+    """A User key's name; absent for Service and Admin keys."""
+    permission_ceiling: NotRequired[list[str]]
+    """A User key's sorted permission ceiling; absent for Service and Admin keys."""
 
 class CredentialList(TypedDict):
     """A principal's credentials."""
 
     credentials: list[CredentialMetadata]
+    next_cursor: NotRequired[str]
+    """The following page's cursor; absent on the last page and complete lists."""
+
+class CurrentUserProfile(TypedDict):
+    """The calling User's safe profile; ``permissions`` are informational."""
+
+    tenant: str
+    tenant_id: str
+    principal_id: str
+    principal_kind: Literal["user"]
+    username: str | None
+    authentication: Literal["password", "sso"]
+    permissions: list[str]
 
 class RevokePrincipalRequest(TypedDict):
     """Revoke a principal of ``principal_kind`` for an audited ``reason``."""
@@ -204,6 +221,34 @@ class Principals:
             WyrdError: ``WYRD_PERMISSION_403_DENIED_RBAC`` without
                 ``service_accounts:write``;
                 ``WYRD_AUTH_404_PRINCIPAL_NOT_FOUND`` for an unknown principal.
+
+        """
+        ...
+
+    def list_credentials_page(
+        self, principal_id: str, *, limit: int | None = None, cursor: str | None = None
+    ) -> CredentialList:
+        """Read one page of a principal's credential metadata, newest first.
+
+        Args:
+            principal_id: the principal whose credentials to list.
+            limit: page size, 1 to 100; 50 when omitted.
+            cursor: the previous page's ``next_cursor`` for the same principal.
+
+        Raises:
+            WyrdError: ``WYRD_SPEC_400_VALIDATION`` for a bad limit or a cursor
+                of another principal; ``WYRD_PERMISSION_403_DENIED_RBAC`` when
+                the caller may not read these credentials.
+
+        """
+        ...
+
+    def me(self) -> CurrentUserProfile:
+        """Read the calling User's safe profile.
+
+        Raises:
+            WyrdError: ``WYRD_PERMISSION_403_DENIED_RBAC`` when the caller is
+                not a User.
 
         """
         ...

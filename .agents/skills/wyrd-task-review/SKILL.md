@@ -85,19 +85,28 @@ use the harness's agent-delegation capability to spawn separate fresh subagents;
 simulating multiple reviewer roles in one context does not satisfy this skill.
 No agent may fill more than one role.
 
-Select reviewers for the round's affected boundaries:
+Specialist selection is a mandatory contract-coverage obligation. Before
+spawning discovery reviewers, record each materially affected contract or
+invariant, its owners, producers and consumers, applicable specialist roles,
+and source-backed justification for each selection or omission. Assess impact
+from task obligations and actual behavior, including unchanged dependencies;
+diff paths alone do not define acceptance coverage. Carry-forward requires
+prior review evidence covering the relevant contract or invariant; unchanged
+files alone are insufficient. Missing prior evidence requires targeted review
+of that gap under the remediation scope rules, not a repository-wide restart.
+
+Select every required role under these applicability criteria:
 
 1. **First review:** spawn one fresh `behavior-rev` for comprehensive adversarial
    discovery. It covers behavior and invariants, applicable repository rules,
    maintainability, and credible failure/recovery paths. These obligations
    remain required when no specialist is selected.
-2. **Conditional specialists:** add `invariant-rev` for materially complex shared
-   state or lifecycle behavior, `repo-rev` for broad cross-tier rule coverage,
+2. **Required specialists when applicable:** add `invariant-rev` for materially
+   complex shared state or lifecycle behavior, `repo-rev` for broad cross-tier rule coverage,
    `maintainer-rev` for substantial ownership or abstraction changes, and
    `system-rev` for material failure-propagation or recovery changes. Spawn a
-   `domain-rev` for each materially changed sensitive boundary requiring domain
+   `domain-rev` for each materially affected sensitive boundary requiring domain
    expertise, such as security/RBAC, tenancy, concurrency, or persistent data.
-   Mere use of an established boundary does not require its own reviewer.
    Scope specialists to that boundary and run independent discovery in parallel.
 3. **Remediation review:** default to one fresh `ponytail-rev` checking closure,
    changed code, and affected paths. Add discovery or specialist reviewers only
@@ -123,7 +132,8 @@ without an intended verdict. Full cumulative context remains available to all.
 The orchestrator routes inputs, records coverage and reviewer selection,
 compares claims, and writes artifacts from the validated ledger; it does not
 validate its own findings. A missing selected reviewer/report or a changed
-candidate returns `BLOCKED`; an unselected specialist requires no report.
+candidate returns `BLOCKED`; a specialist with source-backed justification for
+non-applicability requires no report.
 
 ## Materiality and correction burden
 
@@ -342,9 +352,10 @@ correction. A healthy-path test alone cannot prove a changed recovery path.
 
 ## Independent sensitive domain review (`domain-rev`)
 
-Spawn a separate `domain-rev` for each sensitive domain materially changed by
-the candidate. Scope each agent to one coherent domain and give it the approved
-specification, original task, complete diff, governing authority, surrounding
+Spawn a separate `domain-rev` for each materially affected sensitive domain
+identified by the specialist applicability record. Scope each agent to one
+coherent domain and give it the approved specification, original task, complete
+diff, governing authority, surrounding
 code, available verification results, and exact report path needed to trace that
 boundary end to end. Examples include an RBAC/security reviewer for permission
 and trust-boundary changes or a data-layer reviewer for transaction, RLS,
@@ -372,14 +383,23 @@ predetermined count or obtain agreement.
 
 Always spawn a fresh `ponytail-rev` after any selected discovery and follow-up
 are complete, even when their proposed finding union is empty. Give it the
-immutable subject, applicable authorities, round scope and relevant diffs,
-all selected reviewer reports, prior verdicts and acceptance/closure evidence,
+immutable subject, applicable authorities, round scope, specialist applicability
+record, relevant diffs, all selected reviewer reports, prior verdicts and
+acceptance/closure evidence,
 and remediation tasks, but no intended verdict. On remediation it independently
 checks the fix and affected paths rather than merely accepting claimed closure;
 unaffected evidence carries forward under the scope rules above. Check that
 selected and carried-forward evidence cover the applicable acceptance and
 repository obligations, including when the proposed finding union is empty.
 Investigate a specific missing proof; do not repeat comprehensive discovery.
+
+Independently verify specialist applicability and coverage, including omitted
+roles and the evidence used to carry their coverage forward. If a required
+specialist was missed, the orchestrator obtains its review and the validator
+checks that report before issuing a verdict. An unavailable required review
+returns `BLOCKED`. An empty finding ledger cannot substitute for required
+specialist coverage. Use the existing orchestrator and validator; no additional
+reviewer role or approval stage is introduced.
 
 The `ponytail-rev` independently inspects the actual source, validates every
 proposed finding and correction, including claims from only one reviewer. It
@@ -454,12 +474,14 @@ blocks the review. Preserve its final ledger and recommendations as
 
 In the established review directory, preserve the selected reviewers' reports
 and `findings-validation.md`, then write `verdict.md` containing the immutable
-subject, round scope and carried-forward evidence, reviewer selection and
-coverage, reconciled acceptance matrix, independent review results, follow-up
+subject, round scope and carried-forward evidence, validated specialist
+applicability, reviewer selection and coverage, reconciled acceptance matrix,
+independent review results, follow-up
 decision, validated finding ledger, verification limits, prior-finding closure,
 any required convergence assessment, and one verdict:
 
-- `PASS` — all required reports are complete, the independently validated ledger
+- `PASS` — specialist applicability and coverage are independently validated,
+  all required reports are complete, the independently validated ledger
   is empty, every obligation passes after reconciling proposed findings with
   source or carried-forward evidence, non-goals remain excluded, verification
   is credible, and no unrelated change entered the diff. Exhaustive edge-case

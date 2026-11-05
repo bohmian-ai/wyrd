@@ -11,6 +11,7 @@ pub mod api_keys;
 pub mod browser_sessions;
 pub mod device_authorizations;
 pub mod human_connections;
+pub mod local_passwords;
 pub mod login_state;
 /// Discovery of the users and Service or Agent principals a tenant
 /// administrator can assign Roles to.
@@ -26,7 +27,8 @@ pub mod users;
 pub mod workload_bindings;
 
 pub use api_keys::{
-    ApiKeyMetadataRow, credential_belongs_to, list_api_key_metadata, revoke_api_key,
+    ApiKeyMetadataRow, credential_belongs_to, list_api_key_metadata, page_api_key_metadata,
+    revoke_api_key,
 };
 pub use browser_sessions::{
     BrowserSessionAuthority, LiveBrowserSession, insert_browser_session, live_browser_session,
@@ -43,6 +45,11 @@ pub use human_connections::{
     insert_human_candidate, live_human_connections, lock_human_connection_slot,
     promote_tested_human_candidate, remove_human_connection, replace_human_candidate,
     sealed_tenant_secrets, stamp_human_candidate_tested, swap_sealed_tenant_secret,
+};
+pub use local_passwords::{
+    AttemptScope, InvitationRow, PasswordResetRow, attempt_refusal, consume_invitation,
+    consume_password_reset, insert_invitation, insert_password_reset, record_attempt_failure,
+    revoke_invitation,
 };
 pub use login_state::{LoginState, consume_login_state, insert_login_state};
 pub use principal_directory::{
@@ -62,18 +69,22 @@ pub use roles::{
     RoleRow, delete_role, insert_role, list_roles, role_by_id, role_by_name, roles_by_name,
 };
 pub use service_accounts::{
-    ApiKeyLookupRow, ApiKeyStatus, ServiceAccountPrincipalRow, api_key_by_prefix,
-    api_key_status_by_prefix, delete_service_account, family_account_id, insert_api_key,
-    insert_refresh_token, insert_service_account, provision_system_principal,
-    service_account_by_id, set_workload_restriction, system_principal_id,
-    tenant_admin_principal_id, touch_api_key_last_used, workload_family,
+    ApiKeyLookupRow, ApiKeyOwner, ApiKeyStatus, ServiceAccountPrincipalRow, api_key_by_prefix,
+    api_key_owner, api_key_status_by_prefix, delete_service_account, family_account_id,
+    insert_api_key, insert_refresh_token, insert_service_account, insert_user_api_key,
+    provision_system_principal, service_account_by_id, set_workload_restriction,
+    system_principal_id, tenant_admin_principal_id, touch_api_key_last_used, workload_family,
 };
 pub use trusted_issuers::{
     TrustedIssuerWrite, delete_trusted_issuer, insert_trusted_issuer, trusted_issuer_by_url,
     trusted_issuer_exists, trusted_issuers_for_tenant, upsert_trusted_issuer,
 };
 pub use user_identities::{upsert_user_identity, user_id_by_identity};
-pub use users::{UserRow, delete_user, insert_user, user_by_id};
+pub use users::{
+    LocalCredentialRow, UserRow, delete_user, insert_local_user, insert_user,
+    local_credential_by_username, local_credential_for_update, local_username, set_password_hash,
+    user_by_id,
+};
 pub use workload_bindings::{
     WorkloadBindingWrite, delete_workload_binding, delete_workload_bindings_for_issuer,
     insert_workload_binding, upsert_workload_binding, workload_binding_by_key,

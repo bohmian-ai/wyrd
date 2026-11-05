@@ -103,6 +103,14 @@ pub enum Resource {
     /// the tenant. The built-in `admin` role reaches it through its wildcard;
     /// no other built-in role grants it.
     IdentityConnections,
+    /// The calling User's own personal API keys.
+    ///
+    /// Self-only: a real User's resolved authority always includes
+    /// `personal_credentials:read` and `personal_credentials:write`, which
+    /// list and revoke (and, after a recent human sign-in, create) only that
+    /// User's own keys. Service and Admin authority never receives them, and
+    /// they never reach another principal's credentials.
+    PersonalCredentials,
     /// The tenant directory itself: creating, inspecting, suspending, and
     /// recovering administration for a tenant.
     ///
@@ -239,6 +247,7 @@ impl Resource {
             Self::ServiceAccounts => "service_accounts",
             Self::Users => "users",
             Self::IdentityConnections => "identity_connections",
+            Self::PersonalCredentials => "personal_credentials",
             Self::Tenants => "tenants",
             Self::PlatformIdentity => "platform_identity",
             Self::PlatformCredentials => "platform_credentials",
@@ -633,6 +642,26 @@ impl Permission {
         }
     }
 
+    /// List the calling User's own personal keys.
+    #[must_use]
+    pub const fn personal_credentials_read() -> Self {
+        Self {
+            resource: Resource::PersonalCredentials,
+            action: Action::Read,
+            scope: PermissionScope::All,
+        }
+    }
+
+    /// Revoke and create the calling User's own personal keys.
+    #[must_use]
+    pub const fn personal_credentials_write() -> Self {
+        Self {
+            resource: Resource::PersonalCredentials,
+            action: Action::Write,
+            scope: PermissionScope::All,
+        }
+    }
+
     /// Manage users.
     #[must_use]
     pub const fn users_manage() -> Self {
@@ -856,6 +885,7 @@ fn parse_resource(value: &str) -> Result<Resource, PermissionParseError> {
         "service_accounts" => Resource::ServiceAccounts,
         "users" => Resource::Users,
         "identity_connections" => Resource::IdentityConnections,
+        "personal_credentials" => Resource::PersonalCredentials,
         "bifrost_table" => Resource::BifrostTable,
         "bifrost_record" => Resource::BifrostRecord,
         "bifrost_peer" => Resource::BifrostPeer,
@@ -1090,6 +1120,7 @@ mod tests {
             Resource::ServiceAccounts,
             Resource::Users,
             Resource::IdentityConnections,
+            Resource::PersonalCredentials,
             Resource::AnyOf(vec![Resource::Operators, Resource::Triggers]),
             Resource::Wildcard,
         ];

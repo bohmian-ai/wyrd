@@ -62,7 +62,9 @@ WIRE_ROOTS = [
     # Authentication and principals.
     "CreateServicePrincipalRequest",
     "CreateServicePrincipalResponse",
+    "CredentialListQuery",
     "CredentialListResponse",
+    "CurrentUserProfile",
     "IssuedCredential",
     "PrincipalPage",
     "PrincipalQuery",
@@ -92,6 +94,7 @@ REQUEST_ROOTS = {
     "BifrostQueryRequest",
     "CreateOperatorConnectionRequest",
     "CreateServicePrincipalRequest",
+    "CredentialListQuery",
     "GatewayCapturePolicyWrite",
     "GatewayFallbackPolicy",
     "GatewayGovernancePolicy",

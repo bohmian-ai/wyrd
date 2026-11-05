@@ -44,3 +44,12 @@ test('known upstream codes retain canonical metadata while diagnostics and unkno
   mutable.details = { secret: 'value' };
   expect(problem('internal').details).toEqual({});
 });
+
+test('a throttled password attempt keeps only its positive whole retry wait', () => {
+  const throttled = { ...problem('passwordAttempts'), detail: 'secret', details: { retry_after_seconds: 840, password: 'secret' } };
+  expect(safeProblem(throttled)).toEqual({ ...problem('passwordAttempts'), details: { retry_after_seconds: 840 } });
+  for (const wait of [0, -1, 1.5, '840', null]) {
+    expect(safeProblem({ ...throttled, details: { retry_after_seconds: wait } })).toEqual(problem('passwordAttempts'));
+  }
+  expect(safeProblem({ ...problem('validation'), details: { retry_after_seconds: 840 } })).toEqual(problem('validation'));
+});

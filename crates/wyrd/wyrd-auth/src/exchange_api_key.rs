@@ -838,8 +838,8 @@ pub(crate) mod pg_tests {
     ) {
         sqlx::query(
             "INSERT INTO wyrd.auth_api_keys
-                 (id, data_tenant_id, principal_id, prefix, key_hash, sub_principal_id, act_principal_id, expires_at, revoked_at)
-             VALUES ($1, $2, $3, $4, 'placeholder-hash', $5, $5, $6, CASE WHEN $7 THEN now() ELSE NULL END)",
+                 (id, data_tenant_id, principal_id, service_account_id, prefix, key_hash, sub_principal_id, act_principal_id, expires_at, revoked_at)
+             VALUES ($1, $2, $3, $3, $4, 'placeholder-hash', $5, $5, $6, CASE WHEN $7 THEN now() ELSE NULL END)",
         )
         .bind(Uuid::new_v4())
         .bind(tenant.as_uuid())
@@ -926,8 +926,8 @@ pub(crate) mod pg_tests {
         let api_key_id = Uuid::new_v4();
         sqlx::query(
             "INSERT INTO wyrd.auth_api_keys
-                 (id, data_tenant_id, principal_id, prefix, key_hash, sub_principal_id, act_principal_id, expires_at)
-             VALUES ($1, $2, $3, $4, $5, $6, $6, now() + interval '1 day')",
+                 (id, data_tenant_id, principal_id, service_account_id, prefix, key_hash, sub_principal_id, act_principal_id, expires_at)
+             VALUES ($1, $2, $3, $3, $4, $5, $6, $6, now() + interval '1 day')",
         )
         .bind(api_key_id)
         .bind(tenant.as_uuid())
@@ -1088,8 +1088,8 @@ pub(crate) mod pg_tests {
         let hash = wyrd_auth_issue::hash_secret(key.secret.expose_secret());
         sqlx::query(
             "INSERT INTO wyrd.auth_api_keys
-                 (id, data_tenant_id, principal_id, prefix, key_hash, sub_principal_id, act_principal_id, expires_at)
-             VALUES ($1, $2, $3, $4, $5, $6, $6, now() + interval '1 day')",
+                 (id, data_tenant_id, principal_id, service_account_id, prefix, key_hash, sub_principal_id, act_principal_id, expires_at)
+             VALUES ($1, $2, $3, $3, $4, $5, $6, $6, now() + interval '1 day')",
         )
         .bind(Uuid::new_v4())
         .bind(tenant.as_uuid())
@@ -1413,8 +1413,8 @@ pub(crate) mod pg_tests {
         // service returns NotFound.
         sqlx::query(
             "INSERT INTO wyrd.auth_api_keys
-                 (id, data_tenant_id, principal_id, prefix, key_hash, sub_principal_id, act_principal_id, expires_at, revoked_at)
-             VALUES ($1, $2, $3, $4, 'placeholder-hash', $5, $5, now() + interval '1 year', now())",
+                 (id, data_tenant_id, principal_id, service_account_id, prefix, key_hash, sub_principal_id, act_principal_id, expires_at, revoked_at)
+             VALUES ($1, $2, $3, $3, $4, 'placeholder-hash', $5, $5, now() + interval '1 year', now())",
         )
         .bind(Uuid::new_v4())
         .bind(tenant.as_uuid())
@@ -1453,8 +1453,8 @@ pub(crate) mod pg_tests {
         // Store a verifier that is not this key's SHA-256 digest.
         sqlx::query(
             "INSERT INTO wyrd.auth_api_keys
-                 (id, data_tenant_id, principal_id, prefix, key_hash, sub_principal_id, act_principal_id, expires_at)
-             VALUES ($1, $2, $3, $4, 'not-a-valid-phc-hash', $5, $5, now() + interval '1 year')",
+                 (id, data_tenant_id, principal_id, service_account_id, prefix, key_hash, sub_principal_id, act_principal_id, expires_at)
+             VALUES ($1, $2, $3, $3, $4, 'not-a-valid-phc-hash', $5, $5, now() + interval '1 year')",
         )
         .bind(Uuid::new_v4())
         .bind(tenant.as_uuid())

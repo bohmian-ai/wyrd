@@ -30,6 +30,7 @@ use super::points::{
     NEGATIVE_BUCKET_COUNT_ELEMENT, NEGATIVE_BUCKET_FIELDS, POSITIVE_BUCKET_COUNT_ELEMENT,
     POSITIVE_BUCKET_FIELDS, QUANTILE_VALUE_ELEMENT,
 };
+use super::series::with_series_ids;
 use crate::otlp_contract::MetricsOutcome;
 use crate::tables::fields::canonical_arrow_fields;
 use crate::tables::signal::{
@@ -295,7 +296,11 @@ pub fn canonical_metric_schema() -> Arc<Schema> {
 /// Returns the refusal of [`validate_canonical_user_batch`], and
 /// [`BifrostError::SchemaParse`] when `metric_type` is unknown, a column
 /// outside the declared kind is populated, a numeric point carries both or
-/// neither value alternative, or a bucket set is only partly present.
+/// neither value alternative, or a bucket set is only partly present, and the
+/// [`with_series_ids`] refusal when a series identity cannot be encoded.
+///
+/// The returned batch carries the `series_id` every row's identity derives,
+/// whatever the writer supplied.
 pub fn validate_metric_points(batch: &RecordBatch) -> Result<RecordBatch, BifrostError> {
     let schema_parse = |detail| BifrostError::SchemaParse { detail };
     let batch = validate_canonical_user_batch(METRIC_FIELDS, batch)?;
@@ -341,7 +346,7 @@ pub fn validate_metric_points(batch: &RecordBatch) -> Result<RecordBatch, Bifros
         }
     }
     refuse_partial_structs(&batch, &["positive_buckets", "negative_buckets"])?;
-    Ok(batch)
+    with_series_ids(&batch)
 }
 
 /// Count the data points a metric declares, whatever its kind.
@@ -1129,7 +1134,8 @@ impl PointColumns {
     /// Assemble the accepted rows into the canonical point batch.
     ///
     /// Column order comes from [`METRIC_FIELDS`], followed by the two nullable
-    /// correlation columns Scribe consumes.
+    /// correlation columns Scribe consumes. `series_id` is filled last, from
+    /// the assembled columns, by the one function untrusted batches also use.
     ///
     /// # Errors
     ///
@@ -1197,6 +1203,10 @@ impl PointColumns {
             variant_column(self.scope_attributes.iter().map(Some)),
             u32_as_i64_column(self.scope_dropped_attributes_count),
             utf8_column(&self.scope_schema_url),
+            arrow::array::new_null_array(
+                &arrow::datatypes::DataType::FixedSizeBinary(16),
+                self.rows,
+            ),
             utf8_opt_column(&self.service_name),
             utf8_opt_column(&self.service_version),
             utf8_opt_column(&self.deployment_environment),
@@ -1206,8 +1216,9 @@ impl PointColumns {
             utf8_opt_column(&self.card_uid),
             utf8_opt_column(&self.run_id),
         ]);
-        RecordBatch::try_new(Arc::clone(&METRIC_SCHEMA), columns)
-            .map_err(|error| TableError::Internal(format!("canonical metric batch: {error}")))
+        let batch = RecordBatch::try_new(Arc::clone(&METRIC_SCHEMA), columns)
+            .map_err(|error| TableError::Internal(format!("canonical metric batch: {error}")))?;
+        with_series_ids(&batch).map_err(|error| TableError::Internal(error.to_string()))
     }
 }
 

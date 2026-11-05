@@ -23,6 +23,7 @@ use wyrd_spec::error::WyrdProblem;
 use wyrd_spec::vala::api::{BifrostQueryRequest, QueryClass};
 use wyrd_spec::vala::error::BifrostError;
 use wyrd_testing::WyrdTestServer;
+use wyrd_testing::bifrost::canonical_signals::{Cell, Row, attributes, batch, spans};
 use wyrd_testing::bifrost::telemetry::BifrostMetricKind;
 use wyrd_testing::bifrost::{BifrostClusterSpec, ScribeCacheMode, WyrdTestCluster};
 
@@ -1731,6 +1732,226 @@ async fn prove_time_range_reads(
     Ok(())
 }
 
+/// Observe's span predicates return exact rows across persisted and live
+/// sources, prune what they exclude, and log no statistics warning.
+///
+/// Node 0's Scribe owns the spans; node 1's Oracle reads them over the peer
+/// network, so live rows reach it through live Scribe routes dealt across its
+/// output partitions. One hour of spans is flushed into objects and a later
+/// hour stays live. Each hour holds a GenAI chat span, its tool-call child,
+/// and a span with no GenAI operation. A neighbouring tenant writes its own
+/// chat span under the same scope in between.
+///
+/// Each query filters by the Observe shape: a nanosecond time window, the
+/// service, the numeric kind, and the GenAI operation. A matching filter
+/// returns its span from both sources exactly once, a nonmatching kind or
+/// operation returns only the other spans, an SQL-null operation matches
+/// only `IS NULL`, and a window no span overlaps returns nothing and opens
+/// no object. No statistics conversion warning reaches the production
+/// telemetry while any of it runs.
+///
+/// # Panics
+///
+/// Panics when a query returns other rows, opens an excluded object, or a
+/// statistics warning is captured.
+#[tokio::test]
+#[ignore = "requires the serialized Postgres-backed Oracle journey lane"]
+async fn observe_predicates_preserve_rows_across_live_and_persisted_sources() {
+    Box::pin(prove_observe_predicates())
+        .await
+        .expect("Observe predicates return exact rows on every source");
+}
+
+/// Drives [`observe_predicates_preserve_rows_across_live_and_persisted_sources`].
+///
+/// # Errors
+///
+/// Returns a cluster, provisioning, describe, ingest, flush, or query error,
+/// or an error naming the case whose rows, reads, or warnings differ.
+async fn prove_observe_predicates() -> Result<(), JourneyError> {
+    /// Canonical span table every case writes and queries.
+    const SPANS: &str = "bifrost.traces.spans";
+    /// Owner tenant's writer principal; ingest stamps it as each owner span's
+    /// service, so the service predicate filters by it.
+    const OWNER: &str = "observe-owner";
+    /// Neighbour tenant's writer principal and service; its reader sees only
+    /// its own chat span.
+    const NEIGHBOUR: &str = "observe-neighbour";
+    /// One hour: the spacing between the persisted, neighbouring, and live
+    /// spans, and the margin that pads or misses the queried windows.
+    const HOUR_NANOS: i64 = 3_600_000_000_000;
+    let persisted = 1_760_000_400_000_000_000_i64;
+    let neighbouring = persisted + HOUR_NANOS;
+    let live = persisted + 2 * HOUR_NANOS;
+
+    let cluster = WyrdTestCluster::start_spec(BifrostClusterSpec::three_mixed()).await?;
+    let writer_node = cluster.server(0).ok_or("missing node 0")?;
+    let reader_node = cluster.server(1).ok_or("missing node 1")?;
+    let owner_tenant = cluster.data_tenant_id();
+    let neighbour_tenant = cluster.add_tenant("observe-predicates-neighbour").await?;
+    for tenant in [owner_tenant, neighbour_tenant] {
+        writer_node
+            .ensure_builtin_table_for_test(tenant, "traces", "spans")
+            .await?;
+    }
+    let owner = writer_for_tenant(writer_node, owner_tenant, OWNER).await?;
+    let neighbour = writer_for_tenant(writer_node, neighbour_tenant, NEIGHBOUR).await?;
+    let schema = wyrd_client::bifrost::TableConfig::describe_with(owner.client(), SPANS)
+        .await?
+        .user_schema()
+        .clone();
+    let scope = format!("wyrd.observe.{}", uuid::Uuid::now_v7().simple());
+    // A span with no GenAI operation: the column is SQL null.
+    let unnamed = |start: i64| {
+        let row: Row = std::collections::BTreeMap::from([
+            ("trace_id", Cell::Bytes(vec![7; 16])),
+            ("span_id", Cell::Bytes(start.to_be_bytes().to_vec())),
+            ("name", Cell::Text("unnamed".to_owned())),
+            ("kind", Cell::Int32(1)),
+            ("start_time_unix_nano", Cell::Int64(start)),
+            ("end_time_unix_nano", Cell::Int64(start + 1_000_000)),
+            ("duration_nano", Cell::Int64(1_000_000)),
+            ("scope_present", Cell::Bool(true)),
+            ("scope_name", Cell::Text(scope.clone())),
+            ("resource_present", Cell::Bool(true)),
+            (
+                "resource_attributes",
+                Cell::Variant(attributes(&[("service.name", "wyrd.fixture.service")])),
+            ),
+            (
+                "service_name",
+                Cell::Text("wyrd.fixture.service".to_owned()),
+            ),
+            ("gen_ai_operation_name", Cell::Null),
+        ]);
+        batch(&schema, &[row])
+    };
+    for anchor in [persisted, live] {
+        if anchor == live {
+            neighbour
+                .write_batch(SPANS, &spans(&schema, &scope, neighbouring))
+                .await?;
+            writer_node.flush_bifrost().await?;
+        }
+        owner
+            .write_batch(SPANS, &spans(&schema, &scope, anchor))
+            .await?;
+        owner.write_batch(SPANS, &unnamed(anchor + 200_000)).await?;
+        if anchor == persisted {
+            writer_node.flush_bifrost().await?;
+        }
+    }
+    cluster.refresh_oracle_snapshots().await?;
+    let owner_reader = client_for_tenant(reader_node, owner_tenant, "observe-owner-reader").await?;
+    let neighbour_reader =
+        client_for_tenant(reader_node, neighbour_tenant, "observe-neighbour-reader").await?;
+
+    let nanos = |nanos: i64| {
+        DateTime::<Utc>::from_timestamp_nanos(nanos)
+            .format("%Y-%m-%d %H:%M:%S%.9f")
+            .to_string()
+    };
+    let observe = |service: &str, lower: i64, upper: i64, filter: &str| {
+        format!(
+            "SELECT name, CAST(start_time_unix_nano AS BIGINT) AS started FROM {SPANS} \
+             WHERE scope_name = '{scope}' \
+             AND start_time_unix_nano >= TIMESTAMP '{}' \
+             AND start_time_unix_nano < TIMESTAMP '{}' \
+             AND service_name = '{service}' AND {filter} ORDER BY started, name",
+            nanos(lower),
+            nanos(upper),
+        )
+    };
+    let window = |service: &str, filter: &str| {
+        observe(service, persisted - HOUR_NANOS, live + HOUR_NANOS, filter)
+    };
+    let rows = |spans: &[(&str, i64)]| {
+        spans
+            .iter()
+            .map(|(name, started)| vec![(*name).to_owned(), started.to_string()])
+            .collect::<Vec<_>>()
+    };
+    let chat = "kind = 3 AND gen_ai_operation_name = 'chat'";
+    let tool = "kind = 1 AND gen_ai_operation_name = 'execute_tool'";
+    let cases = [
+        (
+            "chat spans",
+            &owner_reader,
+            window(OWNER, chat),
+            rows(&[
+                ("chat claude-opus-5", persisted),
+                ("chat claude-opus-5", live),
+            ]),
+        ),
+        (
+            "tool-call spans",
+            &owner_reader,
+            window(OWNER, tool),
+            rows(&[
+                ("execute_tool search", persisted + 100_000),
+                ("execute_tool search", live + 100_000),
+            ]),
+        ),
+        (
+            "spans without an operation",
+            &owner_reader,
+            window(OWNER, "kind = 1 AND gen_ai_operation_name IS NULL"),
+            rows(&[
+                ("unnamed", persisted + 200_000),
+                ("unnamed", live + 200_000),
+            ]),
+        ),
+        (
+            "a chat kind with a tool operation",
+            &owner_reader,
+            window(OWNER, "kind = 3 AND gen_ai_operation_name = 'execute_tool'"),
+            Vec::new(),
+        ),
+        (
+            "the neighbour's chat span",
+            &neighbour_reader,
+            window(NEIGHBOUR, chat),
+            rows(&[("chat claude-opus-5", neighbouring)]),
+        ),
+    ];
+
+    let telemetry = cluster.telemetry();
+    let checkpoint = telemetry.checkpoint()?;
+    for (case, client, sql, expected) in &cases {
+        let (_, actual) = run_rows(client, sql).await?;
+        if &actual != expected {
+            return Err(format!("{case}: expected {expected:?}, saw {actual:?}").into());
+        }
+    }
+    let reads = |node: &WyrdTestServer| node.object_reads_for_test().ranged_reads();
+    let reads_before = (reads(writer_node), reads(reader_node));
+    let (_, disjoint) = run_rows(&owner_reader, &observe(OWNER, 0, HOUR_NANOS, chat)).await?;
+    if !disjoint.is_empty() {
+        return Err(format!("a window no span overlaps returned {disjoint:?}").into());
+    }
+    if (reads(writer_node), reads(reader_node)) != reads_before {
+        return Err("a window no span overlaps opened an object".into());
+    }
+    let warnings = telemetry
+        .spans_since(&checkpoint)
+        .into_iter()
+        .flat_map(|span| span.events)
+        .filter(|event| {
+            event
+                .attributes
+                .get("level")
+                .is_some_and(|level| level == "WARN")
+        })
+        .filter(|event| event.name.contains("values to array"))
+        .map(|event| event.name)
+        .collect::<Vec<_>>();
+    if !warnings.is_empty() {
+        return Err(format!("statistics conversion warned: {warnings:?}").into());
+    }
+    cluster.shutdown().await?;
+    Ok(())
+}
+
 /// Bound on every source transition the source-consistency journeys wait for.
 const SOURCE_TRANSITION_BOUND: Duration = Duration::from_mins(1);
 
@@ -1882,8 +2103,18 @@ async fn prove_source_transitions() -> Result<(), JourneyError> {
     let pause = Arc::new(vala_bifrost_redux::oracle::OraclePreparationPause::new(
         context.request_id.clone(),
     ));
-    // Forge keeps promoting case 1's files for a moment, and each promotion
-    // moves the cut; wait until a query is served from the warm cache.
+    // Forge promotes case 1's file on the publication hint; its settlement
+    // marks the file compacted and evicts every Oracle's cached cut in the
+    // same commit. Wait for it, then until a query is served from the warm
+    // cache.
+    tokio::time::timeout(SOURCE_TRANSITION_BOUND, async {
+        while file_tier_counts(&cluster, tenant, &table).await?.1 != 0 {
+            tokio::time::sleep(crate::distributed::SETTLEMENT_INTERVAL).await;
+        }
+        Ok::<_, JourneyError>(())
+    })
+    .await
+    .map_err(|_| "published during acquisition: case 1's file was never promoted")??;
     tokio::time::timeout(SOURCE_TRANSITION_BOUND, async {
         loop {
             vala_bifrost_redux::catalog::reset_cut_reads_for_test();

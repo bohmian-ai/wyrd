@@ -989,6 +989,13 @@ impl ScribeShardRuntime {
         }
     }
 
+    /// Takes every retained owner's join handle, so a test can await the
+    /// owners' termination after aborting them.
+    #[cfg(test)]
+    pub(crate) async fn take_owners_for_test(&self) -> Vec<tokio::task::JoinHandle<()>> {
+        std::mem::take(&mut *self.tasks.lock().await)
+    }
+
     /// Retains one never-completing owner and returns its abort probe.
     #[cfg(any(test, feature = "test-support"))]
     pub(crate) async fn install_shutdown_stall_for_test(&self) -> tokio::task::AbortHandle {
@@ -3292,7 +3299,18 @@ impl ShardOwner {
                 detail: "injected post-sync WAL failure".to_owned(),
             };
             debug_assert!(self.retained_commit_ambiguity.is_none());
+            let held = post_commit
+                .state
+                .durable
+                .iter()
+                .map(|slice| AppendSliceId {
+                    batch_id: uuid::Uuid::from_bytes(slice.batch_id),
+                    seal_key: slice.seal_key.clone(),
+                    slice_index: slice.slice_index,
+                })
+                .collect();
             self.retained_commit_ambiguity = Some(post_commit.into_state());
+            self.wal_handle.hold_post_sync_for_test(held);
             return Err(error);
         }
         let insert = stages.insert.timer();

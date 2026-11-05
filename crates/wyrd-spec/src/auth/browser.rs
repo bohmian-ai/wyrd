@@ -51,6 +51,73 @@ pub struct BrowserApiKeyRequest {
     pub api_key: SecretBearer,
 }
 
+/// Body of `POST /auth/browser/password/signup`: enroll a local User with a
+/// one-time invitation code.
+///
+/// The invitation alone decides the User's tenant membership and Roles; the
+/// request names no principal, email or Role.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
+#[serde(deny_unknown_fields)]
+pub struct PasswordSignupRequest {
+    /// The tenant's route key the invitation was issued for.
+    pub tenant: TenantSlug,
+    /// The one-time enrollment code.
+    #[schemars(with = "String")]
+    pub invitation_code: SecretBearer,
+    /// The chosen tenant-local username, canonicalized by the server.
+    pub username: String,
+    /// The chosen password.
+    #[schemars(with = "String")]
+    pub password: SecretBearer,
+}
+
+/// Body of `POST /auth/browser/password/login`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
+#[serde(deny_unknown_fields)]
+pub struct PasswordLoginRequest {
+    /// The tenant's route key.
+    pub tenant: TenantSlug,
+    /// The local username, canonicalized by the server.
+    pub username: String,
+    /// The password.
+    #[schemars(with = "String")]
+    pub password: SecretBearer,
+}
+
+/// Body of `POST /auth/browser/password/change`, sent with the tenant's
+/// local password session.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
+#[serde(deny_unknown_fields)]
+pub struct PasswordChangeRequest {
+    /// The tenant's route key whose session is changing its password.
+    pub tenant: TenantSlug,
+    /// The current password, verified before any change.
+    #[schemars(with = "String")]
+    pub current_password: SecretBearer,
+    /// The new password.
+    #[schemars(with = "String")]
+    pub new_password: SecretBearer,
+}
+
+/// Body of `POST /auth/browser/password/reset`: choose a new password with an
+/// operator-issued one-time reset code.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
+#[serde(deny_unknown_fields)]
+pub struct PasswordResetRequest {
+    /// The tenant's route key the reset was issued for.
+    pub tenant: TenantSlug,
+    /// The one-time reset code.
+    #[schemars(with = "String")]
+    pub reset_code: SecretBearer,
+    /// The new password.
+    #[schemars(with = "String")]
+    pub new_password: SecretBearer,
+}
+
 /// Query of `GET /auth/browser/session`.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 #[cfg_attr(feature = "server", derive(utoipa::IntoParams))]
@@ -82,6 +149,8 @@ pub enum BrowserCredential {
     Sso,
     /// A recovery API key signed the browser in.
     ApiKey,
+    /// A Wyrd-owned local username and password signed the person in.
+    Password,
 }
 
 /// Safe metadata of one live tenant browser session.
@@ -99,6 +168,10 @@ pub struct BrowserSessionView {
     pub principal_id: PrincipalId,
     /// That principal's kind.
     pub principal_kind: PrincipalKindTag,
+    /// The principal's canonical local username; `null` for an SSO-only User
+    /// or a Service.
+    #[serde(default)]
+    pub username: Option<String>,
     /// How the session was created.
     pub credential: BrowserCredential,
     /// The principal's current operations as `resource:action` names,

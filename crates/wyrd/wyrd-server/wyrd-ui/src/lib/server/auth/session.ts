@@ -177,7 +177,8 @@ export class LocalSessions {
 
 export const sessions = new LocalSessions();
 
-export function reject(kind: Parameters<typeof problem>[0]): never {
-  const value = problem(kind);
+/** Throw the safe problem `kind`, or an already safe problem, as the response error. */
+export function reject(kind: Parameters<typeof problem>[0] | WyrdProblem): never {
+  const value = typeof kind === 'string' ? problem(kind) : kind;
   error(value.status, { ...value, message: value.title });
 }

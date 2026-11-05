@@ -1,0 +1,60 @@
+# Independent behavior review — PASS
+
+Subject: original TASK-003, approved specification revision 13, cumulative base `c62ebce8c4de0d43a2b9d50d360de628c49fd533` through candidate `6aace6e07728e59deb1fcd85ce969b2d0a4260db`, branch `wyrd-ui-main-integration`.
+
+This is a fresh caller-to-result acceptance review. Read the review skill, subject, original task, specification's component/query/host/invariant obligations, root and TypeScript SDK rules, workflow, maintainer guidance, UI guidance, testing map and applicable Card/session/query architecture. Inspected the cumulative diff and resulting shared package, host adapters, native collector, shared JSON builder, server collection, packaging and focused proof. Prior verdicts and latest validated ledger informed hypotheses, not acceptance. No peer discovery report or implementation completion summary was used as proof. Unrelated PR #205/main and separately accepted TASK-027 layout are excluded; the renderer's shared loading/action seams remain included.
+
+## Acceptance matrix
+
+UI-relative paths below start at `crates/wyrd/wyrd-server/wyrd-ui/`. PASS denotes source acceptance supported by the stated available evidence, not a claim to have newly executed that proof.
+
+| Requirement, criterion, constraint or non-goal | Implementation evidence | Verification evidence | Result |
+|---|---|---|---|
+| Publishable portable package; approved components/loaders/view/catalog/Node/MCP exports; browser imports cannot load the addon | `packages/ui/package.json`, `src/lib/index.ts`, type-only SDK imports in contract/schemas and primitives; only `node.ts` imports SDK values | Public-entry smoke in existing UI test command; supplied package/UI check and historical build | PASS |
+| One schema/catalog authority, pinned view version/catalog and panel-local validation | `schemas.ts` strict component/action schemas; `scripts/catalog.ts`; `validatePanel`, `validateIntent`; `view.ts::validateView`; WyrdView validates each panel independently | Catalog/codegen check; portable-rendering and canonical-problem assertions | PASS |
+| All four chart types, typed props and honest populated/empty/denied/error/loading/degraded states | `shapeChart` validates appropriate Arrow descriptors/cardinality; Chart renders timeseries/bar/stat/table and stable problem identity; degraded notice preserves result evidence | Rendering assertions for all types/states, schema mismatch, positional table and partial notice; supplied 40/40 | PASS |
+| Authored SQL unchanged; inherited versus explicit range; exact reproducible Open in Query binds | `loadChart` selects input range before context; `chartParams` supplies typed range/bucket; one executed object flows into Chart action; WyrdView resolves shared range once | Fixed-clock explicit/inherited range, brush/reset and action input assertions; live bound query on both surfaces | PASS |
+| Duplicate names/nulls remain positional and chart validation uses the rendered column | Shared `columnIndex` first-match owner used by `shapeChart`, timeSeries, barRows and stat; table iterates ordered columns/cells | Conflicting descriptor-order cases, duplicate x/series/stat cases and live duplicate/null query | PASS |
+| Signed geometry and twenty distinguishable series; authored group identity survives grouping/folding | Chart signed bounds/bar endpoints; `plot.ts::MAX_SERIES=20`, typed tuple key, collision-qualified authored captions and aggregate caption selected against emitted names | Mixed/all-negative/flat/zero geometry cases; 5/20/21 cue assertions; tuple/null/text/other caption and rerender cases | PASS |
+| Exact flat Card read, bounded dependent version paging, failure isolation and canonical copied identity | `loadCardHeader` exact get then list resolved kind/name, five bounded pages and abort checks; failed list remains its own state; shared `fmtCardRef` includes kind/name/version and supplied UID | Live exact reads; paging/negative/dependent assertions; Model/Data copy/chip tests and clipboard failure | PASS |
+| CardHeader tabs/version/Observe intents and host completion states | Component only emits schema-declared navigation; pending/unavailable disables controls; selection resets to host input; ActionNote shows outcomes; version change omits stale UID | Direct CardHeader and WyrdView pending/dedup/refusal/action tests | PASS |
+| Closed six-read union and existing SDK/MCP capability reuse | `contract.ts::WireRequest`; Node calls Cards/Bifrost/Execution owners; MCP maps existing tools/envelopes; no component-specific domain route | Real-server authorized-read scenario exercises five successful reads and missing execution refusal; denial and malformed binds retain stable outcomes | PASS |
+| Equivalent positional JSON projection and no usable partial result before valid terminal | Native collect and server ResultCollector use shared `JsonResultBuilder`; existing client stream decoder and server framing/settlement remain authoritative | Supplied real-server 2/2, historical positional/accounting regression; degraded source path shared (live degraded proof remains unavailable) | PASS |
+| Original supplied budgets refused without narrowing/clamping; same effective caps/defaults and exact accounting | Native `collect` now accepts `Option<f64>`, takes the stream, calls `parse_ceiling` before narrowing, then unchanged shared `admit_ceilings` and builder; MCP retains integer decode/admission | Added native-backed wrapping/fractional row/byte cases; direct same-stream closure/fresh-query assertions; defaults/maxima/output overflow retained; supplied RED/GREEN and candidate checks | PASS |
+| Supersession/cancellation releases work, stops dependencies and fences late results | Node abort after acquisition, abort listener calling SDK return and post-collect check; native close notification before stream mutex; `loadCardHeader` aborts before next page; WyrdView abort/controllers settle fence | Acquisition/active/pre-aborted tests; dependency and supersession cases; supplied real query pre-aborted assertions | PASS |
+| Canonical stable problems and consistent denied/error behavior | Rust-derived problems generator; `wyrdProblem` at local producers; complete endpoint problem serialization; SDK/MCP code/title preserved; `failed` maps 401/403 | Canonical problem suite, malformed endpoint request and live authorization tests | PASS |
+| Tenant session-bound BFF and server-only custom app credentials | BrowserSession private cookie and `client()` shared SDK forwarding; `/t/[tenantKey]/ui/load` uses selected session; query-only Bifrost skips bearer ingest; example server executor owns credential | Existing live session/foreign-tenant/malformed/no-credential assertions and browser-session no-ingest Rust regression | PASS |
+| Non-Svelte mount, built AppBridge renderer, gallery/custom direct/view examples and primitives | `view.ts::mountView`, app main theme/tool-result handling, single HTML Vite build, `_gallery`, example pages; native dialog and shared primitives | Existing T1/T3/T4/T5 assertions; historical recorded individual human approval 2026-10-20; supplied real-server 2/2 | PASS |
+| Existing production build owner carries SDK runtime/addon; no replacement transport/build framework | `scripts/build.sh::bundle` invokes existing SDK build, packs SDK with runtime dependencies, copies native addon and import-smokes handler/SDK; mise honors build profile | Historical Darwin bundle/import evidence; present source path. Linux bundles/images not newly qualified | PASS |
+| Scope/reference preservation; no saved-view store, Ask service, A2UI, arbitrary writes, per-component routes, production MCP registration or publication | Attributed cumulative diff; schemas expose only declared intents; read executor remains closed/read-only; existing auth/query owners remain authoritative | Static diff and consumer review; supplied historical acceptance evidence | PASS |
+
+## R5 source trace and falsification
+
+The public executor and direct SDK caller still pass JavaScript numbers unchanged. The information-losing conversion was at native `collect`, not in the host. At `sdks/wyrd-sdk-ts/native/src/lib.rs:1382–1423`, `Option<f64>` retains the incoming Number, `take()` removes the stream before any refusal, and both options pass through `parse_ceiling` (`:1566–1573`). Converting the floating-point value to decimal text and parsing `u32` refuses the four prior wrapping/fractional examples instead of transforming them into admitted values. Nonfinite, negative, fractional and beyond-u32 values cannot become an admitted positive integer through this parse. `admit_ceilings` still owns the actual 1..10,000-row / 1..16-MiB policy after exact integer conversion; defaults remain 1000/4 MiB.
+
+Failures use the existing validation error and NativeQueryStep projection. Returning after `take()` drops the local stream, so wrapper `#done=true` cannot strand it in the native slot. Valid paths still use the same builder, terminal decoder and close notification. The latest test changes exercise the real native-backed calls for both fields, independently assert refusal on Node/MCP, verify same-stream collection stays closed and a fresh query returns three rows. These checks directly address the previous gap; they do not claim identical protocol-specific input-error wording. No new public API, policy owner or numerical abstraction was introduced.
+
+Existing alternatives were checked: the prior MCP collector already supplied the required positional JSON/value encoding and exact JSON accounting, now extracted once into the shared builder. SDK Arrow collection bounds transport/batch bytes and does not replace that projection. Existing SDK stream/return and server QueryArguments/ResultCollector remain the lifecycle/admission owners. Browser-session Bifrost extends the existing query-only construction rather than introducing a second client. These extensions are sufficient and expressly within the task; deleting them would remove required host parity.
+
+## Current-source prior finding closure
+
+| ID | Current source evidence | Disposition |
+|---|---|---|
+| FIND-003-1 | `loadChart` input-first range and shared executed binds; WyrdView resolves inherited range | CLOSED |
+| FIND-003-2 | First-match `columnIndex` shared by descriptor validation and all bound numeric renderers | CLOSED |
+| FIND-003-3 | Chart signed y bounds include zero; bars span signed endpoints with nonnegative heights | CLOSED |
+| FIND-003-4 | Twenty-series limit plus four markers/five dashes; folding starts above twenty | CLOSED |
+| FIND-003-5 | CardHeader named action states, disable/refusal notes and authoritative selection | CLOSED |
+| FIND-003-6 | Node acquisition/active/late abort paths close the stream; native close signals drain | CLOSED |
+| FIND-003-7 | Generated canonical problems at local producers and full endpoint serialization | CLOSED |
+| FIND-003-8 | Runtime JSON import has standard `with { type: 'json' }`; public-entry smoke remains | CLOSED |
+| FIND-003-9 | Aggregate caption checks final emitted authored captions before appending | CLOSED |
+| FIND-003-10 | Typed raw-group/y tuple identifies values before summing; separate collision-safe caption production | CLOSED |
+| FIND-003-11 | Lossless native Number extraction/parse precedes shared admission; taken stream drops on refusal | CLOSED by R5 |
+| FIND-003-12 | Shared canonical formatter includes kind; CardHeader and chip reuse it, changed-version refs omit stale UID | CLOSED |
+
+## Proposed findings and limits
+
+No material proposed findings. Overall **PASS** for this independent behavior lens. All earlier IDs have current-source closure; the independently validated final verdict remains the orchestrator's responsibility.
+
+Skipped: build/test reruns and new platform/browser/human qualification under packet-only restrictions. Supplied candidate checks remain reported execution; Linux/images and live degraded parity remain unverified, not newly established passes. HEAD was independently checked as the requested full candidate; only this report was written.

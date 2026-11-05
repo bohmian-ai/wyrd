@@ -1,0 +1,24 @@
+{
+  "name": "@wyrd/example-ui-app",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "scripts": {
+    "dev": "vite dev",
+    "build": "vite build",
+    "check": "svelte-kit sync && svelte-check --tsconfig ./tsconfig.json"
+  },
+  "devDependencies": {
+    "@sveltejs/adapter-node": "5.5.7",
+    "@sveltejs/kit": "2.70.3",
+    "@sveltejs/vite-plugin-svelte": "latest",
+    "svelte": "latest",
+    "svelte-check": "latest",
+    "typescript": "^5.9.0",
+    "vite": "latest"
+  },
+  "dependencies": {
+    "wyrd-ai": "link:../../sdks/wyrd-sdk-ts/wyrd",
+    "wyrd-ai-ui": "workspace:*"
+  }
+}

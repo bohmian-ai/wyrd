@@ -590,6 +590,68 @@ pub enum WyrdError {
         /// Structured detail payload.
         details: serde_json::Value,
     },
+    /// A local username and password did not sign in: an unknown username, a
+    /// wrong password, a suspended User, or an account without a local
+    /// password, indistinguishably.
+    #[error("[WYRD_AUTH_401_PASSWORD_INVALID] {message}")]
+    #[wyrd_error(
+        code = "WYRD_AUTH_401_PASSWORD_INVALID",
+        status = 401,
+        title = "Username or password not accepted",
+        remediation = "Check the tenant, username and password and try again; a forgotten password is reset with a code from a tenant administrator."
+    )]
+    PasswordInvalid {
+        /// Human-readable error message.
+        message: String,
+        /// Structured detail payload.
+        details: serde_json::Value,
+    },
+    /// Too many failed password verifications in the current fixed window,
+    /// for this account or this source.
+    #[error("[WYRD_AUTH_429_PASSWORD_ATTEMPTS] {message}")]
+    #[wyrd_error(
+        code = "WYRD_AUTH_429_PASSWORD_ATTEMPTS",
+        status = 429,
+        title = "Too many password attempts",
+        remediation = "Wait `details.retry_after_seconds` until the fixed attempt window ends, then try again."
+    )]
+    PasswordAttempts {
+        /// Human-readable error message.
+        message: String,
+        /// Structured detail payload.
+        details: serde_json::Value,
+    },
+    /// An enrollment invitation or password-reset code is malformed, unknown,
+    /// expired, revoked, already used, or for another tenant,
+    /// indistinguishably.
+    #[error("[WYRD_AUTH_401_ONE_TIME_CODE_INVALID] {message}")]
+    #[wyrd_error(
+        code = "WYRD_AUTH_401_ONE_TIME_CODE_INVALID",
+        status = 401,
+        title = "One-time code not accepted",
+        remediation = "Ask a tenant administrator for a new invitation or reset code; each code is single-use and expires."
+    )]
+    OneTimeCodeInvalid {
+        /// Human-readable error message.
+        message: String,
+        /// Structured detail payload.
+        details: serde_json::Value,
+    },
+    /// Creating a personal credential needs a human sign-in from the last
+    /// five minutes.
+    #[error("[WYRD_AUTH_403_RECENT_LOGIN_REQUIRED] {message}")]
+    #[wyrd_error(
+        code = "WYRD_AUTH_403_RECENT_LOGIN_REQUIRED",
+        status = 403,
+        title = "Recent sign-in required",
+        remediation = "Sign in again with your password or SSO, then create the key within five minutes; an API key or recovery session cannot create one."
+    )]
+    RecentLoginRequired {
+        /// Human-readable error message.
+        message: String,
+        /// Structured detail payload.
+        details: serde_json::Value,
+    },
     /// OIDC ID token nonce did not match the stored login nonce.
     #[error("[WYRD_AUTH_400_INVALID_NONCE] {message}")]
     #[wyrd_error(
@@ -3784,6 +3846,10 @@ impl WyrdError {
             | Self::UnsupportedGrantType { message, details }
             | Self::InvalidState { message, details }
             | Self::OriginRefused { message, details }
+            | Self::PasswordInvalid { message, details }
+            | Self::PasswordAttempts { message, details }
+            | Self::OneTimeCodeInvalid { message, details }
+            | Self::RecentLoginRequired { message, details }
             | Self::DeviceAuthorization { message, details }
             | Self::InvalidNonce { message, details }
             | Self::RefreshReused { message, details }
@@ -4700,6 +4766,22 @@ mod tests {
             },
             WyrdError::OriginRefused {
                 message: "browser request origin refused".to_owned(),
+                details: serde_json::json!({}),
+            },
+            WyrdError::PasswordInvalid {
+                message: "username or password not accepted".to_owned(),
+                details: serde_json::json!({}),
+            },
+            WyrdError::PasswordAttempts {
+                message: "too many password attempts".to_owned(),
+                details: serde_json::json!({ "retry_after_seconds": 900 }),
+            },
+            WyrdError::OneTimeCodeInvalid {
+                message: "one-time code not accepted".to_owned(),
+                details: serde_json::json!({}),
+            },
+            WyrdError::RecentLoginRequired {
+                message: "recent sign-in required".to_owned(),
                 details: serde_json::json!({}),
             },
             WyrdError::InvalidNonce {

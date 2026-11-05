@@ -4,6 +4,7 @@
 //   brand/theme.css                                   workbench Tailwind theme
 //   docs/src/styles/wyrd-tokens.css                   docs site tokens
 //   .agents/skills/wyrd-ui/references/wyrd-theme.css  wyrd-ui skill reference
+//   packages/ui/src/lib/theme.css                     wyrd-ai-ui component tokens
 //   brand/logo.svg, brand/logo-light.svg, brand/app-icon.svg,
 //   docs/src/assets/wyrd-mark.svg, docs/public/favicon.svg   Wyrd mark renderings
 // Usage:
@@ -123,7 +124,11 @@ export function contrastFailures({ modes, tokens, pairs = [] }) {
 
 // ── CSS projections ────────────────────────────────────────────────────────
 
-/** The per-mode custom property lines, grouped by role family. */
+/**
+ * The per-mode custom property lines, grouped by role family, then the mode's
+ * native control rendering: the browser draws scrollbars and form controls in
+ * the mode's scheme, with a muted thumb on a clear track.
+ */
 function tokenLines(tokens, mode) {
   const lines = [];
   let current = null;
@@ -134,6 +139,7 @@ function tokenLines(tokens, mode) {
     }
     lines.push(`  ${name}: ${def[mode]};`);
   }
+  lines.push('', '  /* native controls */', `  color-scheme: ${mode};`, '  scrollbar-color: var(--muted) transparent;');
   return lines;
 }
 
@@ -167,6 +173,15 @@ function docsCss({ modes, scale, tokens }) {
     const selector = mode === 'light' ? ':root,\n:root[data-theme="light"]' : `:root[data-theme="${mode}"]`;
     return `${selector} {\n${tokenLines(tokens, mode).join('\n')}\n}`;
   });
+  return [BANNER, '', fonts, '', ...modeBlocks, ''].join('\n');
+}
+
+/** wyrd-ai-ui: the workbench tokens without the Tailwind mapping, for any host page. */
+function packageCss({ modes, scale, tokens }) {
+  const fonts = `:root {\n${fontLines(scale).join('\n')}\n}`;
+  const modeBlocks = modes.map(
+    (mode) => `[data-mode="${mode}"] {\n${tokenLines(tokens, mode).join('\n')}\n}`
+  );
   return [BANNER, '', fonts, '', ...modeBlocks, ''].join('\n');
 }
 
@@ -225,6 +240,7 @@ export function renderTargets(palette) {
     { path: join(here, 'theme.css'), content: workbenchCss(palette) },
     { path: join(repo, 'docs/src/styles/wyrd-tokens.css'), content: docsCss(palette) },
     { path: join(repo, '.agents/skills/wyrd-ui/references/wyrd-theme.css'), content: skillCss(palette) },
+    { path: join(here, '../packages/ui/src/lib/theme.css'), content: packageCss(palette) },
     { path: join(here, 'logo.svg'), content: markSvg(palette, 'dark') },
     { path: join(here, 'logo-light.svg'), content: markSvg(palette, 'light') },
     { path: join(here, 'app-icon.svg'), content: markSvg(palette, 'adaptive') },

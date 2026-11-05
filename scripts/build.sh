@@ -7,7 +7,8 @@
 #       Builds this host's bundle into release/: the wyrd-server binary,
 #       which also runs as the Monty worker it spawns for Verifier code, and
 #       the production UI in release/ui (the adapter-node BFF build, its
-#       package.json, and production node_modules). No Node executable is
+#       package.json, and production node_modules, including the packed
+#       wyrd-ai SDK and this host's native addon). No Node executable is
 #       bundled: native installs use the system Node, images their own.
 #       WYRD_PROFILE names the Cargo profile (default release; published
 #       bundles use dist).
@@ -39,6 +40,7 @@ bundle() {
   [[ $profile == dev ]] && profile_dir=debug
 
   cargo build --locked -p wyrd-server --profile "$profile" --features cloud
+  WYRD_PROFILE="$profile" mise run ts:build
   pnpm --dir "$ui" install --frozen-lockfile
   pnpm --dir "$ui" build
 
@@ -48,11 +50,20 @@ bundle() {
   cp -R "$ui/build" "$ui/package.json" "$ui/pnpm-lock.yaml" "$out/ui/"
   # adapter-node leaves `dependencies` external; install only those.
   pnpm --dir "$out/ui" install --prod --frozen-lockfile --ignore-scripts
-  rm "$out/ui/pnpm-lock.yaml"
+  # The workspace links wyrd-ai from source; ship its packed form and this
+  # host's addon, which the SDK loads from beside its own entry point.
+  local pack sdk=sdks/wyrd-sdk-ts/wyrd
+  pack="$(mktemp -d)"
+  trap 'rm -rf "$pack"' RETURN
+  (cd "$sdk" && npm pack --silent --pack-destination "$pack") >/dev/null
+  (cd "$out/ui" && npm pkg delete devDependencies)
+  pnpm --dir "$out/ui" add --prod --ignore-scripts --no-optional "$pack"/wyrd-ai-*.tgz
+  cp "$sdk"/wyrd.*.node "$(cd "$out/ui/node_modules/wyrd-ai" && pwd -P)/"
+  rm -f "$out/ui/pnpm-lock.yaml" "$out/ui/pnpm-workspace.yaml"
 
   "$out/wyrd-server" --version
   # The BFF's server code and every runtime dependency load without a listener.
-  (cd "$out/ui" && node --input-type=module -e 'await import("./build/handler.js")')
+  (cd "$out/ui" && node --input-type=module -e 'await import("./build/handler.js"); await import("wyrd-ai")')
 }
 
 bundle_in() {

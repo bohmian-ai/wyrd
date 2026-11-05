@@ -843,7 +843,7 @@ tokens are never Wyrd authority.
 
 | Client | OAuth client | Grant | Session holder |
 |---|---|---|---|
-| Web app | First-party browser session, not a separate OAuth client | Rust-owned OIDC login or API-key recovery under `/auth/browser` | Opaque HttpOnly session cookie; only its digest and bound authority persist in Postgres; fixed 12-hour absolute lifetime |
+| Web app | First-party browser session, not a separate OAuth client | Rust-owned OIDC login, local password login or API-key recovery under `/auth/browser` | Opaque HttpOnly session cookie; only its digest and bound authority persist in Postgres; fixed 12-hour absolute lifetime |
 | CLI and SDKs | `wyrd-cli`, public | Device authorization (RFC 8628) | `credentials.toml`, owned by `wyrd-client`; refresh token rotates on every use |
 
 Rust owns browser login transactions, callbacks, session creation, validation,
@@ -872,12 +872,41 @@ separate Node `/login/callback` OAuth-code exchange or UI refresh-token flow.
 Deployed Services and Agents keep their own API keys or workload assertions;
 human SSO never replaces or disables them.
 
+Local password sign-in is the provider-free human path. An administrator
+holding User management and tenant administration creates a User directly
+(`POST /v1/principals/users`: username, password and Role names; `wyrd
+principal user create`), provisions an invitation by Role names (`POST
+/v1/principals/users/invitations`, 24-hour single-use code returned once;
+`wyrd principal user invite`) and, for recovery, a reset code (`POST
+/v1/principals/users/{principal_id}/password-reset`, 15 minutes); codes are
+delivered out of band and never appear in URLs. `POST
+/auth/browser/password/signup` redeems an invitation into a tenant User with
+a canonical tenant-local username; `/login`, `/change` and `/reset` verify,
+replace or reset the password. Rust stores only an Argon2id verifier,
+bounds failures per account and per source, and ends every local session of
+the User on change or reset; reset never signs in. `wyrd-server setup`
+creates no User. SSO-only Users have no password and are never linked to a
+local account by email or username. There is no OAuth password grant and no
+email delivery.
+
+`GET /v1/principals/me` returns the calling User's safe profile: principal,
+tenant, username, authentication method and effective permissions. Users
+list, create and revoke their own keys through the existing
+`/v1/principals/{principal_id}/credentials` routes under
+`personal_credentials:read|write`; creation requires a human login in the last
+five minutes, a name, a nonempty permission ceiling and an explicit expiry of
+at most 365 days. The UI page `/t/{tenant}/settings/account` and the SDK
+`Principals.me` / `list_credentials_page` projections use these routes; MCP
+exposes own-key metadata and revoke but never issues a secret.
+
 Browser session cookies contain only random identifiers. Records store their
-digests, tenant/principal, absolute expiry/revocation and either the exact
-human-connection revision or recovery-credential reference, not recoverable
-credentials. Recovery logout revokes only its browser session. Rust checks
-current authority on browser requests; existing tenant access-token snapshot
-semantics remain unchanged. Login transactions expire in five minutes and
+digests, tenant/principal, absolute expiry/revocation and exactly one anchor,
+not recoverable credentials: the exact human-connection revision of an SSO
+session, the recovery-credential reference of a recovery session, or the
+local User's password revision of a password session. Recovery logout revokes
+only its browser session. Rust checks current authority on browser requests
+against that anchor; only SSO sessions check the connection. Existing tenant
+access-token snapshot semantics remain unchanged. Login transactions expire in five minutes and
 sessions in twelve hours, with no sliding renewal. Protected tenant `/v1`
 HTTP APIs accept exactly one selected browser cookie through the existing
 principal/permission/audit boundary; ambiguous multiple session cookies are
@@ -888,7 +917,10 @@ back to a cookie after refusal. Cookie-authenticated mutations require exact
 trusted Origin checks; provider callback correlation remains transaction-bound.
 Production cookies are host-only, HttpOnly, Secure and SameSite=Lax, with the
 existing loopback-development exception. No API key or OAuth token reaches
-browser cookies, page data, URLs or JavaScript. Store failure is unavailable,
+browser cookies, page data, URLs or JavaScript, with one exception: a
+personal key the User just created is shown once from the authenticated,
+no-store POST action result and is never in the initial page load, history,
+storage, URLs, logs, telemetry, captures or cookies. Store failure is unavailable,
 not anonymous success. Prior credential-bearing UI cookies require re-login;
 no plaintext-cookie compatibility path is retained.
 

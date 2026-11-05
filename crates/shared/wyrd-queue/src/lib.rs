@@ -23,6 +23,7 @@ pub mod batch_builder;
 pub mod bounded_arrow;
 pub mod config;
 pub mod error;
+pub mod json_result;
 pub mod producer;
 pub mod queue;
 pub mod sealed_sender;

@@ -43,7 +43,7 @@ pub use crate::otlp_contract::{IngestOutcome, LogsOutcome, MetricsOutcome};
 use crate::scribe::preprocess::logical_data_identity;
 use crate::tables::{
     CallsTable, DomainTable, ExecutionInputsTable, ExecutionOutputsTable, ObjectsTable,
-    ResultsTable, TableError,
+    ResultsTable, SeriesTable, TableError,
 };
 use wyrd_runtime::principal::CardAttribution;
 use wyrd_spec::auth::Attribution;
@@ -584,9 +584,10 @@ impl<A: GateAudit + 'static> Gate<A> {
     ///
     /// The checks run cheapest first. A principal holding `BifrostRecord`
     /// `Write` under no scope at all is refused before any catalog work. The
-    /// four server-owned verification tables and the exact `bifrost.gateway.calls`
-    /// table are written only by the server's internal capture writer, which
-    /// never passes Gate, so every public principal, a wildcard holder
+    /// four server-owned verification tables, the exact `bifrost.gateway.calls`
+    /// and `bifrost.storage.objects` tables, and `bifrost.metrics.series`,
+    /// which Scribe derives from admitted points, are written only by the
+    /// server, never through Gate, so every public principal, a wildcard holder
     /// included, is refused next; the rest of `bifrost.gateway` is not reserved. Otherwise Scribe resolves the tenant's registered table UID and the principal must
     /// hold `BifrostRecord` `Write` covering that exact table object scope.
     ///
@@ -616,6 +617,7 @@ impl<A: GateAudit + 'static> Gate<A> {
         if is_verification_result_table(table)
             || (table.namespace == BifrostNamespace::Gateway && table.name == CallsTable::NAME)
             || (table.namespace == BifrostNamespace::Storage && table.name == ObjectsTable::NAME)
+            || (table.namespace == BifrostNamespace::Metrics && table.name == SeriesTable::NAME)
         {
             return Ok(Err(IngestError::ReservedBuiltinWriteDenied {
                 table: table.fqn(),
@@ -2735,10 +2737,12 @@ mod tests {
         );
     }
 
-    /// Every public write to the four server-owned verification tables is refused
-    /// as reserved, for every principal kind — a SYSTEM principal and a
-    /// wildcard administrator included — before Scribe, with exactly one
-    /// denied decision, because only the server's internal writer writes them.
+    /// Every public write to the server-owned verification tables and to
+    /// `bifrost.metrics.series` is refused as reserved, for every principal
+    /// kind — a SYSTEM principal and a wildcard administrator included — before
+    /// Scribe, with exactly one denied decision, because only the server writes
+    /// them: its internal writer the verification tables, and Scribe the series
+    /// rows it derives from admitted points.
     ///
     /// # Panics
     /// Panics when a write is admitted, refused with another error, reaches
@@ -2766,6 +2770,7 @@ mod tests {
             "bifrost.verification.results",
             "bifrost.verification.execution_inputs",
             "bifrost.verification.execution_outputs",
+            "bifrost.metrics.series",
         ] {
             for (label, auth) in &principals {
                 let scribe_calls = Arc::new(AtomicUsize::new(0));

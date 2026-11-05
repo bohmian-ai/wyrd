@@ -16,6 +16,7 @@ pub mod issuance;
 pub mod issue_api_key;
 pub mod jwt_bearer;
 pub mod login;
+pub mod passwords;
 pub mod pg_resolvers;
 pub mod platform_authz;
 pub mod platform_credentials;

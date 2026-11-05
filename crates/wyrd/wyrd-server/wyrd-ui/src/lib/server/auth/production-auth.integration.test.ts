@@ -16,6 +16,7 @@
  * and connection replacement end sessions at once.
  */
 import { spawn } from 'node:child_process';
+import { chromium } from 'playwright';
 import { expect, test } from 'vitest';
 
 type Journey = {
@@ -781,4 +782,46 @@ test('production provider replacement settings', async () => {
   // Removing the retired connection leaves the replacement's session live.
   expect((await replaced.go(0, settings)).status).toBe(200);
   expect((await replaced.go(1, settings)).status).toBe(200);
+}, journeyTimeout);
+
+test('production SSO account settings', async () => {
+  // The first journey deactivates the SSO tenant's connection; this tenant's stays active.
+  const sso = journey.switchTenants.keycloak;
+  // A genuine provider login as the viewer, who holds no tenant identity administration.
+  const bob = new Browser();
+  const session = await ssoLogin(bob, journey.users.reader, 0, 0, sso);
+  const chrome = await chromium.launch();
+  try {
+    const context = await chrome.newContext();
+    // The public origin is the load balancer: Chromium's requests to it reach BFF replica 0.
+    await context.route(`${journey.origin}/**`, async (route) => {
+      const url = new URL(route.request().url());
+      await route.fulfill({ response: await route.fetch({ url: journey.bffs[0] + url.pathname + url.search }) });
+    });
+    await context.addCookies([{ name: sessionCookie(sso), value: session, url: journey.origin, httpOnly: true, sameSite: 'Lax' }]);
+    const page = await context.newPage();
+    const account = `${journey.origin}/t/${sso}/settings/account`;
+    await page.goto(account);
+    await expect.poll(() => page.locator('dl').textContent()).toContain('Single sign-on');
+    expect(await page.getByLabel('Current password').count()).toBe(0);
+    expect(await page.getByLabel('Expires after (days)').inputValue()).toBe('30');
+    expect(await page.locator('input[name=permission]:checked').count()).toBe(0);
+
+    // The fresh SSO session creates a key whose secret is shown once.
+    await page.getByLabel('Name').fill('sso-laptop');
+    await page.locator('input[name=permission][value="cards:read"]').check();
+    await page.getByRole('button', { name: 'Create key' }).click();
+    const shown = page.locator('[data-secret]');
+    await expect.poll(() => shown.count()).toBe(1);
+    const secret = (await shown.textContent()) ?? '';
+    const used = await asKey(secret, 'GET', '/principals/me');
+    expect(used.status).toBe(200);
+    expect(((await used.json()) as { permissions: string[] }).permissions).toEqual(['cards:read']);
+    await page.goto(account);
+    expect(await page.content()).not.toContain(secret);
+    expect(await page.locator('tbody tr', { hasText: 'sso-laptop' }).textContent()).toContain('✓ active');
+    expect(await page.content()).not.toContain(session);
+  } finally {
+    await chrome.close();
+  }
 }, journeyTimeout);

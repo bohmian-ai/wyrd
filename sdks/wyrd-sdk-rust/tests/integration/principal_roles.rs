@@ -3,14 +3,17 @@
 //! One stable Service account runs every release of its family, each run
 //! keeping its own exact root.
 
+use std::collections::BTreeSet;
 use std::time::Duration;
 
+use secrecy::ExposeSecret as _;
 use serde::Deserialize;
 use serde_json::json;
 use wyrd_ai::auth::{
-    CreateServicePrincipalRequest, PrincipalId, PrincipalKindTag, PrincipalQuery, Principals,
-    RevokePrincipalRequest, RoleAssignment, RoleSource, WorkloadFamily, WorkloadKind,
-    WorkloadRestriction,
+    AccountAuthentication, CreateServicePrincipalRequest, CreateUserInvitationRequest,
+    CreateUserRequest, CredentialListQuery, PrincipalId, PrincipalKindTag, PrincipalQuery,
+    Principals, RevokePrincipalRequest, RoleAssignment, RoleSource, SecretBearer, WorkloadFamily,
+    WorkloadKind, WorkloadRestriction,
 };
 use wyrd_ai::bifrost::{BifrostOptions, QueryParam};
 use wyrd_ai::cards::Cards;
@@ -172,6 +175,81 @@ async fn only_a_tenant_admin_assigns_roles() {
     deployment.shutdown().await;
 }
 
+/// A tenant administrator creates a local User holding the named Role and
+/// invites another by Role name; policy, duplicate and unknown-Role inputs are
+/// refused, and a workload that is no administrator can do neither.
+///
+/// # Panics
+/// Panics when a step fails or an outcome differs.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires the repository-managed Postgres journey lifecycle"]
+async fn administrators_create_and_invite_users() {
+    let (deployment, _, key) = service_principal().await;
+    let admin = Principals::connect_with(&deployment.admin())
+        .await
+        .expect("handle connects");
+    let request = |username: &str, password: &str, role: &str| CreateUserRequest {
+        username: username.to_owned(),
+        password: SecretBearer::new(password.to_owned()),
+        roles: vec![role.to_owned()],
+    };
+
+    let created = admin
+        .create_user(&request("Development", "development", "admin"))
+        .await
+        .expect("an administrator creates a User");
+    assert_eq!(created.username, "development");
+    let roles = admin
+        .roles(&created.principal_id)
+        .await
+        .expect("roles read");
+    assert_eq!(roles.roles, vec![assignment("admin", RoleSource::Direct)]);
+    for (refused, why) in [
+        (
+            request("development", "development", "admin"),
+            "a taken username",
+        ),
+        (
+            request("short", "seven77", "admin"),
+            "a password under eight characters",
+        ),
+        (
+            request("unknown", "development", "no-such-role"),
+            "an unknown Role",
+        ),
+    ] {
+        let error = admin.create_user(&refused).await.expect_err(why);
+        assert_eq!(error.code(), "WYRD_SPEC_400_VALIDATION", "{why}");
+    }
+
+    let invited = admin
+        .invite_user(&CreateUserInvitationRequest {
+            roles: vec!["editor".to_owned()],
+        })
+        .await
+        .expect("an administrator invites");
+    assert_eq!(invited.invitation_code.expose().len(), 43);
+    assert_eq!(invited.invitation.role_ids.len(), 1);
+    assert!(invited.signup_url.as_str().ends_with("/signup"));
+
+    let workload = Principals::connect_with(&deployment.client(&key))
+        .await
+        .expect("handle connects");
+    let create = workload
+        .create_user(&request("intruder", "development", "admin"))
+        .await
+        .expect_err("a workload cannot create Users");
+    let invite = workload
+        .invite_user(&CreateUserInvitationRequest {
+            roles: vec!["admin".to_owned()],
+        })
+        .await
+        .expect_err("a workload cannot invite");
+    assert_eq!(create.code(), "WYRD_PERMISSION_403_DENIED_RBAC");
+    assert_eq!(invite.code(), "WYRD_PERMISSION_403_DENIED_RBAC");
+    deployment.shutdown().await;
+}
+
 /// A signed-in user discovered by email keeps its identity-provider Role
 /// beside a direct grant of the same Role; revoking removes only the direct
 /// one.
@@ -224,6 +302,131 @@ async fn direct_and_idp_user_assignments_coexist() {
         .expect("the administrator revokes viewer");
     assert!(revoked.changed);
     assert_eq!(revoked.roles, [assignment("viewer", RoleSource::Idp)]);
+    deployment.shutdown().await;
+}
+
+/// A local User reads their own profile and key metadata, page by page,
+/// through their own restricted key, and revokes it; the key never carries
+/// more than its ceiling and a Service is never given a human profile.
+///
+/// # Panics
+/// Panics when the deployment fails to start or any expectation fails.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires the repository-managed Postgres journey lifecycle"]
+async fn users_manage_personal_keys() {
+    let deployment = Deployment::start().await;
+    let ceiling = [
+        "personal_credentials:write",
+        "cards:read",
+        "personal_credentials:read",
+    ];
+    let (user, key) = deployment
+        .server()
+        .bootstrap_user_key("keeper", &["editor"], &ceiling)
+        .await
+        .expect("a local User creates a key");
+    let own = Principals::connect_with(&deployment.client(key.expose_secret()))
+        .await
+        .expect("handle connects");
+
+    let me = own.me().await.expect("the User reads their profile");
+    assert_eq!(me.principal_id, user);
+    assert_eq!(me.principal_kind, PrincipalKindTag::User);
+    assert_eq!(me.username.as_deref(), Some("keeper"));
+    assert_eq!(me.authentication, AccountAuthentication::Password);
+    assert_eq!(
+        me.permissions,
+        [
+            "cards:read",
+            "personal_credentials:read",
+            "personal_credentials:write"
+        ]
+    );
+
+    let page = own
+        .list_credentials_page(&user, CredentialListQuery::default())
+        .await
+        .expect("the User pages their keys");
+    assert_eq!(page.next_cursor, None);
+    let [listed] = page.credentials.as_slice() else {
+        panic!("one key: {page:?}");
+    };
+    assert_eq!(listed.name.as_deref(), Some("keeper"));
+    assert_eq!(
+        listed.permission_ceiling.as_deref(),
+        Some(&me.permissions[..])
+    );
+    assert!(listed.expires_at.is_some());
+    let unpaged = own
+        .list_credentials(&user)
+        .await
+        .expect_err("a User lists their keys page by page");
+    assert_eq!(unpaged.code(), "WYRD_SPEC_400_VALIDATION");
+    let issued = own
+        .issue_credential(&user)
+        .await
+        .expect_err("a User key is created only from a recent sign-in");
+    assert_eq!(issued.status(), 400);
+
+    // More than a page of keys created in one instant pages exactly once.
+    let mut expected: BTreeSet<_> = deployment
+        .server()
+        .seed_user_keys(user, 105)
+        .await
+        .expect("keys seed")
+        .into_iter()
+        .collect();
+    expected.insert(listed.id);
+    let mut seen = BTreeSet::new();
+    let mut cursor = None;
+    loop {
+        let page = own
+            .list_credentials_page(
+                &user,
+                CredentialListQuery {
+                    limit: Some(100),
+                    cursor,
+                },
+            )
+            .await
+            .expect("the User pages their keys");
+        assert!(page.credentials.len() <= 100);
+        for key in &page.credentials {
+            assert!(seen.insert(key.id), "{} listed twice", key.id);
+        }
+        let Some(next) = page.next_cursor else { break };
+        cursor = Some(next);
+    }
+    assert_eq!(seen, expected);
+
+    let admin = Principals::connect_with(&deployment.admin())
+        .await
+        .expect("handle connects");
+    let complete = admin
+        .list_credentials(&user)
+        .await
+        .expect("an administrator lists completely");
+    assert_eq!(
+        complete
+            .credentials
+            .iter()
+            .map(|key| key.id)
+            .collect::<BTreeSet<_>>(),
+        expected
+    );
+    let service = admin
+        .me()
+        .await
+        .expect_err("a Service has no human profile");
+    assert_eq!(service.code(), "WYRD_PERMISSION_403_DENIED_RBAC");
+
+    own.revoke_credential(&user, listed.id)
+        .await
+        .expect("the User revokes their key");
+    let revoked = Principals::connect_with(&deployment.client(key.expose_secret()))
+        .await
+        .expect_err("a revoked key no longer exchanges");
+    assert_eq!(revoked.status(), 401);
     deployment.shutdown().await;
 }
 

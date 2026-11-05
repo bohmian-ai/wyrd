@@ -30,3 +30,7 @@ credentials/
 *.log
 **/*.log
 !crates/wyrd/wyrd-enterprise/keys/license-pub.pem
+
+# The bundle's production dependencies and native addon are image content.
+!release/ui/node_modules/
+!release/ui/node_modules/**

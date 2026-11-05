@@ -134,3 +134,19 @@ test("state httpAuth carries its own service, run, and environment", async () =>
     vi.unstubAllGlobals();
   }
 });
+
+test("a browser-session client is validated locally and has no bearer", async () => {
+  const session = WyrdClient.forBrowserSession({
+    serverUrl: "http://127.0.0.1:9",
+    cookie: "wyrd_session_acme=opaque.1",
+    origin: "https://ui.example.com",
+  });
+
+  expect(session.serverUrl).toBe("http://127.0.0.1:9");
+  await expect(session.accessToken()).rejects.toMatchObject({ code: "WYRD_CLIENT_400_CONFIG_INVALID" });
+  for (const cookie of ["theme=dark", "wyrd_session_acme=a; wyrd_session_beta=b"]) {
+    expect(() =>
+      WyrdClient.forBrowserSession({ serverUrl: "http://127.0.0.1:9", cookie, origin: "https://ui.example.com" }),
+    ).toThrow(expect.objectContaining({ code: "WYRD_CLIENT_400_CONFIG_INVALID" }));
+  }
+});

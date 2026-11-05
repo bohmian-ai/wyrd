@@ -19,8 +19,11 @@
 //! ([`BrowserSessions::recover`]); and a repeated logout is safe
 //! ([`BrowserSessions::logout`]).
 
+use std::net::{IpAddr, SocketAddr};
+
 use axum::Json;
-use axum::extract::{Extension, Query, State};
+use axum::extract::rejection::JsonRejection;
+use axum::extract::{ConnectInfo, Extension, Query, State};
 use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use secrecy::{ExposeSecret as _, SecretString};
@@ -29,15 +32,23 @@ use wyrd_auth::browser_sessions::{BROWSER_SESSION_TTL, BrowserSessions, CreatedB
 use wyrd_spec::DataTenantId;
 use wyrd_spec::auth::{
     BrowserApiKeyRequest, BrowserLoginRequest, BrowserLoginResponse, BrowserLogoutRequest,
-    BrowserSessionQuery, BrowserSessionView, BrowserSessionsResponse,
+    BrowserSessionQuery, BrowserSessionView, BrowserSessionsResponse, PasswordChangeRequest,
+    PasswordLoginRequest, PasswordResetRequest, PasswordSignupRequest,
 };
 use wyrd_spec::error::{WyrdError, WyrdProblem};
 use wyrd_spec::ids::TenantSlug;
 use wyrd_spec::request_id::RequestId;
 
 use crate::auth::{RequestOrigin, auth_not_configured};
-use crate::http::error::WyrdErrorResponse;
+use crate::http::error::{WyrdErrorResponse, body_rejection};
 use crate::state::AppState;
+
+/// Request extension marking recent human sign-in proof: the request was
+/// authenticated by a password or provider browser session created at most
+/// five minutes ago. Bearer, API-key and recovery-session requests never
+/// carry it.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct RecentHumanLogin;
 
 /// Prefix of every tenant browser-session cookie name; the rest is the
 /// tenant's route key.
@@ -215,8 +226,9 @@ pub async fn login(
     State(state): State<AppState>,
     RequestOrigin(origin): RequestOrigin,
     headers: HeaderMap,
-    Json(request): Json<BrowserLoginRequest>,
+    request: Result<Json<BrowserLoginRequest>, JsonRejection>,
 ) -> Result<Response, WyrdErrorResponse> {
+    let Json(request) = request.map_err(|rejection| body_rejection(&rejection))?;
     require_same_origin(&headers, &origin)?;
     let begun = browser_sessions(&state)?
         .begin(&request.tenant, &origin)
@@ -378,20 +390,16 @@ pub async fn api_key(
     RequestOrigin(origin): RequestOrigin,
     headers: HeaderMap,
     id: Option<Extension<RequestId>>,
-    Json(request): Json<BrowserApiKeyRequest>,
+    request: Result<Json<BrowserApiKeyRequest>, JsonRejection>,
 ) -> Result<Response, WyrdErrorResponse> {
+    let Json(request) = request.map_err(|rejection| body_rejection(&rejection))?;
     require_same_origin(&headers, &origin)?;
     let sessions = browser_sessions(&state)?;
     let api_key = request.api_key.into_secret_string();
     let created = sessions
         .recover(&request.tenant, &api_key, request_id(id).as_str())
         .await?;
-    let view = sessions.view(&created.session).await?;
-    Ok(with_cookies(
-        StatusCode::OK,
-        vec![set_session_cookie(&origin, &view.tenant, &created.cookie)],
-        Json(view),
-    ))
+    signed_in_view(&sessions, &origin, StatusCode::OK, &created).await
 }
 
 /// `GET /auth/browser/session` — the live sessions this browser presents.
@@ -514,8 +522,9 @@ pub async fn logout(
     State(state): State<AppState>,
     RequestOrigin(origin): RequestOrigin,
     headers: HeaderMap,
-    Json(request): Json<BrowserLogoutRequest>,
+    request: Result<Json<BrowserLogoutRequest>, JsonRejection>,
 ) -> Result<Response, WyrdErrorResponse> {
+    let Json(request) = request.map_err(|rejection| body_rejection(&rejection))?;
     require_same_origin(&headers, &origin)?;
     let sessions = browser_sessions(&state)?;
     for (label, value) in session_cookies(&headers) {
@@ -527,6 +536,227 @@ pub async fn logout(
         StatusCode::NO_CONTENT,
         vec![clear_session_cookie(&origin, request.tenant.as_str())],
         (),
+    ))
+}
+
+/// The TCP peer the password failure source window is keyed by, when the
+/// listener recorded one.
+fn peer(connect: Option<Extension<ConnectInfo<SocketAddr>>>) -> Option<IpAddr> {
+    connect.map(|Extension(ConnectInfo(addr))| addr.ip())
+}
+
+/// `POST /auth/browser/password/signup` — enroll a local User with a one-use
+/// invitation and sign the browser in.
+///
+/// # Errors
+/// `403 WYRD_AUTH_403_ORIGIN_REFUSED` without this deployment's exact
+/// `Origin`; `400 WYRD_SPEC_400_VALIDATION` for a username or password
+/// outside policy or a taken username; `401
+/// WYRD_AUTH_401_ONE_TIME_CODE_INVALID` for an unusable invitation; `503
+/// WYRD_AUTH_503_VERIFY_UNAVAILABLE` when the store fails.
+#[utoipa::path(
+    post,
+    path = "/auth/browser/password/signup",
+    request_body = PasswordSignupRequest,
+    responses(
+        (status = 201, description = "User enrolled and signed in; its session cookie is set",
+          body = BrowserSessionView,
+          headers(("Set-Cookie" = String, description = "The tenant session cookie"))),
+        (status = 400, description = "Username or password outside policy, or the username \
+          is taken (WYRD_SPEC_400_VALIDATION)", body = WyrdProblem),
+        (status = 401, description = "The invitation is unknown, expired, revoked or used \
+          (WYRD_AUTH_401_ONE_TIME_CODE_INVALID)", body = WyrdProblem),
+        (status = 403, description = "Origin absent or foreign \
+          (WYRD_AUTH_403_ORIGIN_REFUSED)", body = WyrdProblem),
+        (status = 503, description = "The store is unavailable \
+          (WYRD_AUTH_503_VERIFY_UNAVAILABLE)", body = WyrdProblem)
+    ),
+    security(()),
+    tag = "Auth"
+)]
+#[tracing::instrument(level = "debug", skip_all)]
+pub async fn password_signup(
+    State(state): State<AppState>,
+    RequestOrigin(origin): RequestOrigin,
+    headers: HeaderMap,
+    id: Option<Extension<RequestId>>,
+    request: Result<Json<PasswordSignupRequest>, JsonRejection>,
+) -> Result<Response, WyrdErrorResponse> {
+    let Json(request) = request.map_err(|rejection| body_rejection(&rejection))?;
+    require_same_origin(&headers, &origin)?;
+    let sessions = browser_sessions(&state)?;
+    let created = sessions
+        .password_signup(request, request_id(id).as_str())
+        .await?;
+    signed_in_view(&sessions, &origin, StatusCode::CREATED, &created).await
+}
+
+/// `POST /auth/browser/password/login` — sign a local User in.
+///
+/// # Errors
+/// `403 WYRD_AUTH_403_ORIGIN_REFUSED` without this deployment's exact
+/// `Origin`; `401 WYRD_AUTH_401_PASSWORD_INVALID` for every unusable
+/// username/password pair; `429 WYRD_AUTH_429_PASSWORD_ATTEMPTS`, with
+/// `Retry-After`, while a failure window is exhausted; `503
+/// WYRD_AUTH_503_VERIFY_UNAVAILABLE` when the store fails.
+#[utoipa::path(
+    post,
+    path = "/auth/browser/password/login",
+    request_body = PasswordLoginRequest,
+    responses(
+        (status = 200, description = "Signed in; a fresh session cookie is set",
+          body = BrowserSessionView,
+          headers(("Set-Cookie" = String, description = "The tenant session cookie"))),
+        (status = 401, description = "Username or password not accepted \
+          (WYRD_AUTH_401_PASSWORD_INVALID)", body = WyrdProblem),
+        (status = 403, description = "Origin absent or foreign \
+          (WYRD_AUTH_403_ORIGIN_REFUSED)", body = WyrdProblem),
+        (status = 429, description = "Too many failed attempts; retry after the window ends \
+          (WYRD_AUTH_429_PASSWORD_ATTEMPTS)", body = WyrdProblem,
+          headers(("Retry-After" = u64, description = "Seconds until the window ends"))),
+        (status = 503, description = "The store is unavailable \
+          (WYRD_AUTH_503_VERIFY_UNAVAILABLE)", body = WyrdProblem)
+    ),
+    security(()),
+    tag = "Auth"
+)]
+#[tracing::instrument(level = "debug", skip_all)]
+pub async fn password_login(
+    State(state): State<AppState>,
+    RequestOrigin(origin): RequestOrigin,
+    headers: HeaderMap,
+    id: Option<Extension<RequestId>>,
+    connect: Option<Extension<ConnectInfo<SocketAddr>>>,
+    request: Result<Json<PasswordLoginRequest>, JsonRejection>,
+) -> Result<Response, WyrdErrorResponse> {
+    let Json(request) = request.map_err(|rejection| body_rejection(&rejection))?;
+    require_same_origin(&headers, &origin)?;
+    let sessions = browser_sessions(&state)?;
+    let created = sessions
+        .password_login(request, peer(connect), request_id(id).as_str())
+        .await?;
+    signed_in_view(&sessions, &origin, StatusCode::OK, &created).await
+}
+
+/// `POST /auth/browser/password/change` — change the selected tenant's
+/// signed-in local User's password.
+///
+/// Every local session of the User ends, so the selected cookie is cleared.
+///
+/// # Errors
+/// `403 WYRD_AUTH_403_ORIGIN_REFUSED` without this deployment's exact
+/// `Origin`; `401 WYRD_AUTH_401_INVALID_TOKEN` without a live password
+/// session for `tenant`; `400 WYRD_SPEC_400_VALIDATION` for a new password
+/// outside policy; `401 WYRD_AUTH_401_PASSWORD_INVALID` for a wrong current
+/// password; `429 WYRD_AUTH_429_PASSWORD_ATTEMPTS` while a window is
+/// exhausted; `503 WYRD_AUTH_503_VERIFY_UNAVAILABLE` when the store fails.
+#[utoipa::path(
+    post,
+    path = "/auth/browser/password/change",
+    request_body = PasswordChangeRequest,
+    responses(
+        (status = 204, description = "Password changed; local sessions ended and the cookie \
+          cleared", headers(("Set-Cookie" = String, description = "The cleared session cookie"))),
+        (status = 400, description = "New password outside policy \
+          (WYRD_SPEC_400_VALIDATION)", body = WyrdProblem),
+        (status = 401, description = "No live password session for the tenant, or the current \
+          password is not accepted (WYRD_AUTH_401_INVALID_TOKEN, \
+          WYRD_AUTH_401_PASSWORD_INVALID)", body = WyrdProblem),
+        (status = 403, description = "Origin absent or foreign \
+          (WYRD_AUTH_403_ORIGIN_REFUSED)", body = WyrdProblem),
+        (status = 429, description = "Too many failed attempts \
+          (WYRD_AUTH_429_PASSWORD_ATTEMPTS)", body = WyrdProblem),
+        (status = 503, description = "The store is unavailable \
+          (WYRD_AUTH_503_VERIFY_UNAVAILABLE)", body = WyrdProblem)
+    ),
+    security(()),
+    tag = "Auth"
+)]
+#[tracing::instrument(level = "debug", skip_all)]
+pub async fn password_change(
+    State(state): State<AppState>,
+    RequestOrigin(origin): RequestOrigin,
+    headers: HeaderMap,
+    connect: Option<Extension<ConnectInfo<SocketAddr>>>,
+    request: Result<Json<PasswordChangeRequest>, JsonRejection>,
+) -> Result<Response, WyrdErrorResponse> {
+    let Json(request) = request.map_err(|rejection| body_rejection(&rejection))?;
+    require_same_origin(&headers, &origin)?;
+    let sessions = browser_sessions(&state)?;
+    let tenant = request.tenant.clone();
+    let cookie = session_cookies(&headers)
+        .into_iter()
+        .find_map(|(label, value)| (label.as_ref() == Some(&tenant)).then_some(value))
+        .ok_or_else(|| WyrdError::InvalidToken {
+            message: "no live browser session; sign in again".to_owned(),
+            details: serde_json::json!({ "reason": "browser_session_invalid" }),
+        })?;
+    let session = sessions.resolve(&cookie).await?;
+    sessions
+        .password_change(&session, request, peer(connect))
+        .await?;
+    Ok(with_cookies(
+        StatusCode::NO_CONTENT,
+        vec![clear_session_cookie(&origin, tenant.as_str())],
+        (),
+    ))
+}
+
+/// `POST /auth/browser/password/reset` — set a local User's password with a
+/// one-use operator reset code. The browser is not signed in.
+///
+/// # Errors
+/// `403 WYRD_AUTH_403_ORIGIN_REFUSED` without this deployment's exact
+/// `Origin`; `400 WYRD_SPEC_400_VALIDATION` for a new password outside
+/// policy; `401 WYRD_AUTH_401_ONE_TIME_CODE_INVALID` for an unusable code;
+/// `503 WYRD_AUTH_503_VERIFY_UNAVAILABLE` when the store fails.
+#[utoipa::path(
+    post,
+    path = "/auth/browser/password/reset",
+    request_body = PasswordResetRequest,
+    responses(
+        (status = 204, description = "Password set; every local session of the User ended"),
+        (status = 400, description = "New password outside policy \
+          (WYRD_SPEC_400_VALIDATION)", body = WyrdProblem),
+        (status = 401, description = "The reset code is unknown, expired or used \
+          (WYRD_AUTH_401_ONE_TIME_CODE_INVALID)", body = WyrdProblem),
+        (status = 403, description = "Origin absent or foreign \
+          (WYRD_AUTH_403_ORIGIN_REFUSED)", body = WyrdProblem),
+        (status = 503, description = "The store is unavailable \
+          (WYRD_AUTH_503_VERIFY_UNAVAILABLE)", body = WyrdProblem)
+    ),
+    security(()),
+    tag = "Auth"
+)]
+#[tracing::instrument(level = "debug", skip_all)]
+pub async fn password_reset(
+    State(state): State<AppState>,
+    RequestOrigin(origin): RequestOrigin,
+    headers: HeaderMap,
+    request: Result<Json<PasswordResetRequest>, JsonRejection>,
+) -> Result<Response, WyrdErrorResponse> {
+    let Json(request) = request.map_err(|rejection| body_rejection(&rejection))?;
+    require_same_origin(&headers, &origin)?;
+    browser_sessions(&state)?.password_reset(request).await?;
+    Ok(with_cookies(StatusCode::NO_CONTENT, Vec::new(), ()))
+}
+
+/// The response for a session just created: its metadata at `status` with
+/// its cookie set.
+///
+/// # Errors
+/// Returns the refusals of [`BrowserSessions::view`].
+async fn signed_in_view(
+    sessions: &BrowserSessions,
+    origin: &Url,
+    status: StatusCode,
+    created: &CreatedBrowserSession,
+) -> Result<Response, WyrdErrorResponse> {
+    let view = sessions.view(&created.session).await?;
+    Ok(with_cookies(
+        status,
+        vec![set_session_cookie(origin, &view.tenant, &created.cookie)],
+        Json(view),
     ))
 }
 

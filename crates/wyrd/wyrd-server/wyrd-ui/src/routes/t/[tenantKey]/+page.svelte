@@ -4,8 +4,10 @@
 </script>
 
 <svelte:head><title>{data.tenant.name} · Wyrd</title></svelte:head>
+<div class="app-page">
 <h1>{data.tenant.name}</h1>
 <p>Signed in as <strong>{data.session.subject.name}</strong> to tenant <code>{data.tenant.key}</code>.</p>
+</div>
 
 <style>
   h1 {

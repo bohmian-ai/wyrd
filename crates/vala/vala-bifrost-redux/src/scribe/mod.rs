@@ -29,6 +29,7 @@ pub mod registry;
 pub mod replay;
 pub mod routing;
 pub mod seal_key;
+mod series_index;
 pub mod shards;
 pub(crate) mod staging;
 pub mod staging_runtime;
@@ -332,6 +333,9 @@ pub struct ScribeImpl {
     /// Vala SQL pool holding the batch-control fence, read by ingress only to
     /// recover an accepted retry the committed index no longer holds.
     control_postgres: Option<Arc<vala_sql::ValaPostgres>>,
+    /// The `bifrost.metrics.series` rows this process has made durable, so a
+    /// points batch admits only the series rows it adds.
+    series_seen: series_index::SeriesSeen,
     /// Test-tier barrier installed at the public ingest seam, if any.
     #[cfg(any(test, feature = "test-support"))]
     ingest_stall: Arc<std::sync::Mutex<Option<Arc<IngestStall>>>>,
@@ -1244,6 +1248,7 @@ impl ScribeImpl {
             admission_clock: ingress::AdmissionClock::new(control_postgres.clone()),
             control_postgres,
             fence_operator,
+            series_seen: series_index::SeriesSeen::default(),
             #[cfg(any(test, feature = "test-support"))]
             ingest_stall: Arc::new(std::sync::Mutex::new(None)),
             #[cfg(any(test, feature = "test-support"))]
@@ -1539,6 +1544,22 @@ impl ScribeImpl {
         self.persistence_cpu.close();
         self.wal_io.close();
         self.ingress_cpu.close();
+    }
+
+    /// Stops this Scribe as a crash would: [`Self::abort_shutdown`] without
+    /// graceful flush, then waits until every shard owner has terminated and
+    /// every job already submitted to the WAL IO lane has finished.
+    ///
+    /// Once this returns nothing this Scribe started can still write its WAL,
+    /// so another writer may open the directory.
+    #[cfg(test)]
+    pub(crate) async fn abort_and_settle_for_test(&self) {
+        let owners = self.shards.take_owners_for_test().await;
+        self.abort_shutdown();
+        for owner in owners {
+            let _ = owner.await;
+        }
+        self.wal_io.drain().await;
     }
 
     /// Installs one retained never-completing shard task for shutdown-bound tests.

@@ -17,7 +17,7 @@
 
 use axum::Json;
 use axum::extract::rejection::{JsonRejection, PathRejection, QueryRejection};
-use axum::extract::{Path, Query, State};
+use axum::extract::{Extension, Path, Query, State};
 use axum::http::StatusCode;
 use secrecy::ExposeSecret;
 use std::fmt::Display;
@@ -26,10 +26,10 @@ use wyrd_auth::issue_api_key::WyrdApiKey;
 use wyrd_runtime::{Permission, RoleRef};
 use wyrd_spec::auth::{
     Attribution, CreateServicePrincipalRequest, CreateServicePrincipalResponse,
-    CredentialListResponse, CredentialMetadata, IssuedCredential, PrincipalId, PrincipalKindTag,
-    PrincipalPage, PrincipalQuery, PrincipalRoles, PrincipalStatus, PrincipalSummary,
-    RoleAssignment, RoleAssignmentChange, RoleSource, SecretBearer, WorkloadFamily,
-    WorkloadRestriction,
+    CreateUserCredentialRequest, CredentialListQuery, CredentialListResponse, CredentialMetadata,
+    IssuedCredential, PrincipalId, PrincipalKindTag, PrincipalPage, PrincipalQuery, PrincipalRoles,
+    PrincipalStatus, PrincipalSummary, RoleAssignment, RoleAssignmentChange, RoleSource,
+    SecretBearer, WorkloadFamily, WorkloadRestriction,
 };
 use wyrd_spec::error::{WyrdError, WyrdProblem};
 use wyrd_spec::vala::api::AuditOutcome;
@@ -44,7 +44,9 @@ use wyrd_sql::queries::auth::{
     set_workload_restriction, user_by_id,
 };
 
+use super::accounts::{credential_page, is_principal_admin, is_self, mint_user_credential};
 use crate::audit;
+use crate::auth::browser::RecentHumanLogin;
 use crate::components::auth::Caller;
 use crate::http::error::{WyrdErrorResponse, body_rejection, internal_failure, path_rejection};
 use crate::state::AppState;
@@ -76,6 +78,11 @@ pub fn principals_router() -> OpenApiRouter<AppState> {
         .routes(routes!(list_principals, create_service_principal))
         .routes(routes!(list_principal_roles))
         .routes(routes!(grant_principal_role, revoke_principal_role))
+        .routes(routes!(super::accounts::current_user))
+        .routes(routes!(super::accounts::create_user))
+        .routes(routes!(super::accounts::create_user_invitation))
+        .routes(routes!(super::accounts::revoke_user_invitation))
+        .routes(routes!(super::accounts::create_password_reset))
         .routes(routes!(list_credentials, issue_credential))
         .routes(routes!(revoke_credential))
         .routes(routes!(set_principal_workload_restriction))
@@ -350,23 +357,34 @@ async fn create_service_principal(
 /// This is the first half of a rotation: the principal now holds two live
 /// credentials, so the old one can be retired once the new one is verified.
 ///
+/// A Service/Admin target takes no body. A User target requires a
+/// [`CreateUserCredentialRequest`] naming the key, its permission ceiling and
+/// lifetime: a User issuing for itself needs `personal_credentials:write` and
+/// a password or provider browser session at most five minutes old, and
+/// issuing for another User needs principal and tenant administration.
+///
 /// # Errors
-/// Returns a stable Wyrd error when the caller is unauthorized or a write
-/// fails.
+/// Returns a stable Wyrd error when the caller is unauthorized, the body is
+/// absent for a User or present for an account, the request is outside its
+/// bounds, or a write fails.
 #[utoipa::path(
     post,
     path = "/principals/{principal_id}/credentials",
     params(("principal_id" = Uuid, Path, description = "Principal to issue for")),
+    request_body(content = Option<CreateUserCredentialRequest>,
+      description = "Required for a User target and refused for any other"),
     responses(
         (status = 200, description = "Credential issued, plaintext returned once",
          body = IssuedCredential),
-        (status = 400, description = "A path identifier is not a valid UUID \
+        (status = 400, description = "A path identifier is not a valid UUID, or the body is \
+          absent for a User, present for an account, or outside its bounds \
           (WYRD_SPEC_400_VALIDATION)", body = WyrdProblem),
         (status = 401, description = "The request carried no usable access token \
           (WYRD_AUTH_401_UNAUTHENTICATED, WYRD_AUTH_401_INVALID_TOKEN, \
           WYRD_AUTH_401_TOKEN_EXPIRED)", body = WyrdProblem),
-        (status = 403, description = "Tenant principal administration required \
-          (WYRD_PERMISSION_403_DENIED_RBAC)", body = WyrdProblem),
+        (status = 403, description = "Tenant principal administration, the self credential \
+          capability, or a recent sign-in is required (WYRD_PERMISSION_403_DENIED_RBAC, \
+          WYRD_AUTH_403_RECENT_LOGIN_REQUIRED)", body = WyrdProblem),
         (status = 404, description = "No such principal in the caller's tenant \
           (WYRD_AUTH_404_PRINCIPAL_NOT_FOUND)", body = WyrdProblem),
         (status = 500, description = "A tenant store read or write failed \
@@ -376,25 +394,84 @@ async fn create_service_principal(
     ),
     tag = "Principals"
 )]
-#[tracing::instrument(level = "info", skip(state, caller))]
+#[tracing::instrument(level = "info", skip(state, caller, recent, body))]
 async fn issue_credential(
     State(state): State<AppState>,
     caller: Caller,
+    recent: Option<Extension<RecentHumanLogin>>,
     principal_id: Result<Path<Uuid>, PathRejection>,
-) -> Result<Json<IssuedCredential>, WyrdErrorResponse> {
+    body: axum::body::Bytes,
+) -> Result<axum::response::Response, WyrdErrorResponse> {
     let Path(principal_id) = principal_id.map_err(|rejection| path_rejection(&rejection))?;
-    let conn = authorize(
-        &state,
-        &caller,
-        "issue tenant credentials",
-        "auth.credential.issue",
-        &format!("principal:{principal_id}"),
-    )
-    .await?;
+    let resource = format!("principal:{principal_id}");
+    let own = is_self(&caller, principal_id);
+    let conn = if own && !is_principal_admin(&caller) {
+        audit::authorize(
+            &state,
+            &caller,
+            &Permission::personal_credentials_write(),
+            "auth.credential.issue",
+            &resource,
+        )?;
+        tenant_conn(&state, &caller).await?
+    } else {
+        authorize(
+            &state,
+            &caller,
+            "issue tenant credentials",
+            "auth.credential.issue",
+            &resource,
+        )
+        .await?
+    };
     let mut conn = require_principal(conn, principal_id).await?;
-    let issued = mint_credential(&mut conn, principal_id, caller.attribution()).await?;
+    let user_target = user_by_id(&mut conn, principal_id)
+        .await
+        .map_err(internal)?
+        .is_some();
+    // The body is parsed only once the caller may reach this principal.
+    let request = (!body.is_empty())
+        .then(|| Json::<CreateUserCredentialRequest>::from_bytes(&body))
+        .transpose()
+        .map_err(|rejection| body_rejection(&rejection))?
+        .map(|Json(request)| request);
+    let issued = match (user_target, request) {
+        (true, None) => {
+            return Err(invalid(
+                "a User credential needs a name, permission_ceiling and expires_in",
+                serde_json::json!({ "field": "body" }),
+            ));
+        }
+        (false, Some(_)) => {
+            return Err(invalid(
+                "only a User credential takes a request body",
+                serde_json::json!({ "field": "body" }),
+            ));
+        }
+        (true, Some(request)) => {
+            if own && recent.is_none() {
+                return Err(WyrdErrorResponse::from(WyrdError::RecentLoginRequired {
+                    message: "sign in again within five minutes to create a personal key"
+                        .to_owned(),
+                    details: serde_json::json!({}),
+                }));
+            }
+            if !own {
+                audit::authorize(
+                    &state,
+                    &caller,
+                    &Permission::wildcard(),
+                    "auth.credential.issue",
+                    &resource,
+                )?;
+            }
+            mint_user_credential(&state, &mut conn, &caller, principal_id, request).await?
+        }
+        (false, None) => mint_credential(&mut conn, principal_id, caller.attribution()).await?,
+    };
     conn.commit().await.map_err(internal)?;
-    Ok(Json(issued))
+    // The plaintext appears once, in this response; no cache may keep it.
+    Ok(crate::auth::oauth::no_store(StatusCode::OK, Json(issued)))
 }
 
 /// List a principal's credential metadata.
@@ -405,7 +482,10 @@ async fn issue_credential(
 #[utoipa::path(
     get,
     path = "/principals/{principal_id}/credentials",
-    params(("principal_id" = Uuid, Path, description = "Principal whose credentials to list")),
+    params(
+        ("principal_id" = Uuid, Path, description = "Principal whose credentials to list"),
+        CredentialListQuery
+    ),
     responses(
         (status = 200, description = "Non-secret credential metadata, newest first",
          body = CredentialListResponse),
@@ -425,14 +505,21 @@ async fn issue_credential(
     ),
     tag = "Principals"
 )]
-#[tracing::instrument(level = "info", skip(state, caller))]
+#[tracing::instrument(level = "info", skip(state, caller, query))]
 async fn list_credentials(
     State(state): State<AppState>,
     caller: Caller,
     principal_id: Result<Path<Uuid>, PathRejection>,
+    query: Result<Query<CredentialListQuery>, QueryRejection>,
 ) -> Result<Json<CredentialListResponse>, WyrdErrorResponse> {
     let Path(principal_id) = principal_id.map_err(|rejection| path_rejection(&rejection))?;
-    list_credentials_for(&state, &caller, principal_id)
+    let Query(query) = query.map_err(|rejection| {
+        invalid(
+            "credential query is malformed",
+            serde_json::json!({ "query": rejection.body_text() }),
+        )
+    })?;
+    list_credentials_for(&state, &caller, principal_id, &query)
         .await
         .map(Json)
         .map_err(WyrdErrorResponse::from)
@@ -442,36 +529,63 @@ async fn list_credentials(
 ///
 /// The operation behind both the HTTP route and the MCP tool, so the two
 /// surfaces cannot disagree about authorization, tenancy, or what a listing
-/// contains.
+/// contains. With no `limit` or `cursor` an administrator reads the complete
+/// listing; either one selects one page. A User reading its own keys without
+/// principal administration holds `personal_credentials:read` and must page.
 ///
 /// # Errors
-/// Returns a stable Wyrd error when the caller is unauthorized or the read
-/// fails.
+/// Returns a stable Wyrd error when the caller is unauthorized, a personal
+/// listing is not paged, the page query is invalid, or the read fails.
 pub(crate) async fn list_credentials_for(
     state: &AppState,
     caller: &Caller,
     principal_id: Uuid,
+    query: &CredentialListQuery,
 ) -> Result<CredentialListResponse, WyrdError> {
-    let conn = authorize(
-        state,
-        caller,
-        "list tenant credentials",
-        "auth.credential.list",
-        &format!("principal:{principal_id}"),
-    )
-    .await
-    .map_err(WyrdError::from)?;
-    let mut conn = require_principal(conn, principal_id).await?;
-    let rows = list_api_key_metadata(&mut conn, principal_id)
+    let resource = format!("principal:{principal_id}");
+    let conn = if is_self(caller, principal_id) && !is_principal_admin(caller) {
+        audit::authorize(
+            state,
+            caller,
+            &Permission::personal_credentials_read(),
+            "auth.credential.list",
+            &resource,
+        )?;
+        if !query.is_paged() {
+            return Err(WyrdError::Validation {
+                message: "a personal credential listing pages: send limit (1-100) or cursor"
+                    .to_owned(),
+                details: serde_json::json!({ "field": "limit" }),
+            });
+        }
+        tenant_conn(state, caller).await.map_err(WyrdError::from)?
+    } else {
+        authorize(
+            state,
+            caller,
+            "list tenant credentials",
+            "auth.credential.list",
+            &resource,
+        )
         .await
-        .map_err(|error| WyrdError::from(internal(error)))?;
+        .map_err(WyrdError::from)?
+    };
+    let mut conn = require_principal(conn, principal_id).await?;
+    let listing = if query.is_paged() {
+        credential_page(&mut conn, principal_id, query).await?
+    } else {
+        let rows = list_api_key_metadata(&mut conn, principal_id)
+            .await
+            .map_err(|error| WyrdError::from(internal(error)))?;
+        CredentialListResponse {
+            credentials: rows.into_iter().map(metadata).collect(),
+            next_cursor: None,
+        }
+    };
     conn.commit()
         .await
         .map_err(|error| WyrdError::from(internal(error)))?;
-
-    Ok(CredentialListResponse {
-        credentials: rows.into_iter().map(metadata).collect(),
-    })
+    Ok(listing)
 }
 
 /// Revoke one credential, leaving the principal and its roles untouched.
@@ -540,15 +654,27 @@ pub(crate) async fn revoke_credential_for(
     principal_id: Uuid,
     credential_id: Uuid,
 ) -> Result<(), WyrdError> {
-    let mut conn = authorize(
-        state,
-        caller,
-        "revoke tenant credentials",
-        "auth.credential.revoke",
-        &format!("credential:{credential_id}"),
-    )
-    .await
-    .map_err(WyrdError::from)?;
+    let resource = format!("credential:{credential_id}");
+    let mut conn = if is_self(caller, principal_id) && !is_principal_admin(caller) {
+        audit::authorize(
+            state,
+            caller,
+            &Permission::personal_credentials_write(),
+            "auth.credential.revoke",
+            &resource,
+        )?;
+        tenant_conn(state, caller).await.map_err(WyrdError::from)?
+    } else {
+        authorize(
+            state,
+            caller,
+            "revoke tenant credentials",
+            "auth.credential.revoke",
+            &resource,
+        )
+        .await
+        .map_err(WyrdError::from)?
+    };
 
     // Scoped to the principal the path names, so a credential id alone cannot
     // revoke a credential belonging to some other principal. The refusal
@@ -1140,7 +1266,7 @@ fn invalid(message: &str, details: serde_json::Value) -> WyrdErrorResponse {
 }
 
 /// Project a stored credential row onto its non-secret wire metadata.
-fn metadata(row: ApiKeyMetadataRow) -> CredentialMetadata {
+pub(crate) fn metadata(row: ApiKeyMetadataRow) -> CredentialMetadata {
     CredentialMetadata {
         id: row.id,
         prefix: row.prefix,
@@ -1148,6 +1274,8 @@ fn metadata(row: ApiKeyMetadataRow) -> CredentialMetadata {
         expires_at: row.expires_at.map(|at| at.to_rfc3339()),
         revoked_at: row.revoked_at.map(|at| at.to_rfc3339()),
         last_used_at: row.last_used_at.map(|at| at.to_rfc3339()),
+        name: row.name,
+        permission_ceiling: row.permission_ceiling.map(|ceiling| ceiling.0),
     }
 }
 

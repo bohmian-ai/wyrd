@@ -1,7 +1,7 @@
 # TASK-005 — Card browsing and definition component family
 
-Spec: [revision 9, approved](../spec.md). Status: Proposed; platform prerequisite holds completion.  
-Dependencies: [TASK-003](TASK-003-shared-ui-foundation.md).  
+Spec: [revision 15, approved](../spec.md). Status: Proposed; listed dependencies and required evidence govern completion.
+Dependencies: [TASK-003](TASK-003-shared-ui-foundation.md).
 Mapped obligations: REQ-030, REQ-024, REQ-020, AC-006, AC-007, AC-011, AC-010; all INV-001–INV-007 apply, with TASK-001-specific exclusions only in TASK-001.
 
 External dependency: Only if required ArtifactTable actions lack a current SDK/MCP projection: obtain approved platform action contract before calling that action complete. This task does not authorize implementation of that platform prerequisite. Contract-independent work may proceed, but fixtures/unavailable controls cannot close it.
@@ -14,14 +14,20 @@ Exact Card identity, relationships and kind-specific declarative content can be 
 
 Own RelationshipList, CardFacts, CompositionGraph, PromptMessages, PromptVariables, UsedBy, VersionDiff, ModelInterface, ArtifactTable, CardInventory and CardInventorySummary. Reuse CardHeader from TASK-003. Current Card/spec/artifact contracts win over historical layouts and handwritten types. No Prompt telemetry strip or client-side lineage owner.
 
-Use committed main `8651b96fd`, the approved spec and current canvas. Historical `wyrd-server-ui` at `7bfc3a8a` supplies read/state/test evidence only. Current uncommitted trace changes are unrelated and must be preserved. Package components render typed props; portable loaders plan/shape; executor/host boundaries own credentials, authorized IO and action execution. Preserve tenant isolation, stable errors and server audit behavior. No speculative framework, test-only configuration or replacement selectors.
+Use approved spec revision 15, the current canvas and current source contracts. `8651b96fd` is the historical migration baseline, not the current schema authority. Historical `wyrd-server-ui` at `7bfc3a8a` supplies read/state/test evidence only. Package components render typed props; portable loaders plan/shape; executor/host boundaries own credentials, authorized IO and action execution. Preserve tenant isolation, stable errors and server audit behavior. No speculative framework, test-only configuration or replacement selectors.
 
 | Capability | Existing owner/symbol | Inspected callers/tests | Missing behavior | Selected extension | New machinery justification |
 |---|---|---|---|---|---|
 | Exact Card reads | `sdks/wyrd-sdk-ts/wyrd/src/index.ts::Cards.get`, `Cards.list`; server `src/mcp/cards.rs::GET_BY_REF` | `sdks/wyrd-sdk-ts/wyrd/tests/support/server.ts::registered`; current Card envelopes | No portable UI projection | Extend the approved component loaders over these reads | No new registry, identity lookup or lineage owner |
 | Kind content | `crates/wyrd-spec/src/card/agent.rs::AgentSpec`, `prompt/spec.rs::PromptSpec`, `model.rs::ModelSpec`, `data.rs::DataSpec`, `service.rs::ServiceSpec` | SDK registered Card reads; historical server/card-live.ts::liveAgent/livePrompt/liveModel at 7bfc3a8a | No reusable canvas-aligned content projections | New generated-type-based components and pure loaders over current reads | Historical functions are evidence only; no old types/components copied |
 
-Paths under `src/mcp`, `src/query` or `tests/integration` described as server owners are rooted at `crates/wyrd/wyrd-server/`. Proposed TASK dependencies are not capabilities already present on main.
+Paths under `src/mcp`, `src/query` or `tests/integration` described as server owners are rooted at `crates/wyrd/wyrd-server/`. Revalidate source-map availability against the current checkout; historical missing-behavior claims do not override delivered contracts or completed dependencies.
+
+## Required Board Coverage
+
+RelationshipList → the relationships rail on Agent, Prompt, Model, Data and Service; CardFacts → declared facts and metadata on those boards; CompositionGraph → Agent/Service composition; PromptMessages, PromptVariables, UsedBy and VersionDiff → the corresponding Prompt sections; ModelInterface and ArtifactTable → Model interface/artifacts; CardInventorySummary → Home Cards. CardInventory has no dedicated approved board: record the missing reference and obtain explicit visual acceptance before calling it accepted.
+
+Record the reference region, implementation screenshot, state, theme and viewport; distinguish behavioral proof, visual comparison and individual human acceptance. Differences require a fix or an explicit approved exception. [Audit and evidence rules](../references/task-audit-2026-10-29.md) apply.
 
 ## Approach
 

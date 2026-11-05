@@ -15,6 +15,11 @@ export type JsonValue =
 export type AbsoluteUrl = string;
 
 /**
+ * How a User account authenticates.
+ */
+export type AccountAuthentication = "password" | "sso";
+
+/**
  * A data-producing step action. Actions read and compute only.
  */
 export type Action = ActionExtract | ActionAgent | ActionCode;
@@ -642,7 +647,7 @@ export interface CatboostMeta {
 export type Check = CheckAssert | CheckTrace | CheckAgent | CheckCode | CheckDrift;
 
 /**
- * A tool-less Agent returning the Verdict schema.
+ * An Agent, with any tools it declares, returning the Verdict schema.
  */
 export interface CheckAgent {
   /**
@@ -1052,6 +1057,26 @@ export interface CreateServicePrincipalResponse {
 export type CredentialBindingName = string;
 
 /**
+ * Query of `GET /v1/principals/{principal_id}/credentials`.
+ *
+ * Supplying `limit` or `cursor` selects one bounded page, newest first with
+ * the credential id as a stable tie-break; supplying neither keeps the
+ * complete administrator listing. A cursor resumes strictly after the last
+ * row it was issued for and binds the tenant and principal; it confers no
+ * authority, which every page re-checks.
+ */
+export interface CredentialListQuery {
+  /**
+   * Opaque continuation from the previous page's `next_cursor`.
+   */
+  readonly cursor?: string | null;
+  /**
+   * Page size, 1–100; a cursor alone pages by 50.
+   */
+  readonly limit?: number | null;
+}
+
+/**
  * A principal's credential metadata.
  */
 export interface CredentialListResponse {
@@ -1059,6 +1084,11 @@ export interface CredentialListResponse {
    * Credentials, newest first. Never any secret material.
    */
   readonly credentials: readonly CredentialMetadata[];
+  /**
+   * Continuation of a paged listing; present only when more rows remain
+   * and never on a complete (unpaged) listing.
+   */
+  readonly next_cursor?: string;
 }
 
 /**
@@ -1085,6 +1115,16 @@ export interface CredentialMetadata {
    * Last successful use.
    */
   readonly last_used_at: string | null;
+  /**
+   * Normalized name of a User key; absent for Service, Admin and platform
+   * credentials, whose authority is their principal's.
+   */
+  readonly name?: string;
+  /**
+   * Permission ceiling of a User key in canonical sorted order; absent for
+   * Service, Admin and platform credentials, which carry none.
+   */
+  readonly permission_ceiling?: readonly string[];
   /**
    * Non-secret lookup prefix.
    */
@@ -1113,6 +1153,44 @@ export interface CredentialRef {
  * ISO-4217 alphabetic currency code, such as `USD`.
  */
 export type CurrencyCode = string;
+
+/**
+ * Response of `GET /v1/principals/me`: the calling User's safe profile.
+ *
+ * Derived from the verified caller and current User state; never an email,
+ * password verifier, provider subject, session identifier or key secret.
+ */
+export interface CurrentUserProfile {
+  /**
+   * How the account authenticates, independent of this request's credential.
+   */
+  readonly authentication: AccountAuthentication;
+  /**
+   * Sorted, distinct caller-effective `resource:action` names;
+   * informational only, never authority.
+   */
+  readonly permissions: readonly string[];
+  /**
+   * The User.
+   */
+  readonly principal_id: PrincipalId;
+  /**
+   * Always `user`.
+   */
+  readonly principal_kind: PrincipalKindTag;
+  /**
+   * The tenant's route key.
+   */
+  readonly tenant: TenantSlug;
+  /**
+   * The tenant's isolation key.
+   */
+  readonly tenant_id: DataTenantId;
+  /**
+   * Canonical local username; `null` for an SSO-only account.
+   */
+  readonly username: string | null;
+}
 
 /**
  * Custom Python loader metadata.
@@ -1338,6 +1416,11 @@ export interface DataStats {
    */
   readonly sha256: string;
 }
+
+/**
+ * Immutable tenant isolation key used by tenant-scoped Wyrd and Vala rows.
+ */
+export type DataTenantId = string;
 
 /**
  * Arrow-free logical column type. The exhaustive set Bifrost accepts on the
@@ -6126,6 +6209,11 @@ export type TaskId = string;
  * Closed Wyrd ML task taxonomy.
  */
 export type TaskType = "BinaryClassification" | "MultiClassClassification" | "Regression" | "Clustering" | "AnomalyDetection" | "Forecasting" | "Generation" | "Other";
+
+/**
+ * Human-visible tenant slug resolved to a DataTenantId at the auth boundary.
+ */
+export type TenantSlug = string;
 
 /**
  * Config for the Tensorflow model interface.

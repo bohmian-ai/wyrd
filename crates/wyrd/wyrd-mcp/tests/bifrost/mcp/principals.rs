@@ -13,6 +13,8 @@ use crate::connectivity::{
 mod pg_tests {
     use super::{McpJourneyError, discover, principals, problem, refusal, structured, transport};
 
+    use std::collections::BTreeSet;
+
     use jsonschema::Validator;
     use rmcp::ClientServiceExt as _;
     use rmcp::model::CallToolRequestParams;
@@ -24,6 +26,9 @@ mod pg_tests {
 
     /// The read tool every authenticated agent may use.
     const LIST_CREDENTIALS: &str = "principals.list_credentials";
+
+    /// The calling User's safe profile.
+    const ME: &str = "principals.me";
 
     /// The write tool only an administrative agent may use.
     const REVOKE_CREDENTIAL: &str = "principals.revoke_credential";
@@ -618,6 +623,203 @@ mod pg_tests {
 
         credential_client.cancel().await?;
         admin_client.cancel().await?;
+        Ok(())
+    }
+
+    /// A local User's own key reads the User's profile and pages and revokes
+    /// the User's key metadata over MCP; the catalog never offers a tool that
+    /// returns a key secret, and the revoke tool appears only with
+    /// `personal_credentials:write` in the key's ceiling.
+    ///
+    /// # Errors
+    ///
+    /// Returns server startup, bootstrap, MCP transport, or tool-call
+    /// failures.
+    ///
+    /// # Panics
+    /// Panics when the profile, page, refusals, or catalog contradict the
+    /// published contract.
+    #[tokio::test(flavor = "multi_thread")]
+    #[ignore = "requires the Postgres-backed Bifrost journey lane"]
+    async fn users_manage_personal_key_metadata() -> Result<(), McpJourneyError> {
+        let server = WyrdTestServer::start_bound().await?;
+        let (user, key) = server
+            .bootstrap_user_key(
+                "keeper",
+                &["viewer"],
+                &["personal_credentials:read", "personal_credentials:write"],
+            )
+            .await?;
+        let (_, reader_key) = server
+            .bootstrap_user_key("reader", &["viewer"], &["personal_credentials:read"])
+            .await?;
+        let admin = server
+            .bootstrap_service("mcp-personal-admin", &["admin"])
+            .await?;
+
+        let client = ()
+            .serve_with_lifecycle(
+                transport(&server, ResolvedCredential::ApiKey(key.clone()), None)?,
+                discover(),
+            )
+            .await?;
+        let names: Vec<String> = client
+            .list_all_tools()
+            .await?
+            .iter()
+            .map(|tool| tool.name.to_string())
+            .collect();
+        for offered in [ME, LIST_CREDENTIALS, REVOKE_CREDENTIAL] {
+            assert!(
+                names.iter().any(|name| name == offered),
+                "{offered}: {names:?}"
+            );
+        }
+        assert!(
+            !names
+                .iter()
+                .any(|name| name.starts_with("principals.") && name.contains("issue")),
+            "no tool returns a key secret: {names:?}"
+        );
+
+        let me = structured(client.call_tool(call(ME, serde_json::json!({}))?).await?)?;
+        assert_eq!(me["principal_id"], user.to_string(), "{me}");
+        assert_eq!(me["username"], "keeper", "{me}");
+        assert_eq!(me["authentication"], "password", "{me}");
+        assert_eq!(
+            me["permissions"],
+            serde_json::json!(["personal_credentials:read", "personal_credentials:write"])
+        );
+        let strict = refusal(
+            client
+                .call_tool(call(ME, serde_json::json!({ "x": 1 }))?)
+                .await,
+        )?;
+        assert!(
+            strict.contains("VALIDATION") || strict.contains("unknown field"),
+            "{strict}"
+        );
+
+        let own = serde_json::json!({ "principal_id": user.to_string(), "limit": 1 });
+        let page = structured(client.call_tool(call(LIST_CREDENTIALS, own)?).await?)?;
+        let credentials = page["credentials"]
+            .as_array()
+            .ok_or("credentials are a list")?;
+        assert_eq!(credentials.len(), 1, "{page}");
+        assert!(page.get("next_cursor").is_none(), "{page}");
+        assert_eq!(credentials[0]["name"], "keeper", "{page}");
+        assert!(
+            credentials[0].get("credential").is_none(),
+            "no secret: {page}"
+        );
+        let unpaged = refusal(
+            client
+                .call_tool(call(
+                    LIST_CREDENTIALS,
+                    serde_json::json!({ "principal_id": user.to_string() }),
+                )?)
+                .await,
+        )?;
+        assert!(unpaged.contains("WYRD_SPEC_400_VALIDATION"), "{unpaged}");
+
+        // More than a page of keys created in one instant pages exactly once.
+        let mut expected: BTreeSet<String> = server
+            .seed_user_keys(user, 105)
+            .await?
+            .into_iter()
+            .map(|id| id.to_string())
+            .collect();
+        expected.insert(credentials[0]["id"].as_str().ok_or("id")?.to_owned());
+        let mut seen = BTreeSet::new();
+        let mut cursor = None;
+        loop {
+            let mut args = serde_json::json!({ "principal_id": user.to_string(), "limit": 100 });
+            if let Some(cursor) = cursor.take() {
+                args["cursor"] = cursor;
+            }
+            let page = structured(client.call_tool(call(LIST_CREDENTIALS, args)?).await?)?;
+            let listed = page["credentials"]
+                .as_array()
+                .ok_or("credentials are a list")?;
+            assert!(listed.len() <= 100, "{page}");
+            for key in listed {
+                let id = key["id"].as_str().ok_or("id")?.to_owned();
+                assert!(seen.insert(id.clone()), "{id} listed twice");
+            }
+            let Some(next) = page.get("next_cursor") else {
+                break;
+            };
+            cursor = Some(next.clone());
+        }
+        assert_eq!(seen, expected);
+        let administrator = ()
+            .serve_with_lifecycle(
+                transport(
+                    &server,
+                    ResolvedCredential::ApiKey(admin.api_key().ok_or("admin key")?.clone()),
+                    None,
+                )?,
+                discover(),
+            )
+            .await?;
+        let complete = structured(
+            administrator
+                .call_tool(call(
+                    LIST_CREDENTIALS,
+                    serde_json::json!({ "principal_id": user.to_string() }),
+                )?)
+                .await?,
+        )?;
+        let complete: BTreeSet<String> = complete["credentials"]
+            .as_array()
+            .ok_or("credentials are a list")?
+            .iter()
+            .filter_map(|key| key["id"].as_str().map(str::to_owned))
+            .collect();
+        assert_eq!(complete, expected);
+        administrator.cancel().await?;
+        let foreign = refusal(
+            client
+                .call_tool(call(
+                    LIST_CREDENTIALS,
+                    serde_json::json!({ "principal_id": admin.id().to_string(), "limit": 5 }),
+                )?)
+                .await,
+        )?;
+        assert!(foreign.contains("PERMISSION"), "{foreign}");
+
+        let reader = ()
+            .serve_with_lifecycle(
+                transport(&server, ResolvedCredential::ApiKey(reader_key), None)?,
+                discover(),
+            )
+            .await?;
+        let reader_names: Vec<String> = reader
+            .list_all_tools()
+            .await?
+            .iter()
+            .map(|tool| tool.name.to_string())
+            .collect();
+        assert!(
+            !reader_names.iter().any(|name| name == REVOKE_CREDENTIAL),
+            "a read-only key is not offered revocation: {reader_names:?}"
+        );
+        reader.cancel().await?;
+
+        let revoked = structured(
+            client
+                .call_tool(call(
+                    REVOKE_CREDENTIAL,
+                    serde_json::json!({
+                        "principal_id": user.to_string(),
+                        "credential_id": credentials[0]["id"],
+                    }),
+                )?)
+                .await?,
+        )?;
+        assert_eq!(revoked["revoked"], true, "{revoked}");
+        client.cancel().await?;
+        assert!(server.exchange_api_key(&key).await.is_err());
         Ok(())
     }
 }

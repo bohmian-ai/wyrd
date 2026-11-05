@@ -10,7 +10,7 @@ use crate::scribe::geometry::DEFAULT_SHARD_COUNT;
 use crate::scribe::stream_identity::{NodeId, StreamIdentity, WriterEpoch};
 use crate::scribe::tail_rpc::FetchLiveTailRequest;
 use crate::scribe::wal::{WalConfig, WalWriter};
-use arrow::array::{Array, ArrayRef, Int64Array};
+use arrow::array::{Array, ArrayRef, AsArray, Int64Array};
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
 use tempfile::TempDir;
@@ -102,6 +102,18 @@ fn principal(tenant: DataTenantId) -> Principal {
 ///
 /// Panics when the projection rejects a point.
 fn projected_metric_batch() -> RecordBatch {
+    projected_metric_batch_at(FIXTURE_POINT_TIME_NANOS)
+}
+
+/// Build the [`projected_metric_batch`] points of one series from `base`.
+///
+/// The four points are `base` plus 0 to 3 nanoseconds, so a `base` on an hour
+/// boundary keeps them all in that hour.
+///
+/// # Panics
+///
+/// Panics when the projection rejects a point.
+fn projected_metric_batch_at(base: u64) -> RecordBatch {
     use wyrd_tonic::otlp::metrics::v1::{
         Metric, ResourceMetrics, ScopeMetrics, Summary, SummaryDataPoint, metric,
         summary_data_point::ValueAtQuantile,
@@ -110,7 +122,7 @@ fn projected_metric_batch() -> RecordBatch {
     let point = |index: u64| SummaryDataPoint {
         attributes: Vec::new(),
         start_time_unix_nano: 0,
-        time_unix_nano: FIXTURE_POINT_TIME_NANOS + index,
+        time_unix_nano: base + index,
         count: index + 1,
         sum: 1.5,
         quantile_values: vec![
@@ -252,7 +264,7 @@ const MANAGED_COLUMNS: &[&str] = &[
 /// Assert every stored managed column is the table's own `Field` and value.
 ///
 /// The canonical path constructs only the managed arrays and clones every
-/// managed `Field` — sensitivity metadata, type, and nullability —
+/// managed `Field` — metadata, type, and nullability —
 /// from `(definition.schema)()`, so a locally reconstructed envelope would
 /// differ here even when the values happen to agree.
 ///
@@ -1068,4 +1080,627 @@ mod pg_tests {
             .shutdown(std::time::Instant::now() + std::time::Duration::from_secs(1))
             .await;
     }
+}
+
+/// One hour in nanoseconds, the `bifrost.metrics.series` partition width.
+const HOUR_NANOS: u64 = 3_600_000_000_000;
+
+/// One embedded Scribe whose WAL lives under `wal_dir`.
+///
+/// # Panics
+///
+/// Panics when the WAL writer cannot be built.
+fn embedded_scribe(wal_dir: &std::path::Path) -> ScribeImpl {
+    let wal = Arc::new(
+        WalWriter::new(wal_dir, *Uuid::nil().as_bytes(), 1, WalConfig::default())
+            .expect("WAL writer"),
+    );
+    let operator = Arc::new(object_store::memory::InMemory::new());
+    ScribeImpl::new_for_embedded_with_deps(operator, wal, &Uuid::nil().to_string(), 1)
+}
+
+/// The `bifrost.metrics.points` frame carrying `rows` in `payload` form,
+/// written by one principal per tenant, as one writer's batches are.
+fn points_frame(
+    tenant: DataTenantId,
+    batch_id: Uuid,
+    rows: &RecordBatch,
+    native: bool,
+) -> ScribeIngressFrame {
+    let principal = Principal::new(
+        PrincipalId::new(tenant.as_uuid()),
+        PrincipalKind::User,
+        tenant,
+        Vec::new(),
+        PermissionSet::new(),
+    );
+    ScribeIngressFrame {
+        attributed_cards: None,
+        dimensions: None,
+        workload: principal.workload_uid.clone(),
+        attribution: wyrd_spec::auth::Attribution::direct(principal.id).into(),
+        authenticated_tenant: tenant,
+        principal,
+        table: TableRef::new(BifrostNamespace::Metrics, "points"),
+        expected_schema_fingerprint: Some(projected_source_schema_fingerprint(
+            rows.schema().as_ref(),
+        )),
+        table_version: None,
+        request_id: RequestId::now_v7(),
+        batch_id,
+        measured_wire_bytes: 0,
+        payload: if native {
+            IngressPayload::ArrowIpc(bytes::Bytes::from(ipc_stream(std::slice::from_ref(rows))))
+        } else {
+            IngressPayload::Canonical(crate::contracts::CanonicalIngress::unreserved(vec![
+                rows.clone(),
+            ]))
+        },
+    }
+}
+
+/// Read `tenant`'s hot rows of one metrics table over the hours from
+/// `first_hour_nanos` through `last_hour_nanos`, as `(hour, series_id)`
+/// sorted, where `hour` is the row's `time_column` truncated to its hour.
+///
+/// # Panics
+///
+/// Panics when the read fails or a column is absent or mistyped.
+async fn series_keys(
+    scribe: &ScribeImpl,
+    tenant: DataTenantId,
+    table: &str,
+    time_column: &str,
+    (first_hour_nanos, last_hour_nanos): (u64, u64),
+) -> Vec<(i64, Vec<u8>)> {
+    let hour = |nanos: u64| {
+        crate::catalog::TimeGranularity::Hour
+            .bucket(chrono::DateTime::from_timestamp_nanos(
+                i64::try_from(nanos).expect("the fixed instant fits i64"),
+            ))
+            .expect("a fixed instant buckets into an hour")
+    };
+    let stored = live_rows(
+        scribe,
+        &FetchLiveTailRequest {
+            pruning: None,
+            binding: TenantTableBinding::resolve((
+                tenant,
+                TableRef::new(BifrostNamespace::Metrics, table),
+            ))
+            .expect("binding"),
+            target_stream: StreamIdentity::new(NodeId::new(Uuid::nil()), WriterEpoch::new(1)),
+            start_partition: hour(first_hour_nanos),
+            end_partition: hour(last_hour_nanos),
+            required_fields: crate::scribe::tail_rpc::tests::named_fields([
+                "series_id",
+                time_column,
+            ]),
+            query_id: Uuid::new_v4(),
+            capture_id: Uuid::nil(),
+        },
+        "series snapshot",
+    )
+    .await;
+    let mut keys = Vec::new();
+    for batch in &stored {
+        let ids = batch
+            .column_by_name("series_id")
+            .and_then(|column| column.as_fixed_size_binary_opt())
+            .expect("series_id is FixedSizeBinary");
+        let times = batch
+            .column_by_name(time_column)
+            .and_then(|column| {
+                column.as_primitive_opt::<arrow::datatypes::TimestampNanosecondType>()
+            })
+            .expect("the time column is a nanosecond timestamp");
+        for row in 0..batch.num_rows() {
+            let nanos = times.value(row);
+            keys.push((
+                nanos - nanos.rem_euclid(i64::try_from(HOUR_NANOS).expect("hour fits i64")),
+                ids.value(row).to_vec(),
+            ));
+        }
+    }
+    keys.sort();
+    keys
+}
+
+/// The one `series_id` every point of `rows` carries.
+///
+/// # Panics
+///
+/// Panics when `rows` has no `series_id` or its points span several series.
+fn single_series_id(rows: &RecordBatch) -> Vec<u8> {
+    let ids = rows
+        .column_by_name("series_id")
+        .and_then(|column| column.as_fixed_size_binary_opt())
+        .expect("projected points carry series_id");
+    let first = ids.value(0).to_vec();
+    assert!(
+        (0..ids.len()).all(|row| ids.value(row) == first.as_slice()),
+        "the fixture is one series"
+    );
+    first
+}
+
+/// One series ingested in two batches in one hour, then in the next hour,
+/// has one series row per hour, and the second batch of the first hour,
+/// whose series this process already made durable, writes no series row.
+///
+/// # Panics
+///
+/// Panics when a points batch is refused, or the series rows are not exactly
+/// one per hour carrying the points' own `series_id`.
+#[tokio::test]
+async fn a_series_has_one_row_per_hour_and_repeats_are_suppressed() {
+    let temp_dir = TempDir::new().expect("WAL temp dir");
+    let scribe = embedded_scribe(temp_dir.path());
+    let tenant = DataTenantId::new_v7();
+    let first = FIXTURE_POINT_TIME_NANOS;
+    let next = first + HOUR_NANOS;
+    let batches = [
+        projected_metric_batch_at(first),
+        projected_metric_batch_at(first + 100),
+        projected_metric_batch_at(next),
+    ];
+    for rows in &batches {
+        Scribe::ingest_frame(&scribe, points_frame(tenant, Uuid::now_v7(), rows, false))
+            .await
+            .expect("the points batch and its series rows are durable");
+    }
+
+    let id = single_series_id(&batches[0]);
+    let hour = |nanos: u64| i64::try_from(nanos).expect("hour fits i64");
+    assert_eq!(
+        series_keys(&scribe, tenant, "series", "hour_unix_nano", (first, next)).await,
+        vec![(hour(first), id.clone()), (hour(next), id.clone())],
+        "one series row per hour, none for the repeat in the first hour"
+    );
+    assert_eq!(
+        series_keys(&scribe, tenant, "points", "time_unix_nano", (first, next))
+            .await
+            .len(),
+        12,
+        "every point is durable"
+    );
+    scribe
+        .shutdown(std::time::Instant::now() + std::time::Duration::from_secs(1))
+        .await;
+}
+
+/// `rows` with its `run_id` correlation column set to `runs`, one per row.
+///
+/// # Panics
+///
+/// Panics when `rows` has no `run_id` column or `runs` is not one per row.
+fn with_runs(rows: &RecordBatch, runs: &[&str]) -> RecordBatch {
+    let at = rows
+        .schema()
+        .index_of("run_id")
+        .expect("projected points carry run_id");
+    let mut columns = rows.columns().to_vec();
+    columns[at] = Arc::new(arrow::array::StringArray::from(runs.to_vec()));
+    RecordBatch::try_new(rows.schema(), columns).expect("the runs are one per row")
+}
+
+/// `tenant`'s rows of metrics `table` over the hours `first_hour_nanos`
+/// through `last_hour_nanos`, read from writer `epoch`'s stream, each as its hex `series_id` then its `run_id`,
+/// `deployment_environment`, `service_name` and `workload_card_uid`, sorted.
+///
+/// # Panics
+///
+/// Panics when the read fails or a column is absent or not UTF-8.
+async fn series_contexts(
+    scribe: &ScribeImpl,
+    tenant: DataTenantId,
+    table: &str,
+    (first_hour_nanos, last_hour_nanos): (u64, u64),
+    epoch: i64,
+) -> Vec<(String, [Option<String>; 4])> {
+    /// The accepted-context columns a series row is indexed under: a point
+    /// matches its row only when every one of them agrees.
+    const CONTEXT: [&str; 4] = [
+        "run_id",
+        "deployment_environment",
+        "service_name",
+        "workload_card_uid",
+    ];
+    let hour = |nanos: u64| {
+        crate::catalog::TimeGranularity::Hour
+            .bucket(chrono::DateTime::from_timestamp_nanos(
+                i64::try_from(nanos).expect("the fixed instant fits i64"),
+            ))
+            .expect("a fixed instant buckets into an hour")
+    };
+    let stored = live_rows(
+        scribe,
+        &FetchLiveTailRequest {
+            pruning: None,
+            binding: TenantTableBinding::resolve((
+                tenant,
+                TableRef::new(BifrostNamespace::Metrics, table),
+            ))
+            .expect("binding"),
+            target_stream: StreamIdentity::new(NodeId::new(Uuid::nil()), WriterEpoch::new(epoch)),
+            start_partition: hour(first_hour_nanos),
+            end_partition: hour(last_hour_nanos),
+            required_fields: crate::scribe::tail_rpc::tests::named_fields(
+                std::iter::once("series_id").chain(CONTEXT),
+            ),
+            query_id: Uuid::new_v4(),
+            capture_id: Uuid::nil(),
+        },
+        "series context snapshot",
+    )
+    .await;
+    let mut rows = Vec::new();
+    for batch in &stored {
+        let ids = batch
+            .column_by_name("series_id")
+            .and_then(|column| column.as_fixed_size_binary_opt())
+            .expect("series_id is FixedSizeBinary");
+        let texts = CONTEXT.map(|name| {
+            batch
+                .column_by_name(name)
+                .and_then(|column| column.as_string_opt::<i32>())
+                .expect("the context column is UTF-8")
+        });
+        for row in 0..batch.num_rows() {
+            rows.push((
+                hex::encode(ids.value(row)),
+                texts.map(|text| text.is_valid(row).then(|| text.value(row).to_owned())),
+            ));
+        }
+    }
+    rows.sort();
+    rows
+}
+
+/// One series in one hour has a series row for each accepted context its
+/// points carry: each native run, within one batch and across batches, and
+/// each accepted environment and workload Service across batches. A batch
+/// repeating a context already durable writes no row, and every row keeps the
+/// points' own `series_id`.
+///
+/// # Panics
+///
+/// Panics when a points batch is refused, a context has no series row, a
+/// repeated context writes another, a row carries another `series_id`, or a
+/// durable point's context differs from the series rows'.
+#[tokio::test]
+async fn a_series_has_one_row_per_accepted_context_in_an_hour() {
+    use crate::tables::{CardDescriptor, FrameDimensions};
+    use wyrd_spec::envelope::CardKind;
+    use wyrd_spec::ids::CardUid;
+
+    let temp_dir = TempDir::new().expect("WAL temp dir");
+    let scribe = embedded_scribe(temp_dir.path());
+    let tenant = DataTenantId::new_v7();
+    let at = FIXTURE_POINT_TIME_NANOS;
+    let rows = projected_metric_batch_at(at);
+    let id = hex::encode(single_series_id(&rows));
+    let ingest = |frame: ScribeIngressFrame| {
+        let scribe = &scribe;
+        async move {
+            Scribe::ingest_frame(scribe, frame)
+                .await
+                .expect("the points batch and its series rows are durable");
+        }
+    };
+    // Two runs in one native batch, a third in the next, then the first again.
+    ingest(points_frame(
+        tenant,
+        Uuid::now_v7(),
+        &with_runs(&rows, &["run-a", "run-a", "run-b", "run-b"]),
+        true,
+    ))
+    .await;
+    ingest(points_frame(
+        tenant,
+        Uuid::now_v7(),
+        &with_runs(&rows, &["run-c"; 4]),
+        true,
+    ))
+    .await;
+    ingest(points_frame(
+        tenant,
+        Uuid::now_v7(),
+        &with_runs(&rows, &["run-a"; 4]),
+        true,
+    ))
+    .await;
+    // Two accepted environments, then two workloads whose Services Gate described.
+    let accepted = |environment: Option<&str>, workload: Option<(&CardUid, &str)>| {
+        let mut frame = points_frame(tenant, Uuid::now_v7(), &rows, false);
+        frame.workload = workload.map(|(uid, _)| uid.clone());
+        frame.dimensions = Some(FrameDimensions {
+            environment: environment.map(str::to_owned),
+            cards: workload
+                .map(|(uid, service)| {
+                    (
+                        uid.clone(),
+                        CardDescriptor {
+                            kind: CardKind::Service,
+                            name: service.to_owned(),
+                            version: "1.0.0".to_owned(),
+                        },
+                    )
+                })
+                .into_iter()
+                .collect(),
+        });
+        frame
+    };
+    ingest(accepted(Some("dev"), None)).await;
+    ingest(accepted(Some("prod"), None)).await;
+    ingest(accepted(Some("prod"), None)).await;
+    let (checkout, billing) = (
+        CardUid::new(Uuid::now_v7().to_string()).expect("card uid"),
+        CardUid::new(Uuid::now_v7().to_string()).expect("card uid"),
+    );
+    ingest(accepted(None, Some((&checkout, "checkout")))).await;
+    ingest(accepted(None, Some((&billing, "billing")))).await;
+
+    let text = |value: &str| Some(value.to_owned());
+    let mut expected = vec![
+        (id.clone(), [text("run-a"), None, None, None]),
+        (id.clone(), [text("run-b"), None, None, None]),
+        (id.clone(), [text("run-c"), None, None, None]),
+        (id.clone(), [None, text("dev"), None, None]),
+        (id.clone(), [None, text("prod"), None, None]),
+        (
+            id.clone(),
+            [None, None, text("checkout"), text(checkout.as_str())],
+        ),
+        (
+            id.clone(),
+            [None, None, text("billing"), text(billing.as_str())],
+        ),
+    ];
+    expected.sort();
+    assert_eq!(
+        series_contexts(&scribe, tenant, "series", (at, at), 1).await,
+        expected,
+        "one series row per context, none for a repeated context"
+    );
+    let mut points = series_contexts(&scribe, tenant, "points", (at, at), 1).await;
+    points.dedup();
+    assert_eq!(
+        points, expected,
+        "every durable point keeps its context, and each has its series row"
+    );
+    scribe
+        .shutdown(std::time::Instant::now() + std::time::Duration::from_secs(1))
+        .await;
+}
+
+/// A series admission that fails fails its points admission: no point is
+/// durable without its series row, and the writer's retry of the same batch
+/// writes both.
+///
+/// The series rows go through the canonical ingress path, so a decoded-request
+/// ceiling below their size refuses them while the native points batch, which
+/// that ceiling does not bind, is otherwise admissible.
+///
+/// # Panics
+///
+/// Panics when the points are admitted while their series admission fails,
+/// a point is durable after that failure, or the retry does not store both.
+#[tokio::test]
+async fn a_failed_series_admission_fails_the_points_admission() {
+    let temp_dir = TempDir::new().expect("WAL temp dir");
+    let scribe = embedded_scribe(temp_dir.path());
+    let tenant = DataTenantId::new_v7();
+    let rows = projected_metric_batch();
+    let hours = (FIXTURE_POINT_TIME_NANOS, FIXTURE_POINT_TIME_NANOS);
+    let batch_id = Uuid::now_v7();
+
+    scribe.set_decoded_request_limit_for_test(1);
+    let error = Scribe::ingest_frame(&scribe, points_frame(tenant, batch_id, &rows, true))
+        .await
+        .expect_err("a refused series admission refuses its points");
+    assert!(
+        matches!(error, ScribeError::DecodedPayloadTooLarge { .. }),
+        "the series refusal is the points refusal: {error:?}"
+    );
+    assert!(
+        series_keys(&scribe, tenant, "points", "time_unix_nano", hours)
+            .await
+            .is_empty(),
+        "no point is durable without its series row"
+    );
+
+    scribe.set_decoded_request_limit_for_test(usize::MAX);
+    Scribe::ingest_frame(&scribe, points_frame(tenant, batch_id, &rows, true))
+        .await
+        .expect("the retried batch is admitted with its series rows");
+    let hour = i64::try_from(FIXTURE_POINT_TIME_NANOS).expect("hour fits i64");
+    assert_eq!(
+        series_keys(&scribe, tenant, "series", "hour_unix_nano", hours).await,
+        vec![(hour, single_series_id(&rows))]
+    );
+    assert_eq!(
+        series_keys(&scribe, tenant, "points", "time_unix_nano", hours)
+            .await
+            .len(),
+        4
+    );
+    scribe
+        .shutdown(std::time::Instant::now() + std::time::Duration::from_secs(1))
+        .await;
+}
+
+/// Drives `ingest` until the WAL's post-sync fault holds a group with a slice
+/// `target` matches, retained after its completed sync, then drops `ingest`
+/// unanswered and stops `scribe` as a crash would, returning once its owners
+/// and WAL IO have finished.
+///
+/// # Panics
+///
+/// Panics when `ingest` answers first or the fault's watch closes.
+async fn crash_once_held(
+    scribe: &ScribeImpl,
+    wal: &WalWriter,
+    target: impl Fn(&crate::scribe::preprocess::AppendSliceId) -> bool,
+    ingest: impl std::future::Future<Output = Result<crate::contracts::FrameAdmission, ScribeError>>,
+) {
+    let mut held = wal.post_sync_held_for_test();
+    let mut ingest = Box::pin(ingest);
+    tokio::select! {
+        biased;
+        result = &mut ingest => panic!("the held admission answered: {result:?}"),
+        held = held.wait_for(|slices| slices.iter().any(&target)) => {
+            drop(held.expect("the WAL's faults outlive its Scribe"));
+        }
+    }
+    drop(ingest);
+    scribe.abort_and_settle_for_test().await;
+}
+
+/// One embedded Scribe at writer `epoch` over the WAL under `wal_dir`, after
+/// ordinary WAL replay; a restart is the next epoch over the same directory.
+///
+/// # Panics
+///
+/// Panics when the WAL writer cannot be built or replay fails.
+async fn restarted_scribe(wal_dir: &std::path::Path, epoch: i64) -> (Arc<WalWriter>, ScribeImpl) {
+    let wal = Arc::new(
+        WalWriter::new(
+            wal_dir,
+            *Uuid::nil().as_bytes(),
+            epoch,
+            WalConfig::default(),
+        )
+        .expect("WAL writer"),
+    );
+    let operator = Arc::new(object_store::memory::InMemory::new());
+    let scribe = ScribeImpl::new_for_embedded_with_deps(
+        operator,
+        Arc::clone(&wal),
+        &Uuid::nil().to_string(),
+        epoch,
+    );
+    scribe
+        .replay_wal_async()
+        .await
+        .expect("ordinary WAL replay");
+    (wal, scribe)
+}
+
+/// A process that stops after a points batch's series rows are durable,
+/// before its points are dispatched, recovers the series row and no point
+/// through ordinary WAL replay, and the writer's retry of that batch is
+/// admitted with every point indexed by its series row.
+///
+/// The WAL's post-sync fault holds the series admission retained after its
+/// completed sync, unanswered; the process is then aborted without graceful
+/// flush, and its owners and WAL IO finish before the next writer opens.
+///
+/// # Panics
+///
+/// Panics when the held admission answers, replay fails, a point is
+/// recovered, the series row is not, or the retry is refused or leaves a
+/// point without its series row for its hour and context.
+#[tokio::test]
+async fn a_stop_after_durable_series_rows_recovers_them_and_admits_the_retry() {
+    let temp_dir = TempDir::new().expect("WAL temp dir");
+    let tenant = DataTenantId::new_v7();
+    let at = FIXTURE_POINT_TIME_NANOS;
+    let rows = with_runs(&projected_metric_batch_at(at), &["run-a"; 4]);
+    let batch_id = Uuid::now_v7();
+
+    let (wal, scribe) = restarted_scribe(temp_dir.path(), 1).await;
+    wal.trip_post_sync_failure_for_test();
+    crash_once_held(
+        &scribe,
+        &wal,
+        |slice| slice.seal_key.table.name == "series",
+        Scribe::ingest_frame(&scribe, points_frame(tenant, batch_id, &rows, true)),
+    )
+    .await;
+    drop((scribe, wal));
+
+    let (_wal, scribe) = restarted_scribe(temp_dir.path(), 2).await;
+    let series = series_contexts(&scribe, tenant, "series", (at, at), 2).await;
+    assert_eq!(series.len(), 1, "the durable series row is recovered");
+    assert!(
+        series_contexts(&scribe, tenant, "points", (at, at), 2)
+            .await
+            .is_empty(),
+        "no point was dispatched"
+    );
+    Scribe::ingest_frame(&scribe, points_frame(tenant, batch_id, &rows, true))
+        .await
+        .expect("the writer's retry of the interrupted batch is admitted");
+    let points = series_contexts(&scribe, tenant, "points", (at, at), 2).await;
+    assert_eq!(points.len(), 4, "the retried points are durable");
+    assert!(
+        points.iter().all(|point| series.contains(point)),
+        "every point has its series row for its hour and context"
+    );
+    assert_eq!(
+        series_contexts(&scribe, tenant, "series", (at, at), 2).await,
+        series,
+        "the retry adds no second series row"
+    );
+    scribe
+        .shutdown(std::time::Instant::now() + std::time::Duration::from_secs(1))
+        .await;
+}
+
+/// A process that stops after points are durable but before they are
+/// answered recovers them through ordinary WAL replay, each with its series
+/// row for its hour and context.
+///
+/// The first batch is answered with its series row; the WAL's post-sync
+/// fault then holds a later batch of the same series retained after its
+/// completed sync, unanswered; the process is then aborted without graceful
+/// flush, and its owners and WAL IO finish before the next writer opens.
+///
+/// # Panics
+///
+/// Panics when the held admission answers, replay fails, the unanswered
+/// points are not recovered, or a recovered point lacks its series row.
+#[tokio::test]
+async fn a_stop_after_durable_unanswered_points_recovers_every_point_indexed() {
+    let temp_dir = TempDir::new().expect("WAL temp dir");
+    let tenant = DataTenantId::new_v7();
+    let at = FIXTURE_POINT_TIME_NANOS;
+    let (rows, later) = (
+        with_runs(&projected_metric_batch_at(at), &["run-a"; 4]),
+        with_runs(&projected_metric_batch_at(at + 100), &["run-a"; 4]),
+    );
+    let unanswered = Uuid::now_v7();
+
+    let (wal, scribe) = restarted_scribe(temp_dir.path(), 1).await;
+    Scribe::ingest_frame(&scribe, points_frame(tenant, Uuid::now_v7(), &rows, true))
+        .await
+        .expect("the first batch and its series row are durable");
+    wal.trip_post_sync_failure_for_test();
+    crash_once_held(
+        &scribe,
+        &wal,
+        |slice| slice.batch_id == unanswered,
+        Scribe::ingest_frame(&scribe, points_frame(tenant, unanswered, &later, true)),
+    )
+    .await;
+    drop((scribe, wal));
+
+    let (_wal, scribe) = restarted_scribe(temp_dir.path(), 2).await;
+    let series = series_contexts(&scribe, tenant, "series", (at, at), 2).await;
+    let points = series_contexts(&scribe, tenant, "points", (at, at), 2).await;
+    assert_eq!(series.len(), 1, "the series row is recovered");
+    assert_eq!(
+        points.len(),
+        8,
+        "the answered and the unanswered points are recovered"
+    );
+    assert!(
+        points.iter().all(|point| series.contains(point)),
+        "every recovered point has its series row for its hour and context"
+    );
+    scribe
+        .shutdown(std::time::Instant::now() + std::time::Duration::from_secs(1))
+        .await;
 }

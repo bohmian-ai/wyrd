@@ -231,6 +231,20 @@ impl Bifrost {
         block_on(self.inner.describe_table(namespace, name))
     }
 
+    /// Validate one `WHERE` predicate over a table and return its normalized text.
+    ///
+    /// # Errors
+    ///
+    /// As [`crate::bifrost::Bifrost::validate_predicate`].
+    pub fn validate_predicate(
+        &self,
+        namespace: &str,
+        name: &str,
+        expression: &str,
+    ) -> Result<String, BifrostClientError> {
+        block_on(self.inner.validate_predicate(namespace, name, expression))
+    }
+
     /// Alter one registered table's definition at its observed table version.
     ///
     /// # Arguments

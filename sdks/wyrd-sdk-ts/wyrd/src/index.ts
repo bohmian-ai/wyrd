@@ -19,8 +19,11 @@ import type {
   CreateOperatorConnectionRequest,
   CreateServicePrincipalRequest,
   CreateServicePrincipalResponse,
+  AccountAuthentication,
+  CredentialListQuery,
   CredentialListResponse as CredentialList,
   CredentialMetadata,
+  CurrentUserProfile,
   DataTypeSpec,
   FallbackRule,
   FallbackScope,
@@ -101,6 +104,7 @@ import type {
 const require = createRequire(import.meta.url);
 const nativeBinding = require("../index.cjs") as typeof import("../index.cjs");
 const {
+  connectBrowserSessionClient,
   connectWyrdClient,
   openWyrdState,
   storedTimestampText,
@@ -158,8 +162,11 @@ export type {
   CreateOperatorConnectionRequest,
   CreateServicePrincipalRequest,
   CreateServicePrincipalResponse,
+  AccountAuthentication,
+  CredentialListQuery,
   CredentialList,
   CredentialMetadata,
+  CurrentUserProfile,
   DataTypeSpec,
   FallbackRule,
   FallbackScope,
@@ -506,6 +513,22 @@ async function closeNative(native: NativeBifrostQueryStream): Promise<void> {
   }
 }
 
+/** One result column, in engine order; names may repeat. `data_type` is the Arrow type's display. */
+export interface QueryColumn {
+  readonly name: string;
+  readonly data_type: string;
+  readonly nullable: boolean;
+}
+
+/** A complete bounded query result: positional rows, returned only after a valid terminal. */
+export interface BoundedQueryResult {
+  readonly columns: readonly QueryColumn[];
+  readonly rows: readonly (readonly unknown[])[];
+  readonly terminal: Omit<QueryTerminal, "arrow_ipc_eos" | "error" | "outcome"> & {
+    readonly outcome: Exclude<QueryTerminal["outcome"], "failed">;
+  };
+}
+
 /**
  * One running query's Arrow batches, iterated as they arrive.
  *
@@ -631,6 +654,29 @@ export class BifrostQueryStream implements AsyncIterableIterator<RecordBatch> {
     }
     this.#done = true;
     return { done: true, value: undefined };
+  }
+
+  /**
+   * Read the whole result as one bounded JSON value with positional rows.
+   *
+   * Rows are encoded by the same Rust projection the server's MCP
+   * `bifrost.query` tool uses, so both return the same value for one result.
+   * Returned only after the validated terminal; a result past either ceiling
+   * fails as `WYRD_VALA_413_QUERY_RESULT_TOO_LARGE` and is never truncated.
+   * {@link BifrostQueryStream.return} during collection stops it.
+   *
+   * @param options - Row ceiling (default 1000) and serialized byte ceiling (default 4 MiB).
+   * @returns The complete `{columns, rows, terminal}` result.
+   * @throws {@link WyrdError} for a failed or oversized query; the stream is closed either way.
+   */
+  async collect(options: { maxRows?: number; maxBytes?: number } = {}): Promise<BoundedQueryResult> {
+    this.#done = true;
+    const step = await this.#native.collect(options.maxRows, options.maxBytes);
+    const error = projectedError(step);
+    if (error !== undefined) {
+      throw error;
+    }
+    return JSON.parse(step.terminalJson as string) as BoundedQueryResult;
   }
 
   /**
@@ -1502,6 +1548,26 @@ export class Bifrost {
   }
 
   /**
+   * Check one `WHERE` predicate over a table without running a query.
+   *
+   * Only the table's columns, literals, comparisons, `AND`/`OR`/`NOT`,
+   * `IS [NOT] NULL`, `IN`, `BETWEEN`, `LIKE`, and `ILIKE` are allowed, up to
+   * 8 KiB.
+   *
+   * @param namespace - The table's namespace, such as `bifrost.logs`.
+   * @param name - The table's name within `namespace`, such as `records`.
+   * @param expression - The predicate without the `WHERE` keyword.
+   * @returns The normalized predicate; `""` for a blank one.
+   * @throws {@link WyrdError} `WYRD_VALA_400_QUERY_INVALID_SQL` for a predicate
+   * outside the grammar or the table's columns, `WYRD_VALA_403_QUERY_FORBIDDEN`
+   * for a table the caller may not query, or a not-found, authorization, or
+   * transport failure.
+   */
+  async validatePredicate(namespace: string, name: string, expression: string): Promise<string> {
+    return lifecycleValue<string>(await this.#native.validatePredicate(namespace, name, expression));
+  }
+
+  /**
    * Edit one registered table's layout or custom columns.
    *
    * @param namespace - The table's namespace, such as `bifrost.datasets`.
@@ -1651,6 +1717,35 @@ export class WyrdClient {
     } = {},
   ): WyrdClient {
     const result = connectWyrdClient(options.serverUrl, options.credential, options.grpcUrl, options.workloadUid);
+    return new WyrdClient(nativeHandle(result.client, result.error));
+  }
+
+  /**
+   * Build a client that acts as one forwarded browser session, without IO.
+   *
+   * For a server-side web host, such as the Wyrd UI's server, serving a
+   * browser signed in through Wyrd's Rust-owned browser sessions. Each request
+   * presents the browser's tenant session cookie and the public origin it was
+   * issued at; nothing is minted, cached, or renewed, and no ambient
+   * credential is consulted. The client reaches the tenant `/v1` HTTP
+   * surface only, so Cards, Bifrost queries, and verification reads work,
+   * while gRPC ingest, MCP, and {@link WyrdClient.accessToken} refuse it.
+   * Never construct one in browser code: the cookie is the browser's
+   * credential and must not leave the server.
+   *
+   * @param options - `serverUrl`, the Wyrd server's HTTP base URL; `cookie`,
+   * the single `wyrd_session_<tenant>=<value>` cookie pair; `origin`, the
+   * browser-facing origin the session was issued at.
+   * @returns The client.
+   * @throws {@link WyrdError} `WYRD_CLIENT_400_CONFIG_INVALID` for a malformed
+   * cookie, origin, or server URL.
+   */
+  static forBrowserSession(options: {
+    readonly serverUrl: string;
+    readonly cookie: string;
+    readonly origin: string;
+  }): WyrdClient {
+    const result = connectBrowserSessionClient(options.serverUrl, options.cookie, options.origin);
     return new WyrdClient(nativeHandle(result.client, result.error));
   }
 
@@ -2083,6 +2178,30 @@ export class Principals {
    */
   async listCredentials(principalId: string): Promise<CredentialList> {
     return lifecycleValue(await this.#native.listCredentials(principalId));
+  }
+
+  /**
+   * Read one page of a principal's credential metadata, newest first; an
+   * omitted `limit` reads 50. Pass a page's `next_cursor` as `cursor` with
+   * the same principal to read the following page.
+   *
+   * @param principalId - The principal whose credentials to list.
+   * @param query - Page size (1–100) and the previous page's continuation.
+   * @returns One page, with `next_cursor` only when more rows remain.
+   * @throws {@link WyrdError} for a bad limit, another principal's cursor, or a transport or authorization failure.
+   */
+  async listCredentialsPage(principalId: string, query: CredentialListQuery = {}): Promise<CredentialList> {
+    return lifecycleValue(await this.#native.listCredentialsPage(principalId, JSON.stringify(query)));
+  }
+
+  /**
+   * Read the calling User's safe profile; `permissions` are informational.
+   *
+   * @returns The tenant, username, account authentication and effective permissions.
+   * @throws {@link WyrdError} when the caller is not a User, or a transport failure.
+   */
+  async me(): Promise<CurrentUserProfile> {
+    return lifecycleValue(await this.#native.me());
   }
 
   /**

@@ -146,6 +146,9 @@ fn fingerprint_credential(credential: &ResolvedCredential, workload_uid: Option<
                 actor.workload_uid().map(CardUid::as_str),
             ));
         }
+        ResolvedCredential::BrowserSession(session) => {
+            hasher.update(session.cookie().expose_secret());
+        }
     }
     if let Some(uid) = workload_uid {
         hasher.update([0]);

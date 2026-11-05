@@ -398,6 +398,47 @@ impl WyrdTestServer {
         Ok(bootstrap.id().to_string())
     }
 
+    /// Create a local password User `name` holding the built-in `roles`, sign
+    /// them in, and create one of their own keys limited to `ceiling` through
+    /// the production routes; returns the principal id and the key. Must be
+    /// called inside the context manager.
+    ///
+    /// # Errors
+    /// Raises a Wyrd Python error when the context manager is inactive or a
+    /// route refuses.
+    #[pyo3(signature = (roles, name, ceiling))]
+    fn bootstrap_user_key(
+        &self,
+        roles: Vec<String>,
+        name: &str,
+        ceiling: Vec<String>,
+    ) -> WyrdPyResult<(String, String)> {
+        let server = self.started()?;
+        let roles: Vec<&str> = roles.iter().map(String::as_str).collect();
+        let ceiling: Vec<&str> = ceiling.iter().map(String::as_str).collect();
+        let (id, key) = wyrd_runtime::runtime()
+            .block_on(server.bootstrap_user_key(name, &roles, &ceiling))
+            .map_err(py_error)?;
+        Ok((id.to_string(), key.expose_secret().to_owned()))
+    }
+
+    /// Store `count` valid keys for User `user` sharing one creation time,
+    /// so their listing pages across timestamp ties; returns their ids.
+    ///
+    /// # Errors
+    /// Raises a harness error for an invalid principal id, and a Wyrd
+    /// Python error when the context manager is inactive or the write fails.
+    fn seed_user_keys(&self, user: &str, count: usize) -> WyrdPyResult<Vec<String>> {
+        let server = self.started()?;
+        let user = user
+            .parse::<wyrd_runtime::PrincipalId>()
+            .map_err(|error| harness_error(format!("invalid principal id: {error}")))?;
+        let ids = wyrd_runtime::runtime()
+            .block_on(server.seed_user_keys(user, count))
+            .map_err(py_error)?;
+        Ok(ids.iter().map(ToString::to_string).collect())
+    }
+
     /// Issue an API key for a registered Service Card's family runtime account.
     ///
     /// A credential fixture: the account restricted to the Card's family is

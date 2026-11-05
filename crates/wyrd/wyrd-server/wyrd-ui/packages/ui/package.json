@@ -1,0 +1,81 @@
+{
+  "name": "wyrd-ai-ui",
+  "version": "0.1.0",
+  "description": "Wyrd UI components, portable loaders, view documents, and their Node and MCP App executors.",
+  "license": "Apache-2.0",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/bohmian-ai/wyrd.git",
+    "directory": "crates/wyrd/wyrd-server/wyrd-ui/packages/ui"
+  },
+  "type": "module",
+  "files": [
+    "dist"
+  ],
+  "sideEffects": [
+    "**/*.css"
+  ],
+  "svelte": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "svelte": "./dist/index.js",
+      "default": "./dist/index.js"
+    },
+    "./loaders": {
+      "types": "./dist/loaders.d.ts",
+      "default": "./dist/loaders.js"
+    },
+    "./view": {
+      "types": "./dist/view.d.ts",
+      "svelte": "./dist/view.js",
+      "default": "./dist/view.js"
+    },
+    "./catalog.json": "./dist/catalog.json",
+    "./node": {
+      "types": "./dist/node.d.ts",
+      "default": "./dist/node.js"
+    },
+    "./mcp": {
+      "types": "./dist/mcp.d.ts",
+      "default": "./dist/mcp.js"
+    },
+    "./wyrd-view.html": "./dist/wyrd-view.html"
+  },
+  "scripts": {
+    "build": "node scripts/catalog.ts && svelte-package && vite build --config vite.app.config.ts",
+    "catalog": "node scripts/catalog.ts",
+    "check": "svelte-check --tsconfig ./tsconfig.json"
+  },
+  "dependencies": {
+    "zod": "4.5.4"
+  },
+  "peerDependencies": {
+    "@modelcontextprotocol/ext-apps": "^2.0.3",
+    "svelte": "^5.0.0",
+    "wyrd-ai": "^0.2.0"
+  },
+  "peerDependenciesMeta": {
+    "@modelcontextprotocol/ext-apps": {
+      "optional": true
+    },
+    "wyrd-ai": {
+      "optional": true
+    }
+  },
+  "devDependencies": {
+    "@modelcontextprotocol/client": "2.3.1",
+    "@modelcontextprotocol/core": "2.3.1",
+    "@modelcontextprotocol/ext-apps": "2.0.3",
+    "@sveltejs/package": "latest",
+    "@sveltejs/vite-plugin-svelte": "latest",
+    "svelte": "latest",
+    "typescript": "^6.0.0",
+    "vite": "latest",
+    "wyrd-ai": "link:../../../../../../sdks/wyrd-sdk-ts/wyrd",
+    "svelte-check": "latest",
+    "@fontsource/familjen-grotesk": "5.3.0",
+    "@fontsource/fragment-mono": "5.3.0"
+  }
+}

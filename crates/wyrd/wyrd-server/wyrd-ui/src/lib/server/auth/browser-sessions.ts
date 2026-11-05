@@ -1,6 +1,7 @@
 import type { Cookies } from '@sveltejs/kit';
+import { WyrdClient } from 'wyrd-ai';
 import { serverUrl } from '../upstream';
-import { problemKind } from '../problem';
+import { upstreamProblem } from '../problem';
 import { reject, type SessionMetadata, type TenantContext } from './session';
 
 const sessionPrefix = 'wyrd_session_';
@@ -12,11 +13,12 @@ type View = {
   tenant_id: string;
   tenant_name: string;
   principal_id: string;
+  username: string | null;
   permissions: string[];
   expires_at: string;
 };
 
-type Call = { method: 'GET' | 'POST'; cookie?: string; body?: unknown };
+type Call = { method: 'GET' | 'POST' | 'DELETE'; cookie?: string; body?: unknown };
 
 /**
  * Call one Rust `/auth/browser/*` or `/v1` operation server to server as the
@@ -46,7 +48,7 @@ async function call(path: string, url: URL, { method, cookie, body }: Call): Pro
 
 /** Refuse with the safe problem a non-2xx Wyrd answer maps to. */
 async function refuse(response: Response): Promise<never> {
-  reject(await problemKind(response));
+  reject(await upstreamProblem(response));
 }
 
 /**
@@ -112,6 +114,7 @@ export class BrowserSession {
     this.#url = url;
     this.tenantName = view.tenant_name;
     this.principalId = view.principal_id;
+    this.name = view.username ?? view.principal_id;
     this.tenantId = view.tenant_id;
     this.permissions = view.permissions;
     this.expiresAt = Date.parse(view.expires_at);
@@ -119,6 +122,8 @@ export class BrowserSession {
 
   readonly tenantName: string;
   readonly principalId: string;
+  /** The local username, else the principal id. */
+  readonly name: string;
   readonly tenantId: string;
   readonly permissions: string[];
   readonly expiresAt: number;
@@ -132,7 +137,7 @@ export class BrowserSession {
         tenantId: this.tenantId,
         permissions: this.permissions
       },
-      subject: { id: this.principalId, name: this.principalId },
+      subject: { id: this.principalId, name: this.name },
       permissions: this.permissions
     };
   }
@@ -147,6 +152,15 @@ export class BrowserSession {
       cookie: this.#cookie,
       body
     });
+  }
+
+  /**
+   * An SDK client acting as this session: the Rust client forwards only this
+   * tenant's session cookie and the trusted origin, so the server authorizes
+   * every read exactly as it does this session's `/v1` calls.
+   */
+  client(): WyrdClient {
+    return WyrdClient.forBrowserSession({ serverUrl: serverUrl(), cookie: this.#cookie, origin: this.#url.origin });
   }
 }
 
@@ -192,6 +206,60 @@ export class BrowserSessions {
     if (!response.ok) await refuse(response);
     relayCookies(response, cookies);
     return `/t/${encodeURIComponent(tenantKey)}`;
+  }
+
+  /**
+   * Local password sign-in or invitation signup: the server verifies the
+   * password (the BFF never does), creates the session and sets its cookie.
+   * `fields` are the typed request's fields besides the tenant.
+   */
+  async password(
+    operation: 'login' | 'signup',
+    tenantKey: string,
+    fields: Record<string, string>,
+    url: URL,
+    cookies: Cookies
+  ): Promise<string> {
+    this.cookieName(tenantKey);
+    const response = await call(`/auth/browser/password/${operation}`, url, {
+      method: 'POST',
+      body: { tenant: tenantKey, ...fields }
+    });
+    if (!response.ok) await refuse(response);
+    relayCookies(response, cookies);
+    return `/t/${encodeURIComponent(tenantKey)}`;
+  }
+
+  /** Set a new password with an operator-issued reset code; signs nothing in. */
+  async resetPassword(tenantKey: string, resetCode: string, newPassword: string, url: URL): Promise<void> {
+    this.cookieName(tenantKey);
+    const response = await call('/auth/browser/password/reset', url, {
+      method: 'POST',
+      body: { tenant: tenantKey, reset_code: resetCode, new_password: newPassword }
+    });
+    if (!response.ok) await refuse(response);
+  }
+
+  /**
+   * Change this session's local password; the server ends every local
+   * session of the User and clears this tenant's cookie.
+   */
+  async changePassword(
+    tenantKey: string,
+    currentPassword: string,
+    newPassword: string,
+    url: URL,
+    cookies: Cookies
+  ): Promise<void> {
+    const name = this.cookieName(tenantKey);
+    const value = cookies.get(name);
+    const response = await call('/auth/browser/password/change', url, {
+      method: 'POST',
+      cookie: value ? `${name}=${value}` : undefined,
+      body: { tenant: tenantKey, current_password: currentPassword, new_password: newPassword }
+    });
+    if (!response.ok) await refuse(response);
+    relayCookies(response, cookies);
   }
 
   /**
@@ -267,7 +335,7 @@ export class BrowserSessions {
     const current = sessions.find((view) => view.tenant === session.tenantKey);
     if (!current) reject('unauthenticated');
     return {
-      subject: { id: current.principal_id, name: current.principal_id },
+      subject: { id: current.principal_id, name: current.username ?? current.principal_id },
       expiresAt: Date.parse(current.expires_at),
       tenants: [current, ...sessions.filter((view) => view !== current)].map((view) => ({
         key: view.tenant,

@@ -2,10 +2,10 @@
 //!
 //! A row is keyed by the SHA-256 of a random session identifier that exists
 //! only in the browser's HttpOnly cookie. [`insert_browser_session`] records a
-//! session once a provider sign-in or recovery key verified the principal,
-//! [`live_browser_session`] finds an unexpired, unrevoked session whose
-//! recovery key (if any) is still valid, and [`revoke_browser_session`] ends
-//! one session at logout. Forced RLS is the only tenant selection, and
+//! session once a provider sign-in, local password or recovery key verified
+//! the principal, [`live_browser_session`] finds an unexpired, unrevoked
+//! session whose recovery key or local password revision (if any) is still
+//! current, and [`revoke_browser_session`] ends one session at logout. Forced RLS is the only tenant selection, and
 //! `PostgreSQL` owns every time: callers bind the lifetime, never an instant.
 // raw-query grep allowlist: auth tables post-date the sqlx offline cache; run `mise run sqlx:prepare` to promote to macros.
 
@@ -29,20 +29,26 @@ const PURGE_EXPIRED_BROWSER_SESSIONS_SQL: &str = r"
 const INSERT_BROWSER_SESSION_SQL: &str = r"
     INSERT INTO wyrd.auth_browser_sessions (
         session_hash, data_tenant_id, principal_id, connection_id,
-        connection_revision, api_key_id, expires_at
-    ) VALUES ($1, $2, $3, $4, $5, $6, statement_timestamp() + ($7 * interval '1 second'))
+        connection_revision, api_key_id, password_revision, expires_at
+    ) VALUES ($1, $2, $3, $4, $5, $6, $7, statement_timestamp() + ($8 * interval '1 second'))
     RETURNING expires_at
 ";
 
 /// The unexpired, unrevoked session with this hash whose recovery key, when
-/// it has one, is itself unrevoked and unexpired.
+/// it has one, is itself unrevoked and unexpired, and whose local password
+/// revision, when it has one, is still its User's current revision. `recent`
+/// is whether the session was created in the last five minutes.
 const LIVE_BROWSER_SESSION_SQL: &str = r"
     SELECT s.principal_id, s.connection_id, s.connection_revision, s.api_key_id,
-           s.expires_at
+           s.password_revision, s.expires_at,
+           s.created_at > statement_timestamp() - interval '5 minutes' AS recent
       FROM wyrd.auth_browser_sessions s
       LEFT JOIN wyrd.auth_api_keys k
         ON k.data_tenant_id = s.data_tenant_id
        AND k.id = s.api_key_id
+      LEFT JOIN wyrd.auth_users u
+        ON u.data_tenant_id = s.data_tenant_id
+       AND u.id = s.principal_id
      WHERE s.session_hash = $1
        AND s.revoked_at IS NULL
        AND s.expires_at > statement_timestamp()
@@ -51,6 +57,9 @@ const LIVE_BROWSER_SESSION_SQL: &str = r"
                 AND k.principal_id = s.principal_id
                 AND k.revoked_at IS NULL
                 AND (k.expires_at IS NULL OR k.expires_at > statement_timestamp())))
+       AND (s.password_revision IS NULL
+            OR (u.password_hash IS NOT NULL
+                AND u.password_revision = s.password_revision))
 ";
 
 /// Revoke the live session with this hash.
@@ -69,6 +78,9 @@ pub enum BrowserSessionAuthority {
     Connection(HumanConnectionBinding),
     /// A recovery sign-in with this API-key credential.
     ApiKey(Uuid),
+    /// A local password sign-in at this password revision of the session's
+    /// User.
+    Password(i64),
 }
 
 /// A live browser session as [`live_browser_session`] found it.
@@ -80,6 +92,8 @@ pub struct LiveBrowserSession {
     pub authority: BrowserSessionAuthority,
     /// The session's absolute expiry.
     pub expires_at: DateTime<Utc>,
+    /// Whether the session was created in the last five minutes.
+    pub recent: bool,
 }
 
 /// Raw row returned by [`LIVE_BROWSER_SESSION_SQL`].
@@ -93,8 +107,12 @@ struct LiveRow {
     connection_revision: Option<i64>,
     /// The recovery API key id, for a recovery sign-in.
     api_key_id: Option<Uuid>,
+    /// The local password revision, for a password sign-in.
+    password_revision: Option<i64>,
     /// Absolute expiry.
     expires_at: DateTime<Utc>,
+    /// Created in the last five minutes.
+    recent: bool,
 }
 
 /// Insert a browser session keyed by `session_hash` for `principal_id`,
@@ -117,9 +135,10 @@ pub async fn insert_browser_session(
     sqlx::query(PURGE_EXPIRED_BROWSER_SESSIONS_SQL)
         .execute(&mut **conn.transaction())
         .await?;
-    let (connection, api_key_id) = match authority {
-        BrowserSessionAuthority::Connection(binding) => (Some(binding), None),
-        BrowserSessionAuthority::ApiKey(api_key_id) => (None, Some(api_key_id)),
+    let (connection, api_key_id, password_revision) = match authority {
+        BrowserSessionAuthority::Connection(binding) => (Some(binding), None, None),
+        BrowserSessionAuthority::ApiKey(api_key_id) => (None, Some(api_key_id), None),
+        BrowserSessionAuthority::Password(revision) => (None, None, Some(revision)),
     };
     sqlx::query(INSERT_BROWSER_SESSION_SQL)
         .bind(session_hash.as_bytes().as_slice())
@@ -128,6 +147,7 @@ pub async fn insert_browser_session(
         .bind(connection.map(|binding| binding.connection_id))
         .bind(connection.map(|binding| binding.connection_revision))
         .bind(api_key_id)
+        .bind(password_revision)
         .bind(ttl.as_secs_f64())
         .fetch_one(&mut **conn.transaction())
         .await
@@ -136,7 +156,8 @@ pub async fn insert_browser_session(
 
 /// This tenant's unexpired, unrevoked session with `session_hash`, when its
 /// recovery key (if it has one) still belongs to the session's principal and
-/// is unrevoked and unexpired; `None` otherwise.
+/// is unrevoked and unexpired, and its local password revision (if it has
+/// one) is still current; `None` otherwise.
 ///
 /// Reads only: resolving a session never extends or otherwise writes it.
 ///
@@ -152,14 +173,20 @@ pub async fn live_browser_session(
         .fetch_optional(&mut **conn.transaction())
         .await?;
     row.map(|row| {
-        let authority = match (row.connection_id, row.connection_revision, row.api_key_id) {
-            (Some(connection_id), Some(connection_revision), None) => {
+        let authority = match (
+            row.connection_id,
+            row.connection_revision,
+            row.api_key_id,
+            row.password_revision,
+        ) {
+            (Some(connection_id), Some(connection_revision), None, None) => {
                 BrowserSessionAuthority::Connection(HumanConnectionBinding {
                     connection_id,
                     connection_revision,
                 })
             }
-            (None, None, Some(api_key_id)) => BrowserSessionAuthority::ApiKey(api_key_id),
+            (None, None, Some(api_key_id), None) => BrowserSessionAuthority::ApiKey(api_key_id),
+            (None, None, None, Some(revision)) => BrowserSessionAuthority::Password(revision),
             _ => {
                 return Err(sqlx::Error::Decode(
                     "browser session authority is corrupt".into(),
@@ -170,6 +197,7 @@ pub async fn live_browser_session(
             principal_id: row.principal_id,
             authority,
             expires_at: row.expires_at,
+            recent: row.recent,
         })
     })
     .transpose()

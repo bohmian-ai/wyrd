@@ -167,6 +167,47 @@ class WyrdTestServer:
         """
         ...
 
+    def bootstrap_user_key(
+        self, roles: list[str], name: str, ceiling: list[str]
+    ) -> tuple[str, str]:
+        """Create a local User holding ``roles`` and one of their own keys.
+
+        The User signs in with a password and creates the key through the
+        production routes, as Settings does.
+
+        Args:
+            roles: built-in Role names the User holds.
+            name: the User's username.
+            ceiling: the key's permission ceiling.
+
+        Returns:
+            The User's principal id and the key.
+
+        Raises:
+            WyrdError: Outside the context manager, or when a route refuses.
+
+        """
+        ...
+
+    def seed_user_keys(self, user: str, count: int) -> list[str]:
+        """Store ``count`` valid keys for User ``user`` with one creation time.
+
+        Their listing pages across timestamp ties.
+
+        Args:
+            user: the User's principal id.
+            count: how many keys to store.
+
+        Returns:
+            The stored keys' ids.
+
+        Raises:
+            WyrdError: Outside the context manager, for an invalid id, or
+                when the write fails.
+
+        """
+        ...
+
     def bootstrap_service(self, roles: list[str], name: str = "svc") -> str:
         """Mint a fixture-tenant service principal and return its API key.
 

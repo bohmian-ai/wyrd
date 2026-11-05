@@ -336,6 +336,55 @@ impl NativeWyrdTestServer {
         result
     }
 
+    /// Create a local password User `name` holding the built-in `roles`, sign
+    /// them in, and create one of their own keys limited to `ceiling` through
+    /// the production routes; returns `[principalId, key]`.
+    ///
+    /// # Errors
+    ///
+    /// Returns a napi error when the harness is closed or a route refuses.
+    #[napi]
+    pub fn bootstrap_user_key(
+        &self,
+        roles: Vec<String>,
+        name: String,
+        ceiling: Vec<String>,
+    ) -> Result<Vec<String>> {
+        let result = self.with_server(|server| {
+            let roles: Vec<&str> = roles.iter().map(String::as_str).collect();
+            let ceiling: Vec<&str> = ceiling.iter().map(String::as_str).collect();
+            let (id, key) = wyrd_runtime::runtime()
+                .block_on(server.bootstrap_user_key(&name, &roles, &ceiling))
+                .map_err(reason)?;
+            Ok(vec![
+                id.to_string(),
+                secrecy::ExposeSecret::expose_secret(&key).to_owned(),
+            ])
+        });
+        drop((roles, name, ceiling));
+        result
+    }
+
+    /// Store `count` valid keys for User `user` sharing one creation time, so
+    /// their listing pages across timestamp ties; returns their ids.
+    ///
+    /// # Errors
+    ///
+    /// Returns a napi error when the harness is closed, `user` is not a
+    /// principal id, or the write fails.
+    #[napi]
+    pub fn seed_user_keys(&self, user: String, count: u32) -> Result<Vec<String>> {
+        self.with_server(|server| {
+            let user = user
+                .parse::<wyrd_runtime::PrincipalId>()
+                .map_err(|error| reason(format!("invalid principal id: {error}")))?;
+            let ids = wyrd_runtime::runtime()
+                .block_on(server.seed_user_keys(user, count as usize))
+                .map_err(reason)?;
+            Ok(ids.iter().map(ToString::to_string).collect())
+        })
+    }
+
     /// Bootstrap a service principal holding `roles` in tenant `tenant_id` and
     /// return its API key.
     ///

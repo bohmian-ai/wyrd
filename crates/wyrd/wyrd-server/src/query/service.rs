@@ -6,6 +6,7 @@ use wyrd_spec::error::{WyrdError, WyrdProblem};
 use wyrd_spec::request_id::RequestId;
 use wyrd_spec::vala::api::{
     AuditOutcome, AuthMethod, BifrostQueryRequest, CancelRunningQueryResponse, RunningQuerySummary,
+    ValidatePredicateRequest, ValidatePredicateResponse,
 };
 
 use crate::AppState;
@@ -301,6 +302,82 @@ pub async fn cancel_running_query(
             }),
         None => Err(wyrd_spec::vala::error::BifrostError::OracleRoleUnavailable.into()),
     }
+}
+
+/// Validates one optional `WHERE` predicate over a Bifrost table and returns it normalized.
+///
+/// Authorization precedes schema disclosure: the caller must hold the Bifrost
+/// read capability and then the read grant on this exact table, the same
+/// decision Oracle takes for a query; only after both does the table's schema
+/// decide which columns the predicate may name. The payload columns of
+/// `bifrost.gateway.calls` additionally need the payload-read grant. The
+/// grammar itself is [`crate::query::floor::normalize_predicate`]. Nothing is
+/// executed; every later query using the predicate is still authorized.
+///
+/// # Errors
+///
+/// Returns the stable authorization or query-forbidden denial (both staged
+/// on the audit outbox), a validation error for an unknown namespace, the
+/// catalog's not-found error for a table absent from the caller's tenant, or
+/// [`wyrd_spec::vala::error::BifrostError::QueryInvalidSql`] for a predicate
+/// outside the permitted grammar or columns.
+pub async fn validate_predicate(
+    state: &AppState,
+    caller: &Caller,
+    request: ValidatePredicateRequest,
+) -> Result<ValidatePredicateResponse, WyrdError> {
+    use vala_bifrost_redux::catalog::TableRef;
+    use vala_bifrost_redux::tables::{CallsTable, DomainTable, managed_columns};
+
+    let audit = QueryAuthority::new(state, caller, "vala.query.validate_predicate", "vala.query");
+    audit.admit_capability()?;
+    let catalog = state
+        .bifrost
+        .catalog()
+        .ok_or(wyrd_spec::vala::error::BifrostError::ScribeRoleUnavailable)?;
+    let table = TableRef::new(
+        crate::bifrost::convert::namespace_from_wire(&request.namespace)?,
+        request.name,
+    );
+    let uid = catalog
+        .table_uid(&table, caller.data_tenant_id)
+        .await
+        .map_err(|error| WyrdError::from(error.into_public()))?;
+    let granted = |permission: &Permission| {
+        state
+            .auth
+            .permission_check
+            .check(&caller.principal, permission)
+            == PermissionVerdict::Allow
+    };
+    if !granted(&Permission {
+        resource: Resource::BifrostQuery,
+        action: Action::Read,
+        scope: table.permission_scope(&uid),
+    }) {
+        return Err(
+            audit.record_object_denial(wyrd_spec::vala::error::BifrostError::QueryForbidden.into())
+        );
+    }
+    audit.record_admission();
+    let description = catalog
+        .describe_table(&table, caller.data_tenant_id)
+        .await
+        .map_err(|error| WyrdError::from(error.into_public()))?;
+    let payload = table.fqn() == format!("bifrost.{}.{}", CallsTable::NAMESPACE, CallsTable::NAME)
+        && !granted(&Permission::gateway_payload_read());
+    let expression = crate::query::floor::normalize_predicate(&request.expression, |name| {
+        if payload && CallsTable::SENSITIVE_PAYLOAD_COLUMNS.contains(&name) {
+            return false;
+        }
+        managed_columns::is_managed_column(name)
+            || description
+                .user_fields
+                .iter()
+                .chain(&description.correlation_fields)
+                .any(|field| field.name == name)
+    })?;
+    Ok(ValidatePredicateResponse { expression })
 }
 
 /// operators.

@@ -1,7 +1,6 @@
 # Verification owners for the UI task packet
 
-This is a planning reference, not another test/build framework. Source is committed
-main `8651b96fd`; scripts/commands below were inspected, not executed in planning.
+This is a planning reference, not another test/build framework. Original source is committed main `8651b96fd`; revision-11 browser/agent ownership was inspected at `cbd4e97c8`. Commands were inspected, not executed in planning.
 
 ## Revision-10 remediation proof
 
@@ -50,7 +49,7 @@ check or claim another platform passed.
   current `ts:test:integration` owner does. These are setup, not a new test selector API.
 - New renderer tests cover T1/T2/T3 and the actual built-artifact T4 fixture host.
   New live component tests cover T5 and derive sanitized populated/empty fixtures.
-  New page tests cover T6. Primitives without reads have no fake loader/T5 test.
+  New page tests cover real-browser T6. Primitives without reads have no fake loader/T5 test.
   Missing prerequisites defer actual completion; no manufactured RED is required
   for already-correct behavior or static configuration/deletion obligations.
 
@@ -92,6 +91,139 @@ changes, stable refusal codes, sanitization/fixture provenance and T1–T5 appli
 Record desktop/mobile and light/dark human acceptance individually, including each
 component in a grouped task, with keyboard/focus, touch, long content and overflow.
 An unchanged/static item receives static/regression proof, not a fake failing test.
-The full library waits for every component/action/live prerequisite; fixture readiness
+The in-scope library (excluding deferred Ask/saved views) waits for every component/action/live prerequisite; fixture readiness
 is never silently promoted to production completeness. MCP production sandbox/security
 proof in TASK-011 supplements (and is not replaced by) AppBridge fixture tests.
+
+## Revision-11 primary deployed journeys
+
+**Conventional UI (REQ-034/AC-013).** TASK-012 and each TASK-013–026 scenario 2
+retain their existing exact `ui-pages.integration.test.ts` Vitest selector but
+must drive a real browser against the production BFF/server. Calling a page
+load/POST function or simulating cookies over HTTP is supporting proof only.
+Approved revision 18 assigns the first real-browser test tooling and deployed
+page lifecycle/auth integration to TASK-004-REV-02, absorbing TASK-012. TASK-011
+and later pages reuse that owner; each page retains its workflow and
+applicable range/identity/negative assertions. Browser automation may be headless;
+record actual engine/version, navigation, interactions and visible/server results.
+Minimal test-only browser dependencies are authorized; no new production/test
+environment switch or alternate selector framework is authorized.
+
+Inspect/reuse `identity_ui_e2e.rs::start_bff/production_ui_bff_journey` for real
+BFF lifecycle and `test_local_development.py::local_deployment` for installed
+production UI and owned database. The former currently launches only
+`production-auth.integration.test.ts`; it does not automatically run the library
+or page files. Foundation `ui-library.integration.test.ts::appBridgeView` uses
+jsdom, patched postMessage/ResizeObserver and fixture App tool replies; its
+separate real SDK/MCP reads do not establish a connected browser journey.
+Do not duplicate these owners or describe their present proof as a browser run.
+
+**Agent/MCP App (REQ-035/AC-014).** Existing live ownership:
+`sdks/wyrd-sdk-python/tests/agent_readiness/live.py`, `observe.py`,
+`tests/unit/test_agent_readiness.py`, and `test:agent-readiness:smoke:live`.
+The current CLI supports `--agent`, `--timeout`, `--artifacts` and one objective
+only; no browser, follow-up or UI scenario flag exists. TASK-011 explicitly adds
+`--journey mcp-ui` plus an opt-in mise entry using this owner. Default coding
+readiness stays unchanged. Planned focused live command after that extension:
+
+```bash
+mise exec -- scripts/postgres/with-test-postgres.sh -- uv run --directory sdks/wyrd-sdk-python python -m tests.agent_readiness.live --journey mcp-ui --agent claude --agent codex
+```
+
+This is a planned interface, not a command claimed to work today. Use existing
+`py:setup`, `docs:install`, built CLI/server/tests, current production UI/library
+and checkout wheel/docs prerequisites from the inspected readiness/local-dev
+owners. The UI addition must close the UI build/browser-install prerequisites
+in its opt-in mise entry without changing the default coding objective. Local
+credentials use existing environment/untracked `mise.local.toml` or existing
+Codex login isolation; never read/copy secrets into artifacts or browser state.
+
+Unit regression selector and original runner regressions are listed exactly in
+TASK-011. Credential-free doubles prove continuation/cleanup decisions only.
+Deterministic real-browser/real-MCP tests force malformed inputs, denials, empty
+and failed reads, cross-tenant and supersession cases without paying a model to
+reproduce every failure. The live sequence must still prove actual agent
+catalog discovery, generated views, same-conversation follow-up and connected
+browser range interactions. Missing host/credentials are explicit BLOCKED
+outcomes and fail live acceptance, never silently skip selected agents.
+
+Record source, agent, host, browser versions; sanitized prompts/follow-ups and
+actual resource/tool exchanges; screenshots/browser traces and range changes;
+viewer-scoped request/results and server evidence; process deadline/cleanup
+outcomes. No fixed wording/tool-count assertion or model self-report replaces
+observable success. A repository test host must use the real connected agent
+session and MCP lifecycle; fixture outputs copied into an independent browser
+cannot count. Commercial-client claims require that client to be exercised.
+
+Final change review owns combined evidence for both primary journeys. The
+live lane remains opt-in and outside unattended CI/`gate`; absence of its proof
+blocks AC-014 even when the aggregate passes. Other in-scope platform and human
+inspection dependencies remain unchanged. Ask/REQ-031 are deferred.
+
+## Integrated development proof — approved revision 16 mock correction
+
+TASK-004-REV-02 is the single in-progress, staged assignment for the internal gateway mock,
+canonical source/current-production-wheel workflow and first live trace page.
+Its exact focused commands and source-backed test ownership are recorded once
+in that task. Existing gateway dispatch, public gateway/server, Python
+local-development/Bifrost and UI runners remain owners; the newly listed
+selectors are planned until implemented. The canonical pin has no
+`gateway.json`, so the old standalone-example test's skip cannot prove this
+workflow. Normal dev data must use the real launcher/production SDK and public
+flush/readback, not test-only server flushes or a second WyrdTestServer.
+
+The final normal development run records exactly 1,000 dispatched app requests,
+separate expected/actual workflow and terminal verification counts, retained
+spans/metrics/logs, source/patch and wheel identity, and the caller's browser
+inspection. Only the model answers/usage are fixture-controlled; authorization,
+tools, verifier execution and retained telemetry are real. Full library and
+production MCP App completion remain separate later gates.
+
+The old mock-deployment V1/V2 results at `d87d24882`/`930a2de96` remain
+historical evidence only. Revision 16 requires runtime scope proof on the same
+tenant/key/deployment/model, unchanged OpenAI auth hooks and native SDK paths,
+plus frozen accepted execution context across queue reconstruction/config change.
+Use R2 V1/V2 and V11–V14; stage completion awaits those actual results and the
+affected owner checks. Planning ran no application tests or services.
+
+## Provider-only correction — TASK-004-R3
+
+The caller rejected revision-16 Stage 1 despite its recorded test passes.
+TASK-004-R3 C1–C9 replace its mock proof: runtime dispatch and language scopes,
+unchanged routing/credentials, existing attempt provider identity and no calls
+schema or verification-persistence expansion. V14 queued snapshot proof and new
+mock_fixture columns are superseded obligations. Old results stay historical.
+No new test/build/service execution occurred during correction planning.
+
+## Revision 18 local-development and Observe ownership
+
+The two current tasks are [MockServer](../tasks/TASK-004-revision/TASK-01-mockserver.md)
+and [live Observe workflow](../tasks/TASK-004-revision/TASK-02-live-observe-workflow.md).
+R1/R2/R3 are [retired evidence](retired-task-004/), not runnable instructions.
+Task 02 absorbs TASK-012/020/021/022 in full: shell, Traces/Spans, Logs, Metrics
+and their real-browser T6/visual proof. Current planned selectors/setup are in
+those two tasks; older task-specific selectors are historical guidance only.
+
+Normal dev uses the production SDK and Rust server plus an optional local
+MockServer through existing endpoint configuration. Queued judges use that
+same endpoint; no paid model credentials, runtime scope, snapshot or queue
+propagation. Default batch: 500 real app HTTP requests at concurrency 8,
+public terminal verification waits and actual spans/logs/metrics readback.
+Image/fixture/source/wheel identities and expected/actual counts are evidence.
+Do not equate a response count with completed observations. Real-browser
+proof uses the production BFF/server with the existing Vitest integration
+runner and minimal test-only Playwright Node API; jsdom/HTTP-only auth is
+supporting proof. Independent review and individual human inspection remain.
+
+## Approved revision 19 / Task 03
+
+Task03's exact focused commands and planned selectors are in
+[tasks/TASK-004-revision/TASK-03-local-users-personal-keys-and-observe.md](../tasks/TASK-004-revision/TASK-03-local-users-personal-keys-and-observe.md).
+They cover genuine local signup/login/session/reset, ordinary User-owned key
+identity/permissions, seeded dev:full readiness before its500-request batch and
+actual reference/theme/geometry proof. They are planned, not executed PASS
+results; no password/API-key shortcut can replace the normal human journey.
+Current audit results and external research are linked from that task. The caller
+approved spec19, its provision-then-enroll admission and Task03's typed contracts
+on 2026-11-02; Task03 is ready for implementation. Existing accepted
+regressions carry forward where unaffected.

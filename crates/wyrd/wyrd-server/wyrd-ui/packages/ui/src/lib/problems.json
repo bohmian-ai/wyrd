@@ -1,0 +1,110 @@
+{
+  "conflict": {
+    "code": "WYRD_SPEC_409_CONFLICT",
+    "detail": "Conflict",
+    "details": {},
+    "remediation": "Refresh the resource and retry with the current version or idempotency key.",
+    "status": 409,
+    "title": "Conflict",
+    "type": "https://wyrd.dev/problems/WYRD_SPEC_409_CONFLICT"
+  },
+  "denied": {
+    "code": "WYRD_PERMISSION_403_DENIED_RBAC",
+    "detail": "Permission denied (RBAC)",
+    "details": {},
+    "remediation": "Request the required role from a workspace admin.",
+    "status": 403,
+    "title": "Permission denied (RBAC)",
+    "type": "https://wyrd.dev/problems/WYRD_PERMISSION_403_DENIED_RBAC"
+  },
+  "expired": {
+    "code": "WYRD_AUTH_401_TOKEN_EXPIRED",
+    "detail": "Token expired",
+    "details": {},
+    "remediation": "Re-authenticate to obtain a fresh token.",
+    "status": 401,
+    "title": "Token expired",
+    "type": "https://wyrd.dev/problems/WYRD_AUTH_401_TOKEN_EXPIRED"
+  },
+  "internal": {
+    "code": "WYRD_SPEC_500_INTERNAL",
+    "detail": "Internal error",
+    "details": {},
+    "remediation": "Retry later or inspect server logs using the request ID.",
+    "status": 500,
+    "title": "Internal error",
+    "type": "https://wyrd.dev/problems/WYRD_SPEC_500_INTERNAL"
+  },
+  "notFound": {
+    "code": "WYRD_SPEC_404_NOT_FOUND",
+    "detail": "Resource not found",
+    "details": {},
+    "remediation": "Check that the referenced Wyrd resource exists.",
+    "status": 404,
+    "title": "Resource not found",
+    "type": "https://wyrd.dev/problems/WYRD_SPEC_404_NOT_FOUND"
+  },
+  "oneTimeCodeInvalid": {
+    "code": "WYRD_AUTH_401_ONE_TIME_CODE_INVALID",
+    "detail": "One-time code not accepted",
+    "details": {},
+    "remediation": "Ask a tenant administrator for a new invitation or reset code; each code is single-use and expires.",
+    "status": 401,
+    "title": "One-time code not accepted",
+    "type": "https://wyrd.dev/problems/WYRD_AUTH_401_ONE_TIME_CODE_INVALID"
+  },
+  "passwordAttempts": {
+    "code": "WYRD_AUTH_429_PASSWORD_ATTEMPTS",
+    "detail": "Too many password attempts",
+    "details": {},
+    "remediation": "Wait `details.retry_after_seconds` until the fixed attempt window ends, then try again.",
+    "status": 429,
+    "title": "Too many password attempts",
+    "type": "https://wyrd.dev/problems/WYRD_AUTH_429_PASSWORD_ATTEMPTS"
+  },
+  "passwordInvalid": {
+    "code": "WYRD_AUTH_401_PASSWORD_INVALID",
+    "detail": "Username or password not accepted",
+    "details": {},
+    "remediation": "Check the tenant, username and password and try again; a forgotten password is reset with a code from a tenant administrator.",
+    "status": 401,
+    "title": "Username or password not accepted",
+    "type": "https://wyrd.dev/problems/WYRD_AUTH_401_PASSWORD_INVALID"
+  },
+  "recentLogin": {
+    "code": "WYRD_AUTH_403_RECENT_LOGIN_REQUIRED",
+    "detail": "Recent sign-in required",
+    "details": {},
+    "remediation": "Sign in again with your password or SSO, then create the key within five minutes; an API key or recovery session cannot create one.",
+    "status": 403,
+    "title": "Recent sign-in required",
+    "type": "https://wyrd.dev/problems/WYRD_AUTH_403_RECENT_LOGIN_REQUIRED"
+  },
+  "unauthenticated": {
+    "code": "WYRD_AUTH_401_UNAUTHENTICATED",
+    "detail": "Not authenticated",
+    "details": {},
+    "remediation": "Present a valid Wyrd token as `X-Wyrd-Access-Token: Bearer <token>`.",
+    "status": 401,
+    "title": "Not authenticated",
+    "type": "https://wyrd.dev/problems/WYRD_AUTH_401_UNAUTHENTICATED"
+  },
+  "upstream": {
+    "code": "WYRD_SPEC_502_UPSTREAM_FAILURE",
+    "detail": "Upstream dependency failed",
+    "details": {},
+    "remediation": "Check the upstream dependency health and retry policy.",
+    "status": 502,
+    "title": "Upstream dependency failed",
+    "type": "https://wyrd.dev/problems/WYRD_SPEC_502_UPSTREAM_FAILURE"
+  },
+  "validation": {
+    "code": "WYRD_SPEC_400_VALIDATION",
+    "detail": "Validation failed",
+    "details": {},
+    "remediation": "Check the submitted Wyrd request fields against the published schema and retry.",
+    "status": 400,
+    "title": "Validation failed",
+    "type": "https://wyrd.dev/problems/WYRD_SPEC_400_VALIDATION"
+  }
+}

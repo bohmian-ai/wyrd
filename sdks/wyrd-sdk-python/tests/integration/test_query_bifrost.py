@@ -5,11 +5,12 @@
 rows 1 and 2 under one managed ``run_id`` and row 3 under another.
 """
 
+import asyncio
 import uuid
 
 import pytest
 from wyrd import WyrdError
-from wyrd.bifrost import Bifrost, TableConfig
+from wyrd.bifrost import AsyncBifrost, Bifrost, TableConfig
 from wyrd.client import WyrdClient
 from wyrd.testing import WyrdTestServer
 
@@ -193,3 +194,53 @@ def test_unauthorized_table_refusal_reveals_no_columns(
         )
     assert refused.value.code == "WYRD_VALA_403_QUERY_FORBIDDEN"
     assert "verdcit" not in refused.value.detail and "verdict" not in refused.value.detail
+
+
+def test_predicates_are_typed_bounded_and_tenant_scoped(
+    wyrd_server: WyrdTestServer, bifrost: Bifrost, live_table: str, other_tenant: str
+) -> None:
+    namespace, name = live_table.rsplit(".", 1)
+    assert bifrost.validate_predicate(namespace, name, "id >= 2 and value like 't%'") == (
+        "id >= 2 AND value LIKE 't%'"
+    )
+    assert bifrost.validate_predicate(namespace, name, "run_id is not null") == "run_id IS NOT NULL"
+    assert bifrost.validate_predicate(namespace, name, " ") == ""
+    assert asyncio.run(AsyncBifrost().validate_predicate(namespace, name, "id=1")) == "id = 1"
+    for expression in (
+        "id = 1; DROP TABLE live_query_rows",
+        f"id IN (SELECT id FROM {live_table})",
+        "id = $1",
+        "id = 1 -- comment",
+        "verdict = 'passed'",
+        "value = '" + "x" * 8192 + "'",
+    ):
+        with pytest.raises(WyrdError) as invalid:
+            bifrost.validate_predicate(namespace, name, expression)
+        assert invalid.value.code == "WYRD_VALA_400_QUERY_INVALID_SQL", expression
+
+    datasets_only: dict[str, object] = {
+        "resource": "bifrost_query",
+        "action": "read",
+        "scope": {"bifrost": {"schema": {"catalog": "bifrost", "schema": "datasets"}}},
+    }
+    reader = Bifrost(
+        client=WyrdClient(
+            credential=wyrd_server.scoped_api_key("predicate_reader", [datasets_only])
+        )
+    )
+    assert reader.validate_predicate(namespace, name, "id = 1") == "id = 1"
+    with pytest.raises(WyrdError) as forbidden:
+        reader.validate_predicate("bifrost.verification", "results", "verdcit = 'passed'")
+    assert forbidden.value.code == "WYRD_VALA_403_QUERY_FORBIDDEN"
+    assert "verdcit" not in forbidden.value.detail and "verdict" not in forbidden.value.detail
+
+    other = Bifrost(
+        client=WyrdClient(
+            credential=wyrd_server.bootstrap_service_in_tenant(
+                other_tenant, ["admin"], name="predicate-other"
+            )
+        )
+    )
+    with pytest.raises(WyrdError) as unseen:
+        other.validate_predicate(namespace, name, "id = 1")
+    assert unseen.value.code == "WYRD_VALA_404_BIFROST_TABLE_NOT_FOUND"

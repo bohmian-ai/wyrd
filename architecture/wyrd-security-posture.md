@@ -203,6 +203,18 @@ credential.
   verifies token exchange, and then revokes the old key.
 - The deployment secret provider, never a Card, supplies `WYRD_API_KEY` to an
   SDK or workload.
+- A credential has exactly one tenant owner, a Service account or a User.
+  Personal User keys carry a normalized name, a nonempty permission ceiling
+  and an explicit expiry of at most 365 days; each exchange issues the
+  intersection of the ceiling with the User's current grants, so a later
+  grant never widens an old key. `personal_credentials:read` lists and
+  `personal_credentials:write` revokes only the caller's own keys, both
+  derived from the verified caller rather than a submitted principal;
+  Service principals hold neither. Creation additionally requires a browser
+  or SSO session created by a human login within five minutes; API-key
+  recovery is not such proof. A restricted key needs the matching ceiling to
+  list or revoke. Credential lists page at 50 by default, at most 100, with an
+  opaque cursor. Other-User issuance still needs tenant administration.
 
 ### Access and refresh tokens
 
@@ -318,8 +330,10 @@ credential.
   Cookies are Secure in production; only the existing loopback-development
   HTTP exception is permitted. Raw identifiers never enter database rows,
   metadata, URLs, logs or traces. The record stores a one-way digest, tenant,
-  principal, twelve-hour absolute expiry, revocation and either the exact
-  human-connection revision or originating credential reference. There is
+  principal, twelve-hour absolute expiry, revocation and exactly one anchor:
+  the exact human-connection revision of an SSO session, the originating
+  credential reference of a recovery session, or the local User's password
+  revision of a password session. There is
   no sliding renewal and no recoverable credential vault. Database-owned
   timestamps and tenant RLS govern the record; existing auth maintenance owns
   expiry cleanup.
@@ -334,8 +348,20 @@ credential.
   unavailability. `POST /auth/browser/logout` revokes only the selected tenant
   session and clears its cookie. Recovery logout never revokes the API key or
   other browser sessions; logout does not end the IdP session.
+- Local password login (`POST /auth/browser/password/login`), invitation
+  signup, password change and code reset run in Rust. Passwords are 8–128
+  characters, NFC-normalized and blocklist-checked, stored only as an
+  Argon2id verifier, and never logged, echoed or relayed through Node storage.
+  Ten failures per tenant and username, or one hundred per source, refuse
+  further attempts with `429` and `Retry-After` until the window passes;
+  unknown users and wrong passwords are indistinguishable. Invitation and
+  reset codes are 256-bit, single-use, stored by SHA-256 verifier and bound to
+  tenant and purpose. Change and reset advance the User's password revision,
+  which ends every local session; API keys stay valid until revoked.
 - Every browser-session request checks current tenant/principal authority.
-  Human sessions require the exact Active connection revision. API-key-backed
+  SSO sessions require the exact Active connection revision; password
+  sessions require the User's current password revision and never consult a
+  connection. API-key-backed
   sessions require a still-valid originating credential and preserve all its
   effective-permission restrictions. Existing grant resolution, credential
   attribution, permission checks and non-blocking audit are reused; no Node
@@ -358,7 +384,10 @@ credential.
   than replace, Rust enforcement. Read-only GETs never mutate settings or log
   out a session.
 - Session metadata and credential-bearing responses use
-  `Cache-Control: no-store`. Existing Wyrd error codes distinguish refused authority from
+  `Cache-Control: no-store`. The one browser-visible secret is a personal key
+  shown once from its authenticated no-store POST action result; it is never
+  part of the initial page data, history, storage, URLs, logs, telemetry,
+  captures or cookies. Existing Wyrd error codes distinguish refused authority from
   unavailable storage; a database outage cannot become anonymous, cached or
   mock success. Cookie authentication is documented alongside bearer
   authentication in served OpenAPI. UI-only OAuth issuance/renewal is retired

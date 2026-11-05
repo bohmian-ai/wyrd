@@ -5,6 +5,7 @@
 use std::io;
 
 use axum::body::{Body, Bytes};
+use axum::extract::rejection::JsonRejection;
 use axum::extract::{Path, State};
 use axum::http::{StatusCode, header};
 use axum::response::{IntoResponse, Response};
@@ -15,7 +16,7 @@ use wyrd_spec::error::{WyrdError, WyrdProblem};
 use wyrd_spec::request_id::RequestId;
 use wyrd_spec::vala::api::{
     BifrostQueryRequest, CancelRunningQueryResponse, ListRunningQueriesResponse,
-    RunningQuerySummary,
+    RunningQuerySummary, ValidatePredicateRequest, ValidatePredicateResponse,
 };
 use wyrd_spec::vala::error::BifrostError;
 use wyrd_tonic::frame_codec::FrameEncoder;
@@ -152,6 +153,58 @@ pub fn router() -> OpenApiRouter<AppState> {
         .routes(routes!(sync_query))
         .routes(routes!(list_running_queries))
         .routes(routes!(get_running_query, cancel_running_query))
+        .routes(routes!(validate_predicate))
+}
+
+#[utoipa::path(
+    post,
+    path = "/query/predicate",
+    request_body = ValidatePredicateRequest,
+    responses(
+        (status = 200, description = "The predicate is valid for this table; its normalized \
+          text", body = ValidatePredicateResponse),
+        (status = 400, description = "The body does not decode, the namespace is unknown, or \
+          the predicate is outside the permitted grammar, names a column the table does not \
+          have, or exceeds 8 KiB (WYRD_SPEC_400_VALIDATION, WYRD_VALA_400_QUERY_INVALID_SQL)",
+         body = WyrdProblem, content_type = "application/problem+json"),
+        (status = 401, description = "The request carried no usable access token \
+          (WYRD_AUTH_401_UNAUTHENTICATED, WYRD_AUTH_401_INVALID_TOKEN, \
+          WYRD_AUTH_401_TOKEN_EXPIRED)", body = WyrdProblem, content_type = "application/problem+json"),
+        (status = 403, description = "The principal may not query Bifrost, or not this table \
+          (WYRD_PERMISSION_403_DENIED_RBAC, WYRD_VALA_403_QUERY_FORBIDDEN)",
+         body = WyrdProblem, content_type = "application/problem+json"),
+        (status = 404, description = "No table of that name exists in this tenant \
+          (WYRD_VALA_404_BIFROST_TABLE_NOT_FOUND)", body = WyrdProblem, content_type = "application/problem+json"),
+        (status = 503, description = "This server carries no catalog, or no verifier is \
+          configured for the access token (WYRD_VALA_503_SCRIBE_ROLE_UNAVAILABLE, \
+          WYRD_AUTH_503_VERIFY_UNAVAILABLE)", body = WyrdProblem, content_type = "application/problem+json")
+    ),
+    tag = "Bifrost"
+)]
+/// Validates one `WHERE` predicate over a Bifrost table without running a query.
+///
+/// # Errors
+///
+/// Returns `WYRD_SPEC_400_VALIDATION` when the body does not decode as a
+/// `ValidatePredicateRequest`; otherwise the authorization, catalog, or
+/// predicate errors of [`service::validate_predicate`].
+///
+/// The `vala.query.validate_predicate` span skips state, the caller's
+/// credentials, and the body, so the predicate never enters a trace.
+#[tracing::instrument(name = "vala.query.validate_predicate", level = "debug", skip_all)]
+pub(crate) async fn validate_predicate(
+    State(state): State<AppState>,
+    caller: Caller,
+    body: Result<Json<ValidatePredicateRequest>, JsonRejection>,
+) -> Result<Json<ValidatePredicateResponse>, WyrdErrorResponse> {
+    let Json(body) = body.map_err(|rejection| WyrdError::Validation {
+        message: "the body does not decode as a ValidatePredicateRequest".to_owned(),
+        details: serde_json::json!({ "field": "body", "reason": rejection.body_text() }),
+    })?;
+    service::validate_predicate(&state, &caller, body)
+        .await
+        .map(Json)
+        .map_err(WyrdErrorResponse::from)
 }
 
 #[utoipa::path(

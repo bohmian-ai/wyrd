@@ -1,0 +1,4 @@
+# Development wyrd-server overrides used by `mise run dev:full`: every OpenAI
+# call, including queued judges, reaches the local MockServer fixtures.
+[gateway.endpoints]
+openai = "http://127.0.0.1:1080/v1"

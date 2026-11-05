@@ -12,6 +12,7 @@ description = "Server-tier auth domain logic for Wyrd."
 path = "src/lib.rs"
 
 [dependencies]
+argon2 = { workspace = true }
 base64 = { workspace = true }
 chrono = { workspace = true }
 jsonwebtoken = { workspace = true }
@@ -22,8 +23,9 @@ serde_json = { workspace = true }
 sha2 = { workspace = true }
 sqlx = { workspace = true }
 thiserror = { workspace = true }
-tokio = { workspace = true }
+tokio = { workspace = true, features = ["sync"] }
 tracing = { workspace = true }
+unicode-normalization = { workspace = true }
 url = { workspace = true }
 uuid = { workspace = true, features = ["std", "v4"] }
 wyrd-auth-issue = { workspace = true }

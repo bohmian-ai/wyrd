@@ -84,3 +84,15 @@ services:
       timeout: 5s
       retries: 20
       start_period: 5s
+
+  # Local OpenAI fixtures for `mise run dev:mockserver` / `dev:full`. Unmatched
+  # requests get 404; nothing is proxied upstream.
+  mockserver:
+    image: ghcr.io/mock-server/mockserver:9.2.0@sha256:016f7d16bc88d2e1aa52d5a177f1aafee758cf70bea5e0624b0ab2c32f394df1
+    environment:
+      MOCKSERVER_INITIALIZATION_JSON_PATH: /config/expectations.json
+      MOCKSERVER_ATTEMPT_TO_PROXY_IF_NO_MATCHING_EXPECTATION: "false"
+    volumes:
+      - ./tests/fixtures/mockserver/expectations.json:/config/expectations.json:ro
+    ports:
+      - "127.0.0.1:1080:1080"

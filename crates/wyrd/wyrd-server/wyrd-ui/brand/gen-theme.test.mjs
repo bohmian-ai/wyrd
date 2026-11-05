@@ -30,7 +30,14 @@ const ROLES = {
   '--code-muted': ['#8f92a5', '#8f92a5'],
   '--code-keyword': ['#7a8cff', '#7a8cff'],
   '--code-string': ['#c5f23b', '#c5f23b'],
-  '--code-number': ['#f0a13c', '#f0a13c']
+  '--code-number': ['#f0a13c', '#f0a13c'],
+  // Observe canvas roles, approved with specification revision 19 (2026-11-02).
+  '--nav-surface': ['#eef0f4', '#0e1017'],
+  '--selected-border': ['#4d5ef0', '#3a4170'],
+  '--level-info': ['#4d5ef0', '#3a4170'],
+  '--series-3': ['#7a8cff', '#4d5ef0'],
+  '--series-4': ['#4d5ef0', '#a9b4ff'],
+  '--series-5': ['#8fae2a', '#8fae2a']
 };
 
 // The README Wyrd mark geometry (REQ-002). Renderings may recolor, never redraw.
@@ -58,6 +65,18 @@ test('both application projections carry every approved role value in both modes
   for (const [token, [light, dark]] of Object.entries(ROLES)) {
     for (const b of blocks.light) assert.equal(b[token], light, `${token} light`);
     for (const b of blocks.dark) assert.equal(b[token], dark, `${token} dark`);
+  }
+});
+
+test('each mode block draws native scrollbars and controls in its own scheme', () => {
+  for (const path of ['brand/theme.css', 'packages/ui/src/lib/theme.css']) {
+    for (const mode of ['light', 'dark']) {
+      const css = byName(path);
+      const start = css.indexOf(`[data-mode="${mode}"] {`);
+      const body = css.slice(start, css.indexOf('}', start));
+      assert.match(body, new RegExp(`color-scheme: ${mode};`), `${path} ${mode}`);
+      assert.match(body, /scrollbar-color: var\(--muted\) transparent;/, `${path} ${mode}`);
+    }
   }
 });
 

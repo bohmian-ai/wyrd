@@ -107,6 +107,20 @@ pub fn body_rejection(rejection: &JsonRejection) -> WyrdErrorResponse {
     })
 }
 
+/// Whether `error` is a transient refusal retryable after one second.
+fn retryable_now(error: &WyrdError) -> bool {
+    matches!(
+        error,
+        WyrdError::AuthVerifyUnavailable { .. }
+            | WyrdError::VerificationStagingFull { .. }
+            | WyrdError::Vala {
+                error: wyrd_spec::vala::error::BifrostError::QueryAdmissionRejected
+                    | wyrd_spec::vala::error::BifrostError::QueryQueueFull
+                    | wyrd_spec::vala::error::BifrostError::IngestBusy { .. }
+            }
+    )
+}
+
 /// Render a Wyrd error as an RFC 9457 problem+json response.
 #[must_use]
 pub fn wyrd_error_response(error: WyrdError) -> Response {
@@ -121,16 +135,15 @@ pub fn wyrd_error_response_from_parts(
     request_id: Option<&wyrd_spec::request_id::RequestId>,
 ) -> Response {
     let status = StatusCode::from_u16(error.status()).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
-    let retry_after = matches!(
-        &error,
-        WyrdError::AuthVerifyUnavailable { .. }
-            | WyrdError::VerificationStagingFull { .. }
-            | WyrdError::Vala {
-                error: wyrd_spec::vala::error::BifrostError::QueryAdmissionRejected
-                    | wyrd_spec::vala::error::BifrostError::QueryQueueFull
-                    | wyrd_spec::vala::error::BifrostError::IngestBusy { .. }
-            }
-    );
+    let retry_after = match &error {
+        // An exhausted password window says exactly when it ends.
+        WyrdError::PasswordAttempts { details, .. } => details
+            .get("retry_after_seconds")
+            .and_then(serde_json::Value::as_u64)
+            .map(|seconds| seconds.to_string()),
+        _ => None,
+    }
+    .or_else(|| retryable_now(&error).then(|| "1".to_owned()));
     let mut body = error.as_problem_json();
     if let (serde_json::Value::Object(map), Some(id)) = (&mut body, request_id) {
         map.insert(
@@ -141,11 +154,12 @@ pub fn wyrd_error_response_from_parts(
     match serde_json::to_vec(&body) {
         Ok(bytes) => {
             let mut response = response_with_body(status, bytes);
-            if retry_after {
-                response.headers_mut().insert(
-                    axum::http::header::RETRY_AFTER,
-                    axum::http::HeaderValue::from_static("1"),
-                );
+            if let Some(value) =
+                retry_after.and_then(|value| axum::http::HeaderValue::from_str(&value).ok())
+            {
+                response
+                    .headers_mut()
+                    .insert(axum::http::header::RETRY_AFTER, value);
             }
             if let Some(id) = request_id
                 && let Ok(val) = axum::http::HeaderValue::from_str(id.as_str())

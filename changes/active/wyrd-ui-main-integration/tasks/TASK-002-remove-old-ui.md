@@ -1,6 +1,6 @@
 # TASK-002 — Remove obsolete UI while retaining login
 
-Spec: [revision 9, approved](../spec.md). Status: Proposed.  
+Spec: [revision 9, approved](../spec.md). Status: Complete — accepted by the caller on 2026-10-23.  
 Dependencies: None.  
 Mapped obligations: REQ-032, REQ-020, AC-010; all INV-001–INV-007 apply, with TASK-001-specific exclusions only in TASK-001.
 

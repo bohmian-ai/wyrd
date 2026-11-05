@@ -14,9 +14,10 @@ use schemars::SchemaGenerator;
 use serde_json::{Map, Value, json, to_string_pretty};
 use wyrd_spec::auth::{
     AbsoluteUrl, CallbackQuery, CreateServicePrincipalRequest, CreateServicePrincipalResponse,
-    CredentialListResponse, GatewayAccess, IssuedCredential, IssuerUrl, LoginInitResponse,
-    PrincipalKindTag, PrincipalPage, PrincipalQuery, PrincipalRoles, RevokePrincipalRequest,
-    RoleAssignmentChange, TokenAudience, TokenRequest, TokenResponse,
+    CredentialListQuery, CredentialListResponse, CurrentUserProfile, GatewayAccess,
+    IssuedCredential, IssuerUrl, LoginInitResponse, PrincipalKindTag, PrincipalPage,
+    PrincipalQuery, PrincipalRoles, RevokePrincipalRequest, RoleAssignmentChange, TokenAudience,
+    TokenRequest, TokenResponse,
 };
 use wyrd_spec::card::agent::AgentSpec;
 use wyrd_spec::card::artifact::{ArtifactSpec, FrameworkAdapterRef};
@@ -81,7 +82,8 @@ use wyrd_spec::vala::api::{
     GetRunningQueryRequest, ListRunningQueriesResponse, NullOrderWire, PhysicalLayoutWire,
     QueryTerminalFrame, RegisterOutcome, RegisterTableRequest, RegisterTableResponse,
     RunningQueryLifecycleState, RunningQueryProgress, RunningQuerySummary, SortDirectionWire,
-    SortKeyWire, TableStatus, TimeGranularityWire, TimeUnit,
+    SortKeyWire, TableStatus, TimeGranularityWire, TimeUnit, ValidatePredicateRequest,
+    ValidatePredicateResponse,
 };
 use wyrd_spec::vala::trace::SpanRecord;
 use wyrd_spec::verification::VerificationBindingStatus;
@@ -250,6 +252,8 @@ fn contracts() -> Value {
         CreateServicePrincipalResponse,
         IssuedCredential,
         CredentialListResponse,
+        CredentialListQuery,
+        CurrentUserProfile,
         PrincipalRoles,
         RoleAssignmentChange,
         PrincipalPage,
@@ -291,6 +295,8 @@ fn contracts() -> Value {
         GetRunningQueryRequest,
         CancelRunningQueryRequest,
         CancelRunningQueryResponse,
+        ValidatePredicateRequest,
+        ValidatePredicateResponse,
         QueryTerminalFrame,
         AuditEvent,
         AuthMethod,
@@ -383,6 +389,34 @@ fn write_problem_examples(out: &Path) -> Result<(), Box<dyn StdError>> {
         (
             "denied",
             WyrdError::PermissionDeniedRbac {
+                message: String::new(),
+                details: json!({}),
+            },
+        ),
+        (
+            "passwordInvalid",
+            WyrdError::PasswordInvalid {
+                message: String::new(),
+                details: json!({}),
+            },
+        ),
+        (
+            "passwordAttempts",
+            WyrdError::PasswordAttempts {
+                message: String::new(),
+                details: json!({}),
+            },
+        ),
+        (
+            "oneTimeCodeInvalid",
+            WyrdError::OneTimeCodeInvalid {
+                message: String::new(),
+                details: json!({}),
+            },
+        ),
+        (
+            "recentLogin",
+            WyrdError::RecentLoginRequired {
                 message: String::new(),
                 details: json!({}),
             },

@@ -51,6 +51,7 @@ const view = {
   tenant_name: 'Acme',
   principal_id: 'p-1',
   principal_kind: 'user',
+  username: null,
   credential: 'sso',
   permissions: ['cards:read'],
   expires_at: '2026-10-20T00:00:00Z'
@@ -181,10 +182,10 @@ test('metadata requires current live enumeration', async () => {
 
   const live = jar({ wyrd_session_acme: 'a.1', wyrd_session_beta: 'b.2', theme: 'dark' });
   const session = await selected(live);
-  const current = { ...view, principal_id: 'p-1', expires_at: '2026-10-21T00:00:00Z' };
+  const current = { ...view, principal_id: 'p-1', username: 'development', expires_at: '2026-10-21T00:00:00Z' };
   const requests = server(() => Response.json({ sessions: [beta, current] }));
   expect(await new BrowserSessions().metadata(session, url, live.cookies)).toEqual({
-    subject: { id: 'p-1', name: 'p-1' },
+    subject: { id: 'p-1', name: 'development' },
     expiresAt: Date.parse('2026-10-21T00:00:00Z'),
     tenants: [
       { key: 'acme', name: 'Acme' },

@@ -15,6 +15,7 @@
 </script>
 
 <svelte:head><title>Settings · {data.tenant.name} · Wyrd</title></svelte:head>
+<div class="app-page">
 <div class="heading">
   <h1>Settings</h1>
   <p>Single sign-on for {data.tenant.name}. Secrets are write-only and never shown.</p>
@@ -130,6 +131,7 @@
     </section>
   </div>
 {/if}
+</div>
 
 <style>
   .heading {

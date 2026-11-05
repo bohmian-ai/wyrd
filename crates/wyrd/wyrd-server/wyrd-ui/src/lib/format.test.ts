@@ -1,5 +1,5 @@
 import { expect, test } from 'vitest';
-import { fmtCost, fmtCount, fmtDuration } from './format';
+import { fmtCost, fmtCount, fmtDuration } from 'wyrd-ai-ui';
 
 test('fmtDuration switches from ms to seconds at 1000ms', () => {
   expect(fmtDuration(843)).toBe('843ms');

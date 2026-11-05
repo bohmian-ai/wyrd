@@ -1,6 +1,6 @@
 # TASK-001 — Installed and container UI with existing login
 
-Spec: [revision 9, approved](../spec.md). Status: Proposed.  
+Spec: [revision 9, approved](../spec.md). Status: Complete — accepted by the caller on 2026-10-23.  
 Dependencies: None.  
 Mapped obligations: REQ-001, REQ-002, REQ-003, REQ-004, REQ-005, REQ-006, REQ-020, AC-001, AC-002, AC-003, AC-004, AC-005, AC-010; all INV-001–INV-007 apply, with TASK-001-specific exclusions only in TASK-001.
 

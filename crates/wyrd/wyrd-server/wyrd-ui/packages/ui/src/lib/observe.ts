@@ -1,0 +1,1320 @@
+/**
+ * Observe loaders: built-in reads of the canonical signal tables. Every SQL
+ * text is assembled only from the fixed tables and column allowlists in
+ * `SIGNALS`; every value, range bound and identity is a typed `$n` bind.
+ */
+import { failed, wyrdProblem, type Loaded, type Problem, type QueryParam, type QueryResult, type WireRequest } from './contract.js';
+import { fmtDuration, fmtNumber, parseInstant } from './format.js';
+import { bucketFor, bucketWidth, chartParams, inputProblem, resolveRange, shapeChart, type ChartProps, type LoadContext } from './loaders.js';
+import { MAX_SERIES, columnIndex, identityCaptions, numeric } from './plot.js';
+import {
+  IDS,
+  SIGNALS,
+  TIES,
+  cursorColumns,
+  listSort,
+  logStats,
+  type AbsoluteRange,
+  type ChartInput,
+  type FacetRailInput,
+  type Filter,
+  type Range,
+  type RecordDetailInput,
+  type RecordTableInput,
+  type Signal,
+  type Stat,
+  type StatStripInput,
+  type TraceWaterfallInput
+} from './schemas.js';
+
+/** An executed read, for reproducing it in Query. */
+export interface Executed {
+  readonly sql: string;
+  readonly params: readonly QueryParam[];
+}
+
+/** Props of `StatStrip`: per stat, its total rows and its bucketed rows. */
+export interface StatStripProps {
+  readonly input: StatStripInput;
+  readonly result: Loaded<{ readonly stats: readonly { readonly stat: Stat; readonly total: QueryResult; readonly series: QueryResult }[] }>;
+}
+
+/** Props of `FacetRail`: per facet, `value, n` rows, largest first; an eleventh row means more values exist. */
+export interface FacetRailProps {
+  readonly input: FacetRailInput;
+  readonly result: Loaded<{ readonly facets: readonly { readonly column: string; readonly values: QueryResult }[] }>;
+}
+
+/**
+ * Props of `RecordTable`. Signal rows carry the shown columns first, then the
+ * identity columns of `keyColumns`; trace rows also carry span and error
+ * counts read for the visible traces only.
+ */
+export interface RecordTableProps {
+  readonly input: RecordTableInput;
+  readonly executed?: Executed;
+  readonly result: Loaded<{ readonly rows: QueryResult; readonly counts?: Loaded<QueryResult>; readonly page?: Page }>;
+}
+
+/** The cursors of the pages beside a signal list's page; an absent side has no rows. */
+export interface Page {
+  readonly older?: readonly QueryParam[];
+  readonly newer?: readonly QueryParam[];
+}
+
+/** Props of `TraceWaterfall`: every retained span of the trace, in start order. */
+export interface TraceWaterfallProps {
+  readonly input: TraceWaterfallInput;
+  readonly result: Loaded<QueryResult>;
+}
+
+/** Props of `RecordDetail`: the whole stored row; more than one row shares a log key only on a duplicate write. */
+export interface RecordDetailProps {
+  readonly input: RecordDetailInput;
+  readonly result: Loaded<QueryResult>;
+}
+
+/** Rows a facet reads: ten shown, the eleventh only reports that more exist. */
+export const FACET_VALUES = 10;
+/** Rows a list reads unless its input says otherwise. */
+export const LIST_LIMIT = 50;
+/** Spans a trace may hold before its read is refused as too large rather than shown truncated. */
+const TRACE_SPANS = 10_000;
+
+/** The panel's own range, else the view's; a signal read needs one. */
+function rangeOf(own: Range | undefined, context: LoadContext): AbsoluteRange | Problem {
+  const range = own ? resolveRange(own) : context.range;
+  return range ?? wyrdProblem('validation', 'A signal read needs a range and none was supplied.');
+}
+
+/** Builds one read's predicate list, binding each value as the next `$n`. */
+class Binds {
+  readonly params: QueryParam[] = [];
+  readonly clauses: string[] = [];
+
+  /** Bind `value` and return its placeholder. */
+  bind(value: QueryParam): string {
+    this.params.push(value);
+    return `$${this.params.length}`;
+  }
+
+  /** Start with the event-time range as `$1`/`$2`. */
+  static over(time: string, range: AbsoluteRange): Binds {
+    const binds = new Binds();
+    binds.clauses.push(`${time} >= ${binds.bind(range.from)}::timestamptz AND ${time} < ${binds.bind(range.to)}::timestamptz`);
+    return binds;
+  }
+
+  /**
+   * Start a read of {@link SERIES_TABLE} with the hours `range` overlaps as
+   * `$1`/`$2`: a series row covers its whole hour, so the hour holding `from`
+   * is read too.
+   */
+  static hours(range: AbsoluteRange): Binds {
+    const binds = new Binds();
+    binds.clauses.push(`hour_unix_nano >= date_bin(INTERVAL '1 hour', ${binds.bind(range.from)}::timestamptz) AND hour_unix_nano < ${binds.bind(range.to)}::timestamptz`);
+    return binds;
+  }
+
+  /** AND one server-normalized predicate; it binds nothing and names only the table's own columns. */
+  predicate(sql: string | undefined): this {
+    if (sql) this.clauses.push(`(${sql})`);
+    return this;
+  }
+
+  /** AND each WHERE clause; the column is already one of the signal's allowlisted names, and an id binds as hex. */
+  where(filters: readonly Filter[] = []): this {
+    for (const { column, value, not } of filters) {
+      const bound = () => ((IDS as readonly string[]).includes(column) ? `decode(${this.bind(value)}, 'hex')` : this.bind(value));
+      if (value === null) this.clauses.push(`${column} IS ${not ? 'NOT ' : ''}NULL`);
+      else this.clauses.push(`${column} ${not ? 'IS DISTINCT FROM' : '='} ${bound()}`);
+    }
+    return this;
+  }
+
+  /**
+   * Keep root spans in the range whose trace has a span matching every
+   * predicate so far, so a filter on a child span's column, such as the
+   * Card on a model call, finds its trace. The first clause is the range.
+   */
+  roots(table: string): this {
+    const [window, ...rest] = this.clauses;
+    const matching = rest.length ? [`trace_id IN (SELECT trace_id FROM ${table} WHERE ${this.sql})`] : [];
+    this.clauses.splice(0, this.clauses.length, window, ROOT, ...matching);
+    return this;
+  }
+
+  get sql(): string {
+    return this.clauses.join(' AND ');
+  }
+}
+
+/** The bifrost.traces.spans predicate that keeps only root spans. */
+const ROOT = 'parent_span_id IS NULL';
+/** OTLP `STATUS_CODE_ERROR`. */
+const STATUS_ERROR = 2;
+
+/** One query of the batch, or the problem that stops it. */
+function query(sql: string, params: readonly QueryParam[], max_rows?: number, max_bytes?: number): Extract<WireRequest, { op: 'bifrost.query' }> {
+  return { op: 'bifrost.query', sql, params: [...params], ...(max_rows === undefined ? {} : { max_rows }), ...(max_bytes === undefined ? {} : { max_bytes }) };
+}
+
+/**
+ * Validate a panel's `where_sql` against its signal table before any read
+ * uses it: the normalized predicate, `undefined` for none, or the refusal
+ * that stops the panel with no dependent read.
+ */
+async function predicateFor(table: string, whereSql: string | undefined, context: LoadContext): Promise<{ sql?: string } | Loaded<never>> {
+  if (!whereSql?.trim()) return {};
+  const dot = table.lastIndexOf('.');
+  const [checked] = await context.executor.run(
+    [{ op: 'bifrost.validate_predicate', namespace: table.slice(0, dot), name: table.slice(dot + 1), expression: whereSql }],
+    context.signal
+  );
+  if (!checked.ok) return failed(checked.problem);
+  context.signal?.throwIfAborted();
+  return { sql: checked.value.expression || undefined };
+}
+
+/** The first refused or failed result of a batch, as the component's state. */
+function firstFailure(results: readonly { ok: boolean; problem?: Problem }[]): Loaded<never> | undefined {
+  const failure = results.find((each) => !each.ok);
+  return failure?.problem ? failed(failure.problem) : undefined;
+}
+
+/** The value column and table of each built-in stat. */
+const STAT_SOURCES: Record<Stat, { table: string; time: string; value: string; filter?: string; roots?: true; byCurrency?: true }> = {
+  traces: { table: SIGNALS.spans.table, time: SIGNALS.spans.time, value: 'count(*)', roots: true },
+  spans: { table: SIGNALS.spans.table, time: SIGNALS.spans.time, value: 'count(*)' },
+  errors: { table: SIGNALS.spans.table, time: SIGNALS.spans.time, value: 'count(*)', filter: `status_code = ${STATUS_ERROR}` },
+  duration_p95: { table: SIGNALS.spans.table, time: SIGNALS.spans.time, value: 'approx_percentile_cont(duration_nano, 0.95)', roots: true },
+  invocations: { table: SIGNALS.spans.table, time: SIGNALS.spans.time, value: 'count(*)', filter: "gen_ai_operation_name = 'invoke_agent'" },
+  logs: { table: SIGNALS.logs.table, time: SIGNALS.logs.time, value: 'count(*)' },
+  // OTLP severity numbers 17-24 are ERROR and FATAL; the recorded number decides, never the text or a name.
+  log_errors: { table: SIGNALS.logs.table, time: SIGNALS.logs.time, value: 'count(*)', filter: 'severity_number >= 17' },
+  // The gateway's metered usage: one row per call and usage entry, counting only token units, so
+  // nested spans never count one call twice. Null, never zero, when no call recorded any.
+  tokens: {
+    table: '(SELECT started_at, workload_card_uid, subject_card_uid, unnest(usage) AS u FROM bifrost.gateway.calls) AS usage',
+    time: 'started_at',
+    value: "sum(CAST(u['quantity'] AS DECIMAL(38, 12)))",
+    filter: "u['unit'] = 'tokens'"
+  },
+  calls: { table: 'bifrost.gateway.calls', time: 'started_at', value: 'count(*)' },
+  // Amounts in different currencies never add up: one row per recorded currency.
+  cost: { table: 'bifrost.gateway.calls', time: 'started_at', value: 'sum(CAST(cost AS DECIMAL(38, 12)))', filter: 'cost IS NOT NULL', byCurrency: true }
+};
+
+/** The total and per-bucket reads of one stat. */
+export function statQueries(stat: Stat, input: StatStripInput, range: AbsoluteRange, bucket: string, predicate?: string): [Executed, Executed] {
+  const source = STAT_SOURCES[stat];
+  const filtered = source.table === SIGNALS.spans.table || source.table === SIGNALS.logs.table;
+  const plan = (series: boolean) => {
+    const binds = Binds.over(source.time, range);
+    const bin = series ? `date_bin(${binds.bind(bucket)}::interval, ${source.time})` : '';
+    if (source.filter) binds.clauses.push(source.filter);
+    if (input.scope) binds.clauses.push(`${input.scope.column} = ${binds.bind(input.scope.uid)}`);
+    if (filtered) binds.where(input.where).predicate(predicate);
+    if (source.roots) binds.roots(source.table);
+    const currency = source.byCurrency ? ', currency' : '';
+    const sql = series
+      ? `SELECT ${bin} AS at, ${source.value} AS value${currency} FROM ${source.table} WHERE ${binds.sql} GROUP BY ${bin}${currency} ORDER BY at`
+      : `SELECT ${source.value} AS value${currency} FROM ${source.table} WHERE ${binds.sql}${currency ? ` GROUP BY currency ORDER BY currency` : ''}`;
+    return { sql, params: binds.params };
+  };
+  return [plan(false), plan(true)];
+}
+
+/** Load each stat's total and series in one batch; one refusal refuses the strip. */
+export async function loadStatStrip(input: StatStripInput, context: LoadContext): Promise<StatStripProps> {
+  const range = rangeOf(input.range, context);
+  if ('code' in range) return { input, result: { state: 'error', problem: range } };
+  const predicate = await predicateFor(SIGNALS[logStats(input.stats) ? 'logs' : 'spans'].table, input.where_sql, context);
+  if ('state' in predicate) return { input, result: predicate };
+  const plans = input.stats.map((stat) => statQueries(stat, input, range, bucketFor(range), predicate.sql));
+  const results = await context.executor.run(plans.flatMap(([total, series]) => [query(total.sql, total.params), query(series.sql, series.params)]), context.signal);
+  const failure = firstFailure(results);
+  if (failure) return { input, result: failure };
+  const stats = input.stats.map((stat, index) => ({
+    stat,
+    total: (results[index * 2] as { value: QueryResult }).value,
+    series: (results[index * 2 + 1] as { value: QueryResult }).value
+  }));
+  const recorded = stats.some(({ total }) => total.rows.some((row) => row[0] !== null && Number(row[0]) !== 0));
+  if (!recorded) {
+    const tables = [...new Set(input.stats.map((stat) => (stat === 'tokens' ? 'bifrost.gateway.calls usage' : STAT_SOURCES[stat].table)))].join(' or ');
+    return { input, result: { state: 'empty', data: { stats }, reason: `Nothing recorded in ${tables} in this range${scopeText(input)}.` } };
+  }
+  return { input, result: { state: 'populated', data: { stats } } };
+}
+
+/** The ownership scope as a reason names it. */
+function scopeText(input: StatStripInput): string {
+  return input.scope ? ` for ${input.scope.column} = ${input.scope.uid}` : '';
+}
+
+/** Why a signal list is empty, naming the table, its event-time column and the WHERE that would have to match. */
+function emptyList(signal: Signal, where: readonly Filter[] = []): string {
+  const what = signal === 'traces' ? 'root spans' : 'rows';
+  const matching = where.length ? ` matching ${where.map((filter) => filter.column).join(', ')}` : '';
+  return `No ${what} in ${SIGNALS[signal].table} with ${SIGNALS[signal].time} in this range${matching}.`;
+}
+
+/** Facet counts of one column under the list's own WHERE and range. */
+export function facetQuery(input: FacetRailInput, column: string, range: AbsoluteRange, predicate?: string): Executed {
+  const signal = SIGNALS[input.signal];
+  const binds = Binds.over(signal.time, range);
+  binds.where(input.where).predicate(predicate);
+  // A trace facet counts the traces with a span of each value, under the same span-level WHERE.
+  const n = input.signal === 'traces' ? 'count(DISTINCT trace_id)' : 'count(*)';
+  // A severity text value reads the highest severity number recorded with it, so its level comes from the number.
+  const level = input.signal === 'logs' && column === 'severity_text' ? ', max(severity_number) AS severity_number' : '';
+  return {
+    sql: `SELECT ${column} AS value, ${n} AS n${level} FROM ${signal.table} WHERE ${binds.sql} GROUP BY ${column} ORDER BY n DESC, value LIMIT ${FACET_VALUES + 1}`,
+    params: binds.params
+  };
+}
+
+/** Load every facet in one batch; one refusal refuses the rail. */
+export async function loadFacetRail(input: FacetRailInput, context: LoadContext): Promise<FacetRailProps> {
+  const range = rangeOf(input.range, context);
+  if ('code' in range) return { input, result: { state: 'error', problem: range } };
+  const predicate = await predicateFor(SIGNALS[input.signal].table, input.where_sql, context);
+  if ('state' in predicate) return { input, result: predicate };
+  const plans = input.facets.map((column) => facetQuery(input, column, range, predicate.sql));
+  const results = await context.executor.run(plans.map((plan) => query(plan.sql, plan.params)), context.signal);
+  const failure = firstFailure(results);
+  if (failure) return { input, result: failure };
+  const facets = input.facets.map((column, index) => ({ column, values: (results[index] as { value: QueryResult }).value }));
+  if (facets.every(({ values }) => values.rows.length === 0))
+    return { input, result: { state: 'empty', data: { facets }, reason: emptyList(input.signal, input.where) } };
+  return { input, result: { state: 'populated', data: { facets } } };
+}
+
+/**
+ * Columns a list reads after its shown columns, by signal: the row's identity
+ * and the cues its cells read, a span's parent and a record's severity number.
+ */
+export const KEY_COLUMNS: Record<Signal, readonly string[]> = {
+  traces: ['trace_id', 'span_id', 'duration_nano'],
+  spans: ['trace_id', 'span_id', 'parent_span_id'],
+  logs: ['trace_id', 'span_id', 'observed_time_unix_nano', 'wyrd_request_id', 'severity_number'],
+  metrics: []
+};
+
+/** The columns a signal list shows. */
+export function shownColumns(input: Extract<RecordTableInput, { signal: Signal }>): readonly string[] {
+  return input.columns ?? SIGNALS[input.signal].columns;
+}
+
+/** One column of a list's order, as the query reads it. */
+interface OrderKey {
+  readonly column: string;
+  readonly desc: boolean;
+  /** Only the sort column may be empty; it sorts last, so first when a page reads backward. */
+  readonly nullable: boolean;
+}
+
+/** A column as the order compares it: an id by its lowercase hex, which orders as its bytes. */
+const ordered = (column: string) => ((IDS as readonly string[]).includes(column) ? `encode(${column}, 'hex')` : column);
+
+/**
+ * A list's order: the sort column, event time newest first, then the ties
+ * ascending. A page before a row reads the reverse order.
+ */
+function orderKeys(signal: Signal, input: Extract<RecordTableInput, { signal: Signal }>): readonly OrderKey[] {
+  const sort = listSort(signal, input.sort);
+  const backward = input.before !== undefined;
+  return cursorColumns(signal, input.sort).map((column, index) => {
+    const desc = column === sort.column ? sort.desc : column === SIGNALS[signal].time;
+    return { column, desc: desc !== backward, nullable: index === 0 && column !== SIGNALS[signal].time };
+  });
+}
+
+/**
+ * The rows strictly beyond `values` in the order of `keys`, as a keyset
+ * predicate: beyond the first key, or equal to it and beyond the rest. An
+ * empty value sorts last forward and first backward.
+ */
+function beyond(binds: Binds, keys: readonly OrderKey[], values: readonly QueryParam[], backward: boolean): string {
+  const placeholders = keys.map(({ column }, index) =>
+    values[index] === null ? '' : column.endsWith('_unix_nano') ? `${binds.bind(values[index])}::timestamptz` : binds.bind(values[index])
+  );
+  let rest = '';
+  for (let index = keys.length - 1; index >= 0; index -= 1) {
+    const { column, desc, nullable } = keys[index];
+    const value = values[index];
+    const left = ordered(column);
+    const placeholder = placeholders[index];
+    const past = value === null ? (nullable && backward ? `${left} IS NOT NULL` : '') : `${left} ${desc ? '<' : '>'} ${placeholder}${nullable && !backward ? ` OR ${left} IS NULL` : ''}`;
+    const equal = value === null ? `${left} IS NULL` : `${left} = ${placeholder}`;
+    rest = `(${[past, rest ? `(${equal} AND ${rest})` : ''].filter(Boolean).join(' OR ') || 'FALSE'})`;
+  }
+  return rest;
+}
+
+/**
+ * One page of one signal, shown columns first and then its other key and
+ * cursor columns, ids as lowercase hex. Traces, spans and logs read in their
+ * sort order one row past the page, which says whether another page
+ * follows; metric points read their newest rows.
+ */
+export function listQuery(input: Extract<RecordTableInput, { signal: Signal }>, range: AbsoluteRange, predicate?: string): Executed {
+  const signal = SIGNALS[input.signal];
+  const paged = TIES[input.signal].length > 0;
+  const binds = Binds.over(signal.time, range);
+  binds.where(input.where).predicate(predicate);
+  if (input.signal === 'traces') binds.roots(signal.table);
+  const keys = orderKeys(input.signal, input);
+  const cursor = input.after ?? input.before;
+  if (paged && cursor) binds.clauses.push(beyond(binds, keys, cursor, input.before !== undefined));
+  const read = [...new Set([...KEY_COLUMNS[input.signal], ...(paged ? cursorColumns(input.signal, input.sort) : [])])]
+    .filter((key) => !shownColumns(input).includes(key))
+    .map((key) => ((IDS as readonly string[]).includes(key) || key === 'parent_span_id' ? `encode(${key}, 'hex') AS ${key}` : key));
+  const shown = shownColumns(input).map((column) => {
+    if (input.signal !== 'metrics') return column;
+    if (EXACT.includes(column)) return `CAST(${column} AS VARCHAR) AS ${column}`;
+    return NESTED_EXACT[column] ? `${NESTED_EXACT[column]} AS ${column}` : column;
+  });
+  const order = paged
+    ? keys.map(({ column, desc, nullable }) => `${ordered(column)} ${desc ? 'DESC' : 'ASC'}${nullable ? ` NULLS ${input.before ? 'FIRST' : 'LAST'}` : ''}`).join(', ')
+    : `${signal.time} DESC`;
+  const limit = (input.limit ?? LIST_LIMIT) + (paged ? 1 : 0);
+  return { sql: `SELECT ${[...shown, ...read].join(', ')} FROM ${signal.table} WHERE ${binds.sql} ORDER BY ${order} LIMIT ${limit}`, params: binds.params };
+}
+
+/**
+ * Metric integer columns a list reads as exact decimal text: JSON numbers
+ * cannot carry every int64 or uint64, so the server spells them.
+ */
+const EXACT: readonly string[] = ['int_value', 'histogram_count', 'summary_count', 'exponential_zero_count'];
+
+/**
+ * Nested metric counts a list reads as exact decimal text with their
+ * structure kept: OTLP counts are uint64, which JSON numbers cannot carry.
+ */
+const NESTED_EXACT: Readonly<Record<string, string>> = {
+  bucket_counts: 'CAST(bucket_counts AS VARCHAR[])',
+  positive_buckets:
+    "CASE WHEN positive_buckets IS NULL THEN NULL ELSE named_struct('offset', positive_buckets['offset'], 'bucket_counts', CAST(positive_buckets['bucket_counts'] AS VARCHAR[])) END",
+  negative_buckets:
+    "CASE WHEN negative_buckets IS NULL THEN NULL ELSE named_struct('offset', negative_buckets['offset'], 'bucket_counts', CAST(negative_buckets['bucket_counts'] AS VARCHAR[])) END"
+};
+
+/** Metric types a series chart plots; histogram and summary points are listed, never plotted. */
+const PLOTTED = "metric_type IN ('gauge', 'sum')";
+
+/** Aggregations a metric chart may apply across series at each recorded instant. Percentiles are not offered. */
+export const METRIC_AGGREGATIONS = ['sum', 'mean', 'min', 'max'] as const;
+/** One offered metric aggregation. */
+export type MetricAggregation = (typeof METRIC_AGGREGATIONS)[number];
+
+/** SQL of each aggregation over exact integers. */
+const AGGREGATE: Record<MetricAggregation, string> = { sum: 'sum', mean: 'avg', min: 'min', max: 'max' };
+
+/** A point's recorded meaning: points that differ in any of these never share a group. */
+const MEANING = ['metric_type', 'unit', 'aggregation_temporality', 'is_monotonic'] as const;
+
+/** Most keys one metric view groups by at once. */
+export const MAX_GROUP_KEYS = 3;
+/** The Variant each group-key source reads one key of. */
+const KEY_SOURCES = { attributes: 'attributes', resource: 'resource_attributes', scope: 'scope_attributes' } as const;
+/** Promoted metrics columns a view may group by: every filter column but the metric and its meaning. Variant keys are typed. */
+export const METRIC_GROUP_KEYS: readonly string[] = (SIGNALS.metrics.filters as readonly string[]).filter((column) => column !== 'metric_name' && !(MEANING as readonly string[]).includes(column));
+
+/**
+ * The SQL that reads one group key, binding a Variant key as text: a promoted
+ * column as itself, or `attributes.<key>`, `resource.<key>` or `scope.<key>`
+ * as that one key's text form, so no read rebuilds a whole attribute set.
+ *
+ * @throws when `key` names neither a promoted column nor a Variant key.
+ */
+function groupKey(key: string, binds: Binds): string {
+  if (METRIC_GROUP_KEYS.includes(key)) return key;
+  const dot = key.indexOf('.');
+  const source = KEY_SOURCES[key.slice(0, dot) as keyof typeof KEY_SOURCES];
+  const name = key.slice(dot + 1);
+  if (dot < 0 || !source || !name || name.length > 256) throw new Error(`${key} is not a metrics group key`);
+  return `variant_get_text(${source}, ${binds.bind(name)})`;
+}
+
+/** The read of one metric's plotted groups. */
+export interface MetricInput {
+  readonly metric: string;
+  readonly where?: readonly Filter[];
+  readonly where_sql?: string;
+  /** Replace the default aggregation across series: sum for sums, mean for gauges. */
+  readonly aggregation?: MetricAggregation;
+  /** Keep one group per value of each key, at most {@link MAX_GROUP_KEYS}: promoted columns or `attributes.`, `resource.` or `scope.` keys. */
+  readonly by?: readonly string[];
+  /** Plot every series apart, at most {@link MAX_SERIES}, instead of aggregating across them. */
+  readonly apart?: boolean;
+  readonly range?: Range;
+}
+
+/**
+ * Props of one metric: the Chart of its groups, the typed identity columns
+ * that key them, and each group's Latest, Max and Mean of its plotted values.
+ */
+export interface MetricProps {
+  readonly input: MetricInput;
+  readonly chart: ChartProps;
+  readonly identity: readonly string[];
+  readonly summary: Loaded<QueryResult>;
+  /** Present when the metric records explicit-bucket histogram points in the range. */
+  readonly histogram?: HistogramProps;
+  /** The keys offered to group by: the promoted columns, then the keys the metric's series record. */
+  readonly keys: readonly string[];
+}
+
+/** A Chart keyed by typed identity columns, with each line's Latest, Max and Mean. */
+export type KeyedChartProps = ChartProps & { readonly identity: readonly string[]; readonly summary: Loaded<QueryResult> };
+
+/**
+ * One histogram metric's plots: the mean and bucket-estimated percentiles
+ * over time, the count rate over time, and the bucket distribution over the
+ * whole range. Each is an ordinary Chart over the same recorded points; the
+ * plots over time key every line by its group's typed identity.
+ */
+export interface HistogramProps {
+  readonly latency: KeyedChartProps;
+  readonly rate: KeyedChartProps;
+  readonly distribution: ChartProps;
+}
+
+/** The range's binds, the metric, the WHERE and predicate, and the group keys as `g1`… of one metric read. */
+function metricBinds(input: MetricInput, range: AbsoluteRange, kind: string, predicate?: string) {
+  const filters = SIGNALS.metrics.filters as readonly string[];
+  for (const { column } of input.where ?? []) if (!filters.includes(column)) throw new Error(`${column} is not a metrics column`);
+  const keys = input.apart ? [] : (input.by ?? []);
+  if (keys.length > MAX_GROUP_KEYS) throw new Error(`at most ${MAX_GROUP_KEYS} group keys`);
+  const binds = Binds.over(SIGNALS.metrics.time, range);
+  binds.clauses.push(`metric_name = ${binds.bind(input.metric)}`, kind);
+  binds.where((input.where ?? []).filter(({ column, not }) => column !== 'metric_name' || not)).predicate(predicate);
+  const groups = keys.map((key, index) => [`g${index + 1}`, groupKey(key, binds)] as const);
+  return { binds, keys, groups };
+}
+
+/**
+ * The chart read of one metric, aggregated on the server into the chart's
+ * windows. Each series, by `series_id`, gives one value per window:
+ * - a monotonic cumulative sum the increases of its points in the window,
+ *   each over the series' previous point (a changed start or a smaller value
+ *   is a reset, counted from zero; a series' first point in the range counts
+ *   nothing when the series started before the range, and in full otherwise),
+ *   and a delta sum its points added up, both per second;
+ * - a gauge or non-monotonic cumulative sum its last value.
+ * Series then aggregate per recorded meaning and group: sums add up and
+ * gauges average, unless `aggregation` replaces it; with `apart` every series
+ * stays its own group. The {@link MAX_SERIES} groups with the largest measure
+ * over the range are read (total for rates, mean otherwise), each row naming
+ * how many groups there were.
+ *
+ * Integer points stay exact decimals through every step while a window and
+ * the point before it hold only integers, so an increase past 2^53 is exact;
+ * `value` is that result as double precision for plotting. Each row also
+ * carries its group's `latest`, `max` and `mean` over the plotted windows as
+ * server text: exact decimals for integer gauges and sums, the double
+ * otherwise, with Max ordered by the double and a rounded tie broken exactly
+ * (a double that ties an integer is integral). A rate is a double.
+ */
+export function metricQueries(input: MetricInput, range: AbsoluteRange, predicate?: string): { identity: readonly string[]; chart: Executed } {
+  const { binds, keys, groups } = metricBinds(input, range, PLOTTED, predicate);
+  const bucket = binds.bind(bucketFor(range));
+  const seconds = binds.bind(bucketWidth(range) / 1000);
+  const meaning = MEANING.join(', ');
+  const kept = groups.map(([name]) => `, ${name}`).join('');
+  const group = [meaning, ...(input.apart ? ['series'] : groups.map(([name]) => name))].join(', ');
+  const counter = "metric_type = 'sum' AND (is_monotonic OR aggregation_temporality = 1)";
+  const across = (x: string) => (input.aggregation ? `${AGGREGATE[input.aggregation]}(${x})` : `CASE WHEN metric_type = 'sum' THEN sum(${x}) ELSE avg(${x}) END`);
+  // $1 is the range's start. One point's increase over the series' previous point `xp`, read as `x` or as the exact `i`.
+  const increase = (x: 'x' | 'i') => `CASE WHEN head THEN CASE WHEN s < $1::timestamptz THEN 0 ELSE ${x} END WHEN s = sp AND ${x} >= ${x}p THEN ${x} - ${x}p ELSE ${x} END`;
+  // One window's value of a series from its points' total `xt`, last value `x1` and summed increases `xd`.
+  const value = (x: 'x' | 'i') => `CASE WHEN aggregation_temporality = 1 THEN ${x}t WHEN metric_type = 'sum' AND is_monotonic THEN ${x}d ELSE ${x}1 END`;
+  const by = `PARTITION BY ${group}`;
+  const sql =
+    `WITH pts AS (SELECT date_bin(${bucket}::interval, ${SIGNALS.metrics.time}) AS w, ${SIGNALS.metrics.time} AS t, start_time_unix_nano AS s, series_id, ${meaning}, ` +
+    `${groups.map(([name, sql]) => `${sql} AS ${name}, `).join('')}CAST(int_value AS DECIMAL(38, 0)) AS i, COALESCE(CAST(int_value AS DOUBLE), double_value) AS x FROM ${SIGNALS.metrics.table} WHERE ${binds.sql}), ` +
+    `steps AS (SELECT *, lag(t) OVER series IS NULL AS head, lag(s) OVER series AS sp, lag(x) OVER series AS xp, lag(i) OVER series AS ip FROM pts WINDOW series AS (PARTITION BY series_id ORDER BY t)), ` +
+    `ends AS (SELECT w, series_id, ${meaning}${kept}, sum(x) AS xt, last_value(x ORDER BY t) AS x1, sum(${increase('x')}) AS xd, ` +
+    `sum(i) AS it, last_value(i ORDER BY t) AS i1, sum(${increase('i')}) AS id, bool_and(i IS NOT NULL AND (head OR ip IS NOT NULL)) AS exact FROM steps GROUP BY w, series_id, ${meaning}${kept}), ` +
+    `per AS (SELECT w, encode(series_id, 'hex') AS series, ${meaning}${kept}, ${value('x')} AS v, CASE WHEN exact THEN ${value('i')} END AS vi FROM ends), ` +
+    `grouped AS (SELECT w, ${group}, CAST(CASE WHEN count(vi) = count(*) THEN ${across('vi')} END AS DECIMAL(38, 4)) AS gi, ${across('v')} AS gv FROM per GROUP BY w, ${group}), ` +
+    `valued AS (SELECT w, ${group}, COALESCE(CAST(gi AS DOUBLE), gv) / CASE WHEN ${counter} THEN ${seconds} ELSE 1 END AS value, CASE WHEN NOT (${counter}) THEN gi END AS exact FROM grouped), ` +
+    `measured AS (SELECT *, CASE WHEN ${counter} THEN sum(value) OVER (${by}) ELSE avg(value) OVER (${by}) END AS measure FROM valued), ` +
+    `ranked AS (SELECT *, dense_rank() OVER (ORDER BY measure DESC NULLS LAST, ${group}) AS rank FROM measured), ` +
+    `plotted AS (SELECT *, COALESCE(CAST(exact AS VARCHAR), CAST(value AS VARCHAR)) AS text, COALESCE(exact, CASE WHEN abs(value) < 1e19 THEN CAST(value AS DECIMAL(38, 0)) END) AS tie FROM (SELECT *, max(rank) OVER () AS groups FROM ranked) WHERE rank <= ${MAX_SERIES}) ` +
+    `SELECT w AS at, ${group}, value, groups, last_value(text) OVER (${by} ORDER BY w ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING) AS latest, ` +
+    `first_value(text) OVER (${by} ORDER BY value DESC NULLS LAST, tie DESC NULLS LAST) AS max, ` +
+    `CASE WHEN count(exact) OVER (${by}) = count(*) OVER (${by}) THEN CAST(avg(exact) OVER (${by}) AS VARCHAR) ELSE CAST(avg(value) OVER (${by}) AS VARCHAR) END AS mean ` +
+    `FROM plotted ORDER BY at`;
+  return { identity: [...MEANING, ...(input.apart ? ['series'] : keys)], chart: { sql, params: binds.params } };
+}
+
+/** One metric's series in {@link SERIES_TABLE} over the hours `range` overlaps, under the WHERE and predicate. */
+function metricSeriesBinds(input: MetricInput, range: AbsoluteRange, predicate?: string): Binds {
+  const filters = SIGNALS.metrics.filters as readonly string[];
+  for (const { column } of input.where ?? []) if (!filters.includes(column)) throw new Error(`${column} is not a metrics column`);
+  const binds = Binds.hours(range);
+  binds.clauses.push(`metric_name = ${binds.bind(input.metric)}`);
+  return binds.where((input.where ?? []).filter(({ column, not }) => column !== 'metric_name' || not)).predicate(predicate);
+}
+
+/**
+ * The recorded resource, scope and attributes of `series`, by `series_id`,
+ * each as its JSON text from the series index's newest hour in the range:
+ * the only read of whole attribute sets for a chart, and only for the
+ * plotted series.
+ */
+export function seriesLabelsQuery(input: MetricInput, range: AbsoluteRange, series: readonly string[], predicate?: string): Executed {
+  const binds = metricSeriesBinds(input, range, predicate);
+  binds.clauses.push(`series_id IN (${series.map((id) => `decode(${binds.bind(id)}, 'hex')`).join(', ')})`);
+  return {
+    sql:
+      `SELECT encode(series_id, 'hex') AS series, to_json(resource_attributes) AS resource, scope_name, scope_version, to_json(scope_attributes) AS scope, to_json(attributes) AS attributes ` +
+      `FROM (SELECT *, row_number() OVER (PARTITION BY series_id ORDER BY hour_unix_nano DESC) AS newest FROM ${SERIES_TABLE} WHERE ${binds.sql}) WHERE newest = 1`,
+    params: binds.params
+  };
+}
+
+/** Most series whose attribute sets suggest group keys. */
+const KEY_SAMPLE = 100;
+
+/** The attribute sets of at most {@link KEY_SAMPLE} of the metric's series in range, whose keys the view offers to group by. */
+export function groupKeysQuery(input: MetricInput, range: AbsoluteRange, predicate?: string): Executed {
+  const binds = metricSeriesBinds(input, range, predicate);
+  return {
+    sql: `SELECT to_json(attributes) AS attributes, to_json(resource_attributes) AS resource, to_json(scope_attributes) AS scope FROM ${SERIES_TABLE} WHERE ${binds.sql} LIMIT ${KEY_SAMPLE}`,
+    params: binds.params
+  };
+}
+
+/** The promoted group keys, then each `attributes.`, `resource.` or `scope.` key `read`'s sets record, once each and sorted. */
+function offeredKeys(read: QueryResult): readonly string[] {
+  const found = new Set<string>();
+  read.columns.forEach(({ name }, index) => {
+    for (const row of read.rows) {
+      if (typeof row[index] !== 'string') continue;
+      let set: unknown;
+      try {
+        set = JSON.parse(row[index]);
+      } catch {
+        continue;
+      }
+      if (set && typeof set === 'object' && !Array.isArray(set)) for (const key of Object.keys(set)) found.add(`${name}.${key}`);
+    }
+  });
+  return [...METRIC_GROUP_KEYS, ...[...found].sort()];
+}
+
+/** Rows one windowed plot reads: {@link MAX_SERIES} series or groups by the at most 201 windows a range spans. */
+const PLOT_ROWS = MAX_SERIES * 201;
+/** Bytes one windowed plot reads. */
+const PLOT_BYTES = 16 * 1024 * 1024;
+
+/** The summary columns every chart row carries for its group, computed on the server. */
+const SUMMARY = ['latest', 'max', 'mean'] as const;
+
+/** Each plotted group's server-computed Latest, Max and Mean, once per group, keyed by `identity`. */
+function plottedSummary(chart: QueryResult, identity: readonly string[]): QueryResult {
+  const groups = new Map<string, unknown[]>();
+  const columns = [...identity, ...SUMMARY].map((name) => columnIndex(chart, name));
+  for (const row of chart.rows) {
+    const cells = columns.map((index) => row[index]);
+    const key = JSON.stringify(cells.slice(0, identity.length));
+    if (!groups.has(key)) groups.set(key, cells);
+  }
+  return { columns: columns.map((index) => chart.columns[index]), rows: [...groups.values()], terminal: chart.terminal };
+}
+
+/** Name the read's `g1`… columns by their group keys, and with `labels` replace each series id by its recorded resource, scope and attributes. */
+function named(read: QueryResult, keys: readonly string[], labels?: QueryResult): QueryResult {
+  const columns = read.columns.map((column) => (/^g\d+$/.test(column.name) ? { ...column, name: keys[Number(column.name.slice(1)) - 1] } : column));
+  if (!labels) return { ...read, columns };
+  const at = columnIndex(read, 'series');
+  const recorded = new Map(labels.rows.map((row) => [row[0], row.slice(1)]));
+  const empty = labels.columns.slice(1).map(() => null);
+  return {
+    columns: [...columns.slice(0, at), ...labels.columns.slice(1), ...columns.slice(at + 1)],
+    rows: read.rows.map((row) => [...row.slice(0, at), ...(recorded.get(row[at]) ?? empty), ...row.slice(at + 1)]),
+    terminal: read.terminal
+  };
+}
+
+/** The labels read of `series`, at most one row each. */
+function labelsRead(input: MetricInput, range: AbsoluteRange, series: readonly string[], predicate?: string) {
+  const labels = seriesLabelsQuery(input, range, series, predicate);
+  return query(labels.sql, labels.params, series.length);
+}
+
+/** The recorded columns an `apart` series is identified by in place of its id. */
+const SERIES_LABELS = ['resource', 'scope_name', 'scope_version', 'scope', 'attributes'] as const;
+
+/**
+ * Load one metric's chart and its histogram plots in one batch over one
+ * range and one validated predicate; with `apart`, a second read labels only
+ * the plotted series of both. A refused predicate issues no read.
+ */
+export async function loadMetric(input: MetricInput, context: LoadContext): Promise<MetricProps> {
+  const stopped = (state: Loaded<never>): MetricProps => ({ input, identity: [], summary: state, chart: { input: metricChart(input), result: state }, keys: METRIC_GROUP_KEYS });
+  const range = rangeOf(input.range, context);
+  if ('code' in range) return stopped({ state: 'error', problem: range });
+  const predicate = await predicateFor(SIGNALS.metrics.table, input.where_sql, context);
+  if ('state' in predicate) return stopped(predicate);
+  let plan: ReturnType<typeof metricQueries>;
+  let points: Executed;
+  let keyed: Executed;
+  try {
+    plan = metricQueries(input, range, predicate.sql);
+    points = histogramQuery(input, range, predicate.sql);
+    keyed = groupKeysQuery(input, range, predicate.sql);
+  } catch (error) {
+    return stopped({ state: 'error', problem: inputProblem('Metric', { path: ['by'], message: (error as Error).message }) });
+  }
+  const [chart, histogram, sampled] = await context.executor.run(
+    [query(plan.chart.sql, plan.chart.params, PLOT_ROWS, PLOT_BYTES), query(points.sql, points.params, PLOT_ROWS, PLOT_BYTES), query(keyed.sql, keyed.params, KEY_SAMPLE, PLOT_BYTES)],
+    context.signal
+  );
+  // With `apart`, one read labels only the plotted gauge, sum and histogram series.
+  const ids = (read: typeof chart) => (read.ok ? read.value.rows.map((row) => String(row[columnIndex(read.value, 'series')])) : []);
+  const plotted = input.apart ? [...new Set([...ids(chart), ...ids(histogram)])] : [];
+  const [labelled] = plotted.length ? await context.executor.run([labelsRead(input, range, plotted, predicate.sql)], context.signal) : [undefined];
+  const label = (read: typeof chart, keys: readonly string[]): typeof chart => {
+    if (!read.ok || !read.value.rows.length) return read;
+    if (!input.apart) return { ok: true, value: named(read.value, keys) };
+    return !labelled || labelled.ok ? { ok: true, value: named(read.value, [], labelled?.value) } : labelled;
+  };
+  const read = label(chart, plan.identity.slice(MEANING.length));
+  const identity = input.apart && read.ok && read.value.rows.length ? [...MEANING, ...SERIES_LABELS] : plan.identity;
+  const histogramRead = label(histogram, input.by ?? []);
+  const histogramKeys = [...MEANING, ...(input.apart ? SERIES_LABELS : (input.by ?? []))];
+  const reason = `No gauge or sum point of ${input.metric} in ${SIGNALS.metrics.table} in this range.`;
+  const loaded = (data: QueryResult): Loaded<QueryResult> => (data.rows.length ? { state: 'populated', data } : { state: 'empty', data, reason });
+  const total = read.ok && read.value.rows.length ? numeric(read.value.rows[0][columnIndex(read.value, 'groups')]) : 0;
+  const noun = input.apart ? 'series' : 'groups';
+  const capped = total > MAX_SERIES ? ` · the ${MAX_SERIES} largest of ${total} ${noun} plotted` : '';
+  const title = `${metricChart(input).title}${capped}`;
+  return {
+    input,
+    identity,
+    chart: { input: { ...metricChart(input), title, sql: plan.chart.sql, range }, executed: plan.chart, result: read.ok ? loaded(read.value) : failed(read.problem) },
+    summary: read.ok ? loaded(plottedSummary(read.value, identity)) : failed(read.problem),
+    // A failed sample offers the promoted columns alone; any key can still be typed.
+    keys: sampled.ok ? offeredKeys(sampled.value) : METRIC_GROUP_KEYS,
+    ...(!histogramRead.ok ? { histogram: histogramProps(input, range, points, failed(histogramRead.problem), histogramKeys) } : histogramRead.value.rows.length ? { histogram: histogramProps(input, range, points, histogramRead.value, histogramKeys) } : {})
+  };
+}
+
+/** The metric's chart definition before its SQL is planned. */
+function metricChart(input: MetricInput): Extract<ChartInput, { type: 'timeseries' }> {
+  const across = input.aggregation ?? 'sum of sums, mean of gauges';
+  const how = input.apart
+    ? 'each series apart'
+    : `${across} across series${input.by?.length ? ` by ${input.by.join(', ')}` : ''}`;
+  return { type: 'timeseries', title: `${input.metric} · ${how} · counters per second · plotted as double precision`, sql: '-', x: 'at', y: ['value'] };
+}
+
+/** Explicit-bucket histogram points, the only histogram kind plotted; exponential histograms and summaries stay listed. */
+const HISTOGRAM = "metric_type = 'histogram'";
+/** The percentiles estimated from a histogram's buckets. */
+export const HISTOGRAM_PERCENTILES = [50, 95, 99] as const;
+
+/**
+ * The read of one histogram metric, folded on the server into the chart's
+ * windows: one row per window and group (recorded meaning, grouping value or,
+ * with `apart`, `series`, and bounds) with its count, sum, bounds and bucket
+ * counts, for the {@link MAX_SERIES} groups that counted most over the range,
+ * each row naming how many groups there were.
+ *
+ * A cumulative point counts its increase over its series' previous point; a
+ * changed start or a smaller count is a reset, and the point then counts from
+ * zero. A series' first point in the range counts nothing when the series
+ * started before the range, and in full otherwise. Delta points count as
+ * recorded. A window's sum is null unless every sum it merges was recorded,
+ * so a missing sum never reads as zero.
+ */
+export function histogramQuery(input: MetricInput, range: AbsoluteRange, predicate?: string): Executed {
+  const { binds, groups: keyed } = metricBinds(input, range, HISTOGRAM, predicate);
+  const bucket = binds.bind(bucketFor(range));
+  const group = [...MEANING, ...(input.apart ? ['series'] : keyed.map(([name]) => name)), 'bounds'].join(', ');
+  // $1 is the range's start: a series that started before it has its first point as the baseline.
+  const base = (now: string, prior: string, zero: string) =>
+    `CASE WHEN head THEN CASE WHEN started < $1::timestamptz THEN ${now}${zero} END WHEN sp = started AND n >= np THEN ${prior}${zero} END`;
+  const each = `unnest(generate_series(1, CAST(cardinality(b) AS BIGINT))) AS i, unnest(b) AS c`;
+  const sql =
+    `WITH pts AS (SELECT date_bin(${bucket}::interval, ${SIGNALS.metrics.time}) AS w, ${SIGNALS.metrics.time} AS t, start_time_unix_nano AS started, ` +
+    `${MEANING.join(', ')}, ${input.apart ? "encode(series_id, 'hex') AS series, " : keyed.map(([name, sql]) => `${sql} AS ${name}, `).join('')}explicit_bounds AS bounds, series_id, ` +
+    `CAST(histogram_count AS BIGINT) AS n, histogram_sum AS v, CAST(bucket_counts AS BIGINT[]) AS b FROM ${SIGNALS.metrics.table} WHERE ${binds.sql}), ` +
+    `steps AS (SELECT *, lag(t) OVER series IS NULL AS head, lag(started) OVER series AS sp, lag(n) OVER series AS np, lag(v) OVER series AS vp, lag(b) OVER series AS bp ` +
+    `FROM pts WHERE aggregation_temporality = 2 WINDOW series AS (PARTITION BY series_id ORDER BY t)), ` +
+    `counted AS (SELECT w, ${group}, ${each}, ${base('b', 'bp', '')} AS bb, n - ${base('n', 'np', ' ELSE 0')} AS dn, v - ${base('v', 'vp', ' ELSE 0')} AS dv FROM steps ` +
+    `UNION ALL SELECT w, ${group}, ${each}, NULL AS bb, n AS dn, v AS dv FROM pts WHERE aggregation_temporality <> 2), ` +
+    `buckets AS (SELECT w, ${group}, i, sum(CAST(c AS BIGINT) - COALESCE(CAST(array_element(bb, i) AS BIGINT), 0)) AS c, ` +
+    `sum(CASE WHEN i = 1 THEN dn END) AS dn, sum(CASE WHEN i = 1 THEN dv END) AS dv, count(CASE WHEN i = 1 THEN dn END) AS kn, count(CASE WHEN i = 1 THEN dv END) AS kv FROM counted GROUP BY w, ${group}, i), ` +
+    `windows AS (SELECT w, ${group}, sum(dn) AS count, CASE WHEN sum(kv) = sum(kn) THEN sum(dv) END AS sum, array_agg(CAST(c AS VARCHAR) ORDER BY i) AS buckets FROM buckets GROUP BY w, ${group}), ` +
+    `ranked AS (SELECT *, dense_rank() OVER (ORDER BY measure DESC, ${group}) AS rank FROM (SELECT *, sum(count) OVER (PARTITION BY ${group}) AS measure FROM windows WHERE count > 0)) ` +
+    `SELECT w AS at, ${group}, count, sum, buckets, groups FROM (SELECT *, max(rank) OVER () AS groups FROM ranked) WHERE rank <= ${MAX_SERIES} ORDER BY at`;
+  return { sql, params: binds.params };
+}
+
+/** One histogram window or range total: summed counts, the sum when every merged sum was recorded, and bucket counts. */
+interface Tally {
+  count: number;
+  sum: number | null;
+  buckets: number[];
+}
+
+/** One group of series sharing recorded meaning, bounds and the grouping value or series, by its identity cells. */
+interface Group {
+  readonly cells: readonly unknown[];
+  readonly bounds: readonly number[];
+  readonly windows: [string, Tally][];
+  readonly total: Tally;
+}
+
+/**
+ * The value at percentile `q` (0–100) of bucket counts over `bounds`, by
+ * linear interpolation inside the bucket holding the rank, as Prometheus
+ * `histogram_quantile` does; the first bucket starts at 0. A rank in the
+ * unbounded last bucket returns that bucket's lower bound with `atLeast`.
+ * No counts, or no finite bound to report, return undefined.
+ */
+export function bucketPercentile(bounds: readonly number[], buckets: readonly number[], q: number): { value: number; atLeast: boolean } | undefined {
+  const total = buckets.reduce((sum, count) => sum + count, 0);
+  if (total <= 0) return undefined;
+  const rank = (q / 100) * total;
+  let below = 0;
+  for (let index = 0; index < buckets.length; index++) {
+    const count = buckets[index];
+    if (count > 0 && below + count >= rank) {
+      if (index >= bounds.length) return bounds.length ? { value: bounds[bounds.length - 1], atLeast: true } : undefined;
+      const lower = index === 0 ? Math.min(0, bounds[0]) : bounds[index - 1];
+      return { value: lower + ((bounds[index] - lower) * (rank - below)) / count, atLeast: false };
+    }
+    below += count;
+  }
+  return undefined;
+}
+
+/** A bucket's caption from its bounds: `≤ 0.005`, `0.005–0.01`, `> 10`. */
+function bucketLabel(bounds: readonly number[], index: number): string {
+  if (!bounds.length) return 'all';
+  if (index === 0) return `≤ ${fmtNumber(bounds[0])}`;
+  if (index >= bounds.length) return `> ${fmtNumber(bounds[bounds.length - 1])}`;
+  return `${fmtNumber(bounds[index - 1])}–${fmtNumber(bounds[index])}`;
+}
+
+/** The measure column naming what each histogram line plots: `mean`, `p50 estimated`… or `per second`. */
+const MEASURE = 'measure';
+
+/**
+ * The windowed plots of one histogram read: the mean and estimated
+ * percentiles and the count rate per window, keyed by `identity` (the read's
+ * group cells, `bounds` and `measure`), each with one `summary` row per line,
+ * and the bucket counts over the whole range.
+ */
+export interface HistogramWindows {
+  readonly identity: readonly string[];
+  readonly latency: QueryResult;
+  readonly latencySummary: QueryResult;
+  readonly rate: QueryResult;
+  readonly rateSummary: QueryResult;
+  readonly distribution: QueryResult;
+}
+
+/**
+ * Shape the server's histogram windows of `range` into the plots. `keys` are
+ * the read's group columns besides bounds: the recorded meaning, then the
+ * grouping keys or the series' recorded labels. Every line keeps its group's
+ * typed identity, so no two groups ever add up. A window whose sum was not
+ * recorded has no mean; an estimate in the unbounded top bucket is that
+ * bucket's lower bound and its `text` reads `≥`, as does any Max or Mean of a
+ * line holding one.
+ */
+export function histogramWindows(read: QueryResult, range: AbsoluteRange, keys: readonly string[] = MEANING): HistogramWindows {
+  const at = (name: string) => columnIndex(read, name);
+  const [ti, ci, sumi, bi, ki] = ['at', 'count', 'sum', 'bounds', 'buckets'].map(at);
+  const keyIndexes = keys.map(at);
+  const seconds = bucketWidth(range) / 1000;
+  const groups = new Map<string, Group>();
+  for (const row of read.rows) {
+    const bounds = ((row[bi] ?? []) as unknown[]).map(numeric);
+    const tally = { count: numeric(row[ci] ?? 0), sum: row[sumi] === null || row[sumi] === undefined ? null : numeric(row[sumi]), buckets: ((row[ki] ?? []) as unknown[]).map(numeric) };
+    const cells = [...keyIndexes.map((index) => row[index] ?? null), JSON.stringify(bounds)];
+    const key = JSON.stringify(cells);
+    const group = groups.get(key) ?? { cells, bounds, windows: [], total: { count: 0, sum: 0, buckets: [] } };
+    groups.set(key, group);
+    group.windows.push([new Date(parseInstant(row[ti])).toISOString(), tally]);
+    group.total.count += tally.count;
+    tally.buckets.forEach((value, index) => (group.total.buckets[index] = (group.total.buckets[index] ?? 0) + value));
+  }
+  const latency: unknown[][] = [];
+  const rate: unknown[][] = [];
+  const distribution: unknown[][] = [];
+  const lines = { latency: new Map<string, { cells: unknown[]; values: [number, boolean][] }>(), rate: new Map<string, { cells: unknown[]; values: [number, boolean][] }>() };
+  const plot = (into: keyof typeof lines, instant: string, cells: readonly unknown[], measure: string, value: number | null, atLeast = false) => {
+    const line = [...cells, measure];
+    (into === 'latency' ? latency : rate).push([instant, ...line, value, value === null ? null : `${atLeast ? '≥ ' : ''}${value}`]);
+    const key = JSON.stringify(line);
+    const kept = lines[into].get(key) ?? { cells: line, values: [] };
+    if (value !== null) kept.values.push([value, atLeast]);
+    lines[into].set(key, kept);
+  };
+  const captions = identityCaptions([...groups.values()].map(({ cells }) => cells));
+  [...groups.values()].forEach((group, index) => {
+    for (const [instant, tally] of group.windows) {
+      plot('rate', instant, group.cells, 'per second', tally.count / seconds);
+      plot('latency', instant, group.cells, 'mean', tally.sum === null ? null : tally.sum / tally.count);
+      for (const q of HISTOGRAM_PERCENTILES) {
+        const estimate = bucketPercentile(group.bounds, tally.buckets, q);
+        if (estimate) plot('latency', instant, group.cells, `p${q} estimated`, estimate.value, estimate.atLeast);
+      }
+    }
+    group.total.buckets.forEach((count, bucket) => distribution.push([groups.size > 1 ? `${captions[index]} ${bucketLabel(group.bounds, bucket)}` : bucketLabel(group.bounds, bucket), count]));
+  });
+  const identity = [...keys, 'bounds', MEASURE];
+  const columns = (...names: [string, string][]) => names.map(([name, data_type]) => ({ name, data_type, nullable: true }));
+  const keyed = keys.map((name) => read.columns[at(name)]).concat(columns(['bounds', 'Utf8'], [MEASURE, 'Utf8']));
+  const timed = [...columns(['at', 'Utf8']), ...keyed, ...columns(['value', 'Float64'], ['text', 'Utf8'])];
+  // A line's Latest, Max and Mean of what it plotted; a Max or Mean over a lower bound is itself only a lower bound.
+  const summary = (into: keyof typeof lines): QueryResult => ({
+    columns: [...keyed, ...columns(['latest', 'Utf8'], ['max', 'Utf8'], ['mean', 'Utf8'])],
+    rows: [...lines[into].values()].map(({ cells, values }) => {
+      if (!values.length) return [...cells, null, null, null];
+      const bound = values.some(([, atLeast]) => atLeast) ? '≥ ' : '';
+      const [latest, latestAtLeast] = values[values.length - 1];
+      const max = Math.max(...values.map(([value]) => value));
+      const mean = values.reduce((sum, [value]) => sum + value, 0) / values.length;
+      return [...cells, `${latestAtLeast ? '≥ ' : ''}${latest}`, `${bound}${max}`, `${bound}${mean}`];
+    }),
+    terminal: read.terminal
+  });
+  return {
+    identity,
+    latency: { columns: timed, rows: latency, terminal: read.terminal },
+    latencySummary: summary('latency'),
+    rate: { columns: timed, rows: rate, terminal: read.terminal },
+    rateSummary: summary('rate'),
+    distribution: { columns: columns(['bucket', 'Utf8'], ['count', 'Float64']), rows: distribution, terminal: read.terminal }
+  };
+}
+
+/** The histogram Charts of one read keyed by their typed identity, or one shared failure. */
+function histogramProps(input: MetricInput, range: AbsoluteRange, executed: Executed, read: QueryResult | Loaded<never>, keys: readonly string[]): HistogramProps {
+  const how = `${input.apart ? 'each series apart · ' : input.by?.length ? `by ${input.by.join(', ')} · ` : ''}explicit-bucket histogram`;
+  const total = 'state' in read || !read.rows.length ? 0 : numeric(read.rows[0][columnIndex(read, 'groups')]);
+  const capped = total > MAX_SERIES ? ` · the ${MAX_SERIES} that counted most of ${total} ${input.apart ? 'series' : 'groups'} plotted` : '';
+  const charts = {
+    latency: { type: 'timeseries', title: `${input.metric} · mean of recorded sums and percentiles estimated from buckets, ≥ marking a lower bound · ${how}${capped}`, sql: executed.sql, x: 'at', y: ['value'], range },
+    rate: { type: 'timeseries', title: `${input.metric} · recordings per second · ${how}${capped}`, sql: executed.sql, x: 'at', y: ['value'], range },
+    distribution: { type: 'bar', title: `${input.metric} · bucket counts over the range · ${how}${capped}`, sql: executed.sql, x: 'bucket', y: ['count'] }
+  } as const satisfies Record<keyof HistogramProps, ChartInput>;
+  if ('state' in read) {
+    const identity = [...keys, 'bounds', MEASURE];
+    return {
+      latency: { input: charts.latency, executed, result: read, identity, summary: read },
+      rate: { input: charts.rate, executed, result: read, identity, summary: read },
+      distribution: { input: charts.distribution, executed, result: read }
+    };
+  }
+  const windows = histogramWindows(read, range, keys);
+  const unit = read.rows.length ? read.rows[0][columnIndex(read, 'unit')] : undefined;
+  const reason = `No histogram counts of ${input.metric} in this range.`;
+  const loaded = (data: QueryResult): Loaded<QueryResult> => (data.rows.length ? { state: 'populated', data } : { state: 'empty', data, reason });
+  return {
+    latency: { input: { ...charts.latency, ...(unit ? { unit: String(unit) } : {}) }, executed, result: loaded(windows.latency), identity: windows.identity, summary: loaded(windows.latencySummary) },
+    rate: { input: charts.rate, executed, result: loaded(windows.rate), identity: windows.identity, summary: loaded(windows.rateSummary) },
+    distribution: { input: charts.distribution, executed, result: loaded(windows.distribution) }
+  };
+}
+
+/** The metric series index: one row per series per hour it has points in, read wherever only series matter. */
+const SERIES_TABLE = 'bifrost.metrics.series';
+
+/** Most metric names the rail lists; one more is read to tell that more match. */
+export const METRIC_NAMES = 50;
+
+/**
+ * The metrics the rail offers under the view's WHERE, read from the series
+ * index so its cost follows series, not points: name, type and unit of each,
+ * by name, at most {@link METRIC_NAMES} plus one. `search` keeps names
+ * holding it, ignoring case. The WHERE's columns are the series' own; a
+ * predicate naming a point-only column is refused by the server.
+ */
+export function metricNamesQuery(where: readonly Filter[], range: AbsoluteRange, predicate?: string, search?: string): Executed {
+  const binds = Binds.hours(range);
+  binds.where(where.filter(({ column }) => column !== 'metric_name')).predicate(predicate);
+  if (search?.trim()) binds.clauses.push(`strpos(lower(metric_name), lower(${binds.bind(search.trim())})) > 0`);
+  return {
+    sql: `SELECT metric_name, metric_type, unit FROM ${SERIES_TABLE} WHERE ${binds.sql} GROUP BY metric_name, metric_type, unit ORDER BY metric_name, metric_type, unit LIMIT ${METRIC_NAMES + 1}`,
+    params: binds.params
+  };
+}
+
+/** Load the metric rail's names; a refused predicate issues no read. */
+export async function loadMetricNames(input: { readonly where?: readonly Filter[]; readonly where_sql?: string; readonly range?: Range; readonly search?: string }, context: LoadContext): Promise<Loaded<QueryResult>> {
+  const range = rangeOf(input.range, context);
+  if ('code' in range) return { state: 'error', problem: range };
+  const predicate = await predicateFor(SIGNALS.metrics.table, input.where_sql, context);
+  if ('state' in predicate) return predicate;
+  const plan = metricNamesQuery(input.where ?? [], range, predicate.sql, input.search);
+  const [read] = await context.executor.run([query(plan.sql, plan.params, METRIC_NAMES + 1)], context.signal);
+  if (!read.ok) return failed(read.problem);
+  const reason = input.search?.trim() ? `No metric names hold “${input.search.trim()}”.` : emptyList('metrics', input.where);
+  return read.value.rows.length ? { state: 'populated', data: read.value } : { state: 'empty', data: read.value, reason };
+}
+
+/** The three overview charts of Traces and Spans, and the totals their headlines read. */
+export interface TraceOverviewProps {
+  readonly spans: ChartProps;
+  readonly errors: ChartProps;
+  readonly duration: ChartProps;
+  /** `spans, traces, error_traces, span_p95_ms, p95_ms, p50_ms` over the whole range, or the state that stopped them; `span_p95_ms` is over every span, the others over roots. */
+  readonly totals: Loaded<QueryResult>;
+}
+
+/**
+ * The trace overview reads: spans and error spans per bucket, root duration
+ * p95 and p50 per bucket, and the range totals, all under one range, WHERE
+ * and predicate. Durations read in milliseconds.
+ */
+export function traceOverviewQueries(input: { readonly where?: readonly Filter[] }, range: AbsoluteRange, bucket: string, predicate?: string) {
+  const spans = SIGNALS.spans;
+  const plan = (select: string, roots: boolean, series: boolean) => {
+    const binds = Binds.over(spans.time, range);
+    const bin = series ? `date_bin(${binds.bind(bucket)}::interval, ${spans.time})` : '';
+    binds.where(input.where).predicate(predicate);
+    if (roots) binds.roots(spans.table);
+    const sql = series
+      ? `SELECT ${bin} AS at, ${select} FROM ${spans.table} WHERE ${binds.sql} GROUP BY ${bin} ORDER BY at`
+      : `SELECT ${select} FROM ${spans.table} WHERE ${binds.sql}`;
+    return { sql, params: binds.params };
+  };
+  const p = (share: number) => `approx_percentile_cont(duration_nano, ${share}) / 1e6`;
+  return {
+    spans: plan('count(*) AS spans', false, true),
+    errors: plan(`count(*) FILTER (WHERE status_code = ${STATUS_ERROR}) AS errors`, false, true),
+    duration: plan(`${p(0.95)} AS p95, ${p(0.5)} AS p50`, true, true),
+    totals: plan(`count(*) AS spans, count(DISTINCT trace_id) AS traces, count(DISTINCT trace_id) FILTER (WHERE status_code = ${STATUS_ERROR}) AS error_traces, ${p(0.95)} AS span_p95_ms`, false, false),
+    durations: plan(`${p(0.95)} AS p95_ms, ${p(0.5)} AS p50_ms`, true, false)
+  };
+}
+
+/** Load the trace overview in one batch; one refused predicate refuses every chart with no dependent read. */
+export async function loadTraceOverview(input: { readonly where?: readonly Filter[]; readonly where_sql?: string; readonly range?: Range }, context: LoadContext): Promise<TraceOverviewProps> {
+  const charts: Record<'spans' | 'errors' | 'duration', ChartInput> = {
+    spans: { type: 'timeseries', title: 'Spans', sql: '-', x: 'at', y: ['spans'] },
+    errors: { type: 'timeseries', title: 'Errors', sql: '-', x: 'at', y: ['errors'] },
+    duration: { type: 'timeseries', title: 'Duration', sql: '-', x: 'at', y: ['p95', 'p50'], unit: 'ms' }
+  };
+  const all = (state: Loaded<never>): TraceOverviewProps => ({
+    spans: { input: charts.spans, result: state },
+    errors: { input: charts.errors, result: state },
+    duration: { input: charts.duration, result: state },
+    totals: state
+  });
+  const range = rangeOf(input.range, context);
+  if ('code' in range) return all({ state: 'error', problem: range });
+  const predicate = await predicateFor(SIGNALS.spans.table, input.where_sql, context);
+  if ('state' in predicate) return all(predicate);
+  const plans = traceOverviewQueries(input, range, bucketFor(range), predicate.sql);
+  const order = ['spans', 'errors', 'duration', 'totals', 'durations'] as const;
+  const results = await context.executor.run(order.map((name) => query(plans[name].sql, plans[name].params)), context.signal);
+  const [spans, errors, duration, totals, durations] = results;
+  const chart = (name: 'spans' | 'errors' | 'duration', read: (typeof results)[number]): ChartProps => ({
+    input: { ...charts[name], sql: plans[name].sql, range },
+    executed: plans[name],
+    result: read.ok ? shapeChart({ ...charts[name], sql: plans[name].sql, range }, read.value) : failed(read.problem)
+  });
+  const joined: Loaded<QueryResult> =
+    !totals.ok ? failed(totals.problem)
+    : !durations.ok ? failed(durations.problem)
+    : { state: 'populated', data: { ...totals.value, columns: [...totals.value.columns, ...durations.value.columns], rows: [[...totals.value.rows[0], ...durations.value.rows[0]]] } };
+  return { spans: chart('spans', spans), errors: chart('errors', errors), duration: chart('duration', duration), totals: joined };
+}
+
+/** Log levels by OTLP severity number: 17 and up error, 13 and up warn, 9 and up info, 1 and up debug (TRACE and DEBUG), else unset. */
+const LEVEL = "CASE WHEN severity_number >= 17 THEN 'error' WHEN severity_number >= 13 THEN 'warn' WHEN severity_number >= 9 THEN 'info' WHEN severity_number >= 1 THEN 'debug' ELSE 'unset' END";
+
+/** Records per bucket and level under the list's range, WHERE and predicate. */
+export function logTimelineQuery(input: { readonly where?: readonly Filter[] }, range: AbsoluteRange, bucket: string, predicate?: string): Executed {
+  const logs = SIGNALS.logs;
+  const binds = Binds.over(logs.time, range);
+  const bin = `date_bin(${binds.bind(bucket)}::interval, ${logs.time})`;
+  binds.where(input.where).predicate(predicate);
+  return {
+    sql: `SELECT ${bin} AS at, ${LEVEL} AS level, count(*) AS records FROM ${logs.table} WHERE ${binds.sql} GROUP BY ${bin}, ${LEVEL} ORDER BY at`,
+    params: binds.params
+  };
+}
+
+/** Load the Logs severity timeline; a refused predicate issues no read. */
+export async function loadLogTimeline(input: { readonly where?: readonly Filter[]; readonly where_sql?: string; readonly range?: Range }, context: LoadContext): Promise<ChartProps> {
+  const bucket = (range: AbsoluteRange) => bucketFor(range);
+  const chartInput = (sql: string, range?: AbsoluteRange): ChartInput => ({
+    type: 'timeseries',
+    title: `Records per ${range ? bucket(range) : 'bucket'}`,
+    sql,
+    x: 'at',
+    y: ['records'],
+    series: 'level',
+    ...(range ? { range } : {})
+  });
+  const range = rangeOf(input.range, context);
+  if ('code' in range) return { input: chartInput('-'), result: { state: 'error', problem: range } };
+  const predicate = await predicateFor(SIGNALS.logs.table, input.where_sql, context);
+  if ('state' in predicate) return { input: chartInput('-', range), result: predicate };
+  const plan = logTimelineQuery(input, range, bucket(range), predicate.sql);
+  const [read] = await context.executor.run([query(plan.sql, plan.params)], context.signal);
+  const chart = chartInput(plan.sql, range);
+  return { input: chart, executed: plan, result: read.ok ? shapeChart(chart, read.value) : failed(read.problem) };
+}
+
+/** How far a trace's spans may start outside its root's own start and end: clock skew between services, and work that outlives the root. */
+const TRACE_SLACK_MS = 3_600_000;
+
+/**
+ * Span and error counts of exactly these traces. `roots` is the time their
+ * root spans cover, from the earliest start to the latest end; the read keeps
+ * spans starting within it, widened by {@link TRACE_SLACK_MS} each side, so
+ * it opens only those partitions. Blooms prune an id list of more than three
+ * values no further than its min/max statistics, so the time bound carries it.
+ */
+export function countsQuery(traceIds: readonly string[], roots: { readonly from: number; readonly to: number }): Executed {
+  const binds = Binds.over(SIGNALS.spans.time, { from: new Date(roots.from - TRACE_SLACK_MS).toISOString(), to: new Date(roots.to + TRACE_SLACK_MS).toISOString() });
+  const ids = traceIds.map((id) => `decode(${binds.bind(id)}, 'hex')`).join(', ');
+  // ponytail: a span starting over an hour outside its root's start and end goes uncounted; widen the slack if traces do that.
+  return {
+    sql:
+      `SELECT encode(trace_id, 'hex') AS trace_id, count(*) AS spans, count(*) FILTER (WHERE status_code = ${STATUS_ERROR}) AS errors ` +
+      `FROM ${SIGNALS.spans.table} WHERE ${binds.sql} AND trace_id IN (${ids}) GROUP BY trace_id`,
+    params: binds.params
+  };
+}
+
+/**
+ * Load one list. Trace rows then read span and error counts for the visible
+ * traces only; a refused or failed list issues no count read, and a failed
+ * count read keeps the list with its own state.
+ */
+export async function loadRecordTable(input: RecordTableInput, context: LoadContext): Promise<RecordTableProps> {
+  let executed: Executed;
+  if ('sql' in input) {
+    const range = input.range ? resolveRange(input.range) : context.range;
+    const params = chartParams(input.sql, range);
+    if (!Array.isArray(params)) return { input, result: { state: 'error', problem: params } };
+    executed = { sql: input.sql, params };
+  } else {
+    const range = rangeOf(input.range, context);
+    if ('code' in range) return { input, result: { state: 'error', problem: range } };
+    const predicate = await predicateFor(SIGNALS[input.signal].table, input.where_sql, context);
+    if ('state' in predicate) return { input, result: predicate };
+    executed = listQuery(input, range, predicate.sql);
+  }
+  const [read] = await context.executor.run([query(executed.sql, executed.params, 'sql' in input ? (input.limit ?? 500) : undefined)], context.signal);
+  if (!read.ok) return { input, executed, result: failed(read.problem) };
+  let rows = read.value;
+  let page: Page | undefined;
+  if ('signal' in input && TIES[input.signal].length) {
+    const limit = input.limit ?? LIST_LIMIT;
+    const more = rows.rows.length > limit;
+    // The first page reached backward reads again forward, so it is full.
+    if (input.before && !more) return loadRecordTable({ ...input, before: undefined }, context);
+    const kept = rows.rows.slice(0, limit);
+    rows = { ...rows, rows: input.before ? kept.reverse() : kept };
+    const at = (row: readonly unknown[] | undefined) => (row ? cursorColumns(input.signal, input.sort).map((column) => row[columnIndex(rows, column)] as QueryParam) : undefined);
+    page = { older: more || input.before ? at(rows.rows.at(-1)) : undefined, newer: input.after || input.before ? at(rows.rows[0]) : undefined };
+  }
+  if (rows.rows.length === 0) {
+    const reason = 'sql' in input ? 'The SQL returned no rows in this range.' : emptyList(input.signal, input.where);
+    return { input, executed, result: { state: 'empty', data: { rows }, reason } };
+  }
+  if (!('signal' in input) || input.signal !== 'traces') return { input, executed, result: { state: 'populated', data: { rows, page } } };
+  context.signal?.throwIfAborted();
+  const at = shownColumns(input).length;
+  const [ti, di] = [columnIndex(rows, SIGNALS.traces.time), columnIndex(rows, 'duration_nano')];
+  const starts = rows.rows.map((row) => parseInstant(row[ti]));
+  const ends = rows.rows.map((row, index) => starts[index] + Math.ceil(numeric(row[di] ?? 0) / 1e6));
+  const counted = countsQuery([...new Set(rows.rows.map((row) => String(row[at])))], { from: Math.min(...starts), to: Math.max(...ends) });
+  const [counts] = await context.executor.run([query(counted.sql, counted.params)], context.signal);
+  const loaded: Loaded<QueryResult> = counts.ok ? { state: 'populated', data: counts.value } : failed(counts.problem);
+  return { input, executed, result: { state: 'populated', data: { rows, counts: loaded, page } } };
+}
+
+/** Every retained span of one trace; past the ceiling the read is refused, never truncated. */
+export function waterfallQuery(traceId: string): Executed {
+  return {
+    sql:
+      "SELECT encode(span_id, 'hex') AS span_id, encode(parent_span_id, 'hex') AS parent_span_id, name, service_name, " +
+      `start_time_unix_nano, duration_nano, status_code FROM ${SIGNALS.spans.table} WHERE trace_id = decode($1, 'hex') ORDER BY start_time_unix_nano, span_id`,
+    params: [traceId]
+  };
+}
+
+/** Load one exact trace. The range is navigation context and never narrows the evidence. */
+export async function loadTraceWaterfall(input: TraceWaterfallInput, context: LoadContext): Promise<TraceWaterfallProps> {
+  const plan = waterfallQuery(input.traceId);
+  const [read] = await context.executor.run([query(plan.sql, plan.params, TRACE_SPANS)], context.signal);
+  if (!read.ok) return { input, result: failed(read.problem) };
+  if (read.value.rows.length === 0)
+    return { input, result: { state: 'empty', data: read.value, reason: `No retained span you may read has trace_id ${input.traceId}.` } };
+  return { input, result: { state: 'populated', data: read.value } };
+}
+
+/** The whole stored row of one span or log record. */
+export function detailQuery(input: RecordDetailInput): Executed {
+  if ('log' in input)
+    return {
+      sql:
+        `SELECT * FROM ${SIGNALS.logs.table} WHERE time_unix_nano = $1::timestamptz AND observed_time_unix_nano = $2::timestamptz ` +
+        'AND wyrd_request_id = $3',
+      params: [input.log.time_unix_nano, input.log.observed_time_unix_nano, input.log.wyrd_request_id]
+    };
+  return {
+    sql: `SELECT * FROM ${SIGNALS.spans.table} WHERE trace_id = decode($1, 'hex') AND span_id = decode($2, 'hex')`,
+    params: [input.traceId, input.spanId]
+  };
+}
+
+/** Load one record with its payload columns; a principal who may not read the table is refused. */
+export async function loadRecordDetail(input: RecordDetailInput, context: LoadContext): Promise<RecordDetailProps> {
+  const plan = detailQuery(input);
+  const [read] = await context.executor.run([query(plan.sql, plan.params, 10)], context.signal);
+  if (!read.ok) return { input, result: failed(read.problem) };
+  if (read.value.rows.length === 0) {
+    const what = 'log' in input ? `log record written by ${input.log.wyrd_request_id}` : `span ${input.spanId} of trace ${input.traceId}`;
+    return { input, result: { state: 'empty', data: read.value, reason: `No retained ${what} you may read.` } };
+  }
+  return { input, result: { state: 'populated', data: read.value } };
+}
+
+/**
+ * An Arrow JSON nanosecond timestamp (`2026-10-20T14:05:00.123456789+00:00`)
+ * as epoch nanoseconds, exact past the millisecond a `Date` keeps.
+ * Returns `undefined` for a value that is not such a timestamp.
+ */
+export function parseNanos(value: unknown): bigint | undefined {
+  if (typeof value !== 'string') return undefined;
+  const match = /^([^.]+?)(?:\.(\d{1,9}))?([zZ]|[+-]\d\d:?\d\d)?$/.exec(value);
+  const ms = match ? Date.parse(`${match[1]}${match[3] ?? 'Z'}`) : Number.NaN;
+  if (!match || Number.isNaN(ms)) return undefined;
+  return BigInt(ms) * 1_000_000n + BigInt((match[2] ?? '').padEnd(9, '0'));
+}
+
+/** Column headings for the canonical columns; any other column is headed by its name. */
+const LABELS: Readonly<Record<string, string>> = {
+  start_time_unix_nano: 'Start',
+  time_unix_nano: 'Time',
+  observed_time_unix_nano: 'Observed',
+  name: 'Name',
+  service_name: 'Service',
+  duration_nano: 'Duration',
+  status_code: 'Status',
+  kind: 'Kind',
+  severity_text: 'Severity',
+  severity_number: 'Severity number',
+  body_text: 'Message',
+  exception_type: 'Exception',
+  metric_name: 'Metric',
+  metric_type: 'Type',
+  unit: 'Unit',
+  int_value: 'Integer value',
+  double_value: 'Double value',
+  workload_card_uid: 'Workload',
+  subject_card_uid: 'Card',
+  gen_ai_request_model: 'Model',
+  gen_ai_operation_name: 'Operation'
+};
+
+/** A column's heading; the column name itself stays available as its title for writing WHERE. */
+export function columnLabel(column: string): string {
+  return LABELS[column] ?? column;
+}
+
+/** The log level of an OTLP severity number: 17 and up error, 13 and up warn, 1 and up info, else unset. */
+export function severityLevel(number: unknown): 'error' | 'warn' | 'info' | 'unset' {
+  const n = Number(number ?? 0);
+  return n >= 17 ? 'error' : n >= 13 ? 'warn' : n >= 1 ? 'info' : 'unset';
+}
+
+/** A hex id as its first and last four characters. */
+export function shortId(id: string): string {
+  return id.length > 10 ? `${id.slice(0, 4)}…${id.slice(-4)}` : id;
+}
+
+/** OTLP span status codes by name. */
+export const STATUS_NAMES: Readonly<Record<number, string>> = { 0: 'unset', 1: 'ok', 2: 'error' };
+
+/**
+ * A row cell as text: null is `∅`, a nanosecond duration reads as time, a
+ * timestamp as month-day and time to the millisecond (the exact value is the
+ * caller's title), nested values as JSON.
+ */
+export function cellText(column: string, value: unknown): string {
+  if (value === null || value === undefined) return '∅';
+  if (column === 'duration_nano') return fmtDuration(Math.round(Number(value) / 1e6));
+  const instant = column.endsWith('_unix_nano') && typeof value === 'string' && /^\d{4}-(\d\d-\d\d)T(\d\d:\d\d:\d\d)(\.\d{1,3})?/.exec(value);
+  if (instant) return `${instant[1]} ${instant[2]}${instant[3] ?? ''}`;
+  return typeof value === 'object' ? JSON.stringify(value) : String(value);
+}
+
+/** One span placed in its trace: depth under its parent and offset from the trace start. */
+export interface WaterfallSpan {
+  readonly spanId: string;
+  readonly parentId: string | null;
+  readonly depth: number;
+  readonly name: string;
+  readonly service: string | null;
+  readonly startMs: number;
+  readonly durationMs: number;
+  readonly error: boolean;
+  readonly children: number;
+}
+
+/**
+ * Place spans depth-first in start order. A span whose parent is not
+ * retained or not readable, or whose parents form a cycle, becomes a root,
+ * so no span is dropped.
+ */
+export function spanTree(result: QueryResult): WaterfallSpan[] {
+  const at = (name: string) => columnIndex(result, name);
+  const [id, parent, name, service, start, duration, status] = [
+    'span_id', 'parent_span_id', 'name', 'service_name', 'start_time_unix_nano', 'duration_nano', 'status_code'
+  ].map(at);
+  const ids = new Set(result.rows.map((row) => String(row[id])));
+  const children = new Map<string | null, (readonly unknown[])[]>();
+  for (const row of result.rows) {
+    const key = row[parent] !== null && ids.has(String(row[parent])) ? String(row[parent]) : null;
+    children.set(key, [...(children.get(key) ?? []), row]);
+  }
+  const origin = result.rows.reduce<bigint | undefined>((min, row) => {
+    const ns = parseNanos(row[start]);
+    return ns !== undefined && (min === undefined || ns < min) ? ns : min;
+  }, undefined);
+  const placed: WaterfallSpan[] = [];
+  const seen = new Set<string>();
+  const visit = (key: string | null, depth: number, rows = children.get(key) ?? []) => {
+    for (const row of rows) {
+      const spanId = String(row[id]);
+      if (seen.has(spanId)) continue;
+      seen.add(spanId);
+      const ns = parseNanos(row[start]);
+      placed.push({
+        spanId,
+        parentId: row[parent] === null ? null : String(row[parent]),
+        depth,
+        name: String(row[name]),
+        service: row[service] === null ? null : String(row[service]),
+        startMs: ns !== undefined && origin !== undefined ? Number(ns - origin) / 1e6 : 0,
+        durationMs: Number(row[duration]) / 1e6,
+        error: Number(row[status]) === STATUS_ERROR,
+        children: children.get(spanId)?.length ?? 0
+      });
+      visit(spanId, depth + 1);
+    }
+  };
+  visit(null, 0);
+  // A parent cycle is unreachable from any root; its spans still show, as roots.
+  visit(null, 0, result.rows.filter((row) => !seen.has(String(row[id]))));
+  return placed;
+}

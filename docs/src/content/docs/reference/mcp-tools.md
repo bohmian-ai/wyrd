@@ -53,6 +53,7 @@ Tool names contain dots, which many model providers refuse, so each framework fo
 | `bifrost.list_tables` | `bifrost_table:read` | `{}` → `{tables}` | List readable tables |
 | `bifrost.describe_table` | `bifrost_table:read` | `{namespace, name}` → table description | Read one table's schema and layout |
 | `bifrost.query` | scoped `bifrost_query:read` | `{sql, deadline_ms?, max_rows?, max_bytes?}` → `{columns, rows, terminal}` | Run one bounded `SELECT` |
+| `bifrost.validate_predicate` | scoped `bifrost_query:read` | `{namespace, name, expression}` → `{expression}` | Check one `WHERE` filter over a table's columns, up to 8 KiB, and return it normalized |
 
 Gateway request and response payload columns also need `gateway_payload:read`.
 

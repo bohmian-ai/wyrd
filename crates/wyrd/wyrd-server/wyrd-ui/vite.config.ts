@@ -7,6 +7,8 @@ export default defineConfig({
   // Vitest resolves server modules; keep its optimized dependencies out of the browser cache.
   cacheDir: process.env.VITEST ? 'node_modules/.vite-vitest' : 'node_modules/.vite',
   plugins: [tailwindcss(), sveltekit(), svelteTesting()],
+  // The SDK loads its native addon at runtime; a linked checkout must not be bundled.
+  ssr: { external: ['wyrd-ai'] },
   test: {
     environment: 'jsdom',
     globals: true,

@@ -1,0 +1,1668 @@
+{
+  "catalogId": "wyrd.ui/v1",
+  "view": {
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "type": "object",
+    "properties": {
+      "version": {
+        "type": "string",
+        "const": "wyrd.view/v1"
+      },
+      "catalogId": {
+        "type": "string",
+        "const": "wyrd.ui/v1"
+      },
+      "title": {
+        "type": "string",
+        "minLength": 1
+      },
+      "range": {
+        "anyOf": [
+          {
+            "type": "object",
+            "properties": {
+              "from": {
+                "type": "string",
+                "format": "date-time",
+                "pattern": "^(?:(?:\\d\\d[2468][048]|\\d\\d[13579][26]|\\d\\d0[48]|[02468][048]00|[13579][26]00)-02-29|\\d{4}-(?:(?:0[13578]|1[02])-(?:0[1-9]|[12]\\d|3[01])|(?:0[469]|11)-(?:0[1-9]|[12]\\d|30)|(?:02)-(?:0[1-9]|1\\d|2[0-8])))T(?:(?:[01]\\d|2[0-3]):[0-5]\\d:[0-5]\\d(?:\\.\\d+)?(?:Z|([+-](?:[01]\\d|2[0-3]):[0-5]\\d)))$"
+              },
+              "to": {
+                "type": "string",
+                "format": "date-time",
+                "pattern": "^(?:(?:\\d\\d[2468][048]|\\d\\d[13579][26]|\\d\\d0[48]|[02468][048]00|[13579][26]00)-02-29|\\d{4}-(?:(?:0[13578]|1[02])-(?:0[1-9]|[12]\\d|3[01])|(?:0[469]|11)-(?:0[1-9]|[12]\\d|30)|(?:02)-(?:0[1-9]|1\\d|2[0-8])))T(?:(?:[01]\\d|2[0-3]):[0-5]\\d:[0-5]\\d(?:\\.\\d+)?(?:Z|([+-](?:[01]\\d|2[0-3]):[0-5]\\d)))$"
+              }
+            },
+            "required": [
+              "from",
+              "to"
+            ],
+            "additionalProperties": false
+          },
+          {
+            "type": "object",
+            "properties": {
+              "last": {
+                "type": "string",
+                "pattern": "^[1-9]\\d{0,4}[mhd]$"
+              }
+            },
+            "required": [
+              "last"
+            ],
+            "additionalProperties": false
+          }
+        ]
+      },
+      "panels": {
+        "minItems": 1,
+        "maxItems": 24,
+        "type": "array",
+        "items": {
+          "type": "object",
+          "properties": {
+            "id": {
+              "type": "string",
+              "minLength": 1
+            },
+            "component": {
+              "type": "string",
+              "minLength": 1
+            },
+            "input": {},
+            "layout": {
+              "type": "object",
+              "properties": {
+                "x": {
+                  "type": "integer",
+                  "minimum": 0,
+                  "maximum": 11
+                },
+                "y": {
+                  "type": "integer",
+                  "minimum": 0,
+                  "maximum": 9007199254740991
+                },
+                "w": {
+                  "type": "integer",
+                  "minimum": 1,
+                  "maximum": 12
+                },
+                "h": {
+                  "type": "integer",
+                  "minimum": 1,
+                  "maximum": 48
+                }
+              },
+              "required": [
+                "x",
+                "y",
+                "w",
+                "h"
+              ],
+              "additionalProperties": false
+            }
+          },
+          "required": [
+            "id",
+            "component",
+            "input"
+          ],
+          "additionalProperties": false
+        }
+      }
+    },
+    "required": [
+      "version",
+      "catalogId",
+      "range",
+      "panels"
+    ],
+    "additionalProperties": false
+  },
+  "components": {
+    "Chart": {
+      "description": "One chart over read-only SQL: timeseries, bar, stat, or table, with title, source caption, Open in Query, and in-chart errors. $1/$2 bind the range as RFC 3339 strings and $3 the bucket.",
+      "input": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "oneOf": [
+          {
+            "type": "object",
+            "properties": {
+              "type": {
+                "type": "string",
+                "const": "timeseries"
+              },
+              "title": {
+                "type": "string",
+                "minLength": 1
+              },
+              "sql": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 65536
+              },
+              "unit": {
+                "type": "string",
+                "minLength": 1
+              },
+              "range": {
+                "anyOf": [
+                  {
+                    "type": "object",
+                    "properties": {
+                      "from": {
+                        "type": "string",
+                        "format": "date-time",
+                        "pattern": "^(?:(?:\\d\\d[2468][048]|\\d\\d[13579][26]|\\d\\d0[48]|[02468][048]00|[13579][26]00)-02-29|\\d{4}-(?:(?:0[13578]|1[02])-(?:0[1-9]|[12]\\d|3[01])|(?:0[469]|11)-(?:0[1-9]|[12]\\d|30)|(?:02)-(?:0[1-9]|1\\d|2[0-8])))T(?:(?:[01]\\d|2[0-3]):[0-5]\\d:[0-5]\\d(?:\\.\\d+)?(?:Z|([+-](?:[01]\\d|2[0-3]):[0-5]\\d)))$"
+                      },
+                      "to": {
+                        "type": "string",
+                        "format": "date-time",
+                        "pattern": "^(?:(?:\\d\\d[2468][048]|\\d\\d[13579][26]|\\d\\d0[48]|[02468][048]00|[13579][26]00)-02-29|\\d{4}-(?:(?:0[13578]|1[02])-(?:0[1-9]|[12]\\d|3[01])|(?:0[469]|11)-(?:0[1-9]|[12]\\d|30)|(?:02)-(?:0[1-9]|1\\d|2[0-8])))T(?:(?:[01]\\d|2[0-3]):[0-5]\\d:[0-5]\\d(?:\\.\\d+)?(?:Z|([+-](?:[01]\\d|2[0-3]):[0-5]\\d)))$"
+                      }
+                    },
+                    "required": [
+                      "from",
+                      "to"
+                    ],
+                    "additionalProperties": false
+                  },
+                  {
+                    "type": "object",
+                    "properties": {
+                      "last": {
+                        "type": "string",
+                        "pattern": "^[1-9]\\d{0,4}[mhd]$"
+                      }
+                    },
+                    "required": [
+                      "last"
+                    ],
+                    "additionalProperties": false
+                  }
+                ]
+              },
+              "x": {
+                "type": "string",
+                "minLength": 1
+              },
+              "y": {
+                "minItems": 1,
+                "type": "array",
+                "items": {
+                  "type": "string",
+                  "minLength": 1
+                }
+              },
+              "series": {
+                "type": "string",
+                "minLength": 1
+              }
+            },
+            "required": [
+              "type",
+              "sql",
+              "x",
+              "y"
+            ],
+            "additionalProperties": false
+          },
+          {
+            "type": "object",
+            "properties": {
+              "type": {
+                "type": "string",
+                "const": "bar"
+              },
+              "title": {
+                "type": "string",
+                "minLength": 1
+              },
+              "sql": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 65536
+              },
+              "unit": {
+                "type": "string",
+                "minLength": 1
+              },
+              "range": {
+                "anyOf": [
+                  {
+                    "type": "object",
+                    "properties": {
+                      "from": {
+                        "type": "string",
+                        "format": "date-time",
+                        "pattern": "^(?:(?:\\d\\d[2468][048]|\\d\\d[13579][26]|\\d\\d0[48]|[02468][048]00|[13579][26]00)-02-29|\\d{4}-(?:(?:0[13578]|1[02])-(?:0[1-9]|[12]\\d|3[01])|(?:0[469]|11)-(?:0[1-9]|[12]\\d|30)|(?:02)-(?:0[1-9]|1\\d|2[0-8])))T(?:(?:[01]\\d|2[0-3]):[0-5]\\d:[0-5]\\d(?:\\.\\d+)?(?:Z|([+-](?:[01]\\d|2[0-3]):[0-5]\\d)))$"
+                      },
+                      "to": {
+                        "type": "string",
+                        "format": "date-time",
+                        "pattern": "^(?:(?:\\d\\d[2468][048]|\\d\\d[13579][26]|\\d\\d0[48]|[02468][048]00|[13579][26]00)-02-29|\\d{4}-(?:(?:0[13578]|1[02])-(?:0[1-9]|[12]\\d|3[01])|(?:0[469]|11)-(?:0[1-9]|[12]\\d|30)|(?:02)-(?:0[1-9]|1\\d|2[0-8])))T(?:(?:[01]\\d|2[0-3]):[0-5]\\d:[0-5]\\d(?:\\.\\d+)?(?:Z|([+-](?:[01]\\d|2[0-3]):[0-5]\\d)))$"
+                      }
+                    },
+                    "required": [
+                      "from",
+                      "to"
+                    ],
+                    "additionalProperties": false
+                  },
+                  {
+                    "type": "object",
+                    "properties": {
+                      "last": {
+                        "type": "string",
+                        "pattern": "^[1-9]\\d{0,4}[mhd]$"
+                      }
+                    },
+                    "required": [
+                      "last"
+                    ],
+                    "additionalProperties": false
+                  }
+                ]
+              },
+              "x": {
+                "type": "string",
+                "minLength": 1
+              },
+              "y": {
+                "minItems": 1,
+                "type": "array",
+                "items": {
+                  "type": "string",
+                  "minLength": 1
+                }
+              }
+            },
+            "required": [
+              "type",
+              "sql",
+              "x",
+              "y"
+            ],
+            "additionalProperties": false
+          },
+          {
+            "type": "object",
+            "properties": {
+              "type": {
+                "type": "string",
+                "const": "stat"
+              },
+              "title": {
+                "type": "string",
+                "minLength": 1
+              },
+              "sql": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 65536
+              },
+              "unit": {
+                "type": "string",
+                "minLength": 1
+              },
+              "range": {
+                "anyOf": [
+                  {
+                    "type": "object",
+                    "properties": {
+                      "from": {
+                        "type": "string",
+                        "format": "date-time",
+                        "pattern": "^(?:(?:\\d\\d[2468][048]|\\d\\d[13579][26]|\\d\\d0[48]|[02468][048]00|[13579][26]00)-02-29|\\d{4}-(?:(?:0[13578]|1[02])-(?:0[1-9]|[12]\\d|3[01])|(?:0[469]|11)-(?:0[1-9]|[12]\\d|30)|(?:02)-(?:0[1-9]|1\\d|2[0-8])))T(?:(?:[01]\\d|2[0-3]):[0-5]\\d:[0-5]\\d(?:\\.\\d+)?(?:Z|([+-](?:[01]\\d|2[0-3]):[0-5]\\d)))$"
+                      },
+                      "to": {
+                        "type": "string",
+                        "format": "date-time",
+                        "pattern": "^(?:(?:\\d\\d[2468][048]|\\d\\d[13579][26]|\\d\\d0[48]|[02468][048]00|[13579][26]00)-02-29|\\d{4}-(?:(?:0[13578]|1[02])-(?:0[1-9]|[12]\\d|3[01])|(?:0[469]|11)-(?:0[1-9]|[12]\\d|30)|(?:02)-(?:0[1-9]|1\\d|2[0-8])))T(?:(?:[01]\\d|2[0-3]):[0-5]\\d:[0-5]\\d(?:\\.\\d+)?(?:Z|([+-](?:[01]\\d|2[0-3]):[0-5]\\d)))$"
+                      }
+                    },
+                    "required": [
+                      "from",
+                      "to"
+                    ],
+                    "additionalProperties": false
+                  },
+                  {
+                    "type": "object",
+                    "properties": {
+                      "last": {
+                        "type": "string",
+                        "pattern": "^[1-9]\\d{0,4}[mhd]$"
+                      }
+                    },
+                    "required": [
+                      "last"
+                    ],
+                    "additionalProperties": false
+                  }
+                ]
+              },
+              "y": {
+                "minItems": 1,
+                "maxItems": 1,
+                "type": "array",
+                "items": {
+                  "type": "string",
+                  "minLength": 1
+                }
+              }
+            },
+            "required": [
+              "type",
+              "sql"
+            ],
+            "additionalProperties": false
+          },
+          {
+            "type": "object",
+            "properties": {
+              "type": {
+                "type": "string",
+                "const": "table"
+              },
+              "title": {
+                "type": "string",
+                "minLength": 1
+              },
+              "sql": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 65536
+              },
+              "unit": {
+                "type": "string",
+                "minLength": 1
+              },
+              "range": {
+                "anyOf": [
+                  {
+                    "type": "object",
+                    "properties": {
+                      "from": {
+                        "type": "string",
+                        "format": "date-time",
+                        "pattern": "^(?:(?:\\d\\d[2468][048]|\\d\\d[13579][26]|\\d\\d0[48]|[02468][048]00|[13579][26]00)-02-29|\\d{4}-(?:(?:0[13578]|1[02])-(?:0[1-9]|[12]\\d|3[01])|(?:0[469]|11)-(?:0[1-9]|[12]\\d|30)|(?:02)-(?:0[1-9]|1\\d|2[0-8])))T(?:(?:[01]\\d|2[0-3]):[0-5]\\d:[0-5]\\d(?:\\.\\d+)?(?:Z|([+-](?:[01]\\d|2[0-3]):[0-5]\\d)))$"
+                      },
+                      "to": {
+                        "type": "string",
+                        "format": "date-time",
+                        "pattern": "^(?:(?:\\d\\d[2468][048]|\\d\\d[13579][26]|\\d\\d0[48]|[02468][048]00|[13579][26]00)-02-29|\\d{4}-(?:(?:0[13578]|1[02])-(?:0[1-9]|[12]\\d|3[01])|(?:0[469]|11)-(?:0[1-9]|[12]\\d|30)|(?:02)-(?:0[1-9]|1\\d|2[0-8])))T(?:(?:[01]\\d|2[0-3]):[0-5]\\d:[0-5]\\d(?:\\.\\d+)?(?:Z|([+-](?:[01]\\d|2[0-3]):[0-5]\\d)))$"
+                      }
+                    },
+                    "required": [
+                      "from",
+                      "to"
+                    ],
+                    "additionalProperties": false
+                  },
+                  {
+                    "type": "object",
+                    "properties": {
+                      "last": {
+                        "type": "string",
+                        "pattern": "^[1-9]\\d{0,4}[mhd]$"
+                      }
+                    },
+                    "required": [
+                      "last"
+                    ],
+                    "additionalProperties": false
+                  }
+                ]
+              }
+            },
+            "required": [
+              "type",
+              "sql"
+            ],
+            "additionalProperties": false
+          }
+        ]
+      },
+      "states": [
+        "populated",
+        "empty",
+        "denied",
+        "error",
+        "loading"
+      ],
+      "emits": [
+        {
+          "name": "chart.range",
+          "description": "A time-series brush selected this absolute range for the whole view.",
+          "input": {
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "type": "object",
+            "properties": {
+              "from": {
+                "type": "string",
+                "format": "date-time",
+                "pattern": "^(?:(?:\\d\\d[2468][048]|\\d\\d[13579][26]|\\d\\d0[48]|[02468][048]00|[13579][26]00)-02-29|\\d{4}-(?:(?:0[13578]|1[02])-(?:0[1-9]|[12]\\d|3[01])|(?:0[469]|11)-(?:0[1-9]|[12]\\d|30)|(?:02)-(?:0[1-9]|1\\d|2[0-8])))T(?:(?:[01]\\d|2[0-3]):[0-5]\\d:[0-5]\\d(?:\\.\\d+)?(?:Z|([+-](?:[01]\\d|2[0-3]):[0-5]\\d)))$"
+              },
+              "to": {
+                "type": "string",
+                "format": "date-time",
+                "pattern": "^(?:(?:\\d\\d[2468][048]|\\d\\d[13579][26]|\\d\\d0[48]|[02468][048]00|[13579][26]00)-02-29|\\d{4}-(?:(?:0[13578]|1[02])-(?:0[1-9]|[12]\\d|3[01])|(?:0[469]|11)-(?:0[1-9]|[12]\\d|30)|(?:02)-(?:0[1-9]|1\\d|2[0-8])))T(?:(?:[01]\\d|2[0-3]):[0-5]\\d:[0-5]\\d(?:\\.\\d+)?(?:Z|([+-](?:[01]\\d|2[0-3]):[0-5]\\d)))$"
+              }
+            },
+            "required": [
+              "from",
+              "to"
+            ],
+            "additionalProperties": false
+          },
+          "completion": "view-range"
+        },
+        {
+          "name": "chart.open_in_query",
+          "description": "Open the exact executed SQL and its typed binds in Query.",
+          "input": {
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "type": "object",
+            "properties": {
+              "sql": {
+                "type": "string",
+                "minLength": 1
+              },
+              "params": {
+                "type": "array",
+                "items": {
+                  "type": [
+                    "null",
+                    "boolean",
+                    "number",
+                    "string"
+                  ]
+                }
+              }
+            },
+            "required": [
+              "sql",
+              "params"
+            ],
+            "additionalProperties": false
+          },
+          "completion": "host-navigation"
+        }
+      ]
+    },
+    "CardHeader": {
+      "description": "An exact Card version: name, kind, version select, status, uid copy, tabs, and the primary action.",
+      "input": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "type": "object",
+        "properties": {
+          "cardRef": {
+            "type": "object",
+            "properties": {
+              "kind": {
+                "type": "string",
+                "enum": [
+                  "Data",
+                  "Model",
+                  "Experiment",
+                  "Prompt",
+                  "Agent",
+                  "Verifier",
+                  "Service",
+                  "Policy",
+                  "Mcp",
+                  "Audit",
+                  "Artifact",
+                  "Trigger",
+                  "Operator",
+                  "Source"
+                ]
+              },
+              "name": {
+                "type": "string",
+                "minLength": 1
+              },
+              "version": {
+                "type": "string",
+                "pattern": "^\\d+\\.\\d+\\.\\d+(?:-[0-9A-Za-z.-]+)?(?:\\+[0-9A-Za-z.-]+)?$"
+              },
+              "uid": {
+                "anyOf": [
+                  {
+                    "type": "string",
+                    "minLength": 1
+                  },
+                  {
+                    "type": "null"
+                  }
+                ]
+              }
+            },
+            "required": [
+              "kind",
+              "name",
+              "version"
+            ],
+            "additionalProperties": false
+          },
+          "tabs": {
+            "maxItems": 12,
+            "type": "array",
+            "items": {
+              "type": "object",
+              "properties": {
+                "id": {
+                  "type": "string",
+                  "minLength": 1
+                },
+                "label": {
+                  "type": "string",
+                  "minLength": 1
+                }
+              },
+              "required": [
+                "id",
+                "label"
+              ],
+              "additionalProperties": false
+            }
+          },
+          "tab": {
+            "type": "string",
+            "minLength": 1
+          }
+        },
+        "required": [
+          "cardRef"
+        ],
+        "additionalProperties": false
+      },
+      "states": [
+        "populated",
+        "denied",
+        "error",
+        "loading"
+      ],
+      "emits": [
+        {
+          "name": "card.version",
+          "description": "Show another exact version of this Card.",
+          "input": {
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "type": "object",
+            "properties": {
+              "card_ref": {
+                "type": "object",
+                "properties": {
+                  "kind": {
+                    "type": "string",
+                    "enum": [
+                      "Data",
+                      "Model",
+                      "Experiment",
+                      "Prompt",
+                      "Agent",
+                      "Verifier",
+                      "Service",
+                      "Policy",
+                      "Mcp",
+                      "Audit",
+                      "Artifact",
+                      "Trigger",
+                      "Operator",
+                      "Source"
+                    ]
+                  },
+                  "name": {
+                    "type": "string",
+                    "minLength": 1
+                  },
+                  "version": {
+                    "type": "string",
+                    "pattern": "^\\d+\\.\\d+\\.\\d+(?:-[0-9A-Za-z.-]+)?(?:\\+[0-9A-Za-z.-]+)?$"
+                  },
+                  "uid": {
+                    "anyOf": [
+                      {
+                        "type": "string",
+                        "minLength": 1
+                      },
+                      {
+                        "type": "null"
+                      }
+                    ]
+                  }
+                },
+                "required": [
+                  "kind",
+                  "name",
+                  "version"
+                ],
+                "additionalProperties": false
+              }
+            },
+            "required": [
+              "card_ref"
+            ],
+            "additionalProperties": false
+          },
+          "completion": "host-navigation"
+        },
+        {
+          "name": "card.tab",
+          "description": "Show one of the host-supplied tabs.",
+          "input": {
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "type": "object",
+            "properties": {
+              "tab": {
+                "type": "string",
+                "minLength": 1
+              }
+            },
+            "required": [
+              "tab"
+            ],
+            "additionalProperties": false
+          },
+          "completion": "host-navigation"
+        },
+        {
+          "name": "card.open_in_observe",
+          "description": "Open this Card's telemetry in Observe.",
+          "input": {
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "type": "object",
+            "properties": {
+              "card_ref": {
+                "type": "object",
+                "properties": {
+                  "kind": {
+                    "type": "string",
+                    "enum": [
+                      "Data",
+                      "Model",
+                      "Experiment",
+                      "Prompt",
+                      "Agent",
+                      "Verifier",
+                      "Service",
+                      "Policy",
+                      "Mcp",
+                      "Audit",
+                      "Artifact",
+                      "Trigger",
+                      "Operator",
+                      "Source"
+                    ]
+                  },
+                  "name": {
+                    "type": "string",
+                    "minLength": 1
+                  },
+                  "version": {
+                    "type": "string",
+                    "pattern": "^\\d+\\.\\d+\\.\\d+(?:-[0-9A-Za-z.-]+)?(?:\\+[0-9A-Za-z.-]+)?$"
+                  },
+                  "uid": {
+                    "anyOf": [
+                      {
+                        "type": "string",
+                        "minLength": 1
+                      },
+                      {
+                        "type": "null"
+                      }
+                    ]
+                  }
+                },
+                "required": [
+                  "kind",
+                  "name",
+                  "version"
+                ],
+                "additionalProperties": false
+              }
+            },
+            "required": [
+              "card_ref"
+            ],
+            "additionalProperties": false
+          },
+          "completion": "host-navigation"
+        }
+      ]
+    },
+    "StatStrip": {
+      "description": "One to five recorded numbers with a sparkline each, from built-in reads of bifrost.traces.spans, bifrost.logs.records and bifrost.gateway.calls, optionally scoped to one workload_card_uid or subject_card_uid.",
+      "input": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "type": "object",
+        "properties": {
+          "stats": {
+            "minItems": 1,
+            "maxItems": 5,
+            "type": "array",
+            "items": {
+              "type": "string",
+              "enum": [
+                "traces",
+                "spans",
+                "errors",
+                "duration_p95",
+                "invocations",
+                "logs",
+                "log_errors",
+                "tokens",
+                "calls",
+                "cost"
+              ]
+            }
+          },
+          "scope": {
+            "type": "object",
+            "properties": {
+              "column": {
+                "type": "string",
+                "enum": [
+                  "workload_card_uid",
+                  "subject_card_uid"
+                ]
+              },
+              "uid": {
+                "type": "string",
+                "minLength": 1
+              }
+            },
+            "required": [
+              "column",
+              "uid"
+            ],
+            "additionalProperties": false
+          },
+          "where": {
+            "maxItems": 32,
+            "type": "array",
+            "items": {
+              "type": "object",
+              "properties": {
+                "column": {
+                  "type": "string",
+                  "minLength": 1
+                },
+                "value": {
+                  "type": [
+                    "null",
+                    "boolean",
+                    "number",
+                    "string"
+                  ]
+                },
+                "not": {
+                  "type": "boolean"
+                }
+              },
+              "required": [
+                "column",
+                "value"
+              ],
+              "additionalProperties": false
+            }
+          },
+          "where_sql": {
+            "type": "string",
+            "maxLength": 8192
+          },
+          "range": {
+            "anyOf": [
+              {
+                "type": "object",
+                "properties": {
+                  "from": {
+                    "type": "string",
+                    "format": "date-time",
+                    "pattern": "^(?:(?:\\d\\d[2468][048]|\\d\\d[13579][26]|\\d\\d0[48]|[02468][048]00|[13579][26]00)-02-29|\\d{4}-(?:(?:0[13578]|1[02])-(?:0[1-9]|[12]\\d|3[01])|(?:0[469]|11)-(?:0[1-9]|[12]\\d|30)|(?:02)-(?:0[1-9]|1\\d|2[0-8])))T(?:(?:[01]\\d|2[0-3]):[0-5]\\d:[0-5]\\d(?:\\.\\d+)?(?:Z|([+-](?:[01]\\d|2[0-3]):[0-5]\\d)))$"
+                  },
+                  "to": {
+                    "type": "string",
+                    "format": "date-time",
+                    "pattern": "^(?:(?:\\d\\d[2468][048]|\\d\\d[13579][26]|\\d\\d0[48]|[02468][048]00|[13579][26]00)-02-29|\\d{4}-(?:(?:0[13578]|1[02])-(?:0[1-9]|[12]\\d|3[01])|(?:0[469]|11)-(?:0[1-9]|[12]\\d|30)|(?:02)-(?:0[1-9]|1\\d|2[0-8])))T(?:(?:[01]\\d|2[0-3]):[0-5]\\d:[0-5]\\d(?:\\.\\d+)?(?:Z|([+-](?:[01]\\d|2[0-3]):[0-5]\\d)))$"
+                  }
+                },
+                "required": [
+                  "from",
+                  "to"
+                ],
+                "additionalProperties": false
+              },
+              {
+                "type": "object",
+                "properties": {
+                  "last": {
+                    "type": "string",
+                    "pattern": "^[1-9]\\d{0,4}[mhd]$"
+                  }
+                },
+                "required": [
+                  "last"
+                ],
+                "additionalProperties": false
+              }
+            ]
+          }
+        },
+        "required": [
+          "stats"
+        ],
+        "additionalProperties": false
+      },
+      "states": [
+        "populated",
+        "empty",
+        "denied",
+        "error",
+        "loading"
+      ],
+      "emits": []
+    },
+    "FacetRail": {
+      "description": "Value counts of a signal's columns under the list's own WHERE and range; a value asks the host to filter by it.",
+      "input": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "type": "object",
+        "properties": {
+          "signal": {
+            "type": "string",
+            "enum": [
+              "traces",
+              "spans",
+              "logs",
+              "metrics"
+            ]
+          },
+          "where": {
+            "maxItems": 32,
+            "type": "array",
+            "items": {
+              "type": "object",
+              "properties": {
+                "column": {
+                  "type": "string",
+                  "minLength": 1
+                },
+                "value": {
+                  "type": [
+                    "null",
+                    "boolean",
+                    "number",
+                    "string"
+                  ]
+                },
+                "not": {
+                  "type": "boolean"
+                }
+              },
+              "required": [
+                "column",
+                "value"
+              ],
+              "additionalProperties": false
+            }
+          },
+          "where_sql": {
+            "type": "string",
+            "maxLength": 8192
+          },
+          "facets": {
+            "minItems": 1,
+            "maxItems": 12,
+            "type": "array",
+            "items": {
+              "type": "string",
+              "minLength": 1
+            }
+          },
+          "range": {
+            "anyOf": [
+              {
+                "type": "object",
+                "properties": {
+                  "from": {
+                    "type": "string",
+                    "format": "date-time",
+                    "pattern": "^(?:(?:\\d\\d[2468][048]|\\d\\d[13579][26]|\\d\\d0[48]|[02468][048]00|[13579][26]00)-02-29|\\d{4}-(?:(?:0[13578]|1[02])-(?:0[1-9]|[12]\\d|3[01])|(?:0[469]|11)-(?:0[1-9]|[12]\\d|30)|(?:02)-(?:0[1-9]|1\\d|2[0-8])))T(?:(?:[01]\\d|2[0-3]):[0-5]\\d:[0-5]\\d(?:\\.\\d+)?(?:Z|([+-](?:[01]\\d|2[0-3]):[0-5]\\d)))$"
+                  },
+                  "to": {
+                    "type": "string",
+                    "format": "date-time",
+                    "pattern": "^(?:(?:\\d\\d[2468][048]|\\d\\d[13579][26]|\\d\\d0[48]|[02468][048]00|[13579][26]00)-02-29|\\d{4}-(?:(?:0[13578]|1[02])-(?:0[1-9]|[12]\\d|3[01])|(?:0[469]|11)-(?:0[1-9]|[12]\\d|30)|(?:02)-(?:0[1-9]|1\\d|2[0-8])))T(?:(?:[01]\\d|2[0-3]):[0-5]\\d:[0-5]\\d(?:\\.\\d+)?(?:Z|([+-](?:[01]\\d|2[0-3]):[0-5]\\d)))$"
+                  }
+                },
+                "required": [
+                  "from",
+                  "to"
+                ],
+                "additionalProperties": false
+              },
+              {
+                "type": "object",
+                "properties": {
+                  "last": {
+                    "type": "string",
+                    "pattern": "^[1-9]\\d{0,4}[mhd]$"
+                  }
+                },
+                "required": [
+                  "last"
+                ],
+                "additionalProperties": false
+              }
+            ]
+          }
+        },
+        "required": [
+          "signal",
+          "facets"
+        ],
+        "additionalProperties": false
+      },
+      "states": [
+        "populated",
+        "empty",
+        "denied",
+        "error",
+        "loading"
+      ],
+      "emits": [
+        {
+          "name": "facet.filter",
+          "description": "Add this column and value to the WHERE clause; a null value means unset.",
+          "input": {
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "type": "object",
+            "properties": {
+              "signal": {
+                "type": "string",
+                "enum": [
+                  "traces",
+                  "spans",
+                  "logs",
+                  "metrics"
+                ]
+              },
+              "column": {
+                "type": "string",
+                "minLength": 1
+              },
+              "value": {
+                "type": [
+                  "null",
+                  "boolean",
+                  "number",
+                  "string"
+                ]
+              },
+              "not": {
+                "type": "boolean"
+              }
+            },
+            "required": [
+              "signal",
+              "column",
+              "value"
+            ],
+            "additionalProperties": false
+          },
+          "completion": "host-navigation"
+        }
+      ]
+    },
+    "RecordTable": {
+      "description": "Typed rows of one signal (traces as root spans with span and error counts, spans, logs or metric points) or of authored SQL, newest first or sorted by a column, paged by keyset cursor, with optional grouping and live mode that pauses while inspected.",
+      "input": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "anyOf": [
+          {
+            "type": "object",
+            "properties": {
+              "signal": {
+                "type": "string",
+                "enum": [
+                  "traces",
+                  "spans",
+                  "logs",
+                  "metrics"
+                ]
+              },
+              "where": {
+                "maxItems": 32,
+                "type": "array",
+                "items": {
+                  "type": "object",
+                  "properties": {
+                    "column": {
+                      "type": "string",
+                      "minLength": 1
+                    },
+                    "value": {
+                      "type": [
+                        "null",
+                        "boolean",
+                        "number",
+                        "string"
+                      ]
+                    },
+                    "not": {
+                      "type": "boolean"
+                    }
+                  },
+                  "required": [
+                    "column",
+                    "value"
+                  ],
+                  "additionalProperties": false
+                }
+              },
+              "where_sql": {
+                "type": "string",
+                "maxLength": 8192
+              },
+              "columns": {
+                "minItems": 1,
+                "maxItems": 24,
+                "type": "array",
+                "items": {
+                  "type": "string",
+                  "minLength": 1
+                }
+              },
+              "sort": {
+                "type": "object",
+                "properties": {
+                  "column": {
+                    "type": "string",
+                    "minLength": 1
+                  },
+                  "desc": {
+                    "type": "boolean"
+                  }
+                },
+                "required": [
+                  "column",
+                  "desc"
+                ],
+                "additionalProperties": false
+              },
+              "after": {
+                "minItems": 1,
+                "maxItems": 8,
+                "type": "array",
+                "items": {
+                  "type": [
+                    "null",
+                    "boolean",
+                    "number",
+                    "string"
+                  ]
+                }
+              },
+              "before": {
+                "minItems": 1,
+                "maxItems": 8,
+                "type": "array",
+                "items": {
+                  "type": [
+                    "null",
+                    "boolean",
+                    "number",
+                    "string"
+                  ]
+                }
+              },
+              "range": {
+                "anyOf": [
+                  {
+                    "type": "object",
+                    "properties": {
+                      "from": {
+                        "type": "string",
+                        "format": "date-time",
+                        "pattern": "^(?:(?:\\d\\d[2468][048]|\\d\\d[13579][26]|\\d\\d0[48]|[02468][048]00|[13579][26]00)-02-29|\\d{4}-(?:(?:0[13578]|1[02])-(?:0[1-9]|[12]\\d|3[01])|(?:0[469]|11)-(?:0[1-9]|[12]\\d|30)|(?:02)-(?:0[1-9]|1\\d|2[0-8])))T(?:(?:[01]\\d|2[0-3]):[0-5]\\d:[0-5]\\d(?:\\.\\d+)?(?:Z|([+-](?:[01]\\d|2[0-3]):[0-5]\\d)))$"
+                      },
+                      "to": {
+                        "type": "string",
+                        "format": "date-time",
+                        "pattern": "^(?:(?:\\d\\d[2468][048]|\\d\\d[13579][26]|\\d\\d0[48]|[02468][048]00|[13579][26]00)-02-29|\\d{4}-(?:(?:0[13578]|1[02])-(?:0[1-9]|[12]\\d|3[01])|(?:0[469]|11)-(?:0[1-9]|[12]\\d|30)|(?:02)-(?:0[1-9]|1\\d|2[0-8])))T(?:(?:[01]\\d|2[0-3]):[0-5]\\d:[0-5]\\d(?:\\.\\d+)?(?:Z|([+-](?:[01]\\d|2[0-3]):[0-5]\\d)))$"
+                      }
+                    },
+                    "required": [
+                      "from",
+                      "to"
+                    ],
+                    "additionalProperties": false
+                  },
+                  {
+                    "type": "object",
+                    "properties": {
+                      "last": {
+                        "type": "string",
+                        "pattern": "^[1-9]\\d{0,4}[mhd]$"
+                      }
+                    },
+                    "required": [
+                      "last"
+                    ],
+                    "additionalProperties": false
+                  }
+                ]
+              },
+              "groupBy": {
+                "type": "string",
+                "minLength": 1
+              },
+              "live": {
+                "type": "boolean"
+              },
+              "limit": {
+                "type": "integer",
+                "minimum": 1,
+                "maximum": 500
+              }
+            },
+            "required": [
+              "signal"
+            ],
+            "additionalProperties": false
+          },
+          {
+            "type": "object",
+            "properties": {
+              "sql": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 65536
+              },
+              "range": {
+                "anyOf": [
+                  {
+                    "type": "object",
+                    "properties": {
+                      "from": {
+                        "type": "string",
+                        "format": "date-time",
+                        "pattern": "^(?:(?:\\d\\d[2468][048]|\\d\\d[13579][26]|\\d\\d0[48]|[02468][048]00|[13579][26]00)-02-29|\\d{4}-(?:(?:0[13578]|1[02])-(?:0[1-9]|[12]\\d|3[01])|(?:0[469]|11)-(?:0[1-9]|[12]\\d|30)|(?:02)-(?:0[1-9]|1\\d|2[0-8])))T(?:(?:[01]\\d|2[0-3]):[0-5]\\d:[0-5]\\d(?:\\.\\d+)?(?:Z|([+-](?:[01]\\d|2[0-3]):[0-5]\\d)))$"
+                      },
+                      "to": {
+                        "type": "string",
+                        "format": "date-time",
+                        "pattern": "^(?:(?:\\d\\d[2468][048]|\\d\\d[13579][26]|\\d\\d0[48]|[02468][048]00|[13579][26]00)-02-29|\\d{4}-(?:(?:0[13578]|1[02])-(?:0[1-9]|[12]\\d|3[01])|(?:0[469]|11)-(?:0[1-9]|[12]\\d|30)|(?:02)-(?:0[1-9]|1\\d|2[0-8])))T(?:(?:[01]\\d|2[0-3]):[0-5]\\d:[0-5]\\d(?:\\.\\d+)?(?:Z|([+-](?:[01]\\d|2[0-3]):[0-5]\\d)))$"
+                      }
+                    },
+                    "required": [
+                      "from",
+                      "to"
+                    ],
+                    "additionalProperties": false
+                  },
+                  {
+                    "type": "object",
+                    "properties": {
+                      "last": {
+                        "type": "string",
+                        "pattern": "^[1-9]\\d{0,4}[mhd]$"
+                      }
+                    },
+                    "required": [
+                      "last"
+                    ],
+                    "additionalProperties": false
+                  }
+                ]
+              },
+              "groupBy": {
+                "type": "string",
+                "minLength": 1
+              },
+              "live": {
+                "type": "boolean"
+              },
+              "limit": {
+                "type": "integer",
+                "minimum": 1,
+                "maximum": 500
+              }
+            },
+            "required": [
+              "sql"
+            ],
+            "additionalProperties": false
+          }
+        ]
+      },
+      "states": [
+        "populated",
+        "empty",
+        "denied",
+        "error",
+        "loading",
+        "live"
+      ],
+      "emits": [
+        {
+          "name": "record.open",
+          "description": "Open one trace or span, or one log record by its exact identity.",
+          "input": {
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "anyOf": [
+              {
+                "type": "object",
+                "properties": {
+                  "trace_id": {
+                    "type": "string",
+                    "pattern": "^[0-9a-f]{32}$"
+                  },
+                  "span_id": {
+                    "type": "string",
+                    "pattern": "^[0-9a-f]{16}$"
+                  }
+                },
+                "required": [
+                  "trace_id"
+                ],
+                "additionalProperties": false
+              },
+              {
+                "type": "object",
+                "properties": {
+                  "log": {
+                    "type": "object",
+                    "properties": {
+                      "time_unix_nano": {
+                        "type": "string",
+                        "minLength": 1
+                      },
+                      "observed_time_unix_nano": {
+                        "type": "string",
+                        "minLength": 1
+                      },
+                      "wyrd_request_id": {
+                        "type": "string",
+                        "minLength": 1
+                      }
+                    },
+                    "required": [
+                      "time_unix_nano",
+                      "observed_time_unix_nano",
+                      "wyrd_request_id"
+                    ],
+                    "additionalProperties": false
+                  }
+                },
+                "required": [
+                  "log"
+                ],
+                "additionalProperties": false
+              }
+            ]
+          },
+          "completion": "host-navigation"
+        },
+        {
+          "name": "record.open_in_query",
+          "description": "Open the list's exact executed SQL and its typed binds in Query.",
+          "input": {
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "type": "object",
+            "properties": {
+              "sql": {
+                "type": "string",
+                "minLength": 1
+              },
+              "params": {
+                "type": "array",
+                "items": {
+                  "type": [
+                    "null",
+                    "boolean",
+                    "number",
+                    "string"
+                  ]
+                }
+              }
+            },
+            "required": [
+              "sql",
+              "params"
+            ],
+            "additionalProperties": false
+          },
+          "completion": "host-navigation"
+        },
+        {
+          "name": "record.sort",
+          "description": "Read the list again ordered by this column, from its first page.",
+          "input": {
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "type": "object",
+            "properties": {
+              "column": {
+                "type": "string",
+                "minLength": 1
+              },
+              "desc": {
+                "type": "boolean"
+              }
+            },
+            "required": [
+              "column",
+              "desc"
+            ],
+            "additionalProperties": false
+          },
+          "completion": "host-navigation"
+        },
+        {
+          "name": "record.page",
+          "description": "Read the page after the last row shown, or before the first, in the same order.",
+          "input": {
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "anyOf": [
+              {
+                "type": "object",
+                "properties": {
+                  "after": {
+                    "minItems": 1,
+                    "maxItems": 8,
+                    "type": "array",
+                    "items": {
+                      "type": [
+                        "null",
+                        "boolean",
+                        "number",
+                        "string"
+                      ]
+                    }
+                  }
+                },
+                "required": [
+                  "after"
+                ],
+                "additionalProperties": false
+              },
+              {
+                "type": "object",
+                "properties": {
+                  "before": {
+                    "minItems": 1,
+                    "maxItems": 8,
+                    "type": "array",
+                    "items": {
+                      "type": [
+                        "null",
+                        "boolean",
+                        "number",
+                        "string"
+                      ]
+                    }
+                  }
+                },
+                "required": [
+                  "before"
+                ],
+                "additionalProperties": false
+              }
+            ]
+          },
+          "completion": "host-navigation"
+        }
+      ]
+    },
+    "TraceWaterfall": {
+      "description": "Every retained span of one exact trace as a timed tree, collapsed below two levels; a span asks the host to select it.",
+      "input": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "type": "object",
+        "properties": {
+          "traceId": {
+            "type": "string",
+            "pattern": "^[0-9a-f]{32}$"
+          },
+          "spanId": {
+            "type": "string",
+            "pattern": "^[0-9a-f]{16}$"
+          },
+          "range": {
+            "anyOf": [
+              {
+                "type": "object",
+                "properties": {
+                  "from": {
+                    "type": "string",
+                    "format": "date-time",
+                    "pattern": "^(?:(?:\\d\\d[2468][048]|\\d\\d[13579][26]|\\d\\d0[48]|[02468][048]00|[13579][26]00)-02-29|\\d{4}-(?:(?:0[13578]|1[02])-(?:0[1-9]|[12]\\d|3[01])|(?:0[469]|11)-(?:0[1-9]|[12]\\d|30)|(?:02)-(?:0[1-9]|1\\d|2[0-8])))T(?:(?:[01]\\d|2[0-3]):[0-5]\\d:[0-5]\\d(?:\\.\\d+)?(?:Z|([+-](?:[01]\\d|2[0-3]):[0-5]\\d)))$"
+                  },
+                  "to": {
+                    "type": "string",
+                    "format": "date-time",
+                    "pattern": "^(?:(?:\\d\\d[2468][048]|\\d\\d[13579][26]|\\d\\d0[48]|[02468][048]00|[13579][26]00)-02-29|\\d{4}-(?:(?:0[13578]|1[02])-(?:0[1-9]|[12]\\d|3[01])|(?:0[469]|11)-(?:0[1-9]|[12]\\d|30)|(?:02)-(?:0[1-9]|1\\d|2[0-8])))T(?:(?:[01]\\d|2[0-3]):[0-5]\\d:[0-5]\\d(?:\\.\\d+)?(?:Z|([+-](?:[01]\\d|2[0-3]):[0-5]\\d)))$"
+                  }
+                },
+                "required": [
+                  "from",
+                  "to"
+                ],
+                "additionalProperties": false
+              },
+              {
+                "type": "object",
+                "properties": {
+                  "last": {
+                    "type": "string",
+                    "pattern": "^[1-9]\\d{0,4}[mhd]$"
+                  }
+                },
+                "required": [
+                  "last"
+                ],
+                "additionalProperties": false
+              }
+            ]
+          }
+        },
+        "required": [
+          "traceId"
+        ],
+        "additionalProperties": false
+      },
+      "states": [
+        "populated",
+        "empty",
+        "denied",
+        "error",
+        "loading"
+      ],
+      "emits": [
+        {
+          "name": "trace.select",
+          "description": "Select this span of the trace.",
+          "input": {
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "type": "object",
+            "properties": {
+              "trace_id": {
+                "type": "string",
+                "pattern": "^[0-9a-f]{32}$"
+              },
+              "span_id": {
+                "type": "string",
+                "pattern": "^[0-9a-f]{16}$"
+              }
+            },
+            "required": [
+              "trace_id",
+              "span_id"
+            ],
+            "additionalProperties": false
+          },
+          "completion": "host-navigation"
+        }
+      ]
+    },
+    "RecordDetail": {
+      "description": "One exact span or log record: messages, attributes, events, exception and the raw row.",
+      "input": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "anyOf": [
+          {
+            "type": "object",
+            "properties": {
+              "traceId": {
+                "type": "string",
+                "pattern": "^[0-9a-f]{32}$"
+              },
+              "spanId": {
+                "type": "string",
+                "pattern": "^[0-9a-f]{16}$"
+              }
+            },
+            "required": [
+              "traceId",
+              "spanId"
+            ],
+            "additionalProperties": false
+          },
+          {
+            "type": "object",
+            "properties": {
+              "log": {
+                "type": "object",
+                "properties": {
+                  "time_unix_nano": {
+                    "type": "string",
+                    "minLength": 1
+                  },
+                  "observed_time_unix_nano": {
+                    "type": "string",
+                    "minLength": 1
+                  },
+                  "wyrd_request_id": {
+                    "type": "string",
+                    "minLength": 1
+                  }
+                },
+                "required": [
+                  "time_unix_nano",
+                  "observed_time_unix_nano",
+                  "wyrd_request_id"
+                ],
+                "additionalProperties": false
+              }
+            },
+            "required": [
+              "log"
+            ],
+            "additionalProperties": false
+          }
+        ]
+      },
+      "states": [
+        "populated",
+        "empty",
+        "denied",
+        "error",
+        "loading"
+      ],
+      "emits": [
+        {
+          "name": "record.filter",
+          "description": "Filter the list by this field, or with not, exclude it.",
+          "input": {
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "type": "object",
+            "properties": {
+              "signal": {
+                "type": "string",
+                "enum": [
+                  "traces",
+                  "spans",
+                  "logs",
+                  "metrics"
+                ]
+              },
+              "column": {
+                "type": "string",
+                "minLength": 1
+              },
+              "value": {
+                "type": [
+                  "null",
+                  "boolean",
+                  "number",
+                  "string"
+                ]
+              },
+              "not": {
+                "type": "boolean"
+              }
+            },
+            "required": [
+              "signal",
+              "column",
+              "value"
+            ],
+            "additionalProperties": false
+          },
+          "completion": "host-navigation"
+        },
+        {
+          "name": "record.logs",
+          "description": "Show the log records of this span.",
+          "input": {
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "type": "object",
+            "properties": {
+              "trace_id": {
+                "type": "string",
+                "pattern": "^[0-9a-f]{32}$"
+              },
+              "span_id": {
+                "type": "string",
+                "pattern": "^[0-9a-f]{16}$"
+              }
+            },
+            "required": [
+              "trace_id",
+              "span_id"
+            ],
+            "additionalProperties": false
+          },
+          "completion": "host-navigation"
+        },
+        {
+          "name": "record.open",
+          "description": "Open this log record's trace and span.",
+          "input": {
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "type": "object",
+            "properties": {
+              "trace_id": {
+                "type": "string",
+                "pattern": "^[0-9a-f]{32}$"
+              },
+              "span_id": {
+                "type": "string",
+                "pattern": "^[0-9a-f]{16}$"
+              }
+            },
+            "required": [
+              "trace_id"
+            ],
+            "additionalProperties": false
+          },
+          "completion": "host-navigation"
+        }
+      ]
+    }
+  }
+}

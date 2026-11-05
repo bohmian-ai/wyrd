@@ -67,9 +67,9 @@ The request ID is the existing request/batch-fence correlator. The ingestion
 instant is taken once at admission from the PostgreSQL-anchored clock and
 retained across retry. Callers never supply managed identity as user fields.
 
-The ten system tables (spans, logs, metrics, gateway calls, drift
-observations, verification results, execution inputs, drift result features,
-storage objects and audit) additionally share six nullable Utf8 dimensions:
+The eleven system tables (spans, logs, metric points, metric series, gateway
+calls, drift observations, verification results, execution inputs, drift
+result features, storage objects and audit) additionally share six nullable Utf8 dimensions:
 service_name, service_version, deployment_environment, subject_kind,
 subject_name and subject_version. Registered UIDs determine identity labels;
 accepted workload context determines environment. Existing signal columns occur
@@ -81,7 +81,9 @@ Service version ASC NULLS FIRST and their existing time axis DESC NULLS LAST.
 Time-only partitions remain hourly for telemetry/gateway and daily for
 verification/drift. Creation defaults combine service_name, subject_name,
 workload_card_uid, subject_card_uid and run_id Blooms with signal-specific lookup
-keys; audit retains its accountability defaults. Ten result Blooms include
+keys; audit retains its accountability defaults. `bifrost.metrics.points`
+adds `metric_name` and `series_id`; `bifrost.metrics.series` adds `series_id`
+and `metric_name`. Ten result Blooms include
 result_id, execution_id, verifier_card_uid, binding_id and group_id. These are
 complete replaceable creation defaults, never a hidden validation floor.
 No environment/kind/version Bloom or identity partition is implied. The exact
@@ -134,7 +136,14 @@ consume no committed version. Data, snapshot and housekeeping commits preserve
 it. There is no parallel configuration counter, composite layout revision,
 accepted-recipe JSON or definition fingerprint standing in for this version.
 Native Iceberg schema/spec/order IDs remain physical descriptors, not Bifrost
-definition versions. Snapshot IDs and Scribe publication progress describe
+definition versions.
+
+A built-in's schema is creation-only. Tenant provisioning and server startup
+create a missing built-in from its current definition and refuse, aborting
+boot, one whose stored definition differs; a definition edit never adds,
+renames, or retypes a built-in column, though its layout may change. A
+warehouse whose built-in predates a changed built-in schema is therefore
+rebuilt: there is no built-in schema migration, backfill, or alias. Snapshot IDs and Scribe publication progress describe
 visibility and do not select the definition of accepted data.
 
 The domain is `1..=9223372036854775807`, represented by Rust `i64`, SQL
@@ -354,6 +363,57 @@ typed columns:
   `http_response_status_code`, `url_full`, and the `exception_*` columns of the
   span's last `exception` event on spans; the record's own `exception_*`
   attributes and `body_text` (the body when it is a string) on logs.
+- `bifrost.metrics.points` carries `series_id`, a nullable
+  `FixedSizeBinary(16)` column with a Bloom filter, derived at admission from
+  the point's series identity and never taken from a writer: Scribe replaces
+  any value a raw Arrow writer supplies, and the OTLP projection derives the
+  same id with the same function over the same canonical columns. The id is
+  the first 16 bytes of SHA-256 over a version byte `1` followed by
+  `metric_name`, `metric_type`, `unit`, `aggregation_temporality`,
+  `is_monotonic`, `explicit_bounds`, `resource_attributes`, `scope_name`,
+  `scope_version`, `scope_attributes`, and `attributes`, each as a one-byte
+  type tag, a big-endian `u32` length, and the bytes. An absent value is the
+  null tag with length 0; object keys are sorted bytewise at every depth and
+  arrays keep their order; every integer width is a big-endian `i64`; floats
+  are IEEE-754 bits with `-0.0` written as `0.0` and every NaN as one
+  canonical NaN. Description, `metadata`, schema URLs, `resource_entity_refs`,
+  exemplars, flags, values, and times are excluded. A new encoding takes a new
+  version byte. The id groups points into series; it is not a security
+  boundary.
+- `bifrost.metrics.series` is the series index: one row per series per UTC
+  hour and accepted context in which the series has points, partitioned hourly on
+  `hour_unix_nano`. Its columns are `series_id`, `hour_unix_nano`,
+  `metric_name`, `metric_type`, `unit`, `aggregation_temporality`,
+  `is_monotonic`, `explicit_bounds`, `scope_name`, `scope_version`,
+  `resource_attributes`, `scope_attributes`, `attributes`, the promoted
+  resource columns, and the attribution columns, each declared and meaning
+  exactly as on the point, then the managed columns. The identity fields and
+  attribute sets are fixed for a series. The promoted and attribution columns
+  are the point's accepted context and are not: a native writer names its own
+  `run_id`, and Gate stamps the accepted workload's Service and the accepted
+  environment over the observed values. The context is the promoted Service,
+  environment, SDK and subject columns, `subject_card_uid`, `run_id`,
+  `workload_card_uid`, `sub_principal_id` and `act_principal_id`; the request
+  id and admission instant are not part of it. Each distinct context of a
+  series in an hour is its own row, so a scoped read finds every series a
+  matching point has. Its retention is that of `bifrost.metrics.points`.
+  - Scribe writes it, and nothing else may: Gate refuses every client write.
+    From each new points batch it derives the first point of each series,
+    hour and context not yet durable in this process, and admits those rows as one
+    `bifrost.metrics.series` batch, with a batch id derived from the points
+    batch's own and the rows it needs, before the points. The points are
+    dispatched only after that batch is durable, and acknowledged only after
+    both, so a durable point always has its series row for its hour. Bifrost
+    has no cross-table admission; this order is the guarantee.
+  - A failed or unacknowledged series admission fails the points admission;
+    the writer retries the whole batch.
+  - A bounded per-process set of the series rows already durable for each
+    hour and context suppresses repeats: a key joins only once its row is durable, and a
+    points batch whose series are all in it admits no series batch and costs
+    no extra sync. Overflow clears the set and a restart empties it; either
+    only writes a row again. Rows therefore repeat across replicas and
+    restarts, and readers aggregate by `series_id`, never counting rows as
+    series.
 - Three tables hold each verification fact once. A result read assembles the
   public `VerificationResult` from them: the verdict from `results`,
   `requirements` and `steps` from `execution_outputs` by `result_id`, and
@@ -490,6 +550,17 @@ reserved-field and Variant/value checks. Version identity removes redundant
 schema/layout hashing, not required casts or trust-boundary validation.
 Reuse the existing conformance-plan cache by version/descriptor and actual
 source shape; do not hash layout JSON or resolve current metadata per batch.
+
+A canonical signal table's physical Arrow schema carries no field-class
+label. The ledger owns each column's projection and permission class, and
+payload authorization reads table and column policy, never Arrow metadata.
+Without the label, sealed Parquet field metadata equals the registered Iceberg
+schema, so filters reach statistics and Bloom filters uncast. The version-3
+canonical physical fingerprint commits names, types, nullability, nested
+children and semantic metadata other than field ids and extension keys; it
+has no class byte. Data accepted under an earlier labelled schema is not
+restamped: replay keeps its original schema, fence and digest, and the label
+is inert metadata on those files.
 
 Bifrost has three timestamp types, named as Snowflake names them:
 
@@ -874,7 +945,12 @@ columns resolve by field id, file pruning is re-planned against each file's own
 schema, and the live tail carries the required fields so memtable rows admitted
 under an earlier table version project by id. A column a source predates reads
 null,
-so filters on it stay exact. There is no caller-selected source
+so filters on it stay exact. Where a file column differs from the table
+column only in field metadata, with the same scalar Arrow type and no
+extension type on either, the adapted predicate references the file column
+bare instead of casting it, so an `IN` list of any length or a null test
+still prunes by statistics and Bloom filters; projection still adapts the
+column to the table field. There is no caller-selected source
 mode, freshness policy, or query class.
 
 Oracle plans every query once through the pinned `datafusion-distributed`
@@ -1809,8 +1885,9 @@ Permissions are scoped through `BifrostTable`, `BifrostRecord`, and
 `BifrostQuery`. Generic writes cannot target reserved or system-managed tables;
 `bifrost.gateway.calls`, the three verification tables
 (`bifrost.verification.results`, `bifrost.verification.execution_inputs`, and
-`bifrost.verification.execution_outputs`), and the `bifrost.storage.objects`
-inventory accept no public write at all: Gate refuses every principal. Only
+`bifrost.verification.execution_outputs`), the `bifrost.storage.objects`
+inventory, and the `bifrost.metrics.series` index, which Scribe derives from
+admitted points, accept no public write at all: Gate refuses every principal. Only
 the server-internal capture writer writes them, together with
 the capture spans in `bifrost.traces.spans`, and the tenant copies of server
 spans join them there through the same outbox; result rows carry the verified

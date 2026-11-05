@@ -32,9 +32,9 @@ use wyrd_spec::vala::api::{AuditDetail, AuditOutcome};
 use wyrd_spec::vala::audit_detail::AuditDelegationStep;
 use wyrd_spec::vala::audit_detail::CardScopeMintKind;
 use wyrd_sql::queries::auth::{
-    RoleRow, human_connection_is_active, insert_human_refresh_token, list_service_account_roles,
-    list_user_roles, lock_human_connection_slot, lock_refresh_family, refresh_issuance_instant,
-    roles_by_name, service_account_by_id, user_by_id,
+    ApiKeyOwner, RoleRow, api_key_owner, human_connection_is_active, insert_human_refresh_token,
+    list_service_account_roles, list_user_roles, lock_human_connection_slot, lock_refresh_family,
+    refresh_issuance_instant, roles_by_name, service_account_by_id, user_by_id,
 };
 use wyrd_sql::queries::platform::tenant_resolver::tenant_admits_credentials;
 use wyrd_sql::queries::verification::record_machine_authentication;
@@ -141,6 +141,10 @@ pub enum TenantGrant {
     },
     /// A verified federated OIDC login.
     OidcLogin,
+    /// A live browser session created by a verified local password sign-in,
+    /// re-resolved on one request; the session row binds the password
+    /// revision.
+    PasswordLogin,
     /// A consumed human refresh token.
     Refresh {
         /// The refresh row presented, consumed by a `wyrd-cli` rotation.
@@ -192,7 +196,21 @@ pub enum TenantGrant {
 impl TenantGrant {
     /// Whether the grant names a human user rather than a machine principal.
     fn is_human(&self) -> bool {
-        matches!(self, Self::OidcLogin | Self::Refresh { .. })
+        matches!(
+            self,
+            Self::OidcLogin | Self::PasswordLogin | Self::Refresh { .. }
+        )
+    }
+
+    /// The API-key row a key or recovery grant presents, whose owner decides
+    /// whether the grant resolves a User.
+    fn api_key_id(&self) -> Option<Uuid> {
+        match self {
+            Self::ApiKey { credential_id, .. } | Self::BrowserRecovery { credential_id } => {
+                Some(*credential_id)
+            }
+            _ => None,
+        }
     }
 
     /// The stored credential the token is attributed to, when there is one.
@@ -202,7 +220,10 @@ impl TenantGrant {
                 Some(*credential_id)
             }
             Self::Refresh { consumed } => Some(*consumed),
-            Self::OidcLogin | Self::JwtBearer { .. } | Self::Delegation { .. } => None,
+            Self::OidcLogin
+            | Self::PasswordLogin
+            | Self::JwtBearer { .. }
+            | Self::Delegation { .. } => None,
         }
     }
 
@@ -217,7 +238,10 @@ impl TenantGrant {
             Self::Delegation {
                 actor_workload_uid, ..
             } => Some(actor_workload_uid),
-            Self::OidcLogin | Self::Refresh { .. } | Self::BrowserRecovery { .. } => None,
+            Self::OidcLogin
+            | Self::PasswordLogin
+            | Self::Refresh { .. }
+            | Self::BrowserRecovery { .. } => None,
         }
     }
 
@@ -241,6 +265,7 @@ impl TenantGrant {
             // The subject's Card scope was minted with its own token; the
             // exchange confers no new emit authority.
             Self::OidcLogin
+            | Self::PasswordLogin
             | Self::Refresh { .. }
             | Self::Delegation { .. }
             | Self::BrowserRecovery { .. } => None,
@@ -753,6 +778,10 @@ impl TenantTokenIssuer {
     /// Resolve `principal_id` and the Card context `grant` selects, recording
     /// root activity when the grant qualifies.
     ///
+    /// A key or recovery grant whose credential a User owns resolves that
+    /// User, and its current permissions are narrowed to the key's stored
+    /// ceiling, so a role granted later never widens an older key.
+    ///
     /// Activity is recorded only for a direct machine grant whose root
     /// validated and whose account is that root family's runtime account, so
     /// an unrestricted caller of another family's release never activates it.
@@ -765,7 +794,23 @@ impl TenantTokenIssuer {
         principal_id: Uuid,
         grant: &TenantGrant,
     ) -> Result<(ResolvedPrincipal, ResolvedContext), IssuanceError> {
-        let principal = self.resolve(conn, principal_id, grant.is_human()).await?;
+        let owner = match grant.api_key_id() {
+            Some(id) => api_key_owner(conn, id).await?,
+            None => None,
+        };
+        let (human, ceiling) = match owner {
+            Some(ApiKeyOwner::User { permission_ceiling }) => (true, Some(permission_ceiling)),
+            _ => (grant.is_human(), None),
+        };
+        let mut principal = self.resolve(conn, principal_id, human).await?;
+        if let Some(ceiling) = ceiling {
+            let ceiling = ceiling
+                .iter()
+                .map(|expression| expression.parse::<Permission>())
+                .collect::<Result<PermissionSet, _>>()
+                .map_err(|_| sqlx::Error::Decode("stored permission ceiling".into()))?;
+            principal.permissions = principal.permissions.intersection(&ceiling)?;
+        }
         let root = grant.selected_root();
         let context = ResolvedContext::resolve(conn, root, principal.restriction.as_ref()).await?;
         if let Some(root) = root.filter(|_| grant.records_owner_activity()) {
@@ -824,13 +869,45 @@ impl TenantTokenIssuer {
         let roles = role_refs(role_names).map_err(|error| IssuanceError::RoleCorrupt {
             role: error.to_string(),
         })?;
-        let permissions = resolve_permissions(conn, &roles).await?;
+        let mut permissions = resolve_permissions(conn, &roles).await?;
+        if human {
+            // Every real User may read and manage its own credentials;
+            // ownership is enforced where the capability is checked.
+            permissions.insert(Permission::personal_credentials_read());
+            permissions.insert(Permission::personal_credentials_write());
+        }
         Ok(ResolvedPrincipal {
             principal,
             roles,
             permissions,
             restriction,
         })
+    }
+
+    /// The current permissions of `principal_id` — a User or a
+    /// Service/Admin account — when it is active in an admitting tenant;
+    /// `None` for a missing or inactive principal. A User's include its self
+    /// credential capabilities.
+    ///
+    /// Revalidates authority at the moment it is spent, such as an
+    /// enrollment invitation issuer's or a new User key's ceiling.
+    ///
+    /// # Errors
+    /// As [`Self::issue`], less the signing and Card-context errors and the
+    /// inactive-principal refusal.
+    pub async fn current_permissions(
+        &self,
+        conn: &mut TenantConn<'_>,
+        principal_id: Uuid,
+    ) -> Result<Option<PermissionSet>, IssuanceError> {
+        for human in [true, false] {
+            match self.resolve(conn, principal_id, human).await {
+                Ok(resolved) => return Ok(Some(resolved.permissions)),
+                Err(IssuanceError::PrincipalInactive) => {}
+                Err(error) => return Err(error),
+            }
+        }
+        Ok(None)
     }
 
     /// Establish or renew a human session: an access token from

@@ -485,3 +485,115 @@ async fn stable_account_context_cli_journey() {
 
     stop_served(server, shutdown, serve_handle).await;
 }
+
+/// An administrator creates a local User, with the password on standard
+/// input, and invites another by Role name through the CLI; a caller that is
+/// no tenant administrator is refused both with the server's stable error.
+///
+/// # Panics
+/// Panics when the server or a bootstrap fails, or a command succeeds,
+/// fails or prints contrary to the contract.
+#[tokio::test]
+async fn principal_user_cli_journey() {
+    let (server, base_url, shutdown, serve_handle) = start_served("principal user").await;
+    let admin = server
+        .bootstrap_service("cli-user-admin", &["admin"])
+        .await
+        .expect("administrator bootstraps");
+    let admin_token = machine_token(&server, &admin).await;
+    let viewer = server
+        .bootstrap_service("cli-user-viewer", &["viewer"])
+        .await
+        .expect("unprivileged caller bootstraps");
+    let viewer_token = machine_token(&server, &viewer).await;
+    let create = |token: String| {
+        let base_url = base_url.clone();
+        tokio::task::spawn_blocking(move || {
+            let mut child = Command::cargo_bin("wyrd")
+                .expect("wyrd binary builds")
+                .args([
+                    "principal",
+                    "user",
+                    "create",
+                    "--username",
+                    "development",
+                    "--role",
+                    "admin",
+                    "--server",
+                    &base_url,
+                ])
+                .env("WYRD_ACCESS_TOKEN", token)
+                .env_remove("WYRD_API_KEY")
+                .stdin(std::process::Stdio::piped())
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::piped())
+                .spawn()
+                .expect("wyrd command runs");
+            std::io::Write::write_all(
+                &mut child.stdin.take().expect("stdin is piped"),
+                b"development\n",
+            )
+            .expect("password is written");
+            child.wait_with_output().expect("wyrd command exits")
+        })
+    };
+
+    let created = create(admin_token.clone())
+        .await
+        .expect("CLI subprocess joins");
+    let stdout = String::from_utf8_lossy(&created.stdout);
+    assert!(
+        created.status.success(),
+        "{}",
+        String::from_utf8_lossy(&created.stderr)
+    );
+    assert!(stdout.contains("username: development"), "{stdout}");
+    assert!(
+        !stdout.contains("development\ndevelopment"),
+        "the password is never printed"
+    );
+
+    let invite = |token: String| {
+        run_cli_async(
+            vec![
+                "principal".to_owned(),
+                "user".to_owned(),
+                "invite".to_owned(),
+                "--role".to_owned(),
+                "editor".to_owned(),
+                "--server".to_owned(),
+                base_url.clone(),
+            ],
+            token,
+        )
+    };
+    let invited = invite(admin_token).await;
+    let stdout = String::from_utf8_lossy(&invited.stdout);
+    assert!(
+        invited.status.success(),
+        "{}",
+        String::from_utf8_lossy(&invited.stderr)
+    );
+    let code = stdout
+        .lines()
+        .find_map(|line| line.strip_prefix("invitation_code: "))
+        .expect("the code is printed");
+    assert_eq!(code.len(), 43);
+    assert!(stdout.contains("/signup"), "{stdout}");
+
+    for refused in [
+        create(viewer_token.clone())
+            .await
+            .expect("CLI subprocess joins"),
+        invite(viewer_token).await,
+    ] {
+        assert!(!refused.status.success(), "a viewer must not manage Users");
+        let stderr = String::from_utf8_lossy(&refused.stderr);
+        assert!(
+            stderr.contains("WYRD_PERMISSION_403_DENIED_RBAC"),
+            "{stderr}"
+        );
+    }
+
+    stop_served(server, shutdown, serve_handle).await;
+}

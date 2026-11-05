@@ -754,10 +754,12 @@ run = "scripts/identity/with-identity-providers.sh -- mise run test:identity:ui:
 [tasks."test:identity:ui:suite"]
 hide = true
 description = "Build the UI and run the production UI journey against already-running Postgres, Keycloak, and Dex."
+depends = ["ts:build"]
 env = { WYRD_KEYCLOAK_ISSUER = "http://localhost:8180/realms/wyrd-test", WYRD_DEX_ISSUER = "http://localhost:5556" }
 run = """
 set -e
 pnpm --dir crates/wyrd/wyrd-server/wyrd-ui install --frozen-lockfile
+pnpm --dir crates/wyrd/wyrd-server/wyrd-ui exec playwright install --only-shell chromium
 pnpm --dir crates/wyrd/wyrd-server/wyrd-ui build
 cargo nextest run --locked -p wyrd-server --test integration --run-ignored=all --no-capture -E 'test(=identity_ui_e2e::production_ui_bff_journey)'
 """
@@ -1146,7 +1148,7 @@ run = [
 
 [tasks."dev:backend"]
 description = "Build and run wyrd-server on :8080"
-run = ["cargo build -p wyrd-server", "scripts/postgres/dev-server.sh"]
+run = ["cargo build -p wyrd-server -p wyrd-cli", "scripts/postgres/dev-server.sh"]
 
 [tasks."cli:init"]
 description = "Establish this deployment's platform administrative root and print its credential once"
@@ -1249,7 +1251,7 @@ run = "pnpm dev --mode mocks --host 0.0.0.0 --port ${WYRD_DOCS_PORT:-4321}"
 [tasks."dev:both"]
 description = "Run wyrd-server (:8080) and UI (:3000) in parallel"
 run = """
-cargo build -p wyrd-server
+cargo build -p wyrd-server -p wyrd-cli
 scripts/postgres/dev-server.sh &
 BACKEND_PID=$!
 cd crates/wyrd/wyrd-server/wyrd-ui && pnpm run dev --host 0.0.0.0 --port ${WYRD_UI_PORT:-3000} &
@@ -1258,17 +1260,107 @@ trap 'kill $BACKEND_PID $FRONTEND_PID 2>/dev/null' EXIT INT TERM
 wait $BACKEND_PID $FRONTEND_PID
 """
 
-[tasks."dev:full"]
-description = "Boot wyrd-server and UI on :3000"
+[tasks."dev:mockserver"]
+description = "Serve the checked-in OpenAI fixtures from MockServer on 127.0.0.1:1080"
+shell = "bash -c"
 run = """
-cargo build -p wyrd-server
-scripts/postgres/dev-server.sh &
-SERVER_PID=$!
-cd crates/wyrd/wyrd-server/wyrd-ui && pnpm install --frozen-lockfile && pnpm run dev --host 0.0.0.0 --port ${WYRD_UI_PORT:-3000} &
-UI_PID=$!
-trap 'kill $SERVER_PID $UI_PID 2>/dev/null' EXIT INT TERM
-wait $SERVER_PID $UI_PID
+set -Eeuo pipefail
+compose=(docker compose --project-name "wyrd-dev-mockserver-$$" --file docker-compose.yml)
+trap '"${compose[@]}" down --remove-orphans >/dev/null 2>&1' EXIT INT TERM
+"${compose[@]}" up --detach mockserver
+want=$(grep -c '"priority"' tests/fixtures/mockserver/expectations.json)
+for _ in $(seq 1 60); do
+  got=$(curl -sf http://127.0.0.1:1080/mockserver/ready >/dev/null && curl -sf -X PUT 'http://127.0.0.1:1080/mockserver/retrieve?type=ACTIVE_EXPECTATIONS&format=JSON' | grep -c '"priority"' || true)
+  [[ ${got:-0} -eq $want ]] && break
+  sleep 1
+done
+[[ ${got:-0} -eq $want ]] || { echo "MockServer loaded ${got:-0} of $want expectations within 60s" >&2; exit 1; }
+printf "\nMockServer ready on http://127.0.0.1:1080 with %s OpenAI expectations\n\n" "$got"
+"${compose[@]}" logs --follow mockserver
 """
+
+[tasks."dev:full"]
+description = "Boot MockServer, wyrd-server, the UI on :3000 and the canonical wyrd-example-py app on :8000, then send one workload batch"
+usage = """
+flag "--requests <n>" default="500" help="Workload requests in the startup batch"
+flag "--concurrency <n>" default="8" help="Requests in flight at once"
+"""
+shell = "bash -c"
+run = """
+set -Eeuo pipefail
+cargo build -p wyrd-server -p wyrd-cli
+scripts/dev/example-app.sh prepare
+# Each service runs in its own process group, so stopping one stops all of its children.
+# The app stops first so its telemetry drains into a still-running server.
+set -m
+pids=()
+app=
+stop() {
+  trap "" INT TERM
+  trap - EXIT
+  if [[ -n $app ]]; then kill -TERM -- "-$app" 2>/dev/null && wait "$app" || true; fi
+  for pid in "${pids[@]}"; do kill -TERM -- "-$pid" 2>/dev/null || true; done
+  wait
+}
+trap stop EXIT INT TERM
+mise run dev:mockserver &
+pids+=($!)
+config=${WYRD_CONFIG_HOME:-${XDG_CONFIG_HOME:-$HOME/.config}/wyrd}
+credentials=$config/credentials.toml
+ui=http://127.0.0.1:${WYRD_UI_PORT:-3000}
+started=$(mktemp)
+WYRD_CONFIG_PATH="$PWD/tests/fixtures/mockserver/server.toml" WYRD_SEALING_KEY_BASE64=$(openssl rand -base64 32) scripts/postgres/dev-server.sh &
+server=$!
+pids+=($server)
+# Sign-in is the real local User login, never the UI's fixture identity.
+(cd crates/wyrd/wyrd-server/wyrd-ui && pnpm install --frozen-lockfile && WYRD_UI_LOCAL_AUTH=false exec pnpm run dev --host 0.0.0.0 --port ${WYRD_UI_PORT:-3000}) &
+ui_pid=$!
+pids+=($ui_pid)
+# Ready means serving, holding this start's new tenant key, written once the tenant and User exist, and the UI's sign-in page answering.
+until curl -sf http://127.0.0.1:8080/readyz >/dev/null && [[ $credentials -nt $started ]] && curl -sf -o /dev/null "$ui/t/dev/login"; do
+  kill -0 "$server" 2>/dev/null || { echo "wyrd-server exited before it was ready" >&2; exit 1; }
+  kill -0 "$ui_pid" 2>/dev/null || { echo "the UI exited before it was ready" >&2; exit 1; }
+  sleep 1
+done
+rm -f "$started"
+printf '\nUI ready     %s/t/dev/login (sign in as development / development)\n\n' "$ui"
+until curl -sf http://127.0.0.1:1080/mockserver/ready >/dev/null; do
+  kill -0 "${pids[0]}" 2>/dev/null || { echo "MockServer exited before it was ready" >&2; exit 1; }
+  sleep 1
+done
+# A failed setup or batch leaves the server, UI and MockServer running for diagnosis.
+if scripts/dev/example-app.sh setup; then
+  scripts/dev/example-app.sh serve &
+  app=$!
+  until curl -sf -o /dev/null http://127.0.0.1:${WYRD_EXAMPLE_PORT:-8000}/docs; do
+    kill -0 "$app" 2>/dev/null || { echo "wyrd-example-py exited before it was ready" >&2; exit 1; }
+    sleep 1
+  done
+  example="http://127.0.0.1:${WYRD_EXAMPLE_PORT:-8000}/docs"
+  if scripts/dev/example-app.sh batch --requests "$usage_requests" --concurrency "$usage_concurrency"; then
+    batch="passed; send another with mise run dev:batch -- --requests 20 --concurrency 2"
+  else
+    batch="FAILED (see the report above); every service is still running for diagnosis"
+  fi
+else
+  example="not started: setup FAILED (see above)"
+  batch="not sent: setup FAILED; the server, UI and MockServer are still running for diagnosis"
+fi
+printf '\nwyrd-server  http://127.0.0.1:8080 (fresh database; tenant dev key replaced %s)\n' "$credentials"
+printf 'UI           %s/t/dev/login (sign in as development / development)\n' "$ui"
+printf 'example app  %s\n' "$example"
+printf 'MockServer   http://127.0.0.1:1080/mockserver/dashboard\n'
+printf 'batch        %s\n\n' "$batch"
+wait -n "${pids[@]}" ${app:+"$app"}
+"""
+
+[tasks."dev:batch"]
+description = "Send one more workload batch to the running dev:full canonical app"
+usage = """
+flag "--requests <n>" default="500" help="Workload requests in the batch"
+flag "--concurrency <n>" default="8" help="Requests in flight at once"
+"""
+run = 'scripts/dev/example-app.sh batch --requests "$usage_requests" --concurrency "$usage_concurrency"'
 
 [tasks.check]
 description = "Whole-plan closeout gate: fmt check + all-feature Clippy"
@@ -1309,7 +1401,7 @@ cargo run --locked -q -p wyrd-spec --example gen_schemas --features server -- co
 """
 
 [tasks."codegen:check"]
-description = "Fail if UI problem examples, TypeScript error codes, TypeScript wire types, or UI theme tokens drift from source"
+description = "Fail if UI problem examples, TypeScript error codes, TypeScript wire types, UI theme tokens, or the UI component catalog drift from source"
 run = """
 set -eu
 GENERATED="crates/wyrd-spec/schemas/ui_problem_examples.json sdks/wyrd-sdk-ts/wyrd/src/error-codes.ts sdks/wyrd-sdk-ts/wyrd/src/card-types.ts"
@@ -1322,6 +1414,7 @@ shasum -a 256 $GENERATED > "$AFTER"
 diff -u "$BEFORE" "$AFTER" \
   || { echo 'codegen drift detected - run mise run codegen:regen and commit'; exit 1; }
 (cd crates/wyrd/wyrd-server/wyrd-ui && node --test brand/gen-theme.test.mjs && node brand/gen-theme.mjs --check)
+(cd crates/wyrd/wyrd-server/wyrd-ui && pnpm install --frozen-lockfile && node packages/ui/scripts/catalog.ts --check)
 """
 
 # --- napi TypeScript pipeline -----------------------------------------------------
@@ -1345,10 +1438,10 @@ dir = "sdks/wyrd-sdk-ts"
 run = "pnpm install --frozen-lockfile"
 
 [tasks."ts:build"]
-description = "Build the public wyrd-ai napi addon (sdks/wyrd-sdk-ts/native) + emit index.d.ts into sdks/wyrd-sdk-ts/wyrd (slice 13a)"
+description = "Build the public wyrd-ai napi addon (sdks/wyrd-sdk-ts/native) in the WYRD_PROFILE Cargo profile (default dev) + emit index.d.ts into sdks/wyrd-sdk-ts/wyrd (slice 13a)"
 depends = ["ts:install"]
 dir = "sdks/wyrd-sdk-ts/wyrd"
-run = "pnpm exec napi build --platform --manifest-path ../native/Cargo.toml --output-dir . --package-json-path package.json && test ! -f index.js || mv index.js index.generated.cjs && cp index.d.ts index.d.cts && pnpm exec tsc -p tsconfig.build.json && node -e 'require(\"node:fs\").rmSync(\"index.generated.cjs\", { force: true })'"
+run = "pnpm exec napi build --platform $([ \"${WYRD_PROFILE:-dev}\" = dev ] || echo --profile \"$WYRD_PROFILE\") --manifest-path ../native/Cargo.toml --output-dir . --package-json-path package.json && test ! -f index.js || mv index.js index.generated.cjs && cp index.d.ts index.d.cts && pnpm exec tsc -p tsconfig.build.json && node -e 'require(\"node:fs\").rmSync(\"index.generated.cjs\", { force: true })'"
 
 [tasks."ts:build:testing"]
 description = "Build the private @wyrd/testing napi harness addon (sdks/wyrd-sdk-ts/native-testing) into sdks/wyrd-sdk-ts/testing; feeds the integration lane only (slice 13a)"

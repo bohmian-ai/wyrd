@@ -1,0 +1,644 @@
+[
+  {
+    "id": "policy-judge",
+    "priority": 30,
+    "httpRequest": {
+      "method": "POST",
+      "path": "/v1/chat/completions",
+      "body": {
+        "type": "JSON",
+        "json": {
+          "model": "gpt-6-luna"
+        },
+        "matchType": "ONLY_MATCHING_FIELDS"
+      }
+    },
+    "httpResponse": {
+      "statusCode": 200,
+      "headers": {
+        "content-type": [
+          "application/json"
+        ]
+      },
+      "body": {
+        "type": "JSON",
+        "json": {
+          "id": "chatcmpl-mockserver",
+          "object": "chat.completion",
+          "created": 1,
+          "model": "gpt-6-luna",
+          "choices": [
+            {
+              "index": 0,
+              "finish_reason": "stop",
+              "message": {
+                "role": "assistant",
+                "content": "{\"outcome\": \"passed\", \"reason\": \"scripted development verdict\", \"citations\": [{\"slot\": \"order\", \"locator\": {\"json_pointer\": \"/price\"}}]}"
+              }
+            }
+          ],
+          "usage": {
+            "prompt_tokens": 5,
+            "completion_tokens": 3,
+            "total_tokens": 8
+          }
+        }
+      }
+    }
+  },
+  {
+    "id": "support-refund-answer",
+    "priority": 20,
+    "httpRequest": {
+      "method": "POST",
+      "path": "/v1/chat/completions",
+      "body": {
+        "type": "JSON",
+        "json": {
+          "model": "gpt-4o",
+          "messages": [
+            {
+              "role": "user",
+              "content": "${json-unit.regex}(?is)Order A-100[123]:.*refund.*"
+            },
+            {
+              "role": "tool"
+            }
+          ]
+        },
+        "matchType": "ONLY_MATCHING_FIELDS"
+      }
+    },
+    "httpResponse": {
+      "statusCode": 200,
+      "headers": {
+        "content-type": [
+          "application/json"
+        ]
+      },
+      "body": {
+        "type": "JSON",
+        "json": {
+          "id": "chatcmpl-mockserver",
+          "object": "chat.completion",
+          "created": 1,
+          "model": "gpt-4o",
+          "choices": [
+            {
+              "index": 0,
+              "finish_reason": "stop",
+              "message": {
+                "role": "assistant",
+                "content": "You have a guaranteed refund."
+              }
+            }
+          ],
+          "usage": {
+            "prompt_tokens": 5,
+            "completion_tokens": 3,
+            "total_tokens": 8
+          }
+        }
+      }
+    }
+  },
+  {
+    "id": "support-ship-answer",
+    "priority": 19,
+    "httpRequest": {
+      "method": "POST",
+      "path": "/v1/chat/completions",
+      "body": {
+        "type": "JSON",
+        "json": {
+          "model": "gpt-4o",
+          "messages": [
+            {
+              "role": "user",
+              "content": "${json-unit.regex}(?is)Order A-100[1-5]:.*ship.*"
+            },
+            {
+              "role": "tool"
+            }
+          ]
+        },
+        "matchType": "ONLY_MATCHING_FIELDS"
+      }
+    },
+    "httpResponse": {
+      "statusCode": 200,
+      "headers": {
+        "content-type": [
+          "application/json"
+        ]
+      },
+      "body": {
+        "type": "JSON",
+        "json": {
+          "id": "chatcmpl-mockserver",
+          "object": "chat.completion",
+          "created": 1,
+          "model": "gpt-4o",
+          "choices": [
+            {
+              "index": 0,
+              "finish_reason": "stop",
+              "message": {
+                "role": "assistant",
+                "content": "Your order ships tomorrow."
+              }
+            }
+          ],
+          "usage": {
+            "prompt_tokens": 5,
+            "completion_tokens": 3,
+            "total_tokens": 8
+          }
+        }
+      }
+    }
+  },
+  {
+    "id": "support-lookup-A-1001",
+    "priority": 10,
+    "httpRequest": {
+      "method": "POST",
+      "path": "/v1/chat/completions",
+      "body": {
+        "type": "JSON",
+        "json": {
+          "model": "gpt-4o",
+          "messages": [
+            {
+              "role": "user",
+              "content": "${json-unit.regex}(?is)Order A-1001:.*(ship|refund).*"
+            }
+          ]
+        },
+        "matchType": "ONLY_MATCHING_FIELDS"
+      }
+    },
+    "httpResponse": {
+      "statusCode": 200,
+      "headers": {
+        "content-type": [
+          "application/json"
+        ]
+      },
+      "body": {
+        "type": "JSON",
+        "json": {
+          "id": "chatcmpl-mockserver",
+          "object": "chat.completion",
+          "created": 1,
+          "model": "gpt-4o",
+          "choices": [
+            {
+              "index": 0,
+              "finish_reason": "tool_calls",
+              "message": {
+                "role": "assistant",
+                "content": null,
+                "tool_calls": [
+                  {
+                    "id": "call_lookup_order",
+                    "type": "function",
+                    "function": {
+                      "name": "lookup_order",
+                      "arguments": "{\"order_id\": \"A-1001\"}"
+                    }
+                  }
+                ]
+              }
+            }
+          ],
+          "usage": {
+            "prompt_tokens": 5,
+            "completion_tokens": 3,
+            "total_tokens": 8
+          }
+        }
+      },
+      "delay": {
+        "timeUnit": "MILLISECONDS",
+        "value": 80
+      }
+    }
+  },
+  {
+    "id": "support-lookup-A-1002",
+    "priority": 10,
+    "httpRequest": {
+      "method": "POST",
+      "path": "/v1/chat/completions",
+      "body": {
+        "type": "JSON",
+        "json": {
+          "model": "gpt-4o",
+          "messages": [
+            {
+              "role": "user",
+              "content": "${json-unit.regex}(?is)Order A-1002:.*(ship|refund).*"
+            }
+          ]
+        },
+        "matchType": "ONLY_MATCHING_FIELDS"
+      }
+    },
+    "httpResponse": {
+      "statusCode": 200,
+      "headers": {
+        "content-type": [
+          "application/json"
+        ]
+      },
+      "body": {
+        "type": "JSON",
+        "json": {
+          "id": "chatcmpl-mockserver",
+          "object": "chat.completion",
+          "created": 1,
+          "model": "gpt-4o",
+          "choices": [
+            {
+              "index": 0,
+              "finish_reason": "tool_calls",
+              "message": {
+                "role": "assistant",
+                "content": null,
+                "tool_calls": [
+                  {
+                    "id": "call_lookup_order",
+                    "type": "function",
+                    "function": {
+                      "name": "lookup_order",
+                      "arguments": "{\"order_id\": \"A-1002\"}"
+                    }
+                  }
+                ]
+              }
+            }
+          ],
+          "usage": {
+            "prompt_tokens": 5,
+            "completion_tokens": 3,
+            "total_tokens": 8
+          }
+        }
+      },
+      "delay": {
+        "timeUnit": "MILLISECONDS",
+        "value": 150
+      }
+    }
+  },
+  {
+    "id": "support-lookup-A-1003",
+    "priority": 10,
+    "httpRequest": {
+      "method": "POST",
+      "path": "/v1/chat/completions",
+      "body": {
+        "type": "JSON",
+        "json": {
+          "model": "gpt-4o",
+          "messages": [
+            {
+              "role": "user",
+              "content": "${json-unit.regex}(?is)Order A-1003:.*(ship|refund).*"
+            }
+          ]
+        },
+        "matchType": "ONLY_MATCHING_FIELDS"
+      }
+    },
+    "httpResponse": {
+      "statusCode": 200,
+      "headers": {
+        "content-type": [
+          "application/json"
+        ]
+      },
+      "body": {
+        "type": "JSON",
+        "json": {
+          "id": "chatcmpl-mockserver",
+          "object": "chat.completion",
+          "created": 1,
+          "model": "gpt-4o",
+          "choices": [
+            {
+              "index": 0,
+              "finish_reason": "tool_calls",
+              "message": {
+                "role": "assistant",
+                "content": null,
+                "tool_calls": [
+                  {
+                    "id": "call_lookup_order",
+                    "type": "function",
+                    "function": {
+                      "name": "lookup_order",
+                      "arguments": "{\"order_id\": \"A-1003\"}"
+                    }
+                  }
+                ]
+              }
+            }
+          ],
+          "usage": {
+            "prompt_tokens": 5,
+            "completion_tokens": 3,
+            "total_tokens": 8
+          }
+        }
+      },
+      "delay": {
+        "timeUnit": "MILLISECONDS",
+        "value": 250
+      }
+    }
+  },
+  {
+    "id": "support-lookup-A-1004",
+    "priority": 10,
+    "httpRequest": {
+      "method": "POST",
+      "path": "/v1/chat/completions",
+      "body": {
+        "type": "JSON",
+        "json": {
+          "model": "gpt-4o",
+          "messages": [
+            {
+              "role": "user",
+              "content": "${json-unit.regex}(?is)Order A-1004:.*(ship|refund).*"
+            }
+          ]
+        },
+        "matchType": "ONLY_MATCHING_FIELDS"
+      }
+    },
+    "httpResponse": {
+      "statusCode": 200,
+      "headers": {
+        "content-type": [
+          "application/json"
+        ]
+      },
+      "body": {
+        "type": "JSON",
+        "json": {
+          "id": "chatcmpl-mockserver",
+          "object": "chat.completion",
+          "created": 1,
+          "model": "gpt-4o",
+          "choices": [
+            {
+              "index": 0,
+              "finish_reason": "tool_calls",
+              "message": {
+                "role": "assistant",
+                "content": null,
+                "tool_calls": [
+                  {
+                    "id": "call_lookup_order",
+                    "type": "function",
+                    "function": {
+                      "name": "lookup_order",
+                      "arguments": "{\"order_id\": \"A-1004\"}"
+                    }
+                  }
+                ]
+              }
+            }
+          ],
+          "usage": {
+            "prompt_tokens": 5,
+            "completion_tokens": 3,
+            "total_tokens": 8
+          }
+        }
+      },
+      "delay": {
+        "timeUnit": "MILLISECONDS",
+        "value": 400
+      }
+    }
+  },
+  {
+    "id": "support-lookup-A-1005",
+    "priority": 10,
+    "httpRequest": {
+      "method": "POST",
+      "path": "/v1/chat/completions",
+      "body": {
+        "type": "JSON",
+        "json": {
+          "model": "gpt-4o",
+          "messages": [
+            {
+              "role": "user",
+              "content": "${json-unit.regex}(?is)Order A-1005:.*(ship|refund).*"
+            }
+          ]
+        },
+        "matchType": "ONLY_MATCHING_FIELDS"
+      }
+    },
+    "httpResponse": {
+      "statusCode": 200,
+      "headers": {
+        "content-type": [
+          "application/json"
+        ]
+      },
+      "body": {
+        "type": "JSON",
+        "json": {
+          "id": "chatcmpl-mockserver",
+          "object": "chat.completion",
+          "created": 1,
+          "model": "gpt-4o",
+          "choices": [
+            {
+              "index": 0,
+              "finish_reason": "tool_calls",
+              "message": {
+                "role": "assistant",
+                "content": null,
+                "tool_calls": [
+                  {
+                    "id": "call_lookup_order",
+                    "type": "function",
+                    "function": {
+                      "name": "lookup_order",
+                      "arguments": "{\"order_id\": \"A-1005\"}"
+                    }
+                  }
+                ]
+              }
+            }
+          ],
+          "usage": {
+            "prompt_tokens": 5,
+            "completion_tokens": 3,
+            "total_tokens": 8
+          }
+        }
+      },
+      "delay": {
+        "timeUnit": "MILLISECONDS",
+        "value": 1200
+      }
+    }
+  },
+  {
+    "id": "provider-server-error",
+    "priority": 40,
+    "httpRequest": {
+      "method": "POST",
+      "path": "/v1/chat/completions",
+      "body": {
+        "type": "JSON",
+        "json": {
+          "model": "gpt-4o",
+          "messages": [
+            {
+              "role": "user",
+              "content": "${json-unit.regex}(?is)Order A-2001:.*"
+            }
+          ]
+        },
+        "matchType": "ONLY_MATCHING_FIELDS"
+      }
+    },
+    "httpResponse": {
+      "statusCode": 500,
+      "headers": {
+        "content-type": [
+          "application/json"
+        ]
+      },
+      "body": {
+        "type": "JSON",
+        "json": {
+          "error": {
+            "message": "The server had an error while processing your request.",
+            "type": "server_error",
+            "code": null
+          }
+        }
+      }
+    }
+  },
+  {
+    "id": "provider-rate-limited",
+    "priority": 40,
+    "httpRequest": {
+      "method": "POST",
+      "path": "/v1/chat/completions",
+      "body": {
+        "type": "JSON",
+        "json": {
+          "model": "gpt-4o",
+          "messages": [
+            {
+              "role": "user",
+              "content": "${json-unit.regex}(?is)Order A-2002:.*"
+            }
+          ]
+        },
+        "matchType": "ONLY_MATCHING_FIELDS"
+      }
+    },
+    "httpResponse": {
+      "statusCode": 429,
+      "headers": {
+        "content-type": [
+          "application/json"
+        ],
+        "retry-after": [
+          "1"
+        ]
+      },
+      "body": {
+        "type": "JSON",
+        "json": {
+          "error": {
+            "message": "Rate limit reached for requests.",
+            "type": "requests",
+            "code": null
+          }
+        }
+      }
+    }
+  },
+  {
+    "id": "provider-timeout",
+    "priority": 40,
+    "httpRequest": {
+      "method": "POST",
+      "path": "/v1/chat/completions",
+      "body": {
+        "type": "JSON",
+        "json": {
+          "model": "gpt-4o",
+          "messages": [
+            {
+              "role": "user",
+              "content": "${json-unit.regex}(?is)Order A-2003:.*"
+            }
+          ]
+        },
+        "matchType": "ONLY_MATCHING_FIELDS"
+      }
+    },
+    "httpResponse": {
+      "statusCode": 200,
+      "headers": {
+        "content-type": [
+          "application/json"
+        ]
+      },
+      "body": {
+        "type": "JSON",
+        "json": {
+          "id": "chatcmpl-mockserver",
+          "object": "chat.completion",
+          "created": 1,
+          "model": "gpt-4o",
+          "choices": [
+            {
+              "index": 0,
+              "finish_reason": "tool_calls",
+              "message": {
+                "role": "assistant",
+                "content": null,
+                "tool_calls": [
+                  {
+                    "id": "call_lookup_order",
+                    "type": "function",
+                    "function": {
+                      "name": "lookup_order",
+                      "arguments": "{\"order_id\": \"A-2003\"}"
+                    }
+                  }
+                ]
+              }
+            }
+          ],
+          "usage": {
+            "prompt_tokens": 5,
+            "completion_tokens": 3,
+            "total_tokens": 8
+          }
+        }
+      },
+      "delay": {
+        "timeUnit": "MILLISECONDS",
+        "value": 3000
+      }
+    }
+  }
+]

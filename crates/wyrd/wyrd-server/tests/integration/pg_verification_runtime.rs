@@ -1541,13 +1541,16 @@ async fn target_loading_spends_the_claimed_deadline() {
         },
         &script,
     );
-    // The claim statement ran before the blocked Card read began, so its
-    // deadline has passed once the database clock is a budget past it.
+    // The claim statement ran before the runner's blocked target read began,
+    // so its deadline has passed once the database clock is a budget past
+    // that read. Other Card readers, such as ingest attribution, may block
+    // earlier and are not the runner.
     let wait = tokio::time::Instant::now() + WAIT;
     while !sqlx::query_scalar::<_, bool>(
         "SELECT coalesce(bool_or(statement_timestamp() > a.query_start + INTERVAL '300 milliseconds'), false) \
            FROM pg_locks l JOIN pg_stat_activity a USING (pid) \
-          WHERE NOT l.granted AND l.relation = 'wyrd.cards'::regclass",
+          WHERE NOT l.granted AND l.relation = 'wyrd.cards'::regclass \
+            AND a.query LIKE '%wyrd.verification_target(%'",
     )
     .fetch_one(&harness.assertion)
     .await

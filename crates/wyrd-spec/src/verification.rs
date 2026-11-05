@@ -24,7 +24,7 @@ use crate::card::trigger::TriggerDuration;
 use crate::card::verifier::{OrderBy, SourceText};
 use crate::ids::{BindingId, CardUid, ExecutionId, FeatureName, OperatorDispatchId, SlotName};
 
-pub use ids::{JsonPath, TaskId};
+pub use ids::{JsonPath, PublicationName, TaskId};
 pub use operator::{ComparisonOperator, DivergenceMetric, JsonValueType};
 pub use plan::{DagError, ExecutionPlan, Stage, plan_stages};
 

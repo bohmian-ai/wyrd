@@ -12,6 +12,7 @@ use std::time::Duration;
 
 pub mod blocks;
 pub mod evidence;
+pub mod publications;
 pub mod registry;
 pub mod sandbox;
 pub mod tools;

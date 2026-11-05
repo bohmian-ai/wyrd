@@ -395,6 +395,31 @@ impl Workspace {
         self.writer.lock().await
     }
 
+    /// Freeze `/work` file `path` for publication: its basename and bytes,
+    /// read while holding [`Self::writer`], so no `/work` writer changes it
+    /// mid-read and later writes never reach the frozen copy.
+    ///
+    /// # Errors
+    /// Returns a `publication_path` [`invalid`] refusal for a path outside
+    /// `/work`, and [`Self::file`]'s refusals for a missing, non-regular, or
+    /// oversized file.
+    pub async fn freeze_file(&self, path: &str) -> Result<(String, Vec<u8>), ToolError> {
+        let Some(rest) = relative(path, "/work/") else {
+            return Err(invalid(
+                "publication_path",
+                "path",
+                path,
+                format!("{path} is not a file this invocation wrote under /work"),
+                "a path under /work without empty, . or .. segments",
+            ));
+        };
+        let basename = rest.rsplit('/').next().unwrap_or(rest).to_owned();
+        let _writer = self.writer().await;
+        let (host, _) = self.file(path)?;
+        let bytes = tokio::fs::read(&host).await.map_err(failed)?;
+        Ok((basename, bytes))
+    }
+
     /// The sandbox mounts: `/inputs` read-only and `/work` writable up to
     /// the space `/work` may still grow by, which is the smaller of the
     /// `/work` write limit and the scratch left after inputs, less what

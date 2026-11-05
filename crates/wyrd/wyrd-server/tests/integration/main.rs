@@ -9,6 +9,9 @@ mod identity_ui_e2e;
 /// Rust-owned opaque browser sessions through `/auth/browser`.
 mod pg_browser_sessions;
 mod pg_card_declaration_route;
+/// The durable publication backend of queued Verifier work.
+#[cfg(feature = "test-support")]
+mod pg_durable_verifier_work;
 // Inspects recovered WAL state through `replay_wal_directory`, which exists only
 // under `vala-bifrost-redux/test-support`; this crate's `test-support` feature
 // forwards it.

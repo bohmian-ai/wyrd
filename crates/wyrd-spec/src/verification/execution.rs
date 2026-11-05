@@ -29,7 +29,7 @@ use crate::reference::CardRef;
 use crate::storage::ids::UploadId;
 use crate::storage::upload::UploadPlan;
 use crate::vala::ids::{RunId, TraceId};
-use crate::verification::TaskId;
+use crate::verification::{PublicationName, TaskId};
 
 /// `POST /v1/verification/execute` and `POST /v1/verification/enqueue`
 /// request body: the exact Verifier and subject plus one declaration per
@@ -414,6 +414,109 @@ pub enum InvocationSettlement {
         /// The reported requirement result.
         result: Box<RequirementResult>,
     },
+}
+
+/// The content kind one execution publication retains.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum PublicationKind {
+    /// One regular file.
+    File,
+    /// One directory tree.
+    Directory,
+    /// One bounded JSON value, `null` included.
+    Json,
+}
+
+/// The producer invocation attempt that accepted a publication.
+///
+/// This is the host-assigned logical invocation identity: the step, its
+/// zero-based fanout item and repeat iteration when those constructs exist,
+/// and its one-based attempt. Authors never supply it.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize, JsonSchema)]
+#[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
+pub struct Producer {
+    /// The producing step.
+    pub step_id: TaskId,
+    /// Zero-based fanout item; `None` without fanout.
+    pub item_index: Option<u32>,
+    /// Zero-based repeat iteration; `None` without repeat.
+    pub iteration_index: Option<u32>,
+    /// One-based attempt.
+    pub attempt: u32,
+}
+
+/// One regular file a file or directory publication retains.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
+pub struct PublicationFile {
+    /// Path relative to the publication root; a file publication's one entry
+    /// is its basename.
+    pub path: String,
+    /// SHA-256 of the file's bytes, the verification File that holds them.
+    pub sha256: Sha256Hex,
+    /// File size in bytes.
+    pub size_bytes: u64,
+}
+
+/// The immutable manifest of a file or directory publication.
+///
+/// Every byte it names was completed as a verification File before the
+/// manifest committed, so a manifest never names partial content.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
+pub struct PublicationManifest {
+    /// Every regular file, sorted by path.
+    pub files: Vec<PublicationFile>,
+}
+
+/// The content one publication retains: a manifest of completed Files for
+/// a file or directory, or a bounded JSON value.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum PublicationContent {
+    /// One regular file; its manifest holds exactly one entry.
+    File {
+        /// The retained file.
+        manifest: PublicationManifest,
+    },
+    /// One directory tree.
+    Directory {
+        /// The retained tree.
+        manifest: PublicationManifest,
+    },
+    /// One JSON value, `null` included.
+    Json {
+        /// The retained value.
+        value: Value,
+    },
+}
+
+impl PublicationContent {
+    /// The kind of content retained.
+    #[must_use]
+    pub const fn kind(&self) -> PublicationKind {
+        match self {
+            Self::File { .. } => PublicationKind::File,
+            Self::Directory { .. } => PublicationKind::Directory,
+            Self::Json { .. } => PublicationKind::Json,
+        }
+    }
+}
+
+/// One accepted, immutable execution publication.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
+pub struct Publication {
+    /// The logical name, unique within its producer attempt.
+    pub name: PublicationName,
+    /// The invocation attempt that accepted it.
+    pub producer: Producer,
+    /// The retained content.
+    #[serde(flatten)]
+    pub content: PublicationContent,
 }
 
 /// One tool call an Agent action made.

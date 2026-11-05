@@ -27,7 +27,7 @@ use sqlx::types::{Json, Uuid};
 use wyrd_runtime::AcceptedAuthority;
 use wyrd_runtime::principal::PrincipalId;
 use wyrd_spec::DataTenantId;
-use wyrd_spec::auth::Attribution;
+use wyrd_spec::auth::{Attribution, Sha256Hex};
 use wyrd_spec::card::operator::{DriftCounts, MAX_SUMMARY_CHARS};
 use wyrd_spec::card::verifier::SourceText;
 use wyrd_spec::error::WyrdError;
@@ -35,14 +35,15 @@ use wyrd_spec::ids::{
     BindingId, CardUid, ExecutionId, GroupId, OperatorDispatchId, SlotName, VerificationResultId,
 };
 use wyrd_spec::vala::ids::{RunId, SpanId, TraceId};
-use wyrd_spec::verification::TaskId;
 use wyrd_spec::verification::execution::{
-    InvocationSettlement, VerificationExecutionState, VerificationRequest,
+    InvocationSettlement, Producer, Publication, PublicationContent, PublicationManifest,
+    VerificationExecutionState, VerificationRequest,
 };
 use wyrd_spec::verification::{
     DriftWindow, FrozenTarget, GroupEndSettings, OperatorDispatchState, VerificationBindingStatus,
     VerificationError, VerificationVerdict, VerifierReadiness,
 };
+use wyrd_spec::verification::{PublicationName, TaskId};
 
 use crate::queries::verification::{BindingSchedule, InactivityTimeout, binding_activity};
 use crate::{OperatorPool, TenantConn};
@@ -640,6 +641,47 @@ const SETTLE_INVOCATION_SQL: &str = r"
      WHERE i.execution_id = e.execution_id AND i.task_id = $3 AND i.attempt = $4
        AND i.item_index IS NULL AND i.iteration_index IS NULL
        AND i.settlement IS NULL
+";
+
+/// Accept one publication of a leased execution's invocation attempt, once.
+///
+/// The execution row is share-locked as [`BEGIN_INVOCATION_SQL`] does. A
+/// name the attempt already holds inserts nothing; the statement then reports
+/// whether that holder is the same call with the same arguments. The outer
+/// read runs on the statement's snapshot, so it never sees this insert.
+const ACCEPT_PUBLICATION_SQL: &str = r"
+    WITH fenced AS (
+        SELECT data_tenant_id, execution_id FROM wyrd.verifier_executions
+         WHERE execution_id = $1 AND lease_token = $2 AND status = 'running'
+           FOR SHARE
+    ), inserted AS (
+        INSERT INTO wyrd.verifier_execution_publications
+            (data_tenant_id, execution_id, task_id, item_index, iteration_index, attempt,
+             name, kind, call_id, arguments_sha256, value, manifest, accepted_at)
+        SELECT data_tenant_id, execution_id, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12,
+               statement_timestamp()
+          FROM fenced
+        ON CONFLICT DO NOTHING
+        RETURNING 1
+    )
+    SELECT EXISTS (SELECT 1 FROM fenced) AS fenced,
+           EXISTS (SELECT 1 FROM inserted) AS inserted,
+           COALESCE((SELECT p.call_id = $9 AND p.arguments_sha256 = $10
+                       FROM wyrd.verifier_execution_publications p
+                      WHERE p.execution_id = $1 AND p.task_id = $3
+                        AND p.item_index IS NOT DISTINCT FROM $4
+                        AND p.iteration_index IS NOT DISTINCT FROM $5
+                        AND p.attempt = $6 AND p.name = $7), FALSE) AS same_call
+";
+
+/// Read one publication of an execution by its producer attempt and name.
+const PUBLICATION_SQL: &str = r"
+    SELECT task_id, item_index, iteration_index, attempt, name, kind, value, manifest
+      FROM wyrd.verifier_execution_publications
+     WHERE execution_id = $1 AND task_id = $2
+       AND item_index IS NOT DISTINCT FROM $3
+       AND iteration_index IS NOT DISTINCT FROM $4
+       AND attempt = $5 AND name = $6
 ";
 
 /// Read one execution's control-plane status.
@@ -1596,6 +1638,83 @@ pub struct Invocation {
     /// Its committed settlement; `None` when the attempt was dispatched and
     /// never settled, so its outcome is unknown.
     pub settlement: Option<InvocationSettlement>,
+}
+
+/// The call that asks to accept one publication.
+#[derive(Debug, Clone, Copy)]
+pub struct PublicationCall<'a> {
+    /// The publication to accept.
+    pub publication: &'a Publication,
+    /// The accepting call's identity, stable across its replays.
+    pub call_id: &'a str,
+    /// Digest of the call's canonical arguments.
+    pub arguments: &'a Sha256Hex,
+}
+
+/// Outcome of accepting one publication.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PublicationAcceptance {
+    /// The publication committed.
+    Accepted,
+    /// The same call with the same arguments already committed it.
+    Replayed,
+    /// Another call, or the same call with other arguments, holds the name
+    /// in this attempt.
+    Conflict,
+    /// The lease is no longer held; nothing committed.
+    StaleLease,
+}
+
+/// One stored publication row.
+#[derive(sqlx::FromRow)]
+struct PublicationRow {
+    task_id: String,
+    item_index: Option<i32>,
+    iteration_index: Option<i32>,
+    attempt: i32,
+    name: String,
+    kind: String,
+    value: Option<Json<Value>>,
+    manifest: Option<Json<PublicationManifest>>,
+}
+
+impl PublicationRow {
+    /// Decode the stored row.
+    ///
+    /// # Errors
+    /// Returns a decode error when an identity, index, kind, or content
+    /// column is malformed.
+    fn decode(self) -> Result<Publication, SqlxError> {
+        let index = |index: Option<i32>| index.map(u32::try_from).transpose();
+        let content = match (self.kind.as_str(), self.value, self.manifest) {
+            ("json", Some(Json(value)), None) => PublicationContent::Json { value },
+            ("file", None, Some(Json(manifest))) => PublicationContent::File { manifest },
+            ("directory", None, Some(Json(manifest))) => PublicationContent::Directory { manifest },
+            (kind, ..) => {
+                return Err(SqlxError::Decode(
+                    format!("publication kind {kind:?} does not match its content").into(),
+                ));
+            }
+        };
+        Ok(Publication {
+            name: stored(PublicationName::new(self.name))?,
+            producer: Producer {
+                step_id: stored(TaskId::new(self.task_id))?,
+                item_index: stored(index(self.item_index))?,
+                iteration_index: stored(index(self.iteration_index))?,
+                attempt: stored(u32::try_from(self.attempt))?,
+            },
+            content,
+        })
+    }
+}
+
+/// A producer's zero-based index or one-based attempt as its SQL integer.
+///
+/// # Errors
+/// Returns an encode error when the value exceeds `INTEGER`.
+fn column(value: u32) -> Result<i32, SqlxError> {
+    i32::try_from(value).map_err(|error| SqlxError::Encode(Box::new(error)))
 }
 
 /// Outcome of a token-fenced settlement.
@@ -3192,6 +3311,86 @@ impl VerifierExecutionQueue {
                 .execute(&mut **conn.transaction())
                 .await?;
             Ok(settlement(result.rows_affected()))
+        })
+        .await
+    }
+
+    /// Accept `call`'s publication under `lease`, once.
+    ///
+    /// Every File its manifest names must already be complete. The same call
+    /// with the same arguments replays as [`PublicationAcceptance::Replayed`];
+    /// any other holder of the name in that attempt is a conflict.
+    ///
+    /// # Errors
+    /// Returns the database error when the statement fails, or an encode
+    /// error when a producer index, attempt, or content cannot be stored.
+    #[tracing::instrument(skip(self, conn, call), fields(operation = "verification.executions.accept_publication", execution_id = %lease.execution_id))]
+    pub async fn accept_publication(
+        &self,
+        conn: &mut TenantConn<'_>,
+        lease: ExecutionLease,
+        call: PublicationCall<'_>,
+    ) -> Result<PublicationAcceptance, SqlxError> {
+        timed("accept_publication", async {
+            let publication = call.publication;
+            let producer = &publication.producer;
+            let (kind, value, manifest) = match &publication.content {
+                PublicationContent::Json { value } => ("json", Some(Json(value)), None),
+                PublicationContent::File { manifest } => ("file", None, Some(Json(manifest))),
+                PublicationContent::Directory { manifest } => {
+                    ("directory", None, Some(Json(manifest)))
+                }
+            };
+            let (fenced, inserted, same_call): (bool, bool, bool) =
+                sqlx::query_as(ACCEPT_PUBLICATION_SQL)
+                    .bind(lease.execution_id.as_uuid())
+                    .bind(lease.token.0)
+                    .bind(producer.step_id.as_str())
+                    .bind(producer.item_index.map(column).transpose()?)
+                    .bind(producer.iteration_index.map(column).transpose()?)
+                    .bind(column(producer.attempt)?)
+                    .bind(publication.name.as_str())
+                    .bind(kind)
+                    .bind(call.call_id)
+                    .bind(call.arguments.to_string())
+                    .bind(value)
+                    .bind(manifest)
+                    .fetch_one(&mut **conn.transaction())
+                    .await?;
+            Ok(match (fenced, inserted, same_call) {
+                (false, ..) => PublicationAcceptance::StaleLease,
+                (true, true, _) => PublicationAcceptance::Accepted,
+                (true, false, true) => PublicationAcceptance::Replayed,
+                (true, false, false) => PublicationAcceptance::Conflict,
+            })
+        })
+        .await
+    }
+
+    /// Read the publication `name` that `producer` accepted in `execution`;
+    /// `None` when it accepted none under that name.
+    ///
+    /// # Errors
+    /// Returns the database error when the read fails, or a decode error when
+    /// the stored row is malformed.
+    pub async fn publication(
+        &self,
+        conn: &mut TenantConn<'_>,
+        execution: ExecutionId,
+        producer: &Producer,
+        name: &PublicationName,
+    ) -> Result<Option<Publication>, SqlxError> {
+        timed("publication", async {
+            let row: Option<PublicationRow> = sqlx::query_as(PUBLICATION_SQL)
+                .bind(execution.as_uuid())
+                .bind(producer.step_id.as_str())
+                .bind(producer.item_index.map(column).transpose()?)
+                .bind(producer.iteration_index.map(column).transpose()?)
+                .bind(column(producer.attempt)?)
+                .bind(name.as_str())
+                .fetch_optional(&mut **conn.transaction())
+                .await?;
+            row.map(PublicationRow::decode).transpose()
         })
         .await
     }

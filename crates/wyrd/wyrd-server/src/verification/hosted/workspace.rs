@@ -33,12 +33,13 @@ use wyrd_loader::{EXTRACT_VERSION, Extraction, lines, zip_guard};
 use wyrd_spec::error::WyrdError;
 use wyrd_spec::ids::SlotName;
 use wyrd_spec::verification::execution::{
-    CollectionEntry, InputDeclaration, Producer, Publication, PublicationContent,
+    CollectionEntry, InputDeclaration, Producer, PublicationContent,
 };
 
 use super::evidence::TenantEvidence;
 use super::tools::{invocation, structured};
 use super::{HostedLimits, extract_refused};
+use wyrd_sql::queries::verifier_executions::StoredPublication;
 
 /// Process-wide admission of scratch workspaces.
 pub struct Workspaces {
@@ -111,8 +112,9 @@ impl Workspaces {
                         .publications(&producer.step_id)
                         .await?
                         .into_iter()
-                        .find(|publication| {
-                            &publication.producer == producer && &publication.name == name
+                        .find(|stored| {
+                            &stored.publication.producer == producer
+                                && &stored.publication.name == name
                         })
                         .ok_or_else(|| {
                             terminal(format!(
@@ -130,8 +132,8 @@ impl Workspaces {
                     for publication in evidence.publications(step).await? {
                         let relative = format!(
                             "content/{}/{}",
-                            segment(&publication.producer),
-                            publication.name.as_str()
+                            segment(&publication.publication.producer),
+                            publication.publication.name.as_str()
                         );
                         mount
                             .publication(
@@ -141,6 +143,7 @@ impl Workspaces {
                                 sources,
                             )
                             .await?;
+                        let publication = publication.publication;
                         manifest.entries.push(CollectionEntry {
                             kind: publication.content.kind(),
                             name: publication.name,
@@ -218,7 +221,8 @@ impl Mount {
     }
 
     /// Stage `publication` at `path`: a file there, a JSON file there, or a
-    /// directory there with its files and empty directories beneath it.
+    /// directory there with its files and empty directories beneath it,
+    /// each file read through its completed File descriptor.
     ///
     /// # Errors
     /// Returns [`TenantEvidence::published`]'s errors.
@@ -226,14 +230,14 @@ impl Mount {
         &mut self,
         evidence: &TenantEvidence,
         path: &str,
-        publication: &Publication,
+        stored: &StoredPublication,
         sources: &BTreeSet<SlotName>,
     ) -> Result<(), BlockError> {
-        match &publication.content {
+        match &stored.publication.content {
             PublicationContent::Json { value } => self.json(path.to_owned(), value, sources),
             PublicationContent::File { manifest } => {
-                for file in &manifest.files {
-                    let bytes = evidence.published(file).await?;
+                for (file, object) in manifest.files.iter().zip(&stored.objects) {
+                    let bytes = evidence.published(file, object).await?;
                     self.file(path.to_owned(), bytes, None, sources);
                 }
             }
@@ -245,8 +249,8 @@ impl Mount {
                         .iter()
                         .map(|directory| format!("{path}/{directory}")),
                 );
-                for file in &manifest.files {
-                    let bytes = evidence.published(file).await?;
+                for (file, object) in manifest.files.iter().zip(&stored.objects) {
+                    let bytes = evidence.published(file, object).await?;
                     self.file(format!("{path}/{}", file.path), bytes, None, sources);
                 }
             }

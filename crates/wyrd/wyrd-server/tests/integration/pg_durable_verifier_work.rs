@@ -95,6 +95,7 @@ impl Leased {
             .await
             .expect("the publications read")
             .into_iter()
+            .map(|stored| stored.publication)
             .find(|publication| {
                 &publication.producer == producer && publication.name.as_str() == name
             })
@@ -510,9 +511,10 @@ async fn directory_snapshot_is_complete_or_rejected() {
         .expect("test server shuts down");
 }
 
-/// A replay of the same call and arguments recovers its one receipt; the
-/// same name from another call, or from that call with other arguments,
-/// conflicts; a fresh attempt publishes the name again with its own
+/// A replay of the same call and arguments recovers its one receipt, even
+/// after its scratch file is removed or replaced by a directory and while
+/// storage is unavailable, answering the stored kind; the same name from
+/// another call, or from that call with other arguments, conflicts; a fresh attempt publishes the name again with its own
 /// attribution. An upload that fails, or a publication under a lease since
 /// reclaimed, leaves nothing readable.
 ///
@@ -551,6 +553,35 @@ async fn publication_replay_preserves_attempt_identity() {
             .await
             .expect("the file call and its replay answer one receipt");
     }
+    std::fs::remove_file(workspace.work_dir().join("notes.md")).expect("scratch removed");
+    let wyrd_storage::BackendConfig::Local { root } =
+        leased.server.state().storage.backend_config()
+    else {
+        panic!("the test server stores locally");
+    };
+    let evidence = root
+        .join(leased.server.data_tenant_id().to_string())
+        .join("evidence/sha256");
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        std::fs::set_permissions(&evidence, std::fs::Permissions::from_mode(0o000)).expect("chmod");
+        let gone = publications
+            .path(&call("f1", &first, "notes"), &workspace, "/work/notes.md")
+            .await;
+        put(&workspace, "notes.md/now-a-directory.md", b"other");
+        let replaced = publications
+            .path(&call("f1", &first, "notes"), &workspace, "/work/notes.md")
+            .await;
+        std::fs::set_permissions(&evidence, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+        assert_eq!(
+            (
+                gone.expect("a replay needs neither scratch nor storage"),
+                replaced.expect("a replay ignores what scratch holds now")
+            ),
+            (PublicationKind::File, PublicationKind::File),
+            "a replay answers the stored kind"
+        );
+    }
     for (id, value) in [("c1", json!({"v": 2})), ("c2", json!({"v": 1}))] {
         let error = publications
             .json(&call(id, &first, "report"), value)
@@ -578,14 +609,6 @@ async fn publication_replay_preserves_attempt_identity() {
         "each attempt keeps its own attribution"
     );
 
-    let wyrd_storage::BackendConfig::Local { root } =
-        leased.server.state().storage.backend_config()
-    else {
-        panic!("the test server stores locally");
-    };
-    let evidence = root
-        .join(leased.server.data_tenant_id().to_string())
-        .join("evidence/sha256");
     {
         use std::os::unix::fs::PermissionsExt as _;
         put(&workspace, "tree/kept.md", b"kept");
@@ -625,6 +648,147 @@ async fn publication_replay_preserves_attempt_identity() {
         ],
         "one entry per accepted call, none for the failed upload or stale lease"
     );
+    leased
+        .server
+        .shutdown()
+        .await
+        .expect("test server shuts down");
+}
+
+/// Publication limits bound what one execution retains: a file at the file
+/// limit is accepted and mounts, one byte more is refused before upload, and
+/// the cumulative count and byte ceilings hold across replays, which are
+/// charged once, and across a reclaim, which inherits the spent budget.
+/// Accepted files mount from their completed File descriptors while the
+/// object inventory cannot be read at all.
+///
+/// # Panics
+/// Panics when a limit admits or refuses the wrong publication, a replay or
+/// reclaim changes the charge, or a mount needs the inventory.
+#[tokio::test(flavor = "multi_thread")]
+async fn publication_limits_survive_reclaim() {
+    let leased = Leased::start().await;
+    let limits = HostedLimits {
+        file_max_bytes: 8,
+        files_max_bytes: 16,
+        publications_max: 3,
+        work_write_max_bytes: 64,
+        ..HostedLimits::default()
+    };
+    let caller = user(leased.server.data_tenant_id(), []);
+    let workspace = Workspace::materialize(Vec::new(), limits, None).expect("workspace");
+    let publications = Publications::new(leased.server.state(), &caller, leased.lease, limits);
+    let producer = Producer {
+        step_id: TaskId::new("review").expect("task"),
+        item_index: None,
+        iteration_index: None,
+        attempt: 1,
+    };
+    put(&workspace, "edge.bin", b"12345678");
+    put(&workspace, "over.bin", b"123456789");
+    put(&workspace, "tail.bin", b"abcdefgh");
+
+    assert_eq!(
+        publications
+            .path(
+                &call("edge", &producer, "edge"),
+                &workspace,
+                "/work/edge.bin"
+            )
+            .await
+            .expect("a file at the file limit is accepted"),
+        PublicationKind::File
+    );
+    let over = publications
+        .path(
+            &call("over", &producer, "over"),
+            &workspace,
+            "/work/over.bin",
+        )
+        .await
+        .expect_err("a file over the file limit is refused");
+    assert_eq!(rule(&over), "publication_size");
+    publications
+        .json(&call("j", &producer, "j"), json!("ab"))
+        .await
+        .expect("a 4-byte value fits the 16-byte total");
+    let tail = publications
+        .path(
+            &call("tail", &producer, "tail"),
+            &workspace,
+            "/work/tail.bin",
+        )
+        .await
+        .expect_err("12 retained bytes plus 8 exceed 16");
+    assert_eq!(rule(&tail), "publication_bytes");
+    publications
+        .path(
+            &call("edge", &producer, "edge"),
+            &workspace,
+            "/work/edge.bin",
+        )
+        .await
+        .expect("a replay is not charged again");
+
+    let current = leased.reclaim().await;
+    let resumed = Publications::new(leased.server.state(), &caller, current, limits);
+    resumed
+        .json(&call("k", &producer, "k"), json!(1))
+        .await
+        .expect("the third publication fits");
+    let count = resumed
+        .json(&call("l", &producer, "l"), json!(1))
+        .await
+        .expect_err("a reclaim inherits the accepted count");
+    assert_eq!(rule(&count), "publication_count");
+    for refused in ["over", "tail", "l"] {
+        assert_eq!(leased.read(&producer, refused).await, None, "{refused}");
+    }
+
+    let blind = wyrd_server::components::auth::Caller {
+        // Not a SYSTEM principal, so every inventory query is unavailable.
+        executed_by: Some(wyrd_runtime::principal::PrincipalId::new(
+            uuid::Uuid::new_v4(),
+        )),
+        ..caller
+    };
+    let evidence = TenantEvidence::new(
+        leased.server.state().clone(),
+        blind,
+        BTreeMap::new(),
+        limits,
+    )
+    .with_execution(leased.lease.execution_id);
+    evidence
+        .read(&InputDeclaration::File {
+            sha256: wyrd_spec::auth::Sha256Hex::digest(b"12345678"),
+            size_bytes: 8,
+            format: MediaFormat::Markdown,
+            filename: None,
+        })
+        .await
+        .expect_err("the object inventory cannot be read by this caller");
+    let mounted = Workspaces::new(limits)
+        .open(
+            &BTreeMap::from([(
+                "/inputs/edge".to_owned(),
+                CallInput {
+                    value: CallValue::Publication {
+                        producer: producer.clone(),
+                        name: PublicationName::new("edge").expect("name"),
+                    },
+                    sources: BTreeSet::new(),
+                },
+            )]),
+            &evidence,
+        )
+        .await
+        .expect("an accepted file mounts from its completed descriptor");
+    assert_eq!(
+        std::fs::read(mounted.inputs_dir().join("edge")).expect("mounted"),
+        b"12345678"
+    );
+    drop(mounted);
     leased
         .server
         .shutdown()

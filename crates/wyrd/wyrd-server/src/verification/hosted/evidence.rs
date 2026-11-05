@@ -34,14 +34,16 @@ use wyrd_spec::envelope::CardKind;
 use wyrd_spec::ids::{CardUid, ExecutionId, SlotName};
 use wyrd_spec::reference::{CardRef, CardRefIdentity};
 use wyrd_spec::registry::StoredArtifactEntry;
+use wyrd_spec::storage::StoredObjectRef;
 use wyrd_spec::verification::TaskId;
 use wyrd_spec::verification::execution::{
-    CallProvenance, Citation, InputDeclaration, Locator, Publication, PublicationFile,
+    CallProvenance, Citation, InputDeclaration, Locator, PublicationFile,
 };
-use wyrd_sql::queries::verifier_executions::VerifierExecutionQueue;
+use wyrd_sql::queries::verifier_executions::{StoredPublication, VerifierExecutionQueue};
 use wyrd_storage::error::StorageError;
 use wyrd_storage::tenant_path::{self, ValidatedPath};
 
+use super::publications::published_object;
 use super::registry::refusal;
 use super::{HostedLimits, extract_refused};
 use crate::components::auth::Caller;
@@ -105,12 +107,13 @@ impl TenantEvidence {
 
     /// Every publication `step` accepted in the bound execution, grouped by
     /// item, iteration, and attempt and in acceptance order within an
-    /// attempt; none without a bound execution.
+    /// attempt, each with its completed File descriptors; none without a
+    /// bound execution.
     ///
     /// # Errors
     /// Returns [`BlockError::Retryable`] when the publications cannot be
     /// read now.
-    pub async fn publications(&self, step: &TaskId) -> Result<Vec<Publication>, BlockError> {
+    pub async fn publications(&self, step: &TaskId) -> Result<Vec<StoredPublication>, BlockError> {
         let Some(execution) = self.execution else {
             return Ok(Vec::new());
         };
@@ -129,14 +132,21 @@ impl TenantEvidence {
             .map_err(|error| unavailable(&error))
     }
 
-    /// The verified bytes of one file a publication retains.
+    /// The verified bytes of one file a publication retains, read from the
+    /// completed File descriptor `object` its acceptance kept, never from
+    /// an inventory lookup.
     ///
     /// # Errors
-    /// As reading a declared File: [`BlockError::Retryable`] while its
-    /// completed record is not yet visible or storage is unavailable, and
-    /// [`BlockError::Terminal`] for bytes that do not match its manifest.
-    pub async fn published(&self, file: &PublicationFile) -> Result<Vec<u8>, BlockError> {
-        let path = self.file_object(&file.sha256, file.size_bytes).await?;
+    /// [`BlockError::Terminal`] for a descriptor that does not match the
+    /// manifest file or bytes that do not, and [`BlockError::Retryable`]
+    /// while storage is unavailable.
+    pub async fn published(
+        &self,
+        file: &PublicationFile,
+        object: &StoredObjectRef,
+    ) -> Result<Vec<u8>, BlockError> {
+        let path = published_object(self.caller.data_tenant_id, file, object)
+            .map_err(|error| terminal(&error.to_string()))?;
         self.stored(&path, file.size_bytes, &file.sha256).await
     }
 

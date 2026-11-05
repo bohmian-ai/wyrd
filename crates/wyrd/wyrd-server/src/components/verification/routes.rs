@@ -429,7 +429,7 @@ async fn get_publication(
 /// Returns a stable Wyrd error when the path, producer selector, or file
 /// path is invalid, the publication is JSON, the caller lacks
 /// `verifier:read` on the execution's Verifier, the queued execution or
-/// publication is absent, the file's upload is not yet visible, or storage
+/// publication is absent, its stored file descriptor is malformed, or storage
 /// fails.
 #[utoipa::path(
     post,

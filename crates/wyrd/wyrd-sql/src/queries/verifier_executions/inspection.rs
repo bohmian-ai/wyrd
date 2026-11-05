@@ -3,7 +3,10 @@
 //! A listing's first page fixes its cut, the highest insertion `sequence`
 //! committed then; every later page of that listing reads strictly after
 //! its predecessor and never past the cut, so a listing has no gap or
-//! duplicate while more entries commit. Publication pages carry names,
+//! duplicate while more entries commit. Every writer allocating an
+//! execution's sequence holds its row `FOR NO KEY UPDATE` to commit, and the
+//! cut is read only after [`CUT_LOCK_SQL`] waits out such a writer, so no
+//! lower sequence can commit after a cut that excludes it. Publication pages carry names,
 //! kinds, and producers only, never content.
 // raw-query grep allowlist: verifier execution tables post-date the sqlx offline cache; run `mise run sqlx:prepare` to promote to macros.
 
@@ -15,6 +18,15 @@ use wyrd_spec::verification::execution::{InvocationSettlement, Producer, Publica
 
 use super::{VerifierExecutionQueue, producer, stored, timed};
 use crate::TenantConn;
+
+/// Wait until no writer of execution `$1` holds an uncommitted sequence.
+///
+/// The share lock conflicts with the writers' `FOR NO KEY UPDATE` and is
+/// released at the reader's commit; the cut is then read by a later
+/// statement, whose snapshot includes every writer this one waited for.
+const CUT_LOCK_SQL: &str = r"
+    SELECT 1 FROM wyrd.verifier_executions WHERE execution_id = $1 FOR SHARE
+";
 
 /// The highest invocation sequence `$1` has committed.
 const INVOCATION_CUT_SQL: &str = r"
@@ -89,23 +101,36 @@ pub struct PublicationEntry {
 /// One stored invocation attempt with its sequence.
 #[derive(sqlx::FromRow)]
 struct InvocationRow {
+    /// Insertion order within the execution's listing.
     sequence: i64,
+    /// Step or requirement invoked.
     task_id: String,
+    /// Zero-based fanout item; `None` without fanout.
     item_index: Option<i32>,
+    /// Zero-based repeat iteration; `None` without repeat.
     iteration_index: Option<i32>,
+    /// One-based attempt.
     attempt: i32,
+    /// Committed settlement; `None` while unsettled.
     settlement: Option<Json<InvocationSettlement>>,
 }
 
 /// One stored publication's name, kind, and producer with its sequence.
 #[derive(sqlx::FromRow)]
 struct PublicationEntryRow {
+    /// Insertion order within the execution's listing.
     sequence: i64,
+    /// Producer step or requirement.
     task_id: String,
+    /// Zero-based fanout item; `None` without fanout.
     item_index: Option<i32>,
+    /// Zero-based repeat iteration; `None` without repeat.
     iteration_index: Option<i32>,
+    /// One-based producer attempt.
     attempt: i32,
+    /// Logical publication name.
     name: String,
+    /// `file`, `directory`, or `json`.
     kind: String,
 }
 
@@ -113,7 +138,7 @@ struct PublicationEntryRow {
 ///
 /// # Errors
 /// Returns a decode error for a kind the table does not admit.
-fn kind(kind: &str) -> Result<PublicationKind, SqlxError> {
+pub(super) fn kind(kind: &str) -> Result<PublicationKind, SqlxError> {
     match kind {
         "file" => Ok(PublicationKind::File),
         "directory" => Ok(PublicationKind::Directory),
@@ -122,6 +147,27 @@ fn kind(kind: &str) -> Result<PublicationKind, SqlxError> {
             format!("unknown publication kind {other:?}").into(),
         )),
     }
+}
+
+/// A new listing's cut of `execution`: `cut_sql`'s highest committed
+/// sequence, read once [`CUT_LOCK_SQL`] has waited out every writer still
+/// holding an uncommitted one.
+///
+/// # Errors
+/// Returns the database error when either read fails.
+async fn cut(
+    conn: &mut TenantConn<'_>,
+    execution: ExecutionId,
+    cut_sql: &'static str,
+) -> Result<i64, SqlxError> {
+    sqlx::query(CUT_LOCK_SQL)
+        .bind(execution.as_uuid())
+        .execute(&mut **conn.transaction())
+        .await?;
+    sqlx::query_scalar(cut_sql)
+        .bind(execution.as_uuid())
+        .fetch_one(&mut **conn.transaction())
+        .await
 }
 
 impl VerifierExecutionQueue {
@@ -144,10 +190,7 @@ impl VerifierExecutionQueue {
             let position = match position {
                 Some(position) => position,
                 None => PagePosition {
-                    through: sqlx::query_scalar(INVOCATION_CUT_SQL)
-                        .bind(execution.as_uuid())
-                        .fetch_one(&mut **conn.transaction())
-                        .await?,
+                    through: cut(conn, execution, INVOCATION_CUT_SQL).await?,
                     after: 0,
                 },
             };
@@ -202,10 +245,7 @@ impl VerifierExecutionQueue {
             let position = match position {
                 Some(position) => position,
                 None => PagePosition {
-                    through: sqlx::query_scalar(PUBLICATION_CUT_SQL)
-                        .bind(execution.as_uuid())
-                        .fetch_one(&mut **conn.transaction())
-                        .await?,
+                    through: cut(conn, execution, PUBLICATION_CUT_SQL).await?,
                     after: 0,
                 },
             };

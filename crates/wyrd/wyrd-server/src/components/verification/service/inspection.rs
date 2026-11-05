@@ -18,7 +18,6 @@ use wyrd_runtime::permission::{Action, PermissionScope, Resource};
 use wyrd_spec::error::WyrdError;
 use wyrd_spec::ids::ExecutionId;
 use wyrd_spec::storage::{DownloadInitResponse, StorageBackendKind};
-use wyrd_spec::vala::error::BifrostError;
 use wyrd_spec::verification::execution::{
     CancelExecutionResponse, EXECUTION_PAGE_DEFAULT, EXECUTION_PAGE_MAX, ExecutionInvocation,
     ExecutionPageQuery, HistoryProjection, InvocationPage, InvocationProgress,
@@ -27,15 +26,17 @@ use wyrd_spec::verification::execution::{
 };
 use wyrd_spec::verification::{PublicationName, TaskId};
 use wyrd_sql::TenantConn;
-use wyrd_sql::queries::verifier_executions::{ExecutionStatus, InvocationEntry, PagePosition};
+use wyrd_sql::queries::verifier_executions::{
+    ExecutionStatus, InvocationEntry, PagePosition, StoredPublication,
+};
 use wyrd_storage::error::StorageError;
 use wyrd_storage::tenant_path::ValidatedPath;
 
 use super::VerificationControl;
 use crate::audit;
 use crate::components::auth::Caller;
-use crate::components::storage::inventory::ObjectInventory;
 use crate::state::registry_db_error;
+use crate::verification::hosted::publications::published_object;
 
 /// Audit operation of an invocation page read.
 const LIST_INVOCATIONS: &str = "verification.execution.invocations";
@@ -372,6 +373,7 @@ impl<'a> VerificationControl<'a> {
         }
         self.select(caller, execution_id, step, name, selector, READ_PUBLICATION)
             .await
+            .map(|stored| stored.publication)
     }
 
     /// A download plan for one file of a file or directory publication: the
@@ -446,13 +448,14 @@ impl<'a> VerificationControl<'a> {
 
     /// Authorize `operation` on the publication `selector` names and locate
     /// its one file: the file publication's only file, or the directory's
-    /// regular file at `selector.path`.
+    /// regular file at `selector.path`, through the completed File
+    /// descriptor its acceptance kept, never an inventory lookup.
     ///
     /// # Errors
     /// Returns [`WyrdError::Validation`] for a JSON publication, a path on a
     /// file publication, or a directory path its manifest does not list;
-    /// `WYRD_VALA_503_QUERY_VISIBILITY_UNAVAILABLE` while the file's completed
-    /// upload is not yet visible; and the errors of [`Self::publication`].
+    /// [`WyrdError::Internal`] for a descriptor that does not match its
+    /// manifest file; and the errors of [`Self::publication`].
     async fn file(
         &self,
         caller: &Caller,
@@ -462,13 +465,13 @@ impl<'a> VerificationControl<'a> {
         selector: &PublicationSelector,
         operation: &str,
     ) -> Result<(ValidatedPath, PublicationFile), WyrdError> {
-        let publication = self
+        let stored = self
             .select(caller, execution_id, step, name, selector, operation)
             .await?;
         let path = selector.path.as_deref();
-        let file = match publication.content {
+        let found = match stored.publication.content {
             PublicationContent::File { manifest } if path.is_none() => {
-                manifest.files.into_iter().next()
+                manifest.files.into_iter().zip(stored.objects).next()
             }
             PublicationContent::File { .. } => {
                 return Err(invalid(
@@ -479,7 +482,8 @@ impl<'a> VerificationControl<'a> {
             PublicationContent::Directory { manifest } if path.is_some() => manifest
                 .files
                 .into_iter()
-                .find(|file| Some(file.path.as_str()) == path),
+                .zip(stored.objects)
+                .find(|(file, _)| Some(file.path.as_str()) == path),
             PublicationContent::Directory { .. } => {
                 return Err(invalid(
                     "a directory publication download names one of its manifest's files",
@@ -492,12 +496,10 @@ impl<'a> VerificationControl<'a> {
                     "name",
                 ));
             }
-        }
-        .ok_or_else(|| invalid("the publication manifest lists no such file", "path"))?;
-        let object = ObjectInventory::new(self.state)
-            .file_object(caller.data_tenant_id, &file.sha256, file.size_bytes)
-            .await?
-            .ok_or_else(|| WyrdError::from(BifrostError::QueryVisibilityUnavailable))?;
+        };
+        let (file, object) =
+            found.ok_or_else(|| invalid("the publication manifest lists no such file", "path"))?;
+        let object = published_object(caller.data_tenant_id, &file, &object)?;
         Ok((object, file))
     }
 
@@ -513,7 +515,7 @@ impl<'a> VerificationControl<'a> {
         name: &PublicationName,
         selector: &PublicationSelector,
         operation: &str,
-    ) -> Result<Publication, WyrdError> {
+    ) -> Result<StoredPublication, WyrdError> {
         if selector.attempt == 0 {
             return Err(invalid("attempt is one-based", "attempt"));
         }
@@ -528,7 +530,8 @@ impl<'a> VerificationControl<'a> {
         conn.commit().await.map_err(registry_db_error)?;
         publications
             .into_iter()
-            .find(|publication| {
+            .find(|stored| {
+                let publication = &stored.publication;
                 publication.name == *name
                     && publication.producer.attempt == selector.attempt
                     && publication.producer.item_index == selector.item_index

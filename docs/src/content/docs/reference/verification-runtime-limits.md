@@ -14,8 +14,9 @@ Environment variables on `wyrd-server`, read once at startup; a change takes a r
 | --- | ---: | --- |
 | `WYRD_VERIFICATION_ENABLED` | `1` | Whether an API-serving process runs Verifiers: `1` or `0`. Also `[verification] enabled` in TOML |
 | `WYRD_VERIFICATION_TIMEOUT_MS` | 60000 | The whole `verify` call |
-| `WYRD_VERIFICATION_FILE_MAX_MIB` | 20 | One input file |
-| `WYRD_VERIFICATION_FILES_MAX_MIB` | 100 | All input files of one request or one workspace together |
+| `WYRD_VERIFICATION_FILE_MAX_MIB` | 20 | One input file, and one file a publication retains |
+| `WYRD_VERIFICATION_FILES_MAX_MIB` | 100 | All input files of one request or one workspace together, and all bytes one execution's publications retain |
+| `WYRD_VERIFICATION_PUBLICATIONS_MAX` | 1000 | Publications one execution accepts across all its attempts |
 | `WYRD_VERIFICATION_ARCHIVE_MAX_MIB` | 200 | Decompressed bytes of one archive, including DOCX, XLSX, and PPTX containers |
 | `WYRD_VERIFICATION_ARCHIVE_MAX_ENTRIES` | 10000 | Entries in one archive |
 | `WYRD_VERIFICATION_ARCHIVE_MAX_RATIO` | 100 | Decompressed-to-compressed size ratio of one archive |
@@ -70,4 +71,5 @@ Live workers are capped by `MONTY_MAX_WORKERS` and by `MONTY_POOL_MEMORY_MIB / M
 | `TIMEOUT_MS` in `verify` | `WYRD_VERIFICATION_504_EXECUTION_TIMED_OUT` |
 | No Python worker or workspace free | Direct call: `WYRD_SERVER_503_SERVICE_UNAVAILABLE`. Queued: stays queued, attempt not counted |
 | Verification disabled on this process | `WYRD_SERVER_503_SERVICE_UNAVAILABLE` |
+| A publication over `FILE_MAX_MIB`, `FILES_MAX_MIB`, or `PUBLICATIONS_MAX` | The publish call is refused with the limit and nothing is published; the execution's accepted publications and their totals survive retries and recovery |
 | Any other limit in a step or check, including `AGENT_CODE_BUDGET_MS` | The step fails or the check is `inconclusive`, with the limit in its `reason` |

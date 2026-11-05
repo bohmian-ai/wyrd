@@ -1832,6 +1832,11 @@ impl VerificationConfig {
             &mut limits.files_max_bytes,
         )?;
         set_scaled(
+            "WYRD_VERIFICATION_PUBLICATIONS_MAX",
+            1,
+            &mut limits.publications_max,
+        )?;
+        set_scaled(
             "WYRD_VERIFICATION_ARCHIVE_MAX_MIB",
             MIB,
             &mut limits.archive_max_bytes,

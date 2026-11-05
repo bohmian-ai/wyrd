@@ -38,9 +38,10 @@
 //! execution is queued before its inputs are durable.
 //!
 //! A batch of Verifier execution events is the one write whose frame is not
-//! derived from its slice: it travels alone under the batch identity the
-//! execution queue persisted before staging it, so a resubmission from any
-//! process is deduplicated, and its acknowledgement is reported back to the
+//! derived from its slice: each of its events travels alone under the batch
+//! identity the execution queue persisted before staging it and the event's
+//! position, so a resubmission from any process at any request ceiling is
+//! deduplicated, and its acknowledgement is reported back to the
 //! projector that persisted it.
 //!
 //! A sink given the Wyrd Postgres owner also schedules grouped verification:
@@ -258,8 +259,10 @@ pub enum ScribeWrite {
     /// as `bifrost.verification.execution_events` rows.
     ///
     /// The batch is its own frame, identified by `batch` rather than by the
-    /// slice, so every submission of it, by any process, carries one batch
-    /// identity and Scribe's batch-id dedup absorbs a resubmission.
+    /// slice, and each event travels as its own Scribe batch identified by
+    /// `batch` and its position, so every submission of an event, by any
+    /// process at any request ceiling, carries one identity and Scribe's
+    /// batch-id dedup absorbs a resubmission.
     ExecutionEvents {
         /// The persisted batch identity.
         batch: Uuid,
@@ -1302,11 +1305,19 @@ impl ScribeSink {
     /// be its size, so cutting costs one measurement per frame and depends
     /// only on the rows: an identical slice always cuts identically. A
     /// projected batch is never divided; skewed row sizes are left to
-    /// [`Chunk::encode`]'s split by encoded size.
+    /// [`Chunk::encode`]'s split by encoded size. A keyed frame, a persisted
+    /// execution event batch, is cut one event per chunk whatever the
+    /// budget, so each event's identity is its batch and position and a
+    /// replay at another request ceiling never reuses an identity for
+    /// different rows.
     fn chunks(frame: &Frame, budget: usize) -> Vec<Chunk> {
         let sample = &frame.parts[0];
         let row_bytes = sample.bytes().div_ceil(sample.num_rows().max(1)).max(1);
-        let rows_per_chunk = (budget / row_bytes).max(1);
+        let rows_per_chunk = if frame.key.is_some() {
+            1
+        } else {
+            (budget / row_bytes).max(1)
+        };
         let mut chunks = Vec::new();
         let (mut first, mut rows, mut parts) = (0, 0, Vec::new());
         for part in &frame.parts {
@@ -2908,6 +2919,49 @@ mod tests {
             .map(|frame| frame.rows)
             .collect();
         assert_eq!(frames, vec![DECISIONS]);
+    }
+
+    /// Proves an execution event's physical identity is its batch and
+    /// position alone: the same persisted batch cut at a one-byte budget and
+    /// at an unbounded one submits one single-row frame per event under the
+    /// same batch ids, so a replay at another valid request ceiling never
+    /// reuses an accepted identity for different rows.
+    ///
+    /// # Panics
+    ///
+    /// Panics when a decision cannot be staged or encoded, or an event's
+    /// identity or membership depends on the budget.
+    #[test]
+    fn event_identities_do_not_depend_on_the_frame_budget() {
+        let ScribeWrite::Audit(Some(row)) = decision("bifrost.record.write").into() else {
+            panic!("a decision stages its row");
+        };
+        let batch = uuid::Uuid::now_v7();
+        let events = [ScribeWrite::ExecutionEvents {
+            batch,
+            rows: vec![(row, background()); 4],
+            acked: Mutex::new(None),
+        }];
+        let frames = ScribeSink::frames(&events, &mut BTreeSet::new());
+        let tenant = DataTenantId::new_v7();
+        let cut = |budget| {
+            ScribeSink::chunks(&frames[0], budget)
+                .into_iter()
+                .enumerate()
+                .flat_map(|(chunk, rows)| {
+                    rows.encode(tenant, (batch, 0, chunk), budget, true)
+                        .expect("the chunk encodes")
+                })
+                .map(|(frame, _)| match frame.payload {
+                    FramePayload::Rows { rows, .. } => (frame.batch_id, rows.num_rows()),
+                    FramePayload::Ipc(_) => panic!("an in-process frame carries its rows"),
+                })
+                .collect::<Vec<_>>()
+        };
+        let narrow = cut(1);
+        assert_eq!(narrow.len(), 4, "one frame per event");
+        assert!(narrow.iter().all(|(_, rows)| *rows == 1));
+        assert_eq!(cut(usize::MAX), narrow, "the budget changes no identity");
     }
 
     /// Proves a retryable refusal replays the identical slice: the call and

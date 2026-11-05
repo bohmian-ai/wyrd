@@ -62,7 +62,10 @@ use wyrd_spec::reference::{CardRef, InlineableRef, Ref};
 use wyrd_spec::request_id::RequestId;
 use wyrd_spec::verification::TaskId;
 use wyrd_spec::verification::VerificationVerdict;
-use wyrd_spec::verification::execution::{CallProvenance, Citation, InputDeclaration, Locator};
+use wyrd_spec::verification::execution::{
+    CallProvenance, Citation, InputDeclaration, InvocationSettlement, Locator,
+};
+use wyrd_sql::queries::verifier_executions::VerifierExecutionQueue;
 use wyrd_testing::logs::LogCapture;
 use wyrd_testing::verification::VerificationFixture;
 use wyrd_testing::{Bootstrap, WyrdTestServer, WyrdTestServerBuilder};
@@ -1583,4 +1586,155 @@ async fn nonconforming_queued_evidence_errors_without_a_verdict() {
     }
     assert_eq!(settled[3].status, "completed", "{:?}", settled[3]);
     assert!(settled[3].result_id.is_some(), "{:?}", settled[3]);
+}
+
+/// A queued execution whose exact Agent, or that Agent's Prompt, was
+/// deleted before its Agent step starts settles `errored` with
+/// `capability_unavailable` on its first attempt under a submitter holding
+/// only `verifier:run` on the Verifier: the predecessor code step's
+/// committed checkpoint stays readable, the Agent step leaves no invocation,
+/// and no verdict is judged. The hosted engine's native provider registry
+/// is empty and the test gateway reaches no provider, so no model call can
+/// happen.
+///
+/// # Panics
+/// Panics when the server, seeding, or runtime fails, or an execution
+/// settles otherwise or loses its predecessor checkpoint.
+#[tokio::test]
+async fn deleted_agent_definition_errors_queued_execution_as_unavailable() {
+    let registered = Registered::start().await;
+    let tenant = registered.server.data_tenant_id();
+    registered
+        .server
+        .ensure_builtin_tables_for_test(tenant)
+        .await
+        .expect("tenant receives every built-in table");
+    let state = registered.server.state().clone();
+    let seed = VerificationFixture::provision(&state, tenant)
+        .await
+        .expect("tenant provisions");
+    let (subject, _) = seed
+        .service("unavailable-subject")
+        .await
+        .expect("subject registers");
+    let Bootstrap::User { jwt, .. } = registered
+        .server
+        .bootstrap_user("unavailable-writer", &["editor"])
+        .await
+        .expect("writer bootstraps")
+    else {
+        panic!("user bootstrap returned a non-user principal");
+    };
+    let mut executions = Vec::new();
+    for deleted_kind in ["Agent", "Prompt"] {
+        let name = format!("unavailable-{}", deleted_kind.to_lowercase());
+        let agent =
+            crate::pg_principal_roles::register_agent(&registered.server, &jwt, &name).await;
+        let verifier = seed
+            .verifier(
+                &format!("{name}-verifier"),
+                &json!({
+                    "steps": [
+                        { "id": "prepare",
+                          "action": { "kind": "code", "entrypoint": "f",
+                                      "source": { "inline": "def f():\n    return 1" } } },
+                        { "id": "review",
+                          "action": { "kind": "agent",
+                                      "agent": { "kind": "Agent", "name": name, "version": "1.0.0", "uid": agent },
+                                      "inputs": { "prepared": "steps.prepare.output" } },
+                          "requirements": [{ "id": "reviewed", "statement": "The Agent reviews.",
+                              "check": { "kind": "assert", "path": "steps.review.output",
+                                         "operator": "is_not_null" } }] }
+                    ]
+                }),
+            )
+            .await
+            .expect("Verifier registers");
+        let deleted = if deleted_kind == "Agent" {
+            name.clone()
+        } else {
+            format!("{name}-prompt")
+        };
+        let mut conn = registered
+            .server
+            .tenant_conn_for(tenant)
+            .await
+            .expect("tenant connection");
+        sqlx::query("UPDATE wyrd.cards SET status = 'deleted' WHERE name = $1")
+            .bind(&deleted)
+            .execute(&mut **conn.transaction())
+            .await
+            .expect("the definition is deleted");
+        conn.commit().await.expect("deletion commits");
+        let runner = seed
+            .clone()
+            .with_actor_permissions(PermissionSet::from_iter([Permission::verifier_run(
+                verifier.clone(),
+            )]));
+        executions.push(
+            runner
+                .submit(&verifier, &subject, BTreeMap::new())
+                .await
+                .expect("execution queues"),
+        );
+    }
+
+    let runtime = VerificationRuntime::builder(&state)
+        .limits(RuntimeLimits {
+            lease: Duration::from_mins(1),
+            execution_timeout: Duration::from_secs(20),
+            poll_interval: Duration::from_millis(50),
+            ..RuntimeLimits::default()
+        })
+        .build()
+        .expect("the runtime composes");
+    let stop = CancellationToken::new();
+    let task = tokio::spawn(runtime.run(stop.clone()));
+    let deadline = Instant::now() + Duration::from_mins(1);
+    let mut settled = Vec::new();
+    for &execution in &executions {
+        settled.push(loop {
+            let row = seed.execution(execution).await.expect("execution reads");
+            if !matches!(row.status.as_str(), "pending" | "running" | "retrying") {
+                break row;
+            }
+            assert!(Instant::now() < deadline, "{execution} never settled");
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        });
+    }
+    stop.cancel();
+    task.await.expect("the runtime stops");
+
+    for (execution, row) in executions.into_iter().zip(settled) {
+        assert_eq!(
+            (row.status.as_str(), row.attempts, row.error_code.as_deref()),
+            ("errored", 1, Some("capability_unavailable")),
+            "{row:?}"
+        );
+        assert!(row.result_id.is_none(), "no verdict is judged: {row:?}");
+        let mut conn = registered
+            .server
+            .tenant_conn_for(tenant)
+            .await
+            .expect("tenant connection");
+        let page = VerifierExecutionQueue::default()
+            .invocation_page(&mut conn, execution, None, 16)
+            .await
+            .expect("invocations read");
+        let invocations: Vec<(&str, bool)> = page
+            .entries
+            .iter()
+            .map(|(_, entry)| {
+                (
+                    entry.producer.step_id.as_str(),
+                    matches!(entry.settlement, Some(InvocationSettlement::Action { .. })),
+                )
+            })
+            .collect();
+        assert_eq!(
+            invocations,
+            [("prepare", true)],
+            "only the predecessor's settled checkpoint remains"
+        );
+    }
 }

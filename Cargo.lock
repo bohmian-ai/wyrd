@@ -10594,6 +10594,8 @@ dependencies = [
  "tower-http",
  "tracing",
  "tracing-subscriber",
+ "unicase",
+ "unicode-normalization",
  "url",
  "utoipa",
  "utoipa-axum",

@@ -395,29 +395,94 @@ impl Workspace {
         self.writer.lock().await
     }
 
-    /// Freeze `/work` file `path` for publication: its basename and bytes,
-    /// read while holding [`Self::writer`], so no `/work` writer changes it
-    /// mid-read and later writes never reach the frozen copy.
+    /// Freeze `/work` file or directory `path` for publication, read while
+    /// holding [`Self::writer`] so no `/work` writer changes it mid-read and
+    /// later writes never reach the frozen copy.
+    ///
+    /// A directory is walked completely or refused: every entry must be a
+    /// regular file or directory with a UTF-8 name free of backslashes and
+    /// control characters, no two relative paths may match under NFC plus
+    /// Unicode case folding, and the tree must stay within the entry, depth,
+    /// and byte limits. Nothing is renamed, skipped, or truncated.
     ///
     /// # Errors
-    /// Returns a `publication_path` [`invalid`] refusal for a path outside
-    /// `/work`, and [`Self::file`]'s refusals for a missing, non-regular, or
-    /// oversized file.
-    pub async fn freeze_file(&self, path: &str) -> Result<(String, Vec<u8>), ToolError> {
+    /// Returns an [`invalid`] refusal: `publication_path` for a path outside
+    /// `/work`, `workspace_missing` for a missing path, `regular_file` for a
+    /// special file, `publication_tree` for an entry the tree rules refuse,
+    /// `work_budget` for content over the byte limit; and an invocation
+    /// failure for an unreadable entry.
+    pub async fn freeze(&self, path: &str) -> Result<Frozen, ToolError> {
         let Some(rest) = relative(path, "/work/") else {
             return Err(invalid(
                 "publication_path",
                 "path",
                 path,
-                format!("{path} is not a file this invocation wrote under /work"),
+                format!("{path} is not a file or directory this invocation wrote under /work"),
                 "a path under /work without empty, . or .. segments",
             ));
         };
-        let basename = rest.rsplit('/').next().unwrap_or(rest).to_owned();
         let _writer = self.writer().await;
-        let (host, _) = self.file(path)?;
-        let bytes = tokio::fs::read(&host).await.map_err(failed)?;
-        Ok((basename, bytes))
+        let host = self.work_dir().join(rest);
+        if !host.symlink_metadata().map_err(|_| missing(path))?.is_dir() {
+            let (host, _) = self.file(path)?;
+            let name = rest.rsplit('/').next().unwrap_or(rest).to_owned();
+            let bytes = std::fs::read(&host).map_err(failed)?;
+            return Ok(Frozen::File { name, bytes });
+        }
+        let mut tree = Tree::default();
+        let mut pending = vec![(host, String::new(), 0_usize)];
+        while let Some((dir, prefix, depth)) = pending.pop() {
+            for entry in std::fs::read_dir(&dir).map_err(failed)? {
+                let entry = entry.map_err(failed)?;
+                let name = entry.file_name().into_string().map_err(|name| {
+                    tree_refused(path, &format!("{} is not UTF-8", name.to_string_lossy()))
+                })?;
+                let relative = if prefix.is_empty() {
+                    name.clone()
+                } else {
+                    format!("{prefix}/{name}")
+                };
+                tree.admit(path, &name, &relative, self.limits.archive_max_entries)?;
+                let meta = entry.path().symlink_metadata().map_err(failed)?;
+                if meta.is_dir() {
+                    if depth + 1 > PUBLICATION_MAX_DEPTH {
+                        return Err(tree_refused(
+                            path,
+                            &format!("{relative} is deeper than {PUBLICATION_MAX_DEPTH} levels"),
+                        ));
+                    }
+                    tree.directories.push(relative.clone());
+                    pending.push((entry.path(), relative, depth + 1));
+                } else if meta.is_file() {
+                    tree.bytes += meta.len();
+                    if tree.bytes > self.limits.work_write_max_bytes {
+                        return Err(invalid(
+                            "work_budget",
+                            "path",
+                            path,
+                            format!(
+                                "{path} holds more than the {}-byte /work limit",
+                                self.limits.work_write_max_bytes
+                            ),
+                            "a smaller file or directory",
+                        ));
+                    }
+                    let bytes = std::fs::read(entry.path()).map_err(failed)?;
+                    tree.files.push((relative, bytes));
+                } else {
+                    return Err(tree_refused(
+                        path,
+                        &format!("{relative} is a link or special file"),
+                    ));
+                }
+            }
+        }
+        tree.files.sort();
+        tree.directories.sort();
+        Ok(Frozen::Directory {
+            files: tree.files,
+            directories: tree.directories,
+        })
     }
 
     /// The sandbox mounts: `/inputs` read-only and `/work` writable up to
@@ -1007,6 +1072,92 @@ fn walkdir(dir: &Path, most: usize) -> (Vec<(String, u64)>, bool) {
     }
     found.sort();
     (found, false)
+}
+
+/// Most directory levels below a published directory's root.
+// ponytail: fixed depth bound; make it a Deployment limit if trees need it.
+const PUBLICATION_MAX_DEPTH: usize = 32;
+
+/// A `/work` file or directory frozen for publication.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Frozen {
+    /// One regular file.
+    File {
+        /// Its basename.
+        name: String,
+        /// Its bytes.
+        bytes: Vec<u8>,
+    },
+    /// One directory tree, every path relative to its root.
+    Directory {
+        /// Every regular file and its bytes, sorted by path.
+        files: Vec<(String, Vec<u8>)>,
+        /// Every directory, empty ones included, sorted.
+        directories: Vec<String>,
+    },
+}
+
+/// A directory tree being frozen.
+#[derive(Default)]
+struct Tree {
+    /// Regular files and their bytes.
+    files: Vec<(String, Vec<u8>)>,
+    /// Directories.
+    directories: Vec<String>,
+    /// Folded relative paths seen so far.
+    folded: std::collections::HashSet<unicase::UniCase<String>>,
+    /// File bytes so far.
+    bytes: u64,
+}
+
+impl Tree {
+    /// Admit entry `name` at `relative` under published `path`: a safe name,
+    /// no collision under NFC plus case folding, and within `most` entries.
+    ///
+    /// # Errors
+    /// Returns a `publication_tree` refusal naming the violated rule.
+    fn admit(
+        &mut self,
+        path: &str,
+        name: &str,
+        relative: &str,
+        most: usize,
+    ) -> Result<(), ToolError> {
+        use unicode_normalization::UnicodeNormalization as _;
+        if name.contains('\\') || name.chars().any(char::is_control) {
+            return Err(tree_refused(
+                path,
+                &format!("{relative:?} holds a backslash or control character"),
+            ));
+        }
+        if !self
+            .folded
+            .insert(unicase::UniCase::unicode(relative.nfc().collect()))
+        {
+            return Err(tree_refused(
+                path,
+                &format!("{relative} collides with another entry ignoring case and normalization"),
+            ));
+        }
+        if self.folded.len() > most {
+            return Err(tree_refused(
+                path,
+                &format!("it holds more than {most} entries"),
+            ));
+        }
+        Ok(())
+    }
+}
+
+/// A directory publication refused because of `reason`.
+fn tree_refused(path: &str, reason: &str) -> ToolError {
+    invalid(
+        "publication_tree",
+        "path",
+        path,
+        format!("{path} cannot be published: {reason}"),
+        "a tree of regular files and directories with distinct UTF-8 names",
+    )
 }
 
 /// `text` in consecutive pieces of at most `size` bytes on character

@@ -150,7 +150,7 @@ async fn file_and_json_publications_are_immutable() {
 
     let kinds = [
         publications
-            .file(
+            .path(
                 &call("c1", &producer, "report"),
                 &workspace,
                 "/work/notes/report one.md",
@@ -191,6 +191,7 @@ async fn file_and_json_publications_are_immutable() {
                     sha256,
                     size_bytes: report.len() as u64,
                 }],
+                directories: Vec::new(),
             },
         })
     );
@@ -227,7 +228,7 @@ async fn file_and_json_publications_are_immutable() {
     assert_eq!(bytes, report.as_bytes(), "scratch writes never reach it");
 
     let file = publications
-        .file(&call("c4", &producer, "big"), &workspace, "/work/big.bin")
+        .path(&call("c4", &producer, "big"), &workspace, "/work/big.bin")
         .await
         .expect_err("an oversized file is refused");
     assert_eq!(rule(&file), "work_budget");
@@ -239,6 +240,212 @@ async fn file_and_json_publications_are_immutable() {
     for refused in ["big", "huge"] {
         assert_eq!(leased.read(&producer, refused).await, None);
     }
+    leased
+        .server
+        .shutdown()
+        .await
+        .expect("test server shuts down");
+}
+
+/// Write `bytes` at `/work/<relative>`, creating its parents.
+///
+/// # Panics
+/// Panics when the write fails.
+fn put(workspace: &Workspace, relative: &str, bytes: &[u8]) {
+    let host = workspace.work_dir().join(relative);
+    std::fs::create_dir_all(host.parent().expect("a parent")).expect("parents");
+    std::fs::write(host, bytes).expect("write");
+}
+
+/// How many entries `/work/<relative>` holds; a case-insensitive or
+/// normalizing filesystem merges colliding names, so a case only applies
+/// where every entry it wrote exists.
+///
+/// # Panics
+/// Panics when the directory cannot be read.
+fn entries(workspace: &Workspace, relative: &str) -> usize {
+    std::fs::read_dir(workspace.work_dir().join(relative))
+        .expect("directory reads")
+        .count()
+}
+
+/// A nested directory with Unicode and space names and empty directories
+/// publishes completely, each path and byte as written; a tree holding any
+/// refused entry, or over a count, depth, or byte limit, publishes nothing.
+/// A snapshot waiting on a writer freezes the tree that writer left.
+///
+/// # Panics
+/// Panics when an accepted path or digest differs, a refused tree leaves an
+/// entry, or a snapshot mixes states.
+#[tokio::test(flavor = "multi_thread")]
+async fn directory_snapshot_is_complete_or_rejected() {
+    let leased = Leased::start().await;
+    let limits = HostedLimits {
+        work_write_max_bytes: 1024,
+        archive_max_entries: 8,
+        ..HostedLimits::default()
+    };
+    let caller = user(leased.server.data_tenant_id(), []);
+    let workspace = Workspace::materialize(Vec::new(), limits, None).expect("workspace");
+    let publications = Publications::new(leased.server.state(), &caller, leased.lease, limits);
+    let producer = Producer {
+        step_id: TaskId::new("review").expect("task"),
+        item_index: None,
+        iteration_index: None,
+        attempt: 1,
+    };
+    let written = [
+        ("report/summary.md", "# Summary\n"),
+        ("report/naïve dir/notes 1.txt", "größe\n"),
+        ("report/deep/a/b/c.txt", "c\n"),
+    ];
+    for (relative, text) in written {
+        put(&workspace, relative, text.as_bytes());
+    }
+    std::fs::create_dir_all(workspace.work_dir().join("report/empty")).expect("empty");
+    assert_eq!(
+        publications
+            .path(
+                &call("tree", &producer, "report"),
+                &workspace,
+                "/work/report"
+            )
+            .await
+            .expect("the tree publishes"),
+        PublicationKind::Directory
+    );
+    put(&workspace, "report/summary.md", b"rewritten");
+    let file = |path: &str, text: &str| PublicationFile {
+        path: path.to_owned(),
+        sha256: wyrd_spec::auth::Sha256Hex::digest(text.as_bytes()),
+        size_bytes: text.len() as u64,
+    };
+    assert_eq!(
+        leased.read(&producer, "report").await,
+        Some(PublicationContent::Directory {
+            manifest: PublicationManifest {
+                files: vec![
+                    file("deep/a/b/c.txt", "c\n"),
+                    file("naïve dir/notes 1.txt", "größe\n"),
+                    file("summary.md", "# Summary\n"),
+                ],
+                directories: ["deep", "deep/a", "deep/a/b", "empty", "naïve dir"]
+                    .map(str::to_owned)
+                    .to_vec(),
+            },
+        })
+    );
+
+    put(&workspace, "backslash/a\\b", b"x");
+    put(&workspace, "control/a\u{7}b", b"x");
+    put(&workspace, "symlink/target", b"x");
+    std::os::unix::fs::symlink(
+        workspace.work_dir().join("symlink/target"),
+        workspace.work_dir().join("symlink/link"),
+    )
+    .expect("symlink");
+    std::fs::create_dir_all(workspace.work_dir().join("special")).expect("special");
+    let _socket = std::os::unix::net::UnixListener::bind(workspace.work_dir().join("special/s"))
+        .expect("socket");
+    put(&workspace, "case/Readme.md", b"x");
+    put(&workspace, "case/README.md", b"y");
+    put(&workspace, "nfc/caf\u{e9}", b"x");
+    put(&workspace, "nfc/cafe\u{301}", b"y");
+    put(&workspace, "kinds/a", b"x");
+    std::fs::create_dir_all(workspace.work_dir().join("kinds/A")).expect("directory");
+    for index in 0..9 {
+        put(&workspace, &format!("count/{index}"), b"x");
+    }
+    put(&workspace, "bytes/one", &[b'x'; 600]);
+    put(&workspace, "bytes/two", &[b'x'; 600]);
+    let outside = "is not a file or directory this invocation wrote";
+    let mut refused = vec![
+        ("backslash", "/work/backslash", "backslash or control"),
+        ("control", "/work/control", "backslash or control"),
+        ("symlink", "/work/symlink", "link or special"),
+        ("special", "/work/special", "link or special"),
+        ("count", "/work/count", "more than 8 entries"),
+        ("bytes", "/work/bytes", "-byte /work limit"),
+        ("traversal", "/work/../work/report", outside),
+        ("absolute", "/etc", outside),
+        ("missing", "/work/absent", "does not exist"),
+    ];
+    for case in ["case", "nfc", "kinds"] {
+        if entries(&workspace, case) == 2 {
+            refused.push((case, "", "collides"));
+        }
+    }
+    {
+        use std::os::unix::ffi::OsStrExt as _;
+        let name = std::ffi::OsStr::from_bytes(b"bad\xff");
+        std::fs::create_dir_all(workspace.work_dir().join("utf8")).expect("utf8");
+        if std::fs::write(workspace.work_dir().join("utf8").join(name), b"x").is_ok() {
+            refused.push(("utf8", "/work/utf8", "is not UTF-8"));
+        }
+    }
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        put(&workspace, "unreadable/locked", b"x");
+        let locked = workspace.work_dir().join("unreadable/locked");
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o000)).expect("chmod");
+        if std::fs::read(&locked).is_err() {
+            refused.push(("unreadable", "/work/unreadable", "workspace IO failed"));
+        }
+    }
+    let deep = Workspace::materialize(Vec::new(), HostedLimits::default(), None).expect("deep");
+    put(&deep, &format!("depth/{}x", "d/".repeat(33)), b"x");
+    let mut cases: Vec<_> = refused
+        .into_iter()
+        .map(|(case, path, reason)| {
+            let path = if path.is_empty() {
+                format!("/work/{case}")
+            } else {
+                path.to_owned()
+            };
+            (case, path, reason, &workspace)
+        })
+        .collect();
+    cases.push((
+        "depth",
+        "/work/depth".to_owned(),
+        "deeper than 32 levels",
+        &deep,
+    ));
+    for (case, path, reason, workspace) in cases {
+        let error = publications
+            .path(&call(case, &producer, case), workspace, &path)
+            .await
+            .expect_err(case);
+        let detail = error.detail().unwrap_or_default().to_owned();
+        assert!(detail.contains(reason), "{case}: {error}");
+        assert_eq!(leased.read(&producer, case).await, None, "{case}");
+    }
+
+    put(&workspace, "held/one.txt", b"old");
+    let writer = workspace.writer().await;
+    let held = call("held", &producer, "held");
+    let publish = publications.path(&held, &workspace, "/work/held");
+    let edit = async {
+        tokio::task::yield_now().await;
+        put(&workspace, "held/one.txt", b"1");
+        put(&workspace, "held/two.txt", b"2");
+        drop(writer);
+    };
+    let (published, ()) = tokio::join!(publish, edit);
+    assert_eq!(
+        published.expect("the held tree publishes"),
+        PublicationKind::Directory
+    );
+    assert_eq!(
+        leased.read(&producer, "held").await,
+        Some(PublicationContent::Directory {
+            manifest: PublicationManifest {
+                files: vec![file("one.txt", "1"), file("two.txt", "2")],
+                directories: Vec::new(),
+            },
+        }),
+        "the snapshot waits for the writer and freezes the tree it left"
+    );
     leased
         .server
         .shutdown()

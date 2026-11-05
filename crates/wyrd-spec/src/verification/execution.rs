@@ -469,6 +469,9 @@ pub struct PublicationFile {
 pub struct PublicationManifest {
     /// Every regular file, sorted by path.
     pub files: Vec<PublicationFile>,
+    /// Every directory below a directory publication's root, empty ones
+    /// included, sorted; empty for a file.
+    pub directories: Vec<String>,
 }
 
 /// The content one publication retains: a manifest of completed Files for

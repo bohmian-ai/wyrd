@@ -1,9 +1,9 @@
 //! Named publications of queued Verifier invocation attempts.
 //!
 //! [`Publications`] is the hosted backend a trusted caller inside one leased
-//! execution retains content through: a `/work` file or a bounded JSON value
-//! under a logical name, scoped to its producer attempt. A file is frozen
-//! under the workspace's writer lock, completed as an ordinary verification
+//! execution retains content through: a `/work` file or directory, or a bounded JSON value
+//! under a logical name, scoped to its producer attempt. Content is frozen
+//! under the workspace's writer lock, each file completed as an ordinary verification
 //! File through the shared storage lifecycle, and only then named by a
 //! manifest committed under the execution's lease, so a publication is never
 //! visible with partial content and a stale lease commits nothing. Every
@@ -26,7 +26,7 @@ use wyrd_storage::tenant_path;
 
 use super::HostedLimits;
 use super::tools::{invocation, structured};
-use super::workspace::Workspace;
+use super::workspace::{Frozen, Workspace};
 use crate::components::auth::Caller;
 use crate::components::storage::inventory::ObjectInventory;
 use crate::components::storage::routes::completed_file;
@@ -106,48 +106,68 @@ impl<'a> Publications<'a> {
             .await
     }
 
-    /// Publish the `/work` file at `path` under `call`'s name: freeze it,
-    /// complete its bytes as a verification File, then commit its manifest.
+    /// Publish the `/work` file or directory at `path` under `call`'s name:
+    /// freeze it, complete every file as a verification File, then commit
+    /// its manifest. An interrupted or refused publication commits nothing.
     ///
     /// # Errors
-    /// Returns [`Workspace::freeze_file`]'s refusals, an invocation failure
-    /// when the File cannot complete, and [`Self::accept`]'s refusals.
-    pub async fn file(
+    /// Returns [`Workspace::freeze`]'s refusals, an invocation failure when
+    /// a File cannot complete, and [`Self::accept`]'s refusals.
+    pub async fn path(
         &self,
         call: &PublishCall,
         workspace: &Workspace,
         path: &str,
     ) -> Result<PublicationKind, ToolError> {
-        let (basename, bytes) = workspace.freeze_file(path).await?;
-        let file = self
-            .complete(bytes)
-            .await
-            .map_err(|error| invocation(format!("{path} could not be retained: {error}")))?;
-        let arguments = serde_json::json!({ "name": call.name, "path": path });
-        let manifest = PublicationManifest {
-            files: vec![PublicationFile {
-                path: basename,
-                ..file
-            }],
+        let (files, directories, directory) = match workspace.freeze(path).await? {
+            Frozen::File { name, bytes } => (vec![(name, bytes)], Vec::new(), false),
+            Frozen::Directory { files, directories } => (files, directories, true),
         };
-        self.accept(call, &arguments, PublicationContent::File { manifest })
-            .await
+        let mut retained = Vec::with_capacity(files.len());
+        for (relative, bytes) in files {
+            let sha256 = Sha256Hex::digest(&bytes);
+            let size_bytes = bytes.len() as u64;
+            self.complete(sha256, bytes)
+                .await
+                .map_err(|error| invocation(format!("{path} could not be retained: {error}")))?;
+            retained.push(PublicationFile {
+                path: relative,
+                sha256,
+                size_bytes,
+            });
+        }
+        let manifest = PublicationManifest {
+            files: retained,
+            directories,
+        };
+        let content = if directory {
+            PublicationContent::Directory { manifest }
+        } else {
+            PublicationContent::File { manifest }
+        };
+        let arguments = serde_json::json!({ "name": call.name, "path": path });
+        self.accept(call, &arguments, content).await
     }
 
-    /// Complete `bytes` as one verification File through the shared storage
-    /// lifecycle and record it in the object inventory.
+    /// Complete `bytes`, whose digest is `sha256`, as one verification File
+    /// through the shared storage lifecycle and record it in the object
+    /// inventory.
     ///
     /// # Errors
     /// Returns the storage, verification, or inventory failure.
-    async fn complete(&self, bytes: Vec<u8>) -> Result<PublicationFile, WyrdError> {
-        let sha256 = Sha256Hex::digest(&bytes);
-        let size_bytes = bytes.len() as u64;
+    async fn complete(&self, sha256: Sha256Hex, bytes: Vec<u8>) -> Result<(), WyrdError> {
         let storage = StorageCaller {
             data_tenant_id: self.caller.data_tenant_id,
         };
         let postgres = self.state.postgres.wyrd();
-        let init =
-            file_upload_init(&self.state.storage, postgres, &storage, &sha256, size_bytes).await?;
+        let init = file_upload_init(
+            &self.state.storage,
+            postgres,
+            &storage,
+            &sha256,
+            bytes.len() as u64,
+        )
+        .await?;
         let path = tenant_path::evidence(self.caller.data_tenant_id, &sha256, &init.upload_id);
         self.state
             .storage
@@ -168,12 +188,7 @@ impl<'a> Publications<'a> {
                 self.caller.attribution(),
                 &[fact],
             )
-            .await?;
-        Ok(PublicationFile {
-            path: String::new(),
-            sha256,
-            size_bytes,
-        })
+            .await
     }
 
     /// Commit `content` under `call`'s producer and name with the digest of

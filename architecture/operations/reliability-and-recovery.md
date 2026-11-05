@@ -246,6 +246,39 @@ direct-Iceberg relay is not a recovery mechanism.
   resumes cursors, and preserves one authoritative terminal outcome per
   attempt.
 
+## Verification execution handoff and cleanup
+
+Postgres retains active execution/block checkpoints and outstanding finalization
+custody. The existing execution/projection lifecycle delivers complete canonical
+terminal evidence through Scribe using stable replay identities, then performs bounded
+indexed tenant cleanup only after acknowledged coverage and retained source ownership
+are established. Completion status alone, an event ACK, a timer or a sample query does
+not authorize deletion. Use normal Scribe publication/capture ownership; cleanup does
+not wait for Iceberg promotion or create a separate archive service. An outage delays
+handoff/cleanup with bounded admission and retry rather than dropping accepted evidence
+or crashing unrelated capabilities.
+
+Recovery reconstructs queued work from logical block checkpoints and frozen decisions. A
+finalization restart resends selected retained facts, never repeats settled model calls
+or resumes a terminal execution. A direct request without publications adds no execution
+coordination writes; direct accepted publications have request-scoped durability and can
+be finalized after interruption without background workflow continuation. Required
+data/source-version gaps in older work remain honest and ineligible for unsafe purge;
+version rollout must drain or migrate available facts before enabling cleanup for that
+format.
+
+Shared File ownership also releases publication-owned completed upload-session metadata
+after retained descriptor custody is safe, preserving ordinary Card/input-File
+completion replay and the accepted object. Purge must preserve retained File roots,
+canonical replay/cursor/cancel behavior and independent registry,
+binding/schedule/group, repository/library and Operator/provider delivery lifetimes.
+Retained API reads use Bifrost despite leftover operational rows; actual historical
+source unavailability is explicit and never permission to create a second execution.
+Qualify crashes at component acknowledgement, terminal selection, source transfer and
+deletion boundaries, including pending delivery and cross-tenant cleanup progress. This
+operational cleanup does not define a new File/Bifrost evidence TTL or exempt normal
+security/control-plane dependencies.
+
 ## Dependency and regional failure
 
 - Postgres unavailability stops mutations, policy decisions that require

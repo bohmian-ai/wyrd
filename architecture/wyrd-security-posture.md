@@ -250,17 +250,24 @@ credential.
   the registered `bifrost.drift.observations` table UID; a missing SYSTEM
   principal or unreadable table identity fails closed before any row is
   returned.
-- An execution status read, once `verifier:read` on the execution's exact
-  Verifier is authorized and audited, reads that execution's records through
-  the same SYSTEM read authority granted `bifrost_query:read` only on the
-  registered `bifrost.verification.execution_inputs`, `results`, and
-  `execution_outputs` table UIDs, serving the caller, with fixed statements
-  filtered to that execution. Invocation and publication inspection read the
-  tenant's Postgres execution records under forced RLS; a publication
-  download plan, and the local backend's publication content route, resolve
-  its File through the object inventory's SYSTEM read; local publication
-  bytes are never served through the `cards:read` local blob route.
-  No caller SQL runs under this authority.
+- Dedicated execution status/progress/publication reads authorize and audit current
+  `verifier:read` on the recorded exact Verifier, plus repository read where applicable.
+  Active/finalizing records use forced-RLS Postgres; retained execution reads use fixed
+  tenant/execution-scoped statements under the same narrow SYSTEM read authority for
+  registered `bifrost.verification.execution_inputs`, `results`, `execution_outputs` and
+  `execution_events`. Retained identity and full metadata do not require a leftover
+  execution row or fetching a deleted Card. Historical accepted authority is provenance,
+  not a grant to the requesting caller. Ordinary public Bifrost SQL retains caller table
+  permissions; no caller SQL runs under internal authority.
+  Accepted publication mounts/download/local-content select the exact private verified
+File association from the active record or retained manifest and validate its tenant,
+producer, path, digest and length through existing storage owners. Do not rediscover by
+global digest or accept a caller storage path. Local publication bytes remain under
+verifier authorization, never the cards:read blob route. Preserve File
+completion/inventory acknowledgement and original evidence retention. Execution cleanup
+must transfer accepted references first, cannot remove live delivery/replay authority,
+and never makes unavailable history proof of absence or a reason to admit duplicate
+work.
 - Revoking a credential, suspending or deleting a principal, suspending a
   tenant, or changing grants refuses the next issuance immediately. A tenant
   token already issued keeps its snapshot authority until its five-minute

@@ -1498,7 +1498,9 @@ publication, its kind, its mounted `path`, and its producer item, iteration,
 and attempt) plus `content/<opaque invocation segment>/<name>`, so failed
 attempts' accepted partial work stays readable and distinct. Mounted content
 cites only its producer's original slots; a failed step's partial work and
-the manifest cite none. Direct verify accepts no publications.
+the manifest cite none. Direct verification may retain Agent publications and engine
+extraction through request-scoped durable acceptance; standalone code actions receive no
+publication tool.
 
 Requirement outcomes are `passed`, `failed`, `inconclusive`, or
 `not_applicable`. An intentional skip (false `when`) makes dependent
@@ -1754,6 +1756,14 @@ bounds, the last ending `errored`. Per-file and aggregate limits
 (`WYRD_VERIFICATION_FILE_MAX_MIB`, `WYRD_VERIFICATION_FILES_MAX_MIB`) are
 enforced at planning. `ArtifactRef` selects a declared Artifact under its own
 authorization.
+Accepted publications additionally carry the exact descriptor returned by verified File
+completion: it is committed privately with the active publication and transferred with
+the retained Bifrost manifest. Hosted publication mounts and inspection/download/content
+use that association, not a new digest/size inventory lookup. Match descriptor tenant,
+digest and length to the selected manifest and preserve shared
+download/integrity/cleanup ownership and inventory ACK. This does not change ordinary
+input-File discovery or authorize caller-supplied storage paths.
+
 
 Execution reads — status, invocation and publication pages, publication
 reads, download plans, and local publication content — check `verifier:read` against the execution's
@@ -1834,11 +1844,54 @@ baselines. Parsed Verifiers are cached per process by tenant and Card UID in
 a fixed 64 MiB least-recently-used cache that is never shared across tenants.
 A deleted Verifier terminates the execution `errored`.
 
-When execution completes, the runner builds the result once and stages it on
-the process Scribe outbox, then settles at once: settlement never waits for
-Scribe, so a completed execution can lack a retained result. Leases renew on
-the PostgreSQL clock once a third of the lease has passed; an expired lease is
-never revived, and a renewal that no longer finds the token cancels that work.
+One shared verification engine executes the declarative graph. A worker constructs a
+disposable engine per execution attempt over shared process dependencies and a local
+settled-work ledger. Queued recovery loads pinned declarations, accepted authority,
+block attempts/settlements, conserved deadline/budgets and frozen control decisions from
+Postgres; it does not serialize engine memory or replay orchestration code from
+historical events. Begin commits before external work and settlement before dependent
+release. Uncommitted ambiguous calls may repeat within remaining bounds; committed calls
+do not. Persisted formats are versioned and incompatible workers cannot claim them.
+
+Postgres owns active execution and finalization coordination; Bifrost owns retained
+execution evidence. Direct work without publications adds no execution queue or
+per-block checkpoint writes. Direct publication creates only request-owned durable
+identity/limits/fencing and accepted File associations, without eligibility for queued
+workflow recovery. A returned committed reference may feed the running ledger without
+metadata rediscovery. Direct disconnect stops execution; housekeeping may finish
+evidence handoff, never resume provider calls. Security, registry/cache misses, evidence
+and gateway IO retain their ordinary contracts.
+
+Finalization selects one stable terminal outcome under current authority and durably
+delivers all required input/result/detail, invocation/publication metadata and terminal
+selection through the existing Scribe outbox. Successful final completion
+acknowledgement follows that handoff, never process-memory staging. Normal Scribe ACK
+and Oracle cut/live-capture continuity apply; no Iceberg-promotion wait or separate
+freshness mode. A cancelled/errored work decision can be inspected during finalization
+with projection position; cancellation acknowledgement still certifies the committed
+work fence, not cleanup readiness. Every accepted terminal outcome, including
+failed/cancelled/timed-out partial evidence, is retained before operational cleanup.
+Finalization recovery resends stable identities and never resumes terminal Agent work.
+
+After handoff the shared execution reader serves all retained execution endpoints from
+canonical Bifrost sources, even while Postgres rows await cleanup. Bounded tenant-scoped
+cleanup in the existing execution/projection lifecycle removes
+execution/checkpoint/publication/acknowledged-intent rows only after complete delivery,
+retained source ownership and dependent control work are safe. No timer or isolated
+event ACK authorizes deletion. Source transfer uses existing Scribe publication/capture
+ownership rather than waiting for Iceberg or adding an archive catalog. Release
+publication-owned completed upload-session metadata through existing File ownership only
+after completion/replay custody is transferred, without changing ordinary
+Card/input-File upload semantics or deleting accepted objects. Preserve accepted File
+roots, existing evidence lifetime, page cuts, request-key/digest replay and terminal
+cancel after purge. Keep bindings, schedules/groups, repository
+generation/webhook/library state and pending Operator/provider delivery under their own
+lifecycles; delivery-status updates project independently and never change verdict.
+Temporary historical unavailability is explicit, not absence or an obsolete-PG fallback.
+
+Leases renew on the PostgreSQL clock once a third of the lease has passed; an expired
+lease is never revived. New invocation/checkpoint/publication commits require unexpired
+current authority, and renewal ownership loss cancels the work.
 
 A `VerificationResult` carries `execution_id`, optional `run_id`, the exact
 `verifier` and `subject`, and an `outcome` of `verdict`, `requirements`
@@ -1855,13 +1908,24 @@ selector for group and schedule work, and queued activation context. A
 returned `VerificationResult` is assembled from the three by one reader:
 verdict from the summary, breakdown from outputs by result ID, evidence from
 inputs by execution ID (a group's resolved slot lists; an empty map for
-scheduled Drift). PostgreSQL stores no input values; a queued execution's
-selected `result_id` stays authoritative. A direct execution has no queue
-row: its status is read from records whose input origin is `direct`, and is
-`completed` once they are visible. Unknown IDs remain not found. A queued
-execution's progress history is projected into
-`bifrost.verification.execution_events` (see the Bifrost design); it is
-history only, never an input to a result.
+scheduled Drift). PostgreSQL stores no input payload values. While active/finalizing its
+selected `result_id` and transition intent govern handoff; the canonical terminal
+execution fact in `bifrost.verification.execution_events` records that selection for
+retained reads after cleanup. Never choose a result by recency: abandoned attempts can
+leave non-selected result rows. The same dataset retains typed invocation metadata, full
+sanitized terminal errors, exact publication manifests/private completed File
+associations and replay identity; existing input/result/output payload meanings are
+unchanged. Historical events do not drive active recovery or supply a second verdict.
+Unknown IDs remain not found only after an authoritative read; source unavailability is
+retryable.
+
+Dedicated execution reads retain exact Verifier/repository feature authorization using
+current caller grants and recorded immutable identities, without requiring source Card
+retrieval or leftover queue rows. The server centrally selects active/finalizing
+Postgres versus retained Bifrost and preserves cursor membership and public responses;
+SDKs, MCP, CLI and UI do not choose a source. Plain direct work has no queue row; direct
+retained publications have request-owned metadata that is cleaned after the same
+handoff. Existing ordinary registry/principal control-plane operations are unaffected.
 
 Every work record names who the work was for (`sub_principal_id`) and who
 performed it (`act_principal_id`). A direct caller A records A/A and a

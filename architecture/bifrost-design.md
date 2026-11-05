@@ -414,7 +414,7 @@ typed columns:
     only writes a row again. Rows therefore repeat across replicas and
     restarts, and readers aggregate by `series_id`, never counting rows as
     series.
-- Three tables hold each verification fact once. A result read assembles the
+- The existing three result tables hold each result payload fact once. A result read assembles the
   public `VerificationResult` from them: the verdict from `results`,
   `requirements` and `steps` from `execution_outputs` by `result_id`, and
   `evidence` from `execution_inputs` by `execution_id`. Detail is never
@@ -452,20 +452,52 @@ typed columns:
   Its published input timestamp is `recorded_at`, the server-recorded input
   time, distinct from execution timing or sample/window time. It uses the
   same execution/binding/application-Run correlation names where applicable.
-- `bifrost.verification.execution_events` is a queued execution's progress
-  history: one row per execution status or attempt change, invocation start,
-  settlement, or abandonment, and accepted publication, with its
-  server-assigned `event_id`, tenant-ordered `sequence`, execution, step,
-  item, iteration, and attempt, status, bounded reason, and a publication's
-  name, kind, total size, file count, file digest, and, for a JSON
-  publication, its value as the sensitive `value` Variant. It never holds
-  bytes, results, or evidence, and its `occurred_at` is not ordering. Each
-  event commits in Postgres with its transition; a projector stages it
-  through the Scribe outbox under a batch identity committed before
-  submission, so an ambiguous outcome resubmits the same batch and Scribe's
-  batch dedup absorbs it. Live progress reads from the execution records,
-  which report each execution's pending, failed, and acknowledged projection
-  position; projection lag delays history only.
+- `bifrost.verification.execution_events` retains typed execution lifecycle, invocation
+  and publication facts, including bounded authored JSON in its existing sensitive value
+  semantics. It preserves server-assigned event identity, execution sequence/cut and
+  producer indices/attempt. Extend its versioned metadata for authoritative terminal
+  selection: exact result ID or null, full sanitized error and recorded
+  tenant/Verifier/subject/repository/actor identity; inspectable invocation/disposition
+  records; complete file/directory manifests with private verified File associations,
+  original-call receipt identity and source lineage; and accepted request
+  scope/key/digest for replay. It references existing inputs/results/outputs rather than
+  copying their payload or inventing another verdict. Oversized metadata/bytes use
+  existing immutable File references, never SQL payload custody or a new archive table
+  family.
+  - Active/finalizing transitions and handoff intent commit in Postgres together. The
+    existing projector/outbox uses persisted stable identities and physical event
+    membership across retry/configuration changes; ambiguous acknowledgement cannot
+    insert different rows under an old identity. Finalization durably delivers every
+    required component before its canonical terminal handoff is acknowledged, with one
+    selected terminal outcome. Events are history/retained read facts, not code-replay
+    instructions for the active engine.
+  - The shared reader serves active/finalizing metadata from Postgres and retained
+    execution endpoints from Bifrost after handoff, even before operational cleanup. It
+    reads explicit terminal selection and identity rather than latest result recency,
+    source Card lookup or history replay. Preserve current feature authorization and
+    fixed internal reads, producer selection, page-cut membership across cleanup,
+    complete errors and temporary-unavailability versus absence. Ordinary public Bifrost
+    SQL still requires table grants.
+  - Scribe ACK includes authoritative active insertion visible to a subsequent local
+    capture; Oracle's normal cut/capture/revision repin provides source continuity. It
+    does not by itself certify that all components of an execution handoff have arrived.
+    Cleanup of operational execution rows requires complete acknowledged coverage plus
+    retained source ownership through the existing published/live ownership transitions.
+    Do not add Iceberg-promotion waits, request freshness knobs, an archive catalog or
+    timer-based purge. A lost/unacknowledged component leaves recoverable Postgres
+    intent; terminal finalization retries delivery, never settled model work.
+  - Exact completed File associations are read from active publication metadata or
+    retained manifests, never rediscovered through generic inventory by digest for an
+    already accepted publication. Preserve File completion/inventory ACK,
+    path/digest/length validation and existing storage cleanup. Transfer evidence roots
+    before deleting operational rows; cleanup of execution metadata does not shorten
+    evidence retention.
+  - Post-execution Operator/provider deliveries keep their existing operational retry
+    owners and project updated delivery state independently using the canonical
+    execution identity. Retained execution status assembles that projection without a
+    terminal queue row. Registry/principal, binding/schedule/group, repository
+    generation/webhook and library maintenance lifetimes are separate; an execution
+    purge cannot cascade away live work.
 - Every nullable built-in Struct — the `bifrost.metrics.points` bucket sets and
   `bifrost.gateway.calls` `resolved_model` — has nullable children, because a
   required Parquet leaf under a null parent reads back as another row's value

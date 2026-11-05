@@ -223,6 +223,53 @@ async fn action_checkpoint_survives_unfinished_requirements() {
     assistant.deployment.shutdown().await;
 }
 
+/// A direct verification of a publication-free Verifier, a judged one
+/// included, never queues: it writes no execution or invocation checkpoint
+/// row, and its final outcome still reads back by its ID once published.
+///
+/// # Panics
+/// Panics when a verify fails, a direct request leaves execution
+/// coordination behind, or the read-back result differs.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires the repository-managed Postgres journey lane"]
+async fn direct_verification_avoids_execution_coordination() {
+    let assistant = Assistant::start().await;
+    let state = assistant.state().await;
+    let run = state.run_for_card("agent").expect("agent run opens");
+    let mut results = Vec::new();
+    for verifier in ["answer-check", "answer-judged"] {
+        results.push(
+            run.observe()
+                .verify(verifier, json!("yes"))
+                .await
+                .expect("the answer is judged"),
+        );
+    }
+    let server = assistant.deployment.server();
+    let executions = VerificationFixture::provision(server.state(), server.data_tenant_id())
+        .await
+        .expect("the tenant provisions")
+        .executions()
+        .await
+        .expect("executions read");
+    assert_eq!(
+        executions,
+        [],
+        "direct work writes no execution, so no invocation checkpoint either"
+    );
+    server.flush_bifrost().await.expect("rows publish");
+    for result in results {
+        let resumed = Execution::connect_with(result.execution_id, &assistant.deployment.admin())
+            .await
+            .expect("the handle rebuilds from its ID")
+            .wait(WAIT)
+            .await
+            .expect("the direct execution reads back");
+        assert_eq!(resumed, result);
+    }
+    assistant.deployment.shutdown().await;
+}
+
 /// The `code` of a refused call.
 ///
 /// # Panics

@@ -54,6 +54,28 @@ impl HeldLease {
     pub(super) fn lost(&self) -> &CancellationToken {
         &self.lost
     }
+
+    /// Confirm in PostgreSQL that this lease still holds its run, renewing it
+    /// as a tick would, and cancel [`lost`](Self::lost) when it does not.
+    ///
+    /// Work about to leave the process, such as a result write, confirms
+    /// first, so a holder whose lease expired or was reclaimed since its last
+    /// renewal stops before writing.
+    ///
+    /// # Errors
+    /// Returns [`SqlError`] when the connection, statement, or commit fails;
+    /// the lease is then neither confirmed nor cancelled.
+    pub(super) async fn confirm(&self) -> Result<bool, SqlError> {
+        let held = self
+            .renewal
+            .renew_tenant(self.tenant, &[self.token])
+            .await?
+            .contains(&self.token);
+        if !held {
+            self.lost.cancel();
+        }
+        Ok(held)
+    }
 }
 
 impl Drop for HeldLease {

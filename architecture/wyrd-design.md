@@ -650,7 +650,11 @@ the caller's verified pair for a realtime invocation, and the run's subject
 with the tenant's `System` principal as actor for a queued run — which Scribe
 stamps as `sub_principal_id` and `act_principal_id`; each row names the verified Card as `card_uid` and the
 exact Verifier Card as `verifier_card_uid`; a result batch is never dropped for time and is retried under its
-own batch id until Scribe acknowledges it. Gate refuses every public write to
+own batch id until Scribe acknowledges it. A queued run commits `completed`
+only after Scribe acknowledges every row of its selected result; a result
+Scribe drops retries the run from its committed checkpoints with
+`result_undelivered`, and one not acknowledged before the execution deadline
+times the run out. Gate refuses every public write to
 `bifrost.gateway.calls` and the three result tables.
 Tenant principal kinds are `TenantAdmin`, `User`, and `Service`, plus the
 internal credentialless `System` actor. Agent is a Card kind, not a principal

@@ -1026,6 +1026,7 @@ impl<'a> ResultLayoutJourney<'a> {
             ScribeWrite::Result {
                 payload,
                 attribution: Attribution::direct(self.system),
+                acked: std::sync::Mutex::new(None),
             },
         );
         let lost = outbox
@@ -1688,6 +1689,7 @@ async fn trusted_delivery_preserves_each_origin() -> Result<(), ServerJourneyErr
             ScribeWrite::Result {
                 payload: builder.build(&drift_outcome(Some(two_feature_report()?))?)?,
                 attribution,
+                acked: std::sync::Mutex::new(None),
             },
         );
         expected.push(
@@ -2977,6 +2979,7 @@ impl TypedPayloadJourney {
                 ScribeWrite::Result {
                     payload,
                     attribution: Attribution::direct(PrincipalId::new(seed.system_principal())),
+                    acked: std::sync::Mutex::new(None),
                 },
             );
             published.push((result, outcome));
@@ -7209,6 +7212,7 @@ async fn exploration_filters_keep_exact_populations() -> Result<(), ServerJourne
                 ScribeWrite::Result {
                     payload: builder.build(&drift_outcome(Some(two_feature_report()?))?)?,
                     attribution,
+                    acked: std::sync::Mutex::new(None),
                 },
             );
         }

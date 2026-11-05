@@ -868,6 +868,7 @@ impl<'a> VerificationControl<'a> {
                     ScribeWrite::Result {
                         payload,
                         attribution: caller.attribution(),
+                        acked: std::sync::Mutex::new(None),
                     },
                 );
             }

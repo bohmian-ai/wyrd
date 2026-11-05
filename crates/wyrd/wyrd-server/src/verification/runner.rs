@@ -12,10 +12,11 @@
 //! completed outcome becomes one result payload, staged on an outbox slot
 //! reserved before the engine ran (a full reserved share defers the
 //! execution instead) on the process
-//! [`ScribeOutbox`] attributed to the execution's subject and SYSTEM inside
-//! the fenced transaction that completes the execution, so a visible
-//! completion always has its result staged; delivery belongs to the outbox
-//! and never re-executes the execution. A retryable failure is retried within
+//! [`ScribeOutbox`] attributed to the execution's subject and SYSTEM; only
+//! once Scribe acknowledges it does the fenced transaction complete the
+//! execution, so a visible completion always has its result durable. A result
+//! Scribe drops retries the execution from its committed checkpoints, and one
+//! not acknowledged before the deadline times the execution out. A retryable failure is retried within
 //! the attempt budget; a terminal failure is terminated without a verdict;
 //! work abandoned by shutdown is released with its attempt refunded; and work
 //! whose lease is lost stops without settling. While an execution is in
@@ -68,14 +69,14 @@ use super::RuntimeLimits;
 use super::authority::SystemReadAuthority;
 use super::cache::{Db, Target};
 use super::claims::{ClaimLoop, LeasedWork, settled};
-use super::completions::{self, Completions, SharedResult};
+use super::completions::Completions;
 use super::drift::DriftEngine;
 use super::engines::{self, EngineOutcome};
 use super::health::RuntimeCapability;
 use super::history::EventProjector;
 use super::hosted::blocks::{Execution, HostedBlocks};
 use super::inputs::{InputResolver, InputRow};
-use super::leases::LeaseRenewal;
+use super::leases::{HeldLease, LeaseRenewal};
 use super::results::{ResultPayloadBuilder, ResultRun};
 use super::telemetry::{ExecutionMode, ExecutionTelemetry, Phase};
 use crate::components::auth::Caller;
@@ -99,6 +100,9 @@ pub const VERIFIER_INVALID: &str = "verifier_invalid";
 pub const EXECUTION_INTERRUPTED: &str = "execution_interrupted";
 /// Stable error code when a completed result could not be encoded.
 pub const RESULT_INVALID: &str = "result_invalid";
+/// Stable error code when Scribe dropped or rejected a completed result, so
+/// the execution is retried.
+pub const RESULT_UNDELIVERED: &str = "result_undelivered";
 /// Stable error code when a block was refused process capacity, so the
 /// execution is deferred.
 pub const RUNTIME_BUSY: &str = "verification_runtime_busy";
@@ -377,9 +381,9 @@ impl VerifierRunner {
     /// attempt, so a full outbox backs claims off instead of losing results.
     /// An execution whose `deadline` has already passed times out without
     /// dispatching anything. Otherwise the engine runs until `deadline` and a
-    /// completed outcome is built into its result write, which
-    /// [`settle`](Self::settle) stages inside the lease-fenced transaction
-    /// that completes the execution. Never fails: every failure becomes the
+    /// completed outcome is built into its result write, which [`deliver`]
+    /// hands to Scribe before [`settle`](Self::settle) completes the
+    /// execution. Never fails: every failure becomes the
     /// [`Transition`] it maps to.
     async fn execute(
         &self,
@@ -655,16 +659,13 @@ impl VerifierRunner {
 
     /// Apply `transition` to `run` in one tenant transaction.
     ///
-    /// A [`Transition::Complete`] first joins the group commit
-    /// through [`Completions`], which settles it in one transaction with the
-    /// tenant's other completing runs; only when no batch committed it does
-    /// it settle alone here. Either way, when the completion applies under
-    /// this lease, the write in `result` is taken and staged on its reserved
-    /// slot before the transaction commits, so no reader sees the run
-    /// `completed` before its result is pending. A stale lease stages nothing. If the commit then fails, the
-    /// already-staged write keeps its result ID: a retried settlement under
-    /// the same lease completes the run without staging again, and a lost
-    /// lease leaves the result written for a run another claim re-executes.
+    /// A [`Transition::Complete`], whose result Scribe already acknowledged,
+    /// first joins the group commit through [`Completions`], which settles it
+    /// in one transaction with the tenant's other completing runs; only when
+    /// no batch committed it does it settle alone here. A failed commit
+    /// retried under the same lease completes the run with the same result
+    /// ID, and a lost lease leaves the result written for a run another claim
+    /// re-executes.
     ///
     /// Returns the stable outcome label: `completed`, `retrying`,
     /// `exhausted`, `cancelled`, `timed_out`, `errored`,
@@ -679,7 +680,6 @@ impl VerifierRunner {
         tenant: DataTenantId,
         run: &ClaimedExecution,
         transition: Transition,
-        result: &SharedResult,
     ) -> Result<&'static str, SqlError> {
         if transition == Transition::LeaseLost {
             return Ok("stale_lease");
@@ -699,7 +699,7 @@ impl VerifierRunner {
                 summary: summary.clone(),
                 drift: *drift,
             };
-            if let Some(settlement) = self.completions.complete(tenant, completion, result).await {
+            if let Some(settlement) = self.completions.complete(tenant, completion).await {
                 return Ok(settled(settlement, "completed"));
             }
         }
@@ -715,7 +715,6 @@ impl VerifierRunner {
                     .queue
                     .complete(&mut conn, lease, result_id, verdict, &summary, drift)
                     .await?;
-                completions::stage(tenant, settlement, result);
                 settled(settlement, "completed")
             }
             Transition::Retry(error) => {
@@ -896,10 +895,7 @@ impl LeasedWork for VerifierRunner {
     /// is logged; the lease then expires into a reclaim.
     async fn release_late(&self, tenant: DataTenantId, claim: &AttemptClaim) {
         let run = &claim.run;
-        match self
-            .settle(tenant, run, Transition::Release, &SharedResult::default())
-            .await
-        {
+        match self.settle(tenant, run, Transition::Release).await {
             Ok(outcome) => {
                 tracing::info!(execution_id = %run.lease.execution_id, outcome, "claim committed after shutdown began; released");
             }
@@ -951,6 +947,10 @@ impl VerifierRunner {
             () = lost.cancelled() => (Transition::LeaseLost, None),
             executed = self.execute(tenant, run, verifier, deadline, &telemetry) => executed,
         };
+        let transition = match result {
+            Some(result) => deliver(tenant, transition, result, deadline, &held, abandon).await,
+            None => transition,
+        };
         let transition = match transition {
             Transition::LeaseLost if abandon.is_cancelled() => Transition::Release,
             Transition::Retry(_) if stop.is_cancelled() => Transition::Release,
@@ -960,14 +960,11 @@ impl VerifierRunner {
         if let Some(error) = transition.error() {
             tracing::Span::current().record("error_code", error.code.as_str());
         }
-        let result = Arc::new(Mutex::new(result));
         let settled = telemetry
             .phase(
                 Phase::Settlement,
-                persist(lost, || {
-                    self.settle(tenant, run, transition.clone(), &result)
-                })
-                .instrument(tracing::info_span!("verification.settle")),
+                persist(lost, || self.settle(tenant, run, transition.clone()))
+                    .instrument(tracing::info_span!("verification.settle")),
             )
             .await;
         drop(held);
@@ -1008,15 +1005,70 @@ impl VerifierRunner {
     }
 }
 
+/// Hand a completed run's `result` to Scribe and return the transition the
+/// run settles with once Scribe answers.
+///
+/// The lease is confirmed first, so a holder whose lease expired or was
+/// reclaimed since its last renewal writes no result. `transition` stands
+/// once Scribe acknowledges every row of the result, so the run commits
+/// `completed` only with its result durable. A result Scribe drops or
+/// rejects retries the run from its committed checkpoints with
+/// [`RESULT_UNDELIVERED`], and one still unacknowledged at `deadline` times
+/// the run out as an engine past it does; a staged write that lands later
+/// keeps its own result ID, which no execution selects. A lost lease or an
+/// abandoning shutdown stops waiting as the engine does.
+async fn deliver(
+    tenant: DataTenantId,
+    transition: Transition,
+    (slot, mut write): StagedResult,
+    deadline: tokio::time::Instant,
+    held: &HeldLease,
+    abandon: &CancellationToken,
+) -> Transition {
+    let lost = held.lost();
+    if !matches!(persist(lost, || held.confirm()).await, Ok(true)) {
+        return if abandon.is_cancelled() {
+            Transition::Release
+        } else {
+            Transition::LeaseLost
+        };
+    }
+    let (sender, acked) = tokio::sync::oneshot::channel();
+    if let ScribeWrite::Result { acked, .. } = &mut write {
+        *acked
+            .get_mut()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(sender);
+    }
+    slot.stage(tenant, write);
+    tokio::select! {
+        biased;
+        () = abandon.cancelled() => Transition::Release,
+        () = lost.cancelled() => Transition::LeaseLost,
+        delivered = tokio::time::timeout_at(deadline, acked) => match delivered {
+            Ok(Ok(())) => transition,
+            Ok(Err(_)) => Transition::Retry(failure(
+                RESULT_UNDELIVERED,
+                "Scribe did not accept the verification result",
+            )),
+            Err(_) => Transition::Terminate(
+                TerminalStatus::TimedOut,
+                failure(
+                    EXECUTION_TIMED_OUT,
+                    "the verification result was not acknowledged before the execution deadline",
+                ),
+            ),
+        },
+    }
+}
+
 /// Build `outcome`'s result payload once into the write that completes `run`.
 ///
 /// The payload mints its own result ID, which the completing settlement
 /// records as the execution's selected result, and `ended_at`, the results table's
 /// time column, is a result fact this process observes, not a coordination
 /// instant. The write is attributed to the execution's subject with `system`
-/// as actor, and returned rather than staged: only a settlement that still
-/// holds the lease may stage it, so a holder that lost its lease writes no
-/// result. An outcome that cannot be encoded terminates `errored` with no
+/// as actor, and returned rather than staged, so [`deliver`] stages it only
+/// while the attempt still holds its lease. An outcome that cannot be encoded terminates `errored` with no
 /// write.
 fn result(
     run: &ClaimedExecution,
@@ -1073,6 +1125,7 @@ fn result(
         Some(ScribeWrite::Result {
             payload,
             attribution: Attribution::new(run.attribution.sub_principal_id, system),
+            acked: Mutex::new(None),
         }),
     )
 }
@@ -1178,6 +1231,11 @@ impl ExecutionCheckpoints {
 
 #[async_trait::async_trait]
 impl Checkpoints for ExecutionCheckpoints {
+    /// Record that `attempt` of `task` started, fenced by the lease.
+    ///
+    /// # Errors
+    /// Returns a bounded reason when the write cannot commit or the lease is
+    /// no longer held.
     async fn begin(&self, task: &TaskId, attempt: u32) -> Result<(), String> {
         self.fenced(async |conn| {
             self.queue
@@ -1187,6 +1245,12 @@ impl Checkpoints for ExecutionCheckpoints {
         .await
     }
 
+    /// Remove the unsettled `attempt` of `task`, fenced by the lease, so a
+    /// later attempt replays it.
+    ///
+    /// # Errors
+    /// Returns a bounded reason when the write cannot commit or the lease is
+    /// no longer held.
     async fn forget(&self, task: &TaskId, attempt: u32) -> Result<(), String> {
         self.fenced(async |conn| {
             self.queue
@@ -1196,6 +1260,12 @@ impl Checkpoints for ExecutionCheckpoints {
         .await
     }
 
+    /// Commit `settled` as the settlement of `attempt` of `task`, fenced by
+    /// the lease.
+    ///
+    /// # Errors
+    /// Returns a bounded reason when the write cannot commit or the lease is
+    /// no longer held.
     async fn settle(
         &self,
         task: &TaskId,

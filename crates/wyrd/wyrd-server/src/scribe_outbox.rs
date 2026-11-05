@@ -42,7 +42,9 @@
 //! identity the execution queue persisted before staging it and the event's
 //! position, so a resubmission from any process at any request ceiling is
 //! deduplicated, and its acknowledgement is reported back to the
-//! projector that persisted it.
+//! projector that persisted it. A queued run's result is likewise reported
+//! back once its slice is acknowledged and not lost, so the runner commits
+//! the run `completed` only after its result is durable.
 //!
 //! A sink given the Wyrd Postgres owner also schedules grouped verification:
 //! once a slice's frames are acknowledged, every grouped inputs or result row
@@ -212,6 +214,11 @@ pub enum ScribeWrite {
         payload: ResultPayload,
         /// The run's subject and actor, which Scribe stamps on every row.
         attribution: Attribution,
+        /// Fired once Scribe acknowledges every row of the result, and only
+        /// then; a rejected, unprojectable, or dropped write drops the sender
+        /// instead. A queued run commits `completed` only after it fires;
+        /// `None` for a write nothing awaits.
+        acked: Mutex<Option<oneshot::Sender<()>>>,
     },
     /// One Verifier execution's input record.
     ExecutionInputs {
@@ -423,6 +430,7 @@ impl ScribeWrite {
             Self::Result {
                 payload,
                 attribution,
+                ..
             } => payload
                 .rows()
                 .iter()
@@ -1838,14 +1846,15 @@ impl OutboxSink for ScribeSink {
             {
                 reserved.stage(tenant, Acknowledged((**queued).clone()));
             }
-            if let ScribeWrite::ExecutionEvents { acked, .. } = item
+            if let ScribeWrite::ExecutionEvents { acked, .. } | ScribeWrite::Result { acked, .. } =
+                item
                 && !lost.contains(&index)
                 && let Some(sender) = acked
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner)
                     .take()
             {
-                // The projector may have given up; it resubmits the batch.
+                // The waiter may have given up; it resubmits or re-executes.
                 let _ = sender.send(());
             }
         }
@@ -2053,6 +2062,7 @@ mod tests {
         ScribeWrite::Result {
             payload,
             attribution,
+            acked: Mutex::new(None),
         }
     }
 
@@ -3422,9 +3432,11 @@ mod tests {
             ScribeWrite::Result {
                 payload,
                 attribution,
+                ..
             } => ScribeWrite::Result {
                 payload: payload.clone(),
                 attribution: *attribution,
+                acked: Mutex::new(None),
             },
             ScribeWrite::ExecutionInputs {
                 row,

@@ -556,6 +556,7 @@ fn result(source: &ClaimedExecution, payload: ResultPayload) -> ScribeWrite {
     ScribeWrite::Result {
         payload,
         attribution: source.attribution,
+        acked: std::sync::Mutex::new(None),
     }
 }
 

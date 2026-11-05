@@ -1241,6 +1241,68 @@ async fn unscorable_verifier_errors_without_publishing() {
     runtime.stop().await;
 }
 
+/// A run commits `completed` only once Scribe acknowledges its result: while
+/// the result is held before Scribe the run stays `running` with no selected
+/// result, and completes on its first attempt once released. A result Scribe
+/// rejects retries the run with `result_undelivered`, and the retry completes
+/// it; a result still unacknowledged at the deadline times the run out with
+/// no result.
+///
+/// # Panics
+/// Panics when a run completes before its result is acknowledged, a
+/// rejected result does not retry and complete, or an unacknowledged one
+/// does not time out.
+#[tokio::test]
+async fn completion_waits_for_the_durable_result() {
+    let harness = Harness::start().await;
+    let script = EngineScript::default();
+    for _ in 0..4 {
+        script.push(EngineOutcome::Completed(unscored_report()));
+    }
+    let runtime = harness.spawn(
+        &RuntimeLimits {
+            execution_timeout: Duration::from_secs(5),
+            ..Harness::limits()
+        },
+        &script,
+    );
+
+    let hold = harness.fault.hold_next(OUTPUTS);
+    let run = harness.submit().await;
+    tokio::time::timeout(WAIT, hold.arrived())
+        .await
+        .expect("the result reaches Scribe");
+    let row = harness.seed.execution(run).await.expect("execution reads");
+    assert_eq!(
+        (row.status.as_str(), row.result_id),
+        ("running", None),
+        "no run completes before its result is durable"
+    );
+    hold.release();
+    let row = harness.wait_execution(run, status("completed")).await;
+    assert_eq!(row.attempts, 1);
+    assert!(row.result_id.is_some());
+
+    harness.fault.reject_next(OUTPUTS);
+    let run = harness.submit().await;
+    let row = harness.wait_execution(run, status("retrying")).await;
+    assert_eq!(row.error_code.as_deref(), Some("result_undelivered"));
+    assert_eq!(row.result_id, None);
+    harness.expire(run).await;
+    let row = harness.wait_execution(run, status("completed")).await;
+    assert_eq!(row.attempts, 2, "the retry delivers its own result");
+
+    let hold = harness.fault.hold_next(OUTPUTS);
+    let run = harness.submit().await;
+    let row = harness.wait_execution(run, status("timed_out")).await;
+    assert_eq!(
+        (row.error_code.as_deref(), row.result_id),
+        (Some("execution_timed_out"), None)
+    );
+    hold.release();
+    runtime.stop().await;
+}
+
 /// A result batch Scribe durably accepted but whose acknowledgement was lost
 /// makes the outbox resend the identical slice: the output and summary frames
 /// are resubmitted with the same table, batch ID, and Arrow bytes, and Scribe

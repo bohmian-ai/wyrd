@@ -218,6 +218,7 @@ impl EvidenceInvestigation {
                 ScribeWrite::Result {
                     payload,
                     attribution: Attribution::direct(PrincipalId::new(seed.system_principal())),
+                    acked: std::sync::Mutex::new(None),
                 },
             );
         }

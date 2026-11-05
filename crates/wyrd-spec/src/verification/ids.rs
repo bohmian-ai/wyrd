@@ -101,6 +101,14 @@ impl PublicationName {
     }
 }
 
+impl FromStr for PublicationName {
+    type Err = WyrdError;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        Self::new(value)
+    }
+}
+
 impl<'de> Deserialize<'de> for PublicationName {
     fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
         let value = String::deserialize(deserializer)?;

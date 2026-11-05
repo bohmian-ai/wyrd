@@ -243,13 +243,15 @@ fn refused<T: std::fmt::Debug>(result: Result<T, wyrd_ai::WyrdError>) -> String 
 /// with it for another Verifier only, is refused; one scoped to this Verifier reads.
 /// Another tenant sees no such execution. A viewer cannot cancel; the
 /// administrator's cancel and its repeat both answer `cancelled`, and the
-/// publications stay listed.
+/// publications stay listed. The `wyrd execution` command lists, reads,
+/// plans, refuses, cancels, and reads status with the same answers.
 ///
 /// # Panics
 /// Panics when any read, refusal, or cancellation differs.
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "requires the repository-managed Postgres journey lane"]
 async fn execution_pages_are_stable_and_tenant_scoped() {
+    use wyrd_ai::cli::{ExecutionArg, ExecutionVerb, PageArgs, PublicationArgs};
     use wyrd_ai::verify::{
         ExecutionPageQuery, InvocationProgress, PublicationContent, PublicationKind,
         PublicationName, PublicationSelector, TaskId, VerificationExecutionStatus,
@@ -564,13 +566,84 @@ async fn execution_pages_are_stable_and_tenant_scoped() {
         "WYRD_PERMISSION_403_DENIED_RBAC"
     );
 
-    for _ in 0..2 {
-        let cancelled = execution.cancel().await.expect("the cancel commits");
-        assert_eq!(
-            (cancelled.execution_id, cancelled.status),
-            (id, VerificationExecutionStatus::Cancelled)
-        );
-    }
+    let target = ExecutionArg { execution_id: id };
+    let cli = |verb: ExecutionVerb, client: wyrd_ai::WyrdClient| {
+        wyrd_ai::cli::execution(verb, Some(client))
+    };
+    let listed_by_cli = cli(
+        ExecutionVerb::Publications(PageArgs {
+            execution: target.clone(),
+            limit: None,
+            cursor: None,
+        }),
+        deployment.admin(),
+    )
+    .await
+    .expect("the CLI lists publications");
+    assert_eq!(
+        listed_by_cli["items"],
+        serde_json::to_value(&publications).expect("items")
+    );
+    let selected = |name: &str, path: Option<&str>| PublicationArgs {
+        execution: target.clone(),
+        step_id: TaskId::new("draft").expect("step"),
+        name: PublicationName::new(name).expect("name"),
+        attempt: 1,
+        item_index: None,
+        iteration_index: None,
+        path: path.map(str::to_owned),
+    };
+    let tree = cli(
+        ExecutionVerb::Publication(selected("tree", None)),
+        deployment.admin(),
+    )
+    .await
+    .expect("the CLI reads a directory publication");
+    assert_eq!(
+        tree["manifest"],
+        serde_json::to_value(&directory).expect("manifest")
+    );
+    let plan = cli(
+        ExecutionVerb::Download(selected("tree", Some("a.md"))),
+        deployment.admin(),
+    )
+    .await
+    .expect("the CLI plans a directory file download");
+    assert_eq!(plan["size_bytes"], directory.files[0].size_bytes);
+    let too_many = PageArgs {
+        execution: target.clone(),
+        limit: Some(201),
+        cursor: None,
+    };
+    assert_eq!(
+        refused(cli(ExecutionVerb::Invocations(too_many), deployment.admin()).await),
+        "WYRD_SPEC_400_VALIDATION"
+    );
+    let viewer_key = deployment.key("pages_cli_viewer", &["viewer"]).await;
+    assert_eq!(
+        refused(
+            cli(
+                ExecutionVerb::Cancel(target.clone()),
+                deployment.client(&viewer_key)
+            )
+            .await
+        ),
+        "WYRD_PERMISSION_403_DENIED_RBAC"
+    );
+
+    let cancelled = execution.cancel().await.expect("the cancel commits");
+    assert_eq!(
+        (cancelled.execution_id, cancelled.status),
+        (id, VerificationExecutionStatus::Cancelled)
+    );
+    let repeated = cli(ExecutionVerb::Cancel(target.clone()), deployment.admin())
+        .await
+        .expect("the CLI repeats the cancel");
+    assert_eq!(repeated, serde_json::to_value(cancelled).expect("cancel"));
+    let status = cli(ExecutionVerb::Status(target), deployment.admin())
+        .await
+        .expect("the CLI reads the status");
+    assert_eq!(status["status"], "cancelled");
     assert_eq!(
         execution
             .publications(&ExecutionPageQuery::default())

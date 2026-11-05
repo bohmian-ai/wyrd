@@ -14,6 +14,7 @@ mod cli;
 mod client;
 pub mod declaration;
 pub mod error;
+mod execution;
 pub mod gateway;
 /// `wyrd init`: local server bootstrap and its guided setup handoff.
 pub mod init;
@@ -47,6 +48,7 @@ pub mod commands {
         BumpLevel, CheckCard, CheckReport, SelectorArgs, artifact_files, artifact_upload, declare,
         declare_check, get, pull,
     };
+    pub use crate::execution::{ExecutionArg, ExecutionVerb, PageArgs, PublicationArgs, execution};
     pub use crate::gateway::{
         delete_provider_credential, put_provider_credential, revoke_provider_credential,
     };

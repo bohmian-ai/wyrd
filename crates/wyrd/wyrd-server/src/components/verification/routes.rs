@@ -147,12 +147,13 @@ async fn evidence(
     ))
 }
 
-/// Stage one background Verifier execution and return its ID.
+/// Durably admit one background Verifier execution and return its ID.
 ///
 /// # Errors
 /// Returns a stable Wyrd error when the body or Idempotency-Key is malformed,
-/// the caller lacks `verifier:run` on the Verifier, the inputs exceed a
-/// bound, or this process hosts no Verifier queue.
+/// the key names a different request, the caller lacks `verifier:run` on the
+/// Verifier, the inputs exceed a bound, this process hosts no Verifier queue,
+/// or the submission was lost before admission.
 #[utoipa::path(
     post,
     path = "/verification/enqueue",
@@ -160,7 +161,7 @@ async fn evidence(
     params(("Idempotency-Key" = Option<String>, Header, description = "Optional retry key; a \
         retry with the same key and body returns the same execution_id")),
     responses(
-        (status = 202, description = "Execution staged; poll its status",
+        (status = 202, description = "Execution durably admitted; poll its status",
          body = EnqueueVerificationResponse),
         (status = 400, description = "The body or Idempotency-Key is invalid \
           (WYRD_VERIFICATION_400_INPUT_INVALID, WYRD_SPEC_400_VALIDATION)", body = WyrdProblem),
@@ -169,9 +170,12 @@ async fn evidence(
           WYRD_AUTH_401_TOKEN_EXPIRED)", body = WyrdProblem),
         (status = 403, description = "The principal lacks verifier:run on the Verifier \
           (WYRD_PERMISSION_403_DENIED_RBAC)", body = WyrdProblem),
+        (status = 409, description = "The Idempotency-Key already names a different request \
+          (WYRD_REGISTRY_409_IDEMPOTENCY_CONFLICT)", body = WyrdProblem),
         (status = 413, description = "The body or inputs exceed a bound \
           (WYRD_VERIFICATION_413_INPUT_TOO_LARGE)", body = WyrdProblem),
-        (status = 503, description = "This process hosts no Verifier queue \
+        (status = 503, description = "This process hosts no Verifier queue, or the submission \
+          was not admitted and may be retried under its key \
           (WYRD_SERVER_503_SERVICE_UNAVAILABLE)", body = WyrdProblem)
     ),
     tag = "Verification"
@@ -189,7 +193,9 @@ async fn enqueue(
 ) -> Result<(StatusCode, Json<EnqueueVerificationResponse>), WyrdErrorResponse> {
     let key = extract_idempotency_key(&headers)?;
     let request: VerificationRequest = decode_body(body).await?;
-    let response = VerificationControl::new(&state).enqueue(&caller, request, key.as_ref());
+    let response = VerificationControl::new(&state)
+        .enqueue(&caller, request, key.as_ref())
+        .await;
     let outcome = if response.is_ok() {
         "staged"
     } else {

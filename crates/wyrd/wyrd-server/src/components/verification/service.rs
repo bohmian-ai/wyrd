@@ -30,7 +30,7 @@ use wyrd_spec::verification::{
 };
 use wyrd_sql::queries::cards::get_card_by_uid;
 use wyrd_sql::queries::verifier_executions::{
-    Admission, Cause, EnqueueRefusal, Submission, VerifierExecutionQueue,
+    Admission, Cause, EnqueueRefusal, Submission, SubmissionOutcome, VerifierExecutionQueue,
 };
 use wyrd_sql::{ParsedCardRow, TenantConn};
 
@@ -51,7 +51,7 @@ use crate::verification::inputs::InputResolver;
 use crate::verification::results::{
     InputRecord, ResultPayloadBuilder, ResultPayloadError, ResultRun,
 };
-use crate::verification::submissions::Queued;
+use crate::verification::submissions::{AdmissionReply, Queued};
 use crate::verification::telemetry::{ExecutionMode, ExecutionTelemetry, Phase};
 
 /// Audit operation of a binding status read.
@@ -658,11 +658,13 @@ impl<'a> VerificationControl<'a> {
     /// so identical retries share it), and stages the pinned inputs marked
     /// `queue_execution` on the Scribe outbox with the [`Submission`]. Once
     /// Scribe acknowledges the inputs, the submission is queued through the
-    /// batched writer, which decides replay, conflict, and refusal; until
-    /// then status reads not found. Reads and writes no Postgres. The
-    /// execution runs as the caller, never as a binding owner. The request's
-    /// span and the caller's own sampled flag become the execution's
-    /// [`Cause`], which its attempts link to.
+    /// batched writer, which decides replay, conflict, and refusal. This
+    /// returns only after that writer commits, so an acknowledged execution
+    /// is recoverable: a matching retry under the same key returns the
+    /// original execution. The handler itself reads and writes no Postgres.
+    /// The execution runs as the caller, never as a binding owner. The
+    /// request's span and the caller's own sampled flag become the
+    /// execution's [`Cause`], which its attempts link to.
     ///
     /// # Errors
     /// Returns [`WyrdError::PermissionDeniedRbac`] without `verifier:run` on
@@ -670,10 +672,12 @@ impl<'a> VerificationControl<'a> {
     /// the subject's UID, [`WyrdError::VerificationInputTooLarge`] for inputs
     /// past a Variant limit, `WYRD_SPEC_400_VALIDATION` for an empty
     /// `deployment_environment`, [`WyrdError::ServiceUnavailable`] when this
-    /// process hosts no Verifier queue, and
+    /// process hosts no Verifier queue or the submission was lost before its
+    /// admission committed, [`WyrdError::RegistryIdempotencyConflict`] when
+    /// the key already names a different request, and
     /// [`WyrdError::VerificationStagingFull`] when the submission or Scribe
     /// outbox cannot reserve its slot, before any input is staged.
-    pub(crate) fn enqueue(
+    pub(crate) async fn enqueue(
         &self,
         caller: &Caller,
         request: VerificationRequest,
@@ -753,6 +757,7 @@ impl<'a> VerificationControl<'a> {
             .reserve(1)
             .map_err(staging_full)?;
         let execution_id = submission.execution_id;
+        let (reply, admitted) = AdmissionReply::channel();
         staged.stage(
             caller.data_tenant_id,
             ScribeWrite::ExecutionInputs {
@@ -763,11 +768,31 @@ impl<'a> VerificationControl<'a> {
                     Box::new(Queued {
                         admission: Admission::Submitted(submission),
                         claim: None,
+                        reply: Some(reply),
                     }),
                 )),
             },
         );
-        Ok(EnqueueVerificationResponse { execution_id })
+        match admitted.await {
+            Ok(SubmissionOutcome::Accepted | SubmissionOutcome::Refused(_)) => {
+                Ok(EnqueueVerificationResponse { execution_id })
+            }
+            Ok(SubmissionOutcome::Replayed(original)) => Ok(EnqueueVerificationResponse {
+                execution_id: original,
+            }),
+            Ok(SubmissionOutcome::Conflict { original }) => {
+                Err(WyrdError::RegistryIdempotencyConflict {
+                    message: "this Idempotency-Key already names a different verification request"
+                        .to_owned(),
+                    details: serde_json::json!({ "execution_id": original }),
+                })
+            }
+            Err(_lost) => Err(WyrdError::ServiceUnavailable {
+                message: "the submission was not admitted; retry with the same Idempotency-Key"
+                    .to_owned(),
+                details: serde_json::json!({ "retry_after_seconds": STAGING_RETRY_AFTER_SECONDS }),
+            }),
+        }
     }
 
     /// Stage a completed direct execution's inputs and result on the Scribe

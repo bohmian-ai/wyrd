@@ -122,8 +122,7 @@ impl Execution {
     ///
     /// # Errors
     /// Returns the execution's own structured error when it settled as
-    /// errored, cancelled, or timed out, including a delayed
-    /// idempotency conflict; [`Execution::wait_timed_out`]'s error when
+    /// errored, cancelled, or timed out; [`Execution::wait_timed_out`]'s error when
     /// `deadline` passes first; and any other status-read error unchanged.
     ///
     /// # Cancellation

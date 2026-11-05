@@ -1900,8 +1900,9 @@ caller's pair for `submit` inputs, and the execution's accepted subject with
 the tenant `System` principal as actor for a queued result. A `submit`
 creates its queued `wyrd.verifier_executions` row only after Scribe
 acknowledges its `execution_inputs` batch, through the existing batched
-request outbox; staged inputs not yet acknowledged are lost on abrupt process
-death, and the execution then never becomes visible. The row stores no input
+request outbox, and `submit` answers only after that row commits; staged
+inputs not yet acknowledged are lost on abrupt process death, and that
+submission is then never acknowledged. The row stores no input
 values: the runner resolves them, and the accepted routes, from that input
 record. A group or schedule execution follows the same order: the scheduler
 prepares it without writing the queue and stages its selector record on a

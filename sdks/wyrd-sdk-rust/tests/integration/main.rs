@@ -8,6 +8,8 @@
 /// One Service action read back as one connected trace timeline.
 mod action_timeline;
 mod declare_and_pull;
+/// Queued work, acknowledged only once durably admitted.
+mod durable_verifier_work;
 mod gateway_admin;
 mod gateway_inference;
 /// TypeSafe Jev through the Gateway, natively and through Chat Completions.

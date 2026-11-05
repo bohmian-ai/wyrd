@@ -432,9 +432,8 @@ impl Target<'_> {
     ///
     /// One `Idempotency-Key` is minted per call and replayed on every
     /// transport retry, so a retried request names the same execution.
-    /// `202` confirms staging only: replay or conflict is decided when the
-    /// queue accepts it, and a conflict surfaces through the execution's
-    /// status and `wait`.
+    /// `202` confirms durable admission: a replay returns the original
+    /// execution, and a conflict or a loss before admission is an error.
     ///
     /// # Errors
     /// As [`Target::execute`].

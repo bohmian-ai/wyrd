@@ -614,8 +614,7 @@ class Execution:
 
         Raises:
             WyrdError: the execution's own error when it settled as errored,
-                cancelled, or timed out, including a delayed
-                ``WYRD_REGISTRY_409_IDEMPOTENCY_CONFLICT``;
+                cancelled, or timed out;
                 ``WYRD_SDK_504_VERIFICATION_WAIT_TIMEOUT`` when ``timeout``
                 passes first; ``WYRD_SPEC_400_VALIDATION`` for a negative
                 ``timeout``; the client's connection error on first use; and

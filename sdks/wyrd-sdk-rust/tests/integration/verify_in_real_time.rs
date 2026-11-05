@@ -58,11 +58,11 @@ pub(crate) struct Assistant {
     /// The registered assistant Service.
     pub(crate) service: CardRef,
     /// The registered `answer-check` assertion Verifier.
-    answer_check: CardRef,
+    pub(crate) answer_check: CardRef,
     /// The registered `answer-judged` Agent-check Verifier.
     answer_judged: CardRef,
     /// The registered `assistant-agent` Card the Verifiers judge.
-    agent: CardRef,
+    pub(crate) agent: CardRef,
 }
 
 /// `builder` running the verification runtime, its gateway provider root
@@ -139,6 +139,20 @@ impl Assistant {
             answer_check: declared(&assistant, "answer-check"),
             answer_judged: declared(&assistant, "answer-judged"),
             agent: declared(&assistant, "assistant-agent"),
+        }
+    }
+
+    /// Restart the server over the same Postgres and storage, still running
+    /// the verification runtime on the same judge, as a process restart
+    /// does.
+    ///
+    /// # Panics
+    /// Panics when the server does not restart.
+    pub(crate) async fn restart(self) -> Self {
+        let builder = on_judge(WyrdTestServer::builder(), &self.judge);
+        Self {
+            deployment: self.deployment.restart(builder).await,
+            ..self
         }
     }
 
@@ -1312,12 +1326,36 @@ impl Grouped {
 ///
 /// # Panics
 /// Panics when no token mints or the submission is not accepted.
-async fn enqueue_as(
+pub(crate) async fn enqueue_as(
     client: &WyrdClient,
     deployment: &Deployment,
     idempotency_key: &str,
     body: &serde_json::Value,
 ) -> ExecutionId {
+    let (status, accepted) = enqueue_response(client, deployment, idempotency_key, body)
+        .await
+        .expect("the server answers");
+    assert_eq!(status, 202, "{accepted}");
+    accepted["execution_id"]
+        .as_str()
+        .and_then(|id| id.parse().ok())
+        .expect("the response names its execution")
+}
+
+/// The status and JSON body `POST /v1/verification/enqueue` answers `body`
+/// with as `client` under `idempotency_key`.
+///
+/// # Errors
+/// Returns the transport error when no answer arrives.
+///
+/// # Panics
+/// Panics when no token mints or the body is not JSON.
+pub(crate) async fn enqueue_response(
+    client: &WyrdClient,
+    deployment: &Deployment,
+    idempotency_key: &str,
+    body: &serde_json::Value,
+) -> reqwest::Result<(u16, serde_json::Value)> {
     let token = client.access_token().await.expect("access token mints");
     let response = reqwest::Client::new()
         .post(format!(
@@ -1329,17 +1367,12 @@ async fn enqueue_as(
         ))
         .header("x-wyrd-access-token", format!("Bearer {}", token.expose()))
         .header("idempotency-key", idempotency_key)
+        .timeout(Duration::from_secs(5))
         .json(body)
         .send()
-        .await
-        .expect("the server answers");
+        .await?;
     let status = response.status().as_u16();
-    let accepted: serde_json::Value = response.json().await.expect("the body is JSON");
-    assert_eq!(status, 202, "{accepted}");
-    accepted["execution_id"]
-        .as_str()
-        .and_then(|id| id.parse().ok())
-        .expect("the response names its execution")
+    Ok((status, response.json().await.expect("the body is JSON")))
 }
 
 /// A support conversation populated over three Runs of the Rust SDK, then
@@ -1414,24 +1447,20 @@ async fn grouped_support_resumes() {
         replayed,
         "the same key and body replay one execution"
     );
-    let conflict = support
-        .enqueue_over_http(
-            deployment,
-            "support-turn-0006",
-            &json!({
-                "verifier_card_uid": declared(&support.receipt, "turn-check").uid,
-                "card_uid": declared(&support.receipt, "assistant-agent").uid,
-                "inputs": {"turn": {"kind": "json", "value": {"answer": ""}}},
-            }),
-        )
-        .await;
-    let conflicted = Execution::connect_with(conflict, &deployment.admin())
-        .await
-        .expect("the execution handle connects")
-        .wait(WAIT)
-        .await
-        .expect_err("the key conflict settles errored");
-    assert_eq!(conflicted.code(), "WYRD_REGISTRY_409_IDEMPOTENCY_CONFLICT");
+    let (status, conflicted) = enqueue_response(
+        &support.client,
+        deployment,
+        "support-turn-0006",
+        &json!({
+            "verifier_card_uid": declared(&support.receipt, "turn-check").uid,
+            "card_uid": declared(&support.receipt, "assistant-agent").uid,
+            "inputs": {"turn": {"kind": "json", "value": {"answer": ""}}},
+        }),
+    )
+    .await
+    .expect("the server answers");
+    assert_eq!(status, 409, "{conflicted}");
+    assert_eq!(conflicted["code"], "WYRD_REGISTRY_409_IDEMPOTENCY_CONFLICT");
     Execution::connect_with(replayed, &deployment.admin())
         .await
         .expect("the execution handle connects")

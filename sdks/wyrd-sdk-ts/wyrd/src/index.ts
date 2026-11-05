@@ -2612,8 +2612,8 @@ export namespace verify {
      * Poll with capped backoff until a result, the execution's own error, or
      * `timeoutMs`. A result is never invented from a status.
      *
-     * @throws {@link WyrdError} the settled execution's error (including an
-     * asynchronous idempotency conflict), `WYRD_SDK_504_VERIFICATION_WAIT_TIMEOUT`,
+     * @throws {@link WyrdError} the settled execution's error,
+     * `WYRD_SDK_504_VERIFICATION_WAIT_TIMEOUT`,
      * or a non-transient read failure.
      */
     async wait(options: { readonly timeoutMs: number }): Promise<VerificationResult> {
@@ -2729,7 +2729,7 @@ export class Observe {
   /**
    * Submit slot values: Window samples are recorded for the Verifier's
    * schedule, and Run evidence is queued for one execution. Acceptance confirms
-   * staging only; read the outcome through the execution's `wait`.
+   * durable admission; read the outcome through the execution's `wait`.
    *
    * @param verifier - The bound Verifier's name.
    * @param inputs - As {@link Observe.verify}.

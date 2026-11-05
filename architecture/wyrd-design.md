@@ -1703,7 +1703,7 @@ execution; scheduled executions have no `run_id`.
 |---|---|
 | `POST /v1/verification/evidence` | Declare files by digest and length; receive an `upload_id` and shared upload plan for each one with no completed File record, under the tenant's `evidence/sha256/<digest>` namespace |
 | `POST /v1/verification/execute` | Exact Verifier and subject, optional Run and `group_id`, named input declarations, optional route overrides → `200 VerificationResult` |
-| `POST /v1/verification/enqueue` | The same Run evidence with `Idempotency-Key` → `202 { execution_id }` |
+| `POST /v1/verification/enqueue` | The same Run evidence with `Idempotency-Key` → `202 { execution_id }` after durable admission |
 | `GET /v1/verification/executions/{execution_id}` | Status, terminal error, result when visible, and a group execution's `group_id`, owner, and source selection once its input record is visible; a direct execution's completed status once its records are visible |
 | `GET /v1/verification/bindings/{binding_id}` | Readiness, cadence, `last_execution_id`, and a `group_end` binding's frozen settings and source bindings |
 
@@ -1759,11 +1759,16 @@ writer admits the execution, moving the expected schedule cursor or
 consuming the selected pending group generation in that transaction. The batched writer
 decides `Idempotency-Key` replay and conflict per tenant, subject, actor, and
 key: a matching retry returns the same execution ID; a conflicting one settles
-`errored` with `WYRD_REGISTRY_409_IDEMPOTENCY_CONFLICT`, never runs, and leaves
-the original unchanged. `202` therefore confirms staging only. Staged work
-can be lost on abrupt process death before acknowledgment and then never
-becomes visible; observable losses are counted, and nothing is silently
-resubmitted. `VerificationExecution.wait` polls with capped backoff, tolerates
+`errored` with `WYRD_REGISTRY_409_IDEMPOTENCY_CONFLICT`, never runs, leaves
+the original unchanged, and is refused to its caller with that code.
+`submit` answers only after the batched writer commits the queued row, so
+`202` confirms recoverable admission: a response lost after that commit is
+recovered by retrying under the same key, which returns the same execution.
+Work lost before the commit, on abrupt process death or an unacknowledged
+input, is never acknowledged; the caller receives
+`WYRD_SERVER_503_SERVICE_UNAVAILABLE` or no answer and retries under its key.
+Observable losses are counted, and nothing is silently resubmitted. Audit
+acknowledgement is unchanged. `VerificationExecution.wait` polls with capped backoff, tolerates
 not-found and delayed results within its deadline, and returns only a real
 result, the terminal error, or `WYRD_SDK_504_VERIFICATION_WAIT_TIMEOUT`.
 

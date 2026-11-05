@@ -154,7 +154,8 @@ pub struct EvidenceUpload {
 }
 
 /// `202 Accepted` body of `POST /v1/verification/enqueue`. It confirms
-/// staging only; replay or conflict is decided when the queue accepts it.
+/// durable admission; a replay under the same key names the original
+/// execution.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
 pub struct EnqueueVerificationResponse {

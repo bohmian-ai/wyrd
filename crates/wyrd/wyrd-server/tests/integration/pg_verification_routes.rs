@@ -412,8 +412,8 @@ fn run_decision(outcome: &str) -> (String, String) {
 
 /// Enqueued executions are accepted under the caller's authority, never the
 /// binding owner's: a keyed retry shares its execution, a key reused for a
-/// different body gets its own execution that settles with the idempotency
-/// conflict, unkeyed requests never deduplicate, and the binding and
+/// different body is refused with the idempotency conflict, unkeyed requests
+/// never deduplicate, and the binding and
 /// execution status reads return the frozen identities.
 ///
 /// # Panics
@@ -436,11 +436,10 @@ async fn enqueued_executions_replay_conflict_and_read_back() {
     assert_eq!(execution_id(&replay), keyed, "same key and body replays");
     let other = fixture.request(&fixture.assertion, json!(2));
     let (status, conflicting) = enqueue(&server, &jwt, &other, Some("vr-retry-0001")).await;
-    assert_eq!(status, StatusCode::ACCEPTED, "{conflicting}");
-    let conflict = execution_id(&conflicting);
-    assert_ne!(
-        conflict, keyed,
-        "conflicting content gets its own execution"
+    assert_eq!(status, StatusCode::CONFLICT, "{conflicting}");
+    assert_eq!(
+        conflicting["code"], "WYRD_REGISTRY_409_IDEMPOTENCY_CONFLICT",
+        "{conflicting}"
     );
     let (_, first) = enqueue(&server, &jwt, &body, None).await;
     let (_, second) = enqueue(&server, &jwt, &body, None).await;
@@ -458,12 +457,6 @@ async fn enqueued_executions_replay_conflict_and_read_back() {
     assert_eq!(
         execution_identity(&server, keyed).await,
         ("manual".to_owned(), None, None, Some(requester))
-    );
-    let refused = visible_execution(&server, &jwt, conflict).await;
-    assert_eq!(refused["status"], "errored", "{refused}");
-    assert_eq!(
-        refused["error"]["code"], "WYRD_REGISTRY_409_IDEMPOTENCY_CONFLICT",
-        "{refused}"
     );
     for accepted in [&first, &second] {
         visible_execution(&server, &jwt, execution_id(accepted)).await;

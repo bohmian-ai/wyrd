@@ -7618,9 +7618,10 @@ async fn group_lookup_preserves_source_occurrences() -> Result<(), ServerJourney
 /// `conversation-verifier`; `observed-service` binds its Model daily to the
 /// Custom `observed-drift` Verifier. Each hydrated Service authors through
 /// its own Run: the Model's Window sample is recorded by `submit`, and while
-/// Scribe holds the input record of the agent's grouped `submit`, the SDK
-/// sees no such execution and a direct `verify` still answers. Released, the turn is queued under the
-/// ID its enqueue returned and the production runtime completes it. The
+/// Scribe holds the input record of the agent's grouped `submit`, that
+/// `submit` is not acknowledged, the queue holds nothing, and a direct
+/// `verify` still answers. Released, the turn is admitted and only then
+/// acknowledged under its ID, and the production runtime completes it. The
 /// runtime then prepares the expired group's run, whose input record Scribe
 /// holds next: the queue still holds only the turn, and a direct verify
 /// still answers. Released, the group run and the scheduled window complete
@@ -7750,24 +7751,19 @@ async fn queued_origins_share_ack_gated_admission() -> Result<(), ServerJourneyE
     server.flush_bifrost().await?;
 
     let held = server.stall_next_bifrost_write_into(EXECUTION_INPUTS)?;
-    let Submission::Queued(accepted) = support
-        .run_for_card("agent")?
-        .observe()
-        .group_id(GroupId::new("held")?)
-        .submit("turn-check", json!({"answer": "yes"}))
-        .await?
-    else {
-        return Err("a turn-check submission queues an execution".into());
-    };
-    held.wait_entered().await;
-    let staged = *accepted.id();
-    match Execution::connect_with(staged, &admin)
-        .await?
-        .status()
-        .await
-    {
-        Err(WyrdError::VerificationExecutionNotFound { .. }) => {}
-        other => return Err(format!("a held turn is not queued: {other:?}").into()),
+    let turn_run = support.run_for_card("agent")?;
+    let observe = turn_run.observe().group_id(GroupId::new("held")?);
+    let submitted = observe.submit("turn-check", json!({"answer": "yes"}));
+    tokio::pin!(submitted);
+    tokio::select! {
+        biased;
+        answered = &mut submitted => {
+            return Err(format!("a held turn is acknowledged before admission: {answered:?}").into());
+        }
+        () = held.wait_entered() => {}
+    }
+    if !seed.executions().await?.is_empty() {
+        return Err("a held turn is not queued".into());
     }
     direct().await?;
     seed.make_binding_due(binding).await?;
@@ -7777,6 +7773,10 @@ async fn queued_origins_share_ack_gated_admission() -> Result<(), ServerJourneyE
     let stop = CancellationToken::new();
     let task = tokio::spawn(runtime.run(stop.clone()));
     held.release();
+    let Submission::Queued(accepted) = submitted.await? else {
+        return Err("a turn-check submission queues an execution".into());
+    };
+    let staged = *accepted.id();
     let turn = await_queued(&seed, &json!({"execution_id": staged})).await?;
     if turn != staged {
         return Err(format!("the turn is queued as {turn}, not {staged}").into());

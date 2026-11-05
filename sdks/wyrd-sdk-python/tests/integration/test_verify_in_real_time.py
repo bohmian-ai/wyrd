@@ -463,11 +463,11 @@ def test_another_tenant_cannot_verify_the_assistant(
         assert raised.value.code == "WYRD_AUTH_401_WORKLOAD_UID_REFUSED"
 
 
-def enqueue_over_http(
+def enqueue_response(
     server: WyrdTestServer, client: WyrdClient, idempotency_key: str, body: dict
-) -> str:
-    """Enqueue ``body`` over plain HTTP as ``client`` with ``idempotency_key``; return the execution."""
-    response = httpx.post(
+) -> httpx.Response:
+    """Enqueue ``body`` over plain HTTP as ``client`` with ``idempotency_key``."""
+    return httpx.post(
         f"{server.base_url}/v1/verification/enqueue",
         headers={
             "x-wyrd-access-token": f"Bearer {client.access_token()}",
@@ -476,6 +476,13 @@ def enqueue_over_http(
         json=body,
         timeout=60,
     )
+
+
+def enqueue_over_http(
+    server: WyrdTestServer, client: WyrdClient, idempotency_key: str, body: dict
+) -> str:
+    """Enqueue ``body`` over plain HTTP as ``client`` with ``idempotency_key``; return the execution."""
+    response = enqueue_response(server, client, idempotency_key, body)
     accepted = response.json()
     assert response.status_code == 202, accepted
     return accepted["execution_id"]
@@ -539,13 +546,12 @@ def test_grouped_support_resumes(wyrd_server: WyrdTestServer, cards: Cards, tmp_
     assert outcome["evidence"]["answered"] == {"kind": "json", "value": ["passed"] * 6}
     assert outcome["verdict"] == "passed"
     assert binding_status(wyrd_server, binding_id)["last_execution_id"] == judged["execution_id"]
-    # A conflicting replay is refused by the queue after staging; it is sent
+    # A conflicting replay is refused once the queue decides it; it is sent
     # to its own group so the conversation above keeps its six turns.
     conflicting = {**body({"answer": ""}), "group_id": f"{group}-conflict"}
-    conflict = enqueue_over_http(wyrd_server, service, idempotency_key, conflicting)
-    with pytest.raises(WyrdError) as conflicted:
-        verify.Execution.connect(conflict, admin).wait(WAIT_SECONDS)
-    assert conflicted.value.code == "WYRD_REGISTRY_409_IDEMPOTENCY_CONFLICT"
+    conflicted = enqueue_response(wyrd_server, service, idempotency_key, conflicting)
+    assert conflicted.status_code == 409, conflicted.text
+    assert conflicted.json()["code"] == "WYRD_REGISTRY_409_IDEMPOTENCY_CONFLICT"
     with pytest.raises(WyrdError) as refused:
         declare(cards, "cards/verify_in_real_time/support-unsourced.yaml")
     assert refused.value.code == "WYRD_SPEC_400_TRIGGER_ACTIVATION_MISMATCH"

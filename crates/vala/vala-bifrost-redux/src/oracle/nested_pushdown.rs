@@ -1222,7 +1222,7 @@ pub(super) mod tests {
                 lit("k"),
             ])
         };
-        let cases: [(&str, Vec<(&str, Expr)>, Option<Expr>, Vec<String>); 4] = [
+        let cases = [
             (
                 "SELECT v ->> 'a' AS a FROM t",
                 vec![("a", text_at("a"))],

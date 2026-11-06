@@ -252,3 +252,93 @@ must preserve all engine-revision/codec integrity checks.
 - [Peer security](../../../../architecture/wyrd-security-posture.md#peer-identity-and-distributed-oracle).
 - [Execution discipline](../../../implementation-execution.md),
   [testing](../../../../TESTING.md), [Rust](../../../../agent_docs/rust.md).
+
+## Implementation Evidence
+
+### Revalidated owners and gap
+
+- Requirement contract: TASK-001's signed `RemoteScanPayload` reaches
+  `ScribeTailResolver::live_leaf` as `ReadRequirements`; nothing is lost
+  before the staged branch. Published reads are planned on the leader, whose
+  session runs `FilterPushdown` then `ProjectionPushdown`, so the warehouse
+  `ParquetSource` already carries the pushed `variant_get` outputs and filter
+  (existing V2–V5 proof).
+- Gap: the staged branch wrapped `hot_parquet_scan` in a `FilterExec` and
+  `ProjectionExec`, but the follower ran only `FilterPushdown` after decode.
+  The projection stayed above the scan, so the staged `ParquetSource`
+  decoded every leaf of the signed closure, sibling shredded keys included.
+  V1 RED: the staged read of `v ->> 'a'` decoded all 16 leaves of the
+  fixture file, while the warehouse plan decoded 3 (`v.metadata`,
+  `v.typed_value.a.{value,typed_value}`). The journey RED (fix withheld):
+  the staged covered key scanned 917 bytes, the same as its whole root.
+
+### Repair
+
+- `oracle/follower.rs::staged_scan`: the staged leaf is built in one place
+  (shared `hot_parquet_scan` with `HotObjects::Staged(lease)`, unchanged
+  factory, no footer cache, lease extension per file). The requirements'
+  operators are pushed into it in the Oracle session order (`FilterPushdown`,
+  then `ProjectionPushdown`), so each staged run plans its own leaves against
+  its own physical schema through the same per-file planner as published files.
+- The post-decode `FilterPushdown` in `PhysicalPlanFollower::execute` is
+  deleted. Scribe fragments ship only the placeholder (TASK-001), so the
+  staged leaf's own pushdown was its only remaining effect; its comment was
+  stale.
+- No reader, cache, planner, format, public selector or accounting fold was
+  added. The architecture prose ("each Oracle reader decodes only that path's
+  leaves") was already the contract; the staged path now matches it.
+
+Callers checked: `live_leaf` is the only staged-scan consumer; `execute` is
+Scribe-only (`validate_assignment`), and the existing staged tests
+(`scribe_staged_scan_prunes_non_matching_row_groups`,
+`a_dropped_staged_scan_releases_its_lease_immediately`) push their own
+filters and still pass.
+
+### Selector corrections
+
+- V7 lives in `oracle::live::tests`, beside `LiveFrameDecoder`, the validated
+  completion boundary that calls `RemoteScanMetrics::record_footer`:
+  `test(=oracle::live::tests::variant_source_completion_counts_only_accepted_work)`.
+  It is verification-only: no accounting branch changed, and it passed first.
+- V1's filter-only case reads `SELECT 1 AS one … WHERE …` on the warehouse
+  side. The test's empty registered `MemTable` lets `DataFusion` answer
+  `count(*)` from statistics before the hot scan is swapped in; the scan
+  projection (zero columns) is identical.
+
+### Diagnosis
+
+- **V6 `Flush("staged rows did not settle within 60s")`.** Symptom: the
+  publish issued while the query was held timed out. Evidence (traced run,
+  `WYRD_LOG=info,vala_bifrost_redux=debug`): 33 distinct queries before the
+  hang, i.e. every tier passed and the hang was the held-query publish.
+  `ScribeImpl::flush_staged` publishes, then `retire_committed` waits for the
+  held query's retained capture. Cause: the journey awaited the flush before
+  releasing the paused query, so retirement could not finish; this is the
+  production retention rule the journey must observe. Fix site: the journey
+  runs the publish concurrently, waits until the table's live authorities are
+  only `Published` while the query is still held, then releases and drains it,
+  and lets the flush finish retirement.
+
+### Evidence
+
+| Acceptance criterion | Implementation evidence | Verification evidence | Result |
+|---|---|---|---|
+| REQ-001/002; remaining AC-001/002 | `follower.rs::staged_scan` pushdown | V1 (staged = warehouse leaves, exact rows incl. residual `"str"`, list path, zero-column filter-only); V2–V5; V6 both topologies across memory/staged/published, covered reads reconstruct 0, learned staged and published covered key scans fewer bytes than its root | PASS |
+| REQ-003; AC-002 | shared `hot_parquet_scan`, `HotObjects::Staged` factory and lease unchanged | V1; V8 (foreign/missing footer, vanished object, cached ranges, dropped staged lease) | PASS |
+| REQ-004; AC-003 | no change to proof, cuts, leases or cancellation | V6 held query returns each row once through publication and retirement, successor cut once, unprivileged caller refused; V9; V10 | PASS |
+| REQ-005; AC-003 | `LiveFrameDecoder::accept` unchanged | V7 (accepted once; foreign-fragment and stale footers refused; dropped attempt folds nothing; known zero `Some(0)`; memtable bytes `None`); V9; V10 | PASS |
+
+Commands (repository root, sequential): V1, V2–V5, V7, V8 exact selectors;
+V6 alone, with the fix withheld (RED), and with TASK-001's V3 journey;
+owner families `oracle::(exec|follower|nested_pushdown|live|codec|memtable_source)`
+and `scribe::(tail_rpc|memtable)` (110/110); `mise run test:bifrost:journey:oracle`
+(65/65, includes V3, V6, V9, V10); `mise run fmt`; `mise run lints`;
+`mise run check:deps`; `mise run check:tenant-isolation`; `git diff --check`.
+No generated contract changed, so `codegen:check` was not required.
+
+Non-goals stayed excluded: no new reader, cache, file format, public query
+selector, Forge or learning change, and no CPU/latency claim (TASK-003).
+Changed files: `oracle/follower.rs`, `oracle/nested_pushdown.rs` (tests),
+`oracle/live.rs` (test), `wyrd-testing/tests/bifrost/oracle/distributed.rs`.
+The pre-existing `changes/active/benchmark-scaling` deletions in the working
+tree are not part of this task and were left unstaged.

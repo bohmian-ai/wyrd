@@ -367,4 +367,3 @@ export async function loadVersionDiff(input: VersionDiffInput, context: Context)
   if (changes.length > 0) return { input, result: { state: 'populated', data } };
   return { input, result: { state: 'empty', data, reason: `Versions ${other} and ${input.cardRef.version} are authored identically.` } };
 }
-

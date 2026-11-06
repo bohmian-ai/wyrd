@@ -537,10 +537,12 @@ test('TASK-004: Metric windows count every recorded value', async ({ server }) =
 test('card and prompt components use authorized host reads and actions', async ({ server, seeded }) => {
   const cards = await Cards.connect();
   const ui = (name: string) => fixture(`cards/ui_cards/${name}`);
-  const older = exact(declared(await cards.declareFromPath(ui('support-reply-1.0.0.yaml'))));
-  const prompt = exact(declared(await cards.declareFromPath(ui('support-reply-1.1.0.yaml'))));
+  /** A declared Prompt as the exact Prompt reference its components take. */
+  const asPrompt = (ref: Exact) => ({ ...ref, kind: 'Prompt' as const });
+  const older = asPrompt(exact(declared(await cards.declareFromPath(ui('support-reply-1.0.0.yaml')))));
+  const prompt = asPrompt(exact(declared(await cards.declareFromPath(ui('support-reply-1.1.0.yaml')))));
   const agent = exact(declared(await cards.declareFromPath(ui('reply-agent.yaml'))));
-  const native = exact(declared(await cards.declareFromPath(fixture('cards/declare_and_pull/native-prompt.yaml'))));
+  const native = asPrompt(exact(declared(await cards.declareFromPath(fixture('cards/declare_and_pull/native-prompt.yaml')))));
   // Another tenant registers a Prompt of its own; this tenant never sees it.
   const tenant = 'ui-cards-foreign';
   const foreignKey = server.bootstrapServiceInTenant(server.seedTenant(tenant), ['admin'], 'ui-cards-admin');
@@ -623,7 +625,7 @@ test('card and prompt components use authorized host reads and actions', async (
   // A principal without card permission sees each component denied and no dependent read.
   const runs: WireRequest[][] = [];
   const queryOnly = nodeExecutor(WyrdClient.connect({ credential: server.scopedApiKey('ui_cards_denied', ['bifrost_query:read']) }));
-  const denied = { executor: { run: (requests: readonly WireRequest[], signal?: AbortSignal) => (runs.push([...requests]), queryOnly.run(requests, signal)) } };
+  const denied: { executor: Executor } = { executor: { run: ((requests, signal) => (runs.push([...requests]), queryOnly.run(requests, signal))) as Executor['run'] } };
   for (const loaded of await Promise.all([
     loadCardInventory({}, denied),
     loadCardFacts({ cardRef: agent }, denied),
@@ -673,7 +675,7 @@ test('card and prompt components use authorized host reads and actions', async (
     ]
   };
   const app = await appBridgeView(doc, (name, args) => {
-    if (name === 'cards.list') return { items: inventory.filter((item) => item.kind === 'Prompt'), next_cursor: null };
+    if (name === 'cards.list') return { items: inventory.filter((item) => (item as { kind: string }).kind === 'Prompt'), next_cursor: null };
     if (name === 'cards.get') return { card: (args.card_ref as { name: string }).name === AGENT.name ? agentCard : prompts['1.1.0'] };
     return notFound;
   });

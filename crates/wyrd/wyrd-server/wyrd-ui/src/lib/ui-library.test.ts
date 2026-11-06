@@ -101,7 +101,8 @@ import {
   statQueries,
   validateIntent,
   validatePanel,
-  type ChartInput
+  type ChartInput,
+  type VersionDiffData
 } from 'wyrd-ai-ui/loaders';
 import { mountView, remoteLoader, validateView, WyrdView } from 'wyrd-ai-ui/view';
 import examples from '../../../../../wyrd-spec/schemas/ui_problem_examples.json';
@@ -2170,7 +2171,7 @@ test('prompt definitions and comparisons preserve authored forms', async () => {
     { op: 'cards.get_by_ref', card_ref: { kind: 'Prompt', name: 'support-reply', version: '1.0.0' } }
   ]);
   expect(diff.result).toMatchObject({ state: 'populated', data: { versions: ['1.1.0', '1.0.0'], other: '1.0.0' } });
-  const changes = (diff.result as { data: { changes: { field: string; from?: unknown; to?: unknown }[] } }).data.changes;
+  const changes = (diff.result as { data: VersionDiffData }).data.changes;
   expect(changes.map((change) => change.field)).toEqual(['system', 'messages[0]', 'response_format', 'variables']);
   expect(changes.find((change) => change.field === 'response_format')).toEqual({ field: 'response_format', to: 'verdict' });
   expect(changes.find((change) => change.field === 'variables')).toEqual({ field: 'variables', from: ['ticket'], to: ['ticket', 'tone'] });

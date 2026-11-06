@@ -7748,7 +7748,13 @@ mod tests {
                 .expect("no registry to wait on");
         let day = key.partition.time();
         let read = capture
-            .read(&(day..=day), logical.fields(), Some(&pruning), None)
+            .read(
+                &(day..=day),
+                logical.fields(),
+                Some(&pruning),
+                None,
+                &crate::scribe::memtable::tests::unbounded_pool(),
+            )
             .expect("capture reads");
         let mut values = Vec::new();
         for readable in read.batches {
@@ -9309,6 +9315,7 @@ mod tests {
                 &crate::scribe::tail_rpc::tests::named_fields(["value"]),
                 None,
                 None,
+                &crate::scribe::memtable::tests::unbounded_pool(),
             )
             .expect("projected read");
         drop(active);
@@ -9396,6 +9403,7 @@ mod tests {
                 &crate::scribe::tail_rpc::tests::named_fields(["value"]),
                 None,
                 None,
+                &crate::scribe::memtable::tests::unbounded_pool(),
             )
             .expect("projected read");
         let frozen = memtable.freeze(&key).expect("owner freeze");

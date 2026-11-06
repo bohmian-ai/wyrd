@@ -1245,17 +1245,23 @@ async fn reconstructing_rows(
 ///
 /// `learned` states whether the cohort's generation pins a learned layout,
 /// so the whole root must reconstruct; a covered query never does.
+/// `documents` are the cohort's `(value, v)` rows in ascending `value`, and
+/// its queries cover the closed range between the first and last.
 ///
 /// # Errors
 ///
-/// Returns a query error or a description of the differing answer.
+/// Returns a query error, an error when `documents` is empty or a `to_json`
+/// row does not render as a value and its JSON, or a description of the
+/// differing answer.
 async fn prove_variant_memory_answers(
     reader: &WyrdClient,
     table_fqn: &str,
     documents: &[(i64, serde_json::Value)],
     learned: bool,
 ) -> Result<(), JourneyError> {
-    let (first, last) = (documents[0].0, documents[documents.len() - 1].0);
+    let (Some((first, _)), Some((last, _))) = (documents.first(), documents.last()) else {
+        return Err("a cohort needs at least one document".into());
+    };
     let range = format!("value BETWEEN {first} AND {last}");
     let text = |value: &serde_json::Value| match value {
         serde_json::Value::String(text) => text.clone(),
@@ -1315,11 +1321,12 @@ async fn prove_variant_memory_answers(
     }
     let roots = rows
         .iter()
-        .map(|row| {
-            Ok((
-                row[0].parse::<i64>()?,
-                serde_json::from_str::<serde_json::Value>(&row[1])?,
-            ))
+        .map(|row| match row.as_slice() {
+            [value, json] => Ok((
+                value.parse::<i64>()?,
+                serde_json::from_str::<serde_json::Value>(json)?,
+            )),
+            _ => Err(format!("`{sql}` rendered {row:?}").into()),
         })
         .collect::<Result<Vec<_>, JourneyError>>()?;
     if roots != documents {

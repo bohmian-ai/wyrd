@@ -400,6 +400,7 @@ async fn canonical_nested_batches_share_one_managed_wal_path() {
         &FetchLiveTailRequest {
             pruning: None,
             requirements: None,
+            memory: crate::scribe::memtable::tests::unbounded_pool(),
             binding,
             target_stream: StreamIdentity::new(NodeId::new(Uuid::nil()), WriterEpoch::new(1)),
             start_partition: day,
@@ -566,6 +567,7 @@ async fn assert_producer_rows_share_the_wal_path(scribe: &ScribeImpl, tenant: Da
         &FetchLiveTailRequest {
             pruning: None,
             requirements: None,
+            memory: crate::scribe::memtable::tests::unbounded_pool(),
             binding: TenantTableBinding::resolve((tenant, table)).expect("binding"),
             target_stream: StreamIdentity::new(NodeId::new(Uuid::nil()), WriterEpoch::new(1)),
             start_partition: day,
@@ -680,6 +682,7 @@ async fn production_shard_snapshot_serves_exact_projection_and_lsn_range() {
     let request = FetchLiveTailRequest {
         pruning: None,
         requirements: None,
+        memory: crate::scribe::memtable::tests::unbounded_pool(),
         binding,
         target_stream: stream,
         start_partition,
@@ -804,6 +807,7 @@ fn value_read(
     FetchLiveTailRequest {
         pruning: None,
         requirements: None,
+        memory: crate::scribe::memtable::tests::unbounded_pool(),
         binding: TenantTableBinding::resolve((tenant, table.clone())).expect("tail binding"),
         target_stream: stream,
         start_partition,
@@ -1169,6 +1173,7 @@ async fn series_keys(
         &FetchLiveTailRequest {
             pruning: None,
             requirements: None,
+            memory: crate::scribe::memtable::tests::unbounded_pool(),
             binding: TenantTableBinding::resolve((
                 tenant,
                 TableRef::new(BifrostNamespace::Metrics, table),
@@ -1323,6 +1328,7 @@ async fn series_contexts(
         &FetchLiveTailRequest {
             pruning: None,
             requirements: None,
+            memory: crate::scribe::memtable::tests::unbounded_pool(),
             binding: TenantTableBinding::resolve((
                 tenant,
                 TableRef::new(BifrostNamespace::Metrics, table),

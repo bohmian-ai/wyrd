@@ -60,8 +60,10 @@ pub(super) struct MemtableSource {
     merged: Merged,
     /// The sizing that deals batches over partitions by their recorded column bytes.
     partitioning: crate::scan_sizing::OraclePartitioning,
-    /// Accounting owners of the batches' Arrow buffers.
-    charges: Arc<[Arc<crate::scribe::memory::RetainedArrowCharge>]>,
+    /// Accounting owners of the batches' Arrow buffers: the captured
+    /// generations' charges and the query's reservation of what the read
+    /// allocated for it.
+    charges: Arc<crate::scribe::memtable::LiveReadOwners>,
     /// The static filters this source took over, as one conjunction, or
     /// `None` while every filter stays with the operator above.
     filter: Option<Arc<dyn PhysicalExpr>>,
@@ -88,7 +90,7 @@ impl MemtableSource {
     /// differ.
     pub(super) fn try_new(
         batches: Vec<(RecordBatch, Arc<Statistics>)>,
-        charges: Arc<[Arc<crate::scribe::memory::RetainedArrowCharge>]>,
+        charges: Arc<crate::scribe::memtable::LiveReadOwners>,
         partitioning: crate::scan_sizing::OraclePartitioning,
         cap: usize,
         schema: SchemaRef,
@@ -542,7 +544,7 @@ mod tests {
                 bounded(&[10, 11, 12]),
                 bounded(&[20, 21, 22]),
             ],
-            Arc::from(Vec::new()),
+            Arc::default(),
             crate::scan_sizing::OraclePartitioning::new(
                 2,
                 crate::scan_sizing::ORACLE_PARTITION_SCAN_BYTES,
@@ -613,7 +615,7 @@ mod tests {
                 bounded(&[10, 11, 12]),
                 (with_null, Arc::new(null_bounds)),
             ],
-            Arc::from(Vec::new()),
+            Arc::default(),
             crate::scan_sizing::OraclePartitioning::new(
                 1,
                 crate::scan_sizing::ORACLE_PARTITION_SCAN_BYTES,
@@ -742,7 +744,7 @@ mod tests {
         };
         let source = MemtableSource::try_new(
             batches,
-            Arc::from(Vec::new()),
+            Arc::default(),
             crate::scan_sizing::OraclePartitioning::new(
                 1,
                 crate::scan_sizing::ORACLE_PARTITION_SCAN_BYTES,
@@ -819,7 +821,7 @@ mod tests {
             Precision::Exact(ScalarValue::Int64(Some(-7)));
         let source = MemtableSource::try_new(
             vec![(first_batch, recorded), bounded(&[-3, 2])],
-            Arc::from(Vec::new()),
+            Arc::default(),
             partitioning,
             1,
             Arc::clone(&schema),
@@ -852,14 +854,9 @@ mod tests {
         let cast = Arc::new(Schema::new(vec![Field::new("id", DataType::Int32, false)]));
         let (batch, bounds) = bounded(&[1, 2]);
         let batch = super::super::exec::project_batch(&batch, Arc::clone(&cast)).expect("cast");
-        let source = MemtableSource::try_new(
-            vec![(batch, bounds)],
-            Arc::from(Vec::new()),
-            partitioning,
-            1,
-            cast,
-        )
-        .expect("cast source");
+        let source =
+            MemtableSource::try_new(vec![(batch, bounds)], Arc::default(), partitioning, 1, cast)
+                .expect("cast source");
         let total = source.partition_statistics(None).expect("total");
 
         assert_eq!(total.column_statistics[0].min_value, Precision::Absent);

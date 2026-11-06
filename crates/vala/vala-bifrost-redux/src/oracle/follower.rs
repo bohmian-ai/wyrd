@@ -482,19 +482,25 @@ impl<T> ScribeTailResolver<T> {
 impl<T> ScribeTailResolver<T> {
     /// Builds the Scribe follower's leaf over one opened live read.
     ///
-    /// Memtable rows are projected to the signed closure and dealt round-robin
-    /// across the partitions their bytes earn, at most the session's target
-    /// partitions (see [`crate::scan_sizing::OraclePartitioning::scan_partitions`]), of one
-    /// in-memory source. Each batch keeps the exact bounds Scribe recorded at
-    /// append, so the query's pushed predicate drops batches it cannot match,
-    /// and the kept batches are dealt again over the partitions their own
-    /// bytes earn. The unserved staged runs are read by
+    /// Memtable rows arrive already filtered and evaluated to `output_schema`,
+    /// the schema [`signed_requirements`] derives: the requirements' outputs
+    /// when `requirements` is present, else the signed closure. They are dealt
+    /// round-robin across the partitions their bytes earn, at most the
+    /// session's target partitions (see
+    /// [`crate::scan_sizing::OraclePartitioning::scan_partitions`]), of one
+    /// in-memory source. Each batch carries the statistics the live read
+    /// projected onto its outputs, inexact once its filter dropped a row, so
+    /// the query's pushed predicate drops batches it cannot match, and the
+    /// kept batches are dealt again over the partitions their own bytes earn.
+    /// The staged runs are read at `required_schema`, the closure, and meet
+    /// the same filter and outputs through `DataFusion`'s operators, so every
+    /// leaf exposes `output_schema`. The unserved staged runs are read by
     /// `DataFusion`'s Parquet scan, so they get the row-group and page pruning
     /// every Oracle hot read gets, with no footer caching because a staged run
     /// is rewritable; the scan's files hold the staged lease until the plan
     /// drops. A read with neither
-    /// rows nor runs is an in-memory source of empty partitions at the
-    /// closure schema.
+    /// rows nor runs is an in-memory source of empty partitions at
+    /// `output_schema`.
     ///
     /// # Errors
     /// Returns [`FollowerResolutionError::Fault`] when a memtable batch does
@@ -527,7 +533,7 @@ impl<T> ScribeTailResolver<T> {
             // re-deals whatever the query's predicate keeps.
             let source = super::memtable_source::MemtableSource::try_new(
                 projected,
-                charges.into(),
+                Arc::new(charges),
                 self.partitioning,
                 session.config().target_partitions(),
                 Arc::clone(output_schema),
@@ -785,6 +791,7 @@ where
                 required_fields: required_schema.fields().clone(),
                 pruning,
                 requirements: requirements.clone(),
+                memory: Arc::clone(&session.runtime_env().memory_pool),
             })
             .await?;
         let plan = self

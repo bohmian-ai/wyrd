@@ -237,6 +237,8 @@ pub struct BifrostResourcePolicy {
     pub scratch_limit_bytes: Option<u64>,
     /// Optional effective CPU cap; it may only reduce detection.
     pub effective_cpu: Option<usize>,
+    /// Explicit Scribe worker counts; omitted ones derive from effective CPU.
+    pub scribe_workers: ScribeWorkerOverrides,
     /// Optional explicit Oracle query slot-unit concurrency limit.
     ///
     /// `None` derives the limit from this pod's own memory and CPU through
@@ -587,6 +589,108 @@ pub struct ResourcePlan {
     pub forge_enabled: bool,
     /// Disposable scratch bytes available after the filesystem floor.
     pub scratch_limit_bytes: u64,
+    /// Scribe worker counts: explicit overrides, else derived from
+    /// [`Self::effective_cpu`].
+    pub scribe_workers: ScribeWorkers,
+    /// Process Scribe outbox concurrency derived from [`Self::effective_cpu`].
+    pub outbox: OutboxExecution,
+}
+
+/// Scribe worker counts an operator set explicitly.
+///
+/// `None` derives the count from the plan's effective CPU, so an omitted
+/// setting and an explicit one equal to its default stay distinguishable
+/// until the plan resolves them.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ScribeWorkerOverrides {
+    /// Explicit coordination-runtime worker count.
+    pub coordination_threads: Option<usize>,
+    /// Explicit ingress CPU worker count.
+    pub ingress_cpu_threads: Option<usize>,
+    /// Explicit persistence CPU worker count.
+    pub persistence_cpu_threads: Option<usize>,
+}
+
+/// Resolved Scribe worker counts for one process.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ScribeWorkers {
+    /// Coordination-runtime workers hosting the shard owners and loops.
+    pub coordination_threads: usize,
+    /// Ingress CPU workers for pre-ACK decode, validation, and projection.
+    pub ingress_cpu_threads: usize,
+    /// Persistence CPU workers for splitting, serialization, and replay.
+    pub persistence_cpu_threads: usize,
+}
+
+impl ScribeWorkers {
+    /// Applies `overrides` over the CPU-derived defaults.
+    ///
+    /// Coordination defaults to `max(C, 2)`, since each shard owner blocks in
+    /// memtable insertion and `COMMIT`. Ingress and persistence split the
+    /// budget `B = max(C - 2, 2)`: ingress takes `max(B / 3, 1)` and
+    /// persistence the rest, at least one. An explicit ingress count does not
+    /// change the persistence default.
+    #[must_use]
+    pub fn resolve(effective_cpu: usize, overrides: ScribeWorkerOverrides) -> Self {
+        let budget = effective_cpu.saturating_sub(2).max(2);
+        let ingress = (budget / 3).max(1);
+        Self {
+            coordination_threads: overrides
+                .coordination_threads
+                .unwrap_or(effective_cpu.max(2)),
+            ingress_cpu_threads: overrides.ingress_cpu_threads.unwrap_or(ingress),
+            persistence_cpu_threads: overrides
+                .persistence_cpu_threads
+                .unwrap_or(budget.saturating_sub(ingress).max(1)),
+        }
+    }
+}
+
+/// Fewest process Scribe outbox writers, whatever the effective CPU.
+pub const OUTBOX_MIN_WRITERS: usize = 4;
+
+/// Frame deliveries one outbox writer encodes, submits, or awaits at once.
+pub const OUTBOX_DELIVERIES_PER_WRITER: usize = 8;
+
+/// Immutable process Scribe outbox concurrency.
+///
+/// `W = max(4, C)` writers write slices concurrently over `W` ordered lanes
+/// per tenant, each writer holding up to eight deliveries, so the process
+/// holds at most `8 × W`. These are concurrency ceilings, not reserved cores
+/// or memory.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct OutboxExecution {
+    /// Slices written at once across every tenant and lane.
+    pub writers: usize,
+    /// Ordered lanes each tenant's writes spread over.
+    pub lanes: usize,
+    /// Deliveries one writer holds at once.
+    pub deliveries_per_writer: usize,
+    /// Deliveries the whole process holds at once.
+    pub deliveries: usize,
+}
+
+impl OutboxExecution {
+    /// Derives the outbox concurrency for `effective_cpu`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BifrostResourceError::InvalidPlan`] when the process
+    /// delivery ceiling cannot be represented.
+    pub fn resolve(effective_cpu: usize) -> Result<Self, BifrostResourceError> {
+        let writers = effective_cpu.max(OUTBOX_MIN_WRITERS);
+        let deliveries = writers
+            .checked_mul(OUTBOX_DELIVERIES_PER_WRITER)
+            .ok_or_else(|| BifrostResourceError::InvalidPlan {
+                detail: format!("outbox delivery ceiling for {writers} writers overflows"),
+            })?;
+        Ok(Self {
+            writers,
+            lanes: writers,
+            deliveries_per_writer: OUTBOX_DELIVERIES_PER_WRITER,
+            deliveries,
+        })
+    }
 }
 
 /// Portable source selected for each resolved resource dimension.
@@ -1104,6 +1208,7 @@ impl BifrostRuntimeResources {
                 bifrost_memory_limit_bytes: None,
                 scratch_limit_bytes: Some(scratch_limit_bytes),
                 effective_cpu: None,
+                scribe_workers: Default::default(),
                 oracle_query_slot_limit: None,
                 oracle_partition_scan_bytes: None,
                 scratch_root: None,
@@ -1280,6 +1385,12 @@ impl ScribeResources {
     #[must_use]
     pub(crate) fn effective_cpu(&self) -> usize {
         self.governor.plan().effective_cpu
+    }
+
+    /// Returns the Scribe worker counts this pod's plan resolved.
+    #[must_use]
+    pub(crate) fn scribe_workers(&self) -> ScribeWorkers {
+        self.governor.plan().scribe_workers
     }
 
     /// Returns this pod's Oracle partition sizing, the same one its Oracle
@@ -2132,6 +2243,8 @@ impl BifrostResourceGovernor {
         }
         let memory_limit_bytes = snapshot.memory_limit_bytes;
         let effective_cpu = cap_positive(snapshot.effective_cpu, policy.effective_cpu, "CPU")?;
+        let outbox = OutboxExecution::resolve(effective_cpu)?;
+        let scribe_workers = ScribeWorkers::resolve(effective_cpu, policy.scribe_workers);
         let oracle_query_slot_limit = policy.oracle_query_slot_limit;
         let oracle_partition_scan_bytes = match policy.oracle_partition_scan_bytes {
             Some(0) => {
@@ -2161,6 +2274,8 @@ impl BifrostResourceGovernor {
                     oracle_enabled: policy.roles.contains(&BifrostRole::Oracle),
                     forge_enabled: policy.roles.contains(&BifrostRole::Forge),
                     scratch_limit_bytes,
+                    scribe_workers,
+                    outbox,
                 },
                 sources: ResolvedResourceSources {
                     memory: snapshot.memory_source,
@@ -4501,6 +4616,7 @@ mod tests {
             bifrost_memory_limit_bytes: None,
             scratch_limit_bytes: None,
             effective_cpu: None,
+            scribe_workers: Default::default(),
             oracle_query_slot_limit: None,
             oracle_partition_scan_bytes: None,
             scratch_root: None,
@@ -4519,6 +4635,54 @@ mod tests {
             memory_source: ResourceSource::Injected,
             cpu_source: ResourceSource::Injected,
         }
+    }
+
+    /// Startup resolves outbox writers, lanes, and delivery ceilings from the
+    /// one effective CPU, keeping the four-writer baseline and scaling above it.
+    ///
+    /// # Panics
+    ///
+    /// Panics when a count leaves the approved matrix, a CPU cap is not applied
+    /// before derivation, or an unrepresentable ceiling does not refuse startup.
+    #[test]
+    fn startup_execution_counts_follow_resources() {
+        let resolve = |observed: usize, cap: Option<usize>| {
+            let mut snapshot = snapshot(1024 * MIB);
+            snapshot.effective_cpu = observed;
+            let mut policy = policy(&[BifrostRole::Scribe]);
+            policy.effective_cpu = cap;
+            BifrostRuntimeResources::from_snapshot(snapshot, policy).map(|owner| owner.plan())
+        };
+        for (cpu, writers) in [(1, 4), (2, 4), (4, 4), (8, 8), (16, 16)] {
+            let plan = resolve(cpu, None).expect("a positive observation resolves");
+            assert_eq!(
+                plan.outbox,
+                OutboxExecution {
+                    writers,
+                    lanes: writers,
+                    deliveries_per_writer: 8,
+                    deliveries: 8 * writers,
+                },
+                "effective CPU {cpu}"
+            );
+        }
+        let capped = resolve(16, Some(8)).expect("a reducing cap resolves");
+        assert_eq!((capped.effective_cpu, capped.outbox.writers), (8, 8));
+        assert_eq!(capped.outbox.deliveries, 64);
+        let raised = resolve(4, Some(16)).expect("a cap above detection is ignored");
+        assert_eq!(raised.outbox.writers, 4, "a cap never raises detected CPU");
+        assert!(matches!(
+            resolve(usize::MAX, None),
+            Err(BifrostResourceError::InvalidPlan { .. })
+        ));
+        assert!(matches!(
+            resolve(0, None),
+            Err(BifrostResourceError::Unavailable { .. })
+        ));
+        assert!(matches!(
+            resolve(8, Some(0)),
+            Err(BifrostResourceError::InvalidPlan { .. })
+        ));
     }
 
     /// Boot composition preserves the selected message bound and rejects a clamp.

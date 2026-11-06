@@ -38,7 +38,7 @@ use vala_bifrost_redux::maintenance::{StagingFilePublisher, staging_file_channel
 use vala_bifrost_redux::namespaces::BifrostNamespace;
 use vala_bifrost_redux::resources::{
     BifrostResourcePolicy, BifrostRole, BifrostRuntimeResources, ResourceSource,
-    SystemResourceSnapshot,
+    ScribeWorkerOverrides, SystemResourceSnapshot,
 };
 use vala_bifrost_redux::scribe::ScribeImpl;
 use vala_bifrost_redux::scribe::admission::AdmissionConfig;
@@ -5088,6 +5088,10 @@ impl WyrdTestServerBuilder {
                     bifrost_memory_limit_bytes: None,
                     scratch_limit_bytes: None,
                     effective_cpu: None,
+                    scribe_workers: ScribeWorkerOverrides {
+                        persistence_cpu_threads: self.scribe_persistence_cpu_threads,
+                        ..ScribeWorkerOverrides::default()
+                    },
                     oracle_query_slot_limit: self.oracle_query_slot_limit,
                     oracle_partition_scan_bytes: self.oracle_partition_scan_bytes,
                     scratch_root: Some(scratch_root),
@@ -5203,7 +5207,7 @@ impl WyrdTestServerBuilder {
             config.bifrost.scribe.outbox_capacity = capacity;
         }
         if let Some(threads) = self.scribe_persistence_cpu_threads {
-            config.bifrost.scribe.persistence_cpu_threads = threads;
+            config.bifrost.scribe.persistence_cpu_threads = Some(threads);
         }
         config.bifrost.storage = self.bifrost_storage_io;
         if let Some(oracle) = self.oracle_runtime.clone() {
@@ -6056,6 +6060,7 @@ mod production_composition_tests {
                 bifrost_memory_limit_bytes: None,
                 scratch_limit_bytes: None,
                 effective_cpu: None,
+                scribe_workers: Default::default(),
                 oracle_query_slot_limit: None,
                 oracle_partition_scan_bytes: None,
                 scratch_root: Some(scratch.path().to_owned()),

@@ -14,9 +14,7 @@ use datafusion::physical_optimizer::PhysicalOptimizerRule as _;
 use datafusion::physical_optimizer::filter_pushdown::FilterPushdown;
 use datafusion::physical_plan::{ExecutionPlan, SendableRecordBatchStream, execute_stream};
 use datafusion_proto::bytes::physical_plan_from_bytes_with_extension_codec;
-use datafusion_proto::protobuf::{
-    PhysicalExprNode, PhysicalPlanNode, physical_plan_node::PhysicalPlanType,
-};
+use datafusion_proto::protobuf::{PhysicalPlanNode, physical_plan_node::PhysicalPlanType};
 use prost::Message;
 use thiserror::Error;
 use wyrd_spec::DataTenantId;
@@ -25,10 +23,11 @@ use wyrd_spec::vala::api::{
     TenantTableBinding,
 };
 
-use super::codec::{OraclePhysicalExtensionCodec, physical_plan_fingerprint};
+use super::codec::{OraclePhysicalExtensionCodec, RemoteScanPayload, physical_plan_fingerprint};
 use crate::catalog::layout::TimePartition;
 use crate::catalog::{BifrostCatalog, TableRef};
 use crate::contracts::ScribeError;
+use crate::scribe::memtable::ReadRequirements;
 use crate::scribe::stream_identity::StreamIdentity;
 use crate::scribe::tail_rpc::{FetchLiveTailRequest, FetchLiveTailService, LiveTailBatches};
 
@@ -126,18 +125,77 @@ pub(super) fn signed_closure_schema(
         })
 }
 
+/// Parses one placeholder's read requirements against its signed closure,
+/// returning them with the schema the follower's leaf exposes: the closure
+/// when the payload carries none, else the outputs' schema.
+///
+/// This is the single derivation of what a Scribe leaf evaluates. The
+/// resolver calls it before tail IO and [`PhysicalPlanFollower::decode`]
+/// after every scan id resolves. Expressions are parsed only against the
+/// closure derived from the authenticated schema, never a schema the request
+/// supplies, so a filter or output naming anything else is refused.
+///
+/// # Errors
+///
+/// Returns a redacted message when the filter is not a boolean over the
+/// closure, an output does not plan over it, or output names and
+/// expressions are not index-aligned.
+pub(super) fn signed_requirements(
+    closure: &SchemaRef,
+    payload: &RemoteScanPayload,
+    context: &TaskContext,
+) -> Result<(Option<ReadRequirements>, SchemaRef), String> {
+    use datafusion::physical_expr::projection::{ProjectionExpr, ProjectionExprs};
+    let refused = || "scan requirements do not plan over the signed closure".to_owned();
+    let parse = |expr| {
+        datafusion_proto::physical_plan::from_proto::parse_physical_expr(
+            expr,
+            context,
+            closure,
+            &OraclePhysicalExtensionCodec::encoder(),
+        )
+        .map_err(|_| refused())
+    };
+    let filter = payload.filter.as_ref().map(parse).transpose()?;
+    if filter.as_ref().is_some_and(|filter| {
+        filter
+            .data_type(closure)
+            .is_ok_and(|data_type| data_type != arrow::datatypes::DataType::Boolean)
+    }) {
+        return Err(refused());
+    }
+    let outputs = match &payload.outputs {
+        None if filter.is_none() => return Ok((None, Arc::clone(closure))),
+        None => ProjectionExprs::from_indices(
+            &(0..closure.fields().len()).collect::<Vec<_>>(),
+            closure,
+        ),
+        Some(outputs) if outputs.exprs.len() == outputs.names.len() => ProjectionExprs::new(
+            outputs
+                .exprs
+                .iter()
+                .zip(&outputs.names)
+                .map(|(expr, name)| Ok(ProjectionExpr::new(parse(expr)?, name.clone())))
+                .collect::<Result<Vec<_>, String>>()?,
+        ),
+        Some(_) => return Err(refused()),
+    };
+    let schema = Arc::new(outputs.project_schema(closure).map_err(|_| refused())?);
+    Ok((Some(ReadRequirements { filter, outputs }), schema))
+}
+
 /// Async boundary that constructs one authenticated role-local scan provider.
 #[async_trait]
 pub trait FollowerSourceResolver: Send + Sync {
     /// Resolves exactly one validated assignment for the signed target role
     /// and the authenticated query it belongs to.
     ///
-    /// `filter` is the encoded predicate of the `FilterExec` the signed plan
-    /// places directly above this assignment's placeholder, if any. A
-    /// resolver may narrow its source by it before reading; the decoded plan
-    /// still applies the filter, so ignoring it is always correct.
+    /// `payload` is this assignment's signed placeholder: its exact filter
+    /// and ordered outputs over the closure, which [`signed_requirements`]
+    /// parses.
     ///
-    /// The returned plan must expose exactly the signed closure, and the
+    /// The returned plan must expose exactly the schema
+    /// [`signed_requirements`] derives, and the
     /// returned `full_schema` must be the authenticated schema that closure was
     /// projected out of; `decode` revalidates both. Cancellation may discard a
     /// locally acquired provider; no provider is published to decode until this
@@ -152,7 +210,7 @@ pub trait FollowerSourceResolver: Send + Sync {
         target_role: ClusterRole,
         query_id: uuid::Uuid,
         assignment: &FollowerScanAssignment,
-        filter: Option<&PhysicalExprNode>,
+        payload: &RemoteScanPayload,
         session: &SessionState,
     ) -> Result<ResolvedFollowerSource, FollowerResolutionError>;
 }
@@ -174,11 +232,11 @@ where
         target_role: ClusterRole,
         query_id: uuid::Uuid,
         assignment: &FollowerScanAssignment,
-        filter: Option<&PhysicalExprNode>,
+        payload: &RemoteScanPayload,
         session: &SessionState,
     ) -> Result<ResolvedFollowerSource, FollowerResolutionError> {
         self.as_ref()
-            .resolve(target_role, query_id, assignment, filter, session)
+            .resolve(target_role, query_id, assignment, payload, session)
             .await
     }
 }
@@ -224,9 +282,8 @@ fn require_scannable_work(
 struct PreflightRequest {
     /// Assignments keyed by exact encoded scan identity.
     assignments: HashMap<String, FollowerScanAssignment>,
-    /// The encoded predicate of the `FilterExec` directly above a scan's
-    /// placeholder, keyed by the scan identity it filters.
-    filters: HashMap<String, PhysicalExprNode>,
+    /// Each scan's encoded placeholder, keyed by its scan identity.
+    payloads: HashMap<String, RemoteScanPayload>,
 }
 
 /// Checked peer-context and local-incarnation facts used by IO-free preflight.
@@ -433,6 +490,8 @@ impl<T> ScribeTailResolver<T> {
         &self,
         read: LiveTailBatches,
         required_schema: &SchemaRef,
+        requirements: Option<&ReadRequirements>,
+        output_schema: &SchemaRef,
         assignment: &FollowerScanAssignment,
         session: &SessionState,
     ) -> Result<Arc<dyn ExecutionPlan>, FollowerResolutionError> {
@@ -444,7 +503,7 @@ impl<T> ScribeTailResolver<T> {
                 .iter()
                 .map(|batch| {
                     Ok((
-                        super::exec::project_batch(&batch.rows, Arc::clone(required_schema))
+                        super::exec::project_batch(&batch.rows, Arc::clone(output_schema))
                             .map_err(|_| fault("Scribe memtable rows do not match the closure"))?,
                         Arc::clone(&batch.statistics),
                     ))
@@ -457,7 +516,7 @@ impl<T> ScribeTailResolver<T> {
                 charges.into(),
                 self.partitioning,
                 session.config().target_partitions(),
-                Arc::clone(required_schema),
+                Arc::clone(output_schema),
             )
             .map_err(|_| fault("Scribe memtable source construction failed"))?;
             leaves.push(Arc::new(DataSourceExec::new(Arc::new(source))));
@@ -487,18 +546,38 @@ impl<T> ScribeTailResolver<T> {
             // unknown; one partition per run is the split a decoded follower
             // plan has always had.
             let runs = files.len();
-            leaves.push(
-                super::exec::hot_parquet_scan(
-                    files,
-                    super::exec::HotObjects::Staged(lease),
-                    assignment.binding.tenant_id,
-                    required_schema,
-                    None,
-                    session.config().options(),
-                    Some(runs),
-                )
-                .map_err(|_| fault("Scribe staged scan construction failed"))?,
-            );
+            let mut staged = super::exec::hot_parquet_scan(
+                files,
+                super::exec::HotObjects::Staged(lease),
+                assignment.binding.tenant_id,
+                required_schema,
+                None,
+                session.config().options(),
+                Some(runs),
+            )
+            .map_err(|_| fault("Scribe staged scan construction failed"))?;
+            // The staged runs meet the same requirements through
+            // `DataFusion`'s own operators, which pushdown moves into the
+            // Parquet scan.
+            if let Some(requirements) = requirements {
+                if let Some(filter) = &requirements.filter {
+                    staged = Arc::new(
+                        datafusion::physical_plan::filter::FilterExec::try_new(
+                            Arc::clone(filter),
+                            staged,
+                        )
+                        .map_err(|_| fault("Scribe staged filter construction failed"))?,
+                    );
+                }
+                staged = Arc::new(
+                    datafusion::physical_plan::projection::ProjectionExec::try_new(
+                        requirements.outputs.iter().cloned(),
+                        staged,
+                    )
+                    .map_err(|_| fault("Scribe staged projection construction failed"))?,
+                );
+            }
+            leaves.push(staged);
         }
         match leaves.len() {
             1 => Ok(leaves.remove(0)),
@@ -589,7 +668,7 @@ where
         target_role: ClusterRole,
         query_id: uuid::Uuid,
         assignment: &FollowerScanAssignment,
-        filter: Option<&PhysicalExprNode>,
+        payload: &RemoteScanPayload,
         session: &SessionState,
     ) -> Result<ResolvedFollowerSource, FollowerResolutionError> {
         if target_role != ClusterRole::Scribe {
@@ -652,6 +731,8 @@ where
             ));
         }
         let required_schema = signed_closure_schema(full_schema.as_ref(), assignment)?;
+        let (requirements, output_schema) =
+            signed_requirements(&required_schema, payload, &session.task_ctx())?;
         let table_name = format!(
             "{}.{}",
             assignment.binding.namespace, assignment.binding.table
@@ -662,23 +743,14 @@ where
             cut.writer_epoch,
         );
         if assignment.scan_id != local_scan_id {
-            return empty_assignment_leaf(&required_schema, full_schema);
+            return empty_assignment_leaf(&output_schema, full_schema);
         }
         let start_partition = TimePartition::from_wire(cut.start_partition);
         let end_partition = TimePartition::from_wire(cut.end_partition);
-        // The signed filter over the closure. One that does not decode or
-        // plan prunes nothing: the decoded plan applies it regardless, and
-        // refuses a filter that does not decode.
-        let pruning = filter
-            .and_then(|filter| {
-                datafusion_proto::physical_plan::from_proto::parse_physical_expr(
-                    filter,
-                    &session.task_ctx(),
-                    &required_schema,
-                    &OraclePhysicalExtensionCodec::encoder(),
-                )
-                .ok()
-            })
+        // The signed filter also prunes captured batches by their bounds.
+        let pruning = requirements
+            .as_ref()
+            .and_then(|requirements| requirements.filter.clone())
             .and_then(|predicate| {
                 crate::scan_sizing::BatchPruning::try_new(&required_schema, predicate)
             });
@@ -693,16 +765,23 @@ where
                 end_partition,
                 // The signed closure's fields, in order. Scribe projects the
                 // memtable to exactly these fields, resolved by field id, so
-                // the wide columns are never materialized, and the declared
-                // leaf schema below is the same closure — the serialized
-                // plan's `Column` indices are closure indices.
+                // the wide columns are never materialized; the requirements
+                // are planned over the same closure and evaluated on each
+                // generation's own layout.
                 required_fields: required_schema.fields().clone(),
                 pruning,
-                requirements: None,
+                requirements: requirements.clone(),
             })
             .await?;
         let plan = self
-            .live_leaf(read, &required_schema, assignment, session)
+            .live_leaf(
+                read,
+                &required_schema,
+                requirements.as_ref(),
+                &output_schema,
+                assignment,
+                session,
+            )
             .await?;
         Ok(ResolvedFollowerSource { plan, full_schema })
     }
@@ -805,10 +884,11 @@ where
     ) -> Result<Arc<dyn ExecutionPlan>, PhysicalPlanFollowerError> {
         let PreflightRequest {
             assignments,
-            mut filters,
+            payloads,
         } = self.preflight(request, &authenticated)?;
         let mut providers = HashMap::with_capacity(assignments.len());
         for (scan_id, assignment) in assignments {
+            let payload = &payloads[&scan_id];
             self.effects.resolver.fetch_add(1, Ordering::SeqCst);
             let resolved = self
                 .resolver
@@ -816,7 +896,7 @@ where
                     request.target_fence.role,
                     authenticated.query_id,
                     &assignment,
-                    filters.remove(&scan_id).as_ref(),
+                    payload,
                     session,
                 )
                 .await
@@ -836,12 +916,13 @@ where
                     ),
                 ));
             }
-            let expected = signed_closure_schema(resolved.full_schema.as_ref(), &assignment)
+            let (_, expected) = signed_closure_schema(resolved.full_schema.as_ref(), &assignment)
+                .and_then(|closure| signed_requirements(&closure, payload, context))
                 .map_err(|detail| PhysicalPlanFollowerError::Resolution(detail.into()))?;
             if resolved.plan.schema() != expected {
                 return Err(PhysicalPlanFollowerError::Resolution(
                     FollowerResolutionError::Fault(
-                        "resolved provider schema differs from the signed projection closure"
+                        "resolved provider schema differs from the signed scan outputs"
                             .to_owned(),
                     ),
                 ));
@@ -1004,9 +1085,8 @@ where
         }
         let root = PhysicalPlanNode::decode(request.physical_plan_bytes.as_slice())
             .map_err(|error| PhysicalPlanFollowerError::Preflight(error.to_string()))?;
-        let mut encoded = HashMap::new();
-        let mut filters = HashMap::new();
-        Self::collect_extensions(&root, None, &mut encoded, &mut filters)?;
+        let mut payloads = HashMap::new();
+        Self::collect_extensions(&root, &mut payloads)?;
         let mut assignments = HashMap::with_capacity(request.assignments.len());
         for assignment in &request.assignments {
             if assignment.scan_id.is_empty()
@@ -1030,11 +1110,11 @@ where
                 request.target_fence.fencing_token,
             )?;
         }
-        if encoded.len() != assignments.len()
-            || encoded.iter().any(|(scan_id, fingerprint)| {
-                assignments
-                    .get(scan_id)
-                    .is_none_or(|assignment| &assignment.schema_fingerprint != fingerprint)
+        if payloads.len() != assignments.len()
+            || payloads.iter().any(|(scan_id, payload)| {
+                assignments.get(scan_id).is_none_or(|assignment| {
+                    assignment.schema_fingerprint != payload.schema_fingerprint
+                })
             })
         {
             return Err(PhysicalPlanFollowerError::Preflight(
@@ -1043,38 +1123,29 @@ where
         }
         Ok(PreflightRequest {
             assignments,
-            filters,
+            payloads,
         })
     }
 
     /// Walks every child of follower-permitted native operators and leaf extensions.
     ///
-    /// Each extension's scan identity is recorded in `encoded` with its schema
-    /// fingerprint, and `above`, the predicate of the `FilterExec` that is
-    /// the extension's direct parent, in `filters`.
+    /// Each extension's payload is recorded in `payloads` by its scan identity.
     ///
     /// # Errors
     /// Returns a preflight error for missing inputs, unsupported operators,
     /// malformed extensions, or duplicate scan identities.
     fn collect_extensions(
         node: &PhysicalPlanNode,
-        above: Option<&PhysicalExprNode>,
-        encoded: &mut HashMap<String, String>,
-        filters: &mut HashMap<String, PhysicalExprNode>,
+        payloads: &mut HashMap<String, RemoteScanPayload>,
     ) -> Result<(), PhysicalPlanFollowerError> {
         let children: Vec<&PhysicalPlanNode> = match node.physical_plan_type.as_ref() {
             Some(PhysicalPlanType::Extension(extension)) => {
                 let payload = OraclePhysicalExtensionCodec::preflight_extension(&extension.node)
                     .map_err(|error| PhysicalPlanFollowerError::Preflight(error.to_string()))?;
-                if let Some(above) = above {
-                    filters.insert(payload.scan_id.clone(), above.clone());
-                }
                 if !extension.inputs.is_empty()
                     || payload.scan_id.is_empty()
                     || payload.schema_fingerprint.is_empty()
-                    || encoded
-                        .insert(payload.scan_id, payload.schema_fingerprint)
-                        .is_some()
+                    || payloads.insert(payload.scan_id.clone(), payload).is_some()
                 {
                     return Err(PhysicalPlanFollowerError::Preflight(
                         "invalid or duplicate encoded scan".to_owned(),
@@ -1129,12 +1200,8 @@ where
                 "native operator is missing its input".to_owned(),
             ));
         }
-        let above = match node.physical_plan_type.as_ref() {
-            Some(PhysicalPlanType::Filter(filter)) => filter.expr.as_ref(),
-            _ => None,
-        };
         for child in children {
-            Self::collect_extensions(child, above, encoded, filters)?;
+            Self::collect_extensions(child, payloads)?;
         }
         Ok(())
     }
@@ -1164,7 +1231,7 @@ pub fn authenticated_preflight(
             _target_role: ClusterRole,
             _query_id: uuid::Uuid,
             _assignment: &FollowerScanAssignment,
-            _filter: Option<&PhysicalExprNode>,
+            _payload: &RemoteScanPayload,
             _session: &SessionState,
         ) -> Result<ResolvedFollowerSource, FollowerResolutionError> {
             Err(FollowerResolutionError::Fault(
@@ -1335,7 +1402,7 @@ pub(crate) mod tests {
             _target_role: ClusterRole,
             _query_id: uuid::Uuid,
             assignment: &FollowerScanAssignment,
-            _filter: Option<&PhysicalExprNode>,
+            _payload: &RemoteScanPayload,
             _session: &SessionState,
         ) -> Result<ResolvedFollowerSource, FollowerResolutionError> {
             self.calls.fetch_add(1, Ordering::SeqCst);
@@ -1349,16 +1416,15 @@ pub(crate) mod tests {
         }
     }
 
-    /// Preflight records the predicate of the `FilterExec` directly above a
-    /// placeholder under that placeholder's scan identity, which the Scribe
-    /// resolver prunes memtable batches by before projecting them.
+    /// Preflight records each placeholder's payload, with its signed filter,
+    /// under that placeholder's scan identity.
     ///
     /// # Panics
     ///
     /// Panics when the plan cannot be encoded, preflight refuses it, or the
     /// filter is not recorded for the scan.
     #[test]
-    fn preflight_records_the_filter_above_each_placeholder() {
+    fn preflight_records_each_placeholder_payload() {
         let schema = Arc::new(Schema::new(vec![Field::new(
             "value",
             DataType::Int64,
@@ -1369,33 +1435,25 @@ pub(crate) mod tests {
             datafusion::logical_expr::Operator::Eq,
             datafusion::physical_expr::expressions::lit(2_i64),
         ));
-        let placeholder = Arc::new(RemoteSourcePlaceholderExec::new(
+        let placeholder = RemoteSourcePlaceholderExec::new(
             "scan",
             super::super::assignment_schema_fingerprint(schema.as_ref()),
             schema,
-        ));
+        )
+        .with_requirements(Some(predicate), None)
+        .expect("filtered placeholder");
         let bytes = physical_plan_to_bytes_with_extension_codec(
-            Arc::new(
-                datafusion::physical_plan::filter::FilterExec::try_new(predicate, placeholder)
-                    .expect("filter over the placeholder"),
-            ),
+            Arc::new(placeholder),
             &OraclePhysicalExtensionCodec::encoder(),
         )
         .expect("encoded plan");
         let root = PhysicalPlanNode::decode(bytes.as_ref()).expect("decoded plan node");
-        let mut encoded = HashMap::new();
-        let mut filters = HashMap::new();
+        let mut payloads = HashMap::new();
 
-        PhysicalPlanFollower::<CountingResolver>::collect_extensions(
-            &root,
-            None,
-            &mut encoded,
-            &mut filters,
-        )
-        .expect("preflight accepts the filtered placeholder");
+        PhysicalPlanFollower::<CountingResolver>::collect_extensions(&root, &mut payloads)
+            .expect("preflight accepts the filtered placeholder");
 
-        assert!(encoded.contains_key("scan"));
-        assert!(filters.contains_key("scan"));
+        assert!(payloads["scan"].filter.is_some());
     }
 
     /// Creates one valid Scribe-role request and its exact authenticated facts.
@@ -1521,7 +1579,7 @@ pub(crate) mod tests {
                 ClusterRole::Scribe,
                 test_query_id(),
                 &assignment(local_scribe_scan_id(&binding, stream)),
-                None,
+                &RemoteScanPayload::default(),
                 &session,
             )
             .await
@@ -1543,7 +1601,7 @@ pub(crate) mod tests {
                 ClusterRole::Scribe,
                 test_query_id(),
                 &assignment(sibling),
-                None,
+                &RemoteScanPayload::default(),
                 &session,
             )
             .await
@@ -1618,7 +1676,7 @@ pub(crate) mod tests {
                     ClusterRole::Scribe,
                     test_query_id(),
                     &refused,
-                    None,
+                    &RemoteScanPayload::default(),
                     &session,
                 )
                 .await
@@ -1956,7 +2014,7 @@ pub(crate) mod tests {
                     },
                 )
                 .await,
-                None,
+                &RemoteScanPayload::default(),
                 &session,
             )
             .await
@@ -2172,7 +2230,7 @@ pub(crate) mod tests {
                     ),
                 )
                 .await,
-                None,
+                &RemoteScanPayload::default(),
                 &session,
             )
             .await
@@ -2217,7 +2275,7 @@ pub(crate) mod tests {
                     closure.clone(),
                     fingerprint.clone(),
                 ),
-                None,
+                &RemoteScanPayload::default(),
                 &session,
             )
             .await
@@ -2252,7 +2310,7 @@ pub(crate) mod tests {
                 ClusterRole::Scribe,
                 test_query_id(),
                 &assignment,
-                None,
+                &RemoteScanPayload::default(),
                 &session,
             )
             .await
@@ -2315,14 +2373,18 @@ pub(crate) mod tests {
             &OraclePhysicalExtensionCodec::encoder(),
         )
         .expect("encoded filter");
+        let filtered = RemoteScanPayload {
+            filter: Some(filter),
+            ..RemoteScanPayload::default()
+        };
 
-        for filter in [Some(&filter), None] {
+        for payload in [&filtered, &RemoteScanPayload::default()] {
             recording
                 .resolve(
                     ClusterRole::Scribe,
                     test_query_id(),
                     &assignment,
-                    filter,
+                    payload,
                     &session,
                 )
                 .await
@@ -2386,7 +2448,7 @@ pub(crate) mod tests {
                         closure,
                         "sha256:wrong".to_owned(),
                     ),
-                    None,
+                    &RemoteScanPayload::default(),
                     &session,
                 )
                 .await
@@ -2458,7 +2520,7 @@ pub(crate) mod tests {
                 ClusterRole::Scribe,
                 test_query_id(),
                 &assignment,
-                None,
+                &RemoteScanPayload::default(),
                 session,
             )
             .await
@@ -2660,7 +2722,7 @@ pub(crate) mod tests {
                 ClusterRole::Scribe,
                 test_query_id(),
                 &assignment,
-                None,
+                &RemoteScanPayload::default(),
                 &session,
             )
             .await
@@ -2692,7 +2754,7 @@ pub(crate) mod tests {
                 ClusterRole::Scribe,
                 test_query_id(),
                 &assignment,
-                None,
+                &RemoteScanPayload::default(),
                 &session,
             )
             .await

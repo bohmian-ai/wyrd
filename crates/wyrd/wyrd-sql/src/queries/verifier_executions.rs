@@ -377,14 +377,14 @@ const ADVANCE_EXPECTED_CURSOR_SQL: &str = r"
 /// it instead of being misread during a rolling upgrade.
 const WORKER_FORMAT: i32 = 2;
 
-/// Claim up to `$3` of the oldest due, retry-due, or lease-expired executions,
+/// Claim up to `$2` of the oldest due, retry-due, or lease-expired executions,
 /// each under its own fresh lease, in one statement.
 ///
-/// The `exhausted` CTE first settles, as `errored` with error `$1`, every
-/// expired lease that has no attempt left; data-modifying CTEs always run,
-/// and the candidate scan excludes exactly those rows, so one statement both
-/// exhausts and claims without the two touching the same row. Every claimed
-/// row draws its own random lease token, returned as `lease_token`, so each
+/// An expired lease with no attempt left is claimed without counting an
+/// attempt and returned as `exhausted`, so its runner delivers a terminal
+/// outcome the execution already selected, or settles the exhaustion,
+/// without computing; the queue cannot see Bifrost to decide that itself.
+/// Every claimed row draws its own random lease token, returned as `lease_token`, so each
 /// claim renews and settles independently.
 ///
 /// Due and lease-expired rows are each read in the order of their own
@@ -394,60 +394,53 @@ const WORKER_FORMAT: i32 = 2;
 /// either scan but not claimed stay locked only until the claim commits,
 /// and concurrent claims skip them.
 ///
-/// The first claim fixes the execution deadline `$4` milliseconds after its
+/// The first claim fixes the execution deadline `$3` milliseconds after its
 /// statement time and every claim returns what remains of it, so a reclaim
 /// never replenishes it.
 ///
 /// Availability, expiry, and the new lease deadline are all PostgreSQL's
-/// statement time; `$2` is only the lease length in milliseconds, so a pod
+/// statement time; `$1` is only the lease length in milliseconds, so a pod
 /// whose clock differs from the database can neither claim early nor hold a
 /// lease the database believes already expired. Only executions whose
-/// `worker_format` is at most `$5`, this worker's [`WORKER_FORMAT`], are
-/// claimed or exhausted, so a newer record keeps its attempts and checkpoints
+/// `worker_format` is at most `$4`, this worker's [`WORKER_FORMAT`], are
+/// claimed, so a newer record keeps its attempts and checkpoints
 /// for a worker that understands it. Each claim also returns the
 /// Verifier's ready fitted Drift baselines keyed by requirement, so the drift
 /// engine opens no connection to read them; the Verifier, subject, and SYSTEM
 /// principal are resolved by the caller through `wyrd.verification_target`.
 const CLAIM_SQL: &str = r"
-    WITH exhausted AS (
-        UPDATE wyrd.verifier_executions x
-           SET status = 'errored', error = $1, lease_expires_at = NULL,
-               next_attempt_at = NULL, settled_at = statement_timestamp(),
-               updated_at = statement_timestamp()
-         WHERE x.status = 'running'
-           AND x.lease_expires_at <= statement_timestamp()
-           AND x.attempts >= x.max_attempts AND x.worker_format <= $5
-    ),
-    due AS (
-        SELECT execution_id, next_attempt_at AS due_at
+    WITH due AS (
+        SELECT execution_id, next_attempt_at AS due_at, false AS exhausted
           FROM wyrd.verifier_executions
          WHERE status IN ('pending', 'retrying') AND next_attempt_at <= statement_timestamp()
-           AND worker_format <= $5
+           AND worker_format <= $4
          ORDER BY next_attempt_at, execution_id
-         LIMIT $3
+         LIMIT $2
            FOR UPDATE SKIP LOCKED
     ),
     expired AS (
-        SELECT execution_id, lease_expires_at AS due_at
+        SELECT execution_id, lease_expires_at AS due_at, attempts >= max_attempts AS exhausted
           FROM wyrd.verifier_executions
          WHERE status = 'running' AND lease_expires_at <= statement_timestamp()
-           AND attempts < max_attempts AND worker_format <= $5
+           AND worker_format <= $4
          ORDER BY lease_expires_at, execution_id
-         LIMIT $3
+         LIMIT $2
            FOR UPDATE SKIP LOCKED
     ),
     candidate AS (
-        SELECT execution_id, due_at FROM due
+        SELECT execution_id, due_at, exhausted FROM due
         UNION ALL
-        SELECT execution_id, due_at FROM expired
+        SELECT execution_id, due_at, exhausted FROM expired
         ORDER BY due_at, execution_id
-        LIMIT $3
+        LIMIT $2
     )
     UPDATE wyrd.verifier_executions e
-       SET status = 'running', attempts = e.attempts + 1, lease_token = gen_random_uuid(),
-           lease_expires_at = statement_timestamp() + ($2::bigint * INTERVAL '1 millisecond'),
+       SET status = 'running',
+           attempts = CASE WHEN candidate.exhausted THEN e.attempts ELSE e.attempts + 1 END,
+           lease_token = gen_random_uuid(),
+           lease_expires_at = statement_timestamp() + ($1::bigint * INTERVAL '1 millisecond'),
            deadline_at = COALESCE(e.deadline_at,
-                                  statement_timestamp() + ($4::bigint * INTERVAL '1 millisecond')),
+                                  statement_timestamp() + ($3::bigint * INTERVAL '1 millisecond')),
            next_attempt_at = NULL, updated_at = statement_timestamp()
       FROM candidate
      WHERE e.execution_id = candidate.execution_id
@@ -458,6 +451,7 @@ const CLAIM_SQL: &str = r"
               e.sub_principal_id, e.act_principal_id, e.authority, e.attempts,
               e.max_attempts, e.lease_expires_at, e.deadline_at, e.cause_trace_id,
               e.cause_span_id, e.cause_sampled, e.group_id, e.deployment_environment,
+              candidate.exhausted,
               GREATEST(0, (EXTRACT(EPOCH FROM statement_timestamp() - candidate.due_at)
                            * 1000)::bigint) AS queue_wait_ms,
               GREATEST(0, (EXTRACT(EPOCH FROM statement_timestamp() - e.created_at)
@@ -1554,6 +1548,11 @@ pub struct ClaimedExecution {
     pub attempt: i32,
     /// Attempt budget frozen at admission.
     pub max_attempts: i32,
+    /// Whether the claim took an expired lease of the final attempt, which
+    /// counts no attempt: the claimant only delivers a terminal outcome the
+    /// execution already selected, or settles it as exhausted, and never
+    /// computes.
+    pub exhausted: bool,
     /// Exact Verifier Card UID.
     pub verifier_card_uid: CardUid,
     /// Exact Verifier Card version.
@@ -2797,14 +2796,15 @@ impl VerifierExecutionQueue {
     /// Claim up to `limit` runnable executions of the caller's tenant, each
     /// under its own fresh lease, in one statement.
     ///
-    /// The statement first settles, as `errored`, every expired lease whose
-    /// attempts are exhausted, so a crash loop cannot exceed the budget. It
-    /// then locks the oldest `pending` or `retrying` executions due at
+    /// The statement locks the oldest `pending` or `retrying` executions due at
     /// PostgreSQL's statement time, or `running` executions whose lease the
     /// database considers expired, with `SKIP LOCKED`; marks each `running`
     /// with its own lease token expiring `lease_for` after that same database
     /// instant; counts the attempt; and fixes the execution deadline
-    /// `deadline_for` after its first claim, which a reclaim keeps. Returns
+    /// `deadline_for` after its first claim, which a reclaim keeps. An
+    /// expired lease with no attempt left is claimed without counting one,
+    /// as [`ClaimedExecution::exhausted`], so a crash loop cannot exceed the
+    /// budget. Returns
     /// nothing when nothing is runnable, and never more than `limit`; the
     /// order is unspecified. The
     /// caller commits before executing. The statement opens no span of its
@@ -2822,12 +2822,7 @@ impl VerifierExecutionQueue {
         limit: u32,
     ) -> Result<Vec<ClaimedExecution>, SqlxError> {
         timed("claim", async {
-            let exhausted = VerificationError {
-                code: "lease_expired".to_owned(),
-                message: "the execution's lease expired after its final attempt".to_owned(),
-            };
             let rows: Vec<ClaimedRow> = sqlx::query_as(CLAIM_SQL)
-                .bind(Json(&exhausted))
                 .bind(lease_for.num_milliseconds())
                 .bind(i64::from(limit))
                 .bind(deadline_for.num_milliseconds())
@@ -3565,6 +3560,8 @@ struct ClaimedRow {
     attempts: i32,
     /// Attempt budget.
     max_attempts: i32,
+    /// Whether this claim took an expired final attempt.
+    exhausted: bool,
     /// Lease expiry.
     lease_expires_at: DateTime<Utc>,
     /// The execution deadline the first claim fixed.
@@ -3626,6 +3623,7 @@ impl ClaimedRow {
             deadline_at: self.deadline_at,
             attempt: self.attempts,
             max_attempts: self.max_attempts,
+            exhausted: self.exhausted,
             verifier_card_uid: stored(CardUid::from_uuid(self.verifier_card_uid))?,
             verifier_version: self.verifier_version,
             card_uid: stored(CardUid::from_uuid(self.card_uid))?,

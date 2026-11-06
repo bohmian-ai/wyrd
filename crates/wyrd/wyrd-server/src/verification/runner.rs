@@ -376,7 +376,8 @@ impl VerifierRunner {
     /// lease, and state that cannot be read or is in another format defers
     /// the execution, so it never restarts as fresh. State that already
     /// selected a terminal outcome delivers that outcome again without
-    /// running the engine. An execution whose `deadline` has already passed
+    /// running the engine; an [`exhausted`](ClaimedExecution::exhausted)
+    /// claim of state that selected none errors. An execution whose `deadline` has already passed
     /// times out without dispatching anything. Otherwise the engine runs
     /// from the recovered invocations until `deadline`, and a completed
     /// outcome is selected in the state before it is built into its result
@@ -416,6 +417,9 @@ impl VerifierRunner {
         if let Some(selected) = state.snapshot().await.terminal {
             let (transition, write) = result(run, &selected, system);
             return (transition, write.map(|write| (slot, write)));
+        }
+        if run.exhausted {
+            return (exhausted(), None);
         }
         let started_at = Utc::now();
         let outcome = if deadline <= tokio::time::Instant::now() {
@@ -982,7 +986,9 @@ impl VerifierRunner {
     /// a terminal outcome is durably settled — the run's trigger-to-terminal
     /// latency: its age at claim plus this attempt's elapsed [`Instant`] time.
     /// A settled deferral spends no attempt, so it records only its span's
-    /// outcome and none of these series.
+    /// outcome and none of these series. An exhausted claim, which has no
+    /// attempt to refund or spend, errors instead of retrying or deferring
+    /// and leaves its lease to expire instead of releasing it.
     /// Returns whether admission backpressure deferred the run.
     async fn attempt(
         &self,
@@ -1013,6 +1019,8 @@ impl VerifierRunner {
             None => transition,
         };
         let transition = match transition {
+            Transition::Release if run.exhausted => Transition::LeaseLost,
+            Transition::Retry(_) | Transition::Defer(_) if run.exhausted => exhausted(),
             Transition::LeaseLost if abandon.is_cancelled() => Transition::Release,
             Transition::Retry(_) if stop.is_cancelled() => Transition::Release,
             transition => transition,
@@ -1348,6 +1356,18 @@ const fn terminal_label(status: TerminalStatus) -> &'static str {
 ///
 /// The error is persisted and exposed in execution status, so `message` names only
 /// the failed operation; dependency causes go to the diagnostic log instead.
+/// How an exhausted claim ends when it cannot deliver an already selected
+/// outcome: no attempt is left to compute one.
+fn exhausted() -> Transition {
+    Transition::Terminate(
+        TerminalStatus::Errored,
+        failure(
+            "lease_expired",
+            "the execution's lease expired after its final attempt",
+        ),
+    )
+}
+
 fn failure(code: &str, message: &str) -> VerificationError {
     VerificationError {
         code: code.to_owned(),

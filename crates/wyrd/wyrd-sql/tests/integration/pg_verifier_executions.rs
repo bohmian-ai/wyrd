@@ -1921,12 +1921,13 @@ async fn retries_back_off_then_exhaust_to_errored() {
 }
 
 /// Cancelled and timed-out executions settle with their error and no result, and a
-/// crash on the final attempt is settled `errored` by the next claim instead of
-/// being reclaimed past the budget.
+/// crash on the final attempt is claimed once more as exhausted, counting no
+/// attempt, so its claimant can deliver an already selected outcome or
+/// settle the exhaustion; only a counted attempt computes.
 ///
 /// # Panics
 /// Panics when a terminal status carries a result or dispatch, or an
-/// exhausted expired lease is reclaimed.
+/// exhausted expired lease is claimed as a counted attempt.
 #[tokio::test]
 async fn terminal_failures_and_expired_final_attempts_carry_no_verdict() {
     let fixture = PgFixture::start().await.expect("fixture starts");
@@ -1972,17 +1973,48 @@ async fn terminal_failures_and_expired_final_attempts_carry_no_verdict() {
     }
 
     let execution = scheduled(&queue, &mut conn, binding).await;
-    for _ in 0..3 {
-        claim(&queue, &mut conn).await;
+    for attempt in 1..=3 {
+        let claimed = claim(&queue, &mut conn).await;
+        assert_eq!(
+            (claimed.attempt, claimed.exhausted),
+            (attempt, false),
+            "each attempt within the budget computes"
+        );
         expire_deadlines(&mut conn, execution).await;
     }
+    for _ in 0..2 {
+        let claimed = claim(&queue, &mut conn).await;
+        assert_eq!(
+            (claimed.attempt, claimed.exhausted),
+            (3, true),
+            "an expired final attempt is claimed again without counting one"
+        );
+        expire_deadlines(&mut conn, execution).await;
+    }
+    let claimed = claim(&queue, &mut conn).await;
+    let exhausted = VerificationError {
+        code: "lease_expired".to_owned(),
+        message: "the execution's lease expired after its final attempt".to_owned(),
+    };
+    assert_eq!(
+        queue
+            .terminate(
+                &mut conn,
+                claimed.lease,
+                TerminalStatus::Errored,
+                &exhausted
+            )
+            .await
+            .expect("terminate answers"),
+        Settlement::Applied
+    );
     assert!(
         queue
             .claim(&mut conn, Duration::minutes(5), Duration::minutes(5), 1)
             .await
             .expect("claim runs")
             .is_empty(),
-        "an exhausted expired lease is not reclaimed"
+        "a settled exhaustion is not claimed again"
     );
     let status = queue
         .execution_status(&mut conn, execution)

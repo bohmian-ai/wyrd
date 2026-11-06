@@ -2023,6 +2023,28 @@ fn sent_values(sent: &SentBatch, column: &str) -> std::collections::BTreeSet<Str
 /// engine, re-delivers the result under the same identity, and the status
 /// read returns that selected verdict.
 ///
+/// # Panics
+/// Panics as [`redelivers_the_selected_result`] does.
+#[tokio::test]
+async fn reclaimed_attempt_after_a_failed_settlement_redelivers_the_selected_result() {
+    redelivers_the_selected_result(false).await;
+}
+
+/// A final attempt whose result was staged but whose settlement never
+/// commits is reconciled before exhaustion: the exhausted reclaim counts no
+/// attempt, runs no engine, and completes with the selected result.
+///
+/// # Panics
+/// Panics as [`redelivers_the_selected_result`] does.
+#[tokio::test]
+async fn final_attempt_after_a_failed_settlement_completes_instead_of_exhausting() {
+    redelivers_the_selected_result(true).await;
+}
+
+/// Fail the first attempt's settlement after its result was staged, on the
+/// final attempt when `final_attempt`, and prove the reclaim completes the
+/// execution with that result.
+///
 /// A test-only deferred constraint trigger fails every completing commit made
 /// under the first attempt's lease token, so its result reaches Scribe while
 /// its settlement rolls back; the lease is then expired and a fresh runner,
@@ -2030,10 +2052,10 @@ fn sent_values(sent: &SentBatch, column: &str) -> std::collections::BTreeSet<Str
 ///
 /// # Panics
 /// Panics when the fault cannot be installed, the execution does not complete
-/// on its reclaim, the reclaim runs its engine or mints another result
-/// identity, or the status read returns another outcome.
-#[tokio::test]
-async fn reclaimed_attempt_after_a_failed_settlement_redelivers_the_selected_result() {
+/// on its reclaim, the reclaim counts the wrong attempt, runs its engine, or
+/// mints another result identity, or the status read returns another
+/// outcome.
+async fn redelivers_the_selected_result(final_attempt: bool) {
     let harness = Harness::start().await;
     let abandoned = EngineScript::default();
     abandoned.hold();
@@ -2060,6 +2082,15 @@ async fn reclaimed_attempt_after_a_failed_settlement_redelivers_the_selected_res
             .await
             .expect("the settlement fault installs");
     }
+    if final_attempt {
+        sqlx::query(
+            "UPDATE wyrd.verifier_executions SET max_attempts = attempts WHERE execution_id = $1",
+        )
+        .bind(run.as_uuid())
+        .execute(&harness.assertion)
+        .await
+        .expect("the attempt becomes the final one");
+    }
     abandoned.release();
     let deadline = tokio::time::Instant::now() + WAIT;
     while !harness.writes().await.iter().any(|table| table == RESULTS) {
@@ -2076,7 +2107,11 @@ async fn reclaimed_attempt_after_a_failed_settlement_redelivers_the_selected_res
     winner.push(EngineOutcome::Completed(unscored_report()));
     let fresh = harness.spawn(&Harness::limits(), &winner);
     let row = harness.wait_execution(run, status("completed")).await;
-    assert_eq!(row.attempts, 2, "the reclaim is the second attempt");
+    assert_eq!(
+        row.attempts,
+        if final_attempt { 1 } else { 2 },
+        "only a reclaim within the budget counts an attempt"
+    );
     stale.stop().await;
     fresh.stop().await;
 

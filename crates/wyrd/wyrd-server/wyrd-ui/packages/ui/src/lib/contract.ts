@@ -5,6 +5,7 @@
  * imports are type-only, so no browser entry point loads the Node SDK.
  */
 import type {
+  ArtifactInventoryResponse,
   BoundedQueryResult,
   CardRef,
   CardSummary,
@@ -18,7 +19,10 @@ import type {
 
 import problems from './problems.json' with { type: 'json' };
 
-export type { CardRef, CardSummary, QueryColumn, QueryParam, RegisteredCard } from 'wyrd-ai';
+export type { ArtifactInventoryResponse, CardRef, CardSummary, QueryColumn, QueryParam, RegisteredCard } from 'wyrd-ai';
+
+/** One file registration recorded for a Card version. */
+export type StoredArtifactEntry = ArtifactInventoryResponse['artifacts'][number];
 
 /**
  * The stable Wyrd error a refused or failed read reports. Upstream reads keep
@@ -46,6 +50,7 @@ export function wyrdProblem(kind: keyof typeof problems, detail: string): Proble
 export type WireRequest =
   | { readonly op: 'cards.get_by_ref'; readonly card_ref: CardRef }
   | ({ readonly op: 'cards.list' } & ListCardsRequest)
+  | { readonly op: 'cards.list_artifacts'; readonly card_ref: CardRef }
   | {
       readonly op: 'bifrost.query';
       readonly sql: string;
@@ -74,6 +79,7 @@ export type TableDescriptionWire = Omit<TableDescription, 'table_version'> & { r
 export interface WireResponses {
   'cards.get_by_ref': RegisteredCard;
   'cards.list': ListCardsResponse;
+  'cards.list_artifacts': ArtifactInventoryResponse;
   'bifrost.query': QueryResult;
   'bifrost.list_tables': TableListing;
   'bifrost.describe_table': TableDescriptionWire;

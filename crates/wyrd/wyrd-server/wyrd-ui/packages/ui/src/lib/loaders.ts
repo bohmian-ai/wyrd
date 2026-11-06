@@ -7,14 +7,12 @@ import {
   failed,
   wyrdProblem,
   type ActionIntent,
-  type CardSummary,
   type Executor,
   type Loaded,
   type Problem,
   type QueryParam,
   type QueryResult,
   type RegisteredCard,
-  type WireRequest
 } from './contract.js';
 import type { ZodType } from 'zod';
 import { columnIndex } from './plot.js';
@@ -31,6 +29,26 @@ import {
   type TraceWaterfallProps
 } from './observe.js';
 import {
+  listVersions,
+  loadArtifactTable,
+  loadCardFacts,
+  loadCardInventory,
+  loadPromptMessages,
+  loadPromptVariables,
+  loadRelationshipList,
+  loadUsedBy,
+  loadVersionDiff,
+  type ArtifactTableProps,
+  type CardFactsProps,
+  type CardInventoryProps,
+  type CardVersions,
+  type PromptMessagesProps,
+  type PromptVariablesProps,
+  type RelationshipListProps,
+  type UsedByProps,
+  type VersionDiffProps
+} from './cards.js';
+import {
   components,
   type AbsoluteRange,
   type CardHeaderInput,
@@ -42,6 +60,7 @@ import {
 export * from './contract.js';
 export * from './schemas.js';
 export * from './observe.js';
+export * from './cards.js';
 
 /** What every loader receives from its host. */
 export interface LoadContext {
@@ -60,13 +79,6 @@ export interface ChartProps {
   readonly result: Loaded<QueryResult>;
 }
 
-/** The exact versions of one Card, newest first. */
-export interface CardVersions {
-  readonly items: readonly CardSummary[];
-  /** More versions exist than the loader pages through. */
-  readonly truncated: boolean;
-}
-
 /** Props of `CardHeader`. */
 export interface CardHeaderProps {
   readonly input: CardHeaderInput;
@@ -77,6 +89,14 @@ export interface CardHeaderProps {
 export interface ComponentProps {
   Chart: ChartProps;
   CardHeader: CardHeaderProps;
+  CardInventory: CardInventoryProps;
+  CardFacts: CardFactsProps;
+  RelationshipList: RelationshipListProps;
+  ArtifactTable: ArtifactTableProps;
+  PromptMessages: PromptMessagesProps;
+  PromptVariables: PromptVariablesProps;
+  UsedBy: UsedByProps;
+  VersionDiff: VersionDiffProps;
   StatStrip: StatStripProps;
   FacetRail: FacetRailProps;
   RecordTable: RecordTableProps;
@@ -190,28 +210,6 @@ export async function loadChart(input: ChartInput, context: LoadContext): Promis
   return { input, executed, result: read.ok ? shapeChart(input, read.value) : failed(read.problem) };
 }
 
-/** Versions per `cards.list` page, and the pages a header follows before reporting truncation. */
-const VERSION_PAGE = 100;
-const VERSION_PAGES = 5;
-
-/** Order exact versions newest first by semantic version, prereleases below their release. */
-export function compareVersions(left: string, right: string): number {
-  const parse = (version: string) => {
-    const [core, pre] = version.split('+')[0].split(/-(.*)/s);
-    return { parts: core.split('.').map(Number), pre };
-  };
-  const a = parse(left);
-  const b = parse(right);
-  for (let index = 0; index < 3; index += 1) {
-    const difference = (b.parts[index] ?? 0) - (a.parts[index] ?? 0);
-    if (difference !== 0) return difference;
-  }
-  if (a.pre === b.pre) return 0;
-  if (a.pre === undefined) return -1;
-  if (b.pre === undefined) return 1;
-  return b.pre.localeCompare(a.pre, undefined, { numeric: true });
-}
-
 /**
  * Load one exact Card, then the exact versions sharing its resolved identity.
  *
@@ -223,32 +221,7 @@ export async function loadCardHeader(input: CardHeaderInput, context: LoadContex
   const [read] = await context.executor.run([{ op: 'cards.get_by_ref', card_ref: input.cardRef }], context.signal);
   if (!read.ok) return { input, result: failed(read.problem) };
   const card = read.value;
-  const items: CardSummary[] = [];
-  let cursor: string | null = null;
-  let versions: Loaded<CardVersions> | undefined;
-  for (let page = 0; page < VERSION_PAGES; page += 1) {
-    context.signal?.throwIfAborted();
-    const request: Extract<WireRequest, { op: 'cards.list' }> = {
-      op: 'cards.list',
-      kind: card.kind,
-      name: card.metadata.name,
-      include_prerelease: true,
-      limit: VERSION_PAGE,
-      cursor
-    };
-    const [listed] = await context.executor.run([request], context.signal);
-    if (!listed.ok) {
-      versions = failed(listed.problem);
-      break;
-    }
-    items.push(...listed.value.items);
-    cursor = listed.value.next_cursor;
-    if (cursor === null) break;
-  }
-  versions ??= {
-    state: 'populated',
-    data: { items: items.sort((a, b) => compareVersions(a.version, b.version)), truncated: cursor !== null }
-  };
+  const versions = await listVersions(card, context);
   return { input, result: { state: 'populated', data: { card, versions } } };
 }
 
@@ -264,6 +237,14 @@ const LOADERS: {
 } = {
   Chart: loadChart,
   CardHeader: loadCardHeader,
+  CardInventory: loadCardInventory,
+  CardFacts: loadCardFacts,
+  RelationshipList: loadRelationshipList,
+  ArtifactTable: loadArtifactTable,
+  PromptMessages: loadPromptMessages,
+  PromptVariables: loadPromptVariables,
+  UsedBy: loadUsedBy,
+  VersionDiff: loadVersionDiff,
   StatStrip: loadStatStrip,
   FacetRail: loadFacetRail,
   RecordTable: loadRecordTable,

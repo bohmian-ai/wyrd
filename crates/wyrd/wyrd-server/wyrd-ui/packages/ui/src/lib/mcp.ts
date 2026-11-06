@@ -14,6 +14,8 @@ function tool(request: WireRequest): { name: string; arguments: Record<string, u
       return { name: 'cards.get', arguments: rest, value: (content) => content.card };
     case 'verification.get_execution':
     case 'cards.list':
+    // No MCP tool lists a Card's files yet; the host's refusal of the call is the read's outcome.
+    case 'cards.list_artifacts':
     case 'bifrost.query':
     case 'bifrost.list_tables':
     case 'bifrost.describe_table':

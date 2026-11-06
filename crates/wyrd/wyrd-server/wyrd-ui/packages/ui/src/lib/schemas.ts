@@ -6,36 +6,42 @@
  * values, so only these schemas define what a document or intent may carry.
  */
 import { z } from 'zod';
-import type { CardKind, CardRef } from 'wyrd-ai';
+import type { CardKind, CardRef, CardSummary } from 'wyrd-ai';
 
-/** Every Card kind the registry serves, checked against the generated union both ways. */
-const CARD_KINDS = [
+/**
+ * The twelve registrable Card kinds of the architecture kind catalog, in its
+ * order. The generated union still names Policy and Source, which the catalog
+ * removed; every other generated kind must appear here.
+ */
+export const CARD_KINDS = [
   'Data',
   'Model',
+  'Artifact',
   'Experiment',
   'Prompt',
   'Agent',
-  'Verifier',
-  'Service',
-  'Policy',
   'Mcp',
+  'Service',
   'Audit',
-  'Artifact',
+  'Verifier',
   'Trigger',
-  'Operator',
-  'Source'
+  'Operator'
 ] as const satisfies readonly CardKind[];
-const everyKind: CardKind extends (typeof CARD_KINDS)[number] ? true : never = true;
+const everyKind: Exclude<CardKind, 'Policy' | 'Source'> extends (typeof CARD_KINDS)[number] ? true : never = true;
 void everyKind;
+
+/** Lifecycle statuses an inventory may filter by; a deleted Card is never listed. */
+export const CARD_STATUSES = ['active', 'pending', 'deprecated', 'failed', 'expired'] as const satisfies readonly CardSummary['status'][];
+
+/** An exact version such as 1.4.2, never a range or "latest". */
+const exactVersion = z.string().regex(/^\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?(?:\+[0-9A-Za-z.-]+)?$/, 'an exact version such as 1.4.2');
 
 /** An exact Card reference: a full version pin, never a range or "latest". */
 export const CardRefSchema = z
   .object({
     kind: z.enum(CARD_KINDS),
     name: z.string().min(1),
-    version: z
-      .string()
-      .regex(/^\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?(?:\+[0-9A-Za-z.-]+)?$/, 'an exact version such as 1.4.2'),
+    version: exactVersion,
     uid: z.string().min(1).nullish()
   })
   .strict() satisfies z.ZodType<CardRef>;
@@ -95,6 +101,51 @@ export const CardHeaderInputSchema = z
     tab: z.string().min(1).optional()
   })
   .strict();
+
+/** The pages an inventory follows through `cards.list` cursors at most. */
+export const INVENTORY_PAGES = 20;
+
+/** Inventory filters; each maps onto the `cards.list` request field of the same meaning. */
+const inventoryFilters = {
+  /**
+   * One word with no spaces, quotes or operators matches names containing it,
+   * ignoring case; anything else is the metadata query itself (labels.team = "search").
+   */
+  query: z.string().max(4096).optional(),
+  kind: z.enum(CARD_KINDS).optional(),
+  status: z.enum(CARD_STATUSES).optional(),
+  include_prerelease: z.boolean().optional()
+};
+
+/** The input of `CardInventory`: filters and how many server pages to show. */
+export const CardInventoryInputSchema = z
+  .object({ ...inventoryFilters, pages: z.number().int().min(1).max(INVENTORY_PAGES).optional() })
+  .strict();
+
+/** The input of an exact-Card detail component. */
+export const CardDetailInputSchema = z.object({ cardRef: CardRefSchema }).strict();
+
+/** The input of `CardFacts`: one exact Card; `yaml` shows the whole returned Card as YAML instead. */
+export const CardFactsInputSchema = z.object({ cardRef: CardRefSchema, yaml: z.boolean().optional() }).strict();
+
+/** One exact Prompt Card. */
+const promptRef = CardRefSchema.extend({ kind: z.literal('Prompt') });
+
+/** The input of a Prompt component. */
+export const PromptInputSchema = z.object({ cardRef: promptRef }).strict();
+
+/** The input of `VersionDiff`: one exact Prompt and another registered version; absent, the version before it. */
+export const VersionDiffInputSchema = z
+  .object({ cardRef: promptRef, otherVersion: exactVersion.optional() })
+  .strict()
+  .refine((input) => input.otherVersion !== input.cardRef.version, { message: 'must differ from cardRef.version', path: ['otherVersion'] });
+
+/** Open one exact Card version. */
+const openCard = {
+  description: 'Open this exact Card version.',
+  input: z.object({ card_ref: CardRefSchema }).strict(),
+  completion: 'host-navigation'
+} as const;
 
 /** A bind value: JSON null, boolean, number, or string. */
 const queryParam = z.union([z.null(), z.boolean(), z.number(), z.string()]);
@@ -394,6 +445,76 @@ export const components = {
       }
     }
   },
+  CardInventory: {
+    description:
+      'Every registered Card version cards.list returns, in registration order: kind, name, version, status, uid and update time, ' +
+      'filtered by kind, lifecycle status, prerelease and a name or metadata query (labels., annotations.), paged by server cursor.',
+    input: CardInventoryInputSchema,
+    states: ['populated', 'empty', 'denied', 'error', 'loading'],
+    emits: {
+      'cards.filter': {
+        description: 'Read the inventory again under these filters, from its first page.',
+        input: z.object(inventoryFilters).strict(),
+        completion: 'host-navigation'
+      },
+      'cards.more': {
+        description: "Show one more page, following the last page's server cursor.",
+        input: z.object({ pages: z.number().int().min(2).max(INVENTORY_PAGES) }).strict(),
+        completion: 'host-navigation'
+      },
+      'card.open': openCard
+    }
+  },
+  CardFacts: {
+    description: "An exact Card's server-managed facts (uid, status, hashes, labels, annotations, origin), or the whole returned Card as YAML.",
+    input: CardFactsInputSchema,
+    states: ['populated', 'denied', 'error', 'loading'],
+    emits: {}
+  },
+  RelationshipList: {
+    description: "An exact Card's server-derived relationships: each exact outbound and inbound Card reference.",
+    input: CardDetailInputSchema,
+    states: ['populated', 'empty', 'denied', 'error', 'loading'],
+    emits: { 'card.open': openCard }
+  },
+  ArtifactTable: {
+    description: 'The files registration recorded for one exact Card version: relative path, size, SHA-256 digest and content type.',
+    input: CardDetailInputSchema,
+    states: ['populated', 'empty', 'denied', 'error', 'loading'],
+    emits: {}
+  },
+  PromptMessages: {
+    description:
+      "An exact Prompt as authored: provider, model and response format, then the portable system text and messages, or the native format's body unchanged.",
+    input: PromptInputSchema,
+    states: ['populated', 'denied', 'error', 'loading'],
+    emits: {}
+  },
+  PromptVariables: {
+    description: "The text and media variables the server's Prompt compiler derived from an exact Prompt (status.prompt).",
+    input: PromptInputSchema,
+    states: ['populated', 'empty', 'denied', 'error', 'loading'],
+    emits: {}
+  },
+  UsedBy: {
+    description: "The Agents whose spec references an exact Prompt, from its server-derived inbound relationships, with each Agent's execution route.",
+    input: PromptInputSchema,
+    states: ['populated', 'empty', 'denied', 'error', 'loading'],
+    emits: { 'card.open': openCard }
+  },
+  VersionDiff: {
+    description:
+      'The authored differences between two registered versions of one Prompt: provider, model, system text, messages, settings, response format and derived variables.',
+    input: VersionDiffInputSchema,
+    states: ['populated', 'empty', 'denied', 'error', 'loading'],
+    emits: {
+      'prompt.compare': {
+        description: 'Compare the Prompt with this other registered version.',
+        input: z.object({ other_version: exactVersion }).strict(),
+        completion: 'host-navigation'
+      }
+    }
+  },
   StatStrip: {
     description:
       'One to five recorded numbers with a sparkline each, from built-in reads of bifrost.traces.spans, ' +
@@ -470,6 +591,14 @@ export type ComponentName = keyof typeof components;
 export type ChartInput = z.infer<typeof ChartInputSchema>;
 /** A validated `CardHeader` input. */
 export type CardHeaderInput = z.infer<typeof CardHeaderInputSchema>;
+/** A validated `CardInventory` input. */
+export type CardInventoryInput = z.infer<typeof CardInventoryInputSchema>;
+/** A validated exact-Card detail input. */
+export type CardDetailInput = z.infer<typeof CardDetailInputSchema>;
+/** A validated `CardFacts` input. */
+export type CardFactsInput = z.infer<typeof CardFactsInputSchema>;
+/** A validated `VersionDiff` input. */
+export type VersionDiffInput = z.infer<typeof VersionDiffInputSchema>;
 /** A view or panel range. */
 export type Range = z.infer<typeof RangeSchema>;
 /** One WHERE clause. */

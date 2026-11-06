@@ -34,6 +34,8 @@ export function nodeExecutor(client: WyrdClient): Executor {
         const { op: _, ...query } = request;
         return (await cards()).list(query);
       }
+      case 'cards.list_artifacts':
+        return (await cards()).listArtifacts(request.card_ref);
       case 'bifrost.query': {
         const stream = await (await bifrost()).stream(request.sql, request.params ?? [], { deadlineMs: request.deadline_ms });
         const abort = () => void stream.return();

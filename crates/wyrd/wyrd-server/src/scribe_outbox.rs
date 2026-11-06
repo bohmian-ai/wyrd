@@ -2311,8 +2311,28 @@ mod tests {
 
     /// One revision of `execution_id`'s state, and the receiver its
     /// acceptance fires.
+    ///
+    /// # Panics
+    /// Panics when a fresh `UUIDv7` is not a valid Card UID, or a stand-in
+    /// identity's static name or version fails to parse; neither happens.
     fn execution_state(
         execution_id: ExecutionId,
+    ) -> (ScribeWrite, tokio::sync::oneshot::Receiver<()>) {
+        execution_state_of(
+            execution_id,
+            wyrd_spec::verification::state::ExecutionState::fresh(),
+        )
+    }
+
+    /// Revision 1 of `execution_id`'s `state`, and the receiver its
+    /// acceptance fires.
+    ///
+    /// # Panics
+    /// Panics when a fresh `UUIDv7` is not a valid Card UID, or a stand-in
+    /// identity's static name or version fails to parse; neither happens.
+    fn execution_state_of(
+        execution_id: ExecutionId,
+        state: wyrd_spec::verification::state::ExecutionState,
     ) -> (ScribeWrite, tokio::sync::oneshot::Receiver<()>) {
         let (verifier, subject) = (uid(), uid());
         let row = crate::verification::state::StateRow {
@@ -2330,7 +2350,7 @@ mod tests {
             batch: uuid::Uuid::now_v7(),
             checkpoint: Arc::new(crate::verification::state::Checkpoint::new(
                 1,
-                wyrd_spec::verification::state::ExecutionState::fresh(),
+                state,
                 Arc::new(row),
             )),
             attribution: background(),
@@ -2377,6 +2397,109 @@ mod tests {
 
         let reason = 64 * 1024;
         assert!(ScribeSink::weight(&drift_result(&uid(), background(), 0, reason)) > reason);
+    }
+
+    /// Proves a revision is charged the variable values it retains: a
+    /// requirement settlement capturing a large actual value, data, and
+    /// reason, and the terminal outcome repeating them, charge at least
+    /// those bytes without any publication, so an outbox of exactly that
+    /// charge refuses another reservation while the revision waits and
+    /// admits one once it is written.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the revision is undercharged, a reservation is admitted
+    /// while it waits, or none is once it is written.
+    #[tokio::test]
+    async fn checkpoint_charge_tracks_variable_settlements() {
+        let value = 64 * 1024;
+        let requirement = RequirementResult {
+            id: TaskId::new("judge").expect("task id"),
+            step: None,
+            statement: "judge".to_owned(),
+            outcome: RequirementOutcome::Passed,
+            reason: "r".repeat(value),
+            actual: Some(serde_json::Value::String("a".repeat(value))),
+            citations: Vec::new(),
+            data: Some(serde_json::Map::from_iter([(
+                "d".to_owned(),
+                serde_json::Value::String("d".repeat(value)),
+            )])),
+            detail: None,
+            check: serde_json::from_value::<Check>(serde_json::json!({
+                "kind": "assert", "path": "inputs.x", "operator": "equals", "expected": true
+            }))
+            .expect("assert check decodes"),
+            provenance: None,
+        };
+        let mut state = wyrd_spec::verification::state::ExecutionState::fresh();
+        state
+            .invocations
+            .push(wyrd_spec::verification::state::InvocationRecord {
+                sequence: 1,
+                producer: wyrd_spec::verification::execution::Producer {
+                    step_id: requirement.id.clone(),
+                    item_index: None,
+                    iteration_index: None,
+                    attempt: 1,
+                },
+                settlement: Some(
+                    wyrd_spec::verification::execution::InvocationSettlement::Requirement {
+                        result: Box::new(requirement.clone()),
+                    },
+                ),
+            });
+        state.terminal = Some(wyrd_spec::verification::state::TerminalSelection {
+            result_id: wyrd_spec::ids::VerificationResultId::new_v7(),
+            started_at: Utc::now(),
+            ended_at: Utc::now(),
+            outcome: VerificationOutcome {
+                verdict: VerificationVerdict::Passed,
+                requirements: vec![requirement],
+                steps: Vec::new(),
+                evidence: std::collections::BTreeMap::new(),
+            },
+        });
+        let (write, acked) = execution_state_of(ExecutionId::new_v7(), state);
+        let weight = ScribeSink::weight(&write);
+        assert!(
+            weight >= 6 * value,
+            "a revision is charged its six {value}-byte values, not {weight}"
+        );
+
+        let scribe = Arc::new(TableGate::new(ScribeTable::ExecutionEvents));
+        let outbox = ScribeSink::bounded_outbox(
+            Some(ScribeRoute::Local(Arc::clone(&scribe) as _, None)),
+            BIFROST_INGEST_REQUEST_LIMIT_BYTES,
+            wyrd_runtime::outbox::OutboxLimits {
+                items: 16,
+                bytes: weight,
+            },
+            None,
+        );
+        let tenant = DataTenantId::new_v7();
+        outbox
+            .reserve(1)
+            .expect("an empty outbox admits the revision")
+            .stage(tenant, write);
+        let Err(refused) = outbox.reserve(1) else {
+            panic!("a waiting revision holds its whole charge");
+        };
+        assert_eq!(refused.unit, "bytes");
+        scribe.release.add_permits(1);
+        tokio::time::timeout(Duration::from_secs(10), acked)
+            .await
+            .expect("the revision is written")
+            .expect("the revision is accepted");
+        assert_eq!(
+            outbox
+                .settle(Instant::now() + Duration::from_secs(10))
+                .await,
+            0
+        );
+        outbox
+            .reserve(1)
+            .expect("a written revision releases its charge");
     }
 
     /// Proves the frames of a mixed slice build every staged audit and

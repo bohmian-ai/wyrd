@@ -57,7 +57,7 @@ use crate::verification::inputs::InputResolver;
 use crate::verification::results::{
     InputRecord, ResultPayloadBuilder, ResultPayloadError, ResultRun,
 };
-use crate::verification::state::{RunState, StateRow};
+use crate::verification::state::{Decision, RunState, StateRow};
 use crate::verification::submissions::{AdmissionReply, Queued};
 use crate::verification::telemetry::{ExecutionMode, ExecutionTelemetry, Phase};
 
@@ -602,7 +602,10 @@ impl<'a> VerificationControl<'a> {
                 Err(error) => return ("errored", Err(WyrdError::internal(error.to_string()))),
             };
             let selected = match state.select(&outcome, started_at).await {
-                Ok(selected) => selected,
+                Ok(Decision::Selected(selected)) => selected,
+                Ok(Decision::Failed(failure)) => {
+                    return ("errored", Err(WyrdError::internal(failure.error.message)));
+                }
                 Err(error) => return ("unavailable", Err(state_unavailable(&error))),
             };
             telemetry.time(Phase::Stage, || {

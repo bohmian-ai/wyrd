@@ -20,7 +20,7 @@ use uuid::Uuid;
 use wyrd_runtime::Permission;
 use wyrd_runtime::permission::{Action, PermissionScope, Resource};
 use wyrd_spec::error::WyrdError;
-use wyrd_spec::ids::{CardUid, ExecutionId};
+use wyrd_spec::ids::ExecutionId;
 use wyrd_spec::storage::{DownloadInitResponse, StorageBackendKind};
 use wyrd_spec::verification::execution::{
     CancelExecutionResponse, EXECUTION_PAGE_DEFAULT, EXECUTION_PAGE_MAX, ExecutionInvocation,
@@ -28,15 +28,10 @@ use wyrd_spec::verification::execution::{
     InvocationSettlement, Publication, PublicationContent, PublicationFile, PublicationPage,
     PublicationSelector, PublicationSummary, Speculation,
 };
-use wyrd_spec::verification::state::{
-    AcceptedPublication, ExecutionIdentity, ExecutionState, InvocationRecord,
-};
-use wyrd_spec::verification::{
-    PublicationName, TaskId, VerificationError, VerificationExecutionStatus,
-};
-use wyrd_sql::queries::cards::get_card_by_uid;
-use wyrd_sql::queries::verifier_executions::ExecutionStatus;
-use wyrd_sql::{ParsedCardRow, TenantConn};
+use wyrd_spec::verification::state::{AcceptedPublication, ExecutionState, InvocationRecord};
+use wyrd_spec::verification::{PublicationName, TaskId, VerificationExecutionStatus};
+use wyrd_sql::TenantConn;
+use wyrd_sql::queries::verifier_executions::{ExecutionStatus, PendingDelivery};
 use wyrd_storage::error::StorageError;
 use wyrd_storage::tenant_path::ValidatedPath;
 
@@ -44,10 +39,10 @@ use super::VerificationControl;
 use crate::audit;
 use crate::components::auth::Caller;
 use crate::state::registry_db_error;
-use crate::verification::cache::exact_ref;
 use crate::verification::hosted::publications::published_object;
 use crate::verification::inputs::InputResolver;
-use crate::verification::state::{RunState, StateError, StateRow};
+use crate::verification::runner::DELIVERY_TIMEOUT;
+use crate::verification::state::RunState;
 
 /// Audit operation of an invocation page read.
 const LIST_INVOCATIONS: &str = "verification.execution.invocations";
@@ -678,8 +673,11 @@ impl<'a> VerificationControl<'a> {
     /// Cancel queued `execution_id` and answer its status after the
     /// cancellation fence commits.
     ///
-    /// Unfinished work settles `cancelled`; settled work keeps its status,
-    /// result, and publications, so a repeat answers the current status.
+    /// Unfinished work settles `cancelled` at once, whatever Bifrost's
+    /// availability, and owes the cancellation to its retained state; a
+    /// runner delivers it if this request cannot. Settled work keeps its
+    /// status, result, and publications, so a repeat answers the current
+    /// status.
     ///
     /// # Errors
     /// The errors of [`Self::retained`] for `verifier:run`, and a registry
@@ -703,30 +701,13 @@ impl<'a> VerificationControl<'a> {
             .await
             .map_err(registry_db_error)?
             .ok_or_else(|| execution_not_found(execution_id))?;
-        let retain = if cancelled {
-            let identity = match (
-                Self::card(&mut conn, &status.verifier_card_uid).await?,
-                Self::card(&mut conn, &status.card_uid).await?,
-            ) {
-                (Some(verifier), Some(subject)) => Some(ExecutionIdentity {
-                    verifier: exact_ref(&verifier),
-                    subject: exact_ref(&subject),
-                    deployment_environment: status.deployment_environment.clone(),
-                    // ponytail: a fallback identity omits the group and owner, which
-                    // only an execution cancelled before its first claim lacks.
-                    group_id: None,
-                    owner_card_uid: None,
-                }),
-                _ => None,
-            };
-            Some((self.records(&mut conn, caller).await?, identity))
-        } else {
-            None
+        let deliver = match cancelled {
+            Some(pending) => Some((pending, self.records(&mut conn, caller).await?)),
+            None => None,
         };
         conn.commit().await.map_err(registry_db_error)?;
-        if let Some((query, identity)) = retain {
-            self.retain_cancellation(caller, &status, &query, identity)
-                .await;
+        if let Some((pending, query)) = deliver {
+            self.deliver_cancellation(caller, &pending, &query).await;
         }
         Ok(CancelExecutionResponse {
             execution_id,
@@ -736,79 +717,44 @@ impl<'a> VerificationControl<'a> {
 }
 
 impl VerificationControl<'_> {
-    /// Record the cancellation `status` just committed in the execution's
-    /// state, as `caller`, so it outlives the queue row. The state keeps an
-    /// identity it recorded, else takes `identity`. A failure is logged and
-    /// never undoes the committed cancellation.
-    async fn retain_cancellation(
+    /// Deliver the cancellation `pending` just committed to the execution's
+    /// state, as `caller`, and retire its owed delivery once acknowledged. A
+    /// failure is logged and leaves the delivery owed for a runner; it never
+    /// undoes the committed cancellation.
+    async fn deliver_cancellation(
         &self,
         caller: &Caller,
-        status: &ExecutionStatus,
+        pending: &PendingDelivery,
         query: &crate::query::scheduled::ScheduledQueryCaller,
-        identity: Option<ExecutionIdentity>,
     ) {
-        let execution_id = status.state.execution_id;
-        let records = InputResolver::new(query, None);
-        let recorded = async {
-            let (revision, state) =
-                RunState::accepted(self.state, caller.data_tenant_id, execution_id, &records)
-                    .await?;
-            let Some(identity) = state.identity.clone().or(identity) else {
-                return Err(StateError::Unavailable(
-                    "neither the state nor the registry holds the execution's identity".to_owned(),
-                ));
-            };
-            let row = StateRow {
-                execution_id,
-                verifier_uid: status.verifier_card_uid.clone(),
-                card_uid: status.card_uid.clone(),
-                owner_card_uid: identity.owner_card_uid.clone(),
-                run_id: None,
-                deployment_environment: status.deployment_environment.clone(),
-                attribution: caller.attribution(),
-                identity,
-            };
-            let deadline = tokio::time::Instant::now() + CANCEL_RECORD_TIMEOUT;
-            let writer = RunState::at(
-                std::sync::Arc::clone(self.state.bifrost.scribe_outbox()),
+        let execution_id = pending.execution_id;
+        let delivered = async {
+            RunState::deliver(
+                self.state,
                 caller.data_tenant_id,
-                row,
-                deadline,
-                None,
-                state,
-                revision,
-            );
-            let error = status.state.error.clone().unwrap_or(VerificationError {
-                code: "cancelled".to_owned(),
-                message: "the execution was cancelled".to_owned(),
-            });
-            writer
-                .fail(VerificationExecutionStatus::Cancelled, &error)
+                &InputResolver::new(query, None),
+                pending,
+                caller.attribution(),
+                DELIVERY_TIMEOUT,
+            )
+            .await
+            .map_err(|error| error.to_string())?;
+            let mut conn = self
+                .state
+                .registry_tenant_conn(caller.data_tenant_id)
                 .await
+                .map_err(|error| error.to_string())?;
+            self.queue
+                .delivered(&mut conn, execution_id)
+                .await
+                .map_err(|error| error.to_string())?;
+            conn.commit().await.map_err(|error| error.to_string())
         };
-        if let Err(error) = recorded.await {
-            tracing::warn!(execution_id = %execution_id, %error, "the cancellation was not retained in the execution state");
-        }
-    }
-
-    /// The Card `uid` names in the caller's tenant, when it still exists.
-    ///
-    /// # Errors
-    /// Returns the registry error of a failed read.
-    async fn card(
-        conn: &mut TenantConn<'_>,
-        uid: &CardUid,
-    ) -> Result<Option<ParsedCardRow>, WyrdError> {
-        match get_card_by_uid(conn, uid).await {
-            Ok(row) => Ok(Some(row)),
-            Err(WyrdError::RegistryCardNotFound { .. }) => Ok(None),
-            Err(error) => Err(error),
+        if let Err(error) = delivered.await {
+            tracing::warn!(execution_id = %execution_id, %error, "the cancellation is owed to the execution state; a runner delivers it");
         }
     }
 }
-
-/// How long recording a cancellation waits for its revision's acceptance.
-const CANCEL_RECORD_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
 /// The root-relative content route of the publication file `selector` names,
 /// which a local download plan hands out. Step and name are URL-safe by

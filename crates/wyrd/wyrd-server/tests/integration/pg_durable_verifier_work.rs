@@ -28,7 +28,7 @@ use wyrd_server::verification::inputs::InputResolver;
 use wyrd_server::verification::leases::LeaseRenewal;
 use wyrd_server::verification::results::{ResultPayloadBuilder, ResultRun};
 use wyrd_server::verification::state::{
-    Checkpoint, RunState, StateError, StateRow, revision_batch, stand_in_identity,
+    Checkpoint, Decision, RunState, StateError, StateRow, revision_batch, stand_in_identity,
 };
 use wyrd_spec::DataTenantId;
 use wyrd_spec::auth::Attribution;
@@ -156,7 +156,8 @@ impl Leased {
     /// Returns the [`StateError`] refusing the recovery read.
     ///
     /// # Panics
-    /// Panics when the SYSTEM read authority does not resolve.
+    /// Panics when the SYSTEM read authority does not resolve, or when the
+    /// renewal's held-lease lock is poisoned.
     async fn writer(
         server: &WyrdTestServer,
         outbox: Arc<ScribeOutbox>,
@@ -1314,7 +1315,13 @@ async fn cancelled_work_keeps_checkpoints_and_fences_stale_writes() {
     tx.rollback().await.expect("the format change rolls back");
 
     let mut tx = conn().await;
-    assert!(queue.cancel(&mut tx, execution).await.expect("cancel runs"));
+    assert!(
+        queue
+            .cancel(&mut tx, execution)
+            .await
+            .expect("cancel runs")
+            .is_some()
+    );
     tx.commit().await.expect("the cancel commits");
     leased
         .run
@@ -1323,7 +1330,11 @@ async fn cancelled_work_keeps_checkpoints_and_fences_stale_writes() {
         .expect_err("a cancelled lease checkpoints nothing");
     let mut tx = conn().await;
     assert!(
-        !queue.cancel(&mut tx, execution).await.expect("cancel runs"),
+        queue
+            .cancel(&mut tx, execution)
+            .await
+            .expect("cancel runs")
+            .is_none(),
         "a repeated cancel writes nothing"
     );
     let stale = (
@@ -1618,6 +1629,9 @@ async fn terminal_selection_and_inspection_use_run_state() {
         .select(&outcome(VerificationVerdict::Failed), chrono::Utc::now())
         .await
         .expect("the outcome is selected");
+    let Decision::Selected(selected) = selected else {
+        panic!("a fresh state selects the outcome");
+    };
 
     let current = leased.reclaim().await;
     assert_eq!(current.snapshot().await.terminal.as_ref(), Some(&selected));
@@ -1626,7 +1640,7 @@ async fn terminal_selection_and_inspection_use_run_state() {
             .select(&outcome(VerificationVerdict::Passed), chrono::Utc::now())
             .await
             .expect("the selection reads"),
-        selected,
+        Decision::Selected(selected.clone()),
         "a reclaim re-delivers the selected outcome and identity"
     );
 

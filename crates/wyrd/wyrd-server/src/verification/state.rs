@@ -47,7 +47,10 @@ use wyrd_spec::verification::state::{
     TerminalFailure, TerminalSelection,
 };
 use wyrd_spec::verification::{VerificationError, VerificationExecutionStatus};
+use wyrd_sql::queries::cards::get_card_by_uid;
+use wyrd_sql::queries::verifier_executions::PendingDelivery;
 
+use super::cache::exact_ref;
 use super::inputs::InputResolver;
 use super::leases::HeldLease;
 use super::results::{ResultPayloadBuilder, ResultRun};
@@ -101,6 +104,29 @@ pub enum StateError {
     /// unknown; this writer releases nothing more.
     #[error("the execution state no longer accepts this writer's changes")]
     Stale,
+}
+
+/// The one terminal decision an execution's state holds: a selected
+/// outcome or a recorded failure, whichever was accepted first.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Decision {
+    /// The outcome the execution completes with.
+    Selected(TerminalSelection),
+    /// How the execution ended without an outcome.
+    Failed(TerminalFailure),
+}
+
+impl Decision {
+    /// The decision `state` holds, if any. A state holding both, which no
+    /// writer produces, is read as its selection.
+    #[must_use]
+    pub fn of(state: &ExecutionState) -> Option<Self> {
+        state
+            .terminal
+            .clone()
+            .map(Self::Selected)
+            .or_else(|| state.failure.clone().map(Self::Failed))
+    }
 }
 
 /// The execution identities every revision's row records.
@@ -336,25 +362,67 @@ pub struct Checkpoint {
     state: ExecutionState,
     /// The identities its row records.
     row: Arc<StateRow>,
+    /// The memory it is charged, fixed when it is frozen.
+    weight: usize,
     /// The prepared row, or why it cannot be prepared.
     prepared: OnceLock<Result<StagedRow, String>>,
 }
 
 impl Checkpoint {
-    /// Bytes an entry of the state is estimated to hold beyond its JSON
-    /// values.
+    /// Bytes each entry of the state is charged beyond its encoded length,
+    /// for its in-memory structure and its prepared row's per-value overhead.
     const ENTRY_BYTES: usize = 512;
+
+    /// Times its encoded length the state is charged: the frozen state, the
+    /// JSON tree and Variant its preparation builds, and the prepared row
+    /// holding that Variant all hold its values at once.
+    const COPIES: usize = 4;
 
     /// `state` frozen as `revision` of the execution `row` identifies, not
     /// prepared yet.
     #[must_use]
     pub fn new(revision: i64, state: ExecutionState, row: Arc<StateRow>) -> Self {
+        let weight = Self::charge(&state);
         Self {
             revision,
             state,
             row,
+            weight,
             prepared: OnceLock::new(),
         }
+    }
+
+    /// The memory `state` is charged: [`Self::COPIES`] times its compact
+    /// JSON length, which every settlement, captured value, reason, outcome,
+    /// identity, failure, and publication descriptor adds to, plus
+    /// [`Self::ENTRY_BYTES`] per entry.
+    ///
+    /// The length is counted as the state streams into a sink that keeps no
+    /// byte, so the charge follows every retained value without building the
+    /// row its preparation does later on the outbox's encoding pool.
+    // ponytail: a counting pass over the state per revision; charge per-entry deltas if large states make it costly.
+    fn charge(state: &ExecutionState) -> usize {
+        /// A sink counting the bytes written to it.
+        struct Counted(usize);
+        impl std::io::Write for Counted {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                self.0 = self.0.saturating_add(bytes.len());
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let mut counted = Counted(0);
+        // A state that does not encode is refused by its preparation; what
+        // was counted before the error still bounds its memory.
+        let _ = serde_json::to_writer(&mut counted, state);
+        let objects: usize = state.publications.iter().map(|p| p.objects.len()).sum();
+        let entries = 1 + state.invocations.len() + state.publications.len() + objects;
+        counted
+            .0
+            .saturating_mul(Self::COPIES)
+            .saturating_add(Self::ENTRY_BYTES.saturating_mul(entries))
     }
 
     /// A revision whose row is already prepared, such as one written in
@@ -364,6 +432,7 @@ impl Checkpoint {
     pub fn prepared(revision: i64, row: Arc<StateRow>, prepared: StagedRow) -> Self {
         Self {
             revision,
+            weight: prepared.owned_bytes(),
             state: ExecutionState::fresh(),
             row,
             prepared: OnceLock::from(Ok(prepared)),
@@ -376,28 +445,11 @@ impl Checkpoint {
         self.row.execution_id
     }
 
-    /// Memory the outbox charges while the revision waits: the frozen state
-    /// it holds, and so the row it prepares, which grow with its entries and
-    /// its JSON publications' bytes. Stable for the revision's life, so
-    /// admission and release charge the same.
-    // ponytail: estimated from entry counts and JSON bytes without encoding; measure the prepared row if admission undercounts.
+    /// Memory the outbox charges while the revision waits, fixed when it
+    /// was frozen, so admission, every retry, and release charge the same.
     #[must_use]
-    pub fn weight(&self) -> usize {
-        let state = &self.state;
-        let objects: usize = state.publications.iter().map(|p| p.objects.len()).sum();
-        let json: u64 = state
-            .publications
-            .iter()
-            .filter(|p| p.objects.is_empty())
-            .map(|p| p.retained_bytes)
-            .sum();
-        let entries = 1 + state.invocations.len() + state.publications.len() + objects;
-        // A JSON value is held as its tree and its encoded Variant.
-        Self::ENTRY_BYTES.saturating_mul(entries).saturating_add(
-            usize::try_from(json)
-                .unwrap_or(usize::MAX)
-                .saturating_mul(2),
-        )
+    pub const fn weight(&self) -> usize {
+        self.weight
     }
 
     /// The revision's `bifrost.verification.execution_events` row, prepared
@@ -413,6 +465,11 @@ impl Checkpoint {
     }
 
     /// Encodes the state as its revision's row.
+    ///
+    /// # Errors
+    /// Returns the encoding error's message when the state does not encode
+    /// as JSON, or its checkpoint row does not build, such as when the value
+    /// exceeds a Variant bound.
     fn prepare(&self) -> Result<StagedRow, String> {
         let value = serde_json::to_value(&self.state).map_err(|error| error.to_string())?;
         let row = &self.row;
@@ -521,6 +578,93 @@ impl RunState {
         }
     }
 
+    /// Record the terminal decision `pending` owes its execution's state,
+    /// attributed as `attribution`, returning the decision the state holds
+    /// once an accepted revision holds it, waiting at most `until`.
+    ///
+    /// The accepted state is read through `records` first, and a state that
+    /// already decided keeps its decision, so a retried delivery writes
+    /// nothing. Otherwise the decision is recorded by a writer with no lease,
+    /// which never computes, under the identity the state recorded, else the
+    /// exact identity of the execution's queue row and its Cards, which the
+    /// row keeps from being deleted while it exists.
+    ///
+    /// # Errors
+    /// Returns [`StateError::Unavailable`] when the state or the Cards cannot
+    /// be read or Scribe has no capacity, [`StateError::Incompatible`] for a
+    /// state in another format, and [`StateError::Stale`] when the revision
+    /// is refused or unacknowledged.
+    pub async fn deliver(
+        app: &AppState,
+        tenant: DataTenantId,
+        records: &InputResolver<'_>,
+        pending: &PendingDelivery,
+        attribution: Attribution,
+        until: std::time::Duration,
+    ) -> Result<Decision, StateError> {
+        let (revision, state) = Self::accepted(app, tenant, pending.execution_id, records).await?;
+        if let Some(decided) = Decision::of(&state) {
+            return Ok(decided);
+        }
+        let identity = match state.identity.clone() {
+            Some(identity) => identity,
+            None => Self::registered(app, tenant, pending).await?,
+        };
+        let row = StateRow {
+            execution_id: pending.execution_id,
+            verifier_uid: pending.verifier_card_uid.clone(),
+            card_uid: pending.card_uid.clone(),
+            owner_card_uid: pending.owner_card_uid.clone(),
+            run_id: pending.run_id.clone(),
+            deployment_environment: pending.deployment_environment.clone(),
+            attribution,
+            identity,
+        };
+        Self::at(
+            Arc::clone(app.bifrost.scribe_outbox()),
+            tenant,
+            row,
+            tokio::time::Instant::now() + until,
+            None,
+            state,
+            revision,
+        )
+        .fail(pending.status, &pending.error)
+        .await
+    }
+
+    /// The exact identity `pending`'s queue row and its Cards record.
+    ///
+    /// # Errors
+    /// Returns [`StateError::Unavailable`] when a Card cannot be read.
+    async fn registered(
+        app: &AppState,
+        tenant: DataTenantId,
+        pending: &PendingDelivery,
+    ) -> Result<ExecutionIdentity, StateError> {
+        let unavailable =
+            |error: &dyn std::fmt::Display| StateError::Unavailable(error.to_string());
+        let mut conn = app
+            .postgres
+            .wyrd()
+            .tenant_conn(tenant)
+            .await
+            .map_err(|error| unavailable(&error))?;
+        let verifier = get_card_by_uid(&mut conn, &pending.verifier_card_uid)
+            .await
+            .map_err(|error| unavailable(&error))?;
+        let subject = get_card_by_uid(&mut conn, &pending.card_uid)
+            .await
+            .map_err(|error| unavailable(&error))?;
+        Ok(ExecutionIdentity {
+            verifier: exact_ref(&verifier),
+            subject: exact_ref(&subject),
+            deployment_environment: pending.deployment_environment.clone(),
+            group_id: pending.group_id.clone(),
+            owner_card_uid: pending.owner_card_uid.clone(),
+        })
+    }
+
     /// The instant this writer's attempt ends; no revision is awaited past it.
     #[must_use]
     pub fn deadline(&self) -> tokio::time::Instant {
@@ -599,10 +743,10 @@ impl RunState {
         self.held.lock().await.state.clone()
     }
 
-    /// The terminal outcome the state selected, selecting `outcome` with a
-    /// new result identity first when it has none, returned once an
-    /// accepted revision holds it; once selected, every later entry delivers
-    /// the same result.
+    /// The terminal decision the state holds, selecting `outcome` with a
+    /// new result identity first when it holds none, returned once an
+    /// accepted revision holds it. A recorded failure is never superseded:
+    /// once either is decided, every later entry delivers the same decision.
     ///
     /// # Errors
     /// Returns the [`Self::durable`] errors.
@@ -610,29 +754,22 @@ impl RunState {
         &self,
         outcome: &VerificationOutcome,
         started_at: DateTime<Utc>,
-    ) -> Result<TerminalSelection, StateError> {
-        let (selected, ticket) = {
-            let mut held = self.held.lock().await;
-            if let Some(selected) = &held.state.terminal {
-                (selected.clone(), held.changes)
-            } else {
-                let selected = TerminalSelection {
-                    result_id: VerificationResultId::new_v7(),
-                    started_at,
-                    ended_at: Utc::now(),
-                    outcome: outcome.clone(),
-                };
-                held.state.terminal = Some(selected.clone());
-                (selected, held.changed())
-            }
-        };
-        self.durable(ticket).await?;
-        Ok(selected)
+    ) -> Result<Decision, StateError> {
+        self.decide(|| {
+            Decision::Selected(TerminalSelection {
+                result_id: VerificationResultId::new_v7(),
+                started_at,
+                ended_at: Utc::now(),
+                outcome: outcome.clone(),
+            })
+        })
+        .await
     }
 
-    /// Record that the execution ended without an outcome, as `status` with
-    /// `error`, returning once an accepted revision holds it. A state that
-    /// already selected an outcome or recorded a failure keeps it.
+    /// The terminal decision the state holds, recording that the execution
+    /// ended without an outcome, as `status` with `error`, first when it
+    /// holds none, returned once an accepted revision holds it. A selected
+    /// outcome or an earlier failure is kept.
     ///
     /// # Errors
     /// Returns the [`Self::durable`] errors.
@@ -640,21 +777,41 @@ impl RunState {
         &self,
         status: VerificationExecutionStatus,
         error: &VerificationError,
-    ) -> Result<(), StateError> {
-        let ticket = {
+    ) -> Result<Decision, StateError> {
+        self.decide(|| {
+            Decision::Failed(TerminalFailure {
+                status,
+                error: error.clone(),
+                ended_at: Utc::now(),
+            })
+        })
+        .await
+    }
+
+    /// The decision the state holds, else `decision()` recorded as it,
+    /// returned once an accepted revision holds it. The check and the
+    /// change share one memory lock, so two deciders never both decide.
+    ///
+    /// # Errors
+    /// Returns the [`Self::durable`] errors.
+    async fn decide(&self, decision: impl FnOnce() -> Decision) -> Result<Decision, StateError> {
+        let (decided, ticket) = {
             let mut held = self.held.lock().await;
-            if held.state.terminal.is_some() || held.state.failure.is_some() {
-                held.changes
+            if let Some(decided) = Decision::of(&held.state) {
+                (decided, held.changes)
             } else {
-                held.state.failure = Some(TerminalFailure {
-                    status,
-                    error: error.clone(),
-                    ended_at: Utc::now(),
-                });
-                held.changed()
+                let decided = decision();
+                match &decided {
+                    Decision::Selected(selected) => {
+                        held.state.terminal = Some(selected.clone());
+                    }
+                    Decision::Failed(failure) => held.state.failure = Some(failure.clone()),
+                }
+                (decided, held.changed())
             }
         };
-        self.durable(ticket).await
+        self.durable(ticket).await?;
+        Ok(decided)
     }
 
     /// The receipt `call` already holds, when it holds one, once an
@@ -983,7 +1140,7 @@ mod tests {
     use wyrd_spec::verification::execution::VerificationOutcome;
     use wyrd_spec::verification::{TaskId, VerificationVerdict};
 
-    use super::{RunState, StateRow};
+    use super::{Decision, RunState, StateRow};
     use crate::components::gateway::recording::TableGate;
     use crate::scribe_outbox::{ScribeSink, ScribeTable};
 
@@ -1167,9 +1324,53 @@ mod tests {
         scribe.release.add_permits(1);
         let (first, second) = (first.await, second.await);
         assert_eq!(
-            first.expect("selected").result_id,
-            second.expect("selected").result_id
+            first.expect("selected"),
+            second.expect("selected"),
+            "both share one selected result"
         );
+        assert_eq!(revisions(&scribe).len(), 1);
+    }
+
+    /// Proves a recorded failure is the execution's one decision: a later
+    /// selection and a later failure both answer it and record nothing.
+    ///
+    /// # Panics
+    /// Panics when a later decision supersedes the failure or is recorded.
+    #[tokio::test]
+    async fn a_recorded_failure_is_never_superseded() {
+        let (state, scribe) = held_state();
+        scribe.release.add_permits(1);
+        let error = |code: &str| wyrd_spec::verification::VerificationError {
+            code: code.to_owned(),
+            message: code.to_owned(),
+        };
+        let failed = state
+            .fail(
+                wyrd_spec::verification::VerificationExecutionStatus::Errored,
+                &error("engine"),
+            )
+            .await
+            .expect("the failure is accepted");
+        assert!(matches!(failed, Decision::Failed(_)));
+        let outcome = VerificationOutcome {
+            verdict: VerificationVerdict::Passed,
+            requirements: Vec::new(),
+            steps: Vec::new(),
+            evidence: BTreeMap::new(),
+        };
+        let selected = state
+            .select(&outcome, chrono::Utc::now())
+            .await
+            .expect("the decision reads");
+        let refailed = state
+            .fail(
+                wyrd_spec::verification::VerificationExecutionStatus::TimedOut,
+                &error("later"),
+            )
+            .await
+            .expect("the decision reads");
+        assert_eq!((&selected, &refailed), (&failed, &failed));
+        assert!(state.snapshot().await.terminal.is_none());
         assert_eq!(revisions(&scribe).len(), 1);
     }
 

@@ -39,7 +39,7 @@ use wyrd_spec::verification::TaskId;
 use wyrd_spec::verification::execution::{VerificationExecutionState, VerificationRequest};
 use wyrd_spec::verification::{
     DriftWindow, FrozenTarget, GroupEndSettings, OperatorDispatchState, VerificationBindingStatus,
-    VerificationError, VerificationVerdict, VerifierReadiness,
+    VerificationError, VerificationExecutionStatus, VerificationVerdict, VerifierReadiness,
 };
 
 use crate::queries::verification::{BindingSchedule, InactivityTimeout, binding_activity};
@@ -107,7 +107,7 @@ const INSERT_SUBMISSIONS_SQL: &str = r"
         sub_principal_id, act_principal_id, authority, cause_trace_id, cause_span_id,
         idempotency_key, request_sha256, status, error, max_attempts,
         next_attempt_at, settled_at, created_at, updated_at, cause_sampled, group_id,
-        deployment_environment
+        deployment_environment, delivery_due_at
     )
     SELECT r.execution_id, wyrd.current_tenant(), v.card_uid, v.version, s.card_uid,
            'manual', r.run_id,
@@ -117,7 +117,8 @@ const INSERT_SUBMISSIONS_SQL: &str = r"
            CASE WHEN r.error IS NULL THEN statement_timestamp() END,
            CASE WHEN r.error IS NOT NULL THEN statement_timestamp() END,
            statement_timestamp(), statement_timestamp(), r.cause_sampled, r.group_id,
-           r.deployment_environment
+           r.deployment_environment,
+           CASE WHEN r.error IS NOT NULL THEN statement_timestamp() END
       FROM unnest($1::uuid[], $2::uuid[], $3::uuid[], $4::text[], $5::uuid[],
                   $6::uuid[], $7::jsonb[], $8::bytea[], $9::bytea[], $10::text[],
                   $11::bytea[], $12::jsonb[], $13::bool[], $14::text[], $16::text[])
@@ -305,12 +306,13 @@ const INSERT_GROUP_ERROR_SQL: &str = r"
         execution_id, data_tenant_id, verifier_card_uid, verifier_version, card_uid,
         origin, owner_card_uid, binding_id, trigger_uid, trigger_digest, operators,
         group_id, sub_principal_id, act_principal_id, status, error, max_attempts,
-        created_at, updated_at, settled_at
+        created_at, updated_at, settled_at, delivery_due_at
     )
     SELECT $1, wyrd.current_tenant(), b.verifier_card_uid, v.version, b.card_uid,
            'group', b.owner_card_uid, b.binding_id, b.trigger_uid, b.trigger_digest,
            b.operators, $3, $4, $5, 'errored', $6, $7,
-           statement_timestamp(), statement_timestamp(), statement_timestamp()
+           statement_timestamp(), statement_timestamp(), statement_timestamp(),
+           statement_timestamp()
       FROM wyrd.verification_bindings b
       JOIN wyrd.cards v ON v.card_uid = b.verifier_card_uid
      WHERE b.binding_id = $2
@@ -579,12 +581,13 @@ const RETRY_SQL: &str = r"
     RETURNING next_attempt_at
 ";
 
-/// Settle a leased execution in a terminal non-completed status.
+/// Settle a leased execution in a terminal non-completed status, its
+/// delivery due at once.
 const TERMINATE_SQL: &str = r"
     UPDATE wyrd.verifier_executions
        SET status = $3, error = $4, lease_expires_at = NULL,
            next_attempt_at = NULL, settled_at = statement_timestamp(),
-           updated_at = statement_timestamp()
+           delivery_due_at = statement_timestamp(), updated_at = statement_timestamp()
      WHERE execution_id = $1 AND lease_token = $2 AND status = 'running'
 ";
 
@@ -603,22 +606,51 @@ const RELEASE_SQL: &str = r"
 ///
 /// Clearing the lease and leaving `running` fences the worker holding it: every
 /// later write it attempts is fenced on `status = 'running'` and its lease.
+/// Its delivery is due at once.
 const CANCEL_SQL: &str = r"
     UPDATE wyrd.verifier_executions
        SET status = 'cancelled', error = $2, lease_expires_at = NULL,
            next_attempt_at = NULL, settled_at = statement_timestamp(),
-           updated_at = statement_timestamp()
+           delivery_due_at = statement_timestamp(), updated_at = statement_timestamp()
      WHERE execution_id = $1 AND status IN ('pending', 'retrying', 'running')
+    RETURNING execution_id, status, error, verifier_card_uid, card_uid, owner_card_uid,
+              authority, group_id, run_id, deployment_environment, sub_principal_id
 ";
 
-/// Cancel every unfinished execution a principal submitted or accepted.
+/// Cancel every unfinished execution a principal submitted or accepted, each
+/// delivery due at once.
 const CANCEL_PRINCIPAL_SQL: &str = r"
     UPDATE wyrd.verifier_executions
        SET status = 'cancelled', error = $2, lease_expires_at = NULL,
            next_attempt_at = NULL, settled_at = statement_timestamp(),
-           updated_at = statement_timestamp()
+           delivery_due_at = statement_timestamp(), updated_at = statement_timestamp()
      WHERE (sub_principal_id = $1 OR act_principal_id = $1)
        AND status IN ('pending', 'retrying', 'running')
+";
+
+/// Claim up to `$2` due terminal deliveries of `worker_format` at most `$3`,
+/// each moved `$1` milliseconds ahead on the database clock, so a claimant
+/// that dies leaves it due again once that lease passes.
+const CLAIM_DELIVERIES_SQL: &str = r"
+    UPDATE wyrd.verifier_executions e
+       SET delivery_due_at = statement_timestamp() + ($1::bigint * INTERVAL '1 millisecond')
+      FROM (SELECT execution_id FROM wyrd.verifier_executions
+             WHERE delivery_due_at <= statement_timestamp() AND worker_format <= $3
+             ORDER BY delivery_due_at, execution_id
+             LIMIT $2
+               FOR UPDATE SKIP LOCKED) due
+     WHERE e.execution_id = due.execution_id
+    RETURNING e.execution_id, e.status, e.error, e.verifier_card_uid, e.card_uid,
+              e.owner_card_uid, e.authority, e.group_id, e.run_id,
+              e.deployment_environment, e.sub_principal_id
+";
+
+/// Make an owed terminal delivery due again `$2` milliseconds from now, or
+/// retire it once delivered when `$2` is null.
+const RESCHEDULE_DELIVERY_SQL: &str = r"
+    UPDATE wyrd.verifier_executions
+       SET delivery_due_at = statement_timestamp() + ($2::bigint * INTERVAL '1 millisecond')
+     WHERE execution_id = $1 AND delivery_due_at IS NOT NULL
 ";
 
 /// Which of principals `$1` are no longer active, read once every listed
@@ -683,6 +715,8 @@ const BINDING_TARGETS_SQL: &str = r"
 /// probe is not repeated for the filter and the order. A scan therefore costs
 /// the tenants with queued or running work and never the rows they hold;
 /// grouping the claimable rows instead read the whole backlog every round.
+/// Tenants owing a due terminal delivery join through the partial index of
+/// owed deliveries, which holds no settled history.
 const RUNNABLE_TENANTS_SQL: &str = r"
     WITH RECURSIVE queued(tenant) AS (
         (SELECT data_tenant_id FROM wyrd.verifier_executions
@@ -719,10 +753,18 @@ const RUNNABLE_TENANTS_SQL: &str = r"
                 UNION
                 SELECT tenant FROM leased WHERE tenant IS NOT NULL) AS t
     )
+    ), delivering AS (
+        SELECT data_tenant_id AS tenant, min(delivery_due_at) AS since
+          FROM wyrd.verifier_executions
+         WHERE delivery_due_at <= statement_timestamp()
+         GROUP BY data_tenant_id
+    )
     SELECT tenant
-      FROM waiting
-     WHERE since IS NOT NULL
-     ORDER BY since, tenant
+      FROM (SELECT tenant, since FROM waiting WHERE since IS NOT NULL
+            UNION ALL
+            SELECT tenant, since FROM delivering) AS due
+     GROUP BY tenant
+     ORDER BY min(since), tenant
 ";
 
 /// List tenants with due scheduled bindings, most overdue tenant first.
@@ -1642,6 +1684,37 @@ impl TerminalStatus {
             Self::Errored => "errored",
         }
     }
+}
+
+/// A terminal execution whose decision its retained state does not hold yet,
+/// claimed by [`VerifierExecutionQueue::claim_deliveries`].
+///
+/// It carries only the sanitized decision and the immutable identities its
+/// queue row froze at admission; a refused group execution carries no
+/// accepted inputs or authority.
+#[derive(Debug, Clone, PartialEq)]
+pub struct PendingDelivery {
+    /// The execution.
+    pub execution_id: ExecutionId,
+    /// Its terminal status: `cancelled`, `timed_out`, or `errored`.
+    pub status: VerificationExecutionStatus,
+    /// The public error it settled with.
+    pub error: VerificationError,
+    /// Exact Verifier Card UID.
+    pub verifier_card_uid: CardUid,
+    /// Exact Card verified.
+    pub card_uid: CardUid,
+    /// The owner Service: the binding owner, else the accepted caller's
+    /// owning root; `None` when neither exists.
+    pub owner_card_uid: Option<CardUid>,
+    /// Caller group, or the group a group execution judges.
+    pub group_id: Option<GroupId>,
+    /// The application Run judged, when there is one.
+    pub run_id: Option<RunId>,
+    /// The accepted deployment environment tag.
+    pub deployment_environment: Option<String>,
+    /// The subject the execution serves.
+    pub sub_principal_id: PrincipalId,
 }
 
 /// One execution's status read, with the identities the caller authorizes on.
@@ -3073,7 +3146,8 @@ impl VerifierExecutionQueue {
     /// Settle a claimed execution in a terminal status with no verdict.
     ///
     /// `cancelled`, `timed_out`, and `errored` executions record `error`,
-    /// point at no result, and never dispatch an Operator.
+    /// point at no result, and never dispatch an Operator. The execution
+    /// owes its decision to its retained state until [`Self::delivered`].
     ///
     /// # Errors
     /// Returns the database error when the update fails.
@@ -3132,30 +3206,32 @@ impl VerifierExecutionQueue {
     /// The execution settles `cancelled` with no result and keeps its
     /// recorded state. A worker holding its lease is fenced: its renewal and
     /// settlement report [`Settlement::StaleLease`], and a lease confirmation
-    /// before each state revision stops it. Cancelling a settled or
+    /// before each state revision stops it. The cancellation is owed to the
+    /// retained state until [`Self::delivered`]. Cancelling a settled or
     /// unknown execution writes nothing, so repeating a cancel is harmless.
-    /// Returns whether this call cancelled it. The caller authorizes first
-    /// and commits.
+    /// Returns the delivery this call cancelled it with, or `None` when it
+    /// cancelled nothing. The caller authorizes first and commits.
     ///
     /// # Errors
-    /// Returns the database error when the update fails.
+    /// Returns the database error when the update fails, or a decode error
+    /// when the cancelled row's identity is malformed.
     #[tracing::instrument(skip(self, conn), fields(operation = "verification.executions.cancel", execution_id = %execution))]
     pub async fn cancel(
         &self,
         conn: &mut TenantConn<'_>,
         execution: ExecutionId,
-    ) -> Result<bool, SqlxError> {
+    ) -> Result<Option<PendingDelivery>, SqlxError> {
         timed("cancel", async {
             let error = VerificationError {
                 code: "cancelled".to_owned(),
                 message: "the execution was cancelled".to_owned(),
             };
-            let result = sqlx::query(CANCEL_SQL)
+            let row: Option<DeliveryRow> = sqlx::query_as(CANCEL_SQL)
                 .bind(execution.as_uuid())
                 .bind(Json(&error))
-                .execute(&mut **conn.transaction())
+                .fetch_optional(&mut **conn.transaction())
                 .await?;
-            Ok(result.rows_affected() > 0)
+            row.map(DeliveryRow::into_pending).transpose()
         })
         .await
     }
@@ -3165,8 +3241,8 @@ impl VerifierExecutionQueue {
     ///
     /// Runs on the revocation's own connection so the suspension and the
     /// cancellations commit together; each settles `cancelled` with the
-    /// `principal_revoked` code and fences its worker as [`Self::cancel`]
-    /// does. Returns how many executions were cancelled.
+    /// `principal_revoked` code, fences its worker, and owes its delivery as
+    /// [`Self::cancel`] does. Returns how many executions were cancelled.
     ///
     /// # Errors
     /// Returns the database error when the update fails.
@@ -3187,6 +3263,84 @@ impl VerifierExecutionQueue {
                 .execute(&mut **conn.transaction())
                 .await?;
             Ok(result.rows_affected())
+        })
+        .await
+    }
+
+    /// Claim up to `limit` of the tenant's due terminal deliveries, each
+    /// leased for `lease_for` on the database clock.
+    ///
+    /// A terminal execution without a verdict owes its decision to its
+    /// retained state from the moment its status commits until
+    /// [`Self::delivered`] retires the delivery. A claim only moves the
+    /// delivery one lease ahead, so a claimant that dies leaves it due
+    /// again; delivering twice records one decision. An execution of a newer
+    /// worker format is left for a worker that understands its state. Claims
+    /// compute nothing, evaluate no permission, and write no audit.
+    ///
+    /// # Errors
+    /// Returns the database error when the statement fails, or a decode error
+    /// when a claimed row's identity, status, or error is malformed.
+    pub async fn claim_deliveries(
+        &self,
+        conn: &mut TenantConn<'_>,
+        lease_for: Duration,
+        limit: u32,
+    ) -> Result<Vec<PendingDelivery>, SqlxError> {
+        timed("claim_deliveries", async {
+            let rows: Vec<DeliveryRow> = sqlx::query_as(CLAIM_DELIVERIES_SQL)
+                .bind(lease_for.num_milliseconds())
+                .bind(i64::from(limit))
+                .bind(WORKER_FORMAT)
+                .fetch_all(&mut **conn.transaction())
+                .await?;
+            rows.into_iter().map(DeliveryRow::into_pending).collect()
+        })
+        .await
+    }
+
+    /// Retire `execution`'s owed terminal delivery once its decision is
+    /// acknowledged in its retained state. Returns whether a delivery was
+    /// owed; retiring again changes nothing.
+    ///
+    /// # Errors
+    /// Returns the database error when the update fails.
+    #[tracing::instrument(skip(self, conn), fields(operation = "verification.executions.delivered", execution_id = %execution))]
+    pub async fn delivered(
+        &self,
+        conn: &mut TenantConn<'_>,
+        execution: ExecutionId,
+    ) -> Result<bool, SqlxError> {
+        timed("delivered", async {
+            let result = sqlx::query(RESCHEDULE_DELIVERY_SQL)
+                .bind(execution.as_uuid())
+                .bind(None::<i64>)
+                .execute(&mut **conn.transaction())
+                .await?;
+            Ok(result.rows_affected() > 0)
+        })
+        .await
+    }
+
+    /// Make `execution`'s owed terminal delivery due again `delay` after the
+    /// database's statement time, because recording it failed for now.
+    ///
+    /// # Errors
+    /// Returns the database error when the update fails.
+    #[tracing::instrument(skip(self, conn), fields(operation = "verification.executions.redeliver", execution_id = %execution))]
+    pub async fn redeliver(
+        &self,
+        conn: &mut TenantConn<'_>,
+        execution: ExecutionId,
+        delay: Duration,
+    ) -> Result<(), SqlxError> {
+        timed("redeliver", async {
+            sqlx::query(RESCHEDULE_DELIVERY_SQL)
+                .bind(execution.as_uuid())
+                .bind(Some(delay.num_milliseconds()))
+                .execute(&mut **conn.transaction())
+                .await?;
+            Ok(())
         })
         .await
     }
@@ -3584,6 +3738,70 @@ struct ClaimedRow {
     remaining_ms: i64,
     /// The Verifier's ready fitted baselines by requirement; `None` when none.
     fitted_baselines: Option<Json<BTreeMap<TaskId, Value>>>,
+}
+
+/// Raw columns of one claimed terminal delivery.
+#[derive(sqlx::FromRow)]
+struct DeliveryRow {
+    /// Execution identity.
+    execution_id: Uuid,
+    /// Stored terminal status.
+    status: String,
+    /// Settled error.
+    error: Option<Json<VerificationError>>,
+    /// Verifier Card UID.
+    verifier_card_uid: Uuid,
+    /// Verified Card UID.
+    card_uid: Uuid,
+    /// Binding owner.
+    owner_card_uid: Option<Uuid>,
+    /// Accepted authority; `None` for refused group work.
+    authority: Option<Json<AcceptedAuthority>>,
+    /// Caller or judged group.
+    group_id: Option<String>,
+    /// Application Run judged.
+    run_id: Option<String>,
+    /// Accepted deployment environment tag.
+    deployment_environment: Option<String>,
+    /// Subject principal.
+    sub_principal_id: Uuid,
+}
+
+impl DeliveryRow {
+    /// Convert raw columns into a typed delivery.
+    ///
+    /// # Errors
+    /// Returns [`SqlxError::Decode`] when an identity is malformed, the
+    /// status carries a verdict, or no error was settled.
+    fn into_pending(self) -> Result<PendingDelivery, SqlxError> {
+        let status: VerificationExecutionStatus = stored(self.status.parse())?;
+        let Some(Json(error)) = self.error else {
+            return Err(SqlxError::Decode(
+                "an owed terminal delivery has no settled error".into(),
+            ));
+        };
+        let owner = match self.owner_card_uid {
+            Some(uid) => Some(stored(CardUid::from_uuid(uid))?),
+            None => self
+                .authority
+                .and_then(|Json(authority)| authority.owning_root().cloned()),
+        };
+        Ok(PendingDelivery {
+            execution_id: stored(ExecutionId::new(self.execution_id))?,
+            status,
+            error,
+            verifier_card_uid: stored(CardUid::from_uuid(self.verifier_card_uid))?,
+            card_uid: stored(CardUid::from_uuid(self.card_uid))?,
+            owner_card_uid: owner,
+            group_id: self
+                .group_id
+                .map(|id| stored(GroupId::new(id)))
+                .transpose()?,
+            run_id: self.run_id.map(RunId::from_string),
+            deployment_environment: self.deployment_environment,
+            sub_principal_id: PrincipalId::new(self.sub_principal_id),
+        })
+    }
 }
 
 impl ClaimedRow {

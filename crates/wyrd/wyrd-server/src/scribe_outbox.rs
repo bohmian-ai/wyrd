@@ -75,8 +75,7 @@ use uuid::Uuid;
 use vala_bifrost_redux::catalog::TableRef;
 use vala_bifrost_redux::cluster::ClusterRegistry;
 use vala_bifrost_redux::contracts::{
-    CanonicalIngress, IngressPayload, Scribe, ScribeError, ScribeIngressFrame, ScribeStateAdvance,
-    StampedAttribution,
+    CanonicalIngress, IngressPayload, Scribe, ScribeError, ScribeIngressFrame, StampedAttribution,
 };
 use vala_bifrost_redux::gate::attribution::{CardRegistry, batch_card_uids, native_card_uids};
 use vala_bifrost_redux::namespaces::BifrostNamespace;
@@ -106,11 +105,12 @@ use wyrd_tonic::otlp::trace::v1::ResourceSpans;
 use wyrd_tonic::prost::Message as _;
 use wyrd_tonic::tonic::Code;
 use wyrd_tonic::tonic::transport::Channel;
+use wyrd_tonic::wyrd::v1::IngestCaptureRequest;
 use wyrd_tonic::wyrd::v1::scribe_capture_peer_service_client::ScribeCapturePeerServiceClient;
-use wyrd_tonic::wyrd::v1::{IngestCaptureRequest, IngestCaptureState};
 
 use crate::components::gateway::CallCapture;
-use crate::verification::results::{ResultPayload, ResultRow};
+use crate::verification::results::{ResultPayload, ResultRow, checkpoint_schema};
+use crate::verification::state::Checkpoint;
 use crate::verification::submissions::{Queued, SubmissionSink};
 
 /// The process's one non-blocking outbox for every Scribe-bound write.
@@ -268,19 +268,18 @@ pub enum ScribeWrite {
     ///
     /// The revision is its own frame and its own Scribe batch, identified by
     /// `batch` rather than by the slice, so every submission of it carries
-    /// one identity and Scribe's batch-id dedup absorbs a resubmission. The
-    /// batch carries `state`, so Scribe accepts it only from the state's
-    /// current writer at exactly the next revision; other executions'
-    /// revisions in the slice keep their own acceptance.
+    /// one identity and Scribe's batch-id dedup absorbs a resubmission; a
+    /// different revision under the same identity is refused as a batch
+    /// conflict. Other executions' revisions in the slice keep their own
+    /// acceptance.
     ExecutionState {
         /// The revision's batch identity.
         batch: Uuid,
-        /// The revision's row.
-        row: StagedRow,
+        /// The frozen revision, whose row the writer prepares as it encodes
+        /// the revision's frame.
+        checkpoint: Arc<Checkpoint>,
         /// The execution's subject and actor, which Scribe stamps on the row.
         attribution: Attribution,
-        /// The writer's claim to advance the state to this revision.
-        state: ScribeStateAdvance,
         /// Fired once Scribe accepts the revision's own frame, without waiting
         /// for the slice's other frames, and only then; a refused,
         /// unprojectable, or dropped write drops the sender instead.
@@ -336,6 +335,9 @@ enum Part {
     Row(StagedRow),
     /// Rows a capture or span projection built.
     Batch(RecordBatch),
+    /// One execution state revision, prepared as its staged row when its
+    /// chunk is encoded.
+    Checkpoint(Arc<Checkpoint>),
 }
 
 impl Part {
@@ -344,22 +346,24 @@ impl Part {
         match self {
             Self::Row(row) => row.schema(),
             Self::Batch(batch) => batch.schema_ref(),
+            Self::Checkpoint(_) => checkpoint_schema(),
         }
     }
 
     /// How many rows this part holds.
     fn num_rows(&self) -> usize {
         match self {
-            Self::Row(_) => 1,
+            Self::Row(_) | Self::Checkpoint(_) => 1,
             Self::Batch(batch) => batch.num_rows(),
         }
     }
 
-    /// Memory the part holds: a staged row's values, or a batch's retained
-    /// Arrow bytes.
+    /// Memory the part holds: a staged row's values, a batch's retained
+    /// Arrow bytes, or a revision's [`Checkpoint::weight`].
     fn bytes(&self) -> usize {
         match self {
             Self::Row(row) => row.owned_bytes(),
+            Self::Checkpoint(checkpoint) => checkpoint.weight(),
             Self::Batch(batch) => {
                 wyrd_queue::retained_bytes(batch).unwrap_or_else(|| batch.get_array_memory_size())
             }
@@ -368,23 +372,29 @@ impl Part {
 
     /// The one batch holding `parts`' rows in order, which share one schema.
     ///
-    /// A run of staged rows is built straight into one dense batch, each
-    /// column allocated once; a lone batch is shared, and several batches
-    /// are concatenated. Staged-row and batch destinations never overlap, so
-    /// a frame never mixes the two.
+    /// A run of staged rows, with each revision prepared as its row, is
+    /// built straight into one dense batch, each column allocated once; a
+    /// lone batch is shared, and several batches are concatenated. Staged-row
+    /// and batch destinations never overlap, so a frame never mixes the two.
     ///
     /// # Errors
     ///
-    /// Returns the Arrow error when the rows cannot be built, the batches
-    /// cannot be concatenated, or staged rows are mixed with batches.
+    /// Returns the Arrow error when a revision cannot be prepared, the rows
+    /// cannot be built, the batches cannot be concatenated, or staged rows
+    /// are mixed with batches.
     fn dense(parts: &[Self]) -> Result<RecordBatch, arrow::error::ArrowError> {
         let staged = parts
             .iter()
             .map(|part| match part {
-                Self::Row(row) => Some(row.clone()),
-                Self::Batch(_) => None,
+                Self::Row(row) => Ok(Some(row.clone())),
+                Self::Checkpoint(checkpoint) => {
+                    checkpoint.row().cloned().map(Some).map_err(|error| {
+                        arrow::error::ArrowError::InvalidArgumentError(error.to_owned())
+                    })
+                }
+                Self::Batch(_) => Ok(None),
             })
-            .collect::<Option<Vec<_>>>();
+            .collect::<Result<Option<Vec<_>>, _>>()?;
         if let Some(rows) = staged {
             return StagedRow::project(&rows);
         }
@@ -394,9 +404,11 @@ impl Part {
         let batches = parts
             .iter()
             .map(|part| match part {
-                Self::Row(_) => Err(arrow::error::ArrowError::InvalidArgumentError(
-                    "a frame mixes staged rows with batches".to_owned(),
-                )),
+                Self::Row(_) | Self::Checkpoint(_) => {
+                    Err(arrow::error::ArrowError::InvalidArgumentError(
+                        "a frame mixes staged rows with batches".to_owned(),
+                    ))
+                }
                 Self::Batch(batch) => Ok(batch.clone()),
             })
             .collect::<Result<Vec<_>, _>>()?;
@@ -474,11 +486,13 @@ impl ScribeWrite {
                 part: Part::Row(row.clone()),
             }]),
             Self::ExecutionState {
-                row, attribution, ..
+                checkpoint,
+                attribution,
+                ..
             } => Ok(vec![Rows {
                 table: ScribeTable::ExecutionEvents,
                 attribution: *attribution,
-                part: Part::Row(row.clone()),
+                part: Part::Checkpoint(Arc::clone(checkpoint)),
             }]),
         }
     }
@@ -737,9 +751,6 @@ pub(crate) struct ScribeBatch {
     pub(crate) batch_id: Uuid,
     /// Request the frame is admitted under.
     pub(crate) request_id: RequestId,
-    /// The keyed state advance Scribe accepts the batch under; `None` for
-    /// every table that is not state-fenced.
-    pub(crate) state: Option<ScribeStateAdvance>,
     /// The rows; every row but an audit decision carries the subject and
     /// actor Scribe stamps on it.
     pub(crate) payload: FramePayload,
@@ -803,7 +814,6 @@ impl ScribeBatch {
             table: self.table.table_ref(),
             expected_schema_fingerprint: None,
             table_version: None,
-            state: self.state,
             request_id: self.request_id,
             batch_id: self.batch_id,
             measured_wire_bytes,
@@ -910,12 +920,6 @@ impl ScribePeers {
                 batch_id: batch.batch_id.to_string(),
                 request_id: batch.request_id.as_str().to_owned(),
                 arrow_ipc: ipc.clone(),
-                state: batch.state.map(|state| IngestCaptureState {
-                    key: state.key.to_string(),
-                    writer: state.writer.to_string(),
-                    revision: state.revision,
-                    not_after_unix_micros: state.not_after.map(|at| at.timestamp_micros()),
-                }),
             })
             .await
             .map(|_| ())
@@ -1180,8 +1184,6 @@ struct Frame {
     /// replaces the slice's idempotency key and position in its batch ids;
     /// `None` for a frame shared by the slice's writes.
     key: Option<Uuid>,
-    /// The keyed state advance a one-write frame carries; `None` otherwise.
-    state: Option<ScribeStateAdvance>,
     /// Destination table.
     table: ScribeTable,
     /// The rows, all of one schema.
@@ -1209,7 +1211,6 @@ impl Frame {
             }
             None => frames.push(Self {
                 key: None,
-                state: None,
                 table,
                 parts: vec![part],
                 owners,
@@ -1231,7 +1232,6 @@ impl Frame {
     fn chunk(&self, first: usize, rows: usize, parts: Vec<Part>) -> Chunk {
         Chunk {
             table: self.table,
-            state: self.state,
             parts,
             owners: self.owners[first..first + rows].to_vec(),
         }
@@ -1266,17 +1266,15 @@ impl ScribeSink {
             }
             if let ScribeWrite::ExecutionState {
                 batch,
-                row,
+                checkpoint,
                 attribution,
-                state,
                 ..
             } = item
             {
                 frames.push(Frame {
                     key: Some(*batch),
-                    state: Some(*state),
                     table: ScribeTable::ExecutionEvents,
-                    parts: vec![Part::Row(row.clone())],
+                    parts: vec![Part::Checkpoint(Arc::clone(checkpoint))],
                     owners: vec![(index, *attribution)],
                 });
                 continue;
@@ -1373,8 +1371,6 @@ impl ScribeSink {
 struct Chunk {
     /// Destination table.
     table: ScribeTable,
-    /// The keyed state advance the chunk's batch carries.
-    state: Option<ScribeStateAdvance>,
     /// The staged rows and projected batches holding the chunk's rows, in
     /// row order.
     parts: Vec<Part>,
@@ -1557,20 +1553,7 @@ impl Chunk {
         start: usize,
         payload: FramePayload,
     ) -> ScribeBatch {
-        let mut digest = Sha256::new();
-        digest.update(b"wyrd.scribe.outbox.batch-id.v2");
-        digest.update(tenant.as_uuid().as_bytes());
-        digest.update(self.table.fqn().as_bytes());
-        digest.update(slice.as_bytes());
-        for place in [frame, chunk, start] {
-            digest.update((place as u64).to_le_bytes());
-        }
-        let digest: [u8; 32] = digest.finalize().into();
-        let mut bytes = [0_u8; 16];
-        bytes.copy_from_slice(&digest[..16]);
-        bytes[6] = (bytes[6] & 0x0f) | 0x70;
-        bytes[8] = (bytes[8] & 0x3f) | 0x80;
-        let batch_id = Uuid::from_bytes(bytes);
+        let batch_id = batch_id(tenant, self.table, (slice, frame, chunk), start);
         let request_id =
             RequestId::parse(&batch_id.to_string()).expect("a UUIDv7 batch id is a request id");
         ScribeBatch {
@@ -1578,10 +1561,41 @@ impl Chunk {
             table: self.table,
             batch_id,
             request_id,
-            state: self.state,
             payload,
         }
     }
+}
+
+/// The Scribe batch id of the rows from `start` of chunk `chunk` of frame
+/// `frame` of `tenant`'s slice or write key `slice` for `table`, carrying
+/// `UUIDv7` version and variant bits.
+fn batch_id(
+    tenant: DataTenantId,
+    table: ScribeTable,
+    (slice, frame, chunk): Origin,
+    start: usize,
+) -> Uuid {
+    let mut digest = Sha256::new();
+    digest.update(b"wyrd.scribe.outbox.batch-id.v2");
+    digest.update(tenant.as_uuid().as_bytes());
+    digest.update(table.fqn().as_bytes());
+    digest.update(slice.as_bytes());
+    for place in [frame, chunk, start] {
+        digest.update((place as u64).to_le_bytes());
+    }
+    let digest: [u8; 32] = digest.finalize().into();
+    let mut bytes = [0_u8; 16];
+    bytes.copy_from_slice(&digest[..16]);
+    bytes[6] = (bytes[6] & 0x0f) | 0x70;
+    bytes[8] = (bytes[8] & 0x3f) | 0x80;
+    Uuid::from_bytes(bytes)
+}
+
+/// The Scribe batch id, and so the batch fence, under which `tenant`'s
+/// execution state revision staged with batch identity `key` is written: a
+/// revision is its own one-row frame and chunk.
+pub(crate) fn revision_batch_id(tenant: DataTenantId, key: Uuid) -> Uuid {
+    batch_id(tenant, ScribeTable::ExecutionEvents, (key, 0, 0), 0)
 }
 
 impl ScribeSink {
@@ -1773,6 +1787,7 @@ impl OutboxSink for ScribeSink {
     /// order. Server spans take lane 0. No reader relies on cross-batch commit
     /// order: group lists order by the recorded input time or a declared key.
     fn lane(item: &ScribeWrite) -> u64 {
+        let execution;
         let key = match item {
             ScribeWrite::Capture(capture) => Some(capture.request_id()),
             ScribeWrite::Audit(Some(row)) => row.text(WYRD_REQUEST_ID),
@@ -1786,7 +1801,10 @@ impl OutboxSink for ScribeSink {
             } => return SubmissionSink::admission_lane(&queued.admission),
             ScribeWrite::ExecutionInputs { row, .. } => row.row.text("execution_id"),
             ScribeWrite::Object { row, .. } => row.text("storage_path"),
-            ScribeWrite::ExecutionState { row, .. } => row.text("execution_id"),
+            ScribeWrite::ExecutionState { checkpoint, .. } => {
+                execution = checkpoint.execution_id().to_string();
+                Some(execution.as_str())
+            }
             ScribeWrite::Audit(None) | ScribeWrite::ServerSpans { .. } => None,
         };
         key.map_or(0, |key| {
@@ -1808,9 +1826,8 @@ impl OutboxSink for ScribeSink {
                 payload.rows().iter().map(ResultRow::owned_bytes).sum()
             }
             ScribeWrite::ExecutionInputs { row, .. } => row.owned_bytes(),
-            ScribeWrite::Object { row, .. } | ScribeWrite::ExecutionState { row, .. } => {
-                row.owned_bytes()
-            }
+            ScribeWrite::Object { row, .. } => row.owned_bytes(),
+            ScribeWrite::ExecutionState { checkpoint, .. } => checkpoint.weight(),
             ScribeWrite::ServerSpans { spans, .. } => spans.encoded_len(),
         }
     }
@@ -2294,44 +2311,27 @@ mod tests {
 
     /// One revision of `execution_id`'s state, and the receiver its
     /// acceptance fires.
-    ///
-    /// # Panics
-    ///
-    /// Panics when the revision does not build.
     fn execution_state(
         execution_id: ExecutionId,
     ) -> (ScribeWrite, tokio::sync::oneshot::Receiver<()>) {
-        let (verifier, subject, now) = (uid(), uid(), Utc::now());
-        let row = ResultPayloadBuilder::new(
-            ResultRun {
-                execution_id,
-                run_id: None,
-                verifier_version: "",
-                card_uid: &subject,
-                owner_card_uid: None,
-                group_id: None,
-                deployment_environment: None,
-                binding_id: None,
-                trigger: None,
-                window: None,
-            },
-            &verifier,
-            now,
-            now,
-        )
-        .checkpoint(1, false, &serde_json::json!({}))
-        .expect("a revision builds");
+        let row = crate::verification::state::StateRow {
+            execution_id,
+            verifier_uid: uid(),
+            card_uid: uid(),
+            owner_card_uid: None,
+            run_id: None,
+            deployment_environment: None,
+            attribution: background(),
+        };
         let (sender, acked) = tokio::sync::oneshot::channel();
         let write = ScribeWrite::ExecutionState {
             batch: uuid::Uuid::now_v7(),
-            row: row.row,
+            checkpoint: Arc::new(crate::verification::state::Checkpoint::new(
+                1,
+                wyrd_spec::verification::state::ExecutionState::fresh(),
+                Arc::new(row),
+            )),
             attribution: background(),
-            state: vala_bifrost_redux::contracts::ScribeStateAdvance {
-                key: execution_id.as_uuid(),
-                writer: uuid::Uuid::now_v7(),
-                revision: 1,
-                not_after: None,
-            },
             acked: Mutex::new(Some(sender)),
         };
         (write, acked)

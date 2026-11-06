@@ -2,7 +2,8 @@
 //! of every Verifier execution, one row per accepted revision.
 //!
 //! Owns the table's authored schema and physical layout only; the server
-//! writes each revision through Scribe as a state-fenced write.
+//! writes each revision through Scribe under a batch id derived from its
+//! execution and revision.
 
 use arrow::datatypes::Field;
 
@@ -17,9 +18,11 @@ use wyrd_spec::vala::api::PhysicalLayoutWire;
 /// `bifrost.verification.execution_events` — one row per accepted revision
 /// of one execution's recoverable state.
 ///
-/// The table is state-fenced: `execution_id` is the state key and `sequence`
-/// its revision, so a row exists only once Scribe accepted that revision from
-/// the execution's current writer, and replay never restores a refused one.
+/// `execution_id` is the state key and `sequence` its revision. Each
+/// revision is written under a batch id derived from both, so the first
+/// accepted batch keeps the revision, a second writer's different rows for it
+/// are refused as a batch conflict, and its durable batch fence names the
+/// revision as accepted whether or not a query can see the row yet.
 /// `event` is `checkpoint`, `status` the execution status the revision
 /// records, and [`VALUE`] the complete versioned logical state: pinned
 /// inputs, attempts, settlements, accepted publications with their exact
@@ -43,8 +46,8 @@ impl DomainTable for ExecutionEventsTable {
     const PAYLOAD_CLASS: PayloadClass = PayloadClass::Sensitive;
     /// The value column gated behind the elevated payload permission.
     const SENSITIVE_PAYLOAD_COLUMNS: &'static [&'static str] = &[VALUE];
-    /// Each row is one accepted revision of an execution's state.
-    const STATE_FENCED: bool = true;
+    /// A revision is accepted only once its batch fence commits.
+    const FENCED_ONLY: bool = true;
 
     /// Authored columns in order; managed correlation and system columns are appended by the catalog.
     fn arrow_fields() -> Vec<Field> {

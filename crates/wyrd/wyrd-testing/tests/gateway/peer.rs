@@ -163,7 +163,6 @@ async fn submit_partial_resolved_model(
             batch_id: uuid::Uuid::now_v7().to_string(),
             request_id: RequestId::now_v7().as_str().to_owned(),
             arrow_ipc: writer.into_inner()?.into(),
-            state: None,
         })
         .await
         .err()

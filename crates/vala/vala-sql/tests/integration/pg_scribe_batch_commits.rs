@@ -3,13 +3,14 @@
 //! Tests verify:
 //! - one statement inserts a whole tenant group and one read classifies its
 //!   conflicts, in offered order, even when a batch id repeats across tables
-//! - a contradiction rolls back the group's fresh fences and never resolves
+//! - different rows under a spent batch id are a per-batch conflict, and a
+//!   caller dropping the transaction keeps none of the group's fresh fences
 //! - a changed batch under another version reports that version, so its
 //!   caller can roll back the fresh fences before comparing it
 //! - uncertain-commit resolution classifies a whole offered set in one read
 //! - a fence offered for another tenant is refused
-//! - a keyed-state write is accepted with its fence only from the claimed
-//!   writer at the next revision, and a claim answers the accepted position
+//! - a durable-fence lookup names exactly the offered batch ids that hold a
+//!   fence on their table
 
 mod pg_tests {
     use std::sync::{Mutex, OnceLock};
@@ -21,10 +22,8 @@ mod pg_tests {
     use uuid::Uuid;
     use vala_sql::TenantConn;
     use vala_sql::queries::scribe_batch_commits::{
-        ScribeBatchCommit, ScribeBatchCommitResolution, accepted_version, record, resolve,
-    };
-    use vala_sql::queries::scribe_state_heads::{
-        ScribeStateAdvance, ScribeStateClaim, ScribeStateHead, claim,
+        ScribeBatchCommit, ScribeBatchCommitResolution, accepted_version, committed_batches,
+        record, resolve,
     };
     use wyrd_dev_fixtures::pg::PgFixture;
     use wyrd_spec::DataTenantId;
@@ -127,7 +126,6 @@ mod pg_tests {
             wal_lsn_min: lsn,
             wal_lsn_max: lsn + 1,
             request_id: Uuid::now_v7(),
-            state: None,
         }
     }
 
@@ -247,41 +245,53 @@ mod pg_tests {
         assert_eq!(log.count("SELECT"), 0, "no fence conflicted");
     }
 
-    /// Proves a contradiction fails the group and leaves none of its fresh
-    /// fences durable.
+    /// Proves different rows under a spent batch id are a conflict of that
+    /// batch alone, and that dropping the group's transaction leaves none of
+    /// its fresh fences durable.
     ///
     /// # Panics
     ///
-    /// Panics when the fixture cannot start, the contradiction is accepted,
-    /// or a fresh fence from the failed group survives.
+    /// Panics when the fixture cannot start, the conflict is misclassified,
+    /// or a fresh fence from the dropped group survives.
     #[tokio::test]
-    async fn a_contradiction_rolls_back_the_groups_fresh_fences() {
+    async fn a_conflict_is_refused_per_batch_and_leaves_no_fresh_fence() {
         let fixture = PgFixture::start().await.expect("fixture");
         let tenant = fixture.data_tenant_id();
         let accepted = fence(tenant, "bifrost.a", Uuid::now_v7(), 10);
         commit_group(&fixture, &[(accepted.clone(), Utc::now())]).await;
 
         let fresh = fence(tenant, "bifrost.a", Uuid::now_v7(), 20);
-        let contradiction = ScribeBatchCommit {
+        let conflicting = ScribeBatchCommit {
             slice_set_digest: [0xEE; 32],
             ..accepted
         };
         let mut conn = TenantConn::acquire(fixture.app_pool(), tenant)
             .await
             .expect("tenant connection");
-        resolve(&mut conn, std::iter::once(&contradiction))
-            .await
-            .expect_err("uncertain-commit resolution refuses a contradiction");
+        assert_eq!(
+            resolve(&mut conn, std::iter::once(&conflicting))
+                .await
+                .expect("a conflict resolves"),
+            [ScribeBatchCommitResolution::Conflicted],
+            "uncertain-commit resolution names the conflict"
+        );
         drop(conn);
         let mut conn = TenantConn::acquire(fixture.app_pool(), tenant)
             .await
             .expect("tenant connection");
-        record(
-            &mut conn,
-            &[(fresh.clone(), Utc::now()), (contradiction, Utc::now())],
-        )
-        .await
-        .expect_err("different rows under a spent batch id are refused");
+        assert_eq!(
+            record(
+                &mut conn,
+                &[(fresh.clone(), Utc::now()), (conflicting, Utc::now())],
+            )
+            .await
+            .expect("the group records"),
+            [
+                ScribeBatchCommitResolution::Committed,
+                ScribeBatchCommitResolution::Conflicted
+            ],
+            "only the batch reusing a spent id conflicts"
+        );
         drop(conn);
 
         let mut conn = TenantConn::acquire(fixture.app_pool(), tenant)
@@ -292,7 +302,7 @@ mod pg_tests {
                 .await
                 .expect("fence resolves"),
             [ScribeBatchCommitResolution::Absent],
-            "the failed group committed none of its fresh fences"
+            "the dropped group committed none of its fresh fences"
         );
     }
 
@@ -397,145 +407,38 @@ mod pg_tests {
             .await
             .expect_err("a foreign fence does not resolve");
     }
-    /// Claims `key` of `bifrost.state` for `writer` in one committed
-    /// transaction.
-    async fn claim_state(
-        fixture: &PgFixture,
-        tenant: DataTenantId,
-        key: Uuid,
-        writer: Uuid,
-        generation: i64,
-    ) -> ScribeStateClaim {
-        let mut conn = TenantConn::acquire(fixture.app_pool(), tenant)
-            .await
-            .expect("tenant connection");
-        let claimed = claim(&mut conn, "bifrost.state", key, writer, generation)
-            .await
-            .expect("the claim runs");
-        conn.commit().await.expect("the claim commits");
-        claimed
-    }
 
-    /// A fence of `bifrost.state` recording `revision` of `key` by `writer`.
-    fn state_fence(
-        tenant: DataTenantId,
-        key: Uuid,
-        writer: Uuid,
-        revision: i64,
-        lsn: i64,
-    ) -> ScribeBatchCommit {
-        ScribeBatchCommit {
-            state: Some(ScribeStateAdvance {
-                key,
-                writer,
-                revision,
-                not_after: None,
-            }),
-            ..fence(tenant, "bifrost.state", Uuid::now_v7(), lsn)
-        }
-    }
-
-    /// Proves a keyed-state write is accepted only from the claimed writer at
-    /// the next revision before its bound, in the same transaction as its
-    /// fence, and that a claim answers the accepted position, installs a new
-    /// writer, and refuses an older generation.
+    /// Proves the durable-fence lookup answers exactly the offered ids that
+    /// hold a fence on the named table: not a fresh id, and not an id fenced
+    /// only on another table.
     ///
     /// # Panics
     ///
-    /// Panics when the fixture cannot start or a claim, write, or refusal is
-    /// misclassified.
+    /// Panics when the fixture cannot start or the lookup answers another set.
     #[tokio::test]
-    async fn a_state_write_is_accepted_only_from_the_claimed_writer_at_the_next_revision() {
+    async fn the_fence_lookup_names_exactly_the_committed_batches() {
         let fixture = PgFixture::start().await.expect("fixture");
         let tenant = fixture.data_tenant_id();
-        let key = Uuid::now_v7();
-        let (first, second) = (Uuid::now_v7(), Uuid::now_v7());
-        let absent = ScribeStateClaim::Claimed(ScribeStateHead {
-            revision: 0,
-            batch_id: None,
-        });
-        assert_eq!(claim_state(&fixture, tenant, key, first, 1).await, absent);
-
-        let accepted = state_fence(tenant, key, first, 1, 10);
-        assert_eq!(
-            commit_group(&fixture, &[(accepted.clone(), Utc::now())]).await,
-            [ScribeBatchCommitResolution::Committed]
-        );
-        assert_eq!(
-            commit_group(&fixture, &[(accepted.clone(), Utc::now())]).await,
-            [ScribeBatchCommitResolution::Committed],
-            "an accepted write retries as committed without advancing again"
-        );
-        let skipped = state_fence(tenant, key, first, 3, 20);
-        let expired = ScribeBatchCommit {
-            state: Some(ScribeStateAdvance {
-                not_after: Some(Utc::now() - chrono::Duration::seconds(1)),
-                ..state_fence(tenant, key, first, 2, 30).state.expect("state")
-            }),
-            ..state_fence(tenant, key, first, 2, 30)
-        };
+        let shared = Uuid::now_v7();
+        let fenced = fence(tenant, "bifrost.a", Uuid::now_v7(), 10);
+        commit_group(
+            &fixture,
+            &[
+                (fenced.clone(), Utc::now()),
+                (fence(tenant, "bifrost.b", shared, 20), Utc::now()),
+            ],
+        )
+        .await;
         let mut conn = TenantConn::acquire(fixture.app_pool(), tenant)
             .await
             .expect("tenant connection");
-        assert_eq!(
-            record(
-                &mut conn,
-                &[(skipped.clone(), Utc::now()), (expired.clone(), Utc::now())]
-            )
-            .await
-            .expect("the group records"),
-            [ScribeBatchCommitResolution::StateRefused; 2],
-            "a skipped revision and a passed bound are refused"
-        );
-        drop(conn);
-
-        assert_eq!(
-            claim_state(&fixture, tenant, key, second, 2).await,
-            ScribeStateClaim::Claimed(ScribeStateHead {
-                revision: 1,
-                batch_id: Some(accepted.batch_id),
-            }),
-            "a takeover inherits the accepted revision"
-        );
-        assert_eq!(
-            claim_state(&fixture, tenant, key, first, 1).await,
-            ScribeStateClaim::Superseded,
-            "a delayed older claim cannot displace the new writer"
-        );
-        let stale = state_fence(tenant, key, first, 2, 40);
-        let current = state_fence(tenant, key, second, 2, 50);
-        let mut conn = TenantConn::acquire(fixture.app_pool(), tenant)
-            .await
-            .expect("tenant connection");
-        assert_eq!(
-            record(&mut conn, &[(stale.clone(), Utc::now())])
-                .await
-                .expect("the stale write records"),
-            [ScribeBatchCommitResolution::StateRefused],
-            "the replaced writer cannot advance the state"
-        );
-        drop(conn);
-        assert_eq!(
-            commit_group(&fixture, &[(current.clone(), Utc::now())]).await,
-            [ScribeBatchCommitResolution::Committed]
-        );
-        let mut conn = TenantConn::acquire(fixture.app_pool(), tenant)
-            .await
-            .expect("tenant connection");
-        assert_eq!(
-            resolve(&mut conn, [&skipped, &expired, &stale].into_iter())
-                .await
-                .expect("fences resolve"),
-            [ScribeBatchCommitResolution::Absent; 3],
-            "no refused write left a durable fence"
-        );
-        drop(conn);
-        assert_eq!(
-            claim_state(&fixture, tenant, key, second, 2).await,
-            ScribeStateClaim::Claimed(ScribeStateHead {
-                revision: 2,
-                batch_id: Some(current.batch_id),
-            })
-        );
+        let found = committed_batches(
+            &mut conn,
+            "bifrost.a",
+            &[Uuid::now_v7(), fenced.batch_id, shared],
+        )
+        .await
+        .expect("the lookup runs");
+        assert_eq!(found, [fenced.batch_id]);
     }
 }

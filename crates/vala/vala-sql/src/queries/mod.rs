@@ -20,4 +20,3 @@ pub mod oracle_reader_authority;
 pub mod profiles;
 pub mod queues;
 pub mod scribe_batch_commits;
-pub mod scribe_state_heads;

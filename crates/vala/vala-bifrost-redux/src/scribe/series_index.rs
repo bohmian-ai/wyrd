@@ -115,7 +115,6 @@ impl SeriesFrame {
                         SeriesTable::schema_fingerprint(),
                     )),
                     table_version: None,
-                    state: None,
                     request_id: points.request_id.clone(),
                     batch_id: points.batch_id,
                     measured_wire_bytes: 0,

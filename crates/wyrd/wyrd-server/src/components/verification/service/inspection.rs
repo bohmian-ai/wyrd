@@ -279,8 +279,8 @@ impl<'a> VerificationControl<'a> {
 
     /// Authorize `operation` as [`Self::authorized`] does, then read the
     /// execution's accepted state and revision as the tenant's SYSTEM
-    /// principal serving `caller`, without claiming it; an execution no
-    /// writer claimed yet has fresh state at revision 0.
+    /// principal serving `caller`, without writing it; an execution with no
+    /// accepted revision yet has fresh state at revision 0.
     ///
     /// # Errors
     /// The errors of [`Self::authorized`], and
@@ -303,8 +303,7 @@ impl<'a> VerificationControl<'a> {
             execution_id,
             &InputResolver::new(&query, None),
         )
-        .await?
-        .unwrap_or_else(|| (0, ExecutionState::fresh()));
+        .await?;
         Ok((status, revision, state))
     }
 

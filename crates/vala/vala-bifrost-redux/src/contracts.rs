@@ -80,10 +80,9 @@ impl From<Attribution> for StampedAttribution {
     }
 }
 
-/// The keyed state heads a state-fenced table's writers claim and readers
-/// locate the accepted revision through.
-pub use vala_sql::queries::scribe_state_heads;
-pub use vala_sql::queries::scribe_state_heads::ScribeStateAdvance;
+/// The durable-fence lookup a writer that derives its batch ids from its
+/// record identity learns its accepted records through.
+pub use vala_sql::queries::scribe_batch_commits::committed_batches;
 
 /// One logical batch crossing the Gate-to-Scribe boundary.
 #[derive(Debug)]
@@ -143,14 +142,6 @@ pub struct ScribeIngressFrame {
     pub request_id: RequestId,
     /// The client idempotency identifier for this batch.
     pub batch_id: uuid::Uuid,
-    /// The keyed-state revision the batch records, required exactly for a
-    /// state-fenced table.
-    ///
-    /// Scribe accepts the batch only when its writer owns the state and its
-    /// revision directly follows the accepted one, atomically with the
-    /// batch's durable fence; otherwise the batch is refused with
-    /// [`ScribeError::StateRefused`] and never becomes durable or visible.
-    pub state: Option<ScribeStateAdvance>,
     /// Server-measured bytes after transport decompression.
     pub measured_wire_bytes: usize,
     /// Native Arrow IPC, engine-only projected Arrow, or a fixed-capacity
@@ -376,11 +367,10 @@ pub enum ScribeError {
         actual: StreamIdentity,
     },
 
-    /// The batch's keyed-state revision was refused: its writer no longer
-    /// owns the state, the revision does not directly follow the accepted
-    /// one, or the writer's bound passed. The batch is not durable.
-    #[error("keyed state revision refused")]
-    StateRefused,
+    /// The batch id is already durable with different rows under the same
+    /// table version; the first batch keeps it and this one is not durable.
+    #[error("batch identity already committed with different rows")]
+    BatchConflict,
 
     #[error("internal scribe failure: {detail}")]
     Internal { detail: String },
@@ -421,7 +411,7 @@ impl ScribeError {
                 requested: *requested,
                 actual: *actual,
             },
-            Self::StateRefused => Self::StateRefused,
+            Self::BatchConflict => Self::BatchConflict,
             Self::Internal { detail } => Self::Internal {
                 detail: detail.clone(),
             },

@@ -11,7 +11,7 @@ use vala_bifrost_redux::scribe::geometry::{
 };
 use vala_bifrost_redux::scribe::persistence::PersistenceFaults;
 use vala_verify::blocks::Checkpoints as _;
-use wyrd_server::verification::state::{RunState, StateError};
+use wyrd_server::verification::state::{RunState, StateError, revision_fence};
 use wyrd_spec::verification::TaskId;
 use wyrd_spec::verification::state::ExecutionState;
 use wyrd_testing::WyrdTestServer;
@@ -611,7 +611,13 @@ async fn execution_pod(
 }
 
 /// Takes over `execution` as the next claim of its lease and returns that
-/// writer's claim of the Bifrost state.
+/// writer's recovery of the Bifrost state.
+///
+/// # Errors
+///
+/// Returns the [`StateError`] refusing the recovery: an accepted revision
+/// that cannot be found or read is unavailable, and one in another format is
+/// incompatible.
 ///
 /// # Panics
 ///
@@ -648,13 +654,13 @@ fn invocations(state: &ExecutionState) -> Vec<(String, u32)> {
 
 /// Recovery loads exactly the accepted revision or fails closed.
 ///
-/// A writer accepts two invocation revisions. When the state head names a
-/// revision whose row is not visible, as a delayed accepted record would, a
-/// takeover is refused as unavailable instead of starting fresh or loading
-/// the older revision, and changes nothing. Once the head and its row agree,
-/// a takeover loads the accepted revision exactly, and the same revision
-/// reads back after the pod restarts on its retained data root and replays
-/// its WAL.
+/// A writer accepts two invocation revisions. When a third revision's batch
+/// fence is durable but its row is not visible, as when the Scribe holding
+/// it was unavailable before the read discovered it, a takeover is refused
+/// as unavailable instead of starting fresh or loading the older revision,
+/// and changes nothing. Once every fenced revision is readable, a takeover
+/// loads the accepted revision exactly, and the same revision reads back
+/// after the pod restarts on its retained data root and replays its WAL.
 ///
 /// # Panics
 ///
@@ -680,32 +686,33 @@ async fn execution_recovery_requires_exact_accepted_state() {
     let accepted = first.snapshot().await;
     drop(first);
 
-    let head = |delta: i64| {
-        let pool = server
-            .pg_fixture()
-            .superuser_pool()
-            .expect("fixture exposes a superuser pool");
-        async move {
-            sqlx::query(
-                "UPDATE vala.scribe_state_heads SET revision = revision + $1 \
-                 WHERE logical_table_fqn = 'bifrost.verification.execution_events' \
-                 AND state_key = $2",
-            )
-            .bind(delta)
-            .bind(execution.as_uuid())
-            .execute(&pool)
-            .await
-            .expect("the head moves");
-        }
-    };
-    head(1).await;
+    let pool = server
+        .pg_fixture()
+        .superuser_pool()
+        .expect("fixture exposes a superuser pool");
+    let unseen = revision_fence(server.data_tenant_id(), execution, 3);
+    sqlx::query(
+        "INSERT INTO vala.scribe_batch_commits \
+         SELECT (jsonb_populate_record(c, jsonb_build_object('batch_id', $2::uuid))).* \
+           FROM vala.scribe_batch_commits c \
+          WHERE logical_table_fqn = 'bifrost.verification.execution_events' AND batch_id = $1",
+    )
+    .bind(revision_fence(server.data_tenant_id(), execution, 2))
+    .bind(unseen)
+    .execute(&pool)
+    .await
+    .expect("a third revision's fence is durable");
     let refused = take_over(&fixture, &server, execution).await;
     assert!(
         matches!(refused, Err(StateError::Unavailable(_))),
-        "an invisible accepted revision fails closed: {:?}",
+        "a fenced revision no read can see fails closed: {:?}",
         refused.as_ref().err()
     );
-    head(-1).await;
+    sqlx::query("DELETE FROM vala.scribe_batch_commits WHERE batch_id = $1")
+        .bind(unseen)
+        .execute(&pool)
+        .await
+        .expect("the unseen fence is withdrawn");
     let recovered = take_over(&fixture, &server, execution)
         .await
         .expect("the accepted revision recovers");
@@ -731,12 +738,14 @@ async fn execution_recovery_requires_exact_accepted_state() {
     server.shutdown().await.expect("the server drains cleanly");
 }
 
-/// A takeover inherits progress accepted before it and fences the replaced
-/// writer, and the refused write never resurrects through WAL replay.
+/// A takeover inherits progress accepted before it, the first accepted
+/// writer of a revision keeps it, and the refused write never resurrects
+/// through WAL replay.
 ///
 /// Writer A accepts one revision and is taken over by writer B, which
-/// inherits it. A's next revision is refused while B's is accepted. After the
-/// pod restarts on its retained data root and replays its WAL, the execution
+/// inherits it. B accepts the next revision; A, delayed past the takeover,
+/// offers its own rows for that same revision and is refused. After the pod
+/// restarts on its retained data root and replays its WAL, the execution
 /// holds exactly B's two revisions, one row each, and a further takeover
 /// recovers B's state.
 ///
@@ -768,14 +777,14 @@ async fn execution_takeover_rejects_late_writes_after_replay() {
         [("review".to_owned(), 1)],
         "B inherits the progress accepted before its takeover"
     );
-    replaced
-        .begin(&TaskId::new("late").expect("task"), 1)
-        .await
-        .expect_err("the replaced writer advances nothing");
     current
         .begin(&TaskId::new("judge").expect("task"), 1)
         .await
         .expect("B's revision is accepted");
+    replaced
+        .begin(&TaskId::new("late").expect("task"), 1)
+        .await
+        .expect_err("the replaced writer cannot take B's revision");
     let accepted = current.snapshot().await;
     drop((replaced, current));
 

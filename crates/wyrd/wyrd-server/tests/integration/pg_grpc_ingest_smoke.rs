@@ -218,7 +218,6 @@ async fn seed_tail_rows(state: &AppState, tenant: DataTenantId) {
                 &Schema::new(vec![Field::new("value", DataType::Int64, false)]),
             )),
             table_version: None,
-            state: None,
             request_id,
             batch_id: uuid::Uuid::now_v7(),
             measured_wire_bytes,

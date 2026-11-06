@@ -565,8 +565,7 @@ impl<'a> VerificationControl<'a> {
         let timeout = blocks.limits().verify_timeout;
         let deadline = tokio::time::Instant::now() + timeout;
         let owner = wyrd_runtime::owning_root(&caller.principal, &caller.delegation_chain);
-        let state = match RunState::fresh(
-            self.state,
+        let state = Arc::new(RunState::fresh(
             Arc::clone(self.state.bifrost.scribe_outbox()),
             caller.data_tenant_id,
             StateRow {
@@ -579,12 +578,7 @@ impl<'a> VerificationControl<'a> {
                 attribution: caller.attribution(),
             },
             deadline,
-        )
-        .await
-        {
-            Ok(state) => Arc::new(state),
-            Err(error) => return ("unavailable", Err(state_unavailable(&error))),
-        };
+        ));
         let engine = match blocks.engine(
             self.state,
             Execution {

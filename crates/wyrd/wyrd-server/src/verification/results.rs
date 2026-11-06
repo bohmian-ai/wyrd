@@ -109,6 +109,19 @@ static SCHEMAS: LazyLock<[(TypeId, String, SchemaRef); 4]> = LazyLock::new(|| {
     ]
 });
 
+/// The schema every execution state revision's row fills.
+///
+/// # Panics
+/// Panics only if [`SCHEMAS`] lacked the execution events table, which its
+/// construction rules out.
+pub(crate) fn checkpoint_schema() -> &'static SchemaRef {
+    &SCHEMAS
+        .iter()
+        .find(|(table, _, _)| *table == TypeId::of::<ExecutionEventsTable>())
+        .expect("every result table has a shared schema")
+        .2
+}
+
 /// The correlation columns every result row carries after its table's
 /// fields, in this order.
 const CORRELATION: [&str; 3] = [WORKLOAD_CARD_UID, SUBJECT_CARD_UID, RUN_ID];

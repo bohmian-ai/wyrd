@@ -75,8 +75,6 @@ pub(crate) struct AdmittedAppend {
     pub request_id: Uuid,
     /// Admission instant stamped as `wyrd_ingested_at` and stored on the fence.
     pub ingested_at_micros: i64,
-    /// The keyed-state revision the batch records, accepted with its fence.
-    pub state: Option<crate::contracts::ScribeStateAdvance>,
     pub rows: AdmittedRows,
     pub measured_wire_bytes: usize,
     pub reservation: InflightFrameReservation,
@@ -149,8 +147,6 @@ pub(crate) struct PreparedAppend {
     pub batch_id: Uuid,
     /// Admission instant stamped as `wyrd_ingested_at` and stored on the fence.
     pub ingested_at_micros: i64,
-    /// The keyed-state revision the batch records, accepted with its fence.
-    pub state: Option<crate::contracts::ScribeStateAdvance>,
     pub tenant: DataTenantId,
     pub table: TableRef,
     pub prepared_bytes: usize,
@@ -674,7 +670,6 @@ pub(crate) fn prepare_append(admitted: AdmittedAppend) -> Result<PreparedAppend,
         batch_id,
         request_id,
         ingested_at_micros,
-        state,
         rows,
         measured_wire_bytes: _measured_wire_bytes,
         reservation,
@@ -716,7 +711,6 @@ pub(crate) fn prepare_append(admitted: AdmittedAppend) -> Result<PreparedAppend,
     Ok(PreparedAppend {
         batch_id,
         ingested_at_micros,
-        state,
         tenant,
         table,
         prepared_bytes,

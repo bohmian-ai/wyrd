@@ -33,7 +33,7 @@ use wyrd_server::verification::hosted::publications::{Publications, PublishCall}
 use wyrd_server::verification::hosted::workspace::Workspace;
 use wyrd_server::verification::inputs::InputResolver;
 use wyrd_server::verification::results::{InputRecord, ResultPayloadBuilder, ResultRun};
-use wyrd_server::verification::state::{RunState, StateError, StateRow, StateWriter};
+use wyrd_server::verification::state::{RunState, StateError, StateRow};
 use wyrd_spec::DataTenantId;
 use wyrd_spec::auth::Attribution;
 use wyrd_spec::card::verifier::{OWNER_OCCURRENCE_KEY, VerifierSpec};
@@ -778,7 +778,8 @@ impl VerificationFixture {
     }
 
     /// The accepted Bifrost state of `execution`, read as the tenant's
-    /// SYSTEM principal through `state`; `None` when no writer ever claimed it.
+    /// SYSTEM principal through `state`; `None` when no revision was ever
+    /// accepted.
     ///
     /// # Errors
     /// Returns [`VerificationFixtureError`] when the read authority does not
@@ -797,18 +798,17 @@ impl VerificationFixture {
         )
         .await
         .map_err(|error| VerificationFixtureError::Card(format!("{error:?}")))?;
-        Ok(accepted.map(|(_, accepted)| accepted))
+        Ok((accepted.0 > 0).then_some(accepted.1))
     }
 
-    /// Claim the tenant's next due execution as a worker would, then claim
-    /// its Bifrost state as that lease's writer at the attempt's generation,
-    /// recovering the accepted revision as the tenant's SYSTEM principal.
+    /// Claim the tenant's next due execution as a worker would, then
+    /// recover its accepted Bifrost state as the tenant's SYSTEM principal.
     /// The returned state confirms no lease before its revisions.
     ///
     /// # Errors
     /// Returns [`VerificationFixtureError`] when nothing is claimable or the
-    /// claim or read authority fails; a refused state claim is the inner
-    /// [`StateError`].
+    /// claim or read authority fails; a state that cannot be recovered is the
+    /// inner [`StateError`].
     pub async fn claim_state(
         &self,
         state: &AppState,
@@ -828,7 +828,7 @@ impl VerificationFixture {
             })?;
         conn.commit().await?;
         let query = self.system_query(state).await?;
-        let run = RunState::claim(
+        let run = RunState::recover(
             state,
             Arc::clone(state.bifrost.scribe_outbox()),
             self.tenant,
@@ -841,14 +841,9 @@ impl VerificationFixture {
                 deployment_environment: claimed.deployment_environment.clone(),
                 attribution: claimed.attribution,
             },
-            StateWriter {
-                writer: claimed.lease.token.as_uuid(),
-                generation: i64::from(claimed.attempt),
-                not_after: Some(claimed.deadline_at),
-                deadline: tokio::time::Instant::now() + std::time::Duration::from_secs(60),
-            },
+            tokio::time::Instant::now() + std::time::Duration::from_secs(60),
             None,
-            Some(&InputResolver::new(&query, None)),
+            &InputResolver::new(&query, None),
         )
         .await;
         Ok((claimed, run))

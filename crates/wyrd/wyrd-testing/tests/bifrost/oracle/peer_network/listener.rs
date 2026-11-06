@@ -562,7 +562,6 @@ async fn a_frame_above_the_tonic_default_is_acknowledged_and_retained(
         batch_id: uuid::Uuid::now_v7().to_string(),
         request_id: event.request_id.as_str().to_owned(),
         arrow_ipc: writer.into_inner()?.into(),
-        state: None,
     };
     let encoded = wyrd_tonic::prost::Message::encoded_len(&request);
     let ceiling = vala_bifrost_redux::gate::limits::BIFROST_INGEST_REQUEST_LIMIT_BYTES;

@@ -512,19 +512,20 @@ pub enum BifrostError {
         column: Option<String>,
     },
 
-    /// A keyed state write was refused: its writer no longer owns the state,
-    /// its revision does not follow the accepted one, or its bound passed.
+    /// The batch id is already durable with different rows under the same
+    /// table version.
     ///
-    /// No row of the batch was accepted or will ever become visible.
-    #[error("keyed state write refused for table: {table}")]
+    /// The first batch keeps the id; no row of this batch was accepted or
+    /// will ever become visible.
+    #[error("batch identity conflict for table: {table}")]
     #[wyrd_error(
-        code = "WYRD_VALA_409_BIFROST_STATE_REFUSED",
+        code = "WYRD_VALA_409_BIFROST_BATCH_CONFLICT",
         status = 409,
-        title = "Keyed state write refused",
-        remediation = "Another writer owns this state or the write's bound passed. Stop writing it; reclaim the state and recover its accepted revision before writing again."
+        title = "Batch id already committed with different rows",
+        remediation = "Another batch already committed this batch_id with different rows. Read the table to learn what was accepted; send new rows under a new batch_id."
     )]
-    StateRefused {
-        /// Fully-qualified table name the refused write targeted.
+    BatchConflict {
+        /// Fully-qualified table name the refused batch targeted.
         table: String,
     },
 

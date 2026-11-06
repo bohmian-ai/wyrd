@@ -15,7 +15,7 @@
 
 use std::sync::Arc;
 
-use vala_bifrost_redux::contracts::{Scribe, ScribeStateAdvance};
+use vala_bifrost_redux::contracts::Scribe;
 use vala_bifrost_redux::gate::IngestError;
 use vala_bifrost_redux::gate::attribution::CardRegistry;
 use wyrd_spec::DataTenantId;
@@ -55,8 +55,8 @@ impl ScribeCapturePeerGrpc {
     ///
     /// # Errors
     ///
-    /// Returns `InvalidArgument` for a malformed tenant, batch, or request id
-    /// or state claim, and `PermissionDenied` for the reserved
+    /// Returns `InvalidArgument` for a malformed tenant, batch, or request id,
+    /// and `PermissionDenied` for the reserved
     /// system tenant outside audit history or any table other than the seven
     /// server-internal destinations.
     fn batch(request: IngestCaptureRequest) -> Result<ScribeBatch, Status> {
@@ -83,30 +83,11 @@ impl ScribeCapturePeerGrpc {
             .request_id
             .parse::<RequestId>()
             .map_err(|_| Status::invalid_argument("capture request_id is invalid"))?;
-        let state = request
-            .state
-            .map(|state| {
-                let invalid = || Status::invalid_argument("capture state is malformed");
-                Ok::<_, Status>(ScribeStateAdvance {
-                    key: state.key.parse().map_err(|_| invalid())?,
-                    writer: state.writer.parse().map_err(|_| invalid())?,
-                    revision: state.revision,
-                    not_after: state
-                        .not_after_unix_micros
-                        .map(|micros| {
-                            chrono::DateTime::<chrono::Utc>::from_timestamp_micros(micros)
-                                .ok_or_else(invalid)
-                        })
-                        .transpose()?,
-                })
-            })
-            .transpose()?;
         Ok(ScribeBatch {
             tenant,
             table,
             batch_id,
             request_id,
-            state,
             payload: FramePayload::Ipc(request.arrow_ipc),
         })
     }
@@ -174,7 +155,6 @@ mod tests {
             batch_id: uuid::Uuid::now_v7().to_string(),
             request_id: RequestId::now_v7().as_str().to_owned(),
             arrow_ipc: Bytes::new(),
-            state: None,
         }
     }
 

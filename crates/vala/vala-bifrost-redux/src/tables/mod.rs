@@ -336,9 +336,9 @@ pub struct BuiltinTableDefinition {
     /// row, the Parquet Bloom recipe, and every partition identity — is derived
     /// from that one canonical layout.
     pub physical_layout: fn() -> PhysicalLayoutWire,
-    /// Whether every write records one revision of a keyed state; see
-    /// [`DomainTable::STATE_FENCED`].
-    pub state_fenced: bool,
+    /// Whether only fenced batches hold the table's records; see
+    /// [`DomainTable::FENCED_ONLY`].
+    pub fenced_only: bool,
 }
 
 /// Enforce the Variant contract over one supplied batch at the trust boundary.
@@ -609,14 +609,13 @@ pub trait DomainTable: Send + Sync + 'static {
     /// of one of these columns; see [`refuse_partial_structs`].
     const WHOLE_STRUCTS: &'static [&'static str] = &[];
 
-    /// Whether every write records one revision of a keyed state.
+    /// Whether only a batch with a durable fence holds the table's records.
     ///
-    /// Scribe then requires each batch to carry its
-    /// [`ScribeStateAdvance`](crate::contracts::ScribeStateAdvance) and
-    /// accepts it only from the state's current writer at the next revision,
-    /// with its durable fence; replay never restores an unfenced batch of the
-    /// table, because its revision was never accepted.
-    const STATE_FENCED: bool = false;
+    /// A writer of such a table treats a batch as accepted only once its
+    /// fence commits, so WAL replay never restores a batch the fence never
+    /// accepted: it was never acknowledged, and a later batch may already
+    /// hold its batch id.
+    const FENCED_ONLY: bool = false;
 
     /// User-owned fields, excluding correlation and system fields.
     fn arrow_fields() -> Vec<Field>;
@@ -1279,7 +1278,7 @@ const fn definition<T: DomainTable>() -> BuiltinTableDefinition {
         canonical_validator: T::CANONICAL_VALIDATOR,
         derived_columns: T::DERIVED_COLUMNS,
         physical_layout: T::physical_layout,
-        state_fenced: T::STATE_FENCED,
+        fenced_only: T::FENCED_ONLY,
     }
 }
 

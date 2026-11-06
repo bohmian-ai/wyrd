@@ -76,7 +76,7 @@ use super::hosted::blocks::{Execution, HostedBlocks};
 use super::inputs::{InputResolver, InputRow};
 use super::leases::{HeldLease, LeaseRenewal};
 use super::results::{ResultPayloadBuilder, ResultRun};
-use super::state::{RunState, StateError, StateRow, StateWriter};
+use super::state::{RunState, StateError, StateRow};
 use super::telemetry::{ExecutionMode, ExecutionTelemetry, Phase};
 use crate::components::auth::Caller;
 use crate::components::gateway::GatewayCallContext;
@@ -447,13 +447,12 @@ impl VerifierRunner {
         }
     }
 
-    /// Claim the execution's state under `lease`'s token, generation the
-    /// attempt, bounded by the original deadline, and recover its accepted
-    /// revision as `system`.
+    /// Recover the execution's accepted state as `system` for this attempt,
+    /// whose revisions confirm `lease` and are awaited until `deadline`.
     ///
     /// # Errors
-    /// Returns the [`Transition`] a state that cannot be claimed or
-    /// recovered ends this attempt in.
+    /// Returns the [`Transition`] a state that cannot be recovered ends this
+    /// attempt in.
     async fn state(
         &self,
         tenant: DataTenantId,
@@ -466,7 +465,7 @@ impl VerifierRunner {
             .reader(tenant, run, system)
             .await
             .map_err(|error| state_failure(run, &StateError::Unavailable(error.to_string())))?;
-        RunState::claim(
+        RunState::recover(
             &self.state,
             Arc::clone(&self.outbox),
             tenant,
@@ -482,14 +481,9 @@ impl VerifierRunner {
                 deployment_environment: run.deployment_environment.clone(),
                 attribution: Attribution::new(run.attribution.sub_principal_id, system),
             },
-            StateWriter {
-                writer: run.lease.token.as_uuid(),
-                generation: i64::from(run.attempt),
-                not_after: Some(run.deadline_at),
-                deadline,
-            },
+            deadline,
             Some(Arc::clone(lease)),
-            Some(&InputResolver::new(&query, None)),
+            &InputResolver::new(&query, None),
         )
         .await
         .map_err(|error| state_failure(run, &error))
@@ -1209,7 +1203,6 @@ fn owner(run: &ClaimedExecution) -> Option<&wyrd_spec::ids::CardUid> {
 fn state_failure(run: &ClaimedExecution, error: &StateError) -> Transition {
     tracing::warn!(execution_id = %run.lease.execution_id, %error, "the execution state cannot be used");
     match error {
-        StateError::Superseded => Transition::LeaseLost,
         StateError::Unavailable(_) => Transition::Defer(failure(
             STATE_UNAVAILABLE,
             "the execution state cannot be read or written now",

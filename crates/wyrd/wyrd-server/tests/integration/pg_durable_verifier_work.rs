@@ -12,9 +12,7 @@ use serde_json::{Value, json};
 use skald_spec::MediaFormat;
 use tokio_util::sync::CancellationToken;
 use vala_bifrost_redux::catalog::{TableRef, TableUid};
-use vala_bifrost_redux::contracts::{
-    FrameAdmission, Scribe, ScribeError, ScribeIngressFrame, ScribeStateAdvance,
-};
+use vala_bifrost_redux::contracts::{FrameAdmission, Scribe, ScribeError, ScribeIngressFrame};
 use vala_bifrost_redux::namespaces::BifrostNamespace;
 use vala_verify::blocks::{CallInput, CallValue, Checkpoints as _};
 use wyrd_runtime::principal::PrincipalId;
@@ -29,7 +27,9 @@ use wyrd_server::verification::hosted::workspace::{Workspace, Workspaces};
 use wyrd_server::verification::inputs::InputResolver;
 use wyrd_server::verification::leases::LeaseRenewal;
 use wyrd_server::verification::results::{ResultPayloadBuilder, ResultRun};
-use wyrd_server::verification::state::{RunState, StateError, StateRow, StateWriter};
+use wyrd_server::verification::state::{
+    Checkpoint, RunState, StateError, StateRow, revision_batch,
+};
 use wyrd_spec::DataTenantId;
 use wyrd_spec::auth::Attribution;
 use wyrd_spec::ids::{CardUid, SlotName};
@@ -147,11 +147,14 @@ impl Leased {
         )
     }
 
-    /// Claim `claimed`'s execution state for its lease, as a worker would,
+    /// Recover `claimed`'s execution state for its lease, as a worker would,
     /// staging its revisions on `outbox`.
     ///
     /// # Errors
-    /// Returns the [`StateError`] refusing the claim or its recovery read.
+    /// Returns the [`StateError`] refusing the recovery read.
+    ///
+    /// # Panics
+    /// Panics when the SYSTEM read authority does not resolve.
     async fn writer(
         server: &WyrdTestServer,
         outbox: Arc<ScribeOutbox>,
@@ -162,7 +165,7 @@ impl Leased {
         let tenant = server.data_tenant_id();
         let query = Self::query(server, system).await;
         let lease = renewal.hold(tenant, claimed.lease.token, &CancellationToken::new());
-        let run = RunState::claim(
+        let run = RunState::recover(
             server.state(),
             outbox,
             tenant,
@@ -175,14 +178,9 @@ impl Leased {
                 deployment_environment: claimed.deployment_environment.clone(),
                 attribution: Attribution::new(claimed.attribution.sub_principal_id, system),
             },
-            StateWriter {
-                writer: claimed.lease.token.as_uuid(),
-                generation: i64::from(claimed.attempt),
-                not_after: Some(claimed.deadline_at),
-                deadline: tokio::time::Instant::now() + std::time::Duration::from_secs(300),
-            },
+            tokio::time::Instant::now() + std::time::Duration::from_secs(300),
             Some(Arc::new(lease)),
-            Some(&InputResolver::new(&query, None)),
+            &InputResolver::new(&query, None),
         )
         .await?;
         Ok(Arc::new(run))
@@ -191,8 +189,16 @@ impl Leased {
     /// The execution's accepted state, read back from Bifrost.
     ///
     /// # Panics
-    /// Panics when the state is unreadable or was never claimed.
+    /// Panics when the state is unreadable.
     async fn accepted(&self) -> ExecutionState {
+        self.revision().await.1
+    }
+
+    /// The execution's accepted revision and state, read back from Bifrost.
+    ///
+    /// # Panics
+    /// Panics when the state is unreadable.
+    async fn revision(&self) -> (i64, ExecutionState) {
         let query = Self::query(&self.server, self.system).await;
         RunState::accepted(
             self.server.state(),
@@ -202,8 +208,6 @@ impl Leased {
         )
         .await
         .expect("the state reads")
-        .expect("the state was claimed")
-        .1
     }
 
     /// The publication `name` of `producer`, if accepted.
@@ -688,13 +692,16 @@ async fn directory_snapshot_is_complete_or_rejected() {
 /// A replay of the same call and arguments recovers its one receipt, even
 /// after its scratch file is removed or replaced by a directory and while
 /// storage is unavailable, answering the stored kind; the same name from
-/// another call, or from that call with other arguments, conflicts; a fresh attempt publishes the name again with its own
-/// attribution. An upload that fails, or a publication under a lease since
-/// reclaimed, leaves nothing readable.
+/// another call, or from that call with other arguments, conflicts; a fresh
+/// attempt publishes the name again with its own attribution. A live replay
+/// adds no revision. An upload that fails leaves nothing readable. Once the
+/// lease is reclaimed, an identical JSON replay is refused as the stale
+/// writer's first operation, and a file replay and a new publication after it.
 ///
 /// # Panics
-/// Panics when a replay adds an entry, a conflict is accepted, attempts
-/// merge, or a failed or stale publication becomes readable.
+/// Panics when a replay adds an entry or a revision, a conflict is accepted,
+/// attempts merge, a stale replay succeeds, or a failed or stale publication
+/// becomes readable.
 #[tokio::test(flavor = "multi_thread")]
 async fn publication_replay_preserves_attempt_identity() {
     let leased = Leased::start().await;
@@ -714,6 +721,7 @@ async fn publication_replay_preserves_attempt_identity() {
     };
     put(&workspace, "notes.md", b"notes");
 
+    let mut published = None;
     for _ in 0..2 {
         assert_eq!(
             publications
@@ -726,6 +734,12 @@ async fn publication_replay_preserves_attempt_identity() {
             .path(&call("f1", &first, "notes"), &workspace, "/work/notes.md")
             .await
             .expect("the file call and its replay answer one receipt");
+        let revision = leased.revision().await.0;
+        assert_eq!(
+            *published.get_or_insert(revision),
+            revision,
+            "a replay adds no revision"
+        );
     }
     std::fs::remove_file(workspace.work_dir().join("notes.md")).expect("scratch removed");
     let wyrd_storage::BackendConfig::Local { root } =
@@ -797,9 +811,9 @@ async fn publication_replay_preserves_attempt_identity() {
 
     let current = leased.reclaim().await;
     let stale = publications
-        .json(&call("c4", &second, "late"), json!(null))
+        .json(&call("c1", &first, "report"), json!({"v": 1}))
         .await
-        .expect_err("a reclaimed lease publishes nothing");
+        .expect_err("a JSON replay as the stale writer's first operation is refused");
     assert!(
         stale
             .to_string()
@@ -807,9 +821,13 @@ async fn publication_replay_preserves_attempt_identity() {
         "{stale}"
     );
     publications
-        .json(&call("c1", &first, "report"), json!({"v": 1}))
+        .path(&call("f1", &first, "notes"), &workspace, "/work/notes.md")
         .await
-        .expect_err("a replay under the stale lease is fenced too");
+        .expect_err("a file replay under the stale lease is refused");
+    publications
+        .json(&call("c4", &second, "late"), json!(null))
+        .await
+        .expect_err("a reclaimed lease publishes nothing");
     Publications::new(leased.server.state(), &caller, &current, limits)
         .json(&call("c5", &second, "late"), json!(null))
         .await
@@ -1722,15 +1740,21 @@ async fn state_format_changes_preserve_existing_custody() {
     state.bifrost.scribe_outbox().stage(
         tenant,
         ScribeWrite::ExecutionState {
-            batch: uuid::Uuid::now_v7(),
-            row: row.row,
+            batch: revision_batch(leased.lease.execution_id, 1),
+            checkpoint: Arc::new(Checkpoint::prepared(
+                1,
+                Arc::new(StateRow {
+                    execution_id: leased.lease.execution_id,
+                    verifier_uid,
+                    card_uid,
+                    owner_card_uid: None,
+                    run_id: None,
+                    deployment_environment: None,
+                    attribution: Attribution::new(leased.system, leased.system),
+                }),
+                row.row,
+            )),
             attribution: Attribution::new(leased.system, leased.system),
-            state: ScribeStateAdvance {
-                key: leased.lease.execution_id.as_uuid(),
-                writer: leased.lease.token.as_uuid(),
-                revision: 1,
-                not_after: None,
-            },
             acked: std::sync::Mutex::new(Some(sender)),
         },
     );

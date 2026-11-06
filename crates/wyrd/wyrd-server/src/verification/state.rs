@@ -1,30 +1,37 @@
 //! The recoverable state of one running Verifier execution.
 //!
 //! [`RunState`] is the one owner of an execution's [`ExecutionState`] while
-//! it runs, for direct and queued executions alike. Its claim installs the
-//! runner as the state's only writer and answers the accepted revision, and
-//! recovery reads exactly that revision from
-//! `bifrost.verification.execution_events`: revision 0 is authoritative
-//! absence, and a revision not visible yet is [`StateError::Unavailable`],
-//! never older or empty state. Steps change the live state in memory under a
-//! short lock and wait, outside it, for an accepted revision holding their
-//! change before its effect escapes. At most one revision per execution is
-//! pending: it freezes every change made so far into one complete revision
-//! staged on the process Scribe outbox, which Scribe accepts only from this
-//! writer at exactly the next revision, while later changes accumulate for
-//! the revision after it. A writer shut out by a takeover advances nothing,
-//! and a revision refused or whose acceptance is unknown breaks the state:
-//! nothing more is released, and the attempt recovers the accepted revision
-//! under a new claim.
+//! it runs, for direct and queued executions alike. Every revision is one
+//! `bifrost.verification.execution_events` row written under a batch id
+//! derived from its execution and revision, so the first batch Scribe fences
+//! keeps the revision and another writer's different rows for it are refused
+//! as a batch conflict. Recovery finds the accepted revision from those
+//! generic batch fences, which commit before any acknowledgement and are
+//! never removed, and reads exactly that revision's row: no fence is
+//! authoritative absence, and a fenced revision not visible yet, such as one
+//! a Scribe unavailable to the read still holds, is
+//! [`StateError::Unavailable`], never older or empty state. A direct
+//! execution's identity is new, so it starts fresh with no read. Steps change
+//! the live state in memory under a short lock and wait, outside it, for an
+//! accepted revision holding their change before its effect escapes. At most
+//! one revision per execution is pending: it freezes every change made so
+//! far into one complete revision staged on the process Scribe outbox, while
+//! later changes accumulate for the revision after it. A revision refused or
+//! whose acceptance is unknown breaks the state: nothing more is released,
+//! and the attempt recovers the accepted revision again. A delayed old
+//! worker that still passes its lease check can race a replacement for one
+//! revision; whichever batch is fenced first keeps it, and the other writer
+//! breaks.
 
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 
 use chrono::{DateTime, Utc};
 use futures_util::FutureExt as _;
 use futures_util::future::{BoxFuture, Shared};
+use sha2::{Digest as _, Sha256};
 use tokio::sync::oneshot;
-use vala_bifrost_redux::contracts::ScribeStateAdvance;
-use vala_bifrost_redux::contracts::scribe_state_heads::{self, ScribeStateClaim};
+use vala_bifrost_redux::contracts::committed_batches;
+use vala_bifrost_redux::tables::staged::StagedRow;
 use wyrd_spec::DataTenantId;
 use wyrd_spec::auth::{Attribution, Sha256Hex};
 use wyrd_spec::error::WyrdError;
@@ -42,24 +49,49 @@ use wyrd_spec::verification::state::{
 use super::inputs::InputResolver;
 use super::leases::HeldLease;
 use super::results::{ResultPayloadBuilder, ResultRun};
-use crate::scribe_outbox::{ScribeOutbox, ScribeWrite};
+use crate::scribe_outbox::{ScribeOutbox, ScribeWrite, revision_batch_id};
 use crate::state::AppState;
 
-/// The state-fenced table every revision is a row of, and the state head's
-/// logical table.
+/// The table every revision is a row of, and the logical table of every
+/// revision's batch fence.
 const STATE_TABLE: &str = "bifrost.verification.execution_events";
+
+/// How many revisions one fence lookup asks about while recovery finds the
+/// accepted revision.
+// ponytail: a linear walk of PROBE revisions per statement; gallop if executions grow far past it.
+const PROBE: i64 = 256;
+
+/// The batch identity of `revision` of `execution`'s state, which the
+/// outbox writes under its [`revision_fence`].
+///
+/// Derived from both, so every writer of one revision offers the same batch
+/// id: an honest retry dedups and a different revision's rows conflict.
+#[must_use]
+pub fn revision_batch(execution: ExecutionId, revision: i64) -> uuid::Uuid {
+    let digest = Sha256::new()
+        .chain_update(execution.as_uuid().as_bytes())
+        .chain_update(revision.to_be_bytes())
+        .finalize();
+    let mut bytes = [0; 16];
+    bytes.copy_from_slice(&digest[..16]);
+    uuid::Builder::from_custom_bytes(bytes).into_uuid()
+}
+
+/// The Scribe batch id `tenant`'s `revision` of `execution` is written
+/// under, whose batch fence is exactly whether the revision was accepted.
+#[must_use]
+pub fn revision_fence(tenant: DataTenantId, execution: ExecutionId, revision: i64) -> uuid::Uuid {
+    revision_batch_id(tenant, revision_batch(execution, revision))
+}
 
 /// Why an execution's state cannot be used.
 #[derive(Debug, Clone, thiserror::Error)]
 pub enum StateError {
-    /// The accepted revision cannot be read or written now: the head or the
-    /// revision's row is not reachable or not visible yet, or Scribe has no
-    /// capacity. Nothing was assumed absent; recovery is retried.
+    /// The accepted revision cannot be read or written now: its fence or
+    /// row is not reachable or not visible yet, or Scribe has no capacity.
+    /// Nothing was assumed absent; recovery is retried.
     #[error("the execution state is unavailable: {0}")]
     Unavailable(String),
-    /// A newer claim owns the state; this writer must stop.
-    #[error("a newer claim owns the execution state")]
-    Superseded,
     /// The accepted revision is in a format this worker does not run.
     #[error(transparent)]
     Incompatible(#[from] ExecutionStateError),
@@ -86,20 +118,6 @@ pub struct StateRow {
     pub deployment_environment: Option<String>,
     /// The execution's subject and actor, which Scribe stamps on each row.
     pub attribution: Attribution,
-}
-
-/// How one claim writes the state.
-#[derive(Debug, Clone, Copy)]
-pub struct StateWriter {
-    /// This claim's writer identity.
-    pub writer: uuid::Uuid,
-    /// The claim's generation; a lower one never displaces a higher one.
-    pub generation: i64,
-    /// The instant after which Scribe accepts no revision of this writer,
-    /// on the PostgreSQL clock; `None` sets no bound.
-    pub not_after: Option<DateTime<Utc>>,
-    /// How long this process waits for any one revision's acceptance.
-    pub deadline: tokio::time::Instant,
 }
 
 /// The call that asks to accept one publication.
@@ -208,7 +226,7 @@ impl Held {
     }
 }
 
-/// How one claim stages revisions: everything a revision is written with
+/// How one writer stages revisions: everything a revision is written with
 /// except its state, shared with the pending revision's acceptance.
 struct StateScribe {
     /// The outbox every revision is staged on.
@@ -216,9 +234,10 @@ struct StateScribe {
     /// The execution's tenant.
     tenant: DataTenantId,
     /// The identities every revision's row records.
-    row: StateRow,
-    /// This claim's writer.
-    writer: StateWriter,
+    row: Arc<StateRow>,
+    /// The instant this writer's attempt ends; no revision is awaited past
+    /// it.
+    deadline: tokio::time::Instant,
     /// The queued execution's lease, confirmed before each revision is
     /// frozen so a cancelled, expired, or reclaimed run stops changing its
     /// state; `None` for a direct execution.
@@ -235,25 +254,137 @@ impl StateScribe {
         }
     }
 
-    /// Stage `state` as `revision` under one batch identity, which every
-    /// retry of the staged write keeps, and wait for Scribe to accept it
-    /// from this writer at exactly that revision. It holds no connection
-    /// while it waits, so it may wait unpolled until a waiter drives it.
+    /// Stage `state` as `revision` under the revision's batch identity,
+    /// which every retry and every writer of it keeps, and wait for Scribe to
+    /// accept it. The outbox writer prepares the revision's row, so this
+    /// caller does no encoding. It holds no connection while it waits, so it
+    /// may wait unpolled until a waiter drives it.
     ///
     /// # Errors
-    /// Returns [`StateError::Stale`] when the revision is refused or
-    /// unacknowledged by the writer's deadline, and
-    /// [`StateError::Unavailable`] when the revision cannot be encoded or no
-    /// outbox capacity frees by the deadline.
+    /// Returns [`StateError::Stale`] when the revision is refused, such as
+    /// when another writer's rows already hold it or it cannot be encoded,
+    /// or unacknowledged by the writer's deadline, and
+    /// [`StateError::Unavailable`] when no outbox capacity frees by the
+    /// deadline.
     async fn write(
         self: Arc<Self>,
         revision: i64,
         state: ExecutionState,
     ) -> Result<(), StateError> {
-        let value = serde_json::to_value(&state)
-            .map_err(|error| StateError::Unavailable(error.to_string()))?;
+        let slot = self
+            .outbox
+            .reserve_until(1, self.deadline.into_std())
+            .await
+            .map_err(|full| StateError::Unavailable(full.to_string()))?;
+        let (sender, acked) = oneshot::channel();
+        slot.stage(
+            self.tenant,
+            ScribeWrite::ExecutionState {
+                batch: revision_batch(self.row.execution_id, revision),
+                checkpoint: Arc::new(Checkpoint::new(revision, state, Arc::clone(&self.row))),
+                attribution: self.row.attribution,
+                acked: Mutex::new(Some(sender)),
+            },
+        );
+        match tokio::time::timeout_at(self.deadline, acked).await {
+            Ok(Ok(())) => Ok(()),
+            _ => Err(StateError::Stale),
+        }
+    }
+}
+
+/// One frozen revision staged on the Scribe outbox, whose writer prepares
+/// its row on the outbox's bounded encoding pool, once, so every retry of
+/// the revision submits the same row.
+#[derive(Debug)]
+pub struct Checkpoint {
+    /// The revision this is.
+    revision: i64,
+    /// The complete state it records.
+    state: ExecutionState,
+    /// The identities its row records.
+    row: Arc<StateRow>,
+    /// The prepared row, or why it cannot be prepared.
+    prepared: OnceLock<Result<StagedRow, String>>,
+}
+
+impl Checkpoint {
+    /// Bytes an entry of the state is estimated to hold beyond its JSON
+    /// values.
+    const ENTRY_BYTES: usize = 512;
+
+    /// `state` frozen as `revision` of the execution `row` identifies, not
+    /// prepared yet.
+    #[must_use]
+    pub fn new(revision: i64, state: ExecutionState, row: Arc<StateRow>) -> Self {
+        Self {
+            revision,
+            state,
+            row,
+            prepared: OnceLock::new(),
+        }
+    }
+
+    /// A revision whose row is already prepared, such as one written in
+    /// another state format.
+    #[cfg(any(test, feature = "test-support"))]
+    #[must_use]
+    pub fn prepared(revision: i64, row: Arc<StateRow>, prepared: StagedRow) -> Self {
+        Self {
+            revision,
+            state: ExecutionState::fresh(),
+            row,
+            prepared: OnceLock::from(Ok(prepared)),
+        }
+    }
+
+    /// The execution whose revision this is.
+    #[must_use]
+    pub fn execution_id(&self) -> ExecutionId {
+        self.row.execution_id
+    }
+
+    /// Memory the outbox charges while the revision waits: the frozen state
+    /// it holds, and so the row it prepares, which grow with its entries and
+    /// its JSON publications' bytes. Stable for the revision's life, so
+    /// admission and release charge the same.
+    // ponytail: estimated from entry counts and JSON bytes without encoding; measure the prepared row if admission undercounts.
+    #[must_use]
+    pub fn weight(&self) -> usize {
+        let state = &self.state;
+        let objects: usize = state.publications.iter().map(|p| p.objects.len()).sum();
+        let json: u64 = state
+            .publications
+            .iter()
+            .filter(|p| p.objects.is_empty())
+            .map(|p| p.retained_bytes)
+            .sum();
+        let entries = 1 + state.invocations.len() + state.publications.len() + objects;
+        // A JSON value is held as its tree and its encoded Variant.
+        Self::ENTRY_BYTES.saturating_mul(entries).saturating_add(
+            usize::try_from(json)
+                .unwrap_or(usize::MAX)
+                .saturating_mul(2),
+        )
+    }
+
+    /// The revision's `bifrost.verification.execution_events` row, prepared
+    /// on first use.
+    ///
+    /// # Errors
+    /// Returns why the state cannot be encoded as its row.
+    pub fn row(&self) -> Result<&StagedRow, &str> {
+        self.prepared
+            .get_or_init(|| self.prepare())
+            .as_ref()
+            .map_err(String::as_str)
+    }
+
+    /// Encodes the state as its revision's row.
+    fn prepare(&self) -> Result<StagedRow, String> {
+        let value = serde_json::to_value(&self.state).map_err(|error| error.to_string())?;
         let row = &self.row;
-        let row = ResultPayloadBuilder::new(
+        ResultPayloadBuilder::new(
             ResultRun {
                 execution_id: row.execution_id,
                 run_id: row.run_id.as_ref(),
@@ -270,33 +401,9 @@ impl StateScribe {
             Utc::now(),
             Utc::now(),
         )
-        .checkpoint(revision, state.terminal.is_some(), &value)
-        .map_err(|error| StateError::Unavailable(error.to_string()))?;
-        let slot = self
-            .outbox
-            .reserve_until(1, self.writer.deadline.into_std())
-            .await
-            .map_err(|full| StateError::Unavailable(full.to_string()))?;
-        let (sender, acked) = oneshot::channel();
-        slot.stage(
-            self.tenant,
-            ScribeWrite::ExecutionState {
-                batch: uuid::Uuid::now_v7(),
-                row: row.row,
-                attribution: self.row.attribution,
-                state: ScribeStateAdvance {
-                    key: self.row.execution_id.as_uuid(),
-                    writer: self.writer.writer,
-                    revision,
-                    not_after: self.writer.not_after,
-                },
-                acked: Mutex::new(Some(sender)),
-            },
-        );
-        match tokio::time::timeout_at(self.writer.deadline, acked).await {
-            Ok(Ok(())) => Ok(()),
-            _ => Err(StateError::Stale),
-        }
+        .checkpoint(self.revision, self.state.terminal.is_some(), &value)
+        .map(|row| row.row)
+        .map_err(|error| error.to_string())
     }
 }
 
@@ -310,145 +417,97 @@ pub struct RunState {
 }
 
 impl RunState {
-    /// Claim `tenant`'s execution state for `writer` and recover its accepted
-    /// revision through `records`, whose read authority must cover
-    /// `bifrost.verification.execution_events`. Without `records` the
-    /// identity must be new: any accepted revision is refused rather than
-    /// read.
+    /// Recover `tenant`'s execution state for a new writer whose attempt
+    /// ends at `deadline`, through `records`, whose read authority must cover
+    /// `bifrost.verification.execution_events`. `lease`, when the execution
+    /// is queued, is confirmed before each revision is frozen.
     ///
     /// # Errors
-    /// Returns [`StateError::Superseded`] when a newer claim owns the state,
-    /// [`StateError::Unavailable`] when the head or the accepted revision
-    /// cannot be read, and [`StateError::Incompatible`] for a revision in
+    /// Returns [`StateError::Unavailable`] when the accepted revision cannot
+    /// be found or read, and [`StateError::Incompatible`] for a revision in
     /// another format.
-    pub async fn claim(
-        app: &AppState,
-        outbox: Arc<ScribeOutbox>,
-        tenant: DataTenantId,
-        row: StateRow,
-        writer: StateWriter,
-        lease: Option<Arc<HeldLease>>,
-        records: Option<&InputResolver<'_>>,
-    ) -> Result<Self, StateError> {
-        let unavailable =
-            |error: &dyn std::fmt::Display| StateError::Unavailable(error.to_string());
-        let mut conn = app
-            .postgres
-            .vala()
-            .tenant_conn(tenant)
-            .await
-            .map_err(|error| unavailable(&error))?;
-        let claimed = scribe_state_heads::claim(
-            &mut conn,
-            STATE_TABLE,
-            row.execution_id.as_uuid(),
-            writer.writer,
-            writer.generation,
-        )
-        .await
-        .map_err(|error| unavailable(&error))?;
-        let ScribeStateClaim::Claimed(head) = claimed else {
-            return Err(StateError::Superseded);
-        };
-        conn.commit().await.map_err(|error| unavailable(&error))?;
-        let state = match records {
-            Some(records) => Self::read(records, row.execution_id, head.revision).await?,
-            None if head.revision == 0 => ExecutionState::fresh(),
-            None => {
-                return Err(StateError::Unavailable(
-                    "a new execution identity already has accepted state".to_owned(),
-                ));
-            }
-        };
-        Ok(Self {
-            scribe: Arc::new(StateScribe {
-                outbox,
-                tenant,
-                row,
-                writer,
-                lease,
-            }),
-            held: tokio::sync::Mutex::new(Held::new(state, head.revision)),
-        })
-    }
-
-    /// Claim the state of an execution identity no writer has advanced, such
-    /// as a direct execution's, for a new writer with no lease and no
-    /// database-clock bound, waiting for each revision's acceptance until
-    /// `deadline`.
-    ///
-    /// A direct execution's identity is new to its request and never
-    /// resumed, so its state starts fresh and nothing is read; any accepted
-    /// revision is refused.
-    ///
-    /// # Errors
-    /// As [`Self::claim`] without `records`.
-    pub async fn fresh(
+    pub async fn recover(
         app: &AppState,
         outbox: Arc<ScribeOutbox>,
         tenant: DataTenantId,
         row: StateRow,
         deadline: tokio::time::Instant,
+        lease: Option<Arc<HeldLease>>,
+        records: &InputResolver<'_>,
     ) -> Result<Self, StateError> {
-        let writer = StateWriter {
-            writer: uuid::Uuid::now_v7(),
-            generation: 0,
-            not_after: None,
+        let (revision, state) = Self::accepted(app, tenant, row.execution_id, records).await?;
+        Ok(Self::at(
+            outbox, tenant, row, deadline, lease, state, revision,
+        ))
+    }
+
+    /// The state of an execution identity no writer ever advanced, such as
+    /// a direct execution's, for a new writer with no lease, waiting for each
+    /// revision's acceptance until `deadline`.
+    ///
+    /// A direct execution's identity is new to its request and never
+    /// resumed, so its state starts fresh and nothing is read.
+    #[must_use]
+    pub fn fresh(
+        outbox: Arc<ScribeOutbox>,
+        tenant: DataTenantId,
+        row: StateRow,
+        deadline: tokio::time::Instant,
+    ) -> Self {
+        Self::at(
+            outbox,
+            tenant,
+            row,
             deadline,
-        };
-        Self::claim(app, outbox, tenant, row, writer, None, None).await
+            None,
+            ExecutionState::fresh(),
+            0,
+        )
+    }
+
+    /// A writer of `state`, accepted at `revision`.
+    fn at(
+        outbox: Arc<ScribeOutbox>,
+        tenant: DataTenantId,
+        row: StateRow,
+        deadline: tokio::time::Instant,
+        lease: Option<Arc<HeldLease>>,
+        state: ExecutionState,
+        revision: i64,
+    ) -> Self {
+        Self {
+            scribe: Arc::new(StateScribe {
+                outbox,
+                tenant,
+                row: Arc::new(row),
+                deadline,
+                lease,
+            }),
+            held: tokio::sync::Mutex::new(Held::new(state, revision)),
+        }
     }
 
     /// The instant this writer's attempt ends; no revision is awaited past it.
     #[must_use]
     pub fn deadline(&self) -> tokio::time::Instant {
-        self.scribe.writer.deadline
+        self.scribe.deadline
     }
 
-    /// The accepted revision and state of `execution` without claiming it,
-    /// so inspecting a running execution never shuts out its writer; `None`
-    /// when no writer ever claimed it.
+    /// The accepted revision and state of `execution`, without writing it,
+    /// so inspecting a running execution never shuts out its writer; fresh
+    /// at revision 0 when no revision was ever accepted.
     ///
     /// # Errors
-    /// As [`Self::claim`], without [`StateError::Superseded`].
+    /// As [`Self::recover`].
     pub async fn accepted(
         app: &AppState,
         tenant: DataTenantId,
         execution: ExecutionId,
         records: &InputResolver<'_>,
-    ) -> Result<Option<(i64, ExecutionState)>, StateError> {
-        let unavailable =
-            |error: &dyn std::fmt::Display| StateError::Unavailable(error.to_string());
-        let mut conn = app
-            .postgres
-            .vala()
-            .tenant_conn(tenant)
-            .await
-            .map_err(|error| unavailable(&error))?;
-        let head = scribe_state_heads::head(&mut conn, STATE_TABLE, execution.as_uuid())
-            .await
-            .map_err(|error| unavailable(&error))?;
-        drop(conn);
-        let Some(head) = head else {
-            return Ok(None);
-        };
-        Ok(Some((
-            head.revision,
-            Self::read(records, execution, head.revision).await?,
-        )))
-    }
-
-    /// The state at exactly `revision`: fresh at 0, otherwise its one row.
-    ///
-    /// # Errors
-    /// As [`Self::claim`].
-    async fn read(
-        records: &InputResolver<'_>,
-        execution: ExecutionId,
-        revision: i64,
-    ) -> Result<ExecutionState, StateError> {
+    ) -> Result<(i64, ExecutionState), StateError> {
+        let revision = Self::accepted_revision(app, tenant, execution).await?;
         if revision == 0 {
-            return Ok(ExecutionState::fresh());
+            return Ok((0, ExecutionState::fresh()));
         }
         let value = records
             .state(execution, revision)
@@ -457,7 +516,47 @@ impl RunState {
             .ok_or_else(|| {
                 StateError::Unavailable(format!("revision {revision} is not visible yet"))
             })?;
-        Ok(ExecutionState::decode(value)?)
+        Ok((revision, ExecutionState::decode(value)?))
+    }
+
+    /// The last revision of `execution` whose batch fence committed; 0 when
+    /// none did.
+    ///
+    /// A revision is frozen only after the one before it was accepted, so the
+    /// accepted revisions are exactly the fenced prefix from revision 1.
+    ///
+    /// # Errors
+    /// Returns [`StateError::Unavailable`] when the fences cannot be read.
+    async fn accepted_revision(
+        app: &AppState,
+        tenant: DataTenantId,
+        execution: ExecutionId,
+    ) -> Result<i64, StateError> {
+        let unavailable =
+            |error: &dyn std::fmt::Display| StateError::Unavailable(error.to_string());
+        let mut conn = app
+            .postgres
+            .vala()
+            .tenant_conn(tenant)
+            .await
+            .map_err(|error| unavailable(&error))?;
+        let mut revision = 0;
+        loop {
+            let probed: Vec<_> = (revision + 1..=revision + PROBE)
+                .map(|next| revision_fence(tenant, execution, next))
+                .collect();
+            let fenced = committed_batches(&mut conn, STATE_TABLE, &probed)
+                .await
+                .map_err(|error| unavailable(&error))?;
+            let accepted = probed
+                .iter()
+                .take_while(|batch| fenced.contains(batch))
+                .count();
+            revision += i64::try_from(accepted).unwrap_or(PROBE);
+            if accepted < probed.len() {
+                return Ok(revision);
+            }
+        }
     }
 
     /// A copy of the live state, which holds changes still awaiting
@@ -558,20 +657,27 @@ impl RunState {
         self.receipt_once_accepted(found, ticket).await
     }
 
-    /// `found` once an accepted revision holds change `ticket`, or
-    /// [`PublicationAcceptance::StaleLease`] when none will.
+    /// `found` once an accepted revision holds change `ticket` and the
+    /// writer's lease, when it has one, still holds its run, or
+    /// [`PublicationAcceptance::StaleLease`] otherwise.
+    ///
+    /// The lease is confirmed outside the memory lock even when an accepted
+    /// revision already held the change, so a replay is never the first
+    /// success of a cancelled, expired, or reclaimed run.
     async fn receipt_once_accepted(
         &self,
         found: PublicationAcceptance,
         ticket: u64,
     ) -> PublicationAcceptance {
-        match self.durable(ticket).await {
-            Ok(()) => found,
-            Err(error) => {
-                tracing::warn!(execution_id = %self.scribe.row.execution_id, %error, "a publication was not accepted");
-                PublicationAcceptance::StaleLease
-            }
+        if let Err(error) = self.durable(ticket).await {
+            tracing::warn!(execution_id = %self.scribe.row.execution_id, %error, "a publication was not accepted");
+            return PublicationAcceptance::StaleLease;
         }
+        if !self.scribe.confirmed().await {
+            self.held.lock().await.broken = true;
+            return PublicationAcceptance::StaleLease;
+        }
+        found
     }
 
     /// Every publication `step` recorded in the live state, grouped by item,
@@ -814,10 +920,9 @@ mod tests {
     use wyrd_spec::auth::{Attribution, PrincipalId};
     use wyrd_spec::ids::{CardUid, ExecutionId};
     use wyrd_spec::verification::execution::VerificationOutcome;
-    use wyrd_spec::verification::state::ExecutionState;
     use wyrd_spec::verification::{TaskId, VerificationVerdict};
 
-    use super::{Held, RunState, StateRow, StateScribe, StateWriter};
+    use super::{RunState, StateRow};
     use crate::components::gateway::recording::TableGate;
     use crate::scribe_outbox::{ScribeSink, ScribeTable};
 
@@ -831,6 +936,10 @@ mod tests {
 
     /// A fresh direct execution's state, written through a Scribe that holds
     /// every revision until released.
+    ///
+    /// # Panics
+    /// Panics when a fresh UUID is not a Card UID, or when called outside a
+    /// Tokio runtime, where the outbox cannot spawn its writer.
     fn held_state() -> (RunState, Arc<TableGate>) {
         let scribe = Arc::new(TableGate::new(ScribeTable::ExecutionEvents));
         let outbox = ScribeSink::local_outbox(Arc::clone(&scribe) as _, None);
@@ -846,22 +955,12 @@ mod tests {
                 PrincipalId::new(uuid::Uuid::now_v7()),
             ),
         };
-        let writer = StateWriter {
-            writer: uuid::Uuid::now_v7(),
-            generation: 0,
-            not_after: None,
-            deadline: tokio::time::Instant::now() + Duration::from_secs(30),
-        };
-        let state = RunState {
-            scribe: Arc::new(StateScribe {
-                outbox,
-                tenant: DataTenantId::new_v7(),
-                row,
-                writer,
-                lease: None,
-            }),
-            held: tokio::sync::Mutex::new(Held::new(ExecutionState::fresh(), 0)),
-        };
+        let state = RunState::fresh(
+            outbox,
+            DataTenantId::new_v7(),
+            row,
+            tokio::time::Instant::now() + Duration::from_secs(30),
+        );
         (state, scribe)
     }
 
@@ -1021,7 +1120,7 @@ mod tests {
         let (state, scribe) = held_state();
         scribe
             .inner
-            .refuse_next(vala_bifrost_redux::contracts::ScribeError::StateRefused);
+            .refuse_next(vala_bifrost_redux::contracts::ScribeError::BatchConflict);
         scribe
             .release
             .add_permits(tokio::sync::Semaphore::MAX_PERMITS);

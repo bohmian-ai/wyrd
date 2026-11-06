@@ -1678,7 +1678,9 @@ mod tests {
                 .set(SubqueryIndex::new(0), ScalarValue::Int64(Some(value)))
                 .expect("scalar populates");
             let (resolved, routes) = live.resolved(0).expect("the populated scalar resolves");
-            let (fragment, _) = resolved.fragment(&routes[0], 0).expect("the fragment encodes");
+            let (fragment, _) = resolved
+                .fragment(&routes[0], 0)
+                .expect("the fragment encodes");
             let root = PhysicalPlanNode::decode(fragment.physical_plan_bytes.as_slice())
                 .expect("the fragment plan decodes");
             let Some(PhysicalPlanType::Extension(extension)) = root.physical_plan_type else {

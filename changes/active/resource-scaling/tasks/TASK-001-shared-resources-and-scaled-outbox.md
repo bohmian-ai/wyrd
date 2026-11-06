@@ -555,7 +555,69 @@ spread evenly by request id over 32 lanes instead of 4, so each slice carries
 fixed frame build, `spawn_blocking` encode, Scribe ingress/WAL and one memtable
 `RecordBatch`. Worker pools and shards are identical. **Cause** batching
 dilution inherent in "a slice is one lane's batch" once lanes grow with C;
-the byte-bound payload step gains from parallelism. **Fix site** `OutboxWriter`
+the payload c64 step was faster, but flush reasons were not recorded, so the
+gain is not attributed to any batching mode, and it cost 1.5× CPU and 1.6×
+RSS. **Fix site** `OutboxWriter`
 batching; the fix that restores batching (one slice covering several idle
 lanes of a tenant, retried by its lane set) changes the approved definition of
 a slice, so it is a specification decision, not an implementation choice.
+
+## Revision 3 Execution Evidence
+
+Spec revision 3 (approved) withdraws the CPU-scaled outbox. Commit `89162f762`
+restores main's outbox geometry and keeps the shared configuration, worker
+sizing, diagnostics and delivery accounting. `wyrd-runtime` `outbox.rs` and
+`verification/submissions.rs` are byte-identical to main; `OutboxExecution`,
+`ResourcePlan.outbox`, `OutboxSink::lanes` and configurable lanes are removed.
+
+| Acceptance criterion | Implementation evidence | Verification evidence | Result |
+|---|---|---|---|
+| AC-001 startup resolution | `scribe_outbox.rs` fixed `SCRIBE_WRITERS`/`SCRIBE_LANES`/`FRAMES_IN_FLIGHT`/`SCRIBE_DELIVERIES` (4/4/8/32), independent of the plan; `ScribeWorkers::resolve` from the shared C | `resources::tests::startup_cpu_cap_applies_before_derivation` (cap lowers C before worker derivation, never raises it, zero observation and zero cap refused); `config::tests::scribe_worker_resolution_preserves_explicit_settings` | PASS |
+| AC-002 delivery limit and correctness | `ScribeSink::deliver` holds a process `SCRIBE_DELIVERIES` permit from encode through ACK, moved into the blocking closure | `scribe_outbox::tests::delivery_limits_preserve_per_writer_ack_overlap` (4 tenants hold 8 each, 32 total, 0 permits left, all restored); `scribe_outbox::tests::cancelled_encoding_retains_delivery_capacity`; 20/20 `wyrd-runtime outbox::`; 143/143 wyrd-server `config|boot|scribe_outbox|verification::submissions` with Postgres | PASS |
+| AC-003 non-regression | — | L1 below | see below |
+| AC-004 one configuration | startup diagnostic reports the fixed outbox constants and the plan's workers | `owner_inspection::startup_consumers_share_one_resource_configuration` | PASS |
+| AC-005 memory and scratch | unchanged | 919/919 `vala-bifrost-redux --lib` with Postgres | PASS |
+| SDK evidence journey | — | `verification_runtime::scaled_outboxes_preserve_sdk_evidence` | PASS |
+
+Checks: `mise run fmt`, `mise run lints`, `check:deps`,
+`check:tenant-isolation`, `git diff --check` pass.
+
+### L1 non-regression
+
+Same host as above, `capacity l1 gateway --allow-dirty`, all runs VALID (runs
+rejected as `host.busy` by a concurrent build in another worktree were
+discarded and repeated). Comparison 1: candidate `20261106T200028Z-89162f762`
+against main `20261106T175550Z-5234961d5`. Every flagged step was re-run as one
+fresh back-to-back pair: main `20261106T202437Z-5234961d5`, candidate
+`20261106T202756Z-89162f762`. Rate and cores are medians with main's min..max;
+peak RSS and server p99 are single per-step values (no repetition range).
+
+| step | pair rate main [range] → rev 3 | pair cores main [range] → rev 3 | pair RSS MiB | pair p99 ms | outside in both comparisons |
+|---|---|---|---|---|---|
+| 1 KiB buffered c1 | 5076 [4823..5190] → 5174 | 1.24 [1.24..1.25] → 1.24 | 888 → 887 | 0.293 → 0.291 | none |
+| 1 KiB buffered c64 | 54202 [51798..55539] → 54128 | 19.22 [19.17..19.55] → 19.57 | 2326 → 2297 | 1.487 → 1.483 | cores (+0.02 over max) |
+| 1 KiB streamed c1 | 24 → 24 | 0.11 → 0.10 | 1428 → 1459 | 0.694 → 0.644 | RSS (+2.2%) |
+| 1 KiB streamed c64 | 1525 [1524..1533] → 1537 | 1.69 [1.61..1.74] → 1.49 | 1603 → 1673 | 0.847 → 0.507 | RSS (+4.4%) |
+| 64 KiB metadata c1 | 2691 [2656..2702] → 2904 | 1.18 [1.18..1.69] → 1.17 | 2385 → 2413 | 0.502 → 0.457 | RSS (+1.2%) |
+| 64 KiB metadata c64 | 18512 [17654..18656] → 19030 | 19.09 [18.45..19.53] → 19.67 | 2106 → 2167 | 4.088 → 3.920 | none |
+| 64 KiB payload c1 | 2168 [2058..2225] → 2083 | 1.95 [1.88..2.01] → 1.89 | 4567 → 4659 | 0.775 → 0.731 | RSS (+2.0%) |
+| 64 KiB payload c64 | 4607 [4566..5012] → 4795 | 10.57 [10.20..10.58] → 10.62 | 7498 → 7675 | 158.3 → 166.5 | none |
+
+Rate: inside or above main's range on every step in both comparisons. Errors,
+lost, shed, dropped and undrained captures: zero in every run. Revision 2's
+regression is gone (1 KiB buffered c64 49,372 → 54,128 req/s; 1 KiB streamed
+c64 2.67 → 1.49 cores, 3,367 → 1,673 MiB; payload c64 14,053 → 7,675 MiB).
+
+Under AC-003's literal rule, five step-metrics were outside main's numbers in
+both comparisons: one cores median 0.02 above main's maximum, and four RSS
+peaks 1–4% above main's single value. Main's own run-to-run variation on the
+same steps is larger than those differences: RSS between the two main runs
+moved 1325 → 1428 (+8%) streamed c1, 2035 → 2385 (+17%) 64 KiB metadata c1,
+8882 → 7498 (−16%) payload c64; buffered c64 cores ranged 19.17..19.55. Because
+peak RSS has no repetition range, any increase is outside. That counts as a
+literal AC-003 miss on RSS and one cores median; the maintainer decides whether
+it passes.
+
+Non-goals: no CPU-scaled geometry, coalescing, linger or batch tuning, queue,
+pool, WAL or shard change, new setting, dependency, SDK or wire change.
+Unrelated working-tree entries were not touched.

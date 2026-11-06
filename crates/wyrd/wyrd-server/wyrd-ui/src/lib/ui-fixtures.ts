@@ -51,8 +51,82 @@ export const registered = {
   metadata: { name: 'ranker', version: '1.4.2', uid: 'card_01HX' },
   spec: {}
 } as unknown as RegisteredCard;
-export const summary = (version: string, status = 'active') => ({ version, status, name: 'ranker', kind: 'Model', created_at: '2026-10-19T14:02:00Z' }) as never;
+export const summary = (version: string, status = 'active', kind = 'Model', name = 'ranker') =>
+  ({
+    version,
+    status,
+    name,
+    kind,
+    card_uid: `card_${kind}_${name}_${version}`,
+    spec_hash: 'sha256:0f3a',
+    artifact_hash: null,
+    created_at: '2026-10-19T14:02:00Z',
+    updated_at: '2026-10-20T09:15:00Z'
+  }) as never;
+
+/** Two versions of one portable Prompt, an Agent using the newer one, and a native-format Prompt keeping an extension field. */
+export const PROMPT: CardRef = { kind: 'Prompt', name: 'support-reply', version: '1.1.0' };
+export const AGENT: CardRef = { kind: 'Agent', name: 'support', version: '1.0.0' };
+export const SERVICE: CardRef = { kind: 'Service', name: 'support-api', version: '1.0.0' };
+export const NATIVE: CardRef = { kind: 'Prompt', name: 'native-reply', version: '1.0.0' };
+const promptCard = (version: string, spec: object, variables: string[], inbound: CardRef[]) =>
+  ({
+    apiVersion: 'wyrd/v1',
+    kind: 'Prompt',
+    metadata: { name: PROMPT.name, version, uid: `card_prompt_${version}`, labels: { team: 'support' }, spec_hash: `sha256:${version}` },
+    spec,
+    relationships: { inbound_refs: inbound.map((ref) => ({ ref })), outbound_refs: [] },
+    status: { phase: 'active', prompt: { variables, media_variables: [] } }
+  }) as unknown as RegisteredCard;
+export const prompts: Record<string, RegisteredCard> = {
+  '1.0.0': promptCard('1.0.0', { provider: 'openai', model: 'gpt-5', system: 'You answer support tickets.', messages: [{ role: 'user', content: 'Ticket: {{ticket}}' }] }, ['ticket'], []),
+  '1.1.0': promptCard(
+    '1.1.0',
+    {
+      provider: 'openai',
+      model: 'gpt-5',
+      system: 'You answer support tickets.\nCite the policy section you rely on.',
+      messages: [{ role: 'user', content: 'Ticket: {{ticket}}\nTone: {{tone}}' }],
+      response_format: 'verdict'
+    },
+    ['ticket', 'tone'],
+    [AGENT]
+  )
+};
+export const nativePrompt = {
+  apiVersion: 'wyrd/v1',
+  kind: 'Prompt',
+  metadata: { name: NATIVE.name, version: NATIVE.version, uid: 'card_native' },
+  spec: { provider: 'openai', model: 'gpt-5', format: 'responses', body: { input: [{ role: 'user', content: 'Ticket: {{ticket}}' }], future_knob: true } },
+  relationships: { inbound_refs: [], outbound_refs: [] },
+  status: { phase: 'active', prompt: { variables: ['ticket'], media_variables: [] } }
+} as unknown as RegisteredCard;
+export const agent = {
+  apiVersion: 'wyrd/v1',
+  kind: 'Agent',
+  metadata: { name: AGENT.name, version: AGENT.version, uid: 'card_agent' },
+  spec: { execution_route: { kind: 'wyrd_gateway', deployment: 'primary' }, prompt: PROMPT },
+  relationships: { outbound_refs: [{ ref: PROMPT }], inbound_refs: [{ ref: SERVICE }] },
+  status: { phase: 'active' }
+} as unknown as RegisteredCard;
+/** The files registration recorded for the Model. */
+export const artifacts = {
+  artifacts: [
+    { relative_path: 'weights/model.bin', size_bytes: 4_404_019, sha256: 'n4bQgYhMfWWaL+qgxVrQFaO/TxsrC4Is0V1sFbDwCgg=', content_type: 'application/octet-stream' },
+    { relative_path: 'README.md', size_bytes: 812, sha256: 'LCa0a2j/xo/5m0U8HTBBNBNCLXBkg7+g+YpeiGJm564=', content_type: null }
+  ]
+};
+/** One row per version across kinds, as the inventory lists them. */
+export const inventory = [
+  summary('1.0.0', 'active', 'Prompt', 'support-reply'),
+  summary('1.1.0', 'active', 'Prompt', 'support-reply'),
+  summary('1.0.0', 'active', 'Agent', 'support'),
+  summary('1.4.1', 'deprecated'),
+  summary('1.4.2', 'pending'),
+  summary('2.0.0-rc.1', 'failed', 'Data', 'tickets')
+];
 export const denied = { code: 'WYRD_AUTH_403_FORBIDDEN', title: 'Forbidden', status: 403 };
+export const notFound = { code: 'WYRD_REGISTRY_404_CARD_NOT_FOUND', title: 'Card not found', status: 404 };
 export const RANGE = { from: '2026-10-20T00:00:00Z', to: '2026-10-20T12:00:00Z' };
 
 const col = (name: string, data_type = 'Utf8', nullable = true) => ({ name, data_type, nullable });
@@ -209,13 +283,23 @@ export function observeAnswer(sql: string): QueryResult | undefined {
   return undefined;
 }
 
+/** A response with nothing in it: no rows, list items, files, relationships or variables. */
+function emptied(value: unknown): unknown {
+  const object = value as Record<string, unknown>;
+  if ('rows' in object) return { ...(object as unknown as QueryResult), rows: [], terminal: terminal(0) };
+  if ('items' in object) return { items: [], next_cursor: null };
+  if ('artifacts' in object) return { artifacts: [] };
+  if ('metadata' in object) return { ...object, relationships: { inbound_refs: [], outbound_refs: [] }, status: { phase: 'active', prompt: { variables: [], media_variables: [] } } };
+  return value;
+}
+
 /** Fixture executors by the state each makes every panel reach: rows kept or emptied, refused, failed, or never answered. */
 export const stateExecutors: Record<'populated' | 'empty' | 'denied' | 'error' | 'loading', Executor> = {
   populated: { run: (requests) => fixtureExecutor.run(requests) },
   empty: {
     run: (requests) =>
       fixtureExecutor.run(requests).then((results) =>
-        results.map((each) => (each.ok && 'rows' in (each.value as object) ? { ok: true, value: { ...(each.value as QueryResult), rows: [], terminal: terminal(0) } } : each))
+        results.map((each) => (each.ok ? { ok: true, value: emptied(each.value) } : each))
       ) as never
   },
   denied: { run: (requests) => Promise.resolve(requests.map(() => ({ ok: false, problem: denied }))) as never },
@@ -247,10 +331,21 @@ export const fixtureExecutor: Executor = {
     Promise.resolve(
       requests.map((request) => {
         switch (request.op) {
-          case 'cards.get_by_ref':
+          case 'cards.get_by_ref': {
+            const ref = request.card_ref;
+            if (ref.kind === 'Agent') return { ok: true, value: agent };
+            if (ref.name === NATIVE.name) return { ok: true, value: nativePrompt };
+            if (ref.kind === 'Prompt') return prompts[ref.version] ? { ok: true, value: prompts[ref.version] } : { ok: false, problem: notFound };
             return { ok: true, value: registered };
+          }
           case 'cards.list':
-            return { ok: true, value: { items: [summary('1.4.2'), summary('1.4.1', 'deprecated')], next_cursor: null } };
+            if (request.kind === 'Prompt' && request.name === PROMPT.name)
+              return { ok: true, value: { items: [summary('1.0.0', 'active', 'Prompt', PROMPT.name), summary('1.1.0', 'active', 'Prompt', PROMPT.name)], next_cursor: null } };
+            if (request.name === NATIVE.name) return { ok: true, value: { items: [summary('1.0.0', 'active', 'Prompt', NATIVE.name)], next_cursor: null } };
+            if (request.name !== undefined) return { ok: true, value: { items: [summary('1.4.2'), summary('1.4.1', 'deprecated')], next_cursor: null } };
+            return { ok: true, value: { items: request.cursor ? inventory.slice(3) : inventory.slice(0, 3), next_cursor: request.cursor ? null : 'page-2' } };
+          case 'cards.list_artifacts':
+            return { ok: true, value: artifacts };
           case 'bifrost.query': {
             // Honour bound $1/$2 like the server, so a brushed range visibly narrows the plot.
             const observed = observeAnswer(request.sql);

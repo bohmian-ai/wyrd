@@ -8,11 +8,27 @@
 import { z } from 'zod';
 import type { CardKind, CardRef, CardSummary } from 'wyrd-ai';
 
-/**
- * The twelve registrable Card kinds of the architecture kind catalog, in its
- * order. The generated union still names Policy and Source, which the catalog
- * removed; every other generated kind must appear here.
- */
+/** Every Card kind the registry serves, checked against the generated union both ways. */
+const SERVED_KINDS = [
+  'Data',
+  'Model',
+  'Experiment',
+  'Prompt',
+  'Agent',
+  'Verifier',
+  'Service',
+  'Policy',
+  'Mcp',
+  'Audit',
+  'Artifact',
+  'Trigger',
+  'Operator',
+  'Source'
+] as const satisfies readonly CardKind[];
+const everyKind: CardKind extends (typeof SERVED_KINDS)[number] ? true : never = true;
+void everyKind;
+
+/** The twelve registrable Card kinds of the architecture kind catalog, in its order: the inventory's kind filter. */
 export const CARD_KINDS = [
   'Data',
   'Model',
@@ -27,8 +43,6 @@ export const CARD_KINDS = [
   'Trigger',
   'Operator'
 ] as const satisfies readonly CardKind[];
-const everyKind: Exclude<CardKind, 'Policy' | 'Source'> extends (typeof CARD_KINDS)[number] ? true : never = true;
-void everyKind;
 
 /** Lifecycle statuses an inventory may filter by; a deleted Card is never listed. */
 export const CARD_STATUSES = ['active', 'pending', 'deprecated', 'failed', 'expired'] as const satisfies readonly CardSummary['status'][];
@@ -39,7 +53,7 @@ const exactVersion = z.string().regex(/^\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?(?:\+[0
 /** An exact Card reference: a full version pin, never a range or "latest". */
 export const CardRefSchema = z
   .object({
-    kind: z.enum(CARD_KINDS),
+    kind: z.enum(SERVED_KINDS),
     name: z.string().min(1),
     version: exactVersion,
     uid: z.string().min(1).nullish()

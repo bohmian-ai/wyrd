@@ -21,6 +21,7 @@
   } from 'wyrd-ai-ui';
   import { WyrdView } from 'wyrd-ai-ui/view';
   import type { Executor } from 'wyrd-ai-ui';
+  import type { ComponentName } from 'wyrd-ai-ui/loaders';
   import {
     AUTHORED_SQL,
     bareSpan,
@@ -30,6 +31,8 @@
     fixtureExecutor,
     liveExecutor,
     LOG,
+    NATIVE,
+    PROMPT,
     RANGE,
     registered,
     series,
@@ -67,7 +70,7 @@
   }
   /** One component's checkpoint: the board regions it must match and its cases. */
   interface Checkpoint {
-    readonly component: 'StatStrip' | 'FacetRail' | 'RecordTable' | 'Chart' | 'TraceWaterfall' | 'RecordDetail';
+    readonly component: ComponentName;
     readonly regions: readonly (readonly [board: string, region: string])[];
     readonly note?: string;
     readonly cases: readonly Case[];
@@ -79,6 +82,62 @@
   const bare: Executor = { run: (requests) => Promise.resolve(requests.map(() => ({ ok: true, value: bareSpan }))) as never };
 
   const checkpoints = (live: Executor): Checkpoint[] => [
+    {
+      component: 'CardInventory',
+      regions: [['Cards', 'filter bar, kind nav, version table and footer']],
+      cases: [
+        { label: 'all kinds · first page, more to load', input: {} },
+        { label: 'two pages kept after Load more', input: { pages: 2 } },
+        { label: 'filtered to Prompts with prereleases', input: { kind: 'Prompt', include_prerelease: true, query: 'support' } },
+        { label: 'filtered · no match', input: { query: 'nothing' }, state: 'empty' },
+        { label: 'empty tenant', input: {}, state: 'empty' },
+        ...STATES.filter((state) => state !== 'empty').map((state) => ({ label: state, input: {}, state })),
+        { label: 'narrow', input: {}, narrow: true }
+      ]
+    },
+    {
+      component: 'CardFacts',
+      regions: [['Prompt', 'Metadata rail']],
+      cases: [
+        { label: 'metadata', input: { cardRef: PROMPT } },
+        { label: 'YAML', input: { cardRef: PROMPT, yaml: true } },
+        ...STATES.filter((state) => state !== 'empty').map((state) => ({ label: state, input: { cardRef: PROMPT }, state }))
+      ]
+    },
+    {
+      component: 'RelationshipList',
+      regions: [['Prompt', 'Relationships rail']],
+      cases: [{ label: 'outbound and inbound', input: { cardRef: { kind: 'Agent', name: 'support', version: '1.0.0' } } }, ...states({ cardRef: PROMPT })]
+    },
+    {
+      component: 'ArtifactTable',
+      regions: [['Cards', 'Files tab']],
+      cases: [{ label: 'registered files', input: { cardRef: card } }, ...states({ cardRef: card })]
+    },
+    {
+      component: 'PromptMessages',
+      regions: [['Prompt', 'Prompt panel']],
+      cases: [
+        { label: 'portable', input: { cardRef: PROMPT } },
+        { label: 'native body with an extension field', input: { cardRef: NATIVE } },
+        ...STATES.filter((state) => state !== 'empty').map((state) => ({ label: state, input: { cardRef: PROMPT }, state }))
+      ]
+    },
+    {
+      component: 'PromptVariables',
+      regions: [['Prompt', 'Variables table']],
+      cases: [{ label: 'derived variables', input: { cardRef: PROMPT } }, ...states({ cardRef: PROMPT })]
+    },
+    {
+      component: 'UsedBy',
+      regions: [['Prompt', 'Used by table']],
+      cases: [{ label: 'one Agent behind a Service', input: { cardRef: PROMPT } }, ...states({ cardRef: PROMPT })]
+    },
+    {
+      component: 'VersionDiff',
+      regions: [['Prompt', 'Changes from the previous version']],
+      cases: [{ label: '1.0.0 → 1.1.0', input: { cardRef: PROMPT } }, { label: 'only one version', input: { cardRef: PROMPT }, state: 'empty' }, ...STATES.filter((state) => state !== 'empty').map((state) => ({ label: state, input: { cardRef: PROMPT }, state }))]
+    },
     {
       component: 'FacetRail',
       regions: [['Main', 'left facet column'], ['Spans', 'left facet column'], ['Logs', 'left facet column']],
@@ -206,7 +265,7 @@
         <Chart input={timeseries} result={{ state: 'error', problem: { code: 'WYRD_VALA_413_QUERY_RESULT_TOO_LARGE', title: 'Query result too large' } }} {actions} {onaction} />
       </div>
 
-      <h2>Observe</h2>
+      <h2>Catalog components</h2>
       {#each views[mode] as checkpoint (checkpoint.component)}
         <section class="checkpoint" aria-label="{checkpoint.component} checkpoint">
           <h3>{checkpoint.component}</h3>

@@ -505,16 +505,18 @@
                 "enum": [
                   "Data",
                   "Model",
-                  "Artifact",
                   "Experiment",
                   "Prompt",
                   "Agent",
-                  "Mcp",
-                  "Service",
-                  "Audit",
                   "Verifier",
+                  "Service",
+                  "Policy",
+                  "Mcp",
+                  "Audit",
+                  "Artifact",
                   "Trigger",
-                  "Operator"
+                  "Operator",
+                  "Source"
                 ]
               },
               "name": {
@@ -598,16 +600,18 @@
                     "enum": [
                       "Data",
                       "Model",
-                      "Artifact",
                       "Experiment",
                       "Prompt",
                       "Agent",
-                      "Mcp",
-                      "Service",
-                      "Audit",
                       "Verifier",
+                      "Service",
+                      "Policy",
+                      "Mcp",
+                      "Audit",
+                      "Artifact",
                       "Trigger",
-                      "Operator"
+                      "Operator",
+                      "Source"
                     ]
                   },
                   "name": {
@@ -679,16 +683,18 @@
                     "enum": [
                       "Data",
                       "Model",
-                      "Artifact",
                       "Experiment",
                       "Prompt",
                       "Agent",
-                      "Mcp",
-                      "Service",
-                      "Audit",
                       "Verifier",
+                      "Service",
+                      "Policy",
+                      "Mcp",
+                      "Audit",
+                      "Artifact",
                       "Trigger",
-                      "Operator"
+                      "Operator",
+                      "Source"
                     ]
                   },
                   "name": {
@@ -865,16 +871,18 @@
                     "enum": [
                       "Data",
                       "Model",
-                      "Artifact",
                       "Experiment",
                       "Prompt",
                       "Agent",
-                      "Mcp",
-                      "Service",
-                      "Audit",
                       "Verifier",
+                      "Service",
+                      "Policy",
+                      "Mcp",
+                      "Audit",
+                      "Artifact",
                       "Trigger",
-                      "Operator"
+                      "Operator",
+                      "Source"
                     ]
                   },
                   "name": {
@@ -928,16 +936,18 @@
                 "enum": [
                   "Data",
                   "Model",
-                  "Artifact",
                   "Experiment",
                   "Prompt",
                   "Agent",
-                  "Mcp",
-                  "Service",
-                  "Audit",
                   "Verifier",
+                  "Service",
+                  "Policy",
+                  "Mcp",
+                  "Audit",
+                  "Artifact",
                   "Trigger",
-                  "Operator"
+                  "Operator",
+                  "Source"
                 ]
               },
               "name": {
@@ -998,16 +1008,18 @@
                 "enum": [
                   "Data",
                   "Model",
-                  "Artifact",
                   "Experiment",
                   "Prompt",
                   "Agent",
-                  "Mcp",
-                  "Service",
-                  "Audit",
                   "Verifier",
+                  "Service",
+                  "Policy",
+                  "Mcp",
+                  "Audit",
+                  "Artifact",
                   "Trigger",
-                  "Operator"
+                  "Operator",
+                  "Source"
                 ]
               },
               "name": {
@@ -1066,16 +1078,18 @@
                     "enum": [
                       "Data",
                       "Model",
-                      "Artifact",
                       "Experiment",
                       "Prompt",
                       "Agent",
-                      "Mcp",
-                      "Service",
-                      "Audit",
                       "Verifier",
+                      "Service",
+                      "Policy",
+                      "Mcp",
+                      "Audit",
+                      "Artifact",
                       "Trigger",
-                      "Operator"
+                      "Operator",
+                      "Source"
                     ]
                   },
                   "name": {
@@ -1129,16 +1143,18 @@
                 "enum": [
                   "Data",
                   "Model",
-                  "Artifact",
                   "Experiment",
                   "Prompt",
                   "Agent",
-                  "Mcp",
-                  "Service",
-                  "Audit",
                   "Verifier",
+                  "Service",
+                  "Policy",
+                  "Mcp",
+                  "Audit",
+                  "Artifact",
                   "Trigger",
-                  "Operator"
+                  "Operator",
+                  "Source"
                 ]
               },
               "name": {
@@ -1361,16 +1377,18 @@
                     "enum": [
                       "Data",
                       "Model",
-                      "Artifact",
                       "Experiment",
                       "Prompt",
                       "Agent",
-                      "Mcp",
-                      "Service",
-                      "Audit",
                       "Verifier",
+                      "Service",
+                      "Policy",
+                      "Mcp",
+                      "Audit",
+                      "Artifact",
                       "Trigger",
-                      "Operator"
+                      "Operator",
+                      "Source"
                     ]
                   },
                   "name": {

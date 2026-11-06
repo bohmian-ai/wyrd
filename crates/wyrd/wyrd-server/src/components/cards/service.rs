@@ -382,7 +382,8 @@ fn card_files(manifests: &[CardManifestCompletionRow]) -> Result<CardFiles, Wyrd
 /// Reads the blob at the registry's retained pointer, verifies it against the
 /// registry row and completed files, then overlays server-derived state: inbound
 /// relationships and `status`, whose `verification.binding_ids` lists the
-/// owner's projected bindings and is omitted when the Card owns none.
+/// owner's projected bindings and is omitted when the Card owns none, and
+/// whose `prompt` carries a Prompt Card's compiled variables.
 ///
 /// # Errors
 /// Returns `WYRD_REGISTRY_404_CARD_NOT_FOUND` before the blob is active,
@@ -437,11 +438,16 @@ async fn hydrate_card(
             alias: None,
         })
         .collect();
+    let prompt = match &card.spec {
+        Spec::Prompt(spec) => Some(spec.status()),
+        _ => None,
+    };
     card.status = Some(Status {
         phase: row.status.as_db_str().to_owned(),
         message: None,
         updated_at: Some(row.updated_at),
         verification,
+        prompt,
     });
     Ok(GetCardResponse {
         card,
@@ -3113,6 +3119,7 @@ mod tests {
             message: None,
             updated_at: None,
             verification: None,
+            prompt: None,
         });
         card.relationships.inbound = vec!["different-live-edge".to_owned()];
         let second = immutable_card_blob_bytes(card).expect("blob serializes");

@@ -492,7 +492,9 @@ spec:
 ### Prompt
 A Prompt is authored once, in exactly one of two forms, and is stored,
 hashed, returned, and hydrated in that form. Variables, media variables, and
-the response type are derived, never authored.
+the response type are derived, never authored. A Card read serves the compiled
+variables as read-only `status.prompt: { variables, media_variables }`, so
+clients display them without re-parsing the spec.
 ```yaml
 # Portable form: compiled by the shared Skald compiler for its provider.
 spec:

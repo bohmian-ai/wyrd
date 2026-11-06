@@ -4345,6 +4345,24 @@ export interface PromptSpec {
 }
 
 /**
+ * The variables the Prompt compiler derived from a stored Prompt Card.
+ *
+ * Read-side projection only: the server derives it from the authored spec on
+ * every read and never stores it, and a registration request's own `status`
+ * is ignored. Clients display these names rather than re-parsing the spec.
+ */
+export interface PromptStatus {
+  /**
+   * Media placeholder names (`${media:name}`) left to bind.
+   */
+  readonly media_variables: readonly string[];
+  /**
+   * Text placeholder names (`{{name}}` or `${name}`) rendering requires.
+   */
+  readonly variables: readonly string[];
+}
+
+/**
  * Upstream protocol family a deployment speaks.
  *
  * The built-in variants use Skald's typed provider protocols and authenticate
@@ -6083,6 +6101,13 @@ export interface Status {
    * Lifecycle phase such as `draft`, `active`, or `deprecated`.
    */
   readonly phase: string;
+  /**
+   * The variables the Prompt compiler derived from this Prompt Card's
+   * spec; absent for every other kind.
+   *
+   * Read-side projection only, like `verification`.
+   */
+  readonly prompt?: PromptStatus | null;
   /**
    * Last status update timestamp.
    */

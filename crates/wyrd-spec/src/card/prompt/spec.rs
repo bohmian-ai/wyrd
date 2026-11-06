@@ -53,6 +53,30 @@ impl PromptSpec {
     pub fn is_fully_bound(&self) -> bool {
         self.prompt.variables.is_empty()
     }
+
+    /// Returns the compiled placeholder names a Card read serves as
+    /// `status.prompt`, in the compiler's first-appearance order.
+    pub fn status(&self) -> PromptStatus {
+        PromptStatus {
+            variables: self.prompt.variables.clone(),
+            media_variables: self.prompt.media_variables.clone(),
+        }
+    }
+}
+
+/// The variables the Prompt compiler derived from a stored Prompt Card.
+///
+/// Read-side projection only: the server derives it from the authored spec on
+/// every read and never stores it, and a registration request's own `status`
+/// is ignored. Clients display these names rather than re-parsing the spec.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
+#[serde(deny_unknown_fields)]
+pub struct PromptStatus {
+    /// Text placeholder names (`{{name}}` or `${name}`) rendering requires.
+    pub variables: Vec<String>,
+    /// Media placeholder names (`${media:name}`) left to bind.
+    pub media_variables: Vec<String>,
 }
 
 /// Compiles an authored Prompt, resolving a named `response_format` as the

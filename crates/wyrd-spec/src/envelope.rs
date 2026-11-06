@@ -465,6 +465,12 @@ pub struct Status {
     /// a registration request's own `status` is ignored.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub verification: Option<VerificationStatus>,
+    /// The variables the Prompt compiler derived from this Prompt Card's
+    /// spec; absent for every other kind.
+    ///
+    /// Read-side projection only, like `verification`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prompt: Option<crate::card::prompt::PromptStatus>,
 }
 
 /// Native Wyrd Card kind plus forward-compatible external catch-all.

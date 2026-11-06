@@ -19,7 +19,7 @@ pub use parameter::{
     ParameterName, extract_media_placeholders, extract_text_placeholders, is_valid_parameter_name,
 };
 pub use promptref::PromptRef;
-pub use spec::{PromptSpec, compile_prompt};
+pub use spec::{PromptSpec, PromptStatus, compile_prompt};
 pub use validate::{PromptError, validate};
 
 #[cfg(test)]
@@ -461,6 +461,10 @@ mod prompt_authored_tests {
             ProviderRequest::OpenAiChatCompletion(_)
         ));
         assert_eq!(prompt.prompt.variables, vec!["persona", "doc"]);
+        assert_eq!(
+            serde_json::to_value(prompt.status()).expect("status json"),
+            serde_json::json!({"variables": ["persona", "doc"], "media_variables": []})
+        );
         assert_eq!(prompt.prompt.response_type, ResponseType::Text);
         assert_eq!(
             spec,

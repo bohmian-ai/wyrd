@@ -1179,6 +1179,22 @@ Every Wyrd pod has at least 4 GiB of memory; boot refuses a detected limit
 below that floor, so the smallest supported pod has a 3-GiB cap and a
 1.5-GiB query grant.
 
+Each process resolves one immutable resource configuration at startup, before
+any consumer starts, from its own observed CPU, memory, and scratch, never a
+peer's. `WYRD_BIFROST_EFFECTIVE_CPU` may only lower the observed CPU `C`.
+Scribe, Oracle, Forge, storage, transport, and the process Scribe outbox size
+themselves from that configuration or a capability derived from it; none
+probes the host. Omitted Scribe coordination, ingress, and persistence worker
+counts derive from `C` (`B = max(C - 2, 2)`: ingress `max(B / 3, 1)`,
+persistence `max(B - ingress, 1)`, coordination `max(C, 2)`); an explicit
+worker count keeps its value. The outbox runs `W = max(4, C)` slice writers,
+`W` ordered lanes per tenant, eight concurrent frame deliveries per writer,
+and at most `8 * W` deliveries across the process. These are concurrency
+ceilings, not reserved cores or memory; queue capacities, database pools, WAL
+IO, and Scribe shard counts do not scale with `C`. Startup logs the resolved
+configuration, its sources, explicit overrides, and queue limits. Usage and
+pressure counters stay live; only the configuration is fixed.
+
 Only fallible cooperative reservation is hard-limited. Growth DataFusion does
 not let fail is still real memory, so it is charged to an explicit process
 headroom counter that makes later fallible growth refuse sooner. Dependency
@@ -1363,8 +1379,9 @@ Python, TypeScript, and MCP.
 
 `bifrost.system.audit_log` is the authoritative retained audit history. Every
 audit event is staged in memory on the process Scribe outbox, whose one
-background writer cuts each tenant's writes into producer lanes keyed by
-request, Verifier execution, or a queued submission's idempotency key, lets a
+logical dispatcher cuts each tenant's writes into its fixed producer lanes keyed by
+request, Verifier execution, or a queued submission's idempotency key, hands
+independent lanes' slices to concurrent slice writers, lets a
 lane's slice linger until its oldest write is 50 ms old or it holds 4,096 writes
 or 32 MiB of accounted bytes, as a Kafka producer's `linger.ms` and `batch.size`
 do, takes at most 32 MiB of a lane's backlog per slice, so a large backlog is
@@ -1383,6 +1400,9 @@ platform audit principal, the one principal Scribe admits for the reserved
 system owner's audit history. A retryable failure resubmits the identical
 slice, so Scribe's durable batch-id fence absorbs a write whose
 acknowledgement was lost; later arrivals in that lane wait for the next slice.
+A delivery stays counted against the process ceiling from encoding through
+Scribe's acknowledgement, including blocking encoding whose waiter was
+cancelled; the count bounds concurrency, not bytes.
 Producer lanes are independent of Scribe shards, which keep their own routing,
 WAL, and fence. A row carries
 only decision content: there is no chain, sequence, or publication progress,

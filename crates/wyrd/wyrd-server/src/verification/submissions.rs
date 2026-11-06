@@ -7,7 +7,7 @@
 //! No queue row exists before that acknowledgement. The generic [`Outbox`]
 //! owns the bounded queue, per-lane batching, retry with backoff, and
 //! shutdown; [`SubmissionSink`] is its one durable write. Each tenant's work
-//! is spread over [`SubmissionSink::LANES`] lanes that commit concurrently;
+//! is spread over [`SUBMISSION_WRITER_CONNECTIONS`] lanes that commit concurrently;
 //! every submission under one idempotency key shares a lane, and every
 //! scheduled and group candidate of a tenant shares lane 0, so their
 //! retries, conflicts, and source transitions are decided in arrival order. Each write is one tenant transaction: submissions resolve
@@ -163,7 +163,9 @@ impl OutboxSink for SubmissionSink {
     const NAME: &'static str = "verifier_submissions";
 
     /// Wyrd pool connections the writer holds per tenant at once.
-    const LANES: usize = SUBMISSION_WRITER_CONNECTIONS;
+    fn lanes(&self) -> usize {
+        SUBMISSION_WRITER_CONNECTIONS
+    }
 
     /// See [`Self::admission_lane`].
     fn lane(item: &Acknowledged) -> u64 {
@@ -359,7 +361,7 @@ mod tests {
     /// population misses a lane.
     #[test]
     fn one_keys_submissions_share_a_lane() {
-        let lanes = SubmissionSink::LANES as u64;
+        let lanes = SUBMISSION_WRITER_CONNECTIONS as u64;
         let mut homes: HashMap<String, u64> = HashMap::new();
         let mut keyed_lanes = HashSet::new();
         for submission in submissions(1_024, Some(63)) {
@@ -375,7 +377,7 @@ mod tests {
                 SubmissionSink::admission_lane(&Admission::Submitted(submission.clone())) % lanes
             })
             .collect();
-        assert_eq!(keyed_lanes.len(), SubmissionSink::LANES);
-        assert_eq!(unkeyed_lanes.len(), SubmissionSink::LANES);
+        assert_eq!(keyed_lanes.len(), SUBMISSION_WRITER_CONNECTIONS);
+        assert_eq!(unkeyed_lanes.len(), SUBMISSION_WRITER_CONNECTIONS);
     }
 }

@@ -401,6 +401,36 @@ async fn build_bifrost_external_dependencies(
     let resources = runtime_resources
         .compose_roles()
         .map_err(|error| ServerBootError::Scribe(error.to_string()))?;
+    // Every Bifrost consumer below sizes itself from this one plan, so an
+    // operator comparing hosts reads the whole resolved configuration here.
+    let plan = resources.plan();
+    let sources = resources.sources();
+    let overrides = config.scribe.worker_overrides();
+    tracing::info!(
+        effective_cpu = plan.effective_cpu,
+        cpu_source = ?sources.cpu,
+        memory_limit_bytes = plan.memory_limit_bytes,
+        memory_source = ?sources.memory,
+        server_memory_min_bytes = plan.server_memory_min_bytes,
+        managed_memory_bytes = plan.managed_memory_bytes,
+        bifrost_memory_cap_bytes = ?config.resources.memory_limit_bytes,
+        scratch_limit_bytes = plan.scratch_limit_bytes,
+        scratch_source = ?sources.scratch,
+        scribe_coordination_threads = plan.scribe_workers.coordination_threads,
+        scribe_ingress_cpu_threads = plan.scribe_workers.ingress_cpu_threads,
+        scribe_persistence_cpu_threads = plan.scribe_workers.persistence_cpu_threads,
+        explicit_coordination_threads = ?overrides.coordination_threads,
+        explicit_ingress_cpu_threads = ?overrides.ingress_cpu_threads,
+        explicit_persistence_cpu_threads = ?overrides.persistence_cpu_threads,
+        outbox_writers = plan.outbox.writers,
+        outbox_lanes = plan.outbox.lanes,
+        outbox_deliveries_per_writer = plan.outbox.deliveries_per_writer,
+        outbox_deliveries = plan.outbox.deliveries,
+        outbox_capacity_items = config.scribe.outbox_capacity,
+        outbox_capacity_bytes = config.scribe.outbox_bytes,
+        oracle_query_slot_limit = ?plan.oracle_query_slot_limit,
+        "Bifrost resource configuration resolved"
+    );
     // Boot order is resources -> storage owner -> catalog. The owner's cache
     // budget is a share of this node's managed memory and is allocated only for
     // an Oracle-serving target, so it cannot be resolved before the resource
@@ -903,6 +933,7 @@ pub async fn compose_bifrost(
             bytes: scribe_config.outbox_bytes,
         },
         Some(postgres.wyrd().clone()),
+        resource_plan.outbox,
     );
     let scribe = if let Some(parts) = scribe {
         let fragment_security_audit = Arc::new(

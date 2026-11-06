@@ -588,3 +588,98 @@ async fn unready_roles_heartbeat_until_teardown_ends_membership_tasks()
     server.shutdown().await?;
     Ok(())
 }
+
+/// Raw process observation with `cpu` effective CPUs over the pod floor.
+fn observation(cpu: usize) -> vala_bifrost_redux::resources::SystemResourceSnapshot {
+    vala_bifrost_redux::resources::SystemResourceSnapshot {
+        memory_limit_bytes: vala_bifrost_redux::resources::MIN_POD_MEMORY_BYTES,
+        effective_cpu: cpu,
+        scratch_capacity_bytes: 4 * 1024 * 1024 * 1024,
+        scratch_available_bytes: 4 * 1024 * 1024 * 1024,
+        memory_source: vala_bifrost_redux::resources::ResourceSource::Injected,
+        cpu_source: vala_bifrost_redux::resources::ResourceSource::Injected,
+    }
+}
+
+/// Every startup consumer of one process sizes itself from that process's plan.
+///
+/// A split-role cluster gives its Oracle-only producer, which sends its outbox
+/// to the peer Scribe, and its Scribe node different observations; each must
+/// resolve outbox and worker counts from its own CPU, never its peer's. A
+/// combined node with an effective CPU cap and one explicit worker count must
+/// size every consumer from the capped CPU while keeping the explicit value.
+/// Scribe and Oracle capabilities must reference their node's one resource root.
+///
+/// # Panics
+///
+/// Panics when a cluster cannot start, a node composes no resources, or any
+/// consumer's sizing differs from the node's resolved plan.
+#[tokio::test]
+#[ignore = "requires Postgres and object storage"]
+async fn startup_consumers_share_one_resource_configuration() {
+    use vala_bifrost_redux::resources::{OutboxExecution, ScribeWorkerOverrides, ScribeWorkers};
+    use wyrd_server::config::BifrostTarget;
+    use wyrd_testing::bifrost::TestOracleResources;
+
+    let assert_node =
+        |server: &wyrd_testing::WyrdTestServer, cpu: usize, overrides: ScribeWorkerOverrides| {
+            let state = server.state();
+            let roles = state
+                .bifrost_resources()
+                .expect("a Bifrost node composes resources");
+            let plan = roles.plan();
+            assert_eq!(plan.effective_cpu, cpu, "the node resolves its own CPU");
+            assert_eq!(
+                plan.outbox,
+                OutboxExecution::resolve(cpu).expect("the outbox counts resolve")
+            );
+            assert_eq!(plan.scribe_workers, ScribeWorkers::resolve(cpu, overrides));
+            assert_eq!(
+                state.bifrost.scribe_outbox().sink().execution(),
+                plan.outbox,
+                "the process outbox runs the plan's counts"
+            );
+            if let Some(scribe) = roles.scribe() {
+                assert!(scribe.shares_root_with(roles));
+            }
+            if let Some(oracle) = roles.oracle() {
+                assert!(oracle.shares_root_with(roles));
+            }
+        };
+
+    let mut split =
+        BifrostClusterSpec::for_targets(&[BifrostTarget::Oracle, BifrostTarget::Scribe]);
+    for (node, cpu) in split.nodes.iter_mut().zip([16, 4]) {
+        node.oracle = Some(TestOracleResources {
+            system_resources: Some(observation(cpu)),
+            ..TestOracleResources::default()
+        });
+    }
+    let cluster = WyrdTestCluster::start_spec(split)
+        .await
+        .expect("the split-role cluster starts");
+    for (index, cpu) in [(0, 16), (1, 4)] {
+        let server = cluster
+            .server(index)
+            .unwrap_or_else(|| panic!("node {index} is bound"));
+        assert_node(server, cpu, ScribeWorkerOverrides::default());
+    }
+    drop(cluster);
+
+    let overrides = ScribeWorkerOverrides {
+        ingress_cpu_threads: Some(5),
+        ..ScribeWorkerOverrides::default()
+    };
+    let mut combined = BifrostClusterSpec::for_targets(&[BifrostTarget::All]);
+    combined.nodes[0].oracle = Some(TestOracleResources {
+        system_resources: Some(observation(32)),
+        effective_cpu_cap: Some(8),
+        scribe_workers: overrides,
+        ..TestOracleResources::default()
+    });
+    let cluster = WyrdTestCluster::start_spec(combined)
+        .await
+        .expect("the combined node starts");
+    let server = cluster.server(0).expect("the combined node is bound");
+    assert_node(server, 8, overrides);
+}

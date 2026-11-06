@@ -109,6 +109,10 @@ pub struct TestOracleResources {
     /// resource plan derives. `None` keeps the derived count; a journey sets
     /// it only to saturate an admission class deterministically.
     pub oracle_query_slot_limit: Option<usize>,
+    /// `bifrost.resources.effective_cpu`, which may only lower the observed CPU.
+    pub effective_cpu_cap: Option<usize>,
+    /// Explicit Scribe worker counts; omitted ones derive from effective CPU.
+    pub scribe_workers: vala_bifrost_redux::resources::ScribeWorkerOverrides,
 }
 
 /// Concrete role and identity descriptor for one Bifrost pod.
@@ -1865,6 +1869,12 @@ impl WyrdTestCluster {
             .and_then(|oracle| oracle.oracle_query_slot_limit)
         {
             builder = builder.with_oracle_query_slot_limit_for_test(slots);
+        }
+        if let Some(oracle) = resources.spec.oracle.as_ref() {
+            builder = builder.with_scribe_workers_for_test(oracle.scribe_workers);
+            if let Some(cpu) = oracle.effective_cpu_cap {
+                builder = builder.with_effective_cpu_cap_for_test(cpu);
+            }
         }
         // Journey tables hold kilobytes. One byte per scan task spreads them
         // over the cluster's Oracle followers the way a production-sized table

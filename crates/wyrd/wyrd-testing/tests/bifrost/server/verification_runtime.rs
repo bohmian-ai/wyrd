@@ -8046,3 +8046,157 @@ async fn custom_query_preserves_evidence_and_limits() -> Result<(), ServerJourne
     cluster.shutdown().await?;
     Ok(())
 }
+
+/// Queued SDK verification keeps its evidence under every outbox geometry.
+///
+/// A combined node at the four-CPU baseline and at sixteen CPUs, and a split
+/// Oracle/Scribe pair at sixteen CPUs whose producer has no local Scribe, each
+/// take more independent queued executions than the process has outbox
+/// lanes. An unknown Verifier is refused before anything is queued. Each
+/// accepted execution reaches the queue only once Scribe acknowledged it,
+/// completes through the real runtime, and publishes exactly one passing
+/// result attributed to the submitting service, readable through Oracle
+/// after the outbox drains and the node shuts down cleanly.
+///
+/// # Errors
+/// Returns cluster, seeding, route, runtime, or query errors, or a
+/// description of the first expectation that does not hold.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires the serialized Postgres-backed journey lane"]
+async fn scaled_outboxes_preserve_sdk_evidence() -> Result<(), ServerJourneyError> {
+    use wyrd_server::config::BifrostTarget;
+    const EXECUTIONS: usize = 40;
+    for (targets, cpu) in [
+        (&[BifrostTarget::All][..], 4),
+        (&[BifrostTarget::All][..], 16),
+        (&[BifrostTarget::Oracle, BifrostTarget::Scribe][..], 16),
+    ] {
+        let mut spec = BifrostClusterSpec::for_targets(targets);
+        for node in &mut spec.nodes {
+            if let Some(observed) = node
+                .oracle
+                .as_mut()
+                .and_then(|oracle| oracle.system_resources.as_mut())
+            {
+                observed.effective_cpu = cpu;
+            }
+        }
+        let cluster = WyrdTestCluster::start_spec(spec).await?;
+        let tenant = cluster.data_tenant_id();
+        let producer = cluster.server(0).ok_or("missing producer node")?;
+        let scribe = cluster
+            .servers()
+            .find(|server| server.bifrost_scribe().is_some())
+            .ok_or("the cluster composed no Scribe")?;
+        let seed = VerificationFixture::provision(producer.state(), tenant).await?;
+        let (subject, _) = seed.service("scaled-subject").await?;
+        let verifier = assert_verifier(&seed, "scaled-assert").await?;
+        producer
+            .seed_role(
+                QUEUED_RUNNER,
+                &[Permission::card_read(), Permission::verifier_run_any()],
+            )
+            .await?;
+        let caller = producer
+            .bootstrap_service("scaled-caller", &[QUEUED_RUNNER])
+            .await?;
+        let client = super::query::client_for(
+            producer,
+            caller.api_key().ok_or("the caller carries an API key")?,
+        )?;
+        let inputs = json!({ "x": { "kind": "json", "value": true } });
+
+        let refused = client
+            .request_json::<_, Value>(
+                reqwest::Method::POST,
+                "/v1/verification/enqueue",
+                Some(&enqueue_body(
+                    &CardUid::new(uuid::Uuid::now_v7().to_string())?,
+                    &subject,
+                    inputs.clone(),
+                )),
+            )
+            .await;
+        if refused.is_ok() || !seed.executions().await?.is_empty() {
+            return Err("an unknown Verifier was queued".into());
+        }
+
+        let mut accepted = Vec::with_capacity(EXECUTIONS);
+        for _ in 0..EXECUTIONS {
+            let started: Value = client
+                .request_json(
+                    reqwest::Method::POST,
+                    "/v1/verification/enqueue",
+                    Some(&enqueue_body(&verifier, &subject, inputs.clone())),
+                )
+                .await?;
+            accepted.push(await_queued(&seed, &started).await?);
+        }
+        let runtime = VerificationRuntime::builder(producer.state())
+            .build()
+            .ok_or("the runtime did not compose")?;
+        let stop = CancellationToken::new();
+        let task = tokio::spawn(runtime.run(stop.clone()));
+        let deadline = tokio::time::Instant::now() + WAIT;
+        for &execution in &accepted {
+            loop {
+                let row = seed.execution(execution).await?;
+                if row.status == "completed" {
+                    break;
+                }
+                if tokio::time::Instant::now() >= deadline {
+                    return Err(format!("{execution} never completed: {row:?}").into());
+                }
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        }
+        stop.cancel();
+        tokio::time::timeout(WAIT, task).await??;
+
+        let unwritten = producer
+            .state()
+            .bifrost
+            .scribe_outbox()
+            .settle(std::time::Instant::now() + WAIT)
+            .await;
+        if unwritten != 0 {
+            return Err(format!("{unwritten} results never reached Scribe").into());
+        }
+        scribe.flush_bifrost().await?;
+        cluster.refresh_oracle_snapshots().await?;
+        let caller_id = caller.id().as_uuid();
+        let ids = accepted
+            .iter()
+            .map(|execution| format!("'{execution}'"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let rows = query_rows(
+            producer,
+            tenant,
+            format!(
+                "SELECT DISTINCT execution_id FROM bifrost.verification.results \
+                 WHERE CAST(execution_id AS VARCHAR) IN ({ids}) AND verdict = 'passed' \
+                 AND {SUB_PRINCIPAL_ID} = '{caller_id}' AND {SUBJECT_CARD_UID} = '{subject}'"
+            ),
+        )
+        .await?;
+        let all = query_rows(
+            producer,
+            tenant,
+            format!(
+                "SELECT result_id FROM bifrost.verification.results \
+                 WHERE CAST(execution_id AS VARCHAR) IN ({ids})"
+            ),
+        )
+        .await?;
+        if (rows, all) != (EXECUTIONS as u64, EXECUTIONS as u64) {
+            return Err(format!(
+                "{targets:?} at {cpu} CPUs: {rows} attributed executions of {all} results, \
+                 expected {EXECUTIONS} each"
+            )
+            .into());
+        }
+        cluster.shutdown().await?;
+    }
+    Ok(())
+}

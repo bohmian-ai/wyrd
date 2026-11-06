@@ -13,9 +13,9 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use secrecy::{ExposeSecret, SecretString};
-use vala_bifrost_redux::resources::ScribeWorkerOverrides;
 use serde::Deserialize;
 use url::Url;
+use vala_bifrost_redux::resources::ScribeWorkerOverrides;
 use vala_bifrost_redux::scribe::geometry::{ScribeGeometry, ScribeGeometryError};
 use wyrd_auth_oidc::{AddressPolicy, ScreenedHttp};
 use wyrd_crypt::SealingKeyring;
@@ -1436,7 +1436,6 @@ pub struct BifrostResourceConfig {
     #[serde(default)]
     pub oracle_partition_scan_bytes: Option<u64>,
 }
-
 
 fn default_scribe_wal_io_threads() -> usize {
     4
@@ -5065,20 +5064,21 @@ minimum_slots = 2
                     memory_source: ResourceSource::Injected,
                     cpu_source: ResourceSource::Injected,
                 },
-                config
-                    .bifrost
-                    .resource_policy([BifrostRole::Scribe].into_iter().collect(), None, None),
+                config.bifrost.resource_policy(
+                    [BifrostRole::Scribe].into_iter().collect(),
+                    None,
+                    None,
+                ),
             )
             .expect("plan resolves")
             .plan()
         };
-        let workers = |coordination_threads, ingress_cpu_threads, persistence_cpu_threads| {
-            ScribeWorkers {
+        let workers =
+            |coordination_threads, ingress_cpu_threads, persistence_cpu_threads| ScribeWorkers {
                 coordination_threads,
                 ingress_cpu_threads,
                 persistence_cpu_threads,
-            }
-        };
+            };
         let cap = "[bifrost.resources]\neffective_cpu = 8\n";
         // C = 8: coordination max(8, 2), budget 6, ingress 2, persistence 4.
         let omitted = resolve(cap);
@@ -5095,10 +5095,9 @@ minimum_slots = 2
         let explicit = "[bifrost.scribe]\ncoordination_threads = 8\ningress_cpu_threads = 2\n\
                         persistence_cpu_threads = 4\n";
         assert_eq!(resolve(explicit).scribe_workers, workers(8, 2, 4));
-        let config = from_toml_str_with_dev_oracle_opt_in(
-            "[bifrost.scribe]\npersistence_cpu_threads = 0\n",
-        )
-        .expect("a zero count parses");
+        let config =
+            from_toml_str_with_dev_oracle_opt_in("[bifrost.scribe]\npersistence_cpu_threads = 0\n")
+                .expect("a zero count parses");
         let error = config
             .bifrost
             .scribe

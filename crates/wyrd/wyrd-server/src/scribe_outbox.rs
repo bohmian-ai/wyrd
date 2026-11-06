@@ -7,7 +7,7 @@
 //! groups those rows by destination into frames under batch ids derived from
 //! the slice's idempotency key, splitting any group larger than a quarter of
 //! the configured Scribe request ceiling by rows on the blocking pool, and
-//! submits up to [`FRAMES_IN_FLIGHT`] chunks of frames at once in-process to
+//! submits up to [`OUTBOX_DELIVERIES_PER_WRITER`](vala_bifrost_redux::resources::OUTBOX_DELIVERIES_PER_WRITER) chunks of frames at once in-process to
 //! this pod's Scribe as canonical batches, never encoded, or over the peer
 //! plane to a live one as Arrow IPC streams, each encoded once. A
 //! peer call that has not answered within [`PEER_SUBMIT_TIMEOUT`] fails as
@@ -22,11 +22,17 @@
 //! `outbox_events_lost_total{outbox="scribe",reason="rejected"}`, and
 //! consumed, and a write for a process that can reach no Scribe likewise with
 //! `reason="unreachable"`, so later writes for the tenant continue. Each
-//! tenant's writes spread over [`SCRIBE_LANES`] lanes by request or
+//! tenant's writes spread over the resource plan's [`OutboxExecution::lanes`]
+//! lanes by request or
 //! Verifier execution, so one call's decision and capture, or one
 //! execution's inputs and result, keep their order while different calls
 //! and executions are written concurrently. These producer lanes are not
-//! Scribe shards: Scribe routes every frame it admits by its own key. Work
+//! Scribe shards: Scribe routes every frame it admits by its own key. The one
+//! logical outbox dispatcher writes up to [`OutboxExecution::writers`] slices
+//! at once; each delivery, from the start of its encoding until Scribe
+//! answers it, holds one of the process's [`OutboxExecution::deliveries`]
+//! permits, so encoding work a cancelled write leaves running still counts.
+//! Work
 //! held here is process memory: abrupt process death or the shutdown
 //! deadline loses it without changing the operation that produced it.
 //!
@@ -70,6 +76,7 @@ use vala_bifrost_redux::contracts::{
 use vala_bifrost_redux::gate::attribution::{CardRegistry, batch_card_uids, native_card_uids};
 use vala_bifrost_redux::namespaces::BifrostNamespace;
 use vala_bifrost_redux::oracle::dispatcher::BifrostPeerTls;
+use vala_bifrost_redux::resources::OutboxExecution;
 use vala_bifrost_redux::tables::audit::projection::stage_audit_event;
 use vala_bifrost_redux::tables::gateway::CallsTable;
 use vala_bifrost_redux::tables::staged::StagedRow;
@@ -105,13 +112,6 @@ use crate::verification::submissions::{Queued, SubmissionSink};
 /// The process's one non-blocking outbox for every Scribe-bound write.
 pub type ScribeOutbox = Outbox<ScribeSink>;
 
-/// Most slices written at once, across every tenant and lane.
-const SCRIBE_WRITERS: usize = 4;
-
-/// Lanes each tenant's Scribe writes spread over; see
-/// [`ScribeSink::lane`].
-const SCRIBE_LANES: usize = 4;
-
 /// Default of `scribe.outbox_capacity`: the most writes the process Scribe
 /// outbox admits at once, queued, retrying, or in flight.
 ///
@@ -143,7 +143,7 @@ const SCRIBE_BATCH_WRITES: usize = 4_096;
 /// so an unbounded write of a payload-capture backlog, hundreds of
 /// megabytes, held the reserved byte share for its whole duration and made
 /// new calls wait for it. At the default 16 MiB Scribe request ceiling this
-/// is [`FRAMES_IN_FLIGHT`] frames of [`frame_budget`], so one write's frames
+/// is [`OUTBOX_DELIVERIES_PER_WRITER`](vala_bifrost_redux::resources::OUTBOX_DELIVERIES_PER_WRITER) frames of [`frame_budget`], so one write's frames
 /// are all submitted at once and its capacity returns within one round of
 /// acknowledgements.
 const SCRIBE_BATCH_BYTES: usize = 32 << 20;
@@ -160,16 +160,6 @@ pub(crate) const SCRIBE_BYTES: usize = 1 << 30;
 /// Matches the other Bifrost peer call budgets. Expiry surfaces as
 /// `DeadlineExceeded`, which classifies as [`ScribeRefusal::Unavailable`].
 const PEER_SUBMIT_TIMEOUT: Duration = Duration::from_secs(30);
-
-/// Most frames of one tenant slice awaiting Scribe's acknowledgement at once.
-///
-/// Each frame waits for its own durable acknowledgement, so submitting them
-/// one at a time made a slice's write time the sum of its acknowledgements.
-/// Concurrent frames share Scribe's WAL commits instead. The bound keeps one
-/// slice's encoded frames, about this many times the frame budget, within
-/// the memory a large backlog may take, and leaves Scribe admission room for
-/// the other writers' slices.
-const FRAMES_IN_FLIGHT: usize = 8;
 
 /// Frame budget for a Scribe request ceiling of `request_bytes`.
 ///
@@ -974,9 +964,93 @@ pub struct ScribeSink {
     /// Wyrd Postgres owner recording acknowledged grouped activity; `None`
     /// schedules no group.
     groups: Option<WyrdPostgres>,
+    /// Writers, lanes, and delivery ceilings the resource plan resolved.
+    execution: OutboxExecution,
+    /// The process's [`OutboxExecution::deliveries`] permits; each delivery
+    /// holds one from the start of its encoding until Scribe answers it.
+    deliveries: Arc<Semaphore>,
+    /// Parks every encoding after it starts, so a test can cancel its waiter.
+    #[cfg(test)]
+    encoding_hold: Option<Arc<EncodingHold>>,
+}
+
+/// Test seam that parks each encoding on the blocking pool once it starts.
+#[cfg(test)]
+#[derive(Default)]
+pub(crate) struct EncodingHold {
+    /// Encodings started so far.
+    started: Mutex<usize>,
+    /// Whether parked encodings may finish.
+    released: Mutex<bool>,
+    /// Wakes parked encodings and waiters on `started`.
+    changed: std::sync::Condvar,
+}
+
+#[cfg(test)]
+impl EncodingHold {
+    /// Counts one started encoding, then blocks until released.
+    ///
+    /// The wait is bounded so a failed assertion cannot leave the runtime's
+    /// shutdown joined on parked blocking threads forever.
+    ///
+    /// # Panics
+    ///
+    /// Panics when a lock is poisoned.
+    fn park(&self) {
+        *self.started.lock().expect("started") += 1;
+        self.changed.notify_all();
+        let released = self.released.lock().expect("released");
+        drop(
+            self.changed
+                .wait_timeout_while(released, Duration::from_secs(30), |released| !*released)
+                .expect("released"),
+        );
+    }
+
+    /// Blocks until `count` encodings have started.
+    ///
+    /// # Panics
+    ///
+    /// Panics when a lock is poisoned.
+    pub(crate) fn wait_started(&self, count: usize) {
+        drop(
+            self.changed
+                .wait_while(self.started.lock().expect("started"), |started| {
+                    *started < count
+                })
+                .expect("started"),
+        );
+    }
+
+    /// Encodings started so far.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the lock is poisoned.
+    pub(crate) fn started(&self) -> usize {
+        *self.started.lock().expect("started")
+    }
+
+    /// Lets every parked and later encoding finish.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the lock is poisoned.
+    pub(crate) fn release(&self) {
+        *self.released.lock().expect("released") = true;
+        self.changed.notify_all();
+    }
 }
 
 impl ScribeSink {
+    /// The writer, lane, and delivery counts this sink runs, so an
+    /// owner-inspection journey can compare them with the resource plan.
+    #[cfg(feature = "test-support")]
+    #[must_use]
+    pub const fn execution(&self) -> OutboxExecution {
+        self.execution
+    }
+
     /// The default outbox limits, [`SCRIBE_CAPACITY`] writes and
     /// [`SCRIBE_BYTES`] bytes, for outboxes built without a configuration.
     #[cfg(any(test, feature = "test-support"))]
@@ -998,13 +1072,32 @@ impl ScribeSink {
     #[cfg(any(test, feature = "test-support"))]
     #[must_use]
     pub(crate) fn outbox(route: Option<ScribeRoute>, request_bytes: usize) -> Arc<ScribeOutbox> {
-        Self::bounded_outbox(route, request_bytes, Self::DEFAULT_LIMITS, None)
+        Self::bounded_outbox(
+            route,
+            request_bytes,
+            Self::DEFAULT_LIMITS,
+            None,
+            Self::baseline_execution(),
+        )
+    }
+
+    /// The four-writer outbox concurrency a four-CPU plan resolves, for
+    /// outboxes built without a resource plan.
+    ///
+    /// # Panics
+    ///
+    /// Never: four writers' deliveries are representable.
+    #[cfg(any(test, feature = "test-support"))]
+    #[must_use]
+    pub(crate) fn baseline_execution() -> OutboxExecution {
+        OutboxExecution::resolve(vala_bifrost_redux::resources::OUTBOX_MIN_WRITERS)
+            .expect("the baseline outbox concurrency is representable")
     }
 
     /// Starts an outbox like [`Self::outbox`] admitting at most `limits`
-    /// writes and bytes (`scribe.outbox_capacity` and `scribe.outbox_bytes`)
-    /// and recording acknowledged grouped activity through `groups`, when
-    /// given.
+    /// writes and bytes (`scribe.outbox_capacity` and `scribe.outbox_bytes`),
+    /// recording acknowledged grouped activity through `groups`, when given,
+    /// and writing with the resource plan's `execution` concurrency.
     ///
     /// # Panics
     /// Panics when called outside a Tokio runtime, because the writer task is
@@ -1015,17 +1108,33 @@ impl ScribeSink {
         request_bytes: usize,
         limits: OutboxLimits,
         groups: Option<WyrdPostgres>,
+        execution: OutboxExecution,
     ) -> Arc<ScribeOutbox> {
         Outbox::new(
-            Self {
-                route,
-                attempts: AtomicUsize::new(0),
-                frame_budget: frame_budget(request_bytes),
-                groups,
-            },
-            SCRIBE_WRITERS,
+            Self::new(route, request_bytes, groups, execution),
+            execution.writers,
             limits,
         )
+    }
+
+    /// A sink submitting along `route` in frames sized for `request_bytes`,
+    /// holding `execution`'s delivery permits.
+    fn new(
+        route: Option<ScribeRoute>,
+        request_bytes: usize,
+        groups: Option<WyrdPostgres>,
+        execution: OutboxExecution,
+    ) -> Self {
+        Self {
+            route,
+            attempts: AtomicUsize::new(0),
+            frame_budget: frame_budget(request_bytes),
+            groups,
+            execution,
+            deliveries: Arc::new(Semaphore::new(execution.deliveries)),
+            #[cfg(test)]
+            encoding_hold: None,
+        }
     }
 
     /// Starts an outbox submitting in-process to `scribe`, standing in for a
@@ -1046,6 +1155,7 @@ impl ScribeSink {
             vala_bifrost_redux::gate::limits::BIFROST_INGEST_REQUEST_LIMIT_BYTES,
             Self::DEFAULT_LIMITS,
             groups,
+            Self::baseline_execution(),
         )
     }
 
@@ -1481,13 +1591,15 @@ impl Chunk {
 impl ScribeSink {
     /// Submits every frame of `frames`, the frames of outbox slice `slice`
     /// from index `first` on, along `route` for write `attempt`, keeping up
-    /// to [`FRAMES_IN_FLIGHT`] chunks encoding or awaiting acknowledgement.
+    /// to [`OutboxExecution::deliveries_per_writer`] chunks encoding or
+    /// awaiting acknowledgement.
     /// `items` are the slice's writes.
     ///
     /// Each frame is cut into [`Chunk`]s, and each chunk is concatenated and
     /// encoded on the blocking pool by [`Self::deliver`] only as a slot
     /// frees, so the slice's encoding runs in parallel and at most
-    /// [`FRAMES_IN_FLIGHT`] chunks' streams are held at once. Writes whose
+    /// [`OutboxExecution::deliveries_per_writer`] chunks' streams are held at
+    /// once. Writes whose
     /// rows cannot be encoded, or whose stream Scribe rejects terminally,
     /// are added to `lost`. Each storage object write of `items` is notified
     /// as its own frame is acknowledged. After a retryable refusal no further
@@ -1502,7 +1614,8 @@ impl ScribeSink {
     ///
     /// Dropping the future drops the chunks in flight; Scribe may already
     /// hold some of their streams, and the retried slice resubmits them
-    /// under the same batch ids.
+    /// under the same batch ids. An encoding already running keeps its
+    /// delivery permit until it finishes.
     async fn submit(
         &self,
         route: &ScribeRoute,
@@ -1522,7 +1635,7 @@ impl ScribeSink {
                 .map(move |(chunk, rows)| ((slice, first + index, chunk), rows))
         });
         for (origin, chunk) in chunks {
-            if in_flight.len() == FRAMES_IN_FLIGHT
+            if in_flight.len() == self.execution.deliveries_per_writer
                 && let Some(done) = in_flight.next().await
             {
                 Self::tally(tenant, items, done, lost, &mut refused);
@@ -1530,7 +1643,7 @@ impl ScribeSink {
             if refused.is_some() {
                 break;
             }
-            in_flight.push(Self::deliver(route, tenant, origin, chunk, budget, attempt));
+            in_flight.push(self.deliver(route, tenant, origin, chunk, attempt));
         }
         while let Some(done) = in_flight.next().await {
             Self::tally(tenant, items, done, lost, &mut refused);
@@ -1538,8 +1651,14 @@ impl ScribeSink {
         refused.map_or(Ok(()), Err)
     }
 
-    /// Encodes `chunk` on the blocking pool, then submits its streams along
-    /// `route` in turn, stopping after a retryable refusal.
+    /// Takes one of the process's delivery permits, encodes `chunk` on the
+    /// blocking pool, then submits its streams along `route` in turn,
+    /// stopping after a retryable refusal.
+    ///
+    /// The encoding owns the permit while it runs, so dropping this future
+    /// mid-encoding leaves that work counted until it finishes; once it
+    /// returns, this future holds the permit until Scribe has answered every
+    /// submitted stream.
     ///
     /// Returns each submitted stream with its answer, and the slice positions
     /// of the chunk's writes when its rows could not be encoded, which is
@@ -1547,20 +1666,32 @@ impl ScribeSink {
     ///
     /// # Panics
     ///
-    /// Re-raises a panic of the encoding. The encoding is not cancelled
-    /// while this future awaits it, since a runtime shutting down drops this
-    /// future first.
+    /// Re-raises a panic of the encoding, and panics if the process's
+    /// delivery semaphore was closed, which nothing does. The encoding is not
+    /// cancelled while this future awaits it, since a runtime shutting down
+    /// drops this future first.
     async fn deliver(
+        &self,
         route: &ScribeRoute,
         tenant: DataTenantId,
         origin: Origin,
         chunk: Chunk,
-        budget: usize,
         attempt: usize,
     ) -> (Vec<Submitted>, Vec<usize>) {
+        let permit = Arc::clone(&self.deliveries)
+            .acquire_owned()
+            .await
+            .expect("the delivery semaphore is never closed");
         let in_process = route.in_process();
+        let budget = self.frame_budget;
+        #[cfg(test)]
+        let hold = self.encoding_hold.clone();
         let encoding = tokio::task::spawn_blocking(move || {
-            match chunk.encode(tenant, origin, budget, in_process) {
+            #[cfg(test)]
+            if let Some(hold) = hold {
+                hold.park();
+            }
+            let encoded = match chunk.encode(tenant, origin, budget, in_process) {
                 Ok(streams) => Ok(streams),
                 Err(error) => Err((
                     error,
@@ -1571,15 +1702,19 @@ impl ScribeSink {
                         .map(|(position, _)| position)
                         .collect(),
                 )),
-            }
+            };
+            (encoded, permit)
         });
-        let streams = match encoding.await {
-            Ok(Ok(streams)) => streams,
-            Ok(Err((error, table, owners))) => {
+        let (encoded, _permit) = match encoding.await {
+            Ok(done) => done,
+            Err(panicked) => std::panic::resume_unwind(panicked.into_panic()),
+        };
+        let streams = match encoded {
+            Ok(streams) => streams,
+            Err((error, table, owners)) => {
                 tracing::warn!(outbox = Self::NAME, %tenant, table = table.fqn(), %error, "a Scribe frame could not be encoded; its writes are dropped");
                 return (Vec::new(), owners);
             }
-            Err(panicked) => std::panic::resume_unwind(panicked.into_panic()),
         };
         let mut submitted = Vec::with_capacity(streams.len());
         for (batch, owners) in streams {
@@ -1640,8 +1775,11 @@ impl OutboxSink for ScribeSink {
     const NAME: &'static str = "scribe";
     /// Lanes one tenant's writes spread over, so its captures and decisions
     /// are written by several slices at once instead of waiting on one
-    /// slice's acknowledgements.
-    const LANES: usize = SCRIBE_LANES;
+    /// slice's acknowledgements: the resource plan's
+    /// [`OutboxExecution::lanes`].
+    fn lanes(&self) -> usize {
+        self.execution.lanes
+    }
     const LINGER: Duration = SCRIBE_LINGER;
     const BATCH_ITEMS: usize = SCRIBE_BATCH_WRITES;
     const BATCH_BYTES: usize = SCRIBE_BATCH_BYTES;
@@ -1702,7 +1840,8 @@ impl OutboxSink for ScribeSink {
     /// Writes one tenant's slice as destination frames: every detail frame,
     /// then, once all are acknowledged, every result summary frame.
     ///
-    /// Within each phase up to [`FRAMES_IN_FLIGHT`] frames await Scribe at
+    /// Within each phase up to [`OutboxExecution::deliveries_per_writer`]
+    /// frames await Scribe at
     /// once, so their acknowledgement order is not their row order. Every
     /// frame of this attempt is submitted to the same Scribe, so a retry
     /// after a peer refusal or timeout moves the whole slice to the next
@@ -1779,6 +1918,7 @@ mod tests {
     use vala_bifrost_redux::contracts::{FrameAdmission, Scribe, ScribeError, ScribeIngressFrame};
     use vala_bifrost_redux::gate::limits::BIFROST_INGEST_REQUEST_LIMIT_BYTES;
     use vala_bifrost_redux::oracle::dispatcher::BifrostPeerTls;
+    use vala_bifrost_redux::resources::{OUTBOX_DELIVERIES_PER_WRITER, OutboxExecution};
     use wyrd_runtime::audit::AuditStage;
     use wyrd_runtime::outbox::OutboxSink as _;
     use wyrd_spec::DataTenantId;
@@ -1810,10 +1950,9 @@ mod tests {
     use wyrd_tonic::otlp::trace::v1::{ResourceSpans, ScopeSpans, Span};
 
     use super::{
-        ACT_PRINCIPAL_ID, FRAMES_IN_FLIGHT, FramePayload, Outbox, PEER_SUBMIT_TIMEOUT,
-        SCRIBE_LANES, SCRIBE_WRITERS, SUB_PRINCIPAL_ID, ScribeOutbox, ScribePeers, ScribeRefusal,
-        ScribeRoute, ScribeSink, ScribeTable, ScribeWrite, ServerSpanSink, StagedRow,
-        TENANT_SPAN_PERMITS, concat_batches, frame_budget, payload_ipc,
+        ACT_PRINCIPAL_ID, EncodingHold, FramePayload, PEER_SUBMIT_TIMEOUT, SUB_PRINCIPAL_ID,
+        ScribeOutbox, ScribePeers, ScribeRefusal, ScribeRoute, ScribeSink, ScribeTable,
+        ScribeWrite, ServerSpanSink, StagedRow, TENANT_SPAN_PERMITS, concat_batches, payload_ipc,
     };
     use base64::Engine as _;
 
@@ -2124,7 +2263,7 @@ mod tests {
 
         let lanes: BTreeSet<u64> = (0..64)
             .map(|_| {
-                ScribeSink::lane(&ScribeWrite::from(decision("gateway.chat"))) % SCRIBE_LANES as u64
+                ScribeSink::lane(&ScribeWrite::from(decision("gateway.chat"))) % baseline_lanes()
             })
             .collect();
         assert!(lanes.len() > 1, "one tenant's calls spread over lanes");
@@ -2341,7 +2480,7 @@ mod tests {
                     let attempt = execution_result(execution, &uid(), background(), 0, 0);
                     assert_eq!(ScribeSink::lane(&attempt), lane);
                 }
-                lane % SCRIBE_LANES as u64
+                lane % baseline_lanes()
             })
             .collect();
         assert!(lanes.len() > 1, "one tenant's executions spread over lanes");
@@ -2458,7 +2597,7 @@ mod tests {
     async fn verification_lanes_keep_phase_order_across_retry() {
         let held = ExecutionId::new_v7();
         let lane = |execution| {
-            ScribeSink::lane(&direct_inputs(execution, background())) % SCRIBE_LANES as u64
+            ScribeSink::lane(&direct_inputs(execution, background())) % baseline_lanes()
         };
         let free = std::iter::repeat_with(ExecutionId::new_v7)
             .take(64)
@@ -2642,7 +2781,7 @@ mod tests {
     /// another producer waits for the held write, or a lost write notifies.
     #[tokio::test]
     async fn inventory_ack_is_isolated() {
-        let lane = |write: &ScribeWrite| ScribeSink::lane(write) % SCRIBE_LANES as u64;
+        let lane = |write: &ScribeWrite| ScribeSink::lane(write) % baseline_lanes();
         let path = (0..64)
             .map(|index| format!("held-{index}"))
             .find(|path| lane(&object(path).0) != 0)
@@ -3085,16 +3224,18 @@ mod tests {
     /// Starts an outbox submitting along `route` under a `request_bytes`
     /// Scribe ceiling.
     fn route_outbox(route: ScribeRoute, request_bytes: usize) -> Arc<ScribeOutbox> {
-        Outbox::new(
-            ScribeSink {
-                route: Some(route),
-                attempts: AtomicUsize::new(0),
-                frame_budget: frame_budget(request_bytes),
-                groups: None,
-            },
-            SCRIBE_WRITERS,
+        ScribeSink::bounded_outbox(
+            Some(route),
+            request_bytes,
             ScribeSink::DEFAULT_LIMITS,
+            None,
+            ScribeSink::baseline_execution(),
         )
+    }
+
+    /// Lanes of an outbox at the baseline concurrency.
+    fn baseline_lanes() -> u64 {
+        ScribeSink::baseline_execution().lanes as u64
     }
 
     /// Each distinct acknowledged frame once, in first-acknowledged order,
@@ -3478,8 +3619,261 @@ mod tests {
         }
     }
 
+    /// A Scribe that holds every submission until `release` is set, counting
+    /// the submissions it holds per tenant and in all, and their peaks.
+    struct HeldAcks {
+        /// Records every acknowledged frame.
+        inner: Arc<RecordingScribe>,
+        /// Submissions held now, per tenant.
+        held: Mutex<HashMap<DataTenantId, usize>>,
+        /// Most submissions held at once in all, and per tenant.
+        peaks: Mutex<(usize, HashMap<DataTenantId, usize>)>,
+        /// Submissions held now in all, watched by the test.
+        holding: tokio::sync::watch::Sender<usize>,
+        /// Set to let every held submission be acknowledged.
+        release: tokio::sync::watch::Sender<bool>,
+    }
+
+    impl HeldAcks {
+        /// A Scribe holding every submission until released.
+        fn new() -> Self {
+            Self {
+                inner: Arc::default(),
+                held: Mutex::default(),
+                peaks: Mutex::default(),
+                holding: tokio::sync::watch::channel(0).0,
+                release: tokio::sync::watch::channel(false).0,
+            }
+        }
+
+        /// Submissions of `tenant` held now.
+        ///
+        /// # Panics
+        ///
+        /// Panics when the lock is poisoned.
+        fn held(&self, tenant: DataTenantId) -> usize {
+            self.held
+                .lock()
+                .expect("held")
+                .get(&tenant)
+                .copied()
+                .unwrap_or_default()
+        }
+
+        /// Adds `delta` to `tenant`'s held count, updating the total and the
+        /// peaks.
+        ///
+        /// # Panics
+        ///
+        /// Panics when a lock is poisoned.
+        fn shift(&self, tenant: DataTenantId, delta: isize) {
+            let mut held = self.held.lock().expect("held");
+            let count = held.entry(tenant).or_default();
+            *count = count.saturating_add_signed(delta);
+            let count = *count;
+            let total = held.values().sum::<usize>();
+            drop(held);
+            let mut peaks = self.peaks.lock().expect("peaks");
+            peaks.0 = peaks.0.max(total);
+            let peak = peaks.1.entry(tenant).or_default();
+            *peak = (*peak).max(count);
+            drop(peaks);
+            self.holding.send_replace(total);
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl Scribe for HeldAcks {
+        /// Always ready.
+        fn is_ready(&self) -> bool {
+            true
+        }
+
+        /// Holds `frame` until released, then acknowledges it through the
+        /// recording Scribe.
+        ///
+        /// # Errors
+        ///
+        /// Returns the recording Scribe's refusal.
+        async fn ingest_frame(
+            &self,
+            frame: ScribeIngressFrame,
+        ) -> Result<FrameAdmission, ScribeError> {
+            let tenant = frame.authenticated_tenant;
+            self.shift(tenant, 1);
+            let _ = self
+                .release
+                .subscribe()
+                .wait_for(|released| *released)
+                .await;
+            self.shift(tenant, -1);
+            self.inner.ingest_frame(frame).await
+        }
+
+        /// Resolves through the recording Scribe.
+        ///
+        /// # Errors
+        ///
+        /// Returns the recording Scribe's resolution error.
+        async fn resolve_write_table(
+            &self,
+            tenant: DataTenantId,
+            table: &TableRef,
+        ) -> Result<TableUid, ScribeError> {
+            self.inner.resolve_write_table(tenant, table).await
+        }
+    }
+
+    /// Detail writes of one execution enough for more chunks than one writer
+    /// may hold under [`SMALL_REQUEST_BYTES`].
+    fn many_details() -> Vec<ScribeWrite> {
+        let execution = ExecutionId::new_v7();
+        (0..8)
+            .flat_map(|_| detail(background(), execution))
+            .collect()
+    }
+
+    /// At four and eight effective CPUs, every writer holds its eight
+    /// deliveries at once while Scribe withholds acknowledgements, never more
+    /// per writer nor more than the process ceiling in all, and encoding alone
+    /// frees no capacity; releasing acknowledgements drains every slice.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the outbox has the wrong lanes, a writer cannot reach or
+    /// exceeds its eight deliveries, the process ceiling is passed, a
+    /// finished encoding returns capacity before its acknowledgement, or a
+    /// row is lost.
+    #[tokio::test]
+    async fn delivery_limits_preserve_per_writer_ack_overlap() {
+        for cpu in [4, 8] {
+            let execution = OutboxExecution::resolve(cpu).expect("representable outbox");
+            let scribe = Arc::new(HeldAcks::new());
+            let outbox = ScribeSink::bounded_outbox(
+                Some(ScribeRoute::Local(Arc::clone(&scribe) as _, None)),
+                SMALL_REQUEST_BYTES,
+                ScribeSink::DEFAULT_LIMITS,
+                None,
+                execution,
+            );
+            assert_eq!(outbox.sink().lanes(), execution.writers);
+            let tenants: Vec<DataTenantId> = (0..execution.writers)
+                .map(|_| DataTenantId::new_v7())
+                .collect();
+            for tenant in &tenants {
+                for write in many_details() {
+                    outbox.stage(*tenant, write);
+                }
+            }
+            let mut holding = scribe.holding.subscribe();
+            tokio::time::timeout(
+                Duration::from_secs(10),
+                holding.wait_for(|held| *held == execution.deliveries),
+            )
+            .await
+            .expect("every writer reaches its deliveries")
+            .expect("the Scribe is alive");
+            for tenant in &tenants {
+                assert_eq!(
+                    scribe.held(*tenant),
+                    execution.deliveries_per_writer,
+                    "each writer holds its own deliveries"
+                );
+            }
+            assert_eq!(
+                outbox.sink().deliveries.available_permits(),
+                0,
+                "encoded deliveries awaiting acknowledgement keep their capacity"
+            );
+            scribe.release.send_replace(true);
+            settle(&outbox).await;
+            let (peak, per_tenant) = scribe.peaks.lock().expect("peaks").clone();
+            assert_eq!(peak, execution.deliveries, "C={cpu}");
+            assert!(
+                per_tenant
+                    .values()
+                    .all(|peak| *peak == execution.deliveries_per_writer),
+                "no writer passes its own deliveries: {per_tenant:?}"
+            );
+            assert_eq!(
+                outbox.sink().deliveries.available_permits(),
+                execution.deliveries
+            );
+            assert_eq!(
+                output_results(&retained(scribe.inner.received())).len(),
+                tenants.len() * 8 * DETAIL_RESULTS
+            );
+        }
+    }
+
+    /// An encoding whose write is cancelled keeps its delivery permit while it
+    /// runs, so repeated cancelled attempts stop at the process ceiling and a
+    /// retry starts no encoding past it; once released, every permit returns
+    /// exactly once and the retry completes.
+    ///
+    /// # Panics
+    ///
+    /// Panics when a cancelled encoding frees capacity, an encoding starts
+    /// past the ceiling, the retry fails, or capacity returns other than once.
+    #[tokio::test]
+    async fn cancelled_encoding_retains_delivery_capacity() {
+        let execution = ScribeSink::baseline_execution();
+        let hold = Arc::new(EncodingHold::default());
+        let mut sink = ScribeSink::new(
+            Some(ScribeRoute::Local(
+                Arc::new(RecordingScribe::default()),
+                None,
+            )),
+            SMALL_REQUEST_BYTES,
+            None,
+            execution,
+        );
+        sink.encoding_hold = Some(Arc::clone(&hold));
+        let tenant = DataTenantId::new_v7();
+        let slice = uuid::Uuid::now_v7();
+        let items = many_details();
+        for attempt in 1..=execution.writers {
+            let mut write = std::pin::pin!(sink.write(tenant, slice, &items));
+            assert!(futures_util::FutureExt::now_or_never(write.as_mut()).is_none());
+            hold.wait_started(attempt * execution.deliveries_per_writer);
+        }
+        assert_eq!(hold.started(), execution.deliveries);
+        assert_eq!(
+            sink.deliveries.available_permits(),
+            0,
+            "cancelled encodings keep their capacity"
+        );
+        let mut retry = std::pin::pin!(sink.write(tenant, slice, &items));
+        assert!(futures_util::FutureExt::now_or_never(retry.as_mut()).is_none());
+        assert_eq!(
+            hold.started(),
+            execution.deliveries,
+            "no encoding starts past the process ceiling"
+        );
+        hold.release();
+        tokio::time::timeout(Duration::from_secs(10), retry)
+            .await
+            .expect("the retry completes")
+            .expect("the retry is acknowledged");
+        let deliveries = u32::try_from(execution.deliveries).expect("small ceiling");
+        drop(
+            tokio::time::timeout(
+                Duration::from_secs(10),
+                sink.deliveries.acquire_many(deliveries),
+            )
+            .await
+            .expect("every cancelled encoding returns its permit")
+            .expect("the semaphore is open"),
+        );
+        assert_eq!(
+            sink.deliveries.available_permits(),
+            execution.deliveries,
+            "each permit returns exactly once"
+        );
+    }
+
     /// Proves a slice's frames await Scribe together rather than one at a
-    /// time, never more than [`FRAMES_IN_FLIGHT`] at once, within the Scribe
+    /// time, never more than [`OUTBOX_DELIVERIES_PER_WRITER`] at once, within the Scribe
     /// request ceiling, and that every summary is acknowledged after every detail row.
     ///
     /// # Panics
@@ -3504,13 +3898,13 @@ mod tests {
 
         let frames = scribe.inner.received();
         assert!(
-            frames.len() > FRAMES_IN_FLIGHT,
+            frames.len() > OUTBOX_DELIVERIES_PER_WRITER,
             "the slice needs more frames than may be in flight: {}",
             frames.len()
         );
         let peak = scribe.peak.load(Ordering::SeqCst);
         assert!(
-            (2..=FRAMES_IN_FLIGHT).contains(&peak),
+            (2..=OUTBOX_DELIVERIES_PER_WRITER).contains(&peak),
             "frames overlap within the bound: {peak}"
         );
         assert!(

@@ -166,10 +166,6 @@ pub trait OutboxSink: Send + Sync + 'static {
     type Error: Display + Send + 'static;
     /// Label for this outbox's metrics and logs.
     const NAME: &'static str;
-    /// Lanes each tenant's items are spread over. Lanes of one tenant write
-    /// concurrently; the default single lane writes a tenant one slice at a
-    /// time.
-    const LANES: usize = 1;
     /// Longest a lane's oldest waiting item waits for more to join its write,
     /// as Kafka's `linger.ms`. The default of zero writes as soon as a lane is
     /// free.
@@ -185,7 +181,16 @@ pub trait OutboxSink: Send + Sync + 'static {
     /// when the whole backlog is.
     const BATCH_BYTES: usize = usize::MAX;
 
-    /// The lane `item` is written in, taken modulo [`Self::LANES`].
+    /// Lanes each tenant's items are spread over, read once when the outbox
+    /// starts and fixed for its lifetime. Lanes of one tenant write
+    /// concurrently; the default single lane writes a tenant one slice at a
+    /// time, and zero is read as one.
+    #[must_use]
+    fn lanes(&self) -> usize {
+        1
+    }
+
+    /// The lane `item` is written in, taken modulo [`Self::lanes`].
     ///
     /// Items of one tenant and lane are written in arrival order, one write
     /// at a time, so items whose writes must observe each other in arrival
@@ -318,6 +323,7 @@ impl<S: OutboxSink> Outbox<S> {
                 in_flight: HashMap::new(),
                 retry_at: HashMap::new(),
                 concurrency: concurrency.max(1),
+                lanes: sink.lanes().max(1) as u64,
                 pending: Arc::clone(&pending),
                 admission: Arc::clone(&admission),
                 idle: Arc::clone(&idle),
@@ -912,7 +918,7 @@ type Backlog<I> = (Vec<I>, Load);
 /// [`Load`] so a bounded prefix can be written, and their total.
 type Waiting<I> = (Vec<(I, Load)>, Load);
 
-/// A tenant and one of its [`OutboxSink::LANES`]: the unit written in arrival
+/// A tenant and one of its [`OutboxSink::lanes`]: the unit written in arrival
 /// order, one write at a time.
 type Lane = (DataTenantId, usize);
 
@@ -953,6 +959,8 @@ struct OutboxWriter<S: OutboxSink> {
     retry_at: HashMap<Lane, (Instant, Duration)>,
     /// Most writes run at once.
     concurrency: usize,
+    /// The sink's [`OutboxSink::lanes`], read once at start.
+    lanes: u64,
     /// Count shared with the handle; decremented once items are written.
     pending: Arc<AtomicUsize>,
     /// Admission shares shared with the handle; released with `pending`.
@@ -992,11 +1000,10 @@ impl<S: OutboxSink> OutboxWriter<S> {
                 count = self.requests.recv_many(&mut received, usize::MAX), if open => {
                     open = count != 0;
                     self.closed = !open;
-                    let lanes = S::LANES.max(1) as u64;
                     let now = Instant::now();
                     for (tenant, item, load) in received.drain(..) {
-                        // The remainder is below `LANES`, a `usize`.
-                        let lane = usize::try_from(S::lane(&item) % lanes).unwrap_or_default();
+                        // The remainder is below `lanes`, a `usize`.
+                        let lane = usize::try_from(S::lane(&item) % self.lanes).unwrap_or_default();
                         self.since.entry((tenant, lane)).or_insert(now);
                         let (items, backlog) = self.waiting.entry((tenant, lane)).or_default();
                         items.push((item, load));
@@ -1616,6 +1623,7 @@ mod tests {
             in_flight: HashMap::new(),
             retry_at: HashMap::new(),
             concurrency: 1,
+            lanes: 1,
             pending: Arc::default(),
             admission: Arc::default(),
             idle: Arc::default(),
@@ -1667,7 +1675,11 @@ mod tests {
         type Item = u32;
         type Error = MemoryError;
         const NAME: &'static str = "lanes";
-        const LANES: usize = 2;
+
+        /// Two lanes.
+        fn lanes(&self) -> usize {
+            2
+        }
 
         /// An item's parity is its lane.
         fn lane(item: &u32) -> u64 {
@@ -1728,6 +1740,193 @@ mod tests {
             *outbox.sink().written.lock().expect("unpoisoned"),
             vec![vec![1], vec![0], vec![2, 4]]
         );
+    }
+
+    /// One logged sink event: a write attempt starting with its tenant, slice
+    /// key, and items, or ending with its items and whether it succeeded.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    enum LaneEvent {
+        /// A write attempt began.
+        Start(DataTenantId, Uuid, Vec<u32>),
+        /// A write attempt returned.
+        End(Vec<u32>, bool),
+    }
+
+    /// A sink of `lanes` lanes, item `n` in lane `n % lanes`, that logs every
+    /// attempt and holds each until all its items are released through `open`;
+    /// an item in `fail_once` fails its first attempt.
+    struct GatedLanes {
+        /// Lane count the outbox reads once.
+        lanes: usize,
+        /// Items whose writes may finish.
+        open: tokio::sync::watch::Sender<std::collections::BTreeSet<u32>>,
+        /// Items whose next write fails once.
+        fail_once: Mutex<HashSet<u32>>,
+        /// Every attempt's start and end, in order.
+        log: tokio::sync::watch::Sender<Vec<LaneEvent>>,
+    }
+
+    impl OutboxSink for GatedLanes {
+        type Item = u32;
+        type Error = MemoryError;
+        const NAME: &'static str = "gated-lanes";
+
+        /// The configured count.
+        fn lanes(&self) -> usize {
+            self.lanes
+        }
+
+        /// An item is its own lane key.
+        fn lane(item: &u32) -> u64 {
+            u64::from(*item)
+        }
+
+        /// Logs the attempt, waits for every item to be released, then fails
+        /// once for a `fail_once` head item.
+        ///
+        /// # Errors
+        ///
+        /// Returns [`MemoryError`] on an injected failure.
+        ///
+        /// # Panics
+        ///
+        /// Panics if the failure set's lock is poisoned.
+        async fn write(
+            &self,
+            tenant: DataTenantId,
+            slice: Uuid,
+            items: &[u32],
+        ) -> Result<(), MemoryError> {
+            self.log
+                .send_modify(|log| log.push(LaneEvent::Start(tenant, slice, items.to_vec())));
+            let mut open = self.open.subscribe();
+            let _ = open
+                .wait_for(|open| items.iter().all(|item| open.contains(item)))
+                .await;
+            let failed = self.fail_once.lock().expect("unpoisoned").remove(&items[0]);
+            self.log
+                .send_modify(|log| log.push(LaneEvent::End(items.to_vec(), !failed)));
+            if failed {
+                Err(MemoryError {
+                    panics_on_display: false,
+                })
+            } else {
+                Ok(())
+            }
+        }
+    }
+
+    /// Outboxes over four and eight configured lanes write every lane of a
+    /// tenant at once, hold a busy lane's later items behind its active or
+    /// retrying slice, retry a failed slice under its first key with exactly
+    /// its items, and never put two tenants in one slice.
+    ///
+    /// # Panics
+    ///
+    /// Panics when fewer lanes progress at once than configured, a later item
+    /// overtakes its lane, a retry changes identity or items, or a slice mixes
+    /// tenants.
+    #[tokio::test]
+    async fn configured_lanes_preserve_order_retry_and_progress() {
+        let starts = |log: &[LaneEvent]| {
+            log.iter()
+                .filter(|event| matches!(event, LaneEvent::Start(..)))
+                .count()
+        };
+        let position = |log: &[LaneEvent], wanted: &dyn Fn(&LaneEvent) -> bool| {
+            log.iter().position(wanted).expect("event was logged")
+        };
+        for lanes in [4_usize, 8] {
+            let count = u32::try_from(lanes).expect("small lane count");
+            let sink = GatedLanes {
+                lanes,
+                open: tokio::sync::watch::channel(std::collections::BTreeSet::new()).0,
+                fail_once: Mutex::new(HashSet::from([1])),
+                log: tokio::sync::watch::channel(Vec::new()).0,
+            };
+            let outbox = Outbox::new(sink, lanes, ROOMY);
+            let mut log = outbox.sink().log.subscribe();
+            let wait = async |log: &mut tokio::sync::watch::Receiver<Vec<LaneEvent>>,
+                              done: &dyn Fn(&[LaneEvent]) -> bool| {
+                tokio::time::timeout(Duration::from_secs(10), log.wait_for(|log| done(log)))
+                    .await
+                    .expect("the outbox progresses")
+                    .expect("the sink is alive")
+                    .clone()
+            };
+            let tenant = DataTenantId::new_v7();
+            for item in 0..count {
+                outbox.stage(tenant, item);
+            }
+            let started = wait(&mut log, &|log| starts(log) == lanes).await;
+            assert!(
+                started
+                    .iter()
+                    .all(|event| matches!(event, LaneEvent::Start(..))),
+                "all {lanes} lanes are in flight before any finishes"
+            );
+            // Later items of busy lanes 0 and 1, and another tenant's item in
+            // lane 0, arrive while every lane is written.
+            let other = DataTenantId::new_v7();
+            outbox.stage(tenant, count);
+            outbox.stage(tenant, count + 1);
+            outbox.stage(other, 2 * count);
+            outbox.sink().open.send_modify(|open| {
+                open.extend((1..count).chain([count + 1, 2 * count]));
+            });
+            let settled_but_lane_zero = wait(&mut log, &|log| {
+                [vec![count + 1], vec![2 * count]]
+                    .iter()
+                    .all(|items| log.contains(&LaneEvent::End(items.clone(), true)))
+            })
+            .await;
+            assert!(
+                !settled_but_lane_zero.iter().any(
+                    |event| matches!(event, LaneEvent::Start(_, _, items) if items == &[count])
+                ),
+                "lane 0's later item waits for its active slice"
+            );
+            outbox.sink().open.send_modify(|open| {
+                open.extend([0, count]);
+            });
+            assert_eq!(outbox.settle(within(10)).await, 0);
+            let log = outbox.sink().log.borrow().clone();
+            assert!(
+                position(&log, &|event| *event == LaneEvent::End(vec![0], true))
+                    < position(
+                        &log,
+                        &|event| matches!(event, LaneEvent::Start(_, _, items) if items == &[count])
+                    ),
+                "lane 0 keeps arrival order"
+            );
+            let lane_one: Vec<(Uuid, Vec<u32>)> = log
+                .iter()
+                .filter_map(|event| match event {
+                    LaneEvent::Start(_, slice, items) if items.contains(&1) => {
+                        Some((*slice, items.clone()))
+                    }
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(lane_one.len(), 2, "the failed slice is retried once");
+            assert_eq!(lane_one[0], lane_one[1], "the retry keeps key and items");
+            assert_eq!(lane_one[0].1, vec![1], "the later item is not merged in");
+            assert!(
+                position(&log, &|event| *event == LaneEvent::End(vec![1], true))
+                    < position(
+                        &log,
+                        &|event| matches!(event, LaneEvent::Start(_, _, items) if items == &[count + 1])
+                    ),
+                "lane 1's later item waits for the retry"
+            );
+            for event in &log {
+                if let LaneEvent::Start(owner, _, items) = event {
+                    let foreign = items.contains(&(2 * count));
+                    assert_eq!(*owner == other, foreign, "slices never mix tenants");
+                    assert!(!foreign || items.len() == 1);
+                }
+            }
+        }
     }
 
     /// A sink whose items weigh their value, written at most

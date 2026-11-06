@@ -2255,14 +2255,16 @@ impl ReadableSource {
     /// [`DefaultPhysicalExprAdapterFactory`]: datafusion::physical_expr_adapter::DefaultPhysicalExprAdapterFactory
     ///
     /// Each emitted batch grows `query` by the allocations it does not share
-    /// with its captured batch, and one batch's logical fallback rows are
-    /// reserved beside it only while that batch evaluates.
+    /// with its captured batch. While one batch is filtered or reconstructed,
+    /// a workspace reservation beside `query` holds the batches it copies;
+    /// it is released before that batch's output is reserved, so an
+    /// allocation the output keeps from it is charged once.
     ///
     /// # Errors
     ///
     /// Returns the column-selection error unchanged, or an internal error
     /// when Variant reconstruction, Arrow cast, requirement evaluation, or
-    /// batch assembly fails, or `query` refuses to grow.
+    /// batch assembly fails, or `query` refuses the workspace or an output.
     fn project(
         &self,
         required: &[FieldRef],
@@ -2334,6 +2336,14 @@ impl ReadableSource {
             }
             workspace.free();
             let captured = batch;
+            let hold = |held: &[RecordBatch]| {
+                workspace
+                    .try_resize(crate::scribe::memory::unshared_arrow_bytes(
+                        held,
+                        &[captured],
+                    ))
+                    .map_err(refused)
+            };
             let mut physical = physical_projection(batch, &schema, &projection);
             let batch = if let Some(requirements) = requirements {
                 let adapted = match &mut adapted_requirements {
@@ -2345,17 +2355,9 @@ impl ReadableSource {
                     requirements,
                     physical,
                     &statistics,
-                    |physical| {
-                        let rows = self.logical_batch(&schema, &projection, physical)?;
-                        workspace
-                            .try_resize(crate::scribe::memory::unshared_arrow_bytes(
-                                std::slice::from_ref(&rows),
-                                &[captured],
-                            ))
-                            .map_err(refused)?;
-                        Ok(rows)
-                    },
+                    |physical| self.logical_batch(&schema, &projection, physical),
                     |physical, column| self.logical_column(&projection, physical, column),
+                    hold,
                 )?
                 else {
                     continue;
@@ -2383,6 +2385,7 @@ impl ReadableSource {
                         if kept.num_rows() == 0 {
                             continue;
                         }
+                        hold(std::slice::from_ref(&kept))?;
                         if kept.num_rows() != physical.num_rows() {
                             statistics = Arc::new(statistics.as_ref().clone().to_inexact());
                         }
@@ -2391,6 +2394,9 @@ impl ReadableSource {
                 }
                 self.logical_batch(&schema, &projection, &physical)?
             };
+            // The workspace is gone once the output exists, so the query
+            // takes over whatever allocations the output kept from it.
+            workspace.free();
             query
                 .try_grow(crate::scribe::memory::unshared_arrow_bytes(
                     std::slice::from_ref(&batch),
@@ -2605,10 +2611,15 @@ impl AdaptedRequirements {
     /// batches `logical` builds carry the required fields in the order the
     /// outputs' bare columns index.
     ///
+    /// Whenever it builds logical rows or filters, it passes `hold` every
+    /// batch it then keeps, so the caller can charge that workspace while it
+    /// is held; the workspace ends when this returns.
+    ///
     /// # Errors
     ///
     /// Returns an internal error when the logical fallback fails to build or
-    /// evaluate, or the output batch cannot be assembled.
+    /// evaluate, or the output batch cannot be assembled, and `hold`'s error
+    /// when it refuses the workspace.
     ///
     /// # Panics
     ///
@@ -2622,6 +2633,7 @@ impl AdaptedRequirements {
         statistics: &Arc<Statistics>,
         logical: impl Fn(&RecordBatch) -> Result<RecordBatch, ScribeError>,
         column: impl Fn(&RecordBatch, usize) -> Result<arrow::array::ArrayRef, ScribeError>,
+        hold: impl Fn(&[RecordBatch]) -> Result<(), ScribeError>,
     ) -> Result<Option<(RecordBatch, Arc<Statistics>)>, ScribeError> {
         let internal = |error: datafusion::error::DataFusionError| ScribeError::Internal {
             detail: format!("live-tail requirement evaluation failed: {error}"),
@@ -2646,6 +2658,7 @@ impl AdaptedRequirements {
                 kept
             } else {
                 let rows = logical(&physical)?;
+                hold(&[physical.clone(), rows.clone()])?;
                 let kept = mask(filter, &rows).map_err(internal)?;
                 restored = Some(rows);
                 kept
@@ -2657,6 +2670,12 @@ impl AdaptedRequirements {
                 .map(|rows| arrow::compute::filter_record_batch(&rows, &kept))
                 .transpose()
                 .map_err(arrow_internal)?;
+            hold(
+                &[Some(physical.clone()), restored.clone()]
+                    .into_iter()
+                    .flatten()
+                    .collect::<Vec<_>>(),
+            )?;
             if physical.num_rows() == 0 {
                 return Ok(None);
             }
@@ -2691,9 +2710,12 @@ impl AdaptedRequirements {
                 columns.push(value);
                 continue;
             }
-            let rows_batch = match restored {
-                Some(ref rows) => rows,
-                None => restored.insert(logical(&physical)?),
+            let rows_batch = if let Some(rows) = &restored {
+                rows
+            } else {
+                let rows = restored.insert(logical(&physical)?);
+                hold(&[physical.clone(), rows.clone()])?;
+                rows
             };
             columns.push(
                 output
@@ -3495,9 +3517,16 @@ pub(crate) mod tests {
     /// ceiling that admits the first batch's output but not the second's, the
     /// read fails and leaves neither pool nor root holding anything.
     ///
+    /// A partial `value % 2 = 0` filter copies each batch's survivors into a
+    /// workspace the read charges while it holds them: a zero-column count
+    /// returns exact row counts, peaks above one copy and keeps nothing; a
+    /// bare `value` output keeps the copies, peaks at exactly what it keeps,
+    /// so the handoff charges each allocation once; and a ceiling below one
+    /// copy refuses the count without residue.
+    ///
     /// # Panics
-    /// Panics when a fixture cannot be built, or a reservation, the root's
-    /// attribution or a refusal differs from the above.
+    /// Panics when a fixture cannot be built, or a reservation, peak, the
+    /// root's attribution or a refusal differs from the above.
     #[test]
     fn computed_live_outputs_respect_query_memory_budget() {
         use datafusion::physical_expr::projection::{ProjectionExpr, ProjectionExprs};
@@ -3545,17 +3574,17 @@ pub(crate) mod tests {
         let context = datafusion::prelude::SessionContext::new();
         let df_schema =
             datafusion::common::DFSchema::try_from(Arc::clone(&schema)).expect("schema");
+        let plan = |sql: &str| {
+            context
+                .create_physical_expr(
+                    context.parse_sql_expr(sql, &df_schema).expect("parses"),
+                    &df_schema,
+                )
+                .expect("plans")
+        };
         let requirements = |sql: &str| ReadRequirements {
             filter: None,
-            outputs: ProjectionExprs::new([ProjectionExpr::new(
-                context
-                    .create_physical_expr(
-                        context.parse_sql_expr(sql, &df_schema).expect("parses"),
-                        &df_schema,
-                    )
-                    .expect("plans"),
-                "out",
-            )]),
+            outputs: ProjectionExprs::new([ProjectionExpr::new(plan(sql), "out")]),
         };
         let column_bytes = 3 * usize::try_from(ROWS).expect("rows fit") * size_of::<i64>();
         let execution = scribe
@@ -3622,6 +3651,201 @@ pub(crate) mod tests {
         );
         assert_eq!(tight.memory_pool().reserved(), 0, "no residue in the pool");
         assert_eq!(held(), (0, scribe_before), "no residue at the root");
+
+        // An even-value filter keeps half of every batch, so evaluating it
+        // copies the survivors into a batch the read holds while it derives
+        // the outputs.
+        let even = |outputs: &[&str]| ReadRequirements {
+            filter: Some(plan("value % 2 = 0")),
+            outputs: ProjectionExprs::new(
+                outputs
+                    .iter()
+                    .map(|sql| ProjectionExpr::new(plan(sql), *sql)),
+            ),
+        };
+        let survivors = usize::try_from(ROWS / 2).expect("rows fit") * size_of::<i64>();
+        let count = PeakPool::over(pool);
+        let counted = capture
+            .read(
+                &partitions,
+                schema.fields(),
+                None,
+                Some(&even(&[])),
+                &count.pool(),
+            )
+            .expect("a fitting filtered count");
+        assert_eq!(
+            counted
+                .batches
+                .iter()
+                .map(|readable| (readable.batch.num_columns(), readable.batch.num_rows()))
+                .collect::<Vec<_>>(),
+            vec![(0, 512); 3],
+            "exact surviving rows with no output columns"
+        );
+        assert!(
+            count.peak() >= survivors,
+            "the copied survivors are charged while held"
+        );
+        assert_eq!(pool.reserved(), 0, "a count retains no output buffers");
+        drop(counted);
+        assert_eq!(held(), (0, scribe_before));
+
+        let kept = PeakPool::over(pool);
+        let survived = capture
+            .read(
+                &partitions,
+                schema.fields(),
+                None,
+                Some(&even(&["value"])),
+                &kept.pool(),
+            )
+            .expect("a fitting filtered read");
+        let retained = crate::scribe::memory::unshared_arrow_bytes(
+            &survived
+                .batches
+                .iter()
+                .map(|readable| readable.batch.clone())
+                .collect::<Vec<_>>(),
+            &[],
+        );
+        assert!(retained >= 3 * survivors, "the survivors are copies");
+        assert_eq!(pool.reserved(), retained, "each survivor once");
+        assert_eq!(
+            kept.peak(),
+            retained,
+            "workspace hands its survivors to the output without a double charge"
+        );
+        assert_eq!(held(), (retained, scribe_before));
+        drop(survived);
+        assert_eq!(held(), (0, scribe_before));
+
+        let starved = scribe
+            .follower_execution(survivors / 2)
+            .expect("follower execution");
+        assert!(
+            capture
+                .read(
+                    &partitions,
+                    schema.fields(),
+                    None,
+                    Some(&even(&[])),
+                    starved.memory_pool(),
+                )
+                .is_err(),
+            "filter workspace beyond the ceiling refuses the count"
+        );
+        assert_eq!(
+            starved.memory_pool().reserved(),
+            0,
+            "no residue in the pool"
+        );
+        assert_eq!(held(), (0, scribe_before), "no residue at the root");
+    }
+
+    /// A pass-through view of a real pool that records the most it held
+    /// after any growth, so a test can see a reservation released before the
+    /// read returns.
+    #[derive(Debug)]
+    struct PeakPool {
+        /// The pool every call reaches.
+        inner: Arc<dyn datafusion::execution::memory_pool::MemoryPool>,
+        /// The largest `inner.reserved()` seen after a growth.
+        peak: std::sync::atomic::AtomicUsize,
+    }
+
+    impl PeakPool {
+        /// Wraps `inner`, which keeps owning every byte.
+        fn over(inner: &Arc<dyn datafusion::execution::memory_pool::MemoryPool>) -> Arc<Self> {
+            Arc::new(Self {
+                inner: Arc::clone(inner),
+                peak: std::sync::atomic::AtomicUsize::new(0),
+            })
+        }
+
+        /// This view as the pool a read reserves from.
+        fn pool(self: &Arc<Self>) -> Arc<dyn datafusion::execution::memory_pool::MemoryPool> {
+            Arc::clone(self) as _
+        }
+
+        /// The largest reservation `inner` held after any growth.
+        fn peak(&self) -> usize {
+            self.peak.load(std::sync::atomic::Ordering::Relaxed)
+        }
+
+        /// Records `inner`'s current reservation if it is the largest yet.
+        fn record(&self) {
+            self.peak
+                .fetch_max(self.inner.reserved(), std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+
+    impl std::fmt::Display for PeakPool {
+        /// Names the view after the pool it wraps.
+        fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(formatter, "peak({})", self.inner)
+        }
+    }
+
+    impl datafusion::execution::memory_pool::MemoryPool for PeakPool {
+        /// Names this view.
+        fn name(&self) -> &'static str {
+            "peak"
+        }
+
+        /// Registers `consumer` with the wrapped pool.
+        fn register(&self, consumer: &datafusion::execution::memory_pool::MemoryConsumer) {
+            self.inner.register(consumer);
+        }
+
+        /// Unregisters `consumer` from the wrapped pool.
+        fn unregister(&self, consumer: &datafusion::execution::memory_pool::MemoryConsumer) {
+            self.inner.unregister(consumer);
+        }
+
+        /// Grows the wrapped pool, then records the peak.
+        fn grow(
+            &self,
+            reservation: &datafusion::execution::memory_pool::MemoryReservation,
+            additional: usize,
+        ) {
+            self.inner.grow(reservation, additional);
+            self.record();
+        }
+
+        /// Shrinks the wrapped pool.
+        fn shrink(
+            &self,
+            reservation: &datafusion::execution::memory_pool::MemoryReservation,
+            shrink: usize,
+        ) {
+            self.inner.shrink(reservation, shrink);
+        }
+
+        /// Tries to grow the wrapped pool, recording the peak on success.
+        ///
+        /// # Errors
+        ///
+        /// Returns the wrapped pool's refusal unchanged.
+        fn try_grow(
+            &self,
+            reservation: &datafusion::execution::memory_pool::MemoryReservation,
+            additional: usize,
+        ) -> datafusion::error::Result<()> {
+            self.inner.try_grow(reservation, additional)?;
+            self.record();
+            Ok(())
+        }
+
+        /// The wrapped pool's reservation.
+        fn reserved(&self) -> usize {
+            self.inner.reserved()
+        }
+
+        /// The wrapped pool's limit.
+        fn memory_limit(&self) -> datafusion::execution::memory_pool::MemoryLimit {
+            self.inner.memory_limit()
+        }
     }
 
     fn make_test_meta(lsn: u64) -> ScribeAppendMeta {

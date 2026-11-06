@@ -5,6 +5,16 @@
 <script lang="ts" module>
   /** The status a pill reports; `neutral` means no status. */
   export type Tone = 'neutral' | 'ok' | 'warn' | 'danger' | 'running';
+
+  /** The tone of each Card lifecycle status. */
+  export const CARD_TONES: Readonly<Record<string, Tone>> = {
+    active: 'ok',
+    pending: 'running',
+    deprecated: 'warn',
+    expired: 'warn',
+    failed: 'danger',
+    deleted: 'neutral'
+  };
 </script>
 
 <script lang="ts">

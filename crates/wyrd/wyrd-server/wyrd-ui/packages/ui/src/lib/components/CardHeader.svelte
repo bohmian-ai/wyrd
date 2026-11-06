@@ -10,18 +10,9 @@
   import ActionButton from './ActionButton.svelte';
   import ActionNote from './ActionNote.svelte';
   import EmptyState from './EmptyState.svelte';
-  import StatusPill, { type Tone } from './StatusPill.svelte';
+  import StatusPill, { CARD_TONES } from './StatusPill.svelte';
 
   let { input, result, actions = {}, onaction }: CardHeaderProps & ActionProps = $props();
-
-  const TONES: Record<string, Tone> = {
-    active: 'ok',
-    pending: 'running',
-    deprecated: 'warn',
-    expired: 'warn',
-    failed: 'danger',
-    deleted: 'neutral'
-  };
 
   const card = $derived(result.state === 'populated' ? result.data.card : undefined);
   const versions = $derived(result.state === 'populated' ? result.data.versions : undefined);
@@ -78,7 +69,7 @@
             </select>
           </label>
           <ActionNote state={versionState} />
-          {#if current}<span class="status"><StatusPill tone={TONES[current.status]} label={current.status} /></span>{/if}
+          {#if current}<span class="status"><StatusPill tone={CARD_TONES[current.status]} label={current.status} /></span>{/if}
         </div>
         <p class="meta">
           <span>{fmtCardRef(ref)}</span>

@@ -22,6 +22,14 @@
   import { COLUMNS, GAP, NARROW, ROW, edit, place, rowsHeight } from './layout.js';
   import ActionButton from './components/ActionButton.svelte';
   import CardHeader from './components/CardHeader.svelte';
+  import CardInventory from './components/CardInventory.svelte';
+  import CardFacts from './components/CardFacts.svelte';
+  import RelationshipList from './components/RelationshipList.svelte';
+  import ArtifactTable from './components/ArtifactTable.svelte';
+  import PromptMessages from './components/PromptMessages.svelte';
+  import PromptVariables from './components/PromptVariables.svelte';
+  import UsedBy from './components/UsedBy.svelte';
+  import VersionDiff from './components/VersionDiff.svelte';
   import Chart from './components/Chart.svelte';
   import EmptyState from './components/EmptyState.svelte';
   import FacetRail from './components/FacetRail.svelte';
@@ -64,7 +72,18 @@
   let timers: ReturnType<typeof setInterval>[] = [];
 
   /** The component that renders each catalog name. */
-  const VIEWS: Record<ComponentName, Component<any>> = { Chart, CardHeader, StatStrip, FacetRail, RecordTable, TraceWaterfall, RecordDetail };
+  const VIEWS: Record<ComponentName, Component<any>> = {
+    Chart,
+    CardHeader,
+    CardInventory,
+    CardFacts,
+    RelationshipList,
+    ArtifactTable,
+    PromptMessages,
+    PromptVariables,
+    UsedBy,
+    VersionDiff,
+    StatStrip, FacetRail, RecordTable, TraceWaterfall, RecordDetail };
   /** How often a live panel re-reads. */
   const LIVE_MS = 5_000;
 

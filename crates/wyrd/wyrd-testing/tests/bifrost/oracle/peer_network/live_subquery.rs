@@ -13,7 +13,7 @@ use arrow::record_batch::RecordBatch;
 use datafusion_proto::protobuf::PhysicalPlanNode;
 use datafusion_proto::protobuf::physical_plan_node::PhysicalPlanType;
 use serde::Deserialize;
-use vala_bifrost_redux::oracle::codec::OraclePhysicalExtensionCodec;
+use vala_bifrost_redux::oracle::codec::remote_scan_filter_for_test;
 use wyrd_client::bifrost::BifrostClientError;
 use wyrd_server::config::BifrostTarget;
 use wyrd_tonic::prost::Message as _;
@@ -207,10 +207,7 @@ async fn prove_remote_scalar_subquery_ships_as_a_literal() -> Result<(), PeerJou
     else {
         return Err("the H2 fragment ships more than its placeholder".into());
     };
-    let plan = format!(
-        "{:?}",
-        OraclePhysicalExtensionCodec::preflight_extension(&placeholder.node)?.filter
-    );
+    let plan = format!("{:?}", remote_scan_filter_for_test(&placeholder.node)?);
     for (name, micros) in [
         ("static bound", tables.at(1, 0)),
         ("resolved scalar", tables.at(PICKED.0, PICKED.1)),

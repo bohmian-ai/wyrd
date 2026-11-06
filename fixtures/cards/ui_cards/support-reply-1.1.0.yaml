@@ -1,0 +1,19 @@
+apiVersion: wyrd/v1
+kind: Prompt
+metadata:
+  name: support-reply
+  version: 1.1.0
+  labels:
+    team: support
+spec:
+  provider: openai
+  model: gpt-4o
+  system: |-
+    You answer support tickets.
+    Cite the policy section you rely on.
+  messages:
+  - role: user
+    content: |-
+      Ticket: {{ticket}}
+      Tone: {{tone}}
+  response_format: verdict

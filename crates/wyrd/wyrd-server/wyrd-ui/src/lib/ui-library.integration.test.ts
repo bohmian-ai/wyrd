@@ -1,5 +1,5 @@
 /**
- * TASK-003 and TASK-004 live proof. The built `ui://wyrd/view` HTML runs in the ext-apps
+ * TASK-003, TASK-004 and TASK-005 live proof. The built `ui://wyrd/view` HTML runs in the ext-apps
  * AppBridge test host; every other read goes to a real Wyrd server started by
  * `@wyrd/testing` over repository Postgres, through the SDK, the MCP endpoint,
  * and the BFF's real browser session. Nothing here mocks the server.
@@ -13,7 +13,15 @@ import { z } from 'zod';
 import { Bifrost, Cards, TableConfig, WyrdClient } from 'wyrd-ai';
 import {
   CardRefSchema,
+  loadArtifactTable,
+  loadCardFacts,
   loadCardHeader,
+  loadCardInventory,
+  loadPromptMessages,
+  loadPromptVariables,
+  loadRelationshipList,
+  loadUsedBy,
+  loadVersionDiff,
   loadChart,
   loadFacetRail,
   loadMetric,
@@ -30,7 +38,7 @@ import { mcpExecutor } from 'wyrd-ai-ui/mcp';
 import { nodeExecutor } from 'wyrd-ai-ui/node';
 import { env } from '$env/dynamic/private';
 import { browserSessions } from '$lib/server/auth/browser-sessions';
-import { card, observeAnswer, registered, series, summary, timeseries } from '$lib/ui-fixtures';
+import { AGENT, PROMPT, agent as agentCard, card, inventory, notFound, observeAnswer, prompts, registered, series, summary, timeseries } from '$lib/ui-fixtures';
 import { exportOtlp, nanos, seedSignals } from '$lib/ui-signals.integration';
 import { POST as loadPanel } from '../routes/t/[tenantKey]/ui/load/+server';
 import { declared, fixture, serverTest, type DeclaredRef } from '../../../../../../sdks/wyrd-sdk-ts/wyrd/tests/support/server';
@@ -358,7 +366,7 @@ test('TASK-004: Authorized Observe across hosts', async ({ server, seeded }) => 
       expect((await loadFacetRail({ signal: 'traces', facets: ['service_name'] }, context)).result).toMatchObject({ state: 'populated', data: { facets: [{ values: { rows: [['ui-agent', 1]] } }] } });
       // Spans filter by a bound WHERE; the waterfall reads the exact trace with nanosecond starts.
       const errors = await loadRecordTable({ signal: 'spans', where: [{ column: 'status_code', value: 2 }] }, context);
-      expect(errors.result).toMatchObject({ state: 'populated', data: { rows: { rows: [[expect.any(String), 'execute_tool search', 'ui-agent', 100_000_000, 2, 1, TRACE, 'b9c7c989f97918e1']] } } });
+      expect(errors.result).toMatchObject({ state: 'populated', data: { rows: { rows: [[expect.any(String), 'execute_tool search', 'ui-agent', 100_000_000, 2, TRACE, 'b9c7c989f97918e1', '53995c3f42cd8ad8']] } } });
       const waterfall = await loadTraceWaterfall({ traceId: TRACE }, context);
       expect(waterfall.result.state === 'populated' && spanTree(waterfall.result.data).map((span) => [span.name, span.depth, span.startMs])).toEqual([
         ['invoke_agent support', 0, 0],
@@ -524,4 +532,154 @@ test('TASK-004: Metric windows count every recorded value', async ({ server }) =
       .map(([resource, , value]) => [JSON.parse(String(resource))['service.name'], value])
       .sort()
   ).toEqual([['api', 0.5], ['worker', 1.5]]);
+});
+
+test('card and prompt components use authorized host reads and actions', async ({ server, seeded }) => {
+  const cards = await Cards.connect();
+  const ui = (name: string) => fixture(`cards/ui_cards/${name}`);
+  const older = exact(declared(await cards.declareFromPath(ui('support-reply-1.0.0.yaml'))));
+  const prompt = exact(declared(await cards.declareFromPath(ui('support-reply-1.1.0.yaml'))));
+  const agent = exact(declared(await cards.declareFromPath(ui('reply-agent.yaml'))));
+  const native = exact(declared(await cards.declareFromPath(fixture('cards/declare_and_pull/native-prompt.yaml'))));
+  // Another tenant registers a Prompt of its own; this tenant never sees it.
+  const tenant = 'ui-cards-foreign';
+  const foreignKey = server.bootstrapServiceInTenant(server.seedTenant(tenant), ['admin'], 'ui-cards-admin');
+  const foreignCards = await Cards.connect({ client: WyrdClient.connect({ credential: foreignKey }) });
+  const theirs = exact(declared(await foreignCards.declareFromPath(fixture('cards/gateway_inference/ask-prompt.yaml'))));
+
+  const client = WyrdClient.connect();
+  const mcp = await mcpOver(server.baseUrl, client);
+  try {
+    for (const [surface, executor] of [['node', nodeExecutor(client)], ['mcp', mcp.executor]] as const) {
+      const context = { executor };
+      // Inventory: one row per version, filtered by kind, name and label; the other tenant's Card never lists.
+      const prompts = await loadCardInventory({ kind: 'Prompt' }, context);
+      expect(prompts.result.state, surface).toBe('populated');
+      const uids = prompts.result.state === 'populated' ? prompts.result.data.items.map((item) => item.card_uid) : [];
+      expect(uids).toEqual(expect.arrayContaining([older.uid, prompt.uid, native.uid]));
+      expect(uids).not.toContain(theirs.uid);
+      const named = await loadCardInventory({ query: 'SUPPORT-reply' }, context);
+      expect(named.result.state === 'populated' && named.result.data.items.map((item) => item.version).sort()).toEqual(['1.0.0', '1.1.0']);
+      const labelled = await loadCardInventory({ query: 'labels.team = "support"', kind: 'Prompt' }, context);
+      expect(labelled.result.state === 'populated' && labelled.result.data.items.map((item) => item.card_uid).sort()).toEqual([older.uid, prompt.uid].sort());
+      expect((await loadCardInventory({ query: 'ask-prompt' }, context)).result).toMatchObject({ state: 'empty', reason: 'No Card version matches these filters.' });
+      expect((await loadCardInventory({ query: 'name = = "x"' }, context)).result).toMatchObject({ state: 'error', problem: { code: 'WYRD_SPEC_400_VALIDATION' } });
+
+      // Exact detail: facts, relationships in both directions and the registered files.
+      expect((await loadCardFacts({ cardRef: agent }, context)).result).toMatchObject({ state: 'populated', data: { metadata: { uid: agent.uid } } });
+      expect((await loadRelationshipList({ cardRef: agent }, context)).result).toMatchObject({
+        state: 'populated',
+        data: { outbound: [{ ref: { kind: 'Prompt', name: 'support-reply', version: '1.1.0', uid: prompt.uid } }] }
+      });
+      expect((await loadRelationshipList({ cardRef: prompt }, context)).result).toMatchObject({ state: 'populated', data: { inbound: [{ ref: { uid: agent.uid } }] } });
+      expect((await loadCardFacts({ cardRef: { ...prompt, version: '9.9.9', uid: undefined } }, context)).result).toMatchObject({
+        state: 'error',
+        problem: { code: 'WYRD_REGISTRY_404_CARD_NOT_FOUND' }
+      });
+      expect((await loadCardFacts({ cardRef: theirs }, context)).result).toMatchObject({ state: 'error', problem: { code: 'WYRD_REGISTRY_404_CARD_NOT_FOUND' } });
+      const files = await loadArtifactTable({ cardRef: seeded.model }, context);
+      if (surface === 'node') {
+        expect(files.result).toMatchObject({ state: 'populated', data: [{ relative_path: 'support-model.bin' }] });
+        expect((await loadArtifactTable({ cardRef: agent }, context)).result).toMatchObject({ state: 'empty' });
+      } else {
+        // The MCP server has no file-listing tool yet; the panel shows its refusal.
+        expect(files.result.state, JSON.stringify(files.result)).toBe('error');
+      }
+
+      // Prompt: authored forms kept, server-derived variables, its Agent and a comparison.
+      expect((await loadPromptMessages({ cardRef: prompt }, context)).result).toMatchObject({
+        state: 'populated',
+        data: { system: 'You answer support tickets.\nCite the policy section you rely on.', response_format: 'verdict' }
+      });
+      expect((await loadPromptMessages({ cardRef: native }, context)).result).toMatchObject({
+        state: 'populated',
+        data: { format: 'chat_completion', body: { seed: 123, future_knob: { enabled: true } } }
+      });
+      expect((await loadPromptMessages({ cardRef: agent }, context)).result).toMatchObject({ state: 'error', problem: { code: 'WYRD_SPEC_400_VALIDATION' } });
+      expect((await loadPromptVariables({ cardRef: prompt }, context)).result).toEqual({
+        state: 'populated',
+        data: [
+          { name: 'ticket', kind: 'text' },
+          { name: 'tone', kind: 'text' }
+        ]
+      });
+      expect((await loadUsedBy({ cardRef: prompt }, context)).result).toMatchObject({
+        state: 'populated',
+        data: [{ ref: { uid: agent.uid }, agent: { state: 'populated', data: { route: { kind: 'native' }, services: [] } } }]
+      });
+      expect((await loadUsedBy({ cardRef: older }, context)).result).toMatchObject({ state: 'empty' });
+      const diff = await loadVersionDiff({ cardRef: prompt }, context);
+      expect(diff.result.state === 'populated' && [diff.result.data.other, diff.result.data.changes.map((change) => change.field)]).toEqual([
+        '1.0.0',
+        ['system', 'messages[0]', 'response_format', 'variables']
+      ]);
+      expect((await loadVersionDiff({ cardRef: older, otherVersion: '1.1.0' }, context)).result).toMatchObject({ state: 'populated', data: { other: '1.1.0' } });
+      expect((await loadVersionDiff({ cardRef: native }, context)).result).toMatchObject({ state: 'empty', reason: 'Only version 1.0.0 is registered.' });
+    }
+  } finally {
+    await mcp.close();
+  }
+
+  // A principal without card permission sees each component denied and no dependent read.
+  const runs: WireRequest[][] = [];
+  const queryOnly = nodeExecutor(WyrdClient.connect({ credential: server.scopedApiKey('ui_cards_denied', ['bifrost_query:read']) }));
+  const denied = { executor: { run: (requests: readonly WireRequest[], signal?: AbortSignal) => (runs.push([...requests]), queryOnly.run(requests, signal)) } };
+  for (const loaded of await Promise.all([
+    loadCardInventory({}, denied),
+    loadCardFacts({ cardRef: agent }, denied),
+    loadRelationshipList({ cardRef: agent }, denied),
+    loadArtifactTable({ cardRef: seeded.model }, denied),
+    loadPromptMessages({ cardRef: prompt }, denied),
+    loadPromptVariables({ cardRef: prompt }, denied),
+    loadUsedBy({ cardRef: prompt }, denied),
+    loadVersionDiff({ cardRef: prompt }, denied)
+  ]))
+    expect(loaded.result).toMatchObject({ state: 'denied', problem: { code: DENIED } });
+  expect(runs.every((requests) => requests.length === 1)).toBe(true);
+  expect(runs).toHaveLength(8);
+
+  // BFF: the other tenant's browser session lists its own Prompt and never this tenant's.
+  env.WYRD_SERVER_URL = server.baseUrl;
+  const url = new URL(`http://ui.test/t/${tenant}/ui/load`);
+  const cookies = jar();
+  await browserSessions.signInWithApiKey(tenant, foreignKey, url, cookies);
+  const browserSession = await browserSessions.read(tenant, url, cookies);
+  const bff = async (body: unknown) => {
+    const response = await loadPanel({
+      locals: { browserSession },
+      request: new Request(url, { method: 'POST', body: JSON.stringify(body), headers: { 'content-type': 'application/json' } })
+    } as never);
+    const text = await response.text();
+    expect(text).not.toContain(foreignKey);
+    return JSON.parse(text) as { result: { state: string; data?: { items: { card_uid: string }[] } } };
+  };
+  const listed = await bff({ component: 'CardInventory', input: {}, range: RANGE });
+  const visible = listed.result.data?.items.map((item) => item.card_uid) ?? [];
+  expect(visible).toContain(theirs.uid);
+  for (const ours of [older, prompt, agent, native, seeded.model]) expect(visible).not.toContain(ours.uid);
+  expect(await bff({ component: 'PromptMessages', input: { cardRef: prompt }, range: RANGE })).toMatchObject({
+    result: { state: 'error', problem: { code: 'WYRD_REGISTRY_404_CARD_NOT_FOUND' } }
+  });
+
+  // T4: the built HTML renders Card and Prompt panels through host tools/call alone.
+  const doc = {
+    version: 'wyrd.view/v1',
+    catalogId: 'wyrd.ui/v1',
+    range: RANGE,
+    panels: [
+      { id: 'cards', component: 'CardInventory', input: { kind: 'Prompt' } },
+      { id: 'messages', component: 'PromptMessages', input: { cardRef: PROMPT } },
+      { id: 'used', component: 'UsedBy', input: { cardRef: PROMPT } }
+    ]
+  };
+  const app = await appBridgeView(doc, (name, args) => {
+    if (name === 'cards.list') return { items: inventory.filter((item) => item.kind === 'Prompt'), next_cursor: null };
+    if (name === 'cards.get') return { card: (args.card_ref as { name: string }).name === AGENT.name ? agentCard : prompts['1.1.0'] };
+    return notFound;
+  });
+  await vi.waitFor(() => expect(app.document.querySelector('[data-panel="used"]')?.textContent).toContain(AGENT.name));
+  expect(app.document.querySelector('[data-panel="cards"]')?.textContent).toContain(PROMPT.name);
+  expect(app.document.querySelector('[data-panel="messages"]')?.textContent).toContain('{{ticket}}');
+  expect(app.calls.map((call) => call.name).sort()).toEqual(['cards.get', 'cards.get', 'cards.get', 'cards.list']);
+  expect(app.calls.find((call) => call.name === 'cards.list')?.arguments).toMatchObject({ kind: 'Prompt', limit: 50 });
 });

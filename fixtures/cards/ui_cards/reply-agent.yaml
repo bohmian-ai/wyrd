@@ -1,0 +1,12 @@
+apiVersion: wyrd/v1
+kind: Agent
+metadata:
+  name: reply-agent
+  version: 1.0.0
+spec:
+  prompt:
+    kind: Prompt
+    name: support-reply
+    version: 1.1.0
+  execution_route:
+    kind: native

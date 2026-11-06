@@ -27,6 +27,7 @@ A story uses the same file and test names in every SDK: `<story>.rs`,
 | `signed_in_development` | the `local_development` Cards; alice's login comes from the test server's saved-login fixtures | `saved_login_completes_the_workflow_past_token_expiry` |
 | `otel_export` | no Cards | `stock_exporter_span_reads_back_through_bifrost` |
 | `saved_user_auth` | `gateway_inference/ask-prompt.yaml`; logins come from the test server's saved-login fixtures | `newest_saved_login_is_used_without_a_selector`, `saved_reader_login_is_denied_a_write`, `stale_login_refreshes_and_saves_the_renewal`, `revoked_login_is_refused`, `selector_naming_no_saved_login_is_refused`, `explicit_key_beside_a_tenant_selector_is_refused` |
+| `ui_cards` | the `declare_and_pull` Model and Service, `ui_cards/support-reply-1.0.0.yaml`, `ui_cards/support-reply-1.1.0.yaml`, then `ui_cards/reply-agent.yaml`, which uses Prompt 1.1.0, and `declare_and_pull/native-prompt.yaml`; another tenant registers `gateway_inference/ask-prompt.yaml` | `card and prompt components use authorized host reads and actions`, `authenticated card browsing and prompt comparison` |
 
 ## Verifier coverage matrix
 

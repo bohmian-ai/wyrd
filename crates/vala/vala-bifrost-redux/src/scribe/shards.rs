@@ -7748,7 +7748,7 @@ mod tests {
                 .expect("no registry to wait on");
         let day = key.partition.time();
         let read = capture
-            .read(&(day..=day), logical.fields(), Some(&pruning))
+            .read(&(day..=day), logical.fields(), Some(&pruning), None)
             .expect("capture reads");
         let mut values = Vec::new();
         for readable in read.batches {
@@ -9308,6 +9308,7 @@ mod tests {
                 &(key.partition.time()..=key.partition.time()),
                 &crate::scribe::tail_rpc::tests::named_fields(["value"]),
                 None,
+                None,
             )
             .expect("projected read");
         drop(active);
@@ -9393,6 +9394,7 @@ mod tests {
             .read(
                 &(key.partition.time()..=key.partition.time()),
                 &crate::scribe::tail_rpc::tests::named_fields(["value"]),
+                None,
                 None,
             )
             .expect("projected read");

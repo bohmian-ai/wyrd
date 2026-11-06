@@ -875,6 +875,61 @@ async fn submitted_answer_is_judged_in_the_background_and_resumes_by_id() {
     assistant.deployment.shutdown().await;
 }
 
+/// `verify` and `submit` run the same request through one durable execution
+/// path: the direct call returns its result synchronously under its own
+/// identity, while the submission completes in the background with the same
+/// verdict, and a handle rebuilt from either ID reads back exactly the result
+/// that execution returned.
+///
+/// # Panics
+/// Panics when a call fails, the verdicts differ, the executions share an
+/// identity, or a result read back by its ID differs.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires the repository-managed Postgres journey lifecycle"]
+async fn verify_and_submit_share_durable_execution_state() {
+    let assistant = Assistant::start().await;
+    let state = assistant.state().await;
+    let run = state.run_for_card("agent").expect("agent run opens");
+
+    let direct = run
+        .observe()
+        .verify("answer-check", json!("yes"))
+        .await
+        .expect("the answer verifies");
+    let Submission::Queued(execution) = run
+        .observe()
+        .submit("answer-check", json!("yes"))
+        .await
+        .expect("the answer is submitted")
+    else {
+        panic!("Run evidence queues an execution");
+    };
+    let waited = execution.wait(WAIT).await.expect("the execution settles");
+    let service = assistant
+        .deployment
+        .service_client(&assistant.service)
+        .await;
+    let resumed = Execution::connect_with(*execution.id(), &service)
+        .await
+        .expect("the handle rebuilds from its ID")
+        .wait(WAIT)
+        .await
+        .expect("the resumed handle reads the result");
+    let reread = Execution::connect_with(direct.execution_id, &service)
+        .await
+        .expect("the handle rebuilds from its ID")
+        .wait(WAIT)
+        .await
+        .expect("the direct result reads back");
+
+    assert_eq!(direct.outcome.verdict, VerificationVerdict::Passed);
+    assert_eq!(waited.outcome.verdict, direct.outcome.verdict);
+    assert_ne!(direct.execution_id, waited.execution_id);
+    assert_eq!(resumed, waited);
+    assert_eq!(reread, direct);
+    assistant.deployment.shutdown().await;
+}
+
 /// Another tenant cannot read a queued execution by its ID: the status read
 /// is refused as not found until the wait gives up.
 ///

@@ -9,7 +9,7 @@
   import { goto } from '$app/navigation';
   import { page } from '$app/state';
   import { Drawer, EmptyState, RecordDetail, StatusPill, TraceWaterfall, fmtCount, fmtDuration, type ActionIntent, type ActionState } from 'wyrd-ai-ui';
-  import { cellText, shortId, spanTree, validateIntent, type ComponentName } from 'wyrd-ai-ui/loaders';
+  import { cellText, shortId, spanTree, validateIntent, wyrdProblem, type ComponentName, type Problem, type TraceWaterfallProps } from 'wyrd-ai-ui/loaders';
   import { closed, moved, readState, step, writeState, type ObserveState } from '$lib/observe-host';
   import type { PageProps } from './$types';
 
@@ -56,8 +56,8 @@
   }
 
   /** The open trace's root and totals for the drawer header, from the spans it read. */
-  const trace = $derived.by(() => {
-    const read = data.waterfall && !('code' in data.waterfall) ? data.waterfall.result : undefined;
+  function summary(waterfall: TraceWaterfallProps | Problem) {
+    const read = 'code' in waterfall ? undefined : waterfall.result;
     if (read?.state !== 'populated') return undefined;
     const spans = spanTree(read.data);
     const root = spans.find((span) => span.depth === 0);
@@ -70,7 +70,9 @@
       spans: spans.length,
       errors: spans.filter((span) => span.error).length
     };
-  });
+  }
+  /** A read that failed in transit, such as an aborted navigation, as the panel's problem. */
+  const lost = (error: unknown) => wyrdProblem('upstream', String(error));
   /** Expanded fills the viewport; otherwise the drawer leaves the list beside it. */
   let expanded = $state(false);
   let copied = $state(false);
@@ -87,22 +89,25 @@
 {#if data.waterfall}
   <Drawer open title="Trace" width={expanded ? '100vw' : '884px'} onclose={() => go(closed(current))}>
     {#snippet heading()}
-      <div class="trace">
-        <p class="root">
-          <strong>{trace?.root?.name ?? 'Trace'}</strong>
-          {#if trace?.errors}<StatusPill tone="danger" label="error" />{/if}
-          {#if trace?.root?.service}<span class="chip">{trace.root.service}</span>{/if}
-        </p>
-        <p class="facts">
-          trace <span title={current.trace}>{shortId(current.trace ?? '')}</span>{#if trace}{#if trace.start}{' '}· {trace.start}{/if} · {fmtDuration(Math.round(trace.duration))} · {fmtCount(trace.spans)} spans · {fmtCount(trace.errors)} {trace.errors === 1 ? 'error' : 'errors'}{/if}
-        </p>
-      </div>
+      {#await data.waterfall}
+        {@render facts(undefined)}
+      {:then waterfall}
+        {@render facts(summary(waterfall))}
+      {:catch}
+        {@render facts(undefined)}
+      {/await}
     {/snippet}
     {#snippet tools()}
       <button type="button" onclick={link}>{copied ? 'Link copied' : 'Link'}</button>
       <button type="button" aria-pressed={expanded} onclick={() => (expanded = !expanded)}>{expanded ? 'Collapse' : 'Expand'} ↗</button>
     {/snippet}
-    {#if 'code' in data.waterfall}<EmptyState state="error" problem={data.waterfall} />{:else}<TraceWaterfall {...data.waterfall} {actions} onaction={onaction('TraceWaterfall')} />{/if}
+    {#await data.waterfall}
+      <TraceWaterfall input={{ traceId: current.trace ?? '' }} result={{ state: 'loading' }} />
+    {:then waterfall}
+      {#if 'code' in waterfall}<EmptyState state="error" problem={waterfall} />{:else}<TraceWaterfall {...waterfall} {actions} onaction={onaction('TraceWaterfall')} />{/if}
+    {:catch error}
+      <EmptyState state="error" problem={lost(error)} />
+    {/await}
     <div class="span">{@render record()}</div>
   </Drawer>
 {:else if data.record}
@@ -118,7 +123,26 @@
 {/if}
 
 {#snippet record()}
-  {#if data.record && 'code' in data.record}<EmptyState state="error" problem={data.record} />{:else if data.record}<RecordDetail {...data.record} {actions} onaction={onaction('RecordDetail')} />{/if}
+  {#await data.record}
+    <EmptyState state="loading" title="Loading record" />
+  {:then record}
+    {#if record && 'code' in record}<EmptyState state="error" problem={record} />{:else if record}<RecordDetail {...record} {actions} onaction={onaction('RecordDetail')} />{/if}
+  {:catch error}
+    <EmptyState state="error" problem={lost(error)} />
+  {/await}
+{/snippet}
+
+{#snippet facts(trace: ReturnType<typeof summary>)}
+  <div class="trace">
+    <p class="root">
+      <strong>{trace?.root?.name ?? 'Trace'}</strong>
+      {#if trace?.errors}<StatusPill tone="danger" label="error" />{/if}
+      {#if trace?.root?.service}<span class="chip">{trace.root.service}</span>{/if}
+    </p>
+    <p class="facts">
+      trace <span title={current.trace}>{shortId(current.trace ?? '')}</span>{#if trace}{#if trace.start}{' '}· {trace.start}{/if} · {fmtDuration(Math.round(trace.duration))} · {fmtCount(trace.spans)} spans · {fmtCount(trace.errors)} {trace.errors === 1 ? 'error' : 'errors'}{/if}
+    </p>
+  </div>
 {/snippet}
 
 <style>

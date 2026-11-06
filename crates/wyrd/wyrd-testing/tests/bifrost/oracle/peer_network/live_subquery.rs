@@ -11,7 +11,9 @@ use arrow::array::{Int64Array, TimestampMicrosecondArray};
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
 use datafusion_proto::protobuf::PhysicalPlanNode;
+use datafusion_proto::protobuf::physical_plan_node::PhysicalPlanType;
 use serde::Deserialize;
+use vala_bifrost_redux::oracle::codec::OraclePhysicalExtensionCodec;
 use wyrd_client::bifrost::BifrostClientError;
 use wyrd_server::config::BifrostTarget;
 use wyrd_tonic::prost::Message as _;
@@ -200,7 +202,15 @@ async fn prove_remote_scalar_subquery_ships_as_a_literal() -> Result<(), PeerJou
         )
         .into());
     }
-    let plan = format!("{:?}", PhysicalPlanNode::decode(plan.as_slice())?);
+    let Some(PhysicalPlanType::Extension(placeholder)) =
+        PhysicalPlanNode::decode(plan.as_slice())?.physical_plan_type
+    else {
+        return Err("the H2 fragment ships more than its placeholder".into());
+    };
+    let plan = format!(
+        "{:?}",
+        OraclePhysicalExtensionCodec::preflight_extension(&placeholder.node)?.filter
+    );
     for (name, micros) in [
         ("static bound", tables.at(1, 0)),
         ("resolved scalar", tables.at(PICKED.0, PICKED.1)),

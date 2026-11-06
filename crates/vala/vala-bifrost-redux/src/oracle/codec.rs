@@ -363,7 +363,7 @@ impl OraclePhysicalExtensionCodec {
     /// # Errors
     /// Returns a plan error when the envelope or payload is invalid, or the
     /// extension is not a remote scan.
-    pub(crate) fn preflight_extension(bytes: &[u8]) -> Result<RemoteScanPayload> {
+    pub fn preflight_extension(bytes: &[u8]) -> Result<RemoteScanPayload> {
         let envelope = OracleExtensionEnvelope::decode(bytes).map_err(|error| {
             DataFusionError::Plan(format!("invalid Oracle extension envelope: {error}"))
         })?;

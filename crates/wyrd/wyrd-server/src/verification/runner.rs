@@ -1368,10 +1368,6 @@ const fn terminal_label(status: TerminalStatus) -> &'static str {
     }
 }
 
-/// An execution failure with a stable `code` and fixed public `message`.
-///
-/// The error is persisted and exposed in execution status, so `message` names only
-/// the failed operation; dependency causes go to the diagnostic log instead.
 /// `transition`, once the execution failure it ends `run` with, if any, is
 /// recorded in `state`: a terminal status, or a retry its final attempt
 /// exhausts. A failure the state cannot record is logged, and the queue
@@ -1411,6 +1407,10 @@ fn exhausted() -> Transition {
     )
 }
 
+/// An execution failure with a stable `code` and fixed public `message`.
+///
+/// The error is persisted and exposed in execution status, so `message` names only
+/// the failed operation; dependency causes go to the diagnostic log instead.
 fn failure(code: &str, message: &str) -> VerificationError {
     VerificationError {
         code: code.to_owned(),

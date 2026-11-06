@@ -47,8 +47,17 @@ import { fireEvent, waitFor, within } from '@testing-library/svelte';
 import { tick } from 'svelte';
 import { vi } from 'vitest';
 import {
+  ArtifactTable,
+  CardFacts,
   CardHeader,
+  CardInventory,
   CardRefChip,
+  PromptMessages,
+  PromptVariables,
+  RelationshipList,
+  UsedBy,
+  VersionDiff,
+  fmtYaml,
   Chart,
   Drawer,
   DurationBar,
@@ -72,7 +81,16 @@ import {
   chartParams,
   facetQuery,
   histogramWindows,
+  inventoryFilter,
+  loadArtifactTable,
+  loadCardFacts,
   loadCardHeader,
+  loadCardInventory,
+  loadPromptMessages,
+  loadPromptVariables,
+  loadRelationshipList,
+  loadUsedBy,
+  loadVersionDiff,
   loadChart,
   loadRecordDetail,
   loadRecordTable,
@@ -94,9 +112,20 @@ import { nodeExecutor } from 'wyrd-ai-ui/node';
 import { Bifrost, WyrdError, type WyrdClient } from 'wyrd-ai';
 import catalog from 'wyrd-ai-ui/catalog.json';
 import { place as placeAll, rowsHeight } from '../../packages/ui/src/lib/layout';
+import { CARD_TABS, PROMPT_TABS, readInventory, writeDetail, writeInventory } from '$lib/cards-host';
+import { load as loadCardDetail } from '../routes/t/[tenantKey]/cards/detail/+page.server';
 import {
+  AGENT,
+  agent,
+  artifacts,
   AUTHORED_SQL,
   authored,
+  inventory,
+  NATIVE,
+  notFound,
+  PROMPT,
+  prompts,
+  SERVICE,
   bareSpan,
   buckets,
   card,
@@ -1173,7 +1202,23 @@ test('TASK-027: Narrow views', async () => {
 
 test('TASK-004: Canonical signal interactions', async () => {
   // The catalog generates every Observe component with its states and typed actions.
-  expect(Object.keys(catalog.components)).toEqual(['Chart', 'CardHeader', 'StatStrip', 'FacetRail', 'RecordTable', 'TraceWaterfall', 'RecordDetail']);
+  expect(Object.keys(catalog.components)).toEqual([
+    'Chart',
+    'CardHeader',
+    'CardInventory',
+    'CardFacts',
+    'RelationshipList',
+    'ArtifactTable',
+    'PromptMessages',
+    'PromptVariables',
+    'UsedBy',
+    'VersionDiff',
+    'StatStrip',
+    'FacetRail',
+    'RecordTable',
+    'TraceWaterfall',
+    'RecordDetail'
+  ]);
   expect(catalog.components.RecordTable.states).toContain('live');
   expect(catalog.components.RecordDetail.emits.map((action) => action.name)).toEqual(['record.filter', 'record.logs', 'record.open']);
 
@@ -1893,4 +1938,258 @@ test('Observe canvas colour roles and series composition', async () => {
     ['✕ error', 'var(--danger)']
   ]);
   fall.unmount();
+});
+
+/** A fixture answer, recorded; `override` replaces the answer for the reads it matches. */
+function fixtureRecording(override: (request: WireRequest) => WireResult | undefined = () => undefined) {
+  return recording(async (request) => override(request) ?? (await fixtureExecutor.run([request]))[0]);
+}
+const ops = (calls: { request: WireRequest }[]) => calls.map((call) => call.request.op);
+const failure = { code: 'WYRD_SPEC_500_INTERNAL', title: 'Internal error', status: 500 };
+
+test('card inventory preserves filters cursors and exact references', async () => {
+  // A plain word matches names, escaped and case-insensitive; anything else is the metadata query itself.
+  expect(inventoryFilter('support')).toBe('name =~ "(?i)support"');
+  expect(inventoryFilter(' a.b ')).toBe('name =~ "(?i)a\\\\.b"');
+  expect(inventoryFilter('labels.team = "search"')).toBe('labels.team = "search"');
+  expect(inventoryFilter('exists')).toBe('exists');
+  expect(inventoryFilter('  ')).toBeUndefined();
+
+  // Every page follows the previous server cursor; filters reach cards.list unchanged.
+  const paged = fixtureRecording();
+  const two = await loadCardInventory({ kind: 'Prompt', status: 'active', include_prerelease: true, query: 'support', pages: 2 }, { executor: paged.executor });
+  expect(paged.calls.map((call) => call.request)).toEqual([
+    { op: 'cards.list', limit: 50, cursor: null, filter: 'name =~ "(?i)support"', kind: 'Prompt', status: 'active', include_prerelease: true },
+    { op: 'cards.list', limit: 50, cursor: 'page-2', filter: 'name =~ "(?i)support"', kind: 'Prompt', status: 'active', include_prerelease: true }
+  ]);
+  expect(two.result).toMatchObject({ state: 'populated', data: { items: inventory, more: false, filtered: true } });
+  const first = await loadCardInventory({}, { executor: fixtureExecutor });
+  expect(first.result).toMatchObject({ state: 'populated', data: { items: inventory.slice(0, 3), more: true, filtered: false } });
+  // A refused page is the panel's state, never rows beside a failure; empty says why.
+  const late = recording((request) => ((request as { cursor: string | null }).cursor ? { ok: false, problem: denied } : { ok: true, value: { items: inventory, next_cursor: 'next' } }));
+  expect((await loadCardInventory({ pages: 2 }, { executor: late.executor })).result).toEqual({ state: 'denied', problem: denied });
+  expect((await loadCardInventory({}, { executor: stateExecutors.error })).result.state).toBe('error');
+  expect((await loadCardInventory({}, { executor: stateExecutors.empty })).result).toMatchObject({ state: 'empty', reason: 'This tenant has no registered Cards.' });
+  expect((await loadCardInventory({ query: 'x' }, { executor: stateExecutors.empty })).result).toMatchObject({ state: 'empty', reason: 'No Card version matches these filters.' });
+
+  // Only registrable kinds, listable statuses and bounded pages validate.
+  for (const input of [{ kind: 'Policy' }, { kind: 'External' }, { status: 'deleted' }, { pages: 0 }, { pages: 21 }, { cursor: 'x' }])
+    expect(validatePanel('CardInventory', input)).toMatchObject({ code: 'WYRD_SPEC_400_VALIDATION' });
+  expect(catalog.components.CardInventory.emits.map((action) => action.name)).toEqual(['cards.filter', 'cards.more', 'card.open']);
+
+  // The URL round-trips filters and pages; a filter change drops pages, starting a fresh cursor chain.
+  const search = writeInventory({ query: 'support', kind: 'Prompt', status: 'active', include_prerelease: true, pages: 3 });
+  expect(readInventory(new URLSearchParams(search))).toEqual({ query: 'support', kind: 'Prompt', status: 'active', include_prerelease: true, pages: 3 });
+  expect(writeInventory({ query: 'support' })).toBe('?q=support');
+
+  // Rows open their exact reference; filters, kinds and Load more emit validated intents.
+  const onaction = vi.fn();
+  const view = render(CardInventory, { input: { kind: 'Prompt' }, result: first.result, onaction });
+  expect(within(view.container).getAllByRole('row')).toHaveLength(4);
+  await fireEvent.click(within(view.container).getAllByRole('button', { name: 'support-reply' })[0]);
+  await fireEvent.input(within(view.container).getByRole('textbox'), { target: { value: 'support' } });
+  await fireEvent.submit(within(view.container).getByRole('textbox').closest('form') as HTMLFormElement);
+  await fireEvent.click(within(within(view.container).getByRole('navigation', { name: 'Kinds' })).getByRole('button', { name: 'Model' }));
+  await fireEvent.change(within(view.container).getByRole('combobox'), { target: { value: 'deprecated' } });
+  await fireEvent.click(within(view.container).getByRole('checkbox'));
+  await fireEvent.click(within(view.container).getByRole('button', { name: 'Load more' }));
+  const intents = onaction.mock.calls.map(([intent]) => intent);
+  expect(intents).toEqual([
+    { name: 'card.open', input: { card_ref: { kind: 'Prompt', name: 'support-reply', version: '1.0.0', uid: 'card_Prompt_support-reply_1.0.0' } } },
+    { name: 'cards.filter', input: { kind: 'Prompt', query: 'support' } },
+    { name: 'cards.filter', input: { kind: 'Model' } },
+    { name: 'cards.filter', input: { kind: 'Prompt', status: 'deprecated' } },
+    { name: 'cards.filter', input: { kind: 'Prompt', include_prerelease: true } },
+    { name: 'cards.more', input: { pages: 2 } }
+  ]);
+  for (const intent of intents) expect(validateIntent('CardInventory', intent)).toEqual(intent);
+  expect(validateIntent('CardInventory', { name: 'card.open', input: { card_ref: { kind: 'Model', name: 'ranker', version: 'latest' } } })).toMatchObject({ code: 'WYRD_SPEC_400_VALIDATION' });
+  // A pending action takes no further input.
+  await view.rerender({ input: {}, result: first.result, onaction, actions: { 'cards.more': { state: 'pending' } } });
+  expect(within(view.container).getByRole('button', { name: 'Load more' })).toBeDisabled();
+
+  // Empty, filtered-empty, denied and failed stay distinct.
+  const states = render(CardInventory, { input: { query: 'nothing' }, result: { state: 'empty', data: { items: [], more: false, filtered: true }, reason: 'No Card version matches these filters.' }, onaction });
+  await fireEvent.click(within(states.container).getByRole('button', { name: 'Clear filter' }));
+  expect(onaction).toHaveBeenLastCalledWith({ name: 'cards.filter', input: {} });
+  await states.rerender({ input: {}, result: { state: 'empty', data: { items: [], more: false, filtered: false }, reason: 'This tenant has no registered Cards.' } });
+  expect(states.container).toHaveTextContent('wyrd declare');
+  await states.rerender({ input: { query: 'a ==' }, result: { state: 'error', problem: { code: 'WYRD_QUERY_400_INVALID_SYNTAX', title: 'Invalid query' } } });
+  expect(states.container).toHaveTextContent('WYRD_QUERY_400_INVALID_SYNTAX');
+  await states.rerender({ input: {}, result: { state: 'denied', problem: denied } });
+  expect(states.container).toHaveTextContent('Not authorized');
+
+  // The fixture view document validates and renders through WyrdView.
+  const doc = { version: 'wyrd.view/v1', catalogId: 'wyrd.ui/v1', range: RANGE, panels: [{ id: 'cards', component: 'CardInventory', input: { pages: 2 } }] };
+  expect(validateView(doc)).toMatchObject({ panels: [{ component: 'CardInventory' }] });
+  const rendered = render(WyrdView, { doc, executor: fixtureExecutor });
+  await waitFor(() => expect(rendered.container.querySelectorAll('[data-panel="cards"] tbody tr')).toHaveLength(6));
+});
+
+test('exact card detail preserves relationships files and action outcomes', async () => {
+  // A refused Card read issues no dependent read.
+  for (const load of [loadRelationshipList, loadCardFacts]) {
+    const refused = recording(() => ({ ok: false, problem: denied }));
+    expect((await load({ cardRef: AGENT }, { executor: refused.executor })).result).toEqual({ state: 'denied', problem: denied });
+    expect(ops(refused.calls)).toEqual(['cards.get_by_ref']);
+  }
+
+  // Relationships keep the server's exact references and direction.
+  const reads = fixtureRecording();
+  const relationships = await loadRelationshipList({ cardRef: AGENT }, { executor: reads.executor });
+  expect(reads.calls[0].request).toEqual({ op: 'cards.get_by_ref', card_ref: AGENT });
+  expect(relationships.result).toEqual({ state: 'populated', data: { outbound: [{ ref: PROMPT }], inbound: [{ ref: SERVICE }] } });
+  expect((await loadRelationshipList({ cardRef: AGENT }, { executor: stateExecutors.empty })).result.state).toBe('empty');
+
+  // Files come from the registered-file listing of that exact version; none is empty, never a missing Card.
+  const files = fixtureRecording();
+  const populated = await loadArtifactTable({ cardRef: card }, { executor: files.executor });
+  expect(files.calls.map((call) => call.request)).toEqual([{ op: 'cards.list_artifacts', card_ref: card }]);
+  expect(populated.result).toEqual({ state: 'populated', data: artifacts.artifacts });
+  expect((await loadArtifactTable({ cardRef: card }, { executor: stateExecutors.empty })).result).toMatchObject({ state: 'empty', reason: 'Registration recorded no files for this version.' });
+  expect((await loadArtifactTable({ cardRef: card }, { executor: stateExecutors.denied })).result.state).toBe('denied');
+  expect((await loadArtifactTable({ cardRef: card }, { executor: recording(() => ({ ok: false, problem: failure })).executor })).result).toEqual({ state: 'error', problem: failure });
+  const table = render(ArtifactTable, populated);
+  expect(table.container).toHaveTextContent('weights/model.bin');
+  expect(table.container).toHaveTextContent('4.2 MiB');
+  expect(table.container).toHaveTextContent(artifacts.artifacts[0].sha256);
+  expect(table.container).toHaveTextContent('application/octet-stream');
+  expect(within(table.container).getAllByRole('row')).toHaveLength(3);
+
+  // MCP has no file-listing tool yet: the host's real refusal is the read's outcome.
+  const app = { callServerTool: vi.fn(async () => ({ isError: true, content: [], structuredContent: { code: 'WYRD_MCP_404_TOOL_NOT_FOUND', title: 'Tool not found', status: 404 } })) };
+  const [refusal] = await mcpExecutor(app as never).run([{ op: 'cards.list_artifacts', card_ref: card }]);
+  expect(app.callServerTool).toHaveBeenCalledWith({ name: 'cards.list_artifacts', arguments: { card_ref: card } }, { signal: undefined });
+  expect(refusal).toEqual({ ok: false, problem: { code: 'WYRD_MCP_404_TOOL_NOT_FOUND', title: 'Tool not found', status: 404, detail: undefined } });
+
+  // Facts and YAML show the Card as returned.
+  const facts = await loadCardFacts({ cardRef: PROMPT }, { executor: fixtureExecutor });
+  const shown = render(CardFacts, facts);
+  expect(shown.container).toHaveTextContent('card_prompt_1.1.0');
+  expect(shown.container).toHaveTextContent('labels.team');
+  const yaml = render(CardFacts, { ...facts, input: { cardRef: PROMPT, yaml: true } });
+  expect(yaml.container.querySelector('pre')?.textContent).toBe(fmtYaml(prompts['1.1.0']));
+  expect(fmtYaml({ apiVersion: 'wyrd/v1', spec: { system: 'a\nb', count: 1, empty: [], tags: ['x', 'true'] } })).toBe(
+    ['apiVersion: wyrd/v1', 'spec:', '  system: |-', '    a', '    b', '  count: 1', '  empty: []', '  tags:', '    - x', '    - "true"'].join('\n')
+  );
+
+  // Following a relationship emits its exact reference; the host reports each outcome beside it.
+  const onaction = vi.fn();
+  const list = render(RelationshipList, { ...relationships, onaction });
+  await fireEvent.click(within(list.container).getByRole('button', { name: fmtCardRef(SERVICE) }));
+  expect(onaction).toHaveBeenCalledWith({ name: 'card.open', input: { card_ref: SERVICE } });
+  expect(validateIntent('RelationshipList', onaction.mock.calls[0][0])).toEqual(onaction.mock.calls[0][0]);
+  await list.rerender({ ...relationships, onaction, actions: { 'card.open': { state: 'pending' } } });
+  expect(within(list.container).getByRole('button', { name: fmtCardRef(SERVICE) })).toBeDisabled();
+  await list.rerender({ ...relationships, onaction, actions: { 'card.open': { state: 'denied', problem: denied } } });
+  expect(within(list.container).getByRole('alert')).toHaveTextContent(denied.code);
+  await list.rerender({ ...relationships, onaction: undefined, actions: {} });
+  expect(within(list.container).getByRole('button', { name: fmtCardRef(SERVICE) })).toBeDisabled();
+
+  // Every kind keeps the Files tab; the detail URL names one exact version and nothing else.
+  expect(CARD_TABS.map((tab) => tab.id)).toEqual(['overview', 'files', 'yaml']);
+  expect(PROMPT_TABS.map((tab) => tab.id)).toEqual(['overview', 'versions', 'files', 'yaml']);
+  expect(writeDetail({ ...PROMPT, uid: 'u 1' }, { tab: 'versions', compare: '1.0.0' })).toBe('?kind=Prompt&name=support-reply&version=1.1.0&uid=u+1&tab=versions&compare=1.0.0');
+  const detail = (search: string) => loadCardDetail({ locals: {}, url: new URL(`http://ui.test/t/acme/cards/detail${search}`), request: new Request('http://ui.test') } as never);
+  for (const search of ['?kind=Model&name=ranker', '?kind=Model&name=ranker&version=latest', '?kind=Policy&name=p&version=1.0.0', '?name=ranker&version=1.0.0'])
+    expect(await detail(search)).toMatchObject({ problem: { code: 'WYRD_SPEC_400_VALIDATION' } });
+
+  // A replaced version supersedes its in-flight read; the late old answer never renders.
+  const pending: ((result: WireResult) => void)[] = [];
+  const held = recording(() => new Promise<WireResult>((resolve) => pending.push(resolve)));
+  const doc = (version: string) => ({ version: 'wyrd.view/v1', catalogId: 'wyrd.ui/v1', range: RANGE, panels: [{ id: 'facts', component: 'CardFacts', input: { cardRef: { ...PROMPT, version } } }] });
+  const view = render(WyrdView, { doc: doc('1.0.0'), executor: held.executor });
+  await waitFor(() => expect(held.calls).toHaveLength(1));
+  await view.rerender({ doc: doc('1.1.0'), executor: held.executor });
+  await waitFor(() => expect(held.calls).toHaveLength(2));
+  expect(held.calls[0].signal?.aborted).toBe(true);
+  expect(held.calls[1].request).toEqual({ op: 'cards.get_by_ref', card_ref: { ...PROMPT, version: '1.1.0' } });
+  pending[1]({ ok: true, value: prompts['1.1.0'] });
+  await waitFor(() => expect(view.container).toHaveTextContent('card_prompt_1.1.0'));
+  pending[0]({ ok: true, value: prompts['1.0.0'] });
+  await tick();
+  expect(view.container).not.toHaveTextContent('card_prompt_1.0.0');
+});
+
+test('prompt definitions and comparisons preserve authored forms', async () => {
+  // Portable and native forms render as authored; nothing reads telemetry.
+  const reads = fixtureRecording();
+  const portable = await loadPromptMessages({ cardRef: PROMPT }, { executor: reads.executor });
+  expect(portable.result).toEqual({ state: 'populated', data: prompts['1.1.0'].spec });
+  const shown = render(PromptMessages, portable);
+  expect(within(shown.container).getByRole('region', { name: 'Message 1' })).toHaveTextContent('1 · user');
+  expect(within(shown.container).getByRole('region', { name: 'System' }).querySelector('pre')?.textContent).toBe('You answer support tickets.\nCite the policy section you rely on.');
+  expect(shown.container).toHaveTextContent('response verdict');
+  const native = await loadPromptMessages({ cardRef: NATIVE }, { executor: reads.executor });
+  const body = render(PromptMessages, native);
+  expect(within(body.container).getByRole('region', { name: 'Native body' }).querySelector('pre')?.textContent).toBe(fmtYaml((native.result as { data: { body: unknown } }).data.body));
+  expect(body.container).toHaveTextContent('future_knob: true');
+  expect(body.container).toHaveTextContent('native responses');
+  // Multimodal and long content stay readable; an absent system message says so.
+  const long = 'x'.repeat(5000);
+  const media = { ...prompts['1.0.0'], spec: { provider: 'anthropic', model: 'claude', messages: [{ role: 'user', content: [{ type: 'text', text: long }, { type: 'image', source: '${media:photo}' }] }] } };
+  const multimodal = render(PromptMessages, await loadPromptMessages({ cardRef: PROMPT }, { executor: recording(() => ({ ok: true, value: media as never })).executor }));
+  expect(multimodal.container).toHaveTextContent('No system message.');
+  expect(within(multimodal.container).getByRole('region', { name: 'Message 1' })).toHaveTextContent('[image] ${media:photo}');
+  expect(within(multimodal.container).getByRole('region', { name: 'Message 1' }).textContent).toContain(long);
+  // Only Prompt references validate; a non-Prompt answer is an error, not a reinterpreted spec.
+  expect(validatePanel('PromptMessages', { cardRef: card })).toMatchObject({ code: 'WYRD_SPEC_400_VALIDATION' });
+  expect((await loadPromptMessages({ cardRef: PROMPT }, { executor: recording(() => ({ ok: true, value: agent })).executor })).result.state).toBe('error');
+
+  // Variables are the server's status.prompt derivation, in its order.
+  const variables = await loadPromptVariables({ cardRef: PROMPT }, { executor: reads.executor });
+  expect(variables.result).toEqual({ state: 'populated', data: [{ name: 'ticket', kind: 'text' }, { name: 'tone', kind: 'text' }] });
+  const withMedia = { ...prompts['1.0.0'], status: { phase: 'active', prompt: { variables: [], media_variables: ['photo'] } } };
+  expect((await loadPromptVariables({ cardRef: PROMPT }, { executor: recording(() => ({ ok: true, value: withMedia as never })).executor })).result).toEqual({ state: 'populated', data: [{ name: 'photo', kind: 'media' }] });
+  expect((await loadPromptVariables({ cardRef: PROMPT }, { executor: stateExecutors.empty })).result).toMatchObject({ state: 'empty', reason: 'This Prompt renders with no variables.' });
+  expect(within(render(PromptVariables, variables).container).getAllByRole('row')).toHaveLength(3);
+
+  // Used by: inbound Agent relationships, each Agent read for its route; a refused Agent keeps its row.
+  const users = fixtureRecording();
+  const usedBy = await loadUsedBy({ cardRef: PROMPT }, { executor: users.executor });
+  expect(users.calls.map((call) => call.request)).toEqual([{ op: 'cards.get_by_ref', card_ref: PROMPT }, { op: 'cards.get_by_ref', card_ref: AGENT }]);
+  expect(usedBy.result).toEqual({ state: 'populated', data: [{ ref: AGENT, agent: { state: 'populated', data: { route: { kind: 'wyrd_gateway', deployment: 'primary' }, services: [SERVICE] } } }] });
+  const refusedAgent = await loadUsedBy({ cardRef: PROMPT }, { executor: fixtureRecording((request) => (request.op === 'cards.get_by_ref' && request.card_ref.kind === 'Agent' ? { ok: false, problem: denied } : undefined)).executor });
+  expect(refusedAgent.result).toEqual({ state: 'populated', data: [{ ref: AGENT, agent: { state: 'denied', problem: denied } }] });
+  const refusedPrompt = recording(() => ({ ok: false, problem: denied }));
+  expect((await loadUsedBy({ cardRef: PROMPT }, { executor: refusedPrompt.executor })).result.state).toBe('denied');
+  expect(ops(refusedPrompt.calls)).toEqual(['cards.get_by_ref']);
+  const onaction = vi.fn();
+  const table = render(UsedBy, { ...usedBy, onaction });
+  expect(table.container).toHaveTextContent('wyrd_gateway · primary');
+  await fireEvent.click(within(table.container).getByRole('button', { name: fmtCardRef(AGENT) }));
+  expect(onaction).toHaveBeenLastCalledWith({ name: 'card.open', input: { card_ref: AGENT } });
+  expect(render(UsedBy, refusedAgent).container).toHaveTextContent(denied.code);
+
+  // A comparison pins both versions and shows only the authored differences.
+  const compared = fixtureRecording();
+  const diff = await loadVersionDiff({ cardRef: PROMPT }, { executor: compared.executor });
+  expect(compared.calls.map((call) => call.request)).toEqual([
+    { op: 'cards.get_by_ref', card_ref: PROMPT },
+    { op: 'cards.list', kind: 'Prompt', name: 'support-reply', include_prerelease: true, limit: 100, cursor: null },
+    { op: 'cards.get_by_ref', card_ref: { kind: 'Prompt', name: 'support-reply', version: '1.0.0' } }
+  ]);
+  expect(diff.result).toMatchObject({ state: 'populated', data: { versions: ['1.1.0', '1.0.0'], other: '1.0.0' } });
+  const changes = (diff.result as { data: { changes: { field: string; from?: unknown; to?: unknown }[] } }).data.changes;
+  expect(changes.map((change) => change.field)).toEqual(['system', 'messages[0]', 'response_format', 'variables']);
+  expect(changes.find((change) => change.field === 'response_format')).toEqual({ field: 'response_format', to: 'verdict' });
+  expect(changes.find((change) => change.field === 'variables')).toEqual({ field: 'variables', from: ['ticket'], to: ['ticket', 'tone'] });
+  // Any two versions: the older one compared against the newer, in either direction.
+  expect((await loadVersionDiff({ cardRef: { ...PROMPT, version: '1.0.0' }, otherVersion: '1.1.0' }, { executor: fixtureExecutor })).result).toMatchObject({ data: { other: '1.1.0' } });
+  expect(validatePanel('VersionDiff', { cardRef: PROMPT, otherVersion: PROMPT.version })).toMatchObject({ code: 'WYRD_SPEC_400_VALIDATION' });
+  expect(validatePanel('VersionDiff', { cardRef: PROMPT, otherVersion: 'latest' })).toMatchObject({ code: 'WYRD_SPEC_400_VALIDATION' });
+  expect((await loadVersionDiff({ cardRef: PROMPT, otherVersion: '9.9.9' }, { executor: fixtureExecutor })).result).toEqual({ state: 'error', problem: notFound });
+  const single = await loadVersionDiff({ cardRef: NATIVE }, { executor: fixtureExecutor });
+  expect(single.result).toMatchObject({ state: 'empty', reason: 'Only version 1.0.0 is registered.' });
+  expect(render(VersionDiff, single).container).toHaveTextContent('Only version 1.0.0 is registered.');
+  const picker = render(VersionDiff, { ...diff, onaction });
+  expect(within(picker.container).getByRole('region', { name: 'system' }).querySelectorAll('pre')).toHaveLength(2);
+  await fireEvent.change(within(picker.container).getByRole('combobox'), { target: { value: '1.0.0' } });
+  expect(onaction).toHaveBeenLastCalledWith({ name: 'prompt.compare', input: { other_version: '1.0.0' } });
+  expect(validateIntent('VersionDiff', onaction.mock.lastCall?.[0])).toEqual({ name: 'prompt.compare', input: { other_version: '1.0.0' } });
+
+  // No Prompt component reads telemetry.
+  expect([...reads.calls, ...users.calls, ...compared.calls].map((call) => call.request.op)).not.toContain('bifrost.query');
+  for (const name of ['PromptMessages', 'PromptVariables', 'UsedBy', 'VersionDiff'] as const)
+    expect(validateView({ version: 'wyrd.view/v1', catalogId: 'wyrd.ui/v1', range: RANGE, panels: [{ id: 'p', component: name, input: { cardRef: PROMPT } }] })).toMatchObject({ panels: [{ component: name }] });
 });

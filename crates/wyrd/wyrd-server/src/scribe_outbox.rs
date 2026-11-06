@@ -281,7 +281,8 @@ pub enum ScribeWrite {
         attribution: Attribution,
         /// The writer's claim to advance the state to this revision.
         state: ScribeStateAdvance,
-        /// Fired once Scribe accepts the revision, and only then; a refused,
+        /// Fired once Scribe accepts the revision's own frame, without waiting
+        /// for the slice's other frames, and only then; a refused,
         /// unprojectable, or dropped write drops the sender instead.
         acked: Mutex<Option<oneshot::Sender<()>>>,
     },
@@ -1594,9 +1595,10 @@ impl ScribeSink {
     /// frees, so the slice's encoding runs in parallel and at most
     /// [`FRAMES_IN_FLIGHT`] chunks' streams are held at once. Writes whose
     /// rows cannot be encoded, or whose stream Scribe rejects terminally,
-    /// are added to `lost`. Each storage object write of `items` is notified
-    /// as its own frame is acknowledged. After a retryable refusal no further
-    /// chunk is started; those in flight still finish.
+    /// are added to `lost`. Each storage object write and execution state
+    /// revision of `items` is notified as its own frame is acknowledged.
+    /// After a retryable refusal no further chunk is started; those in
+    /// flight still finish.
     ///
     /// # Errors
     ///
@@ -1702,8 +1704,8 @@ impl ScribeSink {
     /// Records one delivered chunk: writes that could not be encoded or
     /// whose stream was rejected terminally are added to `lost`, the first
     /// retryable refusal is kept in `refused` unless an earlier one already
-    /// is, and each storage object write of `items` in an acknowledged stream
-    /// is notified.
+    /// is, and each storage object write and execution state revision of
+    /// `items` in an acknowledged stream is notified.
     fn tally(
         tenant: DataTenantId,
         items: &[ScribeWrite],
@@ -1716,7 +1718,10 @@ impl ScribeSink {
             match result {
                 Ok(()) => {
                     for position in owners {
-                        if let Some(ScribeWrite::Object { acked, .. }) = items.get(position)
+                        if let Some(
+                            ScribeWrite::Object { acked, .. }
+                            | ScribeWrite::ExecutionState { acked, .. },
+                        ) = items.get(position)
                             && let Some(sender) = acked
                                 .lock()
                                 .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -1761,7 +1766,9 @@ impl OutboxSink for ScribeSink {
     /// [`SubmissionSink::admission_lane`] does, so requests sharing an
     /// idempotency key, or a tenant's scheduled and group candidates, are acknowledged, and
     /// handed to that outbox, in arrival order; its result is staged only
-    /// after the execution was admitted. A storage object write lanes by its
+    /// after the execution was admitted. A revision of an execution's state
+    /// lanes by its `execution_id`, so different executions' revisions are
+    /// written concurrently. A storage object write lanes by its
     /// `storage_path`, so one object's completion and deletion keep their
     /// order. Server spans take lane 0. No reader relies on cross-batch commit
     /// order: group lists order by the recorded input time or a declared key.
@@ -1779,9 +1786,8 @@ impl OutboxSink for ScribeSink {
             } => return SubmissionSink::admission_lane(&queued.admission),
             ScribeWrite::ExecutionInputs { row, .. } => row.row.text("execution_id"),
             ScribeWrite::Object { row, .. } => row.text("storage_path"),
-            ScribeWrite::Audit(None)
-            | ScribeWrite::ServerSpans { .. }
-            | ScribeWrite::ExecutionState { .. } => None,
+            ScribeWrite::ExecutionState { row, .. } => row.text("execution_id"),
+            ScribeWrite::Audit(None) | ScribeWrite::ServerSpans { .. } => None,
         };
         key.map_or(0, |key| {
             let mut hasher = DefaultHasher::new();
@@ -1869,8 +1875,7 @@ impl OutboxSink for ScribeSink {
             {
                 reserved.stage(tenant, Acknowledged((**queued).clone()));
             }
-            if let ScribeWrite::ExecutionState { acked, .. } | ScribeWrite::Result { acked, .. } =
-                item
+            if let ScribeWrite::Result { acked, .. } = item
                 && !lost.contains(&index)
                 && let Some(sender) = acked
                     .lock()
@@ -1940,7 +1945,7 @@ mod tests {
 
     use crate::components::gateway::CallCapture;
     use crate::components::gateway::capture_tests::{facts, policy};
-    use crate::components::gateway::recording::{Received, RecordingScribe};
+    use crate::components::gateway::recording::{Received, RecordingScribe, TableGate};
     use crate::components::storage::inventory::{ObjectFact, ObjectOrigin, ObjectState};
     use crate::grpc::capture_peer::ScribeCapturePeerGrpc;
     use crate::verification::results::{InputRecord, ResultPayloadBuilder, ResultRun};
@@ -2287,6 +2292,51 @@ mod tests {
         }
     }
 
+    /// One revision of `execution_id`'s state, and the receiver its
+    /// acceptance fires.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the revision does not build.
+    fn execution_state(
+        execution_id: ExecutionId,
+    ) -> (ScribeWrite, tokio::sync::oneshot::Receiver<()>) {
+        let (verifier, subject, now) = (uid(), uid(), Utc::now());
+        let row = ResultPayloadBuilder::new(
+            ResultRun {
+                execution_id,
+                run_id: None,
+                verifier_version: "",
+                card_uid: &subject,
+                owner_card_uid: None,
+                group_id: None,
+                deployment_environment: None,
+                binding_id: None,
+                trigger: None,
+                window: None,
+            },
+            &verifier,
+            now,
+            now,
+        )
+        .checkpoint(1, false, &serde_json::json!({}))
+        .expect("a revision builds");
+        let (sender, acked) = tokio::sync::oneshot::channel();
+        let write = ScribeWrite::ExecutionState {
+            batch: uuid::Uuid::now_v7(),
+            row: row.row,
+            attribution: background(),
+            state: vala_bifrost_redux::contracts::ScribeStateAdvance {
+                key: execution_id.as_uuid(),
+                writer: uuid::Uuid::now_v7(),
+                revision: 1,
+                not_after: None,
+            },
+            acked: Mutex::new(Some(sender)),
+        };
+        (write, acked)
+    }
+
     /// The staged rows of one Verifier or audit write.
     ///
     /// # Panics
@@ -2445,9 +2495,9 @@ mod tests {
         );
     }
 
-    /// Proves one Verifier execution's inputs record and result share a lane
-    /// whatever the attempt or Card judged, while different executions of
-    /// one tenant spread over several.
+    /// Proves one Verifier execution's inputs record, state revisions, and
+    /// result share a lane whatever the attempt or Card judged, while
+    /// different executions of one tenant spread over several.
     ///
     /// # Panics
     ///
@@ -2459,6 +2509,7 @@ mod tests {
             .map(|_| {
                 let execution = ExecutionId::new_v7();
                 let lane = ScribeSink::lane(&direct_inputs(execution, background()));
+                assert_eq!(ScribeSink::lane(&execution_state(execution).0), lane);
                 for _ in 0..2 {
                     let attempt = execution_result(execution, &uid(), background(), 0, 0);
                     assert_eq!(ScribeSink::lane(&attempt), lane);
@@ -2467,6 +2518,41 @@ mod tests {
             })
             .collect();
         assert!(lanes.len() > 1, "one tenant's executions spread over lanes");
+    }
+
+    /// Proves a state revision is acknowledged once its own frame is,
+    /// while another frame of its slice is still held in Scribe.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the revision waits for the held frame or the slice
+    /// completes before it is released.
+    #[tokio::test]
+    async fn a_revision_is_acknowledged_at_its_own_frame() {
+        let scribe = Arc::new(TableGate::new(ScribeTable::Objects));
+        let outbox = ScribeSink::local_outbox(Arc::clone(&scribe) as _, None);
+        let tenant = DataTenantId::new_v7();
+        let (revision, acked) = execution_state(ExecutionId::new_v7());
+        let slice = vec![object("held").0, revision];
+        let writing = tokio::spawn({
+            let outbox = Arc::clone(&outbox);
+            async move {
+                outbox
+                    .sink()
+                    .write(tenant, uuid::Uuid::now_v7(), &slice)
+                    .await
+            }
+        });
+        tokio::time::timeout(Duration::from_secs(10), acked)
+            .await
+            .expect("the revision is not held by its slice")
+            .expect("the revision is accepted");
+        assert!(!writing.is_finished(), "the object frame is still held");
+        scribe.release.add_permits(1);
+        writing
+            .await
+            .expect("the write completes")
+            .expect("the slice is written");
     }
 
     /// A Scribe that holds every frame naming execution `held` until
@@ -2653,64 +2739,6 @@ mod tests {
         assert_eq!(summaries(&scribe.inner.received()), 3);
     }
 
-    /// A Scribe that admits every frame through `inner`, holding each storage
-    /// object frame until `release` has a permit.
-    struct ObjectGate {
-        /// Records every admitted frame and answers scripted refusals.
-        inner: Arc<RecordingScribe>,
-        /// Permits the held object frames wait for.
-        release: tokio::sync::Semaphore,
-        /// Signalled when an object frame arrives.
-        arrived: tokio::sync::Notify,
-    }
-
-    #[async_trait::async_trait]
-    impl Scribe for ObjectGate {
-        /// Always ready.
-        fn is_ready(&self) -> bool {
-            true
-        }
-
-        /// Admits `frame` through the recording Scribe, after a release
-        /// permit when it names the object inventory.
-        ///
-        /// # Errors
-        ///
-        /// Returns the recording Scribe's scripted refusal.
-        ///
-        /// # Panics
-        ///
-        /// Panics when the release semaphore is closed while an object frame
-        /// waits.
-        async fn ingest_frame(
-            &self,
-            frame: ScribeIngressFrame,
-        ) -> Result<FrameAdmission, ScribeError> {
-            if frame.table == ScribeTable::Objects.table_ref() {
-                self.arrived.notify_one();
-                self.release
-                    .acquire()
-                    .await
-                    .expect("the release stays open")
-                    .forget();
-            }
-            self.inner.ingest_frame(frame).await
-        }
-
-        /// Resolves through the recording Scribe.
-        ///
-        /// # Errors
-        ///
-        /// Returns the recording Scribe's resolution error.
-        async fn resolve_write_table(
-            &self,
-            tenant: DataTenantId,
-            table: &TableRef,
-        ) -> Result<TableUid, ScribeError> {
-            self.inner.resolve_write_table(tenant, table).await
-        }
-    }
-
     /// One completed storage object write at `path`, and the receiver its
     /// acknowledgement fires.
     ///
@@ -2776,11 +2804,7 @@ mod tests {
                 .find(|write| lane(write) != held_lane)
                 .expect("some write takes another lane")
         };
-        let scribe = Arc::new(ObjectGate {
-            inner: Arc::default(),
-            release: tokio::sync::Semaphore::new(0),
-            arrived: tokio::sync::Notify::new(),
-        });
+        let scribe = Arc::new(TableGate::new(ScribeTable::Objects));
         let outbox = route_outbox(
             ScribeRoute::Local(Arc::clone(&scribe) as _, None),
             BIFROST_INGEST_REQUEST_LIMIT_BYTES,

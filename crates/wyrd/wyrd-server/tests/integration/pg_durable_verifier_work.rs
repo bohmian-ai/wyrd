@@ -11,13 +11,15 @@ use std::sync::Arc;
 use serde_json::{Value, json};
 use skald_spec::MediaFormat;
 use tokio_util::sync::CancellationToken;
-use vala_bifrost_redux::catalog::TableRef;
-use vala_bifrost_redux::contracts::ScribeStateAdvance;
+use vala_bifrost_redux::catalog::{TableRef, TableUid};
+use vala_bifrost_redux::contracts::{
+    FrameAdmission, Scribe, ScribeError, ScribeIngressFrame, ScribeStateAdvance,
+};
 use vala_bifrost_redux::namespaces::BifrostNamespace;
 use vala_verify::blocks::{CallInput, CallValue, Checkpoints as _};
 use wyrd_runtime::principal::PrincipalId;
 use wyrd_server::query::scheduled::ScheduledQueryCaller;
-use wyrd_server::scribe_outbox::ScribeWrite;
+use wyrd_server::scribe_outbox::{ScribeOutbox, ScribeSink, ScribeWrite};
 use wyrd_server::verification::VerificationRuntime;
 use wyrd_server::verification::authority::SystemReadAuthority;
 use wyrd_server::verification::hosted::HostedLimits;
@@ -28,6 +30,7 @@ use wyrd_server::verification::inputs::InputResolver;
 use wyrd_server::verification::leases::LeaseRenewal;
 use wyrd_server::verification::results::{ResultPayloadBuilder, ResultRun};
 use wyrd_server::verification::state::{RunState, StateError, StateRow, StateWriter};
+use wyrd_spec::DataTenantId;
 use wyrd_spec::auth::Attribution;
 use wyrd_spec::ids::{CardUid, SlotName};
 use wyrd_spec::verification::execution::{
@@ -109,7 +112,8 @@ impl Leased {
             VerifierExecutionQueue::default(),
             std::time::Duration::from_secs(300),
         ));
-        let run = Self::writer(&server, &renewal, system, &claimed)
+        let outbox = Arc::clone(server.state().bifrost.scribe_outbox());
+        let run = Self::writer(&server, outbox, &renewal, system, &claimed)
             .await
             .expect("the execution state claims");
         Self {
@@ -143,12 +147,14 @@ impl Leased {
         )
     }
 
-    /// Claim `claimed`'s execution state for its lease, as a worker would.
+    /// Claim `claimed`'s execution state for its lease, as a worker would,
+    /// staging its revisions on `outbox`.
     ///
     /// # Errors
     /// Returns the [`StateError`] refusing the claim or its recovery read.
     async fn writer(
         server: &WyrdTestServer,
+        outbox: Arc<ScribeOutbox>,
         renewal: &Arc<LeaseRenewal>,
         system: PrincipalId,
         claimed: &ClaimedExecution,
@@ -158,7 +164,7 @@ impl Leased {
         let lease = renewal.hold(tenant, claimed.lease.token, &CancellationToken::new());
         let run = RunState::claim(
             server.state(),
-            Arc::clone(server.state().bifrost.scribe_outbox()),
+            outbox,
             tenant,
             StateRow {
                 execution_id: claimed.lease.execution_id,
@@ -237,6 +243,20 @@ impl Leased {
     /// # Panics
     /// Panics when the update or the queue claim fails.
     async fn try_reclaim(&self) -> Result<Arc<RunState>, StateError> {
+        self.reclaim_on(Arc::clone(self.server.state().bifrost.scribe_outbox()))
+            .await
+    }
+
+    /// Expire the lease on the database clock and claim the execution again,
+    /// returning its writer's claim of the state, which stages its revisions
+    /// on `outbox`.
+    ///
+    /// # Errors
+    /// Returns the [`StateError`] refusing the state claim.
+    ///
+    /// # Panics
+    /// Panics when the update or the queue claim fails.
+    async fn reclaim_on(&self, outbox: Arc<ScribeOutbox>) -> Result<Arc<RunState>, StateError> {
         let mut conn = self
             .server
             .tenant_conn_for(self.server.data_tenant_id())
@@ -262,7 +282,7 @@ impl Leased {
             .pop()
             .expect("the expired lease is reclaimable");
         conn.commit().await.expect("the reclaim commits");
-        Self::writer(&self.server, &self.renewal, self.system, &claimed).await
+        Self::writer(&self.server, outbox, &self.renewal, self.system, &claimed).await
     }
 
     /// The execution's deadline on the database clock.
@@ -1883,4 +1903,159 @@ async fn direct_and_queued_use_bifrost_run_state() {
     assert_eq!(row.result_id, Some(selected.result_id.as_uuid()));
     assert_eq!(selected.outcome.verdict, results[0].outcome.verdict);
     server.shutdown().await.expect("test server shuts down");
+}
+
+/// A Scribe that admits every frame through the server's own, holding each
+/// execution state revision until `release` has a permit.
+struct HeldRevisions {
+    /// The server's Scribe.
+    scribe: Arc<dyn Scribe>,
+    /// Permits the held revisions wait for.
+    release: tokio::sync::Semaphore,
+    /// Signalled when a held revision arrives.
+    arrived: tokio::sync::Notify,
+}
+
+#[async_trait::async_trait]
+impl Scribe for HeldRevisions {
+    /// Admits `frame` through the server's Scribe, after a release permit
+    /// when it is a state revision.
+    ///
+    /// # Errors
+    /// Returns the server Scribe's refusal.
+    ///
+    /// # Panics
+    /// Panics when the release semaphore closes while a revision waits.
+    async fn ingest_frame(&self, frame: ScribeIngressFrame) -> Result<FrameAdmission, ScribeError> {
+        if frame.table.fqn() == "bifrost.verification.execution_events" {
+            self.arrived.notify_one();
+            self.release
+                .acquire()
+                .await
+                .expect("the release stays open")
+                .forget();
+        }
+        self.scribe.ingest_frame(frame).await
+    }
+
+    /// Resolves through the server's Scribe.
+    ///
+    /// # Errors
+    /// Returns the server Scribe's resolution error.
+    async fn resolve_write_table(
+        &self,
+        tenant: DataTenantId,
+        table: &TableRef,
+    ) -> Result<TableUid, ScribeError> {
+        self.scribe.resolve_write_table(tenant, table).await
+    }
+}
+
+/// Whether polling `future` once leaves it pending.
+async fn pending<F: Future + Unpin>(future: &mut F) -> bool {
+    tokio::time::timeout(std::time::Duration::ZERO, future)
+        .await
+        .is_err()
+}
+
+/// A reclaim recovers exactly the batches Scribe accepted while independent
+/// steps recorded their progress concurrently.
+///
+/// The factual check's caller confirms its lease and freezes its revision,
+/// which is held while the sensitive check records its start in memory, and
+/// the sensitive waiter is cancelled before any revision holds it.
+/// Once the factual revision is accepted, the accepted state holds only the
+/// factual check, and the reclaim resumes from it without the sensitive
+/// check. The replaced writer then freezes the sensitive check and the
+/// dependent combination into one revision, which is refused, so neither
+/// becomes accepted. The new writer records both siblings concurrently, and
+/// the accepted state then holds all three.
+///
+/// # Panics
+/// Panics when a step returns before its revision is accepted, the recovered
+/// state holds an unaccepted change, or the replaced writer is accepted.
+#[tokio::test(flavor = "multi_thread")]
+async fn batched_checkpoints_recover_exactly_the_accepted_batch() {
+    let leased = Leased::start().await;
+    let held = Arc::new(HeldRevisions {
+        scribe: Arc::clone(
+            leased
+                .server
+                .state()
+                .bifrost_ingest()
+                .expect("the server runs Scribe")
+                .scribe(),
+        ) as _,
+        release: tokio::sync::Semaphore::new(0),
+        arrived: tokio::sync::Notify::new(),
+    });
+    let outbox = ScribeSink::local_outbox(
+        Arc::clone(&held) as _,
+        Some(leased.server.state().postgres.wyrd().clone()),
+    );
+    let first = leased
+        .reclaim_on(outbox)
+        .await
+        .expect("the execution state claims");
+    let task = |id: &str| TaskId::new(id).expect("task");
+    let (factual, sensitive, combine) = (task("factual"), task("sensitive"), task("combine"));
+
+    let mut factual_started = Box::pin(first.begin(&factual, 1));
+    tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        tokio::select! {
+            started = &mut factual_started => panic!("returned while held: {started:?}"),
+            () = held.arrived.notified() => {}
+        }
+    })
+    .await
+    .expect("the factual revision reaches Scribe");
+    let mut sensitive_started = Box::pin(first.begin(&sensitive, 1));
+    assert!(
+        pending(&mut sensitive_started).await,
+        "the held revision does not hold the sensitive check"
+    );
+    drop(sensitive_started);
+    assert_eq!(attempts(&first.snapshot().await).len(), 2);
+    held.release
+        .add_permits(tokio::sync::Semaphore::MAX_PERMITS);
+    factual_started
+        .await
+        .expect("the factual revision is accepted");
+    assert_eq!(
+        attempts(&leased.accepted().await),
+        [("factual".to_owned(), 1)],
+        "the accepted revision holds only the factual check"
+    );
+
+    let current = leased.reclaim().await;
+    assert_eq!(
+        attempts(&current.snapshot().await),
+        [("factual".to_owned(), 1)]
+    );
+    assert!(
+        first.begin(&combine, 1).await.is_err(),
+        "the replaced writer's batch is refused"
+    );
+    assert_eq!(
+        attempts(&leased.accepted().await),
+        [("factual".to_owned(), 1)]
+    );
+
+    let (sensitive_started, combine_started) =
+        tokio::join!(current.begin(&sensitive, 1), current.begin(&combine, 1));
+    sensitive_started.expect("the sensitive check is accepted");
+    combine_started.expect("the combination is accepted");
+    assert_eq!(
+        attempts(&leased.accepted().await),
+        [
+            ("factual".to_owned(), 1),
+            ("sensitive".to_owned(), 1),
+            ("combine".to_owned(), 1)
+        ]
+    );
+    leased
+        .server
+        .shutdown()
+        .await
+        .expect("test server shuts down");
 }

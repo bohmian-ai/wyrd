@@ -28,7 +28,7 @@ use wyrd_server::verification::inputs::InputResolver;
 use wyrd_server::verification::leases::LeaseRenewal;
 use wyrd_server::verification::results::{ResultPayloadBuilder, ResultRun};
 use wyrd_server::verification::state::{
-    Checkpoint, RunState, StateError, StateRow, revision_batch,
+    Checkpoint, RunState, StateError, StateRow, revision_batch, stand_in_identity,
 };
 use wyrd_spec::DataTenantId;
 use wyrd_spec::auth::Attribution;
@@ -40,7 +40,9 @@ use wyrd_spec::verification::execution::{
 };
 use wyrd_spec::verification::state::{EXECUTION_STATE_FORMAT, ExecutionState};
 use wyrd_spec::verification::{PublicationName, TaskId};
-use wyrd_spec::verification::{VerificationError, VerificationVerdict};
+use wyrd_spec::verification::{
+    VerificationError, VerificationExecutionStatus, VerificationVerdict,
+};
 use wyrd_sql::queries::auth::service_accounts::system_principal_id;
 use wyrd_sql::queries::verifier_executions::{
     ClaimedExecution, ExecutionLease, Settlement, TerminalStatus, VerifierExecutionQueue,
@@ -171,6 +173,7 @@ impl Leased {
             tenant,
             StateRow {
                 execution_id: claimed.lease.execution_id,
+                identity: stand_in_identity(&claimed.verifier_card_uid, &claimed.card_uid),
                 verifier_uid: claimed.verifier_card_uid.clone(),
                 card_uid: claimed.card_uid.clone(),
                 owner_card_uid: None,
@@ -1685,6 +1688,221 @@ async fn terminal_selection_and_inspection_use_run_state() {
         .expect("test server shuts down");
 }
 
+/// A user's bearer token for `name`, bootstrapped with `roles`.
+///
+/// # Panics
+/// Panics when the user does not bootstrap.
+async fn jwt(server: &WyrdTestServer, name: &str, roles: &[&str]) -> String {
+    let wyrd_testing::Bootstrap::User { jwt, .. } = server
+        .bootstrap_user(name, roles)
+        .await
+        .expect("user bootstraps")
+    else {
+        panic!("a user bootstraps as a user");
+    };
+    jwt
+}
+
+/// The status and JSON body of `method` on the execution route `path`.
+///
+/// # Panics
+/// Panics when the request does not respond or its body is not JSON.
+async fn respond(
+    server: &WyrdTestServer,
+    jwt: &str,
+    method: &str,
+    path: &str,
+) -> (axum::http::StatusCode, Value) {
+    let response = server
+        .oneshot_authenticated(
+            jwt,
+            axum::http::Request::builder()
+                .method(method)
+                .uri(format!("/v1/verification/executions/{path}"))
+                .body(axum::body::Body::empty())
+                .expect("request builds"),
+        )
+        .await
+        .expect("the request responds");
+    let status = response.status();
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .expect("the body reads");
+    (
+        status,
+        serde_json::from_slice(&body).expect("the body is JSON"),
+    )
+}
+
+impl Leased {
+    /// Delete the execution's queue row, then its Verifier and subject Cards.
+    ///
+    /// # Panics
+    /// Panics when a delete fails or deletes nothing.
+    async fn forget_queue_and_cards(&self) {
+        let mut conn = self
+            .server
+            .tenant_conn_for(self.server.data_tenant_id())
+            .await
+            .expect("tenant connection opens");
+        let (verifier, card): (uuid::Uuid, uuid::Uuid) = sqlx::query_as(
+            "DELETE FROM wyrd.verifier_executions WHERE execution_id = $1 \
+             RETURNING verifier_card_uid, card_uid",
+        )
+        .bind(self.lease.execution_id.as_uuid())
+        .fetch_one(&mut **conn.transaction())
+        .await
+        .expect("the queue row deletes");
+        let deleted = sqlx::query("DELETE FROM wyrd.cards WHERE card_uid = ANY($1)")
+            .bind([verifier, card])
+            .execute(&mut **conn.transaction())
+            .await
+            .expect("the Cards delete")
+            .rows_affected();
+        assert_eq!(deleted, 2, "both Cards delete");
+        conn.commit().await.expect("the deletes commit");
+    }
+}
+
+/// A user cancelling an execution that recorded no checkpoint retains the
+/// cancellation in its state: once its queue row and both Cards are gone, a
+/// reader of its Verifier still reads it cancelled with the queue's error,
+/// and a caller without the grant is refused.
+///
+/// # Panics
+/// Panics when the cancel is refused, the state does not hold the
+/// cancellation, or a read differs.
+#[tokio::test(flavor = "multi_thread")]
+async fn cancellation_reads_back_from_state_after_the_queue_and_cards_are_gone() {
+    let leased = Leased::start().await;
+    let execution = leased.lease.execution_id;
+    let editor = jwt(&leased.server, "canceller", &["editor"]).await;
+    let (status, body) = respond(
+        &leased.server,
+        &editor,
+        "POST",
+        &format!("{execution}/cancel"),
+    )
+    .await;
+    assert_eq!(
+        (status, body["status"].clone()),
+        (axum::http::StatusCode::OK, json!("cancelled")),
+        "{body}"
+    );
+    let failure = leased
+        .accepted()
+        .await
+        .failure
+        .expect("the state holds the cancellation");
+    assert_eq!(
+        (failure.status, failure.error.code.as_str()),
+        (VerificationExecutionStatus::Cancelled, "cancelled")
+    );
+
+    leased.forget_queue_and_cards().await;
+    let viewer = jwt(&leased.server, "cancel-reader", &["viewer"]).await;
+    let (status, body) = respond(&leased.server, &viewer, "GET", &execution.to_string()).await;
+    assert_eq!(
+        (
+            status,
+            body["status"].clone(),
+            body["error"]["code"].clone(),
+            body["result"].clone()
+        ),
+        (
+            axum::http::StatusCode::OK,
+            json!("cancelled"),
+            json!("cancelled"),
+            Value::Null
+        ),
+        "{body}"
+    );
+    let outsider = jwt(&leased.server, "cancel-outsider", &[]).await;
+    let (status, body) = respond(&leased.server, &outsider, "GET", &execution.to_string()).await;
+    assert_eq!(status, axum::http::StatusCode::FORBIDDEN, "{body}");
+    leased
+        .server
+        .shutdown()
+        .await
+        .expect("test server shuts down");
+}
+
+/// An engine failure recorded in the state is the execution's historical
+/// error: the public read answers it over a different queue error, and
+/// still answers it once the queue row and both Cards are gone. A later
+/// failure does not replace it.
+///
+/// # Panics
+/// Panics when a revision is refused or a read differs from the recorded
+/// failure.
+#[tokio::test(flavor = "multi_thread")]
+async fn failures_read_back_from_state_instead_of_the_queue_payload() {
+    let leased = Leased::start().await;
+    let execution = leased.lease.execution_id;
+    let engine = VerificationError {
+        code: "engine_failed".to_owned(),
+        message: "the engine failed".to_owned(),
+    };
+    leased
+        .run
+        .fail(VerificationExecutionStatus::Errored, &engine)
+        .await
+        .expect("the failure is accepted");
+    leased
+        .run
+        .fail(
+            VerificationExecutionStatus::TimedOut,
+            &VerificationError {
+                code: "later".to_owned(),
+                message: "a later failure".to_owned(),
+            },
+        )
+        .await
+        .expect("a repeated failure is accepted");
+    let mut conn = leased
+        .server
+        .tenant_conn_for(leased.server.data_tenant_id())
+        .await
+        .expect("tenant connection opens");
+    VerifierExecutionQueue::default()
+        .terminate(
+            &mut conn,
+            leased.lease,
+            TerminalStatus::Errored,
+            &VerificationError {
+                code: "queue_only".to_owned(),
+                message: "the queue's copy".to_owned(),
+            },
+        )
+        .await
+        .expect("terminate runs");
+    conn.commit().await.expect("the settlement commits");
+
+    let viewer = jwt(&leased.server, "failure-reader", &["viewer"]).await;
+    let read = async || {
+        let (status, body) = respond(&leased.server, &viewer, "GET", &execution.to_string()).await;
+        assert_eq!(status, axum::http::StatusCode::OK, "{body}");
+        (body["status"].clone(), body["error"]["code"].clone())
+    };
+    let expected = (json!("errored"), json!("engine_failed"));
+    assert_eq!(
+        read().await,
+        expected,
+        "a queued read answers the state's error"
+    );
+    leased.forget_queue_and_cards().await;
+    assert_eq!(
+        read().await,
+        expected,
+        "a retained read answers the state's error"
+    );
+    leased
+        .server
+        .shutdown()
+        .await
+        .expect("test server shuts down");
+}
+
 /// A state in a format this worker does not run keeps its custody: a
 /// reclaim refuses it as incompatible instead of resuming or starting fresh,
 /// and the accepted revision is left unchanged.
@@ -1745,6 +1963,7 @@ async fn state_format_changes_preserve_existing_custody() {
                 1,
                 Arc::new(StateRow {
                     execution_id: leased.lease.execution_id,
+                    identity: stand_in_identity(&verifier_uid, &card_uid),
                     verifier_uid,
                     card_uid,
                     owner_card_uid: None,

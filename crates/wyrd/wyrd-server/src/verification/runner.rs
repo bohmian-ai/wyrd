@@ -53,8 +53,8 @@ use wyrd_spec::card::verifier::VerifierSpec;
 use wyrd_spec::error::WyrdError;
 use wyrd_spec::ids::{SlotName, VerificationResultId};
 use wyrd_spec::verification::execution::InputDeclaration;
-use wyrd_spec::verification::state::TerminalSelection;
-use wyrd_spec::verification::{TaskId, VerifierReadiness};
+use wyrd_spec::verification::state::{ExecutionIdentity, TerminalSelection};
+use wyrd_spec::verification::{TaskId, VerificationExecutionStatus, VerifierReadiness};
 use wyrd_spec::verification::{VerificationError, VerificationVerdict};
 use wyrd_sql::queries::verifier_executions::{
     ClaimedExecution, Completion, EnqueueRefusal, ExecutionInput, RetryOutcome, TerminalStatus,
@@ -410,7 +410,10 @@ impl VerifierRunner {
                 None,
             );
         };
-        let state = match self.state(tenant, run, system, deadline, lease).await {
+        let state = match self
+            .state(tenant, run, &verifier, system, deadline, lease)
+            .await
+        {
             Ok(state) => Arc::new(state),
             Err(transition) => return (transition, None),
         };
@@ -419,7 +422,7 @@ impl VerifierRunner {
             return (transition, write.map(|write| (slot, write)));
         }
         if run.exhausted {
-            return (exhausted(), None);
+            return (retained(run, &state, exhausted()).await, None);
         }
         let started_at = Utc::now();
         let outcome = if deadline <= tokio::time::Instant::now() {
@@ -445,9 +448,14 @@ impl VerifierRunner {
                 }
                 Err(error) => (state_failure(run, &error), None),
             },
-            EngineOutcome::Retry(error) => (Transition::Retry(error), None),
+            EngineOutcome::Retry(error) => {
+                (retained(run, &state, Transition::Retry(error)).await, None)
+            }
             EngineOutcome::Deferred(error) => (Transition::Defer(error), None),
-            EngineOutcome::Terminal(status, error) => (Transition::Terminate(status, error), None),
+            EngineOutcome::Terminal(status, error) => (
+                retained(run, &state, Transition::Terminate(status, error)).await,
+                None,
+            ),
         }
     }
 
@@ -461,6 +469,7 @@ impl VerifierRunner {
         &self,
         tenant: DataTenantId,
         run: &ClaimedExecution,
+        verifier: &Target,
         system: PrincipalId,
         deadline: tokio::time::Instant,
         lease: &Arc<HeldLease>,
@@ -484,6 +493,13 @@ impl VerifierRunner {
                 },
                 deployment_environment: run.deployment_environment.clone(),
                 attribution: Attribution::new(run.attribution.sub_principal_id, system),
+                identity: ExecutionIdentity {
+                    verifier: verifier.verifier.clone(),
+                    subject: verifier.subject.clone(),
+                    deployment_environment: run.deployment_environment.clone(),
+                    group_id: run.group_id.clone(),
+                    owner_card_uid: owner(run).cloned(),
+                },
             },
             deadline,
             Some(Arc::clone(lease)),
@@ -1356,6 +1372,33 @@ const fn terminal_label(status: TerminalStatus) -> &'static str {
 ///
 /// The error is persisted and exposed in execution status, so `message` names only
 /// the failed operation; dependency causes go to the diagnostic log instead.
+/// `transition`, once the execution failure it ends `run` with, if any, is
+/// recorded in `state`: a terminal status, or a retry its final attempt
+/// exhausts. A failure the state cannot record is logged, and the queue
+/// still settles it.
+async fn retained(run: &ClaimedExecution, state: &RunState, transition: Transition) -> Transition {
+    let failure = match &transition {
+        Transition::Terminate(status, error) => Some((
+            match status {
+                TerminalStatus::Cancelled => VerificationExecutionStatus::Cancelled,
+                TerminalStatus::TimedOut => VerificationExecutionStatus::TimedOut,
+                TerminalStatus::Errored => VerificationExecutionStatus::Errored,
+            },
+            error,
+        )),
+        Transition::Retry(error) if run.attempt >= run.max_attempts => {
+            Some((VerificationExecutionStatus::Errored, error))
+        }
+        _ => None,
+    };
+    if let Some((status, error)) = failure
+        && let Err(unrecorded) = state.fail(status, error).await
+    {
+        tracing::warn!(execution_id = %run.lease.execution_id, error = %unrecorded, "an execution's failure was not retained");
+    }
+    transition
+}
+
 /// How an exhausted claim ends when it cannot deliver an already selected
 /// outcome: no attempt is left to compute one.
 fn exhausted() -> Transition {

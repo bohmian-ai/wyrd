@@ -43,8 +43,10 @@ use wyrd_spec::verification::execution::{
     InvocationSettlement, Producer, Publication, PublicationKind, VerificationOutcome,
 };
 use wyrd_spec::verification::state::{
-    AcceptedPublication, ExecutionState, ExecutionStateError, InvocationRecord, TerminalSelection,
+    AcceptedPublication, ExecutionIdentity, ExecutionState, ExecutionStateError, InvocationRecord,
+    TerminalFailure, TerminalSelection,
 };
+use wyrd_spec::verification::{VerificationError, VerificationExecutionStatus};
 
 use super::inputs::InputResolver;
 use super::leases::HeldLease;
@@ -118,6 +120,36 @@ pub struct StateRow {
     pub deployment_environment: Option<String>,
     /// The execution's subject and actor, which Scribe stamps on each row.
     pub attribution: Attribution,
+    /// The exact identity every revision records.
+    pub identity: ExecutionIdentity,
+}
+
+/// A stand-in identity naming `verifier` and `subject` by UID, for writers
+/// whose exact names do not matter.
+///
+/// # Panics
+/// Panics only if its static name or version failed to parse, which they
+/// never do.
+#[cfg(any(test, feature = "test-support"))]
+#[must_use]
+pub fn stand_in_identity(verifier: &CardUid, subject: &CardUid) -> ExecutionIdentity {
+    let exact = |kind, name: &str, uid: &CardUid| wyrd_spec::reference::CardRef {
+        kind,
+        name: wyrd_spec::ids::CardName::new(name).expect("a static Card name is valid"),
+        version: wyrd_semver::VersionBlock::parse("1.0.0").expect("a static version is valid"),
+        uid: Some(uid.clone()),
+    };
+    ExecutionIdentity {
+        verifier: exact(
+            wyrd_spec::envelope::CardKind::Verifier,
+            "verifier",
+            verifier,
+        ),
+        subject: exact(wyrd_spec::envelope::CardKind::Model, "subject", subject),
+        deployment_environment: None,
+        group_id: None,
+        owner_card_uid: None,
+    }
 }
 
 /// The call that asks to accept one publication.
@@ -465,16 +497,18 @@ impl RunState {
         )
     }
 
-    /// A writer of `state`, accepted at `revision`.
-    fn at(
+    /// A writer of `state`, accepted at `revision`, which records `row`'s
+    /// identity unless the state already holds one.
+    pub(crate) fn at(
         outbox: Arc<ScribeOutbox>,
         tenant: DataTenantId,
         row: StateRow,
         deadline: tokio::time::Instant,
         lease: Option<Arc<HeldLease>>,
-        state: ExecutionState,
+        mut state: ExecutionState,
         revision: i64,
     ) -> Self {
+        state.identity.get_or_insert_with(|| row.identity.clone());
         Self {
             scribe: Arc::new(StateScribe {
                 outbox,
@@ -594,6 +628,33 @@ impl RunState {
         };
         self.durable(ticket).await?;
         Ok(selected)
+    }
+
+    /// Record that the execution ended without an outcome, as `status` with
+    /// `error`, returning once an accepted revision holds it. A state that
+    /// already selected an outcome or recorded a failure keeps it.
+    ///
+    /// # Errors
+    /// Returns the [`Self::durable`] errors.
+    pub async fn fail(
+        &self,
+        status: VerificationExecutionStatus,
+        error: &VerificationError,
+    ) -> Result<(), StateError> {
+        let ticket = {
+            let mut held = self.held.lock().await;
+            if held.state.terminal.is_some() || held.state.failure.is_some() {
+                held.changes
+            } else {
+                held.state.failure = Some(TerminalFailure {
+                    status,
+                    error: error.clone(),
+                    ended_at: Utc::now(),
+                });
+                held.changed()
+            }
+        };
+        self.durable(ticket).await
     }
 
     /// The receipt `call` already holds, when it holds one, once an
@@ -943,10 +1004,12 @@ mod tests {
     fn held_state() -> (RunState, Arc<TableGate>) {
         let scribe = Arc::new(TableGate::new(ScribeTable::ExecutionEvents));
         let outbox = ScribeSink::local_outbox(Arc::clone(&scribe) as _, None);
+        let (verifier, subject) = (uid(), uid());
         let row = StateRow {
             execution_id: ExecutionId::new_v7(),
-            verifier_uid: uid(),
-            card_uid: uid(),
+            identity: super::stand_in_identity(&verifier, &subject),
+            verifier_uid: verifier,
+            card_uid: subject,
             owner_card_uid: None,
             run_id: None,
             deployment_environment: None,

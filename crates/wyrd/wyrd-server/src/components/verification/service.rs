@@ -29,16 +29,15 @@ use wyrd_spec::verification::execution::{
     EnqueueVerificationResponse, EvidencePlanRequest, EvidencePlanResponse, EvidenceUpload,
     VerificationExecutionState, VerificationRequest, VerificationResult,
 };
-use wyrd_spec::verification::state::TerminalSelection;
+use wyrd_spec::verification::state::{ExecutionIdentity, TerminalSelection};
 use wyrd_spec::verification::{
-    VerificationBindingStatus, VerificationExecutionStatus, VerifierReadiness,
+    VerificationBindingStatus, VerificationError, VerificationExecutionStatus, VerifierReadiness,
 };
+use wyrd_sql::TenantConn;
 use wyrd_sql::queries::auth::service_accounts::system_principal_id;
-use wyrd_sql::queries::cards::get_card_by_uid;
 use wyrd_sql::queries::verifier_executions::{
     Admission, Cause, EnqueueRefusal, Submission, SubmissionOutcome, VerifierExecutionQueue,
 };
-use wyrd_sql::{ParsedCardRow, TenantConn};
 
 use crate::audit;
 use crate::components::auth::Caller;
@@ -52,7 +51,7 @@ use crate::query::scheduled::ScheduledQueryCaller;
 use crate::scribe_outbox::{ScribeSink, ScribeWrite};
 use crate::state::{AppState, registry_db_error};
 use crate::verification::authority::SystemReadAuthority;
-use crate::verification::cache::{Db, Target, exact_ref};
+use crate::verification::cache::{Db, Target};
 use crate::verification::hosted::blocks::{Execution, HostedBlocks};
 use crate::verification::inputs::InputResolver;
 use crate::verification::results::{
@@ -209,143 +208,68 @@ impl<'a> VerificationControl<'a> {
 
     /// Read one execution's status, dispatches, and result once visible.
     ///
-    /// Authorizes and audits `verifier:read` on the execution's exact
-    /// Verifier, reads the status and both exact Cards in one tenant
-    /// transaction, then — for a completed execution — reads its
-    /// PostgreSQL-selected result through the one result reader. Records are
-    /// read by the tenant's SYSTEM principal granted only the three
-    /// verification record tables, serving the caller, so a reader needs no
-    /// Bifrost table grant. A group execution's source selection is read
-    /// from its input record. A direct execution has no queue row: its ID
-    /// resolves only through a published result whose input record has the
-    /// `direct` origin, and reads as completed. A result Scribe has not yet
-    /// published leaves `result` absent, so the caller polls again.
+    /// Reads the execution as [`Self::retained`](VerificationControl::retained)
+    /// does, for direct and queued work alike and whether or not its queue
+    /// row remains, authorizing `verifier:read` on its exact Verifier. The
+    /// status, error, and result come from the accepted state: a selected
+    /// outcome is read back from its result records under the result
+    /// identity the state selected, with the Verifier and subject the state
+    /// recorded, so a deleted Card or a removed queue row changes nothing; a
+    /// recorded failure answers its status and error. Only unfinished work
+    /// answers the queue's status. Dispatches and a group execution's source
+    /// selection are read from the queue row and the input record. A result
+    /// Scribe has not yet published leaves `result` absent, so the caller
+    /// polls again.
     ///
     /// # Errors
-    /// Returns [`WyrdError::PermissionDeniedRbac`] without `verifier:read` on
-    /// the execution's Verifier,
-    /// [`WyrdError::VerificationExecutionNotFound`] when the tenant has no
-    /// such execution, a registry unavailability error when a read fails,
-    /// `WYRD_VALA_503_QUERY_VISIBILITY_UNAVAILABLE` when the record reader is
-    /// unavailable, and the query error when a record read fails.
+    /// The errors of [`Self::retained`](VerificationControl::retained), and
+    /// the query error when a record read fails.
     pub(crate) async fn get_execution(
         &self,
         caller: &Caller,
         execution_id: ExecutionId,
     ) -> Result<VerificationExecutionState, WyrdError> {
-        let resource = format!("verification.execution:{execution_id}");
-        self.require_verifier(caller, Action::Read, GET_EXECUTION, &resource)?;
-        let mut conn = self
-            .state
-            .registry_tenant_conn(caller.data_tenant_id)
-            .await?;
-        let query = self.records(&mut conn, caller).await?;
-        let records = InputResolver::new(&query, None);
-        let status = self
-            .queue
-            .execution_status(&mut conn, execution_id)
-            .await
-            .map_err(registry_db_error)?;
-        let Some(status) = status else {
-            drop(conn);
-            return self
-                .direct_execution(caller, &records, execution_id, &resource)
-                .await?
-                .ok_or_else(|| inspection::execution_not_found(execution_id));
+        let retained = self.retained(caller, execution_id, GET_EXECUTION).await?;
+        let records = InputResolver::new(&retained.query, None);
+        let identity = retained.state.identity.as_ref();
+        let mut state = match &retained.queued {
+            Some(queued) => queued.state.clone(),
+            None => VerificationExecutionState {
+                execution_id,
+                status: VerificationExecutionStatus::Running,
+                error: None,
+                result: None,
+                dispatches: Vec::new(),
+                group_id: identity.and_then(|identity| identity.group_id.clone()),
+                owner_card_uid: identity.and_then(|identity| identity.owner_card_uid.clone()),
+                group: None,
+            },
         };
-        audit::authorize(
-            self.state,
-            caller,
-            &Permission::verifier_read(status.verifier_card_uid.clone()),
-            GET_EXECUTION,
-            &resource,
-        )?;
-        let mut state = status.state;
-        let verifier = Self::card(&mut conn, &status.verifier_card_uid).await?;
-        let subject = Self::card(&mut conn, &status.card_uid).await?;
-        drop(conn);
+        state.status = retained.status();
+        if let Some(failure) = &retained.state.failure {
+            state.error = Some(failure.error.clone());
+        }
         if state.group_id.is_some() && state.owner_card_uid.is_some() {
             state.group = match records.record(execution_id).await? {
                 Some(record) => record.group()?.map(|selector| selector.snapshot()),
                 None => None,
             };
         }
-        let (Some(result_id), Some(verifier), Some(subject)) =
-            (status.result_id, verifier, subject)
-        else {
+        let (Some(selected), Some(identity)) = (&retained.state.terminal, identity) else {
             return Ok(state);
         };
-        state.result =
-            records
-                .result(result_id)
-                .await?
-                .map(|(run_id, outcome)| VerificationResult {
-                    execution_id,
-                    run_id,
-                    verifier: exact_ref(&verifier),
-                    subject: exact_ref(&subject),
-                    outcome,
-                    deployment_environment: status.deployment_environment,
-                });
-        Ok(state)
-    }
-
-    /// The completed status of direct execution `execution_id`, `None` until
-    /// its result, output, and input records are visible or when no direct
-    /// execution has this ID; a found one is authorized and audited as
-    /// `verifier:read` on its Verifier for `resource`.
-    ///
-    /// # Errors
-    /// Returns [`WyrdError::PermissionDeniedRbac`] without that grant, a query
-    /// failure, a registry error when a Card read fails, and an internal
-    /// error when a stored record is malformed.
-    async fn direct_execution(
-        &self,
-        caller: &Caller,
-        records: &InputResolver<'_>,
-        execution_id: ExecutionId,
-        resource: &str,
-    ) -> Result<Option<VerificationExecutionState>, WyrdError> {
-        let Some(direct) = records.direct(execution_id).await? else {
-            return Ok(None);
-        };
-        audit::authorize(
-            self.state,
-            caller,
-            &Permission::verifier_read(direct.verifier_card_uid.clone()),
-            GET_EXECUTION,
-            resource,
-        )?;
-        let Some((run_id, outcome)) = records.result(direct.result_id).await? else {
-            return Ok(None);
-        };
-        let mut conn = self
-            .state
-            .registry_tenant_conn(caller.data_tenant_id)
-            .await?;
-        let verifier = Self::card(&mut conn, &direct.verifier_card_uid).await?;
-        let subject = Self::card(&mut conn, &direct.card_uid).await?;
-        drop(conn);
-        let (Some(verifier), Some(subject)) = (verifier, subject) else {
-            return Ok(None);
-        };
-        Ok(Some(VerificationExecutionState {
-            execution_id,
-            status: VerificationExecutionStatus::Completed,
-            error: None,
-            result: Some(VerificationResult {
+        state.result = records
+            .result(selected.result_id)
+            .await?
+            .map(|(run_id, outcome)| VerificationResult {
                 execution_id,
                 run_id,
-                verifier: exact_ref(&verifier),
-                subject: exact_ref(&subject),
+                verifier: identity.verifier.clone(),
+                subject: identity.subject.clone(),
                 outcome,
-                deployment_environment: direct.deployment_environment,
-            }),
-            dispatches: Vec::new(),
-            group_id: direct.group_id,
-            owner_card_uid: None,
-            group: None,
-        }))
+                deployment_environment: identity.deployment_environment.clone(),
+            });
+        Ok(state)
     }
 
     /// Plan uploads of the caller's evidence files that are not completed
@@ -576,113 +500,142 @@ impl<'a> VerificationControl<'a> {
                 run_id: request.run_id.clone(),
                 deployment_environment: request.deployment_environment.clone(),
                 attribution: caller.attribution(),
+                identity: ExecutionIdentity {
+                    verifier: target.verifier.clone(),
+                    subject: target.subject.clone(),
+                    deployment_environment: request.deployment_environment.clone(),
+                    group_id: request.group_id.clone(),
+                    owner_card_uid: None,
+                },
             },
             deadline,
         ));
-        let engine = match blocks.engine(
-            self.state,
-            Execution {
-                caller: &executor,
-                verifier: &request.verifier_card_uid,
-                evidence: &request.inputs,
-                routes: &request.execution_route_overrides,
-                subject: GatewayCallContext {
-                    workload_card_uid: owner.cloned(),
-                    subject_card_uid: Some(request.card_uid.clone()),
-                    run_id: request.run_id.clone(),
-                    deployment_environment: request.deployment_environment.clone(),
+        let finished = async {
+            let engine = match blocks.engine(
+                self.state,
+                Execution {
+                    caller: &executor,
+                    verifier: &request.verifier_card_uid,
+                    evidence: &request.inputs,
+                    routes: &request.execution_route_overrides,
+                    subject: GatewayCallContext {
+                        workload_card_uid: owner.cloned(),
+                        subject_card_uid: Some(request.card_uid.clone()),
+                        run_id: request.run_id.clone(),
+                        deployment_environment: request.deployment_environment.clone(),
+                    },
+                    defer_unlanded_traces: false,
+                    drift: DriftChecks::new(None, BTreeMap::new(), BTreeMap::new()),
+                    clock: telemetry.clock(),
+                    execution: Some(Arc::clone(&state)),
                 },
-                defer_unlanded_traces: false,
-                drift: DriftChecks::new(None, BTreeMap::new(), BTreeMap::new()),
-                clock: telemetry.clock(),
-                execution: Some(Arc::clone(&state)),
-            },
-        ) {
-            Ok(engine) => engine.with_checkpoints(Arc::clone(&state) as Arc<dyn Checkpoints>, []),
-            Err(error) => return ("errored", Err(error)),
-        };
-        let ran = telemetry
-            .phase(
-                Phase::Engine,
-                engine.run(Arc::clone(&target.spec), request.inputs.clone(), deadline),
+            ) {
+                Ok(engine) => {
+                    engine.with_checkpoints(Arc::clone(&state) as Arc<dyn Checkpoints>, [])
+                }
+                Err(error) => return ("errored", Err(error)),
+            };
+            let ran = telemetry
+                .phase(
+                    Phase::Engine,
+                    engine.run(Arc::clone(&target.spec), request.inputs.clone(), deadline),
+                )
+                .instrument(tracing::info_span!("verification.engine"))
+                .await;
+            let outcome = match ran {
+                Ok(outcome) => outcome,
+                Err(EngineError::DeadlineExceeded) => {
+                    return (
+                        "timed_out",
+                        Err(WyrdError::VerificationExecutionTimedOut {
+                            message: "the Verifier exceeded the direct execution deadline"
+                                .to_owned(),
+                            details: serde_json::json!({ "deadline_seconds": timeout.as_secs() }),
+                        }),
+                    );
+                }
+                Err(EngineError::Plan(error)) => return ("errored", Err(error)),
+                Err(EngineError::Busy(reason)) => {
+                    return (
+                        "unavailable",
+                        Err(WyrdError::ServiceUnavailable {
+                            message:
+                                "the verification runtime has no capacity for this Verifier now"
+                                    .to_owned(),
+                            details: serde_json::json!({ "reason": reason }),
+                        }),
+                    );
+                }
+                Err(EngineError::InputInvalid(reason)) => {
+                    return (
+                        "refused",
+                        Err(WyrdError::VerificationInputInvalid {
+                            message: reason.clone(),
+                            details: serde_json::json!({ "reason": reason }),
+                        }),
+                    );
+                }
+                Err(EngineError::InputTooLarge(reason)) => {
+                    return (
+                        "refused",
+                        Err(WyrdError::VerificationInputTooLarge {
+                            message: reason.clone(),
+                            details: serde_json::json!({ "reason": reason }),
+                        }),
+                    );
+                }
+                Err(EngineError::DefinitionUnavailable(reason)) => {
+                    return ("errored", Err(WyrdError::registry_card_not_found(reason)));
+                }
+                Err(EngineError::EvidenceUnavailable(reason)) => {
+                    return (
+                        "unavailable",
+                        Err(WyrdError::ServiceUnavailable {
+                            message: "the verification evidence cannot be admitted now".to_owned(),
+                            details: serde_json::json!({ "reason": reason }),
+                        }),
+                    );
+                }
+                Err(EngineError::Checkpoint(reason)) => {
+                    return ("unavailable", Err(state_unavailable(&reason)));
+                }
+                Err(error) => return ("errored", Err(WyrdError::internal(error.to_string()))),
+            };
+            let selected = match state.select(&outcome, started_at).await {
+                Ok(selected) => selected,
+                Err(error) => return ("unavailable", Err(state_unavailable(&error))),
+            };
+            telemetry.time(Phase::Stage, || {
+                Self::stage_direct(&staged, caller, execution_id, request, &target, &selected);
+            });
+            (
+                "completed",
+                Ok(VerificationResult {
+                    execution_id,
+                    run_id: request.run_id.clone(),
+                    verifier: target.verifier.clone(),
+                    subject: target.subject.clone(),
+                    outcome,
+                    deployment_environment: request.deployment_environment.clone(),
+                }),
             )
-            .instrument(tracing::info_span!("verification.engine"))
-            .await;
-        let outcome = match ran {
-            Ok(outcome) => outcome,
-            Err(EngineError::DeadlineExceeded) => {
-                return (
-                    "timed_out",
-                    Err(WyrdError::VerificationExecutionTimedOut {
-                        message: "the Verifier exceeded the direct execution deadline".to_owned(),
-                        details: serde_json::json!({ "deadline_seconds": timeout.as_secs() }),
-                    }),
-                );
+        }
+        .await;
+        if let (label, Err(error)) = &finished {
+            let status = if *label == "timed_out" {
+                VerificationExecutionStatus::TimedOut
+            } else {
+                VerificationExecutionStatus::Errored
+            };
+            let failure = VerificationError {
+                code: error.code().to_owned(),
+                message: error.to_string(),
+            };
+            if let Err(unrecorded) = state.fail(status, &failure).await {
+                tracing::warn!(%execution_id, error = %unrecorded, "a direct execution's failure was not retained");
             }
-            Err(EngineError::Plan(error)) => return ("errored", Err(error)),
-            Err(EngineError::Busy(reason)) => {
-                return (
-                    "unavailable",
-                    Err(WyrdError::ServiceUnavailable {
-                        message: "the verification runtime has no capacity for this Verifier now"
-                            .to_owned(),
-                        details: serde_json::json!({ "reason": reason }),
-                    }),
-                );
-            }
-            Err(EngineError::InputInvalid(reason)) => {
-                return (
-                    "refused",
-                    Err(WyrdError::VerificationInputInvalid {
-                        message: reason.clone(),
-                        details: serde_json::json!({ "reason": reason }),
-                    }),
-                );
-            }
-            Err(EngineError::InputTooLarge(reason)) => {
-                return (
-                    "refused",
-                    Err(WyrdError::VerificationInputTooLarge {
-                        message: reason.clone(),
-                        details: serde_json::json!({ "reason": reason }),
-                    }),
-                );
-            }
-            Err(EngineError::DefinitionUnavailable(reason)) => {
-                return ("errored", Err(WyrdError::registry_card_not_found(reason)));
-            }
-            Err(EngineError::EvidenceUnavailable(reason)) => {
-                return (
-                    "unavailable",
-                    Err(WyrdError::ServiceUnavailable {
-                        message: "the verification evidence cannot be admitted now".to_owned(),
-                        details: serde_json::json!({ "reason": reason }),
-                    }),
-                );
-            }
-            Err(EngineError::Checkpoint(reason)) => {
-                return ("unavailable", Err(state_unavailable(&reason)));
-            }
-            Err(error) => return ("errored", Err(WyrdError::internal(error.to_string()))),
-        };
-        let selected = match state.select(&outcome, started_at).await {
-            Ok(selected) => selected,
-            Err(error) => return ("unavailable", Err(state_unavailable(&error))),
-        };
-        telemetry.time(Phase::Stage, || {
-            Self::stage_direct(&staged, caller, execution_id, request, &target, &selected);
-        });
-        (
-            "completed",
-            Ok(VerificationResult {
-                execution_id,
-                run_id: request.run_id.clone(),
-                verifier: target.verifier.clone(),
-                subject: target.subject.clone(),
-                outcome,
-                deployment_environment: request.deployment_environment.clone(),
-            }),
-        )
+        }
+        finished
     }
 
     /// Stage one background execution and return its identity.
@@ -1130,20 +1083,5 @@ impl<'a> VerificationControl<'a> {
             read.into_context(),
             CancellationToken::new(),
         ))
-    }
-
-    /// Read one Card of the caller's tenant, or `None` when it is absent.
-    ///
-    /// # Errors
-    /// Returns a registry error other than not-found.
-    async fn card(
-        conn: &mut TenantConn<'_>,
-        uid: &CardUid,
-    ) -> Result<Option<ParsedCardRow>, WyrdError> {
-        match get_card_by_uid(conn, uid).await {
-            Ok(row) => Ok(Some(row)),
-            Err(WyrdError::RegistryCardNotFound { .. }) => Ok(None),
-            Err(error) => Err(error),
-        }
     }
 }

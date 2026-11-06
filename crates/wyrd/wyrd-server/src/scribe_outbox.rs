@@ -2314,10 +2314,12 @@ mod tests {
     fn execution_state(
         execution_id: ExecutionId,
     ) -> (ScribeWrite, tokio::sync::oneshot::Receiver<()>) {
+        let (verifier, subject) = (uid(), uid());
         let row = crate::verification::state::StateRow {
             execution_id,
-            verifier_uid: uid(),
-            card_uid: uid(),
+            identity: crate::verification::state::stand_in_identity(&verifier, &subject),
+            verifier_uid: verifier,
+            card_uid: subject,
             owner_card_uid: None,
             run_id: None,
             deployment_environment: None,

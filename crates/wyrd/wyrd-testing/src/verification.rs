@@ -42,10 +42,11 @@ use wyrd_spec::ids::{BindingId, CardUid, ExecutionId, SlotName};
 use wyrd_spec::registry::DeclarationOperationId;
 use wyrd_spec::request_id::RequestId;
 use wyrd_spec::verification::execution::{InputDeclaration, Producer, VerificationRequest};
-use wyrd_spec::verification::state::ExecutionState;
+use wyrd_spec::verification::state::{ExecutionIdentity, ExecutionState};
 use wyrd_spec::verification::{PublicationName, TaskId};
 use wyrd_sql::queries::cards::{
-    NewCardRow, NewDeclarationOperation, insert_card_row, insert_declaration_operation,
+    NewCardRow, NewDeclarationOperation, get_card_by_uid, insert_card_row,
+    insert_declaration_operation,
 };
 use wyrd_sql::queries::drift_baselines::DriftBaselineQueue;
 use wyrd_sql::queries::verification::{
@@ -826,6 +827,19 @@ impl VerificationFixture {
             .ok_or_else(|| {
                 VerificationFixtureError::NotEnqueued("nothing is claimable".to_owned())
             })?;
+        let mut exact = async |uid| {
+            get_card_by_uid(&mut conn, uid)
+                .await
+                .map(|card| wyrd_spec::reference::CardRef {
+                    kind: card.kind,
+                    name: card.name,
+                    version: card.version,
+                    uid: Some(card.card_uid),
+                })
+                .map_err(|error| VerificationFixtureError::Card(error.to_string()))
+        };
+        let verifier = exact(&claimed.verifier_card_uid).await?;
+        let subject = exact(&claimed.card_uid).await?;
         conn.commit().await?;
         let query = self.system_query(state).await?;
         let run = RunState::recover(
@@ -840,6 +854,13 @@ impl VerificationFixture {
                 run_id: None,
                 deployment_environment: claimed.deployment_environment.clone(),
                 attribution: claimed.attribution,
+                identity: ExecutionIdentity {
+                    verifier,
+                    subject,
+                    deployment_environment: claimed.deployment_environment.clone(),
+                    group_id: claimed.group_id.clone(),
+                    owner_card_uid: claimed.owner_card_uid.clone(),
+                },
             },
             tokio::time::Instant::now() + std::time::Duration::from_secs(60),
             None,

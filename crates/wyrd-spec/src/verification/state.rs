@@ -2,8 +2,9 @@
 //!
 //! [`ExecutionState`] is the complete logical state an execution resumes
 //! from: every invocation attempt and its settlement, every accepted
-//! publication with the exact File descriptors that hold its bytes, and the
-//! selected terminal outcome. Each accepted revision is one
+//! publication with the exact File descriptors that hold its bytes, the
+//! exact execution identity, and the selected terminal outcome or the
+//! failure the execution ended with. Each accepted revision is one
 //! `bifrost.verification.execution_events` row whose value is this state
 //! serialized whole, so recovery reads exactly one row. Runtime handles,
 //! credentials, and model conversations are never part of it, and file bytes
@@ -14,15 +15,19 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use super::execution::{InvocationSettlement, Producer, Publication, VerificationOutcome};
+use super::{VerificationError, VerificationExecutionStatus};
 use crate::auth::Sha256Hex;
-use crate::ids::VerificationResultId;
+use crate::ids::{CardUid, GroupId, VerificationResultId};
+use crate::reference::CardRef;
 use crate::storage::StoredObjectRef;
 
 /// The state format this release writes and reads.
 ///
 /// A stored state of any other format is refused rather than reinterpreted,
 /// so a worker never resumes, or restarts as fresh, state it cannot read.
-pub const EXECUTION_STATE_FORMAT: u32 = 1;
+/// Format 2 added the recorded identity and the terminal failure; format 1
+/// never left development and is refused.
+pub const EXECUTION_STATE_FORMAT: u32 = 2;
 
 /// The complete recoverable state of one execution at one accepted revision.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
@@ -30,6 +35,11 @@ pub const EXECUTION_STATE_FORMAT: u32 = 1;
 pub struct ExecutionState {
     /// The state format, [`EXECUTION_STATE_FORMAT`] when written.
     pub format: u32,
+    /// The exact execution identity every revision records, so retained
+    /// reads never consult the registry; `None` only before the first
+    /// revision.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub identity: Option<ExecutionIdentity>,
     /// The last entry sequence assigned; each new invocation attempt or
     /// publication takes the next one, so listings keep commit order.
     pub sequence: i64,
@@ -41,6 +51,41 @@ pub struct ExecutionState {
     /// The selected terminal outcome, once the execution produced one.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub terminal: Option<TerminalSelection>,
+    /// How the execution ended without an outcome, once it did; never
+    /// recorded beside a [`Self::terminal`] outcome.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub failure: Option<TerminalFailure>,
+}
+
+/// The exact identities an execution was accepted for.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ExecutionIdentity {
+    /// The exact Verifier executed.
+    pub verifier: CardRef,
+    /// The exact subject judged.
+    pub subject: CardRef,
+    /// The deployment environment tag the execution was invoked with.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub deployment_environment: Option<String>,
+    /// Caller group the execution belongs to, or the group it judges.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub group_id: Option<GroupId>,
+    /// Binding owner of a background execution.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub owner_card_uid: Option<CardUid>,
+}
+
+/// How an execution ended without an outcome.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TerminalFailure {
+    /// `cancelled`, `timed_out`, or `errored`.
+    pub status: VerificationExecutionStatus,
+    /// The sanitized terminal error.
+    pub error: VerificationError,
+    /// When the execution ended.
+    pub ended_at: DateTime<Utc>,
 }
 
 /// One recorded invocation attempt.
@@ -135,6 +180,12 @@ impl ExecutionState {
 mod tests {
     use super::{EXECUTION_STATE_FORMAT, ExecutionState, ExecutionStateError};
 
+    /// Only [`EXECUTION_STATE_FORMAT`] decodes: a newer, missing, or
+    /// earlier format is incompatible and a state that does not decode is
+    /// malformed, never fresh.
+    ///
+    /// # Panics
+    /// Panics when another format decodes, or a refusal is misclassified.
     #[test]
     fn only_the_current_format_decodes() {
         let fresh = ExecutionState::fresh();
@@ -150,6 +201,10 @@ mod tests {
         assert!(matches!(
             ExecutionState::decode(serde_json::json!({})),
             Err(ExecutionStateError::Incompatible { found: 0 })
+        ));
+        assert!(matches!(
+            ExecutionState::decode(serde_json::json!({ "format": 1, "sequence": 0 })),
+            Err(ExecutionStateError::Incompatible { found: 1 })
         ));
         assert!(matches!(
             ExecutionState::decode(

@@ -425,9 +425,9 @@ impl LiveScribeExec {
         &self.scan_metrics
     }
 
-    /// Returns this leaf with its predicate snapshotted to static
-    /// expressions, and the routes output `partition` reads under that
-    /// snapshot.
+    /// Returns this leaf with its predicate and absorbed outputs snapshotted
+    /// to static expressions, and the routes output `partition` reads under
+    /// that snapshot.
     ///
     /// Route `i` of the planning-time selection belongs to partition
     /// `i % partitions`, so every route is dealt exactly once whatever each
@@ -436,13 +436,15 @@ impl LiveScribeExec {
     /// polled: a `ScalarSubqueryExec` above has populated its values by then,
     /// and a join has finished its build side before polling its probe side,
     /// so a resolved scalar or a join's dynamic filter becomes a static
-    /// predicate that both prunes routes and ships in every fragment. `self`
-    /// keeps the runtime-bound predicate for re-execution.
+    /// predicate that both prunes routes and ships in every fragment, and a
+    /// resolved scalar in an output ships as its literal under the same alias
+    /// and position. `self` keeps the runtime-bound expressions for
+    /// re-execution.
     ///
     /// # Errors
     ///
-    /// Returns the snapshot error when the predicate reads execution state
-    /// that is not yet populated.
+    /// Returns the snapshot error when the predicate or an output reads
+    /// execution state that is not yet populated, before any fragment exists.
     fn resolved(&self, partition: usize) -> DataFusionResult<(Self, Vec<LiveScribeRoute>)> {
         let routes = LiveTableRoutes {
             binding: self.routes.binding.clone(),
@@ -457,6 +459,11 @@ impl LiveScribeExec {
             captures: Arc::clone(&self.routes.captures),
         };
         let mut leaf = self.clone();
+        leaf.projection = self
+            .projection
+            .clone()
+            .map(|outputs| outputs.try_map_exprs(snapshot_physical_expr))
+            .transpose()?;
         let Some(predicate) = &self.predicate else {
             return Ok((leaf, routes.routes));
         };
@@ -1594,6 +1601,103 @@ mod tests {
             let micros = first_hour + value * HOUR_MICROS;
             assert!(
                 encoded.contains(&micros.to_string()),
+                "the resolved literal ships"
+            );
+        }
+    }
+
+    /// An absorbed output that reads a scalar subquery ships each execution's
+    /// resolved value, with no predicate on the leaf.
+    ///
+    /// `SELECT v, v + (SELECT ...) AS m` absorbed into the leaf refuses to
+    /// resolve while the scalar is pending; once populated, the fragment's
+    /// outputs carry that literal under their aliases and no scalar subquery,
+    /// and a reset with another value ships the new one, because the planned
+    /// leaf keeps the runtime-bound output.
+    ///
+    /// # Panics
+    /// Panics when a fixture cannot be built, or resolution, the encoded
+    /// outputs or their names differ from the above.
+    #[test]
+    fn absorbed_scalar_outputs_snapshot_per_execution() {
+        use datafusion::logical_expr::Operator;
+        use datafusion::logical_expr::physical_planning_context::{
+            ScalarSubqueryResults, SubqueryIndex,
+        };
+        use datafusion::physical_expr::expressions::{BinaryExpr, Column};
+        use datafusion::physical_expr::projection::ProjectionExpr;
+        use datafusion::physical_expr::scalar_subquery::ScalarSubqueryExpr;
+        use datafusion::physical_plan::projection::ProjectionExec;
+        use datafusion::scalar::ScalarValue;
+        use datafusion_proto::protobuf::{PhysicalPlanNode, physical_plan_node::PhysicalPlanType};
+        use prost::Message as _;
+
+        let schema = Arc::new(Schema::new(vec![Field::new("v", DataType::Int64, false)]));
+        let leaf = Arc::new(LiveScribeExec::new(
+            crate::oracle::exec::tests::one_live_route(wyrd_spec::DataTenantId::new_v7()),
+            crate::catalog::TimeAxis::new(
+                crate::oracle::exec::tests::FIXTURE_TIME_COLUMN,
+                crate::catalog::TimeGranularity::Hour,
+            ),
+            "f".repeat(64),
+            vec!["v".to_owned()],
+            Arc::clone(&schema),
+            1,
+        ));
+        let results = ScalarSubqueryResults::new(1);
+        let outputs = vec![
+            ProjectionExpr::new(Arc::new(Column::new("v", 0)), "v"),
+            ProjectionExpr::new(
+                Arc::new(BinaryExpr::new(
+                    Arc::new(Column::new("v", 0)),
+                    Operator::Plus,
+                    Arc::new(ScalarSubqueryExpr::new(
+                        DataType::Int64,
+                        false,
+                        SubqueryIndex::new(0),
+                        results.clone(),
+                    )),
+                )),
+                "m",
+            ),
+        ];
+        let projection = ProjectionExec::try_new(outputs, leaf.clone()).expect("projection plans");
+        let absorbed = leaf
+            .try_swapping_with_projection(&projection)
+            .expect("the leaf absorbs the projection")
+            .expect("the leaf absorbs the projection");
+        let live = absorbed
+            .downcast_ref::<LiveScribeExec>()
+            .expect("the absorbed plan is the live leaf");
+        assert!(live.predicate.is_none(), "no predicate rides the leaf");
+        assert!(live.resolved(0).is_err(), "a pending output cannot resolve");
+
+        for value in [41_i64, 97] {
+            results.clear();
+            results
+                .set(SubqueryIndex::new(0), ScalarValue::Int64(Some(value)))
+                .expect("scalar populates");
+            let (resolved, routes) = live.resolved(0).expect("the populated scalar resolves");
+            let (fragment, _) = resolved.fragment(&routes[0], 0).expect("the fragment encodes");
+            let root = PhysicalPlanNode::decode(fragment.physical_plan_bytes.as_slice())
+                .expect("the fragment plan decodes");
+            let Some(PhysicalPlanType::Extension(extension)) = root.physical_plan_type else {
+                panic!("the fragment ships only its placeholder");
+            };
+            let shipped = crate::oracle::codec::OraclePhysicalExtensionCodec::preflight_extension(
+                &extension.node,
+            )
+            .expect("the placeholder payload decodes")
+            .outputs
+            .expect("the absorbed outputs ship");
+            assert_eq!(shipped.names, ["v", "m"], "aliases and order survive");
+            let encoded = format!("{:?}", shipped.exprs);
+            assert!(
+                !encoded.contains("ScalarSubquery"),
+                "no scalar subquery ships"
+            );
+            assert!(
+                encoded.contains(&value.to_string()),
                 "the resolved literal ships"
             );
         }

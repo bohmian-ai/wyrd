@@ -10947,6 +10947,7 @@ dependencies = [
  "uuid",
  "vala-bifrost-redux",
  "vala-sql",
+ "vala-verify",
  "wiremock",
  "workspace-hack",
  "wyrd-auth",

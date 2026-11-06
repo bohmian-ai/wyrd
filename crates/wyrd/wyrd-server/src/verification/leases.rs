@@ -26,7 +26,7 @@ struct Held {
 }
 
 /// Owner of every lease this process's runner holds, and their renewal.
-pub(super) struct LeaseRenewal {
+pub struct LeaseRenewal {
     /// Wyrd Postgres owner that opens each tenant's renewal transaction.
     postgres: WyrdPostgres,
     /// Queue owning the renewal statement.
@@ -38,7 +38,7 @@ pub(super) struct LeaseRenewal {
 }
 
 /// A lease registered for renewal until this guard drops.
-pub(super) struct HeldLease {
+pub struct HeldLease {
     /// The renewal owner the lease is removed from on drop.
     renewal: Arc<LeaseRenewal>,
     /// Tenant of the run.
@@ -51,7 +51,7 @@ pub(super) struct HeldLease {
 
 impl HeldLease {
     /// The token cancelled when this lease is lost or its work abandoned.
-    pub(super) fn lost(&self) -> &CancellationToken {
+    pub fn lost(&self) -> &CancellationToken {
         &self.lost
     }
 
@@ -65,7 +65,7 @@ impl HeldLease {
     /// # Errors
     /// Returns [`SqlError`] when the connection, statement, or commit fails;
     /// the lease is then neither confirmed nor cancelled.
-    pub(super) async fn confirm(&self) -> Result<bool, SqlError> {
+    pub async fn confirm(&self) -> Result<bool, SqlError> {
         let held = self
             .renewal
             .renew_tenant(self.tenant, &[self.token])
@@ -96,11 +96,7 @@ impl Drop for HeldLease {
 
 impl LeaseRenewal {
     /// Build a renewal owner granting `lease` through `postgres`.
-    pub(super) fn new(
-        postgres: WyrdPostgres,
-        queue: VerifierExecutionQueue,
-        lease: Duration,
-    ) -> Self {
+    pub fn new(postgres: WyrdPostgres, queue: VerifierExecutionQueue, lease: Duration) -> Self {
         Self {
             postgres,
             queue,
@@ -116,7 +112,7 @@ impl LeaseRenewal {
     ///
     /// # Panics
     /// Panics when the held-lease lock is poisoned.
-    pub(super) fn hold(
+    pub fn hold(
         self: &Arc<Self>,
         tenant: DataTenantId,
         token: LeaseToken,

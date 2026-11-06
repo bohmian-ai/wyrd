@@ -16,7 +16,7 @@ use wyrd_dev_fixtures::pg::PgFixture;
 use wyrd_runtime::principal::{Principal, PrincipalId, PrincipalKind, PrincipalRef};
 use wyrd_runtime::{AcceptedAuthority, DelegationStep, PermissionSet};
 use wyrd_spec::DataTenantId;
-use wyrd_spec::auth::{Attribution, Sha256Hex, WorkloadFamily, WorkloadKind};
+use wyrd_spec::auth::{Attribution, WorkloadFamily, WorkloadKind};
 use wyrd_spec::card::operator::{DriftCounts, MAX_SUMMARY_CHARS, OperatorFailureContext};
 use wyrd_spec::card::trigger::TriggerDuration;
 use wyrd_spec::card::verifier::{OWNER_OCCURRENCE_KEY, SourceText};
@@ -24,15 +24,11 @@ use wyrd_spec::envelope::{Card, CardKind};
 use wyrd_spec::ids::{BindingId, CardUid, ExecutionId, GroupId, SlotName, VerificationResultId};
 use wyrd_spec::registry::DeclarationOperationId;
 use wyrd_spec::vala::ids::{RunId, SpanId, TraceId};
-use wyrd_spec::verification::execution::{
-    InputDeclaration, InvocationSettlement, Producer, Publication, PublicationContent,
-    PublicationKind, StepResult, StepStatus, VerificationRequest,
-};
+use wyrd_spec::verification::execution::{InputDeclaration, VerificationRequest};
 use wyrd_spec::verification::{
     DriftWindow, GroupEndSettings, GroupSource, OperatorDispatchStatus, VerificationError,
     VerificationExecutionStatus, VerificationVerdict, VerifierReadiness,
 };
-use wyrd_spec::verification::{PublicationName, TaskId};
 use wyrd_sql::TenantConn;
 use wyrd_sql::queries::auth::{
     insert_service_account, provision_system_principal, suspend_service_account_principal,
@@ -48,10 +44,9 @@ use wyrd_sql::queries::verification_target::VerificationTargets;
 use wyrd_sql::queries::verifier_executions::{
     Cause, ClaimedExecution, Completion, DueSettlement, EnqueueOutcome, EnqueueRefusal,
     ExecutionAuthority, ExecutionInput, ExecutionLease, ExecutionOrigin, ExecutionStatus,
-    GroupActivity, GroupSelection, InvocationEntry, Page, PagePosition, PinnedGroup, Prepared,
-    PublicationAcceptance, PublicationBudget, PublicationCall, PublicationEntry, PublicationLimit,
-    QueueCounts, RetryOutcome, ScheduleOutcome, ScheduleSkip, ScheduleTick, ScheduledAdmission,
-    Settlement, Submission, SubmissionOutcome, TerminalStatus, VerifierExecutionQueue,
+    GroupActivity, GroupSelection, PinnedGroup, Prepared, QueueCounts, RetryOutcome,
+    ScheduleOutcome, ScheduleSkip, ScheduleTick, ScheduledAdmission, Settlement, Submission,
+    SubmissionOutcome, TerminalStatus, VerifierExecutionQueue,
 };
 use wyrd_sql::row_types::cards::CardStatus;
 
@@ -1690,15 +1685,13 @@ async fn reclaimed_lease_fences_the_stale_token() {
     assert_eq!(status.state.error, None);
 }
 
-/// Invocation checkpoints commit only under the live lease, a settlement
-/// commits once, and an unsettled attempt can be forgotten; a reclaim keeps
-/// every checkpoint and the deadline the first claim fixed.
+/// A reclaim keeps the deadline the first claim fixed and never replenishes
+/// what remains of it.
 ///
 /// # Panics
-/// Panics when a stale lease writes a checkpoint, a settlement is replaced,
-/// or a reclaim replenishes the deadline.
+/// Panics when a reclaim moves or replenishes the deadline.
 #[tokio::test]
-async fn invocation_checkpoints_are_fenced_and_survive_reclaim() {
+async fn reclaims_keep_the_first_deadline() {
     let fixture = PgFixture::start().await.expect("fixture starts");
     let actor = actor(fixture.data_tenant_id());
     let queue = VerifierExecutionQueue::default();
@@ -1710,51 +1703,7 @@ async fn invocation_checkpoints_are_fenced_and_survive_reclaim() {
     let verifier = register_verifier(&mut conn, &actor, "drift", custom_drift()).await;
     let binding = bind(&mut conn, &owner, &verifier, Vec::new()).await;
     let execution = scheduled(&queue, &mut conn, binding).await;
-    let (review, judge) = (
-        TaskId::new("review").expect("task id"),
-        TaskId::new("judge").expect("task id"),
-    );
-    let settled = InvocationSettlement::Action {
-        result: Box::new(StepResult {
-            id: review.clone(),
-            status: StepStatus::Succeeded,
-            output: Some(json!("ok")),
-            attempts: 1,
-            duration_ms: 1,
-            reason: None,
-            provenance: None,
-            tool_calls: Vec::new(),
-        }),
-        sources: BTreeSet::new(),
-    };
-
     let stale = claim(&queue, &mut conn).await;
-    let applied = [
-        queue
-            .begin_invocation(&mut conn, stale.lease, &review, 1)
-            .await,
-        queue
-            .settle_invocation(&mut conn, stale.lease, &review, 1, &settled)
-            .await,
-        queue
-            .settle_invocation(&mut conn, stale.lease, &review, 1, &settled)
-            .await,
-        queue
-            .begin_invocation(&mut conn, stale.lease, &judge, 1)
-            .await,
-    ]
-    .map(|write| write.expect("checkpoint answers"));
-    assert_eq!(
-        applied,
-        [
-            Settlement::Applied,
-            Settlement::Applied,
-            Settlement::StaleLease,
-            Settlement::Applied
-        ],
-        "a settlement commits once"
-    );
-
     expire_deadlines(&mut conn, execution).await;
     let current = queue
         .claim(&mut conn, Duration::minutes(5), Duration::hours(1), 1)
@@ -1762,60 +1711,14 @@ async fn invocation_checkpoints_are_fenced_and_survive_reclaim() {
         .expect("claim runs")
         .pop()
         .expect("the expired lease is reclaimable");
+    assert_eq!(current.lease.execution_id, execution);
     assert!(
         current.remaining <= stale.remaining,
         "a reclaim never replenishes the deadline"
     );
-    let fenced = [
-        queue
-            .begin_invocation(&mut conn, stale.lease, &judge, 2)
-            .await,
-        queue
-            .settle_invocation(&mut conn, stale.lease, &judge, 1, &settled)
-            .await,
-        queue
-            .forget_invocation(&mut conn, stale.lease, &judge, 1)
-            .await,
-    ]
-    .map(|write| write.expect("stale checkpoint answers"));
-    assert_eq!(fenced, [Settlement::StaleLease; 3]);
-    let recorded = queue
-        .invocations(&mut conn, execution)
-        .await
-        .expect("checkpoints read");
-    let mut recorded: Vec<_> = recorded
-        .into_iter()
-        .map(|invocation| {
-            (
-                invocation.task.as_str().to_owned(),
-                invocation.attempt,
-                invocation.settlement.is_some(),
-            )
-        })
-        .collect();
-    recorded.sort();
-    assert_eq!(
-        recorded,
-        [
-            ("judge".to_owned(), 1, false),
-            ("review".to_owned(), 1, true)
-        ],
-        "a reclaim restores every committed checkpoint"
-    );
-    assert_eq!(
-        queue
-            .forget_invocation(&mut conn, current.lease, &judge, 1)
-            .await
-            .expect("forget answers"),
-        Settlement::Applied
-    );
-    assert_eq!(
-        queue
-            .forget_invocation(&mut conn, current.lease, &review, 1)
-            .await
-            .expect("forget answers"),
-        Settlement::StaleLease,
-        "a settled checkpoint is never forgotten"
+    assert!(
+        current.deadline_at <= stale.deadline_at,
+        "a reclaim never moves the deadline later"
     );
 }
 
@@ -1839,15 +1742,15 @@ async fn set_record(conn: &mut TenantConn<'_>, execution: ExecutionId, format: i
 
 /// A worker never claims, reclaims, or exhausts a record of a newer format:
 /// an expired lease with attempts left and one with none are both left
-/// `running` with their attempts and checkpoints. Once a compatible worker
-/// owns the record again, its reclaim restores the same committed
-/// checkpoints.
+/// `running` with their attempts, so their state stays for a worker that
+/// understands it. Once a compatible worker owns the record again, it
+/// reclaims it as the next attempt.
 ///
 /// # Panics
 /// Panics when an incompatible record is claimed or settled, or a compatible
-/// reclaim loses a checkpoint.
+/// worker does not reclaim it.
 #[tokio::test]
-async fn worker_formats_preserve_checkpoint_custody() {
+async fn newer_worker_formats_keep_their_records() {
     let fixture = PgFixture::start().await.expect("fixture starts");
     let actor = actor(fixture.data_tenant_id());
     let queue = VerifierExecutionQueue::default();
@@ -1859,59 +1762,11 @@ async fn worker_formats_preserve_checkpoint_custody() {
     let verifier = register_verifier(&mut conn, &actor, "drift", custom_drift()).await;
     let binding = bind(&mut conn, &owner, &verifier, Vec::new()).await;
     let execution = scheduled(&queue, &mut conn, binding).await;
-    let (review, judge) = (
-        TaskId::new("review").expect("task id"),
-        TaskId::new("judge").expect("task id"),
-    );
-    let settled = InvocationSettlement::Action {
-        result: Box::new(StepResult {
-            id: review.clone(),
-            status: StepStatus::Succeeded,
-            output: Some(json!("ok")),
-            attempts: 1,
-            duration_ms: 1,
-            reason: None,
-            provenance: None,
-            tool_calls: Vec::new(),
-        }),
-        sources: BTreeSet::new(),
-    };
     let first = claim(&queue, &mut conn).await;
-    for write in [
-        queue
-            .begin_invocation(&mut conn, first.lease, &review, 1)
-            .await,
-        queue
-            .settle_invocation(&mut conn, first.lease, &review, 1, &settled)
-            .await,
-        queue
-            .begin_invocation(&mut conn, first.lease, &judge, 1)
-            .await,
-    ] {
-        assert_eq!(write.expect("checkpoint answers"), Settlement::Applied);
-    }
-    let checkpoints = async |conn: &mut TenantConn<'_>| {
-        let mut recorded: Vec<_> = queue
-            .invocations(conn, execution)
-            .await
-            .expect("checkpoints read")
-            .into_iter()
-            .map(|invocation| {
-                (
-                    invocation.task.as_str().to_owned(),
-                    invocation.attempt,
-                    invocation.settlement.is_some(),
-                )
-            })
-            .collect();
-        recorded.sort();
-        recorded
-    };
-    let committed = checkpoints(&mut conn).await;
 
     expire_deadlines(&mut conn, execution).await;
     for attempts in [1, first.max_attempts] {
-        set_record(&mut conn, execution, 2, attempts).await;
+        set_record(&mut conn, execution, 3, attempts).await;
         let claimed = queue
             .claim(&mut conn, Duration::minutes(5), Duration::hours(1), 1)
             .await
@@ -1923,18 +1778,12 @@ async fn worker_formats_preserve_checkpoint_custody() {
             (VerificationExecutionStatus::Running, None),
             "a newer record with {attempts} attempts is left as it is"
         );
-        assert_eq!(checkpoints(&mut conn).await, committed);
     }
 
-    set_record(&mut conn, execution, 1, 1).await;
+    set_record(&mut conn, execution, 2, 1).await;
     let reclaimed = claim(&queue, &mut conn).await;
     assert_eq!(reclaimed.lease.execution_id, execution);
     assert_eq!(reclaimed.attempt, 2, "the reclaim is the next attempt");
-    assert_eq!(
-        checkpoints(&mut conn).await,
-        committed,
-        "a compatible reclaim restores every committed checkpoint"
-    );
 }
 
 /// A submission's enqueuing cause, including the caller's sampling
@@ -4354,740 +4203,4 @@ async fn queued_admission_preserves_tenant_and_input_identity() {
     );
     assert_eq!(pending_groups(&mut conn, group_binding).await, 0);
     conn.commit().await.expect("writer commits");
-}
-
-/// A listing keeps the cut its first page fixed, even while concurrent
-/// writers commit out of start order: a writer allocating a higher sequence
-/// waits for an uncommitted lower one, and a first page waits for it too, so
-/// the continuation returns exactly the cut's committed membership and never
-/// an attempt begun after it, which a new listing does return.
-///
-/// # Panics
-/// Panics when a writer or first page does not wait for an uncommitted
-/// lower sequence, or a page skips, repeats, or reads past its cut.
-#[tokio::test]
-async fn invocation_pages_keep_their_first_cut() {
-    let fixture = PgFixture::start().await.expect("fixture starts");
-    let actor = actor(fixture.data_tenant_id());
-    let queue = VerifierExecutionQueue::default();
-    let mut setup = fixture
-        .tenant_conn()
-        .await
-        .expect("tenant connection opens");
-    let (owner, _) = declare_service(&mut setup, &actor, "svc").await;
-    let verifier = register_verifier(&mut setup, &actor, "drift", custom_drift()).await;
-    let binding = bind(&mut setup, &owner, &verifier, Vec::new()).await;
-    let execution = scheduled(&queue, &mut setup, binding).await;
-    let claimed = claim(&queue, &mut setup).await;
-    let task = |name: &str| TaskId::new(name).expect("task id");
-    queue
-        .begin_invocation(&mut setup, claimed.lease, &task("review"), 1)
-        .await
-        .expect("the attempt begins");
-    setup.commit().await.expect("setup commits");
-    let steps = |page: &Page<InvocationEntry>| -> Vec<String> {
-        page.entries
-            .iter()
-            .map(|(_, entry)| entry.producer.step_id.as_str().to_owned())
-            .collect()
-    };
-    let mut lower = fixture.tenant_conn().await.expect("lower opens");
-    assert_eq!(
-        queue
-            .begin_invocation(&mut lower, claimed.lease, &task("judge"), 1)
-            .await
-            .expect("the lower attempt begins"),
-        Settlement::Applied
-    );
-    let mut higher = fixture.tenant_conn().await.expect("higher opens");
-    let mut probe = fixture.tenant_conn().await.expect("probe opens");
-    let higher_begin = async {
-        queue
-            .begin_invocation(&mut higher, claimed.lease, &task("summary"), 1)
-            .await
-            .expect("the higher attempt begins");
-        higher.commit().await.expect("higher commits");
-    };
-    tokio::pin!(higher_begin);
-    let raced = tokio::select! {
-        () = &mut higher_begin => true,
-        () = await_blocked_backend(&mut probe) => false,
-    };
-    assert!(
-        !raced,
-        "a higher sequence waits for an uncommitted lower one"
-    );
-    let mut reader = fixture.tenant_conn().await.expect("reader opens");
-    let first_page = async {
-        let page = queue.invocation_page(&mut reader, execution, None, 1).await;
-        reader.commit().await.expect("reader commits");
-        page
-    };
-    tokio::pin!(first_page);
-    let read = tokio::select! {
-        page = &mut first_page => Some(page),
-        () = await_blocked_backends(&mut probe, 2) => None,
-    };
-    assert!(
-        read.is_none(),
-        "a first page waits for an uncommitted sequence"
-    );
-    lower.commit().await.expect("lower commits");
-    higher_begin.await;
-    let first = first_page.await.expect("the first page reads");
-    assert_eq!(steps(&first), ["review"]);
-
-    let mut late = fixture.tenant_conn().await.expect("late opens");
-    queue
-        .begin_invocation(&mut late, claimed.lease, &task("late"), 1)
-        .await
-        .expect("a later attempt begins");
-    late.commit().await.expect("late commits");
-    let position = PagePosition {
-        through: first.through,
-        after: first.entries[0].0,
-    };
-    let mut conn = fixture
-        .tenant_conn()
-        .await
-        .expect("tenant connection opens");
-    let rest = queue
-        .invocation_page(&mut conn, execution, Some(position), 10)
-        .await
-        .expect("the continuation reads");
-    assert_eq!(
-        (rest.through, steps(&rest)),
-        (
-            first.through,
-            vec!["judge".to_owned(), "summary".to_owned()]
-        ),
-        "the continuation is exactly the first cut's committed membership"
-    );
-    let fresh = queue
-        .invocation_page(&mut conn, execution, None, 10)
-        .await
-        .expect("a new listing reads");
-    assert_eq!(steps(&fresh), ["review", "judge", "summary", "late"]);
-}
-
-/// Generous ceilings for tests that do not exercise publication budgets.
-const UNBOUNDED: PublicationBudget = PublicationBudget {
-    max_count: 100,
-    max_bytes: 1 << 20,
-};
-
-/// Ask to accept JSON `value` under `name` from attempt 1 of `step` as call
-/// `call_id`, uncommitted, within `budget`.
-///
-/// # Panics
-/// Panics when an identity is invalid or the statement fails.
-#[expect(
-    clippy::too_many_arguments,
-    reason = "one test call's identity, content, and budget"
-)]
-async fn publish(
-    queue: &VerifierExecutionQueue,
-    conn: &mut TenantConn<'_>,
-    lease: ExecutionLease,
-    step: &str,
-    name: &str,
-    call_id: &str,
-    value: Value,
-    budget: PublicationBudget,
-) -> PublicationAcceptance {
-    let retained = serde_json::to_vec(&value).expect("value serializes").len() as u64;
-    let arguments = Sha256Hex::digest(
-        serde_json::to_vec(&json!({ "name": name, "value": value }))
-            .expect("arguments serialize")
-            .as_slice(),
-    );
-    let publication = Publication {
-        name: PublicationName::new(name).expect("publication name"),
-        producer: Producer {
-            step_id: TaskId::new(step).expect("task id"),
-            item_index: None,
-            iteration_index: None,
-            attempt: 1,
-        },
-        content: PublicationContent::Json { value },
-    };
-    queue
-        .accept_publication(
-            conn,
-            lease,
-            PublicationCall {
-                publication: &publication,
-                call_id,
-                arguments: &arguments,
-                objects: &[],
-                retained_bytes: retained,
-            },
-            budget,
-        )
-        .await
-        .expect("acceptance answers")
-}
-
-/// A publication listing keeps its first cut as invocation listings do: a
-/// higher acceptance and a first page each wait for an uncommitted lower
-/// acceptance, and the continuation returns exactly the cut's committed
-/// membership.
-///
-/// # Panics
-/// Panics when an acceptance or first page does not wait, or a page skips,
-/// repeats, or reads past its cut.
-#[tokio::test]
-async fn publication_pages_keep_their_first_cut() {
-    let fixture = PgFixture::start().await.expect("fixture starts");
-    let actor = actor(fixture.data_tenant_id());
-    let queue = VerifierExecutionQueue::default();
-    let mut setup = fixture
-        .tenant_conn()
-        .await
-        .expect("tenant connection opens");
-    let (owner, _) = declare_service(&mut setup, &actor, "svc").await;
-    let verifier = register_verifier(&mut setup, &actor, "drift", custom_drift()).await;
-    let binding = bind(&mut setup, &owner, &verifier, Vec::new()).await;
-    let execution = scheduled(&queue, &mut setup, binding).await;
-    let lease = claim(&queue, &mut setup).await.lease;
-    publish(
-        &queue,
-        &mut setup,
-        lease,
-        "review",
-        "first",
-        "c1",
-        json!(1),
-        UNBOUNDED,
-    )
-    .await;
-    setup.commit().await.expect("setup commits");
-    let names = |page: &Page<PublicationEntry>| -> Vec<String> {
-        page.entries
-            .iter()
-            .map(|(_, entry)| entry.name.as_str().to_owned())
-            .collect()
-    };
-
-    let mut lower = fixture.tenant_conn().await.expect("lower opens");
-    assert_eq!(
-        publish(
-            &queue,
-            &mut lower,
-            lease,
-            "review",
-            "lower",
-            "c2",
-            json!(2),
-            UNBOUNDED
-        )
-        .await,
-        PublicationAcceptance::Accepted
-    );
-    let mut higher = fixture.tenant_conn().await.expect("higher opens");
-    let mut probe = fixture.tenant_conn().await.expect("probe opens");
-    let higher_accept = async {
-        publish(
-            &queue,
-            &mut higher,
-            lease,
-            "review",
-            "higher",
-            "c3",
-            json!(3),
-            UNBOUNDED,
-        )
-        .await;
-        higher.commit().await.expect("higher commits");
-    };
-    tokio::pin!(higher_accept);
-    let raced = tokio::select! {
-        () = &mut higher_accept => true,
-        () = await_blocked_backend(&mut probe) => false,
-    };
-    assert!(
-        !raced,
-        "a higher acceptance waits for an uncommitted lower one"
-    );
-    let mut reader = fixture.tenant_conn().await.expect("reader opens");
-    let first_page = async {
-        let page = queue
-            .publication_page(&mut reader, execution, None, 1)
-            .await;
-        reader.commit().await.expect("reader commits");
-        page
-    };
-    tokio::pin!(first_page);
-    let read = tokio::select! {
-        page = &mut first_page => Some(page),
-        () = await_blocked_backends(&mut probe, 2) => None,
-    };
-    assert!(
-        read.is_none(),
-        "a first page waits for an uncommitted acceptance"
-    );
-    lower.commit().await.expect("lower commits");
-    higher_accept.await;
-    let first = first_page.await.expect("the first page reads");
-    assert_eq!(names(&first), ["first"]);
-
-    let mut late = fixture.tenant_conn().await.expect("late opens");
-    publish(
-        &queue,
-        &mut late,
-        lease,
-        "review",
-        "late",
-        "c4",
-        json!(4),
-        UNBOUNDED,
-    )
-    .await;
-    late.commit().await.expect("late commits");
-    let mut conn = fixture
-        .tenant_conn()
-        .await
-        .expect("tenant connection opens");
-    let rest = queue
-        .publication_page(
-            &mut conn,
-            execution,
-            Some(PagePosition {
-                through: first.through,
-                after: first.entries[0].0,
-            }),
-            10,
-        )
-        .await
-        .expect("the continuation reads");
-    assert_eq!(
-        (rest.through, names(&rest)),
-        (first.through, vec!["lower".to_owned(), "higher".to_owned()]),
-        "the continuation is exactly the first cut's committed membership"
-    );
-    let fresh = queue
-        .publication_page(&mut conn, execution, None, 10)
-        .await
-        .expect("a new listing reads");
-    assert_eq!(names(&fresh), ["first", "lower", "higher", "late"]);
-}
-
-/// Two identical publication calls racing in separate transactions both
-/// acknowledge the one committed acceptance: the second waits on the
-/// execution row, then replays the winner's stored kind instead of
-/// reporting a conflict. A different call or different arguments under the
-/// name conflict, and only the unexpired lease holder reads a receipt.
-///
-/// # Panics
-/// Panics when the racing call does not wait, reports a conflict, or a
-/// receipt differs.
-#[tokio::test]
-async fn concurrent_identical_publications_replay_the_winner() {
-    let fixture = PgFixture::start().await.expect("fixture starts");
-    let actor = actor(fixture.data_tenant_id());
-    let queue = VerifierExecutionQueue::default();
-    let mut setup = fixture
-        .tenant_conn()
-        .await
-        .expect("tenant connection opens");
-    let (owner, _) = declare_service(&mut setup, &actor, "svc").await;
-    let verifier = register_verifier(&mut setup, &actor, "drift", custom_drift()).await;
-    let binding = bind(&mut setup, &owner, &verifier, Vec::new()).await;
-    let execution = scheduled(&queue, &mut setup, binding).await;
-    let lease = claim(&queue, &mut setup).await.lease;
-    setup.commit().await.expect("setup commits");
-
-    let mut winner = fixture.tenant_conn().await.expect("winner opens");
-    assert_eq!(
-        publish(
-            &queue,
-            &mut winner,
-            lease,
-            "review",
-            "report",
-            "call",
-            json!(null),
-            UNBOUNDED
-        )
-        .await,
-        PublicationAcceptance::Accepted
-    );
-    let mut racer = fixture.tenant_conn().await.expect("racer opens");
-    let mut probe = fixture.tenant_conn().await.expect("probe opens");
-    let replay = async {
-        let outcome = publish(
-            &queue,
-            &mut racer,
-            lease,
-            "review",
-            "report",
-            "call",
-            json!(null),
-            UNBOUNDED,
-        )
-        .await;
-        racer.commit().await.expect("racer commits");
-        outcome
-    };
-    tokio::pin!(replay);
-    let raced = tokio::select! {
-        outcome = &mut replay => Some(outcome),
-        () = await_blocked_backend(&mut probe) => None,
-    };
-    assert_eq!(
-        raced, None,
-        "the identical call waits for the uncommitted winner"
-    );
-    winner.commit().await.expect("winner commits");
-    assert_eq!(
-        replay.await,
-        PublicationAcceptance::Replayed(PublicationKind::Json),
-        "the identical call acknowledges the committed winner"
-    );
-
-    let mut conn = fixture
-        .tenant_conn()
-        .await
-        .expect("tenant connection opens");
-    assert_eq!(
-        publish(
-            &queue,
-            &mut conn,
-            lease,
-            "review",
-            "report",
-            "other",
-            json!(null),
-            UNBOUNDED
-        )
-        .await,
-        PublicationAcceptance::Conflict
-    );
-    assert_eq!(
-        publish(
-            &queue,
-            &mut conn,
-            lease,
-            "review",
-            "report",
-            "call",
-            json!(1),
-            UNBOUNDED
-        )
-        .await,
-        PublicationAcceptance::Conflict,
-        "the same call with other arguments conflicts"
-    );
-    let stored = Publication {
-        name: PublicationName::new("report").expect("publication name"),
-        producer: Producer {
-            step_id: TaskId::new("review").expect("task id"),
-            item_index: None,
-            iteration_index: None,
-            attempt: 1,
-        },
-        content: PublicationContent::Json { value: json!(null) },
-    };
-    let arguments = Sha256Hex::digest(
-        serde_json::to_vec(&json!({ "name": "report", "value": null }))
-            .expect("arguments serialize")
-            .as_slice(),
-    );
-    let receipt = PublicationCall {
-        publication: &stored,
-        call_id: "call",
-        arguments: &arguments,
-        objects: &[],
-        retained_bytes: 4,
-    };
-    assert_eq!(
-        queue
-            .publication_receipt(&mut conn, lease, receipt)
-            .await
-            .expect("the receipt reads"),
-        Some(PublicationAcceptance::Replayed(PublicationKind::Json)),
-        "the lease holder recovers its receipt from the stored row"
-    );
-    expire_deadlines(&mut conn, execution).await;
-    assert_eq!(
-        queue
-            .publication_receipt(&mut conn, lease, receipt)
-            .await
-            .expect("the receipt reads"),
-        Some(PublicationAcceptance::StaleLease),
-        "an expired lease recovers nothing"
-    );
-    assert_eq!(
-        queue
-            .publications(
-                &mut conn,
-                execution,
-                &TaskId::new("review").expect("task id")
-            )
-            .await
-            .expect("publications read")
-            .len(),
-        1,
-        "the race stored one publication"
-    );
-}
-
-/// Publication budgets are cumulative per execution: concurrent acceptances
-/// charge one shared count and byte total, a replay charges nothing, a
-/// publication crossing either ceiling commits nothing, and a reclaimed
-/// attempt inherits the spent budget.
-///
-/// # Panics
-/// Panics when a charge is lost, a replay is charged, an over-budget
-/// publication commits, or a reclaim replenishes the budget.
-#[tokio::test]
-async fn publication_budgets_are_cumulative_and_survive_reclaim() {
-    let fixture = PgFixture::start().await.expect("fixture starts");
-    let actor = actor(fixture.data_tenant_id());
-    let queue = VerifierExecutionQueue::default();
-    let mut conn = fixture
-        .tenant_conn()
-        .await
-        .expect("tenant connection opens");
-    let (owner, _) = declare_service(&mut conn, &actor, "svc").await;
-    let verifier = register_verifier(&mut conn, &actor, "drift", custom_drift()).await;
-    let binding = bind(&mut conn, &owner, &verifier, Vec::new()).await;
-    let execution = scheduled(&queue, &mut conn, binding).await;
-    let stale = claim(&queue, &mut conn).await.lease;
-    conn.commit().await.expect("setup commits");
-    // Each value serializes to 4 bytes.
-    let budget = PublicationBudget {
-        max_count: 3,
-        max_bytes: 10,
-    };
-
-    let mut first = fixture.tenant_conn().await.expect("first opens");
-    let mut second = fixture.tenant_conn().await.expect("second opens");
-    let (a, b) = tokio::join!(
-        async {
-            let outcome = publish(
-                &queue,
-                &mut first,
-                stale,
-                "review",
-                "a",
-                "ca",
-                json!("aa"),
-                budget,
-            )
-            .await;
-            first.commit().await.expect("first commits");
-            outcome
-        },
-        async {
-            let outcome = publish(
-                &queue,
-                &mut second,
-                stale,
-                "review",
-                "b",
-                "cb",
-                json!("bb"),
-                budget,
-            )
-            .await;
-            second.commit().await.expect("second commits");
-            outcome
-        },
-    );
-    assert_eq!(
-        (a, b),
-        (
-            PublicationAcceptance::Accepted,
-            PublicationAcceptance::Accepted
-        )
-    );
-    let mut conn = fixture
-        .tenant_conn()
-        .await
-        .expect("tenant connection opens");
-    assert_eq!(
-        publish(
-            &queue,
-            &mut conn,
-            stale,
-            "review",
-            "a",
-            "ca",
-            json!("aa"),
-            budget
-        )
-        .await,
-        PublicationAcceptance::Replayed(PublicationKind::Json),
-        "a replay is not charged again"
-    );
-    assert_eq!(
-        publish(
-            &queue,
-            &mut conn,
-            stale,
-            "review",
-            "c",
-            "cc",
-            json!("cc"),
-            budget
-        )
-        .await,
-        PublicationAcceptance::OverBudget(PublicationLimit::Bytes),
-        "a third 4-byte value crosses the 10-byte total"
-    );
-    expire_deadlines(&mut conn, execution).await;
-    let current = queue
-        .claim(&mut conn, Duration::minutes(5), Duration::hours(1), 1)
-        .await
-        .expect("claim runs")
-        .pop()
-        .expect("the expired lease is reclaimable")
-        .lease;
-    let wide = PublicationBudget {
-        max_count: 2,
-        ..UNBOUNDED
-    };
-    assert_eq!(
-        publish(
-            &queue,
-            &mut conn,
-            current,
-            "review",
-            "d",
-            "cd",
-            json!(1),
-            wide
-        )
-        .await,
-        PublicationAcceptance::OverBudget(PublicationLimit::Count),
-        "the reclaimed attempt inherits both accepted publications"
-    );
-    let stored: (i32, i64) = sqlx::query_as(
-        "SELECT publication_count, publication_bytes FROM wyrd.verifier_executions \
-          WHERE execution_id = $1",
-    )
-    .bind(execution.as_uuid())
-    .fetch_one(&mut **conn.transaction())
-    .await
-    .expect("accounting reads");
-    assert_eq!(stored, (2, 8));
-}
-
-/// A lease past its database expiry admits no new invocation, settlement,
-/// or publication even before any reclaim, while its accepted evidence stays
-/// readable and a fresh claim proceeds.
-///
-/// # Panics
-/// Panics when an expired lease writes, accepted evidence disappears, or the
-/// fresh claim is refused.
-#[tokio::test]
-async fn expired_leases_refuse_invocation_and_publication_writes() {
-    let fixture = PgFixture::start().await.expect("fixture starts");
-    let actor = actor(fixture.data_tenant_id());
-    let queue = VerifierExecutionQueue::default();
-    let mut conn = fixture
-        .tenant_conn()
-        .await
-        .expect("tenant connection opens");
-    let (owner, _) = declare_service(&mut conn, &actor, "svc").await;
-    let verifier = register_verifier(&mut conn, &actor, "drift", custom_drift()).await;
-    let binding = bind(&mut conn, &owner, &verifier, Vec::new()).await;
-    let execution = scheduled(&queue, &mut conn, binding).await;
-    let expired = claim(&queue, &mut conn).await.lease;
-    let review = TaskId::new("review").expect("task id");
-    let judge = TaskId::new("judge").expect("task id");
-    let settled = InvocationSettlement::Action {
-        result: Box::new(StepResult {
-            id: review.clone(),
-            status: StepStatus::Succeeded,
-            output: Some(json!("ok")),
-            attempts: 1,
-            duration_ms: 1,
-            reason: None,
-            provenance: None,
-            tool_calls: Vec::new(),
-        }),
-        sources: BTreeSet::new(),
-    };
-    queue
-        .begin_invocation(&mut conn, expired, &review, 1)
-        .await
-        .expect("the attempt begins");
-    publish(
-        &queue,
-        &mut conn,
-        expired,
-        "review",
-        "kept",
-        "c1",
-        json!(1),
-        UNBOUNDED,
-    )
-    .await;
-    expire_deadlines(&mut conn, execution).await;
-
-    let refused = [
-        queue.begin_invocation(&mut conn, expired, &judge, 1).await,
-        queue
-            .settle_invocation(&mut conn, expired, &review, 1, &settled)
-            .await,
-        queue
-            .forget_invocation(&mut conn, expired, &review, 1)
-            .await,
-    ]
-    .map(|write| write.expect("the fenced write answers"));
-    assert_eq!(refused, [Settlement::StaleLease; 3]);
-    assert_eq!(
-        publish(
-            &queue,
-            &mut conn,
-            expired,
-            "review",
-            "new",
-            "c2",
-            json!(2),
-            UNBOUNDED
-        )
-        .await,
-        PublicationAcceptance::StaleLease
-    );
-    let status: String =
-        sqlx::query_scalar("SELECT status FROM wyrd.verifier_executions WHERE execution_id = $1")
-            .bind(execution.as_uuid())
-            .fetch_one(&mut **conn.transaction())
-            .await
-            .expect("status reads");
-    assert_eq!(status, "running", "no reclaim has run");
-    assert_eq!(
-        queue
-            .publications(&mut conn, execution, &review)
-            .await
-            .expect("publications read")
-            .len(),
-        1,
-        "accepted evidence stays readable"
-    );
-    assert_eq!(
-        queue
-            .invocations(&mut conn, execution)
-            .await
-            .expect("checkpoints read")
-            .len(),
-        1
-    );
-    let current = queue
-        .claim(&mut conn, Duration::minutes(5), Duration::hours(1), 1)
-        .await
-        .expect("claim runs")
-        .pop()
-        .expect("the expired lease is reclaimable")
-        .lease;
-    assert_eq!(
-        queue
-            .begin_invocation(&mut conn, current, &judge, 1)
-            .await
-            .expect("the attempt begins"),
-        Settlement::Applied
-    );
 }

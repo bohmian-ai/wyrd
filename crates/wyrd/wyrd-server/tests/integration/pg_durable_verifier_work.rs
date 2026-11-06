@@ -10,36 +10,55 @@ use std::sync::Arc;
 
 use serde_json::{Value, json};
 use skald_spec::MediaFormat;
-use vala_verify::blocks::{CallInput, CallValue};
+use tokio_util::sync::CancellationToken;
+use vala_bifrost_redux::catalog::TableRef;
+use vala_bifrost_redux::namespaces::BifrostNamespace;
+use vala_verify::blocks::{CallInput, CallValue, Checkpoints as _};
+use wyrd_runtime::principal::PrincipalId;
+use wyrd_server::query::scheduled::ScheduledQueryCaller;
+use wyrd_server::verification::authority::SystemReadAuthority;
 use wyrd_server::verification::hosted::HostedLimits;
 use wyrd_server::verification::hosted::evidence::TenantEvidence;
 use wyrd_server::verification::hosted::publications::{Publications, PublishCall};
 use wyrd_server::verification::hosted::workspace::{Workspace, Workspaces};
+use wyrd_server::verification::inputs::InputResolver;
+use wyrd_server::verification::leases::LeaseRenewal;
+use wyrd_server::verification::state::{RunState, StateRow, StateWriter};
+use wyrd_spec::auth::Attribution;
 use wyrd_spec::ids::SlotName;
 use wyrd_spec::verification::VerificationError;
 use wyrd_spec::verification::execution::{
     InputDeclaration, Producer, ProducerInvocation, PublicationCollection, PublicationContent,
     PublicationFile, PublicationKind, PublicationManifest, Speculation, StepStatus,
 };
+use wyrd_spec::verification::state::ExecutionState;
 use wyrd_spec::verification::{PublicationName, TaskId};
+use wyrd_sql::queries::auth::service_accounts::system_principal_id;
 use wyrd_sql::queries::verifier_executions::{
-    ExecutionLease, Settlement, TerminalStatus, VerifierExecutionQueue,
+    ClaimedExecution, ExecutionLease, Settlement, TerminalStatus, VerifierExecutionQueue,
 };
 use wyrd_testing::WyrdTestServer;
 use wyrd_testing::verification::VerificationFixture;
 
 use crate::pg_hosted_artifacts::user;
 
-/// One leased execution of a fresh in-process server.
+/// One leased execution of a fresh in-process server, written through the
+/// Bifrost execution state its claim holds.
 struct Leased {
     /// The server; dropping it stops the server.
     server: WyrdTestServer,
     /// The claimed execution's lease.
     lease: ExecutionLease,
+    /// The lease renewal owner every writer's lease registers with.
+    renewal: Arc<LeaseRenewal>,
+    /// The tenant's SYSTEM principal, which reads the state back.
+    system: PrincipalId,
+    /// The first claim's state writer.
+    run: Arc<RunState>,
 }
 
 impl Leased {
-    /// Start a server, submit one execution, and claim it.
+    /// Start a server, submit one execution, and claim it and its state.
     ///
     /// # Panics
     /// Panics when the server, fixture, submission, or claim fails.
@@ -74,11 +93,105 @@ impl Leased {
             .expect("claim runs")
             .pop()
             .expect("the execution is claimable");
+        let system = system_principal_id(&mut conn)
+            .await
+            .expect("SYSTEM reads")
+            .map(PrincipalId::new)
+            .expect("the tenant has SYSTEM");
         conn.commit().await.expect("the claim commits");
+        let renewal = Arc::new(LeaseRenewal::new(
+            server.state().postgres.wyrd().clone(),
+            VerifierExecutionQueue::default(),
+            std::time::Duration::from_secs(300),
+        ));
+        let run = Self::writer(&server, &renewal, system, &claimed).await;
         Self {
             server,
             lease: claimed.lease,
+            renewal,
+            system,
+            run,
         }
+    }
+
+    /// A query caller reading the execution's records as SYSTEM.
+    ///
+    /// # Panics
+    /// Panics when the SYSTEM read authority does not resolve.
+    async fn query(server: &WyrdTestServer, system: PrincipalId) -> ScheduledQueryCaller {
+        let tables = ["execution_inputs", "execution_outputs", "execution_events"]
+            .map(|name| TableRef::new(BifrostNamespace::Verification, name));
+        let read = SystemReadAuthority::resolve(
+            server.state(),
+            server.data_tenant_id(),
+            Some(system),
+            &tables,
+        )
+        .await
+        .expect("SYSTEM read authority resolves");
+        ScheduledQueryCaller::new(
+            server.state().clone(),
+            read.into_context(),
+            CancellationToken::new(),
+        )
+    }
+
+    /// Claim `claimed`'s execution state for its lease, as a worker would.
+    ///
+    /// # Panics
+    /// Panics when the state claim or its recovery read fails.
+    async fn writer(
+        server: &WyrdTestServer,
+        renewal: &Arc<LeaseRenewal>,
+        system: PrincipalId,
+        claimed: &ClaimedExecution,
+    ) -> Arc<RunState> {
+        let tenant = server.data_tenant_id();
+        let query = Self::query(server, system).await;
+        let lease = renewal.hold(tenant, claimed.lease.token, &CancellationToken::new());
+        let run = RunState::claim(
+            server.state(),
+            Arc::clone(server.state().bifrost.scribe_outbox()),
+            tenant,
+            StateRow {
+                execution_id: claimed.lease.execution_id,
+                verifier_uid: claimed.verifier_card_uid.clone(),
+                card_uid: claimed.card_uid.clone(),
+                owner_card_uid: None,
+                run_id: None,
+                deployment_environment: claimed.deployment_environment.clone(),
+                attribution: Attribution::new(claimed.attribution.sub_principal_id, system),
+            },
+            StateWriter {
+                writer: claimed.lease.token.as_uuid(),
+                generation: i64::from(claimed.attempt),
+                not_after: Some(claimed.deadline_at),
+                deadline: tokio::time::Instant::now() + std::time::Duration::from_secs(300),
+            },
+            Some(Arc::new(lease)),
+            Some(&InputResolver::new(&query, None)),
+        )
+        .await
+        .expect("the execution state claims");
+        Arc::new(run)
+    }
+
+    /// The execution's accepted state, read back from Bifrost.
+    ///
+    /// # Panics
+    /// Panics when the state is unreadable or was never claimed.
+    async fn accepted(&self) -> ExecutionState {
+        let query = Self::query(&self.server, self.system).await;
+        RunState::accepted(
+            self.server.state(),
+            self.server.data_tenant_id(),
+            self.lease.execution_id,
+            &InputResolver::new(&query, None),
+        )
+        .await
+        .expect("the state reads")
+        .expect("the state was claimed")
+        .1
     }
 
     /// The publication `name` of `producer`, if accepted.
@@ -86,31 +199,24 @@ impl Leased {
     /// # Panics
     /// Panics when the read fails.
     async fn read(&self, producer: &Producer, name: &str) -> Option<PublicationContent> {
-        let mut conn = self
-            .server
-            .tenant_conn_for(self.server.data_tenant_id())
+        self.accepted()
             .await
-            .expect("tenant connection opens");
-        VerifierExecutionQueue::default()
-            .publications(&mut conn, self.lease.execution_id, &producer.step_id)
-            .await
-            .expect("the publications read")
+            .publications
             .into_iter()
-            .map(|stored| stored.publication)
+            .map(|accepted| accepted.publication)
             .find(|publication| {
                 &publication.producer == producer && publication.name.as_str() == name
             })
             .map(|publication| publication.content)
     }
-}
 
-impl Leased {
-    /// Expire the lease on the database clock and claim the execution again,
-    /// returning the new lease; the old one is stale from then on.
+    /// Expire the lease on the database clock and claim the execution and
+    /// its state again, returning the new writer; the old one is stale from
+    /// then on.
     ///
     /// # Panics
-    /// Panics when the update or claim fails.
-    async fn reclaim(&self) -> ExecutionLease {
+    /// Panics when the update or either claim fails.
+    async fn reclaim(&self) -> Arc<RunState> {
         let mut conn = self
             .server
             .tenant_conn_for(self.server.data_tenant_id())
@@ -136,27 +242,28 @@ impl Leased {
             .pop()
             .expect("the expired lease is reclaimable");
         conn.commit().await.expect("the reclaim commits");
-        claimed.lease
+        Self::writer(&self.server, &self.renewal, self.system, &claimed).await
     }
 
-    /// Every accepted publication of the execution as (task, attempt, name).
+    /// Every accepted publication of the execution as (task, attempt, name),
+    /// in acceptance order.
     ///
     /// # Panics
     /// Panics when the read fails.
     async fn entries(&self) -> Vec<(String, i32, String)> {
-        let mut conn = self
-            .server
-            .tenant_conn_for(self.server.data_tenant_id())
+        self.accepted()
             .await
-            .expect("tenant connection opens");
-        sqlx::query_as(
-            "SELECT task_id, attempt, name FROM wyrd.verifier_execution_publications \
-             WHERE execution_id = $1 ORDER BY attempt, sequence",
-        )
-        .bind(self.lease.execution_id.as_uuid())
-        .fetch_all(&mut **conn.transaction())
-        .await
-        .expect("the publications read")
+            .publications
+            .into_iter()
+            .map(|accepted| {
+                let producer = accepted.publication.producer;
+                (
+                    producer.step_id.as_str().to_owned(),
+                    i32::try_from(producer.attempt).expect("attempt fits"),
+                    accepted.publication.name.as_str().to_owned(),
+                )
+            })
+            .collect()
     }
 }
 
@@ -205,7 +312,7 @@ async fn file_and_json_publications_are_immutable() {
     std::fs::create_dir_all(workspace.work_dir().join("notes")).expect("directory");
     std::fs::write(workspace.work_dir().join("notes/report one.md"), report).expect("write");
     std::fs::write(workspace.work_dir().join("big.bin"), vec![b'x'; 1025]).expect("write");
-    let publications = Publications::new(leased.server.state(), &caller, leased.lease, limits);
+    let publications = Publications::new(leased.server.state(), &caller, &leased.run, limits);
     let producer = Producer {
         step_id: TaskId::new("review").expect("task"),
         item_index: None,
@@ -352,7 +459,7 @@ async fn directory_snapshot_is_complete_or_rejected() {
     };
     let caller = user(leased.server.data_tenant_id(), []);
     let workspace = Arc::new(Workspace::materialize(Vec::new(), limits, None).expect("workspace"));
-    let publications = Publications::new(leased.server.state(), &caller, leased.lease, limits);
+    let publications = Publications::new(leased.server.state(), &caller, &leased.run, limits);
     let producer = Producer {
         step_id: TaskId::new("review").expect("task"),
         item_index: None,
@@ -535,7 +642,7 @@ async fn publication_replay_preserves_attempt_identity() {
     let limits = HostedLimits::default();
     let caller = user(leased.server.data_tenant_id(), []);
     let workspace = Arc::new(Workspace::materialize(Vec::new(), limits, None).expect("workspace"));
-    let publications = Publications::new(leased.server.state(), &caller, leased.lease, limits);
+    let publications = Publications::new(leased.server.state(), &caller, &leased.run, limits);
     let first = Producer {
         step_id: TaskId::new("review").expect("task"),
         item_index: None,
@@ -635,14 +742,16 @@ async fn publication_replay_preserves_attempt_identity() {
         .await
         .expect_err("a reclaimed lease publishes nothing");
     assert!(
-        stale.to_string().contains("no longer holds its lease"),
+        stale
+            .to_string()
+            .contains("no longer holds its state, lease, or deadline"),
         "{stale}"
     );
     publications
         .json(&call("c1", &first, "report"), json!({"v": 1}))
         .await
         .expect_err("a replay under the stale lease is fenced too");
-    Publications::new(leased.server.state(), &caller, current, limits)
+    Publications::new(leased.server.state(), &caller, &current, limits)
         .json(&call("c5", &second, "late"), json!(null))
         .await
         .expect("the current lease publishes");
@@ -685,7 +794,7 @@ async fn publication_limits_survive_reclaim() {
     };
     let caller = user(leased.server.data_tenant_id(), []);
     let workspace = Arc::new(Workspace::materialize(Vec::new(), limits, None).expect("workspace"));
-    let publications = Publications::new(leased.server.state(), &caller, leased.lease, limits);
+    let publications = Publications::new(leased.server.state(), &caller, &leased.run, limits);
     let producer = Producer {
         step_id: TaskId::new("review").expect("task"),
         item_index: None,
@@ -739,7 +848,7 @@ async fn publication_limits_survive_reclaim() {
         .expect("a replay is not charged again");
 
     let current = leased.reclaim().await;
-    let resumed = Publications::new(leased.server.state(), &caller, current, limits);
+    let resumed = Publications::new(leased.server.state(), &caller, &current, limits);
     resumed
         .json(&call("k", &producer, "k"), json!(1))
         .await
@@ -766,7 +875,7 @@ async fn publication_limits_survive_reclaim() {
         BTreeMap::new(),
         limits,
     )
-    .with_execution(leased.lease.execution_id);
+    .with_execution(Arc::clone(&leased.run));
     evidence
         .read(&InputDeclaration::File {
             sha256: wyrd_spec::auth::Sha256Hex::digest(b"12345678"),
@@ -819,7 +928,7 @@ async fn publication_mounts_preserve_status_and_lineage() {
     let leased = Leased::start().await;
     let limits = HostedLimits::default();
     let caller = user(leased.server.data_tenant_id(), []);
-    let publications = Publications::new(leased.server.state(), &caller, leased.lease, limits);
+    let publications = Publications::new(leased.server.state(), &caller, &leased.run, limits);
     let producer = |step: &str, attempt| Producer {
         step_id: TaskId::new(step).expect("task"),
         item_index: None,
@@ -865,7 +974,7 @@ async fn publication_mounts_preserve_status_and_lineage() {
         BTreeMap::new(),
         limits,
     )
-    .with_execution(leased.lease.execution_id);
+    .with_execution(Arc::clone(&leased.run));
     let answer = BTreeSet::from([SlotName::new("answer").expect("slot")]);
     let named = |producer: &Producer, name: &str| CallInput {
         value: CallValue::Publication {
@@ -1060,7 +1169,7 @@ async fn publication_mounts_preserve_status_and_lineage() {
 
 /// Cancelling leased work after a checkpoint and a publication fences the
 /// worker: its next invocation, publication, settlement, and renewal are all
-/// stale, the recorded checkpoint and publication survive unchanged, and the
+/// stale, the accepted checkpoint and publication survive unchanged, and the
 /// execution is never claimed again. A repeated cancel changes nothing. A
 /// record of a newer worker format is not claimable by this worker even
 /// once its lease expires.
@@ -1076,7 +1185,7 @@ async fn cancelled_work_keeps_checkpoints_and_fences_stale_writes() {
     let queue = VerifierExecutionQueue::default();
     let limits = HostedLimits::default();
     let caller = user(tenant, []);
-    let publications = Publications::new(state, &caller, leased.lease, limits);
+    let publications = Publications::new(state, &caller, &leased.run, limits);
     let task = TaskId::new("review").expect("task");
     let producer = Producer {
         step_id: task.clone(),
@@ -1093,15 +1202,11 @@ async fn cancelled_work_keeps_checkpoints_and_fences_stale_writes() {
             .expect("tenant connection opens")
     };
 
-    let mut tx = conn().await;
-    assert_eq!(
-        queue
-            .begin_invocation(&mut tx, leased.lease, &task, 1)
-            .await
-            .expect("begin runs"),
-        Settlement::Applied
-    );
-    tx.commit().await.expect("the checkpoint commits");
+    leased
+        .run
+        .begin(&task, 1)
+        .await
+        .expect("the checkpoint is accepted");
     publications
         .json(&call("c1", &producer, "report"), json!({"v": 1}))
         .await
@@ -1109,7 +1214,7 @@ async fn cancelled_work_keeps_checkpoints_and_fences_stale_writes() {
 
     let mut tx = conn().await;
     sqlx::query(
-        "UPDATE wyrd.verifier_executions SET worker_format = 2, \
+        "UPDATE wyrd.verifier_executions SET worker_format = 3, \
                 lease_expires_at = statement_timestamp() WHERE execution_id = $1",
     )
     .bind(execution.as_uuid())
@@ -1131,16 +1236,17 @@ async fn cancelled_work_keeps_checkpoints_and_fences_stale_writes() {
     let mut tx = conn().await;
     assert!(queue.cancel(&mut tx, execution).await.expect("cancel runs"));
     tx.commit().await.expect("the cancel commits");
+    leased
+        .run
+        .begin(&task, 2)
+        .await
+        .expect_err("a cancelled lease checkpoints nothing");
     let mut tx = conn().await;
     assert!(
         !queue.cancel(&mut tx, execution).await.expect("cancel runs"),
         "a repeated cancel writes nothing"
     );
     let stale = (
-        queue
-            .begin_invocation(&mut tx, leased.lease, &task, 2)
-            .await
-            .expect("begin runs"),
         queue
             .terminate(
                 &mut tx,
@@ -1168,19 +1274,7 @@ async fn cancelled_work_keeps_checkpoints_and_fences_stale_writes() {
             .expect("claim runs")
             .len(),
     );
-    assert_eq!(
-        stale,
-        (
-            Settlement::StaleLease,
-            Settlement::StaleLease,
-            Vec::new(),
-            0
-        )
-    );
-    let invocations = queue
-        .invocations(&mut tx, execution)
-        .await
-        .expect("invocations read");
+    assert_eq!(stale, (Settlement::StaleLease, Vec::new(), 0));
     let status: (String, Option<String>) = sqlx::query_as(
         "SELECT status, error->>'code' FROM wyrd.verifier_executions WHERE execution_id = $1",
     )
@@ -1189,14 +1283,25 @@ async fn cancelled_work_keeps_checkpoints_and_fences_stale_writes() {
     .await
     .expect("status reads");
     tx.commit().await.expect("the reads commit");
-    assert_eq!(
-        (invocations.len(), invocations[0].attempt, status),
-        (1, 1, ("cancelled".to_owned(), Some("cancelled".to_owned())))
-    );
     publications
         .json(&call("c2", &producer, "late"), json!(null))
         .await
         .expect_err("a cancelled lease publishes nothing");
+    let accepted = leased.accepted().await;
+    assert_eq!(
+        (
+            accepted
+                .invocations
+                .iter()
+                .map(|invocation| invocation.producer.attempt)
+                .collect::<Vec<_>>(),
+            status
+        ),
+        (
+            vec![1],
+            ("cancelled".to_owned(), Some("cancelled".to_owned()))
+        )
+    );
     assert_eq!(
         leased.entries().await,
         [("review".to_owned(), 1, "report".to_owned())],

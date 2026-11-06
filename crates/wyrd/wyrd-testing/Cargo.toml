@@ -95,6 +95,7 @@ wyrd-tonic = { workspace = true, features = ["server", "client"] }
 uuid = { workspace = true, features = ["v4", "v7"] }
 vala-bifrost-redux = { workspace = true, features = ["bench-support", "test-support"] }
 vala-sql = { workspace = true }
+vala-verify = { workspace = true }
 wyrd-auth = { workspace = true }
 wyrd-auth-issue = { workspace = true }
 wyrd-auth-oidc = { workspace = true }

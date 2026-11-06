@@ -93,6 +93,31 @@ pub async fn claim(
     })
 }
 
+/// The accepted position of `key` in `logical_table_fqn`, without claiming
+/// it; `None` when no writer ever claimed the state.
+///
+/// Readers use this so inspecting a state never shuts out its writer.
+///
+/// # Errors
+///
+/// Returns [`SqlError`] when PostgreSQL cannot execute the statement.
+pub async fn head(
+    conn: &mut TenantConn<'_>,
+    logical_table_fqn: &str,
+    key: uuid::Uuid,
+) -> Result<Option<ScribeStateHead>, SqlError> {
+    let head: Option<(i64, Option<uuid::Uuid>)> = sqlx::query_as(
+        "SELECT revision, batch_id FROM vala.scribe_state_heads \
+          WHERE data_tenant_id = wyrd.current_tenant() \
+            AND logical_table_fqn = $1 AND state_key = $2",
+    )
+    .bind(logical_table_fqn)
+    .bind(key)
+    .fetch_optional(&mut **conn.transaction())
+    .await?;
+    Ok(head.map(|(revision, batch_id)| ScribeStateHead { revision, batch_id }))
+}
+
 /// Accepts each offered write whose writer owns its state, whose revision
 /// directly follows the accepted one, and whose bound has not passed, and
 /// records the batch that accepted it.
@@ -131,8 +156,18 @@ pub async fn advance(
     )
     .bind(offered.iter().map(|(_, _, s)| s.key).collect::<Vec<_>>())
     .bind(offered.iter().map(|(_, _, s)| s.writer).collect::<Vec<_>>())
-    .bind(offered.iter().map(|(_, _, s)| s.revision).collect::<Vec<_>>())
-    .bind(offered.iter().map(|(_, batch, _)| *batch).collect::<Vec<_>>())
+    .bind(
+        offered
+            .iter()
+            .map(|(_, _, s)| s.revision)
+            .collect::<Vec<_>>(),
+    )
+    .bind(
+        offered
+            .iter()
+            .map(|(_, batch, _)| *batch)
+            .collect::<Vec<_>>(),
+    )
     .bind(
         offered
             .iter()

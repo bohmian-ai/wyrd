@@ -143,6 +143,14 @@ message IngestCaptureRequest {
   reserved 6, 7, 8, 9; reserved "verifier", "principal_id", "sub_principal_id", "act_principal_id";
   string tenant_id = 1; string table = 2; string batch_id = 3; string request_id = 4;
   bytes arrow_ipc = 5;
+  // Present only for a state-fenced table: the writer's claim to advance one
+  // keyed state by exactly one revision.
+  IngestCaptureState state = 10;
+}
+// not_after_unix_micros bounds acceptance on the receiving PostgreSQL clock;
+// absent sets no bound.
+message IngestCaptureState {
+  string key = 1; string writer = 2; int64 revision = 3; optional sint64 not_after_unix_micros = 4;
 }
 message IngestCaptureResponse {}
 // One successful Scribe promotion Iceberg commit. properties carries only the

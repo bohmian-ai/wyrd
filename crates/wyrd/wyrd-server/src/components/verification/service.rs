@@ -14,7 +14,7 @@ use tokio_util::sync::CancellationToken;
 use tracing::Instrument as _;
 use vala_bifrost_redux::catalog::TableRef;
 use vala_bifrost_redux::namespaces::BifrostNamespace;
-use vala_verify::blocks::{DriftChecks, EngineError};
+use vala_verify::blocks::{Checkpoints, DriftChecks, EngineError};
 use wyrd_runtime::outbox::{OutboxFull, Reservation};
 use wyrd_runtime::permission::{Action, Resource};
 use wyrd_runtime::principal::PrincipalId;
@@ -27,8 +27,9 @@ use wyrd_spec::vala::error::BifrostError;
 use wyrd_spec::vala::ids::{SpanId, TraceId};
 use wyrd_spec::verification::execution::{
     EnqueueVerificationResponse, EvidencePlanRequest, EvidencePlanResponse, EvidenceUpload,
-    VerificationExecutionState, VerificationOutcome, VerificationRequest, VerificationResult,
+    VerificationExecutionState, VerificationRequest, VerificationResult,
 };
+use wyrd_spec::verification::state::TerminalSelection;
 use wyrd_spec::verification::{
     VerificationBindingStatus, VerificationExecutionStatus, VerifierReadiness,
 };
@@ -57,6 +58,7 @@ use crate::verification::inputs::InputResolver;
 use crate::verification::results::{
     InputRecord, ResultPayloadBuilder, ResultPayloadError, ResultRun,
 };
+use crate::verification::state::{RunState, StateRow};
 use crate::verification::submissions::{AdmissionReply, Queued};
 use crate::verification::telemetry::{ExecutionMode, ExecutionTelemetry, Phase};
 
@@ -109,6 +111,17 @@ fn staging_full(full: OutboxFull) -> WyrdError {
     metrics::counter!("verification_staging_refused_total", "outbox" => full.outbox).increment(1);
     WyrdError::VerificationStagingFull {
         message: "this server has no verification staging capacity now".to_owned(),
+        details: serde_json::json!({ "retry_after_seconds": STAGING_RETRY_AFTER_SECONDS }),
+    }
+}
+
+/// The retryable refusal of a direct execution whose state could not be
+/// claimed or changed, such as while Scribe is unreachable; the identical
+/// call may be retried whole as a new execution.
+fn state_unavailable(error: &dyn std::fmt::Display) -> WyrdError {
+    tracing::warn!(%error, "the direct execution state is unavailable");
+    WyrdError::ServiceUnavailable {
+        message: "the verification execution state cannot be recorded now".to_owned(),
         details: serde_json::json!({ "retry_after_seconds": STAGING_RETRY_AFTER_SECONDS }),
     }
 }
@@ -550,6 +563,28 @@ impl<'a> VerificationControl<'a> {
         let executor = caller.clone().executed_by_system(system);
         let started_at = Utc::now();
         let timeout = blocks.limits().verify_timeout;
+        let deadline = tokio::time::Instant::now() + timeout;
+        let owner = wyrd_runtime::owning_root(&caller.principal, &caller.delegation_chain);
+        let state = match RunState::fresh(
+            self.state,
+            Arc::clone(self.state.bifrost.scribe_outbox()),
+            caller.data_tenant_id,
+            StateRow {
+                execution_id,
+                verifier_uid: request.verifier_card_uid.clone(),
+                card_uid: request.card_uid.clone(),
+                owner_card_uid: owner.cloned(),
+                run_id: request.run_id.clone(),
+                deployment_environment: request.deployment_environment.clone(),
+                attribution: caller.attribution(),
+            },
+            deadline,
+        )
+        .await
+        {
+            Ok(state) => Arc::new(state),
+            Err(error) => return ("unavailable", Err(state_unavailable(&error))),
+        };
         let engine = match blocks.engine(
             self.state,
             Execution {
@@ -558,11 +593,7 @@ impl<'a> VerificationControl<'a> {
                 evidence: &request.inputs,
                 routes: &request.execution_route_overrides,
                 subject: GatewayCallContext {
-                    workload_card_uid: wyrd_runtime::owning_root(
-                        &caller.principal,
-                        &caller.delegation_chain,
-                    )
-                    .cloned(),
+                    workload_card_uid: owner.cloned(),
                     subject_card_uid: Some(request.card_uid.clone()),
                     run_id: request.run_id.clone(),
                     deployment_environment: request.deployment_environment.clone(),
@@ -570,20 +601,16 @@ impl<'a> VerificationControl<'a> {
                 defer_unlanded_traces: false,
                 drift: DriftChecks::new(None, BTreeMap::new(), BTreeMap::new()),
                 clock: telemetry.clock(),
-                execution: None,
+                execution: Some(Arc::clone(&state)),
             },
         ) {
-            Ok(engine) => engine,
+            Ok(engine) => engine.with_checkpoints(Arc::clone(&state) as Arc<dyn Checkpoints>, []),
             Err(error) => return ("errored", Err(error)),
         };
         let ran = telemetry
             .phase(
                 Phase::Engine,
-                engine.run(
-                    Arc::clone(&target.spec),
-                    request.inputs.clone(),
-                    tokio::time::Instant::now() + timeout,
-                ),
+                engine.run(Arc::clone(&target.spec), request.inputs.clone(), deadline),
             )
             .instrument(tracing::info_span!("verification.engine"))
             .await;
@@ -639,18 +666,17 @@ impl<'a> VerificationControl<'a> {
                     }),
                 );
             }
+            Err(EngineError::Checkpoint(reason)) => {
+                return ("unavailable", Err(state_unavailable(&reason)));
+            }
             Err(error) => return ("errored", Err(WyrdError::internal(error.to_string()))),
         };
+        let selected = match state.select(&outcome, started_at).await {
+            Ok(selected) => selected,
+            Err(error) => return ("unavailable", Err(state_unavailable(&error))),
+        };
         telemetry.time(Phase::Stage, || {
-            Self::stage_direct(
-                &staged,
-                caller,
-                execution_id,
-                request,
-                &target,
-                &outcome,
-                started_at,
-            );
+            Self::stage_direct(&staged, caller, execution_id, request, &target, &selected);
         });
         (
             "completed",
@@ -809,12 +835,12 @@ impl<'a> VerificationControl<'a> {
         }
     }
 
-    /// Stage a completed direct execution's inputs and result on the Scribe
-    /// outbox.
+    /// Stage a completed direct execution's inputs and the result its state
+    /// `selected` on the Scribe outbox.
     ///
     /// Both rows are staged on the slots `staged` reserved before the
-    /// execution ran. The payload mints its own result identity and
-    /// correlates with the execution through `execution_id`. Its rows name the subject
+    /// execution ran. The payload carries the selected result identity and
+    /// interval and correlates with the execution through `execution_id`. Its rows name the subject
     /// as `subject_card_uid` and the exact Verifier as `verifier_card_uid`, are
     /// attributed to the caller, carry the caller's application Run, group,
     /// and authenticated owner Service, and have no binding or Trigger. The inputs row never queues work. The
@@ -826,8 +852,7 @@ impl<'a> VerificationControl<'a> {
         execution_id: ExecutionId,
         request: &VerificationRequest,
         target: &Target,
-        outcome: &VerificationOutcome,
-        started_at: chrono::DateTime<Utc>,
+        selected: &TerminalSelection,
     ) {
         let verifier_version = target.verifier.version.to_string();
         let builder = ResultPayloadBuilder::new(
@@ -847,12 +872,17 @@ impl<'a> VerificationControl<'a> {
                 window: None,
             },
             &request.verifier_card_uid,
-            started_at,
-            Utc::now(),
+            selected.started_at,
+            selected.ended_at,
         );
         let built = builder
             .inputs(InputRecord::Direct(&request.inputs))
-            .and_then(|row| Ok((row, builder.build(outcome)?)));
+            .and_then(|row| {
+                Ok((
+                    row,
+                    builder.build_as(selected.result_id, &selected.outcome)?,
+                ))
+            });
         match built {
             Ok((row, payload)) => {
                 staged.stage(
@@ -1068,13 +1098,14 @@ impl<'a> VerificationControl<'a> {
 
     /// The record reader of an execution read: the tenant's SYSTEM
     /// principal granted only `bifrost.verification.execution_inputs`,
-    /// `results`, and `execution_outputs`, serving `caller`.
+    /// `results`, `execution_outputs`, and `execution_events`, serving
+    /// `caller`.
     ///
     /// # Errors
     /// Returns a registry error when the SYSTEM principal cannot be read, and
     /// `WYRD_VALA_503_QUERY_VISIBILITY_UNAVAILABLE` when the read authority
     /// cannot be built.
-    async fn records(
+    pub(super) async fn records(
         &self,
         conn: &mut TenantConn<'_>,
         caller: &Caller,
@@ -1083,8 +1114,13 @@ impl<'a> VerificationControl<'a> {
             .await
             .map_err(registry_db_error)?
             .map(PrincipalId::new);
-        let tables = ["execution_inputs", "results", "execution_outputs"]
-            .map(|name| TableRef::new(BifrostNamespace::Verification, name));
+        let tables = [
+            "execution_inputs",
+            "results",
+            "execution_outputs",
+            "execution_events",
+        ]
+        .map(|name| TableRef::new(BifrostNamespace::Verification, name));
         let read = SystemReadAuthority::resolve(self.state, caller.data_tenant_id, system, &tables)
             .await
             .map_err(|error| {

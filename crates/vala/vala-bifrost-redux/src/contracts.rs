@@ -80,6 +80,9 @@ impl From<Attribution> for StampedAttribution {
     }
 }
 
+/// The keyed state heads a state-fenced table's writers claim and readers
+/// locate the accepted revision through.
+pub use vala_sql::queries::scribe_state_heads;
 pub use vala_sql::queries::scribe_state_heads::ScribeStateAdvance;
 
 /// One logical batch crossing the Gate-to-Scribe boundary.

@@ -65,7 +65,6 @@ use wyrd_spec::verification::VerificationVerdict;
 use wyrd_spec::verification::execution::{
     CallProvenance, Citation, InputDeclaration, InvocationSettlement, Locator,
 };
-use wyrd_sql::queries::verifier_executions::VerifierExecutionQueue;
 use wyrd_testing::logs::LogCapture;
 use wyrd_testing::verification::VerificationFixture;
 use wyrd_testing::{Bootstrap, WyrdTestServer, WyrdTestServerBuilder};
@@ -1712,19 +1711,15 @@ async fn deleted_agent_definition_errors_queued_execution_as_unavailable() {
             "{row:?}"
         );
         assert!(row.result_id.is_none(), "no verdict is judged: {row:?}");
-        let mut conn = registered
-            .server
-            .tenant_conn_for(tenant)
+        let accepted = seed
+            .execution_state(&state, execution)
             .await
-            .expect("tenant connection");
-        let page = VerifierExecutionQueue::default()
-            .invocation_page(&mut conn, execution, None, 16)
-            .await
-            .expect("invocations read");
-        let invocations: Vec<(&str, bool)> = page
-            .entries
+            .expect("the state reads")
+            .expect("the execution claimed its state");
+        let invocations: Vec<(&str, bool)> = accepted
+            .invocations
             .iter()
-            .map(|(_, entry)| {
+            .map(|entry| {
                 (
                     entry.producer.step_id.as_str(),
                     matches!(entry.settlement, Some(InvocationSettlement::Action { .. })),

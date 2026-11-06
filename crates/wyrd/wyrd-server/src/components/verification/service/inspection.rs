@@ -4,9 +4,10 @@
 //! authorizes `verifier:read` (or `verifier:run` to cancel) on exactly that
 //! Verifier, so a grant scoped to one Verifier inspects only its
 //! executions. An absent or other-tenant execution is the same not-found.
-//! Invocation and publication pages read the queue records at a cut their
-//! first page fixes, so a listing neither skips nor repeats entries while the
-//! execution progresses, and never loads publication content.
+//! Invocation and publication pages read the execution's accepted state at a
+//! cut their first page fixes, so a listing neither skips nor repeats entries
+//! while the execution progresses, and never returns publication content. A
+//! state that cannot be read now is unavailable, never empty.
 
 use base64::Engine as _;
 use bytes::Bytes;
@@ -24,11 +25,10 @@ use wyrd_spec::verification::execution::{
     InvocationSettlement, Publication, PublicationContent, PublicationFile, PublicationPage,
     PublicationSelector, PublicationSummary, Speculation,
 };
+use wyrd_spec::verification::state::{AcceptedPublication, ExecutionState, InvocationRecord};
 use wyrd_spec::verification::{PublicationName, TaskId};
 use wyrd_sql::TenantConn;
-use wyrd_sql::queries::verifier_executions::{
-    ExecutionStatus, InvocationEntry, PagePosition, StoredPublication,
-};
+use wyrd_sql::queries::verifier_executions::ExecutionStatus;
 use wyrd_storage::error::StorageError;
 use wyrd_storage::tenant_path::ValidatedPath;
 
@@ -37,6 +37,8 @@ use crate::audit;
 use crate::components::auth::Caller;
 use crate::state::registry_db_error;
 use crate::verification::hosted::publications::published_object;
+use crate::verification::inputs::InputResolver;
+use crate::verification::state::RunState;
 
 /// Audit operation of an invocation page read.
 const LIST_INVOCATIONS: &str = "verification.execution.invocations";
@@ -73,6 +75,15 @@ struct Cursor {
     c: i64,
     /// Sequence of the last entry returned.
     a: i64,
+}
+
+/// Where a page of one listing starts.
+#[derive(Debug, Clone, Copy)]
+struct PagePosition {
+    /// The listing's cut: the state sequence its first page saw.
+    through: i64,
+    /// The sequence of the last entry already returned; `0` before any.
+    after: i64,
 }
 
 /// The validation refusal naming `field`.
@@ -125,17 +136,29 @@ fn position(
     Ok((limit, position))
 }
 
-/// Keep at most `limit` of `entries`, read one past it, and the cursor
-/// continuing after them when more remain.
+/// Keep at most `limit` of the `entries` of a listing at `position`, or at a
+/// new cut of `state` when `None`, and the cursor continuing after them when
+/// more remain.
 fn page<T>(
-    mut entries: Vec<(i64, T)>,
+    entries: impl IntoIterator<Item = (i64, T)>,
+    state: &ExecutionState,
+    position: Option<PagePosition>,
     limit: u32,
-    through: i64,
     tenant: Uuid,
     execution: ExecutionId,
     listing: &str,
 ) -> (Vec<T>, Option<String>) {
+    let position = position.unwrap_or(PagePosition {
+        through: state.sequence,
+        after: 0,
+    });
+    let through = position.through;
     let limit = limit as usize;
+    let mut entries: Vec<_> = entries
+        .into_iter()
+        .filter(|(sequence, _)| *sequence > position.after && *sequence <= through)
+        .take(limit + 1)
+        .collect();
     let more = entries.len() > limit;
     entries.truncate(limit);
     let next_cursor = entries.last().filter(|_| more).map(|(after, _)| {
@@ -156,7 +179,7 @@ fn page<T>(
 }
 
 /// One invocation attempt's public progress.
-fn invocation(entry: InvocationEntry) -> ExecutionInvocation {
+fn invocation(entry: InvocationRecord) -> ExecutionInvocation {
     let (progress, reason) = match entry.settlement {
         None => (InvocationProgress::Started, None),
         Some(InvocationSettlement::Action { result, .. }) => (
@@ -254,11 +277,42 @@ impl<'a> VerificationControl<'a> {
         Ok((conn, status))
     }
 
-    /// One page of queued `execution_id`'s invocation attempts, its status,
-    /// and its history projection position.
+    /// Authorize `operation` as [`Self::authorized`] does, then read the
+    /// execution's accepted state and revision as the tenant's SYSTEM
+    /// principal serving `caller`, without claiming it; an execution no
+    /// writer claimed yet has fresh state at revision 0.
     ///
-    /// Progress is read from the execution records, so it is current while
-    /// history projection lags.
+    /// # Errors
+    /// The errors of [`Self::authorized`], and
+    /// `WYRD_VALA_503_QUERY_VISIBILITY_UNAVAILABLE` when the accepted state
+    /// cannot be read now.
+    async fn accepted(
+        &self,
+        caller: &Caller,
+        execution_id: ExecutionId,
+        operation: &str,
+    ) -> Result<(ExecutionStatus, i64, ExecutionState), WyrdError> {
+        let (mut conn, status) = self
+            .authorized(caller, execution_id, Action::Read, operation)
+            .await?;
+        let query = self.records(&mut conn, caller).await?;
+        conn.commit().await.map_err(registry_db_error)?;
+        let (revision, state) = RunState::accepted(
+            self.state,
+            caller.data_tenant_id,
+            execution_id,
+            &InputResolver::new(&query, None),
+        )
+        .await?
+        .unwrap_or_else(|| (0, ExecutionState::fresh()));
+        Ok((status, revision, state))
+    }
+
+    /// One page of queued `execution_id`'s invocation attempts, its status,
+    /// and the accepted state revision it was read at.
+    ///
+    /// Progress is read from the accepted execution state, so every revision
+    /// Scribe accepted is current.
     ///
     /// # Errors
     /// Returns [`WyrdError::Validation`] for a bad limit or cursor, and the
@@ -271,38 +325,30 @@ impl<'a> VerificationControl<'a> {
     ) -> Result<InvocationPage, WyrdError> {
         let tenant = caller.data_tenant_id.as_uuid();
         let (limit, position) = position(query, tenant, execution_id, "invocations")?;
-        let (mut conn, status) = self
-            .authorized(caller, execution_id, Action::Read, LIST_INVOCATIONS)
+        let (status, revision, state) = self
+            .accepted(caller, execution_id, LIST_INVOCATIONS)
             .await?;
-        let read = self
-            .queue
-            .invocation_page(&mut conn, execution_id, position, limit + 1)
-            .await
-            .map_err(registry_db_error)?;
-        let history = self
-            .queue
-            .projection_position(&mut conn, execution_id)
-            .await
-            .map_err(registry_db_error)?;
-        conn.commit().await.map_err(registry_db_error)?;
         let (items, next_cursor) = page(
-            read.entries,
+            state
+                .invocations
+                .iter()
+                .map(|record| (record.sequence, record.clone())),
+            &state,
+            position,
             limit,
-            read.through,
             tenant,
             execution_id,
             "invocations",
         );
-        let count = |value: i64| u64::try_from(value).unwrap_or_default();
         Ok(InvocationPage {
             execution_id,
             status: status.state.status,
             items: items.into_iter().map(invocation).collect(),
             next_cursor,
             history: HistoryProjection {
-                acknowledged: count(history.acknowledged),
-                pending: count(history.pending),
-                failed: count(history.failed),
+                acknowledged: u64::try_from(revision).unwrap_or_default(),
+                pending: 0,
+                failed: 0,
             },
         })
     }
@@ -320,34 +366,32 @@ impl<'a> VerificationControl<'a> {
     ) -> Result<PublicationPage, WyrdError> {
         let tenant = caller.data_tenant_id.as_uuid();
         let (limit, position) = position(query, tenant, execution_id, "publications")?;
-        let (mut conn, _) = self
-            .authorized(caller, execution_id, Action::Read, LIST_PUBLICATIONS)
+        let (_, _, state) = self
+            .accepted(caller, execution_id, LIST_PUBLICATIONS)
             .await?;
-        let read = self
-            .queue
-            .publication_page(&mut conn, execution_id, position, limit + 1)
-            .await
-            .map_err(registry_db_error)?;
-        conn.commit().await.map_err(registry_db_error)?;
         let (items, next_cursor) = page(
-            read.entries,
+            state.publications.iter().map(|accepted| {
+                let publication = &accepted.publication;
+                (
+                    accepted.sequence,
+                    PublicationSummary {
+                        name: publication.name.clone(),
+                        kind: publication.content.kind(),
+                        producer: publication.producer.clone(),
+                        speculation: Speculation::None,
+                    },
+                )
+            }),
+            &state,
+            position,
             limit,
-            read.through,
             tenant,
             execution_id,
             "publications",
         );
         Ok(PublicationPage {
             execution_id,
-            items: items
-                .into_iter()
-                .map(|entry| PublicationSummary {
-                    name: entry.name,
-                    kind: entry.kind,
-                    producer: entry.producer,
-                    speculation: Speculation::None,
-                })
-                .collect(),
+            items,
             next_cursor,
         })
     }
@@ -515,24 +559,18 @@ impl<'a> VerificationControl<'a> {
         name: &PublicationName,
         selector: &PublicationSelector,
         operation: &str,
-    ) -> Result<StoredPublication, WyrdError> {
+    ) -> Result<AcceptedPublication, WyrdError> {
         if selector.attempt == 0 {
             return Err(invalid("attempt is one-based", "attempt"));
         }
-        let (mut conn, _) = self
-            .authorized(caller, execution_id, Action::Read, operation)
-            .await?;
-        let publications = self
-            .queue
-            .publications(&mut conn, execution_id, step)
-            .await
-            .map_err(registry_db_error)?;
-        conn.commit().await.map_err(registry_db_error)?;
-        publications
+        let (_, _, state) = self.accepted(caller, execution_id, operation).await?;
+        state
+            .publications
             .into_iter()
             .find(|stored| {
                 let publication = &stored.publication;
-                publication.name == *name
+                publication.producer.step_id == *step
+                    && publication.name == *name
                     && publication.producer.attempt == selector.attempt
                     && publication.producer.item_index == selector.item_index
                     && publication.producer.iteration_index == selector.iteration_index

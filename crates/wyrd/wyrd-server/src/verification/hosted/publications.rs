@@ -1,16 +1,16 @@
 //! Named publications of queued Verifier invocation attempts.
 //!
-//! [`Publications`] is the hosted backend a trusted caller inside one leased
+//! [`Publications`] is the hosted backend a trusted caller inside one running
 //! execution retains content through: a `/work` file or directory, or a bounded JSON value
 //! under a logical name, scoped to its producer attempt. A call that already
 //! committed recovers its stored receipt before touching scratch or storage.
 //! Otherwise content is frozen under the workspace's writer lock, each file
 //! completed as an ordinary verification File through the shared storage
-//! lifecycle, and only then named by a manifest committed under the
-//! execution's lease with each file's completed descriptor, charged to the
-//! execution's cumulative publication budget, so a publication is never
-//! visible with partial content, a stale lease commits nothing, and readers
-//! locate its bytes without rediscovery. Every refusal is a [`ToolError`]
+//! lifecycle, and only then named by a manifest accepted into the
+//! execution's [`RunState`] with each file's completed descriptor, charged
+//! to the execution's cumulative publication budget, so a publication is
+//! never visible with partial content, a writer that lost the state accepts
+//! nothing, and readers locate its bytes without rediscovery. Every refusal is a [`ToolError`]
 //! the calling Agent can read and correct.
 
 use std::sync::Arc;
@@ -25,10 +25,6 @@ use wyrd_spec::verification::execution::{
     Producer, Publication, PublicationContent, PublicationFile, PublicationKind,
     PublicationManifest,
 };
-use wyrd_sql::queries::verifier_executions::{
-    ExecutionLease, PublicationAcceptance, PublicationBudget, PublicationCall, PublicationLimit,
-    VerifierExecutionQueue,
-};
 use wyrd_storage::service::{StorageCaller, file_upload_init, reconcile_upload};
 use wyrd_storage::tenant_path;
 
@@ -39,6 +35,9 @@ use crate::components::auth::Caller;
 use crate::components::storage::inventory::ObjectInventory;
 use crate::components::storage::routes::completed_file;
 use crate::state::AppState;
+use crate::verification::state::{
+    PublicationAcceptance, PublicationBudget, PublicationCall, PublicationLimit, RunState,
+};
 
 /// One call asking to publish, as its producer attempt makes it.
 #[derive(Debug, Clone)]
@@ -51,32 +50,32 @@ pub struct PublishCall {
     pub name: PublicationName,
 }
 
-/// The publication backend of one leased execution.
+/// The publication backend of one running execution.
 pub struct Publications<'a> {
     /// Server state: storage, Postgres, and the object inventory.
     state: &'a AppState,
     /// The execution's accepted authority Files are completed as.
     caller: &'a Caller,
-    /// The lease every publication commits under.
-    lease: ExecutionLease,
+    /// The execution state every publication is accepted into.
+    run: &'a RunState,
     /// The Deployment limits in force.
     limits: HostedLimits,
 }
 
 impl<'a> Publications<'a> {
-    /// The backend of the execution `lease` holds, completing Files as
-    /// `caller`.
+    /// The backend of the execution whose state `run` writes, completing
+    /// Files as `caller`.
     #[must_use]
     pub const fn new(
         state: &'a AppState,
         caller: &'a Caller,
-        lease: ExecutionLease,
+        run: &'a RunState,
         limits: HostedLimits,
     ) -> Self {
         Self {
             state,
             caller,
-            lease,
+            run,
             limits,
         }
     }
@@ -231,14 +230,14 @@ impl<'a> Publications<'a> {
         Ok(completed.stored)
     }
 
-    /// The receipt `call` already holds, when it holds one: the stored kind
-    /// when this call committed the name with these `arguments`, a
+    /// The receipt `call` already holds, when it holds one: the accepted
+    /// kind when this call published the name with these `arguments`, a
     /// `publication_name` refusal when another call holds it, or the lost
-    /// lease. `probe` stands in for content that is only identified, never
+    /// state. `probe` stands in for content that is only identified, never
     /// stored.
     ///
     /// # Errors
-    /// Returns an invocation failure when the receipt cannot be read.
+    /// Returns an invocation failure when the arguments cannot serialize.
     async fn receipt(
         &self,
         call: &PublishCall,
@@ -247,33 +246,30 @@ impl<'a> Publications<'a> {
     ) -> Result<Option<Result<PublicationKind, ToolError>>, ToolError> {
         let digest = digest(arguments)?;
         let publication = self.publication(call, probe);
-        let mut conn = self.conn().await?;
-        let held = VerifierExecutionQueue::default()
-            .publication_receipt(
-                &mut conn,
-                self.lease,
-                PublicationCall {
-                    publication: &publication,
-                    call_id: &call.id,
-                    arguments: &digest,
-                    objects: &[],
-                    retained_bytes: 0,
-                },
-            )
-            .await
-            .map_err(|error| unavailable(&error))?;
+        let held = self
+            .run
+            .publication_receipt(PublicationCall {
+                publication: &publication,
+                call_id: &call.id,
+                arguments: &digest,
+                objects: &[],
+                retained_bytes: 0,
+            })
+            .await;
         Ok(held.map(|held| answer(call, held)))
     }
 
-    /// Commit `content` under `call`'s producer and name with the digest of
+    /// Accept `content` under `call`'s producer and name with the digest of
     /// its canonical `arguments` and the completed descriptor of each of its
-    /// manifest files, under the execution's lease and publication budget.
+    /// manifest files into the execution's state, within its publication
+    /// budget; the receipt is returned only once the state's revision is
+    /// accepted.
     ///
     /// # Errors
     /// Returns a `publication_name` refusal when another call already holds
     /// the name in this attempt, a `publication_count` or `publication_bytes`
     /// refusal when the execution's budget cannot hold it, and an invocation
-    /// failure when the lease or deadline no longer holds or the commit fails.
+    /// failure when the writer lost the state, its lease, or its deadline.
     async fn accept(
         &self,
         call: &PublishCall,
@@ -291,11 +287,9 @@ impl<'a> Publications<'a> {
         };
         let digest = digest(arguments)?;
         let publication = self.publication(call, content);
-        let mut conn = self.conn().await?;
-        let accepted = VerifierExecutionQueue::default()
+        let accepted = self
+            .run
             .accept_publication(
-                &mut conn,
-                self.lease,
                 PublicationCall {
                     publication: &publication,
                     call_id: &call.id,
@@ -308,10 +302,8 @@ impl<'a> Publications<'a> {
                     max_bytes: self.limits.files_max_bytes,
                 },
             )
-            .await
-            .map_err(|error| unavailable(&error))?;
+            .await;
         if accepted == PublicationAcceptance::Accepted {
-            conn.commit().await.map_err(|error| unavailable(&error))?;
             return Ok(publication.content.kind());
         }
         answer(call, accepted)
@@ -325,18 +317,6 @@ impl<'a> Publications<'a> {
             content,
         }
     }
-
-    /// A tenant transaction for one publication statement.
-    ///
-    /// # Errors
-    /// Returns an invocation failure when no connection is available.
-    async fn conn(&self) -> Result<wyrd_sql::TenantConn<'a>, ToolError> {
-        self.state
-            .postgres
-            .tenant_conn(self.caller.data_tenant_id)
-            .await
-            .map_err(|error| unavailable(&error))
-    }
 }
 
 /// The digest of canonical `arguments`.
@@ -347,11 +327,6 @@ fn digest(arguments: &Value) -> Result<Sha256Hex, ToolError> {
     let canonical = serde_jcs::to_vec(arguments)
         .map_err(|error| invocation(format!("the arguments cannot serialize: {error}")))?;
     Ok(Sha256Hex::digest(&canonical))
-}
-
-/// An invocation failure for a publication that could not commit.
-fn unavailable(error: &dyn std::fmt::Display) -> ToolError {
-    invocation(format!("the publication could not commit: {error}"))
 }
 
 /// A structured limit refusal of `field`, whose bound is `expected`.
@@ -399,7 +374,8 @@ fn answer(call: &PublishCall, held: PublicationAcceptance) -> Result<Publication
             "fewer retained bytes per execution".to_owned(),
         )),
         PublicationAcceptance::StaleLease | PublicationAcceptance::Accepted => Err(invocation(
-            "the execution no longer holds its lease or deadline; nothing was published".to_owned(),
+            "the execution no longer holds its state, lease, or deadline; nothing was published"
+                .to_owned(),
         )),
     }
 }

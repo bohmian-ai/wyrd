@@ -27,7 +27,7 @@ use vala_verify::blocks::{
 use wyrd_spec::card::agent::ExecutionRoute;
 use wyrd_spec::card::verifier::{Action, Check};
 use wyrd_spec::error::WyrdError;
-use wyrd_spec::ids::{CardUid, ExecutionId, SlotName};
+use wyrd_spec::ids::{CardUid, SlotName};
 use wyrd_spec::verification::TaskId;
 use wyrd_spec::verification::execution::InputDeclaration;
 
@@ -41,6 +41,7 @@ use super::workspace::Workspaces;
 use crate::components::auth::Caller;
 use crate::components::gateway::{GatewayCallContext, ServerWyrdGatewayCaller};
 use crate::state::AppState;
+use crate::verification::state::RunState;
 
 /// Most steps or checks one execution runs at once.
 // ponytail: fixed per-execution fan-out; the sandbox and workspace pools
@@ -80,9 +81,9 @@ pub struct Execution<'a> {
     /// The execution's block clock (`ExecutionTelemetry::clock`), on which
     /// the engine records every block's run interval.
     pub clock: BlockClock,
-    /// The queued execution whose publications workspaces mount; `None` for
-    /// direct verify, which accepts none.
-    pub execution: Option<ExecutionId>,
+    /// The execution state whose accepted publications workspaces mount;
+    /// `None` for an engine bound to no execution.
+    pub execution: Option<Arc<RunState>>,
 }
 
 impl HostedBlocks {
@@ -148,7 +149,7 @@ impl HostedBlocks {
             self.limits,
         );
         let evidence = Arc::new(match execution.execution {
-            Some(id) => evidence.with_execution(id),
+            Some(state) => evidence.with_execution(state),
             None => evidence,
         });
         let registry = Arc::new(TenantRegistry::new(

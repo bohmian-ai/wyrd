@@ -512,6 +512,22 @@ pub enum BifrostError {
         column: Option<String>,
     },
 
+    /// A keyed state write was refused: its writer no longer owns the state,
+    /// its revision does not follow the accepted one, or its bound passed.
+    ///
+    /// No row of the batch was accepted or will ever become visible.
+    #[error("keyed state write refused for table: {table}")]
+    #[wyrd_error(
+        code = "WYRD_VALA_409_BIFROST_STATE_REFUSED",
+        status = 409,
+        title = "Keyed state write refused",
+        remediation = "Another writer owns this state or the write's bound passed. Stop writing it; reclaim the state and recover its accepted revision before writing again."
+    )]
+    StateRefused {
+        /// Fully-qualified table name the refused write targeted.
+        table: String,
+    },
+
     /// A batch with this ID was previously attempted but failed permanently.
     #[error("duplicate failed batch: {batch_id}")]
     #[wyrd_error(

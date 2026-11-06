@@ -45,7 +45,7 @@ use wyrd_spec::verification::execution::{
     InputDeclaration, RequirementResult, StepResult, VerificationOutcome,
 };
 use wyrd_spec::verification::{DriftWindow, FrozenTarget, VerificationVerdict};
-use wyrd_sql::queries::verifier_executions::{ExecutionEvent, Submission};
+use wyrd_sql::queries::verifier_executions::Submission;
 
 use super::inputs::{GroupSelector, InputOrigin, ScheduleSelector};
 
@@ -293,7 +293,20 @@ impl<'a> ResultPayloadBuilder<'a> {
         &self,
         outcome: &VerificationOutcome,
     ) -> Result<ResultPayload, ResultPayloadError> {
-        let result_id = VerificationResultId::new_v7();
+        self.build_as(VerificationResultId::new_v7(), outcome)
+    }
+
+    /// Map `outcome` to its ordered rows under `result_id`, the identity an
+    /// execution's state already selected, so delivering a selected outcome
+    /// again writes the same result.
+    ///
+    /// # Errors
+    /// As [`Self::build`].
+    pub fn build_as(
+        &self,
+        result_id: VerificationResultId,
+        outcome: &VerificationOutcome,
+    ) -> Result<ResultPayload, ResultPayloadError> {
         let output = StoredOutput {
             requirements: &outcome.requirements,
             steps: &outcome.steps,
@@ -413,46 +426,53 @@ impl<'a> ResultPayloadBuilder<'a> {
         ])
     }
 
-    /// One committed execution event's
-    /// `bifrost.verification.execution_events` row, carrying the run's
-    /// shared dimensions and correlation columns.
+    /// One accepted revision of an execution's recoverable state as its
+    /// `bifrost.verification.execution_events` row: `sequence` is the
+    /// revision, `status` is `terminal` once an outcome is selected and
+    /// `running` before, and the value is the complete `state`. The row
+    /// carries the run's shared dimensions and correlation columns.
     ///
     /// # Errors
-    /// Returns a Variant error when a JSON publication's value cannot be
-    /// encoded, and the [`Self::finish`] errors.
-    pub fn event(&self, event: &ExecutionEvent) -> Result<ResultRow, ResultPayloadError> {
-        let int = |value: Option<i32>| Cell::Int(value.map(i64::from));
+    /// Returns a Variant error when the state cannot be encoded, and the
+    /// [`Self::finish`] errors.
+    pub fn checkpoint(
+        &self,
+        revision: i64,
+        terminal: bool,
+        state: &serde_json::Value,
+    ) -> Result<ResultRow, ResultPayloadError> {
+        let none = || Cell::text(None::<&str>);
         self.finish::<ExecutionEventsTable>(vec![
-            ("event_id", Cell::text(Some(event.event_id.to_string()))),
+            (
+                "event_id",
+                Cell::text(Some(uuid::Uuid::now_v7().to_string())),
+            ),
             (
                 "execution_id",
                 Cell::text(Some(self.run.execution_id.to_string())),
             ),
-            ("sequence", Cell::Int(Some(event.sequence))),
-            ("event", Cell::text(Some(event.event.as_str()))),
-            ("status", Cell::text(event.status.as_deref())),
+            ("sequence", Cell::Int(Some(revision))),
+            ("event", Cell::text(Some("checkpoint"))),
+            (
+                "status",
+                Cell::text(Some(if terminal { "terminal" } else { "running" })),
+            ),
             (
                 "verifier_card_uid",
                 Cell::text(Some(self.verifier_uid.as_str())),
             ),
-            ("step_id", Cell::text(event.task_id.as_deref())),
-            ("item_index", int(event.item_index)),
-            ("iteration_index", int(event.iteration_index)),
-            ("attempt", int(event.attempt)),
-            (
-                "publication_name",
-                Cell::text(event.publication_name.as_deref()),
-            ),
-            (
-                "publication_kind",
-                Cell::text(event.publication_kind.as_deref()),
-            ),
-            ("size_bytes", Cell::Int(event.size_bytes)),
-            ("file_count", int(event.file_count)),
-            ("sha256", Cell::text(event.sha256.as_deref())),
-            ("reason", Cell::text(event.reason.as_deref())),
-            (VALUE, variant(VALUE, event.value.as_ref())?),
-            ("occurred_at", time(Some(event.occurred_at))),
+            ("step_id", none()),
+            ("item_index", Cell::Int(None)),
+            ("iteration_index", Cell::Int(None)),
+            ("attempt", Cell::Int(None)),
+            ("publication_name", none()),
+            ("publication_kind", none()),
+            ("size_bytes", Cell::Int(None)),
+            ("file_count", Cell::Int(None)),
+            ("sha256", none()),
+            ("reason", none()),
+            (VALUE, variant(VALUE, Some(state))?),
+            ("occurred_at", time(Some(Utc::now()))),
         ])
     }
 

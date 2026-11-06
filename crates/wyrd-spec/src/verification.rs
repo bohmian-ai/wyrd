@@ -13,6 +13,7 @@ pub mod execution;
 pub mod ids;
 pub mod operator;
 pub mod plan;
+pub mod state;
 
 use std::collections::BTreeMap;
 

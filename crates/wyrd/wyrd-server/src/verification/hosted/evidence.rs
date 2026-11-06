@@ -14,7 +14,7 @@
 //! evidence also only when its sniffed format matches, so a mismatched file
 //! can never feed a pass. Extraction, workspaces, citations, and native media all read through
 //! it; it is also the Agent executor's [`EvidenceReader`] and the `extract`
-//! action's [`ActionExecutor`]. Bound to a queued execution, it also reads
+//! action's [`ActionExecutor`]. Bound to an execution's state, it also reads
 //! the publications that execution's steps accepted, which workspaces mount
 //! through `steps.<id>.publications` references.
 
@@ -31,7 +31,7 @@ use wyrd_loader::{EXTRACT_VERSION, Extraction, lines, locates, units};
 use wyrd_spec::auth::Sha256Hex;
 use wyrd_spec::card::verifier::{Action, InputSlot};
 use wyrd_spec::envelope::CardKind;
-use wyrd_spec::ids::{CardUid, ExecutionId, SlotName};
+use wyrd_spec::ids::{CardUid, SlotName};
 use wyrd_spec::reference::{CardRef, CardRefIdentity};
 use wyrd_spec::registry::StoredArtifactEntry;
 use wyrd_spec::storage::StoredObjectRef;
@@ -39,7 +39,7 @@ use wyrd_spec::verification::TaskId;
 use wyrd_spec::verification::execution::{
     CallProvenance, Citation, InputDeclaration, Locator, PublicationFile,
 };
-use wyrd_sql::queries::verifier_executions::{StoredPublication, VerifierExecutionQueue};
+use wyrd_spec::verification::state::AcceptedPublication;
 use wyrd_storage::error::StorageError;
 use wyrd_storage::tenant_path::{self, ValidatedPath};
 
@@ -50,6 +50,7 @@ use crate::components::auth::Caller;
 use crate::components::cards::routes::{authorize_card_ref, get_card_objects_by_ref_for};
 use crate::components::storage::inventory::ObjectInventory;
 use crate::state::AppState;
+use crate::verification::state::RunState;
 
 /// Reads one execution's pinned evidence from its tenant's storage.
 pub struct TenantEvidence {
@@ -69,9 +70,9 @@ pub struct TenantEvidence {
     artifacts: Mutex<BTreeMap<ArtifactKey, Arc<ArtifactInventory>>>,
     /// File limits in force.
     limits: HostedLimits,
-    /// The queued execution whose publications are readable; `None` for
-    /// direct verify, which accepts none.
-    execution: Option<ExecutionId>,
+    /// The execution state whose accepted publications are readable; `None`
+    /// for a reader bound to no execution.
+    execution: Option<Arc<RunState>>,
 }
 
 /// An exact Artifact reference: its identity and optional pinned UID.
@@ -100,36 +101,27 @@ impl TenantEvidence {
 
     /// This reader, bound to read the publications `execution` accepted.
     #[must_use]
-    pub const fn with_execution(mut self, execution: ExecutionId) -> Self {
+    pub fn with_execution(mut self, execution: Arc<RunState>) -> Self {
         self.execution = Some(execution);
         self
     }
 
-    /// Every publication `step` accepted in the bound execution, grouped by
-    /// item, iteration, and attempt and in acceptance order within an
-    /// attempt, each with its completed File descriptors; none without a
+    /// Every publication `step` accepted in the bound execution's state,
+    /// grouped by item, iteration, and attempt and in acceptance order within
+    /// an attempt, each with its completed File descriptors; none without a
     /// bound execution.
     ///
     /// # Errors
-    /// Returns [`BlockError::Retryable`] when the publications cannot be
-    /// read now.
-    pub async fn publications(&self, step: &TaskId) -> Result<Vec<StoredPublication>, BlockError> {
-        let Some(execution) = self.execution else {
-            return Ok(Vec::new());
-        };
-        let unavailable = |error: &dyn std::fmt::Display| BlockError::Retryable {
-            reason: format!("the step's publications cannot be read: {error}"),
-        };
-        let mut conn = self
-            .state
-            .postgres
-            .tenant_conn(self.caller.data_tenant_id)
-            .await
-            .map_err(|error| unavailable(&error))?;
-        VerifierExecutionQueue::default()
-            .publications(&mut conn, execution, step)
-            .await
-            .map_err(|error| unavailable(&error))
+    /// Never fails: the accepted state is held in memory. The result keeps
+    /// the workspace's fallible read shape.
+    pub async fn publications(
+        &self,
+        step: &TaskId,
+    ) -> Result<Vec<AcceptedPublication>, BlockError> {
+        Ok(match &self.execution {
+            Some(state) => state.publications(step).await,
+            None => Vec::new(),
+        })
     }
 
     /// The verified bytes of one file a publication retains, read from the

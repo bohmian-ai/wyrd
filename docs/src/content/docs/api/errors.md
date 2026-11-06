@@ -474,6 +474,7 @@ This page is generated from the error definitions in the Wyrd source.
 | `WYRD_VALA_409_BIFROST_DUPLICATE_FAILED_BATCH` | 409 | Duplicate batch previously failed | This batch_id was committed but the write failed. Use a new batch_id to retry. |
 | `WYRD_VALA_409_BIFROST_FINGERPRINT_MISMATCH` | 409 | Schema fingerprint mismatch | The Arrow schema does not match the registered table schema. Evolve the schema explicitly. |
 | `WYRD_VALA_409_BIFROST_LAYOUT_MISMATCH` | 409 | Bifrost physical layout mismatch | Retry with the table's registered physical layout or register a different table. |
+| `WYRD_VALA_409_BIFROST_STATE_REFUSED` | 409 | Keyed state write refused | Another writer owns this state or the write's bound passed. Stop writing it; reclaim the state and recover its accepted revision before writing again. |
 | `WYRD_VALA_409_BIFROST_TABLE_VERSION_CONFLICT` | 409 | Stale table version | The table's definition changed. Describe the table again and build a new batch from the returned table_version. |
 | `WYRD_VALA_409_BIFROST_TABLE_VERSION_EXHAUSTED` | 409 | Table version exhausted | The table is at version 9223372036854775807 and accepts no further edits. Register a new table for the changed definition. |
 | `WYRD_VALA_409_RUNNING_QUERY_CONFLICT` | 409 | Running query ownership conflict | Do not retry cancellation automatically; investigate the contradictory Oracle owners. |

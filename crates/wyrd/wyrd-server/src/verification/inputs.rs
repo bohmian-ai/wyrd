@@ -252,6 +252,35 @@ impl<'q> InputResolver<'q> {
         Ok(rows.into_values().next())
     }
 
+    /// The value of `execution`'s state at exactly `revision`, `None` while
+    /// that revision is not visible.
+    ///
+    /// Only the exact revision is read: an earlier one is never returned in
+    /// its place, so a revision still held by an unreachable writer reads as
+    /// not visible rather than as older state.
+    ///
+    /// # Errors
+    /// Returns the query refusal or failure, and an internal error when the
+    /// stored row is malformed.
+    pub async fn state(
+        &self,
+        execution: ExecutionId,
+        revision: i64,
+    ) -> Result<Option<Value>, WyrdError> {
+        let batches = self
+            .rows(&format!(
+                "SELECT value FROM bifrost.verification.execution_events \
+                 WHERE execution_id = {} AND sequence = {revision}",
+                quote(&execution.to_string())
+            ))
+            .await?;
+        batches
+            .iter()
+            .find(|batch| batch.num_rows() > 0)
+            .map(|batch| variant(batch, "value", 0))
+            .transpose()
+    }
+
     /// The evidence `row` judges: a supplied record's declarations, a
     /// group's resolved slot lists, or a schedule's empty map. `None` while a
     /// group source's input or selected output is not visible.

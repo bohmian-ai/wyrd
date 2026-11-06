@@ -36,22 +36,10 @@ use wyrd_spec::ids::{
 };
 use wyrd_spec::vala::ids::{RunId, SpanId, TraceId};
 use wyrd_spec::verification::TaskId;
-use wyrd_spec::verification::execution::{
-    InvocationSettlement, Producer, VerificationExecutionState, VerificationRequest,
-};
+use wyrd_spec::verification::execution::{VerificationExecutionState, VerificationRequest};
 use wyrd_spec::verification::{
     DriftWindow, FrozenTarget, GroupEndSettings, OperatorDispatchState, VerificationBindingStatus,
     VerificationError, VerificationVerdict, VerifierReadiness,
-};
-
-mod events;
-mod inspection;
-mod publications;
-
-pub use events::{EventBatch, ExecutionEvent, ProjectionPosition};
-pub use inspection::{InvocationEntry, Page, PagePosition, PublicationEntry};
-pub use publications::{
-    PublicationAcceptance, PublicationBudget, PublicationCall, PublicationLimit, StoredPublication,
 };
 
 use crate::queries::verification::{BindingSchedule, InactivityTimeout, binding_activity};
@@ -387,7 +375,7 @@ const ADVANCE_EXPECTED_CURSOR_SQL: &str = r"
 /// A claim skips any execution whose `worker_format` is newer, so a record
 /// written for newer checkpoint semantics is left for a worker that can run
 /// it instead of being misread during a rolling upgrade.
-const WORKER_FORMAT: i32 = 1;
+const WORKER_FORMAT: i32 = 2;
 
 /// Claim up to `$3` of the oldest due, retry-due, or lease-expired executions,
 /// each under its own fresh lease, in one statement.
@@ -468,8 +456,8 @@ const CLAIM_SQL: &str = r"
               e.trigger_digest, e.window_start, e.window_end,
               e.run_id,
               e.sub_principal_id, e.act_principal_id, e.authority, e.attempts,
-              e.max_attempts, e.lease_expires_at, e.cause_trace_id, e.cause_span_id,
-              e.cause_sampled, e.group_id, e.deployment_environment,
+              e.max_attempts, e.lease_expires_at, e.deadline_at, e.cause_trace_id,
+              e.cause_span_id, e.cause_sampled, e.group_id, e.deployment_environment,
               GREATEST(0, (EXTRACT(EPOCH FROM statement_timestamp() - candidate.due_at)
                            * 1000)::bigint) AS queue_wait_ms,
               GREATEST(0, (EXTRACT(EPOCH FROM statement_timestamp() - e.created_at)
@@ -656,63 +644,6 @@ const INACTIVE_PRINCIPALS_SQL: &str = r"
     SELECT id FROM users WHERE status <> 'active'
     UNION
     SELECT id FROM machines WHERE status <> 'active'
-";
-
-/// Read every recorded invocation attempt of one execution, settled or not,
-/// in task and attempt order, through the invocation identity index.
-const INVOCATIONS_SQL: &str = r"
-    SELECT task_id, attempt, settlement
-      FROM wyrd.verifier_execution_invocations
-     WHERE execution_id = $1
-     ORDER BY task_id, attempt
-";
-
-/// Record that task `$3` starts attempt `$4` of a leased execution, before
-/// the attempt is dispatched, while its lease and deadline hold on the
-/// database clock.
-///
-/// The execution row is locked `FOR NO KEY UPDATE`, which every writer that
-/// allocates a page `sequence` of the execution takes before allocating it
-/// and holds to commit, so the execution's sequences commit in order and a
-/// page cut never later gains a lower one. A concurrent reclaim either waits
-/// for this insert or makes it insert nothing.
-const BEGIN_INVOCATION_SQL: &str = r"
-    INSERT INTO wyrd.verifier_execution_invocations
-        (data_tenant_id, execution_id, task_id, attempt, started_at)
-    SELECT e.data_tenant_id, e.execution_id, $3, $4, statement_timestamp()
-      FROM wyrd.verifier_executions e
-     WHERE e.execution_id = $1 AND e.lease_token = $2 AND e.status = 'running'
-       AND e.lease_expires_at > statement_timestamp()
-       AND e.deadline_at > statement_timestamp()
-       FOR NO KEY UPDATE
-";
-
-/// Remove unsettled attempt `$4` of task `$3`, refused capacity before it ran,
-/// under the execution's unexpired lease, with the execution row
-/// share-locked so a concurrent reclaim waits for it.
-const FORGET_INVOCATION_SQL: &str = r"
-    DELETE FROM wyrd.verifier_execution_invocations i
-     USING (SELECT execution_id FROM wyrd.verifier_executions
-             WHERE execution_id = $1 AND lease_token = $2 AND status = 'running'
-               AND lease_expires_at > statement_timestamp()
-               FOR SHARE) e
-     WHERE i.execution_id = e.execution_id AND i.task_id = $3 AND i.attempt = $4
-       AND i.item_index IS NULL AND i.iteration_index IS NULL
-       AND i.settlement IS NULL
-";
-
-/// Settle attempt `$4` of task `$3` with `$5`, once, under the execution's
-/// unexpired lease, share-locked as [`FORGET_INVOCATION_SQL`] does.
-const SETTLE_INVOCATION_SQL: &str = r"
-    UPDATE wyrd.verifier_execution_invocations i
-       SET settlement = $5, settled_at = statement_timestamp()
-      FROM (SELECT execution_id FROM wyrd.verifier_executions
-             WHERE execution_id = $1 AND lease_token = $2 AND status = 'running'
-               AND lease_expires_at > statement_timestamp()
-               FOR SHARE) e
-     WHERE i.execution_id = e.execution_id AND i.task_id = $3 AND i.attempt = $4
-       AND i.item_index IS NULL AND i.iteration_index IS NULL
-       AND i.settlement IS NULL
 ";
 
 /// Read one execution's control-plane status.
@@ -1575,6 +1506,15 @@ impl PinnedGroup {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct LeaseToken(pub(crate) Uuid);
 
+impl LeaseToken {
+    /// The token's value, which identifies this claim as the only writer of
+    /// the execution's recoverable state.
+    #[must_use]
+    pub const fn as_uuid(&self) -> Uuid {
+        self.0
+    }
+}
+
 /// The identity a runner settles a claimed execution with.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ExecutionLease {
@@ -1607,6 +1547,9 @@ pub struct ClaimedExecution {
     pub lease: ExecutionLease,
     /// When the lease expires and the execution becomes reclaimable.
     pub lease_expires_at: DateTime<Utc>,
+    /// The execution deadline its first claim fixed on the PostgreSQL clock;
+    /// a reclaim or renewal never moves it.
+    pub deadline_at: DateTime<Utc>,
     /// This attempt's number, starting at 1.
     pub attempt: i32,
     /// Attempt budget frozen at admission.
@@ -1657,45 +1600,6 @@ pub struct ClaimedExecution {
     /// unchanged to its result rows; `None` when it carried none. Never an
     /// execution input.
     pub deployment_environment: Option<String>,
-}
-
-/// One recorded attempt of one block invocation of an execution.
-#[derive(Debug, Clone, PartialEq)]
-pub struct Invocation {
-    /// The step or requirement invoked.
-    pub task: TaskId,
-    /// The one-based attempt.
-    pub attempt: u32,
-    /// Its committed settlement; `None` when the attempt was dispatched and
-    /// never settled, so its outcome is unknown.
-    pub settlement: Option<InvocationSettlement>,
-}
-
-/// A stored producer identity.
-///
-/// # Errors
-/// Returns a decode error when an identity or index is malformed.
-fn producer(
-    task: String,
-    item: Option<i32>,
-    iteration: Option<i32>,
-    attempt: i32,
-) -> Result<Producer, SqlxError> {
-    let index = |index: Option<i32>| index.map(u32::try_from).transpose();
-    Ok(Producer {
-        step_id: stored(TaskId::new(task))?,
-        item_index: stored(index(item))?,
-        iteration_index: stored(index(iteration))?,
-        attempt: stored(u32::try_from(attempt))?,
-    })
-}
-
-/// A producer's zero-based index or one-based attempt as its SQL integer.
-///
-/// # Errors
-/// Returns an encode error when the value exceeds `INTEGER`.
-fn column(value: u32) -> Result<i32, SqlxError> {
-    i32::try_from(value).map_err(|error| SqlxError::Encode(Box::new(error)))
 }
 
 /// Outcome of a token-fenced settlement.
@@ -3230,10 +3134,10 @@ impl VerifierExecutionQueue {
 
     /// Cancel `execution` if it is still unfinished.
     ///
-    /// The execution settles `cancelled` with no result and keeps its recorded
-    /// invocations and publications. A worker holding its lease is fenced:
-    /// its renewal, checkpoints, publications, and settlement all report
-    /// [`Settlement::StaleLease`] and it stops. Cancelling a settled or
+    /// The execution settles `cancelled` with no result and keeps its
+    /// recorded state. A worker holding its lease is fenced: its renewal and
+    /// settlement report [`Settlement::StaleLease`], and a lease confirmation
+    /// before each state revision stops it. Cancelling a settled or
     /// unknown execution writes nothing, so repeating a cancel is harmless.
     /// Returns whether this call cancelled it. The caller authorizes first
     /// and commits.
@@ -3288,118 +3192,6 @@ impl VerifierExecutionQueue {
                 .execute(&mut **conn.transaction())
                 .await?;
             Ok(result.rows_affected())
-        })
-        .await
-    }
-
-    /// Every recorded invocation attempt of `execution`, settled or not, in
-    /// task and attempt order.
-    ///
-    /// # Errors
-    /// Returns the database error when the read fails, or a decode error when
-    /// a stored task identity, attempt, or settlement is malformed.
-    pub async fn invocations(
-        &self,
-        conn: &mut TenantConn<'_>,
-        execution: ExecutionId,
-    ) -> Result<Vec<Invocation>, SqlxError> {
-        timed("invocations", async {
-            let rows: Vec<(String, i32, Option<Json<InvocationSettlement>>)> =
-                sqlx::query_as(INVOCATIONS_SQL)
-                    .bind(execution.as_uuid())
-                    .fetch_all(&mut **conn.transaction())
-                    .await?;
-            rows.into_iter()
-                .map(|(task, attempt, settlement)| {
-                    Ok(Invocation {
-                        task: stored(TaskId::new(task))?,
-                        attempt: stored(u32::try_from(attempt))?,
-                        settlement: settlement.map(|settlement| settlement.0),
-                    })
-                })
-                .collect()
-        })
-        .await
-    }
-
-    /// Record that `task` starts its one-based `attempt` under `lease`,
-    /// before the attempt is dispatched.
-    ///
-    /// # Errors
-    /// Returns the database error when the insert fails, including a unique
-    /// violation when the attempt was already recorded.
-    #[tracing::instrument(skip(self, conn), fields(operation = "verification.executions.begin_invocation", execution_id = %lease.execution_id))]
-    pub async fn begin_invocation(
-        &self,
-        conn: &mut TenantConn<'_>,
-        lease: ExecutionLease,
-        task: &TaskId,
-        attempt: u32,
-    ) -> Result<Settlement, SqlxError> {
-        timed("begin_invocation", async {
-            let result = sqlx::query(BEGIN_INVOCATION_SQL)
-                .bind(lease.execution_id.as_uuid())
-                .bind(lease.token.0)
-                .bind(task.as_str())
-                .bind(i64::from(attempt))
-                .execute(&mut **conn.transaction())
-                .await?;
-            Ok(settlement(result.rows_affected()))
-        })
-        .await
-    }
-
-    /// Remove `task`'s unsettled `attempt` under `lease`, because it was
-    /// refused capacity before it was dispatched and spends nothing.
-    ///
-    /// # Errors
-    /// Returns the database error when the delete fails.
-    #[tracing::instrument(skip(self, conn), fields(operation = "verification.executions.forget_invocation", execution_id = %lease.execution_id))]
-    pub async fn forget_invocation(
-        &self,
-        conn: &mut TenantConn<'_>,
-        lease: ExecutionLease,
-        task: &TaskId,
-        attempt: u32,
-    ) -> Result<Settlement, SqlxError> {
-        timed("forget_invocation", async {
-            let result = sqlx::query(FORGET_INVOCATION_SQL)
-                .bind(lease.execution_id.as_uuid())
-                .bind(lease.token.0)
-                .bind(task.as_str())
-                .bind(i64::from(attempt))
-                .execute(&mut **conn.transaction())
-                .await?;
-            Ok(settlement(result.rows_affected()))
-        })
-        .await
-    }
-
-    /// Commit `settled` as the outcome of `task`'s `attempt` under `lease`.
-    /// An attempt settles once; a stale lease or an already settled attempt
-    /// changes nothing and is [`Settlement::StaleLease`].
-    ///
-    /// # Errors
-    /// Returns the database error when the update fails.
-    #[tracing::instrument(skip(self, conn, settled), fields(operation = "verification.executions.settle_invocation", execution_id = %lease.execution_id))]
-    pub async fn settle_invocation(
-        &self,
-        conn: &mut TenantConn<'_>,
-        lease: ExecutionLease,
-        task: &TaskId,
-        attempt: u32,
-        settled: &InvocationSettlement,
-    ) -> Result<Settlement, SqlxError> {
-        timed("settle_invocation", async {
-            let result = sqlx::query(SETTLE_INVOCATION_SQL)
-                .bind(lease.execution_id.as_uuid())
-                .bind(lease.token.0)
-                .bind(task.as_str())
-                .bind(i64::from(attempt))
-                .bind(Json(settled))
-                .execute(&mut **conn.transaction())
-                .await?;
-            Ok(settlement(result.rows_affected()))
         })
         .await
     }
@@ -3775,6 +3567,8 @@ struct ClaimedRow {
     max_attempts: i32,
     /// Lease expiry.
     lease_expires_at: DateTime<Utc>,
+    /// The execution deadline the first claim fixed.
+    deadline_at: DateTime<Utc>,
     /// Submitting request's trace id, 16 bytes.
     cause_trace_id: Option<Vec<u8>>,
     /// Submitting request's span id, 8 bytes.
@@ -3829,6 +3623,7 @@ impl ClaimedRow {
                 token: LeaseToken(self.lease_token),
             },
             lease_expires_at: self.lease_expires_at,
+            deadline_at: self.deadline_at,
             attempt: self.attempts,
             max_attempts: self.max_attempts,
             verifier_card_uid: stored(CardUid::from_uuid(self.verifier_card_uid))?,

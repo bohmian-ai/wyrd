@@ -2019,21 +2019,21 @@ fn sent_values(sent: &SentBatch, column: &str) -> std::collections::BTreeSet<Str
 }
 
 /// An attempt whose result was staged but whose settlement never commits
-/// loses to the reclaiming attempt: each produced result carries its own
-/// identity, the execution selects the winner's, and its status read returns
-/// the winner's verdict, never the abandoned attempt's output.
+/// hands its selected result to the reclaiming attempt: the reclaim runs no
+/// engine, re-delivers the result under the same identity, and the status
+/// read returns that selected verdict.
 ///
 /// A test-only deferred constraint trigger fails every completing commit made
 /// under the first attempt's lease token, so its result reaches Scribe while
-/// its settlement rolls back; the lease is then expired and a fresh runner
-/// reclaims and completes the execution with a different verdict.
+/// its settlement rolls back; the lease is then expired and a fresh runner,
+/// scripted with a different verdict, reclaims and completes the execution.
 ///
 /// # Panics
 /// Panics when the fault cannot be installed, the execution does not complete
-/// on its reclaim, the attempts share a result identity, or the status read
-/// returns the abandoned attempt's outcome.
+/// on its reclaim, the reclaim runs its engine or mints another result
+/// identity, or the status read returns another outcome.
 #[tokio::test]
-async fn reclaimed_attempt_after_a_failed_settlement_selects_its_own_result() {
+async fn reclaimed_attempt_after_a_failed_settlement_redelivers_the_selected_result() {
     let harness = Harness::start().await;
     let abandoned = EngineScript::default();
     abandoned.hold();
@@ -2080,16 +2080,20 @@ async fn reclaimed_attempt_after_a_failed_settlement_selects_its_own_result() {
     stale.stop().await;
     fresh.stop().await;
 
+    assert_eq!(winner.entered(), 0, "the reclaim runs no engine");
     let summaries = sent_to(&harness.fault, RESULTS).await;
-    assert_eq!(summaries.len(), 2, "both attempts published a summary");
-    let (lost, won) = (sent_result_id(&summaries[0]), sent_result_id(&summaries[1]));
-    assert_ne!(lost, won, "each produced result has its own identity");
-    assert_eq!(row.result_id.map(|id| id.to_string()), Some(won.clone()));
+    assert_eq!(summaries.len(), 2, "both attempts delivered the summary");
+    let (first, again) = (sent_result_id(&summaries[0]), sent_result_id(&summaries[1]));
+    assert_eq!(
+        first, again,
+        "the reclaim re-delivers the selected identity"
+    );
+    assert_eq!(row.result_id.map(|id| id.to_string()), Some(first.clone()));
     let outputs = sent_to(&harness.fault, OUTPUTS).await;
     assert_eq!(
         outputs.iter().map(sent_result_id).collect::<Vec<_>>(),
-        [lost, won],
-        "each attempt wrote one output under its own result identity"
+        [first.clone(), first],
+        "each delivery wrote the output under the selected identity"
     );
 
     harness.durable_rows().await;
@@ -2117,8 +2121,8 @@ async fn reclaimed_attempt_after_a_failed_settlement_selects_its_own_result() {
         .expect("status body reads");
     let state: serde_json::Value = serde_json::from_slice(&body).expect("status is JSON");
     assert_eq!(
-        state["result"]["outcome"]["verdict"], "inconclusive",
-        "the winner's verdict is read: {state}"
+        state["result"]["outcome"]["verdict"], "failed",
+        "the selected verdict is read: {state}"
     );
 }
 
@@ -2584,9 +2588,10 @@ impl Harness {
 /// acknowledgement: while that record's Scribe write is held, the pass has
 /// staged the run but no queue row exists, the cursor stays due, another
 /// queued execution's admission does not admit it, and a later pass does not
-/// prepare the occurrence again; a direct execution still returns. Once the
-/// write is released, the run is admitted under its staged identity and the
-/// cursor moves to the tick's next occurrence in the same commit.
+/// prepare the occurrence again. Once the write is released, a direct
+/// execution racing it returns with its state accepted, the run is admitted
+/// under its staged identity, and the cursor moves to the tick's next
+/// occurrence in the same commit.
 ///
 /// # Panics
 /// Panics when a run exists before its input is acknowledged, the cursor
@@ -2657,21 +2662,24 @@ async fn queued_origins_require_their_own_input_ack() {
         "direct-caller",
     )
     .await;
-    let direct = traced_execute(
-        &harness.server,
-        Some(&jwt),
-        (&verifier, &subject),
-        "00-0af7651916cd43dd8448eb211c80319c-b7ad6b7169203331-01",
-    )
-    .await;
+    let (direct, ()) = tokio::join!(
+        traced_execute(
+            &harness.server,
+            Some(&jwt),
+            (&verifier, &subject),
+            "00-0af7651916cd43dd8448eb211c80319c-b7ad6b7169203331-01",
+        ),
+        async {
+            stall.release();
+            stall.wait_completed().await;
+        }
+    );
     assert_eq!(
         direct,
         axum::http::StatusCode::OK,
-        "a direct execution returns while a queued input is held"
+        "a direct execution racing a held queued input returns once Scribe accepts its state"
     );
 
-    stall.release();
-    stall.wait_completed().await;
     harness
         .server
         .flush_bifrost()
@@ -4497,16 +4505,17 @@ async fn grpc_health_answers(server: &WyrdTestServer) {
 ///
 /// The role-separated cluster boots its Oracle pods while its only Scribe pod
 /// is held back, so the Oracle pod's peer route reaches no Scribe. Traced
-/// executions continue a sampled caller until the Scribe-outbox loss counter
-/// rises, proving copies past the permit pool are dropped at once; each also
-/// stages its Verifier result, and HTTP, gRPC, and MCP keep answering. Once
-/// the Scribe pod joins, that same outbox drains: exactly the permitted copies
-/// and every result publish, and one later copy is accepted with no loss.
+/// reads continue a sampled caller until the Scribe-outbox loss counter
+/// rises, proving copies past the permit pool are dropped at once, while
+/// HTTP, gRPC, and MCP keep answering. Once the Scribe pod joins, that same
+/// outbox drains: exactly the permitted copies publish, and a later traced
+/// execution, whose result Bifrost must accept before it returns, publishes
+/// its result and a copy with no loss.
 ///
 /// # Panics
 /// Panics when the cluster or seeding fails, a request is refused, the cap
-/// does not hold, a result is lost, the outbox does not drain, or the later
-/// copy is dropped.
+/// does not hold, the outbox does not drain, or the later result or copy is
+/// dropped.
 #[tokio::test]
 async fn sustained_scribe_outage_caps_tenant_spans() {
     use wyrd_testing::bifrost::cluster::{BifrostClusterSpec, WyrdTestCluster};
@@ -4533,13 +4542,19 @@ async fn sustained_scribe_outage_caps_tenant_spans() {
             "the tenant span cap never dropped a copy"
         );
         requests += 1;
-        let status = traced_execute(
-            oracle,
-            Some(&jwt),
-            (&verifier, &subject),
-            &format!("00-{OUTAGE_TRACE}-{requests:016x}-01"),
-        )
-        .await;
+        let request = axum::http::Request::builder()
+            .uri("/v1/cards")
+            .header(
+                "traceparent",
+                format!("00-{OUTAGE_TRACE}-{requests:016x}-01"),
+            )
+            .body(axum::body::Body::empty())
+            .expect("read request builds");
+        let status = oracle
+            .oneshot_authenticated(&jwt, request)
+            .await
+            .expect("read request responds")
+            .status();
         assert!(status.is_success(), "request {requests}: {status}");
     }
     assert!(
@@ -4578,12 +4593,6 @@ async fn sustained_scribe_outage_caps_tenant_spans() {
         SPAN_PERMITS,
         "exactly the permitted copies publish"
     );
-    assert_eq!(
-        published_rows(&assertion, tenant, RESULTS).await,
-        i64::try_from(requests).expect("a small count"),
-        "every Verifier result staged during the outage publishes"
-    );
-
     let lost_after_recovery = lost_scribe_writes(&cluster);
     let status = traced_execute(
         oracle,
@@ -4595,6 +4604,11 @@ async fn sustained_scribe_outage_caps_tenant_spans() {
     assert!(status.is_success(), "{status}");
     assert_eq!(outbox.settle(std::time::Instant::now() + WAIT).await, 0);
     scribe_pod.flush_bifrost().await.expect("Scribe flushes");
+    assert_eq!(
+        published_rows(&assertion, tenant, RESULTS).await,
+        1,
+        "the accepted execution's result publishes"
+    );
     let recovered = oracle
         .retained_span_records(tenant, "name", &format!("trace_id = X'{RECOVERED_TRACE}'"))
         .await

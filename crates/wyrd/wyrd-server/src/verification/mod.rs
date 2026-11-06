@@ -20,15 +20,15 @@ pub mod fault;
 pub mod fitter;
 pub mod groups;
 pub mod health;
-mod history;
 pub mod hosted;
 pub mod inputs;
-mod leases;
+pub mod leases;
 pub mod operators;
 pub mod permits;
 pub mod results;
 pub mod runner;
 pub mod scheduler;
+pub mod state;
 pub mod submissions;
 pub mod telemetry;
 

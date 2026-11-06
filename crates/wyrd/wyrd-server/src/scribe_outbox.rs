@@ -75,7 +75,8 @@ use uuid::Uuid;
 use vala_bifrost_redux::catalog::TableRef;
 use vala_bifrost_redux::cluster::ClusterRegistry;
 use vala_bifrost_redux::contracts::{
-    CanonicalIngress, IngressPayload, Scribe, ScribeError, ScribeIngressFrame, StampedAttribution,
+    CanonicalIngress, IngressPayload, Scribe, ScribeError, ScribeIngressFrame, ScribeStateAdvance,
+    StampedAttribution,
 };
 use vala_bifrost_redux::gate::attribution::{CardRegistry, batch_card_uids, native_card_uids};
 use vala_bifrost_redux::namespaces::BifrostNamespace;
@@ -105,8 +106,8 @@ use wyrd_tonic::otlp::trace::v1::ResourceSpans;
 use wyrd_tonic::prost::Message as _;
 use wyrd_tonic::tonic::Code;
 use wyrd_tonic::tonic::transport::Channel;
-use wyrd_tonic::wyrd::v1::IngestCaptureRequest;
 use wyrd_tonic::wyrd::v1::scribe_capture_peer_service_client::ScribeCapturePeerServiceClient;
+use wyrd_tonic::wyrd::v1::{IngestCaptureRequest, IngestCaptureState};
 
 use crate::components::gateway::CallCapture;
 use crate::verification::results::{ResultPayload, ResultRow};
@@ -262,23 +263,26 @@ pub enum ScribeWrite {
         /// slice by reference.
         acked: Mutex<Option<oneshot::Sender<()>>>,
     },
-    /// One persisted batch of a tenant's Verifier execution events, staged
-    /// as `bifrost.verification.execution_events` rows.
+    /// One revision of a Verifier execution's recoverable state, staged as
+    /// its `bifrost.verification.execution_events` row.
     ///
-    /// The batch is its own frame, identified by `batch` rather than by the
-    /// slice, and each event travels as its own Scribe batch identified by
-    /// `batch` and its position, so every submission of an event, by any
-    /// process at any request ceiling, carries one identity and Scribe's
-    /// batch-id dedup absorbs a resubmission.
-    ExecutionEvents {
-        /// The persisted batch identity.
+    /// The revision is its own frame and its own Scribe batch, identified by
+    /// `batch` rather than by the slice, so every submission of it carries
+    /// one identity and Scribe's batch-id dedup absorbs a resubmission. The
+    /// batch carries `state`, so Scribe accepts it only from the state's
+    /// current writer at exactly the next revision; other executions'
+    /// revisions in the slice keep their own acceptance.
+    ExecutionState {
+        /// The revision's batch identity.
         batch: Uuid,
-        /// Each event's row and the execution's subject and actor, which
-        /// Scribe stamps on it, in sequence order.
-        rows: Vec<(StagedRow, Attribution)>,
-        /// Fired once Scribe acknowledges the whole batch, and only then; a
-        /// rejected, unprojectable, or dropped write drops the sender
-        /// instead.
+        /// The revision's row.
+        row: StagedRow,
+        /// The execution's subject and actor, which Scribe stamps on the row.
+        attribution: Attribution,
+        /// The writer's claim to advance the state to this revision.
+        state: ScribeStateAdvance,
+        /// Fired once Scribe accepts the revision, and only then; a refused,
+        /// unprojectable, or dropped write drops the sender instead.
         acked: Mutex<Option<oneshot::Sender<()>>>,
     },
 }
@@ -468,14 +472,13 @@ impl ScribeWrite {
                 attribution: *attribution,
                 part: Part::Row(row.clone()),
             }]),
-            Self::ExecutionEvents { rows, .. } => Ok(rows
-                .iter()
-                .map(|(row, attribution)| Rows {
-                    table: ScribeTable::ExecutionEvents,
-                    attribution: *attribution,
-                    part: Part::Row(row.clone()),
-                })
-                .collect()),
+            Self::ExecutionState {
+                row, attribution, ..
+            } => Ok(vec![Rows {
+                table: ScribeTable::ExecutionEvents,
+                attribution: *attribution,
+                part: Part::Row(row.clone()),
+            }]),
         }
     }
 
@@ -501,7 +504,7 @@ impl ScribeWrite {
             | Self::Capture(_)
             | Self::ServerSpans { .. }
             | Self::Object { .. }
-            | Self::ExecutionEvents { .. } => {
+            | Self::ExecutionState { .. } => {
                 return None;
             }
         };
@@ -536,7 +539,8 @@ pub enum ScribeTable {
     ExecutionInputs,
     /// `bifrost.storage.objects`, one row per completed or deleted object.
     Objects,
-    /// `bifrost.verification.execution_events`, one row per execution event.
+    /// `bifrost.verification.execution_events`, one row per accepted
+    /// revision of an execution's recoverable state.
     ExecutionEvents,
 }
 
@@ -732,6 +736,9 @@ pub(crate) struct ScribeBatch {
     pub(crate) batch_id: Uuid,
     /// Request the frame is admitted under.
     pub(crate) request_id: RequestId,
+    /// The keyed state advance Scribe accepts the batch under; `None` for
+    /// every table that is not state-fenced.
+    pub(crate) state: Option<ScribeStateAdvance>,
     /// The rows; every row but an audit decision carries the subject and
     /// actor Scribe stamps on it.
     pub(crate) payload: FramePayload,
@@ -795,7 +802,7 @@ impl ScribeBatch {
             table: self.table.table_ref(),
             expected_schema_fingerprint: None,
             table_version: None,
-            state: None,
+            state: self.state,
             request_id: self.request_id,
             batch_id: self.batch_id,
             measured_wire_bytes,
@@ -902,6 +909,12 @@ impl ScribePeers {
                 batch_id: batch.batch_id.to_string(),
                 request_id: batch.request_id.as_str().to_owned(),
                 arrow_ipc: ipc.clone(),
+                state: batch.state.map(|state| IngestCaptureState {
+                    key: state.key.to_string(),
+                    writer: state.writer.to_string(),
+                    revision: state.revision,
+                    not_after_unix_micros: state.not_after.map(|at| at.timestamp_micros()),
+                }),
             })
             .await
             .map(|_| ())
@@ -1166,6 +1179,8 @@ struct Frame {
     /// replaces the slice's idempotency key and position in its batch ids;
     /// `None` for a frame shared by the slice's writes.
     key: Option<Uuid>,
+    /// The keyed state advance a one-write frame carries; `None` otherwise.
+    state: Option<ScribeStateAdvance>,
     /// Destination table.
     table: ScribeTable,
     /// The rows, all of one schema.
@@ -1193,6 +1208,7 @@ impl Frame {
             }
             None => frames.push(Self {
                 key: None,
+                state: None,
                 table,
                 parts: vec![part],
                 owners,
@@ -1214,6 +1230,7 @@ impl Frame {
     fn chunk(&self, first: usize, rows: usize, parts: Vec<Part>) -> Chunk {
         Chunk {
             table: self.table,
+            state: self.state,
             parts,
             owners: self.owners[first..first + rows].to_vec(),
         }
@@ -1246,18 +1263,21 @@ impl ScribeSink {
                 captures.push((index, capture));
                 continue;
             }
-            if let ScribeWrite::ExecutionEvents { batch, rows, .. } = item {
-                if !rows.is_empty() {
-                    frames.push(Frame {
-                        key: Some(*batch),
-                        table: ScribeTable::ExecutionEvents,
-                        parts: rows.iter().map(|(row, _)| Part::Row(row.clone())).collect(),
-                        owners: rows
-                            .iter()
-                            .map(|(_, attribution)| (index, *attribution))
-                            .collect(),
-                    });
-                }
+            if let ScribeWrite::ExecutionState {
+                batch,
+                row,
+                attribution,
+                state,
+                ..
+            } = item
+            {
+                frames.push(Frame {
+                    key: Some(*batch),
+                    state: Some(*state),
+                    table: ScribeTable::ExecutionEvents,
+                    parts: vec![Part::Row(row.clone())],
+                    owners: vec![(index, *attribution)],
+                });
                 continue;
             }
             let rows = match item.rows() {
@@ -1352,6 +1372,8 @@ impl ScribeSink {
 struct Chunk {
     /// Destination table.
     table: ScribeTable,
+    /// The keyed state advance the chunk's batch carries.
+    state: Option<ScribeStateAdvance>,
     /// The staged rows and projected batches holding the chunk's rows, in
     /// row order.
     parts: Vec<Part>,
@@ -1555,6 +1577,7 @@ impl Chunk {
             table: self.table,
             batch_id,
             request_id,
+            state: self.state,
             payload,
         }
     }
@@ -1758,7 +1781,7 @@ impl OutboxSink for ScribeSink {
             ScribeWrite::Object { row, .. } => row.text("storage_path"),
             ScribeWrite::Audit(None)
             | ScribeWrite::ServerSpans { .. }
-            | ScribeWrite::ExecutionEvents { .. } => None,
+            | ScribeWrite::ExecutionState { .. } => None,
         };
         key.map_or(0, |key| {
             let mut hasher = DefaultHasher::new();
@@ -1779,9 +1802,8 @@ impl OutboxSink for ScribeSink {
                 payload.rows().iter().map(ResultRow::owned_bytes).sum()
             }
             ScribeWrite::ExecutionInputs { row, .. } => row.owned_bytes(),
-            ScribeWrite::Object { row, .. } => row.owned_bytes(),
-            ScribeWrite::ExecutionEvents { rows, .. } => {
-                rows.iter().map(|(row, _)| row.owned_bytes()).sum()
+            ScribeWrite::Object { row, .. } | ScribeWrite::ExecutionState { row, .. } => {
+                row.owned_bytes()
             }
             ScribeWrite::ServerSpans { spans, .. } => spans.encoded_len(),
         }
@@ -1847,7 +1869,7 @@ impl OutboxSink for ScribeSink {
             {
                 reserved.stage(tenant, Acknowledged((**queued).clone()));
             }
-            if let ScribeWrite::ExecutionEvents { acked, .. } | ScribeWrite::Result { acked, .. } =
+            if let ScribeWrite::ExecutionState { acked, .. } | ScribeWrite::Result { acked, .. } =
                 item
                 && !lost.contains(&index)
                 && let Some(sender) = acked
@@ -2930,49 +2952,6 @@ mod tests {
             .map(|frame| frame.rows)
             .collect();
         assert_eq!(frames, vec![DECISIONS]);
-    }
-
-    /// Proves an execution event's physical identity is its batch and
-    /// position alone: the same persisted batch cut at a one-byte budget and
-    /// at an unbounded one submits one single-row frame per event under the
-    /// same batch ids, so a replay at another valid request ceiling never
-    /// reuses an accepted identity for different rows.
-    ///
-    /// # Panics
-    ///
-    /// Panics when a decision cannot be staged or encoded, or an event's
-    /// identity or membership depends on the budget.
-    #[test]
-    fn event_identities_do_not_depend_on_the_frame_budget() {
-        let ScribeWrite::Audit(Some(row)) = decision("bifrost.record.write").into() else {
-            panic!("a decision stages its row");
-        };
-        let batch = uuid::Uuid::now_v7();
-        let events = [ScribeWrite::ExecutionEvents {
-            batch,
-            rows: vec![(row, background()); 4],
-            acked: Mutex::new(None),
-        }];
-        let frames = ScribeSink::frames(&events, &mut BTreeSet::new());
-        let tenant = DataTenantId::new_v7();
-        let cut = |budget| {
-            ScribeSink::chunks(&frames[0], budget)
-                .into_iter()
-                .enumerate()
-                .flat_map(|(chunk, rows)| {
-                    rows.encode(tenant, (batch, 0, chunk), budget, true)
-                        .expect("the chunk encodes")
-                })
-                .map(|(frame, _)| match frame.payload {
-                    FramePayload::Rows { rows, .. } => (frame.batch_id, rows.num_rows()),
-                    FramePayload::Ipc(_) => panic!("an in-process frame carries its rows"),
-                })
-                .collect::<Vec<_>>()
-        };
-        let narrow = cut(1);
-        assert_eq!(narrow.len(), 4, "one frame per event");
-        assert!(narrow.iter().all(|(_, rows)| *rows == 1));
-        assert_eq!(cut(usize::MAX), narrow, "the budget changes no identity");
     }
 
     /// Proves a retryable refusal replays the identical slice: the call and

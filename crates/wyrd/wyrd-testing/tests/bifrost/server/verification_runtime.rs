@@ -15,7 +15,7 @@
 //! native JSON. A fourth journey sends raw Arrow IPC with malformed Variant
 //! columns to built-ins and proves each is refused before any ACK.
 
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, HashMap};
 use std::fmt::Debug;
 use std::sync::Arc;
 use std::time::Duration;
@@ -44,15 +44,12 @@ use wyrd_client::{Bifrost, Principals};
 use wyrd_queue::variant::{EncodedVariant, WyrdJsonEncoderFactory};
 use wyrd_runtime::permission::PermissionSet;
 use wyrd_runtime::{Permission, Principal, PrincipalKind};
-use wyrd_server::components::auth::Caller;
 use wyrd_server::query::scheduled::ScheduledQueryCaller;
 use wyrd_server::scribe_outbox::{ScribeSink, ScribeWrite};
 use wyrd_server::state::LimitsConfig;
 use wyrd_server::verification::engines::EngineOutcome;
-use wyrd_server::verification::fault::PublicationFault;
 use wyrd_server::verification::health::RuntimeCapability;
 use wyrd_server::verification::hosted::HostedLimits;
-use wyrd_server::verification::hosted::publications::{Publications, PublishCall};
 use wyrd_server::verification::results::{InputRecord, ResultPayloadBuilder, ResultRun};
 use wyrd_server::verification::runner::EngineScript;
 use wyrd_server::verification::{RuntimeLimits, VerificationRuntime};
@@ -73,13 +70,11 @@ use wyrd_spec::vala::managed_columns::{
     WYRD_INGESTED_AT, WYRD_REQUEST_ID,
 };
 use wyrd_spec::vala::{AuditDetail, BifrostError, audit_detail_canonical_json};
-use wyrd_spec::verification::execution::Producer;
+use wyrd_spec::verification::TaskId;
 use wyrd_spec::verification::execution::{
     InputDeclaration, RequirementDetail, RequirementOutcome, RequirementResult, VerificationOutcome,
 };
 use wyrd_spec::verification::{DriftReport, DriftVerdict, DriftWindow, VerificationVerdict};
-use wyrd_spec::verification::{PublicationName, TaskId};
-use wyrd_sql::queries::verifier_executions::VerifierExecutionQueue;
 use wyrd_testing::bifrost::{BifrostClusterSpec, RawIngest, WyrdTestCluster, canonical_signals};
 use wyrd_testing::gateway_capture::GatewayCapture;
 use wyrd_testing::listener_stall::ListenerStallProxy;
@@ -3545,236 +3540,6 @@ async fn cancel_and_revocation_fence_unfinished_work() -> Result<(), ServerJourn
     stop.cancel();
     tokio::time::timeout(WAIT, task).await??;
     server.shutdown().await?;
-    Ok(())
-}
-
-/// History table execution events are projected into.
-const EVENTS: &str = "bifrost.verification.execution_events";
-
-/// Live progress reads from Postgres while projection is paused, and the
-/// projected history replays an ambiguous acknowledgement without
-/// duplicating or losing an event.
-///
-/// On a role-separated cluster, an execution is claimed with no runtime
-/// running, an invocation begins, and it publishes the JSON `{"v": 1}`.
-/// The invocation and publication read back from the execution records at
-/// once, while the projection position reports every event pending and none
-/// acknowledged. A runtime on the Scribe-only node then reclaims the expired
-/// lease and completes the execution while the first history batch's
-/// acknowledgement is lost, and the Oracle node reads the history back. The batch is
-/// resubmitted under its persisted identity, the position reaches fully
-/// acknowledged, and Bifrost holds exactly the committed event IDs once
-/// each, the publication's value as a Variant, and one output row.
-///
-/// # Errors
-/// Returns cluster, seeding, runtime, or query errors, or a description of
-/// the first expectation that does not hold.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "requires the serialized Postgres-backed journey lane"]
-async fn events_replay_without_hiding_live_progress() -> Result<(), ServerJourneyError> {
-    let cluster = WyrdTestCluster::start_spec(BifrostClusterSpec::role_separated()).await?;
-    let tenant = cluster.data_tenant_id();
-    let oracle = cluster.server(0).ok_or("missing Oracle node")?;
-    let scribe = cluster
-        .servers()
-        .find(|server| server.bifrost_scribe().is_some())
-        .ok_or("the cluster composed no Scribe")?;
-    let seed = VerificationFixture::provision(oracle.state(), tenant).await?;
-    let (subject, _) = seed.service("history-subject").await?;
-    let verifier = seed.drift_verifier("history-drift").await?;
-    let execution = seed.submit(&verifier, &subject, BTreeMap::new()).await?;
-    let queue = VerifierExecutionQueue::default();
-
-    let mut conn = oracle.tenant_conn_for(tenant).await?;
-    let lease = queue
-        .claim(
-            &mut conn,
-            chrono::Duration::minutes(5),
-            chrono::Duration::minutes(5),
-            1,
-        )
-        .await?
-        .pop()
-        .ok_or("the execution is claimable")?
-        .lease;
-    let task = TaskId::new("review")?;
-    queue.begin_invocation(&mut conn, lease, &task, 1).await?;
-    conn.commit().await?;
-    let caller = Caller {
-        data_tenant_id: tenant,
-        principal: Principal::new(
-            PrincipalId::new(uuid::Uuid::now_v7()),
-            PrincipalKind::User,
-            tenant,
-            Vec::new(),
-            PermissionSet::default(),
-        ),
-        request_id: RequestId::now_v7(),
-        delegation_chain: Vec::new(),
-        executed_by: None,
-    };
-    let producer = Producer {
-        step_id: task.clone(),
-        item_index: None,
-        iteration_index: None,
-        attempt: 1,
-    };
-    Publications::new(oracle.state(), &caller, lease, HostedLimits::default())
-        .json(
-            &PublishCall {
-                id: "c1".to_owned(),
-                producer: producer.clone(),
-                name: PublicationName::new("report")?,
-            },
-            json!({"v": 1}),
-        )
-        .await
-        .map_err(|error| format!("the live lease publishes: {error:?}"))?;
-
-    let mut conn = oracle.tenant_conn_for(tenant).await?;
-    let invocations = queue.invocations(&mut conn, execution).await?;
-    let publications = queue.publications(&mut conn, execution, &task).await?;
-    let paused = queue.projection_position(&mut conn, execution).await?;
-    let committed: BTreeSet<String> = sqlx::query_scalar::<_, uuid::Uuid>(
-        "SELECT event_id FROM wyrd.verifier_execution_events WHERE execution_id = $1",
-    )
-    .bind(execution.as_uuid())
-    .fetch_all(&mut **conn.transaction())
-    .await?
-    .into_iter()
-    .map(|id| id.to_string())
-    .collect();
-    conn.rollback().await?;
-    expect_eq("live invocations", &invocations.len(), &1)?;
-    expect_eq("live publications", &publications.len(), &1)?;
-    expect_eq("paused acknowledged events", &paused.acknowledged, &0)?;
-    expect_eq(
-        "paused pending events",
-        &usize::try_from(paused.pending)?,
-        &committed.len(),
-    )?;
-
-    let fault = PublicationFault::default();
-    fault.lose_ack_next(EVENTS);
-    let script = EngineScript::default();
-    script.push(EngineOutcome::Completed(drift_outcome(Some(
-        two_feature_report()?,
-    ))?));
-    let runtime = VerificationRuntime::builder(scribe.state())
-        .publication_fault(fault.clone())
-        .engine_script(script)
-        .build()
-        .ok_or("the runtime did not compose")?;
-    let mut conn = oracle.tenant_conn_for(tenant).await?;
-    sqlx::query(
-        "UPDATE wyrd.verifier_executions SET lease_expires_at = statement_timestamp() \
-         WHERE execution_id = $1",
-    )
-    .bind(execution.as_uuid())
-    .execute(&mut **conn.transaction())
-    .await?;
-    conn.commit().await?;
-    let stop = CancellationToken::new();
-    let task_handle = tokio::spawn(runtime.run(stop.clone()));
-    let deadline = tokio::time::Instant::now() + WAIT;
-    let (row, position) = loop {
-        let row = seed.execution(execution).await?;
-        let mut conn = oracle.tenant_conn_for(tenant).await?;
-        let position = queue.projection_position(&mut conn, execution).await?;
-        conn.rollback().await?;
-        if row.status == "completed" && position.pending == 0 && position.failed == 0 {
-            break (row, position);
-        }
-        if tokio::time::Instant::now() >= deadline {
-            return Err(format!("history never caught up: {row:?} {position:?}").into());
-        }
-        tokio::time::sleep(Duration::from_millis(50)).await;
-    };
-    let sent: Vec<_> = fault
-        .sent()
-        .await
-        .into_iter()
-        .filter(|sent| sent.table == EVENTS)
-        .collect();
-    stop.cancel();
-    tokio::time::timeout(WAIT, task_handle).await??;
-    let result = row.result_id.ok_or("the completed run has a result")?;
-    if !sent
-        .iter()
-        .enumerate()
-        .any(|(at, first)| sent[at + 1..].iter().any(|again| again == first))
-    {
-        return Err("the unacknowledged history batch was never resubmitted unchanged".into());
-    }
-    let mut conn = oracle.tenant_conn_for(tenant).await?;
-    let completed: BTreeSet<String> = sqlx::query_scalar::<_, uuid::Uuid>(
-        "SELECT event_id FROM wyrd.verifier_execution_events WHERE execution_id = $1",
-    )
-    .bind(execution.as_uuid())
-    .fetch_all(&mut **conn.transaction())
-    .await?
-    .into_iter()
-    .map(|id| id.to_string())
-    .collect();
-    conn.rollback().await?;
-    if !committed.is_subset(&completed) {
-        return Err("a paused event left the committed history".into());
-    }
-    expect_eq(
-        "acknowledged events",
-        &usize::try_from(position.acknowledged)?,
-        &completed.len(),
-    )?;
-
-    scribe.flush_bifrost().await?;
-    cluster.refresh_oracle_snapshots().await?;
-    let projected = query_texts(
-        oracle,
-        tenant,
-        format!("SELECT event_id FROM {EVENTS} WHERE execution_id = '{execution}'"),
-    )
-    .await?;
-    let projected_ids: Vec<String> = projected
-        .into_iter()
-        .filter_map(|row| row.into_iter().next().flatten())
-        .collect();
-    expect_eq(
-        "projected event rows",
-        &projected_ids.len(),
-        &completed.len(),
-    )?;
-    expect_eq(
-        "projected event ids",
-        &projected_ids.into_iter().collect::<BTreeSet<_>>(),
-        &completed,
-    )?;
-    let values = query_json(
-        oracle,
-        scheduled_context(tenant)?,
-        format!(
-            "SELECT value FROM {EVENTS} WHERE execution_id = '{execution}' \
-             AND event = 'publication'"
-        ),
-    )
-    .await?;
-    expect_eq(
-        "projected publication value",
-        &values,
-        &vec![vec![json!({"v": 1})]],
-    )?;
-    expect_eq(
-        "output rows",
-        &query_rows(
-            oracle,
-            tenant,
-            format!(
-                "SELECT result_id FROM bifrost.verification.execution_outputs \
-                 WHERE result_id = '{result}'"
-            ),
-        )
-        .await?,
-        &1,
-    )?;
     Ok(())
 }
 

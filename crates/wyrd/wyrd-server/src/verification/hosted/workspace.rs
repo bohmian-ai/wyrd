@@ -39,7 +39,7 @@ use wyrd_spec::verification::execution::{
 use super::evidence::TenantEvidence;
 use super::tools::{invocation, structured};
 use super::{HostedLimits, extract_refused};
-use wyrd_sql::queries::verifier_executions::StoredPublication;
+use wyrd_spec::verification::state::AcceptedPublication;
 
 /// Process-wide admission of scratch workspaces.
 pub struct Workspaces {
@@ -230,7 +230,7 @@ impl Mount {
         &mut self,
         evidence: &TenantEvidence,
         path: &str,
-        stored: &StoredPublication,
+        stored: &AcceptedPublication,
         sources: &BTreeSet<SlotName>,
     ) -> Result<(), BlockError> {
         match &stored.publication.content {

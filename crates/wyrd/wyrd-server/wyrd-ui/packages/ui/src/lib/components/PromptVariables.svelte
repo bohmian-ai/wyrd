@@ -7,7 +7,7 @@
   let { input, result }: PromptVariablesProps = $props();
 </script>
 
-<Panel title="Variables" note="derived by the server">
+<Panel title="Variables" note="derived from the messages">
   {#if result.state === 'populated'}
     <table>
       <thead><tr><th>Name</th><th>Kind</th></tr></thead>

@@ -357,7 +357,7 @@ test('TASK-003: Validated portable rendering', async () => {
     result: { state: 'populated', data: { card: registered, versions: { state: 'populated', data: { items: [summary('1.4.2'), summary('1.4.1', 'deprecated')], truncated: true } } } }
   });
   expect(header.getByRole('heading', { level: 2 })).toHaveTextContent('ranker');
-  expect(header.container).toHaveTextContent('Model/ranker@1.4.2');
+  expect(header.container).toHaveTextContent('Model / ranker@1.4.2');
   expect(header.container).toHaveTextContent('✓active');
   expect([...header.container.querySelectorAll('option')].map((option) => option.value)).toEqual(['1.4.2', '1.4.1']);
   expect(header.container).toHaveTextContent('showing the newest 2 versions');
@@ -1987,12 +1987,12 @@ test('card inventory preserves filters cursors and exact references', async () =
   const onaction = vi.fn();
   const view = render(CardInventory, { input: { kind: 'Prompt' }, result: first.result, onaction });
   expect(within(view.container).getAllByRole('row')).toHaveLength(4);
-  await fireEvent.click(within(view.container).getAllByRole('button', { name: 'support-reply' })[0]);
+  await fireEvent.click(within(view.container).getByRole('button', { name: 'Open Prompt/support-reply@1.0.0' }));
   await fireEvent.input(within(view.container).getByRole('textbox'), { target: { value: 'support' } });
   await fireEvent.submit(within(view.container).getByRole('textbox').closest('form') as HTMLFormElement);
-  await fireEvent.click(within(within(view.container).getByRole('navigation', { name: 'Kinds' })).getByRole('button', { name: 'Model' }));
+  await fireEvent.click(within(within(view.container).getByRole('navigation', { name: 'Kind' })).getByRole('button', { name: 'Model' }));
   await fireEvent.change(within(view.container).getByRole('combobox'), { target: { value: 'deprecated' } });
-  await fireEvent.click(within(view.container).getByRole('checkbox'));
+  await fireEvent.click(within(view.container).getByRole('button', { name: 'Prerelease' }));
   await fireEvent.click(within(view.container).getByRole('button', { name: 'Load more' }));
   const intents = onaction.mock.calls.map(([intent]) => intent);
   expect(intents).toEqual([
@@ -2018,13 +2018,13 @@ test('card inventory preserves filters cursors and exact references', async () =
   await states.rerender({ input: { query: 'a ==' }, result: { state: 'error', problem: { code: 'WYRD_QUERY_400_INVALID_SYNTAX', title: 'Invalid query' } } });
   expect(states.container).toHaveTextContent('WYRD_QUERY_400_INVALID_SYNTAX');
   await states.rerender({ input: {}, result: { state: 'denied', problem: denied } });
-  expect(states.container).toHaveTextContent('Not authorized');
+  expect(states.container).toHaveTextContent("You can't list Cards here");
 
   // The fixture view document validates and renders through WyrdView.
   const doc = { version: 'wyrd.view/v1', catalogId: 'wyrd.ui/v1', range: RANGE, panels: [{ id: 'cards', component: 'CardInventory', input: { pages: 2 } }] };
   expect(validateView(doc)).toMatchObject({ panels: [{ component: 'CardInventory' }] });
   const rendered = render(WyrdView, { doc, executor: fixtureExecutor });
-  await waitFor(() => expect(rendered.container.querySelectorAll('[data-panel="cards"] tbody tr')).toHaveLength(6));
+  await waitFor(() => expect(rendered.container.querySelectorAll('[data-panel="cards"] .row')).toHaveLength(6));
 });
 
 test('exact card detail preserves relationships files and action outcomes', async () => {
@@ -2066,8 +2066,9 @@ test('exact card detail preserves relationships files and action outcomes', asyn
   // Facts and YAML show the Card as returned.
   const facts = await loadCardFacts({ cardRef: PROMPT }, { executor: fixtureExecutor });
   const shown = render(CardFacts, facts);
-  expect(shown.container).toHaveTextContent('card_prompt_1.1.0');
-  expect(shown.container).toHaveTextContent('labels.team');
+  // The header carries the uid and phase; Metadata keeps labels, hashes and update time.
+  expect(shown.container).toHaveTextContent('sha256:1.1.0');
+  expect(shown.container).toHaveTextContent('team=support');
   const yaml = render(CardFacts, { ...facts, input: { cardRef: PROMPT, yaml: true } });
   expect(yaml.container.querySelector('pre')?.textContent).toBe(fmtYaml(prompts['1.1.0']));
   expect(fmtYaml({ apiVersion: 'wyrd/v1', spec: { system: 'a\nb', count: 1, empty: [], tags: ['x', 'true'] } })).toBe(
@@ -2077,15 +2078,15 @@ test('exact card detail preserves relationships files and action outcomes', asyn
   // Following a relationship emits its exact reference; the host reports each outcome beside it.
   const onaction = vi.fn();
   const list = render(RelationshipList, { ...relationships, onaction });
-  await fireEvent.click(within(list.container).getByRole('button', { name: fmtCardRef(SERVICE) }));
+  await fireEvent.click(within(list.container).getByRole('button', { name: `used by ${fmtCardRef(SERVICE)}` }));
   expect(onaction).toHaveBeenCalledWith({ name: 'card.open', input: { card_ref: SERVICE } });
   expect(validateIntent('RelationshipList', onaction.mock.calls[0][0])).toEqual(onaction.mock.calls[0][0]);
   await list.rerender({ ...relationships, onaction, actions: { 'card.open': { state: 'pending' } } });
-  expect(within(list.container).getByRole('button', { name: fmtCardRef(SERVICE) })).toBeDisabled();
+  expect(within(list.container).getByRole('button', { name: `used by ${fmtCardRef(SERVICE)}` })).toBeDisabled();
   await list.rerender({ ...relationships, onaction, actions: { 'card.open': { state: 'denied', problem: denied } } });
   expect(within(list.container).getByRole('alert')).toHaveTextContent(denied.code);
   await list.rerender({ ...relationships, onaction: undefined, actions: {} });
-  expect(within(list.container).getByRole('button', { name: fmtCardRef(SERVICE) })).toBeDisabled();
+  expect(within(list.container).getByRole('button', { name: `used by ${fmtCardRef(SERVICE)}` })).toBeDisabled();
 
   // Every kind keeps the Files tab; the detail URL names one exact version and nothing else.
   expect(CARD_TABS.map((tab) => tab.id)).toEqual(['overview', 'files', 'yaml']);
@@ -2106,10 +2107,10 @@ test('exact card detail preserves relationships files and action outcomes', asyn
   expect(held.calls[0].signal?.aborted).toBe(true);
   expect(held.calls[1].request).toEqual({ op: 'cards.get_by_ref', card_ref: { ...PROMPT, version: '1.1.0' } });
   pending[1]({ ok: true, value: prompts['1.1.0'] });
-  await waitFor(() => expect(view.container).toHaveTextContent('card_prompt_1.1.0'));
+  await waitFor(() => expect(view.container).toHaveTextContent('sha256:1.1.0'));
   pending[0]({ ok: true, value: prompts['1.0.0'] });
   await tick();
-  expect(view.container).not.toHaveTextContent('card_prompt_1.0.0');
+  expect(view.container).not.toHaveTextContent('sha256:1.0.0');
 });
 
 test('prompt definitions and comparisons preserve authored forms', async () => {
@@ -2119,8 +2120,10 @@ test('prompt definitions and comparisons preserve authored forms', async () => {
   expect(portable.result).toEqual({ state: 'populated', data: prompts['1.1.0'].spec });
   const shown = render(PromptMessages, portable);
   expect(within(shown.container).getByRole('region', { name: 'Message 1' })).toHaveTextContent('1 · user');
-  expect(within(shown.container).getByRole('region', { name: 'System' }).querySelector('pre')?.textContent).toBe('You answer support tickets.\nCite the policy section you rely on.');
-  expect(shown.container).toHaveTextContent('response verdict');
+  expect(within(shown.container).getByRole('region', { name: 'System' }).querySelector('.bubble')?.textContent?.trim()).toBe('You answer support tickets.\nCite the policy section you rely on.');
+  expect(shown.container).toHaveTextContent('response · verdict');
+  // Placeholders are marked as authored, never rewritten.
+  expect([...shown.container.querySelectorAll('.var')].map((part) => part.textContent)).toEqual(['{{ticket}}', '{{tone}}']);
   const native = await loadPromptMessages({ cardRef: NATIVE }, { executor: reads.executor });
   const body = render(PromptMessages, native);
   expect(within(body.container).getByRole('region', { name: 'Native body' }).querySelector('pre')?.textContent).toBe(fmtYaml((native.result as { data: { body: unknown } }).data.body));
@@ -2158,7 +2161,7 @@ test('prompt definitions and comparisons preserve authored forms', async () => {
   const onaction = vi.fn();
   const table = render(UsedBy, { ...usedBy, onaction });
   expect(table.container).toHaveTextContent('wyrd_gateway · primary');
-  await fireEvent.click(within(table.container).getByRole('button', { name: fmtCardRef(AGENT) }));
+  await fireEvent.click(within(table.container).getByRole('button', { name: `${AGENT.name}@${AGENT.version}` }));
   expect(onaction).toHaveBeenLastCalledWith({ name: 'card.open', input: { card_ref: AGENT } });
   expect(render(UsedBy, refusedAgent).container).toHaveTextContent(denied.code);
 
@@ -2182,12 +2185,16 @@ test('prompt definitions and comparisons preserve authored forms', async () => {
   expect((await loadVersionDiff({ cardRef: PROMPT, otherVersion: '9.9.9' }, { executor: fixtureExecutor })).result).toEqual({ state: 'error', problem: notFound });
   const single = await loadVersionDiff({ cardRef: NATIVE }, { executor: fixtureExecutor });
   expect(single.result).toMatchObject({ state: 'empty', reason: 'Only version 1.0.0 is registered.' });
-  expect(render(VersionDiff, single).container).toHaveTextContent('Only version 1.0.0 is registered.');
+  expect(render(VersionDiff, single).container).toHaveTextContent('Only version 1.0.0 is registered. Registering a new version shows its message, variable and response-format diff here.');
   const picker = render(VersionDiff, { ...diff, onaction });
   expect(within(picker.container).getByRole('region', { name: 'system' }).querySelectorAll('pre')).toHaveLength(2);
   await fireEvent.change(within(picker.container).getByRole('combobox'), { target: { value: '1.0.0' } });
   expect(onaction).toHaveBeenLastCalledWith({ name: 'prompt.compare', input: { other_version: '1.0.0' } });
   expect(validateIntent('VersionDiff', onaction.mock.lastCall?.[0])).toEqual({ name: 'prompt.compare', input: { other_version: '1.0.0' } });
+
+  // A Prompt records no telemetry, so its header offers no Open in Observe.
+  const promptHeader = render(CardHeader, { input: { cardRef: PROMPT }, result: { state: 'populated', data: { card: prompts['1.1.0'], versions: { state: 'populated', data: { items: [], truncated: false } } } }, onaction });
+  expect(within(promptHeader.container).queryByRole('button', { name: /Open in Observe/ })).toBeNull();
 
   // No Prompt component reads telemetry.
   expect([...reads.calls, ...users.calls, ...compared.calls].map((call) => call.request.op)).not.toContain('bifrost.query');

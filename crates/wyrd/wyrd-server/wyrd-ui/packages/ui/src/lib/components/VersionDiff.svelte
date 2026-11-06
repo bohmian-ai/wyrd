@@ -19,7 +19,10 @@
   const show = (value: unknown) => (value === undefined ? '(unset)' : typeof value === 'string' ? value : fmtYaml(value));
 </script>
 
-<Panel title="Changes" note={data?.other ? `v${data.other} → v${input.cardRef.version}` : 'between versions'}>
+<Panel
+  title={data?.other ? `Changes from v${data.other}` : 'Changes from the previous version'}
+  note={data?.other ? `v${data.other} → v${input.cardRef.version}` : 'compares any two versions'}
+>
   {#snippet tools()}
     {#if others.length > 0 && data?.other}
       <label>
@@ -49,7 +52,11 @@
       </section>
     {/each}
   {:else if result.state === 'empty'}
-    <EmptyState state="empty" title={result.reason} />
+    <EmptyState
+      state="empty"
+      title={result.reason}
+      detail={others.length === 0 ? "Registering a new version shows its message, variable and response-format diff here." : undefined}
+    />
   {:else if result.state === 'loading'}
     <EmptyState state="loading" title="Comparing {input.cardRef.name} versions" />
   {:else}

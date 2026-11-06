@@ -30,11 +30,10 @@
 </script>
 
 <svelte:head><title>Cards · {data.tenant.name} · Wyrd</title></svelte:head>
-<div class="app-page cards">
-  <header>
-    <p class="crumb"><span>{data.tenant.key}</span> / Cards</p>
-    <h1>Cards</h1>
-  </header>
+<header class="bar">
+  <span>{data.tenant.key} /</span><span class="here">Cards</span>
+</header>
+<div class="cards">
   {#if 'code' in data.inventory}
     <EmptyState state="error" problem={data.inventory} />
   {:else}
@@ -43,18 +42,27 @@
 </div>
 
 <style>
-  .cards {
+  .bar {
     display: flex;
-    flex-direction: column;
-    gap: 16px;
-  }
-  .crumb {
-    margin: 0 0 4px;
+    align-items: center;
+    gap: 12px;
+    padding: 14px 24px;
+    border-bottom: 1px solid var(--border);
     color: var(--muted);
     font: 12px var(--font-mono);
   }
-  h1 {
-    margin: 0;
-    font: var(--weight-strong) 24px var(--font-sans);
+  .here {
+    color: var(--text);
+  }
+  .cards {
+    padding: 16px 24px 24px;
+  }
+  @media (max-width: 767px) {
+    .bar {
+      padding: 12px 16px;
+    }
+    .cards {
+      padding: 16px;
+    }
   }
 </style>

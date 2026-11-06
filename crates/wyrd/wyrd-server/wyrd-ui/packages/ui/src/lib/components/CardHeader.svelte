@@ -4,15 +4,21 @@
   its own state, so a failed listing never hides the Card itself.
 -->
 <script lang="ts">
+  import type { Snippet } from 'svelte';
   import type { ActionProps, ActionState, CardRef } from '../contract.js';
   import type { CardHeaderProps } from '../loaders.js';
-  import { fmtCardRef, fmtInstant, parseInstant } from '../format.js';
+  import { fmtAgo, fmtCardRef, fmtInstant, fmtShortId, parseInstant } from '../format.js';
   import ActionButton from './ActionButton.svelte';
   import ActionNote from './ActionNote.svelte';
   import EmptyState from './EmptyState.svelte';
   import StatusPill, { CARD_TONES } from './StatusPill.svelte';
 
-  let { input, result, actions = {}, onaction }: CardHeaderProps & ActionProps = $props();
+  /**
+   * `primary` replaces the header's primary action. A Prompt records no
+   * telemetry, so it never offers Open in Observe; its host may offer
+   * another action here, such as opening an Agent that uses it.
+   */
+  let { input, result, actions = {}, onaction, primary }: CardHeaderProps & ActionProps & { primary?: Snippet } = $props();
 
   const card = $derived(result.state === 'populated' ? result.data.card : undefined);
   const versions = $derived(result.state === 'populated' ? result.data.versions : undefined);
@@ -72,15 +78,15 @@
           {#if current}<span class="status"><StatusPill tone={CARD_TONES[current.status]} label={current.status} /></span>{/if}
         </div>
         <p class="meta">
-          <span>{fmtCardRef(ref)}</span>
+          <span>{ref.kind} / {ref.name}@{ref.version}</span>
           {#if card.metadata.uid}
-            <span>
-              uid {card.metadata.uid}
+            <span title={card.metadata.uid}>
+              uid {fmtShortId(card.metadata.uid)}
               <button type="button" class="icon" aria-label="Copy uid" onclick={() => copy(card.metadata.uid ?? '')}>⧉</button>
             </span>
           {/if}
           {#if current}
-            <span>registered <time datetime={current.created_at}>{fmtInstant(parseInstant(current.created_at))}</time></span>
+            <span>registered <time datetime={current.created_at} title={fmtInstant(parseInstant(current.created_at))}>{fmtAgo(parseInstant(current.created_at))}</time></span>
           {/if}
           {#if versions?.state === 'populated' && versions.data.truncated}
             <span>showing the newest {items.length} versions</span>
@@ -92,13 +98,17 @@
       </div>
       <div class="actions">
         <ActionButton label="Copy ref" lead="⧉" onclick={() => copy(fmtCardRef(ref))} />
-        <ActionButton
-          variant="primary"
-          label="Open in Observe"
-          icon="↗"
-          state={onaction ? actions['card.open_in_observe'] : unavailable}
-          onclick={() => onaction?.({ name: 'card.open_in_observe', input: { card_ref: ref } })}
-        />
+        {#if primary}
+          {@render primary()}
+        {:else if ref.kind !== 'Prompt'}
+          <ActionButton
+            variant="primary"
+            label="Open in Observe"
+            icon="↗"
+            state={onaction ? actions['card.open_in_observe'] : unavailable}
+            onclick={() => onaction?.({ name: 'card.open_in_observe', input: { card_ref: ref } })}
+          />
+        {/if}
       </div>
     </div>
 
@@ -110,7 +120,10 @@
             aria-current={tab.id === (input.tab ?? input.tabs[0].id) ? 'page' : undefined}
             disabled={!onaction || blocked(tabState)}
             aria-busy={tabState?.state === 'pending' ? 'true' : undefined}
-            onclick={() => onaction?.({ name: 'card.tab', input: { tab: tab.id } })}>{tab.label}</button
+            onclick={() => onaction?.({ name: 'card.tab', input: { tab: tab.id } })}
+            >{tab.label}{#if tab.id === 'versions' && versions?.state === 'populated'}<span class="count"
+                >{items.length}{versions.data.truncated ? '+' : ''}</span
+              >{/if}</button
           >
         {/each}
         <ActionNote state={tabState} />
@@ -129,7 +142,6 @@
     flex-direction: column;
     gap: 16px;
     min-width: 0;
-    border-bottom: 1px solid var(--border);
     color: var(--text);
     font-family: var(--font-sans);
   }
@@ -164,11 +176,11 @@
     display: inline-flex;
     align-items: center;
     gap: 6px;
-    border: 1px solid color-mix(in srgb, var(--declare) 45%, var(--border));
+    border: 1px solid var(--selected-border);
     border-radius: var(--r);
     padding: 2px 8px;
     background: var(--declare-soft);
-    color: var(--declare);
+    color: color-mix(in srgb, var(--declare) 45%, var(--text));
     font: 11px var(--font-mono);
     letter-spacing: 0.04em;
     text-transform: uppercase;
@@ -255,6 +267,9 @@
   }
   nav button:enabled:hover {
     color: var(--text);
+  }
+  .count {
+    margin-left: 5px;
   }
   nav button[aria-current='page'] {
     color: var(--text);

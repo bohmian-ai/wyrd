@@ -957,49 +957,52 @@ test('authenticated card browsing and prompt comparison', async ({ ui }) => {
   const inventory = `${ui.base}/t/${TENANT}/cards`;
   await page.getByRole('navigation', { name: 'Destinations' }).getByRole('link', { name: 'Cards' }).click();
   await page.waitForURL(inventory);
-  const rows = page.getByRole('region', { name: 'Cards', exact: true }).locator('tbody tr');
+  const rows = page.getByRole('table', { name: 'Card versions' }).locator('.row');
   const mine = rows.filter({ hasText: prompt.name });
   await expect.poll(() => mine.count()).toBe(2);
   expect(await rows.filter({ hasText: agent.name }).count()).toBe(1);
   expect(await page.getByRole('region', { name: 'Cards', exact: true }).textContent()).not.toContain(theirs.name);
 
   // Kind and name filters live in the URL; Back restores them.
-  await page.getByRole('navigation', { name: 'Kinds' }).getByRole('button', { name: 'Prompt', exact: true }).click();
+  await page.getByRole('navigation', { name: 'Kind' }).getByRole('button', { name: 'Prompt', exact: true }).click();
   await expect.poll(() => new URL(page.url()).searchParams.get('kind')).toBe('Prompt');
   await expect.poll(() => rows.filter({ hasText: agent.name }).count()).toBe(0);
-  expect(new Set(await rows.locator('td:first-child').allTextContents())).toEqual(new Set(['Prompt']));
-  await page.getByLabel('Filter').fill('reply-agent');
-  await page.getByLabel('Filter').press('Enter');
-  await expect.poll(() => page.getByRole('region', { name: 'Cards', exact: true }).textContent()).toContain('No Card version matches these filters.');
+  expect(new Set(await rows.locator('.kind').allTextContents())).toEqual(new Set(['Prompt']));
+  await page.getByRole('textbox', { name: /^Filter Cards/ }).fill('reply-agent');
+  await page.getByRole('textbox', { name: /^Filter Cards/ }).press('Enter');
+  await expect.poll(() => page.getByRole('region', { name: 'Cards', exact: true }).textContent()).toContain('No Cards match');
   await page.goBack();
   await expect.poll(() => mine.count()).toBe(2);
   expect(new URL(page.url()).searchParams.get('q')).toBeNull();
   expect(new URL(page.url()).searchParams.get('kind')).toBe('Prompt');
   // An invalid filter is the server's stable refusal.
-  await page.getByLabel('Filter').fill('name = = "x"');
-  await page.getByLabel('Filter').press('Enter');
+  await page.getByRole('textbox', { name: /^Filter Cards/ }).fill('name = = "x"');
+  await page.getByRole('textbox', { name: /^Filter Cards/ }).press('Enter');
   await expect.poll(() => page.getByRole('region', { name: 'Cards', exact: true }).textContent()).toContain('WYRD_SPEC_400_VALIDATION');
   await page.goBack();
 
   // A row opens its exact version; Back returns to the filtered rows.
-  await rows.filter({ hasText: '1.1.0' }).getByRole('button', { name: prompt.name }).click();
+  // The whole row is the target; it opens that exact version.
+  await page.getByRole('button', { name: `Open Prompt/${prompt.name}@1.1.0` }).click();
   await page.waitForURL((url) => url.pathname.endsWith('/cards/detail') && url.searchParams.get('version') === '1.1.0');
   expect(new URL(page.url()).searchParams.get('uid')).toBe(prompt.uid);
   const definition = page.getByRole('region', { name: 'Prompt', exact: true });
   await expect.poll(() => definition.textContent()).toContain('Cite the policy section you rely on.');
   expect(await page.getByRole('region', { name: 'Variables', exact: true }).textContent()).toMatch(/ticket.*tone/);
   expect(await page.getByRole('region', { name: 'Used by', exact: true }).textContent()).toContain(`${agent.name}@1.0.0`);
-  const changes = page.getByRole('region', { name: 'Changes', exact: true });
+  const changes = page.getByRole('region', { name: /^Changes from/ });
   expect(await changes.textContent()).toContain('v1.0.0 → v1.1.0');
   expect(await changes.getByRole('region', { name: 'response_format', exact: true }).getByLabel('v1.1.0').textContent()).toContain('verdict');
-  expect(await page.getByRole('button', { name: /Open in Observe/ }).isDisabled()).toBe(true);
+  // A Prompt records no telemetry: its primary action opens the Agent using it.
+  expect(await page.getByRole('button', { name: /Open in Observe/ }).count()).toBe(0);
+  expect(await page.getByRole('button', { name: `Open ${agent.name}`, exact: true }).isEnabled()).toBe(true);
 
   // Choosing another version replaces the whole reference; that version has no Agent and compares against 1.1.0.
   await page.getByLabel('Version').selectOption('1.0.0');
   await expect.poll(() => new URL(page.url()).searchParams.get('version')).toBe('1.0.0');
   expect(new URL(page.url()).searchParams.get('uid')).toBeNull();
   await expect.poll(() => page.getByRole('region', { name: 'Used by', exact: true }).textContent()).toContain('No registered Agent uses this Prompt version.');
-  expect(await page.getByRole('region', { name: 'Changes', exact: true }).textContent()).toContain('v1.1.0 → v1.0.0');
+  expect(await changes.textContent()).toContain('v1.1.0 → v1.0.0');
   expect(await definition.textContent()).not.toContain('Cite the policy section');
 
   // Tabs keep the exact reference: Versions, YAML, then Files.
@@ -1013,7 +1016,7 @@ test('authenticated card browsing and prompt comparison', async ({ ui }) => {
   // The Agent's relationships open the exact Prompt it uses.
   await page.goto(`${ui.base}/t/${TENANT}/cards/detail?kind=Agent&name=${agent.name}&version=1.0.0`);
   const related = page.getByRole('region', { name: 'Relationships', exact: true });
-  await related.getByRole('button', { name: `${prompt.name}@1.1.0` }).click();
+  await related.getByRole('button', { name: `references Prompt/${prompt.name}@1.1.0#${prompt.uid}` }).click();
   await expect.poll(() => new URL(page.url()).searchParams.get('uid')).toBe(prompt.uid);
   // A file-carrying Card lists what registration recorded.
   await page.goto(`${ui.base}/t/${TENANT}/cards/detail?kind=Model&name=${model.name}&version=${model.version}&tab=files`);
@@ -1164,12 +1167,12 @@ base('development environment lifecycle', { timeout: 2_400_000 }, async () => {
     await page.getByRole('navigation', { name: 'Destinations' }).getByRole('link', { name: 'Cards' }).click();
     await page.waitForURL('http://127.0.0.1:3000/t/dev/cards');
     const cards = page.getByRole('region', { name: 'Cards', exact: true });
-    await expect.poll(() => cards.locator('tbody tr', { hasText: 'support-reply' }).count()).toBe(2);
-    expect(await cards.locator('tbody tr', { hasText: 'reply-agent' }).count()).toBe(1);
-    await cards.locator('tbody tr', { hasText: '1.1.0' }).getByRole('button', { name: 'support-reply' }).click();
+    await expect.poll(() => cards.locator('.row', { hasText: 'support-reply' }).count()).toBe(2);
+    expect(await cards.locator('.row', { hasText: 'reply-agent' }).count()).toBe(1);
+    await cards.getByRole('button', { name: 'Open Prompt/support-reply@1.1.0' }).click();
     await page.waitForURL((url) => url.pathname === '/t/dev/cards/detail' && url.searchParams.get('version') === '1.1.0');
     await expect.poll(() => page.getByRole('region', { name: 'Used by', exact: true }).textContent()).toContain('reply-agent@1.0.0');
-    expect(await page.getByRole('region', { name: 'Changes', exact: true }).textContent()).toContain('v1.0.0 → v1.1.0');
+    expect(await page.getByRole('region', { name: /^Changes from/ }).textContent()).toContain('v1.0.0 → v1.1.0');
     await page.goto('http://127.0.0.1:3000/t/dev/cards/detail?kind=Model&name=support-model&version=1.0.0&tab=files');
     await expect.poll(() => page.getByRole('region', { name: 'Files', exact: true }).textContent()).toContain('support-model.bin');
 

@@ -40,32 +40,46 @@
     display: flex;
     flex-wrap: wrap;
     align-items: center;
-    gap: 4px 10px;
-    padding: 10px 14px;
+    gap: 4px 12px;
+    padding: 10px 16px;
     border-bottom: 1px solid var(--border);
   }
   h3 {
     margin: 0;
-    font: 600 11px var(--font-mono);
-    letter-spacing: 0.08em;
+    color: var(--muted);
+    font: 400 11px var(--font-mono);
+    letter-spacing: 0.06em;
     text-transform: uppercase;
   }
   .note {
+    margin-left: auto;
     color: var(--muted);
     font: 11px var(--font-mono);
   }
   .tools {
     display: inline-flex;
     flex-wrap: wrap;
+    align-items: center;
     gap: 6px;
     margin-left: auto;
+  }
+  .note + .tools {
+    margin-left: 0;
   }
   .body {
     display: flex;
     flex-direction: column;
-    gap: 10px;
+    gap: 14px;
     min-width: 0;
-    padding: 12px 14px;
+    padding: 14px 16px;
+  }
+  /* A table or `.flush` list runs edge to edge; anything beside it keeps the body inset. */
+  .body:has(> :global(:is(table, .flush))) {
+    gap: 0;
+    padding: 0;
+  }
+  .body:has(> :global(:is(table, .flush))) > :global(:not(table, .flush)) {
+    margin: 10px 16px;
   }
   .body :global(table) {
     width: 100%;
@@ -73,22 +87,23 @@
     font: 12px var(--font-mono);
   }
   .body :global(th) {
-    height: 28px;
-    padding: 0 10px 0 0;
-    border-bottom: 1px solid var(--border-soft);
+    padding: 8px 16px;
+    border-bottom: 1px solid var(--border);
     color: var(--muted);
-    font: 11px var(--font-mono);
+    font: 400 11px var(--font-mono);
     letter-spacing: 0.06em;
     text-align: left;
     text-transform: uppercase;
     white-space: nowrap;
   }
   .body :global(td) {
-    height: 34px;
     max-width: 360px;
-    padding: 0 10px 0 0;
+    padding: 9px 16px;
     border-bottom: 1px solid var(--border-soft);
     overflow-wrap: anywhere;
+  }
+  .body :global(tr:last-child td) {
+    border-bottom: 0;
   }
   .body :global(pre) {
     margin: 0;

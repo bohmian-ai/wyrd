@@ -47,6 +47,20 @@ export function fmtInstant(ms: number): string {
   return `${new Date(ms).toISOString().slice(0, 16).replace('T', ' ')} UTC`;
 }
 
+/** How long before `now` an instant was, as a list cell reads it → "now" / "5m ago" / "2h ago" / "12d ago"; a future instant reads "now". */
+export function fmtAgo(ms: number, now = Date.now()): string {
+  const minutes = Math.floor((now - ms) / 60_000);
+  if (minutes < 1) return 'now';
+  if (minutes < 60) return `${minutes}m ago`;
+  if (minutes < 24 * 60) return `${Math.floor(minutes / 60)}h ago`;
+  return `${Math.floor(minutes / (24 * 60))}d ago`;
+}
+
+/** A long id shortened for a list cell, keeping both ends → "01a2f7c1…4be20". */
+export function fmtShortId(id: string): string {
+  return id.length > 15 ? `${id.slice(0, 8)}…${id.slice(-5)}` : id;
+}
+
 /** An exact Card reference in canonical spelling → "Model/ranker@1.4.2", plus "#uid" when one is supplied. */
 export function fmtCardRef(ref: { kind: string; name: string; version: string; uid?: string | null }): string {
   return `${ref.kind}/${ref.name}@${ref.version}${ref.uid ? `#${ref.uid}` : ''}`;

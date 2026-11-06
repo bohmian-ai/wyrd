@@ -17,20 +17,20 @@
   const open = (ref: CardRef) => onaction?.({ name: 'card.open', input: { card_ref: ref } });
 </script>
 
-<Panel title="Used by" note="server-derived">
+<Panel title="Used by" note="Agents whose spec.prompt references this Card">
   {#if result.state === 'populated'}
     <table>
       <thead><tr><th>Agent</th><th>Route</th><th>Service</th></tr></thead>
       <tbody>
         {#each result.data as user (fmtCardRef(user.ref))}
           <tr>
-            <td><button type="button" class="open" {disabled} onclick={() => open(user.ref)}>{fmtCardRef(user.ref)}</button></td>
+            <td><button type="button" class="open" {disabled} title={fmtCardRef(user.ref)} onclick={() => open(user.ref)}>{user.ref.name}@{user.ref.version}</button></td>
             {#if user.agent.state === 'populated'}
               {@const route = user.agent.data.route}
-              <td>{route.kind === 'wyrd_gateway' ? `wyrd_gateway · ${route.deployment}` : 'native'}</td>
+              <td class="muted">{route.kind === 'wyrd_gateway' ? `wyrd_gateway · ${route.deployment}` : 'native'}</td>
               <td>
                 {#each user.agent.data.services as service (fmtCardRef(service))}
-                  <button type="button" class="open" {disabled} onclick={() => open(service)}>{fmtCardRef(service)}</button>
+                  <button type="button" class="open" {disabled} title={fmtCardRef(service)} onclick={() => open(service)}>{service.name}</button>
                 {:else}<span class="muted">—</span>{/each}
               </td>
             {:else if user.agent.state === 'denied' || user.agent.state === 'error'}

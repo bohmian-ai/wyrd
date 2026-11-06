@@ -1,5 +1,5 @@
 <!--
-  One exact Card version: header, then the selected tab. Every Card has
+  One exact Card version: breadcrumb, header, then the selected tab. Every Card has
   Overview (facts and relationships), Files and YAML; a Prompt adds its
   authored definition, variables, using Agents and version comparison. The
   URL holds the exact reference, tab and comparison, so every navigation
@@ -9,6 +9,7 @@
   import { goto } from '$app/navigation';
   import { navigating, page } from '$app/state';
   import {
+    ActionButton,
     ArtifactTable,
     CardFacts,
     CardHeader,
@@ -29,12 +30,8 @@
   let { data }: PageProps = $props();
   const base = $derived(`/t/${encodeURIComponent(data.tenant.key)}`);
   let actions = $state<Record<string, ActionState>>({});
-  /** A Prompt has no telemetry of its own, so its header offers no Observe. */
-  const headerActions = $derived(
-    data.cardRef?.kind === 'Prompt'
-      ? { ...actions, 'card.open_in_observe': { state: 'unavailable', reason: 'A Prompt records no telemetry; open an Agent that uses it.' } as const }
-      : actions
-  );
+  /** A Prompt records no telemetry; its primary action opens the first Agent that uses it. */
+  const agent = $derived(data.prompt?.usedBy.result.state === 'populated' ? data.prompt.usedBy.result.data[0]?.ref : undefined);
 
   /** Navigating to another version clears this version's content until the new one loads. */
   const switching = $derived.by(() => {
@@ -76,71 +73,115 @@
 </script>
 
 <svelte:head><title>{data.cardRef ? `${data.cardRef.name}@${data.cardRef.version}` : 'Card'} · Cards · Wyrd</title></svelte:head>
-<div class="app-page detail">
-  <p class="crumb"><a href="{base}/cards">Cards</a>{#if data.cardRef} / {data.cardRef.kind} / {data.cardRef.name}{/if}</p>
-  {#if data.problem}
-    <EmptyState state="error" problem={data.problem} />
-  {:else if switching}
+<header class="bar">
+  <a href="{base}/cards">Cards</a>
+  {#if data.cardRef}<span>/</span><span>{data.cardRef.kind}</span><span>/</span><span class="here">{data.cardRef.name}</span>{/if}
+</header>
+{#if data.problem}
+  <div class="content"><EmptyState state="error" problem={data.problem} /></div>
+{:else if switching}
+  <div class="content">
     <EmptyState state="loading" title="Loading {navigating.to?.url.searchParams.get('name')}@{navigating.to?.url.searchParams.get('version')}" />
-  {:else if data.header}
-    <CardHeader {...data.header} actions={headerActions} onaction={onaction('CardHeader')} />
-    {#if data.files}
-      <ArtifactTable {...data.files} />
-    {:else if data.yaml}
-      <CardFacts {...data.yaml} />
-    {:else if data.diff}
+  </div>
+{:else if data.header}
+  <section class="hero">
+    <CardHeader {...data.header} {actions} onaction={onaction('CardHeader')} primary={agent ? openAgent : undefined} />
+  </section>
+  {#if data.files}
+    <div class="content"><ArtifactTable {...data.files} /></div>
+  {:else if data.yaml}
+    <div class="content"><CardFacts {...data.yaml} /></div>
+  {:else if data.diff}
+    <div class="content">
       {#if 'code' in data.diff}<EmptyState state="error" problem={data.diff} />{:else}<VersionDiff {...data.diff} {actions} onaction={onaction('VersionDiff')} />{/if}
-    {:else if data.facts && data.relationships}
-      <div class="columns">
-        <div class="main">
-          {#if data.prompt}
-            <PromptMessages {...data.prompt.messages} />
-            <PromptVariables {...data.prompt.variables} />
-            <UsedBy {...data.prompt.usedBy} {actions} onaction={onaction('UsedBy')} />
-            <VersionDiff {...data.prompt.diff} {actions} onaction={onaction('VersionDiff')} />
-          {:else}
-            <CardFacts {...data.facts} />
-          {/if}
-        </div>
-        <aside>
-          <RelationshipList {...data.relationships} {actions} onaction={onaction('RelationshipList')} />
-          {#if data.prompt}<CardFacts {...data.facts} />{/if}
-        </aside>
+    </div>
+  {:else if data.facts && data.relationships}
+    <div class="content columns">
+      <div class="main">
+        {#if data.prompt}
+          <PromptMessages {...data.prompt.messages} />
+          <PromptVariables {...data.prompt.variables} />
+          <UsedBy {...data.prompt.usedBy} {actions} onaction={onaction('UsedBy')} />
+          <VersionDiff {...data.prompt.diff} {actions} onaction={onaction('VersionDiff')} />
+        {:else}
+          <CardFacts {...data.facts} />
+        {/if}
       </div>
-    {/if}
+      <aside>
+        <RelationshipList {...data.relationships} {actions} onaction={onaction('RelationshipList')} />
+        {#if data.prompt}<CardFacts {...data.facts} />{/if}
+      </aside>
+    </div>
   {/if}
-</div>
+{/if}
+
+{#snippet openAgent()}
+  {#if agent}
+    <ActionButton
+      variant="primary"
+      label="Open {agent.name}"
+      state={actions['card.open']}
+      onclick={() => onaction('UsedBy')({ name: 'card.open', input: { card_ref: agent } })}
+    />
+  {/if}
+{/snippet}
 
 <style>
-  .detail {
+  .bar {
     display: flex;
-    flex-direction: column;
-    gap: 16px;
-  }
-  .crumb {
-    margin: 0;
+    align-items: center;
+    gap: 8px;
+    min-height: 55px;
+    padding: 10px 24px;
+    border-bottom: 1px solid var(--border);
+    background: var(--nav-surface);
     color: var(--muted);
     font: 12px var(--font-mono);
   }
-  .crumb a {
+  .bar a {
+    color: inherit;
+  }
+  .bar a:hover {
     color: var(--declare);
+  }
+  .here {
+    color: var(--text);
+  }
+  .hero {
+    padding: 22px 24px 0;
+    border-bottom: 1px solid var(--border);
+  }
+  .content {
+    display: flex;
+    flex-direction: column;
+    gap: 20px;
+    padding: 20px 24px 32px;
   }
   .columns {
     display: grid;
-    grid-template-columns: minmax(0, 1fr) minmax(260px, 340px);
-    gap: 16px;
+    grid-template-columns: minmax(0, 1fr) 360px;
     align-items: start;
-  }
-  @media (max-width: 900px) {
-    .columns {
-      grid-template-columns: minmax(0, 1fr);
-    }
   }
   .main,
   aside {
     display: flex;
     flex-direction: column;
-    gap: 16px;
+    gap: 20px;
     min-width: 0;
+  }
+  aside {
+    gap: 16px;
+  }
+  @media (max-width: 1023px) {
+    .columns {
+      grid-template-columns: minmax(0, 1fr);
+    }
+  }
+  @media (max-width: 767px) {
+    .bar,
+    .hero,
+    .content {
+      padding-inline: 16px;
+    }
   }
 </style>

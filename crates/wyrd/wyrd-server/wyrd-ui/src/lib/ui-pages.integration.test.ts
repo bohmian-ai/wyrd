@@ -330,7 +330,7 @@ test('authenticated logs investigation', async ({ ui }) => {
   await expect.poll(() => new URL(page.url()).searchParams.get('where')).toBe(JSON.stringify([{ column: 'severity_text', value: 'ERROR' }]));
   await expect.poll(() => list.locator('tbody tr').count()).toBe(1);
 
-  // Wrap and paging are reader controls over the rows already read; Columns is kept in the URL.
+  // Wrap is a reader control over the rows already read; Columns is kept in the URL.
   await list.getByRole('button', { name: 'Wrap lines' }).click();
   expect(await list.getByRole('button', { name: 'Wrap lines' }).getAttribute('aria-pressed')).toBe('true');
   await list.locator('summary', { hasText: 'Columns' }).click();
@@ -339,7 +339,9 @@ test('authenticated logs investigation', async ({ ui }) => {
   expect(JSON.parse(new URL(page.url()).searchParams.get('columns') ?? '[]')).not.toContain('body_text');
   await page.goBack();
   await expect.poll(() => list.locator('th[title="body_text"]').count()).toBe(1);
-  expect(await list.getByRole('navigation', { name: 'Pages' }).getByRole('combobox').inputValue()).toBe('50');
+  // One record fills one keyset page: neither Newer nor Older has a cursor.
+  const pager = list.getByRole('navigation', { name: 'Pages' });
+  expect([await pager.getByRole('button', { name: /Newer/ }).isDisabled(), await pager.getByRole('button', { name: /Older/ }).isDisabled()]).toEqual([true, true]);
 
   // The record opens by its exact identity beside the list, with its body and recorded fields.
   await list.locator('tbody tr').first().click();
@@ -696,7 +698,7 @@ test('observe boards match approved canvas', async ({ server, ui }) => {
       await expect.poll(() => list.locator('tbody tr').count(), { timeout: 30_000 }).toBe(3);
       expect(await page.locator('[data-panel="facets"]').count()).toBe(1);
       expect(await page.locator('.listbar .counts').textContent()).toMatch(/^3 spans match · p95 /);
-      expect(await list.locator('th').allTextContents()).toEqual(['Start', 'Name', 'Service', 'Trace', 'Parent', 'Duration', 'Status']);
+      expect(await list.locator('th').allTextContents()).toEqual(['Start ↓', 'Name', 'Service', 'Trace', 'Parent', 'Duration', 'Status']);
       expect(await list.getByTitle(TRACE).first().textContent()).toBe(`${TRACE.slice(0, 4)}…${TRACE.slice(-4)}`);
       expect(await list.locator('.foot').textContent()).toMatch(/Showing 3 spans · a trace id opens that trace/);
       expect(await page.evaluate(() => document.documentElement.scrollWidth)).toBeLessThanOrEqual(width);
@@ -939,6 +941,96 @@ test('local signup and personal settings', async ({ server, ui }) => {
   } finally {
     await context.close();
   }
+});
+
+test('authenticated card browsing and prompt comparison', async ({ ui }) => {
+  const cards = await Cards.connect({ client: WyrdClient.connect({ serverUrl: ui.serverUrl, credential: ui.adminKey }) });
+  const ui_cards = (name: string) => fixture(`cards/ui_cards/${name}`);
+  const model = declared(await cards.declareFromPath(fixture('cards/declare_and_pull/support-model.yaml')));
+  await cards.declareFromPath(ui_cards('support-reply-1.0.0.yaml'));
+  const prompt = declared(await cards.declareFromPath(ui_cards('support-reply-1.1.0.yaml')));
+  const agent = declared(await cards.declareFromPath(ui_cards('reply-agent.yaml')));
+  // The default tenant's Prompt is never listed here.
+  const theirs = declared(await (await Cards.connect()).declareFromPath(fixture('cards/gateway_inference/ask-prompt.yaml')));
+
+  const page = await humanSignIn(ui.browser, ui.base, TENANT, await invitation(ui.serverUrl, ui.adminKey, 'admin'));
+  const inventory = `${ui.base}/t/${TENANT}/cards`;
+  await page.getByRole('navigation', { name: 'Destinations' }).getByRole('link', { name: 'Cards' }).click();
+  await page.waitForURL(inventory);
+  const rows = page.getByRole('region', { name: 'Cards', exact: true }).locator('tbody tr');
+  const mine = rows.filter({ hasText: prompt.name });
+  await expect.poll(() => mine.count()).toBe(2);
+  expect(await rows.filter({ hasText: agent.name }).count()).toBe(1);
+  expect(await page.getByRole('region', { name: 'Cards', exact: true }).textContent()).not.toContain(theirs.name);
+
+  // Kind and name filters live in the URL; Back restores them.
+  await page.getByRole('navigation', { name: 'Kinds' }).getByRole('button', { name: 'Prompt', exact: true }).click();
+  await expect.poll(() => new URL(page.url()).searchParams.get('kind')).toBe('Prompt');
+  await expect.poll(() => rows.filter({ hasText: agent.name }).count()).toBe(0);
+  expect(new Set(await rows.locator('td:first-child').allTextContents())).toEqual(new Set(['Prompt']));
+  await page.getByLabel('Filter').fill('reply-agent');
+  await page.getByLabel('Filter').press('Enter');
+  await expect.poll(() => page.getByRole('region', { name: 'Cards', exact: true }).textContent()).toContain('No Card version matches these filters.');
+  await page.goBack();
+  await expect.poll(() => mine.count()).toBe(2);
+  expect(new URL(page.url()).searchParams.get('q')).toBeNull();
+  expect(new URL(page.url()).searchParams.get('kind')).toBe('Prompt');
+  // An invalid filter is the server's stable refusal.
+  await page.getByLabel('Filter').fill('name = = "x"');
+  await page.getByLabel('Filter').press('Enter');
+  await expect.poll(() => page.getByRole('region', { name: 'Cards', exact: true }).textContent()).toContain('WYRD_SPEC_400_VALIDATION');
+  await page.goBack();
+
+  // A row opens its exact version; Back returns to the filtered rows.
+  await rows.filter({ hasText: '1.1.0' }).getByRole('button', { name: prompt.name }).click();
+  await page.waitForURL((url) => url.pathname.endsWith('/cards/detail') && url.searchParams.get('version') === '1.1.0');
+  expect(new URL(page.url()).searchParams.get('uid')).toBe(prompt.uid);
+  const definition = page.getByRole('region', { name: 'Prompt', exact: true });
+  await expect.poll(() => definition.textContent()).toContain('Cite the policy section you rely on.');
+  expect(await page.getByRole('region', { name: 'Variables', exact: true }).textContent()).toMatch(/ticket.*tone/);
+  expect(await page.getByRole('region', { name: 'Used by', exact: true }).textContent()).toContain(`${agent.name}@1.0.0`);
+  const changes = page.getByRole('region', { name: 'Changes', exact: true });
+  expect(await changes.textContent()).toContain('v1.0.0 → v1.1.0');
+  expect(await changes.getByRole('region', { name: 'response_format', exact: true }).getByLabel('v1.1.0').textContent()).toContain('verdict');
+  expect(await page.getByRole('button', { name: /Open in Observe/ }).isDisabled()).toBe(true);
+
+  // Choosing another version replaces the whole reference; that version has no Agent and compares against 1.1.0.
+  await page.getByLabel('Version').selectOption('1.0.0');
+  await expect.poll(() => new URL(page.url()).searchParams.get('version')).toBe('1.0.0');
+  expect(new URL(page.url()).searchParams.get('uid')).toBeNull();
+  await expect.poll(() => page.getByRole('region', { name: 'Used by', exact: true }).textContent()).toContain('No registered Agent uses this Prompt version.');
+  expect(await page.getByRole('region', { name: 'Changes', exact: true }).textContent()).toContain('v1.1.0 → v1.0.0');
+  expect(await definition.textContent()).not.toContain('Cite the policy section');
+
+  // Tabs keep the exact reference: Versions, YAML, then Files.
+  await page.getByRole('navigation', { name: `${prompt.name} sections` }).getByRole('button', { name: 'YAML' }).click();
+  await expect.poll(() => new URL(page.url()).searchParams.get('tab')).toBe('yaml');
+  await expect.poll(() => page.getByRole('region', { name: 'YAML', exact: true }).textContent()).toContain('version: "1.0.0"');
+  await page.getByRole('navigation', { name: `${prompt.name} sections` }).getByRole('button', { name: 'Files' }).click();
+  await expect.poll(() => page.getByRole('region', { name: 'Files', exact: true }).textContent()).toContain('Registration recorded no files for this version.');
+  expect(new URL(page.url()).searchParams.get('version')).toBe('1.0.0');
+
+  // The Agent's relationships open the exact Prompt it uses.
+  await page.goto(`${ui.base}/t/${TENANT}/cards/detail?kind=Agent&name=${agent.name}&version=1.0.0`);
+  const related = page.getByRole('region', { name: 'Relationships', exact: true });
+  await related.getByRole('button', { name: `${prompt.name}@1.1.0` }).click();
+  await expect.poll(() => new URL(page.url()).searchParams.get('uid')).toBe(prompt.uid);
+  // A file-carrying Card lists what registration recorded.
+  await page.goto(`${ui.base}/t/${TENANT}/cards/detail?kind=Model&name=${model.name}&version=${model.version}&tab=files`);
+  await expect.poll(() => page.getByRole('region', { name: 'Files', exact: true }).textContent()).toContain('support-model.bin');
+
+  // An invalid identity is a validation error, an absent version not found, and another tenant's Card absent; none falls back to latest.
+  const detail = `${ui.base}/t/${TENANT}/cards/detail`;
+  expect(await serverHtml(page, `${detail}?kind=Prompt&name=${prompt.name}`)).toContain('WYRD_SPEC_400_VALIDATION');
+  expect(await serverHtml(page, `${detail}?kind=Prompt&name=${prompt.name}&version=latest`)).toContain('WYRD_SPEC_400_VALIDATION');
+  expect(await serverHtml(page, `${detail}?kind=Prompt&name=${prompt.name}&version=9.9.9`)).toContain('WYRD_REGISTRY_404_CARD_NOT_FOUND');
+  expect(await serverHtml(page, `${detail}?kind=Prompt&name=${theirs.name}&version=${theirs.version}`)).toContain('WYRD_REGISTRY_404_CARD_NOT_FOUND');
+
+  // A principal holding no role sees the inventory and detail denied with the stable code.
+  const viewer = await signIn(ui.browser, ui.base, TENANT, ui.readerKey);
+  await viewer.goto(inventory);
+  await expect.poll(() => viewer.getByRole('region', { name: 'Cards', exact: true }).textContent()).toContain('WYRD_PERMISSION_403_DENIED_RBAC');
+  expect(await serverHtml(viewer, `${detail}?kind=Prompt&name=${prompt.name}&version=1.1.0`)).toContain('WYRD_PERMISSION_403_DENIED_RBAC');
 });
 
 /** The repository root, where `mise run dev:full` runs. */

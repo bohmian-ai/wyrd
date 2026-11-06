@@ -426,14 +426,7 @@ impl VerifierRunner {
                     Phase::Engine,
                     tokio::time::timeout_at(
                         deadline,
-                        self.dispatch(
-                            tenant,
-                            run,
-                            &verifier.spec,
-                            system,
-                            &state,
-                            telemetry,
-                        ),
+                        self.dispatch(tenant, run, &verifier.spec, system, &state, telemetry),
                     )
                     .instrument(tracing::info_span!("verification.engine")),
                 )
@@ -616,7 +609,10 @@ impl VerifierRunner {
                 )
             }),
         );
-        match engine.run(Arc::clone(spec), evidence, state.deadline()).await {
+        match engine
+            .run(Arc::clone(spec), evidence, state.deadline())
+            .await
+        {
             Ok(outcome) => EngineOutcome::Completed(outcome),
             Err(error) => engine_failure(run, &error),
         }

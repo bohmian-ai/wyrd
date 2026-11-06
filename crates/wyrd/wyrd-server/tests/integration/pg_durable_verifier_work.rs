@@ -12,10 +12,13 @@ use serde_json::{Value, json};
 use skald_spec::MediaFormat;
 use tokio_util::sync::CancellationToken;
 use vala_bifrost_redux::catalog::TableRef;
+use vala_bifrost_redux::contracts::ScribeStateAdvance;
 use vala_bifrost_redux::namespaces::BifrostNamespace;
 use vala_verify::blocks::{CallInput, CallValue, Checkpoints as _};
 use wyrd_runtime::principal::PrincipalId;
 use wyrd_server::query::scheduled::ScheduledQueryCaller;
+use wyrd_server::scribe_outbox::ScribeWrite;
+use wyrd_server::verification::VerificationRuntime;
 use wyrd_server::verification::authority::SystemReadAuthority;
 use wyrd_server::verification::hosted::HostedLimits;
 use wyrd_server::verification::hosted::evidence::TenantEvidence;
@@ -23,16 +26,18 @@ use wyrd_server::verification::hosted::publications::{Publications, PublishCall}
 use wyrd_server::verification::hosted::workspace::{Workspace, Workspaces};
 use wyrd_server::verification::inputs::InputResolver;
 use wyrd_server::verification::leases::LeaseRenewal;
-use wyrd_server::verification::state::{RunState, StateRow, StateWriter};
+use wyrd_server::verification::results::{ResultPayloadBuilder, ResultRun};
+use wyrd_server::verification::state::{RunState, StateError, StateRow, StateWriter};
 use wyrd_spec::auth::Attribution;
-use wyrd_spec::ids::SlotName;
-use wyrd_spec::verification::VerificationError;
+use wyrd_spec::ids::{CardUid, SlotName};
 use wyrd_spec::verification::execution::{
     InputDeclaration, Producer, ProducerInvocation, PublicationCollection, PublicationContent,
     PublicationFile, PublicationKind, PublicationManifest, Speculation, StepStatus,
+    VerificationOutcome, VerificationResult,
 };
-use wyrd_spec::verification::state::ExecutionState;
+use wyrd_spec::verification::state::{EXECUTION_STATE_FORMAT, ExecutionState};
 use wyrd_spec::verification::{PublicationName, TaskId};
+use wyrd_spec::verification::{VerificationError, VerificationVerdict};
 use wyrd_sql::queries::auth::service_accounts::system_principal_id;
 use wyrd_sql::queries::verifier_executions::{
     ClaimedExecution, ExecutionLease, Settlement, TerminalStatus, VerifierExecutionQueue,
@@ -104,7 +109,9 @@ impl Leased {
             VerifierExecutionQueue::default(),
             std::time::Duration::from_secs(300),
         ));
-        let run = Self::writer(&server, &renewal, system, &claimed).await;
+        let run = Self::writer(&server, &renewal, system, &claimed)
+            .await
+            .expect("the execution state claims");
         Self {
             server,
             lease: claimed.lease,
@@ -138,14 +145,14 @@ impl Leased {
 
     /// Claim `claimed`'s execution state for its lease, as a worker would.
     ///
-    /// # Panics
-    /// Panics when the state claim or its recovery read fails.
+    /// # Errors
+    /// Returns the [`StateError`] refusing the claim or its recovery read.
     async fn writer(
         server: &WyrdTestServer,
         renewal: &Arc<LeaseRenewal>,
         system: PrincipalId,
         claimed: &ClaimedExecution,
-    ) -> Arc<RunState> {
+    ) -> Result<Arc<RunState>, StateError> {
         let tenant = server.data_tenant_id();
         let query = Self::query(server, system).await;
         let lease = renewal.hold(tenant, claimed.lease.token, &CancellationToken::new());
@@ -171,9 +178,8 @@ impl Leased {
             Some(Arc::new(lease)),
             Some(&InputResolver::new(&query, None)),
         )
-        .await
-        .expect("the execution state claims");
-        Arc::new(run)
+        .await?;
+        Ok(Arc::new(run))
     }
 
     /// The execution's accepted state, read back from Bifrost.
@@ -217,6 +223,20 @@ impl Leased {
     /// # Panics
     /// Panics when the update or either claim fails.
     async fn reclaim(&self) -> Arc<RunState> {
+        self.try_reclaim()
+            .await
+            .expect("the execution state claims")
+    }
+
+    /// Expire the lease on the database clock and claim the execution again,
+    /// returning its writer's claim of the state.
+    ///
+    /// # Errors
+    /// Returns the [`StateError`] refusing the state claim.
+    ///
+    /// # Panics
+    /// Panics when the update or the queue claim fails.
+    async fn try_reclaim(&self) -> Result<Arc<RunState>, StateError> {
         let mut conn = self
             .server
             .tenant_conn_for(self.server.data_tenant_id())
@@ -243,6 +263,25 @@ impl Leased {
             .expect("the expired lease is reclaimable");
         conn.commit().await.expect("the reclaim commits");
         Self::writer(&self.server, &self.renewal, self.system, &claimed).await
+    }
+
+    /// The execution's deadline on the database clock.
+    ///
+    /// # Panics
+    /// Panics when the read fails.
+    async fn deadline(&self) -> chrono::DateTime<chrono::Utc> {
+        let mut conn = self
+            .server
+            .tenant_conn_for(self.server.data_tenant_id())
+            .await
+            .expect("tenant connection opens");
+        sqlx::query_scalar(
+            "SELECT deadline_at FROM wyrd.verifier_executions WHERE execution_id = $1",
+        )
+        .bind(self.lease.execution_id.as_uuid())
+        .fetch_one(&mut **conn.transaction())
+        .await
+        .expect("the deadline reads")
     }
 
     /// Every accepted publication of the execution as (task, attempt, name),
@@ -1312,4 +1351,536 @@ async fn cancelled_work_keeps_checkpoints_and_fences_stale_writes() {
         .shutdown()
         .await
         .expect("test server shuts down");
+}
+
+/// The (step, attempt) of every invocation `state` records, in commit order.
+fn attempts(state: &ExecutionState) -> Vec<(String, u32)> {
+    state
+        .invocations
+        .iter()
+        .map(|invocation| {
+            (
+                invocation.producer.step_id.as_str().to_owned(),
+                invocation.producer.attempt,
+            )
+        })
+        .collect()
+}
+
+/// A verdict-only outcome with no requirement or step.
+fn outcome(verdict: VerificationVerdict) -> VerificationOutcome {
+    VerificationOutcome {
+        verdict,
+        requirements: Vec::new(),
+        steps: Vec::new(),
+        evidence: BTreeMap::new(),
+    }
+}
+
+/// A reclaim resumes invocation attempts from the accepted Bifrost state
+/// under the execution's original deadline.
+///
+/// The first claim begins two attempts and abandons a third before it ran.
+/// The reclaim recovers exactly the two begun attempts, both still spent, so
+/// a retry of one starts its next attempt; the abandoned attempt is gone, the
+/// database deadline is unchanged, and PostgreSQL holds no invocation copy.
+///
+/// # Panics
+/// Panics when a revision is refused, the reclaim recovers other attempts,
+/// the deadline moves, or a PostgreSQL invocation table exists.
+#[tokio::test(flavor = "multi_thread")]
+async fn invocations_resume_from_bifrost_with_original_bounds() {
+    let leased = Leased::start().await;
+    let task = |id: &str| TaskId::new(id).expect("task");
+    for step in ["review", "judge", "refused"] {
+        leased
+            .run
+            .begin(&task(step), 1)
+            .await
+            .expect("the attempt is accepted");
+    }
+    leased
+        .run
+        .forget(&task("refused"), 1)
+        .await
+        .expect("the attempt refused capacity is forgotten");
+    let deadline = leased.deadline().await;
+
+    let current = leased.reclaim().await;
+    assert_eq!(
+        attempts(&current.snapshot().await),
+        [("review".to_owned(), 1), ("judge".to_owned(), 1)]
+    );
+    current
+        .begin(&task("judge"), 2)
+        .await
+        .expect("the interrupted attempt retries as its next attempt");
+    assert_eq!(
+        attempts(&leased.accepted().await),
+        [
+            ("review".to_owned(), 1),
+            ("judge".to_owned(), 1),
+            ("judge".to_owned(), 2)
+        ]
+    );
+    assert_eq!(
+        leased.deadline().await,
+        deadline,
+        "a reclaim keeps the deadline"
+    );
+    let mut conn = leased
+        .server
+        .tenant_conn_for(leased.server.data_tenant_id())
+        .await
+        .expect("tenant connection opens");
+    let legacy: Option<String> =
+        sqlx::query_scalar("SELECT to_regclass('wyrd.verifier_execution_invocations')::text")
+            .fetch_one(&mut **conn.transaction())
+            .await
+            .expect("the catalog reads");
+    assert_eq!(legacy, None, "no PostgreSQL invocation copy exists");
+    drop(conn);
+    leased
+        .server
+        .shutdown()
+        .await
+        .expect("test server shuts down");
+}
+
+/// A reclaim recovers every accepted publication with its exact private
+/// File descriptors and replay receipt from the Bifrost state.
+///
+/// The first claim publishes a file and a JSON value. The reclaim's state
+/// holds the identical accepted publications, objects included; replaying
+/// the same call after its scratch is removed is accepted without a new
+/// entry, the replaced writer is refused, and an evidence reader bound to
+/// the recovered state resolves the same descriptors from it.
+///
+/// # Panics
+/// Panics when a publication is refused or differs after recovery, a replay
+/// adds an entry, the stale writer publishes, or the reader resolves other
+/// descriptors.
+#[tokio::test(flavor = "multi_thread")]
+async fn publications_recover_exact_descriptors_from_run_state() {
+    let leased = Leased::start().await;
+    let limits = HostedLimits::default();
+    let caller = user(leased.server.data_tenant_id(), []);
+    let task = TaskId::new("review").expect("task");
+    leased
+        .run
+        .begin(&task, 1)
+        .await
+        .expect("the attempt begins");
+    let producer = Producer {
+        step_id: task.clone(),
+        item_index: None,
+        iteration_index: None,
+        attempt: 1,
+    };
+    let workspace = Arc::new(Workspace::materialize(Vec::new(), limits, None).expect("workspace"));
+    std::fs::write(workspace.work_dir().join("report.md"), "# Kept\n").expect("write");
+    let first = Publications::new(leased.server.state(), &caller, &leased.run, limits);
+    first
+        .path(
+            &call("p1", &producer, "report"),
+            &workspace,
+            "/work/report.md",
+        )
+        .await
+        .expect("the file publishes");
+    first
+        .json(&call("p2", &producer, "verdict"), json!({"ok": true}))
+        .await
+        .expect("the value publishes");
+    let accepted = leased.run.publications(&task).await;
+
+    let current = leased.reclaim().await;
+    assert_eq!(
+        current.publications(&task).await,
+        accepted,
+        "the reclaim recovers the exact accepted publications"
+    );
+    std::fs::remove_file(workspace.work_dir().join("report.md")).expect("scratch is removed");
+    Publications::new(leased.server.state(), &caller, &current, limits)
+        .path(
+            &call("p1", &producer, "report"),
+            &workspace,
+            "/work/report.md",
+        )
+        .await
+        .expect("the same call replays its receipt without scratch");
+    first
+        .json(&call("p3", &producer, "late"), json!(null))
+        .await
+        .expect_err("the replaced writer publishes nothing");
+    assert_eq!(
+        leased.entries().await,
+        [
+            ("review".to_owned(), 1, "report".to_owned()),
+            ("review".to_owned(), 1, "verdict".to_owned()),
+        ]
+    );
+    let evidence = TenantEvidence::new(
+        leased.server.state().clone(),
+        caller,
+        BTreeMap::new(),
+        limits,
+    )
+    .with_execution(Arc::clone(&current));
+    let recovered = evidence
+        .publications(&task)
+        .await
+        .expect("publications read");
+    assert_eq!(recovered, accepted);
+    leased
+        .server
+        .shutdown()
+        .await
+        .expect("test server shuts down");
+}
+
+/// The selected terminal outcome and the public inspection reads come from
+/// the accepted Bifrost state.
+///
+/// The first claim records an attempt and a publication and selects a failed
+/// outcome. A reclaim recovers that selection and, asked to select another
+/// outcome, returns the original one with its result identity and times.
+/// The public invocation and publication listings return the accepted
+/// entries for a reader of the execution's Verifier.
+///
+/// # Panics
+/// Panics when a revision is refused, the reclaim selects another outcome or
+/// identity, or an inspection read differs from the accepted state.
+#[tokio::test(flavor = "multi_thread")]
+async fn terminal_selection_and_inspection_use_run_state() {
+    let leased = Leased::start().await;
+    let limits = HostedLimits::default();
+    let caller = user(leased.server.data_tenant_id(), []);
+    let task = TaskId::new("review").expect("task");
+    leased
+        .run
+        .begin(&task, 1)
+        .await
+        .expect("the attempt begins");
+    let producer = Producer {
+        step_id: task.clone(),
+        item_index: None,
+        iteration_index: None,
+        attempt: 1,
+    };
+    Publications::new(leased.server.state(), &caller, &leased.run, limits)
+        .json(&call("p1", &producer, "report"), json!({"v": 1}))
+        .await
+        .expect("the value publishes");
+    let selected = leased
+        .run
+        .select(&outcome(VerificationVerdict::Failed), chrono::Utc::now())
+        .await
+        .expect("the outcome is selected");
+
+    let current = leased.reclaim().await;
+    assert_eq!(current.snapshot().await.terminal.as_ref(), Some(&selected));
+    assert_eq!(
+        current
+            .select(&outcome(VerificationVerdict::Passed), chrono::Utc::now())
+            .await
+            .expect("the selection reads"),
+        selected,
+        "a reclaim re-delivers the selected outcome and identity"
+    );
+
+    let reader = leased
+        .server
+        .bootstrap_user("inspection-reader", &["viewer"])
+        .await
+        .expect("reader bootstraps");
+    let wyrd_testing::Bootstrap::User { jwt, .. } = reader else {
+        panic!("a user bootstraps as a user");
+    };
+    let read = async |path: &str| {
+        let response = leased
+            .server
+            .oneshot_authenticated(
+                &jwt,
+                axum::http::Request::builder()
+                    .uri(format!(
+                        "/v1/verification/executions/{}/{path}",
+                        leased.lease.execution_id
+                    ))
+                    .body(axum::body::Body::empty())
+                    .expect("request builds"),
+            )
+            .await
+            .expect("the read responds");
+        assert_eq!(response.status(), axum::http::StatusCode::OK, "{path}");
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("the body reads");
+        serde_json::from_slice::<Value>(&body).expect("the page is JSON")
+    };
+    let invocations = read("invocations").await;
+    assert_eq!(
+        invocations["items"]
+            .as_array()
+            .expect("items")
+            .iter()
+            .map(|item| item["producer"]["step_id"].clone())
+            .collect::<Vec<_>>(),
+        [json!("review")],
+        "{invocations}"
+    );
+    let publications = read("publications").await;
+    assert_eq!(
+        publications["items"]
+            .as_array()
+            .expect("items")
+            .iter()
+            .map(|item| item["name"].clone())
+            .collect::<Vec<_>>(),
+        [json!("report")],
+        "{publications}"
+    );
+    leased
+        .server
+        .shutdown()
+        .await
+        .expect("test server shuts down");
+}
+
+/// A state in a format this worker does not run keeps its custody: a
+/// reclaim refuses it as incompatible instead of resuming or starting fresh,
+/// and the accepted revision is left unchanged.
+///
+/// # Panics
+/// Panics when the forged revision is not accepted, the reclaim resumes or
+/// starts fresh, or the accepted revision changes.
+#[tokio::test(flavor = "multi_thread")]
+async fn state_format_changes_preserve_existing_custody() {
+    let leased = Leased::start().await;
+    let state = leased.server.state();
+    let tenant = leased.server.data_tenant_id();
+    let mut newer = serde_json::to_value(ExecutionState::fresh()).expect("state encodes");
+    newer["format"] = json!(EXECUTION_STATE_FORMAT + 1);
+    newer["sequence"] = json!(7);
+    let verifier_version = String::new();
+    let mut conn = leased
+        .server
+        .tenant_conn_for(tenant)
+        .await
+        .expect("tenant connection opens");
+    let (card, verifier): (uuid::Uuid, uuid::Uuid) = sqlx::query_as(
+        "SELECT card_uid, verifier_card_uid FROM wyrd.verifier_executions \
+         WHERE execution_id = $1",
+    )
+    .bind(leased.lease.execution_id.as_uuid())
+    .fetch_one(&mut **conn.transaction())
+    .await
+    .expect("the execution's Cards read");
+    drop(conn);
+    let card_uid = CardUid::from_uuid(card).expect("uid");
+    let verifier_uid = CardUid::from_uuid(verifier).expect("uid");
+    let row = ResultPayloadBuilder::new(
+        ResultRun {
+            execution_id: leased.lease.execution_id,
+            run_id: None,
+            verifier_version: &verifier_version,
+            card_uid: &card_uid,
+            owner_card_uid: None,
+            group_id: None,
+            deployment_environment: None,
+            binding_id: None,
+            trigger: None,
+            window: None,
+        },
+        &verifier_uid,
+        chrono::Utc::now(),
+        chrono::Utc::now(),
+    )
+    .checkpoint(1, false, &newer)
+    .expect("the revision row builds");
+    let (sender, acked) = tokio::sync::oneshot::channel();
+    state.bifrost.scribe_outbox().stage(
+        tenant,
+        ScribeWrite::ExecutionState {
+            batch: uuid::Uuid::now_v7(),
+            row: row.row,
+            attribution: Attribution::new(leased.system, leased.system),
+            state: ScribeStateAdvance {
+                key: leased.lease.execution_id.as_uuid(),
+                writer: leased.lease.token.as_uuid(),
+                revision: 1,
+                not_after: None,
+            },
+            acked: std::sync::Mutex::new(Some(sender)),
+        },
+    );
+    acked.await.expect("the newer-format revision is accepted");
+
+    let refused = leased.try_reclaim().await;
+    assert!(
+        matches!(refused, Err(StateError::Incompatible(_))),
+        "a newer state format is refused: {:?}",
+        refused.as_ref().err()
+    );
+    let query = Leased::query(&leased.server, leased.system).await;
+    let kept = RunState::accepted(
+        state,
+        tenant,
+        leased.lease.execution_id,
+        &InputResolver::new(&query, None),
+    )
+    .await;
+    assert!(
+        matches!(kept, Err(StateError::Incompatible(_))),
+        "the accepted revision is unchanged and still refused: {:?}",
+        kept.as_ref().err()
+    );
+    leased
+        .server
+        .shutdown()
+        .await
+        .expect("test server shuts down");
+}
+
+/// Direct and queued verification both select their outcome through the
+/// same Bifrost execution state.
+///
+/// Two direct executions of one assertion Verifier get distinct identities,
+/// admit no queue record, and each leaves an accepted state whose selected
+/// outcome is the one returned. A queued submission of the same request run
+/// by the runtime completes with the result its accepted state selected.
+///
+/// # Panics
+/// Panics when provisioning or a request fails, a direct execution shares an
+/// identity, admits a queue record, or returns an outcome its state did not
+/// select, or the queued result differs from its selected one.
+#[tokio::test(flavor = "multi_thread")]
+async fn direct_and_queued_use_bifrost_run_state() {
+    let server = WyrdTestServer::start_in_process()
+        .await
+        .expect("test server starts");
+    let tenant = server.data_tenant_id();
+    server
+        .ensure_builtin_tables_for_test(tenant)
+        .await
+        .expect("tenant receives every built-in table");
+    let fixture = VerificationFixture::provision(server.state(), tenant)
+        .await
+        .expect("the tenant provisions");
+    let (subject, _) = fixture.service("shared").await.expect("service");
+    let verifier = fixture
+        .verifier(
+            "shared-assertion",
+            &json!({
+                "inputs": { "x": { "type": "json" } },
+                "requirements": [{
+                    "id": "x_is_one",
+                    "statement": "The input x equals one.",
+                    "check": { "kind": "assert", "path": "inputs.x",
+                               "operator": "equals", "expected": 1 }
+                }]
+            }),
+        )
+        .await
+        .expect("verifier");
+    let wyrd_testing::Bootstrap::Machine { api_key, .. } = server
+        .bootstrap_service_in_tenant(tenant, "shared-caller", &["editor"])
+        .await
+        .expect("caller bootstraps")
+    else {
+        panic!("service bootstrap returned a user principal");
+    };
+    let jwt = server
+        .exchange_api_key(&api_key)
+        .await
+        .expect("caller key exchanges");
+    let direct = async || {
+        let response = server
+            .oneshot_authenticated(
+                &jwt,
+                axum::http::Request::builder()
+                    .method(axum::http::Method::POST)
+                    .uri("/v1/verification/execute")
+                    .header(axum::http::header::CONTENT_TYPE, "application/json")
+                    .body(axum::body::Body::from(
+                        json!({
+                            "verifier_card_uid": verifier,
+                            "card_uid": subject,
+                            "inputs": { "x": { "kind": "json", "value": 1 } },
+                        })
+                        .to_string(),
+                    ))
+                    .expect("request builds"),
+            )
+            .await
+            .expect("the execution responds");
+        assert_eq!(response.status(), axum::http::StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("the body reads");
+        serde_json::from_slice::<VerificationResult>(&body).expect("a result")
+    };
+    let results = [direct().await, direct().await];
+    assert_ne!(
+        results[0].execution_id, results[1].execution_id,
+        "fresh direct calls are distinct executions"
+    );
+    for result in &results {
+        let state = fixture
+            .execution_state(server.state(), result.execution_id)
+            .await
+            .expect("the state reads")
+            .expect("a direct execution claims its state");
+        assert_eq!(
+            state.terminal.map(|selected| selected.outcome),
+            Some(result.outcome.clone()),
+            "the direct result is the outcome its state selected"
+        );
+    }
+    assert!(
+        fixture
+            .executions()
+            .await
+            .expect("executions read")
+            .is_empty(),
+        "a direct execution admits no queue record"
+    );
+
+    let queued = fixture
+        .submit(
+            &verifier,
+            &subject,
+            BTreeMap::from([(
+                SlotName::new("x").expect("slot"),
+                InputDeclaration::Json { value: json!(1) },
+            )]),
+        )
+        .await
+        .expect("the execution is admitted");
+    let runtime = VerificationRuntime::builder(server.state())
+        .build()
+        .expect("the runtime composes");
+    let stop = tokio_util::sync::CancellationToken::new();
+    let task = tokio::spawn(runtime.run(stop.clone()));
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_mins(1);
+    let row = loop {
+        let row = fixture.execution(queued).await.expect("execution reads");
+        if row.status == "completed" {
+            break row;
+        }
+        assert!(tokio::time::Instant::now() < deadline, "{row:?}");
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    };
+    stop.cancel();
+    task.await.expect("the runtime stops");
+    let selected = fixture
+        .execution_state(server.state(), queued)
+        .await
+        .expect("the state reads")
+        .expect("the queued execution claimed its state")
+        .terminal
+        .expect("the queued execution selected its outcome");
+    assert_eq!(row.result_id, Some(selected.result_id.as_uuid()));
+    assert_eq!(selected.outcome.verdict, results[0].outcome.verdict);
+    server.shutdown().await.expect("test server shuts down");
 }

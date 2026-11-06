@@ -107,28 +107,28 @@ struct OracleExtensionEnvelope {
 pub struct RemoteScanPayload {
     /// Stable request-local scan identifier.
     #[prost(string, tag = "1")]
-    pub scan_id: String,
+    pub(crate) scan_id: String,
     /// Fingerprint of the expected provider schema.
     #[prost(string, tag = "2")]
-    pub schema_fingerprint: String,
+    pub(crate) schema_fingerprint: String,
     /// Exact filter the data owner applies before producing any row.
     #[prost(message, optional, tag = "3")]
-    pub filter: Option<datafusion_proto::protobuf::PhysicalExprNode>,
+    pub(crate) filter: Option<datafusion_proto::protobuf::PhysicalExprNode>,
     /// Ordered outputs the data owner produces in place of the closure;
     /// absent means the closure itself.
     #[prost(message, optional, tag = "4")]
-    pub outputs: Option<RemoteScanOutputs>,
+    pub(crate) outputs: Option<RemoteScanOutputs>,
 }
 
 /// Ordered output expressions of one remote scan and their names.
 #[derive(Clone, PartialEq, Message)]
-pub struct RemoteScanOutputs {
+pub(crate) struct RemoteScanOutputs {
     /// Output expressions over the signed closure schema, in output order.
     #[prost(message, repeated, tag = "1")]
-    pub exprs: Vec<datafusion_proto::protobuf::PhysicalExprNode>,
+    pub(crate) exprs: Vec<datafusion_proto::protobuf::PhysicalExprNode>,
     /// Output field names, index-aligned with `exprs`.
     #[prost(string, repeated, tag = "2")]
-    pub names: Vec<String>,
+    pub(crate) names: Vec<String>,
 }
 
 /// Leaf a live Scribe fragment carries in place of the Scribe's own source.
@@ -174,7 +174,7 @@ impl RemoteSourcePlaceholderExec {
     /// # Errors
     ///
     /// Returns a plan error when `outputs` do not plan over the closure.
-    pub fn with_requirements(
+    pub(crate) fn with_requirements(
         mut self,
         filter: Option<Arc<dyn PhysicalExpr>>,
         outputs: Option<datafusion::physical_expr::projection::ProjectionExprs>,
@@ -363,7 +363,7 @@ impl OraclePhysicalExtensionCodec {
     /// # Errors
     /// Returns a plan error when the envelope or payload is invalid, or the
     /// extension is not a remote scan.
-    pub fn preflight_extension(bytes: &[u8]) -> Result<RemoteScanPayload> {
+    pub(crate) fn preflight_extension(bytes: &[u8]) -> Result<RemoteScanPayload> {
         let envelope = OracleExtensionEnvelope::decode(bytes).map_err(|error| {
             DataFusionError::Plan(format!("invalid Oracle extension envelope: {error}"))
         })?;
@@ -380,6 +380,23 @@ impl OraclePhysicalExtensionCodec {
         RemoteScanPayload::decode(envelope.payload.as_slice())
             .map_err(|error| DataFusionError::Plan(format!("invalid remote scan payload: {error}")))
     }
+}
+
+/// Test-only observation of the exact filter a remote scan placeholder ships.
+///
+/// Decodes `bytes`, a placeholder's extension node, through the same
+/// preflight the follower runs, so a journey outside the crate can inspect
+/// the signed filter without the payload's other contents becoming public.
+/// Present only under `test-support`.
+///
+/// # Errors
+/// Returns the preflight's plan error when `bytes` is not a valid remote scan
+/// extension.
+#[cfg(feature = "test-support")]
+pub fn remote_scan_filter_for_test(
+    bytes: &[u8],
+) -> Result<Option<datafusion_proto::protobuf::PhysicalExprNode>> {
+    Ok(OraclePhysicalExtensionCodec::preflight_extension(bytes)?.filter)
 }
 
 impl PhysicalExtensionCodec for OraclePhysicalExtensionCodec {

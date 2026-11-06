@@ -33,7 +33,7 @@ use wyrd_server::verification::hosted::publications::{Publications, PublishCall}
 use wyrd_server::verification::hosted::workspace::Workspace;
 use wyrd_server::verification::inputs::InputResolver;
 use wyrd_server::verification::results::{InputRecord, ResultPayloadBuilder, ResultRun};
-use wyrd_server::verification::state::{RunState, StateRow};
+use wyrd_server::verification::state::{RunState, StateError, StateRow, StateWriter};
 use wyrd_spec::DataTenantId;
 use wyrd_spec::auth::Attribution;
 use wyrd_spec::card::verifier::{OWNER_OCCURRENCE_KEY, VerifierSpec};
@@ -52,7 +52,7 @@ use wyrd_sql::queries::verification::{
     BindingActivation, FrozenTarget, NewBinding, project_bindings, record_machine_authentication,
 };
 use wyrd_sql::queries::verifier_executions::{
-    Submission, SubmissionOutcome, VerifierExecutionQueue,
+    ClaimedExecution, Submission, SubmissionOutcome, VerifierExecutionQueue,
 };
 use wyrd_sql::row_types::cards::CardStatus;
 use wyrd_sql::{SqlError, TenantConn, WyrdPostgres};
@@ -691,38 +691,8 @@ impl VerificationFixture {
     ) -> Result<ExecutionId, VerificationFixtureError> {
         let refused =
             |error: &dyn std::fmt::Debug| VerificationFixtureError::Card(format!("{error:?}"));
-        let queue = VerifierExecutionQueue::default();
-        let mut conn = self.postgres.tenant_conn(self.tenant).await?;
-        let claimed = queue
-            .claim(
-                &mut conn,
-                chrono::Duration::minutes(30),
-                chrono::Duration::minutes(30),
-                1,
-            )
-            .await?
-            .pop()
-            .ok_or_else(|| {
-                VerificationFixtureError::NotEnqueued("nothing is claimable".to_owned())
-            })?;
-        conn.commit().await?;
-        let run = RunState::fresh(
-            state,
-            Arc::clone(state.bifrost.scribe_outbox()),
-            self.tenant,
-            StateRow {
-                execution_id: claimed.lease.execution_id,
-                verifier_uid: claimed.verifier_card_uid.clone(),
-                card_uid: claimed.card_uid.clone(),
-                owner_card_uid: claimed.owner_card_uid.clone(),
-                run_id: None,
-                deployment_environment: claimed.deployment_environment.clone(),
-                attribution: claimed.attribution,
-            },
-            tokio::time::Instant::now() + std::time::Duration::from_secs(60),
-        )
-        .await
-        .map_err(|e| refused(&e))?;
+        let (claimed, run) = self.claim_state(state).await?;
+        let run = run.map_err(|e| refused(&e))?;
         let mut steps: Vec<&str> = Vec::new();
         for (step, ..) in publications {
             if !steps.contains(step) {
@@ -818,8 +788,103 @@ impl VerificationFixture {
         state: &AppState,
         execution: ExecutionId,
     ) -> Result<Option<ExecutionState>, VerificationFixtureError> {
-        let refused =
-            |error: &dyn std::fmt::Debug| VerificationFixtureError::Card(format!("{error:?}"));
+        let query = self.system_query(state).await?;
+        let accepted = RunState::accepted(
+            state,
+            self.tenant,
+            execution,
+            &InputResolver::new(&query, None),
+        )
+        .await
+        .map_err(|error| VerificationFixtureError::Card(format!("{error:?}")))?;
+        Ok(accepted.map(|(_, accepted)| accepted))
+    }
+
+    /// Claim the tenant's next due execution as a worker would, then claim
+    /// its Bifrost state as that lease's writer at the attempt's generation,
+    /// recovering the accepted revision as the tenant's SYSTEM principal.
+    /// The returned state confirms no lease before its revisions.
+    ///
+    /// # Errors
+    /// Returns [`VerificationFixtureError`] when nothing is claimable or the
+    /// claim or read authority fails; a refused state claim is the inner
+    /// [`StateError`].
+    pub async fn claim_state(
+        &self,
+        state: &AppState,
+    ) -> Result<(ClaimedExecution, Result<RunState, StateError>), VerificationFixtureError> {
+        let mut conn = self.postgres.tenant_conn(self.tenant).await?;
+        let claimed = VerifierExecutionQueue::default()
+            .claim(
+                &mut conn,
+                chrono::Duration::minutes(30),
+                chrono::Duration::minutes(30),
+                1,
+            )
+            .await?
+            .pop()
+            .ok_or_else(|| {
+                VerificationFixtureError::NotEnqueued("nothing is claimable".to_owned())
+            })?;
+        conn.commit().await?;
+        let query = self.system_query(state).await?;
+        let run = RunState::claim(
+            state,
+            Arc::clone(state.bifrost.scribe_outbox()),
+            self.tenant,
+            StateRow {
+                execution_id: claimed.lease.execution_id,
+                verifier_uid: claimed.verifier_card_uid.clone(),
+                card_uid: claimed.card_uid.clone(),
+                owner_card_uid: claimed.owner_card_uid.clone(),
+                run_id: None,
+                deployment_environment: claimed.deployment_environment.clone(),
+                attribution: claimed.attribution,
+            },
+            StateWriter {
+                writer: claimed.lease.token.as_uuid(),
+                generation: i64::from(claimed.attempt),
+                not_after: Some(claimed.deadline_at),
+                deadline: tokio::time::Instant::now() + std::time::Duration::from_secs(60),
+            },
+            None,
+            Some(&InputResolver::new(&query, None)),
+        )
+        .await;
+        Ok((claimed, run))
+    }
+
+    /// Expire `execution`'s lease on the database clock, so the next claim
+    /// takes it over.
+    ///
+    /// # Errors
+    /// Returns [`VerificationFixtureError`] when the update fails.
+    pub async fn expire_lease(
+        &self,
+        execution: ExecutionId,
+    ) -> Result<(), VerificationFixtureError> {
+        let mut conn = self.postgres.tenant_conn(self.tenant).await?;
+        sqlx::query(
+            "UPDATE wyrd.verifier_executions SET lease_expires_at = statement_timestamp() \
+             WHERE execution_id = $1",
+        )
+        .bind(execution.as_uuid())
+        .execute(&mut **conn.transaction())
+        .await?;
+        conn.commit().await?;
+        Ok(())
+    }
+
+    /// A query caller reading the tenant's execution records as its SYSTEM
+    /// principal.
+    ///
+    /// # Errors
+    /// Returns [`VerificationFixtureError`] when the read authority does not
+    /// resolve.
+    async fn system_query(
+        &self,
+        state: &AppState,
+    ) -> Result<ScheduledQueryCaller, VerificationFixtureError> {
         let tables = ["execution_inputs", "execution_outputs", "execution_events"]
             .map(|name| TableRef::new(BifrostNamespace::Verification, name));
         let read = SystemReadAuthority::resolve(
@@ -829,18 +894,12 @@ impl VerificationFixture {
             &tables,
         )
         .await
-        .map_err(|e| refused(&e))?;
-        let query =
-            ScheduledQueryCaller::new(state.clone(), read.into_context(), CancellationToken::new());
-        let accepted = RunState::accepted(
-            state,
-            self.tenant,
-            execution,
-            &InputResolver::new(&query, None),
-        )
-        .await
-        .map_err(|e| refused(&e))?;
-        Ok(accepted.map(|(_, accepted)| accepted))
+        .map_err(|error| VerificationFixtureError::Card(format!("{error:?}")))?;
+        Ok(ScheduledQueryCaller::new(
+            state.clone(),
+            read.into_context(),
+            CancellationToken::new(),
+        ))
     }
 
     /// Every execution of this tenant, oldest first.

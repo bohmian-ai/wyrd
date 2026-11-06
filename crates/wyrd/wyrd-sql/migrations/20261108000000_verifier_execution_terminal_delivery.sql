@@ -7,14 +7,11 @@
 -- then `delivery_due_at` keeps that delivery claimable: a runner claims it by
 -- moving the instant one lease ahead, records the decision without
 -- computing, and clears it once acknowledged, so the delivery survives every
--- process interruption. Only terminal statuses without a verdict can owe a
--- delivery; executions settled before this migration keep their queue record
--- only.
+-- process interruption. Only the writers settling a terminal status without
+-- a verdict set it; executions settled before this migration keep their
+-- queue record only.
 ALTER TABLE wyrd.verifier_executions
-    ADD COLUMN delivery_due_at timestamptz,
-    ADD CONSTRAINT verifier_executions_delivery_shape CHECK (
-        delivery_due_at IS NULL OR status IN ('cancelled', 'timed_out', 'errored')
-    );
+    ADD COLUMN delivery_due_at timestamptz;
 
 CREATE INDEX verifier_executions_delivery_due
     ON wyrd.verifier_executions (data_tenant_id, delivery_due_at)

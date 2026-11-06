@@ -715,8 +715,8 @@ const BINDING_TARGETS_SQL: &str = r"
 /// probe is not repeated for the filter and the order. A scan therefore costs
 /// the tenants with queued or running work and never the rows they hold;
 /// grouping the claimable rows instead read the whole backlog every round.
-/// Tenants owing a due terminal delivery join through the partial index of
-/// owed deliveries, which holds no settled history.
+/// Tenants owing a due terminal delivery are walked the same way through the
+/// partial index of owed deliveries, which holds no settled history.
 const RUNNABLE_TENANTS_SQL: &str = r"
     WITH RECURSIVE queued(tenant) AS (
         (SELECT data_tenant_id FROM wyrd.verifier_executions
@@ -752,17 +752,29 @@ const RUNNABLE_TENANTS_SQL: &str = r"
           FROM (SELECT tenant FROM queued WHERE tenant IS NOT NULL
                 UNION
                 SELECT tenant FROM leased WHERE tenant IS NOT NULL) AS t
-    )
+    ), owing(tenant) AS (
+        (SELECT data_tenant_id FROM wyrd.verifier_executions
+          WHERE delivery_due_at IS NOT NULL
+          ORDER BY data_tenant_id DESC, delivery_due_at DESC LIMIT 1)
+        UNION ALL
+        SELECT (SELECT e.data_tenant_id FROM wyrd.verifier_executions e
+                 WHERE e.delivery_due_at IS NOT NULL AND e.data_tenant_id < o.tenant
+                 ORDER BY e.data_tenant_id DESC, e.delivery_due_at DESC LIMIT 1)
+          FROM owing o
+         WHERE o.tenant IS NOT NULL
     ), delivering AS (
-        SELECT data_tenant_id AS tenant, min(delivery_due_at) AS since
-          FROM wyrd.verifier_executions
-         WHERE delivery_due_at <= statement_timestamp()
-         GROUP BY data_tenant_id
+        SELECT o.tenant,
+               (SELECT min(e.delivery_due_at) FROM wyrd.verifier_executions e
+                 WHERE e.data_tenant_id = o.tenant
+                   AND e.delivery_due_at <= statement_timestamp()) AS since
+          FROM owing o
+         WHERE o.tenant IS NOT NULL
     )
     SELECT tenant
-      FROM (SELECT tenant, since FROM waiting WHERE since IS NOT NULL
+      FROM (SELECT tenant, since FROM waiting
             UNION ALL
             SELECT tenant, since FROM delivering) AS due
+     WHERE since IS NOT NULL
      GROUP BY tenant
      ORDER BY min(since), tenant
 ";
@@ -4256,7 +4268,8 @@ mod pg_tests {
     /// # Panics
     /// Panics when the fixture cannot start, seeding or `EXPLAIN` fails, or
     /// the plan reads `verifier_executions` other than through
-    /// `verifier_runs_due` or `verifier_runs_leased`.
+    /// `verifier_runs_due`, `verifier_runs_leased`, or
+    /// `verifier_executions_delivery_due`.
     #[tokio::test]
     async fn runnable_scan_walks_the_claim_indexes_however_large_the_backlog() {
         let fixture = PgFixture::start().await.expect("fixture starts");
@@ -4285,7 +4298,14 @@ mod pg_tests {
         for (node, index) in execution_reads(&plan) {
             assert!(
                 (node == "Index Only Scan" || node == "Index Scan")
-                    && (index == "verifier_runs_due" || index == "verifier_runs_leased"),
+                    && matches!(
+                        index.as_str(),
+                        Some(
+                            "verifier_runs_due"
+                                | "verifier_runs_leased"
+                                | "verifier_executions_delivery_due"
+                        )
+                    ),
                 "{node} via {index} in {plan}"
             );
         }

@@ -1244,14 +1244,15 @@ async fn unscorable_verifier_errors_without_publishing() {
 /// A run commits `completed` only once Scribe acknowledges its result: while
 /// the result is held before Scribe the run stays `running` with no selected
 /// result, and completes on its first attempt once released. A result Scribe
-/// rejects retries the run with `result_undelivered`, and the retry completes
-/// it; a result still unacknowledged at the deadline times the run out with
-/// no result.
+/// rejects defers the run without spending an attempt, and the next claim
+/// delivers the same selected result; a result still unacknowledged at the
+/// deadline keeps the run waiting for it rather than timing out an outcome
+/// its state already selected.
 ///
 /// # Panics
 /// Panics when a run completes before its result is acknowledged, a
-/// rejected result does not retry and complete, or an unacknowledged one
-/// does not time out.
+/// rejected result is not delivered again under its identity, or an
+/// unacknowledged one ends the run at its deadline.
 #[tokio::test]
 async fn completion_waits_for_the_durable_result() {
     let harness = Harness::start().await;
@@ -1285,21 +1286,49 @@ async fn completion_waits_for_the_durable_result() {
 
     harness.fault.reject_next(OUTPUTS);
     let run = harness.submit().await;
-    let row = harness.wait_execution(run, status("retrying")).await;
-    assert_eq!(row.error_code.as_deref(), Some("result_undelivered"));
-    assert_eq!(row.result_id, None);
-    harness.expire(run).await;
     let row = harness.wait_execution(run, status("completed")).await;
-    assert_eq!(row.attempts, 2, "the retry delivers its own result");
+    assert_eq!(row.attempts, 1, "the deferred delivery spends no attempt");
+    let outputs = sent_to(&harness.fault, OUTPUTS).await;
+    let delivered: Vec<_> = outputs[1..].iter().map(sent_result_id).collect();
+    assert_eq!(
+        delivered,
+        vec![row.result_id.expect("a result").to_string(); 2],
+        "the rejected result is delivered again under its identity"
+    );
 
     let hold = harness.fault.hold_next(OUTPUTS);
     let run = harness.submit().await;
-    let row = harness.wait_execution(run, status("timed_out")).await;
+    tokio::time::timeout(WAIT, hold.arrived())
+        .await
+        .expect("the result reaches Scribe");
+    let deadline = tokio::time::Instant::now() + WAIT;
+    loop {
+        let passed: bool = sqlx::query_scalar(
+            "SELECT deadline_at < statement_timestamp() FROM wyrd.verifier_executions \
+             WHERE execution_id = $1",
+        )
+        .bind(run.as_uuid())
+        .fetch_one(&harness.assertion)
+        .await
+        .expect("the deadline reads");
+        if passed {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "timed out waiting for the execution deadline"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    let row = harness.seed.execution(run).await.expect("execution reads");
     assert_eq!(
-        (row.error_code.as_deref(), row.result_id),
-        (Some("execution_timed_out"), None)
+        (row.status.as_str(), row.result_id),
+        ("running", None),
+        "a selected result is awaited past the deadline"
     );
     hold.release();
+    let row = harness.wait_execution(run, status("completed")).await;
+    assert_eq!((row.attempts, row.error_code), (1, None));
     runtime.stop().await;
 }
 
@@ -2057,51 +2086,7 @@ async fn final_attempt_after_a_failed_settlement_completes_instead_of_exhausting
 /// outcome.
 async fn redelivers_the_selected_result(final_attempt: bool) {
     let harness = Harness::start().await;
-    let abandoned = EngineScript::default();
-    abandoned.hold();
-    abandoned.push(EngineOutcome::Completed(drifting_report()));
-    let stale = harness.spawn(&Harness::limits(), &abandoned);
-    let run = harness.submit().await;
-    wait_until("the first claim", || abandoned.entered() == 1).await;
-    let (Some(token), _) = harness.lease(run).await else {
-        panic!("the first attempt holds a lease");
-    };
-    for statement in [
-        "CREATE OR REPLACE FUNCTION public.fail_settlement() RETURNS trigger \
-         LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'injected settlement failure'; END $$"
-            .to_owned(),
-        format!(
-            "CREATE CONSTRAINT TRIGGER fail_settlement AFTER UPDATE ON wyrd.verifier_executions \
-             DEFERRABLE INITIALLY DEFERRED FOR EACH ROW \
-             WHEN (NEW.status = 'completed' AND OLD.lease_token = '{token}'::uuid) \
-             EXECUTE FUNCTION public.fail_settlement()"
-        ),
-    ] {
-        sqlx::query(AssertSqlSafe(statement))
-            .execute(&harness.assertion)
-            .await
-            .expect("the settlement fault installs");
-    }
-    if final_attempt {
-        sqlx::query(
-            "UPDATE wyrd.verifier_executions SET max_attempts = attempts WHERE execution_id = $1",
-        )
-        .bind(run.as_uuid())
-        .execute(&harness.assertion)
-        .await
-        .expect("the attempt becomes the final one");
-    }
-    abandoned.release();
-    let deadline = tokio::time::Instant::now() + WAIT;
-    while !harness.writes().await.iter().any(|table| table == RESULTS) {
-        assert!(
-            tokio::time::Instant::now() < deadline,
-            "timed out waiting for the abandoned result to be staged"
-        );
-        tokio::time::sleep(Duration::from_millis(5)).await;
-    }
-
-    stale.stop.cancel();
+    let (run, stale) = stage_unsettled_result(&harness, final_attempt).await;
     harness.expire(run).await;
     let winner = EngineScript::default();
     winner.push(EngineOutcome::Completed(unscored_report()));
@@ -2159,6 +2144,216 @@ async fn redelivers_the_selected_result(final_attempt: bool) {
         state["result"]["outcome"]["verdict"], "failed",
         "the selected verdict is read: {state}"
     );
+}
+
+/// A final attempt whose selected result was staged but whose settlement
+/// never commits is not exhausted while its state cannot be read: an
+/// exhausted reclaim that cannot read it leaves its lease to expire without
+/// computing, and once the state reads again the next reclaim completes the
+/// execution with the selected result instead of erroring.
+///
+/// The outage revokes the tenant role's read of the Scribe batch fences the
+/// accepted revision is recovered from; it is restored once the reclaim has
+/// reported the state unusable.
+///
+/// # Panics
+/// Panics as [`stage_unsettled_result`] does, when the grant cannot change,
+/// the reclaim never reports the outage, or the execution does not complete
+/// on its first attempt without computing.
+#[tokio::test]
+async fn exhausted_reconciliation_survives_source_and_capacity_outage() {
+    let logs = LogCapture::install();
+    let harness = Harness::start().await;
+    let (run, stale) = stage_unsettled_result(&harness, true).await;
+    let grant = |statement: &'static str| {
+        let pool = harness.assertion.clone();
+        async move {
+            sqlx::query(statement)
+                .execute(&pool)
+                .await
+                .expect("the fence grant changes");
+        }
+    };
+    grant("REVOKE SELECT ON vala.scribe_batch_commits FROM wyrd_tenant").await;
+    harness.expire(run).await;
+    let winner = EngineScript::default();
+    winner.push(EngineOutcome::Completed(unscored_report()));
+    let fresh = harness.spawn(&Harness::limits(), &winner);
+    let deadline = tokio::time::Instant::now() + WAIT;
+    while !logs.text().contains("the execution state cannot be used") {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "timed out waiting for the reclaim to meet the outage"
+        );
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    grant("GRANT SELECT ON vala.scribe_batch_commits TO wyrd_tenant").await;
+    harness.expire(run).await;
+    let row = harness.wait_execution(run, status("completed")).await;
+    stale.stop().await;
+    fresh.stop().await;
+    assert_eq!(row.attempts, 1, "no reclaim counts an attempt");
+    assert_eq!(winner.entered(), 0, "no reclaim computes");
+    let summaries = sent_to(&harness.fault, RESULTS).await;
+    assert_eq!(
+        row.result_id.map(|id| id.to_string()),
+        Some(sent_result_id(&summaries[0])),
+        "the execution completes with the selected result"
+    );
+}
+
+/// Stage `harness`'s submitted execution's selected result while its
+/// settlement never commits, on its final attempt when `final_attempt`, and
+/// return the execution and its stopping runtime.
+///
+/// A test-only deferred constraint trigger fails every completing commit
+/// made under the first attempt's lease token, so its result reaches Scribe
+/// while its settlement rolls back; the runtime's claim loop is closed, so
+/// only a fresh runtime reclaims the execution once its lease is expired.
+///
+/// # Panics
+/// Panics when the fault cannot be installed or the result is never staged.
+async fn stage_unsettled_result(
+    harness: &Harness,
+    final_attempt: bool,
+) -> (ExecutionId, RunningRuntime) {
+    let abandoned = EngineScript::default();
+    abandoned.hold();
+    abandoned.push(EngineOutcome::Completed(drifting_report()));
+    let stale = harness.spawn(&Harness::limits(), &abandoned);
+    let run = harness.submit().await;
+    wait_until("the first claim", || abandoned.entered() == 1).await;
+    let (Some(token), _) = harness.lease(run).await else {
+        panic!("the first attempt holds a lease");
+    };
+    for statement in [
+        "CREATE OR REPLACE FUNCTION public.fail_settlement() RETURNS trigger \
+         LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'injected settlement failure'; END $$"
+            .to_owned(),
+        format!(
+            "CREATE CONSTRAINT TRIGGER fail_settlement AFTER UPDATE ON wyrd.verifier_executions \
+             DEFERRABLE INITIALLY DEFERRED FOR EACH ROW \
+             WHEN (NEW.status = 'completed' AND OLD.lease_token = '{token}'::uuid) \
+             EXECUTE FUNCTION public.fail_settlement()"
+        ),
+    ] {
+        sqlx::query(AssertSqlSafe(statement))
+            .execute(&harness.assertion)
+            .await
+            .expect("the settlement fault installs");
+    }
+    if final_attempt {
+        sqlx::query(
+            "UPDATE wyrd.verifier_executions SET max_attempts = attempts WHERE execution_id = $1",
+        )
+        .bind(run.as_uuid())
+        .execute(&harness.assertion)
+        .await
+        .expect("the attempt becomes the final one");
+    }
+    abandoned.release();
+    let deadline = tokio::time::Instant::now() + WAIT;
+    while !harness.writes().await.iter().any(|table| table == RESULTS) {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "timed out waiting for the abandoned result to be staged"
+        );
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    stale.stop.cancel();
+    (run, stale)
+}
+
+/// A terminal failure accepted in the execution's state is never recomputed:
+/// when the settlement terminating it never commits, the reclaim runs no
+/// engine, terminates with the recorded error, and retires the decision's
+/// owed delivery.
+///
+/// A test-only deferred constraint trigger fails every `errored` commit made
+/// under the first attempt's lease token, so the failure reaches the state
+/// while its termination rolls back; the lease is then expired and a fresh
+/// runner, scripted to complete, reclaims the execution.
+///
+/// # Panics
+/// Panics when the fault cannot be installed, the reclaim runs its engine,
+/// settles another status or error, writes a result, or leaves its delivery
+/// owed.
+#[tokio::test]
+async fn terminal_failure_reclaims_without_reentering_the_engine() {
+    let harness = Harness::start().await;
+    let failing = EngineScript::default();
+    failing.hold();
+    failing.push(EngineOutcome::Terminal(
+        TerminalStatus::Errored,
+        VerificationError {
+            code: "engine_refused".to_owned(),
+            message: "the engine refused the input".to_owned(),
+        },
+    ));
+    let stale = harness.spawn(&Harness::limits(), &failing);
+    let run = harness.submit().await;
+    wait_until("the first claim", || failing.entered() == 1).await;
+    let (Some(token), _) = harness.lease(run).await else {
+        panic!("the first attempt holds a lease");
+    };
+    for statement in [
+        "CREATE OR REPLACE FUNCTION public.fail_termination() RETURNS trigger \
+         LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'injected termination failure'; END $$"
+            .to_owned(),
+        format!(
+            "CREATE CONSTRAINT TRIGGER fail_termination AFTER UPDATE ON wyrd.verifier_executions \
+             DEFERRABLE INITIALLY DEFERRED FOR EACH ROW \
+             WHEN (NEW.status = 'errored' AND OLD.lease_token = '{token}'::uuid) \
+             EXECUTE FUNCTION public.fail_termination()"
+        ),
+    ] {
+        sqlx::query(AssertSqlSafe(statement))
+            .execute(&harness.assertion)
+            .await
+            .expect("the termination fault installs");
+    }
+    let claimed = sent_to(&harness.fault, EVENTS).await.len();
+    failing.release();
+    let deadline = tokio::time::Instant::now() + WAIT;
+    while sent_to(&harness.fault, EVENTS).await.len() == claimed {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "timed out waiting for the failure to reach the state"
+        );
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+
+    stale.stop.cancel();
+    harness.expire(run).await;
+    let winner = EngineScript::default();
+    winner.push(EngineOutcome::Completed(unscored_report()));
+    let fresh = harness.spawn(&Harness::limits(), &winner);
+    let row = harness.wait_execution(run, status("errored")).await;
+    assert_eq!(row.error_code.as_deref(), Some("engine_refused"));
+    assert_eq!(row.result_id, None);
+    let deadline = tokio::time::Instant::now() + WAIT;
+    loop {
+        let owed: bool = sqlx::query_scalar(
+            "SELECT delivery_due_at IS NOT NULL FROM wyrd.verifier_executions \
+             WHERE execution_id = $1",
+        )
+        .bind(run.as_uuid())
+        .fetch_one(&harness.assertion)
+        .await
+        .expect("the delivery reads");
+        if !owed {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "timed out waiting for the delivery to retire"
+        );
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    stale.stop().await;
+    fresh.stop().await;
+    assert_eq!(winner.entered(), 0, "the reclaim runs no engine");
+    assert!(harness.writes().await.is_empty(), "no result is written");
 }
 
 /// A crashed runner degrades health, is restarted, and — once the lost lease

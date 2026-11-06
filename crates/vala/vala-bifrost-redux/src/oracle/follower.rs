@@ -698,6 +698,7 @@ where
                 // plan's `Column` indices are closure indices.
                 required_fields: required_schema.fields().clone(),
                 pruning,
+                requirements: None,
             })
             .await?;
         let plan = self

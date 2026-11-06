@@ -379,6 +379,10 @@ pub struct FetchLiveTailRequest {
     /// The query's filter planned over `required_fields`, which Scribe prunes
     /// memory batches by before projecting them; `None` keeps every batch.
     pub pruning: Option<crate::scan_sizing::BatchPruning>,
+    /// The outputs and exact filter Scribe evaluates over `required_fields`,
+    /// returning only those outputs for the rows the filter keeps; `None`
+    /// returns `required_fields` whole.
+    pub(crate) requirements: Option<crate::scribe::memtable::ReadRequirements>,
 }
 
 /// One shallow, structural hot snapshot returned by a shard owner.
@@ -965,6 +969,7 @@ impl FetchLiveTailService {
             &(request.start_partition..=request.end_partition),
             &request.required_fields,
             request.pruning.as_ref(),
+            request.requirements.as_ref(),
         )?;
         Ok(LiveTailBatches {
             memtable: read
@@ -1468,6 +1473,7 @@ pub(crate) mod tests {
             super::TenantTableBinding::resolve((tenant, table)).expect("fixture binding resolves");
         let request = super::FetchLiveTailRequest {
             pruning: None,
+            requirements: None,
             binding,
             target_stream: stream,
             query_id: uuid::Uuid::new_v4(),
@@ -1592,6 +1598,7 @@ pub(crate) mod tests {
             super::TenantTableBinding::resolve((tenant, table)).expect("fixture binding resolves");
         let request = super::FetchLiveTailRequest {
             pruning: None,
+            requirements: None,
             binding,
             target_stream: stream,
             query_id: uuid::Uuid::new_v4(),

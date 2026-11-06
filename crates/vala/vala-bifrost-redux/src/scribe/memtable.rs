@@ -974,7 +974,7 @@ impl Memtable {
     ) -> Result<Vec<ReadableBatch>, ScribeError> {
         let mut batches = Vec::new();
         for source in self.readable_sources(tenant, table, partitions)? {
-            source.project(required, None, &mut batches)?;
+            source.project(required, None, None, &mut batches)?;
         }
         Ok(batches)
     }
@@ -1985,6 +1985,7 @@ impl LiveCapture {
         partitions: &std::ops::RangeInclusive<crate::catalog::layout::TimePartition>,
         required: &[FieldRef],
         pruning: Option<&crate::scan_sizing::BatchPruning>,
+        requirements: Option<&ReadRequirements>,
     ) -> Result<CapturedRead, ScribeError> {
         let in_range: Vec<&ReadableSource> = self
             .memory
@@ -1997,7 +1998,7 @@ impl LiveCapture {
             Vec::with_capacity(in_range.iter().map(|source| source.batch_count()).sum());
         let mut charges = Vec::with_capacity(in_range.len());
         for source in in_range {
-            source.project(required, pruning, &mut batches)?;
+            source.project(required, pruning, requirements, &mut batches)?;
             charges.push(Arc::clone(&source.charge));
         }
         let runs = self
@@ -2221,11 +2222,9 @@ impl ReadableSource {
         &self,
         required: &[FieldRef],
         pruning: Option<&crate::scan_sizing::BatchPruning>,
+        requirements: Option<&ReadRequirements>,
         output: &mut Vec<ReadableBatch>,
     ) -> Result<(), ScribeError> {
-        let internal = |error: arrow::error::ArrowError| ScribeError::Internal {
-            detail: format!("live-tail Arrow projection failed: {error}"),
-        };
         let projection = projection_indices(&self.schema, required)?;
         let schema = Arc::new(Schema::new_with_metadata(
             projection
@@ -2269,9 +2268,10 @@ impl ReadableSource {
             })
             .collect();
         let keep = pruning.map(|pruning| pruning.keep(&statistics, statistics.len()));
-        // One generation pins one layout, so the predicate adapts once to the
-        // first physical batch and serves them all.
+        // One generation pins one layout, so expressions adapt once to the
+        // first physical batch and serve them all.
         let mut adapted: Option<Option<Arc<dyn datafusion::physical_expr::PhysicalExpr>>> = None;
+        let mut adapted_requirements: Option<AdaptedRequirements> = None;
         for (index, ((batch, wal_lsn_max), mut statistics)) in self
             .runs
             .iter()
@@ -2282,63 +2282,54 @@ impl ReadableSource {
             if keep.as_ref().is_some_and(|keep| !keep[index]) {
                 continue;
             }
-            let shredded = projection.iter().any(|(_, source)| {
-                source.is_some_and(|column| {
-                    batch.column(column).data_type() != self.schema.field(column).data_type()
-                })
-            });
             let mut physical = physical_projection(batch, &schema, &projection);
-            if let Some(pruning) = pruning.filter(|_| shredded) {
-                let predicate = adapted.get_or_insert_with(|| {
-                    use datafusion::physical_expr_adapter::PhysicalExprAdapterFactory as _;
-                    datafusion::physical_expr_adapter::DefaultPhysicalExprAdapterFactory
-                        .create(Arc::clone(&schema), physical.schema())
-                        .ok()?
-                        .rewrite(Arc::clone(pruning.predicate().orig_expr()))
-                        .ok()
+            let batch = if let Some(requirements) = requirements {
+                let adapted = match &mut adapted_requirements {
+                    Some(adapted) => adapted,
+                    None => adapted_requirements
+                        .insert(requirements.adapt(&schema, physical.schema_ref())?),
+                };
+                let Some((batch, evaluated)) = adapted.evaluate(
+                    requirements,
+                    physical,
+                    &statistics,
+                    |physical| self.logical_batch(&schema, &projection, physical),
+                    |physical, column| self.logical_column(&projection, physical, column),
+                )?
+                else {
+                    continue;
+                };
+                statistics = evaluated;
+                batch
+            } else {
+                let shredded = projection.iter().any(|(_, source)| {
+                    source.is_some_and(|column| {
+                        batch.column(column).data_type() != self.schema.field(column).data_type()
+                    })
                 });
-                if let Some(kept) = predicate.as_ref().and_then(|predicate| {
-                    datafusion::physical_plan::filter::batch_filter(&physical, predicate).ok()
-                }) {
-                    if kept.num_rows() == 0 {
-                        continue;
-                    }
-                    if kept.num_rows() != physical.num_rows() {
-                        statistics = Arc::new(statistics.as_ref().clone().to_inexact());
-                    }
-                    physical = kept;
-                }
-            }
-            let rows = physical.num_rows();
-            let columns = projection
-                .iter()
-                .zip(physical.schema_ref().fields())
-                .zip(physical.columns())
-                .map(|(((field, source), stored), column)| match source {
-                    Some(source) => {
-                        let logical = crate::schema::logical_column(
-                            stored,
-                            column,
-                            self.schema.field(*source),
-                        )
-                        .map_err(|detail| ScribeError::Internal {
-                            detail: format!("live-tail Variant reconstruction failed: {detail}"),
-                        })?;
-                        if logical.data_type() == field.data_type() {
-                            Ok(logical)
-                        } else {
-                            arrow::compute::cast(&logical, field.data_type()).map_err(internal)
+                if let Some(pruning) = pruning.filter(|_| shredded) {
+                    let predicate = adapted.get_or_insert_with(|| {
+                        use datafusion::physical_expr_adapter::PhysicalExprAdapterFactory as _;
+                        datafusion::physical_expr_adapter::DefaultPhysicalExprAdapterFactory
+                            .create(Arc::clone(&schema), physical.schema())
+                            .ok()?
+                            .rewrite(Arc::clone(pruning.predicate().orig_expr()))
+                            .ok()
+                    });
+                    if let Some(kept) = predicate.as_ref().and_then(|predicate| {
+                        datafusion::physical_plan::filter::batch_filter(&physical, predicate).ok()
+                    }) {
+                        if kept.num_rows() == 0 {
+                            continue;
                         }
+                        if kept.num_rows() != physical.num_rows() {
+                            statistics = Arc::new(statistics.as_ref().clone().to_inexact());
+                        }
+                        physical = kept;
                     }
-                    None => Ok(Arc::clone(column)),
-                })
-                .collect::<Result<Vec<_>, _>>()?;
-            let batch = RecordBatch::try_new_with_options(
-                Arc::clone(&schema),
-                columns,
-                &arrow::array::RecordBatchOptions::new().with_row_count(Some(rows)),
-            )
-            .map_err(internal)?;
+                }
+                self.logical_batch(&schema, &projection, &physical)?
+            };
             output.push(ReadableBatch {
                 partition_day: self.seal_key.partition.time(),
                 wal_lsn_max,
@@ -2348,6 +2339,293 @@ impl ReadableSource {
             });
         }
         Ok(())
+    }
+
+    /// Returns column `column` of `physical`, a [`physical_projection`] of
+    /// one captured batch, in its logical type: a shredded Variant
+    /// reconstructed from its typed leaves and residual, and a field the
+    /// batch stored under an earlier type cast to the required one.
+    ///
+    /// # Errors
+    ///
+    /// Returns an internal error when Variant reconstruction or the cast fails.
+    fn logical_column(
+        &self,
+        projection: &[(FieldRef, Option<usize>)],
+        physical: &RecordBatch,
+        column: usize,
+    ) -> Result<arrow::array::ArrayRef, ScribeError> {
+        let (field, source) = &projection[column];
+        let stored = physical.column(column);
+        let Some(source) = source else {
+            return Ok(Arc::clone(stored));
+        };
+        #[cfg(feature = "test-support")]
+        if stored.data_type() != self.schema.field(*source).data_type() {
+            VARIANT_RECONSTRUCTIONS.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+        }
+        let logical = crate::schema::logical_column(
+            &physical.schema_ref().fields()[column],
+            stored,
+            self.schema.field(*source),
+        )
+        .map_err(|detail| ScribeError::Internal {
+            detail: format!("live-tail Variant reconstruction failed: {detail}"),
+        })?;
+        if logical.data_type() == field.data_type() {
+            Ok(logical)
+        } else {
+            arrow::compute::cast(&logical, field.data_type()).map_err(|error| {
+                ScribeError::Internal {
+                    detail: format!("live-tail Arrow projection failed: {error}"),
+                }
+            })
+        }
+    }
+
+    /// Returns `physical`, a [`physical_projection`] of one captured batch,
+    /// in the logical `schema` of the required fields, every column
+    /// converted by [`Self::logical_column`].
+    ///
+    /// # Errors
+    ///
+    /// Returns an internal error when a column does not convert or Arrow
+    /// rejects the batch.
+    fn logical_batch(
+        &self,
+        schema: &SchemaRef,
+        projection: &[(FieldRef, Option<usize>)],
+        physical: &RecordBatch,
+    ) -> Result<RecordBatch, ScribeError> {
+        let columns = (0..projection.len())
+            .map(|column| self.logical_column(projection, physical, column))
+            .collect::<Result<Vec<_>, _>>()?;
+        RecordBatch::try_new_with_options(
+            Arc::clone(schema),
+            columns,
+            &arrow::array::RecordBatchOptions::new().with_row_count(Some(physical.num_rows())),
+        )
+        .map_err(|error| ScribeError::Internal {
+            detail: format!("live-tail Arrow projection failed: {error}"),
+        })
+    }
+}
+
+/// Shredded Variant columns this process's live reads have reconstructed into
+/// their logical storage, across every read.
+#[cfg(feature = "test-support")]
+static VARIANT_RECONSTRUCTIONS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+/// Returns how many shredded Variant batch columns live reads have
+/// reconstructed in this process.
+///
+/// A read that serves a covered path from typed leaves adds nothing, so a
+/// journey can tell leaf execution from a whole-root reconstruction that
+/// happens to return the same answer.
+#[cfg(feature = "test-support")]
+#[must_use]
+pub fn variant_reconstructions_for_test() -> usize {
+    VARIANT_RECONSTRUCTIONS.load(std::sync::atomic::Ordering::Acquire)
+}
+
+/// The ordered outputs and exact filter one live read evaluates in place of
+/// returning its required fields whole.
+///
+/// Both are planned over the read's required fields, in order, so a read
+/// returns exactly the rows `filter` keeps and exactly the columns `outputs`
+/// names, repeated or reordered as they are listed. An input only `filter`
+/// reads never reaches the output, and an empty `outputs` returns each kept
+/// batch's row count with no column.
+#[derive(Debug, Clone)]
+pub(crate) struct ReadRequirements {
+    /// Predicate every returned row satisfies, or `None` to keep every row.
+    pub(crate) filter: Option<Arc<dyn datafusion::physical_expr::PhysicalExpr>>,
+    /// Expressions the read returns, in order, under their aliases.
+    pub(crate) outputs: datafusion::physical_expr::projection::ProjectionExprs,
+}
+
+impl ReadRequirements {
+    /// Adapts the filter and every computed output to one generation's
+    /// `physical` layout of the `logical` required fields, through
+    /// `DataFusion`'s [`DefaultPhysicalExprAdapterFactory`], so a Variant
+    /// path reads its typed leaves. An expression that does not adapt is kept
+    /// for evaluation over the logical rows.
+    ///
+    /// [`DefaultPhysicalExprAdapterFactory`]: datafusion::physical_expr_adapter::DefaultPhysicalExprAdapterFactory
+    ///
+    /// # Errors
+    ///
+    /// Returns an internal error when `outputs` do not plan over `logical`.
+    fn adapt(
+        &self,
+        logical: &SchemaRef,
+        physical: &SchemaRef,
+    ) -> Result<AdaptedRequirements, ScribeError> {
+        use datafusion::physical_expr_adapter::PhysicalExprAdapterFactory as _;
+        let schema = self
+            .outputs
+            .project_schema(logical)
+            .map_err(|error| ScribeError::Internal {
+                detail: format!("live-tail outputs do not plan over the required fields: {error}"),
+            })?;
+        let adapter = datafusion::physical_expr_adapter::DefaultPhysicalExprAdapterFactory
+            .create(Arc::clone(logical), Arc::clone(physical))
+            .ok();
+        let adapt = |expr: &Arc<dyn datafusion::physical_expr::PhysicalExpr>| {
+            adapter
+                .as_ref()
+                .and_then(|adapter| adapter.rewrite(Arc::clone(expr)).ok())
+        };
+        Ok(AdaptedRequirements {
+            filter: self.filter.as_ref().and_then(adapt),
+            outputs: self
+                .outputs
+                .iter()
+                .map(|output| {
+                    output
+                        .expr
+                        .downcast_ref::<datafusion::physical_expr::expressions::Column>()
+                        .is_none()
+                        .then(|| adapt(&output.expr))
+                        .flatten()
+                })
+                .collect(),
+            schema: Arc::new(schema),
+        })
+    }
+}
+
+/// One generation's [`ReadRequirements`], adapted once to its physical layout.
+#[derive(Debug)]
+struct AdaptedRequirements {
+    /// The filter over the physical layout, or `None` when there is no filter
+    /// or it did not adapt.
+    filter: Option<Arc<dyn datafusion::physical_expr::PhysicalExpr>>,
+    /// Each output over the physical layout, index-aligned with the
+    /// requirements' outputs; `None` for a bare column, which is converted
+    /// alone, or an output that did not adapt.
+    outputs: Vec<Option<Arc<dyn datafusion::physical_expr::PhysicalExpr>>>,
+    /// The output schema, planned over the logical required fields.
+    schema: SchemaRef,
+}
+
+impl AdaptedRequirements {
+    /// Filters one `physical` batch exactly and evaluates the outputs over
+    /// the rows it keeps, with `statistics` projected alongside and inexact
+    /// once a row was dropped; `None` when no row is kept.
+    ///
+    /// Adapted expressions read the physical layout. A bare column output is
+    /// converted on its own by `column`, so only the roots an output names
+    /// whole are reconstructed. An expression that did not adapt, did not
+    /// evaluate, or returned another type is evaluated over the logical rows
+    /// `logical` builds, once per batch, so it keeps exact semantics.
+    ///
+    /// # Errors
+    ///
+    /// Returns an internal error when the logical fallback fails to build or
+    /// evaluate, or the output batch cannot be assembled.
+    fn evaluate(
+        &self,
+        requirements: &ReadRequirements,
+        mut physical: RecordBatch,
+        statistics: &Arc<Statistics>,
+        logical: impl Fn(&RecordBatch) -> Result<RecordBatch, ScribeError>,
+        column: impl Fn(&RecordBatch, usize) -> Result<arrow::array::ArrayRef, ScribeError>,
+    ) -> Result<Option<(RecordBatch, Arc<Statistics>)>, ScribeError> {
+        let internal = |error: datafusion::error::DataFusionError| ScribeError::Internal {
+            detail: format!("live-tail requirement evaluation failed: {error}"),
+        };
+        let arrow_internal = |error: arrow::error::ArrowError| ScribeError::Internal {
+            detail: format!("live-tail requirement evaluation failed: {error}"),
+        };
+        let mask = |expr: &Arc<dyn datafusion::physical_expr::PhysicalExpr>,
+                    batch: &RecordBatch| {
+            expr.evaluate(batch)
+                .and_then(|value| value.into_array(batch.num_rows()))
+                .and_then(|mask| {
+                    datafusion::common::cast::as_boolean_array(&mask).map(Clone::clone)
+                })
+        };
+        let mut restored: Option<RecordBatch> = None;
+        let mut statistics = Statistics::clone(statistics);
+        if let Some(filter) = &requirements.filter {
+            let kept = match self
+                .filter
+                .as_ref()
+                .and_then(|adapted| mask(adapted, &physical).ok())
+            {
+                Some(kept) => kept,
+                None => {
+                    let rows = logical(&physical)?;
+                    let kept = mask(filter, &rows).map_err(internal)?;
+                    restored = Some(rows);
+                    kept
+                }
+            };
+            let rows = physical.num_rows();
+            physical = arrow::compute::filter_record_batch(&physical, &kept).map_err(arrow_internal)?;
+            restored = restored
+                .map(|rows| arrow::compute::filter_record_batch(&rows, &kept))
+                .transpose()
+                .map_err(arrow_internal)?;
+            if physical.num_rows() == 0 {
+                return Ok(None);
+            }
+            if physical.num_rows() != rows {
+                statistics = statistics.to_inexact();
+            }
+        }
+        let rows = physical.num_rows();
+        let mut columns = Vec::with_capacity(self.outputs.len());
+        for ((output, adapted), field) in requirements
+            .outputs
+            .iter()
+            .zip(&self.outputs)
+            .zip(self.schema.fields())
+        {
+            if let Some(source) = output
+                .expr
+                .downcast_ref::<datafusion::physical_expr::expressions::Column>()
+            {
+                columns.push(match &restored {
+                    Some(rows) => Arc::clone(rows.column(source.index())),
+                    None => column(&physical, source.index())?,
+                });
+                continue;
+            }
+            if let Some(value) = adapted
+                .as_ref()
+                .and_then(|adapted| adapted.evaluate(&physical).ok())
+                .and_then(|value| value.into_array(rows).ok())
+                .filter(|value| value.data_type() == field.data_type())
+            {
+                columns.push(value);
+                continue;
+            }
+            if restored.is_none() {
+                restored = Some(logical(&physical)?);
+            }
+            let rows_batch = restored.as_ref().expect("restored just above");
+            columns.push(
+                output
+                    .expr
+                    .evaluate(rows_batch)
+                    .and_then(|value| value.into_array(rows))
+                    .map_err(internal)?,
+            );
+        }
+        let statistics = requirements
+            .outputs
+            .project_statistics(statistics, &self.schema)
+            .map_err(internal)?;
+        let batch = RecordBatch::try_new_with_options(
+            Arc::clone(&self.schema),
+            columns,
+            &arrow::array::RecordBatchOptions::new().with_row_count(Some(rows)),
+        )
+        .map_err(arrow_internal)?;
+        Ok(Some((batch, Arc::new(statistics))))
     }
 }
 
@@ -2569,6 +2847,239 @@ mod tests {
         assert!(projection_indices(&captured, &[with_id("a", "2"), with_id("b", "2")]).is_err());
     }
 
+    /// A learned generation serves covered Variant paths from its typed
+    /// leaves: a scalar projection, a filter-only count, null and mixed-type
+    /// paths, `IN`, nested and list paths, and repeated or reordered outputs
+    /// return the same values as the canonical generation of the same rows
+    /// without reconstructing a shredded column, while whole-root output
+    /// reconstructs the complete logical value.
+    ///
+    /// Each read covers a learned and a canonical generation of identical
+    /// documents, so both batches must agree with the expected values, and
+    /// the learned batch's reconstruction count is observed directly.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the fixture cannot learn or shred its layout, a read
+    /// fails, a value or schema differs, or a covered path reconstructs.
+    #[test]
+    fn covered_variant_paths_avoid_unrelated_reconstruction() {
+        use arrow::array::{Array as _, AsArray as _};
+        use datafusion::physical_expr::projection::{ProjectionExpr, ProjectionExprs};
+
+        let documents = [
+            Some(r#"{"region":"eu-west","nested":{"k":"a"},"tags":["x","y"]}"#),
+            Some(r#"{"region":"us-east","nested":{"k":"b"},"tags":["z"]}"#),
+            Some(r#"{"region":"eu-west","extra":true,"nested":{"k":"c"},"tags":[]}"#),
+            Some(r#"{"nested":{},"tags":["w"]}"#),
+            None,
+            Some(r#"{"region":7,"nested":{"k":"d"},"tags":["v"]}"#),
+        ];
+        let text: arrow::array::ArrayRef = Arc::new(arrow::array::StringArray::from(documents.to_vec()));
+        let attrs: arrow::array::ArrayRef = parquet_variant_compute::json_to_variant(&text)
+            .expect("valid JSON")
+            .into();
+        let attrs = arrow::compute::cast(&attrs, &wyrd_types::variant::variant_storage_type())
+            .expect("Variant storage casts to the stored shape");
+        let rows = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![
+                Field::new("value", DataType::Int64, false),
+                wyrd_types::variant::variant_field("attrs", true),
+            ])),
+            vec![Arc::new(Int64Array::from_iter_values(0..6)), attrs],
+        )
+        .expect("logical rows");
+        let logical = rows.schema();
+
+        let learned_key = make_test_seal_key();
+        let canonical_key = SealKey::new(
+            learned_key.tenant,
+            learned_key.table.clone(),
+            crate::test_support::day_partition(2026, 7, 15),
+        );
+        let resources = crate::resources::ScribeResources::for_test();
+        let mut sampler = iceberg::writer::file_writer::variant_shredding::VariantSampler::new(
+            &logical,
+            crate::parquet::writer_properties::BIFROST_VARIANT_SHREDDING,
+            0,
+            &[rows.num_rows()],
+        );
+        sampler
+            .offer(&rows, &vec![0; rows.num_rows()], 0)
+            .expect("sample offer");
+        resources.variant_layouts().install(
+            &resources,
+            (
+                learned_key.tenant,
+                learned_key.table.clone(),
+                learned_key.table_version,
+            ),
+            Arc::clone(&logical),
+            sampler.layout(),
+        );
+        let layout = resources
+            .variant_layouts()
+            .get(
+                learned_key.tenant,
+                &learned_key.table,
+                learned_key.table_version,
+            )
+            .expect("the sample shreds `attrs`");
+        let memtable = Memtable::new();
+        memtable
+            .insert_with_layout(
+                &learned_key,
+                make_test_meta(1),
+                layout.shred(&rows).expect("shredded rows"),
+                Some(layout),
+            )
+            .expect("learned insert");
+        memtable
+            .insert(&canonical_key, make_test_meta(2), rows.clone())
+            .expect("canonical insert");
+        let capture = LiveCapture::take([&memtable], learned_key.tenant, &learned_key.table, None)
+            .expect("locks")
+            .expect("no registry to wait on");
+        let partitions = learned_key.partition.time()..=canonical_key.partition.time();
+
+        let context = datafusion::prelude::SessionContext::new();
+        let df_schema =
+            datafusion::common::DFSchema::try_from(Arc::clone(&logical)).expect("logical schema");
+        let plan = |sql: &str| {
+            context
+                .create_physical_expr(
+                    context.parse_sql_expr(sql, &df_schema).expect("expression parses"),
+                    &df_schema,
+                )
+                .expect("expression plans")
+        };
+        // Reads both generations and returns each batch with the shredded
+        // columns the read reconstructed.
+        let read = |filter: Option<&str>, outputs: &[(&str, &str)]| {
+            let requirements = ReadRequirements {
+                filter: filter.map(plan),
+                outputs: ProjectionExprs::new(
+                    outputs
+                        .iter()
+                        .map(|(sql, alias)| ProjectionExpr::new(plan(sql), *alias)),
+                ),
+            };
+            let before = variant_reconstructions_for_test();
+            let read = capture
+                .read(&partitions, logical.fields(), None, Some(&requirements))
+                .expect("capture read");
+            let batches = read
+                .batches
+                .into_iter()
+                .map(|readable| readable.batch)
+                .collect::<Vec<_>>();
+            assert_eq!(batches.len(), 2, "one batch per generation");
+            (batches, variant_reconstructions_for_test() - before)
+        };
+        let texts = |batch: &RecordBatch, column: usize| {
+            batch
+                .column(column)
+                .as_string::<i32>()
+                .iter()
+                .map(|value| value.map(str::to_owned))
+                .collect::<Vec<_>>()
+        };
+        let values = |batch: &RecordBatch, column: usize| {
+            batch
+                .column(column)
+                .as_primitive::<arrow::datatypes::Int64Type>()
+                .values()
+                .to_vec()
+        };
+        let owned = |values: &[Option<&str>]| {
+            values
+                .iter()
+                .map(|value| value.map(str::to_owned))
+                .collect::<Vec<_>>()
+        };
+
+        let (batches, reconstructed) = read(None, &[("attrs ->> 'region'", "r")]);
+        for batch in &batches {
+            assert_eq!(batch.schema().field(0).name(), "r");
+            assert_eq!(batch.schema().field(0).data_type(), &DataType::Utf8);
+            assert_eq!(
+                texts(batch, 0),
+                owned(&[
+                    Some("eu-west"),
+                    Some("us-east"),
+                    Some("eu-west"),
+                    None,
+                    None,
+                    Some("7"),
+                ])
+            );
+        }
+        assert_eq!(reconstructed, 0, "a scalar path reads its leaf");
+
+        let (batches, reconstructed) = read(Some("attrs ->> 'region' = 'eu-west'"), &[]);
+        for batch in &batches {
+            assert_eq!(batch.num_columns(), 0, "a filter-only input is not output");
+            assert_eq!(batch.num_rows(), 2, "the count keeps its cardinality");
+        }
+        assert_eq!(reconstructed, 0, "a filter-only count reads its leaf");
+
+        let (batches, reconstructed) = read(
+            Some("attrs ->> 'region' IS NULL"),
+            &[("value", "v"), ("attrs ->> 'region'", "r"), ("value", "v")],
+        );
+        for batch in &batches {
+            let names = batch
+                .schema()
+                .fields()
+                .iter()
+                .map(|field| field.name().clone())
+                .collect::<Vec<_>>();
+            assert_eq!(names, ["v", "r", "v"], "outputs keep their order and repeats");
+            assert_eq!(values(batch, 0), [3, 4]);
+            assert_eq!(texts(batch, 1), owned(&[None, None]));
+            assert_eq!(values(batch, 2), [3, 4]);
+        }
+        assert_eq!(reconstructed, 0, "a null test reads its leaf");
+
+        let (batches, reconstructed) = read(
+            Some("attrs ->> 'region' IN ('us-east', '7')"),
+            &[
+                ("variant_get_text(attrs, 'nested', 'k')", "k"),
+                ("variant_get_text(attrs, 'tags', 0)", "tag"),
+            ],
+        );
+        for batch in &batches {
+            assert_eq!(texts(batch, 0), owned(&[Some("b"), Some("d")]));
+            assert_eq!(texts(batch, 1), owned(&[Some("z"), Some("v")]));
+        }
+        assert_eq!(reconstructed, 0, "nested, list, and IN paths read leaves");
+
+        let (batches, reconstructed) = read(Some("attrs IS NOT NULL"), &[("attrs", "attrs")]);
+        for batch in &batches {
+            let attrs = batch.column(0);
+            assert_eq!(
+                attrs.data_type(),
+                &wyrd_types::variant::variant_storage_type(),
+                "a whole root is its complete logical value"
+            );
+            let json = parquet_variant_compute::variant_to_json(attrs).expect("Variant JSON");
+            let parsed = json
+                .iter()
+                .map(|value| {
+                    serde_json::from_str::<serde_json::Value>(value.expect("non-null"))
+                        .expect("JSON")
+                })
+                .collect::<Vec<_>>();
+            let expected = documents
+                .iter()
+                .flatten()
+                .map(|document| serde_json::from_str::<serde_json::Value>(document).expect("JSON"))
+                .collect::<Vec<_>>();
+            assert_eq!(parsed, expected, "residual fields survive");
+        }
+        assert_eq!(reconstructed, 1, "only the learned whole root reconstructs");
+    }
+
     /// A capture read prunes its memory batches by the query's predicate,
     /// planned over the required fields, before projecting them: a batch
     /// whose bounds exclude the key is never returned, the matching one is,
@@ -2610,7 +3121,7 @@ mod tests {
         let partitions = key.partition.time()..=key.partition.time();
         let lsns = |pruning| {
             let mut lsns = capture
-                .read(&partitions, schema.fields(), pruning)
+                .read(&partitions, schema.fields(), pruning, None)
                 .expect("capture read")
                 .batches
                 .iter()
@@ -2662,7 +3173,7 @@ mod tests {
         let partitions = key.partition.time()..=key.partition.time();
         let lsns = |capture: &LiveCapture, pruning| -> Vec<u64> {
             capture
-                .read(&partitions, schema.fields(), pruning)
+                .read(&partitions, schema.fields(), pruning, None)
                 .expect("capture read")
                 .batches
                 .iter()
@@ -2801,7 +3312,7 @@ mod tests {
         let recorded = Arc::clone(&capture.memory[0].runs[0].statistics[0]);
         let read = |fields: &[FieldRef]| {
             let mut batches = capture
-                .read(&partitions, fields, None)
+                .read(&partitions, fields, None, None)
                 .expect("capture read")
                 .batches;
             assert_eq!(batches.capacity(), 1, "the batch list is sized once");

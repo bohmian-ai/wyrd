@@ -12,6 +12,7 @@ import { expect, vi } from 'vitest';
 import { z } from 'zod';
 import { Bifrost, Cards, TableConfig, WyrdClient } from 'wyrd-ai';
 import {
+  CardRefSchema,
   loadCardHeader,
   loadChart,
   loadFacetRail,
@@ -132,14 +133,18 @@ function jar(): Cookies {
   } as Cookies;
 }
 
+/** A declared Card as the exact reference a component input takes. */
+const exact = (ref: DeclaredRef) => ({ ...CardRefSchema.parse(ref), uid: ref.uid });
+type Exact = ReturnType<typeof exact>;
+
 /** The fixture tenant's Cards and latency table, seeded once per file. */
-const test = serverTest().extend<{ seeded: { model: DeclaredRef; foreign: DeclaredRef } }>({
+const test = serverTest().extend<{ seeded: { model: Exact; foreign: Exact } }>({
   seeded: [
     async ({ server }, use) => {
       await seedLatency(server);
       const cards = await Cards.connect();
-      const model = declared(await cards.declareFromPath(fixture('cards/declare_and_pull/support-model.yaml')));
-      const foreign = declared(await cards.declareFromPath(fixture('cards/latency_baseline/latency-baseline.yaml')));
+      const model = exact(declared(await cards.declareFromPath(fixture('cards/declare_and_pull/support-model.yaml'))));
+      const foreign = exact(declared(await cards.declareFromPath(fixture('cards/latency_baseline/latency-baseline.yaml'))));
       // The custom app example shows the support desk Service.
       await cards.declareFromPath(fixture('cards/declare_and_pull/support-desk.yaml'));
       await use({ model, foreign });

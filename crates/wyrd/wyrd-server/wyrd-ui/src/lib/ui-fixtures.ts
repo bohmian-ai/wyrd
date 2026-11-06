@@ -44,7 +44,7 @@ export const day: QueryResult = {
   terminal: terminal(48)
 };
 export const timeseries: ChartInput = { type: 'timeseries', title: 'Latency', sql: 'SELECT at, model, p95 FROM t WHERE at >= $1::timestamptz AND at < $2::timestamptz', unit: 'ms', x: 'at', y: ['p95'], series: 'model' };
-export const card: CardRef = { kind: 'Model', name: 'ranker', version: '1.4.2' };
+export const card = { kind: 'Model', name: 'ranker', version: '1.4.2' } as const satisfies CardRef;
 export const registered = {
   apiVersion: 'wyrd/v1',
   kind: 'Model',
@@ -65,10 +65,10 @@ export const summary = (version: string, status = 'active', kind = 'Model', name
   }) as never;
 
 /** Two versions of one portable Prompt, an Agent using the newer one, and a native-format Prompt keeping an extension field. */
-export const PROMPT: CardRef = { kind: 'Prompt', name: 'support-reply', version: '1.1.0' };
-export const AGENT: CardRef = { kind: 'Agent', name: 'support', version: '1.0.0' };
-export const SERVICE: CardRef = { kind: 'Service', name: 'support-api', version: '1.0.0' };
-export const NATIVE: CardRef = { kind: 'Prompt', name: 'native-reply', version: '1.0.0' };
+export const PROMPT = { kind: 'Prompt', name: 'support-reply', version: '1.1.0' } as const satisfies CardRef;
+export const AGENT = { kind: 'Agent', name: 'support', version: '1.0.0' } as const satisfies CardRef;
+export const SERVICE = { kind: 'Service', name: 'support-api', version: '1.0.0' } as const satisfies CardRef;
+export const NATIVE = { kind: 'Prompt', name: 'native-reply', version: '1.0.0' } as const satisfies CardRef;
 const promptCard = (version: string, spec: object, variables: string[], inbound: CardRef[]) =>
   ({
     apiVersion: 'wyrd/v1',

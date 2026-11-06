@@ -24,7 +24,7 @@ Paths under `src/mcp`, `src/query` or `tests/integration` described as server ow
 
 ## Required Board Coverage
 
-Cards inventory has no dedicated approved PNG. Record the missing reference and obtain an approved reference or explicit visual acceptance before declaring fidelity. Generic detail uses shared header/version/YAML/facts/relationships regions on Agent/Prompt/Model/Data/Service; kind-specific content remains in its own task.
+Cards inventory follows the approved `Cards` board ([png](../references/canvas/png/Cards.png)). Generic detail uses shared header/version/YAML/facts/relationships regions on Agent/Prompt/Model/Data/Service; kind-specific content remains in its own task.
 
 Record reference region, implementation screenshot, state, theme and viewport. Distinguish behavioral proof, visual comparison and individual human acceptance. Every difference needs a fix or an explicitly approved exception. See the [audit and evidence rules](../references/task-audit-2026-10-29.md).
 
@@ -83,7 +83,7 @@ Run `mise exec -- pnpm --dir crates/wyrd/wyrd-server/wyrd-ui check` and `mise ex
 
 ### Human visual checkpoint
 
-Cards inventory (no dedicated PNG: REQ-008 and CardInventory contract) then generic Card header/detail against relevant Card boards; approve each separately. Run the app with its normal development command (`mise exec -- pnpm --dir crates/wyrd/wyrd-server/wyrd-ui dev`) for gallery work, or the built production BFF/current native/container launch for deployed proof. Family tasks use `/_gallery`; page tasks use their authenticated route. Real journey data/credentials come from the repository-managed setup, never a production credential in fixtures. Use representative populated, empty, denied, error and loading states; desktop and mobile, light and dark, keyboard/focus, touch, long content and narrow overflow. Record acceptance separately for every owned component/page checkpoint. Wait for human inspection before starting the next dependent slice; family acceptance never waives an individual component. A human-uninspected slice remains unaccepted.
+Cards inventory against the `Cards` board (REQ-008, CardInventory) then generic Card header/detail against relevant Card boards; approve each separately. Run the app with its normal development command (`mise exec -- pnpm --dir crates/wyrd/wyrd-server/wyrd-ui dev`) for gallery work, or the built production BFF/current native/container launch for deployed proof. Family tasks use `/_gallery`; page tasks use their authenticated route. Real journey data/credentials come from the repository-managed setup, never a production credential in fixtures. Use representative populated, empty, denied, error and loading states; desktop and mobile, light and dark, keyboard/focus, touch, long content and narrow overflow. Record acceptance separately for every owned component/page checkpoint. Wait for human inspection before starting the next dependent slice; family acceptance never waives an individual component. A human-uninspected slice remains unaccepted.
 
 ## Material Stop Conditions
 

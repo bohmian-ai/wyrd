@@ -1208,6 +1208,124 @@ async fn learned_variant_memory_queries_preserve_source_contract() -> Result<(),
     Ok(())
 }
 
+/// A scalar subquery in a live projection returns its current value through
+/// the public query surface on both mixed and role-separated clusters.
+///
+/// Rows live only in Scribe memory. A no-`WHERE` projection of the scalar
+/// beside a column, a computed output nesting it, and a Variant path beside
+/// it each return every row with the subquery's value, however the server
+/// plans the scalar; after a second write raises the maximum, the same SQL
+/// returns the new value. Every query reaches a Scribe fragment.
+///
+/// # Errors
+///
+/// Returns an error when a cluster, ingest or query fails, or an answer or
+/// fragment count differs.
+#[tokio::test]
+#[ignore = "requires the serialized Postgres-backed Oracle journey lane"]
+async fn scalar_subquery_outputs_survive_live_projection_absorption() -> Result<(), JourneyError> {
+    for spec in [
+        BifrostClusterSpec::one_mixed(),
+        BifrostClusterSpec::role_separated(),
+    ] {
+        prove_live_scalar_outputs(spec).await?;
+    }
+    Ok(())
+}
+
+/// Drives one topology through
+/// [`scalar_subquery_outputs_survive_live_projection_absorption`].
+///
+/// # Errors
+///
+/// Returns an error when any of its steps fails.
+async fn prove_live_scalar_outputs(spec: BifrostClusterSpec) -> Result<(), JourneyError> {
+    let cluster = WyrdTestCluster::start_spec(spec).await?;
+    let tenant = cluster.data_tenant_id();
+    let ingress = cluster
+        .servers()
+        .find(|server| server.bifrost_scribe().is_some())
+        .ok_or("missing Scribe ingress")?;
+    let table = unique_table("oracle_live_scalar_output");
+    let table_fqn = format!("bifrost.bifrost.{table}");
+    let schema: SchemaRef = Arc::new(arrow::datatypes::Schema::new(vec![
+        arrow::datatypes::Field::new("value", DataType::Int64, false),
+        wyrd_types::variant::variant_field("v", true),
+    ]));
+    register_table_with(
+        ingress,
+        tenant,
+        &table,
+        schema
+            .fields()
+            .iter()
+            .map(|field| field.as_ref().clone())
+            .collect(),
+    )
+    .await?;
+    let writer = writer(ingress, "live-scalar-writer").await?;
+    let reader = client(ingress, "live-scalar-reader").await?;
+    let fragments = || {
+        cluster
+            .servers()
+            .filter_map(|server| server.state().bifrost_ingest())
+            .map(|ingest| ingest.fragment_inspection().0)
+            .sum::<u64>()
+    };
+    let mut values = Vec::new();
+    for batch in [1_i64..=3, 4..=6] {
+        writer
+            .write(
+                &table_fqn,
+                &schema,
+                batch.clone().map(|value| {
+                    serde_json::json!({"value": value, "v": {"a": format!("a{value}")}})
+                        .to_string()
+                        .into_bytes()
+                }),
+            )
+            .await?;
+        values.extend(batch);
+        cluster.refresh_oracle_snapshots().await?;
+        let max = values.iter().max().ok_or("no rows were written")?;
+        let scalar = format!("(SELECT max(value) FROM {table_fqn})");
+        for (sql, expected) in [
+            (
+                format!("SELECT value, {scalar} AS m FROM {table_fqn} ORDER BY value"),
+                values
+                    .iter()
+                    .map(|value| vec![value.to_string(), max.to_string()])
+                    .collect::<Vec<_>>(),
+            ),
+            (
+                format!("SELECT value + {scalar} AS s FROM {table_fqn} ORDER BY s"),
+                values
+                    .iter()
+                    .map(|value| vec![(value + max).to_string()])
+                    .collect(),
+            ),
+            (
+                format!("SELECT v ->> 'a' AS a, {scalar} AS m FROM {table_fqn} ORDER BY a"),
+                values
+                    .iter()
+                    .map(|value| vec![format!("a{value}"), max.to_string()])
+                    .collect(),
+            ),
+        ] {
+            let before = fragments();
+            let (_, rows) = run_rows(&reader, &sql).await?;
+            if rows != expected {
+                return Err(format!("`{sql}` returned {rows:?}, expected {expected:?}").into());
+            }
+            if fragments() == before {
+                return Err(format!("`{sql}` never reached a Scribe fragment").into());
+            }
+        }
+    }
+    cluster.shutdown().await?;
+    Ok(())
+}
+
 /// Forty `(value, document)` rows from `first` mixing typed, mistyped, null,
 /// list, nested, and missing Variant keys.
 fn variant_documents(first: i64) -> Vec<(i64, serde_json::Value)> {

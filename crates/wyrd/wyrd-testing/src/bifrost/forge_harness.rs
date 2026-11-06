@@ -60,7 +60,7 @@ fn forge_runtime_resources(
             bifrost_memory_limit_bytes: None,
             scratch_limit_bytes: None,
             effective_cpu: None,
-            scribe_workers: Default::default(),
+            scribe_workers: vala_bifrost_redux::resources::ScribeWorkerOverrides::default(),
             oracle_query_slot_limit: None,
             oracle_partition_scan_bytes: None,
             scratch_root: Some(scratch_root.to_owned()),

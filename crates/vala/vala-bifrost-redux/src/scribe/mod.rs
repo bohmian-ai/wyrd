@@ -665,7 +665,7 @@ fn embedded_scribe_resources(config: AdmissionConfig) -> crate::resources::Scrib
                 bifrost_memory_limit_bytes: None,
                 scratch_limit_bytes: Some(crate::resources::MIN_SCRATCH_FREE_BYTES),
                 effective_cpu: None,
-                scribe_workers: Default::default(),
+                scribe_workers: crate::resources::ScribeWorkerOverrides::default(),
                 oracle_query_slot_limit: None,
                 oracle_partition_scan_bytes: None,
                 scratch_root: None,

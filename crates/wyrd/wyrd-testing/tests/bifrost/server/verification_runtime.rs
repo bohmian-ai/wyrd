@@ -8052,7 +8052,8 @@ async fn custom_query_preserves_evidence_and_limits() -> Result<(), ServerJourne
 /// A combined node at the four-CPU baseline and at sixteen CPUs, and a split
 /// Oracle/Scribe pair at sixteen CPUs whose producer has no local Scribe, each
 /// take more independent queued executions than the process has outbox
-/// lanes. An unknown Verifier is refused before anything is queued. Each
+/// lanes. A caller without the runner role is refused before anything is
+/// queued. Each
 /// accepted execution reaches the queue only once Scribe acknowledged it,
 /// completes through the real runtime, and publishes exactly one passing
 /// result attributed to the submitting service, readable through Oracle
@@ -8106,19 +8107,27 @@ async fn scaled_outboxes_preserve_sdk_evidence() -> Result<(), ServerJourneyErro
         )?;
         let inputs = json!({ "x": { "kind": "json", "value": true } });
 
-        let refused = client
-            .request_json::<_, Value>(
-                reqwest::Method::POST,
-                "/v1/verification/enqueue",
-                Some(&enqueue_body(
-                    &CardUid::new(uuid::Uuid::now_v7().to_string())?,
-                    &subject,
-                    inputs.clone(),
-                )),
-            )
-            .await;
-        if refused.is_ok() || !seed.executions().await?.is_empty() {
-            return Err("an unknown Verifier was queued".into());
+        let outsider = producer.bootstrap_service("scaled-outsider", &[]).await?;
+        let refused = super::query::client_for(
+            producer,
+            outsider
+                .api_key()
+                .ok_or("the outsider carries an API key")?,
+        )?
+        .request_json::<_, Value>(
+            reqwest::Method::POST,
+            "/v1/verification/enqueue",
+            Some(&enqueue_body(&verifier, &subject, inputs.clone())),
+        )
+        .await;
+        if let Ok(accepted) = refused {
+            return Err(
+                format!("a caller without the runner role was accepted: {accepted}").into(),
+            );
+        }
+        let queued = seed.executions().await?;
+        if !queued.is_empty() {
+            return Err(format!("a refused enqueue was queued: {queued:?}").into());
         }
 
         let mut accepted = Vec::with_capacity(EXECUTIONS);

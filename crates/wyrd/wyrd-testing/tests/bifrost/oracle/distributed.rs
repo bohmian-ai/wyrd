@@ -1271,7 +1271,11 @@ async fn prove_variant_memory_answers(
             documents
                 .iter()
                 .map(|(value, document)| {
-                    vec![value.to_string(), text(&document["a"]), text(&document["a"])]
+                    vec![
+                        value.to_string(),
+                        text(&document["a"]),
+                        text(&document["a"]),
+                    ]
                 })
                 .collect::<Vec<_>>(),
         ),
@@ -1656,7 +1660,10 @@ fn writer_follower_bytes(cluster: &WyrdTestCluster) -> Result<usize, JourneyErro
         .servers()
         .filter_map(|server| server.state().bifrost_ingest())
     {
-        let bytes = ingest.resources().snapshot()?.oracle_query_memory_used_bytes;
+        let bytes = ingest
+            .resources()
+            .snapshot()?
+            .oracle_query_memory_used_bytes;
         held = Some(held.unwrap_or(0) + bytes);
     }
     held.ok_or_else(|| "the cluster has no Scribe runtime".into())

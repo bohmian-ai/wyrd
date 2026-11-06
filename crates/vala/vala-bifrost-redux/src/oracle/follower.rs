@@ -166,10 +166,9 @@ pub(super) fn signed_requirements(
     }
     let outputs = match &payload.outputs {
         None if filter.is_none() => return Ok((None, Arc::clone(closure))),
-        None => ProjectionExprs::from_indices(
-            &(0..closure.fields().len()).collect::<Vec<_>>(),
-            closure,
-        ),
+        None => {
+            ProjectionExprs::from_indices(&(0..closure.fields().len()).collect::<Vec<_>>(), closure)
+        }
         Some(outputs) if outputs.exprs.len() == outputs.names.len() => ProjectionExprs::new(
             outputs
                 .exprs
@@ -922,8 +921,7 @@ where
             if resolved.plan.schema() != expected {
                 return Err(PhysicalPlanFollowerError::Resolution(
                     FollowerResolutionError::Fault(
-                        "resolved provider schema differs from the signed scan outputs"
-                            .to_owned(),
+                        "resolved provider schema differs from the signed scan outputs".to_owned(),
                     ),
                 ));
             }
@@ -2449,12 +2447,14 @@ pub(crate) mod tests {
         );
         let closure = signed_closure_schema(schema.as_ref(), &assignment).expect("closure");
         let context = SessionContext::new();
-        let df_schema = datafusion::common::DFSchema::try_from(Arc::clone(&closure))
-            .expect("closure schema");
+        let df_schema =
+            datafusion::common::DFSchema::try_from(Arc::clone(&closure)).expect("closure schema");
         let plan = |sql: &str| {
             context
                 .create_physical_expr(
-                    context.parse_sql_expr(sql, &df_schema).expect("expression parses"),
+                    context
+                        .parse_sql_expr(sql, &df_schema)
+                        .expect("expression parses"),
                     &df_schema,
                 )
                 .expect("expression plans")
@@ -2474,9 +2474,10 @@ pub(crate) mod tests {
                 &OraclePhysicalExtensionCodec::encoder(),
             )
             .expect("encoded plan");
-            let Some(PhysicalPlanType::Extension(extension)) = PhysicalPlanNode::decode(bytes.as_ref())
-                .expect("decoded plan node")
-                .physical_plan_type
+            let Some(PhysicalPlanType::Extension(extension)) =
+                PhysicalPlanNode::decode(bytes.as_ref())
+                    .expect("decoded plan node")
+                    .physical_plan_type
             else {
                 panic!("the placeholder encodes as the extension");
             };
@@ -2548,10 +2549,7 @@ pub(crate) mod tests {
             "ordered outputs arrive planned over the closure"
         );
         assert_eq!(
-            scalar_requirements
-                .filter
-                .as_ref()
-                .map(ToString::to_string),
+            scalar_requirements.filter.as_ref().map(ToString::to_string),
             Some(filter.to_string()),
             "the exact filter arrives unchanged"
         );
@@ -2574,7 +2572,8 @@ pub(crate) mod tests {
                         &(Arc::new(datafusion::physical_expr::expressions::Column::new(
                             "unused_payload",
                             2,
-                        )) as Arc<dyn datafusion::physical_expr::PhysicalExpr>),
+                        ))
+                            as Arc<dyn datafusion::physical_expr::PhysicalExpr>),
                         &OraclePhysicalExtensionCodec::encoder(),
                     )
                     .expect("encoded column"),
@@ -2587,7 +2586,9 @@ pub(crate) mod tests {
         let misaligned = RemoteScanPayload {
             outputs: Some(crate::oracle::codec::RemoteScanOutputs {
                 names: vec!["r".to_owned()],
-                ..encoded(None, Some(ProjectionExprs::new([]))).outputs.expect("outputs")
+                ..encoded(None, Some(ProjectionExprs::new([])))
+                    .outputs
+                    .expect("outputs")
             }),
             ..RemoteScanPayload::default()
         };

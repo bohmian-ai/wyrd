@@ -564,8 +564,15 @@ impl ExecutionPlan for LiveScribeExec {
         &self,
         f: &mut dyn FnMut(&Arc<dyn PhysicalExpr>) -> DataFusionResult<TreeNodeRecursion>,
     ) -> DataFusionResult<TreeNodeRecursion> {
-        let outputs = self.projection.iter().flat_map(|outputs| outputs.iter());
-        for expr in self.predicate.iter().chain(outputs.map(|output| &output.expr)) {
+        let outputs = self
+            .projection
+            .iter()
+            .flat_map(datafusion::physical_expr::projection::ProjectionExprs::iter);
+        for expr in self
+            .predicate
+            .iter()
+            .chain(outputs.map(|output| &output.expr))
+        {
             if f(expr)? == TreeNodeRecursion::Stop {
                 return Ok(TreeNodeRecursion::Stop);
             }
@@ -589,13 +596,11 @@ impl ExecutionPlan for LiveScribeExec {
             None => projection.projection_expr().clone(),
         };
         let mut leaf = self.clone();
-        leaf.properties = Arc::new(
-            PlanProperties::clone(&self.properties).with_eq_properties(
-                datafusion::physical_expr::EquivalenceProperties::new(Arc::new(
-                    outputs.project_schema(&self.closure)?,
-                )),
-            ),
-        );
+        leaf.properties = Arc::new(PlanProperties::clone(&self.properties).with_eq_properties(
+            datafusion::physical_expr::EquivalenceProperties::new(Arc::new(
+                outputs.project_schema(&self.closure)?,
+            )),
+        ));
         leaf.projection = Some(outputs);
         Ok(Some(Arc::new(leaf)))
     }
@@ -1234,9 +1239,9 @@ mod tests {
     use wyrd_spec::vala::api::WorkerScanStats;
 
     use super::*;
-    use datafusion::physical_plan::filter::FilterExec;
     use crate::oracle::dispatcher::{NativeCompletion, NativeOutputTally};
     use crate::oracle::exec::tests::FIXTURE_TIME_COLUMN;
+    use datafusion::physical_plan::filter::FilterExec;
 
     /// A static query filter pushed to the live leaf replaces the leader's
     /// `FilterExec` and ships on every fragment as the placeholder's exact

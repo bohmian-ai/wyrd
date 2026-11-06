@@ -230,7 +230,10 @@ impl ExecutionPlan for RemoteSourcePlaceholderExec {
         &self,
         f: &mut dyn FnMut(&Arc<dyn PhysicalExpr>) -> DataFusionResult<TreeNodeRecursion>,
     ) -> DataFusionResult<TreeNodeRecursion> {
-        let outputs = self.outputs.iter().flat_map(|outputs| outputs.iter());
+        let outputs = self
+            .outputs
+            .iter()
+            .flat_map(datafusion::physical_expr::projection::ProjectionExprs::iter);
         for expr in self.filter.iter().chain(outputs.map(|output| &output.expr)) {
             if f(expr)? == TreeNodeRecursion::Stop {
                 return Ok(TreeNodeRecursion::Stop);

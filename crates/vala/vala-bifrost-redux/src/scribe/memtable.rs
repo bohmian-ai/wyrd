@@ -2470,12 +2470,14 @@ impl ReadRequirements {
         physical: &SchemaRef,
     ) -> Result<AdaptedRequirements, ScribeError> {
         use datafusion::physical_expr_adapter::PhysicalExprAdapterFactory as _;
-        let schema = self
-            .outputs
-            .project_schema(logical)
-            .map_err(|error| ScribeError::Internal {
-                detail: format!("live-tail outputs do not plan over the required fields: {error}"),
-            })?;
+        let schema =
+            self.outputs
+                .project_schema(logical)
+                .map_err(|error| ScribeError::Internal {
+                    detail: format!(
+                        "live-tail outputs do not plan over the required fields: {error}"
+                    ),
+                })?;
         let adapter = datafusion::physical_expr_adapter::DefaultPhysicalExprAdapterFactory
             .create(Arc::clone(logical), Arc::clone(physical))
             .ok();
@@ -2550,28 +2552,26 @@ impl AdaptedRequirements {
                     batch: &RecordBatch| {
             expr.evaluate(batch)
                 .and_then(|value| value.into_array(batch.num_rows()))
-                .and_then(|mask| {
-                    datafusion::common::cast::as_boolean_array(&mask).map(Clone::clone)
-                })
+                .and_then(|mask| datafusion::common::cast::as_boolean_array(&mask).cloned())
         };
         let mut restored: Option<RecordBatch> = None;
         let mut statistics = Statistics::clone(statistics);
         if let Some(filter) = &requirements.filter {
-            let kept = match self
+            let kept = if let Some(kept) = self
                 .filter
                 .as_ref()
                 .and_then(|adapted| mask(adapted, &physical).ok())
             {
-                Some(kept) => kept,
-                None => {
-                    let rows = logical(&physical)?;
-                    let kept = mask(filter, &rows).map_err(internal)?;
-                    restored = Some(rows);
-                    kept
-                }
+                kept
+            } else {
+                let rows = logical(&physical)?;
+                let kept = mask(filter, &rows).map_err(internal)?;
+                restored = Some(rows);
+                kept
             };
             let rows = physical.num_rows();
-            physical = arrow::compute::filter_record_batch(&physical, &kept).map_err(arrow_internal)?;
+            physical =
+                arrow::compute::filter_record_batch(&physical, &kept).map_err(arrow_internal)?;
             restored = restored
                 .map(|rows| arrow::compute::filter_record_batch(&rows, &kept))
                 .transpose()
@@ -2882,7 +2882,8 @@ mod tests {
             None,
             Some(r#"{"region":7,"nested":{"k":"d"},"tags":["v"]}"#),
         ];
-        let text: arrow::array::ArrayRef = Arc::new(arrow::array::StringArray::from(documents.to_vec()));
+        let text: arrow::array::ArrayRef =
+            Arc::new(arrow::array::StringArray::from(documents.to_vec()));
         let attrs: arrow::array::ArrayRef = parquet_variant_compute::json_to_variant(&text)
             .expect("valid JSON")
             .into();
@@ -2955,7 +2956,9 @@ mod tests {
         let plan = |sql: &str| {
             context
                 .create_physical_expr(
-                    context.parse_sql_expr(sql, &df_schema).expect("expression parses"),
+                    context
+                        .parse_sql_expr(sql, &df_schema)
+                        .expect("expression parses"),
                     &df_schema,
                 )
                 .expect("expression plans")
@@ -3041,7 +3044,11 @@ mod tests {
                 .iter()
                 .map(|field| field.name().clone())
                 .collect::<Vec<_>>();
-            assert_eq!(names, ["v", "r", "v"], "outputs keep their order and repeats");
+            assert_eq!(
+                names,
+                ["v", "r", "v"],
+                "outputs keep their order and repeats"
+            );
             assert_eq!(values(batch, 0), [3, 4]);
             assert_eq!(texts(batch, 1), owned(&[None, None]));
             assert_eq!(values(batch, 2), [3, 4]);

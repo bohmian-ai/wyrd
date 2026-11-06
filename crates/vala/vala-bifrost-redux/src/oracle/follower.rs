@@ -133,13 +133,17 @@ pub(super) fn signed_closure_schema(
 /// resolver calls it before tail IO and [`PhysicalPlanFollower::decode`]
 /// after every scan id resolves. Expressions are parsed only against the
 /// closure derived from the authenticated schema, never a schema the request
-/// supplies, so a filter or output naming anything else is refused.
+/// supplies, and every column any filter or output references, however
+/// deeply nested, must name the closure field at its ordinal, so a filter or
+/// output reaching anything else is refused before any source opens, even
+/// one an empty source would never evaluate.
 ///
 /// # Errors
 ///
-/// Returns a redacted message when the filter is not a boolean over the
-/// closure, an output does not plan over it, or output names and
-/// expressions are not index-aligned.
+/// Returns a redacted message when an expression references a column outside
+/// the closure, the filter's type cannot be derived or is not Boolean, an
+/// output does not plan over the closure, or output names and expressions
+/// are not index-aligned.
 pub(super) fn signed_requirements(
     closure: &SchemaRef,
     payload: &RemoteScanPayload,
@@ -148,20 +152,31 @@ pub(super) fn signed_requirements(
     use datafusion::physical_expr::projection::{ProjectionExpr, ProjectionExprs};
     let refused = || "scan requirements do not plan over the signed closure".to_owned();
     let parse = |expr| {
-        datafusion_proto::physical_plan::from_proto::parse_physical_expr(
+        let expr = datafusion_proto::physical_plan::from_proto::parse_physical_expr(
             expr,
             context,
             closure,
             &OraclePhysicalExtensionCodec::encoder(),
         )
-        .map_err(|_| refused())
+        .map_err(|_| refused())?;
+        let closed = datafusion::physical_expr::utils::collect_columns(&expr)
+            .iter()
+            .all(|column| {
+                closure
+                    .fields()
+                    .get(column.index())
+                    .is_some_and(|field| field.name() == column.name())
+            });
+        if closed { Ok(expr) } else { Err(refused()) }
     };
     let filter = payload.filter.as_ref().map(parse).transpose()?;
-    if filter.as_ref().is_some_and(|filter| {
-        filter
-            .data_type(closure)
-            .is_ok_and(|data_type| data_type != arrow::datatypes::DataType::Boolean)
-    }) {
+    if filter
+        .as_ref()
+        .map(|filter| filter.data_type(closure))
+        .transpose()
+        .map_err(|_| refused())?
+        .is_some_and(|data_type| data_type != arrow::datatypes::DataType::Boolean)
+    {
         return Err(refused());
     }
     let outputs = match &payload.outputs {
@@ -2407,7 +2422,8 @@ pub(crate) mod tests {
     /// signed closure, and the leaf exposes exactly those outputs. Repeated
     /// outputs keep their order, a filter-only COUNT exposes zero columns,
     /// and requirements that do not plan over the closure refuse before the
-    /// tail is opened.
+    /// empty tail is opened, including a column outside it nested under a
+    /// null test in the filter or an output, or a bare one as a filter.
     ///
     /// # Panics
     ///
@@ -2592,7 +2608,48 @@ pub(crate) mod tests {
             }),
             ..RemoteScanPayload::default()
         };
-        for refused in [off_closure, not_boolean, misaligned] {
+        let wire = |expr: Arc<dyn datafusion::physical_expr::PhysicalExpr>| {
+            datafusion_proto::physical_plan::to_proto::serialize_physical_expr(
+                &expr,
+                &OraclePhysicalExtensionCodec::encoder(),
+            )
+            .expect("encoded expression")
+        };
+        let outside = || -> Arc<dyn datafusion::physical_expr::PhysicalExpr> {
+            Arc::new(datafusion::physical_expr::expressions::Column::new(
+                "unused_payload",
+                2,
+            ))
+        };
+        let null_test = || -> Arc<dyn datafusion::physical_expr::PhysicalExpr> {
+            Arc::new(datafusion::physical_expr::expressions::IsNullExpr::new(
+                outside(),
+            ))
+        };
+        let bare_filter = RemoteScanPayload {
+            filter: Some(wire(outside())),
+            outputs: Some(crate::oracle::codec::RemoteScanOutputs::default()),
+            ..RemoteScanPayload::default()
+        };
+        let nested_filter = RemoteScanPayload {
+            filter: Some(wire(null_test())),
+            ..RemoteScanPayload::default()
+        };
+        let nested_output = RemoteScanPayload {
+            outputs: Some(crate::oracle::codec::RemoteScanOutputs {
+                exprs: vec![wire(null_test())],
+                names: vec!["leak".to_owned()],
+            }),
+            ..RemoteScanPayload::default()
+        };
+        for refused in [
+            off_closure,
+            not_boolean,
+            misaligned,
+            bare_filter,
+            nested_filter,
+            nested_output,
+        ] {
             assert!(
                 resolve(refused).await.is_err(),
                 "requirements outside the closure refuse"

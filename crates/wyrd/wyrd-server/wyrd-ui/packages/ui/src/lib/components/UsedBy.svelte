@@ -27,7 +27,7 @@
             <td><button type="button" class="open" {disabled} onclick={() => open(user.ref)}>{fmtCardRef(user.ref)}</button></td>
             {#if user.agent.state === 'populated'}
               {@const route = user.agent.data.route}
-              <td>{route.kind === 'wyrd_gateway' ? `gateway ${route.deployment}` : 'native'}</td>
+              <td>{route.kind === 'wyrd_gateway' ? `wyrd_gateway · ${route.deployment}` : 'native'}</td>
               <td>
                 {#each user.agent.data.services as service (fmtCardRef(service))}
                   <button type="button" class="open" {disabled} onclick={() => open(service)}>{fmtCardRef(service)}</button>

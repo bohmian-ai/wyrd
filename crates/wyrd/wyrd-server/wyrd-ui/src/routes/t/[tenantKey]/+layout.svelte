@@ -31,7 +31,7 @@
   const groups = $derived<readonly (readonly Destination[])[]>([
     [
       { label: 'Home', href: base, icon: ICONS.home },
-      { label: 'Cards', icon: ICONS.cards }
+      { label: 'Cards', href: `${base}/cards`, icon: ICONS.cards }
     ],
     [
       { label: 'Observe', href: `${base}/observe`, icon: ICONS.observe },

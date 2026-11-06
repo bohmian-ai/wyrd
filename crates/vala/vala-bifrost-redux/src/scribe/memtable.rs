@@ -1961,7 +1961,8 @@ impl LiveCapture {
     }
 
     /// Reads one partition range of the capture: its memory batches `pruning`
-    /// keeps, projected to `required`, the accounting owners of those
+    /// keeps, projected to `required` or, with `requirements`, filtered and
+    /// evaluated to their outputs over `required`, the accounting owners of those
     /// batches, its staged run paths in merge order, and the lease that keeps
     /// those runs on disk.
     ///
@@ -2212,12 +2213,18 @@ impl ReadableSource {
     /// batch's bounds become inexact. A predicate that does not adapt or
     /// evaluate filters nothing here; the query's own filter still runs.
     ///
+    /// With `requirements`, each batch is instead filtered exactly and
+    /// emitted as their outputs, evaluated on the batch's own layout (see
+    /// [`AdaptedRequirements::evaluate`]): a covered Variant path reads its
+    /// typed leaves, and only a root an output names whole is reconstructed.
+    ///
     /// [`DefaultPhysicalExprAdapterFactory`]: datafusion::physical_expr_adapter::DefaultPhysicalExprAdapterFactory
     ///
     /// # Errors
     ///
     /// Returns the column-selection error unchanged, or an internal error
-    /// when Variant reconstruction, Arrow cast, or batch assembly fails.
+    /// when Variant reconstruction, Arrow cast, requirement evaluation, or
+    /// batch assembly fails.
     fn project(
         &self,
         required: &[FieldRef],

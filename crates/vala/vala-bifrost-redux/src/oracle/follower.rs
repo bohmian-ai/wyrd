@@ -2404,6 +2404,209 @@ pub(crate) mod tests {
         );
     }
 
+    /// A Variant path's ordered outputs and exact filter, encoded by the
+    /// leader's placeholder, reach the Scribe's live read planned over the
+    /// signed closure, and the leaf exposes exactly those outputs. Repeated
+    /// outputs keep their order, a filter-only COUNT exposes zero columns,
+    /// and requirements that do not plan over the closure refuse before the
+    /// tail is opened.
+    ///
+    /// # Panics
+    ///
+    /// Panics when a fixture cannot be planned or encoded, resolution
+    /// differs from the above, or a refused payload reaches the tail.
+    #[tokio::test]
+    async fn learned_variant_requirements_reach_memory() {
+        use datafusion::physical_expr::projection::{ProjectionExpr, ProjectionExprs};
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("unused_payload", DataType::Utf8, true),
+            Field::new("value", DataType::Int64, false),
+            wyrd_types::variant::variant_field("attrs", true),
+        ]));
+        let tenant_id = DataTenantId::new_v7();
+        let stream = StreamIdentity::new(
+            crate::scribe::stream_identity::NodeId::new(uuid::Uuid::now_v7()),
+            WriterEpoch::new(2),
+        );
+        let requests = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let recording = ScribeTailResolver::with_schema(
+            Arc::new(RecordingTail {
+                stream,
+                requests: Arc::clone(&requests),
+                batches: Vec::new(),
+            }),
+            Arc::clone(&schema),
+        );
+        let binding = closure_fixture_binding(tenant_id);
+        let fingerprint = super::super::assignment_schema_fingerprint(schema.as_ref());
+        let assignment = closure_assignment(
+            local_scribe_scan_id(&binding, stream),
+            binding,
+            schema.as_ref(),
+            vec!["attrs".to_owned(), "value".to_owned()],
+            fingerprint.clone(),
+        );
+        let closure = signed_closure_schema(schema.as_ref(), &assignment).expect("closure");
+        let context = SessionContext::new();
+        let df_schema = datafusion::common::DFSchema::try_from(Arc::clone(&closure))
+            .expect("closure schema");
+        let plan = |sql: &str| {
+            context
+                .create_physical_expr(
+                    context.parse_sql_expr(sql, &df_schema).expect("expression parses"),
+                    &df_schema,
+                )
+                .expect("expression plans")
+        };
+        let session = SessionContext::new_with_config(
+            crate::resources::OracleSessionShape::for_test().session_config(),
+        )
+        .state();
+        // The payload exactly as the leader's placeholder encodes it.
+        let encoded = |filter, outputs| {
+            let placeholder =
+                RemoteSourcePlaceholderExec::new("scan", fingerprint.clone(), Arc::clone(&closure))
+                    .with_requirements(filter, outputs)
+                    .expect("requirements plan over the closure");
+            let bytes = physical_plan_to_bytes_with_extension_codec(
+                Arc::new(placeholder),
+                &OraclePhysicalExtensionCodec::encoder(),
+            )
+            .expect("encoded plan");
+            let Some(PhysicalPlanType::Extension(extension)) = PhysicalPlanNode::decode(bytes.as_ref())
+                .expect("decoded plan node")
+                .physical_plan_type
+            else {
+                panic!("the placeholder encodes as the extension");
+            };
+            OraclePhysicalExtensionCodec::preflight_extension(&extension.node)
+                .expect("payload decodes")
+        };
+        let resolve = |payload: RemoteScanPayload| {
+            let recording = &recording;
+            let assignment = &assignment;
+            let session = &session;
+            async move {
+                recording
+                    .resolve(
+                        ClusterRole::Scribe,
+                        test_query_id(),
+                        assignment,
+                        &payload,
+                        session,
+                    )
+                    .await
+            }
+        };
+        let region = plan("attrs ->> 'region'");
+        let filter = plan("attrs ->> 'region' = 'eu-west'");
+
+        let scalar = resolve(encoded(
+            Some(Arc::clone(&filter)),
+            Some(ProjectionExprs::new([
+                ProjectionExpr::new(Arc::clone(&region), "r"),
+                ProjectionExpr::new(plan("value"), "v"),
+                ProjectionExpr::new(Arc::clone(&region), "r2"),
+            ])),
+        ))
+        .await
+        .expect("covered requirements resolve");
+        let count = resolve(encoded(
+            Some(Arc::clone(&filter)),
+            Some(ProjectionExprs::new([])),
+        ))
+        .await
+        .expect("a filter-only COUNT resolves");
+        let recorded = requests
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+
+        assert_eq!(plan_column_names(&scalar.plan), ["r", "v", "r2"]);
+        assert_eq!(scalar.plan.schema().field(1).data_type(), &DataType::Int64);
+        assert_eq!(count.plan.schema().fields().len(), 0);
+        assert_eq!(recorded.len(), 2, "each resolution opens the tail once");
+        let received = |index: usize| {
+            recorded[index]
+                .requirements
+                .clone()
+                .expect("requirements reach the live read")
+        };
+        let scalar_requirements = received(0);
+        assert_eq!(
+            scalar_requirements
+                .outputs
+                .iter()
+                .map(|output| (output.alias.as_str(), output.expr.to_string()))
+                .collect::<Vec<_>>(),
+            [
+                ("r", region.to_string()),
+                ("v", plan("value").to_string()),
+                ("r2", region.to_string()),
+            ],
+            "ordered outputs arrive planned over the closure"
+        );
+        assert_eq!(
+            scalar_requirements
+                .filter
+                .as_ref()
+                .map(ToString::to_string),
+            Some(filter.to_string()),
+            "the exact filter arrives unchanged"
+        );
+        assert!(recorded[0].pruning.is_some(), "the filter also prunes");
+        assert_eq!(received(1).outputs.iter().count(), 0);
+        assert_eq!(
+            recorded[0]
+                .required_fields
+                .iter()
+                .map(|field| field.name().as_str())
+                .collect::<Vec<_>>(),
+            ["attrs", "value"],
+            "the live read still selects the signed closure"
+        );
+
+        let off_closure = RemoteScanPayload {
+            outputs: Some(crate::oracle::codec::RemoteScanOutputs {
+                exprs: vec![
+                    datafusion_proto::physical_plan::to_proto::serialize_physical_expr(
+                        &(Arc::new(datafusion::physical_expr::expressions::Column::new(
+                            "unused_payload",
+                            2,
+                        )) as Arc<dyn datafusion::physical_expr::PhysicalExpr>),
+                        &OraclePhysicalExtensionCodec::encoder(),
+                    )
+                    .expect("encoded column"),
+                ],
+                names: vec!["leak".to_owned()],
+            }),
+            ..RemoteScanPayload::default()
+        };
+        let not_boolean = encoded(Some(plan("value")), None);
+        let misaligned = RemoteScanPayload {
+            outputs: Some(crate::oracle::codec::RemoteScanOutputs {
+                names: vec!["r".to_owned()],
+                ..encoded(None, Some(ProjectionExprs::new([]))).outputs.expect("outputs")
+            }),
+            ..RemoteScanPayload::default()
+        };
+        for refused in [off_closure, not_boolean, misaligned] {
+            assert!(
+                resolve(refused).await.is_err(),
+                "requirements outside the closure refuse"
+            );
+        }
+        assert_eq!(
+            requests
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .len(),
+            2,
+            "a refused payload never opens the tail"
+        );
+    }
+
     /// A mismatched *full* schema fingerprint refuses before any source IO.
     ///
     /// The closure a leader signs narrows the columns a leaf returns; it never

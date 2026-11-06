@@ -493,3 +493,69 @@ task or specification revision when approved behavior and proof stay intact.
 - [Security principles](../../../../architecture/wyrd-security-posture.md#security-principles)
 - [Rust ownership](../../../../agent_docs/rust.md)
 - [Benchmark method](../../../../benchmarks/README.md)
+
+## Execution Evidence
+
+Candidate commits on `change/resource-scaling`: `d7c7f498c` (shared plan:
+worker counts, outbox geometry), `9980d062c` (outbox lanes, process delivery
+permits, startup diagnostic, harness on the production policy path, journeys,
+architecture), and the follow-up lint/journey commit. Baseline main
+`5234961d51798581a026834cfffd5efaadc226b4`.
+
+| Acceptance criterion | Implementation evidence | Verification evidence | Result |
+|---|---|---|---|
+| AC-001 startup counts | `resources.rs` `OutboxExecution::resolve`, `ScribeWorkers::resolve`, `ResourcePlan.{outbox,scribe_workers}` from `from_snapshot` | `resources::tests::startup_execution_counts_follow_resources` (C=1/2/4→4/4/32, 8→8/8/64, 16→16/16/128, cap, overflow `InvalidPlan`, zero refused) | PASS |
+| AC-002 concurrency/correctness | `outbox.rs` `OutboxSink::lanes`, `OutboxWriter.lanes`; `scribe_outbox.rs` `ScribeSink::deliver` process permit held encode→ACK and moved into the blocking closure | `outbox::tests::configured_lanes_preserve_order_retry_and_progress` (lanes 4, 8); `scribe_outbox::tests::delivery_limits_preserve_per_writer_ack_overlap` (C=4, 8); `scribe_outbox::tests::cancelled_encoding_retains_delivery_capacity`; mutation RED: early permit drop fails the overlap test, uncounted blocking encode fails both; 21/21 `wyrd-runtime outbox::`, 143/143 wyrd-server `config|boot|scribe_outbox|verification::submissions` with Postgres | PASS |
+| AC-003 throughput | existing `capacity l1/l2 gateway` driver, `--allow-dirty` records under `target/benchmarks/` | see Throughput below: L1 regresses beyond run variation on this host; no provisioned smaller/larger CPU environment | FAIL |
+| AC-004 one configuration | `config.rs` `BifrostRuntimeConfig::resource_policy`, `ScribeRuntimeConfig::worker_overrides`; `scribe/mod.rs` `ScribeLaneConfig::for_resources` (host probe removed); `boot/mod.rs` plan-driven pools, outbox and `Bifrost resource configuration resolved` diagnostic; test server uses `resource_policy` | `config::tests::scribe_worker_resolution_preserves_explicit_settings`; `owner_inspection::startup_consumers_share_one_resource_configuration` (Oracle-only producer at 16 CPUs and Scribe peer at 4 resolve their own plans; combined node with cap 8 over observed 32 and explicit ingress 5; outbox sink runs the plan; Scribe/Oracle share the root) | PASS |
+| AC-005 memory/scratch | unchanged `shared_memory_cap`/`scratch_budget` | 919/919 `vala-bifrost-redux --lib` with Postgres | PASS |
+| SDK evidence journey | — | `verification_runtime::scaled_outboxes_preserve_sdk_evidence` (combined C=4, C=16, split Oracle/Scribe C=16; 40 queued executions each, unauthorized enqueue refused and not queued, exact attributed results after drain) | PASS |
+
+Checks: `mise run fmt:check`, `mise run lints`, `check:deps`,
+`check:tenant-isolation`, `git diff --check` pass.
+
+Diagnosis (journey negative): **Symptom** `scaled_outboxes_preserve_sdk_evidence`
+read `202 {"execution_id":…}` for an unknown Verifier UID. **Cause** the enqueue
+route accepts and the queued path judges later; the test's assumption was wrong.
+**Fix site** the test: it now uses an existing admission refusal (caller
+without the runner role).
+
+Non-goals: no new public setting, dependency, feature, migration, SDK or wire
+change; queue capacities, pools, WAL IO and shards unchanged;
+`SubmissionSink` keeps four lanes. Unrelated working-tree entries
+(`changes/active/benchmark-scaling/*` deletions, `changes/active/gateway-latency-capture/`)
+were not touched.
+
+### Throughput
+
+Host: AMD Ryzen 9 9950X, 32 logical CPU, 91 GiB, Linux; the only host
+available. Effective C = 32 on both: baseline 4 writers/4 lanes/32 deliveries;
+candidate 32/32/256; Scribe workers 32/10/20 on both; shards 4.
+
+`mise run bench:l1:gateway -- --allow-dirty`, both VALID, median (min..max) of 3:
+
+| step | baseline req/s | candidate req/s | server cores b→c | peak RSS b→c |
+|---|---|---|---|---|
+| buffered-1kib-metadata c1 | 4453 (3815..4515) | 4166 (4040..4181) | 1.18→2.13 | 867→2699 MiB |
+| buffered-1kib-metadata c64 | 53368 (51131..53408) | 49372 (48750..50705) | 19.2→20.2 | 2308→2579 MiB |
+| streamed-1kib-metadata c64 | 1536 | 1536 | 1.49→2.67 | 1446→3367 MiB |
+| buffered-64kib-metadata c64 | 18269 (16791..18763) | 17018 (16986..18335) | 20.1→20.3 | 2321→3227 MiB |
+| buffered-64kib-payload c64 | 4783, p99 169 ms | 5110, p99 95 ms (p95 22→46) | 11.1→16.8 | 8882→14053 MiB |
+
+No errors, loss, shed or undrained captures in either. Records:
+`target/benchmarks/gateway/overhead/20261106T175910Z-2714244aa.json` (candidate);
+baseline `20261106T175550Z-5234961d5.json` in a scratch baseline worktree.
+
+Diagnosis (independent read-only diagnostician): **Symptom** candidate
+throughput below baseline's range on linger-bound steps, with 1.8× CPU and
+2.3× RSS at an equal, upstream-paced rate. **Evidence** each lane lingers and
+slices independently (`outbox.rs` `is_ready`/`lingered`/`take`), captures
+spread evenly by request id over 32 lanes instead of 4, so each slice carries
+~1/8 the rows (streamed c64: ~19 → ~2.4 rows per slice); every slice pays
+fixed frame build, `spawn_blocking` encode, Scribe ingress/WAL and one memtable
+`RecordBatch`. Worker pools and shards are identical. **Cause** batching
+dilution inherent in "a slice is one lane's batch" once lanes grow with C;
+the byte-bound payload step gains from parallelism. **Fix site** `OutboxWriter`
+batching; the fix that restores batching (one slice covering several idle
+lanes of a tenant, retried by its lane set) changes the approved definition of
+a slice, so it is a specification decision, not an implementation choice.

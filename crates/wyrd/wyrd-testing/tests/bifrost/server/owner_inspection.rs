@@ -605,7 +605,7 @@ fn observation(cpu: usize) -> vala_bifrost_redux::resources::SystemResourceSnaps
 ///
 /// A split-role cluster gives its Oracle-only producer, which sends its outbox
 /// to the peer Scribe, and its Scribe node different observations; each must
-/// resolve outbox and worker counts from its own CPU, never its peer's. A
+/// resolve worker counts from its own CPU, never its peer's. A
 /// combined node with an effective CPU cap and one explicit worker count must
 /// size every consumer from the capped CPU while keeping the explicit value.
 /// Scribe and Oracle capabilities must reference their node's one resource root.
@@ -617,7 +617,7 @@ fn observation(cpu: usize) -> vala_bifrost_redux::resources::SystemResourceSnaps
 #[tokio::test]
 #[ignore = "requires Postgres and object storage"]
 async fn startup_consumers_share_one_resource_configuration() {
-    use vala_bifrost_redux::resources::{OutboxExecution, ScribeWorkerOverrides, ScribeWorkers};
+    use vala_bifrost_redux::resources::{ScribeWorkerOverrides, ScribeWorkers};
     use wyrd_server::config::BifrostTarget;
     use wyrd_testing::bifrost::TestOracleResources;
 
@@ -629,16 +629,7 @@ async fn startup_consumers_share_one_resource_configuration() {
                 .expect("a Bifrost node composes resources");
             let plan = roles.plan();
             assert_eq!(plan.effective_cpu, cpu, "the node resolves its own CPU");
-            assert_eq!(
-                plan.outbox,
-                OutboxExecution::resolve(cpu).expect("the outbox counts resolve")
-            );
             assert_eq!(plan.scribe_workers, ScribeWorkers::resolve(cpu, overrides));
-            assert_eq!(
-                state.bifrost.scribe_outbox().sink().execution(),
-                plan.outbox,
-                "the process outbox runs the plan's counts"
-            );
             if let Some(scribe) = roles.scribe() {
                 assert!(scribe.shares_root_with(roles));
             }

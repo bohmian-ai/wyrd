@@ -1182,16 +1182,14 @@ below that floor, so the smallest supported pod has a 3-GiB cap and a
 Each process resolves one immutable resource configuration at startup, before
 any consumer starts, from its own observed CPU, memory, and scratch, never a
 peer's. `WYRD_BIFROST_EFFECTIVE_CPU` may only lower the observed CPU `C`.
-Scribe, Oracle, Forge, storage, transport, and the process Scribe outbox size
-themselves from that configuration or a capability derived from it; none
-probes the host. Omitted Scribe coordination, ingress, and persistence worker
+Scribe, Oracle, Forge, storage, and transport size themselves from that
+configuration or a capability derived from it; none probes the host. Omitted Scribe coordination, ingress, and persistence worker
 counts derive from `C` (`B = max(C - 2, 2)`: ingress `max(B / 3, 1)`,
 persistence `max(B - ingress, 1)`, coordination `max(C, 2)`); an explicit
-worker count keeps its value. The outbox runs `W = max(4, C)` slice writers,
-`W` ordered lanes per tenant, eight concurrent frame deliveries per writer,
-and at most `8 * W` deliveries across the process. These are concurrency
-ceilings, not reserved cores or memory; queue capacities, database pools, WAL
-IO, and Scribe shard counts do not scale with `C`. Startup logs the resolved
+worker count keeps its value. The process Scribe outbox does not scale with
+`C`: it runs four slice writers and four ordered lanes per tenant, with eight
+concurrent frame deliveries per writer and 32 across the process. Queue capacities, database pools,
+WAL IO, and Scribe shard counts do not scale with `C` either. Startup logs the resolved
 configuration, its sources, explicit overrides, and queue limits. Usage and
 pressure counters stay live; only the configuration is fixed.
 

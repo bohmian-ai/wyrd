@@ -3897,8 +3897,7 @@ mod tests {
 
     use super::*;
     use vala_bifrost_redux::resources::{
-        ORACLE_PARTITION_WORKING_MEMORY_BYTES, OutboxExecution, ResourcePlan, ScribeWorkers,
-        oracle_worker_slots,
+        ORACLE_PARTITION_WORKING_MEMORY_BYTES, ResourcePlan, ScribeWorkers, oracle_worker_slots,
     };
 
     /// Serialize env-var tests so concurrent test threads cannot interfere.
@@ -5084,7 +5083,6 @@ minimum_slots = 2
         let omitted = resolve(cap);
         assert_eq!(omitted.effective_cpu, 8);
         assert_eq!(omitted.scribe_workers, workers(8, 2, 4));
-        assert_eq!(omitted.outbox.writers, 8);
         // Uncapped, the same omission follows the observed 32 CPUs.
         assert_eq!(resolve("").scribe_workers, workers(32, 10, 20));
         // Explicit ingress leaves the persistence default's formula alone.
@@ -6031,7 +6029,6 @@ minimum_slots = 2
             forge_enabled: false,
             scratch_limit_bytes: 0,
             scribe_workers: ScribeWorkers::resolve(effective_cpu, ScribeWorkerOverrides::default()),
-            outbox: OutboxExecution::resolve(effective_cpu).expect("representable outbox"),
         };
         // Memory is generous, so CPU is what bounds concurrency; the ratio is
         // two units per effective core.

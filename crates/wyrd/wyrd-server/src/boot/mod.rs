@@ -422,10 +422,10 @@ async fn build_bifrost_external_dependencies(
         explicit_coordination_threads = ?overrides.coordination_threads,
         explicit_ingress_cpu_threads = ?overrides.ingress_cpu_threads,
         explicit_persistence_cpu_threads = ?overrides.persistence_cpu_threads,
-        outbox_writers = plan.outbox.writers,
-        outbox_lanes = plan.outbox.lanes,
-        outbox_deliveries_per_writer = plan.outbox.deliveries_per_writer,
-        outbox_deliveries = plan.outbox.deliveries,
+        outbox_writers = crate::scribe_outbox::SCRIBE_WRITERS,
+        outbox_lanes = crate::scribe_outbox::SCRIBE_LANES,
+        outbox_deliveries_per_writer = crate::scribe_outbox::FRAMES_IN_FLIGHT,
+        outbox_deliveries = crate::scribe_outbox::SCRIBE_DELIVERIES,
         outbox_capacity_items = config.scribe.outbox_capacity,
         outbox_capacity_bytes = config.scribe.outbox_bytes,
         oracle_query_slot_limit = ?plan.oracle_query_slot_limit,
@@ -933,7 +933,6 @@ pub async fn compose_bifrost(
             bytes: scribe_config.outbox_bytes,
         },
         Some(postgres.wyrd().clone()),
-        resource_plan.outbox,
     );
     let scribe = if let Some(parts) = scribe {
         let fragment_security_audit = Arc::new(
@@ -2384,8 +2383,6 @@ mod tests {
                 6,
                 vala_bifrost_redux::resources::ScribeWorkerOverrides::default(),
             ),
-            outbox: vala_bifrost_redux::resources::OutboxExecution::resolve(6)
-                .expect("representable outbox"),
         };
         let forge_runtime = ForgeRuntimeConfig::default();
         let worker = super::forge_compaction_worker_config(&plan, &forge_runtime);

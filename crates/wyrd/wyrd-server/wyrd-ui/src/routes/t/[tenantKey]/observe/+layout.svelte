@@ -694,9 +694,9 @@
     color: var(--muted);
     font: 12px var(--font-mono);
   }
-  /* A choice fits "all series" or a short column name; a long attribute name truncates in the closed control. */
+  /* A choice is as wide as a short column name, so the Logs header keeps one row beside the open record; a long attribute name truncates in the closed control. */
   .by select {
-    max-width: 11em;
+    max-width: 7em;
   }
   .keys {
     flex-wrap: wrap;

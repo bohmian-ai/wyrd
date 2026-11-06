@@ -1160,6 +1160,19 @@ base('development environment lifecycle', { timeout: 2_400_000 }, async () => {
       { timeout: 180_000, interval: 2_000 }
     );
 
+    // Setup seeded the Cards board through public registration: the rail opens it, a Prompt compares its versions and lists its Agent.
+    await page.getByRole('navigation', { name: 'Destinations' }).getByRole('link', { name: 'Cards' }).click();
+    await page.waitForURL('http://127.0.0.1:3000/t/dev/cards');
+    const cards = page.getByRole('region', { name: 'Cards', exact: true });
+    await expect.poll(() => cards.locator('tbody tr', { hasText: 'support-reply' }).count()).toBe(2);
+    expect(await cards.locator('tbody tr', { hasText: 'reply-agent' }).count()).toBe(1);
+    await cards.locator('tbody tr', { hasText: '1.1.0' }).getByRole('button', { name: 'support-reply' }).click();
+    await page.waitForURL((url) => url.pathname === '/t/dev/cards/detail' && url.searchParams.get('version') === '1.1.0');
+    await expect.poll(() => page.getByRole('region', { name: 'Used by', exact: true }).textContent()).toContain('reply-agent@1.0.0');
+    expect(await page.getByRole('region', { name: 'Changes', exact: true }).textContent()).toContain('v1.0.0 → v1.1.0');
+    await page.goto('http://127.0.0.1:3000/t/dev/cards/detail?kind=Model&name=support-model&version=1.0.0&tab=files');
+    await expect.poll(() => page.getByRole('region', { name: 'Files', exact: true }).textContent()).toContain('support-model.bin');
+
     // Sign-out ends the session.
     await page.locator('details.identity summary').click();
     await page.getByRole('button', { name: 'Sign out' }).click();

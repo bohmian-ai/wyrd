@@ -2,7 +2,7 @@
 # Prepare and run the canonical wyrd-example-py application for `dev:full`.
 #
 #   example-app.sh prepare   pinned checkout + this checkout's production wheel
-#   example-app.sh setup     gateway deployment to MockServer, Cards, capture policy
+#   example-app.sh setup     gateway deployment to MockServer, Cards, capture policy, the Cards board's fixtures
 #   example-app.sh serve     the API on 127.0.0.1:${WYRD_EXAMPLE_PORT:-8000}
 #   example-app.sh batch ARGS   one bounded workload batch (scripts/batch.py)
 #   example-app.sh test ARGS    the app's pytest suite with the testing-enabled wheel,
@@ -83,6 +83,13 @@ setup() {
  "deployments": [{"name": "openai", "adapter": "openai", "auth": {"bearer": {"credential": "openai-key"}}}]}
 JSON
   uv run --no-sync python -m scripts.deploy
+  # The Cards board's representative registry: a Model with a file, two
+  # versions of one Prompt and the Agent using the newer one.
+  local card
+  for card in declare_and_pull/support-model.yaml ui_cards/support-reply-1.0.0.yaml \
+    ui_cards/support-reply-1.1.0.yaml ui_cards/reply-agent.yaml; do
+    uv run --no-sync wyrd declare "$root/fixtures/cards/$card" >/dev/null
+  done
 }
 
 # The app's tests start a WyrdTestServer, which only the testing wheel has.

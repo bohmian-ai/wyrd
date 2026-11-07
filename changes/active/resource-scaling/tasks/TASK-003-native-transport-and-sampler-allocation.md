@@ -380,3 +380,167 @@ small fixture extensions remain implementation-owned decisions.
 - [Bifrost sampling, memory and durability](../../../../architecture/bifrost-design.md)
 - [Security posture](../../../../architecture/wyrd-security-posture.md)
 - [Benchmark method](../../../../benchmarks/README.md)
+
+## Implementation Evidence
+
+Candidate `aa2a6a0d8` (Wyrd `3ca828260`, `69f58d4f9`, `aa2a6a0d8`) on
+baseline `d608ee303`. Forks on `wyrd-production`: iceberg-rust
+`e849bc4fa46430e6278a4c201106cdd68dc5b244`, iceberg-compaction
+`764fe2a8bbf2a8d1577ca27fec76751ac91c07ff` (repinned to that iceberg). Every
+benchmark ran on clean commits (`dirty: false`; the only untracked path is an
+unrelated change packet). Host: Ryzen 9 9950X, 32 CPU / 91 GiB, Linux x86_64.
+
+### Reuse map
+
+- **Transport:** `clients::send_bytes_with_retry` builds one
+  `reqwest::Request` and sends `try_clone` per attempt. The `Bytes` body is
+  shared by refcount. `answer_text` keeps the read buffer when it is valid
+  UTF-8. RawV1 takes ownership of `Box<RawValue>` and converts it to bytes with
+  no copy.
+- **Capture:** `adapter::complete` returns the RawV1 usage decode only when
+  capture is selected, and `ResponseCapture::json` consumes it.
+- **Sampler:** the fork's `variant_shredding` analyzer reads selected values in
+  place through a borrowed typed/residual reader that mirrors
+  `unshred_variant`. `ColumnSample::values` no longer takes or unshreds.
+  Wyrd's `claim_sample` consumers and reservations are unchanged.
+- **Profile population:** no harness change. The last repetition's
+  post-drain `TimingEvidence.after` snapshot
+  (`timings/<step>/repetition-3.json`) is cumulative per (case, phase),
+  warmup included. The heap capture follows it directly. Allocation per call
+  is the difference of consecutive steps' `alloc_space`, divided by the
+  difference of their `gateway.buffered`/`gateway.stream.end` succeeded counts.
+  That counts warmup, measured and drain calls over the same interval. The
+  TASK-002 figure of 4.26 MiB/call used measured calls only and is superseded.
+
+| Acceptance criterion | Implementation evidence | Verification evidence | Result |
+|---|---|---|---|
+| REQ-010; INV-008; AC-008 | `skald-providers/src/clients/mod.rs` (`attempt_request`, `answer_text`), `raw.rs::body_bytes`, `wyrd-gateway/src/adapter/{mod,http}.rs` | `clients::bounded_answers::native_transport_reuses_owned_buffers` (RED with the old lossy copy), the `selected_capture_is_scrubbed_bounded_and_leaves_answers_unchanged` extension, providers lib 49/49, gateway lib 67/67 | PASS |
+| REQ-008; INV-005; AC-007 | fork `variant_shredding.rs` borrowed reader | `physical_sample_counts_without_payload_reconstruction` (old: 39,824,263 B vs new 50,811 B, every parity assertion equal), iceberg variant tests 53/53 | PASS |
+| REQ-011; INV-006; AC-009 | consumers and ×2 reservation unchanged | vala mixed-layouts test, redux tier-2 lane 1002/1002, learned-layout journey | PASS |
+| REQ-012; INV-008; AC-010 | removed stacks below | two paired `--profile` intervals; unprofiled L1 and RSS rerun pair | PASS |
+| AC-003; preserved AC-006 | — | full L1 baseline and candidate, main Gateway L1, rule reruns | PASS (see below) |
+
+### AC-010 allocation, paired `--profile` (KiB per reconciled call)
+
+Runs: baseline `20261107T211245Z` and `20261107T211927Z`; candidate
+`20261107T205853Z` and `20261107T211606Z`, all VALID.
+
+| Step | Baseline runs 1 / 2 | Candidate runs 1 / 2 | Δ |
+|---|---|---|---|
+| buffered-64kib-capture-payload.c64 | 3310 / 3302 | 2640 / 2644 | −20% |
+| buffered-64kib-capture-payload.c1 | 3138 / 3185 | 2804 / 2795 | −11% |
+| buffered-64kib-capture-metadata.c64 | 1344 / 1349 | 1152 / 1157 | −14% |
+| buffered-64kib-capture-metadata.c1 | 1457 / 1373 | 1174 / 1182 | −17% |
+| buffered-1kib-capture-metadata.c64 | 214 / 216 | 212 / 213 | −1% |
+
+Each side repeats to within 6%, so every 64 KiB reduction is larger than the
+repeat variation. The streamed 1 KiB steps (about 487 calls at c1) mostly
+carry background flush work from adjacent steps, so they are not normalized.
+
+Removed stacks, inclusive `alloc_space` per step, baseline → candidate:
+
+- `unshred_variant`: 36.0 → 0 GiB at payload c64 and 4.4 → 0 GiB at c1.
+- The sampler's `assemble_claim`: 40.8 → 1.8 GiB at payload c64.
+- `from_str<serde_json::Value>`, the second native decode: 13.1 → 6.6 GiB at
+  payload c64.
+- The gateway `dispatch` closure: 23.7 → 0 GiB at metadata c64.
+- The first-send `send` copy: 1.56 → 0 GiB.
+
+Remaining top leaves at payload c64:
+- `append_slice` 48.2 GiB
+- `reserve_inner` 24.2 GiB
+- `write` 18.2 GiB
+- `encode_ipc` 12.7 GiB
+- `compress_zstd` 12.5 GiB
+- Arrow binary `with_capacity` 12.2 GiB
+- `take_bytes` 12.2 GiB
+- JSON `end_string` 12.2 GiB
+
+These are ingress Variant encoding, WAL IPC and zstd, and capture
+serialization, which are outside this task.
+
+Peak RSS under profiling at payload c64: baseline 5413–5698 MiB, candidate
+5260–5662 MiB, overlapping. Cumulative allocation is reported separately from
+RSS.
+
+### Full unprofiled L1, candidate vs baseline `d608ee303`
+
+Records (gitignored `benchmarks/history`):
+- candidate `*-aa2a6a0d8.json`: writes-parquet `20261107T214316Z`, hot
+  `215038Z`, parquet `215420Z`, verification `215908Z`, gateway `220023Z`;
+- baseline `*-d608ee303.json`: `212248Z`, `213011Z`, `213354Z`, `213842Z`,
+  `213957Z`.
+
+Bifrost (all three) and Gateway are VALID on both sides. Verification is
+INVALID on both sides only for `driver.saturated` at c64: the driver used
+6.42–6.55 cores against a 6.40 limit. Every Verification criterion is met
+(p99 0.335–0.337 ms, zero errors and lost writes). Bifrost and Verification
+show no headline metric (rate, p50, p99, peak RSS, CPU per row or verification)
+more than 5% outside the baseline range in the worse direction.
+`native-write-c64` is 19% faster.
+
+Gateway medians, candidate vs baseline (three repetitions each). Errors,
+lost, shed and undrained are 0 on every repetition.
+
+| Step | Rate req/s | CPU µs/req | p99 ms | Peak RSS MiB |
+|---|---|---|---|---|
+| buffered-64kib-capture-payload.c64 | 5832 vs 5587–5604 | 1749 vs 1841–1937 | 134.9 vs 126.1–145.5 | 4683 vs 4544–4629 |
+| buffered-64kib-capture-payload.c1 | 2580 vs 2384–2446 | 692 vs 712–751 | 0.540 vs 0.575–0.579 | 2456 vs 2290–2446 |
+| buffered-64kib-capture-metadata.c64 | 21773 vs 19521–20177 | 921 vs 988–1066 | 3.408 vs 3.656–3.891 | 2130 vs 1711–2271 |
+| buffered-64kib-capture-metadata.c1 | 3357 vs 3108–3256 | 347 vs 356–378 | 0.381 vs 0.404–0.412 | 1390 vs 1242–1490 |
+
+The payload RSS medians sat just above the baseline maximum (c64 +1.2%,
+c1 +0.4%). A fresh back-to-back pair of payload c64 (baseline
+`20261107T220908Z`, candidate `20261107T221002Z`) clears it: candidate
+4463 MiB vs 4412–4547 MiB, with rate 5963 vs 5384–5821 and CPU 1700 vs
+1873–1897 µs.
+
+**AC-003 vs main `5234961d5`** (Gateway `20261107T220348Z`, VALID). Every
+candidate median is in range or better except `streamed-1kib-capture-metadata.c1`
+CPU: 5207 vs 4959–5041 µs. At 24 req/s that metric moves in steps of about
+83 µs, one 10 ms CPU tick per repetition. The rule's fresh back-to-back pair
+(main `20261107T220725Z`, candidate `20261107T220816Z`) clears it: candidate
+4628 vs 4546–4711 µs. Every 64 KiB step beats main's range on rate, CPU and
+p99, and payload RSS is 4683 vs 7155–7652 MiB at c64.
+
+**AC-006 imported reads (hot, p50 median, candidate vs baseline):**
+- span-shredded memtable 21.8 vs 22.1 ms;
+- span-shredded staged 17.0 vs 16.9 ms;
+- span-long-tail staged 37.7 vs 38.1 ms;
+- span-long-tail memtable 26.4 vs 26.6 ms.
+
+TASK-002's memtable long-tail regression (26.7 vs 20.2–20.5 ms against
+`1a0699e42`) is unchanged and remains reported.
+
+### Commands
+
+```sh
+mise exec -- cargo nextest run --locked -p wyrd-skald-providers --lib -E 'test(=clients::bounded_answers::native_transport_reuses_owned_buffers)'
+mise exec -- cargo nextest run --locked -p wyrd-skald-providers --lib
+mise exec -- cargo nextest run --locked -p wyrd-gateway --lib
+cargo test -p iceberg --lib writer::file_writer::variant_shredding   # fork, rustfmt +nightly-2026-03-05
+mise run test:bifrost:integration:redux
+mise run fmt:check && mise run lints && mise run check:deps && mise run check:tenant-isolation
+git diff --check
+mise run bench:l1:gateway -- --allow-dirty --profile          # ×2 per side
+mise run bench:l1 -- --allow-dirty                            # baseline and candidate
+mise run bench:l1:gateway -- --allow-dirty                    # main
+mise run bench:l1:gateway -- --allow-dirty --steps <step>     # rule rerun pairs
+```
+
+### Non-goals and limits
+
+The following stayed out of scope:
+- capacity hints, scratch reuse, pools, caches, allocator changes;
+- translated or streamed paths;
+- layout policy, thresholds, retry bytes, merge reservations;
+- new dependencies or features;
+- benchmark harness changes.
+
+No unrelated file changed. The allocation figures are paired aggregates per
+step, not per-repetition medians, because the heap profiler captures once per
+step. CPU attribution is unavailable because samply needs
+`perf_event_paranoid` ≤ 1. Verification's driver saturation is a
+driver-budget condition on both sides and was not addressed here.
+
+**Status: IMPLEMENTED.** This routes to `$wyrd-task-review`.

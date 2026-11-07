@@ -19,12 +19,12 @@ use serde_json::{Value, json};
 use tempfile::TempDir;
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, Request, ResponseTemplate};
-use wyrd_ai::VerificationResult;
 use wyrd_ai::state::WyrdState;
 use wyrd_ai::verify::{
     Execution, ExecutionPageQuery, PublicationContent, PublicationKind, PublicationName,
     PublicationSelector, PublicationSummary, TaskId,
 };
+use wyrd_ai::{StepStatus, VerificationResult};
 use wyrd_spec::auth::Sha256Hex;
 use wyrd_testing::server::WyrdTestServer;
 
@@ -39,7 +39,7 @@ const INVALID: &str = "WYRD_SPEC_400_VALIDATION";
 const REPORT: &str = "# Final report\n";
 
 /// The report the drafter's second attempt publishes after its first
-/// attempt loses the provider.
+/// attempt gets an undecodable model reply.
 const RETRIED: &str = "# Retried report\n";
 
 /// The JSON assessment the drafter publishes by value.
@@ -227,7 +227,7 @@ fn refusals(turn: usize) -> ResponseTemplate {
 /// The scripted model: one reply per request, chosen by the Agent's prompt
 /// marker, the review's marker, and the turn. `attempts` counts the
 /// `RETRY-RUN` drafter's first turns, so its two attempts carry distinct
-/// call IDs and only the first loses its provider.
+/// call IDs and only the first gets an undecodable reply.
 fn reply(request: &Request, attempts: &AtomicUsize) -> ResponseTemplate {
     let messages = messages(request);
     let prompt = text(&messages);
@@ -245,7 +245,14 @@ fn reply(request: &Request, attempts: &AtomicUsize) -> ResponseTemplate {
                 )]);
             }
             if results(&messages).contains_key("a1-p-report") {
-                return ResponseTemplate::new(500);
+                return ResponseTemplate::new(200).set_body_json(json!({ "garbled": true }));
+            }
+            if turn == 3 {
+                let replayed = json!({ "name": "replayed", "value": "once" });
+                return calls(&[
+                    ("a2-replay", "publish", replayed.clone()),
+                    ("a2-replay", "publish", replayed),
+                ]);
             }
             return publish_all(turn, "a2-", RETRIED).unwrap_or_else(done);
         }
@@ -815,5 +822,114 @@ async fn agent_publishes_file_directory_and_json() {
         .await
         .expect("the tree file download plans");
     assert_eq!((plan.size_bytes, plan.sha256), (4, digest(b"beta")));
+    desk.deployment.shutdown().await;
+}
+
+/// Every result `messages` holds for provider call `id`, in order.
+fn answers(messages: &[Value], id: &str) -> Vec<Value> {
+    messages
+        .iter()
+        .filter(|message| message["role"] == "tool" && message["tool_call_id"] == id)
+        .filter_map(|message| serde_json::from_str(message["content"].as_str()?).ok())
+        .collect()
+}
+
+/// The drafter's first attempt publishes `report` and then gets an
+/// undecodable model reply; the fresh second attempt reuses the name, and its publications,
+/// not the first attempt's, feed the consumer, each attributed to the
+/// attempt the host ran. Replaying one provider call ID returns the one
+/// original receipt and accepts one publication. A drafter that only
+/// answers publishes nothing, and its consumer fails before any model call.
+///
+/// # Panics
+/// Panics when a verification is refused or an attempt, attribution,
+/// receipt, or consumer outcome differs.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires the repository-managed Postgres journey lifecycle"]
+async fn agent_publish_retries_use_host_identity() {
+    let desk = PublishDesk::start().await;
+
+    let result = desk.verify("report-pipeline", "RETRY-RUN").await;
+
+    assert_eq!(
+        requirement(&result, "consumed").outcome,
+        wyrd_ai::RequirementOutcome::Passed,
+        "{result:?}"
+    );
+    assert_eq!(step(&result, "draft").attempts, 2);
+    let consumer = desk.results("CONSUME:").await;
+    assert_eq!(lines(&consumer["c-report"]), RETRIED.trim_end());
+    let drafted = desk.requests("DRAFT:").await;
+    let last = messages(drafted.last().expect("the drafter called the model"));
+    assert_eq!(
+        answers(&last, "a2-replay"),
+        [
+            json!({ "name": "replayed", "kind": "json" }),
+            json!({ "name": "replayed", "kind": "json" }),
+        ],
+        "a replayed call returns its original receipt"
+    );
+    let mut listed: Vec<(u32, String, PublicationKind)> = desk
+        .publications(&result)
+        .await
+        .into_iter()
+        .map(|publication| {
+            (
+                publication.producer.attempt,
+                publication.name.as_str().to_owned(),
+                publication.kind,
+            )
+        })
+        .collect();
+    listed.sort_by(|left, right| (left.0, &left.1).cmp(&(right.0, &right.1)));
+    let expected: Vec<(u32, String, PublicationKind)> = [
+        (1, "report", PublicationKind::Json),
+        (2, "assessment", PublicationKind::Json),
+        (2, "nothing", PublicationKind::Json),
+        (2, "replayed", PublicationKind::Json),
+        (2, "report", PublicationKind::File),
+        (2, "tree", PublicationKind::Directory),
+    ]
+    .into_iter()
+    .map(|(attempt, name, kind)| (attempt, name.to_owned(), kind))
+    .collect();
+    assert_eq!(listed, expected, "each attempt keeps its own attribution");
+    let execution = desk.execution(&result).await;
+    let draft = TaskId::new("draft").expect("step");
+    let report = PublicationName::new("report").expect("name");
+    assert_eq!(
+        execution
+            .publication(&draft, &report, &selector(1, None))
+            .await
+            .expect("the first attempt's report reads")
+            .content,
+        PublicationContent::Json {
+            value: json!("attempt 1")
+        }
+    );
+
+    let result = desk.verify("report-pipeline", "NO-PUBLISH").await;
+
+    assert_eq!(step(&result, "draft").status, StepStatus::Succeeded);
+    let consume = step(&result, "consume");
+    assert_eq!(consume.status, StepStatus::Failed, "{result:?}");
+    assert!(
+        consume
+            .reason
+            .as_deref()
+            .is_some_and(|reason| reason.contains("published no")),
+        "{consume:?}"
+    );
+    assert!(
+        desk.publications(&result).await.is_empty(),
+        "a final answer is not a publication"
+    );
+    assert!(
+        desk.requests("CONSUME:")
+            .await
+            .iter()
+            .all(|request| !text(&messages(request)).contains("NO-PUBLISH")),
+        "the consumer never reached the model"
+    );
     desk.deployment.shutdown().await;
 }

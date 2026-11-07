@@ -403,7 +403,7 @@ async fn file_and_json_publications_are_immutable() {
         tool_result_max_bytes: 64,
         ..HostedLimits::default()
     };
-    let caller = user(leased.server.data_tenant_id(), []);
+    let caller = leased.publisher([]);
     let workspace = Arc::new(Workspace::materialize(Vec::new(), limits, None).expect("workspace"));
     let report = "# Review\n\nThe answer holds.\n";
     std::fs::create_dir_all(workspace.work_dir().join("notes")).expect("directory");
@@ -554,7 +554,7 @@ async fn directory_snapshot_is_complete_or_rejected() {
         archive_max_entries: 8,
         ..HostedLimits::default()
     };
-    let caller = user(leased.server.data_tenant_id(), []);
+    let caller = leased.publisher([]);
     let workspace = Arc::new(Workspace::materialize(Vec::new(), limits, None).expect("workspace"));
     let publications = Publications::new(leased.server.state(), &caller, &leased.run, limits);
     let producer = Producer {
@@ -740,7 +740,7 @@ async fn directory_snapshot_is_complete_or_rejected() {
 async fn publication_replay_preserves_attempt_identity() {
     let leased = Leased::start().await;
     let limits = HostedLimits::default();
-    let caller = user(leased.server.data_tenant_id(), []);
+    let caller = leased.publisher([]);
     let workspace = Arc::new(Workspace::materialize(Vec::new(), limits, None).expect("workspace"));
     let publications = Publications::new(leased.server.state(), &caller, &leased.run, limits);
     let first = Producer {
@@ -903,7 +903,7 @@ async fn publication_limits_survive_reclaim() {
         work_write_max_bytes: 64,
         ..HostedLimits::default()
     };
-    let caller = user(leased.server.data_tenant_id(), []);
+    let caller = leased.publisher([]);
     let workspace = Arc::new(Workspace::materialize(Vec::new(), limits, None).expect("workspace"));
     let publications = Publications::new(leased.server.state(), &caller, &leased.run, limits);
     let producer = Producer {
@@ -1038,7 +1038,7 @@ async fn publication_limits_survive_reclaim() {
 async fn publication_mounts_preserve_status_and_lineage() {
     let leased = Leased::start().await;
     let limits = HostedLimits::default();
-    let caller = user(leased.server.data_tenant_id(), []);
+    let caller = leased.publisher([]);
     let publications = Publications::new(leased.server.state(), &caller, &leased.run, limits);
     let producer = |step: &str, attempt| Producer {
         step_id: TaskId::new(step).expect("task"),
@@ -1295,7 +1295,7 @@ async fn cancelled_work_keeps_checkpoints_and_fences_stale_writes() {
     let tenant = leased.server.data_tenant_id();
     let queue = VerifierExecutionQueue::default();
     let limits = HostedLimits::default();
-    let caller = user(tenant, []);
+    let caller = leased.publisher([]);
     let publications = Publications::new(state, &caller, &leased.run, limits);
     let task = TaskId::new("review").expect("task");
     let producer = Producer {
@@ -1751,7 +1751,7 @@ async fn invocations_resume_from_bifrost_with_original_bounds() {
 async fn publications_recover_exact_descriptors_from_run_state() {
     let leased = Leased::start().await;
     let limits = HostedLimits::default();
-    let caller = user(leased.server.data_tenant_id(), []);
+    let caller = leased.publisher([]);
     let task = TaskId::new("review").expect("task");
     leased
         .run
@@ -1842,7 +1842,7 @@ async fn publications_recover_exact_descriptors_from_run_state() {
 async fn terminal_selection_and_inspection_use_run_state() {
     let leased = Leased::start().await;
     let limits = HostedLimits::default();
-    let caller = user(leased.server.data_tenant_id(), []);
+    let caller = leased.publisher([]);
     let task = TaskId::new("review").expect("task");
     leased
         .run
@@ -3274,7 +3274,7 @@ async fn concurrent_settlements_release_their_hosted_dependent() {
     .expect("Verifier decodes");
     spec.validate().expect("valid Verifier");
     let spec = Arc::new(spec);
-    let caller = user(leased.server.data_tenant_id(), []);
+    let caller = leased.publisher([]);
     let verifier = CardUid::from_uuid(uuid::Uuid::now_v7()).expect("uid");
     let (evidence, routes) = (BTreeMap::new(), BTreeMap::new());
     let run = async |state: &Arc<RunState>| {

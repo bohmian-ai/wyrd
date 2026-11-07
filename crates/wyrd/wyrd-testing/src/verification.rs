@@ -22,7 +22,7 @@ use vala_bifrost_redux::catalog::TableRef;
 use vala_bifrost_redux::namespaces::BifrostNamespace;
 use vala_verify::blocks::Checkpoints as _;
 use wyrd_runtime::principal::{Principal, PrincipalId, PrincipalKind};
-use wyrd_runtime::{AcceptedAuthority, PermissionSet};
+use wyrd_runtime::{AcceptedAuthority, Permission, PermissionSet};
 use wyrd_server::AppState;
 use wyrd_server::components::auth::Caller;
 use wyrd_server::query::scheduled::ScheduledQueryCaller;
@@ -703,9 +703,15 @@ impl VerificationFixture {
                 steps.push(step);
             }
         }
+        // The accepted authority of a running execution holds `verifier:run`
+        // on exactly its Verifier, which File publications are decided on.
+        let mut principal = self.actor.clone();
+        principal
+            .effective_permissions
+            .insert(Permission::verifier_run(claimed.verifier_card_uid.clone()));
         let caller = Caller {
             data_tenant_id: self.tenant,
-            principal: self.actor.clone(),
+            principal,
             request_id: RequestId::now_v7(),
             delegation_chain: Vec::new(),
             executed_by: None,

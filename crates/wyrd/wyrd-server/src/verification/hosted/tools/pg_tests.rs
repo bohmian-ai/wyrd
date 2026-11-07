@@ -5,13 +5,15 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
 
 use skald_spec::MediaFormat;
-use wyrd_spec::ids::SlotName;
+use wyrd_spec::ids::{CardUid, SlotName};
 use wyrd_spec::verification::TaskId;
 
 use super::super::workspace::Staged;
 use super::*;
 
-use crate::test_support::{test_caller as caller, test_state as state};
+use crate::components::gateway::recording::RecordingScribe;
+use crate::test_support::{test_caller as caller, test_state as state, test_tenant};
+use crate::verification::state::{StateRow, stand_in_identity};
 
 /// A sandbox that never spawns a worker; no test here runs Python.
 ///
@@ -32,6 +34,10 @@ async fn idle_sandbox(limits: HostedLimits) -> Arc<Sandbox> {
 }
 
 /// An invocation as `caller` over a workspace holding `/inputs/notes.txt`.
+///
+/// # Panics
+/// Panics when the workspace cannot materialize or the shared fixture or
+/// empty pool cannot start.
 async fn invocation(caller: Caller, limits: HostedLimits) -> Invocation {
     let workspace = Workspace::materialize(
         vec![Staged {
@@ -291,6 +297,182 @@ fn retries_keep_their_actions_spent_time() {
                 .lock()
                 .expect("budget"),
             limits.agent_code_budget
+        );
+    });
+}
+
+/// A fresh direct execution state of Verifier `verifier` for `caller`,
+/// staging its revisions on `state`'s outbox.
+///
+/// # Panics
+/// Panics when a `UUIDv7` is not a Card UID.
+fn execution(state: &AppState, caller: &Caller, verifier: &CardUid) -> Arc<RunState> {
+    let subject = CardUid::from_uuid(uuid::Uuid::now_v7()).expect("uid");
+    Arc::new(RunState::fresh(
+        Arc::clone(state.bifrost.scribe_outbox()),
+        test_tenant(),
+        StateRow {
+            execution_id: wyrd_spec::ids::ExecutionId::new_v7(),
+            identity: stand_in_identity(verifier, &subject),
+            verifier_uid: verifier.clone(),
+            card_uid: subject,
+            owner_card_uid: None,
+            run_id: None,
+            deployment_environment: None,
+            attribution: wyrd_spec::auth::Attribution::new(
+                caller.principal.id,
+                caller.principal.id,
+            ),
+        },
+        Instant::now() + Duration::from_secs(30),
+    ))
+}
+
+/// A `/work` file publication is a File operation of the receiving
+/// boundary: a caller holding `verifier:run` on exactly its Verifier stages
+/// one `tool:invoke` and one File decision, both allowed and both for the
+/// same principal and request, and a replay with the scratch gone returns
+/// the original receipt. A JSON value creates no File and stages only its
+/// tool decision. A caller holding only the `publish` grant is denied at the
+/// File decision before any File work, so a missing path answers the denial.
+///
+/// # Panics
+/// Panics when a decision is missing, extra, or misattributed, a receipt
+/// differs, or the tool-only caller reaches File work.
+#[test]
+fn file_publications_decide_their_file_permission() {
+    wyrd_runtime::runtime().block_on(async {
+        let (recorded, scribe) = RecordingScribe::attach(state().await);
+        let verifier = CardUid::from_uuid(uuid::Uuid::now_v7()).expect("uid");
+        let limits = HostedLimits::default();
+        let producer = Producer {
+            step_id: TaskId::new("draft").expect("task id"),
+            item_index: None,
+            iteration_index: None,
+            attempt: 1,
+        };
+        let publishing = async |caller: Caller| {
+            let run = execution(&recorded, &caller, &verifier);
+            Invocation {
+                state: recorded.clone(),
+                publisher: Some((run, producer.clone())),
+                ..invocation(caller, limits).await
+            }
+        };
+        let decisions = async |caller: &Caller| {
+            let deadline = std::time::Instant::now() + Duration::from_secs(30);
+            assert_eq!(recorded.bifrost.scribe_outbox().settle(deadline).await, 0);
+            scribe
+                .audit_decisions()
+                .into_iter()
+                .filter(|row| row.request_id == caller.request_id.as_str())
+                .map(|row| {
+                    assert_eq!(row.sub_principal_id, caller.principal.id.as_uuid());
+                    (row.operation, row.resource, row.permission, row.outcome)
+                })
+                .collect::<Vec<_>>()
+        };
+        let row = |operation: &str, resource: &str, permission: Permission, outcome: &str| {
+            (
+                operation.to_owned(),
+                resource.to_owned(),
+                permission.to_string(),
+                outcome.to_owned(),
+            )
+        };
+        let invoke = |tool: BuiltinTool| {
+            row(
+                OPERATION,
+                tool.as_str(),
+                Permission::tool_invoke(tool),
+                "allowed",
+            )
+        };
+        let files = |outcome| {
+            row(
+                "verification.publication.files",
+                "publication:tree",
+                Permission::verifier_run_any(),
+                outcome,
+            )
+        };
+
+        let granted = caller([
+            Permission::tool_invoke_any(),
+            Permission::verifier_run(verifier.clone()),
+        ]);
+        let publisher = publishing(granted.clone()).await;
+        publisher
+            .call(
+                BuiltinTool::FsWrite,
+                None,
+                json!({"path": "/work/tree/a.md", "content": "alpha"}),
+            )
+            .await
+            .expect("the scratch file writes");
+        let tree = json!({"name": "tree", "path": "/work/tree"});
+        let receipt = json!({"name": "tree", "kind": "directory"});
+        assert_eq!(
+            publisher
+                .call(BuiltinTool::Publish, Some("p-tree"), tree.clone())
+                .await
+                .expect("the tree publishes"),
+            receipt
+        );
+        assert_eq!(
+            publisher
+                .call(
+                    BuiltinTool::Publish,
+                    Some("p-json"),
+                    json!({"name": "j", "value": 1})
+                )
+                .await
+                .expect("the value publishes"),
+            json!({"name": "j", "kind": "json"})
+        );
+        std::fs::remove_dir_all(
+            publisher
+                .workspace()
+                .expect("scratch")
+                .work_dir()
+                .join("tree"),
+        )
+        .expect("scratch removed");
+        assert_eq!(
+            publisher
+                .call(BuiltinTool::Publish, Some("p-tree"), tree)
+                .await
+                .expect("the replay answers its receipt"),
+            receipt,
+            "a replay needs no scratch and uploads nothing"
+        );
+        assert_eq!(
+            decisions(&granted).await,
+            [
+                invoke(BuiltinTool::FsWrite),
+                invoke(BuiltinTool::Publish),
+                files("allowed"),
+                invoke(BuiltinTool::Publish),
+                invoke(BuiltinTool::Publish),
+                files("allowed"),
+            ],
+            "the tool and File decisions are separate; JSON makes no File decision"
+        );
+
+        let tool_only = caller([Permission::tool_invoke(BuiltinTool::Publish)]);
+        let denied = publishing(tool_only.clone())
+            .await
+            .call(
+                BuiltinTool::Publish,
+                Some("p-ghost"),
+                json!({"name": "tree", "path": "/work/missing"}),
+            )
+            .await;
+        assert_eq!(code(denied), "WYRD_PERMISSION_403_DENIED_RBAC");
+        assert_eq!(
+            decisions(&tool_only).await,
+            [invoke(BuiltinTool::Publish), files("denied"),],
+            "the File decision precedes any File work"
         );
     });
 }

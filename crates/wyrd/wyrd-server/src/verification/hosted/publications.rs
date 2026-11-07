@@ -2,8 +2,11 @@
 //!
 //! [`Publications`] is the hosted backend a trusted caller inside one running
 //! execution retains content through: a `/work` file or directory, or a bounded JSON value
-//! under a logical name, scoped to its producer attempt. A call that already
-//! committed recovers its stored receipt before touching scratch or storage.
+//! under a logical name, scoped to its producer attempt. A `/work`
+//! publication first decides and audits the accepted caller's File
+//! permission, as every verification File operation does; a JSON value
+//! creates no File. A call that already committed recovers its stored
+//! receipt before touching scratch or storage.
 //! Otherwise content is frozen under the workspace's writer lock, each file
 //! completed as an ordinary verification File through the shared storage
 //! lifecycle, and only then named by a manifest accepted into the
@@ -34,10 +37,14 @@ use super::workspace::{Frozen, Workspace};
 use crate::components::auth::Caller;
 use crate::components::storage::inventory::ObjectInventory;
 use crate::components::storage::routes::completed_file;
+use crate::components::verification::service::VerificationControl;
 use crate::state::AppState;
 use crate::verification::state::{
     PublicationAcceptance, PublicationBudget, PublicationCall, PublicationLimit, RunState,
 };
+
+/// Audit operation of a `/work` publication's File decision.
+const FILES: &str = "verification.publication.files";
 
 /// One call asking to publish, as its producer attempt makes it.
 #[derive(Debug, Clone)]
@@ -114,21 +121,31 @@ impl<'a> Publications<'a> {
     }
 
     /// Publish the `/work` file or directory at `path` under `call`'s name:
-    /// return the stored receipt when this call already committed it,
-    /// otherwise freeze it, complete every file as a verification File, then
-    /// commit its manifest. An interrupted or refused publication commits
-    /// nothing.
+    /// decide the accepted caller's File permission, as every other
+    /// verification File operation does, then return the stored receipt
+    /// when this call already committed it, otherwise freeze it, complete
+    /// every file as a verification File, then commit its manifest. An
+    /// interrupted or refused publication commits nothing.
     ///
     /// # Errors
-    /// Returns [`Workspace::freeze`]'s refusals, a `publication_size`
-    /// refusal for a file over the file limit, an invocation failure when a
-    /// File cannot complete, and [`Self::accept`]'s refusals.
+    /// Returns the [`WyrdError::PermissionDeniedRbac`] refusal before any
+    /// File work when the caller holds no `verifier:run` grant,
+    /// [`Workspace::freeze`]'s refusals, a `publication_size` refusal for a
+    /// file over the file limit, an invocation failure when a File cannot
+    /// complete, and [`Self::accept`]'s refusals.
     pub async fn path(
         &self,
         call: &PublishCall,
         workspace: &Arc<Workspace>,
         path: &str,
     ) -> Result<PublicationKind, ToolError> {
+        VerificationControl::new(self.state)
+            .authorize_evidence(
+                self.caller,
+                FILES,
+                &format!("publication:{}", call.name.as_str()),
+            )
+            .map_err(|error| structured(&error))?;
         let arguments = serde_json::json!({ "name": call.name, "path": path });
         let probe = PublicationContent::File {
             manifest: PublicationManifest {

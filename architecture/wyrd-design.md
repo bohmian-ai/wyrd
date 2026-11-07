@@ -1981,7 +1981,7 @@ bounded scratch for that invocation only.
 `AgentSpec.tool_names` selects server-owned built-ins: `cards.list`,
 `cards.get`, `bifrost.list_tables`,
 `bifrost.describe_table`, `bifrost.query`, `fs.list`, `fs.read`, `fs.search`,
-`fs.extract`, and `code.run`. `fs.read` returns a UTF-8 file's actual lines
+`fs.extract`, `fs.write`, `code.run`, and `publish`. `fs.read` returns a UTF-8 file's actual lines
 with `lines` locators and a resumable `next`, refusing directories and
 non-UTF-8 files. `fs.search` returns one bounded hit per matching line across
 visible inputs and scratch, in path order, skipping non-text files: a
@@ -1990,9 +1990,22 @@ file or directory scope, and a filename `glob` (the basename, or the path
 relative to the scope when it contains `/`); an invalid pattern or scope is
 refused and a cut result says `truncated`. `fs.extract` takes one input
 `path` and a new `/work` `output_path`, writes the shared extractor's JSON
-without overwriting, and returns `{output_path, sources, extractor_version}`. The Invoker resolves them before the first model call through
-the existing `ToolResolver`/`ToolRegistry`; an unknown name fails, and
-filesystem tools and a workspace require each other. There is no fetch tool.
+without overwriting, and returns `{output_path, sources, extractor_version}`.
+`fs.write` creates or replaces one UTF-8 file under `/work`, creating safe
+parents within the `/work` budget, and returns `{path, bytes}`; `/inputs`,
+traversal, and link or file parents are refused. `publish` is step-only: it
+snapshots one `/work` file or directory, or takes one JSON value (`null`
+included), under a logical name unique within the step attempt, and returns
+`{name, kind}` only after the execution state accepts it, keyed by the
+provider tool call so a replayed call returns its original receipt. The host
+supplies the producer step, item, iteration, and attempt; a final answer is
+never a publication. An Agent that selects `fs.write`, `code.run`, or
+`publish` gets private `/work` scratch without a declared input mount. The
+Invoker resolves them before the first model call through the existing
+`ToolResolver`/`ToolRegistry`; an unknown or repeated name fails, the
+reading `fs.*` tools need a workspace or a scratch writer (`fs.write`,
+`code.run`), and a workspace needs a tool that uses it. There is no fetch
+tool.
 Every call first needs `{"resource":"tool","action":"invoke"}` with scope
 `all` or `{ "tool": <exact name> }`, then the called capability's own
 permission (for `bifrost.query`, read on every table it touches). Neither

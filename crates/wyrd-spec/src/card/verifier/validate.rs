@@ -574,7 +574,7 @@ where
             return Err(invalid(
                 "agent_tools",
                 path,
-                "a workspace requires a filesystem or code.run tool",
+                "a workspace requires an fs.*, code.run, or publish tool",
             ));
         }
         if builtins.contains(&BuiltinTool::Publish) && !matches!(position, Position::Step(_)) {

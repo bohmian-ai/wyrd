@@ -52,6 +52,13 @@ const REPORT: &str = "# Final report\n";
 /// attempt gets an undecodable model reply.
 const RETRIED: &str = "# Retried report\n";
 
+/// A file of 3,000 numbered lines, larger than one tool result.
+fn big() -> String {
+    (0..3_000)
+        .map(|line| format!("line {line:04}: the quick brown fox jumps over the lazy dog\n"))
+        .collect()
+}
+
 /// The JSON assessment the drafter publishes by value.
 fn assessment() -> Value {
     json!({ "risk": "low", "score": 0.9, "notes": ["é", "two words"] })
@@ -245,6 +252,41 @@ fn reply(request: &Request, attempts: &AtomicUsize, waiting: &Notify) -> Respons
     let prompt = text(&messages);
     let turn = turn(&messages);
     if prompt.contains("DRAFT:") {
+        if prompt.contains("LIMITS-RUN") {
+            return match turn {
+                0 => calls(&[
+                    (
+                        "l-big",
+                        "fs.write",
+                        json!({ "path": "/work/big.md", "content": big() }),
+                    ),
+                    (
+                        "l-huge",
+                        "publish",
+                        json!({ "name": "huge", "value": "x".repeat(70_000) }),
+                    ),
+                    (
+                        "l-a",
+                        "fs.write",
+                        json!({ "path": "/work/a.md", "content": "a" }),
+                    ),
+                    (
+                        "l-b",
+                        "fs.write",
+                        json!({ "path": "/work/b.md", "content": "b" }),
+                    ),
+                ]),
+                1 => calls(&[
+                    ("l-read", "fs.read", json!({ "path": "/work/big.md" })),
+                    (
+                        "l-publish",
+                        "publish",
+                        json!({ "name": "big", "path": "/work/big.md" }),
+                    ),
+                ]),
+                _ => done(),
+            };
+        }
         if prompt.contains("CANCEL-RUN") {
             return match turn {
                 0 => calls(&[("early", "publish", json!({ "name": "early", "value": 1 }))]),
@@ -1206,6 +1248,105 @@ async fn tool_calls_recheck_permissions_and_revocation() {
             .iter()
             .all(|request| !text(&messages(request)).contains("CONSUME:")),
         "cancelled work starts no later Agent"
+    );
+    desk.deployment.shutdown().await;
+}
+
+/// Tool work stays bounded and its provenance exact: a JSON value over the
+/// tool result limit is refused as `publication_size` and publishes
+/// nothing, a file larger than one result reads back as one bounded page
+/// that continues, the same file publishes whole, and concurrent scratch
+/// writers all land. Each recorded call keeps its dotted tool, its
+/// arguments, and the digest and size of exactly the result the model got,
+/// and a refused call records its stable code with no output.
+///
+/// # Panics
+/// Panics when the verification is refused or a bound, record,
+/// publication, or download plan differs.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires the repository-managed Postgres journey lifecycle"]
+async fn tool_limits_release_capacity_and_preserve_provenance() {
+    let desk = PublishDesk::start().await;
+
+    let result = desk.verify("report-pipeline", "LIMITS-RUN").await;
+
+    let drafter = desk.results("LIMITS-RUN").await;
+    assert_eq!(refusal(&drafter["l-huge"]), (INVALID, "publication_size"));
+    for call in ["l-a", "l-b"] {
+        assert!(drafter[call]["bytes"] == 1, "{call}: {}", drafter[call]);
+    }
+    let read = &drafter["l-read"];
+    let size = serde_json::to_vec(read).expect("the read serializes").len();
+    assert!(
+        size <= 64 * 1024,
+        "one result stays within the limit: {size}"
+    );
+    assert!(lines(read).starts_with("line 0000: "), "{read}");
+    assert!(
+        read["next"]
+            .as_u64()
+            .is_some_and(|next| next > 0 && next < 3_000),
+        "a long file continues on its next page: {}",
+        read["next"]
+    );
+    let receipt = json!({ "name": "big", "kind": "file" });
+    assert_eq!(drafter["l-publish"], receipt);
+
+    let draft = step(&result, "draft");
+    let publish = draft
+        .tool_calls
+        .iter()
+        .find(|call| call.arguments["name"] == "big")
+        .expect("the publish is recorded");
+    let returned = serde_json::to_vec(&receipt).expect("the receipt serializes");
+    assert_eq!(
+        (
+            serde_json::to_value(publish.tool).expect("the tool serializes"),
+            &publish.arguments,
+            publish.output_sha256,
+            publish.returned_bytes,
+            publish.error.as_deref(),
+        ),
+        (
+            json!("publish"),
+            &json!({ "name": "big", "path": "/work/big.md" }),
+            Some(Sha256Hex::digest(&returned)),
+            returned.len() as u64,
+            None,
+        )
+    );
+    let huge = draft
+        .tool_calls
+        .iter()
+        .find(|call| call.arguments["name"] == "huge")
+        .expect("the refused publish is recorded");
+    assert_eq!((huge.output_sha256, huge.returned_bytes), (None, 0));
+    assert!(
+        huge.error
+            .as_deref()
+            .is_some_and(|error| error.starts_with(INVALID)),
+        "{huge:?}"
+    );
+    let names: Vec<String> = desk
+        .publications(&result)
+        .await
+        .into_iter()
+        .map(|publication| publication.name.as_str().to_owned())
+        .collect();
+    assert_eq!(names, ["big"], "the refused value publishes nothing");
+    let plan = desk
+        .execution(&result)
+        .await
+        .download(
+            &TaskId::new("draft").expect("step"),
+            &PublicationName::new("big").expect("name"),
+            &selector(1, None),
+        )
+        .await
+        .expect("the file download plans");
+    assert_eq!(
+        (plan.size_bytes, plan.sha256),
+        (big().len() as u64, digest(big().as_bytes()))
     );
     desk.deployment.shutdown().await;
 }

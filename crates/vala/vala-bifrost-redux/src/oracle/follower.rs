@@ -492,13 +492,13 @@ impl<T> ScribeTailResolver<T> {
     /// projected onto its outputs, inexact once its filter dropped a row, so
     /// the query's pushed predicate drops batches it cannot match, and the
     /// kept batches are dealt again over the partitions their own bytes earn.
-    /// The staged runs are read at `required_schema`, the closure, and meet
-    /// the same filter and outputs through `DataFusion`'s operators, so every
-    /// leaf exposes `output_schema`. The unserved staged runs are read by
-    /// `DataFusion`'s Parquet scan, so they get the row-group and page pruning
-    /// every Oracle hot read gets, with no footer caching because a staged run
-    /// is rewritable; the scan's files hold the staged lease until the plan
-    /// drops. A read with neither
+    /// The staged runs are read by [`staged_scan`] at `required_schema`, the
+    /// closure, with the same filter and outputs pushed into their Parquet
+    /// scan, so every leaf exposes `output_schema` and each run decodes only
+    /// the leaves its own layout needs. They get the row-group and page
+    /// pruning every Oracle hot read gets, with no footer caching because a
+    /// staged run is rewritable; the scan's files hold the staged lease until
+    /// the plan drops. A read with neither
     /// rows nor runs is an in-memory source of empty partitions at
     /// `output_schema`.
     ///
@@ -562,41 +562,15 @@ impl<T> ScribeTailResolver<T> {
                     ),
                 });
             }
-            // A staged run's footer is never cached, so its row groups are
-            // unknown; one partition per run is the split a decoded follower
-            // plan has always had.
-            let runs = files.len();
-            let mut staged = super::exec::hot_parquet_scan(
+            let staged = staged_scan(
                 files,
-                super::exec::HotObjects::Staged(lease),
+                lease,
                 assignment.binding.tenant_id,
                 required_schema,
-                None,
+                requirements,
                 session.config().options(),
-                Some(runs),
             )
             .map_err(|_| fault("Scribe staged scan construction failed"))?;
-            // The staged runs meet the same requirements through
-            // `DataFusion`'s own operators, which pushdown moves into the
-            // Parquet scan.
-            if let Some(requirements) = requirements {
-                if let Some(filter) = &requirements.filter {
-                    staged = Arc::new(
-                        datafusion::physical_plan::filter::FilterExec::try_new(
-                            Arc::clone(filter),
-                            staged,
-                        )
-                        .map_err(|_| fault("Scribe staged filter construction failed"))?,
-                    );
-                }
-                staged = Arc::new(
-                    datafusion::physical_plan::projection::ProjectionExec::try_new(
-                        requirements.outputs.iter().cloned(),
-                        staged,
-                    )
-                    .map_err(|_| fault("Scribe staged projection construction failed"))?,
-                );
-            }
             leaves.push(staged);
         }
         match leaves.len() {
@@ -605,6 +579,64 @@ impl<T> ScribeTailResolver<T> {
                 .map_err(|_| fault("Scribe live source union failed")),
         }
     }
+}
+
+/// Builds a Scribe follower's staged leaf: the shared hot Parquet scan of
+/// `files` at the signed closure `required_schema`, evaluated to the
+/// requirements' outputs when `requirements` is present.
+///
+/// The files are read through [`super::exec::hot_parquet_scan`] as
+/// [`super::exec::HotObjects::Staged`], so they share the published files'
+/// per-file planning and footer tenant proof yet are never cached, and each
+/// file holds `lease` until the plan drops. The requirements' filter and
+/// outputs are placed above the scan as `DataFusion`'s own operators and
+/// pushed into it, so each staged file decodes only the leaves its own
+/// layout needs.
+///
+/// # Errors
+///
+/// Returns the `DataFusion` error raised when the scan or an operator above
+/// it cannot be built.
+pub(super) fn staged_scan(
+    files: Vec<super::exec::HotFileSource>,
+    lease: Option<Arc<crate::scribe::hot_source::StagedSourceLease>>,
+    tenant: DataTenantId,
+    required_schema: &SchemaRef,
+    requirements: Option<&ReadRequirements>,
+    options: &Arc<datafusion::config::ConfigOptions>,
+) -> datafusion::error::Result<Arc<dyn ExecutionPlan>> {
+    // A staged run's footer is never cached, so its row groups are
+    // unknown; one partition per run is the split a decoded follower
+    // plan has always had.
+    let runs = files.len();
+    let mut staged = super::exec::hot_parquet_scan(
+        files,
+        super::exec::HotObjects::Staged(lease),
+        tenant,
+        required_schema,
+        None,
+        options,
+        Some(runs),
+    )?;
+    if let Some(requirements) = requirements {
+        if let Some(filter) = &requirements.filter {
+            staged = Arc::new(datafusion::physical_plan::filter::FilterExec::try_new(
+                Arc::clone(filter),
+                staged,
+            )?);
+        }
+        staged = Arc::new(
+            datafusion::physical_plan::projection::ProjectionExec::try_new(
+                requirements.outputs.iter().cloned(),
+                staged,
+            )?,
+        );
+    }
+    // The order an Oracle session runs them in: the filter first, so the
+    // projection then merges into the scan the filter left.
+    let staged = FilterPushdown::new().optimize(staged, options)?;
+    datafusion::physical_optimizer::projection_pushdown::ProjectionPushdown::new()
+        .optimize(staged, options)
 }
 
 /// One follower fragment execution: its output stream and its scan evidence.
@@ -988,13 +1020,7 @@ where
             .decode(request, authenticated, &session, &context)
             .await?;
         self.effects.execution.fetch_add(1, Ordering::SeqCst);
-        // A live fragment ships its predicate as a `FilterExec` above the
-        // placeholder; `DataFusion`'s own pushdown moves it into the
-        // substituted staged scan, where it prunes row groups and pages.
-        let plan = FilterPushdown::new()
-            .optimize(plan, session.config().options())
-            .map_err(|error| PhysicalPlanFollowerError::Execution(error.to_string()))?;
-        // Snapshot the scan metric sets after pushdown and before execution
+        // Snapshot the scan metric sets before execution
         // consumes the plan. They return to the leader in this live
         // fragment's footer; published scans report through
         // `record_distributed_scan_metrics` instead.

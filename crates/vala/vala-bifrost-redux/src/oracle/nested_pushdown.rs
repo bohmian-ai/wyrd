@@ -864,6 +864,20 @@ pub(super) mod tests {
     /// Panics when the query does not plan to exactly one Parquet scan or the
     /// pushed expressions do not plan over the file.
     async fn scan_leaves(published: &Bytes, sql: &str) -> Vec<String> {
+        let plan = HotTable::new(published, logical_schema()).plan(sql).await;
+        plan_leaves(published, &plan, sql)
+    }
+
+    /// Returns the Parquet leaves `published` decodes under `plan`'s one
+    /// Parquet scan over [`logical_schema`]: the projection and predicate in
+    /// its `ParquetSource`, planned through [`FileReadPlan`], with the leaves
+    /// a pushed predicate decodes for its row filter.
+    ///
+    /// # Panics
+    ///
+    /// Panics when `plan` (described by `label`) holds other than exactly
+    /// one Parquet scan or its pushed expressions do not plan over the file.
+    fn plan_leaves(published: &Bytes, plan: &Arc<dyn ExecutionPlan>, label: &str) -> Vec<String> {
         use datafusion::datasource::physical_plan::{
             FileScanConfig, FileSource as _, ParquetSource,
         };
@@ -893,13 +907,10 @@ pub(super) mod tests {
         }
 
         let schema = logical_schema();
-        let plan = HotTable::new(published, Arc::clone(&schema))
-            .plan(sql)
-            .await;
         let mut scans = Scans(Vec::new());
         let Ok(()) = datafusion::physical_plan::accept(plan.as_ref(), &mut scans);
         let [source] = scans.0.as_slice() else {
-            panic!("{sql} plans one Parquet scan, found {}", scans.0.len());
+            panic!("{label} plans one Parquet scan, found {}", scans.0.len());
         };
         let projection = source.projection().cloned().unwrap_or_else(|| {
             ProjectionExprs::from_indices(&(0..schema.fields().len()).collect::<Vec<_>>(), &schema)
@@ -908,7 +919,31 @@ pub(super) mod tests {
             ArrowReaderMetadata::load(published, ArrowReaderOptions::new()).expect("valid footer");
         let file_plan = FileReadPlan::new(&reader, &schema, projection, source.filter(), 20)
             .expect("per-file plan");
-        decoded_leaves(published, &file_plan)
+        let mut leaves = decoded_leaves(published, &file_plan);
+        // The row filter decodes its own leaves, outside the projection mask.
+        if let Some(filter) = source.filter() {
+            assert!(
+                file_plan.plan.row_filter.is_some(),
+                "{label} filters while decoding"
+            );
+            let filtered = FileReadPlan::new(
+                &reader,
+                &schema,
+                ProjectionExprs::new([ProjectionExpr::new(filter, "filter")]),
+                None,
+                20,
+            )
+            .expect("filter plan");
+            let descriptor = reader.metadata().file_metadata().schema_descr();
+            leaves = (0..descriptor.num_columns())
+                .filter(|&leaf| {
+                    file_plan.plan.projection_mask.leaf_included(leaf)
+                        || filtered.plan.projection_mask.leaf_included(leaf)
+                })
+                .map(|leaf| descriptor.column(leaf).path().string())
+                .collect();
+        }
+        leaves
     }
 
     /// A Variant key under a list element decodes only that key's leaves,
@@ -1151,6 +1186,130 @@ pub(super) mod tests {
                     ids,
                     "{filter} at {a_type} pruning={pruning}"
                 );
+            }
+        }
+    }
+
+    /// A staged run and a published object holding the same file select the
+    /// same leaves for the same requirements: the follower's staged leaf
+    /// (the requirements' filter and outputs over the shared hot scan) and
+    /// the warehouse scan an Oracle session plans for the equivalent SQL
+    /// decode only the projected and filtered keys' leaves of the shredded
+    /// file, never a sibling shredded key, and the root Variant of the
+    /// unshredded one. Both return the same rows, including the residual
+    /// `"str"` stored under the integer-shredded `a`, a list path's key, and
+    /// a filter-only read's row count with zero output columns, as a COUNT
+    /// reads it.
+    ///
+    /// # Panics
+    ///
+    /// Panics when a staged or warehouse read decodes other leaves than the
+    /// case expects or the two reads return different rows.
+    #[tokio::test]
+    async fn staged_and_warehouse_variant_requirements_select_the_same_leaves() {
+        let attributes = "events.list.element.attributes";
+        let a_leaves = [
+            "v.metadata",
+            "v.typed_value.a.value",
+            "v.typed_value.a.typed_value",
+        ];
+        let index_k = || {
+            datafusion::functions_variant::VARIANT_GET_TEXT.call(vec![
+                datafusion::functions::core::expr_fn::get_field(
+                    datafusion::functions_nested::expr_fn::array_element(col("events"), lit(1_i64)),
+                    "attributes",
+                ),
+                lit("k"),
+            ])
+        };
+        let cases = [
+            (
+                "SELECT v ->> 'a' AS a FROM t",
+                vec![("a", text_at("a"))],
+                None,
+                a_leaves.map(ToOwned::to_owned).to_vec(),
+            ),
+            (
+                "SELECT id FROM t WHERE v ->> 'a' = 'str'",
+                vec![("id", col("id"))],
+                Some(text_at("a").eq(lit("str"))),
+                ["id"]
+                    .into_iter()
+                    .chain(a_leaves)
+                    .map(ToOwned::to_owned)
+                    .collect(),
+            ),
+            (
+                "SELECT 1 AS one FROM t WHERE v ->> 'a' = '2'",
+                Vec::new(),
+                Some(text_at("a").eq(lit("2"))),
+                a_leaves.map(ToOwned::to_owned).to_vec(),
+            ),
+            (
+                "SELECT events[1]['attributes'] ->> 'k' AS k FROM t",
+                vec![("k", index_k())],
+                None,
+                [
+                    "metadata",
+                    "typed_value.k.value",
+                    "typed_value.k.typed_value",
+                ]
+                .map(|leaf| format!("{attributes}.{leaf}"))
+                .to_vec(),
+            ),
+        ];
+        let shredded = write_file(true);
+        let unshredded = write_file(false);
+        let options = Arc::new(crate::resources::OracleSessionShape::for_test().config_options());
+        let schema = logical_schema();
+        for (sql, outputs, filter, shredded_leaves) in cases {
+            let requirements = crate::scribe::memtable::ReadRequirements {
+                filter: filter.as_ref().map(physical),
+                outputs: ProjectionExprs::new(
+                    outputs
+                        .iter()
+                        .map(|(name, expr)| ProjectionExpr::new(physical(expr), *name)),
+                ),
+            };
+            for published in [&shredded, &unshredded] {
+                let root = tempfile::tempdir().expect("staged root");
+                let run = root.path().join("run.parquet");
+                std::fs::write(&run, published).expect("staged run");
+                let staged = super::super::follower::staged_scan(
+                    vec![HotFileSource {
+                        location: run.to_str().expect("UTF-8 path").to_owned(),
+                        size_bytes: published.len(),
+                        row_count: None,
+                        event_time: crate::catalog::event_time::EventTimeStatistics::Unusable(
+                            crate::catalog::event_time::EventTimeBoundsDefect::Missing,
+                        ),
+                    }],
+                    None,
+                    *FIXTURE_TENANT,
+                    &schema,
+                    Some(&requirements),
+                    &options,
+                )
+                .expect("staged leaf plans");
+                let staged_leaves = plan_leaves(published, &staged, sql);
+                assert_eq!(staged_leaves, scan_leaves(published, sql).await, "{sql}");
+                if published == &shredded {
+                    assert_eq!(staged_leaves, shredded_leaves, "{sql}");
+                }
+                let table = HotTable::new(published, Arc::clone(&schema));
+                let staged_rows = table.run(staged).await;
+                let warehouse = table.sql(sql).await;
+                if outputs.is_empty() {
+                    assert!(staged_rows.iter().all(|batch| batch.num_columns() == 0));
+                    let rows: usize = staged_rows.iter().map(RecordBatch::num_rows).sum();
+                    assert_eq!(rows, warehouse.num_rows(), "{sql}");
+                    assert_eq!(rows, 1, "{sql}");
+                } else {
+                    let staged_rows =
+                        arrow::compute::concat_batches(&staged_rows[0].schema(), &staged_rows)
+                            .expect("concat");
+                    assert_eq!(staged_rows.columns(), warehouse.columns(), "{sql}");
+                }
             }
         }
     }

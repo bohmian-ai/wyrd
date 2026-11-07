@@ -2214,4 +2214,123 @@ mod tests {
             "a memtable read scans no Parquet"
         );
     }
+
+    /// Only a validated completion folds a source's scan evidence, once.
+    ///
+    /// An accepted staged footer contributes its bytes and file. A footer
+    /// signed for another fragment is refused, a second completion after the
+    /// accepted one is refused as stale, and an attempt dropped before its
+    /// footer (a cancellation) folds nothing. A completed source that read
+    /// zero bytes reports a known zero, while a memtable completion leaves
+    /// bytes unknown even though its decoded Arrow batch had a size.
+    ///
+    /// # Panics
+    /// Panics when a fixture frame cannot be built, a valid frame is refused,
+    /// a refused frame is accepted, or the collected evidence differs.
+    #[test]
+    fn variant_source_completion_counts_only_accepted_work() {
+        let fingerprint = "a".repeat(64);
+        let schema = Arc::new(Schema::new(vec![Field::new("v", DataType::Int64, false)]));
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![Arc::new(Int64Array::from(vec![1, 2, 3]))],
+        )
+        .expect("fixture batch");
+        let binding = TenantTableBinding {
+            tenant_id: wyrd_spec::DataTenantId::new_v7(),
+            namespace: "bifrost".to_owned(),
+            table: "events".to_owned(),
+        };
+        let leaf = || {
+            LiveScribeExec::new(
+                LiveTableRoutes {
+                    captures: LiveCaptures::none_for_test(binding.clone()),
+                    binding: binding.clone(),
+                    routes: Vec::new(),
+                },
+                crate::catalog::TimeAxis::new(
+                    crate::oracle::exec::tests::FIXTURE_TIME_COLUMN,
+                    crate::catalog::TimeGranularity::Hour,
+                ),
+                "f".repeat(64),
+                vec!["v".to_owned()],
+                Arc::clone(&schema),
+                1,
+            )
+        };
+        let staged = |bytes| WorkerScanStats {
+            bytes_scanned: Some(bytes),
+            files_scanned: 1,
+            partitions_scanned: 1,
+            ..WorkerScanStats::default()
+        };
+        let collected = |live: &LiveScribeExec| {
+            let mut stats = crate::oracle::exec::OracleQueryScanStats::from_plan(live);
+            stats.finalize();
+            (stats.physical_bytes_scanned, stats.files_scanned)
+        };
+        let remote = |live: &LiveScribeExec, signed: &str, stats| {
+            let mut encoder = super::super::dispatcher::AttemptEncoder::default();
+            let mut decoder =
+                LiveFrameDecoder::new(fingerprint.clone(), Arc::clone(live.scan_metrics()));
+            for frame in [
+                encoder.start(Arc::clone(&schema)).expect("schema frame"),
+                encoder.encode(&batch).expect("batch frame").1,
+            ] {
+                decoder
+                    .accept(LiveFrame::Wire(frame))
+                    .expect("data frame validates");
+            }
+            let footer = encoder.finish_physical(signed, stats).expect("footer");
+            (decoder, footer)
+        };
+
+        let live = leaf();
+        let (mut accepted, footer) = remote(&live, &fingerprint, staged(4096));
+        accepted
+            .accept(LiveFrame::Wire(footer.clone()))
+            .expect("the signed footer validates");
+        assert_eq!(
+            accepted.accept(LiveFrame::Wire(footer)),
+            Err(LiveFrameError::AfterFooter),
+            "a stale repeat of the accepted footer is refused"
+        );
+        let (mut refused, footer) = remote(&live, &"b".repeat(64), staged(8192));
+        assert_eq!(
+            refused.accept(LiveFrame::Wire(footer)),
+            Err(LiveFrameError::Footer),
+            "a footer signed for another fragment is refused"
+        );
+        let (cancelled, _) = remote(&live, &fingerprint, staged(16384));
+        drop(cancelled);
+        assert_eq!(
+            collected(&live),
+            (Some(4096), 1),
+            "only the accepted completion contributes, once"
+        );
+
+        let zero = leaf();
+        let (mut decoder, footer) = remote(&zero, &fingerprint, staged(0));
+        decoder
+            .accept(LiveFrame::Wire(footer))
+            .expect("the zero-byte footer validates");
+        assert_eq!(collected(&zero), (Some(0), 1), "a known zero stays zero");
+
+        let memtable = leaf();
+        let mut decoder =
+            LiveFrameDecoder::new(fingerprint.clone(), Arc::clone(memtable.scan_metrics()));
+        let mut tally = NativeOutputTally::default();
+        tally.record(&batch).expect("tally grows");
+        decoder
+            .accept(LiveFrame::Batch(batch.clone()))
+            .expect("in-process batch validates");
+        decoder
+            .accept(tally.complete(fingerprint.clone(), WorkerScanStats::default()))
+            .expect("in-process completion validates");
+        assert_eq!(
+            collected(&memtable),
+            (None, 0),
+            "decoded Arrow bytes are not file IO"
+        );
+    }
 }

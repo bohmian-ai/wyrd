@@ -2,9 +2,9 @@
 //!
 //! CPU profiles are captured by external `samply` for a whole experiment
 //! run. Heap profiles come from the server itself: a `bench` build samples
-//! its live allocations once [`HeapProfiler::start`] asks it to, and each
+//! its allocations once [`HeapProfiler::start`] asks it to, and each
 //! measured step ends with one pprof capture, `heap-<step>.pb.gz`, of the
-//! memory the steps so far allocated and still hold.
+//! memory the steps so far allocated and of what they still hold.
 //!
 //! `--profile` asks for one capture per server PID, started once the
 //! servers are ready and interrupted before they stop, with the same

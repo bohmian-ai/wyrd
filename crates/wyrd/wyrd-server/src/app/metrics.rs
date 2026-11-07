@@ -374,8 +374,8 @@ pub const BENCHMARK_TIMINGS_PATH: &str = "/benchmark/timings";
 /// payload, query, or reset. The Prometheus recorder is untouched.
 ///
 /// A `bench` build also serves [`crate::heap_profile::PATH`]: `POST` starts
-/// heap sampling and `GET` returns the live sampled allocations as a gzipped
-/// pprof profile of sizes and code locations only.
+/// heap sampling and `GET` returns the sampled allocations, allocated and
+/// still live, as a gzipped pprof profile of sizes and code locations only.
 pub fn metrics_router(handle: PrometheusHandle, benchmark_snapshot: bool) -> Router {
     let router = Router::new().route("/metrics", get(move || ready(handle.render())));
     if !benchmark_snapshot {

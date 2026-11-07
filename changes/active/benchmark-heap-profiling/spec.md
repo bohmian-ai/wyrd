@@ -1,6 +1,6 @@
 ---
 id: SPEC-benchmark-heap-profiling
-revision: 1
+revision: 2
 status: approved
 ---
 
@@ -17,8 +17,8 @@ This change adds two pieces of evidence:
 - every repetition records the server's resident memory when its window
   opens, beside the peak, so peak minus opening is the memory that step added;
 - `--profile` also captures a sampled heap profile of the server at the end
-  of every step, in pprof format, naming the call stacks that hold live
-  allocations.
+  of every step, in pprof format, naming the call stacks that allocated
+  memory and the ones that still hold it.
 
 The allocator stays mimalloc. Changing the allocator would profile a different
 server than the one benchmarked.
@@ -37,10 +37,11 @@ is off each allocation and free costs one relaxed atomic load.
 
 Once sampling starts, the allocator samples about one allocation per 512 KiB
 allocated, with the exponentially distributed intervals that Go, tcmalloc and
-jemalloc use. It records each sampled allocation's size and call stack until
-the allocation is freed. Each sample is weighted by the inverse of its
-sampling probability, so totals estimate all live heap bytes allocated since
-sampling started. Allocations made by the sampler itself are never sampled.
+jemalloc use. It adds each sampled allocation's size to its call stack's
+allocated total, and keeps it as live until the allocation is freed. Each
+sample is weighted by the inverse of its sampling probability, so totals
+estimate all heap bytes allocated since sampling started, and the live heap
+among them. Allocations made by the sampler itself are never sampled.
 
 **Endpoints.** These are served on the loopback metrics listener, only in a
 `bench` build with benchmark snapshots enabled:
@@ -48,12 +49,18 @@ sampling started. Allocations made by the sampler itself are never sampled.
 | Request | Effect |
 |---|---|
 | `POST /benchmark/heap` | Starts sampling. Repeating it is a no-op. Answers 204. |
-| `GET /benchmark/heap` | Answers a gzipped pprof `Profile` with sample types `inuse_objects` (count) and `inuse_space` (bytes), symbolized function names, files and lines, and period type `space`/bytes with period 524288. Before sampling starts, the profile has no samples. |
+| `GET /benchmark/heap` | Answers a gzipped pprof `Profile` with Go's heap sample types `alloc_objects` (count), `alloc_space` (bytes), `inuse_objects` (count) and `inuse_space` (bytes), in that order, symbolized function names, files and lines, and period type `space`/bytes with period 524288. Before sampling starts, the profile has no samples. |
 
 Allocations made before sampling starts are not tracked, which matches how
 the samply CPU profile attaches only after fixtures load. A profile therefore
-shows memory the measured steps allocated and still hold, not idle server
-memory.
+shows memory the measured steps allocated, and what of it they still hold,
+not idle server memory.
+
+Both views are needed. Resident memory can grow far past the live heap: a
+step that allocates and frees gigabytes before it ends holds little live heap
+at its end, while the allocator may keep the freed pages. `inuse_*` answers
+what is held; `alloc_*` answers which code allocated the memory a step drove
+resident memory up with.
 
 **Harness.** `--profile` already runs samply. It now also:
 
@@ -75,20 +82,25 @@ Example:
 pprof -top profiles/heap-buffered-64kib-capture-metadata.pb.gz
 pprof -top -base profiles/heap-buffered-1kib-capture-metadata.pb.gz \
   profiles/heap-buffered-64kib-capture-metadata.pb.gz
+pprof -top -sample_index=alloc_space -base \
+  profiles/heap-buffered-1kib-capture-metadata.pb.gz \
+  profiles/heap-buffered-64kib-capture-metadata.pb.gz
 ```
 
 The first command shows what the server still holds after that step. The
-second shows only what changed since the earlier step.
+second shows only how that changed since the earlier step. The third shows
+what the later step allocated, freed or not.
 
 ## Requirements
 
 - **REQ-001:** each repetition records its window's opening resident memory
   next to its peak.
-- **REQ-002:** a `bench` build samples live heap allocations only after
+- **REQ-002:** a `bench` build samples heap allocations only after
   `POST /benchmark/heap`, through the existing `CountingMiMalloc` wrapper,
   which still delegates every allocation to mimalloc.
 - **REQ-003:** `GET /benchmark/heap` returns a self-contained, symbolized,
-  gzipped pprof profile of the live sampled allocations. Reading it needs
+  gzipped pprof profile of the sampled allocations, both allocated and
+  still live. Reading it needs
   neither the server binary nor a running server.
 - **REQ-004:** `--profile` captures one heap profile per measured step and
   records each one's path or the reason it is missing.
@@ -104,8 +116,7 @@ second shows only what changed since the earlier step.
 - **INV-004:** every supported platform uses the same code path. Stacks come
   from the `backtrace` crate, without `/proc` or platform gating.
 
-Out of scope: changing the allocator, allocation counts (`alloc_*` sample
-types), heap profiles of driver or worker processes, memory criteria or
+Out of scope: changing the allocator, heap profiles of driver or worker processes, memory criteria or
 targets, history or results-page changes, and production heap profiling.
 
 ## Expensive-to-reverse decisions
@@ -122,9 +133,10 @@ targets, history or results-page changes, and production heap profiling.
   reading and a peak no lower than it, and that a schema-3 record without
   the opening field still reads.
 - **AC-002:** server unit tests show that, before the start request, the
-  profile has no samples. After it, a live allocation of a few MiB is
-  attributed to the allocating function with roughly its size, and freeing
-  it removes it. Sampler allocations are never sampled. Non-GET/POST methods
+  profile has no samples. After it, an allocation of a few MiB is
+  attributed to the allocating function with roughly its size in both
+  `alloc_space` and `inuse_space`, and freeing it removes it from
+  `inuse_space` only. Sampler allocations are never sampled. Non-GET/POST methods
   are refused, and a build or listener without benchmark snapshots serves no
   heap route.
 - **AC-003:** profiler unit tests show that captures and failures become
@@ -153,3 +165,7 @@ captures.
 ## Revision history
 
 - Revision 1, 2026-11-06: first draft.
+- Revision 2, 2026-11-07: adds the `alloc_*` sample types. The first profiled
+  runs held 0.5 to 0.8 GiB of live heap at step ends against 2 to 8 GiB of
+  resident memory, so live heap alone could not name the code behind the
+  growth. Approved 2026-11-07 by the maintainer ("go ahead").

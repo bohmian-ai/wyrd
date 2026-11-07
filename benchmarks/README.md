@@ -304,16 +304,22 @@ verdict is unchanged.
 
 `--profile` also takes heap profiles of the server. Once the fixtures are
 loaded, the run asks the `bench` server build to start sampling its heap:
-about one allocation per 512 KiB allocated, recorded with its call stack
-until it is freed, through the same mimalloc allocator the server always
-uses. After each measured step, the run saves `profiles/heap-<step>.pb.gz`, a
-symbolized pprof profile (`inuse_space`, `inuse_objects`) of the memory the
-steps so far allocated and still hold. Memory allocated before sampling
-started is not in it.
+about one allocation per 512 KiB allocated, recorded with its call stack,
+through the same mimalloc allocator the server always uses. After each
+measured step, the run saves `profiles/heap-<step>.pb.gz`, a symbolized pprof
+profile with Go's four heap sample types: `alloc_space` and `alloc_objects`
+count everything the steps so far allocated, freed or not, and `inuse_space`
+and `inuse_objects` what they still hold. Memory allocated before sampling
+started is in neither.
+
+Resident memory can grow far past `inuse_space`: memory a step allocates and
+frees before it ends is gone from `inuse_space`, but the allocator may keep
+its pages. `alloc_space` shows which code allocated it.
 
 ```bash
 pprof -top profiles/heap-<step>.pb.gz                      # what is held after <step>
-pprof -top -base profiles/heap-<earlier>.pb.gz profiles/heap-<step>.pb.gz  # what <step> added
+pprof -top -base profiles/heap-<earlier>.pb.gz profiles/heap-<step>.pb.gz  # what <step> still holds beyond <earlier>
+pprof -top -sample_index=alloc_space -base profiles/heap-<earlier>.pb.gz profiles/heap-<step>.pb.gz  # what <step> allocated
 ```
 
 `pprof` is Google's profile viewer (`go install github.com/google/pprof@latest`);

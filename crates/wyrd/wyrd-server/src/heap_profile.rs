@@ -2,10 +2,12 @@
 //!
 //! The binary's allocator reports every allocation and free here. Until
 //! [`start`] runs, each report is one relaxed load. Afterwards about one
-//! allocation per [`SAMPLE_PERIOD`] allocated bytes is kept with its call
-//! stack until it is freed, the exponential sampling Go, tcmalloc and
-//! jemalloc use, and [`profile`] renders the live samples as a gzipped pprof
-//! `Profile` whose totals estimate the live heap allocated since the start.
+//! allocation per [`SAMPLE_PERIOD`] allocated bytes is sampled with its call
+//! stack, the exponential sampling Go, tcmalloc and jemalloc use. Each sample
+//! counts toward its stack's allocated total for good and stays live until it
+//! is freed. [`profile`] renders both as a gzipped pprof `Profile` with Go's
+//! four heap sample types: `alloc_*` estimates everything allocated since the
+//! start, freed or not, and `inuse_*` what is still held.
 //!
 //! The sampler's own allocations are never sampled: every path that may
 //! allocate runs under [`Reentry`], which the allocator hooks check first.
@@ -53,8 +55,11 @@ const BUCKETS: usize = 1 << 16;
 /// Whether [`start`] has run.
 static SAMPLING: AtomicBool = AtomicBool::new(false);
 
-/// Live samples by address.
-static LIVE: Mutex<BTreeMap<usize, Sample>> = Mutex::new(BTreeMap::new());
+/// Every sample taken since [`start`].
+static SAMPLES: Mutex<Samples> = Mutex::new(Samples {
+    live: BTreeMap::new(),
+    allocated: BTreeMap::new(),
+});
 
 /// Live samples per address bucket; see [`BUCKETS`].
 static BUCKETED: [AtomicU32; BUCKETS] = [const { AtomicU32::new(0) }; BUCKETS];
@@ -67,6 +72,14 @@ thread_local! {
     static RANDOM: Cell<u64> = const { Cell::new(0) };
     /// Set while this thread runs sampler code.
     static IN_SAMPLER: Cell<bool> = const { Cell::new(false) };
+}
+
+/// The samples taken since [`start`].
+struct Samples {
+    /// Samples not yet freed, by address.
+    live: BTreeMap<usize, Sample>,
+    /// Estimated allocations per stack, freed or not.
+    allocated: BTreeMap<Vec<usize>, Estimate>,
 }
 
 /// One sampled live allocation.
@@ -111,8 +124,13 @@ fn sample_allocation(address: *mut u8, size: u64) {
     }
     let _reentry = Reentry::enter();
     let stack = capture_stack();
-    let mut live = live();
-    live.insert(address.addr(), Sample { size, stack });
+    let mut samples = samples();
+    samples
+        .allocated
+        .entry(stack.clone())
+        .or_default()
+        .add(Estimate::of(size));
+    samples.live.insert(address.addr(), Sample { size, stack });
     bucket(address).fetch_add(1, Ordering::Relaxed);
 }
 
@@ -122,12 +140,12 @@ fn forget_allocation(address: *mut u8) {
         return;
     }
     let _reentry = Reentry::enter();
-    if live().remove(&address.addr()).is_some() {
+    if samples().live.remove(&address.addr()).is_some() {
         bucket(address).fetch_sub(1, Ordering::Relaxed);
     }
 }
 
-/// The live samples as a gzipped pprof profile, symbolized in process.
+/// The samples as a gzipped pprof profile, symbolized in process.
 ///
 /// Blocks while it resolves symbols; call it off the async runtime.
 ///
@@ -137,13 +155,27 @@ fn forget_allocation(address: *mut u8) {
 #[must_use]
 pub fn profile() -> Vec<u8> {
     let _reentry = Reentry::enter();
-    let samples: Vec<(u64, Vec<usize>)> = live()
-        .values()
-        .map(|sample| (sample.size, sample.stack.clone()))
-        .collect();
+    let (allocated, live): (Vec<_>, Vec<_>) = {
+        let samples = samples();
+        (
+            samples
+                .allocated
+                .iter()
+                .map(|(stack, estimate)| (stack.clone(), *estimate))
+                .collect(),
+            samples
+                .live
+                .values()
+                .map(|sample| (sample.stack.clone(), Estimate::of(sample.size)))
+                .collect(),
+        )
+    };
     let mut builder = ProfileBuilder::default();
-    for (size, stack) in samples {
-        builder.add(size, &stack);
+    for (stack, estimate) in allocated {
+        builder.totals(&stack).allocated.add(estimate);
+    }
+    for (stack, estimate) in live {
+        builder.totals(&stack).live.add(estimate);
     }
     let mut gzip = GzEncoder::new(Vec::new(), Compression::default());
     gzip.write_all(&builder.finish().encode_to_vec())
@@ -174,9 +206,54 @@ impl Drop for Reentry {
     }
 }
 
-/// The live table, even after a panic elsewhere poisoned it.
-fn live() -> MutexGuard<'static, BTreeMap<usize, Sample>> {
-    LIVE.lock().unwrap_or_else(PoisonError::into_inner)
+/// The sample tables, even after a panic elsewhere poisoned them.
+fn samples() -> MutexGuard<'static, Samples> {
+    SAMPLES.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+/// Estimated objects and bytes behind some samples.
+#[derive(Clone, Copy, Default)]
+struct Estimate {
+    /// Estimated allocations.
+    objects: f64,
+    /// Estimated bytes.
+    bytes: f64,
+}
+
+impl Estimate {
+    /// One sampled allocation of `size` bytes, weighted by the inverse of the
+    /// chance an allocation of that size is sampled.
+    fn of(size: u64) -> Self {
+        let weight = 1.0 / (1.0 - (-(size as f64) / SAMPLE_PERIOD as f64).exp());
+        Self {
+            objects: weight,
+            bytes: weight * size as f64,
+        }
+    }
+
+    /// Adds `other` to this estimate.
+    fn add(&mut self, other: Self) {
+        self.objects += other.objects;
+        self.bytes += other.bytes;
+    }
+
+    /// The estimate as pprof values: objects, then bytes.
+    #[expect(
+        clippy::cast_possible_truncation,
+        reason = "estimated objects and bytes fit in i64"
+    )]
+    fn values(self) -> [i64; 2] {
+        [self.objects.round() as i64, self.bytes.round() as i64]
+    }
+}
+
+/// One stack's estimates in a profile.
+#[derive(Default)]
+struct Totals {
+    /// Allocated since the start, freed or not.
+    allocated: Estimate,
+    /// Still held.
+    live: Estimate,
 }
 
 /// The bucket `address` hashes into.
@@ -363,14 +440,14 @@ struct ProfileBuilder {
     locations: HashMap<Frame, u64>,
     /// Symbolized frames by return address.
     resolved: HashMap<usize, Vec<Frame>>,
-    /// Estimated live objects and bytes by stack of location ids.
-    totals: HashMap<Vec<u64>, (f64, f64)>,
+    /// Estimates by stack of location ids.
+    totals: HashMap<Vec<u64>, Totals>,
 }
 
 impl ProfileBuilder {
-    /// Adds one sampled allocation of `size` bytes, weighted by the inverse
-    /// of the chance an allocation of that size is sampled.
-    fn add(&mut self, size: u64, stack: &[usize]) {
+    /// The totals of the symbolized, trimmed `stack` of return addresses.
+    /// Raw stacks that trim to the same frames share one entry.
+    fn totals(&mut self, stack: &[usize]) -> &mut Totals {
         let frames: Vec<Frame> = stack
             .iter()
             .flat_map(|&address| self.resolve(address))
@@ -379,10 +456,7 @@ impl ProfileBuilder {
             .iter()
             .map(|frame| self.location(frame))
             .collect();
-        let weight = 1.0 / (1.0 - (-(size as f64) / SAMPLE_PERIOD as f64).exp());
-        let total = self.totals.entry(locations).or_default();
-        total.0 += weight;
-        total.1 += weight * size as f64;
+        self.totals.entry(locations).or_default()
     }
 
     /// The frames at `address`, innermost inlined function first.
@@ -467,18 +541,17 @@ impl ProfileBuilder {
         index
     }
 
-    /// The finished profile: `inuse_objects` and `inuse_space` per stack,
-    /// sampled every [`SAMPLE_PERIOD`] bytes.
-    #[expect(
-        clippy::cast_possible_truncation,
-        reason = "estimated live objects and bytes fit in i64"
-    )]
+    /// The finished profile: Go's heap sample types per stack, sampled every
+    /// [`SAMPLE_PERIOD`] bytes. `inuse_space` comes last, so pprof shows it
+    /// by default.
     fn finish(mut self) -> pprof::Profile {
         let mut value_type = |kind: &str, unit: &str| pprof::ValueType {
             r#type: self.string(kind),
             unit: self.string(unit),
         };
         let sample_type = vec![
+            value_type("alloc_objects", "count"),
+            value_type("alloc_space", "bytes"),
             value_type("inuse_objects", "count"),
             value_type("inuse_space", "bytes"),
         ];
@@ -490,9 +563,9 @@ impl ProfileBuilder {
         profile.sample = self
             .totals
             .into_iter()
-            .map(|(location_id, (objects, bytes))| pprof::Sample {
+            .map(|(location_id, totals)| pprof::Sample {
                 location_id,
-                value: vec![objects.round() as i64, bytes.round() as i64],
+                value: [totals.allocated.values(), totals.live.values()].concat(),
             })
             .collect();
         profile
@@ -537,9 +610,15 @@ mod tests {
         string(profile, function.name)
     }
 
-    /// The estimated live bytes on stacks through a function named
-    /// `function`.
-    fn bytes_through(profile: &Profile, function: &str) -> i64 {
+    /// The `alloc_space` value's index in a sample.
+    const ALLOC_SPACE: usize = 1;
+
+    /// The `inuse_space` value's index in a sample.
+    const INUSE_SPACE: usize = 3;
+
+    /// The estimated bytes of sample type `index` on stacks through a
+    /// function named `function`.
+    fn bytes_through(profile: &Profile, function: &str, index: usize) -> i64 {
         profile
             .sample
             .iter()
@@ -549,7 +628,7 @@ mod tests {
                     .iter()
                     .any(|&id| function_name(profile, id).contains(function))
             })
-            .map(|sample| sample.value[1])
+            .map(|sample| sample.value[index])
             .sum()
     }
 
@@ -598,9 +677,10 @@ mod tests {
         super::allocated(address, 8 << 20);
     }
 
-    /// Nothing is sampled before the start; afterwards a live allocation is
-    /// attributed to its caller at about its size, its free removes it, and
-    /// the profile names its sample types and period.
+    /// Nothing is sampled before the start; afterwards an allocation is
+    /// attributed to its caller at about its size, its free removes it from
+    /// `inuse_space` but not `alloc_space`, and the profile names its sample
+    /// types and period.
     ///
     /// # Panics
     ///
@@ -624,19 +704,30 @@ mod tests {
             .iter()
             .map(|value_type| string(&profile, value_type.r#type))
             .collect();
-        assert_eq!(names, ["inuse_objects", "inuse_space"]);
-        assert_eq!(profile.period, super::SAMPLE_PERIOD.cast_signed());
-        let bytes = bytes_through(&profile, "allocate_eight_mib");
-        assert!(
-            (8 << 20..(8 << 20) + 1024).contains(&bytes),
-            "{bytes} bytes"
+        assert_eq!(
+            names,
+            [
+                "alloc_objects",
+                "alloc_space",
+                "inuse_objects",
+                "inuse_space"
+            ]
         );
+        assert_eq!(profile.period, super::SAMPLE_PERIOD.cast_signed());
+        let eight_mib = 8 << 20..(8 << 20) + 1024;
+        for index in [ALLOC_SPACE, INUSE_SPACE] {
+            let bytes = bytes_through(&profile, "allocate_eight_mib", index);
+            assert!(eight_mib.contains(&bytes), "{bytes} bytes");
+        }
 
         super::freed(address);
+        let profile = decode(&super::profile());
         assert_eq!(
-            bytes_through(&decode(&super::profile()), "allocate_eight_mib"),
+            bytes_through(&profile, "allocate_eight_mib", INUSE_SPACE),
             0
         );
+        let allocated = bytes_through(&profile, "allocate_eight_mib", ALLOC_SPACE);
+        assert!(eight_mib.contains(&allocated), "{allocated} bytes");
         drop(block);
     }
 }

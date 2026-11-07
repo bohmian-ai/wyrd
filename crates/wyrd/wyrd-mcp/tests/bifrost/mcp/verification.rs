@@ -42,6 +42,10 @@ mod pg_tests {
     use wyrd_spec::envelope::CardKind;
     use wyrd_spec::reference::CardRef;
     use wyrd_spec::registry::{GetCardResponse, ListCardsResponse};
+    use wyrd_spec::storage::DownloadInitResponse;
+    use wyrd_spec::verification::execution::{
+        Publication, PublicationContent, PublicationKind, PublicationPage,
+    };
     use wyrd_testing::{Bootstrap, WyrdTestServer};
 
     /// The Card read tool an agent uses to find binding IDs.
@@ -3287,7 +3291,8 @@ mod pg_tests {
     /// The scripted `publish-desk` model: the drafter writes and revises
     /// `/work/report.md`, writes a tree holding a nested Unicode, spaced file
     /// and an empty directory, then publishes the report, the tree, a JSON
-    /// assessment, and an explicit `null` in one turn; every other turn, and
+    /// assessment, and an explicit `null` in one turn; its first turn also
+    /// writes `/inputs`, which the workspace refuses. Every other turn, and
     /// the consumer, finishes with `{"done": true}`.
     fn publish_desk(request: &wiremock::Request) -> wiremock::ResponseTemplate {
         let body: JsonValue = serde_json::from_slice(&request.body).unwrap_or_default();
@@ -3310,7 +3315,14 @@ mod pg_tests {
         let write =
             |path: &str, content: &str| serde_json::json!({ "path": path, "content": content });
         let calls = match (drafting, turn) {
-            (true, 0) => vec![call("w1", "fs.write", write("/work/report.md", "draft v1"))],
+            (true, 0) => vec![
+                call("w1", "fs.write", write("/work/report.md", "draft v1")),
+                call(
+                    "x-write-inputs",
+                    "fs.write",
+                    write("/inputs/report.md", "forged"),
+                ),
+            ],
             (true, 1) => vec![
                 call("w2", "fs.write", write("/work/report.md", DESK_REPORT)),
                 call("w3", "fs.write", write("/work/tree/a.md", "alpha")),
@@ -3364,6 +3376,26 @@ mod pg_tests {
     /// The report the `publish-desk` drafter publishes after revising it.
     const DESK_REPORT: &str = "# Final report\n";
 
+    /// The base64 SHA-256 a download plan reports for [`DESK_REPORT`].
+    const DESK_REPORT_SHA256: &str = "Ir06sS2VoUyv9Zu1ER4D6fjj0mKQiWHzAgYl/q7kE3M=";
+
+    /// The base64 SHA-256 a download plan reports for the tree's `beta` file.
+    const DESK_BETA_SHA256: &str = "9E5k5185SOn3P436lHIcTOjLtPJlxHkMcCstQc+/J1M=";
+
+    /// The stable code of a permission denial.
+    const DENIED: &str = "WYRD_PERMISSION_403_DENIED_RBAC";
+
+    /// Every tool call `state`'s drafter made, from its execution result.
+    fn drafted(state: &JsonValue) -> Vec<JsonValue> {
+        state["result"]["outcome"]["steps"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter(|step| step["id"] == "draft")
+            .flat_map(|step| step["tool_calls"].as_array().cloned().unwrap_or_default())
+            .collect()
+    }
+
     /// The JSON assessment the `publish-desk` drafter publishes by value.
     fn desk_assessment() -> JsonValue {
         serde_json::json!({ "risk": "low", "score": 0.9, "notes": ["é", "two words"] })
@@ -3375,8 +3407,13 @@ mod pg_tests {
     /// the drafter's first attempt, reads each typed content — the tree's
     /// files and its `empty` and `nested dir` directories — and plans the
     /// report's and a nested tree file's downloads with their exact size and
-    /// digest. An unpublished name answers the stable not-found code, and a
-    /// caller holding only `cards:read` is denied.
+    /// digest. A first-turn write to `/inputs`, with the tool granted, is
+    /// refused by the workspace and returns nothing. An unpublished name
+    /// answers the stable not-found code. A Service granted no tool runs
+    /// the same review with every drafter call denied, returning nothing and
+    /// publishing nothing. Each invalid tool selection is refused at
+    /// registration and never reaches the model, and a caller holding only
+    /// `cards:read` is denied the publication.
     ///
     /// # Errors
     ///
@@ -3392,13 +3429,6 @@ mod pg_tests {
     #[ignore = "requires the Postgres-backed Bifrost journey lane"]
     async fn hosted_agent_tools_agent_publishes_file_directory_and_json()
     -> Result<(), McpJourneyError> {
-        use base64::Engine as _;
-        use sha2::Digest as _;
-        use wyrd_spec::storage::DownloadInitResponse;
-        use wyrd_spec::verification::execution::{
-            Publication, PublicationContent, PublicationKind, PublicationPage,
-        };
-
         let upstream = wiremock::MockServer::start().await;
         wiremock::Mock::given(wiremock::matchers::method("POST"))
             .and(wiremock::matchers::path("/v1/chat/completions"))
@@ -3466,6 +3496,24 @@ mod pg_tests {
         let id = text(&accepted, "/execution_id")?.to_owned();
         let state = settle(&agent, &id).await?;
         assert_eq!(state["result"]["outcome"]["verdict"], "passed", "{state}");
+        let forged = drafted(&state)
+            .into_iter()
+            .find(|call| call["arguments"]["content"] == "forged")
+            .ok_or("the /inputs write is recorded")?;
+        assert_eq!(
+            (
+                forged["returned_bytes"].as_u64(),
+                forged.get("output_sha256").is_none()
+            ),
+            (Some(0), true),
+            "an invoke-granted write the workspace refuses returns nothing: {forged}"
+        );
+        assert!(
+            forged["error"]
+                .as_str()
+                .is_some_and(|error| error.contains("WYRD_SPEC_400_VALIDATION")),
+            "{forged}"
+        );
 
         let page: PublicationPage = serde_json::from_value(structured(
             agent
@@ -3542,14 +3590,16 @@ mod pg_tests {
             }
         );
 
-        let digest = |bytes: &[u8]| {
-            base64::engine::general_purpose::STANDARD.encode(sha2::Sha256::digest(bytes))
-        };
-        for (arguments, bytes) in [
-            (select("report", None), DESK_REPORT.as_bytes()),
+        for (arguments, bytes, digest) in [
+            (
+                select("report", None),
+                DESK_REPORT.len(),
+                DESK_REPORT_SHA256,
+            ),
             (
                 select("tree", Some("nested dir/é b.md")),
-                b"beta".as_slice(),
+                4,
+                DESK_BETA_SHA256,
             ),
         ] {
             let plan: DownloadInitResponse = serde_json::from_value(structured(
@@ -3558,8 +3608,8 @@ mod pg_tests {
                     .await?,
             )?)?;
             assert_eq!(
-                (plan.size_bytes, plan.sha256),
-                (bytes.len() as u64, digest(bytes))
+                (plan.size_bytes, plan.sha256.as_str()),
+                (bytes as u64, digest)
             );
         }
 
@@ -3573,6 +3623,83 @@ mod pg_tests {
             "{absent}"
         );
         agent.cancel().await?;
+
+        let narrowed = server
+            .bootstrap_service("mcp-desk-narrowed", &["editor", "mcp_desk_invoker"])
+            .await?;
+        let narrowed = connect(&server, &narrowed).await?;
+        let accepted = structured(
+            narrowed
+                .call_tool(call(
+                    ENQUEUE,
+                    serde_json::json!({
+                        "verifier_card_uid": pipeline,
+                        "card_uid": desk_uid,
+                        "inputs": { "question": { "kind": "json", "value": "NARROWED-RUN" } },
+                    }),
+                )?)
+                .await?,
+        )?;
+        let narrowed_id = text(&accepted, "/execution_id")?.to_owned();
+        let state = settle(&narrowed, &narrowed_id).await?;
+        let calls = drafted(&state);
+        assert!(!calls.is_empty(), "{state}");
+        for call in &calls {
+            assert!(
+                call["error"]
+                    .as_str()
+                    .is_some_and(|error| error.contains(DENIED))
+                    && call["returned_bytes"] == 0
+                    && call.get("output_sha256").is_none(),
+                "a call without its tool grant is denied and returns nothing: {call}"
+            );
+        }
+        let page: PublicationPage = serde_json::from_value(structured(
+            narrowed
+                .call_tool(call(
+                    "verification.list_publications",
+                    serde_json::json!({ "execution_id": narrowed_id }),
+                )?)
+                .await?,
+        )?)?;
+        assert!(page.items.is_empty(), "denied calls publish nothing");
+        narrowed.cancel().await?;
+
+        for (name, reason) in [
+            ("unknown-tool", "http.fetch is not a built-in tool"),
+            ("provider-spelling", "fs_write is not a built-in tool"),
+            ("duplicate-tool", "publish is selected more than once"),
+            (
+                "check-publishes",
+                "publish is available only to step Agents",
+            ),
+        ] {
+            let refused = Box::pin(cards.declare_from_path(Path::new(&format!(
+                "{}/../../../fixtures/cards/hosted_agent_tools/invalid/{name}.yaml",
+                env!("CARGO_MANIFEST_DIR")
+            ))))
+            .await
+            .err()
+            .ok_or("the invalid selection is refused")?;
+            let problem = format!("{refused:?}");
+            assert_eq!(
+                refused.code(),
+                "WYRD_LOADER_400_INVALID_ENVELOPE",
+                "{name}: {problem}"
+            );
+            assert!(
+                problem.contains("agent_tools") && problem.contains(reason),
+                "{name}: {problem}"
+            );
+        }
+        let received = upstream.received_requests().await.unwrap_or_default();
+        assert!(
+            received
+                .iter()
+                .all(|request| !String::from_utf8_lossy(&request.body).contains("NEVER CALLED")),
+            "no refused selection reached the model"
+        );
+
         let reader = server
             .bootstrap_service("mcp-desk-cards", &["mcp_desk_cards"])
             .await?;

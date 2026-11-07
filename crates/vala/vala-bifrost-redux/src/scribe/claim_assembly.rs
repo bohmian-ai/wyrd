@@ -260,9 +260,10 @@ impl ClaimAssembler {
         let variant_layout =
             ClaimVariantSample::new(request.runs.claim, request.runs.runs(), &request.schema)
                 .layout()?;
-        let merge = StagedRunMerge::open(
+        let mut merge = StagedRunMerge::open(
             request.runs.runs(),
-            request.schema,
+            Arc::clone(&request.schema),
+            variant_layout.clone(),
             request.tenant,
             request.layout,
             MERGE_BATCH_ROWS,
@@ -278,7 +279,8 @@ impl ClaimAssembler {
             },
             &request.memory,
             variant_layout.clone(),
-            merge,
+            request.schema,
+            &mut merge,
         )?;
         let rows = artifacts.iter().try_fold(0_u64, |sum, artifact| {
             u64::try_from(artifact.row_count)

@@ -297,8 +297,10 @@ pub struct ArtifactPlan<'a> {
 ///
 /// Unlike a frozen generation, a claim has no candidate boundaries: sealing
 /// happens only at the target and at the end, which is what lets several
-/// members share one object. Every object is shredded with `variant_layout`,
-/// the claim's sampled layout.
+/// members share one object. Every object stores `variant_layout`, the
+/// claim's sampled layout, and is sealed under `logical`, the claim's logical
+/// schema: a batch already in the layout's physical schema is written as is,
+/// and any other batch is shredded with the layout.
 ///
 /// # Errors
 ///
@@ -309,9 +311,16 @@ pub fn encode_ordered_claim(
     plan: ArtifactPlan<'_>,
     memory: &crate::resources::ScribeResources,
     variant_layout: VariantLayout,
+    logical: Arc<Schema>,
     ordered: impl Iterator<Item = Result<RecordBatch, ScribeError>>,
 ) -> Result<(BoundedParquetArtifactSet, Vec<RowGroupStats>), ScribeError> {
-    let mut roller = RollingArtifactWriter::new(plan, VariantPlan::Final(variant_layout));
+    let mut roller = RollingArtifactWriter::new(
+        plan,
+        VariantPlan::Final {
+            layout: variant_layout,
+            logical,
+        },
+    );
     for batch in ordered {
         roller.append_charged_batch(memory, &batch?)?;
     }
@@ -631,12 +640,18 @@ enum VariantPlan {
         /// Logical schema of the generation being staged.
         logical: Arc<Schema>,
     },
-    /// A final object shredded with the claim's freshly sampled layout.
+    /// A final object in the claim's freshly sampled layout.
     ///
-    /// The claim merge emits logical rows, so the first batch's schema is the
-    /// logical schema and each batch is shredded. Final objects are measured
-    /// by the residual-share metric.
-    Final(VariantLayout),
+    /// The claim merge emits batches already in the layout's physical schema,
+    /// which are written as is; a logical batch is shredded. `logical` names
+    /// the footer identity whatever schema a batch arrives in. Final objects
+    /// are measured by the residual-share metric.
+    Final {
+        /// Variant layout every final object stores.
+        layout: VariantLayout,
+        /// Logical schema of the claim being assembled.
+        logical: Arc<Schema>,
+    },
 }
 
 impl<'a> RollingArtifactWriter<'a> {
@@ -730,7 +745,7 @@ impl<'a> RollingArtifactWriter<'a> {
         {
             ordered_batch
         } else {
-            let VariantPlan::Final(layout) = &self.variants else {
+            let VariantPlan::Final { layout, .. } = &self.variants else {
                 return Err(ScribeError::Internal {
                     detail: "a staged generation's batches changed physical layout".to_owned(),
                 });
@@ -770,9 +785,9 @@ impl<'a> RollingArtifactWriter<'a> {
 
     /// Opens the next artifact for the batch that is about to be written.
     ///
-    /// The artifact keeps the logical schema — the staged generation's, or
-    /// the claim batch's own. A staged run's encoder opens on the batch's own
-    /// physical schema; a final object's on its layout's physical schema.
+    /// The artifact keeps the logical schema its plan names, never the
+    /// batch's. A staged run's encoder opens on the batch's own physical
+    /// schema; a final object's on its layout's physical schema.
     ///
     /// # Errors
     ///
@@ -794,12 +809,11 @@ impl<'a> RollingArtifactWriter<'a> {
         })?;
         let (schema, physical) = match &self.variants {
             VariantPlan::Staged { logical } => (Arc::clone(logical), group.schema()),
-            VariantPlan::Final(layout) => {
-                let schema = group.schema();
+            VariantPlan::Final { layout, logical } => {
                 let physical = layout
-                    .physical_schema(&schema)
+                    .physical_schema(logical)
                     .map_err(|error| variant_error(&error))?;
-                (schema, physical)
+                (Arc::clone(logical), physical)
             }
         };
         let physical_fingerprint =
@@ -883,7 +897,7 @@ impl<'a> RollingArtifactWriter<'a> {
             schema_fingerprint,
             variant_residual_share,
         } = evidence;
-        if matches!(self.variants, VariantPlan::Final(_)) {
+        if matches!(self.variants, VariantPlan::Final { .. }) {
             VariantWriter::Scribe.record(variant_residual_share);
         }
         self.row_group_stats.extend(row_group_stats.iter().cloned());
@@ -3125,6 +3139,7 @@ mod tests {
             claim_plan(scratch, &layout, tenant),
             &crate::resources::ScribeResources::for_test(),
             variant_layout,
+            schema,
             batches.iter().cloned().map(Ok),
         )
         .expect("claim encodes")
@@ -3295,6 +3310,7 @@ mod tests {
         let merge = crate::scribe::claim_merge::StagedRunMerge::open(
             &runs,
             Arc::clone(&schema),
+            fresh.clone(),
             tenant,
             &layout,
             1,
@@ -3305,6 +3321,7 @@ mod tests {
             claim_plan(claim_scratch.path(), &layout, tenant),
             &crate::resources::ScribeResources::for_test(),
             fresh,
+            Arc::clone(&schema),
             merge,
         )
         .expect("claim encodes");
@@ -3327,6 +3344,7 @@ mod tests {
         let refusal = crate::scribe::claim_merge::StagedRunMerge::open(
             &runs,
             schema,
+            VariantLayout::default(),
             DataTenantId::new_v7(),
             &layout,
             1,
@@ -3336,6 +3354,173 @@ mod tests {
             refusal.to_string().contains("tenant"),
             "the refusal names the tenant: {refusal}"
         );
+    }
+
+    /// Identity of the claim the layout-reuse tests sample and assemble.
+    fn reuse_claim() -> crate::scribe::assembly::StagingClaimId {
+        crate::scribe::assembly::StagingClaimId::from_hex(&"07".repeat(32)).expect("claim id")
+    }
+
+    /// Variant documents whose `a` is mostly typed, and whose residual holds
+    /// `b`, a nested list, a mixed-type `a`, JSON nulls and arrays.
+    fn reuse_documents(rows: usize, offset: usize) -> Vec<String> {
+        (offset..offset + rows)
+            .map(|row| match row % 5 {
+                0 => format!(r#"{{"a":{row},"b":"x{row}"}}"#),
+                1 => format!(r#"{{"a":{row},"c":{{"d":[1,{row}]}},"b":"y"}}"#),
+                2 => r#"{"a":"text","b":null}"#.to_owned(),
+                3 => "null".to_owned(),
+                _ => format!(r#"[{row},{{"b":1}}]"#),
+            })
+            .collect()
+    }
+
+    /// A run of `documents` whose event times start at `first_timestamp`.
+    fn reuse_run(first_timestamp: i64, documents: &[String]) -> RecordBatch {
+        let json: Vec<&str> = documents.iter().map(String::as_str).collect();
+        variant_run(first_timestamp, &json)
+    }
+
+    /// Which rows of a one-run, one-stratum claim over `logical` the claim sample keeps.
+    fn kept_rows(logical: &RecordBatch) -> Vec<bool> {
+        use iceberg::writer::file_writer::variant_shredding::VariantSampler;
+
+        let mut seed = [0_u8; 8];
+        seed.copy_from_slice(&reuse_claim().as_bytes()[..8]);
+        let mut probe = VariantSampler::new(
+            &logical.schema(),
+            crate::parquet::BIFROST_VARIANT_SHREDDING,
+            u64::from_le_bytes(seed),
+            &[logical.num_rows()],
+        );
+        (0..logical.num_rows())
+            .map(|row| {
+                let before = probe.sampled_rows();
+                probe
+                    .offer(&logical.slice(row, 1), &[0], row as u64)
+                    .expect("probe offer");
+                probe.sampled_rows() > before
+            })
+            .collect()
+    }
+
+    /// `physical` with the residual bytes of every row not `kept` replaced by an invalid Variant.
+    ///
+    /// Reconstructing any such row fails, so a step that succeeds on the
+    /// result never reconstructed a row outside `kept`.
+    fn poison_unkept(physical: &RecordBatch, kept: &[bool]) -> RecordBatch {
+        const INVALID_VARIANT: &[u8] = &[0xFF];
+        let index = physical.schema().index_of("v").expect("variant column");
+        let storage = physical.column(index).as_struct();
+        let residual = storage.column_by_name("value").expect("residual value");
+        let residual_type = residual.data_type().clone();
+        let residual = arrow::compute::cast(residual, &DataType::Binary).expect("residual bytes");
+        let residual = residual.as_binary::<i32>();
+        let poisoned: arrow::array::BinaryArray = (0..physical.num_rows())
+            .map(|row| {
+                residual.is_valid(row).then(|| {
+                    if kept[row] {
+                        residual.value(row)
+                    } else {
+                        INVALID_VARIANT
+                    }
+                })
+            })
+            .collect();
+        let children = storage
+            .fields()
+            .iter()
+            .zip(storage.columns())
+            .map(|(field, child)| {
+                if field.name() == "value" {
+                    arrow::compute::cast(&poisoned, &residual_type).expect("residual type")
+                } else {
+                    Arc::clone(child)
+                }
+            })
+            .collect();
+        let storage = arrow::array::StructArray::new(
+            storage.fields().clone(),
+            children,
+            storage.nulls().cloned(),
+        );
+        let mut columns = physical.columns().to_vec();
+        columns[index] = Arc::new(storage);
+        RecordBatch::try_new(physical.schema(), columns).expect("poisoned run")
+    }
+
+    /// Writes an already physical `batch` of `logical` as one staged run under `dir`.
+    fn physical_run(
+        batch: &RecordBatch,
+        logical: &Arc<Schema>,
+        dir: &Path,
+        tenant: DataTenantId,
+    ) -> PathBuf {
+        std::fs::create_dir_all(dir).expect("run scratch");
+        let sort_layout = crate::tables::hourly_test_layout(logical.as_ref());
+        let mut writer = RollingArtifactWriter::new(
+            claim_plan(dir, &sort_layout, tenant),
+            VariantPlan::Staged {
+                logical: Arc::clone(logical),
+            },
+        );
+        writer.append_ordered_batch(batch).expect("physical run");
+        let (artifacts, _) = writer.finish().expect("physical run seals");
+        artifacts[0].scratch_path.clone()
+    }
+
+    /// The layout the reuse claim's sample selects over `runs`.
+    fn sampled_layout(runs: &[PathBuf], logical: &Arc<Schema>) -> VariantLayout {
+        crate::scribe::claim_sample::ClaimVariantSample::new(reuse_claim(), runs, logical)
+            .layout()
+            .expect("claim sample")
+    }
+
+    /// Samples, merges and encodes `runs` as the reuse claim, returning the
+    /// objects, the selected layout and the rows the merge converted.
+    fn assemble_reuse_claim(
+        runs: &[PathBuf],
+        logical: &Arc<Schema>,
+        scratch: &Path,
+        tenant: DataTenantId,
+    ) -> (BoundedParquetArtifactSet, VariantLayout, usize) {
+        std::fs::create_dir_all(scratch).expect("claim scratch");
+        let variant_layout = sampled_layout(runs, logical);
+        let sort_layout = crate::tables::hourly_test_layout(logical.as_ref());
+        let mut merge = crate::scribe::claim_merge::StagedRunMerge::open(
+            runs,
+            Arc::clone(logical),
+            variant_layout.clone(),
+            tenant,
+            &sort_layout,
+            1_000,
+        )
+        .expect("claim merge opens");
+        let (artifacts, _) = encode_ordered_claim(
+            claim_plan(scratch, &sort_layout, tenant),
+            &crate::resources::ScribeResources::for_test(),
+            variant_layout.clone(),
+            Arc::clone(logical),
+            &mut merge,
+        )
+        .expect("claim encodes");
+        (artifacts, variant_layout, merge.converted_rows())
+    }
+
+    /// The field names `layout` shreds in column `v` of `logical`.
+    fn shredded_names(layout: &VariantLayout, logical: &Arc<Schema>) -> Vec<String> {
+        let physical = layout.physical_schema(logical).expect("physical schema");
+        let DataType::Struct(storage) = physical.field_with_name("v").expect("v").data_type()
+        else {
+            return Vec::new();
+        };
+        match storage
+            .find("typed_value")
+            .map(|(_, field)| field.data_type())
+        {
+            Some(DataType::Struct(fields)) => fields.iter().map(|f| f.name().clone()).collect(),
+            _ => Vec::new(),
+        }
     }
 
     /// The claim sample reconstructs only the observations it keeps.
@@ -3348,153 +3533,171 @@ mod tests {
     /// cold, which includes the residual-only `b`.
     #[test]
     fn claim_sampling_reconstructs_only_selected_observations() {
-        use iceberg::writer::file_writer::variant_shredding::VariantSampler;
-
         let tenant = DataTenantId::new_v7();
-        let claim =
-            crate::scribe::assembly::StagingClaimId::from_hex(&"07".repeat(32)).expect("claim id");
-        let documents: Vec<String> = (0..20_000)
-            .map(|row| match row % 5 {
-                0 => format!(r#"{{"a":{row},"b":"x{row}"}}"#),
-                1 => format!(r#"{{"a":{row},"c":{{"d":[1,{row}]}},"b":"y"}}"#),
-                2 => r#"{"a":"text","b":null}"#.to_owned(),
-                3 => "null".to_owned(),
-                _ => format!(r#"[{row},{{"b":1}}]"#),
-            })
-            .collect();
-        let json: Vec<&str> = documents.iter().map(String::as_str).collect();
-        let logical = variant_run(1, &json);
+        let logical = reuse_run(1, &reuse_documents(20_000, 0));
         let schema = logical.schema();
-        let rows = logical.num_rows();
-
-        let mut seed = [0_u8; 8];
-        seed.copy_from_slice(&claim.as_bytes()[..8]);
-        let mut probe = VariantSampler::new(
-            &schema,
-            crate::parquet::BIFROST_VARIANT_SHREDDING,
-            u64::from_le_bytes(seed),
-            &[rows],
-        );
-        let kept: Vec<bool> = (0..rows)
-            .map(|row| {
-                let before = probe.sampled_rows();
-                probe
-                    .offer(&logical.slice(row, 1), &[0], row as u64)
-                    .expect("probe offer");
-                probe.sampled_rows() > before
-            })
-            .collect();
+        let kept = kept_rows(&logical);
         let sampled = kept.iter().filter(|kept| **kept).count();
         assert!(
-            sampled > 0 && sampled < rows / 2,
-            "the sample keeps {sampled} of {rows} rows"
+            sampled > 0 && sampled < logical.num_rows() / 2,
+            "the sample keeps {sampled} of {} rows",
+            logical.num_rows()
         );
 
         let scratch = tempfile::tempdir().expect("run scratch");
-        let cold_dir = scratch.path().join("cold");
-        std::fs::create_dir_all(&cold_dir).expect("cold scratch");
-        let cold_run = staged_run(&logical, VariantLayout::default(), &cold_dir, tenant);
-        let cold = crate::scribe::claim_sample::ClaimVariantSample::new(
-            claim,
-            std::slice::from_ref(&cold_run),
-            &schema,
-        )
-        .layout()
-        .expect("cold sample");
+        let cold_run = physical_run(&logical, &schema, &scratch.path().join("cold"), tenant);
+        let cold = sampled_layout(std::slice::from_ref(&cold_run), &schema);
+        assert!(
+            shredded_names(&cold, &schema).contains(&"b".to_owned()),
+            "the cold sample shreds `b`"
+        );
 
-        let a_only_json = [r#"{"a":1}"#; 64];
-        let a_only_dir = scratch.path().join("a-only");
-        std::fs::create_dir_all(&a_only_dir).expect("a-only scratch");
-        let a_only_run = staged_run(
-            &variant_run(1, &a_only_json),
-            VariantLayout::default(),
-            &a_only_dir,
+        let a_only_run = physical_run(
+            &variant_run(1, &[r#"{"a":1}"#; 64]),
+            &schema,
+            &scratch.path().join("a-only"),
             tenant,
         );
-        let learned = crate::scribe::claim_sample::ClaimVariantSample::new(
-            claim,
-            std::slice::from_ref(&a_only_run),
-            &schema,
-        )
-        .layout()
-        .expect("a-only layout");
-        let physical = learned.shred(&logical).expect("learned layout");
-        let column = physical.column_by_name("v").expect("variant column");
-        let storage = column.as_struct();
-        let residual = storage.column_by_name("value").expect("residual value");
-        let residual_type = residual.data_type().clone();
-        let residual = arrow::compute::cast(residual, &DataType::Binary).expect("residual bytes");
-        let residual = residual.as_binary::<i32>();
-        const INVALID_VARIANT: &[u8] = &[0xFF];
-        let poisoned: arrow::array::BinaryArray = (0..rows)
-            .map(|row| {
-                residual.is_valid(row).then(|| {
-                    if kept[row] {
-                        residual.value(row)
-                    } else {
-                        INVALID_VARIANT
-                    }
-                })
-            })
-            .collect();
-        let poisoned_storage = arrow::array::StructArray::new(
-            storage.fields().clone(),
-            storage
-                .fields()
-                .iter()
-                .zip(storage.columns())
-                .map(|(field, child)| {
-                    if field.name() == "value" {
-                        arrow::compute::cast(&poisoned, &residual_type).expect("residual type")
-                    } else {
-                        Arc::clone(child)
-                    }
-                })
-                .collect(),
-            storage.nulls().cloned(),
-        );
-        let mut columns = physical.columns().to_vec();
-        columns[physical.schema().index_of("v").expect("v")] = Arc::new(poisoned_storage);
-        let poisoned = RecordBatch::try_new(physical.schema(), columns).expect("poisoned run");
+        let learned = sampled_layout(std::slice::from_ref(&a_only_run), &schema);
+        assert_eq!(shredded_names(&learned, &schema), ["a"]);
+        let poisoned = poison_unkept(&learned.shred(&logical).expect("learned layout"), &kept);
         assert!(
             crate::schema::logical_batch(&poisoned, &schema).is_err(),
             "reconstructing an unsampled row fails"
         );
+        let warm_run = physical_run(&poisoned, &schema, &scratch.path().join("learned"), tenant);
+        assert_eq!(
+            sampled_layout(std::slice::from_ref(&warm_run), &schema),
+            cold,
+            "a learned run samples the same rows and layout as a cold one, reconstructing only those rows"
+        );
+    }
 
-        let learned_dir = scratch.path().join("learned");
-        std::fs::create_dir_all(&learned_dir).expect("learned scratch");
-        let sort_layout = crate::tables::hourly_test_layout(schema.as_ref());
-        let mut writer = RollingArtifactWriter::new(
-            claim_plan(&learned_dir, &sort_layout, tenant),
-            VariantPlan::Staged {
-                logical: Arc::clone(&schema),
-            },
+    /// Runs staged in the claim's selected layout reach its objects as stored.
+    ///
+    /// Cold runs choose the claim's layout. The same rows staged in that
+    /// layout select it again, convert no row, and publish objects
+    /// byte-identical to the cold claim's, with the same footer identity,
+    /// values and order; a retry writes the same bytes. A claim mixing a
+    /// matching run with one staged in another layout converts only the
+    /// mismatched run's rows and still publishes the same bytes. A matching run
+    /// whose unsampled residuals are invalid Variants still publishes, so
+    /// neither the merge nor the writer reconstructs or reshreds its rows.
+    #[test]
+    fn matching_layouts_publish_without_variant_roundtrip() {
+        let tenant = DataTenantId::new_v7();
+        let scratch = tempfile::tempdir().expect("claim scratch");
+        let root = scratch.path();
+        let first = reuse_run(0, &reuse_documents(3_000, 0));
+        let second = reuse_run(1_500, &reuse_documents(3_000, 3_000));
+        let schema = first.schema();
+        let cold_runs = vec![
+            physical_run(&first, &schema, &root.join("cold-0"), tenant),
+            physical_run(&second, &schema, &root.join("cold-1"), tenant),
+        ];
+        let (cold, selected, converted) =
+            assemble_reuse_claim(&cold_runs, &schema, &root.join("cold"), tenant);
+        assert!(!selected.is_unshredded(), "the claim shreds `v`");
+        assert_eq!(
+            converted, 6_000,
+            "cold runs are converted to the selected layout"
         );
-        writer.append_ordered_batch(&poisoned).expect("learned run");
-        let (artifacts, _) = writer.finish().expect("learned run seals");
-        let warm = crate::scribe::claim_sample::ClaimVariantSample::new(
-            claim,
-            std::slice::from_ref(&artifacts[0].scratch_path),
+        let checksums = |artifacts: &BoundedParquetArtifactSet| {
+            artifacts
+                .iter()
+                .map(|artifact| artifact.checksum.clone())
+                .collect::<Vec<_>>()
+        };
+        let (shredded, values) = read_variant_artifact(&cold[0].scratch_path);
+        assert_eq!(shredded, shredded_names(&selected, &schema));
+        assert_eq!(values.len(), 6_000);
+        assert_eq!(
+            cold[0].schema_fingerprint,
+            hex::encode(crate::schema::SchemaFingerprint::from_arrow_schema_exact(&schema).0),
+            "the footer names the logical schema"
+        );
+
+        let shred = |batch: &RecordBatch, layout: &VariantLayout| {
+            layout.shred(batch).expect("staged layout")
+        };
+        let learned_runs = vec![
+            physical_run(
+                &shred(&first, &selected),
+                &schema,
+                &root.join("learned-0"),
+                tenant,
+            ),
+            physical_run(
+                &shred(&second, &selected),
+                &schema,
+                &root.join("learned-1"),
+                tenant,
+            ),
+        ];
+        let (learned, layout, converted) =
+            assemble_reuse_claim(&learned_runs, &schema, &root.join("learned"), tenant);
+        assert_eq!(
+            layout, selected,
+            "the fresh sample selects the staged layout"
+        );
+        assert_eq!(converted, 0, "matching runs are not converted");
+        assert_eq!(
+            checksums(&learned),
+            checksums(&cold),
+            "matching runs publish the same bytes"
+        );
+        let (retry, _, _) =
+            assemble_reuse_claim(&learned_runs, &schema, &root.join("retry"), tenant);
+        assert_eq!(
+            checksums(&retry),
+            checksums(&learned),
+            "a retry writes the same bytes"
+        );
+
+        let a_only = sampled_layout(
+            &[physical_run(
+                &variant_run(1, &[r#"{"a":1}"#; 64]),
+                &schema,
+                &root.join("a-only"),
+                tenant,
+            )],
             &schema,
-        )
-        .layout()
-        .expect("the learned sample reconstructs only kept rows");
-        assert_eq!(warm, cold, "learned and cold runs sample the same layout");
-        let physical = cold.physical_schema(&schema).expect("cold layout");
-        let DataType::Struct(storage) = physical.field_with_name("v").expect("v").data_type()
-        else {
-            panic!("variant storage");
-        };
-        let Some((_, typed)) = storage.find("typed_value") else {
-            panic!("the claim shreds `v`");
-        };
-        let DataType::Struct(typed) = typed.data_type() else {
-            panic!("object shredding");
-        };
-        assert!(
-            typed.find("b").is_some(),
-            "a residual-only field is learned: {typed:?}"
         );
+        assert_ne!(a_only, selected);
+        let mixed_runs = vec![
+            learned_runs[0].clone(),
+            physical_run(
+                &shred(&second, &a_only),
+                &schema,
+                &root.join("mixed-1"),
+                tenant,
+            ),
+        ];
+        let (mixed, layout, converted) =
+            assemble_reuse_claim(&mixed_runs, &schema, &root.join("mixed"), tenant);
+        assert_eq!(layout, selected);
+        assert_eq!(converted, 3_000, "only the mismatched run is converted");
+        assert_eq!(
+            checksums(&mixed),
+            checksums(&cold),
+            "a mixed claim publishes the same bytes"
+        );
+
+        let alone = sampled_layout(&cold_runs[..1], &schema);
+        let poisoned = poison_unkept(&shred(&first, &alone), &kept_rows(&first));
+        let poisoned_run = physical_run(&poisoned, &schema, &root.join("poisoned"), tenant);
+        let (published, layout, converted) = assemble_reuse_claim(
+            std::slice::from_ref(&poisoned_run),
+            &schema,
+            &root.join("poisoned-claim"),
+            tenant,
+        );
+        assert_eq!(layout, alone, "the run's own layout is selected again");
+        assert_eq!(
+            converted, 0,
+            "a matching run is published without reconstruction"
+        );
+        assert_eq!(published[0].row_count, 3_000);
     }
 
     /// Row-group bounds are read from the table's own time column, and a

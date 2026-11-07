@@ -69,7 +69,8 @@ use wyrd_server::state::{
     BifrostShutdownReport, BifrostTestControls, EngineWorker, QueryStreamFault,
     QueryStreamFaultController, ScribeCoordinationRuntime, TestHooks,
 };
-use wyrd_server::verification::hosted::HostedLimits;
+/// The hosted Verifier limits [`WyrdTestServerBuilder::with_verification_limits_for_test`] takes.
+pub use wyrd_server::verification::hosted::HostedLimits;
 use wyrd_server::{AppState, WyrdServer, WyrdServerConfig, build_router};
 use wyrd_spec::DataTenantId;
 use wyrd_spec::vala::api::NodeId;

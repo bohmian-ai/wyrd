@@ -33,7 +33,7 @@ use wyrd_ai::verify::{Submission, VerificationExecutionStatus};
 use wyrd_ai::{StepStatus, VerificationResult, WyrdClient};
 use wyrd_spec::auth::Sha256Hex;
 use wyrd_spec::auth::TokenAudience;
-use wyrd_testing::server::WyrdTestServer;
+use wyrd_testing::server::{HostedLimits, WyrdTestServer};
 
 use crate::local_development::configure_gateway;
 use crate::support::{Deployment, declare, pull};
@@ -52,6 +52,15 @@ const REPORT: &str = "# Final report\n";
 /// The report the drafter's second attempt publishes after its first
 /// attempt gets an undecodable model reply.
 const RETRIED: &str = "# Retried report\n";
+
+/// The `/work` write ceiling every drafter's scratch runs under.
+const WORK: usize = 256 * 1024;
+
+/// The `/work` bytes the `LIMITS-RUN` drafter has left once it holds the big
+/// file and its two one-byte files.
+fn room() -> usize {
+    WORK - big().len() - 2
+}
 
 /// A file of 3,000 numbered lines, larger than one tool result.
 fn big() -> String {
@@ -304,6 +313,22 @@ fn reply(request: &Request, script: &Script) -> ResponseTemplate {
                         json!({ "name": "big", "path": "/work/big.md" }),
                     ),
                 ]),
+                2 => calls(&[(
+                    "l-over",
+                    "fs.write",
+                    json!({ "path": "/work/c.md", "content": "c".repeat(room() + 1) }),
+                )]),
+                3 => calls(&[(
+                    "l-replace-over",
+                    "fs.write",
+                    json!({ "path": "/work/b.md", "content": "b".repeat(room() + 2) }),
+                )]),
+                4 => calls(&[(
+                    "l-replace",
+                    "fs.write",
+                    json!({ "path": "/work/a.md", "content": "a".repeat(room() + 1) }),
+                )]),
+                5 => calls(&[("l-kept", "fs.read", json!({ "path": "/work/b.md" }))]),
                 _ => done(),
             };
         }
@@ -648,6 +673,11 @@ impl PublishDesk {
 /// A verification-capable server whose gateway deploys on `upstream`.
 fn builder(upstream: &MockServer) -> wyrd_testing::server::WyrdTestServerBuilder {
     WyrdTestServer::builder()
+        .with_verification_limits_for_test(HostedLimits {
+            monty_min_workers: 0,
+            work_write_max_bytes: WORK as u64,
+            ..HostedLimits::default()
+        })
         .with_verification_runtime_for_test()
         .with_gateway_provider_root_for_test(upstream.uri().parse().expect("upstream URL parses"))
 }
@@ -1349,11 +1379,32 @@ async fn tool_calls_recheck_permissions_and_revocation() {
     desk.deployment.shutdown().await;
 }
 
+/// The `/work` path the `LIMITS-RUN` refused write `call` targets.
+fn drafter_path(call: &str) -> &'static str {
+    if call == "l-over" {
+        "/work/c.md"
+    } else {
+        "/work/b.md"
+    }
+}
+
+/// The content length of the `LIMITS-RUN` refused write `call`.
+fn drafter_size(call: &str) -> usize {
+    if call == "l-over" {
+        room() + 1
+    } else {
+        room() + 2
+    }
+}
+
 /// Tool work stays bounded and its provenance exact: a JSON value over the
 /// tool result limit is refused as `publication_size` and publishes
 /// nothing, a file larger than one result reads back as one bounded page
 /// that continues, the same file publishes whole, and concurrent scratch
-/// writers all land. Each recorded call keeps its dotted tool, its
+/// writers all land. Once `/work` is nearly full, a new file or a
+/// replacement growing past the cumulative budget is refused as
+/// `work_budget`, recorded with no output, and leaves the old file intact,
+/// while a replacement that fits once its old bytes are released lands. Each recorded call keeps its dotted tool, its
 /// arguments, and the digest and size of exactly the result the model got,
 /// and a refused call records its stable code with no output.
 ///
@@ -1423,6 +1474,44 @@ async fn tool_limits_release_capacity_and_preserve_provenance() {
             .as_deref()
             .is_some_and(|error| error.starts_with(INVALID)),
         "{huge:?}"
+    );
+    for call in ["l-over", "l-replace-over"] {
+        assert_eq!(
+            refusal(&drafter[call]),
+            (INVALID, "work_budget"),
+            "{call}: the cumulative /work budget refuses it"
+        );
+        let refused = draft
+            .tool_calls
+            .iter()
+            .find(|record| {
+                record.arguments["path"] == drafter_path(call)
+                    && record.arguments["content"].as_str().map(str::len)
+                        == Some(drafter_size(call))
+            })
+            .expect("the refused write is recorded");
+        assert_eq!(
+            (refused.output_sha256, refused.returned_bytes),
+            (None, 0),
+            "{call}: a refused write returns nothing"
+        );
+        assert!(
+            refused
+                .error
+                .as_deref()
+                .is_some_and(|error| error.starts_with(INVALID)),
+            "{refused:?}"
+        );
+    }
+    assert_eq!(
+        drafter["l-replace"],
+        json!({ "path": "/work/a.md", "bytes": room() + 1 }),
+        "a replacement is charged only what it adds"
+    );
+    assert_eq!(
+        lines(&drafter["l-kept"]),
+        "b",
+        "a refused write changes nothing"
     );
     let names: Vec<String> = desk
         .publications(&result)

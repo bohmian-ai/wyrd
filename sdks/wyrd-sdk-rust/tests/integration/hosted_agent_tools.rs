@@ -24,6 +24,7 @@ use tokio::sync::Notify;
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, Request, ResponseTemplate};
 use wyrd_ai::cards::CardRef;
+use wyrd_ai::cli::{ExecutionArg, ExecutionVerb, PageArgs, PublicationArgs};
 use wyrd_ai::state::WyrdState;
 use wyrd_ai::verify::{
     Execution, ExecutionPageQuery, PublicationContent, PublicationKind, PublicationName,
@@ -771,7 +772,10 @@ async fn agent_writes_private_workspace_files() {
 /// path, and a forged producer field are refused and publish nothing. The
 /// consumer reads exactly the published bytes through its mounts and finds
 /// the report through the collection manifest's actual path; the public
-/// readback returns the same content with matching download digests.
+/// readback returns the same content with matching download digests, and
+/// the in-process `wyrd execution` command lists the same publications,
+/// shows the file, directory, and JSON content, and refuses an unpublished
+/// name with its stable code.
 ///
 /// # Panics
 /// Panics when the verification is refused or a receipt, refusal, mounted
@@ -962,6 +966,67 @@ async fn agent_publishes_file_directory_and_json() {
         .await
         .expect("the tree file download plans");
     assert_eq!((plan.size_bytes, plan.sha256), (4, BETA_SHA256.to_owned()));
+
+    let target = ExecutionArg {
+        execution_id: result.execution_id,
+    };
+    let cli = |verb: ExecutionVerb| wyrd_ai::cli::execution(verb, Some(desk.deployment.admin()));
+    let listed = cli(ExecutionVerb::Publications(PageArgs {
+        execution: target.clone(),
+        limit: None,
+        cursor: None,
+    }))
+    .await
+    .expect("the CLI lists publications");
+    let mut names: Vec<&str> = listed["items"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|item| item["name"].as_str())
+        .collect();
+    names.sort_unstable();
+    assert_eq!(names, ["assessment", "nothing", "report", "tree"]);
+    let selected = |name: &str| PublicationArgs {
+        execution: target.clone(),
+        step_id: draft.clone(),
+        name: PublicationName::new(name).expect("name"),
+        attempt: 1,
+        item_index: None,
+        iteration_index: None,
+        path: None,
+    };
+    let shown = async |name: &str| {
+        cli(ExecutionVerb::Publication(selected(name)))
+            .await
+            .expect("the CLI reads the publication")
+    };
+    let report = shown("report").await;
+    assert_eq!(
+        (
+            &report["kind"],
+            &report["manifest"]["files"][0]["size_bytes"]
+        ),
+        (&json!("file"), &json!(REPORT.len()))
+    );
+    let tree = shown("tree").await;
+    assert_eq!(
+        (&tree["kind"], &tree["manifest"]["directories"]),
+        (&json!("directory"), &json!(["empty", "nested dir"]))
+    );
+    assert_eq!(
+        (
+            &shown("assessment").await["value"],
+            &shown("nothing").await["value"]
+        ),
+        (&assessment(), &Value::Null)
+    );
+    assert_eq!(
+        cli(ExecutionVerb::Publication(selected("ghost")))
+            .await
+            .expect_err("an unpublished name is refused")
+            .code(),
+        "WYRD_VERIFICATION_404_PUBLICATION_NOT_FOUND"
+    );
     desk.deployment.shutdown().await;
 }
 

@@ -11,8 +11,6 @@ nothing is published.
 
 from __future__ import annotations
 
-import base64
-import hashlib
 import json
 from pathlib import Path
 from typing import Any
@@ -96,9 +94,11 @@ def publications(execution: verify.Execution) -> list[Any]:
             return listed
 
 
-def digest(content: bytes) -> str:
-    """The base64 SHA-256 a download plan reports for ``content``."""
-    return base64.b64encode(hashlib.sha256(content).digest()).decode()
+DIGESTS = {
+    "report": "Ir06sS2VoUyv9Zu1ER4D6fjj0mKQiWHzAgYl/q7kE3M=",
+    "tree": "9E5k5185SOn3P436lHIcTOjLtPJlxHkMcCstQc+/J1M=",
+}
+"""The base64 SHA-256 a download plan reports for each publication's planned file."""
 
 
 def test_agent_publishes_file_directory_and_json(
@@ -179,7 +179,7 @@ def test_agent_publishes_file_directory_and_json(
         ("tree", "nested dir/é b.md", b"beta"),
     ]:
         planned = execution.download(draft, name, path)
-        assert (planned["size_bytes"], planned["sha256"]) == (len(content), digest(content)), name
+        assert (planned["size_bytes"], planned["sha256"]) == (len(content), DIGESTS[name]), name
 
 
 def test_tool_calls_need_their_own_grant(

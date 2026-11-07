@@ -1488,22 +1488,50 @@ fn agent_engine(
     )
 }
 
+/// A Verifier of the Agent `steps`, each `(id, retries, tools, workspace)`
+/// reading JSON input `x` as its `document`, in order.
+///
+/// # Panics
+/// Panics when the Verifier does not decode or validate.
+fn agent_steps(steps: &[(&str, u32, &[&str], Value)]) -> Arc<VerifierSpec> {
+    let steps: Vec<Value> = steps
+        .iter()
+        .map(|(id, retries, tools, workspace)| {
+            let mut action = serde_json::to_value(Action::Agent(reviewer(tools))).expect("action");
+            action["inputs"] = json!({ "document": "inputs.x" });
+            action["workspace"] = workspace.clone();
+            json!({ "id": id, "retries": retries, "action": action })
+        })
+        .collect();
+    let spec: VerifierSpec = serde_json::from_value(json!({
+        "inputs": { "x": { "type": "json" } },
+        "steps": steps
+    }))
+    .expect("Verifier decodes");
+    spec.validate().expect("valid Verifier");
+    Arc::new(spec)
+}
+
 /// A Verifier of one Agent step `id` reading JSON input `x`, declaring
 /// `publish` and `code.run`, with `retries` retries.
 ///
 /// # Panics
 /// Panics when the Verifier does not decode or validate.
 fn publishing_step(id: &str, retries: u32) -> Arc<VerifierSpec> {
-    let mut action =
-        serde_json::to_value(Action::Agent(reviewer(&["publish", "code.run"]))).expect("action");
-    action["inputs"] = json!({ "document": "inputs.x" });
-    let spec: VerifierSpec = serde_json::from_value(json!({
-        "inputs": { "x": { "type": "json" } },
-        "steps": [{ "id": id, "retries": retries, "action": action }]
-    }))
-    .expect("Verifier decodes");
-    spec.validate().expect("valid Verifier");
-    Arc::new(spec)
+    agent_steps(&[(id, retries, &["publish", "code.run"], json!({}))])
+}
+
+/// The JSON evidence every Agent step here reads as input `x`.
+///
+/// # Panics
+/// Never; the slot name is valid.
+fn notes() -> BTreeMap<SlotName, InputDeclaration> {
+    BTreeMap::from([(
+        SlotName::new("x").expect("slot"),
+        InputDeclaration::Json {
+            value: json!("the notes"),
+        },
+    )])
 }
 
 /// An attempt refused Python capacity after it retained a publication is
@@ -1652,6 +1680,309 @@ fn attempts(state: &ExecutionState) -> Vec<(String, u32)> {
             )
         })
         .collect()
+}
+
+/// The report the drafter writes and publishes.
+const KEPT: &[u8] = b"# Kept\n";
+
+/// An Agent drafter's accepted file reaches its consumer after recovery,
+/// from the exact accepted descriptor, while the object inventory cannot be
+/// read. The first claim's drafter writes and publishes `report` and
+/// settles; its consumer is then refused Python capacity before retaining
+/// anything. The reclaim recovers the settled drafter alone. A caller
+/// whose inventory queries all fail cannot read the report as evidence,
+/// and replaying the drafter's original publish call after its reply was
+/// lost, with neither scratch nor writable storage, answers the original
+/// receipt and accepts nothing. Once capacity frees, the recovered run as
+/// that caller never runs the drafter again, and the consumer reads
+/// exactly the accepted bytes.
+///
+/// # Panics
+/// Panics when the run is not deferred busy, the recovery holds other
+/// attempts, the inventory is readable, the replay accepts or uploads, the
+/// drafter runs again, or the consumer reads other bytes.
+#[tokio::test(flavor = "multi_thread")]
+async fn agent_publications_reach_a_recovered_consumer() {
+    let leased = Leased::start().await;
+    let limits = saturable();
+    let caller = leased.publisher([Permission::tool_invoke_any()]);
+    let sandbox = Arc::new(Sandbox::start(worker(), limits).await.expect("pool starts"));
+    let none = serde_json::Map::new();
+    let far = tokio::time::Instant::now() + std::time::Duration::from_secs(60);
+    // One admitted operation holds the only worker admission while pending.
+    let mut held = Box::pin(sandbox.run("def f():\n    return 1", "f", &none, Vec::new(), far));
+    assert!(futures_util::FutureExt::now_or_never(&mut held).is_none());
+    let model = Arc::new(MockProvider::new(ProviderName::OpenAi));
+    let spec = agent_steps(&[
+        ("draft", 0, &["fs.write", "publish"], json!({})),
+        (
+            "consume",
+            1,
+            &["fs.read", "code.run"],
+            json!({ "/inputs/report.md": "steps.draft.publications.report" }),
+        ),
+    ]);
+    let report = std::str::from_utf8(KEPT).expect("UTF-8");
+    model.push_response(answer(
+        None,
+        &[
+            (
+                "fs_write",
+                json!({ "path": "/work/report.md", "content": report }),
+            ),
+            (
+                "publish",
+                json!({ "name": "report", "path": "/work/report.md" }),
+            ),
+        ],
+    ));
+    model.push_response(answer(Some("{}"), &[]));
+    model.push_response(answer(None, &[("code_run", json!({ "source": "1" }))]));
+
+    let interrupted = agent_engine(&leased, &leased.run, &caller, &model, &sandbox, Vec::new())
+        .run(Arc::clone(&spec), notes(), far)
+        .await;
+    assert!(
+        matches!(interrupted, Err(EngineError::Busy(_))),
+        "{interrupted:?}"
+    );
+    assert_eq!(model.remaining(), 0);
+
+    let current = leased.reclaim().await;
+    let recovered = current.snapshot().await;
+    assert_eq!(
+        attempts(&recovered),
+        [("draft".to_owned(), 1)],
+        "the reclaim recovers the settled drafter; the refused consumer spent nothing"
+    );
+    let blind = wyrd_server::components::auth::Caller {
+        // Not a SYSTEM principal, so every inventory query is unavailable.
+        executed_by: Some(PrincipalId::new(uuid::Uuid::new_v4())),
+        ..caller.clone()
+    };
+    let evidence = TenantEvidence::new(
+        leased.server.state().clone(),
+        blind.clone(),
+        BTreeMap::new(),
+        limits,
+    )
+    .with_execution(Arc::clone(&current));
+    evidence
+        .read(&InputDeclaration::File {
+            sha256: wyrd_spec::auth::Sha256Hex::digest(KEPT),
+            size_bytes: KEPT.len() as u64,
+            format: MediaFormat::Markdown,
+            filename: None,
+        })
+        .await
+        .expect_err("the object inventory cannot be read by this caller");
+
+    let producer = Producer {
+        step_id: TaskId::new("draft").expect("task"),
+        item_index: None,
+        iteration_index: None,
+        attempt: 1,
+    };
+    let revision = leased.revision().await.0;
+    let wyrd_storage::BackendConfig::Local { root } =
+        leased.server.state().storage.backend_config()
+    else {
+        panic!("the test server stores locally");
+    };
+    let objects = root
+        .join(leased.server.data_tenant_id().to_string())
+        .join("evidence/sha256");
+    let replayed = {
+        use std::os::unix::fs::PermissionsExt as _;
+        std::fs::set_permissions(&objects, std::fs::Permissions::from_mode(0o000)).expect("chmod");
+        let empty = Arc::new(Workspace::materialize(Vec::new(), limits, None).expect("workspace"));
+        // The Agent's second call of its first turn was the publish.
+        let replayed = Publications::new(leased.server.state(), &blind, &current, limits)
+            .path(
+                &call("call_1", &producer, "report"),
+                &empty,
+                "/work/report.md",
+            )
+            .await;
+        std::fs::set_permissions(&objects, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+        replayed
+    };
+    assert_eq!(
+        replayed.expect("the original call replays without scratch or storage"),
+        PublicationKind::File
+    );
+    assert_eq!(
+        leased.revision().await.0,
+        revision,
+        "the replay accepts nothing"
+    );
+
+    drop(held);
+    model.push_response(answer(
+        None,
+        &[("fs_read", json!({ "path": "/inputs/report.md" }))],
+    ));
+    model.push_response(answer(Some("{}"), &[]));
+    let outcome = agent_engine(
+        &leased,
+        &current,
+        &blind,
+        &model,
+        &sandbox,
+        recovered.invocations,
+    )
+    .run(spec, notes(), far)
+    .await
+    .expect("the recovered run settles");
+    assert_eq!(
+        model.remaining(),
+        0,
+        "the settled drafter makes no model call"
+    );
+    let steps: Vec<_> = outcome
+        .steps
+        .iter()
+        .map(|step| (step.id.as_str(), step.status, step.attempts))
+        .collect();
+    assert_eq!(
+        steps,
+        [
+            ("draft", StepStatus::Succeeded, 1),
+            ("consume", StepStatus::Succeeded, 1)
+        ],
+        "{outcome:?}"
+    );
+    assert_eq!(
+        attempts(&leased.accepted().await),
+        [("draft".to_owned(), 1), ("consume".to_owned(), 1)]
+    );
+    let mounted = Workspaces::new(limits)
+        .open(
+            &BTreeMap::from([(
+                "/inputs/report.md".to_owned(),
+                CallInput {
+                    value: CallValue::Publication {
+                        producer,
+                        name: PublicationName::new("report").expect("name"),
+                    },
+                    sources: BTreeSet::from([SlotName::new("x").expect("slot")]),
+                },
+            )]),
+            &evidence,
+        )
+        .await
+        .expect("the accepted file mounts from its descriptor");
+    assert_eq!(
+        std::fs::read(mounted.inputs_dir().join("report.md")).expect("mounted"),
+        KEPT
+    );
+    let read = serde_json::to_vec(&mounted.read("/inputs/report.md", 0).expect("reads"))
+        .expect("the read serializes");
+    let consumed = &outcome.steps[1].tool_calls[0];
+    assert_eq!(
+        (
+            consumed.output_sha256.clone(),
+            consumed.returned_bytes,
+            consumed.error.as_deref()
+        ),
+        (
+            Some(wyrd_spec::auth::Sha256Hex::digest(&read)),
+            read.len() as u64,
+            None
+        ),
+        "the consumer read exactly the accepted bytes"
+    );
+    drop(mounted);
+    leased
+        .server
+        .shutdown()
+        .await
+        .expect("test server shuts down");
+}
+
+/// Dropping a running Agent step, as a disconnecting direct caller drops
+/// its request, starts no later Agent work. With every state revision held
+/// at Scribe, the drafter's attempt is admitted, its first model turn
+/// publishes `early`, and the run is dropped while that publication waits
+/// for acceptance. Once Scribe is released, the model has still been asked
+/// for nothing more and `after` is never published.
+///
+/// # Panics
+/// Panics when the run finishes while held, a revision does not reach
+/// Scribe, or the dropped run calls the model or publishes again.
+#[tokio::test(flavor = "multi_thread")]
+async fn dropped_agent_work_makes_no_later_call() {
+    let leased = Leased::start().await;
+    let held = Arc::new(HeldRevisions {
+        scribe: Arc::clone(
+            leased
+                .server
+                .state()
+                .bifrost_ingest()
+                .expect("the server runs Scribe")
+                .scribe(),
+        ) as _,
+        release: tokio::sync::Semaphore::new(0),
+        arrived: tokio::sync::Notify::new(),
+    });
+    let outbox = ScribeSink::local_outbox(
+        Arc::clone(&held) as _,
+        Some(leased.server.state().postgres.wyrd().clone()),
+    );
+    let first = leased
+        .reclaim_on(outbox)
+        .await
+        .expect("the execution state claims");
+    let limits = saturable();
+    let caller = leased.publisher([Permission::tool_invoke_any()]);
+    let sandbox = Arc::new(Sandbox::start(worker(), limits).await.expect("pool starts"));
+    let model = Arc::new(MockProvider::new(ProviderName::OpenAi));
+    for name in ["early", "after"] {
+        model.push_response(answer(
+            None,
+            &[("publish", json!({ "name": name, "value": 1 }))],
+        ));
+    }
+    model.push_response(answer(Some("{}"), &[]));
+    let far = tokio::time::Instant::now() + std::time::Duration::from_secs(60);
+    let engine = agent_engine(&leased, &first, &caller, &model, &sandbox, Vec::new());
+    let mut run = Box::pin(engine.run(publishing_step("draft", 0), notes(), far));
+
+    for (revision, asked, release) in [("the attempt", 3, 1), ("the early publication", 2, 0)] {
+        tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            tokio::select! {
+                outcome = &mut run => panic!("returned while held: {outcome:?}"),
+                () = held.arrived.notified() => {}
+            }
+        })
+        .await
+        .unwrap_or_else(|_| panic!("{revision} reaches Scribe"));
+        assert_eq!(model.remaining(), asked, "{revision} waits on Scribe");
+        held.release.add_permits(release);
+    }
+    drop(run);
+    held.release
+        .add_permits(tokio::sync::Semaphore::MAX_PERMITS);
+
+    assert_eq!(
+        model.remaining(),
+        2,
+        "a dropped run makes no later model call"
+    );
+    let current = leased.reclaim().await;
+    assert!(
+        current
+            .publications(&TaskId::new("draft").expect("task"))
+            .await
+            .iter()
+            .all(|accepted| accepted.publication.name.as_str() != "after"),
+        "a dropped run publishes nothing later"
+    );
+    leased
+        .server
+        .shutdown()
+        .await
+        .expect("test server shuts down");
 }
 
 /// A verdict-only outcome with no requirement or step.

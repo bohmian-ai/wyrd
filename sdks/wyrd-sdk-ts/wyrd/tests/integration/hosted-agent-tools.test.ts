@@ -9,7 +9,6 @@
 // conversation. The test then inspects what the model received, the recorded
 // tool calls, and the publications read back through the public execution
 // surface.
-import { createHash } from "node:crypto";
 import { mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -232,10 +231,11 @@ function grants(toolScope: unknown): unknown[] {
   ];
 }
 
-/** The base64 SHA-256 a download plan reports for `content`. */
-function digest(content: string): string {
-  return createHash("sha256").update(Buffer.from(content)).digest("base64");
-}
+/** The base64 SHA-256 a download plan reports for each publication's planned file. */
+const DIGESTS = {
+  report: "Ir06sS2VoUyv9Zu1ER4D6fjj0mKQiWHzAgYl/q7kE3M=",
+  tree: "9E5k5185SOn3P436lHIcTOjLtPJlxHkMcCstQc+/J1M=",
+} as const;
 
 /**
  * `test` on a fresh verification-capable server per test whose gateway
@@ -375,7 +375,7 @@ test("agent_publishes_file_directory_and_json", async ({ server, provider, bundl
     ["tree", "nested dir/é b.md", "beta"],
   ] as const) {
     const planned = await execution.download("draft", name, { attempt: 1, path });
-    expect([planned.size_bytes, planned.sha256], name).toEqual([Buffer.byteLength(content), digest(content)]);
+    expect([planned.size_bytes, planned.sha256], name).toEqual([Buffer.byteLength(content), DIGESTS[name]]);
   }
 
   const question = "FULL-RUN narrowed";

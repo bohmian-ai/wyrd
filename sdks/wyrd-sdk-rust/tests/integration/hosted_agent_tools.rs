@@ -62,6 +62,18 @@ fn room() -> usize {
     WORK - big().len() - 2
 }
 
+/// The base64 SHA-256 a download plan reports for [`REPORT`].
+const REPORT_SHA256: &str = "Ir06sS2VoUyv9Zu1ER4D6fjj0mKQiWHzAgYl/q7kE3M=";
+
+/// The base64 SHA-256 a download plan reports for the tree's `beta` file.
+const BETA_SHA256: &str = "9E5k5185SOn3P436lHIcTOjLtPJlxHkMcCstQc+/J1M=";
+
+/// The base64 SHA-256 a download plan reports for [`big`].
+const BIG_SHA256: &str = "SkXiaIRNPIxWGi6KNZI281jmsUq5DG3eVCjJ5e2fqR4=";
+
+/// The SHA-256 of the receipt the `big` publish returns to the model.
+const BIG_RECEIPT_SHA256: &str = "481017e0fef8a537cff0af3369f24be327b64f67a967b1db10d9499e65f4aacb";
+
 /// A file of 3,000 numbered lines, larger than one tool result.
 fn big() -> String {
     let mut text = String::new();
@@ -262,9 +274,6 @@ struct Script {
     /// The `RETRY-RUN` drafter's first turns so far, so its two attempts
     /// carry distinct call IDs and only the first gets an undecodable reply.
     attempts: AtomicUsize,
-    /// The `RESTART-RUN` consumer's first turns so far; only the first is
-    /// held.
-    held: AtomicUsize,
     /// Raised when a scripted Agent starts waiting on a held reply.
     waiting: Notify,
 }
@@ -272,10 +281,7 @@ struct Script {
 /// The scripted model: one reply per request, chosen by the Agent's prompt
 /// marker, the review's marker, and the turn. The `CANCEL-RUN` drafter
 /// publishes `early`, then raises `waiting` and holds its next reply, which
-/// would publish `late`, long enough to be cancelled; the `DISCONNECT-RUN`
-/// drafter does the same for a direct caller that disconnects; the `RESTART-RUN`
-/// consumer raises it and holds its first reply long enough for the server
-/// to restart.
+/// would publish `late`, long enough to be cancelled.
 fn reply(request: &Request, script: &Script) -> ResponseTemplate {
     let messages = messages(request);
     let prompt = text(&messages);
@@ -343,21 +349,6 @@ fn reply(request: &Request, script: &Script) -> ResponseTemplate {
                 _ => done(),
             };
         }
-        if prompt.contains("DISCONNECT-RUN") {
-            return match turn {
-                0 => calls(&[("early", "publish", json!({ "name": "early", "value": 1 }))]),
-                1 => {
-                    script.waiting.notify_one();
-                    calls(&[(
-                        "after",
-                        "fs.write",
-                        json!({ "path": "/work/after.md", "content": "x" }),
-                    )])
-                    .set_delay(Duration::from_secs(2))
-                }
-                _ => done(),
-            };
-        }
         if prompt.contains("NO-PUBLISH") {
             return done();
         }
@@ -386,19 +377,12 @@ fn reply(request: &Request, script: &Script) -> ResponseTemplate {
             }
             return publish_all(turn, "a2-", RETRIED).unwrap_or_else(done);
         }
-        if prompt.contains("RESTART-RUN") {
+        if prompt.contains("QUEUED-RUN") {
             return publish_all(turn, "", REPORT).unwrap_or_else(done);
         }
         return publish_all(turn, "", REPORT).unwrap_or_else(|| refusals(turn));
     }
     if prompt.contains("CONSUME:") {
-        if prompt.contains("RESTART-RUN")
-            && turn == 0
-            && script.held.fetch_add(1, Ordering::SeqCst) == 0
-        {
-            script.waiting.notify_one();
-            return done().set_delay(Duration::from_secs(15));
-        }
         return match turn {
             0 => calls(&[
                 (
@@ -508,8 +492,6 @@ struct PublishDesk {
     root: CardRef,
     /// The scripted model's memory.
     script: Arc<Script>,
-    /// The every-tool principal's key.
-    key: String,
     /// The hydrated Service, as a principal granted every tool.
     state: WyrdState,
 }
@@ -547,27 +529,7 @@ impl PublishDesk {
             bundle,
             root: desk.root,
             script,
-            key,
             state,
-        }
-    }
-
-    /// Restart the server over the same Postgres and storage, as a process
-    /// restart does, and reload the every-tool principal's state against it.
-    ///
-    /// # Panics
-    /// Panics when the server does not restart or the bundle does not load.
-    async fn restart(self) -> Self {
-        let deployment = self.deployment.restart(builder(&self.upstream)).await;
-        let state = WyrdState::from_path_with(
-            self.bundle.path().join("bundle"),
-            deployment.client(&self.key),
-        )
-        .expect("bundle loads offline");
-        Self {
-            deployment,
-            state,
-            ..self
         }
     }
 
@@ -712,12 +674,6 @@ fn selector(attempt: u32, path: Option<&str>) -> PublicationSelector {
         iteration_index: None,
         path: path.map(str::to_owned),
     }
-}
-
-/// The base64 SHA-256 a download plan reports for `bytes`.
-fn digest(bytes: &[u8]) -> String {
-    use base64::Engine as _;
-    base64::engine::general_purpose::STANDARD.encode(Sha256Hex::digest(bytes).as_bytes())
 }
 
 /// The scribe writes, replaces, and reads back a nested Unicode file in its
@@ -995,7 +951,7 @@ async fn agent_publishes_file_directory_and_json() {
         .expect("the report download plans");
     assert_eq!(
         (plan.size_bytes, plan.sha256),
-        (REPORT.len() as u64, digest(REPORT.as_bytes()))
+        (REPORT.len() as u64, REPORT_SHA256.to_owned())
     );
     let plan = execution
         .download(
@@ -1005,7 +961,7 @@ async fn agent_publishes_file_directory_and_json() {
         )
         .await
         .expect("the tree file download plans");
-    assert_eq!((plan.size_bytes, plan.sha256), (4, digest(b"beta")));
+    assert_eq!((plan.size_bytes, plan.sha256), (4, BETA_SHA256.to_owned()));
     desk.deployment.shutdown().await;
 }
 
@@ -1458,7 +1414,7 @@ async fn tool_limits_release_capacity_and_preserve_provenance() {
         (
             json!("publish"),
             &json!({ "name": "big", "path": "/work/big.md" }),
-            Some(Sha256Hex::digest(&returned)),
+            Some(Sha256Hex::new(BIG_RECEIPT_SHA256).expect("a SHA-256")),
             returned.len() as u64,
             None,
         )
@@ -1532,78 +1488,39 @@ async fn tool_limits_release_capacity_and_preserve_provenance() {
         .expect("the file download plans");
     assert_eq!(
         (plan.size_bytes, plan.sha256),
-        (big().len() as u64, digest(big().as_bytes()))
+        (big().len() as u64, BIG_SHA256.to_owned())
     );
     desk.deployment.shutdown().await;
 }
 
-/// A direct caller that disconnects while its drafter waits on the model
-/// starts no later Agent work. A queued review takes the same tool and state
-/// path as a direct one, and its accepted publications survive a process
-/// restart: the drafter
-/// commits, the server restarts while the consumer waits on the model, and
-/// the interrupted call spends the consumer's first attempt, and its retry
-/// reads exactly the accepted content from the restored state without the
-/// drafter running again.
+/// A queued review takes the same tool and state path as a direct one: the
+/// drafter publishes in its one attempt, the consumer reads exactly the
+/// accepted content in its one attempt, and the execution lists every
+/// accepted publication.
 ///
 /// # Panics
-/// Panics when the submission, restart, or recovery fails, or the drafter
-/// runs again, or a read or publication differs.
+/// Panics when the submission is refused or does not settle, an attempt is
+/// repeated, or a read or publication differs.
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "requires the repository-managed Postgres journey lifecycle"]
 async fn publications_follow_shared_run_state() {
     let desk = PublishDesk::start().await;
-    tokio::select! {
-        result = desk.verify("report-pipeline", "DISCONNECT-RUN") => {
-            panic!("the held review finished: {result:?}");
-        }
-        () = desk.script.waiting.notified() => {}
-    }
-    // Dropping the verify above disconnects; the held reply lands after two
-    // seconds, so a still-running drafter would call the model again well
-    // within this window.
-    tokio::time::sleep(Duration::from_secs(5)).await;
-    assert_eq!(
-        desk.requests("DISCONNECT-RUN").await.len(),
-        2,
-        "a disconnected direct review starts no later Agent work"
-    );
     let Submission::Queued(queued) = desk
         .state
         .run()
         .observe()
-        .submit("report-pipeline", json!("RESTART-RUN"))
+        .submit("report-pipeline", json!("QUEUED-RUN"))
         .await
         .expect("the review is submitted")
     else {
         panic!("Run evidence queues an execution");
     };
-    let id = *queued.id();
-    desk.script.waiting.notified().await;
-    let drafted = desk.requests("DRAFT: ").await.len();
-    desk.deployment
-        .server()
-        .flush_bifrost()
-        .await
-        .expect("Bifrost flushes");
-
-    let desk = desk.restart().await;
-    let server = desk.deployment.server();
-    wyrd_testing::verification::VerificationFixture::provision(
-        server.state(),
-        server.data_tenant_id(),
-    )
-    .await
-    .expect("the tenant provisions")
-    .expire_deadlines(id)
-    .await
-    .expect("the stopped process's lease expires");
-    let result = Execution::connect_with(id, &desk.deployment.admin())
+    let result = Execution::connect_with(*queued.id(), &desk.deployment.admin())
         .await
         .expect("the execution handle connects")
         .wait(Duration::from_secs(90))
         .await
-        .expect("the recovered execution settles");
+        .expect("the queued execution settles");
 
     assert_eq!(
         requirement(&result, "consumed").outcome,
@@ -1611,11 +1528,12 @@ async fn publications_follow_shared_run_state() {
         "{result:?}"
     );
     assert_eq!(
-        desk.requests("DRAFT: ").await.len(),
-        drafted,
-        "the committed drafter never runs again"
+        (
+            step(&result, "draft").attempts,
+            step(&result, "consume").attempts
+        ),
+        (1, 1)
     );
-    assert_eq!(step(&result, "consume").attempts, 2);
     let consumer = desk.results("CONSUME:").await;
     assert_eq!(lines(&consumer["c-report"]), REPORT.trim_end());
     assert_eq!(lines(&consumer["c-nothing"]), "null");

@@ -3311,6 +3311,24 @@ impl ScribeMemoryLease {
         Ok(())
     }
 
+    /// Resizes maintenance ownership through the same root transaction.
+    ///
+    /// Maintenance work such as claim assembly holds one lease per workspace
+    /// and settles it to that workspace's current bytes, so growth is refused
+    /// by the shared cap exactly as a fresh maintenance reservation would be.
+    ///
+    /// # Errors
+    ///
+    /// Returns the stable Scribe busy projection when the shared cap cannot
+    /// cover growth, or the internal projection on accounting poison.
+    pub(crate) fn resize_maintenance(
+        &mut self,
+        bytes: usize,
+    ) -> Result<(), crate::contracts::ScribeError> {
+        self.resize_with_limit(bytes, None)
+            .map_err(scribe_resource_error)
+    }
+
     /// Resizes ingress ownership through the same root transaction.
     ///
     /// # Errors

@@ -27,8 +27,11 @@ use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 use wyrd_spec::vala::SUB_PRINCIPAL_ID;
 
 use crate::contracts::ScribeError;
+use crate::resources::ScribeResources;
 use crate::scribe::assembly::StagingClaimId;
 use crate::scribe::claim_assembly::MERGE_BATCH_ROWS;
+use crate::scribe::claim_merge::shaped_batch_rows;
+use crate::scribe::memory::{MemoryCategory, retained_arrow_bytes};
 
 /// One claim's runs and the seed that makes its Variant sample reproducible.
 pub struct ClaimVariantSample<'a> {
@@ -62,8 +65,9 @@ impl<'a> ClaimVariantSample<'a> {
     ///
     /// Returns [`ScribeError::Internal`] when a run cannot be opened or decoded,
     /// a `sub_principal_id` is null or not a string, or a Variant column cannot be
-    /// sampled.
-    pub fn layout(&self) -> Result<VariantLayout, ScribeError> {
+    /// sampled, and [`ScribeError::IngestBusy`] when `memory` cannot hold a
+    /// decoded batch.
+    pub fn layout(&self, memory: &ScribeResources) -> Result<VariantLayout, ScribeError> {
         let policy = crate::parquet::BIFROST_VARIANT_SHREDDING;
         if VariantSampler::new(self.schema, policy, self.seed, &[]).is_inert() {
             return Ok(VariantLayout::default());
@@ -75,7 +79,7 @@ impl<'a> ClaimVariantSample<'a> {
             .map(|_| SUB_PRINCIPAL_ID);
         let mut strata: HashMap<String, usize> = HashMap::new();
         let mut stratum_rows: Vec<usize> = Vec::new();
-        self.scan(principal.as_slice(), |batch| {
+        self.scan(memory, principal.as_slice(), |batch| {
             match principal {
                 Some(column) => {
                     for value in &principals(batch, column)? {
@@ -99,7 +103,7 @@ impl<'a> ClaimVariantSample<'a> {
         let mut columns: Vec<String> = sampler.column_names().map(str::to_owned).collect();
         columns.extend(principal.map(str::to_owned));
         let mut position = 0_u64;
-        self.scan(&columns, |batch| {
+        self.scan(memory, &columns, |batch| {
             let rows = match principal {
                 Some(column) => principals(batch, column)?
                     .iter()
@@ -120,20 +124,33 @@ impl<'a> ClaimVariantSample<'a> {
 
     /// Reads `columns` of every run in claim order and visits each batch in its physical layout.
     ///
+    /// Each batch's footer-shaped estimate is reserved from `memory` twice
+    /// over before it is decoded — the sampler reconstructs its chosen rows
+    /// beside the batch — and held until the next batch replaces it.
+    ///
     /// # Errors
     ///
     /// Returns [`ScribeError::Internal`] when a run cannot be opened or
-    /// decoded, or any error `visit` returns.
+    /// decoded, [`ScribeError::IngestBusy`] when a batch's reservation cannot
+    /// be granted, or any error `visit` returns.
     fn scan(
         &self,
+        memory: &ScribeResources,
         columns: &[impl AsRef<str>],
         mut visit: impl FnMut(&RecordBatch) -> Result<(), ScribeError>,
     ) -> Result<(), ScribeError> {
+        let mut lease = memory.try_reserve_maintenance(MemoryCategory::Persistence, 0)?;
         for run in self.runs {
-            for batch in self.run_reader(run, columns)? {
+            let (mut reader, workspace) = self.run_reader(run, columns)?;
+            loop {
+                lease.resize_maintenance(workspace)?;
+                let Some(batch) = reader.next() else {
+                    break;
+                };
                 let batch = batch.map_err(|error| ScribeError::Internal {
                     detail: format!("decode the staged run for Variant sampling: {error}"),
                 })?;
+                lease.resize_maintenance(workspace.max(retained_arrow_bytes(&batch)))?;
                 visit(&batch)?;
             }
         }
@@ -144,7 +161,9 @@ impl<'a> ClaimVariantSample<'a> {
     ///
     /// Shredding rewrites a column's storage but never adds or reorders
     /// top-level fields, so each logical field is one Parquet root column at
-    /// the same index in every run, shredded or not.
+    /// the same index in every run, shredded or not. Batches are shaped by the
+    /// projected columns' footer width; the returned workspace is the bytes
+    /// one batch and its sampled reconstruction may hold.
     ///
     /// # Errors
     ///
@@ -154,7 +173,13 @@ impl<'a> ClaimVariantSample<'a> {
         &self,
         run: &Path,
         columns: &[impl AsRef<str>],
-    ) -> Result<parquet::arrow::arrow_reader::ParquetRecordBatchReader, ScribeError> {
+    ) -> Result<
+        (
+            parquet::arrow::arrow_reader::ParquetRecordBatchReader,
+            usize,
+        ),
+        ScribeError,
+    > {
         let file = std::fs::File::open(run).map_err(|error| ScribeError::Internal {
             detail: format!("open the staged run for Variant sampling: {error}"),
         })?;
@@ -163,17 +188,24 @@ impl<'a> ClaimVariantSample<'a> {
                 detail: format!("build the staged run Variant sampling reader: {error}"),
             }
         })?;
-        let roots = columns
+        let roots: Vec<usize> = columns
             .iter()
-            .filter_map(|name| self.schema.index_of(name.as_ref()).ok());
+            .filter_map(|name| self.schema.index_of(name.as_ref()).ok())
+            .collect();
+        let (batch_rows, row_bytes) =
+            shaped_batch_rows(builder.metadata(), Some(&roots), MERGE_BATCH_ROWS);
         let mask = ProjectionMask::roots(builder.parquet_schema(), roots);
-        builder
+        let reader = builder
             .with_projection(mask)
-            .with_batch_size(MERGE_BATCH_ROWS)
+            .with_batch_size(batch_rows)
             .build()
             .map_err(|error| ScribeError::Internal {
                 detail: format!("start the staged run Variant sampling read: {error}"),
-            })
+            })?;
+        Ok((
+            reader,
+            batch_rows.saturating_mul(row_bytes).saturating_mul(2),
+        ))
     }
 }
 
@@ -262,7 +294,7 @@ mod tests {
         let schema = sample_schema();
         let claim = StagingClaimId::from_hex(&"2a".repeat(32)).expect("claim id");
         let layout = ClaimVariantSample::new(claim, runs, &schema)
-            .layout()
+            .layout(&ScribeResources::for_test())
             .expect("claim sample");
         let physical = layout.physical_schema(&schema).expect("physical schema");
         let DataType::Struct(storage) = physical.field_with_name("v").expect("v").data_type()
@@ -333,7 +365,7 @@ mod tests {
         let claim = StagingClaimId::from_hex(&"2a".repeat(32)).expect("claim id");
         let missing = [PathBuf::from("/nonexistent/run.parquet")];
         let layout = ClaimVariantSample::new(claim, &missing, &schema)
-            .layout()
+            .layout(&ScribeResources::for_test())
             .expect("no run is opened");
         assert_eq!(layout, VariantLayout::default());
     }

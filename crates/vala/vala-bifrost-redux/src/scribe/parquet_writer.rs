@@ -622,6 +622,8 @@ struct RollingArtifactWriter<'a> {
     row_group_stats: Vec<RowGroupStats>,
     /// Variant layout every artifact is opened with, chosen before the writer opens.
     variants: VariantPlan,
+    /// Persistence reservation for the open artifact's buffered row group.
+    buffered: Option<crate::resources::ScribeMemoryLease>,
 }
 
 /// The Variant layout a rolling writer opens every artifact with.
@@ -667,15 +669,19 @@ impl<'a> RollingArtifactWriter<'a> {
             artifacts: Vec::new(),
             row_group_stats: Vec::new(),
             variants,
+            buffered: None,
         }
     }
 
     /// Charges one materialized batch's retained bytes while it is held.
     ///
     /// The batch is a Wyrd-owned copy (sorted candidate or merge output), so it
-    /// holds a Scribe lease for exactly its distinct allocations and no more;
-    /// nothing is admitted for encoder or footer bytes it may later need. The
-    /// lease lasts while the encoder writes the batch.
+    /// holds a Scribe lease for exactly its distinct allocations while the
+    /// encoder writes it. The open artifact's buffered row group is charged
+    /// too: before the write its reservation grows by the batch's bytes —
+    /// the encoder's copy, or the shredded copy it encodes — and afterwards it
+    /// settles to the encoder's reported buffer, reaching zero once the
+    /// artifact seals.
     ///
     /// # Errors
     ///
@@ -687,11 +693,31 @@ impl<'a> RollingArtifactWriter<'a> {
         memory: &crate::resources::ScribeResources,
         batch: &RecordBatch,
     ) -> Result<(), ScribeError> {
-        let _held = memory.try_reserve_maintenance(
-            crate::scribe::memory::MemoryCategory::Persistence,
-            crate::scribe::memory::retained_arrow_bytes(batch),
-        )?;
-        self.append_ordered_batch(batch)
+        let bytes = crate::scribe::memory::retained_arrow_bytes(batch);
+        let _held = memory
+            .try_reserve_maintenance(crate::scribe::memory::MemoryCategory::Persistence, bytes)?;
+        let buffered = self
+            .open
+            .as_ref()
+            .map_or(0, |open| open.writer.memory_size());
+        let lease =
+            match self.buffered.as_mut() {
+                Some(lease) => lease,
+                None => self.buffered.insert(memory.try_reserve_maintenance(
+                    crate::scribe::memory::MemoryCategory::Persistence,
+                    0,
+                )?),
+            };
+        lease.resize_maintenance(buffered.saturating_add(bytes))?;
+        self.append_ordered_batch(batch)?;
+        let buffered = self
+            .open
+            .as_ref()
+            .map_or(0, |open| open.writer.memory_size());
+        if let Some(lease) = self.buffered.as_mut() {
+            lease.resize_maintenance(buffered)?;
+        }
+        Ok(())
     }
 
     /// Writes one already ordered batch and rolls if the object target is met.
@@ -3132,7 +3158,7 @@ mod tests {
             crate::scribe::assembly::StagingClaimId::from_hex(&"07".repeat(32)).expect("claim id");
         let variant_layout =
             crate::scribe::claim_sample::ClaimVariantSample::new(claim, runs, &schema)
-                .layout()
+                .layout(&crate::resources::ScribeResources::for_test())
                 .expect("claim sample");
         let layout = crate::tables::hourly_test_layout(schema.as_ref());
         encode_ordered_claim(
@@ -3281,7 +3307,7 @@ mod tests {
             std::slice::from_ref(&a_only_run),
             &schema,
         )
-        .layout()
+        .layout(&crate::resources::ScribeResources::for_test())
         .expect("a-only layout");
         assert!(!a_only.is_unshredded(), "the a-only sample shreds `a`");
 
@@ -3304,7 +3330,7 @@ mod tests {
         assert_eq!(values, [r#"{"a":3,"b":"x"}"#, r#"{"b":"y"}"#]);
 
         let fresh = crate::scribe::claim_sample::ClaimVariantSample::new(claim, &runs, &schema)
-            .layout()
+            .layout(&crate::resources::ScribeResources::for_test())
             .expect("claim sample over mixed layouts");
         let layout = crate::tables::hourly_test_layout(schema.as_ref());
         let merge = crate::scribe::claim_merge::StagedRunMerge::open(
@@ -3314,6 +3340,7 @@ mod tests {
             tenant,
             &layout,
             1,
+            &crate::resources::ScribeResources::for_test(),
         )
         .expect("a layout difference merges after logical and tenant checks");
         let claim_scratch = tempfile::tempdir().expect("claim scratch");
@@ -3348,6 +3375,7 @@ mod tests {
             DataTenantId::new_v7(),
             &layout,
             1,
+            &crate::resources::ScribeResources::for_test(),
         )
         .expect_err("another tenant's shredded run is refused");
         assert!(
@@ -3472,7 +3500,7 @@ mod tests {
     /// The layout the reuse claim's sample selects over `runs`.
     fn sampled_layout(runs: &[PathBuf], logical: &Arc<Schema>) -> VariantLayout {
         crate::scribe::claim_sample::ClaimVariantSample::new(reuse_claim(), runs, logical)
-            .layout()
+            .layout(&crate::resources::ScribeResources::for_test())
             .expect("claim sample")
     }
 
@@ -3484,8 +3512,28 @@ mod tests {
         scratch: &Path,
         tenant: DataTenantId,
     ) -> (BoundedParquetArtifactSet, VariantLayout, usize) {
+        try_assemble_reuse_claim(
+            runs,
+            logical,
+            scratch,
+            tenant,
+            &crate::resources::ScribeResources::for_test(),
+        )
+        .expect("claim assembles")
+    }
+
+    /// [`assemble_reuse_claim`] charging the sample, merge and writer to `memory`.
+    fn try_assemble_reuse_claim(
+        runs: &[PathBuf],
+        logical: &Arc<Schema>,
+        scratch: &Path,
+        tenant: DataTenantId,
+        memory: &crate::resources::ScribeResources,
+    ) -> Result<(BoundedParquetArtifactSet, VariantLayout, usize), ScribeError> {
         std::fs::create_dir_all(scratch).expect("claim scratch");
-        let variant_layout = sampled_layout(runs, logical);
+        let variant_layout =
+            crate::scribe::claim_sample::ClaimVariantSample::new(reuse_claim(), runs, logical)
+                .layout(memory)?;
         let sort_layout = crate::tables::hourly_test_layout(logical.as_ref());
         let mut merge = crate::scribe::claim_merge::StagedRunMerge::open(
             runs,
@@ -3493,18 +3541,17 @@ mod tests {
             variant_layout.clone(),
             tenant,
             &sort_layout,
-            1_000,
-        )
-        .expect("claim merge opens");
+            crate::scribe::claim_assembly::MERGE_BATCH_ROWS,
+            memory,
+        )?;
         let (artifacts, _) = encode_ordered_claim(
             claim_plan(scratch, &sort_layout, tenant),
-            &crate::resources::ScribeResources::for_test(),
+            memory,
             variant_layout.clone(),
             Arc::clone(logical),
             &mut merge,
-        )
-        .expect("claim encodes");
-        (artifacts, variant_layout, merge.converted_rows())
+        )?;
+        Ok((artifacts, variant_layout, merge.converted_rows()))
     }
 
     /// The field names `layout` shreds in column `v` of `logical`.
@@ -3521,6 +3568,130 @@ mod tests {
             Some(DataType::Struct(fields)) => fields.iter().map(|f| f.name().clone()).collect(),
             _ => Vec::new(),
         }
+    }
+
+    /// A claim of wide rows converting one run holds only what it reserves.
+    ///
+    /// Two runs of 64 KiB payload rows, one staged in the claim's layout and
+    /// one in another, are sampled, merged and encoded under a 40 MiB root.
+    /// Every decoded, converted and buffered batch is byte-shaped and
+    /// reserved before it is built, so the claim fits; 4 MiB of headroom
+    /// refuses it as busy without leaking a reservation, and two claims run
+    /// concurrently under one root both finish and release everything.
+    #[test]
+    fn claim_conversion_overlap_stays_within_reserved_bytes() {
+        let tenant = DataTenantId::new_v7();
+        let scratch = tempfile::tempdir().expect("claim scratch");
+        let root = scratch.path();
+        let payload = "x".repeat(64 * 1024);
+        let wide = |offset: usize| {
+            (offset..offset + 320)
+                .map(|row| format!(r#"{{"a":{row},"p":"{payload}"}}"#))
+                .collect::<Vec<_>>()
+        };
+        let first = reuse_run(0, &wide(0));
+        let second = reuse_run(160, &wide(320));
+        let schema = first.schema();
+        let selected = sampled_layout(
+            &[
+                physical_run(&first, &schema, &root.join("cold-0"), tenant),
+                physical_run(&second, &schema, &root.join("cold-1"), tenant),
+            ],
+            &schema,
+        );
+        let other = sampled_layout(
+            &[physical_run(
+                &variant_run(1, &[r#"{"a":1}"#; 64]),
+                &schema,
+                &root.join("a-only"),
+                tenant,
+            )],
+            &schema,
+        );
+        assert_ne!(selected, other);
+        let runs = vec![
+            physical_run(
+                &selected.shred(&first).expect("selected layout"),
+                &schema,
+                &root.join("matching"),
+                tenant,
+            ),
+            physical_run(
+                &other.shred(&second).expect("other layout"),
+                &schema,
+                &root.join("converting"),
+                tenant,
+            ),
+        ];
+        let resources = |limit: usize| {
+            crate::resources::BifrostRuntimeResources::composed_for_test(
+                limit,
+                512 * 1024 * 1024,
+                [crate::resources::BifrostRole::Scribe],
+            )
+            .scribe()
+            .expect("Scribe capability")
+        };
+        let used = |memory: &crate::resources::ScribeResources| {
+            memory.memory_snapshot().scribe_total_bytes
+        };
+
+        let memory = resources(40 * 1024 * 1024);
+        let baseline = used(&memory);
+        let (artifacts, layout, converted) =
+            try_assemble_reuse_claim(&runs, &schema, &root.join("fits"), tenant, &memory)
+                .expect("a byte-shaped claim fits its reservation");
+        assert_eq!(layout, selected);
+        assert_eq!(converted, 320, "only the converting run is converted");
+        assert_eq!(
+            artifacts
+                .iter()
+                .map(|artifact| artifact.row_count)
+                .sum::<usize>(),
+            640
+        );
+        assert_eq!(used(&memory), baseline, "a finished claim holds nothing");
+
+        let occupied = memory
+            .try_reserve_maintenance(
+                crate::scribe::memory::MemoryCategory::Persistence,
+                36 * 1024 * 1024,
+            )
+            .expect("another owner occupies the root");
+        let refusal =
+            try_assemble_reuse_claim(&runs, &schema, &root.join("tight"), tenant, &memory)
+                .expect_err("headroom smaller than one batch refuses the claim");
+        assert!(
+            matches!(refusal, ScribeError::IngestBusy { .. }),
+            "the refusal is retryable: {refusal}"
+        );
+        drop(occupied);
+        assert_eq!(used(&memory), baseline, "a refused claim holds nothing");
+
+        let shared = resources(80 * 1024 * 1024);
+        let baseline = used(&shared);
+        std::thread::scope(|scope| {
+            let claims: Vec<_> = ["concurrent-0", "concurrent-1"]
+                .into_iter()
+                .map(|name| {
+                    let (runs, schema, shared) = (&runs, &schema, &shared);
+                    scope.spawn(move || {
+                        try_assemble_reuse_claim(runs, schema, &root.join(name), tenant, shared)
+                    })
+                })
+                .collect();
+            for claim in claims {
+                claim
+                    .join()
+                    .expect("claim thread")
+                    .expect("concurrent claims fit one root");
+            }
+        });
+        assert_eq!(
+            used(&shared),
+            baseline,
+            "concurrent claims release everything"
+        );
     }
 
     /// The claim sample reconstructs only the observations it keeps.

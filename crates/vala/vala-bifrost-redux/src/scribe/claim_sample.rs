@@ -7,10 +7,11 @@
 //! the fork's [`VariantSampler`], which keeps a row when its seeded hash falls
 //! under its stratum's Cochran rate. Only counters are held, never rows.
 //!
-//! A run may already be shredded with its generation's layout. Its Variant
-//! columns are reconstructed to complete logical values before they are
-//! offered, so a key that layout left in the residual is counted exactly like
-//! a key it shredded, and the claim's fresh layout can choose it.
+//! A run may already be shredded with its generation's layout. Its physical
+//! batches are offered as decoded: the sampler reconstructs complete logical
+//! values only for the rows it keeps, so a key that layout left in the residual
+//! is counted exactly like a key it shredded, the claim's fresh layout can
+//! choose it, and unsampled rows are never reconstructed.
 //!
 //! The seed is the claim identity and a row's position is its position across
 //! the runs in claim order, so a re-run claim picks the same sample.
@@ -117,12 +118,12 @@ impl<'a> ClaimVariantSample<'a> {
         Ok(sampler.layout())
     }
 
-    /// Reads `columns` of every run in claim order and visits each batch in the logical schema.
+    /// Reads `columns` of every run in claim order and visits each batch in its physical layout.
     ///
     /// # Errors
     ///
-    /// Returns [`ScribeError::Internal`] when a run cannot be opened, decoded,
-    /// or reconstructed to the logical schema, or any error `visit` returns.
+    /// Returns [`ScribeError::Internal`] when a run cannot be opened or
+    /// decoded, or any error `visit` returns.
     fn scan(
         &self,
         columns: &[impl AsRef<str>],
@@ -133,14 +134,6 @@ impl<'a> ClaimVariantSample<'a> {
                 let batch = batch.map_err(|error| ScribeError::Internal {
                     detail: format!("decode the staged run for Variant sampling: {error}"),
                 })?;
-                let batch =
-                    crate::schema::logical_batch(&batch, self.schema).map_err(|detail| {
-                        ScribeError::Internal {
-                            detail: format!(
-                                "reconstruct a staged run for Variant sampling: {detail}"
-                            ),
-                        }
-                    })?;
                 visit(&batch)?;
             }
         }

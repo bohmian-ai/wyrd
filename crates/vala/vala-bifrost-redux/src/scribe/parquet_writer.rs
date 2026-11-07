@@ -3338,6 +3338,165 @@ mod tests {
         );
     }
 
+    /// The claim sample reconstructs only the observations it keeps.
+    ///
+    /// A learned run shreds `a`, so `b`, a nested list, mixed `a` types, null
+    /// Variants and JSON nulls live in its residual. Every row the claim's
+    /// seeded sample does not keep has its residual bytes replaced with an
+    /// invalid Variant, so reconstructing any unsampled row fails. The learned
+    /// run must still sample to exactly the layout the same rows sample to
+    /// cold, which includes the residual-only `b`.
+    #[test]
+    fn claim_sampling_reconstructs_only_selected_observations() {
+        use iceberg::writer::file_writer::variant_shredding::VariantSampler;
+
+        let tenant = DataTenantId::new_v7();
+        let claim =
+            crate::scribe::assembly::StagingClaimId::from_hex(&"07".repeat(32)).expect("claim id");
+        let documents: Vec<String> = (0..20_000)
+            .map(|row| match row % 5 {
+                0 => format!(r#"{{"a":{row},"b":"x{row}"}}"#),
+                1 => format!(r#"{{"a":{row},"c":{{"d":[1,{row}]}},"b":"y"}}"#),
+                2 => r#"{"a":"text","b":null}"#.to_owned(),
+                3 => "null".to_owned(),
+                _ => format!(r#"[{row},{{"b":1}}]"#),
+            })
+            .collect();
+        let json: Vec<&str> = documents.iter().map(String::as_str).collect();
+        let logical = variant_run(1, &json);
+        let schema = logical.schema();
+        let rows = logical.num_rows();
+
+        let mut seed = [0_u8; 8];
+        seed.copy_from_slice(&claim.as_bytes()[..8]);
+        let mut probe = VariantSampler::new(
+            &schema,
+            crate::parquet::BIFROST_VARIANT_SHREDDING,
+            u64::from_le_bytes(seed),
+            &[rows],
+        );
+        let kept: Vec<bool> = (0..rows)
+            .map(|row| {
+                let before = probe.sampled_rows();
+                probe
+                    .offer(&logical.slice(row, 1), &[0], row as u64)
+                    .expect("probe offer");
+                probe.sampled_rows() > before
+            })
+            .collect();
+        let sampled = kept.iter().filter(|kept| **kept).count();
+        assert!(
+            sampled > 0 && sampled < rows / 2,
+            "the sample keeps {sampled} of {rows} rows"
+        );
+
+        let scratch = tempfile::tempdir().expect("run scratch");
+        let cold_dir = scratch.path().join("cold");
+        std::fs::create_dir_all(&cold_dir).expect("cold scratch");
+        let cold_run = staged_run(&logical, VariantLayout::default(), &cold_dir, tenant);
+        let cold = crate::scribe::claim_sample::ClaimVariantSample::new(
+            claim,
+            std::slice::from_ref(&cold_run),
+            &schema,
+        )
+        .layout()
+        .expect("cold sample");
+
+        let a_only_json = [r#"{"a":1}"#; 64];
+        let a_only_dir = scratch.path().join("a-only");
+        std::fs::create_dir_all(&a_only_dir).expect("a-only scratch");
+        let a_only_run = staged_run(
+            &variant_run(1, &a_only_json),
+            VariantLayout::default(),
+            &a_only_dir,
+            tenant,
+        );
+        let learned = crate::scribe::claim_sample::ClaimVariantSample::new(
+            claim,
+            std::slice::from_ref(&a_only_run),
+            &schema,
+        )
+        .layout()
+        .expect("a-only layout");
+        let physical = learned.shred(&logical).expect("learned layout");
+        let column = physical.column_by_name("v").expect("variant column");
+        let storage = column.as_struct();
+        let residual = storage.column_by_name("value").expect("residual value");
+        let residual_type = residual.data_type().clone();
+        let residual = arrow::compute::cast(residual, &DataType::Binary).expect("residual bytes");
+        let residual = residual.as_binary::<i32>();
+        const INVALID_VARIANT: &[u8] = &[0xFF];
+        let poisoned: arrow::array::BinaryArray = (0..rows)
+            .map(|row| {
+                residual.is_valid(row).then(|| {
+                    if kept[row] {
+                        residual.value(row)
+                    } else {
+                        INVALID_VARIANT
+                    }
+                })
+            })
+            .collect();
+        let poisoned_storage = arrow::array::StructArray::new(
+            storage.fields().clone(),
+            storage
+                .fields()
+                .iter()
+                .zip(storage.columns())
+                .map(|(field, child)| {
+                    if field.name() == "value" {
+                        arrow::compute::cast(&poisoned, &residual_type).expect("residual type")
+                    } else {
+                        Arc::clone(child)
+                    }
+                })
+                .collect(),
+            storage.nulls().cloned(),
+        );
+        let mut columns = physical.columns().to_vec();
+        columns[physical.schema().index_of("v").expect("v")] = Arc::new(poisoned_storage);
+        let poisoned = RecordBatch::try_new(physical.schema(), columns).expect("poisoned run");
+        assert!(
+            crate::schema::logical_batch(&poisoned, &schema).is_err(),
+            "reconstructing an unsampled row fails"
+        );
+
+        let learned_dir = scratch.path().join("learned");
+        std::fs::create_dir_all(&learned_dir).expect("learned scratch");
+        let sort_layout = crate::tables::hourly_test_layout(schema.as_ref());
+        let mut writer = RollingArtifactWriter::new(
+            claim_plan(&learned_dir, &sort_layout, tenant),
+            VariantPlan::Staged {
+                logical: Arc::clone(&schema),
+            },
+        );
+        writer.append_ordered_batch(&poisoned).expect("learned run");
+        let (artifacts, _) = writer.finish().expect("learned run seals");
+        let warm = crate::scribe::claim_sample::ClaimVariantSample::new(
+            claim,
+            std::slice::from_ref(&artifacts[0].scratch_path),
+            &schema,
+        )
+        .layout()
+        .expect("the learned sample reconstructs only kept rows");
+        assert_eq!(warm, cold, "learned and cold runs sample the same layout");
+        let physical = cold.physical_schema(&schema).expect("cold layout");
+        let DataType::Struct(storage) = physical.field_with_name("v").expect("v").data_type()
+        else {
+            panic!("variant storage");
+        };
+        let Some((_, typed)) = storage.find("typed_value") else {
+            panic!("the claim shreds `v`");
+        };
+        let DataType::Struct(typed) = typed.data_type() else {
+            panic!("object shredding");
+        };
+        assert!(
+            typed.find("b").is_some(),
+            "a residual-only field is learned: {typed:?}"
+        );
+    }
+
     /// Row-group bounds are read from the table's own time column, and a
     /// nanosecond column narrows to the microsecond interval containing it.
     ///

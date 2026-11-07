@@ -1881,7 +1881,7 @@ async fn agent_publications_reach_a_recovered_consumer() {
     let consumed = &outcome.steps[1].tool_calls[0];
     assert_eq!(
         (
-            consumed.output_sha256.clone(),
+            consumed.output_sha256,
             consumed.returned_bytes,
             consumed.error.as_deref()
         ),

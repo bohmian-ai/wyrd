@@ -8,10 +8,11 @@
 //! under its stratum's Cochran rate. Only counters are held, never rows.
 //!
 //! A run may already be shredded with its generation's layout. Its physical
-//! batches are offered as decoded: the sampler reconstructs complete logical
-//! values only for the rows it keeps, so a key that layout left in the residual
-//! is counted exactly like a key it shredded, the claim's fresh layout can
-//! choose it, and unsampled rows are never reconstructed.
+//! batches are offered as decoded: the sampler reads the complete logical value
+//! of each row it keeps in place, typed leaves together with their residual,
+//! so a key that layout left in the residual is counted exactly like a key it
+//! shredded and the claim's fresh layout can choose it. No value is
+//! reconstructed or encoded to be sampled.
 //!
 //! The seed is the claim identity and a row's position is its position across
 //! the runs in claim order, so a re-run claim picks the same sample.
@@ -125,8 +126,8 @@ impl<'a> ClaimVariantSample<'a> {
     /// Reads `columns` of every run in claim order and visits each batch in its physical layout.
     ///
     /// Each batch's footer-shaped estimate is reserved from `memory` twice
-    /// over before it is decoded — the sampler reconstructs its chosen rows
-    /// beside the batch — and held until the next batch replaces it.
+    /// over before it is decoded, a bound covering the batch and the
+    /// sampler's work beside it, and held until the next batch replaces it.
     ///
     /// # Errors
     ///
@@ -162,8 +163,8 @@ impl<'a> ClaimVariantSample<'a> {
     /// Shredding rewrites a column's storage but never adds or reorders
     /// top-level fields, so each logical field is one Parquet root column at
     /// the same index in every run, shredded or not. Batches are shaped by the
-    /// projected columns' footer width; the returned workspace is the bytes
-    /// one batch and its sampled reconstruction may hold.
+    /// projected columns' footer width; the returned workspace is twice the
+    /// bytes one batch may hold.
     ///
     /// # Errors
     ///

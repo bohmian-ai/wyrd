@@ -486,10 +486,12 @@ at any depth before rows leave the scan.
   stratum's sampled non-null values hold it with one compatible type. The seed
   is the claim, so a re-run claim writes the same objects. Each element of a
   Variant inside a List counts as one observation, and one layout covers every
-  element. The sample holds counters, never rows. The sample reconstructs
-  only the selected observations — typed leaves plus residual, through the
-  recursive `unshred_variants` — so a key a staged run kept only in its
-  residual stays discoverable. Runs of different layouts merge only after
+  element. The sample holds counters, never rows. The sample inspects the
+  complete logical value of only the selected observations — typed leaves
+  together with their residual, read in place exactly as reconstruction would
+  produce them — so a key a staged run kept only in its residual stays
+  discoverable. Selected observations may be reconstructed at most; sampling
+  never needs to. Runs of different layouts merge only after
   their footers name the claim's logical schema and tenant; a run already in
   the claim's physical layout passes through without a Variant round trip,
   and only an incompatible run is reconstructed and reshredded. The sample,

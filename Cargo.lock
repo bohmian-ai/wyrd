@@ -4025,7 +4025,7 @@ dependencies = [
 [[package]]
 name = "iceberg"
 version = "0.10.0"
-source = "git+https://github.com/bohmian-ai/iceberg-rust?rev=2902554d1ea0b5d1d41dd8f45e2a02c83c0e56e7#2902554d1ea0b5d1d41dd8f45e2a02c83c0e56e7"
+source = "git+https://github.com/bohmian-ai/iceberg-rust?rev=e849bc4fa46430e6278a4c201106cdd68dc5b244#e849bc4fa46430e6278a4c201106cdd68dc5b244"
 dependencies = [
  "aes-gcm",
  "anyhow",
@@ -4084,7 +4084,7 @@ dependencies = [
 [[package]]
 name = "iceberg-catalog-sql"
 version = "0.10.0"
-source = "git+https://github.com/bohmian-ai/iceberg-rust?rev=2902554d1ea0b5d1d41dd8f45e2a02c83c0e56e7#2902554d1ea0b5d1d41dd8f45e2a02c83c0e56e7"
+source = "git+https://github.com/bohmian-ai/iceberg-rust?rev=e849bc4fa46430e6278a4c201106cdd68dc5b244#e849bc4fa46430e6278a4c201106cdd68dc5b244"
 dependencies = [
  "async-trait",
  "iceberg",
@@ -4095,7 +4095,7 @@ dependencies = [
 [[package]]
 name = "iceberg-compaction-core"
 version = "0.1.0"
-source = "git+https://github.com/bohmian-ai/iceberg-compaction?rev=ab3da17ae9e1fe198273531b5823daf07da0af3f#ab3da17ae9e1fe198273531b5823daf07da0af3f"
+source = "git+https://github.com/bohmian-ai/iceberg-compaction?rev=764fe2a8bbf2a8d1577ca27fec76751ac91c07ff#764fe2a8bbf2a8d1577ca27fec76751ac91c07ff"
 dependencies = [
  "async-stream",
  "async-trait",
@@ -4123,7 +4123,7 @@ dependencies = [
 [[package]]
 name = "iceberg-datafusion"
 version = "0.10.0"
-source = "git+https://github.com/bohmian-ai/iceberg-rust?rev=2902554d1ea0b5d1d41dd8f45e2a02c83c0e56e7#2902554d1ea0b5d1d41dd8f45e2a02c83c0e56e7"
+source = "git+https://github.com/bohmian-ai/iceberg-rust?rev=e849bc4fa46430e6278a4c201106cdd68dc5b244#e849bc4fa46430e6278a4c201106cdd68dc5b244"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -6322,7 +6322,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "03da047801ff44bb6a4d407d4860c05fd70bb81714e6b2f3812603d5b145b042"
 dependencies = [
  "heck",
- "itertools 0.14.0",
+ "itertools 0.10.5",
  "log",
  "multimap",
  "petgraph 0.8.3",
@@ -6343,7 +6343,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b570b25f7617e43d59005d0990ccb79e950a423952cea19671b7a876da390adf"
 dependencies = [
  "anyhow",
- "itertools 0.14.0",
+ "itertools 0.10.5",
  "proc-macro2",
  "quote",
  "syn 2.0.118",

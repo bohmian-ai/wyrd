@@ -20,10 +20,11 @@
 //! or `--allow-dirty` run's under `target/benchmarks/`), and exit 0 (VALID)
 //! or 2 (INVALID);
 //! a missed performance target is reported and never changes the exit.
-//! `--profile` adds optional samply captures, `--allow-dirty` records a
-//! dirty source, `--steps` selects declared steps, and `--smoke` runs the
-//! same plan at smoke scale under `target/benchmarks/smoke/`. A full run
-//! never runs a smoke first; `mise run bench:smoke` runs every level's smoke.
+//! `--profile` adds optional samply CPU captures and server heap profiles,
+//! `--allow-dirty` records a dirty source, `--steps` selects declared steps,
+//! and `--smoke` runs the same plan at smoke scale under
+//! `target/benchmarks/smoke/`. A full run never runs a smoke first;
+//! `mise run bench:smoke` runs every level's smoke.
 
 mod client_queue;
 mod flags;

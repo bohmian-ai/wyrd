@@ -32,7 +32,9 @@ use wyrd_sql::{MIGRATION_LEASE_WAIT, PoolConfig, SqlError, WyrdPostgres};
 static GLOBAL: CountingMiMalloc = CountingMiMalloc;
 
 /// mimalloc, plus the worker's live-byte count that enforces Monty's memory
-/// limits and a null check that ends a worker deliberately.
+/// limits and a null check that ends a worker deliberately. A `bench` build
+/// also reports each allocation and free to the heap sampler, which ignores
+/// them until a benchmark starts it.
 ///
 /// Counting starts in `main`, after the runtime's few pre-`main`
 /// allocations, so a free of one of those saturates the count at zero rather
@@ -56,12 +58,16 @@ unsafe impl GlobalAlloc for CountingMiMalloc {
         if ptr.is_null() {
             worker::refused(layout.size());
         }
+        #[cfg(feature = "bench")]
+        wyrd_server::heap_profile::allocated(ptr, layout.size());
         ptr
     }
 
     /// Refund `layout` to a worker's budget, then free it through mimalloc.
     unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
         worker::refund(layout.size());
+        #[cfg(feature = "bench")]
+        wyrd_server::heap_profile::freed(ptr);
         // SAFETY: `ptr` came from our `alloc`/`realloc` with this same `layout`.
         unsafe { MiMalloc.dealloc(ptr, layout) };
     }
@@ -74,6 +80,8 @@ unsafe impl GlobalAlloc for CountingMiMalloc {
         if ptr.is_null() {
             worker::refused(layout.size());
         }
+        #[cfg(feature = "bench")]
+        wyrd_server::heap_profile::allocated(ptr, layout.size());
         ptr
     }
 
@@ -84,12 +92,16 @@ unsafe impl GlobalAlloc for CountingMiMalloc {
             Some(growth) => worker::charge(growth),
             None => worker::refund(layout.size() - new_size),
         }
+        #[cfg(feature = "bench")]
+        wyrd_server::heap_profile::freed(ptr);
         // SAFETY: `ptr`/`layout` describe a live block from this allocator, and
         // `new_size` is the caller's — all forwarded unchanged.
         let new_ptr = unsafe { MiMalloc.realloc(ptr, layout, new_size) };
         if new_ptr.is_null() {
             worker::refused(new_size);
         }
+        #[cfg(feature = "bench")]
+        wyrd_server::heap_profile::allocated(new_ptr, new_size);
         new_ptr
     }
 }

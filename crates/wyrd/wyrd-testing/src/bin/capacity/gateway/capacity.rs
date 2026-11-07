@@ -645,6 +645,7 @@ impl Observed {
             processes: vec![PROCESS.to_owned()],
             server_cpu_seconds: usage.server_cpu_seconds,
             peak_memory_bytes: usage.peak_memory_bytes,
+            opening_memory_bytes: usage.opening_memory_bytes,
             memory_interval_ms: PEAK_SAMPLE_INTERVAL_MS,
             driver_cpu_seconds: usage.driver_cpu_seconds,
             arrivals: Some(Arrivals {
@@ -1116,6 +1117,10 @@ impl Workload for Capacity {
     /// The server's PID while it runs.
     fn processes(&self) -> Vec<u32> {
         self.server.iter().filter_map(LocalServer::pid).collect()
+    }
+
+    fn heap_profile_url(&self) -> Option<String> {
+        self.server.as_ref().map(LocalServer::heap_profile_url)
     }
 
     /// Runs `phase` of `step` over `window`.

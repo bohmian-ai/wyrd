@@ -294,6 +294,9 @@ pub struct Usage {
     /// Sampled peak server resident memory over the window, or `None` when
     /// it was never sampled.
     pub peak_memory_bytes: Option<u64>,
+    /// Server resident memory as the window opened, or `None` when it was
+    /// never sampled.
+    pub opening_memory_bytes: Option<u64>,
     /// CPU seconds this benchmark process used, to show the driver was not
     /// the bottleneck; `None` when unreadable.
     pub driver_cpu_seconds: Option<f64>,
@@ -392,13 +395,12 @@ impl Window {
         let seconds = stopped.duration_since(started).as_secs_f64();
         let drained = server.metrics().await?;
         let resources = resources.finish([server], seconds);
-        let (server_cpu_seconds, peak_memory_bytes) = resources
-            .first()
-            .map_or((None, None), |used| (used.cpu_seconds, used.peak_memory));
+        let used = resources.first();
         let usage = Usage {
             seconds,
-            server_cpu_seconds,
-            peak_memory_bytes,
+            server_cpu_seconds: used.and_then(|used| used.cpu_seconds),
+            peak_memory_bytes: used.and_then(|used| used.peak_memory),
+            opening_memory_bytes: used.and_then(|used| used.opening_memory),
             driver_cpu_seconds: driver,
             drain_seconds,
             telemetry: readings.since(&drained),
@@ -442,6 +444,9 @@ pub struct Resources {
     pub cores: Option<f64>,
     /// Sampled peak resident memory, bytes, or `None` when never sampled.
     pub peak_memory: Option<u64>,
+    /// Resident memory as the window opened, bytes, or `None` when never
+    /// sampled.
+    pub opening_memory: Option<u64>,
 }
 
 /// Server process CPU and sampled peak-memory readings at a window's start.
@@ -502,12 +507,14 @@ impl ResourceWindow {
                     }
                     _ => None,
                 };
+                let memory = sampler.and_then(|sampler| sampler.finish().ok());
                 Resources {
                     cpu_seconds,
                     cores: cpu_seconds
                         .filter(|_| window_seconds > 0.0)
                         .map(|cpu| cpu / window_seconds),
-                    peak_memory: sampler.and_then(|sampler| sampler.finish().ok()),
+                    peak_memory: memory.map(|memory| memory.peak),
+                    opening_memory: memory.map(|memory| memory.opening),
                 }
             })
             .collect()

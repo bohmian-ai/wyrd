@@ -372,16 +372,46 @@ pub const BENCHMARK_TIMINGS_PATH: &str = "/benchmark/timings";
 /// [`wyrd_telemetry::timing::TimingSnapshot`] as JSON: bounded aggregate
 /// distributions and counters only, with no request identity, tenant,
 /// payload, query, or reset. The Prometheus recorder is untouched.
+///
+/// A `bench` build also serves [`crate::heap_profile::PATH`]: `POST` starts
+/// heap sampling and `GET` returns the live sampled allocations as a gzipped
+/// pprof profile of sizes and code locations only.
 pub fn metrics_router(handle: PrometheusHandle, benchmark_snapshot: bool) -> Router {
     let router = Router::new().route("/metrics", get(move || ready(handle.render())));
     if !benchmark_snapshot {
         return router;
     }
     wyrd_telemetry::timing::enable();
-    router.route(
+    let router = router.route(
         BENCHMARK_TIMINGS_PATH,
         get(|| ready(axum::Json(wyrd_telemetry::timing::snapshot()))),
-    )
+    );
+    #[cfg(feature = "bench")]
+    let router = router.route(
+        crate::heap_profile::PATH,
+        get(heap_profile).post(|| {
+            crate::heap_profile::start();
+            ready(axum::http::StatusCode::NO_CONTENT)
+        }),
+    );
+    router
+}
+
+/// The sampled heap profile, rendered on a blocking thread because
+/// symbolizing takes a while.
+///
+/// # Errors
+///
+/// Answers 500 when rendering panicked.
+#[cfg(feature = "bench")]
+async fn heap_profile() -> Result<impl axum::response::IntoResponse, axum::http::StatusCode> {
+    let profile = tokio::task::spawn_blocking(crate::heap_profile::profile)
+        .await
+        .map_err(|_| axum::http::StatusCode::INTERNAL_SERVER_ERROR)?;
+    Ok((
+        [(axum::http::header::CONTENT_TYPE, "application/octet-stream")],
+        profile,
+    ))
 }
 
 /// Serve the metrics router on an already-bound `listener` until `shutdown`.
@@ -682,11 +712,16 @@ mod tests {
     async fn benchmark_snapshots_are_local_read_only_and_opt_in() {
         let handle = get_handle();
         let ordinary = metrics_router(handle.clone(), false);
-        assert_eq!(
-            fetch(&ordinary, "GET", BENCHMARK_TIMINGS_PATH).await.0,
-            StatusCode::NOT_FOUND
-        );
+        for path in [BENCHMARK_TIMINGS_PATH, "/benchmark/heap"] {
+            assert_eq!(fetch(&ordinary, "GET", path).await.0, StatusCode::NOT_FOUND);
+        }
         let router = metrics_router(handle.clone(), true);
+        #[cfg(not(feature = "bench"))]
+        assert_eq!(
+            fetch(&router, "GET", "/benchmark/heap").await.0,
+            StatusCode::NOT_FOUND,
+            "only a bench build serves heap profiles"
+        );
         let secret = "tenant-7f3a-trace-4bf92f3577b34da6a3ce929d0e0e4736";
         let span = tracing::info_span!("request", tenant = secret);
         wyrd_telemetry::record_timing(
@@ -783,5 +818,41 @@ mod tests {
             !output.contains("etc/passwd"),
             "raw URI path must never appear as a metric label (unbounded cardinality); got:\n{output}"
         );
+    }
+
+    /// A `bench` build's heap route starts sampling on `POST`, serves a
+    /// gzipped profile on `GET`, and refuses every other method.
+    ///
+    /// # Panics
+    ///
+    /// Panics when a method is answered wrongly.
+    #[cfg(feature = "bench")]
+    #[tokio::test]
+    async fn bench_heap_profile_starts_and_serves() {
+        let router = metrics_router(get_handle().clone(), true);
+        let call = |method: &str| {
+            let request = Request::builder()
+                .method(method)
+                .uri(crate::heap_profile::PATH)
+                .body(Body::empty())
+                .expect("request builds");
+            router.clone().oneshot(request)
+        };
+        assert_eq!(
+            call("POST").await.expect("POST").status(),
+            StatusCode::NO_CONTENT
+        );
+        let response = call("GET").await.expect("GET");
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("body");
+        assert_eq!(&body[..2], [0x1f, 0x8b], "a gzip stream");
+        for method in ["PUT", "DELETE"] {
+            assert_eq!(
+                call(method).await.expect(method).status(),
+                StatusCode::METHOD_NOT_ALLOWED
+            );
+        }
     }
 }

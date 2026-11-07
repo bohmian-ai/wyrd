@@ -44,7 +44,7 @@ use sha2::{Digest as _, Sha256};
 use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
 
-use crate::profile::{ProfileNote, Profiler};
+use crate::profile::{HeapProfiler, ProfileNote, Profiler};
 use crate::release_server::{Host, HostLoad};
 
 /// The only record version this module writes and reads: a VALID or
@@ -1321,6 +1321,10 @@ pub struct Repetition {
     pub server_cpu_seconds: Option<f64>,
     /// Sampled peak server resident memory, bytes.
     pub peak_memory_bytes: Option<u64>,
+    /// Server resident memory as the window opened, bytes; peak less
+    /// opening is the memory the window added. Absent from older records.
+    #[serde(default)]
+    pub opening_memory_bytes: Option<u64>,
     /// The memory sampling interval, milliseconds.
     pub memory_interval_ms: u64,
     /// Driver CPU-seconds, or `None` when unreadable.
@@ -1532,6 +1536,12 @@ pub trait Workload: Send {
 
     /// PIDs of the declared server processes, for optional profiling.
     fn processes(&self) -> Vec<u32>;
+
+    /// Where the server under test serves its heap profile, for optional
+    /// profiling; `None`, the default, when it serves none.
+    fn heap_profile_url(&self) -> Option<String> {
+        None
+    }
 
     /// Runs `phase` of `step` for `window` and returns what it measured.
     /// The runner calls it once per warmup and repetition and never retries
@@ -1808,14 +1818,14 @@ where
             }
             Err(reason) => stopped = Some(reason),
         }
-        let profiler = match (&options.profiler, stopped.is_none()) {
-            (Some(program), true) => Profiler::start(
-                program,
-                &workload.processes(),
-                &options.artifacts.join("profiles"),
-            ),
-            _ => Profiler::disabled(),
+        let profiles = options.artifacts.join("profiles");
+        let profiling = options.profiler.as_ref().filter(|_| stopped.is_none());
+        let profiler = match profiling {
+            Some(program) => Profiler::start(program, &workload.processes(), &profiles),
+            None => Profiler::disabled(),
         };
+        let heap_url = profiling.and_then(|_| workload.heap_profile_url());
+        let mut heap = HeapProfiler::start(heap_url, &profiles).await;
         for step in &declaration.steps {
             if stopped.is_some()
                 || step.kind != StepKind::Measured
@@ -1869,6 +1879,7 @@ where
                     }
                 }
             }
+            heap.capture(&step.id).await;
         }
         let saving = tokio::task::spawn_blocking(move || profiler.finish());
         match tokio::time::timeout(FINISH_GRACE, workload.finish()).await {
@@ -1900,6 +1911,7 @@ where
             notes: vec!["the profiler thread panicked".to_owned()],
             ..ProfileNote::default()
         });
+        heap.finish(&mut profile);
     }
     let elapsed = worked.unwrap_or_else(|| clock.elapsed());
     if elapsed > Duration::from_secs(timing.budget_seconds) {
@@ -4989,6 +5001,24 @@ mod tests {
             invalid.render().contains("— the run admitted no workload")
                 || invalid.render().contains("| INVALID |")
         );
+    }
+
+    /// A repetition kept before the opening-memory reading existed still
+    /// reads, with no opening reading.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the older repetition is refused or invents a reading.
+    #[test]
+    fn repetitions_without_opening_memory_still_read() {
+        let mut older = serde_json::to_value(good()).expect("serializes");
+        older
+            .as_object_mut()
+            .expect("an object")
+            .remove("opening_memory_bytes");
+        let read: Repetition = serde_json::from_value(older).expect("an older repetition reads");
+        assert_eq!(read.opening_memory_bytes, None);
+        assert_eq!(read.peak_memory_bytes, good().peak_memory_bytes);
     }
 
     /// V9: absent, failing, incomplete, and successful profilers leave the

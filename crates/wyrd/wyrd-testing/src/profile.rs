@@ -1,5 +1,10 @@
-//! Optional diagnostic CPU profiles of the declared server processes,
-//! captured by external `samply` for a whole experiment run.
+//! Optional diagnostic CPU and heap profiles of the server under test.
+//!
+//! CPU profiles are captured by external `samply` for a whole experiment
+//! run. Heap profiles come from the server itself: a `bench` build samples
+//! its live allocations once [`HeapProfiler::start`] asks it to, and each
+//! measured step ends with one pprof capture, `heap-<step>.pb.gz`, of the
+//! memory the steps so far allocated and still hold.
 //!
 //! `--profile` asks for one capture per server PID, started once the
 //! servers are ready and interrupted before they stop, with the same
@@ -188,5 +193,153 @@ impl Drop for Profiler {
             let _ = child.kill();
             let _ = child.wait();
         }
+    }
+}
+
+/// The heap profiles of one experiment, read from the server under test.
+pub struct HeapProfiler {
+    /// The server's heap profile endpoint, or `None` when it serves none
+    /// or sampling did not start.
+    url: Option<String>,
+    /// Where captures are written.
+    directory: PathBuf,
+    /// Saved captures.
+    captures: Vec<String>,
+    /// Causes noted so far.
+    notes: Vec<String>,
+}
+
+impl HeapProfiler {
+    /// Asks the server at `url` to start sampling, writing captures under
+    /// `directory`. `None` captures nothing and notes nothing.
+    ///
+    /// Never fails: a server that does not start sampling becomes a note,
+    /// and the run continues without heap profiles.
+    pub async fn start(url: Option<String>, directory: &Path) -> Self {
+        let mut profiler = Self {
+            url: None,
+            directory: directory.to_path_buf(),
+            captures: Vec::new(),
+            notes: Vec::new(),
+        };
+        let Some(url) = url else {
+            return profiler;
+        };
+        let started = reqwest::Client::new()
+            .post(&url)
+            .send()
+            .await
+            .and_then(reqwest::Response::error_for_status);
+        match started {
+            Ok(_) => profiler.url = Some(url),
+            Err(error) => profiler.notes.push(format!(
+                "heap profiling disabled: {url} did not start: {error}"
+            )),
+        }
+        profiler
+    }
+
+    /// Saves the server's current heap profile as `heap-<step>.pb.gz`, or
+    /// notes why it could not.
+    pub async fn capture(&mut self, step: &str) {
+        let Some(url) = &self.url else {
+            return;
+        };
+        let profile = match reqwest::get(url)
+            .await
+            .and_then(reqwest::Response::error_for_status)
+        {
+            Ok(response) => response.bytes().await,
+            Err(error) => Err(error),
+        };
+        let output = self.directory.join(format!("heap-{step}.pb.gz"));
+        let saved = match profile {
+            Ok(profile) => std::fs::create_dir_all(&self.directory)
+                .and_then(|()| std::fs::write(&output, profile))
+                .map_err(|error| error.to_string()),
+            Err(error) => Err(error.to_string()),
+        };
+        match saved {
+            Ok(()) => self.captures.push(output.display().to_string()),
+            Err(error) => self
+                .notes
+                .push(format!("heap capture after {step} failed: {error}")),
+        }
+    }
+
+    /// Adds the captures and notes to the CPU profiles' `note`; any heap
+    /// note leaves it incomplete.
+    pub fn finish(self, note: &mut ProfileNote) {
+        note.complete &= self.notes.is_empty();
+        note.captures.extend(self.captures);
+        note.notes.extend(self.notes);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{HeapProfiler, ProfileNote};
+
+    /// A stand-in heap endpoint that starts on `POST` and serves `profile`
+    /// on `GET`; returns its URL.
+    async fn heap_endpoint() -> String {
+        let router = axum::Router::new().route(
+            "/benchmark/heap",
+            axum::routing::get(|| async { "profile" })
+                .post(|| async { axum::http::StatusCode::NO_CONTENT }),
+        );
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .expect("bind");
+        let address = listener.local_addr().expect("address");
+        tokio::spawn(async move { axum::serve(listener, router).await });
+        format!("http://{address}/benchmark/heap")
+    }
+
+    /// A served profile is saved per step and listed as a capture; a server
+    /// that does not start sampling leaves a note and no capture; a workload
+    /// without a heap endpoint adds neither.
+    ///
+    /// # Panics
+    ///
+    /// Panics when a capture or note is wrong.
+    #[tokio::test]
+    async fn heap_captures_and_failures_become_profile_evidence() {
+        let directory = tempfile::tempdir().expect("directory");
+        let complete = || ProfileNote {
+            requested: true,
+            complete: true,
+            ..ProfileNote::default()
+        };
+
+        let mut served = HeapProfiler::start(Some(heap_endpoint().await), directory.path()).await;
+        served.capture("chat.c1").await;
+        let mut note = complete();
+        served.finish(&mut note);
+        let saved = directory.path().join("heap-chat.c1.pb.gz");
+        assert_eq!(note.captures, [saved.display().to_string()]);
+        assert!(note.complete && note.notes.is_empty(), "{note:?}");
+        assert_eq!(std::fs::read(saved).expect("saved"), b"profile");
+
+        let mut refused = HeapProfiler::start(
+            Some("http://127.0.0.1:9/benchmark/heap".to_owned()),
+            directory.path(),
+        )
+        .await;
+        refused.capture("chat.c1").await;
+        let mut note = complete();
+        refused.finish(&mut note);
+        assert!(note.captures.is_empty());
+        assert!(!note.complete);
+        assert!(
+            note.notes[0].contains("heap profiling disabled"),
+            "{note:?}"
+        );
+
+        let mut absent = HeapProfiler::start(None, directory.path()).await;
+        absent.capture("chat.c1").await;
+        let mut note = complete();
+        absent.finish(&mut note);
+        assert_eq!(note, complete());
     }
 }

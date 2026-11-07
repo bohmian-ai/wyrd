@@ -406,6 +406,7 @@ impl Competing {
             processes: vec!["wyrd-server".to_owned()],
             server_cpu_seconds: usage.server_cpu_seconds,
             peak_memory_bytes: usage.peak_memory_bytes,
+            opening_memory_bytes: usage.opening_memory_bytes,
             memory_interval_ms: PEAK_SAMPLE_INTERVAL_MS,
             driver_cpu_seconds: usage.driver_cpu_seconds,
             ..Repetition::default()
@@ -1077,6 +1078,10 @@ impl Workload for Competing {
             .and_then(LocalServer::pid)
             .into_iter()
             .collect()
+    }
+
+    fn heap_profile_url(&self) -> Option<String> {
+        self.server.as_ref().map(LocalServer::heap_profile_url)
     }
 
     /// Runs the whole capacity → overload → recovery sequence; a warmup

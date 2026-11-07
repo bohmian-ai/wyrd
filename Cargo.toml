@@ -221,6 +221,7 @@ tonic-build = "0.14"
 tonic-prost = "0.14"
 tonic-prost-build = "0.14"
 prost = "0.14"
+backtrace = "0.3"
 napi = { version = "3", default-features = false, features = ["napi8", "tokio_rt"] }
 napi-derive = "3"
 napi-build = "2"

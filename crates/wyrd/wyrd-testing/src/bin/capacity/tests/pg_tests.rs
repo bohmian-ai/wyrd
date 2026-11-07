@@ -164,6 +164,10 @@ impl Workload for Controlled {
         self.inner.processes()
     }
 
+    fn heap_profile_url(&self) -> Option<String> {
+        self.inner.heap_profile_url()
+    }
+
     async fn measure(
         &mut self,
         step: &Step,

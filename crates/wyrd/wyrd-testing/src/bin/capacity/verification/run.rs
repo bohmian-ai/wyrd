@@ -323,6 +323,7 @@ impl Bench {
             processes: vec![PROCESS.to_owned()],
             server_cpu_seconds: usage.server_cpu_seconds,
             peak_memory_bytes: usage.peak_memory_bytes,
+            opening_memory_bytes: usage.opening_memory_bytes,
             memory_interval_ms: PEAK_SAMPLE_INTERVAL_MS,
             driver_cpu_seconds: usage.driver_cpu_seconds,
             ..Repetition::default()
@@ -483,6 +484,7 @@ impl Bench {
             processes: vec![PROCESS.to_owned()],
             server_cpu_seconds: used.first().and_then(|used| used.cpu_seconds),
             peak_memory_bytes: used.first().and_then(|used| used.peak_memory),
+            opening_memory_bytes: used.first().and_then(|used| used.opening_memory),
             memory_interval_ms: PEAK_SAMPLE_INTERVAL_MS,
             driver_cpu_seconds: driver,
             ..Repetition::default()
@@ -637,6 +639,10 @@ impl Workload for Bench {
             .and_then(LocalServer::pid)
             .into_iter()
             .collect()
+    }
+
+    fn heap_profile_url(&self) -> Option<String> {
+        self.server.as_ref().map(LocalServer::heap_profile_url)
     }
 
     /// Runs `step` for `window`: closed loop at L1, the whole open-loop
@@ -1383,6 +1389,10 @@ mod tests {
 
             fn processes(&self) -> Vec<u32> {
                 self.bench.processes()
+            }
+
+            fn heap_profile_url(&self) -> Option<String> {
+                self.bench.heap_profile_url()
             }
 
             async fn measure(

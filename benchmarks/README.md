@@ -186,7 +186,7 @@ Flags:
 
 | Flag | Applies to | Effect |
 |---|---|---|
-| `--profile` | every command | Adds optional samply captures under `target/benchmarks/` (see [Profiling](#profiling)). |
+| `--profile` | every command | Adds optional samply CPU captures and per-step server heap profiles under `target/benchmarks/` (see [Profiling](#profiling)). |
 | `--allow-dirty` | every command | Records a dirty source (see [Source](#source)). |
 | `--steps a,b` | engine commands | Runs a declared subset; the record lists every omitted step and never claims full coverage. |
 
@@ -248,8 +248,8 @@ a `-<n>` suffix. A record holds:
 - the command and non-secret configuration;
 - the host, build, and source;
 - the declared controls and criteria;
-- every repetition's metrics, units, sample counts, and server and driver
-  CPU;
+- every repetition's metrics, units, sample counts, server and driver CPU,
+  and the server's opening and peak resident memory;
 - every criterion's outcome, every reason, and the verdict.
 
 Raw evidence stays under `target/benchmarks/<engine>/<experiment>/<UTC
@@ -301,3 +301,27 @@ invocation on every platform, and saves the captures under the run's
 `target/benchmarks/` artifacts. A profile is diagnostic only. When samply is
 missing or a capture fails, the record carries a note instead, and the
 verdict is unchanged.
+
+`--profile` also takes heap profiles of the server. Once the fixtures are
+loaded, the run asks the `bench` server build to start sampling its heap:
+about one allocation per 512 KiB allocated, recorded with its call stack
+until it is freed, through the same mimalloc allocator the server always
+uses. After each measured step, the run saves `profiles/heap-<step>.pb.gz`, a
+symbolized pprof profile (`inuse_space`, `inuse_objects`) of the memory the
+steps so far allocated and still hold. Memory allocated before sampling
+started is not in it.
+
+```bash
+pprof -top profiles/heap-<step>.pb.gz                      # what is held after <step>
+pprof -top -base profiles/heap-<earlier>.pb.gz profiles/heap-<step>.pb.gz  # what <step> added
+```
+
+`pprof` is Google's profile viewer (`go install github.com/google/pprof@latest`);
+`-http=:8080` opens a flame graph. Each stack starts at the code that asked
+for memory, with the allocator and the standard library's `Vec` and `Box`
+plumbing trimmed. Inlined frames carry short names in the bench build's
+line-table debug info; `-lines` shows their files and lines.
+
+Every repetition also records `opening_memory_bytes`, the server's resident
+memory as its window opened, beside `peak_memory_bytes`. Peak minus opening
+is the memory that window added, in profiled and unprofiled runs alike.

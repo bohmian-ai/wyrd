@@ -27,7 +27,7 @@ use std::time::{Duration, Instant};
 
 pub(crate) mod os;
 
-pub use os::{HostLoad, PEAK_SAMPLE_INTERVAL_MS, PeakSampler};
+pub use os::{HostLoad, MemoryReadings, PEAK_SAMPLE_INTERVAL_MS, PeakSampler};
 
 use secrecy::{ExposeSecret, SecretString};
 use tempfile::TempDir;
@@ -370,6 +370,13 @@ impl LocalServer {
     pub async fn timings(&self) -> Result<wyrd_telemetry::timing::TimingSnapshot> {
         let url = format!("http://127.0.0.1:{METRICS_PORT}/benchmark/timings");
         Ok(reqwest::get(url).await?.error_for_status()?.json().await?)
+    }
+
+    /// The loopback URL a `bench` build serves its heap profile at, which
+    /// [`crate::profile::HeapProfiler`] starts and reads.
+    #[must_use]
+    pub fn heap_profile_url(&self) -> String {
+        format!("http://127.0.0.1:{METRICS_PORT}/benchmark/heap")
     }
 
     /// Microseconds of user plus system CPU the server process has used so

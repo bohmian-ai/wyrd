@@ -14,7 +14,7 @@
 use std::collections::BTreeMap;
 use std::sync::{Arc, LazyLock};
 
-use arrow::array::{ArrayRef, RecordBatch, StringArray};
+use arrow::array::{ArrayRef, AsArray as _, RecordBatch, StringArray};
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::json::ReaderBuilder;
 use base64::Engine;
@@ -181,10 +181,12 @@ pub struct CallCapture {
     /// encoded.
     payload: GatewayCallPayloadV1,
     /// The selected request payload, redacted and encoded as a Variant on the
-    /// capturing task so the Scribe lane appends it without re-encoding.
-    request: Option<EncodedVariant>,
-    /// The selected response payload, encoded as [`Self::request`] is.
-    response: Option<EncodedVariant>,
+    /// capturing task and moved into a one-row storage column, so the Scribe
+    /// lane appends it without re-encoding and a lone capture's batch shares
+    /// its buffers.
+    request: Option<ArrayRef>,
+    /// The selected response payload, held as [`Self::request`] is.
+    response: Option<ArrayRef>,
     /// Bytes of every object the row references, persisted before delivery.
     objects: PayloadObjects,
     /// One span's admitted-adapter provider and fields per attempt, in
@@ -315,7 +317,12 @@ impl CallCapture {
         [&self.request, &self.response]
             .into_iter()
             .flatten()
-            .map(EncodedVariant::encoded_bytes)
+            .map(|column| {
+                let storage = column.as_struct();
+                (0..storage.num_columns())
+                    .map(|child| storage.column(child).as_binary::<i32>().values().len())
+                    .sum::<usize>()
+            })
             .sum::<usize>()
             + self.objects.bytes()
     }
@@ -332,12 +339,14 @@ impl CallCapture {
     ///
     /// The scalar columns decode from the serialized payloads in one decoder
     /// pass; the `request_payload` and `response_payload` Variant columns
-    /// append the payloads already encoded by [`Self::from_facts`]. Every
-    /// batch shares one schema `Arc`.
+    /// join the one-row columns [`Self::from_facts`] encoded: a lone capture's
+    /// batch shares them without a copy, and several are concatenated once
+    /// into exactly sized buffers. Every batch shares one schema `Arc`.
     ///
     /// # Errors
     ///
-    /// Returns [`CaptureDrop::Projection`] when Arrow cannot decode the rows.
+    /// Returns [`CaptureDrop::Projection`] when Arrow cannot decode the rows
+    /// or join the payload columns.
     pub(crate) fn calls_batch(captures: &[&Self]) -> Result<RecordBatch, CaptureDrop> {
         let (schema, scalars) = &*CALLS_SCHEMAS;
         let mut decoder = ReaderBuilder::new(Arc::clone(scalars))
@@ -363,32 +372,19 @@ impl CallCapture {
                     .map(|capture| capture.subject.as_ref().and_then(pick)),
             ))
         };
-        let payload = |pick: fn(&CallCapture) -> Option<&EncodedVariant>| -> ArrayRef {
-            let (metadata_bytes, value_bytes) = captures
+        let payload = |pick: fn(&CallCapture) -> Option<&ArrayRef>| {
+            let rows = captures
                 .iter()
-                .filter_map(|capture| pick(capture))
-                .fold((0, 0), |(metadata, value), encoded| {
-                    (
-                        metadata + encoded.metadata().len(),
-                        value + encoded.value().len(),
-                    )
-                });
-            let mut column = VariantColumnBuilder::with_byte_capacity(
-                captures.len(),
-                metadata_bytes,
-                value_bytes,
-            );
-            for capture in captures {
-                column.append_option(pick(capture));
-            }
-            column.finish()
+                .map(|capture| pick(capture).unwrap_or(&NULL_PAYLOAD).as_ref())
+                .collect::<Vec<_>>();
+            arrow::compute::concat(&rows).map_err(|_| CaptureDrop::Projection)
         };
         let columns = schema
             .fields()
             .iter()
             .map(|field| match field.name().as_str() {
-                REQUEST_PAYLOAD => Ok(payload(|capture| capture.request.as_ref())),
-                RESPONSE_PAYLOAD => Ok(payload(|capture| capture.response.as_ref())),
+                REQUEST_PAYLOAD => payload(|capture| capture.request.as_ref()),
+                RESPONSE_PAYLOAD => payload(|capture| capture.response.as_ref()),
                 WORKLOAD_CARD_UID => Ok(subject(|context| {
                     context.workload_card_uid.as_ref().map(CardUid::as_str)
                 })),
@@ -807,6 +803,14 @@ static CALLS_SCHEMAS: LazyLock<(Arc<Schema>, Arc<Schema>)> = LazyLock::new(|| {
     )
 });
 
+/// The canonical one-row null payload column: empty child bytes under an
+/// invalid row, as [`VariantColumnBuilder::append_null`] writes it.
+static NULL_PAYLOAD: LazyLock<ArrayRef> = LazyLock::new(|| {
+    let mut column = VariantColumnBuilder::with_capacity(1);
+    column.append_null();
+    column.finish()
+});
+
 /// Whether `name` is one of the two Variant payload columns of
 /// `bifrost.gateway.calls`, which the JSON row decoder cannot build.
 fn is_payload_column(name: &str) -> bool {
@@ -815,7 +819,7 @@ fn is_payload_column(name: &str) -> bool {
 
 /// Redacts `value` in place, collecting substituted binary content into
 /// `objects`, and encodes it as the stored Variant in one pass, with no JSON
-/// text in between.
+/// text in between, moving the encoding into its one-row storage column.
 ///
 /// # Errors
 ///
@@ -824,11 +828,12 @@ fn is_payload_column(name: &str) -> bool {
 fn redacted_payload(
     mut value: Value,
     objects: &mut PayloadObjects,
-) -> Result<EncodedVariant, CaptureDrop> {
+) -> Result<ArrayRef, CaptureDrop> {
     redact(&mut value, objects)?;
     EncodedVariant::from_serialize(&value)
         .ok()
         .filter(|encoded| encoded.encoded_bytes() <= GATEWAY_JSON_MAX_BYTES)
+        .map(EncodedVariant::into_column)
         .ok_or(CaptureDrop::Payload)
 }
 
@@ -1126,14 +1131,14 @@ pub(crate) mod tests {
     use std::collections::BTreeSet;
     use std::num::{NonZeroU32, NonZeroU64};
 
-    use arrow::array::Array;
+    use arrow::array::{Array, AsArray as _};
     use chrono::Utc;
     use serde_json::json;
     use wyrd_gateway::{
         AttemptRecord, AttemptUsage, IngressDialect, MediaRequest, OpenAiMediaRoute, UploadContent,
         UploadFile,
     };
-    use wyrd_queue::variant::variant_bytes_to_json;
+    use wyrd_queue::variant::variant_cell_to_json;
     use wyrd_spec::DataTenantId;
     use wyrd_spec::auth::{Attribution, PrincipalId};
     use wyrd_spec::gateway::{
@@ -1143,8 +1148,9 @@ pub(crate) mod tests {
     use wyrd_spec::ids::ProviderDeploymentName;
 
     use super::{
-        AnyValueKind, CallCapture, CallFacts, CaptureDrop, PayloadObjects, ScribeTable,
-        object_path, request_content,
+        AnyValueKind, ArrayRef, CallCapture, CallFacts, CaptureDrop, EncodedVariant,
+        PayloadObjects, REDACTED, REQUEST_PAYLOAD, RESPONSE_PAYLOAD, ScribeTable, object_path,
+        request_content,
     };
 
     /// Secret planted under credential-shaped keys; must never be persisted.
@@ -1374,6 +1380,99 @@ pub(crate) mod tests {
         }
     }
 
+    /// Proves redacted payloads reach the calls columns without an
+    /// intermediate copy.
+    ///
+    /// A lone capture's request and response columns are the very buffers
+    /// its redacted encoding produced; a group concatenates them once, in
+    /// order, with a metadata-only call's payloads null. The nested request
+    /// keeps its redaction and binary references, the response its redacted
+    /// token, and the outbox weight stays the encoded bytes.
+    ///
+    /// # Panics
+    /// Panics when a column copies a lone capture's payload or a row differs.
+    #[test]
+    fn capture_columns_avoid_intermediate_payload_copies() {
+        let both = [GatewayPayloadField::Request, GatewayPayloadField::Response];
+        let payload = CallCapture::from_facts(facts(policy(GatewayCaptureMode::Payload, &both)))
+            .expect("payload projects");
+        let metadata = CallCapture::from_facts(facts(policy(GatewayCaptureMode::Metadata, &[])))
+            .expect("metadata projects");
+        let value_buffer = |column: &ArrayRef| {
+            column
+                .as_struct()
+                .column(1)
+                .as_binary::<i32>()
+                .values()
+                .as_ptr()
+        };
+        let rendered = |column: &ArrayRef, row| {
+            variant_cell_to_json(column.as_ref(), row).expect("the payload renders")
+        };
+        let request = payload.request.as_ref().expect("request selected");
+        let response = payload.response.as_ref().expect("response selected");
+        let request_json = rendered(request, 0);
+        let response_json = rendered(response, 0);
+        assert!(!request_json.to_string().contains(CANARY), "{request_json}");
+        assert!(
+            !request_json.to_string().contains(IMAGE_B64),
+            "{request_json}"
+        );
+        assert_eq!(
+            request_json["messages"][0]["content"][1]["inline_data"]["data"]["content_type"],
+            "image/png"
+        );
+        assert_eq!(
+            response_json,
+            json!({"id": "chatcmpl-1", "token": REDACTED})
+        );
+        let encoded = [&request_json, &response_json]
+            .into_iter()
+            .map(|value| {
+                EncodedVariant::from_json(value)
+                    .expect("encodes")
+                    .encoded_bytes()
+            })
+            .sum::<usize>();
+        assert_eq!(payload.content_bytes(), encoded + payload.objects.bytes());
+
+        let lone = CallCapture::calls_batch(&[&payload]).expect("calls batch");
+        for (name, column) in [(REQUEST_PAYLOAD, request), (RESPONSE_PAYLOAD, response)] {
+            assert_eq!(
+                value_buffer(lone.column_by_name(name).expect(name)),
+                value_buffer(column),
+                "a lone capture's {name} shares its encoded buffer"
+            );
+        }
+
+        let group =
+            CallCapture::calls_batch(&[&metadata, &payload, &metadata]).expect("calls batch");
+        let column = group
+            .column_by_name(REQUEST_PAYLOAD)
+            .expect("request column");
+        assert_eq!(column.data_type(), request.data_type());
+        assert_eq!(column.null_count(), 2, "metadata calls keep null payloads");
+        assert_eq!(rendered(column, 1), request_json);
+        assert_eq!(
+            rendered(
+                group
+                    .column_by_name(RESPONSE_PAYLOAD)
+                    .expect("response column"),
+                1
+            ),
+            response_json
+        );
+        let storage = column.as_struct();
+        for child in 0..storage.num_columns() {
+            let bytes = storage.column(child).as_binary::<i32>();
+            assert_eq!(
+                bytes.value_length(0) + bytes.value_length(2),
+                0,
+                "a null payload keeps empty child bytes"
+            );
+        }
+    }
+
     /// Proves a selected payload is redacted, binary content becomes a
     /// digest reference with no base64, and the unselected field stays null.
     #[test]
@@ -1384,7 +1483,7 @@ pub(crate) mod tests {
         )))
         .expect("payload projects");
         let request = capture.request.as_ref().expect("request selected");
-        let request = variant_bytes_to_json(request.metadata(), request.value())
+        let request = variant_cell_to_json(request.as_ref(), 0)
             .expect("the encoded request renders")
             .to_string();
         assert!(!request.contains(CANARY), "{request}");

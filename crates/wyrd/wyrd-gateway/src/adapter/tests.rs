@@ -489,6 +489,49 @@ async fn request_preparation_avoids_duplicate_body_materialization() {
     }
 }
 
+/// Credential scrubbing of a captured answer edits it in place.
+///
+/// Secret-free strings keep their allocations, a string or key holding the
+/// secret loses every occurrence, and a short or encoded secret is still
+/// judged as before.
+///
+/// # Panics
+///
+/// Panics when secret-free content is reallocated or a secret survives.
+#[test]
+fn capture_scrubbing_rebuilds_only_secret_holding_content() {
+    let secret = "sk-scrub-secret";
+    let value = json!({
+        "id": "chatcmpl-1",
+        "choices": [{"message": {"content": "x".repeat(4096)}}],
+        "echo": format!("key={secret};again={secret}"),
+        format!("{secret}-key"): "named",
+    });
+    let content = value["choices"][0]["message"]["content"]
+        .as_str()
+        .expect("content")
+        .as_ptr();
+    let scrubbed = super::without_secret(value, secret);
+    assert_eq!(
+        scrubbed["choices"][0]["message"]["content"]
+            .as_str()
+            .expect("content")
+            .as_ptr(),
+        content,
+        "secret-free content keeps its allocation"
+    );
+    assert_eq!(scrubbed["echo"], "key=;again=");
+    assert_eq!(scrubbed["-key"], "named");
+    assert!(!scrubbed.to_string().contains(secret), "{scrubbed}");
+    assert!(!super::holds_encoded_secret(&scrubbed, secret));
+    let encoded = base64::engine::general_purpose::STANDARD.encode(format!("{secret}!"));
+    assert!(super::holds_encoded_secret(
+        &json!({"b64": encoded}),
+        secret
+    ));
+    assert!(!super::holds_encoded_secret(&json!(["c2stc2"]), secret));
+}
+
 /// Noncanonical native answer bytes reach the caller unchanged.
 #[tokio::test]
 async fn native_answer_bytes_are_preserved() {

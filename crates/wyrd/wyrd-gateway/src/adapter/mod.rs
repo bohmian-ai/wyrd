@@ -411,22 +411,35 @@ pub(crate) fn refusal(
 
 /// Removes every exact occurrence of `secret` from the decoded strings and
 /// object keys of `value`.
-pub(crate) fn without_secret(value: Value, secret: &str) -> Value {
+///
+/// The value is edited in place: only a string or an object's keys holding
+/// `secret` are rebuilt, so secret-free content keeps its allocations.
+pub(crate) fn without_secret(mut value: Value, secret: &str) -> Value {
+    remove_secret(&mut value, secret);
+    value
+}
+
+/// Removes `secret` from `value` in place, as [`without_secret`] does.
+fn remove_secret(value: &mut Value, secret: &str) {
     match value {
-        Value::String(text) => Value::String(text.replace(secret, "")),
-        Value::Array(items) => Value::Array(
-            items
-                .into_iter()
-                .map(|item| without_secret(item, secret))
-                .collect(),
-        ),
-        Value::Object(object) => Value::Object(
-            object
-                .into_iter()
-                .map(|(key, item)| (key.replace(secret, ""), without_secret(item, secret)))
-                .collect(),
-        ),
-        other => other,
+        Value::String(text) if text.contains(secret) => *text = text.replace(secret, ""),
+        Value::Array(items) => {
+            for item in items {
+                remove_secret(item, secret);
+            }
+        }
+        Value::Object(object) => {
+            if object.keys().any(|key| key.contains(secret)) {
+                *object = std::mem::take(object)
+                    .into_iter()
+                    .map(|(key, item)| (key.replace(secret, ""), item))
+                    .collect();
+            }
+            for item in object.values_mut() {
+                remove_secret(item, secret);
+            }
+        }
+        _ => {}
     }
 }
 
@@ -460,6 +473,11 @@ fn encodes_secret(text: &str, secret: &str) -> bool {
         .strip_prefix("data:")
         .and_then(|rest| rest.split_once(";base64,"))
         .map_or(text, |(_, encoded)| encoded);
+    // Base64 decodes at most three bytes per four characters, so text too
+    // short to hold the secret is judged without decoding it.
+    if encoded.len().saturating_mul(3) < secret.len().saturating_mul(4) {
+        return false;
+    }
     base64::engine::general_purpose::STANDARD
         .decode(encoded)
         .is_ok_and(|bytes| {

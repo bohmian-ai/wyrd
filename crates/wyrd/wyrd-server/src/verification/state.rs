@@ -1009,15 +1009,25 @@ impl vala_verify::blocks::Checkpoints for RunState {
         .await
     }
 
-    /// Remove the unsettled `attempt` of `task`, refused capacity before it
-    /// ran, so a later attempt replays it, returning once an accepted
-    /// revision no longer holds it.
+    /// Remove the unsettled `attempt` of `task`, refused capacity or its
+    /// definition before it retained anything, so a later attempt replays
+    /// it, returning once an accepted revision no longer holds it.
+    ///
+    /// An attempt that already accepted a publication keeps its record: its
+    /// retained work stays attributed to it, so the attempt is spent and
+    /// restoration starts fresh work at the next attempt.
     ///
     /// # Errors
     /// Returns a bounded reason when no accepted revision will reflect it.
     async fn forget(&self, task: &TaskId, attempt: u32) -> Result<(), String> {
         let wanted = producer(task, attempt);
         self.change(|state| {
+            if state.publications.iter().any(|accepted| {
+                let producer = &accepted.publication.producer;
+                producer.step_id == wanted.step_id && producer.attempt == wanted.attempt
+            }) {
+                return Ok(false);
+            }
             let recorded = state.invocations.len();
             state
                 .invocations

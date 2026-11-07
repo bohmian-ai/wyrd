@@ -565,7 +565,7 @@ async fn evidence_metadata_is_resolved_once() {
 }
 
 /// Refuses every registry lookup; the Agent here is authored inline.
-struct NoRegistry;
+pub(crate) struct NoRegistry;
 
 #[async_trait::async_trait]
 impl AgentCardResolver for NoRegistry {
@@ -594,7 +594,7 @@ impl PromptCardResolver for NoRegistry {
 }
 
 /// One scripted OpenAI answer: `text`, or else the `calls` it requests.
-fn answer(text: Option<&str>, calls: &[(&str, Value)]) -> ProviderResponse {
+pub(crate) fn answer(text: Option<&str>, calls: &[(&str, Value)]) -> ProviderResponse {
     let tool_calls = (!calls.is_empty()).then(|| {
         calls
             .iter()
@@ -643,7 +643,7 @@ fn answer(text: Option<&str>, calls: &[(&str, Value)]) -> ProviderResponse {
 ///
 /// # Panics
 /// Panics when the static Prompt or schema is invalid.
-fn reviewer(tools: &[&str]) -> AgentCall {
+pub(crate) fn reviewer(tools: &[&str]) -> AgentCall {
     let prompt = openai_chat(
         "gpt-test",
         OpenAiChatOptions {
@@ -1002,7 +1002,7 @@ async fn card_resolution_is_the_verifier_run() {
 
 /// Hosted limits of a one-worker pool with no waiters and one workspace, so
 /// a single held admission saturates each.
-fn saturable() -> HostedLimits {
+pub(crate) fn saturable() -> HostedLimits {
     HostedLimits {
         monty_min_workers: 0,
         monty_max_workers: 1,

@@ -230,7 +230,8 @@ pub trait Checkpoints: Send + Sync {
     async fn begin(&self, task: &TaskId, attempt: u32) -> Result<(), String>;
 
     /// Forget `task`'s unsettled `attempt`, which was refused process
-    /// capacity before it ran, so it spends nothing.
+    /// capacity or its definition, so it spends nothing. A host keeps the
+    /// record of an attempt that already retained work, which stays spent.
     ///
     /// # Errors
     /// Returns a bounded reason when the record cannot be removed.

@@ -9,12 +9,19 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
 use serde_json::{Value, json};
+use skald_runtime::{MockProvider, ProviderRegistry};
 use skald_spec::MediaFormat;
+use skald_spec::ProviderName;
 use tokio_util::sync::CancellationToken;
 use vala_bifrost_redux::catalog::{TableRef, TableUid};
 use vala_bifrost_redux::contracts::{FrameAdmission, Scribe, ScribeError, ScribeIngressFrame};
 use vala_bifrost_redux::namespaces::BifrostNamespace;
-use vala_verify::blocks::{BlockClock, CallInput, CallValue, Checkpoints, DriftChecks};
+use vala_verify::InMemoryTraceSource;
+use vala_verify::blocks::{
+    ActionExecutor, AgentExecutor, BlockClock, CallInput, CallValue, CheckExecutor, Checkpoints,
+    DriftChecks, EngineError, EvidenceReader, VerificationEngine,
+};
+use wyrd_runtime::Permission;
 use wyrd_runtime::principal::PrincipalId;
 use wyrd_server::components::gateway::GatewayCallContext;
 use wyrd_server::query::scheduled::ScheduledQueryCaller;
@@ -25,6 +32,8 @@ use wyrd_server::verification::hosted::HostedLimits;
 use wyrd_server::verification::hosted::blocks::{Execution, HostedBlocks};
 use wyrd_server::verification::hosted::evidence::TenantEvidence;
 use wyrd_server::verification::hosted::publications::{Publications, PublishCall};
+use wyrd_server::verification::hosted::sandbox::Sandbox;
+use wyrd_server::verification::hosted::tools::HostedTools;
 use wyrd_server::verification::hosted::workspace::{Workspace, Workspaces};
 use wyrd_server::verification::inputs::InputResolver;
 use wyrd_server::verification::leases::LeaseRenewal;
@@ -35,7 +44,7 @@ use wyrd_server::verification::state::{
 };
 use wyrd_spec::DataTenantId;
 use wyrd_spec::auth::Attribution;
-use wyrd_spec::card::verifier::VerifierSpec;
+use wyrd_spec::card::verifier::{Action, VerifierSpec};
 use wyrd_spec::ids::{CardUid, ExecutionId, GroupId, SlotName};
 use wyrd_spec::verification::execution::{
     InputDeclaration, InvocationSettlement, Producer, ProducerInvocation, PublicationCollection,
@@ -55,7 +64,7 @@ use wyrd_sql::queries::verifier_executions::{
 use wyrd_testing::WyrdTestServer;
 use wyrd_testing::verification::VerificationFixture;
 
-use crate::pg_hosted_artifacts::user;
+use crate::pg_hosted_artifacts::{NoRegistry, answer, reviewer, saturable, user};
 use crate::sandbox_worker::worker;
 
 /// One leased execution of a fresh in-process server, written through the
@@ -71,6 +80,8 @@ struct Leased {
     system: PrincipalId,
     /// The first claim's state writer.
     run: Arc<RunState>,
+    /// The claimed execution's Verifier.
+    verifier: CardUid,
 }
 
 impl Leased {
@@ -130,7 +141,20 @@ impl Leased {
             renewal,
             system,
             run,
+            verifier: claimed.verifier_card_uid,
         }
+    }
+
+    /// A user of the execution's tenant granted `verifier:run` on exactly
+    /// its Verifier, as its accepted authority is, plus `permissions`.
+    fn publisher(
+        &self,
+        permissions: impl IntoIterator<Item = Permission>,
+    ) -> wyrd_server::components::auth::Caller {
+        user(
+            self.server.data_tenant_id(),
+            std::iter::once(Permission::verifier_run(self.verifier.clone())).chain(permissions),
+        )
     }
 
     /// A query caller reading the execution's records as SYSTEM.
@@ -1395,6 +1419,220 @@ async fn cancelled_work_keeps_checkpoints_and_fences_stale_writes() {
         [("review".to_owned(), 1, "report".to_owned())],
         "the accepted publication survives and the late one is refused"
     );
+    leased
+        .server
+        .shutdown()
+        .await
+        .expect("test server shuts down");
+}
+
+/// A hosted Agent engine over `run`'s execution state: every model call is
+/// answered by `model`, and tools run as `caller` on `sandbox`.
+///
+/// # Panics
+/// Never; the concurrency is nonzero.
+fn agent_engine(
+    leased: &Leased,
+    run: &Arc<RunState>,
+    caller: &wyrd_server::components::auth::Caller,
+    model: &Arc<MockProvider>,
+    sandbox: &Arc<Sandbox>,
+    recorded: Vec<wyrd_spec::verification::state::InvocationRecord>,
+) -> VerificationEngine {
+    let limits = saturable();
+    let evidence = Arc::new(
+        TenantEvidence::new(
+            leased.server.state().clone(),
+            caller.clone(),
+            BTreeMap::new(),
+            limits,
+        )
+        .with_execution(Arc::clone(run)),
+    );
+    let mut providers = ProviderRegistry::new();
+    providers.register(Arc::clone(model) as _);
+    let agent = Arc::new(
+        AgentExecutor::new(
+            Arc::new(providers),
+            Arc::new(NoRegistry),
+            Arc::new(NoRegistry),
+        )
+        .with_toolset(Arc::new(
+            HostedTools::new(
+                leased.server.state().clone(),
+                caller.clone(),
+                Arc::clone(&evidence),
+                Arc::new(Workspaces::new(limits)),
+                Arc::clone(sandbox),
+                limits,
+            )
+            .with_execution(Arc::clone(run)),
+        ))
+        .with_evidence(evidence as Arc<dyn EvidenceReader>),
+    );
+    VerificationEngine::new(
+        Arc::clone(&agent) as Arc<dyn ActionExecutor>,
+        agent as Arc<dyn CheckExecutor>,
+        Arc::new(InMemoryTraceSource::new()),
+        std::num::NonZeroUsize::MIN,
+    )
+    .with_checkpoints(
+        Arc::clone(run) as Arc<dyn Checkpoints>,
+        recorded.into_iter().map(|record| {
+            (
+                record.producer.step_id,
+                record.producer.attempt,
+                record.settlement,
+            )
+        }),
+    )
+}
+
+/// A Verifier of one Agent step `id` reading JSON input `x`, declaring
+/// `publish` and `code.run`, with `retries` retries.
+///
+/// # Panics
+/// Panics when the Verifier does not decode or validate.
+fn publishing_step(id: &str, retries: u32) -> Arc<VerifierSpec> {
+    let mut action =
+        serde_json::to_value(Action::Agent(reviewer(&["publish", "code.run"]))).expect("action");
+    action["inputs"] = json!({ "document": "inputs.x" });
+    let spec: VerifierSpec = serde_json::from_value(json!({
+        "inputs": { "x": { "type": "json" } },
+        "steps": [{ "id": id, "retries": retries, "action": action }]
+    }))
+    .expect("Verifier decodes");
+    spec.validate().expect("valid Verifier");
+    Arc::new(spec)
+}
+
+/// An attempt refused Python capacity after it retained a publication is
+/// spent, not forgotten. With the only sandbox admission held, `draft`
+/// publishes `report` and then is refused at `code.run`; `once`, with no
+/// retry, does the same; `early` is refused at `code.run` before retaining
+/// anything. Each run defers busy. After a reclaim, `draft` runs attempt 2,
+/// which republishes `report` beside attempt 1's still-readable value;
+/// `once` is not restarted and makes no model call; `early`, whose refusal
+/// retained nothing, runs as attempt 1 once capacity frees.
+///
+/// # Panics
+/// Panics when a refused run is not busy, a retained attempt is forgotten
+/// or restarted, a forgotten one is spent, or a publication changes.
+#[tokio::test(flavor = "multi_thread")]
+async fn retained_publications_keep_their_busy_attempt() {
+    let leased = Leased::start().await;
+    let limits = saturable();
+    let caller = leased.publisher([Permission::tool_invoke_any()]);
+    let sandbox = Arc::new(Sandbox::start(worker(), limits).await.expect("pool starts"));
+    let none = serde_json::Map::new();
+    let far = tokio::time::Instant::now() + std::time::Duration::from_secs(60);
+    // One admitted operation holds the only worker admission while pending.
+    let mut held = Box::pin(sandbox.run("def f():\n    return 1", "f", &none, Vec::new(), far));
+    assert!(futures_util::FutureExt::now_or_never(&mut held).is_none());
+    let model = Arc::new(MockProvider::new(ProviderName::OpenAi));
+    let evidence = BTreeMap::from([(
+        SlotName::new("x").expect("slot"),
+        InputDeclaration::Json {
+            value: json!("the notes"),
+        },
+    )]);
+    let run = async |state: &Arc<RunState>, spec: &Arc<VerifierSpec>| {
+        let recorded = state.snapshot().await.invocations;
+        agent_engine(&leased, state, &caller, &model, &sandbox, recorded)
+            .run(Arc::clone(spec), evidence.clone(), far)
+            .await
+    };
+    let publish = |name: &str, value: &str| {
+        answer(
+            None,
+            &[("publish", json!({ "name": name, "value": value }))],
+        )
+    };
+    let code = || answer(None, &[("code_run", json!({ "source": "1" }))]);
+    let (draft, once, early) = (
+        publishing_step("draft", 1),
+        publishing_step("once", 0),
+        publishing_step("early", 0),
+    );
+
+    for (spec, published) in [
+        (&draft, Some("report")),
+        (&once, Some("once")),
+        (&early, None),
+    ] {
+        if let Some(name) = published {
+            model.push_response(publish(name, "attempt 1"));
+        }
+        model.push_response(code());
+        let refused = run(&leased.run, spec).await;
+        assert!(matches!(refused, Err(EngineError::Busy(_))), "{refused:?}");
+    }
+    assert_eq!(model.remaining(), 0, "every refusal stopped its loop");
+    let accepted = leased.accepted().await;
+    assert_eq!(
+        attempts(&accepted),
+        [("draft".to_owned(), 1), ("once".to_owned(), 1)],
+        "an attempt with retained work stays spent; one without is forgotten"
+    );
+
+    let current = leased.reclaim().await;
+    model.push_response(publish("report", "attempt 2"));
+    model.push_response(answer(Some("{}"), &[]));
+    let outcome = run(&current, &draft).await.expect("the retry runs");
+    let step = |outcome: &VerificationOutcome, id: &str| {
+        outcome
+            .steps
+            .iter()
+            .find(|step| step.id.as_str() == id)
+            .map(|step| (step.status, step.attempts))
+    };
+    assert_eq!(
+        step(&outcome, "draft"),
+        Some((StepStatus::Succeeded, 2)),
+        "the fresh work runs the next attempt: {outcome:?}"
+    );
+    let producer = |step: &str, attempt: u32| Producer {
+        step_id: TaskId::new(step).expect("task"),
+        item_index: None,
+        iteration_index: None,
+        attempt,
+    };
+    for (attempt, value) in [(1, "attempt 1"), (2, "attempt 2")] {
+        assert_eq!(
+            leased.read(&producer("draft", attempt), "report").await,
+            Some(PublicationContent::Json {
+                value: json!(value)
+            }),
+            "attempt {attempt} keeps its own report"
+        );
+    }
+
+    model.push_response(code());
+    model.push_response(answer(Some("{}"), &[]));
+    let outcome = run(&current, &once)
+        .await
+        .expect("the exhausted step settles");
+    let (status, spent) = step(&outcome, "once").expect("once settles");
+    assert_eq!(
+        (status, spent, model.remaining()),
+        (StepStatus::Failed, 1, 2),
+        "a step with no retry left is not restarted and calls no model"
+    );
+    assert_eq!(
+        leased.read(&producer("once", 1), "once").await,
+        Some(PublicationContent::Json {
+            value: json!("attempt 1")
+        })
+    );
+
+    drop(held);
+    let outcome = run(&current, &early).await.expect("the deferred step runs");
+    assert_eq!(
+        step(&outcome, "early"),
+        Some((StepStatus::Succeeded, 1)),
+        "a refusal before retained work spends no attempt: {outcome:?}"
+    );
+    assert_eq!(model.remaining(), 0);
     leased
         .server
         .shutdown()

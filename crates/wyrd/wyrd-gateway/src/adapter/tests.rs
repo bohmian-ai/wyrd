@@ -69,14 +69,14 @@ fn model_of(deployment: &ProviderDeployment) -> &ModelId {
 /// # Errors
 ///
 /// Returns the [`UnsupportedRequest`] of [`super::prepare`].
-fn prepare(
+fn prepare<'a>(
     ingress: IngressDialect,
     operation: GatewayOperation,
     stream: bool,
-    body: &Value,
-    deployment: &ProviderDeployment,
+    body: &'a Value,
+    deployment: &'a ProviderDeployment,
     media: Option<&MediaRequest>,
-) -> Result<Prepared, UnsupportedRequest> {
+) -> Result<Prepared<'a>, UnsupportedRequest> {
     super::prepare(
         ingress,
         operation,
@@ -86,6 +86,18 @@ fn prepare(
         model_of(deployment),
         media,
     )
+}
+
+/// The JSON a prepared native request sends upstream.
+///
+/// # Panics
+///
+/// Panics when `prepared` is a translated request.
+fn native_json(prepared: &Prepared<'_>) -> Value {
+    let Prepared::Native(body) = prepared else {
+        panic!("native request expected, got {prepared:?}");
+    };
+    serde_json::to_value(body).expect("native body serializes")
 }
 
 /// Bearer authentication through credential `cred`.
@@ -362,6 +374,119 @@ async fn compatible_passthrough_rewrites_model_and_uses_provider_credential() {
             .all(|name| !name.as_str().starts_with("wyrd-")),
         "no gateway or caller headers reach the provider"
     );
+}
+
+/// Native preparation borrows the caller's body in planning and at dispatch.
+///
+/// Preparing a native body for two deployments shares the caller's one JSON
+/// object rather than copying it, yet each upstream request carries its own
+/// deployment's model in the caller's member position with every other
+/// member byte-identical, a body without a model gains one, and the caller's
+/// body is never changed between attempts. A non-object body is still
+/// refused before dispatch.
+///
+/// # Panics
+///
+/// Panics when a prepared body is copied or an upstream request differs.
+#[tokio::test]
+async fn request_preparation_avoids_duplicate_body_materialization() {
+    let server = MockServer::start().await;
+    let reply = json!({"id": "c1", "choices": []});
+    for route in ["/first/chat/completions", "/second/chat/completions"] {
+        answer(&server, route, "authorization", "Bearer sk", reply.clone()).await;
+    }
+    let target = |model: &str, route: &str| {
+        deployment(
+            model,
+            json!({"openai_compatible": {"base_url": format!("{}/{route}/", server.uri())}}),
+            bearer(),
+        )
+    };
+    let first = target("acme/first-model", "first");
+    let second = target("acme/second-model", "second");
+    let body = json!({
+        "stream": false,
+        "model": "acme/requested",
+        "messages": [{"role": "user", "content": "x".repeat(64 * 1024)}],
+        "metadata": {"nested": [1, {"deep": true}]},
+    });
+    let caller = body.clone();
+    let object = body.as_object().expect("object body");
+
+    for (deployment, native) in [(&first, "first-model"), (&second, "second-model")] {
+        let prepared = prepare(
+            IngressDialect::OpenAi,
+            GatewayOperation::ChatCompletions,
+            false,
+            &body,
+            deployment,
+            None,
+        )
+        .expect("a native body is representable");
+        let Prepared::Native(native_body) = &prepared else {
+            panic!("native request expected, got {prepared:?}");
+        };
+        assert!(
+            std::ptr::eq(native_body.body, object),
+            "preparation borrows the caller's body"
+        );
+        let mut expected = object.clone();
+        expected.insert("model".to_owned(), json!(native));
+        assert_eq!(
+            serde_json::to_string(native_body).expect("serializes"),
+            serde_json::to_string(&expected).expect("serializes"),
+            "only the model changes, in place"
+        );
+    }
+
+    let modelless = json!({"input": "hi"});
+    let applied = super::NativeBody {
+        body: modelless.as_object().expect("object body"),
+        model: Some("first-model"),
+    };
+    assert_eq!(
+        serde_json::to_string(&applied).expect("serializes"),
+        r#"{"input":"hi","model":"first-model"}"#,
+        "an absent model follows the caller's members"
+    );
+
+    let refusal = prepare(
+        IngressDialect::OpenAi,
+        GatewayOperation::ChatCompletions,
+        false,
+        &json!(["not", "an", "object"]),
+        &first,
+        None,
+    )
+    .expect_err("a non-object body is refused");
+    assert_eq!(refusal.field, "body", "{refusal}");
+
+    let dispatch = dispatch(&server);
+    for deployment in [&first, &second] {
+        let result = attempt(
+            &dispatch,
+            IngressDialect::OpenAi,
+            deployment,
+            Some("sk"),
+            &body,
+        )
+        .await;
+        let AttemptResult::Completed { body: answer, .. } = result else {
+            panic!("completion expected, got {result:?}");
+        };
+        assert_eq!(parsed(&answer), reply);
+    }
+    assert_eq!(body, caller, "attempts never change the caller's body");
+    let requests = server.received_requests().await.expect("recording");
+    assert_eq!(requests.len(), 2, "one upstream request per attempt");
+    for (request, native) in requests.iter().zip(["first-model", "second-model"]) {
+        let mut expected = caller.clone();
+        expected["model"] = json!(native);
+        assert_eq!(
+            serde_json::from_slice::<Value>(&request.body).expect("json body"),
+            expected
+        );
+    }
 }
 
 /// Noncanonical native answer bytes reach the caller unchanged.
@@ -758,18 +883,19 @@ fn operations_and_dialects_are_matched_to_the_adapter() {
         .expect_err(field);
         assert_eq!(error.field, field, "{error}");
     }
+    let body = json!({"model": "acme/m", "input": "hi"});
     let embeddings = prepare(
         IngressDialect::OpenAi,
         GatewayOperation::Embeddings,
         false,
-        &json!({"model": "acme/m", "input": "hi"}),
+        &body,
         &compatible,
         None,
     )
     .expect("compatible embeddings pass through");
     assert_eq!(
-        embeddings,
-        Prepared::Native(json!({"model": "m", "input": "hi"}))
+        native_json(&embeddings),
+        json!({"model": "m", "input": "hi"})
     );
 }
 
@@ -2231,11 +2357,12 @@ fn media_files_are_matched_to_the_route() {
             "file",
         ),
     ]);
+    let body = json!({"model": "acme/m", "prompt": "hat"});
     let edit = prepare(
         IngressDialect::OpenAi,
         GatewayOperation::Images,
         false,
-        &json!({"model": "acme/m", "prompt": "hat"}),
+        &body,
         &compatible,
         Some(&media_of(
             OpenAiMediaRoute::ImageEdits,
@@ -2243,10 +2370,7 @@ fn media_files_are_matched_to_the_route() {
         )),
     )
     .expect("an edit with images and a mask passes through");
-    assert_eq!(
-        edit,
-        Prepared::Native(json!({"model": "m", "prompt": "hat"}))
-    );
+    assert_eq!(native_json(&edit), json!({"model": "m", "prompt": "hat"}));
 }
 
 /// Batches lifecycle actions reach the `OpenAI` Files and Batches routes: an

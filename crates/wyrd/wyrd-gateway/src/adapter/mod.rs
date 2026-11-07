@@ -23,8 +23,8 @@ mod stream;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use base64::Engine as _;
-use serde::Serialize;
 use serde::de::DeserializeOwned;
+use serde::{Deserialize as _, Serialize};
 use serde_json::value::{RawValue, to_raw_value};
 use serde_json::{Map, Value, json};
 use skald_spec::ProviderResponse;
@@ -116,11 +116,14 @@ impl Wire {
 }
 
 /// Request ready for one deployment.
+///
+/// A native request borrows the caller's body, so planning and dispatch never
+/// copy it; translated requests own their typed target bodies.
 #[derive(Debug, Clone, PartialEq)]
-pub(crate) enum Prepared {
+pub(crate) enum Prepared<'a> {
     /// A body already in the deployment's dialect, sent unchanged except for
     /// its model; the answer returns unchanged.
-    Native(Value),
+    Native(NativeBody<'a>),
     /// Chat Completions translated to Anthropic Messages; the answer
     /// translates back. Boxed so the variant does not inflate every `Native`.
     Anthropic(Box<AnthropicMessagesRequest>),
@@ -133,10 +136,63 @@ pub(crate) enum Prepared {
     Jev(Box<JevRequest>),
 }
 
+/// A caller's native JSON object with the deployment's model applied on the wire.
+///
+/// The override is applied as the body serializes, never by copying it: a
+/// present `model` member keeps its position with the new value, and an
+/// absent one follows the caller's members. Every other member serializes
+/// exactly as submitted.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) struct NativeBody<'a> {
+    /// The caller's body, shared by every attempt of the call.
+    body: &'a Map<String, Value>,
+    /// The deployment's native model, when the dialect carries it in the body.
+    model: Option<&'a str>,
+}
+
+impl NativeBody<'_> {
+    /// Returns the body with its model applied as an owned JSON value.
+    ///
+    /// Only Images, Audio and Batches lifecycle requests, whose clients build
+    /// multipart forms from a JSON tree, take this copy; every other path
+    /// serializes [`NativeBody`] directly.
+    pub(crate) fn to_value(self) -> Value {
+        let mut object = self.body.clone();
+        if let Some(model) = self.model {
+            object.insert("model".to_owned(), Value::String(model.to_owned()));
+        }
+        Value::Object(object)
+    }
+}
+
+impl Serialize for NativeBody<'_> {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeMap as _;
+
+        let Some(model) = self.model else {
+            return self.body.serialize(serializer);
+        };
+        let present = self.body.contains_key("model");
+        let mut map = serializer.serialize_map(Some(self.body.len() + usize::from(!present)))?;
+        for (key, value) in self.body {
+            if key == "model" {
+                map.serialize_entry(key, model)?;
+            } else {
+                map.serialize_entry(key, value)?;
+            }
+        }
+        if !present {
+            map.serialize_entry("model", model)?;
+        }
+        map.end()
+    }
+}
+
 /// Builds the upstream request of `body` for `model` on `deployment`.
 ///
 /// Pure and deterministic, so planning can use it to drop deployments that
-/// cannot represent a request before admission and dispatch repeats it.
+/// cannot represent a request before admission and dispatch repeats it. A
+/// native request only borrows `body`, so neither pass copies it.
 ///
 /// # Errors
 ///
@@ -148,15 +204,15 @@ pub(crate) enum Prepared {
 /// only to `OpenAI`-protocol adapters, as do Batches lifecycle bodies. Jev
 /// `systemone` bodies reach only Jev deployments; a Chat Completions body
 /// reaches Jev only as the typed Jev request in its last user message.
-pub(crate) fn prepare(
+pub(crate) fn prepare<'a>(
     ingress: IngressDialect,
     operation: GatewayOperation,
     stream: bool,
-    body: &Value,
+    body: &'a Value,
     deployment: &ProviderDeployment,
-    model: &ModelId,
+    model: &'a ModelId,
     media: Option<&MediaRequest>,
-) -> Result<Prepared, UnsupportedRequest> {
+) -> Result<Prepared<'a>, UnsupportedRequest> {
     let model = model.as_str();
     media::validate(operation, media, body)?;
     let chat = operation == GatewayOperation::ChatCompletions;
@@ -527,21 +583,20 @@ fn unsupported_operation(
     )
 }
 
-/// Copies a native body, rewriting `model` when the dialect carries it in the
+/// Borrows a native body, applying `model` when the dialect carries it in the
 /// body.
 ///
 /// # Errors
 ///
 /// Returns [`UnsupportedRequest`] for a non-object body.
-fn native(body: &Value, model: Option<&str>) -> Result<Value, UnsupportedRequest> {
-    let Value::Object(object) = body else {
+fn native<'a>(
+    body: &'a Value,
+    model: Option<&'a str>,
+) -> Result<NativeBody<'a>, UnsupportedRequest> {
+    let Value::Object(body) = body else {
         return Err(UnsupportedRequest::new("body", "must be a JSON object"));
     };
-    let mut object = object.clone();
-    if let Some(model) = model {
-        object.insert("model".to_owned(), Value::String(model.to_owned()));
-    }
-    Ok(Value::Object(object))
+    Ok(NativeBody { body, model })
 }
 
 /// Largest number of inputs one embeddings request may carry: the `OpenAI`
@@ -563,7 +618,7 @@ const MAX_EMBEDDING_INPUTS: usize = 2048;
 /// `encoding_format` for a format other than `float` or `base64`.
 fn embeddings(body: &Value) -> Result<(), UnsupportedRequest> {
     let request: OpenAiEmbeddingsRequest =
-        serde_json::from_value(body.clone()).map_err(|error| {
+        OpenAiEmbeddingsRequest::deserialize(body).map_err(|error| {
             UnsupportedRequest::new(
                 "body",
                 format!("is not a valid embeddings request: {error}"),
@@ -622,7 +677,7 @@ fn inputs(input: &OpenAiEmbeddingsInput) -> (usize, bool) {
 /// instead of returning the answer.
 pub(crate) fn faithful_embeddings(request: &Value, answer: &RawValue) -> bool {
     let (Ok(request), Ok(answer)) = (
-        serde_json::from_value::<OpenAiEmbeddingsRequest>(request.clone()),
+        OpenAiEmbeddingsRequest::deserialize(request),
         serde_json::from_str::<Value>(answer.get()),
     ) else {
         return false;
@@ -696,7 +751,7 @@ fn streamable(
 ///
 /// Returns [`UnsupportedRequest`] naming the decode failure.
 fn chat_request(body: &Value) -> Result<OpenAiChatRequest, UnsupportedRequest> {
-    serde_json::from_value(body.clone()).map_err(|error| {
+    OpenAiChatRequest::deserialize(body).map_err(|error| {
         UnsupportedRequest::new(
             "body",
             format!("is not a valid chat completion request: {error}"),

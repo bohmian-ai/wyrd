@@ -24,8 +24,8 @@ use wyrd_spec::ids::ModelId;
 
 use super::stream::{ChatChunks, Frames, MediaCapture, StreamCapture, relay, relay_media};
 use super::{
-    BatchAction, IngressDialect, MediaRequest, Prepared, Wire, complete, faithful_embeddings,
-    prepare, refusal,
+    BatchAction, IngressDialect, MediaRequest, NativeBody, Prepared, Wire, complete,
+    faithful_embeddings, prepare, refusal,
 };
 use crate::credential::ProviderSecret;
 use crate::engine::{
@@ -243,7 +243,7 @@ impl Client {
     async fn open(
         self,
         operation: GatewayOperation,
-        prepared: Prepared,
+        prepared: Prepared<'_>,
     ) -> ProviderResult<ProviderByteStream> {
         let body = match &prepared {
             Prepared::Native(body) => to_raw_value(body),
@@ -276,10 +276,16 @@ impl Client {
     /// Returns the Skald provider error of the exchange, or
     /// [`ProviderError::VariantMismatch`] for a client other than `OpenAI` or a
     /// translated request, which preparation rules out.
-    async fn media(self, media: &MediaRequest, prepared: Prepared) -> ProviderResult<MediaAnswer> {
+    async fn media(
+        self,
+        media: &MediaRequest,
+        prepared: Prepared<'_>,
+    ) -> ProviderResult<MediaAnswer> {
         match (self, prepared) {
             (Self::OpenAi(client), Prepared::Native(body)) => {
-                client.send_media(media.route, &body, &media.files).await
+                client
+                    .send_media(media.route, &body.to_value(), &media.files)
+                    .await
             }
             (_, _) => Err(mismatch()),
         }
@@ -297,11 +303,13 @@ impl Client {
     async fn open_media(
         self,
         media: &MediaRequest,
-        prepared: Prepared,
+        prepared: Prepared<'_>,
     ) -> ProviderResult<ProviderByteStream> {
         match (self, prepared) {
             (Self::OpenAi(client), Prepared::Native(body)) => {
-                client.stream_media(media.route, &body, &media.files).await
+                client
+                    .stream_media(media.route, &body.to_value(), &media.files)
+                    .await
             }
             (_, _) => Err(mismatch()),
         }
@@ -319,12 +327,14 @@ impl Client {
         self,
         action: &BatchAction,
         native: &str,
-        prepared: Prepared,
+        prepared: Prepared<'_>,
     ) -> ProviderResult<MediaAnswer> {
         match (self, prepared) {
             (Self::OpenAi(client), Prepared::Native(body)) => {
                 let (route, file) = action.route(native);
-                client.send_batch(&route, &body, file.as_ref()).await
+                client
+                    .send_batch(&route, &body.to_value(), file.as_ref())
+                    .await
             }
             (_, _) => Err(mismatch()),
         }
@@ -344,9 +354,9 @@ impl Client {
     async fn send(
         self,
         operation: GatewayOperation,
-        prepared: Prepared,
+        prepared: Prepared<'_>,
     ) -> ProviderResult<ProviderResponse> {
-        let raw = |body: &serde_json::Value| {
+        let raw = |body: &NativeBody<'_>| {
             to_raw_value(body).map_err(|error| ProviderError::decode("gateway", error))
         };
         let response = match (self, prepared) {
@@ -520,7 +530,7 @@ impl Client {
     async fn stream(
         self,
         attempt: &ProviderAttempt<'_>,
-        prepared: Prepared,
+        prepared: Prepared<'_>,
         wire: Wire,
         frames: Frames,
         limit: usize,
@@ -565,7 +575,7 @@ impl Client {
         self,
         media: &MediaRequest,
         attempt: &ProviderAttempt<'_>,
-        prepared: Prepared,
+        prepared: Prepared<'_>,
         limit: usize,
     ) -> AttemptResult {
         match self.open_media(media, prepared).await {
@@ -609,7 +619,7 @@ impl Client {
         self,
         action: &BatchAction,
         attempt: &ProviderAttempt<'_>,
-        prepared: Prepared,
+        prepared: Prepared<'_>,
     ) -> AttemptResult {
         match self.batch(action, attempt.model.as_str(), prepared).await {
             Ok(answer) => match serde_json::from_slice::<Box<RawValue>>(&answer.bytes) {

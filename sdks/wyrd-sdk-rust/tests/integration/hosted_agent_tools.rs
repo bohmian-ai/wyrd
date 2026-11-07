@@ -347,12 +347,17 @@ fn reply(request: &Request, script: &Script) -> ResponseTemplate {
             if results(&messages).contains_key("a1-p-report") {
                 return ResponseTemplate::new(200).set_body_json(json!({ "garbled": true }));
             }
-            if turn == 3 {
-                let replayed = json!({ "name": "replayed", "value": "once" });
-                return calls(&[
-                    ("a2-replay", "publish", replayed.clone()),
-                    ("a2-replay", "publish", replayed),
-                ]);
+            let replayed = |name: &str, value: &str| json!({ "name": name, "value": value });
+            match turn {
+                3 => {
+                    return calls(&[
+                        ("a2-replay", "publish", replayed("replayed", "once")),
+                        ("a2-replay", "publish", replayed("replayed", "once")),
+                    ]);
+                }
+                4 => return calls(&[("a2-replay", "publish", replayed("renamed", "once"))]),
+                5 => return calls(&[("a2-replay", "publish", replayed("replayed", "twice"))]),
+                _ => {}
             }
             return publish_all(turn, "a2-", RETRIED).unwrap_or_else(done);
         }
@@ -987,8 +992,10 @@ fn answers(messages: &[Value], id: &str) -> Vec<Value> {
 /// undecodable model reply; the fresh second attempt reuses the name, and its publications,
 /// not the first attempt's, feed the consumer, each attributed to the
 /// attempt the host ran. Replaying one provider call ID returns the one
-/// original receipt and accepts one publication. A drafter that only
-/// answers publishes nothing, and its consumer fails before any model call.
+/// original receipt and accepts one publication; the same call ID under
+/// another name or with another value is refused and retains nothing new.
+/// A drafter that only answers publishes nothing, and its consumer fails
+/// before any model call.
 ///
 /// # Panics
 /// Panics when a verification is refused or an attempt, attribution,
@@ -1010,14 +1017,23 @@ async fn agent_publish_retries_use_host_identity() {
     assert_eq!(lines(&consumer["c-report"]), RETRIED.trim_end());
     let drafted = desk.requests("DRAFT:").await;
     let last = messages(drafted.last().expect("the drafter called the model"));
+    let answered = answers(&last, "a2-replay");
     assert_eq!(
-        answers(&last, "a2-replay"),
+        answered[..2],
         [
             json!({ "name": "replayed", "kind": "json" }),
             json!({ "name": "replayed", "kind": "json" }),
         ],
         "a replayed call returns its original receipt"
     );
+    assert_eq!(answered.len(), 4, "{answered:?}");
+    for changed in &answered[2..] {
+        assert_eq!(
+            refusal(changed),
+            (INVALID, "publication_name"),
+            "the call cannot take another name or value"
+        );
+    }
     let mut listed: Vec<(u32, String, PublicationKind)> = desk
         .publications(&result)
         .await
@@ -1055,6 +1071,21 @@ async fn agent_publish_retries_use_host_identity() {
         PublicationContent::Json {
             value: json!("attempt 1")
         }
+    );
+    assert_eq!(
+        execution
+            .publication(
+                &draft,
+                &PublicationName::new("replayed").expect("name"),
+                &selector(2, None)
+            )
+            .await
+            .expect("the replayed publication reads")
+            .content,
+        PublicationContent::Json {
+            value: json!("once")
+        },
+        "only the original arguments are retained"
     );
 
     let result = desk.verify("report-pipeline", "NO-PUBLISH").await;

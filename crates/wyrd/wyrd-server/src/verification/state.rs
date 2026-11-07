@@ -224,7 +224,7 @@ pub enum PublicationAcceptance {
     /// accepted kind is its receipt.
     Replayed(PublicationKind),
     /// Another call, or the same call with other arguments, holds the name
-    /// in this attempt.
+    /// in this attempt, or the same call already published another name.
     Conflict,
     /// Accepting it would cross a cumulative ceiling; nothing changed.
     OverBudget(PublicationLimit),
@@ -760,9 +760,9 @@ impl RunState {
     }
 
     /// Accept `call`'s publication, once, within `budget`: the same call
-    /// with the same arguments replays, another holder of the name in the
-    /// attempt conflicts, and a publication over a cumulative ceiling is
-    /// refused. Every answer but a refusal over a ceiling is returned only
+    /// with the same name and arguments replays, another holder of the name
+    /// in the attempt, or the same call under another name or arguments,
+    /// conflicts, and a publication over a cumulative ceiling is refused. Every answer but a refusal over a ceiling is returned only
     /// once an accepted revision holds the publication it names.
     pub async fn accept_publication(
         &self,
@@ -955,8 +955,9 @@ impl RunState {
 }
 
 /// The receipt `call` holds in `state`: replayed with the accepted kind for
-/// the same call and arguments, a conflict for any other holder of the name
-/// in the producer attempt, or `None` while the name is free.
+/// the same call, name, and arguments, a conflict for any other holder of
+/// the name in the producer attempt or for the same call under another name
+/// or arguments, or `None` while both the name and the call are free.
 fn receipt(state: &ExecutionState, call: PublicationCall<'_>) -> Option<PublicationAcceptance> {
     let wanted = call.publication;
     state
@@ -964,10 +965,13 @@ fn receipt(state: &ExecutionState, call: PublicationCall<'_>) -> Option<Publicat
         .iter()
         .find(|accepted| {
             accepted.publication.producer == wanted.producer
-                && accepted.publication.name == wanted.name
+                && (accepted.publication.name == wanted.name || accepted.call_id == call.call_id)
         })
         .map(|accepted| {
-            if accepted.call_id == call.call_id && accepted.arguments == *call.arguments {
+            if accepted.call_id == call.call_id
+                && accepted.publication.name == wanted.name
+                && accepted.arguments == *call.arguments
+            {
                 PublicationAcceptance::Replayed(accepted.publication.content.kind())
             } else {
                 PublicationAcceptance::Conflict
@@ -1065,12 +1069,19 @@ mod tests {
 
     use vala_verify::blocks::Checkpoints as _;
     use wyrd_spec::DataTenantId;
+    use wyrd_spec::auth::Sha256Hex;
     use wyrd_spec::auth::{Attribution, PrincipalId};
     use wyrd_spec::ids::{CardUid, ExecutionId};
-    use wyrd_spec::verification::execution::VerificationOutcome;
+    use wyrd_spec::verification::PublicationName;
+    use wyrd_spec::verification::execution::{
+        Publication, PublicationContent, PublicationKind, VerificationOutcome,
+    };
+    use wyrd_spec::verification::state::ExecutionState;
     use wyrd_spec::verification::{TaskId, VerificationVerdict};
 
-    use super::{Decision, RunState, StateRow};
+    use super::{
+        Decision, PublicationAcceptance, PublicationBudget, PublicationCall, RunState, StateRow,
+    };
     use crate::components::gateway::recording::TableGate;
     use crate::scribe_outbox::{ScribeSink, ScribeTable};
 
@@ -1089,6 +1100,15 @@ mod tests {
     /// Panics when a fresh UUID is not a Card UID, or when called outside a
     /// Tokio runtime, where the outbox cannot spawn its writer.
     fn held_state() -> (RunState, Arc<TableGate>) {
+        held_at(ExecutionState::fresh(), 0)
+    }
+
+    /// A direct execution's writer of `state`, accepted at `revision`,
+    /// written through a Scribe that holds every revision until released.
+    ///
+    /// # Panics
+    /// Panics as [`held_state`] does.
+    fn held_at(state: ExecutionState, revision: i64) -> (RunState, Arc<TableGate>) {
         let scribe = Arc::new(TableGate::new(ScribeTable::ExecutionEvents));
         let outbox = ScribeSink::local_outbox(Arc::clone(&scribe) as _, None);
         let (verifier, subject) = (uid(), uid());
@@ -1105,11 +1125,14 @@ mod tests {
                 PrincipalId::new(uuid::Uuid::now_v7()),
             ),
         };
-        let state = RunState::fresh(
+        let state = RunState::at(
             outbox,
             DataTenantId::new_v7(),
             row,
             tokio::time::Instant::now() + Duration::from_secs(30),
+            None,
+            state,
+            revision,
         );
         (state, scribe)
     }
@@ -1321,5 +1344,118 @@ mod tests {
         assert!(state.begin(&factual_id, 1).await.is_err());
         assert!(state.begin(&sensitive_id, 1).await.is_err());
         assert!(revisions(&scribe).is_empty());
+    }
+
+    /// Accept JSON `value` under `name` for provider call `call` of `task`'s
+    /// `attempt` into `state`.
+    ///
+    /// # Panics
+    /// Panics when `name` is invalid or `value` does not serialize.
+    async fn publish(
+        state: &RunState,
+        (task_id, attempt): (&str, u32),
+        call: &str,
+        name: &str,
+        value: serde_json::Value,
+    ) -> PublicationAcceptance {
+        let arguments = serde_json::json!({ "name": name, "value": value });
+        let publication = Publication {
+            name: PublicationName::new(name).expect("name"),
+            producer: super::producer(&task(task_id), attempt),
+            content: PublicationContent::Json { value },
+        };
+        state
+            .accept_publication(
+                PublicationCall {
+                    publication: &publication,
+                    call_id: call,
+                    arguments: &Sha256Hex::digest(
+                        &serde_jcs::to_vec(&arguments).expect("arguments serialize"),
+                    ),
+                    objects: &[],
+                    retained_bytes: 1,
+                },
+                PublicationBudget {
+                    max_count: 16,
+                    max_bytes: 1024,
+                },
+            )
+            .await
+    }
+
+    /// Proves one provider call keeps the one name and arguments it was
+    /// accepted with, live and in a state restored from its accepted
+    /// revision: its identical replay answers the original receipt, the same
+    /// call under another name or with another value conflicts, another call
+    /// cannot take the name, a fresh attempt may, and nothing else is kept.
+    ///
+    /// # Panics
+    /// Panics when a call acquires a second name or value, or a fresh
+    /// attempt cannot reuse the name.
+    #[tokio::test]
+    async fn a_call_keeps_its_original_publication() {
+        let (live, scribe) = held_state();
+        scribe
+            .release
+            .add_permits(tokio::sync::Semaphore::MAX_PERMITS);
+        let draft = ("draft", 1);
+        assert_eq!(
+            publish(&live, draft, "p1", "a", serde_json::json!(1)).await,
+            PublicationAcceptance::Accepted
+        );
+        assert_eq!(
+            publish(&live, draft, "p1", "b", serde_json::json!(1)).await,
+            PublicationAcceptance::Conflict,
+            "a live call cannot take a second name"
+        );
+        let (restored, scribe) = held_at(live.snapshot().await, 1);
+        scribe
+            .release
+            .add_permits(tokio::sync::Semaphore::MAX_PERMITS);
+        for (call, name, value, expected) in [
+            (
+                "p1",
+                "a",
+                1,
+                PublicationAcceptance::Replayed(PublicationKind::Json),
+            ),
+            ("p1", "b", 1, PublicationAcceptance::Conflict),
+            ("p1", "a", 2, PublicationAcceptance::Conflict),
+            ("p2", "a", 1, PublicationAcceptance::Conflict),
+        ] {
+            assert_eq!(
+                publish(&restored, draft, call, name, serde_json::json!(value)).await,
+                expected,
+                "{call} {name} {value}"
+            );
+        }
+        assert_eq!(
+            publish(&restored, ("draft", 2), "p1", "a", serde_json::json!(3)).await,
+            PublicationAcceptance::Accepted,
+            "a fresh attempt may reuse the name and call ID"
+        );
+        let kept: Vec<(u32, String, serde_json::Value)> = restored
+            .snapshot()
+            .await
+            .publications
+            .into_iter()
+            .map(|accepted| {
+                let PublicationContent::Json { value } = accepted.publication.content else {
+                    panic!("only JSON was published");
+                };
+                (
+                    accepted.publication.producer.attempt,
+                    accepted.publication.name.as_str().to_owned(),
+                    value,
+                )
+            })
+            .collect();
+        assert_eq!(
+            kept,
+            [
+                (1, "a".to_owned(), serde_json::json!(1)),
+                (2, "a".to_owned(), serde_json::json!(3)),
+            ]
+        );
     }
 }

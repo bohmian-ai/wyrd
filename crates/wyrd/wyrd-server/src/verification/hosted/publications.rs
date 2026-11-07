@@ -353,7 +353,8 @@ fn answer(call: &PublishCall, held: PublicationAcceptance) -> Result<Publication
         PublicationAcceptance::Replayed(kind) => Ok(kind),
         PublicationAcceptance::Conflict => Err(structured(&WyrdError::Validation {
             message: format!(
-                "the name {} is already published in this attempt; publish under another name",
+                "the name {} is already published in this attempt, or this call already \
+                 published another name or value; publish under another name in a new call",
                 call.name.as_str()
             ),
             details: serde_json::json!({

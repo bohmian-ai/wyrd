@@ -6,6 +6,7 @@
 //! [`Publications`]; no public endpoint accepts arbitrary paths.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::os::unix::fs::PermissionsExt as _;
 use std::sync::Arc;
 
 use serde_json::{Value, json};
@@ -18,8 +19,8 @@ use vala_bifrost_redux::contracts::{FrameAdmission, Scribe, ScribeError, ScribeI
 use vala_bifrost_redux::namespaces::BifrostNamespace;
 use vala_verify::InMemoryTraceSource;
 use vala_verify::blocks::{
-    ActionExecutor, AgentExecutor, BlockClock, CallInput, CallValue, CheckExecutor, Checkpoints,
-    DriftChecks, EngineError, EvidenceReader, VerificationEngine,
+    ActionExecutor, AgentExecutor, BlockClock, BlockError, CallInput, CallValue, CheckExecutor,
+    Checkpoints, DriftChecks, EngineError, EvidenceReader, VerificationEngine,
 };
 use wyrd_runtime::Permission;
 use wyrd_runtime::principal::PrincipalId;
@@ -1767,7 +1768,7 @@ async fn agent_publications_reach_a_recovered_consumer() {
         limits,
     )
     .with_execution(Arc::clone(&current));
-    evidence
+    let unread = evidence
         .read(&InputDeclaration::File {
             sha256: wyrd_spec::auth::Sha256Hex::digest(KEPT),
             size_bytes: KEPT.len() as u64,
@@ -1776,6 +1777,13 @@ async fn agent_publications_reach_a_recovered_consumer() {
         })
         .await
         .expect_err("the object inventory cannot be read by this caller");
+    assert!(
+        matches!(
+            &unread,
+            BlockError::Retryable { reason } if reason == "the evidence inventory cannot be read now"
+        ),
+        "{unread:?}"
+    );
 
     let producer = Producer {
         step_id: TaskId::new("draft").expect("task"),
@@ -1793,7 +1801,6 @@ async fn agent_publications_reach_a_recovered_consumer() {
         .join(leased.server.data_tenant_id().to_string())
         .join("evidence/sha256");
     let replayed = {
-        use std::os::unix::fs::PermissionsExt as _;
         std::fs::set_permissions(&objects, std::fs::Permissions::from_mode(0o000)).expect("chmod");
         let empty = Arc::new(Workspace::materialize(Vec::new(), limits, None).expect("workspace"));
         // The Agent's second call of its first turn was the publish.

@@ -382,7 +382,8 @@ impl VerificationEngine {
         }
     }
 
-    /// Forget `task`'s `attempt`, refused process capacity before it ran.
+    /// Forget `task`'s unsettled `attempt`, refused process capacity or its
+    /// definition; the store keeps an attempt that already retained work.
     ///
     /// # Errors
     /// Returns [`EngineError::Checkpoint`] when the record cannot be removed.

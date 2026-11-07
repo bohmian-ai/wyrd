@@ -23,6 +23,7 @@ import {
   verify,
   type VerificationResult,
   WyrdClient,
+  type WyrdError,
   WyrdState,
 } from "wyrd-ai";
 
@@ -403,4 +404,36 @@ test("agent_publishes_file_directory_and_json", async ({ server, provider, bundl
     asked.every((request) => !text(request).includes("CONSUME:")),
     `${question}: the consumer never reached the model`,
   ).toBe(true);
+});
+
+/**
+ * Every refused selection is refused at registration with the loader's
+ * stable code and its `agent_tools` diagnostic, registers nothing, and never
+ * reaches the model: an unknown tool, the provider-facing spelling of a
+ * built-in, a repeated tool, and `publish` on a requirement check's Agent.
+ */
+test("refused_selections_never_reach_the_model", async ({ provider, bundle: _ }) => {
+  const cards = await Cards.connect();
+  for (const [name, reason] of [
+    ["unknown-tool", "http.fetch is not a built-in tool"],
+    ["provider-spelling", "fs_write is not a built-in tool"],
+    ["duplicate-tool", "publish is selected more than once"],
+    ["check-publishes", "publish is available only to step Agents"],
+  ] as const) {
+    const refused = await cards.declareFromPath(fixture(`cards/hosted_agent_tools/invalid/${name}.yaml`)).then(
+      () => undefined,
+      (error: unknown) => error as WyrdError,
+    );
+    const problem = `${refused?.message} ${JSON.stringify(refused?.details)}`;
+    expect(refused?.code, `${name}: ${problem}`).toBe("WYRD_LOADER_400_INVALID_ENVELOPE");
+    expect(problem, name).toContain("agent_tools");
+    expect(problem, name).toContain(reason);
+    await expect(cards.resolveLatest("Verifier", name), name).rejects.toMatchObject({
+      code: "WYRD_REGISTRY_404_CARD_NOT_FOUND",
+    });
+  }
+  expect(
+    provider.received.some((request) => text(request).includes("NEVER CALLED")),
+    "no refused selection reached the model",
+  ).toBe(false);
 });

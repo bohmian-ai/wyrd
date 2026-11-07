@@ -16,13 +16,23 @@ from pathlib import Path
 from typing import Any
 
 import pytest
-from wyrd import verify
+from wyrd import WyrdError, verify
 from wyrd.cards import Cards
 from wyrd.client import WyrdClient
 from wyrd.state import WyrdState
 from wyrd.testing import WyrdTestServer
 
-from .support import ASSESSMENT, REPORT, Receiver, client_of, declare, pull, read_text, tool_results
+from .support import (
+    ASSESSMENT,
+    FIXTURES,
+    REPORT,
+    Receiver,
+    client_of,
+    declare,
+    pull,
+    read_text,
+    tool_results,
+)
 from .test_local_development import configure_gateway
 from .test_verifier_building_blocks import grants, requirement, step
 
@@ -210,3 +220,24 @@ def test_tool_calls_need_their_own_grant(
     assert consume["status"] == "failed"
     assert "published no" in consume.get("reason", ""), consume
     assert requests(receiver, "CONSUME: NARROWED-RUN") == [], "the consumer never reached the model"
+
+
+def test_refused_selections_never_reach_the_model(
+    cards: Cards, receiver: Receiver, publish_desk_bundle: Path
+) -> None:
+    for name, reason in [
+        ("unknown-tool", "http.fetch is not a built-in tool"),
+        ("provider-spelling", "fs_write is not a built-in tool"),
+        ("duplicate-tool", "publish is selected more than once"),
+        ("check-publishes", "publish is available only to step Agents"),
+    ]:
+        with pytest.raises(WyrdError) as refused:
+            cards.declare_from_path(FIXTURES / f"cards/hosted_agent_tools/invalid/{name}.yaml")
+        problem = f"{refused.value.message} {json.dumps(refused.value.details)}"
+        assert refused.value.code == "WYRD_LOADER_400_INVALID_ENVELOPE", (name, problem)
+        assert "agent_tools" in problem and reason in problem, (name, problem)
+        assert not cards.list(kind="Verifier", name=name).refs, name
+    assert not any(
+        "NEVER CALLED" in json.dumps(delivery.body)
+        for delivery in receiver.to("/v1/chat/completions")
+    ), "no refused selection reached the model"

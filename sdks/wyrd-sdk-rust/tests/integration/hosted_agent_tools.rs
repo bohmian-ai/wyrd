@@ -14,23 +14,33 @@
 use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::time::Duration;
 
+use secrecy::{ExposeSecret as _, SecretString};
 use serde_json::{Value, json};
 use tempfile::TempDir;
+use tokio::sync::Notify;
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, Request, ResponseTemplate};
+use wyrd_ai::cards::CardRef;
 use wyrd_ai::state::WyrdState;
 use wyrd_ai::verify::{
     Execution, ExecutionPageQuery, PublicationContent, PublicationKind, PublicationName,
     PublicationSelector, PublicationSummary, TaskId,
 };
-use wyrd_ai::{StepStatus, VerificationResult};
+use wyrd_ai::verify::{Submission, VerificationExecutionStatus};
+use wyrd_ai::{StepStatus, VerificationResult, WyrdClient};
 use wyrd_spec::auth::Sha256Hex;
+use wyrd_spec::auth::TokenAudience;
 use wyrd_testing::server::WyrdTestServer;
 
 use crate::local_development::configure_gateway;
 use crate::support::{Deployment, declare, pull};
 use crate::verifier_building_blocks::{completion, grants, requirement, step, tool_call};
+
+/// The stable code of a permission denial, carried by every denied tool
+/// call's error.
+const DENIED: &str = "WYRD_PERMISSION_403_DENIED_RBAC";
 
 /// The stable code of a refused tool argument.
 const INVALID: &str = "WYRD_SPEC_400_VALIDATION";
@@ -227,12 +237,25 @@ fn refusals(turn: usize) -> ResponseTemplate {
 /// The scripted model: one reply per request, chosen by the Agent's prompt
 /// marker, the review's marker, and the turn. `attempts` counts the
 /// `RETRY-RUN` drafter's first turns, so its two attempts carry distinct
-/// call IDs and only the first gets an undecodable reply.
-fn reply(request: &Request, attempts: &AtomicUsize) -> ResponseTemplate {
+/// call IDs and only the first gets an undecodable reply. The `CANCEL-RUN`
+/// drafter publishes `early`, then raises `waiting` and holds its next reply,
+/// which would publish `late`, long enough to be cancelled.
+fn reply(request: &Request, attempts: &AtomicUsize, waiting: &Notify) -> ResponseTemplate {
     let messages = messages(request);
     let prompt = text(&messages);
     let turn = turn(&messages);
     if prompt.contains("DRAFT:") {
+        if prompt.contains("CANCEL-RUN") {
+            return match turn {
+                0 => calls(&[("early", "publish", json!({ "name": "early", "value": 1 }))]),
+                1 => {
+                    waiting.notify_one();
+                    calls(&[("late", "publish", json!({ "name": "late", "value": 2 }))])
+                        .set_delay(Duration::from_secs(20))
+                }
+                _ => done(),
+            };
+        }
         if prompt.contains("NO-PUBLISH") {
             return done();
         }
@@ -364,6 +387,10 @@ struct PublishDesk {
     upstream: MockServer,
     /// The Card bundle, which every state loads from.
     bundle: TempDir,
+    /// The registered `publish-desk` Service.
+    root: CardRef,
+    /// Raised once the `CANCEL-RUN` drafter is waiting on its held reply.
+    waiting: Arc<Notify>,
     /// The hydrated Service, as a principal granted every tool.
     state: WyrdState,
 }
@@ -378,9 +405,11 @@ impl PublishDesk {
     async fn start() -> Self {
         let upstream = MockServer::start().await;
         let attempts = Arc::new(AtomicUsize::new(0));
+        let waiting = Arc::new(Notify::new());
+        let raised = Arc::clone(&waiting);
         Mock::given(method("POST"))
             .and(path("/v1/chat/completions"))
-            .respond_with(move |request: &Request| reply(request, &attempts))
+            .respond_with(move |request: &Request| reply(request, &attempts, &raised))
             .mount(&upstream)
             .await;
         let deployment = Deployment::start_with(
@@ -405,8 +434,20 @@ impl PublishDesk {
             deployment,
             upstream,
             bundle,
+            root: desk.root,
+            waiting,
             state,
         }
+    }
+
+    /// The hydrated Service, loaded with its server calls fixed to `client`
+    /// and Bifrost not started.
+    ///
+    /// # Panics
+    /// Panics when the bundle does not load.
+    fn state_as(&self, client: WyrdClient) -> WyrdState {
+        WyrdState::from_path_with(self.bundle.path().join("bundle"), client)
+            .expect("bundle loads offline")
     }
 
     /// Verify `question` with `verifier` now, as the every-tool principal.
@@ -1011,6 +1052,160 @@ async fn selected_hosted_tools_resolve_before_model_calls() {
     assert!(
         called.iter().all(|name| !name.contains('.')),
         "the model sees provider-facing names only: {called:?}"
+    );
+    desk.deployment.shutdown().await;
+}
+
+/// Assert `result`'s drafter called the `FULL-RUN` tools where only its
+/// `fs.write` calls ran and every other call was denied with [`DENIED`] and
+/// returned nothing, so it published nothing and its consumer failed before
+/// any model call for `question`.
+///
+/// # Panics
+/// Panics when a call, publication, or the consumer differs.
+async fn assert_writes_only(desk: &PublishDesk, result: &VerificationResult, question: &str) {
+    let draft = step(result, "draft");
+    assert!(!draft.tool_calls.is_empty(), "{question}");
+    for call in &draft.tool_calls {
+        let tool = serde_json::to_value(call.tool).expect("the tool serializes");
+        let denied = call
+            .error
+            .as_deref()
+            .is_some_and(|error| error.contains(DENIED));
+        if tool == "fs.write" {
+            assert!(!denied, "{question}: {call:?}");
+        } else {
+            assert!(denied, "{question}: {call:?}");
+            assert_eq!(
+                (call.output_sha256.as_ref(), call.returned_bytes),
+                (None, 0),
+                "{question}: a denied call returns nothing"
+            );
+        }
+    }
+    let drafted = desk.requests(question).await;
+    let denied = results(&messages(
+        drafted.last().expect("the drafter called the model"),
+    ));
+    assert!(
+        denied["p-assessment"].get("value").is_none()
+            && !denied["p-assessment"].to_string().contains("low"),
+        "{question}: a denied publish echoes no content"
+    );
+    assert!(desk.publications(result).await.is_empty(), "{question}");
+    assert_eq!(
+        step(result, "consume").status,
+        StepStatus::Failed,
+        "{question}"
+    );
+    assert!(
+        desk.requests(question)
+            .await
+            .iter()
+            .all(|request| !text(&messages(request)).contains("CONSUME:")),
+        "{question}: the consumer never reached the model"
+    );
+}
+
+/// Every hosted tool call is authorized on its own against the accepted
+/// authority: a principal granted only `fs.write`, and a delegate granted
+/// only `fs.write` acting for a principal granted every tool, both write
+/// scratch while each read, code, and publish call is denied with nothing
+/// returned or published. Cancelling a queued execution while its drafter
+/// waits on the model keeps the publication accepted before the
+/// cancellation and accepts nothing later.
+///
+/// # Panics
+/// Panics when a principal does not seed, a verification or cancellation
+/// is refused, or a call, publication, or status differs.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires the repository-managed Postgres journey lifecycle"]
+async fn tool_calls_recheck_permissions_and_revocation() {
+    let desk = PublishDesk::start().await;
+    let writes = grants(json!({ "tool": "fs.write" }));
+
+    let key = desk.deployment.granted_key("writes_only", &writes).await;
+    let state = desk.state_as(desk.deployment.client(&key));
+    let result = desk
+        .verify_as(&state, "report-pipeline", "FULL-RUN narrowed")
+        .await;
+    assert_writes_only(&desk, &result, "FULL-RUN narrowed").await;
+
+    let subject = desk
+        .deployment
+        .granted("publish_subject", &grants(json!("all")))
+        .await;
+    let actor = desk.deployment.granted("publish_delegate", &writes).await;
+    let token = desk
+        .deployment
+        .server()
+        .exchange_api_key(subject.api_key().expect("the subject has a key"))
+        .await
+        .expect("the subject's token exchanges");
+    let delegated = desk
+        .deployment
+        .rooted(
+            actor
+                .api_key()
+                .expect("the delegate has a key")
+                .expose_secret(),
+            &desk.root,
+        )
+        .on_behalf_of(SecretString::from(token), TokenAudience::Wyrd)
+        .await
+        .expect("the delegate acts for the subject");
+    let result = desk
+        .verify_as(
+            &desk.state_as(delegated),
+            "report-pipeline",
+            "FULL-RUN delegated",
+        )
+        .await;
+    assert_writes_only(&desk, &result, "FULL-RUN delegated").await;
+
+    let Submission::Queued(queued) = desk
+        .state
+        .run()
+        .observe()
+        .submit("report-pipeline", json!("CANCEL-RUN"))
+        .await
+        .expect("the review is submitted")
+    else {
+        panic!("Run evidence queues an execution");
+    };
+    desk.waiting.notified().await;
+    let execution = Execution::connect_with(*queued.id(), &desk.deployment.admin())
+        .await
+        .expect("the execution handle connects");
+    let cancelled = execution.cancel().await.expect("the execution cancels");
+    assert_eq!(cancelled.status, VerificationExecutionStatus::Cancelled);
+    let listed: Vec<(String, u32)> = execution
+        .publications(&ExecutionPageQuery {
+            limit: None,
+            cursor: None,
+        })
+        .await
+        .expect("the publications read")
+        .items
+        .into_iter()
+        .map(|publication| {
+            (
+                publication.name.as_str().to_owned(),
+                publication.producer.attempt,
+            )
+        })
+        .collect();
+    assert_eq!(
+        listed,
+        [("early".to_owned(), 1)],
+        "cancellation keeps accepted work and accepts nothing later"
+    );
+    assert!(
+        desk.requests("CANCEL-RUN")
+            .await
+            .iter()
+            .all(|request| !text(&messages(request)).contains("CONSUME:")),
+        "cancelled work starts no later Agent"
     );
     desk.deployment.shutdown().await;
 }

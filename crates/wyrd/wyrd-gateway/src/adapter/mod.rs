@@ -295,7 +295,9 @@ pub(crate) fn prepare<'a>(
 /// usage.
 ///
 /// A raw answer is a native passthrough whose bytes return unchanged; a parsed
-/// copy only yields its usage, read as `wire`. Typed Anthropic and Google
+/// copy yields its usage, read as `wire`, and is returned for the capture
+/// projection when `capture` selects it, so a captured answer decodes once.
+/// Every other answer returns no decoded copy. Typed Anthropic and Google
 /// answers translate to a chat completion, serialized once and named `id`
 /// when the provider supplies no usable identifier. A typed Jev answer
 /// returns as Jev's own response with its usage, or, when `translated` (the
@@ -311,12 +313,13 @@ pub(crate) fn complete(
     response: ProviderResponse,
     wire: Wire,
     translated: bool,
+    capture: bool,
     id: &str,
     model: &str,
-) -> Result<(Box<RawValue>, AttemptUsage), AttemptUsage> {
+) -> Result<(Box<RawValue>, AttemptUsage, Option<Value>), AttemptUsage> {
     let chat_completion = |usage: AttemptUsage, chat: Option<OpenAiChatResponse>| {
         chat.and_then(|chat| to_raw_value(&chat).ok())
-            .map(|chat| (chat, usage.clone()))
+            .map(|chat| (chat, usage.clone(), None))
             .ok_or(usage)
     };
     match response {
@@ -324,7 +327,7 @@ pub(crate) fn complete(
             let body: Value =
                 serde_json::from_str(raw.get()).map_err(|_| AttemptUsage::default())?;
             let usage = usage(wire, &body);
-            Ok((raw, usage))
+            Ok((raw, usage, capture.then_some(body)))
         }
         ProviderResponse::AnthropicMessage(native) => {
             let usage = usage(
@@ -349,7 +352,7 @@ pub(crate) fn complete(
                 return chat_completion(usage, jev::chat_response(&answer, id));
             }
             to_raw_value(&answer)
-                .map(|body| (body, usage.clone()))
+                .map(|body| (body, usage.clone(), None))
                 .map_err(|_| usage)
         }
         _ => Err(AttemptUsage::default()),

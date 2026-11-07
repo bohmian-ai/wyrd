@@ -2952,7 +2952,9 @@ async fn capturing(
 async fn selected_capture_is_scrubbed_bounded_and_leaves_answers_unchanged() {
     const CANARY: &str = "sk-capture-canary-77";
     let server = MockServer::start().await;
-    let answer = format!(r#"{{"id":"c1","choices":[],"meta":{{"echo":{{"note":"{CANARY}"}}}}}}"#);
+    let answer = format!(
+        r#"{{"id":"c1","choices":[],"meta":{{"echo":{{"note":"{CANARY}"}}}},"x":"\u00e9 é","usage":{{"total_tokens":8,"prompt_tokens":3,"completion_tokens":5}}}}"#
+    );
     Mock::given(method("POST"))
         .and(path("/v1/chat/completions"))
         .and(wiremock::matchers::body_partial_json(
@@ -2994,7 +2996,7 @@ async fn selected_capture_is_scrubbed_bounded_and_leaves_answers_unchanged() {
     let AttemptResult::Completed {
         body: ResponseBody::Json(raw),
         capture: Some(ResponseCapture::Json(capture)),
-        ..
+        usage,
     } = buffered
     else {
         panic!("captured JSON expected: {buffered:?}");
@@ -3002,6 +3004,25 @@ async fn selected_capture_is_scrubbed_bounded_and_leaves_answers_unchanged() {
     assert_eq!(raw.get(), answer, "the caller's answer is unchanged");
     assert!(!capture.to_string().contains(CANARY), "{capture}");
     assert_eq!(capture["meta"]["echo"]["note"], "");
+    assert_eq!(capture["x"], "é é");
+    assert!(usage.normalized.is_some(), "{usage:?}");
+    // The usage decode is the capture's only decode, and only when selected.
+    for selected in [true, false] {
+        let native = serde_json::value::RawValue::from_string(answer.clone()).expect("raw");
+        let (bytes, mapped, decoded) = super::complete(
+            skald_spec::ProviderResponse::RawV1(native),
+            super::Wire::OpenAi,
+            false,
+            selected,
+            "c1",
+            "m",
+        )
+        .expect("native answer maps");
+        assert_eq!(bytes.get(), answer, "the caller's answer is unchanged");
+        assert_eq!(mapped, usage);
+        let expected = selected.then(|| serde_json::from_str::<Value>(&answer).expect("json"));
+        assert_eq!(decoded, expected, "selected: {selected}");
+    }
     let unselected = attempt(
         &dispatch,
         IngressDialect::OpenAi,

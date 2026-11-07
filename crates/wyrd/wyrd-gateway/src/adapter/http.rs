@@ -745,21 +745,27 @@ impl ProviderDispatch for HttpProviderDispatch {
             }
         };
         let mapped = tracing::info_span!("gateway.translate", direction = "response")
-            .in_scope(|| complete(response, wire, translated, &id, model));
+            .in_scope(|| complete(response, wire, translated, attempt.capture, &id, model));
         match mapped {
-            Ok((body, usage))
+            Ok((body, usage, decoded))
                 if attempt.operation != GatewayOperation::Embeddings
                     || faithful_embeddings(attempt.body, &body) =>
             {
                 AttemptResult::Completed {
-                    capture: captured(&attempt, &body),
+                    capture: match decoded {
+                        Some(decoded) => ResponseCapture::json(
+                            decoded,
+                            attempt.credential.map(ProviderSecret::expose),
+                        ),
+                        None => captured(&attempt, &body),
+                    },
                     body: ResponseBody::Json(body),
                     usage,
                 }
             }
             // An answer that cannot be mapped, or an embeddings answer that
             // ignores its request, fails rather than returning as success.
-            Ok((_, usage)) | Err(usage) => AttemptResult::Failed {
+            Ok((_, usage, _)) | Err(usage) => AttemptResult::Failed {
                 class: FailureClass::Rejected,
                 usage,
             },

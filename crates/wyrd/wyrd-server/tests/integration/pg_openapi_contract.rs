@@ -1526,11 +1526,14 @@ async fn card_contract_publishes_typed_lifecycle_and_problem_shapes() {
 /// document names no retired evaluation identifier — neither an abbreviation
 /// (`Eval…`, `…_EVAL_…`) nor an expanded product name (`EvaluationRun`,
 /// `evaluation_runs`, `/evaluations`), while descriptive `Evaluation` prose
-/// and words such as `retrieval` stay legal.
+/// and words such as `retrieval` stay legal. A recorded tool call names one
+/// built-in by its dotted identity, the new `fs.write` and `publish`
+/// included, and never by its provider-facing spelling.
 ///
 /// # Panics
 /// Panics when the server fails to start or stop, when a Verification path,
-/// method, status, or schema reference differs, or when the document names a
+/// method, status, or schema reference differs, when a recorded tool
+/// identity is missing or provider-spelled, or when the document names a
 /// retired evaluation identifier.
 #[tokio::test]
 async fn verification_contract_publishes_eleven_typed_operations_and_the_local_upload() {
@@ -1678,6 +1681,29 @@ async fn verification_contract_publishes_eleven_typed_operations_and_the_local_u
             .iter()
             .all(|status| documented.contains(status)),
         "{documented:?}"
+    );
+
+    let tool = resolve_schema(
+        &document,
+        &document["components"]["schemas"]["ToolCallRecord"]["properties"]["tool"],
+    );
+    let tools: BTreeSet<&str> = tool["enum"]
+        .as_array()
+        .expect("a recorded tool is one built-in")
+        .iter()
+        .filter_map(Value::as_str)
+        .collect();
+    assert!(
+        ["fs.write", "publish", "fs.read", "code.run"]
+            .iter()
+            .all(|name| tools.contains(name)),
+        "{tools:?}"
+    );
+    assert!(
+        tools
+            .iter()
+            .all(|name| name.contains('.') || *name == "publish"),
+        "recorded tools keep their dotted identity, never a provider spelling: {tools:?}"
     );
 
     let retired = retired_vocabulary(&document.to_string());

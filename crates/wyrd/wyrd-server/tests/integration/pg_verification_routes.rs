@@ -2349,6 +2349,106 @@ async fn verdict_declarations_validate_before_persistence() {
     server.shutdown().await.expect("test server shuts down");
 }
 
+/// A Verifier of one Agent step selecting `tools`, or, when `check` is set,
+/// of one Agent requirement check selecting them.
+fn selecting(tools: &[&str], check: bool) -> Value {
+    let agent = json!({
+        "execution_route": { "kind": "wyrd_gateway", "deployment": "openai" },
+        "tool_names": tools,
+        "prompt": {
+            "provider": "openai", "model": "gpt-4o",
+            "messages": [{ "role": "user", "content": "Draft {{answer}}" }]
+        }
+    });
+    let call = json!({ "kind": "agent", "inputs": { "answer": "inputs.answer" }, "agent": agent });
+    if check {
+        let mut call = call;
+        call["agent"]["prompt"]["response_format"] = json!("verdict");
+        return json!({
+            "inputs": { "answer": { "type": "json" } },
+            "requirements": [{ "id": "judged", "statement": "The answer is judged.", "check": call }]
+        });
+    }
+    json!({
+        "inputs": { "answer": { "type": "json" } },
+        "steps": [{ "id": "draft", "action": call }]
+    })
+}
+
+/// `POST /v1/cards` refuses each invalid Agent tool selection as a stable
+/// validation problem with its `agent_tools` rule before persistence: an
+/// unknown tool, the provider-facing spelling of a built-in, a repeated
+/// tool, and `publish` on a requirement check. A step selecting the new
+/// built-ins registers and reads back under their dotted identities.
+///
+/// # Panics
+/// Panics when a refused selection registers or answers another refusal,
+/// or the valid one is refused or reads back other identities.
+#[tokio::test(flavor = "current_thread")]
+async fn agent_tool_selections_validate_before_persistence() {
+    let server = WyrdTestServer::start_in_process()
+        .await
+        .expect("test server starts");
+    let (_, jwt) = user(&server, "vr-selector", &["editor"]).await;
+    for (name, spec, reason) in [
+        (
+            "vr-unknown-tool",
+            selecting(&["http.fetch"], false),
+            "http.fetch is not a built-in tool",
+        ),
+        (
+            "vr-provider-spelling",
+            selecting(&["fs_write"], false),
+            "fs_write is not a built-in tool",
+        ),
+        (
+            "vr-duplicate-tool",
+            selecting(&["publish", "publish"], false),
+            "publish is selected more than once",
+        ),
+        (
+            "vr-check-publishes",
+            selecting(&["publish"], true),
+            "publish is available only to step Agents",
+        ),
+    ] {
+        let (status, problem) = declare_verifier(&server, &jwt, name, &spec).await;
+        assert_eq!(
+            (status, &problem["code"], &problem["details"]["rule"]),
+            (
+                StatusCode::BAD_REQUEST,
+                &json!("WYRD_SPEC_400_VALIDATION"),
+                &json!("agent_tools")
+            ),
+            "{name}: {problem}"
+        );
+        assert!(
+            problem["detail"]
+                .as_str()
+                .is_some_and(|detail| detail.contains(reason)),
+            "{name}: {problem}"
+        );
+        let (status, _) = get(&server, &jwt, &format!("/v1/cards/Verifier/{name}/latest")).await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "{name} was not persisted");
+    }
+    let (status, body) = declare_verifier(
+        &server,
+        &jwt,
+        "vr-drafting-agent",
+        &selecting(&["fs.write", "publish"], false),
+    )
+    .await;
+    assert!(status.is_success(), "{status} {body}");
+    let (status, card) = get(&server, &jwt, "/v1/cards/Verifier/vr-drafting-agent/latest").await;
+    assert_eq!(status, StatusCode::OK, "{card}");
+    assert!(
+        card.to_string()
+            .contains(r#""tool_names":["fs.write","publish"]"#),
+        "{card}"
+    );
+    server.shutdown().await.expect("test server shuts down");
+}
+
 /// A direct execution returns its code check's custom data to the home
 /// tenant, through the execution read too, while another tenant's rootless
 /// administrator can neither execute the Verifier nor read the execution.

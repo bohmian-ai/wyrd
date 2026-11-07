@@ -413,7 +413,7 @@ export type BlockSource = string | MediaSource;
  * may be scoped to. Registration and authorization share this one
  * vocabulary, so a name is either a built-in everywhere or nowhere.
  */
-export type BuiltinTool = "cards.list" | "cards.get" | "bifrost.list_tables" | "bifrost.describe_table" | "bifrost.query" | "fs.list" | "fs.read" | "fs.search" | "fs.extract" | "code.run";
+export type BuiltinTool = "cards.list" | "cards.get" | "bifrost.list_tables" | "bifrost.describe_table" | "bifrost.query" | "fs.list" | "fs.read" | "fs.search" | "fs.extract" | "fs.write" | "code.run" | "publish";
 
 /**
  * What executed one Agent, code, extract, or drift block.

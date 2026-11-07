@@ -128,7 +128,7 @@ impl AgentToolset for HostedTools {
     ///
     /// # Errors
     /// Returns [`BlockError::Terminal`] when a filesystem reading tool is
-    /// declared without a workspace, or `publish` without a step `producer`
+    /// declared without a workspace or a scratch writer, or `publish` without a step `producer`
     /// or an execution to accept into, plus [`Workspaces::open`] failures.
     async fn open(
         &self,
@@ -138,7 +138,10 @@ impl AgentToolset for HostedTools {
         tools: &[BuiltinTool],
         producer: Option<&Producer>,
     ) -> Result<ToolSession, BlockError> {
-        if workspace.is_empty() && tools.iter().any(|tool| tool.is_filesystem()) {
+        if workspace.is_empty()
+            && tools.iter().any(|tool| tool.is_filesystem())
+            && !tools.iter().any(|tool| tool.writes_scratch())
+        {
             return Err(BlockError::Terminal {
                 reason: "filesystem tools need a declared workspace".to_owned(),
             });

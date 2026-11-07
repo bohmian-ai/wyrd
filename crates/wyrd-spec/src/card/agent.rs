@@ -158,6 +158,13 @@ impl BuiltinTool {
     pub const fn uses_workspace(self) -> bool {
         self.is_filesystem() || matches!(self, Self::FsWrite | Self::CodeRun | Self::Publish)
     }
+
+    /// True for the tools that create files in private `/work` scratch,
+    /// `fs.write` and `code.run`. Selecting one gives the filesystem reading
+    /// tools something to read, so they need no declared input workspace.
+    pub const fn writes_scratch(self) -> bool {
+        matches!(self, Self::FsWrite | Self::CodeRun)
+    }
 }
 
 /// Agent authoring body inside a Wyrd Agent Card envelope.

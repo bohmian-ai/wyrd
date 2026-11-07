@@ -1,0 +1,34 @@
+# The drafter publishes a report file, a nested directory, a JSON
+# assessment, and an explicit JSON null; the consumer mounts each by name
+# and the whole collection, so it reads exactly the accepted content.
+apiVersion: wyrd/v1
+kind: Verifier
+metadata:
+  name: report-pipeline
+  version: 1.0.0
+spec:
+  description: A drafter publishes its work and a consumer reads what it published.
+  inputs:
+    question: {type: json, schema: {type: string}}
+  steps:
+    - id: draft
+      retries: 1
+      action:
+        kind: agent
+        agent: ./drafter.yaml
+        inputs: {question: inputs.question}
+    - id: consume
+      action:
+        kind: agent
+        agent: ./consumer.yaml
+        inputs: {question: inputs.question}
+        workspace:
+          /inputs/report.md: steps.draft.publications.report
+          /inputs/tree: steps.draft.publications.tree
+          /inputs/assessment.json: steps.draft.publications.assessment
+          /inputs/nothing.json: steps.draft.publications.nothing
+          /inputs/all: steps.draft.publications
+  requirements:
+    - id: consumed
+      statement: The consumer read the published work
+      check: {kind: assert, path: steps.consume.output.done, operator: equals, expected: true}

@@ -191,10 +191,10 @@ fn tools_refuse_forged_arguments_and_spent_budgets() {
     });
 }
 
-/// A filesystem reading tool without a declared workspace fails before any
-/// tool is bound, and so does `publish` outside a step attempt of an
-/// execution; `fs.write` and `code.run` get private scratch, and Card and
-/// Bifrost tools need none.
+/// A filesystem reading tool without a declared workspace or a scratch
+/// writer fails before any tool is bound, and so does `publish` outside a
+/// step attempt of an execution; `fs.write` and `code.run` get private
+/// scratch the reading tools may read, and Card and Bifrost tools need none.
 ///
 /// # Panics
 /// Panics when a reading tool or an unbound `publish` opens, or a
@@ -240,6 +240,11 @@ fn reading_tools_need_a_declared_workspace() {
         for declared in [
             &[BuiltinTool::CardsGet, BuiltinTool::BifrostQuery][..],
             &[BuiltinTool::FsWrite, BuiltinTool::CodeRun],
+            &[
+                BuiltinTool::FsWrite,
+                BuiltinTool::FsRead,
+                BuiltinTool::FsList,
+            ],
         ] {
             assert!(
                 tools

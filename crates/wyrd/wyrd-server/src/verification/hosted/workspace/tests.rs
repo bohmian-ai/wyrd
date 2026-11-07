@@ -647,6 +647,116 @@ fn workspace_refuses_bad_paths_and_limits() {
     );
 }
 
+/// `fs.write` creates and replaces regular `/work` files with their parents
+/// and reads back exactly; it refuses `/inputs`, traversal, a file or link
+/// as a parent or target, and content over the `/work` budget, which counts
+/// a replaced file once, leaving every refused location untouched.
+///
+/// # Panics
+/// Panics when a write differs or a refused write changes the workspace.
+#[test]
+fn workspace_writes_private_scratch() {
+    let limits = HostedLimits {
+        work_write_max_bytes: 16,
+        ..HostedLimits::default()
+    };
+    let workspace = Workspace::materialize(
+        vec![staged(
+            "/inputs/a.txt",
+            b"input".to_vec(),
+            MediaFormat::Text,
+        )],
+        limits,
+        None,
+    )
+    .expect("workspace");
+    assert_eq!(
+        workspace
+            .write("/work/notes/day 1/é.md", "draft")
+            .expect("written"),
+        json!({"path": "/work/notes/day 1/é.md", "bytes": 5})
+    );
+    assert_eq!(
+        workspace
+            .write("/work/notes/day 1/é.md", "final text!!")
+            .expect("replaced"),
+        json!({"path": "/work/notes/day 1/é.md", "bytes": 12})
+    );
+    assert_eq!(
+        std::fs::read_to_string(workspace.work_dir().join("notes/day 1/é.md")).expect("read"),
+        "final text!!"
+    );
+    assert_eq!(
+        refusal(workspace.write("/work/other.md", "12345")),
+        invalid("work_budget"),
+        "twelve held plus five passes sixteen"
+    );
+    workspace
+        .write("/work/notes/day 1/é.md", "sixteen bytes!!!")
+        .expect("a replacement counts the replaced file once");
+    for path in [
+        "/inputs/a.txt",
+        "/inputs/new.txt",
+        "/work/../inputs/a.txt",
+        "/work//x.md",
+        "/work/./x.md",
+        "/etc/x.md",
+        "/work",
+    ] {
+        assert_eq!(
+            refusal(workspace.write(path, "x")),
+            invalid("write_path"),
+            "{path}"
+        );
+    }
+    assert_eq!(
+        std::fs::read_to_string(workspace.inputs_dir().join("a.txt")).expect("input"),
+        "input"
+    );
+    std::fs::write(workspace.work_dir().join("flat"), b"").expect("file");
+    assert_eq!(
+        refusal(workspace.write("/work/flat/child.md", "x")),
+        invalid("write_parent")
+    );
+    let outside = tempfile::tempdir().expect("outside");
+    std::os::unix::fs::symlink(outside.path(), workspace.work_dir().join("escape")).expect("link");
+    assert_eq!(
+        refusal(workspace.write("/work/escape/deeper/x.md", "x")),
+        invalid("write_parent")
+    );
+    std::os::unix::fs::symlink(
+        outside.path().join("target.md"),
+        workspace.work_dir().join("linked.md"),
+    )
+    .expect("link");
+    assert_eq!(
+        refusal(workspace.write("/work/linked.md", "x")),
+        invalid("regular_file")
+    );
+    assert_eq!(
+        refusal(workspace.write("/work/notes", "x")),
+        invalid("regular_file")
+    );
+    assert_eq!(
+        std::fs::read_dir(outside.path()).expect("outside").count(),
+        0,
+        "no write followed a link out of /work"
+    );
+    let big = HostedLimits {
+        work_write_max_bytes: 4,
+        ..HostedLimits::default()
+    };
+    let small = Workspace::materialize(Vec::new(), big, None).expect("workspace");
+    assert_eq!(
+        refusal(small.write("/work/new/deep/x.md", "hello")),
+        invalid("work_budget")
+    );
+    assert!(
+        !small.work_dir().join("new").exists(),
+        "a refused write creates no parent"
+    );
+}
+
 /// A snapshot whose caller is cancelled keeps the `/work` writer turn until
 /// its blocking read ends, so no writer changes the tree mid-read.
 ///

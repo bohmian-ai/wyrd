@@ -1,0 +1,12 @@
+# The subject of the hosted Agent tools story: a Service verified by one
+# Verifier whose drafter writes private scratch and publishes it for a
+# downstream consumer, and one whose Agents only write and read scratch.
+apiVersion: wyrd/v1
+kind: Service
+metadata:
+  name: publish-desk
+  version: 1.0.0
+spec:
+  verified_by:
+    - verifier: ./report-pipeline.yaml
+    - verifier: ./scratch-writes.yaml

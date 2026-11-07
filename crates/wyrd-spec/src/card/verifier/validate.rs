@@ -549,14 +549,24 @@ where
                     format!("{name} is not a built-in tool"),
                 ));
             };
+            if builtins.contains(&tool) {
+                return Err(invalid(
+                    "agent_tools",
+                    path,
+                    format!("{name} is selected more than once"),
+                ));
+            }
             builtins.push(tool);
         }
         let fs_tool = builtins.iter().any(|tool| tool.is_filesystem());
-        if fs_tool && call.workspace.is_empty() {
+        if fs_tool
+            && call.workspace.is_empty()
+            && !builtins.iter().any(|tool| tool.writes_scratch())
+        {
             return Err(invalid(
                 "agent_tools",
                 path,
-                "filesystem tools require a workspace",
+                "filesystem tools require a workspace or a scratch writer",
             ));
         }
         let workspace_tool = builtins.iter().any(|tool| tool.uses_workspace());
@@ -1802,8 +1812,9 @@ mod tests {
 
     /// Every built-in tool validates on a step Agent, with a workspace only
     /// when a workspace tool runs in it, and the scratch-only `fs.write`,
-    /// `code.run`, and `publish` also without one; only a step Agent may
-    /// publish, and unknown names stay refused.
+    /// `code.run`, and `publish` also without one, as are reading tools
+    /// beside a scratch writer; only a step Agent may publish, and unknown or
+    /// repeated names stay refused.
     ///
     /// # Panics
     /// Panics when a built-in is refused or an unknown name is admitted.
@@ -1835,6 +1846,26 @@ mod tests {
         parse(&scratch)
             .validate()
             .expect("scratch-only tools need no declared workspace");
+        let reads_scratch = with(
+            with(
+                review(),
+                "/steps/1/action/agent/tool_names",
+                json!(["fs.write", "fs.read", "fs.list"]),
+            ),
+            "/steps/1/action/workspace",
+            json!({}),
+        );
+        parse(&reads_scratch)
+            .validate()
+            .expect("reading tools read a scratch writer's files");
+        for tools in [json!(["fs.read"]), json!(["publish", "publish"])] {
+            let body = with(
+                with(review(), "/steps/1/action/agent/tool_names", tools.clone()),
+                "/steps/1/action/workspace",
+                json!({}),
+            );
+            assert_eq!(rule(&body), "agent_tools", "{tools}");
+        }
         let writes = with(
             review(),
             "/requirements/2/check/agent/tool_names",

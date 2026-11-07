@@ -300,7 +300,9 @@ BuiltinTool: TypeAlias = Literal[
     "fs.read",
     "fs.search",
     "fs.extract",
+    "fs.write",
     "code.run",
+    "publish",
 ]
 
 class ToolCallRecord(TypedDict):

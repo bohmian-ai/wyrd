@@ -283,6 +283,10 @@ struct Script {
 /// marker, the review's marker, and the turn. The `CANCEL-RUN` drafter
 /// publishes `early`, then raises `waiting` and holds its next reply, which
 /// would publish `late`, long enough to be cancelled.
+///
+/// # Panics
+/// Panics when the consumer's second turn arrives without the result of its
+/// `c-manifest` read.
 fn reply(request: &Request, script: &Script) -> ResponseTemplate {
     let messages = messages(request);
     let prompt = text(&messages);
@@ -633,7 +637,11 @@ impl PublishDesk {
     }
 }
 
-/// A verification-capable server whose gateway deploys on `upstream`.
+/// A verification-capable server whose gateway deploys on `upstream`, with
+/// `/work` writes capped at [`WORK`] and no warm Monty workers.
+///
+/// # Panics
+/// Panics when the upstream's URL does not parse.
 fn builder(upstream: &MockServer) -> wyrd_testing::server::WyrdTestServerBuilder {
     WyrdTestServer::builder()
         .with_verification_limits_for_test(HostedLimits {

@@ -583,3 +583,37 @@ live-read integration, outside this task's write-path owners.
 | AC-010 peak RSS and allocation at payload c64 | PASS on RSS (median below baseline minimum); allocation −29.9% paired aggregate; per-repetition allocation and CPU attribution unavailable |
 | AC-003 L1 non-regression vs main | FAIL by rule on `buffered-1kib-capture-metadata.c1` (unstable across pairs) and `buffered-64kib-capture-metadata.c1` p99 (predates TASK-002) |
 | AC-006 imported performance | PASS for covered memtable/staged paths; memtable long-tail fallback 30% slower, reported |
+
+### AC-003 diagnosis
+
+- **Symptom:** after the rule's re-run pair, the two c1 steps above stay outside
+  main's range. That is 1–3% on 1 KiB c1 rate/CPU and 3–5% (about 10 µs) on
+  64 KiB metadata c1 server p99. Every c64 step is in range or better.
+- **Evidence:**
+  - **User-space CPU profiles.** `perf record -e cpu-clock:u -F 1999 --call-graph fp`
+    attached to the server for the selected step, main vs candidate,
+    41–46k samples each. On 1 KiB c1, no symbol's self time differs by more
+    than 0.25 points, and the rows that differ are the same permission
+    deserializers under different monomorphized names. The request-body
+    `indexmap::Bucket` clone is gone in the candidate. On 64 KiB c1 the
+    largest delta is +0.69 points in `Utf8Chunks::next`, reached only from
+    unchanged `skald_providers::clients::send_bytes_with_retry`. Total samples
+    (41210 vs 41333) and request counts match.
+  - **Bench allocator hook.** `6d12ff842`'s `heap_profile::{allocated,freed}`
+    costs one relaxed load per call while sampling is off.
+  - **Main against itself.** Two main runs pass the rule against each other on
+    both steps.
+  - **Interleaved repeats disagree in direction:**
+    - 1 KiB c1 candidate vs main: 5776 vs 5846–5927, then 5907 vs 5676–5851.
+    - 64 KiB c1 p99 at `89162f762` vs main: 0.300 vs 0.277–0.293, then 0.305
+      vs 0.295–0.312.
+- **Cause:** not established. The 64 KiB c1 p99 shift is already present at
+  `1a0699e42`, inside TASK-001's range (`5234961d5..1a0699e42`). The profiles
+  show no code path that TASK-002 adds or changes doing more work. The shift is
+  the same size as same-host repeat variation, which three repetitions per run
+  cannot separate.
+- **Fix site:** none identified. No change was made; re-running until a pair
+  passes would not be evidence.
+
+AC-003 remains **FAIL** by its rule; the maintainer decides how the c1
+evidence is treated.

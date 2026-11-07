@@ -14,6 +14,8 @@ mod gateway_admin;
 mod gateway_inference;
 /// TypeSafe Jev through the Gateway, natively and through Chat Completions.
 mod gateway_jev;
+/// Agents write private scratch and publish it for the steps that read it.
+mod hosted_agent_tools;
 /// The admin-key local workflow, start to finish, without a publication flush.
 mod local_development;
 mod observe_a_run;

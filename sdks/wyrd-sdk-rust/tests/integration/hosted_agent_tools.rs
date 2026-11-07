@@ -1,0 +1,819 @@
+//! Hosted Agent tools, end to end: `publish-desk`'s drafter writes and
+//! revises files in its private `/work` scratch with `fs.write`, publishes a
+//! file, a directory, a JSON value, and an explicit `null` under logical
+//! names, and a downstream consumer reads exactly the accepted content
+//! through its mounted inputs and the collection manifest; `scratch-writes`'
+//! Agents only write and read their own scratch.
+//!
+//! The local upstream stands in for the model provider and scripts each
+//! Agent by its prompt marker, the question under review, and the number of
+//! assistant turns already in the conversation. The test then inspects what
+//! the model received, the recorded tool calls, and the publications read
+//! back through the public execution surface.
+
+use std::collections::BTreeMap;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
+
+use serde_json::{Value, json};
+use tempfile::TempDir;
+use wiremock::matchers::{method, path};
+use wiremock::{Mock, MockServer, Request, ResponseTemplate};
+use wyrd_ai::VerificationResult;
+use wyrd_ai::state::WyrdState;
+use wyrd_ai::verify::{
+    Execution, ExecutionPageQuery, PublicationContent, PublicationKind, PublicationName,
+    PublicationSelector, PublicationSummary, TaskId,
+};
+use wyrd_spec::auth::Sha256Hex;
+use wyrd_testing::server::WyrdTestServer;
+
+use crate::local_development::configure_gateway;
+use crate::support::{Deployment, declare, pull};
+use crate::verifier_building_blocks::{completion, grants, requirement, step, tool_call};
+
+/// The stable code of a refused tool argument.
+const INVALID: &str = "WYRD_SPEC_400_VALIDATION";
+
+/// The report the drafter publishes; later scratch writes never change it.
+const REPORT: &str = "# Final report\n";
+
+/// The report the drafter's second attempt publishes after its first
+/// attempt loses the provider.
+const RETRIED: &str = "# Retried report\n";
+
+/// The JSON assessment the drafter publishes by value.
+fn assessment() -> Value {
+    json!({ "risk": "low", "score": 0.9, "notes": ["é", "two words"] })
+}
+
+/// The messages of the Chat Completions `request`.
+fn messages(request: &Request) -> Vec<Value> {
+    let body: Value = serde_json::from_slice(&request.body).unwrap_or_default();
+    body["messages"].as_array().cloned().unwrap_or_default()
+}
+
+/// The text of every message in `messages`, joined.
+fn text(messages: &[Value]) -> String {
+    messages
+        .iter()
+        .filter_map(|message| message["content"].as_str())
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// How many assistant turns `messages` already holds.
+fn turn(messages: &[Value]) -> usize {
+    messages
+        .iter()
+        .filter(|message| message["role"] == "assistant")
+        .count()
+}
+
+/// Every tool result in `messages`, by the provider call ID it answers,
+/// parsed from its JSON content.
+fn results(messages: &[Value]) -> BTreeMap<String, Value> {
+    messages
+        .iter()
+        .filter(|message| message["role"] == "tool")
+        .filter_map(|message| {
+            let id = message["tool_call_id"].as_str()?.to_owned();
+            let content = message["content"].as_str()?;
+            Some((id, serde_json::from_str(content).unwrap_or(Value::Null)))
+        })
+        .collect()
+}
+
+/// The text of an `fs.read` result: its units' lines, joined by newlines.
+fn lines(read: &Value) -> String {
+    read["units"]
+        .as_array()
+        .map(|units| {
+            units
+                .iter()
+                .filter_map(|unit| unit["text"].as_str())
+                .collect::<Vec<_>>()
+                .join("\n")
+        })
+        .unwrap_or_default()
+}
+
+/// An assistant turn calling each `(id, tool, arguments)` at once.
+fn calls(calls: &[(&str, &str, Value)]) -> ResponseTemplate {
+    let calls: Vec<Value> = calls
+        .iter()
+        .map(|(id, tool, arguments)| tool_call(id, tool, arguments))
+        .collect();
+    completion(json!({ "role": "assistant", "content": null, "tool_calls": calls }))
+}
+
+/// The final `{"done": true}` answer.
+fn done() -> ResponseTemplate {
+    completion(json!({ "role": "assistant", "content": r#"{"done":true}"# }))
+}
+
+/// The drafter's turns that write and publish all four publications: the
+/// report revised once, a tree with a nested Unicode, spaced filename and an
+/// empty directory, the JSON assessment, and an explicit `null`. Call IDs
+/// carry `prefix`, so attempts are told apart.
+fn publish_all(turn: usize, prefix: &str, report: &str) -> Option<ResponseTemplate> {
+    let id = |name: &str| format!("{prefix}{name}");
+    let write = |path: &str, content: &str| json!({ "path": path, "content": content });
+    Some(match turn {
+        0 => calls(&[(&id("w1"), "fs.write", write("/work/report.md", "draft v1"))]),
+        1 => calls(&[
+            (&id("w2"), "fs.write", write("/work/report.md", report)),
+            (&id("w3"), "fs.write", write("/work/tree/a.md", "alpha")),
+            (
+                &id("w4"),
+                "fs.write",
+                write("/work/tree/nested dir/é b.md", "beta"),
+            ),
+            (
+                &id("w5"),
+                "code.run",
+                json!({ "source": "import os\nos.makedirs('/work/tree/empty')" }),
+            ),
+        ]),
+        2 => calls(&[
+            (&id("r1"), "fs.read", json!({ "path": "/work/report.md" })),
+            (
+                &id("p-report"),
+                "publish",
+                json!({ "name": "report", "path": "/work/report.md" }),
+            ),
+            (
+                &id("p-tree"),
+                "publish",
+                json!({ "name": "tree", "path": "/work/tree" }),
+            ),
+            (
+                &id("p-assessment"),
+                "publish",
+                json!({ "name": "assessment", "value": assessment() }),
+            ),
+            (
+                &id("p-nothing"),
+                "publish",
+                json!({ "name": "nothing", "value": null }),
+            ),
+        ]),
+        _ => return None,
+    })
+}
+
+/// The drafter after publishing everything in the `FULL-RUN` review: it
+/// mutates scratch and tries every refused publication and write, then
+/// finishes.
+fn refusals(turn: usize) -> ResponseTemplate {
+    if turn > 3 {
+        return done();
+    }
+    calls(&[
+        (
+            "w6",
+            "fs.write",
+            json!({ "path": "/work/report.md", "content": "mutated after publishing" }),
+        ),
+        (
+            "x-conflict",
+            "publish",
+            json!({ "name": "report", "value": 1 }),
+        ),
+        (
+            "x-both",
+            "publish",
+            json!({ "name": "both", "path": "/work/report.md", "value": 1 }),
+        ),
+        ("x-neither", "publish", json!({ "name": "neither" })),
+        (
+            "x-name",
+            "publish",
+            json!({ "name": "bad name!", "value": 1 }),
+        ),
+        (
+            "x-missing",
+            "publish",
+            json!({ "name": "ghost", "path": "/work/missing.md" }),
+        ),
+        (
+            "x-inputs",
+            "publish",
+            json!({ "name": "foreign", "path": "/inputs/report.md" }),
+        ),
+        (
+            "x-escape",
+            "publish",
+            json!({ "name": "escape", "path": "/work/../etc" }),
+        ),
+        (
+            "x-forged",
+            "publish",
+            json!({ "name": "forged", "value": 1, "attempt": 9, "step_id": "consume" }),
+        ),
+        (
+            "x-write-inputs",
+            "fs.write",
+            json!({ "path": "/inputs/x.md", "content": "x" }),
+        ),
+        (
+            "x-write-escape",
+            "fs.write",
+            json!({ "path": "/work/../x.md", "content": "x" }),
+        ),
+    ])
+}
+
+/// The scripted model: one reply per request, chosen by the Agent's prompt
+/// marker, the review's marker, and the turn. `attempts` counts the
+/// `RETRY-RUN` drafter's first turns, so its two attempts carry distinct
+/// call IDs and only the first loses its provider.
+fn reply(request: &Request, attempts: &AtomicUsize) -> ResponseTemplate {
+    let messages = messages(request);
+    let prompt = text(&messages);
+    let turn = turn(&messages);
+    if prompt.contains("DRAFT:") {
+        if prompt.contains("NO-PUBLISH") {
+            return done();
+        }
+        if prompt.contains("RETRY-RUN") {
+            if turn == 0 && attempts.fetch_add(1, Ordering::SeqCst) == 0 {
+                return calls(&[(
+                    "a1-p-report",
+                    "publish",
+                    json!({ "name": "report", "value": "attempt 1" }),
+                )]);
+            }
+            if results(&messages).contains_key("a1-p-report") {
+                return ResponseTemplate::new(500);
+            }
+            return publish_all(turn, "a2-", RETRIED).unwrap_or_else(done);
+        }
+        return publish_all(turn, "", REPORT).unwrap_or_else(|| refusals(turn));
+    }
+    if prompt.contains("CONSUME:") {
+        return match turn {
+            0 => calls(&[
+                (
+                    "c-report",
+                    "fs.read",
+                    json!({ "path": "/inputs/report.md" }),
+                ),
+                ("c-tree", "fs.list", json!({ "path": "/inputs/tree" })),
+                (
+                    "c-assessment",
+                    "fs.read",
+                    json!({ "path": "/inputs/assessment.json" }),
+                ),
+                (
+                    "c-nothing",
+                    "fs.read",
+                    json!({ "path": "/inputs/nothing.json" }),
+                ),
+                (
+                    "c-manifest",
+                    "fs.read",
+                    json!({ "path": "/inputs/all/manifest.json" }),
+                ),
+            ]),
+            1 => {
+                let manifest: Value =
+                    serde_json::from_str(&lines(&results(&messages)["c-manifest"]))
+                        .unwrap_or_default();
+                let entry = manifest["entries"]
+                    .as_array()
+                    .and_then(|entries| entries.iter().find(|entry| entry["name"] == "report"))
+                    .and_then(|entry| entry["path"].as_str())
+                    .unwrap_or("missing");
+                calls(&[(
+                    "c-entry",
+                    "fs.read",
+                    json!({ "path": format!("/inputs/all/{entry}") }),
+                )])
+            }
+            _ => done(),
+        };
+    }
+    if prompt.contains("SCRATCH:") {
+        let write = |path: &str, content: &str| json!({ "path": path, "content": content });
+        return match turn {
+            0 => calls(&[
+                (
+                    "s-create",
+                    "fs.write",
+                    write("/work/notes/day 1/é.md", "first"),
+                ),
+                ("s-inputs", "fs.write", write("/inputs/x.md", "x")),
+                ("s-escape", "fs.write", write("/work/../escape.md", "x")),
+                ("s-dot", "fs.write", write("/work/./x.md", "x")),
+                ("s-root", "fs.write", write("/work", "x")),
+            ]),
+            1 => calls(&[
+                (
+                    "s-replace",
+                    "fs.write",
+                    write("/work/notes/day 1/é.md", "second, longer"),
+                ),
+                (
+                    "s-parent",
+                    "fs.write",
+                    write("/work/notes/day 1/é.md/child.md", "x"),
+                ),
+            ]),
+            2 => calls(&[
+                (
+                    "s-read",
+                    "fs.read",
+                    json!({ "path": "/work/notes/day 1/é.md" }),
+                ),
+                ("s-list", "fs.list", json!({ "path": "/work" })),
+            ]),
+            _ => done(),
+        };
+    }
+    if prompt.contains("PEEK:") {
+        return match turn {
+            0 => calls(&[
+                ("k-list", "fs.list", json!({ "path": "/work" })),
+                (
+                    "k-write",
+                    "fs.write",
+                    json!({ "path": "/work/mine.md", "content": "mine" }),
+                ),
+            ]),
+            _ => done(),
+        };
+    }
+    ResponseTemplate::new(500)
+}
+
+/// The publish desk deployment: a verification-capable server whose gateway
+/// deploys `gpt-4o` on the scripted upstream, with `publish-desk` registered
+/// and hydrated; verifications run as a principal granted every tool.
+struct PublishDesk {
+    /// The deployment.
+    deployment: Deployment,
+    /// The scripted model upstream.
+    upstream: MockServer,
+    /// The Card bundle, which every state loads from.
+    bundle: TempDir,
+    /// The hydrated Service, as a principal granted every tool.
+    state: WyrdState,
+}
+
+impl PublishDesk {
+    /// Start the scripted upstream and the server, deploy `openai` on the
+    /// upstream, declare and pull `publish-desk`, and load it as a principal
+    /// that may verify, invoke the gateway, and call every tool.
+    ///
+    /// # Panics
+    /// Panics when a setup step fails.
+    async fn start() -> Self {
+        let upstream = MockServer::start().await;
+        let attempts = Arc::new(AtomicUsize::new(0));
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .respond_with(move |request: &Request| reply(request, &attempts))
+            .mount(&upstream)
+            .await;
+        let deployment = Deployment::start_with(
+            WyrdTestServer::builder()
+                .with_verification_runtime_for_test()
+                .with_gateway_provider_root_for_test(
+                    upstream.uri().parse().expect("upstream URL parses"),
+                ),
+        )
+        .await;
+        configure_gateway(&deployment.admin()).await;
+        let cards = deployment.cards().await;
+        let desk = declare(&cards, "cards/hosted_agent_tools/publish-desk.yaml").await;
+        let bundle = pull(&cards, &desk.root).await;
+        let key = deployment
+            .granted_key("every_tool", &grants(json!("all")))
+            .await;
+        let state =
+            WyrdState::from_path_with(bundle.path().join("bundle"), deployment.client(&key))
+                .expect("bundle loads offline");
+        Self {
+            deployment,
+            upstream,
+            bundle,
+            state,
+        }
+    }
+
+    /// Verify `question` with `verifier` now, as the every-tool principal.
+    ///
+    /// # Panics
+    /// Panics when the verify is refused.
+    async fn verify(&self, verifier: &str, question: &str) -> VerificationResult {
+        self.verify_as(&self.state, verifier, question).await
+    }
+
+    /// Verify `question` with `verifier` now through `state`.
+    ///
+    /// # Panics
+    /// Panics when the verify is refused.
+    async fn verify_as(
+        &self,
+        state: &WyrdState,
+        verifier: &str,
+        question: &str,
+    ) -> VerificationResult {
+        state
+            .run()
+            .observe()
+            .verify(verifier, json!(question))
+            .await
+            .expect("the verification runs")
+    }
+
+    /// Every Chat Completions request the upstream received whose messages
+    /// carry `marker`, in arrival order.
+    ///
+    /// # Panics
+    /// Panics when the upstream does not record requests.
+    async fn requests(&self, marker: &str) -> Vec<Request> {
+        self.upstream
+            .received_requests()
+            .await
+            .expect("the upstream records requests")
+            .into_iter()
+            .filter(|request| text(&messages(request)).contains(marker))
+            .collect()
+    }
+
+    /// Every tool result the Agent prompted with `marker` returned, by call
+    /// ID, read from the last request it sent.
+    ///
+    /// # Panics
+    /// Panics when the Agent sent no request.
+    async fn results(&self, marker: &str) -> BTreeMap<String, Value> {
+        let requests = self.requests(marker).await;
+        results(&messages(
+            requests.last().expect("the Agent called the model"),
+        ))
+    }
+
+    /// Every publication of `result`'s execution, read back as the
+    /// deployment's admin through the public paged listing.
+    ///
+    /// # Panics
+    /// Panics when the execution or a page cannot be read.
+    async fn publications(&self, result: &VerificationResult) -> Vec<PublicationSummary> {
+        let execution = self.execution(result).await;
+        let mut publications = Vec::new();
+        let mut cursor = None;
+        loop {
+            let page = execution
+                .publications(&ExecutionPageQuery {
+                    limit: Some(2),
+                    cursor,
+                })
+                .await
+                .expect("a publication page reads");
+            publications.extend(page.items);
+            cursor = page.next_cursor;
+            if cursor.is_none() {
+                return publications;
+            }
+        }
+    }
+
+    /// `result`'s execution as the deployment's admin.
+    ///
+    /// # Panics
+    /// Panics when the handle cannot connect.
+    async fn execution(&self, result: &VerificationResult) -> Execution {
+        Execution::connect_with(result.execution_id, &self.deployment.admin())
+            .await
+            .expect("the execution handle connects")
+    }
+}
+
+/// The function names the model was offered in `request`, in offer order.
+fn offered(request: &Request) -> Vec<String> {
+    let body: Value = serde_json::from_slice(&request.body).unwrap_or_default();
+    body["tools"]
+        .as_array()
+        .map(|tools| {
+            tools
+                .iter()
+                .filter_map(|tool| tool["function"]["name"].as_str().map(str::to_owned))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// The stable code and repair rule of a refused tool result.
+fn refusal(result: &Value) -> (&str, &str) {
+    (
+        result["code"].as_str().unwrap_or_default(),
+        result["details"]["rule"].as_str().unwrap_or_default(),
+    )
+}
+
+/// The publication selector of step attempt `attempt`, at `path` when given.
+fn selector(attempt: u32, path: Option<&str>) -> PublicationSelector {
+    PublicationSelector {
+        attempt,
+        item_index: None,
+        iteration_index: None,
+        path: path.map(str::to_owned),
+    }
+}
+
+/// The base64 SHA-256 a download plan reports for `bytes`.
+fn digest(bytes: &[u8]) -> String {
+    use base64::Engine as _;
+    base64::engine::general_purpose::STANDARD.encode(Sha256Hex::digest(bytes).as_bytes())
+}
+
+/// The scribe writes, replaces, and reads back a nested Unicode file in its
+/// private scratch without any declared input; writes to `/inputs`, through
+/// traversal, at `/work` itself, or below a file are refused with their
+/// typed rule and change nothing; the peeker, a later step, sees none of the
+/// scribe's files and writes its own.
+///
+/// # Panics
+/// Panics when the verification is refused or a write, read, refusal, or
+/// listing differs.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires the repository-managed Postgres journey lifecycle"]
+async fn agent_writes_private_workspace_files() {
+    let desk = PublishDesk::start().await;
+
+    let result = desk.verify("scratch-writes", "SCRATCH-RUN").await;
+
+    assert_eq!(
+        requirement(&result, "written").outcome,
+        wyrd_ai::RequirementOutcome::Passed,
+        "{result:?}"
+    );
+    let scribe = desk.results("SCRATCH:").await;
+    assert_eq!(
+        scribe["s-create"],
+        json!({ "path": "/work/notes/day 1/é.md", "bytes": 5 })
+    );
+    assert_eq!(
+        scribe["s-replace"],
+        json!({ "path": "/work/notes/day 1/é.md", "bytes": 14 })
+    );
+    assert_eq!(lines(&scribe["s-read"]), "second, longer");
+    let listed: Vec<&str> = scribe["s-list"]["files"]
+        .as_array()
+        .expect("the scratch lists")
+        .iter()
+        .filter_map(|file| file["path"].as_str())
+        .collect();
+    assert_eq!(listed, ["/work/notes/day 1/é.md"], "nothing refused landed");
+    for (call, rule) in [
+        ("s-inputs", "write_path"),
+        ("s-escape", "write_path"),
+        ("s-dot", "write_path"),
+        ("s-root", "write_path"),
+        ("s-parent", "write_parent"),
+    ] {
+        assert_eq!(refusal(&scribe[call]), (INVALID, rule), "{call}");
+    }
+    let peeker = desk.results("PEEK:").await;
+    assert_eq!(
+        peeker["k-list"]["files"],
+        json!([]),
+        "a later step never sees another step's scratch"
+    );
+    assert_eq!(
+        peeker["k-write"],
+        json!({ "path": "/work/mine.md", "bytes": 4 })
+    );
+    let write = step(&result, "write");
+    let mut recorded: Vec<(Value, bool)> = write
+        .tool_calls
+        .iter()
+        .map(|call| {
+            (
+                serde_json::to_value(call.tool).expect("the tool serializes"),
+                call.error.is_none(),
+            )
+        })
+        .collect();
+    recorded.sort_by_key(|(tool, ok)| (tool.to_string(), *ok));
+    assert_eq!(
+        recorded,
+        [
+            (json!("fs.list"), true),
+            (json!("fs.read"), true),
+            (json!("fs.write"), false),
+            (json!("fs.write"), false),
+            (json!("fs.write"), false),
+            (json!("fs.write"), false),
+            (json!("fs.write"), false),
+            (json!("fs.write"), true),
+            (json!("fs.write"), true),
+        ],
+        "every call is recorded under its dotted built-in name"
+    );
+    desk.deployment.shutdown().await;
+}
+
+/// The drafter revises a report in scratch and publishes it, a tree with a
+/// nested Unicode, spaced filename and an empty directory, a JSON
+/// assessment, and an explicit `null`; each receipt is exactly
+/// `{name, kind}`. Its later scratch mutation, a same-name republish, both
+/// or neither source, an invalid name, a missing, `/inputs`, or escaping
+/// path, and a forged producer field are refused and publish nothing. The
+/// consumer reads exactly the published bytes through its mounts and finds
+/// the report through the collection manifest's actual path; the public
+/// readback returns the same content with matching download digests.
+///
+/// # Panics
+/// Panics when the verification is refused or a receipt, refusal, mounted
+/// read, or readback differs.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires the repository-managed Postgres journey lifecycle"]
+async fn agent_publishes_file_directory_and_json() {
+    let desk = PublishDesk::start().await;
+
+    let result = desk.verify("report-pipeline", "FULL-RUN").await;
+
+    assert_eq!(
+        requirement(&result, "consumed").outcome,
+        wyrd_ai::RequirementOutcome::Passed,
+        "{result:?}"
+    );
+    let mut drafted = offered(&desk.requests("DRAFT:").await[0]);
+    drafted.sort();
+    assert_eq!(drafted, ["code_run", "fs_read", "fs_write", "publish"]);
+    let mut consumed = offered(&desk.requests("CONSUME:").await[0]);
+    consumed.sort();
+    assert_eq!(
+        consumed,
+        ["fs_list", "fs_read"],
+        "the consumer is offered no write tools"
+    );
+    let drafter = desk.results("DRAFT:").await;
+    for (call, name, kind) in [
+        ("p-report", "report", "file"),
+        ("p-tree", "tree", "directory"),
+        ("p-assessment", "assessment", "json"),
+        ("p-nothing", "nothing", "json"),
+    ] {
+        assert_eq!(
+            drafter[call],
+            json!({ "name": name, "kind": kind }),
+            "{call}"
+        );
+    }
+    assert_eq!(lines(&drafter["r1"]), REPORT.trim_end());
+    assert_eq!(
+        drafter["w6"],
+        json!({ "path": "/work/report.md", "bytes": 24 })
+    );
+    for (call, rule) in [
+        ("x-conflict", "publication_name"),
+        ("x-both", "publication_source"),
+        ("x-neither", "publication_source"),
+        ("x-missing", "workspace_missing"),
+        ("x-inputs", "publication_path"),
+        ("x-escape", "publication_path"),
+        ("x-write-inputs", "write_path"),
+        ("x-write-escape", "write_path"),
+    ] {
+        assert_eq!(refusal(&drafter[call]), (INVALID, rule), "{call}");
+    }
+    assert_eq!(
+        (
+            drafter["x-name"]["code"].as_str(),
+            &drafter["x-name"]["details"]["field"]
+        ),
+        (Some(INVALID), &json!("name"))
+    );
+    assert_eq!(
+        drafter["x-forged"]["code"], "SKALD_TOOL_422_INPUT",
+        "the host owns the producer identity"
+    );
+
+    let consumer = desk.results("CONSUME:").await;
+    assert_eq!(
+        lines(&consumer["c-report"]),
+        REPORT.trim_end(),
+        "scratch changes after publishing never reach the publication"
+    );
+    assert_eq!(lines(&consumer["c-entry"]), REPORT.trim_end());
+    let tree: Vec<&str> = consumer["c-tree"]["files"]
+        .as_array()
+        .expect("the tree lists")
+        .iter()
+        .filter_map(|file| file["path"].as_str())
+        .collect();
+    assert_eq!(
+        tree,
+        ["/inputs/tree/a.md", "/inputs/tree/nested dir/é b.md"]
+    );
+    assert_eq!(
+        serde_json::from_str::<Value>(&lines(&consumer["c-assessment"])).ok(),
+        Some(assessment())
+    );
+    assert_eq!(lines(&consumer["c-nothing"]), "null");
+    let manifest: Value = serde_json::from_str(&lines(&consumer["c-manifest"]))
+        .expect("the collection manifest is JSON");
+    let mut entries: Vec<(&str, &str)> = manifest["entries"]
+        .as_array()
+        .expect("the manifest lists entries")
+        .iter()
+        .map(|entry| {
+            (
+                entry["name"].as_str().unwrap_or_default(),
+                entry["kind"].as_str().unwrap_or_default(),
+            )
+        })
+        .collect();
+    entries.sort_unstable();
+    assert_eq!(
+        entries,
+        [
+            ("assessment", "json"),
+            ("nothing", "json"),
+            ("report", "file"),
+            ("tree", "directory"),
+        ],
+        "publishes in one turn run concurrently, in acceptance order"
+    );
+
+    let publications = desk.publications(&result).await;
+    let mut listed: Vec<(&str, &str, u32, PublicationKind)> = publications
+        .iter()
+        .map(|publication| {
+            (
+                publication.producer.step_id.as_str(),
+                publication.name.as_str(),
+                publication.producer.attempt,
+                publication.kind,
+            )
+        })
+        .collect();
+    listed.sort_by_key(|(_, name, _, _)| *name);
+    assert_eq!(
+        listed,
+        [
+            ("draft", "assessment", 1, PublicationKind::Json),
+            ("draft", "nothing", 1, PublicationKind::Json),
+            ("draft", "report", 1, PublicationKind::File),
+            ("draft", "tree", 1, PublicationKind::Directory),
+        ],
+        "refused calls and the final answer publish nothing"
+    );
+    let execution = desk.execution(&result).await;
+    let draft = TaskId::new("draft").expect("step");
+    let name = |name: &str| PublicationName::new(name).expect("name");
+    let read = |publication: &str| {
+        let execution = &execution;
+        let draft = &draft;
+        let publication = name(publication);
+        async move {
+            execution
+                .publication(draft, &publication, &selector(1, None))
+                .await
+                .expect("the publication reads")
+                .content
+        }
+    };
+    let PublicationContent::Directory { manifest } = read("tree").await else {
+        panic!("the tree is a directory publication");
+    };
+    let paths: Vec<&str> = manifest
+        .files
+        .iter()
+        .map(|file| file.path.as_str())
+        .collect();
+    assert_eq!(paths, ["a.md", "nested dir/é b.md"]);
+    assert_eq!(manifest.directories, ["empty", "nested dir"]);
+    assert_eq!(
+        read("assessment").await,
+        PublicationContent::Json {
+            value: assessment()
+        }
+    );
+    assert_eq!(
+        read("nothing").await,
+        PublicationContent::Json { value: Value::Null }
+    );
+    let plan = execution
+        .download(&draft, &name("report"), &selector(1, None))
+        .await
+        .expect("the report download plans");
+    assert_eq!(
+        (plan.size_bytes, plan.sha256),
+        (REPORT.len() as u64, digest(REPORT.as_bytes()))
+    );
+    let plan = execution
+        .download(
+            &draft,
+            &name("tree"),
+            &selector(1, Some("nested dir/é b.md")),
+        )
+        .await
+        .expect("the tree file download plans");
+    assert_eq!((plan.size_bytes, plan.sha256), (4, digest(b"beta")));
+    desk.deployment.shutdown().await;
+}

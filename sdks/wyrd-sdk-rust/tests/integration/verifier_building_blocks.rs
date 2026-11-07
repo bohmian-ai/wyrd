@@ -239,7 +239,7 @@ pub(crate) fn requirement<'a>(result: &'a VerificationResult, id: &str) -> &'a R
 ///
 /// # Panics
 /// Panics when the result has no such step.
-fn step<'a>(result: &'a VerificationResult, id: &str) -> &'a StepResult {
+pub(crate) fn step<'a>(result: &'a VerificationResult, id: &str) -> &'a StepResult {
     result
         .outcome
         .steps
@@ -1843,7 +1843,7 @@ async fn typed_verdict_data_mismatch_keeps_original_result() {
 /// The grants of a principal that verifies, invokes the gateway, reads Cards
 /// and Bifrost, and may call the tools `tool_scope` covers: `"all"` or one
 /// exact `{"tool": name}`.
-fn grants(tool_scope: Value) -> [Value; 5] {
+pub(crate) fn grants(tool_scope: Value) -> [Value; 5] {
     [
         json!({ "resource": "verifier", "action": "run", "scope": "all" }),
         json!({ "resource": "gateway", "action": "invoke", "scope": "all" }),

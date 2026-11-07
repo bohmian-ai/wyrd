@@ -112,6 +112,9 @@ pub struct BlockCall<'a, B> {
     pub workspace: BTreeMap<String, CallInput>,
     /// When the engine cancels this attempt.
     pub deadline: Instant,
+    /// The one-based attempt this call is, counting the block's recorded
+    /// attempts, so a host attributes what the attempt retains to it.
+    pub attempt: u32,
 }
 
 /// Data one step action produced.
@@ -334,6 +337,7 @@ mod tests {
             inputs: BTreeMap::from([("from".to_owned(), input)]),
             workspace: BTreeMap::new(),
             deadline: Instant::now() + Duration::from_secs(5),
+            attempt: 1,
         };
         let output = executor.execute(call).await.expect("output");
         assert_eq!(output.output, json!({"slides": []}));

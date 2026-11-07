@@ -629,7 +629,7 @@ impl Agent {
                             }
                             ChainResult::Replaced(replacement) => replacement,
                         };
-                        let result = tool.invoke(args).await;
+                        let result = tool.invoke_call(&call.id, args).await;
                         let (ok, content) = match apply_chain_with_panic_catch_tool_result(
                             &after_tool,
                             &ctx,

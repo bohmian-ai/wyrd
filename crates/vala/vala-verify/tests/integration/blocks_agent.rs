@@ -27,7 +27,9 @@ use wyrd_spec::ids::SlotName;
 use wyrd_spec::reference::{CardRef, InlineableRef};
 use wyrd_spec::verification::TaskId;
 use wyrd_spec::verification::VerificationVerdict;
-use wyrd_spec::verification::execution::{CallProvenance, Citation, InputDeclaration, Locator};
+use wyrd_spec::verification::execution::{
+    CallProvenance, Citation, InputDeclaration, Locator, Producer,
+};
 
 /// Build the [`TaskId`] used for a requirement or step in these fixtures.
 ///
@@ -169,6 +171,7 @@ impl AgentToolset for FixedToolset {
         _workspace: &BTreeMap<String, CallInput>,
         _deadline: Instant,
         _tools: &[BuiltinTool],
+        _producer: Option<&Producer>,
     ) -> Result<ToolSession, BlockError> {
         let registry = ToolRegistry::new();
         registry
@@ -316,6 +319,7 @@ async fn step(
             inputs,
             workspace: BTreeMap::new(),
             deadline: Instant::now() + Duration::from_secs(30),
+            attempt: 1,
         },
     )
     .await
@@ -341,6 +345,7 @@ async fn check(
             inputs,
             workspace: BTreeMap::new(),
             deadline: Instant::now() + Duration::from_secs(30),
+            attempt: 1,
         },
     )
     .await
@@ -1019,6 +1024,7 @@ async fn check_agent_reads_its_workspace_through_declared_tools() {
                 },
             )]),
             deadline: Instant::now() + Duration::from_secs(30),
+            attempt: 1,
         },
     )
     .await
@@ -1162,6 +1168,7 @@ impl AgentToolset for BusyToolset {
         _workspace: &BTreeMap<String, CallInput>,
         _deadline: Instant,
         _tools: &[BuiltinTool],
+        _producer: Option<&Producer>,
     ) -> Result<ToolSession, BlockError> {
         let registry = ToolRegistry::new();
         registry

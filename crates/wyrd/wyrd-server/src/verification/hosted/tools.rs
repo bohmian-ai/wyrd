@@ -1,13 +1,16 @@
 //! The server's built-in Agent tools.
 //!
 //! [`HostedTools`] is the server [`AgentToolset`]: for each Agent step or check
-//! attempt it materializes the declared workspace when a filesystem or code
-//! tool needs one, then registers one [`Builtin`] per declared tool bound to
-//! that invocation's accepted caller, workspace, deadline, and Python budget.
+//! attempt it materializes the declared workspace, or a private scratch-only
+//! one, when a workspace tool needs it, then registers one [`Builtin`] per
+//! declared tool bound to that invocation's accepted caller, workspace,
+//! deadline, Python budget, and, for a step, its producer attempt.
 //! Every call first authorizes and audits `tool:invoke` on the exact built-in
 //! through the shared [`audit::authorize`] boundary, then dispatches to the
 //! existing authorized owner: the Card read operations, the Bifrost catalog
-//! service, [`BoundedQuery`], the [`Workspace`], or the [`Sandbox`]. Those
+//! service, [`BoundedQuery`], the [`Workspace`], the [`Sandbox`], or the
+//! execution's [`Publications`], keyed by the provider's tool call so a
+//! repeated call returns its original receipt. Those
 //! owners still enforce their own permissions, so a tool grant never implies
 //! data access. Card and Bifrost descriptions and argument schemas are the
 //! MCP catalog's, so both surfaces advertise one contract.
@@ -31,10 +34,12 @@ use wyrd_runtime::Permission;
 use wyrd_spec::card::agent::BuiltinTool;
 use wyrd_spec::error::WyrdError;
 use wyrd_spec::registry::ListCardsRequest;
-use wyrd_spec::verification::TaskId;
+use wyrd_spec::verification::execution::Producer;
+use wyrd_spec::verification::{PublicationName, TaskId};
 
 use super::HostedLimits;
 use super::evidence::TenantEvidence;
+use super::publications::{Publications, PublishCall};
 use super::sandbox::Sandbox;
 use super::workspace::{Search, Workspace, Workspaces};
 use crate::AppState;
@@ -45,6 +50,7 @@ use crate::components::cards::routes::list_cards_for;
 use crate::mcp::bifrost::{DescribeTableArguments, compact_entry};
 use crate::mcp::cards::GetCardArgs;
 use crate::query::collect::{BoundedQuery, QueryArguments};
+use crate::verification::state::RunState;
 
 /// Audit operation of every tool invocation decision.
 const OPERATION: &str = "verification.tool.invoke";
@@ -64,6 +70,9 @@ pub struct HostedTools {
     /// Python time left per Agent action, kept across its attempts so a
     /// retry never restores spent time.
     code_budgets: Mutex<BTreeMap<TaskId, Arc<Mutex<Duration>>>>,
+    /// The execution state `publish` accepts into; `None` for tools bound
+    /// to no execution, which cannot publish.
+    execution: Option<Arc<RunState>>,
     /// Limits in force.
     limits: HostedLimits,
 }
@@ -87,8 +96,16 @@ impl HostedTools {
             workspaces,
             sandbox,
             code_budgets: Mutex::new(BTreeMap::new()),
+            execution: None,
             limits,
         }
+    }
+
+    /// These tools, publishing into the execution state `execution` writes.
+    #[must_use]
+    pub fn with_execution(mut self, execution: Arc<RunState>) -> Self {
+        self.execution = Some(execution);
+        self
     }
 
     /// The Python budget of action `id`, created full on its first attempt.
@@ -105,28 +122,38 @@ impl HostedTools {
 
 #[async_trait]
 impl AgentToolset for HostedTools {
-    /// Materialize the workspace when a declared tool needs one, then bind
-    /// each declared tool to this attempt.
+    /// Materialize the workspace when a declared tool runs in one, then
+    /// bind each declared tool to this attempt. `fs.write`, `code.run`, and
+    /// `publish` alone get private scratch without a declared input mount.
     ///
     /// # Errors
-    /// Returns [`BlockError::Terminal`] when a filesystem or code tool is
-    /// declared without a workspace, plus [`Workspaces::open`] failures.
+    /// Returns [`BlockError::Terminal`] when a filesystem reading tool is
+    /// declared without a workspace, or `publish` without a step `producer`
+    /// or an execution to accept into, plus [`Workspaces::open`] failures.
     async fn open(
         &self,
         id: &TaskId,
         workspace: &BTreeMap<String, CallInput>,
         deadline: Instant,
         tools: &[BuiltinTool],
+        producer: Option<&Producer>,
     ) -> Result<ToolSession, BlockError> {
-        let workspace = if tools
-            .iter()
-            .any(|tool| tool.is_filesystem() || *tool == BuiltinTool::CodeRun)
-        {
-            if workspace.is_empty() {
+        if workspace.is_empty() && tools.iter().any(|tool| tool.is_filesystem()) {
+            return Err(BlockError::Terminal {
+                reason: "filesystem tools need a declared workspace".to_owned(),
+            });
+        }
+        let publisher = if tools.contains(&BuiltinTool::Publish) {
+            let (Some(run), Some(producer)) = (&self.execution, producer) else {
                 return Err(BlockError::Terminal {
-                    reason: "filesystem and code tools need a declared workspace".to_owned(),
+                    reason: "publish is available only to a step Agent of an execution".to_owned(),
                 });
-            }
+            };
+            Some((Arc::clone(run), producer.clone()))
+        } else {
+            None
+        };
+        let workspace = if tools.iter().any(|tool| tool.uses_workspace()) {
             Some(Arc::new(
                 self.workspaces.open(workspace, &self.evidence).await?,
             ))
@@ -140,6 +167,7 @@ impl AgentToolset for HostedTools {
             sandbox: Arc::clone(&self.sandbox),
             deadline,
             code_budget: self.code_budget(id),
+            publisher,
             limits: self.limits,
         });
         let registry = ToolRegistry::new();
@@ -179,17 +207,26 @@ struct Invocation {
     /// Python time left for `code.run` in this action, shared with its
     /// other attempts.
     code_budget: Arc<Mutex<Duration>>,
+    /// The execution state and step attempt `publish` retains content for,
+    /// when `publish` is declared.
+    publisher: Option<(Arc<RunState>, Producer)>,
     /// Limits in force.
     limits: HostedLimits,
 }
 
 impl Invocation {
-    /// Run `tool` with `args` as the accepted caller.
+    /// Run `tool` with `args` as the accepted caller for provider tool call
+    /// `call_id`, when it is known.
     ///
     /// # Errors
     /// Returns the tool-invoke denial before anything runs, then argument,
     /// domain authorization, and execution failures.
-    async fn call(&self, tool: BuiltinTool, args: Value) -> Result<Value, ToolError> {
+    async fn call(
+        &self,
+        tool: BuiltinTool,
+        call_id: Option<&str>,
+        args: Value,
+    ) -> Result<Value, ToolError> {
         audit::authorize(
             &self.state,
             &self.caller,
@@ -267,11 +304,65 @@ impl Invocation {
                 .await
                 .map_err(|error| invocation(error.to_string()))?
             }
+            BuiltinTool::FsWrite => {
+                let workspace = Arc::clone(self.workspace()?);
+                let WriteArgs { path, content } = parse(args)?;
+                let writer = workspace.writer().await;
+                tokio::task::spawn_blocking(move || {
+                    let _writer = writer;
+                    workspace.write(&path, &content)
+                })
+                .await
+                .map_err(|error| invocation(error.to_string()))?
+            }
             BuiltinTool::CodeRun => {
                 let CodeArgs { source } = parse(args)?;
                 self.run(source).await
             }
+            BuiltinTool::Publish => {
+                let call_id = call_id.ok_or_else(|| {
+                    invocation("publish runs only for a model's tool call".to_owned())
+                })?;
+                self.publish(call_id, parse(args)?).await
+            }
         }
+    }
+
+    /// Retain `args`' source under its name for this step attempt, keyed by
+    /// provider tool call `call_id`, and return the `{name, kind}` receipt
+    /// once the execution state accepted it.
+    ///
+    /// # Errors
+    /// Returns a Validation refusal for an invalid name or not exactly one
+    /// source, plus [`Publications::path`] and [`Publications::json`]
+    /// refusals.
+    async fn publish(&self, call_id: &str, args: PublishArgs) -> Result<Value, ToolError> {
+        let (run, producer) = self
+            .publisher
+            .as_ref()
+            .ok_or_else(|| invocation("this call cannot publish".to_owned()))?;
+        let name = PublicationName::new(args.name).map_err(|error| structured(&error))?;
+        let call = PublishCall {
+            id: call_id.to_owned(),
+            producer: producer.clone(),
+            name,
+        };
+        let publications = Publications::new(&self.state, &self.caller, run, self.limits);
+        let kind = match (args.path, args.value) {
+            (Some(path), None) => publications.path(&call, self.workspace()?, &path).await?,
+            (None, Some(value)) => publications.json(&call, value).await?,
+            _ => {
+                return Err(structured(&WyrdError::Validation {
+                    message: "publish needs exactly one source: a /work `path` or a JSON `value`"
+                        .to_owned(),
+                    details: json!({
+                        "rule": "publication_source", "field": "path",
+                        "expected": "exactly one of path or value",
+                    }),
+                }));
+            }
+        };
+        Ok(json!({"name": call.name, "kind": kind}))
     }
 
     /// Run `source` with `/inputs` read-only and `/work` writable, charging
@@ -452,12 +543,21 @@ impl AgentTool for Builtin {
         json!({"type": "object"})
     }
 
-    /// Authorize, then run the tool.
+    /// Authorize, then run the tool outside any provider call; `publish`
+    /// refuses, since it needs the call's identity.
     ///
     /// # Errors
     /// Returns [`Invocation::call`] failures.
     async fn invoke(&self, args: Value) -> Result<Value, ToolError> {
-        self.invocation.call(self.tool, args).await
+        self.invocation.call(self.tool, None, args).await
+    }
+
+    /// Authorize, then run the tool for provider tool call `call_id`.
+    ///
+    /// # Errors
+    /// Returns [`Invocation::call`] failures.
+    async fn invoke_call(&self, call_id: &str, args: Value) -> Result<Value, ToolError> {
+        self.invocation.call(self.tool, Some(call_id), args).await
     }
 }
 
@@ -488,6 +588,40 @@ struct FsArgs {
 struct CodeArgs {
     /// Python whose last expression is the result.
     source: String,
+}
+
+/// Arguments of `fs.write`.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct WriteArgs {
+    /// The `/work` file to create or replace.
+    path: String,
+    /// Its whole UTF-8 content.
+    content: String,
+}
+
+/// Arguments of `publish`: a name and exactly one source, which
+/// [`Invocation::publish`] checks.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PublishArgs {
+    /// The logical name, `[A-Za-z0-9_-]{1,64}`.
+    name: String,
+    /// A `/work` file or directory to retain.
+    #[serde(default)]
+    path: Option<String>,
+    /// A JSON value to retain; an explicit `null` is a value.
+    #[serde(default, deserialize_with = "present")]
+    value: Option<Value>,
+}
+
+/// A field that is present, so an explicit JSON `null` is `Some(Null)`
+/// rather than absent.
+///
+/// # Errors
+/// Never fails for JSON input: every JSON value deserializes.
+fn present<'de, D: serde::Deserializer<'de>>(deserializer: D) -> Result<Option<Value>, D::Error> {
+    Value::deserialize(deserializer).map(Some)
 }
 
 /// The description and argument schema of `tool`; Card and Bifrost tools
@@ -539,11 +673,33 @@ fn descriptor(tool: BuiltinTool) -> (String, Value) {
                 "output_path": {"type": "string", "description": "New file path under /work."}
             }, "required": ["path", "output_path"], "additionalProperties": false}),
         ),
+        BuiltinTool::FsWrite => (
+            "Create or replace one UTF-8 text file under /work, this call's private scratch, \
+             creating missing parent directories. Returns the `path` and the `bytes` written. \
+             /inputs is read-only, and writes count against the /work budget.",
+            json!({"type": "object", "properties": {
+                "path": {"type": "string", "description": "File path under /work."},
+                "content": {"type": "string", "description": "The file's whole UTF-8 content."}
+            }, "required": ["path", "content"], "additionalProperties": false}),
+        ),
         BuiltinTool::CodeRun => (
             "Run sandboxed Python with /inputs read-only and /work writable; returns printed output \
              and the repr of the last expression, both cut at the result limit. No network, host \
              files, or packages.",
             json!({"type": "object", "properties": {"source": {"type": "string"}}, "required": ["source"], "additionalProperties": false}),
+        ),
+        BuiltinTool::Publish => (
+            "Retain content for the steps that read this step's publications, under a logical \
+             `name` (letters, digits, `_`, `-`; at most 64). Give exactly one source: `path`, an \
+             existing /work file or whole directory, snapshotted now so later writes do not \
+             change it; or `value`, any JSON value, null included. Returns `{name, kind}` once \
+             retained; calling it again under a name this attempt published is refused. A final \
+             answer is not a publication.",
+            json!({"type": "object", "properties": {
+                "name": {"type": "string", "pattern": "^[A-Za-z0-9_-]{1,64}$"},
+                "path": {"type": "string", "description": "A /work file or directory."},
+                "value": {"description": "Any JSON value, null included."}
+            }, "required": ["name"], "additionalProperties": false}),
         ),
         _ => {
             return crate::mcp::cards::descriptors()

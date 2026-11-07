@@ -86,14 +86,21 @@ pub enum BuiltinTool {
     /// Extract one workspace document into JSON under `/work`.
     #[serde(rename = "fs.extract")]
     FsExtract,
+    /// Create or replace one UTF-8 file in the invocation's private `/work`.
+    #[serde(rename = "fs.write")]
+    FsWrite,
     /// Run sandboxed Python over the workspace.
     #[serde(rename = "code.run")]
     CodeRun,
+    /// Retain a `/work` file, directory, or JSON value under a logical name
+    /// for the step's successors; only a step Agent may declare it.
+    #[serde(rename = "publish")]
+    Publish,
 }
 
 impl BuiltinTool {
     /// Every built-in, in catalog order.
-    pub const ALL: [Self; 10] = [
+    pub const ALL: [Self; 12] = [
         Self::CardsList,
         Self::CardsGet,
         Self::BifrostListTables,
@@ -103,7 +110,9 @@ impl BuiltinTool {
         Self::FsRead,
         Self::FsSearch,
         Self::FsExtract,
+        Self::FsWrite,
         Self::CodeRun,
+        Self::Publish,
     ];
 
     /// The wire name, identical to the serde spelling.
@@ -119,7 +128,9 @@ impl BuiltinTool {
             Self::FsRead => "fs.read",
             Self::FsSearch => "fs.search",
             Self::FsExtract => "fs.extract",
+            Self::FsWrite => "fs.write",
             Self::CodeRun => "code.run",
+            Self::Publish => "publish",
         }
     }
 
@@ -130,13 +141,22 @@ impl BuiltinTool {
         Self::ALL.into_iter().find(|tool| tool.as_str() == name)
     }
 
-    /// True for the `fs.*` tools, which read only a declared workspace.
+    /// True for the `fs.*` tools that read a declared workspace; `fs.write`
+    /// writes private scratch and needs none.
     #[must_use]
     pub const fn is_filesystem(self) -> bool {
         matches!(
             self,
             Self::FsList | Self::FsRead | Self::FsSearch | Self::FsExtract
         )
+    }
+
+    /// True for every tool that runs in the invocation's workspace: the
+    /// filesystem tools, `fs.write`, `code.run`, and `publish`. Without a
+    /// declared workspace they share a private scratch-only one.
+    #[must_use]
+    pub const fn uses_workspace(self) -> bool {
+        self.is_filesystem() || matches!(self, Self::FsWrite | Self::CodeRun | Self::Publish)
     }
 }
 

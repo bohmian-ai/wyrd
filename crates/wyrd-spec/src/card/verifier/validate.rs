@@ -559,12 +559,19 @@ where
                 "filesystem tools require a workspace",
             ));
         }
-        let workspace_tool = fs_tool || builtins.contains(&BuiltinTool::CodeRun);
+        let workspace_tool = builtins.iter().any(|tool| tool.uses_workspace());
         if !call.workspace.is_empty() && !workspace_tool {
             return Err(invalid(
                 "agent_tools",
                 path,
                 "a workspace requires a filesystem or code.run tool",
+            ));
+        }
+        if builtins.contains(&BuiltinTool::Publish) && !matches!(position, Position::Step(_)) {
+            return Err(invalid(
+                "agent_tools",
+                path,
+                "publish is available only to step Agents; a check's Agent cannot publish",
             ));
         }
         if !matches!(position, Position::Step(_)) {
@@ -1794,7 +1801,9 @@ mod tests {
     }
 
     /// Every built-in tool validates on a step Agent, with a workspace only
-    /// when a filesystem or code tool reads it; unknown names stay refused.
+    /// when a workspace tool runs in it, and the scratch-only `fs.write`,
+    /// `code.run`, and `publish` also without one; only a step Agent may
+    /// publish, and unknown names stay refused.
     ///
     /// # Panics
     /// Panics when a built-in is refused or an unknown name is admitted.
@@ -1807,17 +1816,50 @@ mod tests {
                 "/steps/1/action/agent/tool_names",
                 json!([tool.as_str()]),
             );
-            if !tool.is_filesystem() && tool != BuiltinTool::CodeRun {
+            if !tool.uses_workspace() {
                 body = with(body, "/steps/1/action/workspace", json!({}));
             }
             parse(&body)
                 .validate()
                 .unwrap_or_else(|error| panic!("{}: {error:?}", tool.as_str()));
         }
-        for name in ["cards", "bifrost.*", "fs.read/x", "FS.READ", "http.fetch"] {
+        let scratch = with(
+            with(
+                review(),
+                "/steps/1/action/agent/tool_names",
+                json!(["fs.write", "code.run", "publish"]),
+            ),
+            "/steps/1/action/workspace",
+            json!({}),
+        );
+        parse(&scratch)
+            .validate()
+            .expect("scratch-only tools need no declared workspace");
+        let writes = with(
+            review(),
+            "/requirements/2/check/agent/tool_names",
+            json!(["fs.write"]),
+        );
+        parse(&writes)
+            .validate()
+            .expect("a check Agent may write scratch");
+        for name in [
+            "cards",
+            "bifrost.*",
+            "fs.read/x",
+            "FS.READ",
+            "http.fetch",
+            "fs_write",
+        ] {
             let body = with(review(), "/steps/1/action/agent/tool_names", json!([name]));
             assert_eq!(rule(&body), "agent_tools", "{name}");
         }
+        let publishes = with(
+            review(),
+            "/requirements/2/check/agent/tool_names",
+            json!(["publish"]),
+        );
+        assert_eq!(rule(&publishes), "agent_tools", "a check cannot publish");
     }
 
     /// Check Agents in either position, inline or resolver-supplied, must

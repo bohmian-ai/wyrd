@@ -148,8 +148,8 @@ impl HostedBlocks {
             execution.evidence.clone(),
             self.limits,
         );
-        let evidence = Arc::new(match execution.execution {
-            Some(state) => evidence.with_execution(state),
+        let evidence = Arc::new(match &execution.execution {
+            Some(state) => evidence.with_execution(Arc::clone(state)),
             None => evidence,
         });
         let registry = Arc::new(TenantRegistry::new(
@@ -163,14 +163,20 @@ impl HostedBlocks {
             registry as Arc<dyn PromptCardResolver>,
         )
         .with_evidence(Arc::clone(&evidence) as Arc<dyn EvidenceReader>)
-        .with_toolset(Arc::new(HostedTools::new(
-            state.clone(),
-            caller.clone(),
-            Arc::clone(&evidence),
-            Arc::clone(&self.workspaces),
-            Arc::clone(&self.sandbox),
-            self.limits,
-        )))
+        .with_toolset(Arc::new({
+            let tools = HostedTools::new(
+                state.clone(),
+                caller.clone(),
+                Arc::clone(&evidence),
+                Arc::clone(&self.workspaces),
+                Arc::clone(&self.sandbox),
+                self.limits,
+            );
+            match &execution.execution {
+                Some(run) => tools.with_execution(Arc::clone(run)),
+                None => tools,
+            }
+        }))
         .with_wyrd_gateway(Arc::new(
             ServerWyrdGatewayCaller::new(state.clone(), caller.clone())
                 .attributed(Some(execution.subject)),

@@ -30,7 +30,9 @@ use wyrd_spec::ids::SlotName;
 use wyrd_spec::reference::{CardRef, InlineableRef};
 use wyrd_spec::verification::TaskId;
 use wyrd_spec::verification::VerificationVerdict;
-use wyrd_spec::verification::execution::{CallProvenance, Citation, InputDeclaration, Verdict};
+use wyrd_spec::verification::execution::{
+    CallProvenance, Citation, InputDeclaration, Producer, Verdict,
+};
 
 use super::tools::{AgentToolset, ToolSession, finished};
 use super::{
@@ -325,7 +327,8 @@ impl AgentExecutor {
     /// Run one Agent call and return its raw run plus provenance.
     ///
     /// `slots` are the citation slots a check invocation can reach, empty for
-    /// a step; see [`Self::bind`].
+    /// a step; see [`Self::bind`]. `producer` is the step attempt the
+    /// toolset attributes publications to, `None` for a check.
     ///
     /// Steps and checks get exactly their declared built-ins from the toolset, which holds the
     /// invocation's workspace until the run ends. The first tool refused
@@ -349,6 +352,7 @@ impl AgentExecutor {
         workspace: &BTreeMap<String, CallInput>,
         slots: &BTreeSet<SlotName>,
         deadline: Instant,
+        producer: Option<&Producer>,
     ) -> Result<Invoked, BlockError> {
         let resolved = self.resolve(&call.agent).await?;
         let route = self.route(id, &resolved.spec.execution_route)?;
@@ -374,7 +378,11 @@ impl AgentExecutor {
                 .toolset
                 .as_ref()
                 .ok_or_else(|| terminal("this host provides no built-in tools"))?;
-            Some(toolset.open(id, workspace, deadline, &declared).await?)
+            Some(
+                toolset
+                    .open(id, workspace, deadline, &declared, producer)
+                    .await?,
+            )
         };
         let tools = match &session {
             Some(session) => session.resolve(&declared, &records)?,
@@ -441,6 +449,12 @@ impl ActionExecutor for AgentExecutor {
         let Action::Agent(agent) = call.block else {
             return Err(terminal("the Agent executor runs only Agent actions"));
         };
+        let producer = Producer {
+            step_id: call.id.clone(),
+            item_index: None,
+            iteration_index: None,
+            attempt: call.attempt,
+        };
         let invoked = self
             .invoke(
                 call.id,
@@ -449,6 +463,7 @@ impl ActionExecutor for AgentExecutor {
                 &call.workspace,
                 &BTreeSet::new(),
                 call.deadline,
+                Some(&producer),
             )
             .await?;
         let output = invoked
@@ -494,6 +509,7 @@ impl CheckExecutor for AgentExecutor {
                 &call.workspace,
                 &reachable,
                 call.deadline,
+                None,
             )
             .await?;
         let answer = invoked

@@ -775,7 +775,10 @@ impl VerificationEngine {
                     let attempt = engine.recorded(&requirement.id) + 1;
                     engine.begin(&requirement.id, attempt).await?;
                     let step = key.0.map(|index| &spec.steps[index].id);
-                    let judged = match engine.judge(requirement, step, inputs, deadline).await {
+                    let judged = match engine
+                        .judge(requirement, step, inputs, deadline, attempt)
+                        .await
+                    {
                         Err(
                             error @ (EngineError::Busy(_) | EngineError::DefinitionUnavailable(_)),
                         ) => {
@@ -855,6 +858,7 @@ impl VerificationEngine {
                 inputs: bindings.inputs.clone(),
                 workspace: bindings.workspace.clone(),
                 deadline: timeout.unwrap_or(deadline),
+                attempt: attempts,
             };
             let timer = BlockTimer::start(&self.clock, "action", action_kind(&step.action));
             let result = match timeout {
@@ -891,7 +895,8 @@ impl VerificationEngine {
         }
     }
 
-    /// Run one requirement's check over its resolved bindings.
+    /// Run attempt `attempt` of one requirement's check over its resolved
+    /// bindings.
     ///
     /// A failed Agent or code check is inconclusive, and so is an `each`
     /// assertion selecting no value, with reason [`EMPTY_SELECTION`], so an
@@ -920,6 +925,7 @@ impl VerificationEngine {
         step: Option<&TaskId>,
         bindings: Bindings,
         deadline: Instant,
+        attempt: u32,
     ) -> Result<Judged, EngineError> {
         let _permit = self.permits.acquire().await;
         let sources = bindings.sources();
@@ -964,6 +970,7 @@ impl VerificationEngine {
                     inputs,
                     workspace,
                     deadline,
+                    attempt,
                 };
                 match self.checks.execute(call).await {
                     Ok(output) => (Judged::cited(output, &sources), true),

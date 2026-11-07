@@ -26,7 +26,7 @@ use tokio::time::Instant;
 use wyrd_spec::auth::Sha256Hex;
 use wyrd_spec::card::agent::BuiltinTool;
 use wyrd_spec::verification::TaskId;
-use wyrd_spec::verification::execution::ToolCallRecord;
+use wyrd_spec::verification::execution::{Producer, ToolCallRecord};
 
 use super::{BlockError, CallInput};
 
@@ -39,7 +39,8 @@ use super::{BlockError, CallInput};
 #[async_trait]
 pub trait AgentToolset: Send + Sync {
     /// Open the tool session for `tools` of the Agent call `id`, in its
-    /// resolved `workspace` and cancelled at `deadline`.
+    /// resolved `workspace` and cancelled at `deadline`. `producer` is the
+    /// step attempt a `publish` call retains content for; a check has none.
     ///
     /// Called once per Agent step or check attempt, before the first model
     /// call. The returned session lives exactly as long as that attempt.
@@ -55,6 +56,7 @@ pub trait AgentToolset: Send + Sync {
         workspace: &BTreeMap<String, CallInput>,
         deadline: Instant,
         tools: &[BuiltinTool],
+        producer: Option<&Producer>,
     ) -> Result<ToolSession, BlockError>;
 }
 
@@ -246,7 +248,17 @@ impl AgentTool for RecordedTool {
         self.inner.output_schema()
     }
 
-    /// Invoke the bound tool and record arguments, output digest, and size.
+    /// Invoke the bound tool outside any provider call; see
+    /// [`Self::invoke_call`].
+    ///
+    /// # Errors
+    /// Returns [`Self::invoke_call`]'s errors.
+    async fn invoke(&self, args: Value) -> Result<Value, ToolError> {
+        self.record(args, |args| self.inner.invoke(args)).await
+    }
+
+    /// Invoke the bound tool for provider call `call_id` and record
+    /// arguments, output digest, and size.
     ///
     /// A failed call records its error prefixed with its stable Wyrd code, so
     /// a denied call names `WYRD_PERMISSION_403_DENIED_RBAC`. A result larger than the session limit is replaced by an error, so
@@ -257,7 +269,27 @@ impl AgentTool for RecordedTool {
     /// # Errors
     /// Returns the bound tool's error, or [`ToolError::Invocation`] for an
     /// oversized or unserializable result.
-    async fn invoke(&self, args: Value) -> Result<Value, ToolError> {
+    async fn invoke_call(&self, call_id: &str, args: Value) -> Result<Value, ToolError> {
+        self.record(args, |args| self.inner.invoke_call(call_id, args))
+            .await
+    }
+}
+
+impl RecordedTool {
+    /// Run `call` over `args` and record it; see
+    /// [`AgentTool::invoke_call`] on [`RecordedTool`].
+    ///
+    /// # Errors
+    /// Returns `call`'s error, or [`ToolError::Invocation`] for an
+    /// oversized or unserializable result.
+    async fn record<'a, F>(
+        &'a self,
+        args: Value,
+        call: impl FnOnce(Value) -> F,
+    ) -> Result<Value, ToolError>
+    where
+        F: Future<Output = Result<Value, ToolError>> + 'a,
+    {
         let slot = {
             let mut records = self.records.lock().unwrap_or_else(PoisonError::into_inner);
             records.push(None);
@@ -270,7 +302,7 @@ impl AgentTool for RecordedTool {
             returned_bytes: 0,
             error: None,
         };
-        let result = self.inner.invoke(args).await.and_then(|output| {
+        let result = call(args).await.and_then(|output| {
             // Encoding stops at the limit, so an oversized result never
             // allocates more than the limit.
             let mut writer = Capped {

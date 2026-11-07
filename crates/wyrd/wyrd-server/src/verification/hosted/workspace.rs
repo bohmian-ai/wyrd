@@ -1030,6 +1030,96 @@ impl Workspace {
         }))
     }
 
+    /// `fs.write`: create or replace the regular `/work` file `path` with
+    /// UTF-8 `content`, creating missing parent directories, and return the
+    /// path and byte count written.
+    ///
+    /// Run it on the blocking pool while holding [`Self::writer`], so the
+    /// `/work` budget it checks stays true. Every existing parent must be a
+    /// real directory and an existing target a regular file, so a write never
+    /// follows a link out of `/work`. The budget counts a replaced file once;
+    /// a refused write creates nothing, and the new bytes land by rename, so
+    /// a failed write never leaves a partial file.
+    ///
+    /// # Errors
+    /// Returns an [`invalid`] refusal: `write_path` for a path outside
+    /// `/work` (`/inputs` included), `write_parent` for a parent that is not
+    /// a directory, `regular_file` for a target that is a directory, link, or
+    /// special file, and `work_budget` for content over the `/work` budget. A
+    /// local IO failure is an [`invocation`] failure.
+    pub fn write(&self, path: &str, content: &str) -> Result<Value, ToolError> {
+        let rest = relative(path, "/work/").ok_or_else(|| {
+            invalid(
+                "write_path",
+                "path",
+                path,
+                format!("{path} is not a file path under /work; /inputs is read-only"),
+                "a file path under /work without empty, . or .. segments",
+            )
+        })?;
+        let segments: Vec<&str> = rest.split('/').collect();
+        let (name, parents) = segments.split_last().ok_or_else(|| outside(path))?;
+        let mut parent = self.work_dir();
+        let mut missing_parents = Vec::new();
+        for segment in parents {
+            parent.push(segment);
+            if !missing_parents.is_empty() {
+                missing_parents.push(parent.clone());
+                continue;
+            }
+            match parent.symlink_metadata() {
+                Ok(meta) if meta.is_dir() => {}
+                Ok(_) => {
+                    return Err(invalid(
+                        "write_parent",
+                        "path",
+                        path,
+                        format!("a parent of {path} is a file, link, or special file"),
+                        "a path whose existing parents are directories",
+                    ));
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    missing_parents.push(parent.clone());
+                }
+                Err(error) => return Err(failed(error)),
+            }
+        }
+        let target = parent.join(name);
+        let replaced = match target.symlink_metadata() {
+            Ok(meta) if meta.is_file() => meta.len(),
+            Ok(_) => {
+                return Err(invalid(
+                    "regular_file",
+                    "path",
+                    path,
+                    format!("{path} is a directory, link, or special file"),
+                    "a new or existing regular file",
+                ));
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => 0,
+            Err(error) => return Err(failed(error)),
+        };
+        let bytes = u64::try_from(content.len()).unwrap_or(u64::MAX);
+        if bytes > self.work_room().saturating_add(replaced) {
+            return Err(invalid(
+                "work_budget",
+                "content",
+                path,
+                format!("{path} would exceed the /work write budget"),
+                "fewer or smaller /work files",
+            ));
+        }
+        for directory in &missing_parents {
+            std::fs::create_dir(directory).map_err(failed)?;
+        }
+        let mut staged = tempfile::NamedTempFile::new_in(self.root.path()).map_err(failed)?;
+        std::io::Write::write_all(&mut staged, content.as_bytes()).map_err(failed)?;
+        staged
+            .persist(&target)
+            .map_err(|error| failed(error.error))?;
+        Ok(json!({"path": path, "bytes": bytes}))
+    }
+
     /// Most `/work` entries a list or search visits: no result could show
     /// more, since every listed entry takes more than 16 bytes.
     const fn walk_limit(&self) -> usize {

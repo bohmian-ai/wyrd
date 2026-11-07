@@ -51,6 +51,7 @@ async fn invocation(caller: Caller, limits: HostedLimits) -> Invocation {
         sandbox: idle_sandbox(limits).await,
         deadline: Instant::now() + Duration::from_secs(30),
         code_budget: Arc::new(Mutex::new(limits.agent_code_budget)),
+        publisher: None,
         limits,
     }
 }
@@ -86,32 +87,32 @@ fn tools_require_their_exact_invoke_grant() {
 
         assert_eq!(
             exact
-                .call(BuiltinTool::FsRead, read.clone())
+                .call(BuiltinTool::FsRead, None, read.clone())
                 .await
                 .expect("granted")["units"][1]["text"],
             "beta"
         );
         assert_eq!(
-            code(none.call(BuiltinTool::FsRead, read.clone()).await),
+            code(none.call(BuiltinTool::FsRead, None, read.clone()).await),
             "WYRD_PERMISSION_403_DENIED_RBAC"
         );
         assert_eq!(
             code(
                 exact
-                    .call(BuiltinTool::FsList, json!({"path": "/inputs"}))
+                    .call(BuiltinTool::FsList, None, json!({"path": "/inputs"}))
                     .await
             ),
             "WYRD_PERMISSION_403_DENIED_RBAC"
         );
         assert!(
             global
-                .call(BuiltinTool::FsSearch, json!({"query": "ALPHA"}))
+                .call(BuiltinTool::FsSearch, None, json!({"query": "ALPHA"}))
                 .await
                 .is_ok()
         );
         assert_eq!(
             code(
-                none.call(BuiltinTool::CodeRun, json!({"source": "1"}))
+                none.call(BuiltinTool::CodeRun, None, json!({"source": "1"}))
                     .await
             ),
             "WYRD_PERMISSION_403_DENIED_RBAC"
@@ -145,14 +146,14 @@ fn tool_and_domain_grants_are_both_required() {
             (BuiltinTool::CardsList, json!({})),
             (BuiltinTool::BifrostListTables, json!({})),
         ] {
-            let result = tools_only.call(tool, args).await;
+            let result = tools_only.call(tool, None, args).await;
             assert!(denied(&result), "{tool:?}: {result:?}");
         }
         for (tool, args) in [
             (BuiltinTool::CardsList, json!({})),
             (BuiltinTool::BifrostQuery, json!({"sql": "SELECT 1"})),
         ] {
-            let result = data_only.call(tool, args).await;
+            let result = data_only.call(tool, None, args).await;
             assert_eq!(code(result), "WYRD_PERMISSION_403_DENIED_RBAC", "{tool:?}");
         }
     });
@@ -179,10 +180,10 @@ fn tools_refuse_forged_arguments_and_spent_budgets() {
             (BuiltinTool::BifrostQuery, json!({"sql": "SELECT 1", "tenant": "other"})),
             (BuiltinTool::CardsList, json!({"delegation_chain": []})),
         ] {
-            let result = invocation.call(tool, args).await;
+            let result = invocation.call(tool, None, args).await;
             assert!(matches!(result, Err(ToolError::InvalidInput(_))), "{tool:?}: {result:?}");
         }
-        let spent = invocation.call(BuiltinTool::CodeRun, json!({"source": "1"})).await;
+        let spent = invocation.call(BuiltinTool::CodeRun, None, json!({"source": "1"})).await;
         assert!(
             matches!(&spent, Err(ToolError::Invocation { detail, .. }) if detail.contains("budget")),
             "{spent:?}"
@@ -190,13 +191,16 @@ fn tools_refuse_forged_arguments_and_spent_budgets() {
     });
 }
 
-/// A filesystem or code tool without a declared workspace fails before any
-/// tool is bound; Card and Bifrost tools need none.
+/// A filesystem reading tool without a declared workspace fails before any
+/// tool is bound, and so does `publish` outside a step attempt of an
+/// execution; `fs.write` and `code.run` get private scratch, and Card and
+/// Bifrost tools need none.
 ///
 /// # Panics
-/// Panics when a workspace tool opens without a workspace.
+/// Panics when a reading tool or an unbound `publish` opens, or a
+/// scratch-only tool is refused.
 #[test]
-fn workspace_tools_need_a_declared_workspace() {
+fn reading_tools_need_a_declared_workspace() {
     wyrd_runtime::runtime().block_on(async {
         let limits = HostedLimits::default();
         let tools = HostedTools::new(
@@ -215,25 +219,36 @@ fn workspace_tools_need_a_declared_workspace() {
         let id = TaskId::new("review").expect("task id");
         let deadline = Instant::now() + Duration::from_secs(30);
         let none = BTreeMap::new();
-        for tool in [BuiltinTool::FsRead, BuiltinTool::CodeRun] {
+        let producer = Producer {
+            step_id: id.clone(),
+            item_index: None,
+            iteration_index: None,
+            attempt: 1,
+        };
+        for (tool, producer) in [
+            (BuiltinTool::FsRead, None),
+            (BuiltinTool::Publish, None),
+            (BuiltinTool::Publish, Some(&producer)),
+        ] {
             let refused = tools
-                .open(&id, &none, deadline, &[tool])
+                .open(&id, &none, deadline, &[tool], producer)
                 .await
                 .err()
                 .expect("refused");
             assert!(matches!(refused, BlockError::Terminal { .. }), "{refused}");
         }
-        assert!(
-            tools
-                .open(
-                    &id,
-                    &none,
-                    deadline,
-                    &[BuiltinTool::CardsGet, BuiltinTool::BifrostQuery]
-                )
-                .await
-                .is_ok()
-        );
+        for declared in [
+            &[BuiltinTool::CardsGet, BuiltinTool::BifrostQuery][..],
+            &[BuiltinTool::FsWrite, BuiltinTool::CodeRun],
+        ] {
+            assert!(
+                tools
+                    .open(&id, &none, deadline, declared, None)
+                    .await
+                    .is_ok(),
+                "{declared:?}"
+            );
+        }
     });
 }
 

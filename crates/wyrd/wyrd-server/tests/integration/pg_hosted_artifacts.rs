@@ -306,6 +306,7 @@ async fn artifact_evidence_and_code_reach_every_consumer() {
             )]),
             workspace: BTreeMap::new(),
             deadline: Instant::now() + Duration::from_secs(30),
+            attempt: 1,
         },
     )
     .await
@@ -833,6 +834,7 @@ async fn recovered_authority_bounds_every_agent_tool() {
                     },
                 )]),
                 deadline: Instant::now() + Duration::from_secs(60),
+                attempt: 1,
             },
         )
         .await
@@ -876,6 +878,7 @@ async fn recovered_authority_bounds_every_agent_tool() {
             inputs: document(output.output.clone()),
             workspace: BTreeMap::new(),
             deadline: Instant::now() + Duration::from_secs(60),
+            attempt: 1,
         },
     )
     .await
@@ -1084,6 +1087,7 @@ async fn capacity_refusal_is_busy_at_every_hosted_consumer() {
                 inputs: one(),
                 workspace: BTreeMap::new(),
                 deadline: far,
+                attempt: 1,
             },
         )
     };
@@ -1102,6 +1106,7 @@ async fn capacity_refusal_is_busy_at_every_hosted_consumer() {
                 inputs: one(),
                 workspace: BTreeMap::new(),
                 deadline: far,
+                attempt: 1,
             },
         )
         .await
@@ -1144,6 +1149,7 @@ async fn capacity_refusal_is_busy_at_every_hosted_consumer() {
                     inputs: document(json!("the notes")),
                     workspace: notes_workspace(registered),
                     deadline: Instant::now() + Duration::from_secs(30),
+                    attempt: 1,
                 },
             )
             .await

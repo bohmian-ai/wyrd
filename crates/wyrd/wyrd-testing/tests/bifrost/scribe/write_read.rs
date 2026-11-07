@@ -2040,20 +2040,15 @@ async fn learned_layout_evolution_preserves_published_evidence() {
     let table = format!("{}.{name}", BifrostNamespace::Datasets.as_str());
     let first_key = tenant_key(&server, tenant).await;
     let second_key = tenant_key(&server, tenant).await;
-    let generations: [(std::ops::Range<i64>, fn(i64) -> String); 3] = [
-        (0..300, |value| format!(r#"{{"a":{value},"b":"s{value}"}}"#)),
-        (300..600, |value| {
-            format!(r#"{{"a":{value},"b":"t{value}"}}"#)
-        }),
-        (600..900, |value| {
-            format!(r#"{{"a":{value},"c":{{"d":[{value},"x"]}}}}"#)
-        }),
-    ];
+    let document = |generation: i64, value: i64| match generation {
+        0 => format!(r#"{{"a":{value},"b":"s{value}"}}"#),
+        1 => format!(r#"{{"a":{value},"b":"t{value}"}}"#),
+        _ => format!(r#"{{"a":{value},"c":{{"d":[{value},"x"]}}}}"#),
+    };
     let mut written = Vec::new();
-    let mut append = async |client: &wyrd_client::WyrdClient, generation: usize| {
-        let (values, document) = generations[generation].clone();
-        let rows = values
-            .map(|value| (value, document(value)))
+    let mut append = async |client: &wyrd_client::WyrdClient, generation: i64| {
+        let rows = (generation * 300..(generation + 1) * 300)
+            .map(|value| (value, document(generation, value)))
             .collect::<Vec<_>>();
         let batch = super::recovery::variant_batch(
             &rows

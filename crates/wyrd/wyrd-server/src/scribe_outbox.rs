@@ -208,7 +208,12 @@ pub enum ScribeWrite {
     /// One gateway call's validated analytical record, its objects already
     /// persisted.
     Capture(Box<CallCapture>),
-    /// One Verifier judgment's output and summary rows.
+    /// One Verifier judgment's output and summary rows, each its own frame
+    /// whose batch id derives from the result's `result_id` and table, so a
+    /// later delivery of the same selected result carries the same two
+    /// identities: Scribe's batch-id fence absorbs a row it already accepted
+    /// and refuses different rows under an accepted identity as a batch
+    /// conflict.
     Result {
         /// The result's rows, output before the summary, each naming the
         /// Card verified as its `subject_card_uid`.
@@ -1180,9 +1185,10 @@ pub(crate) type Owner = (usize, Attribution);
 
 /// One frame being assembled from consecutive rows of one destination.
 struct Frame {
-    /// Persisted identity of a frame that is one write's own batch, which
-    /// replaces the slice's idempotency key and position in its batch ids;
-    /// `None` for a frame shared by the slice's writes.
+    /// Persisted identity of a frame that is one write's own batch, an
+    /// execution state revision's batch or a Verifier result's `result_id`,
+    /// which replaces the slice's idempotency key and position in its batch
+    /// ids; `None` for a frame shared by the slice's writes.
     key: Option<Uuid>,
     /// Destination table.
     table: ScribeTable,
@@ -1252,9 +1258,12 @@ impl ScribeSink {
     /// keys its frame by request: a gateway call row carries its admitting
     /// request as content, like an audit decision, so captures of many calls
     /// share a frame. Captures are gathered and projected in one pass, after
-    /// the other writes' rows. Result summary frames
-    /// are moved after every detail frame, so a visible summary's details
-    /// were acknowledged first. Positions of writes that cannot be projected
+    /// the other writes' rows. A Verifier result's output and summary are
+    /// each their own one-row frame keyed by its `result_id`, so every
+    /// delivery of a selected result, in any slice, resubmits the same two
+    /// batch ids and Scribe's batch-id fence keeps each row once. Result
+    /// summary frames are moved after every detail frame, so a visible
+    /// summary's details were acknowledged first. Positions of writes that cannot be projected
     /// are added to `lost`.
     fn frames(items: &[ScribeWrite], lost: &mut BTreeSet<usize>) -> Vec<Frame> {
         let mut frames: Vec<Frame> = Vec::new();
@@ -1286,9 +1295,21 @@ impl ScribeSink {
                     continue;
                 }
             };
+            let key = match item {
+                ScribeWrite::Result { payload, .. } => Some(payload.result_id().as_uuid()),
+                _ => None,
+            };
             for rows in rows {
                 let owners = vec![(index, rows.attribution); rows.part.num_rows()];
-                Frame::absorb(&mut frames, rows.table, rows.part, owners);
+                match key {
+                    Some(key) => frames.push(Frame {
+                        key: Some(key),
+                        table: rows.table,
+                        parts: vec![rows.part],
+                        owners,
+                    }),
+                    None => Frame::absorb(&mut frames, rows.table, rows.part, owners),
+                }
             }
         }
         // Captures that cannot project in bulk are projected call by call, so
@@ -1334,10 +1355,10 @@ impl ScribeSink {
     /// only on the rows: an identical slice always cuts identically. A
     /// projected batch is never divided; skewed row sizes are left to
     /// [`Chunk::encode`]'s split by encoded size. A keyed frame, a persisted
-    /// execution event batch, is cut one event per chunk whatever the
-    /// budget, so each event's identity is its batch and position and a
-    /// replay at another request ceiling never reuses an identity for
-    /// different rows.
+    /// execution event batch or one row of a Verifier result, is cut one row
+    /// per chunk whatever the budget, so each row's identity is its key and
+    /// position and a replay at another request ceiling never reuses an
+    /// identity for different rows.
     fn chunks(frame: &Frame, budget: usize) -> Vec<Chunk> {
         let sample = &frame.parts[0];
         let row_bytes = sample.bytes().div_ceil(sample.num_rows().max(1)).max(1);
@@ -2122,12 +2143,13 @@ mod tests {
     }
 
     /// Proves one tenant slice becomes one frame per destination whatever
-    /// its callers: three results of one run attribution share a single
-    /// summary frame scoped to the Cards verified, two calls of different
+    /// its callers, except that each Verifier result is its own output and
+    /// summary frame: three results of one run attribution are three summary
+    /// frames together scoped to the Cards verified, two calls of different
     /// callers admitted under different requests share one row frame and one
     /// span frame, every row carrying its own write's subject and actor and
-    /// naming its own admitting request, and the summary frame is submitted
-    /// last although it was staged first. Every frame names the no-caller
+    /// naming its own admitting request, and the summary frames are submitted
+    /// last although they were staged first. Every frame names the no-caller
     /// marker as its transport principal; the verified pairs live on the rows.
     /// The capture frames share a phase and arrive in either order. The
     /// slice is written straight through the sink, since the outbox spreads
@@ -2170,14 +2192,18 @@ mod tests {
             .iter()
             .map(|frame| (frame.table.as_str(), frame.rows))
             .collect::<Vec<_>>();
-        frames[..3].sort_unstable();
+        frames[..5].sort_unstable();
         assert_eq!(
             frames,
             [
                 ("bifrost.gateway.calls", 2),
                 ("bifrost.traces.spans", 2),
-                ("bifrost.verification.execution_outputs", 3),
-                ("bifrost.verification.results", 3),
+                ("bifrost.verification.execution_outputs", 1),
+                ("bifrost.verification.execution_outputs", 1),
+                ("bifrost.verification.execution_outputs", 1),
+                ("bifrost.verification.results", 1),
+                ("bifrost.verification.results", 1),
+                ("bifrost.verification.results", 1),
             ]
         );
         let (judgments, captures): (Vec<_>, Vec<_>) = received
@@ -2193,11 +2219,22 @@ mod tests {
             .map(|row| row["request_id"].as_str().expect("request_id").to_owned())
             .collect::<HashSet<_>>();
         assert_eq!(requests.len(), 2, "each row names its own request");
-        for frame in judgments {
-            assert_eq!(frame.pairs, [attribution; 3], "{}", frame.table);
+        for table in [
+            "bifrost.verification.execution_outputs",
+            "bifrost.verification.results",
+        ] {
+            let frames = judgments
+                .iter()
+                .filter(|frame| frame.table == table)
+                .collect::<Vec<_>>();
+            assert!(frames.iter().all(|frame| frame.pairs == [attribution]));
             assert_eq!(
-                frame.card_scope.iter().collect::<HashSet<_>>(),
-                subjects.iter().collect::<HashSet<_>>()
+                frames
+                    .iter()
+                    .flat_map(|frame| &frame.card_scope)
+                    .collect::<HashSet<_>>(),
+                subjects.iter().collect::<HashSet<_>>(),
+                "{table}"
             );
         }
         assert!(received.iter().all(|frame| frame.tenant == tenant));
@@ -2503,7 +2540,8 @@ mod tests {
     }
 
     /// Proves the frames of a mixed slice build every staged audit and
-    /// Verifier row straight into one dense batch per destination: each
+    /// Verifier row straight into one dense batch per destination, or per
+    /// result for a Verifier result's own frames: each
     /// encoded frame decodes to exactly the rows its writes' own one-row
     /// projections hold, in slice order with nulls and Variants intact, each
     /// attributed row followed by its own write's subject and actor, audit
@@ -2611,11 +2649,13 @@ mod tests {
             seen,
             [
                 (ScribeTable::AuditLog, vec![0, 3]),
-                (ScribeTable::ExecutionOutputs, vec![1, 4]),
+                (ScribeTable::ExecutionOutputs, vec![1]),
                 (ScribeTable::ExecutionInputs, vec![2]),
+                (ScribeTable::ExecutionOutputs, vec![4]),
                 (ScribeTable::Calls, vec![5]),
                 (ScribeTable::Spans, vec![5]),
-                (ScribeTable::Results, vec![1, 4]),
+                (ScribeTable::Results, vec![1]),
+                (ScribeTable::Results, vec![4]),
             ]
         );
     }
@@ -3137,6 +3177,60 @@ mod tests {
         assert_eq!(held, submitted[..2].iter().copied().collect::<HashSet<_>>());
     }
 
+    /// Proves a selected result keeps its write identities however it is
+    /// staged: written in three slices, alongside or after other results and
+    /// in either order, its output and its summary are each their own
+    /// one-row frame under one batch id per table, carrying the same
+    /// encoded rows every time, the two tables' ids differ, and other
+    /// results keep their own ids. Five result writes cost ten frames.
+    ///
+    /// # Panics
+    ///
+    /// Panics when a resubmission changes a result's identity or rows, two
+    /// results or tables share an identity, or a frame holds another row.
+    #[tokio::test]
+    async fn result_redelivery_keeps_batch_identity() {
+        let scribe = Arc::new(RecordingScribe::default());
+        let outbox = ScribeSink::local_outbox(Arc::clone(&scribe) as _, None);
+        let tenant = DataTenantId::new_v7();
+        let attribution = background();
+        let [selected, other, later] = [(); 3].map(|()| result(&uid(), attribution));
+        let slices = [
+            vec![copied(&selected), other],
+            vec![later, copied(&selected)],
+            vec![selected],
+        ];
+        for slice in &slices {
+            outbox
+                .sink()
+                .write(tenant, uuid::Uuid::now_v7(), slice)
+                .await
+                .expect("the slice is written");
+        }
+
+        let received = scribe.received();
+        assert_eq!(received.len(), 10, "two one-row frames per result write");
+        let mut identities = HashMap::<(String, String), HashSet<_>>::new();
+        for frame in &received {
+            let [result_id] = frame_results(frame).try_into().expect("one row per frame");
+            identities
+                .entry((frame.table.clone(), result_id))
+                .or_default()
+                .insert((frame.batch_id, frame.ipc.clone()));
+        }
+        assert_eq!(identities.len(), 6, "three results in two tables");
+        assert!(
+            identities.values().all(|written| written.len() == 1),
+            "every write of a result carries one identity and its rows: {identities:?}"
+        );
+        let ids = identities
+            .values()
+            .flatten()
+            .map(|(batch_id, _)| *batch_id)
+            .collect::<HashSet<_>>();
+        assert_eq!(ids.len(), 6, "no two results or tables share an identity");
+    }
+
     /// Proves a terminal refusal is consumed: the rejected frame is dropped,
     /// the slice's other frames are still written, and a later write for the
     /// tenant is not blocked behind it.
@@ -3387,20 +3481,27 @@ mod tests {
         frames
             .iter()
             .filter(|frame| frame.table == "bifrost.verification.execution_outputs")
-            .flat_map(|frame| {
-                StreamReader::try_new(std::io::Cursor::new(frame.ipc.clone()), None)
-                    .expect("an item frame opens")
-                    .flat_map(|batch| {
-                        let batch = batch.expect("an item batch decodes");
-                        let ids = batch
-                            .column_by_name("result_id")
-                            .expect("result_id column")
-                            .as_string::<i32>()
-                            .clone();
-                        (0..ids.len())
-                            .map(|row| ids.value(row).to_owned())
-                            .collect::<Vec<_>>()
-                    })
+            .flat_map(frame_results)
+            .collect()
+    }
+
+    /// The result ID of every row of the Verifier result `frame`, in order.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the frame does not decode.
+    fn frame_results(frame: &Received) -> Vec<String> {
+        StreamReader::try_new(std::io::Cursor::new(frame.ipc.clone()), None)
+            .expect("a result frame opens")
+            .flat_map(|batch| {
+                let batch = batch.expect("a result batch decodes");
+                let ids = batch
+                    .column_by_name("result_id")
+                    .expect("result_id column")
+                    .as_string::<i32>()
+                    .clone();
+                (0..ids.len())
+                    .map(|row| ids.value(row).to_owned())
                     .collect::<Vec<_>>()
             })
             .collect()

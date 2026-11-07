@@ -464,40 +464,46 @@ typed columns:
   copying their payload or inventing another verdict. Oversized metadata/bytes use
   existing immutable File references, never SQL payload custody or a new archive table
   family.
-  - Active/finalizing transitions and handoff intent commit in Postgres together. The
-    existing projector/outbox uses persisted stable identities and physical event
-    membership across retry/configuration changes; ambiguous acknowledgement cannot
-    insert different rows under an old identity. Finalization durably delivers every
-    required component before its canonical terminal handoff is acknowledged, with one
-    selected terminal outcome. Events are history/retained read facts, not code-replay
-    instructions for the active engine.
-  - The shared reader serves active/finalizing metadata from Postgres and retained
-    execution endpoints from Bifrost after handoff, even before operational cleanup. It
-    reads explicit terminal selection and identity rather than latest result recency,
-    source Card lookup or history replay. Preserve current feature authorization and
-    fixed internal reads, producer selection, page-cut membership across cleanup,
-    complete errors and temporary-unavailability versus absence. Ordinary public Bifrost
-    SQL still requires table grants.
-  - Scribe ACK includes authoritative active insertion visible to a subsequent local
-    capture; Oracle's normal cut/capture/revision repin provides source continuity. It
-    does not by itself certify that all components of an execution handoff have arrived.
-    Cleanup of operational execution rows requires complete acknowledged coverage plus
-    retained source ownership through the existing published/live ownership transitions.
-    Do not add Iceberg-promotion waits, request freshness knobs, an archive catalog or
-    timer-based purge. A lost/unacknowledged component leaves recoverable Postgres
-    intent; terminal finalization retries delivery, never settled model work.
-  - Exact completed File associations are read from active publication metadata or
-    retained manifests, never rediscovered through generic inventory by digest for an
-    already accepted publication. Preserve File completion/inventory ACK,
-    path/digest/length validation and existing storage cleanup. Transfer evidence roots
-    before deleting operational rows; cleanup of execution metadata does not shorten
-    evidence retention.
-  - Post-execution Operator/provider deliveries keep their existing operational retry
-    owners and project updated delivery state independently using the canonical
-    execution identity. Retained execution status assembles that projection without a
-    terminal queue row. Registry/principal, binding/schedule/group, repository
-    generation/webhook and library maintenance lifetimes are separate; an execution
-    purge cannot cascade away live work.
+  - Verification execution checkpoints extend the existing canonical verification
+    data with complete versioned logical state. The engine owns the live object;
+    PostgreSQL queue rows coordinate work, not a duplicate checkpoint/result
+    payload store or general event projection backlog. The existing queue also
+    retains durable pending terminal delivery: the minimal sanitized terminal
+    decision and stable delivery identity remain retryable until canonical
+    Bifrost records receive WAL/batch-commit ACK. Only then may the queue retire
+    delivery. This narrow responsibility covers every queued terminal producer;
+    it introduces no execution-head table, separate finalizer or second writer.
+    Existing inputs/results/outputs retain their meanings.
+  - The existing shared Scribe outbox provides bounded batching, stable retry
+    identities and WAL acknowledgement at consequential execution boundaries.
+    Exact completed File descriptors stay with accepted publications from the
+    start; no terminal archive handoff or PostgreSQL descriptor transfer exists.
+  - Internal execution recovery reads obtain the accepted checkpoint position
+    and its exact compatible state, authoritative absence, or explicit
+    unavailability. Missing required source/record means wait/retry. Ordinary
+    analytical query success does not certify authoritative execution recovery;
+    its documented source-discovery semantics below remain unchanged. No public
+    freshness selector or execution-side source registry is added.
+  - Extend existing checkpoint acceptance/fence machinery for current-writer and
+    expected-revision acceptance. A replacement shuts out stale writes before
+    continuing. Expiry/cancellation/deadline protection remains required, and a
+    rejected WAL write must stay rejected during replay. Existing batch replay
+    deduplication alone does not implement this contract. These are required
+    owner extensions, not claims that the current implementation already does so.
+    Each revision's batch identity derives from its execution and revision, so
+    its Scribe batch fence accepts exactly one write of it; recovery reads the
+    fenced prefix. No PostgreSQL execution-head table exists. A revision the old
+    writer froze under its confirmed lease just before takeover may still be
+    accepted first and is then inherited; that rare interval is accepted.
+  - File completion, exact path/digest/length validation, inventory acknowledgement
+    and existing storage/session retention remain unchanged. No inventory
+    rediscovery, remote-publication/Iceberg wait, extra writer or new collector.
+  - Execution APIs keep recorded identity, current feature permissions, exact
+    producer selection, page membership and complete errors without legacy
+    PostgreSQL payload rows. Operator/provider deliveries and registry/principal,
+    binding/schedule/group, webhook/generation and library metadata retain their
+    independent lifetimes; delivery retry does not reexecute verification.
+
 - Every nullable built-in Struct — the `bifrost.metrics.points` bucket sets and
   `bifrost.gateway.calls` `resolved_model` — has nullable children, because a
   required Parquet leaf under a null parent reads back as another row's value

@@ -14,30 +14,33 @@ use tokio_util::sync::CancellationToken;
 use vala_bifrost_redux::catalog::{TableRef, TableUid};
 use vala_bifrost_redux::contracts::{FrameAdmission, Scribe, ScribeError, ScribeIngressFrame};
 use vala_bifrost_redux::namespaces::BifrostNamespace;
-use vala_verify::blocks::{CallInput, CallValue, Checkpoints as _};
+use vala_verify::blocks::{BlockClock, CallInput, CallValue, Checkpoints, DriftChecks};
 use wyrd_runtime::principal::PrincipalId;
+use wyrd_server::components::gateway::GatewayCallContext;
 use wyrd_server::query::scheduled::ScheduledQueryCaller;
 use wyrd_server::scribe_outbox::{ScribeOutbox, ScribeSink, ScribeWrite};
 use wyrd_server::verification::VerificationRuntime;
 use wyrd_server::verification::authority::SystemReadAuthority;
 use wyrd_server::verification::hosted::HostedLimits;
+use wyrd_server::verification::hosted::blocks::{Execution, HostedBlocks};
 use wyrd_server::verification::hosted::evidence::TenantEvidence;
 use wyrd_server::verification::hosted::publications::{Publications, PublishCall};
 use wyrd_server::verification::hosted::workspace::{Workspace, Workspaces};
 use wyrd_server::verification::inputs::InputResolver;
 use wyrd_server::verification::leases::LeaseRenewal;
 use wyrd_server::verification::results::{ResultPayloadBuilder, ResultRun};
+use wyrd_server::verification::scheduler::GroupHandoff;
 use wyrd_server::verification::state::{
     Checkpoint, Decision, RunState, StateError, StateRow, revision_batch, stand_in_identity,
 };
 use wyrd_spec::DataTenantId;
 use wyrd_spec::auth::Attribution;
-use wyrd_spec::card::verifier::Check;
-use wyrd_spec::ids::{CardUid, ExecutionId, SlotName};
+use wyrd_spec::card::verifier::VerifierSpec;
+use wyrd_spec::ids::{CardUid, ExecutionId, GroupId, SlotName};
 use wyrd_spec::verification::execution::{
     InputDeclaration, InvocationSettlement, Producer, ProducerInvocation, PublicationCollection,
-    PublicationContent, PublicationFile, PublicationKind, PublicationManifest, RequirementOutcome,
-    RequirementResult, Speculation, StepStatus, VerificationOutcome, VerificationResult,
+    PublicationContent, PublicationFile, PublicationKind, PublicationManifest, Speculation,
+    StepStatus, VerificationOutcome, VerificationResult,
 };
 use wyrd_spec::verification::state::{EXECUTION_STATE_FORMAT, ExecutionState};
 use wyrd_spec::verification::{PublicationName, TaskId};
@@ -46,12 +49,14 @@ use wyrd_spec::verification::{
 };
 use wyrd_sql::queries::auth::service_accounts::system_principal_id;
 use wyrd_sql::queries::verifier_executions::{
-    ClaimedExecution, ExecutionLease, Settlement, TerminalStatus, VerifierExecutionQueue,
+    ClaimedExecution, ExecutionLease, Settlement, TerminalDelivery, TerminalStatus,
+    VerifierExecutionQueue,
 };
 use wyrd_testing::WyrdTestServer;
 use wyrd_testing::verification::VerificationFixture;
 
 use crate::pg_hosted_artifacts::user;
+use crate::sandbox_worker::worker;
 
 /// One leased execution of a fresh in-process server, written through the
 /// Bifrost execution state its claim holds.
@@ -1316,13 +1321,7 @@ async fn cancelled_work_keeps_checkpoints_and_fences_stale_writes() {
     tx.rollback().await.expect("the format change rolls back");
 
     let mut tx = conn().await;
-    assert!(
-        queue
-            .cancel(&mut tx, execution)
-            .await
-            .expect("cancel runs")
-            .is_some()
-    );
+    assert!(queue.cancel(&mut tx, execution).await.expect("cancel runs"));
     tx.commit().await.expect("the cancel commits");
     leased
         .run
@@ -1331,11 +1330,7 @@ async fn cancelled_work_keeps_checkpoints_and_fences_stale_writes() {
         .expect_err("a cancelled lease checkpoints nothing");
     let mut tx = conn().await;
     assert!(
-        queue
-            .cancel(&mut tx, execution)
-            .await
-            .expect("cancel runs")
-            .is_none(),
+        !queue.cancel(&mut tx, execution).await.expect("cancel runs"),
         "a repeated cancel writes nothing"
     );
     let stale = (
@@ -1348,6 +1343,7 @@ async fn cancelled_work_keeps_checkpoints_and_fences_stale_writes() {
                     code: "late".to_owned(),
                     message: "a late settlement".to_owned(),
                 },
+                TerminalDelivery::Acknowledged,
             )
             .await
             .expect("terminate runs"),
@@ -1630,18 +1626,18 @@ async fn terminal_selection_and_inspection_use_run_state() {
         .select(&outcome(VerificationVerdict::Failed), chrono::Utc::now())
         .await
         .expect("the outcome is selected");
-    let Decision::Selected(selected) = selected else {
-        panic!("a fresh state selects the outcome");
-    };
 
     let current = leased.reclaim().await;
-    assert_eq!(current.snapshot().await.terminal.as_ref(), Some(&selected));
+    assert_eq!(
+        current.snapshot().await.terminal.map(Decision::Selected),
+        Some(selected.clone())
+    );
     assert_eq!(
         current
             .select(&outcome(VerificationVerdict::Passed), chrono::Utc::now())
             .await
             .expect("the selection reads"),
-        Decision::Selected(selected.clone()),
+        selected,
         "a reclaim re-delivers the selected outcome and identity"
     );
 
@@ -1793,12 +1789,25 @@ async fn forget(server: &WyrdTestServer, executions: &[ExecutionId]) {
 /// `execution`'s accepted state, read back from Bifrost as `system`.
 ///
 /// # Panics
-/// Panics when the state is unreadable.
+/// Panics as [`accepted`] does.
 async fn retained(
     server: &WyrdTestServer,
     system: PrincipalId,
     execution: ExecutionId,
 ) -> ExecutionState {
+    accepted(server, system, execution).await.1
+}
+
+/// `execution`'s accepted revision and state, read back from Bifrost as
+/// `system`; revision 0 when none was accepted.
+///
+/// # Panics
+/// Panics when the state is unreadable.
+async fn accepted(
+    server: &WyrdTestServer,
+    system: PrincipalId,
+    execution: ExecutionId,
+) -> (i64, ExecutionState) {
     let query = Leased::query(server, system).await;
     RunState::accepted(
         server.state(),
@@ -1808,24 +1817,75 @@ async fn retained(
     )
     .await
     .expect("the state reads")
-    .1
 }
 
-/// The number of the tenant's executions still owing a terminal delivery.
+/// The tenant's executions still owing a terminal delivery, with when each
+/// is due.
 ///
 /// # Panics
 /// Panics when the read fails.
-async fn owed(server: &WyrdTestServer) -> i64 {
-    let mut conn = server
-        .tenant_conn_for(server.data_tenant_id())
-        .await
-        .expect("tenant connection opens");
-    sqlx::query_scalar(
-        "SELECT count(*) FROM wyrd.verifier_executions WHERE delivery_due_at IS NOT NULL",
+async fn owed(server: &WyrdTestServer) -> BTreeMap<ExecutionId, chrono::DateTime<chrono::Utc>> {
+    sqlx::query_as(
+        "SELECT execution_id, delivery_due_at FROM wyrd.verifier_executions \
+         WHERE delivery_due_at IS NOT NULL",
     )
-    .fetch_one(&mut **conn.transaction())
+    .fetch_all(&superuser(server))
     .await
-    .expect("the owed deliveries count")
+    .expect("the owed deliveries read")
+    .into_iter()
+    .map(|(id, due): (uuid::Uuid, _)| (ExecutionId::new(id).expect("a stored execution ID"), due))
+    .collect()
+}
+
+/// The server's superuser pool, for assertions and fault injection.
+///
+/// # Panics
+/// Panics when the fixture exposes no superuser pool.
+fn superuser(server: &WyrdTestServer) -> sqlx::PgPool {
+    server
+        .pg_fixture()
+        .superuser_pool()
+        .expect("fixture exposes a superuser pool")
+}
+
+/// Run `server`'s verification runtime until `done` holds of the owed
+/// deliveries, then stop it.
+///
+/// # Panics
+/// Panics when the runtime does not compose or stop, or `done` never holds
+/// within a minute.
+async fn deliver_until(
+    server: &WyrdTestServer,
+    done: impl Fn(&BTreeMap<ExecutionId, chrono::DateTime<chrono::Utc>>) -> bool,
+) {
+    let (stop, task) = start_runtime(server);
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_mins(1);
+    loop {
+        let owed = owed(server).await;
+        if done(&owed) {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the runtime never reached the expected deliveries; owed {owed:?}"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    stop.cancel();
+    task.await.expect("the runtime stops");
+}
+
+/// Spawn `server`'s verification runtime; returns its stop token and task.
+///
+/// # Panics
+/// Panics when the runtime does not compose.
+fn start_runtime(server: &WyrdTestServer) -> (CancellationToken, tokio::task::JoinHandle<()>) {
+    let runtime = VerificationRuntime::builder(server.state())
+        .build()
+        .expect("the runtime composes");
+    let stop = CancellationToken::new();
+    let task = tokio::spawn(runtime.run(stop.clone()));
+    (stop, task)
 }
 
 /// A started server with a provisioned tenant, its SYSTEM principal, and
@@ -1861,215 +1921,9 @@ async fn seeded() -> (
     (server, fixture, system, subject, verifier)
 }
 
-/// Every terminal decision the queue settles reaches the execution's state
-/// however its producer stopped: an attempt terminated with nothing in its
-/// state and a pending execution cancelled whose caller never delivered
-/// the cancellation are both owed, a delivery claim that dies before
-/// recording leaves them owed, and a restarted runtime records both without
-/// computing. Each then reads back with its status, error, and identity
-/// once its queue row and Cards are gone.
-///
-/// # Panics
-/// Panics when a settlement or claim fails, a delivery is not owed or not
-/// retired, or a retained read differs.
-#[tokio::test(flavor = "multi_thread")]
-async fn terminal_delivery_survives_every_commit_boundary() {
-    let (server, fixture, system, subject, verifier) = seeded().await;
-    let queue = VerifierExecutionQueue::default();
-    let crashed = fixture
-        .submit(&verifier, &subject, BTreeMap::new())
-        .await
-        .expect("the execution is admitted");
-    let mut conn = server
-        .tenant_conn_for(server.data_tenant_id())
-        .await
-        .expect("tenant connection opens");
-    let claimed = queue
-        .claim(
-            &mut conn,
-            chrono::Duration::minutes(5),
-            chrono::Duration::minutes(5),
-            1,
-        )
-        .await
-        .expect("claim runs")
-        .pop()
-        .expect("the execution is claimable");
-    assert_eq!(claimed.lease.execution_id, crashed);
-    let engine = VerificationError {
-        code: "engine_crashed".to_owned(),
-        message: "the engine crashed".to_owned(),
-    };
-    queue
-        .terminate(&mut conn, claimed.lease, TerminalStatus::Errored, &engine)
-        .await
-        .expect("terminate runs");
-    conn.commit().await.expect("the termination commits");
-    let cancelled = fixture
-        .submit(&verifier, &subject, BTreeMap::new())
-        .await
-        .expect("the execution is admitted");
-    let mut conn = server
-        .tenant_conn_for(server.data_tenant_id())
-        .await
-        .expect("tenant connection opens");
-    assert!(
-        queue
-            .cancel(&mut conn, cancelled)
-            .await
-            .expect("cancel runs")
-            .is_some()
-    );
-    conn.commit().await.expect("the cancellation commits");
-    assert_eq!(owed(&server).await, 2, "both decisions are owed");
-
-    let mut conn = server
-        .tenant_conn_for(server.data_tenant_id())
-        .await
-        .expect("tenant connection opens");
-    let abandoned = queue
-        .claim_deliveries(&mut conn, chrono::Duration::zero(), 10)
-        .await
-        .expect("the deliveries claim");
-    conn.commit().await.expect("the delivery claim commits");
-    assert_eq!(abandoned.len(), 2, "a dead delivery worker claimed both");
-    assert_eq!(owed(&server).await, 2, "a claimed delivery stays owed");
-
-    let runtime = VerificationRuntime::builder(server.state())
-        .build()
-        .expect("the runtime composes");
-    let stop = CancellationToken::new();
-    let task = tokio::spawn(runtime.run(stop.clone()));
-    let deadline = tokio::time::Instant::now() + std::time::Duration::from_mins(1);
-    while owed(&server).await > 0 {
-        assert!(
-            tokio::time::Instant::now() < deadline,
-            "the restarted runtime delivers both"
-        );
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-    }
-    stop.cancel();
-    task.await.expect("the runtime stops");
-
-    for (execution, status, code) in [
-        (
-            crashed,
-            VerificationExecutionStatus::Errored,
-            "engine_crashed",
-        ),
-        (
-            cancelled,
-            VerificationExecutionStatus::Cancelled,
-            "cancelled",
-        ),
-    ] {
-        let state = retained(&server, system, execution).await;
-        let failure = state.failure.expect("the state holds the decision");
-        assert_eq!(
-            (failure.status, failure.error.code.as_str()),
-            (status, code)
-        );
-        assert!(state.terminal.is_none(), "nothing is selected");
-        let identity = state.identity.expect("the state holds the identity");
-        assert_eq!(identity.verifier.uid.as_ref(), Some(&verifier));
-        assert_eq!(identity.subject.uid.as_ref(), Some(&subject));
-    }
-    forget(&server, &[crashed, cancelled]).await;
-    let viewer = jwt(&server, "delivery-reader", &["viewer"]).await;
-    for (execution, status, code) in [
-        (crashed, "errored", "engine_crashed"),
-        (cancelled, "cancelled", "cancelled"),
-    ] {
-        let (http, body) = respond(&server, &viewer, "GET", &execution.to_string()).await;
-        assert_eq!(
-            (http, body["status"].clone(), body["error"]["code"].clone()),
-            (axum::http::StatusCode::OK, json!(status), json!(code)),
-            "{body}"
-        );
-    }
-    server.shutdown().await.expect("test server shuts down");
-}
-
-/// A user cancelling a grouped execution before any claim retains the
-/// execution's group and its absent owner with its exact Verifier and
-/// subject: the
-/// cancellation is delivered before the response, and the retained read
-/// answers it once the queue row and Cards are gone. A caller without the
-/// grant can neither cancel nor read it.
-///
-/// # Panics
-/// Panics when the cancel is refused, a delivery stays owed, the retained
-/// identity differs, or a caller without the grant is not refused.
-#[tokio::test(flavor = "multi_thread")]
-async fn preclaim_group_cancellation_preserves_retained_identity() {
-    let (server, fixture, system, subject, verifier) = seeded().await;
-    let execution = fixture
-        .submit(&verifier, &subject, BTreeMap::new())
-        .await
-        .expect("the execution is admitted");
-    sqlx::query(
-        "UPDATE wyrd.verifier_executions SET group_id = 'session-7' WHERE execution_id = $1",
-    )
-    .bind(execution.as_uuid())
-    .execute(
-        &server
-            .pg_fixture()
-            .superuser_pool()
-            .expect("fixture exposes a superuser pool"),
-    )
-    .await
-    .expect("the execution is grouped");
-
-    let outsider = jwt(&server, "group-outsider", &[]).await;
-    let (status, body) = respond(&server, &outsider, "POST", &format!("{execution}/cancel")).await;
-    assert_eq!(status, axum::http::StatusCode::FORBIDDEN, "{body}");
-    let editor = jwt(&server, "group-canceller", &["editor"]).await;
-    let (status, body) = respond(&server, &editor, "POST", &format!("{execution}/cancel")).await;
-    assert_eq!(
-        (status, body["status"].clone()),
-        (axum::http::StatusCode::OK, json!("cancelled")),
-        "{body}"
-    );
-    assert_eq!(owed(&server).await, 0, "the cancel delivered its decision");
-
-    let state = retained(&server, system, execution).await;
-    let failure = state.failure.expect("the state holds the cancellation");
-    assert_eq!(
-        (failure.status, failure.error.code.as_str()),
-        (VerificationExecutionStatus::Cancelled, "cancelled")
-    );
-    let identity = state.identity.expect("the state holds the identity");
-    assert_eq!(
-        serde_json::to_value(&identity.group_id).expect("the group encodes"),
-        json!("session-7")
-    );
-    assert_eq!(identity.owner_card_uid, None, "a submission names no owner");
-    assert_eq!(identity.verifier.uid.as_ref(), Some(&verifier));
-    assert_eq!(identity.subject.uid.as_ref(), Some(&subject));
-
-    forget(&server, &[execution]).await;
-    let viewer = jwt(&server, "group-reader", &["viewer"]).await;
-    let (status, body) = respond(&server, &viewer, "GET", &execution.to_string()).await;
-    assert_eq!(
-        (
-            status,
-            body["status"].clone(),
-            body["error"]["code"].clone()
-        ),
-        (
-            axum::http::StatusCode::OK,
-            json!("cancelled"),
-            json!("cancelled")
-        ),
-        "{body}"
-    );
-    let (status, body) = respond(&server, &outsider, "GET", &execution.to_string()).await;
-    assert_eq!(status, axum::http::StatusCode::FORBIDDEN, "{body}");
-    server.shutdown().await.expect("test server shuts down");
-}
-
 /// A user cancelling an execution that recorded no checkpoint retains the
-/// cancellation in its state: once its queue row and both Cards are gone, a
+/// cancellation in its state once the runtime delivers the decision the
+/// cancel left owed: once its queue row and both Cards are gone, a
 /// reader of its Verifier still reads it cancelled with the queue's error,
 /// and a caller without the grant is refused.
 ///
@@ -2093,6 +1947,8 @@ async fn cancellation_reads_back_from_state_after_the_queue_and_cards_are_gone()
         (axum::http::StatusCode::OK, json!("cancelled")),
         "{body}"
     );
+    assert!(owed(&leased.server).await.contains_key(&execution));
+    deliver_until(&leased.server, BTreeMap::is_empty).await;
     let failure = leased
         .accepted()
         .await
@@ -2129,6 +1985,82 @@ async fn cancellation_reads_back_from_state_after_the_queue_and_cards_are_gone()
         .shutdown()
         .await
         .expect("test server shuts down");
+}
+
+/// A user cancelling a grouped execution before any claim retains the
+/// execution's group and its absent owner with its exact Verifier and
+/// subject: the cancellation leaves its delivery owed, the runtime records
+/// it, and the retained read answers it once the queue row and Cards are
+/// gone. A caller without the grant can neither cancel nor read it.
+///
+/// # Panics
+/// Panics when the cancel is refused, a delivery stays owed, the retained
+/// identity differs, or a caller without the grant is not refused.
+#[tokio::test(flavor = "multi_thread")]
+async fn preclaim_group_cancellation_preserves_retained_identity() {
+    let (server, fixture, system, subject, verifier) = seeded().await;
+    let execution = fixture
+        .submit(&verifier, &subject, BTreeMap::new())
+        .await
+        .expect("the execution is admitted");
+    sqlx::query(
+        "UPDATE wyrd.verifier_executions SET group_id = 'session-7' WHERE execution_id = $1",
+    )
+    .bind(execution.as_uuid())
+    .execute(&superuser(&server))
+    .await
+    .expect("the execution is grouped");
+
+    let outsider = jwt(&server, "group-outsider", &[]).await;
+    let (status, body) = respond(&server, &outsider, "POST", &format!("{execution}/cancel")).await;
+    assert_eq!(status, axum::http::StatusCode::FORBIDDEN, "{body}");
+    let editor = jwt(&server, "group-canceller", &["editor"]).await;
+    let (status, body) = respond(&server, &editor, "POST", &format!("{execution}/cancel")).await;
+    assert_eq!(
+        (status, body["status"].clone()),
+        (axum::http::StatusCode::OK, json!("cancelled")),
+        "{body}"
+    );
+    assert_eq!(
+        owed(&server).await.into_keys().collect::<Vec<_>>(),
+        [execution]
+    );
+    deliver_until(&server, BTreeMap::is_empty).await;
+
+    let state = retained(&server, system, execution).await;
+    let failure = state.failure.expect("the state holds the cancellation");
+    assert_eq!(
+        (failure.status, failure.error.code.as_str()),
+        (VerificationExecutionStatus::Cancelled, "cancelled")
+    );
+    let identity = state.identity.expect("the state holds the identity");
+    assert_eq!(
+        serde_json::to_value(&identity.group_id).expect("the group encodes"),
+        json!("session-7")
+    );
+    assert_eq!(identity.owner_card_uid, None, "a submission names no owner");
+    assert_eq!(identity.verifier.uid.as_ref(), Some(&verifier));
+    assert_eq!(identity.subject.uid.as_ref(), Some(&subject));
+
+    forget(&server, &[execution]).await;
+    let viewer = jwt(&server, "group-reader", &["viewer"]).await;
+    let (status, body) = respond(&server, &viewer, "GET", &execution.to_string()).await;
+    assert_eq!(
+        (
+            status,
+            body["status"].clone(),
+            body["error"]["code"].clone()
+        ),
+        (
+            axum::http::StatusCode::OK,
+            json!("cancelled"),
+            json!("cancelled")
+        ),
+        "{body}"
+    );
+    let (status, body) = respond(&server, &outsider, "GET", &execution.to_string()).await;
+    assert_eq!(status, axum::http::StatusCode::FORBIDDEN, "{body}");
+    server.shutdown().await.expect("test server shuts down");
 }
 
 /// An engine failure recorded in the state is the execution's historical
@@ -2177,6 +2109,7 @@ async fn failures_read_back_from_state_instead_of_the_queue_payload() {
                 code: "queue_only".to_owned(),
                 message: "the queue's copy".to_owned(),
             },
+            TerminalDelivery::Acknowledged,
         )
         .await
         .expect("terminate runs");
@@ -2607,29 +2540,427 @@ async fn batched_checkpoints_recover_exactly_the_accepted_batch() {
         .expect("test server shuts down");
 }
 
-/// The passing settlement of requirement `id` with `actual`.
+/// `method` on `path` as `jwt` with the JSON `body`, returning the status
+/// and JSON answer.
 ///
 /// # Panics
-/// Panics when `id` is not a task id or the assert check does not decode.
-fn judged(id: &str, actual: Value) -> InvocationSettlement {
-    InvocationSettlement::Requirement {
-        result: Box::new(RequirementResult {
-            id: TaskId::new(id).expect("task id"),
-            step: None,
-            statement: id.to_owned(),
-            outcome: RequirementOutcome::Passed,
-            reason: format!("{id} held"),
-            actual: Some(actual),
-            citations: Vec::new(),
-            data: None,
-            detail: None,
-            check: serde_json::from_value::<Check>(json!({
-                "kind": "assert", "path": "inputs.x", "operator": "equals", "expected": true
-            }))
-            .expect("assert check decodes"),
-            provenance: None,
-        }),
+/// Panics when the request does not respond or its body is not JSON.
+async fn send_json(
+    server: &WyrdTestServer,
+    jwt: &str,
+    path: &str,
+    body: &Value,
+) -> (axum::http::StatusCode, Value) {
+    let response = server
+        .oneshot_authenticated(
+            jwt,
+            axum::http::Request::builder()
+                .method("POST")
+                .uri(path)
+                .header(axum::http::header::CONTENT_TYPE, "application/json")
+                .body(axum::body::Body::from(body.to_string()))
+                .expect("request builds"),
+        )
+        .await
+        .expect("the request responds");
+    let status = response.status();
+    let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .expect("the body reads");
+    (
+        status,
+        serde_json::from_slice(&bytes).unwrap_or(Value::Null),
+    )
+}
+
+/// Enqueue `verifier` about `subject` as `jwt` through the public route and
+/// wait until the queue writer has committed it.
+///
+/// # Panics
+/// Panics when the enqueue is not accepted or never commits.
+async fn enqueue(
+    server: &WyrdTestServer,
+    fixture: &VerificationFixture,
+    jwt: &str,
+    verifier: &CardUid,
+    subject: &CardUid,
+) -> ExecutionId {
+    let (status, body) = send_json(
+        server,
+        jwt,
+        "/v1/verification/enqueue",
+        &json!({"verifier_card_uid": verifier, "card_uid": subject, "inputs": {}}),
+    )
+    .await;
+    assert_eq!(status, axum::http::StatusCode::ACCEPTED, "{body}");
+    let execution: ExecutionId =
+        serde_json::from_value(body["execution_id"].clone()).expect("an execution ID");
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_mins(1);
+    while fixture.execution(execution).await.is_err() {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the enqueue never commits"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
     }
+    execution
+}
+
+/// Every non-attempt terminal producer leaves its decision owed across every
+/// commit boundary, and a restarted runtime records it through the one
+/// terminal operation without computing.
+///
+/// The producers are a user's cancel, a principal's revocation, an admission
+/// fenced by that revocation, an admission refused before any target load,
+/// and a group activation refused for its lapsed owner; each commits with no
+/// runtime and no checkpoint. The revocation fences a live lease while the
+/// execution state is unreadable, so its control commit alone stops the
+/// computation. A delivery claim that dies, unreadable state, and a missing
+/// SYSTEM principal each leave every delivery owed until restored; a
+/// delivery whose retiring commit fails keeps its acknowledged decision
+/// owed until a later claim, once the failed claim's lease is expired,
+/// retires it without writing again. Each then
+/// reads back with its status, error, and identity, also once its queue row
+/// and Cards are gone.
+///
+/// # Panics
+/// Panics when a producer commits other than owed, a fenced settlement
+/// commits, a delivery retires while its dependency is down or before its
+/// decision is acknowledged, a decision is written twice, or a retained read
+/// differs.
+#[tokio::test(flavor = "multi_thread")]
+async fn terminal_delivery_survives_every_commit_boundary() {
+    let (server, fixture, system, subject, verifier) = seeded().await;
+    let pool = superuser(&server);
+    let exec = |statement: &'static str| {
+        let pool = pool.clone();
+        async move {
+            sqlx::query(statement)
+                .execute(&pool)
+                .await
+                .expect("the fault statement applies");
+        }
+    };
+    let system_kind = |kind: &'static str| {
+        let pool = pool.clone();
+        async move {
+            sqlx::query("UPDATE wyrd.auth_service_accounts SET principal_kind = $2 WHERE id = $1")
+                .bind(system.as_uuid())
+                .bind(kind)
+                .execute(&pool)
+                .await
+                .expect("the SYSTEM principal changes");
+        }
+    };
+    let wyrd_testing::Bootstrap::User {
+        id: submitter,
+        jwt: submitting,
+    } = server
+        .bootstrap_user("delivery-submitter", &["editor"])
+        .await
+        .expect("user bootstraps")
+    else {
+        panic!("a user bootstraps as a user");
+    };
+    let refusing = jwt(&server, "delivery-refused", &["editor"]).await;
+    let admin = jwt(&server, "delivery-admin", &["admin"]).await;
+    let queue = VerifierExecutionQueue::default();
+
+    let cancelled = enqueue(&server, &fixture, &submitting, &verifier, &subject).await;
+    let (status, body) =
+        respond(&server, &submitting, "POST", &format!("{cancelled}/cancel")).await;
+    assert_eq!(status, axum::http::StatusCode::OK, "{body}");
+
+    let revoked = enqueue(&server, &fixture, &submitting, &verifier, &subject).await;
+    let mut conn = server
+        .tenant_conn_for(server.data_tenant_id())
+        .await
+        .expect("tenant connection opens");
+    let live = queue
+        .claim(
+            &mut conn,
+            chrono::Duration::minutes(5),
+            chrono::Duration::minutes(5),
+            1,
+        )
+        .await
+        .expect("claim runs")
+        .pop()
+        .expect("the execution is claimable");
+    conn.commit().await.expect("the claim commits");
+    assert_eq!(live.lease.execution_id, revoked);
+    exec("REVOKE SELECT ON vala.scribe_batch_commits FROM wyrd_tenant").await;
+    let (status, body) = send_json(
+        &server,
+        &admin,
+        &format!("/v1/principals/{submitter}/revoke"),
+        &json!({"principal_kind": "user", "reason": "delivery test"}),
+    )
+    .await;
+    assert_eq!(status, axum::http::StatusCode::OK, "{body}");
+    let mut conn = server
+        .tenant_conn_for(server.data_tenant_id())
+        .await
+        .expect("tenant connection opens");
+    let engine = VerificationError {
+        code: "engine_crashed".to_owned(),
+        message: "the engine crashed".to_owned(),
+    };
+    assert_eq!(
+        queue
+            .terminate(
+                &mut conn,
+                live.lease,
+                TerminalStatus::Errored,
+                &engine,
+                TerminalDelivery::Acknowledged,
+            )
+            .await
+            .expect("terminate runs"),
+        Settlement::StaleLease,
+        "the revocation fenced the live computation"
+    );
+    conn.commit().await.expect("the fenced settlement commits");
+    exec("GRANT SELECT ON vala.scribe_batch_commits TO wyrd_tenant").await;
+
+    let fenced = enqueue(&server, &fixture, &submitting, &verifier, &subject).await;
+    let refused = enqueue(&server, &fixture, &refusing, &subject, &subject).await;
+    let refusal = fixture
+        .execution(refused)
+        .await
+        .expect("execution reads")
+        .error_code
+        .expect("the refusal records its error");
+    let cases = [
+        (
+            cancelled,
+            VerificationExecutionStatus::Cancelled,
+            "cancelled",
+            &verifier,
+        ),
+        (
+            revoked,
+            VerificationExecutionStatus::Cancelled,
+            "principal_revoked",
+            &verifier,
+        ),
+        (
+            fenced,
+            VerificationExecutionStatus::Cancelled,
+            "principal_revoked",
+            &verifier,
+        ),
+        (
+            refused,
+            VerificationExecutionStatus::Errored,
+            refusal.as_str(),
+            &subject,
+        ),
+    ];
+    for (execution, status, code, _) in &cases {
+        let row = fixture
+            .execution(*execution)
+            .await
+            .expect("execution reads");
+        assert_eq!(
+            (row.status.as_str(), row.error_code.as_deref()),
+            (<&str>::from(*status), Some(*code)),
+            "{execution} commits its decision"
+        );
+    }
+    let all: BTreeSet<ExecutionId> = cases.iter().map(|case| case.0).collect();
+    let owed_at = owed(&server).await;
+    assert_eq!(
+        owed_at.keys().copied().collect::<BTreeSet<_>>(),
+        all,
+        "every decision is owed"
+    );
+
+    let mut conn = server
+        .tenant_conn_for(server.data_tenant_id())
+        .await
+        .expect("tenant connection opens");
+    let abandoned = queue
+        .claim_deliveries(&mut conn, chrono::Duration::zero(), 10)
+        .await
+        .expect("the deliveries claim");
+    conn.commit().await.expect("the delivery claim commits");
+    assert_eq!(
+        abandoned.len(),
+        all.len(),
+        "a dead delivery worker claimed every one"
+    );
+
+    let reclaimed = |before: BTreeMap<ExecutionId, chrono::DateTime<chrono::Utc>>| {
+        move |owed: &BTreeMap<ExecutionId, chrono::DateTime<chrono::Utc>>| {
+            owed.len() == before.len()
+                && owed
+                    .iter()
+                    .all(|(id, due)| before.get(id).is_some_and(|was| was < due))
+        }
+    };
+    exec("REVOKE SELECT ON vala.scribe_batch_commits FROM wyrd_tenant").await;
+    deliver_until(&server, reclaimed(owed(&server).await)).await;
+    exec("GRANT SELECT ON vala.scribe_batch_commits TO wyrd_tenant").await;
+    system_kind("service").await;
+    deliver_until(&server, reclaimed(owed(&server).await)).await;
+    system_kind("system").await;
+    for execution in &all {
+        assert_eq!(
+            accepted(&server, system, *execution).await.0,
+            0,
+            "{execution} records nothing while its dependency is down"
+        );
+    }
+
+    for statement in [
+        "CREATE FUNCTION public.fail_retirement() RETURNS trigger LANGUAGE plpgsql \
+         AS $$ BEGIN RAISE EXCEPTION 'injected retirement failure'; END $$"
+            .to_owned(),
+        format!(
+            "CREATE TRIGGER fail_retirement BEFORE UPDATE ON wyrd.verifier_executions \
+             FOR EACH ROW WHEN (OLD.delivery_due_at IS NOT NULL \
+             AND NEW.delivery_due_at IS NULL AND NEW.execution_id = '{}'::uuid) \
+             EXECUTE FUNCTION public.fail_retirement()",
+            cancelled.as_uuid()
+        ),
+    ] {
+        sqlx::query(sqlx::AssertSqlSafe(statement))
+            .execute(&pool)
+            .await
+            .expect("the retirement fault installs");
+    }
+    let (stop, task) = start_runtime(&server);
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_mins(1);
+    while owed(&server).await.into_keys().ne([cancelled])
+        || accepted(&server, system, cancelled).await.0 == 0
+    {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the other deliveries never retired; owed {:?}",
+            owed(&server).await
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    stop.cancel();
+    task.await.expect("the runtime stops");
+    assert!(
+        owed(&server).await.contains_key(&cancelled),
+        "an acknowledged decision stays owed while its retirement fails"
+    );
+    exec("DROP TRIGGER fail_retirement ON wyrd.verifier_executions").await;
+    exec(
+        "UPDATE wyrd.verifier_executions SET delivery_due_at = statement_timestamp() \
+         WHERE delivery_due_at IS NOT NULL",
+    )
+    .await;
+    deliver_until(&server, BTreeMap::is_empty).await;
+
+    for (execution, status, code, verifier) in &cases {
+        let (revision, state) = accepted(&server, system, *execution).await;
+        assert_eq!(revision, 1, "{execution} records its decision once");
+        let failure = state.failure.expect("the state holds the decision");
+        assert_eq!(
+            (failure.status, failure.error.code.as_str()),
+            (*status, *code)
+        );
+        assert!(state.terminal.is_none(), "nothing is selected");
+        let identity = state.identity.expect("the state holds the identity");
+        assert_eq!(
+            (
+                identity.verifier.uid.as_ref(),
+                identity.subject.uid.as_ref()
+            ),
+            (Some(*verifier), Some(&subject))
+        );
+    }
+    forget(&server, &all.iter().copied().collect::<Vec<_>>()).await;
+    let viewer = jwt(&server, "delivery-reader", &["viewer"]).await;
+    for (execution, status, code, _) in &cases {
+        let (http, body) = respond(&server, &viewer, "GET", &execution.to_string()).await;
+        assert_eq!(
+            (http, body["status"].clone(), body["error"]["code"].clone()),
+            (axum::http::StatusCode::OK, json!(status), json!(code)),
+            "{body}"
+        );
+    }
+    server.shutdown().await.expect("test server shuts down");
+
+    let support = crate::pg_verification_groups::Support::start().await;
+    support.turn("lapsed", "one", None).await;
+    support
+        .server
+        .flush_bifrost()
+        .await
+        .expect("Bifrost flushes");
+    support
+        .exec(
+            "UPDATE wyrd.workload_activity
+                SET last_authenticated_at = statement_timestamp() - INTERVAL '400 days'",
+        )
+        .await;
+    support.make_due().await;
+    let refused = support
+        .scheduler(&Arc::new(tokio::sync::Semaphore::new(4)))
+        .group_pass(&CancellationToken::new())
+        .await
+        .expect("the pass runs");
+    let [GroupHandoff::Errored(group)] = refused.as_slice() else {
+        panic!("a lapsed owner records one refusal: {refused:?}");
+    };
+    assert!(
+        owed(&support.server).await.contains_key(group),
+        "the refusal is owed"
+    );
+    let group_verifier: uuid::Uuid = sqlx::query_scalar(
+        "SELECT verifier_card_uid FROM wyrd.verifier_executions WHERE execution_id = $1",
+    )
+    .bind(group.as_uuid())
+    .fetch_one(&superuser(&support.server))
+    .await
+    .expect("the refusal's Verifier reads");
+    deliver_until(&support.server, |owed| !owed.contains_key(group)).await;
+    let mut conn = support
+        .server
+        .tenant_conn_for(support.server.data_tenant_id())
+        .await
+        .expect("tenant connection opens");
+    let system = system_principal_id(&mut conn)
+        .await
+        .expect("SYSTEM reads")
+        .map(PrincipalId::new)
+        .expect("the tenant has SYSTEM");
+    conn.commit().await.expect("the read commits");
+    let (revision, state) = accepted(&support.server, system, *group).await;
+    assert_eq!(revision, 1, "the refusal records once");
+    let failure = state.failure.expect("the state holds the refusal");
+    assert_eq!(
+        (failure.status, failure.error.code.as_str()),
+        (
+            VerificationExecutionStatus::Errored,
+            "WYRD_AUTH_401_CREDENTIAL_REVOKED"
+        )
+    );
+    let identity = state.identity.expect("the state holds the identity");
+    assert_eq!(
+        (
+            identity.verifier.uid.as_ref(),
+            identity.subject.uid.as_ref(),
+            identity.owner_card_uid.as_ref(),
+            identity.group_id.as_ref().map(GroupId::as_str)
+        ),
+        (
+            Some(&CardUid::from_uuid(group_verifier).expect("a stored Card UID")),
+            Some(&support.agent),
+            Some(&support.owner),
+            Some("lapsed")
+        )
+    );
+    support
+        .server
+        .shutdown()
+        .await
+        .expect("test server shuts down");
 }
 
 /// The settlement each of `state`'s invocation attempts committed, by step.
@@ -2646,22 +2977,24 @@ fn settlements(state: &ExecutionState) -> BTreeMap<String, Option<InvocationSett
         .collect()
 }
 
-/// Two steps settling concurrently while their revision is held both wait
-/// for one accepted revision, which covers both settlements before their
-/// dependent begins; a restart then restores both settled values exactly,
-/// beside the dependent's attempt, without another attempt of either step.
+/// The hosted engine runs a dependent only on its predecessors' accepted
+/// settlements, and a restart reuses them.
+///
+/// Two independent code steps run in parallel on a writer whose every state
+/// revision is held before Scribe; their dependent consumes both outputs.
+/// Each revision is released one at a time, and when the dependent's first
+/// attempt is recorded the accepted state already covers both predecessors'
+/// settlements. The execution then crashes before that revision is accepted,
+/// and a reclaimed engine restores both settlements without attempting
+/// either step again, runs the dependent once, and passes with both values.
 ///
 /// # Panics
-/// Panics when a settlement returns before its revision is accepted, the
-/// accepted state misses a settlement, or the restart repeats or changes
-/// one.
+/// Panics when the dependent is recorded before both settlements are
+/// accepted, a run fails, a settled step is attempted again or changes, or
+/// the dependent does not consume both values.
 #[tokio::test(flavor = "multi_thread")]
 async fn concurrent_settlements_release_their_hosted_dependent() {
     let leased = Leased::start().await;
-    let task = |id: &str| TaskId::new(id).expect("task");
-    let (left, right, combine) = (task("left"), task("right"), task("combine"));
-    leased.run.begin(&left, 1).await.expect("left begins");
-    leased.run.begin(&right, 1).await.expect("right begins");
     let held = Arc::new(HeldRevisions {
         scribe: Arc::clone(
             leased
@@ -2682,53 +3015,111 @@ async fn concurrent_settlements_release_their_hosted_dependent() {
         .reclaim_on(outbox)
         .await
         .expect("the execution state claims");
-    let (left_value, right_value) = (judged("left", json!(1)), judged("right", json!("two")));
-
-    let mut settled = Box::pin(async {
-        tokio::join!(
-            writer.settle(&left, 1, &left_value),
-            writer.settle(&right, 1, &right_value)
-        )
-    });
-    tokio::time::timeout(std::time::Duration::from_secs(10), async {
-        tokio::select! {
-            settled = &mut settled => panic!("returned while held: {settled:?}"),
-            () = held.arrived.notified() => {}
-        }
-    })
-    .await
-    .expect("a settlement revision reaches Scribe");
-    assert!(pending(&mut settled).await, "both settlements wait");
-    held.release
-        .add_permits(tokio::sync::Semaphore::MAX_PERMITS);
-    let (left_settled, right_settled) = settled.await;
-    left_settled.expect("the left settlement is accepted");
-    right_settled.expect("the right settlement is accepted");
-    let expected = BTreeMap::from([
-        ("left".to_owned(), Some(left_value.clone())),
-        ("right".to_owned(), Some(right_value.clone())),
-    ]);
-    assert_eq!(
-        settlements(&leased.accepted().await),
-        expected,
-        "the accepted revision covers both settlements"
-    );
-    writer
-        .begin(&combine, 1)
+    let blocks = HostedBlocks::start(worker(), HostedLimits::default())
         .await
-        .expect("the dependent begins");
+        .expect("the sandbox starts");
+    let code =
+        |source: &str| json!({ "kind": "code", "entrypoint": "f", "source": { "inline": source } });
+    let spec: VerifierSpec = serde_json::from_value(json!({
+        "steps": [
+            { "id": "left", "action": code("def f():\n    return 1") },
+            { "id": "right", "action": code("def f():\n    return 'two'") },
+            { "id": "combine", "depends_on": ["left", "right"],
+              "action": { "kind": "code", "entrypoint": "f",
+                          "source": { "inline": "def f(a, b):\n    return [a, b]" },
+                          "inputs": { "a": "steps.left.output", "b": "steps.right.output" } },
+              "requirements": [{ "id": "combined", "statement": "The dependent reads both values.",
+                  "check": { "kind": "assert", "path": "steps.combine.output",
+                             "operator": "equals", "expected": [1, "two"] } }] }
+        ]
+    }))
+    .expect("Verifier decodes");
+    spec.validate().expect("valid Verifier");
+    let spec = Arc::new(spec);
+    let caller = user(leased.server.data_tenant_id(), []);
+    let verifier = CardUid::from_uuid(uuid::Uuid::now_v7()).expect("uid");
+    let (evidence, routes) = (BTreeMap::new(), BTreeMap::new());
+    let run = async |state: &Arc<RunState>| {
+        let recorded = state.snapshot().await.invocations;
+        blocks
+            .engine(
+                leased.server.state(),
+                Execution {
+                    caller: &caller,
+                    verifier: &verifier,
+                    evidence: &evidence,
+                    routes: &routes,
+                    subject: GatewayCallContext::default(),
+                    defer_unlanded_traces: false,
+                    drift: DriftChecks::new(None, BTreeMap::new(), BTreeMap::new()),
+                    clock: BlockClock::default(),
+                    execution: Some(Arc::clone(state)),
+                },
+            )
+            .expect("the engine builds")
+            .with_checkpoints(
+                Arc::clone(state) as Arc<dyn Checkpoints>,
+                recorded.into_iter().map(|record| {
+                    (
+                        record.producer.step_id,
+                        record.producer.attempt,
+                        record.settlement,
+                    )
+                }),
+            )
+            .run(
+                Arc::clone(&spec),
+                BTreeMap::new(),
+                tokio::time::Instant::now() + std::time::Duration::from_secs(60),
+            )
+            .await
+    };
+    let combine = |state: &ExecutionState| settlements(state).contains_key("combine");
+
+    let mut crashed = Box::pin(run(&writer));
+    let predecessors = loop {
+        tokio::time::timeout(std::time::Duration::from_secs(30), async {
+            tokio::select! {
+                ran = &mut crashed => panic!("the run finished while a revision was held: {ran:?}"),
+                () = held.arrived.notified() => {}
+            }
+        })
+        .await
+        .expect("each revision reaches Scribe");
+        if combine(&writer.snapshot().await) {
+            break settlements(&leased.accepted().await);
+        }
+        held.release.add_permits(1);
+    };
+    assert!(
+        ["left", "right"]
+            .iter()
+            .all(|step| predecessors.get(*step).is_some_and(Option::is_some))
+            && !predecessors.contains_key("combine"),
+        "the dependent starts only once both settlements are accepted: {predecessors:?}"
+    );
+    drop(crashed);
 
     let restarted = leased.reclaim().await;
-    let mut restored = expected;
-    restored.insert("combine".to_owned(), None);
-    assert_eq!(settlements(&restarted.snapshot().await), restored);
+    let outcome = run(&restarted).await.expect("the reclaimed run completes");
+    held.release
+        .add_permits(tokio::sync::Semaphore::MAX_PERMITS);
+    assert_eq!(outcome.verdict, VerificationVerdict::Passed, "{outcome:?}");
+    let accepted = leased.accepted().await;
+    let restored = settlements(&accepted);
+    for step in ["left", "right"] {
+        assert_eq!(restored[step], predecessors[step], "{step} is restored");
+    }
     assert_eq!(
-        attempts(&restarted.snapshot().await),
-        [
+        attempts(&accepted)
+            .into_iter()
+            .filter(|(step, _)| ["left", "right", "combine"].contains(&step.as_str()))
+            .collect::<BTreeSet<_>>(),
+        BTreeSet::from([
             ("left".to_owned(), 1),
             ("right".to_owned(), 1),
             ("combine".to_owned(), 1)
-        ],
+        ]),
         "no settled step is attempted again"
     );
     leased

@@ -62,17 +62,17 @@ const HELD: &str = "1h";
 const LEASE: chrono::TimeDelta = chrono::TimeDelta::minutes(10);
 
 /// One bound server with the support Service registered and credentialed.
-struct Support {
+pub(crate) struct Support {
     /// The bound server, verification runtime off.
-    server: WyrdTestServer,
+    pub(crate) server: WyrdTestServer,
     /// Tenant admin token that registered the Service and reads executions.
     admin: String,
     /// The Service's access token, which also records its activity.
     service: String,
     /// The support Service, owner of every turn.
-    owner: CardUid,
+    pub(crate) owner: CardUid,
     /// The Agent each turn judges.
-    agent: CardUid,
+    pub(crate) agent: CardUid,
     /// The per-turn source Verifier.
     turn_check: CardUid,
 }
@@ -87,7 +87,7 @@ impl Support {
     /// # Panics
     /// Panics when the server, registration, credential exchange, or window
     /// update fails.
-    async fn start() -> Self {
+    pub(crate) async fn start() -> Self {
         let server = WyrdTestServer::builder()
             .start_bound()
             .await
@@ -138,7 +138,7 @@ impl Support {
     ///
     /// # Panics
     /// Panics when the enqueue is not accepted or never becomes readable.
-    async fn turn(&self, group: &str, answer: &str, key: Option<&str>) -> ExecutionId {
+    pub(crate) async fn turn(&self, group: &str, answer: &str, key: Option<&str>) -> ExecutionId {
         let body = json!({
             "verifier_card_uid": self.turn_check,
             "card_uid": self.agent,
@@ -219,7 +219,7 @@ impl Support {
 
     /// A scheduler over the server's Postgres and the real [`GroupPoller`],
     /// sharing `capacity` as the runtime's execution capacity.
-    fn scheduler(&self, capacity: &Arc<Semaphore>) -> VerificationScheduler {
+    pub(crate) fn scheduler(&self, capacity: &Arc<Semaphore>) -> VerificationScheduler {
         let state = self.server.state();
         VerificationScheduler::new(
             state.postgres.wyrd().clone(),
@@ -261,7 +261,7 @@ impl Support {
     ///
     /// # Panics
     /// Panics when the statement or commit fails.
-    async fn exec(&self, sql: &'static str) {
+    pub(crate) async fn exec(&self, sql: &'static str) {
         let mut conn = self.conn().await;
         sqlx::query(sql)
             .execute(&mut **conn.transaction())
@@ -307,7 +307,7 @@ impl Support {
     ///
     /// # Panics
     /// Panics when the update fails.
-    async fn make_due(&self) {
+    pub(crate) async fn make_due(&self) {
         let mut conn = self.conn().await;
         sqlx::query("UPDATE wyrd.verification_group_pending SET due_at = statement_timestamp()")
             .execute(&mut **conn.transaction())

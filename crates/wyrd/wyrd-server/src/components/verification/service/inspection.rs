@@ -31,7 +31,7 @@ use wyrd_spec::verification::execution::{
 use wyrd_spec::verification::state::{AcceptedPublication, ExecutionState, InvocationRecord};
 use wyrd_spec::verification::{PublicationName, TaskId, VerificationExecutionStatus};
 use wyrd_sql::TenantConn;
-use wyrd_sql::queries::verifier_executions::{ExecutionStatus, PendingDelivery};
+use wyrd_sql::queries::verifier_executions::ExecutionStatus;
 use wyrd_storage::error::StorageError;
 use wyrd_storage::tenant_path::ValidatedPath;
 
@@ -41,7 +41,6 @@ use crate::components::auth::Caller;
 use crate::state::registry_db_error;
 use crate::verification::hosted::publications::published_object;
 use crate::verification::inputs::InputResolver;
-use crate::verification::runner::DELIVERY_TIMEOUT;
 use crate::verification::state::RunState;
 
 /// Audit operation of an invocation page read.
@@ -673,10 +672,9 @@ impl<'a> VerificationControl<'a> {
     /// Cancel queued `execution_id` and answer its status after the
     /// cancellation fence commits.
     ///
-    /// Unfinished work settles `cancelled` at once, whatever Bifrost's
-    /// availability, and owes the cancellation to its retained state; a
-    /// runner delivers it if this request cannot. Settled work keeps its
-    /// status, result, and publications, so a repeat answers the current
+    /// Unfinished work settles `cancelled` with its terminal delivery due,
+    /// which the runner records in the execution's state; settled work keeps
+    /// its status, result, and publications, so a repeat answers the current
     /// status.
     ///
     /// # Errors
@@ -690,8 +688,7 @@ impl<'a> VerificationControl<'a> {
         let (mut conn, _) = self
             .authorized(caller, execution_id, Action::Run, CANCEL)
             .await?;
-        let cancelled = self
-            .queue
+        self.queue
             .cancel(&mut conn, execution_id)
             .await
             .map_err(registry_db_error)?;
@@ -701,58 +698,11 @@ impl<'a> VerificationControl<'a> {
             .await
             .map_err(registry_db_error)?
             .ok_or_else(|| execution_not_found(execution_id))?;
-        let deliver = match cancelled {
-            Some(pending) => Some((pending, self.records(&mut conn, caller).await?)),
-            None => None,
-        };
         conn.commit().await.map_err(registry_db_error)?;
-        if let Some((pending, query)) = deliver {
-            self.deliver_cancellation(caller, &pending, &query).await;
-        }
         Ok(CancelExecutionResponse {
             execution_id,
             status: status.state.status,
         })
-    }
-}
-
-impl VerificationControl<'_> {
-    /// Deliver the cancellation `pending` just committed to the execution's
-    /// state, as `caller`, and retire its owed delivery once acknowledged. A
-    /// failure is logged and leaves the delivery owed for a runner; it never
-    /// undoes the committed cancellation.
-    async fn deliver_cancellation(
-        &self,
-        caller: &Caller,
-        pending: &PendingDelivery,
-        query: &crate::query::scheduled::ScheduledQueryCaller,
-    ) {
-        let execution_id = pending.execution_id;
-        let delivered = async {
-            RunState::deliver(
-                self.state,
-                caller.data_tenant_id,
-                &InputResolver::new(query, None),
-                pending,
-                caller.attribution(),
-                DELIVERY_TIMEOUT,
-            )
-            .await
-            .map_err(|error| error.to_string())?;
-            let mut conn = self
-                .state
-                .registry_tenant_conn(caller.data_tenant_id)
-                .await
-                .map_err(|error| error.to_string())?;
-            self.queue
-                .delivered(&mut conn, execution_id)
-                .await
-                .map_err(|error| error.to_string())?;
-            conn.commit().await.map_err(|error| error.to_string())
-        };
-        if let Err(error) = delivered.await {
-            tracing::warn!(execution_id = %execution_id, %error, "the cancellation is owed to the execution state; a runner delivers it");
-        }
     }
 }
 

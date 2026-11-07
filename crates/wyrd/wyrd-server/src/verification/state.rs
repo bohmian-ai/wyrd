@@ -47,10 +47,7 @@ use wyrd_spec::verification::state::{
     TerminalFailure, TerminalSelection,
 };
 use wyrd_spec::verification::{VerificationError, VerificationExecutionStatus};
-use wyrd_sql::queries::cards::get_card_by_uid;
-use wyrd_sql::queries::verifier_executions::PendingDelivery;
 
-use super::cache::exact_ref;
 use super::inputs::InputResolver;
 use super::leases::HeldLease;
 use super::results::{ResultPayloadBuilder, ResultRun};
@@ -65,6 +62,11 @@ const STATE_TABLE: &str = "bifrost.verification.execution_events";
 /// accepted revision.
 // ponytail: a linear walk of PROBE revisions per statement; gallop if executions grow far past it.
 const PROBE: i64 = 256;
+
+/// How long a terminal decision's revision is awaited at least, so a
+/// decision made at or past its writer's deadline, such as a timeout, is
+/// still recorded.
+pub(super) const DECISION_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
 /// The batch identity of `revision` of `execution`'s state, which the
 /// outbox writes under its [`revision_fence`].
@@ -314,24 +316,24 @@ impl StateScribe {
 
     /// Stage `state` as `revision` under the revision's batch identity,
     /// which every retry and every writer of it keeps, and wait for Scribe to
-    /// accept it. The outbox writer prepares the revision's row, so this
+    /// accept it until `deadline`. The outbox writer prepares the revision's row, so this
     /// caller does no encoding. It holds no connection while it waits, so it
     /// may wait unpolled until a waiter drives it.
     ///
     /// # Errors
     /// Returns [`StateError::Stale`] when the revision is refused, such as
     /// when another writer's rows already hold it or it cannot be encoded,
-    /// or unacknowledged by the writer's deadline, and
-    /// [`StateError::Unavailable`] when no outbox capacity frees by the
-    /// deadline.
+    /// or unacknowledged by `deadline`, and [`StateError::Unavailable`] when
+    /// no outbox capacity frees by it.
     async fn write(
         self: Arc<Self>,
         revision: i64,
         state: ExecutionState,
+        deadline: tokio::time::Instant,
     ) -> Result<(), StateError> {
         let slot = self
             .outbox
-            .reserve_until(1, self.deadline.into_std())
+            .reserve_until(1, deadline.into_std())
             .await
             .map_err(|full| StateError::Unavailable(full.to_string()))?;
         let (sender, acked) = oneshot::channel();
@@ -344,7 +346,7 @@ impl StateScribe {
                 acked: Mutex::new(Some(sender)),
             },
         );
-        match tokio::time::timeout_at(self.deadline, acked).await {
+        match tokio::time::timeout_at(deadline, acked).await {
             Ok(Ok(())) => Ok(()),
             _ => Err(StateError::Stale),
         }
@@ -405,10 +407,18 @@ impl Checkpoint {
         /// A sink counting the bytes written to it.
         struct Counted(usize);
         impl std::io::Write for Counted {
+            /// Count `bytes`, saturating, and keep none of them.
+            ///
+            /// # Errors
+            /// Never fails: every byte is accepted.
             fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
                 self.0 = self.0.saturating_add(bytes.len());
                 Ok(bytes.len())
             }
+            /// Nothing is buffered, so there is nothing to flush.
+            ///
+            /// # Errors
+            /// Never fails.
             fn flush(&mut self) -> std::io::Result<()> {
                 Ok(())
             }
@@ -578,93 +588,6 @@ impl RunState {
         }
     }
 
-    /// Record the terminal decision `pending` owes its execution's state,
-    /// attributed as `attribution`, returning the decision the state holds
-    /// once an accepted revision holds it, waiting at most `until`.
-    ///
-    /// The accepted state is read through `records` first, and a state that
-    /// already decided keeps its decision, so a retried delivery writes
-    /// nothing. Otherwise the decision is recorded by a writer with no lease,
-    /// which never computes, under the identity the state recorded, else the
-    /// exact identity of the execution's queue row and its Cards, which the
-    /// row keeps from being deleted while it exists.
-    ///
-    /// # Errors
-    /// Returns [`StateError::Unavailable`] when the state or the Cards cannot
-    /// be read or Scribe has no capacity, [`StateError::Incompatible`] for a
-    /// state in another format, and [`StateError::Stale`] when the revision
-    /// is refused or unacknowledged.
-    pub async fn deliver(
-        app: &AppState,
-        tenant: DataTenantId,
-        records: &InputResolver<'_>,
-        pending: &PendingDelivery,
-        attribution: Attribution,
-        until: std::time::Duration,
-    ) -> Result<Decision, StateError> {
-        let (revision, state) = Self::accepted(app, tenant, pending.execution_id, records).await?;
-        if let Some(decided) = Decision::of(&state) {
-            return Ok(decided);
-        }
-        let identity = match state.identity.clone() {
-            Some(identity) => identity,
-            None => Self::registered(app, tenant, pending).await?,
-        };
-        let row = StateRow {
-            execution_id: pending.execution_id,
-            verifier_uid: pending.verifier_card_uid.clone(),
-            card_uid: pending.card_uid.clone(),
-            owner_card_uid: pending.owner_card_uid.clone(),
-            run_id: pending.run_id.clone(),
-            deployment_environment: pending.deployment_environment.clone(),
-            attribution,
-            identity,
-        };
-        Self::at(
-            Arc::clone(app.bifrost.scribe_outbox()),
-            tenant,
-            row,
-            tokio::time::Instant::now() + until,
-            None,
-            state,
-            revision,
-        )
-        .fail(pending.status, &pending.error)
-        .await
-    }
-
-    /// The exact identity `pending`'s queue row and its Cards record.
-    ///
-    /// # Errors
-    /// Returns [`StateError::Unavailable`] when a Card cannot be read.
-    async fn registered(
-        app: &AppState,
-        tenant: DataTenantId,
-        pending: &PendingDelivery,
-    ) -> Result<ExecutionIdentity, StateError> {
-        let unavailable =
-            |error: &dyn std::fmt::Display| StateError::Unavailable(error.to_string());
-        let mut conn = app
-            .postgres
-            .wyrd()
-            .tenant_conn(tenant)
-            .await
-            .map_err(|error| unavailable(&error))?;
-        let verifier = get_card_by_uid(&mut conn, &pending.verifier_card_uid)
-            .await
-            .map_err(|error| unavailable(&error))?;
-        let subject = get_card_by_uid(&mut conn, &pending.card_uid)
-            .await
-            .map_err(|error| unavailable(&error))?;
-        Ok(ExecutionIdentity {
-            verifier: exact_ref(&verifier),
-            subject: exact_ref(&subject),
-            deployment_environment: pending.deployment_environment.clone(),
-            group_id: pending.group_id.clone(),
-            owner_card_uid: pending.owner_card_uid.clone(),
-        })
-    }
-
     /// The instant this writer's attempt ends; no revision is awaited past it.
     #[must_use]
     pub fn deadline(&self) -> tokio::time::Instant {
@@ -790,7 +713,9 @@ impl RunState {
 
     /// The decision the state holds, else `decision()` recorded as it,
     /// returned once an accepted revision holds it. The check and the
-    /// change share one memory lock, so two deciders never both decide.
+    /// change share one memory lock, so two deciders never both decide. A
+    /// revision holding the decision is awaited for at least
+    /// [`DECISION_TIMEOUT`], even past the writer's deadline.
     ///
     /// # Errors
     /// Returns the [`Self::durable`] errors.
@@ -810,7 +735,11 @@ impl RunState {
                 (decided, held.changed())
             }
         };
-        self.durable(ticket).await?;
+        let deadline = self
+            .scribe
+            .deadline
+            .max(tokio::time::Instant::now() + DECISION_TIMEOUT);
+        self.durable(ticket, deadline).await?;
         Ok(decided)
     }
 
@@ -887,7 +816,7 @@ impl RunState {
         found: PublicationAcceptance,
         ticket: u64,
     ) -> PublicationAcceptance {
-        if let Err(error) = self.durable(ticket).await {
+        if let Err(error) = self.durable(ticket, self.scribe.deadline).await {
             tracing::warn!(execution_id = %self.scribe.row.execution_id, %error, "a publication was not accepted");
             return PublicationAcceptance::StaleLease;
         }
@@ -946,12 +875,13 @@ impl RunState {
             }
             held.changed()
         };
-        self.durable(ticket)
+        self.durable(ticket, self.scribe.deadline)
             .await
             .map_err(|error| error.to_string())
     }
 
-    /// Wait until an accepted revision holds change `ticket`.
+    /// Wait until an accepted revision holds change `ticket`, awaiting a
+    /// revision this call freezes until `deadline`.
     ///
     /// Joins the pending revision, or, when none is pending, confirms the
     /// lease outside the lock and freezes the live state, every change so
@@ -967,7 +897,7 @@ impl RunState {
     /// Returns [`StateError::Stale`] when the state is broken or the lease
     /// no longer holds, and the [`StateScribe::write`] errors of a revision
     /// holding `ticket`; each breaks the state.
-    async fn durable(&self, ticket: u64) -> Result<(), StateError> {
+    async fn durable(&self, ticket: u64, deadline: tokio::time::Instant) -> Result<(), StateError> {
         let mut confirmed = false;
         loop {
             let pending = {
@@ -996,7 +926,7 @@ impl RunState {
                         revision,
                         covers: held.changes,
                         accepted: Arc::clone(&self.scribe)
-                            .write(revision, held.state.clone())
+                            .write(revision, held.state.clone(), deadline)
                             .boxed()
                             .shared(),
                     };

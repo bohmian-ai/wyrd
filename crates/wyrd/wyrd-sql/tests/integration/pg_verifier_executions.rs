@@ -46,7 +46,7 @@ use wyrd_sql::queries::verifier_executions::{
     ExecutionAuthority, ExecutionInput, ExecutionLease, ExecutionOrigin, ExecutionStatus,
     GroupActivity, GroupSelection, PinnedGroup, Prepared, QueueCounts, RetryOutcome,
     ScheduleOutcome, ScheduleSkip, ScheduleTick, ScheduledAdmission, Settlement, Submission,
-    SubmissionOutcome, TerminalStatus, VerifierExecutionQueue,
+    SubmissionOutcome, TerminalDelivery, TerminalStatus, VerifierExecutionQueue,
 };
 use wyrd_sql::row_types::cards::CardStatus;
 
@@ -1920,6 +1920,169 @@ async fn retries_back_off_then_exhaust_to_errored() {
     assert!(status.state.dispatches.is_empty());
 }
 
+/// The stored terminal delivery due time of `execution`.
+///
+/// # Panics
+/// Panics when the read fails.
+async fn delivery_due(conn: &mut TenantConn<'_>, execution: ExecutionId) -> Option<DateTime<Utc>> {
+    sqlx::query_scalar(
+        "SELECT delivery_due_at FROM wyrd.verifier_executions WHERE execution_id = $1",
+    )
+    .bind(execution.as_uuid())
+    .fetch_one(&mut **conn.transaction())
+    .await
+    .expect("the delivery reads")
+}
+
+/// An acknowledged termination owes no delivery, while an owed termination
+/// and a cancellation are due at once and the cancellation fences the worker
+/// it stopped. A delivery claim moves the delivery one lease ahead, so a
+/// claim that dies leaves it due again and only the latest claimant retires
+/// or defers it.
+///
+/// # Panics
+/// Panics when a termination owes the wrong delivery, a stale worker or
+/// claim settles, or a claim selects a delivery that is not due.
+#[tokio::test]
+async fn terminal_deliveries_are_settled_only_by_their_latest_claim() {
+    let fixture = PgFixture::start().await.expect("fixture starts");
+    let actor = actor(fixture.data_tenant_id());
+    let queue = VerifierExecutionQueue::default();
+    let mut conn = fixture
+        .tenant_conn()
+        .await
+        .expect("tenant connection opens");
+    let (owner, _) = declare_service(&mut conn, &actor, "svc").await;
+    let verifier = register_verifier(&mut conn, &actor, "drift", custom_drift()).await;
+    let binding = bind(&mut conn, &owner, &verifier, vec![FrozenTarget::Uid(uid())]).await;
+    let error = engine_error();
+
+    for (delivery, owed) in [
+        (TerminalDelivery::Acknowledged, false),
+        (TerminalDelivery::Owed, true),
+    ] {
+        let execution = scheduled(&queue, &mut conn, binding).await;
+        let claimed = claim(&queue, &mut conn).await;
+        assert_eq!(
+            queue
+                .terminate(
+                    &mut conn,
+                    claimed.lease,
+                    TerminalStatus::Errored,
+                    &error,
+                    delivery
+                )
+                .await
+                .expect("terminate answers"),
+            Settlement::Applied
+        );
+        assert_eq!(delivery_due(&mut conn, execution).await.is_some(), owed);
+    }
+    let cancelled = scheduled(&queue, &mut conn, binding).await;
+    let running = claim(&queue, &mut conn).await;
+    assert!(
+        queue
+            .cancel(&mut conn, cancelled)
+            .await
+            .expect("cancel runs")
+    );
+    assert_eq!(
+        queue
+            .terminate(
+                &mut conn,
+                running.lease,
+                TerminalStatus::Errored,
+                &error,
+                TerminalDelivery::Acknowledged,
+            )
+            .await
+            .expect("terminate answers"),
+        Settlement::StaleLease,
+        "the cancelled worker is fenced"
+    );
+    assert!(delivery_due(&mut conn, cancelled).await.is_some());
+
+    let died = queue
+        .claim_deliveries(&mut conn, Duration::zero(), 10)
+        .await
+        .expect("the deliveries claim");
+    assert_eq!(died.len(), 2, "both owed deliveries are due");
+    let latest = queue
+        .claim_deliveries(&mut conn, Duration::minutes(5), 10)
+        .await
+        .expect("the deliveries claim");
+    assert_eq!(
+        latest
+            .iter()
+            .map(|pending| pending.execution_id)
+            .collect::<BTreeSet<_>>(),
+        died.iter().map(|pending| pending.execution_id).collect(),
+        "a dead claim leaves its deliveries due again"
+    );
+    for pending in &died {
+        assert_eq!(
+            queue
+                .delivered(&mut conn, pending)
+                .await
+                .expect("delivered answers"),
+            Settlement::StaleLease,
+            "a superseded claim retires nothing"
+        );
+    }
+    assert!(
+        queue
+            .claim_deliveries(&mut conn, Duration::minutes(5), 10)
+            .await
+            .expect("the deliveries claim")
+            .is_empty(),
+        "a held claim is not due"
+    );
+    let [deferred, retired] = [&latest[0], &latest[1]];
+    assert_eq!(
+        queue
+            .redeliver(&mut conn, deferred, Duration::zero())
+            .await
+            .expect("redeliver answers"),
+        Settlement::Applied
+    );
+    assert_eq!(
+        queue
+            .delivered(&mut conn, deferred)
+            .await
+            .expect("delivered answers"),
+        Settlement::StaleLease,
+        "a deferred claim no longer holds the delivery"
+    );
+    assert_eq!(
+        queue
+            .delivered(&mut conn, retired)
+            .await
+            .expect("delivered answers"),
+        Settlement::Applied
+    );
+    assert_eq!(delivery_due(&mut conn, retired.execution_id).await, None);
+    let again = queue
+        .claim_deliveries(&mut conn, Duration::minutes(5), 10)
+        .await
+        .expect("the deliveries claim");
+    assert_eq!(
+        again
+            .iter()
+            .map(|pending| pending.execution_id)
+            .collect::<Vec<_>>(),
+        [deferred.execution_id],
+        "only the deferred delivery is due again"
+    );
+    assert_eq!(
+        queue
+            .delivered(&mut conn, &again[0])
+            .await
+            .expect("delivered answers"),
+        Settlement::Applied
+    );
+    assert_eq!(delivery_due(&mut conn, deferred.execution_id).await, None);
+}
+
 /// Cancelled and timed-out executions settle with their error and no result, and a
 /// crash on the final attempt is claimed once more as exhausted, counting no
 /// attempt, so its claimant can deliver an already selected outcome or
@@ -1956,7 +2119,13 @@ async fn terminal_failures_and_expired_final_attempts_carry_no_verdict() {
         let claimed = claim(&queue, &mut conn).await;
         assert_eq!(
             queue
-                .terminate(&mut conn, claimed.lease, terminal, &error)
+                .terminate(
+                    &mut conn,
+                    claimed.lease,
+                    terminal,
+                    &error,
+                    TerminalDelivery::Acknowledged,
+                )
                 .await
                 .expect("terminate answers"),
             Settlement::Applied
@@ -2002,7 +2171,8 @@ async fn terminal_failures_and_expired_final_attempts_carry_no_verdict() {
                 &mut conn,
                 claimed.lease,
                 TerminalStatus::Errored,
-                &exhausted
+                &exhausted,
+                TerminalDelivery::Acknowledged,
             )
             .await
             .expect("terminate answers"),

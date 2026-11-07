@@ -3451,8 +3451,7 @@ async fn cancel_and_revocation_fence_unfinished_work() -> Result<(), ServerJourn
         let mut conn = server.tenant_conn_for(tenant).await?;
         let cancelled = wyrd_sql::queries::verifier_executions::VerifierExecutionQueue::default()
             .cancel(&mut conn, execution)
-            .await?
-            .is_some();
+            .await?;
         conn.commit().await?;
         Ok(cancelled)
     };

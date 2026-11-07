@@ -1,10 +1,10 @@
 ---
 id: SPEC-resource-scaling
-revision: 3
+revision: 4
 status: approved
 ---
 
-# One startup resource configuration for Bifrost
+# Shared resources and lower allocation through Gateway and Scribe
 
 Every Bifrost consumer in a process should size itself from one resource
 configuration resolved at startup, so an operator's CPU cap or explicit worker
@@ -15,6 +15,12 @@ Revision 2 also scaled outbox writers and ordered lanes with CPU. Measured on
 the Gateway L1 benchmark, that change reduced throughput while raising CPU and
 memory. This revision withdraws it: the outbox keeps main's geometry, and any
 future outbox concurrency change must first show the outbox is the bottleneck.
+
+Revision 4 retains that resource behavior and adds integration of the learned-layout
+read work and removal of avoidable payload rebuilding from Gateway through Scribe
+publication. The goal is substantially lower allocation and memory growth under
+sustained payload capture, without weakening evidence durability or learning.
+Revision 4 was approved by the maintainer on 2026-11-07.
 
 ## Problem
 
@@ -119,6 +125,85 @@ unless an operator set one explicitly. The outbox runs 4 writers, 4 lanes and
   use the shared C; explicit worker overrides remain effective. A configured
   effective CPU cap never leaves a consumer sized from an independent probe.
 
+## Payload allocation behavior
+
+A physical layout stores selected Variant fields as typed leaves and the remaining
+content as residual data. Logical values stay the same across layouts. Keep these
+learned layouts in memory and local staging; always-canonical staging is not the fix.
+
+For example, memory and staged runs use cached layout A. Every hot-file assembly
+still takes a fresh sample. If it selects A again, matching shredded columns reach
+the output without reconstruction and reshredding. If it selects B, incompatible
+inputs are converted without losing residual content. Existing generations retain
+their pinned layouts; future generations use the new cache hint.
+
+The sampling unit stays the existing claim: if it rolls into multiple hot files,
+those files share that claim's freshly selected layout. Every new claim resamples;
+this revision does not introduce a separate sample for each rolled file.
+
+Today claim sampling reconstructs whole batches before selecting sample rows,
+merge reconstructs them again, and final encoding reshreds them even when the
+selected mapping is unchanged. Gateway preparation and capture column construction
+add full-payload materializations. These source-backed findings establish redundant
+work, not the supplied profile's exact totals or an achievable allocation floor.
+
+- **REQ-007 (integrated reads):** integrate the committed `variant-file-reads`
+  work and retain layout-aware memory/staged reads, source-local planning,
+  complete-value fallback, tenant proofs and generation/file leases. Close its
+  existing correctness and performance obligations; merging commits alone is not
+  proof. Do not import unrelated worktree deletions or review files.
+- **REQ-008 (fresh learning):** every hot-file claim determines its output layout
+  from a fresh deterministic, seeded, stratified sample under the existing policy.
+  Typed leaves and residual fields both participate; evolving distributions,
+  missing/null values, mixed types and nested/list values remain discoverable.
+  Select sampled observations before complete-value reconstruction; do not
+  reconstruct unsampled payloads merely to sample. Preserve the existing selected
+  observations, seed, strata, list semantics and thresholds.
+- **REQ-009 (preserved physical data):** when input Variant layouts match the
+  freshly selected output layout, merge and final encoding preserve their shredded
+  representation without complete-value reconstruction and reshredding. For mixed
+  inputs, convert only incompatible Variant columns/inputs to the selected layout.
+  Bounded canonical reconstruction is an allowed fallback for incompatible inputs,
+  not matching ones. Preserve exact values, logical/physical footer identity,
+  deterministic total order and byte-identical claim retries.
+- **REQ-010 (request/capture copies):** remove redundant full-body preparation and
+  copying in Gateway planning/dispatch and redundant intermediate payload
+  materializations between redacted capture and Arrow column construction, using
+  existing owners. Preserve model substitution, provider translation, validation,
+  retry/fallback, secret scrubbing, binary references and error semantics. Reusing
+  ownership must not retain an unnecessary second full-body representation.
+  Only internal representation changes are authorized.
+- **REQ-011 (bounded workspaces):** sampling, conversion, decoded merge and writer
+  workspaces, including input/output overlap and concurrent claims, fit existing
+  global/tenant/table reservations. Row counts alone are not a byte bound. Fit work
+  to reserved bytes; an accepted large row remains processable without an uncounted
+  oversize escape. Refusal precedes acceptance; acknowledged data drains or remains
+  recoverable. Preserve existing admission policy and reservation categories.
+- **REQ-012 (measured reduction):** demonstrate repeatable reductions in allocated
+  bytes per reconciled call and payload-case peak RSS beyond baseline variation,
+  attributable to removal of the specified passes and copies. Report live heap and
+  post-drain memory separately. Retained work must settle across equivalent load/
+  drain cycles. Lower throughput, larger queues or deferred work are not a fix.
+  No absolute allocation floor, hard-RSS ceiling or new allocator is promised.
+
+### Costs and authority changes
+
+Fresh sampling, layout conversion, sorting, canonical WAL serialization and Parquet
+encode/decode still cost CPU and memory. Sharing Arrow buffers does not make raw
+received JSON a Variant array. Different generations/files may retain different
+layouts; readers use native metadata and expose the same logical values.
+
+This revision intentionally replaces the blanket reconstruction mechanism in the
+Scribe Variant sampling/merge paragraph of `architecture/bifrost-design.md`
+(currently lines 480–493). Update that owner in the same implementation: retain
+fresh sampling and complete-value semantics, reconstruct only selected sample
+observations and incompatible merge inputs, and preserve matching physical columns.
+Keep learned-cache policy, canonical WAL, local stage format/metadata, recovery,
+promotion and publication fencing. Forge continues combining source-footer counts
+with its existing row-weighted policy; it does not freshly sample payloads.
+No new persisted format, claim-membership key, layout registry, dependency family
+or public setting is authorized.
+
 ## Invariants, scope and non-goals
 
 - **INV-001:** detection failure, invalid settings and unrepresentable derived
@@ -133,6 +218,15 @@ unless an operator set one explicitly. The outbox runs 4 writers, 4 lanes and
   writers, lanes, delivery limits or batching must first show measured outbox
   saturation and a profile identifying its limiting stage. A CPU count alone
   is not evidence of an outbox bottleneck.
+- **INV-005:** every hot-file assembly resamples; a matching layout permits
+  physical reuse, never skipping learning or ignoring residual fields.
+- **INV-006:** canonical WAL, ACK-before-handoff, staged recovery authority,
+  schema identity, publication fencing and exact tenant attribution remain.
+- **INV-007:** learned-leaf reads in memory/staging remain; no always-canonical
+  replacement or second resident cache is introduced.
+- **INV-008:** reductions cannot come from dropping evidence, extra redaction,
+  changed responses, smaller admitted payload limits, weakened accounting or work
+  left outstanding beyond measurement.
 
 Production and production-equivalent test startup use the same resolution
 path, with deterministic observations injectable for tests. Tenants keep
@@ -142,9 +236,15 @@ changes. The verifier submission outbox keeps its existing four-lane geometry.
 
 Excluded: CPU-scaled outbox geometry, cross-lane slice coalescing, linger or
 batch-size tuning, queue-capacity, database-pool, WAL IO or shard scaling,
-gateway admission/latency/capture changes, reservation fairness, memory
-partitions, per-frame byte allowances, preallocation, new schedulers or pools,
+gateway admission or ownership-policy redesign, capture-content policy changes,
+reservation fairness, memory partitions, new per-frame byte allowances,
+speculative preallocation, new schedulers or pools,
 live reconfiguration, new public settings, dependencies, SDK or wire changes.
+
+Measured request/capture copy removal and byte-bounded work within existing Scribe
+reservations are included. The separate draft `gateway-latency-capture` packet is
+not adopted: capture admission, post-response ownership and scheduling policy
+redesign remain outside this revision.
 
 ## Acceptance
 
@@ -176,24 +276,72 @@ live reconfiguration, new public settings, dependencies, SDK or wire changes.
 - **AC-005 (memory and scratch):** existing resource-owner tests continue to
   show unchanged headroom, caps, floors and shared accounting.
 
+- **AC-006 (integrated reads):** queries over canonical/learned memory, staged and
+  published data agree on complete values and selective results; covered paths avoid
+  unrelated reconstruction. Complete the imported packet's remaining matched
+  memory/staged performance proof without weakening its criteria.
+- **AC-007 (learning/reuse):** cold input, unchanged learned layout, changed
+  distribution and mixed layouts produce the freshly sampled layout and exact
+  ordered values. Evidence shows no full unsampled reconstruction, and matching
+  columns bypass merge reconstruction and final reshredding. Eligible residual-only
+  fields become newly learned. Repeated claims write byte-identical objects.
+- **AC-008 (request/capture):** owner tests demonstrate reduced materialization
+  with unchanged model rewriting, native/translated responses, validation, selected
+  redacted content, binary references and errors. Real server journeys read back
+  exact attributed captures after drain, including cancellation, streaming, retries
+  and split-role submission.
+- **AC-009 (memory/durability):** large-payload, multi-run and concurrent claims
+  under tight budgets account input/output overlap. Work progresses in reservations
+  or applies existing pre-acceptance pressure; failure/cancellation releases once.
+  Acknowledged rows survive pressure/restart and remain exact through staging,
+  publication, promotion and compaction.
+- **AC-010 (allocation evidence):** compare matched quiet-host runs with identical
+  builds, actual resource/outbox geometry, payloads and repetitions. Use unprofiled
+  L1 for non-regression and paired profiled runs for attribution. In the 64 KiB-per-
+  body payload case at c64, median allocated bytes per reconciled call and peak RSS
+  must each fall below the baseline's minimum repetition; repeat a fresh pair if
+  unsettled. Profiles must also demonstrate removal of the specified passes/copies.
+  Record both bodies (about 128 KiB captured per call), matching profile deltas to
+  all warmup/measured/drain work in their interval. Report outstanding/completed
+  work, throughput, CPU, p99, live heap, RSS time series and post-drain ownership
+  across repeated equivalent cycles. Owned bytes settle within budgets rather
+  than accumulate; RSS need not immediately return to its initial value. Separate
+  total request allocation from incremental payload-capture cost using the existing
+  matched metadata comparison; metadata capture is not capture disabled.
+  Preserve AC-003's non-regression rule and zero errors/lost/shed/
+  undrained captures. No 100 KiB or 3× allocation floor is asserted.
+
+For AC-010, retain an immutable pre-TASK-002 resource-scaling baseline with fixed
+revision-3 geometry, before read integration or copy removal. Compare the final
+candidate against it; an integration-only run may separate read integration from
+write-path savings. AC-003 separately compares the final candidate with main, and
+the imported read packet retains its original performance comparison. Historical
+TASK-001 L1 misses are not waived: the final candidate must satisfy these rules,
+with no discretionary pass.
+
 All existing correctness, reference and applicable real client/server journey
 gates remain. A real SDK verification journey on combined and split targets
 continues to read back exact, attributed evidence after drain.
 
 ## Decisions and approval
 
-No open material decisions. Requested approval: withdraw revision 2's CPU-scaled
-outbox geometry in favor of main's fixed 4/4/8/32, keep the shared startup
-configuration, worker sizing, diagnostics and cancellation-safe delivery
-accounting, replace the scaling criterion with L1 non-regression, and adopt
-INV-004 as the gate for future outbox concurrency proposals.
+Revision 3 was approved on 2026-11-06. The maintainer approved revision 4 on
+2026-11-07: retain shared resources
+and fixed 4/4/8/32 geometry; integrate learned-layout reads; resample every hot-file
+claim while preserving matching shredded columns; remove specified request/capture
+copies; fit conversion work within existing byte reservations; and require matched
+allocation/RSS evidence. This approval includes the explicit Scribe architecture correction above.
 
-Consequence: the revision 2 implementation on `change/resource-scaling`
-reverts its CPU-scaled outbox counts and configurable lanes, keeping the
-shared configuration, worker sizing, diagnostics and delivery accounting.
-TASK-001 is re-scoped through `$wyrd-plan` after approval.
+There is no new persistent format, claim-membership, sampling-policy, Forge,
+security or ACK decision delegated to execution. TASK-002 is the single added task
+proposal against approved revision 4. TASK-001's existing revision-2 prose
+and evidence do not authorize restoring scaled geometry; the integrated candidate
+must satisfy revision 3's fixed counts before allocation comparisons. Its revision-3
+implementation intent is unchanged.
 
-Approved 2026-11-06 by the maintainer.
+The TASK-001 dependency requires its revision-3 resource and cancellation behavior
+before this work, not an assertion that historical performance evidence passed.
+Final revision-4 verification must close outstanding L1 acceptance.
 
 ## Authority and baseline
 
@@ -202,6 +350,11 @@ Baseline: main `5234961d51798581a026834cfffd5efaadc226b4`. Owners:
 `crates/shared/wyrd-runtime/src/outbox.rs` and
 `crates/vala/vala-bifrost-redux/src/resources.rs`. Evidence: the Execution
 Evidence section of `tasks/TASK-001-shared-resources-and-scaled-outbox.md`.
+Added owners are Scribe sampling/merge/writer and admission, Gateway adapter
+preparation, server capture projection, shared Variant encoding and the existing
+capacity driver. TASK-002 records reuse and verification. The imported read source
+is commit `5f92c71f33a98e7d6616aab9f0a201762da84ebf` on
+`change/variant-file-reads-task-002`; its outstanding performance proof is included.
 Follow [Bifrost memory](../../../architecture/bifrost-design.md#admission-and-memory),
 [resource invariants](../../../architecture/bifrost-design.md#resource-and-failure-invariants)
 and [overload](../../../architecture/operations/reliability-and-recovery.md#capacity-and-overload).
@@ -222,3 +375,8 @@ owns unchanged tenant and audit authority.
   4/4/8/32 outbox geometry, keeps the shared configuration and correctness
   improvements, replaces the scaling criterion with L1 non-regression, and adds
   INV-004.
+- Revision 4, 2026-11-07, approved: adds `variant-file-reads` integration, fresh
+  per-claim sampling with physical-layout preservation, request/capture copy
+  removal, byte-bounded workspaces and matched memory/allocation proof. Intentionally
+  replaces unconditional sampling/merge reconstruction in the Bifrost owner, updated
+  with the implementation. Approved by the maintainer on 2026-11-07.

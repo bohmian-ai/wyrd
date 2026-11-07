@@ -326,9 +326,8 @@ impl AgentExecutor {
 
     /// Run one Agent call and return its raw run plus provenance.
     ///
-    /// `slots` are the citation slots a check invocation can reach, empty for
-    /// a step; see [`Self::bind`]. `producer` is the step attempt the
-    /// toolset attributes publications to, `None` for a check.
+    /// `role` carries a step's producing attempt or a check's reachable
+    /// citation slots; see [`Role`].
     ///
     /// Steps and checks get exactly their declared built-ins from the toolset, which holds the
     /// invocation's workspace until the run ends. The first tool refused
@@ -350,12 +349,15 @@ impl AgentExecutor {
         call: &AgentCall,
         inputs: &BTreeMap<String, CallInput>,
         workspace: &BTreeMap<String, CallInput>,
-        slots: &BTreeSet<SlotName>,
         deadline: Instant,
-        producer: Option<&Producer>,
+        role: &Role<'_>,
     ) -> Result<Invoked, BlockError> {
         let resolved = self.resolve(&call.agent).await?;
         let route = self.route(id, &resolved.spec.execution_route)?;
+        let (slots, producer) = match role {
+            Role::Step(producer) => (&BTreeSet::new(), Some(producer)),
+            Role::Check(slots) => (*slots, None),
+        };
         let (prompt, vars) = self.bind(&resolved.prompt, inputs, slots).await?;
         let declared = resolved
             .spec
@@ -461,9 +463,8 @@ impl ActionExecutor for AgentExecutor {
                 agent,
                 &call.inputs,
                 &call.workspace,
-                &BTreeSet::new(),
                 call.deadline,
-                Some(&producer),
+                &Role::Step(producer),
             )
             .await?;
         let output = invoked
@@ -507,9 +508,8 @@ impl CheckExecutor for AgentExecutor {
                 agent,
                 &call.inputs,
                 &call.workspace,
-                &reachable,
                 call.deadline,
-                None,
+                &Role::Check(&reachable),
             )
             .await?;
         let answer = invoked
@@ -551,6 +551,15 @@ struct Resolved {
     prompt: Prompt,
     /// The Prompt Card, when referenced.
     prompt_ref: Option<CardRef>,
+}
+
+/// What one Agent call is invoked as.
+enum Role<'a> {
+    /// A step action: the attempt the toolset attributes publications to.
+    Step(Producer),
+    /// A check: the citation slots its Verdict may cite, narrowed by
+    /// [`AgentExecutor::bind`] when non-empty.
+    Check(&'a BTreeSet<SlotName>),
 }
 
 /// The result of one Agent run.

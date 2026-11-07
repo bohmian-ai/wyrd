@@ -12,6 +12,7 @@
 //! back through the public execution surface.
 
 use std::collections::BTreeMap;
+use std::fmt::Write as _;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
@@ -54,9 +55,14 @@ const RETRIED: &str = "# Retried report\n";
 
 /// A file of 3,000 numbered lines, larger than one tool result.
 fn big() -> String {
-    (0..3_000)
-        .map(|line| format!("line {line:04}: the quick brown fox jumps over the lazy dog\n"))
-        .collect()
+    let mut text = String::new();
+    for line in 0..3_000 {
+        let _ = writeln!(
+            text,
+            "line {line:04}: the quick brown fox jumps over the lazy dog"
+        );
+    }
+    text
 }
 
 /// The JSON assessment the drafter publishes by value.
@@ -257,7 +263,8 @@ struct Script {
 /// The scripted model: one reply per request, chosen by the Agent's prompt
 /// marker, the review's marker, and the turn. The `CANCEL-RUN` drafter
 /// publishes `early`, then raises `waiting` and holds its next reply, which
-/// would publish `late`, long enough to be cancelled; the `RESTART-RUN`
+/// would publish `late`, long enough to be cancelled; the `DISCONNECT-RUN`
+/// drafter does the same for a direct caller that disconnects; the `RESTART-RUN`
 /// consumer raises it and holds its first reply long enough for the server
 /// to restart.
 fn reply(request: &Request, script: &Script) -> ResponseTemplate {
@@ -307,6 +314,21 @@ fn reply(request: &Request, script: &Script) -> ResponseTemplate {
                     script.waiting.notify_one();
                     calls(&[("late", "publish", json!({ "name": "late", "value": 2 }))])
                         .set_delay(Duration::from_secs(20))
+                }
+                _ => done(),
+            };
+        }
+        if prompt.contains("DISCONNECT-RUN") {
+            return match turn {
+                0 => calls(&[("early", "publish", json!({ "name": "early", "value": 1 }))]),
+                1 => {
+                    script.waiting.notify_one();
+                    calls(&[(
+                        "after",
+                        "fs.write",
+                        json!({ "path": "/work/after.md", "content": "x" }),
+                    )])
+                    .set_delay(Duration::from_secs(2))
                 }
                 _ => done(),
             };
@@ -1395,8 +1417,10 @@ async fn tool_limits_release_capacity_and_preserve_provenance() {
     desk.deployment.shutdown().await;
 }
 
-/// A queued review takes the same tool and state path as a direct one, and
-/// its accepted publications survive a process restart: the drafter
+/// A direct caller that disconnects while its drafter waits on the model
+/// starts no later Agent work. A queued review takes the same tool and state
+/// path as a direct one, and its accepted publications survive a process
+/// restart: the drafter
 /// commits, the server restarts while the consumer waits on the model, and
 /// the interrupted call spends the consumer's first attempt, and its retry
 /// reads exactly the accepted content from the restored state without the
@@ -1409,6 +1433,21 @@ async fn tool_limits_release_capacity_and_preserve_provenance() {
 #[ignore = "requires the repository-managed Postgres journey lifecycle"]
 async fn publications_follow_shared_run_state() {
     let desk = PublishDesk::start().await;
+    tokio::select! {
+        result = desk.verify("report-pipeline", "DISCONNECT-RUN") => {
+            panic!("the held review finished: {result:?}");
+        }
+        () = desk.script.waiting.notified() => {}
+    }
+    // Dropping the verify above disconnects; the held reply lands after two
+    // seconds, so a still-running drafter would call the model again well
+    // within this window.
+    tokio::time::sleep(Duration::from_secs(5)).await;
+    assert_eq!(
+        desk.requests("DISCONNECT-RUN").await.len(),
+        2,
+        "a disconnected direct review starts no later Agent work"
+    );
     let Submission::Queued(queued) = desk
         .state
         .run()

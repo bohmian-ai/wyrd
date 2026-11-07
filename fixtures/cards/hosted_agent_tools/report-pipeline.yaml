@@ -18,6 +18,7 @@ spec:
         agent: ./drafter.yaml
         inputs: {question: inputs.question}
     - id: consume
+      retries: 1
       action:
         kind: agent
         agent: ./consumer.yaml

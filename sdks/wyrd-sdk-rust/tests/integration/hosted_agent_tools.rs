@@ -241,13 +241,26 @@ fn refusals(turn: usize) -> ResponseTemplate {
     ])
 }
 
+/// What the scripted model remembers across requests.
+#[derive(Default)]
+struct Script {
+    /// The `RETRY-RUN` drafter's first turns so far, so its two attempts
+    /// carry distinct call IDs and only the first gets an undecodable reply.
+    attempts: AtomicUsize,
+    /// The `RESTART-RUN` consumer's first turns so far; only the first is
+    /// held.
+    held: AtomicUsize,
+    /// Raised when a scripted Agent starts waiting on a held reply.
+    waiting: Notify,
+}
+
 /// The scripted model: one reply per request, chosen by the Agent's prompt
-/// marker, the review's marker, and the turn. `attempts` counts the
-/// `RETRY-RUN` drafter's first turns, so its two attempts carry distinct
-/// call IDs and only the first gets an undecodable reply. The `CANCEL-RUN`
-/// drafter publishes `early`, then raises `waiting` and holds its next reply,
-/// which would publish `late`, long enough to be cancelled.
-fn reply(request: &Request, attempts: &AtomicUsize, waiting: &Notify) -> ResponseTemplate {
+/// marker, the review's marker, and the turn. The `CANCEL-RUN` drafter
+/// publishes `early`, then raises `waiting` and holds its next reply, which
+/// would publish `late`, long enough to be cancelled; the `RESTART-RUN`
+/// consumer raises it and holds its first reply long enough for the server
+/// to restart.
+fn reply(request: &Request, script: &Script) -> ResponseTemplate {
     let messages = messages(request);
     let prompt = text(&messages);
     let turn = turn(&messages);
@@ -291,7 +304,7 @@ fn reply(request: &Request, attempts: &AtomicUsize, waiting: &Notify) -> Respons
             return match turn {
                 0 => calls(&[("early", "publish", json!({ "name": "early", "value": 1 }))]),
                 1 => {
-                    waiting.notify_one();
+                    script.waiting.notify_one();
                     calls(&[("late", "publish", json!({ "name": "late", "value": 2 }))])
                         .set_delay(Duration::from_secs(20))
                 }
@@ -302,7 +315,7 @@ fn reply(request: &Request, attempts: &AtomicUsize, waiting: &Notify) -> Respons
             return done();
         }
         if prompt.contains("RETRY-RUN") {
-            if turn == 0 && attempts.fetch_add(1, Ordering::SeqCst) == 0 {
+            if turn == 0 && script.attempts.fetch_add(1, Ordering::SeqCst) == 0 {
                 return calls(&[(
                     "a1-p-report",
                     "publish",
@@ -321,9 +334,19 @@ fn reply(request: &Request, attempts: &AtomicUsize, waiting: &Notify) -> Respons
             }
             return publish_all(turn, "a2-", RETRIED).unwrap_or_else(done);
         }
+        if prompt.contains("RESTART-RUN") {
+            return publish_all(turn, "", REPORT).unwrap_or_else(done);
+        }
         return publish_all(turn, "", REPORT).unwrap_or_else(|| refusals(turn));
     }
     if prompt.contains("CONSUME:") {
+        if prompt.contains("RESTART-RUN")
+            && turn == 0
+            && script.held.fetch_add(1, Ordering::SeqCst) == 0
+        {
+            script.waiting.notify_one();
+            return done().set_delay(Duration::from_secs(15));
+        }
         return match turn {
             0 => calls(&[
                 (
@@ -431,8 +454,10 @@ struct PublishDesk {
     bundle: TempDir,
     /// The registered `publish-desk` Service.
     root: CardRef,
-    /// Raised once the `CANCEL-RUN` drafter is waiting on its held reply.
-    waiting: Arc<Notify>,
+    /// The scripted model's memory.
+    script: Arc<Script>,
+    /// The every-tool principal's key.
+    key: String,
     /// The hydrated Service, as a principal granted every tool.
     state: WyrdState,
 }
@@ -446,22 +471,14 @@ impl PublishDesk {
     /// Panics when a setup step fails.
     async fn start() -> Self {
         let upstream = MockServer::start().await;
-        let attempts = Arc::new(AtomicUsize::new(0));
-        let waiting = Arc::new(Notify::new());
-        let raised = Arc::clone(&waiting);
+        let script = Arc::new(Script::default());
+        let scripted = Arc::clone(&script);
         Mock::given(method("POST"))
             .and(path("/v1/chat/completions"))
-            .respond_with(move |request: &Request| reply(request, &attempts, &raised))
+            .respond_with(move |request: &Request| reply(request, &scripted))
             .mount(&upstream)
             .await;
-        let deployment = Deployment::start_with(
-            WyrdTestServer::builder()
-                .with_verification_runtime_for_test()
-                .with_gateway_provider_root_for_test(
-                    upstream.uri().parse().expect("upstream URL parses"),
-                ),
-        )
-        .await;
+        let deployment = Deployment::start_with(builder(&upstream)).await;
         configure_gateway(&deployment.admin()).await;
         let cards = deployment.cards().await;
         let desk = declare(&cards, "cards/hosted_agent_tools/publish-desk.yaml").await;
@@ -477,8 +494,28 @@ impl PublishDesk {
             upstream,
             bundle,
             root: desk.root,
-            waiting,
+            script,
+            key,
             state,
+        }
+    }
+
+    /// Restart the server over the same Postgres and storage, as a process
+    /// restart does, and reload the every-tool principal's state against it.
+    ///
+    /// # Panics
+    /// Panics when the server does not restart or the bundle does not load.
+    async fn restart(self) -> Self {
+        let deployment = self.deployment.restart(builder(&self.upstream)).await;
+        let state = WyrdState::from_path_with(
+            self.bundle.path().join("bundle"),
+            deployment.client(&self.key),
+        )
+        .expect("bundle loads offline");
+        Self {
+            deployment,
+            state,
+            ..self
         }
     }
 
@@ -579,6 +616,13 @@ impl PublishDesk {
             .await
             .expect("the execution handle connects")
     }
+}
+
+/// A verification-capable server whose gateway deploys on `upstream`.
+fn builder(upstream: &MockServer) -> wyrd_testing::server::WyrdTestServerBuilder {
+    WyrdTestServer::builder()
+        .with_verification_runtime_for_test()
+        .with_gateway_provider_root_for_test(upstream.uri().parse().expect("upstream URL parses"))
 }
 
 /// The function names the model was offered in `request`, in offer order.
@@ -1215,7 +1259,7 @@ async fn tool_calls_recheck_permissions_and_revocation() {
     else {
         panic!("Run evidence queues an execution");
     };
-    desk.waiting.notified().await;
+    desk.script.waiting.notified().await;
     let execution = Execution::connect_with(*queued.id(), &desk.deployment.admin())
         .await
         .expect("the execution handle connects");
@@ -1348,5 +1392,81 @@ async fn tool_limits_release_capacity_and_preserve_provenance() {
         (plan.size_bytes, plan.sha256),
         (big().len() as u64, digest(big().as_bytes()))
     );
+    desk.deployment.shutdown().await;
+}
+
+/// A queued review takes the same tool and state path as a direct one, and
+/// its accepted publications survive a process restart: the drafter
+/// commits, the server restarts while the consumer waits on the model, and
+/// the interrupted call spends the consumer's first attempt, and its retry
+/// reads exactly the accepted content from the restored state without the
+/// drafter running again.
+///
+/// # Panics
+/// Panics when the submission, restart, or recovery fails, or the drafter
+/// runs again, or a read or publication differs.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires the repository-managed Postgres journey lifecycle"]
+async fn publications_follow_shared_run_state() {
+    let desk = PublishDesk::start().await;
+    let Submission::Queued(queued) = desk
+        .state
+        .run()
+        .observe()
+        .submit("report-pipeline", json!("RESTART-RUN"))
+        .await
+        .expect("the review is submitted")
+    else {
+        panic!("Run evidence queues an execution");
+    };
+    let id = *queued.id();
+    desk.script.waiting.notified().await;
+    let drafted = desk.requests("DRAFT: ").await.len();
+    desk.deployment
+        .server()
+        .flush_bifrost()
+        .await
+        .expect("Bifrost flushes");
+
+    let desk = desk.restart().await;
+    let server = desk.deployment.server();
+    wyrd_testing::verification::VerificationFixture::provision(
+        server.state(),
+        server.data_tenant_id(),
+    )
+    .await
+    .expect("the tenant provisions")
+    .expire_deadlines(id)
+    .await
+    .expect("the stopped process's lease expires");
+    let result = Execution::connect_with(id, &desk.deployment.admin())
+        .await
+        .expect("the execution handle connects")
+        .wait(Duration::from_secs(90))
+        .await
+        .expect("the recovered execution settles");
+
+    assert_eq!(
+        requirement(&result, "consumed").outcome,
+        wyrd_ai::RequirementOutcome::Passed,
+        "{result:?}"
+    );
+    assert_eq!(
+        desk.requests("DRAFT: ").await.len(),
+        drafted,
+        "the committed drafter never runs again"
+    );
+    assert_eq!(step(&result, "consume").attempts, 2);
+    let consumer = desk.results("CONSUME:").await;
+    assert_eq!(lines(&consumer["c-report"]), REPORT.trim_end());
+    assert_eq!(lines(&consumer["c-nothing"]), "null");
+    let mut names: Vec<String> = desk
+        .publications(&result)
+        .await
+        .into_iter()
+        .map(|publication| publication.name.as_str().to_owned())
+        .collect();
+    names.sort();
+    assert_eq!(names, ["assessment", "nothing", "report", "tree"]);
     desk.deployment.shutdown().await;
 }

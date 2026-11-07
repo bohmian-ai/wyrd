@@ -486,11 +486,18 @@ at any depth before rows leave the scan.
   stratum's sampled non-null values hold it with one compatible type. The seed
   is the claim, so a re-run claim writes the same objects. Each element of a
   Variant inside a List counts as one observation, and one layout covers every
-  element. The sample holds counters, never rows. The sample and the claim
-  merge read complete values — typed leaves plus residual reconstructed by the
+  element. The sample holds counters, never rows. The sample reconstructs
+  only the selected observations — typed leaves plus residual, through the
   recursive `unshred_variants` — so a key a staged run kept only in its
-  residual stays discoverable; runs of different layouts merge only after
-  their footers name the claim's logical schema and tenant.
+  residual stays discoverable. Runs of different layouts merge only after
+  their footers name the claim's logical schema and tenant; a run already in
+  the claim's physical layout passes through without a Variant round trip,
+  and only an incompatible run is reconstructed and reshredded. The sample,
+  the merge, and the writer decode in byte-shaped batches whose workspace —
+  decoded width from the footer's unencoded payload bytes plus fixed leaf
+  widths, tripled while a run converts — is reserved on the Scribe governed
+  root before it is decoded, so a claim that does not fit fails `IngestBusy`
+  instead of exceeding the root.
 - **Learned layouts.** A successful claim assembly installs its layout in a
   process-local advisory cache keyed by exact tenant, table, and table
   version, in completion order; entries are bounded in count and charged to

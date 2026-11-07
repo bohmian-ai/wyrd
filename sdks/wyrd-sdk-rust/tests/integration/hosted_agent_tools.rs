@@ -933,3 +933,84 @@ async fn agent_publish_retries_use_host_identity() {
     );
     desk.deployment.shutdown().await;
 }
+
+/// Every refused selection is refused at registration with the loader's
+/// stable code and its `agent_tools` diagnostic, before any model call: an unknown tool, the
+/// provider-facing spelling of a built-in, a repeated tool, and `publish` on
+/// a requirement check's Agent. The selected built-ins keep their dotted
+/// wire identity in the step's records and reach the model only under
+/// their provider-facing names.
+///
+/// # Panics
+/// Panics when a refused selection registers, its refusal differs, a model
+/// call is made for it, or a selected tool's identity differs.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires the repository-managed Postgres journey lifecycle"]
+async fn selected_hosted_tools_resolve_before_model_calls() {
+    let desk = PublishDesk::start().await;
+    let cards = desk.deployment.cards().await;
+
+    for (name, unknown) in [
+        ("unknown-tool", "http.fetch is not a built-in tool"),
+        ("provider-spelling", "fs_write is not a built-in tool"),
+        ("duplicate-tool", "publish is selected more than once"),
+        (
+            "check-publishes",
+            "publish is available only to step Agents",
+        ),
+    ] {
+        let refused = cards
+            .declare_from_path(crate::support::fixture(&format!(
+                "cards/hosted_agent_tools/invalid/{name}.yaml"
+            )))
+            .await
+            .expect_err("the selection is refused");
+        assert_eq!(
+            refused.code(),
+            "WYRD_LOADER_400_INVALID_ENVELOPE",
+            "{name}: {refused}"
+        );
+        let problem = format!("{refused:?}");
+        assert!(problem.contains("agent_tools"), "{name}: {problem}");
+        assert!(problem.contains(unknown), "{name}: {problem}");
+    }
+    assert!(
+        desk.requests("NEVER CALLED").await.is_empty(),
+        "no refused selection reached the model"
+    );
+
+    let result = desk.verify("report-pipeline", "FULL-RUN").await;
+    let mut tools: Vec<Value> = step(&result, "draft")
+        .tool_calls
+        .iter()
+        .map(|call| serde_json::to_value(call.tool).expect("the tool serializes"))
+        .collect();
+    tools.sort_by_key(Value::to_string);
+    tools.dedup();
+    assert_eq!(
+        tools,
+        [
+            json!("code.run"),
+            json!("fs.read"),
+            json!("fs.write"),
+            json!("publish")
+        ]
+    );
+    let called: Vec<String> = desk
+        .requests("DRAFT:")
+        .await
+        .iter()
+        .flat_map(|request| {
+            messages(request)
+                .into_iter()
+                .filter_map(|message| message["tool_calls"].as_array().cloned())
+                .flatten()
+                .filter_map(|call| call["function"]["name"].as_str().map(str::to_owned))
+        })
+        .collect();
+    assert!(
+        called.iter().all(|name| !name.contains('.')),
+        "the model sees provider-facing names only: {called:?}"
+    );
+    desk.deployment.shutdown().await;
+}

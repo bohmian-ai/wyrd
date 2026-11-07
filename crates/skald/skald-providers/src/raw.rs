@@ -8,12 +8,20 @@ use crate::retry::RetryPolicy;
 use crate::transport::HttpTransport;
 
 /// Sends a raw JSON body without reserializing it and returns raw JSON response.
+///
+/// The body's allocation moves into the request and backs every exchange,
+/// retries included; the answer text becomes the returned value.
+///
+/// # Errors
+///
+/// Returns the errors of [`super::clients::send_bytes_with_retry`], or
+/// [`ProviderError::Decode`] when the answer is not JSON.
 pub async fn send_raw(
     transport: &HttpTransport,
     provider: &str,
     url: &str,
     mut headers: HeaderMap,
-    body: &RawValue,
+    body: Box<RawValue>,
     retry: &RetryPolicy,
 ) -> ProviderResult<Box<RawValue>> {
     headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
@@ -23,12 +31,17 @@ pub async fn send_raw(
         reqwest::Method::POST,
         url,
         headers,
-        body.get().as_bytes().to_vec(),
+        body_bytes(body),
         retry,
     )
     .await?;
 
     RawValue::from_string(text).map_err(|error| ProviderError::decode(provider, error))
+}
+
+/// Bytes of a raw JSON `body`, keeping its allocation.
+pub(crate) fn body_bytes(body: Box<RawValue>) -> Vec<u8> {
+    Box::<str>::from(body).into_string().into_bytes()
 }
 
 #[cfg(test)]

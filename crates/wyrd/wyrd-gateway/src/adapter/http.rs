@@ -361,16 +361,16 @@ impl Client {
         };
         let response = match (self, prepared) {
             (Self::OpenAi(client), Prepared::Native(body)) => {
-                ProviderResponse::RawV1(client.send_raw(route(operation)?, &raw(&body)?).await?)
+                ProviderResponse::RawV1(client.send_raw(route(operation)?, raw(&body)?).await?)
             }
             (Self::Anthropic(client), Prepared::Native(body)) => {
-                ProviderResponse::RawV1(client.send_raw(&raw(&body)?).await?)
+                ProviderResponse::RawV1(client.send_raw(raw(&body)?).await?)
             }
             (Self::Google(client), Prepared::Native(body)) => {
-                ProviderResponse::RawV1(client.send_raw(&raw(&body)?).await?)
+                ProviderResponse::RawV1(client.send_raw(raw(&body)?).await?)
             }
             (Self::Vertex(client), Prepared::Native(body)) => {
-                ProviderResponse::RawV1(client.send_raw(&raw(&body)?).await?)
+                ProviderResponse::RawV1(client.send_raw(raw(&body)?).await?)
             }
             (Self::Anthropic(client), Prepared::Anthropic(request)) => {
                 client

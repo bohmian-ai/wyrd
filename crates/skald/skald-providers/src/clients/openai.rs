@@ -290,7 +290,7 @@ impl OpenAiClient {
     pub async fn send_raw(
         &self,
         route: OpenAiRoute,
-        body: &RawValue,
+        body: Box<RawValue>,
     ) -> ProviderResult<Box<RawValue>> {
         raw::send_raw(
             &self.transport,
@@ -500,7 +500,7 @@ impl OpenAiClient {
                     "openai",
                     &url,
                     self.auth.headers()?,
-                    &body,
+                    body,
                     &self.retry,
                 )
                 .await?;
@@ -799,7 +799,7 @@ mod openai_raw_route {
 
         let body = RawValue::from_string(request.to_owned()).expect("raw body");
         let response = common::openai_client(&server.uri())
-            .send_raw(OpenAiRoute::ChatCompletions, &body)
+            .send_raw(OpenAiRoute::ChatCompletions, body)
             .await
             .expect("raw route succeeds");
 

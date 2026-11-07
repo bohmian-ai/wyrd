@@ -72,7 +72,7 @@ impl AnthropicClient {
     /// headers are invalid, and [`ProviderError::Connect`],
     /// [`ProviderError::Timeout`], or [`ProviderError::Upstream`] when the
     /// exchange fails.
-    pub async fn send_raw(&self, body: &RawValue) -> ProviderResult<Box<RawValue>> {
+    pub async fn send_raw(&self, body: Box<RawValue>) -> ProviderResult<Box<RawValue>> {
         raw::send_raw(
             &self.transport,
             "anthropic",
@@ -130,7 +130,7 @@ impl AnthropicClient {
                     "anthropic",
                     &url,
                     self.auth.headers()?,
-                    &body,
+                    body,
                     &self.retry,
                 )
                 .await?;

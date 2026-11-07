@@ -66,7 +66,7 @@ impl VertexClient {
     /// headers are invalid, and [`ProviderError::Connect`],
     /// [`ProviderError::Timeout`], or [`ProviderError::Upstream`] when the
     /// exchange fails.
-    pub async fn send_raw(&self, body: &RawValue) -> ProviderResult<Box<RawValue>> {
+    pub async fn send_raw(&self, body: Box<RawValue>) -> ProviderResult<Box<RawValue>> {
         raw::send_raw(
             &self.transport,
             "vertex",
@@ -141,7 +141,7 @@ impl VertexClient {
                     "vertex",
                     &url,
                     self.auth.headers().await?,
-                    &body,
+                    body,
                     &self.retry,
                 )
                 .await?;

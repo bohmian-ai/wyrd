@@ -33,6 +33,10 @@ use crate::transport::HttpTransport;
 /// bound before its status is inspected, so neither a success nor a refusal
 /// can buffer an unbounded body.
 ///
+/// `body` is owned by the request once: every exchange, retries included,
+/// sends the same immutable backing rather than a copy of it. A valid UTF-8
+/// answer becomes the returned text without copying.
+///
 /// Each HTTP exchange, retries included, is logged in the caller's
 /// [`crate::exchange::scope`] as ended once its body is read, before decode.
 ///
@@ -51,15 +55,19 @@ pub async fn send_bytes_with_retry(
     retry: &RetryPolicy,
 ) -> ProviderResult<String> {
     headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
+    let request = transport
+        .client()
+        .request(method, url)
+        .headers(headers)
+        .body(body)
+        .build()
+        .map_err(|error| map_reqwest_error(provider, error))?;
     let mut attempt = 0;
     loop {
         let mut exchange = ExchangeTimer::start();
         let response = transport
             .client()
-            .request(method.clone(), url)
-            .headers(headers.clone())
-            .body(body.clone())
-            .send()
+            .execute(attempt_request(&request))
             .await
             .map_err(|error| map_reqwest_error(provider, error))?;
         exchange.headers();
@@ -69,7 +77,7 @@ pub async fn send_bytes_with_retry(
         let bytes =
             read_bounded_bytes(provider, response, transport.config().max_response_bytes).await?;
         drop(exchange);
-        let text = String::from_utf8_lossy(&bytes).into_owned();
+        let text = answer_text(bytes);
 
         if status.is_success() {
             return Ok(text);
@@ -224,7 +232,27 @@ async fn read_bounded(
     limit: usize,
 ) -> ProviderResult<String> {
     let bytes = read_bounded_bytes(provider, response, limit).await?;
-    Ok(String::from_utf8_lossy(&bytes).into_owned())
+    Ok(answer_text(bytes))
+}
+
+/// Another handle on a buffered `request` for one exchange, sharing its
+/// immutable body backing.
+///
+/// # Panics
+///
+/// Panics when the body is streamed, which a request built from in-memory
+/// bytes by [`send_bytes_with_retry`] never is.
+fn attempt_request(request: &reqwest::Request) -> reqwest::Request {
+    request
+        .try_clone()
+        .expect("a request with an in-memory body is reusable")
+}
+
+/// Answer `bytes` as text: valid UTF-8 keeps its buffer, and invalid UTF-8 is
+/// replaced, as `reqwest::Response::text` does.
+fn answer_text(bytes: Vec<u8>) -> String {
+    String::from_utf8(bytes)
+        .unwrap_or_else(|error| String::from_utf8_lossy(error.as_bytes()).into_owned())
 }
 
 /// Reads an answer body unchanged, failing once it exceeds `limit` bytes.
@@ -479,5 +507,102 @@ mod bounded_answers {
                 retry_after_ms: None,
             }
         );
+    }
+
+    /// A native body is serialized once and its allocation backs the first
+    /// exchange and every retry, and a valid UTF-8 answer keeps its buffer as
+    /// text; invalid UTF-8 is replaced, refusals keep status and body, and an
+    /// oversized answer fails before its status is inspected.
+    #[tokio::test]
+    async fn native_transport_reuses_owned_buffers() {
+        let request = r#"{"model":"m","messages":[],"vendor":"é"}"#;
+        let body = serde_json::value::RawValue::from_string(request.to_owned()).expect("raw body");
+        let backing = body.get().as_ptr();
+        let bytes = crate::raw::body_bytes(body);
+        assert_eq!(bytes.as_ptr(), backing, "the raw body keeps its allocation");
+        let built = reqwest::Client::new()
+            .post("http://localhost/")
+            .body(bytes)
+            .build()
+            .expect("request builds");
+        for _ in 0..2 {
+            let attempt = super::attempt_request(&built);
+            let sent = attempt.body().and_then(reqwest::Body::as_bytes);
+            assert_eq!(sent.map(<[u8]>::as_ptr), Some(backing), "no body copy");
+        }
+        let valid = "{\"x\":\"é\"}".as_bytes().to_vec();
+        let answer = valid.as_ptr();
+        let text = super::answer_text(valid);
+        assert_eq!(text.as_ptr(), answer, "no text copy");
+        assert_eq!(super::answer_text(vec![b'a', 0xff]), "a\u{fffd}");
+
+        let ok = || ResponseTemplate::new(200);
+        let cases: [(_, Vec<_>, Result<Vec<u8>, _>); 4] = [
+            (
+                "retried",
+                vec![
+                    ResponseTemplate::new(500),
+                    ok().set_body_string("{\"id\":\"é\"}"),
+                ],
+                Ok("{\"id\":\"é\"}".into()),
+            ),
+            (
+                "invalid utf-8",
+                vec![ok().set_body_bytes(vec![b'"', 0xff, b'"'])],
+                Ok("\"\u{fffd}\"".into()),
+            ),
+            (
+                "refused",
+                vec![ResponseTemplate::new(418).set_body_string("{\"error\":\"teapot\"}")],
+                Err(ProviderError::Status {
+                    provider: "openai".to_owned(),
+                    status: 418,
+                    body: "{\"error\":\"teapot\"}".to_owned(),
+                    retry_after_ms: None,
+                }),
+            ),
+            (
+                "oversized refusal",
+                vec![ResponseTemplate::new(418).set_body_string("x".repeat(2048))],
+                Err(ProviderError::upstream(
+                    "openai",
+                    418,
+                    "response body exceeded 1024 bytes",
+                )),
+            ),
+        ];
+        for (name, answers, expected) in cases {
+            let server = MockServer::start().await;
+            let attempts = answers.len();
+            for answer in answers {
+                Mock::given(method("POST"))
+                    .respond_with(answer)
+                    .up_to_n_times(1)
+                    .mount(&server)
+                    .await;
+            }
+            let transport = HttpTransport::new(TransportConfig {
+                max_response_bytes: 1024,
+                ..TransportConfig::default()
+            })
+            .expect("transport builds");
+            let answer = super::send_bytes_with_retry(
+                &transport,
+                "openai",
+                reqwest::Method::POST,
+                &server.uri(),
+                reqwest::header::HeaderMap::new(),
+                request.as_bytes().to_vec(),
+                &common::retry_policy(),
+            )
+            .await
+            .map(String::into_bytes);
+            assert_eq!(answer, expected, "{name}");
+            let received = server.received_requests().await.expect("recorded");
+            assert_eq!(received.len(), attempts, "{name}");
+            for exchange in received {
+                assert_eq!(exchange.body, request.as_bytes(), "{name}: same body");
+            }
+        }
     }
 }

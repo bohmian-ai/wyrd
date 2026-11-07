@@ -75,7 +75,7 @@ impl GoogleClient {
     /// headers are invalid, and [`ProviderError::Connect`],
     /// [`ProviderError::Timeout`], or [`ProviderError::Upstream`] when the
     /// exchange fails.
-    pub async fn send_raw(&self, body: &RawValue) -> ProviderResult<Box<RawValue>> {
+    pub async fn send_raw(&self, body: Box<RawValue>) -> ProviderResult<Box<RawValue>> {
         raw::send_raw(
             &self.transport,
             "google",
@@ -144,7 +144,7 @@ impl GoogleClient {
                     "google",
                     &self.auth.url("/raw"),
                     self.auth.headers()?,
-                    &body,
+                    body,
                     &self.retry,
                 )
                 .await?;

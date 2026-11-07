@@ -3292,8 +3292,10 @@ mod pg_tests {
     /// `/work/report.md`, writes a tree holding a nested Unicode, spaced file
     /// and an empty directory, then publishes the report, the tree, a JSON
     /// assessment, and an explicit `null` in one turn; its first turn also
-    /// writes `/inputs`, which the workspace refuses. Every other turn, and
-    /// the consumer, finishes with `{"done": true}`.
+    /// writes `/inputs`, which the workspace refuses. The `tool-review`
+    /// investigator's first turn reads `publish-desk`'s Card and queries
+    /// Bifrost. Every other turn, and the consumer, finishes with
+    /// `{"done": true}`.
     fn publish_desk(request: &wiremock::Request) -> wiremock::ResponseTemplate {
         let body: JsonValue = serde_json::from_slice(&request.body).unwrap_or_default();
         let messages = body["messages"].as_array().cloned().unwrap_or_default();
@@ -3314,7 +3316,29 @@ mod pg_tests {
         };
         let write =
             |path: &str, content: &str| serde_json::json!({ "path": path, "content": content });
+        let investigating = messages.iter().any(|message| {
+            message["content"]
+                .as_str()
+                .is_some_and(|text| text.contains("INVESTIGATE:"))
+        });
         let calls = match (drafting, turn) {
+            (false, 0) if investigating => vec![
+                call(
+                    "i-card",
+                    "cards.get",
+                    serde_json::json!({ "card_ref": {
+                        "kind": "Service", "name": "publish-desk", "version": "1.0.0",
+                    } }),
+                ),
+                call(
+                    "i-query",
+                    "bifrost.query",
+                    serde_json::json!({
+                        "sql": "SELECT execution_id FROM bifrost.verification.results LIMIT 1",
+                        "max_rows": 1,
+                    }),
+                ),
+            ],
             (true, 0) => vec![
                 call("w1", "fs.write", write("/work/report.md", "draft v1")),
                 call(
@@ -3411,7 +3435,10 @@ mod pg_tests {
     /// refused by the workspace and returns nothing. An unpublished name
     /// answers the stable not-found code. A Service granted no tool runs
     /// the same review with every drafter call denied, returning nothing and
-    /// publishing nothing. Each invalid tool selection is refused at
+    /// publishing nothing. A Service granted every tool but not
+    /// `bifrost_query:read` runs `tool-review`: its investigator reads the
+    /// Card, and its `bifrost.query` is denied and returns nothing. Each
+    /// invalid tool selection is refused at
     /// registration and never reaches the model, and a caller holding only
     /// `cards:read` is denied the publication.
     ///
@@ -3664,6 +3691,74 @@ mod pg_tests {
         )?)?;
         assert!(page.items.is_empty(), "denied calls publish nothing");
         narrowed.cancel().await?;
+
+        let review = Box::pin(cards.declare_from_path(Path::new(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../../fixtures/cards/verifier_building_blocks/tool-review.yaml"
+        ))))
+        .await?
+        .root
+        .uid
+        .ok_or("a registered Card has a UID")?
+        .to_string();
+        server
+            .seed_role(
+                "mcp_desk_no_query",
+                &[
+                    Permission::card_read(),
+                    Permission::verifier_read_any(),
+                    Permission::verifier_run_any(),
+                    Permission::tool_invoke_any(),
+                ],
+            )
+            .await?;
+        let unqueried = server
+            .bootstrap_service(
+                "mcp-desk-no-query",
+                &["mcp_desk_no_query", "mcp_desk_invoker"],
+            )
+            .await?;
+        let unqueried = connect(&server, &unqueried).await?;
+        let accepted = structured(
+            unqueried
+                .call_tool(call(
+                    ENQUEUE,
+                    serde_json::json!({
+                        "verifier_card_uid": review,
+                        "card_uid": desk_uid,
+                        "inputs": { "question": { "kind": "json", "value": "NO-QUERY-RUN" } },
+                    }),
+                )?)
+                .await?,
+        )?;
+        let state = settle(&unqueried, text(&accepted, "/execution_id")?).await?;
+        let investigated: Vec<(String, bool, bool, bool)> = state["result"]["outcome"]["steps"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .flat_map(|step| step["tool_calls"].as_array().cloned().unwrap_or_default())
+            .map(|call| {
+                (
+                    call["tool"].as_str().unwrap_or_default().to_owned(),
+                    call["error"]
+                        .as_str()
+                        .is_some_and(|error| error.contains(DENIED)),
+                    call["returned_bytes"]
+                        .as_u64()
+                        .is_some_and(|bytes| bytes > 0),
+                    call.get("output_sha256").is_some(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            investigated,
+            [
+                ("cards.get".to_owned(), false, true, true),
+                ("bifrost.query".to_owned(), true, false, false),
+            ],
+            "an invoked tool its domain grant refuses returns nothing: {state}"
+        );
+        unqueried.cancel().await?;
 
         for (name, reason) in [
             ("unknown-tool", "http.fetch is not a built-in tool"),

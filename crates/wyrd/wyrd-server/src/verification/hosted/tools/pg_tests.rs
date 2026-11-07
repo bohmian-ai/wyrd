@@ -5,6 +5,8 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
 
 use skald_spec::MediaFormat;
+use wyrd_runtime::{DelegationStep, PrincipalRef};
+use wyrd_spec::auth::PrincipalId;
 use wyrd_spec::ids::{CardUid, SlotName};
 use wyrd_spec::verification::TaskId;
 
@@ -329,9 +331,10 @@ fn execution(state: &AppState, caller: &Caller, verifier: &CardUid) -> Arc<RunSt
 }
 
 /// A `/work` file publication is a File operation of the receiving
-/// boundary: a caller holding `verifier:run` on exactly its Verifier stages
-/// one `tool:invoke` and one File decision, both allowed and both for the
-/// same principal and request, and a replay with the scratch gone returns
+/// boundary: a delegated caller, executed by another actor, holding
+/// `verifier:run` on exactly its Verifier stages one `tool:invoke` and one
+/// File decision, both allowed and both with the caller's request, subject,
+/// actor, and delegation, and a replay with the scratch gone returns
 /// the original receipt. A JSON value creates no File and stages only its
 /// tool decision. A caller holding only the `publish` grant is denied at the
 /// File decision before any File work, so a missing path answers the denial.
@@ -367,7 +370,22 @@ fn file_publications_decide_their_file_permission() {
                 .into_iter()
                 .filter(|row| row.request_id == caller.request_id.as_str())
                 .map(|row| {
-                    assert_eq!(row.sub_principal_id, caller.principal.id.as_uuid());
+                    let attribution = caller.attribution();
+                    assert_eq!(
+                        (row.sub_principal_id, row.act_principal_id),
+                        (
+                            attribution.sub_principal_id.as_uuid(),
+                            attribution.act_principal_id.as_uuid()
+                        ),
+                        "{} keeps the caller's subject and actor",
+                        row.operation
+                    );
+                    assert_eq!(
+                        row.detail.is_some(),
+                        !caller.delegation_chain.is_empty(),
+                        "{} keeps the caller's delegation",
+                        row.operation
+                    );
                     (row.operation, row.resource, row.permission, row.outcome)
                 })
                 .collect::<Vec<_>>()
@@ -397,10 +415,17 @@ fn file_publications_decide_their_file_permission() {
             )
         };
 
-        let granted = caller([
-            Permission::tool_invoke_any(),
-            Permission::verifier_run(verifier.clone()),
-        ]);
+        let delegator = caller([]).principal;
+        let granted = Caller {
+            delegation_chain: vec![DelegationStep {
+                principal: PrincipalRef::from_principal(&delegator),
+            }],
+            executed_by: Some(PrincipalId::new(uuid::Uuid::now_v7())),
+            ..caller([
+                Permission::tool_invoke_any(),
+                Permission::verifier_run(verifier.clone()),
+            ])
+        };
         let publisher = publishing(granted.clone()).await;
         publisher
             .call(

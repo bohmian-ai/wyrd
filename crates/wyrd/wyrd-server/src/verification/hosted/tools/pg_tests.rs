@@ -8,6 +8,7 @@ use skald_spec::MediaFormat;
 use wyrd_runtime::{DelegationStep, PrincipalRef};
 use wyrd_spec::auth::PrincipalId;
 use wyrd_spec::ids::{CardUid, SlotName};
+use wyrd_spec::vala::api::AuditDetail;
 use wyrd_spec::verification::TaskId;
 
 use super::super::workspace::Staged;
@@ -380,9 +381,16 @@ fn file_publications_decide_their_file_permission() {
                         "{} keeps the caller's subject and actor",
                         row.operation
                     );
+                    let delegation = (!caller.delegation_chain.is_empty()).then(|| {
+                        serde_json::to_value(AuditDetail::DelegationAttribution {
+                            delegation_chain: wyrd_runtime::audit_delegation_chain(
+                                &caller.delegation_chain,
+                            ),
+                        })
+                        .expect("the delegation detail serializes")
+                    });
                     assert_eq!(
-                        row.detail.is_some(),
-                        !caller.delegation_chain.is_empty(),
+                        row.detail, delegation,
                         "{} keeps the caller's delegation",
                         row.operation
                     );

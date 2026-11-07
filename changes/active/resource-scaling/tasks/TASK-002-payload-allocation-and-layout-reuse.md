@@ -428,3 +428,158 @@ equivalent selectors and fixture geometry remain implementation decisions.
 - [Wyrd protocol](../../../../architecture/wyrd-design.md)
 - [Security posture](../../../../architecture/wyrd-security-posture.md)
 - [Benchmark method](../../../../benchmarks/README.md)
+
+## Execution Evidence
+
+Candidate commits on `change/resource-scaling` after allocation baseline
+`1a0699e42` (fixed revision-3 geometry): `b75caaf98` (integrate
+`variant-file-reads` at `5f92c71f3`; textual merge clean, no file touched by both
+sides, excluded dirty path `changes/active/gateway-latency-capture/`),
+`3b19e120f`, `07a9b08c1`, `3f077efa2`, `8c3e75fca`, `1f8ef0983`, `90058fcbb`,
+`603d6050c`, `f8dda554d`, `05e2e4264`. Fork pins: `bohmian-ai/iceberg-rust`
+`wyrd-production` `2902554d1` ("Sample shredded Variant input by reconstructing
+only the chosen values"; fork RED `shredded_input_samples_like_its_logical_values`
+panics on composite `typed_value` without it) and
+`bohmian-ai/iceberg-compaction` `wyrd-production` `ab3da17ae` (resolves iceberg at
+that revision). AC-003 baseline main `5234961d5`.
+
+| Acceptance criterion | Implementation evidence | Verification evidence | Result |
+|---|---|---|---|
+| REQ-007/INV-007/AC-006 imported reads | `b75caaf98` integration; source-local leaf reads unchanged | `mise run test:bifrost:integration:redux` 1002/1002 with Postgres; imported journeys compiled in `wyrd-testing`; L1 `hot`/`parquet` below | PASS (correctness); performance see below |
+| REQ-008/INV-005/AC-007 sample | `claim_sample.rs` reconstructs only chosen observations through fork `VariantSampler` values; seed, strata, thresholds unchanged | `scribe::parquet_writer::tests::claim_sampling_reconstructs_only_selected_observations`; RED with whole-batch reconstruction restored: "reconstruct a staged run for Variant sampling … 1-byte buffer" | PASS |
+| REQ-009/INV-006/AC-007 layout reuse | `claim_merge.rs` `RunCursor.converts`/`physical_batch` passes matching runs through, converts only differing runs after `verify_layout_footer`; `parquet_writer.rs` `VariantPlan::Final { layout, logical }` | `matching_layouts_publish_without_variant_roundtrip` (RED: forcing every cursor to convert fails "matching runs are not converted"); `mixed_staged_layouts_preserve_values_and_fresh_discovery`, `rerun_claim_writes_byte_identical_objects`, `recovery_runs_are_unshredded_and_the_claim_sample_shreds` | PASS |
+| REQ-011/INV-006/AC-009 byte bounds | `resources.rs` `ScribeMemoryLease::resize_maintenance`; `claim_merge.rs` `shaped_batch_rows`, `MERGE_BATCH_BYTES`, per-cursor lease; `claim_sample.rs` leased scan; `RollingArtifactWriter.buffered` lease | `scribe::parquet_writer::tests::claim_conversion_overlap_stays_within_reserved_bytes` (40 MiB root fits 2×320×64 KiB claim, 36 MiB held fails `IngestBusy` and releases, two concurrent claims on 80 MiB succeed and return to baseline); RED: row-count geometry fails "a byte-shaped claim fits its reservation: IngestBusy" | PASS |
+| REQ-010/INV-008/AC-008 request | `adapter/mod.rs` `NativeBody<'a>`, `prepare<'a>`, `Prepared<'a>`; typed requests deserialize from `&Value` | `adapter::tests::request_preparation_avoids_duplicate_body_materialization` (RED: clone in `native()` fails "preparation borrows the caller's body"); `cargo nextest run -p wyrd-gateway --lib` 67/67 | PASS |
+| REQ-010/INV-008/AC-008 capture | `wyrd-queue` `EncodedVariant::into_column`; `capture.rs` `ArrayRef` payloads, `NULL_PAYLOAD`, `concat`; `without_secret` in place, `encodes_secret` length guard | `capture::tests::capture_columns_avoid_intermediate_payload_copies` (RED: `VariantColumnBuilder` copy fails the shared-buffer assertion); `adapter::tests::capture_scrubbing_rebuilds_only_secret_holding_content` (RED: always-replace fails "secret-free content keeps its allocation"); capture lane 11/11 incl. `payload_capture_redacts_secrets_and_references_binary_content` | PASS |
+| REQ-010/REQ-011 lifecycle journey | `tests/bifrost/scribe/write_read.rs` | `write_read::learned_layout_evolution_preserves_published_evidence` (learned publish, learned staging, restart, cold changed distribution from a second writer, mixed claim, restart; exact ordered readback at every stage, `a` shredded in every object, selective `v->>'a'` reads, per-writer `sub_principal_id`, second tenant reads nothing); gateway `compatible::openai_compatible_streams_terminate_and_survive_a_capture_outage` | PASS |
+| Bifrost owner | `architecture/bifrost-design.md` Scribe sampling/merge paragraph | `mise run docs:check` | PASS |
+
+Commands:
+
+```sh
+mise exec -- scripts/postgres/with-test-postgres.sh -- bash -lc 'mise run db:migrate:inner && cargo nextest run --locked -p wyrd-testing --test scribe -P journey --run-ignored=all -E "test(=write_read::learned_layout_evolution_preserves_published_evidence)"'
+mise exec -- scripts/postgres/with-test-postgres.sh -- bash -lc 'mise run db:migrate:all:inner && WYRD_TEST_GATEWAY_PROVIDER_KEY=sk-native-upstream cargo nextest run --locked -p wyrd-testing --test gateway -P journey --run-ignored=all -E "test(=compatible::openai_compatible_streams_terminate_and_survive_a_capture_outage)"'
+mise run test:bifrost:integration:redux
+mise exec -- cargo nextest run --locked -p wyrd-gateway --lib
+mise exec -- cargo nextest run --locked -p wyrd-server --lib -E 'test(/^components::gateway::capture::tests::/)'
+```
+
+Checks: `mise run fmt:check`, `mise run lints`, `mise run check:deps`,
+`mise run check:tenant-isolation`, `git diff --check` pass.
+
+Diagnoses:
+
+- **Symptom** the byte-bounds test failed `IngestBusy` with shaping on.
+  **Evidence** footer `uncompressed_size` gave 211 B/row for repeated 64 KiB
+  payloads. **Cause** dictionary encoding shrinks encoded pages; the decoded
+  width is the unencoded byte-array payload. **Fix site** `shaped_batch_rows`
+  uses `unencoded_byte_array_data_bytes` plus fixed leaf widths, rows clamped to
+  the file's row count.
+- **Symptom** `scribe::staging_runtime::pg_tests::a_claim_stranded_in_publishing_publishes_after_restart`
+  failed "promotion evidence contradicts the published object". **Evidence**
+  attempt 1 sealed 972 B, the resumed attempt 1472 B; the resumed object's
+  `ARROW:schema` carried the staged run's `wyrd.bifrost.{object_identity,schema_fingerprint,tenant}`;
+  bisect: passes at `3b19e120f`, fails at `07a9b08c1`. **Cause** `restore_context`
+  rebuilds the claim schema from a run footer, whose key-value metadata the
+  Parquet reader folds into the Arrow schema; since final objects seal under the
+  claim's logical schema, a resumed claim wrote different bytes. **Fix site**
+  `ScribeStagingRuntime::restore_context` drops the run writer's footer identity
+  keys (`f8dda554d`); the live context path has none. Redux lane 1002/1002.
+- Earlier non-Postgres lib runs failed only Postgres fixtures with
+  `WYRD_TEST_DATABASE_ADMIN_URL` unset; the Postgres lane passes them.
+
+Non-goals: no new public setting, wire or persisted format, dependency, feature,
+cache, allocator, pool, outbox geometry or batching change, capture admission
+redesign or Forge change; `changes/active/gateway-latency-capture/` untouched.
+Response media capture still clones the answer bytes (changing it needs a Skald
+signature change); translated (Anthropic/Google/Jev) bodies are still built at
+both planning and dispatch.
+
+### Performance
+
+Same host (32 vCPU Linux x86_64), sequential quiet-host runs, `--allow-dirty`
+records under `benchmarks/history/` (unprofiled) and `target/benchmarks/`
+(`--profile`, `--steps`). Candidate `05e2e4264`, allocation baseline
+`1a0699e42`, main `5234961d5`. Every run VALID, zero errors/lost/shed/undrained.
+
+**AC-010, unprofiled L1 `buffered-64kib-capture-payload.c64`** (median vs
+baseline min–max):
+
+| Metric | Candidate | Baseline `1a0699e42` | Main |
+|---|---|---|---|
+| peak RSS | 4587 MiB | 7357–9944 MiB | 7471–7783 MiB |
+| server CPU per call | 1841 µs | 2218–2575 µs | 2201–2254 µs |
+| rate | 5616 req/s | 4174–4857 req/s | 4809–4979 req/s |
+| server p99 | 112.6 ms | 143.4–192.2 ms | 156.1–167.8 ms |
+
+The c1 payload step matches: RSS 2510 vs 4315–4714 MiB, CPU 724 vs 832–1090 µs.
+
+**AC-010, paired `--profile` heap `alloc_space`** (step delta divided by the
+step's reconciled calls; warmup allocations are in both numerators):
+
+| Step | Candidate | Baseline | Δ |
+|---|---|---|---|
+| buffered-64kib-capture-payload.c64 | 4361 KiB/call | 6223 KiB/call | −29.9% |
+| buffered-64kib-capture-payload.c1 | 4272 KiB/call | 5842 KiB/call | −26.9% |
+| buffered-64kib-capture-metadata.c64 | 1814 KiB/call | 2014 KiB/call | −9.9% |
+| buffered-1kib-capture-metadata.c64 | 285 KiB/call | 296 KiB/call | −3.5% |
+
+Attribution at payload c64: the request-body `clone` frame (12.6 GiB in the
+baseline) is gone; Arrow binary `append_slice` falls 127.6 → 79.8 GiB,
+`with_capacity<GenericBinaryType>` 32.7 → 13.2 GiB, Variant `build`
+43.2 → 25.3 GiB. Remaining costs are WAL IPC encode, zstd, Parquet/Variant
+encode and serde serialization. The streamed 1 KiB c1 and c64 profile deltas
+move between adjacent steps (cumulative profile: c1 −64%, c64 +41%, about
++2% combined over equal calls). Limits: the heap profiler samples per step,
+not per repetition, so the allocation comparison is one paired aggregate
+rather than a median against the baseline minimum repetition. The samply CPU
+captures failed on this host (`perf_event_paranoid` > 1), so CPU attribution
+is missing.
+
+**AC-003 vs main** (all steps, three repetitions). Out-of-range medians in the
+worse direction on the first run: `buffered-1kib-capture-metadata.c1`
+(rate, CPU), `streamed-1kib-capture-metadata.c1` (rate),
+`buffered-64kib-capture-metadata.c1` (rate, CPU, RSS, p99). After the fresh
+back-to-back pair:
+
+- streamed c1 clears.
+- buffered 1 KiB c1 falls outside again: rate 5706 vs 5787–5879, CPU 218.3
+  vs 209.5–214.2 µs.
+- buffered 64 KiB metadata c1 is outside on p99 only: 0.309 vs
+  0.288–0.294 ms.
+
+Two further interleaved buffered 1 KiB c1 pairs disagree in direction:
+
+| Pair | Candidate rate | Main rate range |
+|---|---|---|
+| A | 5776 | 5846–5927 |
+| B | 5907 | 5676–5851 |
+
+Commit `3f077efa2` swings the same way (5663 and 5869), so the gap follows
+host variation rather than a commit. The 64 KiB metadata c1 p99 gap is already
+present at baseline `1a0699e42` (0.332 vs main 0.284–0.308 ms), so it predates
+TASK-002. By AC-003's rule both c1 steps are recorded as **FAIL**. Every c64
+step is in range or better than main.
+
+**AC-006 imported reads, L1 `hot`/`parquet` vs `1a0699e42`** (p50 median vs
+baseline range):
+
+- **Gains on hot covered paths:**
+  - span-shredded staged 16.8 vs 85.3–85.5 ms;
+  - span-shredded memtable 22.0 vs 30.7–30.9 ms;
+  - span-long-tail staged 38.0 vs 55.5–55.8 ms;
+  - point memtable c64 1.82 vs 2.02–2.05 ms.
+- **Hot regression:** span-long-tail memtable is slower, 26.7 vs 20.2–20.5 ms
+  (rate 36.6 vs 47.4–47.8).
+- **Parquet tier:** within about ±5%. span-shredded c1 is 15.4 vs
+  14.5–14.6 ms, and span-trace c64 is 13.4 vs 12.8–13.0 ms.
+
+The memtable long-tail filter is a residual/fallback read with no speedup
+promise. It reads exactly but slower, and it comes from the imported
+live-read integration, outside this task's write-path owners.
+
+| Acceptance criterion | Result |
+|---|---|
+| AC-010 peak RSS and allocation at payload c64 | PASS on RSS (median below baseline minimum); allocation −29.9% paired aggregate; per-repetition allocation and CPU attribution unavailable |
+| AC-003 L1 non-regression vs main | FAIL by rule on `buffered-1kib-capture-metadata.c1` (unstable across pairs) and `buffered-64kib-capture-metadata.c1` p99 (predates TASK-002) |
+| AC-006 imported performance | PASS for covered memtable/staged paths; memtable long-tail fallback 30% slower, reported |

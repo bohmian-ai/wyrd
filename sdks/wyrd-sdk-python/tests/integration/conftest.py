@@ -28,10 +28,12 @@ from wyrd.testing import WyrdTestServer
 
 from .gateway.support import PROVIDER_KEY, Upstream
 from .support import (
+    ASSESSMENT,
     BASELINE_TIMEOUT_SECONDS,
     FRAME_CLAIM,
     LIVE_REVIEW,
     ON_CALL_TOKEN,
+    REPORT,
     UNBADGED_BASE64,
     Delivery,
     QueryRow,
@@ -42,9 +44,11 @@ from .support import (
     declare,
     hydrated,
     pull,
+    read_text,
     reset_telemetry_providers,
     service_key,
     shut_down_telemetry_providers,
+    tool_results,
 )
 from .test_local_development import configure_gateway
 
@@ -274,6 +278,98 @@ def probe_turn(messages: list[dict]) -> dict:
     return {"role": "assistant", "content": json.dumps({"done": True, "results": results})}
 
 
+def calls(*script: tuple[str, str, object]) -> dict:
+    """An assistant turn calling each ``(id, tool, arguments)`` at once."""
+    return {
+        "role": "assistant",
+        "content": None,
+        "tool_calls": [
+            {
+                "id": id,
+                "type": "function",
+                "function": {"name": tool.replace(".", "_"), "arguments": json.dumps(arguments)},
+            }
+            for id, tool, arguments in script
+        ],
+    }
+
+
+DONE = {"role": "assistant", "content": '{"done":true}'}
+"""A ``report-pipeline`` Agent's final answer."""
+
+
+def drafter_turn(messages: list[dict]) -> dict:
+    """The ``report-pipeline`` drafter's next turn.
+
+    It writes the report twice, writes a tree with a nested Unicode, spaced
+    filename and an empty directory, publishes the report, the tree, the
+    ``ASSESSMENT``, and an explicit ``null``, then mutates its scratch and
+    tries every refused publication and write before it finishes.
+    """
+    turn = sum(1 for each in messages if each.get("role") == "assistant")
+    if turn == 0:
+        return calls(("w1", "fs.write", {"path": "/work/report.md", "content": "draft v1"}))
+    if turn == 1:
+        return calls(
+            ("w2", "fs.write", {"path": "/work/report.md", "content": REPORT}),
+            ("w3", "fs.write", {"path": "/work/tree/a.md", "content": "alpha"}),
+            ("w4", "fs.write", {"path": "/work/tree/nested dir/é b.md", "content": "beta"}),
+            ("w5", "code.run", {"source": "import os\nos.makedirs('/work/tree/empty')"}),
+        )
+    if turn == 2:
+        return calls(
+            ("r1", "fs.read", {"path": "/work/report.md"}),
+            ("p-report", "publish", {"name": "report", "path": "/work/report.md"}),
+            ("p-tree", "publish", {"name": "tree", "path": "/work/tree"}),
+            ("p-assessment", "publish", {"name": "assessment", "value": ASSESSMENT}),
+            ("p-nothing", "publish", {"name": "nothing", "value": None}),
+        )
+    if turn == 3:
+        return calls(
+            ("w6", "fs.write", {"path": "/work/report.md", "content": "mutated after publishing"}),
+            ("x-conflict", "publish", {"name": "report", "value": 1}),
+            ("x-both", "publish", {"name": "both", "path": "/work/report.md", "value": 1}),
+            ("x-neither", "publish", {"name": "neither"}),
+            ("x-name", "publish", {"name": "bad name!", "value": 1}),
+            ("x-missing", "publish", {"name": "ghost", "path": "/work/missing.md"}),
+            ("x-inputs", "publish", {"name": "foreign", "path": "/inputs/report.md"}),
+            ("x-escape", "publish", {"name": "escape", "path": "/work/../etc"}),
+            (
+                "x-forged",
+                "publish",
+                {"name": "forged", "value": 1, "attempt": 9, "step_id": "consume"},
+            ),
+            ("x-write-inputs", "fs.write", {"path": "/inputs/x.md", "content": "x"}),
+            ("x-write-escape", "fs.write", {"path": "/work/../x.md", "content": "x"}),
+        )
+    return DONE
+
+
+def consumer_turn(messages: list[dict]) -> dict:
+    """The ``report-pipeline`` consumer's next turn.
+
+    It reads each mounted publication and the collection manifest, then the
+    report through the manifest entry's path, and finishes.
+    """
+    turn = sum(1 for each in messages if each.get("role") == "assistant")
+    if turn == 0:
+        return calls(
+            ("c-report", "fs.read", {"path": "/inputs/report.md"}),
+            ("c-tree", "fs.list", {"path": "/inputs/tree"}),
+            ("c-assessment", "fs.read", {"path": "/inputs/assessment.json"}),
+            ("c-nothing", "fs.read", {"path": "/inputs/nothing.json"}),
+            ("c-manifest", "fs.read", {"path": "/inputs/all/manifest.json"}),
+        )
+    if turn == 1:
+        try:
+            manifest = json.loads(read_text(tool_results(messages)["c-manifest"] or {}))
+            [entry] = [each["path"] for each in manifest["entries"] if each["name"] == "report"]
+        except (KeyError, TypeError, ValueError):
+            entry = "missing"
+        return calls(("c-entry", "fs.read", {"path": f"/inputs/all/{entry}"}))
+    return DONE
+
+
 SLOW_SECONDS = 15.0
 """How long the ``SLOW-READER`` reader waits to answer, past its step's five-second deadline."""
 
@@ -295,7 +391,9 @@ def completion(body: dict) -> tuple[int, dict]:
     correct its reply, cites a foreign pointer on ``JUDGE-FOREIGN-CITE``, and
     otherwise passes citing the answer text. The scored judge (its prompt carries
     ``SCORE:``) answers ``scored``. The handbook judge reads its mount and
-    answers ``handbook_verdict``; the file probe plays ``probe_turn``. Every
+    answers ``handbook_verdict``; the file probe plays ``probe_turn``; the
+    ``report-pipeline`` drafter and consumer play ``drafter_turn`` and
+    ``consumer_turn``. Every
     other judge agrees.
     """
     text = json.dumps(body)
@@ -327,6 +425,10 @@ def completion(body: dict) -> tuple[int, dict]:
     elif LIVE_REVIEW in text:
         [trace_id, *_] = re.findall("[0-9a-f]{32}", text)
         message = {"role": "assistant", "content": REVIEWED} if returned else live_query(trace_id)
+    elif "DRAFT: " in text:
+        message = drafter_turn(body["messages"])
+    elif "CONSUME: " in text:
+        message = consumer_turn(body["messages"])
     elif "SCORE:" in text:
         message = {"role": "assistant", "content": scored(text)}
     else:

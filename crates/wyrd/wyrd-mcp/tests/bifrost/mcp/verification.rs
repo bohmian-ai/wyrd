@@ -3283,4 +3283,314 @@ mod pg_tests {
         server.shutdown().await?;
         Ok(())
     }
+
+    /// The scripted `publish-desk` model: the drafter writes and revises
+    /// `/work/report.md`, writes a tree holding a nested Unicode, spaced file
+    /// and an empty directory, then publishes the report, the tree, a JSON
+    /// assessment, and an explicit `null` in one turn; every other turn, and
+    /// the consumer, finishes with `{"done": true}`.
+    fn publish_desk(request: &wiremock::Request) -> wiremock::ResponseTemplate {
+        let body: JsonValue = serde_json::from_slice(&request.body).unwrap_or_default();
+        let messages = body["messages"].as_array().cloned().unwrap_or_default();
+        let drafting = messages.iter().any(|message| {
+            message["content"]
+                .as_str()
+                .is_some_and(|text| text.contains("DRAFT:"))
+        });
+        let turn = messages
+            .iter()
+            .filter(|message| message["role"] == "assistant")
+            .count();
+        let call = |id: &str, tool: &str, arguments: JsonValue| {
+            serde_json::json!({
+                "id": id, "type": "function",
+                "function": { "name": tool.replace('.', "_"), "arguments": arguments.to_string() },
+            })
+        };
+        let write =
+            |path: &str, content: &str| serde_json::json!({ "path": path, "content": content });
+        let calls = match (drafting, turn) {
+            (true, 0) => vec![call("w1", "fs.write", write("/work/report.md", "draft v1"))],
+            (true, 1) => vec![
+                call("w2", "fs.write", write("/work/report.md", DESK_REPORT)),
+                call("w3", "fs.write", write("/work/tree/a.md", "alpha")),
+                call(
+                    "w4",
+                    "fs.write",
+                    write("/work/tree/nested dir/é b.md", "beta"),
+                ),
+                call(
+                    "w5",
+                    "code.run",
+                    serde_json::json!({ "source": "import os\nos.makedirs('/work/tree/empty')" }),
+                ),
+            ],
+            (true, 2) => vec![
+                call(
+                    "p-report",
+                    "publish",
+                    serde_json::json!({ "name": "report", "path": "/work/report.md" }),
+                ),
+                call(
+                    "p-tree",
+                    "publish",
+                    serde_json::json!({ "name": "tree", "path": "/work/tree" }),
+                ),
+                call(
+                    "p-assessment",
+                    "publish",
+                    serde_json::json!({ "name": "assessment", "value": desk_assessment() }),
+                ),
+                call(
+                    "p-nothing",
+                    "publish",
+                    serde_json::json!({ "name": "nothing", "value": null }),
+                ),
+            ],
+            _ => Vec::new(),
+        };
+        let message = if calls.is_empty() {
+            serde_json::json!({ "role": "assistant", "content": r#"{"done":true}"# })
+        } else {
+            serde_json::json!({ "role": "assistant", "content": null, "tool_calls": calls })
+        };
+        wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "id": "chatcmpl-desk", "object": "chat.completion", "created": 1, "model": "gpt-4o",
+            "choices": [{ "index": 0, "finish_reason": "stop", "message": message }],
+            "usage": { "prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2 },
+        }))
+    }
+
+    /// The report the `publish-desk` drafter publishes after revising it.
+    const DESK_REPORT: &str = "# Final report\n";
+
+    /// The JSON assessment the `publish-desk` drafter publishes by value.
+    fn desk_assessment() -> JsonValue {
+        serde_json::json!({ "risk": "low", "score": 0.9, "notes": ["é", "two words"] })
+    }
+
+    /// A hosted Agent's publications read back over MCP: `publish-desk`'s
+    /// drafter, enqueued with `FULL-RUN`, publishes a report file, a tree,
+    /// a JSON assessment, and an explicit `null`; the Service lists them as
+    /// the drafter's first attempt, reads each typed content — the tree's
+    /// files and its `empty` and `nested dir` directories — and plans the
+    /// report's and a nested tree file's downloads with their exact size and
+    /// digest. An unpublished name answers the stable not-found code, and a
+    /// caller holding only `cards:read` is denied.
+    ///
+    /// # Errors
+    ///
+    /// Returns provider, server, fixture, bootstrap, MCP transport,
+    /// tool-call, or decode failures, or an error when the execution never
+    /// settles.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the verdict, a listed publication, its content, a download
+    /// plan, or a refusal differs from the expectation.
+    #[tokio::test(flavor = "multi_thread")]
+    #[ignore = "requires the Postgres-backed Bifrost journey lane"]
+    async fn hosted_agent_tools_agent_publishes_file_directory_and_json()
+    -> Result<(), McpJourneyError> {
+        use base64::Engine as _;
+        use sha2::Digest as _;
+        use wyrd_spec::storage::DownloadInitResponse;
+        use wyrd_spec::verification::execution::{
+            Publication, PublicationContent, PublicationKind, PublicationPage,
+        };
+
+        let upstream = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .and(wiremock::matchers::path("/v1/chat/completions"))
+            .respond_with(publish_desk)
+            .mount(&upstream)
+            .await;
+        let server = Box::pin(
+            WyrdTestServer::builder()
+                .with_verification_runtime_for_test()
+                .with_gateway_provider_root_for_test(upstream.uri().parse()?)
+                .start_bound(),
+        )
+        .await?;
+        server
+            .deploy_gateway_model_for_test("gpt-4o", "mcp_desk_invoker")
+            .await?;
+        server
+            .seed_role("mcp_desk_tools", &[Permission::tool_invoke_any()])
+            .await?;
+        server
+            .seed_role("mcp_desk_cards", &[Permission::card_read()])
+            .await?;
+        let admin = server
+            .bootstrap_service("mcp-desk-admin", &["admin"])
+            .await?;
+        let cards = Cards::connect_with(&client(&server, api_key(&admin)?)?).await?;
+        let desk = Box::pin(cards.declare_from_path(Path::new(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../../fixtures/cards/hosted_agent_tools/publish-desk.yaml"
+        ))))
+        .await?;
+        let pipeline = desk
+            .outcomes
+            .iter()
+            .find(|outcome| outcome.card_ref.name.as_str() == "report-pipeline")
+            .and_then(|outcome| outcome.card_ref.uid.as_ref())
+            .ok_or("publish-desk registers report-pipeline")?
+            .to_string();
+        let desk_uid = desk
+            .root
+            .uid
+            .clone()
+            .ok_or("a registered Card has a UID")?
+            .to_string();
+        let principal = server
+            .credential_registered_service(
+                &desk.root,
+                &["editor", "mcp_desk_invoker", "mcp_desk_tools"],
+            )
+            .await?;
+        let agent = connect_rooted(&server, &principal).await?;
+
+        let accepted = structured(
+            agent
+                .call_tool(call(
+                    ENQUEUE,
+                    serde_json::json!({
+                        "verifier_card_uid": pipeline,
+                        "card_uid": desk_uid,
+                        "inputs": { "question": { "kind": "json", "value": "FULL-RUN" } },
+                    }),
+                )?)
+                .await?,
+        )?;
+        let id = text(&accepted, "/execution_id")?.to_owned();
+        let state = settle(&agent, &id).await?;
+        assert_eq!(state["result"]["outcome"]["verdict"], "passed", "{state}");
+
+        let page: PublicationPage = serde_json::from_value(structured(
+            agent
+                .call_tool(call(
+                    "verification.list_publications",
+                    serde_json::json!({ "execution_id": id }),
+                )?)
+                .await?,
+        )?)?;
+        let mut listed: Vec<_> = page
+            .items
+            .iter()
+            .map(|item| {
+                (
+                    item.producer.step_id.as_str(),
+                    item.name.as_str(),
+                    item.producer.attempt,
+                    item.kind,
+                )
+            })
+            .collect();
+        listed.sort_by_key(|(_, name, _, _)| *name);
+        assert_eq!(
+            listed,
+            [
+                ("draft", "assessment", 1, PublicationKind::Json),
+                ("draft", "nothing", 1, PublicationKind::Json),
+                ("draft", "report", 1, PublicationKind::File),
+                ("draft", "tree", 1, PublicationKind::Directory),
+            ]
+        );
+
+        let select = |name: &str, path: Option<&str>| {
+            let mut arguments = serde_json::json!({
+                "execution_id": id, "step_id": "draft", "name": name, "attempt": 1
+            });
+            if let Some(path) = path {
+                arguments["path"] = path.into();
+            }
+            arguments
+        };
+        let read = |name: &str| {
+            let agent = &agent;
+            let arguments = select(name, None);
+            async move {
+                let publication: Publication = serde_json::from_value(structured(
+                    agent
+                        .call_tool(call("verification.get_publication", arguments)?)
+                        .await?,
+                )?)?;
+                Ok::<_, McpJourneyError>(publication.content)
+            }
+        };
+        let PublicationContent::File { manifest: report } = read("report").await? else {
+            return Err("the report is a file publication".into());
+        };
+        assert_eq!(report.files[0].size_bytes, DESK_REPORT.len() as u64);
+        let PublicationContent::Directory { manifest: tree } = read("tree").await? else {
+            return Err("the tree is a directory publication".into());
+        };
+        let paths: Vec<_> = tree.files.iter().map(|file| file.path.as_str()).collect();
+        assert_eq!(paths, ["a.md", "nested dir/é b.md"]);
+        assert_eq!(tree.directories, ["empty", "nested dir"]);
+        assert_eq!(
+            read("assessment").await?,
+            PublicationContent::Json {
+                value: desk_assessment()
+            }
+        );
+        assert_eq!(
+            read("nothing").await?,
+            PublicationContent::Json {
+                value: JsonValue::Null
+            }
+        );
+
+        let digest = |bytes: &[u8]| {
+            base64::engine::general_purpose::STANDARD.encode(sha2::Sha256::digest(bytes))
+        };
+        for (arguments, bytes) in [
+            (select("report", None), DESK_REPORT.as_bytes()),
+            (
+                select("tree", Some("nested dir/é b.md")),
+                b"beta".as_slice(),
+            ),
+        ] {
+            let plan: DownloadInitResponse = serde_json::from_value(structured(
+                agent
+                    .call_tool(call("verification.download_publication", arguments)?)
+                    .await?,
+            )?)?;
+            assert_eq!(
+                (plan.size_bytes, plan.sha256),
+                (bytes.len() as u64, digest(bytes))
+            );
+        }
+
+        let absent = refusal(
+            agent
+                .call_tool(call("verification.get_publication", select("ghost", None))?)
+                .await,
+        )?;
+        assert!(
+            absent.contains("WYRD_VERIFICATION_404_PUBLICATION_NOT_FOUND"),
+            "{absent}"
+        );
+        agent.cancel().await?;
+        let reader = server
+            .bootstrap_service("mcp-desk-cards", &["mcp_desk_cards"])
+            .await?;
+        let reader = connect(&server, &reader).await?;
+        let denied = refusal(
+            reader
+                .call_tool(call(
+                    "verification.get_publication",
+                    select("report", None),
+                )?)
+                .await,
+        )?;
+        assert!(
+            denied.contains("WYRD_PERMISSION_403_DENIED_RBAC"),
+            "{denied}"
+        );
+        reader.cancel().await?;
+        server.shutdown().await?;
+        Ok(())
+    }
 }

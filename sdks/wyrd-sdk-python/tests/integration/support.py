@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import shutil
 import threading
 import time
@@ -42,6 +43,30 @@ UNBADGED = "no badge!"
 
 UNBADGED_BASE64 = "bm8gYmFkZ2Uh"
 """``UNBADGED`` in base64, as the judge's image data URL carries it."""
+
+
+REPORT = "# Final report\n"
+"""The report the ``report-pipeline`` drafter publishes."""
+
+ASSESSMENT = {"risk": "low", "score": 0.9, "notes": ["é", "two words"]}
+"""The JSON assessment the ``report-pipeline`` drafter publishes by value."""
+
+
+def read_text(read: dict[str, Any]) -> str:
+    """The text of an ``fs.read`` result: its units' lines, joined by newlines."""
+    return "\n".join(unit["text"] for unit in read.get("units", []))
+
+
+def tool_results(messages: list[dict]) -> dict[str, Any]:
+    """Every tool result in ``messages``, by the provider call ID it answers, decoded from JSON."""
+    results: dict[str, Any] = {}
+    for message in messages:
+        if message.get("role") == "tool":
+            try:
+                results[message["tool_call_id"]] = json.loads(message["content"])
+            except ValueError:
+                results[message["tool_call_id"]] = None
+    return results
 
 
 @dataclass

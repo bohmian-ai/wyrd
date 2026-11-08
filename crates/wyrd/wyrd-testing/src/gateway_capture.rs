@@ -11,7 +11,9 @@
 //! frames [`PacedUpstream`] writes one at a time. `wiremock` returns one
 //! whole body after one delay, so it cannot pace a stream; [`PacedUpstream`]
 //! is the bounded local provider that does, recording when it sent each
-//! frame.
+//! frame. Nor can it wait for a test event, so [`HeldUpstream`] forwards to
+//! a scripted upstream and holds chosen answers until the test releases
+//! them.
 
 use std::collections::HashMap;
 use std::net::SocketAddr;

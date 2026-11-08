@@ -46,6 +46,7 @@ mod pg_tests {
     use wyrd_spec::verification::execution::{
         Publication, PublicationContent, PublicationKind, PublicationPage,
     };
+    use wyrd_testing::gateway_capture::HeldUpstream;
     use wyrd_testing::{Bootstrap, WyrdTestServer};
 
     /// The Card read tool an agent uses to find binding IDs.
@@ -3827,10 +3828,9 @@ mod pg_tests {
     /// and `style` collection manifests, or the `extra` one for a `SPEC-`
     /// question; the quoter reads `/inputs/security.json`. The comparer
     /// disagrees on `ADMIT`, answers `null` on `BLOCK`, and agrees otherwise;
-    /// a `LATE-DECISION` comparison and a `KNOWN` bootstrap hold their
-    /// replies for [`HELD_REPLY`], and an `EARLY-DECISION` comparison waits
-    /// [`BRIEF_REPLY`] while its extra review holds its first turn for
-    /// [`HELD_REPLY`]; the extra review publishes `account`. A section
+    /// the bootstrap, the comparison, and the extra review answer at once, a
+    /// speculative race ordering them by holding answers at the desk's
+    /// [`HeldUpstream`]; the extra review publishes `account`. A section
     /// reviewer publishes its section and index; the polisher scores each
     /// round by its index; the escalation publishes a `note`, then breaks;
     /// the summarizer reads both collection manifests, publishes `summary`,
@@ -3930,11 +3930,7 @@ mod pg_tests {
         };
         let done = || answer(serde_json::json!({ "done": true }));
         if prompt.contains("BOOTSTRAP:") {
-            return if prompt.contains("KNOWN") {
-                done().set_delay(HELD_REPLY)
-            } else {
-                done()
-            };
+            return done();
         }
         if prompt.contains("COMPARE:") {
             let agree = if prompt.contains("ADMIT") {
@@ -3944,21 +3940,10 @@ mod pg_tests {
             } else {
                 JsonValue::Bool(true)
             };
-            let reply = answer(serde_json::json!({ "agree": agree }));
-            return if prompt.contains("LATE-DECISION") {
-                reply.set_delay(HELD_REPLY)
-            } else if prompt.contains("EARLY-DECISION") {
-                reply.set_delay(BRIEF_REPLY)
-            } else {
-                reply
-            };
+            return answer(serde_json::json!({ "agree": agree }));
         }
         if prompt.contains("EXTRA:") {
             return match turn {
-                0 if prompt.contains("EARLY-DECISION") => {
-                    publish("e-publish", "account", serde_json::json!({ "extra": true }))
-                        .set_delay(HELD_REPLY)
-                }
                 0 => publish("e-publish", "account", serde_json::json!({ "extra": true })),
                 _ => done(),
             };
@@ -4080,14 +4065,6 @@ mod pg_tests {
     /// execution is still running when it is cancelled.
     const HELD_PLAN: Duration = Duration::from_secs(5);
 
-    /// How long a held speculative reply waits, so the other side of its
-    /// race settles first.
-    const HELD_REPLY: Duration = Duration::from_secs(3);
-
-    /// How long an early comparison waits, so the bootstrap it races settles
-    /// first while a held extra review is still running.
-    const BRIEF_REPLY: Duration = Duration::from_secs(1);
-
     /// The messages of every request `upstream` received whose prompt
     /// carries both `marker` and `question`, in arrival order.
     ///
@@ -4179,6 +4156,8 @@ mod pg_tests {
     struct OrchestrationDesk {
         /// The scripted model upstream.
         upstream: wiremock::MockServer,
+        /// The gateway's provider, holding chosen upstream answers.
+        held: HeldUpstream,
         /// The server.
         server: WyrdTestServer,
         /// The Service's runtime account.
@@ -4206,10 +4185,11 @@ mod pg_tests {
                 .respond_with(orchestration_desk)
                 .mount(&upstream)
                 .await;
+            let held = HeldUpstream::start(&upstream).await?;
             let server = Box::pin(
                 WyrdTestServer::builder()
                     .with_verification_runtime_for_test()
-                    .with_gateway_provider_root_for_test(upstream.uri().parse()?)
+                    .with_gateway_provider_root_for_test(held.uri().parse()?)
                     .start_bound(),
             )
             .await?;
@@ -4255,6 +4235,7 @@ mod pg_tests {
             let agent = connect_rooted(&server, &principal).await?;
             Ok(Self {
                 upstream,
+                held,
                 server,
                 principal,
                 agent,
@@ -4314,6 +4295,49 @@ mod pg_tests {
                     )?)
                     .await?,
             )?)?)
+        }
+
+        /// Wait until `execution_id`'s invocation listing, read over MCP,
+        /// holds an attempt of `step` that `reached` accepts, and return it.
+        ///
+        /// # Errors
+        ///
+        /// Returns tool-call or decode failures, or an error when no such
+        /// attempt is accepted within [`SETTLE`].
+        async fn reached(
+            &self,
+            execution_id: &str,
+            step: &str,
+            reached: impl Fn(&JsonValue) -> bool,
+        ) -> Result<JsonValue, McpJourneyError> {
+            let deadline = tokio::time::Instant::now() + SETTLE;
+            loop {
+                let page = structured(
+                    self.agent
+                        .call_tool(call(
+                            "verification.list_invocations",
+                            serde_json::json!({ "execution_id": execution_id, "limit": 200 }),
+                        )?)
+                        .await?,
+                )?;
+                if let Some(invocation) =
+                    page["items"]
+                        .as_array()
+                        .into_iter()
+                        .flatten()
+                        .find(|invocation| {
+                            invocation["producer"]["step_id"] == step && reached(invocation)
+                        })
+                {
+                    return Ok(invocation.clone());
+                }
+                if tokio::time::Instant::now() >= deadline {
+                    return Err(
+                        format!("{execution_id}: no {step} attempt reached the milestone").into(),
+                    );
+                }
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
         }
 
         /// Disconnect the agent and stop the server.
@@ -4786,7 +4810,9 @@ mod pg_tests {
     /// eligible makes no call. The consolidator only ever reads the recorded
     /// disposition and receives the account only when it was admitted, while
     /// `verification.list_publications` keeps the excluded account with its
-    /// disposition.
+    /// disposition. Each race is ordered by holding provider answers until
+    /// `verification.list_invocations` or the upstream shows the other side
+    /// settled or arrived, never by elapsed time.
     ///
     /// # Errors
     ///
@@ -4804,10 +4830,24 @@ mod pg_tests {
     -> Result<(), McpJourneyError> {
         use wyrd_spec::verification::execution::Speculation;
 
+        /// The order a question's race is held in.
+        #[derive(Clone, Copy)]
+        enum Race {
+            /// The comparison answers once the extra review settled.
+            ActionFirst,
+            /// The comparison answers once the extra review's request
+            /// arrived, and the extra review once the comparison settled.
+            DecisionFirst,
+            /// The bootstrap answers once the comparison settled.
+            Known,
+        }
+
         /// One question's expected observations.
         struct Case {
-            /// The question, carrying the comparer's and timing markers.
+            /// The question, carrying the comparer's marker.
             question: &'static str,
+            /// The order its race is held in.
+            race: Race,
             /// Whether the extra review called the model.
             called: bool,
             /// The `extra` step's status.
@@ -4824,6 +4864,7 @@ mod pg_tests {
         let cases = [
             Case {
                 question: "SPEC-ADMIT-LATE-DECISION",
+                race: Race::ActionFirst,
                 called: true,
                 status: "succeeded",
                 speculation: "admitted",
@@ -4832,6 +4873,7 @@ mod pg_tests {
             },
             Case {
                 question: "SPEC-ADMIT-EARLY-DECISION",
+                race: Race::DecisionFirst,
                 called: true,
                 status: "succeeded",
                 speculation: "admitted",
@@ -4840,6 +4882,7 @@ mod pg_tests {
             },
             Case {
                 question: "SPEC-DISCARD-LATE-DECISION",
+                race: Race::ActionFirst,
                 called: true,
                 status: "skipped",
                 speculation: "discarded",
@@ -4848,6 +4891,7 @@ mod pg_tests {
             },
             Case {
                 question: "SPEC-DISCARD-EARLY-DECISION",
+                race: Race::DecisionFirst,
                 called: true,
                 status: "skipped",
                 speculation: "discarded",
@@ -4856,6 +4900,7 @@ mod pg_tests {
             },
             Case {
                 question: "SPEC-BLOCK-LATE-DECISION",
+                race: Race::ActionFirst,
                 called: true,
                 status: "failed",
                 speculation: "blocked",
@@ -4864,6 +4909,7 @@ mod pg_tests {
             },
             Case {
                 question: "SPEC-KNOWN",
+                race: Race::Known,
                 called: false,
                 status: "skipped",
                 speculation: "discarded",
@@ -4873,7 +4919,47 @@ mod pg_tests {
         ];
         for case in cases {
             let question = case.question;
+            let compare = ["COMPARE:", question];
+            let reviewing = ["EXTRA:", question];
+            let bootstrap = ["BOOTSTRAP:", question];
+            let acted = |invocation: &JsonValue| invocation["state"] == "action";
+            match case.race {
+                Race::ActionFirst => desk.held.hold(&compare),
+                Race::DecisionFirst => {
+                    desk.held.hold(&compare);
+                    desk.held.hold(&reviewing);
+                }
+                Race::Known => desk.held.hold(&bootstrap),
+            }
             let id = desk.ask("speculative-review", question).await?;
+            match case.race {
+                Race::ActionFirst => {
+                    desk.reached(&id, "extra", acted).await?;
+                    desk.held.release(&compare);
+                }
+                Race::DecisionFirst => {
+                    let deadline = tokio::time::Instant::now() + SETTLE;
+                    while asked(&desk.upstream, "EXTRA:", question).await?.is_empty() {
+                        if tokio::time::Instant::now() >= deadline {
+                            return Err(format!("{question}: no extra review request").into());
+                        }
+                        tokio::time::sleep(Duration::from_millis(50)).await;
+                    }
+                    desk.held.release(&compare);
+                    desk.reached(&id, "compare", acted).await?;
+                    if case.retained.is_empty() {
+                        desk.reached(&id, "extra", |invocation| {
+                            invocation["speculation"] == "discarded"
+                        })
+                        .await?;
+                    }
+                    desk.held.release(&reviewing);
+                }
+                Race::Known => {
+                    desk.reached(&id, "compare", acted).await?;
+                    desk.held.release(&bootstrap);
+                }
+            }
             let state = settle(&desk.agent, &id).await?;
             let outcome = &state["result"]["outcome"];
             let consolidated = outcome["requirements"]

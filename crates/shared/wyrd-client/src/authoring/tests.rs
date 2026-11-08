@@ -528,3 +528,257 @@ fn offline_edits_preserve_snapshots() {
         Err(WyrdError::RegistryInvalidVersionBlock { .. })
     ));
 }
+
+fn story(relative: &str) -> std::path::PathBuf {
+    std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../../fixtures/cards/card_authoring")
+        .join(relative)
+}
+
+/// A policy-judge Agent named `name`, as the story's Agent files declare it.
+fn policy_judge(name: &str) -> Agent {
+    let mut prompt = Prompt::new(
+        "openai",
+        "gpt-4o",
+        "POLICY JUDGE: read /inputs/policy.json with fs.read. Determine whether the proposed \
+         release satisfies the company policy. Cite original request and policy evidence. \
+         Report: {{report}} Recipient: {{recipient}} Purpose: {{purpose}} Destination: \
+         {{destination}}",
+    )
+    .expect("prompt compiles");
+    prompt
+        .set_response_format(json!("verdict"))
+        .expect("verdict is a named format");
+    let mut agent = Agent::new(name, "1.0.0", prompt).expect("valid identity");
+    agent.set_gateway_route("openai").expect("valid deployment");
+    agent.set_tools([BuiltinTool::FsRead.as_str()]);
+    agent.set_max_iterations(3);
+    agent
+}
+
+/// A code step running `entrypoint` of the story's checks over `inputs`,
+/// judged by one `path == expected` requirement.
+fn fact_step(
+    id: &str,
+    entrypoint: &str,
+    inputs: &[(&str, &Reference)],
+    requirement: (&str, &str, &str, Value),
+) -> Step {
+    let mut call =
+        CodeCall::from_file(story("release_checks.py"), entrypoint).expect("source reads");
+    for (name, value) in inputs {
+        call.add_input(name, (*value).clone())
+            .expect("valid parameter");
+    }
+    let mut step = Step::new(id, Action::code(call)).expect("valid id");
+    let (requirement_id, statement, path, expected) = requirement;
+    let check = Check::equals(step.output(path).expect("path"), expected);
+    step.add_requirement(Requirement::new(requirement_id, statement, check).expect("valid id"))
+        .expect("new id");
+    step
+}
+
+/// Declare the recipient, purpose, and destination slots on `verifier`.
+fn release_inputs(verifier: &mut Verifier) -> [Reference; 3] {
+    let recipient = verifier
+        .add_input(
+            "recipient",
+            json!({
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["email", "authorized", "permitted_purposes"],
+                "properties": {
+                    "email": {"type": "string"},
+                    "authorized": {"type": "boolean"},
+                    "permitted_purposes": {"type": "array", "items": {"type": "string"}},
+                },
+            }),
+        )
+        .expect("new slot");
+    let purpose = verifier
+        .add_input("purpose", json!({"type": "string"}))
+        .expect("new slot");
+    let destination = verifier
+        .add_input(
+            "destination",
+            json!({
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["url", "encrypted", "restricted_access", "public_sharing"],
+                "properties": {
+                    "url": {"type": "string"},
+                    "encrypted": {"type": "boolean"},
+                    "restricted_access": {"type": "boolean"},
+                    "public_sharing": {"type": "boolean"},
+                },
+            }),
+        )
+        .expect("new slot");
+    [recipient, purpose, destination]
+}
+
+/// The `card_authoring` story's Service, authored in code.
+fn finance_release(policy: &ArtifactFile) -> Service {
+    let reviewer = policy_judge("report-reviewer");
+    let mut report_policy = Verifier::new("report-policy", "1.0.0").expect("valid identity");
+    report_policy.set_description("The report is fit to share under the company sharing policy.");
+    let report = report_policy
+        .add_input(
+            "report",
+            json!({
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["text"],
+                "properties": {"text": {"type": "string"}},
+            }),
+        )
+        .expect("new slot");
+    let [recipient, purpose, destination] = release_inputs(&mut report_policy);
+    let mut scan = fact_step(
+        "policy",
+        "report_facts",
+        &[("report", &report)],
+        (
+            "no-bank-account-identifier",
+            "The report contains no prohibited bank identifier.",
+            "contains_bank_identifier",
+            json!(false),
+        ),
+    );
+    let mut judge = AgentCall::new(reviewer.clone());
+    for (name, value) in [
+        ("report", &report),
+        ("recipient", &recipient),
+        ("purpose", &purpose),
+        ("destination", &destination),
+    ] {
+        judge
+            .add_input(name, value.clone())
+            .expect("valid parameter");
+    }
+    judge.add_workspace_file("/inputs/policy.json", policy);
+    scan.add_requirement(
+        Requirement::new(
+            "sharing-policy-satisfied",
+            "The release satisfies the company sharing policy.",
+            Check::agent(judge),
+        )
+        .expect("valid id"),
+    )
+    .expect("new id");
+    let context = fact_step(
+        "policy-context",
+        "policy_context",
+        &[("report", &report), ("purpose", &purpose)],
+        (
+            "usable-report",
+            "The proposed release contains report text.",
+            "has_report",
+            json!(true),
+        ),
+    );
+    report_policy.add_step(scan).expect("new step");
+    report_policy.add_step(context).expect("new step");
+
+    let mut release_access = Verifier::new("release-access", "1.0.0").expect("valid identity");
+    release_access.set_description("The recipient and destination may receive the report.");
+    let [recipient, purpose, destination] = release_inputs(&mut release_access);
+    release_access
+        .add_input_with_required("notes", json!({"type": "string"}), false)
+        .expect("new slot");
+    release_access
+        .add_step(fact_step(
+            "recipient",
+            "recipient_facts",
+            &[("recipient", &recipient), ("purpose", &purpose)],
+            (
+                "recipient-authorized",
+                "The recipient is authorized for this purpose.",
+                "authorized",
+                json!(true),
+            ),
+        ))
+        .expect("new step");
+    release_access
+        .add_step(fact_step(
+            "destination",
+            "destination_facts",
+            &[("destination", &destination)],
+            (
+                "destination-controls-satisfied",
+                "The destination has appropriate access controls.",
+                "appropriate",
+                json!(true),
+            ),
+        ))
+        .expect("new step");
+
+    let mut service = Service::new("finance-release", "1.0.0").expect("valid identity");
+    service.set_service_type("api");
+    service
+        .add_component("report-reviewer", reviewer, [report_policy])
+        .expect("new alias");
+    service
+        .add_component(
+            "release-controls",
+            policy_judge("release-controls"),
+            [release_access],
+        )
+        .expect("new alias");
+    service
+}
+
+#[test]
+fn declarations_match_file_authored_tree() {
+    let policy = Artifact::from_path(
+        "company-sharing-policy",
+        "1.0.0",
+        story("company-sharing-policy.pdf"),
+        true,
+    )
+    .expect("valid identity");
+    let authored = CardDefinition::from(finance_release(
+        &policy
+            .file("extracted/company-sharing-policy.pdf.json")
+            .expect("relative path"),
+    ))
+    .declaration()
+    .expect("valid graph");
+    let files = wyrd_loader::build_declaration_input(
+        wyrd_loader::load(&story("finance-release.yaml")).expect("the story loads"),
+    )
+    .expect("the story builds");
+
+    assert_eq!(
+        authored.artifacts,
+        [policy],
+        "the policy publishes first, alone"
+    );
+    let identity = |submission: &wyrd_spec::registry::CardSubmission| {
+        (
+            format!("{:?}", submission.kind),
+            submission.metadata.name.to_string(),
+        )
+    };
+    let mut authored_submissions = authored.input.submissions.clone();
+    let mut file_submissions = files.submissions.clone();
+    authored_submissions.sort_by_key(identity);
+    file_submissions.sort_by_key(identity);
+    assert_eq!(authored_submissions.len(), 5);
+    for (authored, file) in authored_submissions.iter().zip(&file_submissions) {
+        assert_eq!(identity(authored), identity(file));
+        assert_eq!(
+            authored.spec,
+            file.spec,
+            "{:?} matches its file",
+            identity(file)
+        );
+        assert_eq!(authored.metadata, file.metadata);
+        assert!(authored.artifacts.is_empty() && file.artifacts.is_empty());
+    }
+    assert_eq!(
+        authored.input.submissions.last().map(identity),
+        files.submissions.last().map(identity),
+        "both declare the Service root last",
+    );
+}

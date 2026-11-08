@@ -289,7 +289,61 @@ profile: {kind: Spc, sample_size: 5}
     assert_eq!(
         stages,
         [vec!["extract", "policy"], vec!["policy-context"]],
-        "only explicit depends_on orders steps, even though policy-context references policy",
+        "the policy-context dependency stages it after policy",
+    );
+
+    let stages = |verifier: &Verifier| -> Result<Vec<Vec<String>>, WyrdError> {
+        Ok(verifier
+            .plan()?
+            .stages
+            .iter()
+            .map(|stage| {
+                stage
+                    .tasks
+                    .iter()
+                    .map(|task| task.as_str().to_owned())
+                    .collect()
+            })
+            .collect())
+    };
+    let mut ordering = Verifier::new("ordering", "1.0.0").expect("valid identity");
+    let input = ordering.add_input("value", Value::Null).expect("new slot");
+    let first = Step::new("first", Action::extract(input.clone())).expect("valid id");
+    let mut explicit = Step::new("explicit", Action::extract(input.clone())).expect("valid id");
+    explicit.add_depends_on(&first);
+    let mut inferred_call = CodeCall::inline("def f(x):\n    return x\n", "f");
+    inferred_call
+        .add_input("x", first.output("").expect("whole output"))
+        .expect("valid parameter");
+    let inferred = Step::new("inferred", Action::code(inferred_call)).expect("valid id");
+    let mut cyclic = Step::new("cyclic", Action::extract(input.clone())).expect("valid id");
+    cyclic.add_depends_on(&cyclic.clone());
+    let unknown_target = Step::new("unknown", Action::extract(input)).expect("valid id");
+    let mut dangling = Step::new(
+        "dangling",
+        Action::extract(unknown_target.output("").expect("path")),
+    )
+    .expect("valid id");
+    dangling.add_depends_on(&unknown_target);
+    for step in [first, explicit, inferred] {
+        ordering.add_step(step).expect("new step");
+    }
+    assert_eq!(
+        stages(&ordering).expect("plans"),
+        [vec!["first"], vec!["explicit", "inferred"]],
+        "an explicit-only depends_on edge stages like an inferred output reference",
+    );
+    let mut refused = ordering.clone();
+    refused.add_step(cyclic).expect("new step");
+    assert_eq!(
+        rule(&stages(&refused).expect_err("self dependency")),
+        Some("graph")
+    );
+    let mut refused = ordering;
+    refused.add_step(dangling).expect("new step");
+    assert_eq!(
+        rule(&stages(&refused).expect_err("unknown dependency")),
+        Some("graph")
     );
 
     let canonical_agent: AgentSpec = yaml(

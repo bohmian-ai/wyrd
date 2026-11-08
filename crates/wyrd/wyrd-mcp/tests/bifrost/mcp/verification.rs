@@ -3815,4 +3815,467 @@ mod pg_tests {
         server.shutdown().await?;
         Ok(())
     }
+
+    /// The scripted `orchestration-desk` model for `specialist-review`: one
+    /// reply per request, chosen by the Agent's prompt marker and the number
+    /// of assistant turns already in its conversation. The planner selects
+    /// specialists by the question's marker (`security: null` when
+    /// `UNDECIDED`), holds its reply for [`HELD_PLAN`] when `HELD`, and
+    /// breaks without a marker; the generalist and security specialist
+    /// publish `account`; the stylist publishes a partial `draft`, then
+    /// breaks; the consolidator reads the `security` and `style` collection
+    /// manifests; the quoter reads `/inputs/security.json`. Every other turn
+    /// finishes with `{"done": true}`.
+    fn orchestration_desk(request: &wiremock::Request) -> wiremock::ResponseTemplate {
+        let body: JsonValue = serde_json::from_slice(&request.body).unwrap_or_default();
+        let messages = body["messages"].as_array().cloned().unwrap_or_default();
+        let prompt: String = messages
+            .iter()
+            .filter_map(|message| message["content"].as_str())
+            .collect();
+        let turn = messages
+            .iter()
+            .filter(|message| message["role"] == "assistant")
+            .count();
+        let reply = |message: JsonValue| {
+            wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "id": "chatcmpl-orchestration", "object": "chat.completion", "created": 1,
+                "model": "gpt-4o",
+                "choices": [{ "index": 0, "finish_reason": "stop", "message": message }],
+                "usage": { "prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2 },
+            }))
+        };
+        let answer = |value: JsonValue| {
+            reply(serde_json::json!({ "role": "assistant", "content": value.to_string() }))
+        };
+        let calls = |calls: &[(&str, &str, JsonValue)]| {
+            let calls: Vec<JsonValue> = calls
+                .iter()
+                .map(|(id, tool, arguments)| {
+                    serde_json::json!({
+                        "id": id, "type": "function",
+                        "function": { "name": tool.replace('.', "_"), "arguments": arguments.to_string() },
+                    })
+                })
+                .collect();
+            reply(serde_json::json!({ "role": "assistant", "content": null, "tool_calls": calls }))
+        };
+        let garbled = || {
+            wiremock::ResponseTemplate::new(200)
+                .set_body_json(serde_json::json!({ "garbled": true }))
+        };
+        let publish = |id: &str, name: &str, value: JsonValue| {
+            calls(&[(
+                id,
+                "publish",
+                serde_json::json!({ "name": name, "value": value }),
+            )])
+        };
+        if prompt.contains("PLAN:") {
+            let decision = [
+                (
+                    "NEITHER",
+                    serde_json::json!({ "security": false, "style": false }),
+                ),
+                (
+                    "SECURITY-ONLY",
+                    serde_json::json!({ "security": true, "style": false }),
+                ),
+                (
+                    "BOTH",
+                    serde_json::json!({ "security": true, "style": true }),
+                ),
+                (
+                    "UNDECIDED",
+                    serde_json::json!({ "security": null, "style": false }),
+                ),
+                (
+                    "HELD",
+                    serde_json::json!({ "security": true, "style": true }),
+                ),
+            ]
+            .into_iter()
+            .find(|(marker, _)| prompt.contains(marker));
+            return match decision {
+                Some(("HELD", decision)) => answer(decision).set_delay(HELD_PLAN),
+                Some((_, decision)) => answer(decision),
+                None => garbled(),
+            };
+        }
+        if turn > 0 && !prompt.contains("STYLE:") {
+            return answer(serde_json::json!({ "done": true }));
+        }
+        if prompt.contains("GENERAL:") {
+            publish(
+                "s-publish",
+                "account",
+                serde_json::json!({ "focus": "general" }),
+            )
+        } else if prompt.contains("SECURITY:") {
+            publish(
+                "s-publish",
+                "account",
+                serde_json::json!({ "focus": "security" }),
+            )
+        } else if prompt.contains("STYLE:") {
+            match turn {
+                0 => publish("s-draft", "draft", serde_json::json!({ "partial": true })),
+                _ => garbled(),
+            }
+        } else if prompt.contains("CONSOLIDATE:") {
+            let read = |collection: &str| {
+                (
+                    format!("c-{collection}"),
+                    serde_json::json!({ "path": format!("/inputs/{collection}/manifest.json") }),
+                )
+            };
+            let (security, style) = (read("security"), read("style"));
+            calls(&[
+                (&security.0, "fs.read", security.1.clone()),
+                (&style.0, "fs.read", style.1.clone()),
+            ])
+        } else if prompt.contains("QUOTE:") {
+            calls(&[(
+                "q-read",
+                "fs.read",
+                serde_json::json!({ "path": "/inputs/security.json" }),
+            )])
+        } else {
+            wiremock::ResponseTemplate::new(500)
+        }
+    }
+
+    /// How long the planner holds a `HELD` question's decision, so its
+    /// execution is still running when it is cancelled.
+    const HELD_PLAN: Duration = Duration::from_secs(5);
+
+    /// The messages of every request `upstream` received whose prompt
+    /// carries both `marker` and `question`, in arrival order.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the upstream does not record requests.
+    async fn asked(
+        upstream: &wiremock::MockServer,
+        marker: &str,
+        question: &str,
+    ) -> Result<Vec<Vec<JsonValue>>, McpJourneyError> {
+        Ok(upstream
+            .received_requests()
+            .await
+            .ok_or("the upstream records requests")?
+            .iter()
+            .map(|request| {
+                serde_json::from_slice::<JsonValue>(&request.body).unwrap_or_default()["messages"]
+                    .as_array()
+                    .cloned()
+                    .unwrap_or_default()
+            })
+            .filter(|messages| {
+                let prompt: String = messages
+                    .iter()
+                    .filter_map(|message| message["content"].as_str())
+                    .collect();
+                prompt.contains(&format!("{marker} {question}"))
+            })
+            .collect())
+    }
+
+    /// The collection manifest the consolidator's `fs.read` call `id`
+    /// returned in `messages`, parsed from the read's text units.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when no such result was returned or its text is not
+    /// a JSON manifest.
+    fn manifest(messages: &[JsonValue], id: &str) -> Result<JsonValue, McpJourneyError> {
+        let read: JsonValue = messages
+            .iter()
+            .find(|message| message["role"] == "tool" && message["tool_call_id"] == id)
+            .and_then(|message| message["content"].as_str())
+            .map(serde_json::from_str)
+            .transpose()?
+            .ok_or_else(|| format!("the consolidator read {id}"))?;
+        let text: Vec<&str> = read["units"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|unit| unit["text"].as_str())
+            .collect();
+        Ok(serde_json::from_str(&text.join("\n"))?)
+    }
+
+    /// `specialist-review` over MCP: an agent enqueues each question, polls
+    /// `verification.get_execution` to its result, and reads the execution's
+    /// publications, against the same `orchestration-desk` Verifiers the SDK
+    /// journeys use. A specialist whose `when` is false is skipped before it
+    /// is called; an undecidable `null` decision fails the security step
+    /// with the type mismatch. The consolidator always runs and reads every
+    /// collection's manifest with its producer's honest status and admitted
+    /// entries — the stylist's failed attempt keeps its partial draft. The
+    /// quoter, requiring `steps.security.publications.account` by name, is
+    /// skipped and never called whenever security published no account. The
+    /// publication listing names exactly the published accounts and draft,
+    /// none speculative. A held execution cancelled through
+    /// `verification.cancel` answers `cancelled` and reads back cancelled.
+    ///
+    /// # Errors
+    ///
+    /// Returns provider, server, fixture, bootstrap, MCP transport,
+    /// tool-call, or decode failures, or an error when an execution never
+    /// settles.
+    ///
+    /// # Panics
+    ///
+    /// Panics when a step status, a model call, a collection manifest, a
+    /// requirement, a listed publication, or the cancellation differs.
+    #[tokio::test(flavor = "multi_thread")]
+    #[ignore = "requires the Postgres-backed Bifrost journey lane"]
+    async fn verifier_orchestration_conditions_and_collections_preserve_missing_evidence()
+    -> Result<(), McpJourneyError> {
+        use wyrd_spec::verification::VerificationExecutionStatus;
+        use wyrd_spec::verification::execution::{CancelExecutionResponse, Speculation};
+
+        /// One question's expected observations.
+        struct Case {
+            /// The question, carrying the planner's marker.
+            question: &'static str,
+            /// Statuses of `plan`, `security`, `style`, and `quote`.
+            statuses: [&'static str; 4],
+            /// Agent prompt markers the model was called with.
+            called: &'static [&'static str],
+            /// The `security` and `style` manifests' status and entry names.
+            collections: [(&'static str, &'static [&'static str]); 2],
+            /// The `(step, name)` of every listed publication, sorted.
+            published: &'static [(&'static str, &'static str)],
+        }
+
+        let upstream = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .and(wiremock::matchers::path("/v1/chat/completions"))
+            .respond_with(orchestration_desk)
+            .mount(&upstream)
+            .await;
+        let server = Box::pin(
+            WyrdTestServer::builder()
+                .with_verification_runtime_for_test()
+                .with_gateway_provider_root_for_test(upstream.uri().parse()?)
+                .start_bound(),
+        )
+        .await?;
+        server
+            .deploy_gateway_model_for_test("gpt-4o", "mcp_orchestration_invoker")
+            .await?;
+        server
+            .seed_role("mcp_orchestration_tools", &[Permission::tool_invoke_any()])
+            .await?;
+        let admin = server
+            .bootstrap_service("mcp-orchestration-admin", &["admin"])
+            .await?;
+        let cards = Cards::connect_with(&client(&server, api_key(&admin)?)?).await?;
+        let desk = Box::pin(cards.declare_from_path(Path::new(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../../fixtures/cards/verifier_orchestration/orchestration-desk.yaml"
+        ))))
+        .await?;
+        let review = desk
+            .outcomes
+            .iter()
+            .find(|outcome| outcome.card_ref.name.as_str() == "specialist-review")
+            .and_then(|outcome| outcome.card_ref.uid.as_ref())
+            .ok_or("orchestration-desk registers specialist-review")?
+            .to_string();
+        let desk_uid = desk
+            .root
+            .uid
+            .clone()
+            .ok_or("a registered Card has a UID")?
+            .to_string();
+        let principal = server
+            .credential_registered_service(
+                &desk.root,
+                &[
+                    "editor",
+                    "mcp_orchestration_invoker",
+                    "mcp_orchestration_tools",
+                ],
+            )
+            .await?;
+        let agent = connect_rooted(&server, &principal).await?;
+        let enqueue = |question: &str| {
+            let agent = &agent;
+            let arguments = serde_json::json!({
+                "verifier_card_uid": review,
+                "card_uid": desk_uid,
+                "inputs": { "question": { "kind": "json", "value": question } },
+            });
+            async move {
+                let accepted = structured(agent.call_tool(call(ENQUEUE, arguments)?).await?)?;
+                Ok::<_, McpJourneyError>(text(&accepted, "/execution_id")?.to_owned())
+            }
+        };
+
+        let cases = [
+            Case {
+                question: "NEITHER",
+                statuses: ["succeeded", "skipped", "skipped", "skipped"],
+                called: &["GENERAL:", "CONSOLIDATE:"],
+                collections: [("skipped", &[]), ("skipped", &[])],
+                published: &[("general", "account")],
+            },
+            Case {
+                question: "SECURITY-ONLY",
+                statuses: ["succeeded", "succeeded", "skipped", "succeeded"],
+                called: &["GENERAL:", "SECURITY:", "CONSOLIDATE:", "QUOTE:"],
+                collections: [("succeeded", &["account"]), ("skipped", &[])],
+                published: &[("general", "account"), ("security", "account")],
+            },
+            Case {
+                question: "BOTH",
+                statuses: ["succeeded", "succeeded", "failed", "succeeded"],
+                called: &["GENERAL:", "SECURITY:", "STYLE:", "CONSOLIDATE:", "QUOTE:"],
+                collections: [("succeeded", &["account"]), ("failed", &["draft"])],
+                published: &[
+                    ("general", "account"),
+                    ("security", "account"),
+                    ("style", "draft"),
+                ],
+            },
+            Case {
+                question: "UNDECIDED",
+                statuses: ["succeeded", "failed", "skipped", "skipped"],
+                called: &["GENERAL:", "CONSOLIDATE:"],
+                collections: [("failed", &[]), ("skipped", &[])],
+                published: &[("general", "account")],
+            },
+        ];
+        for case in cases {
+            let question = case.question;
+            let id = enqueue(question).await?;
+            let state = settle(&agent, &id).await?;
+            let outcome = &state["result"]["outcome"];
+            let step = |id: &str| {
+                outcome["steps"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .find(|step| step["id"] == id)
+                    .cloned()
+                    .unwrap_or_default()
+            };
+            let statuses =
+                ["plan", "security", "style", "quote"].map(|id| step(id)["status"].clone());
+            assert_eq!(
+                statuses,
+                case.statuses.map(JsonValue::from),
+                "{question}: {state}"
+            );
+            assert_eq!(step("general")["status"], "succeeded", "{question}");
+            let consolidated = outcome["requirements"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .find(|requirement| requirement["id"] == "consolidated")
+                .map(|requirement| requirement["outcome"].clone());
+            assert_eq!(
+                consolidated,
+                Some(JsonValue::from("passed")),
+                "{question}: consolidation reads failed and skipped collections"
+            );
+            if question == "UNDECIDED" {
+                let security = step("security");
+                assert!(
+                    security["reason"]
+                        .as_str()
+                        .is_some_and(|reason| reason.contains("kind (null, bool)")),
+                    "{question}: {security}"
+                );
+            }
+            if step("quote")["status"] == "skipped" {
+                let quote = step("quote");
+                assert_eq!(quote["attempts"], 0, "{question}: {quote}");
+                assert!(
+                    quote["reason"].as_str().is_some_and(|reason| {
+                        reason.starts_with("step `security` has no successful attempt to publish")
+                    }),
+                    "{question}: a skipped quote names the missing producer: {quote}"
+                );
+            }
+            for marker in ["GENERAL:", "SECURITY:", "STYLE:", "CONSOLIDATE:", "QUOTE:"] {
+                let ran = !asked(&upstream, marker, question).await?.is_empty();
+                assert_eq!(ran, case.called.contains(&marker), "{question}: {marker}");
+            }
+            let consolidator = asked(&upstream, "CONSOLIDATE:", question).await?;
+            let read = consolidator
+                .last()
+                .ok_or("the consolidator called the model")?;
+            for (collection, (status, names)) in
+                ["security", "style"].into_iter().zip(case.collections)
+            {
+                let manifest = manifest(read, &format!("c-{collection}"))?;
+                let entries: Vec<&str> = manifest["entries"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .filter_map(|entry| entry["name"].as_str())
+                    .collect();
+                assert_eq!(
+                    (
+                        manifest["status"].as_str(),
+                        manifest["speculation"].as_str(),
+                        entries.as_slice()
+                    ),
+                    (Some(status), Some("none"), names),
+                    "{question}: {collection} {manifest}"
+                );
+            }
+            let page: PublicationPage = serde_json::from_value(structured(
+                agent
+                    .call_tool(call(
+                        "verification.list_publications",
+                        serde_json::json!({ "execution_id": id }),
+                    )?)
+                    .await?,
+            )?)?;
+            let mut published: Vec<_> = page
+                .items
+                .iter()
+                .map(|item| (item.producer.step_id.as_str(), item.name.as_str()))
+                .collect();
+            published.sort_unstable();
+            assert_eq!(published, case.published, "{question}");
+            assert!(
+                page.items
+                    .iter()
+                    .all(|item| item.speculation == Speculation::None),
+                "{question}: no specialist is speculative"
+            );
+        }
+
+        let held = enqueue("HELD").await?;
+        let deadline = tokio::time::Instant::now() + SETTLE;
+        while asked(&upstream, "PLAN:", "HELD").await?.is_empty() {
+            if tokio::time::Instant::now() >= deadline {
+                return Err("the held plan never reached the model".into());
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        let cancelled: CancelExecutionResponse = serde_json::from_value(structured(
+            agent
+                .call_tool(call(
+                    "verification.cancel",
+                    serde_json::json!({ "execution_id": held }),
+                )?)
+                .await?,
+        )?)?;
+        assert_eq!(
+            (cancelled.execution_id.to_string(), cancelled.status),
+            (held.clone(), VerificationExecutionStatus::Cancelled)
+        );
+        let state = settle(&agent, &held).await?;
+        assert_eq!(state["status"], "cancelled", "{state}");
+        agent.cancel().await?;
+        server.shutdown().await?;
+        Ok(())
+    }
 }

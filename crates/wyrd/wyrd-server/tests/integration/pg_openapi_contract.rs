@@ -1528,13 +1528,19 @@ async fn card_contract_publishes_typed_lifecycle_and_problem_shapes() {
 /// `evaluation_runs`, `/evaluations`), while descriptive `Evaluation` prose
 /// and words such as `retrieval` stay legal. A recorded tool call names one
 /// built-in by its dotted identity, the new `fs.write` and `publish`
-/// included, and never by its provider-facing spelling.
+/// included, and never by its provider-facing spelling. A step publishes
+/// its orchestration controls (`depends_on` with its `any_succeeded` form,
+/// `when`, `foreach`, `repeat`, `speculative`) and a Verifier its `limits`;
+/// invocation and publication listings report each producer's speculative
+/// disposition, one of the five the contract names, and its branch item,
+/// iteration, and attempt.
 ///
 /// # Panics
 /// Panics when the server fails to start or stop, when a Verification path,
 /// method, status, or schema reference differs, when a recorded tool
-/// identity is missing or provider-spelled, or when the document names a
-/// retired evaluation identifier.
+/// identity is missing or provider-spelled, when an orchestration control,
+/// disposition, or producer field is unpublished, or when the document names
+/// a retired evaluation identifier.
 #[tokio::test]
 async fn verification_contract_publishes_eleven_typed_operations_and_the_local_upload() {
     let server = WyrdTestServer::start_in_process()
@@ -1704,6 +1710,58 @@ async fn verification_contract_publishes_eleven_typed_operations_and_the_local_u
             .iter()
             .all(|name| name.contains('.') || *name == "publish"),
         "recorded tools keep their dotted identity, never a provider spelling: {tools:?}"
+    );
+
+    let schemas = &document["components"]["schemas"];
+    let properties = |name: &str| -> BTreeSet<String> {
+        let schema = resolve_schema(&document, &schemas[name]);
+        let flattened = schema["allOf"].as_array().into_iter().flatten();
+        let found: BTreeSet<String> = std::iter::once(schema)
+            .chain(flattened)
+            .filter_map(|part| part["properties"].as_object())
+            .flat_map(|properties| properties.keys().cloned())
+            .collect();
+        assert!(!found.is_empty(), "{name} is an object schema: {schema}");
+        found
+    };
+    let step = properties("Step");
+    assert!(
+        ["depends_on", "when", "foreach", "repeat", "speculative"]
+            .iter()
+            .all(|control| step.contains(*control)),
+        "a step publishes every orchestration control: {step:?}"
+    );
+    assert!(
+        properties("VerifierSpec").contains("limits"),
+        "a Verifier publishes its authored limits"
+    );
+    assert!(
+        schemas["DependsOn"].to_string().contains("any_succeeded"),
+        "depends_on publishes its any_succeeded form: {}",
+        schemas["DependsOn"]
+    );
+    let speculation: BTreeSet<&str> = resolve_schema(&document, &schemas["Speculation"])["enum"]
+        .as_array()
+        .expect("a speculative disposition is an enum")
+        .iter()
+        .filter_map(Value::as_str)
+        .collect();
+    assert_eq!(
+        speculation,
+        BTreeSet::from(["none", "pending", "admitted", "discarded", "blocked"])
+    );
+    for listed in ["ExecutionInvocation", "PublicationSummary"] {
+        assert!(
+            properties(listed).contains("speculation"),
+            "{listed} reports its producer's speculative disposition"
+        );
+    }
+    let producer = properties("Producer");
+    assert!(
+        ["step_id", "item_index", "iteration_index", "attempt"]
+            .iter()
+            .all(|field| producer.contains(*field)),
+        "a producer names its branch item, iteration, and attempt: {producer:?}"
     );
 
     let retired = retired_vocabulary(&document.to_string());

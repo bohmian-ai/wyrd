@@ -131,6 +131,8 @@ struct Script {
     actions: HashMap<&'static str, Behavior>,
     /// Check result by requirement ID; unscripted checks error.
     checks: HashMap<&'static str, Result<CheckOutput, BlockError>>,
+    /// Checks that wait for their signal before returning their result.
+    held: HashMap<&'static str, Arc<Notify>>,
     /// `action:<id>` / `check:<id>` in call order.
     log: Mutex<Vec<String>>,
     /// Attempts made per step.
@@ -244,16 +246,23 @@ impl ActionExecutor for Script {
 
 #[async_trait]
 impl CheckExecutor for Script {
-    /// Return the requirement's scripted result.
+    /// Return the requirement's scripted result, after its signal when it
+    /// is held.
     ///
     /// # Errors
     /// Returns the scripted error, or a terminal error when unscripted.
     ///
     /// # Panics
     /// Panics when another call panicked while holding the log lock.
+    ///
+    /// # Cancellation
+    /// A held call waits for its signal; dropping it is safe.
     async fn execute(&self, call: BlockCall<'_, Check>) -> Result<CheckOutput, BlockError> {
         self.record(format!("check:{}", label(&call)));
         self.mount(call.id, &call.workspace);
+        if let Some(signal) = self.held.get(call.id.as_str()) {
+            signal.notified().await;
+        }
         self.checks
             .get(call.id.as_str())
             .cloned()
@@ -3536,6 +3545,182 @@ async fn waiting_blocks_release_unrelated_permits() {
     assert!(x.is_ok() && y.is_ok(), "{x:?} {y:?}");
     let calls = script.calls();
     assert!(at(&calls, "action:a") < at(&calls, "action:b"), "{calls:?}");
+}
+
+/// A check waiting for capacity spends nothing: while a code check holds
+/// the run's only permit, the Agent check beside it is neither recorded nor
+/// called, so after an interruption the reclaimed execution still has the
+/// one Agent invocation to judge it. The interrupted code check, which was
+/// dispatched, stays recorded.
+///
+/// # Panics
+/// Panics when the waiting check is recorded or called before it is
+/// admitted, or the reclaimed execution cannot judge it.
+#[tokio::test(start_paused = true)]
+async fn waiting_checks_spend_only_after_admission() {
+    let spec = verifier(json!({
+        "inputs": {"answer": {"type": "json"}},
+        "limits": {"concurrency": 1, "max_agent_invocations": 1},
+        "requirements": [
+            {"id": "slow", "statement": "slow", "check": code_check(json!({"x": "inputs.answer"}))},
+            {"id": "judged", "statement": "judged", "check": answer_agent()}
+        ]
+    }));
+    let passed = || {
+        Ok(verdict(
+            VerificationVerdict::Passed,
+            json!([{"slot": "answer", "locator": {"json_pointer": "/text"}}]),
+        ))
+    };
+    let stalled = Arc::new(Script {
+        checks: HashMap::from([("slow", passed()), ("judged", passed())]),
+        held: HashMap::from([("slow", Arc::new(Notify::new()))]),
+        ..Script::default()
+    });
+    let ledger = Arc::new(Ledger::default());
+    let interrupted = run(
+        &engine(&stalled, InMemoryTraceSource::new(), 4).with_checkpoints(
+            Arc::clone(&ledger) as Arc<dyn Checkpoints>,
+            &ExecutionState::default(),
+        ),
+        &spec,
+        json!({"answer": {"text": "a"}}),
+    )
+    .await;
+    assert!(
+        matches!(interrupted, Err(EngineError::DeadlineExceeded)),
+        "{interrupted:?}"
+    );
+    assert_eq!(
+        stalled.calls(),
+        ["check:slow"],
+        "the waiting check is not called"
+    );
+    assert_eq!(
+        ledger.attempts(),
+        [("slow".to_owned(), 1, false)],
+        "only the dispatched check is recorded"
+    );
+
+    let recovered = Arc::new(Script {
+        checks: HashMap::from([("slow", passed()), ("judged", passed())]),
+        ..Script::default()
+    });
+    let outcome = run(
+        &engine(&recovered, InMemoryTraceSource::new(), 4).with_checkpoints(
+            Arc::clone(&ledger) as Arc<dyn Checkpoints>,
+            &ledger.recorded(),
+        ),
+        &spec,
+        json!({"answer": {"text": "a"}}),
+    )
+    .await
+    .expect("outcome");
+    assert_eq!(recovered.calls(), ["check:slow", "check:judged"]);
+    let judged = requirement(&outcome, "judged");
+    assert_eq!(judged.outcome, RequirementOutcome::Passed, "{judged:?}");
+    assert_eq!(
+        ledger.attempts(),
+        [
+            ("judged".to_owned(), 1, true),
+            ("slow".to_owned(), 1, false),
+            ("slow".to_owned(), 2, true)
+        ],
+        "the interrupted check keeps its attempt"
+    );
+}
+
+/// A capacity refusal from one step check defers the execution only after
+/// the step's other dispatched check settles: the running Agent check's
+/// settlement is recorded before the refusal returns, the refused check's
+/// attempt is forgotten, and the reclaimed execution calls only the refused
+/// check, without spending the one Agent invocation again.
+///
+/// # Panics
+/// Panics when the refusal returns while the sibling still runs, drops its
+/// settlement, or recovery calls the settled check again.
+#[tokio::test(start_paused = true)]
+async fn capacity_refusal_lets_dispatched_checks_settle() {
+    let spec = verifier(json!({
+        "inputs": {"answer": {"type": "json"}},
+        "limits": {"max_agent_invocations": 1},
+        "steps": [{
+            "id": "work",
+            "action": code_action(json!({"x": "inputs.answer"})),
+            "requirements": [
+                {"id": "running", "statement": "running", "check": answer_agent()},
+                {"id": "refused", "statement": "refused", "check": code_check(json!({"x": "inputs.answer"}))}
+            ]
+        }]
+    }));
+    let passed = || {
+        Ok(verdict(
+            VerificationVerdict::Passed,
+            json!([{"slot": "answer", "locator": {"json_pointer": "/text"}}]),
+        ))
+    };
+    let release = Arc::new(Notify::new());
+    let refusing = Arc::new(Script {
+        checks: HashMap::from([
+            ("running", passed()),
+            (
+                "refused",
+                Err(BlockError::Busy {
+                    reason: "no worker".to_owned(),
+                }),
+            ),
+        ]),
+        held: HashMap::from([("running", Arc::clone(&release))]),
+        ..Script::default()
+    });
+    let ledger = Arc::new(Ledger::default());
+    let engine_under_test = engine(&refusing, InMemoryTraceSource::new(), 4).with_checkpoints(
+        Arc::clone(&ledger) as Arc<dyn Checkpoints>,
+        &ExecutionState::default(),
+    );
+    let refusal = run(&engine_under_test, &spec, json!({"answer": {"text": "a"}}));
+    tokio::pin!(refusal);
+    assert!(
+        tokio::time::timeout(Duration::from_secs(5), &mut refusal)
+            .await
+            .is_err(),
+        "the refusal waits for the running check"
+    );
+    assert_eq!(
+        refusing.calls(),
+        ["action:work", "check:running", "check:refused"]
+    );
+    release.notify_one();
+    let refused = refusal.await;
+    assert!(matches!(refused, Err(EngineError::Busy(_))), "{refused:?}");
+    assert_eq!(
+        ledger.attempts(),
+        [
+            ("running".to_owned(), 1, true),
+            ("work".to_owned(), 1, true)
+        ],
+        "the running check settles and the refused attempt is forgotten"
+    );
+
+    let recovered = Arc::new(Script {
+        checks: HashMap::from([("running", passed()), ("refused", passed())]),
+        ..Script::default()
+    });
+    let outcome = run(
+        &engine(&recovered, InMemoryTraceSource::new(), 4).with_checkpoints(
+            Arc::new(Ledger::default()) as Arc<dyn Checkpoints>,
+            &ledger.recorded(),
+        ),
+        &spec,
+        json!({"answer": {"text": "a"}}),
+    )
+    .await
+    .expect("outcome");
+    assert_eq!(recovered.calls(), ["check:refused"]);
+    for id in ["running", "refused"] {
+        let judged = requirement(&outcome, id);
+        assert_eq!(judged.outcome, RequirementOutcome::Passed, "{judged:?}");
+    }
 }
 
 /// An inline Agent action or check reading the `answer` input.

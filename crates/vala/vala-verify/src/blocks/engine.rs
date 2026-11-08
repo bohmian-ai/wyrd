@@ -1417,8 +1417,14 @@ impl VerificationEngine {
     /// concurrently, returning them in declaration order, each attributed to
     /// the frame's item and iteration.
     ///
+    /// A capacity refusal waits for the other dispatched checks to settle
+    /// before it returns, so their accepted settlements are kept.
+    ///
     /// # Errors
     /// Returns the first orchestration failure a judgment returns.
+    ///
+    /// # Panics
+    /// Panics when `index` does not name a step of `spec`.
     async fn instance_requirements(
         &self,
         spec: &Arc<VerifierSpec>,
@@ -1440,7 +1446,7 @@ impl VerificationEngine {
         }
         while !running.is_empty() {
             let (at, result) = running.next(EngineError::Join).await;
-            results.push((at, result?));
+            results.push((at, settled(result, &mut running).await?));
         }
         results.sort_by_key(|(at, _)| *at);
         Ok(results.into_iter().map(|(_, result)| result).collect())
@@ -1452,8 +1458,11 @@ impl VerificationEngine {
     /// and every explicit binding gap; the strongest cause wins, so a failed
     /// binding is never hidden behind an intentionally skipped owner. A
     /// requirement with a gap takes the gap's outcome without calling its
-    /// check; an Agent check finding the run's budget spent is inconclusive
-    /// without a call; otherwise the check runs under the concurrency bound.
+    /// check. Otherwise the prepared check first waits for capacity, the run's
+    /// bound then the engine's, and only once admitted spends an Agent
+    /// invocation and records its attempt, so a check waiting for capacity
+    /// spends nothing; an Agent check finding the run's budget spent is
+    /// inconclusive without a call.
     ///
     /// # Errors
     /// Returns [`EngineError::Capture`] when an actual value cannot be
@@ -1489,6 +1498,7 @@ impl VerificationEngine {
         let spec = Arc::clone(spec);
         Ok(Prepared::Run(Box::pin(async move {
             let requirement = requirement_at(&spec, key);
+            let _permits = engine.admit().await;
             if matches!(requirement.check, Check::Agent(_)) && !engine.spend() {
                 return Judged::inconclusive(BUDGET_SPENT.to_owned()).report(&spec, key, instance);
             }
@@ -1631,8 +1641,9 @@ impl VerificationEngine {
     /// assertion selecting no value, with reason [`EMPTY_SELECTION`], so an
     /// empty selection never passes vacuously.
     ///
-    /// The check is timed into [`BLOCK_DURATION_SECONDS`] after the permit
-    /// is held, inside a debug `verification.block` span; a check that could
+    /// The caller holds the check's permits. The check is timed into
+    /// [`BLOCK_DURATION_SECONDS`] inside a debug `verification.block` span; a
+    /// check that could
     /// not judge (an uncomparable value, an unreadable trace, a failed or
     /// refused executor) records `outcome="error"`.
     ///
@@ -1656,7 +1667,6 @@ impl VerificationEngine {
         deadline: Instant,
         producer: &Producer,
     ) -> Result<Judged, EngineError> {
-        let _permits = self.admit().await;
         let sources = bindings.sources();
         let Bindings { inputs, workspace } = bindings;
         let timer = BlockTimer::start(&self.clock, "check", check_kind(&requirement.check));

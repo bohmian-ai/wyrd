@@ -20,16 +20,16 @@ const EXAMPLE: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/finance-release");
 /// report text.
 const APPROVES: &str = r#"{"outcome":"passed","reason":"an external audit may receive this report","citations":[{"slot":"report","locator":{"json_pointer":"/text"}}]}"#;
 
-/// The program prints a passing verdict from both Verifiers for the
-/// permitted release, and fails `report-policy` on its bank account
-/// assertion for the release that names one.
+/// The program prints a passing `release-check` for the permitted release,
+/// and a failing one, on its bank account assertion, for the release that
+/// names one.
 ///
 /// # Panics
 /// Panics when the server cannot start, the program fails, or it prints
 /// anything else.
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "requires the repository-managed Postgres journey lifecycle"]
-async fn finance_release_verifies_both_releases() {
+async fn finance_release_passes_and_fails() {
     let model = MockServer::start().await;
     Mock::given(method("POST"))
         .and(path("/v1/chat/completions"))
@@ -100,13 +100,11 @@ async fn finance_release_verifies_both_releases() {
 
     assert_eq!(
         String::from_utf8(output.stdout).expect("the program prints UTF-8"),
-        "permitted release\n\
-         \x20 report-policy: passed\n\
-         \x20 release-access: passed\n\
-         release naming a bank account\n\
-         \x20 report-policy: failed\n\
-         \x20   not passed: The report names no bank account.\n\
-         \x20 release-access: passed\n",
+        "Quarterly total $120.\n\
+         \x20 release-check: passed\n\
+         Quarterly total $120. Paid from BANK-ACCOUNT-DEMO-001.\n\
+         \x20 release-check: failed\n\
+         \x20   not passed: The report names no bank account.\n",
     );
     server.shutdown().await.expect("test server shuts down");
 }

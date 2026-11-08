@@ -461,3 +461,217 @@ structure and reversible local organization remain implementation-owned.
 - [Bifrost sampling, memory and durability](../../../../architecture/bifrost-design.md)
 - [Security posture](../../../../architecture/wyrd-security-posture.md)
 - [Benchmark method](../../../../benchmarks/README.md)
+
+## Implementation Evidence
+
+Candidate `bea7f8b4c` (Wyrd `78aad72c9`, `fcfe12740`, `6a134deb8`, `b3a6363a4`,
+`bea7f8b4c`) on immediate baseline `aa2a6a0d8`. Arrow fork on `wyrd-production`:
+`394d4b0757488d70df9a78c0c271ab3c8fbc2928` (`a11acb8` scenario 4, `394d4b0`
+scenario 5, on `ca5feff`), pinned in `Cargo.toml`, `Cargo.lock` and the
+workspace-hack. Every Wyrd benchmark record is `dirty: false`; the only
+untracked path is an unrelated change packet. Host: Ryzen 9 9950X, 32 CPU /
+91 GiB, Linux x86_64, rustc 1.99.0, release with frame pointers.
+
+### Reuse map
+
+- **Token bound:** `routes.rs::token_bound` still measures the serialized body
+  length that `usage_bound` consumes. It now counts it through
+  `serde_json::to_writer` into a byte counter (`SerializedLength`), so the
+  serialization semantics are unchanged and no text is built.
+- **Native body:** `adapter/http.rs::NativeBody` keeps its single serializer.
+  `to_json` estimates the exact length from the `Value` tree and serializes once
+  into a `Vec` of that capacity. The providers' existing `send_raw`/`stream_raw`
+  take ownership of that `Vec` (no `RawValue` box, no shrink). No length
+  contract was added.
+- **Residuals:** the fork's `VariantValueArrayBuilder` reserves the top-level
+  residual from the input's row lengths (`reserve_for_row`). A top-level row
+  whose stored value bytes need no rewrite (no shredded field present, or no
+  typed output) is referenced in the input buffer (`append_shared`). `build`
+  keeps a shared buffer only when the rows reference at least half of it, and
+  otherwise copies those rows. Wyrd's `retained_arrow_bytes` already charges full
+  buffer capacity, so a kept buffer is charged in full. Nested residuals,
+  sampling, trimming and reservations are unchanged.
+- **Capture batches:** `ScribeSink::frames` groups captures greedily by
+  `CallCapture::row_bytes` plus the attributed columns before projecting. Each
+  group is projected once by the existing `CallCapture::project`, which falls
+  back to per-capture projection. The `chunks` split then cuts already bounded
+  batches and no longer needs `take_record_batch`. Batch sizes, concurrency,
+  admission, loss and the oversize policy are unchanged.
+- **Response collection:** `read_bounded_bytes` sizes its `Vec` from
+  `Content-Length` capped at the bound. Actual-byte enforcement per chunk is
+  unchanged. Server ingress body collection was not touched.
+- **Validation (scenario 3): not changed.** `typed_body` deserializes
+  `GatewayChatCompletionsRequest` (skald-spec) from `&Value`. That type owns
+  `String`/`Value` fields and flattens provider settings, so any typed check
+  materializes the payload. Avoiding the copy would mean either borrowing public
+  contract types or a second validator that duplicates the parser. Both are
+  stop conditions.
+
+| Acceptance criterion | Implementation evidence | Verification evidence | Result |
+|---|---|---|---|
+| REQ-010; AC-008 (scenario 1) | `routes.rs::token_bound`, `SerializedLength` | `usage_bound_tests::usage_bound_requires_an_output_maximum_where_output_exists` extended: exact length parity on escapes, unicode, numbers and a 2 MiB body; RED 3,146,387 B allocated, GREEN < 4096 B | PASS |
+| REQ-010; AC-008 (scenario 2) | `adapter/http.rs::NativeBody::to_json`, providers `send_raw`/`stream_raw` take `Vec<u8>` | `adapter::tests::compatible_passthrough_rewrites_model_and_uses_provider_credential` extended: byte parity with `serde_json::to_vec` on a 1 MiB escaped body with extensions, with and without a model; capacity equals the up-front estimate and ≤ len + len/16 (RED: buffer grew) | PASS |
+| REQ-010; AC-008 (scenario 3) | none | `typed_body::<GatewayChatCompletionsRequest>` copies 2,098,793 B for a 2 MiB body (focused measurement) | FAIL: contract gap (see reuse map) |
+| REQ-008/009/011; INV-003/005/007; AC-007/009 (scenarios 4–5) | fork `shred_variant.rs` (`StoredValue`, `reserve_for_row`), `variant_array_builder.rs` (`append_shared`, ≥50% retention in `build`) | `shred_variant::tests::residual_encoding_reuses_storage_with_bounded_capacity` (new): RED 8,337,090 B for 2,098,336 input bytes, GREEN < 1.25× input, mostly-typed < 2.5×, logical parity, shared-row and validity matrix (RED on sharing for row 0); the three named object tests and all 546 package lib tests; learned-layout journey; redux 1002/1002 | PASS |
+| REQ-003/010/011; INV-004/006/008; AC-002/008/009 (scenario 6) | `capture.rs::row_bytes`, `scribe_outbox.rs::frames/chunks` | `scribe_outbox::tests::large_captures_reach_bounded_frames_without_a_split_copy` (new): RED 2,897,489 B for 1,155,960 content bytes, GREEN 1,224,313 B in 5 frames, each within budget, retained ≤ wire + wire/4 + 4096, exact readback, subjects, positions, and identical retry and peer ids; the five named outbox tests and capture test; peer, outage and cancellation journeys | PASS |
+| REQ-010; AC-008 (scenario 7) | `clients/mod.rs::read_bounded_bytes` | `clients::bounded_answers::oversized_answers_fail_and_refusals_keep_status_and_body` extended: known 100,000 B → capacity == len (RED 114,602), chunked, unrepresentable and oversized advertised lengths, truncated body; `native_transport_reuses_owned_buffers` | PASS |
+| REQ-012; AC-003/010; INV-008 | — | paired profiles, full L1 on both sides, rule reruns, main Gateway | see below; payload c64 peak RSS unresolved |
+
+Non-goals stayed excluded: no batching or concurrency retune, no server ingress
+change, no public, generated or durable contract change, no new dependency or
+feature. No codegen change.
+
+### AC-010 allocation, paired `--profile` (KiB per reconciled call)
+
+Runs: baseline `20261108T151913Z` and `20261108T154139Z`; candidate
+`20261108T153201Z` and `20261108T153536Z`, all VALID. Same method as TASK-003
+(Δ`alloc_space` over consecutive steps divided by Δ succeeded
+`gateway.buffered`/`gateway.stream.end`). A first baseline attempt
+(`20261108T153521Z`) went INVALID with `host.busy` from another session's
+build and was rerun.
+
+| Step | Baseline runs 1 / 2 | Candidate runs 1 / 2 | Δ |
+|---|---|---|---|
+| buffered-64kib-capture-payload.c64 | 2639 / 2637 | 1874 / 1859 | −29% |
+| buffered-64kib-capture-payload.c1 | 2883 / 2898 | 2134 / 2220 | −25% |
+| buffered-64kib-capture-metadata.c64 | 1154 / 1156 | 764 / 770 | −34% |
+| buffered-64kib-capture-metadata.c1 | 1173 / 1175 | 869 / 793 | −29% |
+| buffered-1kib-capture-metadata.c64 | 210 / 211 | 202 / 203 | −4% |
+
+Each side repeats to within 10%, and every 64 KiB reduction is larger than that.
+
+Inclusive `alloc_space` stacks over payload c64 minus the preceding c1
+interval. Each is an inclusive parent, so they do not add up. Baseline covers
+107,733 calls and candidate 159,944, so totals are not per call.
+
+| Stack | Baseline GiB | Candidate GiB |
+|---|---|---|
+| `token_bound` | 19.77 | 0.06 |
+| native `to_raw_value` / `to_json` | 26.42 | 9.73 |
+| `to_string<Value>` | 20.36 | 0.91 |
+| outbox `take_record_batch` | 13.36 | 0 |
+| ingress `shred_variant` | 53.86 | 40.55 |
+| `concat` | 13.21 | 19.81 |
+| outbox `encode` | 17.61 | 9.29 |
+| `typed_body` | 6.72 | 9.94 |
+| WAL `compress_to_vec` | 13.52 | 20.00 |
+
+Sizing materialization and the split copy are gone. Native serialization and
+residual growth fell (per call, 26.42/107,733 → 9.73/159,944 and
+53.86/107,733 → 40.55/159,944). One `concat` remains: the per-group projection
+in `CallCapture::project` that concatenates one-row Variant columns. Scenario 6
+removed only the second copy. `typed_body` (scenario 3) and the WAL zstd grow
+with call count.
+
+### Full unprofiled L1, candidate vs baseline `aa2a6a0d8`
+
+Records (gitignored `benchmarks/history`):
+- baseline `*-aa2a6a0d8.json`: writes-parquet `20261108T154622Z`, hot
+  `155343Z`, parquet `155830Z`, verification `160319Z`, gateway `160434Z`;
+- candidate `*-bea7f8b4c.json`: `161044Z`, `161805Z`, `162150Z`, `162638Z`,
+  `162753Z`.
+
+All five experiments ran their three repetitions on both sides. Errors, lost,
+shed and undrained are 0 on every repetition. Bifrost (all three) and Gateway
+are VALID on both sides. Verification is INVALID on both sides only for
+`driver.saturated` at c64: the driver used 6.43–6.55 cores against a 6.40
+limit. Every Verification criterion is met, and each Verification median is
+inside the baseline range (c64 p99 0.368 vs 0.350–0.389 ms, RSS 3106 vs
+2629–3417 MiB). Hot and parquet reads show no headline metric (rate, p99, peak
+RSS) more than 5% worse than the baseline range. Parquet c1 peak RSS sits
+3–5% above the baseline maximum (for example `span-trace-c1` 1973 vs
+1808–1884 MiB), while hot RSS is below it at every step.
+
+Gateway, candidate median vs baseline range:
+
+| Step | Rate req/s | CPU µs/req | p99 ms | Peak RSS MiB |
+|---|---|---|---|---|
+| buffered-1kib-capture-metadata.c1 | 4925 vs 5773–5858 | 248 vs 210–214 | 0.340 vs 0.245–0.256 | 717 vs 608–925 |
+| buffered-1kib-capture-metadata.c64 | 55073 vs 55675–57605 | 351 vs 346–364 | 1.455 vs 1.368–1.418 | 2196 vs 2021–2178 |
+| streamed-1kib-capture-metadata.c64 | 1537 vs 1538 | 931 vs 939–984 | 0.791 vs 0.490–0.560 | 1375 vs 1648–1875 |
+| buffered-64kib-capture-metadata.c1 | 2595 vs 3305–3382 | 441 vs 342–355 | 0.609 vs 0.366–0.406 | 1934 vs 1240–1504 |
+| buffered-64kib-capture-metadata.c64 | 23333 vs 20834–22065 | 838 vs 877–913 | 3.224 vs 3.357–3.721 | 2212 vs 2133–2196 |
+| buffered-64kib-capture-payload.c1 | 2414 vs 2437–2563 | 710 vs 689–725 | 0.673 vs 0.536–0.654 | 2271 vs 2462–2543 |
+| buffered-64kib-capture-payload.c64 | 8728 vs 5521–5793 | 1675 vs 1715–1753 | 56 vs 135–147 | 5085 vs 4606–4716 |
+
+Writes-parquet flagged `otlp-spans-c64`: rate 510 vs 532–768, p99 230 vs
+177–218 ms, RSS 3231 vs 3018–3079 MiB. It also flagged `otlp-logs-c64` RSS
+(4923 vs 3988–4469 MiB, with rate 563 vs 441–552) and `native-write-c1` p99
+(81 vs 28–59 ms).
+
+**Rule reruns, one fresh back-to-back pair per engine** (target records):
+- Gateway: baseline `20261108T170624Z`, candidate `20261108T171236Z`.
+  - Cleared: `buffered-1kib-capture-metadata.c1` 5337 vs 5012–5831 req/s and
+    233 vs 211–248 µs; `buffered-64kib-capture-metadata.c1` 3418 vs 3030–3356
+    req/s and 340 vs 358–459 µs; `streamed-1kib-capture-metadata.c64` p99
+    0.509 vs 0.468–0.505 ms (+0.7%).
+  - Payload c64 still exceeds the baseline in peak RSS: 5533 vs
+    4047–4439 MiB, with rate 8967 vs 5734–5827, CPU 1752 vs 1694–1707 µs
+    (+3%) and p99 53 vs 107–126 ms.
+- Writes: baseline `20261108T171531Z`, candidate `20261108T172651Z`.
+  - Cleared: `otlp-spans-c64` (955 vs 915–953 rows/s, p99 104 vs 115–182 ms,
+    RSS 2710 vs 2926–2997 MiB); `otlp-logs-c64` RSS (3980 vs 4114–4723 MiB);
+    `native-write-c1` p99 (120 vs 39–123 ms).
+  - `otlp-logs-c64` rate is 440 vs 461–692. It was 563 vs 441–552 in the full
+    run, so this step's spread across runs is larger than the difference. Its
+    single rerun did not clear it, and it is reported as unresolved.
+
+**Payload c64 peak RSS (unresolved).** Each repetition is a fixed 5 s window.
+The candidate completes about 55% more calls in it (43–46k vs 28–29k) and
+ingests 4.6–5.0 GiB of capture against 2.7–2.8 GiB, with drain 0.3–0.5 s vs
+0.75–0.96 s. Peak RSS per captured GiB is lower (0.97–1.22 vs 1.39–1.70 GiB),
+but absolute peak RSS exceeds the immediate baseline in every pair. Residual
+sharing is not the cause. A worktree with the fork at `a11acb8` (scenario 4
+only; record diff
+`ddbf272d5f37d3b628ae4ddef823d21c649ef8e7fd456ec11bea82c717cd0e91`) ran back to
+back with the candidate:
+- Gateway payload c64: no-share `20261108T174300Z` 5123–5500 MiB at
+  9.2k req/s, candidate `20261108T174533Z` 4859–5060 MiB at 9.1k req/s.
+- Writes `otlp-spans-c64`: no-share `20261108T175318Z` 2634–3054 MiB, candidate
+  `20261108T175509Z` 2552–3041 MiB.
+
+No equal-rate comparison exists, because the harness drives closed-loop clients
+without a rate cap. The extra RSS has not been proven to come from the higher
+ingest rate.
+
+**AC-003 vs main `5234961d5`** (Gateway `20261108T180612Z`, VALID, `dirty:
+false`). Every 64 KiB step beats main's range on rate, CPU and p99. Payload peak
+RSS is 5085 vs 7051–7385 MiB at c64 and 2271 vs 4471–4816 MiB at c1. Four
+medians fell outside main's range in the worse direction:
+- `buffered-1kib-capture-metadata.c1` p99 0.340 vs 0.306–0.316 ms;
+- `streamed-1kib-capture-metadata.c1` p99 0.952 vs 0.666–0.900 ms;
+- `streamed-1kib-capture-metadata.c64` p99 0.791 vs 0.498–0.612 ms;
+- `buffered-64kib-capture-metadata.c1` rate 2595 vs 2941–3160 req/s and p99
+  0.609 vs 0.437–0.459 ms.
+
+`buffered-64kib-capture-metadata.c64` RSS is 2212 vs 1761–2160 MiB (+2.4%,
+within 5%). The rule's fresh back-to-back pair (main `20261108T181100Z`,
+candidate `20261108T181353Z`, both VALID) clears all four:
+- 1 KiB c1: 5952 vs 5760–5872 req/s, p99 0.250 vs 0.247–0.252 ms;
+- streamed c1: p99 0.766 vs 0.720–0.880 ms;
+- streamed c64: p99 0.518 vs 0.501–0.557 ms;
+- 64 KiB metadata c1: 3429 vs 3148–3204 req/s, p99 0.380 vs 0.400–0.436 ms.
+
+### Commands
+
+```sh
+mise exec -- cargo nextest run --locked -p wyrd-server --lib -E 'test(/^components::gateway::routes::usage_bound_tests::/) or test(/^components::gateway::capture::tests::/) or test(/^scribe_outbox::tests::/)'   # 35/35
+mise exec -- cargo nextest run --locked -p wyrd-gateway --lib          # 67/67
+mise exec -- cargo nextest run --locked -p wyrd-skald-providers --lib  # 49/49
+cargo nextest run -p bohmian-parquet-variant-compute --lib             # fork, 546/546; clippy clean in touched files
+mise exec -- scripts/postgres/with-test-postgres.sh -- bash -lc 'mise run db:migrate:all:inner && cargo nextest run --locked -p wyrd-testing --test scribe -P journey --run-ignored=all -E "test(=write_read::learned_layout_evolution_preserves_published_evidence)"'
+mise exec -- scripts/postgres/with-test-postgres.sh -- bash -lc 'mise run db:migrate:all:inner && cargo nextest run --locked -p wyrd-testing --test gateway -P journey --run-ignored=all -E "test(=peer::oracle_only_gateway_captures_through_the_peer_scribe)"'
+mise exec -- scripts/postgres/with-test-postgres.sh -- bash -lc 'mise run db:migrate:all:inner && cargo nextest run --locked -p wyrd-testing --test gateway -P journey --run-ignored=all -E "test(=compatible::openai_compatible_streams_terminate_and_survive_a_capture_outage)"'
+mise exec -- scripts/postgres/with-test-postgres.sh -- bash -lc 'mise run db:migrate:all:inner && cargo nextest run --locked -p wyrd-testing --test gateway -P journey --run-ignored=all -E "test(=resilience::a_cancelled_call_is_still_settled_and_the_server_keeps_serving)"'
+mise run test:bifrost:integration:redux                                # 1002/1002
+mise run fmt:check && mise run lints && mise run check:deps && mise run check:tenant-isolation && mise run check:workspace-hack
+mise exec -- git diff --check
+mise run bench:l1:gateway -- --allow-dirty --profile                   # ×2 per side
+mise run bench:l1 -- --allow-dirty                                     # baseline and candidate
+mise run bench:l1:gateway -- --allow-dirty                             # main
+mise run bench:l1:gateway -- --allow-dirty --steps <step>              # rule rerun pair
+mise run bench:l1:bifrost:writes -- --allow-dirty --steps <step>       # rule rerun pair
+```
+
+Baseline, main and no-share artifacts (records, timings, profiles) are in `target/benchmarks-baseline` and
+`target/benchmarks-noshare`. Candidate profiles are in `target/benchmarks`.

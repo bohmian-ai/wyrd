@@ -1,7 +1,8 @@
 # A planner selects specialists while a generalist reviews; each selected
 # specialist runs, an unselected one is skipped before its workspace binds,
 # and the consolidator reads every settled collection whatever its outcome.
-# The quoter requires the security account by name.
+# The stylist and the quoter require the security account by name, so a
+# stylist skipped by its condition is skipped before that binding resolves.
 apiVersion: wyrd/v1
 kind: Verifier
 metadata:
@@ -38,6 +39,7 @@ spec:
         inputs: {question: inputs.question}
         workspace:
           /inputs/question.json: inputs.question
+          /inputs/security.json: steps.security.publications.account
     - id: consolidate
       action:
         kind: agent

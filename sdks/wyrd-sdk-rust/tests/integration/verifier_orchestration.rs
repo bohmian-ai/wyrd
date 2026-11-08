@@ -166,6 +166,7 @@ fn reply(request: &Request, script: &Script) -> ResponseTemplate {
             ("BOTH", json!({ "security": true, "style": true })),
             ("UNDECIDED", json!({ "security": null, "style": false })),
             ("FORGOTTEN", json!({ "style": false })),
+            ("SILENT", json!({ "security": true, "style": false })),
         ]
         .into_iter()
         .find(|(marker, _)| prompt.contains(marker));
@@ -173,6 +174,9 @@ fn reply(request: &Request, script: &Script) -> ResponseTemplate {
             Some((_, decision)) => answer(&decision),
             None => ResponseTemplate::new(200).set_body_json(json!({ "garbled": true })),
         };
+    }
+    if prompt.contains("SECURITY:") && prompt.contains("SILENT") {
+        return done();
     }
     if prompt.contains("GENERAL:") || prompt.contains("SECURITY:") {
         let focus = if prompt.contains("GENERAL:") {
@@ -751,17 +755,20 @@ struct Case {
     called: &'static [&'static str],
     /// The `security` and `style` collections' status and entry names.
     collections: [(&'static str, &'static [&'static str]); 2],
-    /// Text the failed `security` step's reason carries, when it failed.
-    security_reason: Option<&'static str>,
+    /// A failed step and text its reason carries, when one failed for a
+    /// reason the case pins.
+    reason: Option<(&'static str, &'static str)>,
 }
 
 /// A planner's decisions select specialists: true runs one, false skips it
-/// before its workspace binds and makes no call, and a `null`, missing, or
+/// before its workspace binds (the stylist's skip reason names its condition,
+/// never the security account it would mount) and makes no call, and a `null`, missing, or
 /// unreadable decision fails it as an evaluation error rather than skipping.
 /// The consolidator reads every settled collection whatever its outcome,
 /// the stylist's failed attempt keeping its partial draft and its failed
 /// status. The quoter, requiring the security account by name, runs only
-/// when that account was produced. With no specialist selected and only the
+/// when that account was produced: a security review that succeeds without
+/// publishing it fails the quoter before its model is called. With no specialist selected and only the
 /// specialist judged, the verdict is inconclusive. The CLI reports the same
 /// branch statuses and publications as the SDK.
 ///
@@ -779,42 +786,49 @@ async fn conditions_and_collections_preserve_missing_evidence() {
             statuses: [Succeeded, Skipped, Skipped, Skipped],
             called: &["GENERAL:", "CONSOLIDATE:"],
             collections: [("skipped", &[]), ("skipped", &[])],
-            security_reason: None,
+            reason: None,
         },
         Case {
             question: "SECURITY-ONLY",
             statuses: [Succeeded, Succeeded, Skipped, Succeeded],
             called: &["GENERAL:", "SECURITY:", "CONSOLIDATE:", "QUOTE:"],
             collections: [("succeeded", &["account"]), ("skipped", &[])],
-            security_reason: None,
+            reason: None,
         },
         Case {
             question: "BOTH",
             statuses: [Succeeded, Succeeded, Failed, Succeeded],
             called: &["GENERAL:", "SECURITY:", "STYLE:", "CONSOLIDATE:", "QUOTE:"],
             collections: [("succeeded", &["account"]), ("failed", &["draft"])],
-            security_reason: None,
+            reason: None,
         },
         Case {
             question: "UNDECIDED",
             statuses: [Succeeded, Failed, Skipped, Skipped],
             called: &["GENERAL:", "CONSOLIDATE:"],
             collections: [("failed", &[]), ("skipped", &[])],
-            security_reason: Some("kind (null, bool)"),
+            reason: Some(("security", "kind (null, bool)")),
         },
         Case {
             question: "FORGOTTEN",
             statuses: [Succeeded, Failed, Skipped, Skipped],
             called: &["GENERAL:", "CONSOLIDATE:"],
             collections: [("failed", &[]), ("skipped", &[])],
-            security_reason: Some("security"),
+            reason: Some(("security", "security")),
+        },
+        Case {
+            question: "SILENT",
+            statuses: [Succeeded, Succeeded, Skipped, Failed],
+            called: &["GENERAL:", "SECURITY:", "CONSOLIDATE:"],
+            collections: [("succeeded", &[]), ("skipped", &[])],
+            reason: Some(("quote", "published no `account`")),
         },
         Case {
             question: "UNPLANNED",
             statuses: [Failed, Failed, Failed, Skipped],
             called: &["GENERAL:", "CONSOLIDATE:"],
             collections: [("failed", &[]), ("failed", &[])],
-            security_reason: None,
+            reason: None,
         },
     ];
     for case in cases {
@@ -823,6 +837,16 @@ async fn conditions_and_collections_preserve_missing_evidence() {
         let statuses = ["plan", "security", "style", "quote"].map(|id| step(&result, id).status);
         assert_eq!(statuses, case.statuses, "{question}: {result:?}");
         assert_eq!(step(&result, "general").status, Succeeded, "{question}");
+        let style = step(&result, "style");
+        if style.status == Skipped {
+            assert!(
+                style
+                    .reason
+                    .as_deref()
+                    .is_some_and(|reason| reason.contains("`steps.plan.output.style` was false")),
+                "{question}: the condition skips before the account binding resolves: {style:?}"
+            );
+        }
         assert_eq!(
             requirement(&result, "consolidated").outcome,
             RequirementOutcome::Passed,
@@ -832,14 +856,14 @@ async fn conditions_and_collections_preserve_missing_evidence() {
             let ran = !desk.asked(marker, question).await.is_empty();
             assert_eq!(ran, case.called.contains(&marker), "{question}: {marker}");
         }
-        if let Some(cause) = case.security_reason {
-            let security = step(&result, "security");
+        if let Some((id, cause)) = case.reason {
+            let failed = step(&result, id);
             assert!(
-                security
+                failed
                     .reason
                     .as_deref()
                     .is_some_and(|reason| reason.contains(cause)),
-                "{question}: {security:?}"
+                "{question}: {failed:?}"
             );
         }
         let consolidator = desk.asked("CONSOLIDATE:", question).await;

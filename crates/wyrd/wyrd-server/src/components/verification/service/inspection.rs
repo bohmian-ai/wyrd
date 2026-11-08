@@ -26,7 +26,7 @@ use wyrd_spec::verification::execution::{
     CancelExecutionResponse, EXECUTION_PAGE_DEFAULT, EXECUTION_PAGE_MAX, ExecutionInvocation,
     ExecutionPageQuery, HistoryProjection, InvocationPage, InvocationProgress,
     InvocationSettlement, Publication, PublicationContent, PublicationFile, PublicationPage,
-    PublicationSelector, PublicationSummary, Speculation,
+    PublicationSelector, PublicationSummary,
 };
 use wyrd_spec::verification::state::{AcceptedPublication, ExecutionState, InvocationRecord};
 use wyrd_spec::verification::{PublicationName, TaskId, VerificationExecutionStatus};
@@ -181,8 +181,9 @@ fn page<T>(
     )
 }
 
-/// One invocation attempt's public progress.
-fn invocation(entry: InvocationRecord) -> ExecutionInvocation {
+/// One invocation attempt's public progress, with the disposition `state`
+/// recorded for its step.
+fn invocation(state: &ExecutionState, entry: InvocationRecord) -> ExecutionInvocation {
     let (progress, reason) = match entry.settlement {
         None => (InvocationProgress::Started, None),
         Some(InvocationSettlement::Action { result, .. }) => (
@@ -199,10 +200,10 @@ fn invocation(entry: InvocationRecord) -> ExecutionInvocation {
         ),
     };
     ExecutionInvocation {
+        speculation: state.speculation(&entry.producer.step_id),
         producer: entry.producer,
         progress,
         reason,
-        speculation: Speculation::None,
     }
 }
 
@@ -423,7 +424,10 @@ impl<'a> VerificationControl<'a> {
         Ok(InvocationPage {
             execution_id,
             status,
-            items: items.into_iter().map(invocation).collect(),
+            items: items
+                .into_iter()
+                .map(|entry| invocation(&state, entry))
+                .collect(),
             next_cursor,
             history: HistoryProjection {
                 acknowledged: u64::try_from(revision).unwrap_or_default(),
@@ -458,7 +462,7 @@ impl<'a> VerificationControl<'a> {
                         name: publication.name.clone(),
                         kind: publication.content.kind(),
                         producer: publication.producer.clone(),
-                        speculation: Speculation::None,
+                        speculation: state.speculation(&publication.producer.step_id),
                     },
                 )
             }),

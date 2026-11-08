@@ -136,6 +136,25 @@ pub enum ControlRecord {
     },
 }
 
+impl ExecutionState {
+    /// The recorded disposition of `step`'s contribution: what its
+    /// speculative guard decided, or `none` when nothing was recorded.
+    #[must_use]
+    pub fn speculation(&self, step: &TaskId) -> Speculation {
+        self.controls
+            .iter()
+            .find_map(|control| match control {
+                ControlRecord::Disposition {
+                    step: decided,
+                    speculation,
+                    ..
+                } if decided == step => Some(*speculation),
+                _ => None,
+            })
+            .unwrap_or(Speculation::None)
+    }
+}
+
 impl ControlRecord {
     /// The step this decision is about.
     #[must_use]
@@ -230,7 +249,32 @@ impl ExecutionState {
 
 #[cfg(test)]
 mod tests {
-    use super::{EXECUTION_STATE_FORMAT, ExecutionState, ExecutionStateError};
+    use super::{
+        ControlRecord, EXECUTION_STATE_FORMAT, ExecutionState, ExecutionStateError, Speculation,
+        TaskId,
+    };
+
+    /// A step's recorded disposition is what inspection reports; a step
+    /// with none recorded reports `none`.
+    ///
+    /// # Panics
+    /// Panics when a recorded disposition is not reported, or an
+    /// undecided step reports one.
+    #[test]
+    fn recorded_dispositions_are_reported() {
+        let critic = TaskId::new("critic").expect("valid step id");
+        let reader = TaskId::new("reader").expect("valid step id");
+        let state = ExecutionState {
+            controls: vec![ControlRecord::Disposition {
+                step: critic.clone(),
+                speculation: Speculation::Discarded,
+                reason: "the reader failed".to_owned(),
+            }],
+            ..ExecutionState::fresh()
+        };
+        assert_eq!(state.speculation(&critic), Speculation::Discarded);
+        assert_eq!(state.speculation(&reader), Speculation::None);
+    }
 
     /// Only [`EXECUTION_STATE_FORMAT`] decodes: a newer, missing, or
     /// earlier format is incompatible and a state that does not decode is

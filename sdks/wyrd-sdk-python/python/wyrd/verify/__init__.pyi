@@ -270,6 +270,8 @@ class DataModel(Protocol):
         """
         ...
 
+Speculation: TypeAlias = Literal["none", "pending", "admitted", "discarded", "blocked"]
+
 class RequirementResult(TypedDict, Generic[DataT]):
     """One requirement's judgment.
 
@@ -289,6 +291,8 @@ class RequirementResult(TypedDict, Generic[DataT]):
     detail: NotRequired[RequirementDetail]
     check: Check
     provenance: NotRequired[CallProvenance]
+    item_index: NotRequired[int | None]
+    iteration_index: NotRequired[int | None]
 
 BuiltinTool: TypeAlias = Literal[
     "cards.list",
@@ -405,7 +409,7 @@ class ExecutionInvocation(TypedDict):
     status: NotRequired[Literal["succeeded", "failed", "skipped"]]
     outcome: NotRequired[RequirementOutcome]
     reason: str | None
-    speculation: Literal["none"]
+    speculation: Speculation
 
 class HistoryProjection(TypedDict):
     """How many of the execution's history batches Bifrost acknowledged, holds, or failed."""
@@ -431,7 +435,7 @@ class PublicationSummary(TypedDict):
     name: str
     kind: PublicationKind
     producer: Producer
-    speculation: Literal["none"]
+    speculation: Speculation
 
 class PublicationPage(TypedDict):
     """``Execution.publications()``: one page of accepted publications in commit order."""

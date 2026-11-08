@@ -1747,6 +1747,26 @@ export interface DeclarationReceipt {
 }
 
 /**
+ * A step's dependencies beyond the ones its references imply.
+ *
+ * The list form orders the step after every listed step whatever its
+ * status. The object form `{any_succeeded: [...]}` makes the step
+ * eligible once any listed step settled `succeeded`; when every listed step
+ * settled otherwise, the step does not run.
+ */
+export type DependsOn = readonly TaskId[] | DependsOnAnySucceeded;
+
+/**
+ * Predecessors of which one must succeed.
+ */
+export interface DependsOnAnySucceeded {
+  /**
+   * Nonempty, unique, known steps.
+   */
+  readonly any_succeeded: readonly TaskId[];
+}
+
+/**
  * Who may invoke a deployment beyond its administrators.
  *
  * Neither value permits anonymous inference: every call still needs a
@@ -2344,6 +2364,32 @@ export interface FieldSpec2Input {
    * Whether the column is nullable. Defaults to `true`.
    */
   readonly nullable?: boolean;
+}
+
+/**
+ * Bounded fanout of one step's action: exactly one of `count` or `items`.
+ *
+ * Each item is an independent invocation with its own zero-based index,
+ * attempts, and private scratch. Validation refuses any other shape.
+ */
+export interface Foreach {
+  /**
+   * Most items running at once; only lowers the execution's limit.
+   */
+  readonly concurrency?: number | null;
+  /**
+   * A positive number of identical invocations.
+   */
+  readonly count?: number | null;
+  /**
+   * A reference to a JSON array frozen whole before any item runs.
+   */
+  readonly items?: Reference | null;
+  /**
+   * The most items `items` may hold; required with `items`. A longer
+   * array fails the step without running any item.
+   */
+  readonly max_items?: number | null;
 }
 
 /**
@@ -5157,7 +5203,7 @@ export interface RefSibling {
 }
 
 /**
- * Scope reference: inputs.<slot>, steps.<id>.output, steps.<id>.status, steps.<id>.requirements.<id>.outcome|reason, requirement.id, or requirement.statement, with .field, [n], and (in assert each) [*] selectors below inputs and step outputs; an Agent workspace source may also mount steps.<id>.publications or steps.<id>.publications.<name>.
+ * Scope reference: inputs.<slot>, steps.<id>.output, steps.<id>.status, steps.<id>.requirements.<id>.outcome|reason, requirement.id, requirement.statement, item, item_index, iteration.output, iteration.previous, or iteration.index, with .field, [n], and (in assert each) [*] selectors below inputs, step outputs, item, and iteration outputs; an Agent workspace source may also mount steps.<id>.publications or steps.<id>.publications.<name>.
  */
 export type Reference = string;
 
@@ -5619,6 +5665,24 @@ export interface Relationships {
 export type RelativeArtifactPath = string;
 
 /**
+ * Bounded sequential repetition of one step's action.
+ *
+ * Each iteration and its step requirements settle before `until` is
+ * evaluated; true stops successfully, false runs the next iteration, and
+ * exhausting `max_iterations` fails the step.
+ */
+export interface Repeat {
+  /**
+   * The positive iteration bound.
+   */
+  readonly max_iterations: number;
+  /**
+   * The stop condition; it may read `iteration.output`.
+   */
+  readonly until: Condition;
+}
+
+/**
  * Request correlation ID; required to be a UUID v7.
  */
 export type RequestId = string;
@@ -5689,6 +5753,16 @@ export interface RequirementResult {
    * Requirement ID.
    */
   readonly id: TaskId;
+  /**
+   * Zero-based fanout item of the owning step's invocation this instance
+   * judged; absent without fanout.
+   */
+  readonly item_index?: number | null;
+  /**
+   * Zero-based repeat iteration of the owning step's invocation this
+   * instance judged; absent without repeat.
+   */
+  readonly iteration_index?: number | null;
   /**
    * The outcome.
    */
@@ -6374,7 +6448,7 @@ export type SpecHash = string;
 /**
  * A step's speculative disposition, as a collection manifest reports it.
  */
-export type Speculation = "none";
+export type Speculation = "none" | "pending" | "admitted" | "discarded" | "blocked";
 
 /**
  * DataCard split label.
@@ -6506,13 +6580,22 @@ export interface Step {
    */
   readonly action: Action;
   /**
-   * Ordering-only dependencies beyond those implied by references.
+   * Dependencies beyond those implied by references: an ordering-only
+   * list, or `{any_succeeded: [...]}`.
    */
-  readonly depends_on?: readonly TaskId[];
+  readonly depends_on?: DependsOn;
+  /**
+   * Runs the action once per frozen item or a fixed number of times.
+   */
+  readonly foreach?: Foreach | null;
   /**
    * Verifier-unique block ID.
    */
   readonly id: TaskId;
+  /**
+   * Runs the action sequentially until a condition holds.
+   */
+  readonly repeat?: Repeat | null;
   /**
    * Requirements judged after the action, before dependents start.
    */
@@ -6521,6 +6604,11 @@ export interface Step {
    * Retries after the first failed attempt, at most [`MAX_STEP_RETRIES`].
    */
   readonly retries?: number;
+  /**
+   * Lets the action start before `when` resolves, withholding its
+   * contribution until the condition admits it. Requires `when`.
+   */
+  readonly speculative?: boolean;
   /**
    * Per-attempt timeout in seconds.
    */
@@ -7122,6 +7210,28 @@ export interface VerificationStatus {
 export type VerificationVerdict = "passed" | "failed" | "inconclusive";
 
 /**
+ * Authored execution ceilings. Each one only lowers the server's effective
+ * limit; omitted values use the server's published defaults.
+ */
+export interface VerifierLimits {
+  /**
+   * Most actions and checks running at once across the whole execution,
+   * fanout items included.
+   */
+  readonly concurrency?: number | null;
+  /**
+   * Most Agent action and check attempts, retries included, the
+   * execution may start over its whole life; recovery never replenishes
+   * it.
+   */
+  readonly max_agent_invocations?: number | null;
+  /**
+   * Whole-execution deadline in seconds, queue and retry waits included.
+   */
+  readonly timeout_seconds?: number | null;
+}
+
+/**
  * A subject-less Verifier: inputs, optional steps, requirements, decision.
  */
 export interface VerifierSpec {
@@ -7141,6 +7251,10 @@ export interface VerifierSpec {
    * Named evidence slots, addressed as `inputs.<slot>`.
    */
   readonly inputs?: Readonly<Record<string, InputSlot>>;
+  /**
+   * Ceilings that only lower the server's effective execution limits.
+   */
+  readonly limits?: VerifierLimits | null;
   /**
    * Order of a group Verifier's source lists: `recorded_at`, or an input
    * key that orders every slot reading the same source binding. Absent

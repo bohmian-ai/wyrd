@@ -964,8 +964,8 @@ struct Speculated {
 /// work; a `null` comparison blocks it; a decision known before the extra
 /// review is eligible makes no call. The consolidator only ever reads the
 /// recorded disposition, never a pending one, and receives the account only
-/// when it was admitted, while an authorized reader still inspects the
-/// retained excluded account with its disposition.
+/// when it was admitted, while a caller holding only `verifier:read` still
+/// inspects the retained excluded account, leaving its disposition unchanged.
 ///
 /// # Panics
 /// Panics when a verification is refused or a call, status, disposition,
@@ -1027,6 +1027,15 @@ async fn speculative_disposition_controls_consumer_admission() {
     ];
     let extra = TaskId::new("extra").expect("step");
     let account = PublicationName::new("account").expect("name");
+    let reader = desk.deployment.client(
+        &desk
+            .deployment
+            .granted_key(
+                "speculation_reader",
+                &[json!({"resource": "verifier", "action": "read", "scope": "all"})],
+            )
+            .await,
+    );
     for case in cases {
         let question = case.question;
         let result = desk.verify("speculative-review", question).await;
@@ -1073,7 +1082,7 @@ async fn speculative_disposition_controls_consumer_admission() {
             .collect();
         assert_eq!(retained, Vec::from_iter(case.retained), "{question}");
         if case.retained.is_some() {
-            let execution = Execution::connect_with(result.execution_id, &desk.deployment.admin())
+            let execution = Execution::connect_with(result.execution_id, &reader)
                 .await
                 .expect("the execution handle connects");
             let inspected = execution
@@ -1088,13 +1097,25 @@ async fn speculative_disposition_controls_consumer_admission() {
                     },
                 )
                 .await
-                .expect("an authorized reader inspects the retained account");
+                .expect("a verifier:read grant inspects the retained account");
             assert_eq!(
                 inspected.content,
                 PublicationContent::Json {
                     value: json!({ "extra": true })
                 },
                 "{question}"
+            );
+            let reread: Vec<Speculation> = desk
+                .publications(&result)
+                .await
+                .iter()
+                .filter(|publication| publication.producer.step_id == extra)
+                .map(|publication| publication.speculation)
+                .collect();
+            assert_eq!(
+                reread,
+                Vec::from_iter(case.retained),
+                "{question}: inspection leaves the disposition unchanged"
             );
         }
     }

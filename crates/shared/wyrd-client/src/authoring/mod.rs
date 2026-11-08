@@ -415,9 +415,11 @@ impl From<OperatorSpec> for Linked<OperatorSpec> {
 #[derive(Debug, Clone, PartialEq)]
 pub struct Binding {
     /// The canonical binding.
-    binding: VerificationBinding,
-    /// The bound Verifier, Trigger, and Operator definitions.
+    canonical: VerificationBinding,
+    /// The bound Verifier and Operator definitions, which only accumulate.
     dependencies: Dependencies,
+    /// The current Trigger's definition; replacing the Trigger replaces it.
+    trigger: Dependencies,
 }
 
 impl Binding {
@@ -427,13 +429,14 @@ impl Binding {
     pub fn new(verifier: Verifier) -> Self {
         let verifier_ref = verifier.card_ref();
         Self {
-            binding: binding(Ref::Sibling {
+            canonical: binding(Ref::Sibling {
                 sibling: verifier_ref,
             }),
             dependencies: Dependencies {
                 cards: vec![verifier.into()],
                 artifacts: Vec::new(),
             },
+            trigger: Dependencies::default(),
         }
     }
 
@@ -441,36 +444,46 @@ impl Binding {
     #[must_use]
     pub fn registered(verifier: CardRef) -> Self {
         Self {
-            binding: binding(Ref::Ref(identity(verifier))),
+            canonical: binding(Ref::Ref(identity(verifier))),
             dependencies: Dependencies::default(),
+            trigger: Dependencies::default(),
         }
     }
 
-    /// Run the bound Verifier when `trigger` fires.
+    /// Run the bound Verifier when `trigger` fires, replacing any earlier
+    /// Trigger together with the definition it carried.
     pub fn set_runs_on(&mut self, trigger: impl Into<Linked<TriggerSpec>>) {
         let trigger = trigger.into();
-        self.binding.runs_on = Some(trigger.reference);
-        self.dependencies.absorb(trigger.dependencies);
+        self.canonical.runs_on = Some(trigger.reference);
+        self.trigger = trigger.dependencies;
     }
 
     /// Dispatch `operator` after a failed verdict.
     pub fn add_on_failure(&mut self, operator: impl Into<Linked<OperatorSpec>>) {
         let operator = operator.into();
-        self.binding.on_failure.push(operator.reference);
+        self.canonical.on_failure.push(operator.reference);
         self.dependencies.absorb(operator.dependencies);
     }
 
     /// Dispatch `operator` when a settled group verdict changes.
     pub fn add_on_verdict_change(&mut self, operator: impl Into<Linked<OperatorSpec>>) {
         let operator = operator.into();
-        self.binding.on_verdict_change.push(operator.reference);
+        self.canonical.on_verdict_change.push(operator.reference);
         self.dependencies.absorb(operator.dependencies);
     }
 
     /// The canonical binding.
     #[must_use]
     pub fn binding(&self) -> &VerificationBinding {
-        &self.binding
+        &self.canonical
+    }
+
+    /// The canonical binding and every definition its current values
+    /// reference, for the subject it is attached to.
+    fn into_parts(self) -> (VerificationBinding, Dependencies) {
+        let mut dependencies = self.dependencies;
+        dependencies.absorb(self.trigger);
+        (self.canonical, dependencies)
     }
 }
 
@@ -617,9 +630,9 @@ impl Agent {
 
     /// Bind a Verifier to this standalone Agent.
     pub fn add_verifier(&mut self, binding: impl Into<Binding>) {
-        let binding = binding.into();
-        self.spec.verified_by.push(binding.binding);
-        self.dependencies.absorb(binding.dependencies);
+        let (binding, dependencies) = binding.into().into_parts();
+        self.spec.verified_by.push(binding);
+        self.dependencies.absorb(dependencies);
     }
 }
 
@@ -683,9 +696,9 @@ impl Service {
 
     /// Bind a Verifier to the Service as a whole.
     pub fn add_verifier(&mut self, binding: impl Into<Binding>) {
-        let binding = binding.into();
-        self.spec.verified_by.push(binding.binding);
-        self.dependencies.absorb(binding.dependencies);
+        let (binding, dependencies) = binding.into().into_parts();
+        self.spec.verified_by.push(binding);
+        self.dependencies.absorb(dependencies);
     }
 
     /// Append the component `alias` referencing `card_ref`.
@@ -719,9 +732,9 @@ impl Service {
             credential_refs: Vec::new(),
         };
         for binding in verified_by {
-            let binding = binding.into();
-            component.verified_by.push(binding.binding);
-            self.dependencies.absorb(binding.dependencies);
+            let (binding, dependencies) = binding.into().into_parts();
+            component.verified_by.push(binding);
+            self.dependencies.absorb(dependencies);
         }
         self.spec.components.push(component);
         Ok(())

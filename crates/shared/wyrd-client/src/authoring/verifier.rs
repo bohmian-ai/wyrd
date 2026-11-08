@@ -361,9 +361,10 @@ impl Action {
     /// Invoke an Agent.
     #[must_use]
     pub fn agent(call: AgentCall) -> Self {
+        let (call, dependencies) = call.into_parts();
         Self {
-            action: spec::Action::Agent(call.call),
-            dependencies: call.dependencies,
+            action: spec::Action::Agent(call),
+            dependencies,
         }
     }
 
@@ -442,9 +443,10 @@ impl Check {
     /// Judge with an Agent whose Prompt returns a verdict.
     #[must_use]
     pub fn agent(call: AgentCall) -> Self {
+        let (call, dependencies) = call.into_parts();
         Self {
-            check: spec::Check::Agent(call.call),
-            dependencies: call.dependencies,
+            check: spec::Check::Agent(call),
+            dependencies,
         }
     }
 
@@ -501,8 +503,11 @@ impl Check {
 pub struct AgentCall {
     /// The canonical call.
     call: spec::AgentCall,
-    /// The Agent definition and local Artifacts the call references.
+    /// The Agent definition the call references.
     dependencies: Dependencies,
+    /// The local Artifact each workspace destination currently mounts; a
+    /// replaced destination drops its entry.
+    workspace: BTreeMap<String, Dependencies>,
 }
 
 impl AgentCall {
@@ -519,6 +524,7 @@ impl AgentCall {
                 workspace: BTreeMap::new(),
             },
             dependencies: agent.dependencies,
+            workspace: BTreeMap::new(),
         }
     }
 
@@ -533,15 +539,18 @@ impl AgentCall {
         Ok(())
     }
 
-    /// Mount the value of `value` as JSON at workspace `path`.
+    /// Mount the value of `value` as JSON at workspace `path`, replacing
+    /// whatever `path` mounted.
     pub fn add_workspace_input(&mut self, path: &str, value: Reference) {
         self.call
             .workspace
             .insert(path.to_owned(), WorkspaceSource::Scope(value));
+        self.workspace.remove(path);
     }
 
     /// Mount the fixed `file` of an exact Artifact version at workspace
-    /// `path`; a local Artifact is published before the graph.
+    /// `path`, replacing whatever `path` mounted; a local Artifact is
+    /// published before the graph.
     pub fn add_workspace_file(&mut self, path: &str, file: &ArtifactFile) {
         self.call.workspace.insert(
             path.to_owned(),
@@ -549,13 +558,23 @@ impl AgentCall {
                 artifact: file.selection(),
             },
         );
-        self.dependencies.absorb(file.dependencies());
+        self.workspace.insert(path.to_owned(), file.dependencies());
     }
 
     /// The canonical call.
     #[must_use]
     pub fn call(&self) -> &spec::AgentCall {
         &self.call
+    }
+
+    /// The canonical call and every definition and local Artifact its
+    /// current Agent and workspace mounts reference, in workspace path order.
+    fn into_parts(self) -> (spec::AgentCall, Dependencies) {
+        let mut dependencies = self.dependencies;
+        for mounted in self.workspace.into_values() {
+            dependencies.absorb(mounted);
+        }
+        (self.call, dependencies)
     }
 }
 

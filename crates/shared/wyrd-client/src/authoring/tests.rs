@@ -794,3 +794,141 @@ fn declarations_match_file_authored_tree() {
         "both declare the Service root last",
     );
 }
+
+/// A sibling `daily` 1.0.0 Trigger firing on `cron`.
+///
+/// # Panics
+/// Panics when the fixed name or version is not an exact identity.
+fn daily(cron: &str) -> CardDefinition {
+    CardDefinition::new(
+        "daily",
+        "1.0.0",
+        Spec::Trigger(TriggerSpec {
+            description: None,
+            activation: wyrd_spec::card::trigger::TriggerActivation::Schedule {
+                cron: cron.to_owned(),
+                tz: None,
+            },
+        }),
+    )
+    .expect("valid identity")
+}
+
+/// The declaration of a Verifier with a `report` input whose one Agent step
+/// makes `call`.
+///
+/// # Errors
+/// Returns [`CardDefinition::declaration`]'s refusal.
+///
+/// # Panics
+/// Panics when the fixed Verifier identity, slot, or step ID is invalid.
+fn call_declaration(call: AgentCall) -> Result<Declaration, WyrdError> {
+    let mut verifier = Verifier::new("workspace", "1.0.0").expect("valid identity");
+    verifier.add_input("report", Value::Null).expect("new slot");
+    verifier
+        .add_step(Step::new("judge", Action::agent(call)).expect("valid id"))
+        .expect("new step");
+    CardDefinition::from(verifier).declaration()
+}
+
+/// Replacing a Trigger or a workspace destination leaves exactly the
+/// dependencies of the current values: an edited definition declares and
+/// publishes what the same definition built directly does, while two
+/// current conflicting definitions still refuse.
+#[test]
+fn replacements_keep_only_current_dependencies() {
+    let verifier = Verifier::new("checked", "1.0.0").expect("valid identity");
+    let declare = |binding: Binding| {
+        let mut agent = reviewer();
+        agent.add_verifier(binding);
+        CardDefinition::from(agent).declaration()
+    };
+    let mut direct = Binding::new(verifier.clone());
+    direct.set_runs_on(daily("0 6 * * *"));
+    let mut edited = Binding::new(verifier.clone());
+    edited.set_runs_on(daily("0 0 * * *"));
+    edited.set_runs_on(daily("0 6 * * *"));
+    assert_eq!(edited, direct, "replacement equals direct construction");
+    let declaration = declare(edited).expect("only the current Trigger is declared");
+    assert_eq!(declaration, declare(direct).expect("valid graph"));
+    let triggers: Vec<&Value> = declaration
+        .input
+        .submissions
+        .iter()
+        .filter(|submission| submission.kind == CardKind::Trigger)
+        .map(|submission| &submission.spec)
+        .collect();
+    assert_eq!(
+        triggers,
+        [&json!({"kind": "schedule", "cron": "0 6 * * *"})]
+    );
+    let mut inline = Binding::new(verifier.clone());
+    inline.set_runs_on(daily("0 0 * * *"));
+    inline.set_runs_on(Linked::registered(daily("0 6 * * *").card_ref()));
+    assert!(
+        declare(inline)
+            .expect("valid graph")
+            .input
+            .submissions
+            .iter()
+            .all(|submission| submission.kind != CardKind::Trigger),
+        "a registered Trigger replaces the sibling submission",
+    );
+
+    let mut first = Binding::new(verifier.clone());
+    first.set_runs_on(daily("0 0 * * *"));
+    let mut second = Binding::new(Verifier::new("other", "1.0.0").expect("valid identity"));
+    second.set_runs_on(daily("0 6 * * *"));
+    let mut agent = reviewer();
+    agent.add_verifier(first);
+    agent.add_verifier(second);
+    assert!(
+        matches!(
+            CardDefinition::from(agent).declaration(),
+            Err(WyrdError::SpecDuplicateSubmission { .. })
+        ),
+        "two current definitions of daily 1.0.0 still conflict",
+    );
+
+    let obsolete = Artifact::from_path("obsolete-policy", "1.0.0", "missing/obsolete.pdf", false)
+        .expect("valid identity");
+    let scope = Reference::input("report").expect("reference");
+    let mut to_scope = AgentCall::new(reviewer());
+    to_scope.add_workspace_file("/inputs/policy.json", &obsolete.files());
+    to_scope.add_workspace_input("/inputs/policy.json", scope.clone());
+    let mut scope_only = AgentCall::new(reviewer());
+    scope_only.add_workspace_input("/inputs/policy.json", scope.clone());
+    assert_eq!(
+        to_scope, scope_only,
+        "replacement equals direct construction"
+    );
+    assert!(
+        call_declaration(to_scope)
+            .expect("valid graph")
+            .artifacts
+            .is_empty(),
+        "a replaced local Artifact is not published",
+    );
+
+    let mut to_file = AgentCall::new(reviewer());
+    to_file.add_workspace_file("/inputs/policy.json", &obsolete.files());
+    to_file.add_workspace_file("/inputs/policy.json", &policy().files());
+    let mut file_only = AgentCall::new(reviewer());
+    file_only.add_workspace_file("/inputs/policy.json", &policy().files());
+    assert_eq!(to_file, file_only, "replacement equals direct construction");
+    assert_eq!(
+        call_declaration(to_file).expect("valid graph").artifacts,
+        [policy()],
+        "only the current local Artifact is published",
+    );
+
+    let mut shared = AgentCall::new(reviewer());
+    shared.add_workspace_file("/inputs/policy.json", &policy().files());
+    shared.add_workspace_file("/inputs/copy.json", &policy().files());
+    shared.add_workspace_input("/inputs/policy.json", scope);
+    assert_eq!(
+        call_declaration(shared).expect("valid graph").artifacts,
+        [policy()],
+        "an Artifact still mounted elsewhere is still published",
+    );
+}

@@ -4469,10 +4469,6 @@ impl ShardOwner {
         Ok((slice, Some(layout)))
     }
 
-    /// Takes the next prepared slice of one append, in order.
-    ///
-    /// Slices are fully materialized before the append reaches the shard, so
-    /// this only pops the next one; `None` means the append has no slices left.
     /// Reports whether a retained batch already holds this append's batch id
     /// with a different payload.
     ///
@@ -4497,6 +4493,10 @@ impl ShardOwner {
         Ok(false)
     }
 
+    /// Takes the next prepared slice of one append, in order.
+    ///
+    /// Slices are fully materialized before the append reaches the shard, so
+    /// this only pops the next one; `None` means the append has no slices left.
     fn next_prepared_slice(append: &mut PreparedAppend) -> Option<PreparedSlice> {
         match &mut append.slices {
             PreparedSliceSet::Materialized(slices) => {

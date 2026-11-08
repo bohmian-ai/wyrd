@@ -1226,6 +1226,9 @@ impl VerificationEngine {
     /// Returns the first orchestration failure a member returns; every other
     /// member is then dropped, except that a capacity refusal first lets
     /// every running member settle.
+    ///
+    /// # Panics
+    /// Panics when `index` does not name a step of `spec`.
     async fn members(
         &self,
         spec: &Arc<VerifierSpec>,
@@ -1284,6 +1287,9 @@ impl VerificationEngine {
     /// Returns [`EngineError::Busy`], [`EngineError::DefinitionUnavailable`],
     /// [`EngineError::Checkpoint`], [`EngineError::Capture`], or
     /// [`EngineError::EvidenceUnavailable`] from its blocks.
+    ///
+    /// # Panics
+    /// Panics when `index` does not name a step of `spec`.
     async fn member(
         &self,
         spec: &Arc<VerifierSpec>,
@@ -1936,6 +1942,9 @@ fn complete(ledger: &Ledger, task: &TaskId) -> bool {
 }
 
 /// Whether the pending `node` may start against `ledger`.
+///
+/// # Panics
+/// Panics when a [`Node::Step`] index does not name a step of `spec`.
 fn ready(spec: &VerifierSpec, ledger: &Ledger, node: Node) -> bool {
     match node {
         Node::Step(index) => {
@@ -1997,6 +2006,9 @@ fn requirement_bindings(
 ///
 /// # Errors
 /// Returns [`EngineError::Capture`] when an actual value cannot be captured.
+///
+/// # Panics
+/// Panics when `index` does not name a step of `spec`.
 fn missing_requirements(
     spec: &VerifierSpec,
     scope: &Scope<'_>,
@@ -2143,6 +2155,9 @@ enum Node {
 
 impl Node {
     /// The ledger id this node settles.
+    ///
+    /// # Panics
+    /// Panics when the node's index does not name a declaration of `spec`.
     fn id(self, spec: &VerifierSpec) -> &TaskId {
         match self {
             Self::Step(index) | Self::Disposition(index) => &spec.steps[index].id,

@@ -2076,6 +2076,9 @@ async fn hold_sections(upstream: &MockServer, prefix: &str, delay: Duration) {
 
 /// The arrival position of every section-reviewer request for each
 /// section, in arrival order.
+///
+/// # Panics
+/// Panics when the upstream does not record requests.
 async fn section_turns(desk: &Desk) -> BTreeMap<String, Vec<usize>> {
     let mut turns: BTreeMap<String, Vec<usize>> = BTreeMap::new();
     for (at, messages) in desk.requests("SECTION:").await.iter().enumerate() {
@@ -2093,6 +2096,9 @@ async fn section_turns(desk: &Desk) -> BTreeMap<String, Vec<usize>> {
 /// The `(item_index, attempt)` of every `map` publication of `result`, in
 /// item order; publications list in commit order, which concurrent items
 /// do not fix.
+///
+/// # Panics
+/// Panics when the execution or a page of its publications cannot be read.
 async fn mapped(desk: &Desk, result: &VerificationResult) -> Vec<(Option<u32>, u32)> {
     let mut mapped: Vec<_> = desk
         .publications(result)

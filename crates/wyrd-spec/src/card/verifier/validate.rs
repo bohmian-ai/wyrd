@@ -2647,6 +2647,9 @@ mod tests {
 
     /// A Verifier whose `review` step reads the `sections` array of its JSON
     /// input, with `step` merged into the `review` step.
+    ///
+    /// # Panics
+    /// Panics when `step` is not a JSON object.
     fn controlled(step: Value) -> Value {
         let mut review = json!({"id": "review", "action": code(json!({}))});
         for (key, value) in step.as_object().expect("step fields") {

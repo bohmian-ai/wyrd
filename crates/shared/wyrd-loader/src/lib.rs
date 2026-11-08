@@ -150,6 +150,41 @@ pub fn load(path: &Path) -> Result<LoadedTree, LoadError> {
     })
 }
 
+/// Validate and order Cards authored in memory into a declaration input.
+///
+/// The in-memory counterpart of [`load`] plus [`build_declaration_input`]:
+/// the cards skip discovery, parsing, workspace defaults, and path
+/// resolution, because code authoring already wrote every sibling and
+/// external reference, and then pass the same validation and dependency
+/// ordering a file tree does. Each card's `source_path` only labels its
+/// diagnostics. In-memory cards carry no artifact manifest: a heavy Artifact
+/// is published on its own first, as a file-authored one is.
+///
+/// # Errors
+/// Returns `LoadError` with every error-severity diagnostic the file
+/// pipeline would report for the same cards, such as duplicate identities,
+/// invalid Verifiers or bindings, unresolved paths, authored UIDs, cycles,
+/// and composition errors.
+pub fn declaration_input_from_cards(cards: &[AuthoredCard]) -> Result<DeclarationInput, LoadError> {
+    let diagnostics = validate::validate_tree(cards);
+    if diagnostics
+        .iter()
+        .any(|diagnostic| diagnostic.severity == Severity::Error)
+    {
+        return Err(LoadError::multiple(diagnostics));
+    }
+    let order = order::order_cards(cards).map_err(LoadError::multiple)?;
+    let submissions = order
+        .into_iter()
+        .map(|index| order::submission_for(&cards[index]))
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(LoadError::single)?;
+    Ok(DeclarationInput {
+        submissions,
+        artifact_sources: BTreeMap::new(),
+    })
+}
+
 /// Consume a loaded tree and return its wire-ready submissions.
 ///
 /// # Errors

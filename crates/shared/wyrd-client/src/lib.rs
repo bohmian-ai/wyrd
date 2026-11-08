@@ -10,6 +10,7 @@
 #![deny(rustdoc::broken_intra_doc_links)]
 
 pub mod auth;
+pub mod authoring;
 pub mod bifrost;
 pub mod cards;
 pub mod client;

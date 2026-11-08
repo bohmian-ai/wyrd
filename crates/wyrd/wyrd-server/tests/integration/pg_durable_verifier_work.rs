@@ -23,6 +23,7 @@ use vala_verify::blocks::{
     Checkpoints, DriftChecks, EngineError, EvidenceReader, VerificationEngine,
 };
 use wyrd_runtime::Permission;
+use wyrd_runtime::outbox::OutboxSink as _;
 use wyrd_runtime::principal::PrincipalId;
 use wyrd_server::components::auth::Caller;
 use wyrd_server::components::gateway::GatewayCallContext;
@@ -2714,8 +2715,8 @@ enum FirstWriter {
 /// revision, and a refused checkpoint is never accepted. Either way the
 /// state reads back cancelled with no result, the accepted report remains
 /// publicly listed, the worker records nothing more, and an unrelated
-/// execution submitted while the delivery is held completes with its result
-/// retained and no delivery owed.
+/// execution staged in the held delivery's outbox lane while it is held
+/// completes with its result retained and no delivery owed.
 ///
 /// # Panics
 /// Panics when a delivery retires before its acknowledgement or stays owed,
@@ -2727,6 +2728,38 @@ async fn cancellation_writer_race_preserves_terminal_delivery() {
     for first in [FirstWriter::Checkpoint, FirstWriter::Delivery] {
         cancellation_race(first).await;
     }
+}
+
+/// The Scribe outbox lane every write of `execution` is staged in.
+///
+/// # Panics
+/// Panics when the probe row does not build.
+fn outbox_lane(execution: ExecutionId, verifier: &CardUid) -> u64 {
+    let now = chrono::Utc::now();
+    let row = ResultPayloadBuilder::new(
+        ResultRun {
+            execution_id: execution,
+            run_id: None,
+            verifier_version: "",
+            card_uid: verifier,
+            owner_card_uid: None,
+            group_id: None,
+            deployment_environment: None,
+            binding_id: None,
+            trigger: None,
+            window: None,
+        },
+        verifier,
+        now,
+        now,
+    )
+    .checkpoint(1, false, &json!({}))
+    .expect("the probe row builds");
+    ScribeSink::lane(&ScribeWrite::ExecutionInputs {
+        row,
+        attribution: Attribution::unresolved(),
+        queued: None,
+    }) % ScribeSink::LANES as u64
 }
 
 /// One forced arrival order of
@@ -2813,11 +2846,20 @@ async fn cancellation_race(first: FirstWriter) {
         "{first:?}: an unacknowledged delivery stays owed"
     );
     let (bystander_subject, _) = leased.fixture.service("bystander").await.expect("service");
-    let bystander = leased
-        .fixture
-        .submit(&leased.verifier, &bystander_subject, BTreeMap::new())
-        .await
-        .expect("the unrelated execution is admitted");
+    let lane = outbox_lane(execution, &leased.verifier);
+    let mut bystander = None;
+    for _ in 0..64 {
+        let submitted = leased
+            .fixture
+            .submit(&leased.verifier, &bystander_subject, BTreeMap::new())
+            .await
+            .expect("the unrelated execution is admitted");
+        if outbox_lane(submitted, &leased.verifier) == lane {
+            bystander = Some(submitted);
+            break;
+        }
+    }
+    let bystander = bystander.expect("an unrelated execution shares the held delivery's lane");
 
     let checkpointed = match first {
         FirstWriter::Checkpoint => {

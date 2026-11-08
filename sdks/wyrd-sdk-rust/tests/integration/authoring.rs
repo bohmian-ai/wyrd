@@ -292,38 +292,74 @@ fn report_policy(version: &str, judge: &Agent, policy: &ArtifactFile) -> Verifie
 /// `release-access` at `version`: independent recipient and destination
 /// steps, and an optional `notes` slot.
 fn release_access(version: &str) -> Verifier {
+    access_verifier(version, false)
+}
+
+/// `release-access` at `version` with a `summary` step that depends on and
+/// consumes both fact steps' outputs.
+fn summarized_access(version: &str) -> Verifier {
+    access_verifier(version, true)
+}
+
+/// `release-access` at `version`, with the dependent `summary` step when
+/// `summarize` is set.
+fn access_verifier(version: &str, summarize: bool) -> Verifier {
     let mut verifier = Verifier::new("release-access", version).expect("valid identity");
     verifier.set_description("The recipient and destination may receive the report.");
     let [recipient, purpose, destination] = release_inputs(&mut verifier);
     verifier
         .add_input_with_required("notes", json!({"type": "string"}), false)
         .expect("new slot");
-    verifier
-        .add_step(fact_step(
-            "recipient",
-            "recipient_facts",
-            &[("recipient", &recipient), ("purpose", &purpose)],
-            (
-                "recipient-authorized",
-                "The recipient is authorized for this purpose.",
-                "authorized",
-                json!(true),
-            ),
-        ))
-        .expect("new step");
-    verifier
-        .add_step(fact_step(
-            "destination",
-            "destination_facts",
-            &[("destination", &destination)],
-            (
-                "destination-controls-satisfied",
-                "The destination has appropriate access controls.",
-                "appropriate",
-                json!(true),
-            ),
-        ))
-        .expect("new step");
+    let recipient = fact_step(
+        "recipient",
+        "recipient_facts",
+        &[("recipient", &recipient), ("purpose", &purpose)],
+        (
+            "recipient-authorized",
+            "The recipient is authorized for this purpose.",
+            "authorized",
+            json!(true),
+        ),
+    );
+    let destination = fact_step(
+        "destination",
+        "destination_facts",
+        &[("destination", &destination)],
+        (
+            "destination-controls-satisfied",
+            "The destination has appropriate access controls.",
+            "appropriate",
+            json!(true),
+        ),
+    );
+    if summarize {
+        let mut call = CodeCall::from_file(story("release_checks.py"), "summarize_findings")
+            .expect("source reads");
+        call.add_input("recipient", recipient.output("").expect("output"))
+            .expect("valid parameter");
+        call.add_input("destination", destination.output("").expect("output"))
+            .expect("valid parameter");
+        let mut summary = Step::new("summary", Action::code(call)).expect("valid id");
+        summary.add_depends_on(&recipient);
+        summary.add_depends_on(&destination);
+        let releasable = summary.output("releasable").expect("output");
+        summary
+            .add_requirement(
+                Requirement::new(
+                    "release-permitted",
+                    "Both the recipient and the destination permit the release.",
+                    Check::equals(releasable, json!(true)),
+                )
+                .expect("valid id"),
+            )
+            .expect("new id");
+        verifier.add_step(recipient).expect("new step");
+        verifier.add_step(destination).expect("new step");
+        verifier.add_step(summary).expect("new step");
+    } else {
+        verifier.add_step(recipient).expect("new step");
+        verifier.add_step(destination).expect("new step");
+    }
     verifier
 }
 
@@ -513,6 +549,11 @@ async fn multi_component_service_verifies_each_subject() {
         "{report:#?} {access:#?}"
     );
     assert!(releases(&report, &access), "{report:#?} {access:#?}");
+    assert_eq!(
+        story_server.judge_calls().await,
+        2,
+        "only report-policy's judge runs: one policy read, then its verdict"
+    );
     let judged = requirement(&report, "sharing-policy-satisfied");
     assert_eq!(judged.outcome, RequirementOutcome::Passed, "{judged:#?}");
     assert!(
@@ -1081,5 +1122,89 @@ async fn declarations_match_files_and_keep_refusals() {
         "WYRD_PERMISSION_403_DENIED_RBAC",
         "{refused:?}"
     );
+    story_server.deployment.shutdown().await;
+}
+
+/// A dependent `summary` step added to `release-access` keeps its explicit
+/// dependencies through registration and runs after both fact steps,
+/// consuming their outputs: a controlled release summarizes as releasable
+/// and passes, a public destination summarizes as not releasable and fails.
+///
+/// # Panics
+/// Panics when declaration or verification fails, or an output differs.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires the repository-managed Postgres journey lifecycle"]
+async fn dependent_steps_consume_prior_outputs() {
+    let story_server = Story::start().await;
+    let cards = story_server.deployment.cards().await;
+    let policy = local_policy("1.0.0", &story("company-sharing-policy.pdf"));
+    let service = finance_release(
+        "1.1.0",
+        &policy.file(POLICY_FILE).expect("relative path"),
+        summarized_access("1.1.0"),
+    );
+    let state = story_server.state(&service).await;
+    let registered = cards
+        .get(CardSelector::exact(card_ref(
+            CardKind::Verifier,
+            "release-access",
+            "1.1.0",
+        )))
+        .await
+        .expect("release-access reads");
+    let spec = serde_json::to_value(&registered.spec).expect("spec serializes");
+    assert_eq!(spec["steps"][2]["id"], "summary");
+    assert_eq!(
+        spec["steps"][2]["depends_on"],
+        json!(["recipient", "destination"])
+    );
+    assert_eq!(
+        spec["steps"][2]["action"]["inputs"],
+        json!({"recipient": "steps.recipient.output", "destination": "steps.destination.output"}),
+    );
+
+    let mut public = permitted();
+    public["destination"]["public_sharing"] = json!(true);
+    for (request, releasable, verdict) in [
+        (permitted(), true, VerificationVerdict::Passed),
+        (public, false, VerificationVerdict::Failed),
+    ] {
+        let (_, access) = verify_both(&state, &request).await;
+        let access = access.expect("release-access runs");
+        assert_attributed(
+            &access,
+            &state,
+            "release-controls",
+            "release-access",
+            &["recipient", "destination", "summary"],
+        );
+        let summary = access
+            .outcome
+            .steps
+            .iter()
+            .find(|step| step.id.as_str() == "summary")
+            .expect("summary ran");
+        assert_eq!(summary.status, StepStatus::Succeeded, "{summary:#?}");
+        assert_eq!(
+            summary.output,
+            Some(json!({
+                "releasable": releasable,
+                "recipient": {"authorized": true},
+                "destination": {"appropriate": releasable},
+            })),
+            "{access:#?}"
+        );
+        let expected = if releasable {
+            RequirementOutcome::Passed
+        } else {
+            RequirementOutcome::Failed
+        };
+        assert_eq!(
+            outcome(&access, "release-permitted"),
+            expected,
+            "{access:#?}"
+        );
+        assert_eq!(access.outcome.verdict, verdict, "{access:#?}");
+    }
     story_server.deployment.shutdown().await;
 }

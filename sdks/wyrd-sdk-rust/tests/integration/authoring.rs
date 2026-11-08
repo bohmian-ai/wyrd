@@ -935,3 +935,151 @@ async fn local_artifacts_reuse_and_keep_versions() {
     assert_eq!(mounted_policy(&cards, "3.0.0").await, json!("3.0.0"));
     story_server.deployment.shutdown().await;
 }
+
+/// Each declared Card of `receipt`, by name, with its resolved identity and
+/// spec hash.
+fn resolved(
+    receipt: &wyrd_ai::cards::DeclarationReceipt,
+) -> std::collections::BTreeMap<String, (CardRef, String)> {
+    receipt
+        .outcomes
+        .iter()
+        .map(|outcome| {
+            (
+                outcome.card_ref.name.to_string(),
+                (outcome.card_ref.clone(), outcome.spec_hash.clone()),
+            )
+        })
+        .collect()
+}
+
+/// The checked-in files and the code-authored graph register the same
+/// content under the same identities: the policy publishes once, the
+/// authored graph is an idempotent rerun of the file graph through `Cards`,
+/// and `WyrdState` hydrates the same component identities from either
+/// form. Changed content under a published version and a caller without
+/// the declare grant keep their existing refusals through both entry
+/// points.
+///
+/// # Panics
+/// Panics when a declaration differs or a refusal carries another code.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires the repository-managed Postgres journey lifecycle"]
+async fn declarations_match_files_and_keep_refusals() {
+    let story_server = Story::start().await;
+    let deployment = &story_server.deployment;
+    let cards = deployment.cards().await;
+    let source = story("company-sharing-policy.pdf");
+    let local = local_policy("1.0.0", &source);
+    let published = cards
+        .upload_artifact(
+            &source,
+            local.metadata().clone(),
+            local.spec().clone(),
+            true,
+        )
+        .await
+        .expect("the policy file publishes");
+    let files = declare(&cards, "cards/card_authoring/finance-release.yaml").await;
+
+    let authored = baseline(&local.file(POLICY_FILE).expect("relative path"));
+    let receipt = cards
+        .declare_authored(&authored)
+        .await
+        .expect("the authored graph declares");
+    assert_eq!(receipt.root, files.root);
+    assert_eq!(
+        resolved(&receipt),
+        resolved(&files),
+        "same identities and content"
+    );
+    assert!(
+        receipt
+            .outcomes
+            .iter()
+            .all(|outcome| outcome.outcome == DeclarationOutcomeKind::IdempotentNoop),
+        "the authored graph is the file graph: {receipt:#?}"
+    );
+    let reused = cards
+        .declare_authored(&baseline(&registered_policy("1.0.0")))
+        .await
+        .expect("the reference form declares");
+    assert_eq!(resolved(&reused), resolved(&files));
+    assert_eq!(
+        cards
+            .upload_artifact(
+                &source,
+                local.metadata().clone(),
+                local.spec().clone(),
+                true
+            )
+            .await
+            .expect("the unchanged policy republishes"),
+        published,
+        "the authored publication kept the file publication's identity"
+    );
+
+    let from_code = story_server.state(&authored).await;
+    let from_file = WyrdState::declare_with(
+        story("finance-release.yaml"),
+        DeclareOptions {
+            client: Some(deployment.admin()),
+            ..DeclareOptions::default()
+        },
+    )
+    .await
+    .expect("the path form still declares");
+    for alias in ["report-reviewer", "release-controls"] {
+        assert_eq!(
+            from_code.card_ref(alias).expect("alias resolves"),
+            from_file.card_ref(alias).expect("alias resolves"),
+        );
+    }
+
+    let mut edited = release_access("1.0.0");
+    edited.set_description("Changed after publication.");
+    let changed = finance_release("1.0.0", &registered_policy("1.0.0"), edited);
+    let drift = cards
+        .declare_authored(&changed)
+        .await
+        .expect_err("changed content under a published version is refused");
+    assert_eq!(drift.code(), "WYRD_REGISTRY_409_SPEC_DRIFT", "{drift:?}");
+    let drift = WyrdState::declare_authored_with(
+        &changed,
+        DeclareOptions {
+            client: Some(deployment.admin()),
+            ..DeclareOptions::default()
+        },
+    )
+    .await
+    .expect_err("changed content under a published version is refused");
+    assert_eq!(drift.code(), "WYRD_REGISTRY_409_SPEC_DRIFT", "{drift:?}");
+
+    let reader = deployment.client(&deployment.scoped_key("card_reader", &["cards:read"]).await);
+    let refused = Cards::connect_with(&reader)
+        .await
+        .expect("the reader connects")
+        .declare_authored(&authored)
+        .await
+        .expect_err("a reader cannot declare");
+    assert_eq!(
+        refused.code(),
+        "WYRD_PERMISSION_403_DENIED_RBAC",
+        "{refused:?}"
+    );
+    let refused = WyrdState::declare_authored_with(
+        &authored,
+        DeclareOptions {
+            client: Some(reader),
+            ..DeclareOptions::default()
+        },
+    )
+    .await
+    .expect_err("a reader cannot declare");
+    assert_eq!(
+        refused.code(),
+        "WYRD_PERMISSION_403_DENIED_RBAC",
+        "{refused:?}"
+    );
+    story_server.deployment.shutdown().await;
+}

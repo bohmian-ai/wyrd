@@ -473,7 +473,8 @@ pub struct ConfigureOptions {
     pub deployment_environment: Option<String>,
 }
 
-/// How [`WyrdState::declare_with`] declares a Card file and prepares its state.
+/// How [`WyrdState::declare_with`] and [`WyrdState::declare_authored_with`]
+/// declare a graph and prepare its state.
 #[derive(Debug, Clone, Default)]
 pub struct DeclareOptions {
     /// The client the declaration, the pull, and every later server call of

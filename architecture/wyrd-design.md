@@ -2315,6 +2315,33 @@ one move, and reference slots accept `Ref` or `InlineableRef<T>`. A path string 
 loader-only authoring syntax projected to a Ref/Sibling before send; inline
 is available only at `InlineableRef<T>` slots.
 
+### In-memory authoring
+
+`wyrd-client::authoring` (`wyrd_ai::authoring` in Rust; the Python and
+TypeScript SDKs wrap it) builds the same Cards in code. Each value is backed
+by its canonical `wyrd-spec` type and edited through inherent constructors
+and `add_*`/`set_*` methods; nothing touches the network, and
+`CodeCall::from_file` reads its source once. Adding a child captures its
+value, duplicate step/requirement IDs, slots, and aliases are refused, and
+every authored Card holds an exact version pin.
+
+A referenced definition becomes a sibling of the containing graph; a
+registered Card stays an external exact reference. An Artifact, local or
+registered, is always referenced externally by exact name and version, with
+no UID. `CardDefinition::declaration` passes the graph through the loader's
+file-tree validation and ordering (`wyrd_loader::declaration_input_from_cards`),
+emits one submission per distinct identity, and refuses two different
+definitions of one identity with `WYRD_SPEC_400_DUPLICATE_SUBMISSION`. No
+local path reaches a submission.
+
+`Cards::declare_authored` and `WyrdState::declare_authored(_with)` validate
+locally first, publish each local Artifact as its own sole submission
+through `Cards::upload_artifact`, and then declare the graph through
+`Cards::declare`; the state forms pull and hydrate as `declare_with` does.
+There is no rollback: a graph refused after publication leaves the Artifact
+registered for reuse by reference. Code-authored and file-authored forms of
+one graph register identical content and identities.
+
 ### Pre-declaration matrix (Rule 14)
 
 | Kind | Must pre-declare? | Why |

@@ -24,6 +24,7 @@ use vala_verify::blocks::{
 };
 use wyrd_runtime::Permission;
 use wyrd_runtime::principal::PrincipalId;
+use wyrd_server::components::auth::Caller;
 use wyrd_server::components::gateway::GatewayCallContext;
 use wyrd_server::query::scheduled::ScheduledQueryCaller;
 use wyrd_server::scribe_outbox::{ScribeOutbox, ScribeSink, ScribeWrite};
@@ -52,7 +53,7 @@ use wyrd_spec::verification::execution::{
     PublicationContent, PublicationFile, PublicationKind, PublicationManifest, Speculation,
     StepStatus, VerificationOutcome, VerificationResult,
 };
-use wyrd_spec::verification::state::{EXECUTION_STATE_FORMAT, ExecutionState};
+use wyrd_spec::verification::state::{EXECUTION_STATE_FORMAT, ExecutionState, InvocationRecord};
 use wyrd_spec::verification::{PublicationName, TaskId};
 use wyrd_spec::verification::{
     VerificationError, VerificationExecutionStatus, VerificationVerdict,
@@ -148,10 +149,7 @@ impl Leased {
 
     /// A user of the execution's tenant granted `verifier:run` on exactly
     /// its Verifier, as its accepted authority is, plus `permissions`.
-    fn publisher(
-        &self,
-        permissions: impl IntoIterator<Item = Permission>,
-    ) -> wyrd_server::components::auth::Caller {
+    fn publisher(&self, permissions: impl IntoIterator<Item = Permission>) -> Caller {
         user(
             self.server.data_tenant_id(),
             std::iter::once(Permission::verifier_run(self.verifier.clone())).chain(permissions),
@@ -974,7 +972,7 @@ async fn publication_limits_survive_reclaim() {
         assert_eq!(leased.read(&producer, refused).await, None, "{refused}");
     }
 
-    let blind = wyrd_server::components::auth::Caller {
+    let blind = Caller {
         // Not a SYSTEM principal, so every inventory query is unavailable.
         executed_by: Some(wyrd_runtime::principal::PrincipalId::new(
             uuid::Uuid::new_v4(),
@@ -1435,10 +1433,10 @@ async fn cancelled_work_keeps_checkpoints_and_fences_stale_writes() {
 fn agent_engine(
     leased: &Leased,
     run: &Arc<RunState>,
-    caller: &wyrd_server::components::auth::Caller,
+    caller: &Caller,
     model: &Arc<MockProvider>,
     sandbox: &Arc<Sandbox>,
-    recorded: Vec<wyrd_spec::verification::state::InvocationRecord>,
+    recorded: Vec<InvocationRecord>,
 ) -> VerificationEngine {
     let limits = saturable();
     let evidence = Arc::new(
@@ -1692,9 +1690,9 @@ const KEPT: &[u8] = b"# Kept\n";
 /// settles; its consumer is then refused Python capacity before retaining
 /// anything. The reclaim recovers the settled drafter alone. A caller
 /// whose inventory queries all fail cannot read the report as evidence,
-/// and replaying the drafter's original publish call after its reply was
-/// lost, with neither scratch nor writable storage, answers the original
-/// receipt and accepts nothing. Once capacity frees, the recovered run as
+/// and replaying the drafter's original publish call, whose receipt the
+/// drafter already received, with neither scratch nor writable storage,
+/// answers the original receipt and accepts nothing. Once capacity frees, the recovered run as
 /// that caller never runs the drafter again, and the consumer reads
 /// exactly the accepted bytes.
 ///
@@ -1756,7 +1754,7 @@ async fn agent_publications_reach_a_recovered_consumer() {
         [("draft".to_owned(), 1)],
         "the reclaim recovers the settled drafter; the refused consumer spent nothing"
     );
-    let blind = wyrd_server::components::auth::Caller {
+    let blind = Caller {
         // Not a SYSTEM principal, so every inventory query is unavailable.
         executed_by: Some(PrincipalId::new(uuid::Uuid::new_v4())),
         ..caller.clone()
@@ -1900,6 +1898,109 @@ async fn agent_publications_reach_a_recovered_consumer() {
         "the consumer read exactly the accepted bytes"
     );
     drop(mounted);
+    leased
+        .server
+        .shutdown()
+        .await
+        .expect("test server shuts down");
+}
+
+/// A File publication whose first reply never reaches its caller still
+/// answers that caller's retry with the original receipt. The caller waits
+/// on a reply channel; the server side publishes `report` and then drops
+/// both the result and the channel before sending, so the reply is lost
+/// after acceptance and before delivery. The caller sees no reply, reads
+/// the accepted entry back from Bifrost, and retries the same call,
+/// producer, name, and path against the reclaimed state with its scratch
+/// tree gone and storage unwritable: it receives the File receipt, and the
+/// accepted revision and entry are unchanged.
+///
+/// # Panics
+/// Panics when a reply arrives, the first publication is not accepted, or
+/// the retry fails, uploads, or changes the accepted revision or entry.
+#[tokio::test(flavor = "multi_thread")]
+async fn publication_receipt_survives_a_lost_reply() {
+    let leased = Leased::start().await;
+    let limits = HostedLimits::default();
+    let caller = leased.publisher([]);
+    let producer = Producer {
+        step_id: TaskId::new("draft").expect("task"),
+        item_index: None,
+        iteration_index: None,
+        attempt: 1,
+    };
+    let publish = call("call_1", &producer, "report");
+    let workspace = Arc::new(Workspace::materialize(Vec::new(), limits, None).expect("workspace"));
+    put(&workspace, "report.md", KEPT);
+
+    let (reply, received) = tokio::sync::oneshot::channel();
+    let first = Publications::new(leased.server.state(), &caller, &leased.run, limits)
+        .path(&publish, &workspace, "/work/report.md")
+        .await;
+    // The loss point: the server-side result is discarded with its reply
+    // sender, so the caller never receives it.
+    drop((first, reply));
+    let lost: Result<Result<PublicationKind, skald_tool::ToolError>, _> = received.await;
+    lost.expect_err("the caller never receives the first reply");
+
+    let (revision, state) = leased.revision().await;
+    let accepted = state
+        .publications
+        .into_iter()
+        .map(|accepted| accepted.publication)
+        .find(|publication| publication.producer == producer)
+        .expect("the publication was accepted before its reply was lost");
+    assert_eq!(accepted.name.as_str(), "report");
+    assert_eq!(
+        accepted.content,
+        PublicationContent::File {
+            manifest: PublicationManifest {
+                files: vec![PublicationFile {
+                    path: "report.md".to_owned(),
+                    sha256: wyrd_spec::auth::Sha256Hex::digest(KEPT),
+                    size_bytes: KEPT.len() as u64,
+                }],
+                directories: Vec::new(),
+            },
+        },
+        "the accepted File holds the published bytes"
+    );
+
+    let current = leased.reclaim().await;
+    std::fs::remove_file(workspace.work_dir().join("report.md")).expect("scratch removed");
+    let wyrd_storage::BackendConfig::Local { root } =
+        leased.server.state().storage.backend_config()
+    else {
+        panic!("the test server stores locally");
+    };
+    let objects = root
+        .join(leased.server.data_tenant_id().to_string())
+        .join("evidence/sha256");
+    std::fs::set_permissions(&objects, std::fs::Permissions::from_mode(0o000)).expect("chmod");
+    let retried = Publications::new(leased.server.state(), &caller, &current, limits)
+        .path(&publish, &workspace, "/work/report.md")
+        .await;
+    std::fs::set_permissions(&objects, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+    assert_eq!(
+        retried.expect("the retry replays without scratch or storage"),
+        PublicationKind::File,
+        "the retry answers the original receipt"
+    );
+    assert_eq!(
+        leased.revision().await.0,
+        revision,
+        "the retry accepts nothing"
+    );
+    assert_eq!(
+        leased.read(&producer, "report").await,
+        Some(accepted.content),
+        "the accepted entry is unchanged"
+    );
+    assert_eq!(
+        leased.entries().await,
+        [("draft".to_owned(), 1, "report".to_owned())],
+        "one entry for the call and its retry"
+    );
     leased
         .server
         .shutdown()

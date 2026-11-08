@@ -1077,6 +1077,7 @@ mod tests {
     use std::sync::Arc;
     use std::time::Duration;
 
+    use serde_json::Value;
     use vala_verify::blocks::Checkpoints as _;
     use wyrd_spec::DataTenantId;
     use wyrd_spec::auth::Sha256Hex;
@@ -1366,7 +1367,7 @@ mod tests {
         (task_id, attempt): (&str, u32),
         call: &str,
         name: &str,
-        value: serde_json::Value,
+        value: Value,
     ) -> PublicationAcceptance {
         let arguments = serde_json::json!({ "name": name, "value": value });
         let publication = Publication {
@@ -1444,7 +1445,7 @@ mod tests {
             PublicationAcceptance::Accepted,
             "a fresh attempt may reuse the name and call ID"
         );
-        let kept: Vec<(u32, String, serde_json::Value)> = restored
+        let kept: Vec<(u32, String, Value)> = restored
             .snapshot()
             .await
             .publications

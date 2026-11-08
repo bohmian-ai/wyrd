@@ -319,12 +319,20 @@ fn report_policy(version: &str, judge: &Agent, policy: &ArtifactFile) -> Verifie
 
 /// `release-access` at `version`: independent recipient and destination
 /// steps, and an optional `notes` slot.
+///
+/// # Panics
+/// Panics as `access_verifier` does, including when `version` is not an
+/// exact version.
 fn release_access(version: &str) -> Verifier {
     access_verifier(version, false)
 }
 
 /// `release-access` at `version` with a `summary` step that depends on and
 /// consumes both fact steps' outputs.
+///
+/// # Panics
+/// Panics as `access_verifier` does, including when `version` is not an
+/// exact version.
 fn summarized_access(version: &str) -> Verifier {
     access_verifier(version, true)
 }
@@ -448,6 +456,9 @@ fn card_ref(kind: CardKind, name: &str, version: &str) -> CardRef {
 }
 
 /// The baseline story graph over `policy`.
+///
+/// # Panics
+/// Panics when the story's checks cannot be read, as `fact_step` does.
 fn baseline(policy: &ArtifactFile) -> Service {
     finance_release("1.0.0", policy, release_access("1.0.0"))
 }
@@ -527,6 +538,9 @@ fn releases(report: &VerificationResult, access: &VerificationResult) -> bool {
 }
 
 /// The outcome of requirement `id` in `result`.
+///
+/// # Panics
+/// Panics when `result` has no requirement `id`, as `requirement` does.
 fn outcome(result: &VerificationResult, id: &str) -> RequirementOutcome {
     requirement(result, id).outcome
 }
@@ -791,6 +805,10 @@ fn declared_kinds(receipt: &wyrd_ai::cards::DeclarationReceipt) -> Vec<CardKind>
 
 /// Whether Artifact `version` of the policy is registered and holds its
 /// extracted policy file.
+///
+/// # Panics
+/// Panics when `version` is not an exact version, as `card_ref` does,
+/// before the server is asked.
 async fn policy_published(cards: &Cards, version: &str) -> bool {
     cards
         .list_artifacts(CardSelector::exact(card_ref(

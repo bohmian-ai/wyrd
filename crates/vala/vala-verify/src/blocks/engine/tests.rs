@@ -3116,3 +3116,268 @@ async fn invalid_step_controls_reject_before_dispatch() {
     assert!(matches!(refused, Err(EngineError::Plan(_))), "{refused:?}");
     assert!(script.calls().is_empty());
 }
+
+/// `limits.concurrency` and `foreach.concurrency` only lower the engine's
+/// bound, and fanout never multiplies it: two blocks that must run together
+/// finish only when every bound reaching them admits both.
+///
+/// # Panics
+/// Panics when a bound admits more blocks than it allows, or a wide enough
+/// bound does not let them overlap.
+#[tokio::test(start_paused = true)]
+async fn run_and_fanout_bounds_only_lower_engine_capacity() {
+    let pair = |limits: Value| {
+        verifier(json!({
+            "inputs": {"answer": {"type": "json"}},
+            "limits": limits,
+            "steps": [
+                {"id": "a", "action": code_action(json!({"x": "inputs.answer"}))},
+                {"id": "b", "action": code_action(json!({"x": "inputs.answer"}))}
+            ]
+        }))
+    };
+    let swept = |foreach: Value| {
+        verifier(json!({
+            "inputs": {"answer": {"type": "json"}},
+            "steps": [{"id": "a", "foreach": foreach, "action": code_action(json!({"x": "inputs.answer"}))}]
+        }))
+    };
+    let together = |steps: &[&'static str]| {
+        let barrier = Arc::new(Barrier::new(2));
+        Arc::new(Script {
+            actions: steps
+                .iter()
+                .map(|id| (*id, Behavior::Together(Arc::clone(&barrier), json!({}))))
+                .collect(),
+            ..Script::default()
+        })
+    };
+    let cases = [
+        (pair(json!({"concurrency": 2})), &["a", "b"][..], 4, true),
+        (pair(json!({"concurrency": 1})), &["a", "b"][..], 4, false),
+        (pair(json!({"concurrency": 4})), &["a", "b"][..], 1, false),
+        (swept(json!({"count": 2})), &["a"][..], 4, true),
+        (
+            swept(json!({"count": 2, "concurrency": 1})),
+            &["a"][..],
+            4,
+            false,
+        ),
+        (
+            swept(json!({"count": 2, "concurrency": 2})),
+            &["a"][..],
+            1,
+            false,
+        ),
+    ];
+    for (spec, steps, capacity, overlaps) in cases {
+        let script = together(steps);
+        let outcome = run(
+            &engine(&script, InMemoryTraceSource::new(), capacity),
+            &spec,
+            json!({"answer": 1}),
+        )
+        .await;
+        assert_eq!(
+            outcome.is_ok(),
+            overlaps,
+            "{:?} with capacity {capacity}: {outcome:?}",
+            spec.limits
+        );
+        if !overlaps {
+            assert!(
+                matches!(outcome, Err(EngineError::DeadlineExceeded)),
+                "{outcome:?}"
+            );
+        }
+    }
+}
+
+/// An inline Agent action or check reading the `answer` input.
+fn answer_agent() -> Value {
+    reader_agent(json!({"/inputs/answer.json": "inputs.answer"}))
+}
+
+/// `limits.max_agent_invocations` counts every Agent action and check
+/// attempt, retries included: once spent, a later Agent action fails and an
+/// Agent check is inconclusive without being called, while code blocks still
+/// run. A reclaimed execution counts the attempts it already recorded, so
+/// recovery never replenishes the budget.
+///
+/// # Panics
+/// Panics when a spent budget dispatches an Agent block, a code block is
+/// refused, or recovery replenishes the budget.
+#[tokio::test(start_paused = true)]
+async fn agent_budget_counts_retries_and_is_never_replenished() {
+    let retryable = || BlockError::Retryable {
+        reason: "provider unavailable".to_owned(),
+    };
+    let spec = verifier(json!({
+        "inputs": {"answer": {"type": "json"}},
+        "limits": {"max_agent_invocations": 3},
+        "steps": [
+            {"id": "first", "retries": 2, "action": answer_agent()},
+            {"id": "second", "depends_on": ["first"], "action": answer_agent()},
+            {"id": "plain", "depends_on": ["first"], "action": code_action(json!({"x": "inputs.answer"}))}
+        ],
+        "requirements": [
+            {"id": "judged", "statement": "judged", "check": answer_agent()},
+            {"id": "coded", "statement": "coded", "check": {"kind": "assert", "path": "steps.plain.status", "operator": "equals", "expected": "succeeded"}}
+        ]
+    }));
+    let script = Arc::new(Script {
+        actions: HashMap::from([(
+            "first",
+            Behavior::Attempts(vec![retryable(), retryable()], json!({})),
+        )]),
+        checks: HashMap::from([(
+            "judged",
+            Ok(verdict(VerificationVerdict::Passed, json!([]))),
+        )]),
+        ..Script::default()
+    });
+    let outcome = run(
+        &engine(&script, InMemoryTraceSource::new(), 4),
+        &spec,
+        json!({"answer": 1}),
+    )
+    .await
+    .expect("outcome");
+    let calls = script.calls();
+    assert_eq!(
+        calls.iter().filter(|call| *call == "action:first").count(),
+        3
+    );
+    assert!(!calls.contains(&"action:second".to_owned()), "{calls:?}");
+    assert!(!calls.contains(&"check:judged".to_owned()), "{calls:?}");
+    assert!(calls.contains(&"action:plain".to_owned()), "{calls:?}");
+    let second = step(&outcome, "second");
+    assert_eq!(
+        (second.status, second.attempts, second.reason.as_deref()),
+        (StepStatus::Failed, 0, Some(BUDGET_SPENT))
+    );
+    let judged = requirement(&outcome, "judged");
+    assert_eq!(
+        (judged.outcome, judged.reason.as_str()),
+        (RequirementOutcome::Inconclusive, BUDGET_SPENT)
+    );
+    let coded = requirement(&outcome, "coded");
+    assert_eq!(coded.outcome, RequirementOutcome::Passed, "{coded:?}");
+
+    let resumable = verifier(json!({
+        "inputs": {"answer": {"type": "json"}},
+        "limits": {"max_agent_invocations": 2},
+        "steps": [{"id": "first", "retries": 3, "action": answer_agent()}]
+    }));
+    let hung = Arc::new(Notify::new());
+    let crashed = Arc::new(Script {
+        actions: HashMap::from([("first", Behavior::Hang(hung))]),
+        ..Script::default()
+    });
+    let ledger = Arc::new(Ledger::default());
+    let interrupted = engine(&crashed, InMemoryTraceSource::new(), 4).with_checkpoints(
+        Arc::clone(&ledger) as Arc<dyn Checkpoints>,
+        &ExecutionState::default(),
+    );
+    assert!(matches!(
+        run(&interrupted, &resumable, json!({"answer": 1})).await,
+        Err(EngineError::DeadlineExceeded)
+    ));
+    let recovered = Arc::new(Script {
+        actions: HashMap::from([("first", Behavior::Attempts(vec![retryable()], json!({})))]),
+        ..Script::default()
+    });
+    let resumed = engine(&recovered, InMemoryTraceSource::new(), 4).with_checkpoints(
+        Arc::clone(&ledger) as Arc<dyn Checkpoints>,
+        &ledger.recorded(),
+    );
+    let outcome = run(&resumed, &resumable, json!({"answer": 1}))
+        .await
+        .expect("outcome");
+    assert_eq!(recovered.calls(), ["action:first"]);
+    let first = step(&outcome, "first");
+    assert_eq!(
+        (first.status, first.attempts, first.reason.as_deref()),
+        (StepStatus::Failed, 2, Some(BUDGET_SPENT))
+    );
+}
+
+/// A `when` that reads missing data or compares the wrong type fails its
+/// step without a call rather than skipping it as false, and a speculative
+/// step whose true guard admits a failed action stays visible as failed and
+/// fails, not skips, its consumer.
+///
+/// # Panics
+/// Panics when an unevaluable condition skips or runs its step, or an
+/// admitted failure is hidden.
+#[tokio::test(start_paused = true)]
+async fn condition_errors_and_admitted_failures_stay_failures() {
+    let when = |path: &str, operator: &str, expected: Value| json!({"path": path, "operator": operator, "expected": expected});
+    let spec = verifier(json!({
+        "inputs": {"answer": {"type": "json"}},
+        "steps": [
+            {"id": "compare", "action": code_action(json!({"x": "inputs.answer"}))},
+            {"id": "missing", "when": when("steps.compare.output.absent", "equals", json!(1)),
+             "action": code_action(json!({"x": "inputs.answer"}))},
+            {"id": "mistyped", "when": when("steps.compare.output.x", "greater_than", json!("high")),
+             "action": code_action(json!({"x": "inputs.answer"}))},
+            {"id": "extra", "speculative": true, "when": when("steps.compare.output.x", "equals", json!(1)),
+             "action": code_action(json!({"x": "inputs.answer"}))},
+            {"id": "consumer", "action": code_action(json!({"e": "steps.extra.output"}))}
+        ]
+    }));
+    let ledger = Arc::new(Ledger::default());
+    let script = Arc::new(Script {
+        actions: HashMap::from([
+            ("compare", echo(&[1])),
+            (
+                "extra",
+                Behavior::Attempts(
+                    vec![BlockError::Terminal {
+                        reason: "the extra review broke".to_owned(),
+                    }],
+                    json!(null),
+                ),
+            ),
+        ]),
+        ..Script::default()
+    });
+    let outcome = run(
+        &engine(&script, InMemoryTraceSource::new(), 8).with_checkpoints(
+            Arc::clone(&ledger) as Arc<dyn Checkpoints>,
+            &ExecutionState::default(),
+        ),
+        &spec,
+        json!({"answer": 1}),
+    )
+    .await
+    .expect("outcome");
+    let calls = script.calls();
+    for refused in ["missing", "mistyped"] {
+        assert_eq!(
+            step(&outcome, refused).status,
+            StepStatus::Failed,
+            "{refused}"
+        );
+        assert!(
+            !calls.contains(&format!("action:{refused}")),
+            "{refused}: {calls:?}"
+        );
+    }
+    let extra = step(&outcome, "extra");
+    assert_eq!(
+        (extra.status, extra.reason.as_deref()),
+        (StepStatus::Failed, Some("the extra review broke"))
+    );
+    assert!(
+        ledger.recorded().controls.iter().any(|control| matches!(
+            control,
+            ControlRecord::Disposition { step, speculation: Speculation::Admitted, .. }
+                if step.as_str() == "extra"
+        )),
+        "{:?}",
+        ledger.recorded().controls
+    );
+    assert_ne!(step(&outcome, "consumer").status, StepStatus::Succeeded);
+    assert!(!calls.contains(&"action:consumer".to_owned()), "{calls:?}");
+}

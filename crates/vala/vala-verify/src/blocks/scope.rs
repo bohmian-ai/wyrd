@@ -64,6 +64,16 @@ impl Missing {
         }
     }
 
+    /// The status of a step whose own control value is this gap: an
+    /// intentional skip upstream stays a skip, and anything else is the
+    /// step's evaluation error, never an implicit false.
+    pub(super) const fn control_status(&self) -> StepStatus {
+        match self.cause {
+            Cause::Skipped => StepStatus::Skipped,
+            Cause::Failed => StepStatus::Failed,
+        }
+    }
+
     /// Fold several gaps into one: the strongest cause wins, keeping the
     /// first reason recorded for that cause.
     pub(super) fn strongest(gaps: impl IntoIterator<Item = Self>) -> Option<Self> {

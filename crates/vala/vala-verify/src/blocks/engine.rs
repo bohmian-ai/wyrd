@@ -1045,7 +1045,7 @@ impl VerificationEngine {
                         };
                         return settle(StepStatus::Skipped, gap, speculation);
                     }
-                    Err(gap) => return settle(StepStatus::Skipped, gap, speculation),
+                    Err(gap) => return settle(gap.control_status(), gap, speculation),
                 }
             }
         }
@@ -1055,7 +1055,7 @@ impl VerificationEngine {
                 (Some(items), _) => {
                     let resolved = match scope.resolve(items, None) {
                         Ok(resolved) => resolved,
-                        Err(gap) => return settle(StepStatus::Skipped, gap, speculation),
+                        Err(gap) => return settle(gap.control_status(), gap, speculation),
                     };
                     let (values, freeze) = match (self.frozen(&step.id), &resolved.value) {
                         (Some(frozen), _) => (frozen.clone(), None),

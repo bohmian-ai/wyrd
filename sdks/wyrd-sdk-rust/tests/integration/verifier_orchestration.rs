@@ -16,14 +16,16 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 use serde_json::{Value, json};
-use wiremock::matchers::{method, path};
+use wiremock::matchers::{body_string_contains, method, path};
 use wiremock::{Mock, MockServer, Request, ResponseTemplate};
 use wyrd_ai::state::WyrdState;
 use wyrd_ai::verify::{
     Execution, ExecutionPageQuery, File, PublicationContent, PublicationName, PublicationSelector,
-    PublicationSummary, Speculation, TaskId,
+    PublicationSummary, Speculation, Submission, TaskId,
 };
 use wyrd_ai::{RequirementOutcome, StepStatus, VerificationResult, VerificationVerdict};
+use wyrd_spec::verification::state::ControlRecord;
+use wyrd_testing::verification::VerificationFixture;
 
 use crate::hosted_agent_tools::{builder, calls, done, lines, messages, results, text, turn};
 use crate::local_development::configure_gateway;
@@ -332,6 +334,18 @@ fn reply(request: &Request, script: &Script) -> ResponseTemplate {
     ResponseTemplate::new(500)
 }
 
+/// Start the scripted upstream every desk's Agents call.
+async fn upstream() -> MockServer {
+    let upstream = MockServer::start().await;
+    let script = Arc::new(Script::default());
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(move |request: &Request| reply(request, &script))
+        .mount(&upstream)
+        .await;
+    upstream
+}
+
 /// The orchestration desk deployment: a verification-capable server whose
 /// gateway deploys `gpt-4o` on the scripted upstream, with
 /// `orchestration-desk` registered and hydrated; verifications run as a
@@ -353,13 +367,7 @@ impl Desk {
     /// # Panics
     /// Panics when a setup step fails.
     async fn start() -> Self {
-        let upstream = MockServer::start().await;
-        let script = Arc::new(Script::default());
-        Mock::given(method("POST"))
-            .and(path("/v1/chat/completions"))
-            .respond_with(move |request: &Request| reply(request, &script))
-            .mount(&upstream)
-            .await;
+        let upstream = upstream().await;
         let deployment = Deployment::start_with(builder(&upstream)).await;
         configure_gateway(&deployment.admin()).await;
         let cards = deployment.cards().await;
@@ -1180,5 +1188,177 @@ async fn document_pipeline_uses_array_repeat_and_publications() {
         json!([{ "slot": "document", "locator": { "json_pointer": "/title" } }])
     );
     assert_eq!(result.outcome.verdict, VerificationVerdict::Failed);
+    desk.deployment.shutdown().await;
+}
+
+/// A queued execution crashes while its second refinement iteration's model
+/// call is held: its frozen items, its speculative decision, and its
+/// settled work are already accepted in Bifrost. The restarted server
+/// reclaims it and resumes from that logical state: no section reviewer,
+/// comparison, extra review, or settled iteration runs again; the
+/// interrupted iteration spends its attempt and runs as its retry, attempt
+/// 2; and the refinement stops
+/// within its original bound with every accepted publication kept.
+///
+/// # Panics
+/// Panics when the submission is refused or does not settle, accepted
+/// state is missing, or settled work runs again.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires the repository-managed Postgres journey lifecycle"]
+async fn logical_control_state_resumes_from_bifrost() {
+    const MARKER: &str = "RESUME-ADMIT";
+    let desk = Desk::start().await;
+    Mock::given(method("POST"))
+        .and(body_string_contains(MARKER))
+        .and(body_string_contains("index=1"))
+        .respond_with(ResponseTemplate::new(200).set_delay(Duration::from_secs(600)))
+        .up_to_n_times(1)
+        .with_priority(1)
+        .mount(&desk.upstream)
+        .await;
+    let Submission::Queued(queued) = desk
+        .state
+        .run()
+        .observe()
+        .submit(
+            "resume-pipeline",
+            json!({ "marker": MARKER, "sections": ["alpha", "beta"] }),
+        )
+        .await
+        .expect("the pipeline is submitted")
+    else {
+        panic!("Run evidence queues an execution");
+    };
+    let execution = *queued.id();
+    let deadline = std::time::Instant::now() + Duration::from_secs(90);
+    while !iterations(&desk.asked("REFINE:", MARKER).await).contains(&1) {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the second iteration never started"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    let server = desk.deployment.server();
+    let fixture = VerificationFixture::provision(server.state(), server.data_tenant_id())
+        .await
+        .expect("the tenant provisions");
+    let accepted = fixture
+        .execution_state(server.state(), execution)
+        .await
+        .expect("the accepted state reads")
+        .expect("the execution accepted progress");
+    let map = TaskId::new("map").expect("step");
+    let extra = TaskId::new("extra").expect("step");
+    assert!(
+        accepted.controls.contains(&ControlRecord::Items {
+            step: map.clone(),
+            items: vec![json!("alpha"), json!("beta")],
+        }),
+        "{:?}",
+        accepted.controls
+    );
+    assert_eq!(accepted.speculation(&extra), Speculation::Admitted);
+    let before = (
+        desk.requests("SECTION:").await.len(),
+        desk.asked("COMPARE:", MARKER).await.len(),
+        desk.asked("EXTRA:", MARKER).await.len(),
+    );
+    assert_eq!(before.0, 4, "two turns for each of two sections");
+    server.flush_bifrost().await.expect("Bifrost flushes");
+
+    let upstream = desk.upstream;
+    let deployment = desk.deployment.restart(builder(&upstream)).await;
+    let server = deployment.server();
+    VerificationFixture::provision(server.state(), server.data_tenant_id())
+        .await
+        .expect("the tenant provisions")
+        .expire_deadlines(execution)
+        .await
+        .expect("the crashed process's lease expires");
+    let result = Execution::connect_with(execution, &deployment.admin())
+        .await
+        .expect("the execution handle connects")
+        .wait(Duration::from_secs(90))
+        .await
+        .expect("the recovered execution settles");
+    let desk = Desk {
+        deployment,
+        upstream,
+        state: desk.state,
+    };
+
+    assert_eq!(
+        requirement(&result, "refined").outcome,
+        RequirementOutcome::Passed,
+        "{result:?}"
+    );
+    assert_eq!(
+        (
+            desk.requests("SECTION:").await.len(),
+            desk.asked("COMPARE:", MARKER).await.len(),
+            desk.asked("EXTRA:", MARKER).await.len(),
+        ),
+        before,
+        "settled items, the decision, and the admitted review are restored"
+    );
+    assert_eq!(
+        step(&result, "map").output,
+        Some(json!([{ "done": true }, { "done": true }]))
+    );
+    assert_eq!(
+        iterations(&desk.asked("REFINE:", MARKER).await),
+        [0, 0, 1, 1, 1, 2, 2],
+        "iteration 0 is restored and the held iteration 1 runs once more"
+    );
+    let refine = step(&result, "refine");
+    assert_eq!(
+        (refine.status, refine.output.clone()),
+        (
+            StepStatus::Succeeded,
+            Some(json!({ "score": 2, "text": "v2" }))
+        )
+    );
+    let attempts: Vec<(Option<u32>, u32)> = desk
+        .publications(&result)
+        .await
+        .iter()
+        .filter(|publication| publication.producer.step_id.as_str() == "refine")
+        .map(|publication| {
+            (
+                publication.producer.iteration_index,
+                publication.producer.attempt,
+            )
+        })
+        .collect();
+    assert_eq!(
+        attempts,
+        [(Some(0), 1), (Some(1), 2), (Some(2), 1)],
+        "the interrupted iteration publishes as its second attempt"
+    );
+    let mut published: Vec<(String, Option<u32>, Option<u32>, Speculation)> = desk
+        .publications(&result)
+        .await
+        .iter()
+        .map(|publication| {
+            (
+                publication.producer.step_id.as_str().to_owned(),
+                publication.producer.item_index,
+                publication.producer.iteration_index,
+                publication.speculation,
+            )
+        })
+        .collect();
+    published.sort_by(|a, b| (&a.0, a.1, a.2).cmp(&(&b.0, b.1, b.2)));
+    assert_eq!(
+        published,
+        [
+            ("extra".to_owned(), None, None, Speculation::Admitted),
+            ("map".to_owned(), Some(0), None, Speculation::None),
+            ("map".to_owned(), Some(1), None, Speculation::None),
+            ("refine".to_owned(), None, Some(0), Speculation::None),
+            ("refine".to_owned(), None, Some(1), Speculation::None),
+            ("refine".to_owned(), None, Some(2), Speculation::None),
+        ]
+    );
     desk.deployment.shutdown().await;
 }

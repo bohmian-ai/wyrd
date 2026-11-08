@@ -1907,17 +1907,18 @@ async fn agent_publications_reach_a_recovered_consumer() {
 
 /// A File publication whose first reply never reaches its caller still
 /// answers that caller's retry with the original receipt. The caller waits
-/// on a reply channel; the server side publishes `report` and then drops
-/// both the result and the channel before sending, so the reply is lost
-/// after acceptance and before delivery. The caller sees no reply, reads
+/// on a reply channel whose sender the responder owns; the responder
+/// publishes `report`, succeeds, and drops the sender instead of sending
+/// that success, so the reply is lost after acceptance and before delivery. The caller sees no reply, reads
 /// the accepted entry back from Bifrost, and retries the same call,
 /// producer, name, and path against the reclaimed state with its scratch
 /// tree gone and storage unwritable: it receives the File receipt, and the
 /// accepted revision and entry are unchanged.
 ///
 /// # Panics
-/// Panics when a reply arrives, the first publication is not accepted, or
-/// the retry fails, uploads, or changes the accepted revision or entry.
+/// Panics when the first publication fails or is not accepted, a reply
+/// arrives, or the retry fails, uploads, or changes the accepted revision
+/// or entry.
 #[tokio::test(flavor = "multi_thread")]
 async fn publication_receipt_survives_a_lost_reply() {
     let leased = Leased::start().await;
@@ -1933,14 +1934,23 @@ async fn publication_receipt_survives_a_lost_reply() {
     let workspace = Arc::new(Workspace::materialize(Vec::new(), limits, None).expect("workspace"));
     put(&workspace, "report.md", KEPT);
 
-    let (reply, received) = tokio::sync::oneshot::channel();
-    let first = Publications::new(leased.server.state(), &caller, &leased.run, limits)
-        .path(&publish, &workspace, "/work/report.md")
-        .await;
-    // The loss point: the server-side result is discarded with its reply
-    // sender, so the caller never receives it.
-    drop((first, reply));
-    let lost: Result<Result<PublicationKind, skald_tool::ToolError>, _> = received.await;
+    let (reply, received) =
+        tokio::sync::oneshot::channel::<Result<PublicationKind, skald_tool::ToolError>>();
+    // The responder owns the caller's reply sender and publishes; the loss
+    // point is that it drops the sender after its successful result instead
+    // of sending it, so the caller's wait ends only once publishing has.
+    let responder = async {
+        let first = Publications::new(leased.server.state(), &caller, &leased.run, limits)
+            .path(&publish, &workspace, "/work/report.md")
+            .await;
+        drop(reply);
+        first
+    };
+    let (first, lost) = tokio::join!(responder, received);
+    assert_eq!(
+        first.expect("the first publication succeeds before its reply is lost"),
+        PublicationKind::File
+    );
     lost.expect_err("the caller never receives the first reply");
 
     let (revision, state) = leased.revision().await;

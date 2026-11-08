@@ -871,7 +871,9 @@ impl VerificationEngine {
     /// # Errors
     /// Returns [`EngineError::Capture`], [`EngineError::Join`],
     /// [`EngineError::Busy`], [`EngineError::DefinitionUnavailable`], or
-    /// [`EngineError::Checkpoint`]; every running block is then dropped.
+    /// [`EngineError::Checkpoint`]; every running block is then dropped,
+    /// except that a capacity refusal ([`EngineError::Busy`]) first lets every
+    /// running block settle and dispatches nothing more.
     async fn drive(
         &self,
         spec: &Arc<VerifierSpec>,
@@ -963,7 +965,7 @@ impl VerificationEngine {
                 continue;
             }
             let (node, done) = tasks.next(EngineError::Join).await;
-            ledger.insert(node.id(spec).clone(), done?);
+            ledger.insert(node.id(spec).clone(), settled(done, &mut tasks).await?);
         }
     }
 
@@ -1222,7 +1224,8 @@ impl VerificationEngine {
     ///
     /// # Errors
     /// Returns the first orchestration failure a member returns; every other
-    /// member is then dropped.
+    /// member is then dropped, except that a capacity refusal first lets
+    /// every running member settle.
     async fn members(
         &self,
         spec: &Arc<VerifierSpec>,
@@ -1263,7 +1266,7 @@ impl VerificationEngine {
         let mut members: Vec<(usize, Member)> = Vec::with_capacity(total);
         while !running.is_empty() {
             let (at, member) = running.next(EngineError::Join).await;
-            members.push((at, member?));
+            members.push((at, settled(member, &mut running).await?));
         }
         members.sort_by_key(|(at, _)| *at);
         Ok(members.into_iter().map(|(_, member)| member).collect())
@@ -2141,6 +2144,23 @@ impl Node {
 /// A requirement's declaration: the index of its containing step, or `None`
 /// for a whole-Verifier requirement, and its index in that list.
 type Key = (Option<usize>, usize);
+
+/// `finished`'s value, or its error once every other task in `running`
+/// finished when the error is a capacity refusal: the execution is deferred
+/// without spending attempts already dispatched, which settle and are
+/// recorded instead of being dropped and counted as interrupted.
+///
+/// # Errors
+/// Returns `finished`'s error.
+async fn settled<K: PartialEq, O>(
+    finished: Result<O, EngineError>,
+    running: &mut Tasks<K, O, EngineError>,
+) -> Result<O, EngineError> {
+    if matches!(finished, Err(EngineError::Busy(_))) {
+        running.drain(EngineError::Join).await;
+    }
+    finished
+}
 
 /// The block and instance `producer` is an attempt of.
 fn instance_key(producer: &Producer) -> (TaskId, Instance) {

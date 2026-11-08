@@ -86,7 +86,8 @@ enum Behavior {
     Hang(Arc<Notify>),
     /// Panic with this message.
     Panic(&'static str),
-    /// Wait `delays[item]` seconds (none when absent), record
+    /// Refuse capacity on the first attempt of an item in `busy`; else
+    /// wait `delays[item]` seconds (none when absent), record
     /// `done:<call>`, then fail terminally when the item is in `fail`, or
     /// return the call's inputs as one JSON object.
     Echo {
@@ -94,6 +95,8 @@ enum Behavior {
         delays: Vec<u64>,
         /// Items that fail.
         fail: Vec<u32>,
+        /// Items whose first attempt is refused capacity.
+        busy: Vec<u32>,
     },
 }
 
@@ -213,8 +216,13 @@ impl ActionExecutor for Script {
                 std::future::pending().await
             }
             Some(Behavior::Panic(message)) => panic!("{message}"),
-            Some(Behavior::Echo { delays, fail }) => {
+            Some(Behavior::Echo { delays, fail, busy }) => {
                 let item = call.item_index.unwrap_or(0);
+                if attempt == 0 && busy.contains(&item) {
+                    return Err(BlockError::Busy {
+                        reason: format!("item {item} found no worker"),
+                    });
+                }
                 let delay = delays.get(item as usize).copied().unwrap_or(0);
                 tokio::time::sleep(Duration::from_secs(delay)).await;
                 self.record(format!("done:{label}"));
@@ -1736,6 +1744,74 @@ async fn capacity_refusal_stops_the_execution_without_judging() {
     assert_eq!(step(&retried, "draft").attempts, 2);
 }
 
+/// A capacity refusal defers the execution without throwing away work
+/// already dispatched: a fanout sibling and an unrelated step that were
+/// running settle and are recorded before the refusal returns, the refused
+/// attempt is forgotten, and the reclaimed execution runs only the refused
+/// item, without spending the step's single attempt on the siblings.
+///
+/// # Panics
+/// Panics when the refusal drops running work, a settled block runs again,
+/// or the reclaimed step fails.
+#[tokio::test(start_paused = true)]
+async fn capacity_refusal_lets_dispatched_work_settle() {
+    let spec = verifier(json!({
+        "inputs": {"answer": {"type": "json"}},
+        "steps": [
+            {"id": "map", "foreach": {"count": 2}, "action": code_action(json!({}))},
+            {"id": "other", "action": code_action(json!({"x": "inputs.answer"}))}
+        ]
+    }));
+    let script = |busy: Vec<u32>| {
+        Arc::new(Script {
+            actions: HashMap::from([
+                (
+                    "map",
+                    Behavior::Echo {
+                        delays: vec![5],
+                        fail: Vec::new(),
+                        busy,
+                    },
+                ),
+                ("other", echo(&[5])),
+            ]),
+            ..Script::default()
+        })
+    };
+    let refused = script(vec![1]);
+    let ledger = Arc::new(Ledger::default());
+    let outcome = run(
+        &engine(&refused, InMemoryTraceSource::new(), 8).with_checkpoints(
+            Arc::clone(&ledger) as Arc<dyn Checkpoints>,
+            &ExecutionState::default(),
+        ),
+        &spec,
+        json!({"answer": 1}),
+    )
+    .await;
+    assert!(matches!(outcome, Err(EngineError::Busy(_))), "{outcome:?}");
+    assert_eq!(
+        ledger.attempts(),
+        [("map".to_owned(), 1, true), ("other".to_owned(), 1, true)],
+        "running work settles and the refused attempt is forgotten"
+    );
+
+    let reclaimed = script(Vec::new());
+    let outcome = run(
+        &engine(&reclaimed, InMemoryTraceSource::new(), 8).with_checkpoints(
+            Arc::new(Ledger::default()) as Arc<dyn Checkpoints>,
+            &ledger.recorded(),
+        ),
+        &spec,
+        json!({"answer": 1}),
+    )
+    .await
+    .expect("the reclaimed execution runs");
+    assert_eq!(reclaimed.calls(), ["action:map[1]", "done:map[1]"]);
+    assert_eq!(step(&outcome, "map").status, StepStatus::Succeeded);
+    assert_eq!(step(&outcome, "other").status, StepStatus::Succeeded);
+}
+
 /// Every action attempt and check is timed into the block histogram under
 /// its block and kind: a judged assertion and a succeeded action record
 /// `ok`, and a check whose executor failed records `error`.
@@ -2610,6 +2686,7 @@ fn echo(delays: &[u64]) -> Behavior {
     Behavior::Echo {
         delays: delays.to_vec(),
         fail: Vec::new(),
+        busy: Vec::new(),
     }
 }
 
@@ -2734,6 +2811,7 @@ async fn array_fanout_freezes_and_orders_items() {
                     Behavior::Echo {
                         delays: Vec::new(),
                         fail: vec![1],
+                        busy: Vec::new(),
                     },
                 ),
                 (

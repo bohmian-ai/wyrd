@@ -127,6 +127,16 @@ impl<K: PartialEq, O, E> Tasks<K, O, E> {
         self.running.is_empty()
     }
 
+    /// Wait for every running future to finish and discard the results, so
+    /// work already dispatched settles instead of being dropped; each future
+    /// records its own settlement, and the caller already holds the error
+    /// it returns.
+    pub(crate) async fn drain(&mut self, panicked: fn(String) -> E) {
+        while !self.is_empty() {
+            let _finished = self.next(panicked).await;
+        }
+    }
+
     /// Wait for the next running future to finish, returning its key and
     /// result, or `panicked` applied to the message of a future that
     /// panicked.

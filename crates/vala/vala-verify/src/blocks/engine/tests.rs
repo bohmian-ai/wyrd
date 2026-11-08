@@ -3173,7 +3173,8 @@ async fn repeat_refines_one_iteration_at_a_time() {
 /// consumers of discarded or blocked output or named publications are never
 /// called. Every
 /// disposition decided after the step started is recorded, and a recorded
-/// disposition wins over a re-evaluated guard.
+/// disposition wins over a re-evaluated guard; a crash before a decision
+/// commits reruns nothing and decides it again the same way.
 ///
 /// # Panics
 /// Panics when a call, order, admission, or record differs.
@@ -3345,6 +3346,47 @@ async fn speculative_steps_withhold_content_until_admitted() {
             "{id}: a recorded disposition keeps the attempt that ran"
         );
         assert!(!resumed.calls().contains(&format!("action:{id}")), "{id}");
+    }
+
+    let undecided = script();
+    let recorded = ledger.recorded();
+    let before_decisions = ExecutionState {
+        controls: recorded
+            .controls
+            .iter()
+            .filter(|control| !matches!(control, ControlRecord::Disposition { .. }))
+            .cloned()
+            .collect(),
+        ..recorded
+    };
+    let outcome = run(
+        &engine(&undecided, InMemoryTraceSource::new(), 8).with_checkpoints(
+            Arc::new(Ledger::default()) as Arc<dyn Checkpoints>,
+            &before_decisions,
+        ),
+        &spec,
+        json!({"answer": 1}),
+    )
+    .await
+    .expect("outcome recovered before its decisions");
+    assert_eq!(step(&outcome, "extra").output, Some(json!({"y": 1})));
+    for (id, status) in [
+        ("dropped", StepStatus::Skipped),
+        ("blocked", StepStatus::Failed),
+    ] {
+        let withheld = step(&outcome, id);
+        assert_eq!(
+            (withheld.status, withheld.output.clone()),
+            (status, None),
+            "{id}: a crash before the decision commits decides it again the same way"
+        );
+    }
+    for id in ["compare", "extra", "dropped", "blocked"] {
+        assert!(
+            !undecided.calls().contains(&format!("action:{id}")),
+            "{id} reran: {:?}",
+            undecided.calls()
+        );
     }
 }
 

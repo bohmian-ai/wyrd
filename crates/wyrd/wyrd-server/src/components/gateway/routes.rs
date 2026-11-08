@@ -2071,10 +2071,14 @@ pub(super) fn usage_bound(
 /// Token usage bound of a request `body` whose output is at most `output`
 /// tokens, or `None` when a quantity cannot be represented.
 ///
-/// Input tokens are bounded by the serialized body length, since no token is
-/// shorter than one byte; `output` of `None` adds no output dimension.
+/// Input tokens are bounded by the compact serialized body length, since no
+/// token is shorter than one byte; the length is counted as the body
+/// serializes, without keeping its text. `output` of `None` adds no output
+/// dimension.
 pub(super) fn token_bound(body: &Value, output: Option<u64>) -> Option<Vec<GatewayUsageAmount>> {
-    let input = u64::try_from(body.to_string().len()).ok()?;
+    let mut length = SerializedLength(0);
+    serde_json::to_writer(&mut length, body).ok()?;
+    let input = u64::try_from(length.0).ok()?;
     let amount = |dimension: &str, quantity: u64| {
         Some(GatewayUsageAmount {
             dimension: dimension.to_owned(),
@@ -2089,21 +2093,39 @@ pub(super) fn token_bound(body: &Value, output: Option<u64>) -> Option<Vec<Gatew
     Some(bound)
 }
 
+/// Byte count of everything written to it; the written bytes are dropped.
+struct SerializedLength(usize);
+
+impl std::io::Write for SerializedLength {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        self.0 += bytes.len();
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod usage_bound_tests {
     use serde_json::json;
     use wyrd_spec::gateway::GatewayOperation;
 
     use super::usage_bound;
+    use crate::test_support::CountingAllocator;
 
     /// Chat output is bounded by the maximum times the choice count, Responses
     /// output by `max_output_tokens`, and input by the body length; a chat or
     /// Responses request without a maximum is unbounded, and embeddings bound
-    /// only input.
+    /// only input. The input bound is the compact JSON length, escapes,
+    /// Unicode and number forms included, counted without serializing the
+    /// body.
     ///
     /// # Panics
     ///
-    /// Panics when a bound differs from the expected amounts.
+    /// Panics when a bound differs from the expected amounts or counting
+    /// allocates request-sized text.
     #[test]
     fn usage_bound_requires_an_output_maximum_where_output_exists() {
         let length = |body: &serde_json::Value| body.to_string().len().to_string();
@@ -2124,5 +2146,28 @@ mod usage_bound_tests {
         ] {
             assert!(usage_bound(operation, &json!({"model": "acme/a"})).is_none());
         }
+        let overflowing = json!({"model": "acme/a", "max_tokens": u64::MAX, "n": 2});
+        assert!(usage_bound(GatewayOperation::ChatCompletions, &overflowing).is_none());
+
+        for body in [
+            json!({"input": "quote \" slash \\ tab \t nul \u{0} bell \u{7}"}),
+            json!({"input": "é ☃ 🦀 \u{2028}", "ключ": ["ü"]}),
+            json!({"input": [[1, {"a": {"b": [true, false, null]}}], {}, []]}),
+            json!({"input": [0, -1, u64::MAX, i64::MIN, 1.5, -0.0, 1e300, 2.5e-8]}),
+        ] {
+            let bound = usage_bound(GatewayOperation::Embeddings, &body).expect("bounded");
+            assert_eq!(bound[0].quantity.as_str(), length(&body), "{body}");
+        }
+
+        let long = "x".repeat(1 << 20);
+        let large = json!({"model": "acme/a", "messages": [{"content": long}], "max_tokens": 1});
+        let (bound, allocated) = CountingAllocator::measure(|| {
+            usage_bound(GatewayOperation::ChatCompletions, &large).expect("bounded")
+        });
+        assert_eq!(bound[0].quantity.as_str(), length(&large));
+        assert!(
+            allocated < 4096,
+            "counting serializes no request text: {allocated} bytes allocated"
+        );
     }
 }

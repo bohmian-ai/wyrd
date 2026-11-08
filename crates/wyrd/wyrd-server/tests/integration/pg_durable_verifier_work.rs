@@ -2712,9 +2712,10 @@ enum FirstWriter {
 /// writer and then the other forces each arrival order: the losing write is
 /// refused on its own, a refused delivery is delivered again on the newer
 /// revision, and a refused checkpoint is never accepted. Either way the
-/// state reads back cancelled with no result, the accepted report remains,
-/// the worker records nothing more, and an unrelated execution submitted
-/// while the delivery is held settles with no delivery owed.
+/// state reads back cancelled with no result, the accepted report remains
+/// publicly listed, the worker records nothing more, and an unrelated
+/// execution submitted while the delivery is held completes with its result
+/// retained and no delivery owed.
 ///
 /// # Panics
 /// Panics when a delivery retires before its acknowledgement or stays owed,
@@ -2859,6 +2860,22 @@ async fn cancellation_race(first: FirstWriter) {
     owed_until(&leased.server, BTreeMap::is_empty).await;
     stop.cancel();
     task.await.expect("the runtime stops");
+    let settled = leased
+        .fixture
+        .execution(bystander)
+        .await
+        .expect("the unrelated execution reads");
+    assert_eq!(
+        (
+            settled.status.as_str(),
+            retained(&leased.server, leased.system, bystander)
+                .await
+                .terminal
+                .is_some()
+        ),
+        ("completed", true),
+        "{first:?}: the unrelated execution completes and its result is retained"
+    );
 
     let retained = leased.accepted().await;
     let failure = retained
@@ -2909,6 +2926,27 @@ async fn cancellation_race(first: FirstWriter) {
             Value::Null
         ),
         "{first:?}: {body}"
+    );
+    let (status, body) = respond(
+        &leased.server,
+        &viewer,
+        "GET",
+        &format!("{execution}/publications"),
+    )
+    .await;
+    assert_eq!(
+        (
+            status,
+            body["items"].as_array().map(|items| items
+                .iter()
+                .map(|item| (item["name"].clone(), item["producer"]["step_id"].clone()))
+                .collect::<Vec<_>>())
+        ),
+        (
+            axum::http::StatusCode::OK,
+            Some(vec![(json!("report"), json!("review"))])
+        ),
+        "{first:?}: the accepted report stays publicly inspectable: {body}"
     );
     leased
         .server

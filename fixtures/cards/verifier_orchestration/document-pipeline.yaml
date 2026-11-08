@@ -1,5 +1,6 @@
 # A non-repository document pipeline: the uploaded document is extracted,
-# its sections are reviewed as array work, a flagged document escalates, and
+# its sections are reviewed as array work and each is polished by its own
+# repeat, a flagged document escalates, and
 # a summarizer refines over every settled collection before a cited
 # judgment. The appendix fans out over an empty array.
 apiVersion: wyrd/v1
@@ -20,6 +21,15 @@ spec:
         kind: agent
         agent: ./section-reviewer.yaml
         inputs: {section: item, index: item_index}
+    - id: polish
+      foreach: {items: steps.read.output.value.sections, max_items: 5}
+      repeat:
+        max_iterations: 3
+        until: {path: iteration.output.score, operator: greater_than_or_equals, expected: 1}
+      action:
+        kind: agent
+        agent: ./polisher.yaml
+        inputs: {section: item, index: item_index, round: iteration.index}
     - id: appendix
       foreach: {items: steps.read.output.value.appendix, max_items: 5}
       action:

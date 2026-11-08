@@ -300,6 +300,20 @@ fn reply(request: &Request, script: &Script) -> ResponseTemplate {
             _ => done(),
         };
     }
+    if prompt.contains("POLISH:") {
+        let (section, round) = prompt
+            .split_once("POLISH: ")
+            .and_then(|(_, rest)| rest.split_once(" item="))
+            .and_then(|(section, rest)| Some((section, rest.split_once("round=")?.1)))
+            .and_then(|(section, round)| {
+                Some((
+                    section,
+                    round.split_whitespace().next()?.parse::<u64>().ok()?,
+                ))
+            })
+            .unwrap_or_default();
+        return answer(&json!({ "score": round, "text": format!("{section} v{round}") }));
+    }
     if prompt.contains("ESCALATE:") {
         return match turn {
             0 => calls(&[(
@@ -1280,7 +1294,8 @@ fn entries(result: &Value) -> Vec<(Option<u64>, Option<u64>, String)> {
 
 /// A non-repository document pipeline uses the same public controls: the
 /// uploaded document's sections fan out as array work in order, the
-/// duplicate section keeping its own index; the empty appendix runs no
+/// duplicate section keeping its own index; each section is polished by its
+/// own sequential repeat, the final values in input order; the empty appendix runs no
 /// reviewer and is honestly empty; the flagged document escalates and its
 /// failed escalation keeps its partial note; the summarizer refines one
 /// iteration at a time over both settled collections within its original
@@ -1324,6 +1339,39 @@ async fn document_pipeline_uses_array_repeat_and_publications() {
         reviewed,
         BTreeSet::from(["claims at=1", "claims at=2", "intro at=0"].map(str::to_owned)),
         "the duplicate keeps its own index and the empty appendix calls no reviewer"
+    );
+    let polish = step(&result, "polish");
+    assert_eq!(
+        (polish.status, polish.output.clone()),
+        (
+            StepStatus::Succeeded,
+            Some(json!([
+                { "score": 1, "text": "intro v1" },
+                { "score": 1, "text": "claims v1" },
+                { "score": 1, "text": "claims v1" }
+            ]))
+        ),
+        "each section repeats independently and the final values keep input order"
+    );
+    let mut rounds: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    for messages in desk.requests("POLISH:").await {
+        let prompt = text(&messages);
+        if let Some((item, round)) = prompt
+            .split_once(" item=")
+            .and_then(|(_, rest)| rest.split_once(" round="))
+        {
+            rounds
+                .entry(item.to_owned())
+                .or_default()
+                .push(round.split_whitespace().next().unwrap_or("").to_owned());
+        }
+    }
+    assert_eq!(
+        rounds,
+        BTreeMap::from(
+            ["0", "1", "2"].map(|item| (item.to_owned(), vec!["0".to_owned(), "1".to_owned()]))
+        ),
+        "every item runs its own rounds in order until its condition holds"
     );
     let appendix = step(&result, "appendix");
     assert_eq!(

@@ -75,7 +75,7 @@ impl GoogleClient {
     /// headers are invalid, and [`ProviderError::Connect`],
     /// [`ProviderError::Timeout`], or [`ProviderError::Upstream`] when the
     /// exchange fails.
-    pub async fn send_raw(&self, body: Box<RawValue>) -> ProviderResult<Box<RawValue>> {
+    pub async fn send_raw(&self, body: Vec<u8>) -> ProviderResult<Box<RawValue>> {
         raw::send_raw(
             &self.transport,
             "google",
@@ -98,7 +98,7 @@ impl GoogleClient {
     ///
     /// Returns the errors of [`super::open_stream`], or
     /// [`ProviderError::Decode`] when the auth headers are invalid.
-    pub async fn stream_raw(&self, body: &RawValue) -> ProviderResult<super::ProviderByteStream> {
+    pub async fn stream_raw(&self, body: Vec<u8>) -> ProviderResult<super::ProviderByteStream> {
         super::open_stream(
             &self.transport,
             "google",
@@ -137,7 +137,7 @@ impl GoogleClient {
                 Ok(ProviderResponse::GoogleBatchEmbed(response))
             }
             ProviderRequest::RawV1 { body, .. } => {
-                let body = serde_json::value::to_raw_value(&body)
+                let body = serde_json::to_vec(&body)
                     .map_err(|error| ProviderError::decode("google", error))?;
                 let response = raw::send_raw(
                     &self.transport,

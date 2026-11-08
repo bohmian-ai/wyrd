@@ -8,7 +8,7 @@
 
 use async_trait::async_trait;
 use reqwest::header::HeaderName;
-use serde_json::value::{RawValue, to_raw_value};
+use serde_json::value::RawValue;
 use skald_providers::auth::{
     AnthropicAuth, GoogleApiKeyAuth, GoogleOAuth, JevAuth, OpenAiAuth, VertexAuth,
 };
@@ -246,24 +246,24 @@ impl Client {
         prepared: Prepared<'_>,
     ) -> ProviderResult<ProviderByteStream> {
         let body = match &prepared {
-            Prepared::Native(body) => to_raw_value(body),
-            Prepared::Anthropic(request) => to_raw_value(request),
-            Prepared::Google(request) => to_raw_value(request),
-            Prepared::Jev(request) => to_raw_value(request),
+            Prepared::Native(body) => body.to_json(),
+            Prepared::Anthropic(request) => serde_json::to_vec(request),
+            Prepared::Google(request) => serde_json::to_vec(request),
+            Prepared::Jev(request) => serde_json::to_vec(request),
         }
         .map_err(|error| ProviderError::decode("gateway", error))?;
         match (self, prepared) {
             (Self::OpenAi(client), Prepared::Native(_)) => {
-                client.stream_raw(route(operation)?, &body).await
+                client.stream_raw(route(operation)?, body).await
             }
             (Self::Anthropic(client), Prepared::Native(_) | Prepared::Anthropic(_)) => {
-                client.stream_raw(&body).await
+                client.stream_raw(body).await
             }
             (Self::Google(client), Prepared::Native(_) | Prepared::Google(_)) => {
-                client.stream_raw(&body).await
+                client.stream_raw(body).await
             }
             (Self::Vertex(client), Prepared::Native(_) | Prepared::Google(_)) => {
-                client.stream_raw(&body).await
+                client.stream_raw(body).await
             }
             (_, _) => Err(mismatch()),
         }
@@ -357,7 +357,8 @@ impl Client {
         prepared: Prepared<'_>,
     ) -> ProviderResult<ProviderResponse> {
         let raw = |body: &NativeBody<'_>| {
-            to_raw_value(body).map_err(|error| ProviderError::decode("gateway", error))
+            body.to_json()
+                .map_err(|error| ProviderError::decode("gateway", error))
         };
         let response = match (self, prepared) {
             (Self::OpenAi(client), Prepared::Native(body)) => {

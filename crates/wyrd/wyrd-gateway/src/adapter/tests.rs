@@ -318,6 +318,10 @@ async fn answer(server: &MockServer, route: &str, name: &str, value: &str, body:
 /// An OpenAI-compatible deployment receives the caller body unchanged except
 /// for the native model, authenticated only by the provider credential, and
 /// its usage is normalized and kept canonically.
+///
+/// A large body with escapes and extension members reaches the provider
+/// byte-identical apart from its model, serialized once into a buffer sized
+/// up front that never grows and keeps little spare capacity.
 #[tokio::test]
 async fn compatible_passthrough_rewrites_model_and_uses_provider_credential() {
     let server = MockServer::start().await;
@@ -374,6 +378,50 @@ async fn compatible_passthrough_rewrites_model_and_uses_provider_credential() {
             .all(|name| !name.as_str().starts_with("wyrd-")),
         "no gateway or caller headers reach the provider"
     );
+
+    let extended = json!({
+        "messages": [{"role": "user", "content": format!("{}\"\\\n☃\u{0}", "x".repeat(1 << 20))}],
+        "model": "deepseek/deepseek-chat",
+        "vendor": {"nested": [1, -2.5, u64::MAX, null, true, {}]},
+    });
+    let result = attempt(
+        &dispatch(&server),
+        IngressDialect::OpenAi,
+        &target,
+        Some("sk-deepseek"),
+        &extended,
+    )
+    .await;
+    assert!(
+        matches!(result, AttemptResult::Completed { .. }),
+        "{result:?}"
+    );
+    let requests = server.received_requests().await.expect("recording");
+    let mut expected = extended.clone();
+    expected["model"] = json!("deepseek-chat");
+    assert_eq!(
+        String::from_utf8(requests[1].body.clone()).expect("utf-8 body"),
+        serde_json::to_string(&expected).expect("serializes"),
+        "only the model changes, escapes and extensions included"
+    );
+    for model in [Some("deepseek-chat"), None] {
+        let native = super::NativeBody {
+            body: extended.as_object().expect("object body"),
+            model,
+        };
+        let json = native.to_json().expect("serializes");
+        assert_eq!(json, serde_json::to_vec(&native).expect("serializes"));
+        assert_eq!(
+            json.capacity(),
+            native.len_hint(),
+            "the body serializes into its up-front buffer without growing"
+        );
+        assert!(
+            json.capacity() <= json.len() + json.len() / 16,
+            "{}",
+            json.capacity()
+        );
+    }
 }
 
 /// Native preparation borrows the caller's body in planning and at dispatch.

@@ -290,7 +290,7 @@ impl OpenAiClient {
     pub async fn send_raw(
         &self,
         route: OpenAiRoute,
-        body: Box<RawValue>,
+        body: Vec<u8>,
     ) -> ProviderResult<Box<RawValue>> {
         raw::send_raw(
             &self.transport,
@@ -316,7 +316,7 @@ impl OpenAiClient {
     pub async fn stream_raw(
         &self,
         route: OpenAiRoute,
-        body: &RawValue,
+        body: Vec<u8>,
     ) -> ProviderResult<super::ProviderByteStream> {
         super::open_stream(
             &self.transport,
@@ -492,7 +492,7 @@ impl OpenAiClient {
                 Ok(ProviderResponse::OpenAiEmbeddings(response))
             }
             ProviderRequest::RawV1 { body, .. } => {
-                let body = serde_json::value::to_raw_value(&body)
+                let body = serde_json::to_vec(&body)
                     .map_err(|error| ProviderError::decode("openai", error))?;
                 let url = format!("{}/raw", self.auth.base_url());
                 let response = raw::send_raw(
@@ -778,7 +778,6 @@ mod openai_chat {
 mod openai_raw_route {
     use crate::OpenAiRoute;
     use crate::common;
-    use serde_json::value::RawValue;
     use wiremock::matchers::{body_string, header, method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
@@ -797,9 +796,8 @@ mod openai_raw_route {
             .mount(&server)
             .await;
 
-        let body = RawValue::from_string(request.to_owned()).expect("raw body");
         let response = common::openai_client(&server.uri())
-            .send_raw(OpenAiRoute::ChatCompletions, body)
+            .send_raw(OpenAiRoute::ChatCompletions, request.as_bytes().to_vec())
             .await
             .expect("raw route succeeds");
 

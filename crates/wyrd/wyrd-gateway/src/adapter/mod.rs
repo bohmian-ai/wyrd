@@ -163,6 +163,65 @@ impl NativeBody<'_> {
         }
         Value::Object(object)
     }
+
+    /// Serializes the body with its model applied as compact JSON bytes.
+    ///
+    /// The bytes are written once into a buffer reserved from
+    /// [`Self::len_hint`], so a body without escapes never grows it, and the
+    /// buffer moves into the transport as is, spare capacity included.
+    ///
+    /// # Errors
+    ///
+    /// Returns the serialization error of a member serde cannot write.
+    pub(crate) fn to_json(self) -> serde_json::Result<Vec<u8>> {
+        let mut json = Vec::with_capacity(self.len_hint());
+        serde_json::to_writer(&mut json, &self)?;
+        Ok(json)
+    }
+
+    /// Compact JSON length of the body with its model applied, assuming no
+    /// string needs escapes and every float takes its longest form.
+    ///
+    /// Only a capacity hint: escapes make the output longer, and shorter
+    /// floats or a replaced model make it shorter.
+    fn len_hint(self) -> usize {
+        let model = self
+            .model
+            .map_or(0, |model| model.len() + r#","model":"""#.len());
+        object_len_hint(self.body) + model
+    }
+}
+
+/// Unescaped compact JSON length of `value`; see [`NativeBody::len_hint`].
+fn json_len_hint(value: &Value) -> usize {
+    match value {
+        Value::Null | Value::Bool(true) => 4,
+        Value::Bool(false) => 5,
+        Value::Number(number) => match (number.as_u64(), number.as_i64()) {
+            (Some(natural), _) => natural
+                .checked_ilog10()
+                .map_or(1, |digits| digits as usize + 1),
+            (None, Some(negative)) => negative.unsigned_abs().ilog10() as usize + 2,
+            // The longest shortest-round-trip f64, such as -2.2250738585072014e-308.
+            (None, None) => 24,
+        },
+        Value::String(text) => text.len() + 2,
+        Value::Array(items) => {
+            2 + items
+                .iter()
+                .map(|item| json_len_hint(item) + 1)
+                .sum::<usize>()
+        }
+        Value::Object(members) => object_len_hint(members),
+    }
+}
+
+/// Unescaped compact JSON length of the object `members`; see [`json_len_hint`].
+fn object_len_hint(members: &Map<String, Value>) -> usize {
+    2 + members
+        .iter()
+        .map(|(key, value)| key.len() + 4 + json_len_hint(value))
+        .sum::<usize>()
 }
 
 impl Serialize for NativeBody<'_> {

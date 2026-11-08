@@ -20,7 +20,6 @@ use std::time::SystemTime;
 
 use reqwest::Method;
 use reqwest::header::{CONTENT_LENGTH, CONTENT_TYPE, HeaderMap, HeaderValue, RETRY_AFTER};
-use serde_json::value::RawValue;
 
 use crate::error::{ProviderError, ProviderResult};
 use crate::exchange::ExchangeTimer;
@@ -153,7 +152,7 @@ pub async fn open_stream(
     provider: &str,
     url: &str,
     mut headers: HeaderMap,
-    body: &RawValue,
+    body: Vec<u8>,
 ) -> ProviderResult<ProviderByteStream> {
     headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
     let mut exchange = ExchangeTimer::start();
@@ -161,7 +160,7 @@ pub async fn open_stream(
         .client()
         .post(url)
         .headers(headers)
-        .body(body.get().as_bytes().to_vec())
+        .body(body)
         .send()
         .await
         .map_err(|error| map_reqwest_error(provider, error))?;
@@ -509,17 +508,16 @@ mod bounded_answers {
         );
     }
 
-    /// A native body is serialized once and its allocation backs the first
-    /// exchange and every retry, and a valid UTF-8 answer keeps its buffer as
+    /// A native body is serialized once and its allocation, spare capacity
+    /// included, backs the first exchange and every retry, and a valid UTF-8 answer keeps its buffer as
     /// text; invalid UTF-8 is replaced, refusals keep status and body, and an
     /// oversized answer fails before its status is inspected.
     #[tokio::test]
     async fn native_transport_reuses_owned_buffers() {
         let request = r#"{"model":"m","messages":[],"vendor":"é"}"#;
-        let body = serde_json::value::RawValue::from_string(request.to_owned()).expect("raw body");
-        let backing = body.get().as_ptr();
-        let bytes = crate::raw::body_bytes(body);
-        assert_eq!(bytes.as_ptr(), backing, "the raw body keeps its allocation");
+        let mut bytes = Vec::with_capacity(request.len() * 2);
+        bytes.extend_from_slice(request.as_bytes());
+        let backing = bytes.as_ptr();
         let built = reqwest::Client::new()
             .post("http://localhost/")
             .body(bytes)

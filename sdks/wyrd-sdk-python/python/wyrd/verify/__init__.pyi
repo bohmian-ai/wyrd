@@ -716,8 +716,9 @@ class Execution:
             The execution's result.
 
         Raises:
-            WyrdError: the execution's own error when it settled as errored,
-                cancelled, or timed out;
+            WyrdError: the execution's own error when it settled as errored
+                or timed out; ``WYRD_SDK_409_VERIFICATION_CANCELLED`` when it
+                was cancelled;
                 ``WYRD_SDK_504_VERIFICATION_WAIT_TIMEOUT`` when ``timeout``
                 passes first; ``WYRD_SPEC_400_VALIDATION`` for a negative
                 ``timeout``; the client's connection error on first use; and

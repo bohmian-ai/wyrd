@@ -210,8 +210,9 @@ impl NativeExecution {
     ///
     /// # Errors
     /// Returns a napi error only when the result cannot be projected; the
-    /// terminal error and `WYRD_SDK_504_VERIFICATION_WAIT_TIMEOUT` are returned
-    /// in [`NativeLifecycleResult`].
+    /// terminal error, `WYRD_SDK_409_VERIFICATION_CANCELLED`, and
+    /// `WYRD_SDK_504_VERIFICATION_WAIT_TIMEOUT` are returned in
+    /// [`NativeLifecycleResult`].
     #[napi]
     pub fn wait<'env>(
         &self,

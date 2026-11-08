@@ -255,6 +255,7 @@ impl PyExecution {
     /// Raises `WYRD_SPEC_400_VALIDATION` for a negative or non-finite
     /// `timeout`, the client's connection error on first use, the
     /// execution's terminal error, including a delayed idempotency conflict,
+    /// `WYRD_SDK_409_VERIFICATION_CANCELLED` for a cancelled execution,
     /// `WYRD_SDK_504_VERIFICATION_WAIT_TIMEOUT` when `timeout` passes first,
     /// and any other status-read error.
     fn wait(&self, py: Python<'_>, timeout: f64) -> WyrdPyResult<PyVerificationResult> {

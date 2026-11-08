@@ -827,7 +827,10 @@ struct Case {
 /// when that account was produced: a security review that succeeds without
 /// publishing it fails the quoter before its model is called. With no specialist selected and only the
 /// specialist judged, the verdict is inconclusive. The CLI and the HTTP
-/// routes report the same branch statuses and publications as the SDK.
+/// routes report the same branch statuses and publications as the SDK. A
+/// held execution cancelled through the SDK makes its wait raise
+/// `WYRD_SDK_409_VERIFICATION_CANCELLED` with its identity, while its status
+/// keeps the stored `cancelled` code and no further work starts.
 ///
 /// # Panics
 /// Panics when a verification or CLI call is refused or a call, status,
@@ -1002,6 +1005,67 @@ async fn conditions_and_collections_preserve_missing_evidence() {
             wyrd_ai::VerificationVerdict::Inconclusive
         )
     );
+
+    Mock::given(method("POST"))
+        .and(body_string_contains("PLAN:"))
+        .and(body_string_contains("HELD"))
+        .respond_with(done().set_delay(STALLED))
+        .with_priority(1)
+        .mount(&desk.upstream)
+        .await;
+    let held = desk.submit("specialist-review", json!("HELD")).await;
+    desk.stalled_in("PLAN:", "HELD").await;
+    let execution = Execution::connect_with(held, &desk.deployment.admin())
+        .await
+        .expect("the execution handle connects");
+    assert_eq!(
+        execution
+            .cancel()
+            .await
+            .expect("the execution cancels")
+            .status,
+        VerificationExecutionStatus::Cancelled
+    );
+    let problem = execution
+        .wait(Duration::from_secs(90))
+        .await
+        .expect_err("a cancelled execution yields no result")
+        .problem();
+    assert_eq!(
+        (
+            problem.code.as_str(),
+            problem.status,
+            &problem.details["execution_id"],
+            &problem.details["status"]
+        ),
+        (
+            "WYRD_SDK_409_VERIFICATION_CANCELLED",
+            409,
+            &json!(held),
+            &json!("cancelled")
+        ),
+        "{problem:?}"
+    );
+    let state = execution.status().await.expect("the status reads");
+    assert_eq!(
+        (
+            state.status,
+            state.result.is_none(),
+            state.error.map(|error| error.code)
+        ),
+        (
+            VerificationExecutionStatus::Cancelled,
+            true,
+            Some("cancelled".to_owned())
+        ),
+        "the stored status keeps its cancelled code"
+    );
+    for marker in ["SECURITY:", "STYLE:", "CONSOLIDATE:", "QUOTE:"] {
+        assert!(
+            desk.asked(marker, "HELD").await.is_empty(),
+            "the cancelled execution starts no {marker} work"
+        );
+    }
     desk.deployment.shutdown().await;
 }
 

@@ -1413,6 +1413,23 @@ pub enum WyrdError {
         /// Structured detail payload.
         details: serde_json::Value,
     },
+    /// A waited verification execution was cancelled, so it has no result.
+    ///
+    /// Its stored status keeps the server's `cancelled` code; only a wait
+    /// reports the cancellation as this error.
+    #[error("[WYRD_SDK_409_VERIFICATION_CANCELLED] {message}")]
+    #[wyrd_error(
+        code = "WYRD_SDK_409_VERIFICATION_CANCELLED",
+        status = 409,
+        title = "Verification execution was cancelled",
+        remediation = "Read the execution's accepted evidence, or submit the verification again; a cancelled execution never resumes."
+    )]
+    SdkVerificationCancelled {
+        /// Human-readable error message.
+        message: String,
+        /// Structured detail payload: the `execution_id` and its `status`.
+        details: serde_json::Value,
+    },
     /// A second `start_bifrost` was attempted on a state that already owns a
     /// connected writer.
     ///
@@ -3978,6 +3995,7 @@ impl WyrdError {
             | Self::SdkUnknownAlias { message, details }
             | Self::SdkUnknownVerifier { message, details }
             | Self::SdkVerificationWaitTimedOut { message, details }
+            | Self::SdkVerificationCancelled { message, details }
             | Self::SdkVerificationDataInvalid { message, details }
             | Self::SdkBifrostAlreadyStarted { message, details }
             | Self::SdkTelemetryProviderExists { message, details }

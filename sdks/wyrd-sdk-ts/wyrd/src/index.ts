@@ -2633,6 +2633,7 @@ export namespace verify {
      * `timeoutMs`. A result is never invented from a status.
      *
      * @throws {@link WyrdError} the settled execution's error,
+     * `WYRD_SDK_409_VERIFICATION_CANCELLED` for a cancelled execution,
      * `WYRD_SDK_504_VERIFICATION_WAIT_TIMEOUT`,
      * or a non-transient read failure.
      */

@@ -1823,7 +1823,8 @@ input, is never acknowledged; the caller receives
 Observable losses are counted, and nothing is silently resubmitted. Audit
 acknowledgement is unchanged. `VerificationExecution.wait` polls with capped backoff, tolerates
 not-found and delayed results within its deadline, and returns only a real
-result, the terminal error, or `WYRD_SDK_504_VERIFICATION_WAIT_TIMEOUT`.
+result, the terminal error, `WYRD_SDK_409_VERIFICATION_CANCELLED` for a cancelled
+execution, or `WYRD_SDK_504_VERIFICATION_WAIT_TIMEOUT`.
 
 Execution status includes the existing Operator `dispatches` projection:
 dispatch ID, exact Operator, delivery status, and optional error. Delivery

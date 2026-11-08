@@ -289,8 +289,10 @@ impl Execution {
     /// * `deadline` - When to stop polling.
     ///
     /// # Errors
-    /// Returns the execution's own structured error when it settled as
-    /// errored, cancelled, or timed out; [`Execution::wait_timed_out`]'s error when
+    /// Returns `WYRD_SDK_409_VERIFICATION_CANCELLED` with the execution's
+    /// `execution_id` and `status` when it was cancelled; the execution's own
+    /// structured error when it settled as errored or timed out;
+    /// [`Execution::wait_timed_out`]'s error when
     /// `deadline` passes first; and any other status-read error unchanged.
     ///
     /// # Cancellation
@@ -318,6 +320,12 @@ impl Execution {
                         error,
                     ) => {
                         let details = json!({ "execution_id": self.id, "status": state.status });
+                        if state.status == VerificationExecutionStatus::Cancelled {
+                            return Err(WyrdError::SdkVerificationCancelled {
+                                message: format!("execution {} was cancelled", self.id),
+                                details,
+                            });
+                        }
                         return Err(match error {
                             Some(error) => code_to_wyrd_error(&error.code, error.message, details),
                             None => WyrdError::Internal {

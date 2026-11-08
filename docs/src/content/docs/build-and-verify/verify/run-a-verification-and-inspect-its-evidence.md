@@ -112,7 +112,7 @@ console.log(result.outcome.verdict);
 
 `connect` uses the ambient credentials, or the client you pass (`client=` in Python, `{ client }` in TypeScript, `connect_with` in Rust). It reads as that principal, so it sees only executions in its own tenant that it may read.
 
-`wait` polls `GET /v1/verification/executions/{execution_id}`, backing off from 100 ms to 2 s. It returns the same `VerificationResult` that `verify` returns, raises the execution's own error when it settled without a verdict, and raises `WYRD_SDK_504_VERIFICATION_WAIT_TIMEOUT` when the timeout passes first. A timeout does not cancel the execution; wait again later.
+`wait` polls `GET /v1/verification/executions/{execution_id}`, backing off from 100 ms to 2 s. It returns the same `VerificationResult` that `verify` returns, raises the execution's own error when it errored or timed out, raises `WYRD_SDK_409_VERIFICATION_CANCELLED` when it was cancelled, and raises `WYRD_SDK_504_VERIFICATION_WAIT_TIMEOUT` when the timeout passes first. A timeout does not cancel the execution; wait again later.
 
 To read once without waiting, call `status()`:
 
@@ -205,6 +205,7 @@ Only a `failed` verdict from a submitted or scheduled execution runs the binding
 | Code or symptom | Cause | Fix |
 | --- | --- | --- |
 | `WYRD_SDK_504_VERIFICATION_WAIT_TIMEOUT` | The execution has not settled | Wait again |
+| `WYRD_SDK_409_VERIFICATION_CANCELLED` | The execution was cancelled; its status keeps the `cancelled` code | Submit again; a cancelled execution never resumes |
 | `WYRD_SERVER_503_SERVICE_UNAVAILABLE` on submit | The submission was lost before it was durably admitted, so it was never acknowledged | Submit again; a retry under the same `Idempotency-Key` names the same execution |
 | `WYRD_REGISTRY_409_IDEMPOTENCY_CONFLICT` on submit | The same `Idempotency-Key` was reused with different content | Use a new key for new content; the original execution is unaffected |
 | `WYRD_PERMISSION_403_DENIED_RBAC` on submit | No `verifier:run` on the bound Verifier | Use a credential with `workload` or a role that includes it |

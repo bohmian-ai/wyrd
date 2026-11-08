@@ -291,7 +291,9 @@ type Case = {
  * succeed, and fails without a call when a succeeded security published
  * no account. A Verifier
  * judging only an unselected specialist is inconclusive, not passed. A held
- * execution cancels through the SDK and reports `cancelled`.
+ * execution cancels through the SDK: its wait raises
+ * `WYRD_SDK_409_VERIFICATION_CANCELLED` with its identity, its status keeps
+ * the stored `cancelled` code, and no further work starts.
  */
 test("conditions_and_collections_preserve_missing_evidence", async ({ provider, state }) => {
   const cases: readonly Case[] = [
@@ -430,7 +432,19 @@ test("conditions_and_collections_preserve_missing_evidence", async ({ provider, 
   for (let repeat = 0; repeat < 2; repeat += 1) {
     expect(await execution.cancel()).toEqual({ execution_id: submitted.execution.id, status: "cancelled" });
   }
-  expect((await execution.status()).status).toBe("cancelled");
+  await expect(execution.wait({ timeoutMs: WAIT_MS }), "a cancelled execution yields no result").rejects.toMatchObject({
+    code: "WYRD_SDK_409_VERIFICATION_CANCELLED",
+    status: 409,
+    details: { execution_id: submitted.execution.id, status: "cancelled" },
+  });
+  const settled = await execution.status();
+  expect([settled.status, settled.error?.code, settled.result ?? null]).toEqual(["cancelled", "cancelled", null]);
+  for (const marker of ["SECURITY:", "STYLE:", "CONSOLIDATE:", "QUOTE:"]) {
+    expect(
+      provider.received.some((request) => text(request).includes(marker) && text(request).includes("HELD")),
+      `the cancelled execution starts no ${marker} work`,
+    ).toBe(false);
+  }
 });
 
 /** Every publication of execution `id`, read back as the administrator through the public paged listing. */

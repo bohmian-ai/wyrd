@@ -170,7 +170,12 @@ def test_conditions_and_collections_preserve_missing_evidence(
     admin = verify.Execution.connect(held.id, client_of(wyrd_server))
     with pytest.raises(WyrdError) as settled:
         admin.wait(WAIT_SECONDS)
-    assert settled.value.details["original_code"] == "cancelled"
+    assert (
+        settled.value.code,
+        settled.value.status,
+        settled.value.details["execution_id"],
+        settled.value.details["status"],
+    ) == ("WYRD_SDK_409_VERIFICATION_CANCELLED", 409, held.id, "cancelled")
     state = admin.status()
     assert (state["status"], state.get("error", {}).get("code"), "result" in state) == (
         "cancelled",

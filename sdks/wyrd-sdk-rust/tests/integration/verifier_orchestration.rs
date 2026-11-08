@@ -1347,7 +1347,8 @@ fn entries(result: &Value) -> Vec<(Option<u64>, Option<u64>, String)> {
 /// duplicate section keeping its own index; each section is polished by its
 /// own sequential repeat, the final values in input order; the empty appendix runs no
 /// reviewer and is honestly empty; the flagged document escalates and its
-/// failed escalation keeps its partial note; the summarizer refines one
+/// failed escalation keeps its partial note, while an unflagged one skips
+/// the escalation and mounts it as empty; the summarizer refines one
 /// iteration at a time over both settled collections within its original
 /// bound. The final requirements pass, fail, and stay inconclusive by their
 /// own evidence, and the cited judgment points into the uploaded document.
@@ -1519,6 +1520,36 @@ async fn document_pipeline_uses_array_repeat_and_publications() {
         json!([{ "slot": "document", "locator": { "json_pointer": "/title" } }])
     );
     assert_eq!(result.outcome.verdict, VerificationVerdict::Failed);
+
+    let clean = desk
+        .verify_document(
+            "document-pipeline",
+            "cards/verifier_orchestration/samples/clean-report.json",
+        )
+        .await;
+    let escalate = step(&clean, "escalate");
+    assert!(
+        escalate.status == StepStatus::Skipped
+            && escalate
+                .reason
+                .as_deref()
+                .is_some_and(|text| text.contains("`steps.read.output.value.flagged` was false")),
+        "an unflagged document never escalates: {escalate:?}"
+    );
+    assert!(desk.requests("ESCALATE: Clean report").await.is_empty());
+    let summaries = desk.requests("SUMMARIZE: Clean report").await;
+    let escalation: Value =
+        serde_json::from_str(&lines(&results(&summaries[1])["m-escalation"])).unwrap_or_default();
+    assert_eq!(
+        (escalation["status"].as_str(), escalation["entries"].clone()),
+        (Some("skipped"), json!([])),
+        "the skipped escalation is mounted as an honest empty collection"
+    );
+    assert_eq!(
+        requirement(&clean, "escalation-done").outcome,
+        RequirementOutcome::NotApplicable,
+        "an intentional skip leaves its requirement not applicable"
+    );
     desk.deployment.shutdown().await;
 }
 

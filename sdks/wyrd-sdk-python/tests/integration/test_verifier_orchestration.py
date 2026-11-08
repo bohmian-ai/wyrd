@@ -51,7 +51,9 @@ WAIT_SECONDS = 90.0
 MARKERS = ("GENERAL:", "SECURITY:", "STYLE:", "CONSOLIDATE:", "QUOTE:")
 """The prompt markers of the Agents a ``specialist-review`` question may call."""
 
-CASES: list[tuple[str, list[str], set[str], list[tuple[str, list[str]]], str | None]] = [
+CASES: list[
+    tuple[str, list[str], set[str], list[tuple[str, list[str]]], tuple[str, str] | None]
+] = [
     (
         "NEITHER",
         ["succeeded", "skipped", "skipped", "skipped"],
@@ -78,14 +80,21 @@ CASES: list[tuple[str, list[str], set[str], list[tuple[str, list[str]]], str | N
         ["succeeded", "failed", "skipped", "skipped"],
         {"GENERAL:", "CONSOLIDATE:"},
         [("failed", []), ("skipped", [])],
-        "kind (null, bool)",
+        ("security", "kind (null, bool)"),
     ),
     (
         "FORGOTTEN",
         ["succeeded", "failed", "skipped", "skipped"],
         {"GENERAL:", "CONSOLIDATE:"},
         [("failed", []), ("skipped", [])],
-        "security",
+        ("security", "security"),
+    ),
+    (
+        "SILENT",
+        ["succeeded", "succeeded", "skipped", "failed"],
+        {"GENERAL:", "SECURITY:", "CONSOLIDATE:"},
+        [("succeeded", []), ("skipped", [])],
+        ("quote", "published no `account`"),
     ),
     (
         "UNPLANNED",
@@ -97,7 +106,7 @@ CASES: list[tuple[str, list[str], set[str], list[tuple[str, list[str]]], str | N
 ]
 """Each question beside the status of ``plan``, ``security``, ``style``, and ``quote``, the
 markers whose Agents it called, the ``security`` and ``style`` collections' manifest status and
-entry names, and the text the failed ``security`` step's reason carries, when it is checked."""
+entry names, and the failed step whose reason is checked beside the text it carries."""
 
 
 @pytest.fixture(scope="module")
@@ -125,7 +134,7 @@ def asked(receiver: Receiver, marker: str, question: str) -> list[list[dict[str,
 def test_conditions_and_collections_preserve_missing_evidence(
     desk: WyrdState, receiver: Receiver, wyrd_server: WyrdTestServer
 ) -> None:
-    for question, statuses, called, collections, security_reason in CASES:
+    for question, statuses, called, collections, reason in CASES:
         result = desk.run().observe.verify("specialist-review", question)
         assert [step(result, id)["status"] for id in ("plan", "security", "style", "quote")] == (
             statuses
@@ -135,8 +144,9 @@ def test_conditions_and_collections_preserve_missing_evidence(
         assert {marker for marker in MARKERS if asked(receiver, marker, question)} == called, (
             question
         )
-        if security_reason is not None:
-            assert security_reason in step(result, "security").get("reason", ""), question
+        if reason is not None:
+            failed, carried = reason
+            assert carried in step(result, failed).get("reason", ""), question
         read = tool_results(asked(receiver, "CONSOLIDATE:", question)[-1])
         for collection, (status, names) in zip(("security", "style"), collections, strict=True):
             manifest = json.loads(read_text(read[f"c-{collection}"]))

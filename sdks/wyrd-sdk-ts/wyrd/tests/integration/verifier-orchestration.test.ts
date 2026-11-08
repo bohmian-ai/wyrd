@@ -109,6 +109,7 @@ const DECISIONS: ReadonlyArray<readonly [string, unknown]> = [
   ["BOTH", { security: true, style: true }],
   ["UNDECIDED", { security: null, style: false }],
   ["FORGOTTEN", { style: false }],
+  ["SILENT", { security: true, style: false }],
 ];
 
 /** The prompt text of every request that reached the upstream, recorded on arrival, before any held reply is sent. */
@@ -145,6 +146,9 @@ function upstream(request: ReceivedRequest): Reply {
     }
     const decision = DECISIONS.find(([marker]) => prompt.includes(marker));
     return decision === undefined ? GARBLED : judgeReply(JSON.stringify(decision[1]));
+  }
+  if (prompt.includes("SECURITY:") && prompt.includes("SILENT")) {
+    return DONE;
   }
   if (prompt.includes("GENERAL:") || prompt.includes("SECURITY:")) {
     const focus = prompt.includes("GENERAL:") ? "general" : "security";
@@ -272,6 +276,8 @@ type Case = {
   readonly collections: readonly [readonly [string, readonly string[]], readonly [string, readonly string[]]];
   /** What the security step's failure reason names, when it failed on the decision. */
   readonly securityReason?: string;
+  /** What the quote step's failure reason names, when security published no account. */
+  readonly quoteReason?: string;
 };
 
 /**
@@ -281,7 +287,9 @@ type Case = {
  * skipping it. The consolidator always runs and reads every collection's
  * manifest with its settled status, a failed stylist's partial draft
  * included. The quoter, which requires the security account by name, runs
- * only when security published it and is skipped otherwise. A Verifier
+ * only when security published it, is skipped when security did not
+ * succeed, and fails without a call when a succeeded security published
+ * no account. A Verifier
  * judging only an unselected specialist is inconclusive, not passed. A held
  * execution cancels through the SDK and reports `cancelled`.
  */
@@ -335,6 +343,16 @@ test("conditions_and_collections_preserve_missing_evidence", async ({ provider, 
       securityReason: "security",
     },
     {
+      question: "SILENT",
+      statuses: ["succeeded", "succeeded", "skipped", "failed"],
+      called: ["GENERAL:", "SECURITY:", "CONSOLIDATE:"],
+      collections: [
+        ["succeeded", []],
+        ["skipped", []],
+      ],
+      quoteReason: "published no `account`",
+    },
+    {
       question: "UNPLANNED",
       statuses: ["failed", "failed", "failed", "skipped"],
       called: ["GENERAL:", "CONSOLIDATE:"],
@@ -350,7 +368,7 @@ test("conditions_and_collections_preserve_missing_evidence", async ({ provider, 
       return prompt.includes(marker) && prompt.includes(question);
     });
 
-  for (const { question, statuses, called, collections, securityReason } of cases) {
+  for (const { question, statuses, called, collections, securityReason, quoteReason } of cases) {
     const result = await state.run().observe.verify("specialist-review", question);
 
     expect(
@@ -368,6 +386,10 @@ test("conditions_and_collections_preserve_missing_evidence", async ({ provider, 
     if (securityReason !== undefined) {
       const security = step(result, "security");
       expect(security.reason ?? "", `${question}: ${JSON.stringify(security)}`).toContain(securityReason);
+    }
+    if (quoteReason !== undefined) {
+      const quote = step(result, "quote");
+      expect(quote.reason ?? "", `${question}: ${JSON.stringify(quote)}`).toContain(quoteReason);
     }
     const consolidator = asked("CONSOLIDATE:", question).at(-1);
     if (consolidator === undefined) {

@@ -3821,7 +3821,8 @@ mod pg_tests {
     /// in its conversation. The planner selects specialists by the question's
     /// marker (`security: null` when `UNDECIDED`), holds its reply for
     /// [`HELD_PLAN`] when `HELD`, and breaks without a marker; the generalist
-    /// and security specialist publish `account`; the stylist publishes a
+    /// and security specialist publish `account`, except that a `SILENT`
+    /// security specialist finishes without it; the stylist publishes a
     /// partial `draft`, then breaks; the consolidator reads the `security`
     /// and `style` collection manifests, or the `extra` one for a `SPEC-`
     /// question; the quoter reads `/inputs/security.json`. The comparer
@@ -3898,6 +3899,10 @@ mod pg_tests {
                 (
                     "UNDECIDED",
                     serde_json::json!({ "security": null, "style": false }),
+                ),
+                (
+                    "SILENT",
+                    serde_json::json!({ "security": true, "style": false }),
                 ),
                 (
                     "HELD",
@@ -4022,7 +4027,9 @@ mod pg_tests {
                 "citations": [{ "slot": "document", "locator": { "json_pointer": "/title" } }],
             }));
         }
-        if turn > 0 && !prompt.contains("STYLE:") {
+        if (turn > 0 && !prompt.contains("STYLE:"))
+            || (prompt.contains("SECURITY:") && prompt.contains("SILENT"))
+        {
             return done();
         }
         if prompt.contains("GENERAL:") {
@@ -4341,7 +4348,8 @@ mod pg_tests {
     /// collection's manifest with its producer's honest status and admitted
     /// entries — the stylist's failed attempt keeps its partial draft. The
     /// quoter, requiring `steps.security.publications.account` by name, is
-    /// skipped and never called whenever security published no account. The
+    /// skipped and never called whenever security did not succeed, and fails
+    /// without a call when a succeeded security published no account. The
     /// publication listing names exactly the published accounts and draft,
     /// none speculative. A held execution cancelled through
     /// `verification.cancel` answers `cancelled` and reads back cancelled.
@@ -4414,6 +4422,13 @@ mod pg_tests {
                 collections: [("failed", &[]), ("skipped", &[])],
                 published: &[("general", "account")],
             },
+            Case {
+                question: "SILENT",
+                statuses: ["succeeded", "succeeded", "skipped", "failed"],
+                called: &["GENERAL:", "SECURITY:", "CONSOLIDATE:"],
+                collections: [("succeeded", &[]), ("skipped", &[])],
+                published: &[("general", "account")],
+            },
         ];
         for case in cases {
             let question = case.question;
@@ -4447,6 +4462,15 @@ mod pg_tests {
                         .as_str()
                         .is_some_and(|reason| reason.contains("kind (null, bool)")),
                     "{question}: {security}"
+                );
+            }
+            if question == "SILENT" {
+                let quote = step("quote");
+                assert!(
+                    quote["reason"]
+                        .as_str()
+                        .is_some_and(|reason| reason.contains("published no `account`")),
+                    "{question}: a succeeded producer without the name fails its consumer: {quote}"
                 );
             }
             if step("quote")["status"] == "skipped" {

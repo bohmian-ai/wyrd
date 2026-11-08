@@ -382,6 +382,7 @@ PLANS = (
     ("BOTH", {"security": True, "style": True}),
     ("UNDECIDED", {"security": None, "style": False}),
     ("FORGOTTEN", {"style": False}),
+    ("SILENT", {"security": True, "style": False}),
 )
 """The planner's decision for the first question marker its prompt carries."""
 
@@ -403,7 +404,8 @@ def orchestration_turn(text: str, messages: list[dict]) -> dict | None:
     """The ``orchestration-desk`` Agents' next turn, or ``None`` for an undecodable reply.
 
     The planner decides by the question's marker and breaks without one. The
-    generalist and security specialist publish their account, the stylist
+    generalist and security specialist publish their account (a ``SILENT``
+    security specialist finishes without one), the stylist
     publishes a partial draft and then breaks, the consolidator reads every
     collection's manifest, and the quoter reads the security account. The
     ``CANCEL-HELD`` generalist holds its reply until the test releases it.
@@ -432,7 +434,7 @@ def orchestration_turn(text: str, messages: list[dict]) -> dict | None:
             HOLD_ARRIVED.set()
             HOLD_RELEASED.wait(300)
         focus = "general" if "GENERAL:" in text else "security"
-        if turn:
+        if turn or (focus == "security" and "SILENT" in text):
             return DONE
         return calls(("s-publish", "publish", {"name": "account", "value": {"focus": focus}}))
     if "STYLE:" in text:

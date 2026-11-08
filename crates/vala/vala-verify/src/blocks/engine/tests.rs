@@ -3630,6 +3630,70 @@ async fn waiting_checks_spend_only_after_admission() {
     );
 }
 
+/// An admitted Agent check spends its invocation once dispatched: when the
+/// execution is interrupted while the check runs, the reclaimed execution
+/// with one Agent invocation finds it spent and does not call the check.
+///
+/// # Panics
+/// Panics when the interrupted check is not recorded or recovery calls it
+/// again.
+#[tokio::test(start_paused = true)]
+async fn interrupted_agent_checks_keep_their_invocation() {
+    let spec = verifier(json!({
+        "inputs": {"answer": {"type": "json"}},
+        "limits": {"max_agent_invocations": 1},
+        "requirements": [{"id": "judged", "statement": "judged", "check": answer_agent()}]
+    }));
+    let passed = || {
+        Ok(verdict(
+            VerificationVerdict::Passed,
+            json!([{"slot": "answer", "locator": {"json_pointer": "/text"}}]),
+        ))
+    };
+    let stalled = Arc::new(Script {
+        checks: HashMap::from([("judged", passed())]),
+        held: HashMap::from([("judged", Arc::new(Notify::new()))]),
+        ..Script::default()
+    });
+    let ledger = Arc::new(Ledger::default());
+    let interrupted = run(
+        &engine(&stalled, InMemoryTraceSource::new(), 4).with_checkpoints(
+            Arc::clone(&ledger) as Arc<dyn Checkpoints>,
+            &ExecutionState::default(),
+        ),
+        &spec,
+        json!({"answer": {"text": "a"}}),
+    )
+    .await;
+    assert!(
+        matches!(interrupted, Err(EngineError::DeadlineExceeded)),
+        "{interrupted:?}"
+    );
+    assert_eq!(stalled.calls(), ["check:judged"]);
+    assert_eq!(ledger.attempts(), [("judged".to_owned(), 1, false)]);
+
+    let recovered = Arc::new(Script {
+        checks: HashMap::from([("judged", passed())]),
+        ..Script::default()
+    });
+    let outcome = run(
+        &engine(&recovered, InMemoryTraceSource::new(), 4).with_checkpoints(
+            Arc::clone(&ledger) as Arc<dyn Checkpoints>,
+            &ledger.recorded(),
+        ),
+        &spec,
+        json!({"answer": {"text": "a"}}),
+    )
+    .await
+    .expect("outcome");
+    assert!(recovered.calls().is_empty(), "{:?}", recovered.calls());
+    let judged = requirement(&outcome, "judged");
+    assert_eq!(
+        (judged.outcome, judged.reason.as_str()),
+        (RequirementOutcome::Inconclusive, BUDGET_SPENT)
+    );
+}
+
 /// A capacity refusal from one step check defers the execution only after
 /// the step's other dispatched check settles: the running Agent check's
 /// settlement is recorded before the refusal returns, the refused check's

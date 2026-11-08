@@ -270,7 +270,13 @@ pub struct VerificationEngine {
     /// The current run's own concurrency bound beneath the engine's;
     /// `None` without `limits.concurrency`.
     run_permits: Option<Arc<Semaphore>>,
+    /// The highest attempt the current run began per block and instance;
+    /// [`Self::run`] starts each run with none.
+    begun: Begun,
 }
+
+/// One run's highest begun attempt per block and instance.
+type Begun = Arc<std::sync::Mutex<HashMap<(TaskId, Instance), u32>>>;
 
 /// One invocation of a block: its zero-based fanout item and repeat
 /// iteration, each `None` when its step does not fan out or repeat.
@@ -351,6 +357,7 @@ impl VerificationEngine {
             checkpoints: None,
             budget: None,
             run_permits: None,
+            begun: Begun::default(),
         }
     }
 
@@ -497,11 +504,62 @@ impl VerificationEngine {
         (run, self.permits.acquire().await.ok())
     }
 
+    /// Lock the current run's begun attempts, recovering them from a
+    /// poisoned lock: no code path panics while holding it.
+    fn begun_attempts(&self) -> std::sync::MutexGuard<'_, HashMap<(TaskId, Instance), u32>> {
+        self.begun
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// Every attempt of `step` that began, in this run or an earlier run
+    /// of this execution, ordered by item, iteration, then attempt, for a
+    /// contribution withheld before it settled in this run. A restored
+    /// settlement reports its own records; every other instance's last
+    /// attempt ends as `status` for `reason`. Nothing begun is an empty
+    /// list.
+    fn attempted(
+        &self,
+        step: &TaskId,
+        status: StepStatus,
+        reason: &str,
+    ) -> Vec<ProducerInvocation> {
+        let mut instances: BTreeMap<Instance, u32> = BTreeMap::new();
+        let recorded = self
+            .checkpoints
+            .iter()
+            .flat_map(|checkpointed| &checkpointed.attempts)
+            .map(|(key, attempts)| (key.clone(), *attempts));
+        let begun: Vec<_> = self
+            .begun_attempts()
+            .iter()
+            .map(|(key, attempts)| (key.clone(), *attempts))
+            .collect();
+        for ((task, instance), attempts) in recorded.chain(begun) {
+            if task == *step && attempts > 0 {
+                let seen = instances.entry(instance).or_default();
+                *seen = (*seen).max(attempts);
+            }
+        }
+        instances
+            .into_iter()
+            .flat_map(
+                |(instance, attempts)| match self.restored_action(step, instance) {
+                    Some(done) => done.invocations,
+                    None => attempt_records(instance.0, instance.1, attempts, status, Some(reason))
+                        .collect(),
+                },
+            )
+            .collect()
+    }
+
     /// Record that the attempt `producer` starts, before it is dispatched.
     ///
     /// # Errors
     /// Returns [`EngineError::Checkpoint`] when the record cannot commit.
     async fn begin(&self, producer: &Producer) -> Result<(), EngineError> {
+        self.begun_attempts()
+            .insert(instance_key(producer), producer.attempt);
         match &self.checkpoints {
             Some(checkpointed) => checkpointed
                 .store
@@ -518,6 +576,8 @@ impl VerificationEngine {
     /// # Errors
     /// Returns [`EngineError::Checkpoint`] when the record cannot be removed.
     async fn forget(&self, producer: &Producer) -> Result<(), EngineError> {
+        self.begun_attempts()
+            .insert(instance_key(producer), producer.attempt - 1);
         match &self.checkpoints {
             Some(checkpointed) => checkpointed
                 .store
@@ -656,6 +716,7 @@ impl VerificationEngine {
             }
             let attempt = Self {
                 reads: TraceReads::default(),
+                begun: Begun::default(),
                 attached: Arc::new(attached),
                 budget: limits
                     .and_then(|limits| limits.max_agent_invocations)
@@ -842,7 +903,11 @@ impl VerificationEngine {
                         }
                         None if tasks.contains(&Node::Step(index)) && !speculation.admits() => {
                             tasks.cancel(&Node::Step(index));
-                            unrun(step, Missing::failed(reason.clone()), Speculation::Pending)
+                            let status = withheld(speculation, &reason).0;
+                            let mut cancelled =
+                                unrun(step, Missing::failed(reason.clone()), Speculation::Pending);
+                            cancelled.invocations = self.attempted(&step.id, status, &reason);
+                            cancelled
                         }
                         _ => continue,
                     };
@@ -958,6 +1023,7 @@ impl VerificationEngine {
         }
         let (status, gap) = withheld(speculation, reason);
         done.result.status = status;
+        done.result.attempts = u32::try_from(done.invocations.len()).unwrap_or(u32::MAX);
         done.result.output = None;
         done.result.reason = Some(gap.reason.clone());
         done.state = Settled::NoOutput { status, gap };
@@ -1032,7 +1098,20 @@ impl VerificationEngine {
                     Some((Speculation::Admitted, _)) => speculation = Speculation::Admitted,
                     Some((decided, reason)) => {
                         let (status, gap) = withheld(decided, &reason);
-                        return settle(status, gap, decided);
+                        let invocations = self.attempted(&step.id, status, &reason);
+                        let mut done = unrun(step, gap, decided);
+                        done.result.status = status;
+                        done.result.attempts = u32::try_from(invocations.len()).unwrap_or(u32::MAX);
+                        done.invocations = invocations;
+                        if let Settled::NoOutput {
+                            status: settled, ..
+                        } = &mut done.state
+                        {
+                            *settled = status;
+                        }
+                        done.requirements =
+                            missing_requirements(spec, &scope, &self.attached, index, &done)?;
+                        return Ok(Prepared::Settled(Arc::new(Done::Step(Box::new(done)))));
                     }
                 }
             } else {
@@ -2062,6 +2141,14 @@ impl Node {
 /// A requirement's declaration: the index of its containing step, or `None`
 /// for a whole-Verifier requirement, and its index in that list.
 type Key = (Option<usize>, usize);
+
+/// The block and instance `producer` is an attempt of.
+fn instance_key(producer: &Producer) -> (TaskId, Instance) {
+    (
+        producer.step_id.clone(),
+        (producer.item_index, producer.iteration_index),
+    )
+}
 
 /// The attempt `attempt` of `task`'s invocation `instance`.
 fn producer(task: &TaskId, (item_index, iteration_index): Instance, attempt: u32) -> Producer {

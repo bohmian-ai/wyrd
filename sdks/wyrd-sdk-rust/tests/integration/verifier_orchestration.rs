@@ -23,8 +23,10 @@ use wyrd_ai::verify::{
     Execution, ExecutionPageQuery, File, PublicationContent, PublicationName, PublicationSelector,
     PublicationSummary, Speculation, Submission, TaskId,
 };
-use wyrd_ai::{RequirementOutcome, StepStatus, VerificationResult, VerificationVerdict};
-use wyrd_spec::verification::state::ControlRecord;
+use wyrd_ai::{
+    ExecutionId, RequirementOutcome, StepStatus, VerificationResult, VerificationVerdict,
+};
+use wyrd_spec::verification::state::{ControlRecord, ExecutionState};
 use wyrd_testing::verification::VerificationFixture;
 
 use crate::hosted_agent_tools::{builder, calls, done, lines, messages, results, text, turn};
@@ -443,6 +445,109 @@ impl Desk {
             .into_iter()
             .filter(|messages| text(messages).contains(question))
             .collect()
+    }
+
+    /// Queue `input` for `verifier` and return the execution's identity.
+    ///
+    /// # Panics
+    /// Panics when the submission is refused or runs at once.
+    async fn submit(&self, verifier: &str, input: Value) -> ExecutionId {
+        let Submission::Queued(queued) = self
+            .state
+            .run()
+            .observe()
+            .submit(verifier, input)
+            .await
+            .expect("the execution is submitted")
+        else {
+            panic!("Run evidence queues an execution");
+        };
+        *queued.id()
+    }
+
+    /// Wait until some request carrying both `marker` and `question` has
+    /// reached the upstream.
+    ///
+    /// # Panics
+    /// Panics when none arrives within 90 seconds.
+    async fn stalled_in(&self, marker: &str, question: &str) {
+        let deadline = std::time::Instant::now() + Duration::from_secs(90);
+        while self.asked(marker, question).await.is_empty() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "{question}: no {marker} request arrived"
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    }
+
+    /// Stop this desk's worker from claiming while it stays inside its held
+    /// calls, flush its accepted state, and expire the lease of every
+    /// execution in `executions`; a replica over the same storage then takes
+    /// them over. Returns the stalled deployment and the desk the replica
+    /// serves.
+    ///
+    /// # Panics
+    /// Panics when the flush, a lease expiry, or the replica fails.
+    async fn take_over(self, executions: &[ExecutionId]) -> (Deployment, Self) {
+        let server = self.deployment.server();
+        server.cancel_bound_workers();
+        server.flush_bifrost().await.expect("Bifrost flushes");
+        let fixture = VerificationFixture::provision(server.state(), server.data_tenant_id())
+            .await
+            .expect("the tenant provisions");
+        for execution in executions {
+            fixture
+                .expire_lease(*execution)
+                .await
+                .expect("the stalled worker's lease expires");
+        }
+        let replica = self.deployment.replica(builder(&self.upstream)).await;
+        (
+            self.deployment,
+            Self {
+                deployment: replica,
+                upstream: self.upstream,
+                state: self.state,
+            },
+        )
+    }
+
+    /// The tenant's verification fixture over this desk's server.
+    ///
+    /// # Panics
+    /// Panics when the tenant cannot be provisioned.
+    async fn fixture(&self) -> VerificationFixture {
+        let server = self.deployment.server();
+        VerificationFixture::provision(server.state(), server.data_tenant_id())
+            .await
+            .expect("the tenant provisions")
+    }
+
+    /// The accepted Bifrost state of `execution`.
+    ///
+    /// # Panics
+    /// Panics when the state cannot be read or no revision was accepted.
+    async fn accepted(&self, execution: ExecutionId) -> ExecutionState {
+        self.fixture()
+            .await
+            .execution_state(self.deployment.server().state(), execution)
+            .await
+            .expect("the accepted state reads")
+            .expect("the execution accepted progress")
+    }
+
+    /// Wait for the taken-over `execution` to settle.
+    ///
+    /// # Panics
+    /// Panics when it does not settle within 90 seconds.
+    async fn settled(&self, execution: ExecutionId) -> VerificationResult {
+        Execution::connect_with(execution, &self.deployment.admin())
+            .await
+            .expect("the execution handle connects")
+            .wait(Duration::from_secs(90))
+            .await
+            .expect("the execution settles")
     }
 
     /// Every publication of `result`'s execution, read back as the
@@ -1397,45 +1502,15 @@ async fn repeat_stops_or_exhausts_without_overlapping() {
             .with_priority(1)
             .mount(&desk.upstream)
             .await;
-        let Submission::Queued(queued) = desk
-            .state
-            .run()
-            .observe()
-            .submit("repeat-takeover", json!(question))
-            .await
-            .expect("the refinement is submitted")
-        else {
-            panic!("Run evidence queues an execution");
-        };
-        executions.push((question, *queued.id()));
+        executions.push((
+            question,
+            desk.submit("repeat-takeover", json!(question)).await,
+        ));
     }
-    let deadline = std::time::Instant::now() + Duration::from_secs(90);
-    for (question, _) in &executions {
-        while !iterations(&desk.asked("REFINE:", question).await).contains(&1) {
-            assert!(
-                std::time::Instant::now() < deadline,
-                "{question}: iteration 1 never started"
-            );
-            tokio::time::sleep(Duration::from_millis(50)).await;
-        }
-    }
-    let Desk {
-        deployment: stalled,
-        upstream,
-        state,
-    } = desk;
-    stalled.server().cancel_bound_workers();
-    stalled
-        .server()
-        .flush_bifrost()
-        .await
-        .expect("Bifrost flushes");
-    let fixture =
-        VerificationFixture::provision(stalled.server().state(), stalled.server().data_tenant_id())
-            .await
-            .expect("the tenant provisions");
+    let fixture = desk.fixture().await;
     let mut deadlines = Vec::new();
-    for (_, execution) in &executions {
+    for (question, execution) in &executions {
+        desk.stalled_in("index=1", question).await;
         let row = fixture
             .execution(*execution)
             .await
@@ -1445,24 +1520,11 @@ async fn repeat_stops_or_exhausts_without_overlapping() {
             "the first claim fixes a deadline"
         );
         deadlines.push(row.deadline_at);
-        fixture
-            .expire_lease(*execution)
-            .await
-            .expect("the stalled worker's lease expires");
     }
-
-    let desk = Desk {
-        deployment: stalled.replica(builder(&upstream)).await,
-        upstream,
-        state,
-    };
+    let ids: Vec<ExecutionId> = executions.iter().map(|(_, execution)| *execution).collect();
+    let (stalled, desk) = desk.take_over(&ids).await;
     for ((question, execution), before) in executions.iter().zip(&deadlines) {
-        let result = Execution::connect_with(*execution, &desk.deployment.admin())
-            .await
-            .expect("the execution handle connects")
-            .wait(Duration::from_secs(90))
-            .await
-            .expect("the taken-over execution settles");
+        let result = desk.settled(*execution).await;
         assert_eq!(
             &fixture
                 .execution(*execution)
@@ -1527,6 +1589,153 @@ async fn repeat_stops_or_exhausts_without_overlapping() {
             iterations(&desk.asked("REFINE:", question).await),
             [0, 0, 1, 1, 1, 2, 2],
             "{question}: iteration 1 runs once more and nothing overlaps"
+        );
+    }
+    desk.deployment.shutdown().await;
+}
+
+/// A takeover after a speculative decision is recorded honours it and
+/// never runs the extra review again. Each comparison decides late: an
+/// admitted extra review has finished, while a discarded or blocked one is
+/// still inside its second call when the decision cancels it. Every
+/// consolidator is stalled when its worker stops and the leases expire. The
+/// replica restores each recorded disposition: it calls neither the
+/// comparer nor the extra reviewer, mounts only admitted content into the
+/// consolidator's retry, and keeps excluded content retained with its
+/// disposition.
+///
+/// # Panics
+/// Panics when a submission is refused or does not settle, a disposition
+/// is not recorded before the takeover, or recovery calls a decided step
+/// again or mounts excluded content.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires the repository-managed Postgres journey lifecycle"]
+async fn speculative_recovery_cannot_resurrect_content() {
+    let desk = Desk::start().await;
+    let cases = [
+        (
+            "SPEC-ADMIT-LATE-DECISION-RECOVER",
+            Speculation::Admitted,
+            StepStatus::Succeeded,
+            &["account"][..],
+        ),
+        (
+            "SPEC-DISCARD-LATE-DECISION-RECOVER",
+            Speculation::Discarded,
+            StepStatus::Skipped,
+            &[][..],
+        ),
+        (
+            "SPEC-BLOCK-LATE-DECISION-RECOVER",
+            Speculation::Blocked,
+            StepStatus::Failed,
+            &[][..],
+        ),
+    ];
+    let mut executions = Vec::new();
+    for (question, speculation, ..) in cases {
+        Mock::given(method("POST"))
+            .and(body_string_contains("CONSOLIDATE:"))
+            .and(body_string_contains(question))
+            .respond_with(done().set_delay(STALLED))
+            .up_to_n_times(1)
+            .with_priority(1)
+            .mount(&desk.upstream)
+            .await;
+        if speculation != Speculation::Admitted {
+            Mock::given(method("POST"))
+                .and(body_string_contains("EXTRA:"))
+                .and(body_string_contains("e-publish"))
+                .and(body_string_contains(question))
+                .respond_with(done().set_delay(STALLED))
+                .with_priority(1)
+                .mount(&desk.upstream)
+                .await;
+        }
+        executions.push(desk.submit("speculative-review", json!(question)).await);
+    }
+    let extra = TaskId::new("extra").expect("step");
+    let mut before = Vec::new();
+    for ((question, speculation, ..), execution) in cases.iter().zip(&executions) {
+        desk.stalled_in("CONSOLIDATE:", question).await;
+        let accepted = desk.accepted(*execution).await;
+        assert_eq!(accepted.speculation(&extra), *speculation, "{question}");
+        before.push((
+            desk.asked("COMPARE:", question).await.len(),
+            desk.asked("EXTRA:", question).await.len(),
+        ));
+    }
+    let (stalled, desk) = desk.take_over(&executions).await;
+
+    for (((question, speculation, status, entries), execution), called) in
+        cases.iter().zip(&executions).zip(&before)
+    {
+        let result = desk.settled(*execution).await;
+        assert_eq!(
+            requirement(&result, "consolidated").outcome,
+            RequirementOutcome::Passed,
+            "{question}: {result:?}"
+        );
+        assert_eq!(step(&result, "extra").status, *status, "{question}");
+        assert_eq!(
+            (
+                desk.asked("COMPARE:", question).await.len(),
+                desk.asked("EXTRA:", question).await.len(),
+            ),
+            *called,
+            "{question}: the recorded decision is restored, not made again"
+        );
+        let consolidator = desk.asked("CONSOLIDATE:", question).await;
+        assert_eq!(
+            consolidator.len(),
+            3,
+            "{question}: the stalled turn, then a retry"
+        );
+        let read = results(
+            consolidator
+                .last()
+                .expect("the consolidator called the model"),
+        );
+        let manifest: Value = serde_json::from_str(&lines(&read["c-extra"]))
+            .unwrap_or_else(|error| panic!("{question}: manifest: {error}"));
+        let mounted: Vec<&str> = manifest["entries"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|entry| entry["name"].as_str())
+            .collect();
+        assert_eq!(
+            (
+                manifest["speculation"].as_str(),
+                mounted.as_slice(),
+                manifest["invocations"][0]["attempt"].as_u64(),
+            ),
+            (
+                serde_json::to_value(speculation)
+                    .ok()
+                    .as_ref()
+                    .and_then(Value::as_str),
+                *entries,
+                Some(1),
+            ),
+            "{question}: {manifest}"
+        );
+        let retained: Vec<Speculation> = desk
+            .publications(&result)
+            .await
+            .iter()
+            .filter(|publication| publication.producer.step_id == extra)
+            .map(|publication| publication.speculation)
+            .collect();
+        assert_eq!(retained, [*speculation], "{question}");
+    }
+
+    stalled.shutdown().await;
+    for ((question, ..), called) in cases.iter().zip(&before) {
+        assert_eq!(
+            desk.asked("EXTRA:", question).await.len(),
+            called.1,
+            "{question}: the stalled worker resurrects nothing"
         );
     }
     desk.deployment.shutdown().await;

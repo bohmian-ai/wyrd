@@ -3036,15 +3036,15 @@ async fn speculative_steps_withhold_content_until_admitted() {
     tokio::time::timeout(Duration::from_secs(1), cancelled.notified())
         .await
         .expect("the discarded work is cancelled");
-    for (id, status) in [
-        ("early", StepStatus::Skipped),
-        ("dropped", StepStatus::Skipped),
-        ("blocked", StepStatus::Failed),
+    for (id, status, attempts) in [
+        ("early", StepStatus::Skipped, 0),
+        ("dropped", StepStatus::Skipped, 1),
+        ("blocked", StepStatus::Failed, 1),
     ] {
         let withheld = step(&outcome, id);
         assert_eq!(
-            (withheld.status, withheld.output.clone()),
-            (status, None),
+            (withheld.status, withheld.output.clone(), withheld.attempts),
+            (status, None, attempts),
             "{id}"
         );
     }
@@ -3083,6 +3083,30 @@ async fn speculative_steps_withhold_content_until_admitted() {
     assert_eq!(step(&outcome, "extra").output, Some(json!({"y": 2})));
     assert_eq!(step(&outcome, "dropped").status, StepStatus::Skipped);
     assert!(!recovered.calls().contains(&"action:dropped".to_owned()));
+
+    let resumed = script();
+    let outcome = run(
+        &engine(&resumed, InMemoryTraceSource::new(), 8).with_checkpoints(
+            Arc::new(Ledger::default()) as Arc<dyn Checkpoints>,
+            &ledger.recorded(),
+        ),
+        &spec,
+        json!({"answer": 1}),
+    )
+    .await
+    .expect("resumed outcome");
+    for (id, status) in [
+        ("dropped", StepStatus::Skipped),
+        ("blocked", StepStatus::Failed),
+    ] {
+        let withheld = step(&outcome, id);
+        assert_eq!(
+            (withheld.status, withheld.attempts),
+            (status, 1),
+            "{id}: a recorded disposition keeps the attempt that ran"
+        );
+        assert!(!resumed.calls().contains(&format!("action:{id}")), "{id}");
+    }
 }
 
 /// A step graph whose only cycle runs through a speculative guard and a

@@ -2289,6 +2289,9 @@ async fn publication_references_resolve_to_attempts_and_statuses() {
                 "/inputs/gated": "steps.gated.publications",
             }))},
             {"id": "blocked", "action": reader_agent(json!({"/inputs/report": "steps.broken.publications.report"}))},
+            {"id": "none", "foreach": {"items": "inputs.answer.none", "max_items": 3},
+             "action": reader_agent(json!({"/inputs/a.json": "inputs.answer"}))},
+            {"id": "after-none", "action": reader_agent(json!({"/inputs/none": "steps.none.publications"}))},
         ],
         "requirements": [{"id": "ran", "statement": "s", "check": {"kind": "assert", "path": "inputs.answer", "operator": "is_not_null"}}],
     }));
@@ -2308,11 +2311,22 @@ async fn publication_references_resolve_to_attempts_and_statuses() {
     let outcome = run(
         &engine(&script, InMemoryTraceSource::new(), 4),
         &spec,
-        json!({"answer": {"go": false}}),
+        json!({"answer": {"go": false, "none": []}}),
     )
     .await
     .expect("outcome");
     let consumed = script.mounts.lock().expect("mounts")["consume"].clone();
+    let after_none = script.mounts.lock().expect("mounts")["after-none"].clone();
+    assert!(
+        matches!(
+            &after_none["/inputs/none"].value,
+            CallValue::Publications { collection, .. }
+                if collection.status == StepStatus::Succeeded
+                    && collection.invocations.is_empty()
+                    && collection.entries.is_empty()
+        ),
+        "an empty fanout mounts an empty successful collection: {after_none:?}"
+    );
     let collection = |status, reason: Option<&str>, invocations: Vec<ProducerInvocation>| {
         CallValue::Publications {
             step: TaskId::new("x").expect("task"),
@@ -2803,13 +2817,17 @@ async fn array_fanout_freezes_and_orders_items() {
              "action": code_action(json!({"s": "item"}))},
             {"id": "partial", "foreach": fanout("inputs.doc.sections", 5),
              "action": code_action(json!({"s": "item"}))},
-            {"id": "sweep", "retries": 1, "foreach": {"count": 2}, "action": code_action(json!({}))}
-        ]
+            {"id": "sweep", "retries": 1, "foreach": {"count": 2}, "action": code_action(json!({}))},
+            {"id": "counted", "foreach": {"count": 2}, "action": code_action(json!({}))}
+        ],
+        "requirements": [{"id": "empty-covers", "statement": "the empty fanout covered something",
+            "check": {"kind": "assert", "each": "steps.empty.output[*]", "operator": "is_not_null"}}]
     }));
     let script = || {
         Arc::new(Script {
             actions: HashMap::from([
                 ("map", echo(&[3, 2, 1])),
+                ("counted", echo(&[])),
                 (
                     "partial",
                     Behavior::Echo {
@@ -2867,6 +2885,26 @@ async fn array_fanout_freezes_and_orders_items() {
     assert_eq!(
         (empty.status, empty.output.clone()),
         (StepStatus::Succeeded, Some(json!([])))
+    );
+    assert_eq!(
+        outcome
+            .requirements
+            .iter()
+            .find(|result| result.id.as_str() == "empty-covers")
+            .map(|result| result.outcome),
+        Some(RequirementOutcome::Inconclusive),
+        "an empty fanout alone passes no requirement"
+    );
+    assert_eq!(
+        step(&outcome, "counted").output,
+        Some(json!([{}, {}])),
+        "count items receive no injected inputs"
+    );
+    assert!(
+        ["action:counted[0]", "action:counted[1]"]
+            .iter()
+            .all(|call| calls.iter().filter(|seen| seen == call).count() == 1),
+        "{calls:?}"
     );
     for (refused, reason) in [
         ("wide", "more than max_items 2"),

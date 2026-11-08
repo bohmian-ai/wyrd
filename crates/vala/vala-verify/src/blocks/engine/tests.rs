@@ -3017,6 +3017,34 @@ async fn array_fanout_freezes_and_orders_items() {
         step(&outcome, "map").output,
         Some(json!([{"s": "b", "i": 0}, {"s": "a", "i": 1}, {"s": "a", "i": 2}]))
     );
+
+    let refused = script();
+    let oversized = ExecutionState {
+        controls: vec![ControlRecord::Items {
+            step: TaskId::new("map").expect("task"),
+            items: (0..6).map(|item| json!(item)).collect(),
+        }],
+        ..ExecutionState::default()
+    };
+    let outcome = run(
+        &engine(&refused, InMemoryTraceSource::new(), 8).with_checkpoints(
+            Arc::new(Ledger::default()) as Arc<dyn Checkpoints>,
+            &oversized,
+        ),
+        &spec,
+        json!({"doc": {"sections": ["z"], "none": []}, "answer": 3}),
+    )
+    .await
+    .expect("refused outcome");
+    assert_eq!(step(&outcome, "map").status, StepStatus::Failed);
+    assert!(
+        !refused
+            .calls()
+            .iter()
+            .any(|call| call.starts_with("action:map")),
+        "recorded items beyond the bound dispatch nothing: {:?}",
+        refused.calls()
+    );
 }
 
 /// A repeat runs one iteration at a time, exposing the zero-based index

@@ -298,10 +298,15 @@ mod tests {
             ExecutionState::decode(serde_json::json!({})),
             Err(ExecutionStateError::Incompatible { found: 0 })
         ));
-        assert!(matches!(
-            ExecutionState::decode(serde_json::json!({ "format": 1, "sequence": 0 })),
-            Err(ExecutionStateError::Incompatible { found: 1 })
-        ));
+        for earlier in 1..EXECUTION_STATE_FORMAT {
+            assert_eq!(
+                ExecutionState::decode(serde_json::json!({ "format": earlier, "sequence": 0 })),
+                Err(ExecutionStateError::Incompatible {
+                    found: u64::from(earlier)
+                }),
+                "format {earlier} predates the recorded controls"
+            );
+        }
         assert!(matches!(
             ExecutionState::decode(
                 serde_json::json!({ "format": EXECUTION_STATE_FORMAT, "sequence": "x" })

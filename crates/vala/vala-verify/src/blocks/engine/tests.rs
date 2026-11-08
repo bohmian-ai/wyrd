@@ -3142,7 +3142,8 @@ async fn repeat_refines_one_iteration_at_a_time() {
 /// finishes before or after the guard, a known-false guard
 /// makes no call, a guard that turns false cancels running work and
 /// withholds it, and an unevaluable guard blocks it as a failure; ordinary
-/// consumers of discarded or blocked output are never called. Every
+/// consumers of discarded or blocked output or named publications are never
+/// called. Every
 /// disposition decided after the step started is recorded, and a recorded
 /// disposition wins over a re-evaluated guard.
 ///
@@ -3161,14 +3162,16 @@ async fn speculative_steps_withhold_content_until_admitted() {
             {"id": "early", "speculative": true, "when": guard("inputs.answer", json!(99)),
              "action": code_action(json!({"y": "inputs.answer"}))},
             {"id": "dropped", "speculative": true, "when": guard("steps.compare.output.x", json!(2)),
-             "action": code_action(json!({"y": "inputs.answer"}))},
+             "action": reader_agent(json!({"/inputs/a.json": "inputs.answer"}))},
             {"id": "blocked", "speculative": true, "when": guard("steps.compare.output.missing", json!(1)),
-             "action": code_action(json!({"y": "inputs.answer"}))},
+             "action": reader_agent(json!({"/inputs/a.json": "inputs.answer"}))},
             {"id": "late", "speculative": true, "when": guard("steps.compare.output.x", json!(1)),
              "action": code_action(json!({"y": "inputs.answer"}))},
             {"id": "late-consumer", "action": code_action(json!({"e": "steps.late.output"}))},
             {"id": "dropped-consumer", "action": code_action(json!({"e": "steps.dropped.output"}))},
-            {"id": "blocked-consumer", "action": code_action(json!({"e": "steps.blocked.output"}))}
+            {"id": "blocked-consumer", "action": code_action(json!({"e": "steps.blocked.output"}))},
+            {"id": "dropped-named", "action": reader_agent(json!({"/inputs/r": "steps.dropped.publications.report"}))},
+            {"id": "blocked-named", "action": reader_agent(json!({"/inputs/r": "steps.blocked.publications.report"}))}
         ]
     }));
     let cancelled = Arc::new(Notify::new());
@@ -3222,7 +3225,12 @@ async fn speculative_steps_withhold_content_until_admitted() {
         step(&outcome, "late-consumer").output,
         Some(json!({"e": {"y": 1}}))
     );
-    for excluded in ["dropped-consumer", "blocked-consumer"] {
+    for excluded in [
+        "dropped-consumer",
+        "blocked-consumer",
+        "dropped-named",
+        "blocked-named",
+    ] {
         let consumer = step(&outcome, excluded);
         assert!(
             consumer.status != StepStatus::Succeeded && consumer.output.is_none(),

@@ -240,6 +240,45 @@ chunk collection or attribute Hyper connection-buffer savings to this change.
 | REQ-003/010/011; INV-004/006/008; AC-002/008/009 | Scenario 6 proves bounded independently owned batches without the extra split-copy; retry IDs/content, local/peer routing, attribution, oversized-row handling and cancellation counts remain exact. No batching/concurrency policy is retuned. |
 | REQ-012; AC-003/010; INV-008 | Paired profiles demonstrate attributable allocation reduction, separate from retained memory. Final L1 records every engine/step/repetition and zero errors/lost/shed/undrained work. Immediate-baseline regressions are investigated; original whole-change baseline/main/read obligations are not reset or waived. |
 
+## Scope Amendment (review decision)
+
+Recorded from the TASK-004 review. It amends this task only; the spec's
+original AC-003 and AC-010 comparisons are unchanged.
+
+- **Scenario 3 is removed.** Public request types and typed validation stay as
+  they are. The helper validates six operations through owning types, and
+  flattened provider settings can carry large values. The measured cost, about
+  2.1 MiB allocated for a 2 MiB body, remains a known cost. A future design
+  should give validation one authoritative path that can borrow. No second
+  handwritten validator and no public ownership change.
+- **The immediate-baseline memory comparison runs at matched load.** Use the
+  optional `--pace` diagnostic: same L1 payload, tenant, upstream and capture
+  policy; fresh server processes; the same offered rate on both sides (90% of
+  the lowest valid baseline sustained rate, at most 64 calls in flight);
+  identical warmup and workload; three load/drain cycles. It must record zero
+  errors, missed or capped arrivals, lost or shed captures and undrained work,
+  plus opening, peak and post-drain RSS and governed memory by owner.
+  Allocation per call and live heap come from separate profiled runs. Default
+  L1 is unchanged.
+- **Memory acceptance.** Higher RSS at the candidate's higher closed-loop
+  throughput is accepted only if all of these hold:
+  - matched-load peak RSS is within baseline variation or better;
+  - governed ownership stays within existing budgets;
+  - post-drain live ownership settles across cycles;
+  - the original pre-TASK-002 allocation/RSS requirement passes;
+  - Gateway's comparison against main passes.
+
+  Otherwise the retaining owner is found and fixed. No raised budgets, and
+  memory per captured GiB is not a substitute.
+- **Bifrost logs.** AC-003's one-rerun rule covers Gateway against main only.
+  For `otlp-logs-c64`, run two predetermined pairs, alternating the order of
+  baseline and candidate, three repetitions each, and report every result. A
+  consistent slowdown is profiled and fixed. Inconsistent results remain an
+  explicit unsettled finding.
+- **Verification.** Records that are INVALID for driver saturation stay
+  INVALID. Valid evidence needs lower driver overhead at its owner, with the
+  same workload and saturation threshold.
+
 ## Implementation Reference
 
 Research inspected Wyrd `a67efcd8dee0df55886d4b3deaf7d8e8a1070c93`; the supplied
@@ -511,7 +550,7 @@ untracked path is an unrelated change packet. Host: Ryzen 9 9950X, 32 CPU /
 |---|---|---|---|
 | REQ-010; AC-008 (scenario 1) | `routes.rs::token_bound`, `SerializedLength` | `usage_bound_tests::usage_bound_requires_an_output_maximum_where_output_exists` extended: exact length parity on escapes, unicode, numbers and a 2 MiB body; RED 3,146,387 B allocated, GREEN < 4096 B | PASS |
 | REQ-010; AC-008 (scenario 2) | `adapter/http.rs::NativeBody::to_json`, providers `send_raw`/`stream_raw` take `Vec<u8>` | `adapter::tests::compatible_passthrough_rewrites_model_and_uses_provider_credential` extended: byte parity with `serde_json::to_vec` on a 1 MiB escaped body with extensions, with and without a model; capacity equals the up-front estimate and ≤ len + len/16 (RED: buffer grew) | PASS |
-| REQ-010; AC-008 (scenario 3) | none | `typed_body::<GatewayChatCompletionsRequest>` copies 2,098,793 B for a 2 MiB body (focused measurement) | FAIL: contract gap (see reuse map) |
+| REQ-010; AC-008 (scenario 3) | removed by the scope amendment | `typed_body::<GatewayChatCompletionsRequest>` copies 2,098,793 B for a 2 MiB body (focused measurement), recorded as a known cost | OUT OF SCOPE |
 | REQ-008/009/011; INV-003/005/007; AC-007/009 (scenarios 4–5) | fork `shred_variant.rs` (`StoredValue`, `reserve_for_row`), `variant_array_builder.rs` (`append_shared`, ≥50% retention in `build`) | `shred_variant::tests::residual_encoding_reuses_storage_with_bounded_capacity` (new): RED 8,337,090 B for 2,098,336 input bytes, GREEN < 1.25× input, mostly-typed < 2.5×, logical parity, shared-row and validity matrix (RED on sharing for row 0); the three named object tests and all 546 package lib tests; learned-layout journey; redux 1002/1002 | PASS |
 | REQ-003/010/011; INV-004/006/008; AC-002/008/009 (scenario 6) | `capture.rs::row_bytes`, `scribe_outbox.rs::frames/chunks` | `scribe_outbox::tests::large_captures_reach_bounded_frames_without_a_split_copy` (new): RED 2,897,489 B for 1,155,960 content bytes, GREEN 1,224,313 B in 5 frames, each within budget, retained ≤ wire + wire/4 + 4096, exact readback, subjects, positions, and identical retry and peer ids; the five named outbox tests and capture test; peer, outage and cancellation journeys | PASS |
 | REQ-010; AC-008 (scenario 7) | `clients/mod.rs::read_bounded_bytes` | `clients::bounded_answers::oversized_answers_fail_and_refusals_keep_status_and_body` extended: known 100,000 B → capacity == len (RED 114,602), chunked, unrepresentable and oversized advertised lengths, truncated body; `native_transport_reuses_owned_buffers` | PASS |

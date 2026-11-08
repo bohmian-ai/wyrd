@@ -3265,7 +3265,9 @@ impl VerifierExecutionQueue {
     /// The execution settles `cancelled` with no result and keeps its
     /// recorded state. A worker holding its lease is fenced: its renewal and
     /// settlement report [`Settlement::StaleLease`], and a lease confirmation
-    /// before each state revision stops it. The cancellation is owed to the
+    /// before each state revision stops it. Cancelling a running execution
+    /// notifies `wyrd_verification_cancelled` on commit, so the holder
+    /// renews and stops at once. The cancellation is owed to the
     /// retained state until a [delivery claim](Self::claim_deliveries)
     /// settles it. Cancelling a settled or unknown execution writes nothing,
     /// so repeating a cancel is harmless.

@@ -18,18 +18,23 @@ use std::time::Duration;
 use serde_json::{Value, json};
 use wiremock::matchers::{body_string_contains, method, path};
 use wiremock::{Mock, MockServer, Request, ResponseTemplate};
+use wyrd_ai::cards::Cards;
 use wyrd_ai::state::WyrdState;
 use wyrd_ai::verify::{
     Execution, ExecutionPageQuery, File, PublicationContent, PublicationName, PublicationSelector,
-    PublicationSummary, Speculation, Submission, TaskId,
+    PublicationSummary, Speculation, Submission, TaskId, VerificationExecutionStatus,
 };
 use wyrd_ai::{
     ExecutionId, RequirementOutcome, StepStatus, VerificationResult, VerificationVerdict,
+    WyrdClient,
 };
 use wyrd_spec::verification::state::{ControlRecord, ExecutionState};
+use wyrd_testing::server::WyrdTestServerBuilder;
 use wyrd_testing::verification::VerificationFixture;
 
-use crate::hosted_agent_tools::{builder, calls, done, lines, messages, results, text, turn};
+use crate::hosted_agent_tools::{
+    builder, calls, done, lines, messages, results, text, turn, workspaces,
+};
 use crate::local_development::configure_gateway;
 use crate::support::{Deployment, declare, fixture, pull};
 use crate::verifier_building_blocks::{completion, grants, requirement, step};
@@ -336,6 +341,24 @@ fn reply(request: &Request, script: &Script) -> ResponseTemplate {
     ResponseTemplate::new(500)
 }
 
+/// Configure the gateway as `admin`, declare and pull
+/// `orchestration-desk` in `admin`'s tenant, and load it as `client`.
+///
+/// # Panics
+/// Panics when a setup step fails.
+async fn hydrate(client: &WyrdClient, admin: &WyrdClient) -> WyrdState {
+    configure_gateway(admin).await;
+    let cards = Cards::connect_with(admin).await.expect("handle connects");
+    let desk = declare(
+        &cards,
+        "cards/verifier_orchestration/orchestration-desk.yaml",
+    )
+    .await;
+    let bundle = pull(&cards, &desk.root).await;
+    WyrdState::from_path_with(bundle.path().join("bundle"), client.clone())
+        .expect("bundle loads offline")
+}
+
 /// Start the scripted upstream every desk's Agents call.
 async fn upstream() -> MockServer {
     let upstream = MockServer::start().await;
@@ -370,26 +393,39 @@ impl Desk {
     /// Panics when a setup step fails.
     async fn start() -> Self {
         let upstream = upstream().await;
-        let deployment = Deployment::start_with(builder(&upstream)).await;
-        configure_gateway(&deployment.admin()).await;
-        let cards = deployment.cards().await;
-        let desk = declare(
-            &cards,
-            "cards/verifier_orchestration/orchestration-desk.yaml",
-        )
-        .await;
-        let bundle = pull(&cards, &desk.root).await;
+        let builder = builder(&upstream);
+        Self::start_with(upstream, builder).await
+    }
+
+    /// [`Self::start`] with the server `builder` configures over
+    /// `upstream`.
+    ///
+    /// # Panics
+    /// Panics when a setup step fails.
+    async fn start_with(upstream: MockServer, builder: WyrdTestServerBuilder) -> Self {
+        let deployment = Deployment::start_with(builder).await;
         let key = deployment
             .granted_key("every_tool", &grants(json!("all")))
             .await;
-        let state =
-            WyrdState::from_path_with(bundle.path().join("bundle"), deployment.client(&key))
-                .expect("bundle loads offline");
+        let state = hydrate(&deployment.client(&key), &deployment.admin()).await;
         Self {
             deployment,
             upstream,
             state,
         }
+    }
+
+    /// `orchestration-desk` hydrated in a new tenant `slug` of this
+    /// deployment, with its own gateway deployment on the same upstream,
+    /// loaded as that tenant's administrator.
+    ///
+    /// # Panics
+    /// Panics when a setup step fails.
+    async fn tenant(&self, slug: &str) -> WyrdState {
+        let admin = self
+            .deployment
+            .client(&self.deployment.other_tenant_admin(slug).await);
+        hydrate(&admin, &admin).await
     }
 
     /// Verify `question` with `verifier` now.
@@ -1738,5 +1774,230 @@ async fn speculative_recovery_cannot_resurrect_content() {
             "{question}: the stalled worker resurrects nothing"
         );
     }
+    desk.deployment.shutdown().await;
+}
+
+/// A mock that answers every section-reviewer turn for a section starting
+/// with `prefix` as the script does, after `delay`.
+async fn hold_sections(upstream: &MockServer, prefix: &str, delay: Duration) {
+    let script = Arc::new(Script::default());
+    Mock::given(method("POST"))
+        .and(body_string_contains(format!("SECTION: {prefix}")))
+        .respond_with(move |request: &Request| reply(request, &script).set_delay(delay))
+        .with_priority(1)
+        .mount(upstream)
+        .await;
+}
+
+/// The arrival position of every section-reviewer request for each
+/// section, in arrival order.
+async fn section_turns(desk: &Desk) -> BTreeMap<String, Vec<usize>> {
+    let mut turns: BTreeMap<String, Vec<usize>> = BTreeMap::new();
+    for (at, messages) in desk.requests("SECTION:").await.iter().enumerate() {
+        let prompt = text(messages);
+        if let Some((section, _)) = prompt
+            .split_once("SECTION: ")
+            .and_then(|(_, rest)| rest.split_once(" at="))
+        {
+            turns.entry(section.to_owned()).or_default().push(at);
+        }
+    }
+    turns
+}
+
+/// The `(item_index, attempt)` of every `map` publication of `result`, in
+/// item order; publications list in commit order, which concurrent items
+/// do not fix.
+async fn mapped(desk: &Desk, result: &VerificationResult) -> Vec<(Option<u32>, u32)> {
+    let mut mapped: Vec<_> = desk
+        .publications(result)
+        .await
+        .iter()
+        .filter(|publication| publication.producer.step_id.as_str() == "map")
+        .map(|publication| {
+            (
+                publication.producer.item_index,
+                publication.producer.attempt,
+            )
+        })
+        .collect();
+    mapped.sort_unstable();
+    mapped
+}
+
+/// The deployment admits two Agent workspaces across every execution and
+/// tenant. Tenant A's three section reviewers, each slow, take both; the
+/// third item is refused capacity, so the execution defers once the two
+/// running items settle and resumes with only the third, which never runs
+/// beside them. Tenant B's single item, submitted while A holds both
+/// workspaces, is deferred the same way and completes once capacity frees,
+/// and neither tenant spends an attempt or reads the other's work. An
+/// execution whose items hold both workspaces indefinitely is cancelled
+/// and releases them at once to tenant B, and a Verifier's
+/// `timeout_seconds` ends a stalled execution long before the deployment's
+/// five-minute deadline.
+///
+/// # Panics
+/// Panics when a submission is refused or does not settle, an item runs
+/// beside the items holding the ceiling, an attempt is spent or work leaks
+/// across tenants, cancellation keeps capacity, or the Verifier timeout is
+/// not applied.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires the repository-managed Postgres journey lifecycle"]
+async fn admission_bounds_fanout_across_tenants() {
+    let upstream = upstream().await;
+    hold_sections(&upstream, "a", HELD).await;
+    hold_sections(&upstream, "c", STALLED).await;
+    hold_sections(&upstream, "d", STALLED).await;
+    let builder = workspaces(&upstream, 2);
+    let desk = Desk::start_with(upstream, builder).await;
+    let other = desk.tenant("admission-other").await;
+    let other_admin = other.client().expect("tenant B has a client").clone();
+
+    let a = desk
+        .submit("admission-sweep", json!(["a0", "a1", "a2"]))
+        .await;
+    let deadline = std::time::Instant::now() + Duration::from_secs(90);
+    while section_turns(&desk).await.len() < 2 {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "two sections never started"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    let Submission::Queued(b) = other
+        .run()
+        .observe()
+        .submit("admission-sweep", json!(["b0"]))
+        .await
+        .expect("tenant B submits")
+    else {
+        panic!("Run evidence queues an execution");
+    };
+    let a = desk.settled(a).await;
+    let b = Execution::connect_with(*b.id(), &other_admin)
+        .await
+        .expect("tenant B's execution handle connects")
+        .wait(Duration::from_secs(90))
+        .await
+        .expect("tenant B's execution settles");
+
+    let turns = section_turns(&desk).await;
+    assert_eq!(
+        turns.values().map(Vec::len).collect::<Vec<_>>(),
+        [2, 2, 2, 2],
+        "every section runs its two turns exactly once: {turns:?}"
+    );
+    let (held, deferred): (Vec<_>, Vec<_>) = ["a0", "a1", "a2"]
+        .iter()
+        .map(|section| &turns[*section])
+        .partition(|at| at[0] < 2);
+    let released = held.iter().map(|at| at[1]).max().expect("two held items");
+    assert_eq!(deferred.len(), 1, "{turns:?}");
+    assert!(
+        deferred[0][0] > released && turns["b0"][0] > released,
+        "nothing starts beside the two items holding the ceiling: {turns:?}"
+    );
+    for result in [&a, &b] {
+        assert_eq!(
+            requirement(result, "mapped").outcome,
+            RequirementOutcome::Passed,
+            "{result:?}"
+        );
+    }
+    assert_eq!(
+        step(&a, "map").output,
+        Some(json!([{ "done": true }, { "done": true }, { "done": true }]))
+    );
+    assert_eq!(
+        mapped(&desk, &a).await,
+        [(Some(0), 1), (Some(1), 1), (Some(2), 1)],
+        "a refused item spends no attempt"
+    );
+    let b_publications = Execution::connect_with(b.execution_id, &other_admin)
+        .await
+        .expect("tenant B's execution handle connects")
+        .publications(&ExecutionPageQuery::default())
+        .await
+        .expect("tenant B reads its publications")
+        .items;
+    assert_eq!(
+        b_publications
+            .iter()
+            .map(|publication| (
+                publication.producer.item_index,
+                publication.producer.attempt
+            ))
+            .collect::<Vec<_>>(),
+        [(Some(0), 1)]
+    );
+    assert!(
+        Execution::connect_with(b.execution_id, &desk.deployment.admin())
+            .await
+            .expect("the execution handle connects")
+            .status()
+            .await
+            .is_err(),
+        "tenant A cannot read tenant B's execution"
+    );
+
+    let stalled = desk.submit("admission-sweep", json!(["c0", "c1"])).await;
+    let deadline = std::time::Instant::now() + Duration::from_secs(90);
+    loop {
+        let turns = section_turns(&desk).await;
+        if turns.contains_key("c0") && turns.contains_key("c1") {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the stalled sections never started"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    Execution::connect_with(stalled, &desk.deployment.admin())
+        .await
+        .expect("the execution handle connects")
+        .cancel()
+        .await
+        .expect("the stalled execution is cancelled");
+    let Submission::Queued(freed) = other
+        .run()
+        .observe()
+        .submit("admission-sweep", json!(["b1"]))
+        .await
+        .expect("tenant B submits")
+    else {
+        panic!("Run evidence queues an execution");
+    };
+    let freed = Execution::connect_with(*freed.id(), &other_admin)
+        .await
+        .expect("tenant B's execution handle connects")
+        .wait(Duration::from_secs(60))
+        .await
+        .expect("cancellation released the workspaces");
+    assert_eq!(
+        requirement(&freed, "mapped").outcome,
+        RequirementOutcome::Passed
+    );
+
+    let started = std::time::Instant::now();
+    let limited = Execution::connect_with(
+        desk.submit("admission-deadline", json!(["d0"])).await,
+        &desk.deployment.admin(),
+    )
+    .await
+    .expect("the execution handle connects");
+    assert!(
+        limited.wait(Duration::from_secs(90)).await.is_err(),
+        "a stalled execution past its timeout has no result"
+    );
+    assert_eq!(
+        limited.status().await.expect("the status reads").status,
+        VerificationExecutionStatus::TimedOut
+    );
+    assert!(
+        started.elapsed() < Duration::from_secs(60),
+        "the Verifier timeout lowers the deployment's deadline"
+    );
     desk.deployment.shutdown().await;
 }

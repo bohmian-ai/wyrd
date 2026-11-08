@@ -643,10 +643,23 @@ impl PublishDesk {
 /// # Panics
 /// Panics when the upstream's URL does not parse.
 pub(crate) fn builder(upstream: &MockServer) -> wyrd_testing::server::WyrdTestServerBuilder {
+    workspaces(upstream, HostedLimits::default().max_workspaces)
+}
+
+/// [`builder`]'s server admitting at most `max_workspaces` concurrent
+/// Agent workspaces across every execution and tenant.
+///
+/// # Panics
+/// Panics when the upstream's URL does not parse.
+pub(crate) fn workspaces(
+    upstream: &MockServer,
+    max_workspaces: usize,
+) -> wyrd_testing::server::WyrdTestServerBuilder {
     WyrdTestServer::builder()
         .with_verification_limits_for_test(HostedLimits {
             monty_min_workers: 0,
             work_write_max_bytes: WORK as u64,
+            max_workspaces,
             ..HostedLimits::default()
         })
         .with_verification_runtime_for_test()

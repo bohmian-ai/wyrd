@@ -1,0 +1,23 @@
+# The same array work whose own timeout lowers the deployment's execution
+# deadline.
+apiVersion: wyrd/v1
+kind: Verifier
+metadata:
+  name: admission-deadline
+  version: 1.0.0
+spec:
+  description: Array work under a Verifier timeout below the deployment's.
+  limits: {timeout_seconds: 3}
+  inputs:
+    sections: {type: json, schema: {type: array, items: {type: string}}}
+  steps:
+    - id: map
+      foreach: {items: inputs.sections, max_items: 4}
+      action:
+        kind: agent
+        agent: ./section-reviewer.yaml
+        inputs: {section: item, index: item_index}
+  requirements:
+    - id: mapped
+      statement: Every section was reviewed
+      check: {kind: assert, path: steps.map.status, operator: equals, expected: succeeded}

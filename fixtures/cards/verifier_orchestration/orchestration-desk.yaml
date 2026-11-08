@@ -16,3 +16,5 @@ spec:
     - verifier: ./document-pipeline.yaml
     - verifier: ./resume-pipeline.yaml
     - verifier: ./repeat-takeover.yaml
+    - verifier: ./admission-sweep.yaml
+    - verifier: ./admission-deadline.yaml

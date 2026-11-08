@@ -3456,6 +3456,46 @@ async fn run_and_fanout_bounds_only_lower_engine_capacity() {
     }
 }
 
+/// A block waiting on its own run's `limits.concurrency` holds no shared
+/// engine permit: while run X's `a` holds X's only permit, X's `b` waits
+/// without taking the engine's second permit, so run Y's `c` can run
+/// beside `a`.
+///
+/// # Panics
+/// Panics when either run does not finish because a waiting block held the
+/// shared permit.
+#[tokio::test(start_paused = true)]
+async fn waiting_blocks_release_unrelated_permits() {
+    let x = verifier(json!({
+        "inputs": {"answer": {"type": "json"}},
+        "limits": {"concurrency": 1},
+        "steps": [
+            {"id": "a", "action": code_action(json!({"x": "inputs.answer"}))},
+            {"id": "b", "action": code_action(json!({"x": "inputs.answer"}))}
+        ]
+    }));
+    let y = verifier(json!({
+        "inputs": {"answer": {"type": "json"}},
+        "steps": [{"id": "c", "action": code_action(json!({"x": "inputs.answer"}))}]
+    }));
+    let barrier = Arc::new(Barrier::new(2));
+    let script = Arc::new(Script {
+        actions: HashMap::from([
+            ("a", Behavior::Together(Arc::clone(&barrier), json!({}))),
+            ("c", Behavior::Together(barrier, json!({}))),
+        ]),
+        ..Script::default()
+    });
+    let engine = engine(&script, InMemoryTraceSource::new(), 2);
+    let (x, y) = tokio::join!(
+        run(&engine, &x, json!({"answer": 1})),
+        run(&engine, &y, json!({"answer": 1}))
+    );
+    assert!(x.is_ok() && y.is_ok(), "{x:?} {y:?}");
+    let calls = script.calls();
+    assert!(at(&calls, "action:a") < at(&calls, "action:b"), "{calls:?}");
+}
+
 /// An inline Agent action or check reading the `answer` input.
 fn answer_agent() -> Value {
     reader_agent(json!({"/inputs/answer.json": "inputs.answer"}))

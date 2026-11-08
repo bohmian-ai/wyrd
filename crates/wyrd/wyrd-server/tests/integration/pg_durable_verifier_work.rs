@@ -1692,9 +1692,9 @@ const KEPT: &[u8] = b"# Kept\n";
 /// whose inventory queries all fail cannot read the report as evidence,
 /// and replaying the drafter's original publish call, whose receipt the
 /// drafter already received, with neither scratch nor writable storage,
-/// answers the original receipt and accepts nothing. Once capacity frees, the recovered run as
-/// that caller never runs the drafter again, and the consumer reads
-/// exactly the accepted bytes.
+/// answers the original receipt and accepts nothing. Once capacity frees,
+/// the recovered run as that caller never runs the drafter again, and the
+/// consumer reads exactly the accepted bytes.
 ///
 /// # Panics
 /// Panics when the run is not deferred busy, the recovery holds other
@@ -1909,8 +1909,9 @@ async fn agent_publications_reach_a_recovered_consumer() {
 /// answers that caller's retry with the original receipt. The caller waits
 /// on a reply channel whose sender the responder owns; the responder
 /// publishes `report`, succeeds, and drops the sender instead of sending
-/// that success, so the reply is lost after acceptance and before delivery. The caller sees no reply, reads
-/// the accepted entry back from Bifrost, and retries the same call,
+/// that success, so the reply is lost after acceptance and before
+/// delivery. The caller sees no reply, reads the accepted entry back from
+/// Bifrost, and retries the same call,
 /// producer, name, and path against the reclaimed state with its scratch
 /// tree gone and storage unwritable: it receives the File receipt, and the
 /// accepted revision and entry are unchanged.

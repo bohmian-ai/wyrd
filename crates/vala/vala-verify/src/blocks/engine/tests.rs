@@ -2268,7 +2268,7 @@ async fn fixed_attachments_mount_selected_files_as_pinned_slots() {
 
 /// Publication references resolve to typed host mounts: a named member to
 /// the successful attempt and its sources, a collection to every settled
-/// producer's honest status and attempts, and a named member of a step with
+/// producer's honest status and attempts once its requirements are judged, and a named member of a step with
 /// no successful attempt to a gap that skips its consumer before it runs.
 ///
 /// # Panics
@@ -2278,7 +2278,8 @@ async fn publication_references_resolve_to_attempts_and_statuses() {
     let spec = verifier(json!({
         "inputs": {"answer": {"type": "json"}},
         "steps": [
-            {"id": "review", "retries": 1, "action": reader_agent(json!({"/inputs/a.json": "inputs.answer"}))},
+            {"id": "review", "retries": 1, "action": reader_agent(json!({"/inputs/a.json": "inputs.answer"})),
+             "requirements": [{"id": "review-ok", "statement": "s", "check": code_check(json!({"r": "steps.review.output"}))}]},
             {"id": "broken", "action": reader_agent(json!({"/inputs/a.json": "inputs.answer"}))},
             {"id": "gated", "when": {"path": "inputs.answer.go", "operator": "equals", "expected": true},
              "action": reader_agent(json!({"/inputs/a.json": "inputs.answer"}))},
@@ -2306,6 +2307,13 @@ async fn publication_references_resolve_to_attempts_and_statuses() {
             ("review", Behavior::Attempts(vec![flaky], json!({}))),
             ("broken", Behavior::Attempts(vec![broken], json!({}))),
         ]),
+        checks: HashMap::from([(
+            "review-ok",
+            Ok(verdict(
+                VerificationVerdict::Passed,
+                json!([{"slot": "answer", "locator": {"json_pointer": "/go"}}]),
+            )),
+        )]),
         ..Script::default()
     });
     let outcome = run(
@@ -2317,6 +2325,11 @@ async fn publication_references_resolve_to_attempts_and_statuses() {
     .expect("outcome");
     let consumed = script.mounts.lock().expect("mounts")["consume"].clone();
     let after_none = script.mounts.lock().expect("mounts")["after-none"].clone();
+    let calls = script.calls();
+    assert!(
+        at(&calls, "check:review-ok") < at(&calls, "action:consume"),
+        "a collection consumer waits for its producer's requirements: {calls:?}"
+    );
     assert!(
         matches!(
             &after_none["/inputs/none"].value,

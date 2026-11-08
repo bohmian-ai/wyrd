@@ -58,6 +58,18 @@ pub enum ReferenceRoot {
     /// `requirement.statement`: the current requirement's statement during
     /// its check.
     RequirementStatement,
+    /// `item`: the current fanout item of an `items` step.
+    Item,
+    /// `item_index`: the zero-based current fanout item of a fanout step.
+    ItemIndex,
+    /// `iteration.output`: the just-completed iteration's output, readable
+    /// only by its step's `repeat.until`.
+    IterationOutput,
+    /// `iteration.previous`: the previous iteration's output, `null` in the
+    /// first iteration.
+    IterationPrevious,
+    /// `iteration.index`: the zero-based current iteration.
+    IterationIndex,
 }
 
 /// A readable field of a requirement verdict.
@@ -101,7 +113,12 @@ impl Reference {
             | ReferenceRoot::StepPublications { step, .. } => Some(step),
             ReferenceRoot::Input(_)
             | ReferenceRoot::RequirementId
-            | ReferenceRoot::RequirementStatement => None,
+            | ReferenceRoot::RequirementStatement
+            | ReferenceRoot::Item
+            | ReferenceRoot::ItemIndex
+            | ReferenceRoot::IterationOutput
+            | ReferenceRoot::IterationPrevious
+            | ReferenceRoot::IterationIndex => None,
         }
     }
 
@@ -189,15 +206,40 @@ impl Reference {
                 Some("statement") => ReferenceRoot::RequirementStatement,
                 _ => return Err(fail("expected requirement.id or requirement.statement")),
             },
-            _ => return Err(fail("root must be inputs, steps, or requirement")),
+            "item" => ReferenceRoot::Item,
+            "item_index" => ReferenceRoot::ItemIndex,
+            "iteration" => match tokens.dotted() {
+                Some("output") => ReferenceRoot::IterationOutput,
+                Some("previous") => ReferenceRoot::IterationPrevious,
+                Some("index") => ReferenceRoot::IterationIndex,
+                _ => {
+                    return Err(fail(
+                        "expected iteration.output, iteration.previous, or iteration.index",
+                    ));
+                }
+            },
+            _ => {
+                return Err(fail(
+                    "root must be inputs, steps, requirement, item, item_index, or iteration",
+                ));
+            }
         };
         let path = tokens
             .segments()
             .ok_or_else(|| fail("malformed selector"))?;
         if !path.is_empty()
-            && !matches!(root, ReferenceRoot::Input(_) | ReferenceRoot::StepOutput(_))
+            && !matches!(
+                root,
+                ReferenceRoot::Input(_)
+                    | ReferenceRoot::StepOutput(_)
+                    | ReferenceRoot::Item
+                    | ReferenceRoot::IterationOutput
+                    | ReferenceRoot::IterationPrevious
+            )
         {
-            return Err(fail("only inputs and step outputs accept child selectors"));
+            return Err(fail(
+                "only inputs, step outputs, item, and iteration outputs accept child selectors",
+            ));
         }
         Ok(Self { root, path })
     }
@@ -262,9 +304,10 @@ impl utoipa::ToSchema for SourceText {}
 /// Generated-schema description of a source declaration.
 /// The schema description of an authored scope reference.
 const REFERENCE_DESCRIPTION: &str = "Scope reference: inputs.<slot>, steps.<id>.output, \
-     steps.<id>.status, steps.<id>.requirements.<id>.outcome|reason, requirement.id, or \
-     requirement.statement, with .field, [n], and (in assert each) [*] selectors below inputs \
-     and step outputs; an Agent workspace source may also mount steps.<id>.publications or \
+     steps.<id>.status, steps.<id>.requirements.<id>.outcome|reason, requirement.id, \
+     requirement.statement, item, item_index, iteration.output, iteration.previous, or \
+     iteration.index, with .field, [n], and (in assert each) [*] selectors below inputs, step \
+     outputs, item, and iteration outputs; an Agent workspace source may also mount steps.<id>.publications or \
      steps.<id>.publications.<name>.";
 
 const SOURCE_DESCRIPTION: &str = "Group source reference: verifiers.<name>.inputs.<slot> or \
@@ -459,6 +502,11 @@ impl fmt::Display for Reference {
             }
             ReferenceRoot::RequirementId => f.write_str("requirement.id")?,
             ReferenceRoot::RequirementStatement => f.write_str("requirement.statement")?,
+            ReferenceRoot::Item => f.write_str("item")?,
+            ReferenceRoot::ItemIndex => f.write_str("item_index")?,
+            ReferenceRoot::IterationOutput => f.write_str("iteration.output")?,
+            ReferenceRoot::IterationPrevious => f.write_str("iteration.previous")?,
+            ReferenceRoot::IterationIndex => f.write_str("iteration.index")?,
         }
         for segment in &self.path {
             match segment {
@@ -685,6 +733,12 @@ mod tests {
             "steps.review.publications.report_1",
             "requirement.id",
             "requirement.statement",
+            "item",
+            "item.sections[0].title",
+            "item_index",
+            "iteration.output.done",
+            "iteration.previous",
+            "iteration.index",
         ] {
             let reference = Reference::parse(text).expect(text);
             assert_eq!(reference.to_string(), text);
@@ -721,6 +775,10 @@ mod tests {
             "steps.a.publications.report[0]",
             "requirement.statement.x",
             "requirement.other",
+            "item_index.x",
+            "iteration",
+            "iteration.next",
+            "iteration.index.x",
             "inputs.a.",
             "inputs.a[]",
             "inputs.a[x]",

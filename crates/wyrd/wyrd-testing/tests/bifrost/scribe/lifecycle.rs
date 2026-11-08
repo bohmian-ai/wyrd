@@ -13,6 +13,7 @@ use vala_bifrost_redux::scribe::persistence::PersistenceFaults;
 use vala_verify::blocks::Checkpoints as _;
 use wyrd_server::verification::state::{RunState, StateError, revision_fence};
 use wyrd_spec::verification::TaskId;
+use wyrd_spec::verification::execution::Producer;
 use wyrd_spec::verification::state::ExecutionState;
 use wyrd_testing::WyrdTestServer;
 use wyrd_testing::bifrost::{BifrostClusterSpec, WyrdTestCluster};
@@ -679,7 +680,7 @@ async fn execution_recovery_requires_exact_accepted_state() {
     let first = first.expect("a fresh execution's state claims");
     for step in ["review", "judge"] {
         first
-            .begin(&TaskId::new(step).expect("task"), 1)
+            .begin(&Producer::plain(&TaskId::new(step).expect("task"), 1))
             .await
             .expect("the revision is accepted");
     }
@@ -765,7 +766,7 @@ async fn execution_takeover_rejects_late_writes_after_replay() {
         .expect("the execution is claimable");
     let replaced = replaced.expect("a fresh execution's state claims");
     replaced
-        .begin(&TaskId::new("review").expect("task"), 1)
+        .begin(&Producer::plain(&TaskId::new("review").expect("task"), 1))
         .await
         .expect("A's first revision is accepted");
 
@@ -778,11 +779,11 @@ async fn execution_takeover_rejects_late_writes_after_replay() {
         "B inherits the progress accepted before its takeover"
     );
     current
-        .begin(&TaskId::new("judge").expect("task"), 1)
+        .begin(&Producer::plain(&TaskId::new("judge").expect("task"), 1))
         .await
         .expect("B's revision is accepted");
     replaced
-        .begin(&TaskId::new("late").expect("task"), 1)
+        .begin(&Producer::plain(&TaskId::new("late").expect("task"), 1))
         .await
         .expect_err("the replaced writer cannot take B's revision");
     let accepted = current.snapshot().await;

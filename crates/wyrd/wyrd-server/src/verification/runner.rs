@@ -829,17 +829,8 @@ impl VerifierRunner {
                 ));
             }
         };
-        let recorded = state.snapshot().await.invocations;
-        let engine = engine.with_checkpoints(
-            Arc::clone(state) as Arc<dyn Checkpoints>,
-            recorded.into_iter().map(|record| {
-                (
-                    record.producer.step_id,
-                    record.producer.attempt,
-                    record.settlement,
-                )
-            }),
-        );
+        let recorded = state.snapshot().await;
+        let engine = engine.with_checkpoints(Arc::clone(state) as Arc<dyn Checkpoints>, &recorded);
         match engine
             .run(Arc::clone(spec), evidence, state.deadline())
             .await
@@ -1352,9 +1343,20 @@ impl VerifierRunner {
         abandon: &CancellationToken,
     ) -> bool {
         let started = Instant::now();
-        // `remaining` was read by the claim statement, which began after
-        // `loaded.0`; target loading and handoff spend it.
-        let deadline = tokio::time::Instant::from_std(loaded.0) + run.remaining;
+        // `remaining` and `age` were read by the claim statement, which
+        // began after `loaded.0`; target loading and handoff spend them. The
+        // Verifier's `limits.timeout_seconds` counts from admission, so queue
+        // and retry waits spend it and a reclaim never replenishes it.
+        let claimed = tokio::time::Instant::from_std(loaded.0);
+        let mut deadline = claimed + run.remaining;
+        if let Some(seconds) = verifier
+            .as_ref()
+            .ok()
+            .and_then(|target| target.spec.limits.as_ref()?.timeout_seconds)
+        {
+            let limit = Duration::from_secs(u64::from(seconds)).saturating_sub(run.age);
+            deadline = deadline.min(claimed + limit);
+        }
         let telemetry = ExecutionTelemetry::start(ExecutionMode::Queued, Some(loaded.0));
         telemetry.record_phase(Phase::Load, loaded.0, loaded.1);
         let origin = run.origin.as_str();

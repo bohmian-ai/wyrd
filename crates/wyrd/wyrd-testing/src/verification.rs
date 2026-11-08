@@ -697,9 +697,13 @@ impl VerificationFixture {
         let mut steps: Vec<&str> = Vec::new();
         for (step, ..) in publications {
             if !steps.contains(step) {
-                run.begin(&TaskId::new(*step).map_err(|e| refused(&e))?, 1)
-                    .await
-                    .map_err(|e| refused(&e))?;
+                let producer = Producer {
+                    step_id: TaskId::new(*step).map_err(|e| refused(&e))?,
+                    item_index: None,
+                    iteration_index: None,
+                    attempt: 1,
+                };
+                run.begin(&producer).await.map_err(|e| refused(&e))?;
                 steps.push(step);
             }
         }

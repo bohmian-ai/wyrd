@@ -451,12 +451,7 @@ impl ActionExecutor for AgentExecutor {
         let Action::Agent(agent) = call.block else {
             return Err(terminal("the Agent executor runs only Agent actions"));
         };
-        let producer = Producer {
-            step_id: call.id.clone(),
-            item_index: None,
-            iteration_index: None,
-            attempt: call.attempt,
-        };
+        let producer = call.producer();
         let invoked = self
             .invoke(
                 call.id,

@@ -307,6 +307,8 @@ async fn artifact_evidence_and_code_reach_every_consumer() {
             workspace: BTreeMap::new(),
             deadline: Instant::now() + Duration::from_secs(30),
             attempt: 1,
+            item_index: None,
+            iteration_index: None,
         },
     )
     .await
@@ -835,6 +837,8 @@ async fn recovered_authority_bounds_every_agent_tool() {
                 )]),
                 deadline: Instant::now() + Duration::from_secs(60),
                 attempt: 1,
+                item_index: None,
+                iteration_index: None,
             },
         )
         .await
@@ -879,6 +883,8 @@ async fn recovered_authority_bounds_every_agent_tool() {
             workspace: BTreeMap::new(),
             deadline: Instant::now() + Duration::from_secs(60),
             attempt: 1,
+            item_index: None,
+            iteration_index: None,
         },
     )
     .await
@@ -1088,6 +1094,8 @@ async fn capacity_refusal_is_busy_at_every_hosted_consumer() {
                 workspace: BTreeMap::new(),
                 deadline: far,
                 attempt: 1,
+                item_index: None,
+                iteration_index: None,
             },
         )
     };
@@ -1107,6 +1115,8 @@ async fn capacity_refusal_is_busy_at_every_hosted_consumer() {
                 workspace: BTreeMap::new(),
                 deadline: far,
                 attempt: 1,
+                item_index: None,
+                iteration_index: None,
             },
         )
         .await
@@ -1150,6 +1160,8 @@ async fn capacity_refusal_is_busy_at_every_hosted_consumer() {
                     workspace: notes_workspace(registered),
                     deadline: Instant::now() + Duration::from_secs(30),
                     attempt: 1,
+                    item_index: None,
+                    iteration_index: None,
                 },
             )
             .await

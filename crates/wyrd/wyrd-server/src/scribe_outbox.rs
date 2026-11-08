@@ -2086,6 +2086,8 @@ mod tests {
             requirements: vec![RequirementResult {
                 id: TaskId::new("drift").expect("task id"),
                 step: None,
+                item_index: None,
+                iteration_index: None,
                 statement: "drift".to_owned(),
                 outcome: RequirementOutcome::Failed,
                 reason: "x".repeat(reason_bytes),
@@ -2453,6 +2455,8 @@ mod tests {
         let requirement = RequirementResult {
             id: TaskId::new("judge").expect("task id"),
             step: None,
+            item_index: None,
+            iteration_index: None,
             statement: "judge".to_owned(),
             outcome: RequirementOutcome::Passed,
             reason: "r".repeat(value),

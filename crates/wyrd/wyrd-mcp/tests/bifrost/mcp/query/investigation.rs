@@ -149,6 +149,8 @@ impl EvidenceInvestigation {
                 requirements: vec![RequirementResult {
                     id: TaskId::new(id)?,
                     step: None,
+                    item_index: None,
+                    iteration_index: None,
                     statement: statement.to_owned(),
                     outcome: RequirementOutcome::Failed,
                     reason: "seeded failure".to_owned(),

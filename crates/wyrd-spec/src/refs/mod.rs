@@ -677,6 +677,7 @@ mod completeness_tests {
     fn agent_verifier() -> VerifierSpec {
         VerifierSpec {
             description: None,
+            limits: None,
             inputs: BTreeMap::new(),
             steps: Vec::new(),
             requirements: vec![Requirement {

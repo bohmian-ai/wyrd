@@ -320,6 +320,8 @@ async fn step(
             workspace: BTreeMap::new(),
             deadline: Instant::now() + Duration::from_secs(30),
             attempt: 1,
+            item_index: None,
+            iteration_index: None,
         },
     )
     .await
@@ -346,6 +348,8 @@ async fn check(
             workspace: BTreeMap::new(),
             deadline: Instant::now() + Duration::from_secs(30),
             attempt: 1,
+            item_index: None,
+            iteration_index: None,
         },
     )
     .await
@@ -1025,6 +1029,8 @@ async fn check_agent_reads_its_workspace_through_declared_tools() {
             )]),
             deadline: Instant::now() + Duration::from_secs(30),
             attempt: 1,
+            item_index: None,
+            iteration_index: None,
         },
     )
     .await

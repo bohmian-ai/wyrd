@@ -129,6 +129,8 @@ fn drift_outcome(report: Option<DriftReport>) -> Result<VerificationOutcome, Ser
         requirements: vec![RequirementResult {
             id: TaskId::new("drift")?,
             step: None,
+            item_index: None,
+            iteration_index: None,
             statement: "The window does not drift.".to_owned(),
             outcome,
             reason: "scored by the journey".to_owned(),

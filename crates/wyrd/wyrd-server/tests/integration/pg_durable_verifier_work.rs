@@ -1314,7 +1314,7 @@ async fn cancelled_work_keeps_checkpoints_and_fences_stale_writes() {
 
     leased
         .run
-        .begin(&task, 1)
+        .begin(&Producer::plain(&task, 1))
         .await
         .expect("the checkpoint is accepted");
     publications
@@ -1348,7 +1348,7 @@ async fn cancelled_work_keeps_checkpoints_and_fences_stale_writes() {
     tx.commit().await.expect("the cancel commits");
     leased
         .run
-        .begin(&task, 2)
+        .begin(&Producer::plain(&task, 2))
         .await
         .expect_err("a cancelled lease checkpoints nothing");
     let mut tx = conn().await;
@@ -1477,13 +1477,10 @@ fn agent_engine(
     )
     .with_checkpoints(
         Arc::clone(run) as Arc<dyn Checkpoints>,
-        recorded.into_iter().map(|record| {
-            (
-                record.producer.step_id,
-                record.producer.attempt,
-                record.settlement,
-            )
-        }),
+        &ExecutionState {
+            invocations: recorded,
+            ..ExecutionState::default()
+        },
     )
 }
 
@@ -2132,13 +2129,13 @@ async fn invocations_resume_from_bifrost_with_original_bounds() {
     for step in ["review", "judge", "refused"] {
         leased
             .run
-            .begin(&task(step), 1)
+            .begin(&Producer::plain(&task(step), 1))
             .await
             .expect("the attempt is accepted");
     }
     leased
         .run
-        .forget(&task("refused"), 1)
+        .forget(&Producer::plain(&task("refused"), 1))
         .await
         .expect("the attempt refused capacity is forgotten");
     let deadline = leased.deadline().await;
@@ -2149,7 +2146,7 @@ async fn invocations_resume_from_bifrost_with_original_bounds() {
         [("review".to_owned(), 1), ("judge".to_owned(), 1)]
     );
     current
-        .begin(&task("judge"), 2)
+        .begin(&Producer::plain(&task("judge"), 2))
         .await
         .expect("the interrupted attempt retries as its next attempt");
     assert_eq!(
@@ -2205,7 +2202,7 @@ async fn publications_recover_exact_descriptors_from_run_state() {
     let task = TaskId::new("review").expect("task");
     leased
         .run
-        .begin(&task, 1)
+        .begin(&Producer::plain(&task, 1))
         .await
         .expect("the attempt begins");
     let producer = Producer {
@@ -2296,7 +2293,7 @@ async fn terminal_selection_and_inspection_use_run_state() {
     let task = TaskId::new("review").expect("task");
     leased
         .run
-        .begin(&task, 1)
+        .begin(&Producer::plain(&task, 1))
         .await
         .expect("the attempt begins");
     let producer = Producer {
@@ -3168,7 +3165,8 @@ async fn batched_checkpoints_recover_exactly_the_accepted_batch() {
     let task = |id: &str| TaskId::new(id).expect("task");
     let (factual, sensitive, combine) = (task("factual"), task("sensitive"), task("combine"));
 
-    let mut factual_started = Box::pin(first.begin(&factual, 1));
+    let factual_attempt = Producer::plain(&factual, 1);
+    let mut factual_started = Box::pin(first.begin(&factual_attempt));
     tokio::time::timeout(std::time::Duration::from_secs(10), async {
         tokio::select! {
             started = &mut factual_started => panic!("returned while held: {started:?}"),
@@ -3177,7 +3175,8 @@ async fn batched_checkpoints_recover_exactly_the_accepted_batch() {
     })
     .await
     .expect("the factual revision reaches Scribe");
-    let mut sensitive_started = Box::pin(first.begin(&sensitive, 1));
+    let sensitive_attempt = Producer::plain(&sensitive, 1);
+    let mut sensitive_started = Box::pin(first.begin(&sensitive_attempt));
     assert!(
         pending(&mut sensitive_started).await,
         "the held revision does not hold the sensitive check"
@@ -3201,7 +3200,7 @@ async fn batched_checkpoints_recover_exactly_the_accepted_batch() {
         [("factual".to_owned(), 1)]
     );
     assert!(
-        first.begin(&combine, 1).await.is_err(),
+        first.begin(&Producer::plain(&combine, 1)).await.is_err(),
         "the replaced writer's batch is refused"
     );
     assert_eq!(
@@ -3209,8 +3208,12 @@ async fn batched_checkpoints_recover_exactly_the_accepted_batch() {
         [("factual".to_owned(), 1)]
     );
 
-    let (sensitive_started, combine_started) =
-        tokio::join!(current.begin(&sensitive, 1), current.begin(&combine, 1));
+    let (sensitive_attempt, combine_attempt) =
+        (Producer::plain(&sensitive, 1), Producer::plain(&combine, 1));
+    let (sensitive_started, combine_started) = tokio::join!(
+        current.begin(&sensitive_attempt),
+        current.begin(&combine_attempt)
+    );
     sensitive_started.expect("the sensitive check is accepted");
     combine_started.expect("the combination is accepted");
     assert_eq!(
@@ -3747,13 +3750,10 @@ async fn concurrent_settlements_release_their_hosted_dependent() {
             .expect("the engine builds")
             .with_checkpoints(
                 Arc::clone(state) as Arc<dyn Checkpoints>,
-                recorded.into_iter().map(|record| {
-                    (
-                        record.producer.step_id,
-                        record.producer.attempt,
-                        record.settlement,
-                    )
-                }),
+                &ExecutionState {
+                    invocations: recorded,
+                    ..ExecutionState::default()
+                },
             )
             .run(
                 Arc::clone(&spec),

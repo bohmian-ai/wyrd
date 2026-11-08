@@ -129,7 +129,14 @@ impl Workspaces {
                 }
                 CallValue::Publications { step, collection } => {
                     let mut manifest = collection.clone();
-                    for publication in evidence.publications(step).await? {
+                    // A withheld speculative contribution mounts no content:
+                    // only its status, disposition, and attempts.
+                    let admitted = if collection.speculation.admits() {
+                        evidence.publications(step).await?
+                    } else {
+                        Vec::new()
+                    };
+                    for publication in admitted {
                         let relative = format!(
                             "content/{}/{}",
                             segment(&publication.publication.producer),

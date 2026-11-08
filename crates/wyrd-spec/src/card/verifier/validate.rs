@@ -14,8 +14,8 @@ use super::extract::ExtractOutput;
 use super::reference::{OrderBy, Reference, ReferenceRoot, SourceField};
 use super::schema_path::{admits, fits};
 use super::{
-    Action, AgentCall, Check, CheckEvidence, CodeCall, CodeSource, Condition, Decide, DriftCheck,
-    InputSlot, MAX_STEP_RETRIES, Requirement, Step, VerifierSpec, WorkspaceSource,
+    Action, AgentCall, Check, CheckEvidence, CodeCall, CodeSource, Condition, Decide, DependsOn,
+    DriftCheck, InputSlot, MAX_STEP_RETRIES, Requirement, Step, VerifierSpec, WorkspaceSource,
 };
 use crate::card::agent::{AgentSpec, BuiltinTool};
 use crate::card::drift::DriftSignal;
@@ -39,12 +39,23 @@ pub struct ResolvedAgent<'a> {
 /// Where a reference or Agent call appears.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Position<'a> {
-    /// A step action or `when` of the named step.
+    /// A step action of the named step, bound once per invocation.
     Step(&'a TaskId),
+    /// A step's `when` or `foreach.items`, resolved once before expansion.
+    Gate(&'a TaskId),
+    /// A step's `repeat.until`, resolved after each iteration settles.
+    Until(&'a TaskId),
     /// A requirement check on the named step.
     StepCheck(&'a TaskId),
     /// A whole-Verifier requirement check.
     VerifierCheck,
+}
+
+impl Position<'_> {
+    /// Whether the position binds step-side values rather than a check's.
+    const fn is_step(self) -> bool {
+        matches!(self, Self::Step(_) | Self::Gate(_) | Self::Until(_))
+    }
 }
 
 /// Builds the structured refusal for one violated rule.
@@ -98,7 +109,8 @@ impl VerifierSpec {
     }
 
     /// Plans step stages from `depends_on` plus every step reference in each
-    /// step's action and `when`.
+    /// step's action, `when`, `foreach.items`, and `repeat.until`, so every
+    /// possible edge, speculative conditions included, is checked for cycles.
     ///
     /// # Errors
     /// Returns [`WyrdError::Validation`] for an unknown step, self
@@ -121,8 +133,9 @@ impl VerifierSpec {
         self.steps
             .iter()
             .map(|step| {
-                let mut deps: BTreeSet<&TaskId> = step.depends_on.iter().collect();
-                deps.extend(step_references(step).filter_map(Reference::step));
+                let mut deps = step.prerequisites();
+                deps.extend(step.depends_on.steps());
+                deps.extend(step.guard_steps());
                 (&step.id, deps)
             })
             .collect()
@@ -164,8 +177,54 @@ impl VerifierSpec {
     }
 }
 
-/// Every reference in a step's action and `when`.
-fn step_references(step: &Step) -> impl Iterator<Item = &Reference> {
+impl Step {
+    /// The steps that must be complete before this step can start: every
+    /// list `depends_on` entry and every step its action, `foreach.items`,
+    /// `repeat.until` (other than itself), and non-speculative `when` read.
+    ///
+    /// `any_succeeded` candidates and a speculative step's guard steps are
+    /// not prerequisites; [`Self::guard_steps`] returns the latter.
+    #[must_use]
+    pub fn prerequisites(&self) -> BTreeSet<&TaskId> {
+        let mut deps: BTreeSet<&TaskId> = match &self.depends_on {
+            DependsOn::After(steps) => steps.iter().collect(),
+            DependsOn::AnySucceeded { .. } => BTreeSet::new(),
+        };
+        let when = self.when.iter().filter(|_| !self.speculative);
+        deps.extend(
+            action_references(self)
+                .chain(when.map(|when| &when.path))
+                .chain(
+                    self.foreach
+                        .as_ref()
+                        .and_then(|foreach| foreach.items.as_ref()),
+                )
+                .filter_map(Reference::step),
+        );
+        // `until` may read its own step's requirement verdicts.
+        deps.extend(
+            self.repeat
+                .iter()
+                .filter_map(|repeat| repeat.until.path.step())
+                .filter(|own| **own != self.id),
+        );
+        deps
+    }
+
+    /// The steps a speculative step's `when` reads, whose completion decides
+    /// its disposition; empty for an ordinary step.
+    #[must_use]
+    pub fn guard_steps(&self) -> BTreeSet<&TaskId> {
+        self.when
+            .iter()
+            .filter(|_| self.speculative)
+            .filter_map(|when| when.path.step())
+            .collect()
+    }
+}
+
+/// Every reference a step's action binds.
+fn action_references(step: &Step) -> std::vec::IntoIter<&Reference> {
     let action: Vec<&Reference> = match &step.action {
         Action::Extract { from } => vec![from],
         Action::Agent(call) => call
@@ -179,9 +238,7 @@ fn step_references(step: &Step) -> impl Iterator<Item = &Reference> {
             .collect(),
         Action::Code(call) => call.inputs.values().collect(),
     };
-    action
-        .into_iter()
-        .chain(step.when.as_ref().map(|when| &when.path))
+    action.into_iter()
 }
 
 /// One validation pass with its resolver and derived lookups.
@@ -214,6 +271,20 @@ where
             validate_order(spec, order)?;
         }
         self.validate_evidence_mode()?;
+        if let Some(limits) = &spec.limits {
+            let fields = [
+                ("concurrency", limits.concurrency),
+                ("max_agent_invocations", limits.max_agent_invocations),
+                ("timeout_seconds", limits.timeout_seconds),
+            ];
+            if let Some((field, _)) = fields.into_iter().find(|(_, value)| *value == Some(0)) {
+                return Err(invalid(
+                    "limits",
+                    &format!("limits.{field}"),
+                    "limits must be positive",
+                ));
+            }
+        }
         if let Decide::PassRate { threshold } = spec.decide
             && !(threshold.is_finite() && threshold > 0.0 && threshold <= 1.0)
         {
@@ -316,16 +387,41 @@ where
                 format!("at most {MAX_STEP_RETRIES} retries"),
             ));
         }
-        for dep in &step.depends_on {
+        let depends_path = format!("{path}.depends_on");
+        if let DependsOn::AnySucceeded { any_succeeded } = &step.depends_on {
+            if any_succeeded.is_empty() {
+                return Err(invalid(
+                    "depends_on",
+                    &depends_path,
+                    "any_succeeded names at least one step",
+                ));
+            }
+            if any_succeeded.iter().collect::<BTreeSet<_>>().len() != any_succeeded.len() {
+                return Err(invalid(
+                    "depends_on",
+                    &depends_path,
+                    "any_succeeded names each step once",
+                ));
+            }
+        }
+        for dep in step.depends_on.steps() {
             if !self.spec.steps.iter().any(|other| &other.id == dep) {
                 return Err(invalid(
                     "unknown_reference",
-                    &format!("{path}.depends_on"),
+                    &depends_path,
                     format!("unknown step {}", dep.as_str()),
                 ));
             }
         }
+        if step.speculative && step.when.is_none() {
+            return Err(invalid(
+                "speculative",
+                &format!("{path}.speculative"),
+                "a speculative step declares the when that admits it",
+            ));
+        }
         let position = Position::Step(&step.id);
+        let gate = Position::Gate(&step.id);
         if let Some(Condition {
             path: when,
             operator,
@@ -333,8 +429,63 @@ where
         }) = &step.when
         {
             let when_path = format!("{path}.when");
-            self.validate_reference(when, position, false, false, &when_path)?;
+            self.validate_reference(when, gate, false, false, &when_path)?;
             validate_operator(operator, &when_path)?;
+        }
+        if let Some(foreach) = &step.foreach {
+            let foreach_path = format!("{path}.foreach");
+            let refuse = |field: &str, message: &str| {
+                let at = if field.is_empty() {
+                    foreach_path.clone()
+                } else {
+                    format!("{foreach_path}.{field}")
+                };
+                Err(invalid("foreach", &at, message))
+            };
+            match (&foreach.count, &foreach.items, foreach.max_items) {
+                (Some(_), Some(_), _) | (None, None, _) => {
+                    return refuse("", "set exactly one of count or items");
+                }
+                (Some(0), None, _) => return refuse("count", "count must be positive"),
+                (Some(_), None, Some(_)) => {
+                    return refuse("max_items", "max_items bounds items only");
+                }
+                (None, Some(_), None | Some(0)) => {
+                    return refuse("max_items", "items requires a positive max_items");
+                }
+                _ => {}
+            }
+            if foreach.concurrency == Some(0) {
+                return refuse("concurrency", "concurrency must be positive");
+            }
+            if let Some(items) = &foreach.items {
+                self.validate_reference(
+                    items,
+                    gate,
+                    false,
+                    false,
+                    &format!("{foreach_path}.items"),
+                )?;
+            }
+        }
+        if let Some(repeat) = &step.repeat {
+            let repeat_path = format!("{path}.repeat");
+            if repeat.max_iterations == 0 {
+                return Err(invalid(
+                    "repeat",
+                    &format!("{repeat_path}.max_iterations"),
+                    "max_iterations must be positive",
+                ));
+            }
+            let until_path = format!("{repeat_path}.until");
+            self.validate_reference(
+                &repeat.until.path,
+                Position::Until(&step.id),
+                false,
+                false,
+                &until_path,
+            )?;
+            validate_operator(&repeat.until.operator, &until_path)?;
         }
         let action_path = format!("{path}.action");
         match &step.action {
@@ -730,10 +881,46 @@ where
                 Ok(())
             }
             ReferenceRoot::RequirementId | ReferenceRoot::RequirementStatement => {
-                if matches!(position, Position::Step(_)) {
+                if position.is_step() {
                     return refuse(
                         "requirement_position",
                         "requirement.* is readable only in checks",
+                    );
+                }
+                Ok(())
+            }
+            ReferenceRoot::Item | ReferenceRoot::ItemIndex => {
+                let foreach = self
+                    .own_step(position)
+                    .and_then(|step| step.foreach.as_ref());
+                let readable = match (&reference.root, foreach) {
+                    (ReferenceRoot::Item, Some(foreach)) => foreach.items.is_some(),
+                    (_, foreach) => foreach.is_some(),
+                };
+                if !readable || matches!(position, Position::Gate(_)) {
+                    return refuse(
+                        "item_position",
+                        "item is readable only by an items fanout step, and item_index by a fanout step, inside its own invocations",
+                    );
+                }
+                Ok(())
+            }
+            ReferenceRoot::IterationOutput
+            | ReferenceRoot::IterationPrevious
+            | ReferenceRoot::IterationIndex => {
+                let repeated = self
+                    .own_step(position)
+                    .is_some_and(|step| step.repeat.is_some());
+                let output = matches!(reference.root, ReferenceRoot::IterationOutput);
+                let placed = match position {
+                    Position::Until(_) => true,
+                    Position::Step(_) | Position::StepCheck(_) => !output,
+                    Position::Gate(_) | Position::VerifierCheck => false,
+                };
+                if !repeated || !placed {
+                    return refuse(
+                        "iteration_position",
+                        "iteration.* is readable only inside a repeat step's own invocations, and iteration.output only by its until",
                     );
                 }
                 Ok(())
@@ -755,11 +942,31 @@ where
                         "only an Agent step publishes named content",
                     );
                 }
+                let selects_member = matches!(
+                    reference.root,
+                    ReferenceRoot::StepPublications { name: Some(_), .. }
+                        | ReferenceRoot::StepVerdict { .. }
+                );
+                if selects_member && target.foreach.is_some() && Some(step) != self.own(position) {
+                    return refuse(
+                        "fanout_member",
+                        "a fanout step has one member per item; mount steps.<id>.publications and read its manifest",
+                    );
+                }
+                if let Position::Until(own) = position
+                    && step == own
+                    && !matches!(reference.root, ReferenceRoot::StepVerdict { .. })
+                {
+                    return refuse(
+                        "step_position",
+                        "until reads its own iteration through iteration.output and its own step only through requirement verdicts",
+                    );
+                }
                 if let ReferenceRoot::StepVerdict { requirement, .. } = &reference.root {
                     if self.owners.get(requirement) != Some(&step) {
                         return refuse("unknown_reference", "the step has no such requirement");
                     }
-                    if !matches!(position, Position::Step(_)) {
+                    if !position.is_step() {
                         return refuse(
                             "verdict_position",
                             "checks cannot read requirement verdicts",
@@ -787,6 +994,23 @@ where
                 Ok(())
             }
         }
+    }
+
+    /// The step whose own invocations `position` belongs to, if any.
+    fn own(&self, position: Position<'a>) -> Option<&'a TaskId> {
+        match position {
+            Position::Step(own)
+            | Position::Gate(own)
+            | Position::Until(own)
+            | Position::StepCheck(own) => Some(own),
+            Position::VerifierCheck => None,
+        }
+    }
+
+    /// The declared step whose own invocations `position` belongs to.
+    fn own_step(&self, position: Position<'a>) -> Option<&'a Step> {
+        let own = self.own(position)?;
+        self.spec.steps.iter().find(|step| &step.id == own)
     }
 
     /// Returns the slot a reference names when it selects the whole slot.
@@ -2414,5 +2638,224 @@ mod tests {
             });
             assert_eq!(outcome.is_ok(), valid, "{selector}: {outcome:?}");
         }
+    }
+
+    /// A code action reading `inputs`.
+    fn code(inputs: Value) -> Value {
+        json!({"kind": "code", "entrypoint": "run", "source": {"inline": "def run(**kw):\n    return kw"}, "inputs": inputs})
+    }
+
+    /// A Verifier whose `review` step reads the `sections` array of its JSON
+    /// input, with `step` merged into the `review` step.
+    fn controlled(step: Value) -> Value {
+        let mut review = json!({"id": "review", "action": code(json!({}))});
+        for (key, value) in step.as_object().expect("step fields") {
+            review[key] = value.clone();
+        }
+        json!({
+            "inputs": {"doc": {"type": "json", "schema": {"type": "object", "additionalProperties": false,
+                "properties": {"sections": {"type": "array"}, "flag": {"type": "boolean"}}}}},
+            "steps": [{"id": "split", "action": code(json!({"doc": "inputs.doc"}))}, review],
+            "requirements": [{"id": "done", "statement": "done",
+                "check": {"kind": "assert", "path": "steps.review.status", "operator": "equals", "expected": "succeeded"}}]
+        })
+    }
+
+    /// Returns the `rule` and `path` of a refusal.
+    ///
+    /// # Panics
+    /// Panics when validation succeeds or the refusal carries no rule/path.
+    fn refusal(body: &Value) -> (String, String) {
+        match parse(body).validate() {
+            Err(WyrdError::Validation { details, .. }) => (
+                details["rule"].as_str().expect("rule").to_owned(),
+                details["path"].as_str().expect("path").to_owned(),
+            ),
+            other => panic!("expected a validation refusal for {body}, got {other:?}"),
+        }
+    }
+
+    /// Fanout, repetition, speculation, `any_succeeded`, and limits accept
+    /// their documented shapes and refuse every other one at its own field,
+    /// including cycles through `any_succeeded` and speculative conditions.
+    ///
+    /// # Panics
+    /// Panics when a valid declaration is refused or an invalid one is
+    /// accepted or refused under another rule or path.
+    #[test]
+    fn step_controls_refuse_invalid_shapes() {
+        let until =
+            json!({"path": "iteration.output.done", "operator": "equals", "expected": true});
+        let flag =
+            json!({"path": "steps.split.output.flag", "operator": "equals", "expected": true});
+        let valid = [
+            controlled(json!({"foreach": {"count": 3}})),
+            controlled(
+                json!({"foreach": {"count": 3, "concurrency": 1}, "action": code(json!({"i": "item_index"}))}),
+            ),
+            controlled(
+                json!({"foreach": {"items": "inputs.doc.sections", "max_items": 10},
+                "action": code(json!({"item": "item.title", "i": "item_index"}))}),
+            ),
+            controlled(json!({"repeat": {"max_iterations": 3, "until": until},
+                "action": code(json!({"previous": "iteration.previous", "i": "iteration.index"}))})),
+            controlled(
+                json!({"foreach": {"count": 2}, "repeat": {"max_iterations": 2, "until": until}}),
+            ),
+            controlled(json!({"depends_on": {"any_succeeded": ["split"]}})),
+            controlled(json!({"when": flag, "speculative": true})),
+            with(
+                controlled(json!({})),
+                "/limits",
+                json!({"concurrency": 2, "max_agent_invocations": 5, "timeout_seconds": 60}),
+            ),
+        ];
+        for body in valid {
+            parse(&body)
+                .validate()
+                .unwrap_or_else(|error| panic!("{body}: {error}"));
+        }
+        let invalid = [
+            (json!({"foreach": {}}), "foreach", "steps[1].foreach"),
+            (
+                json!({"foreach": {"count": 0}}),
+                "foreach",
+                "steps[1].foreach.count",
+            ),
+            (
+                json!({"foreach": {"count": 2, "items": "inputs.doc.sections", "max_items": 3}}),
+                "foreach",
+                "steps[1].foreach",
+            ),
+            (
+                json!({"foreach": {"items": "inputs.doc.sections"}}),
+                "foreach",
+                "steps[1].foreach.max_items",
+            ),
+            (
+                json!({"foreach": {"items": "inputs.doc.sections", "max_items": 0}}),
+                "foreach",
+                "steps[1].foreach.max_items",
+            ),
+            (
+                json!({"foreach": {"count": 2, "max_items": 3}}),
+                "foreach",
+                "steps[1].foreach.max_items",
+            ),
+            (
+                json!({"foreach": {"count": 2, "concurrency": 0}}),
+                "foreach",
+                "steps[1].foreach.concurrency",
+            ),
+            (
+                json!({"foreach": {"items": "inputs.nope", "max_items": 3}}),
+                "unknown_reference",
+                "steps[1].foreach.items",
+            ),
+            (
+                json!({"foreach": {"items": "inputs.doc.missing", "max_items": 3}}),
+                "missing_field",
+                "steps[1].foreach.items",
+            ),
+            (
+                json!({"repeat": {"max_iterations": 0, "until": until}}),
+                "repeat",
+                "steps[1].repeat.max_iterations",
+            ),
+            (
+                json!({"repeat": {"max_iterations": 2, "until": {"path": "inputs.nope", "operator": "equals", "expected": true}}}),
+                "unknown_reference",
+                "steps[1].repeat.until",
+            ),
+            (
+                json!({"speculative": true}),
+                "speculative",
+                "steps[1].speculative",
+            ),
+            (
+                json!({"depends_on": {"any_succeeded": []}}),
+                "depends_on",
+                "steps[1].depends_on",
+            ),
+            (
+                json!({"depends_on": {"any_succeeded": ["split", "split"]}}),
+                "depends_on",
+                "steps[1].depends_on",
+            ),
+            (
+                json!({"depends_on": {"any_succeeded": ["nope"]}}),
+                "unknown_reference",
+                "steps[1].depends_on",
+            ),
+            (
+                json!({"action": code(json!({"item": "item"}))}),
+                "item_position",
+                "steps[1].action",
+            ),
+            (
+                json!({"foreach": {"count": 2}, "action": code(json!({"item": "item"}))}),
+                "item_position",
+                "steps[1].action",
+            ),
+            (
+                json!({"action": code(json!({"i": "item_index"}))}),
+                "item_position",
+                "steps[1].action",
+            ),
+            (
+                json!({"action": code(json!({"i": "iteration.index"}))}),
+                "iteration_position",
+                "steps[1].action",
+            ),
+            (
+                json!({"repeat": {"max_iterations": 2, "until": until}, "action": code(json!({"out": "iteration.output"}))}),
+                "iteration_position",
+                "steps[1].action",
+            ),
+        ];
+        for (step, rule, path) in invalid {
+            let body = controlled(step);
+            assert_eq!(refusal(&body), (rule.to_owned(), path.to_owned()), "{body}");
+        }
+        let limits = with(controlled(json!({})), "/limits", json!({"concurrency": 0}));
+        assert_eq!(
+            refusal(&limits),
+            ("limits".to_owned(), "limits.concurrency".to_owned())
+        );
+        let any_cycle = with(
+            controlled(json!({"action": code(json!({"x": "steps.split.output"}))})),
+            "/steps/0/depends_on",
+            json!({"any_succeeded": ["review"]}),
+        );
+        assert_eq!(refusal(&any_cycle).0, "graph");
+        let guard_cycle = with(
+            controlled(json!({"action": code(json!({"x": "steps.split.output"}))})),
+            "/steps/0/when",
+            json!({"path": "steps.review.output.flag", "operator": "equals", "expected": true}),
+        );
+        let guard_cycle = with(guard_cycle, "/steps/0/speculative", json!(true));
+        assert_eq!(refusal(&guard_cycle).0, "graph");
+        let fanout_member = json!({
+            "steps": [
+                {"id": "review", "foreach": {"count": 2}, "action": {"kind": "agent", "agent": agent(&["publish"], json!("review"), None)}},
+                {"id": "consolidate", "action": {"kind": "agent", "agent": agent(&["fs.read"], json!("consolidate"), None),
+                    "workspace": {"/inputs/report": "steps.review.publications.report"}}}
+            ],
+            "requirements": [{"id": "done", "statement": "done",
+                "check": {"kind": "assert", "path": "steps.consolidate.status", "operator": "equals", "expected": "succeeded"}}]
+        });
+        assert_eq!(
+            refusal(&fanout_member),
+            ("fanout_member".to_owned(), "steps[1].action".to_owned())
+        );
+        let repeated_member = with(fanout_member, "/steps/0/foreach", Value::Null);
+        let repeated_member = with(
+            repeated_member,
+            "/steps/0/repeat",
+            json!({"max_iterations": 2, "until": {"path": "iteration.output", "operator": "equals", "expected": "done"}}),
+        );
+        parse(&repeated_member)
+            .validate()
+            .expect("a repeat's named member is its final iteration's");
     }
 }

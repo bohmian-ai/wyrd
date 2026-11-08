@@ -14,7 +14,10 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use super::execution::{InvocationSettlement, Producer, Publication, VerificationOutcome};
+use super::TaskId;
+use super::execution::{
+    InvocationSettlement, Producer, Publication, Speculation, VerificationOutcome,
+};
 use super::{VerificationError, VerificationExecutionStatus};
 use crate::auth::Sha256Hex;
 use crate::ids::{CardUid, GroupId, VerificationResultId};
@@ -25,9 +28,11 @@ use crate::storage::StoredObjectRef;
 ///
 /// A stored state of any other format is refused rather than reinterpreted,
 /// so a worker never resumes, or restarts as fresh, state it cannot read.
-/// Format 2 added the recorded identity and the terminal failure; format 1
-/// never left development and is refused.
-pub const EXECUTION_STATE_FORMAT: u32 = 2;
+/// Format 2 added the recorded identity and the terminal failure; format 3
+/// added the control records of fanout, repetition, and speculation, so a
+/// worker that cannot honour them refuses the state; format 1 never left
+/// development and is refused.
+pub const EXECUTION_STATE_FORMAT: u32 = 3;
 
 /// The complete recoverable state of one execution at one accepted revision.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
@@ -48,6 +53,10 @@ pub struct ExecutionState {
     pub invocations: Vec<InvocationRecord>,
     /// Every accepted publication, in sequence order.
     pub publications: Vec<AcceptedPublication>,
+    /// Every scheduling decision recovery must reproduce rather than make
+    /// again: frozen fanout items and settled speculative dispositions.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub controls: Vec<ControlRecord>,
     /// The selected terminal outcome, once the execution produced one.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub terminal: Option<TerminalSelection>,
@@ -99,6 +108,49 @@ pub struct InvocationRecord {
     /// The committed settlement; `None` while the attempt is unsettled.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub settlement: Option<InvocationSettlement>,
+}
+
+/// One recorded scheduling decision of an execution.
+///
+/// A decision is recorded before anything it releases runs, and never
+/// changes once recorded: recovery reads it back instead of deciding again.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum ControlRecord {
+    /// The complete ordered array an `items` fanout step expands, frozen
+    /// before its first item is dispatched.
+    Items {
+        /// The fanout step.
+        step: TaskId,
+        /// Every item, in original order.
+        items: Vec<Value>,
+    },
+    /// A speculative step's settled disposition.
+    Disposition {
+        /// The speculative step.
+        step: TaskId,
+        /// Admitted, discarded, or blocked.
+        speculation: Speculation,
+        /// Why the condition decided as it did.
+        reason: String,
+    },
+}
+
+impl ControlRecord {
+    /// The step this decision is about.
+    #[must_use]
+    pub const fn step(&self) -> &TaskId {
+        match self {
+            Self::Items { step, .. } | Self::Disposition { step, .. } => step,
+        }
+    }
+
+    /// Whether `other` is the same kind of decision about the same step, so
+    /// at most one of them may be recorded.
+    #[must_use]
+    pub fn decides_same(&self, other: &Self) -> bool {
+        self.step() == other.step() && std::mem::discriminant(self) == std::mem::discriminant(other)
+    }
 }
 
 /// One accepted publication and its private custody.

@@ -257,6 +257,14 @@ pub struct RequirementResult<T = Map<String, Value>> {
     /// Owning step of a step requirement.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub step: Option<TaskId>,
+    /// Zero-based fanout item of the owning step's invocation this instance
+    /// judged; absent without fanout.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub item_index: Option<u32>,
+    /// Zero-based repeat iteration of the owning step's invocation this
+    /// instance judged; absent without repeat.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub iteration_index: Option<u32>,
     /// The requirement statement.
     pub statement: String,
     /// The outcome.
@@ -447,6 +455,20 @@ pub struct Producer {
     pub attempt: u32,
 }
 
+impl Producer {
+    /// The one-based `attempt` of `step`, which neither fans out nor
+    /// repeats.
+    #[must_use]
+    pub fn plain(step: &TaskId, attempt: u32) -> Self {
+        Self {
+            step_id: step.clone(),
+            item_index: None,
+            iteration_index: None,
+            attempt,
+        }
+    }
+}
+
 /// One regular file a file or directory publication retains.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
@@ -552,6 +574,24 @@ pub struct PublicationCollection {
 pub enum Speculation {
     /// The step is not speculative.
     None,
+    /// The step ran before its condition resolved; its contribution is
+    /// withheld until the condition settles.
+    Pending,
+    /// The condition held; the contribution is admitted.
+    Admitted,
+    /// The condition was false; unfinished work was cancelled and the
+    /// contribution is excluded from ordinary consumers.
+    Discarded,
+    /// The condition could not be evaluated; nothing is admitted.
+    Blocked,
+}
+
+impl Speculation {
+    /// Whether ordinary consumers may read the step's contribution.
+    #[must_use]
+    pub const fn admits(self) -> bool {
+        matches!(self, Self::None | Self::Admitted)
+    }
 }
 
 /// One invocation attempt of a collection's producer step.
@@ -911,6 +951,8 @@ impl RequirementResult {
         Ok(RequirementResult {
             id: self.id,
             step: self.step,
+            item_index: self.item_index,
+            iteration_index: self.iteration_index,
             statement: self.statement,
             outcome: self.outcome,
             reason: self.reason,

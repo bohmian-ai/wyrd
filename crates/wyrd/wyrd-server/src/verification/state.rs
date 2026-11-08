@@ -43,8 +43,8 @@ use wyrd_spec::verification::execution::{
     InvocationSettlement, Producer, Publication, PublicationKind, VerificationOutcome,
 };
 use wyrd_spec::verification::state::{
-    AcceptedPublication, ExecutionIdentity, ExecutionState, ExecutionStateError, InvocationRecord,
-    TerminalFailure, TerminalSelection,
+    AcceptedPublication, ControlRecord, ExecutionIdentity, ExecutionState, ExecutionStateError,
+    InvocationRecord, TerminalFailure, TerminalSelection,
 };
 use wyrd_spec::verification::{VerificationError, VerificationExecutionStatus};
 
@@ -979,29 +979,19 @@ fn receipt(state: &ExecutionState, call: PublicationCall<'_>) -> Option<Publicat
         })
 }
 
-/// The producer of `task`'s `attempt`, which runs without fanout or repeat.
-fn producer(task: &TaskId, attempt: u32) -> Producer {
-    Producer {
-        step_id: task.clone(),
-        item_index: None,
-        iteration_index: None,
-        attempt,
-    }
-}
-
 #[async_trait::async_trait]
 impl vala_verify::blocks::Checkpoints for RunState {
-    /// Record that `attempt` of `task` started, returning once an accepted
-    /// revision holds it.
+    /// Record that the attempt `producer` started, returning once an
+    /// accepted revision holds it.
     ///
     /// # Errors
     /// Returns a bounded reason when no accepted revision will hold it.
-    async fn begin(&self, task: &TaskId, attempt: u32) -> Result<(), String> {
+    async fn begin(&self, producer: &Producer) -> Result<(), String> {
         self.change(|state| {
             state.sequence += 1;
             state.invocations.push(InvocationRecord {
                 sequence: state.sequence,
-                producer: producer(task, attempt),
+                producer: producer.clone(),
                 settlement: None,
             });
             Ok(true)
@@ -1009,7 +999,7 @@ impl vala_verify::blocks::Checkpoints for RunState {
         .await
     }
 
-    /// Remove the unsettled `attempt` of `task`, refused capacity or its
+    /// Remove the unsettled attempt `producer`, refused capacity or its
     /// definition before it retained anything, so a later attempt replays
     /// it, returning once an accepted revision no longer holds it.
     ///
@@ -1019,25 +1009,25 @@ impl vala_verify::blocks::Checkpoints for RunState {
     ///
     /// # Errors
     /// Returns a bounded reason when no accepted revision will reflect it.
-    async fn forget(&self, task: &TaskId, attempt: u32) -> Result<(), String> {
-        let wanted = producer(task, attempt);
+    async fn forget(&self, producer: &Producer) -> Result<(), String> {
         self.change(|state| {
-            if state.publications.iter().any(|accepted| {
-                let producer = &accepted.publication.producer;
-                producer.step_id == wanted.step_id && producer.attempt == wanted.attempt
-            }) {
+            if state
+                .publications
+                .iter()
+                .any(|accepted| &accepted.publication.producer == producer)
+            {
                 return Ok(false);
             }
             let recorded = state.invocations.len();
             state
                 .invocations
-                .retain(|record| record.producer != wanted || record.settlement.is_some());
+                .retain(|record| &record.producer != producer || record.settlement.is_some());
             Ok(state.invocations.len() != recorded)
         })
         .await
     }
 
-    /// Commit `settled` as the settlement of `attempt` of `task`, once,
+    /// Commit `settled` as the settlement of the attempt `producer`, once,
     /// returning once an accepted revision holds it.
     ///
     /// # Errors
@@ -1045,19 +1035,45 @@ impl vala_verify::blocks::Checkpoints for RunState {
     /// no accepted revision will hold the settlement.
     async fn settle(
         &self,
-        task: &TaskId,
-        attempt: u32,
+        producer: &Producer,
         settled: &InvocationSettlement,
     ) -> Result<(), String> {
-        let wanted = producer(task, attempt);
         self.change(|state| {
             let record = state
                 .invocations
                 .iter_mut()
-                .find(|record| record.producer == wanted && record.settlement.is_none())
+                .find(|record| &record.producer == producer && record.settlement.is_none())
                 .ok_or_else(|| "the invocation attempt is not recorded unsettled".to_owned())?;
             record.settlement = Some(settled.clone());
             Ok(true)
+        })
+        .await
+    }
+
+    /// Record the scheduling decision `control` once, returning once an
+    /// accepted revision holds it; recording the same decision again changes
+    /// nothing.
+    ///
+    /// # Errors
+    /// Returns a bounded reason when another decision about the same step is
+    /// already recorded, since a recorded decision is final, or no accepted
+    /// revision will hold it.
+    async fn control(&self, control: &ControlRecord) -> Result<(), String> {
+        self.change(|state| {
+            match state
+                .controls
+                .iter()
+                .find(|recorded| recorded.decides_same(control))
+            {
+                Some(recorded) if recorded == control => Ok(false),
+                Some(_) => {
+                    Err("a different decision about the step is already recorded".to_owned())
+                }
+                None => {
+                    state.controls.push(control.clone());
+                    Ok(true)
+                }
+            }
         })
         .await
     }
@@ -1084,6 +1100,7 @@ mod tests {
     use wyrd_spec::auth::{Attribution, PrincipalId};
     use wyrd_spec::ids::{CardUid, ExecutionId};
     use wyrd_spec::verification::PublicationName;
+    use wyrd_spec::verification::execution::Producer;
     use wyrd_spec::verification::execution::{
         Publication, PublicationContent, PublicationKind, VerificationOutcome,
     };
@@ -1193,11 +1210,13 @@ mod tests {
     async fn siblings_record_progress_while_a_revision_is_held() {
         let (factual_id, sensitive_id) = (task("factual-check"), task("sensitive-check"));
         let (state, scribe) = held_state();
-        let mut factual = Box::pin(state.begin(&factual_id, 1));
+        let factual_id_attempt = Producer::plain(&factual_id, 1);
+        let mut factual = Box::pin(state.begin(&factual_id_attempt));
         assert!(pending(&mut factual).await);
         arrived(&scribe).await;
 
-        let mut sensitive = Box::pin(state.begin(&sensitive_id, 1));
+        let sensitive_id_attempt = Producer::plain(&sensitive_id, 1);
+        let mut sensitive = Box::pin(state.begin(&sensitive_id_attempt));
         assert!(
             pending(&mut sensitive).await,
             "B waits for its own revision"
@@ -1239,14 +1258,17 @@ mod tests {
             task("tone-check"),
         );
         let (state, scribe) = held_state();
-        let mut first = Box::pin(state.begin(&factual_id, 1));
+        let factual_id_attempt = Producer::plain(&factual_id, 1);
+        let mut first = Box::pin(state.begin(&factual_id_attempt));
         assert!(pending(&mut first).await);
         arrived(&scribe).await;
         drop(first);
-        let mut second = Box::pin(state.begin(&sensitive_id, 1));
+        let sensitive_id_attempt = Producer::plain(&sensitive_id, 1);
+        let mut second = Box::pin(state.begin(&sensitive_id_attempt));
         assert!(pending(&mut second).await);
         drop(second);
-        let mut third = Box::pin(state.begin(&tone_id, 1));
+        let tone_id_attempt = Producer::plain(&tone_id, 1);
+        let mut third = Box::pin(state.begin(&tone_id_attempt));
         assert!(pending(&mut third).await);
 
         scribe.release.add_permits(2);
@@ -1352,8 +1374,13 @@ mod tests {
         scribe
             .release
             .add_permits(tokio::sync::Semaphore::MAX_PERMITS);
-        assert!(state.begin(&factual_id, 1).await.is_err());
-        assert!(state.begin(&sensitive_id, 1).await.is_err());
+        assert!(state.begin(&Producer::plain(&factual_id, 1)).await.is_err());
+        assert!(
+            state
+                .begin(&Producer::plain(&sensitive_id, 1))
+                .await
+                .is_err()
+        );
         assert!(revisions(&scribe).is_empty());
     }
 
@@ -1372,7 +1399,12 @@ mod tests {
         let arguments = serde_json::json!({ "name": name, "value": value });
         let publication = Publication {
             name: PublicationName::new(name).expect("name"),
-            producer: super::producer(&task(task_id), attempt),
+            producer: Producer {
+                step_id: task(task_id),
+                item_index: None,
+                iteration_index: None,
+                attempt,
+            },
             content: PublicationContent::Json { value },
         };
         state

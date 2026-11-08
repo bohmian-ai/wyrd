@@ -218,6 +218,8 @@ async fn extract_action_returns_locked_shape() {
         workspace: BTreeMap::new(),
         deadline: tokio::time::Instant::now(),
         attempt: 1,
+        item_index: None,
+        iteration_index: None,
     };
     let output = ActionExecutor::execute(
         &evidence,

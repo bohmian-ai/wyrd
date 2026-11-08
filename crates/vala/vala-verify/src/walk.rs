@@ -1,16 +1,15 @@
-//! Stage-walking driver for a Verifier's `ExecutionPlan`.
+//! The run ledger and the running-block set the Verifier engine drives.
 //!
-//! [`walk`] is the one stage lifecycle the Verifier engine runs:
+//! The engine releases each block as soon as the blocks it depends on are
+//! complete, rather than at stage barriers:
 //!
-//! 1. Walks the stages in topological order, settling every task into one
-//!    [`RunLedger`].
-//! 2. Per stage: the caller's `prepare` classifies each task synchronously
-//!    (no IO) against the ledger of earlier stages, settling skips without
-//!    running and handing back runnable futures.
-//! 3. Polls the runnable tasks concurrently inside the caller's task, so
-//!    each stage costs no runtime spawn or wake-up hop.
-//! 4. At the stage barrier: appends the stage's settlements to the ledger in
-//!    declaration order.
+//! 1. Every settlement lands in one [`RunLedger`], in settlement order.
+//! 2. Ready blocks are classified synchronously (no IO) against the ledger;
+//!    blocks that settle without running are recorded at once, and runnable
+//!    ones join one [`Tasks`] set.
+//! 3. [`Tasks::next`] polls the whole set inside the caller's task, so the
+//!    blocks' waits overlap, their work stays in the caller's trace, and no
+//!    block is spawned or woken through the runtime.
 
 use std::any::Any;
 use std::collections::HashMap;
@@ -19,20 +18,20 @@ use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::pin::Pin;
 use std::task::Poll;
 
-use wyrd_spec::verification::{Stage, TaskId};
+use wyrd_spec::verification::TaskId;
 
-/// Per-run state shared by every stage-walking execution: each settled task
-/// by id, in the order the stage walk settled it.
+/// Per-run state of the Verifier engine: each settled block by id, in the
+/// order it settled.
 ///
-/// [`walk`] owns it and appends one stage at a time in declaration order, so
-/// iteration order is stage order and, within a stage, declaration order.
-/// Preparation of a later stage reads earlier settlements through
-/// [`RunLedger::get`]; nothing mutates a settled entry.
+/// Readiness and scope resolution read earlier settlements through
+/// [`RunLedger::get`]. A block's entry is replaced only when the engine
+/// records a later decision about the same block, such as a speculative
+/// step's disposition; its position stays that of the first settlement.
 #[derive(Debug, Clone)]
 pub struct RunLedger<O> {
-    /// Settled tasks in settlement order.
+    /// Settled blocks in settlement order.
     entries: Vec<(TaskId, O)>,
-    /// Position of each settled task in `entries`.
+    /// Position of each settled block in `entries`.
     index: HashMap<TaskId, usize>,
 }
 
@@ -47,16 +46,21 @@ impl<O> Default for RunLedger<O> {
 }
 
 impl<O> RunLedger<O> {
-    /// The settlement of `task`, when an earlier stage settled it.
+    /// The settlement of `task`, when it settled.
     #[must_use]
     pub fn get(&self, task: &TaskId) -> Option<&O> {
         self.index.get(task).map(|&at| &self.entries[at].1)
     }
 
-    /// Record `task`'s settlement after every earlier one.
-    fn push(&mut self, task: TaskId, settled: O) {
-        self.index.insert(task.clone(), self.entries.len());
-        self.entries.push((task, settled));
+    /// Record `task`'s settlement after every earlier one, or replace the
+    /// settlement it already has in place.
+    pub(crate) fn insert(&mut self, task: TaskId, settled: O) {
+        if let Some(&at) = self.index.get(&task) {
+            self.entries[at].1 = settled;
+        } else {
+            self.index.insert(task.clone(), self.entries.len());
+            self.entries.push((task, settled));
+        }
     }
 }
 
@@ -72,83 +76,81 @@ impl<O> IntoIterator for RunLedger<O> {
     }
 }
 
-/// A pending task future polled by [`walk`].
+/// A pending block future polled by [`Tasks`].
 pub(crate) type Running<O, E> = Pin<Box<dyn Future<Output = Result<O, E>> + Send>>;
 
-/// How one planned task proceeds, decided before its stage fans out.
+/// How one ready block proceeds, decided before it runs.
 pub(crate) enum Prepared<O, E> {
     /// Settled without running, such as a skip.
     Settled(O),
-    /// Runs concurrently with the rest of its stage.
+    /// Runs concurrently with every other running block.
     Run(Running<O, E>),
 }
 
-/// Walk `stages` in order, settling every task into one [`RunLedger`].
+/// The running blocks of one run, keyed by `K`, polled together.
 ///
-/// This is the single stage lifecycle of `vala-verify`: per stage, `prepare`
-/// sees the ledger of every earlier stage and returns one [`Prepared`] per
-/// stage task, in declaration order; settled tasks are recorded as is, and
-/// runnable ones are polled together inside the caller's task and span, so
-/// their waits overlap, their work stays in the caller's trace, and no task
-/// is spawned or woken through the runtime. At the stage barrier
-/// the settlements are appended in declaration order. Contract-specific
-/// classification, budgets and results stay in `prepare`.
-///
-/// # Errors
-/// Returns the first `prepare` error, the first task error in completion
-/// order, or `panicked` applied to the message of a task that panicked.
-///
-/// # Cancellation
-/// Returning early or dropping the future drops every task of the stage
-/// still running; the stage yields no partial settlements. Work a dropped
-/// task already performed is not rolled back.
-pub(crate) async fn walk<'s, O, E>(
-    stages: impl IntoIterator<Item = &'s Stage>,
-    mut prepare: impl FnMut(&RunLedger<O>, &Stage) -> Result<Vec<Prepared<O, E>>, E>,
-    panicked: fn(String) -> E,
-) -> Result<RunLedger<O>, E>
-where
-    O: Send + 'static,
-    E: Send + 'static,
-{
-    let mut ledger = RunLedger::default();
-    for stage in stages {
-        let mut settled = HashMap::new();
-        let mut running = Vec::new();
-        for (at, prepared) in prepare(&ledger, stage)?.into_iter().enumerate() {
-            match prepared {
-                Prepared::Settled(done) => {
-                    settled.insert(at, done);
-                }
-                Prepared::Run(task) => running.push((at, task)),
-            }
-        }
-        while !running.is_empty() {
-            let (at, done) = poll_fn(|cx| {
-                let ready = running
-                    .iter_mut()
-                    .enumerate()
-                    .find_map(|(index, (_, task))| {
-                        match catch_unwind(AssertUnwindSafe(|| task.as_mut().poll(cx))) {
-                            Ok(Poll::Pending) => None,
-                            Ok(Poll::Ready(done)) => Some((index, Ok(done))),
-                            Err(payload) => Some((index, Err(message(payload.as_ref())))),
-                        }
-                    });
-                ready.map_or(Poll::Pending, |(index, done)| {
-                    Poll::Ready((running.swap_remove(index).0, done))
-                })
-            })
-            .await;
-            settled.insert(at, done.map_err(panicked)??);
-        }
-        for (at, task) in stage.tasks.iter().enumerate() {
-            if let Some(done) = settled.remove(&at) {
-                ledger.push(task.clone(), done);
-            }
+/// Dropping the set, or cancelling one key, drops its futures: work a
+/// dropped future already performed is not rolled back, and executors
+/// release their resources on drop.
+pub(crate) struct Tasks<K, O, E> {
+    /// Running futures with their keys.
+    running: Vec<(K, Running<O, E>)>,
+}
+
+impl<K, O, E> Default for Tasks<K, O, E> {
+    /// No running work.
+    fn default() -> Self {
+        Self {
+            running: Vec::new(),
         }
     }
-    Ok(ledger)
+}
+
+impl<K: PartialEq, O, E> Tasks<K, O, E> {
+    /// Start polling `task` under `key`.
+    pub(crate) fn push(&mut self, key: K, task: Running<O, E>) {
+        self.running.push((key, task));
+    }
+
+    /// Whether any future runs under `key`.
+    pub(crate) fn contains(&self, key: &K) -> bool {
+        self.running.iter().any(|(running, _)| running == key)
+    }
+
+    /// Drop every future running under `key`.
+    pub(crate) fn cancel(&mut self, key: &K) {
+        self.running.retain(|(running, _)| running != key);
+    }
+
+    /// Whether nothing is running.
+    pub(crate) fn is_empty(&self) -> bool {
+        self.running.is_empty()
+    }
+
+    /// Wait for the next running future to finish, returning its key and
+    /// result, or `panicked` applied to the message of a future that
+    /// panicked.
+    ///
+    /// # Cancellation
+    /// Dropping the returned future leaves every running future in the set.
+    pub(crate) async fn next(&mut self, panicked: fn(String) -> E) -> (K, Result<O, E>) {
+        poll_fn(|cx| {
+            let ready =
+                self.running.iter_mut().enumerate().find_map(
+                    |(index, (_, task))| match catch_unwind(AssertUnwindSafe(|| {
+                        task.as_mut().poll(cx)
+                    })) {
+                        Ok(Poll::Pending) => None,
+                        Ok(Poll::Ready(done)) => Some((index, done)),
+                        Err(payload) => Some((index, Err(panicked(message(payload.as_ref()))))),
+                    },
+                );
+            ready.map_or(Poll::Pending, |(index, done)| {
+                Poll::Ready((self.running.swap_remove(index).0, done))
+            })
+        })
+        .await
+    }
 }
 
 /// The text of a panic `payload`, or a fixed note when it carries none.

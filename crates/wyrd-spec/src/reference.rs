@@ -1052,6 +1052,7 @@ mod tests {
 
         Spec::Verifier(VerifierSpec {
             description: None,
+            limits: None,
             inputs: BTreeMap::new(),
             steps: Vec::new(),
             requirements: vec![Requirement {

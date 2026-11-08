@@ -554,6 +554,8 @@ fn failing_script(runs: usize) -> EngineScript {
         requirements: vec![RequirementResult {
             id: TaskId::new("drift").expect("task id"),
             step: None,
+            item_index: None,
+            iteration_index: None,
             statement: "The window does not drift.".to_owned(),
             outcome: RequirementOutcome::Failed,
             reason: "latency drifted".to_owned(),

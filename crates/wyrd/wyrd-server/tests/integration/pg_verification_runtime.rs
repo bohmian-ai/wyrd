@@ -714,6 +714,8 @@ fn drift_outcome(
         requirements: vec![RequirementResult {
             id: drift_requirement(),
             step: None,
+            item_index: None,
+            iteration_index: None,
             statement: "The window does not drift.".to_owned(),
             outcome,
             reason: "scripted".to_owned(),

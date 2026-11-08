@@ -29,6 +29,7 @@ use wyrd_spec::verification::execution::{
     EnqueueVerificationResponse, EvidencePlanRequest, EvidencePlanResponse, EvidenceUpload,
     VerificationExecutionState, VerificationRequest, VerificationResult,
 };
+use wyrd_spec::verification::state::ExecutionState;
 use wyrd_spec::verification::state::{ExecutionIdentity, TerminalSelection};
 use wyrd_spec::verification::{
     VerificationBindingStatus, VerificationError, VerificationExecutionStatus, VerifierReadiness,
@@ -486,7 +487,17 @@ impl<'a> VerificationControl<'a> {
         };
         let executor = caller.clone().executed_by_system(system);
         let started_at = Utc::now();
-        let timeout = blocks.limits().verify_timeout;
+        // The Verifier's own `limits.timeout_seconds` only lowers the
+        // server's direct deadline.
+        let timeout = target
+            .spec
+            .limits
+            .as_ref()
+            .and_then(|limits| limits.timeout_seconds)
+            .map(|seconds| std::time::Duration::from_secs(u64::from(seconds)))
+            .map_or(blocks.limits().verify_timeout, |limit| {
+                limit.min(blocks.limits().verify_timeout)
+            });
         let deadline = tokio::time::Instant::now() + timeout;
         let owner = wyrd_runtime::owning_root(&caller.principal, &caller.delegation_chain);
         let state = Arc::new(RunState::fresh(
@@ -530,9 +541,10 @@ impl<'a> VerificationControl<'a> {
                     execution: Some(Arc::clone(&state)),
                 },
             ) {
-                Ok(engine) => {
-                    engine.with_checkpoints(Arc::clone(&state) as Arc<dyn Checkpoints>, [])
-                }
+                Ok(engine) => engine.with_checkpoints(
+                    Arc::clone(&state) as Arc<dyn Checkpoints>,
+                    &ExecutionState::default(),
+                ),
                 Err(error) => return ("errored", Err(error)),
             };
             let ran = telemetry

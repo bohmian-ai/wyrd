@@ -35,6 +35,7 @@ use wyrd_spec::verification::execution::{
     CallProvenance, InputDeclaration, InvocationSettlement, Producer, PublicationCollection,
     RequirementDetail, ToolCallRecord, Verdict,
 };
+use wyrd_spec::verification::state::ControlRecord;
 use wyrd_spec::verification::{PublicationName, TaskId};
 
 mod drift;
@@ -115,6 +116,25 @@ pub struct BlockCall<'a, B> {
     /// The one-based attempt this call is, counting the block's recorded
     /// attempts, so a host attributes what the attempt retains to it.
     pub attempt: u32,
+    /// The zero-based fanout item this call serves, when its step fans out.
+    pub item_index: Option<u32>,
+    /// The zero-based repeat iteration this call serves, when its step
+    /// repeats.
+    pub iteration_index: Option<u32>,
+}
+
+impl<B> BlockCall<'_, B> {
+    /// The invocation attempt this call is: its block, item, iteration, and
+    /// attempt, the identity its retained work is attributed to.
+    #[must_use]
+    pub fn producer(&self) -> Producer {
+        Producer {
+            step_id: self.id.clone(),
+            item_index: self.item_index,
+            iteration_index: self.iteration_index,
+            attempt: self.attempt,
+        }
+    }
 }
 
 /// Data one step action produced.
@@ -222,32 +242,41 @@ pub trait CheckExecutor: Send + Sync {
 /// both writes with the execution's lease; direct verify runs without one.
 #[async_trait]
 pub trait Checkpoints: Send + Sync {
-    /// Record that `task` starts its one-based `attempt`.
+    /// Record that the invocation attempt `producer` starts: a block, its
+    /// item and iteration, and its one-based attempt.
     ///
     /// # Errors
     /// Returns a bounded reason when the record cannot commit, such as a lost
     /// lease; the attempt is then not dispatched.
-    async fn begin(&self, task: &TaskId, attempt: u32) -> Result<(), String>;
+    async fn begin(&self, producer: &Producer) -> Result<(), String>;
 
-    /// Forget `task`'s unsettled `attempt`, which was refused process
+    /// Forget the unsettled attempt `producer`, which was refused process
     /// capacity or its definition, so it spends nothing. A host keeps the
     /// record of an attempt that already retained work, which stays spent.
     ///
     /// # Errors
     /// Returns a bounded reason when the record cannot be removed.
-    async fn forget(&self, task: &TaskId, attempt: u32) -> Result<(), String>;
+    async fn forget(&self, producer: &Producer) -> Result<(), String>;
 
-    /// Commit `settled` as the outcome of `task`'s `attempt`.
+    /// Commit `settled` as the outcome of the attempt `producer`.
     ///
     /// # Errors
     /// Returns a bounded reason when the settlement cannot commit; the block's
     /// dependents then do not run.
     async fn settle(
         &self,
-        task: &TaskId,
-        attempt: u32,
+        producer: &Producer,
         settled: &InvocationSettlement,
     ) -> Result<(), String>;
+
+    /// Record a scheduling decision recovery must reproduce rather than make
+    /// again, such as a step's frozen fanout items or a speculative step's
+    /// disposition, before anything depends on it.
+    ///
+    /// # Errors
+    /// Returns a bounded reason when the decision cannot commit; nothing that
+    /// depends on it then runs.
+    async fn control(&self, control: &ControlRecord) -> Result<(), String>;
 }
 
 /// Decodes a check's raw `response` as the Verdict its declared `schema`
@@ -339,6 +368,8 @@ mod tests {
             workspace: BTreeMap::new(),
             deadline: Instant::now() + Duration::from_secs(5),
             attempt: 1,
+            item_index: None,
+            iteration_index: None,
         };
         let output = executor.execute(call).await.expect("output");
         assert_eq!(output.output, json!({"slides": []}));

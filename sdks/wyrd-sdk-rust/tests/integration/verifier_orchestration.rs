@@ -19,6 +19,7 @@ use serde_json::{Value, json};
 use wiremock::matchers::{body_string_contains, method, path};
 use wiremock::{Mock, MockServer, Request, ResponseTemplate};
 use wyrd_ai::cards::Cards;
+use wyrd_ai::cli::{ExecutionArg, ExecutionVerb, PageArgs};
 use wyrd_ai::state::WyrdState;
 use wyrd_ai::verify::{
     Execution, ExecutionPageQuery, File, PublicationContent, PublicationName, PublicationSelector,
@@ -38,6 +39,16 @@ use crate::hosted_agent_tools::{
 use crate::local_development::configure_gateway;
 use crate::support::{Deployment, declare, fixture, pull};
 use crate::verifier_building_blocks::{completion, grants, requirement, step};
+
+/// Run the CLI's execution `verb` in process as `desk`'s admin.
+///
+/// # Panics
+/// Panics when the CLI call is refused.
+async fn cli(verb: ExecutionVerb, desk: &Desk) -> Value {
+    wyrd_ai::cli::execution(verb, Some(desk.deployment.admin()))
+        .await
+        .expect("the CLI call succeeds")
+}
 
 /// A final answer carrying `value`.
 fn answer(value: &Value) -> ResponseTemplate {
@@ -751,11 +762,12 @@ struct Case {
 /// the stylist's failed attempt keeping its partial draft and its failed
 /// status. The quoter, requiring the security account by name, runs only
 /// when that account was produced. With no specialist selected and only the
-/// specialist judged, the verdict is inconclusive.
+/// specialist judged, the verdict is inconclusive. The CLI reports the same
+/// branch statuses and publications as the SDK.
 ///
 /// # Panics
-/// Panics when a verification is refused or a call, status, collection, or
-/// verdict differs.
+/// Panics when a verification or CLI call is refused or a call, status,
+/// collection, publication, or verdict differs.
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "requires the repository-managed Postgres journey lifecycle"]
 async fn conditions_and_collections_preserve_missing_evidence() {
@@ -852,6 +864,29 @@ async fn conditions_and_collections_preserve_missing_evidence() {
                 "{question}: {collection} {manifest}"
             );
         }
+        let target = ExecutionArg {
+            execution_id: result.execution_id,
+        };
+        let status = cli(ExecutionVerb::Status(target.clone()), &desk).await;
+        assert_eq!(
+            status["result"]["outcome"]["steps"],
+            serde_json::to_value(&result.outcome.steps).expect("steps serialize"),
+            "{question}: the CLI reports every branch's status"
+        );
+        let listed = cli(
+            ExecutionVerb::Publications(PageArgs {
+                execution: target,
+                limit: None,
+                cursor: None,
+            }),
+            &desk,
+        )
+        .await;
+        assert_eq!(
+            listed["items"],
+            serde_json::to_value(desk.publications(&result).await).expect("items serialize"),
+            "{question}: the CLI lists the same publications"
+        );
     }
 
     let unjudged = desk.verify("specialists-only", "NEITHER-ONLY").await;
@@ -1832,7 +1867,7 @@ async fn mapped(desk: &Desk, result: &VerificationResult) -> Vec<(Option<u32>, u
 /// beside them. Tenant B's single item, submitted while A holds both
 /// workspaces, is deferred the same way and completes once capacity frees,
 /// and neither tenant spends an attempt or reads the other's work. An
-/// execution whose items hold both workspaces indefinitely is cancelled
+/// execution whose items hold both workspaces indefinitely is cancelled through the CLI
 /// and releases them at once to tenant B, and a Verifier's
 /// `timeout_seconds` ends a stalled execution long before the deployment's
 /// five-minute deadline.
@@ -1954,12 +1989,17 @@ async fn admission_bounds_fanout_across_tenants() {
         );
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
-    Execution::connect_with(stalled, &desk.deployment.admin())
-        .await
-        .expect("the execution handle connects")
-        .cancel()
-        .await
-        .expect("the stalled execution is cancelled");
+    let cancelled = cli(
+        ExecutionVerb::Cancel(ExecutionArg {
+            execution_id: stalled,
+        }),
+        &desk,
+    )
+    .await;
+    assert_eq!(
+        cancelled["status"], "cancelled",
+        "the CLI cancels the stalled execution"
+    );
     let Submission::Queued(freed) = other
         .run()
         .observe()

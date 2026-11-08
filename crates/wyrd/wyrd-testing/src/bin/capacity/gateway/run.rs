@@ -17,10 +17,13 @@
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;
+use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, Instant};
 use wyrd_testing::release_server::PEAK_SAMPLE_INTERVAL_MS;
 
 use async_trait::async_trait;
+use bytes::Bytes;
+use tokio::sync::Semaphore;
 use tokio::task::JoinSet;
 use wyrd_client::transport::trace::with_benchmark_labels;
 use wyrd_testing::capacity::{
@@ -30,6 +33,7 @@ use wyrd_testing::experiment::{ExperimentError, Phase, Reading, Repetition, Step
 use wyrd_testing::gateway_capture::{PacedUpstream, Pacing};
 use wyrd_testing::release_server::{LocalServer, Metrics};
 
+use crate::gateway::capacity::{Schedule, open_loop};
 use crate::gateway::workload::{
     CapturePolicy, Outcome, PREFIXES, Shape, Tenant, Timed, call, http,
 };
@@ -441,18 +445,23 @@ pub struct Overhead {
     policy: Option<CapturePolicy>,
     /// Where the server log is copied when it stops.
     log: PathBuf,
+    /// The open-loop rate every window offers instead of closed-loop
+    /// clients, requests/s, or `None` for the closed-loop default.
+    pace: Option<f64>,
 }
 
 impl Overhead {
-    /// An unprepared workload that will copy the server log to `log`.
+    /// An unprepared workload that will copy the server log to `log`,
+    /// offering `pace` requests/s open loop when one is given.
     #[must_use]
-    pub const fn new(log: PathBuf) -> Self {
+    pub const fn new(log: PathBuf, pace: Option<f64>) -> Self {
         Self {
             server: None,
             upstream: None,
             tenant: None,
             policy: None,
             log,
+            pace,
         }
     }
 
@@ -512,7 +521,8 @@ impl Overhead {
         let shape = case.shape();
         let labels = (case.id(), phase.label());
         if phase == Phase::Warmup {
-            drive(tenant, &shape, clients, Instant::now() + window, labels).await?;
+            let stop = Instant::now() + window;
+            drive(tenant, &shape, clients, self.pace, stop, labels).await?;
             settle(server).await?;
             return Ok(Repetition::default());
         }
@@ -520,11 +530,16 @@ impl Overhead {
         let (traffic, baseline) = Window::open(server, Selection::RESOURCES).await?;
         let stop = Instant::now() + window;
         let (samples, usage, stopped) = traffic
-            .measure(server, stop, drive(tenant, &shape, clients, stop, labels))
+            .measure(
+                server,
+                stop,
+                drive(tenant, &shape, clients, self.pace, stop, labels),
+            )
             .await?;
         let samples = samples?;
         let drain = settle(server).await?;
         let last = server.metrics().await?;
+        let settled = settled(server, &last);
         let expected: Vec<Expected<'_>> = boundaries(shape.stream)
             .iter()
             .map(|boundary| Expected {
@@ -545,8 +560,36 @@ impl Overhead {
             durable: Durable::between(&baseline, &stopped),
             drain,
         };
-        Ok(observed.repetition())
+        let mut repetition = observed.repetition();
+        repetition.observations.push(settled);
+        Ok(repetition)
     }
+}
+
+/// What the server still holds once a window drained: its resident memory
+/// and the governed memory each Bifrost owner reports in `metrics`, MiB.
+fn settled(server: &LocalServer, metrics: &Metrics) -> String {
+    let mib = |bytes: f64| bytes / 1_048_576.0;
+    let resident = server.resident_memory().map_or_else(
+        || "unread".to_owned(),
+        |bytes| format!("{:.0}", mib(bytes as f64)),
+    );
+    let owners = [
+        "governed_used",
+        "scribe_used",
+        "oracle_used",
+        "forge_used",
+        "transport_used",
+    ]
+    .map(|kind| {
+        let label = format!("kind=\"{kind}\"");
+        format!(
+            "{kind} {:.0}",
+            mib(metrics.sum("bifrost_resource_memory_bytes", &[&label]))
+        )
+    })
+    .join(", ");
+    format!("post-drain MiB: resident {resident}, {owners}")
 }
 
 #[async_trait]
@@ -604,6 +647,8 @@ impl Workload for Overhead {
 /// Runs `clients` closed-loop clients of `tenant`, each with its own
 /// connection and key, making `shape` calls labelled `(case, phase)`
 /// admitted until `stop`; a call validated at or after `stop` is late.
+/// With a `pace`, the same lanes instead carry arrivals offered open loop at
+/// that rate (see [`paced`]).
 ///
 /// # Errors
 ///
@@ -612,10 +657,14 @@ async fn drive(
     tenant: &Tenant,
     shape: &Shape,
     clients: usize,
+    pace: Option<f64>,
     stop: Instant,
     (case, phase): (&'static str, &'static str),
 ) -> Result<Samples> {
     let body = shape.body("overhead");
+    if let Some(rate) = pace {
+        return paced(tenant, shape, clients, rate, stop, (case, phase), body).await;
+    }
     let mut tasks = JoinSet::new();
     for key in tenant.keys.iter().take(clients) {
         let (http, key, shape, body) = (http()?, key.clone(), shape.clone(), body.clone());
@@ -635,6 +684,71 @@ async fn drive(
         match joined {
             Ok(samples) => total.merge(samples),
             Err(_) => *total.errors.entry("panicked".to_owned()).or_default() += 1,
+        }
+    }
+    Ok(total)
+}
+
+/// Offers `shape` calls labelled `(case, phase)` at `rate` requests/s from
+/// now until `stop` through the existing open-loop scheduler, with at most
+/// `clients` open at once, each on a free lane of its own connection and
+/// key. An arrival the scheduler missed or capped counts as an error, so a
+/// window that could not hold its rate is never judged at it.
+///
+/// # Errors
+///
+/// Returns the HTTP client build failure.
+async fn paced(
+    tenant: &Tenant,
+    shape: &Shape,
+    clients: usize,
+    rate: f64,
+    stop: Instant,
+    (case, phase): (&'static str, &'static str),
+    body: Bytes,
+) -> Result<Samples> {
+    let lanes = tenant
+        .keys
+        .iter()
+        .take(clients)
+        .map(|key| Ok((http()?, key.clone())))
+        .collect::<Result<Vec<_>>>()?;
+    let lanes = Arc::new(Mutex::new(lanes));
+    let samples = Arc::new(Mutex::new(Samples::default()));
+    let calls = Mutex::new(JoinSet::new());
+    let start = Instant::now();
+    let schedule = Schedule::new(vec![(rate, stop.saturating_duration_since(start))]);
+    let slots = Arc::new(Semaphore::new(clients));
+    let start = tokio::time::Instant::from_std(start);
+    let driven = open_loop(&schedule, start, slots, clients, &calls, |_| {
+        let (lanes, samples, shape, body) = (
+            Arc::clone(&lanes),
+            Arc::clone(&samples),
+            shape.clone(),
+            body.clone(),
+        );
+        async move {
+            // A slot is held for every open call, so a lane is always free.
+            let lane = lanes.lock().unwrap_or_else(PoisonError::into_inner).pop();
+            let Some((http, key)) = lane else {
+                return;
+            };
+            let timed = with_benchmark_labels(case, phase, call(&http, &key, &shape, body)).await;
+            samples
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .record(&timed, Some(stop));
+            lanes
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .push((http, key));
+        }
+    })
+    .await;
+    let mut total = std::mem::take(&mut *samples.lock().unwrap_or_else(PoisonError::into_inner));
+    for (reason, count) in [("missed", driven.missed), ("capped", driven.capped)] {
+        if count > 0 {
+            *total.errors.entry(reason.to_owned()).or_default() += count;
         }
     }
     Ok(total)

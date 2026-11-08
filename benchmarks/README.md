@@ -189,6 +189,7 @@ Flags:
 | `--profile` | every command | Adds optional samply CPU captures and per-step server heap profiles under `target/benchmarks/` (see [Profiling](#profiling)). |
 | `--allow-dirty` | every command | Records a dirty source (see [Source](#source)). |
 | `--steps a,b` | engine commands | Runs a declared subset; the record lists every omitted step and never claims full coverage. |
+| `--pace <requests/s>` | `bench:l1:gateway` | Offers every window open loop at that rate, at most one open call per step client, with each missed or capped arrival counted as an error. It is a matched-load diagnostic: the record names the rate in its `workload` control, adds post-drain resident and governed memory by owner to each repetition's observations, and stays under `target/benchmarks/`. |
 
 `bench:l1` accepts only `--profile`, `--allow-dirty`, and `--smoke`, and
 passes them to every engine.
@@ -238,7 +239,7 @@ INVALID, appends to history:
 benchmarks/history/<engine>/<experiment>/YYYYMMDDTHHMMSSZ-<sha9>.json
 ```
 
-A `--steps`, `--profile`, or `--allow-dirty` run writes the same record under
+A `--steps`, `--profile`, `--pace` or dirty `--allow-dirty` run writes the same record under
 `target/benchmarks/<engine>/<experiment>/` and a smoke under
 `target/benchmarks/smoke/`; neither ever enters history.
 

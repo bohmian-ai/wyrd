@@ -77,6 +77,11 @@ pub const DEFAULT_RATE: f64 = 250.0;
 /// The L2 experiment's only step.
 pub const CONTENTION: &str = "contention";
 
+/// L1 flags that take a value: `--pace` offers every window open loop at
+/// that many requests/s, capped at the step's client count in flight, a
+/// matched-load diagnostic beside the closed-loop default.
+pub const OVERHEAD_FLAGS: [&str; 1] = ["--pace"];
+
 /// L2 flags that take a value.
 pub const CAPACITY_FLAGS: [&str; 4] = [
     "--rate",
@@ -181,7 +186,7 @@ impl Case {
 /// Returns a message for an unknown argument or an invalid declared value.
 pub fn plan(context: &Context<'_>, base: Declaration) -> std::result::Result<Plan, String> {
     let valued: &[&str] = match context.level {
-        Level::One => &[],
+        Level::One => &OVERHEAD_FLAGS,
         Level::Two => &CAPACITY_FLAGS,
     };
     context.known(valued, &[])?;
@@ -190,7 +195,10 @@ pub fn plan(context: &Context<'_>, base: Declaration) -> std::result::Result<Pla
         .output(Engine::Gateway, &declaration.experiment)
         .join("server.log");
     let workload: Box<dyn wyrd_testing::experiment::Workload> = match context.level {
-        Level::One => Box::new(run::Overhead::new(log)),
+        Level::One => Box::new(run::Overhead::new(
+            log,
+            positive_rate(context.arguments, "--pace")?,
+        )),
         Level::Two => Box::new(capacity::Capacity::new(log)),
     };
     Ok(Plan {
@@ -205,7 +213,7 @@ pub fn plan(context: &Context<'_>, base: Declaration) -> std::result::Result<Pla
 ///
 /// # Errors
 ///
-/// Returns a message for an invalid `--rate` or SLO override.
+/// Returns a message for an invalid `--pace`, `--rate` or SLO override.
 pub fn declare(
     level: Level,
     arguments: &[String],
@@ -213,24 +221,35 @@ pub fn declare(
     _root: &Path,
 ) -> std::result::Result<Declaration, String> {
     match level {
-        Level::One => Ok(overhead(base)),
-        Level::Two => {
-            let rate = crate::flags::value(arguments, "--rate")?
-                .map(|value| {
-                    value
-                        .parse::<f64>()
-                        .ok()
-                        .filter(|rate| rate.is_finite() && *rate > 0.0)
-                        .ok_or_else(|| format!("--rate takes positive requests/s, got `{value}`"))
-                })
-                .transpose()?;
-            Ok(capacity_declaration(base, rate, Slo::parse(arguments)?))
-        }
+        Level::One => Ok(overhead(base, positive_rate(arguments, "--pace")?)),
+        Level::Two => Ok(capacity_declaration(
+            base,
+            positive_rate(arguments, "--rate")?,
+            Slo::parse(arguments)?,
+        )),
     }
 }
 
-/// The L1 `overhead` declaration over `base`.
-fn overhead(mut base: Declaration) -> Declaration {
+/// The positive, finite requests/s `flag` gives, or `None` without it.
+///
+/// # Errors
+///
+/// Returns a message for a repeated flag or a value that is not one.
+fn positive_rate(arguments: &[String], flag: &str) -> std::result::Result<Option<f64>, String> {
+    crate::flags::value(arguments, flag)?
+        .map(|value| {
+            value
+                .parse::<f64>()
+                .ok()
+                .filter(|rate| rate.is_finite() && *rate > 0.0)
+                .ok_or_else(|| format!("{flag} takes positive requests/s, got `{value}`"))
+        })
+        .transpose()
+}
+
+/// The L1 `overhead` declaration over `base`, offered open loop at `pace`
+/// requests/s when one is given.
+fn overhead(mut base: Declaration, pace: Option<f64>) -> Declaration {
     "overhead".clone_into(&mut base.experiment);
     base.question = format!(
         "What overhead does the gateway add to 1 KiB buffered and streamed chat with metadata capture, and 64 KiB buffered chat with metadata and with payload capture, at 1 and 64 closed-loop clients, and is its p99 strictly under {OVERHEAD_LIMIT_MS} ms at {SLO_CLIENTS} clients at every handoff point with every call answered and captured exactly once?"
@@ -249,7 +268,13 @@ fn overhead(mut base: Declaration) -> Declaration {
         (
             "workload".to_owned(),
             json!(format!(
-                "one tenant, one wyrd_sk_ key and keep-alive connection per closed-loop client; each client sends its next call when the last is validated; {}",
+                "one tenant, one wyrd_sk_ key and keep-alive connection per closed-loop client; {}; {}",
+                pace.map_or_else(
+                    || "each client sends its next call when the last is validated".to_owned(),
+                    |rate| format!(
+                        "paced: {rate} requests/s offered open loop, at most one open call per client, a missed or capped arrival counted as an error"
+                    ),
+                ),
                 Case::ALL
                     .map(|case| format!(
                         "{}: {} capture",
@@ -960,6 +985,42 @@ mod tests {
             (65_536, 65_536, false)
         );
         assert_eq!(Case::Streamed1KibCaptureMetadata.shape().expected, 32);
+    }
+
+    /// `--pace` keeps L1's steps and criteria, records the offered rate in
+    /// the workload control so a paced record never reads as closed loop,
+    /// and refuses a rate that is not positive and finite.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the paced declaration differs from the default beyond
+    /// its workload, or a bad rate is accepted.
+    #[test]
+    fn paced_overhead_records_its_rate_and_refuses_bad_ones() {
+        let closed = declare(Level::One, &line(&[]), base(Level::One), Path::new("."))
+            .expect("the L1 declaration");
+        let paced = declare(
+            Level::One,
+            &line(&["--pace", "4970"]),
+            base(Level::One),
+            Path::new("."),
+        )
+        .expect("the paced L1 declaration");
+        assert_eq!(paced.steps.len(), closed.steps.len());
+        assert_eq!(paced.criteria.len(), closed.criteria.len());
+        let workload = paced.controls["workload"].as_str().expect("a workload");
+        assert!(workload.contains("paced: 4970 requests/s"), "{workload}");
+        assert_ne!(paced.controls["workload"], closed.controls["workload"]);
+        for refused in [
+            &["--pace", "0"][..],
+            &["--pace", "nan"],
+            &["--pace", "1", "--pace", "2"],
+        ] {
+            assert!(
+                declare(Level::One, &line(refused), base(Level::One), Path::new(".")).is_err(),
+                "{refused:?}"
+            );
+        }
     }
 
     /// L2 declares one contention step at the default rate with the SLO

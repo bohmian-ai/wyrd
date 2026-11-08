@@ -392,6 +392,15 @@ impl LocalServer {
         self.pid().map(PeakSampler::start)
     }
 
+    /// The server's resident memory now, bytes, or `None` once it is gone
+    /// or unreadable.
+    pub fn resident_memory(&self) -> Option<u64> {
+        self.memory_peak()?
+            .finish()
+            .ok()
+            .map(|readings| readings.opening)
+    }
+
     /// Sends `SIGTERM`, as `Ctrl-C` in the guide does, waits for a clean
     /// exit, and copies the server log to `log`. Returns the seconds the exit
     /// took. The wait yields, so the caller's client connections keep being

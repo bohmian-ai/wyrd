@@ -2591,8 +2591,9 @@ impl Record {
     }
 
     /// Whether the record enters history: a full run of the whole plan from
-    /// a clean source without `--profile`, VALID or INVALID. A `--steps`,
-    /// `--profile`, `--allow-dirty`, or `--smoke` run never does.
+    /// a clean source without `--profile` or Gateway's paced `--pace`
+    /// diagnostic, VALID or INVALID. A `--steps`, `--profile`, `--pace`,
+    /// dirty or `--smoke` run never does.
     #[must_use]
     pub fn historical(&self) -> bool {
         self.mode == Mode::Full
@@ -2602,7 +2603,7 @@ impl Record {
                 .command
                 .args
                 .iter()
-                .any(|argument| argument == "--profile")
+                .any(|argument| argument == "--profile" || argument == "--pace")
     }
 
     /// Reads a record file.
@@ -4333,7 +4334,7 @@ mod tests {
     /// for missing values, store the dirty digest, and never carry a secret
     /// configuration value. Only a clean, unprofiled full run of the whole
     /// plan enters `benchmarks/history/`, VALID or INVALID; a dirty,
-    /// profiled, or `--steps` run stays under `target/benchmarks/`.
+    /// profiled, paced, or `--steps` run stays under `target/benchmarks/`.
     ///
     /// # Panics
     ///
@@ -4415,12 +4416,18 @@ mod tests {
         invalid.verdict = Verdict::Invalid;
         let mut profiled = clean.clone();
         profiled.command = Invocation::new(&["l1".to_owned(), "--profile".to_owned()], &[]);
+        let mut paced = clean.clone();
+        paced.command = Invocation::new(
+            &["l1".to_owned(), "--pace".to_owned(), "100".to_owned()],
+            &[],
+        );
         let mut selected = clean.clone();
         selected.controls.selection = Some(vec!["op-64".to_owned()]);
         for (record, base) in [
             (&clean, "benchmarks/history"),
             (&invalid, "benchmarks/history"),
             (&profiled, "target/benchmarks"),
+            (&paced, "target/benchmarks"),
             (&selected, "target/benchmarks"),
         ] {
             let path = record.publish(root.path()).expect("publish");

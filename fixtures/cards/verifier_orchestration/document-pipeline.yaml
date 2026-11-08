@@ -1,0 +1,61 @@
+# A non-repository document pipeline: the uploaded document is extracted,
+# its sections are reviewed as array work, a flagged document escalates, and
+# a summarizer refines over every settled collection before a cited
+# judgment. The appendix fans out over an empty array.
+apiVersion: wyrd/v1
+kind: Verifier
+metadata:
+  name: document-pipeline
+  version: 1.0.0
+spec:
+  description: Array review, a conditional escalation, and refinement over an uploaded document.
+  inputs:
+    document: {type: media, formats: [json], max_bytes: 65536}
+  steps:
+    - id: read
+      action: {kind: extract, from: inputs.document}
+    - id: sections
+      foreach: {items: steps.read.output.value.sections, max_items: 5}
+      action:
+        kind: agent
+        agent: ./section-reviewer.yaml
+        inputs: {section: item, index: item_index}
+    - id: appendix
+      foreach: {items: steps.read.output.value.appendix, max_items: 5}
+      action:
+        kind: agent
+        agent: ./section-reviewer.yaml
+        inputs: {section: item, index: item_index}
+    - id: escalate
+      when: {path: steps.read.output.value.flagged, operator: equals, expected: true}
+      action:
+        kind: agent
+        agent: ./escalation.yaml
+        inputs: {title: steps.read.output.value.title}
+    - id: summarize
+      repeat:
+        max_iterations: 3
+        until: {path: iteration.output.score, operator: greater_than_or_equals, expected: 1}
+      action:
+        kind: agent
+        agent: ./summarizer.yaml
+        inputs: {title: steps.read.output.value.title, index: iteration.index, previous: iteration.previous}
+        workspace:
+          /inputs/accounts: steps.sections.publications
+          /inputs/escalation: steps.escalate.publications
+  requirements:
+    - id: summarized
+      statement: The summary reached its score
+      check: {kind: assert, path: steps.summarize.output.score, operator: greater_than_or_equals, expected: 1}
+    - id: cited
+      statement: The summary is faithful to the document
+      check:
+        kind: agent
+        agent: ./doc-judge.yaml
+        inputs: {summary: steps.summarize.output.text}
+    - id: appendix-reviewed
+      statement: The appendix was reviewed
+      check: {kind: assert, path: steps.appendix.output, operator: is_non_empty}
+    - id: escalation-done
+      statement: The escalation finished
+      check: {kind: assert, path: steps.escalate.output.done, operator: equals, expected: true}

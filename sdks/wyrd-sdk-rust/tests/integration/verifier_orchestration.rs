@@ -20,14 +20,14 @@ use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, Request, ResponseTemplate};
 use wyrd_ai::state::WyrdState;
 use wyrd_ai::verify::{
-    Execution, ExecutionPageQuery, PublicationContent, PublicationName, PublicationSelector,
+    Execution, ExecutionPageQuery, File, PublicationContent, PublicationName, PublicationSelector,
     PublicationSummary, Speculation, TaskId,
 };
-use wyrd_ai::{RequirementOutcome, StepStatus, VerificationResult};
+use wyrd_ai::{RequirementOutcome, StepStatus, VerificationResult, VerificationVerdict};
 
 use crate::hosted_agent_tools::{builder, calls, done, lines, messages, results, text, turn};
 use crate::local_development::configure_gateway;
-use crate::support::{Deployment, declare, pull};
+use crate::support::{Deployment, declare, fixture, pull};
 use crate::verifier_building_blocks::{completion, grants, requirement, step};
 
 /// A final answer carrying `value`.
@@ -76,6 +76,10 @@ fn numbered(messages: &[Value]) -> Option<usize> {
 /// `EARLY-DECISION` comparison waits briefly while its extra review holds
 /// its first turn longer. The refiner publishes its report, then scores it
 /// by its iteration index, a constant, or a word, or breaks on iteration 1.
+/// A section reviewer publishes its section and index; the escalation
+/// publishes a note, then breaks; the summarizer reads both collections,
+/// publishes a summary, and scores it by its iteration index; the document
+/// judge passes, citing the document's title.
 fn reply(request: &Request, script: &Script) -> ResponseTemplate {
     let messages = messages(request);
     let prompt = text(&messages);
@@ -251,6 +255,70 @@ fn reply(request: &Request, script: &Script) -> ResponseTemplate {
             _ => done(),
         };
     }
+    if prompt.contains("SECTION:") {
+        let (section, at) = prompt
+            .split_once("SECTION: ")
+            .and_then(|(_, rest)| rest.split_once(" at="))
+            .map(|(section, at)| {
+                (
+                    section.to_owned(),
+                    at.split_whitespace().next().unwrap_or(""),
+                )
+            })
+            .unwrap_or_default();
+        let at: u64 = at.parse().unwrap_or(u64::MAX);
+        return match turn {
+            0 => calls(&[(
+                "d-account",
+                "publish",
+                json!({ "name": "account", "value": { "section": section, "at": at } }),
+            )]),
+            _ => done(),
+        };
+    }
+    if prompt.contains("ESCALATE:") {
+        return match turn {
+            0 => calls(&[(
+                "x-note",
+                "publish",
+                json!({ "name": "note", "value": { "escalated": true } }),
+            )]),
+            _ => ResponseTemplate::new(200).set_body_json(json!({ "garbled": true })),
+        };
+    }
+    if prompt.contains("SUMMARIZE:") {
+        let index: u64 = prompt
+            .split_once("index=")
+            .and_then(|(_, rest)| rest.split_whitespace().next()?.parse().ok())
+            .unwrap_or(u64::MAX);
+        return match turn {
+            0 => calls(&[
+                (
+                    "m-accounts",
+                    "fs.read",
+                    json!({ "path": "/inputs/accounts/manifest.json" }),
+                ),
+                (
+                    "m-escalation",
+                    "fs.read",
+                    json!({ "path": "/inputs/escalation/manifest.json" }),
+                ),
+            ]),
+            1 => calls(&[(
+                "m-summary",
+                "publish",
+                json!({ "name": "summary", "value": { "version": index } }),
+            )]),
+            _ => answer(&json!({ "score": index, "text": format!("summary v{index}") })),
+        };
+    }
+    if prompt.contains("JUDGE-DOC:") {
+        return answer(&json!({
+            "outcome": "passed",
+            "reason": "the summary names the report",
+            "citations": [{ "slot": "document", "locator": { "json_pointer": "/title" } }],
+        }));
+    }
     if prompt.contains("QUOTE:") {
         return match turn {
             0 => calls(&[(
@@ -325,6 +393,19 @@ impl Desk {
             .verify(verifier, json!(question))
             .await
             .expect("the verification runs")
+    }
+
+    /// Verify the fixture document at `relative` with `verifier` now.
+    ///
+    /// # Panics
+    /// Panics when the upload or the verify is refused.
+    async fn verify_document(&self, verifier: &str, relative: &str) -> VerificationResult {
+        self.state
+            .run()
+            .observe()
+            .verify(verifier, File::path(fixture(relative)))
+            .await
+            .expect("the document is uploaded and verified")
     }
 
     /// The messages of every request whose messages carry `marker`, in
@@ -933,5 +1014,171 @@ async fn sequential_refinement_returns_final_admitted_report() {
             "{question}"
         );
     }
+    desk.deployment.shutdown().await;
+}
+
+/// The entries of the collection manifest an `fs.read` `result` returned,
+/// as `(item_index, iteration_index, name)`, sorted.
+fn entries(result: &Value) -> Vec<(Option<u64>, Option<u64>, String)> {
+    let manifest: Value = serde_json::from_str(&lines(result)).unwrap_or_default();
+    let mut entries: Vec<_> = manifest["entries"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .map(|entry| {
+            (
+                entry["item_index"].as_u64(),
+                entry["iteration_index"].as_u64(),
+                entry["name"].as_str().unwrap_or_default().to_owned(),
+            )
+        })
+        .collect();
+    entries.sort();
+    entries
+}
+
+/// A non-repository document pipeline uses the same public controls: the
+/// uploaded document's sections fan out as array work in order, the
+/// duplicate section keeping its own index; the empty appendix runs no
+/// reviewer and is honestly empty; the flagged document escalates and its
+/// failed escalation keeps its partial note; the summarizer refines one
+/// iteration at a time over both settled collections within its original
+/// bound. The final requirements pass, fail, and stay inconclusive by their
+/// own evidence, and the cited judgment points into the uploaded document.
+///
+/// # Panics
+/// Panics when the verification is refused or an item, manifest,
+/// iteration, citation, or outcome differs.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires the repository-managed Postgres journey lifecycle"]
+async fn document_pipeline_uses_array_repeat_and_publications() {
+    let desk = Desk::start().await;
+
+    let result = desk
+        .verify_document(
+            "document-pipeline",
+            "cards/verifier_orchestration/samples/field-report.json",
+        )
+        .await;
+
+    let sections = step(&result, "sections");
+    assert_eq!(
+        (sections.status, sections.output.clone()),
+        (
+            StepStatus::Succeeded,
+            Some(json!([{ "done": true }, { "done": true }, { "done": true }]))
+        ),
+        "{result:?}"
+    );
+    let reviewed: BTreeSet<String> = desk
+        .requests("SECTION:")
+        .await
+        .iter()
+        .filter_map(|messages| {
+            let prompt = text(messages);
+            Some(prompt.split_once("SECTION: ")?.1.lines().next()?.to_owned())
+        })
+        .collect();
+    assert_eq!(
+        reviewed,
+        BTreeSet::from(["claims at=1", "claims at=2", "intro at=0"].map(str::to_owned)),
+        "the duplicate keeps its own index and the empty appendix calls no reviewer"
+    );
+    let appendix = step(&result, "appendix");
+    assert_eq!(
+        (appendix.status, appendix.output.clone()),
+        (StepStatus::Succeeded, Some(json!([])))
+    );
+    assert_eq!(step(&result, "escalate").status, StepStatus::Failed);
+    let summarize = step(&result, "summarize");
+    assert_eq!(
+        (summarize.status, summarize.output.clone()),
+        (
+            StepStatus::Succeeded,
+            Some(json!({ "score": 1, "text": "summary v1" }))
+        )
+    );
+    let summaries = desk.requests("SUMMARIZE:").await;
+    assert_eq!(
+        iterations(&summaries),
+        [0, 0, 0, 1, 1, 1],
+        "one iteration at a time, stopping within the bound of 3"
+    );
+    assert!(text(&summaries[0]).contains("previous=null"));
+    let read = results(&summaries[1]);
+    assert_eq!(
+        entries(&read["m-accounts"]),
+        (0..3)
+            .map(|item| (Some(item), None, "account".to_owned()))
+            .collect::<Vec<_>>()
+    );
+    let escalation: Value = serde_json::from_str(&lines(&read["m-escalation"])).unwrap_or_default();
+    assert_eq!(
+        (
+            escalation["status"].as_str(),
+            entries(&read["m-escalation"])
+        ),
+        (Some("failed"), vec![(None, None, "note".to_owned())]),
+        "the failed escalation keeps its partial note"
+    );
+    let accounts: Vec<(Option<u32>, Value)> = {
+        let execution = Execution::connect_with(result.execution_id, &desk.deployment.admin())
+            .await
+            .expect("the execution handle connects");
+        let mut accounts = Vec::new();
+        for publication in desk.publications(&result).await {
+            if publication.producer.step_id.as_str() != "sections" {
+                continue;
+            }
+            let read = execution
+                .publication(
+                    &publication.producer.step_id,
+                    &publication.name,
+                    &PublicationSelector {
+                        attempt: publication.producer.attempt,
+                        item_index: publication.producer.item_index,
+                        iteration_index: None,
+                        path: None,
+                    },
+                )
+                .await
+                .expect("the account reads");
+            let PublicationContent::Json { value } = read.content else {
+                panic!("an account is a JSON publication");
+            };
+            accounts.push((publication.producer.item_index, value));
+        }
+        accounts.sort_by_key(|(item, _)| *item);
+        accounts
+    };
+    assert_eq!(
+        accounts,
+        [
+            (Some(0), json!({ "section": "intro", "at": 0 })),
+            (Some(1), json!({ "section": "claims", "at": 1 })),
+            (Some(2), json!({ "section": "claims", "at": 2 })),
+        ]
+    );
+
+    let outcomes: BTreeMap<&str, RequirementOutcome> = result
+        .outcome
+        .requirements
+        .iter()
+        .map(|judged| (judged.id.as_str(), judged.outcome))
+        .collect();
+    assert_eq!(
+        outcomes,
+        BTreeMap::from([
+            ("appendix-reviewed", RequirementOutcome::Failed),
+            ("cited", RequirementOutcome::Passed),
+            ("escalation-done", RequirementOutcome::Inconclusive),
+            ("summarized", RequirementOutcome::Passed),
+        ])
+    );
+    assert_eq!(
+        serde_json::to_value(&requirement(&result, "cited").citations).expect("citations encode"),
+        json!([{ "slot": "document", "locator": { "json_pointer": "/title" } }])
+    );
+    assert_eq!(result.outcome.verdict, VerificationVerdict::Failed);
     desk.deployment.shutdown().await;
 }

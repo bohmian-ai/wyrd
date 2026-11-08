@@ -13,3 +13,4 @@ spec:
     - verifier: ./specialists-only.yaml
     - verifier: ./speculative-review.yaml
     - verifier: ./refine-report.yaml
+    - verifier: ./document-pipeline.yaml

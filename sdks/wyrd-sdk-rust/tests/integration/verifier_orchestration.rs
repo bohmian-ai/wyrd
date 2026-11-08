@@ -632,7 +632,8 @@ impl Desk {
 /// A fixed sweep of three reviewers runs three items, each reading the same
 /// pinned question and writing the same scratch name without seeing another
 /// item's file. Reviewer 0's failed attempt retries as a second attempt of
-/// its own item, never as a fourth reviewer, and starts from empty scratch.
+/// its own item, never as a fourth reviewer, and starts from empty scratch
+/// and a conversation holding none of the failed attempt's tool calls.
 /// Every item publishes exactly one account under its own index, and the
 /// consolidator's settled collection lists the three accounts.
 ///
@@ -675,6 +676,17 @@ async fn fixed_sweeps_have_private_attempts() {
     let mut questions = BTreeSet::new();
     let mut finished = BTreeSet::new();
     for (&n, conversation) in &reviewers {
+        let foreign: Vec<&str> = conversation
+            .iter()
+            .filter_map(|message| message["tool_calls"].as_array())
+            .flatten()
+            .filter_map(|call| call["id"].as_str())
+            .filter(|id| !id.starts_with(&format!("r{n}-")))
+            .collect();
+        assert!(
+            foreign.is_empty(),
+            "reviewer {n}'s history holds only its own attempt: {foreign:?}"
+        );
         let results = results(conversation);
         let id = |name: &str| format!("r{n}-{name}");
         assert_eq!(
@@ -723,7 +735,7 @@ async fn fixed_sweeps_have_private_attempts() {
     let last = consolidator
         .last()
         .expect("the consolidator called the model");
-    let manifest: Value = serde_json::from_str(&lines(&results(last)["c-manifest"]))
+    let manifest: Value = serde_json::from_str(&lines(&results(last)["c-accounts"]))
         .expect("the collection manifest is JSON");
     let mut entries: Vec<(Option<u64>, Option<&str>)> = manifest["entries"]
         .as_array()

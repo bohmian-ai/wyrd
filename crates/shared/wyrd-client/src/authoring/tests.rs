@@ -5,6 +5,7 @@ use wyrd_spec::card::verifier::VerifierSpec;
 use wyrd_spec::envelope::CardKind;
 use wyrd_spec::error::WyrdError;
 use wyrd_spec::reference::CardRef;
+use wyrd_spec::verification::TaskId;
 
 use super::*;
 
@@ -254,12 +255,12 @@ decide: {pass_rate: {threshold: 0.5}}
             },
         )
         .expect("new slot");
-    let spec = r#"
+    let spec = "
 method: Spc
 signal: {kind: Distribution, baseline_ref: {kind: Data, name: latency-baseline, version: 1.0.0}, features: [latency]}
 condition: {kind: Statistical}
 profile: {kind: Spc, sample_size: 5}
-"#;
+";
     drift
         .add_requirement(
             Requirement::new(
@@ -270,10 +271,21 @@ profile: {kind: Spc, sample_size: 5}
             .expect("valid id"),
         )
         .expect("new id");
-    let canonical_drift: VerifierSpec = yaml(&format!(
-        "inputs: {{latency: {{type: samples, features: [latency]}}}}\nrequirements:\n  - id: latency-stable\n    statement: Latency is in control\n    check:\n      kind: drift\n      on: inputs.latency\n{}",
-        spec.lines().filter(|line| !line.is_empty()).map(|line| format!("      {line}\n")).collect::<String>(),
-    ))
+    let canonical_drift: VerifierSpec = yaml(
+        "
+inputs: {latency: {type: samples, features: [latency]}}
+requirements:
+  - id: latency-stable
+    statement: Latency is in control
+    check:
+      kind: drift
+      on: inputs.latency
+      method: Spc
+      signal: {kind: Distribution, baseline_ref: {kind: Data, name: latency-baseline, version: 1.0.0}, features: [latency]}
+      condition: {kind: Statistical}
+      profile: {kind: Spc, sample_size: 5}
+",
+    )
     .expect("canonical drift Verifier decodes");
     assert_eq!(drift.spec(), &canonical_drift);
     drift
@@ -284,7 +296,7 @@ profile: {kind: Spc, sample_size: 5}
     let stages: Vec<Vec<&str>> = plan
         .stages
         .iter()
-        .map(|stage| stage.tasks.iter().map(|task| task.as_str()).collect())
+        .map(|stage| stage.tasks.iter().map(TaskId::as_str).collect())
         .collect();
     assert_eq!(
         stages,
@@ -378,7 +390,7 @@ run_config: {max_iterations: 3}
         )
         .expect("new alias");
     let canonical_service: ServiceSpec = yaml(
-        r#"
+        "
 service_type: api
 components:
   - alias: reviewer
@@ -387,7 +399,7 @@ components:
   - alias: controls
     ref: {kind: Agent, name: release-controls, version: 1.0.0}
     verified_by: [{verifier: {kind: Verifier, name: report-policy, version: 1.0.0}}]
-"#,
+",
     )
     .expect("canonical Service decodes");
     assert_eq!(service.spec(), &canonical_service);

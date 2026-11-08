@@ -477,7 +477,7 @@ fn releases(report: &VerificationResult, access: &VerificationResult) -> bool {
 
 /// The outcome of requirement `id` in `result`.
 fn outcome(result: &VerificationResult, id: &str) -> RequirementOutcome {
-    requirement(result, id).outcome.clone()
+    requirement(result, id).outcome
 }
 
 /// Assert `result` judged the component `alias` by `verifier` and executed
@@ -789,7 +789,7 @@ async fn local_artifacts_reuse_and_keep_versions() {
     let declaration = wyrd_ai::authoring::CardDefinition::from(authored.clone())
         .declaration()
         .expect("valid graph");
-    assert_eq!(declaration.artifacts, [local.clone()]);
+    assert_eq!(declaration.artifacts, std::slice::from_ref(&local));
     assert!(
         declaration
             .input

@@ -104,6 +104,9 @@ pub type Service = Definition<ServiceSpec>;
 
 impl<S> Definition<S> {
     /// The exact reference this definition registers as, without a UID.
+    ///
+    /// # Panics
+    /// Never: every constructor pins an exact version.
     #[must_use]
     pub fn card_ref(&self) -> CardRef {
         CardRef {
@@ -807,6 +810,9 @@ impl Artifact {
     }
 
     /// The exact reference this Artifact registers as, without a UID.
+    ///
+    /// # Panics
+    /// Never: every constructor pins an exact version.
     #[must_use]
     pub fn card_ref(&self) -> CardRef {
         CardRef {

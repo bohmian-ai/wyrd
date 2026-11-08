@@ -2094,7 +2094,7 @@ pub(super) fn token_bound(body: &Value, output: Option<u64>) -> Option<Vec<Gatew
 }
 
 /// Byte count of everything written to it; the written bytes are dropped.
-struct SerializedLength(usize);
+pub(super) struct SerializedLength(pub(super) usize);
 
 impl std::io::Write for SerializedLength {
     fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {

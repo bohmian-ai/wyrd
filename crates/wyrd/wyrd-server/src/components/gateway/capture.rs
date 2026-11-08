@@ -53,6 +53,7 @@ use wyrd_tonic::otlp::trace::v1::status::StatusCode;
 use wyrd_tonic::otlp::trace::v1::{ResourceSpans, ScopeSpans, Span, Status};
 
 use super::invocation::GatewayCallContext;
+use super::routes::SerializedLength;
 use crate::scribe_outbox::{Owner, ScribeTable, project_spans};
 use crate::state::AppState;
 
@@ -314,6 +315,11 @@ impl CallCapture {
     /// and every referenced object, which the Scribe outbox accounts against
     /// its byte limit.
     pub(crate) fn content_bytes(&self) -> usize {
+        self.payload_bytes() + self.objects.bytes()
+    }
+
+    /// Encoded bytes of both selected payloads.
+    fn payload_bytes(&self) -> usize {
         [&self.request, &self.response]
             .into_iter()
             .flatten()
@@ -324,7 +330,29 @@ impl CallCapture {
                     .sum::<usize>()
             })
             .sum::<usize>()
-            + self.objects.bytes()
+    }
+
+    /// Upper estimate of the sliced Arrow bytes this capture's call row
+    /// holds, known before any row is built: the encoded payloads, the
+    /// scalar fields' serialized JSON, whose quoting and field names outweigh
+    /// the columns' offsets and validity, and the correlation strings with
+    /// their offsets.
+    pub(crate) fn row_bytes(&self) -> usize {
+        let mut scalars = SerializedLength(0);
+        // Serializing to a counter fails only where the row decoder would.
+        let _ = serde_json::to_writer(&mut scalars, &self.payload);
+        let correlation = self.subject.as_ref().map_or(0, |context| {
+            [
+                context.workload_card_uid.as_ref().map(CardUid::as_str),
+                context.subject_card_uid.as_ref().map(CardUid::as_str),
+                context.run_id.as_ref().map(RunId::as_str),
+                context.deployment_environment.as_deref(),
+            ]
+            .into_iter()
+            .map(|value| value.map_or(0, str::len))
+            .sum()
+        });
+        self.payload_bytes() + scalars.0 + correlation + 4 * size_of::<i32>()
     }
 
     /// Builds one `bifrost.gateway.calls` batch holding one row per capture, in

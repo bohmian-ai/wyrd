@@ -191,6 +191,10 @@ const fn frame_budget(request_bytes: usize) -> usize {
     request_bytes / 4
 }
 
+/// Sliced Arrow bytes [`Chunk::attributed`] adds to a row: its subject,
+/// actor and request id, each a UUID string with its offset.
+const ATTRIBUTED_ROW_BYTES: usize = 3 * (36 + size_of::<i32>());
+
 /// One logical write bound for Scribe, staged by its domain owner.
 ///
 /// Each variant projects into a fixed destination set; [`ScribeSink`] owns
@@ -1265,12 +1269,15 @@ impl ScribeSink {
     /// cuts each frame into budget-sized chunks from one measured row. No write
     /// keys its frame by request: a gateway call row carries its admitting
     /// request as content, like an audit decision, so captures of many calls
-    /// share a frame. Captures are gathered and projected in one pass, after
-    /// the other writes' rows. Result summary frames
+    /// share a frame. Captures are gathered after the other writes' rows and
+    /// projected in consecutive groups whose estimated call rows, attribution
+    /// included, fit `budget`, so each group's batch is built by one payload
+    /// concatenation and delivered without a split; a capture larger than
+    /// `budget` is its own group. Result summary frames
     /// are moved after every detail frame, so a visible summary's details
     /// were acknowledged first. Positions of writes that cannot be projected
     /// are added to `lost`.
-    fn frames(items: &[ScribeWrite], lost: &mut BTreeSet<usize>) -> Vec<Frame> {
+    fn frames(items: &[ScribeWrite], budget: usize, lost: &mut BTreeSet<usize>) -> Vec<Frame> {
         let mut frames: Vec<Frame> = Vec::new();
         let mut captures: Vec<(usize, &CallCapture)> = Vec::new();
         for (index, item) in items.iter().enumerate() {
@@ -1290,21 +1297,36 @@ impl ScribeSink {
                 Frame::absorb(&mut frames, rows.table, rows.part, owners);
             }
         }
-        // Captures that cannot project in bulk are projected call by call, so
-        // only the captures that cannot project are lost.
-        let projected = CallCapture::project(&captures).unwrap_or_else(|_| {
-            captures
-                .chunks(1)
-                .filter_map(|single| {
-                    CallCapture::project(single)
-                        .map_err(|drop| Self::unprojected(drop.reason(), [single[0].0], lost))
-                        .ok()
-                })
-                .flatten()
-                .collect()
-        });
-        for (table, batch, owners) in projected {
-            Frame::absorb(&mut frames, table, Part::Batch(batch), owners);
+        let mut groups = Vec::new();
+        let (mut first, mut bytes) = (0, 0_usize);
+        for (end, (_, capture)) in captures.iter().enumerate() {
+            let row = capture.row_bytes() + ATTRIBUTED_ROW_BYTES;
+            if end > first && bytes.saturating_add(row) > budget {
+                groups.push(&captures[first..end]);
+                (first, bytes) = (end, 0);
+            }
+            bytes = bytes.saturating_add(row);
+        }
+        if first < captures.len() {
+            groups.push(&captures[first..]);
+        }
+        for group in groups {
+            // A group that cannot project together is projected call by call,
+            // so only the captures that cannot project are lost.
+            let projected = CallCapture::project(group).unwrap_or_else(|_| {
+                group
+                    .chunks(1)
+                    .filter_map(|single| {
+                        CallCapture::project(single)
+                            .map_err(|drop| Self::unprojected(drop.reason(), [single[0].0], lost))
+                            .ok()
+                    })
+                    .flatten()
+                    .collect()
+            });
+            for (table, batch, owners) in projected {
+                Frame::absorb(&mut frames, table, Part::Batch(batch), owners);
+            }
         }
         frames.sort_by_key(|frame| frame.table == ScribeTable::Results);
         frames
@@ -1328,24 +1350,28 @@ impl ScribeSink {
     /// Cuts `frame`'s rows into consecutive [`Chunk`]s of about `budget`
     /// retained Arrow bytes each, without concatenating them.
     ///
-    /// The frame's first part is measured once and every row is taken to
-    /// be its size, so cutting costs one measurement per frame and depends
-    /// only on the rows: an identical slice always cuts identically. A
-    /// projected batch is never divided; skewed row sizes are left to
-    /// [`Chunk::encode`]'s split by encoded size.
+    /// The frame's first staged row is measured once and every staged row is
+    /// taken to be its size, so cutting costs one measurement per frame; a
+    /// projected batch is measured as a whole and never divided. Cutting
+    /// depends only on the rows: an identical slice always cuts identically.
+    /// Skewed row sizes are left to [`Chunk::encode`]'s split by encoded size.
     fn chunks(frame: &Frame, budget: usize) -> Vec<Chunk> {
         let sample = &frame.parts[0];
         let row_bytes = sample.bytes().div_ceil(sample.num_rows().max(1)).max(1);
-        let rows_per_chunk = (budget / row_bytes).max(1);
         let mut chunks = Vec::new();
-        let (mut first, mut rows, mut parts) = (0, 0, Vec::new());
+        let (mut first, mut rows, mut bytes, mut parts) = (0, 0, 0_usize, Vec::new());
         for part in &frame.parts {
-            if rows > 0 && rows + part.num_rows() > rows_per_chunk {
+            let part_bytes = match part {
+                Part::Row(_) => row_bytes,
+                Part::Batch(_) => part.bytes(),
+            };
+            if rows > 0 && bytes.saturating_add(part_bytes) > budget {
                 chunks.push(frame.chunk(first, rows, std::mem::take(&mut parts)));
                 first += rows;
-                rows = 0;
+                (rows, bytes) = (0, 0);
             }
             rows += part.num_rows();
+            bytes = bytes.saturating_add(part_bytes);
             parts.push(part.clone());
         }
         if rows > 0 {
@@ -1856,7 +1882,7 @@ impl OutboxSink for ScribeSink {
         };
         let attempt = self.attempts.fetch_add(1, Ordering::Relaxed);
         let mut lost = BTreeSet::new();
-        let frames = Self::frames(items, &mut lost);
+        let frames = Self::frames(items, self.frame_budget, &mut lost);
         let split = frames.partition_point(|frame| frame.table != ScribeTable::Results);
         let (details, summaries) = frames.split_at(split);
         for phase in [(0, details), (split, summaries)] {
@@ -2345,7 +2371,7 @@ mod tests {
             ScribeWrite::from(capture(tenant)),
         ];
         let mut lost = BTreeSet::new();
-        let frames = ScribeSink::frames(&slice, &mut lost);
+        let frames = ScribeSink::frames(&slice, usize::MAX, &mut lost);
         assert!(lost.is_empty());
         let mut seen = Vec::new();
         for frame in &frames {
@@ -3339,6 +3365,184 @@ mod tests {
             table: &TableRef,
         ) -> Result<TableUid, ScribeError> {
             self.inner.resolve_write_table(tenant, table).await
+        }
+    }
+
+    /// Proves gateway captures larger than one frame are grouped before they
+    /// are projected: skewed payload captures, metadata-only captures, a
+    /// two-attempt call and many owners reach in-process frames within the
+    /// budget, each its own batch built by one payload concatenation and
+    /// never copied again by a split, except one oversized capture that
+    /// travels alone; the frames read back every row once in slice order
+    /// with its own owner, and a retry or the peer plane yields the same
+    /// frame ids and rows.
+    ///
+    /// # Panics
+    ///
+    /// Panics when a frame is over budget or undercharged, a row is lost,
+    /// repeated, reordered or misattributed, the frames copy the payloads
+    /// more than once, or a retry or the peer plane changes a frame.
+    #[test]
+    fn large_captures_reach_bounded_frames_without_a_split_copy() {
+        use crate::test_support::CountingAllocator;
+        let tenant = DataTenantId::new_v7();
+        let budget = 256 * 1024;
+        let both = [GatewayPayloadField::Request, GatewayPayloadField::Response];
+        let sizes = [
+            90_000, 10_000, 150_000, 0, 20_000, 700_000, 0, 60_000, 5_000, 120_000,
+        ];
+        let slice = sizes
+            .iter()
+            .enumerate()
+            .map(|(index, &bytes)| {
+                let mut facts = if bytes == 0 {
+                    facts(policy(GatewayCaptureMode::Metadata, &[]))
+                } else {
+                    facts(policy(GatewayCaptureMode::Payload, &both))
+                };
+                facts.tenant = tenant;
+                if bytes > 0 {
+                    facts.request = Some(serde_json::json!({
+                        "model": "dep-a/a",
+                        "messages": [{"role": "user", "content": "x".repeat(bytes)}],
+                    }));
+                }
+                if index == 2 {
+                    let mut retried = facts.attempts[0].clone();
+                    retried.ordinal = std::num::NonZeroU32::new(2).expect("nonzero");
+                    facts.attempts.push(retried);
+                    facts.attempts[0].outcome = facts.outcome;
+                }
+                ScribeWrite::from(CallCapture::from_facts(facts).expect("the capture projects"))
+            })
+            .collect::<Vec<_>>();
+        let captures = slice
+            .iter()
+            .enumerate()
+            .map(|(index, write)| match write {
+                ScribeWrite::Capture(capture) => (index, &**capture),
+                _ => unreachable!("every write is a capture"),
+            })
+            .collect::<Vec<_>>();
+        let content = captures
+            .iter()
+            .map(|(_, capture)| capture.content_bytes())
+            .sum::<usize>();
+        let reference = CallCapture::project(&captures).expect("the slice projects");
+
+        let key = uuid::Uuid::now_v7();
+        let deliver = |in_process| {
+            let mut lost = BTreeSet::new();
+            let frames = ScribeSink::frames(&slice, budget, &mut lost);
+            assert!(lost.is_empty());
+            let mut delivered = Vec::new();
+            for (index, frame) in frames.iter().enumerate() {
+                for (place, chunk) in ScribeSink::chunks(frame, budget).iter().enumerate() {
+                    let streams = chunk
+                        .encode(tenant, (key, index, place), budget, in_process)
+                        .expect("the chunk encodes");
+                    delivered.extend(
+                        streams
+                            .into_iter()
+                            .map(|(batch, owners)| (frame.table, batch, owners)),
+                    );
+                }
+            }
+            delivered
+        };
+        let (local, allocated) = CountingAllocator::measure(|| deliver(true));
+        assert!(
+            allocated < content + content / 2,
+            "the payloads are copied once: {allocated} bytes for {content}"
+        );
+        let decoded = |payload: &FramePayload| match payload {
+            FramePayload::Rows { rows, .. } => rows.clone(),
+            FramePayload::Ipc(ipc) => {
+                let batches = StreamReader::try_new(std::io::Cursor::new(ipc.to_vec()), None)
+                    .expect("the stream opens")
+                    .map(|batch| batch.expect("the stream decodes"))
+                    .collect::<Vec<_>>();
+                concat_batches(batches[0].schema_ref(), &batches).expect("one batch")
+            }
+        };
+        for (_, batch, _) in &local {
+            let FramePayload::Rows { rows, wire_bytes } = &batch.payload else {
+                panic!("a local frame carries its rows");
+            };
+            assert!(
+                *wire_bytes <= budget || rows.num_rows() == 1,
+                "{wire_bytes} bytes in {} rows",
+                rows.num_rows()
+            );
+            let retained = wyrd_queue::retained_bytes(rows).expect("retained bytes");
+            assert!(
+                retained <= *wire_bytes + *wire_bytes / 4 + 4096,
+                "a frame owns its rows: {retained} retained for {wire_bytes}"
+            );
+        }
+        for (table, batch, owners) in reference {
+            let frames = local
+                .iter()
+                .filter(|(destination, _, _)| *destination == table)
+                .collect::<Vec<_>>();
+            let width = batch.num_columns();
+            let rows = frames
+                .iter()
+                .map(|(_, frame, _)| {
+                    decoded(&frame.payload)
+                        .project(&(0..width).collect::<Vec<_>>())
+                        .expect("table columns")
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(
+                concat_batches(batch.schema_ref(), &rows).expect("frame rows"),
+                batch,
+                "{}",
+                table.fqn()
+            );
+            let subjects = frames
+                .iter()
+                .flat_map(|(_, frame, _)| {
+                    let rows = decoded(&frame.payload);
+                    rows.column_by_name(SUB_PRINCIPAL_ID)
+                        .expect("subject column")
+                        .as_string::<i32>()
+                        .iter()
+                        .map(|value| value.expect("attributed").to_owned())
+                        .collect::<Vec<_>>()
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(
+                subjects,
+                owners
+                    .iter()
+                    .map(|(_, pair)| pair.sub_principal_id.to_string())
+                    .collect::<Vec<_>>()
+            );
+            let positions = frames
+                .iter()
+                .flat_map(|(_, _, positions)| positions.iter().copied())
+                .collect::<BTreeSet<_>>();
+            assert_eq!(
+                positions,
+                owners.iter().map(|(position, _)| *position).collect()
+            );
+        }
+        let ids = |frames: &[(ScribeTable, super::ScribeBatch, BTreeSet<usize>)]| {
+            frames
+                .iter()
+                .map(|(_, batch, owners)| (batch.batch_id, owners.clone()))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            ids(&deliver(true)),
+            ids(&local),
+            "a retry frames identically"
+        );
+        let peer = deliver(false);
+        assert_eq!(ids(&peer), ids(&local), "the peer plane frames identically");
+        for ((_, ours, _), (_, theirs, _)) in local.iter().zip(&peer) {
+            assert_eq!(decoded(&ours.payload), decoded(&theirs.payload));
         }
     }
 

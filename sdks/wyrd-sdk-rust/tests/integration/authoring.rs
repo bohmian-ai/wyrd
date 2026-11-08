@@ -18,8 +18,9 @@ use serde_json::{Value, json};
 use wiremock::matchers::{body_string_contains, method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 use wyrd_ai::authoring::{
-    Action, Agent, AgentCall, Artifact, ArtifactFile, BuiltinTool, Check, CodeCall, Prompt,
-    Reference, Requirement, Service, Step, Verifier,
+    Action, Agent, AgentCall, Artifact, ArtifactFile, Binding, BuiltinTool, CardDefinition, Check,
+    CodeCall, CodeRuntime, ComparisonOperator, ContextCapture, Decide, InputSlot, Linked, OrderBy,
+    Prompt, Reference, Requirement, Service, Step, Verifier,
 };
 use wyrd_ai::cards::{CardKind, CardRef, CardSelector, Cards};
 use wyrd_ai::state::{DeclareOptions, WyrdState};
@@ -1207,4 +1208,506 @@ async fn dependent_steps_consume_prior_outputs() {
         assert_eq!(access.outcome.verdict, verdict, "{access:#?}");
     }
     story_server.deployment.shutdown().await;
+}
+
+/// Every native comparison operator, in its canonical wire form.
+fn operators() -> Vec<Value> {
+    let named = [
+        "equals",
+        "not_equals",
+        "greater_than",
+        "greater_than_or_equals",
+        "less_than",
+        "less_than_or_equals",
+        "is_positive",
+        "is_negative",
+        "is_zero",
+        "contains",
+        "not_contains",
+        "contains_ignore_case",
+        "starts_with",
+        "ends_with",
+        "is_email",
+        "is_url",
+        "is_uuid",
+        "is_ipv4",
+        "is_ipv6",
+        "is_json",
+        "in",
+        "not_in",
+        "is_subset",
+        "is_superset",
+        "is_disjoint",
+        "all_of",
+        "any_of",
+        "none_of",
+        "is_empty",
+        "is_non_empty",
+        "unique_values",
+        "is_truthy",
+        "is_falsy",
+        "is_null",
+        "is_not_null",
+        "is_string",
+        "is_number",
+        "is_boolean",
+        "is_object",
+    ];
+    let parameterized = [
+        json!({"kind": "in_range", "min": 0.0, "max": 1.0, "inclusive": true}),
+        json!({"kind": "not_in_range", "min": 0.0, "max": 1.0, "inclusive": false}),
+        json!({"kind": "approximately_equals", "tolerance": 0.5}),
+        json!({"kind": "matches_regex", "pattern": "^r"}),
+        json!({"kind": "not_matches_regex", "pattern": "^r"}),
+        json!({"kind": "has_min_length", "min": 1}),
+        json!({"kind": "has_max_length", "max": 9}),
+        json!({"kind": "length", "expected": 2}),
+        json!({"kind": "length_greater_than", "min": 1}),
+        json!({"kind": "length_less_than", "max": 9}),
+        json!({"kind": "is_type", "expected": "object"}),
+        json!({"kind": "within_abs_tolerance", "tolerance": 0.5}),
+        json!({"kind": "within_pct_tolerance", "pct": 5.0}),
+        json!({"kind": "within_std_dev", "sigma": 2.0, "mean": 0.0, "std_dev": 1.0}),
+        json!({"kind": "between_percentiles", "lower_pct": 5.0, "upper_pct": 95.0}),
+        json!({"kind": "divergence_less_than", "metric": "js", "threshold": 0.1}),
+        json!({"kind": "cosine_similarity_at_least", "threshold": 0.9}),
+    ];
+    named
+        .into_iter()
+        .map(Value::from)
+        .chain(parameterized)
+        .collect()
+}
+
+/// `kind`'s canonical spec decoded from its authored JSON form.
+///
+/// # Panics
+/// Panics when `value` is not a valid `kind` spec.
+fn canonical(kind: &CardKind, value: Value) -> wyrd_ai::Spec {
+    wyrd_ai::Spec::from_kind_and_value(kind, value).expect("canonical spec decodes")
+}
+
+/// Through `wyrd_ai` paths alone, every native authoring family builds the
+/// canonical spec its file form decodes to: each remaining registrable kind
+/// from its typed spec, all 56 comparison operators in assert, each, trace,
+/// and step conditions, every Action and Check, every input slot including
+/// group sources and requiredness independent of whether its schema admits
+/// `null`, and a binding's Trigger and both Operator lists in each linking
+/// form. Nothing here contacts a server.
+///
+/// # Panics
+/// Panics when an authored value differs from its canonical form, the
+/// shared validation refuses one, or a declaration omits a submission.
+#[test]
+fn public_paths_author_every_native_family() {
+    let gcs = json!({"source": {"kind": "object_store", "uri": "gs://archive/runs", "format": "parquet"}});
+    let kinds = [
+        (
+            CardKind::Data,
+            json!({
+                "interface": {"kind": "Parquet", "meta": {"compression": "Snappy"}},
+                "schema": {"columns": [{"name": "latency", "dtype": "float64"}]},
+                "stats": {"row_count": 1, "col_count": 1, "byte_count": 1, "sha256": "c4f7700b380aff2662e88d034154d1890c33d3c12c8dda1a0ca9481f43bb9906"},
+            }),
+        ),
+        (
+            CardKind::Model,
+            json!({
+                "interface": {"kind": "Custom", "meta": {"framework_version": "0.1.0", "loader_module": "assistant", "loader_class": "LatencyModel", "extra": {}}},
+                "task_type": "Other",
+                "signature": {"inputs": [{"name": "latency", "dtype": "float64"}], "outputs": [{"name": "score", "dtype": "float64"}]},
+            }),
+        ),
+        (
+            CardKind::Experiment,
+            json!({"experiment_type": "ab", "description": "Prompt comparison"}),
+        ),
+        (
+            CardKind::Policy,
+            json!({"description": "Sharing", "enforcement": "block"}),
+        ),
+        (
+            CardKind::Mcp,
+            json!({"server_name": "files", "transport": "stdio", "scopes": ["read"]}),
+        ),
+        (CardKind::Audit, json!({"description": "Quarterly review"})),
+        (CardKind::Source, gcs),
+        (
+            CardKind::Trigger,
+            json!({"kind": "schedule", "cron": "0 0 * * *"}),
+        ),
+        (
+            CardKind::Operator,
+            json!({"kind": "http", "method": "post", "url": "https://hooks.example.com/release"}),
+        ),
+        (
+            CardKind::Prompt,
+            json!({"provider": "openai", "model": "gpt-4o", "messages": [{"role": "user", "content": "Judge {{report}}"}]}),
+        ),
+    ];
+    for (kind, value) in kinds {
+        let spec = canonical(&kind, value);
+        let card = CardDefinition::new("authored", "1.0.0", spec.clone()).expect("valid identity");
+        assert_eq!((card.card_ref().kind, card.spec()), (kind.clone(), &spec));
+        let declaration = card.declaration().expect("one-Card graph declares");
+        assert_eq!(
+            declaration
+                .input
+                .submissions
+                .iter()
+                .map(|s| s.kind.clone())
+                .collect::<Vec<_>>(),
+            std::slice::from_ref(&kind),
+        );
+    }
+    let prompt = Prompt::new("openai", "gpt-4o", "Judge {{report}}").expect("prompt compiles");
+    assert_eq!(
+        prompt
+            .to_card("authored", "1.0.0")
+            .expect("Prompt Card")
+            .spec(),
+        &canonical(
+            &CardKind::Prompt,
+            json!({"provider": "openai", "model": "gpt-4o", "messages": [{"role": "user", "content": "Judge {{report}}"}]})
+        ),
+    );
+    let mut artifact =
+        Artifact::from_path("policy", "1.0.0", "policy.pdf", false).expect("valid identity");
+    let wyrd_ai::Spec::Artifact(artifact_spec) = canonical(
+        &CardKind::Artifact,
+        json!({"artifact_kind": "document", "description": "Policy"}),
+    ) else {
+        panic!("an Artifact spec decodes as one");
+    };
+    artifact
+        .set_spec(artifact_spec.clone())
+        .expect("valid Artifact spec");
+    assert_eq!(artifact.spec(), &artifact_spec);
+
+    let mut verifier = Verifier::new("inventory", "1.0.0").expect("valid identity");
+    let report = verifier
+        .add_input("report", json!({"type": "object"}))
+        .expect("new slot");
+    for (name, schema, required) in [
+        (
+            "required_nullable",
+            json!({"type": ["object", "null"]}),
+            true,
+        ),
+        (
+            "optional_nullable",
+            json!({"type": ["object", "null"]}),
+            false,
+        ),
+        ("optional_strict", json!({"type": "object"}), false),
+    ] {
+        verifier
+            .add_input_with_required(name, schema, required)
+            .expect("new slot");
+    }
+    let document = verifier
+        .add_slot(
+            "document",
+            InputSlot::Media {
+                formats: vec![wyrd_ai::MediaFormat::Pdf],
+                max_bytes: Some(1024),
+                required: false,
+            },
+        )
+        .expect("new slot");
+    let trace = verifier
+        .add_slot("trace", InputSlot::Trace { required: false })
+        .expect("new slot");
+    let extract = Step::new("extract", Action::extract(document)).expect("valid id");
+    let mut call = AgentCall::new(Linked::registered(card_ref(
+        CardKind::Agent,
+        "judge",
+        "1.0.0",
+    )));
+    call.add_input("report", report.clone())
+        .expect("valid parameter");
+    call.add_workspace_input("/inputs/report.json", report.clone());
+    call.add_workspace_file("/inputs/policy.json", &registered_policy("1.0.0"));
+    let mut judge = Step::new("judge", Action::agent(call.clone())).expect("valid id");
+    judge.set_when(
+        extract.status().expect("status"),
+        ComparisonOperator::Equals,
+        json!("succeeded"),
+    );
+    let mut code = CodeCall::artifact(&registered_policy("1.0.0"), "summarize");
+    code.set_runtime(CodeRuntime::Python);
+    let summarize = Step::new("summarize", Action::code(code)).expect("valid id");
+    for step in [extract, judge, summarize] {
+        verifier.add_step(step).expect("new step");
+    }
+    let mut requirements = vec![
+        Requirement::new("judged", "Judged", Check::agent(call)).expect("valid id"),
+        Requirement::new(
+            "coded",
+            "Coded",
+            Check::code(CodeCall::inline("def f():\n    return {}\n", "f")),
+        )
+        .expect("valid id"),
+        Requirement::new(
+            "formatted",
+            "Formatted",
+            Check::code_with_format(
+                CodeCall::inline("def f():\n    return {}\n", "f"),
+                serde_json::from_value(json!("verdict")).expect("named format"),
+            ),
+        )
+        .expect("valid id"),
+    ];
+    let mut canonical_requirements = vec![
+        json!({"id": "judged", "statement": "Judged", "check": {"kind": "agent", "agent": {"kind": "Agent", "name": "judge", "version": "1.0.0"},
+            "inputs": {"report": "inputs.report"},
+            "workspace": {"/inputs/report.json": "inputs.report", "/inputs/policy.json": {"artifact": {"card": {"kind": "Artifact", "name": "company-sharing-policy", "version": "1.0.0"}, "path": POLICY_FILE}}}}}),
+        json!({"id": "coded", "statement": "Coded", "check": {"kind": "code", "source": {"inline": "def f():\n    return {}\n"}, "entrypoint": "f"}}),
+        json!({"id": "formatted", "statement": "Formatted", "check": {"kind": "code", "source": {"inline": "def f():\n    return {}\n"}, "entrypoint": "f", "response_format": "verdict"}}),
+    ];
+    let wire = operators();
+    assert_eq!(wire.len(), 56, "the native operator catalog");
+    for (index, operator) in wire.into_iter().enumerate() {
+        let typed: ComparisonOperator =
+            serde_json::from_value(operator.clone()).expect("operator decodes");
+        let checks = [
+            (
+                "assert",
+                Check::assert(report.clone(), typed.clone(), json!(1)),
+                json!({"kind": "assert", "path": "inputs.report", "operator": operator, "expected": 1}),
+            ),
+            (
+                "each",
+                Check::each(
+                    Reference::parse("inputs.report.items[*]").expect("path"),
+                    typed.clone(),
+                    json!(1),
+                ),
+                json!({"kind": "assert", "each": "inputs.report.items[*]", "operator": operator, "expected": 1}),
+            ),
+            (
+                "trace",
+                Check::trace(trace.clone(), "$.spans[0].name", typed.clone(), json!(1))
+                    .expect("selector"),
+                json!({"kind": "trace", "on": "inputs.trace", "span_selector": "$.spans[0].name", "operator": operator, "expected": 1}),
+            ),
+        ];
+        for (form, check, canonical_check) in checks {
+            let id = format!("{form}-{index}");
+            requirements.push(Requirement::new(&id, "Compared", check).expect("valid id"));
+            canonical_requirements
+                .push(json!({"id": id, "statement": "Compared", "check": canonical_check}));
+        }
+    }
+    for requirement in requirements {
+        verifier.add_requirement(requirement).expect("new id");
+    }
+    verifier.set_decide(Decide::PassRate { threshold: 0.5 });
+    verifier.set_context_capture(ContextCapture::Hash);
+    let expected = canonical(
+        &CardKind::Verifier,
+        json!({
+            "inputs": {
+                "report": {"type": "json", "schema": {"type": "object"}},
+                "required_nullable": {"type": "json", "schema": {"type": ["object", "null"]}},
+                "optional_nullable": {"type": "json", "schema": {"type": ["object", "null"]}, "required": false},
+                "optional_strict": {"type": "json", "schema": {"type": "object"}, "required": false},
+                "document": {"type": "media", "formats": ["pdf"], "max_bytes": 1024, "required": false},
+                "trace": {"type": "trace", "required": false},
+            },
+            "steps": [
+                {"id": "extract", "action": {"kind": "extract", "from": "inputs.document"}},
+                {"id": "judge", "when": {"path": "steps.extract.status", "operator": "equals", "expected": "succeeded"},
+                 "action": {"kind": "agent", "agent": {"kind": "Agent", "name": "judge", "version": "1.0.0"},
+                    "inputs": {"report": "inputs.report"},
+                    "workspace": {"/inputs/report.json": "inputs.report", "/inputs/policy.json": {"artifact": {"card": {"kind": "Artifact", "name": "company-sharing-policy", "version": "1.0.0"}, "path": POLICY_FILE}}}}},
+                {"id": "summarize", "action": {"kind": "code", "source": {"artifact": {"card": {"kind": "Artifact", "name": "company-sharing-policy", "version": "1.0.0"}, "path": POLICY_FILE}}, "entrypoint": "summarize"}},
+            ],
+            "requirements": canonical_requirements,
+            "decide": {"pass_rate": {"threshold": 0.5}},
+            "context_capture": "hash",
+        }),
+    );
+    let authored = CardDefinition::from(verifier.clone());
+    assert_eq!(authored.spec(), &expected);
+    verifier
+        .validate()
+        .expect("shared validation accepts every operator and family");
+    let wyrd_ai::Spec::Verifier(spec) = &expected else {
+        panic!("a Verifier spec decodes as one");
+    };
+    let required: Vec<(&str, bool)> = spec
+        .inputs
+        .iter()
+        .map(|(name, slot)| (name.as_str(), slot.required()))
+        .collect();
+    assert_eq!(
+        required,
+        [
+            ("document", false),
+            ("optional_nullable", false),
+            ("optional_strict", false),
+            ("report", true),
+            ("required_nullable", true),
+            ("trace", false),
+        ],
+        "requiredness is independent of whether the schema admits null",
+    );
+
+    let mut group = Verifier::new("conversation", "1.0.0").expect("valid identity");
+    let turns = group
+        .add_slot(
+            "turns",
+            serde_json::from_value(json!("verifiers.turn-check.inputs.turn")).expect("source slot"),
+        )
+        .expect("new slot");
+    let answered = group
+        .add_slot(
+            "answered",
+            serde_json::from_value(json!("verifiers.turn-check.requirements.answered.outcome"))
+                .expect("source slot"),
+        )
+        .expect("new slot");
+    group.set_order_by(OrderBy::Input(turns.at("turn").expect("path")));
+    group
+        .add_requirement(
+            Requirement::new(
+                "every-turn-answered",
+                "Every turn was answered",
+                Check::each(
+                    answered.at("[*]").expect("path"),
+                    ComparisonOperator::Equals,
+                    json!("passed"),
+                ),
+            )
+            .expect("valid id"),
+        )
+        .expect("new id");
+    assert_eq!(
+        CardDefinition::from(group.clone()).spec(),
+        &canonical(
+            &CardKind::Verifier,
+            json!({
+                "inputs": {"turns": "verifiers.turn-check.inputs.turn", "answered": "verifiers.turn-check.requirements.answered.outcome"},
+                "order_by": "inputs.turns.turn",
+                "requirements": [{"id": "every-turn-answered", "statement": "Every turn was answered",
+                    "check": {"kind": "assert", "each": "inputs.answered[*]", "operator": "equals", "expected": "passed"}}],
+            })
+        ),
+    );
+    group
+        .validate()
+        .expect("shared validation accepts the group Verifier");
+
+    let mut drift = Verifier::new("latency-drift", "1.0.0").expect("valid identity");
+    let samples = drift
+        .add_slot(
+            "latency",
+            InputSlot::Samples {
+                features: vec!["latency".parse().expect("feature")],
+            },
+        )
+        .expect("new slot");
+    let drift_spec = json!({
+        "method": "Spc",
+        "signal": {"kind": "Distribution", "baseline_ref": {"kind": "Data", "name": "latency-baseline", "version": "1.0.0"}, "features": ["latency"]},
+        "condition": {"kind": "Statistical"},
+        "profile": {"kind": "Spc", "sample_size": 5},
+    });
+    drift
+        .add_requirement(
+            Requirement::new(
+                "stable",
+                "Latency is in control",
+                Check::drift(
+                    samples,
+                    serde_json::from_value(drift_spec.clone()).expect("drift spec"),
+                ),
+            )
+            .expect("valid id"),
+        )
+        .expect("new id");
+    let mut drift_check = drift_spec;
+    drift_check["kind"] = json!("drift");
+    drift_check["on"] = json!("inputs.latency");
+    assert_eq!(
+        CardDefinition::from(drift.clone()).spec(),
+        &canonical(
+            &CardKind::Verifier,
+            json!({
+                "inputs": {"latency": {"type": "samples", "features": ["latency"]}},
+                "requirements": [{"id": "stable", "statement": "Latency is in control", "check": drift_check}],
+            })
+        ),
+    );
+    drift
+        .validate()
+        .expect("shared validation accepts the drift Verifier");
+
+    let trigger = CardDefinition::new(
+        "daily",
+        "1.0.0",
+        canonical(
+            &CardKind::Trigger,
+            json!({"kind": "schedule", "cron": "0 0 * * *"}),
+        ),
+    )
+    .expect("valid identity");
+    let pager = canonical(
+        &CardKind::Operator,
+        json!({"kind": "http", "method": "post", "url": "https://hooks.example.com/release"}),
+    );
+    let wyrd_ai::Spec::Operator(inline_operator) = pager.clone() else {
+        panic!("an Operator spec decodes as one");
+    };
+    let mut binding = Binding::new(Verifier::new("checked", "1.0.0").expect("valid identity"));
+    binding.set_runs_on(trigger);
+    binding.add_on_failure(CardDefinition::new("page", "1.0.0", pager).expect("valid identity"));
+    binding.add_on_failure(Linked::inline(inline_operator));
+    binding.add_on_verdict_change(Linked::registered(card_ref(
+        CardKind::Operator,
+        "notify",
+        "1.0.0",
+    )));
+    let mut agent = policy_judge("bound", "1.0.0");
+    agent.add_verifier(binding);
+    let wyrd_ai::Spec::Agent(bound) = canonical(
+        &CardKind::Agent,
+        json!({
+            "prompt": serde_json::to_value(agent.spec().prompt.clone()).expect("prompt serializes"),
+            "execution_route": {"kind": "wyrd_gateway", "deployment": "openai"},
+            "tool_names": ["fs.read"],
+            "run_config": {"max_iterations": 3},
+            "verified_by": [{
+                "verifier": {"sibling": {"kind": "Verifier", "name": "checked", "version": "1.0.0"}},
+                "runs_on": {"sibling": {"kind": "Trigger", "name": "daily", "version": "1.0.0"}},
+                "on_failure": [
+                    {"sibling": {"kind": "Operator", "name": "page", "version": "1.0.0"}},
+                    {"kind": "http", "method": "post", "url": "https://hooks.example.com/release"},
+                ],
+                "on_verdict_change": [{"kind": "Operator", "name": "notify", "version": "1.0.0"}],
+            }],
+        }),
+    ) else {
+        panic!("an Agent spec decodes as one");
+    };
+    assert_eq!(agent.spec(), &bound);
+    let mut declared: Vec<CardKind> = CardDefinition::from(agent)
+        .declaration()
+        .expect("valid graph")
+        .input
+        .submissions
+        .iter()
+        .map(|submission| submission.kind.clone())
+        .collect();
+    declared.sort_by_key(CardKind::wire_name);
+    assert_eq!(
+        declared,
+        [
+            CardKind::Agent,
+            CardKind::Operator,
+            CardKind::Trigger,
+            CardKind::Verifier
+        ]
+    );
 }

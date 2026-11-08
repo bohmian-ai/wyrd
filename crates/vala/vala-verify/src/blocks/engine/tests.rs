@@ -1043,6 +1043,54 @@ async fn nonconforming_evidence_is_refused_before_any_block() {
     assert_eq!(outcome.verdict, VerificationVerdict::Passed);
 }
 
+/// A supplied `null` is admitted or refused by the slot's schema alone,
+/// whether the slot is required or optional: a schema admitting `null`
+/// passes it through as `null`, and one rejecting `null` refuses it before
+/// any block runs.
+///
+/// # Panics
+/// Panics when a null-admitting slot refuses `null`, a null-rejecting one
+/// admits it, or an admitted `null` does not read as `null`.
+#[tokio::test(start_paused = true)]
+async fn supplied_null_follows_the_slot_schema_not_requiredness() {
+    let nullable = json!({"type": ["object", "null"]});
+    let strict = json!({"type": "object"});
+    let spec = verifier(json!({
+        "inputs": {
+            "required_nullable": {"type": "json", "schema": nullable},
+            "optional_nullable": {"type": "json", "schema": nullable, "required": false},
+            "required_strict": {"type": "json", "schema": strict},
+            "optional_strict": {"type": "json", "schema": strict, "required": false},
+        },
+        "requirements": [
+            {"id": "required", "statement": "r", "check": {"kind": "assert", "path": "inputs.required_nullable", "operator": "is_null"}},
+            {"id": "optional", "statement": "o", "check": {"kind": "assert", "path": "inputs.optional_nullable", "operator": "is_null"}},
+        ]
+    }));
+    let script = Arc::new(Script::default());
+    let engine = engine(&script, InMemoryTraceSource::new(), 1);
+    let admitted = run(
+        &engine,
+        &spec,
+        json!({"required_nullable": null, "optional_nullable": null}),
+    )
+    .await
+    .expect("null-admitting slots admit null");
+    assert_eq!(admitted.verdict, VerificationVerdict::Passed);
+    for slot in ["required_strict", "optional_strict"] {
+        let refused = run(&engine, &spec, json!({ slot: null })).await;
+        assert!(
+            matches!(&refused, Err(EngineError::InputInvalid(reason)) if reason.contains(slot)),
+            "{slot}: {refused:?}"
+        );
+    }
+    assert!(
+        script.calls().is_empty(),
+        "no block ran: {:?}",
+        script.calls()
+    );
+}
+
 /// No requirements, or only not-applicable ones, is inconclusive.
 ///
 /// # Panics

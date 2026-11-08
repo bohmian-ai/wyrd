@@ -844,6 +844,13 @@ impl CardDefinition {
         self.0.card_ref()
     }
 
+    /// The spec as authored so far, before validation; a
+    /// [`CodeSource::file`] position is `null` until its graph is validated.
+    #[must_use]
+    pub fn spec(&self) -> Value {
+        self.0.spec.value()
+    }
+
     /// Snapshot and validate this Card's graph as its declaration: the local
     /// Artifacts to publish first, in reference order, and the containing
     /// graph's input.

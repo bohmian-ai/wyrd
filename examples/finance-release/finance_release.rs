@@ -13,44 +13,35 @@
 //! verifies a permitted release and one that names a bank account.
 
 use wyrd_ai::authoring::{
-    Agent, AgentCall, Artifact, BuiltinTool, Check, ComparisonOperator, Prompt, Requirement,
-    Service, Verifier,
+    Agent, Artifact, Check, Component, InputSlot, Requirement, Service, Verifier,
 };
-use wyrd_ai::serde_json::json;
+use wyrd_ai::serde_json::{Value, json};
 use wyrd_ai::state::WyrdState;
 use wyrd_ai::verify::Inputs;
 use wyrd_ai::{RequirementOutcome, VerificationResult};
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    // The company sharing policy, uploaded from this directory. `true`
-    // extracts the PDF's text so the judge can read it.
+    // The company sharing policy, uploaded from this directory, with the
+    // PDF's text extracted so the judge can read it.
     let policy = Artifact::from_path(
         "company-sharing-policy",
         "1.0.0",
         "company-sharing-policy.pdf",
-        true,
-    )?;
+    )
+    .extract(true);
 
-    // The Agent that writes the reports.
-    let mut writer = Agent::new(
-        "report-writer",
-        "1.0.0",
-        Prompt::new(
-            "openai",
-            "gpt-4o",
-            "Write the customer report for {{customer}}.",
-        )?,
-    )?;
-    writer.set_gateway_route("openai")?;
-
-    // The Service: one Agent, verified by `release-check`.
-    let mut service = Service::new("finance-release", "1.0.0")?;
-    service.add_component("report-writer", writer, Vec::<Verifier>::new())?;
-    service.add_verifier(release_check(&policy)?);
+    // The Service: the Agent that writes the reports, verified by
+    // `release-check`.
+    let writer = Agent::new("report-writer", "1.0.0")
+        .prompt(prompt("Write the customer report for {{customer}}."))
+        .execution_route(json!({ "kind": "wyrd_gateway", "deployment": "openai" }));
+    let service = Service::new("finance-release", "1.0.0")
+        .components([Component::new("report-writer", writer)])
+        .verified_by([release_check(&policy)]);
 
     // Upload the policy, declare every Card, and get a ready state.
-    let state = WyrdState::declare_authored(&service).await?;
+    let state = WyrdState::declare(&service).await?;
 
     for report in [
         "Quarterly total $120.",
@@ -76,82 +67,84 @@ async fn main() -> anyhow::Result<()> {
 }
 
 /// `release-check`: two assertions and one Agent check, which reads `policy`.
-fn release_check(policy: &Artifact) -> anyhow::Result<Verifier> {
-    let mut verifier = Verifier::new("release-check", "1.0.0")?;
-
-    // The evidence the app sends, and the JSON Schema each must match.
-    let report = verifier.add_input(
-        "report",
-        json!({
-            "type": "object",
-            "required": ["text"],
-            "properties": { "text": { "type": "string" } },
-        }),
-    )?;
-    let recipient = verifier.add_input(
-        "recipient",
-        json!({
-            "type": "object",
-            "required": ["email", "authorized"],
-            "properties": {
-                "email": { "type": "string" },
-                "authorized": { "type": "boolean" },
-            },
-        }),
-    )?;
-
-    // An assertion: compare a value, no model runs.
-    verifier.add_requirement(Requirement::new(
-        "no-bank-account",
-        "The report names no bank account.",
-        Check::assert(
-            report.at("text")?,
-            ComparisonOperator::NotContains,
-            json!("BANK-ACCOUNT"),
-        ),
-    )?)?;
-
-    // Another assertion.
-    verifier.add_requirement(Requirement::new(
-        "recipient-authorized",
-        "The recipient is authorized.",
-        Check::equals(recipient.at("authorized")?, json!(true)),
-    )?)?;
-
+fn release_check(policy: &Artifact) -> Verifier {
     // An Agent check: `policy-judge` sees the report and the recipient, and
     // reads the policy from `/inputs/policy.json`.
-    let mut judge = AgentCall::new(policy_judge()?);
-    judge.add_input("report", report)?;
-    judge.add_input("recipient", recipient)?;
-    judge.add_workspace_file(
+    let mut follows_policy = Check::agent(policy_judge()).inputs([
+        ("report", "inputs.report"),
+        ("recipient", "inputs.recipient"),
+    ]);
+    follows_policy.add_workspace(
         "/inputs/policy.json",
-        &policy.file("extracted/company-sharing-policy.pdf.json")?,
+        policy.file("extracted/company-sharing-policy.pdf.json"),
     );
-    verifier.add_requirement(Requirement::new(
-        "follows-policy",
-        "The release follows the company sharing policy.",
-        Check::agent(judge),
-    )?)?;
-    Ok(verifier)
+
+    Verifier::new("release-check", "1.0.0")
+        // The evidence the app sends, and the JSON Schema each must match.
+        .inputs([
+            (
+                "report",
+                InputSlot::json(json!({
+                    "type": "object",
+                    "required": ["text"],
+                    "properties": { "text": { "type": "string" } },
+                })),
+            ),
+            (
+                "recipient",
+                InputSlot::json(json!({
+                    "type": "object",
+                    "required": ["email", "authorized"],
+                    "properties": {
+                        "email": { "type": "string" },
+                        "authorized": { "type": "boolean" },
+                    },
+                })),
+            ),
+        ])
+        .requirements([
+            // Assertions: compare a value, no model runs.
+            Requirement::new(
+                "no-bank-account",
+                "The report names no bank account.",
+                Check::assert("inputs.report.text", "not_contains", "BANK-ACCOUNT"),
+            ),
+            Requirement::new(
+                "recipient-authorized",
+                "The recipient is authorized.",
+                Check::assert("inputs.recipient.authorized", "equals", true),
+            ),
+            Requirement::new(
+                "follows-policy",
+                "The release follows the company sharing policy.",
+                follows_policy,
+            ),
+        ])
 }
 
-/// `policy-judge`: a model that reads the policy and returns a verdict on
-/// the release.
-fn policy_judge() -> anyhow::Result<Agent> {
-    let mut prompt = Prompt::new(
-        "openai",
-        "gpt-4o",
+/// `policy-judge`: a model that reads the policy with `fs.read` and returns
+/// a verdict on the release.
+fn policy_judge() -> Agent {
+    let mut prompt = prompt(
         "Read /inputs/policy.json with fs.read. Decide whether this release \
          follows the company sharing policy, citing the report and the policy. \
          Report: {{report}} Recipient: {{recipient}}",
-    )?;
-    prompt.set_response_format(json!("verdict"))?;
+    );
+    prompt["response_format"] = json!("verdict");
+    Agent::new("policy-judge", "1.0.0")
+        .prompt(prompt)
+        .execution_route(json!({ "kind": "wyrd_gateway", "deployment": "openai" }))
+        .tool_names(["fs.read"])
+        .run_config(json!({ "max_iterations": 3 }))
+}
 
-    let mut judge = Agent::new("policy-judge", "1.0.0", prompt)?;
-    judge.set_gateway_route("openai")?;
-    judge.set_tools([BuiltinTool::FsRead.as_str()]);
-    judge.set_max_iterations(3);
-    Ok(judge)
+/// An inline `gpt-4o` Prompt whose one user message is `text`.
+fn prompt(text: &str) -> Value {
+    json!({
+        "provider": "openai",
+        "model": "gpt-4o",
+        "messages": [{ "role": "user", "content": text }],
+    })
 }
 
 /// Print the verdict on `report`, then each requirement that did not pass.

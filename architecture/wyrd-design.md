@@ -2318,29 +2318,46 @@ is available only at `InlineableRef<T>` slots.
 ### In-memory authoring
 
 `wyrd-client::authoring` (`wyrd_ai::authoring` in Rust; the Python and
-TypeScript SDKs wrap it) builds the same Cards in code. Each value is backed
-by its canonical `wyrd-spec` type and edited through inherent constructors
-and `add_*`/`set_*` methods; nothing touches the network, and
-`CodeCall::from_file` reads its source once. Adding a child captures its
-value, duplicate step/requirement IDs, slots, and aliases are refused, and
-every authored Card holds an exact version pin.
+TypeScript SDKs project it) builds the same Cards in code, in the Card YAML's
+own vocabulary. Each named Card type takes `new(name, version)`; each
+sub-value (`Component`, `Binding`, `InputSlot`, `Step`, `Requirement`,
+`Action`, `Check`) takes the fields that identify it. Every other method is
+named for the YAML field it edits and takes that field's YAML value:
+references stay strings such as `inputs.report.text`, operators stay strings
+or their parameterized objects, and nested objects stay canonical JSON. A
+setter consumes the value and replaces its whole field, together with
+everything that field referenced; an `add_*` method appends one entry in
+place. A Service binds each Component's own Verifiers through
+`Component::verified_by`; Model verification belongs on its Component.
 
-A referenced definition becomes a sibling of the containing graph; a
-registered Card stays an external exact reference. An Artifact, local or
-registered, is always referenced externally by exact name and version, with
-no UID. `CardDefinition::declaration` passes the graph through the loader's
-file-tree validation and ordering (`wyrd_loader::declaration_input_from_cards`),
-emits one submission per distinct identity, and refuses two different
-definitions of one identity with `WYRD_SPEC_400_DUPLICATE_SUBMISSION`. No
-local path reaches a submission.
+Construction and editing do no domain validation, file reads, or network IO,
+so incomplete values and forward references are allowed. An attempted
+duplicate add is kept, not dropped, and refused when validated. A Card value
+at a reference position contributes a sibling definition, captured by value;
+an exact `CardRef` stays an external reference; a local Artifact is always
+referenced externally by exact name and version and published first.
+`CodeSource::file` records a path that each snapshot reads.
 
-`Cards::declare_authored` and `WyrdState::declare_authored(_with)` validate
-locally first, publish each local Artifact as its own sole submission
-through `Cards::upload_artifact`, and then declare the graph through
-`Cards::declare`; the state forms pull and hydrate as `declare_with` does.
-There is no rollback: a graph refused after publication leaves the Artifact
-registered for reuse by reference. Code-authored and file-authored forms of
-one graph register identical content and identities.
+`validate()` and `CardDefinition::declaration` snapshot the graph, read its
+code files, and decode each Card through the loader's own envelope decoding
+(`wyrd_loader::parse_card_value`) and file-tree validation and ordering
+(`wyrd_loader::declaration_input_from_cards`). Invalid code and its YAML
+equivalent therefore refuse with the same `WYRD_LOADER_400_INVALID_ENVELOPE`
+diagnostics and field paths, labelled `Kind/name@version` in place of a file.
+Every call validates afresh; nothing caches a result. The declaration emits
+one submission per distinct identity and refuses two different definitions of
+one identity with `WYRD_SPEC_400_DUPLICATE_SUBMISSION`. No local path reaches
+a submission.
+
+`Cards::declare` accepts a native `DeclarationInput`, a path, or an authored
+Card; `WyrdState::declare(_with)` accept a path or an authored Card and pull
+and hydrate the declared root. An authored Card is validated before anything
+is published, then each local Artifact is published as its own sole
+submission through `Cards::upload_artifact`, and the graph is submitted
+through the same declaration saga as every other input. There is no
+rollback: a graph refused after publication, or a dropped future, leaves each
+published Artifact registered for reuse by reference. Code-authored and
+file-authored forms of one graph register identical content and identities.
 
 ### Pre-declaration matrix (Rule 14)
 

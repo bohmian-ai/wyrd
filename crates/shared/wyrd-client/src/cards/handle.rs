@@ -277,7 +277,7 @@ impl Cards {
     /// # Errors
     /// Returns the loader's or the authored graph's local validation error
     /// (`WYRD_LOADER_400_INVALID_ENVELOPE`, or
-    /// `WYRD_SPEC_409_DUPLICATE_SUBMISSION` for two definitions of one
+    /// `WYRD_SPEC_400_DUPLICATE_SUBMISSION` for two definitions of one
     /// identity), [`Self::upload_artifact`]'s errors for a local Artifact,
     /// and the registry's error when validation, declaration, artifact
     /// upload, or completion fails. A graph refused after an Artifact was

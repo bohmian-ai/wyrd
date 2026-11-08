@@ -3816,16 +3816,26 @@ mod pg_tests {
         Ok(())
     }
 
-    /// The scripted `orchestration-desk` model for `specialist-review`: one
-    /// reply per request, chosen by the Agent's prompt marker and the number
-    /// of assistant turns already in its conversation. The planner selects
-    /// specialists by the question's marker (`security: null` when
-    /// `UNDECIDED`), holds its reply for [`HELD_PLAN`] when `HELD`, and
-    /// breaks without a marker; the generalist and security specialist
-    /// publish `account`; the stylist publishes a partial `draft`, then
-    /// breaks; the consolidator reads the `security` and `style` collection
-    /// manifests; the quoter reads `/inputs/security.json`. Every other turn
-    /// finishes with `{"done": true}`.
+    /// The scripted `orchestration-desk` model: one reply per request, chosen
+    /// by the Agent's prompt marker and the number of assistant turns already
+    /// in its conversation. The planner selects specialists by the question's
+    /// marker (`security: null` when `UNDECIDED`), holds its reply for
+    /// [`HELD_PLAN`] when `HELD`, and breaks without a marker; the generalist
+    /// and security specialist publish `account`; the stylist publishes a
+    /// partial `draft`, then breaks; the consolidator reads the `security`
+    /// and `style` collection manifests, or the `extra` one for a `SPEC-`
+    /// question; the quoter reads `/inputs/security.json`. The comparer
+    /// disagrees on `ADMIT`, answers `null` on `BLOCK`, and agrees otherwise;
+    /// a `LATE-DECISION` comparison and a `KNOWN` bootstrap hold their
+    /// replies for [`HELD_REPLY`], and an `EARLY-DECISION` comparison waits
+    /// [`BRIEF_REPLY`] while its extra review holds its first turn for
+    /// [`HELD_REPLY`]; the extra review publishes `account`. A section
+    /// reviewer publishes its section and index; the polisher scores each
+    /// round by its index; the escalation publishes a `note`, then breaks;
+    /// the summarizer reads both collection manifests, publishes `summary`,
+    /// and scores it by its iteration index; the document judge passes,
+    /// citing the document's title. Every other turn finishes with
+    /// `{"done": true}`.
     fn orchestration_desk(request: &wiremock::Request) -> wiremock::ResponseTemplate {
         let body: JsonValue = serde_json::from_slice(&request.body).unwrap_or_default();
         let messages = body["messages"].as_array().cloned().unwrap_or_default();
@@ -3902,8 +3912,118 @@ mod pg_tests {
                 None => garbled(),
             };
         }
+        let first = messages
+            .iter()
+            .find(|message| message["role"] == "user")
+            .and_then(|message| message["content"].as_str())
+            .unwrap_or_default();
+        let field = |key: &str| {
+            first
+                .split_once(key)
+                .and_then(|(_, rest)| rest.split_whitespace().next())
+                .and_then(|value| value.parse::<u64>().ok())
+        };
+        let done = || answer(serde_json::json!({ "done": true }));
+        if prompt.contains("BOOTSTRAP:") {
+            return if prompt.contains("KNOWN") {
+                done().set_delay(HELD_REPLY)
+            } else {
+                done()
+            };
+        }
+        if prompt.contains("COMPARE:") {
+            let agree = if prompt.contains("ADMIT") {
+                JsonValue::Bool(false)
+            } else if prompt.contains("BLOCK") {
+                JsonValue::Null
+            } else {
+                JsonValue::Bool(true)
+            };
+            let reply = answer(serde_json::json!({ "agree": agree }));
+            return if prompt.contains("LATE-DECISION") {
+                reply.set_delay(HELD_REPLY)
+            } else if prompt.contains("EARLY-DECISION") {
+                reply.set_delay(BRIEF_REPLY)
+            } else {
+                reply
+            };
+        }
+        if prompt.contains("EXTRA:") {
+            return match turn {
+                0 if prompt.contains("EARLY-DECISION") => {
+                    publish("e-publish", "account", serde_json::json!({ "extra": true }))
+                        .set_delay(HELD_REPLY)
+                }
+                0 => publish("e-publish", "account", serde_json::json!({ "extra": true })),
+                _ => done(),
+            };
+        }
+        if prompt.contains("SECTION:") {
+            let section = first
+                .strip_prefix("SECTION: ")
+                .and_then(|rest| rest.split_once(" at="))
+                .map(|(section, _)| section)
+                .unwrap_or_default();
+            return match turn {
+                0 => publish(
+                    "d-account",
+                    "account",
+                    serde_json::json!({ "section": section, "at": field("at=").unwrap_or(u64::MAX) }),
+                ),
+                _ => done(),
+            };
+        }
+        if prompt.contains("POLISH:") {
+            let section = first
+                .strip_prefix("POLISH: ")
+                .and_then(|rest| rest.split_once(" item="))
+                .map(|(section, _)| section)
+                .unwrap_or_default();
+            let round = field("round=").unwrap_or_default();
+            return answer(
+                serde_json::json!({ "score": round, "text": format!("{section} v{round}") }),
+            );
+        }
+        if prompt.contains("ESCALATE:") {
+            return match turn {
+                0 => publish("x-note", "note", serde_json::json!({ "escalated": true })),
+                _ => garbled(),
+            };
+        }
+        if prompt.contains("SUMMARIZE:") {
+            let index = field("index=").unwrap_or(u64::MAX);
+            return match turn {
+                0 => calls(&[
+                    (
+                        "m-accounts",
+                        "fs.read",
+                        serde_json::json!({ "path": "/inputs/accounts/manifest.json" }),
+                    ),
+                    (
+                        "m-escalation",
+                        "fs.read",
+                        serde_json::json!({ "path": "/inputs/escalation/manifest.json" }),
+                    ),
+                ]),
+                1 => publish(
+                    "m-summary",
+                    "summary",
+                    serde_json::json!({ "version": index }),
+                ),
+                _ => answer(
+                    serde_json::json!({ "score": index, "text": format!("summary v{index}") }),
+                ),
+            };
+        }
+        if prompt.contains("JUDGE-DOC:") {
+            return answer(serde_json::json!({
+                "outcome": "passed",
+                "reason": "the summary names the report",
+                "citations": [{ "slot": "document", "locator": { "json_pointer": "/title" } }],
+            }));
+        }
         if turn > 0 && !prompt.contains("STYLE:") {
-            return answer(serde_json::json!({ "done": true }));
+            return done();
         }
         if prompt.contains("GENERAL:") {
             publish(
@@ -3929,6 +4049,10 @@ mod pg_tests {
                     serde_json::json!({ "path": format!("/inputs/{collection}/manifest.json") }),
                 )
             };
+            if prompt.contains("SPEC-") {
+                let extra = read("extra");
+                return calls(&[(&extra.0, "fs.read", extra.1)]);
+            }
             let (security, style) = (read("security"), read("style"));
             calls(&[
                 (&security.0, "fs.read", security.1.clone()),
@@ -3948,6 +4072,14 @@ mod pg_tests {
     /// How long the planner holds a `HELD` question's decision, so its
     /// execution is still running when it is cancelled.
     const HELD_PLAN: Duration = Duration::from_secs(5);
+
+    /// How long a held speculative reply waits, so the other side of its
+    /// race settles first.
+    const HELD_REPLY: Duration = Duration::from_secs(3);
+
+    /// How long an early comparison waits, so the bootstrap it races settles
+    /// first while a held extra review is still running.
+    const BRIEF_REPLY: Duration = Duration::from_secs(1);
 
     /// The messages of every request `upstream` received whose prompt
     /// carries both `marker` and `question`, in arrival order.
@@ -4005,6 +4137,201 @@ mod pg_tests {
         Ok(serde_json::from_str(&text.join("\n"))?)
     }
 
+    /// The `(item_index, iteration_index, name)` of every entry of
+    /// `manifest`, sorted.
+    fn entries(manifest: &JsonValue) -> Vec<(Option<u64>, Option<u64>, String)> {
+        let mut entries: Vec<_> = manifest["entries"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .map(|entry| {
+                (
+                    entry["item_index"].as_u64(),
+                    entry["iteration_index"].as_u64(),
+                    entry["name"].as_str().unwrap_or_default().to_owned(),
+                )
+            })
+            .collect();
+        entries.sort();
+        entries
+    }
+
+    /// The first user message of `messages`: the Agent's rendered prompt.
+    fn prompt(messages: &[JsonValue]) -> &str {
+        messages
+            .iter()
+            .find(|message| message["role"] == "user")
+            .and_then(|message| message["content"].as_str())
+            .unwrap_or_default()
+    }
+
+    /// A verification-capable server whose gateway deploys `gpt-4o` on the
+    /// scripted [`orchestration_desk`] upstream, with `orchestration-desk`
+    /// registered and an MCP agent connected as that Service, granted to
+    /// edit, invoke the gateway, and call every tool.
+    struct OrchestrationDesk {
+        /// The scripted model upstream.
+        upstream: wiremock::MockServer,
+        /// The server.
+        server: WyrdTestServer,
+        /// The Service's runtime account.
+        principal: Bootstrap,
+        /// The MCP agent, acting as `principal` at its root.
+        agent: RunningService<RoleClient, ()>,
+        /// The `orchestration-desk` Service's UID.
+        desk_uid: String,
+        /// The UID of every Card the desk registered, by name.
+        uids: std::collections::BTreeMap<String, String>,
+    }
+
+    impl OrchestrationDesk {
+        /// Start the scripted upstream and the server, register
+        /// `orchestration-desk`, and connect its agent.
+        ///
+        /// # Errors
+        ///
+        /// Returns provider, server, fixture, bootstrap, or MCP transport
+        /// failures, or an error when a registered Card carries no UID.
+        async fn start() -> Result<Self, McpJourneyError> {
+            let upstream = wiremock::MockServer::start().await;
+            wiremock::Mock::given(wiremock::matchers::method("POST"))
+                .and(wiremock::matchers::path("/v1/chat/completions"))
+                .respond_with(orchestration_desk)
+                .mount(&upstream)
+                .await;
+            let server = Box::pin(
+                WyrdTestServer::builder()
+                    .with_verification_runtime_for_test()
+                    .with_gateway_provider_root_for_test(upstream.uri().parse()?)
+                    .start_bound(),
+            )
+            .await?;
+            server
+                .deploy_gateway_model_for_test("gpt-4o", "mcp_orchestration_invoker")
+                .await?;
+            server
+                .seed_role("mcp_orchestration_tools", &[Permission::tool_invoke_any()])
+                .await?;
+            let admin = server
+                .bootstrap_service("mcp-orchestration-admin", &["admin"])
+                .await?;
+            let cards = Cards::connect_with(&client(&server, api_key(&admin)?)?).await?;
+            let desk = Box::pin(cards.declare_from_path(Path::new(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/../../../fixtures/cards/verifier_orchestration/orchestration-desk.yaml"
+            ))))
+            .await?;
+            let uids = desk
+                .outcomes
+                .iter()
+                .filter_map(|outcome| {
+                    let uid = outcome.card_ref.uid.as_ref()?;
+                    Some((outcome.card_ref.name.as_str().to_owned(), uid.to_string()))
+                })
+                .collect();
+            let desk_uid = desk
+                .root
+                .uid
+                .clone()
+                .ok_or("a registered Card has a UID")?
+                .to_string();
+            let principal = server
+                .credential_registered_service(
+                    &desk.root,
+                    &[
+                        "editor",
+                        "mcp_orchestration_invoker",
+                        "mcp_orchestration_tools",
+                    ],
+                )
+                .await?;
+            let agent = connect_rooted(&server, &principal).await?;
+            Ok(Self {
+                upstream,
+                server,
+                principal,
+                agent,
+                desk_uid,
+                uids,
+            })
+        }
+
+        /// Enqueue `inputs` for the desk's Verifier `verifier` over MCP and
+        /// return the execution's ID.
+        ///
+        /// # Errors
+        ///
+        /// Returns an error when the desk registered no such Verifier or the
+        /// enqueue is refused.
+        async fn enqueue(
+            &self,
+            verifier: &str,
+            inputs: JsonValue,
+        ) -> Result<String, McpJourneyError> {
+            let arguments = serde_json::json!({
+                "verifier_card_uid": self.uids.get(verifier).ok_or("the desk registers the Verifier")?,
+                "card_uid": self.desk_uid,
+                "inputs": inputs,
+            });
+            let accepted = structured(self.agent.call_tool(call(ENQUEUE, arguments)?).await?)?;
+            Ok(text(&accepted, "/execution_id")?.to_owned())
+        }
+
+        /// Enqueue `question` for `verifier` as its JSON `question` input.
+        ///
+        /// # Errors
+        ///
+        /// Returns the [`Self::enqueue`] failures.
+        async fn ask(&self, verifier: &str, question: &str) -> Result<String, McpJourneyError> {
+            self.enqueue(
+                verifier,
+                serde_json::json!({ "question": { "kind": "json", "value": question } }),
+            )
+            .await
+        }
+
+        /// Every publication of `execution_id`, listed over MCP.
+        ///
+        /// # Errors
+        ///
+        /// Returns tool-call or decode failures.
+        async fn publications(
+            &self,
+            execution_id: &str,
+        ) -> Result<PublicationPage, McpJourneyError> {
+            Ok(serde_json::from_value(structured(
+                self.agent
+                    .call_tool(call(
+                        "verification.list_publications",
+                        serde_json::json!({ "execution_id": execution_id }),
+                    )?)
+                    .await?,
+            )?)?)
+        }
+
+        /// Disconnect the agent and stop the server.
+        ///
+        /// # Errors
+        ///
+        /// Returns MCP transport or server shutdown failures.
+        async fn shutdown(self) -> Result<(), McpJourneyError> {
+            self.agent.cancel().await?;
+            self.server.shutdown().await?;
+            Ok(())
+        }
+    }
+
+    /// The step `id` of an execution `outcome`, or `null` when absent.
+    fn step(outcome: &JsonValue, id: &str) -> JsonValue {
+        outcome["steps"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .find(|step| step["id"] == id)
+            .cloned()
+            .unwrap_or_default()
+    }
+
     /// `specialist-review` over MCP: an agent enqueues each question, polls
     /// `verification.get_execution` to its result, and reads the execution's
     /// publications, against the same `orchestration-desk` Verifiers the SDK
@@ -4050,70 +4377,9 @@ mod pg_tests {
             published: &'static [(&'static str, &'static str)],
         }
 
-        let upstream = wiremock::MockServer::start().await;
-        wiremock::Mock::given(wiremock::matchers::method("POST"))
-            .and(wiremock::matchers::path("/v1/chat/completions"))
-            .respond_with(orchestration_desk)
-            .mount(&upstream)
-            .await;
-        let server = Box::pin(
-            WyrdTestServer::builder()
-                .with_verification_runtime_for_test()
-                .with_gateway_provider_root_for_test(upstream.uri().parse()?)
-                .start_bound(),
-        )
-        .await?;
-        server
-            .deploy_gateway_model_for_test("gpt-4o", "mcp_orchestration_invoker")
-            .await?;
-        server
-            .seed_role("mcp_orchestration_tools", &[Permission::tool_invoke_any()])
-            .await?;
-        let admin = server
-            .bootstrap_service("mcp-orchestration-admin", &["admin"])
-            .await?;
-        let cards = Cards::connect_with(&client(&server, api_key(&admin)?)?).await?;
-        let desk = Box::pin(cards.declare_from_path(Path::new(concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/../../../fixtures/cards/verifier_orchestration/orchestration-desk.yaml"
-        ))))
-        .await?;
-        let review = desk
-            .outcomes
-            .iter()
-            .find(|outcome| outcome.card_ref.name.as_str() == "specialist-review")
-            .and_then(|outcome| outcome.card_ref.uid.as_ref())
-            .ok_or("orchestration-desk registers specialist-review")?
-            .to_string();
-        let desk_uid = desk
-            .root
-            .uid
-            .clone()
-            .ok_or("a registered Card has a UID")?
-            .to_string();
-        let principal = server
-            .credential_registered_service(
-                &desk.root,
-                &[
-                    "editor",
-                    "mcp_orchestration_invoker",
-                    "mcp_orchestration_tools",
-                ],
-            )
-            .await?;
-        let agent = connect_rooted(&server, &principal).await?;
-        let enqueue = |question: &str| {
-            let agent = &agent;
-            let arguments = serde_json::json!({
-                "verifier_card_uid": review,
-                "card_uid": desk_uid,
-                "inputs": { "question": { "kind": "json", "value": question } },
-            });
-            async move {
-                let accepted = structured(agent.call_tool(call(ENQUEUE, arguments)?).await?)?;
-                Ok::<_, McpJourneyError>(text(&accepted, "/execution_id")?.to_owned())
-            }
-        };
+        let desk = OrchestrationDesk::start().await?;
+        let (upstream, agent) = (&desk.upstream, &desk.agent);
+        let enqueue = |question: &'static str| desk.ask("specialist-review", question);
 
         let cases = [
             Case {
@@ -4152,17 +4418,9 @@ mod pg_tests {
         for case in cases {
             let question = case.question;
             let id = enqueue(question).await?;
-            let state = settle(&agent, &id).await?;
+            let state = settle(agent, &id).await?;
             let outcome = &state["result"]["outcome"];
-            let step = |id: &str| {
-                outcome["steps"]
-                    .as_array()
-                    .into_iter()
-                    .flatten()
-                    .find(|step| step["id"] == id)
-                    .cloned()
-                    .unwrap_or_default()
-            };
+            let step = |id: &str| step(outcome, id);
             let statuses =
                 ["plan", "security", "style", "quote"].map(|id| step(id)["status"].clone());
             assert_eq!(
@@ -4202,10 +4460,10 @@ mod pg_tests {
                 );
             }
             for marker in ["GENERAL:", "SECURITY:", "STYLE:", "CONSOLIDATE:", "QUOTE:"] {
-                let ran = !asked(&upstream, marker, question).await?.is_empty();
+                let ran = !asked(upstream, marker, question).await?.is_empty();
                 assert_eq!(ran, case.called.contains(&marker), "{question}: {marker}");
             }
-            let consolidator = asked(&upstream, "CONSOLIDATE:", question).await?;
+            let consolidator = asked(upstream, "CONSOLIDATE:", question).await?;
             let read = consolidator
                 .last()
                 .ok_or("the consolidator called the model")?;
@@ -4229,14 +4487,7 @@ mod pg_tests {
                     "{question}: {collection} {manifest}"
                 );
             }
-            let page: PublicationPage = serde_json::from_value(structured(
-                agent
-                    .call_tool(call(
-                        "verification.list_publications",
-                        serde_json::json!({ "execution_id": id }),
-                    )?)
-                    .await?,
-            )?)?;
+            let page = desk.publications(&id).await?;
             let mut published: Vec<_> = page
                 .items
                 .iter()
@@ -4254,7 +4505,7 @@ mod pg_tests {
 
         let held = enqueue("HELD").await?;
         let deadline = tokio::time::Instant::now() + SETTLE;
-        while asked(&upstream, "PLAN:", "HELD").await?.is_empty() {
+        while asked(upstream, "PLAN:", "HELD").await?.is_empty() {
             if tokio::time::Instant::now() >= deadline {
                 return Err("the held plan never reached the model".into());
             }
@@ -4272,10 +4523,384 @@ mod pg_tests {
             (cancelled.execution_id.to_string(), cancelled.status),
             (held.clone(), VerificationExecutionStatus::Cancelled)
         );
-        let state = settle(&agent, &held).await?;
+        let state = settle(agent, &held).await?;
         assert_eq!(state["status"], "cancelled", "{state}");
-        agent.cancel().await?;
-        server.shutdown().await?;
-        Ok(())
+        desk.shutdown().await
+    }
+
+    /// `document-pipeline` over MCP, on the same `orchestration-desk`
+    /// declarations the SDK journeys use: the agent plans the field report
+    /// through `verification.evidence`, uploads it through the shared storage
+    /// routes, enqueues it as a `file` input, and reads the settled result.
+    /// The document's sections fan out as array work in input order, the
+    /// duplicate section keeping its own index; each section is polished by
+    /// its own sequential repeat, the final values in input order; the empty
+    /// appendix calls no reviewer and settles `[]`; the flagged document
+    /// escalates and its failed escalation keeps its partial note; the
+    /// summarizer refines one iteration at a time over both settled
+    /// collections within its original bound. The final requirements pass,
+    /// fail, and stay inconclusive by their own evidence, and the cited
+    /// judgment points into the uploaded document.
+    ///
+    /// # Errors
+    ///
+    /// Returns provider, server, fixture, bootstrap, MCP transport, upload,
+    /// tool-call, or decode failures, or an error when the execution never
+    /// settles.
+    ///
+    /// # Panics
+    ///
+    /// Panics when a step, a model call, a manifest, an iteration, a
+    /// publication, a citation, or an outcome differs.
+    #[tokio::test(flavor = "multi_thread")]
+    #[ignore = "requires the Postgres-backed Bifrost journey lane"]
+    async fn verifier_orchestration_document_pipeline_uses_array_repeat_and_publications()
+    -> Result<(), McpJourneyError> {
+        use sha2::Digest as _;
+        use std::collections::BTreeMap;
+
+        let desk = OrchestrationDesk::start().await?;
+        let document = std::fs::read(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../../fixtures/cards/verifier_orchestration/samples/field-report.json"
+        ))?;
+        let sha256 = format!("{:x}", sha2::Sha256::digest(&document));
+        let planned = structured(
+            desk.agent
+                .call_tool(call(
+                    EVIDENCE,
+                    serde_json::json!({ "files": [{ "sha256": sha256, "size_bytes": document.len() }] }),
+                )?)
+                .await?,
+        )?;
+        upload_planned(
+            &rooted_client(&desk.server, &desk.principal)?,
+            desk.server.base_url().ok_or("a bound server has a URL")?,
+            &planned,
+            &document,
+        )
+        .await?;
+        let id = desk
+            .enqueue(
+                "document-pipeline",
+                serde_json::json!({ "document": { "kind": "file", "sha256": sha256,
+                                                  "size_bytes": document.len(), "format": "json" } }),
+            )
+            .await?;
+        let state = settle(&desk.agent, &id).await?;
+        let outcome = &state["result"]["outcome"];
+
+        let sections = step(outcome, "sections");
+        assert_eq!(
+            (&sections["status"], &sections["output"]),
+            (
+                &JsonValue::from("succeeded"),
+                &serde_json::json!([{ "done": true }, { "done": true }, { "done": true }])
+            ),
+            "{state}"
+        );
+        let reviews = asked(&desk.upstream, "SECTION:", "").await?;
+        let reviewed: BTreeSet<&str> = reviews
+            .iter()
+            .filter_map(|messages| prompt(messages).strip_prefix("SECTION: "))
+            .collect();
+        assert_eq!(
+            reviewed,
+            BTreeSet::from(["claims at=1", "claims at=2", "intro at=0"]),
+            "the duplicate keeps its own index and the empty appendix calls no reviewer"
+        );
+        let polish = step(outcome, "polish");
+        assert_eq!(
+            (&polish["status"], &polish["output"]),
+            (
+                &JsonValue::from("succeeded"),
+                &serde_json::json!([
+                    { "score": 1, "text": "intro v1" },
+                    { "score": 1, "text": "claims v1" },
+                    { "score": 1, "text": "claims v1" }
+                ])
+            ),
+            "each section repeats independently and the final values keep input order"
+        );
+        let mut rounds: BTreeMap<String, Vec<String>> = BTreeMap::new();
+        for messages in asked(&desk.upstream, "POLISH:", "").await? {
+            if let Some((item, round)) = prompt(&messages)
+                .split_once(" item=")
+                .and_then(|(_, rest)| rest.split_once(" round="))
+            {
+                rounds
+                    .entry(item.to_owned())
+                    .or_default()
+                    .push(round.to_owned());
+            }
+        }
+        assert_eq!(
+            rounds,
+            BTreeMap::from(
+                ["0", "1", "2"].map(|item| (item.to_owned(), vec!["0".to_owned(), "1".to_owned()]))
+            ),
+            "every item runs its own rounds in order until its condition holds"
+        );
+        let appendix = step(outcome, "appendix");
+        assert_eq!(
+            (&appendix["status"], &appendix["output"]),
+            (&JsonValue::from("succeeded"), &serde_json::json!([])),
+            "{appendix}"
+        );
+        assert_eq!(step(outcome, "escalate")["status"], "failed", "{state}");
+        let summarize = step(outcome, "summarize");
+        assert_eq!(
+            (&summarize["status"], &summarize["output"]),
+            (
+                &JsonValue::from("succeeded"),
+                &serde_json::json!({ "score": 1, "text": "summary v1" })
+            ),
+            "{summarize}"
+        );
+        let summaries = asked(&desk.upstream, "SUMMARIZE:", "").await?;
+        let iterations: Vec<&str> = summaries
+            .iter()
+            .filter_map(|messages| {
+                prompt(messages)
+                    .split_once(" index=")?
+                    .1
+                    .split_whitespace()
+                    .next()
+            })
+            .collect();
+        assert_eq!(
+            iterations,
+            ["0", "0", "0", "1", "1", "1"],
+            "one iteration at a time, stopping within the bound of 3"
+        );
+        assert!(
+            prompt(summaries.first().ok_or("the summarizer called the model")?)
+                .ends_with("previous=null"),
+            "{summaries:?}"
+        );
+        let read = summaries.get(1).ok_or("the summarizer read its inputs")?;
+        assert_eq!(
+            entries(&manifest(read, "m-accounts")?),
+            (0..3)
+                .map(|item| (Some(item), None, "account".to_owned()))
+                .collect::<Vec<_>>()
+        );
+        let escalation = manifest(read, "m-escalation")?;
+        assert_eq!(
+            (escalation["status"].as_str(), entries(&escalation)),
+            (Some("failed"), vec![(None, None, "note".to_owned())]),
+            "the failed escalation keeps its partial note"
+        );
+        let mut accounts = Vec::new();
+        for publication in desk.publications(&id).await?.items {
+            if publication.producer.step_id.as_str() != "sections" {
+                continue;
+            }
+            let read: Publication = serde_json::from_value(structured(
+                desk.agent
+                    .call_tool(call(
+                        "verification.get_publication",
+                        serde_json::json!({
+                            "execution_id": id,
+                            "step_id": "sections",
+                            "name": publication.name.as_str(),
+                            "attempt": publication.producer.attempt,
+                            "item_index": publication.producer.item_index,
+                        }),
+                    )?)
+                    .await?,
+            )?)?;
+            accounts.push((publication.producer.item_index, read.content));
+        }
+        accounts.sort_by_key(|(item, _)| *item);
+        assert_eq!(
+            accounts,
+            [
+                (Some(0), serde_json::json!({ "section": "intro", "at": 0 })),
+                (Some(1), serde_json::json!({ "section": "claims", "at": 1 })),
+                (Some(2), serde_json::json!({ "section": "claims", "at": 2 })),
+            ]
+            .map(|(item, value)| (item, PublicationContent::Json { value }))
+        );
+
+        let requirements: BTreeMap<&str, &JsonValue> = outcome["requirements"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|judged| Some((judged["id"].as_str()?, judged)))
+            .collect();
+        let outcomes: BTreeMap<&str, &str> = requirements
+            .iter()
+            .filter_map(|(id, judged)| Some((*id, judged["outcome"].as_str()?)))
+            .collect();
+        assert_eq!(
+            outcomes,
+            BTreeMap::from([
+                ("appendix-reviewed", "failed"),
+                ("cited", "passed"),
+                ("escalation-done", "inconclusive"),
+                ("summarized", "passed"),
+            ]),
+            "{state}"
+        );
+        assert_eq!(
+            requirements.get("cited").map(|cited| &cited["citations"]),
+            Some(&serde_json::json!([
+                { "slot": "document", "locator": { "json_pointer": "/title" } }
+            ]))
+        );
+        assert_eq!(outcome["verdict"], "failed", "{state}");
+        desk.shutdown().await
+    }
+
+    /// `speculative-review` over MCP, on the same `orchestration-desk`
+    /// declarations the SDK journeys use. After the bootstrap succeeds, the
+    /// extra review runs while the comparison is pending. A disagreement
+    /// admits it whether it finished before or after the decision; an
+    /// agreement discards completed work or cancels running work; a `null`
+    /// comparison blocks it; a decision known before the extra review is
+    /// eligible makes no call. The consolidator only ever reads the recorded
+    /// disposition and receives the account only when it was admitted, while
+    /// `verification.list_publications` keeps the excluded account with its
+    /// disposition.
+    ///
+    /// # Errors
+    ///
+    /// Returns provider, server, fixture, bootstrap, MCP transport,
+    /// tool-call, or decode failures, or an error when an execution never
+    /// settles.
+    ///
+    /// # Panics
+    ///
+    /// Panics when a call, a status, a disposition, a mounted entry, or a
+    /// retained publication differs.
+    #[tokio::test(flavor = "multi_thread")]
+    #[ignore = "requires the Postgres-backed Bifrost journey lane"]
+    async fn verifier_orchestration_speculative_disposition_controls_consumer_admission()
+    -> Result<(), McpJourneyError> {
+        use wyrd_spec::verification::execution::Speculation;
+
+        /// One question's expected observations.
+        struct Case {
+            /// The question, carrying the comparer's and timing markers.
+            question: &'static str,
+            /// Whether the extra review called the model.
+            called: bool,
+            /// The `extra` step's status.
+            status: &'static str,
+            /// The `extra` manifest's speculation.
+            speculation: &'static str,
+            /// The `extra` manifest's entry names.
+            entries: &'static [&'static str],
+            /// The speculation of every retained `extra` publication.
+            retained: &'static [Speculation],
+        }
+
+        let desk = OrchestrationDesk::start().await?;
+        let cases = [
+            Case {
+                question: "SPEC-ADMIT-LATE-DECISION",
+                called: true,
+                status: "succeeded",
+                speculation: "admitted",
+                entries: &["account"],
+                retained: &[Speculation::Admitted],
+            },
+            Case {
+                question: "SPEC-ADMIT-EARLY-DECISION",
+                called: true,
+                status: "succeeded",
+                speculation: "admitted",
+                entries: &["account"],
+                retained: &[Speculation::Admitted],
+            },
+            Case {
+                question: "SPEC-DISCARD-LATE-DECISION",
+                called: true,
+                status: "skipped",
+                speculation: "discarded",
+                entries: &[],
+                retained: &[Speculation::Discarded],
+            },
+            Case {
+                question: "SPEC-DISCARD-EARLY-DECISION",
+                called: true,
+                status: "skipped",
+                speculation: "discarded",
+                entries: &[],
+                retained: &[],
+            },
+            Case {
+                question: "SPEC-BLOCK-LATE-DECISION",
+                called: true,
+                status: "failed",
+                speculation: "blocked",
+                entries: &[],
+                retained: &[Speculation::Blocked],
+            },
+            Case {
+                question: "SPEC-KNOWN",
+                called: false,
+                status: "skipped",
+                speculation: "discarded",
+                entries: &[],
+                retained: &[],
+            },
+        ];
+        for case in cases {
+            let question = case.question;
+            let id = desk.ask("speculative-review", question).await?;
+            let state = settle(&desk.agent, &id).await?;
+            let outcome = &state["result"]["outcome"];
+            let consolidated = outcome["requirements"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .find(|requirement| requirement["id"] == "consolidated")
+                .map(|requirement| requirement["outcome"].clone());
+            assert_eq!(
+                consolidated,
+                Some(JsonValue::from("passed")),
+                "{question}: {state}"
+            );
+            assert_eq!(
+                step(outcome, "extra")["status"],
+                case.status,
+                "{question}: {state}"
+            );
+            assert_eq!(
+                !asked(&desk.upstream, "EXTRA:", question).await?.is_empty(),
+                case.called,
+                "{question}"
+            );
+            let consolidator = asked(&desk.upstream, "CONSOLIDATE:", question).await?;
+            let manifest = manifest(
+                consolidator
+                    .last()
+                    .ok_or("the consolidator called the model")?,
+                "c-extra",
+            )?;
+            let entries: Vec<&str> = manifest["entries"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter_map(|entry| entry["name"].as_str())
+                .collect();
+            assert_eq!(
+                (manifest["speculation"].as_str(), entries.as_slice()),
+                (Some(case.speculation), case.entries),
+                "{question}: {manifest}"
+            );
+            let retained: Vec<Speculation> = desk
+                .publications(&id)
+                .await?
+                .items
+                .iter()
+                .filter(|publication| publication.producer.step_id.as_str() == "extra")
+                .map(|publication| publication.speculation)
+                .collect();
+            assert_eq!(retained, case.retained, "{question}");
+        }
+        desk.shutdown().await
     }
 }

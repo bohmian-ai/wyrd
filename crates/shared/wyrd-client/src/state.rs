@@ -654,8 +654,78 @@ impl WyrdState {
         };
         let cards = Cards::connect_with(&client).await?;
         let receipt = cards.declare_from_path(path).await?;
-        let root = CardSelector::exact(receipt.root);
-        if let Some(bundle_dir) = options.bundle_dir {
+        Self::pull_declared(&cards, client, receipt.root, options.bundle_dir).await
+    }
+
+    /// Declare an authored Card graph and return its state, ready to run, as
+    /// the ambient client.
+    ///
+    /// # Arguments
+    /// * `definition` - The root definition, usually a Service.
+    ///
+    /// # Errors
+    /// As [`Self::declare_authored_with`].
+    pub async fn declare_authored<S>(
+        definition: &crate::authoring::Definition<S>,
+    ) -> Result<Self, WyrdError>
+    where
+        S: Clone,
+        crate::authoring::CardDefinition: From<crate::authoring::Definition<S>>,
+    {
+        Self::declare_authored_with(definition, DeclareOptions::default()).await
+    }
+
+    /// Declare an authored Card graph and return its state, ready to run,
+    /// with `options`.
+    ///
+    /// The in-memory counterpart of [`Self::declare_with`]: local Artifacts
+    /// are published and the graph declared as
+    /// [`crate::cards::Cards::declare_authored`] describes, then the declared
+    /// root's complete graph is pulled and loaded exactly as for a Card file.
+    ///
+    /// # Arguments
+    /// * `definition` - The root definition, usually a Service.
+    /// * `options` - The client and the optional caller-owned bundle directory.
+    ///
+    /// # Errors
+    /// Returns the client's configuration or credential error,
+    /// [`crate::cards::Cards::declare_authored`]'s errors, the pull's error,
+    /// and [`Self::from_path`]'s errors for the bundle.
+    ///
+    /// # Cancellation
+    /// As [`Self::declare_with`].
+    pub async fn declare_authored_with<S>(
+        definition: &crate::authoring::Definition<S>,
+        options: DeclareOptions,
+    ) -> Result<Self, WyrdError>
+    where
+        S: Clone,
+        crate::authoring::CardDefinition: From<crate::authoring::Definition<S>>,
+    {
+        let client = match options.client {
+            Some(client) => client,
+            None => WyrdClient::from_global().map_err(WyrdError::from)?,
+        };
+        let cards = Cards::connect_with(&client).await?;
+        let receipt = cards.declare_authored(definition).await?;
+        Self::pull_declared(&cards, client, receipt.root, options.bundle_dir).await
+    }
+
+    /// Pull the declared `root`'s complete graph and load it as the state of
+    /// `client`, into `bundle_dir` or a temporary directory removed before
+    /// this returns.
+    ///
+    /// # Errors
+    /// Returns the pull's error and [`Self::from_path`]'s errors for the
+    /// bundle.
+    async fn pull_declared(
+        cards: &Cards,
+        client: WyrdClient,
+        root: CardRef,
+        bundle_dir: Option<PathBuf>,
+    ) -> Result<Self, WyrdError> {
+        let root = CardSelector::exact(root);
+        if let Some(bundle_dir) = bundle_dir {
             cards.pull(root, &bundle_dir, BundleMode::Complete).await?;
             return Self::from_path_with(&bundle_dir, client);
         }

@@ -321,6 +321,52 @@ impl Cards {
         Ok(self.declare(&upload.input).await?.root)
     }
 
+    /// Declare an authored Card graph: publish each local Artifact it
+    /// references, then declare the graph.
+    ///
+    /// The graph is snapshotted and validated locally first
+    /// ([`crate::authoring::CardDefinition::declaration`]), so an invalid
+    /// definition publishes nothing. Each local Artifact is then published as
+    /// its own sole submission through [`Self::upload_artifact`], in reference
+    /// order, and the graph through [`Self::declare`]. A registered Artifact
+    /// or Card reference is used as is, with nothing prepared or uploaded.
+    /// Both steps follow the registry's version rules, so an unchanged rerun
+    /// declares nothing new.
+    ///
+    /// # Arguments
+    /// * `definition` - The root definition; every definition it references
+    ///   is declared with it.
+    ///
+    /// # Errors
+    /// Returns the local validation errors of
+    /// [`crate::authoring::CardDefinition::declaration`],
+    /// [`Self::upload_artifact`]'s errors for a local Artifact, and
+    /// [`Self::declare`]'s errors for the graph. A graph refused after an
+    /// Artifact was published keeps that Artifact version registered.
+    pub async fn declare_authored<S>(
+        &self,
+        definition: &crate::authoring::Definition<S>,
+    ) -> Result<DeclarationReceipt, WyrdError>
+    where
+        S: Clone,
+        crate::authoring::CardDefinition: From<crate::authoring::Definition<S>>,
+    {
+        let declaration =
+            crate::authoring::CardDefinition::from(definition.clone()).declaration()?;
+        for artifact in &declaration.artifacts {
+            if let Some(source) = artifact.source() {
+                self.upload_artifact(
+                    &source.path,
+                    artifact.metadata().clone(),
+                    artifact.spec().clone(),
+                    source.extract,
+                )
+                .await?;
+            }
+        }
+        self.declare(&declaration.input).await
+    }
+
     /// The server-authoritative file inventory of one Card: each file's
     /// path, length, digest, and content type.
     ///

@@ -1,0 +1,43 @@
+# Once the bootstrap succeeds, an extra review starts while the comparison
+# is pending; the comparison admits it when the first reviews disagree and
+# discards it when they agree. The consolidator reads the extra review's
+# collection only once the decision is recorded.
+apiVersion: wyrd/v1
+kind: Verifier
+metadata:
+  name: speculative-review
+  version: 1.0.0
+spec:
+  description: A speculative extra review admitted or discarded by a comparison.
+  inputs:
+    question: {type: json, schema: {type: string}}
+  steps:
+    - id: bootstrap
+      action:
+        kind: agent
+        agent: ./bootstrapper.yaml
+        inputs: {question: inputs.question}
+    - id: compare
+      action:
+        kind: agent
+        agent: ./comparer.yaml
+        inputs: {question: inputs.question}
+    - id: extra
+      depends_on: {any_succeeded: [bootstrap]}
+      speculative: true
+      when: {path: steps.compare.output.agree, operator: equals, expected: false}
+      action:
+        kind: agent
+        agent: ./extra-reviewer.yaml
+        inputs: {question: inputs.question}
+    - id: consolidate
+      action:
+        kind: agent
+        agent: ./consolidator.yaml
+        inputs: {question: inputs.question}
+        workspace:
+          /inputs/extra: steps.extra.publications
+  requirements:
+    - id: consolidated
+      statement: The consolidator read the extra review's collection
+      check: {kind: assert, path: steps.consolidate.output.done, operator: equals, expected: true}

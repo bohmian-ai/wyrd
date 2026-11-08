@@ -11,3 +11,4 @@ spec:
     - verifier: ./review-sweep.yaml
     - verifier: ./specialist-review.yaml
     - verifier: ./specialists-only.yaml
+    - verifier: ./speculative-review.yaml

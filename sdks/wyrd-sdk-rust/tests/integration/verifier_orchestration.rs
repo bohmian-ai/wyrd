@@ -13,12 +13,16 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::time::Duration;
 
 use serde_json::{Value, json};
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, Request, ResponseTemplate};
 use wyrd_ai::state::WyrdState;
-use wyrd_ai::verify::{Execution, ExecutionPageQuery, PublicationSummary};
+use wyrd_ai::verify::{
+    Execution, ExecutionPageQuery, PublicationContent, PublicationName, PublicationSelector,
+    PublicationSummary, Speculation, TaskId,
+};
 use wyrd_ai::{RequirementOutcome, StepStatus, VerificationResult};
 
 use crate::hosted_agent_tools::{builder, calls, done, lines, messages, results, text, turn};
@@ -30,6 +34,13 @@ use crate::verifier_building_blocks::{completion, grants, requirement, step};
 fn answer(value: &Value) -> ResponseTemplate {
     completion(json!({ "role": "assistant", "content": value.to_string() }))
 }
+
+/// How long a held reply waits, so the other side of a race settles first.
+const HELD: Duration = Duration::from_secs(3);
+
+/// How long an early decision waits, so the bootstrap it races settles
+/// first while a held extra review is still running.
+const BRIEF: Duration = Duration::from_secs(1);
 
 /// What the scripted model remembers across requests.
 #[derive(Default)]
@@ -60,7 +71,10 @@ fn numbered(messages: &[Value]) -> Option<usize> {
 /// marker and turn. Reviewer 0's first attempt gets an undecodable reply
 /// after its first turn, so its item retries as a second attempt. The
 /// planner decides by the question's marker and breaks without one; the
-/// stylist publishes a partial draft, then breaks.
+/// stylist publishes a partial draft, then breaks. A `LATE-DECISION`
+/// comparison and a `KNOWN` bootstrap hold their replies; an
+/// `EARLY-DECISION` comparison waits briefly while its extra review holds
+/// its first turn longer.
 fn reply(request: &Request, script: &Script) -> ResponseTemplate {
     let messages = messages(request);
     let prompt = text(&messages);
@@ -105,6 +119,8 @@ fn reply(request: &Request, script: &Script) -> ResponseTemplate {
         };
         let reads: Vec<_> = if prompt.contains("SWEEP-RUN") {
             vec![read("accounts")]
+        } else if prompt.contains("SPEC-") {
+            vec![read("extra")]
         } else {
             vec![read("general"), read("security"), read("style")]
         };
@@ -156,6 +172,48 @@ fn reply(request: &Request, script: &Script) -> ResponseTemplate {
                 json!({ "name": "draft", "value": { "partial": true } }),
             )]),
             _ => ResponseTemplate::new(200).set_body_json(json!({ "garbled": true })),
+        };
+    }
+    if prompt.contains("BOOTSTRAP:") {
+        let reply = answer(&json!({ "done": true }));
+        return if prompt.contains("KNOWN") {
+            reply.set_delay(HELD)
+        } else {
+            reply
+        };
+    }
+    if prompt.contains("COMPARE:") {
+        let agree = if prompt.contains("ADMIT") {
+            json!(false)
+        } else if prompt.contains("BLOCK") {
+            Value::Null
+        } else {
+            json!(true)
+        };
+        let reply = answer(&json!({ "agree": agree }));
+        return if prompt.contains("LATE-DECISION") {
+            reply.set_delay(HELD)
+        } else if prompt.contains("EARLY-DECISION") {
+            reply.set_delay(BRIEF)
+        } else {
+            reply
+        };
+    }
+    if prompt.contains("EXTRA:") {
+        return match turn {
+            0 => {
+                let reply = calls(&[(
+                    "e-publish",
+                    "publish",
+                    json!({ "name": "account", "value": { "extra": true } }),
+                )]);
+                if prompt.contains("EARLY-DECISION") {
+                    reply.set_delay(HELD)
+                } else {
+                    reply
+                }
+            }
+            _ => done(),
         };
     }
     if prompt.contains("QUOTE:") {
@@ -544,5 +602,165 @@ async fn conditions_and_collections_preserve_missing_evidence() {
             wyrd_ai::VerificationVerdict::Inconclusive
         )
     );
+    desk.deployment.shutdown().await;
+}
+
+/// One `speculative-review` question's expected observations.
+struct Speculated {
+    /// The question, carrying the comparison's and timing's markers.
+    question: &'static str,
+    /// Whether the extra reviewer was called at all.
+    called: bool,
+    /// The extra step's status.
+    status: StepStatus,
+    /// The disposition the consolidator's manifest reports.
+    speculation: &'static str,
+    /// The entry names the consolidator was given.
+    entries: &'static [&'static str],
+    /// The disposition the execution's publication listing reports for the
+    /// extra account, when one was published.
+    retained: Option<Speculation>,
+}
+
+/// After the bootstrap succeeds, the extra review runs while the comparison
+/// is pending. A disagreement admits it whether it finished before or after
+/// the decision; an agreement discards completed work or cancels running
+/// work; a `null` comparison blocks it; a decision known before the extra
+/// review is eligible makes no call. The consolidator only ever reads the
+/// recorded disposition, never a pending one, and receives the account only
+/// when it was admitted, while an authorized reader still inspects the
+/// retained excluded account with its disposition.
+///
+/// # Panics
+/// Panics when a verification is refused or a call, status, disposition,
+/// mounted entry, or retained publication differs.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires the repository-managed Postgres journey lifecycle"]
+async fn speculative_disposition_controls_consumer_admission() {
+    use StepStatus::{Failed, Skipped, Succeeded};
+    let desk = Desk::start().await;
+    let cases = [
+        Speculated {
+            question: "SPEC-ADMIT-LATE-DECISION",
+            called: true,
+            status: Succeeded,
+            speculation: "admitted",
+            entries: &["account"],
+            retained: Some(Speculation::Admitted),
+        },
+        Speculated {
+            question: "SPEC-ADMIT-EARLY-DECISION",
+            called: true,
+            status: Succeeded,
+            speculation: "admitted",
+            entries: &["account"],
+            retained: Some(Speculation::Admitted),
+        },
+        Speculated {
+            question: "SPEC-DISCARD-LATE-DECISION",
+            called: true,
+            status: Skipped,
+            speculation: "discarded",
+            entries: &[],
+            retained: Some(Speculation::Discarded),
+        },
+        Speculated {
+            question: "SPEC-DISCARD-EARLY-DECISION",
+            called: true,
+            status: Skipped,
+            speculation: "discarded",
+            entries: &[],
+            retained: None,
+        },
+        Speculated {
+            question: "SPEC-BLOCK-LATE-DECISION",
+            called: true,
+            status: Failed,
+            speculation: "blocked",
+            entries: &[],
+            retained: Some(Speculation::Blocked),
+        },
+        Speculated {
+            question: "SPEC-KNOWN",
+            called: false,
+            status: Skipped,
+            speculation: "discarded",
+            entries: &[],
+            retained: None,
+        },
+    ];
+    let extra = TaskId::new("extra").expect("step");
+    let account = PublicationName::new("account").expect("name");
+    for case in cases {
+        let question = case.question;
+        let result = desk.verify("speculative-review", question).await;
+        assert_eq!(
+            requirement(&result, "consolidated").outcome,
+            RequirementOutcome::Passed,
+            "{question}: {result:?}"
+        );
+        assert_eq!(
+            step(&result, "extra").status,
+            case.status,
+            "{question}: {result:?}"
+        );
+        assert_eq!(
+            !desk.asked("EXTRA:", question).await.is_empty(),
+            case.called,
+            "{question}"
+        );
+        let consolidator = desk.asked("CONSOLIDATE:", question).await;
+        let read = results(
+            consolidator
+                .last()
+                .expect("the consolidator called the model"),
+        );
+        let manifest: Value = serde_json::from_str(&lines(&read["c-extra"]))
+            .unwrap_or_else(|error| panic!("{question}: manifest: {error}"));
+        let entries: Vec<&str> = manifest["entries"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|entry| entry["name"].as_str())
+            .collect();
+        assert_eq!(
+            (manifest["speculation"].as_str(), entries.as_slice()),
+            (Some(case.speculation), case.entries),
+            "{question}: {manifest}"
+        );
+        let retained: Vec<Speculation> = desk
+            .publications(&result)
+            .await
+            .iter()
+            .filter(|publication| publication.producer.step_id == extra)
+            .map(|publication| publication.speculation)
+            .collect();
+        assert_eq!(retained, Vec::from_iter(case.retained), "{question}");
+        if case.retained.is_some() {
+            let execution = Execution::connect_with(result.execution_id, &desk.deployment.admin())
+                .await
+                .expect("the execution handle connects");
+            let inspected = execution
+                .publication(
+                    &extra,
+                    &account,
+                    &PublicationSelector {
+                        attempt: 1,
+                        item_index: None,
+                        iteration_index: None,
+                        path: None,
+                    },
+                )
+                .await
+                .expect("an authorized reader inspects the retained account");
+            assert_eq!(
+                inspected.content,
+                PublicationContent::Json {
+                    value: json!({ "extra": true })
+                },
+                "{question}"
+            );
+        }
+    }
     desk.deployment.shutdown().await;
 }

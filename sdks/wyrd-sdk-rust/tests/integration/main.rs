@@ -37,4 +37,6 @@ mod support;
 mod support_desk;
 /// Every Verifier action and Run check kind, and every extractable format.
 mod verifier_building_blocks;
+/// Verifier steps fan out, branch, repeat, and speculate over real Agents.
+mod verifier_orchestration;
 mod verify_in_real_time;

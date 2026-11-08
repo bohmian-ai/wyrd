@@ -1,0 +1,20 @@
+# Reviews the question for style and publishes its account, or a partial draft before it breaks.
+apiVersion: wyrd/v1
+kind: Agent
+metadata:
+  name: stylist
+  version: 1.0.0
+spec:
+  execution_route: {kind: wyrd_gateway, deployment: openai}
+  tool_names: [fs.read, publish]
+  run_config: {max_iterations: 8}
+  prompt:
+    provider: openai
+    model: gpt-4o
+    messages:
+      - role: user
+        content: "STYLE: {{question}}"
+    response_format:
+      type: object
+      properties: {done: {type: boolean}}
+      additionalProperties: false

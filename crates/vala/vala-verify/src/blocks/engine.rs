@@ -39,7 +39,6 @@ use wyrd_spec::card::verifier::{
 };
 use wyrd_spec::error::WyrdError;
 use wyrd_spec::ids::SlotName;
-use wyrd_spec::verification::ContextCapture;
 use wyrd_spec::verification::TaskId;
 use wyrd_spec::verification::VerificationVerdict;
 use wyrd_spec::verification::execution::{
@@ -48,6 +47,7 @@ use wyrd_spec::verification::execution::{
     VerificationOutcome,
 };
 use wyrd_spec::verification::state::{ControlRecord, ExecutionState};
+use wyrd_spec::verification::{ComparisonOperator, ContextCapture};
 
 use super::drift::DriftChecks;
 use super::scope::{
@@ -1766,15 +1766,31 @@ fn bindings(scope: &Scope<'_>, attached: &Attached, step: &Step) -> Result<Bindi
     Ok(Bindings { inputs, workspace })
 }
 
-/// Evaluate a step's `when` or `until` (`clause`) against `scope`.
+/// Evaluate a step's `when` or `until` (`clause`) against `scope`. An
+/// equality against a value of another JSON type, such as a `null`
+/// decision against `true`, cannot be evaluated rather than being false.
 ///
 /// # Errors
 /// Returns the reference's gap, or a failure when the comparison cannot be
 /// evaluated: a false condition is `Ok(false)`, never an error.
 fn condition(scope: &Scope<'_>, condition: &Condition, clause: &str) -> Result<bool, Missing> {
     let path = &condition.path;
-    let observed = scope.resolve(path, None)?;
-    operators::evaluate_operator(&json(&observed), &condition.operator, &condition.expected)
+    let observed = json(&scope.resolve(path, None)?);
+    let compared = if matches!(
+        condition.operator,
+        ComparisonOperator::Equals | ComparisonOperator::NotEquals
+    ) && operators::json_kind(&observed)
+        != operators::json_kind(&condition.expected)
+    {
+        Err(operators::mismatch(
+            &condition.operator,
+            &observed,
+            &condition.expected,
+        ))
+    } else {
+        operators::evaluate_operator(&observed, &condition.operator, &condition.expected)
+    };
+    compared
         .map(|verdict| verdict.passed)
         .map_err(|error| Missing::failed(format!("{clause} `{path}` cannot be evaluated: {error}")))
 }

@@ -1,0 +1,27 @@
+# Judges only the security specialist, so a question that selects no
+# specialist leaves no applicable requirement.
+apiVersion: wyrd/v1
+kind: Verifier
+metadata:
+  name: specialists-only
+  version: 1.0.0
+spec:
+  description: Only a selected specialist is judged.
+  inputs:
+    question: {type: json, schema: {type: string}}
+  steps:
+    - id: plan
+      action:
+        kind: agent
+        agent: ./planner.yaml
+        inputs: {question: inputs.question}
+    - id: security
+      when: {path: steps.plan.output.security, operator: equals, expected: true}
+      action:
+        kind: agent
+        agent: ./security.yaml
+        inputs: {question: inputs.question}
+      requirements:
+        - id: secured
+          statement: The security specialist finished
+          check: {kind: assert, path: steps.security.output.done, operator: equals, expected: true}

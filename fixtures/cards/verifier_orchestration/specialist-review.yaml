@@ -1,0 +1,60 @@
+# A planner selects specialists while a generalist reviews; each selected
+# specialist runs, an unselected one is skipped before its workspace binds,
+# and the consolidator reads every settled collection whatever its outcome.
+# The quoter requires the security account by name.
+apiVersion: wyrd/v1
+kind: Verifier
+metadata:
+  name: specialist-review
+  version: 1.0.0
+spec:
+  description: Conditional specialists consolidated through settled collections.
+  inputs:
+    question: {type: json, schema: {type: string}}
+  steps:
+    - id: plan
+      action:
+        kind: agent
+        agent: ./planner.yaml
+        inputs: {question: inputs.question}
+    - id: general
+      action:
+        kind: agent
+        agent: ./generalist.yaml
+        inputs: {question: inputs.question}
+    - id: security
+      when: {path: steps.plan.output.security, operator: equals, expected: true}
+      action:
+        kind: agent
+        agent: ./security.yaml
+        inputs: {question: inputs.question}
+        workspace:
+          /inputs/question.json: inputs.question
+    - id: style
+      when: {path: steps.plan.output.style, operator: equals, expected: true}
+      action:
+        kind: agent
+        agent: ./stylist.yaml
+        inputs: {question: inputs.question}
+        workspace:
+          /inputs/question.json: inputs.question
+    - id: consolidate
+      action:
+        kind: agent
+        agent: ./consolidator.yaml
+        inputs: {question: inputs.question}
+        workspace:
+          /inputs/general: steps.general.publications
+          /inputs/security: steps.security.publications
+          /inputs/style: steps.style.publications
+    - id: quote
+      action:
+        kind: agent
+        agent: ./quoter.yaml
+        inputs: {question: inputs.question}
+        workspace:
+          /inputs/security.json: steps.security.publications.account
+  requirements:
+    - id: consolidated
+      statement: The consolidator read every collection
+      check: {kind: assert, path: steps.consolidate.output.done, operator: equals, expected: true}

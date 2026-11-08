@@ -3302,8 +3302,9 @@ async fn agent_budget_counts_retries_and_is_never_replenished() {
     );
 }
 
-/// A `when` that reads missing data or compares the wrong type fails its
-/// step without a call rather than skipping it as false, and a speculative
+/// A `when` that reads missing data, cannot compare, or finds a value of
+/// another JSON type than it expects fails its step without a call rather
+/// than skipping it as false, and a speculative
 /// step whose true guard admits a failed action stays visible as failed and
 /// fails, not skips, its consumer.
 ///
@@ -3320,6 +3321,8 @@ async fn condition_errors_and_admitted_failures_stay_failures() {
             {"id": "missing", "when": when("steps.compare.output.absent", "equals", json!(1)),
              "action": code_action(json!({"x": "inputs.answer"}))},
             {"id": "mistyped", "when": when("steps.compare.output.x", "greater_than", json!("high")),
+             "action": code_action(json!({"x": "inputs.answer"}))},
+            {"id": "unlike", "when": when("steps.compare.output.x", "equals", json!(true)),
              "action": code_action(json!({"x": "inputs.answer"}))},
             {"id": "extra", "speculative": true, "when": when("steps.compare.output.x", "equals", json!(1)),
              "action": code_action(json!({"x": "inputs.answer"}))},
@@ -3353,7 +3356,7 @@ async fn condition_errors_and_admitted_failures_stay_failures() {
     .await
     .expect("outcome");
     let calls = script.calls();
-    for refused in ["missing", "mistyped"] {
+    for refused in ["missing", "mistyped", "unlike"] {
         assert_eq!(
             step(&outcome, refused).status,
             StepStatus::Failed,

@@ -93,13 +93,13 @@ fn assessment() -> Value {
 }
 
 /// The messages of the Chat Completions `request`.
-fn messages(request: &Request) -> Vec<Value> {
+pub(crate) fn messages(request: &Request) -> Vec<Value> {
     let body: Value = serde_json::from_slice(&request.body).unwrap_or_default();
     body["messages"].as_array().cloned().unwrap_or_default()
 }
 
 /// The text of every message in `messages`, joined.
-fn text(messages: &[Value]) -> String {
+pub(crate) fn text(messages: &[Value]) -> String {
     messages
         .iter()
         .filter_map(|message| message["content"].as_str())
@@ -108,7 +108,7 @@ fn text(messages: &[Value]) -> String {
 }
 
 /// How many assistant turns `messages` already holds.
-fn turn(messages: &[Value]) -> usize {
+pub(crate) fn turn(messages: &[Value]) -> usize {
     messages
         .iter()
         .filter(|message| message["role"] == "assistant")
@@ -117,7 +117,7 @@ fn turn(messages: &[Value]) -> usize {
 
 /// Every tool result in `messages`, by the provider call ID it answers,
 /// parsed from its JSON content.
-fn results(messages: &[Value]) -> BTreeMap<String, Value> {
+pub(crate) fn results(messages: &[Value]) -> BTreeMap<String, Value> {
     messages
         .iter()
         .filter(|message| message["role"] == "tool")
@@ -130,7 +130,7 @@ fn results(messages: &[Value]) -> BTreeMap<String, Value> {
 }
 
 /// The text of an `fs.read` result: its units' lines, joined by newlines.
-fn lines(read: &Value) -> String {
+pub(crate) fn lines(read: &Value) -> String {
     read["units"]
         .as_array()
         .map(|units| {
@@ -144,7 +144,7 @@ fn lines(read: &Value) -> String {
 }
 
 /// An assistant turn calling each `(id, tool, arguments)` at once.
-fn calls(calls: &[(&str, &str, Value)]) -> ResponseTemplate {
+pub(crate) fn calls(calls: &[(&str, &str, Value)]) -> ResponseTemplate {
     let calls: Vec<Value> = calls
         .iter()
         .map(|(id, tool, arguments)| tool_call(id, tool, arguments))
@@ -153,7 +153,7 @@ fn calls(calls: &[(&str, &str, Value)]) -> ResponseTemplate {
 }
 
 /// The final `{"done": true}` answer.
-fn done() -> ResponseTemplate {
+pub(crate) fn done() -> ResponseTemplate {
     completion(json!({ "role": "assistant", "content": r#"{"done":true}"# }))
 }
 
@@ -642,7 +642,7 @@ impl PublishDesk {
 ///
 /// # Panics
 /// Panics when the upstream's URL does not parse.
-fn builder(upstream: &MockServer) -> wyrd_testing::server::WyrdTestServerBuilder {
+pub(crate) fn builder(upstream: &MockServer) -> wyrd_testing::server::WyrdTestServerBuilder {
     WyrdTestServer::builder()
         .with_verification_limits_for_test(HostedLimits {
             monty_min_workers: 0,

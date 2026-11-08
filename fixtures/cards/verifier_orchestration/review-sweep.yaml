@@ -1,0 +1,33 @@
+# Three identical reviewers over the same pinned question, each with its own
+# scratch, publish an account; the consolidator reads every account through
+# the settled collection.
+apiVersion: wyrd/v1
+kind: Verifier
+metadata:
+  name: review-sweep
+  version: 1.0.0
+spec:
+  description: A fixed sweep of reviewers consolidated through their publications.
+  inputs:
+    question: {type: json, schema: {type: string}}
+  steps:
+    - id: review
+      retries: 1
+      foreach: {count: 3}
+      action:
+        kind: agent
+        agent: ./reviewer.yaml
+        inputs: {question: inputs.question}
+        workspace:
+          /inputs/question.json: inputs.question
+    - id: consolidate
+      action:
+        kind: agent
+        agent: ./consolidator.yaml
+        inputs: {question: inputs.question}
+        workspace:
+          /inputs/accounts: steps.review.publications
+  requirements:
+    - id: consolidated
+      statement: The consolidator read every account
+      check: {kind: assert, path: steps.consolidate.output.done, operator: equals, expected: true}

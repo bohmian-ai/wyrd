@@ -392,9 +392,16 @@ components:
     .expect("canonical Service decodes");
     assert_eq!(service.spec(), &canonical_service);
 
-    let declaration = CardDefinition::from(service)
+    let declaration = CardDefinition::from(service.clone())
         .declaration()
         .expect("valid graph");
+    assert_eq!(
+        CardDefinition::from(service)
+            .declaration()
+            .expect("valid graph"),
+        declaration,
+        "repeated declaration is stable",
+    );
     assert_eq!(
         declaration.artifacts,
         [policy()],
@@ -423,6 +430,10 @@ components:
     assert!(
         !wire.contains("policy.pdf\""),
         "no local path reaches a submission: {wire}"
+    );
+    assert!(
+        !wire.contains("\"status\""),
+        "no derived status reaches a submission: {wire}"
     );
 }
 

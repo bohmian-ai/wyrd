@@ -91,12 +91,19 @@ fn judge_policy(request: &wiremock::Request) -> ResponseTemplate {
 /// One story deployment: a verifying test server whose gateway calls the
 /// scripted policy judge.
 struct Story {
+    /// The verifying server and its Postgres-backed clients.
     deployment: Deployment,
+    /// The scripted model provider the gateway forwards policy-judge calls
+    /// to; it records every request.
     upstream: MockServer,
 }
 
 impl Story {
     /// Start the server and the scripted judge, and configure the gateway.
+    ///
+    /// # Panics
+    /// Panics when the upstream URL does not parse, the server does not
+    /// start, or the gateway cannot be configured.
     async fn start() -> Self {
         let upstream = MockServer::start().await;
         Mock::given(method("POST"))
@@ -122,6 +129,9 @@ impl Story {
 
     /// Declare `service` through `WyrdState` as the admin and return its
     /// ready state.
+    ///
+    /// # Panics
+    /// Panics when the graph is refused or its state does not hydrate.
     async fn state(&self, service: &Service) -> WyrdState {
         WyrdState::declare_authored_with(
             service,
@@ -135,6 +145,9 @@ impl Story {
     }
 
     /// The number of policy-judge requests the upstream has received.
+    ///
+    /// # Panics
+    /// Panics when the upstream is not recording requests.
     async fn judge_calls(&self) -> usize {
         self.upstream
             .received_requests()
@@ -145,6 +158,10 @@ impl Story {
 }
 
 /// A policy-judge Agent `name` at `version`.
+///
+/// # Panics
+/// Panics when the fixed Prompt, `name`, `version`, or deployment is
+/// refused.
 fn policy_judge(name: &str, version: &str) -> Agent {
     let mut prompt = Prompt::new(
         "openai",
@@ -167,6 +184,10 @@ fn policy_judge(name: &str, version: &str) -> Agent {
 
 /// A code step running `entrypoint` of the story's checks over `inputs`,
 /// judged by one `path == expected` requirement.
+///
+/// # Panics
+/// Panics when the story's checks cannot be read or an ID, parameter, or
+/// path is refused.
 fn fact_step(
     id: &str,
     entrypoint: &str,
@@ -188,6 +209,9 @@ fn fact_step(
 }
 
 /// Declare the recipient, purpose, and destination slots on `verifier`.
+///
+/// # Panics
+/// Panics when `verifier` already declares one of them.
 fn release_inputs(verifier: &mut Verifier) -> [Reference; 3] {
     let recipient = verifier
         .add_input(
@@ -228,6 +252,9 @@ fn release_inputs(verifier: &mut Verifier) -> [Reference; 3] {
 
 /// `report-policy` at `version`: the identifier scan with the policy judge
 /// reading `policy`, then the report context.
+///
+/// # Panics
+/// Panics when `version` or any fixed slot, ID, or parameter is refused.
 fn report_policy(version: &str, judge: &Agent, policy: &ArtifactFile) -> Verifier {
     let mut verifier = Verifier::new("report-policy", version).expect("valid identity");
     verifier.set_description("The report is fit to share under the company sharing policy.");
@@ -304,6 +331,9 @@ fn summarized_access(version: &str) -> Verifier {
 
 /// `release-access` at `version`, with the dependent `summary` step when
 /// `summarize` is set.
+///
+/// # Panics
+/// Panics when `version` or any fixed slot, ID, or parameter is refused.
 fn access_verifier(version: &str, summarize: bool) -> Verifier {
     let mut verifier = Verifier::new("release-access", version).expect("valid identity");
     verifier.set_description("The recipient and destination may receive the report.");
@@ -367,6 +397,9 @@ fn access_verifier(version: &str, summarize: bool) -> Verifier {
 /// `finance-release`, with every Card at `version`, verifying
 /// `report-reviewer` by `report-policy` reading `policy` and
 /// `release-controls` by `access`.
+///
+/// # Panics
+/// Panics when `version` or a fixed alias is refused.
 fn finance_release(version: &str, policy: &ArtifactFile, access: Verifier) -> Service {
     let reviewer = policy_judge("report-reviewer", version);
     let report = report_policy(version, &reviewer, policy);
@@ -386,11 +419,17 @@ fn finance_release(version: &str, policy: &ArtifactFile, access: Verifier) -> Se
 }
 
 /// The local policy Artifact `version`, published from `source`.
+///
+/// # Panics
+/// Panics when `version` is not an exact version.
 fn local_policy(version: &str, source: &Path) -> Artifact {
     Artifact::from_path("company-sharing-policy", version, source, true).expect("valid identity")
 }
 
 /// The registered policy Artifact `version`, used without uploading.
+///
+/// # Panics
+/// Panics when `version` is not an exact version.
 fn registered_policy(version: &str) -> ArtifactFile {
     ArtifactFile::new(
         card_ref(CardKind::Artifact, "company-sharing-policy", version),
@@ -400,6 +439,9 @@ fn registered_policy(version: &str) -> ArtifactFile {
 }
 
 /// The exact reference of `kind` `name` at `version`.
+///
+/// # Panics
+/// Panics when `name` or `version` is not a valid reference part.
 fn card_ref(kind: CardKind, name: &str, version: &str) -> CardRef {
     serde_json::from_value(json!({ "kind": kind, "name": name, "version": version }))
         .expect("card reference parses")
@@ -441,6 +483,14 @@ fn inputs(request: &Value, slots: &[&str]) -> Inputs {
 
 /// Verify `request` against both components, each through its own Run
 /// subject and binding.
+///
+/// # Errors
+/// Each result carries its own verification's refusal, such as invalid
+/// input or an unbound Verifier; one refusal does not stop the other
+/// component's verification.
+///
+/// # Panics
+/// Panics when either component's Run cannot open.
 async fn verify_both(
     state: &WyrdState,
     request: &Value,
@@ -483,6 +533,10 @@ fn outcome(result: &VerificationResult, id: &str) -> RequirementOutcome {
 
 /// Assert `result` judged the component `alias` by `verifier` and executed
 /// exactly the steps `steps`, in any stage order.
+///
+/// # Panics
+/// Panics when the subject, Verifier, or executed steps differ, or `alias`
+/// is not a component of `state`.
 fn assert_attributed(
     result: &VerificationResult,
     state: &WyrdState,
@@ -754,6 +808,9 @@ async fn policy_published(cards: &Cards, version: &str) -> bool {
 }
 
 /// The policy version the registered `report-policy` `version` mounts.
+///
+/// # Panics
+/// Panics when `report-policy` `version` cannot be read.
 async fn mounted_policy(cards: &Cards, version: &str) -> Value {
     let card = cards
         .get(CardSelector::exact(card_ref(

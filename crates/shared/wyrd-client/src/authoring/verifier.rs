@@ -139,8 +139,11 @@ impl Verifier {
         self.spec.order_by = Some(order);
     }
 
-    /// The step stages the server would execute, from explicit
-    /// `depends_on` edges only.
+    /// The step stages the server would execute.
+    ///
+    /// A step runs after every step it names in `depends_on` and every step
+    /// whose output or status its action or `when` condition references;
+    /// steps with no edge between them share a stage.
     ///
     /// # Errors
     /// Returns the shared Verifier validation's refusal.
@@ -181,7 +184,7 @@ impl Verifier {
     }
 }
 
-/// One Verifier step: an action, its explicit dependencies, an optional
+/// One Verifier step: an action, its `depends_on` edges, an optional
 /// condition, and the requirements judging its output.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Step {
@@ -239,7 +242,9 @@ impl Step {
         Reference::parse(&path).map_err(|error| invalid("reference", &path, error))
     }
 
-    /// Run after `step` completes; only explicit dependencies order steps.
+    /// Run after `step` completes, even when nothing here references its
+    /// output; a reference to another step's output or status in the action
+    /// or condition orders the steps without this edge.
     pub fn add_depends_on(&mut self, step: &Step) {
         if !self.step.depends_on.contains(&step.step.id) {
             self.step.depends_on.push(step.step.id.clone());

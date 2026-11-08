@@ -1,3 +1,6 @@
+//! Offline authoring: canonical parity, value capture, edits, refusals,
+//! and file-authored parity, with no server.
+
 use serde_json::{Value, json};
 use wyrd_spec::card::agent::AgentSpec;
 use wyrd_spec::card::service::ServiceSpec;
@@ -9,6 +12,8 @@ use wyrd_spec::verification::TaskId;
 
 use super::*;
 
+/// The structured `rule` of a validation refusal, `None` for any other
+/// error.
 fn rule(error: &WyrdError) -> Option<&str> {
     match error {
         WyrdError::Validation { details, .. } => details["rule"].as_str(),
@@ -16,6 +21,11 @@ fn rule(error: &WyrdError) -> Option<&str> {
     }
 }
 
+/// The `report-reviewer` Agent: a gateway-routed verdict Prompt reading
+/// `/inputs/policy.json` with `fs.read` for at most three turns.
+///
+/// # Panics
+/// Panics when the fixed Prompt, identity, or deployment is refused.
 fn reviewer() -> Agent {
     let mut prompt = Prompt::new(
         "openai",
@@ -33,6 +43,11 @@ fn reviewer() -> Agent {
     agent
 }
 
+/// The local `company-sharing-policy` Artifact, extracted on publication;
+/// its source path is never read offline.
+///
+/// # Panics
+/// Panics when the fixed identity is refused.
 fn policy() -> Artifact {
     Artifact::from_path("company-sharing-policy", "1.0.0", "policy.pdf", true)
         .expect("valid identity")
@@ -40,6 +55,10 @@ fn policy() -> Artifact {
 
 /// A Verifier exercising every Action and Check variant, both input
 /// requirednesses, and an explicit dependency.
+///
+/// # Panics
+/// Panics when any fixed identity, slot, reference, ID, or selector is
+/// refused.
 fn every_primitive() -> Verifier {
     let mut verifier = Verifier::new("release-access", "1.0.0").expect("valid identity");
     verifier.set_description("Every authoring primitive");
@@ -169,15 +188,35 @@ fn every_primitive() -> Verifier {
     verifier
 }
 
+/// Decode `text` as YAML into `T` through its JSON form, as the loader
+/// does, so externally tagged enums decode like their file form.
+///
+/// # Errors
+/// Returns the decode error when the value is not a `T`.
+///
+/// # Panics
+/// Panics when `text` is not YAML.
 fn yaml<T: serde::de::DeserializeOwned>(text: &str) -> Result<T, serde_json::Error> {
     serde_json::from_value(serde_yaml::from_str::<Value>(text).expect("YAML parses"))
 }
 
+/// The exact reference to `kind` `name` at 1.0.0.
+///
+/// # Panics
+/// Panics when `kind` or `name` is not a valid reference part.
 fn card(kind: &str, name: &str) -> CardRef {
     serde_json::from_value(json!({"kind": kind, "name": name, "version": "1.0.0"}))
         .expect("card ref")
 }
 
+/// Every authored primitive builds the canonical spec its file form decodes
+/// to, passes the shared validation, and stages by explicit and inferred
+/// edges; the composed Service declares its local Artifact once, its root
+/// last, and no local path or derived status.
+///
+/// # Panics
+/// Panics when an authored spec, plan, or declaration differs from its
+/// canonical form.
 #[test]
 fn core_primitives_match_canonical_contracts() {
     let verifier = every_primitive();
@@ -449,6 +488,12 @@ components:
     );
 }
 
+/// Adding a child captures its value, refused edits change nothing, and two
+/// different definitions of one identity refuse the declaration.
+///
+/// # Panics
+/// Panics when a later edit reaches a captured child, a duplicate is
+/// admitted, or the conflict is not refused.
 #[test]
 fn offline_edits_preserve_snapshots() {
     let mut verifier = Verifier::new("report-policy", "1.0.0").expect("valid identity");
@@ -541,6 +586,7 @@ fn offline_edits_preserve_snapshots() {
     ));
 }
 
+/// The `card_authoring` story's checked-in file at `relative`.
 fn story(relative: &str) -> std::path::PathBuf {
     std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("../../../fixtures/cards/card_authoring")
@@ -548,6 +594,9 @@ fn story(relative: &str) -> std::path::PathBuf {
 }
 
 /// A policy-judge Agent named `name`, as the story's Agent files declare it.
+///
+/// # Panics
+/// Panics when the fixed Prompt, identity, or deployment is refused.
 fn policy_judge(name: &str) -> Agent {
     let mut prompt = Prompt::new(
         "openai",
@@ -570,6 +619,10 @@ fn policy_judge(name: &str) -> Agent {
 
 /// A code step running `entrypoint` of the story's checks over `inputs`,
 /// judged by one `path == expected` requirement.
+///
+/// # Panics
+/// Panics when the story's checks cannot be read or an ID, parameter, or
+/// path is refused.
 fn fact_step(
     id: &str,
     entrypoint: &str,
@@ -591,6 +644,9 @@ fn fact_step(
 }
 
 /// Declare the recipient, purpose, and destination slots on `verifier`.
+///
+/// # Panics
+/// Panics when `verifier` already declares one of them.
 fn release_inputs(verifier: &mut Verifier) -> [Reference; 3] {
     let recipient = verifier
         .add_input(
@@ -629,7 +685,11 @@ fn release_inputs(verifier: &mut Verifier) -> [Reference; 3] {
     [recipient, purpose, destination]
 }
 
-/// The `card_authoring` story's Service, authored in code.
+/// The `card_authoring` story's Service, authored in code, with the report
+/// judge mounting `policy`.
+///
+/// # Panics
+/// Panics when any fixed identity, slot, ID, or alias is refused.
 fn finance_release(policy: &ArtifactFile) -> Service {
     let reviewer = policy_judge("report-reviewer");
     let mut report_policy = Verifier::new("report-policy", "1.0.0").expect("valid identity");
@@ -740,6 +800,12 @@ fn finance_release(policy: &ArtifactFile) -> Service {
     service
 }
 
+/// The story authored in code declares the same identities, metadata, and
+/// specs as its checked-in file tree, publishes only its policy first, and
+/// declares the same root last.
+///
+/// # Panics
+/// Panics when the story does not load or any submission differs.
 #[test]
 fn declarations_match_file_authored_tree() {
     let policy = Artifact::from_path(
@@ -835,6 +901,11 @@ fn call_declaration(call: AgentCall) -> Result<Declaration, WyrdError> {
 /// dependencies of the current values: an edited definition declares and
 /// publishes what the same definition built directly does, while two
 /// current conflicting definitions still refuse.
+///
+/// # Panics
+/// Panics when an edited value differs from its direct construction, an
+/// obsolete Trigger or Artifact is declared or published, a still-mounted
+/// Artifact is dropped, or the current conflict is admitted.
 #[test]
 fn replacements_keep_only_current_dependencies() {
     let verifier = Verifier::new("checked", "1.0.0").expect("valid identity");

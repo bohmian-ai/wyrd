@@ -249,7 +249,9 @@ impl Observe<'_> {
     /// `bifrost.datasets`, which is where reserved and system-managed tables are
     /// refused before admission; the server's not-found, authorization, or
     /// availability error for an unknown, unauthorized, or unavailable table;
-    /// and the lifecycle and queue errors of [`Observe::drift`].
+    /// `WYRD_SDK_400_BIFROST_NOT_STARTED` before startup,
+    /// `WYRD_SDK_409_BIFROST_CLOSED` after shutdown, and
+    /// `WYRD_CLIENT_429_QUEUE_FULL` when the producer is saturated.
     pub async fn record<T: Serialize>(&self, table: &str, row: &T) -> Result<(), WyrdError> {
         self.record_value(table, &to_value(row, "record row")?)
             .await
@@ -520,7 +522,7 @@ impl Observe<'_> {
     }
 }
 
-/// Run evidence [`Observe::stage`] projected and still has to enqueue.
+/// Run evidence a submission projected and still has to enqueue.
 #[derive(Debug)]
 pub struct StagedRun {
     /// The bound Verifier's `metadata.name`, resolved again on enqueue.

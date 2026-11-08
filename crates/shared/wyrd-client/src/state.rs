@@ -666,6 +666,9 @@ impl WyrdState {
     ///
     /// # Errors
     /// As [`Self::declare_authored_with`].
+    ///
+    /// # Cancellation
+    /// As [`Self::declare_authored_with`].
     pub async fn declare_authored<S>(
         definition: &crate::authoring::Definition<S>,
     ) -> Result<Self, WyrdError>
@@ -694,7 +697,12 @@ impl WyrdState {
     /// and [`Self::from_path`]'s errors for the bundle.
     ///
     /// # Cancellation
-    /// As [`Self::declare_with`].
+    /// A failure or a dropped future before the registry accepts the graph
+    /// leaves every Artifact already published, as
+    /// [`crate::cards::Cards::declare_authored`] describes, and returns no
+    /// state. After it accepts the graph, as [`Self::declare_with`]: the
+    /// declaration stays committed, the temporary directory is removed, and
+    /// a `bundle_dir` keeps its prior bundle.
     pub async fn declare_authored_with<S>(
         definition: &crate::authoring::Definition<S>,
         options: DeclareOptions,
@@ -716,9 +724,19 @@ impl WyrdState {
     /// `client`, into `bundle_dir` or a temporary directory removed before
     /// this returns.
     ///
+    /// The shared tail of [`Self::declare_with`] and
+    /// [`Self::declare_authored_with`]; it reads and never declares.
+    ///
     /// # Errors
     /// Returns the pull's error and [`Self::from_path`]'s errors for the
     /// bundle.
+    ///
+    /// # Cancellation
+    /// Dropping the future removes the temporary directory with everything
+    /// staged in it. A `bundle_dir` keeps its prior bundle, because
+    /// [`crate::cards::Cards::pull`] publishes by rename, but the pull's
+    /// staging directory beside it can remain. The declaration of `root` is
+    /// unaffected.
     async fn pull_declared(
         cards: &Cards,
         client: WyrdClient,

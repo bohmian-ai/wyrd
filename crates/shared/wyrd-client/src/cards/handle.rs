@@ -343,6 +343,16 @@ impl Cards {
     /// [`Self::upload_artifact`]'s errors for a local Artifact, and
     /// [`Self::declare`]'s errors for the graph. A graph refused after an
     /// Artifact was published keeps that Artifact version registered.
+    ///
+    /// # Cancellation
+    /// Nothing is rolled back. Every Artifact published before a failure or
+    /// a dropped future stays registered, and one interrupted mid-publication
+    /// is left as [`Self::upload_artifact`] describes: declared but pending,
+    /// partially uploaded, or already Active. A graph interrupted after its
+    /// submission is left as the server holds it. A retry is a new call, not
+    /// a resumption: an Artifact version already registered with the same
+    /// content and an unchanged graph declare nothing new, and any other
+    /// version follows the registry's ordinary version rules.
     pub async fn declare_authored<S>(
         &self,
         definition: &crate::authoring::Definition<S>,

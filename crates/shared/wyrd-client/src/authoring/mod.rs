@@ -290,6 +290,8 @@ fn conflict(card_ref: &CardRef) -> WyrdError {
 }
 
 impl From<Agent> for CardDefinition {
+    /// The same Agent as a Card of any kind, keeping its identity, spec,
+    /// and the definitions it references.
     fn from(agent: Agent) -> Self {
         Self {
             kind: agent.kind,
@@ -301,6 +303,8 @@ impl From<Agent> for CardDefinition {
 }
 
 impl From<Verifier> for CardDefinition {
+    /// The same Verifier as a Card of any kind, keeping its identity, spec,
+    /// and the definitions it references.
     fn from(verifier: Verifier) -> Self {
         Self {
             kind: verifier.kind,
@@ -312,6 +316,8 @@ impl From<Verifier> for CardDefinition {
 }
 
 impl From<Service> for CardDefinition {
+    /// The same Service as a Card of any kind, keeping its identity, spec,
+    /// and the definitions it references.
     fn from(service: Service) -> Self {
         Self {
             kind: service.kind,
@@ -369,42 +375,49 @@ impl<T> Linked<T> {
 }
 
 impl<T> From<CardRef> for Linked<T> {
+    /// As [`Linked::registered`].
     fn from(card_ref: CardRef) -> Self {
         Self::registered(card_ref)
     }
 }
 
 impl<T> From<CardDefinition> for Linked<T> {
+    /// As [`Linked::sibling`].
     fn from(card: CardDefinition) -> Self {
         Self::sibling(card)
     }
 }
 
 impl From<Agent> for Linked<AgentSpec> {
+    /// As [`Linked::sibling`].
     fn from(agent: Agent) -> Self {
         Self::sibling(agent)
     }
 }
 
 impl From<AgentSpec> for Linked<AgentSpec> {
+    /// As [`Linked::inline`].
     fn from(spec: AgentSpec) -> Self {
         Self::inline(spec)
     }
 }
 
 impl From<Prompt> for Linked<skald_spec::Prompt> {
+    /// Embed the compiled Prompt, as [`Linked::inline`].
     fn from(prompt: Prompt) -> Self {
         Self::inline(prompt.0)
     }
 }
 
 impl From<TriggerSpec> for Linked<TriggerSpec> {
+    /// As [`Linked::inline`].
     fn from(spec: TriggerSpec) -> Self {
         Self::inline(spec)
     }
 }
 
 impl From<OperatorSpec> for Linked<OperatorSpec> {
+    /// As [`Linked::inline`].
     fn from(spec: OperatorSpec) -> Self {
         Self::inline(spec)
     }
@@ -488,6 +501,7 @@ impl Binding {
 }
 
 impl From<Verifier> for Binding {
+    /// As [`Binding::new`].
     fn from(verifier: Verifier) -> Self {
         Self::new(verifier)
     }
@@ -505,7 +519,10 @@ fn binding(verifier: Ref) -> VerificationBinding {
 
 /// A Prompt, compiled from its authored form exactly as a Prompt Card is.
 #[derive(Debug, Clone, PartialEq)]
-pub struct Prompt(skald_spec::Prompt);
+pub struct Prompt(
+    /// The compiled canonical Prompt; every edit recompiles it.
+    skald_spec::Prompt,
+);
 
 impl Prompt {
     /// A portable Prompt sending `text` as its one user message to `model`
@@ -973,5 +990,6 @@ fn invalid(rule: &str, path: &str, message: impl std::fmt::Display) -> WyrdError
     }
 }
 
+/// Offline authoring tests.
 #[cfg(test)]
 mod tests;

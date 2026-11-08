@@ -12,3 +12,4 @@ spec:
     - verifier: ./specialist-review.yaml
     - verifier: ./specialists-only.yaml
     - verifier: ./speculative-review.yaml
+    - verifier: ./refine-report.yaml

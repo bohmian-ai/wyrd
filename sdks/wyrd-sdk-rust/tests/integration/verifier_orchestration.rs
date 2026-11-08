@@ -74,7 +74,8 @@ fn numbered(messages: &[Value]) -> Option<usize> {
 /// stylist publishes a partial draft, then breaks. A `LATE-DECISION`
 /// comparison and a `KNOWN` bootstrap hold their replies; an
 /// `EARLY-DECISION` comparison waits briefly while its extra review holds
-/// its first turn longer.
+/// its first turn longer. The refiner publishes its report, then scores it
+/// by its iteration index, a constant, or a word, or breaks on iteration 1.
 fn reply(request: &Request, script: &Script) -> ResponseTemplate {
     let messages = messages(request);
     let prompt = text(&messages);
@@ -213,6 +214,40 @@ fn reply(request: &Request, script: &Script) -> ResponseTemplate {
                     reply
                 }
             }
+            _ => done(),
+        };
+    }
+    if prompt.contains("REFINE:") {
+        let index: u64 = prompt
+            .split_once("index=")
+            .and_then(|(_, rest)| rest.split_whitespace().next()?.parse().ok())
+            .unwrap_or(u64::MAX);
+        if prompt.contains("REFINE-BREAKS") && index == 1 {
+            return ResponseTemplate::new(200).set_body_json(json!({ "garbled": true }));
+        }
+        let score = if prompt.contains("REFINE-EXHAUSTS") {
+            json!(0)
+        } else if prompt.contains("REFINE-INVALID") {
+            json!("high")
+        } else {
+            json!(index)
+        };
+        return match turn {
+            0 => calls(&[(
+                "f-publish",
+                "publish",
+                json!({ "name": "report", "value": { "version": index } }),
+            )]),
+            _ => answer(&json!({ "score": score, "text": format!("v{index}") })),
+        };
+    }
+    if prompt.contains("READ-REPORT:") {
+        return match turn {
+            0 => calls(&[(
+                "r-report",
+                "fs.read",
+                json!({ "path": "/inputs/report.json" }),
+            )]),
             _ => done(),
         };
     }
@@ -761,6 +796,142 @@ async fn speculative_disposition_controls_consumer_admission() {
                 "{question}"
             );
         }
+    }
+    desk.deployment.shutdown().await;
+}
+
+/// The iteration index each `REFINE:` request for `question` was sent for,
+/// in arrival order.
+fn iterations(requests: &[Vec<Value>]) -> Vec<u64> {
+    requests
+        .iter()
+        .filter_map(|messages| {
+            text(messages)
+                .split_once("index=")?
+                .1
+                .split_whitespace()
+                .next()?
+                .parse()
+                .ok()
+        })
+        .collect()
+}
+
+/// The refiner rewrites one iteration at a time: iteration 0 sees a `null`
+/// previous answer and each later one its predecessor's, and no iteration
+/// starts before the previous one finished. `until` stops it at score 2,
+/// each iteration's requirement is judged under its own index, and the
+/// reader receives only the final iteration's report. Exhausting
+/// `max_iterations`, a score `until` cannot compare, or a broken iteration
+/// fails the step without another iteration, and the reader requiring the
+/// report never runs.
+///
+/// # Panics
+/// Panics when a verification is refused or an iteration, previous value,
+/// order, report, or outcome differs.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires the repository-managed Postgres journey lifecycle"]
+async fn sequential_refinement_returns_final_admitted_report() {
+    let desk = Desk::start().await;
+
+    let result = desk.verify("refine-report", "REFINE-STOPS").await;
+    let draft = step(&result, "draft");
+    assert_eq!(
+        (draft.status, draft.output.clone()),
+        (
+            StepStatus::Succeeded,
+            Some(json!({ "score": 2, "text": "v2" }))
+        ),
+        "{result:?}"
+    );
+    assert_eq!(
+        requirement(&result, "final").outcome,
+        RequirementOutcome::Passed
+    );
+    let asked = desk.asked("REFINE:", "REFINE-STOPS").await;
+    assert_eq!(
+        iterations(&asked),
+        [0, 0, 1, 1, 2, 2],
+        "two turns per iteration, never overlapping"
+    );
+    let first = text(&asked[0]);
+    assert!(first.contains("previous=null"), "{first}");
+    let second = text(&asked[2]);
+    assert!(
+        second.contains(r#""score":0"#) && second.contains(r#""text":"v0""#),
+        "iteration 1 sees iteration 0's answer: {second}"
+    );
+    let judged: Vec<(Option<u32>, RequirementOutcome)> = result
+        .outcome
+        .requirements
+        .iter()
+        .filter(|judged| judged.id.as_str() == "scored")
+        .map(|judged| (judged.iteration_index, judged.outcome))
+        .collect();
+    assert_eq!(
+        judged,
+        (0..3)
+            .map(|iteration| (Some(iteration), RequirementOutcome::Passed))
+            .collect::<Vec<_>>()
+    );
+    let reader = desk.asked("READ-REPORT:", "REFINE-STOPS").await;
+    let read = results(reader.last().expect("the reader called the model"));
+    assert_eq!(
+        serde_json::from_str::<Value>(&lines(&read["r-report"])).ok(),
+        Some(json!({ "version": 2 })),
+        "the reader receives the final iteration's report"
+    );
+    let published: Vec<Option<u32>> = desk
+        .publications(&result)
+        .await
+        .iter()
+        .filter(|publication| publication.producer.step_id.as_str() == "draft")
+        .map(|publication| publication.producer.iteration_index)
+        .collect();
+    assert_eq!(published, [Some(0), Some(1), Some(2)]);
+
+    for (question, reason, ran) in [
+        (
+            "REFINE-EXHAUSTS",
+            "max_iterations 4",
+            &[0, 0, 1, 1, 2, 2, 3, 3][..],
+        ),
+        ("REFINE-INVALID", "cannot be evaluated", &[0, 0][..]),
+        ("REFINE-BREAKS", "", &[0, 0, 1][..]),
+    ] {
+        let result = desk.verify("refine-report", question).await;
+        let draft = step(&result, "draft");
+        assert_eq!(
+            (draft.status, draft.output.clone()),
+            (StepStatus::Failed, None),
+            "{question}"
+        );
+        assert!(
+            draft
+                .reason
+                .as_deref()
+                .is_some_and(|text| text.contains(reason)),
+            "{question}: {draft:?}"
+        );
+        assert_eq!(
+            iterations(&desk.asked("REFINE:", question).await),
+            ran,
+            "{question}"
+        );
+        assert_eq!(
+            step(&result, "read").status,
+            StepStatus::Skipped,
+            "{question}"
+        );
+        assert!(
+            desk.asked("READ-REPORT:", question).await.is_empty(),
+            "{question}"
+        );
+        assert_ne!(
+            requirement(&result, "final").outcome,
+            RequirementOutcome::Passed,
+            "{question}"
+        );
     }
     desk.deployment.shutdown().await;
 }

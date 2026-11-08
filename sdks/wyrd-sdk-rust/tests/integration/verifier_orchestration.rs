@@ -40,6 +40,37 @@ use crate::local_development::configure_gateway;
 use crate::support::{Deployment, declare, fixture, pull};
 use crate::verifier_building_blocks::{completion, grants, requirement, step};
 
+/// The JSON body of `GET /v1/verification/executions/{path}`, read as
+/// `desk`'s admin over HTTP.
+///
+/// # Panics
+/// Panics when the token exchange or the read fails or the body is not JSON.
+async fn http(path: &str, desk: &Desk) -> Value {
+    let token = desk
+        .deployment
+        .admin()
+        .access_token()
+        .await
+        .expect("the administrator token mints");
+    reqwest::Client::new()
+        .get(format!(
+            "{}/v1/verification/executions/{path}",
+            desk.deployment
+                .server()
+                .base_url()
+                .expect("bound server has a URL")
+        ))
+        .header("x-wyrd-access-token", format!("Bearer {}", token.expose()))
+        .send()
+        .await
+        .expect("the server answers")
+        .error_for_status()
+        .expect("the execution route reads")
+        .json()
+        .await
+        .expect("the route answers JSON")
+}
+
 /// Run the CLI's execution `verb` in process as `desk`'s admin.
 ///
 /// # Panics
@@ -795,8 +826,8 @@ struct Case {
 /// status. The quoter, requiring the security account by name, runs only
 /// when that account was produced: a security review that succeeds without
 /// publishing it fails the quoter before its model is called. With no specialist selected and only the
-/// specialist judged, the verdict is inconclusive. The CLI reports the same
-/// branch statuses and publications as the SDK.
+/// specialist judged, the verdict is inconclusive. The CLI and the HTTP
+/// routes report the same branch statuses and publications as the SDK.
 ///
 /// # Panics
 /// Panics when a verification or CLI call is refused or a call, status,
@@ -914,6 +945,13 @@ async fn conditions_and_collections_preserve_missing_evidence() {
                 "{question}: {collection} {manifest}"
             );
         }
+        // A direct execution may read `completed` before its result is
+        // visible, so wait for the result before reading status elsewhere.
+        assert_eq!(
+            desk.settled(result.execution_id).await.outcome.steps,
+            result.outcome.steps,
+            "{question}"
+        );
         let target = ExecutionArg {
             execution_id: result.execution_id,
         };
@@ -921,7 +959,7 @@ async fn conditions_and_collections_preserve_missing_evidence() {
         assert_eq!(
             status["result"]["outcome"]["steps"],
             serde_json::to_value(&result.outcome.steps).expect("steps serialize"),
-            "{question}: the CLI reports every branch's status"
+            "{question}: the CLI reports every branch's status: {status}"
         );
         let listed = cli(
             ExecutionVerb::Publications(PageArgs {
@@ -932,10 +970,22 @@ async fn conditions_and_collections_preserve_missing_evidence() {
             &desk,
         )
         .await;
+        let publications =
+            serde_json::to_value(desk.publications(&result).await).expect("items serialize");
         assert_eq!(
-            listed["items"],
-            serde_json::to_value(desk.publications(&result).await).expect("items serialize"),
+            listed["items"], publications,
             "{question}: the CLI lists the same publications"
+        );
+        let id = result.execution_id;
+        assert_eq!(
+            http(&id.to_string(), &desk).await["result"]["outcome"]["steps"],
+            status["result"]["outcome"]["steps"],
+            "{question}: the HTTP route reports every branch's status"
+        );
+        assert_eq!(
+            http(&format!("{id}/publications?limit=100"), &desk).await["items"],
+            publications,
+            "{question}: the HTTP route lists the same publications"
         );
     }
 

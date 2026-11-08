@@ -51,6 +51,12 @@ REPORT = "# Final report\n"
 ASSESSMENT = {"risk": "low", "score": 0.9, "notes": ["é", "two words"]}
 """The JSON assessment the ``report-pipeline`` drafter publishes by value."""
 
+HOLD_ARRIVED = threading.Event()
+"""Set once the local model receives the ``CANCEL-HELD`` generalist's request."""
+
+HOLD_RELEASED = threading.Event()
+"""Set by the test to let the local model answer the held ``CANCEL-HELD`` generalist."""
+
 
 def read_text(read: dict[str, Any]) -> str:
     """The text of an ``fs.read`` result: its units' lines, joined by newlines."""

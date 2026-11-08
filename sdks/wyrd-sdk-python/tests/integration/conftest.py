@@ -31,6 +31,8 @@ from .support import (
     ASSESSMENT,
     BASELINE_TIMEOUT_SECONDS,
     FRAME_CLAIM,
+    HOLD_ARRIVED,
+    HOLD_RELEASED,
     LIVE_REVIEW,
     ON_CALL_TOKEN,
     REPORT,
@@ -370,6 +372,62 @@ def consumer_turn(messages: list[dict]) -> dict:
     return DONE
 
 
+GARBLED = {"garbled": True}
+"""An undecodable provider reply: a body that is no Chat Completions response."""
+
+PLANS = (
+    ("NEITHER", {"security": False, "style": False}),
+    ("SECURITY-ONLY", {"security": True, "style": False}),
+    ("BOTH", {"security": True, "style": True}),
+    ("UNDECIDED", {"security": None, "style": False}),
+    ("FORGOTTEN", {"style": False}),
+)
+"""The planner's decision for the first question marker its prompt carries."""
+
+
+def orchestration_turn(text: str, messages: list[dict]) -> dict | None:
+    """The ``specialist-review`` Agents' next turn, or ``None`` for an undecodable reply.
+
+    The planner decides by the question's marker and breaks without one. The
+    generalist and security specialist publish their account, the stylist
+    publishes a partial draft and then breaks, the consolidator reads every
+    collection's manifest, and the quoter reads the security account. The
+    ``CANCEL-HELD`` generalist holds its reply until the test releases it.
+    """
+    turn = sum(1 for each in messages if each.get("role") == "assistant")
+    if "CONSOLIDATE:" in text:
+        if turn:
+            return DONE
+        return calls(
+            *(
+                (f"c-{name}", "fs.read", {"path": f"/inputs/{name}/manifest.json"})
+                for name in ("general", "security", "style")
+            )
+        )
+    if "PLAN:" in text:
+        plan = next((plan for marker, plan in PLANS if marker in text), None)
+        return None if plan is None else {"role": "assistant", "content": json.dumps(plan)}
+    if "GENERAL:" in text or "SECURITY:" in text:
+        if "CANCEL-HELD" in text:
+            HOLD_ARRIVED.set()
+            HOLD_RELEASED.wait(300)
+        focus = "general" if "GENERAL:" in text else "security"
+        if turn:
+            return DONE
+        return calls(("s-publish", "publish", {"name": "account", "value": {"focus": focus}}))
+    if "STYLE:" in text:
+        if turn:
+            return None
+        return calls(("s-draft", "publish", {"name": "draft", "value": {"partial": True}}))
+    if turn:
+        return DONE
+    return calls(("q-read", "fs.read", {"path": "/inputs/security.json"}))
+
+
+ORCHESTRATION = ("CONSOLIDATE:", "PLAN:", "GENERAL:", "SECURITY:", "STYLE:", "QUOTE:")
+"""The prompt markers ``orchestration_turn`` scripts."""
+
+
 SLOW_SECONDS = 15.0
 """How long the ``SLOW-READER`` reader waits to answer, past its step's five-second deadline."""
 
@@ -393,8 +451,8 @@ def completion(body: dict) -> tuple[int, dict]:
     ``SCORE:``) answers ``scored``. The handbook judge reads its mount and
     answers ``handbook_verdict``; the file probe plays ``probe_turn``; the
     ``report-pipeline`` drafter and consumer play ``drafter_turn`` and
-    ``consumer_turn``. Every
-    other judge agrees.
+    ``consumer_turn``; the ``specialist-review`` Agents play
+    ``orchestration_turn``. Every other judge agrees.
     """
     text = json.dumps(body)
     returned = any(message.get("role") == "tool" for message in body.get("messages", []))
@@ -429,6 +487,11 @@ def completion(body: dict) -> tuple[int, dict]:
         message = drafter_turn(body["messages"])
     elif "CONSUME: " in text:
         message = consumer_turn(body["messages"])
+    elif any(marker in text for marker in ORCHESTRATION):
+        turned = orchestration_turn(text, body["messages"])
+        if turned is None:
+            return 200, GARBLED
+        message = turned
     elif "SCORE:" in text:
         message = {"role": "assistant", "content": scored(text)}
     else:

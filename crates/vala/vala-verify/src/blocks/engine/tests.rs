@@ -2753,6 +2753,10 @@ async fn ready_successors_do_not_wait_for_unrelated_steps() {
         "{calls:?}"
     );
     assert!(
+        at(&calls, "done:a") < at(&calls, "action:any"),
+        "the failed candidate does not release `any`: {calls:?}"
+    );
+    assert!(
         at(&calls, "done:a") < at(&calls, "action:after_a"),
         "{calls:?}"
     );
@@ -2898,6 +2902,27 @@ async fn array_fanout_freezes_and_orders_items() {
             .is_some_and(|text| text.starts_with("item 1:")),
         "{partial:?}"
     );
+    let items: BTreeMap<_, _> = ledger
+        .recorded()
+        .invocations
+        .iter()
+        .filter(|record| record.producer.step_id.as_str() == "partial")
+        .filter_map(|record| match record.settlement.as_ref()? {
+            InvocationSettlement::Action { result, .. } => {
+                Some((record.producer.item_index, result.status))
+            }
+            InvocationSettlement::Requirement { .. } => None,
+        })
+        .collect();
+    assert_eq!(
+        items,
+        BTreeMap::from([
+            (Some(0), StepStatus::Succeeded),
+            (Some(1), StepStatus::Failed),
+            (Some(2), StepStatus::Succeeded),
+        ]),
+        "every item keeps its own status"
+    );
     let sweep = step(&outcome, "sweep");
     assert_eq!(
         (sweep.status, sweep.output.clone(), sweep.attempts),
@@ -2961,7 +2986,9 @@ async fn repeat_refines_one_iteration_at_a_time() {
             {"id": "refine", "repeat": {"max_iterations": 4, "until": until("iteration.output.n", json!(2))},
              "action": code_action(json!({"n": "iteration.index", "prev": "iteration.previous"})),
              "requirements": [{"id": "seen", "statement": "each iteration ran",
-                 "check": {"kind": "assert", "path": "steps.refine.output.n", "operator": "greater_than_or_equals", "expected": 0}}]},
+                 "check": {"kind": "assert", "path": "steps.refine.output.n", "operator": "greater_than_or_equals", "expected": 0}},
+                 {"id": "judged", "statement": "each iteration was judged",
+                 "check": code_check(json!({"n": "steps.refine.output.n"}))}]},
             {"id": "exhaust", "repeat": {"max_iterations": 2, "until": until("iteration.output.n", json!(5))},
              "action": code_action(json!({"n": "iteration.index"}))},
             {"id": "broken", "repeat": {"max_iterations": 3, "until": {"path": "iteration.output.n", "operator": "greater_than_or_equals", "expected": "high"}},
@@ -2980,6 +3007,10 @@ async fn repeat_refines_one_iteration_at_a_time() {
             ("grid", echo(&[1, 2])),
             ("reader", echo(&[])),
         ]),
+        checks: HashMap::from([(
+            "judged",
+            Ok(verdict(VerificationVerdict::Passed, json!([]))),
+        )]),
         ..Script::default()
     });
     let outcome = run(
@@ -3003,6 +3034,17 @@ async fn repeat_refines_one_iteration_at_a_time() {
         "{calls:?}"
     );
     assert!(!calls.contains(&"action:refine#3".to_owned()), "{calls:?}");
+    for iteration in 0..2 {
+        assert!(
+            at(&calls, &format!("check:judged#{iteration}"))
+                < at(&calls, &format!("action:refine#{}", iteration + 1)),
+            "an iteration's requirements settle before the next starts: {calls:?}"
+        );
+    }
+    assert!(
+        calls.contains(&"check:judged#2".to_owned()),
+        "the stopping iteration's requirements settle before until stops it: {calls:?}"
+    );
     assert_eq!(
         outcome
             .requirements
@@ -3303,8 +3345,9 @@ fn answer_agent() -> Value {
 /// `limits.max_agent_invocations` counts every Agent action and check
 /// attempt, retries included: once spent, a later Agent action fails and an
 /// Agent check is inconclusive without being called, while code blocks still
-/// run. A reclaimed execution counts the attempts it already recorded, so
-/// recovery never replenishes the budget.
+/// run. An Agent check spends the budget like an action. A reclaimed
+/// execution counts the attempts it already recorded, so recovery never
+/// replenishes the budget.
 ///
 /// # Panics
 /// Panics when a spent budget dispatches an Agent block, a code block is
@@ -3365,6 +3408,41 @@ async fn agent_budget_counts_retries_and_is_never_replenished() {
     );
     let coded = requirement(&outcome, "coded");
     assert_eq!(coded.outcome, RequirementOutcome::Passed, "{coded:?}");
+
+    let checked = verifier(json!({
+        "inputs": {"answer": {"type": "json"}},
+        "limits": {"max_agent_invocations": 2},
+        "steps": [
+            {"id": "one", "action": answer_agent(),
+             "requirements": [{"id": "reviewed", "statement": "reviewed", "check": answer_agent()}]},
+            {"id": "two", "depends_on": ["one"], "action": answer_agent()}
+        ]
+    }));
+    let script = Arc::new(Script {
+        checks: HashMap::from([(
+            "reviewed",
+            Ok(verdict(VerificationVerdict::Passed, json!([]))),
+        )]),
+        ..Script::default()
+    });
+    let outcome = run(
+        &engine(&script, InMemoryTraceSource::new(), 4),
+        &checked,
+        json!({"answer": 1}),
+    )
+    .await
+    .expect("outcome");
+    let calls = script.calls();
+    assert!(calls.contains(&"check:reviewed".to_owned()), "{calls:?}");
+    assert!(
+        !calls.contains(&"action:two".to_owned()),
+        "a check spends the budget: {calls:?}"
+    );
+    let two = step(&outcome, "two");
+    assert_eq!(
+        (two.status, two.attempts, two.reason.as_deref()),
+        (StepStatus::Failed, 0, Some(BUDGET_SPENT))
+    );
 
     let resumable = verifier(json!({
         "inputs": {"answer": {"type": "json"}},

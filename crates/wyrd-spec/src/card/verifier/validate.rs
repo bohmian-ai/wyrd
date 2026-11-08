@@ -2817,11 +2817,14 @@ mod tests {
             let body = controlled(step);
             assert_eq!(refusal(&body), (rule.to_owned(), path.to_owned()), "{body}");
         }
-        let limits = with(controlled(json!({})), "/limits", json!({"concurrency": 0}));
-        assert_eq!(
-            refusal(&limits),
-            ("limits".to_owned(), "limits.concurrency".to_owned())
-        );
+        for field in ["concurrency", "max_agent_invocations", "timeout_seconds"] {
+            let limits = with(controlled(json!({})), "/limits", json!({ field: 0 }));
+            assert_eq!(
+                refusal(&limits),
+                ("limits".to_owned(), format!("limits.{field}")),
+                "{field}"
+            );
+        }
         let any_cycle = with(
             controlled(json!({"action": code(json!({"x": "steps.split.output"}))})),
             "/steps/0/depends_on",
@@ -2832,6 +2835,11 @@ mod tests {
             controlled(json!({"action": code(json!({"x": "steps.split.output"}))})),
             "/steps/0/when",
             json!({"path": "steps.review.output.flag", "operator": "equals", "expected": true}),
+        );
+        assert_eq!(
+            refusal(&guard_cycle).0,
+            "graph",
+            "an ordinary guard closes the cycle"
         );
         let guard_cycle = with(guard_cycle, "/steps/0/speculative", json!(true));
         assert_eq!(refusal(&guard_cycle).0, "graph");

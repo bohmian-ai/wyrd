@@ -788,7 +788,7 @@ macro_rules! card_methods {
             }
 
             /// The spec as authored so far, before validation; a
-            /// [`CodeSource::file`] position is `null` until its graph is
+            /// [`CodeSource::file`](crate::authoring::CodeSource::file) position is `null` until its graph is
             /// validated.
             #[must_use]
             pub fn spec(&self) -> serde_json::Value {
@@ -845,7 +845,7 @@ impl CardDefinition {
     }
 
     /// The spec as authored so far, before validation; a
-    /// [`CodeSource::file`] position is `null` until its graph is validated.
+    /// [`CodeSource::file`](crate::authoring::CodeSource::file) position is `null` until its graph is validated.
     #[must_use]
     pub fn spec(&self) -> Value {
         self.0.spec.value()

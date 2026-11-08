@@ -7,7 +7,9 @@ settled collection's manifest whatever its status, and the quoter, requiring
 the security account by name, runs only when that account was published.
 ``specialists-only`` judging only an unselected specialist is inconclusive.
 A submitted review whose generalist is held is cancelled and stays
-cancelled once the held reply returns.
+cancelled once the held reply returns. ``speculative-review``'s comparison
+admits, discards, or blocks its extra review, and ``document-pipeline``
+fans an uploaded document's sections out, repeats each, and refines a summary.
 
 The session's local model provider scripts each Agent by its prompt marker
 and turn, as the Rust journey's upstream does.
@@ -26,15 +28,18 @@ from wyrd.state import WyrdState
 from wyrd.testing import WyrdTestServer
 
 from .support import (
+    FIXTURES,
     HOLD_ARRIVED,
     HOLD_RELEASED,
     Receiver,
     client_of,
     declare,
+    prompt_of,
     pull,
     read_text,
     tool_results,
 )
+from .test_hosted_agent_tools import publications
 from .test_local_development import configure_gateway
 from .test_verifier_building_blocks import grants, requirement, step
 
@@ -163,3 +168,147 @@ def test_conditions_and_collections_preserve_missing_evidence(
         False,
     )
     assert not asked(receiver, "CONSOLIDATE:", "CANCEL-HELD"), "cancelled work never resumes"
+
+
+SPECULATED: list[tuple[str, bool, str, str, list[str], list[str]]] = [
+    ("SPEC-ADMIT-LATE-DECISION", True, "succeeded", "admitted", ["account"], ["admitted"]),
+    ("SPEC-ADMIT-EARLY-DECISION", True, "succeeded", "admitted", ["account"], ["admitted"]),
+    ("SPEC-DISCARD-LATE-DECISION", True, "skipped", "discarded", [], ["discarded"]),
+    ("SPEC-DISCARD-EARLY-DECISION", True, "skipped", "discarded", [], []),
+    ("SPEC-BLOCK-LATE-DECISION", True, "failed", "blocked", [], ["blocked"]),
+    ("SPEC-KNOWN", False, "skipped", "discarded", [], []),
+]
+"""Each ``speculative-review`` question beside whether the extra reviewer was called, the
+``extra`` step's status, the speculation and entry names of the consolidator's ``extra``
+manifest, and the speculation the execution's listing retains for the extra account."""
+
+
+def extra_speculation(execution: verify.Execution) -> list[str]:
+    """The speculation of every publication ``execution``'s ``extra`` step retained."""
+    listed = publications(execution)
+    return [each["speculation"] for each in listed if each["producer"]["step_id"] == "extra"]
+
+
+def test_speculative_disposition_controls_consumer_admission(
+    desk: WyrdState, receiver: Receiver, wyrd_server: WyrdTestServer
+) -> None:
+    admin = client_of(wyrd_server)
+    reader = client_of(
+        wyrd_server,
+        wyrd_server.scoped_api_key(
+            "speculation_reader", [{"resource": "verifier", "action": "read", "scope": "all"}]
+        ),
+    )
+    for question, called, status, speculation, names, retained in SPECULATED:
+        result = desk.run().observe.verify("speculative-review", question)
+        assert requirement(result, "consolidated")["outcome"] == "passed", question
+        assert step(result, "extra")["status"] == status, question
+        if called:
+            with receiver.delivered:
+                assert receiver.delivered.wait_for(
+                    lambda question=question: asked(receiver, "EXTRA:", question), 90
+                ), f"{question}: a cancelled extra review counts once abandoned"
+        else:
+            assert not asked(receiver, "EXTRA:", question), question
+        read = tool_results(asked(receiver, "CONSOLIDATE:", question)[-1])
+        manifest = json.loads(read_text(read["c-extra"]))
+        entries = [entry["name"] for entry in manifest["entries"]]
+        assert (manifest["speculation"], entries) == (speculation, names), question
+
+        execution = verify.Execution.connect(result.execution_id, admin)
+        assert extra_speculation(execution) == retained, question
+        if retained:
+            inspected = verify.Execution.connect(result.execution_id, reader).publication(
+                {"step_id": "extra", "attempt": 1}, "account"
+            )
+            assert inspected.get("value") == {"extra": True}, question
+            assert extra_speculation(execution) == retained, (question, "inspection keeps it")
+
+
+def manifest_entries(read: dict[str, Any]) -> list[tuple[int | None, int | None, str]]:
+    """The sorted ``(item_index, iteration_index, name)`` entries of a manifest ``fs.read`` result."""
+    entries = json.loads(read_text(read))["entries"]
+    return sorted(
+        (entry.get("item_index"), entry.get("iteration_index"), entry["name"]) for entry in entries
+    )
+
+
+def test_document_pipeline_uses_array_repeat_and_publications(
+    desk: WyrdState, receiver: Receiver, wyrd_server: WyrdTestServer
+) -> None:
+    document = verify.File(FIXTURES / "cards/verifier_orchestration/samples/field-report.json")
+    result = desk.run().observe.verify("document-pipeline", document)
+
+    sections = step(result, "sections")
+    assert (sections["status"], sections.get("output")) == ("succeeded", [{"done": True}] * 3)
+    reviewed = {
+        prompt_of(messages).split("SECTION: ", 1)[1].splitlines()[0]
+        for messages in asked(receiver, "SECTION:", "")
+    }
+    assert reviewed == {"intro at=0", "claims at=1", "claims at=2"}, (
+        "the duplicate keeps its own index and the empty appendix calls no reviewer"
+    )
+    polish = step(result, "polish")
+    assert (polish["status"], polish.get("output")) == (
+        "succeeded",
+        [
+            {"score": 1, "text": "intro v1"},
+            {"score": 1, "text": "claims v1"},
+            {"score": 1, "text": "claims v1"},
+        ],
+    ), "each section repeats independently and the final values keep input order"
+    rounds: dict[str, list[str]] = {}
+    for messages in asked(receiver, "POLISH:", ""):
+        item, round = prompt_of(messages).split(" item=", 1)[1].split(" round=", 1)
+        rounds.setdefault(item, []).append(round.split()[0])
+    assert rounds == {item: ["0", "1"] for item in ("0", "1", "2")}, (
+        "every item runs its own rounds in order until its condition holds"
+    )
+    appendix = step(result, "appendix")
+    assert (appendix["status"], appendix.get("output")) == ("succeeded", [])
+    assert step(result, "escalate")["status"] == "failed"
+    summarize = step(result, "summarize")
+    assert (summarize["status"], summarize.get("output")) == (
+        "succeeded",
+        {"score": 1, "text": "summary v1"},
+    )
+    summaries = asked(receiver, "SUMMARIZE:", "")
+    assert [
+        int(prompt_of(messages).split("index=", 1)[1].split()[0]) for messages in summaries
+    ] == [0, 0, 0, 1, 1, 1], "one iteration at a time, stopping within the bound of 3"
+    assert "previous=null" in prompt_of(summaries[0])
+    read = tool_results(summaries[1])
+    assert manifest_entries(read["m-accounts"]) == [(item, None, "account") for item in range(3)]
+    escalation = json.loads(read_text(read["m-escalation"]))
+    assert (escalation["status"], manifest_entries(read["m-escalation"])) == (
+        "failed",
+        [(None, None, "note")],
+    ), "the failed escalation keeps its partial note"
+    execution = verify.Execution.connect(result.execution_id, client_of(wyrd_server))
+    accounts = sorted(
+        (
+            (
+                each["producer"].get("item_index"),
+                execution.publication(each["producer"], each["name"]).get("value"),
+            )
+            for each in publications(execution)
+            if each["producer"]["step_id"] == "sections"
+        ),
+        key=lambda account: account[0] or 0,
+    )
+    assert accounts == [
+        (0, {"section": "intro", "at": 0}),
+        (1, {"section": "claims", "at": 1}),
+        (2, {"section": "claims", "at": 2}),
+    ]
+
+    assert {judged["id"]: judged["outcome"] for judged in result.requirements} == {
+        "appendix-reviewed": "failed",
+        "cited": "passed",
+        "escalation-done": "inconclusive",
+        "summarized": "passed",
+    }
+    assert requirement(result, "cited").get("citations") == [
+        {"slot": "document", "locator": {"json_pointer": "/title"}}
+    ]
+    assert result.verdict == "failed"

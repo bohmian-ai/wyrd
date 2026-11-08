@@ -45,6 +45,7 @@ from .support import (
     client_of,
     declare,
     hydrated,
+    prompt_of,
     pull,
     read_text,
     reset_telemetry_providers,
@@ -385,24 +386,43 @@ PLANS = (
 """The planner's decision for the first question marker its prompt carries."""
 
 
+HELD_SECONDS = 3.0
+"""How long a held reply waits, so the other side of a speculative race settles first."""
+
+BRIEF_SECONDS = 1.0
+"""How long an early decision waits, so the bootstrap it races settles first while a held
+extra review is still running."""
+
+
+def answer(value: object) -> dict:
+    """A final answer carrying ``value`` as JSON."""
+    return {"role": "assistant", "content": json.dumps(value)}
+
+
 def orchestration_turn(text: str, messages: list[dict]) -> dict | None:
-    """The ``specialist-review`` Agents' next turn, or ``None`` for an undecodable reply.
+    """The ``orchestration-desk`` Agents' next turn, or ``None`` for an undecodable reply.
 
     The planner decides by the question's marker and breaks without one. The
     generalist and security specialist publish their account, the stylist
     publishes a partial draft and then breaks, the consolidator reads every
     collection's manifest, and the quoter reads the security account. The
     ``CANCEL-HELD`` generalist holds its reply until the test releases it.
+    A ``LATE-DECISION`` comparison and a ``KNOWN`` bootstrap hold their
+    replies; an ``EARLY-DECISION`` comparison waits briefly while its extra
+    review holds its first turn longer. A section reviewer publishes its
+    section and index, the polisher scores each section by its round, the
+    escalation publishes a note and then breaks, the summarizer reads both
+    collections, publishes a summary, and scores it by its iteration index,
+    and the document judge passes, citing the document's title.
     """
     turn = sum(1 for each in messages if each.get("role") == "assistant")
+    prompt = prompt_of(messages)
     if "CONSOLIDATE:" in text:
         if turn:
             return DONE
+        names = ("extra",) if "SPEC-" in text else ("general", "security", "style")
         return calls(
-            *(
-                (f"c-{name}", "fs.read", {"path": f"/inputs/{name}/manifest.json"})
-                for name in ("general", "security", "style")
-            )
+            *((f"c-{name}", "fs.read", {"path": f"/inputs/{name}/manifest.json"}) for name in names)
         )
     if "PLAN:" in text:
         plan = next((plan for marker, plan in PLANS if marker in text), None)
@@ -419,12 +439,79 @@ def orchestration_turn(text: str, messages: list[dict]) -> dict | None:
         if turn:
             return None
         return calls(("s-draft", "publish", {"name": "draft", "value": {"partial": True}}))
+    if "BOOTSTRAP:" in text:
+        if "KNOWN" in text:
+            time.sleep(HELD_SECONDS)
+        return answer({"done": True})
+    if "COMPARE:" in text:
+        agree = False if "ADMIT" in text else None if "BLOCK" in text else True
+        if "LATE-DECISION" in text:
+            time.sleep(HELD_SECONDS)
+        elif "EARLY-DECISION" in text:
+            time.sleep(BRIEF_SECONDS)
+        return answer({"agree": agree})
+    if "EXTRA:" in text:
+        if turn:
+            return DONE
+        if "EARLY-DECISION" in text:
+            time.sleep(HELD_SECONDS)
+        return calls(("e-publish", "publish", {"name": "account", "value": {"extra": True}}))
+    if "SECTION:" in text:
+        found = re.search(r"SECTION: (.*?) at=(\d+)", prompt)
+        section, at = (found[1], int(found[2])) if found else ("", -1)
+        if turn:
+            return DONE
+        return calls(
+            ("d-account", "publish", {"name": "account", "value": {"section": section, "at": at}})
+        )
+    if "POLISH:" in text:
+        found = re.search(r"POLISH: (.*?) item=\S* round=(\d+)", prompt)
+        section, round = (found[1], int(found[2])) if found else ("", 0)
+        return answer({"score": round, "text": f"{section} v{round}"})
+    if "ESCALATE:" in text:
+        if turn:
+            return None
+        return calls(("x-note", "publish", {"name": "note", "value": {"escalated": True}}))
+    if "SUMMARIZE:" in text:
+        found = re.search(r"index=(\d+)", prompt)
+        index = int(found[1]) if found else -1
+        if turn == 0:
+            return calls(
+                ("m-accounts", "fs.read", {"path": "/inputs/accounts/manifest.json"}),
+                ("m-escalation", "fs.read", {"path": "/inputs/escalation/manifest.json"}),
+            )
+        if turn == 1:
+            return calls(("m-summary", "publish", {"name": "summary", "value": {"version": index}}))
+        return answer({"score": index, "text": f"summary v{index}"})
+    if "JUDGE-DOC:" in text:
+        return answer(
+            {
+                "outcome": "passed",
+                "reason": "the summary names the report",
+                "citations": [{"slot": "document", "locator": {"json_pointer": "/title"}}],
+            }
+        )
     if turn:
         return DONE
     return calls(("q-read", "fs.read", {"path": "/inputs/security.json"}))
 
 
-ORCHESTRATION = ("CONSOLIDATE:", "PLAN:", "GENERAL:", "SECURITY:", "STYLE:", "QUOTE:")
+ORCHESTRATION = (
+    "CONSOLIDATE:",
+    "PLAN:",
+    "GENERAL:",
+    "SECURITY:",
+    "STYLE:",
+    "BOOTSTRAP:",
+    "COMPARE:",
+    "EXTRA:",
+    "SECTION:",
+    "POLISH:",
+    "ESCALATE:",
+    "SUMMARIZE:",
+    "JUDGE-DOC:",
+    "QUOTE:",
+)
 """The prompt markers ``orchestration_turn`` scripts."""
 
 
@@ -451,7 +538,7 @@ def completion(body: dict) -> tuple[int, dict]:
     ``SCORE:``) answers ``scored``. The handbook judge reads its mount and
     answers ``handbook_verdict``; the file probe plays ``probe_turn``; the
     ``report-pipeline`` drafter and consumer play ``drafter_turn`` and
-    ``consumer_turn``; the ``specialist-review`` Agents play
+    ``consumer_turn``; the ``orchestration-desk`` Agents play
     ``orchestration_turn``. Every other judge agrees.
     """
     text = json.dumps(body)
@@ -534,7 +621,8 @@ def serving(delay: float = 0.0) -> Generator[Receiver]:
     """Serve the local model provider and Operator hook endpoint until exit.
 
     With a ``delay``, each judge call is recorded on arrival and answered
-    ``delay`` seconds later, so a test can hold judgments in flight.
+    ``delay`` seconds later, so a test can hold judgments in flight. Without
+    one, each call is recorded once answered, or once the caller abandons it.
     """
     server = ThreadingHTTPServer(("127.0.0.1", 0), BaseHTTPRequestHandler)
     received = Receiver(url=f"http://127.0.0.1:{server.server_address[1]}")
@@ -546,13 +634,17 @@ def serving(delay: float = 0.0) -> Generator[Receiver]:
             if delay:
                 received.record(Delivery(self.path, headers, body))
                 time.sleep(delay)
-            status, reply = completion(body) if self.path == "/v1/chat/completions" else (200, {})
-            self.send_response(status)
-            self.send_header("content-type", "application/json")
-            self.end_headers()
-            self.wfile.write(json.dumps(reply).encode())
-            if not delay:
-                received.record(Delivery(self.path, headers, body))
+            try:
+                status, reply = (
+                    completion(body) if self.path == "/v1/chat/completions" else (200, {})
+                )
+                self.send_response(status)
+                self.send_header("content-type", "application/json")
+                self.end_headers()
+                self.wfile.write(json.dumps(reply).encode())
+            finally:
+                if not delay:
+                    received.record(Delivery(self.path, headers, body))
 
         def log_message(self, format: str, *args: object) -> None:
             """Keep per-request access lines out of the test output."""

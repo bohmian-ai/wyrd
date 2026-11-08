@@ -63,6 +63,11 @@ def read_text(read: dict[str, Any]) -> str:
     return "\n".join(unit["text"] for unit in read.get("units", []))
 
 
+def prompt_of(messages: list[dict]) -> str:
+    """Every text content of ``messages``, joined by newlines."""
+    return "\n".join(each["content"] for each in messages if isinstance(each.get("content"), str))
+
+
 def tool_results(messages: list[dict]) -> dict[str, Any]:
     """Every tool result in ``messages``, by the provider call ID it answers, decoded from JSON."""
     results: dict[str, Any] = {}

@@ -10437,6 +10437,7 @@ dependencies = [
  "tempfile",
  "tokio",
  "tracing",
+ "wiremock",
  "workspace-hack",
  "wyrd-ai",
  "wyrd-testing",

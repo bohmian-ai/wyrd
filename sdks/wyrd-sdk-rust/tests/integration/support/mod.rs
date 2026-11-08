@@ -474,6 +474,24 @@ impl Deployment {
         }
     }
 
+    /// Boot `builder` as a second bound replica over the same Postgres and
+    /// artifact storage while this server keeps running, as another pod
+    /// does. The administrator key is shared; clients of the replica are
+    /// built from the returned deployment.
+    ///
+    /// # Panics
+    /// Panics when the replica does not start.
+    pub async fn replica(&self, builder: WyrdTestServerBuilder) -> Self {
+        let server = Box::pin(self.server.start_bound_replica(builder))
+            .await
+            .expect("test server replica starts");
+        Self {
+            server,
+            admin_key: self.admin_key.clone(),
+            admin_root: self.admin_root.clone(),
+        }
+    }
+
     /// Stop the server.
     ///
     /// # Panics

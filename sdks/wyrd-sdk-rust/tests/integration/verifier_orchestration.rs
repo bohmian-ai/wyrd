@@ -1362,3 +1362,172 @@ async fn logical_control_state_resumes_from_bifrost() {
     );
     desk.deployment.shutdown().await;
 }
+
+/// How long a stalled worker's reply waits: longer than the whole journey,
+/// so the worker is still inside its call throughout the takeover.
+const STALLED: Duration = Duration::from_secs(600);
+
+/// Two queued refinements, one that stops and one that exhausts, are each
+/// stalled in iteration 1's first model call when their worker stops
+/// claiming and their leases expire. A second replica takes both over while
+/// the first worker still holds the stalled calls: settled iteration 0 is
+/// restored, the interrupted iteration runs as its retry, and each
+/// refinement stops or exhausts within its original `max_iterations` and
+/// deadline. When the first worker stops, still inside its stalled calls,
+/// nothing it held has started anything: across both workers, every
+/// iteration's calls precede the next iteration's, and no iteration runs
+/// twice.
+///
+/// # Panics
+/// Panics when a submission is refused or does not settle, a deadline
+/// moves, or an iteration overlaps or runs again.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires the repository-managed Postgres journey lifecycle"]
+async fn repeat_stops_or_exhausts_without_overlapping() {
+    const STOPS: &str = "REFINE-TAKEOVER";
+    const EXHAUSTS: &str = "REFINE-EXHAUSTS-TAKEOVER";
+    let desk = Desk::start().await;
+    let mut executions = Vec::new();
+    for question in [STOPS, EXHAUSTS] {
+        Mock::given(method("POST"))
+            .and(body_string_contains(question))
+            .and(body_string_contains("index=1"))
+            .respond_with(answer(&json!({ "late": true })).set_delay(STALLED))
+            .up_to_n_times(1)
+            .with_priority(1)
+            .mount(&desk.upstream)
+            .await;
+        let Submission::Queued(queued) = desk
+            .state
+            .run()
+            .observe()
+            .submit("repeat-takeover", json!(question))
+            .await
+            .expect("the refinement is submitted")
+        else {
+            panic!("Run evidence queues an execution");
+        };
+        executions.push((question, *queued.id()));
+    }
+    let deadline = std::time::Instant::now() + Duration::from_secs(90);
+    for (question, _) in &executions {
+        while !iterations(&desk.asked("REFINE:", question).await).contains(&1) {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "{question}: iteration 1 never started"
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    }
+    let Desk {
+        deployment: stalled,
+        upstream,
+        state,
+    } = desk;
+    stalled.server().cancel_bound_workers();
+    stalled
+        .server()
+        .flush_bifrost()
+        .await
+        .expect("Bifrost flushes");
+    let fixture =
+        VerificationFixture::provision(stalled.server().state(), stalled.server().data_tenant_id())
+            .await
+            .expect("the tenant provisions");
+    let mut deadlines = Vec::new();
+    for (_, execution) in &executions {
+        let row = fixture
+            .execution(*execution)
+            .await
+            .expect("the execution reads");
+        assert!(
+            row.deadline_at.is_some(),
+            "the first claim fixes a deadline"
+        );
+        deadlines.push(row.deadline_at);
+        fixture
+            .expire_lease(*execution)
+            .await
+            .expect("the stalled worker's lease expires");
+    }
+
+    let desk = Desk {
+        deployment: stalled.replica(builder(&upstream)).await,
+        upstream,
+        state,
+    };
+    for ((question, execution), before) in executions.iter().zip(&deadlines) {
+        let result = Execution::connect_with(*execution, &desk.deployment.admin())
+            .await
+            .expect("the execution handle connects")
+            .wait(Duration::from_secs(90))
+            .await
+            .expect("the taken-over execution settles");
+        assert_eq!(
+            &fixture
+                .execution(*execution)
+                .await
+                .expect("the execution reads")
+                .deadline_at,
+            before,
+            "{question}: the takeover keeps the original deadline"
+        );
+        let attempts: Vec<(Option<u32>, u32)> = desk
+            .publications(&result)
+            .await
+            .iter()
+            .map(|publication| {
+                (
+                    publication.producer.iteration_index,
+                    publication.producer.attempt,
+                )
+            })
+            .collect();
+        assert_eq!(
+            attempts,
+            [(Some(0), 1), (Some(1), 2), (Some(2), 1)],
+            "{question}: the interrupted iteration publishes as its retry"
+        );
+        let draft = step(&result, "draft");
+        if *question == STOPS {
+            assert_eq!(
+                (draft.status, draft.output.clone()),
+                (
+                    StepStatus::Succeeded,
+                    Some(json!({ "score": 2, "text": "v2" }))
+                ),
+                "{result:?}"
+            );
+            assert_eq!(
+                requirement(&result, "final").outcome,
+                RequirementOutcome::Passed
+            );
+        } else {
+            assert_eq!(
+                (draft.status, draft.output.clone()),
+                (StepStatus::Failed, None)
+            );
+            assert!(
+                draft
+                    .reason
+                    .as_deref()
+                    .is_some_and(|text| text.contains("max_iterations 3")),
+                "{draft:?}"
+            );
+            assert_ne!(
+                requirement(&result, "final").outcome,
+                RequirementOutcome::Passed
+            );
+        }
+    }
+
+    stalled.shutdown().await;
+    for (question, _) in &executions {
+        assert_eq!(
+            iterations(&desk.asked("REFINE:", question).await),
+            [0, 0, 1, 1, 1, 2, 2],
+            "{question}: iteration 1 runs once more and nothing overlaps"
+        );
+    }
+    desk.deployment.shutdown().await;
+}

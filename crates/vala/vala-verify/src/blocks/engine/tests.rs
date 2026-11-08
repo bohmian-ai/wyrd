@@ -3138,9 +3138,11 @@ async fn repeat_refines_one_iteration_at_a_time() {
 }
 
 /// A speculative step runs while its guard is pending; its consumers wait
-/// for the disposition. A true guard admits its output, a known-false guard
+/// for the disposition. A true guard admits its output whether the action
+/// finishes before or after the guard, a known-false guard
 /// makes no call, a guard that turns false cancels running work and
-/// withholds it, and an unevaluable guard blocks it as a failure. Every
+/// withholds it, and an unevaluable guard blocks it as a failure; ordinary
+/// consumers of discarded or blocked output are never called. Every
 /// disposition decided after the step started is recorded, and a recorded
 /// disposition wins over a re-evaluated guard.
 ///
@@ -3161,7 +3163,12 @@ async fn speculative_steps_withhold_content_until_admitted() {
             {"id": "dropped", "speculative": true, "when": guard("steps.compare.output.x", json!(2)),
              "action": code_action(json!({"y": "inputs.answer"}))},
             {"id": "blocked", "speculative": true, "when": guard("steps.compare.output.missing", json!(1)),
-             "action": code_action(json!({"y": "inputs.answer"}))}
+             "action": code_action(json!({"y": "inputs.answer"}))},
+            {"id": "late", "speculative": true, "when": guard("steps.compare.output.x", json!(1)),
+             "action": code_action(json!({"y": "inputs.answer"}))},
+            {"id": "late-consumer", "action": code_action(json!({"e": "steps.late.output"}))},
+            {"id": "dropped-consumer", "action": code_action(json!({"e": "steps.dropped.output"}))},
+            {"id": "blocked-consumer", "action": code_action(json!({"e": "steps.blocked.output"}))}
         ]
     }));
     let cancelled = Arc::new(Notify::new());
@@ -3173,6 +3180,10 @@ async fn speculative_steps_withhold_content_until_admitted() {
                 ("consumer", echo(&[])),
                 ("dropped", Behavior::Hang(Arc::clone(&cancelled))),
                 ("blocked", echo(&[])),
+                ("late", echo(&[9])),
+                ("late-consumer", echo(&[])),
+                ("dropped-consumer", echo(&[])),
+                ("blocked-consumer", echo(&[])),
             ]),
             ..Script::default()
         })
@@ -3202,6 +3213,26 @@ async fn speculative_steps_withhold_content_until_admitted() {
         step(&outcome, "consumer").output,
         Some(json!({"e": {"y": 1}}))
     );
+    assert!(
+        at(&calls, "done:compare") < at(&calls, "done:late")
+            && at(&calls, "done:late") < at(&calls, "action:late-consumer"),
+        "an action finishing after its true guard is admitted on completion: {calls:?}"
+    );
+    assert_eq!(
+        step(&outcome, "late-consumer").output,
+        Some(json!({"e": {"y": 1}}))
+    );
+    for excluded in ["dropped-consumer", "blocked-consumer"] {
+        let consumer = step(&outcome, excluded);
+        assert!(
+            consumer.status != StepStatus::Succeeded && consumer.output.is_none(),
+            "{consumer:?}"
+        );
+        assert!(
+            !calls.contains(&format!("action:{excluded}")),
+            "an ordinary consumer never receives excluded output: {calls:?}"
+        );
+    }
     assert!(!calls.contains(&"action:early".to_owned()), "{calls:?}");
     assert!(calls.contains(&"action:dropped".to_owned()), "{calls:?}");
     tokio::time::timeout(Duration::from_secs(1), cancelled.notified())
@@ -3232,6 +3263,7 @@ async fn speculative_steps_withhold_content_until_admitted() {
             })
     };
     assert_eq!(disposition("extra"), Some(Speculation::Admitted));
+    assert_eq!(disposition("late"), Some(Speculation::Admitted));
     assert_eq!(disposition("dropped"), Some(Speculation::Discarded));
     assert_eq!(disposition("blocked"), Some(Speculation::Blocked));
     assert_eq!(disposition("early"), None);

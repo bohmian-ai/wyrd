@@ -36,7 +36,7 @@ mod verification;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
-use wyrd_testing::experiment::{Engine, Level};
+use wyrd_testing::experiment::{DRIVER_CORES, Engine, Level};
 
 use crate::levels::{Context, Plan};
 
@@ -44,9 +44,14 @@ use crate::levels::{Context, Plan};
 const RESULTS: &str = "target/benchmarks/results.html";
 
 /// Dispatches the level command the arguments name.
+///
+/// The driver's runtime has one worker per core of its declared
+/// [`DRIVER_CORES`] budget rather than one per host CPU, so the budget every
+/// run is judged against is also the parallelism the driver schedules over.
 fn main() -> ExitCode {
     let arguments: Vec<String> = std::env::args().collect();
     let runtime = match tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(usize::from(DRIVER_CORES))
         .enable_all()
         .build()
     {

@@ -248,6 +248,10 @@ pub struct Timing {
     pub minimum_seconds: u64,
 }
 
+/// The driver's declared CPU budget in cores: the [`Validity::driver_cores`]
+/// every run is judged against, and the worker count of the driver's runtime.
+pub const DRIVER_CORES: u16 = 8;
+
 /// The thresholds every run's validity checks use.
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct Validity {
@@ -275,7 +279,7 @@ impl Default for Validity {
         Self {
             host_busy_fraction: 0.10,
             host_sample_seconds: 10,
-            driver_cores: 8.0,
+            driver_cores: f64::from(DRIVER_CORES),
             driver_fraction: 0.80,
             lateness_p99_us: 5_000.0,
             p99_samples: 1_000,

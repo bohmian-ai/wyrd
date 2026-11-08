@@ -37,12 +37,6 @@ vi.setConfig({ testTimeout: 300_000 });
 /** How long a test waits for a held request to arrive, and how long the held planner holds its reply. */
 const WAIT_MS = 90_000;
 
-/** How long a held reply waits, so the other side of a race settles first. */
-const HELD_MS = 3_000;
-
-/** How long an early decision waits, so the bootstrap it races settles first while a held extra review still runs. */
-const BRIEF_MS = 1_000;
-
 /** One Chat Completions message as the upstream receives it. */
 type Message = {
   readonly role?: string;
@@ -115,6 +109,32 @@ const DECISIONS: ReadonlyArray<readonly [string, unknown]> = [
 /** The prompt text of every request that reached the upstream, recorded on arrival, before any held reply is sent. */
 const arrived: string[] = [];
 
+/** The release of each held `speculative-review` answer, by the prompt fragment that holds it. */
+const holds = new Map<string, { readonly released: Promise<void>; readonly release: () => void }>();
+
+/** Hold the upstream's answer to every request carrying `fragment` until {@link release}. */
+function hold(fragment: string): void {
+  let release = (): void => undefined;
+  const released = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  holds.set(fragment, { released, release });
+}
+
+/** Answer every request `fragment` held, and its later requests at once. */
+function release(fragment: string): void {
+  holds.get(fragment)?.release();
+  holds.delete(fragment);
+}
+
+/** {@link scripted}'s answer to `request`, once no hold matching it is held. */
+function upstream(request: ReceivedRequest): Reply | Promise<Reply> {
+  const prompt = text(request);
+  arrived.push(prompt);
+  const held = [...holds].filter(([fragment]) => prompt.includes(fragment)).map(([, { released }]) => released);
+  return held.length === 0 ? scripted(request) : Promise.all(held).then(() => scripted(request));
+}
+
 /**
  * The scripted model: one reply per request, chosen by the Agent's prompt
  * marker and turn. The consolidator reads every collection's manifest; the
@@ -122,17 +142,15 @@ const arrived: string[] = [];
  * and breaks without one; the generalist and the security specialist publish
  * an account; the stylist publishes a partial draft, then breaks; the quoter
  * reads the security account. A `SPEC-` consolidator reads only the extra
- * collection; a `LATE-DECISION` comparison and a `KNOWN` bootstrap hold their
- * replies; an `EARLY-DECISION` comparison waits briefly while its extra
- * review holds its first turn longer. A section reviewer publishes its
+ * collection; the bootstrap, the comparison, and the extra review answer at
+ * once, a speculative race ordering them through {@link hold}. A section reviewer publishes its
  * section and index; the polisher scores each round by its index; the
  * escalation publishes a note, then breaks; the summarizer reads both
  * collections, publishes a summary, and scores it by its iteration index; the
  * document judge passes, citing the document's title.
  */
-function upstream(request: ReceivedRequest): Reply {
+function scripted(request: ReceivedRequest): Reply {
   const prompt = text(request);
-  arrived.push(prompt);
   const turn = messages(request).filter((message) => message.role === "assistant").length;
   if (prompt.includes("CONSOLIDATE:")) {
     const read = (collection: string): unknown =>
@@ -160,20 +178,14 @@ function upstream(request: ReceivedRequest): Reply {
       : GARBLED;
   }
   if (prompt.includes("BOOTSTRAP:")) {
-    return prompt.includes("KNOWN") ? { ...DONE, delayMs: HELD_MS } : DONE;
+    return DONE;
   }
   if (prompt.includes("COMPARE:")) {
     const agree = prompt.includes("ADMIT") ? false : prompt.includes("BLOCK") ? null : true;
-    const reply = judgeReply(JSON.stringify({ agree }));
-    const delayMs = prompt.includes("LATE-DECISION") ? HELD_MS : prompt.includes("EARLY-DECISION") ? BRIEF_MS : 0;
-    return { ...reply, delayMs };
+    return judgeReply(JSON.stringify({ agree }));
   }
   if (prompt.includes("EXTRA:")) {
-    if (turn > 0) {
-      return DONE;
-    }
-    const reply = toolTurn([toolCall("e-publish", "publish", { name: "account", value: { extra: true } })]);
-    return prompt.includes("EARLY-DECISION") ? { ...reply, delayMs: HELD_MS } : reply;
+    return turn > 0 ? DONE : toolTurn([toolCall("e-publish", "publish", { name: "account", value: { extra: true } })]);
   }
   if (prompt.includes("SECTION:")) {
     const [section = "", at = ""] = prompt.split("SECTION: ")[1]?.split(" at=") ?? [];
@@ -462,8 +474,15 @@ async function publications(id: string): Promise<PublicationSummary[]> {
 
 /** One `speculative-review` question's expected observations. */
 type Speculated = {
-  /** The question, carrying the comparison's and timing's markers. */
+  /** The question, carrying the comparison's marker. */
   readonly question: string;
+  /**
+   * The order its race is held in: `action` answers the comparison once the
+   * extra review settled; `decision` answers it once the extra review's
+   * request arrived, and the extra review once the comparison settled;
+   * `known` answers the bootstrap once the comparison settled.
+   */
+  readonly race: "action" | "decision" | "known";
   /** Whether the extra reviewer was called at all. */
   readonly called: boolean;
   /** The extra step's status. */
@@ -484,12 +503,15 @@ type Speculated = {
  * review is eligible makes no call. The consolidator only ever reads the
  * recorded disposition and receives the account only when it was admitted,
  * while a caller holding only `verifier:read` still inspects the retained
- * excluded account, leaving its disposition unchanged.
+ * excluded account, leaving its disposition unchanged. Each race is ordered by
+ * holding upstream answers until the invocation listing or the upstream shows
+ * the other side settled or arrived, never by elapsed time.
  */
 test("speculative_disposition_controls_consumer_admission", async ({ provider, server, state }) => {
   const cases: readonly Speculated[] = [
     {
       question: "SPEC-ADMIT-LATE-DECISION",
+      race: "action",
       called: true,
       status: "succeeded",
       speculation: "admitted",
@@ -498,6 +520,7 @@ test("speculative_disposition_controls_consumer_admission", async ({ provider, s
     },
     {
       question: "SPEC-ADMIT-EARLY-DECISION",
+      race: "decision",
       called: true,
       status: "succeeded",
       speculation: "admitted",
@@ -506,6 +529,7 @@ test("speculative_disposition_controls_consumer_admission", async ({ provider, s
     },
     {
       question: "SPEC-DISCARD-LATE-DECISION",
+      race: "action",
       called: true,
       status: "skipped",
       speculation: "discarded",
@@ -514,6 +538,7 @@ test("speculative_disposition_controls_consumer_admission", async ({ provider, s
     },
     {
       question: "SPEC-DISCARD-EARLY-DECISION",
+      race: "decision",
       called: true,
       status: "skipped",
       speculation: "discarded",
@@ -522,6 +547,7 @@ test("speculative_disposition_controls_consumer_admission", async ({ provider, s
     },
     {
       question: "SPEC-BLOCK-LATE-DECISION",
+      race: "action",
       called: true,
       status: "failed",
       speculation: "blocked",
@@ -530,6 +556,7 @@ test("speculative_disposition_controls_consumer_admission", async ({ provider, s
     },
     {
       question: "SPEC-KNOWN",
+      race: "known",
       called: false,
       status: "skipped",
       speculation: "discarded",
@@ -550,8 +577,59 @@ test("speculative_disposition_controls_consumer_admission", async ({ provider, s
       .filter((publication) => publication.producer.step_id === "extra")
       .map((publication) => publication.speculation);
 
-  for (const { question, called, status, speculation, entries, retained } of cases) {
-    const result = await state.run().observe.verify("speculative-review", question);
+  const reached = async (
+    execution: verify.Execution,
+    stepId: string,
+    accepts: (invocation: { readonly state: string; readonly speculation: string }) => boolean,
+  ): Promise<void> => {
+    await expect
+      .poll(
+        async () =>
+          (await execution.invocations({ limit: 200 })).items.some(
+            (invocation) => invocation.producer.step_id === stepId && accepts(invocation),
+          ),
+        { timeout: WAIT_MS, interval: 50 },
+      )
+      .toBe(true);
+  };
+
+  for (const { question, race, called, status, speculation, entries, retained } of cases) {
+    const [compare, reviewing, bootstrap] = ["COMPARE:", "EXTRA:", "BOOTSTRAP:"].map(
+      (marker) => `${marker} ${question}`,
+    ) as [string, string, string];
+    let result: VerificationResult;
+    try {
+      for (const fragment of { action: [compare], decision: [compare, reviewing], known: [bootstrap] }[race]) {
+        hold(fragment);
+      }
+      const submitted = await state.run().observe.submit("speculative-review", question);
+      if (submitted.kind !== "queued") {
+        throw new Error("Run evidence queues an execution");
+      }
+      const execution = await verify.Execution.connect(submitted.execution.id);
+      if (race === "action") {
+        await reached(execution, "extra", (invocation) => invocation.state === "action");
+        release(compare);
+      } else if (race === "decision") {
+        await expect
+          .poll(() => arrived.some((prompt) => prompt.includes(reviewing)), { timeout: WAIT_MS, interval: 50 })
+          .toBe(true);
+        release(compare);
+        await reached(execution, "compare", (invocation) => invocation.state === "action");
+        if (retained.length === 0) {
+          await reached(execution, "extra", (invocation) => invocation.speculation === "discarded");
+        }
+        release(reviewing);
+      } else {
+        await reached(execution, "compare", (invocation) => invocation.state === "action");
+        release(bootstrap);
+      }
+      result = await execution.wait({ timeoutMs: WAIT_MS });
+    } finally {
+      for (const fragment of [compare, reviewing, bootstrap]) {
+        release(fragment);
+      }
+    }
 
     expect(requirement(result, "consolidated").outcome, `${question}: ${JSON.stringify(result)}`).toBe("passed");
     expect(step(result, "extra").status, `${question}: ${JSON.stringify(result)}`).toBe(status);

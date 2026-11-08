@@ -254,7 +254,8 @@ fn answer_text(bytes: Vec<u8>) -> String {
         .unwrap_or_else(|error| String::from_utf8_lossy(error.as_bytes()).into_owned())
 }
 
-/// Reads an answer body unchanged, failing once it exceeds `limit` bytes.
+/// Reads an answer body unchanged, failing once it exceeds `limit` bytes. An
+/// advertised length, capped at `limit`, sizes the buffer up front.
 ///
 /// # Errors
 ///
@@ -266,7 +267,12 @@ async fn read_bounded_bytes(
     limit: usize,
 ) -> ProviderResult<Vec<u8>> {
     let status = response.status().as_u16();
-    let mut bytes = Vec::new();
+    // An advertised length sizes the answer, but never past the bound.
+    let hint = response
+        .content_length()
+        .and_then(|len| usize::try_from(len).ok())
+        .map_or(0, |len| len.min(limit));
+    let mut bytes = Vec::with_capacity(hint);
     while let Some(chunk) = response
         .chunk()
         .await
@@ -457,7 +463,9 @@ mod bounded_answers {
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
     /// An answer larger than the transport bound fails instead of buffering,
-    /// and a refused answer keeps its status and body.
+    /// and a refused answer keeps its status and body. A known length sizes the
+    /// collected answer exactly; a chunked answer still collects; an advertised
+    /// length past the bound reserves at most the bound; truncation still fails.
     #[tokio::test]
     async fn oversized_answers_fail_and_refusals_keep_status_and_body() {
         let server = MockServer::start().await;
@@ -505,6 +513,64 @@ mod bounded_answers {
                 body: "{\"error\":\"teapot\"}".to_owned(),
                 retry_after_ms: None,
             }
+        );
+
+        let read = |head: &'static str, body: Vec<u8>, limit| async move {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+                .await
+                .expect("listener binds");
+            let url = format!(
+                "http://{}/",
+                listener.local_addr().expect("listener address")
+            );
+            tokio::spawn(async move {
+                use tokio::io::{AsyncReadExt, AsyncWriteExt};
+                let (mut socket, _) = listener.accept().await.expect("client connects");
+                let mut request = [0_u8; 1024];
+                let _ = socket.read(&mut request).await;
+                let _ = socket.write_all(head.as_bytes()).await;
+                let _ = socket.write_all(&body).await;
+            });
+            let response = reqwest::get(url).await.expect("answer starts");
+            super::read_bounded_bytes("openai", response, limit).await
+        };
+        let head = "HTTP/1.1 200 OK\r\ncontent-length: 100000\r\n\r\n";
+        let known = read(head, vec![b'k'; 100_000], 1 << 20)
+            .await
+            .expect("known length collects");
+        assert_eq!((known.len(), known.capacity()), (100_000, 100_000));
+        let chunked = read(
+            "HTTP/1.1 200 OK\r\ntransfer-encoding: chunked\r\n\r\n",
+            b"3\r\nabc\r\n2\r\nde\r\n0\r\n\r\n".to_vec(),
+            1024,
+        )
+        .await
+        .expect("chunked answer collects");
+        assert_eq!(chunked, b"abcde");
+        let advertised = "HTTP/1.1 200 OK\r\ncontent-length: 18446744073709551613\r\n\r\n";
+        assert!(matches!(
+            read(advertised, vec![b'h'; 2048], 1024).await,
+            Err(ProviderError::Upstream { status: 200, .. })
+        ));
+        assert!(matches!(
+            read(
+                "HTTP/1.1 200 OK\r\ncontent-length: 2048\r\n\r\n",
+                vec![b'o'; 2048],
+                1024
+            )
+            .await,
+            Err(ProviderError::Upstream { status: 200, .. })
+        ));
+        let truncated = read(
+            "HTTP/1.1 200 OK\r\ncontent-length: 512\r\n\r\n",
+            vec![b't'; 100],
+            1024,
+        )
+        .await
+        .expect_err("truncated answer fails");
+        assert!(
+            matches!(truncated, ProviderError::Upstream { status: 0, .. }),
+            "{truncated:?}"
         );
     }
 

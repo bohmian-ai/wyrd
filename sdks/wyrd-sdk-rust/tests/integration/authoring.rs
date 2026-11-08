@@ -683,3 +683,255 @@ async fn multi_component_service_verifies_each_subject() {
     }
     story_server.deployment.shutdown().await;
 }
+
+/// The kinds `receipt` declared.
+fn declared_kinds(receipt: &wyrd_ai::cards::DeclarationReceipt) -> Vec<CardKind> {
+    receipt
+        .outcomes
+        .iter()
+        .map(|outcome| outcome.card_ref.kind.clone())
+        .collect()
+}
+
+/// Whether Artifact `version` of the policy is registered and holds its
+/// extracted policy file.
+async fn policy_published(cards: &Cards, version: &str) -> bool {
+    cards
+        .list_artifacts(CardSelector::exact(card_ref(
+            CardKind::Artifact,
+            "company-sharing-policy",
+            version,
+        )))
+        .await
+        .is_ok_and(|files| {
+            files
+                .artifacts
+                .iter()
+                .any(|file| file.relative_path.as_str() == POLICY_FILE)
+        })
+}
+
+/// The policy version the registered `report-policy` `version` mounts.
+async fn mounted_policy(cards: &Cards, version: &str) -> Value {
+    let card = cards
+        .get(CardSelector::exact(card_ref(
+            CardKind::Verifier,
+            "report-policy",
+            version,
+        )))
+        .await
+        .expect("report-policy reads");
+    let spec = serde_json::to_value(&card.spec).expect("spec serializes");
+    spec["steps"][0]["requirements"][1]["check"]["workspace"]["/inputs/policy.json"]["artifact"]
+        ["card"]["version"]
+        .clone()
+}
+
+/// A local policy publishes first, alone, through `Cards`; a registered
+/// policy reference declares through `WyrdState` with nothing uploaded and
+/// is mounted by the judge; a new local policy version through `WyrdState`
+/// leaves the old graph on the old policy; changed bytes under a published
+/// version, an unreadable source, and an unregistered reference are
+/// refused; and a graph refused after its policy published keeps that
+/// policy, which a later graph reuses by reference.
+///
+/// # Panics
+/// Panics when a declaration, verification, or read differs.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires the repository-managed Postgres journey lifecycle"]
+async fn local_artifacts_reuse_and_keep_versions() {
+    let story_server = Story::start().await;
+    let cards = story_server.deployment.cards().await;
+    let source = story("company-sharing-policy.pdf");
+    let local = local_policy("1.0.0", &source);
+    let authored = baseline(&local.file(POLICY_FILE).expect("relative path"));
+    let declaration = wyrd_ai::authoring::CardDefinition::from(authored.clone())
+        .declaration()
+        .expect("valid graph");
+    assert_eq!(declaration.artifacts, [local.clone()]);
+    assert!(
+        declaration
+            .input
+            .submissions
+            .iter()
+            .all(|submission| submission.kind != CardKind::Artifact
+                && submission.artifacts.is_empty()),
+        "the graph request carries no heavy submission"
+    );
+
+    let receipt = cards
+        .declare_authored(&authored)
+        .await
+        .expect("the local policy publishes and the graph declares");
+    assert_eq!(receipt.root.name.as_str(), "finance-release");
+    assert!(
+        !declared_kinds(&receipt).contains(&CardKind::Artifact),
+        "{receipt:#?}"
+    );
+    assert!(policy_published(&cards, "1.0.0").await);
+    assert_eq!(mounted_policy(&cards, "1.0.0").await, json!("1.0.0"));
+
+    let reused = baseline(&registered_policy("1.0.0"));
+    assert!(
+        wyrd_ai::authoring::CardDefinition::from(reused.clone())
+            .declaration()
+            .expect("valid graph")
+            .artifacts
+            .is_empty(),
+        "a registered reference prepares and uploads nothing"
+    );
+    let state = story_server.state(&reused).await;
+    for _ in 0..2 {
+        let (report, access) = verify_both(&state, &permitted()).await;
+        let (report, access) = (
+            report.expect("report-policy runs"),
+            access.expect("release-access runs"),
+        );
+        assert!(releases(&report, &access), "{report:#?} {access:#?}");
+        assert_eq!(report.verifier.version.as_str(), "1.0.0");
+    }
+
+    let unregistered = story_server
+        .deployment
+        .cards()
+        .await
+        .declare_authored(&finance_release(
+            "9.0.0",
+            &registered_policy("9.0.0"),
+            release_access("9.0.0"),
+        ))
+        .await
+        .expect_err("an unregistered policy reference is not uploaded");
+    assert_eq!(
+        unregistered.code(),
+        "WYRD_REGISTRY_422_UNRESOLVED_DEPENDENCY",
+        "{unregistered:?}"
+    );
+    assert!(!policy_published(&cards, "9.0.0").await, "{unregistered:?}");
+
+    let revised = tempfile::tempdir().expect("revision directory creates");
+    let revised_source = revised.path().join("company-sharing-policy.pdf");
+    let mut bytes = std::fs::read(&source).expect("policy reads");
+    bytes.extend_from_slice(b"% revision 2\n");
+    std::fs::write(&revised_source, bytes).expect("revised policy writes");
+    let revised_state = story_server
+        .state(&finance_release(
+            "2.0.0",
+            &local_policy("2.0.0", &revised_source)
+                .file(POLICY_FILE)
+                .expect("relative path"),
+            release_access("2.0.0"),
+        ))
+        .await;
+    assert!(policy_published(&cards, "2.0.0").await);
+    assert_eq!(mounted_policy(&cards, "2.0.0").await, json!("2.0.0"));
+    assert_eq!(mounted_policy(&cards, "1.0.0").await, json!("1.0.0"));
+    let (revised_report, _) = verify_both(&revised_state, &permitted()).await;
+    assert_eq!(
+        revised_report
+            .expect("report-policy runs")
+            .verifier
+            .version
+            .as_str(),
+        "2.0.0"
+    );
+    let (old_report, _) = verify_both(&state, &permitted()).await;
+    assert_eq!(
+        old_report
+            .expect("report-policy runs")
+            .verifier
+            .version
+            .as_str(),
+        "1.0.0",
+        "the old state keeps the old policy"
+    );
+
+    let drifted = cards
+        .declare_authored(&baseline(
+            &local_policy("1.0.0", &revised_source)
+                .file(POLICY_FILE)
+                .expect("relative path"),
+        ))
+        .await
+        .expect_err("changed bytes under a published version are refused");
+    assert_eq!(
+        drifted.code(),
+        "WYRD_REGISTRY_409_SPEC_DRIFT",
+        "{drifted:?}"
+    );
+
+    let unreadable = cards
+        .declare_authored(&finance_release(
+            "4.0.0",
+            &local_policy("4.0.0", &revised.path().join("missing.pdf"))
+                .file(POLICY_FILE)
+                .expect("relative path"),
+            release_access("4.0.0"),
+        ))
+        .await
+        .expect_err("an unreadable source is refused");
+    assert_eq!(
+        unreadable.code(),
+        "WYRD_LOADER_400_INVALID_ENVELOPE",
+        "{unreadable:?}"
+    );
+    assert!(
+        cards
+            .get(CardSelector::exact(card_ref(
+                CardKind::Service,
+                "finance-release",
+                "4.0.0"
+            )))
+            .await
+            .is_err()
+    );
+
+    let mut orphaned = Service::new("finance-release", "3.0.0").expect("valid identity");
+    let judge = policy_judge("report-reviewer", "3.0.0");
+    let policy = local_policy("3.0.0", &source);
+    orphaned
+        .add_component(
+            "report-reviewer",
+            judge.clone(),
+            [report_policy(
+                "3.0.0",
+                &judge,
+                &policy.file(POLICY_FILE).expect("relative path"),
+            )],
+        )
+        .expect("new alias");
+    orphaned
+        .add_registered_component(
+            "release-controls",
+            card_ref(CardKind::Agent, "unregistered-controls", "1.0.0"),
+            [release_access("3.0.0")],
+        )
+        .expect("new alias");
+    let refused = cards
+        .declare_authored(&orphaned)
+        .await
+        .expect_err("the graph names an unregistered component");
+    assert_eq!(
+        refused.code(),
+        "WYRD_REGISTRY_422_UNRESOLVED_DEPENDENCY",
+        "the server, not local validation, refuses the graph: {refused:?}"
+    );
+    assert!(
+        policy_published(&cards, "3.0.0").await,
+        "the published policy outlives the refused graph: {refused:?}"
+    );
+    let recovered = cards
+        .declare_authored(&finance_release(
+            "3.0.0",
+            &registered_policy("3.0.0"),
+            release_access("3.0.0"),
+        ))
+        .await
+        .expect("the retained policy is reused by reference");
+    assert!(
+        !declared_kinds(&recovered).contains(&CardKind::Artifact),
+        "{recovered:#?}"
+    );
+    assert_eq!(mounted_policy(&cards, "3.0.0").await, json!("3.0.0"));
+    story_server.deployment.shutdown().await;
+}

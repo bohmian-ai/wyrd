@@ -1,668 +1,418 @@
 //! Verifier authoring: inputs, steps, requirements, actions, and checks.
 
-use std::collections::BTreeMap;
-use std::path::Path;
-
 use serde_json::Value;
-use wyrd_spec::card::agent::AgentSpec;
-use wyrd_spec::card::drift::DriftSpec;
-use wyrd_spec::card::prompt::ParameterName;
-use wyrd_spec::card::verifier::{
-    self as spec, CodeCheck, CodeRuntime, CodeSource, Condition, Decide, DriftCheck, InputSlot,
-    OrderBy, Reference, TraceCheck, VerifierSpec, WorkspaceSource,
-};
-use wyrd_spec::envelope::CardKind;
+use wyrd_loader::LoadError;
+use wyrd_spec::envelope::{CardKind, Spec};
 use wyrd_spec::error::WyrdError;
-use wyrd_spec::ids::SlotName;
-use wyrd_spec::verification::{
-    ComparisonOperator, ContextCapture, ExecutionPlan, JsonPath, TaskId,
-};
+use wyrd_spec::verification::ExecutionPlan;
 
-use super::{ArtifactFile, Dependencies, Linked, Verifier, exact_metadata, invalid};
+use super::{Body, Card, CardDefinition, FieldValue, card_methods, fields};
+
+/// A Verifier Card: the evidence it accepts, the steps that compute over it,
+/// and the requirements that judge it.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Verifier {
+    /// The Card under construction.
+    card: Card,
+}
 
 impl Verifier {
-    /// Define Verifier `name` at exact `version` with no inputs, steps, or
-    /// requirements, deciding by every requirement passing.
-    ///
-    /// # Errors
-    /// Returns identity errors as [`super::CardDefinition::new`] does.
-    pub fn new(name: &str, version: &str) -> Result<Self, WyrdError> {
-        Ok(Self::with_metadata(
-            CardKind::Verifier,
-            exact_metadata(name, version)?,
-            VerifierSpec {
-                description: None,
-                inputs: BTreeMap::new(),
-                steps: Vec::new(),
-                requirements: Vec::new(),
-                decide: Decide::All,
-                context_capture: None,
-                order_by: None,
-            },
-        ))
-    }
-
-    /// Set the Verifier's human-readable description.
-    pub fn set_description(&mut self, description: &str) {
-        self.spec.description = Some(description.to_owned());
-    }
-
-    /// Declare the required JSON input `name`, constrained by the JSON Schema
-    /// `schema` (`Value::Null` accepts any JSON value).
-    ///
-    /// # Errors
-    /// As [`Self::add_slot`].
-    pub fn add_input(&mut self, name: &str, schema: Value) -> Result<Reference, WyrdError> {
-        self.add_input_with_required(name, schema, true)
-    }
-
-    /// Declare JSON input `name`, required or optional.
-    ///
-    /// # Errors
-    /// As [`Self::add_slot`].
-    pub fn add_input_with_required(
-        &mut self,
-        name: &str,
-        schema: Value,
-        required: bool,
-    ) -> Result<Reference, WyrdError> {
-        self.add_slot(
-            name,
-            InputSlot::Json {
-                schema: (!schema.is_null()).then_some(schema),
-                required,
-            },
-        )
-    }
-
-    /// Declare input `name` as any canonical slot, such as media, trace, or
-    /// samples, and return its `inputs.<name>` reference.
-    ///
-    /// # Errors
-    /// Returns [`WyrdError::Validation`] for an invalid slot name, and with
-    /// rule `duplicate_input` for a name already declared.
-    pub fn add_slot(&mut self, name: &str, slot: InputSlot) -> Result<Reference, WyrdError> {
-        let path = format!("spec.inputs.{name}");
-        let slot_name = SlotName::new(name).map_err(|error| invalid("slot_name", &path, error))?;
-        if self.spec.inputs.contains_key(&slot_name) {
-            return Err(invalid(
-                "duplicate_input",
-                &path,
-                "input slot names must be unique within a Verifier",
-            ));
+    /// An empty Verifier Card named `name` at `version`; nothing is
+    /// validated until its graph is.
+    pub fn new(name: impl Into<String>, version: impl Into<String>) -> Self {
+        Self {
+            card: Card::new(CardKind::Verifier, name, version),
         }
-        let reference =
-            Reference::input(name).map_err(|error| invalid("reference", &path, error))?;
-        self.spec.inputs.insert(slot_name, slot);
-        Ok(reference)
     }
 
-    /// Append `step`, capturing its current value.
-    ///
-    /// # Errors
-    /// Returns [`WyrdError::Validation`] with rule `duplicate_id` when the
-    /// step or one of its requirements reuses a block ID of this Verifier.
-    pub fn add_step(&mut self, step: Step) -> Result<(), WyrdError> {
-        for id in std::iter::once(&step.step.id).chain(step.step.requirements.iter().map(|r| &r.id))
-        {
-            self.refuse_known_id(id)?;
-        }
-        self.spec.steps.push(step.step);
-        self.dependencies.absorb(step.dependencies);
-        Ok(())
-    }
-
-    /// Append a top-level `requirement`, capturing its current value.
-    ///
-    /// # Errors
-    /// Returns [`WyrdError::Validation`] with rule `duplicate_id` when its ID
-    /// is already a block ID of this Verifier.
-    pub fn add_requirement(&mut self, requirement: Requirement) -> Result<(), WyrdError> {
-        self.refuse_known_id(&requirement.requirement.id)?;
-        self.spec.requirements.push(requirement.requirement);
-        self.dependencies.absorb(requirement.dependencies);
-        Ok(())
-    }
-
-    /// Decide the verdict by `decide`.
-    pub fn set_decide(&mut self, decide: Decide) {
-        self.spec.decide = decide;
-    }
-
-    /// Capture execution context by `capture`.
-    pub fn set_context_capture(&mut self, capture: ContextCapture) {
-        self.spec.context_capture = Some(capture);
-    }
-
-    /// Order a group Verifier's source executions by `order`.
-    pub fn set_order_by(&mut self, order: OrderBy) {
-        self.spec.order_by = Some(order);
-    }
-
-    /// The step stages the server would execute.
+    /// The step stages the server would execute, after validating this
+    /// Verifier as its YAML file would be.
     ///
     /// A step runs after every step it names in `depends_on` and every step
     /// whose output or status its action or `when` condition references;
     /// steps with no edge between them share a stage.
     ///
     /// # Errors
-    /// Returns the shared Verifier validation's refusal.
+    /// Returns `WYRD_LOADER_400_INVALID_ENVELOPE` for a field that does not
+    /// decode, and the shared Verifier validation's refusal.
+    ///
+    /// # Panics
+    /// Never: a Verifier Card always decodes as a Verifier spec.
     pub fn plan(&self) -> Result<ExecutionPlan, WyrdError> {
-        self.spec.plan()
-    }
-
-    /// Run the shared Verifier validation the server applies at declaration.
-    ///
-    /// # Errors
-    /// Returns its [`WyrdError::Validation`] with the failing rule and path.
-    pub fn validate(&self) -> Result<(), WyrdError> {
-        self.spec.validate()
-    }
-
-    /// Refuse `id` when a step or requirement already uses it.
-    ///
-    /// # Errors
-    /// Returns rule `duplicate_id`, as the shared validation does.
-    fn refuse_known_id(&self, id: &TaskId) -> Result<(), WyrdError> {
-        let known = self
-            .spec
-            .steps
-            .iter()
-            .flat_map(|step| {
-                std::iter::once(&step.id).chain(step.requirements.iter().map(|r| &r.id))
-            })
-            .chain(self.spec.requirements.iter().map(|r| &r.id))
-            .any(|known| known == id);
-        if known {
-            return Err(invalid(
-                "duplicate_id",
-                id.as_str(),
-                "step and requirement IDs must be unique across the Verifier",
-            ));
-        }
-        Ok(())
+        let card = self.card.decode().map_err(LoadError::multiple)?;
+        let Spec::Verifier(spec) = card.spec else {
+            unreachable!("a Verifier Card decodes as a Verifier spec");
+        };
+        spec.plan()
     }
 }
 
-/// One Verifier step: an action, its `depends_on` edges, an optional
-/// condition, and the requirements judging its output.
+card_methods!(Verifier);
+
+fields!(Verifier [card.spec] {
+    one description: Value = "description";
+    map inputs, add_input: InputSlot = "inputs";
+    list steps, add_step: Step = "steps";
+    list requirements, add_requirement: Requirement = "requirements";
+    one decide: Value = "decide";
+    one context_capture: Value = "context_capture";
+    one order_by: Value = "order_by";
+});
+
+impl From<Verifier> for CardDefinition {
+    /// The same Card, keeping what it references.
+    fn from(verifier: Verifier) -> Self {
+        Self(verifier.card)
+    }
+}
+
+impl From<&Verifier> for CardDefinition {
+    /// A copy of the Card as it is now.
+    fn from(verifier: &Verifier) -> Self {
+        Self::from(verifier.clone())
+    }
+}
+
+impl From<Verifier> for crate::cards::Declarable<'_> {
+    /// The authored Card and everything it references.
+    fn from(card: Verifier) -> Self {
+        Self::Card(Box::new(card.into()))
+    }
+}
+
+impl From<&Verifier> for crate::cards::Declarable<'_> {
+    /// A copy of the authored Card as it is now.
+    fn from(card: &Verifier) -> Self {
+        Self::Card(Box::new(card.into()))
+    }
+}
+
+impl From<Verifier> for FieldValue {
+    /// A sibling reference to the Verifier, declared in the same graph.
+    fn from(verifier: Verifier) -> Self {
+        Self::from(CardDefinition::from(verifier))
+    }
+}
+
+/// One named evidence slot of a Verifier.
+///
+/// Slots are required unless `required(false)` is set; samples and source
+/// slots are always required.
+#[derive(Debug, Clone, PartialEq)]
+pub struct InputSlot {
+    /// The slot's fields.
+    body: Body,
+}
+
+impl InputSlot {
+    /// A slot of `type`.
+    fn typed(kind: &str) -> Self {
+        Self {
+            body: Body::new([("type", FieldValue::from(kind))]),
+        }
+    }
+
+    /// A JSON value constrained by the JSON Schema `schema`.
+    pub fn json(schema: impl Into<Value>) -> Self {
+        Self::typed("json").schema(schema)
+    }
+
+    /// A pinned file in one of `formats`, such as `"pdf"`.
+    pub fn media<I>(formats: I) -> Self
+    where
+        I: IntoIterator,
+        I::Item: Into<Value>,
+    {
+        Self::typed("media").formats(formats)
+    }
+
+    /// A trace resolved through tenant-scoped trace reads.
+    #[must_use]
+    pub fn trace() -> Self {
+        Self::typed("trace")
+    }
+
+    /// Recorded measurements of `features` for a scheduled window.
+    pub fn samples<I>(features: I) -> Self
+    where
+        I: IntoIterator,
+        I::Item: Into<Value>,
+    {
+        Self::typed("samples").features(features)
+    }
+
+    /// A group Verifier's input authored as the source reference `text`,
+    /// such as `verifiers.<name>.inputs.<slot>`.
+    pub fn source(text: impl Into<String>) -> Self {
+        let mut body = Body::default();
+        body.fields
+            .insert("source".to_owned(), Value::from(text.into()));
+        Self { body }
+    }
+}
+
+fields!(InputSlot [body] {
+    one schema: Value = "schema";
+    list formats, add_format: Value = "formats";
+    one max_bytes: Value = "max_bytes";
+    one required: Value = "required";
+    list features, add_feature: Value = "features";
+});
+
+impl From<InputSlot> for FieldValue {
+    /// The canonical slot object, or a source slot's reference string.
+    fn from(slot: InputSlot) -> Self {
+        match slot.body.fields.get("source") {
+            Some(text) if slot.body.fields.len() == 1 => Self::plain(text.clone()),
+            _ => slot.body.into_field(),
+        }
+    }
+}
+
+/// One data-producing Verifier step.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Step {
-    /// The canonical step.
-    step: spec::Step,
-    /// Definitions and local Artifacts the step references.
-    dependencies: Dependencies,
+    /// The step's fields.
+    body: Body,
 }
 
 impl Step {
-    /// A step `id` running `action`, with no dependencies, condition,
-    /// requirements, timeout, or retries.
-    ///
-    /// # Errors
-    /// Returns [`WyrdError::Validation`] for an invalid block ID.
-    pub fn new(id: &str, action: Action) -> Result<Self, WyrdError> {
-        Ok(Self {
-            step: spec::Step {
-                id: TaskId::new(id)?,
-                action: action.action,
-                depends_on: Vec::new(),
-                when: None,
-                requirements: Vec::new(),
-                timeout_seconds: None,
-                retries: 0,
-            },
-            dependencies: action.dependencies,
-        })
-    }
-
-    /// The reference to `path` inside this step's output, such as
-    /// `authorized` for `steps.<id>.output.authorized`; empty is the whole
-    /// output.
-    ///
-    /// # Errors
-    /// Returns [`WyrdError::Validation`] for a path that does not parse.
-    pub fn output(&self, path: &str) -> Result<Reference, WyrdError> {
-        Reference::step_output(self.step.id.as_str())
-            .and_then(|output| output.at(path))
-            .map_err(|error| {
-                invalid(
-                    "reference",
-                    &format!("steps.{}", self.step.id.as_str()),
-                    error,
-                )
-            })
-    }
-
-    /// The reference to this step's execution status.
-    ///
-    /// # Errors
-    /// Returns [`WyrdError::Validation`] if the reference does not parse.
-    pub fn status(&self) -> Result<Reference, WyrdError> {
-        let path = format!("steps.{}.status", self.step.id.as_str());
-        Reference::parse(&path).map_err(|error| invalid("reference", &path, error))
-    }
-
-    /// Run after `step` completes, even when nothing here references its
-    /// output; a reference to another step's output or status in the action
-    /// or condition orders the steps without this edge.
-    pub fn add_depends_on(&mut self, step: &Step) {
-        if !self.step.depends_on.contains(&step.step.id) {
-            self.step.depends_on.push(step.step.id.clone());
+    /// The step `id` running `action`.
+    pub fn new(id: impl Into<String>, action: impl Into<Action>) -> Self {
+        Self {
+            body: Body::new([
+                ("id", FieldValue::from(id.into())),
+                ("action", FieldValue::from(action.into())),
+            ]),
         }
-    }
-
-    /// Run only when `reference` compares to `expected` by `operator`.
-    pub fn set_when(
-        &mut self,
-        reference: Reference,
-        operator: ComparisonOperator,
-        expected: Value,
-    ) {
-        self.step.when = Some(Condition {
-            path: reference,
-            operator,
-            expected,
-        });
-    }
-
-    /// Judge this step's output with `requirement`.
-    ///
-    /// # Errors
-    /// Returns [`WyrdError::Validation`] with rule `duplicate_id` when the
-    /// step or one of its requirements already uses the ID.
-    pub fn add_requirement(&mut self, requirement: Requirement) -> Result<(), WyrdError> {
-        let id = &requirement.requirement.id;
-        if self.step.id == *id || self.step.requirements.iter().any(|known| known.id == *id) {
-            return Err(invalid(
-                "duplicate_id",
-                id.as_str(),
-                "step and requirement IDs must be unique across the Verifier",
-            ));
-        }
-        self.step.requirements.push(requirement.requirement);
-        self.dependencies.absorb(requirement.dependencies);
-        Ok(())
-    }
-
-    /// Stop each attempt after `seconds`.
-    pub fn set_timeout_seconds(&mut self, seconds: u32) {
-        self.step.timeout_seconds = Some(seconds);
-    }
-
-    /// Retry a failed attempt up to `retries` times.
-    ///
-    /// # Errors
-    /// Returns [`WyrdError::Validation`] above the shared retry limit.
-    pub fn set_retries(&mut self, retries: u32) -> Result<(), WyrdError> {
-        if retries > spec::MAX_STEP_RETRIES {
-            return Err(invalid(
-                "retries",
-                &format!("steps.{}.retries", self.step.id.as_str()),
-                format!("at most {} retries", spec::MAX_STEP_RETRIES),
-            ));
-        }
-        self.step.retries = retries;
-        Ok(())
-    }
-
-    /// The canonical step.
-    #[must_use]
-    pub fn step(&self) -> &spec::Step {
-        &self.step
     }
 }
 
-/// One declared requirement: an ID, the claim it judges, and its check.
+fields!(Step [body] {
+    one id: Value = "id";
+    one action: Action = "action";
+    list depends_on, add_depends_on: Value = "depends_on";
+    one when: Value = "when";
+    list requirements, add_requirement: Requirement = "requirements";
+    one timeout_seconds: Value = "timeout_seconds";
+    one retries: Value = "retries";
+});
+
+impl From<Step> for FieldValue {
+    /// The canonical step object.
+    fn from(step: Step) -> Self {
+        step.body.into_field()
+    }
+}
+
+/// One requirement, producing exactly one verdict.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Requirement {
-    /// The canonical requirement.
-    requirement: spec::Requirement,
-    /// Definitions and local Artifacts the check references.
-    dependencies: Dependencies,
+    /// The requirement's fields.
+    body: Body,
 }
 
 impl Requirement {
-    /// Requirement `id` claiming `statement`, judged by `check`.
-    ///
-    /// # Errors
-    /// Returns [`WyrdError::Validation`] for an invalid block ID.
-    pub fn new(id: &str, statement: &str, check: Check) -> Result<Self, WyrdError> {
-        Ok(Self {
-            requirement: spec::Requirement {
-                id: TaskId::new(id)?,
-                statement: statement.to_owned(),
-                check: check.check,
-            },
-            dependencies: check.dependencies,
-        })
-    }
-
-    /// The canonical requirement.
-    #[must_use]
-    pub fn requirement(&self) -> &spec::Requirement {
-        &self.requirement
+    /// The requirement `id` claiming `statement`, judged by `check`.
+    pub fn new(
+        id: impl Into<String>,
+        statement: impl Into<String>,
+        check: impl Into<Check>,
+    ) -> Self {
+        Self {
+            body: Body::new([
+                ("id", FieldValue::from(id.into())),
+                ("statement", FieldValue::from(statement.into())),
+                ("check", FieldValue::from(check.into())),
+            ]),
+        }
     }
 }
 
-/// A step action: extract a media slot, call an Agent, or run code.
+fields!(Requirement [body] {
+    one id: Value = "id";
+    one statement: Value = "statement";
+    one check: Check = "check";
+});
+
+impl From<Requirement> for FieldValue {
+    /// The canonical requirement object.
+    fn from(requirement: Requirement) -> Self {
+        requirement.body.into_field()
+    }
+}
+
+/// A step action: extract, an Agent call, or sandboxed code.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Action {
-    /// The canonical action.
-    action: spec::Action,
-    /// Definitions and local Artifacts the action references.
-    dependencies: Dependencies,
+    /// The action's fields.
+    body: Body,
 }
 
 impl Action {
-    /// Extract text and structure from the media slot `from`.
-    #[must_use]
-    pub fn extract(from: Reference) -> Self {
-        Self {
-            action: spec::Action::Extract { from },
-            dependencies: Dependencies::default(),
-        }
+    /// An action of `kind` with `fields`.
+    fn of<const N: usize>(kind: &str, fields: [(&str, FieldValue); N]) -> Self {
+        let mut body = Body::new(fields);
+        body.set("kind", FieldValue::from(kind));
+        Self { body }
     }
 
-    /// Invoke an Agent.
-    #[must_use]
-    pub fn agent(call: AgentCall) -> Self {
-        let (call, dependencies) = call.into_parts();
-        Self {
-            action: spec::Action::Agent(call),
-            dependencies,
-        }
+    /// Extract text and structure from the media slot `from`, such as
+    /// `inputs.report`.
+    pub fn extract(from: impl Into<String>) -> Self {
+        Self::of("extract", [("from", FieldValue::from(from.into()))])
     }
 
-    /// Run sandboxed code returning JSON data.
-    #[must_use]
-    pub fn code(call: CodeCall) -> Self {
-        Self {
-            action: spec::Action::Code(call.call),
-            dependencies: call.dependencies,
-        }
+    /// Invoke `agent`: an [`super::Agent`], an exact [`super::CardRef`], a
+    /// YAML reference path, or inline Agent JSON.
+    pub fn agent(agent: impl Into<FieldValue>) -> Self {
+        Self::of("agent", [("agent", agent.into())])
     }
 
-    /// The canonical action.
-    #[must_use]
-    pub fn action(&self) -> &spec::Action {
-        &self.action
+    /// Run `entrypoint` of `source` as sandboxed code returning JSON data.
+    pub fn code(source: impl Into<FieldValue>, entrypoint: impl Into<String>) -> Self {
+        Self::of(
+            "code",
+            [
+                ("source", source.into()),
+                ("entrypoint", FieldValue::from(entrypoint.into())),
+            ],
+        )
     }
 }
 
-/// A verdict-producing check: assert, trace, Agent, code, or drift.
+fields!(Action [body] {
+    map inputs, add_input: Value = "inputs";
+    map workspace, add_workspace: FieldValue = "workspace";
+    one source: FieldValue = "source";
+    one entrypoint: Value = "entrypoint";
+    one runtime: Value = "runtime";
+});
+
+impl From<Action> for FieldValue {
+    /// The canonical action object.
+    fn from(action: Action) -> Self {
+        action.body.into_field()
+    }
+}
+
+/// A verdict-producing requirement check.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Check {
-    /// The canonical check.
-    check: spec::Check,
-    /// Definitions and local Artifacts the check references.
-    dependencies: Dependencies,
+    /// The check's fields.
+    body: Body,
 }
 
 impl Check {
-    /// Compare the one value at `path` to `expected` by `operator`.
-    #[must_use]
-    pub fn assert(path: Reference, operator: ComparisonOperator, expected: Value) -> Self {
-        Self::plain(spec::Check::Assert {
-            path: Some(path),
-            each: None,
-            operator,
-            expected,
-        })
+    /// A check of `kind` with `fields`.
+    fn of<const N: usize>(kind: &str, fields: [(&str, FieldValue); N]) -> Self {
+        let mut body = Body::new(fields);
+        body.set("kind", FieldValue::from(kind));
+        Self { body }
     }
 
-    /// Require `path` to equal `expected`.
-    #[must_use]
-    pub fn equals(path: Reference, expected: Value) -> Self {
-        Self::assert(path, ComparisonOperator::Equals, expected)
-    }
-
-    /// Compare every value `each` selects through `[*]` to `expected`.
-    #[must_use]
-    pub fn each(each: Reference, operator: ComparisonOperator, expected: Value) -> Self {
-        Self::plain(spec::Check::Assert {
-            path: None,
-            each: Some(each),
-            operator,
-            expected,
-        })
-    }
-
-    /// Compare the spans `span_selector` selects in the trace slot `on`.
-    ///
-    /// # Errors
-    /// Returns [`WyrdError::Validation`] for an invalid JSONPath selector.
-    pub fn trace(
-        on: Reference,
-        span_selector: &str,
-        operator: ComparisonOperator,
-        expected: Value,
-    ) -> Result<Self, WyrdError> {
-        Ok(Self::plain(spec::Check::Trace(TraceCheck {
-            on,
-            span_selector: JsonPath::new(span_selector)?,
-            operator,
-            expected,
-        })))
-    }
-
-    /// Judge with an Agent whose Prompt returns a verdict.
-    #[must_use]
-    pub fn agent(call: AgentCall) -> Self {
-        let (call, dependencies) = call.into_parts();
-        Self {
-            check: spec::Check::Agent(call),
-            dependencies,
-        }
-    }
-
-    /// Judge with code returning a verdict.
-    #[must_use]
-    pub fn code(call: CodeCall) -> Self {
-        Self::code_check(call, None)
-    }
-
-    /// Judge with code returning `format`, such as a named verdict format
-    /// with a custom data schema.
-    #[must_use]
-    pub fn code_with_format(call: CodeCall, format: skald_spec::NamedResponseFormat) -> Self {
-        Self::code_check(call, Some(format))
-    }
-
-    /// Judge the samples slot `on` for drift by `spec`.
-    #[must_use]
-    pub fn drift(on: Reference, spec: DriftSpec) -> Self {
-        Self::plain(spec::Check::Drift(DriftCheck { on, spec }))
-    }
-
-    /// The canonical check.
-    #[must_use]
-    pub fn check(&self) -> &spec::Check {
-        &self.check
-    }
-
-    /// A check referencing no definitions.
-    fn plain(check: spec::Check) -> Self {
-        Self {
-            check,
-            dependencies: Dependencies::default(),
-        }
-    }
-
-    /// A code check returning `response_format`.
-    fn code_check(
-        call: CodeCall,
-        response_format: Option<skald_spec::NamedResponseFormat>,
+    /// Compare the one value at `path` with `expected` by `operator`, such
+    /// as `"equals"` or its object form.
+    pub fn assert(
+        path: impl Into<String>,
+        operator: impl Into<Value>,
+        expected: impl Into<Value>,
     ) -> Self {
-        Self {
-            check: spec::Check::Code(CodeCheck {
-                call: call.call,
-                response_format,
-            }),
-            dependencies: call.dependencies,
-        }
-    }
-}
-
-/// One Agent invocation, in a step action or a requirement check.
-#[derive(Debug, Clone, PartialEq)]
-pub struct AgentCall {
-    /// The canonical call.
-    call: spec::AgentCall,
-    /// The Agent definition the call references.
-    dependencies: Dependencies,
-    /// The local Artifact each workspace destination currently mounts; a
-    /// replaced destination drops its entry.
-    workspace: BTreeMap<String, Dependencies>,
-}
-
-impl AgentCall {
-    /// Invoke `agent`: an Agent definition declared in the same graph, a
-    /// registered Agent's [`wyrd_spec::reference::CardRef`], or an inline
-    /// [`AgentSpec`].
-    #[must_use]
-    pub fn new(agent: impl Into<Linked<AgentSpec>>) -> Self {
-        let agent = agent.into();
-        Self {
-            call: spec::AgentCall {
-                agent: agent.reference,
-                inputs: BTreeMap::new(),
-                workspace: BTreeMap::new(),
-            },
-            dependencies: agent.dependencies,
-            workspace: BTreeMap::new(),
-        }
+        Self::of(
+            "assert",
+            [
+                ("path", FieldValue::from(path.into())),
+                ("operator", FieldValue::from(operator.into())),
+                ("expected", FieldValue::from(expected.into())),
+            ],
+        )
     }
 
-    /// Bind the Prompt variable `parameter` to `value`.
-    ///
-    /// # Errors
-    /// Returns [`WyrdError::Validation`] for an invalid parameter name.
-    pub fn add_input(&mut self, parameter: &str, value: Reference) -> Result<(), WyrdError> {
-        self.call
-            .inputs
-            .insert(ParameterName::new(parameter)?, value);
-        Ok(())
+    /// Compare every value `each` selects through `[*]` with `expected` by
+    /// `operator`.
+    pub fn each(
+        each: impl Into<String>,
+        operator: impl Into<Value>,
+        expected: impl Into<Value>,
+    ) -> Self {
+        Self::of(
+            "assert",
+            [
+                ("each", FieldValue::from(each.into())),
+                ("operator", FieldValue::from(operator.into())),
+                ("expected", FieldValue::from(expected.into())),
+            ],
+        )
     }
 
-    /// Mount the value of `value` as JSON at workspace `path`, replacing
-    /// whatever `path` mounted.
-    pub fn add_workspace_input(&mut self, path: &str, value: Reference) {
-        self.call
-            .workspace
-            .insert(path.to_owned(), WorkspaceSource::Scope(value));
-        self.workspace.remove(path);
+    /// Compare the spans `span_selector` selects in the trace slot `on` with
+    /// `expected` by `operator`.
+    pub fn trace(
+        on: impl Into<String>,
+        span_selector: impl Into<String>,
+        operator: impl Into<Value>,
+        expected: impl Into<Value>,
+    ) -> Self {
+        Self::of(
+            "trace",
+            [
+                ("on", FieldValue::from(on.into())),
+                ("span_selector", FieldValue::from(span_selector.into())),
+                ("operator", FieldValue::from(operator.into())),
+                ("expected", FieldValue::from(expected.into())),
+            ],
+        )
     }
 
-    /// Mount the fixed `file` of an exact Artifact version at workspace
-    /// `path`, replacing whatever `path` mounted; a local Artifact is
-    /// published before the graph.
-    pub fn add_workspace_file(&mut self, path: &str, file: &ArtifactFile) {
-        self.call.workspace.insert(
-            path.to_owned(),
-            WorkspaceSource::Artifact {
-                artifact: file.selection(),
-            },
+    /// Judge with `agent`, which returns the Verdict schema.
+    pub fn agent(agent: impl Into<FieldValue>) -> Self {
+        Self::of("agent", [("agent", agent.into())])
+    }
+
+    /// Judge with `entrypoint` of `source`, which returns the Verdict schema.
+    pub fn code(source: impl Into<FieldValue>, entrypoint: impl Into<String>) -> Self {
+        Self::of(
+            "code",
+            [
+                ("source", source.into()),
+                ("entrypoint", FieldValue::from(entrypoint.into())),
+            ],
+        )
+    }
+
+    /// Judge statistical drift over the samples slot `on` with the drift
+    /// fields `spec`: method, signal, condition, and profile.
+    pub fn drift(on: impl Into<String>, spec: impl Into<Value>) -> Self {
+        let mut check = Self::of(
+            "drift",
+            [
+                ("on", FieldValue::from(on.into())),
+                ("spec", FieldValue::from(spec.into())),
+            ],
         );
-        self.workspace.insert(path.to_owned(), file.dependencies());
-    }
-
-    /// The canonical call.
-    #[must_use]
-    pub fn call(&self) -> &spec::AgentCall {
-        &self.call
-    }
-
-    /// The canonical call and every definition and local Artifact its
-    /// current Agent and workspace mounts reference, in workspace path order.
-    fn into_parts(self) -> (spec::AgentCall, Dependencies) {
-        let mut dependencies = self.dependencies;
-        for mounted in self.workspace.into_values() {
-            dependencies.absorb(mounted);
-        }
-        (self.call, dependencies)
+        check.body.flatten = Some("spec");
+        check
     }
 }
 
-/// One sandboxed code invocation, in a step action or a requirement check.
-#[derive(Debug, Clone, PartialEq)]
-pub struct CodeCall {
-    /// The canonical call.
-    call: spec::CodeCall,
-    /// The local Artifact holding the source, if any.
-    dependencies: Dependencies,
-}
+fields!(Check [body] {
+    one path: Value = "path";
+    one operator: Value = "operator";
+    one expected: Value = "expected";
+    one on: Value = "on";
+    one span_selector: Value = "span_selector";
+    map inputs, add_input: Value = "inputs";
+    map workspace, add_workspace: FieldValue = "workspace";
+    one source: FieldValue = "source";
+    one entrypoint: Value = "entrypoint";
+    one runtime: Value = "runtime";
+    one response_format: Value = "response_format";
+    one spec: Value = "spec";
+});
 
-impl CodeCall {
-    /// Run `entrypoint` of the Python `source` embedded in the Verifier.
-    #[must_use]
-    pub fn inline(source: &str, entrypoint: &str) -> Self {
-        Self::with_source(
-            CodeSource::Inline(source.to_owned()),
-            entrypoint,
-            Dependencies::default(),
-        )
-    }
-
-    /// Run `entrypoint` of the UTF-8 Python file at `path`, read now and
-    /// embedded in the Verifier; later edits to the file change nothing.
-    ///
-    /// # Errors
-    /// Returns [`WyrdError::Validation`] with rule `code_source` when the
-    /// file cannot be read as UTF-8 text.
-    pub fn from_file(path: impl AsRef<Path>, entrypoint: &str) -> Result<Self, WyrdError> {
-        let path = path.as_ref();
-        let source = std::fs::read_to_string(path)
-            .map_err(|error| invalid("code_source", &path.display().to_string(), error))?;
-        Ok(Self::inline(&source, entrypoint))
-    }
-
-    /// Run `entrypoint` of the fixed `file` of an exact Artifact version; a
-    /// local Artifact is published before the graph.
-    #[must_use]
-    pub fn artifact(file: &ArtifactFile, entrypoint: &str) -> Self {
-        let selection = file.selection();
-        Self::with_source(
-            CodeSource::Artifact {
-                card: selection.card,
-                path: selection.path,
-            },
-            entrypoint,
-            file.dependencies(),
-        )
-    }
-
-    /// Pass `value` as the keyword argument `parameter`.
-    ///
-    /// # Errors
-    /// Returns [`WyrdError::Validation`] for an invalid parameter name.
-    pub fn add_input(&mut self, parameter: &str, value: Reference) -> Result<(), WyrdError> {
-        self.call
-            .inputs
-            .insert(ParameterName::new(parameter)?, value);
-        Ok(())
-    }
-
-    /// Run under `runtime`.
-    pub fn set_runtime(&mut self, runtime: CodeRuntime) {
-        self.call.runtime = runtime;
-    }
-
-    /// The canonical call.
-    #[must_use]
-    pub fn call(&self) -> &spec::CodeCall {
-        &self.call
-    }
-
-    /// A Python call of `entrypoint` in `source`.
-    fn with_source(source: CodeSource, entrypoint: &str, dependencies: Dependencies) -> Self {
-        Self {
-            call: spec::CodeCall {
-                runtime: CodeRuntime::Python,
-                source,
-                entrypoint: entrypoint.to_owned(),
-                inputs: BTreeMap::new(),
-            },
-            dependencies,
-        }
+impl From<Check> for FieldValue {
+    /// The canonical check object.
+    fn from(check: Check) -> Self {
+        check.body.into_field()
     }
 }

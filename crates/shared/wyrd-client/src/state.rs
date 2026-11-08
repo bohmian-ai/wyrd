@@ -9,7 +9,7 @@ use std::sync::{Arc, OnceLock};
 
 use crate::WyrdClient;
 use crate::bifrost::{Bifrost, BifrostOptions, QueueConfig, TableConfig};
-use crate::cards::{CardSelector, Cards};
+use crate::cards::{CardSelector, Cards, Declarable};
 use crate::environment::Environment;
 use crate::error::WyrdClientError;
 use crate::observe::Run;
@@ -473,8 +473,7 @@ pub struct ConfigureOptions {
     pub deployment_environment: Option<String>,
 }
 
-/// How [`WyrdState::declare_with`] and [`WyrdState::declare_authored_with`]
-/// declare a graph and prepare its state.
+/// How [`WyrdState::declare_with`] declares a graph and prepares its state.
 #[derive(Debug, Clone, Default)]
 pub struct DeclareOptions {
     /// The client the declaration, the pull, and every later server call of
@@ -599,30 +598,35 @@ impl WyrdState {
         })
     }
 
-    /// Declare the Card file at `path` and return the state of its graph,
-    /// ready to run, as the ambient client.
+    /// Declare the Card file at a path, or an authored Card graph, and
+    /// return the state of its graph, ready to run, as the ambient client.
     ///
     /// The online counterpart of [`Self::from_path`]: one call replaces
-    /// `Cards::declare_from_path`, `Cards::pull`, and `from_path`.
+    /// [`crate::cards::Cards::declare`], `Cards::pull`, and `from_path`.
     ///
     /// # Arguments
-    /// * `path` - The root Service Card file; its `./path` references are
-    ///   resolved relative to it and declared with it.
+    /// * `input` - The root Card, usually a Service: a Card file, whose
+    ///   `./path` references are resolved relative to it and declared with
+    ///   it, or an authored Card.
     ///
     /// # Errors
     /// As [`Self::declare_with`].
-    pub async fn declare(path: impl AsRef<Path>) -> Result<Self, WyrdError> {
-        Self::declare_with(path, DeclareOptions::default()).await
+    ///
+    /// # Cancellation
+    /// As [`Self::declare_with`].
+    pub async fn declare(input: impl Into<Declarable<'_>>) -> Result<Self, WyrdError> {
+        Self::declare_with(input, DeclareOptions::default()).await
     }
 
-    /// Declare the Card file at `path` and return the state of its graph,
-    /// ready to run, with `options`.
+    /// Declare the Card file at a path, or an authored Card graph, and
+    /// return the state of its graph, ready to run, with `options`.
     ///
-    /// The file and the files it references are declared under the
-    /// registry's usual version rules, so an unchanged rerun declares
-    /// nothing new. The declared root's complete graph is then pulled and
-    /// loaded with the same validation as [`Self::from_path`]. The declaration,
-    /// the pull, and every later server call of the state use one client.
+    /// The input is declared as [`crate::cards::Cards::declare`] describes,
+    /// under the registry's usual version rules, so an unchanged rerun
+    /// declares nothing new. The declared root's complete graph is then
+    /// pulled and loaded with the same validation as [`Self::from_path`].
+    /// The declaration, the pull, and every later server call of the state
+    /// use one client.
     ///
     /// Without `bundle_dir`, the bundle is pulled into a temporary directory,
     /// loaded into memory, and deleted before this returns; artifact payloads
@@ -630,23 +634,26 @@ impl WyrdState {
     /// `bundle_dir`.
     ///
     /// # Arguments
-    /// * `path` - The root Service Card file.
+    /// * `input` - The root Card file or authored Card.
     /// * `options` - The client and the optional caller-owned bundle directory.
     ///
     /// # Errors
-    /// Returns the client's configuration or credential error, the loader's
-    /// `WYRD_LOADER_400_INVALID_ENVELOPE` for an unreadable or invalid Card
-    /// file, the registry's error when it refuses the declaration (for
-    /// example `WYRD_REGISTRY_409_SPEC_DRIFT` or an authorization refusal),
-    /// the pull's error, and [`Self::from_path`]'s errors for the bundle.
+    /// Returns the client's configuration or credential error,
+    /// [`crate::cards::Cards::declare`]'s errors (the loader's or authored
+    /// graph's `WYRD_LOADER_400_INVALID_ENVELOPE`, and the registry's
+    /// refusal, for example `WYRD_REGISTRY_409_SPEC_DRIFT` or an
+    /// authorization refusal), the pull's error, and [`Self::from_path`]'s
+    /// errors for the bundle.
     ///
     /// # Cancellation
-    /// A failure or a dropped future after the registry accepted the
-    /// declaration leaves the declaration committed, but returns no state
-    /// and removes the temporary directory; a `bundle_dir` keeps its prior
-    /// bundle, as [`crate::cards::Cards::pull`] describes.
+    /// A failure or a dropped future before the registry accepts the graph
+    /// leaves every Artifact already published, as
+    /// [`crate::cards::Cards::declare`] describes, and returns no state. After
+    /// it accepts the graph, the declaration stays committed, no state is
+    /// returned, the temporary directory is removed, and a `bundle_dir` keeps
+    /// its prior bundle, as [`crate::cards::Cards::pull`] describes.
     pub async fn declare_with(
-        path: impl AsRef<Path>,
+        input: impl Into<Declarable<'_>>,
         options: DeclareOptions,
     ) -> Result<Self, WyrdError> {
         let client = match options.client {
@@ -654,69 +661,7 @@ impl WyrdState {
             None => WyrdClient::from_global().map_err(WyrdError::from)?,
         };
         let cards = Cards::connect_with(&client).await?;
-        let receipt = cards.declare_from_path(path).await?;
-        Self::pull_declared(&cards, client, receipt.root, options.bundle_dir).await
-    }
-
-    /// Declare an authored Card graph and return its state, ready to run, as
-    /// the ambient client.
-    ///
-    /// # Arguments
-    /// * `definition` - The root definition, usually a Service.
-    ///
-    /// # Errors
-    /// As [`Self::declare_authored_with`].
-    ///
-    /// # Cancellation
-    /// As [`Self::declare_authored_with`].
-    pub async fn declare_authored<S>(
-        definition: &crate::authoring::Definition<S>,
-    ) -> Result<Self, WyrdError>
-    where
-        S: Clone,
-        crate::authoring::CardDefinition: From<crate::authoring::Definition<S>>,
-    {
-        Self::declare_authored_with(definition, DeclareOptions::default()).await
-    }
-
-    /// Declare an authored Card graph and return its state, ready to run,
-    /// with `options`.
-    ///
-    /// The in-memory counterpart of [`Self::declare_with`]: local Artifacts
-    /// are published and the graph declared as
-    /// [`crate::cards::Cards::declare_authored`] describes, then the declared
-    /// root's complete graph is pulled and loaded exactly as for a Card file.
-    ///
-    /// # Arguments
-    /// * `definition` - The root definition, usually a Service.
-    /// * `options` - The client and the optional caller-owned bundle directory.
-    ///
-    /// # Errors
-    /// Returns the client's configuration or credential error,
-    /// [`crate::cards::Cards::declare_authored`]'s errors, the pull's error,
-    /// and [`Self::from_path`]'s errors for the bundle.
-    ///
-    /// # Cancellation
-    /// A failure or a dropped future before the registry accepts the graph
-    /// leaves every Artifact already published, as
-    /// [`crate::cards::Cards::declare_authored`] describes, and returns no
-    /// state. After it accepts the graph, as [`Self::declare_with`]: the
-    /// declaration stays committed, the temporary directory is removed, and
-    /// a `bundle_dir` keeps its prior bundle.
-    pub async fn declare_authored_with<S>(
-        definition: &crate::authoring::Definition<S>,
-        options: DeclareOptions,
-    ) -> Result<Self, WyrdError>
-    where
-        S: Clone,
-        crate::authoring::CardDefinition: From<crate::authoring::Definition<S>>,
-    {
-        let client = match options.client {
-            Some(client) => client,
-            None => WyrdClient::from_global().map_err(WyrdError::from)?,
-        };
-        let cards = Cards::connect_with(&client).await?;
-        let receipt = cards.declare_authored(definition).await?;
+        let receipt = cards.declare(input).await?;
         Self::pull_declared(&cards, client, receipt.root, options.bundle_dir).await
     }
 
@@ -724,8 +669,7 @@ impl WyrdState {
     /// `client`, into `bundle_dir` or a temporary directory removed before
     /// this returns.
     ///
-    /// The shared tail of [`Self::declare_with`] and
-    /// [`Self::declare_authored_with`]; it reads and never declares.
+    /// The tail of [`Self::declare_with`]; it reads and never declares.
     ///
     /// # Errors
     /// Returns the pull's error and [`Self::from_path`]'s errors for the

@@ -150,6 +150,24 @@ pub fn load(path: &Path) -> Result<LoadedTree, LoadError> {
     })
 }
 
+/// Decode one Card envelope authored in memory, such as a code-authored
+/// definition's `{kind, metadata, spec}`, exactly as the loader decodes one
+/// YAML document of a Card file.
+///
+/// The in-memory counterpart of parsing: no file is read and no `!file`
+/// tag or path reference is resolved. `label` stands in for the source file
+/// in diagnostics.
+///
+/// # Errors
+/// Returns the same invalid-envelope diagnostic a YAML document with this
+/// content reports, naming the offending spec field path.
+pub fn parse_card_value(
+    label: &Path,
+    envelope: serde_json::Value,
+) -> Result<AuthoredCard, Diagnostic> {
+    parse::parse_value(label, envelope)
+}
+
 /// Validate and order Cards authored in memory into a declaration input.
 ///
 /// The in-memory counterpart of [`load`] plus [`build_declaration_input`]:

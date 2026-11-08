@@ -1,5 +1,5 @@
-//! Offline authoring: canonical parity, value capture, edits, refusals,
-//! and file-authored parity, with no server.
+//! Offline authoring: canonical parity, value capture, deferred validation,
+//! shared diagnostics, and file-authored parity, with no server.
 
 use serde_json::{Value, json};
 use wyrd_spec::card::agent::AgentSpec;
@@ -7,206 +7,172 @@ use wyrd_spec::card::service::ServiceSpec;
 use wyrd_spec::card::verifier::VerifierSpec;
 use wyrd_spec::envelope::CardKind;
 use wyrd_spec::error::WyrdError;
-use wyrd_spec::reference::CardRef;
 use wyrd_spec::verification::TaskId;
 
 use super::*;
 
-/// The structured `rule` of a validation refusal, `None` for any other
-/// error.
-fn rule(error: &WyrdError) -> Option<&str> {
-    match error {
-        WyrdError::Validation { details, .. } => details["rule"].as_str(),
-        _ => None,
-    }
+/// Each diagnostic of a refused graph as `(code, message)`, empty for any
+/// error that carries none.
+fn diagnostics(error: &WyrdError) -> Vec<(String, String)> {
+    let WyrdError::LoaderInvalidEnvelope { details, .. } = error else {
+        return Vec::new();
+    };
+    details["diagnostics"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .map(|diagnostic| {
+            (
+                diagnostic["code"].as_str().unwrap_or_default().to_owned(),
+                diagnostic["message"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .to_owned(),
+            )
+        })
+        .collect()
 }
 
-/// The `report-reviewer` Agent: a gateway-routed verdict Prompt reading
-/// `/inputs/policy.json` with `fs.read` for at most three turns.
-///
-/// # Panics
-/// Panics when the fixed Prompt, identity, or deployment is refused.
+/// Whether some diagnostic of `error` has a message containing `needle`.
+fn refuses(error: &WyrdError, needle: &str) -> bool {
+    diagnostics(error)
+        .iter()
+        .any(|(_, message)| message.contains(needle))
+}
+
+/// The `report-reviewer` Agent: a gateway-routed inline verdict Prompt
+/// reading `/inputs/policy.json` with `fs.read` for at most three turns.
 fn reviewer() -> Agent {
-    let mut prompt = Prompt::new(
-        "openai",
-        "gpt-4o",
-        "Review {{report}} against /inputs/policy.json",
-    )
-    .expect("prompt compiles");
-    prompt
-        .set_response_format(json!("verdict"))
-        .expect("verdict is a named format");
-    let mut agent = Agent::new("report-reviewer", "1.0.0", prompt).expect("valid identity");
-    agent.set_gateway_route("openai").expect("valid deployment");
-    agent.set_tools([BuiltinTool::FsRead.as_str()]);
-    agent.set_max_iterations(3);
-    agent
+    Agent::new("report-reviewer", "1.0.0")
+        .prompt(json!({
+            "provider": "openai",
+            "model": "gpt-4o",
+            "messages": [{"role": "user", "content": "Review {{report}} against /inputs/policy.json"}],
+            "response_format": "verdict",
+        }))
+        .execution_route(json!({"kind": "wyrd_gateway", "deployment": "openai"}))
+        .tool_names(["fs.read"])
+        .run_config(json!({"max_iterations": 3}))
 }
 
 /// The local `company-sharing-policy` Artifact, extracted on publication;
 /// its source path is never read offline.
-///
-/// # Panics
-/// Panics when the fixed identity is refused.
 fn policy() -> Artifact {
-    Artifact::from_path("company-sharing-policy", "1.0.0", "policy.pdf", true)
-        .expect("valid identity")
+    Artifact::from_path("company-sharing-policy", "1.0.0", "policy.pdf").extract(true)
 }
 
-/// A Verifier exercising every Action and Check variant, both input
-/// requirednesses, and an explicit dependency.
+/// The spec `card` decodes to, as its YAML file's would.
 ///
 /// # Panics
-/// Panics when any fixed identity, slot, reference, ID, or selector is
-/// refused.
-fn every_primitive() -> Verifier {
-    let mut verifier = Verifier::new("release-access", "1.0.0").expect("valid identity");
-    verifier.set_description("Every authoring primitive");
-    let report = verifier
-        .add_input("report", json!({"type": "object"}))
-        .expect("new slot");
-    let purpose = verifier
-        .add_input_with_required("purpose", Value::Null, false)
-        .expect("new slot");
-    let document = verifier
-        .add_slot(
-            "document",
-            InputSlot::Media {
-                formats: vec![MediaFormat::Pdf],
-                max_bytes: None,
-                required: true,
-            },
-        )
-        .expect("new slot");
-    let trace = verifier
-        .add_slot("trace", InputSlot::Trace { required: true })
-        .expect("new slot");
-    let extract = Step::new("extract", Action::extract(document)).expect("valid id");
-
-    let mut review = AgentCall::new(reviewer());
-    review
-        .add_input("report", report.clone())
-        .expect("valid parameter");
-    review.add_workspace_input("/inputs/report.json", report.clone());
-    review.add_workspace_file(
-        "/inputs/policy.json",
-        &policy()
-            .file("extracted/company-sharing-policy.pdf.json")
-            .expect("relative path"),
-    );
-    let mut policy_step = Step::new("policy", Action::agent(review)).expect("valid id");
-
-    let mut context = CodeCall::inline(
-        "def policy_context(report, purpose):\n    return {}\n",
-        "policy_context",
-    );
-    context
-        .add_input("report", report)
-        .expect("valid parameter");
-    context
-        .add_input("purpose", purpose)
-        .expect("valid parameter");
-    let mut context_step = Step::new("policy-context", Action::code(context)).expect("valid id");
-    context_step.add_depends_on(&policy_step);
-    context_step.set_when(
-        policy_step.output("verdict").expect("path"),
-        ComparisonOperator::Equals,
-        json!("pass"),
-    );
-    context_step.set_timeout_seconds(30);
-    context_step.set_retries(2).expect("within limit");
-    context_step
-        .add_requirement(
-            Requirement::new(
-                "has-report",
-                "The context has a report",
-                Check::equals(
-                    context_step.output("has_report").expect("path"),
-                    json!(true),
-                ),
-            )
-            .expect("valid id"),
-        )
-        .expect("new id");
-    policy_step
-        .add_requirement(
-            Requirement::new(
-                "findings-cited",
-                "Every finding cites the policy",
-                Check::each(
-                    policy_step.output("findings[*].cited").expect("path"),
-                    ComparisonOperator::Equals,
-                    json!(true),
-                ),
-            )
-            .expect("valid id"),
-        )
-        .expect("new id");
-
-    for step in [extract, policy_step, context_step] {
-        verifier.add_step(step).expect("new step");
-    }
-    let checks = [
-        (
-            "trace-order",
-            Check::trace(
-                trace,
-                "$.spans[0].name",
-                ComparisonOperator::Equals,
-                json!("lookup"),
-            )
-            .expect("valid selector"),
-        ),
-        (
-            "judged",
-            Check::agent(AgentCall::new(Linked::registered(card("Agent", "judge")))),
-        ),
-        (
-            "code-judged",
-            Check::code(CodeCall::artifact(
-                &Artifact::registered(card("Artifact", "release-checks"))
-                    .expect("Artifact")
-                    .file("release_checks.py")
-                    .expect("relative path"),
-                "summarize_findings",
-            )),
-        ),
-        (
-            "code-formatted",
-            Check::code_with_format(
-                CodeCall::inline("def judge():\n    return {}\n", "judge"),
-                skald_spec::NamedResponseFormat::Name("verdict".to_owned()),
-            ),
-        ),
-    ];
-    for (id, check) in checks {
-        verifier
-            .add_requirement(Requirement::new(id, "Judged", check).expect("valid id"))
-            .expect("new id");
-    }
-    verifier.set_decide(Decide::PassRate { threshold: 0.5 });
-    verifier
+/// Panics when the spec does not decode as a `T`.
+fn decoded<T: serde::de::DeserializeOwned>(spec: Value) -> T {
+    serde_json::from_value(spec).expect("the authored spec decodes")
 }
 
 /// Decode `text` as YAML into `T` through its JSON form, as the loader
-/// does, so externally tagged enums decode like their file form.
-///
-/// # Errors
-/// Returns the decode error when the value is not a `T`.
+/// does.
 ///
 /// # Panics
-/// Panics when `text` is not YAML.
-fn yaml<T: serde::de::DeserializeOwned>(text: &str) -> Result<T, serde_json::Error> {
+/// Panics when `text` is not YAML or not a `T`.
+fn yaml<T: serde::de::DeserializeOwned>(text: &str) -> T {
     serde_json::from_value(serde_yaml::from_str::<Value>(text).expect("YAML parses"))
+        .expect("canonical value decodes")
 }
 
-/// The exact reference to `kind` `name` at 1.0.0.
+/// A Verifier exercising every Action and Check variant, both input
+/// requirednesses, an explicit dependency, and both editing styles.
+fn every_primitive() -> Verifier {
+    let mut verifier = Verifier::new("release-access", "1.0.0")
+        .description("Every authoring primitive")
+        .inputs([
+            ("report", InputSlot::json(json!({"type": "object"}))),
+            ("purpose", InputSlot::json(Value::Null).required(false)),
+        ]);
+    verifier
+        .add_input("document", InputSlot::media(["pdf"]))
+        .add_input("trace", InputSlot::trace());
+
+    let mut review = Action::agent(reviewer()).inputs([("report", "inputs.report")]);
+    review
+        .add_workspace("/inputs/report.json", "inputs.report")
+        .add_workspace(
+            "/inputs/policy.json",
+            policy().file("extracted/company-sharing-policy.pdf.json"),
+        );
+    let policy_step = Step::new("policy", review).requirements([Requirement::new(
+        "findings-cited",
+        "Every finding cites the policy",
+        Check::each("steps.policy.output.findings[*].cited", "equals", true),
+    )]);
+
+    let mut context = Action::code(
+        CodeSource::inline("def policy_context(report, purpose):\n    return {}\n"),
+        "policy_context",
+    );
+    context
+        .add_input("report", "inputs.report")
+        .add_input("purpose", "inputs.purpose");
+    let mut context_step = Step::new("policy-context", context)
+        .when(json!({"path": "steps.policy.output.verdict", "operator": "equals", "expected": "pass"}))
+        .timeout_seconds(30)
+        .retries(2);
+    context_step
+        .add_depends_on("policy")
+        .add_requirement(Requirement::new(
+            "has-report",
+            "The context has a report",
+            Check::assert("steps.policy-context.output.has_report", "equals", true),
+        ));
+
+    verifier
+        .add_step(Step::new("extract", Action::extract("inputs.document")))
+        .add_step(policy_step)
+        .add_step(context_step);
+    verifier
+        .add_requirement(Requirement::new(
+            "trace-order",
+            "Judged",
+            Check::trace("inputs.trace", "$.spans[0].name", "equals", "lookup"),
+        ))
+        .add_requirement(Requirement::new(
+            "judged",
+            "Judged",
+            Check::agent(CardRef::agent("judge", "1.0.0")),
+        ))
+        .add_requirement(Requirement::new(
+            "code-judged",
+            "Judged",
+            Check::code(
+                CardRef::artifact("release-checks", "1.0.0").file("release_checks.py"),
+                "summarize_findings",
+            ),
+        ))
+        .add_requirement(Requirement::new(
+            "code-formatted",
+            "Judged",
+            Check::code(CodeSource::inline("def judge():\n    return {}\n"), "judge")
+                .response_format("verdict"),
+        ));
+    verifier.decide(json!({"pass_rate": {"threshold": 0.5}}))
+}
+
+/// The stages `verifier` plans, as step IDs.
 ///
-/// # Panics
-/// Panics when `kind` or `name` is not a valid reference part.
-fn card(kind: &str, name: &str) -> CardRef {
-    serde_json::from_value(json!({"kind": kind, "name": name, "version": "1.0.0"}))
-        .expect("card ref")
+/// # Errors
+/// Returns [`Verifier::plan`]'s refusal.
+fn stages(verifier: &Verifier) -> Result<Vec<Vec<String>>, WyrdError> {
+    Ok(verifier
+        .plan()?
+        .stages
+        .iter()
+        .map(|stage| {
+            stage
+                .tasks
+                .iter()
+                .map(|task| task.as_str().to_owned())
+                .collect()
+        })
+        .collect())
 }
 
 /// Every authored primitive builds the canonical spec its file form decodes
@@ -278,38 +244,27 @@ requirements:
     check: {kind: code, source: {inline: "def judge():\n    return {}\n"}, entrypoint: judge, response_format: verdict}
 decide: {pass_rate: {threshold: 0.5}}
 "#,
-    )
-    .expect("canonical Verifier decodes");
-    assert_eq!(verifier.spec(), &canonical);
+    );
+    assert_eq!(decoded::<VerifierSpec>(verifier.spec()), canonical);
     verifier
         .validate()
         .expect("shared validation accepts the authored Verifier");
 
-    let mut drift = Verifier::new("latency-drift", "1.0.0").expect("valid identity");
-    let samples = drift
-        .add_slot(
-            "latency",
-            InputSlot::Samples {
-                features: vec!["latency".parse().expect("feature")],
-            },
-        )
-        .expect("new slot");
-    let spec = "
-method: Spc
-signal: {kind: Distribution, baseline_ref: {kind: Data, name: latency-baseline, version: 1.0.0}, features: [latency]}
-condition: {kind: Statistical}
-profile: {kind: Spc, sample_size: 5}
-";
-    drift
-        .add_requirement(
-            Requirement::new(
-                "latency-stable",
-                "Latency is in control",
-                Check::drift(samples, yaml(spec).expect("drift spec")),
-            )
-            .expect("valid id"),
-        )
-        .expect("new id");
+    let drift = Verifier::new("latency-drift", "1.0.0")
+        .inputs([("latency", InputSlot::samples(["latency"]))])
+        .requirements([Requirement::new(
+            "latency-stable",
+            "Latency is in control",
+            Check::drift(
+                "inputs.latency",
+                json!({
+                    "method": "Spc",
+                    "signal": {"kind": "Distribution", "baseline_ref": {"kind": "Data", "name": "latency-baseline", "version": "1.0.0"}, "features": ["latency"]},
+                    "condition": {"kind": "Statistical"},
+                    "profile": {"kind": "Spc", "sample_size": 5},
+                }),
+            ),
+        )]);
     let canonical_drift: VerifierSpec = yaml(
         "
 inputs: {latency: {type: samples, features: [latency]}}
@@ -324,77 +279,50 @@ requirements:
       condition: {kind: Statistical}
       profile: {kind: Spc, sample_size: 5}
 ",
-    )
-    .expect("canonical drift Verifier decodes");
-    assert_eq!(drift.spec(), &canonical_drift);
+    );
+    assert_eq!(decoded::<VerifierSpec>(drift.spec()), canonical_drift);
     drift
         .validate()
         .expect("shared validation accepts the drift Verifier");
 
     let plan = verifier.plan().expect("plans");
-    let stages: Vec<Vec<&str>> = plan
+    let staged: Vec<Vec<&str>> = plan
         .stages
         .iter()
         .map(|stage| stage.tasks.iter().map(TaskId::as_str).collect())
         .collect();
     assert_eq!(
-        stages,
+        staged,
         [vec!["extract", "policy"], vec!["policy-context"]],
         "the policy-context dependency stages it after policy",
     );
 
-    let stages = |verifier: &Verifier| -> Result<Vec<Vec<String>>, WyrdError> {
-        Ok(verifier
-            .plan()?
-            .stages
-            .iter()
-            .map(|stage| {
-                stage
-                    .tasks
-                    .iter()
-                    .map(|task| task.as_str().to_owned())
-                    .collect()
-            })
-            .collect())
-    };
-    let mut ordering = Verifier::new("ordering", "1.0.0").expect("valid identity");
-    let input = ordering.add_input("value", Value::Null).expect("new slot");
-    let first = Step::new("first", Action::extract(input.clone())).expect("valid id");
-    let mut explicit = Step::new("explicit", Action::extract(input.clone())).expect("valid id");
-    explicit.add_depends_on(&first);
-    let mut inferred_call = CodeCall::inline("def f(x):\n    return x\n", "f");
-    inferred_call
-        .add_input("x", first.output("").expect("whole output"))
-        .expect("valid parameter");
-    let inferred = Step::new("inferred", Action::code(inferred_call)).expect("valid id");
-    let mut cyclic = Step::new("cyclic", Action::extract(input.clone())).expect("valid id");
-    cyclic.add_depends_on(&cyclic.clone());
-    let unknown_target = Step::new("unknown", Action::extract(input)).expect("valid id");
-    let mut dangling = Step::new(
-        "dangling",
-        Action::extract(unknown_target.output("").expect("path")),
-    )
-    .expect("valid id");
-    dangling.add_depends_on(&unknown_target);
-    for step in [first, explicit, inferred] {
-        ordering.add_step(step).expect("new step");
-    }
+    let ordering = Verifier::new("ordering", "1.0.0")
+        .inputs([("value", InputSlot::json(Value::Null))])
+        .steps([
+            Step::new("first", Action::extract("inputs.value")),
+            Step::new("explicit", Action::extract("inputs.value")).depends_on(["first"]),
+            Step::new(
+                "inferred",
+                Action::code(CodeSource::inline("def f(x):\n    return x\n"), "f")
+                    .inputs([("x", "steps.first.output")]),
+            ),
+        ]);
     assert_eq!(
         stages(&ordering).expect("plans"),
         [vec!["first"], vec!["explicit", "inferred"]],
         "an explicit-only depends_on edge stages like an inferred output reference",
     );
-    let mut refused = ordering.clone();
-    refused.add_step(cyclic).expect("new step");
-    assert_eq!(
-        rule(&stages(&refused).expect_err("self dependency")),
-        Some("graph")
+    let mut cyclic = ordering.clone();
+    cyclic.add_step(Step::new("cyclic", Action::extract("inputs.value")).depends_on(["cyclic"]));
+    assert!(stages(&cyclic).is_err(), "a self dependency is refused");
+    let mut dangling = ordering;
+    dangling.add_step(
+        Step::new("dangling", Action::extract("steps.unknown.output")).depends_on(["unknown"]),
     );
-    let mut refused = ordering;
-    refused.add_step(dangling).expect("new step");
-    assert_eq!(
-        rule(&stages(&refused).expect_err("unknown dependency")),
-        Some("graph")
+    assert!(
+        stages(&dangling).is_err(),
+        "an unknown dependency is refused"
     );
 
     let canonical_agent: AgentSpec = yaml(
@@ -408,26 +336,21 @@ execution_route: {kind: wyrd_gateway, deployment: openai}
 tool_names: [fs.read]
 run_config: {max_iterations: 3}
 "#,
-    )
-    .expect("canonical Agent decodes");
-    assert_eq!(reviewer().spec(), &canonical_agent);
+    );
+    assert_eq!(decoded::<AgentSpec>(reviewer().spec()), canonical_agent);
+    let native = reviewer().execution_route(json!({"kind": "native"}));
+    assert_eq!(
+        decoded::<AgentSpec>(native.spec()).execution_route,
+        wyrd_spec::ExecutionRoute::Native {}
+    );
 
-    let mut native = reviewer();
-    native.set_native_route();
-    assert_eq!(native.spec().execution_route, ExecutionRoute::Native {});
-
-    let mut service = Service::new("finance-release", "1.0.0").expect("valid identity");
-    service.set_service_type("api");
+    let mut service = Service::new("finance-release", "1.0.0").service_type("api");
     service
-        .add_component("reviewer", reviewer(), [verifier.clone()])
-        .expect("new alias");
-    service
-        .add_registered_component(
-            "controls",
-            card("Agent", "release-controls"),
-            [Binding::registered(card("Verifier", "report-policy"))],
-        )
-        .expect("new alias");
+        .add_component(Component::new("reviewer", reviewer()).verified_by([verifier.clone()]))
+        .add_component(
+            Component::new("controls", CardRef::agent("release-controls", "1.0.0"))
+                .verified_by([CardRef::verifier("report-policy", "1.0.0")]),
+        );
     let canonical_service: ServiceSpec = yaml(
         "
 service_type: api
@@ -439,25 +362,29 @@ components:
     ref: {kind: Agent, name: release-controls, version: 1.0.0}
     verified_by: [{verifier: {kind: Verifier, name: report-policy, version: 1.0.0}}]
 ",
-    )
-    .expect("canonical Service decodes");
-    assert_eq!(service.spec(), &canonical_service);
+    );
+    assert_eq!(decoded::<ServiceSpec>(service.spec()), canonical_service);
 
-    let declaration = CardDefinition::from(service.clone())
+    let declaration = CardDefinition::from(&service)
         .declaration()
         .expect("valid graph");
     assert_eq!(
-        CardDefinition::from(service)
+        CardDefinition::from(&service)
             .declaration()
             .expect("valid graph"),
         declaration,
         "repeated declaration is stable",
     );
     assert_eq!(
-        declaration.artifacts,
-        [policy()],
+        declaration.artifacts.len(),
+        1,
         "the local Artifact publishes first, once"
     );
+    let local = &declaration.artifacts[0];
+    assert_eq!(local.metadata.name.as_str(), "company-sharing-policy");
+    assert_eq!(local.spec.artifact_kind, "file");
+    assert_eq!(local.source, std::path::Path::new("policy.pdf"));
+    assert!(local.extract);
     let kinds: Vec<CardKind> = declaration
         .input
         .submissions
@@ -488,43 +415,37 @@ components:
     );
 }
 
-/// Adding a child captures its value, refused edits change nothing, and two
-/// different definitions of one identity refuse the declaration.
+/// Adding a child captures its value, attempted duplicates are kept and
+/// refused at validation, a whole-field setter resets that field alone, and
+/// two different definitions of one identity refuse the declaration.
 ///
 /// # Panics
 /// Panics when a later edit reaches a captured child, a duplicate is
-/// admitted, or the conflict is not refused.
+/// admitted or lost, a reset reaches another field, or the conflict is not
+/// refused.
 #[test]
 fn offline_edits_preserve_snapshots() {
-    let mut verifier = Verifier::new("report-policy", "1.0.0").expect("valid identity");
-    let report = verifier.add_input("report", Value::Null).expect("new slot");
-    let mut step =
-        Step::new("policy", Action::agent(AgentCall::new(reviewer()))).expect("valid id");
-    verifier.add_step(step.clone()).expect("new step");
-    step.set_timeout_seconds(5);
-    assert_eq!(
-        verifier.spec().steps[0].timeout_seconds,
-        None,
-        "a step is captured when added"
+    let mut verifier =
+        Verifier::new("report-policy", "1.0.0").inputs([("report", InputSlot::json(Value::Null))]);
+    let mut step = Step::new("policy", Action::agent(reviewer()));
+    verifier.add_step(step.clone());
+    step = step.timeout_seconds(5);
+    assert!(
+        verifier.spec()["steps"][0].get("timeout_seconds").is_none(),
+        "a step is captured when added: {step:?}"
     );
 
-    let mut agent = reviewer();
-    let mut service = Service::new("finance-release", "1.0.0").expect("valid identity");
+    let agent = reviewer();
+    let mut service = Service::new("finance-release", "1.0.0");
     service
-        .add_component("reviewer", agent.clone(), [verifier.clone()])
-        .expect("new alias");
-    agent.set_max_iterations(9);
-    verifier
-        .add_requirement(
-            Requirement::new(
-                "has-report",
-                "Has a report",
-                Check::equals(report.clone(), json!(true)),
-            )
-            .expect("valid id"),
-        )
-        .expect("new id");
-    let declaration = CardDefinition::from(service.clone())
+        .add_component(Component::new("reviewer", agent.clone()).verified_by([verifier.clone()]));
+    let agent = agent.run_config(json!({"max_iterations": 9}));
+    verifier.add_requirement(Requirement::new(
+        "has-report",
+        "Has a report",
+        Check::assert("inputs.report", "equals", true),
+    ));
+    let declaration = CardDefinition::from(&service)
         .declaration()
         .expect("valid graph");
     for submission in &declaration.input.submissions {
@@ -535,39 +456,58 @@ fn offline_edits_preserve_snapshots() {
         }
     }
 
-    let duplicate = verifier
-        .add_step(Step::new("has-report", Action::extract(report.clone())).expect("valid id"))
+    let mut duplicated = verifier.clone();
+    duplicated
+        .add_step(Step::new("has-report", Action::extract("inputs.report")))
+        .add_input("report", InputSlot::trace());
+    assert_eq!(
+        duplicated.spec()["steps"].as_array().map(Vec::len),
+        Some(2),
+        "a duplicate step ID is retained"
+    );
+    let refused = duplicated.validate().expect_err("duplicate IDs and slots");
+    assert!(
+        refuses(&refused, ": inputs.report: duplicate entry"),
+        "{refused:?}"
+    );
+    let mut duplicated = verifier.clone();
+    duplicated.add_step(Step::new("has-report", Action::extract("inputs.report")));
+    let refused = duplicated
+        .validate()
         .expect_err("a step reusing a requirement ID");
-    assert_eq!(rule(&duplicate), Some("duplicate_id"));
-    let duplicate = verifier
-        .add_requirement(
-            Requirement::new("policy", "Reused", Check::equals(report, json!(true)))
-                .expect("valid id"),
-        )
-        .expect_err("a requirement reusing a step ID");
-    assert_eq!(rule(&duplicate), Some("duplicate_id"));
-    let duplicate = verifier
-        .add_input("report", Value::Null)
-        .expect_err("a reused slot");
-    assert_eq!(rule(&duplicate), Some("duplicate_input"));
-    let duplicate = service
-        .add_component("reviewer", reviewer(), Vec::<Binding>::new())
-        .expect_err("a reused alias");
-    assert_eq!(rule(&duplicate), Some("duplicate_alias"));
-    assert_eq!(
-        verifier.spec().steps.len(),
-        1,
-        "a refused edit changes nothing"
-    );
-    assert_eq!(
-        service.spec().components.len(),
-        1,
-        "a refused edit changes nothing"
-    );
+    assert!(refuses(&refused, "has-report"), "{refused:?}");
 
-    service
-        .add_component("controls", agent, Vec::<Binding>::new())
-        .expect("new alias");
+    let reset = duplicated
+        .clone()
+        .inputs([("report", InputSlot::json(Value::Null))]);
+    assert_eq!(
+        reset.spec()["steps"],
+        duplicated.spec()["steps"],
+        "replacing inputs leaves steps"
+    );
+    let mut aliases = service.clone();
+    aliases.add_component(Component::new("reviewer", reviewer()));
+    let refused = aliases.validate().expect_err("a reused alias");
+    assert!(refuses(&refused, "reviewer"), "{refused:?}");
+    let reset = aliases.components([Component::new("reviewer", reviewer())]);
+    reset
+        .validate()
+        .expect("replacing components drops the duplicate attempt");
+
+    let mut duplicate_key = Verifier::new("keys", "1.0.0");
+    duplicate_key
+        .add_input("report", InputSlot::json(Value::Null))
+        .add_input("report", InputSlot::trace());
+    assert!(
+        duplicate_key.validate().is_err(),
+        "a repeated key is refused"
+    );
+    let duplicate_key = duplicate_key.inputs([("report", InputSlot::json(Value::Null))]);
+    duplicate_key
+        .validate()
+        .expect("replacing inputs drops the earlier duplicate attempt");
+
+    service.add_component(Component::new("controls", agent));
     let conflict = CardDefinition::from(service)
         .declaration()
         .expect_err("two different report-reviewer 1.0.0 definitions");
@@ -575,15 +515,153 @@ fn offline_edits_preserve_snapshots() {
         matches!(conflict, WyrdError::SpecDuplicateSubmission { .. }),
         "{conflict:?}"
     );
+}
 
-    assert!(matches!(
-        Agent::new(
-            "report-reviewer",
-            "^1.0",
-            Prompt::new("openai", "gpt-4o", "Review").expect("prompt compiles"),
-        ),
-        Err(WyrdError::RegistryInvalidVersionBlock { .. })
+/// Construction and edits accept anything typed correctly; validation and
+/// declaration refuse each complete invalid snapshot by its YAML path,
+/// revalidate later edits, and read code files only then.
+///
+/// # Panics
+/// Panics when an edit refuses early, a refusal is missing or misattributed,
+/// a file is read before validation, or a later edit escapes validation.
+#[test]
+fn field_edits_defer_validation_and_preserve_snapshots() {
+    let invalid = Verifier::new("Not A Name!", "^1.0");
+    let refused = invalid.validate().expect_err("invalid identity");
+    assert!(!diagnostics(&refused).is_empty(), "{refused:?}");
+
+    let mut verifier = Verifier::new("report-policy", "1.0.0");
+    verifier.add_requirement(Requirement::new(
+        "uses-later-input",
+        "Reads a slot added later",
+        Check::assert("inputs.report", "approximately", true),
     ));
+    let refused = verifier.validate().expect_err("invalid operator");
+    assert!(
+        refuses(&refused, ": requirements[0].check: "),
+        "the operator is refused at its YAML path: {refused:?}"
+    );
+    let verifier = verifier.requirements([Requirement::new(
+        "uses-later-input",
+        "Reads a slot added later",
+        Check::assert("inputs.report", "equals", true),
+    )]);
+    let refused = verifier.validate().expect_err("unknown input");
+    assert!(refuses(&refused, "report"), "{refused:?}");
+    let mut verifier = verifier;
+    verifier.add_input("report", InputSlot::json(Value::Null));
+    verifier
+        .validate()
+        .expect("the forward reference is valid once the slot exists");
+
+    let incomplete = Prompt::new("judge", "1.0.0").model("gpt-4o");
+    let refused = incomplete.validate().expect_err("missing provider");
+    assert!(refuses(&refused, "provider"), "{refused:?}");
+
+    let directory = tempfile::tempdir().expect("scratch directory");
+    let source = directory.path().join("checks.py");
+    let mut coded = verifier.clone();
+    coded.add_step(Step::new(
+        "facts",
+        Action::code(CodeSource::file(&source), "facts").inputs([("report", "inputs.report")]),
+    ));
+    assert!(
+        coded.spec()["steps"][0]["action"]["source"].is_null(),
+        "nothing is read on edit"
+    );
+    let refused = coded.validate().expect_err("the source does not exist yet");
+    assert!(
+        diagnostics(&refused)
+            .iter()
+            .any(|(code, _)| code == "WYRD_LOADER_500_IO" || code.contains("IO")),
+        "{refused:?}"
+    );
+    std::fs::write(&source, "def facts(report):\n    return {}\n").expect("source writes");
+    let first = CardDefinition::from(&coded)
+        .declaration()
+        .expect("the source reads");
+    std::fs::write(&source, "def facts(report):\n    return {'v': 2}\n").expect("source writes");
+    let second = CardDefinition::from(&coded)
+        .declaration()
+        .expect("the source reads");
+    assert_ne!(first, second, "every snapshot reads the file afresh");
+    assert_eq!(
+        second.input.submissions[0].spec["steps"][0]["action"]["source"],
+        json!({"inline": "def facts(report):\n    return {'v': 2}\n"})
+    );
+
+    coded.validate().expect("valid");
+    coded.add_input("broken", InputSlot::json(Value::Null).required("yes"));
+    let refused = coded
+        .validate()
+        .expect_err("an edit after validate is revalidated");
+    assert!(refuses(&refused, ": inputs.broken"), "{refused:?}");
+}
+
+/// The same invalid Card refuses with the same diagnostic code and message,
+/// apart from its source label, whether authored as YAML or code.
+///
+/// # Panics
+/// Panics when either form is admitted or their diagnostics differ.
+#[test]
+fn yaml_and_code_share_diagnostics() {
+    let directory = tempfile::tempdir().expect("scratch directory");
+    let cases: [(&str, Verifier); 3] = [
+        (
+            "inputs: {report: {type: json}}\nrequirements:\n  - {id: r, statement: s, check: {kind: assert, path: inputs.report, operator: approximately, expected: true}}\n",
+            Verifier::new("shared", "1.0.0")
+                .inputs([("report", InputSlot::json(Value::Null))])
+                .requirements([Requirement::new(
+                    "r",
+                    "s",
+                    Check::assert("inputs.report", "approximately", true),
+                )]),
+        ),
+        (
+            "requirements:\n  - {id: r, statement: s, check: {kind: assert, path: inputs.missing, operator: equals, expected: true}}\n",
+            Verifier::new("shared", "1.0.0").requirements([Requirement::new(
+                "r",
+                "s",
+                Check::assert("inputs.missing", "equals", true),
+            )]),
+        ),
+        (
+            "inputs: {report: {type: trace, max_bytes: 1}}\n",
+            Verifier::new("shared", "1.0.0")
+                .inputs([("report", InputSlot::json(Value::Null).required(true))])
+                .inputs([("report", InputSlot::trace().max_bytes(1))]),
+        ),
+    ];
+    for (index, (spec, code)) in cases.into_iter().enumerate() {
+        let file = directory.path().join(format!("case-{index}.yaml"));
+        std::fs::write(
+            &file,
+            format!(
+                "apiVersion: wyrd/v1\nkind: Verifier\nmetadata: {{name: shared, version: 1.0.0}}\nspec:\n{}",
+                spec.lines().flat_map(|line| ["  ", line, "\n"]).collect::<String>()
+            ),
+        )
+        .expect("case writes");
+        let from_file = wyrd_loader::load(&file)
+            .and_then(wyrd_loader::build_declaration_input)
+            .map_err(WyrdError::from)
+            .expect_err("the YAML case is invalid");
+        let from_code = code.validate().expect_err("the code case is invalid");
+        let strip = |error: &WyrdError, label: &str| -> Vec<(String, String)> {
+            diagnostics(error)
+                .into_iter()
+                .map(|(code, message)| (code, message.replace(label, "<card>")))
+                .collect()
+        };
+        let file_label = file.display().to_string();
+        let file_diagnostics = strip(&from_file, &file_label);
+        assert!(!file_diagnostics.is_empty(), "case {index}: {from_file:?}");
+        assert_eq!(
+            strip(&from_code, "Verifier/shared@1.0.0"),
+            file_diagnostics,
+            "case {index} refuses alike"
+        );
+    }
 }
 
 /// The `card_authoring` story's checked-in file at `relative`.
@@ -594,64 +672,45 @@ fn story(relative: &str) -> std::path::PathBuf {
 }
 
 /// A policy-judge Agent named `name`, as the story's Agent files declare it.
-///
-/// # Panics
-/// Panics when the fixed Prompt, identity, or deployment is refused.
 fn policy_judge(name: &str) -> Agent {
-    let mut prompt = Prompt::new(
-        "openai",
-        "gpt-4o",
-        "POLICY JUDGE: read /inputs/policy.json with fs.read. Determine whether the proposed \
-         release satisfies the company policy. Cite original request and policy evidence. \
-         Report: {{report}} Recipient: {{recipient}} Purpose: {{purpose}} Destination: \
-         {{destination}}",
-    )
-    .expect("prompt compiles");
-    prompt
-        .set_response_format(json!("verdict"))
-        .expect("verdict is a named format");
-    let mut agent = Agent::new(name, "1.0.0", prompt).expect("valid identity");
-    agent.set_gateway_route("openai").expect("valid deployment");
-    agent.set_tools([BuiltinTool::FsRead.as_str()]);
-    agent.set_max_iterations(3);
-    agent
+    Agent::new(name, "1.0.0")
+        .execution_route(json!({"kind": "wyrd_gateway", "deployment": "openai"}))
+        .tool_names(["fs.read"])
+        .run_config(json!({"max_iterations": 3}))
+        .prompt(json!({
+            "provider": "openai",
+            "model": "gpt-4o",
+            "messages": [{
+                "role": "user",
+                "content": "POLICY JUDGE: read /inputs/policy.json with fs.read. Determine whether the proposed release satisfies the company policy. Cite original request and policy evidence. Report: {{report}} Recipient: {{recipient}} Purpose: {{purpose}} Destination: {{destination}}",
+            }],
+            "response_format": "verdict",
+        }))
 }
 
 /// A code step running `entrypoint` of the story's checks over `inputs`,
-/// judged by one `path == expected` requirement.
-///
-/// # Panics
-/// Panics when the story's checks cannot be read or an ID, parameter, or
-/// path is refused.
+/// judged by one `steps.<id>.output.<path> == expected` requirement.
 fn fact_step(
     id: &str,
     entrypoint: &str,
-    inputs: &[(&str, &Reference)],
-    requirement: (&str, &str, &str, Value),
+    inputs: &[&str],
+    (requirement, statement, path, expected): (&str, &str, &str, Value),
 ) -> Step {
-    let mut call =
-        CodeCall::from_file(story("release_checks.py"), entrypoint).expect("source reads");
-    for (name, value) in inputs {
-        call.add_input(name, (*value).clone())
-            .expect("valid parameter");
-    }
-    let mut step = Step::new(id, Action::code(call)).expect("valid id");
-    let (requirement_id, statement, path, expected) = requirement;
-    let check = Check::equals(step.output(path).expect("path"), expected);
-    step.add_requirement(Requirement::new(requirement_id, statement, check).expect("valid id"))
-        .expect("new id");
-    step
+    let action = Action::code(CodeSource::file(story("release_checks.py")), entrypoint)
+        .inputs(inputs.iter().map(|name| (*name, format!("inputs.{name}"))));
+    Step::new(id, action).requirements([Requirement::new(
+        requirement,
+        statement,
+        Check::assert(format!("steps.{id}.output.{path}"), "equals", expected),
+    )])
 }
 
-/// Declare the recipient, purpose, and destination slots on `verifier`.
-///
-/// # Panics
-/// Panics when `verifier` already declares one of them.
-fn release_inputs(verifier: &mut Verifier) -> [Reference; 3] {
-    let recipient = verifier
-        .add_input(
+/// The recipient, purpose, and destination slots.
+fn release_inputs() -> [(&'static str, InputSlot); 3] {
+    [
+        (
             "recipient",
-            json!({
+            InputSlot::json(json!({
                 "type": "object",
                 "additionalProperties": false,
                 "required": ["email", "authorized", "permitted_purposes"],
@@ -660,16 +719,12 @@ fn release_inputs(verifier: &mut Verifier) -> [Reference; 3] {
                     "authorized": {"type": "boolean"},
                     "permitted_purposes": {"type": "array", "items": {"type": "string"}},
                 },
-            }),
-        )
-        .expect("new slot");
-    let purpose = verifier
-        .add_input("purpose", json!({"type": "string"}))
-        .expect("new slot");
-    let destination = verifier
-        .add_input(
+            })),
+        ),
+        ("purpose", InputSlot::json(json!({"type": "string"}))),
+        (
             "destination",
-            json!({
+            InputSlot::json(json!({
                 "type": "object",
                 "additionalProperties": false,
                 "required": ["url", "encrypted", "restricted_access", "public_sharing"],
@@ -679,37 +734,36 @@ fn release_inputs(verifier: &mut Verifier) -> [Reference; 3] {
                     "restricted_access": {"type": "boolean"},
                     "public_sharing": {"type": "boolean"},
                 },
-            }),
-        )
-        .expect("new slot");
-    [recipient, purpose, destination]
+            })),
+        ),
+    ]
 }
 
 /// The `card_authoring` story's Service, authored in code, with the report
 /// judge mounting `policy`.
-///
-/// # Panics
-/// Panics when any fixed identity, slot, ID, or alias is refused.
-fn finance_release(policy: &ArtifactFile) -> Service {
+fn finance_release(policy: ArtifactFile) -> Service {
     let reviewer = policy_judge("report-reviewer");
-    let mut report_policy = Verifier::new("report-policy", "1.0.0").expect("valid identity");
-    report_policy.set_description("The report is fit to share under the company sharing policy.");
-    let report = report_policy
-        .add_input(
-            "report",
-            json!({
-                "type": "object",
-                "additionalProperties": false,
-                "required": ["text"],
-                "properties": {"text": {"type": "string"}},
-            }),
-        )
-        .expect("new slot");
-    let [recipient, purpose, destination] = release_inputs(&mut report_policy);
+    let mut report_policy = Verifier::new("report-policy", "1.0.0")
+        .description("The report is fit to share under the company sharing policy.")
+        .inputs(release_inputs());
+    report_policy.add_input(
+        "report",
+        InputSlot::json(json!({
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["text"],
+            "properties": {"text": {"type": "string"}},
+        })),
+    );
+    let mut judge = Check::agent(reviewer.clone()).inputs(
+        ["report", "recipient", "purpose", "destination"]
+            .map(|name| (name, format!("inputs.{name}"))),
+    );
+    judge.add_workspace("/inputs/policy.json", policy);
     let mut scan = fact_step(
         "policy",
         "report_facts",
-        &[("report", &report)],
+        &["report"],
         (
             "no-bank-account-identifier",
             "The report contains no prohibited bank identifier.",
@@ -717,52 +771,38 @@ fn finance_release(policy: &ArtifactFile) -> Service {
             json!(false),
         ),
     );
-    let mut judge = AgentCall::new(reviewer.clone());
-    for (name, value) in [
-        ("report", &report),
-        ("recipient", &recipient),
-        ("purpose", &purpose),
-        ("destination", &destination),
-    ] {
-        judge
-            .add_input(name, value.clone())
-            .expect("valid parameter");
-    }
-    judge.add_workspace_file("/inputs/policy.json", policy);
-    scan.add_requirement(
-        Requirement::new(
-            "sharing-policy-satisfied",
-            "The release satisfies the company sharing policy.",
-            Check::agent(judge),
-        )
-        .expect("valid id"),
-    )
-    .expect("new id");
-    let context = fact_step(
-        "policy-context",
-        "policy_context",
-        &[("report", &report), ("purpose", &purpose)],
-        (
-            "usable-report",
-            "The proposed release contains report text.",
-            "has_report",
-            json!(true),
+    scan.add_requirement(Requirement::new(
+        "sharing-policy-satisfied",
+        "The release satisfies the company sharing policy.",
+        judge,
+    ));
+    let report_policy = report_policy.steps([
+        scan,
+        fact_step(
+            "policy-context",
+            "policy_context",
+            &["report", "purpose"],
+            (
+                "usable-report",
+                "The proposed release contains report text.",
+                "has_report",
+                json!(true),
+            ),
         ),
-    );
-    report_policy.add_step(scan).expect("new step");
-    report_policy.add_step(context).expect("new step");
+    ]);
 
-    let mut release_access = Verifier::new("release-access", "1.0.0").expect("valid identity");
-    release_access.set_description("The recipient and destination may receive the report.");
-    let [recipient, purpose, destination] = release_inputs(&mut release_access);
+    let mut release_access = Verifier::new("release-access", "1.0.0")
+        .description("The recipient and destination may receive the report.")
+        .inputs(release_inputs());
     release_access
-        .add_input_with_required("notes", json!({"type": "string"}), false)
-        .expect("new slot");
-    release_access
+        .add_input(
+            "notes",
+            InputSlot::json(json!({"type": "string"})).required(false),
+        )
         .add_step(fact_step(
             "recipient",
             "recipient_facts",
-            &[("recipient", &recipient), ("purpose", &purpose)],
+            &["recipient", "purpose"],
             (
                 "recipient-authorized",
                 "The recipient is authorized for this purpose.",
@@ -770,34 +810,25 @@ fn finance_release(policy: &ArtifactFile) -> Service {
                 json!(true),
             ),
         ))
-        .expect("new step");
-    release_access
         .add_step(fact_step(
             "destination",
             "destination_facts",
-            &[("destination", &destination)],
+            &["destination"],
             (
                 "destination-controls-satisfied",
                 "The destination has appropriate access controls.",
                 "appropriate",
                 json!(true),
             ),
-        ))
-        .expect("new step");
+        ));
 
-    let mut service = Service::new("finance-release", "1.0.0").expect("valid identity");
-    service.set_service_type("api");
-    service
-        .add_component("report-reviewer", reviewer, [report_policy])
-        .expect("new alias");
-    service
-        .add_component(
-            "release-controls",
-            policy_judge("release-controls"),
-            [release_access],
-        )
-        .expect("new alias");
-    service
+    Service::new("finance-release", "1.0.0")
+        .service_type("api")
+        .components([
+            Component::new("report-reviewer", reviewer).verified_by([report_policy]),
+            Component::new("release-controls", policy_judge("release-controls"))
+                .verified_by([release_access]),
+        ])
 }
 
 /// The story authored in code declares the same identities, metadata, and
@@ -812,13 +843,10 @@ fn declarations_match_file_authored_tree() {
         "company-sharing-policy",
         "1.0.0",
         story("company-sharing-policy.pdf"),
-        true,
     )
-    .expect("valid identity");
+    .extract(true);
     let authored = CardDefinition::from(finance_release(
-        &policy
-            .file("extracted/company-sharing-policy.pdf.json")
-            .expect("relative path"),
+        policy.file("extracted/company-sharing-policy.pdf.json"),
     ))
     .declaration()
     .expect("valid graph");
@@ -828,9 +856,13 @@ fn declarations_match_file_authored_tree() {
     .expect("the story builds");
 
     assert_eq!(
-        authored.artifacts,
-        [policy],
+        authored.artifacts.len(),
+        1,
         "the policy publishes first, alone"
+    );
+    assert_eq!(
+        authored.artifacts[0].source,
+        story("company-sharing-policy.pdf")
     );
     let identity = |submission: &wyrd_spec::registry::CardSubmission| {
         (
@@ -862,22 +894,8 @@ fn declarations_match_file_authored_tree() {
 }
 
 /// A sibling `daily` 1.0.0 Trigger firing on `cron`.
-///
-/// # Panics
-/// Panics when the fixed name or version is not an exact identity.
-fn daily(cron: &str) -> CardDefinition {
-    CardDefinition::new(
-        "daily",
-        "1.0.0",
-        Spec::Trigger(TriggerSpec {
-            description: None,
-            activation: wyrd_spec::card::trigger::TriggerActivation::Schedule {
-                cron: cron.to_owned(),
-                tz: None,
-            },
-        }),
-    )
-    .expect("valid identity")
+fn daily(cron: &str) -> Trigger {
+    Trigger::new("daily", "1.0.0").kind("schedule").cron(cron)
 }
 
 /// The declaration of a Verifier with a `report` input whose one Agent step
@@ -885,22 +903,25 @@ fn daily(cron: &str) -> CardDefinition {
 ///
 /// # Errors
 /// Returns [`CardDefinition::declaration`]'s refusal.
-///
-/// # Panics
-/// Panics when the fixed Verifier identity, slot, or step ID is invalid.
-fn call_declaration(call: AgentCall) -> Result<Declaration, WyrdError> {
-    let mut verifier = Verifier::new("workspace", "1.0.0").expect("valid identity");
-    verifier.add_input("report", Value::Null).expect("new slot");
-    verifier
-        .add_step(Step::new("judge", Action::agent(call)).expect("valid id"))
-        .expect("new step");
-    CardDefinition::from(verifier).declaration()
+fn call_declaration(call: Action) -> Result<Declaration, WyrdError> {
+    Verifier::new("workspace", "1.0.0")
+        .inputs([("report", InputSlot::json(Value::Null))])
+        .steps([Step::new("judge", call)])
+        .card_definition()
+        .declaration()
 }
 
-/// Replacing a Trigger or a workspace destination leaves exactly the
-/// dependencies of the current values: an edited definition declares and
-/// publishes what the same definition built directly does, while two
-/// current conflicting definitions still refuse.
+impl Verifier {
+    /// This Verifier as a root definition.
+    fn card_definition(self) -> CardDefinition {
+        CardDefinition::from(self)
+    }
+}
+
+/// Replacing a Trigger, a component, or a workspace destination leaves
+/// exactly the dependencies of the current values: an edited definition
+/// declares and publishes what the same definition built directly does,
+/// while two current conflicting definitions still refuse.
 ///
 /// # Panics
 /// Panics when an edited value differs from its direct construction, an
@@ -908,17 +929,17 @@ fn call_declaration(call: AgentCall) -> Result<Declaration, WyrdError> {
 /// Artifact is dropped, or the current conflict is admitted.
 #[test]
 fn replacements_keep_only_current_dependencies() {
-    let verifier = Verifier::new("checked", "1.0.0").expect("valid identity");
+    let verifier = Verifier::new("checked", "1.0.0");
     let declare = |binding: Binding| {
-        let mut agent = reviewer();
-        agent.add_verifier(binding);
-        CardDefinition::from(agent).declaration()
+        reviewer()
+            .verified_by([binding])
+            .card_definition()
+            .declaration()
     };
-    let mut direct = Binding::new(verifier.clone());
-    direct.set_runs_on(daily("0 6 * * *"));
-    let mut edited = Binding::new(verifier.clone());
-    edited.set_runs_on(daily("0 0 * * *"));
-    edited.set_runs_on(daily("0 6 * * *"));
+    let direct = Binding::new(verifier.clone()).runs_on(daily("0 6 * * *"));
+    let edited = Binding::new(verifier.clone())
+        .runs_on(daily("0 0 * * *"))
+        .runs_on(daily("0 6 * * *"));
     assert_eq!(edited, direct, "replacement equals direct construction");
     let declaration = declare(edited).expect("only the current Trigger is declared");
     assert_eq!(declaration, declare(direct).expect("valid graph"));
@@ -933,11 +954,11 @@ fn replacements_keep_only_current_dependencies() {
         triggers,
         [&json!({"kind": "schedule", "cron": "0 6 * * *"})]
     );
-    let mut inline = Binding::new(verifier.clone());
-    inline.set_runs_on(daily("0 0 * * *"));
-    inline.set_runs_on(Linked::registered(daily("0 6 * * *").card_ref()));
+    let registered = Binding::new(verifier.clone())
+        .runs_on(daily("0 0 * * *"))
+        .runs_on(daily("0 6 * * *").card_ref());
     assert!(
-        declare(inline)
+        declare(registered)
             .expect("valid graph")
             .input
             .submissions
@@ -946,29 +967,43 @@ fn replacements_keep_only_current_dependencies() {
         "a registered Trigger replaces the sibling submission",
     );
 
-    let mut first = Binding::new(verifier.clone());
-    first.set_runs_on(daily("0 0 * * *"));
-    let mut second = Binding::new(Verifier::new("other", "1.0.0").expect("valid identity"));
-    second.set_runs_on(daily("0 6 * * *"));
-    let mut agent = reviewer();
-    agent.add_verifier(first);
-    agent.add_verifier(second);
+    let first = Binding::new(verifier.clone()).runs_on(daily("0 0 * * *"));
+    let second = Binding::new(Verifier::new("other", "1.0.0")).runs_on(daily("0 6 * * *"));
     assert!(
         matches!(
-            CardDefinition::from(agent).declaration(),
+            reviewer()
+                .verified_by([first, second])
+                .card_definition()
+                .declaration(),
             Err(WyrdError::SpecDuplicateSubmission { .. })
         ),
         "two current definitions of daily 1.0.0 still conflict",
     );
 
-    let obsolete = Artifact::from_path("obsolete-policy", "1.0.0", "missing/obsolete.pdf", false)
-        .expect("valid identity");
-    let scope = Reference::input("report").expect("reference");
-    let mut to_scope = AgentCall::new(reviewer());
-    to_scope.add_workspace_file("/inputs/policy.json", &obsolete.files());
-    to_scope.add_workspace_input("/inputs/policy.json", scope.clone());
-    let mut scope_only = AgentCall::new(reviewer());
-    scope_only.add_workspace_input("/inputs/policy.json", scope.clone());
+    let mut replaced = Service::new("finance-release", "1.0.0");
+    replaced.add_component(Component::new("a", policy_judge("old-judge")));
+    let replaced = replaced.components([Component::new("a", reviewer())]);
+    let names: Vec<String> = CardDefinition::from(replaced)
+        .declaration()
+        .expect("valid graph")
+        .input
+        .submissions
+        .iter()
+        .map(|submission| submission.metadata.name.to_string())
+        .collect();
+    assert!(
+        !names.contains(&"old-judge".to_owned()),
+        "a replaced component's Card is not declared: {names:?}"
+    );
+
+    let obsolete = Artifact::from_path("obsolete-policy", "1.0.0", "missing/obsolete.pdf");
+    let mut to_scope = Action::agent(reviewer());
+    to_scope
+        .add_workspace("/inputs/policy.json", obsolete.file("obsolete.pdf"))
+        .add_workspace("/inputs/report.json", "inputs.report");
+    let to_scope = to_scope.workspace([("/inputs/policy.json", "inputs.report")]);
+    let scope_only =
+        Action::agent(reviewer()).workspace([("/inputs/policy.json", "inputs.report")]);
     assert_eq!(
         to_scope, scope_only,
         "replacement equals direct construction"
@@ -981,25 +1016,44 @@ fn replacements_keep_only_current_dependencies() {
         "a replaced local Artifact is not published",
     );
 
-    let mut to_file = AgentCall::new(reviewer());
-    to_file.add_workspace_file("/inputs/policy.json", &obsolete.files());
-    to_file.add_workspace_file("/inputs/policy.json", &policy().files());
-    let mut file_only = AgentCall::new(reviewer());
-    file_only.add_workspace_file("/inputs/policy.json", &policy().files());
+    let to_file = Action::agent(reviewer())
+        .workspace([("/inputs/policy.json", obsolete.file("obsolete.pdf"))])
+        .workspace([("/inputs/policy.json", policy().file("policy.pdf"))]);
+    let file_only =
+        Action::agent(reviewer()).workspace([("/inputs/policy.json", policy().file("policy.pdf"))]);
     assert_eq!(to_file, file_only, "replacement equals direct construction");
+    let published = call_declaration(to_file).expect("valid graph").artifacts;
     assert_eq!(
-        call_declaration(to_file).expect("valid graph").artifacts,
-        [policy()],
-        "only the current local Artifact is published",
+        published.len(),
+        1,
+        "only the current local Artifact is published"
+    );
+    assert_eq!(
+        published[0].metadata.name.as_str(),
+        "company-sharing-policy"
     );
 
-    let mut shared = AgentCall::new(reviewer());
-    shared.add_workspace_file("/inputs/policy.json", &policy().files());
-    shared.add_workspace_file("/inputs/copy.json", &policy().files());
-    shared.add_workspace_input("/inputs/policy.json", scope);
+    let mut shared = Action::agent(reviewer());
+    shared
+        .add_workspace("/inputs/policy.json", policy().file("policy.pdf"))
+        .add_workspace("/inputs/copy.json", policy().file("policy.pdf"));
+    let shared = shared.workspace([
+        ("/inputs/policy.json", FieldValue::from("inputs.report")),
+        ("/inputs/copy.json", policy().file("policy.pdf").into()),
+    ]);
     assert_eq!(
-        call_declaration(shared).expect("valid graph").artifacts,
-        [policy()],
+        call_declaration(shared)
+            .expect("valid graph")
+            .artifacts
+            .len(),
+        1,
         "an Artifact still mounted elsewhere is still published",
     );
+}
+
+impl Agent {
+    /// This Agent as a root definition.
+    fn card_definition(self) -> CardDefinition {
+        CardDefinition::from(self)
+    }
 }

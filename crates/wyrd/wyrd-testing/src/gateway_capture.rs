@@ -562,3 +562,147 @@ async fn answer(State(paced): State<Paced>, body: Bytes) -> Response {
     )
         .into_response()
 }
+
+/// A local provider in front of a scripted `wiremock` upstream that holds
+/// chosen answers until the test releases them.
+///
+/// Every request is forwarded to the upstream as it arrives, so the
+/// upstream records it and scripts its answer; that answer is handed back
+/// only once no hold matches the request's body; a hold matches a body
+/// containing every one of its fragments. `wiremock`
+/// answers on one thread after a fixed delay, so it cannot wait for a test
+/// event; this provider orders a race by the test's own observations rather
+/// than by elapsed time. A forward the upstream refuses answers `502`.
+/// Dropping it stops serving; a held caller then sees its connection close.
+pub struct HeldUpstream {
+    /// The bound address.
+    address: SocketAddr,
+    /// The fragment sets whose answers are held.
+    held: Arc<tokio::sync::watch::Sender<Vec<Vec<String>>>>,
+    /// The serving task.
+    serving: tokio::task::JoinHandle<()>,
+}
+
+/// What every [`HeldUpstream`] connection shares.
+#[derive(Clone)]
+struct Holding {
+    /// The scripted upstream's base URL.
+    upstream: String,
+    /// The forwarding client.
+    client: reqwest::Client,
+    /// The fragment sets whose answers are held.
+    held: Arc<tokio::sync::watch::Sender<Vec<Vec<String>>>>,
+}
+
+impl HeldUpstream {
+    /// Binds a loopback port and forwards every request to `upstream`,
+    /// holding none yet.
+    ///
+    /// # Errors
+    /// Returns the bind failure.
+    pub async fn start(upstream: &MockServer) -> std::io::Result<Self> {
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0)).await?;
+        let address = listener.local_addr()?;
+        let held = Arc::new(tokio::sync::watch::Sender::new(Vec::new()));
+        let router = Router::new().fallback(forward).with_state(Holding {
+            upstream: upstream.uri(),
+            client: reqwest::Client::new(),
+            held: Arc::clone(&held),
+        });
+        let serving = tokio::spawn(async move {
+            if let Err(error) = axum::serve(listener, router).await {
+                tracing::error!(%error, "the held upstream stopped serving");
+            }
+        });
+        Ok(Self {
+            address,
+            held,
+            serving,
+        })
+    }
+
+    /// The base URL every path prefix hangs off.
+    pub fn uri(&self) -> String {
+        format!("http://{}", self.address)
+    }
+
+    /// Holds the answer to every request whose body contains each of
+    /// `fragments`, including one already waiting, until [`Self::release`].
+    pub fn hold(&self, fragments: &[&str]) {
+        let hold = fragments
+            .iter()
+            .map(|&fragment| fragment.to_owned())
+            .collect();
+        self.held.send_modify(|held| held.push(hold));
+    }
+
+    /// Hands back every answer the hold on `fragments` held, and answers
+    /// its later requests at once.
+    pub fn release(&self, fragments: &[&str]) {
+        self.held
+            .send_modify(|held| held.retain(|hold| hold.as_slice() != fragments));
+    }
+}
+
+impl Drop for HeldUpstream {
+    /// Stops serving.
+    fn drop(&mut self) {
+        self.serving.abort();
+    }
+}
+
+/// Forwards one request to the scripted upstream, then hands back its
+/// answer once no hold matches the request's body; an
+/// unreadable request body answers `400`, and a refused forward `502`.
+async fn forward(State(holding): State<Holding>, request: axum::extract::Request) -> Response {
+    let (parts, body) = request.into_parts();
+    let Ok(body) = axum::body::to_bytes(body, usize::MAX).await else {
+        return (axum::http::StatusCode::BAD_REQUEST, "unreadable body").into_response();
+    };
+    let target = format!(
+        "{}{}",
+        holding.upstream,
+        parts
+            .uri
+            .path_and_query()
+            .map_or("/", axum::http::uri::PathAndQuery::as_str)
+    );
+    let mut headers = parts.headers;
+    headers.remove(axum::http::header::HOST);
+    let answered = holding
+        .client
+        .request(parts.method, target)
+        .headers(headers)
+        .body(body.clone())
+        .send()
+        .await;
+    let (status, content_type, answer) = match answered {
+        Ok(answered) => (
+            answered.status(),
+            answered.headers().get(CONTENT_TYPE).cloned(),
+            answered.bytes().await,
+        ),
+        Err(error) => {
+            return (axum::http::StatusCode::BAD_GATEWAY, error.to_string()).into_response();
+        }
+    };
+    let Ok(answer) = answer else {
+        return (axum::http::StatusCode::BAD_GATEWAY, "unreadable answer").into_response();
+    };
+    let text = String::from_utf8_lossy(&body).into_owned();
+    // The sender lives as long as the serving task, so the wait ends only
+    // when the request is no longer held.
+    let mut held = holding.held.subscribe();
+    let _released = held
+        .wait_for(|held| {
+            !held
+                .iter()
+                .any(|hold| hold.iter().all(|fragment| text.contains(fragment.as_str())))
+        })
+        .await;
+    let mut response = (status, answer).into_response();
+    if let Some(content_type) = content_type {
+        response.headers_mut().insert(CONTENT_TYPE, content_type);
+    }
+    response
+}

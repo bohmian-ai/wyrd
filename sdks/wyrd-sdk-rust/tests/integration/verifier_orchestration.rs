@@ -22,14 +22,16 @@ use wyrd_ai::cards::Cards;
 use wyrd_ai::cli::{ExecutionArg, ExecutionVerb, PageArgs};
 use wyrd_ai::state::WyrdState;
 use wyrd_ai::verify::{
-    Execution, ExecutionPageQuery, File, PublicationContent, PublicationName, PublicationSelector,
-    PublicationSummary, Speculation, Submission, TaskId, VerificationExecutionStatus,
+    Execution, ExecutionInvocation, ExecutionPageQuery, File, InvocationProgress,
+    PublicationContent, PublicationName, PublicationSelector, PublicationSummary, Speculation,
+    Submission, TaskId, VerificationExecutionStatus,
 };
 use wyrd_ai::{
     ExecutionId, RequirementOutcome, StepStatus, VerificationResult, VerificationVerdict,
     WyrdClient,
 };
 use wyrd_spec::verification::state::{ControlRecord, ExecutionState};
+use wyrd_testing::gateway_capture::HeldUpstream;
 use wyrd_testing::server::WyrdTestServerBuilder;
 use wyrd_testing::verification::VerificationFixture;
 
@@ -86,12 +88,9 @@ fn answer(value: &Value) -> ResponseTemplate {
     completion(json!({ "role": "assistant", "content": value.to_string() }))
 }
 
-/// How long a held reply waits, so the other side of a race settles first.
+/// How long a held section reply waits, so the sections holding the
+/// workspace ceiling stay running while the next is refused.
 const HELD: Duration = Duration::from_secs(3);
-
-/// How long an early decision waits, so the bootstrap it races settles
-/// first while a held extra review is still running.
-const BRIEF: Duration = Duration::from_secs(1);
 
 /// What the scripted model remembers across requests.
 #[derive(Default)]
@@ -122,10 +121,9 @@ fn numbered(messages: &[Value]) -> Option<usize> {
 /// marker and turn. Reviewer 0's first attempt gets an undecodable reply
 /// after its first turn, so its item retries as a second attempt. The
 /// planner decides by the question's marker and breaks without one; the
-/// stylist publishes a partial draft, then breaks. A `LATE-DECISION`
-/// comparison and a `KNOWN` bootstrap hold their replies; an
-/// `EARLY-DECISION` comparison waits briefly while its extra review holds
-/// its first turn longer. The refiner publishes its report, then scores it
+/// stylist publishes a partial draft, then breaks. The bootstrap, the
+/// comparison, and the extra review answer at once; a speculative race
+/// orders them by holding answers at a [`HeldUpstream`]. The refiner publishes its report, then scores it
 /// by its iteration index, a constant, or a word, or breaks on iteration 1.
 /// A section reviewer publishes its section and index; the escalation
 /// publishes a note, then breaks; the summarizer reads both collections,
@@ -235,12 +233,7 @@ fn reply(request: &Request, script: &Script) -> ResponseTemplate {
         };
     }
     if prompt.contains("BOOTSTRAP:") {
-        let reply = answer(&json!({ "done": true }));
-        return if prompt.contains("KNOWN") {
-            reply.set_delay(HELD)
-        } else {
-            reply
-        };
+        return answer(&json!({ "done": true }));
     }
     if prompt.contains("COMPARE:") {
         let agree = if prompt.contains("ADMIT") {
@@ -250,29 +243,15 @@ fn reply(request: &Request, script: &Script) -> ResponseTemplate {
         } else {
             json!(true)
         };
-        let reply = answer(&json!({ "agree": agree }));
-        return if prompt.contains("LATE-DECISION") {
-            reply.set_delay(HELD)
-        } else if prompt.contains("EARLY-DECISION") {
-            reply.set_delay(BRIEF)
-        } else {
-            reply
-        };
+        return answer(&json!({ "agree": agree }));
     }
     if prompt.contains("EXTRA:") {
         return match turn {
-            0 => {
-                let reply = calls(&[(
-                    "e-publish",
-                    "publish",
-                    json!({ "name": "account", "value": { "extra": true } }),
-                )]);
-                if prompt.contains("EARLY-DECISION") {
-                    reply.set_delay(HELD)
-                } else {
-                    reply
-                }
-            }
+            0 => calls(&[(
+                "e-publish",
+                "publish",
+                json!({ "name": "account", "value": { "extra": true } }),
+            )]),
             _ => done(),
         };
     }
@@ -1069,10 +1048,26 @@ async fn conditions_and_collections_preserve_missing_evidence() {
     desk.deployment.shutdown().await;
 }
 
+/// The order a `speculative-review` question's race is held in.
+#[derive(Clone, Copy)]
+enum Race {
+    /// The comparison answers only once the extra review's success is
+    /// accepted.
+    ActionFirst,
+    /// The extra review's provider request arrives and its answer is held
+    /// until the comparison's disposition is recorded.
+    DecisionFirst,
+    /// The bootstrap answers only once the comparison is accepted, so the
+    /// decision is known before the extra review is eligible.
+    Known,
+}
+
 /// One `speculative-review` question's expected observations.
 struct Speculated {
-    /// The question, carrying the comparison's and timing's markers.
+    /// The question, carrying the comparison's marker.
     question: &'static str,
+    /// The order its race is held in.
+    race: Race,
     /// Whether the extra reviewer was called at all.
     called: bool,
     /// The extra step's status.
@@ -1086,6 +1081,45 @@ struct Speculated {
     retained: Option<Speculation>,
 }
 
+/// Wait until `execution`'s public invocation listing, read as `desk`'s
+/// admin, holds an attempt of `step` that `reached` accepts, and return it.
+///
+/// # Panics
+/// Panics when the listing cannot be read, or no such attempt is accepted
+/// within 90 seconds.
+async fn reached(
+    desk: &Desk,
+    execution: ExecutionId,
+    step: &str,
+    reached: impl Fn(&ExecutionInvocation) -> bool,
+) -> ExecutionInvocation {
+    let handle = Execution::connect_with(execution, &desk.deployment.admin())
+        .await
+        .expect("the execution handle connects");
+    let deadline = std::time::Instant::now() + Duration::from_secs(90);
+    loop {
+        let page = handle
+            .invocations(&ExecutionPageQuery {
+                limit: Some(200),
+                cursor: None,
+            })
+            .await
+            .expect("the invocations read");
+        if let Some(invocation) = page
+            .items
+            .into_iter()
+            .find(|invocation| invocation.producer.step_id.as_str() == step && reached(invocation))
+        {
+            return invocation;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "{execution}: no accepted {step} attempt reached the milestone"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
 /// After the bootstrap succeeds, the extra review runs while the comparison
 /// is pending. A disagreement admits it whether it finished before or after
 /// the decision; an agreement discards completed work or cancels running
@@ -1095,17 +1129,33 @@ struct Speculated {
 /// when it was admitted, while a caller holding only `verifier:read` still
 /// inspects the retained excluded account, leaving its disposition unchanged.
 ///
+/// Each race is ordered by holding provider answers and observing the
+/// public invocation listing, never by elapsed time: an action-first case
+/// sees the extra review's success accepted with no disposition recorded
+/// before the comparison answers; a decision-first case sees the extra
+/// review's request arrive, then the comparison accepted while the extra
+/// review still runs, a discard recorded at once and an admission only once
+/// the admitted review settles; the known case sees the comparison accepted before the bootstrap answers.
+///
 /// # Panics
-/// Panics when a verification is refused or a call, status, disposition,
-/// mounted entry, or retained publication differs.
+/// Panics when a verification is refused or a milestone, call, status,
+/// disposition, mounted entry, or retained publication differs.
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "requires the repository-managed Postgres journey lifecycle"]
 async fn speculative_disposition_controls_consumer_admission() {
     use StepStatus::{Failed, Skipped, Succeeded};
-    let desk = Desk::start().await;
+    let upstream = upstream().await;
+    let held = HeldUpstream::start(&upstream)
+        .await
+        .expect("the held upstream binds");
+    let builder = builder(&upstream).with_gateway_provider_root_for_test(
+        held.uri().parse().expect("the held upstream's URL parses"),
+    );
+    let desk = Desk::start_with(upstream, builder).await;
     let cases = [
         Speculated {
             question: "SPEC-ADMIT-LATE-DECISION",
+            race: Race::ActionFirst,
             called: true,
             status: Succeeded,
             speculation: "admitted",
@@ -1114,6 +1164,7 @@ async fn speculative_disposition_controls_consumer_admission() {
         },
         Speculated {
             question: "SPEC-ADMIT-EARLY-DECISION",
+            race: Race::DecisionFirst,
             called: true,
             status: Succeeded,
             speculation: "admitted",
@@ -1122,6 +1173,7 @@ async fn speculative_disposition_controls_consumer_admission() {
         },
         Speculated {
             question: "SPEC-DISCARD-LATE-DECISION",
+            race: Race::ActionFirst,
             called: true,
             status: Skipped,
             speculation: "discarded",
@@ -1130,6 +1182,7 @@ async fn speculative_disposition_controls_consumer_admission() {
         },
         Speculated {
             question: "SPEC-DISCARD-EARLY-DECISION",
+            race: Race::DecisionFirst,
             called: true,
             status: Skipped,
             speculation: "discarded",
@@ -1138,6 +1191,7 @@ async fn speculative_disposition_controls_consumer_admission() {
         },
         Speculated {
             question: "SPEC-BLOCK-LATE-DECISION",
+            race: Race::ActionFirst,
             called: true,
             status: Failed,
             speculation: "blocked",
@@ -1146,6 +1200,7 @@ async fn speculative_disposition_controls_consumer_admission() {
         },
         Speculated {
             question: "SPEC-KNOWN",
+            race: Race::Known,
             called: false,
             status: Skipped,
             speculation: "discarded",
@@ -1166,7 +1221,83 @@ async fn speculative_disposition_controls_consumer_admission() {
     );
     for case in cases {
         let question = case.question;
-        let result = desk.verify("speculative-review", question).await;
+        let compare = ["COMPARE:", question];
+        let reviewing = ["EXTRA:", question];
+        let bootstrap = ["BOOTSTRAP:", question];
+        match case.race {
+            Race::ActionFirst => held.hold(&compare),
+            Race::DecisionFirst => {
+                held.hold(&compare);
+                held.hold(&reviewing);
+            }
+            Race::Known => held.hold(&bootstrap),
+        }
+        let execution = desk.submit("speculative-review", json!(question)).await;
+        match case.race {
+            Race::ActionFirst => {
+                let settled = reached(&desk, execution, "extra", |invocation| {
+                    matches!(invocation.progress, InvocationProgress::Action { .. })
+                })
+                .await;
+                assert_eq!(
+                    (settled.progress, settled.speculation),
+                    (
+                        InvocationProgress::Action { status: Succeeded },
+                        Speculation::None
+                    ),
+                    "{question}: the extra review succeeds before any disposition is recorded"
+                );
+                held.release(&compare);
+            }
+            Race::DecisionFirst => {
+                desk.stalled_in("EXTRA:", question).await;
+                held.release(&compare);
+                let compared = reached(&desk, execution, "compare", |invocation| {
+                    matches!(invocation.progress, InvocationProgress::Action { .. })
+                })
+                .await;
+                assert_eq!(
+                    compared.progress,
+                    InvocationProgress::Action { status: Succeeded },
+                    "{question}: the comparison is accepted"
+                );
+                let running = if case.retained.is_some() {
+                    reached(&desk, execution, "extra", |_| true).await
+                } else {
+                    reached(&desk, execution, "extra", |invocation| {
+                        invocation.speculation != Speculation::None
+                    })
+                    .await
+                };
+                assert_eq!(
+                    (running.progress, running.speculation),
+                    (
+                        InvocationProgress::Started,
+                        case.retained
+                            .map_or(Speculation::Discarded, |_| Speculation::None)
+                    ),
+                    "{question}: the decision lands while the extra review runs"
+                );
+                held.release(&reviewing);
+            }
+            Race::Known => {
+                let compared = reached(&desk, execution, "compare", |invocation| {
+                    matches!(invocation.progress, InvocationProgress::Action { .. })
+                })
+                .await;
+                assert_eq!(
+                    compared.progress,
+                    InvocationProgress::Action { status: Succeeded },
+                    "{question}: the comparison is accepted before the bootstrap answers"
+                );
+                assert!(
+                    desk.asked("EXTRA:", question).await.is_empty(),
+                    "{question}: nothing calls the extra review before it is eligible"
+                );
+                held.release(&bootstrap);
+            }
+        }
+        let result = desk.settled(execution).await;
         assert_eq!(
             requirement(&result, "consolidated").outcome,
             RequirementOutcome::Passed,

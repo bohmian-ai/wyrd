@@ -30,6 +30,7 @@ use wyrd_server::query::scheduled::ScheduledQueryCaller;
 use wyrd_server::scribe_outbox::{ScribeOutbox, ScribeSink, ScribeWrite};
 use wyrd_server::verification::VerificationRuntime;
 use wyrd_server::verification::authority::SystemReadAuthority;
+use wyrd_server::verification::fault::PublicationFault;
 use wyrd_server::verification::hosted::HostedLimits;
 use wyrd_server::verification::hosted::blocks::{Execution, HostedBlocks};
 use wyrd_server::verification::hosted::evidence::TenantEvidence;
@@ -84,6 +85,8 @@ struct Leased {
     run: Arc<RunState>,
     /// The claimed execution's Verifier.
     verifier: CardUid,
+    /// The tenant's verification fixture, for submitting more work.
+    fixture: VerificationFixture,
 }
 
 impl Leased {
@@ -144,6 +147,7 @@ impl Leased {
             system,
             run,
             verifier: claimed.verifier_card_uid,
+            fixture,
         }
     }
 
@@ -2544,6 +2548,20 @@ async fn deliver_until(
     done: impl Fn(&BTreeMap<ExecutionId, chrono::DateTime<chrono::Utc>>) -> bool,
 ) {
     let (stop, task) = start_runtime(server);
+    owed_until(server, done).await;
+    stop.cancel();
+    task.await.expect("the runtime stops");
+}
+
+/// Wait until `done` holds of `server`'s owed deliveries, while a runtime
+/// the caller started delivers them.
+///
+/// # Panics
+/// Panics when `done` never holds within a minute.
+async fn owed_until(
+    server: &WyrdTestServer,
+    done: impl Fn(&BTreeMap<ExecutionId, chrono::DateTime<chrono::Utc>>) -> bool,
+) {
     let deadline = tokio::time::Instant::now() + std::time::Duration::from_mins(1);
     loop {
         let owed = owed(server).await;
@@ -2556,8 +2574,6 @@ async fn deliver_until(
         );
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
     }
-    stop.cancel();
-    task.await.expect("the runtime stops");
 }
 
 /// Spawn `server`'s verification runtime; returns its stop token and task.
@@ -2665,6 +2681,235 @@ async fn cancellation_reads_back_from_state_after_the_queue_and_cards_are_gone()
     let outsider = jwt(&leased.server, "cancel-outsider", &[]).await;
     let (status, body) = respond(&leased.server, &outsider, "GET", &execution.to_string()).await;
     assert_eq!(status, axum::http::StatusCode::FORBIDDEN, "{body}");
+    leased
+        .server
+        .shutdown()
+        .await
+        .expect("test server shuts down");
+}
+
+/// The table every execution state revision is written to.
+const EVENTS: &str = "bifrost.verification.execution_events";
+
+/// Which of a cancelled execution's two competing state writers Scribe
+/// admits first.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FirstWriter {
+    /// The worker's checkpoint, confirmed before the cancel.
+    Checkpoint,
+    /// The server's terminal delivery of the cancellation.
+    Delivery,
+}
+
+/// A cancellation racing a worker's checkpoint against the server's
+/// terminal delivery for the same execution stays retained in both arrival
+/// orders.
+///
+/// The worker confirms its live lease and freezes a checkpoint built on the
+/// accepted revision, which is held before Scribe; a user then cancels, and
+/// the runtime's delivery freezes the cancellation on that same revision and
+/// is held too. The delivery stays owed while unacknowledged. Releasing one
+/// writer and then the other forces each arrival order: the losing write is
+/// refused on its own, a refused delivery is delivered again on the newer
+/// revision, and a refused checkpoint is never accepted. Either way the
+/// state reads back cancelled with no result, the accepted report remains,
+/// the worker records nothing more, and an unrelated execution submitted
+/// while the delivery is held settles with no delivery owed.
+///
+/// # Panics
+/// Panics when a delivery retires before its acknowledgement or stays owed,
+/// the cancellation or accepted report is lost, a refused checkpoint is
+/// accepted, the cancelled worker records more work, a read returns a
+/// result, or the unrelated execution never settles.
+#[tokio::test(flavor = "multi_thread")]
+async fn cancellation_writer_race_preserves_terminal_delivery() {
+    for first in [FirstWriter::Checkpoint, FirstWriter::Delivery] {
+        cancellation_race(first).await;
+    }
+}
+
+/// One forced arrival order of
+/// [`cancellation_writer_race_preserves_terminal_delivery`].
+///
+/// # Panics
+/// Panics as that test does, naming `first`.
+async fn cancellation_race(first: FirstWriter) {
+    let leased = Leased::start().await;
+    let state = leased.server.state();
+    let tenant = leased.server.data_tenant_id();
+    let execution = leased.lease.execution_id;
+    let review = TaskId::new("review").expect("task");
+    let producer = Producer::plain(&review, 1);
+    leased
+        .run
+        .begin(&producer)
+        .await
+        .expect("the checkpoint is accepted");
+    Publications::new(
+        state,
+        &leased.publisher([]),
+        &leased.run,
+        HostedLimits::default(),
+    )
+    .json(&call("c1", &producer, "report"), json!({"v": 1}))
+    .await
+    .expect("the live lease publishes");
+
+    let held = Arc::new(HeldRevisions {
+        scribe: Arc::clone(
+            state
+                .bifrost_ingest()
+                .expect("the server runs Scribe")
+                .scribe(),
+        ) as _,
+        release: tokio::sync::Semaphore::new(0),
+        arrived: tokio::sync::Notify::new(),
+    });
+    let worker = leased
+        .reclaim_on(ScribeSink::local_outbox(
+            Arc::clone(&held) as _,
+            Some(state.postgres.wyrd().clone()),
+        ))
+        .await
+        .expect("the execution state claims");
+    let followup = Producer::plain(&TaskId::new("followup").expect("task"), 1);
+    let mut checkpoint = Box::pin(worker.begin(&followup));
+    tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        tokio::select! {
+            started = &mut checkpoint => panic!("{first:?}: returned while held: {started:?}"),
+            () = held.arrived.notified() => {}
+        }
+    })
+    .await
+    .expect("the checkpoint reaches Scribe");
+
+    let mut tx = leased
+        .server
+        .tenant_conn_for(tenant)
+        .await
+        .expect("tenant connection opens");
+    assert!(
+        VerifierExecutionQueue::default()
+            .cancel(&mut tx, execution)
+            .await
+            .expect("cancel runs")
+    );
+    tx.commit().await.expect("the cancel commits");
+
+    let fault = PublicationFault::default();
+    let delivery = fault.hold_next(EVENTS);
+    let runtime = VerificationRuntime::builder(state)
+        .publication_fault(fault)
+        .build()
+        .expect("the runtime composes");
+    let stop = CancellationToken::new();
+    let task = tokio::spawn(runtime.run(stop.clone()));
+    tokio::time::timeout(std::time::Duration::from_mins(1), delivery.arrived())
+        .await
+        .expect("the delivery reaches Scribe");
+    assert!(
+        owed(&leased.server).await.contains_key(&execution),
+        "{first:?}: an unacknowledged delivery stays owed"
+    );
+    let (bystander_subject, _) = leased.fixture.service("bystander").await.expect("service");
+    let bystander = leased
+        .fixture
+        .submit(&leased.verifier, &bystander_subject, BTreeMap::new())
+        .await
+        .expect("the unrelated execution is admitted");
+
+    let checkpointed = match first {
+        FirstWriter::Checkpoint => {
+            held.release
+                .add_permits(tokio::sync::Semaphore::MAX_PERMITS);
+            let checkpointed = checkpoint.await;
+            delivery.release();
+            checkpointed
+        }
+        FirstWriter::Delivery => {
+            delivery.release();
+            owed_until(&leased.server, |owed| !owed.contains_key(&execution)).await;
+            held.release
+                .add_permits(tokio::sync::Semaphore::MAX_PERMITS);
+            checkpoint.await
+        }
+    };
+    assert_eq!(
+        checkpointed.is_ok(),
+        first == FirstWriter::Checkpoint,
+        "{first:?}: only a checkpoint admitted first is accepted: {checkpointed:?}"
+    );
+    owed_until(&leased.server, BTreeMap::is_empty).await;
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_mins(1);
+    while ["queued", "running"].contains(
+        &leased
+            .fixture
+            .execution(bystander)
+            .await
+            .expect("the unrelated execution reads")
+            .status
+            .as_str(),
+    ) {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "{first:?}: the unrelated execution never settles"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    owed_until(&leased.server, BTreeMap::is_empty).await;
+    stop.cancel();
+    task.await.expect("the runtime stops");
+
+    let retained = leased.accepted().await;
+    let failure = retained
+        .failure
+        .clone()
+        .expect("the state holds the cancellation");
+    let mut expected = vec![("review".to_owned(), 1)];
+    if first == FirstWriter::Checkpoint {
+        expected.push(("followup".to_owned(), 1));
+    }
+    assert_eq!(
+        (
+            failure.status,
+            failure.error.code.as_str(),
+            retained.terminal.is_none(),
+            attempts(&retained),
+        ),
+        (
+            VerificationExecutionStatus::Cancelled,
+            "cancelled",
+            true,
+            expected
+        ),
+        "{first:?}"
+    );
+    assert_eq!(
+        leased.entries().await,
+        [("review".to_owned(), 1, "report".to_owned())],
+        "{first:?}: the accepted report remains"
+    );
+    worker
+        .begin(&Producer::plain(&TaskId::new("resumed").expect("task"), 1))
+        .await
+        .expect_err("the cancelled worker records nothing more");
+    let viewer = jwt(&leased.server, "race-reader", &["viewer"]).await;
+    let (status, body) = respond(&leased.server, &viewer, "GET", &execution.to_string()).await;
+    assert_eq!(
+        (
+            status,
+            body["status"].clone(),
+            body["error"]["code"].clone(),
+            body["result"].clone()
+        ),
+        (
+            axum::http::StatusCode::OK,
+            json!("cancelled"),
+            json!("cancelled"),
+            Value::Null
+        ),
+        "{first:?}: {body}"
+    );
     leased
         .server
         .shutdown()
@@ -3092,7 +3337,7 @@ impl Scribe for HeldRevisions {
     /// # Panics
     /// Panics when the release semaphore closes while a revision waits.
     async fn ingest_frame(&self, frame: ScribeIngressFrame) -> Result<FrameAdmission, ScribeError> {
-        if frame.table.fqn() == "bifrost.verification.execution_events" {
+        if frame.table.fqn() == EVENTS {
             self.arrived.notify_one();
             self.release
                 .acquire()

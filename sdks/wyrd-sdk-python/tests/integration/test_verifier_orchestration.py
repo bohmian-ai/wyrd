@@ -18,6 +18,9 @@ and turn, as the Rust journey's upstream does.
 from __future__ import annotations
 
 import json
+import threading
+import time
+from collections.abc import Callable
 from typing import Any
 
 import pytest
@@ -31,6 +34,7 @@ from .support import (
     FIXTURES,
     HOLD_ARRIVED,
     HOLD_RELEASED,
+    HOLDS,
     Receiver,
     client_of,
     declare,
@@ -185,17 +189,66 @@ def test_conditions_and_collections_preserve_missing_evidence(
     assert not asked(receiver, "CONSOLIDATE:", "CANCEL-HELD"), "cancelled work never resumes"
 
 
-SPECULATED: list[tuple[str, bool, str, str, list[str], list[str]]] = [
-    ("SPEC-ADMIT-LATE-DECISION", True, "succeeded", "admitted", ["account"], ["admitted"]),
-    ("SPEC-ADMIT-EARLY-DECISION", True, "succeeded", "admitted", ["account"], ["admitted"]),
-    ("SPEC-DISCARD-LATE-DECISION", True, "skipped", "discarded", [], ["discarded"]),
-    ("SPEC-DISCARD-EARLY-DECISION", True, "skipped", "discarded", [], []),
-    ("SPEC-BLOCK-LATE-DECISION", True, "failed", "blocked", [], ["blocked"]),
-    ("SPEC-KNOWN", False, "skipped", "discarded", [], []),
+SPECULATED: list[tuple[str, str, bool, str, str, list[str], list[str]]] = [
+    (
+        "SPEC-ADMIT-LATE-DECISION",
+        "action",
+        True,
+        "succeeded",
+        "admitted",
+        ["account"],
+        ["admitted"],
+    ),
+    (
+        "SPEC-ADMIT-EARLY-DECISION",
+        "decision",
+        True,
+        "succeeded",
+        "admitted",
+        ["account"],
+        ["admitted"],
+    ),
+    ("SPEC-DISCARD-LATE-DECISION", "action", True, "skipped", "discarded", [], ["discarded"]),
+    ("SPEC-DISCARD-EARLY-DECISION", "decision", True, "skipped", "discarded", [], []),
+    ("SPEC-BLOCK-LATE-DECISION", "action", True, "failed", "blocked", [], ["blocked"]),
+    ("SPEC-KNOWN", "known", False, "skipped", "discarded", [], []),
 ]
-"""Each ``speculative-review`` question beside whether the extra reviewer was called, the
-``extra`` step's status, the speculation and entry names of the consolidator's ``extra``
-manifest, and the speculation the execution's listing retains for the extra account."""
+"""Each ``speculative-review`` question beside the order its race is held in, whether the
+extra reviewer was called, the ``extra`` step's status, the speculation and entry names of the
+consolidator's ``extra`` manifest, and the speculation the execution's listing retains for the
+extra account. An ``action`` race answers the comparison once the extra review settled; a
+``decision`` race answers it once the extra review's request arrived, and the extra review
+once the comparison settled; a ``known`` race answers the bootstrap once the comparison
+settled."""
+
+
+def hold(fragment: str) -> threading.Event:
+    """Hold the local model's answer to every request carrying ``fragment``; the returned
+    event is set once one arrives."""
+    arrived = threading.Event()
+    HOLDS[fragment] = (arrived, threading.Event())
+    return arrived
+
+
+def release(fragment: str) -> None:
+    """Answer every request ``fragment`` held, and its later requests at once."""
+    if held := HOLDS.pop(fragment, None):
+        held[1].set()
+
+
+def reached(
+    execution: verify.Execution,
+    step_id: str,
+    accepts: Callable[[verify.ExecutionInvocation], bool],
+) -> None:
+    """Wait until ``execution`` lists an attempt of ``step_id`` that ``accepts`` accepts."""
+    deadline = time.monotonic() + WAIT_SECONDS
+    while not any(
+        each["producer"]["step_id"] == step_id and accepts(each)
+        for each in execution.invocations(limit=200)["items"]
+    ):
+        assert time.monotonic() < deadline, f"no {step_id} attempt reached the milestone"
+        time.sleep(0.05)
 
 
 def extra_speculation(execution: verify.Execution) -> list[str]:
@@ -214,8 +267,37 @@ def test_speculative_disposition_controls_consumer_admission(
             "speculation_reader", [{"resource": "verifier", "action": "read", "scope": "all"}]
         ),
     )
-    for question, called, status, speculation, names, retained in SPECULATED:
-        result = desk.run().observe.verify("speculative-review", question)
+    for question, race, called, status, speculation, names, retained in SPECULATED:
+        compare, reviewing, bootstrap = (
+            f"{marker} {question}" for marker in ("COMPARE:", "EXTRA:", "BOOTSTRAP:")
+        )
+        try:
+            held = {
+                "action": [compare],
+                "decision": [compare, reviewing],
+                "known": [bootstrap],
+            }[race]
+            arrived = {fragment: hold(fragment) for fragment in held}
+            submitted = desk.run().observe.submit("speculative-review", question)
+            assert isinstance(submitted, verify.Execution)
+            watched = verify.Execution.connect(submitted.id, admin)
+            if race == "action":
+                reached(watched, "extra", lambda each: each["state"] == "action")
+                release(compare)
+            elif race == "decision":
+                assert arrived[reviewing].wait(WAIT_SECONDS), f"{question}: no extra review"
+                release(compare)
+                reached(watched, "compare", lambda each: each["state"] == "action")
+                if not retained:
+                    reached(watched, "extra", lambda each: each["speculation"] == "discarded")
+                release(reviewing)
+            else:
+                reached(watched, "compare", lambda each: each["state"] == "action")
+                release(bootstrap)
+            result = watched.wait(WAIT_SECONDS)
+        finally:
+            for fragment in (compare, reviewing, bootstrap):
+                release(fragment)
         assert requirement(result, "consolidated")["outcome"] == "passed", question
         assert step(result, "extra")["status"] == status, question
         if called:

@@ -57,6 +57,11 @@ HOLD_ARRIVED = threading.Event()
 HOLD_RELEASED = threading.Event()
 """Set by the test to let the local model answer the held ``CANCEL-HELD`` generalist."""
 
+HOLDS: dict[str, tuple[threading.Event, threading.Event]] = {}
+"""The ``(arrived, released)`` events of each held ``speculative-review`` answer, by the
+prompt fragment that holds it: the local model sets ``arrived`` once a request carrying the
+fragment reaches it, and answers that request only once the test sets ``released``."""
+
 
 def read_text(read: dict[str, Any]) -> str:
     """The text of an ``fs.read`` result: its units' lines, joined by newlines."""

@@ -33,6 +33,7 @@ from .support import (
     FRAME_CLAIM,
     HOLD_ARRIVED,
     HOLD_RELEASED,
+    HOLDS,
     LIVE_REVIEW,
     ON_CALL_TOKEN,
     REPORT,
@@ -387,14 +388,6 @@ PLANS = (
 """The planner's decision for the first question marker its prompt carries."""
 
 
-HELD_SECONDS = 3.0
-"""How long a held reply waits, so the other side of a speculative race settles first."""
-
-BRIEF_SECONDS = 1.0
-"""How long an early decision waits, so the bootstrap it races settles first while a held
-extra review is still running."""
-
-
 def answer(value: object) -> dict:
     """A final answer carrying ``value`` as JSON."""
     return {"role": "assistant", "content": json.dumps(value)}
@@ -409,9 +402,8 @@ def orchestration_turn(text: str, messages: list[dict]) -> dict | None:
     publishes a partial draft and then breaks, the consolidator reads every
     collection's manifest, and the quoter reads the security account. The
     ``CANCEL-HELD`` generalist holds its reply until the test releases it.
-    A ``LATE-DECISION`` comparison and a ``KNOWN`` bootstrap hold their
-    replies; an ``EARLY-DECISION`` comparison waits briefly while its extra
-    review holds its first turn longer. A section reviewer publishes its
+    The bootstrap, the comparison, and the extra review answer once no
+    entry of ``HOLDS`` matching their request is held. A section reviewer publishes its
     section and index, the polisher scores each section by its round, the
     escalation publishes a note and then breaks, the summarizer reads both
     collections, publishes a summary, and scores it by its iteration index,
@@ -419,6 +411,10 @@ def orchestration_turn(text: str, messages: list[dict]) -> dict | None:
     """
     turn = sum(1 for each in messages if each.get("role") == "assistant")
     prompt = prompt_of(messages)
+    for fragment, (arrived, released) in list(HOLDS.items()):
+        if fragment in text:
+            arrived.set()
+            released.wait(300)
     if "CONSOLIDATE:" in text:
         if turn:
             return DONE
@@ -442,21 +438,13 @@ def orchestration_turn(text: str, messages: list[dict]) -> dict | None:
             return None
         return calls(("s-draft", "publish", {"name": "draft", "value": {"partial": True}}))
     if "BOOTSTRAP:" in text:
-        if "KNOWN" in text:
-            time.sleep(HELD_SECONDS)
         return answer({"done": True})
     if "COMPARE:" in text:
         agree = False if "ADMIT" in text else None if "BLOCK" in text else True
-        if "LATE-DECISION" in text:
-            time.sleep(HELD_SECONDS)
-        elif "EARLY-DECISION" in text:
-            time.sleep(BRIEF_SECONDS)
         return answer({"agree": agree})
     if "EXTRA:" in text:
         if turn:
             return DONE
-        if "EARLY-DECISION" in text:
-            time.sleep(HELD_SECONDS)
         return calls(("e-publish", "publish", {"name": "account", "value": {"extra": True}}))
     if "SECTION:" in text:
         found = re.search(r"SECTION: (.*?) at=(\d+)", prompt)

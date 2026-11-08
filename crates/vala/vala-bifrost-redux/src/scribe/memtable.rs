@@ -159,8 +159,9 @@ pub(crate) struct PressureCandidate {
 ///
 /// # Errors
 ///
-/// Returns an invariant error when a caller reuses a retained batch ID for a
-/// different schema/data, length, slice ordinal, or complete slice count.
+/// Returns [`ScribeError::BatchConflict`] when a caller reuses a retained
+/// batch ID for a different schema/data, length, slice ordinal, or complete
+/// slice count.
 fn retained_identity_rows(
     meta: &ScribeAppendMeta,
     identity: crate::scribe::wal::ScribeAppendPayloadIdentity,
@@ -171,10 +172,7 @@ fn retained_identity_rows(
         || meta.slice_index != identity.slice_index
         || meta.slice_count != identity.slice_count
     {
-        return Err(ScribeError::Internal {
-            detail: "retained Scribe batch ID was reused with contradictory payload identity"
-                .to_owned(),
-        });
+        return Err(ScribeError::BatchConflict);
     }
     Ok(Some(u64::try_from(meta.rows_accepted).unwrap_or(u64::MAX)))
 }
@@ -422,6 +420,12 @@ impl Memtable {
     /// The lookup is the runtime idempotency index. It is intentionally
     /// derived from the bounded buckets instead of maintaining a process-wide
     /// append-ID set whose memory would grow with the lifetime of a shard.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ScribeError::BatchConflict`] when the retained batch holds
+    /// this ID with a different payload identity, and [`ScribeError::Internal`]
+    /// when a memtable lock is poisoned.
     pub(crate) fn retained_batch_rows(
         &self,
         seal_key: &SealKey,

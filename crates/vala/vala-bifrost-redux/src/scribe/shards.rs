@@ -4226,6 +4226,22 @@ impl ShardOwner {
                 memory.transfer_category(MemoryCategory::Prepared)?;
             }
             let batch_id = *append.batch_id.as_bytes();
+            match self.contradicts_retained(append) {
+                Ok(false) => {}
+                Ok(true) => {
+                    Self::refuse_conflict(append);
+                    let PreparedSliceSet::Materialized(slices) = &mut append.slices;
+                    slices.clear();
+                    continue;
+                }
+                Err(error) => {
+                    if let Err(cleanup_error) = self.release_active_reservations(&durable) {
+                        tracing::error!(error = %cleanup_error, "active cleanup failed after row lookup error");
+                    }
+                    Self::notify_prepared_error(&mut prepared, &error);
+                    return Err(error);
+                }
+            }
             let mut writes_records = false;
             loop {
                 let Some(slice) = Self::next_prepared_slice(append) else {
@@ -4457,6 +4473,30 @@ impl ShardOwner {
     ///
     /// Slices are fully materialized before the append reaches the shard, so
     /// this only pops the next one; `None` means the append has no slices left.
+    /// Reports whether a retained batch already holds this append's batch id
+    /// with a different payload.
+    ///
+    /// `write_group` asks before staging any slice, so a contradictory append
+    /// is refused whole and writes nothing while the rest of its group
+    /// commits.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ScribeError`] when a slice's payload identity cannot be read
+    /// or a memtable lock is poisoned.
+    fn contradicts_retained(&self, append: &PreparedAppend) -> Result<bool, ScribeError> {
+        let PreparedSliceSet::Materialized(slices) = &append.slices;
+        for slice in slices {
+            let identity = slice.wal_append.payload_identity()?;
+            match self.memtable.retained_batch_rows(&slice.seal_key, identity) {
+                Ok(_) => {}
+                Err(ScribeError::BatchConflict) => return Ok(true),
+                Err(error) => return Err(error),
+            }
+        }
+        Ok(false)
+    }
+
     fn next_prepared_slice(append: &mut PreparedAppend) -> Option<PreparedSlice> {
         match &mut append.slices {
             PreparedSliceSet::Materialized(slices) => {
@@ -8138,6 +8178,79 @@ mod tests {
 
         assert_eq!(owner.wal_io.write_submissions_for_test(), 2);
         assert_eq!(owner.wal_io.sync_submissions_for_test(), 1);
+    }
+
+    /// A retained batch ID reused with other rows refuses only that batch.
+    ///
+    /// The contradictory copy learns [`ScribeError::BatchConflict`] and
+    /// writes nothing, while the unrelated batch grouped beside it commits,
+    /// so one writer's contradiction never fails or stalls its neighbours.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the isolated owner cannot be built, a group fails, an ACK is
+    /// missing or wrong, or the contradictory rows become visible.
+    #[tokio::test]
+    async fn contradictory_retained_batch_refuses_only_itself() {
+        let wal_root = tempfile::tempdir().expect("WAL directory");
+        let node = crate::scribe::stream_identity::NodeId::generate();
+        let stream = StreamIdentity::new(node, crate::scribe::stream_identity::WriterEpoch::new(1));
+        let wal = Arc::new(
+            WalWriter::new(
+                wal_root.path(),
+                *node.as_bytes(),
+                1,
+                crate::scribe::wal::WalConfig::default(),
+            )
+            .expect("WAL writer"),
+        );
+        let wal_handle = wal.handle_for_shard(0).expect("WAL handle");
+        let (mut owner, budget) =
+            owner_for_completion_test_with_budget(Memtable::new(), &wal, wal_handle, stream);
+        let key = owner_key();
+        let reused = uuid::Uuid::now_v7();
+        owner
+            .process_group(vec![prepared_append_for_key(&budget, key.clone(), reused)])
+            .await
+            .expect("original commits");
+        let original = owner_prepared_batch();
+        let other_rows = RecordBatch::try_new(
+            original.schema(),
+            vec![
+                Arc::new(Int64Array::from(vec![2_i64])),
+                Arc::clone(original.column(1)),
+            ],
+        )
+        .expect("contradictory rows");
+        let mut contradictory = prepared_append_with_rows(&budget, key.clone(), reused, other_rows);
+        let (conflict_tx, conflict_rx) = tokio::sync::oneshot::channel();
+        contradictory.durable_ack = Some(conflict_tx);
+        let mut neighbour = prepared_append_for_key(&budget, key, uuid::Uuid::now_v7());
+        let (neighbour_tx, neighbour_rx) = tokio::sync::oneshot::channel();
+        neighbour.durable_ack = Some(neighbour_tx);
+        let writes = owner.wal_io.write_submissions_for_test();
+
+        owner
+            .process_group(vec![contradictory, neighbour])
+            .await
+            .expect("the neighbour's group commits");
+
+        assert!(matches!(
+            conflict_rx.await.expect("conflict delivered"),
+            Err(ScribeError::BatchConflict)
+        ));
+        assert!(
+            neighbour_rx
+                .await
+                .expect("neighbour ACK delivered")
+                .expect("neighbour commits")
+                .first_commit
+        );
+        assert_eq!(owner.wal_io.write_submissions_for_test(), writes + 2);
+        let visible = owner.memtable.stats().expect("query-visible rows");
+        assert_eq!(visible.writable_rows + visible.immutable_rows, 2);
+        assert_eq!(budget.category_bytes(MemoryCategory::Prepared), 0);
+        assert_eq!(budget.category_bytes(MemoryCategory::Raw), 0);
     }
 
     /// A batch resent while its original is still queued commits once.

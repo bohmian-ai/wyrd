@@ -603,7 +603,8 @@ async fn failure_after_fsync_before_ack_reuses_stable_batch_once() {
 }
 
 #[tokio::test]
-/// A reused batch ID with different payload identity fails before WAL mutation.
+/// A reused batch ID with different payload identity is a batch conflict
+/// refused before WAL mutation.
 async fn contradictory_batch_retry_is_rejected_before_second_wal_append() {
     let wal_root = tempfile::tempdir().expect("WAL directory");
     let node = NodeId::new(Uuid::now_v7());
@@ -618,7 +619,7 @@ async fn contradictory_batch_retry_is_rejected_before_second_wal_append() {
     let error = ingest_value(&scribe, tenant, "contradictory_retry", batch_id, 8)
         .await
         .expect_err("contradictory retry must not acknowledge");
-    assert!(error.to_string().contains("contradictory payload identity"));
+    assert!(matches!(error, ScribeError::BatchConflict), "{error:?}");
     assert_eq!(
         crate::scribe::wal::wal_file_bytes_for_test(wal.base_dir()),
         wal_bytes_before

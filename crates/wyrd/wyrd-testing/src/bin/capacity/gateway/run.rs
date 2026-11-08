@@ -33,7 +33,7 @@ use wyrd_testing::experiment::{ExperimentError, Phase, Reading, Repetition, Step
 use wyrd_testing::gateway_capture::{PacedUpstream, Pacing};
 use wyrd_testing::release_server::{LocalServer, Metrics};
 
-use crate::gateway::capacity::{Schedule, open_loop};
+use crate::gateway::capacity::{MISS_AFTER, Schedule, open_loop};
 use crate::gateway::workload::{
     CapturePolicy, Outcome, PREFIXES, Shape, Tenant, Timed, call, http,
 };
@@ -412,6 +412,11 @@ impl Observed {
         );
         repetition.set("drain_s", Reading::exact(self.drain.seconds));
         repetition.set("undrained", Reading::exact(self.drain.remaining));
+        if !samples.errors.is_empty() {
+            repetition
+                .observations
+                .push(format!("errors by outcome: {:?}", samples.errors));
+        }
         if samples.arrivals == 0 {
             repetition
                 .invalid
@@ -717,7 +722,13 @@ async fn paced(
     let samples = Arc::new(Mutex::new(Samples::default()));
     let calls = Mutex::new(JoinSet::new());
     let start = Instant::now();
-    let schedule = Schedule::new(vec![(rate, stop.saturating_duration_since(start))]);
+    // The scheduler drops an arrival that wakes at or after its schedule's
+    // end, and timers fire on whole milliseconds, so an arrivals-free tail
+    // lets the window's last arrivals wake in time; only a real miss counts.
+    let schedule = Schedule::new(vec![
+        (rate, stop.saturating_duration_since(start)),
+        (0.0, MISS_AFTER),
+    ]);
     let slots = Arc::new(Semaphore::new(clients));
     let start = tokio::time::Instant::from_std(start);
     let driven = open_loop(&schedule, start, slots, clients, &calls, |_| {
@@ -948,8 +959,12 @@ mod tests {
         ] {
             assert_eq!(exact(&broken.reading(id)), Some(value), "{id}");
         }
-        assert_eq!(broken.observations.len(), 2, "{:?}", broken.observations);
-        assert!(broken.observations[1].starts_with("capture saturated"));
+        assert_eq!(broken.observations.len(), 3, "{:?}", broken.observations);
+        assert_eq!(
+            broken.observations[1],
+            r#"errors by outcome: {"timed_out": 2}"#
+        );
+        assert!(broken.observations[2].starts_with("capture saturated"));
 
         let mut reset = observed(false, 1_000, 2_000_000, 5, 400_000);
         reset.integrity.reset = true;

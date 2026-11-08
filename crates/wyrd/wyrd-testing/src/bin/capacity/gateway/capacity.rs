@@ -1264,8 +1264,9 @@ mod tests {
     }
 
     /// Open-loop arrivals keep the offered rate whatever responses do,
-    /// count a stalled driver's late arrivals missed instead of bursting
-    /// them, count arrivals over the in-flight bound capped, and spread
+    /// plan nothing in an arrivals-free tail, count a stalled driver's late
+    /// arrivals missed instead of bursting them, count arrivals over the
+    /// in-flight bound capped, and spread
     /// contention 70/10/10/10 with both modes per tenant.
     ///
     /// # Panics
@@ -1281,6 +1282,12 @@ mod tests {
         assert_eq!(planned.len(), 200);
         assert_eq!(planned[100].offset, Duration::from_secs(1));
         assert_eq!(planned[101].offset, Duration::from_millis(1_020));
+        let tailed = Schedule::new(vec![
+            (100.0, Duration::from_secs(1)),
+            (0.0, Duration::from_millis(20)),
+        ])
+        .planned();
+        assert_eq!(tailed.len(), 100, "an arrivals-free tail plans nothing");
 
         let split: Vec<(usize, bool)> = (0..1_000).map(contention).collect();
         for (tenant, share) in [(0, 700), (1, 100), (2, 100), (3, 100)] {

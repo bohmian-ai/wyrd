@@ -348,27 +348,27 @@ impl LocalServer {
         self.root.path().join("storage")
     }
 
-    /// Scrapes `/metrics` and parses the Prometheus text exposition.
+    /// The standard counters, gauges, and histogram counts of one benchmark
+    /// snapshot ([`Self::timings`]), keyed as series: the benchmark server
+    /// runs no Prometheus recorder or exposition.
     ///
     /// # Errors
     ///
-    /// Returns an error when the endpoint does not answer 200.
+    /// Returns an error when the snapshot cannot be read.
     pub async fn metrics(&self) -> Result<Metrics> {
-        let url = format!("http://127.0.0.1:{METRICS_PORT}/metrics");
-        let response = reqwest::get(url).await?.error_for_status()?;
-        Ok(Metrics::parse(&response.text().await?))
+        Ok(Metrics::of_snapshot(&self.timings().await?))
     }
 
-    /// Reads the server's cumulative benchmark timing snapshot from the
-    /// loopback metrics listener, which serving enables unless the caller's
-    /// environment turned it off.
+    /// Reads the server's cumulative benchmark snapshot, its timings and
+    /// standard metrics, from the loopback metrics listener of the benchmark
+    /// recorder that serving installs.
     ///
     /// # Errors
     ///
     /// Returns an error when the endpoint does not answer 200 with a
     /// snapshot.
-    pub async fn timings(&self) -> Result<wyrd_telemetry::timing::TimingSnapshot> {
-        let url = format!("http://127.0.0.1:{METRICS_PORT}/benchmark/timings");
+    pub async fn timings(&self) -> Result<wyrd_benchmark::BenchmarkSnapshot> {
+        let url = format!("http://127.0.0.1:{METRICS_PORT}/benchmark/snapshot");
         Ok(reqwest::get(url).await?.error_for_status()?.json().await?)
     }
 
@@ -497,10 +497,103 @@ impl Drop for LocalServer {
     }
 }
 
-/// One `/metrics` scrape: every series and its value.
+/// Per-bound increase between two cumulative bucket readings; a bound absent
+/// from `before` counts from zero.
+fn deltas(before: &[(f64, f64)], after: &[(f64, f64)]) -> Vec<(f64, f64)> {
+    let prior = |bound: f64| {
+        before
+            .iter()
+            .find(|(b, _)| b.to_bits() == bound.to_bits())
+            .map_or(0.0, |(_, count)| *count)
+    };
+    after
+        .iter()
+        .map(|(bound, count)| (*bound, count - prior(*bound)))
+        .collect()
+}
+
+/// A production Prometheus histogram, used by metrics contract tests.
+/// Benchmark latency distributions live in `wyrd-benchmark`.
+#[derive(Debug, Default, Clone)]
+pub struct Histogram {
+    /// Cumulative `le` buckets.
+    pub buckets: Vec<(f64, f64)>,
+    /// Observed seconds.
+    pub sum: f64,
+    /// Observations.
+    pub count: f64,
+}
+
+impl Histogram {
+    /// The histogram of every `family` series whose labels contain each of
+    /// `labels` in one scrape, summed across those series.
+    #[must_use]
+    pub fn read(metrics: &Metrics, family: &str, labels: &[&str]) -> Self {
+        Self {
+            buckets: metrics.buckets(family, labels),
+            sum: metrics.sum(&format!("{family}_sum"), labels),
+            count: metrics.sum(&format!("{family}_count"), labels),
+        }
+    }
+
+    /// The observations `after` added to `self`; a bucket bound or series
+    /// absent from `self` counts from zero.
+    #[must_use]
+    pub fn since(&self, after: &Self) -> Self {
+        Self {
+            buckets: deltas(&self.buckets, &after.buckets),
+            sum: after.sum - self.sum,
+            count: after.count - self.count,
+        }
+    }
+
+    /// Exact mean, seconds, from `_sum` / `_count`, or `None` without
+    /// observations.
+    #[must_use]
+    pub fn mean(&self) -> Option<f64> {
+        (self.count > 0.0).then(|| self.sum / self.count)
+    }
+}
+
+/// Every series of one read and its value: a production `/metrics`
+/// exposition, or a benchmark snapshot's standard metrics.
 pub struct Metrics(BTreeMap<String, f64>);
 
 impl Metrics {
+    /// The standard metrics of a benchmark `snapshot` as series: each
+    /// counter's total, each gauge's value, and each histogram's
+    /// observation count as `<family>_count`, labelled as Prometheus names
+    /// them. Histogram distributions are read from the snapshot itself.
+    #[must_use]
+    pub fn of_snapshot(snapshot: &wyrd_benchmark::BenchmarkSnapshot) -> Self {
+        Self(
+            snapshot
+                .metrics
+                .iter()
+                .map(|metric| {
+                    let (suffix, value) = match &metric.value {
+                        wyrd_benchmark::MetricValue::Counter { total } => ("", *total as f64),
+                        wyrd_benchmark::MetricValue::Gauge { value, .. } => ("", *value),
+                        wyrd_benchmark::MetricValue::Histogram { count, .. } => {
+                            ("_count", *count as f64)
+                        }
+                    };
+                    let labels: Vec<String> = metric
+                        .labels
+                        .iter()
+                        .map(|(label, value)| format!("{label}=\"{value}\""))
+                        .collect();
+                    let series = if labels.is_empty() {
+                        format!("{}{suffix}", metric.name)
+                    } else {
+                        format!("{}{suffix}{{{}}}", metric.name, labels.join(","))
+                    };
+                    (series, value)
+                })
+                .collect(),
+        )
+    }
+
     /// Parses a Prometheus text exposition, skipping comments. Scrapes come
     /// from [`LocalServer::metrics`]; tests of scrape consumers build one
     /// from literal text.

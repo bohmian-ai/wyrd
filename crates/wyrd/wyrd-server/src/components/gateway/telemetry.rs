@@ -176,11 +176,11 @@ impl CallTelemetry {
     /// time under `upstream_point`, and their difference at handoff `point`;
     /// nothing without an arrival.
     ///
-    /// The same duration and provider wait are also recorded through
-    /// [`wyrd_telemetry::record_timing`] under the current span's benchmark
-    /// classification, at boundary `gateway.buffered`,
-    /// `gateway.stream.head`, or `gateway.stream.end`; the benchmark
-    /// histograms keep each call's residual beside both.
+    /// While benchmarking, the duration and provider wait are recorded
+    /// instead through [`wyrd_benchmark::record_timing`] under the current
+    /// span's benchmark classification, at boundary `gateway.buffered`,
+    /// `gateway.stream.head`, or `gateway.stream.end`, so each is counted
+    /// once; the benchmark histograms keep each call's residual beside both.
     fn point(
         &self,
         point: &'static str,
@@ -195,7 +195,7 @@ impl CallTelemetry {
         let duration = at.saturating_duration_since(arrival);
         let stream = if self.stream { "true" } else { "false" };
         let outcome = outcome_name(outcome);
-        wyrd_telemetry::record_timing(
+        wyrd_benchmark::record_timing(
             &tracing::Span::current(),
             match (self.stream, point) {
                 (false, _) => "gateway.buffered",
@@ -206,6 +206,9 @@ impl CallTelemetry {
             duration,
             Some(upstream),
         );
+        if wyrd_benchmark::enabled() {
+            return;
+        }
         metrics::histogram!(
             GATEWAY_DURATION_SECONDS,
             "operation" => self.operation,
@@ -237,18 +240,20 @@ mod tests {
     //! Proof of the handoff boundaries' benchmark histogram observations.
 
     use super::*;
-    use wyrd_telemetry::timing;
+    use wyrd_benchmark as timing;
 
     /// A stream records its head and its final frame as separate
     /// observations, each with its own provider wait and residual; a
     /// buffered call whose wait exceeds its time is a negative residual,
-    /// never a clamped zero; a call without an arrival records nothing.
+    /// never a clamped zero; a call without an arrival records nothing; no
+    /// production duration histogram counts a timed handoff again.
     ///
     /// # Panics
-    /// Panics when a boundary, count, wait, or residual is wrong.
+    /// Panics when a boundary, count, wait, or residual is wrong, or a
+    /// production histogram repeats a handoff.
     #[test]
     fn histograms_preserve_head_and_final_overhead() {
-        timing::enable();
+        timing::install().expect("the benchmark recorder installs");
         let before = timing::snapshot();
         let arrival = Instant::now()
             .checked_sub(Duration::from_millis(300))
@@ -300,5 +305,15 @@ mod tests {
             3,
             "an unarrived call records nothing"
         );
+        for family in [
+            GATEWAY_DURATION_SECONDS,
+            GATEWAY_OVERHEAD_SECONDS,
+            GATEWAY_UPSTREAM_SECONDS,
+        ] {
+            assert!(
+                interval.histogram(family, &[]).is_err(),
+                "{family} would count a timed handoff twice"
+            );
+        }
     }
 }

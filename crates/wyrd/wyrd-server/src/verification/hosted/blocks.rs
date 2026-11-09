@@ -323,16 +323,17 @@ mod tests {
     /// 100, and whose residual is the execution less that union; its
     /// engine phase lands as one `verification.direct.engine` part holding
     /// the run, and the time outside every phase as one
-    /// `verification.direct.outside` part.
+    /// `verification.direct.outside` part; no production duration histogram
+    /// counts the execution a second time.
     ///
     /// # Panics
-    /// Panics when the run fails or the histogram observation, wait,
-    /// residual, or parts are wrong.
+    /// Panics when the run fails, the histogram observation, wait,
+    /// residual, or parts are wrong, or a production histogram repeats it.
     #[tokio::test]
     async fn histogram_overhead_excludes_real_overlapping_blocks() {
-        use wyrd_telemetry::timing;
+        use wyrd_benchmark as timing;
 
-        timing::enable();
+        timing::install().expect("the benchmark recorder installs");
         let before = timing::snapshot();
         let telemetry = ExecutionTelemetry::start(ExecutionMode::Direct, None);
         let blocks = Arc::new(Slow);
@@ -406,6 +407,17 @@ mod tests {
         assert!(phase >= lowest, "the engine phase holds the run");
         let (_, outside) = ms(Some(&interval.series[2].elapsed));
         assert!(outside < 25, "nothing ran outside the engine: {outside} ms");
+        for family in [
+            crate::app::metrics::VERIFICATION_PHASE_DURATION_SECONDS,
+            crate::app::metrics::VERIFICATION_VERIFIER_SECONDS,
+            crate::app::metrics::VERIFICATION_OVERHEAD_SECONDS,
+            crate::app::metrics::VERIFICATION_RUN_DURATION_SECONDS,
+        ] {
+            assert!(
+                interval.histogram(family, &[]).is_err(),
+                "{family} would count the timed execution twice"
+            );
+        }
     }
 }
 

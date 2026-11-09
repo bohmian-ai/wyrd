@@ -13,6 +13,7 @@ default = []
 test-support = []
 
 [dependencies]
+http = { workspace = true }
 serde = { workspace = true, features = ["derive"] }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
@@ -23,9 +24,6 @@ opentelemetry_sdk = { workspace = true }
 opentelemetry-otlp = { workspace = true }
 opentelemetry-proto = { workspace = true }
 tracing-opentelemetry = { workspace = true }
-http = { workspace = true }
-hdrhistogram = { workspace = true }
-num-traits = { workspace = true }
 metrics = { workspace = true }
 ulid = { workspace = true }
 wyrd-tls = { workspace = true }

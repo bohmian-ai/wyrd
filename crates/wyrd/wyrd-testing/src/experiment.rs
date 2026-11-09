@@ -1184,7 +1184,7 @@ impl Reading {
     /// divided by `per`, as the [`Self::bounded`] interval of its bucket,
     /// with the sample count and rank; missing without samples.
     #[must_use]
-    pub fn quantile(distribution: &wyrd_telemetry::timing::Distribution, q: f64, per: f64) -> Self {
+    pub fn quantile(distribution: &wyrd_benchmark::Distribution, q: f64, per: f64) -> Self {
         distribution.quantile(q).map_or_else(
             || Self::missing("no successful sample"),
             |bucket| Self {
@@ -1382,9 +1382,9 @@ pub struct TimingEvidence {
     /// The window's name within its repetition, such as `measured`.
     pub window: String,
     /// The snapshot at the window's open.
-    pub before: wyrd_telemetry::timing::TimingSnapshot,
+    pub before: wyrd_benchmark::BenchmarkSnapshot,
     /// The snapshot once the window's cohort drained.
-    pub after: wyrd_telemetry::timing::TimingSnapshot,
+    pub after: wyrd_benchmark::BenchmarkSnapshot,
     /// The window's expected and recorded observations.
     pub reconciliation: Vec<Reconciled>,
 }
@@ -1485,7 +1485,7 @@ pub enum Phase {
 impl Phase {
     /// The closed benchmark phase label a driver sends with every request
     /// it admits in this phase; a repetition beyond the declared labels is
-    /// [`wyrd_telemetry::timing::INVALID`], which the server counts.
+    /// [`wyrd_benchmark::INVALID`], which the server counts.
     #[must_use]
     pub const fn label(self) -> &'static str {
         match self {
@@ -1493,7 +1493,7 @@ impl Phase {
             Self::Repetition(0) => "repetition-1",
             Self::Repetition(1) => "repetition-2",
             Self::Repetition(2) => "repetition-3",
-            Self::Repetition(_) => wyrd_telemetry::timing::INVALID,
+            Self::Repetition(_) => wyrd_benchmark::INVALID,
         }
     }
 }
@@ -2992,7 +2992,8 @@ mod tests {
         Invocation, Level, Metric, Mode, Op, Options, Outcome, Phase, REPORT_HEADER, Reading,
         Record, Repetition, Source, Status, Step, Validity, Verdict, Workload, run,
     };
-    use crate::capacity::{Histogram, Population, UNLABELLED};
+    use crate::capacity::{Population, UNLABELLED};
+    use crate::release_server::Histogram;
     use crate::release_server::HostLoad;
 
     /// A quiet host sample.
@@ -4036,13 +4037,13 @@ mod tests {
                 .contains("provisioned vCPUs")
         );
 
-        wyrd_telemetry::timing::enable();
+        wyrd_benchmark::install().expect("the benchmark recorder installs");
         let verifier = 2_000_000;
         let window = |requests: &[(u64, Option<u64>)], expected: u64| {
-            let before = wyrd_telemetry::timing::snapshot();
+            let before = wyrd_benchmark::snapshot();
             let request = tracing::Span::none();
             for (elapsed, excluded) in requests {
-                wyrd_telemetry::record_timing(
+                wyrd_benchmark::record_timing(
                     &request,
                     "verification.direct",
                     "completed",
@@ -4050,7 +4051,7 @@ mod tests {
                     excluded.map(std::time::Duration::from_nanos),
                 );
             }
-            let interval = wyrd_telemetry::timing::snapshot()
+            let interval = wyrd_benchmark::snapshot()
                 .since(&before)
                 .expect("one process");
             let mut population = Population::from_interval(interval);
@@ -4120,15 +4121,15 @@ mod tests {
         );
         let mut zero = Repetition::default();
         Population::from_interval({
-            let before = wyrd_telemetry::timing::snapshot();
-            wyrd_telemetry::record_timing(
+            let before = wyrd_benchmark::snapshot();
+            wyrd_benchmark::record_timing(
                 &tracing::Span::none(),
                 "verification.direct",
                 "completed",
                 std::time::Duration::ZERO,
                 Some(std::time::Duration::ZERO),
             );
-            wyrd_telemetry::timing::snapshot()
+            wyrd_benchmark::snapshot()
                 .since(&before)
                 .expect("one process")
         })
@@ -4153,7 +4154,7 @@ mod tests {
             extra.invalid
         );
         let mut overflowed = samples(1_000);
-        overflowed[0].0 = wyrd_telemetry::timing::HIGHEST_NS * 2;
+        overflowed[0].0 = wyrd_benchmark::HIGHEST_NS * 2;
         let overflowed = window(&overflowed, 100);
         assert!(
             overflowed
@@ -4690,11 +4691,11 @@ mod tests {
     #[test]
     fn histogram_cohorts_preserve_measurement_and_drain_windows() {
         use crate::capacity::{Population, UNLABELLED};
-        use wyrd_telemetry::timing;
+        use wyrd_benchmark as timing;
 
-        timing::enable();
+        timing::install().expect("the benchmark recorder installs");
         let record = |micros: u64| {
-            wyrd_telemetry::record_timing(
+            wyrd_benchmark::record_timing(
                 &tracing::Span::none(),
                 "bifrost.query",
                 "success",
@@ -4711,7 +4712,7 @@ mod tests {
         let closed = timing::snapshot();
         record(900_000);
         let drained = timing::snapshot();
-        let window = |after: &timing::TimingSnapshot| {
+        let window = |after: &timing::BenchmarkSnapshot| {
             Population::from_interval(after.since(&before).expect("one process"))
         };
         let (measured, mut cohort) = (window(&closed), window(&drained));
@@ -4755,12 +4756,12 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn kept_timing_evidence_rebuilds_judged_readings() {
         use crate::capacity::{Expected, Population, UNLABELLED};
-        use wyrd_telemetry::timing;
+        use wyrd_benchmark as timing;
 
-        timing::enable();
+        timing::install().expect("the benchmark recorder installs");
         let before = timing::snapshot();
         for (micros, outcome) in [(100, "success"), (300, "success"), (900, "error")] {
-            wyrd_telemetry::record_timing(
+            wyrd_benchmark::record_timing(
                 &tracing::Span::none(),
                 "bifrost.query",
                 outcome,
@@ -4770,7 +4771,7 @@ mod tests {
         }
         let after = timing::snapshot();
         let judged = [("p50_ms", 0.5), ("p95_ms", 0.95), ("p99_ms", 0.99)];
-        let reduce = |before: &timing::TimingSnapshot, after: timing::TimingSnapshot| {
+        let reduce = |before: &timing::BenchmarkSnapshot, after: timing::BenchmarkSnapshot| {
             let mut population = Population::between(before, after).expect("one process");
             population.expect(&[Expected {
                 boundary: "bifrost.query",

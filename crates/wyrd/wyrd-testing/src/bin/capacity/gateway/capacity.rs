@@ -35,7 +35,7 @@ use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
 use wyrd_client::transport::trace::with_benchmark_labels;
 use wyrd_testing::capacity::{
-    Expected, NANOS_PER_MS, Percentiles, Population, Selection, Usage, Window, release_binary,
+    Expected, NANOS_PER_MS, Percentiles, Population, Usage, Window, release_binary,
 };
 use wyrd_testing::experiment::{
     Arrivals, ExperimentError, Phase, Reading, Repetition, Step, Workload,
@@ -1001,7 +1001,7 @@ impl Capacity {
         let slots = Arc::new(Semaphore::new(MAX_IN_FLIGHT));
         let stop = CancellationToken::new();
         let timings = server.timings().await?;
-        let (traffic, baseline) = Window::open(server, Selection::RESOURCES).await?;
+        let (traffic, baseline) = Window::open(server).await?;
         let start = Instant::now() + LEAD;
         let label = format!("{}-{phase:?}", step.id);
         let driving = async {
@@ -1171,7 +1171,7 @@ mod tests {
     use tokio::sync::Semaphore;
     use tokio::task::JoinSet;
     use tokio::time::Instant;
-    use wyrd_telemetry::timing::{Distribution, IntervalSeries};
+    use wyrd_benchmark::{Distribution, IntervalSeries};
     use wyrd_testing::capacity::{Population, UNLABELLED, Usage};
     use wyrd_testing::experiment::Reading;
 

@@ -1696,10 +1696,11 @@ pub struct MetricsConfig {
     /// stays on loopback rather than inheriting the (possibly public) HTTP IP.
     #[serde(default)]
     pub bind: Option<SocketAddr>,
-    /// Whether the metrics listener also serves the read-only benchmark
-    /// timing snapshot, `GET /benchmark/timings`, and the process records
-    /// benchmark timing histograms. Defaults to false; only a
-    /// benchmark-owned server enables it, and it requires a loopback bind.
+    /// Whether this process installs the benchmark recorder instead of the
+    /// Prometheus recorder: its metrics listener then serves the read-only
+    /// benchmark snapshot, `GET /benchmark/snapshot`, and no `/metrics`
+    /// exposition. Defaults to false; only a benchmark-owned server enables
+    /// it, and it requires a loopback bind.
     #[serde(default)]
     pub benchmark_snapshot: bool,
 }

@@ -26,9 +26,7 @@ use bytes::Bytes;
 use tokio::sync::Semaphore;
 use tokio::task::JoinSet;
 use wyrd_client::transport::trace::with_benchmark_labels;
-use wyrd_testing::capacity::{
-    Expected, NANOS_PER_MS, Population, Selection, Usage, Window, release_binary,
-};
+use wyrd_testing::capacity::{Expected, NANOS_PER_MS, Population, Usage, Window, release_binary};
 use wyrd_testing::experiment::{ExperimentError, Phase, Reading, Repetition, Step, Workload};
 use wyrd_testing::gateway_capture::{PacedUpstream, Pacing};
 use wyrd_testing::release_server::{LocalServer, Metrics};
@@ -532,7 +530,7 @@ impl Overhead {
             return Ok(Repetition::default());
         }
         let before = server.timings().await?;
-        let (traffic, baseline) = Window::open(server, Selection::RESOURCES).await?;
+        let (traffic, baseline) = Window::open(server).await?;
         let stop = Instant::now() + window;
         let (samples, usage, stopped) = traffic
             .measure(
@@ -791,7 +789,7 @@ async fn upstreams() -> std::io::Result<[PacedUpstream; 2]> {
 mod tests {
     use std::collections::BTreeMap;
 
-    use wyrd_telemetry::timing::{Distribution, IntervalSeries};
+    use wyrd_benchmark::{Distribution, IntervalSeries};
     use wyrd_testing::capacity::{Population, UNLABELLED, Usage};
     use wyrd_testing::experiment::Reading;
 

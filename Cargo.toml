@@ -62,6 +62,7 @@ wyrd-auth-oidc = { path = "crates/shared/wyrd-auth-oidc", version = "0.4.1" }
 wyrd-auth-verify = { path = "crates/shared/wyrd-auth-verify" }
 wyrd-auth = { path = "crates/wyrd/wyrd-auth", version = "0.4.1" }
 wyrd-dev-fixtures = { path = "crates/shared/wyrd-dev-fixtures" }
+wyrd-benchmark = { path = "crates/shared/wyrd-benchmark", version = "0.4.1" }
 wyrd-bench = { path = "crates/shared/wyrd-bench", version = "0.4.1" }
 wyrd-sql = { path = "crates/wyrd/wyrd-sql" }
 wyrd-gateway = { path = "crates/wyrd/wyrd-gateway", version = "0.4.1" }

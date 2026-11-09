@@ -48,6 +48,7 @@ name = "gateway"
 path = "tests/gateway/main.rs"
 
 [dependencies]
+wyrd-benchmark = { workspace = true }
 # A normal edge, unlike every other member's dev-only one: the Python
 # `testing` extension and the TypeScript testing addon reach the hack only
 # through this harness, so their builds reuse the Rust test builds' third-party

@@ -9224,6 +9224,7 @@ dependencies = [
  "workspace-hack",
  "wyrd-auth-verify",
  "wyrd-bench",
+ "wyrd-benchmark",
  "wyrd-dev-fixtures",
  "wyrd-queue",
  "wyrd-runtime",
@@ -10142,6 +10143,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "wyrd-benchmark"
+version = "0.4.1"
+dependencies = [
+ "hdrhistogram",
+ "http",
+ "metrics",
+ "num-traits",
+ "serde",
+ "tracing",
+ "tracing-subscriber",
+ "ulid",
+ "workspace-hack",
+]
+
+[[package]]
 name = "wyrd-cards"
 version = "0.4.1"
 dependencies = [
@@ -10666,6 +10682,7 @@ dependencies = [
  "wyrd-auth-issue",
  "wyrd-auth-oidc",
  "wyrd-auth-verify",
+ "wyrd-benchmark",
  "wyrd-client",
  "wyrd-crypt",
  "wyrd-dev-fixtures",
@@ -10928,10 +10945,8 @@ dependencies = [
 name = "wyrd-telemetry"
 version = "0.4.1"
 dependencies = [
- "hdrhistogram",
  "http",
  "metrics",
- "num-traits",
  "opentelemetry",
  "opentelemetry-otlp",
  "opentelemetry-proto",
@@ -11007,6 +11022,7 @@ dependencies = [
  "wyrd-auth-issue",
  "wyrd-auth-oidc",
  "wyrd-auth-verify",
+ "wyrd-benchmark",
  "wyrd-client",
  "wyrd-crypt",
  "wyrd-dev-fixtures",
@@ -11056,6 +11072,7 @@ dependencies = [
  "tracing",
  "uuid",
  "workspace-hack",
+ "wyrd-benchmark",
  "wyrd-spec",
  "wyrd-telemetry",
  "wyrd-tls",

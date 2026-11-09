@@ -25,6 +25,7 @@ name = "wyrd-server"
 path = "src/main.rs"
 
 [dependencies]
+wyrd-benchmark = { workspace = true }
 mimalloc = { workspace = true }
 backtrace = { workspace = true, optional = true }
 prost = { workspace = true, optional = true }

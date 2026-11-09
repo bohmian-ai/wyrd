@@ -1,36 +1,47 @@
-//! Bounded high-resolution server timing histograms for benchmark-owned
-//! servers.
+//! The benchmark recorder: the sole metrics backend of a benchmark-owned
+//! Wyrd server, and nothing in an ordinary deployment.
 //!
-//! Each owning server boundary already measures one request with its own
-//! monotonic timer and passes the exact durations to
-//! [`crate::record_timing`]. When [`enable`] has been called, which only a
-//! server whose metrics listener serves the benchmark snapshot does, every
-//! such observation is recorded here into HDR histograms of integer
-//! nanoseconds at [`SIGNIFICANT_DIGITS`] significant digits over
-//! [`LOWEST_NS`]..=[`HIGHEST_NS`]: its elapsed time, its excluded waits, and
-//! the residual computed within the request before recording. A query's
-//! executed-plan scan facts are recorded beside its query series by
-//! [`record_scan`]. Ordinary deployments never enable it and record nothing.
+//! A server started for benchmarking calls [`install`] before it registers
+//! any metric. That installs [`BenchmarkRecorder`] as the process's only
+//! standard `metrics` recorder, so every existing counter, gauge, and
+//! histogram lands here, and starts recording the explicit request timings
+//! owners pass to [`record_timing`]. No Prometheus recorder or exporter runs
+//! beside it, and this is unrelated to tracing and OTLP export. Ordinary
+//! deployments never install it and record nothing here.
 //!
-//! Series are keyed by the closed boundary and outcome labels the owners
+//! Each owning server boundary measures one request with its own monotonic
+//! timer and passes the exact durations to [`record_timing`], recorded into
+//! HDR histograms of integer nanoseconds at [`SIGNIFICANT_DIGITS`]
+//! significant digits over [`LOWEST_NS`]..=[`HIGHEST_NS`]: its elapsed time,
+//! its excluded waits, and the residual computed within the request before
+//! recording. Where an owner has both an explicit timing and a production
+//! duration histogram for one observation, it records the production
+//! histogram only when [`enabled`] is false, so one observation is counted
+//! once. A query's executed-plan scan facts are recorded beside its query
+//! series by [`record_scan`].
+//!
+//! Timing series are keyed by the closed boundary and outcome labels the owners
 //! pass and by the request's benchmark classification ([`CASES`] and
 //! [`PHASES`]), which [`label_request`] reads from the
 //! [`CASE_HEADER`]/[`PHASE_HEADER`] metadata of a benchmark client onto the
 //! request span. A classification confers nothing but a series; an unknown
 //! value is counted and kept under [`INVALID`]. There are at most
-//! [`MAX_SERIES`] timing series and [`MAX_SCAN_SERIES`] scan series; an
-//! observation that would open another is counted in `dropped`, never
-//! merged into an existing series.
+//! [`MAX_SERIES`] timing series, [`MAX_SCAN_SERIES`] scan series, and
+//! [`MAX_METRIC_SERIES`] standard metric series; an observation that would
+//! open another is counted in `dropped`, never merged into an existing
+//! series.
 //!
-//! [`snapshot`] reads every cumulative distribution and counter under the
-//! same lock that records them, so a snapshot is consistent and no
+//! [`snapshot`] reads every cumulative distribution, counter, and gauge
+//! under the same lock that records them, so a snapshot is consistent and no
 //! concurrent observation is lost or counted twice. There is no reset: an
-//! interval is the bucket-count difference of two snapshots of the same
-//! process ([`TimingSnapshot::since`]). A value outside the range, a
-//! negative residual, or a missing component is counted, never clamped,
-//! and makes the interval's series report a problem.
+//! interval is the difference of two snapshots of the same process
+//! ([`BenchmarkSnapshot::since`]). A value outside the range, a negative
+//! residual, or a missing component is counted, never clamped, and makes the
+//! interval's series report a problem.
 
-use std::collections::BTreeMap;
+mod recorder;
+
+use std::collections::{BTreeMap, HashMap};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{LazyLock, Mutex, PoisonError};
 use std::time::{Duration, Instant};
@@ -39,6 +50,11 @@ use hdrhistogram::Histogram;
 use num_traits::ToPrimitive as _;
 use serde::{Deserialize, Serialize};
 use tracing_subscriber::registry::LookupSpan as _;
+
+pub use recorder::{
+    BenchmarkRecorder, HistogramUnit, IntervalMetric, IntervalValue, MAX_METRIC_SERIES,
+    MetricSnapshot, MetricValue,
+};
 
 /// Significant decimal digits every histogram keeps.
 pub const SIGNIFICANT_DIGITS: u8 = 3;
@@ -115,21 +131,33 @@ pub const INVALID: &str = "invalid";
 /// The clock every recorded duration comes from.
 pub const CLOCK: &str = "std::time::Instant: the OS monotonic clock";
 
-/// Whether this process records benchmark timings.
+/// Whether [`install`] made this process a benchmark recorder.
 static ENABLED: AtomicBool = AtomicBool::new(false);
 
-/// The process's timing registry.
-// ponytail: one process-wide lock; per-series locks if recording contention ever shows in server CPU.
+/// The process's benchmark registry.
+// ponytail: one process-wide lock for timings and standard metrics; per-series locks if recording contention ever shows in server CPU.
 static REGISTRY: LazyLock<Mutex<Registry>> = LazyLock::new(|| Mutex::new(Registry::new()));
 
-/// Starts recording benchmark timings in this process. Only a server that
-/// serves the benchmark snapshot calls it; it cannot be turned off.
-pub fn enable() {
+/// Installs [`BenchmarkRecorder`] as this process's only standard `metrics`
+/// recorder and starts recording benchmark timings. A benchmark server calls
+/// it once at startup, before registering any metric; it cannot be turned
+/// off, and a repeated call after it succeeded does nothing.
+///
+/// # Errors
+///
+/// Returns the refusal when another `metrics` recorder is already installed:
+/// a process never mixes the benchmark recorder with another backend.
+pub fn install() -> Result<(), metrics::SetRecorderError<BenchmarkRecorder>> {
+    if enabled() {
+        return Ok(());
+    }
     LazyLock::force(&REGISTRY);
+    metrics::set_global_recorder(BenchmarkRecorder)?;
     ENABLED.store(true, Ordering::Release);
+    Ok(())
 }
 
-/// Whether [`enable`] was called in this process.
+/// Whether [`install`] made this process a benchmark recorder.
 #[must_use]
 pub fn enabled() -> bool {
     ENABLED.load(Ordering::Acquire)
@@ -214,7 +242,7 @@ fn labels_of(span: &tracing::Span) -> Labels {
 /// Records one request's server timing, and each of its `parts` as an
 /// observation of the part's own boundary, under `parent`'s
 /// classification and one lock acquisition; see
-/// [`crate::record_timing_parts`]. Nothing is recorded unless [`enable`]d.
+/// [`record_timing_parts`]. Nothing is recorded unless [`enable`]d.
 pub(crate) fn record(
     parent: &tracing::Span,
     boundary: &'static str,
@@ -341,6 +369,10 @@ struct Registry {
     dropped: u64,
     /// Requests that declared an unknown case or phase.
     invalid_labels: u64,
+    /// Standard metric series, indexed by their handles.
+    metrics: Vec<recorder::Metric>,
+    /// Each registered key's series index, per [`recorder::Kind`].
+    metric_keys: HashMap<metrics::Key, [Option<usize>; 3]>,
 }
 
 impl Registry {
@@ -353,6 +385,8 @@ impl Registry {
             scans: BTreeMap::new(),
             dropped: 0,
             invalid_labels: 0,
+            metrics: Vec::new(),
+            metric_keys: HashMap::new(),
         }
     }
 
@@ -431,8 +465,8 @@ impl Registry {
     }
 
     /// The cumulative snapshot of everything recorded so far.
-    fn snapshot(&self) -> TimingSnapshot {
-        TimingSnapshot {
+    fn snapshot(&self) -> BenchmarkSnapshot {
+        BenchmarkSnapshot {
             process: self.process.clone(),
             pid: std::process::id(),
             taken_ns: u64::try_from(self.started.elapsed().as_nanos()).unwrap_or(u64::MAX),
@@ -471,6 +505,7 @@ impl Registry {
                     out_of_range: scan.out_of_range,
                 })
                 .collect(),
+            metrics: self.metric_snapshots(),
             dropped: self.dropped,
             invalid_labels: self.invalid_labels,
         }
@@ -480,7 +515,7 @@ impl Registry {
 /// The cumulative snapshot of this process's benchmark timings, read
 /// consistently under the recording lock.
 #[must_use]
-pub fn snapshot() -> TimingSnapshot {
+pub fn snapshot() -> BenchmarkSnapshot {
     lock().snapshot()
 }
 
@@ -501,6 +536,10 @@ pub struct Method {
     pub max_series: usize,
     /// [`MAX_SCAN_SERIES`].
     pub max_scan_series: usize,
+    /// [`MAX_METRIC_SERIES`]; zero in a record that predates standard
+    /// metrics.
+    #[serde(default)]
+    pub max_metric_series: usize,
 }
 
 impl Method {
@@ -515,6 +554,7 @@ impl Method {
             highest_scan: HIGHEST_SCAN,
             max_series: MAX_SERIES,
             max_scan_series: MAX_SCAN_SERIES,
+            max_metric_series: MAX_METRIC_SERIES,
         }
     }
 }
@@ -592,9 +632,9 @@ pub struct ScanSnapshot {
     pub out_of_range: u64,
 }
 
-/// A cumulative read of one process's benchmark timings.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct TimingSnapshot {
+/// A cumulative read of one process's benchmark recorder.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct BenchmarkSnapshot {
     /// The process identity, fresh on every start: a replaced process
     /// cannot pass for the same one.
     pub process: String,
@@ -608,6 +648,9 @@ pub struct TimingSnapshot {
     pub series: Vec<SeriesSnapshot>,
     /// Every scan series.
     pub scans: Vec<ScanSnapshot>,
+    /// Every standard metric series; empty in a record that predates them.
+    #[serde(default)]
+    pub metrics: Vec<MetricSnapshot>,
     /// Observations refused by a series bound.
     pub dropped: u64,
     /// Requests that declared an unknown case or phase.
@@ -866,7 +909,7 @@ pub struct IntervalScan {
 
 /// Everything one process recorded between two snapshots.
 #[derive(Debug, Clone)]
-pub struct TimingInterval {
+pub struct BenchmarkInterval {
     /// The process both snapshots read.
     pub process: String,
     /// Monotonic nanoseconds between the snapshots.
@@ -875,13 +918,15 @@ pub struct TimingInterval {
     pub series: Vec<IntervalSeries>,
     /// Scan series with at least one query in the interval.
     pub scans: Vec<IntervalScan>,
+    /// Every standard metric series the later snapshot holds.
+    pub metrics: Vec<IntervalMetric>,
     /// Observations refused by a series bound in the interval.
     pub dropped: u64,
     /// Requests that declared an unknown case or phase in the interval.
     pub invalid_labels: u64,
 }
 
-impl TimingSnapshot {
+impl BenchmarkSnapshot {
     /// What this snapshot recorded after `earlier`, by bucket-count
     /// difference.
     ///
@@ -890,7 +935,7 @@ impl TimingSnapshot {
     /// Returns why the two cannot form an interval: another process or
     /// method, a later `earlier`, or a series or counter that went
     /// backwards or disappeared (a reset).
-    pub fn since(&self, earlier: &Self) -> Result<TimingInterval, String> {
+    pub fn since(&self, earlier: &Self) -> Result<BenchmarkInterval, String> {
         if self.process != earlier.process || self.pid != earlier.pid {
             return Err(format!(
                 "the timing snapshots come from different processes ({} pid {}, then {} pid {}): the server was replaced",
@@ -947,11 +992,13 @@ impl TimingSnapshot {
         if vanished {
             return Err(backwards("a series"));
         }
-        Ok(TimingInterval {
+        let metrics = IntervalMetric::between_all(&self.metrics, &earlier.metrics)?;
+        Ok(BenchmarkInterval {
             process: self.process.clone(),
             nanos,
             series,
             scans,
+            metrics,
             dropped,
             invalid_labels,
         })
@@ -1081,6 +1128,44 @@ impl IntervalScan {
     }
 }
 
+/// Records one request's server timing at an owning boundary into the
+/// bounded benchmark histograms under `parent`'s request classification.
+///
+/// `elapsed` is the owner's monotonic time from handler entry to `boundary`
+/// (result ready, write acknowledged, or response handoff), and `excluded`
+/// the union of the waits the owner does not count as its own work, such as
+/// provider exchanges or Verifier blocks, when the boundary has any, with
+/// the closed `boundary` and `outcome` labels. Nothing is recorded until
+/// [`enable`].
+pub fn record_timing(
+    parent: &tracing::Span,
+    boundary: &'static str,
+    outcome: &'static str,
+    elapsed: Duration,
+    excluded: Option<Duration>,
+) {
+    record(parent, boundary, outcome, elapsed, excluded, &[]);
+}
+
+/// Records one request's server timing as [`record_timing`] does, plus each
+/// `(boundary, duration)` of `parts`: a component of the same request, such
+/// as one execution phase, recorded as an observation of its own boundary
+/// under the same outcome and classification.
+///
+/// The request and its parts are recorded under one lock acquisition, so a
+/// snapshot holds either all of them or none, and a part costs no more
+/// lock traffic than the request already pays.
+pub fn record_timing_parts(
+    parent: &tracing::Span,
+    boundary: &'static str,
+    outcome: &'static str,
+    elapsed: Duration,
+    excluded: Option<Duration>,
+    parts: &[(&'static str, Duration)],
+) {
+    record(parent, boundary, outcome, elapsed, excluded, parts);
+}
+
 #[cfg(test)]
 mod tests {
     use std::time::Duration;
@@ -1102,6 +1187,115 @@ mod tests {
             Duration::from_nanos(elapsed),
             excluded.map(Duration::from_nanos),
         );
+    }
+
+    /// The existing standard `metrics` macros and the explicit request
+    /// timing land in one benchmark snapshot: counters and label-order
+    /// variants share a series, a gauge keeps its decrements and peak, a
+    /// `_seconds` histogram records nanoseconds while any other records its
+    /// integer values unscaled, an unrepresentable value is refused rather
+    /// than rounded, a request keeps its residual, and an absent series is
+    /// missing rather than zero.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the recorder does not install or any series, unit, or
+    /// count is wrong.
+    #[test]
+    fn standard_metrics_and_request_timings_share_one_snapshot() {
+        super::install().expect("the only recorder");
+        assert!(super::enabled());
+        super::install().expect("a repeated install is a no-op");
+        let before = super::snapshot();
+        metrics::counter!("bench_test_total", "lane" => "a", "status" => "ok").increment(2);
+        metrics::counter!("bench_test_total", "status" => "ok", "lane" => "a").increment(1);
+        metrics::counter!("bench_test_total", "lane" => "b", "status" => "ok").increment(4);
+        let pending = metrics::gauge!("bench_test_pending");
+        pending.increment(5.0);
+        pending.decrement(3.0);
+        metrics::histogram!("bench_test_duration_seconds").record(0.000_25);
+        let rows = metrics::histogram!("bench_test_rows");
+        rows.record(4.0);
+        rows.record(0.5);
+        super::record_timing(
+            &tracing::Span::none(),
+            "bench.request",
+            "success",
+            Duration::from_micros(300),
+            Some(Duration::from_micros(100)),
+        );
+        let after = super::snapshot();
+        let interval = after.since(&before).expect("one process");
+
+        assert_eq!(interval.counter("bench_test_total", &[("lane", "a")]), Some(3));
+        assert_eq!(interval.counter("bench_test_total", &[]), Some(7));
+        assert_eq!(interval.counter("bench_test_absent_total", &[]), None);
+        assert_eq!(
+            after
+                .metrics
+                .iter()
+                .filter(|metric| metric.name == "bench_test_total")
+                .count(),
+            2,
+            "label order does not open a series"
+        );
+        let gauge = interval
+            .metrics
+            .iter()
+            .find(|metric| metric.name == "bench_test_pending")
+            .expect("the gauge");
+        assert!(matches!(
+            gauge.value,
+            super::IntervalValue::Gauge { value, peak }
+                if value.to_bits() == 2.0_f64.to_bits() && peak.to_bits() == 5.0_f64.to_bits()
+        ));
+        let duration = interval
+            .histogram("bench_test_duration_seconds", &[])
+            .expect("one duration");
+        let at = duration.quantile(1.0).expect("one observation");
+        assert_eq!(duration.len(), 1);
+        assert!(at.lowest <= 250_000 && 250_000 <= at.highest, "{at:?}");
+        let refused = interval.histogram("bench_test_rows", &[]);
+        assert!(
+            refused.is_err_and(|error| error.contains("1 unrepresentable")),
+            "a fractional value is refused, never rounded"
+        );
+        let rows = interval
+            .metrics
+            .iter()
+            .find_map(|metric| match &metric.value {
+                super::IntervalValue::Histogram { unit, distribution }
+                    if metric.name == "bench_test_rows" =>
+                {
+                    Some((*unit, distribution.clone()))
+                }
+                _ => None,
+            })
+            .expect("the rows histogram");
+        assert_eq!(rows.0, super::HistogramUnit::Value);
+        let four = rows.1.quantile(1.0).expect("one value");
+        assert_eq!((four.lowest, four.highest), (4, 4), "a value is not seconds");
+        assert!(interval.histogram("bench_test_absent_seconds", &[]).is_err());
+
+        let request = interval
+            .series
+            .iter()
+            .find(|series| series.boundary == "bench.request")
+            .expect("the request timing");
+        assert_eq!(request.count, 1);
+        let residual = request.residual.as_ref().expect("a residual");
+        let own = residual.quantile(1.0).expect("one residual");
+        assert!(own.lowest <= 200_000 && 200_000 <= own.highest);
+        assert!(
+            !interval
+                .metrics
+                .iter()
+                .any(|metric| metric.name.contains("request")),
+            "an explicit timing opens no metric series"
+        );
+        let mut reset = after.clone();
+        reset.metrics.retain(|metric| metric.name != "bench_test_pending");
+        assert!(reset.since(&after).is_err(), "a vanished metric is a reset");
     }
 
     /// Unknown labels are classified invalid, absent ones unlabelled.
@@ -1174,5 +1368,215 @@ mod tests {
             certain <= 3 && 3 <= possible && possible - certain <= 1,
             "{certain}..{possible}"
         );
+    }
+}
+
+#[cfg(test)]
+mod recording_tests {
+    use crate::{self as timing, CASE_HEADER, PHASE_HEADER};
+    use std::time::Duration;
+    /// Concurrent observations under labelled requests land exactly once in
+    /// their own case and phase series, as does each recorded part under
+    /// its own boundary; interval snapshots conserve counts,
+    /// keep zero, bound each percentile by its bucket, and report
+    /// out-of-range, negative, reset, and replaced-process evidence.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the test pipeline does not initialize or any count,
+    /// bound, or invalidity is wrong.
+    #[test]
+    fn benchmark_histograms_preserve_bounded_intervals() {
+        let subscriber = tracing_subscriber::Registry::default();
+        let _guard = tracing::subscriber::set_default(subscriber);
+        let request = |case: &str, phase: &str| {
+            let span = tracing::info_span!("request");
+            let mut headers = http::HeaderMap::new();
+            headers.insert(CASE_HEADER, case.parse().expect("header value"));
+            headers.insert(PHASE_HEADER, phase.parse().expect("header value"));
+            timing::label_request(&span, &headers);
+            span
+        };
+        let unlabelled = tracing::info_span!("request");
+        let ignored = request("point-lookup", "warmup");
+        super::record_timing(&ignored, "bifrost.query", "success", Duration::ZERO, None);
+        timing::install().expect("the only recorder");
+        assert_eq!(
+            timing::snapshot().series.len(),
+            0,
+            "nothing is recorded before install, and labels set then are ignored"
+        );
+        let started = timing::snapshot();
+
+        let warmup = request("point-lookup", "warmup");
+        for _ in 0..10 {
+            super::record_timing(
+                &warmup,
+                "bifrost.query",
+                "success",
+                Duration::from_micros(3),
+                None,
+            );
+        }
+        let warm = timing::snapshot();
+        let point = request("point-lookup", "repetition-1");
+        let scan = request("full-scan", "repetition-1");
+        std::thread::scope(|threads| {
+            for thread in 0..8_u64 {
+                let (point, scan, unlabelled) = (&point, &scan, &unlabelled);
+                threads.spawn(move || {
+                    for i in 0..1_000_u64 {
+                        let elapsed = Duration::from_nanos(thread * 1_000 + i);
+                        super::record_timing(point, "bifrost.query", "success", elapsed, None);
+                        if i % 10 == 0 {
+                            super::record_timing(scan, "bifrost.query", "success", elapsed, None);
+                            super::record_timing(
+                                unlabelled,
+                                "bifrost.query",
+                                "success",
+                                elapsed,
+                                None,
+                            );
+                        }
+                    }
+                });
+            }
+        });
+        let gateway = request("buffered-1kib-capture-metadata", "repetition-1");
+        super::record_timing(
+            &gateway,
+            "gateway.buffered",
+            "success",
+            Duration::from_micros(500),
+            Some(Duration::from_micros(400)),
+        );
+        super::record_timing(
+            &gateway,
+            "gateway.buffered",
+            "success",
+            Duration::from_nanos(10),
+            Some(Duration::from_nanos(11)),
+        );
+        super::record_timing(
+            &gateway,
+            "gateway.buffered",
+            "success",
+            Duration::from_secs(600),
+            Some(Duration::ZERO),
+        );
+        let verify = request("direct-verify", "repetition-1");
+        super::record_timing_parts(
+            &verify,
+            "verification.direct",
+            "success",
+            Duration::from_micros(300),
+            Some(Duration::from_micros(10)),
+            &[
+                ("verification.direct.engine", Duration::from_micros(100)),
+                ("verification.direct.stage", Duration::ZERO),
+            ],
+        );
+        let _invalid = request("drop table", "repetition-1");
+        let measured = timing::snapshot();
+
+        let warmed = warm.since(&started).expect("same process");
+        assert_eq!(warmed.series.len(), 1);
+        assert_eq!(warmed.series[0].phase, "warmup");
+        assert_eq!(warmed.series[0].count, 10);
+
+        let interval = measured.since(&warm).expect("same process");
+        let series = |case: &str, boundary: &str| {
+            interval
+                .series
+                .iter()
+                .find(|series| {
+                    series.case == case
+                        && series.boundary == boundary
+                        && series.outcome == "success"
+                })
+                .unwrap_or_else(|| panic!("no {case} {boundary} series"))
+        };
+        let engine = series("direct-verify", "verification.direct.engine");
+        let at = engine.elapsed.quantile(1.0).expect("one part");
+        assert_eq!(
+            engine.count, 1,
+            "a part is one observation of its own boundary"
+        );
+        assert!(at.lowest <= 100_000 && 100_000 <= at.highest);
+        assert!(engine.excluded.is_none() && engine.problems().is_empty());
+        assert_eq!(
+            series("direct-verify", "verification.direct.stage").count,
+            1
+        );
+        assert_eq!(series("direct-verify", "verification.direct").count, 1);
+        let point = series("point-lookup", "bifrost.query");
+        assert_eq!(point.phase, "repetition-1");
+        assert_eq!((point.count, point.elapsed.len()), (8_000, 8_000));
+        assert!(point.problems().is_empty(), "{:?}", point.problems());
+        assert_eq!(series("full-scan", "bifrost.query").count, 800);
+        assert_eq!(series(timing::UNLABELLED, "bifrost.query").count, 800);
+        assert!(
+            interval
+                .series
+                .iter()
+                .all(|series| series.phase != "warmup"),
+            "warmup observations stay in the warmup interval"
+        );
+        let zero = point.elapsed.quantile(0.0).expect("observations");
+        assert_eq!(
+            (zero.lowest, zero.highest),
+            (0, 0),
+            "zero is counted exactly"
+        );
+        let p99 = point.elapsed.quantile(0.99).expect("observations");
+        assert_eq!(p99.rank, 7_920);
+        assert!(p99.lowest <= 7_919 && 7_919 <= p99.highest);
+        assert!(p99.highest - p99.lowest <= 7_919 / 1_000);
+        let whole = measured.since(&started).expect("same process");
+        let total: u64 = whole.series.iter().map(|series| series.count).sum();
+        assert_eq!(
+            total,
+            10 + 8_000 + 800 + 800 + 3 + 3,
+            "each observation and part once"
+        );
+
+        let gateway = series("buffered-1kib-capture-metadata", "gateway.buffered");
+        assert_eq!(gateway.count, 3);
+        let residual = gateway.residual.as_ref().expect("residual component");
+        assert_eq!(
+            residual.len(),
+            1,
+            "only the in-range, non-negative residual"
+        );
+        let half = gateway.elapsed.quantile(0.0).expect("observation");
+        assert!(half.lowest <= 10 && 10 <= half.highest);
+        let problems = gateway.problems().join("; ");
+        assert!(
+            problems.contains("2 durations outside the trackable range"),
+            "{problems}"
+        );
+        assert!(
+            problems.contains("1 excluded waits exceeding elapsed time"),
+            "{problems}"
+        );
+        assert!(
+            problems.contains("2 elapsed observations for 3 requests"),
+            "{problems}"
+        );
+        assert_eq!(
+            interval.invalid_labels, 1,
+            "the unknown declaration is counted once"
+        );
+
+        let mut replaced = measured.clone();
+        replaced.process = "another".to_owned();
+        assert!(replaced.since(&warm).is_err_and(|e| e.contains("replaced")));
+        assert!(
+            warm.since(&measured).is_err(),
+            "a reversed interval is a reset"
+        );
+        let mut reset = measured.clone();
+        reset.series.retain(|series| series.case != "point-lookup");
+        assert!(reset.since(&warm).is_err(), "a vanished series is a reset");
     }
 }

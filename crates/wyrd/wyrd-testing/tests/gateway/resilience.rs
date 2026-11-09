@@ -28,9 +28,8 @@ use wyrd_spec::DataTenantId;
 use wyrd_spec::auth::PLATFORM_AUDIT_PRINCIPAL;
 use wyrd_testing::Bootstrap;
 use wyrd_testing::bifrost::shared_process_telemetry_for_test;
-use wyrd_testing::capacity::Histogram;
 use wyrd_testing::gateway_capture::{GatewayCapture, PacedUpstream, Pacing};
-use wyrd_testing::release_server::Metrics;
+use wyrd_testing::release_server::{Histogram, Metrics};
 
 use crate::harness::{
     INVOKER_ROLE, Journey, api_key, openai_code, refusal, within_one_limit_window,

@@ -813,7 +813,10 @@ impl ScribeImpl {
             return Ok(Dispatched::AcceptedUnder(accepted));
         }
         let elapsed = append_started.elapsed();
-        metrics::histogram!("bifrost_scribe_ack_seconds").record(elapsed.as_secs_f64());
+        // A benchmark keeps this acknowledgement as the write timing alone.
+        if !wyrd_benchmark::enabled() {
+            metrics::histogram!("bifrost_scribe_ack_seconds").record(elapsed.as_secs_f64());
+        }
         profile.record_timing(elapsed, completion.sent.elapsed());
         Ok(Dispatched::Admitted(FrameAdmission {
             batch_id: frame.batch_id,
@@ -1551,17 +1554,18 @@ mod tests {
     }
 
     /// One acknowledged append records Scribe's write boundary and each of
-    /// its phases once, through the real benchmark timing collector.
+    /// its phases once, through the real benchmark timing collector, and no
+    /// acknowledgement histogram counts it again.
     ///
     /// # Panics
     ///
-    /// Panics when the write is refused or a boundary's observation count is
-    /// not exactly one.
+    /// Panics when the write is refused, a boundary's observation count is
+    /// not exactly one, or the acknowledgement histogram repeats it.
     #[tokio::test]
     async fn acknowledged_append_records_each_write_phase_once() {
-        use wyrd_telemetry::timing;
+        use wyrd_benchmark as timing;
 
-        timing::enable();
+        timing::install().expect("the benchmark recorder installs");
         let before = timing::snapshot();
         let scribe = ScribeImpl::new();
         let tenant = DataTenantId::new(uuid::Uuid::now_v7()).expect("random tenant is valid");
@@ -1598,6 +1602,10 @@ mod tests {
                 .sum();
             assert_eq!(count, 1, "{boundary}: {:?}", interval.series);
         }
+        assert!(
+            interval.histogram("bifrost_scribe_ack_seconds", &[]).is_err(),
+            "the acknowledgement histogram would count the timed write twice"
+        );
         scribe
             .shutdown(Instant::now() + Duration::from_secs(1))
             .await;

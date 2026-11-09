@@ -225,50 +225,19 @@ impl ExecutionTelemetry {
     /// count, each phase, the whole execution, the Verifier's block time,
     /// and the overhead.
     ///
-    /// A direct execution's duration and block union are also recorded
-    /// through [`wyrd_telemetry::record_timing_parts`] under the current
-    /// span's benchmark classification at boundary `verification.direct`,
-    /// with each measured phase at its [`Phase::direct_boundary`] and the
-    /// time outside every phase at [`DIRECT_OUTSIDE_BOUNDARY`]; no benchmark
-    /// reads a queued execution's, so it records none.
+    /// While benchmarking, a direct execution's duration and block union are
+    /// recorded instead through [`wyrd_benchmark::record_timing_parts`]
+    /// under the current span's benchmark classification at boundary
+    /// `verification.direct`, with each measured phase at its
+    /// [`Phase::direct_boundary`] and the time outside every phase at
+    /// [`DIRECT_OUTSIDE_BOUNDARY`], so each duration is counted once; no
+    /// benchmark reads a queued execution's timing, so it keeps its
+    /// histograms.
     fn emit(&self, outcome: &'static str, failed: bool) {
         let total = self.started.elapsed();
         let ledger = self.lock();
         let mode = self.mode.as_str();
         metrics::counter!(VERIFICATION_RUN_ATTEMPTS_TOTAL, "mode" => mode).increment(1);
-        let mut parts = Vec::with_capacity(Phase::ALL.len() + 1);
-        for (phase, intervals) in Phase::ALL.iter().zip(ledger.iter()) {
-            if !intervals.is_empty() {
-                let length = union(intervals);
-                metrics::histogram!(
-                    VERIFICATION_PHASE_DURATION_SECONDS,
-                    "mode" => mode,
-                    "phase" => phase.as_str()
-                )
-                .record(length.as_secs_f64());
-                parts.push((phase.direct_boundary(), length));
-            }
-        }
-        let verifier = union(&self.clock.intervals());
-        if self.mode == ExecutionMode::Direct {
-            let phased: Vec<Interval> = ledger.iter().flatten().copied().collect();
-            parts.push((
-                DIRECT_OUTSIDE_BOUNDARY,
-                total.saturating_sub(union(&phased)),
-            ));
-            wyrd_telemetry::record_timing_parts(
-                &tracing::Span::current(),
-                "verification.direct",
-                outcome,
-                total,
-                Some(verifier),
-                &parts,
-            );
-        }
-        metrics::histogram!(VERIFICATION_VERIFIER_SECONDS, "mode" => mode, "outcome" => outcome)
-            .record(verifier.as_secs_f64());
-        metrics::histogram!(VERIFICATION_OVERHEAD_SECONDS, "mode" => mode, "outcome" => outcome)
-            .record(total.saturating_sub(verifier).as_secs_f64());
         if failed {
             metrics::counter!(
                 VERIFICATION_RUN_FAILURES_TOTAL,
@@ -277,6 +246,43 @@ impl ExecutionTelemetry {
             )
             .increment(1);
         }
+        let verifier = union(&self.clock.intervals());
+        if self.mode == ExecutionMode::Direct && wyrd_benchmark::enabled() {
+            let mut parts = Vec::with_capacity(Phase::ALL.len() + 1);
+            for (phase, intervals) in Phase::ALL.iter().zip(ledger.iter()) {
+                if !intervals.is_empty() {
+                    parts.push((phase.direct_boundary(), union(intervals)));
+                }
+            }
+            let phased: Vec<Interval> = ledger.iter().flatten().copied().collect();
+            parts.push((
+                DIRECT_OUTSIDE_BOUNDARY,
+                total.saturating_sub(union(&phased)),
+            ));
+            wyrd_benchmark::record_timing_parts(
+                &tracing::Span::current(),
+                "verification.direct",
+                outcome,
+                total,
+                Some(verifier),
+                &parts,
+            );
+            return;
+        }
+        for (phase, intervals) in Phase::ALL.iter().zip(ledger.iter()) {
+            if !intervals.is_empty() {
+                metrics::histogram!(
+                    VERIFICATION_PHASE_DURATION_SECONDS,
+                    "mode" => mode,
+                    "phase" => phase.as_str()
+                )
+                .record(union(intervals).as_secs_f64());
+            }
+        }
+        metrics::histogram!(VERIFICATION_VERIFIER_SECONDS, "mode" => mode, "outcome" => outcome)
+            .record(verifier.as_secs_f64());
+        metrics::histogram!(VERIFICATION_OVERHEAD_SECONDS, "mode" => mode, "outcome" => outcome)
+            .record(total.saturating_sub(verifier).as_secs_f64());
         metrics::histogram!(
             VERIFICATION_RUN_DURATION_SECONDS,
             "mode" => mode,

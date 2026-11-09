@@ -793,7 +793,10 @@ async fn attempts_record_queue_wait_phases_terminal_latency_and_one_trace() {
         .await;
     runtime.stop().await;
 
-    let rendered = telemetry.prometheus().render();
+    let rendered = telemetry
+        .prometheus()
+        .expect("the capture runtime installs Prometheus")
+        .render();
     let count = |series: &str| -> u64 {
         rendered
             .lines()

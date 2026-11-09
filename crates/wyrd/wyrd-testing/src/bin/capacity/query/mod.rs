@@ -1807,7 +1807,7 @@ mod tests {
             .chain(&HOT_READS)
             .map(|(_, read, _)| read.case());
         for case in WriteOp::ALL.map(WriteOp::name).into_iter().chain(reads) {
-            assert!(wyrd_telemetry::timing::CASES.contains(&case), "{case}");
+            assert!(wyrd_benchmark::CASES.contains(&case), "{case}");
         }
     }
 

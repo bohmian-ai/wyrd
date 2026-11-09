@@ -576,7 +576,7 @@ impl QueryTelemetryGuard {
         self.finish_source_span(outcome);
         self.span.record("outcome", outcome);
         self.scan_stats.finalize();
-        wyrd_telemetry::timing::record_scan(
+        wyrd_benchmark::record_scan(
             &self.span,
             outcome,
             self.scan_stats.physical_rows_scanned,

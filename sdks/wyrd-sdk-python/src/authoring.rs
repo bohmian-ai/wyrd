@@ -324,8 +324,9 @@ macro_rules! authoring_class {
             }
 
             /// Set the field `field` of the receiver from `value` and return
-            /// the receiver; `value` converts before the receiver is
-            /// borrowed, so it may be the receiver itself.
+            /// the receiver; `value` converts while the receiver is not
+            /// borrowed, so it may be the receiver itself or a callback that
+            /// edits it.
             ///
             /// # Errors
             /// As [`Self::set`].
@@ -334,7 +335,8 @@ macro_rules! authoring_class {
                 field: &str,
                 value: &Bound<'py, PyAny>,
             ) -> PyResult<Bound<'py, Self>> {
-                let inner = Self::set(slf.borrow().inner.clone(), field, value)?;
+                let current = slf.borrow().inner.clone();
+                let inner = Self::set(current, field, value)?;
                 slf.borrow_mut().inner = inner;
                 Ok(slf)
             }
@@ -344,6 +346,9 @@ macro_rules! authoring_class {
         impl $py {
             $(
                 #[doc = concat!("Set `", stringify!($one), "`, replacing its earlier value and whatever it referenced; returns this value.")]
+                #[doc = ""]
+                #[doc = "# Errors"]
+                #[doc = concat!("As [`", stringify!($one_convert), "`], naming `", stringify!($one), "`, when `value` does not convert; nothing is then set.")]
                 fn $one<'py>(
                     slf: Bound<'py, Self>,
                     value: &Bound<'py, PyAny>,
@@ -353,6 +358,9 @@ macro_rules! authoring_class {
             )*
             $(
                 #[doc = concat!("Set the whole `", stringify!($list), "` list, replacing every earlier entry; returns this value.")]
+                #[doc = ""]
+                #[doc = "# Errors"]
+                #[doc = concat!("As [`items`] with [`", stringify!($list_convert), "`], naming `", stringify!($list), "`, when `items` does not convert; nothing is then set.")]
                 fn $list<'py>(
                     slf: Bound<'py, Self>,
                     items: &Bound<'py, PyAny>,
@@ -361,6 +369,9 @@ macro_rules! authoring_class {
                 }
 
                 #[doc = concat!("Append one entry to `", stringify!($list), "`; a repeated ID is refused at validation. Returns this value.")]
+                #[doc = ""]
+                #[doc = "# Errors"]
+                #[doc = concat!("As [`", stringify!($list_convert), "`], naming `", stringify!($list), "`, when `item` does not convert; nothing is then appended.")]
                 fn $list_add<'py>(
                     slf: Bound<'py, Self>,
                     item: &Bound<'py, PyAny>,
@@ -372,6 +383,9 @@ macro_rules! authoring_class {
             )*
             $(
                 #[doc = concat!("Set the whole `", stringify!($map), "` map, replacing every earlier entry; returns this value.")]
+                #[doc = ""]
+                #[doc = "# Errors"]
+                #[doc = concat!("As [`entries`] with [`", stringify!($map_convert), "`], naming `", stringify!($map), "`, when `entries` does not convert; nothing is then set.")]
                 fn $map<'py>(
                     slf: Bound<'py, Self>,
                     entries: &Bound<'py, PyAny>,

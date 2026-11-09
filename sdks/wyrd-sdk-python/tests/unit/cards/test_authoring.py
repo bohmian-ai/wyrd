@@ -248,6 +248,37 @@ def test_pydantic_models_supply_input_schemas() -> None:
     assert {"type": "null"} in inputs["report"]["schema"]["properties"]["notes"]["anyOf"]
 
 
+def test_schema_callback_may_edit_its_receiver() -> None:
+    verifier = Verifier("reentrant", "1.0.0")
+
+    class Edits:
+        @classmethod
+        def model_json_schema(cls) -> dict:
+            verifier.description("set while converting")
+            return {"type": "string"}
+
+    assert verifier.inputs({"report": Edits}) is verifier
+    assert verifier.spec()["inputs"] == {"report": {"type": "json", "schema": {"type": "string"}}}
+    assert verifier.add_input("purpose", str) is verifier
+    assert list(verifier.spec()["inputs"]) == ["report", "purpose"]
+
+
+def test_boolean_schemas_are_json_schemas() -> None:
+    accepting = Verifier("accepting", "1.0.0", inputs={"any": True, "none": False})
+    accepting.inputs({"any": True, "none": False})
+    accepting.add_input("open", True).add_input("closed", False)
+    accepting.add_input("explicit-open", InputSlot.json(True))
+    accepting.add_input("explicit-closed", InputSlot.json(False))
+    assert accepting.spec()["inputs"] == {
+        "any": {"type": "json", "schema": True},
+        "none": {"type": "json", "schema": False},
+        "open": {"type": "json", "schema": True},
+        "closed": {"type": "json", "schema": False},
+        "explicit-open": {"type": "json", "schema": True},
+        "explicit-closed": {"type": "json", "schema": False},
+    }
+
+
 def test_every_native_family_constructs_canonical_specs() -> None:
     pager = {"kind": "http", "method": "post", "url": "https://hooks.example.com/release"}
     singles = [

@@ -77,8 +77,9 @@ BindingInput: TypeAlias = (
 )
 """A binding, or the Verifier, exact reference or YAML path it binds."""
 
-SlotInput: TypeAlias = InputSlot | str | type | Mapping[str, JsonInput]
-"""An input slot: a slot, a source reference, a class standing for a schema, or a mapping.
+SlotInput: TypeAlias = InputSlot | str | type | bool | Mapping[str, JsonInput]
+"""An input slot: a slot, a source reference, a class standing for a schema, a boolean
+JSON Schema (``True`` admits every value, ``False`` none), or a mapping.
 
 A mapping whose ``type`` is ``json``, ``media``, ``trace`` or ``samples`` is a
 canonical slot; any other mapping is the JSON Schema of a ``json`` slot, never an
@@ -2548,11 +2549,12 @@ class InputSlot:
     """
 
     @staticmethod
-    def json(schema: type | Mapping[str, JsonInput]) -> InputSlot:
+    def json(schema: type | bool | Mapping[str, JsonInput]) -> InputSlot:
         """A JSON value constrained by ``schema``.
 
         Args:
-            schema: A JSON Schema, or a class standing for one.
+            schema: A JSON Schema, including ``True`` or ``False``, or a class
+                standing for one.
         """
         ...
 

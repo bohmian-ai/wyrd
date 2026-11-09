@@ -92,6 +92,9 @@ pub struct WyrdServer {
     /// Private Bifrost peer router, present only for a peer-bearing target.
     peer_router: Option<TonicRouter>,
     reporter: HealthReporter,
+    /// The process metrics backend installed before boot, handed to the
+    /// bound server; `None` installs the configured backend when the
+    /// metrics listener starts.
     metrics: Option<MetricsBackend>,
     extra_workers: Vec<(&'static str, BoxWorker)>,
     #[cfg(feature = "test-support")]
@@ -390,6 +393,9 @@ pub struct BoundServer {
     /// Exact address the private peer listener holds.
     peer_addr: Option<SocketAddr>,
     reporter: HealthReporter,
+    /// The process metrics backend installed before boot, taken once by the
+    /// metrics listener; `None` installs the configured backend there, and
+    /// with no metrics listener no backend is installed.
     metrics: Option<MetricsBackend>,
     extra_workers: Vec<(&'static str, BoxWorker)>,
     http_listener: Option<TcpListener>,

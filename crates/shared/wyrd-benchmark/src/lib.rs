@@ -203,7 +203,7 @@ impl Labels {
 /// Reads the benchmark metadata in `headers` onto the request `span`
 /// opens, so every timing recorded under it lands in its case and phase
 /// series; an unknown value is counted once in `invalid_labels` and
-/// classified [`INVALID`]. It does nothing unless timing is [`enable`]d or
+/// classified [`INVALID`]. It does nothing unless the recorder is [`install`]ed or
 /// when the request declares neither. The classification only selects a
 /// series: it carries no authority, tenant, or sampling choice.
 pub fn label_request(span: &tracing::Span, headers: &http::HeaderMap) {
@@ -248,7 +248,7 @@ fn labels_of(span: &tracing::Span) -> Labels {
 /// Records one request's server timing, and each of its `parts` as an
 /// observation of the part's own boundary, under `parent`'s
 /// classification and one lock acquisition; see
-/// [`record_timing_parts`]. Nothing is recorded unless [`enable`]d.
+/// [`record_timing_parts`]. Nothing is recorded unless [`install`]ed.
 pub(crate) fn record(
     parent: &tracing::Span,
     boundary: &'static str,
@@ -274,7 +274,7 @@ pub(crate) fn record(
 
 /// Records one query's executed-plan scan facts, rows and bytes when its
 /// scans reported them, under `span`'s classification and the query's
-/// terminal `outcome`. Nothing is recorded unless [`enable`]d; a missing
+/// terminal `outcome`. Nothing is recorded unless [`install`]ed; a missing
 /// fact is counted, never recorded as zero.
 pub fn record_scan(
     span: &tracing::Span,
@@ -1156,7 +1156,7 @@ impl IntervalScan {
 /// the union of the waits the owner does not count as its own work, such as
 /// provider exchanges or Verifier blocks, when the boundary has any, with
 /// the closed `boundary` and `outcome` labels. Nothing is recorded until
-/// [`enable`].
+/// [`install`].
 pub fn record_timing(
     parent: &tracing::Span,
     boundary: &'static str,

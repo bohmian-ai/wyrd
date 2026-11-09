@@ -1111,8 +1111,13 @@ pub(crate) fn mean_ms(distribution: Result<Distribution, String>) -> Reading {
 }
 
 /// Every Scribe acknowledgement in `population`: each timed append and
-/// each deduplicated retry's histogram observation, or why neither was
-/// recorded.
+/// each deduplicated retry's histogram observation.
+///
+/// # Errors
+///
+/// Returns why neither was recorded: no timed append and the retry
+/// histogram's [`Population::histogram`] refusal (absent, or it refused a
+/// value), or the merge's range refusal when both exist.
 pub(crate) fn acknowledgements(population: &Population) -> Result<Distribution, String> {
     let retries = population.histogram(SCRIBE_ACK, &[]);
     match (population.elapsed(SCRIBE_WRITE, "success"), retries) {

@@ -91,12 +91,21 @@ def test_definitions_edit_offline() -> None:
     step.add_depends_on("later").timeout_seconds(5)
     assert verifier.spec()["steps"][0] == {
         "id": "scan",
-        "action": {"kind": "code", "source": {"inline": "def f(**_):\n    return {}\n"}, "entrypoint": "f"},
+        "action": {
+            "kind": "code",
+            "source": {"inline": "def f(**_):\n    return {}\n"},
+            "entrypoint": "f",
+        },
         "requirements": [
             {
                 "id": "scan-ok",
                 "statement": "Fine",
-                "check": {"kind": "assert", "path": "steps.scan.output.ok", "operator": "equals", "expected": True},
+                "check": {
+                    "kind": "assert",
+                    "path": "steps.scan.output.ok",
+                    "operator": "equals",
+                    "expected": True,
+                },
             }
         ],
     }, "a child is captured as it was when passed"
@@ -120,7 +129,10 @@ def test_definitions_edit_offline() -> None:
 
     forward = Verifier("forward", "1.0.0", inputs={"report": str})
     forward.add_step(
-        Step("first", Action.code(CodeSource.inline("x"), "f").inputs({"later": "steps.second.output"}))
+        Step(
+            "first",
+            Action.code(CodeSource.inline("x"), "f").inputs({"later": "steps.second.output"}),
+        )
     )
     forward.add_requirement(
         Requirement("done", "Done", Check.assert_("steps.first.output.ok", "equals", True))
@@ -150,7 +162,9 @@ def test_definitions_edit_offline() -> None:
 
     replaced = Verifier("duplicated", "1.0.0", inputs={"report": str})
     replaced.inputs({"purpose": str})
-    assert list(replaced.spec()["inputs"]) == ["purpose"], "a whole-field setter replaces earlier additions"
+    assert list(replaced.spec()["inputs"]) == ["purpose"], (
+        "a whole-field setter replaces earlier additions"
+    )
 
     with pytest.raises(TypeError, match="unexpected keyword argument 'stepz'"):
         Verifier("typo", "1.0.0", stepz=[])
@@ -226,28 +240,53 @@ def test_every_native_family_constructs_canonical_specs() -> None:
             Data("authored", "1.0.0")
             .interface({"kind": "Parquet", "meta": {"compression": "Snappy"}})
             .schema({"columns": [{"name": "latency", "dtype": "float64"}]})
-            .stats({"row_count": 1, "col_count": 1, "byte_count": 1, "sha256": "c4f7700b380aff2662e88d034154d1890c33d3c12c8dda1a0ca9481f43bb9906"}),
+            .stats(
+                {
+                    "row_count": 1,
+                    "col_count": 1,
+                    "byte_count": 1,
+                    "sha256": "c4f7700b380aff2662e88d034154d1890c33d3c12c8dda1a0ca9481f43bb9906",
+                }
+            ),
             "Data",
         ),
         (
             Model(
                 "authored",
                 "1.0.0",
-                interface={"kind": "Custom", "meta": {"framework_version": "0.1.0", "loader_module": "assistant", "loader_class": "LatencyModel", "extra": {}}},
+                interface={
+                    "kind": "Custom",
+                    "meta": {
+                        "framework_version": "0.1.0",
+                        "loader_module": "assistant",
+                        "loader_class": "LatencyModel",
+                        "extra": {},
+                    },
+                },
                 task_type="Other",
-                signature={"inputs": [{"name": "latency", "dtype": "float64"}], "outputs": [{"name": "score", "dtype": "float64"}]},
+                signature={
+                    "inputs": [{"name": "latency", "dtype": "float64"}],
+                    "outputs": [{"name": "score", "dtype": "float64"}],
+                },
             ),
             "Model",
         ),
         (
-            Experiment("authored", "1.0.0", experiment_type="ab").add_target_ref(CardRef.model("ranker", "1.0.0")),
+            Experiment("authored", "1.0.0", experiment_type="ab").add_target_ref(
+                CardRef.model("ranker", "1.0.0")
+            ),
             "Experiment",
         ),
         (Mcp("authored", "1.0.0", server_name="files", transport="stdio").add_scope("read"), "Mcp"),
         (Audit("authored", "1.0.0", description="Quarterly review"), "Audit"),
         (Trigger("authored", "1.0.0", kind="schedule", cron="0 0 * * *"), "Trigger"),
         (Operator("authored", "1.0.0").action(pager), "Operator"),
-        (Prompt("authored", "1.0.0", provider="openai", model="gpt-4o").add_message({"role": "user", "content": "Hi"}), "Prompt"),
+        (
+            Prompt("authored", "1.0.0", provider="openai", model="gpt-4o").add_message(
+                {"role": "user", "content": "Hi"}
+            ),
+            "Prompt",
+        ),
         (
             Artifact("authored", "1.0.0", artifact_kind="document")
             .add_metadata("owner", {"type": "str", "value": "finance"})
@@ -255,13 +294,25 @@ def test_every_native_family_constructs_canonical_specs() -> None:
             .add_annotation("reviewed", "yes"),
             "Artifact",
         ),
-        (CardDefinition(CardKind.Policy, "authored", "1.0.0", {"description": "Sharing", "enforcement": "block"}), "Policy"),
+        (
+            CardDefinition(
+                CardKind.Policy,
+                "authored",
+                "1.0.0",
+                {"description": "Sharing", "enforcement": "block"},
+            ),
+            "Policy",
+        ),
         (judge(), "Agent"),
     ]
     for card, kind in singles:
         assert card.card_ref().kind == getattr(CardKind, kind)
         card.validate()
-    assert singles[3][0].spec() == {"server_name": "files", "transport": "stdio", "scopes": ["read"]}
+    assert singles[3][0].spec() == {
+        "server_name": "files",
+        "transport": "stdio",
+        "scopes": ["read"],
+    }
     assert singles[6][0].spec() == pager, "an Operator's action is flattened into its spec"
     assert singles[2][0].spec()["target_refs"] == [ref("Model", "ranker")]
 
@@ -271,10 +322,21 @@ def test_every_native_family_constructs_canonical_specs() -> None:
     local.validate()
 
     call = Action.agent(CardRef.agent("judge", "1.0.0"), inputs={"report": "inputs.report"})
-    call.add_workspace("/inputs/report.json", "inputs.report").add_workspace("/inputs/policy.json", policy)
-    check_call = Check.agent(judge(), inputs={"report": "inputs.report"}).workspace({"/inputs/policy.json": local.file("x.pdf")})
-    operators = ["equals", {"kind": "in_range", "min": 0.0, "max": 1.0, "inclusive": True}, {"kind": "matches_regex", "pattern": "^r"}]
-    checks = [Check.code(CodeSource.inline("def f():\n    return {}\n"), "f", response_format="verdict"), check_call]
+    call.add_workspace("/inputs/report.json", "inputs.report").add_workspace(
+        "/inputs/policy.json", policy
+    )
+    check_call = Check.agent(judge(), inputs={"report": "inputs.report"}).workspace(
+        {"/inputs/policy.json": local.file("x.pdf")}
+    )
+    operators = [
+        "equals",
+        {"kind": "in_range", "min": 0.0, "max": 1.0, "inclusive": True},
+        {"kind": "matches_regex", "pattern": "^r"},
+    ]
+    checks = [
+        Check.code(CodeSource.inline("def f():\n    return {}\n"), "f", response_format="verdict"),
+        check_call,
+    ]
     for operator in operators:
         checks += [
             Check.assert_("inputs.report", operator, 1),
@@ -291,53 +353,91 @@ def test_every_native_family_constructs_canonical_specs() -> None:
         },
         steps=[
             Step("extract", Action.extract("inputs.document")),
-            Step("judge", call, when={"path": "steps.extract.status", "operator": "equals", "expected": "succeeded"}),
+            Step(
+                "judge",
+                call,
+                when={
+                    "path": "steps.extract.status",
+                    "operator": "equals",
+                    "expected": "succeeded",
+                },
+            ),
             Step("summarize", Action.code(policy, "summarize").runtime("python")),
             {"id": "canonical", "action": {"kind": "extract", "from": "inputs.document"}},
         ],
-        requirements=[Requirement(f"r{index}", "Compared", check) for index, check in enumerate(checks)],
+        requirements=[
+            Requirement(f"r{index}", "Compared", check) for index, check in enumerate(checks)
+        ],
         decide={"pass_rate": {"threshold": 0.5}},
         context_capture="hash",
     )
     spec = verifier.spec()
     assert spec["steps"][1]["action"]["workspace"]["/inputs/policy.json"] == {
-        "artifact": {"card": ref("Artifact", "company-sharing-policy"), "path": "extracted/policy.json"}
+        "artifact": {
+            "card": ref("Artifact", "company-sharing-policy"),
+            "path": "extracted/policy.json",
+        }
     }
     assert spec["requirements"][1]["check"]["agent"] == {"sibling": ref("Agent", "judge")}
-    assert spec["requirements"][1]["check"]["workspace"]["/inputs/policy.json"]["artifact"]["card"] == ref(
-        "Artifact", "company-sharing-policy", "2.0.0"
-    ), "a local Artifact stands as its exact reference, published first"
+    assert spec["requirements"][1]["check"]["workspace"]["/inputs/policy.json"]["artifact"][
+        "card"
+    ] == ref("Artifact", "company-sharing-policy", "2.0.0"), (
+        "a local Artifact stands as its exact reference, published first"
+    )
     assert spec["requirements"][3]["check"] == {
         "kind": "assert",
         "each": "inputs.report.items[*]",
         "operator": "equals",
         "expected": 1,
     }
-    assert spec["steps"][3] == {"id": "canonical", "action": {"kind": "extract", "from": "inputs.document"}}
+    assert spec["steps"][3] == {
+        "id": "canonical",
+        "action": {"kind": "extract", "from": "inputs.document"},
+    }
     verifier.validate()
 
     group = Verifier(
         "conversation",
         "1.0.0",
-        inputs={"turns": InputSlot.source("verifiers.turn-check.inputs.turn"), "answered": "verifiers.turn-check.requirements.answered.outcome"},
+        inputs={
+            "turns": InputSlot.source("verifiers.turn-check.inputs.turn"),
+            "answered": "verifiers.turn-check.requirements.answered.outcome",
+        },
         order_by="inputs.turns.turn",
-        requirements=[Requirement("answered", "Answered", Check.each("inputs.answered[*]", "equals", "passed"))],
+        requirements=[
+            Requirement(
+                "answered", "Answered", Check.each("inputs.answered[*]", "equals", "passed")
+            )
+        ],
     )
     assert group.spec()["inputs"]["turns"] == "verifiers.turn-check.inputs.turn"
     group.validate()
 
     drift_spec = {
         "method": "Spc",
-        "signal": {"kind": "Distribution", "baseline_ref": ref("Data", "latency-baseline"), "features": ["latency"]},
+        "signal": {
+            "kind": "Distribution",
+            "baseline_ref": ref("Data", "latency-baseline"),
+            "features": ["latency"],
+        },
         "condition": {"kind": "Statistical"},
         "profile": {"kind": "Spc", "sample_size": 5},
     }
     drift = Verifier("latency-drift", "1.0.0", inputs={"latency": InputSlot.samples(["latency"])})
-    drift.add_requirement(Requirement("stable", "Stable", Check.drift("inputs.latency", drift_spec)))
-    assert drift.spec()["requirements"][0]["check"] == {"kind": "drift", "on": "inputs.latency", **drift_spec}
+    drift.add_requirement(
+        Requirement("stable", "Stable", Check.drift("inputs.latency", drift_spec))
+    )
+    assert drift.spec()["requirements"][0]["check"] == {
+        "kind": "drift",
+        "on": "inputs.latency",
+        **drift_spec,
+    }
     drift.validate()
 
-    binding = Binding(Verifier("checked", "1.0.0"), runs_on=Trigger("daily", "1.0.0", kind="schedule", cron="0 0 * * *"))
+    binding = Binding(
+        Verifier("checked", "1.0.0"),
+        runs_on=Trigger("daily", "1.0.0", kind="schedule", cron="0 0 * * *"),
+    )
     binding.add_on_failure(Operator("page", "1.0.0", action=pager)).add_on_failure(pager)
     binding.add_on_verdict_change(CardRef.operator("notify", "1.0.0"))
     bound = judge("bound").add_verified_by(binding)
@@ -352,7 +452,9 @@ def test_every_native_family_constructs_canonical_specs() -> None:
 
     registered = RegisteredRef(CardKind.Agent, "judge", "1.0.0")
     component = Component("judge", registered, source={"path": "services/judge", "kind": "python"})
-    component.add_config("region", {"type": "str", "value": "eu"}).add_verified_by(CardRef.verifier("checked", "1.0.0"))
+    component.add_config("region", {"type": "str", "value": "eu"}).add_verified_by(
+        CardRef.verifier("checked", "1.0.0")
+    )
     service = Service(
         "authored",
         "1.0.0",
@@ -379,7 +481,9 @@ def test_every_native_family_constructs_canonical_specs() -> None:
     file_source = CodeSource.file(POLICY / "missing.py")
     pending = Verifier("pending", "1.0.0", inputs={"report": str})
     pending.add_requirement(Requirement("coded", "Coded", Check.code(file_source, "f")))
-    assert pending.spec()["requirements"][0]["check"]["source"] is None, "a code file is read only at validation"
+    assert pending.spec()["requirements"][0]["check"]["source"] is None, (
+        "a code file is read only at validation"
+    )
     with pytest.raises(WyrdError) as refused:
         pending.validate()
     assert "missing.py" in str(refused.value.details)

@@ -28,10 +28,13 @@ JSON Schema; Pydantic is never imported for you.
 import os
 import pathlib
 from collections.abc import Iterable, Mapping, Sequence
-from typing import Self, TypeAlias, TypedDict, Unpack
+from typing import Any, Self, TypeAlias, TypedDict, Unpack
 
 from .. import cards
-from ..cards import CardKind, JsonValue
+from ..cards import CardKind, JsonScalar
+
+JsonInput: TypeAlias = JsonScalar | Sequence[JsonInput] | Mapping[str, JsonInput]
+"""Any JSON value as authored: nested mappings and sequences of JSON values."""
 
 PathLike: TypeAlias = str | os.PathLike[str] | pathlib.Path
 
@@ -65,16 +68,16 @@ FieldInput: TypeAlias = (
     | InputSlot
     | Action
     | Check
-    | JsonValue
+    | JsonInput
 )
 """A value at a reference position: a Card, an exact reference, an authoring value, or JSON."""
 
 BindingInput: TypeAlias = (
-    Binding | Verifier | CardRef | cards.CardRef | str | Mapping[str, JsonValue]
+    Binding | Verifier | CardRef | cards.CardRef | str | Mapping[str, JsonInput]
 )
 """A binding, or the Verifier, exact reference or YAML path it binds."""
 
-SlotInput: TypeAlias = InputSlot | str | type | Mapping[str, JsonValue]
+SlotInput: TypeAlias = InputSlot | str | type | Mapping[str, JsonInput]
 """An input slot: a slot, a source reference, a class standing for a schema, or a mapping.
 
 A mapping whose ``type`` is ``json``, ``media``, ``trace`` or ``samples`` is a
@@ -251,19 +254,19 @@ class ServiceFields(TypedDict, total=False):
 
     labels: Mapping[str, str]
     annotations: Mapping[str, str]
-    description: JsonValue
-    service_type: JsonValue
-    components: Sequence[Component | Mapping[str, JsonValue]]
+    description: JsonInput
+    service_type: JsonInput
+    components: Sequence[Component | Mapping[str, JsonInput]]
     verified_by: Sequence[BindingInput]
-    tables: Sequence[JsonValue]
-    entry_point: JsonValue
-    deployment: Mapping[str, JsonValue]
-    runtime: JsonValue
-    service_config: Mapping[str, JsonValue]
-    credential_refs: Sequence[JsonValue]
-    content_hash: JsonValue
-    lock_hash: JsonValue
-    metadata: Mapping[str, JsonValue]
+    tables: Sequence[JsonInput]
+    entry_point: JsonInput
+    deployment: Mapping[str, JsonInput]
+    runtime: JsonInput
+    service_config: Mapping[str, JsonInput]
+    credential_refs: Sequence[JsonInput]
+    content_hash: JsonInput
+    lock_hash: JsonInput
+    metadata: Mapping[str, JsonInput]
 
 class Service:
     """A Service Card: a running system, its components, and the Verifiers that check it."""
@@ -282,7 +285,7 @@ class Service:
         """The exact reference this Card registers as."""
         ...
 
-    def spec(self) -> dict[str, JsonValue]:
+    def spec(self) -> dict[str, Any]:
         """The spec as authored so far, before validation.
 
         A ``CodeSource.file`` position is ``None`` until validation reads it.
@@ -335,7 +338,7 @@ class Service:
         """
         ...
 
-    def description(self, value: JsonValue) -> Self:
+    def description(self, value: JsonInput) -> Self:
         """Set ``description``, replacing its earlier value; returns this value.
 
         Args:
@@ -343,7 +346,7 @@ class Service:
         """
         ...
 
-    def service_type(self, value: JsonValue) -> Self:
+    def service_type(self, value: JsonInput) -> Self:
         """Set ``service_type``, replacing its earlier value; returns this value.
 
         Args:
@@ -351,7 +354,7 @@ class Service:
         """
         ...
 
-    def components(self, items: Iterable[Component | Mapping[str, JsonValue]]) -> Self:
+    def components(self, items: Iterable[Component | Mapping[str, JsonInput]]) -> Self:
         """Set the whole ``components`` list, replacing every earlier entry; returns this value.
 
         Args:
@@ -359,7 +362,7 @@ class Service:
         """
         ...
 
-    def add_component(self, item: Component | Mapping[str, JsonValue]) -> Self:
+    def add_component(self, item: Component | Mapping[str, JsonInput]) -> Self:
         """Append one entry to ``components``; returns this value.
 
         Args:
@@ -383,7 +386,7 @@ class Service:
         """
         ...
 
-    def tables(self, items: Iterable[JsonValue]) -> Self:
+    def tables(self, items: Iterable[JsonInput]) -> Self:
         """Set the whole ``tables`` list, replacing every earlier entry; returns this value.
 
         Args:
@@ -391,7 +394,7 @@ class Service:
         """
         ...
 
-    def add_table(self, item: JsonValue) -> Self:
+    def add_table(self, item: JsonInput) -> Self:
         """Append one entry to ``tables``; returns this value.
 
         Args:
@@ -399,7 +402,7 @@ class Service:
         """
         ...
 
-    def entry_point(self, value: JsonValue) -> Self:
+    def entry_point(self, value: JsonInput) -> Self:
         """Set ``entry_point``, replacing its earlier value; returns this value.
 
         Args:
@@ -407,7 +410,7 @@ class Service:
         """
         ...
 
-    def deployment(self, entries: Mapping[str, JsonValue]) -> Self:
+    def deployment(self, entries: Mapping[str, JsonInput]) -> Self:
         """Set the whole ``deployment`` map, replacing every earlier entry; returns this value.
 
         Args:
@@ -415,7 +418,7 @@ class Service:
         """
         ...
 
-    def add_deployment(self, key: str, value: JsonValue) -> Self:
+    def add_deployment(self, key: str, value: JsonInput) -> Self:
         """Insert the entry ``key`` into ``deployment``; returns this value.
 
         Args:
@@ -424,7 +427,7 @@ class Service:
         """
         ...
 
-    def runtime(self, value: JsonValue) -> Self:
+    def runtime(self, value: JsonInput) -> Self:
         """Set ``runtime``, replacing its earlier value; returns this value.
 
         Args:
@@ -432,7 +435,7 @@ class Service:
         """
         ...
 
-    def service_config(self, entries: Mapping[str, JsonValue]) -> Self:
+    def service_config(self, entries: Mapping[str, JsonInput]) -> Self:
         """Set the whole ``service_config`` map, replacing every earlier entry; returns this value.
 
         Args:
@@ -440,7 +443,7 @@ class Service:
         """
         ...
 
-    def add_service_config(self, key: str, value: JsonValue) -> Self:
+    def add_service_config(self, key: str, value: JsonInput) -> Self:
         """Insert the entry ``key`` into ``service_config``; returns this value.
 
         Args:
@@ -449,7 +452,7 @@ class Service:
         """
         ...
 
-    def credential_refs(self, items: Iterable[JsonValue]) -> Self:
+    def credential_refs(self, items: Iterable[JsonInput]) -> Self:
         """Set the whole ``credential_refs`` list, replacing every earlier entry; returns this value.
 
         Args:
@@ -457,7 +460,7 @@ class Service:
         """
         ...
 
-    def add_credential_ref(self, item: JsonValue) -> Self:
+    def add_credential_ref(self, item: JsonInput) -> Self:
         """Append one entry to ``credential_refs``; returns this value.
 
         Args:
@@ -465,7 +468,7 @@ class Service:
         """
         ...
 
-    def content_hash(self, value: JsonValue) -> Self:
+    def content_hash(self, value: JsonInput) -> Self:
         """Set ``content_hash``, replacing its earlier value; returns this value.
 
         Args:
@@ -473,7 +476,7 @@ class Service:
         """
         ...
 
-    def lock_hash(self, value: JsonValue) -> Self:
+    def lock_hash(self, value: JsonInput) -> Self:
         """Set ``lock_hash``, replacing its earlier value; returns this value.
 
         Args:
@@ -481,7 +484,7 @@ class Service:
         """
         ...
 
-    def metadata(self, entries: Mapping[str, JsonValue]) -> Self:
+    def metadata(self, entries: Mapping[str, JsonInput]) -> Self:
         """Set the whole ``metadata`` map, replacing every earlier entry; returns this value.
 
         Args:
@@ -489,7 +492,7 @@ class Service:
         """
         ...
 
-    def add_metadata(self, key: str, value: JsonValue) -> Self:
+    def add_metadata(self, key: str, value: JsonInput) -> Self:
         """Insert the entry ``key`` into ``metadata``; returns this value.
 
         Args:
@@ -504,9 +507,9 @@ class AgentFields(TypedDict, total=False):
     labels: Mapping[str, str]
     annotations: Mapping[str, str]
     prompt: FieldInput
-    execution_route: JsonValue
-    tool_names: Sequence[JsonValue]
-    run_config: JsonValue
+    execution_route: JsonInput
+    tool_names: Sequence[JsonInput]
+    run_config: JsonInput
     verified_by: Sequence[BindingInput]
 
 class Agent:
@@ -526,7 +529,7 @@ class Agent:
         """The exact reference this Card registers as."""
         ...
 
-    def spec(self) -> dict[str, JsonValue]:
+    def spec(self) -> dict[str, Any]:
         """The spec as authored so far, before validation.
 
         A ``CodeSource.file`` position is ``None`` until validation reads it.
@@ -587,7 +590,7 @@ class Agent:
         """
         ...
 
-    def execution_route(self, value: JsonValue) -> Self:
+    def execution_route(self, value: JsonInput) -> Self:
         """Set ``execution_route``, replacing its earlier value; returns this value.
 
         Args:
@@ -595,7 +598,7 @@ class Agent:
         """
         ...
 
-    def tool_names(self, items: Iterable[JsonValue]) -> Self:
+    def tool_names(self, items: Iterable[JsonInput]) -> Self:
         """Set the whole ``tool_names`` list, replacing every earlier entry; returns this value.
 
         Args:
@@ -603,7 +606,7 @@ class Agent:
         """
         ...
 
-    def add_tool_name(self, item: JsonValue) -> Self:
+    def add_tool_name(self, item: JsonInput) -> Self:
         """Append one entry to ``tool_names``; returns this value.
 
         Args:
@@ -611,7 +614,7 @@ class Agent:
         """
         ...
 
-    def run_config(self, value: JsonValue) -> Self:
+    def run_config(self, value: JsonInput) -> Self:
         """Set ``run_config``, replacing its earlier value; returns this value.
 
         Args:
@@ -640,14 +643,14 @@ class PromptFields(TypedDict, total=False):
 
     labels: Mapping[str, str]
     annotations: Mapping[str, str]
-    provider: JsonValue
-    model: JsonValue
-    system: JsonValue
-    messages: Sequence[JsonValue]
-    settings: JsonValue
-    response_format: JsonValue
-    format: JsonValue
-    body: Mapping[str, JsonValue]
+    provider: JsonInput
+    model: JsonInput
+    system: JsonInput
+    messages: Sequence[JsonInput]
+    settings: JsonInput
+    response_format: JsonInput
+    format: JsonInput
+    body: Mapping[str, JsonInput]
 
 class Prompt:
     """A Prompt Card: provider, model, and the authored prompt."""
@@ -666,7 +669,7 @@ class Prompt:
         """The exact reference this Card registers as."""
         ...
 
-    def spec(self) -> dict[str, JsonValue]:
+    def spec(self) -> dict[str, Any]:
         """The spec as authored so far, before validation.
 
         A ``CodeSource.file`` position is ``None`` until validation reads it.
@@ -719,7 +722,7 @@ class Prompt:
         """
         ...
 
-    def provider(self, value: JsonValue) -> Self:
+    def provider(self, value: JsonInput) -> Self:
         """Set ``provider``, replacing its earlier value; returns this value.
 
         Args:
@@ -727,7 +730,7 @@ class Prompt:
         """
         ...
 
-    def model(self, value: JsonValue) -> Self:
+    def model(self, value: JsonInput) -> Self:
         """Set ``model``, replacing its earlier value; returns this value.
 
         Args:
@@ -735,7 +738,7 @@ class Prompt:
         """
         ...
 
-    def system(self, value: JsonValue) -> Self:
+    def system(self, value: JsonInput) -> Self:
         """Set ``system``, replacing its earlier value; returns this value.
 
         Args:
@@ -743,7 +746,7 @@ class Prompt:
         """
         ...
 
-    def messages(self, items: Iterable[JsonValue]) -> Self:
+    def messages(self, items: Iterable[JsonInput]) -> Self:
         """Set the whole ``messages`` list, replacing every earlier entry; returns this value.
 
         Args:
@@ -751,7 +754,7 @@ class Prompt:
         """
         ...
 
-    def add_message(self, item: JsonValue) -> Self:
+    def add_message(self, item: JsonInput) -> Self:
         """Append one entry to ``messages``; returns this value.
 
         Args:
@@ -759,7 +762,7 @@ class Prompt:
         """
         ...
 
-    def settings(self, value: JsonValue) -> Self:
+    def settings(self, value: JsonInput) -> Self:
         """Set ``settings``, replacing its earlier value; returns this value.
 
         Args:
@@ -767,7 +770,7 @@ class Prompt:
         """
         ...
 
-    def response_format(self, value: JsonValue) -> Self:
+    def response_format(self, value: JsonInput) -> Self:
         """Set ``response_format``, replacing its earlier value; returns this value.
 
         Args:
@@ -775,7 +778,7 @@ class Prompt:
         """
         ...
 
-    def format(self, value: JsonValue) -> Self:
+    def format(self, value: JsonInput) -> Self:
         """Set ``format``, replacing its earlier value; returns this value.
 
         Args:
@@ -783,7 +786,7 @@ class Prompt:
         """
         ...
 
-    def body(self, entries: Mapping[str, JsonValue]) -> Self:
+    def body(self, entries: Mapping[str, JsonInput]) -> Self:
         """Set the whole ``body`` map, replacing every earlier entry; returns this value.
 
         Args:
@@ -791,7 +794,7 @@ class Prompt:
         """
         ...
 
-    def add_body(self, key: str, value: JsonValue) -> Self:
+    def add_body(self, key: str, value: JsonInput) -> Self:
         """Insert the entry ``key`` into ``body``; returns this value.
 
         Args:
@@ -805,13 +808,13 @@ class VerifierFields(TypedDict, total=False):
 
     labels: Mapping[str, str]
     annotations: Mapping[str, str]
-    description: JsonValue
+    description: JsonInput
     inputs: Mapping[str, SlotInput]
-    steps: Sequence[Step | Mapping[str, JsonValue]]
-    requirements: Sequence[Requirement | Mapping[str, JsonValue]]
-    decide: JsonValue
-    context_capture: JsonValue
-    order_by: JsonValue
+    steps: Sequence[Step | Mapping[str, JsonInput]]
+    requirements: Sequence[Requirement | Mapping[str, JsonInput]]
+    decide: JsonInput
+    context_capture: JsonInput
+    order_by: JsonInput
 
 class Verifier:
     """A Verifier Card: the evidence it accepts, the steps that compute over it, and the
@@ -831,7 +834,7 @@ class Verifier:
         """The exact reference this Card registers as."""
         ...
 
-    def spec(self) -> dict[str, JsonValue]:
+    def spec(self) -> dict[str, Any]:
         """The spec as authored so far, before validation.
 
         A ``CodeSource.file`` position is ``None`` until validation reads it.
@@ -850,7 +853,7 @@ class Verifier:
         """
         ...
 
-    def plan(self) -> dict[str, JsonValue]:
+    def plan(self) -> dict[str, Any]:
         """The step stages the server would execute, as ``{stages, task_count}``.
 
         Raises:
@@ -893,7 +896,7 @@ class Verifier:
         """
         ...
 
-    def description(self, value: JsonValue) -> Self:
+    def description(self, value: JsonInput) -> Self:
         """Set ``description``, replacing its earlier value; returns this value.
 
         Args:
@@ -918,7 +921,7 @@ class Verifier:
         """
         ...
 
-    def steps(self, items: Iterable[Step | Mapping[str, JsonValue]]) -> Self:
+    def steps(self, items: Iterable[Step | Mapping[str, JsonInput]]) -> Self:
         """Set the whole ``steps`` list, replacing every earlier entry; returns this value.
 
         Args:
@@ -926,7 +929,7 @@ class Verifier:
         """
         ...
 
-    def add_step(self, item: Step | Mapping[str, JsonValue]) -> Self:
+    def add_step(self, item: Step | Mapping[str, JsonInput]) -> Self:
         """Append one entry to ``steps``; returns this value.
 
         Args:
@@ -934,7 +937,7 @@ class Verifier:
         """
         ...
 
-    def requirements(self, items: Iterable[Requirement | Mapping[str, JsonValue]]) -> Self:
+    def requirements(self, items: Iterable[Requirement | Mapping[str, JsonInput]]) -> Self:
         """Set the whole ``requirements`` list, replacing every earlier entry; returns this value.
 
         Args:
@@ -942,7 +945,7 @@ class Verifier:
         """
         ...
 
-    def add_requirement(self, item: Requirement | Mapping[str, JsonValue]) -> Self:
+    def add_requirement(self, item: Requirement | Mapping[str, JsonInput]) -> Self:
         """Append one entry to ``requirements``; returns this value.
 
         Args:
@@ -950,7 +953,7 @@ class Verifier:
         """
         ...
 
-    def decide(self, value: JsonValue) -> Self:
+    def decide(self, value: JsonInput) -> Self:
         """Set ``decide``, replacing its earlier value; returns this value.
 
         Args:
@@ -958,7 +961,7 @@ class Verifier:
         """
         ...
 
-    def context_capture(self, value: JsonValue) -> Self:
+    def context_capture(self, value: JsonInput) -> Self:
         """Set ``context_capture``, replacing its earlier value; returns this value.
 
         Args:
@@ -966,7 +969,7 @@ class Verifier:
         """
         ...
 
-    def order_by(self, value: JsonValue) -> Self:
+    def order_by(self, value: JsonInput) -> Self:
         """Set ``order_by``, replacing its earlier value; returns this value.
 
         Args:
@@ -979,15 +982,15 @@ class ArtifactFields(TypedDict, total=False):
 
     labels: Mapping[str, str]
     annotations: Mapping[str, str]
-    artifact_kind: JsonValue
-    artifact_uris: Sequence[JsonValue]
-    content_type: JsonValue
-    size_bytes: JsonValue
-    integrity: JsonValue
+    artifact_kind: JsonInput
+    artifact_uris: Sequence[JsonInput]
+    content_type: JsonInput
+    size_bytes: JsonInput
+    integrity: JsonInput
     schema_ref: FieldInput
-    framework_adapter: JsonValue
-    external_uri: JsonValue
-    metadata: Mapping[str, JsonValue]
+    framework_adapter: JsonInput
+    external_uri: JsonInput
+    metadata: Mapping[str, JsonInput]
 
 class Artifact:
     """An Artifact Card: a local file or directory published before the graph that
@@ -1007,7 +1010,7 @@ class Artifact:
         """The exact reference this Card registers as."""
         ...
 
-    def spec(self) -> dict[str, JsonValue]:
+    def spec(self) -> dict[str, Any]:
         """The spec as authored so far, before validation.
 
         A ``CodeSource.file`` position is ``None`` until validation reads it.
@@ -1092,7 +1095,7 @@ class Artifact:
         """
         ...
 
-    def artifact_kind(self, value: JsonValue) -> Self:
+    def artifact_kind(self, value: JsonInput) -> Self:
         """Set ``artifact_kind``, replacing its earlier value; returns this value.
 
         Args:
@@ -1100,7 +1103,7 @@ class Artifact:
         """
         ...
 
-    def artifact_uris(self, items: Iterable[JsonValue]) -> Self:
+    def artifact_uris(self, items: Iterable[JsonInput]) -> Self:
         """Set the whole ``artifact_uris`` list, replacing every earlier entry; returns this value.
 
         Args:
@@ -1108,7 +1111,7 @@ class Artifact:
         """
         ...
 
-    def add_artifact_uri(self, item: JsonValue) -> Self:
+    def add_artifact_uri(self, item: JsonInput) -> Self:
         """Append one entry to ``artifact_uris``; returns this value.
 
         Args:
@@ -1116,7 +1119,7 @@ class Artifact:
         """
         ...
 
-    def content_type(self, value: JsonValue) -> Self:
+    def content_type(self, value: JsonInput) -> Self:
         """Set ``content_type``, replacing its earlier value; returns this value.
 
         Args:
@@ -1124,7 +1127,7 @@ class Artifact:
         """
         ...
 
-    def size_bytes(self, value: JsonValue) -> Self:
+    def size_bytes(self, value: JsonInput) -> Self:
         """Set ``size_bytes``, replacing its earlier value; returns this value.
 
         Args:
@@ -1132,7 +1135,7 @@ class Artifact:
         """
         ...
 
-    def integrity(self, value: JsonValue) -> Self:
+    def integrity(self, value: JsonInput) -> Self:
         """Set ``integrity``, replacing its earlier value; returns this value.
 
         Args:
@@ -1148,7 +1151,7 @@ class Artifact:
         """
         ...
 
-    def framework_adapter(self, value: JsonValue) -> Self:
+    def framework_adapter(self, value: JsonInput) -> Self:
         """Set ``framework_adapter``, replacing its earlier value; returns this value.
 
         Args:
@@ -1156,7 +1159,7 @@ class Artifact:
         """
         ...
 
-    def external_uri(self, value: JsonValue) -> Self:
+    def external_uri(self, value: JsonInput) -> Self:
         """Set ``external_uri``, replacing its earlier value; returns this value.
 
         Args:
@@ -1164,7 +1167,7 @@ class Artifact:
         """
         ...
 
-    def metadata(self, entries: Mapping[str, JsonValue]) -> Self:
+    def metadata(self, entries: Mapping[str, JsonInput]) -> Self:
         """Set the whole ``metadata`` map, replacing every earlier entry; returns this value.
 
         Args:
@@ -1172,7 +1175,7 @@ class Artifact:
         """
         ...
 
-    def add_metadata(self, key: str, value: JsonValue) -> Self:
+    def add_metadata(self, key: str, value: JsonInput) -> Self:
         """Insert the entry ``key`` into ``metadata``; returns this value.
 
         Args:
@@ -1186,10 +1189,10 @@ class ModelFields(TypedDict, total=False):
 
     labels: Mapping[str, str]
     annotations: Mapping[str, str]
-    interface: JsonValue
-    task_type: JsonValue
-    signature: JsonValue
-    sample_input: JsonValue
+    interface: JsonInput
+    task_type: JsonInput
+    signature: JsonInput
+    sample_input: JsonInput
     card_refs: Sequence[FieldInput]
 
 class Model:
@@ -1209,7 +1212,7 @@ class Model:
         """The exact reference this Card registers as."""
         ...
 
-    def spec(self) -> dict[str, JsonValue]:
+    def spec(self) -> dict[str, Any]:
         """The spec as authored so far, before validation.
 
         A ``CodeSource.file`` position is ``None`` until validation reads it.
@@ -1262,7 +1265,7 @@ class Model:
         """
         ...
 
-    def interface(self, value: JsonValue) -> Self:
+    def interface(self, value: JsonInput) -> Self:
         """Set ``interface``, replacing its earlier value; returns this value.
 
         Args:
@@ -1270,7 +1273,7 @@ class Model:
         """
         ...
 
-    def task_type(self, value: JsonValue) -> Self:
+    def task_type(self, value: JsonInput) -> Self:
         """Set ``task_type``, replacing its earlier value; returns this value.
 
         Args:
@@ -1278,7 +1281,7 @@ class Model:
         """
         ...
 
-    def signature(self, value: JsonValue) -> Self:
+    def signature(self, value: JsonInput) -> Self:
         """Set ``signature``, replacing its earlier value; returns this value.
 
         Args:
@@ -1286,7 +1289,7 @@ class Model:
         """
         ...
 
-    def sample_input(self, value: JsonValue) -> Self:
+    def sample_input(self, value: JsonInput) -> Self:
         """Set ``sample_input``, replacing its earlier value; returns this value.
 
         Args:
@@ -1315,13 +1318,13 @@ class DataFields(TypedDict, total=False):
 
     labels: Mapping[str, str]
     annotations: Mapping[str, str]
-    interface: JsonValue
-    schema: JsonValue
+    interface: JsonInput
+    schema: JsonInput
     card_refs: Sequence[FieldInput]
     splits: Mapping[str, FieldInput]
-    target_columns: Sequence[JsonValue]
-    sql: JsonValue
-    stats: JsonValue
+    target_columns: Sequence[JsonInput]
+    sql: JsonInput
+    stats: JsonInput
 
 class Data:
     """A Data Card: a dataset's interface, schema, splits, and target columns."""
@@ -1340,7 +1343,7 @@ class Data:
         """The exact reference this Card registers as."""
         ...
 
-    def spec(self) -> dict[str, JsonValue]:
+    def spec(self) -> dict[str, Any]:
         """The spec as authored so far, before validation.
 
         A ``CodeSource.file`` position is ``None`` until validation reads it.
@@ -1393,7 +1396,7 @@ class Data:
         """
         ...
 
-    def interface(self, value: JsonValue) -> Self:
+    def interface(self, value: JsonInput) -> Self:
         """Set ``interface``, replacing its earlier value; returns this value.
 
         Args:
@@ -1401,7 +1404,7 @@ class Data:
         """
         ...
 
-    def schema(self, value: JsonValue) -> Self:
+    def schema(self, value: JsonInput) -> Self:
         """Set ``schema``, replacing its earlier value; returns this value.
 
         Args:
@@ -1442,7 +1445,7 @@ class Data:
         """
         ...
 
-    def target_columns(self, items: Iterable[JsonValue]) -> Self:
+    def target_columns(self, items: Iterable[JsonInput]) -> Self:
         """Set the whole ``target_columns`` list, replacing every earlier entry; returns this value.
 
         Args:
@@ -1450,7 +1453,7 @@ class Data:
         """
         ...
 
-    def add_target_column(self, item: JsonValue) -> Self:
+    def add_target_column(self, item: JsonInput) -> Self:
         """Append one entry to ``target_columns``; returns this value.
 
         Args:
@@ -1458,7 +1461,7 @@ class Data:
         """
         ...
 
-    def sql(self, value: JsonValue) -> Self:
+    def sql(self, value: JsonInput) -> Self:
         """Set ``sql``, replacing its earlier value; returns this value.
 
         Args:
@@ -1466,7 +1469,7 @@ class Data:
         """
         ...
 
-    def stats(self, value: JsonValue) -> Self:
+    def stats(self, value: JsonInput) -> Self:
         """Set ``stats``, replacing its earlier value; returns this value.
 
         Args:
@@ -1479,15 +1482,15 @@ class ExperimentFields(TypedDict, total=False):
 
     labels: Mapping[str, str]
     annotations: Mapping[str, str]
-    experiment_type: JsonValue
-    description: JsonValue
+    experiment_type: JsonInput
+    description: JsonInput
     target_refs: Sequence[FieldInput]
-    default_parameters: Mapping[str, JsonValue]
-    run_refs: Sequence[JsonValue]
-    summary_metrics: Sequence[JsonValue]
-    best_run_ref: JsonValue
+    default_parameters: Mapping[str, JsonInput]
+    run_refs: Sequence[JsonInput]
+    summary_metrics: Sequence[JsonInput]
+    best_run_ref: JsonInput
     card_refs: Sequence[FieldInput]
-    details: Mapping[str, JsonValue]
+    details: Mapping[str, JsonInput]
 
 class Experiment:
     """An Experiment Card: the targets and parameters of a set of runs, with their summary
@@ -1507,7 +1510,7 @@ class Experiment:
         """The exact reference this Card registers as."""
         ...
 
-    def spec(self) -> dict[str, JsonValue]:
+    def spec(self) -> dict[str, Any]:
         """The spec as authored so far, before validation.
 
         A ``CodeSource.file`` position is ``None`` until validation reads it.
@@ -1560,7 +1563,7 @@ class Experiment:
         """
         ...
 
-    def experiment_type(self, value: JsonValue) -> Self:
+    def experiment_type(self, value: JsonInput) -> Self:
         """Set ``experiment_type``, replacing its earlier value; returns this value.
 
         Args:
@@ -1568,7 +1571,7 @@ class Experiment:
         """
         ...
 
-    def description(self, value: JsonValue) -> Self:
+    def description(self, value: JsonInput) -> Self:
         """Set ``description``, replacing its earlier value; returns this value.
 
         Args:
@@ -1592,7 +1595,7 @@ class Experiment:
         """
         ...
 
-    def default_parameters(self, entries: Mapping[str, JsonValue]) -> Self:
+    def default_parameters(self, entries: Mapping[str, JsonInput]) -> Self:
         """Set the whole ``default_parameters`` map, replacing every earlier entry; returns this value.
 
         Args:
@@ -1600,7 +1603,7 @@ class Experiment:
         """
         ...
 
-    def add_default_parameter(self, key: str, value: JsonValue) -> Self:
+    def add_default_parameter(self, key: str, value: JsonInput) -> Self:
         """Insert the entry ``key`` into ``default_parameters``; returns this value.
 
         Args:
@@ -1609,7 +1612,7 @@ class Experiment:
         """
         ...
 
-    def run_refs(self, items: Iterable[JsonValue]) -> Self:
+    def run_refs(self, items: Iterable[JsonInput]) -> Self:
         """Set the whole ``run_refs`` list, replacing every earlier entry; returns this value.
 
         Args:
@@ -1617,7 +1620,7 @@ class Experiment:
         """
         ...
 
-    def add_run_ref(self, item: JsonValue) -> Self:
+    def add_run_ref(self, item: JsonInput) -> Self:
         """Append one entry to ``run_refs``; returns this value.
 
         Args:
@@ -1625,7 +1628,7 @@ class Experiment:
         """
         ...
 
-    def summary_metrics(self, items: Iterable[JsonValue]) -> Self:
+    def summary_metrics(self, items: Iterable[JsonInput]) -> Self:
         """Set the whole ``summary_metrics`` list, replacing every earlier entry; returns this value.
 
         Args:
@@ -1633,7 +1636,7 @@ class Experiment:
         """
         ...
 
-    def add_summary_metric(self, item: JsonValue) -> Self:
+    def add_summary_metric(self, item: JsonInput) -> Self:
         """Append one entry to ``summary_metrics``; returns this value.
 
         Args:
@@ -1641,7 +1644,7 @@ class Experiment:
         """
         ...
 
-    def best_run_ref(self, value: JsonValue) -> Self:
+    def best_run_ref(self, value: JsonInput) -> Self:
         """Set ``best_run_ref``, replacing its earlier value; returns this value.
 
         Args:
@@ -1665,7 +1668,7 @@ class Experiment:
         """
         ...
 
-    def details(self, entries: Mapping[str, JsonValue]) -> Self:
+    def details(self, entries: Mapping[str, JsonInput]) -> Self:
         """Set the whole ``details`` map, replacing every earlier entry; returns this value.
 
         Args:
@@ -1673,7 +1676,7 @@ class Experiment:
         """
         ...
 
-    def add_detail(self, key: str, value: JsonValue) -> Self:
+    def add_detail(self, key: str, value: JsonInput) -> Self:
         """Insert the entry ``key`` into ``details``; returns this value.
 
         Args:
@@ -1687,12 +1690,12 @@ class McpFields(TypedDict, total=False):
 
     labels: Mapping[str, str]
     annotations: Mapping[str, str]
-    description: JsonValue
-    server_name: JsonValue
-    transport: JsonValue
+    description: JsonInput
+    server_name: JsonInput
+    transport: JsonInput
     tool_refs: Sequence[FieldInput]
-    scopes: Sequence[JsonValue]
-    details: Mapping[str, JsonValue]
+    scopes: Sequence[JsonInput]
+    details: Mapping[str, JsonInput]
 
 class Mcp:
     """An Mcp Card: an MCP server and the tools it exposes."""
@@ -1711,7 +1714,7 @@ class Mcp:
         """The exact reference this Card registers as."""
         ...
 
-    def spec(self) -> dict[str, JsonValue]:
+    def spec(self) -> dict[str, Any]:
         """The spec as authored so far, before validation.
 
         A ``CodeSource.file`` position is ``None`` until validation reads it.
@@ -1764,7 +1767,7 @@ class Mcp:
         """
         ...
 
-    def description(self, value: JsonValue) -> Self:
+    def description(self, value: JsonInput) -> Self:
         """Set ``description``, replacing its earlier value; returns this value.
 
         Args:
@@ -1772,7 +1775,7 @@ class Mcp:
         """
         ...
 
-    def server_name(self, value: JsonValue) -> Self:
+    def server_name(self, value: JsonInput) -> Self:
         """Set ``server_name``, replacing its earlier value; returns this value.
 
         Args:
@@ -1780,7 +1783,7 @@ class Mcp:
         """
         ...
 
-    def transport(self, value: JsonValue) -> Self:
+    def transport(self, value: JsonInput) -> Self:
         """Set ``transport``, replacing its earlier value; returns this value.
 
         Args:
@@ -1804,7 +1807,7 @@ class Mcp:
         """
         ...
 
-    def scopes(self, items: Iterable[JsonValue]) -> Self:
+    def scopes(self, items: Iterable[JsonInput]) -> Self:
         """Set the whole ``scopes`` list, replacing every earlier entry; returns this value.
 
         Args:
@@ -1812,7 +1815,7 @@ class Mcp:
         """
         ...
 
-    def add_scope(self, item: JsonValue) -> Self:
+    def add_scope(self, item: JsonInput) -> Self:
         """Append one entry to ``scopes``; returns this value.
 
         Args:
@@ -1820,7 +1823,7 @@ class Mcp:
         """
         ...
 
-    def details(self, entries: Mapping[str, JsonValue]) -> Self:
+    def details(self, entries: Mapping[str, JsonInput]) -> Self:
         """Set the whole ``details`` map, replacing every earlier entry; returns this value.
 
         Args:
@@ -1828,7 +1831,7 @@ class Mcp:
         """
         ...
 
-    def add_detail(self, key: str, value: JsonValue) -> Self:
+    def add_detail(self, key: str, value: JsonInput) -> Self:
         """Insert the entry ``key`` into ``details``; returns this value.
 
         Args:
@@ -1842,11 +1845,11 @@ class AuditFields(TypedDict, total=False):
 
     labels: Mapping[str, str]
     annotations: Mapping[str, str]
-    description: JsonValue
+    description: JsonInput
     subject_refs: Sequence[FieldInput]
     policy_refs: Sequence[FieldInput]
     evidence_refs: Sequence[FieldInput]
-    details: Mapping[str, JsonValue]
+    details: Mapping[str, JsonInput]
 
 class Audit:
     """An Audit Card: subjects, policies, and evidence."""
@@ -1865,7 +1868,7 @@ class Audit:
         """The exact reference this Card registers as."""
         ...
 
-    def spec(self) -> dict[str, JsonValue]:
+    def spec(self) -> dict[str, Any]:
         """The spec as authored so far, before validation.
 
         A ``CodeSource.file`` position is ``None`` until validation reads it.
@@ -1918,7 +1921,7 @@ class Audit:
         """
         ...
 
-    def description(self, value: JsonValue) -> Self:
+    def description(self, value: JsonInput) -> Self:
         """Set ``description``, replacing its earlier value; returns this value.
 
         Args:
@@ -1974,7 +1977,7 @@ class Audit:
         """
         ...
 
-    def details(self, entries: Mapping[str, JsonValue]) -> Self:
+    def details(self, entries: Mapping[str, JsonInput]) -> Self:
         """Set the whole ``details`` map, replacing every earlier entry; returns this value.
 
         Args:
@@ -1982,7 +1985,7 @@ class Audit:
         """
         ...
 
-    def add_detail(self, key: str, value: JsonValue) -> Self:
+    def add_detail(self, key: str, value: JsonInput) -> Self:
         """Insert the entry ``key`` into ``details``; returns this value.
 
         Args:
@@ -1996,11 +1999,11 @@ class TriggerFields(TypedDict, total=False):
 
     labels: Mapping[str, str]
     annotations: Mapping[str, str]
-    description: JsonValue
-    kind: JsonValue
-    cron: JsonValue
-    tz: JsonValue
-    after: JsonValue
+    description: JsonInput
+    kind: JsonInput
+    cron: JsonInput
+    tz: JsonInput
+    after: JsonInput
 
 class Trigger:
     """A Trigger Card: when a binding's Verifier runs. ``kind`` is ``schedule`` with
@@ -2020,7 +2023,7 @@ class Trigger:
         """The exact reference this Card registers as."""
         ...
 
-    def spec(self) -> dict[str, JsonValue]:
+    def spec(self) -> dict[str, Any]:
         """The spec as authored so far, before validation.
 
         A ``CodeSource.file`` position is ``None`` until validation reads it.
@@ -2073,7 +2076,7 @@ class Trigger:
         """
         ...
 
-    def description(self, value: JsonValue) -> Self:
+    def description(self, value: JsonInput) -> Self:
         """Set ``description``, replacing its earlier value; returns this value.
 
         Args:
@@ -2081,7 +2084,7 @@ class Trigger:
         """
         ...
 
-    def kind(self, value: JsonValue) -> Self:
+    def kind(self, value: JsonInput) -> Self:
         """Set ``kind``, replacing its earlier value; returns this value.
 
         Args:
@@ -2089,7 +2092,7 @@ class Trigger:
         """
         ...
 
-    def cron(self, value: JsonValue) -> Self:
+    def cron(self, value: JsonInput) -> Self:
         """Set ``cron``, replacing its earlier value; returns this value.
 
         Args:
@@ -2097,7 +2100,7 @@ class Trigger:
         """
         ...
 
-    def tz(self, value: JsonValue) -> Self:
+    def tz(self, value: JsonInput) -> Self:
         """Set ``tz``, replacing its earlier value; returns this value.
 
         Args:
@@ -2105,7 +2108,7 @@ class Trigger:
         """
         ...
 
-    def after(self, value: JsonValue) -> Self:
+    def after(self, value: JsonInput) -> Self:
         """Set ``after``, replacing its earlier value; returns this value.
 
         Args:
@@ -2118,9 +2121,9 @@ class OperatorFields(TypedDict, total=False):
 
     labels: Mapping[str, str]
     annotations: Mapping[str, str]
-    description: JsonValue
-    action: JsonValue
-    budget: JsonValue
+    description: JsonInput
+    action: JsonInput
+    budget: JsonInput
 
 class Operator:
     """An Operator Card: what runs when a binding's Verifier fails or changes verdict."""
@@ -2139,7 +2142,7 @@ class Operator:
         """The exact reference this Card registers as."""
         ...
 
-    def spec(self) -> dict[str, JsonValue]:
+    def spec(self) -> dict[str, Any]:
         """The spec as authored so far, before validation.
 
         A ``CodeSource.file`` position is ``None`` until validation reads it.
@@ -2192,7 +2195,7 @@ class Operator:
         """
         ...
 
-    def description(self, value: JsonValue) -> Self:
+    def description(self, value: JsonInput) -> Self:
         """Set ``description``, replacing its earlier value; returns this value.
 
         Args:
@@ -2200,7 +2203,7 @@ class Operator:
         """
         ...
 
-    def action(self, value: JsonValue) -> Self:
+    def action(self, value: JsonInput) -> Self:
         """Set ``action``, replacing its earlier value; returns this value.
 
         Args:
@@ -2208,7 +2211,7 @@ class Operator:
         """
         ...
 
-    def budget(self, value: JsonValue) -> Self:
+    def budget(self, value: JsonInput) -> Self:
         """Set ``budget``, replacing its earlier value; returns this value.
 
         Args:
@@ -2219,10 +2222,10 @@ class Operator:
 class ComponentFields(TypedDict, total=False):
     """The ``Component`` fields a constructor takes as keywords, each set as its setter sets it."""
 
-    source: JsonValue
+    source: JsonInput
     verified_by: Sequence[BindingInput]
-    config: Mapping[str, JsonValue]
-    credential_refs: Sequence[JsonValue]
+    config: Mapping[str, JsonInput]
+    credential_refs: Sequence[JsonInput]
 
 class BindingFields(TypedDict, total=False):
     """The ``Binding`` fields a constructor takes as keywords, each set as its setter sets it."""
@@ -2234,32 +2237,32 @@ class BindingFields(TypedDict, total=False):
 class StepFields(TypedDict, total=False):
     """The ``Step`` fields a constructor takes as keywords, each set as its setter sets it."""
 
-    depends_on: Sequence[JsonValue]
-    when: JsonValue
-    requirements: Sequence[Requirement | Mapping[str, JsonValue]]
-    timeout_seconds: JsonValue
-    retries: JsonValue
+    depends_on: Sequence[JsonInput]
+    when: JsonInput
+    requirements: Sequence[Requirement | Mapping[str, JsonInput]]
+    timeout_seconds: JsonInput
+    retries: JsonInput
 
 class InputSlotFields(TypedDict, total=False):
     """The ``InputSlot`` fields a constructor takes as keywords, each set as its setter sets it."""
 
-    max_bytes: JsonValue
-    required: JsonValue
+    max_bytes: JsonInput
+    required: JsonInput
 
 class ActionFields(TypedDict, total=False):
     """The ``Action`` fields a constructor takes as keywords, each set as its setter sets it."""
 
-    inputs: Mapping[str, JsonValue]
+    inputs: Mapping[str, JsonInput]
     workspace: Mapping[str, FieldInput]
-    runtime: JsonValue
+    runtime: JsonInput
 
 class CheckFields(TypedDict, total=False):
     """The ``Check`` fields a constructor takes as keywords, each set as its setter sets it."""
 
-    inputs: Mapping[str, JsonValue]
+    inputs: Mapping[str, JsonInput]
     workspace: Mapping[str, FieldInput]
-    runtime: JsonValue
-    response_format: JsonValue
+    runtime: JsonInput
+    response_format: JsonInput
 
 class ArtifactFile:
     """A fixed file or directory prefix of one exact Artifact version.
@@ -2295,7 +2298,7 @@ class CardDefinition:
     """A Card of any registrable kind, authored as its kind and canonical spec mapping."""
 
     def __init__(
-        self, kind: CardKind | str, name: str, version: str, spec: Mapping[str, JsonValue]
+        self, kind: CardKind | str, name: str, version: str, spec: Mapping[str, JsonInput]
     ) -> None:
         """Define a Card exactly as its YAML ``spec`` would hold it.
 
@@ -2314,7 +2317,7 @@ class CardDefinition:
         """The exact reference this Card registers as."""
         ...
 
-    def spec(self) -> dict[str, JsonValue]:
+    def spec(self) -> dict[str, Any]:
         """The spec as authored."""
         ...
 
@@ -2343,7 +2346,7 @@ class Component:
         """
         ...
 
-    def source(self, value: JsonValue) -> Self:
+    def source(self, value: JsonInput) -> Self:
         """Set ``source``, replacing its earlier value; returns this value.
 
         Args:
@@ -2367,7 +2370,7 @@ class Component:
         """
         ...
 
-    def config(self, entries: Mapping[str, JsonValue]) -> Self:
+    def config(self, entries: Mapping[str, JsonInput]) -> Self:
         """Set the whole ``config`` map, replacing every earlier entry; returns this value.
 
         Args:
@@ -2375,7 +2378,7 @@ class Component:
         """
         ...
 
-    def add_config(self, key: str, value: JsonValue) -> Self:
+    def add_config(self, key: str, value: JsonInput) -> Self:
         """Insert the entry ``key`` into ``config``; returns this value.
 
         Args:
@@ -2384,7 +2387,7 @@ class Component:
         """
         ...
 
-    def credential_refs(self, items: Iterable[JsonValue]) -> Self:
+    def credential_refs(self, items: Iterable[JsonInput]) -> Self:
         """Set the whole ``credential_refs`` list, replacing every earlier entry; returns this value.
 
         Args:
@@ -2392,7 +2395,7 @@ class Component:
         """
         ...
 
-    def add_credential_ref(self, item: JsonValue) -> Self:
+    def add_credential_ref(self, item: JsonInput) -> Self:
         """Append one entry to ``credential_refs``; returns this value.
 
         Args:
@@ -2456,7 +2459,7 @@ class Step:
     """One data-producing Verifier step."""
 
     def __init__(
-        self, id: str, action: Action | Mapping[str, JsonValue], **fields: Unpack[StepFields]
+        self, id: str, action: Action | Mapping[str, JsonInput], **fields: Unpack[StepFields]
     ) -> None:
         """The step ``id`` running ``action``.
 
@@ -2467,7 +2470,7 @@ class Step:
         """
         ...
 
-    def depends_on(self, items: Iterable[JsonValue]) -> Self:
+    def depends_on(self, items: Iterable[JsonInput]) -> Self:
         """Set the whole ``depends_on`` list, replacing every earlier entry; returns this value.
 
         Args:
@@ -2475,7 +2478,7 @@ class Step:
         """
         ...
 
-    def add_depends_on(self, item: JsonValue) -> Self:
+    def add_depends_on(self, item: JsonInput) -> Self:
         """Append one entry to ``depends_on``; returns this value.
 
         Args:
@@ -2483,7 +2486,7 @@ class Step:
         """
         ...
 
-    def when(self, value: JsonValue) -> Self:
+    def when(self, value: JsonInput) -> Self:
         """Set ``when``, replacing its earlier value; returns this value.
 
         Args:
@@ -2491,7 +2494,7 @@ class Step:
         """
         ...
 
-    def requirements(self, items: Iterable[Requirement | Mapping[str, JsonValue]]) -> Self:
+    def requirements(self, items: Iterable[Requirement | Mapping[str, JsonInput]]) -> Self:
         """Set the whole ``requirements`` list, replacing every earlier entry; returns this value.
 
         Args:
@@ -2499,7 +2502,7 @@ class Step:
         """
         ...
 
-    def add_requirement(self, item: Requirement | Mapping[str, JsonValue]) -> Self:
+    def add_requirement(self, item: Requirement | Mapping[str, JsonInput]) -> Self:
         """Append one entry to ``requirements``; returns this value.
 
         Args:
@@ -2507,7 +2510,7 @@ class Step:
         """
         ...
 
-    def timeout_seconds(self, value: JsonValue) -> Self:
+    def timeout_seconds(self, value: JsonInput) -> Self:
         """Set ``timeout_seconds``, replacing its earlier value; returns this value.
 
         Args:
@@ -2515,7 +2518,7 @@ class Step:
         """
         ...
 
-    def retries(self, value: JsonValue) -> Self:
+    def retries(self, value: JsonInput) -> Self:
         """Set ``retries``, replacing its earlier value; returns this value.
 
         Args:
@@ -2526,7 +2529,7 @@ class Step:
 class Requirement:
     """One requirement, producing exactly one verdict."""
 
-    def __init__(self, id: str, statement: str, check: Check | Mapping[str, JsonValue]) -> None:
+    def __init__(self, id: str, statement: str, check: Check | Mapping[str, JsonInput]) -> None:
         """The requirement ``id`` claiming ``statement``, judged by ``check``.
 
         Args:
@@ -2541,7 +2544,7 @@ class InputSlot:
 
     @staticmethod
     def json(
-        schema: type | Mapping[str, JsonValue], **fields: Unpack[InputSlotFields]
+        schema: type | Mapping[str, JsonInput], **fields: Unpack[InputSlotFields]
     ) -> InputSlot:
         """A JSON value constrained by ``schema``.
 
@@ -2588,7 +2591,7 @@ class InputSlot:
         """
         ...
 
-    def max_bytes(self, value: JsonValue) -> Self:
+    def max_bytes(self, value: JsonInput) -> Self:
         """Set ``max_bytes``, replacing its earlier value; returns this value.
 
         Args:
@@ -2596,7 +2599,7 @@ class InputSlot:
         """
         ...
 
-    def required(self, value: JsonValue) -> Self:
+    def required(self, value: JsonInput) -> Self:
         """Set ``required``, replacing its earlier value; returns this value.
 
         Args:
@@ -2628,7 +2631,7 @@ class Action:
 
     @staticmethod
     def code(
-        source: CodeSource | ArtifactFile | Mapping[str, JsonValue],
+        source: CodeSource | ArtifactFile | Mapping[str, JsonInput],
         entrypoint: str,
         **fields: Unpack[ActionFields],
     ) -> Action:
@@ -2641,7 +2644,7 @@ class Action:
         """
         ...
 
-    def inputs(self, entries: Mapping[str, JsonValue]) -> Self:
+    def inputs(self, entries: Mapping[str, JsonInput]) -> Self:
         """Set the whole ``inputs`` map, replacing every earlier entry; returns this value.
 
         Args:
@@ -2649,7 +2652,7 @@ class Action:
         """
         ...
 
-    def add_input(self, key: str, value: JsonValue) -> Self:
+    def add_input(self, key: str, value: JsonInput) -> Self:
         """Insert the entry ``key`` into ``inputs``; returns this value.
 
         Args:
@@ -2675,7 +2678,7 @@ class Action:
         """
         ...
 
-    def runtime(self, value: JsonValue) -> Self:
+    def runtime(self, value: JsonInput) -> Self:
         """Set ``runtime``, replacing its earlier value; returns this value.
 
         Args:
@@ -2687,7 +2690,7 @@ class Check:
     """A verdict-producing requirement check."""
 
     @staticmethod
-    def assert_(path: str, operator: JsonValue, expected: JsonValue) -> Check:
+    def assert_(path: str, operator: JsonInput, expected: JsonInput) -> Check:
         """Compare the one value at ``path`` with ``expected``; the YAML ``kind`` is ``assert``.
 
         Args:
@@ -2698,7 +2701,7 @@ class Check:
         ...
 
     @staticmethod
-    def each(each: str, operator: JsonValue, expected: JsonValue) -> Check:
+    def each(each: str, operator: JsonInput, expected: JsonInput) -> Check:
         """Compare every value ``each`` selects through ``[*]`` with ``expected``.
 
         Args:
@@ -2709,7 +2712,7 @@ class Check:
         ...
 
     @staticmethod
-    def trace(on: str, span_selector: str, operator: JsonValue, expected: JsonValue) -> Check:
+    def trace(on: str, span_selector: str, operator: JsonInput, expected: JsonInput) -> Check:
         """Compare the spans ``span_selector`` selects in the trace slot ``on``.
 
         Args:
@@ -2732,7 +2735,7 @@ class Check:
 
     @staticmethod
     def code(
-        source: CodeSource | ArtifactFile | Mapping[str, JsonValue],
+        source: CodeSource | ArtifactFile | Mapping[str, JsonInput],
         entrypoint: str,
         **fields: Unpack[CheckFields],
     ) -> Check:
@@ -2746,7 +2749,7 @@ class Check:
         ...
 
     @staticmethod
-    def drift(on: str, spec: Mapping[str, JsonValue]) -> Check:
+    def drift(on: str, spec: Mapping[str, JsonInput]) -> Check:
         """Judge statistical drift over the samples slot ``on``.
 
         Args:
@@ -2755,7 +2758,7 @@ class Check:
         """
         ...
 
-    def inputs(self, entries: Mapping[str, JsonValue]) -> Self:
+    def inputs(self, entries: Mapping[str, JsonInput]) -> Self:
         """Set the whole ``inputs`` map, replacing every earlier entry; returns this value.
 
         Args:
@@ -2763,7 +2766,7 @@ class Check:
         """
         ...
 
-    def add_input(self, key: str, value: JsonValue) -> Self:
+    def add_input(self, key: str, value: JsonInput) -> Self:
         """Insert the entry ``key`` into ``inputs``; returns this value.
 
         Args:
@@ -2789,7 +2792,7 @@ class Check:
         """
         ...
 
-    def runtime(self, value: JsonValue) -> Self:
+    def runtime(self, value: JsonInput) -> Self:
         """Set ``runtime``, replacing its earlier value; returns this value.
 
         Args:
@@ -2797,7 +2800,7 @@ class Check:
         """
         ...
 
-    def response_format(self, value: JsonValue) -> Self:
+    def response_format(self, value: JsonInput) -> Self:
         """Set ``response_format``, replacing its earlier value; returns this value.
 
         Args:

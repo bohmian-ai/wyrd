@@ -4,6 +4,7 @@ from os import PathLike
 from pathlib import Path
 from typing import Any, Literal, TypeAlias, TypeVar, overload
 
+from ..authoring import AnyCard
 from ..client import WyrdClient
 from ..data import DataCard, DataInterface
 from ..model import ModelCard, ModelInterface
@@ -450,13 +451,20 @@ class Cards:
 
     def declare(
         self,
-        card: DeclarableCard,
+        card: DeclarableCard | AnyCard | str | PathLike[str],
         version_bump: VersionBump = ...,
         save_args: DataSaveArgs | ModelSaveArgs | None = ...,
     ) -> DeclarationReceipt:
-        """Declare a caller-owned Card and stamp its resolved identity.
+        """Declare an authored Card graph, a Card file, or a caller-owned Card.
 
-        Declaration serializes the complete Card envelope, saves DataCard or
+        An authored Card from ``wyrd.authoring`` is copied as it is now,
+        validated, and declared: each local Artifact it references is
+        published first as its own submission, then the graph; a later graph
+        failure leaves those Artifacts registered. A path declares as
+        ``declare_from_path`` does. Neither takes ``version_bump`` or
+        ``save_args``.
+
+        For a holder, declaration serializes the complete Card envelope, saves DataCard or
         ModelCard artifacts through the attached interface, uploads the
         resulting manifest, and waits for server completion. On success, the
         same `card` object is updated with the server-assigned `uid`, resolved
@@ -467,7 +475,8 @@ class Cards:
         selected dynamically.
 
         Args:
-            card: A `DataCard`, `ModelCard`, or `PromptCard`.
+            card: An authored Card, a Card file or bundle path, or a
+                `DataCard`, `ModelCard`, or `PromptCard`.
             version_bump: how the server derives the version; see
                 `VersionBump`. Omitted, `VersionBump.Patch`. Passing one for
                 a Card whose version is an exact pin is an error.
@@ -480,7 +489,10 @@ class Cards:
             for each declared Card.
 
         Raises:
-            WyrdError: If `card` is not a supported native holder, the
+            WyrdError: ``WYRD_SPEC_400_VALIDATION`` for an invalid authored
+                graph or ``version_bump``/``save_args`` with an authored Card
+                or path; ``WYRD_LOADER_400_INVALID_ENVELOPE`` for an
+                unreadable file or local Artifact source; if `card` is not a supported native holder, the
                 arguments do not match its kind, required interface data is
                 missing, serialization or artifact saving fails, the server
                 rejects the declaration, or completion fails.

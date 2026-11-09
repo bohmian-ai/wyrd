@@ -96,7 +96,17 @@ impl NativeWyrdClient {
     ///
     /// # Errors
     ///
-    /// Never returns a napi error; failures are carried in the result.
+    /// Returns a napi error only when the promise cannot be created; load,
+    /// validation, publication, and registry failures are carried in the
+    /// result.
+    ///
+    /// # Cancellation
+    ///
+    /// The declaration runs on the shared runtime once the promise exists;
+    /// ignoring the promise does not stop it. Nothing is rolled back: every
+    /// Artifact published before a failure stays registered, as the shared
+    /// declaration documents, and a retry is a new call under the
+    /// registry's ordinary version rules.
     #[napi]
     pub fn declare_wyrd_state<'env>(
         &self,
@@ -118,8 +128,17 @@ impl NativeWyrdClient {
     ///
     /// # Errors
     ///
-    /// Returns `InvalidArg` when `card` is not a Card; every other failure
-    /// is carried in the result.
+    /// Returns `InvalidArg` when `card` is not a Card and a napi error when
+    /// the promise cannot be created; validation, publication, and registry
+    /// failures are carried in the result.
+    ///
+    /// # Cancellation
+    ///
+    /// The declaration runs on the shared runtime once the promise exists;
+    /// ignoring the promise does not stop it. Nothing is rolled back: every
+    /// Artifact published before a failure stays registered, as the shared
+    /// declaration documents, and a retry is a new call under the
+    /// registry's ordinary version rules.
     #[napi]
     pub fn declare_authored_wyrd_state<'env>(
         &self,
@@ -150,7 +169,20 @@ impl NativeWyrdClient {
 
 impl NativeWyrdClient {
     /// Declare `input` as this client and resolve to the ready state of its
-    /// graph, or the catalog failure.
+    /// graph, or the catalog failure, through `WyrdState::declare_with`.
+    ///
+    /// # Errors
+    ///
+    /// Returns a napi error only when the promise cannot be created; every
+    /// declaration failure is carried in the result.
+    ///
+    /// # Cancellation
+    ///
+    /// The declaration runs on the shared runtime once the promise exists;
+    /// ignoring the promise does not stop it. Nothing is rolled back: every
+    /// Artifact published before a failure stays registered, as the shared
+    /// declaration documents, and a retry is a new call under the
+    /// registry's ordinary version rules.
     fn declared_state<'env>(
         &self,
         env: &'env Env,
@@ -192,8 +224,16 @@ impl NativeCards {
     /// # Errors
     ///
     /// Returns `InvalidArg` when `card` is not a Card, and a napi error when
-    /// the receipt cannot be serialized; validation, upload, and registry
-    /// failures are returned in the result.
+    /// the promise cannot be created or the receipt cannot be serialized;
+    /// validation, upload, and registry failures are returned in the result.
+    ///
+    /// # Cancellation
+    ///
+    /// The declaration runs on the shared runtime once the promise exists;
+    /// ignoring the promise does not stop it. Nothing is rolled back: every
+    /// Artifact published before a failure stays registered, as the shared
+    /// declaration documents, and a retry is a new call under the
+    /// registry's ordinary version rules.
     #[napi]
     pub fn declare<'env>(
         &self,
@@ -211,8 +251,17 @@ impl NativeCards {
     ///
     /// # Errors
     ///
-    /// Returns a napi error only when the receipt cannot be serialized; load,
-    /// validation, and registry failures are returned in the result.
+    /// Returns a napi error only when the promise cannot be created or the
+    /// receipt cannot be serialized; load, validation, and registry failures
+    /// are returned in the result.
+    ///
+    /// # Cancellation
+    ///
+    /// The declaration runs on the shared runtime once the promise exists;
+    /// ignoring the promise does not stop it. Nothing is rolled back: every
+    /// Artifact published before a failure stays registered, as the shared
+    /// declaration documents, and a retry is a new call under the
+    /// registry's ordinary version rules.
     #[napi]
     pub fn declare_from_path<'env>(
         &self,

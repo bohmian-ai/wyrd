@@ -1,8 +1,8 @@
 //! Thin napi projection of `wyrd_client::authoring` for `wyrd-ai/authoring`.
 //!
-//! [`NativeAuthored`] holds one shared Rust authoring value: a named Card,
-//! a [`CardDefinition`], a sub-value, a [`CardRef`], an [`ArtifactFile`], or
-//! a [`CodeSource`]. Its fields are edited by their YAML names through
+//! [`NativeAuthored`] holds one shared Rust authoring value: one of the
+//! twelve named Cards, a sub-value, a [`CardRef`], an [`ArtifactFile`], or a
+//! [`CodeSource`]. Its fields are edited by their YAML names through
 //! `set`, `add`, and `insert`, which dispatch to the shared setters and add
 //! methods; the TypeScript wrappers spell those as typed camelCase methods.
 //! Arguments arrive as one [`NativeValue`]: canonical JSON plus the
@@ -70,8 +70,6 @@ enum Authored {
     Trigger(Trigger),
     /// An Operator Card.
     Operator(Operator),
-    /// A Card of any kind authored as its canonical spec.
-    Definition(CardDefinition),
     /// A Service component.
     Component(Component),
     /// A verification binding.
@@ -104,7 +102,6 @@ macro_rules! families {
                 match self {
                     $(Self::$card(_) => stringify!($card),)*
                     $(Self::$value(_) => stringify!($value),)*
-                    Self::Definition(_) => "CardDefinition",
                 }
             }
 
@@ -117,7 +114,6 @@ macro_rules! families {
                 Ok(match self {
                     $(Self::$card(inner) => Self::$card(inner.set(field, value)?),)*
                     $(Self::$value(inner) => Self::$value(inner.set(field, value)?),)*
-                    Self::Definition(_) => return Err(unknown("CardDefinition", field)),
                 })
             }
 
@@ -129,7 +125,6 @@ macro_rules! families {
                 match self {
                     $(Self::$card(inner) => inner.add(field, value),)*
                     $(Self::$value(inner) => inner.add(field, value),)*
-                    Self::Definition(_) => Err(unknown("CardDefinition", field)),
                 }
             }
 
@@ -142,7 +137,6 @@ macro_rules! families {
                 match self {
                     $(Self::$card(inner) => inner.insert(field, key, value),)*
                     $(Self::$value(inner) => inner.insert(field, key, value),)*
-                    Self::Definition(_) => Err(unknown("CardDefinition", field)),
                 }
             }
 
@@ -150,7 +144,6 @@ macro_rules! families {
             fn definition(&self) -> Option<CardDefinition> {
                 match self {
                     $(Self::$card(card) => Some(card.into()),)*
-                    Self::Definition(card) => Some(card.clone()),
                     $(Self::$value(_) => None,)*
                 }
             }
@@ -161,7 +154,6 @@ macro_rules! families {
                 match self {
                     $(Self::$card(inner) => inner.into(),)*
                     $(Self::$value(inner) => inner.into(),)*
-                    Self::Definition(inner) => inner.into(),
                 }
             }
         }
@@ -327,6 +319,11 @@ impl NativeValue {
                 .map(|(key, value)| Ok((key, value.field()?)))
                 .collect::<Result<FieldValue>>()?,
         })
+    }
+
+    /// Whether the argument is exactly the JSON `null`.
+    fn is_null(&self) -> bool {
+        self.value.is_null() && self.holes.is_empty()
     }
 
     /// The argument as plain JSON.
@@ -545,10 +542,12 @@ trait Fields: Sized {
 }
 
 /// Generate [`Fields`] for one family from its one-value, list, and map
-/// fields and their converters.
+/// fields and their converters, and the list and map fields whose canonical
+/// `null` its shared clear method sets.
 macro_rules! fields {
     ($(
         $ty:ident {
+            $(null { $($null:ident: $clear:ident),* $(,)? })?
             one { $($one:ident: $one_convert:ident),* $(,)? }
             list { $($list:ident, $list_add:ident: $list_convert:ident),* $(,)? }
             map { $($map:ident, $map_add:ident: $map_convert:ident),* $(,)? }
@@ -560,6 +559,7 @@ macro_rules! fields {
 
                 fn set(self, field: &str, value: NativeValue) -> Result<Self> {
                     match field {
+                        $($(stringify!($null) if value.is_null() => Ok(self.$clear()),)*)?
                         $(stringify!($one) => Ok(self.$one($one_convert(field, value)?)),)*
                         $(stringify!($list) => Ok(self.$list(items(field, value, $list_convert)?)),)*
                         $(stringify!($map) => Ok(self.$map(entries(field, value, $map_convert)?)),)*
@@ -622,6 +622,7 @@ fields! {
         map { labels, add_label: string, annotations, add_annotation: string }
     }
     Prompt {
+        null { messages: clear_messages, body: clear_body }
         one {
             provider: json, model: json, system: json, settings: json,
             response_format: json, format: json,
@@ -759,7 +760,8 @@ impl NativeAuthored {
             .ok_or_else(|| invalid(format!("a {} is not a Card", self.inner.name())))
     }
 
-    /// Wrap `inner`.
+    /// The Node-facing handle owning `inner`; each JS wrapper holds exactly
+    /// one, and arguments copy out of it rather than borrow it.
     fn of(inner: Authored) -> Self {
         Self { inner }
     }
@@ -802,27 +804,6 @@ impl NativeAuthored {
     #[napi(factory)]
     pub fn artifact_from_path(name: String, version: String, path: String) -> Self {
         Self::of(Authored::Artifact(Artifact::from_path(name, version, path)))
-    }
-
-    /// The `kind` Card `name` at `version` with the canonical `spec` JSON.
-    ///
-    /// # Errors
-    ///
-    /// Returns `InvalidArg` for an unknown kind or a spec holding an
-    /// authoring value.
-    #[napi(factory)]
-    pub fn definition(
-        kind: String,
-        name: String,
-        version: String,
-        spec: &NativeValue,
-    ) -> Result<Self> {
-        Ok(Self::of(Authored::Definition(CardDefinition::new(
-            kind_arg(&kind)?,
-            name,
-            version,
-            spec.clone().json("spec")?,
-        ))))
     }
 
     /// The component `alias` for `reference`: a Card, an exact `CardRef`,
@@ -1054,16 +1035,18 @@ impl NativeAuthored {
     }
 
     /// Judge statistical drift over the samples slot `on` with the drift
-    /// fields `spec`: method, signal, condition, and profile.
+    /// fields `spec`: method, signal, condition, and profile, with a Card or
+    /// exact `CardRef` at `signal.baseline_ref`.
     ///
     /// # Errors
     ///
-    /// Returns `InvalidArg` for a spec holding an authoring value.
+    /// Returns `InvalidArg` when an authoring value's path names no
+    /// position inside the argument.
     #[napi(factory)]
     pub fn check_drift(on: String, spec: &NativeValue) -> Result<Self> {
         Ok(Self::of(Authored::Check(Check::drift(
             on,
-            spec.clone().json("spec")?,
+            spec.clone().field()?,
         ))))
     }
 

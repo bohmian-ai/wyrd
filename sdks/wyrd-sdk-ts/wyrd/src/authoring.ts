@@ -42,27 +42,36 @@ const { NativeAuthored, NativeValue } = require("../index.cjs") as typeof import
  */
 export type Authorable<T> = [Wire.JsonValue] extends [T]
   ? T
-  : T extends Wire.CardRef
-    ? T | AuthoredCard | CardRef
-    : T extends Wire.CodeSourceInline | Wire.CodeSourceArtifact
-      ? Shape<T> | CodeSource | ArtifactFile
-      : T extends Wire.WorkspaceSourceArtifact
-        ? Shape<T> | ArtifactFile
-        : T extends Wire.Step
-          ? Shape<T> | Step
-          : T extends Wire.Requirement
-            ? Shape<T> | Requirement
-            : T extends Wire.Action
-              ? Shape<T> | Action
-              : T extends Wire.Check
-                ? Shape<T> | Check
-                : T extends Wire.ServiceComponent
-                  ? Shape<T> | Component
-                  : T extends Wire.VerificationBinding
-                    ? Shape<T> | Binding
-                    : T extends Wire.TypedInputSlot
-                      ? Shape<T> | InputSlot
-                      : Shape<T>;
+  : Same<T, Wire.Action> extends true
+    ? Shape<T> | Action
+    : Same<T, Wire.Check> extends true
+      ? Shape<T> | Check
+      : AuthorableMember<T>;
+
+/**
+ * Whether `A` and `B` are the same type. An agent or code action and check
+ * share their canonical shape, so only the whole union tells them apart.
+ */
+type Same<A, B> = [A] extends [B] ? ([B] extends [A] ? true : false) : false;
+
+/** {@link Authorable} for each member of `T`. */
+type AuthorableMember<T> = T extends Wire.CardRef
+  ? T | AuthoredCard | CardRef
+  : T extends Wire.CodeSourceInline | Wire.CodeSourceArtifact
+    ? Shape<T> | CodeSource | ArtifactFile
+    : T extends Wire.WorkspaceSourceArtifact
+      ? Shape<T> | ArtifactFile
+      : T extends Wire.Step
+        ? Shape<T> | Step
+        : T extends Wire.Requirement
+          ? Shape<T> | Requirement
+          : T extends Wire.ServiceComponent
+            ? Shape<T> | Component
+            : T extends Wire.VerificationBinding
+              ? Shape<T> | Binding
+              : T extends Wire.TypedInputSlot
+                ? Shape<T> | InputSlot
+                : Shape<T>;
 
 /** The members of `T`, each {@link Authorable}. */
 type Shape<T> = T extends readonly (infer U)[]
@@ -1741,24 +1750,11 @@ export class Artifact extends AuthoredCard {
   }
 }
 
-/** A Card of any registrable kind, authored as its kind and canonical spec JSON. */
-export class CardDefinition extends AuthoredCard {
-  /**
-   * Define the `kind` Card `name` at `version` with the canonical `spec` JSON,
-   * as its YAML `spec` would hold it.
-   *
-   * @param kind - The Card kind.
-   * @param name - The Card name.
-   * @param version - The exact version.
-   * @param spec - The canonical spec.
-   */
-  constructor(kind: Wire.CardKind, name: string, version: string, spec: Wire.JsonValue) {
-    super(NativeAuthored.definition(kind, name, version, argument("spec", spec)));
-  }
-}
-
 /** One Service component: an alias for a referenced Card and the Verifiers that check it. */
 export class Component {
+  /** Type-only identity: no other value is a Component, whatever its shape. */
+  declare private readonly family: "Component";
+
   /**
    * The component `alias` for `ref`: a Card, an exact {@link CardRef}, or a
    * reference path, with any other fields given in `options`.
@@ -1846,6 +1842,9 @@ export class Component {
 
 /** One verification binding: the Verifier to run, when it runs, and the Operators that react to its verdicts. */
 export class Binding {
+  /** Type-only identity: no other value is a Binding, whatever its shape. */
+  declare private readonly family: "Binding";
+
   /**
    * Bind `verifier`: a {@link Verifier}, an exact {@link CardRef}, or a
    * reference path, with any other fields given in `options`.
@@ -1911,6 +1910,9 @@ export class Binding {
 
 /** One data-producing Verifier step. */
 export class Step {
+  /** Type-only identity: no other value is a Step, whatever its shape. */
+  declare private readonly family: "Step";
+
   /**
    * The step `id` running `action`, with any other fields given in `options`.
    *
@@ -1996,6 +1998,9 @@ export class Step {
 
 /** One requirement, producing exactly one verdict. */
 export class Requirement {
+  /** Type-only identity: no other value is a Requirement, whatever its shape. */
+  declare private readonly family: "Requirement";
+
   /**
    * The requirement `id` claiming `statement`, judged by `check`.
    *
@@ -2014,6 +2019,9 @@ export class Requirement {
  * supplied `null` is admitted.
  */
 export class InputSlot {
+  /** Type-only identity: no other value is a InputSlot, whatever its shape. */
+  declare private readonly family: "InputSlot";
+
   private constructor() {}
 
   /**
@@ -2082,6 +2090,9 @@ export class InputSlot {
 
 /** A step action: extract, an Agent call, or sandboxed code. */
 export class Action {
+  /** Type-only identity: no other value is a Action, whatever its shape. */
+  declare private readonly family: "Action";
+
   private constructor() {}
 
   /**
@@ -2182,6 +2193,9 @@ export class Action {
 
 /** A verdict-producing requirement check. */
 export class Check {
+  /** Type-only identity: no other value is a Check, whatever its shape. */
+  declare private readonly family: "Check";
+
   private constructor() {}
 
   /**
@@ -2267,13 +2281,14 @@ export class Check {
 
   /**
    * Judge statistical drift over the samples slot `on` with the drift fields
-   * `spec`: method, signal, condition, and profile.
+   * `spec`: method, signal, condition, and profile. A {@link Data} Card or
+   * exact {@link CardRef} may stand at `signal.baseline_ref`.
    *
    * @param on - The samples slot reference.
    * @param spec - The drift fields.
    * @returns The check.
    */
-  static drift(on: string, spec: Omit<Wire.CheckDrift, "kind" | "on">): Check {
+  static drift(on: string, spec: Authorable<Omit<Wire.CheckDrift, "kind" | "on">>): Check {
     return adopt(Check.prototype, NativeAuthored.checkDrift(on, argument("spec", spec)));
   }
 
@@ -2346,6 +2361,9 @@ export class Check {
  * registered Card and nothing is uploaded for it; registration pins its UID.
  */
 export class CardRef {
+  /** Type-only identity: no other value is a CardRef, whatever its shape. */
+  declare private readonly family: "CardRef";
+
   /**
    * The exact reference to the `kind` Card `name` at `version`.
    *
@@ -2451,6 +2469,9 @@ export class CardRef {
  * before its graph.
  */
 export class ArtifactFile {
+  /** Type-only identity: no other value is a ArtifactFile, whatever its shape. */
+  declare private readonly family: "ArtifactFile";
+
   private constructor() {}
 }
 
@@ -2460,6 +2481,9 @@ export class ArtifactFile {
  * third canonical form.
  */
 export class CodeSource {
+  /** Type-only identity: no other value is a CodeSource, whatever its shape. */
+  declare private readonly family: "CodeSource";
+
   private constructor() {}
 
   /**

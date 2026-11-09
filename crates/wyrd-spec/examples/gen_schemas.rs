@@ -116,7 +116,13 @@ fn main() -> Result<(), Box<dyn StdError>> {
     }
 }
 
-/// Registers each listed type as a named root of one shared schema generator.
+/// Registers each listed type as a named root of one shared schema
+/// generator, as a heap-allocated list of `(type name, schema)` pairs, so a
+/// long root list never builds a large array on the stack.
+///
+/// # Panics
+/// Panics if a derived schema fails to serialize, which a `JsonSchema`
+/// derive cannot produce.
 macro_rules! roots {
     ($generator:ident, $($ty:ty),+ $(,)?) => {
         vec![$((

@@ -17,15 +17,6 @@ export declare class NativeAuthored {
    */
   static artifactFromPath(name: string, version: string, path: string): NativeAuthored
   /**
-   * The `kind` Card `name` at `version` with the canonical `spec` JSON.
-   *
-   * # Errors
-   *
-   * Returns `InvalidArg` for an unknown kind or a spec holding an
-   * authoring value.
-   */
-  static definition(kind: string, name: string, version: string, spec: NativeValue): NativeAuthored
-  /**
    * The component `alias` for `reference`: a Card, an exact `CardRef`,
    * or a reference path.
    *
@@ -157,11 +148,13 @@ export declare class NativeAuthored {
   static checkCode(source: NativeValue, entrypoint: string): NativeAuthored
   /**
    * Judge statistical drift over the samples slot `on` with the drift
-   * fields `spec`: method, signal, condition, and profile.
+   * fields `spec`: method, signal, condition, and profile, with a Card or
+   * exact `CardRef` at `signal.baseline_ref`.
    *
    * # Errors
    *
-   * Returns `InvalidArg` for a spec holding an authoring value.
+   * Returns `InvalidArg` when an authoring value's path names no
+   * position inside the argument.
    */
   static checkDrift(on: string, spec: NativeValue): NativeAuthored
   /**
@@ -594,8 +587,16 @@ export declare class NativeCards {
    * # Errors
    *
    * Returns `InvalidArg` when `card` is not a Card, and a napi error when
-   * the receipt cannot be serialized; validation, upload, and registry
-   * failures are returned in the result.
+   * the promise cannot be created or the receipt cannot be serialized;
+   * validation, upload, and registry failures are returned in the result.
+   *
+   * # Cancellation
+   *
+   * The declaration runs on the shared runtime once the promise exists;
+   * ignoring the promise does not stop it. Nothing is rolled back: every
+   * Artifact published before a failure stays registered, as the shared
+   * declaration documents, and a retry is a new call under the
+   * registry's ordinary version rules.
    */
   declare(card: NativeAuthored): Promise<NativeLifecycleResult>
   /**
@@ -603,8 +604,17 @@ export declare class NativeCards {
    *
    * # Errors
    *
-   * Returns a napi error only when the receipt cannot be serialized; load,
-   * validation, and registry failures are returned in the result.
+   * Returns a napi error only when the promise cannot be created or the
+   * receipt cannot be serialized; load, validation, and registry failures
+   * are returned in the result.
+   *
+   * # Cancellation
+   *
+   * The declaration runs on the shared runtime once the promise exists;
+   * ignoring the promise does not stop it. Nothing is rolled back: every
+   * Artifact published before a failure stays registered, as the shared
+   * declaration documents, and a retry is a new call under the
+   * registry's ordinary version rules.
    */
   declareFromPath(path: string): Promise<NativeLifecycleResult>
   /**
@@ -1143,7 +1153,17 @@ export declare class NativeWyrdClient {
    *
    * # Errors
    *
-   * Never returns a napi error; failures are carried in the result.
+   * Returns a napi error only when the promise cannot be created; load,
+   * validation, publication, and registry failures are carried in the
+   * result.
+   *
+   * # Cancellation
+   *
+   * The declaration runs on the shared runtime once the promise exists;
+   * ignoring the promise does not stop it. Nothing is rolled back: every
+   * Artifact published before a failure stays registered, as the shared
+   * declaration documents, and a retry is a new call under the
+   * registry's ordinary version rules.
    */
   declareWyrdState(path: string, bundleDir?: string | undefined | null): Promise<NativeWyrdStateDeclaration>
   /**
@@ -1158,8 +1178,17 @@ export declare class NativeWyrdClient {
    *
    * # Errors
    *
-   * Returns `InvalidArg` when `card` is not a Card; every other failure
-   * is carried in the result.
+   * Returns `InvalidArg` when `card` is not a Card and a napi error when
+   * the promise cannot be created; validation, publication, and registry
+   * failures are carried in the result.
+   *
+   * # Cancellation
+   *
+   * The declaration runs on the shared runtime once the promise exists;
+   * ignoring the promise does not stop it. Nothing is rolled back: every
+   * Artifact published before a failure stays registered, as the shared
+   * declaration documents, and a retry is a new call under the
+   * registry's ordinary version rules.
    */
   declareAuthoredWyrdState(card: NativeAuthored, bundleDir?: string | undefined | null): Promise<NativeWyrdStateDeclaration>
   /**

@@ -1804,17 +1804,23 @@ export class Cards {
   }
 
   /**
-   * Declare an authored Card and every Card it references as one composite,
-   * publishing each local Artifact first, exactly as the equivalent files
-   * would declare.
+   * Declare a Card file, a bundle directory, or an authored Card and every
+   * Card it references as one composite, publishing each local Artifact
+   * first; an authored Card declares exactly as its equivalent files would.
    *
-   * @param card - The root Card from `wyrd-ai/authoring`, copied as it is now.
+   * @param root - A Card file or directory, loaded as
+   * {@link Cards.declareFromPath} loads it, or the root Card from
+   * `wyrd-ai/authoring`, copied as it is now.
    * @returns The graph root and each Card's dependency-first outcome.
-   * @throws {@link WyrdError} from the shared validation, such as
-   * `WYRD_LOADER_400_INVALID_ENVELOPE`, or the registry's refusal.
+   * @throws {@link WyrdError} for a file that does not load or validate, from
+   * the shared validation, such as `WYRD_LOADER_400_INVALID_ENVELOPE`, or the
+   * registry's refusal.
    */
-  async declare(card: AuthoredCard): Promise<DeclarationReceipt> {
-    return lifecycleValue<DeclarationReceipt>(await this.#native.declare(authoredOf(card)));
+  async declare(root: string | AuthoredCard): Promise<DeclarationReceipt> {
+    if (typeof root === "string") {
+      return this.declareFromPath(root);
+    }
+    return lifecycleValue<DeclarationReceipt>(await this.#native.declare(authoredOf(root)));
   }
 
   /**

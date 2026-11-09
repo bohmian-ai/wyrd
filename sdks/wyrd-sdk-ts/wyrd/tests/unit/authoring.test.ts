@@ -6,6 +6,7 @@ import { fileURLToPath } from "node:url";
 import { expect, test } from "vitest";
 
 import { type CardTypes, WyrdError } from "wyrd-ai";
+import * as Authoring from "wyrd-ai/authoring";
 import {
   Action,
   Agent,
@@ -13,7 +14,6 @@ import {
   ArtifactFile,
   Audit,
   Binding,
-  CardDefinition,
   CardRef,
   Check,
   CodeSource,
@@ -142,6 +142,19 @@ test("definitions_edit_offline", () => {
   expect(spec(duplicated).inputs).toEqual({ report: { type: "json", schema: STRING } });
   expect((spec(duplicated).steps as { readonly id: string }[]).map(({ id }) => id)).toEqual(["scan", "scan"]);
 
+  const messages = [{ role: "user", content: "Summarise {{report}}" }] as const;
+  const portable = new Prompt("summary", "1.0.0", { provider: "openai", model: "gpt-4o", messages, body: null });
+  expect(spec(portable), "a canonical null is kept as authored").toMatchObject({ messages, body: null });
+  portable.validate();
+  const switched = new Prompt("summary", "1.0.0", { provider: "openai", model: "gpt-4o" });
+  switched.body({ temperature: 0 }).messages(messages).body(null);
+  expect(spec(switched)).toEqual(spec(portable));
+  switched.messages(null).addBody("temperature", 0);
+  expect(spec(switched)).toMatchObject({ messages: null, body: { temperature: 0 } });
+  expect(refusal(portable.messages(null)).code, "neither form is refused only at validation").toBe(
+    "WYRD_LOADER_400_INVALID_ENVELOPE",
+  );
+
   const replaced = new Verifier("duplicated", "1.0.0", { inputs: { report: STRING } });
   replaced.inputs({ purpose: STRING });
   expect(Object.keys(spec(replaced).inputs as object), "a whole-field setter replaces earlier additions").toEqual([
@@ -242,13 +255,17 @@ test("every_native_family_constructs_canonical_specs", () => {
         .addAnnotation("reviewed", "yes"),
       "Artifact",
     ],
-    [new CardDefinition("Policy", "authored", "1.0.0", { description: "Sharing", enforcement: "block" }), "Policy"],
     [judge(), "Agent"],
   ];
   for (const [card, kind] of singles) {
     expect(card.cardRef().kind).toBe(kind);
     card.validate();
   }
+  const kinds = ["Data", "Model", "Artifact", "Experiment", "Prompt", "Agent", "Mcp", "Service", "Audit", "Verifier"];
+  for (const kind of [...kinds, "Trigger", "Operator"]) {
+    expect(Authoring, `${kind} is authorable by name`).toHaveProperty(kind);
+  }
+  expect("CardDefinition" in Authoring, "no generic constructor admits another kind").toBe(false);
   expect(singles[3]?.[0].spec()).toEqual({ server_name: "files", transport: "stdio", scopes: ["read"] });
   expect(singles[6]?.[0].spec(), "an Operator's action is flattened into its spec").toEqual(pager);
   expect(singles[2]?.[0].spec()).toMatchObject({ target_refs: [ref("Model", "ranker")] });
@@ -346,6 +363,32 @@ test("every_native_family_constructs_canonical_specs", () => {
     ...driftSpec,
   });
   drift.validate();
+  const baseline = new Data("latency-baseline", "1.0.0")
+    .interface({ kind: "Parquet", meta: { compression: "Snappy" } })
+    .schema({ columns: [{ name: "latency", dtype: "float64" }] })
+    .stats({
+      row_count: 1,
+      col_count: 1,
+      byte_count: 1,
+      sha256: "c4f7700b380aff2662e88d034154d1890c33d3c12c8dda1a0ca9481f43bb9906",
+    });
+  const baselineAt = (baselineRef: CardRef | Data): unknown => {
+    const check = Check.drift("inputs.latency", {
+      ...driftSpec,
+      signal: { ...driftSpec.signal, baseline_ref: baselineRef },
+    });
+    const card = new Verifier("latency-drift", "1.0.0", { inputs: { latency: InputSlot.samples(["latency"]) } });
+    card.addRequirement(new Requirement("stable", "Stable", check));
+    card.validate();
+    return (spec(card).requirements as { readonly check: { readonly signal: unknown } }[])[0]?.check.signal;
+  };
+  expect(baselineAt(CardRef.data("latency-baseline", "1.0.0")), "an exact CardRef stays external").toEqual(
+    driftSpec.signal,
+  );
+  expect(baselineAt(baseline), "an authored Data Card is a sibling").toEqual({
+    ...driftSpec.signal,
+    baseline_ref: { sibling: ref("Data", "latency-baseline") },
+  });
 
   const binding = new Binding(new Verifier("checked", "1.0.0"), {
     runs_on: new Trigger("daily", "1.0.0", { kind: "schedule", cron: "0 0 * * *" }),

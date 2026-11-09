@@ -256,6 +256,29 @@ def release_access(version: str, description: str | None = None) -> Verifier:
     return verifier
 
 
+def summarized_access(version: str) -> Verifier:
+    """``release-access`` at ``version`` with a ``summary`` step consuming both fact steps' outputs."""
+    summary = Action.code(CodeSource.file(STORY / "release_checks.py"), "summarize_findings")
+    summary.inputs(
+        {"recipient": "steps.recipient.output", "destination": "steps.destination.output"}
+    )
+    check = Check.assert_("steps.summary.output.releasable", "equals", True)
+    return release_access(version).add_step(
+        Step(
+            "summary",
+            summary,
+            depends_on=["recipient", "destination"],
+            requirements=[
+                Requirement(
+                    "release-permitted",
+                    "Both the recipient and the destination permit the release.",
+                    check,
+                )
+            ],
+        )
+    )
+
+
 def finance_release(version: str, policy: ArtifactFile, access: Verifier) -> Service:
     """``finance-release`` with every Card at ``version``, its reviewer judged against ``policy``."""
     reviewer = policy_judge("report-reviewer", version)
@@ -346,13 +369,27 @@ def declared_kinds(receipt: DeclarationReceipt) -> list[CardKind]:
     return [each.card_ref.kind for each in receipt.outcomes]
 
 
-def policy_published(cards: Cards, version: str) -> bool:
-    """Whether policy ``version`` is registered and holds its extracted policy file."""
+def policy_files(cards: Cards, version: str) -> set[str]:
+    """The files registered policy ``version`` holds; none when it is unregistered."""
     try:
         files = cards.list_artifacts(RegisteredRef("Artifact", "company-sharing-policy", version))
     except WyrdError:
-        return False
-    return any(each["relative_path"] == POLICY_FILE for each in files)
+        return set()
+    return {str(each["relative_path"]) for each in files}
+
+
+def policy_published(cards: Cards, version: str) -> bool:
+    """Whether policy ``version`` is registered and holds its extracted policy file."""
+    return POLICY_FILE in policy_files(cards, version)
+
+
+def cites_policy(report: VerificationResult) -> bool:
+    """Whether ``report``'s passed policy verdict cites a line of the mounted policy."""
+    [policy] = [each for each in report.requirements if each["id"] == "sharing-policy-satisfied"]
+    return policy["outcome"] == "passed" and any(
+        each["slot"].startswith("attachment_") and "lines" in each["locator"]
+        for each in policy.get("citations", [])
+    )
 
 
 def mounted_policy(cards: Cards, version: str) -> str:
@@ -471,6 +508,34 @@ def test_multi_component_service_verifies_each_subject(
             assert again.card_ref(alias) == state.card_ref(alias)
     finally:
         again.shutdown()
+
+    summarized = WyrdState.declare(
+        finance_release("1.1.0", registered_policy("1.0.0"), summarized_access("1.1.0"))
+    )
+    try:
+        registered = cards.get(RegisteredRef("Verifier", "release-access", "1.1.0")).spec
+        assert registered["steps"][2]["depends_on"] == ["recipient", "destination"]
+        public = permitted()
+        public["destination"] = public["destination"].model_copy(update={"public_sharing": True})
+        for request, releasable, verdict in (
+            (permitted(), True, "passed"),
+            (public, False, "failed"),
+        ):
+            access = judged(verify_both(summarized, request)[1])
+            ran = [step["id"] for step in access.steps]
+            assert set(ran) == {"recipient", "destination", "summary"}, ran
+            assert ran[-1] == "summary", "the summary runs after both prerequisites"
+            [summary] = [step for step in access.steps if step["id"] == "summary"]
+            assert summary["status"] == "succeeded", summary
+            assert summary["output"] == {
+                "releasable": releasable,
+                "recipient": {"authorized": True},
+                "destination": {"appropriate": releasable},
+            }, "the summary consumes both prerequisite outputs"
+            assert outcome(access, "release-permitted") == verdict, access.requirements
+            assert access.verdict == verdict
+    finally:
+        summarized.shutdown()
 
 
 def test_local_artifacts_and_declaration_parity(
@@ -593,6 +658,33 @@ def test_local_artifacts_and_declaration_parity(
     with pytest.raises(WyrdError) as denied:
         WyrdState.declare(authored, reader)
     assert code(denied) == "WYRD_PERMISSION_403_DENIED_RBAC"
+
+    directory = tmp_path / "policy-directory"
+    (directory / "appendix").mkdir(parents=True)
+    shutil.copy(POLICY, directory / POLICY.name)
+    (directory / "appendix/retention.md").write_text("Retain release records for seven years.\n")
+    from_directory = cards.declare(
+        finance_release(
+            "6.0.0", local_policy("6.0.0", directory).file(POLICY_FILE), release_access("6.0.0")
+        )
+    )
+    assert CardKind.Artifact not in declared_kinds(from_directory), from_directory.outcomes
+    assert {POLICY.name, POLICY_FILE, "appendix/retention.md"} <= policy_files(cards, "6.0.0")
+    assert mounted_policy(cards, "6.0.0") == "6.0.0"
+    directory_state = WyrdState.declare(
+        finance_release(
+            "7.0.0", local_policy("7.0.0", directory).file(POLICY_FILE), release_access("7.0.0")
+        )
+    )
+    try:
+        assert {POLICY.name, POLICY_FILE, "appendix/retention.md"} <= policy_files(cards, "7.0.0")
+        assert mounted_policy(cards, "7.0.0") == "7.0.0"
+        report, access = map(judged, verify_both(directory_state, permitted()))
+        assert report.verifier.version == "7.0.0"
+        assert cites_policy(report), report.requirements
+        assert releases(report, access), (report.requirements, access.requirements)
+    finally:
+        directory_state.shutdown()
 
     holder = PromptCard(
         Prompt.openai_chat("gpt-4o", messages="Hello {{name}}"),

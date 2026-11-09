@@ -78,10 +78,10 @@ type Fields<S> = { readonly [K in keyof S]?: Authorable<S[K]> };
 type Value<S, K extends keyof S> = Exclude<S[K], undefined>;
 
 /** One entry of the list field `K` of `S`. */
-type Item<S, K extends keyof S> = Value<S, K> extends readonly (infer U)[] ? U : never;
+type Item<S, K extends keyof S> = NonNullable<S[K]> extends readonly (infer U)[] ? U : never;
 
 /** One entry's value of the map field `K` of `S`. */
-type Entry<S, K extends keyof S> = Value<S, K> extends { readonly [key: string]: infer V } ? V : never;
+type Entry<S, K extends keyof S> = NonNullable<S[K]> extends { readonly [key: string]: infer V } ? V : never;
 
 /** `Omit` applied to each member of the union `T`. */
 type DistributiveOmit<T, K extends PropertyKey> = T extends unknown ? Omit<T, K> : never;

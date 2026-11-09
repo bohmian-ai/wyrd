@@ -567,6 +567,170 @@ async fn capacity_capture_accounting_waits_for_post_response_work() {
     );
 }
 
+/// Proves a benchmark-mode server answers, captures, and accounts through
+/// the benchmark recorder alone.
+///
+/// The process selects the benchmark backend through the server's own
+/// startup selection before the server registers any metric, so no
+/// Prometheus recorder can install beside it. A labelled buffered call and
+/// stream are answered in full; once the call tracker and the Scribe outbox
+/// drain, one snapshot interval holds each handoff timing in its case and
+/// phase with a valid population, exactly their two staged captures, the
+/// Scribe outbox writes that carried them, both calls' accounting phase,
+/// no loss, nothing pending, and nothing dropped; no production handoff
+/// histogram repeats a timed duration; and the tenant reads both captured
+/// calls.
+///
+/// # Panics
+/// Panics when a call, snapshot, count, or capture-row expectation fails.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires the repository-managed Postgres journey lifecycle"]
+async fn benchmark_mode_keeps_capture_and_snapshot_counts_without_prometheus() {
+    let backend = wyrd_server::app::metrics::MetricsBackend::install(true)
+        .expect("the benchmark backend installs first");
+    assert!(backend.prometheus().is_none());
+    assert!(
+        wyrd_server::app::metrics::install_recorder().is_err(),
+        "no Prometheus recorder installs beside the benchmark recorder"
+    );
+    let journey = Journey::start().await;
+    Mock::given(method("POST"))
+        .and(path("/timed/v1/chat/completions"))
+        .and(body_string_contains("\"stream\":true"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_raw(
+                    GatewayCapture::chat_events("chatcmpl-1", 2),
+                    "text/event-stream",
+                )
+                .set_delay(UPSTREAM_DELAY),
+        )
+        .with_priority(1)
+        .mount(&journey.upstream)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/timed/v1/chat/completions"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_json(GatewayCapture::completion())
+                .set_delay(UPSTREAM_DELAY),
+        )
+        .with_priority(2)
+        .mount(&journey.upstream)
+        .await;
+    deploy_compatible(&journey, "acme-first", "/timed").await;
+    journey
+        .put(
+            "capture-policy",
+            json!({"mode": "metadata", "payload_fields": []}),
+        )
+        .await;
+    let inspector = api_key(&journey.server, "capacity_inspector", &["admin"]).await;
+    let labelled = |case: &str| {
+        vec![
+            ("authorization", format!("Bearer {}", journey.caller)),
+            (wyrd_benchmark::CASE_HEADER, case.to_owned()),
+            (wyrd_benchmark::PHASE_HEADER, "steady".to_owned()),
+        ]
+    };
+    let before = wyrd_benchmark::snapshot();
+
+    let buffered = journey
+        .post(
+            "/v1/chat/completions",
+            &labelled("buffered-1kib-capture-metadata"),
+            &chat("acme-first/m"),
+        )
+        .await;
+    assert_eq!(buffered.status().as_u16(), 200);
+    buffered.json::<Value>().await.expect("buffered answer");
+    let mut streamed = chat("acme-first/m");
+    streamed["stream"] = json!(true);
+    let streamed = journey
+        .post(
+            "/v1/chat/completions",
+            &labelled("streamed-1kib-capture-metadata"),
+            &streamed,
+        )
+        .await;
+    assert_eq!(streamed.status().as_u16(), 200);
+    assert!(
+        streamed
+            .text()
+            .await
+            .expect("complete stream")
+            .ends_with("data: [DONE]\n\n")
+    );
+    journey.drain_calls().await;
+    journey
+        .server
+        .await_audit_retained()
+        .await
+        .expect("the Scribe outbox settles");
+
+    let after = wyrd_benchmark::snapshot();
+    let (first, last) = (Metrics::of_snapshot(&before), Metrics::of_snapshot(&after));
+    let interval = after.since(&before).expect("one process");
+    let population = wyrd_testing::capacity::Population::from_interval(interval.clone());
+    assert!(population.invalid.is_empty(), "{:?}", population.invalid);
+    assert_eq!(interval.dropped, 0, "the server's series fit their bounds");
+    for (boundary, case) in [
+        ("gateway.buffered", "buffered-1kib-capture-metadata"),
+        ("gateway.stream.head", "streamed-1kib-capture-metadata"),
+        ("gateway.stream.end", "streamed-1kib-capture-metadata"),
+    ] {
+        let recorded: u64 = population
+            .only(case, "steady")
+            .series
+            .iter()
+            .filter(|series| series.boundary == boundary && series.outcome == "succeeded")
+            .map(|series| series.count)
+            .sum();
+        assert_eq!(recorded, 1, "{boundary} of {case}");
+    }
+    let scribe = ["outbox=\"scribe\""];
+    assert_eq!(
+        delta(&first, &last, "wyrd_gateway_capture_total", &["outcome=\"staged\""]),
+        2.0,
+        "both calls stage their capture"
+    );
+    assert!(
+        delta(&first, &last, "outbox_write_seconds_count", &scribe) > 0.0,
+        "the Scribe outbox writer ran"
+    );
+    assert_eq!(
+        delta(
+            &first,
+            &last,
+            "wyrd_gateway_phase_duration_seconds_count",
+            &["phase=\"account\""]
+        ),
+        2.0,
+        "both calls are accounted"
+    );
+    assert_eq!(
+        delta(&first, &last, "outbox_events_lost_total", &[]),
+        0.0,
+        "nothing is lost"
+    );
+    assert_eq!(
+        last.sum("outbox_pending", &scribe),
+        0.0,
+        "the drain leaves nothing pending"
+    );
+    assert!(
+        interval
+            .histogram("wyrd_gateway_duration_seconds", &[])
+            .is_err(),
+        "a timed handoff is not counted again"
+    );
+    assert_eq!(
+        journey.captured_calls(&inspector, 2).await.len(),
+        2,
+        "the tenant reads every captured call"
+    );
+}
+
 /// Stream events [`gateway_capacity_paces_streams_isolates_tenants_and_recovers`]'s
 /// paced upstream writes, one per write.
 const PACED_CHUNKS: usize = 4;

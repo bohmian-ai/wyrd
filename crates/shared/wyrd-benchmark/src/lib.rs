@@ -71,6 +71,12 @@ pub const HIGHEST_NS: u64 = 1 << 37;
 /// (2^50); a larger fact is counted out of range.
 pub const HIGHEST_SCAN: u64 = 1 << 50;
 
+/// The highest trackable standard-metric histogram value, in billionths
+/// (2^62, a value of about 4.6 billion); a larger observation is rejected.
+/// It holds every residual share, call cost, pool size, queue depth, and
+/// outbox batch item or byte count a benchmark server records.
+pub const HIGHEST_METRIC: u64 = 1 << 62;
+
 /// The most timing series one process keeps.
 pub const MAX_SERIES: usize = 256;
 
@@ -315,6 +321,16 @@ fn facts() -> Histogram<u64> {
         .expect("constant scan histogram bounds are valid")
 }
 
+/// A new empty standard-metric value histogram, in billionths.
+fn metric_values() -> Histogram<u64> {
+    #[expect(
+        clippy::expect_used,
+        reason = "the constant bounds and precision are valid HDR parameters"
+    )]
+    Histogram::new_with_bounds(1, HIGHEST_METRIC, SIGNIFICANT_DIGITS)
+        .expect("constant metric histogram bounds are valid")
+}
+
 /// `value` recorded into `histogram`, or `false` when it is out of range.
 fn record_into(histogram: &mut Histogram<u64>, value: u64) -> bool {
     histogram.record(value).is_ok()
@@ -540,6 +556,9 @@ pub struct Method {
     /// metrics.
     #[serde(default)]
     pub max_metric_series: usize,
+    /// [`HIGHEST_METRIC`]; zero in a record that predates standard metrics.
+    #[serde(default)]
+    pub highest_metric: u64,
 }
 
 impl Method {
@@ -555,6 +574,7 @@ impl Method {
             max_series: MAX_SERIES,
             max_scan_series: MAX_SCAN_SERIES,
             max_metric_series: MAX_METRIC_SERIES,
+            highest_metric: HIGHEST_METRIC,
         }
     }
 }
@@ -1026,7 +1046,7 @@ fn counted(later: u64, earlier: u64, what: &str) -> Result<u64, String> {
 fn interval_of(
     later: &Buckets,
     earlier: Option<&Buckets>,
-    empty: fn() -> Histogram<u64>,
+    empty: impl Fn() -> Histogram<u64>,
 ) -> Result<Distribution, String> {
     let later = Distribution::rebuild(later, empty())?;
     match earlier {
@@ -1192,9 +1212,10 @@ mod tests {
     /// The existing standard `metrics` macros and the explicit request
     /// timing land in one benchmark snapshot: counters and label-order
     /// variants share a series, a gauge keeps its decrements and peak, a
-    /// `_seconds` histogram records nanoseconds while any other records its
-    /// integer values unscaled, an unrepresentable value is refused rather
-    /// than rounded, a request keeps its residual, and an absent series is
+    /// `_seconds` histogram records nanoseconds while any other records
+    /// billionths of its values, so whole counts, a fractional ratio, and a
+    /// decimal cost all keep their value; an unrepresentable value is
+    /// refused, a request keeps its residual, and an absent series is
     /// missing rather than zero.
     ///
     /// # Panics
@@ -1216,7 +1237,10 @@ mod tests {
         metrics::histogram!("bench_test_duration_seconds").record(0.000_25);
         let rows = metrics::histogram!("bench_test_rows");
         rows.record(4.0);
-        rows.record(0.5);
+        rows.record(-1.0);
+        rows.record(f64::NAN);
+        metrics::histogram!("bifrost_variant_residual_share", "writer" => "scribe").record(0.25);
+        metrics::histogram!("wyrd_gateway_call_cost", "currency" => "USD").record(0.000_123);
         super::record_timing(
             &tracing::Span::none(),
             "bench.request",
@@ -1260,28 +1284,45 @@ mod tests {
         assert!(at.lowest <= 250_000 && 250_000 <= at.highest, "{at:?}");
         let refused = interval.histogram("bench_test_rows", &[]);
         assert!(
-            refused.is_err_and(|error| error.contains("1 unrepresentable")),
-            "a fractional value is refused, never rounded"
+            refused.is_err_and(|error| error.contains("2 unrepresentable")),
+            "a negative or non-finite value is refused, never clamped"
         );
-        let rows = interval
-            .metrics
-            .iter()
-            .find_map(|metric| match &metric.value {
-                super::IntervalValue::Histogram { unit, distribution }
-                    if metric.name == "bench_test_rows" =>
-                {
-                    Some((*unit, distribution.clone()))
-                }
-                _ => None,
-            })
-            .expect("the rows histogram");
-        assert_eq!(rows.0, super::HistogramUnit::Value);
-        let four = rows.1.quantile(1.0).expect("one value");
-        assert_eq!(
-            (four.lowest, four.highest),
-            (4, 4),
-            "a value is not seconds"
-        );
+        let histogram = |name: &str| {
+            interval
+                .metrics
+                .iter()
+                .find_map(|metric| match &metric.value {
+                    super::IntervalValue::Histogram { unit, distribution }
+                        if metric.name == name =>
+                    {
+                        Some((metric.rejected, *unit, distribution.clone()))
+                    }
+                    _ => None,
+                })
+                .unwrap_or_else(|| panic!("the {name} histogram"))
+        };
+        for (name, value) in [
+            ("bench_test_rows", 4.0),
+            ("bifrost_variant_residual_share", 0.25),
+            ("wyrd_gateway_call_cost", 0.000_123),
+        ] {
+            let (rejected, unit, values) = histogram(name);
+            assert_eq!(unit, super::HistogramUnit::Billionths, "{name}");
+            let at = values.quantile(1.0).expect("one value");
+            let original = |scaled: u64| {
+                num_traits::ToPrimitive::to_f64(&scaled).expect("finite")
+                    / num_traits::ToPrimitive::to_f64(&unit.per_unit()).expect("finite")
+            };
+            assert!(
+                original(at.lowest) <= value && value <= original(at.highest),
+                "{name} keeps {value} in original units: {at:?}"
+            );
+            if name != "bench_test_rows" {
+                assert_eq!((rejected, values.len()), (0, 1), "{name}");
+                assert!(interval.histogram(name, &[]).is_ok(), "{name}");
+            }
+        }
+        assert_eq!(super::HistogramUnit::Nanoseconds.per_unit(), 1_000_000_000);
         assert!(
             interval
                 .histogram("bench_test_absent_seconds", &[])

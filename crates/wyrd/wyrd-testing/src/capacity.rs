@@ -359,6 +359,7 @@ pub fn timing_declaration() -> Value {
         "max_series": method.max_series,
         "max_scan_series": method.max_scan_series,
         "max_metric_series": method.max_metric_series,
+        "metric_histograms": format!("fixed-point billionths: a _seconds histogram in range_ns, any other in [1, {}] billionths of its value, so fractional ratios and decimal costs keep their value", method.highest_metric),
         "percentile": "nearest rank ceil(q * N) over the window's distribution",
         "server_env": { "WYRD_METRICS_BENCHMARK_SNAPSHOT": "1" },
         "tracing": "operator span export stays at its default (disabled); no span is required for timing",

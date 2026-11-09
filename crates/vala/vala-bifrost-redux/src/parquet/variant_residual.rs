@@ -168,4 +168,38 @@ mod tests {
         )]);
         assert_eq!(variant_residual_share(&unshredded, &plain), None);
     }
+
+    /// A benchmark server keeps a partly shredded file's fractional share
+    /// in its own units rather than refusing it as a non-integer.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the recorder does not install or the share is refused or
+    /// lost.
+    #[test]
+    fn benchmark_recorder_keeps_fractional_residual_shares() {
+        wyrd_benchmark::install().expect("the only recorder");
+        let before = wyrd_benchmark::snapshot();
+        VariantWriter::Scribe.record(Some(0.25));
+        VariantWriter::Forge.record(None);
+        let interval = wyrd_benchmark::snapshot()
+            .since(&before)
+            .expect("one process");
+
+        let share = interval
+            .histogram("bifrost_variant_residual_share", &[("writer", "scribe")])
+            .expect("an accepted share");
+        assert_eq!(share.len(), 1);
+        let at = share.quantile(1.0).expect("one share");
+        assert!(
+            at.lowest <= 250_000_000 && 250_000_000 <= at.highest,
+            "billionths of 0.25: {at:?}"
+        );
+        assert!(
+            interval
+                .histogram("bifrost_variant_residual_share", &[("writer", "forge")])
+                .is_err(),
+            "a file without Variant bytes records nothing"
+        );
+    }
 }

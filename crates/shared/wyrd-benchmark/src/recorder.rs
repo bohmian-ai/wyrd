@@ -7,11 +7,14 @@
 //! sorted labels; there are at most [`MAX_METRIC_SERIES`], and a
 //! registration that would open another is counted in `dropped`.
 //!
-//! A histogram whose name ends in `_seconds` records integer nanoseconds in
-//! the timing range; any other histogram records non-negative integer values
-//! exactly in the scan-fact range. A value either cannot hold (negative,
-//! fractional, non-finite, or out of range) is counted `rejected`, never
-//! rounded or clamped.
+//! Every histogram records fixed-point billionths of its observations
+//! ([`HistogramUnit::per_unit`]): a `_seconds` histogram's are nanoseconds
+//! in the timing range, and any other's are billionths of its value in the
+//! [`HIGHEST_METRIC`](crate::HIGHEST_METRIC) range, so a whole count, a
+//! fractional ratio, and a decimal cost all keep their value to a billionth
+//! and [`SIGNIFICANT_DIGITS`](crate::SIGNIFICANT_DIGITS). A value either
+//! cannot hold (negative, non-finite, or out of range) is counted
+//! `rejected`, never clamped.
 
 use std::collections::BTreeMap;
 
@@ -22,7 +25,7 @@ use metrics::{
 use num_traits::ToPrimitive as _;
 use serde::{Deserialize, Serialize};
 
-use crate::{Buckets, Registry, durations, facts, lock, record_into};
+use crate::{Buckets, Registry, durations, lock, metric_values, record_into};
 
 /// The most standard metric series one process keeps.
 pub const MAX_METRIC_SERIES: usize = 1024;
@@ -38,14 +41,35 @@ pub(crate) enum Kind {
     Histogram = 2,
 }
 
-/// What a standard histogram's integer values count.
+/// What a standard histogram's integer values count: both units are
+/// [`per_unit`](Self::per_unit) billionths of the original observation,
+/// in different ranges.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum HistogramUnit {
     /// Nanoseconds of a `_seconds` histogram, in the timing range.
     Nanoseconds,
-    /// The recorded values themselves, in the scan-fact range.
-    Value,
+    /// Billionths of any other histogram's values, in the
+    /// [`HIGHEST_METRIC`](crate::HIGHEST_METRIC) range: a ratio of 0.25 is
+    /// 250,000,000.
+    Billionths,
+}
+
+impl HistogramUnit {
+    /// Recorded integers per original unit: divide a bucket bound by it to
+    /// read seconds or the metric's own value.
+    #[must_use]
+    pub const fn per_unit(self) -> u64 {
+        1_000_000_000
+    }
+
+    /// A new empty histogram of this unit's range.
+    fn empty(self) -> hdrhistogram::Histogram<u64> {
+        match self {
+            Self::Nanoseconds => durations(),
+            Self::Billionths => metric_values(),
+        }
+    }
 }
 
 /// One standard metric series' cumulative state.
@@ -95,19 +119,17 @@ impl Metric {
         }
     }
 
-    /// Records one histogram observation in its unit.
+    /// Records one histogram observation as the nearest billionth; a
+    /// negative, non-finite, or out-of-range value is rejected.
     fn observe(&mut self, observed: f64) {
-        let Value::Histogram { unit, values } = &mut self.value else {
+        let Value::Histogram { values, .. } = &mut self.value else {
             return;
         };
-        let integer = match unit {
-            HistogramUnit::Nanoseconds => (observed * 1e9).round(),
-            HistogramUnit::Value => observed,
-        };
-        let recorded = (integer >= 0.0 && integer.fract() == 0.0)
-            .then(|| integer.to_u64())
+        let scaled = (observed * 1e9).round();
+        let recorded = (scaled >= 0.0)
+            .then(|| scaled.to_u64())
             .flatten()
-            .is_some_and(|integer| record_into(values, integer));
+            .is_some_and(|scaled| record_into(values, scaled));
         if !recorded {
             self.rejected += 1;
         }
@@ -176,14 +198,17 @@ impl Registry {
                         value: 0.0,
                         peak: 0.0,
                     },
-                    Kind::Histogram if name.ends_with("_seconds") => Value::Histogram {
-                        unit: HistogramUnit::Nanoseconds,
-                        values: durations(),
-                    },
-                    Kind::Histogram => Value::Histogram {
-                        unit: HistogramUnit::Value,
-                        values: facts(),
-                    },
+                    Kind::Histogram => {
+                        let unit = if name.ends_with("_seconds") {
+                            HistogramUnit::Nanoseconds
+                        } else {
+                            HistogramUnit::Billionths
+                        };
+                        Value::Histogram {
+                            unit,
+                            values: unit.empty(),
+                        }
+                    }
                 };
                 self.metrics.push(Metric {
                     name,
@@ -455,13 +480,9 @@ impl IntervalMetric {
                     Some(_) => return Err(format!("{what} changed unit: the recorder was reset")),
                     None => None,
                 };
-                let empty = match unit {
-                    HistogramUnit::Nanoseconds => durations,
-                    HistogramUnit::Value => facts,
-                };
                 IntervalValue::Histogram {
                     unit: *unit,
-                    distribution: crate::interval_of(buckets, prior, empty)?,
+                    distribution: crate::interval_of(buckets, prior, || unit.empty())?,
                 }
             }
         };

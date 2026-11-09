@@ -2115,12 +2115,18 @@ mod usage_bound_tests {
     use axum::extract::rejection::JsonRejection;
     use serde::de::DeserializeOwned;
     use serde_json::{Value, json};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+    use wyrd_gateway::{
+        AttemptResult, BatchAction, BatchInput, BuiltinEndpoints, HttpProviderDispatch,
+        IngressDialect, MediaRequest, OpenAiMediaRoute, ProviderAttempt, ProviderDispatch,
+        ProviderSecret, UploadContent, UploadFile,
+    };
     use wyrd_spec::error::WyrdError;
-    use wyrd_spec::gateway::GatewayOperation;
     use wyrd_spec::gateway::openai::{
         GatewayBatchCreateRequest, GatewayChatCompletionsRequest, GatewayEmbeddingsRequest,
         GatewayImageGenerationRequest, GatewayResponsesRequest, GatewaySpeechRequest,
     };
+    use wyrd_spec::gateway::{GatewayCallId, GatewayOperation, ProviderDeployment};
 
     use super::{typed_body, usage_bound};
     use crate::test_support::CountingAllocator;
@@ -2284,6 +2290,58 @@ mod usage_bound_tests {
         }
     }
 
+    /// A native `OpenAI` attempt of `operation` with `body` and its media
+    /// request or batch action.
+    struct Native<'a> {
+        /// Gateway operation of the attempt.
+        operation: GatewayOperation,
+        /// The caller's body.
+        body: &'a Value,
+        /// Media route and files of an Images or Audio attempt.
+        media: Option<&'a MediaRequest>,
+        /// Batches lifecycle action of a Batches attempt.
+        batch: Option<&'a BatchAction>,
+    }
+
+    /// Bytes this thread allocates dispatching `native` to the deployment of
+    /// `dispatch`, a provider that answers every request.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the attempt does not complete.
+    fn dispatched(
+        dispatch: &HttpProviderDispatch,
+        deployment: &ProviderDeployment,
+        native: &Native<'_>,
+    ) -> usize {
+        let secret = ProviderSecret::new("key".to_owned().into());
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let model = &deployment.models.as_ref().expect("models")[0];
+        let (result, bytes) = CountingAllocator::measure(|| {
+            wyrd_runtime::runtime().block_on(dispatch.dispatch(ProviderAttempt {
+                call_id: GatewayCallId::from_uuid(uuid::Uuid::from_u128(0xabc)),
+                ordinal: std::num::NonZeroU32::MIN,
+                operation: native.operation,
+                ingress: IngressDialect::OpenAi,
+                deployment,
+                model,
+                credential: Some(&secret),
+                body: native.body,
+                media: native.media,
+                batch: native.batch,
+                stream: false,
+                capture: false,
+                deadline: tokio::time::Instant::now() + std::time::Duration::from_secs(10),
+                cancel: &cancel,
+            }))
+        });
+        assert!(
+            matches!(result, AttemptResult::Completed { .. }),
+            "{result:?}"
+        );
+        bytes
+    }
+
     /// Request validation accepts and refuses exactly what each operation's
     /// owned contract decodes, naming the same missing member or `body`, and
     /// returns the body unchanged; checking a body copies no message or
@@ -2292,8 +2350,17 @@ mod usage_bound_tests {
     ///
     /// # Panics
     ///
+    /// Native encoding, measured separately, writes media JSON and multipart
+    /// text, batch creation JSON, and batch upload lines straight into their
+    /// final buffers: dispatch allocation grows only by those required bytes
+    /// (a batch upload's file content, then the form carrying it), never by a
+    /// copied body, line, or field.
+    ///
+    /// # Panics
+    ///
     /// Panics when a projection differs from the pinned or owned outcome, the
-    /// body changes, or validation allocation grows with payload text.
+    /// body changes, validation allocation grows with payload text, or native
+    /// encoding allocates more than its required bytes.
     #[test]
     fn request_validation_preserves_contract_without_payload_copies() {
         let chat = |extra: Value| {
@@ -2533,5 +2600,120 @@ mod usage_bound_tests {
                 );
             }
         }
+
+        let runtime = wyrd_runtime::runtime();
+        let server = runtime.block_on(MockServer::start());
+        runtime.block_on(
+            Mock::given(wiremock::matchers::method("POST"))
+                .respond_with(ResponseTemplate::new(200).set_body_raw("{}", "application/json"))
+                .mount(&server),
+        );
+        let mut base = url::Url::parse(&server.uri()).expect("mock url");
+        base.set_path("/v1");
+        let dispatch = HttpProviderDispatch::new(
+            skald_providers::EndpointPolicy::new(false),
+            BuiltinEndpoints {
+                openai: Some(base),
+                ..BuiltinEndpoints::default()
+            },
+        )
+        .expect("dispatch builds");
+        let deployment: ProviderDeployment = serde_json::from_value(json!({
+            "name": "dep",
+            "models": ["gpt-4o"],
+            "adapter": "openai",
+            "auth": {"bearer": {"credential": "cred"}},
+        }))
+        .expect("deployment");
+        let model = "openai/gpt-4o";
+        let audio = UploadFile {
+            field: "file".to_owned(),
+            filename: "a.wav".to_owned(),
+            content_type: "audio/wav".to_owned(),
+            content: UploadContent::Bytes(vec![1, 2, 3]),
+        };
+        let encoded = |label: &str, required: usize, native: &dyn Fn(&str) -> usize| {
+            let (small, large) = (kib(1024), kib(2048));
+            let grown = native(&large).abs_diff(native(&small));
+            let text = large.len() - small.len();
+            assert!(
+                grown < required * text + text / 8,
+                "native encoding: {label} copies its text: {grown} bytes for {text} more text"
+            );
+        };
+        encoded("media JSON", 1, &|text| {
+            let body = json!({"model": model, "prompt": text, "size": "1024x1024"});
+            let media = MediaRequest {
+                route: OpenAiMediaRoute::ImageGenerations,
+                files: Vec::new(),
+            };
+            dispatched(
+                &dispatch,
+                &deployment,
+                &Native {
+                    operation: GatewayOperation::Images,
+                    body: &body,
+                    media: Some(&media),
+                    batch: None,
+                },
+            )
+        });
+        encoded("media multipart", 1, &|text| {
+            let body = json!({"model": model, "prompt": text, "temperature": 0.5});
+            let media = MediaRequest {
+                route: OpenAiMediaRoute::AudioTranscriptions,
+                files: vec![audio.clone()],
+            };
+            dispatched(
+                &dispatch,
+                &deployment,
+                &Native {
+                    operation: GatewayOperation::Audio,
+                    body: &body,
+                    media: Some(&media),
+                    batch: None,
+                },
+            )
+        });
+        encoded("batch create", 1, &|text| {
+            let body = json!({
+                "input_file_id": "file-1",
+                "endpoint": "/v1/chat/completions",
+                "completion_window": "24h",
+                "metadata": {"note": text},
+            });
+            dispatched(
+                &dispatch,
+                &deployment,
+                &Native {
+                    operation: GatewayOperation::Batches,
+                    body: &body,
+                    media: None,
+                    batch: Some(&BatchAction::CreateBatch),
+                },
+            )
+        });
+        encoded("batch upload", 2, &|text| {
+            let line = json!({
+                "custom_id": "a",
+                "method": "POST",
+                "url": "/v1/chat/completions",
+                "body": {"model": model, "messages": [{"role": "user", "content": text}]},
+            });
+            let action = BatchAction::UploadFile {
+                filename: "input.jsonl".to_owned(),
+                input: BatchInput::parse(format!("{line}\n").as_bytes()).expect("input parses"),
+            };
+            dispatched(
+                &dispatch,
+                &deployment,
+                &Native {
+                    operation: GatewayOperation::Batches,
+                    body: &json!({"purpose": "batch"}),
+                    media: None,
+                    batch: Some(&action),
+                },
+            )
+        });
     }
 }

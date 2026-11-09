@@ -11,8 +11,8 @@ pub use anthropic::AnthropicClient;
 pub use google::GoogleClient;
 pub use jev::JevClient;
 pub use openai::{
-    MediaAnswer, OpenAiBatchRoute, OpenAiClient, OpenAiMediaRoute, OpenAiRoute, UploadContent,
-    UploadFile,
+    MediaAnswer, OpenAiBatchRoute, OpenAiClient, OpenAiMediaRoute, OpenAiRoute, RequestBody,
+    UploadContent, UploadFile,
 };
 pub use vertex::VertexClient;
 

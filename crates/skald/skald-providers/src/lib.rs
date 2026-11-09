@@ -17,7 +17,8 @@ pub mod transport;
 
 pub use clients::{
     AnthropicClient, GoogleClient, JevClient, MediaAnswer, OpenAiBatchRoute, OpenAiClient,
-    OpenAiMediaRoute, OpenAiRoute, ProviderByteStream, UploadContent, UploadFile, VertexClient,
+    OpenAiMediaRoute, OpenAiRoute, ProviderByteStream, RequestBody, UploadContent, UploadFile,
+    VertexClient,
 };
 pub use endpoint::EndpointPolicy;
 pub use error::{ProviderError, ProviderResult, RemoteProblem};

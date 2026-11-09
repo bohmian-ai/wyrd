@@ -283,9 +283,7 @@ impl Client {
     ) -> ProviderResult<MediaAnswer> {
         match (self, prepared) {
             (Self::OpenAi(client), Prepared::Native(body)) => {
-                client
-                    .send_media(media.route, &body.to_value(), &media.files)
-                    .await
+                client.send_media(media.route, body, &media.files).await
             }
             (_, _) => Err(mismatch()),
         }
@@ -307,9 +305,7 @@ impl Client {
     ) -> ProviderResult<ProviderByteStream> {
         match (self, prepared) {
             (Self::OpenAi(client), Prepared::Native(body)) => {
-                client
-                    .stream_media(media.route, &body.to_value(), &media.files)
-                    .await
+                client.stream_media(media.route, body, &media.files).await
             }
             (_, _) => Err(mismatch()),
         }
@@ -332,9 +328,7 @@ impl Client {
         match (self, prepared) {
             (Self::OpenAi(client), Prepared::Native(body)) => {
                 let (route, file) = action.route(native);
-                client
-                    .send_batch(&route, &body.to_value(), file.as_ref())
-                    .await
+                client.send_batch(&route, body, file.as_ref()).await
             }
             (_, _) => Err(mismatch()),
         }

@@ -27,6 +27,7 @@ use serde::de::DeserializeOwned;
 use serde::{Deserialize as _, Serialize};
 use serde_json::value::{RawValue, to_raw_value};
 use serde_json::{Map, Value, json};
+use skald_providers::RequestBody;
 use skald_spec::ProviderResponse;
 use skald_spec::wire::anthropic_messages::{AnthropicMessagesRequest, AnthropicUsage};
 use skald_spec::wire::google_generate::{GoogleGenerateContentRequest, GoogleUsageMetadata};
@@ -151,99 +152,31 @@ pub(crate) struct NativeBody<'a> {
 }
 
 impl NativeBody<'_> {
-    /// Returns the body with its model applied as an owned JSON value.
-    ///
-    /// Only Images, Audio and Batches lifecycle requests, whose clients build
-    /// multipart forms from a JSON tree, take this copy; every other path
-    /// serializes [`NativeBody`] directly.
-    pub(crate) fn to_value(self) -> Value {
-        let mut object = self.body.clone();
-        if let Some(model) = self.model {
-            object.insert("model".to_owned(), Value::String(model.to_owned()));
-        }
-        Value::Object(object)
-    }
-
-    /// Serializes the body with its model applied as compact JSON bytes.
-    ///
-    /// The bytes are written once into a buffer reserved from
-    /// [`Self::len_hint`], so a body without escapes never grows it, and the
-    /// buffer moves into the transport as is, spare capacity included.
+    /// Serializes the body with its model applied as compact JSON bytes,
+    /// through [`RequestBody::to_json`].
     ///
     /// # Errors
     ///
     /// Returns the serialization error of a member serde cannot write.
     pub(crate) fn to_json(self) -> serde_json::Result<Vec<u8>> {
-        let mut json = Vec::with_capacity(self.len_hint());
-        serde_json::to_writer(&mut json, &self)?;
-        Ok(json)
-    }
-
-    /// Compact JSON length of the body with its model applied, assuming no
-    /// string needs escapes and every float takes its longest form.
-    ///
-    /// Only a capacity hint: escapes make the output longer, and shorter
-    /// floats or a replaced model make it shorter.
-    fn len_hint(self) -> usize {
-        let model = self
-            .model
-            .map_or(0, |model| model.len() + r#","model":"""#.len());
-        object_len_hint(self.body) + model
+        RequestBody::from(self).to_json()
     }
 }
 
-/// Unescaped compact JSON length of `value`; see [`NativeBody::len_hint`].
-fn json_len_hint(value: &Value) -> usize {
-    match value {
-        Value::Null | Value::Bool(true) => 4,
-        Value::Bool(false) => 5,
-        Value::Number(number) => match (number.as_u64(), number.as_i64()) {
-            (Some(natural), _) => natural
-                .checked_ilog10()
-                .map_or(1, |digits| digits as usize + 1),
-            (None, Some(negative)) => negative.unsigned_abs().ilog10() as usize + 2,
-            // The longest shortest-round-trip f64, such as -2.2250738585072014e-308.
-            (None, None) => 24,
-        },
-        Value::String(text) => text.len() + 2,
-        Value::Array(items) => {
-            2 + items
-                .iter()
-                .map(|item| json_len_hint(item) + 1)
-                .sum::<usize>()
+impl<'a> From<NativeBody<'a>> for RequestBody<'a> {
+    /// The body as the provider encoders take it, its model still unapplied.
+    fn from(body: NativeBody<'a>) -> Self {
+        Self::Object {
+            members: body.body,
+            model: body.model,
         }
-        Value::Object(members) => object_len_hint(members),
     }
-}
-
-/// Unescaped compact JSON length of the object `members`; see [`json_len_hint`].
-fn object_len_hint(members: &Map<String, Value>) -> usize {
-    2 + members
-        .iter()
-        .map(|(key, value)| key.len() + 4 + json_len_hint(value))
-        .sum::<usize>()
 }
 
 impl Serialize for NativeBody<'_> {
+    /// Serializes through [`RequestBody`], the encoders' one member order.
     fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        use serde::ser::SerializeMap as _;
-
-        let Some(model) = self.model else {
-            return self.body.serialize(serializer);
-        };
-        let present = self.body.contains_key("model");
-        let mut map = serializer.serialize_map(Some(self.body.len() + usize::from(!present)))?;
-        for (key, value) in self.body {
-            if key == "model" {
-                map.serialize_entry(key, model)?;
-            } else {
-                map.serialize_entry(key, value)?;
-            }
-        }
-        if !present {
-            map.serialize_entry("model", model)?;
-        }
-        map.end()
+        RequestBody::from(*self).serialize(serializer)
     }
 }
 

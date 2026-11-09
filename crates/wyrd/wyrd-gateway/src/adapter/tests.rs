@@ -413,7 +413,7 @@ async fn compatible_passthrough_rewrites_model_and_uses_provider_credential() {
         assert_eq!(json, serde_json::to_vec(&native).expect("serializes"));
         assert_eq!(
             json.capacity(),
-            native.len_hint(),
+            skald_providers::RequestBody::from(native).len_hint(),
             "the body serializes into its up-front buffer without growing"
         );
         assert!(

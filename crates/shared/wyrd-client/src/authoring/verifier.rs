@@ -406,16 +406,13 @@ impl Check {
     }
 
     /// Judge statistical drift over the samples slot `on` with the drift
-    /// fields `spec`: method, signal, condition, and profile.
-    pub fn drift(on: impl Into<String>, spec: impl Into<Value>) -> Self {
-        let mut check = Self::of(
-            "drift",
-            [
-                ("on", FieldValue::from(on.into())),
-                ("spec", FieldValue::from(spec.into())),
-            ],
-        );
+    /// fields `spec`: method, signal, condition, and profile. A Card or
+    /// exact [`super::CardRef`] may stand at `signal.baseline_ref`, as at any other
+    /// reference position.
+    pub fn drift(on: impl Into<String>, spec: impl Into<FieldValue>) -> Self {
+        let mut check = Self::of("drift", [("on", FieldValue::from(on.into()))]);
         check.body.flatten = Some("spec");
+        check.body.set("spec", spec.into());
         check
     }
 }

@@ -1422,4 +1422,193 @@ fn entry_built_objects_keep_nested_references() {
             .any(|(code, _)| code == "WYRD_LOADER_400_IO"),
         "{error:?}"
     );
+
+    let workspace = |second: FieldValue| {
+        FieldValue::from_iter([
+            (
+                "/inputs/policy.json".to_owned(),
+                FieldValue::from(policy().file("policy.pdf")),
+            ),
+            ("/inputs/policy.json".to_owned(), second),
+        ])
+    };
+    let repeated = Step::from_iter([
+        ("id".to_owned(), FieldValue::from("review")),
+        ("id".to_owned(), FieldValue::from("renamed")),
+        (
+            "action".to_owned(),
+            FieldValue::from_iter([
+                ("kind".to_owned(), FieldValue::from("agent")),
+                ("agent".to_owned(), FieldValue::from(reviewer.clone())),
+                (
+                    "workspace".to_owned(),
+                    workspace(FieldValue::from("inputs.report")),
+                ),
+            ]),
+        ),
+    ]);
+    let repeated = Verifier::new("repeated", "1.0.0")
+        .inputs([("report", InputSlot::json(json!({"type": "object"})))])
+        .steps([repeated]);
+    let step = &repeated.spec()["steps"][0];
+    assert_eq!(step["id"], "review", "the first received field is kept");
+    assert_eq!(
+        step["action"]["workspace"]["/inputs/policy.json"]["artifact"]["path"], "policy.pdf",
+        "the first received destination keeps its fixed source"
+    );
+    let refused = repeated
+        .validate()
+        .expect_err("repeated received keys are refused");
+    for path in [
+        "steps[0].id",
+        "steps[0].action.workspace./inputs/policy.json",
+    ] {
+        assert!(
+            refuses(&refused, &format!("{path}: duplicate entry")),
+            "{path}: {refused:?}"
+        );
+    }
+
+    let distinct = Verifier::new("distinct", "1.0.0")
+        .inputs([("report", InputSlot::json(json!({"type": "object"})))])
+        .steps([Step::from_iter([
+            ("id".to_owned(), FieldValue::from("review")),
+            (
+                "action".to_owned(),
+                FieldValue::from_iter([
+                    ("kind".to_owned(), FieldValue::from("agent")),
+                    ("agent".to_owned(), FieldValue::from(reviewer)),
+                    (
+                        "workspace".to_owned(),
+                        FieldValue::from_iter([
+                            (
+                                "/inputs/policy.json".to_owned(),
+                                FieldValue::from(policy().file("policy.pdf")),
+                            ),
+                            (
+                                "/inputs/report.json".to_owned(),
+                                FieldValue::from("inputs.report"),
+                            ),
+                        ]),
+                    ),
+                ]),
+            ),
+        ])]);
+    let declaration = CardDefinition::from(&distinct)
+        .declaration()
+        .expect("distinct keys keep every nested capture");
+    assert_eq!(
+        declaration.artifacts.len(),
+        1,
+        "the local Artifact publishes"
+    );
+    assert!(
+        declaration
+            .input
+            .expect("a graph")
+            .submissions
+            .iter()
+            .any(|card| card.metadata.name.as_str() == "report-reviewer"),
+        "the nested Agent joins the graph"
+    );
+}
+
+/// A Prompt's nullable `messages` and `body` hold their canonical `null`,
+/// and a drift check's `signal.baseline_ref` takes a Card or exact
+/// `CardRef` as any reference position does.
+///
+/// # Panics
+/// Panics when a null is not kept as authored, a valid null form is
+/// refused, a malformed form is not refused by validation, or a baseline
+/// reference loses its intent.
+#[test]
+fn nullable_prompt_fields_and_drift_references_compose() {
+    let messages = json!([{"role": "user", "content": "Summarise {{report}}"}]);
+    let portable = Prompt::new("summary", "1.0.0")
+        .provider("openai")
+        .model("gpt-4o")
+        .body([("temperature", json!(0))])
+        .messages([messages[0].clone()])
+        .clear_body();
+    assert_eq!(portable.spec()["body"], Value::Null, "the null is authored");
+    assert_eq!(portable.spec()["messages"], messages);
+    CardDefinition::from(&portable)
+        .declaration()
+        .expect("messages with a null body validate");
+    let neither = portable.clone().clear_messages();
+    assert!(
+        CardDefinition::from(&neither).declaration().is_err(),
+        "a Prompt with neither form is refused by validation"
+    );
+
+    let drift = |baseline: FieldValue| {
+        Verifier::new("latency-drift", "1.0.0")
+            .inputs([("latency", InputSlot::samples(["latency"]))])
+            .requirements([Requirement::new(
+                "latency-stable",
+                "Latency is in control",
+                Check::drift(
+                    "inputs.latency",
+                    FieldValue::from_iter([
+                        ("method".to_owned(), FieldValue::from("Spc")),
+                        (
+                            "signal".to_owned(),
+                            FieldValue::from_iter([
+                                ("kind".to_owned(), FieldValue::from("Distribution")),
+                                ("baseline_ref".to_owned(), baseline),
+                                ("features".to_owned(), FieldValue::from(json!(["latency"]))),
+                            ]),
+                        ),
+                        (
+                            "condition".to_owned(),
+                            FieldValue::from(json!({"kind": "Statistical"})),
+                        ),
+                        (
+                            "profile".to_owned(),
+                            FieldValue::from(json!({"kind": "Spc", "sample_size": 5})),
+                        ),
+                    ]),
+                ),
+            )])
+    };
+    let reference = json!({"kind": "Data", "name": "latency-baseline", "version": "1.0.0"});
+    let literal = drift(FieldValue::from(reference.clone()));
+    let external = drift(FieldValue::from(CardRef::data("latency-baseline", "1.0.0")));
+    assert_eq!(
+        external.spec(),
+        literal.spec(),
+        "an exact CardRef stays external"
+    );
+    assert_eq!(
+        external.spec()["requirements"][0]["check"]["signal"]["baseline_ref"],
+        reference
+    );
+    external.validate().expect("an external baseline validates");
+    let baseline = Data::new("latency-baseline", "1.0.0")
+        .interface(json!({"kind": "Parquet", "meta": {"compression": "Snappy"}}))
+        .schema(json!({"columns": [{"name": "latency", "dtype": "float64"}]}))
+        .stats(json!({
+            "row_count": 1,
+            "col_count": 1,
+            "byte_count": 1,
+            "sha256": "c4f7700b380aff2662e88d034154d1890c33d3c12c8dda1a0ca9481f43bb9906",
+        }));
+    let sibling = drift(FieldValue::from(baseline));
+    assert_eq!(
+        sibling.spec()["requirements"][0]["check"]["signal"]["baseline_ref"],
+        json!({ "sibling": reference }),
+        "an authored Data Card is a sibling"
+    );
+    let input = CardDefinition::from(&sibling)
+        .declaration()
+        .map(|declaration| declaration.input.expect("a graph"));
+    assert!(
+        input
+            .as_ref()
+            .is_ok_and(|input| input
+                .submissions
+                .iter()
+                .any(|card| card.metadata.name.as_str() == "latency-baseline")),
+        "the authored baseline joins the graph: {input:?}"
+    );
 }

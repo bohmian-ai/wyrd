@@ -152,13 +152,10 @@ impl From<Value> for FieldValue {
 
 impl FromIterator<(String, FieldValue)> for FieldValue {
     /// The JSON object of `entries`, keeping what each entry references at
-    /// its key; a key given twice keeps its last value.
+    /// its key; a key given twice keeps its first value and validation
+    /// refuses the repeat.
     fn from_iter<I: IntoIterator<Item = (String, FieldValue)>>(entries: I) -> Self {
-        let mut body = Body::default();
-        for (key, value) in entries {
-            body.set(&key, value);
-        }
-        body.into_field()
+        Body::assembled(entries).into_field()
     }
 }
 
@@ -276,12 +273,36 @@ impl Body {
         body
     }
 
+    /// The object of the received `entries`: a key received twice keeps its
+    /// first value and what it captures, and the repeat is recorded for
+    /// validation to refuse, as [`Self::insert`] records a map key.
+    fn assembled(entries: impl IntoIterator<Item = (String, FieldValue)>) -> Self {
+        let mut body = Self::default();
+        for (key, value) in entries {
+            if body.fields.contains_key(&key) {
+                body.captures
+                    .entry(key.clone())
+                    .or_default()
+                    .duplicates
+                    .push(vec![Segment::Key(key)]);
+            } else {
+                body.set(&key, value);
+            }
+        }
+        body
+    }
+
     /// Replace `field` with `value`, dropping what the old value captured.
+    /// The flattened field's captures are located from this object, where
+    /// its entries are written.
     fn set(&mut self, field: &str, value: FieldValue) {
-        let key = Segment::Key(field.to_owned());
+        let captures = if self.flatten == Some(field) {
+            value.captures
+        } else {
+            value.captures.under(&Segment::Key(field.to_owned()))
+        };
         self.fields.insert(field.to_owned(), value.value);
-        self.captures
-            .insert(field.to_owned(), value.captures.under(&key));
+        self.captures.insert(field.to_owned(), captures);
     }
 
     /// Replace the list `field` with `items`.
@@ -480,16 +501,14 @@ macro_rules! canonical_object {
             impl FromIterator<(String, $crate::authoring::FieldValue)> for $ty {
                 /// The canonical object form with `entries` as its fields,
                 /// each keeping what it references; a key given twice keeps
-                /// its last value.
+                /// its first value and validation refuses the repeat.
                 fn from_iter<I>(entries: I) -> Self
                 where
                     I: IntoIterator<Item = (String, $crate::authoring::FieldValue)>,
                 {
-                    let mut body = $crate::authoring::Body::default();
-                    for (key, value) in entries {
-                        body.set(&key, value);
+                    Self {
+                        body: $crate::authoring::Body::assembled(entries),
                     }
-                    Self { body }
                 }
             }
         )*

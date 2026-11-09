@@ -121,6 +121,26 @@ fields!(Prompt [card.spec] {
     map body, add_body: Value = "body";
 });
 
+impl Prompt {
+    /// Set `messages` to `null`, as a Prompt whose request is its `body`
+    /// writes it, dropping every earlier message.
+    #[must_use]
+    pub fn clear_messages(mut self) -> Self {
+        self.card
+            .spec
+            .set("messages", FieldValue::from(Value::Null));
+        self
+    }
+
+    /// Set `body` to `null`, as a Prompt whose request is its `messages`
+    /// writes it, dropping every earlier entry.
+    #[must_use]
+    pub fn clear_body(mut self) -> Self {
+        self.card.spec.set("body", FieldValue::from(Value::Null));
+        self
+    }
+}
+
 card_kind!(
     /// A Model Card: a trained model's interface, task, and signature. A
     /// heavy Card, its weights are registered before any graph that

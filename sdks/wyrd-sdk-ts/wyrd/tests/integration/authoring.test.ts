@@ -546,10 +546,11 @@ test("local_artifacts_and_declaration_parity", async ({ cards, server }) => {
   expect(await policyFiles(cards, "1.0.0")).toContain(POLICY_FILE);
   expect(await mountedPolicy(cards, "1.0.0")).toBe("1.0.0");
 
-  const files = await cards.declareFromPath(STORY);
+  const files = await cards.declare(STORY);
   expect(files.root).toEqual(receipt.root);
   expect(resolved(files), "the authored graph is the file graph").toEqual(resolved(receipt));
   expect(files.outcomes.every(({ outcome }) => outcome === "idempotent_noop")).toBe(true);
+  expect(await cards.declareFromPath(STORY), "the path helper declares the same file graph").toEqual(files);
   expect(resolved(await cards.declare(baseline(registeredPolicy("1.0.0"))))).toEqual(resolved(files));
 
   const fromCode = await WyrdState.declare(baseline(registeredPolicy("1.0.0")));

@@ -1413,6 +1413,23 @@ pub enum WyrdError {
         /// Structured detail payload.
         details: serde_json::Value,
     },
+    /// A waited verification execution was cancelled, so it has no result.
+    ///
+    /// Its stored status keeps the server's `cancelled` code; only a wait
+    /// reports the cancellation as this error.
+    #[error("[WYRD_SDK_409_VERIFICATION_CANCELLED] {message}")]
+    #[wyrd_error(
+        code = "WYRD_SDK_409_VERIFICATION_CANCELLED",
+        status = 409,
+        title = "Verification execution was cancelled",
+        remediation = "Read the execution's accepted evidence, or submit the verification again; a cancelled execution never resumes."
+    )]
+    SdkVerificationCancelled {
+        /// Human-readable error message.
+        message: String,
+        /// Structured detail payload: the `execution_id` and its `status`.
+        details: serde_json::Value,
+    },
     /// A second `start_bifrost` was attempted on a state that already owns a
     /// connected writer.
     ///
@@ -2004,6 +2021,21 @@ pub enum WyrdError {
         remediation = "Use the execution_id returned by POST /v1/verification/enqueue in the same tenant; a just-accepted execution may take a moment to become visible."
     )]
     VerificationExecutionNotFound {
+        /// Human-readable error message.
+        message: String,
+        /// Structured detail payload.
+        details: Value,
+    },
+    /// The execution is visible, but it has no publication with this name
+    /// for the selected producer step, item, iteration, and attempt.
+    #[error("[WYRD_VERIFICATION_404_PUBLICATION_NOT_FOUND] {message}")]
+    #[wyrd_error(
+        code = "WYRD_VERIFICATION_404_PUBLICATION_NOT_FOUND",
+        status = 404,
+        title = "Verification publication not found",
+        remediation = "List GET /v1/verification/executions/{execution_id}/publications and select a listed name with its exact producer attempt, item_index, and iteration_index."
+    )]
+    VerificationPublicationNotFound {
         /// Human-readable error message.
         message: String,
         /// Structured detail payload.
@@ -3963,6 +3995,7 @@ impl WyrdError {
             | Self::SdkUnknownAlias { message, details }
             | Self::SdkUnknownVerifier { message, details }
             | Self::SdkVerificationWaitTimedOut { message, details }
+            | Self::SdkVerificationCancelled { message, details }
             | Self::SdkVerificationDataInvalid { message, details }
             | Self::SdkBifrostAlreadyStarted { message, details }
             | Self::SdkTelemetryProviderExists { message, details }
@@ -4004,6 +4037,7 @@ impl WyrdError {
             | Self::SpecDuplicateBindingOperator { message, details }
             | Self::VerificationBindingNotFound { message, details }
             | Self::VerificationExecutionNotFound { message, details }
+            | Self::VerificationPublicationNotFound { message, details }
             | Self::VerificationInvalidTarget { message, details }
             | Self::VerificationInvalidWindow { message, details }
             | Self::VerificationNotReady { message, details }

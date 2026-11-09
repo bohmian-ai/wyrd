@@ -1,0 +1,24 @@
+apiVersion: wyrd/v1
+kind: Verifier
+metadata:
+  name: reviewed-verifier
+  version: 1.0.0
+spec:
+  description: A reviewer Agent reviews the answer, then a judge Agent checks the review.
+  inputs:
+    answer: {type: json}
+  steps:
+    - id: review
+      action:
+        kind: agent
+        agent: ./reviewer-agent.yaml
+        inputs: {answer: inputs.answer}
+      requirements:
+        - id: review-agrees
+          statement: The review agrees with the customer
+          check:
+            kind: agent
+            agent: ./judge-agent.yaml
+            inputs:
+              claim: requirement.statement
+              answer: steps.review.output

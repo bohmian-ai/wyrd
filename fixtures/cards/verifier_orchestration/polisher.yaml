@@ -1,0 +1,20 @@
+# Polishes one section of an extracted document, one round at a time.
+apiVersion: wyrd/v1
+kind: Agent
+metadata:
+  name: polisher
+  version: 1.0.0
+spec:
+  execution_route: {kind: wyrd_gateway, deployment: openai}
+  tool_names: [publish]
+  run_config: {max_iterations: 8}
+  prompt:
+    provider: openai
+    model: gpt-4o
+    messages:
+      - role: user
+        content: "POLISH: {{section}} item={{index}} round={{round}}"
+    response_format:
+      type: object
+      properties: {score: {type: integer}, text: {type: string}}
+      additionalProperties: false

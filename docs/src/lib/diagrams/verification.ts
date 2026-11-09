@@ -51,7 +51,7 @@ export const verificationPaths: SequenceSpec = {
       rest: 'Your code stages evidence and gets an execution ID back. The queue runs the same engine later, and your code reads the verdict with <code>wait</code>. Press Play.',
       messages: [
         { from: 'svc', to: 'srv', kind: 'control', label: 'observe.submit(...) · Idempotency-Key', say: 'The SDK uploads missing files, then posts the evidence once with one key it reuses on every transport retry.' },
-        { from: 'srv', to: 'svc', kind: 'ref', label: '202 · execution_id', say: '202 confirms staging only. Replay and conflict are decided when the batched queue writer accepts the request.' },
+        { from: 'srv', to: 'svc', kind: 'ref', label: '202 · execution_id', say: '202 confirms durable admission. The batched queue writer commits the request first; a replay returns the same execution and a conflict is refused.' },
         { from: 'srv', to: 'bif', kind: 'data', label: 'stage inputs', say: 'Inputs are staged on the Scribe outbox. Only after Scribe acknowledges them is the queued row created. Staged work lost before that has no durable outcome.' },
         {
           from: 'srv',

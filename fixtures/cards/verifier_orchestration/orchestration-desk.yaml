@@ -1,0 +1,20 @@
+# The subject of the Verifier orchestration story: a Service verified by
+# Verifiers that fan reviewers out, select specialists by condition, refine
+# a report sequentially, and admit or discard a speculative extra review.
+apiVersion: wyrd/v1
+kind: Service
+metadata:
+  name: orchestration-desk
+  version: 1.0.0
+spec:
+  verified_by:
+    - verifier: ./review-sweep.yaml
+    - verifier: ./specialist-review.yaml
+    - verifier: ./specialists-only.yaml
+    - verifier: ./speculative-review.yaml
+    - verifier: ./refine-report.yaml
+    - verifier: ./document-pipeline.yaml
+    - verifier: ./resume-pipeline.yaml
+    - verifier: ./repeat-takeover.yaml
+    - verifier: ./admission-sweep.yaml
+    - verifier: ./admission-deadline.yaml

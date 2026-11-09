@@ -246,6 +246,57 @@ direct-Iceberg relay is not a recovery mechanism.
   resumes cursors, and preserves one authoritative terminal outcome per
   attempt.
 
+## Verification execution state and recovery
+
+The verification engine owns one in-memory logical state and persists complete
+versioned checkpoints through the existing Bifrost shared writer and Scribe WAL
+acknowledgement. PostgreSQL owns queue admission, claims, lease renewal and retry
+scheduling, not a second invocation/publication recovery payload. Direct verify
+remains queue-free and uses the same engine state lifecycle; disconnect does not
+schedule background Agent work. Scheduled/group activation retains its existing
+queue path and retries preserve original windows and pinned inputs.
+
+Recovery obtains the accepted checkpoint position and loads its exact compatible
+state. Authoritative absence permits fresh execution; required unavailable or
+incomplete state causes bounded wait/retry, never older/empty fallback. Ordinary
+analytical query success is not proof of complete recovery. A replacement worker
+shuts out the old writer before continuing; late or rejected checkpoints cannot
+advance accepted state, including after WAL replay, except a revision the old
+writer froze under its confirmed lease just before takeover, which may be
+accepted first and is then inherited. Lease renewal does not extend
+the original execution deadline. Checkpoint rejection is an operation failure,
+not a reason to crash healthy sibling capabilities.
+
+Settled results, decisions, original budgets/deadlines, exact publication
+descriptors and final-result selection survive recovery. Interrupted external
+calls may repeat within remaining policy. A terminal retry resends required
+records with stable identities and returns the selected outcome without model
+reruns. Every queued terminal path retires queue delivery only after canonical
+Bifrost state and required result records receive WAL/batch-commit ACK. Immediate
+cancellation/revocation preserves durable pending delivery in the existing queue.
+A crash before staging, an ambiguous ACK or failed queue settlement leaves
+record-only recovery eligible; unavailable sources never justify dropping that
+responsibility. Computation deadlines and budgets are not replenished, and their
+expiry does not erase required terminal delivery. Existing writer batching and backpressure remain bounded; no separate
+writer, archive handoff, replica protocol or object-publication/Iceberg wait.
+The WAL guarantee requires retained Scribe storage; permanent loss of unpublished
+WAL remains outside automatic recovery. Recovery may wait for its owner/volume.
+
+Existing File completion, session recovery, integrity, inventory acknowledgement
+and evidence retention retain their owners. Accepted descriptors stay with run
+state from acceptance onward; there is no PostgreSQL-to-Bifrost root transfer or
+new execution cleanup/retention policy. Preserve replay/cursor/cancel behavior,
+group comparisons/dedup, binding summaries and independent registry, repository,
+library and Operator/provider delivery lifetimes when obsolete payload paths are
+removed. Old-format custody must not be erased or relabelled as fresh state;
+rollout drains or safely preserves existing work and refuses unsafe interpretation.
+
+Qualify crashes and delayed replies at checkpoint acceptance, writer takeover,
+WAL rejection replay, exact-state loading, publication acceptance, result delivery
+and queue completion. Include stale writes beside healthy batched work and
+independent delivery progress. These are required implementation proofs, not a
+claim that the current Bifrost reader/fence extensions already exist.
+
 ## Dependency and regional failure
 
 - Postgres unavailability stops mutations, policy decisions that require

@@ -650,7 +650,11 @@ the caller's verified pair for a realtime invocation, and the run's subject
 with the tenant's `System` principal as actor for a queued run — which Scribe
 stamps as `sub_principal_id` and `act_principal_id`; each row names the verified Card as `card_uid` and the
 exact Verifier Card as `verifier_card_uid`; a result batch is never dropped for time and is retried under its
-own batch id until Scribe acknowledges it. Gate refuses every public write to
+own batch id until Scribe acknowledges it. A queued run commits `completed`
+only after Scribe acknowledges every row of its selected result; a result
+Scribe drops retries the run from its committed checkpoints with
+`result_undelivered`, and one not acknowledged before the execution deadline
+times the run out. Gate refuses every public write to
 `bifrost.gateway.calls` and the three result tables.
 Tenant principal kinds are `TenantAdmin`, `User`, and `Service`, plus the
 internal credentialless `System` actor. Agent is a Card kind, not a principal
@@ -1484,6 +1488,24 @@ unknown references, checks that read another requirement's verdict, and
 fields absent from a known output schema. Independent steps run concurrently;
 a step's requirements run before its dependents start.
 
+An Agent workspace source may also name `steps.<id>.publications.<name>` or
+`steps.<id>.publications`; no other position accepts them, and only an Agent
+step publishes named content. A named member mounts what the step's
+successful attempt published under that logical name at the destination: a
+file, a directory with its empty directories, or JSON as a UTF-8 JSON file.
+It never falls back to an earlier attempt; a step with no successful attempt
+leaves the consumer's binding missing, and a missing name refuses the
+consumer before it runs. A collection mounts once the step settles, whatever
+its status, as `manifest.json` (`status`, `reason`, `speculation`, every
+attempt's `invocations` record, and `entries` naming each admitted
+publication, its kind, its mounted `path`, and its producer item, iteration,
+and attempt) plus `content/<opaque invocation segment>/<name>`, so failed
+attempts' accepted partial work stays readable and distinct. Mounted content
+cites only its producer's original slots; a failed step's partial work and
+the manifest cite none. Direct and queued verification retain Agent publications
+and engine extraction through the same accepted run state and Bifrost checkpoint
+path; standalone code actions receive no publication tool.
+
 Requirement outcomes are `passed`, `failed`, `inconclusive`, or
 `not_applicable`. An intentional skip (false `when`) makes dependent
 requirements `not_applicable`; a failed or timed-out step makes them
@@ -1703,8 +1725,14 @@ execution; scheduled executions have no `run_id`.
 |---|---|
 | `POST /v1/verification/evidence` | Declare files by digest and length; receive an `upload_id` and shared upload plan for each one with no completed File record, under the tenant's `evidence/sha256/<digest>` namespace |
 | `POST /v1/verification/execute` | Exact Verifier and subject, optional Run and `group_id`, named input declarations, optional route overrides → `200 VerificationResult` |
-| `POST /v1/verification/enqueue` | The same Run evidence with `Idempotency-Key` → `202 { execution_id }` |
+| `POST /v1/verification/enqueue` | The same Run evidence with `Idempotency-Key` → `202 { execution_id }` after durable admission |
 | `GET /v1/verification/executions/{execution_id}` | Status, terminal error, result when visible, and a group execution's `group_id`, owner, and source selection once its input record is visible; a direct execution's completed status once its records are visible |
+| `GET /v1/verification/executions/{execution_id}/invocations` | One page of a queued execution's invocation attempts in insertion order — producer, progress, reason, speculation — with its status and history projection counts |
+| `GET /v1/verification/executions/{execution_id}/publications` | One page of its publications' names, kinds, and producers, without content |
+| `GET /v1/verification/executions/{execution_id}/publications/{step_id}/{name}` | One publication of the exact producer attempt with its JSON value or manifest |
+| `POST /v1/verification/executions/{execution_id}/publications/{step_id}/{name}/download` | The shared download plan of a file publication's file or a directory publication's listed `path`. A cloud backend's plan is presigned; the local backend's points at `.../content` |
+| `GET /v1/verification/executions/{execution_id}/publications/{step_id}/{name}/content` | The local backend's bytes of that same file, selected and authorized as its download plan is |
+| `POST /v1/verification/executions/{execution_id}/cancel` | `{ execution_id, status }` after the cancellation fence commits; settled work keeps its status |
 | `GET /v1/verification/bindings/{binding_id}` | Readiness, cadence, `last_execution_id`, and a `group_end` binding's frozen settings and source bindings |
 
 File contents never pass through Postgres or a verification request body; an
@@ -1732,11 +1760,36 @@ bounds, the last ending `errored`. Per-file and aggregate limits
 (`WYRD_VERIFICATION_FILE_MAX_MIB`, `WYRD_VERIFICATION_FILES_MAX_MIB`) are
 enforced at planning. `ArtifactRef` selects a declared Artifact under its own
 authorization.
+Accepted publications additionally carry the exact descriptor returned by verified File
+completion: its exact association is retained in the accepted run state and its
+Bifrost checkpoint from acceptance onward. Hosted publication mounts and inspection/download/content
+use that association, not a new digest/size inventory lookup. Match descriptor tenant,
+digest and length to the selected manifest and preserve shared
+download/integrity/cleanup ownership and inventory ACK. This does not change ordinary
+input-File discovery or authorize caller-supplied storage paths.
+
+
+Execution reads — status, invocation and publication pages, publication
+reads, download plans, and local publication content — check `verifier:read` against the execution's
+exact Verifier UID, and cancellation checks `verifier:run`; neither falls back
+to `cards:read`. A caller with no grant of the action at any scope is refused
+before the execution is looked up, and an absent or other-tenant execution is
+not found. Pages default to 50 and hold at most 200 entries; a cursor fixes
+its listing's insertion-sequence cut and is bound to the tenant, execution,
+and listing, so a page neither skips nor repeats entries while the execution
+progresses. Execution status reads its records through the tenant's SYSTEM
+read authority granted only `execution_inputs`, `results`, and
+`execution_outputs`; public Bifrost SQL keeps the caller's own table grants.
 
 Public invocation checks `verifier:run` against the selected Verifier's exact
 Card UID. `PermissionScope::Verifier(CardUid)` names one UID; `All` covers
 every Verifier in the tenant. Permission is checked before execution and the
 decision is audited. A binding does not replace the invocation permission.
+The engine loads the executing Verifier's exact Agent and Prompt Cards under
+the same audited `verifier:run`, never `cards:read`; a referenced definition
+that is deleted, mismatched, or otherwise unreadable when its work starts ends
+the execution errored with `capability_unavailable` instead of judging the
+work, and its committed checkpoints stay readable.
 Planning and every follow-up operation on a File upload (part URL, local
 transfer, completion, abort) stage bytes and select no Verifier, so they
 require only operation-level `verifier:run` admission: any `verifier:run`
@@ -1759,13 +1812,19 @@ writer admits the execution, moving the expected schedule cursor or
 consuming the selected pending group generation in that transaction. The batched writer
 decides `Idempotency-Key` replay and conflict per tenant, subject, actor, and
 key: a matching retry returns the same execution ID; a conflicting one settles
-`errored` with `WYRD_REGISTRY_409_IDEMPOTENCY_CONFLICT`, never runs, and leaves
-the original unchanged. `202` therefore confirms staging only. Staged work
-can be lost on abrupt process death before acknowledgment and then never
-becomes visible; observable losses are counted, and nothing is silently
-resubmitted. `VerificationExecution.wait` polls with capped backoff, tolerates
+`errored` with `WYRD_REGISTRY_409_IDEMPOTENCY_CONFLICT`, never runs, leaves
+the original unchanged, and is refused to its caller with that code.
+`submit` answers only after the batched writer commits the queued row, so
+`202` confirms recoverable admission: a response lost after that commit is
+recovered by retrying under the same key, which returns the same execution.
+Work lost before the commit, on abrupt process death or an unacknowledged
+input, is never acknowledged; the caller receives
+`WYRD_SERVER_503_SERVICE_UNAVAILABLE` or no answer and retries under its key.
+Observable losses are counted, and nothing is silently resubmitted. Audit
+acknowledgement is unchanged. `VerificationExecution.wait` polls with capped backoff, tolerates
 not-found and delayed results within its deadline, and returns only a real
-result, the terminal error, or `WYRD_SDK_504_VERIFICATION_WAIT_TIMEOUT`.
+result, the terminal error, `WYRD_SDK_409_VERIFICATION_CANCELLED` for a cancelled
+execution, or `WYRD_SDK_504_VERIFICATION_WAIT_TIMEOUT`.
 
 Execution status includes the existing Operator `dispatches` projection:
 dispatch ID, exact Operator, delivery status, and optional error. Delivery
@@ -1795,11 +1854,62 @@ baselines. Parsed Verifiers are cached per process by tenant and Card UID in
 a fixed 64 MiB least-recently-used cache that is never shared across tenants.
 A deleted Verifier terminates the execution `errored`.
 
-When execution completes, the runner builds the result once and stages it on
-the process Scribe outbox, then settles at once: settlement never waits for
-Scribe, so a completed execution can lack a retained result. Leases renew on
-the PostgreSQL clock once a third of the lease has passed; an expired lease is
-never revived, and a renewal that no longer finds the token cancels that work.
+One shared verification engine executes the declarative graph. Both synchronous
+verify and queued execution load or initialize one in-memory logical run state.
+Bifrost is its durable recovery source; PostgreSQL coordinates queue admission,
+claims, lease renewal, cancellation and retry scheduling, not invocation results
+or publication acceptance. For every queued terminal path, the existing queue
+retains pending terminal delivery until Bifrost accepts the canonical decision
+and required result records through WAL/batch commit. Queue settlement follows
+that ACK. Cancellation/revocation immediately stops computation and retains
+minimal durable delivery coordination; restart retries only record delivery,
+never cancelled or already-terminal computation. No separate finalizer is added. Scheduled/group activation retains the same queue path.
+
+Complete versioned logical checkpoints preserve pinned declarations/evidence,
+settlements, attempts, original deadline/budgets, control decisions, accepted
+publications/exact File descriptors and selected final outcome. The engine reads
+dependencies from memory. Existing shared Scribe outbox batching and WAL ACK apply
+at external dispatch, dependent release, publication receipt and final success.
+No separate writer, recovery store, engine serialization, conversation replay,
+remote-publication wait or archive handoff is introduced.
+
+Bifrost recovery must return the exact accepted compatible state, authoritative
+absence, or explicit unavailability. Its current analytical source discovery is
+not proof of complete recovery. A replacement writer shuts out the old writer
+before loading/continuing; acceptance checks current authority and accepted
+revision, and WAL replay must not resurrect rejected progress. These are required
+extensions of existing Bifrost read/acceptance owners, not a second queue lease.
+A delayed accepted checkpoint causes wait/retry rather than older/fresh state.
+A revision the old writer froze under its confirmed lease just before takeover
+may still be accepted ahead of the replacement's and is then inherited; this
+rare interval is accepted and no PostgreSQL ownership table closes it. Direct
+verify returns its final input, output and result without waiting for their
+acknowledgement. Execution failures and cancellations are recorded in the
+checkpoint with the execution's exact identity, so retained reads need neither
+the queue row nor the source Cards.
+
+Queue leases renew on the PostgreSQL clock; expiry never revives an old lease.
+Renewal loss cancels the runner, but external calls or buffered writes may still
+return late. Acceptance must preserve cancellation, expiry and deadline fences.
+Current defaults remain a ten-minute queue lease and five-minute queued execution
+timeout; renewal does not extend the original execution deadline.
+
+Direct verify remains queue-free and fresh requests have distinct identities.
+It uses the common state lifecycle, including accepted publications; disconnect
+stops new request work without creating background Agent execution or a new resume
+API. Terminal recovery returns the saved outcome and finishes existing delivery
+without reexecuting settled work. Interrupted external effects may repeat within
+remaining bounds; settled failures remain settled.
+
+Dedicated reads preserve existing wire/permission/cursor contracts using accepted
+execution identities and exact File references. They do not switch from a PostgreSQL
+payload owner to an archive. Group comparisons/dedup, binding summaries and
+independent Operator/provider delivery retain their behavior while old execution-row
+dependencies are removed. Existing storage/session and evidence retention owners
+remain; no new cleanup protocol, tombstones or whole-group serialization is added.
+
+Implementation must prove these execution-state guarantees; architectural
+requirements do not assert the current Bifrost extensions are already implemented.
 
 A `VerificationResult` carries `execution_id`, optional `run_id`, the exact
 `verifier` and `subject`, and an `outcome` of `verdict`, `requirements`
@@ -1816,10 +1926,22 @@ selector for group and schedule work, and queued activation context. A
 returned `VerificationResult` is assembled from the three by one reader:
 verdict from the summary, breakdown from outputs by result ID, evidence from
 inputs by execution ID (a group's resolved slot lists; an empty map for
-scheduled Drift). PostgreSQL stores no input values; a queued execution's
-selected `result_id` stays authoritative. A direct execution has no queue
-row: its status is read from records whose input origin is `direct`, and is
-`completed` once they are visible. Unknown IDs remain not found.
+scheduled Drift). PostgreSQL stores no input payload values. The recoverable
+Bifrost state identifies the exact selected result; never choose
+by result-row recency because abandoned deliveries may leave other rows. Existing
+canonical verification data retains typed invocation/publication metadata, exact
+private File associations, complete sanitized errors and replay identity. State
+loading reconstructs logical progress rather than replaying engine instructions.
+Unknown IDs are not found only after an authoritative read; unavailable required
+sources cause retryable failure. Existing result payload meanings stay unchanged.
+
+Dedicated execution reads retain exact Verifier/repository feature authorization using
+current caller grants and recorded immutable identities, without requiring source Card
+retrieval or leftover queue rows. The server reads accepted/recovered execution
+state and exact references; clients
+do not choose a backend. Ordinary registry/principal control-plane reads retain
+their owners. Existing shared upload/session machinery is reused for publications,
+with accepted descriptor custody in the run state from acceptance onward.
 
 Every work record names who the work was for (`sub_principal_id`) and who
 performed it (`act_principal_id`). A direct caller A records A/A and a
@@ -1860,7 +1982,7 @@ bounded scratch for that invocation only.
 `AgentSpec.tool_names` selects server-owned built-ins: `cards.list`,
 `cards.get`, `bifrost.list_tables`,
 `bifrost.describe_table`, `bifrost.query`, `fs.list`, `fs.read`, `fs.search`,
-`fs.extract`, and `code.run`. `fs.read` returns a UTF-8 file's actual lines
+`fs.extract`, `fs.write`, `code.run`, and `publish`. `fs.read` returns a UTF-8 file's actual lines
 with `lines` locators and a resumable `next`, refusing directories and
 non-UTF-8 files. `fs.search` returns one bounded hit per matching line across
 visible inputs and scratch, in path order, skipping non-text files: a
@@ -1869,9 +1991,22 @@ file or directory scope, and a filename `glob` (the basename, or the path
 relative to the scope when it contains `/`); an invalid pattern or scope is
 refused and a cut result says `truncated`. `fs.extract` takes one input
 `path` and a new `/work` `output_path`, writes the shared extractor's JSON
-without overwriting, and returns `{output_path, sources, extractor_version}`. The Invoker resolves them before the first model call through
-the existing `ToolResolver`/`ToolRegistry`; an unknown name fails, and
-filesystem tools and a workspace require each other. There is no fetch tool.
+without overwriting, and returns `{output_path, sources, extractor_version}`.
+`fs.write` creates or replaces one UTF-8 file under `/work`, creating safe
+parents within the `/work` budget, and returns `{path, bytes}`; `/inputs`,
+traversal, and link or file parents are refused. `publish` is step-only: it
+snapshots one `/work` file or directory, or takes one JSON value (`null`
+included), under a logical name unique within the step attempt, and returns
+`{name, kind}` only after the execution state accepts it, keyed by the
+provider tool call so a replayed call returns its original receipt. The host
+supplies the producer step, item, iteration, and attempt; a final answer is
+never a publication. An Agent that selects `fs.write`, `code.run`, or
+`publish` gets private `/work` scratch without a declared input mount. The
+Invoker resolves them before the first model call through the existing
+`ToolResolver`/`ToolRegistry`; an unknown or repeated name fails, the
+reading `fs.*` tools need a workspace or a scratch writer (`fs.write`,
+`code.run`), and a workspace needs a tool that uses it. There is no fetch
+tool.
 Every call first needs `{"resource":"tool","action":"invoke"}` with scope
 `all` or `{ "tool": <exact name> }`, then the called capability's own
 permission (for `bifrost.query`, read on every table it touches). Neither

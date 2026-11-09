@@ -80,6 +80,10 @@ impl From<Attribution> for StampedAttribution {
     }
 }
 
+/// The durable-fence lookup a writer that derives its batch ids from its
+/// record identity learns its accepted records through.
+pub use vala_sql::queries::scribe_batch_commits::committed_batches;
+
 /// One logical batch crossing the Gate-to-Scribe boundary.
 #[derive(Debug)]
 pub struct ScribeIngressFrame {
@@ -363,6 +367,11 @@ pub enum ScribeError {
         actual: StreamIdentity,
     },
 
+    /// The batch id is already durable with different rows under the same
+    /// table version; the first batch keeps it and this one is not durable.
+    #[error("batch identity already committed with different rows")]
+    BatchConflict,
+
     #[error("internal scribe failure: {detail}")]
     Internal { detail: String },
 }
@@ -402,6 +411,7 @@ impl ScribeError {
                 requested: *requested,
                 actual: *actual,
             },
+            Self::BatchConflict => Self::BatchConflict,
             Self::Internal { detail } => Self::Internal {
                 detail: detail.clone(),
             },

@@ -12,6 +12,7 @@ use std::time::Duration;
 
 pub mod blocks;
 pub mod evidence;
+pub mod publications;
 pub mod registry;
 pub mod sandbox;
 pub mod tools;
@@ -49,8 +50,12 @@ pub(crate) fn extract_refused(error: wyrd_loader::ExtractError) -> vala_verify::
 pub struct HostedLimits {
     /// Largest input file, in bytes.
     pub file_max_bytes: u64,
-    /// Largest combined input-file bytes per execution.
+    /// Largest combined input-file bytes per execution, and the most bytes
+    /// one execution's accepted publications may retain together, so every
+    /// publication set stays mountable as successor input.
     pub files_max_bytes: u64,
+    /// Most publications one execution may accept across all its attempts.
+    pub publications_max: u32,
     /// Largest decompressed bytes per archive, including OOXML containers.
     pub archive_max_bytes: u64,
     /// Most entries per archive.
@@ -132,6 +137,7 @@ impl Default for HostedLimits {
         Self {
             file_max_bytes: 20 * MIB,
             files_max_bytes: 100 * MIB,
+            publications_max: 1_000,
             archive_max_bytes: 200 * MIB,
             archive_max_entries: 10_000,
             archive_max_ratio: 100,

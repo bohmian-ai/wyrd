@@ -23,10 +23,10 @@ pub mod cli;
 
 /// In-process server handle used only by TypeScript integration tests.
 ///
-/// Journeys steer the server through exactly three test controls, each backed
-/// by the production code path: `flushBifrost`, `waitForBaseline`, and
-/// `makeBindingDue`. The remaining members start, address, or credential the
-/// server.
+/// Journeys steer the server through exactly four test controls, each backed
+/// by the production code path: `flushBifrost`, `waitForBaseline`,
+/// `makeBindingDue`, and `holdPublications`. The remaining members start,
+/// address, or credential the server.
 #[napi]
 pub struct NativeWyrdTestServer {
     /// Owned Rust harness dropped only after explicit asynchronous shutdown.
@@ -439,6 +439,32 @@ impl NativeWyrdTestServer {
         })
     }
 
+    /// Admit one execution of a fresh Drift Verifier named `name` and hold it
+    /// running with the harness's four fixed publications.
+    ///
+    /// Attempt 1 of step `review` publishes JSON `verdict` `{"ok": true}` and
+    /// JSON `nothing` `null`; attempt 1 of step `draft` publishes file
+    /// `report` (`# Report` and a newline) and directory `tree` (`a.md` is
+    /// `alpha`, `nested/b.md` is `beta`). Only for a server started without
+    /// `verificationRuntime`, which would race for the execution.
+    ///
+    /// # Errors
+    ///
+    /// Returns a napi error when the harness is closed, `name` is not a Card
+    /// name, or the submission or a publication is refused.
+    #[napi]
+    pub fn hold_publications(&self, name: String) -> Result<HeldPublications> {
+        self.with_server(|server| {
+            let (execution, verifier) = wyrd_runtime::runtime()
+                .block_on(server.hold_publications(&name))
+                .map_err(reason)?;
+            Ok(HeldPublications {
+                execution_id: execution.to_string(),
+                verifier: verifier.to_string(),
+            })
+        })
+    }
+
     /// Run `call` against the open harness while holding its lock.
     ///
     /// # Errors
@@ -581,6 +607,16 @@ impl NativeWyrdTestServer {
         }
         Ok(())
     }
+}
+
+/// The execution [`NativeWyrdTestServer::hold_publications`] holds and the
+/// Verifier it runs.
+#[napi(object)]
+pub struct HeldPublications {
+    /// The held execution's ID.
+    pub execution_id: String,
+    /// The held execution's Verifier Card UID.
+    pub verifier: String,
 }
 
 /// Test-only capabilities a story's server starts with; every field is

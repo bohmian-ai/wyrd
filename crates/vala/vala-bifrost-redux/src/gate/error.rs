@@ -118,6 +118,10 @@ pub enum IngestError {
     /// contract; the catalogued error is the public identity.
     #[error("ingest contract violation: {0}")]
     ContractViolation(BifrostError),
+    /// The batch id is already durable with different rows; nothing of this
+    /// batch was accepted.
+    #[error("batch identity already committed with different rows")]
+    BatchConflict,
     /// An internal failure with no stable client remediation.
     #[error("internal ingest error: {0}")]
     Internal(String),
@@ -177,9 +181,10 @@ impl IngestError {
             | Self::WorkloadContextRequired
             | Self::CardUnresolved { .. } => "permission",
             Self::PayloadTooLarge { .. } => "payload_limit",
-            Self::RequestValidation(_) | Self::Decode(_) | Self::ContractViolation(_) => {
-                "validation"
-            }
+            Self::RequestValidation(_)
+            | Self::Decode(_)
+            | Self::ContractViolation(_)
+            | Self::BatchConflict => "validation",
             Self::TableNotFound { .. } | Self::SchemaMismatch { .. } => "catalog",
             Self::IngressClosed => "role_unavailable",
             Self::IngestBusy { .. } | Self::WalDiskFull => "scribe_admission",
@@ -261,6 +266,10 @@ impl IngestError {
             }
             .into(),
             Self::WalDiskFull => BifrostError::WalDiskFull.into(),
+            Self::BatchConflict => BifrostError::BatchConflict {
+                table: fallback_table(),
+            }
+            .into(),
             Self::Internal(detail) => BifrostError::Internal {
                 detail: detail.clone(),
             }
@@ -301,6 +310,7 @@ impl IngestError {
             crate::contracts::ScribeError::CardScopeDenied => Self::CardScopeDenied,
             crate::contracts::ScribeError::IngressClosed => Self::IngressClosed,
             crate::contracts::ScribeError::WalDiskFull => Self::WalDiskFull,
+            crate::contracts::ScribeError::BatchConflict => Self::BatchConflict,
             other => {
                 // The mapped variants above are the ones a caller can act on;
                 // everything else lands here, and a bare "Scribe ingest failed"

@@ -31,11 +31,21 @@ pub(crate) async fn dispatch(
     plan: &DownloadPlan,
     dest: &Path,
 ) -> Result<DownloadOutcome, StorageClientError> {
-    if plan.get_url.contains("/v1/cards/download/local?") {
+    if authenticated(plan) {
         local_fs::download(client, plan, dest).await
     } else {
         single_get::download(client, plan, dest).await
     }
+}
+
+/// Whether `plan` is redeemed through the authenticated Wyrd origin.
+///
+/// The local backend's plans are root-relative server routes, the Card local
+/// blob route or a Verifier publication's content route, which take the
+/// caller's credentials; every presigned backend URL is absolute and takes
+/// none.
+fn authenticated(plan: &DownloadPlan) -> bool {
+    plan.get_url.starts_with('/')
 }
 
 /// Server-declared integrity expectations for one downloaded artifact.
@@ -71,7 +81,7 @@ pub(crate) async fn dispatch_verified(
         expected_sha256,
         expected_size_bytes,
     };
-    if plan.get_url.contains("/v1/cards/download/local?") {
+    if authenticated(plan) {
         local_fs::download_verified(client, plan, dest, verification, &progress).await
     } else {
         single_get::download_verified(client, plan, dest, verification, &progress).await

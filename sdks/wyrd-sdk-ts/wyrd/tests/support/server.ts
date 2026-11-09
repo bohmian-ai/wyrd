@@ -187,7 +187,7 @@ export async function groupExecution(
 /** How a story file starts its server. */
 export interface ServerOptions {
   /** Answers the Gateway adapters and Verifier Agents send to the server's provider upstream. */
-  readonly provider?: (request: ReceivedRequest) => Reply;
+  readonly provider?: (request: ReceivedRequest) => Reply | Promise<Reply>;
   /** Run Drift baseline fitting, scheduled Verifier runs, and Operators. */
   readonly verificationRuntime?: boolean;
   /** Access-token lifetime in seconds, verified with no clock-skew allowance. */

@@ -86,6 +86,8 @@ tempfile = { workspace = true }
 sqlx = { workspace = true }
 subtle = { workspace = true }
 tar = { workspace = true }
+unicase = { workspace = true }
+unicode-normalization = { workspace = true }
 monty-pool = { workspace = true }
 monty-proto = { workspace = true, features = ["worker"] }
 monty-types = { workspace = true }

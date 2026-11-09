@@ -1934,7 +1934,8 @@ impl Scribe for ScribeImpl {
                     | ScribeError::FingerprintMismatch { .. }
                     | ScribeError::TableNotFound { .. }
                     | ScribeError::CardScopeDenied
-                    | ScribeError::StreamMismatch { .. } => Some("invalid"),
+                    | ScribeError::StreamMismatch { .. }
+                    | ScribeError::BatchConflict => Some("invalid"),
                     ScribeError::IngressClosed
                     | ScribeError::IngestBusy { .. }
                     | ScribeError::Internal { .. } => None,

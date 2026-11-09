@@ -1990,4 +1990,76 @@ pub(crate) mod recording {
             })
         }
     }
+
+    /// A Scribe that admits every frame through `inner`, holding each frame
+    /// bound for `table` until `release` has a permit.
+    pub(crate) struct TableGate {
+        /// Records every admitted frame and answers scripted refusals.
+        pub(crate) inner: Arc<RecordingScribe>,
+        /// The destination whose frames are held.
+        pub(crate) table: ScribeTable,
+        /// Permits the held frames wait for.
+        pub(crate) release: tokio::sync::Semaphore,
+        /// Signalled when a held frame arrives.
+        pub(crate) arrived: tokio::sync::Notify,
+    }
+
+    impl TableGate {
+        /// Holds every frame bound for `table`.
+        pub(crate) fn new(table: ScribeTable) -> Self {
+            Self {
+                inner: Arc::default(),
+                table,
+                release: tokio::sync::Semaphore::new(0),
+                arrived: tokio::sync::Notify::new(),
+            }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl Scribe for TableGate {
+        /// Always ready.
+        fn is_ready(&self) -> bool {
+            true
+        }
+
+        /// Admits `frame` through the recording Scribe, after a release
+        /// permit when it is bound for the held table.
+        ///
+        /// # Errors
+        ///
+        /// Returns the recording Scribe's scripted refusal.
+        ///
+        /// # Panics
+        ///
+        /// Panics when the release semaphore is closed while a held frame
+        /// waits.
+        async fn ingest_frame(
+            &self,
+            frame: ScribeIngressFrame,
+        ) -> Result<FrameAdmission, ScribeError> {
+            if frame.table.fqn() == self.table.fqn() {
+                self.arrived.notify_one();
+                self.release
+                    .acquire()
+                    .await
+                    .expect("the release stays open")
+                    .forget();
+            }
+            self.inner.ingest_frame(frame).await
+        }
+
+        /// Resolves through the recording Scribe.
+        ///
+        /// # Errors
+        ///
+        /// Returns the recording Scribe's resolution error.
+        async fn resolve_write_table(
+            &self,
+            tenant: DataTenantId,
+            table: &TableRef,
+        ) -> Result<TableUid, ScribeError> {
+            self.inner.resolve_write_table(tenant, table).await
+        }
+    }
 }

@@ -29,7 +29,7 @@ use crate::reference::CardRef;
 use crate::storage::ids::UploadId;
 use crate::storage::upload::UploadPlan;
 use crate::vala::ids::{RunId, TraceId};
-use crate::verification::TaskId;
+use crate::verification::{PublicationName, TaskId};
 
 /// `POST /v1/verification/execute` and `POST /v1/verification/enqueue`
 /// request body: the exact Verifier and subject plus one declaration per
@@ -154,7 +154,8 @@ pub struct EvidenceUpload {
 }
 
 /// `202 Accepted` body of `POST /v1/verification/enqueue`. It confirms
-/// staging only; replay or conflict is decided when the queue accepts it.
+/// durable admission; a replay under the same key names the original
+/// execution.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
 pub struct EnqueueVerificationResponse {
@@ -256,6 +257,14 @@ pub struct RequirementResult<T = Map<String, Value>> {
     /// Owning step of a step requirement.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub step: Option<TaskId>,
+    /// Zero-based fanout item of the owning step's invocation this instance
+    /// judged; absent without fanout.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub item_index: Option<u32>,
+    /// Zero-based repeat iteration of the owning step's invocation this
+    /// instance judged; absent without repeat.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub iteration_index: Option<u32>,
     /// The requirement statement.
     pub statement: String,
     /// The outcome.
@@ -389,6 +398,398 @@ pub enum StepStatus {
     /// The step did not run: its `when` was false or a dependency did not
     /// succeed.
     Skipped,
+}
+
+/// The committed settlement of one queued block invocation attempt.
+///
+/// A queued execution checkpoints each action and requirement it runs as
+/// soon as the block settles, before the block's dependents run, so a
+/// reclaimed execution restores the settlement instead of running the block
+/// again. Skipped steps and requirements settled by a missing value perform
+/// no IO and are never checkpointed.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum InvocationSettlement {
+    /// A step action succeeded or failed after its attempts.
+    Action {
+        /// The reported step result, its output uncaptured.
+        result: Box<StepResult>,
+        /// Original slots the action read.
+        sources: BTreeSet<SlotName>,
+    },
+    /// A requirement's check was judged.
+    Requirement {
+        /// The reported requirement result.
+        result: Box<RequirementResult>,
+    },
+}
+
+/// The content kind one execution publication retains.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum PublicationKind {
+    /// One regular file.
+    File,
+    /// One directory tree.
+    Directory,
+    /// One bounded JSON value, `null` included.
+    Json,
+}
+
+/// The producer invocation attempt that accepted a publication.
+///
+/// This is the host-assigned logical invocation identity: the step, its
+/// zero-based fanout item and repeat iteration when those constructs exist,
+/// and its one-based attempt. Authors never supply it.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize, JsonSchema)]
+#[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
+pub struct Producer {
+    /// The producing step.
+    pub step_id: TaskId,
+    /// Zero-based fanout item; `None` without fanout.
+    pub item_index: Option<u32>,
+    /// Zero-based repeat iteration; `None` without repeat.
+    pub iteration_index: Option<u32>,
+    /// One-based attempt.
+    pub attempt: u32,
+}
+
+impl Producer {
+    /// The one-based `attempt` of `step`, which neither fans out nor
+    /// repeats.
+    #[must_use]
+    pub fn plain(step: &TaskId, attempt: u32) -> Self {
+        Self {
+            step_id: step.clone(),
+            item_index: None,
+            iteration_index: None,
+            attempt,
+        }
+    }
+}
+
+/// One regular file a file or directory publication retains.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
+pub struct PublicationFile {
+    /// Path relative to the publication root; a file publication's one entry
+    /// is its basename.
+    pub path: String,
+    /// SHA-256 of the file's bytes, the verification File that holds them.
+    pub sha256: Sha256Hex,
+    /// File size in bytes.
+    pub size_bytes: u64,
+}
+
+/// The immutable manifest of a file or directory publication.
+///
+/// Every byte it names was completed as a verification File before the
+/// manifest committed, so a manifest never names partial content.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
+pub struct PublicationManifest {
+    /// Every regular file, sorted by path.
+    pub files: Vec<PublicationFile>,
+    /// Every directory below a directory publication's root, empty ones
+    /// included, sorted; empty for a file.
+    pub directories: Vec<String>,
+}
+
+/// The content one publication retains: a manifest of completed Files for
+/// a file or directory, or a bounded JSON value.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum PublicationContent {
+    /// One regular file; its manifest holds exactly one entry.
+    File {
+        /// The retained file.
+        manifest: PublicationManifest,
+    },
+    /// One directory tree.
+    Directory {
+        /// The retained tree.
+        manifest: PublicationManifest,
+    },
+    /// One JSON value, `null` included.
+    Json {
+        /// The retained value.
+        value: Value,
+    },
+}
+
+impl PublicationContent {
+    /// The kind of content retained.
+    #[must_use]
+    pub const fn kind(&self) -> PublicationKind {
+        match self {
+            Self::File { .. } => PublicationKind::File,
+            Self::Directory { .. } => PublicationKind::Directory,
+            Self::Json { .. } => PublicationKind::Json,
+        }
+    }
+}
+
+/// One accepted, immutable execution publication.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
+pub struct Publication {
+    /// The logical name, unique within its producer attempt.
+    pub name: PublicationName,
+    /// The invocation attempt that accepted it.
+    pub producer: Producer,
+    /// The retained content.
+    #[serde(flatten)]
+    pub content: PublicationContent,
+}
+
+/// The `manifest.json` of a mounted `steps.<id>.publications` collection.
+///
+/// It reports the producer step's terminal status, every invocation attempt
+/// with its status, and every admitted publication with the path its content
+/// is mounted at beneath the collection root, so a consumer reads failed or
+/// skipped producers honestly instead of inferring them from absent files.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
+pub struct PublicationCollection {
+    /// The producer step's terminal status.
+    pub status: StepStatus,
+    /// Why the step failed or was skipped; `null` when it succeeded.
+    pub reason: Option<String>,
+    /// The step's speculative disposition.
+    pub speculation: Speculation,
+    /// Every invocation attempt, ordered by item, iteration, then attempt;
+    /// empty when the step never ran.
+    pub invocations: Vec<ProducerInvocation>,
+    /// Every admitted publication, grouped like `invocations` and in
+    /// acceptance order within an attempt.
+    pub entries: Vec<CollectionEntry>,
+}
+
+/// A step's speculative disposition, as a collection manifest reports it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum Speculation {
+    /// The step is not speculative.
+    None,
+    /// The step ran before its condition resolved; its contribution is
+    /// withheld until the condition settles.
+    Pending,
+    /// The condition held; the contribution is admitted.
+    Admitted,
+    /// The condition was false; unfinished work was cancelled and the
+    /// contribution is excluded from ordinary consumers.
+    Discarded,
+    /// The condition could not be evaluated; nothing is admitted.
+    Blocked,
+}
+
+impl Speculation {
+    /// Whether ordinary consumers may read the step's contribution.
+    #[must_use]
+    pub const fn admits(self) -> bool {
+        matches!(self, Self::None | Self::Admitted)
+    }
+}
+
+/// One invocation attempt of a collection's producer step.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
+pub struct ProducerInvocation {
+    /// Zero-based fanout item; `null` without fanout.
+    pub item_index: Option<u32>,
+    /// Zero-based repeat iteration; `null` without repeat.
+    pub iteration_index: Option<u32>,
+    /// One-based attempt.
+    pub attempt: u32,
+    /// How the attempt ended: a retried attempt failed.
+    pub status: StepStatus,
+    /// Why the attempt failed; `null` when it succeeded.
+    pub reason: Option<String>,
+}
+
+/// One admitted publication of a mounted collection.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
+pub struct CollectionEntry {
+    /// The logical name.
+    pub name: PublicationName,
+    /// Whether it mounts as a file, a directory, or a JSON file.
+    pub kind: PublicationKind,
+    /// The mounted file, JSON file, or directory root, relative to the
+    /// collection root and always beneath `content/`. Its segments are
+    /// opaque: read them here rather than constructing them.
+    pub path: String,
+    /// Zero-based fanout item of the producer; `null` without fanout.
+    pub item_index: Option<u32>,
+    /// Zero-based repeat iteration of the producer; `null` without repeat.
+    pub iteration_index: Option<u32>,
+    /// One-based producer attempt.
+    pub attempt: u32,
+}
+
+/// Page size an execution listing uses when `limit` is omitted.
+pub const EXECUTION_PAGE_DEFAULT: u32 = 50;
+
+/// Most entries one execution listing page returns.
+pub const EXECUTION_PAGE_MAX: u32 = 200;
+
+/// Query of the paginated execution listings,
+/// `GET /v1/verification/executions/{execution_id}/invocations` and
+/// `/publications`.
+///
+/// The first page fixes the listing's cut: every page of one listing,
+/// followed through `next_cursor`, reads exactly the entries committed
+/// before the first page was read, in commit order, with no gap or
+/// duplicate. Entries committed later appear when a new listing is started.
+/// A cursor binds its tenant, execution, and listing and confers no
+/// authority, which every page re-checks.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[cfg_attr(feature = "server", derive(utoipa::IntoParams, utoipa::ToSchema))]
+#[cfg_attr(feature = "server", into_params(parameter_in = Query))]
+#[serde(deny_unknown_fields)]
+pub struct ExecutionPageQuery {
+    /// Page size, 1–200; 50 when omitted.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(range(min = 1, max = 200))]
+    pub limit: Option<u32>,
+    /// Opaque continuation from the previous page's `next_cursor`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(length(min = 1, max = 2048))]
+    pub cursor: Option<String>,
+}
+
+/// How one invocation attempt stands.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
+#[serde(tag = "state", rename_all = "snake_case")]
+pub enum InvocationProgress {
+    /// Dispatched and not settled: still running, or abandoned when its
+    /// execution is terminal.
+    Started,
+    /// A step action settled.
+    Action {
+        /// How the action ended.
+        status: StepStatus,
+    },
+    /// A requirement was judged.
+    Requirement {
+        /// The judgment.
+        outcome: RequirementOutcome,
+    },
+}
+
+/// One checkpointed invocation attempt of a queued execution.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
+pub struct ExecutionInvocation {
+    /// The step or requirement, item, iteration, and attempt.
+    pub producer: Producer,
+    /// Whether the attempt is running or how it settled.
+    #[serde(flatten)]
+    pub progress: InvocationProgress,
+    /// Why a settled attempt failed, was skipped, or was judged as it was;
+    /// `null` otherwise.
+    pub reason: Option<String>,
+    /// The attempt's speculative disposition.
+    pub speculation: Speculation,
+}
+
+/// How far one execution's history has been projected into
+/// `bifrost.verification.execution_events`.
+///
+/// Projection lag delays history only: invocation progress and publications
+/// read from the execution's records whatever this reports.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
+pub struct HistoryProjection {
+    /// Events Scribe acknowledged.
+    pub acknowledged: u64,
+    /// Events not yet submitted.
+    pub pending: u64,
+    /// Events submitted without an acknowledgement, to be resubmitted under
+    /// the same batch identity.
+    pub failed: u64,
+}
+
+/// `GET /v1/verification/executions/{execution_id}/invocations` response.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
+pub struct InvocationPage {
+    /// The execution.
+    pub execution_id: ExecutionId,
+    /// Its current lifecycle status.
+    pub status: VerificationExecutionStatus,
+    /// The page's invocation attempts, in commit order.
+    pub items: Vec<ExecutionInvocation>,
+    /// Continuation of this listing; `null` on its last page.
+    pub next_cursor: Option<String>,
+    /// The execution's history projection position.
+    pub history: HistoryProjection,
+}
+
+/// One accepted publication as a listing names it, without its content.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
+pub struct PublicationSummary {
+    /// The logical name, unique within its producer attempt.
+    pub name: PublicationName,
+    /// The content kind retained.
+    pub kind: PublicationKind,
+    /// The invocation attempt that accepted it.
+    pub producer: Producer,
+    /// Its producer's speculative disposition.
+    pub speculation: Speculation,
+}
+
+/// `GET /v1/verification/executions/{execution_id}/publications` response.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
+pub struct PublicationPage {
+    /// The execution.
+    pub execution_id: ExecutionId,
+    /// The page's publications, in acceptance order.
+    pub items: Vec<PublicationSummary>,
+    /// Continuation of this listing; `null` on its last page.
+    pub next_cursor: Option<String>,
+}
+
+/// Producer selection of one publication read or download, the query of
+/// `GET` and `POST /v1/verification/executions/{execution_id}/publications/{step_id}/{name}[/download]`.
+///
+/// It names the exact producer attempt a listing reports, never the latest
+/// attempt.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[cfg_attr(feature = "server", derive(utoipa::IntoParams, utoipa::ToSchema))]
+#[cfg_attr(feature = "server", into_params(parameter_in = Query))]
+#[serde(deny_unknown_fields)]
+pub struct PublicationSelector {
+    /// One-based producer attempt.
+    #[schemars(range(min = 1))]
+    pub attempt: u32,
+    /// Zero-based fanout item; omitted without fanout.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub item_index: Option<u32>,
+    /// Zero-based repeat iteration; omitted without repeat.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub iteration_index: Option<u32>,
+    /// For a directory download, the regular file's path relative to the
+    /// publication root, as its manifest lists it; omitted otherwise.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub path: Option<String>,
+}
+
+/// `POST /v1/verification/executions/{execution_id}/cancel` response.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
+pub struct CancelExecutionResponse {
+    /// The execution.
+    pub execution_id: ExecutionId,
+    /// Its status after the cancellation fence: `cancelled` for work that
+    /// was unfinished, otherwise the terminal status it already had.
+    pub status: VerificationExecutionStatus,
 }
 
 /// One tool call an Agent action made.
@@ -550,6 +951,8 @@ impl RequirementResult {
         Ok(RequirementResult {
             id: self.id,
             step: self.step,
+            item_index: self.item_index,
+            iteration_index: self.iteration_index,
             statement: self.statement,
             outcome: self.outcome,
             reason: self.reason,

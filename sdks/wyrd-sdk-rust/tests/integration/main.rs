@@ -8,10 +8,14 @@
 /// One Service action read back as one connected trace timeline.
 mod action_timeline;
 mod declare_and_pull;
+/// Queued work, acknowledged only once durably admitted.
+mod durable_verifier_work;
 mod gateway_admin;
 mod gateway_inference;
 /// TypeSafe Jev through the Gateway, natively and through Chat Completions.
 mod gateway_jev;
+/// Agents write private scratch and publish it for the steps that read it.
+mod hosted_agent_tools;
 /// The admin-key local workflow, start to finish, without a publication flush.
 mod local_development;
 mod observe_a_run;
@@ -33,4 +37,6 @@ mod support;
 mod support_desk;
 /// Every Verifier action and Run check kind, and every extractable format.
 mod verifier_building_blocks;
+/// Verifier steps fan out, branch, repeat, and speculate over real Agents.
+mod verifier_orchestration;
 mod verify_in_real_time;

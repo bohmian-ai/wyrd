@@ -77,6 +77,29 @@ pub struct VerifierSpec {
     /// means `recorded_at`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub order_by: Option<OrderBy>,
+    /// Ceilings that only lower the server's effective execution limits.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub limits: Option<VerifierLimits>,
+}
+
+/// Authored execution ceilings. Each one only lowers the server's effective
+/// limit; omitted values use the server's published defaults.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
+#[serde(deny_unknown_fields)]
+pub struct VerifierLimits {
+    /// Most actions and checks running at once across the whole execution,
+    /// fanout items included.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub concurrency: Option<u32>,
+    /// Most Agent action and check attempts, retries included, the
+    /// execution may start over its whole life; recovery never replenishes
+    /// it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_agent_invocations: Option<u32>,
+    /// Whole-execution deadline in seconds, queue and retry waits included.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timeout_seconds: Option<u32>,
 }
 
 impl VerifierSpec {
@@ -384,13 +407,24 @@ pub struct Step {
     pub id: TaskId,
     /// The data-producing action.
     pub action: Action,
-    /// Ordering-only dependencies beyond those implied by references.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub depends_on: Vec<TaskId>,
+    /// Dependencies beyond those implied by references: an ordering-only
+    /// list, or `{any_succeeded: [...]}`.
+    #[serde(default, skip_serializing_if = "DependsOn::is_empty")]
+    pub depends_on: DependsOn,
     /// Gate: the step runs only when the condition holds; otherwise its
     /// requirements are not applicable.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub when: Option<Condition>,
+    /// Runs the action once per frozen item or a fixed number of times.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub foreach: Option<Foreach>,
+    /// Runs the action sequentially until a condition holds.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub repeat: Option<Repeat>,
+    /// Lets the action start before `when` resolves, withholding its
+    /// contribution until the condition admits it. Requires `when`.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub speculative: bool,
     /// Requirements judged after the action, before dependents start.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub requirements: Vec<Requirement>,
@@ -400,6 +434,126 @@ pub struct Step {
     /// Retries after the first failed attempt, at most [`MAX_STEP_RETRIES`].
     #[serde(default, skip_serializing_if = "is_zero")]
     pub retries: u32,
+}
+
+/// Serde skip predicate omitting a false flag.
+#[expect(
+    clippy::trivially_copy_pass_by_ref,
+    reason = "serde skip_serializing_if passes the field by reference"
+)]
+fn is_false(value: &bool) -> bool {
+    !*value
+}
+
+/// A step's dependencies beyond the ones its references imply.
+///
+/// The list form orders the step after every listed step whatever its
+/// status. The object form `{any_succeeded: [...]}` makes the step
+/// eligible once any listed step settled `succeeded`; when every listed step
+/// settled otherwise, the step does not run.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, JsonSchema)]
+#[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
+#[serde(untagged)]
+pub enum DependsOn {
+    /// Ordering-only predecessors.
+    After(Vec<TaskId>),
+    /// Predecessors of which one must succeed.
+    AnySucceeded {
+        /// Nonempty, unique, known steps.
+        any_succeeded: Vec<TaskId>,
+    },
+}
+
+impl Default for DependsOn {
+    /// No dependencies.
+    fn default() -> Self {
+        Self::After(Vec::new())
+    }
+}
+
+impl DependsOn {
+    /// Every named predecessor, in authored order.
+    #[must_use]
+    pub fn steps(&self) -> &[TaskId] {
+        match self {
+            Self::After(steps)
+            | Self::AnySucceeded {
+                any_succeeded: steps,
+            } => steps,
+        }
+    }
+
+    /// Serde skip predicate omitting an empty ordering list.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        matches!(self, Self::After(steps) if steps.is_empty())
+    }
+}
+
+impl<'de> Deserialize<'de> for DependsOn {
+    /// Reads a list of step IDs or an `{any_succeeded: [...]}` object,
+    /// keeping each form's own diagnostic.
+    ///
+    /// # Errors
+    /// Returns a custom error for an invalid step ID, or an object with a
+    /// missing or unknown field.
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        /// The object form, refusing unknown fields.
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct Any {
+            /// The predecessors.
+            any_succeeded: Vec<TaskId>,
+        }
+        match Value::deserialize(deserializer)? {
+            value @ Value::Array(_) => serde_json::from_value(value)
+                .map(Self::After)
+                .map_err(D::Error::custom),
+            value => serde_json::from_value::<Any>(value)
+                .map(|any| Self::AnySucceeded {
+                    any_succeeded: any.any_succeeded,
+                })
+                .map_err(D::Error::custom),
+        }
+    }
+}
+
+/// Bounded fanout of one step's action: exactly one of `count` or `items`.
+///
+/// Each item is an independent invocation with its own zero-based index,
+/// attempts, and private scratch. Validation refuses any other shape.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
+#[serde(deny_unknown_fields)]
+pub struct Foreach {
+    /// A positive number of identical invocations.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub count: Option<u32>,
+    /// A reference to a JSON array frozen whole before any item runs.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub items: Option<Reference>,
+    /// The most items `items` may hold; required with `items`. A longer
+    /// array fails the step without running any item.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_items: Option<u32>,
+    /// Most items running at once; only lowers the execution's limit.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub concurrency: Option<u32>,
+}
+
+/// Bounded sequential repetition of one step's action.
+///
+/// Each iteration and its step requirements settle before `until` is
+/// evaluated; true stops successfully, false runs the next iteration, and
+/// exhausting `max_iterations` fails the step.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
+#[serde(deny_unknown_fields)]
+pub struct Repeat {
+    /// The positive iteration bound.
+    pub max_iterations: u32,
+    /// The stop condition; it may read `iteration.output`.
+    pub until: Condition,
 }
 
 /// Serde skip predicate omitting zero retries.

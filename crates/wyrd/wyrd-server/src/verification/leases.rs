@@ -5,17 +5,24 @@
 //! leases in one statement, extending each once a third of it has passed. A
 //! renewal that finds a run's token gone cancels that run's work at once, and
 //! a run whose lease could not be renewed for a whole lease length is
-//! cancelled too, because its lease may have expired. Renewal is an engine
-//! mechanic: it evaluates no permission and writes no audit.
+//! cancelled too, because its lease may have expired. A cancellation
+//! committed on any replica notifies [`CANCELLED_CHANNEL`], which renews at
+//! once, so cancelled work stops and frees its capacity without waiting for
+//! the next tick. Renewal is an engine mechanic: it evaluates no permission
+//! and writes no audit.
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use tokio::sync::Notify;
 use tokio_util::sync::CancellationToken;
 use wyrd_spec::DataTenantId;
 use wyrd_sql::queries::verifier_executions::{LeaseToken, VerifierExecutionQueue};
 use wyrd_sql::{SqlError, WyrdPostgres};
+
+/// Channel a running execution's cancellation notifies once it commits.
+const CANCELLED_CHANNEL: &str = "wyrd_verification_cancelled";
 
 /// One held lease: the work's cancellation and when it was last known held.
 struct Held {
@@ -26,7 +33,7 @@ struct Held {
 }
 
 /// Owner of every lease this process's runner holds, and their renewal.
-pub(super) struct LeaseRenewal {
+pub struct LeaseRenewal {
     /// Wyrd Postgres owner that opens each tenant's renewal transaction.
     postgres: WyrdPostgres,
     /// Queue owning the renewal statement.
@@ -38,7 +45,7 @@ pub(super) struct LeaseRenewal {
 }
 
 /// A lease registered for renewal until this guard drops.
-pub(super) struct HeldLease {
+pub struct HeldLease {
     /// The renewal owner the lease is removed from on drop.
     renewal: Arc<LeaseRenewal>,
     /// Tenant of the run.
@@ -51,8 +58,30 @@ pub(super) struct HeldLease {
 
 impl HeldLease {
     /// The token cancelled when this lease is lost or its work abandoned.
-    pub(super) fn lost(&self) -> &CancellationToken {
+    pub fn lost(&self) -> &CancellationToken {
         &self.lost
+    }
+
+    /// Confirm in PostgreSQL that this lease still holds its run, renewing it
+    /// as a tick would, and cancel [`lost`](Self::lost) when it does not.
+    ///
+    /// Work about to leave the process, such as a result write, confirms
+    /// first, so a holder whose lease expired or was reclaimed since its last
+    /// renewal stops before writing.
+    ///
+    /// # Errors
+    /// Returns [`SqlError`] when the connection, statement, or commit fails;
+    /// the lease is then neither confirmed nor cancelled.
+    pub async fn confirm(&self) -> Result<bool, SqlError> {
+        let held = self
+            .renewal
+            .renew_tenant(self.tenant, &[self.token])
+            .await?
+            .contains(&self.token);
+        if !held {
+            self.lost.cancel();
+        }
+        Ok(held)
     }
 }
 
@@ -74,11 +103,7 @@ impl Drop for HeldLease {
 
 impl LeaseRenewal {
     /// Build a renewal owner granting `lease` through `postgres`.
-    pub(super) fn new(
-        postgres: WyrdPostgres,
-        queue: VerifierExecutionQueue,
-        lease: Duration,
-    ) -> Self {
+    pub fn new(postgres: WyrdPostgres, queue: VerifierExecutionQueue, lease: Duration) -> Self {
         Self {
             postgres,
             queue,
@@ -94,7 +119,7 @@ impl LeaseRenewal {
     ///
     /// # Panics
     /// Panics when the held-lease lock is poisoned.
-    pub(super) fn hold(
+    pub fn hold(
         self: &Arc<Self>,
         tenant: DataTenantId,
         token: LeaseToken,
@@ -121,17 +146,29 @@ impl LeaseRenewal {
         }
     }
 
-    /// Renew held leases every sixth of a lease until `stop` is cancelled.
+    /// Renew held leases every sixth of a lease, and whenever a cancellation
+    /// is heard on [`CANCELLED_CHANNEL`], until `stop` is cancelled.
     ///
     /// Ticking at a sixth of the lease renews each lease after a third and
-    /// before half of it has passed.
+    /// before half of it has passed. A heard cancellation renews at once, so
+    /// the fenced run's token comes back missing and its work is cancelled;
+    /// renewing early only re-extends leases already past a third. While the
+    /// listener is down the tick remains the bound.
     pub(super) async fn run(&self, stop: CancellationToken) {
-        loop {
-            tokio::select! {
-                () = stop.cancelled() => return,
-                () = tokio::time::sleep(self.lease / 6) => self.renew().await,
+        let cancelled = Notify::new();
+        let listener = self.postgres.listener(CANCELLED_CHANNEL);
+        let listen = listener.watch(stop.clone(), |_| {}, |_| cancelled.notify_one());
+        let renew = async {
+            loop {
+                tokio::select! {
+                    () = stop.cancelled() => return,
+                    () = tokio::time::sleep(self.lease / 6) => {}
+                    () = cancelled.notified() => {}
+                }
+                self.renew().await;
             }
-        }
+        };
+        tokio::join!(listen, renew);
     }
 
     /// Renew every tenant's held leases, one statement per tenant.

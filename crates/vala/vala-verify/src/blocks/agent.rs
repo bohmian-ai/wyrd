@@ -30,7 +30,9 @@ use wyrd_spec::ids::SlotName;
 use wyrd_spec::reference::{CardRef, InlineableRef};
 use wyrd_spec::verification::TaskId;
 use wyrd_spec::verification::VerificationVerdict;
-use wyrd_spec::verification::execution::{CallProvenance, Citation, InputDeclaration, Verdict};
+use wyrd_spec::verification::execution::{
+    CallProvenance, Citation, InputDeclaration, Producer, Verdict,
+};
 
 use super::tools::{AgentToolset, ToolSession, finished};
 use super::{
@@ -307,6 +309,9 @@ impl AgentExecutor {
                         reason: format!("text placeholder {name} cannot bind media"),
                     });
                 }
+                (CallValue::Publication { .. } | CallValue::Publications { .. }, _) => {
+                    return Err(terminal("publications mount only in a workspace"));
+                }
             }
         }
         if !slots.is_empty() {
@@ -321,8 +326,8 @@ impl AgentExecutor {
 
     /// Run one Agent call and return its raw run plus provenance.
     ///
-    /// `slots` are the citation slots a check invocation can reach, empty for
-    /// a step; see [`Self::bind`].
+    /// `role` carries a step's producing attempt or a check's reachable
+    /// citation slots; see [`Role`].
     ///
     /// Steps and checks get exactly their declared built-ins from the toolset, which holds the
     /// invocation's workspace until the run ends. The first tool refused
@@ -344,11 +349,15 @@ impl AgentExecutor {
         call: &AgentCall,
         inputs: &BTreeMap<String, CallInput>,
         workspace: &BTreeMap<String, CallInput>,
-        slots: &BTreeSet<SlotName>,
         deadline: Instant,
+        role: &Role<'_>,
     ) -> Result<Invoked, BlockError> {
         let resolved = self.resolve(&call.agent).await?;
         let route = self.route(id, &resolved.spec.execution_route)?;
+        let (slots, producer) = match role {
+            Role::Step(producer) => (&BTreeSet::new(), Some(producer)),
+            Role::Check(slots) => (*slots, None),
+        };
         let (prompt, vars) = self.bind(&resolved.prompt, inputs, slots).await?;
         let declared = resolved
             .spec
@@ -371,7 +380,11 @@ impl AgentExecutor {
                 .toolset
                 .as_ref()
                 .ok_or_else(|| terminal("this host provides no built-in tools"))?;
-            Some(toolset.open(id, workspace, deadline, &declared).await?)
+            Some(
+                toolset
+                    .open(id, workspace, deadline, &declared, producer)
+                    .await?,
+            )
         };
         let tools = match &session {
             Some(session) => session.resolve(&declared, &records)?,
@@ -438,14 +451,15 @@ impl ActionExecutor for AgentExecutor {
         let Action::Agent(agent) = call.block else {
             return Err(terminal("the Agent executor runs only Agent actions"));
         };
+        let producer = call.producer();
         let invoked = self
             .invoke(
                 call.id,
                 agent,
                 &call.inputs,
                 &call.workspace,
-                &BTreeSet::new(),
                 call.deadline,
+                &Role::Step(producer),
             )
             .await?;
         let output = invoked
@@ -489,8 +503,8 @@ impl CheckExecutor for AgentExecutor {
                 agent,
                 &call.inputs,
                 &call.workspace,
-                &reachable,
                 call.deadline,
+                &Role::Check(&reachable),
             )
             .await?;
         let answer = invoked
@@ -532,6 +546,15 @@ struct Resolved {
     prompt: Prompt,
     /// The Prompt Card, when referenced.
     prompt_ref: Option<CardRef>,
+}
+
+/// What one Agent call is invoked as.
+enum Role<'a> {
+    /// A step action: the attempt the toolset attributes publications to.
+    Step(Producer),
+    /// A check: the citation slots its Verdict may cite, narrowed by
+    /// [`AgentExecutor::bind`] when non-empty.
+    Check(&'a BTreeSet<SlotName>),
 }
 
 /// The result of one Agent run.

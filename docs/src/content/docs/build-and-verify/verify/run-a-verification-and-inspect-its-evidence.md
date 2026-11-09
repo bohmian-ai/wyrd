@@ -13,7 +13,7 @@ draft: true
 ## Prerequisites
 
 - A Verifier bound to the run's Card. Here `my-review` takes one file slot, `document`.
-- `verifier:run` to submit, and the same principal or `cards:read` plus `bifrost_query:read` to inspect.
+- `verifier:run` to submit or cancel, `verifier:read` to read an execution's status, invocations, and publications, and `bifrost_query:read` to query its Bifrost evidence.
 
 ## 1. Submit and keep the ID
 
@@ -62,11 +62,11 @@ if (submitted.kind === "queued") save(submitted.execution.id);
 
 ### What the 202 means
 
-The `202` and its `execution_id` confirm the evidence was staged in the server's memory, not that the execution is queued:
+The `202` and its `execution_id` confirm the execution is durably queued:
 
-- The server queues it after its evidence is durably written, in the background. Until then, reading the execution returns not found.
-- A second submission with the same key but different content is refused at that point, not at the `202`. It settles as `errored` with `WYRD_REGISTRY_409_IDEMPOTENCY_CONFLICT`, never runs, and leaves the original execution unchanged.
-- If the server stops abruptly before the evidence is written, the submission is lost: it never becomes visible, and `wait` times out. Submit again if you need the verdict; nothing is retried for you.
+- The server answers only after the evidence is written and the queued execution is committed. If the response is lost, submitting again with the same key returns the same execution, even from another server replica.
+- A second submission with the same key but different content is refused with `409 WYRD_REGISTRY_409_IDEMPOTENCY_CONFLICT`. It never runs and leaves the original execution unchanged.
+- If the server cannot commit the execution, for example because it stops abruptly, the submission is never acknowledged: `submit` fails with `WYRD_SERVER_503_SERVICE_UNAVAILABLE` or a transport error. Submit again; nothing is retried for you.
 - A completed execution can rarely lack a stored result for the same reason, so `wait` keeps polling and never reports a verdict it has not read.
 
 ## 2. Wait for the result
@@ -112,7 +112,7 @@ console.log(result.outcome.verdict);
 
 `connect` uses the ambient credentials, or the client you pass (`client=` in Python, `{ client }` in TypeScript, `connect_with` in Rust). It reads as that principal, so it sees only executions in its own tenant that it may read.
 
-`wait` polls `GET /v1/verification/executions/{execution_id}`, backing off from 100 ms to 2 s. It returns the same `VerificationResult` that `verify` returns, raises the execution's own error when it settled without a verdict, and raises `WYRD_SDK_504_VERIFICATION_WAIT_TIMEOUT` when the timeout passes first. A timeout does not cancel the execution; wait again later.
+`wait` polls `GET /v1/verification/executions/{execution_id}`, backing off from 100 ms to 2 s. It returns the same `VerificationResult` that `verify` returns, raises the execution's own error when it errored or timed out, raises `WYRD_SDK_409_VERIFICATION_CANCELLED` when it was cancelled, and raises `WYRD_SDK_504_VERIFICATION_WAIT_TIMEOUT` when the timeout passes first. A timeout does not cancel the execution; wait again later.
 
 To read once without waiting, call `status()`:
 
@@ -204,8 +204,10 @@ Only a `failed` verdict from a submitted or scheduled execution runs the binding
 
 | Code or symptom | Cause | Fix |
 | --- | --- | --- |
-| `WYRD_SDK_504_VERIFICATION_WAIT_TIMEOUT` | The execution has not settled, or the submission was lost before it was queued | Wait again; if `status()` stays not found, submit again |
-| `WYRD_REGISTRY_409_IDEMPOTENCY_CONFLICT` from `wait` | The same `Idempotency-Key` was reused with different content | Use a new key for new content; the original execution is unaffected |
+| `WYRD_SDK_504_VERIFICATION_WAIT_TIMEOUT` | The execution has not settled | Wait again |
+| `WYRD_SDK_409_VERIFICATION_CANCELLED` | The execution was cancelled; its status keeps the `cancelled` code | Submit again; a cancelled execution never resumes |
+| `WYRD_SERVER_503_SERVICE_UNAVAILABLE` on submit | The submission was lost before it was durably admitted, so it was never acknowledged | Submit again; a retry under the same `Idempotency-Key` names the same execution |
+| `WYRD_REGISTRY_409_IDEMPOTENCY_CONFLICT` on submit | The same `Idempotency-Key` was reused with different content | Use a new key for new content; the original execution is unaffected |
 | `WYRD_PERMISSION_403_DENIED_RBAC` on submit | No `verifier:run` on the bound Verifier | Use a credential with `workload` or a role that includes it |
 | Not found from another process | That principal is in another tenant or may not read the execution | Connect with the submitting principal or one granted read access |
 | `completed` but no Operator fired | The verdict was `passed` or `inconclusive` | Read `result.outcome.verdict` |

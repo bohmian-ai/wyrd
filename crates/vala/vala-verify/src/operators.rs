@@ -497,7 +497,9 @@ pub fn evaluate_operator(
     }
 }
 
-fn mismatch(op: &ComparisonOperator, left: &Value, right: &Value) -> ExecError {
+/// The error of comparing `left` and `right` with `op` when their JSON
+/// types cannot be compared.
+pub(crate) fn mismatch(op: &ComparisonOperator, left: &Value, right: &Value) -> ExecError {
     ExecError::OperatorMismatch {
         op: op.discriminator().to_string(),
         left_kind: json_kind(left),
@@ -505,7 +507,8 @@ fn mismatch(op: &ComparisonOperator, left: &Value, right: &Value) -> ExecError {
     }
 }
 
-fn json_kind(v: &Value) -> &'static str {
+/// The JSON type name of `v`.
+pub(crate) const fn json_kind(v: &Value) -> &'static str {
     match v {
         Value::Null => "null",
         Value::Bool(_) => "bool",

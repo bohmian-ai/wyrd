@@ -1,0 +1,22 @@
+# Reads every account mounted from the settled collection before it
+# answers.
+apiVersion: wyrd/v1
+kind: Agent
+metadata:
+  name: consolidator
+  version: 1.0.0
+spec:
+  execution_route: {kind: wyrd_gateway, deployment: openai}
+  tool_names: [fs.list, fs.read]
+  run_config: {max_iterations: 8}
+  prompt:
+    provider: openai
+    model: gpt-4o
+    messages:
+      - role: user
+        content: "CONSOLIDATE: {{question}}"
+    response_format:
+      type: object
+      properties: {done: {type: boolean}}
+      required: [done]
+      additionalProperties: false

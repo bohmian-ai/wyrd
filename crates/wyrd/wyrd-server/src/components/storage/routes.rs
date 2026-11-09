@@ -275,7 +275,26 @@ async fn complete(
         }
         UploadOwner::File => (ObjectOrigin::FileUpload, None, None),
     };
-    let fact = ObjectFact {
+    let mut fact = completed_file(&state, &upload_id, stored)?;
+    fact.origin = origin;
+    fact.card_uid = card_uid;
+    fact.relative_path = relative_path;
+    ObjectInventory::new(&state)
+        .record(caller.data_tenant_id, caller.attribution(), &[fact])
+        .await?;
+    Ok(Json(response))
+}
+
+/// The inventory fact of upload `upload_id`'s completed File `stored`.
+///
+/// # Errors
+/// Returns an internal error when the stored size overflows.
+pub(crate) fn completed_file(
+    state: &AppState,
+    upload_id: &UploadId,
+    stored: &wyrd_spec::storage::StoredObjectRef,
+) -> Result<ObjectFact, WyrdError> {
+    Ok(ObjectFact {
         storage_path: stored.storage_path.clone(),
         upload_id: Some(upload_id.to_string()),
         backend: state.storage.backend().to_string(),
@@ -284,15 +303,11 @@ async fn complete(
             .map_err(|_| WyrdError::internal("completed object size overflows"))?,
         content_type: stored.content_type.clone(),
         sse_marker: stored.sse_marker.clone(),
-        origin,
-        card_uid,
-        relative_path,
+        origin: ObjectOrigin::FileUpload,
+        card_uid: None,
+        relative_path: None,
         state: ObjectState::Completed,
-    };
-    ObjectInventory::new(&state)
-        .record(caller.data_tenant_id, caller.attribution(), &[fact])
-        .await?;
-    Ok(Json(response))
+    })
 }
 
 /// Abort an upload and release its pending storage state.

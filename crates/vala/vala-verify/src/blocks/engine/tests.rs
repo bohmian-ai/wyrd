@@ -14,10 +14,14 @@ use tokio::sync::{Barrier, Notify};
 use wyrd_spec::vala::ids::{SpanId, TraceId};
 use wyrd_spec::vala::trace::{InstrumentationScope, Resource, SpanKind, SpanRecord, SpanStatus};
 use wyrd_spec::verification::DriftWindow;
-use wyrd_spec::verification::execution::Verdict;
+use wyrd_spec::verification::PublicationName;
+use wyrd_spec::verification::execution::{
+    Producer, ProducerInvocation, PublicationCollection, Speculation, Verdict,
+};
 
 use super::*;
 use crate::InMemoryTraceSource;
+use wyrd_spec::verification::state::InvocationRecord;
 
 /// One finished one-second span named `name` in `trace`.
 ///
@@ -82,6 +86,32 @@ enum Behavior {
     Hang(Arc<Notify>),
     /// Panic with this message.
     Panic(&'static str),
+    /// Refuse capacity on the first attempt of an item in `busy`; else
+    /// wait `delays[item]` seconds (none when absent), record
+    /// `done:<call>`, then fail terminally when the item is in `fail`, or
+    /// return the call's inputs as one JSON object.
+    Echo {
+        /// Seconds each item waits, by item index (0 without fanout).
+        delays: Vec<u64>,
+        /// Items that fail.
+        fail: Vec<u32>,
+        /// Items whose first attempt is refused capacity.
+        busy: Vec<u32>,
+    },
+}
+
+/// The log label of one call: its block ID, then `[item]` and `#iteration`
+/// when the call has them.
+fn label<B>(call: &BlockCall<'_, B>) -> String {
+    let item = call
+        .item_index
+        .map(|item| format!("[{item}]"))
+        .unwrap_or_default();
+    let iteration = call
+        .iteration_index
+        .map(|iteration| format!("#{iteration}"))
+        .unwrap_or_default();
+    format!("{}{item}{iteration}", call.id.as_str())
 }
 
 /// Notifies when the hanging call that owns it is dropped.
@@ -101,12 +131,14 @@ struct Script {
     actions: HashMap<&'static str, Behavior>,
     /// Check result by requirement ID; unscripted checks error.
     checks: HashMap<&'static str, Result<CheckOutput, BlockError>>,
+    /// Checks that wait for their signal before returning their result.
+    held: HashMap<&'static str, Arc<Notify>>,
     /// `action:<id>` / `check:<id>` in call order.
     log: Mutex<Vec<String>>,
     /// Attempts made per step.
     attempts: Mutex<HashMap<String, usize>>,
-    /// Each call's workspace paths and their sources, by block ID.
-    mounts: Mutex<HashMap<String, BTreeMap<String, BTreeSet<SlotName>>>>,
+    /// Each call's workspace by block ID.
+    mounts: Mutex<HashMap<String, BTreeMap<String, CallInput>>>,
 }
 
 impl Script {
@@ -133,13 +165,10 @@ impl Script {
     /// Panics when another recording call panicked while holding the
     /// mounts lock.
     fn mount(&self, id: &TaskId, workspace: &BTreeMap<String, CallInput>) {
-        self.mounts.lock().expect("mounts").insert(
-            id.as_str().to_owned(),
-            workspace
-                .iter()
-                .map(|(path, input)| (path.clone(), input.sources.clone()))
-                .collect(),
-        );
+        self.mounts
+            .lock()
+            .expect("mounts")
+            .insert(id.as_str().to_owned(), workspace.clone());
     }
 }
 
@@ -160,11 +189,12 @@ impl ActionExecutor for Script {
     /// its signal.
     async fn execute(&self, call: BlockCall<'_, Action>) -> Result<ActionOutput, BlockError> {
         let id = call.id.as_str().to_owned();
-        self.record(format!("action:{id}"));
+        let label = label(&call);
+        self.record(format!("action:{label}"));
         self.mount(call.id, &call.workspace);
         let attempt = {
             let mut attempts = self.attempts.lock().expect("attempts");
-            let count = attempts.entry(id.clone()).or_default();
+            let count = attempts.entry(label.clone()).or_default();
             *count += 1;
             *count - 1
         };
@@ -188,22 +218,51 @@ impl ActionExecutor for Script {
                 std::future::pending().await
             }
             Some(Behavior::Panic(message)) => panic!("{message}"),
+            Some(Behavior::Echo { delays, fail, busy }) => {
+                let item = call.item_index.unwrap_or(0);
+                if attempt == 0 && busy.contains(&item) {
+                    return Err(BlockError::Busy {
+                        reason: format!("item {item} found no worker"),
+                    });
+                }
+                let delay = delays.get(item as usize).copied().unwrap_or(0);
+                tokio::time::sleep(Duration::from_secs(delay)).await;
+                self.record(format!("done:{label}"));
+                if fail.contains(&item) {
+                    return Err(BlockError::Terminal {
+                        reason: format!("item {item} failed"),
+                    });
+                }
+                let inputs = call
+                    .inputs
+                    .iter()
+                    .map(|(name, input)| (name.clone(), json(input)))
+                    .collect();
+                Ok(output(&Value::Object(inputs)))
+            }
         }
     }
 }
 
 #[async_trait]
 impl CheckExecutor for Script {
-    /// Return the requirement's scripted result.
+    /// Return the requirement's scripted result, after its signal when it
+    /// is held.
     ///
     /// # Errors
     /// Returns the scripted error, or a terminal error when unscripted.
     ///
     /// # Panics
     /// Panics when another call panicked while holding the log lock.
+    ///
+    /// # Cancellation
+    /// A held call waits for its signal; dropping it is safe.
     async fn execute(&self, call: BlockCall<'_, Check>) -> Result<CheckOutput, BlockError> {
-        self.record(format!("check:{}", call.id.as_str()));
+        self.record(format!("check:{}", label(&call)));
         self.mount(call.id, &call.workspace);
+        if let Some(signal) = self.held.get(call.id.as_str()) {
+            signal.notified().await;
+        }
         self.checks
             .get(call.id.as_str())
             .cloned()
@@ -1694,6 +1753,74 @@ async fn capacity_refusal_stops_the_execution_without_judging() {
     assert_eq!(step(&retried, "draft").attempts, 2);
 }
 
+/// A capacity refusal defers the execution without throwing away work
+/// already dispatched: a fanout sibling and an unrelated step that were
+/// running settle and are recorded before the refusal returns, the refused
+/// attempt is forgotten, and the reclaimed execution runs only the refused
+/// item, without spending the step's single attempt on the siblings.
+///
+/// # Panics
+/// Panics when the refusal drops running work, a settled block runs again,
+/// or the reclaimed step fails.
+#[tokio::test(start_paused = true)]
+async fn capacity_refusal_lets_dispatched_work_settle() {
+    let spec = verifier(json!({
+        "inputs": {"answer": {"type": "json"}},
+        "steps": [
+            {"id": "map", "foreach": {"count": 2}, "action": code_action(json!({}))},
+            {"id": "other", "action": code_action(json!({"x": "inputs.answer"}))}
+        ]
+    }));
+    let script = |busy: Vec<u32>| {
+        Arc::new(Script {
+            actions: HashMap::from([
+                (
+                    "map",
+                    Behavior::Echo {
+                        delays: vec![5],
+                        fail: Vec::new(),
+                        busy,
+                    },
+                ),
+                ("other", echo(&[5])),
+            ]),
+            ..Script::default()
+        })
+    };
+    let refused = script(vec![1]);
+    let ledger = Arc::new(Ledger::default());
+    let outcome = run(
+        &engine(&refused, InMemoryTraceSource::new(), 8).with_checkpoints(
+            Arc::clone(&ledger) as Arc<dyn Checkpoints>,
+            &ExecutionState::default(),
+        ),
+        &spec,
+        json!({"answer": 1}),
+    )
+    .await;
+    assert!(matches!(outcome, Err(EngineError::Busy(_))), "{outcome:?}");
+    assert_eq!(
+        ledger.attempts(),
+        [("map".to_owned(), 1, true), ("other".to_owned(), 1, true)],
+        "running work settles and the refused attempt is forgotten"
+    );
+
+    let reclaimed = script(Vec::new());
+    let outcome = run(
+        &engine(&reclaimed, InMemoryTraceSource::new(), 8).with_checkpoints(
+            Arc::new(Ledger::default()) as Arc<dyn Checkpoints>,
+            &ledger.recorded(),
+        ),
+        &spec,
+        json!({"answer": 1}),
+    )
+    .await
+    .expect("the reclaimed execution runs");
+    assert_eq!(reclaimed.calls(), ["action:map[1]", "done:map[1]"]);
+    assert_eq!(step(&outcome, "map").status, StepStatus::Succeeded);
+    assert_eq!(step(&outcome, "other").status, StepStatus::Succeeded);
+}
+
 /// Every action attempt and check is timed into the block histogram under
 /// its block and kind: a judged assertion and a succeeded action record
 /// `ok`, and a check whose executor failed records `error`.
@@ -2089,7 +2216,19 @@ async fn fixed_attachments_mount_selected_files_as_pinned_slots() {
         .await
         .expect("outcome");
     let slot = |name: &str| BTreeSet::from([SlotName::new(name).expect("slot")]);
-    let mounts = script.mounts.lock().expect("mounts").clone();
+    let mounts: HashMap<String, BTreeMap<String, BTreeSet<SlotName>>> = script
+        .mounts
+        .lock()
+        .expect("mounts")
+        .iter()
+        .map(|(id, workspace)| {
+            let sources = workspace
+                .iter()
+                .map(|(path, input)| (path.clone(), input.sources.clone()))
+                .collect();
+            (id.clone(), sources)
+        })
+        .collect();
     assert_eq!(
         mounts["read"],
         BTreeMap::from([
@@ -2134,4 +2273,1744 @@ async fn fixed_attachments_mount_selected_files_as_pinned_slots() {
         run(&hosted, &missing, json!({})).await,
         Err(EngineError::InputInvalid(_))
     ));
+}
+
+/// Publication references resolve to typed host mounts: a named member to
+/// the successful attempt and its sources, a collection to every settled
+/// producer's honest status and attempts once its requirements are judged, and a named member of a step with
+/// no successful attempt to a gap that skips its consumer before it runs.
+///
+/// # Panics
+/// Panics when a resolved mount, attempt record, or gap differs.
+#[tokio::test(start_paused = true)]
+async fn publication_references_resolve_to_attempts_and_statuses() {
+    let spec = verifier(json!({
+        "inputs": {"answer": {"type": "json"}},
+        "steps": [
+            {"id": "review", "retries": 1, "action": reader_agent(json!({"/inputs/a.json": "inputs.answer"})),
+             "requirements": [{"id": "review-ok", "statement": "s", "check": code_check(json!({"r": "steps.review.output"}))}]},
+            {"id": "broken", "action": reader_agent(json!({"/inputs/a.json": "inputs.answer"}))},
+            {"id": "gated", "when": {"path": "inputs.answer.go", "operator": "equals", "expected": true},
+             "action": reader_agent(json!({"/inputs/a.json": "inputs.answer"}))},
+            {"id": "consume", "action": reader_agent(json!({
+                "/inputs/report": "steps.review.publications.report",
+                "/inputs/reviews": "steps.review.publications",
+                "/inputs/broken": "steps.broken.publications",
+                "/inputs/gated": "steps.gated.publications",
+            }))},
+            {"id": "blocked", "action": reader_agent(json!({"/inputs/report": "steps.broken.publications.report"}))},
+            {"id": "none", "foreach": {"items": "inputs.answer.none", "max_items": 3},
+             "action": reader_agent(json!({"/inputs/a.json": "inputs.answer"}))},
+            {"id": "after-none", "action": reader_agent(json!({"/inputs/none": "steps.none.publications"}))},
+        ],
+        "requirements": [{"id": "ran", "statement": "s", "check": {"kind": "assert", "path": "inputs.answer", "operator": "is_not_null"}}],
+    }));
+    let flaky = BlockError::Retryable {
+        reason: "flaky".to_owned(),
+    };
+    let broken = BlockError::Terminal {
+        reason: "broken".to_owned(),
+    };
+    let script = Arc::new(Script {
+        actions: HashMap::from([
+            ("review", Behavior::Attempts(vec![flaky], json!({}))),
+            ("broken", Behavior::Attempts(vec![broken], json!({}))),
+        ]),
+        checks: HashMap::from([(
+            "review-ok",
+            Ok(verdict(
+                VerificationVerdict::Passed,
+                json!([{"slot": "answer", "locator": {"json_pointer": "/go"}}]),
+            )),
+        )]),
+        ..Script::default()
+    });
+    let outcome = run(
+        &engine(&script, InMemoryTraceSource::new(), 4),
+        &spec,
+        json!({"answer": {"go": false, "none": []}}),
+    )
+    .await
+    .expect("outcome");
+    let consumed = script.mounts.lock().expect("mounts")["consume"].clone();
+    let after_none = script.mounts.lock().expect("mounts")["after-none"].clone();
+    let calls = script.calls();
+    assert!(
+        at(&calls, "check:review-ok") < at(&calls, "action:consume"),
+        "a collection consumer waits for its producer's requirements: {calls:?}"
+    );
+    assert!(
+        matches!(
+            &after_none["/inputs/none"].value,
+            CallValue::Publications { collection, .. }
+                if collection.status == StepStatus::Succeeded
+                    && collection.invocations.is_empty()
+                    && collection.entries.is_empty()
+        ),
+        "an empty fanout mounts an empty successful collection: {after_none:?}"
+    );
+    let collection = |status, reason: Option<&str>, invocations: Vec<ProducerInvocation>| {
+        CallValue::Publications {
+            step: TaskId::new("x").expect("task"),
+            collection: PublicationCollection {
+                status,
+                reason: reason.map(str::to_owned),
+                speculation: Speculation::None,
+                invocations,
+                entries: Vec::new(),
+            },
+        }
+    };
+    let invocation = |attempt, status, reason: Option<&str>| ProducerInvocation {
+        item_index: None,
+        iteration_index: None,
+        attempt,
+        status,
+        reason: reason.map(str::to_owned),
+    };
+    let answer = BTreeSet::from([SlotName::new("answer").expect("slot")]);
+    let observed: BTreeMap<&str, (CallValue, BTreeSet<SlotName>)> = consumed
+        .iter()
+        .map(|(path, input)| {
+            let value = match &input.value {
+                CallValue::Publications { collection, .. } => CallValue::Publications {
+                    step: TaskId::new("x").expect("task"),
+                    collection: collection.clone(),
+                },
+                value => value.clone(),
+            };
+            (path.as_str(), (value, input.sources.clone()))
+        })
+        .collect();
+    assert_eq!(
+        observed,
+        BTreeMap::from([
+            (
+                "/inputs/report",
+                (
+                    CallValue::Publication {
+                        producer: Producer {
+                            step_id: TaskId::new("review").expect("task"),
+                            item_index: None,
+                            iteration_index: None,
+                            attempt: 2,
+                        },
+                        name: PublicationName::new("report").expect("name"),
+                    },
+                    answer.clone(),
+                ),
+            ),
+            (
+                "/inputs/reviews",
+                (
+                    collection(
+                        StepStatus::Succeeded,
+                        None,
+                        vec![
+                            invocation(1, StepStatus::Failed, Some(crate::blocks::scope::RETRIED)),
+                            invocation(2, StepStatus::Succeeded, None),
+                        ],
+                    ),
+                    answer,
+                ),
+            ),
+            (
+                "/inputs/broken",
+                (
+                    collection(
+                        StepStatus::Failed,
+                        Some("broken"),
+                        vec![invocation(1, StepStatus::Failed, Some("broken"))],
+                    ),
+                    BTreeSet::new(),
+                ),
+            ),
+            (
+                "/inputs/gated",
+                (
+                    collection(
+                        StepStatus::Skipped,
+                        Some("when `inputs.answer.go` was false"),
+                        Vec::new(),
+                    ),
+                    BTreeSet::new(),
+                ),
+            ),
+        ])
+    );
+    let blocked = step(&outcome, "blocked");
+    assert_eq!(blocked.status, StepStatus::Skipped);
+    assert!(
+        blocked
+            .reason
+            .as_deref()
+            .is_some_and(|reason| reason.contains("no successful attempt to publish")),
+        "{blocked:?}"
+    );
+    assert!(!script.calls().contains(&"action:blocked".to_owned()));
+}
+
+/// An in-memory invocation record keyed by task and attempt.
+#[derive(Default)]
+struct Ledger {
+    /// Every recorded attempt and its settlement, once it has one.
+    attempts: Mutex<BTreeMap<Producer, Option<InvocationSettlement>>>,
+    /// Every recorded scheduling decision, in order.
+    controls: Mutex<Vec<ControlRecord>>,
+}
+
+impl Ledger {
+    /// The execution state a reclaimed execution reads back.
+    ///
+    /// # Panics
+    /// Panics when a recording call panicked while holding a lock.
+    fn recorded(&self) -> ExecutionState {
+        ExecutionState {
+            invocations: (1_i64..)
+                .zip(self.attempts.lock().expect("ledger").iter())
+                .map(|(sequence, (producer, settled))| InvocationRecord {
+                    sequence,
+                    producer: producer.clone(),
+                    settlement: settled.clone(),
+                })
+                .collect(),
+            controls: self.controls.lock().expect("ledger").clone(),
+            ..ExecutionState::default()
+        }
+    }
+
+    /// Each recorded attempt and whether it settled.
+    ///
+    /// # Panics
+    /// Panics when a recording call panicked while holding the lock.
+    fn attempts(&self) -> Vec<(String, u32, bool)> {
+        self.attempts
+            .lock()
+            .expect("ledger")
+            .iter()
+            .map(|(producer, settled)| {
+                (
+                    producer.step_id.as_str().to_owned(),
+                    producer.attempt,
+                    settled.is_some(),
+                )
+            })
+            .collect()
+    }
+}
+
+#[async_trait]
+impl Checkpoints for Ledger {
+    /// Record the attempt unsettled.
+    ///
+    /// # Errors
+    /// Never returns an error.
+    ///
+    /// # Panics
+    /// Panics when another call panicked while holding the lock.
+    async fn begin(&self, producer: &Producer) -> Result<(), String> {
+        self.attempts
+            .lock()
+            .expect("ledger")
+            .insert(producer.clone(), None);
+        Ok(())
+    }
+
+    /// Remove the attempt.
+    ///
+    /// # Errors
+    /// Never returns an error.
+    ///
+    /// # Panics
+    /// Panics when another call panicked while holding the lock.
+    async fn forget(&self, producer: &Producer) -> Result<(), String> {
+        self.attempts.lock().expect("ledger").remove(producer);
+        Ok(())
+    }
+
+    /// Record the attempt's settlement.
+    ///
+    /// # Errors
+    /// Never returns an error.
+    ///
+    /// # Panics
+    /// Panics when another call panicked while holding the lock.
+    async fn settle(
+        &self,
+        producer: &Producer,
+        settled: &InvocationSettlement,
+    ) -> Result<(), String> {
+        self.attempts
+            .lock()
+            .expect("ledger")
+            .insert(producer.clone(), Some(settled.clone()));
+        Ok(())
+    }
+
+    /// Record the decision.
+    ///
+    /// # Errors
+    /// Never returns an error.
+    ///
+    /// # Panics
+    /// Panics when another call panicked while holding the lock.
+    async fn control(&self, control: &ControlRecord) -> Result<(), String> {
+        self.controls.lock().expect("ledger").push(control.clone());
+        Ok(())
+    }
+}
+
+/// A reclaimed execution restores a settled action and its requirement
+/// without calling them again, retries an interrupted attempt within the
+/// step's remaining retries, and fails a step whose interrupted attempts
+/// spent them without dispatching it.
+///
+/// # Panics
+/// Panics when a block runs again, an attempt is replenished, or a restored
+/// result differs.
+#[tokio::test(start_paused = true)]
+async fn checkpoints_restore_settled_blocks_and_count_interrupted_attempts() {
+    let spec = verifier(json!({
+        "inputs": {"answer": {"type": "json"}},
+        "steps": [
+            {"id": "review", "action": code_action(json!({"x": "inputs.answer"})),
+             "requirements": [{"id": "agrees", "statement": "the review agrees",
+                 "check": code_check(json!({"review": "steps.review.output"}))}]},
+            {"id": "late", "retries": 1, "depends_on": ["review"],
+             "action": code_action(json!({"x": "inputs.answer"}))},
+            {"id": "stuck", "depends_on": ["review"],
+             "action": code_action(json!({"x": "inputs.answer"}))}
+        ]
+    }));
+    let passes = || Ok(verdict(VerificationVerdict::Passed, json!([])));
+    let hung = Arc::new(Notify::new());
+    let crashed = Arc::new(Script {
+        actions: HashMap::from([
+            ("review", Behavior::Attempts(Vec::new(), json!("reviewed"))),
+            ("late", Behavior::Hang(Arc::clone(&hung))),
+            ("stuck", Behavior::Hang(Arc::clone(&hung))),
+        ]),
+        checks: HashMap::from([("agrees", passes())]),
+        ..Script::default()
+    });
+    let ledger = Arc::new(Ledger::default());
+    let first = engine(&crashed, InMemoryTraceSource::new(), 4).with_checkpoints(
+        Arc::clone(&ledger) as Arc<dyn Checkpoints>,
+        &ExecutionState::default(),
+    );
+    assert!(matches!(
+        run(&first, &spec, json!({"answer": 1})).await,
+        Err(EngineError::DeadlineExceeded)
+    ));
+    let settled = |task: &str, attempt| (task.to_owned(), attempt, true);
+    let open = |task: &str, attempt| (task.to_owned(), attempt, false);
+    assert_eq!(
+        ledger.attempts(),
+        vec![
+            settled("agrees", 1),
+            open("late", 1),
+            settled("review", 1),
+            open("stuck", 1)
+        ]
+    );
+
+    let recovered = Arc::new(Script {
+        actions: HashMap::from([("late", Behavior::Attempts(Vec::new(), json!("late")))]),
+        ..Script::default()
+    });
+    let second = engine(&recovered, InMemoryTraceSource::new(), 4).with_checkpoints(
+        Arc::clone(&ledger) as Arc<dyn Checkpoints>,
+        &ledger.recorded(),
+    );
+    let outcome = run(&second, &spec, json!({"answer": 1}))
+        .await
+        .expect("outcome");
+    assert_eq!(recovered.calls(), vec!["action:late"]);
+    assert_eq!(step(&outcome, "review").output, Some(json!("reviewed")));
+    assert_eq!(step(&outcome, "review").attempts, 1);
+    assert_eq!(
+        requirement(&outcome, "agrees").step,
+        Some(step(&outcome, "review").id.clone())
+    );
+    assert_eq!(
+        (
+            step(&outcome, "late").status,
+            step(&outcome, "late").attempts
+        ),
+        (StepStatus::Succeeded, 2)
+    );
+    let stuck = step(&outcome, "stuck");
+    assert_eq!(
+        (stuck.status, stuck.attempts, stuck.reason.as_deref()),
+        (StepStatus::Failed, 1, Some(ATTEMPTS_INTERRUPTED))
+    );
+    assert_eq!(
+        ledger.attempts(),
+        vec![
+            settled("agrees", 1),
+            open("late", 1),
+            settled("late", 2),
+            settled("review", 1),
+            settled("stuck", 1)
+        ]
+    );
+}
+
+/// An unavailable exact definition stops the whole execution: the action is
+/// not retried or settled, and the check is never judged inconclusive.
+///
+/// # Panics
+/// Panics when an unavailable block is retried, judged, or settled.
+#[tokio::test(start_paused = true)]
+async fn unavailable_definition_stops_the_execution_without_judging() {
+    let gone = || BlockError::Unavailable {
+        reason: "agent/reviewer@1 is unavailable".to_owned(),
+    };
+    let stepped = verifier(json!({
+        "inputs": {"answer": {"type": "json"}},
+        "steps": [{"id": "draft", "action": code_action(json!({"x": "inputs.answer"})), "retries": 2}]
+    }));
+    let script = Arc::new(Script {
+        actions: HashMap::from([("draft", Behavior::Attempts(vec![gone(), gone()], json!({})))]),
+        ..Script::default()
+    });
+    let refused = run(
+        &engine(&script, InMemoryTraceSource::new(), 1),
+        &stepped,
+        json!({"answer": "a"}),
+    )
+    .await;
+    assert!(
+        matches!(refused, Err(EngineError::DefinitionUnavailable(ref reason)) if reason.contains("agent/reviewer@1")),
+        "{refused:?}"
+    );
+    assert_eq!(script.calls(), ["action:draft"], "it is not retried");
+
+    let checked = verifier(json!({
+        "inputs": {"answer": {"type": "json"}},
+        "requirements": [{"id": "judged", "statement": "Judged", "check": code_check(json!({"x": "inputs.answer"}))}]
+    }));
+    let script = Arc::new(Script {
+        checks: HashMap::from([("judged", Err(gone()))]),
+        ..Script::default()
+    });
+    let refused = run(
+        &engine(&script, InMemoryTraceSource::new(), 1),
+        &checked,
+        json!({"answer": "a"}),
+    )
+    .await;
+    assert!(
+        matches!(refused, Err(EngineError::DefinitionUnavailable(_))),
+        "it is not judged: {refused:?}"
+    );
+}
+
+/// The position of the first `entry` in `calls`.
+///
+/// # Panics
+/// Panics when `calls` holds no `entry`.
+fn at(calls: &[String], entry: &str) -> usize {
+    calls
+        .iter()
+        .position(|call| call == entry)
+        .unwrap_or_else(|| panic!("{entry} is not in {calls:?}"))
+}
+
+/// An echoing step behavior: each item waits its delay in seconds.
+fn echo(delays: &[u64]) -> Behavior {
+    Behavior::Echo {
+        delays: delays.to_vec(),
+        fail: Vec::new(),
+        busy: Vec::new(),
+    }
+}
+
+/// A step is released as soon as its own prerequisites complete, while an
+/// unrelated step still runs. An `any_succeeded` step starts after its
+/// first successful candidate; when every candidate failed or was skipped
+/// it starts nothing and keeps the strongest cause; and it never waives an
+/// ordinary binding.
+///
+/// # Panics
+/// Panics when a successor waits for an unrelated step, or a step without a
+/// successful candidate or with a missing binding runs.
+#[tokio::test(start_paused = true)]
+async fn ready_successors_do_not_wait_for_unrelated_steps() {
+    let spec = verifier(json!({
+        "inputs": {"answer": {"type": "json"}},
+        "steps": [
+            {"id": "a", "action": code_action(json!({"x": "inputs.answer"}))},
+            {"id": "slow", "action": code_action(json!({"x": "inputs.answer"}))},
+            {"id": "fails", "action": code_action(json!({"x": "inputs.answer"}))},
+            {"id": "skipped", "when": {"path": "inputs.answer", "operator": "equals", "expected": 2},
+             "action": code_action(json!({"x": "inputs.answer"}))},
+            {"id": "after_a", "depends_on": ["a"], "action": code_action(json!({"x": "steps.a.output"}))},
+            {"id": "any", "depends_on": {"any_succeeded": ["fails", "a", "slow"]},
+             "action": code_action(json!({"x": "inputs.answer"}))},
+            {"id": "none", "depends_on": {"any_succeeded": ["fails", "skipped"]},
+             "action": code_action(json!({"x": "inputs.answer"}))},
+            {"id": "strict", "depends_on": {"any_succeeded": ["a"]},
+             "action": code_action(json!({"x": "steps.fails.output"}))}
+        ]
+    }));
+    let script = Arc::new(Script {
+        actions: HashMap::from([
+            ("a", echo(&[1])),
+            ("slow", echo(&[30])),
+            (
+                "fails",
+                Behavior::Attempts(
+                    vec![BlockError::Terminal {
+                        reason: "broken".to_owned(),
+                    }],
+                    json!(null),
+                ),
+            ),
+            ("after_a", echo(&[0])),
+            ("any", echo(&[0])),
+        ]),
+        ..Script::default()
+    });
+    let outcome = run(
+        &engine(&script, InMemoryTraceSource::new(), 8),
+        &spec,
+        json!({"answer": 1}),
+    )
+    .await
+    .expect("outcome");
+    let calls = script.calls();
+    assert!(
+        at(&calls, "action:after_a") < at(&calls, "done:slow"),
+        "{calls:?}"
+    );
+    assert!(
+        at(&calls, "action:any") < at(&calls, "done:slow"),
+        "{calls:?}"
+    );
+    assert!(
+        at(&calls, "done:a") < at(&calls, "action:any"),
+        "the failed candidate does not release `any`: {calls:?}"
+    );
+    assert!(
+        at(&calls, "done:a") < at(&calls, "action:after_a"),
+        "{calls:?}"
+    );
+    assert_eq!(
+        step(&outcome, "after_a").output,
+        Some(json!({"x": {"x": 1}}))
+    );
+    for unrun in ["none", "strict"] {
+        assert!(
+            !calls.contains(&format!("action:{unrun}")),
+            "{unrun}: {calls:?}"
+        );
+        assert_eq!(step(&outcome, unrun).status, StepStatus::Skipped, "{unrun}");
+    }
+    assert_eq!(step(&outcome, "none").reason.as_deref(), Some("broken"));
+}
+
+/// An `items` fanout freezes its whole array before dispatch, keeps
+/// duplicates at distinct indices, judges each item's requirements, and
+/// returns the outputs in item order whatever order they finish in. An
+/// empty array succeeds with `[]` and no call; a non-array or an array over
+/// `max_items` fails without a call; a failed item fails the step without a
+/// partial aggregate. A `count` fanout retries an item as more attempts of
+/// that item, not as more items. Recovery expands the recorded items, not a
+/// re-resolved array.
+///
+/// # Panics
+/// Panics when an expansion, order, call, status, or record differs.
+#[tokio::test(start_paused = true)]
+async fn array_fanout_freezes_and_orders_items() {
+    let fanout = |items: &str, max: u32| json!({"items": items, "max_items": max});
+    let spec = verifier(json!({
+        "inputs": {"doc": {"type": "json"}, "answer": {"type": "json"}},
+        "steps": [
+            {"id": "map", "foreach": fanout("inputs.doc.sections", 5),
+             "action": code_action(json!({"s": "item", "i": "item_index"})),
+             "requirements": [{"id": "per", "statement": "each item ran",
+                 "check": {"kind": "assert", "path": "steps.map.output.i", "operator": "greater_than_or_equals", "expected": 0}}]},
+            {"id": "empty", "foreach": fanout("inputs.doc.none", 5),
+             "action": code_action(json!({"s": "item"}))},
+            {"id": "wide", "foreach": fanout("inputs.doc.sections", 2),
+             "action": code_action(json!({"s": "item"}))},
+            {"id": "scalar", "foreach": fanout("inputs.answer", 5),
+             "action": code_action(json!({"s": "item"}))},
+            {"id": "partial", "foreach": fanout("inputs.doc.sections", 5),
+             "action": code_action(json!({"s": "item"}))},
+            {"id": "sweep", "retries": 1, "foreach": {"count": 2}, "action": code_action(json!({}))},
+            {"id": "counted", "foreach": {"count": 2}, "action": code_action(json!({}))}
+        ],
+        "requirements": [{"id": "empty-covers", "statement": "the empty fanout covered something",
+            "check": {"kind": "assert", "each": "steps.empty.output[*]", "operator": "is_not_null"}}]
+    }));
+    let script = || {
+        Arc::new(Script {
+            actions: HashMap::from([
+                ("map", echo(&[3, 2, 1])),
+                ("counted", echo(&[])),
+                (
+                    "partial",
+                    Behavior::Echo {
+                        delays: Vec::new(),
+                        fail: vec![1],
+                        busy: Vec::new(),
+                    },
+                ),
+                (
+                    "sweep",
+                    Behavior::Attempts(
+                        vec![BlockError::Retryable {
+                            reason: "flaky".to_owned(),
+                        }],
+                        json!("ok"),
+                    ),
+                ),
+            ]),
+            ..Script::default()
+        })
+    };
+    let first = script();
+    let ledger = Arc::new(Ledger::default());
+    let outcome = run(
+        &engine(&first, InMemoryTraceSource::new(), 8).with_checkpoints(
+            Arc::clone(&ledger) as Arc<dyn Checkpoints>,
+            &ExecutionState::default(),
+        ),
+        &spec,
+        json!({"doc": {"sections": ["b", "a", "a"], "none": []}, "answer": 3}),
+    )
+    .await
+    .expect("outcome");
+    let calls = first.calls();
+    assert_eq!(
+        step(&outcome, "map").output,
+        Some(json!([{"s": "b", "i": 0}, {"s": "a", "i": 1}, {"s": "a", "i": 2}]))
+    );
+    assert!(
+        at(&calls, "done:map[2]") < at(&calls, "done:map[0]"),
+        "{calls:?}"
+    );
+    assert_eq!(
+        outcome
+            .requirements
+            .iter()
+            .filter(|result| result.id.as_str() == "per")
+            .map(|result| (result.item_index, result.outcome))
+            .collect::<Vec<_>>(),
+        (0..3)
+            .map(|item| (Some(item), RequirementOutcome::Passed))
+            .collect::<Vec<_>>()
+    );
+    let empty = step(&outcome, "empty");
+    assert_eq!(
+        (empty.status, empty.output.clone()),
+        (StepStatus::Succeeded, Some(json!([])))
+    );
+    assert_eq!(
+        outcome
+            .requirements
+            .iter()
+            .find(|result| result.id.as_str() == "empty-covers")
+            .map(|result| result.outcome),
+        Some(RequirementOutcome::Inconclusive),
+        "an empty fanout alone passes no requirement"
+    );
+    assert_eq!(
+        step(&outcome, "counted").output,
+        Some(json!([{}, {}])),
+        "count items receive no injected inputs"
+    );
+    assert!(
+        ["action:counted[0]", "action:counted[1]"]
+            .iter()
+            .all(|call| calls.iter().filter(|seen| seen == call).count() == 1),
+        "{calls:?}"
+    );
+    for (refused, reason) in [
+        ("wide", "more than max_items 2"),
+        ("scalar", "is not an array"),
+    ] {
+        let refused_step = step(&outcome, refused);
+        assert_eq!(refused_step.status, StepStatus::Failed, "{refused}");
+        assert!(
+            refused_step
+                .reason
+                .as_deref()
+                .is_some_and(|text| text.contains(reason)),
+            "{refused_step:?}"
+        );
+    }
+    for unrun in ["empty", "wide", "scalar"] {
+        assert!(
+            !calls
+                .iter()
+                .any(|call| call.starts_with(&format!("action:{unrun}"))),
+            "{unrun}: {calls:?}"
+        );
+    }
+    let partial = step(&outcome, "partial");
+    assert_eq!(
+        (partial.status, partial.output.clone()),
+        (StepStatus::Failed, None)
+    );
+    assert!(
+        partial
+            .reason
+            .as_deref()
+            .is_some_and(|text| text.starts_with("item 1:")),
+        "{partial:?}"
+    );
+    let items: BTreeMap<_, _> = ledger
+        .recorded()
+        .invocations
+        .iter()
+        .filter(|record| record.producer.step_id.as_str() == "partial")
+        .filter_map(|record| match record.settlement.as_ref()? {
+            InvocationSettlement::Action { result, .. } => {
+                Some((record.producer.item_index, result.status))
+            }
+            InvocationSettlement::Requirement { .. } => None,
+        })
+        .collect();
+    assert_eq!(
+        items,
+        BTreeMap::from([
+            (Some(0), StepStatus::Succeeded),
+            (Some(1), StepStatus::Failed),
+            (Some(2), StepStatus::Succeeded),
+        ]),
+        "every item keeps its own status"
+    );
+    let sweep = step(&outcome, "sweep");
+    assert_eq!(
+        (sweep.status, sweep.output.clone(), sweep.attempts),
+        (StepStatus::Succeeded, Some(json!(["ok", "ok"])), 4)
+    );
+    for item in ["action:sweep[0]", "action:sweep[1]"] {
+        assert_eq!(
+            calls.iter().filter(|call| *call == item).count(),
+            2,
+            "{calls:?}"
+        );
+    }
+    assert!(!calls.iter().any(|call| call.starts_with("action:sweep[2]")));
+    let frozen = ControlRecord::Items {
+        step: TaskId::new("map").expect("task"),
+        items: vec![json!("b"), json!("a"), json!("a")],
+    };
+    let recorded = ledger.recorded();
+    assert!(
+        recorded.controls.contains(&frozen),
+        "{:?}",
+        recorded.controls
+    );
+
+    let recovered = script();
+    let controls_only = ExecutionState {
+        controls: recorded.controls,
+        ..ExecutionState::default()
+    };
+    let outcome = run(
+        &engine(&recovered, InMemoryTraceSource::new(), 8).with_checkpoints(
+            Arc::new(Ledger::default()) as Arc<dyn Checkpoints>,
+            &controls_only,
+        ),
+        &spec,
+        json!({"doc": {"sections": ["z"], "none": []}, "answer": 3}),
+    )
+    .await
+    .expect("recovered outcome");
+    assert_eq!(
+        step(&outcome, "map").output,
+        Some(json!([{"s": "b", "i": 0}, {"s": "a", "i": 1}, {"s": "a", "i": 2}]))
+    );
+
+    let refused = script();
+    let oversized = ExecutionState {
+        controls: vec![ControlRecord::Items {
+            step: TaskId::new("map").expect("task"),
+            items: (0..6).map(|item| json!(item)).collect(),
+        }],
+        ..ExecutionState::default()
+    };
+    let outcome = run(
+        &engine(&refused, InMemoryTraceSource::new(), 8).with_checkpoints(
+            Arc::new(Ledger::default()) as Arc<dyn Checkpoints>,
+            &oversized,
+        ),
+        &spec,
+        json!({"doc": {"sections": ["z"], "none": []}, "answer": 3}),
+    )
+    .await
+    .expect("refused outcome");
+    assert_eq!(step(&outcome, "map").status, StepStatus::Failed);
+    assert!(
+        !refused
+            .calls()
+            .iter()
+            .any(|call| call.starts_with("action:map")),
+        "recorded items beyond the bound dispatch nothing: {:?}",
+        refused.calls()
+    );
+}
+
+/// A repeat runs one iteration at a time, exposing the zero-based index
+/// and the previous output (`null` first), judges each iteration's
+/// requirements before `until`, and stops when `until` holds; consumers read
+/// the final output. Exhausting `max_iterations` or an unevaluable `until`
+/// fails the step. Composed with fanout, each item repeats independently and
+/// the outputs keep item order.
+///
+/// # Panics
+/// Panics when an iteration, order, output, or status differs.
+#[tokio::test(start_paused = true)]
+async fn repeat_refines_one_iteration_at_a_time() {
+    let until = |path: &str, expected: Value| json!({"path": path, "operator": "greater_than_or_equals", "expected": expected});
+    let spec = verifier(json!({
+        "inputs": {"answer": {"type": "json"}},
+        "steps": [
+            {"id": "refine", "repeat": {"max_iterations": 4, "until": until("iteration.output.n", json!(2))},
+             "action": code_action(json!({"n": "iteration.index", "prev": "iteration.previous"})),
+             "requirements": [{"id": "seen", "statement": "each iteration ran",
+                 "check": {"kind": "assert", "path": "steps.refine.output.n", "operator": "greater_than_or_equals", "expected": 0}},
+                 {"id": "judged", "statement": "each iteration was judged",
+                 "check": code_check(json!({"n": "steps.refine.output.n"}))}]},
+            {"id": "exhaust", "repeat": {"max_iterations": 2, "until": until("iteration.output.n", json!(5))},
+             "action": code_action(json!({"n": "iteration.index"}))},
+            {"id": "broken", "repeat": {"max_iterations": 3, "until": {"path": "iteration.output.n", "operator": "greater_than_or_equals", "expected": "high"}},
+             "action": code_action(json!({"n": "iteration.index"}))},
+            {"id": "grid", "foreach": {"count": 2},
+             "repeat": {"max_iterations": 3, "until": until("iteration.output.n", json!(1))},
+             "action": code_action(json!({"n": "iteration.index", "i": "item_index"}))},
+            {"id": "reader", "action": code_action(json!({"x": "steps.refine.output.n"}))}
+        ]
+    }));
+    let script = Arc::new(Script {
+        actions: HashMap::from([
+            ("refine", echo(&[1])),
+            ("exhaust", echo(&[])),
+            ("broken", echo(&[])),
+            ("grid", echo(&[1, 2])),
+            ("reader", echo(&[])),
+        ]),
+        checks: HashMap::from([(
+            "judged",
+            Ok(verdict(VerificationVerdict::Passed, json!([]))),
+        )]),
+        ..Script::default()
+    });
+    let outcome = run(
+        &engine(&script, InMemoryTraceSource::new(), 8),
+        &spec,
+        json!({"answer": 1}),
+    )
+    .await
+    .expect("outcome");
+    let calls = script.calls();
+    assert_eq!(
+        step(&outcome, "refine").output,
+        Some(json!({"n": 2, "prev": {"n": 1, "prev": {"n": 0, "prev": null}}}))
+    );
+    assert!(
+        at(&calls, "done:refine#0") < at(&calls, "action:refine#1"),
+        "{calls:?}"
+    );
+    assert!(
+        at(&calls, "done:refine#1") < at(&calls, "action:refine#2"),
+        "{calls:?}"
+    );
+    assert!(!calls.contains(&"action:refine#3".to_owned()), "{calls:?}");
+    for iteration in 0..2 {
+        assert!(
+            at(&calls, &format!("check:judged#{iteration}"))
+                < at(&calls, &format!("action:refine#{}", iteration + 1)),
+            "an iteration's requirements settle before the next starts: {calls:?}"
+        );
+    }
+    assert!(
+        calls.contains(&"check:judged#2".to_owned()),
+        "the stopping iteration's requirements settle before until stops it: {calls:?}"
+    );
+    assert_eq!(
+        outcome
+            .requirements
+            .iter()
+            .filter(|result| result.id.as_str() == "seen")
+            .map(|result| result.iteration_index)
+            .collect::<Vec<_>>(),
+        vec![Some(0), Some(1), Some(2)]
+    );
+    assert_eq!(step(&outcome, "reader").output, Some(json!({"x": 2})));
+    for (failed, reason) in [
+        ("exhaust", "max_iterations 2"),
+        ("broken", "cannot be evaluated"),
+    ] {
+        let failed_step = step(&outcome, failed);
+        assert_eq!(
+            (failed_step.status, failed_step.output.clone()),
+            (StepStatus::Failed, None)
+        );
+        assert!(
+            failed_step
+                .reason
+                .as_deref()
+                .is_some_and(|text| text.contains(reason)),
+            "{failed_step:?}"
+        );
+    }
+    assert!(!calls.contains(&"action:broken#1".to_owned()), "{calls:?}");
+    assert_eq!(
+        step(&outcome, "grid").output,
+        Some(json!([{"n": 1, "i": 0}, {"n": 1, "i": 1}]))
+    );
+    for item in 0..2 {
+        assert!(
+            at(&calls, &format!("done:grid[{item}]#0"))
+                < at(&calls, &format!("action:grid[{item}]#1")),
+            "{calls:?}"
+        );
+    }
+}
+
+/// A speculative step runs while its guard is pending; its consumers wait
+/// for the disposition. A true guard admits its output whether the action
+/// finishes before or after the guard, a known-false guard
+/// makes no call, a guard that turns false cancels running work and
+/// withholds it, and an unevaluable guard blocks it as a failure; ordinary
+/// consumers of discarded or blocked output or named publications are never
+/// called. Every
+/// disposition decided after the step started is recorded, and a recorded
+/// disposition wins over a re-evaluated guard; a crash before a decision
+/// commits reruns nothing and decides it again the same way.
+///
+/// # Panics
+/// Panics when a call, order, admission, or record differs.
+#[tokio::test(start_paused = true)]
+async fn speculative_steps_withhold_content_until_admitted() {
+    let guard = |path: &str, expected: Value| json!({"path": path, "operator": "equals", "expected": expected});
+    let spec = verifier(json!({
+        "inputs": {"answer": {"type": "json"}},
+        "steps": [
+            {"id": "compare", "action": code_action(json!({"x": "inputs.answer"}))},
+            {"id": "extra", "speculative": true, "when": guard("steps.compare.output.x", json!(1)),
+             "action": code_action(json!({"y": "inputs.answer"}))},
+            {"id": "consumer", "action": code_action(json!({"e": "steps.extra.output"}))},
+            {"id": "early", "speculative": true, "when": guard("inputs.answer", json!(99)),
+             "action": code_action(json!({"y": "inputs.answer"}))},
+            {"id": "dropped", "speculative": true, "when": guard("steps.compare.output.x", json!(2)),
+             "action": reader_agent(json!({"/inputs/a.json": "inputs.answer"}))},
+            {"id": "blocked", "speculative": true, "when": guard("steps.compare.output.missing", json!(1)),
+             "action": reader_agent(json!({"/inputs/a.json": "inputs.answer"}))},
+            {"id": "late", "speculative": true, "when": guard("steps.compare.output.x", json!(1)),
+             "action": code_action(json!({"y": "inputs.answer"}))},
+            {"id": "late-consumer", "action": code_action(json!({"e": "steps.late.output"}))},
+            {"id": "dropped-consumer", "action": code_action(json!({"e": "steps.dropped.output"}))},
+            {"id": "blocked-consumer", "action": code_action(json!({"e": "steps.blocked.output"}))},
+            {"id": "dropped-named", "action": reader_agent(json!({"/inputs/r": "steps.dropped.publications.report"}))},
+            {"id": "blocked-named", "action": reader_agent(json!({"/inputs/r": "steps.blocked.publications.report"}))}
+        ]
+    }));
+    let cancelled = Arc::new(Notify::new());
+    let script = || {
+        Arc::new(Script {
+            actions: HashMap::from([
+                ("compare", echo(&[5])),
+                ("extra", echo(&[1])),
+                ("consumer", echo(&[])),
+                ("dropped", Behavior::Hang(Arc::clone(&cancelled))),
+                ("blocked", echo(&[])),
+                ("late", echo(&[9])),
+                ("late-consumer", echo(&[])),
+                ("dropped-consumer", echo(&[])),
+                ("blocked-consumer", echo(&[])),
+            ]),
+            ..Script::default()
+        })
+    };
+    let first = script();
+    let ledger = Arc::new(Ledger::default());
+    let outcome = run(
+        &engine(&first, InMemoryTraceSource::new(), 8).with_checkpoints(
+            Arc::clone(&ledger) as Arc<dyn Checkpoints>,
+            &ExecutionState::default(),
+        ),
+        &spec,
+        json!({"answer": 1}),
+    )
+    .await
+    .expect("outcome");
+    let calls = first.calls();
+    assert!(
+        at(&calls, "done:extra") < at(&calls, "done:compare"),
+        "{calls:?}"
+    );
+    assert!(
+        at(&calls, "done:compare") < at(&calls, "action:consumer"),
+        "{calls:?}"
+    );
+    assert_eq!(
+        step(&outcome, "consumer").output,
+        Some(json!({"e": {"y": 1}}))
+    );
+    assert!(
+        at(&calls, "done:compare") < at(&calls, "done:late")
+            && at(&calls, "done:late") < at(&calls, "action:late-consumer"),
+        "an action finishing after its true guard is admitted on completion: {calls:?}"
+    );
+    assert_eq!(
+        step(&outcome, "late-consumer").output,
+        Some(json!({"e": {"y": 1}}))
+    );
+    for excluded in [
+        "dropped-consumer",
+        "blocked-consumer",
+        "dropped-named",
+        "blocked-named",
+    ] {
+        let consumer = step(&outcome, excluded);
+        assert!(
+            consumer.status != StepStatus::Succeeded && consumer.output.is_none(),
+            "{consumer:?}"
+        );
+        assert!(
+            !calls.contains(&format!("action:{excluded}")),
+            "an ordinary consumer never receives excluded output: {calls:?}"
+        );
+    }
+    assert!(!calls.contains(&"action:early".to_owned()), "{calls:?}");
+    assert!(calls.contains(&"action:dropped".to_owned()), "{calls:?}");
+    tokio::time::timeout(Duration::from_secs(1), cancelled.notified())
+        .await
+        .expect("the discarded work is cancelled");
+    for (id, status, attempts) in [
+        ("early", StepStatus::Skipped, 0),
+        ("dropped", StepStatus::Skipped, 1),
+        ("blocked", StepStatus::Failed, 1),
+    ] {
+        let withheld = step(&outcome, id);
+        assert_eq!(
+            (withheld.status, withheld.output.clone(), withheld.attempts),
+            (status, None, attempts),
+            "{id}"
+        );
+    }
+    let disposition = |id: &str| {
+        ledger
+            .recorded()
+            .controls
+            .iter()
+            .find_map(|control| match control {
+                ControlRecord::Disposition {
+                    step, speculation, ..
+                } if step.as_str() == id => Some(*speculation),
+                _ => None,
+            })
+    };
+    assert_eq!(disposition("extra"), Some(Speculation::Admitted));
+    assert_eq!(disposition("late"), Some(Speculation::Admitted));
+    assert_eq!(disposition("dropped"), Some(Speculation::Discarded));
+    assert_eq!(disposition("blocked"), Some(Speculation::Blocked));
+    assert_eq!(disposition("early"), None);
+
+    let recovered = script();
+    let controls_only = ExecutionState {
+        controls: ledger.recorded().controls,
+        ..ExecutionState::default()
+    };
+    let outcome = run(
+        &engine(&recovered, InMemoryTraceSource::new(), 8).with_checkpoints(
+            Arc::new(Ledger::default()) as Arc<dyn Checkpoints>,
+            &controls_only,
+        ),
+        &spec,
+        json!({"answer": 2}),
+    )
+    .await
+    .expect("recovered outcome");
+    assert_eq!(step(&outcome, "extra").output, Some(json!({"y": 2})));
+    assert_eq!(step(&outcome, "dropped").status, StepStatus::Skipped);
+    assert!(!recovered.calls().contains(&"action:dropped".to_owned()));
+
+    let resumed = script();
+    let outcome = run(
+        &engine(&resumed, InMemoryTraceSource::new(), 8).with_checkpoints(
+            Arc::new(Ledger::default()) as Arc<dyn Checkpoints>,
+            &ledger.recorded(),
+        ),
+        &spec,
+        json!({"answer": 1}),
+    )
+    .await
+    .expect("resumed outcome");
+    for (id, status) in [
+        ("dropped", StepStatus::Skipped),
+        ("blocked", StepStatus::Failed),
+    ] {
+        let withheld = step(&outcome, id);
+        assert_eq!(
+            (withheld.status, withheld.attempts),
+            (status, 1),
+            "{id}: a recorded disposition keeps the attempt that ran"
+        );
+        assert!(!resumed.calls().contains(&format!("action:{id}")), "{id}");
+    }
+
+    let undecided = script();
+    let recorded = ledger.recorded();
+    let before_decisions = ExecutionState {
+        controls: recorded
+            .controls
+            .iter()
+            .filter(|control| !matches!(control, ControlRecord::Disposition { .. }))
+            .cloned()
+            .collect(),
+        ..recorded
+    };
+    let outcome = run(
+        &engine(&undecided, InMemoryTraceSource::new(), 8).with_checkpoints(
+            Arc::new(Ledger::default()) as Arc<dyn Checkpoints>,
+            &before_decisions,
+        ),
+        &spec,
+        json!({"answer": 1}),
+    )
+    .await
+    .expect("outcome recovered before its decisions");
+    assert_eq!(step(&outcome, "extra").output, Some(json!({"y": 1})));
+    for (id, status) in [
+        ("dropped", StepStatus::Skipped),
+        ("blocked", StepStatus::Failed),
+    ] {
+        let withheld = step(&outcome, id);
+        assert_eq!(
+            (withheld.status, withheld.output.clone()),
+            (status, None),
+            "{id}: a crash before the decision commits decides it again the same way"
+        );
+    }
+    for id in ["compare", "extra", "dropped", "blocked"] {
+        assert!(
+            !undecided.calls().contains(&format!("action:{id}")),
+            "{id} reran: {:?}",
+            undecided.calls()
+        );
+    }
+}
+
+/// A step graph whose only cycle runs through a speculative guard and a
+/// fanout's items is refused before any block runs, so every potential
+/// edge is checked rather than only ordinary bindings.
+///
+/// # Panics
+/// Panics when the cycle is not refused or a block runs.
+#[tokio::test(start_paused = true)]
+async fn invalid_step_controls_reject_before_dispatch() {
+    let spec: VerifierSpec = serde_json::from_value(json!({
+        "inputs": {"answer": {"type": "json"}},
+        "steps": [
+            {"id": "split", "foreach": {"items": "steps.merge.output", "max_items": 3},
+             "action": code_action(json!({"s": "item"}))},
+            {"id": "merge", "speculative": true,
+             "when": {"path": "steps.split.output", "operator": "equals", "expected": []},
+             "action": code_action(json!({"x": "inputs.answer"}))}
+        ]
+    }))
+    .expect("Verifier");
+    let refusal = spec.validate().expect_err("the cycle is refused");
+    assert!(refusal.to_string().contains("steps"), "{refusal}");
+    let script = Arc::new(Script::default());
+    let refused = run(
+        &engine(&script, InMemoryTraceSource::new(), 4),
+        &Arc::new(spec),
+        json!({"answer": 1}),
+    )
+    .await;
+    assert!(matches!(refused, Err(EngineError::Plan(_))), "{refused:?}");
+    assert!(script.calls().is_empty());
+}
+
+/// `limits.concurrency` and `foreach.concurrency` only lower the engine's
+/// bound, and fanout never multiplies it: two blocks that must run together
+/// finish only when every bound reaching them admits both.
+///
+/// # Panics
+/// Panics when a bound admits more blocks than it allows, or a wide enough
+/// bound does not let them overlap.
+#[tokio::test(start_paused = true)]
+async fn run_and_fanout_bounds_only_lower_engine_capacity() {
+    let pair = |limits: Value| {
+        verifier(json!({
+            "inputs": {"answer": {"type": "json"}},
+            "limits": limits,
+            "steps": [
+                {"id": "a", "action": code_action(json!({"x": "inputs.answer"}))},
+                {"id": "b", "action": code_action(json!({"x": "inputs.answer"}))}
+            ]
+        }))
+    };
+    let swept = |foreach: Value| {
+        verifier(json!({
+            "inputs": {"answer": {"type": "json"}},
+            "steps": [{"id": "a", "foreach": foreach, "action": code_action(json!({"x": "inputs.answer"}))}]
+        }))
+    };
+    let together = |steps: &[&'static str]| {
+        let barrier = Arc::new(Barrier::new(2));
+        Arc::new(Script {
+            actions: steps
+                .iter()
+                .map(|id| (*id, Behavior::Together(Arc::clone(&barrier), json!({}))))
+                .collect(),
+            ..Script::default()
+        })
+    };
+    let cases = [
+        (pair(json!({"concurrency": 2})), &["a", "b"][..], 4, true),
+        (pair(json!({"concurrency": 1})), &["a", "b"][..], 4, false),
+        (pair(json!({"concurrency": 4})), &["a", "b"][..], 1, false),
+        (swept(json!({"count": 2})), &["a"][..], 4, true),
+        (
+            swept(json!({"count": 2, "concurrency": 1})),
+            &["a"][..],
+            4,
+            false,
+        ),
+        (
+            swept(json!({"count": 2, "concurrency": 2})),
+            &["a"][..],
+            1,
+            false,
+        ),
+    ];
+    for (spec, steps, capacity, overlaps) in cases {
+        let script = together(steps);
+        let outcome = run(
+            &engine(&script, InMemoryTraceSource::new(), capacity),
+            &spec,
+            json!({"answer": 1}),
+        )
+        .await;
+        assert_eq!(
+            outcome.is_ok(),
+            overlaps,
+            "{:?} with capacity {capacity}: {outcome:?}",
+            spec.limits
+        );
+        if !overlaps {
+            assert!(
+                matches!(outcome, Err(EngineError::DeadlineExceeded)),
+                "{outcome:?}"
+            );
+        }
+    }
+}
+
+/// A block waiting on its own run's `limits.concurrency` holds no shared
+/// engine permit: while run X's `a` holds X's only permit, X's `b` waits
+/// without taking the engine's second permit, so run Y's `c` can run
+/// beside `a`.
+///
+/// # Panics
+/// Panics when either run does not finish because a waiting block held the
+/// shared permit.
+#[tokio::test(start_paused = true)]
+async fn waiting_blocks_release_unrelated_permits() {
+    let x = verifier(json!({
+        "inputs": {"answer": {"type": "json"}},
+        "limits": {"concurrency": 1},
+        "steps": [
+            {"id": "a", "action": code_action(json!({"x": "inputs.answer"}))},
+            {"id": "b", "action": code_action(json!({"x": "inputs.answer"}))}
+        ]
+    }));
+    let y = verifier(json!({
+        "inputs": {"answer": {"type": "json"}},
+        "steps": [{"id": "c", "action": code_action(json!({"x": "inputs.answer"}))}]
+    }));
+    let barrier = Arc::new(Barrier::new(2));
+    let script = Arc::new(Script {
+        actions: HashMap::from([
+            ("a", Behavior::Together(Arc::clone(&barrier), json!({}))),
+            ("c", Behavior::Together(barrier, json!({}))),
+        ]),
+        ..Script::default()
+    });
+    let engine = engine(&script, InMemoryTraceSource::new(), 2);
+    let (x, y) = tokio::join!(
+        run(&engine, &x, json!({"answer": 1})),
+        run(&engine, &y, json!({"answer": 1}))
+    );
+    assert!(x.is_ok() && y.is_ok(), "{x:?} {y:?}");
+    let calls = script.calls();
+    assert!(at(&calls, "action:a") < at(&calls, "action:b"), "{calls:?}");
+}
+
+/// A check waiting for capacity spends nothing: while a code check holds
+/// the run's only permit, the Agent check beside it is neither recorded nor
+/// called, so after an interruption the reclaimed execution still has the
+/// one Agent invocation to judge it. The interrupted code check, which was
+/// dispatched, stays recorded.
+///
+/// # Panics
+/// Panics when the waiting check is recorded or called before it is
+/// admitted, or the reclaimed execution cannot judge it.
+#[tokio::test(start_paused = true)]
+async fn waiting_checks_spend_only_after_admission() {
+    let spec = verifier(json!({
+        "inputs": {"answer": {"type": "json"}},
+        "limits": {"concurrency": 1, "max_agent_invocations": 1},
+        "requirements": [
+            {"id": "slow", "statement": "slow", "check": code_check(json!({"x": "inputs.answer"}))},
+            {"id": "judged", "statement": "judged", "check": answer_agent()}
+        ]
+    }));
+    let passed = || {
+        Ok(verdict(
+            VerificationVerdict::Passed,
+            json!([{"slot": "answer", "locator": {"json_pointer": "/text"}}]),
+        ))
+    };
+    let stalled = Arc::new(Script {
+        checks: HashMap::from([("slow", passed()), ("judged", passed())]),
+        held: HashMap::from([("slow", Arc::new(Notify::new()))]),
+        ..Script::default()
+    });
+    let ledger = Arc::new(Ledger::default());
+    let interrupted = run(
+        &engine(&stalled, InMemoryTraceSource::new(), 4).with_checkpoints(
+            Arc::clone(&ledger) as Arc<dyn Checkpoints>,
+            &ExecutionState::default(),
+        ),
+        &spec,
+        json!({"answer": {"text": "a"}}),
+    )
+    .await;
+    assert!(
+        matches!(interrupted, Err(EngineError::DeadlineExceeded)),
+        "{interrupted:?}"
+    );
+    assert_eq!(
+        stalled.calls(),
+        ["check:slow"],
+        "the waiting check is not called"
+    );
+    assert_eq!(
+        ledger.attempts(),
+        [("slow".to_owned(), 1, false)],
+        "only the dispatched check is recorded"
+    );
+
+    let recovered = Arc::new(Script {
+        checks: HashMap::from([("slow", passed()), ("judged", passed())]),
+        ..Script::default()
+    });
+    let outcome = run(
+        &engine(&recovered, InMemoryTraceSource::new(), 4).with_checkpoints(
+            Arc::clone(&ledger) as Arc<dyn Checkpoints>,
+            &ledger.recorded(),
+        ),
+        &spec,
+        json!({"answer": {"text": "a"}}),
+    )
+    .await
+    .expect("outcome");
+    assert_eq!(recovered.calls(), ["check:slow", "check:judged"]);
+    let judged = requirement(&outcome, "judged");
+    assert_eq!(judged.outcome, RequirementOutcome::Passed, "{judged:?}");
+    assert_eq!(
+        ledger.attempts(),
+        [
+            ("judged".to_owned(), 1, true),
+            ("slow".to_owned(), 1, false),
+            ("slow".to_owned(), 2, true)
+        ],
+        "the interrupted check keeps its attempt"
+    );
+}
+
+/// An admitted Agent check spends its invocation once dispatched: when the
+/// execution is interrupted while the check runs, the reclaimed execution
+/// with one Agent invocation finds it spent and does not call the check.
+///
+/// # Panics
+/// Panics when the interrupted check is not recorded or recovery calls it
+/// again.
+#[tokio::test(start_paused = true)]
+async fn interrupted_agent_checks_keep_their_invocation() {
+    let spec = verifier(json!({
+        "inputs": {"answer": {"type": "json"}},
+        "limits": {"max_agent_invocations": 1},
+        "requirements": [{"id": "judged", "statement": "judged", "check": answer_agent()}]
+    }));
+    let passed = || {
+        Ok(verdict(
+            VerificationVerdict::Passed,
+            json!([{"slot": "answer", "locator": {"json_pointer": "/text"}}]),
+        ))
+    };
+    let stalled = Arc::new(Script {
+        checks: HashMap::from([("judged", passed())]),
+        held: HashMap::from([("judged", Arc::new(Notify::new()))]),
+        ..Script::default()
+    });
+    let ledger = Arc::new(Ledger::default());
+    let interrupted = run(
+        &engine(&stalled, InMemoryTraceSource::new(), 4).with_checkpoints(
+            Arc::clone(&ledger) as Arc<dyn Checkpoints>,
+            &ExecutionState::default(),
+        ),
+        &spec,
+        json!({"answer": {"text": "a"}}),
+    )
+    .await;
+    assert!(
+        matches!(interrupted, Err(EngineError::DeadlineExceeded)),
+        "{interrupted:?}"
+    );
+    assert_eq!(stalled.calls(), ["check:judged"]);
+    assert_eq!(ledger.attempts(), [("judged".to_owned(), 1, false)]);
+
+    let recovered = Arc::new(Script {
+        checks: HashMap::from([("judged", passed())]),
+        ..Script::default()
+    });
+    let outcome = run(
+        &engine(&recovered, InMemoryTraceSource::new(), 4).with_checkpoints(
+            Arc::clone(&ledger) as Arc<dyn Checkpoints>,
+            &ledger.recorded(),
+        ),
+        &spec,
+        json!({"answer": {"text": "a"}}),
+    )
+    .await
+    .expect("outcome");
+    assert!(recovered.calls().is_empty(), "{:?}", recovered.calls());
+    let judged = requirement(&outcome, "judged");
+    assert_eq!(
+        (judged.outcome, judged.reason.as_str()),
+        (RequirementOutcome::Inconclusive, BUDGET_SPENT)
+    );
+}
+
+/// A capacity refusal from one step check defers the execution only after
+/// the step's other dispatched check settles: the running Agent check's
+/// settlement is recorded before the refusal returns, the refused check's
+/// attempt is forgotten, and the reclaimed execution calls only the refused
+/// check, without spending the one Agent invocation again.
+///
+/// # Panics
+/// Panics when the refusal returns while the sibling still runs, drops its
+/// settlement, or recovery calls the settled check again.
+#[tokio::test(start_paused = true)]
+async fn capacity_refusal_lets_dispatched_checks_settle() {
+    let spec = verifier(json!({
+        "inputs": {"answer": {"type": "json"}},
+        "limits": {"max_agent_invocations": 1},
+        "steps": [{
+            "id": "work",
+            "action": code_action(json!({"x": "inputs.answer"})),
+            "requirements": [
+                {"id": "running", "statement": "running", "check": answer_agent()},
+                {"id": "refused", "statement": "refused", "check": code_check(json!({"x": "inputs.answer"}))}
+            ]
+        }]
+    }));
+    let passed = || {
+        Ok(verdict(
+            VerificationVerdict::Passed,
+            json!([{"slot": "answer", "locator": {"json_pointer": "/text"}}]),
+        ))
+    };
+    let release = Arc::new(Notify::new());
+    let refusing = Arc::new(Script {
+        checks: HashMap::from([
+            ("running", passed()),
+            (
+                "refused",
+                Err(BlockError::Busy {
+                    reason: "no worker".to_owned(),
+                }),
+            ),
+        ]),
+        held: HashMap::from([("running", Arc::clone(&release))]),
+        ..Script::default()
+    });
+    let ledger = Arc::new(Ledger::default());
+    let engine_under_test = engine(&refusing, InMemoryTraceSource::new(), 4).with_checkpoints(
+        Arc::clone(&ledger) as Arc<dyn Checkpoints>,
+        &ExecutionState::default(),
+    );
+    let refusal = run(&engine_under_test, &spec, json!({"answer": {"text": "a"}}));
+    tokio::pin!(refusal);
+    assert!(
+        tokio::time::timeout(Duration::from_secs(5), &mut refusal)
+            .await
+            .is_err(),
+        "the refusal waits for the running check"
+    );
+    assert_eq!(
+        refusing.calls(),
+        ["action:work", "check:running", "check:refused"]
+    );
+    release.notify_one();
+    let refused = refusal.await;
+    assert!(matches!(refused, Err(EngineError::Busy(_))), "{refused:?}");
+    assert_eq!(
+        ledger.attempts(),
+        [
+            ("running".to_owned(), 1, true),
+            ("work".to_owned(), 1, true)
+        ],
+        "the running check settles and the refused attempt is forgotten"
+    );
+
+    let recovered = Arc::new(Script {
+        checks: HashMap::from([("running", passed()), ("refused", passed())]),
+        ..Script::default()
+    });
+    let outcome = run(
+        &engine(&recovered, InMemoryTraceSource::new(), 4).with_checkpoints(
+            Arc::new(Ledger::default()) as Arc<dyn Checkpoints>,
+            &ledger.recorded(),
+        ),
+        &spec,
+        json!({"answer": {"text": "a"}}),
+    )
+    .await
+    .expect("outcome");
+    assert_eq!(recovered.calls(), ["check:refused"]);
+    for id in ["running", "refused"] {
+        let judged = requirement(&outcome, id);
+        assert_eq!(judged.outcome, RequirementOutcome::Passed, "{judged:?}");
+    }
+}
+
+/// An inline Agent action or check reading the `answer` input.
+fn answer_agent() -> Value {
+    reader_agent(json!({"/inputs/answer.json": "inputs.answer"}))
+}
+
+/// `limits.max_agent_invocations` counts every Agent action and check
+/// attempt, retries included: once spent, a later Agent action fails and an
+/// Agent check is inconclusive without being called, while code blocks still
+/// run. An Agent check spends the budget like an action. A reclaimed
+/// execution counts the attempts it already recorded, so recovery never
+/// replenishes the budget.
+///
+/// # Panics
+/// Panics when a spent budget dispatches an Agent block, a code block is
+/// refused, or recovery replenishes the budget.
+#[tokio::test(start_paused = true)]
+async fn agent_budget_counts_retries_and_is_never_replenished() {
+    let retryable = || BlockError::Retryable {
+        reason: "provider unavailable".to_owned(),
+    };
+    let spec = verifier(json!({
+        "inputs": {"answer": {"type": "json"}},
+        "limits": {"max_agent_invocations": 3},
+        "steps": [
+            {"id": "first", "retries": 2, "action": answer_agent()},
+            {"id": "second", "depends_on": ["first"], "action": answer_agent()},
+            {"id": "plain", "depends_on": ["first"], "action": code_action(json!({"x": "inputs.answer"}))}
+        ],
+        "requirements": [
+            {"id": "judged", "statement": "judged", "check": answer_agent()},
+            {"id": "coded", "statement": "coded", "check": {"kind": "assert", "path": "steps.plain.status", "operator": "equals", "expected": "succeeded"}}
+        ]
+    }));
+    let script = Arc::new(Script {
+        actions: HashMap::from([(
+            "first",
+            Behavior::Attempts(vec![retryable(), retryable()], json!({})),
+        )]),
+        checks: HashMap::from([(
+            "judged",
+            Ok(verdict(VerificationVerdict::Passed, json!([]))),
+        )]),
+        ..Script::default()
+    });
+    let outcome = run(
+        &engine(&script, InMemoryTraceSource::new(), 4),
+        &spec,
+        json!({"answer": 1}),
+    )
+    .await
+    .expect("outcome");
+    let calls = script.calls();
+    assert_eq!(
+        calls.iter().filter(|call| *call == "action:first").count(),
+        3
+    );
+    assert!(!calls.contains(&"action:second".to_owned()), "{calls:?}");
+    assert!(!calls.contains(&"check:judged".to_owned()), "{calls:?}");
+    assert!(calls.contains(&"action:plain".to_owned()), "{calls:?}");
+    let second = step(&outcome, "second");
+    assert_eq!(
+        (second.status, second.attempts, second.reason.as_deref()),
+        (StepStatus::Failed, 0, Some(BUDGET_SPENT))
+    );
+    let judged = requirement(&outcome, "judged");
+    assert_eq!(
+        (judged.outcome, judged.reason.as_str()),
+        (RequirementOutcome::Inconclusive, BUDGET_SPENT)
+    );
+    let coded = requirement(&outcome, "coded");
+    assert_eq!(coded.outcome, RequirementOutcome::Passed, "{coded:?}");
+
+    let checked = verifier(json!({
+        "inputs": {"answer": {"type": "json"}},
+        "limits": {"max_agent_invocations": 2},
+        "steps": [
+            {"id": "one", "action": answer_agent(),
+             "requirements": [{"id": "reviewed", "statement": "reviewed", "check": answer_agent()}]},
+            {"id": "two", "depends_on": ["one"], "action": answer_agent()}
+        ]
+    }));
+    let script = Arc::new(Script {
+        checks: HashMap::from([(
+            "reviewed",
+            Ok(verdict(VerificationVerdict::Passed, json!([]))),
+        )]),
+        ..Script::default()
+    });
+    let outcome = run(
+        &engine(&script, InMemoryTraceSource::new(), 4),
+        &checked,
+        json!({"answer": 1}),
+    )
+    .await
+    .expect("outcome");
+    let calls = script.calls();
+    assert!(calls.contains(&"check:reviewed".to_owned()), "{calls:?}");
+    assert!(
+        !calls.contains(&"action:two".to_owned()),
+        "a check spends the budget: {calls:?}"
+    );
+    let two = step(&outcome, "two");
+    assert_eq!(
+        (two.status, two.attempts, two.reason.as_deref()),
+        (StepStatus::Failed, 0, Some(BUDGET_SPENT))
+    );
+
+    let resumable = verifier(json!({
+        "inputs": {"answer": {"type": "json"}},
+        "limits": {"max_agent_invocations": 2},
+        "steps": [{"id": "first", "retries": 3, "action": answer_agent()}]
+    }));
+    let hung = Arc::new(Notify::new());
+    let crashed = Arc::new(Script {
+        actions: HashMap::from([("first", Behavior::Hang(hung))]),
+        ..Script::default()
+    });
+    let ledger = Arc::new(Ledger::default());
+    let interrupted = engine(&crashed, InMemoryTraceSource::new(), 4).with_checkpoints(
+        Arc::clone(&ledger) as Arc<dyn Checkpoints>,
+        &ExecutionState::default(),
+    );
+    assert!(matches!(
+        run(&interrupted, &resumable, json!({"answer": 1})).await,
+        Err(EngineError::DeadlineExceeded)
+    ));
+    let recovered = Arc::new(Script {
+        actions: HashMap::from([("first", Behavior::Attempts(vec![retryable()], json!({})))]),
+        ..Script::default()
+    });
+    let resumed = engine(&recovered, InMemoryTraceSource::new(), 4).with_checkpoints(
+        Arc::clone(&ledger) as Arc<dyn Checkpoints>,
+        &ledger.recorded(),
+    );
+    let outcome = run(&resumed, &resumable, json!({"answer": 1}))
+        .await
+        .expect("outcome");
+    assert_eq!(recovered.calls(), ["action:first"]);
+    let first = step(&outcome, "first");
+    assert_eq!(
+        (first.status, first.attempts, first.reason.as_deref()),
+        (StepStatus::Failed, 2, Some(BUDGET_SPENT))
+    );
+}
+
+/// A `when` that reads missing data, cannot compare, or finds a value of
+/// another JSON type than it expects fails its step without a call rather
+/// than skipping it as false, and a speculative
+/// step whose true guard admits a failed action stays visible as failed and
+/// fails, not skips, its consumer.
+///
+/// # Panics
+/// Panics when an unevaluable condition skips or runs its step, or an
+/// admitted failure is hidden.
+#[tokio::test(start_paused = true)]
+async fn condition_errors_and_admitted_failures_stay_failures() {
+    let when = |path: &str, operator: &str, expected: Value| json!({"path": path, "operator": operator, "expected": expected});
+    let spec = verifier(json!({
+        "inputs": {"answer": {"type": "json"}},
+        "steps": [
+            {"id": "compare", "action": code_action(json!({"x": "inputs.answer"}))},
+            {"id": "missing", "when": when("steps.compare.output.absent", "equals", json!(1)),
+             "action": code_action(json!({"x": "inputs.answer"}))},
+            {"id": "mistyped", "when": when("steps.compare.output.x", "greater_than", json!("high")),
+             "action": code_action(json!({"x": "inputs.answer"}))},
+            {"id": "unlike", "when": when("steps.compare.output.x", "equals", json!(true)),
+             "action": code_action(json!({"x": "inputs.answer"}))},
+            {"id": "extra", "speculative": true, "when": when("steps.compare.output.x", "equals", json!(1)),
+             "action": code_action(json!({"x": "inputs.answer"}))},
+            {"id": "consumer", "action": code_action(json!({"e": "steps.extra.output"}))}
+        ]
+    }));
+    let ledger = Arc::new(Ledger::default());
+    let script = Arc::new(Script {
+        actions: HashMap::from([
+            ("compare", echo(&[1])),
+            (
+                "extra",
+                Behavior::Attempts(
+                    vec![BlockError::Terminal {
+                        reason: "the extra review broke".to_owned(),
+                    }],
+                    json!(null),
+                ),
+            ),
+        ]),
+        ..Script::default()
+    });
+    let outcome = run(
+        &engine(&script, InMemoryTraceSource::new(), 8).with_checkpoints(
+            Arc::clone(&ledger) as Arc<dyn Checkpoints>,
+            &ExecutionState::default(),
+        ),
+        &spec,
+        json!({"answer": 1}),
+    )
+    .await
+    .expect("outcome");
+    let calls = script.calls();
+    for refused in ["missing", "mistyped", "unlike"] {
+        assert_eq!(
+            step(&outcome, refused).status,
+            StepStatus::Failed,
+            "{refused}"
+        );
+        assert!(
+            !calls.contains(&format!("action:{refused}")),
+            "{refused}: {calls:?}"
+        );
+    }
+    let extra = step(&outcome, "extra");
+    assert_eq!(
+        (extra.status, extra.reason.as_deref()),
+        (StepStatus::Failed, Some("the extra review broke"))
+    );
+    assert!(
+        ledger.recorded().controls.iter().any(|control| matches!(
+            control,
+            ControlRecord::Disposition { step, speculation: Speculation::Admitted, .. }
+                if step.as_str() == "extra"
+        )),
+        "{:?}",
+        ledger.recorded().controls
+    );
+    assert_ne!(step(&outcome, "consumer").status, StepStatus::Succeeded);
+    assert!(!calls.contains(&"action:consumer".to_owned()), "{calls:?}");
 }

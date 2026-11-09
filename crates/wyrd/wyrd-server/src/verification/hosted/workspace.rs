@@ -10,7 +10,11 @@
 //! UTF-8 lines of a file, and only `fs.extract` runs the extractor, on
 //! request, into a new `/work` file. Every `/inputs` file keeps the
 //! original slots it came from, so tool output stays citable against
-//! original evidence. Dropping the [`Workspace`] removes the directory and
+//! original evidence. A `steps.<id>.publications` reference mounts what the
+//! execution's step published: a named member at its destination, or the
+//! whole collection as `manifest.json` plus `content/` beneath it; derived
+//! files keep only their producer's original slots, so a generated opinion
+//! can never be cited as original evidence. Dropping the [`Workspace`] removes the directory and
 //! releases its admission, on success, failure, or cancellation alike.
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -28,11 +32,14 @@ use vala_verify::blocks::{BlockError, CallInput, CallValue};
 use wyrd_loader::{EXTRACT_VERSION, Extraction, lines, zip_guard};
 use wyrd_spec::error::WyrdError;
 use wyrd_spec::ids::SlotName;
-use wyrd_spec::verification::execution::InputDeclaration;
+use wyrd_spec::verification::execution::{
+    CollectionEntry, InputDeclaration, Producer, PublicationContent,
+};
 
 use super::evidence::TenantEvidence;
 use super::tools::{invocation, structured};
 use super::{HostedLimits, extract_refused};
+use wyrd_spec::verification::state::AcceptedPublication;
 
 /// Process-wide admission of scratch workspaces.
 pub struct Workspaces {
@@ -59,13 +66,15 @@ impl Workspaces {
     /// the execution is deferred instead. Evidence is read and verified
     /// first, then written on the blocking pool. An Artifact file keeps its
     /// stored content type only as a hint for `fs.extract`; it is never
-    /// unpacked.
+    /// unpacked. A named publication must exist for its successful producer
+    /// attempt, so a missing one refuses the call before it runs.
     ///
     /// # Errors
     /// Returns [`BlockError::Busy`] when every workspace is taken, the
     /// evidence reader's errors, [`BlockError::Terminal`] for an invalid
-    /// path, combined input bytes over the limit, or any materialization
-    /// refusal, and [`BlockError::Retryable`] when the blocking task fails.
+    /// path, a missing named publication, combined input bytes over the
+    /// limit, or any materialization refusal, and [`BlockError::Retryable`]
+    /// when the blocking task fails.
     pub async fn open(
         &self,
         files: &BTreeMap<String, CallInput>,
@@ -77,44 +86,197 @@ impl Workspaces {
                 .map_err(|_| BlockError::Busy {
                     reason: "every workspace is in use".to_owned(),
                 })?;
-        let mut staged = Vec::with_capacity(files.len());
-        let mut total = 0_u64;
+        let mut mount = Mount::default();
         for (path, input) in files {
-            let (bytes, format) = match &input.value {
-                CallValue::Json(value) => (
-                    serde_json::to_vec_pretty(value).unwrap_or_default(),
-                    Some(MediaFormat::Json),
-                ),
-                CallValue::Evidence(InputDeclaration::Artifact { artifact, path }) => {
-                    let (bytes, format) = evidence.artifact(artifact, path.as_deref()).await?;
-                    (bytes, format.filter(|format| !format.is_archive()))
+            let sources = &input.sources;
+            match &input.value {
+                CallValue::Json(value) => mount.json(path.clone(), value, sources),
+                CallValue::Evidence(InputDeclaration::Artifact {
+                    artifact,
+                    path: file,
+                }) => {
+                    let (bytes, format) = evidence.artifact(artifact, file.as_deref()).await?;
+                    mount.file(
+                        path.clone(),
+                        bytes,
+                        format.filter(|format| !format.is_archive()),
+                        sources,
+                    );
                 }
                 CallValue::Evidence(declaration) => {
                     let (bytes, format) = evidence.read(declaration).await?;
-                    (bytes, Some(format))
+                    mount.file(path.clone(), bytes, Some(format), sources);
                 }
-            };
-            total = total.saturating_add(u64::try_from(bytes.len()).unwrap_or(u64::MAX));
-            if total > self.limits.files_max_bytes {
+                CallValue::Publication { producer, name } => {
+                    let publication = evidence
+                        .publications(&producer.step_id)
+                        .await?
+                        .into_iter()
+                        .find(|stored| {
+                            &stored.publication.producer == producer
+                                && &stored.publication.name == name
+                        })
+                        .ok_or_else(|| {
+                            terminal(format!(
+                                "{path}: the successful attempt of step `{}` published no `{}`",
+                                producer.step_id.as_str(),
+                                name.as_str()
+                            ))
+                        })?;
+                    mount
+                        .publication(evidence, path, &publication, sources)
+                        .await?;
+                }
+                CallValue::Publications { step, collection } => {
+                    let mut manifest = collection.clone();
+                    // A withheld speculative contribution mounts no content:
+                    // only its status, disposition, and attempts.
+                    let admitted = if collection.speculation.admits() {
+                        evidence.publications(step).await?
+                    } else {
+                        Vec::new()
+                    };
+                    for publication in admitted {
+                        let relative = format!(
+                            "content/{}/{}",
+                            segment(&publication.publication.producer),
+                            publication.publication.name.as_str()
+                        );
+                        mount
+                            .publication(
+                                evidence,
+                                &format!("{path}/{relative}"),
+                                &publication,
+                                sources,
+                            )
+                            .await?;
+                        let publication = publication.publication;
+                        manifest.entries.push(CollectionEntry {
+                            kind: publication.content.kind(),
+                            name: publication.name,
+                            path: relative,
+                            item_index: publication.producer.item_index,
+                            iteration_index: publication.producer.iteration_index,
+                            attempt: publication.producer.attempt,
+                        });
+                    }
+                    let manifest = serde_json::to_value(&manifest).unwrap_or(Value::Null);
+                    mount.json(format!("{path}/manifest.json"), &manifest, &BTreeSet::new());
+                    mount.directories.push(path.clone());
+                }
+            }
+            if mount.bytes > self.limits.files_max_bytes {
                 return Err(terminal(format!(
                     "workspace inputs exceed the {}-byte combined file limit",
                     self.limits.files_max_bytes
                 )));
             }
-            staged.push(Staged {
-                path: path.clone(),
-                bytes,
-                format,
-                sources: input.sources.clone(),
-            });
         }
         let limits = self.limits;
-        tokio::task::spawn_blocking(move || Workspace::materialize(staged, limits, permit))
-            .await
-            .map_err(|error| BlockError::Retryable {
-                reason: format!("workspace materialization stopped: {error}"),
-            })?
+        tokio::task::spawn_blocking(move || {
+            let workspace = Workspace::materialize(mount.staged, limits, permit)?;
+            for directory in &mount.directories {
+                let host = workspace.host(directory).ok_or_else(|| {
+                    terminal(format!("{directory} is not under /inputs or /work"))
+                })?;
+                std::fs::create_dir_all(host).map_err(io)?;
+            }
+            Ok(workspace)
+        })
+        .await
+        .map_err(|error| BlockError::Retryable {
+            reason: format!("workspace materialization stopped: {error}"),
+        })?
     }
+}
+
+/// The files and directories one open stages.
+#[derive(Default)]
+struct Mount {
+    /// Files to place.
+    staged: Vec<Staged>,
+    /// Directories to create, empty ones included.
+    directories: Vec<String>,
+    /// Combined bytes of the staged files.
+    bytes: u64,
+}
+
+impl Mount {
+    /// Stage `bytes` at `path`.
+    fn file(
+        &mut self,
+        path: String,
+        bytes: Vec<u8>,
+        format: Option<MediaFormat>,
+        sources: &BTreeSet<SlotName>,
+    ) {
+        self.bytes = self
+            .bytes
+            .saturating_add(u64::try_from(bytes.len()).unwrap_or(u64::MAX));
+        self.staged.push(Staged {
+            path,
+            bytes,
+            format,
+            sources: sources.clone(),
+        });
+    }
+
+    /// Stage `value` as a UTF-8 JSON file at `path`.
+    fn json(&mut self, path: String, value: &Value, sources: &BTreeSet<SlotName>) {
+        let bytes = serde_json::to_vec_pretty(value).unwrap_or_default();
+        self.file(path, bytes, Some(MediaFormat::Json), sources);
+    }
+
+    /// Stage `publication` at `path`: a file there, a JSON file there, or a
+    /// directory there with its files and empty directories beneath it,
+    /// each file read through its completed File descriptor.
+    ///
+    /// # Errors
+    /// Returns [`TenantEvidence::published`]'s errors.
+    async fn publication(
+        &mut self,
+        evidence: &TenantEvidence,
+        path: &str,
+        stored: &AcceptedPublication,
+        sources: &BTreeSet<SlotName>,
+    ) -> Result<(), BlockError> {
+        match &stored.publication.content {
+            PublicationContent::Json { value } => self.json(path.to_owned(), value, sources),
+            PublicationContent::File { manifest } => {
+                for (file, object) in manifest.files.iter().zip(&stored.objects) {
+                    let bytes = evidence.published(file, object).await?;
+                    self.file(path.to_owned(), bytes, None, sources);
+                }
+            }
+            PublicationContent::Directory { manifest } => {
+                self.directories.push(path.to_owned());
+                self.directories.extend(
+                    manifest
+                        .directories
+                        .iter()
+                        .map(|directory| format!("{path}/{directory}")),
+                );
+                for (file, object) in manifest.files.iter().zip(&stored.objects) {
+                    let bytes = evidence.published(file, object).await?;
+                    self.file(format!("{path}/{}", file.path), bytes, None, sources);
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+/// The opaque collection segment of `producer`'s invocation attempt.
+fn segment(producer: &Producer) -> String {
+    let item = producer
+        .item_index
+        .map(|item| format!("item-{item}."))
+        .unwrap_or_default();
+    let iteration = producer
+        .iteration_index
+        .map(|iteration| format!("iteration-{iteration}."))
+        .unwrap_or_default();
+    format!("{item}{iteration}attempt-{}", producer.attempt)
 }
 
 /// One file to place under `/inputs`.
@@ -146,8 +308,8 @@ pub struct Workspace {
     /// Bytes the materialized inputs take from the scratch limit.
     inputs_bytes: u64,
     /// Held by one `/work` writer at a time, so each sees the space the
-    /// others left.
-    writer: tokio::sync::Mutex<()>,
+    /// others left; shared so blocking work can own its turn.
+    writer: Arc<tokio::sync::Mutex<()>>,
     /// Limits in force.
     limits: HostedLimits,
     /// Admission held until drop.
@@ -173,7 +335,7 @@ impl Workspace {
             root,
             inputs: BTreeMap::new(),
             inputs_bytes: 0,
-            writer: tokio::sync::Mutex::new(()),
+            writer: Arc::new(tokio::sync::Mutex::new(())),
             limits,
             _permit: permit.into(),
         };
@@ -390,9 +552,119 @@ impl Workspace {
     }
 
     /// Wait to be the only `/work` writer; dropping the guard lets the next
-    /// one in. Cancelling the wait gives up the turn.
-    pub async fn writer(&self) -> tokio::sync::MutexGuard<'_, ()> {
-        self.writer.lock().await
+    /// one in. Cancelling the wait gives up the turn. The guard is owned, so
+    /// blocking work moved to another thread keeps the turn until it ends.
+    pub async fn writer(&self) -> tokio::sync::OwnedMutexGuard<()> {
+        Arc::clone(&self.writer).lock_owned().await
+    }
+
+    /// Freeze `/work` file or directory `path` for publication, read while
+    /// holding [`Self::writer`] so no `/work` writer changes it mid-read and
+    /// later writes never reach the frozen copy.
+    ///
+    /// A directory is walked completely or refused: every entry must be a
+    /// regular file or directory with a UTF-8 name free of backslashes and
+    /// control characters, no two relative paths may match under NFC plus
+    /// Unicode case folding, and the tree must stay within the entry, depth,
+    /// and byte limits. Nothing is renamed, skipped, or truncated.
+    ///
+    /// # Errors
+    /// Returns an [`invalid`] refusal: `publication_path` for a path outside
+    /// `/work`, `workspace_missing` for a missing path, `regular_file` for a
+    /// special file, `publication_tree` for an entry the tree rules refuse,
+    /// `work_budget` for content over the byte limit; and an invocation
+    /// failure for an unreadable entry.
+    pub async fn freeze(self: &Arc<Self>, path: &str) -> Result<Frozen, ToolError> {
+        if relative(path, "/work/").is_none() {
+            return Err(invalid(
+                "publication_path",
+                "path",
+                path,
+                format!("{path} is not a file or directory this invocation wrote under /work"),
+                "a path under /work without empty, . or .. segments",
+            ));
+        }
+        let writer = self.writer().await;
+        let workspace = Arc::clone(self);
+        let path = path.to_owned();
+        // The blocking read owns the writer turn, so a cancelled caller
+        // never lets a writer in while the read still runs.
+        tokio::task::spawn_blocking(move || {
+            let _writer = writer;
+            workspace.snapshot(&path)
+        })
+        .await
+        .map_err(|error| invocation(error.to_string()))?
+    }
+
+    /// [`Self::freeze`]'s read of `/work` path `path`; the caller holds
+    /// [`Self::writer`] and runs it on the blocking pool.
+    ///
+    /// # Errors
+    /// Returns [`Self::freeze`]'s refusals and failures.
+    fn snapshot(&self, path: &str) -> Result<Frozen, ToolError> {
+        let rest = relative(path, "/work/").ok_or_else(|| outside(path))?;
+        let host = self.work_dir().join(rest);
+        if !host.symlink_metadata().map_err(|_| missing(path))?.is_dir() {
+            let (host, _) = self.file(path)?;
+            let name = rest.rsplit('/').next().unwrap_or(rest).to_owned();
+            let bytes = std::fs::read(&host).map_err(failed)?;
+            return Ok(Frozen::File { name, bytes });
+        }
+        let mut tree = Tree::default();
+        let mut pending = vec![(host, String::new(), 0_usize)];
+        while let Some((dir, prefix, depth)) = pending.pop() {
+            for entry in std::fs::read_dir(&dir).map_err(failed)? {
+                let entry = entry.map_err(failed)?;
+                let name = entry.file_name().into_string().map_err(|name| {
+                    tree_refused(path, &format!("{} is not UTF-8", name.to_string_lossy()))
+                })?;
+                let relative = if prefix.is_empty() {
+                    name.clone()
+                } else {
+                    format!("{prefix}/{name}")
+                };
+                tree.admit(path, &name, &relative, self.limits.archive_max_entries)?;
+                let meta = entry.path().symlink_metadata().map_err(failed)?;
+                if meta.is_dir() {
+                    if depth + 1 > PUBLICATION_MAX_DEPTH {
+                        return Err(tree_refused(
+                            path,
+                            &format!("{relative} is deeper than {PUBLICATION_MAX_DEPTH} levels"),
+                        ));
+                    }
+                    tree.directories.push(relative.clone());
+                    pending.push((entry.path(), relative, depth + 1));
+                } else if meta.is_file() {
+                    tree.bytes += meta.len();
+                    if tree.bytes > self.limits.work_write_max_bytes {
+                        return Err(invalid(
+                            "work_budget",
+                            "path",
+                            path,
+                            format!(
+                                "{path} holds more than the {}-byte /work limit",
+                                self.limits.work_write_max_bytes
+                            ),
+                            "a smaller file or directory",
+                        ));
+                    }
+                    let bytes = std::fs::read(entry.path()).map_err(failed)?;
+                    tree.files.push((relative, bytes));
+                } else {
+                    return Err(tree_refused(
+                        path,
+                        &format!("{relative} is a link or special file"),
+                    ));
+                }
+            }
+        }
+        tree.files.sort();
+        tree.directories.sort();
+        Ok(Frozen::Directory {
+            files: tree.files,
+            directories: tree.directories,
+        })
     }
 
     /// The sandbox mounts: `/inputs` read-only and `/work` writable up to
@@ -765,6 +1037,96 @@ impl Workspace {
         }))
     }
 
+    /// `fs.write`: create or replace the regular `/work` file `path` with
+    /// UTF-8 `content`, creating missing parent directories, and return the
+    /// path and byte count written.
+    ///
+    /// Run it on the blocking pool while holding [`Self::writer`], so the
+    /// `/work` budget it checks stays true. Every existing parent must be a
+    /// real directory and an existing target a regular file, so a write never
+    /// follows a link out of `/work`. The budget counts a replaced file once;
+    /// a refused write creates nothing, and the new bytes land by rename, so
+    /// a failed write never leaves a partial file.
+    ///
+    /// # Errors
+    /// Returns an [`invalid`] refusal: `write_path` for a path outside
+    /// `/work` (`/inputs` included), `write_parent` for a parent that is not
+    /// a directory, `regular_file` for a target that is a directory, link, or
+    /// special file, and `work_budget` for content over the `/work` budget. A
+    /// local IO failure is an [`invocation`] failure.
+    pub fn write(&self, path: &str, content: &str) -> Result<Value, ToolError> {
+        let rest = relative(path, "/work/").ok_or_else(|| {
+            invalid(
+                "write_path",
+                "path",
+                path,
+                format!("{path} is not a file path under /work; /inputs is read-only"),
+                "a file path under /work without empty, . or .. segments",
+            )
+        })?;
+        let segments: Vec<&str> = rest.split('/').collect();
+        let (name, parents) = segments.split_last().ok_or_else(|| outside(path))?;
+        let mut parent = self.work_dir();
+        let mut missing_parents = Vec::new();
+        for segment in parents {
+            parent.push(segment);
+            if !missing_parents.is_empty() {
+                missing_parents.push(parent.clone());
+                continue;
+            }
+            match parent.symlink_metadata() {
+                Ok(meta) if meta.is_dir() => {}
+                Ok(_) => {
+                    return Err(invalid(
+                        "write_parent",
+                        "path",
+                        path,
+                        format!("a parent of {path} is a file, link, or special file"),
+                        "a path whose existing parents are directories",
+                    ));
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    missing_parents.push(parent.clone());
+                }
+                Err(error) => return Err(failed(error)),
+            }
+        }
+        let target = parent.join(name);
+        let replaced = match target.symlink_metadata() {
+            Ok(meta) if meta.is_file() => meta.len(),
+            Ok(_) => {
+                return Err(invalid(
+                    "regular_file",
+                    "path",
+                    path,
+                    format!("{path} is a directory, link, or special file"),
+                    "a new or existing regular file",
+                ));
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => 0,
+            Err(error) => return Err(failed(error)),
+        };
+        let bytes = u64::try_from(content.len()).unwrap_or(u64::MAX);
+        if bytes > self.work_room().saturating_add(replaced) {
+            return Err(invalid(
+                "work_budget",
+                "content",
+                path,
+                format!("{path} would exceed the /work write budget"),
+                "fewer or smaller /work files",
+            ));
+        }
+        for directory in &missing_parents {
+            std::fs::create_dir(directory).map_err(failed)?;
+        }
+        let mut staged = tempfile::NamedTempFile::new_in(self.root.path()).map_err(failed)?;
+        std::io::Write::write_all(&mut staged, content.as_bytes()).map_err(failed)?;
+        staged
+            .persist(&target)
+            .map_err(|error| failed(error.error))?;
+        Ok(json!({"path": path, "bytes": bytes}))
+    }
+
     /// Most `/work` entries a list or search visits: no result could show
     /// more, since every listed entry takes more than 16 bytes.
     const fn walk_limit(&self) -> usize {
@@ -982,6 +1344,92 @@ fn walkdir(dir: &Path, most: usize) -> (Vec<(String, u64)>, bool) {
     }
     found.sort();
     (found, false)
+}
+
+/// Most directory levels below a published directory's root.
+// ponytail: fixed depth bound; make it a Deployment limit if trees need it.
+const PUBLICATION_MAX_DEPTH: usize = 32;
+
+/// A `/work` file or directory frozen for publication.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Frozen {
+    /// One regular file.
+    File {
+        /// Its basename.
+        name: String,
+        /// Its bytes.
+        bytes: Vec<u8>,
+    },
+    /// One directory tree, every path relative to its root.
+    Directory {
+        /// Every regular file and its bytes, sorted by path.
+        files: Vec<(String, Vec<u8>)>,
+        /// Every directory, empty ones included, sorted.
+        directories: Vec<String>,
+    },
+}
+
+/// A directory tree being frozen.
+#[derive(Default)]
+struct Tree {
+    /// Regular files and their bytes.
+    files: Vec<(String, Vec<u8>)>,
+    /// Directories.
+    directories: Vec<String>,
+    /// Folded relative paths seen so far.
+    folded: std::collections::HashSet<unicase::UniCase<String>>,
+    /// File bytes so far.
+    bytes: u64,
+}
+
+impl Tree {
+    /// Admit entry `name` at `relative` under published `path`: a safe name,
+    /// no collision under NFC plus case folding, and within `most` entries.
+    ///
+    /// # Errors
+    /// Returns a `publication_tree` refusal naming the violated rule.
+    fn admit(
+        &mut self,
+        path: &str,
+        name: &str,
+        relative: &str,
+        most: usize,
+    ) -> Result<(), ToolError> {
+        use unicode_normalization::UnicodeNormalization as _;
+        if name.contains('\\') || name.chars().any(char::is_control) {
+            return Err(tree_refused(
+                path,
+                &format!("{relative:?} holds a backslash or control character"),
+            ));
+        }
+        if !self
+            .folded
+            .insert(unicase::UniCase::unicode(relative.nfc().collect()))
+        {
+            return Err(tree_refused(
+                path,
+                &format!("{relative} collides with another entry ignoring case and normalization"),
+            ));
+        }
+        if self.folded.len() > most {
+            return Err(tree_refused(
+                path,
+                &format!("it holds more than {most} entries"),
+            ));
+        }
+        Ok(())
+    }
+}
+
+/// A directory publication refused because of `reason`.
+fn tree_refused(path: &str, reason: &str) -> ToolError {
+    invalid(
+        "publication_tree",
+        "path",
+        path,
+        format!("{path} cannot be published: {reason}"),
+        "a tree of regular files and directories with distinct UTF-8 names",
+    )
 }
 
 /// `text` in consecutive pieces of at most `size` bytes on character

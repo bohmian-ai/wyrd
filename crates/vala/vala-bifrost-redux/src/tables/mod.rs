@@ -46,7 +46,9 @@ pub use logs::RecordsTable;
 pub use metrics::{PointsTable, SeriesTable};
 pub use storage::ObjectsTable;
 pub use traces::SpansTable;
-pub use verification::{ExecutionInputsTable, ExecutionOutputsTable, ResultsTable};
+pub use verification::{
+    ExecutionEventsTable, ExecutionInputsTable, ExecutionOutputsTable, ResultsTable,
+};
 
 /// Errors from pure table schema and projection operations.
 #[derive(Debug, Error)]
@@ -334,6 +336,9 @@ pub struct BuiltinTableDefinition {
     /// row, the Parquet Bloom recipe, and every partition identity — is derived
     /// from that one canonical layout.
     pub physical_layout: fn() -> PhysicalLayoutWire,
+    /// Whether only fenced batches hold the table's records; see
+    /// [`DomainTable::FENCED_ONLY`].
+    pub fenced_only: bool,
 }
 
 /// Enforce the Variant contract over one supplied batch at the trust boundary.
@@ -603,6 +608,14 @@ pub trait DomainTable: Send + Sync + 'static {
     /// The pre-declared validator refuses a row that sets only some children
     /// of one of these columns; see [`refuse_partial_structs`].
     const WHOLE_STRUCTS: &'static [&'static str] = &[];
+
+    /// Whether only a batch with a durable fence holds the table's records.
+    ///
+    /// A writer of such a table treats a batch as accepted only once its
+    /// fence commits, so WAL replay never restores a batch the fence never
+    /// accepted: it was never acknowledged, and a later batch may already
+    /// hold its batch id.
+    const FENCED_ONLY: bool = false;
 
     /// User-owned fields, excluding correlation and system fields.
     fn arrow_fields() -> Vec<Field>;
@@ -1265,11 +1278,12 @@ const fn definition<T: DomainTable>() -> BuiltinTableDefinition {
         canonical_validator: T::CANONICAL_VALIDATOR,
         derived_columns: T::DERIVED_COLUMNS,
         physical_layout: T::physical_layout,
+        fenced_only: T::FENCED_ONLY,
     }
 }
 
-/// The single canonical list of eleven server-owned built-in tables.
-pub static BUILTIN_TABLES: [BuiltinTableDefinition; 11] = [
+/// The single canonical list of twelve server-owned built-in tables.
+pub static BUILTIN_TABLES: [BuiltinTableDefinition; 12] = [
     definition::<SpansTable>(),
     definition::<PointsTable>(),
     definition::<SeriesTable>(),
@@ -1278,6 +1292,7 @@ pub static BUILTIN_TABLES: [BuiltinTableDefinition; 11] = [
     definition::<ResultsTable>(),
     definition::<ExecutionInputsTable>(),
     definition::<ExecutionOutputsTable>(),
+    definition::<ExecutionEventsTable>(),
     definition::<AuditLogTable>(),
     definition::<CallsTable>(),
     definition::<ObjectsTable>(),
@@ -1285,7 +1300,7 @@ pub static BUILTIN_TABLES: [BuiltinTableDefinition; 11] = [
 
 /// Return all immutable built-in definitions.
 #[must_use]
-pub const fn builtin_tables() -> &'static [BuiltinTableDefinition; 11] {
+pub const fn builtin_tables() -> &'static [BuiltinTableDefinition; 12] {
     &BUILTIN_TABLES
 }
 
@@ -1297,7 +1312,7 @@ pub fn builtin_table(namespace: &str, name: &str) -> Option<&'static BuiltinTabl
         .find(|definition| definition.namespace == namespace && definition.name == name)
 }
 
-/// Return the eleven built-in logical FQNs in canonical order.
+/// Return the twelve built-in logical FQNs in canonical order.
 #[must_use]
 pub fn builtin_fqns() -> Vec<String> {
     BUILTIN_TABLES
@@ -1321,7 +1336,7 @@ mod tests {
     use wyrd_tonic::otlp::common::v1::{AnyValue, KeyValue};
 
     use super::*;
-    use fields::{boolean, float64, ts_us_utc, utf8};
+    use fields::{boolean, float64, int64, ts_us_utc, utf8};
     use wyrd_queue::variant::VariantViolation;
     use wyrd_spec::vala::api::{VARIANT_MAX_DEPTH, VARIANT_MAX_ENCODED_BYTES};
     use wyrd_spec::vala::{ACT_PRINCIPAL_ID, SUB_PRINCIPAL_ID};
@@ -1500,6 +1515,11 @@ mod tests {
                         PartitionTransformWire::Day,
                         &["result_id", "execution_id"],
                     ),
+                    ("verification", "execution_events") => (
+                        "occurred_at",
+                        PartitionTransformWire::Day,
+                        &["event_id", "execution_id", "verifier_card_uid"],
+                    ),
                     ("storage", "objects") => (
                         "recorded_at",
                         PartitionTransformWire::Day,
@@ -1586,7 +1606,7 @@ mod tests {
         blooms: &'static [&'static str],
     }
 
-    /// The approved contract for all five verification tables.
+    /// The approved contract for all six verification tables.
     fn verification_contracts() -> Vec<VerificationContract> {
         vec![
             VerificationContract {
@@ -1671,6 +1691,46 @@ mod tests {
                     RUN_ID,
                     "result_id",
                     "execution_id",
+                ],
+            },
+            VerificationContract {
+                namespace: "verification",
+                name: "execution_events",
+                columns: vec![
+                    utf8("event_id", false),
+                    utf8("execution_id", false),
+                    int64("sequence", false),
+                    utf8("event", false),
+                    utf8("status", true),
+                    utf8("verifier_card_uid", false),
+                    utf8("step_id", true),
+                    int64("item_index", true),
+                    int64("iteration_index", true),
+                    int64("attempt", true),
+                    utf8("publication_name", true),
+                    utf8("publication_kind", true),
+                    int64("size_bytes", true),
+                    int64("file_count", true),
+                    utf8("sha256", true),
+                    utf8("reason", true),
+                    variant_field("value", true),
+                    ts_us_utc("occurred_at", false),
+                    utf8("service_name", true),
+                    utf8("service_version", true),
+                    utf8("deployment_environment", true),
+                    utf8("subject_kind", true),
+                    utf8("subject_name", true),
+                    utf8("subject_version", true),
+                ],
+                blooms: &[
+                    "service_name",
+                    "subject_name",
+                    WORKLOAD_CARD_UID,
+                    SUBJECT_CARD_UID,
+                    RUN_ID,
+                    "event_id",
+                    "execution_id",
+                    "verifier_card_uid",
                 ],
             },
         ]
@@ -3395,6 +3455,7 @@ mod tests {
                 ][..],
             ),
             ("verification", "execution_outputs", &["output"][..]),
+            ("verification", "execution_events", &["value"][..]),
             (
                 "verification",
                 "execution_inputs",

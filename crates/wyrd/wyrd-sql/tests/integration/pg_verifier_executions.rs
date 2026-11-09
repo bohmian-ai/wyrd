@@ -30,7 +30,9 @@ use wyrd_spec::verification::{
     VerificationExecutionStatus, VerificationVerdict, VerifierReadiness,
 };
 use wyrd_sql::TenantConn;
-use wyrd_sql::queries::auth::{insert_service_account, provision_system_principal};
+use wyrd_sql::queries::auth::{
+    insert_service_account, provision_system_principal, suspend_service_account_principal,
+};
 use wyrd_sql::queries::cards::{
     NewCardRow, NewDeclarationOperation, insert_card_row, insert_declaration_operation,
 };
@@ -44,7 +46,7 @@ use wyrd_sql::queries::verifier_executions::{
     ExecutionAuthority, ExecutionInput, ExecutionLease, ExecutionOrigin, ExecutionStatus,
     GroupActivity, GroupSelection, PinnedGroup, Prepared, QueueCounts, RetryOutcome,
     ScheduleOutcome, ScheduleSkip, ScheduleTick, ScheduledAdmission, Settlement, Submission,
-    SubmissionOutcome, TerminalStatus, VerifierExecutionQueue,
+    SubmissionOutcome, TerminalDelivery, TerminalStatus, VerifierExecutionQueue,
 };
 use wyrd_sql::row_types::cards::CardStatus;
 
@@ -625,7 +627,7 @@ fn engine_error() -> VerificationError {
 /// Panics when the claim fails or nothing is runnable.
 async fn claim(queue: &VerifierExecutionQueue, conn: &mut TenantConn<'_>) -> ClaimedExecution {
     queue
-        .claim(conn, Duration::minutes(5), 1)
+        .claim(conn, Duration::minutes(5), Duration::minutes(5), 1)
         .await
         .expect("claim runs")
         .pop()
@@ -793,7 +795,7 @@ async fn unrunnable_targets_are_refused() {
     }
     assert!(
         queue
-            .claim(&mut conn, Duration::minutes(5), 1)
+            .claim(&mut conn, Duration::minutes(5), Duration::minutes(5), 1)
             .await
             .expect("claim runs")
             .is_empty(),
@@ -1085,6 +1087,213 @@ async fn concurrent_keyed_writers_serialize_on_the_key() {
     );
 }
 
+/// Revoke `principal` the way its revocation does: suspend the account, then
+/// cancel its unfinished executions, returning how many were cancelled.
+///
+/// # Panics
+/// Panics when the suspension or cancellation fails.
+async fn revoke(
+    queue: &VerifierExecutionQueue,
+    conn: &mut TenantConn<'_>,
+    principal: PrincipalId,
+) -> u64 {
+    assert!(
+        suspend_service_account_principal(conn, principal.as_uuid())
+            .await
+            .expect("account suspends"),
+        "the account exists"
+    );
+    queue
+        .cancel_principal(conn, principal)
+        .await
+        .expect("executions cancel")
+}
+
+/// Assert that `execution` is cancelled because its principal was revoked.
+///
+/// # Panics
+/// Panics when the execution is runnable or settled otherwise.
+async fn assert_revoked(
+    queue: &VerifierExecutionQueue,
+    conn: &mut TenantConn<'_>,
+    execution: ExecutionId,
+) {
+    let state = status(queue, conn, execution).await.state;
+    assert_eq!(state.status, VerificationExecutionStatus::Cancelled);
+    assert_eq!(
+        state.error.map(|error| error.code),
+        Some("principal_revoked".to_owned())
+    );
+}
+
+/// A submission and its principal's revocation order on the principal row
+/// whichever commits first: an admission racing an uncommitted revocation
+/// waits for it and commits cancelled, and a revocation racing an
+/// uncommitted admission waits for it and cancels the committed execution.
+/// Neither order leaves runnable work for a revoked principal.
+///
+/// # Panics
+/// Panics when either contender does not wait, or a revoked principal's
+/// execution stays runnable.
+#[tokio::test]
+async fn revocation_and_admission_order_on_the_principal() {
+    let fixture = PgFixture::start().await.expect("fixture starts");
+    let tenant = fixture.data_tenant_id();
+    let alice = actor(tenant);
+    let queue = VerifierExecutionQueue::default();
+    let mut setup = fixture
+        .tenant_conn()
+        .await
+        .expect("tenant connection opens");
+    let (first_card, first) = declare_service(&mut setup, &alice, "first").await;
+    let (second_card, second) = declare_service(&mut setup, &alice, "second").await;
+    let custom = register_verifier(&mut setup, &alice, "custom", custom_drift()).await;
+    setup.commit().await.expect("setup commits");
+    let mut probe = fixture.tenant_conn().await.expect("probe opens");
+
+    let mut revoker = fixture.tenant_conn().await.expect("revoker opens");
+    assert_eq!(revoke(&queue, &mut revoker, first).await, 0);
+    let late = submission(
+        tenant,
+        owner_authority(tenant, first),
+        request(&custom, &first_card),
+        None,
+    );
+    let mut admitter = fixture.tenant_conn().await.expect("admitter opens");
+    let admission = async {
+        let outcome = accept(&queue, &mut admitter, &late).await;
+        admitter.commit().await.expect("admission commits");
+        outcome
+    };
+    tokio::pin!(admission);
+    let raced = tokio::select! {
+        outcome = &mut admission => Some(outcome),
+        () = await_blocked_backend(&mut probe) => None,
+    };
+    assert_eq!(
+        raced, None,
+        "an admission waits for an uncommitted revocation"
+    );
+    revoker.commit().await.expect("revocation commits");
+    assert_eq!(admission.await, SubmissionOutcome::Accepted);
+    let mut reader = fixture.tenant_conn().await.expect("reader opens");
+    assert_revoked(&queue, &mut reader, late.execution_id).await;
+    reader.rollback().await.expect("reader rolls back");
+
+    let early = submission(
+        tenant,
+        owner_authority(tenant, second),
+        request(&custom, &second_card),
+        None,
+    );
+    let mut admitter = fixture.tenant_conn().await.expect("admitter opens");
+    submitted(&queue, &mut admitter, &early).await;
+    let mut revoker = fixture.tenant_conn().await.expect("revoker opens");
+    let revocation = async {
+        let cancelled = revoke(&queue, &mut revoker, second).await;
+        revoker.commit().await.expect("revocation commits");
+        cancelled
+    };
+    tokio::pin!(revocation);
+    let raced = tokio::select! {
+        cancelled = &mut revocation => Some(cancelled),
+        () = await_blocked_backend(&mut probe) => None,
+    };
+    assert_eq!(
+        raced, None,
+        "a revocation waits for an uncommitted admission"
+    );
+    admitter.commit().await.expect("admission commits");
+    assert_eq!(
+        revocation.await,
+        1,
+        "the revocation cancels the admitted execution"
+    );
+    let mut reader = fixture.tenant_conn().await.expect("reader opens");
+    assert_revoked(&queue, &mut reader, early.execution_id).await;
+}
+
+/// A scheduled occurrence and a group end prepared before their owner's
+/// revocation are admitted cancelled once it is suspended, so a delayed
+/// background admission never revives a revoked owner's work.
+///
+/// # Panics
+/// Panics when either admission is refused or its execution stays runnable.
+#[tokio::test]
+async fn background_admission_of_a_revoked_owner_is_cancelled() {
+    let fixture = PgFixture::start().await.expect("fixture starts");
+    let actor = actor(fixture.data_tenant_id());
+    let queue = VerifierExecutionQueue::default();
+    let mut conn = fixture
+        .tenant_conn()
+        .await
+        .expect("tenant connection opens");
+    provision_system_principal(&mut conn, Attribution::unresolved())
+        .await
+        .expect("the tenant SYSTEM principal provisions");
+    let (owner, principal) = declare_service(&mut conn, &actor, "svc").await;
+    let verifier = register_verifier(&mut conn, &actor, "drift", custom_drift()).await;
+    let binding = bind(&mut conn, &owner, &verifier, Vec::new()).await;
+    record_machine_authentication(&mut conn, principal, &owner)
+        .await
+        .expect("owner activates");
+    let due = database_now(&mut conn).await - SCHEDULE_CLAIM_DELAY;
+    set_cursor(&mut conn, binding, Some(due)).await;
+    let (group_binding, activity) = group_end(&mut conn, &actor, &owner).await;
+    let authority = background(&mut conn, principal).await;
+    queue
+        .record_group_activity(&mut conn, &[activity])
+        .await
+        .expect("activity records");
+    sqlx::query(
+        "UPDATE wyrd.verification_group_pending
+            SET due_at = statement_timestamp() - INTERVAL '1 second'
+          WHERE binding_id = $1",
+    )
+    .bind(group_binding.as_uuid())
+    .execute(&mut **conn.transaction())
+    .await
+    .expect("group expires");
+    let occurrence = scheduled_candidate(&queue, &mut conn, principal).await;
+    let group = queue
+        .claim_due_group(&mut conn, &[])
+        .await
+        .expect("group claims")
+        .expect("an expired group is due");
+    let snapshot = pinned(group_binding, "order-1", &[(ExecutionId::new_v7(), None)]);
+    let Prepared::Candidate(group) = queue
+        .prepare_group(
+            &mut conn,
+            group_binding,
+            &snapshot,
+            &authority,
+            Some(group.generation),
+        )
+        .await
+        .expect("group prepares")
+    else {
+        panic!("expected a group candidate");
+    };
+
+    assert_eq!(revoke(&queue, &mut conn, principal).await, 0);
+    assert_eq!(
+        queue
+            .accept_scheduled(&mut conn, &occurrence)
+            .await
+            .expect("occurrence admits"),
+        EnqueueOutcome::Enqueued(occurrence.execution_id)
+    );
+    assert_eq!(
+        queue
+            .accept_grouped(&mut conn, &group)
+            .await
+            .expect("group admits"),
+        EnqueueOutcome::Enqueued(group.execution_id)
+    );
+    assert_revoked(&queue, &mut conn, occurrence.execution_id).await;
+    assert_revoked(&queue, &mut conn, group.execution_id).await;
+}
+
 /// Wait until some backend of this fixture's database is blocked behind
 /// another transaction's lock.
 ///
@@ -1094,6 +1303,16 @@ async fn concurrent_keyed_writers_serialize_on_the_key() {
 /// # Panics
 /// Panics when the probe query fails or nothing blocks within 30 seconds.
 async fn await_blocked_backend(conn: &mut TenantConn<'_>) {
+    await_blocked_backends(conn, 1).await;
+}
+
+/// Wait until at least `count` backends of this fixture's database are
+/// blocked behind other transactions' locks, as [`await_blocked_backend`]
+/// waits for one.
+///
+/// # Panics
+/// Panics when the probe query fails or too few block within 30 seconds.
+async fn await_blocked_backends(conn: &mut TenantConn<'_>, count: i64) {
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
     loop {
         sqlx::query("SELECT pg_stat_clear_snapshot()")
@@ -1107,7 +1326,7 @@ async fn await_blocked_backend(conn: &mut TenantConn<'_>) {
         .fetch_one(&mut **conn.transaction())
         .await
         .expect("blocked backends count");
-        if blocked > 0 {
+        if blocked >= count {
             return;
         }
         assert!(
@@ -1391,7 +1610,7 @@ async fn reclaimed_lease_fences_the_stale_token() {
     );
     assert!(
         queue
-            .claim(&mut conn, Duration::minutes(5), 1)
+            .claim(&mut conn, Duration::minutes(5), Duration::minutes(5), 1)
             .await
             .expect("claim runs")
             .is_empty(),
@@ -1464,6 +1683,107 @@ async fn reclaimed_lease_fences_the_stale_token() {
     assert_eq!(status.state.status, VerificationExecutionStatus::Completed);
     assert_eq!(status.result_id, Some(result));
     assert_eq!(status.state.error, None);
+}
+
+/// A reclaim keeps the deadline the first claim fixed and never replenishes
+/// what remains of it.
+///
+/// # Panics
+/// Panics when a reclaim moves or replenishes the deadline.
+#[tokio::test]
+async fn reclaims_keep_the_first_deadline() {
+    let fixture = PgFixture::start().await.expect("fixture starts");
+    let actor = actor(fixture.data_tenant_id());
+    let queue = VerifierExecutionQueue::default();
+    let mut conn = fixture
+        .tenant_conn()
+        .await
+        .expect("tenant connection opens");
+    let (owner, _) = declare_service(&mut conn, &actor, "svc").await;
+    let verifier = register_verifier(&mut conn, &actor, "drift", custom_drift()).await;
+    let binding = bind(&mut conn, &owner, &verifier, Vec::new()).await;
+    let execution = scheduled(&queue, &mut conn, binding).await;
+    let stale = claim(&queue, &mut conn).await;
+    expire_deadlines(&mut conn, execution).await;
+    let current = queue
+        .claim(&mut conn, Duration::minutes(5), Duration::hours(1), 1)
+        .await
+        .expect("claim runs")
+        .pop()
+        .expect("the expired lease is reclaimable");
+    assert_eq!(current.lease.execution_id, execution);
+    assert!(
+        current.remaining <= stale.remaining,
+        "a reclaim never replenishes the deadline"
+    );
+    assert!(
+        current.deadline_at <= stale.deadline_at,
+        "a reclaim never moves the deadline later"
+    );
+}
+
+/// Rewrite `execution`'s record format and attempts as a newer or restored
+/// worker would find them.
+///
+/// # Panics
+/// Panics when the update fails.
+async fn set_record(conn: &mut TenantConn<'_>, execution: ExecutionId, format: i32, attempts: i32) {
+    sqlx::query(
+        "UPDATE wyrd.verifier_executions SET worker_format = $2, attempts = $3
+          WHERE execution_id = $1",
+    )
+    .bind(execution.as_uuid())
+    .bind(format)
+    .bind(attempts)
+    .execute(&mut **conn.transaction())
+    .await
+    .expect("record rewrites");
+}
+
+/// A worker never claims, reclaims, or exhausts a record of a newer format:
+/// an expired lease with attempts left and one with none are both left
+/// `running` with their attempts, so their state stays for a worker that
+/// understands it. Once a compatible worker owns the record again, it
+/// reclaims it as the next attempt.
+///
+/// # Panics
+/// Panics when an incompatible record is claimed or settled, or a compatible
+/// worker does not reclaim it.
+#[tokio::test]
+async fn newer_worker_formats_keep_their_records() {
+    let fixture = PgFixture::start().await.expect("fixture starts");
+    let actor = actor(fixture.data_tenant_id());
+    let queue = VerifierExecutionQueue::default();
+    let mut conn = fixture
+        .tenant_conn()
+        .await
+        .expect("tenant connection opens");
+    let (owner, _) = declare_service(&mut conn, &actor, "svc").await;
+    let verifier = register_verifier(&mut conn, &actor, "drift", custom_drift()).await;
+    let binding = bind(&mut conn, &owner, &verifier, Vec::new()).await;
+    let execution = scheduled(&queue, &mut conn, binding).await;
+    let first = claim(&queue, &mut conn).await;
+
+    expire_deadlines(&mut conn, execution).await;
+    for attempts in [1, first.max_attempts] {
+        set_record(&mut conn, execution, 3, attempts).await;
+        let claimed = queue
+            .claim(&mut conn, Duration::minutes(5), Duration::hours(1), 1)
+            .await
+            .expect("claim runs");
+        assert!(claimed.is_empty(), "a newer record is never claimed");
+        let state = status(&queue, &mut conn, execution).await.state;
+        assert_eq!(
+            (state.status, state.error),
+            (VerificationExecutionStatus::Running, None),
+            "a newer record with {attempts} attempts is left as it is"
+        );
+    }
+
+    set_record(&mut conn, execution, 2, 1).await;
+    let reclaimed = claim(&queue, &mut conn).await;
+    assert_eq!(reclaimed.lease.execution_id, execution);
+    assert_eq!(reclaimed.attempt, 2, "the reclaim is the next attempt");
 }
 
 /// A submission's enqueuing cause, including the caller's sampling
@@ -1565,7 +1885,7 @@ async fn retries_back_off_then_exhaust_to_errored() {
         assert_eq!(status.state.error, Some(engine_error()));
         assert!(
             queue
-                .claim(&mut conn, Duration::minutes(5), 1)
+                .claim(&mut conn, Duration::minutes(5), Duration::minutes(5), 1)
                 .await
                 .expect("early claim runs")
                 .is_empty(),
@@ -1600,13 +1920,177 @@ async fn retries_back_off_then_exhaust_to_errored() {
     assert!(status.state.dispatches.is_empty());
 }
 
+/// The stored terminal delivery due time of `execution`.
+///
+/// # Panics
+/// Panics when the read fails.
+async fn delivery_due(conn: &mut TenantConn<'_>, execution: ExecutionId) -> Option<DateTime<Utc>> {
+    sqlx::query_scalar(
+        "SELECT delivery_due_at FROM wyrd.verifier_executions WHERE execution_id = $1",
+    )
+    .bind(execution.as_uuid())
+    .fetch_one(&mut **conn.transaction())
+    .await
+    .expect("the delivery reads")
+}
+
+/// An acknowledged termination owes no delivery, while an owed termination
+/// and a cancellation are due at once and the cancellation fences the worker
+/// it stopped. A delivery claim moves the delivery one lease ahead, so a
+/// claim that dies leaves it due again and only the latest claimant retires
+/// or defers it.
+///
+/// # Panics
+/// Panics when a termination owes the wrong delivery, a stale worker or
+/// claim settles, or a claim selects a delivery that is not due.
+#[tokio::test]
+async fn terminal_deliveries_are_settled_only_by_their_latest_claim() {
+    let fixture = PgFixture::start().await.expect("fixture starts");
+    let actor = actor(fixture.data_tenant_id());
+    let queue = VerifierExecutionQueue::default();
+    let mut conn = fixture
+        .tenant_conn()
+        .await
+        .expect("tenant connection opens");
+    let (owner, _) = declare_service(&mut conn, &actor, "svc").await;
+    let verifier = register_verifier(&mut conn, &actor, "drift", custom_drift()).await;
+    let binding = bind(&mut conn, &owner, &verifier, vec![FrozenTarget::Uid(uid())]).await;
+    let error = engine_error();
+
+    for (delivery, owed) in [
+        (TerminalDelivery::Acknowledged, false),
+        (TerminalDelivery::Owed, true),
+    ] {
+        let execution = scheduled(&queue, &mut conn, binding).await;
+        let claimed = claim(&queue, &mut conn).await;
+        assert_eq!(
+            queue
+                .terminate(
+                    &mut conn,
+                    claimed.lease,
+                    TerminalStatus::Errored,
+                    &error,
+                    delivery
+                )
+                .await
+                .expect("terminate answers"),
+            Settlement::Applied
+        );
+        assert_eq!(delivery_due(&mut conn, execution).await.is_some(), owed);
+    }
+    let cancelled = scheduled(&queue, &mut conn, binding).await;
+    let running = claim(&queue, &mut conn).await;
+    assert!(
+        queue
+            .cancel(&mut conn, cancelled)
+            .await
+            .expect("cancel runs")
+    );
+    assert_eq!(
+        queue
+            .terminate(
+                &mut conn,
+                running.lease,
+                TerminalStatus::Errored,
+                &error,
+                TerminalDelivery::Acknowledged,
+            )
+            .await
+            .expect("terminate answers"),
+        Settlement::StaleLease,
+        "the cancelled worker is fenced"
+    );
+    assert!(delivery_due(&mut conn, cancelled).await.is_some());
+
+    let died = queue
+        .claim_deliveries(&mut conn, Duration::zero(), 10)
+        .await
+        .expect("the deliveries claim");
+    assert_eq!(died.len(), 2, "both owed deliveries are due");
+    let latest = queue
+        .claim_deliveries(&mut conn, Duration::minutes(5), 10)
+        .await
+        .expect("the deliveries claim");
+    assert_eq!(
+        latest
+            .iter()
+            .map(|pending| pending.execution_id)
+            .collect::<BTreeSet<_>>(),
+        died.iter().map(|pending| pending.execution_id).collect(),
+        "a dead claim leaves its deliveries due again"
+    );
+    for pending in &died {
+        assert_eq!(
+            queue
+                .delivered(&mut conn, pending)
+                .await
+                .expect("delivered answers"),
+            Settlement::StaleLease,
+            "a superseded claim retires nothing"
+        );
+    }
+    assert!(
+        queue
+            .claim_deliveries(&mut conn, Duration::minutes(5), 10)
+            .await
+            .expect("the deliveries claim")
+            .is_empty(),
+        "a held claim is not due"
+    );
+    let [deferred, retired] = [&latest[0], &latest[1]];
+    assert_eq!(
+        queue
+            .redeliver(&mut conn, deferred, Duration::zero())
+            .await
+            .expect("redeliver answers"),
+        Settlement::Applied
+    );
+    assert_eq!(
+        queue
+            .delivered(&mut conn, deferred)
+            .await
+            .expect("delivered answers"),
+        Settlement::StaleLease,
+        "a deferred claim no longer holds the delivery"
+    );
+    assert_eq!(
+        queue
+            .delivered(&mut conn, retired)
+            .await
+            .expect("delivered answers"),
+        Settlement::Applied
+    );
+    assert_eq!(delivery_due(&mut conn, retired.execution_id).await, None);
+    let again = queue
+        .claim_deliveries(&mut conn, Duration::minutes(5), 10)
+        .await
+        .expect("the deliveries claim");
+    assert_eq!(
+        again
+            .iter()
+            .map(|pending| pending.execution_id)
+            .collect::<Vec<_>>(),
+        [deferred.execution_id],
+        "only the deferred delivery is due again"
+    );
+    assert_eq!(
+        queue
+            .delivered(&mut conn, &again[0])
+            .await
+            .expect("delivered answers"),
+        Settlement::Applied
+    );
+    assert_eq!(delivery_due(&mut conn, deferred.execution_id).await, None);
+}
+
 /// Cancelled and timed-out executions settle with their error and no result, and a
-/// crash on the final attempt is settled `errored` by the next claim instead of
-/// being reclaimed past the budget.
+/// crash on the final attempt is claimed once more as exhausted, counting no
+/// attempt, so its claimant can deliver an already selected outcome or
+/// settle the exhaustion; only a counted attempt computes.
 ///
 /// # Panics
 /// Panics when a terminal status carries a result or dispatch, or an
-/// exhausted expired lease is reclaimed.
+/// exhausted expired lease is claimed as a counted attempt.
 #[tokio::test]
 async fn terminal_failures_and_expired_final_attempts_carry_no_verdict() {
     let fixture = PgFixture::start().await.expect("fixture starts");
@@ -1635,7 +2119,13 @@ async fn terminal_failures_and_expired_final_attempts_carry_no_verdict() {
         let claimed = claim(&queue, &mut conn).await;
         assert_eq!(
             queue
-                .terminate(&mut conn, claimed.lease, terminal, &error)
+                .terminate(
+                    &mut conn,
+                    claimed.lease,
+                    terminal,
+                    &error,
+                    TerminalDelivery::Acknowledged,
+                )
                 .await
                 .expect("terminate answers"),
             Settlement::Applied
@@ -1652,17 +2142,49 @@ async fn terminal_failures_and_expired_final_attempts_carry_no_verdict() {
     }
 
     let execution = scheduled(&queue, &mut conn, binding).await;
-    for _ in 0..3 {
-        claim(&queue, &mut conn).await;
+    for attempt in 1..=3 {
+        let claimed = claim(&queue, &mut conn).await;
+        assert_eq!(
+            (claimed.attempt, claimed.exhausted),
+            (attempt, false),
+            "each attempt within the budget computes"
+        );
         expire_deadlines(&mut conn, execution).await;
     }
+    for _ in 0..2 {
+        let claimed = claim(&queue, &mut conn).await;
+        assert_eq!(
+            (claimed.attempt, claimed.exhausted),
+            (3, true),
+            "an expired final attempt is claimed again without counting one"
+        );
+        expire_deadlines(&mut conn, execution).await;
+    }
+    let claimed = claim(&queue, &mut conn).await;
+    let exhausted = VerificationError {
+        code: "lease_expired".to_owned(),
+        message: "the execution's lease expired after its final attempt".to_owned(),
+    };
+    assert_eq!(
+        queue
+            .terminate(
+                &mut conn,
+                claimed.lease,
+                TerminalStatus::Errored,
+                &exhausted,
+                TerminalDelivery::Acknowledged,
+            )
+            .await
+            .expect("terminate answers"),
+        Settlement::Applied
+    );
     assert!(
         queue
-            .claim(&mut conn, Duration::minutes(5), 1)
+            .claim(&mut conn, Duration::minutes(5), Duration::minutes(5), 1)
             .await
             .expect("claim runs")
             .is_empty(),
-        "an exhausted expired lease is not reclaimed"
+        "a settled exhaustion is not claimed again"
     );
     let status = queue
         .execution_status(&mut conn, execution)
@@ -1966,7 +2488,7 @@ async fn queue_state_is_tenant_isolated() {
     );
     assert!(
         queue
-            .claim(&mut foreign, Duration::minutes(5), 1)
+            .claim(&mut foreign, Duration::minutes(5), Duration::minutes(5), 1)
             .await
             .expect("foreign claim runs")
             .is_empty()
@@ -2186,7 +2708,7 @@ async fn database_clock_owns_verifier_queue_deadlines() {
     );
     assert!(
         queue
-            .claim(&mut conn, Duration::minutes(5), 1)
+            .claim(&mut conn, Duration::minutes(5), Duration::minutes(5), 1)
             .await
             .expect("early claim runs")
             .is_empty(),
@@ -3038,7 +3560,7 @@ async fn group_snapshots_are_idempotent_and_react_in_settlement_order() {
     );
     assert!(
         queue
-            .claim(&mut conn, Duration::minutes(5), 1)
+            .claim(&mut conn, Duration::minutes(5), Duration::minutes(5), 1)
             .await
             .expect("claim runs")
             .is_empty(),
@@ -3194,15 +3716,15 @@ async fn a_claim_takes_up_to_its_limit_in_one_statement() {
     }
 
     let first = queue
-        .claim(&mut conn, Duration::minutes(5), 2)
+        .claim(&mut conn, Duration::minutes(5), Duration::minutes(5), 2)
         .await
         .expect("claim runs");
     let rest = queue
-        .claim(&mut conn, Duration::minutes(5), 5)
+        .claim(&mut conn, Duration::minutes(5), Duration::minutes(5), 5)
         .await
         .expect("claim runs");
     let drained = queue
-        .claim(&mut conn, Duration::minutes(5), 5)
+        .claim(&mut conn, Duration::minutes(5), Duration::minutes(5), 5)
         .await
         .expect("claim runs");
 

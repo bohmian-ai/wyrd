@@ -162,9 +162,9 @@ class Observe:
     ) -> Execution | Recorded:
         """Submit evidence for the bound Verifier ``verifier`` without waiting.
 
-        Run evidence is staged for one queued ``wyrd.verify.Execution`` and
-        its handle is returned; acceptance confirms staging only, and an idempotency
-        conflict surfaces later through ``wait``. Scheduled-window samples are
+        Run evidence is admitted for one queued ``wyrd.verify.Execution`` and
+        its handle is returned once admission is durable; an idempotency
+        conflict is raised. Scheduled-window samples are
         recorded for the Verifier's schedule and ``Recorded`` is returned.
 
         Args:

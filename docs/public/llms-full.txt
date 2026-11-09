@@ -3774,14 +3774,18 @@ A Verifier's Agent calls server built-in tools, named in its `tool_names`. There
 | `fs.read` | Reads a UTF-8 workspace file's actual lines, with `lines` locators and a resumable `next` | Workspace only |
 | `fs.search` | Finds matching lines: literal and case-insensitive by default, or `regex`, `case_sensitive`, a `path` file or directory scope, and a filename `glob` | Workspace only |
 | `fs.extract` | Extracts one supported `/inputs` document to a new `/work` `output_path` as extraction JSON | Workspace only |
+| `fs.write` | Creates or replaces one UTF-8 file under `/work`, creating its parent directories, and returns `path` and `bytes` | Workspace only |
 | `code.run` | Runs sandboxed Python against the workspace | Workspace only |
+| `publish` | Retains one `/work` file or directory, or one JSON value, under a logical `name` for the steps that read this step's publications; returns `{name, kind}` | Step Agents only |
 
 Results are capped by `WYRD_VERIFICATION_TOOL_RESULT_MAX_KIB` ([limits](/wyrd/reference/verification-runtime-limits/)). Each call is recorded in the step's `tool_calls` as `tool`, `arguments`, `output_sha256` (absent when nothing was returned), `returned_bytes`, and `error` (present when the call failed).
 
 ## Rules
 
-- A step Agent with `fs.*` or `code.run` needs a `workspace`, and a `workspace` needs one of them.
-- Step and check Agents follow the same rules: a check Agent may declare any tool and a `workspace`, and each call still needs its grants.
+- `fs.write`, `code.run`, and `publish` get private `/work` scratch without a `workspace`. `fs.list`, `fs.read`, `fs.search`, and `fs.extract` need a `workspace` or one of `fs.write` and `code.run` beside them. A `workspace` needs a tool that uses it.
+- `/work` belongs to one invocation attempt. A later step, a retry, or a sibling never sees it; only what `publish` accepts reaches other steps.
+- Each tool is named once. The provider-facing spelling, such as `fs_write`, is not a tool name.
+- Step and check Agents follow the same rules, except that only a step Agent may declare `publish`. Each call still needs its grants.
 - Nothing is parsed unless the Agent calls `fs.extract`; `fs.read` and `fs.search` serve raw text and refuse or skip binary files.
 
 ## Permissions
@@ -3795,9 +3799,17 @@ Every call needs both a `tool:invoke` grant and the tool's resource permission. 
 
 The scope is `all` or one exact tool name, never a pattern. A call runs as the principal that started the verification, or the binding owner for a scheduled one; delegation can narrow that authority but never widen it. `verifier:run` and declaring a tool grant nothing.
 
+## Publishing
+
+`publish` takes a `name` matching `^[A-Za-z0-9_-]{1,64}$` and exactly one source: `path`, an existing `/work` file or whole directory, or `value`, any JSON value including `null`. A path is snapshotted when the call runs, so later writes do not change the publication; directories keep empty subdirectories and their actual filenames. The receipt is `{"name": ..., "kind": "file" | "directory" | "json"}` and is returned only after the execution accepts the publication.
+
+A name is unique within one step attempt: publishing it again in that attempt is refused, while a fresh retry of the step may reuse it and is attributed to its own attempt. The server records the producing step, item, iteration, and attempt; no argument can set them. A replayed provider tool call returns its original receipt. A final answer is not a publication.
+
+A later step mounts `steps.<id>.publications.<name>` or the whole `steps.<id>.publications` collection, whose `manifest.json` lists each entry's actual path. A step whose named publication is missing fails before its model call. Publications read back through the execution's publication endpoints with their manifests and download plans.
+
 ## Failed tool calls
 
-A failed call does not end the step. The model receives `code`, `error`, and, for a call it can repair, `details`, then may call again; the step's `tool_calls` record keeps the `error`. An `fs.*` call that breaks one of the rules below returns `WYRD_SPEC_400_VALIDATION` with `details` naming the `rule`, the argument `field`, its `value`, and what was `expected`. A local IO failure returns `SKALD_TOOL_500_CALL` without `details`.
+A failed call does not end the step. The model receives `code`, `error`, and, for a call it can repair, `details`, then may call again; the step's `tool_calls` record keeps the `error`. An `fs.*` or `publish` call that breaks one of the rules below returns `WYRD_SPEC_400_VALIDATION` with `details` naming the `rule`, the argument `field`, its `value`, and what was `expected`. A local IO failure returns `SKALD_TOOL_500_CALL` without `details`.
 
 | Rule | Cause |
 | --- | --- |
@@ -3813,14 +3825,22 @@ A failed call does not end the step. The model receives `code`, `error`, and, fo
 | `extraction_refused` | `fs.extract` names a malformed document or one over the extraction limits |
 | `output_path` | `output_path` is not a new file path under `/work` |
 | `output_exists` | `output_path` already exists |
-| `work_budget` | The file or the extraction exceeds the `/work` write budget |
+| `work_budget` | The file, the written content, or the extraction exceeds the `/work` write budget |
+| `write_path` | `fs.write` names `/inputs`, `/work` itself, or a path outside `/work` or with an empty, `.`, or `..` segment |
+| `write_parent` | An `fs.write` parent is a file or a link |
+| `publication_path` | `publish` names a `path` outside `/work` |
+| `publication_source` | `publish` has both or neither of `path` and `value` |
+| `publication_name` | The `name` was already published in this step attempt |
+| `publication_tree` | A published directory holds an entry the tree rules refuse |
+| `publication_size` | A published `value` or file exceeds its limit |
+| `publication_count`, `publication_bytes` | The execution's publications would exceed their count or retained-byte limit |
 
 ## Errors
 
 | Code | Cause |
 | --- | --- |
 | `WYRD_PERMISSION_403_DENIED_RBAC` | The principal lacks `tool:invoke` or the resource permission; the call returns no data |
-| `WYRD_SPEC_400_VALIDATION`, rule `agent_tools` | Unknown tool name, `fs.*` without a workspace, or a workspace without `fs.*` or `code.run` |
+| `WYRD_SPEC_400_VALIDATION`, rule `agent_tools` | Unknown or repeated tool name, a reading `fs.*` tool without a workspace or scratch writer, a workspace without a tool that uses it, or `publish` on a check Agent |
 | `WYRD_SPEC_400_VALIDATION`, rule `workspace_path` | A `workspace` key is not `/inputs/<name>[/<name>...]`, contains `.` or `..`, or overlaps another mount |
 | `WYRD_SPEC_400_VALIDATION`, rule `workspace_artifact` | A workspace `artifact` selection does not reference an Artifact Card |
 
@@ -3838,8 +3858,9 @@ Environment variables on `wyrd-server`, read once at startup; a change takes a r
 | --- | ---: | --- |
 | `WYRD_VERIFICATION_ENABLED` | `1` | Whether an API-serving process runs Verifiers: `1` or `0`. Also `[verification] enabled` in TOML |
 | `WYRD_VERIFICATION_TIMEOUT_MS` | 60000 | The whole `verify` call |
-| `WYRD_VERIFICATION_FILE_MAX_MIB` | 20 | One input file |
-| `WYRD_VERIFICATION_FILES_MAX_MIB` | 100 | All input files of one request or one workspace together |
+| `WYRD_VERIFICATION_FILE_MAX_MIB` | 20 | One input file, and one file a publication retains |
+| `WYRD_VERIFICATION_FILES_MAX_MIB` | 100 | All input files of one request or one workspace together, and all bytes one execution's publications retain |
+| `WYRD_VERIFICATION_PUBLICATIONS_MAX` | 1000 | Publications one execution accepts across all its attempts |
 | `WYRD_VERIFICATION_ARCHIVE_MAX_MIB` | 200 | Decompressed bytes of one archive, including DOCX, XLSX, and PPTX containers |
 | `WYRD_VERIFICATION_ARCHIVE_MAX_ENTRIES` | 10000 | Entries in one archive |
 | `WYRD_VERIFICATION_ARCHIVE_MAX_RATIO` | 100 | Decompressed-to-compressed size ratio of one archive |
@@ -3894,6 +3915,7 @@ Live workers are capped by `MONTY_MAX_WORKERS` and by `MONTY_POOL_MEMORY_MIB / M
 | `TIMEOUT_MS` in `verify` | `WYRD_VERIFICATION_504_EXECUTION_TIMED_OUT` |
 | No Python worker or workspace free | Direct call: `WYRD_SERVER_503_SERVICE_UNAVAILABLE`. Queued: stays queued, attempt not counted |
 | Verification disabled on this process | `WYRD_SERVER_503_SERVICE_UNAVAILABLE` |
+| A publication over `FILE_MAX_MIB`, `FILES_MAX_MIB`, or `PUBLICATIONS_MAX` | The publish call is refused with the limit and nothing is published; the execution's accepted publications and their totals survive retries and recovery |
 | Any other limit in a step or check, including `AGENT_CODE_BUDGET_MS` | The step fails or the check is `inconclusive`, with the limit in its `reason` |
 
 # MCP tools
@@ -3935,10 +3957,15 @@ Tool names contain dots, which many model providers refuse, so each framework fo
 | `cards.list` | `cards:read` | List filters and optional cursor → `{items, next_cursor}` | List Card summaries |
 | `cards.get` | `cards:read` | `{card_ref}` or `{kind, card_uid}` → `{card, created_at, updated_at}` | Read one Card; pass exactly one form |
 | `verification.get_binding` | `cards:read` | `{binding_id}` → binding status | Read one binding |
-| `verification.get_execution` | `cards:read` | `{execution_id}` → execution status | Read one execution |
+| `verification.get_execution` | `verifier:read` on the execution's Verifier | `{execution_id}` → execution status | Read one execution |
+| `verification.list_invocations` | `verifier:read` on the execution's Verifier | `{execution_id, limit?, cursor?}` → `{execution_id, status, items, next_cursor, history}` | Page invocation attempts and their progress |
+| `verification.list_publications` | `verifier:read` on the execution's Verifier | `{execution_id, limit?, cursor?}` → `{execution_id, items, next_cursor}` | Page publication names, kinds, and producers |
+| `verification.get_publication` | `verifier:read` on the execution's Verifier | `{execution_id, step_id, name, attempt, item_index?, iteration_index?}` → publication | Read one publication's JSON value or manifest |
+| `verification.download_publication` | `verifier:read` on the execution's Verifier | The `verification.get_publication` arguments plus `path` for a directory → `{plan, size_bytes, sha256}` | Plan one publication file's download |
 | `verification.evidence` | `verifier:run` | `{files: [{sha256, size_bytes}]}` → `{uploads: [{sha256, upload_id, plan}]}` | Plan uploads for files the tenant lacks; complete each with `POST /v1/cards/upload/{upload_id}/complete` |
 | `verification.execute` | `verifier:run` on exact Verifier | Verifier, subject, optional `run_id`, and named input declarations → `VerificationResult` | Verify now and store the result; no Operator dispatch |
 | `verification.enqueue` | `verifier:run` on exact Verifier | The `verification.execute` arguments plus optional `idempotency_key` → `{execution_id}` | Queue a verification; poll `verification.get_execution` |
+| `verification.cancel` | `verifier:run` on the execution's Verifier | `{execution_id}` → `{execution_id, status}` | Cancel unfinished queued work; settled work keeps its status |
 
 `cards.list.filter` is a query string, such as `labels.env = "prod" and labels.deprecated not exists`, over `labels.<key>`, `annotations.<key>`, and `attributes.<key>`, with `=`, `in`, `not exists`, `and`, `or`, and `not`; at most 64 predicates. A caller passes `next_cursor` back unchanged with the same filters. Missing and foreign-tenant Cards look the same. `verification.execute` refuses a scheduled drift Verifier.
 
@@ -4343,6 +4370,7 @@ This page is generated from the error definitions in the Wyrd source.
 | `WYRD_SDK_409_BIFROST_CLOSED` | 409 | WyrdState Bifrost writer is closed | Create a new WyrdState and start its Bifrost writer; a shut-down state stays closed to writes. |
 | `WYRD_SDK_409_STATE_CONFIG_FROZEN` | 409 | WyrdState configuration is already fixed | Call configure once, before startup and before opening a Run, or construct another WyrdState for a different configuration. |
 | `WYRD_SDK_409_TELEMETRY_PROVIDER_EXISTS` | 409 | An OpenTelemetry provider is already installed | Add each state's Wyrd span, log, and metric exporters to the application's own providers instead of calling start_telemetry. |
+| `WYRD_SDK_409_VERIFICATION_CANCELLED` | 409 | Verification execution was cancelled | Read the execution's accepted evidence, or submit the verification again; a cancelled execution never resumes. |
 | `WYRD_SDK_422_VERIFICATION_DATA_INVALID` | 422 | Verification data does not match the requested type | Match the requested type to the check's declared data schema, use a union or decoder for mixed shapes, or read the result without a type. |
 | `WYRD_SDK_503_TELEMETRY_FLUSH_FAILED` | 503 | Telemetry flush failed | Check the OpenTelemetry exporter's logs and the state's credentials, then retry flush or shutdown. |
 | `WYRD_SDK_504_TELEMETRY_FLUSH_TIMEOUT` | 504 | Telemetry flush timed out | Check that the Wyrd server's OTLP endpoint is reachable, raise the OpenTelemetry SDK export timeout if spans are large, and retry flush or shutdown. |
@@ -4488,6 +4516,7 @@ This page is generated from the error definitions in the Wyrd source.
 | `WYRD_VALA_404_BIFROST_TABLE_NOT_FOUND` | 404 | Bifrost table not found | Create the table via the catalog API before writing or querying. |
 | `WYRD_VALA_404_RUNNING_QUERY_NOT_FOUND` | 404 | Running query not found | Verify the request identity or list currently running queries for the authenticated tenant. |
 | `WYRD_VALA_404_TRACE_NOT_FOUND` | 404 | Trace not found | Confirm the trace_id and that it falls within the queried time window. |
+| `WYRD_VALA_409_BIFROST_BATCH_CONFLICT` | 409 | Batch id already committed with different rows | Another batch already committed this batch_id with different rows. Read the table to learn what was accepted; send new rows under a new batch_id. |
 | `WYRD_VALA_409_BIFROST_COMMIT_CONFLICT` | 409 | Concurrent OLAP commit conflict | Retry the write; another writer committed to the same table concurrently. |
 | `WYRD_VALA_409_BIFROST_COMPACTION_TARGET_MISMATCH` | 409 | Bifrost compaction target mismatch | Retry with the table's registered compaction target, omit it, or register a different table. |
 | `WYRD_VALA_409_BIFROST_COMPACTION_TYPE_MISMATCH` | 409 | Bifrost compaction type mismatch | Retry with the table's registered compaction type, omit it, or register a different table. |
@@ -4544,6 +4573,7 @@ This page is generated from the error definitions in the Wyrd source.
 | `WYRD_VERIFICATION_400_INVALID_WINDOW` | 400 | Invalid Drift window | Send a UTC half-open drift_window with start before end spanning at most 31 days. |
 | `WYRD_VERIFICATION_404_BINDING_NOT_FOUND` | 404 | Verification binding not found | Read the owner Card's card.status.verification.binding_ids and retry with one of those binding IDs. |
 | `WYRD_VERIFICATION_404_EXECUTION_NOT_FOUND` | 404 | Verification execution not found | Use the execution_id returned by POST /v1/verification/enqueue in the same tenant; a just-accepted execution may take a moment to become visible. |
+| `WYRD_VERIFICATION_404_PUBLICATION_NOT_FOUND` | 404 | Verification publication not found | List GET /v1/verification/executions/`{execution_id}`/publications and select a listed name with its exact producer attempt, item_index, and iteration_index. |
 | `WYRD_VERIFICATION_404_TARGET_NOT_FOUND` | 404 | Verification target not found | Use an active Verifier Card UID and an active subject Card UID declared in the caller's tenant. |
 | `WYRD_VERIFICATION_409_BASELINE_LEGACY` | 409 | Verification baseline legacy | Register a new Verifier version so its baseline is refitted under the current format. |
 | `WYRD_VERIFICATION_409_BASELINE_NOT_READY` | 409 | Verification baseline not ready | Poll the Verifier Card's card.status.verification.baseline until it is ready, then retry. |

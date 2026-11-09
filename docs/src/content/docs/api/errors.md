@@ -323,6 +323,7 @@ This page is generated from the error definitions in the Wyrd source.
 | `WYRD_SDK_409_BIFROST_CLOSED` | 409 | WyrdState Bifrost writer is closed | Create a new WyrdState and start its Bifrost writer; a shut-down state stays closed to writes. |
 | `WYRD_SDK_409_STATE_CONFIG_FROZEN` | 409 | WyrdState configuration is already fixed | Call configure once, before startup and before opening a Run, or construct another WyrdState for a different configuration. |
 | `WYRD_SDK_409_TELEMETRY_PROVIDER_EXISTS` | 409 | An OpenTelemetry provider is already installed | Add each state's Wyrd span, log, and metric exporters to the application's own providers instead of calling start_telemetry. |
+| `WYRD_SDK_409_VERIFICATION_CANCELLED` | 409 | Verification execution was cancelled | Read the execution's accepted evidence, or submit the verification again; a cancelled execution never resumes. |
 | `WYRD_SDK_422_VERIFICATION_DATA_INVALID` | 422 | Verification data does not match the requested type | Match the requested type to the check's declared data schema, use a union or decoder for mixed shapes, or read the result without a type. |
 | `WYRD_SDK_503_TELEMETRY_FLUSH_FAILED` | 503 | Telemetry flush failed | Check the OpenTelemetry exporter's logs and the state's credentials, then retry flush or shutdown. |
 | `WYRD_SDK_504_TELEMETRY_FLUSH_TIMEOUT` | 504 | Telemetry flush timed out | Check that the Wyrd server's OTLP endpoint is reachable, raise the OpenTelemetry SDK export timeout if spans are large, and retry flush or shutdown. |
@@ -468,6 +469,7 @@ This page is generated from the error definitions in the Wyrd source.
 | `WYRD_VALA_404_BIFROST_TABLE_NOT_FOUND` | 404 | Bifrost table not found | Create the table via the catalog API before writing or querying. |
 | `WYRD_VALA_404_RUNNING_QUERY_NOT_FOUND` | 404 | Running query not found | Verify the request identity or list currently running queries for the authenticated tenant. |
 | `WYRD_VALA_404_TRACE_NOT_FOUND` | 404 | Trace not found | Confirm the trace_id and that it falls within the queried time window. |
+| `WYRD_VALA_409_BIFROST_BATCH_CONFLICT` | 409 | Batch id already committed with different rows | Another batch already committed this batch_id with different rows. Read the table to learn what was accepted; send new rows under a new batch_id. |
 | `WYRD_VALA_409_BIFROST_COMMIT_CONFLICT` | 409 | Concurrent OLAP commit conflict | Retry the write; another writer committed to the same table concurrently. |
 | `WYRD_VALA_409_BIFROST_COMPACTION_TARGET_MISMATCH` | 409 | Bifrost compaction target mismatch | Retry with the table's registered compaction target, omit it, or register a different table. |
 | `WYRD_VALA_409_BIFROST_COMPACTION_TYPE_MISMATCH` | 409 | Bifrost compaction type mismatch | Retry with the table's registered compaction type, omit it, or register a different table. |
@@ -524,6 +526,7 @@ This page is generated from the error definitions in the Wyrd source.
 | `WYRD_VERIFICATION_400_INVALID_WINDOW` | 400 | Invalid Drift window | Send a UTC half-open drift_window with start before end spanning at most 31 days. |
 | `WYRD_VERIFICATION_404_BINDING_NOT_FOUND` | 404 | Verification binding not found | Read the owner Card's card.status.verification.binding_ids and retry with one of those binding IDs. |
 | `WYRD_VERIFICATION_404_EXECUTION_NOT_FOUND` | 404 | Verification execution not found | Use the execution_id returned by POST /v1/verification/enqueue in the same tenant; a just-accepted execution may take a moment to become visible. |
+| `WYRD_VERIFICATION_404_PUBLICATION_NOT_FOUND` | 404 | Verification publication not found | List GET /v1/verification/executions/`{execution_id}`/publications and select a listed name with its exact producer attempt, item_index, and iteration_index. |
 | `WYRD_VERIFICATION_404_TARGET_NOT_FOUND` | 404 | Verification target not found | Use an active Verifier Card UID and an active subject Card UID declared in the caller's tenant. |
 | `WYRD_VERIFICATION_409_BASELINE_LEGACY` | 409 | Verification baseline legacy | Register a new Verifier version so its baseline is refitted under the current format. |
 | `WYRD_VERIFICATION_409_BASELINE_NOT_READY` | 409 | Verification baseline not ready | Poll the Verifier Card's card.status.verification.baseline until it is ready, then retry. |

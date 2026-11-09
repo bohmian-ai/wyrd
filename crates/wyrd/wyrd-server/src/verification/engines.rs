@@ -108,6 +108,8 @@ mod tests {
         RequirementResult {
             id: TaskId::new(id).expect("valid task id"),
             step: None,
+            item_index: None,
+            iteration_index: None,
             statement: id.to_owned(),
             outcome: RequirementOutcome::Failed,
             reason: "failed".to_owned(),

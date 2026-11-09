@@ -14,8 +14,13 @@ use serde_json::json;
 use tokio::time::Instant;
 use wyrd_spec::error::WyrdError;
 use wyrd_spec::ids::ExecutionId;
+use wyrd_spec::storage::download::DownloadInitResponse;
 use wyrd_spec::verification::VerificationExecutionStatus;
-use wyrd_spec::verification::execution::{VerificationExecutionState, VerificationResult};
+use wyrd_spec::verification::execution::{
+    CancelExecutionResponse, ExecutionPageQuery, InvocationPage, Publication, PublicationPage,
+    PublicationSelector, VerificationExecutionState, VerificationResult,
+};
+use wyrd_spec::verification::{PublicationName, TaskId};
 
 use crate::client::WyrdClient;
 use crate::error::code_to_wyrd_error;
@@ -87,6 +92,169 @@ impl Execution {
             .await
     }
 
+    /// Read one page of the execution's checkpointed invocation attempts,
+    /// with its status and history projection position.
+    ///
+    /// Progress reads from the execution's records, so it is current while
+    /// history projection lags. Follow `next_cursor` unchanged to read the
+    /// rest of the same listing cut; start without a cursor to see attempts
+    /// committed since.
+    ///
+    /// # Arguments
+    /// * `page` - Page size and continuation.
+    ///
+    /// # Errors
+    /// Returns the server's validation error for a limit outside 1–200 or a
+    /// cursor of another listing, its permission error without
+    /// `verifier:read` on the execution's Verifier, its not-found error for
+    /// an execution not visible to the caller's tenant, and transport errors.
+    ///
+    /// # Panics
+    /// Never in practice: a page query of optional scalars always URL-encodes.
+    pub async fn invocations(
+        &self,
+        page: &ExecutionPageQuery,
+    ) -> Result<InvocationPage, WyrdError> {
+        self.get(&format!("invocations?{}", Self::query(page)))
+            .await
+    }
+
+    /// Read one page of the execution's accepted publications, names, kinds,
+    /// and producers only, without loading any content.
+    ///
+    /// # Arguments
+    /// * `page` - Page size and continuation.
+    ///
+    /// # Errors
+    /// Returns the errors of [`Execution::invocations`].
+    ///
+    /// # Panics
+    /// Never in practice: a page query of optional scalars always URL-encodes.
+    pub async fn publications(
+        &self,
+        page: &ExecutionPageQuery,
+    ) -> Result<PublicationPage, WyrdError> {
+        self.get(&format!("publications?{}", Self::query(page)))
+            .await
+    }
+
+    /// Read publication `name` of `step`'s exact producer attempt: a JSON
+    /// publication's value, `null` included, or a file or directory
+    /// publication's manifest.
+    ///
+    /// # Arguments
+    /// * `step` - The producing step.
+    /// * `name` - The publication's logical name.
+    /// * `selector` - The exact attempt, item, and iteration a listing reports.
+    ///
+    /// # Errors
+    /// Returns the errors of [`Execution::invocations`], and
+    /// `WYRD_VERIFICATION_404_PUBLICATION_NOT_FOUND` when that producer
+    /// attempt accepted no publication of that name.
+    ///
+    /// # Panics
+    /// Never in practice: a selector of scalars always URL-encodes.
+    pub async fn publication(
+        &self,
+        step: &TaskId,
+        name: &PublicationName,
+        selector: &PublicationSelector,
+    ) -> Result<Publication, WyrdError> {
+        self.get(&format!(
+            "publications/{}/{}?{}",
+            step.as_str(),
+            name.as_str(),
+            Self::query(selector)
+        ))
+        .await
+    }
+
+    /// Plan the download of a file publication, or of the regular file at
+    /// `selector.path` of a directory publication, as the shared File
+    /// download plan.
+    ///
+    /// # Arguments
+    /// * `step` - The producing step.
+    /// * `name` - The publication's logical name.
+    /// * `selector` - The exact producer attempt, and a directory file's path.
+    ///
+    /// # Errors
+    /// Returns the errors of [`Execution::publication`], the validation error
+    /// for a JSON publication, a missing or unlisted directory path, or a
+    /// path on a file publication, and
+    /// `WYRD_VALA_503_QUERY_VISIBILITY_UNAVAILABLE` while the File's
+    /// completed record is not yet visible.
+    ///
+    /// # Panics
+    /// Never in practice: a selector of scalars always URL-encodes.
+    pub async fn download(
+        &self,
+        step: &TaskId,
+        name: &PublicationName,
+        selector: &PublicationSelector,
+    ) -> Result<DownloadInitResponse, WyrdError> {
+        self.client
+            .http
+            .request_json::<(), _>(
+                Method::POST,
+                &format!(
+                    "/v1/verification/executions/{}/publications/{}/{}/download?{}",
+                    self.id,
+                    step.as_str(),
+                    name.as_str(),
+                    Self::query(selector)
+                ),
+                None,
+            )
+            .await
+    }
+
+    /// Cancel the execution if it is unfinished, returning its status after
+    /// the durable cancellation fence.
+    ///
+    /// Unfinished work becomes `cancelled`; its checkpoints and
+    /// publications are kept and its worker is fenced. Already terminal work
+    /// keeps its status and result. Repeating it is harmless.
+    ///
+    /// # Errors
+    /// Returns the server's permission error without `verifier:run` on the
+    /// execution's Verifier, its not-found error for an execution not visible
+    /// to the caller's tenant, and transport errors.
+    pub async fn cancel(&self) -> Result<CancelExecutionResponse, WyrdError> {
+        self.client
+            .http
+            .request_json::<(), _>(
+                Method::POST,
+                &format!("/v1/verification/executions/{}/cancel", self.id),
+                None,
+            )
+            .await
+    }
+
+    /// `GET` the execution's sub-resource `tail`.
+    ///
+    /// # Errors
+    /// Returns the server's or transport's error.
+    async fn get<D: DeserializeOwned>(&self, tail: &str) -> Result<D, WyrdError> {
+        self.client
+            .http
+            .request_json::<(), _>(
+                Method::GET,
+                &format!("/v1/verification/executions/{}/{tail}", self.id),
+                None,
+            )
+            .await
+    }
+
+    /// `query` URL-encoded.
+    ///
+    /// # Panics
+    /// Panics when `query` holds a value that cannot URL-encode, which no
+    /// query of optional scalars does.
+    fn query(query: &impl serde::Serialize) -> String {
+        serde_urlencoded::to_string(query).expect("a query of optional scalars always URL-encodes")
+    }
+
     /// Poll until the execution yields a result, fails, or `timeout` passes.
     ///
     /// Equivalent to [`Execution::wait_until`] with a deadline `timeout`
@@ -121,9 +289,10 @@ impl Execution {
     /// * `deadline` - When to stop polling.
     ///
     /// # Errors
-    /// Returns the execution's own structured error when it settled as
-    /// errored, cancelled, or timed out, including a delayed
-    /// idempotency conflict; [`Execution::wait_timed_out`]'s error when
+    /// Returns `WYRD_SDK_409_VERIFICATION_CANCELLED` with the execution's
+    /// `execution_id` and `status` when it was cancelled; the execution's own
+    /// structured error when it settled as errored or timed out;
+    /// [`Execution::wait_timed_out`]'s error when
     /// `deadline` passes first; and any other status-read error unchanged.
     ///
     /// # Cancellation
@@ -151,6 +320,12 @@ impl Execution {
                         error,
                     ) => {
                         let details = json!({ "execution_id": self.id, "status": state.status });
+                        if state.status == VerificationExecutionStatus::Cancelled {
+                            return Err(WyrdError::SdkVerificationCancelled {
+                                message: format!("execution {} was cancelled", self.id),
+                                details,
+                            });
+                        }
                         return Err(match error {
                             Some(error) => code_to_wyrd_error(&error.code, error.message, details),
                             None => WyrdError::Internal {

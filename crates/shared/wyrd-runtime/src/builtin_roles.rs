@@ -19,9 +19,10 @@ pub struct BuiltinRole {
 
 /// Every read a tenant principal can be granted: Cards, artifacts, audit,
 /// Operators, gateway configuration and captured payloads, Bifrost table
-/// definitions, and Bifrost queries.
+/// definitions, Bifrost queries, and Verifier execution inspection.
 const VIEWER: &[Permission] = &[
     Permission::card_read(),
+    Permission::verifier_read_any(),
     Permission::artifact_read(),
     Permission::audit_read(),
     Permission::operators_read(),
@@ -36,6 +37,7 @@ const VIEWER: &[Permission] = &[
 /// Verifier, Trigger writes, Operator invocation, and gateway invocation on every model.
 const WORKLOAD: &[Permission] = &[
     Permission::card_read(),
+    Permission::verifier_read_any(),
     Permission::artifact_read(),
     Permission::audit_read(),
     Permission::operators_read(),
@@ -56,6 +58,7 @@ const WORKLOAD: &[Permission] = &[
 /// against belongs to people, not to the workload itself.
 const EDITOR: &[Permission] = &[
     Permission::card_read(),
+    Permission::verifier_read_any(),
     Permission::artifact_read(),
     Permission::audit_read(),
     Permission::operators_read(),
@@ -211,6 +214,7 @@ mod tests {
     fn each_role_holds_its_exact_permissions() {
         let viewer = vec![
             Permission::card_read(),
+            Permission::verifier_read_any(),
             Permission::artifact_read(),
             Permission::audit_read(),
             Permission::operators_read(),

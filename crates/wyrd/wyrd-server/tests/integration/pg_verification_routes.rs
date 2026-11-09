@@ -10,7 +10,8 @@
 //! enqueue. Verification Files travel the shared `/v1/cards/upload/*`
 //! lifecycle under their persisted File ownership and are reused only from a
 //! completed File inventory record. It also proves the tenant's internal SYSTEM result writer is
-//! unreachable through the public principal and credential routes.
+//! unreachable through the public principal and credential routes, and that a
+//! local publication download plan is redeemed under `verifier:read` alone.
 
 use std::time::Duration;
 
@@ -26,7 +27,7 @@ use wyrd_server::components::storage::inventory::{
 use wyrd_spec::auth::{Attribution, PrincipalId, Sha256Hex, TokenAudience};
 use wyrd_spec::ids::{BindingId, CardUid, DataTenantId, ExecutionId};
 use wyrd_spec::reference::CardRef;
-use wyrd_testing::verification::VerificationFixture;
+use wyrd_testing::verification::{Published, VerificationFixture};
 use wyrd_testing::{Bootstrap, WyrdTestServer};
 
 /// How long an acknowledged submission may take to become readable.
@@ -412,8 +413,8 @@ fn run_decision(outcome: &str) -> (String, String) {
 
 /// Enqueued executions are accepted under the caller's authority, never the
 /// binding owner's: a keyed retry shares its execution, a key reused for a
-/// different body gets its own execution that settles with the idempotency
-/// conflict, unkeyed requests never deduplicate, and the binding and
+/// different body is refused with the idempotency conflict, unkeyed requests
+/// never deduplicate, and the binding and
 /// execution status reads return the frozen identities.
 ///
 /// # Panics
@@ -436,11 +437,10 @@ async fn enqueued_executions_replay_conflict_and_read_back() {
     assert_eq!(execution_id(&replay), keyed, "same key and body replays");
     let other = fixture.request(&fixture.assertion, json!(2));
     let (status, conflicting) = enqueue(&server, &jwt, &other, Some("vr-retry-0001")).await;
-    assert_eq!(status, StatusCode::ACCEPTED, "{conflicting}");
-    let conflict = execution_id(&conflicting);
-    assert_ne!(
-        conflict, keyed,
-        "conflicting content gets its own execution"
+    assert_eq!(status, StatusCode::CONFLICT, "{conflicting}");
+    assert_eq!(
+        conflicting["code"], "WYRD_REGISTRY_409_IDEMPOTENCY_CONFLICT",
+        "{conflicting}"
     );
     let (_, first) = enqueue(&server, &jwt, &body, None).await;
     let (_, second) = enqueue(&server, &jwt, &body, None).await;
@@ -458,12 +458,6 @@ async fn enqueued_executions_replay_conflict_and_read_back() {
     assert_eq!(
         execution_identity(&server, keyed).await,
         ("manual".to_owned(), None, None, Some(requester))
-    );
-    let refused = visible_execution(&server, &jwt, conflict).await;
-    assert_eq!(refused["status"], "errored", "{refused}");
-    assert_eq!(
-        refused["error"]["code"], "WYRD_REGISTRY_409_IDEMPOTENCY_CONFLICT",
-        "{refused}"
     );
     for accepted in [&first, &second] {
         visible_execution(&server, &jwt, execution_id(accepted)).await;
@@ -528,8 +522,8 @@ async fn input_rows(server: &WyrdTestServer, execution: ExecutionId) -> (usize, 
 /// accepted request, none for the refused attempt.
 ///
 /// Scribe ingest is stalled so the two unkeyed enqueues ahead of it stay
-/// unwritten and hold the whole reserved share (two of three slots)
-/// deterministically.
+/// unwritten, and so unacknowledged, and hold the whole reserved share (two
+/// of three slots) deterministically.
 ///
 /// Both counts are ordered after the requests before them through
 /// [`Fixture::queued_before_sentinel`], whose first sentinel remains a
@@ -551,17 +545,31 @@ async fn staging_refusal_recovers_the_same_enqueue_identity() {
 
     let stall = server.stall_next_bifrost_write().expect("Scribe stalls");
     let body = fixture.request(&fixture.assertion, json!(1));
-    let (status, ahead) = enqueue(&server, &jwt, &body, None).await;
-    assert_eq!(status, StatusCode::ACCEPTED, "{ahead}");
-    stall.wait_entered().await;
-    let (status, behind) = enqueue(&server, &jwt, &body, None).await;
-    assert_eq!(status, StatusCode::ACCEPTED, "{behind}");
-    let (status, refused) = enqueue(&server, &jwt, &body, Some("vr-pressure-0001")).await;
+    let outbox = std::sync::Arc::clone(server.state().bifrost.scribe_outbox());
+    let fills = async {
+        tokio::join!(
+            enqueue(&server, &jwt, &body, None),
+            enqueue(&server, &jwt, &body, None)
+        )
+    };
+    let refusal = async {
+        stall.wait_entered().await;
+        while outbox.pending() < 2 {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let refused = enqueue(&server, &jwt, &body, Some("vr-pressure-0001")).await;
+        stall.release();
+        refused
+    };
+    let (((ahead, a), (behind, b)), (status, refused)) = tokio::join!(fills, refusal);
     assert_eq!(status, StatusCode::TOO_MANY_REQUESTS, "{refused}");
     assert_eq!(refused["code"], "WYRD_VERIFICATION_429_STAGING_FULL");
     assert_eq!(refused["details"]["retry_after_seconds"], json!(1));
-
-    stall.release();
+    assert_eq!(
+        (ahead, behind),
+        (StatusCode::ACCEPTED, StatusCode::ACCEPTED),
+        "the fills are acknowledged once admitted: {a} {b}"
+    );
     stall.wait_completed().await;
     server.flush_bifrost().await.expect("the share drains");
     assert_eq!(
@@ -678,7 +686,7 @@ async fn enqueue_refusals_fail_before_staging() {
 }
 
 /// A rooted caller may enqueue only a subject its signed Card scope carries:
-/// holding `verifier:run` on exactly the selected Verifier, the subject
+/// holding `verifier:run` and `verifier:read` on exactly the selected Verifier, the subject
 /// family's runtime account rooted at the subject is accepted, while an
 /// unrelated Service rooted at its own Card, and an editor Service acting on
 /// its behalf, are refused with one audited denial each before anything is
@@ -700,6 +708,7 @@ async fn enqueue_admits_only_signed_scope_subjects() {
             &[
                 Permission::card_read(),
                 Permission::verifier_run(fixture.assertion.clone()),
+                Permission::verifier_read(fixture.assertion.clone()),
             ],
         )
         .await
@@ -1556,16 +1565,17 @@ async fn file_upload_authority_and_validation_are_preserved() {
     server.shutdown().await.expect("test server shuts down");
 }
 
-/// Binding and execution status reads each authorize and audit `cards:read`:
-/// a reader is allowed and stages one allowed decision per read, while a
-/// principal whose only role lacks `cards:read` is refused with the stable
-/// RBAC code and stages one denied decision per read, before any lookup.
+/// A binding status read authorizes and audits `cards:read` and an execution
+/// status read `verifier:read`: a viewer is allowed and stages one allowed
+/// decision per read, while a principal with no role is refused with the
+/// stable RBAC code and stages one denied decision per read, before any
+/// lookup.
 ///
 /// # Panics
 /// Panics when the server fails to start, a fixture write fails, a route fails
 /// to respond, or any status, code, or audit expectation fails.
 #[tokio::test(flavor = "current_thread")]
-async fn status_reads_audit_cards_read_decisions() {
+async fn status_reads_audit_their_decisions() {
     let server = WyrdTestServer::start_in_process()
         .await
         .expect("test server starts");
@@ -1589,14 +1599,15 @@ async fn status_reads_audit_cards_read_decisions() {
         let (status, body) = get(&server, &reader_jwt, uri).await;
         assert_eq!(status, StatusCode::OK, "{uri}: {body}");
     }
-    let allowed = vec![("cards:read".to_owned(), "allowed".to_owned())];
+    let decision =
+        |permission: &str, outcome: &str| vec![(permission.to_owned(), outcome.to_owned())];
     assert_eq!(
         decisions(&server, "verification.binding.read", reader).await,
-        allowed
+        decision("cards:read", "allowed")
     );
     assert_eq!(
         decisions(&server, "verification.execution.read", reader).await,
-        allowed
+        decision("verifier:read", "allowed")
     );
 
     let (outsider, outsider_jwt) = user(&server, "vr-status-outsider", &[]).await;
@@ -1611,14 +1622,13 @@ async fn status_reads_audit_cards_read_decisions() {
             "{uri}"
         );
     }
-    let denied = vec![("cards:read".to_owned(), "denied".to_owned())];
     assert_eq!(
         decisions(&server, "verification.binding.read", outsider).await,
-        denied
+        decision("cards:read", "denied")
     );
     assert_eq!(
         decisions(&server, "verification.execution.read", outsider).await,
-        denied
+        decision("verifier:read", "denied")
     );
     server.shutdown().await.expect("test server shuts down");
 }
@@ -2025,12 +2035,14 @@ async fn send(
     uri: &str,
     body: Option<&Value>,
 ) -> (StatusCode, Value) {
-    let request = Request::builder()
-        .method(method)
-        .uri(uri)
-        .header(header::CONTENT_TYPE, "application/json")
-        .body(body.map_or_else(Body::empty, |body| Body::from(body.to_string())))
-        .expect("request builds");
+    let request = Request::builder().method(method).uri(uri);
+    let request = match body {
+        Some(body) => request
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(body.to_string())),
+        None => request.body(Body::empty()),
+    }
+    .expect("request builds");
     let response = server
         .oneshot_authenticated(jwt, request)
         .await
@@ -2337,6 +2349,106 @@ async fn verdict_declarations_validate_before_persistence() {
     server.shutdown().await.expect("test server shuts down");
 }
 
+/// A Verifier of one Agent step selecting `tools`, or, when `check` is set,
+/// of one Agent requirement check selecting them.
+fn selecting(tools: &[&str], check: bool) -> Value {
+    let agent = json!({
+        "execution_route": { "kind": "wyrd_gateway", "deployment": "openai" },
+        "tool_names": tools,
+        "prompt": {
+            "provider": "openai", "model": "gpt-4o",
+            "messages": [{ "role": "user", "content": "Draft {{answer}}" }]
+        }
+    });
+    let call = json!({ "kind": "agent", "inputs": { "answer": "inputs.answer" }, "agent": agent });
+    if check {
+        let mut call = call;
+        call["agent"]["prompt"]["response_format"] = json!("verdict");
+        return json!({
+            "inputs": { "answer": { "type": "json" } },
+            "requirements": [{ "id": "judged", "statement": "The answer is judged.", "check": call }]
+        });
+    }
+    json!({
+        "inputs": { "answer": { "type": "json" } },
+        "steps": [{ "id": "draft", "action": call }]
+    })
+}
+
+/// `POST /v1/cards` refuses each invalid Agent tool selection as a stable
+/// validation problem with its `agent_tools` rule before persistence: an
+/// unknown tool, the provider-facing spelling of a built-in, a repeated
+/// tool, and `publish` on a requirement check. A step selecting the new
+/// built-ins registers and reads back under their dotted identities.
+///
+/// # Panics
+/// Panics when a refused selection registers or answers another refusal,
+/// or the valid one is refused or reads back other identities.
+#[tokio::test(flavor = "current_thread")]
+async fn agent_tool_selections_validate_before_persistence() {
+    let server = WyrdTestServer::start_in_process()
+        .await
+        .expect("test server starts");
+    let (_, jwt) = user(&server, "vr-selector", &["editor"]).await;
+    for (name, spec, reason) in [
+        (
+            "vr-unknown-tool",
+            selecting(&["http.fetch"], false),
+            "http.fetch is not a built-in tool",
+        ),
+        (
+            "vr-provider-spelling",
+            selecting(&["fs_write"], false),
+            "fs_write is not a built-in tool",
+        ),
+        (
+            "vr-duplicate-tool",
+            selecting(&["publish", "publish"], false),
+            "publish is selected more than once",
+        ),
+        (
+            "vr-check-publishes",
+            selecting(&["publish"], true),
+            "publish is available only to step Agents",
+        ),
+    ] {
+        let (status, problem) = declare_verifier(&server, &jwt, name, &spec).await;
+        assert_eq!(
+            (status, &problem["code"], &problem["details"]["rule"]),
+            (
+                StatusCode::BAD_REQUEST,
+                &json!("WYRD_SPEC_400_VALIDATION"),
+                &json!("agent_tools")
+            ),
+            "{name}: {problem}"
+        );
+        assert!(
+            problem["detail"]
+                .as_str()
+                .is_some_and(|detail| detail.contains(reason)),
+            "{name}: {problem}"
+        );
+        let (status, _) = get(&server, &jwt, &format!("/v1/cards/Verifier/{name}/latest")).await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "{name} was not persisted");
+    }
+    let (status, body) = declare_verifier(
+        &server,
+        &jwt,
+        "vr-drafting-agent",
+        &selecting(&["fs.write", "publish"], false),
+    )
+    .await;
+    assert!(status.is_success(), "{status} {body}");
+    let (status, card) = get(&server, &jwt, "/v1/cards/Verifier/vr-drafting-agent/latest").await;
+    assert_eq!(status, StatusCode::OK, "{card}");
+    assert!(
+        card.to_string()
+            .contains(r#""tool_names":["fs.write","publish"]"#),
+        "{card}"
+    );
+    server.shutdown().await.expect("test server shuts down");
+}
+
 /// A direct execution returns its code check's custom data to the home
 /// tenant, through the execution read too, while another tenant's rootless
 /// administrator can neither execute the Verifier nor read the execution.
@@ -2386,4 +2498,117 @@ async fn custom_verdict_data_is_tenant_isolated() {
     assert_eq!(status, StatusCode::NOT_FOUND, "{problem}");
     assert!(!problem.to_string().contains("score"), "{problem}");
     server.shutdown().await.expect("test server shuts down");
+}
+
+/// A local publication download plan is redeemed through its Verifier's own
+/// content route, under `verifier:read` on that Verifier and nothing else.
+///
+/// The fixture holds the execution's lease and publishes a file and a
+/// directory. A caller holding only `verifier:read` on the execution's
+/// Verifier plans both downloads, and each plan's root-relative URL answers
+/// exactly the published bytes. A grant on another Verifier, or `cards:read`
+/// alone, is refused at that URL.
+///
+/// # Panics
+/// Panics when a plan, its URL, its bytes, or a refusal differs.
+#[tokio::test(flavor = "multi_thread")]
+async fn local_publication_downloads_redeem_under_verifier_read() {
+    let server = WyrdTestServer::start_in_process()
+        .await
+        .expect("test server starts");
+    let fixture = VerificationFixture::provision(server.state(), server.data_tenant_id())
+        .await
+        .expect("the tenant provisions");
+    let (subject, _) = fixture.service("local-subject").await.expect("service");
+    let verifier = fixture
+        .drift_verifier("local-plans")
+        .await
+        .expect("verifier");
+    let other = fixture
+        .drift_verifier("local-other")
+        .await
+        .expect("verifier");
+    fixture
+        .submit(&verifier, &subject, std::collections::BTreeMap::new())
+        .await
+        .expect("the execution is admitted");
+    let id = fixture
+        .publish(
+            server.state(),
+            &[
+                ("draft", "report", Published::File(b"# Report\n".to_vec())),
+                (
+                    "draft",
+                    "tree",
+                    Published::Directory(vec![("nested/b.md".to_owned(), b"beta".to_vec())]),
+                ),
+            ],
+        )
+        .await
+        .expect("the held execution publishes");
+    for (role, permission) in [
+        ("lp_exact", Permission::verifier_read(verifier)),
+        ("lp_elsewhere", Permission::verifier_read(other)),
+        ("lp_cards", Permission::card_read()),
+    ] {
+        server
+            .seed_role(role, &[permission])
+            .await
+            .expect("role seeds");
+    }
+    let (_, exact) = user(&server, "lp-exact", &["lp_exact"]).await;
+    let (_, elsewhere) = user(&server, "lp-elsewhere", &["lp_elsewhere"]).await;
+    let (_, cards) = user(&server, "lp-cards", &["lp_cards"]).await;
+
+    for (name, selector, bytes) in [
+        ("report", "attempt=1", b"# Report\n".as_slice()),
+        ("tree", "attempt=1&path=nested%2Fb.md", b"beta".as_slice()),
+    ] {
+        let publication = format!("/v1/verification/executions/{id}/publications/draft/{name}");
+        let (status, plan) = post(
+            &server,
+            &exact,
+            &format!("{publication}/download?{selector}"),
+            String::new(),
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{plan}");
+        let url = plan["plan"]["get_url"]
+            .as_str()
+            .expect("the plan has a URL");
+        assert_eq!(url, format!("{publication}/content?{selector}"));
+        let response = server
+            .oneshot_authenticated(
+                &exact,
+                Request::builder()
+                    .method(Method::GET)
+                    .uri(url)
+                    .body(Body::empty())
+                    .expect("content request builds"),
+            )
+            .await
+            .expect("content request responds");
+        let status = response.status();
+        let fetched = to_bytes(response.into_body(), 1 << 20)
+            .await
+            .expect("content body reads");
+        assert_eq!(
+            (status, fetched.as_ref()),
+            (StatusCode::OK, bytes),
+            "{}",
+            String::from_utf8_lossy(&fetched)
+        );
+        for refused in [&elsewhere, &cards] {
+            let (status, problem) = get(&server, refused, url).await;
+            assert_eq!(
+                (status, problem["code"].as_str()),
+                (
+                    StatusCode::FORBIDDEN,
+                    Some("WYRD_PERMISSION_403_DENIED_RBAC")
+                ),
+                "{name}"
+            );
+        }
+    }
 }

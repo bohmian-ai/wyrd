@@ -9939,6 +9939,7 @@ version = "0.4.1"
 dependencies = [
  "arrow",
  "async-trait",
+ "base64 0.22.1",
  "chrono",
  "opentelemetry",
  "opentelemetry-http",
@@ -10358,6 +10359,7 @@ name = "wyrd-mcp"
 version = "0.4.1"
 dependencies = [
  "arrow",
+ "base64 0.22.1",
  "chrono",
  "futures-util",
  "http",
@@ -10594,6 +10596,8 @@ dependencies = [
  "tower-http",
  "tracing",
  "tracing-subscriber",
+ "unicase",
+ "unicode-normalization",
  "url",
  "utoipa",
  "utoipa-axum",
@@ -10943,6 +10947,7 @@ dependencies = [
  "uuid",
  "vala-bifrost-redux",
  "vala-sql",
+ "vala-verify",
  "wiremock",
  "workspace-hack",
  "wyrd-auth",

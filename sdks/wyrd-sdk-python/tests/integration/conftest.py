@@ -28,10 +28,14 @@ from wyrd.testing import WyrdTestServer
 
 from .gateway.support import PROVIDER_KEY, Upstream
 from .support import (
+    ASSESSMENT,
     BASELINE_TIMEOUT_SECONDS,
     FRAME_CLAIM,
+    HOLD_ARRIVED,
+    HOLD_RELEASED,
     LIVE_REVIEW,
     ON_CALL_TOKEN,
+    REPORT,
     UNBADGED_BASE64,
     Delivery,
     QueryRow,
@@ -41,10 +45,13 @@ from .support import (
     client_of,
     declare,
     hydrated,
+    prompt_of,
     pull,
+    read_text,
     reset_telemetry_providers,
     service_key,
     shut_down_telemetry_providers,
+    tool_results,
 )
 from .test_local_development import configure_gateway
 
@@ -274,6 +281,224 @@ def probe_turn(messages: list[dict]) -> dict:
     return {"role": "assistant", "content": json.dumps({"done": True, "results": results})}
 
 
+def calls(*script: tuple[str, str, object]) -> dict:
+    """An assistant turn calling each ``(id, tool, arguments)`` at once."""
+    return {
+        "role": "assistant",
+        "content": None,
+        "tool_calls": [
+            {
+                "id": id,
+                "type": "function",
+                "function": {"name": tool.replace(".", "_"), "arguments": json.dumps(arguments)},
+            }
+            for id, tool, arguments in script
+        ],
+    }
+
+
+DONE = {"role": "assistant", "content": '{"done":true}'}
+"""A ``report-pipeline`` Agent's final answer."""
+
+
+def drafter_turn(messages: list[dict]) -> dict:
+    """The ``report-pipeline`` drafter's next turn.
+
+    It writes the report twice, writes a tree with a nested Unicode, spaced
+    filename and an empty directory, publishes the report, the tree, the
+    ``ASSESSMENT``, and an explicit ``null``, then mutates its scratch and
+    tries every refused publication and write before it finishes.
+    """
+    turn = sum(1 for each in messages if each.get("role") == "assistant")
+    if turn == 0:
+        return calls(("w1", "fs.write", {"path": "/work/report.md", "content": "draft v1"}))
+    if turn == 1:
+        return calls(
+            ("w2", "fs.write", {"path": "/work/report.md", "content": REPORT}),
+            ("w3", "fs.write", {"path": "/work/tree/a.md", "content": "alpha"}),
+            ("w4", "fs.write", {"path": "/work/tree/nested dir/é b.md", "content": "beta"}),
+            ("w5", "code.run", {"source": "import os\nos.makedirs('/work/tree/empty')"}),
+        )
+    if turn == 2:
+        return calls(
+            ("r1", "fs.read", {"path": "/work/report.md"}),
+            ("p-report", "publish", {"name": "report", "path": "/work/report.md"}),
+            ("p-tree", "publish", {"name": "tree", "path": "/work/tree"}),
+            ("p-assessment", "publish", {"name": "assessment", "value": ASSESSMENT}),
+            ("p-nothing", "publish", {"name": "nothing", "value": None}),
+        )
+    if turn == 3:
+        return calls(
+            ("w6", "fs.write", {"path": "/work/report.md", "content": "mutated after publishing"}),
+            ("x-conflict", "publish", {"name": "report", "value": 1}),
+            ("x-both", "publish", {"name": "both", "path": "/work/report.md", "value": 1}),
+            ("x-neither", "publish", {"name": "neither"}),
+            ("x-name", "publish", {"name": "bad name!", "value": 1}),
+            ("x-missing", "publish", {"name": "ghost", "path": "/work/missing.md"}),
+            ("x-inputs", "publish", {"name": "foreign", "path": "/inputs/report.md"}),
+            ("x-escape", "publish", {"name": "escape", "path": "/work/../etc"}),
+            (
+                "x-forged",
+                "publish",
+                {"name": "forged", "value": 1, "attempt": 9, "step_id": "consume"},
+            ),
+            ("x-write-inputs", "fs.write", {"path": "/inputs/x.md", "content": "x"}),
+            ("x-write-escape", "fs.write", {"path": "/work/../x.md", "content": "x"}),
+        )
+    return DONE
+
+
+def consumer_turn(messages: list[dict]) -> dict:
+    """The ``report-pipeline`` consumer's next turn.
+
+    It reads each mounted publication and the collection manifest, then the
+    report through the manifest entry's path, and finishes.
+    """
+    turn = sum(1 for each in messages if each.get("role") == "assistant")
+    if turn == 0:
+        return calls(
+            ("c-report", "fs.read", {"path": "/inputs/report.md"}),
+            ("c-tree", "fs.list", {"path": "/inputs/tree"}),
+            ("c-assessment", "fs.read", {"path": "/inputs/assessment.json"}),
+            ("c-nothing", "fs.read", {"path": "/inputs/nothing.json"}),
+            ("c-manifest", "fs.read", {"path": "/inputs/all/manifest.json"}),
+        )
+    if turn == 1:
+        try:
+            manifest = json.loads(read_text(tool_results(messages)["c-manifest"] or {}))
+            [entry] = [each["path"] for each in manifest["entries"] if each["name"] == "report"]
+        except (KeyError, TypeError, ValueError):
+            entry = "missing"
+        return calls(("c-entry", "fs.read", {"path": f"/inputs/all/{entry}"}))
+    return DONE
+
+
+GARBLED = {"garbled": True}
+"""An undecodable provider reply: a body that is no Chat Completions response."""
+
+PLANS = (
+    ("NEITHER", {"security": False, "style": False}),
+    ("SECURITY-ONLY", {"security": True, "style": False}),
+    ("BOTH", {"security": True, "style": True}),
+    ("UNDECIDED", {"security": None, "style": False}),
+    ("FORGOTTEN", {"style": False}),
+    ("SILENT", {"security": True, "style": False}),
+)
+"""The planner's decision for the first question marker its prompt carries."""
+
+
+def answer(value: object) -> dict:
+    """A final answer carrying ``value`` as JSON."""
+    return {"role": "assistant", "content": json.dumps(value)}
+
+
+def orchestration_turn(text: str, messages: list[dict]) -> dict | None:
+    """The ``orchestration-desk`` Agents' next turn, or ``None`` for an undecodable reply.
+
+    The planner decides by the question's marker and breaks without one. The
+    generalist and security specialist publish their account (a ``SILENT``
+    security specialist finishes without one), the stylist
+    publishes a partial draft and then breaks, the consolidator reads every
+    collection's manifest, and the quoter reads the security account. The
+    ``CANCEL-HELD`` generalist holds its reply until the test releases it.
+    A section reviewer publishes its section and index, the polisher scores
+    each section by its round, the escalation publishes a note and then
+    breaks, the summarizer reads both collections, publishes a summary, and
+    scores it by its iteration index, and the document judge passes, citing
+    the document's title.
+    """
+    turn = sum(1 for each in messages if each.get("role") == "assistant")
+    prompt = prompt_of(messages)
+    if "CONSOLIDATE:" in text:
+        if turn:
+            return DONE
+        names = ("extra",) if "SPEC-" in text else ("general", "security", "style")
+        return calls(
+            *((f"c-{name}", "fs.read", {"path": f"/inputs/{name}/manifest.json"}) for name in names)
+        )
+    if "PLAN:" in text:
+        plan = next((plan for marker, plan in PLANS if marker in text), None)
+        return None if plan is None else {"role": "assistant", "content": json.dumps(plan)}
+    if "GENERAL:" in text or "SECURITY:" in text:
+        if "CANCEL-HELD" in text:
+            HOLD_ARRIVED.set()
+            HOLD_RELEASED.wait(300)
+        focus = "general" if "GENERAL:" in text else "security"
+        if turn or (focus == "security" and "SILENT" in text):
+            return DONE
+        return calls(("s-publish", "publish", {"name": "account", "value": {"focus": focus}}))
+    if "STYLE:" in text:
+        if turn:
+            return None
+        return calls(("s-draft", "publish", {"name": "draft", "value": {"partial": True}}))
+    if "BOOTSTRAP:" in text:
+        return answer({"done": True})
+    if "COMPARE:" in text:
+        agree = False if "ADMIT" in text else None if "BLOCK" in text else True
+        return answer({"agree": agree})
+    if "EXTRA:" in text:
+        if turn:
+            return DONE
+        return calls(("e-publish", "publish", {"name": "account", "value": {"extra": True}}))
+    if "SECTION:" in text:
+        found = re.search(r"SECTION: (.*?) at=(\d+)", prompt)
+        section, at = (found[1], int(found[2])) if found else ("", -1)
+        if turn:
+            return DONE
+        return calls(
+            ("d-account", "publish", {"name": "account", "value": {"section": section, "at": at}})
+        )
+    if "POLISH:" in text:
+        found = re.search(r"POLISH: (.*?) item=\S* round=(\d+)", prompt)
+        section, round = (found[1], int(found[2])) if found else ("", 0)
+        return answer({"score": round, "text": f"{section} v{round}"})
+    if "ESCALATE:" in text:
+        if turn:
+            return None
+        return calls(("x-note", "publish", {"name": "note", "value": {"escalated": True}}))
+    if "SUMMARIZE:" in text:
+        found = re.search(r"index=(\d+)", prompt)
+        index = int(found[1]) if found else -1
+        if turn == 0:
+            return calls(
+                ("m-accounts", "fs.read", {"path": "/inputs/accounts/manifest.json"}),
+                ("m-escalation", "fs.read", {"path": "/inputs/escalation/manifest.json"}),
+            )
+        if turn == 1:
+            return calls(("m-summary", "publish", {"name": "summary", "value": {"version": index}}))
+        return answer({"score": index, "text": f"summary v{index}"})
+    if "JUDGE-DOC:" in text:
+        return answer(
+            {
+                "outcome": "passed",
+                "reason": "the summary names the report",
+                "citations": [{"slot": "document", "locator": {"json_pointer": "/title"}}],
+            }
+        )
+    if turn:
+        return DONE
+    return calls(("q-read", "fs.read", {"path": "/inputs/security.json"}))
+
+
+ORCHESTRATION = (
+    "CONSOLIDATE:",
+    "PLAN:",
+    "GENERAL:",
+    "SECURITY:",
+    "STYLE:",
+    "BOOTSTRAP:",
+    "COMPARE:",
+    "EXTRA:",
+    "SECTION:",
+    "POLISH:",
+    "ESCALATE:",
+    "SUMMARIZE:",
+    "JUDGE-DOC:",
+    "QUOTE:",
+)
+"""The prompt markers ``orchestration_turn`` scripts."""
+
+
 SLOW_SECONDS = 15.0
 """How long the ``SLOW-READER`` reader waits to answer, past its step's five-second deadline."""
 
@@ -295,8 +520,10 @@ def completion(body: dict) -> tuple[int, dict]:
     correct its reply, cites a foreign pointer on ``JUDGE-FOREIGN-CITE``, and
     otherwise passes citing the answer text. The scored judge (its prompt carries
     ``SCORE:``) answers ``scored``. The handbook judge reads its mount and
-    answers ``handbook_verdict``; the file probe plays ``probe_turn``. Every
-    other judge agrees.
+    answers ``handbook_verdict``; the file probe plays ``probe_turn``; the
+    ``report-pipeline`` drafter and consumer play ``drafter_turn`` and
+    ``consumer_turn``; the ``orchestration-desk`` Agents play
+    ``orchestration_turn``. Every other judge agrees.
     """
     text = json.dumps(body)
     returned = any(message.get("role") == "tool" for message in body.get("messages", []))
@@ -327,6 +554,15 @@ def completion(body: dict) -> tuple[int, dict]:
     elif LIVE_REVIEW in text:
         [trace_id, *_] = re.findall("[0-9a-f]{32}", text)
         message = {"role": "assistant", "content": REVIEWED} if returned else live_query(trace_id)
+    elif "DRAFT: " in text:
+        message = drafter_turn(body["messages"])
+    elif "CONSUME: " in text:
+        message = consumer_turn(body["messages"])
+    elif any(marker in text for marker in ORCHESTRATION):
+        turned = orchestration_turn(text, body["messages"])
+        if turned is None:
+            return 200, GARBLED
+        message = turned
     elif "SCORE:" in text:
         message = {"role": "assistant", "content": scored(text)}
     else:
@@ -369,7 +605,9 @@ def serving(delay: float = 0.0) -> Generator[Receiver]:
     """Serve the local model provider and Operator hook endpoint until exit.
 
     With a ``delay``, each judge call is recorded on arrival and answered
-    ``delay`` seconds later, so a test can hold judgments in flight.
+    ``delay`` seconds later, so a test can hold judgments in flight. Without
+    one, each call is recorded once answered, or once the caller abandons it.
+    A request carrying a fragment the receiver holds is answered once it is released.
     """
     server = ThreadingHTTPServer(("127.0.0.1", 0), BaseHTTPRequestHandler)
     received = Receiver(url=f"http://127.0.0.1:{server.server_address[1]}")
@@ -381,13 +619,18 @@ def serving(delay: float = 0.0) -> Generator[Receiver]:
             if delay:
                 received.record(Delivery(self.path, headers, body))
                 time.sleep(delay)
-            status, reply = completion(body) if self.path == "/v1/chat/completions" else (200, {})
-            self.send_response(status)
-            self.send_header("content-type", "application/json")
-            self.end_headers()
-            self.wfile.write(json.dumps(reply).encode())
-            if not delay:
-                received.record(Delivery(self.path, headers, body))
+            try:
+                received.await_release(json.dumps(body))
+                status, reply = (
+                    completion(body) if self.path == "/v1/chat/completions" else (200, {})
+                )
+                self.send_response(status)
+                self.send_header("content-type", "application/json")
+                self.end_headers()
+                self.wfile.write(json.dumps(reply).encode())
+            finally:
+                if not delay:
+                    received.record(Delivery(self.path, headers, body))
 
         def log_message(self, format: str, *args: object) -> None:
             """Keep per-request access lines out of the test output."""

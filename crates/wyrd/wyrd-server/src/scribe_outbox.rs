@@ -1,5 +1,6 @@
 //! The process's one Scribe-bound outbox: audit decisions, gateway capture,
-//! Verifier execution inputs and results, and tenant copies of server spans.
+//! Verifier execution inputs, results, and history, and tenant copies of
+//! server spans.
 //!
 //! Producers stage logical [`ScribeWrite`] values on [`ScribeOutbox`] and
 //! return at once. The outbox writer hands each tenant's pending slice to
@@ -35,6 +36,15 @@
 //! row acknowledged, the sink stages it as [`Acknowledged`] work on the
 //! [`SubmissionOutbox`] that admits it into the durable queue, so no
 //! execution is queued before its inputs are durable.
+//!
+//! A batch of Verifier execution events is the one write whose frame is not
+//! derived from its slice: each of its events travels alone under the batch
+//! identity the execution queue persisted before staging it and the event's
+//! position, so a resubmission from any process at any request ceiling is
+//! deduplicated, and its acknowledgement is reported back to the
+//! projector that persisted it. A queued run's result is likewise reported
+//! back once its slice is acknowledged and not lost, so the runner commits
+//! the run `completed` only after its result is durable.
 //!
 //! A sink given the Wyrd Postgres owner also schedules grouped verification:
 //! once a slice's frames are acknowledged, every grouped inputs or result row
@@ -76,8 +86,8 @@ use vala_bifrost_redux::tables::staged::StagedRow;
 use vala_bifrost_redux::tables::storage::ObjectsTable;
 use vala_bifrost_redux::tables::traces::project_resource_spans;
 use vala_bifrost_redux::tables::{
-    AuditLogTable, DomainTable, ExecutionInputsTable, ExecutionOutputsTable, ResultsTable,
-    SpansTable,
+    AuditLogTable, DomainTable, ExecutionEventsTable, ExecutionInputsTable, ExecutionOutputsTable,
+    ResultsTable, SpansTable,
 };
 use wyrd_runtime::outbox::{LossReason, Outbox, OutboxLimits, OutboxSink, Reservation, count_lost};
 use wyrd_runtime::{PermissionSet, Principal, PrincipalKind};
@@ -99,7 +109,8 @@ use wyrd_tonic::wyrd::v1::IngestCaptureRequest;
 use wyrd_tonic::wyrd::v1::scribe_capture_peer_service_client::ScribeCapturePeerServiceClient;
 
 use crate::components::gateway::CallCapture;
-use crate::verification::results::{ResultPayload, ResultRow};
+use crate::verification::results::{ResultPayload, ResultRow, checkpoint_schema};
+use crate::verification::state::Checkpoint;
 use crate::verification::submissions::{Queued, SubmissionSink};
 
 /// The process's one non-blocking outbox for every Scribe-bound write.
@@ -197,13 +208,23 @@ pub enum ScribeWrite {
     /// One gateway call's validated analytical record, its objects already
     /// persisted.
     Capture(Box<CallCapture>),
-    /// One Verifier judgment's output and summary rows.
+    /// One Verifier judgment's output and summary rows, each its own frame
+    /// whose batch id derives from the result's `result_id` and table, so a
+    /// later delivery of the same selected result carries the same two
+    /// identities: Scribe's batch-id fence absorbs a row it already accepted
+    /// and refuses different rows under an accepted identity as a batch
+    /// conflict.
     Result {
         /// The result's rows, output before the summary, each naming the
         /// Card verified as its `subject_card_uid`.
         payload: ResultPayload,
         /// The run's subject and actor, which Scribe stamps on every row.
         attribution: Attribution,
+        /// Fired once Scribe acknowledges every row of the result, and only
+        /// then; a rejected, unprojectable, or dropped write drops the sender
+        /// instead. A queued run commits `completed` only after it fires;
+        /// `None` for a write nothing awaits.
+        acked: Mutex<Option<oneshot::Sender<()>>>,
     },
     /// One Verifier execution's input record.
     ExecutionInputs {
@@ -245,6 +266,28 @@ pub enum ScribeWrite {
         /// sender instead. Firing never blocks, so the waiting caller holds
         /// no other write. Taken under its lock because the sink sees the
         /// slice by reference.
+        acked: Mutex<Option<oneshot::Sender<()>>>,
+    },
+    /// One revision of a Verifier execution's recoverable state, staged as
+    /// its `bifrost.verification.execution_events` row.
+    ///
+    /// The revision is its own frame and its own Scribe batch, identified by
+    /// `batch` rather than by the slice, so every submission of it carries
+    /// one identity and Scribe's batch-id dedup absorbs a resubmission; a
+    /// different revision under the same identity is refused as a batch
+    /// conflict. Other executions' revisions in the slice keep their own
+    /// acceptance.
+    ExecutionState {
+        /// The revision's batch identity.
+        batch: Uuid,
+        /// The frozen revision, whose row the writer prepares as it encodes
+        /// the revision's frame.
+        checkpoint: Arc<Checkpoint>,
+        /// The execution's subject and actor, which Scribe stamps on the row.
+        attribution: Attribution,
+        /// Fired once Scribe accepts the revision's own frame, without waiting
+        /// for the slice's other frames, and only then; a refused,
+        /// unprojectable, or dropped write drops the sender instead.
         acked: Mutex<Option<oneshot::Sender<()>>>,
     },
 }
@@ -297,6 +340,9 @@ enum Part {
     Row(StagedRow),
     /// Rows a capture or span projection built.
     Batch(RecordBatch),
+    /// One execution state revision, prepared as its staged row when its
+    /// chunk is encoded.
+    Checkpoint(Arc<Checkpoint>),
 }
 
 impl Part {
@@ -305,22 +351,24 @@ impl Part {
         match self {
             Self::Row(row) => row.schema(),
             Self::Batch(batch) => batch.schema_ref(),
+            Self::Checkpoint(_) => checkpoint_schema(),
         }
     }
 
     /// How many rows this part holds.
     fn num_rows(&self) -> usize {
         match self {
-            Self::Row(_) => 1,
+            Self::Row(_) | Self::Checkpoint(_) => 1,
             Self::Batch(batch) => batch.num_rows(),
         }
     }
 
-    /// Memory the part holds: a staged row's values, or a batch's retained
-    /// Arrow bytes.
+    /// Memory the part holds: a staged row's values, a batch's retained
+    /// Arrow bytes, or a revision's [`Checkpoint::weight`].
     fn bytes(&self) -> usize {
         match self {
             Self::Row(row) => row.owned_bytes(),
+            Self::Checkpoint(checkpoint) => checkpoint.weight(),
             Self::Batch(batch) => {
                 wyrd_queue::retained_bytes(batch).unwrap_or_else(|| batch.get_array_memory_size())
             }
@@ -329,23 +377,29 @@ impl Part {
 
     /// The one batch holding `parts`' rows in order, which share one schema.
     ///
-    /// A run of staged rows is built straight into one dense batch, each
-    /// column allocated once; a lone batch is shared, and several batches
-    /// are concatenated. Staged-row and batch destinations never overlap, so
-    /// a frame never mixes the two.
+    /// A run of staged rows, with each revision prepared as its row, is
+    /// built straight into one dense batch, each column allocated once; a
+    /// lone batch is shared, and several batches are concatenated. Staged-row
+    /// and batch destinations never overlap, so a frame never mixes the two.
     ///
     /// # Errors
     ///
-    /// Returns the Arrow error when the rows cannot be built, the batches
-    /// cannot be concatenated, or staged rows are mixed with batches.
+    /// Returns the Arrow error when a revision cannot be prepared, the rows
+    /// cannot be built, the batches cannot be concatenated, or staged rows
+    /// are mixed with batches.
     fn dense(parts: &[Self]) -> Result<RecordBatch, arrow::error::ArrowError> {
         let staged = parts
             .iter()
             .map(|part| match part {
-                Self::Row(row) => Some(row.clone()),
-                Self::Batch(_) => None,
+                Self::Row(row) => Ok(Some(row.clone())),
+                Self::Checkpoint(checkpoint) => {
+                    checkpoint.row().cloned().map(Some).map_err(|error| {
+                        arrow::error::ArrowError::InvalidArgumentError(error.to_owned())
+                    })
+                }
+                Self::Batch(_) => Ok(None),
             })
-            .collect::<Option<Vec<_>>>();
+            .collect::<Result<Option<Vec<_>>, _>>()?;
         if let Some(rows) = staged {
             return StagedRow::project(&rows);
         }
@@ -355,9 +409,11 @@ impl Part {
         let batches = parts
             .iter()
             .map(|part| match part {
-                Self::Row(_) => Err(arrow::error::ArrowError::InvalidArgumentError(
-                    "a frame mixes staged rows with batches".to_owned(),
-                )),
+                Self::Row(_) | Self::Checkpoint(_) => {
+                    Err(arrow::error::ArrowError::InvalidArgumentError(
+                        "a frame mixes staged rows with batches".to_owned(),
+                    ))
+                }
                 Self::Batch(batch) => Ok(batch.clone()),
             })
             .collect::<Result<Vec<_>, _>>()?;
@@ -396,6 +452,7 @@ impl ScribeWrite {
             Self::Result {
                 payload,
                 attribution,
+                ..
             } => payload
                 .rows()
                 .iter()
@@ -433,6 +490,15 @@ impl ScribeWrite {
                 attribution: *attribution,
                 part: Part::Row(row.clone()),
             }]),
+            Self::ExecutionState {
+                checkpoint,
+                attribution,
+                ..
+            } => Ok(vec![Rows {
+                table: ScribeTable::ExecutionEvents,
+                attribution: *attribution,
+                part: Part::Checkpoint(Arc::clone(checkpoint)),
+            }]),
         }
     }
 
@@ -454,7 +520,11 @@ impl ScribeWrite {
                 .iter()
                 .find(|row| ScribeTable::from_fqn(row.table) == Some(ScribeTable::Results))
                 .map(|row| &row.row)?,
-            Self::Audit(_) | Self::Capture(_) | Self::ServerSpans { .. } | Self::Object { .. } => {
+            Self::Audit(_)
+            | Self::Capture(_)
+            | Self::ServerSpans { .. }
+            | Self::Object { .. }
+            | Self::ExecutionState { .. } => {
                 return None;
             }
         };
@@ -470,7 +540,7 @@ impl ScribeWrite {
 }
 
 /// The destinations the Scribe outbox writes: retained audit history, the two
-/// gateway capture tables, the three Verifier tables, and the storage object
+/// gateway capture tables, the four Verifier tables, and the storage object
 /// inventory.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ScribeTable {
@@ -489,11 +559,14 @@ pub enum ScribeTable {
     ExecutionInputs,
     /// `bifrost.storage.objects`, one row per completed or deleted object.
     Objects,
+    /// `bifrost.verification.execution_events`, one row per accepted
+    /// revision of an execution's recoverable state.
+    ExecutionEvents,
 }
 
 impl ScribeTable {
     /// Every destination, in a fixed order.
-    const ALL: [Self; 7] = [
+    const ALL: [Self; 8] = [
         Self::AuditLog,
         Self::Calls,
         Self::Spans,
@@ -501,6 +574,7 @@ impl ScribeTable {
         Self::ExecutionOutputs,
         Self::ExecutionInputs,
         Self::Objects,
+        Self::ExecutionEvents,
     ];
 
     /// Fully qualified table name, which the peer RPC carries.
@@ -514,6 +588,7 @@ impl ScribeTable {
             Self::ExecutionOutputs => "bifrost.verification.execution_outputs",
             Self::ExecutionInputs => "bifrost.verification.execution_inputs",
             Self::Objects => "bifrost.storage.objects",
+            Self::ExecutionEvents => "bifrost.verification.execution_events",
         }
     }
 
@@ -542,6 +617,9 @@ impl ScribeTable {
                 TableRef::new(BifrostNamespace::Verification, ExecutionInputsTable::NAME)
             }
             Self::Objects => TableRef::new(BifrostNamespace::Storage, ObjectsTable::NAME),
+            Self::ExecutionEvents => {
+                TableRef::new(BifrostNamespace::Verification, ExecutionEventsTable::NAME)
+            }
         }
     }
 }
@@ -1107,6 +1185,11 @@ pub(crate) type Owner = (usize, Attribution);
 
 /// One frame being assembled from consecutive rows of one destination.
 struct Frame {
+    /// Persisted identity of a frame that is one write's own batch, an
+    /// execution state revision's batch or a Verifier result's `result_id`,
+    /// which replaces the slice's idempotency key and position in its batch
+    /// ids; `None` for a frame shared by the slice's writes.
+    key: Option<Uuid>,
     /// Destination table.
     table: ScribeTable,
     /// The rows, all of one schema.
@@ -1133,6 +1216,7 @@ impl Frame {
                 frame.owners.extend(owners);
             }
             None => frames.push(Self {
+                key: None,
                 table,
                 parts: vec![part],
                 owners,
@@ -1143,7 +1227,7 @@ impl Frame {
     /// Whether `part`, bound for `table`, shares this frame's destination
     /// and schema, so one Scribe frame can carry both.
     fn shares(&self, table: ScribeTable, part: &Part) -> bool {
-        self.table == table && {
+        self.key.is_none() && self.table == table && {
             let (ours, theirs) = (self.parts[0].schema(), part.schema());
             Arc::ptr_eq(ours, theirs) || ours == theirs
         }
@@ -1174,9 +1258,12 @@ impl ScribeSink {
     /// keys its frame by request: a gateway call row carries its admitting
     /// request as content, like an audit decision, so captures of many calls
     /// share a frame. Captures are gathered and projected in one pass, after
-    /// the other writes' rows. Result summary frames
-    /// are moved after every detail frame, so a visible summary's details
-    /// were acknowledged first. Positions of writes that cannot be projected
+    /// the other writes' rows. A Verifier result's output and summary are
+    /// each their own one-row frame keyed by its `result_id`, so every
+    /// delivery of a selected result, in any slice, resubmits the same two
+    /// batch ids and Scribe's batch-id fence keeps each row once. Result
+    /// summary frames are moved after every detail frame, so a visible
+    /// summary's details were acknowledged first. Positions of writes that cannot be projected
     /// are added to `lost`.
     fn frames(items: &[ScribeWrite], lost: &mut BTreeSet<usize>) -> Vec<Frame> {
         let mut frames: Vec<Frame> = Vec::new();
@@ -1186,6 +1273,21 @@ impl ScribeSink {
                 captures.push((index, capture));
                 continue;
             }
+            if let ScribeWrite::ExecutionState {
+                batch,
+                checkpoint,
+                attribution,
+                ..
+            } = item
+            {
+                frames.push(Frame {
+                    key: Some(*batch),
+                    table: ScribeTable::ExecutionEvents,
+                    parts: vec![Part::Checkpoint(Arc::clone(checkpoint))],
+                    owners: vec![(index, *attribution)],
+                });
+                continue;
+            }
             let rows = match item.rows() {
                 Ok(rows) => rows,
                 Err(reason) => {
@@ -1193,9 +1295,21 @@ impl ScribeSink {
                     continue;
                 }
             };
+            let key = match item {
+                ScribeWrite::Result { payload, .. } => Some(payload.result_id().as_uuid()),
+                _ => None,
+            };
             for rows in rows {
                 let owners = vec![(index, rows.attribution); rows.part.num_rows()];
-                Frame::absorb(&mut frames, rows.table, rows.part, owners);
+                match key {
+                    Some(key) => frames.push(Frame {
+                        key: Some(key),
+                        table: rows.table,
+                        parts: vec![rows.part],
+                        owners,
+                    }),
+                    None => Frame::absorb(&mut frames, rows.table, rows.part, owners),
+                }
             }
         }
         // Captures that cannot project in bulk are projected call by call, so
@@ -1240,11 +1354,19 @@ impl ScribeSink {
     /// be its size, so cutting costs one measurement per frame and depends
     /// only on the rows: an identical slice always cuts identically. A
     /// projected batch is never divided; skewed row sizes are left to
-    /// [`Chunk::encode`]'s split by encoded size.
+    /// [`Chunk::encode`]'s split by encoded size. A keyed frame, a persisted
+    /// execution event batch or one row of a Verifier result, is cut one row
+    /// per chunk whatever the budget, so each row's identity is its key and
+    /// position and a replay at another request ceiling never reuses an
+    /// identity for different rows.
     fn chunks(frame: &Frame, budget: usize) -> Vec<Chunk> {
         let sample = &frame.parts[0];
         let row_bytes = sample.bytes().div_ceil(sample.num_rows().max(1)).max(1);
-        let rows_per_chunk = (budget / row_bytes).max(1);
+        let rows_per_chunk = if frame.key.is_some() {
+            1
+        } else {
+            (budget / row_bytes).max(1)
+        };
         let mut chunks = Vec::new();
         let (mut first, mut rows, mut parts) = (0, 0, Vec::new());
         for part in &frame.parts {
@@ -1452,20 +1574,7 @@ impl Chunk {
         start: usize,
         payload: FramePayload,
     ) -> ScribeBatch {
-        let mut digest = Sha256::new();
-        digest.update(b"wyrd.scribe.outbox.batch-id.v2");
-        digest.update(tenant.as_uuid().as_bytes());
-        digest.update(self.table.fqn().as_bytes());
-        digest.update(slice.as_bytes());
-        for place in [frame, chunk, start] {
-            digest.update((place as u64).to_le_bytes());
-        }
-        let digest: [u8; 32] = digest.finalize().into();
-        let mut bytes = [0_u8; 16];
-        bytes.copy_from_slice(&digest[..16]);
-        bytes[6] = (bytes[6] & 0x0f) | 0x70;
-        bytes[8] = (bytes[8] & 0x3f) | 0x80;
-        let batch_id = Uuid::from_bytes(bytes);
+        let batch_id = batch_id(tenant, self.table, (slice, frame, chunk), start);
         let request_id =
             RequestId::parse(&batch_id.to_string()).expect("a UUIDv7 batch id is a request id");
         ScribeBatch {
@@ -1476,6 +1585,38 @@ impl Chunk {
             payload,
         }
     }
+}
+
+/// The Scribe batch id of the rows from `start` of chunk `chunk` of frame
+/// `frame` of `tenant`'s slice or write key `slice` for `table`, carrying
+/// `UUIDv7` version and variant bits.
+fn batch_id(
+    tenant: DataTenantId,
+    table: ScribeTable,
+    (slice, frame, chunk): Origin,
+    start: usize,
+) -> Uuid {
+    let mut digest = Sha256::new();
+    digest.update(b"wyrd.scribe.outbox.batch-id.v2");
+    digest.update(tenant.as_uuid().as_bytes());
+    digest.update(table.fqn().as_bytes());
+    digest.update(slice.as_bytes());
+    for place in [frame, chunk, start] {
+        digest.update((place as u64).to_le_bytes());
+    }
+    let digest: [u8; 32] = digest.finalize().into();
+    let mut bytes = [0_u8; 16];
+    bytes.copy_from_slice(&digest[..16]);
+    bytes[6] = (bytes[6] & 0x0f) | 0x70;
+    bytes[8] = (bytes[8] & 0x3f) | 0x80;
+    Uuid::from_bytes(bytes)
+}
+
+/// The Scribe batch id, and so the batch fence, under which `tenant`'s
+/// execution state revision staged with batch identity `key` is written: a
+/// revision is its own one-row frame and chunk.
+pub(crate) fn revision_batch_id(tenant: DataTenantId, key: Uuid) -> Uuid {
+    batch_id(tenant, ScribeTable::ExecutionEvents, (key, 0, 0), 0)
 }
 
 impl ScribeSink {
@@ -1489,9 +1630,10 @@ impl ScribeSink {
     /// frees, so the slice's encoding runs in parallel and at most
     /// [`FRAMES_IN_FLIGHT`] chunks' streams are held at once. Writes whose
     /// rows cannot be encoded, or whose stream Scribe rejects terminally,
-    /// are added to `lost`. Each storage object write of `items` is notified
-    /// as its own frame is acknowledged. After a retryable refusal no further
-    /// chunk is started; those in flight still finish.
+    /// are added to `lost`. Each storage object write and execution state
+    /// revision of `items` is notified as its own frame is acknowledged.
+    /// After a retryable refusal no further chunk is started; those in
+    /// flight still finish.
     ///
     /// # Errors
     ///
@@ -1516,10 +1658,11 @@ impl ScribeSink {
         let mut in_flight = FuturesUnordered::new();
         let mut refused = None;
         let chunks = frames.iter().enumerate().flat_map(|(index, frame)| {
+            let (key, place) = frame.key.map_or((slice, first + index), |key| (key, 0));
             Self::chunks(frame, budget)
                 .into_iter()
                 .enumerate()
-                .map(move |(chunk, rows)| ((slice, first + index, chunk), rows))
+                .map(move |(chunk, rows)| ((key, place, chunk), rows))
         });
         for (origin, chunk) in chunks {
             if in_flight.len() == FRAMES_IN_FLIGHT
@@ -1596,8 +1739,8 @@ impl ScribeSink {
     /// Records one delivered chunk: writes that could not be encoded or
     /// whose stream was rejected terminally are added to `lost`, the first
     /// retryable refusal is kept in `refused` unless an earlier one already
-    /// is, and each storage object write of `items` in an acknowledged stream
-    /// is notified.
+    /// is, and each storage object write and execution state revision of
+    /// `items` in an acknowledged stream is notified.
     fn tally(
         tenant: DataTenantId,
         items: &[ScribeWrite],
@@ -1610,7 +1753,10 @@ impl ScribeSink {
             match result {
                 Ok(()) => {
                     for position in owners {
-                        if let Some(ScribeWrite::Object { acked, .. }) = items.get(position)
+                        if let Some(
+                            ScribeWrite::Object { acked, .. }
+                            | ScribeWrite::ExecutionState { acked, .. },
+                        ) = items.get(position)
                             && let Some(sender) = acked
                                 .lock()
                                 .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -1655,11 +1801,14 @@ impl OutboxSink for ScribeSink {
     /// [`SubmissionSink::admission_lane`] does, so requests sharing an
     /// idempotency key, or a tenant's scheduled and group candidates, are acknowledged, and
     /// handed to that outbox, in arrival order; its result is staged only
-    /// after the execution was admitted. A storage object write lanes by its
+    /// after the execution was admitted. A revision of an execution's state
+    /// lanes by its `execution_id`, so different executions' revisions are
+    /// written concurrently. A storage object write lanes by its
     /// `storage_path`, so one object's completion and deletion keep their
     /// order. Server spans take lane 0. No reader relies on cross-batch commit
     /// order: group lists order by the recorded input time or a declared key.
     fn lane(item: &ScribeWrite) -> u64 {
+        let execution;
         let key = match item {
             ScribeWrite::Capture(capture) => Some(capture.request_id()),
             ScribeWrite::Audit(Some(row)) => row.text(WYRD_REQUEST_ID),
@@ -1673,6 +1822,10 @@ impl OutboxSink for ScribeSink {
             } => return SubmissionSink::admission_lane(&queued.admission),
             ScribeWrite::ExecutionInputs { row, .. } => row.row.text("execution_id"),
             ScribeWrite::Object { row, .. } => row.text("storage_path"),
+            ScribeWrite::ExecutionState { checkpoint, .. } => {
+                execution = checkpoint.execution_id().to_string();
+                Some(execution.as_str())
+            }
             ScribeWrite::Audit(None) | ScribeWrite::ServerSpans { .. } => None,
         };
         key.map_or(0, |key| {
@@ -1695,6 +1848,7 @@ impl OutboxSink for ScribeSink {
             }
             ScribeWrite::ExecutionInputs { row, .. } => row.owned_bytes(),
             ScribeWrite::Object { row, .. } => row.owned_bytes(),
+            ScribeWrite::ExecutionState { checkpoint, .. } => checkpoint.weight(),
             ScribeWrite::ServerSpans { spans, .. } => spans.encoded_len(),
         }
     }
@@ -1759,6 +1913,16 @@ impl OutboxSink for ScribeSink {
             {
                 reserved.stage(tenant, Acknowledged((**queued).clone()));
             }
+            if let ScribeWrite::Result { acked, .. } = item
+                && !lost.contains(&index)
+                && let Some(sender) = acked
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .take()
+            {
+                // The waiter may have given up; it resubmits or re-executes.
+                let _ = sender.send(());
+            }
         }
         Ok(())
     }
@@ -1819,7 +1983,7 @@ mod tests {
 
     use crate::components::gateway::CallCapture;
     use crate::components::gateway::capture_tests::{facts, policy};
-    use crate::components::gateway::recording::{Received, RecordingScribe};
+    use crate::components::gateway::recording::{Received, RecordingScribe, TableGate};
     use crate::components::storage::inventory::{ObjectFact, ObjectOrigin, ObjectState};
     use crate::grpc::capture_peer::ScribeCapturePeerGrpc;
     use crate::verification::results::{InputRecord, ResultPayloadBuilder, ResultRun};
@@ -1922,6 +2086,8 @@ mod tests {
             requirements: vec![RequirementResult {
                 id: TaskId::new("drift").expect("task id"),
                 step: None,
+                item_index: None,
+                iteration_index: None,
                 statement: "drift".to_owned(),
                 outcome: RequirementOutcome::Failed,
                 reason: "x".repeat(reason_bytes),
@@ -1964,6 +2130,7 @@ mod tests {
         ScribeWrite::Result {
             payload,
             attribution,
+            acked: Mutex::new(None),
         }
     }
 
@@ -1978,12 +2145,13 @@ mod tests {
     }
 
     /// Proves one tenant slice becomes one frame per destination whatever
-    /// its callers: three results of one run attribution share a single
-    /// summary frame scoped to the Cards verified, two calls of different
+    /// its callers, except that each Verifier result is its own output and
+    /// summary frame: three results of one run attribution are three summary
+    /// frames together scoped to the Cards verified, two calls of different
     /// callers admitted under different requests share one row frame and one
     /// span frame, every row carrying its own write's subject and actor and
-    /// naming its own admitting request, and the summary frame is submitted
-    /// last although it was staged first. Every frame names the no-caller
+    /// naming its own admitting request, and the summary frames are submitted
+    /// last although they were staged first. Every frame names the no-caller
     /// marker as its transport principal; the verified pairs live on the rows.
     /// The capture frames share a phase and arrive in either order. The
     /// slice is written straight through the sink, since the outbox spreads
@@ -2026,14 +2194,18 @@ mod tests {
             .iter()
             .map(|frame| (frame.table.as_str(), frame.rows))
             .collect::<Vec<_>>();
-        frames[..3].sort_unstable();
+        frames[..5].sort_unstable();
         assert_eq!(
             frames,
             [
                 ("bifrost.gateway.calls", 2),
                 ("bifrost.traces.spans", 2),
-                ("bifrost.verification.execution_outputs", 3),
-                ("bifrost.verification.results", 3),
+                ("bifrost.verification.execution_outputs", 1),
+                ("bifrost.verification.execution_outputs", 1),
+                ("bifrost.verification.execution_outputs", 1),
+                ("bifrost.verification.results", 1),
+                ("bifrost.verification.results", 1),
+                ("bifrost.verification.results", 1),
             ]
         );
         let (judgments, captures): (Vec<_>, Vec<_>) = received
@@ -2049,11 +2221,22 @@ mod tests {
             .map(|row| row["request_id"].as_str().expect("request_id").to_owned())
             .collect::<HashSet<_>>();
         assert_eq!(requests.len(), 2, "each row names its own request");
-        for frame in judgments {
-            assert_eq!(frame.pairs, [attribution; 3], "{}", frame.table);
+        for table in [
+            "bifrost.verification.execution_outputs",
+            "bifrost.verification.results",
+        ] {
+            let frames = judgments
+                .iter()
+                .filter(|frame| frame.table == table)
+                .collect::<Vec<_>>();
+            assert!(frames.iter().all(|frame| frame.pairs == [attribution]));
             assert_eq!(
-                frame.card_scope.iter().collect::<HashSet<_>>(),
-                subjects.iter().collect::<HashSet<_>>()
+                frames
+                    .iter()
+                    .flat_map(|frame| &frame.card_scope)
+                    .collect::<HashSet<_>>(),
+                subjects.iter().collect::<HashSet<_>>(),
+                "{table}"
             );
         }
         assert!(received.iter().all(|frame| frame.tenant == tenant));
@@ -2165,6 +2348,56 @@ mod tests {
         }
     }
 
+    /// One revision of `execution_id`'s state, and the receiver its
+    /// acceptance fires.
+    ///
+    /// # Panics
+    /// Panics when a fresh `UUIDv7` is not a valid Card UID, or a stand-in
+    /// identity's static name or version fails to parse; neither happens.
+    fn execution_state(
+        execution_id: ExecutionId,
+    ) -> (ScribeWrite, tokio::sync::oneshot::Receiver<()>) {
+        execution_state_of(
+            execution_id,
+            wyrd_spec::verification::state::ExecutionState::fresh(),
+        )
+    }
+
+    /// Revision 1 of `execution_id`'s `state`, and the receiver its
+    /// acceptance fires.
+    ///
+    /// # Panics
+    /// Panics when a fresh `UUIDv7` is not a valid Card UID, or a stand-in
+    /// identity's static name or version fails to parse; neither happens.
+    fn execution_state_of(
+        execution_id: ExecutionId,
+        state: wyrd_spec::verification::state::ExecutionState,
+    ) -> (ScribeWrite, tokio::sync::oneshot::Receiver<()>) {
+        let (verifier, subject) = (uid(), uid());
+        let row = crate::verification::state::StateRow {
+            execution_id,
+            identity: crate::verification::state::stand_in_identity(&verifier, &subject),
+            verifier_uid: verifier,
+            card_uid: subject,
+            owner_card_uid: None,
+            run_id: None,
+            deployment_environment: None,
+            attribution: background(),
+        };
+        let (sender, acked) = tokio::sync::oneshot::channel();
+        let write = ScribeWrite::ExecutionState {
+            batch: uuid::Uuid::now_v7(),
+            checkpoint: Arc::new(crate::verification::state::Checkpoint::new(
+                1,
+                state,
+                Arc::new(row),
+            )),
+            attribution: background(),
+            acked: Mutex::new(Some(sender)),
+        };
+        (write, acked)
+    }
+
     /// The staged rows of one Verifier or audit write.
     ///
     /// # Panics
@@ -2205,8 +2438,114 @@ mod tests {
         assert!(ScribeSink::weight(&drift_result(&uid(), background(), 0, reason)) > reason);
     }
 
+    /// Proves a revision is charged the variable values it retains: a
+    /// requirement settlement capturing a large actual value, data, and
+    /// reason, and the terminal outcome repeating them, charge at least
+    /// those bytes without any publication, so an outbox of exactly that
+    /// charge refuses another reservation while the revision waits and
+    /// admits one once it is written.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the revision is undercharged, a reservation is admitted
+    /// while it waits, or none is once it is written.
+    #[tokio::test]
+    async fn checkpoint_charge_tracks_variable_settlements() {
+        let value = 64 * 1024;
+        let requirement = RequirementResult {
+            id: TaskId::new("judge").expect("task id"),
+            step: None,
+            item_index: None,
+            iteration_index: None,
+            statement: "judge".to_owned(),
+            outcome: RequirementOutcome::Passed,
+            reason: "r".repeat(value),
+            actual: Some(serde_json::Value::String("a".repeat(value))),
+            citations: Vec::new(),
+            data: Some(serde_json::Map::from_iter([(
+                "d".to_owned(),
+                serde_json::Value::String("d".repeat(value)),
+            )])),
+            detail: None,
+            check: serde_json::from_value::<Check>(serde_json::json!({
+                "kind": "assert", "path": "inputs.x", "operator": "equals", "expected": true
+            }))
+            .expect("assert check decodes"),
+            provenance: None,
+        };
+        let mut state = wyrd_spec::verification::state::ExecutionState::fresh();
+        state
+            .invocations
+            .push(wyrd_spec::verification::state::InvocationRecord {
+                sequence: 1,
+                producer: wyrd_spec::verification::execution::Producer {
+                    step_id: requirement.id.clone(),
+                    item_index: None,
+                    iteration_index: None,
+                    attempt: 1,
+                },
+                settlement: Some(
+                    wyrd_spec::verification::execution::InvocationSettlement::Requirement {
+                        result: Box::new(requirement.clone()),
+                    },
+                ),
+            });
+        state.terminal = Some(wyrd_spec::verification::state::TerminalSelection {
+            result_id: wyrd_spec::ids::VerificationResultId::new_v7(),
+            started_at: Utc::now(),
+            ended_at: Utc::now(),
+            outcome: VerificationOutcome {
+                verdict: VerificationVerdict::Passed,
+                requirements: vec![requirement],
+                steps: Vec::new(),
+                evidence: std::collections::BTreeMap::new(),
+            },
+        });
+        let (write, acked) = execution_state_of(ExecutionId::new_v7(), state);
+        let weight = ScribeSink::weight(&write);
+        assert!(
+            weight >= 6 * value,
+            "a revision is charged its six {value}-byte values, not {weight}"
+        );
+
+        let scribe = Arc::new(TableGate::new(ScribeTable::ExecutionEvents));
+        let outbox = ScribeSink::bounded_outbox(
+            Some(ScribeRoute::Local(Arc::clone(&scribe) as _, None)),
+            BIFROST_INGEST_REQUEST_LIMIT_BYTES,
+            wyrd_runtime::outbox::OutboxLimits {
+                items: 16,
+                bytes: weight,
+            },
+            None,
+        );
+        let tenant = DataTenantId::new_v7();
+        outbox
+            .reserve(1)
+            .expect("an empty outbox admits the revision")
+            .stage(tenant, write);
+        let Err(refused) = outbox.reserve(1) else {
+            panic!("a waiting revision holds its whole charge");
+        };
+        assert_eq!(refused.unit, "bytes");
+        scribe.release.add_permits(1);
+        tokio::time::timeout(Duration::from_secs(10), acked)
+            .await
+            .expect("the revision is written")
+            .expect("the revision is accepted");
+        assert_eq!(
+            outbox
+                .settle(Instant::now() + Duration::from_secs(10))
+                .await,
+            0
+        );
+        outbox
+            .reserve(1)
+            .expect("a written revision releases its charge");
+    }
+
     /// Proves the frames of a mixed slice build every staged audit and
-    /// Verifier row straight into one dense batch per destination: each
+    /// Verifier row straight into one dense batch per destination, or per
+    /// result for a Verifier result's own frames: each
     /// encoded frame decodes to exactly the rows its writes' own one-row
     /// projections hold, in slice order with nulls and Variants intact, each
     /// attributed row followed by its own write's subject and actor, audit
@@ -2314,18 +2653,20 @@ mod tests {
             seen,
             [
                 (ScribeTable::AuditLog, vec![0, 3]),
-                (ScribeTable::ExecutionOutputs, vec![1, 4]),
+                (ScribeTable::ExecutionOutputs, vec![1]),
                 (ScribeTable::ExecutionInputs, vec![2]),
+                (ScribeTable::ExecutionOutputs, vec![4]),
                 (ScribeTable::Calls, vec![5]),
                 (ScribeTable::Spans, vec![5]),
-                (ScribeTable::Results, vec![1, 4]),
+                (ScribeTable::Results, vec![1]),
+                (ScribeTable::Results, vec![4]),
             ]
         );
     }
 
-    /// Proves one Verifier execution's inputs record and result share a lane
-    /// whatever the attempt or Card judged, while different executions of
-    /// one tenant spread over several.
+    /// Proves one Verifier execution's inputs record, state revisions, and
+    /// result share a lane whatever the attempt or Card judged, while
+    /// different executions of one tenant spread over several.
     ///
     /// # Panics
     ///
@@ -2337,6 +2678,7 @@ mod tests {
             .map(|_| {
                 let execution = ExecutionId::new_v7();
                 let lane = ScribeSink::lane(&direct_inputs(execution, background()));
+                assert_eq!(ScribeSink::lane(&execution_state(execution).0), lane);
                 for _ in 0..2 {
                     let attempt = execution_result(execution, &uid(), background(), 0, 0);
                     assert_eq!(ScribeSink::lane(&attempt), lane);
@@ -2345,6 +2687,41 @@ mod tests {
             })
             .collect();
         assert!(lanes.len() > 1, "one tenant's executions spread over lanes");
+    }
+
+    /// Proves a state revision is acknowledged once its own frame is,
+    /// while another frame of its slice is still held in Scribe.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the revision waits for the held frame or the slice
+    /// completes before it is released.
+    #[tokio::test]
+    async fn a_revision_is_acknowledged_at_its_own_frame() {
+        let scribe = Arc::new(TableGate::new(ScribeTable::Objects));
+        let outbox = ScribeSink::local_outbox(Arc::clone(&scribe) as _, None);
+        let tenant = DataTenantId::new_v7();
+        let (revision, acked) = execution_state(ExecutionId::new_v7());
+        let slice = vec![object("held").0, revision];
+        let writing = tokio::spawn({
+            let outbox = Arc::clone(&outbox);
+            async move {
+                outbox
+                    .sink()
+                    .write(tenant, uuid::Uuid::now_v7(), &slice)
+                    .await
+            }
+        });
+        tokio::time::timeout(Duration::from_secs(10), acked)
+            .await
+            .expect("the revision is not held by its slice")
+            .expect("the revision is accepted");
+        assert!(!writing.is_finished(), "the object frame is still held");
+        scribe.release.add_permits(1);
+        writing
+            .await
+            .expect("the write completes")
+            .expect("the slice is written");
     }
 
     /// A Scribe that holds every frame naming execution `held` until
@@ -2531,64 +2908,6 @@ mod tests {
         assert_eq!(summaries(&scribe.inner.received()), 3);
     }
 
-    /// A Scribe that admits every frame through `inner`, holding each storage
-    /// object frame until `release` has a permit.
-    struct ObjectGate {
-        /// Records every admitted frame and answers scripted refusals.
-        inner: Arc<RecordingScribe>,
-        /// Permits the held object frames wait for.
-        release: tokio::sync::Semaphore,
-        /// Signalled when an object frame arrives.
-        arrived: tokio::sync::Notify,
-    }
-
-    #[async_trait::async_trait]
-    impl Scribe for ObjectGate {
-        /// Always ready.
-        fn is_ready(&self) -> bool {
-            true
-        }
-
-        /// Admits `frame` through the recording Scribe, after a release
-        /// permit when it names the object inventory.
-        ///
-        /// # Errors
-        ///
-        /// Returns the recording Scribe's scripted refusal.
-        ///
-        /// # Panics
-        ///
-        /// Panics when the release semaphore is closed while an object frame
-        /// waits.
-        async fn ingest_frame(
-            &self,
-            frame: ScribeIngressFrame,
-        ) -> Result<FrameAdmission, ScribeError> {
-            if frame.table == ScribeTable::Objects.table_ref() {
-                self.arrived.notify_one();
-                self.release
-                    .acquire()
-                    .await
-                    .expect("the release stays open")
-                    .forget();
-            }
-            self.inner.ingest_frame(frame).await
-        }
-
-        /// Resolves through the recording Scribe.
-        ///
-        /// # Errors
-        ///
-        /// Returns the recording Scribe's resolution error.
-        async fn resolve_write_table(
-            &self,
-            tenant: DataTenantId,
-            table: &TableRef,
-        ) -> Result<TableUid, ScribeError> {
-            self.inner.resolve_write_table(tenant, table).await
-        }
-    }
-
     /// One completed storage object write at `path`, and the receiver its
     /// acknowledgement fires.
     ///
@@ -2654,11 +2973,7 @@ mod tests {
                 .find(|write| lane(write) != held_lane)
                 .expect("some write takes another lane")
         };
-        let scribe = Arc::new(ObjectGate {
-            inner: Arc::default(),
-            release: tokio::sync::Semaphore::new(0),
-            arrived: tokio::sync::Notify::new(),
-        });
+        let scribe = Arc::new(TableGate::new(ScribeTable::Objects));
         let outbox = route_outbox(
             ScribeRoute::Local(Arc::clone(&scribe) as _, None),
             BIFROST_INGEST_REQUEST_LIMIT_BYTES,
@@ -2864,6 +3179,60 @@ mod tests {
             .map(|frame| frame.batch_id)
             .collect::<HashSet<_>>();
         assert_eq!(held, submitted[..2].iter().copied().collect::<HashSet<_>>());
+    }
+
+    /// Proves a selected result keeps its write identities however it is
+    /// staged: written in three slices, alongside or after other results and
+    /// in either order, its output and its summary are each their own
+    /// one-row frame under one batch id per table, carrying the same
+    /// encoded rows every time, the two tables' ids differ, and other
+    /// results keep their own ids. Five result writes cost ten frames.
+    ///
+    /// # Panics
+    ///
+    /// Panics when a resubmission changes a result's identity or rows, two
+    /// results or tables share an identity, or a frame holds another row.
+    #[tokio::test]
+    async fn result_redelivery_keeps_batch_identity() {
+        let scribe = Arc::new(RecordingScribe::default());
+        let outbox = ScribeSink::local_outbox(Arc::clone(&scribe) as _, None);
+        let tenant = DataTenantId::new_v7();
+        let attribution = background();
+        let [selected, other, later] = [(); 3].map(|()| result(&uid(), attribution));
+        let slices = [
+            vec![copied(&selected), other],
+            vec![later, copied(&selected)],
+            vec![selected],
+        ];
+        for slice in &slices {
+            outbox
+                .sink()
+                .write(tenant, uuid::Uuid::now_v7(), slice)
+                .await
+                .expect("the slice is written");
+        }
+
+        let received = scribe.received();
+        assert_eq!(received.len(), 10, "two one-row frames per result write");
+        let mut identities = HashMap::<(String, String), HashSet<_>>::new();
+        for frame in &received {
+            let [result_id] = frame_results(frame).try_into().expect("one row per frame");
+            identities
+                .entry((frame.table.clone(), result_id))
+                .or_default()
+                .insert((frame.batch_id, frame.ipc.clone()));
+        }
+        assert_eq!(identities.len(), 6, "three results in two tables");
+        assert!(
+            identities.values().all(|written| written.len() == 1),
+            "every write of a result carries one identity and its rows: {identities:?}"
+        );
+        let ids = identities
+            .values()
+            .flatten()
+            .map(|(batch_id, _)| *batch_id)
+            .collect::<HashSet<_>>();
+        assert_eq!(ids.len(), 6, "no two results or tables share an identity");
     }
 
     /// Proves a terminal refusal is consumed: the rejected frame is dropped,
@@ -3116,20 +3485,27 @@ mod tests {
         frames
             .iter()
             .filter(|frame| frame.table == "bifrost.verification.execution_outputs")
-            .flat_map(|frame| {
-                StreamReader::try_new(std::io::Cursor::new(frame.ipc.clone()), None)
-                    .expect("an item frame opens")
-                    .flat_map(|batch| {
-                        let batch = batch.expect("an item batch decodes");
-                        let ids = batch
-                            .column_by_name("result_id")
-                            .expect("result_id column")
-                            .as_string::<i32>()
-                            .clone();
-                        (0..ids.len())
-                            .map(|row| ids.value(row).to_owned())
-                            .collect::<Vec<_>>()
-                    })
+            .flat_map(frame_results)
+            .collect()
+    }
+
+    /// The result ID of every row of the Verifier result `frame`, in order.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the frame does not decode.
+    fn frame_results(frame: &Received) -> Vec<String> {
+        StreamReader::try_new(std::io::Cursor::new(frame.ipc.clone()), None)
+            .expect("a result frame opens")
+            .flat_map(|batch| {
+                let batch = batch.expect("a result batch decodes");
+                let ids = batch
+                    .column_by_name("result_id")
+                    .expect("result_id column")
+                    .as_string::<i32>()
+                    .clone();
+                (0..ids.len())
+                    .map(|row| ids.value(row).to_owned())
                     .collect::<Vec<_>>()
             })
             .collect()
@@ -3290,9 +3666,11 @@ mod tests {
             ScribeWrite::Result {
                 payload,
                 attribution,
+                ..
             } => ScribeWrite::Result {
                 payload: payload.clone(),
                 attribution: *attribution,
+                acked: Mutex::new(None),
             },
             ScribeWrite::ExecutionInputs {
                 row,

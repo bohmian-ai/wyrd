@@ -403,9 +403,8 @@ impl Observe<'_> {
     /// subject without waiting for a judgment.
     ///
     /// Run evidence is staged for one queued execution and returns its
-    /// [`Execution`]; a `202` confirms staging, not queue
-    /// acceptance, so a replay conflict or a loss before acceptance surfaces
-    /// through the handle. Window samples are recorded through this state's
+    /// [`Execution`] once it is durably admitted; an idempotency conflict
+    /// or a loss before admission is returned as an error. Window samples are recorded through this state's
     /// Bifrost Drift observation path and return [`Submission::Recorded`]:
     /// the Verifier's schedule judges the window later.
     ///

@@ -191,6 +191,13 @@ pub enum ScribeBatchCommitResolution {
     /// is decided by preparing them under that version, never by comparing a
     /// digest computed under a different definition.
     AcceptedUnder(TableVersion),
+    /// The batch id is spent by different rows under the same table version.
+    ///
+    /// The first fence holds the batch id, so this batch is refused. Like
+    /// [`Self::AcceptedUnder`], the caller must drop the transaction without
+    /// COMMIT and offer the group's other fences again, so the refused batch
+    /// never becomes durable or visible and its siblings still commit.
+    Conflicted,
 }
 
 /// Durable replay decision for one tenant/table/batch identity.
@@ -258,8 +265,8 @@ pub async fn resolve_replay(
 ///
 /// # Errors
 ///
-/// Returns [`SqlError`] when a fence's tenant differs from `conn`, the lookup
-/// is unavailable, or a durable row holds different rows under its identity.
+/// Returns [`SqlError`] when a fence's tenant differs from `conn` or the
+/// lookup is unavailable.
 pub async fn resolve<'a>(
     conn: &mut TenantConn<'_>,
     commits: impl Iterator<Item = &'a ScribeBatchCommit> + Clone,
@@ -353,6 +360,34 @@ pub async fn accepted_version(
         .transpose()
 }
 
+/// The batch ids among `batch_ids` that hold a durable fence on
+/// `logical_table_fqn`, in no particular order.
+///
+/// A fence commits before its batch is acknowledged and is never removed, so
+/// an id answered here names a batch whose rows are authoritative in Bifrost,
+/// whether or not a query can see them yet, and an id not answered was never
+/// acknowledged. A caller that derives its batch ids from its own record
+/// identity learns which of its records were accepted without a record index.
+///
+/// # Errors
+///
+/// Returns [`SqlError`] when PostgreSQL cannot execute the tenant-scoped read.
+pub async fn committed_batches(
+    conn: &mut TenantConn<'_>,
+    logical_table_fqn: &str,
+    batch_ids: &[uuid::Uuid],
+) -> Result<Vec<uuid::Uuid>, SqlError> {
+    sqlx::query_scalar(
+        "SELECT batch_id FROM vala.scribe_batch_commits \
+          WHERE logical_table_fqn = $1 AND batch_id = ANY($2::uuid[])",
+    )
+    .bind(logical_table_fqn)
+    .bind(batch_ids)
+    .fetch_all(&mut **conn.transaction())
+    .await
+    .map_err(SqlError::from)
+}
+
 /// Reads the `PostgreSQL` instant Scribe anchors its admission clock on.
 ///
 /// PostgreSQL is the clock of record for `wyrd_ingested_at`: the value is
@@ -381,12 +416,13 @@ pub async fn ingest_instant(conn: &mut TenantConn<'_>) -> Result<DateTime<Utc>, 
 /// [`ScribeBatchCommitResolution::AlreadyCommitted`] and the caller must not
 /// make them visible again, a fence of another table version is
 /// [`ScribeBatchCommitResolution::AcceptedUnder`] that version, and different
-/// rows under the same version are a contradiction. `Absent` is never returned.
+/// rows under the same version are
+/// [`ScribeBatchCommitResolution::Conflicted`]; after either the caller must
+/// not commit. `Absent` is never returned.
 ///
 /// A fence is keyed by tenant, table, and batch id, never by its position:
 /// `RETURNING` does not preserve input order, and one batch id may name
-/// batches of different tables. A contradiction returns an error before the
-/// caller commits, so none of the group's fresh fences become durable.
+/// batches of different tables.
 ///
 /// `ingested_at` is each batch's admission instant from [`ingest_instant`],
 /// the same value stamped on its rows. It is not part of the identity: a
@@ -394,9 +430,8 @@ pub async fn ingest_instant(conn: &mut TenantConn<'_>) -> Result<DateTime<Utc>, 
 ///
 /// # Errors
 ///
-/// Returns [`SqlError`] when a fence's tenant does not match `conn`, the
-/// insert fails, or an existing commit holds different rows under the same
-/// identity.
+/// Returns [`SqlError`] when a fence's tenant does not match `conn` or the
+/// insert fails.
 pub async fn record(
     conn: &mut TenantConn<'_>,
     commits: &[(ScribeBatchCommit, DateTime<Utc>)],
@@ -542,14 +577,16 @@ fn find<'a>(
 
 /// Classifies `commit` against the durable fence holding its identity.
 ///
-/// A fence accepted under another recorded version answers that version
-/// rather than a contradiction, so the caller can compare the batch under
-/// the definition that accepted it.
+/// A fence accepted under another recorded version answers that version, so
+/// the caller can compare the batch under the definition that accepted it,
+/// and different rows under the same version answer
+/// [`ScribeBatchCommitResolution::Conflicted`]: the first fence keeps the
+/// batch id.
 ///
 /// # Errors
 ///
-/// Returns [`SqlError`] when the durable fence holds different rows under
-/// the same version, or no recorded version.
+/// Returns [`SqlError`] when the durable fence holds other rows and no
+/// recorded version, so no conflict can be judged.
 fn classify(
     existing: &ExistingScribeBatchCommit,
     commit: &ScribeBatchCommit,
@@ -575,7 +612,10 @@ fn classify(
         offered_slice_count = commit.slice_count,
         "Scribe batch identity contradicts its durable fence"
     );
-    Err(invariant("scribe batch commit identity mismatch"))
+    if existing.table_version.is_none() {
+        return Err(invariant("scribe batch commit identity mismatch"));
+    }
+    Ok(ScribeBatchCommitResolution::Conflicted)
 }
 
 /// Refuses a fence offered for a tenant other than `conn`'s.

@@ -31,10 +31,12 @@ use tokio::time::Instant;
 
 use wyrd_spec::card::verifier::{Action, Check};
 use wyrd_spec::ids::SlotName;
-use wyrd_spec::verification::TaskId;
 use wyrd_spec::verification::execution::{
-    CallProvenance, InputDeclaration, RequirementDetail, ToolCallRecord, Verdict,
+    CallProvenance, InputDeclaration, InvocationSettlement, Producer, PublicationCollection,
+    RequirementDetail, ToolCallRecord, Verdict,
 };
+use wyrd_spec::verification::state::ControlRecord;
+use wyrd_spec::verification::{PublicationName, TaskId};
 
 mod drift;
 mod engine;
@@ -64,6 +66,23 @@ pub enum CallValue {
     Json(Value),
     /// Pinned original evidence a media slot names; executors fetch bytes.
     Evidence(InputDeclaration),
+    /// `steps.<id>.publications.<name>`: what `producer`, the step's
+    /// successful attempt, published under `name`. The host mounts it, or
+    /// refuses the call before it runs when no such publication exists.
+    Publication {
+        /// The successful producer attempt.
+        producer: Producer,
+        /// The logical name.
+        name: PublicationName,
+    },
+    /// `steps.<id>.publications`: the settled step's collection, whose
+    /// `entries` the host fills from the execution's admitted publications.
+    Publications {
+        /// The producer step.
+        step: TaskId,
+        /// Its status and attempts, with no entries yet.
+        collection: PublicationCollection,
+    },
 }
 
 /// A resolved binding plus the original input slots it derives from, so
@@ -94,6 +113,28 @@ pub struct BlockCall<'a, B> {
     pub workspace: BTreeMap<String, CallInput>,
     /// When the engine cancels this attempt.
     pub deadline: Instant,
+    /// The one-based attempt this call is, counting the block's recorded
+    /// attempts, so a host attributes what the attempt retains to it.
+    pub attempt: u32,
+    /// The zero-based fanout item this call serves, when its step fans out.
+    pub item_index: Option<u32>,
+    /// The zero-based repeat iteration this call serves, when its step
+    /// repeats.
+    pub iteration_index: Option<u32>,
+}
+
+impl<B> BlockCall<'_, B> {
+    /// The invocation attempt this call is: its block, item, iteration, and
+    /// attempt, the identity its retained work is attributed to.
+    #[must_use]
+    pub fn producer(&self) -> Producer {
+        Producer {
+            step_id: self.id.clone(),
+            item_index: self.item_index,
+            iteration_index: self.iteration_index,
+            attempt: self.attempt,
+        }
+    }
 }
 
 /// Data one step action produced.
@@ -150,6 +191,17 @@ pub enum BlockError {
         /// Bounded, secret-free cause.
         reason: String,
     },
+    /// An exact definition the block requires, such as its Agent or Prompt
+    /// Card, is unavailable.
+    ///
+    /// The block cannot run as declared, so it is never judged and spends
+    /// no authored retry: the engine stops the whole execution with
+    /// [`EngineError::DefinitionUnavailable`].
+    #[error("a required definition is unavailable: {reason}")]
+    Unavailable {
+        /// Bounded, secret-free cause naming the definition.
+        reason: String,
+    },
 }
 
 impl BlockError {
@@ -180,6 +232,51 @@ pub trait CheckExecutor: Send + Sync {
     /// Returns a [`BlockError`] when no verdict was produced; the engine
     /// records the requirement as inconclusive with the error as reason.
     async fn execute(&self, call: BlockCall<'_, Check>) -> Result<CheckOutput, BlockError>;
+}
+
+/// The durable record of one queued execution's block invocations.
+///
+/// The engine records each action or check attempt before dispatching it and
+/// commits the block's settlement before its dependents run, so a reclaimed
+/// execution restores what settled and counts what never did. The host fences
+/// both writes with the execution's lease; direct verify runs without one.
+#[async_trait]
+pub trait Checkpoints: Send + Sync {
+    /// Record that the invocation attempt `producer` starts: a block, its
+    /// item and iteration, and its one-based attempt.
+    ///
+    /// # Errors
+    /// Returns a bounded reason when the record cannot commit, such as a lost
+    /// lease; the attempt is then not dispatched.
+    async fn begin(&self, producer: &Producer) -> Result<(), String>;
+
+    /// Forget the unsettled attempt `producer`, which was refused process
+    /// capacity or its definition, so it spends nothing. A host keeps the
+    /// record of an attempt that already retained work, which stays spent.
+    ///
+    /// # Errors
+    /// Returns a bounded reason when the record cannot be removed.
+    async fn forget(&self, producer: &Producer) -> Result<(), String>;
+
+    /// Commit `settled` as the outcome of the attempt `producer`.
+    ///
+    /// # Errors
+    /// Returns a bounded reason when the settlement cannot commit; the block's
+    /// dependents then do not run.
+    async fn settle(
+        &self,
+        producer: &Producer,
+        settled: &InvocationSettlement,
+    ) -> Result<(), String>;
+
+    /// Record a scheduling decision recovery must reproduce rather than make
+    /// again, such as a step's frozen fanout items or a speculative step's
+    /// disposition, before anything depends on it.
+    ///
+    /// # Errors
+    /// Returns a bounded reason when the decision cannot commit; nothing that
+    /// depends on it then runs.
+    async fn control(&self, control: &ControlRecord) -> Result<(), String>;
 }
 
 /// Decodes a check's raw `response` as the Verdict its declared `schema`
@@ -270,6 +367,9 @@ mod tests {
             inputs: BTreeMap::from([("from".to_owned(), input)]),
             workspace: BTreeMap::new(),
             deadline: Instant::now() + Duration::from_secs(5),
+            attempt: 1,
+            item_index: None,
+            iteration_index: None,
         };
         let output = executor.execute(call).await.expect("output");
         assert_eq!(output.output, json!({"slides": []}));

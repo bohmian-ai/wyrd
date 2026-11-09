@@ -485,8 +485,24 @@ async function enqueueOverHttp(
   idempotencyKey: string,
   body: object,
 ): Promise<string> {
+  const response = await enqueueResponse(baseUrl, client, idempotencyKey, body);
+  const accepted = (await response.json()) as { execution_id: string };
+  expect(response.status, JSON.stringify(accepted)).toBe(202);
+  return accepted.execution_id;
+}
+
+/**
+ * The raw answer to enqueueing `body` over plain HTTP as `client` under
+ * `idempotencyKey`.
+ */
+async function enqueueResponse(
+  baseUrl: string,
+  client: WyrdClient,
+  idempotencyKey: string,
+  body: object,
+): Promise<Response> {
   const token = await client.accessToken();
-  const response = await fetch(`${baseUrl}/v1/verification/enqueue`, {
+  return await fetch(`${baseUrl}/v1/verification/enqueue`, {
     method: "POST",
     headers: {
       "x-wyrd-access-token": `Bearer ${token}`,
@@ -495,9 +511,6 @@ async function enqueueOverHttp(
     },
     body: JSON.stringify(body),
   });
-  const accepted = (await response.json()) as { execution_id: string };
-  expect(response.status, JSON.stringify(accepted)).toBe(202);
-  return accepted.execution_id;
 }
 
 /**
@@ -556,13 +569,12 @@ test("grouped support resumes", async ({ server, assistant }) => {
   });
   const replayed = await enqueueOverHttp(server.baseUrl, client, "support-turn-0006", body(turns[5]));
   expect(await enqueueOverHttp(server.baseUrl, client, "support-turn-0006", body(turns[5]))).toBe(replayed);
-  // An ungrouped conflicting body: a staged input the queue later refuses
-  // would otherwise join the group.
+  // An ungrouped conflicting body: its staged input, which the queue
+  // refuses, would otherwise join the group.
   const { group_id: _, ...ungrouped } = body({ answer: "" });
-  const conflict = await enqueueOverHttp(server.baseUrl, client, "support-turn-0006", ungrouped);
-  await expect((await verify.Execution.connect(conflict)).wait({ timeoutMs: WAIT_MS })).rejects.toMatchObject({
-    code: "WYRD_REGISTRY_409_IDEMPOTENCY_CONFLICT",
-  });
+  const conflict = await enqueueResponse(server.baseUrl, client, "support-turn-0006", ungrouped);
+  expect(conflict.status).toBe(409);
+  expect(await conflict.json()).toMatchObject({ code: "WYRD_REGISTRY_409_IDEMPOTENCY_CONFLICT" });
   await (await verify.Execution.connect(replayed)).wait({ timeoutMs: WAIT_MS });
   // A WyrdState would carry its Service root for the administrator too, so
   // the ownerless turn is the administrator's rootless enqueue.

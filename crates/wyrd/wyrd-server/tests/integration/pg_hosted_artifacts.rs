@@ -62,7 +62,9 @@ use wyrd_spec::reference::{CardRef, InlineableRef, Ref};
 use wyrd_spec::request_id::RequestId;
 use wyrd_spec::verification::TaskId;
 use wyrd_spec::verification::VerificationVerdict;
-use wyrd_spec::verification::execution::{CallProvenance, Citation, InputDeclaration, Locator};
+use wyrd_spec::verification::execution::{
+    CallProvenance, Citation, InputDeclaration, InvocationSettlement, Locator,
+};
 use wyrd_testing::logs::LogCapture;
 use wyrd_testing::verification::VerificationFixture;
 use wyrd_testing::{Bootstrap, WyrdTestServer, WyrdTestServerBuilder};
@@ -304,6 +306,9 @@ async fn artifact_evidence_and_code_reach_every_consumer() {
             )]),
             workspace: BTreeMap::new(),
             deadline: Instant::now() + Duration::from_secs(30),
+            attempt: 1,
+            item_index: None,
+            iteration_index: None,
         },
     )
     .await
@@ -562,7 +567,7 @@ async fn evidence_metadata_is_resolved_once() {
 }
 
 /// Refuses every registry lookup; the Agent here is authored inline.
-struct NoRegistry;
+pub(crate) struct NoRegistry;
 
 #[async_trait::async_trait]
 impl AgentCardResolver for NoRegistry {
@@ -591,7 +596,7 @@ impl PromptCardResolver for NoRegistry {
 }
 
 /// One scripted OpenAI answer: `text`, or else the `calls` it requests.
-fn answer(text: Option<&str>, calls: &[(&str, Value)]) -> ProviderResponse {
+pub(crate) fn answer(text: Option<&str>, calls: &[(&str, Value)]) -> ProviderResponse {
     let tool_calls = (!calls.is_empty()).then(|| {
         calls
             .iter()
@@ -640,7 +645,7 @@ fn answer(text: Option<&str>, calls: &[(&str, Value)]) -> ProviderResponse {
 ///
 /// # Panics
 /// Panics when the static Prompt or schema is invalid.
-fn reviewer(tools: &[&str]) -> AgentCall {
+pub(crate) fn reviewer(tools: &[&str]) -> AgentCall {
     let prompt = openai_chat(
         "gpt-test",
         OpenAiChatOptions {
@@ -831,6 +836,9 @@ async fn recovered_authority_bounds_every_agent_tool() {
                     },
                 )]),
                 deadline: Instant::now() + Duration::from_secs(60),
+                attempt: 1,
+                item_index: None,
+                iteration_index: None,
             },
         )
         .await
@@ -874,6 +882,9 @@ async fn recovered_authority_bounds_every_agent_tool() {
             inputs: document(output.output.clone()),
             workspace: BTreeMap::new(),
             deadline: Instant::now() + Duration::from_secs(60),
+            attempt: 1,
+            item_index: None,
+            iteration_index: None,
         },
     )
     .await
@@ -891,15 +902,18 @@ async fn recovered_authority_bounds_every_agent_tool() {
     assert!(matches!(refused, BlockError::Terminal { .. }), "{refused}");
 }
 
-/// Agent and Prompt Card resolution is the caller's audited `card:read`:
-/// a caller with the grant reaches the Card (and is then told it is not an
-/// Agent or Prompt), while no grant, another tenant, or no caller at all
-/// refuses before the Card is read.
+/// Agent and Prompt Card resolution is the caller's audited `verifier:run`
+/// on the executing Verifier, never `cards:read`: a caller holding only that
+/// grant resolves the exact Agent and its Prompt, which it could not read as
+/// Cards. Another kind, a mismatched UID, a `cards:read`-only caller,
+/// another tenant, or a deleted Agent is unavailable, and no caller at all
+/// refuses.
 ///
 /// # Panics
-/// Panics when a lookup reads a Card its caller may not read.
+/// Panics when a lookup resolves what its caller may not run, or refuses
+/// what it may.
 #[tokio::test]
-async fn card_resolution_is_the_callers_read() {
+async fn card_resolution_is_the_verifier_run() {
     let registered = Registered::start().await;
     let state = registered.server.state().clone();
     let tenant = registered.server.data_tenant_id();
@@ -908,45 +922,93 @@ async fn card_resolution_is_the_callers_read() {
         .seed_tenant("hosted-registry-other")
         .await
         .expect("the other tenant seeds");
-    let card = &registered.card;
-    let registry = |caller: Option<Caller>| TenantRegistry::new(state.clone(), caller);
-    let reason = |error: BlockError| match error {
-        BlockError::Terminal { reason } => reason,
-        BlockError::Retryable { reason } => panic!("retryable: {reason}"),
-        BlockError::Busy { reason } => panic!("busy: {reason}"),
+    let Bootstrap::User { jwt, .. } = registered
+        .server
+        .bootstrap_user("hosted-registry-writer", &["editor"])
+        .await
+        .expect("writer bootstraps")
+    else {
+        panic!("user bootstrap returned a non-user principal");
     };
-
-    let readable = registry(Some(user(tenant, [Permission::card_read()])));
-    let read = reason(
-        AgentCardResolver::resolve(&readable, card)
-            .await
-            .expect_err("an Artifact is not an Agent"),
+    let uid = crate::pg_principal_roles::register_agent(&registered.server, &jwt, "reviewer").await;
+    let exact = |kind: &str, name: &str, uid: Option<&CardUid>| -> CardRef {
+        serde_json::from_value(json!({"kind": kind, "name": name, "version": "1.0.0", "uid": uid}))
+            .expect("reference")
+    };
+    let agent = exact("Agent", "reviewer", Some(&uid));
+    let prompt = exact("Prompt", "reviewer-prompt", None);
+    let verifier = CardUid::from_uuid(uuid::Uuid::now_v7()).expect("uid");
+    let registry =
+        |caller: Option<Caller>| TenantRegistry::new(state.clone(), caller, verifier.clone());
+    let runner = user(tenant, [Permission::verifier_run(verifier.clone())]);
+    assert!(
+        state
+            .auth
+            .permission_check
+            .check(&runner.principal, &Permission::card_read())
+            .into_result()
+            .is_err(),
+        "the runner may not read Cards"
     );
-    assert!(read.contains("is not an Agent"), "{read}");
-    let read = reason(
-        PromptCardResolver::resolve(&readable, card)
-            .await
-            .expect_err("an Artifact is not a Prompt"),
-    );
-    assert!(read.contains("is not a Prompt"), "{read}");
+    AgentCardResolver::resolve(&registry(Some(runner.clone())), &agent)
+        .await
+        .expect("the exact Agent resolves");
+    PromptCardResolver::resolve(&registry(Some(runner.clone())), &prompt)
+        .await
+        .expect("its exact Prompt resolves");
 
-    for caller in [
-        Some(user(tenant, [])),
-        Some(user(other, [Permission::card_read()])),
-        None,
+    let mismatched = exact("Agent", "reviewer", registered.card.uid.as_ref());
+    for (caller, reference) in [
+        (Some(runner.clone()), &registered.card),
+        (Some(runner), &mismatched),
+        (Some(user(tenant, [Permission::card_read()])), &agent),
+        (
+            Some(user(other, [Permission::verifier_run(verifier.clone())])),
+            &agent,
+        ),
     ] {
-        let refused = reason(
-            AgentCardResolver::resolve(&registry(caller), card)
-                .await
-                .expect_err("refused"),
+        let refused = AgentCardResolver::resolve(&registry(caller), reference)
+            .await
+            .expect_err("unavailable");
+        assert!(
+            matches!(&refused, BlockError::Unavailable { reason } if reason.contains("is unavailable")),
+            "{refused}"
         );
-        assert!(!refused.contains("is not an Agent"), "{refused}");
     }
+    let refused = AgentCardResolver::resolve(&registry(None), &agent)
+        .await
+        .expect_err("no caller");
+    assert!(matches!(refused, BlockError::Terminal { .. }), "{refused}");
+
+    let mut conn = registered
+        .server
+        .tenant_conn_for(tenant)
+        .await
+        .expect("tenant connection");
+    sqlx::query("UPDATE wyrd.cards SET status = 'deleted' WHERE card_uid = $1")
+        .bind(uid.as_uuid())
+        .execute(&mut **conn.transaction())
+        .await
+        .expect("the Agent is deleted");
+    conn.commit().await.expect("deletion commits");
+    let deleted = AgentCardResolver::resolve(
+        &registry(Some(user(
+            tenant,
+            [Permission::verifier_run(verifier.clone())],
+        ))),
+        &agent,
+    )
+    .await
+    .expect_err("a deleted Agent is unavailable");
+    assert!(
+        matches!(deleted, BlockError::Unavailable { .. }),
+        "{deleted}"
+    );
 }
 
 /// Hosted limits of a one-worker pool with no waiters and one workspace, so
 /// a single held admission saturates each.
-fn saturable() -> HostedLimits {
+pub(crate) fn saturable() -> HostedLimits {
     HostedLimits {
         monty_min_workers: 0,
         monty_max_workers: 1,
@@ -1031,6 +1093,9 @@ async fn capacity_refusal_is_busy_at_every_hosted_consumer() {
                 inputs: one(),
                 workspace: BTreeMap::new(),
                 deadline: far,
+                attempt: 1,
+                item_index: None,
+                iteration_index: None,
             },
         )
     };
@@ -1049,6 +1114,9 @@ async fn capacity_refusal_is_busy_at_every_hosted_consumer() {
                 inputs: one(),
                 workspace: BTreeMap::new(),
                 deadline: far,
+                attempt: 1,
+                item_index: None,
+                iteration_index: None,
             },
         )
         .await
@@ -1091,6 +1159,9 @@ async fn capacity_refusal_is_busy_at_every_hosted_consumer() {
                     inputs: document(json!("the notes")),
                     workspace: notes_workspace(registered),
                     deadline: Instant::now() + Duration::from_secs(30),
+                    attempt: 1,
+                    item_index: None,
+                    iteration_index: None,
                 },
             )
             .await
@@ -1314,17 +1385,20 @@ async fn artifact_evidence_is_admitted_against_its_slot_and_the_combined_limit()
         let (caller, state) = (&caller, registered.server.state());
         async move {
             let routes = BTreeMap::new();
+            let verifier = CardUid::from_uuid(uuid::Uuid::now_v7()).expect("uid");
             blocks
                 .engine(
                     state,
                     Execution {
                         caller,
+                        verifier: &verifier,
                         evidence: &evidence,
                         routes: &routes,
                         subject: GatewayCallContext::default(),
                         defer_unlanded_traces: false,
                         drift: DriftChecks::new(None, BTreeMap::new(), BTreeMap::new()),
                         clock: BlockClock::default(),
+                        execution: None,
                     },
                 )
                 .expect("engine builds")
@@ -1529,4 +1603,151 @@ async fn nonconforming_queued_evidence_errors_without_a_verdict() {
     }
     assert_eq!(settled[3].status, "completed", "{:?}", settled[3]);
     assert!(settled[3].result_id.is_some(), "{:?}", settled[3]);
+}
+
+/// A queued execution whose exact Agent, or that Agent's Prompt, was
+/// deleted before its Agent step starts settles `errored` with
+/// `capability_unavailable` on its first attempt under a submitter holding
+/// only `verifier:run` on the Verifier: the predecessor code step's
+/// committed checkpoint stays readable, the Agent step leaves no invocation,
+/// and no verdict is judged. The hosted engine's native provider registry
+/// is empty and the test gateway reaches no provider, so no model call can
+/// happen.
+///
+/// # Panics
+/// Panics when the server, seeding, or runtime fails, or an execution
+/// settles otherwise or loses its predecessor checkpoint.
+#[tokio::test]
+async fn deleted_agent_definition_errors_queued_execution_as_unavailable() {
+    let registered = Registered::start().await;
+    let tenant = registered.server.data_tenant_id();
+    registered
+        .server
+        .ensure_builtin_tables_for_test(tenant)
+        .await
+        .expect("tenant receives every built-in table");
+    let state = registered.server.state().clone();
+    let seed = VerificationFixture::provision(&state, tenant)
+        .await
+        .expect("tenant provisions");
+    let (subject, _) = seed
+        .service("unavailable-subject")
+        .await
+        .expect("subject registers");
+    let Bootstrap::User { jwt, .. } = registered
+        .server
+        .bootstrap_user("unavailable-writer", &["editor"])
+        .await
+        .expect("writer bootstraps")
+    else {
+        panic!("user bootstrap returned a non-user principal");
+    };
+    let mut executions = Vec::new();
+    for deleted_kind in ["Agent", "Prompt"] {
+        let name = format!("unavailable-{}", deleted_kind.to_lowercase());
+        let agent =
+            crate::pg_principal_roles::register_agent(&registered.server, &jwt, &name).await;
+        let verifier = seed
+            .verifier(
+                &format!("{name}-verifier"),
+                &json!({
+                    "steps": [
+                        { "id": "prepare",
+                          "action": { "kind": "code", "entrypoint": "f",
+                                      "source": { "inline": "def f():\n    return 1" } } },
+                        { "id": "review",
+                          "action": { "kind": "agent",
+                                      "agent": { "kind": "Agent", "name": name, "version": "1.0.0", "uid": agent },
+                                      "inputs": { "prepared": "steps.prepare.output" } },
+                          "requirements": [{ "id": "reviewed", "statement": "The Agent reviews.",
+                              "check": { "kind": "assert", "path": "steps.review.output",
+                                         "operator": "is_not_null" } }] }
+                    ]
+                }),
+            )
+            .await
+            .expect("Verifier registers");
+        let deleted = if deleted_kind == "Agent" {
+            name.clone()
+        } else {
+            format!("{name}-prompt")
+        };
+        let mut conn = registered
+            .server
+            .tenant_conn_for(tenant)
+            .await
+            .expect("tenant connection");
+        sqlx::query("UPDATE wyrd.cards SET status = 'deleted' WHERE name = $1")
+            .bind(&deleted)
+            .execute(&mut **conn.transaction())
+            .await
+            .expect("the definition is deleted");
+        conn.commit().await.expect("deletion commits");
+        let runner = seed
+            .clone()
+            .with_actor_permissions(PermissionSet::from_iter([Permission::verifier_run(
+                verifier.clone(),
+            )]));
+        executions.push(
+            runner
+                .submit(&verifier, &subject, BTreeMap::new())
+                .await
+                .expect("execution queues"),
+        );
+    }
+
+    let runtime = VerificationRuntime::builder(&state)
+        .limits(RuntimeLimits {
+            lease: Duration::from_mins(1),
+            execution_timeout: Duration::from_secs(20),
+            poll_interval: Duration::from_millis(50),
+            ..RuntimeLimits::default()
+        })
+        .build()
+        .expect("the runtime composes");
+    let stop = CancellationToken::new();
+    let task = tokio::spawn(runtime.run(stop.clone()));
+    let deadline = Instant::now() + Duration::from_mins(1);
+    let mut settled = Vec::new();
+    for &execution in &executions {
+        settled.push(loop {
+            let row = seed.execution(execution).await.expect("execution reads");
+            if !matches!(row.status.as_str(), "pending" | "running" | "retrying") {
+                break row;
+            }
+            assert!(Instant::now() < deadline, "{execution} never settled");
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        });
+    }
+    stop.cancel();
+    task.await.expect("the runtime stops");
+
+    for (execution, row) in executions.into_iter().zip(settled) {
+        assert_eq!(
+            (row.status.as_str(), row.attempts, row.error_code.as_deref()),
+            ("errored", 1, Some("capability_unavailable")),
+            "{row:?}"
+        );
+        assert!(row.result_id.is_none(), "no verdict is judged: {row:?}");
+        let accepted = seed
+            .execution_state(&state, execution)
+            .await
+            .expect("the state reads")
+            .expect("the execution claimed its state");
+        let invocations: Vec<(&str, bool)> = accepted
+            .invocations
+            .iter()
+            .map(|entry| {
+                (
+                    entry.producer.step_id.as_str(),
+                    matches!(entry.settlement, Some(InvocationSettlement::Action { .. })),
+                )
+            })
+            .collect();
+        assert_eq!(
+            invocations,
+            [("prepare", true)],
+            "only the predecessor's settled checkpoint remains"
+        );
+    }
 }

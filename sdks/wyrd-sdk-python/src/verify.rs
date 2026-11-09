@@ -13,11 +13,14 @@ use pyo3::types::{PyBytes, PyDict, PyModule};
 use tokio::time::Instant;
 use wyrd_cards::card_ref::CardRefPy;
 use wyrd_client::WyrdClient;
-use wyrd_client::verify::{ArtifactRef, Execution, File};
+use wyrd_client::verify::{
+    ArtifactRef, Execution, ExecutionPageQuery, File, Producer, PublicationName,
+    PublicationSelector, TaskId,
+};
 use wyrd_spec::error::WyrdError;
 use wyrd_spec::ids::ExecutionId;
 use wyrd_spec::verification::execution::VerificationResult;
-use wyrd_utils::py::{WyrdPyError, WyrdPyResult, json_to_pyobject};
+use wyrd_utils::py::{WyrdPyError, WyrdPyResult, json_to_pyobject, pyobject_to_json};
 
 use crate::observe::invalid_argument;
 
@@ -126,6 +129,29 @@ impl PyExecution {
         Ok(self.inner.get(py, |client| Self::open(id, client))?)
     }
 
+    /// The step and attempt selector of the wire `producer` mapping, with
+    /// the directory file `path` a download names.
+    ///
+    /// # Errors
+    /// Raises `WYRD_SPEC_400_VALIDATION` for a mapping that is not a
+    /// producer.
+    fn selector(
+        producer: &Bound<'_, PyAny>,
+        path: Option<String>,
+    ) -> WyrdPyResult<(TaskId, PublicationSelector)> {
+        let producer: Producer = serde_json::from_value(pyobject_to_json(producer)?)
+            .map_err(|error| invalid_argument("producer", error))?;
+        Ok((
+            producer.step_id,
+            PublicationSelector {
+                attempt: producer.attempt,
+                item_index: producer.item_index,
+                iteration_index: producer.iteration_index,
+                path,
+            },
+        ))
+    }
+
     /// Connect the handle of `id` as `client`, or the ambient client.
     ///
     /// # Errors
@@ -229,6 +255,7 @@ impl PyExecution {
     /// Raises `WYRD_SPEC_400_VALIDATION` for a negative or non-finite
     /// `timeout`, the client's connection error on first use, the
     /// execution's terminal error, including a delayed idempotency conflict,
+    /// `WYRD_SDK_409_VERIFICATION_CANCELLED` for a cancelled execution,
     /// `WYRD_SDK_504_VERIFICATION_WAIT_TIMEOUT` when `timeout` passes first,
     /// and any other status-read error.
     fn wait(&self, py: Python<'_>, timeout: f64) -> WyrdPyResult<PyVerificationResult> {
@@ -259,6 +286,103 @@ impl PyExecution {
         data_type: &Bound<'_, PyAny>,
     ) -> WyrdPyResult<PyVerificationResult> {
         PyVerificationResult::typed(py, self.wait(py, timeout)?.result, data_type)
+    }
+
+    /// One page of the execution's invocation attempts with its status and
+    /// history projection position, as their wire mapping.
+    ///
+    /// # Errors
+    /// Raises `WYRD_SPEC_400_VALIDATION` for a `limit` outside 1–200 or a
+    /// cursor of another listing, the server's not-found error for an
+    /// absent or foreign execution, and its authorization or transport error.
+    #[pyo3(signature = (limit=None, cursor=None))]
+    fn invocations(
+        &self,
+        py: Python<'_>,
+        limit: Option<u32>,
+        cursor: Option<String>,
+    ) -> WyrdPyResult<Py<PyAny>> {
+        let page = ExecutionPageQuery { limit, cursor };
+        let page = crate::trace::block_on(py, self.handle(py)?.invocations(&page))?;
+        Ok(json_to_pyobject(py, &serde_json::to_value(page)?)?)
+    }
+
+    /// One page of the execution's accepted publication names, kinds, and
+    /// producers, never their content, as their wire mapping.
+    ///
+    /// # Errors
+    /// As [`PyExecution::invocations`].
+    #[pyo3(signature = (limit=None, cursor=None))]
+    fn publications(
+        &self,
+        py: Python<'_>,
+        limit: Option<u32>,
+        cursor: Option<String>,
+    ) -> WyrdPyResult<Py<PyAny>> {
+        let page = ExecutionPageQuery { limit, cursor };
+        let page = crate::trace::block_on(py, self.handle(py)?.publications(&page))?;
+        Ok(json_to_pyobject(py, &serde_json::to_value(page)?)?)
+    }
+
+    /// Publication `name` of the exact `producer` attempt, a mapping of
+    /// `step_id`, `attempt`, and optional `item_index` and `iteration_index`
+    /// as a publications page lists it: its JSON value or file or directory
+    /// manifest, as its wire mapping.
+    ///
+    /// # Errors
+    /// Raises `WYRD_SPEC_400_VALIDATION` for a malformed producer, name, or
+    /// zero attempt, `WYRD_VERIFICATION_404_PUBLICATION_NOT_FOUND` when that
+    /// attempt published no such name, and the errors of
+    /// [`PyExecution::invocations`].
+    fn publication(
+        &self,
+        py: Python<'_>,
+        producer: &Bound<'_, PyAny>,
+        name: &str,
+    ) -> WyrdPyResult<Py<PyAny>> {
+        let (step, selector) = Self::selector(producer, None)?;
+        let publication = crate::trace::block_on(
+            py,
+            self.handle(py)?
+                .publication(&step, &PublicationName::new(name)?, &selector),
+        )?;
+        Ok(json_to_pyobject(py, &serde_json::to_value(publication)?)?)
+    }
+
+    /// The download plan of `producer`'s file publication `name`, or of the
+    /// manifest `path` of its directory publication, as its wire mapping.
+    ///
+    /// # Errors
+    /// Raises `WYRD_SPEC_400_VALIDATION` for a JSON publication, a `path` on
+    /// a file, a directory without a listed `path`, and the errors of
+    /// [`PyExecution::publication`].
+    #[pyo3(signature = (producer, name, path=None))]
+    fn download(
+        &self,
+        py: Python<'_>,
+        producer: &Bound<'_, PyAny>,
+        name: &str,
+        path: Option<String>,
+    ) -> WyrdPyResult<Py<PyAny>> {
+        let (step, selector) = Self::selector(producer, path)?;
+        let plan = crate::trace::block_on(
+            py,
+            self.handle(py)?
+                .download(&step, &PublicationName::new(name)?, &selector),
+        )?;
+        Ok(json_to_pyobject(py, &serde_json::to_value(plan)?)?)
+    }
+
+    /// Cancel the execution durably and return its status, which an already
+    /// terminal execution keeps, as its wire mapping.
+    ///
+    /// # Errors
+    /// Raises the server's not-found error for an absent or foreign
+    /// execution, its `verifier:run` authorization error, and its transport
+    /// error.
+    fn cancel(&self, py: Python<'_>) -> WyrdPyResult<Py<PyAny>> {
+        let cancelled = crate::trace::block_on(py, self.handle(py)?.cancel())?;
+        Ok(json_to_pyobject(py, &serde_json::to_value(cancelled)?)?)
     }
 }
 

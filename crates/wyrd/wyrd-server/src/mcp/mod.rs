@@ -428,7 +428,19 @@ impl WyrdMcpHandler {
                     .await
                     .map_err(wyrd_error_to_mcp)
             }
-            name @ (verification::EVIDENCE | verification::EXECUTE | verification::ENQUEUE) => {
+            name @ (verification::LIST_INVOCATIONS
+            | verification::LIST_PUBLICATIONS
+            | verification::GET_PUBLICATION
+            | verification::DOWNLOAD_PUBLICATION) => {
+                let caller = Self::caller(&context).map_err(wyrd_error_to_mcp)?;
+                self.mcp_verification_inspect(name, caller, request.arguments)
+                    .await
+                    .map_err(wyrd_error_to_mcp)
+            }
+            name @ (verification::EVIDENCE
+            | verification::EXECUTE
+            | verification::ENQUEUE
+            | verification::CANCEL) => {
                 let caller = Self::caller(&context).map_err(wyrd_error_to_mcp)?;
                 // Authorized and audited by the operation, like revocation.
                 self.mcp_verification_write(name, caller, request.arguments)

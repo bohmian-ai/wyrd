@@ -1513,10 +1513,12 @@ async fn card_contract_publishes_typed_lifecycle_and_problem_shapes() {
     server.shutdown().await.expect("server shuts down");
 }
 
-/// The Verification surface is exactly five typed operations.
+/// The Verification surface is exactly eleven typed operations.
 ///
-/// Binding status, evidence planning, direct execution, enqueue, and
-/// execution status publish their typed request and response schemas,
+/// Binding status, evidence planning, direct execution, enqueue, execution
+/// status, invocation and publication pages, publication read, download, and
+/// local content, and cancellation publish their typed request and response
+/// schemas; local content answers `application/octet-stream` bytes,
 /// enqueue answers `202 Accepted`, direct execution answers `200` with its
 /// result and documents its stable refusals, and no other Verification
 /// operation is routed: evidence plans target the shared storage upload
@@ -1524,14 +1526,23 @@ async fn card_contract_publishes_typed_lifecycle_and_problem_shapes() {
 /// document names no retired evaluation identifier — neither an abbreviation
 /// (`Eval…`, `…_EVAL_…`) nor an expanded product name (`EvaluationRun`,
 /// `evaluation_runs`, `/evaluations`), while descriptive `Evaluation` prose
-/// and words such as `retrieval` stay legal.
+/// and words such as `retrieval` stay legal. A recorded tool call names one
+/// built-in by its dotted identity, the new `fs.write` and `publish`
+/// included, and never by its provider-facing spelling. A step publishes
+/// its orchestration controls (`depends_on` with its `any_succeeded` form,
+/// `when`, `foreach`, `repeat`, `speculative`) and a Verifier its `limits`;
+/// invocation and publication listings report each producer's speculative
+/// disposition, one of the five the contract names, and its branch item,
+/// iteration, and attempt.
 ///
 /// # Panics
 /// Panics when the server fails to start or stop, when a Verification path,
-/// method, status, or schema reference differs, or when the document names a
-/// retired evaluation identifier.
+/// method, status, or schema reference differs, when a recorded tool
+/// identity is missing or provider-spelled, when an orchestration control,
+/// disposition, or producer field is unpublished, or when the document names
+/// a retired evaluation identifier.
 #[tokio::test]
-async fn verification_contract_publishes_five_typed_operations_and_the_local_upload() {
+async fn verification_contract_publishes_eleven_typed_operations_and_the_local_upload() {
     let server = WyrdTestServer::start_in_process()
         .await
         .expect("test server starts");
@@ -1557,6 +1568,27 @@ async fn verification_contract_publishes_five_typed_operations_and_the_local_upl
             ("/v1/verification/evidence", "post"),
             ("/v1/verification/execute", "post"),
             ("/v1/verification/executions/{execution_id}", "get"),
+            ("/v1/verification/executions/{execution_id}/cancel", "post"),
+            (
+                "/v1/verification/executions/{execution_id}/invocations",
+                "get"
+            ),
+            (
+                "/v1/verification/executions/{execution_id}/publications",
+                "get"
+            ),
+            (
+                "/v1/verification/executions/{execution_id}/publications/{step_id}/{name}",
+                "get"
+            ),
+            (
+                "/v1/verification/executions/{execution_id}/publications/{step_id}/{name}/content",
+                "get"
+            ),
+            (
+                "/v1/verification/executions/{execution_id}/publications/{step_id}/{name}/download",
+                "post"
+            ),
         ])
     );
 
@@ -1599,6 +1631,42 @@ async fn verification_contract_publishes_five_typed_operations_and_the_local_upl
         .as_deref(),
         Some("#/components/schemas/VerificationExecutionState")
     );
+    let publication = "/v1/verification/executions/{execution_id}/publications/{step_id}/{name}";
+    assert!(
+        paths[format!("{publication}/content").as_str()]["get"]["responses"]["200"]["content"]
+            ["application/octet-stream"]
+            .is_object(),
+        "local content answers bytes"
+    );
+    for (path, method, schema) in [
+        (
+            "/v1/verification/executions/{execution_id}/invocations",
+            "get",
+            "InvocationPage",
+        ),
+        (
+            "/v1/verification/executions/{execution_id}/publications",
+            "get",
+            "PublicationPage",
+        ),
+        (publication, "get", "Publication"),
+        (
+            &format!("{publication}/download"),
+            "post",
+            "DownloadInitResponse",
+        ),
+        (
+            "/v1/verification/executions/{execution_id}/cancel",
+            "post",
+            "CancelExecutionResponse",
+        ),
+    ] {
+        assert_eq!(
+            schema_ref(&paths[path][method], "200").as_deref(),
+            Some(format!("#/components/schemas/{schema}").as_str()),
+            "{method} {path}"
+        );
+    }
     let execute = &paths["/v1/verification/execute"]["post"];
     assert_eq!(
         execute["requestBody"]["content"]["application/json"]["schema"]["$ref"],
@@ -1619,6 +1687,81 @@ async fn verification_contract_publishes_five_typed_operations_and_the_local_upl
             .iter()
             .all(|status| documented.contains(status)),
         "{documented:?}"
+    );
+
+    let tool = resolve_schema(
+        &document,
+        &document["components"]["schemas"]["ToolCallRecord"]["properties"]["tool"],
+    );
+    let tools: BTreeSet<&str> = tool["enum"]
+        .as_array()
+        .expect("a recorded tool is one built-in")
+        .iter()
+        .filter_map(Value::as_str)
+        .collect();
+    assert!(
+        ["fs.write", "publish", "fs.read", "code.run"]
+            .iter()
+            .all(|name| tools.contains(name)),
+        "{tools:?}"
+    );
+    assert!(
+        tools
+            .iter()
+            .all(|name| name.contains('.') || *name == "publish"),
+        "recorded tools keep their dotted identity, never a provider spelling: {tools:?}"
+    );
+
+    let schemas = &document["components"]["schemas"];
+    let properties = |name: &str| -> BTreeSet<String> {
+        let schema = resolve_schema(&document, &schemas[name]);
+        let flattened = schema["allOf"].as_array().into_iter().flatten();
+        let found: BTreeSet<String> = std::iter::once(schema)
+            .chain(flattened)
+            .filter_map(|part| part["properties"].as_object())
+            .flat_map(|properties| properties.keys().cloned())
+            .collect();
+        assert!(!found.is_empty(), "{name} is an object schema: {schema}");
+        found
+    };
+    let step = properties("Step");
+    assert!(
+        ["depends_on", "when", "foreach", "repeat", "speculative"]
+            .iter()
+            .all(|control| step.contains(*control)),
+        "a step publishes every orchestration control: {step:?}"
+    );
+    assert!(
+        properties("VerifierSpec").contains("limits"),
+        "a Verifier publishes its authored limits"
+    );
+    assert!(
+        schemas["DependsOn"].to_string().contains("any_succeeded"),
+        "depends_on publishes its any_succeeded form: {}",
+        schemas["DependsOn"]
+    );
+    let speculation: BTreeSet<&str> = resolve_schema(&document, &schemas["Speculation"])["enum"]
+        .as_array()
+        .expect("a speculative disposition is an enum")
+        .iter()
+        .filter_map(Value::as_str)
+        .collect();
+    assert_eq!(
+        speculation,
+        BTreeSet::from(["none", "pending", "admitted", "discarded", "blocked"])
+    );
+    for listed in ["ExecutionInvocation", "PublicationSummary"] {
+        assert!(
+            properties(listed).contains("speculation"),
+            "{listed} reports its producer's speculative disposition"
+        );
+    }
+    let producer = properties("Producer");
+    assert!(
+        ["step_id", "item_index", "iteration_index", "attempt"]
+            .iter()
+            .all(|field| producer.contains(*field)),
+        "a producer names its branch item, iteration, and attempt: {producer:?}"
     );
 
     let retired = retired_vocabulary(&document.to_string());

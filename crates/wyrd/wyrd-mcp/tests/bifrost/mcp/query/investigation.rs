@@ -149,6 +149,8 @@ impl EvidenceInvestigation {
                 requirements: vec![RequirementResult {
                     id: TaskId::new(id)?,
                     step: None,
+                    item_index: None,
+                    iteration_index: None,
                     statement: statement.to_owned(),
                     outcome: RequirementOutcome::Failed,
                     reason: "seeded failure".to_owned(),
@@ -218,6 +220,7 @@ impl EvidenceInvestigation {
                 ScribeWrite::Result {
                     payload,
                     attribution: Attribution::direct(PrincipalId::new(seed.system_principal())),
+                    acked: std::sync::Mutex::new(None),
                 },
             );
         }

@@ -1,28 +1,34 @@
 //! HTTP projection of the Verification control plane.
 //!
-//! Five operations: evidence upload planning, direct execution, background
-//! submission, execution status, and binding status. Evidence bytes travel
+//! Evidence upload planning, direct execution, background submission,
+//! execution status, invocation and publication inspection, publication
+//! download planning, cancellation, and binding status. Evidence bytes travel
 //! through the shared storage upload lifecycle. Each handler parses its
 //! path, header, and body, then delegates to [`VerificationControl`], which
 //! owns authorization, audit, tenancy, and error mapping.
 
 use axum::body::Body;
-use axum::extract::rejection::PathRejection;
-use axum::extract::{Path, State};
-use axum::http::{HeaderMap, StatusCode};
+use axum::extract::rejection::{PathRejection, QueryRejection};
+use axum::extract::{Path, Query, State};
+use axum::http::{HeaderMap, StatusCode, header};
+use axum::response::{IntoResponse, Response};
 use axum::{Extension, Json};
 use wyrd_spec::error::{WyrdError, WyrdProblem};
 use wyrd_spec::ids::{BindingId, ExecutionId};
+use wyrd_spec::storage::DownloadInitResponse;
 use wyrd_spec::verification::execution::{
-    EnqueueVerificationResponse, EvidencePlanRequest, EvidencePlanResponse,
-    VerificationExecutionState, VerificationRequest, VerificationResult,
+    CancelExecutionResponse, EnqueueVerificationResponse, EvidencePlanRequest,
+    EvidencePlanResponse, ExecutionPageQuery, InvocationPage, Publication, PublicationPage,
+    PublicationSelector, VerificationExecutionState, VerificationRequest, VerificationResult,
 };
-use wyrd_spec::verification::{MAX_EXECUTE_BODY_BYTES, VerificationBindingStatus};
+use wyrd_spec::verification::{
+    MAX_EXECUTE_BODY_BYTES, PublicationName, TaskId, VerificationBindingStatus,
+};
 
 use super::service::VerificationControl;
 use crate::components::auth::Caller;
 use crate::components::storage::routes::extract_idempotency_key;
-use crate::http::error::{WyrdErrorResponse, path_rejection};
+use crate::http::error::{WyrdErrorResponse, path_rejection, query_rejection};
 use crate::http::middleware::edge_timeout::EdgeTimer;
 use crate::http::middleware::metrics::RequestArrival;
 use crate::state::AppState;
@@ -38,6 +44,12 @@ pub fn verification_router() -> OpenApiRouter<AppState> {
         .routes(routes!(execute))
         .routes(routes!(enqueue))
         .routes(routes!(get_execution))
+        .routes(routes!(list_invocations))
+        .routes(routes!(list_publications))
+        .routes(routes!(get_publication))
+        .routes(routes!(download_publication))
+        .routes(routes!(publication_content))
+        .routes(routes!(cancel_execution))
 }
 
 /// Read a bounded JSON body and decode it as `T`.
@@ -147,12 +159,13 @@ async fn evidence(
     ))
 }
 
-/// Stage one background Verifier execution and return its ID.
+/// Durably admit one background Verifier execution and return its ID.
 ///
 /// # Errors
 /// Returns a stable Wyrd error when the body or Idempotency-Key is malformed,
-/// the caller lacks `verifier:run` on the Verifier, the inputs exceed a
-/// bound, or this process hosts no Verifier queue.
+/// the key names a different request, the caller lacks `verifier:run` on the
+/// Verifier, the inputs exceed a bound, this process hosts no Verifier queue,
+/// or the submission was lost before admission.
 #[utoipa::path(
     post,
     path = "/verification/enqueue",
@@ -160,7 +173,7 @@ async fn evidence(
     params(("Idempotency-Key" = Option<String>, Header, description = "Optional retry key; a \
         retry with the same key and body returns the same execution_id")),
     responses(
-        (status = 202, description = "Execution staged; poll its status",
+        (status = 202, description = "Execution durably admitted; poll its status",
          body = EnqueueVerificationResponse),
         (status = 400, description = "The body or Idempotency-Key is invalid \
           (WYRD_VERIFICATION_400_INPUT_INVALID, WYRD_SPEC_400_VALIDATION)", body = WyrdProblem),
@@ -169,9 +182,12 @@ async fn evidence(
           WYRD_AUTH_401_TOKEN_EXPIRED)", body = WyrdProblem),
         (status = 403, description = "The principal lacks verifier:run on the Verifier \
           (WYRD_PERMISSION_403_DENIED_RBAC)", body = WyrdProblem),
+        (status = 409, description = "The Idempotency-Key already names a different request \
+          (WYRD_REGISTRY_409_IDEMPOTENCY_CONFLICT)", body = WyrdProblem),
         (status = 413, description = "The body or inputs exceed a bound \
           (WYRD_VERIFICATION_413_INPUT_TOO_LARGE)", body = WyrdProblem),
-        (status = 503, description = "This process hosts no Verifier queue \
+        (status = 503, description = "This process hosts no Verifier queue, or the submission \
+          was not admitted and may be retried under its key \
           (WYRD_SERVER_503_SERVICE_UNAVAILABLE)", body = WyrdProblem)
     ),
     tag = "Verification"
@@ -189,7 +205,9 @@ async fn enqueue(
 ) -> Result<(StatusCode, Json<EnqueueVerificationResponse>), WyrdErrorResponse> {
     let key = extract_idempotency_key(&headers)?;
     let request: VerificationRequest = decode_body(body).await?;
-    let response = VerificationControl::new(&state).enqueue(&caller, request, key.as_ref());
+    let response = VerificationControl::new(&state)
+        .enqueue(&caller, request, key.as_ref())
+        .await;
     let outcome = if response.is_ok() {
         "staged"
     } else {
@@ -203,8 +221,8 @@ async fn enqueue(
 ///
 /// # Errors
 /// Returns a stable Wyrd error when the path is malformed, the caller lacks
-/// `cards:read`, the execution is not visible in the caller's tenant, or a
-/// read fails.
+/// `verifier:read` on the execution's Verifier, the execution is not visible
+/// in the caller's tenant, or a read fails.
 #[utoipa::path(
     get,
     path = "/verification/executions/{execution_id}",
@@ -217,12 +235,13 @@ async fn enqueue(
         (status = 401, description = "The request carried no usable access token \
           (WYRD_AUTH_401_UNAUTHENTICATED, WYRD_AUTH_401_INVALID_TOKEN, \
           WYRD_AUTH_401_TOKEN_EXPIRED)", body = WyrdProblem),
-        (status = 403, description = "The principal may not read Cards \
-          (WYRD_PERMISSION_403_DENIED_RBAC)", body = WyrdProblem),
+        (status = 403, description = "The principal lacks verifier:read on the execution's \
+          Verifier (WYRD_PERMISSION_403_DENIED_RBAC)", body = WyrdProblem),
         (status = 404, description = "No such execution is visible in the caller's tenant \
           yet (WYRD_VERIFICATION_404_EXECUTION_NOT_FOUND)", body = WyrdProblem),
-        (status = 503, description = "The registry is unavailable, or no verifier is \
-          configured for the access token (WYRD_REGISTRY_503_REGISTRY_UNAVAILABLE, \
+        (status = 503, description = "The registry or the execution records are unavailable, \
+          or no verifier is configured for the access token \
+          (WYRD_REGISTRY_503_REGISTRY_UNAVAILABLE, WYRD_VALA_503_QUERY_VISIBILITY_UNAVAILABLE, \
           WYRD_AUTH_503_VERIFY_UNAVAILABLE)", body = WyrdProblem)
     ),
     tag = "Verification"
@@ -237,6 +256,349 @@ async fn get_execution(
     Ok(Json(
         VerificationControl::new(&state)
             .get_execution(&caller, execution_id)
+            .await?,
+    ))
+}
+
+/// List one page of a queued execution's invocation attempts.
+///
+/// Progress is read from the execution records, current while history
+/// projection lags. A cursor continues the listing at the cut its first
+/// page fixed.
+///
+/// # Errors
+/// Returns a stable Wyrd error when the path, limit, or cursor is invalid,
+/// the caller lacks `verifier:read` on the execution's Verifier, the queued
+/// execution is not in the caller's tenant, or a read fails.
+#[utoipa::path(
+    get,
+    path = "/verification/executions/{execution_id}/invocations",
+    params(
+        ("execution_id" = ExecutionId, Path, description = "Execution ID returned by \
+          POST /v1/verification/enqueue"),
+        ExecutionPageQuery
+    ),
+    responses(
+        (status = 200, description = "Invocation attempts in insertion order",
+         body = InvocationPage),
+        (status = 400, description = "The execution ID, limit, or cursor is invalid \
+          (WYRD_SPEC_400_VALIDATION)", body = WyrdProblem),
+        (status = 401, description = "The request carried no usable access token \
+          (WYRD_AUTH_401_UNAUTHENTICATED, WYRD_AUTH_401_INVALID_TOKEN, \
+          WYRD_AUTH_401_TOKEN_EXPIRED)", body = WyrdProblem),
+        (status = 403, description = "The principal lacks verifier:read on the execution's \
+          Verifier (WYRD_PERMISSION_403_DENIED_RBAC)", body = WyrdProblem),
+        (status = 404, description = "No such queued execution in the caller's tenant \
+          (WYRD_VERIFICATION_404_EXECUTION_NOT_FOUND)", body = WyrdProblem),
+        (status = 503, description = "The registry is unavailable, or no verifier is \
+          configured for the access token (WYRD_REGISTRY_503_REGISTRY_UNAVAILABLE, \
+          WYRD_AUTH_503_VERIFY_UNAVAILABLE)", body = WyrdProblem)
+    ),
+    tag = "Verification"
+)]
+#[tracing::instrument(
+    skip(state, caller, query),
+    fields(operation = "verification.execution.invocations")
+)]
+async fn list_invocations(
+    State(state): State<AppState>,
+    caller: Caller,
+    execution_id: Result<Path<ExecutionId>, PathRejection>,
+    query: Result<Query<ExecutionPageQuery>, QueryRejection>,
+) -> Result<Json<InvocationPage>, WyrdErrorResponse> {
+    let Path(execution_id) = execution_id.map_err(|rejection| path_rejection(&rejection))?;
+    let Query(query) = query.map_err(|rejection| query_rejection(&rejection))?;
+    Ok(Json(
+        VerificationControl::new(&state)
+            .invocations(&caller, execution_id, &query)
+            .await?,
+    ))
+}
+
+/// List one page of a queued execution's publication names, without content.
+///
+/// # Errors
+/// Returns a stable Wyrd error when the path, limit, or cursor is invalid,
+/// the caller lacks `verifier:read` on the execution's Verifier, the queued
+/// execution is not in the caller's tenant, or a read fails.
+#[utoipa::path(
+    get,
+    path = "/verification/executions/{execution_id}/publications",
+    params(
+        ("execution_id" = ExecutionId, Path, description = "Execution ID returned by \
+          POST /v1/verification/enqueue"),
+        ExecutionPageQuery
+    ),
+    responses(
+        (status = 200, description = "Publications in acceptance order", body = PublicationPage),
+        (status = 400, description = "The execution ID, limit, or cursor is invalid \
+          (WYRD_SPEC_400_VALIDATION)", body = WyrdProblem),
+        (status = 401, description = "The request carried no usable access token \
+          (WYRD_AUTH_401_UNAUTHENTICATED, WYRD_AUTH_401_INVALID_TOKEN, \
+          WYRD_AUTH_401_TOKEN_EXPIRED)", body = WyrdProblem),
+        (status = 403, description = "The principal lacks verifier:read on the execution's \
+          Verifier (WYRD_PERMISSION_403_DENIED_RBAC)", body = WyrdProblem),
+        (status = 404, description = "No such queued execution in the caller's tenant \
+          (WYRD_VERIFICATION_404_EXECUTION_NOT_FOUND)", body = WyrdProblem),
+        (status = 503, description = "The registry is unavailable, or no verifier is \
+          configured for the access token (WYRD_REGISTRY_503_REGISTRY_UNAVAILABLE, \
+          WYRD_AUTH_503_VERIFY_UNAVAILABLE)", body = WyrdProblem)
+    ),
+    tag = "Verification"
+)]
+#[tracing::instrument(
+    skip(state, caller, query),
+    fields(operation = "verification.execution.publications")
+)]
+async fn list_publications(
+    State(state): State<AppState>,
+    caller: Caller,
+    execution_id: Result<Path<ExecutionId>, PathRejection>,
+    query: Result<Query<ExecutionPageQuery>, QueryRejection>,
+) -> Result<Json<PublicationPage>, WyrdErrorResponse> {
+    let Path(execution_id) = execution_id.map_err(|rejection| path_rejection(&rejection))?;
+    let Query(query) = query.map_err(|rejection| query_rejection(&rejection))?;
+    Ok(Json(
+        VerificationControl::new(&state)
+            .publications(&caller, execution_id, &query)
+            .await?,
+    ))
+}
+
+/// Read one publication of an exact producer attempt with its JSON value or
+/// immutable manifest.
+///
+/// # Errors
+/// Returns a stable Wyrd error when the path or producer selector is
+/// invalid, the caller lacks `verifier:read` on the execution's Verifier,
+/// the queued execution or publication is absent, or a read fails.
+#[utoipa::path(
+    get,
+    path = "/verification/executions/{execution_id}/publications/{step_id}/{name}",
+    params(
+        ("execution_id" = ExecutionId, Path, description = "Execution ID returned by \
+          POST /v1/verification/enqueue"),
+        ("step_id" = TaskId, Path, description = "The producer step"),
+        ("name" = PublicationName, Path, description = "The logical publication name"),
+        PublicationSelector
+    ),
+    responses(
+        (status = 200, description = "The publication", body = Publication),
+        (status = 400, description = "A path identifier or the producer selector is invalid \
+          (WYRD_SPEC_400_VALIDATION)", body = WyrdProblem),
+        (status = 401, description = "The request carried no usable access token \
+          (WYRD_AUTH_401_UNAUTHENTICATED, WYRD_AUTH_401_INVALID_TOKEN, \
+          WYRD_AUTH_401_TOKEN_EXPIRED)", body = WyrdProblem),
+        (status = 403, description = "The principal lacks verifier:read on the execution's \
+          Verifier (WYRD_PERMISSION_403_DENIED_RBAC)", body = WyrdProblem),
+        (status = 404, description = "No such queued execution in the caller's tenant, or no \
+          such publication of the producer attempt \
+          (WYRD_VERIFICATION_404_EXECUTION_NOT_FOUND, \
+          WYRD_VERIFICATION_404_PUBLICATION_NOT_FOUND)", body = WyrdProblem),
+        (status = 503, description = "The registry is unavailable, or no verifier is \
+          configured for the access token (WYRD_REGISTRY_503_REGISTRY_UNAVAILABLE, \
+          WYRD_AUTH_503_VERIFY_UNAVAILABLE)", body = WyrdProblem)
+    ),
+    tag = "Verification"
+)]
+#[tracing::instrument(
+    skip(state, caller, path, query),
+    fields(operation = "verification.execution.publication")
+)]
+async fn get_publication(
+    State(state): State<AppState>,
+    caller: Caller,
+    path: Result<Path<(ExecutionId, TaskId, PublicationName)>, PathRejection>,
+    query: Result<Query<PublicationSelector>, QueryRejection>,
+) -> Result<Json<Publication>, WyrdErrorResponse> {
+    let Path((execution_id, step, name)) = path.map_err(|rejection| path_rejection(&rejection))?;
+    let Query(selector) = query.map_err(|rejection| query_rejection(&rejection))?;
+    Ok(Json(
+        VerificationControl::new(&state)
+            .publication(&caller, execution_id, &step, &name, &selector)
+            .await?,
+    ))
+}
+
+/// Plan the download of one file of a file or directory publication.
+///
+/// A file publication takes no `path`; a directory publication names one
+/// regular file its manifest lists, relative to its root.
+///
+/// # Errors
+/// Returns a stable Wyrd error when the path, producer selector, or file
+/// path is invalid, the publication is JSON, the caller lacks
+/// `verifier:read` on the execution's Verifier, the queued execution or
+/// publication is absent, its stored file descriptor is malformed, or storage
+/// fails.
+#[utoipa::path(
+    post,
+    path = "/verification/executions/{execution_id}/publications/{step_id}/{name}/download",
+    params(
+        ("execution_id" = ExecutionId, Path, description = "Execution ID returned by \
+          POST /v1/verification/enqueue"),
+        ("step_id" = TaskId, Path, description = "The producer step"),
+        ("name" = PublicationName, Path, description = "The logical publication name"),
+        PublicationSelector
+    ),
+    responses(
+        (status = 200, description = "Download plan", body = DownloadInitResponse),
+        (status = 400, description = "A path identifier, the producer selector, or the file \
+          path is invalid, or the publication is JSON (WYRD_SPEC_400_VALIDATION)",
+         body = WyrdProblem),
+        (status = 401, description = "The request carried no usable access token \
+          (WYRD_AUTH_401_UNAUTHENTICATED, WYRD_AUTH_401_INVALID_TOKEN, \
+          WYRD_AUTH_401_TOKEN_EXPIRED)", body = WyrdProblem),
+        (status = 403, description = "The principal lacks verifier:read on the execution's \
+          Verifier (WYRD_PERMISSION_403_DENIED_RBAC)", body = WyrdProblem),
+        (status = 404, description = "No such queued execution in the caller's tenant, or no \
+          such publication of the producer attempt \
+          (WYRD_VERIFICATION_404_EXECUTION_NOT_FOUND, \
+          WYRD_VERIFICATION_404_PUBLICATION_NOT_FOUND)", body = WyrdProblem),
+        (status = 503, description = "The file's completed upload is not visible yet, storage \
+          or the registry is unavailable, or no verifier is configured for the access token; \
+          retry (WYRD_VALA_503_QUERY_VISIBILITY_UNAVAILABLE, \
+          WYRD_STORAGE_503_BACKEND_UNAVAILABLE, WYRD_REGISTRY_503_REGISTRY_UNAVAILABLE, \
+          WYRD_AUTH_503_VERIFY_UNAVAILABLE)", body = WyrdProblem)
+    ),
+    tag = "Verification"
+)]
+#[tracing::instrument(
+    skip(state, caller, path, query),
+    fields(operation = "verification.execution.publication.download")
+)]
+async fn download_publication(
+    State(state): State<AppState>,
+    caller: Caller,
+    path: Result<Path<(ExecutionId, TaskId, PublicationName)>, PathRejection>,
+    query: Result<Query<PublicationSelector>, QueryRejection>,
+) -> Result<Json<DownloadInitResponse>, WyrdErrorResponse> {
+    let Path((execution_id, step, name)) = path.map_err(|rejection| path_rejection(&rejection))?;
+    let Query(selector) = query.map_err(|rejection| query_rejection(&rejection))?;
+    Ok(Json(
+        VerificationControl::new(&state)
+            .download(&caller, execution_id, &step, &name, &selector)
+            .await?,
+    ))
+}
+
+/// Stream the bytes of one publication file on the local storage backend.
+///
+/// This is the `get_url` a local publication download plan hands out; cloud
+/// backends hand out presigned URLs instead. It selects and authorizes
+/// exactly as the download plan does, `verifier:read` on the execution's
+/// Verifier, so a caller who may plan the download may fetch it.
+///
+/// # Errors
+/// Returns the stable Wyrd errors of the download plan, and a storage error
+/// when the object is missing, the backend fails, or the backend is not local.
+#[utoipa::path(
+    get,
+    path = "/verification/executions/{execution_id}/publications/{step_id}/{name}/content",
+    params(
+        ("execution_id" = ExecutionId, Path, description = "Execution ID returned by \
+          POST /v1/verification/enqueue"),
+        ("step_id" = TaskId, Path, description = "The producer step"),
+        ("name" = PublicationName, Path, description = "The logical publication name"),
+        PublicationSelector
+    ),
+    responses(
+        (status = 200, description = "The stored bytes", body = [u8],
+         content_type = "application/octet-stream"),
+        (status = 400, description = "A path identifier, the producer selector, or the file \
+          path is invalid, or the publication is JSON (WYRD_SPEC_400_VALIDATION)",
+         body = WyrdProblem),
+        (status = 401, description = "The request carried no usable access token \
+          (WYRD_AUTH_401_UNAUTHENTICATED, WYRD_AUTH_401_INVALID_TOKEN, \
+          WYRD_AUTH_401_TOKEN_EXPIRED)", body = WyrdProblem),
+        (status = 403, description = "The principal lacks verifier:read on the execution's \
+          Verifier (WYRD_PERMISSION_403_DENIED_RBAC)", body = WyrdProblem),
+        (status = 404, description = "No such queued execution in the caller's tenant, no \
+          such publication of the producer attempt, or no such stored object \
+          (WYRD_VERIFICATION_404_EXECUTION_NOT_FOUND, \
+          WYRD_VERIFICATION_404_PUBLICATION_NOT_FOUND, WYRD_STORAGE_404_OBJECT_NOT_FOUND)",
+         body = WyrdProblem),
+        (status = 500, description = "The storage backend failed or is not local \
+          (WYRD_STORAGE_500_BACKEND, WYRD_SPEC_500_INTERNAL)", body = WyrdProblem),
+        (status = 503, description = "The file's completed upload is not visible yet, storage \
+          or the registry is unavailable, or no verifier is configured for the access token; \
+          retry (WYRD_VALA_503_QUERY_VISIBILITY_UNAVAILABLE, \
+          WYRD_STORAGE_503_BACKEND_UNAVAILABLE, WYRD_REGISTRY_503_REGISTRY_UNAVAILABLE, \
+          WYRD_AUTH_503_VERIFY_UNAVAILABLE)", body = WyrdProblem)
+    ),
+    tag = "Verification"
+)]
+#[tracing::instrument(
+    skip(state, caller, path, query),
+    fields(operation = "verification.execution.publication.content")
+)]
+async fn publication_content(
+    State(state): State<AppState>,
+    caller: Caller,
+    path: Result<Path<(ExecutionId, TaskId, PublicationName)>, PathRejection>,
+    query: Result<Query<PublicationSelector>, QueryRejection>,
+) -> Result<Response, WyrdErrorResponse> {
+    let Path((execution_id, step, name)) = path.map_err(|rejection| path_rejection(&rejection))?;
+    let Query(selector) = query.map_err(|rejection| query_rejection(&rejection))?;
+    let (stream, len) = VerificationControl::new(&state)
+        .content(&caller, execution_id, &step, &name, &selector)
+        .await?;
+    Ok((
+        StatusCode::OK,
+        [
+            (header::CONTENT_TYPE, "application/octet-stream"),
+            (header::CONTENT_LENGTH, &len.to_string()),
+        ],
+        Body::from_stream(stream),
+    )
+        .into_response())
+}
+
+/// Cancel a queued execution and answer its status after the fence commits.
+///
+/// Unfinished work settles `cancelled`; settled work keeps its status,
+/// result, and publications, so a repeat answers the current status.
+///
+/// # Errors
+/// Returns a stable Wyrd error when the path is malformed, the caller lacks
+/// `verifier:run` on the execution's Verifier, the queued execution is not in
+/// the caller's tenant, or the write fails.
+#[utoipa::path(
+    post,
+    path = "/verification/executions/{execution_id}/cancel",
+    params(("execution_id" = ExecutionId, Path, description = "Execution ID returned by \
+        POST /v1/verification/enqueue")),
+    responses(
+        (status = 200, description = "The execution's status after cancellation",
+         body = CancelExecutionResponse),
+        (status = 400, description = "The execution ID is not a valid UUID \
+          (WYRD_SPEC_400_VALIDATION)", body = WyrdProblem),
+        (status = 401, description = "The request carried no usable access token \
+          (WYRD_AUTH_401_UNAUTHENTICATED, WYRD_AUTH_401_INVALID_TOKEN, \
+          WYRD_AUTH_401_TOKEN_EXPIRED)", body = WyrdProblem),
+        (status = 403, description = "The principal lacks verifier:run on the execution's \
+          Verifier (WYRD_PERMISSION_403_DENIED_RBAC)", body = WyrdProblem),
+        (status = 404, description = "No such queued execution in the caller's tenant \
+          (WYRD_VERIFICATION_404_EXECUTION_NOT_FOUND)", body = WyrdProblem),
+        (status = 503, description = "The registry is unavailable, or no verifier is \
+          configured for the access token (WYRD_REGISTRY_503_REGISTRY_UNAVAILABLE, \
+          WYRD_AUTH_503_VERIFY_UNAVAILABLE)", body = WyrdProblem)
+    ),
+    tag = "Verification"
+)]
+#[tracing::instrument(
+    skip(state, caller),
+    fields(operation = "verification.execution.cancel")
+)]
+async fn cancel_execution(
+    State(state): State<AppState>,
+    caller: Caller,
+    execution_id: Result<Path<ExecutionId>, PathRejection>,
+) -> Result<Json<CancelExecutionResponse>, WyrdErrorResponse> {
+    let Path(execution_id) = execution_id.map_err(|rejection| path_rejection(&rejection))?;
+    Ok(Json(
+        VerificationControl::new(&state)
+            .cancel(&caller, execution_id)
             .await?,
     ))
 }

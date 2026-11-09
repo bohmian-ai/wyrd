@@ -512,6 +512,23 @@ pub enum BifrostError {
         column: Option<String>,
     },
 
+    /// The batch id is already durable with different rows under the same
+    /// table version.
+    ///
+    /// The first batch keeps the id; no row of this batch was accepted or
+    /// will ever become visible.
+    #[error("batch identity conflict for table: {table}")]
+    #[wyrd_error(
+        code = "WYRD_VALA_409_BIFROST_BATCH_CONFLICT",
+        status = 409,
+        title = "Batch id already committed with different rows",
+        remediation = "Another batch already committed this batch_id with different rows. Read the table to learn what was accepted; send new rows under a new batch_id."
+    )]
+    BatchConflict {
+        /// Fully-qualified table name the refused batch targeted.
+        table: String,
+    },
+
     /// A batch with this ID was previously attempted but failed permanently.
     #[error("duplicate failed batch: {batch_id}")]
     #[wyrd_error(

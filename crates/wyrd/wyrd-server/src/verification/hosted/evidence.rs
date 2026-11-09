@@ -14,7 +14,9 @@
 //! evidence also only when its sniffed format matches, so a mismatched file
 //! can never feed a pass. Extraction, workspaces, citations, and native media all read through
 //! it; it is also the Agent executor's [`EvidenceReader`] and the `extract`
-//! action's [`ActionExecutor`].
+//! action's [`ActionExecutor`]. Bound to an execution's state, it also reads
+//! the publications that execution's steps accepted, which workspaces mount
+//! through `steps.<id>.publications` references.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::{Arc, Mutex, PoisonError};
@@ -32,16 +34,23 @@ use wyrd_spec::envelope::CardKind;
 use wyrd_spec::ids::{CardUid, SlotName};
 use wyrd_spec::reference::{CardRef, CardRefIdentity};
 use wyrd_spec::registry::StoredArtifactEntry;
-use wyrd_spec::verification::execution::{CallProvenance, Citation, InputDeclaration, Locator};
+use wyrd_spec::storage::StoredObjectRef;
+use wyrd_spec::verification::TaskId;
+use wyrd_spec::verification::execution::{
+    CallProvenance, Citation, InputDeclaration, Locator, PublicationFile,
+};
+use wyrd_spec::verification::state::AcceptedPublication;
 use wyrd_storage::error::StorageError;
 use wyrd_storage::tenant_path::{self, ValidatedPath};
 
+use super::publications::published_object;
 use super::registry::refusal;
 use super::{HostedLimits, extract_refused};
 use crate::components::auth::Caller;
 use crate::components::cards::routes::{authorize_card_ref, get_card_objects_by_ref_for};
 use crate::components::storage::inventory::ObjectInventory;
 use crate::state::AppState;
+use crate::verification::state::RunState;
 
 /// Reads one execution's pinned evidence from its tenant's storage.
 pub struct TenantEvidence {
@@ -61,6 +70,9 @@ pub struct TenantEvidence {
     artifacts: Mutex<BTreeMap<ArtifactKey, Arc<ArtifactInventory>>>,
     /// File limits in force.
     limits: HostedLimits,
+    /// The execution state whose accepted publications are readable; `None`
+    /// for a reader bound to no execution.
+    execution: Option<Arc<RunState>>,
 }
 
 /// An exact Artifact reference: its identity and optional pinned UID.
@@ -83,7 +95,51 @@ impl TenantEvidence {
             files: Mutex::default(),
             artifacts: Mutex::default(),
             limits,
+            execution: None,
         }
+    }
+
+    /// This reader, bound to read the publications `execution` accepted.
+    #[must_use]
+    pub fn with_execution(mut self, execution: Arc<RunState>) -> Self {
+        self.execution = Some(execution);
+        self
+    }
+
+    /// Every publication `step` accepted in the bound execution's state,
+    /// grouped by item, iteration, and attempt and in acceptance order within
+    /// an attempt, each with its completed File descriptors; none without a
+    /// bound execution.
+    ///
+    /// # Errors
+    /// Never fails: the accepted state is held in memory. The result keeps
+    /// the workspace's fallible read shape.
+    pub async fn publications(
+        &self,
+        step: &TaskId,
+    ) -> Result<Vec<AcceptedPublication>, BlockError> {
+        Ok(match &self.execution {
+            Some(state) => state.publications(step).await,
+            None => Vec::new(),
+        })
+    }
+
+    /// The verified bytes of one file a publication retains, read from the
+    /// completed File descriptor `object` its acceptance kept, never from
+    /// an inventory lookup.
+    ///
+    /// # Errors
+    /// [`BlockError::Terminal`] for a descriptor that does not match the
+    /// manifest file or bytes that do not, and [`BlockError::Retryable`]
+    /// while storage is unavailable.
+    pub async fn published(
+        &self,
+        file: &PublicationFile,
+        object: &StoredObjectRef,
+    ) -> Result<Vec<u8>, BlockError> {
+        let path = published_object(self.caller.data_tenant_id, file, object)
+            .map_err(|error| terminal(&error.to_string()))?;
+        self.stored(&path, file.size_bytes, &file.sha256).await
     }
 
     /// The located units of pinned slot `declaration`, or `None` when it

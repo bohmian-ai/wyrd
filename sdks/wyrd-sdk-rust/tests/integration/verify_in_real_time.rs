@@ -52,17 +52,17 @@ pub(crate) struct Assistant {
     /// The deployment.
     pub(crate) deployment: Deployment,
     /// The local judge the `answer-judged` Agent check calls.
-    judge: MockServer,
+    pub(crate) judge: MockServer,
     /// The hydrated assistant bundle.
     bundle: TempDir,
     /// The registered assistant Service.
     pub(crate) service: CardRef,
     /// The registered `answer-check` assertion Verifier.
-    answer_check: CardRef,
+    pub(crate) answer_check: CardRef,
     /// The registered `answer-judged` Agent-check Verifier.
     answer_judged: CardRef,
     /// The registered `assistant-agent` Card the Verifiers judge.
-    agent: CardRef,
+    pub(crate) agent: CardRef,
 }
 
 /// `builder` running the verification runtime, its gateway provider root
@@ -139,6 +139,20 @@ impl Assistant {
             answer_check: declared(&assistant, "answer-check"),
             answer_judged: declared(&assistant, "answer-judged"),
             agent: declared(&assistant, "assistant-agent"),
+        }
+    }
+
+    /// Restart the server over the same Postgres and storage, still running
+    /// the verification runtime on the same judge, as a process restart
+    /// does.
+    ///
+    /// # Panics
+    /// Panics when the server does not restart.
+    pub(crate) async fn restart(self) -> Self {
+        let builder = on_judge(WyrdTestServer::builder(), &self.judge);
+        Self {
+            deployment: self.deployment.restart(builder).await,
+            ..self
         }
     }
 
@@ -861,6 +875,61 @@ async fn submitted_answer_is_judged_in_the_background_and_resumes_by_id() {
     assistant.deployment.shutdown().await;
 }
 
+/// `verify` and `submit` run the same request through one durable execution
+/// path: the direct call returns its result synchronously under its own
+/// identity, while the submission completes in the background with the same
+/// verdict, and a handle rebuilt from either ID reads back exactly the result
+/// that execution returned.
+///
+/// # Panics
+/// Panics when a call fails, the verdicts differ, the executions share an
+/// identity, or a result read back by its ID differs.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires the repository-managed Postgres journey lifecycle"]
+async fn verify_and_submit_share_durable_execution_state() {
+    let assistant = Assistant::start().await;
+    let state = assistant.state().await;
+    let run = state.run_for_card("agent").expect("agent run opens");
+
+    let direct = run
+        .observe()
+        .verify("answer-check", json!("yes"))
+        .await
+        .expect("the answer verifies");
+    let Submission::Queued(execution) = run
+        .observe()
+        .submit("answer-check", json!("yes"))
+        .await
+        .expect("the answer is submitted")
+    else {
+        panic!("Run evidence queues an execution");
+    };
+    let waited = execution.wait(WAIT).await.expect("the execution settles");
+    let service = assistant
+        .deployment
+        .service_client(&assistant.service)
+        .await;
+    let resumed = Execution::connect_with(*execution.id(), &service)
+        .await
+        .expect("the handle rebuilds from its ID")
+        .wait(WAIT)
+        .await
+        .expect("the resumed handle reads the result");
+    let reread = Execution::connect_with(direct.execution_id, &service)
+        .await
+        .expect("the handle rebuilds from its ID")
+        .wait(WAIT)
+        .await
+        .expect("the direct result reads back");
+
+    assert_eq!(direct.outcome.verdict, VerificationVerdict::Passed);
+    assert_eq!(waited.outcome.verdict, direct.outcome.verdict);
+    assert_ne!(direct.execution_id, waited.execution_id);
+    assert_eq!(resumed, waited);
+    assert_eq!(reread, direct);
+    assistant.deployment.shutdown().await;
+}
+
 /// Another tenant cannot read a queued execution by its ID: the status read
 /// is refused as not found until the wait gives up.
 ///
@@ -1312,12 +1381,36 @@ impl Grouped {
 ///
 /// # Panics
 /// Panics when no token mints or the submission is not accepted.
-async fn enqueue_as(
+pub(crate) async fn enqueue_as(
     client: &WyrdClient,
     deployment: &Deployment,
     idempotency_key: &str,
     body: &serde_json::Value,
 ) -> ExecutionId {
+    let (status, accepted) = enqueue_response(client, deployment, idempotency_key, body)
+        .await
+        .expect("the server answers");
+    assert_eq!(status, 202, "{accepted}");
+    accepted["execution_id"]
+        .as_str()
+        .and_then(|id| id.parse().ok())
+        .expect("the response names its execution")
+}
+
+/// The status and JSON body `POST /v1/verification/enqueue` answers `body`
+/// with as `client` under `idempotency_key`.
+///
+/// # Errors
+/// Returns the transport error when no answer arrives.
+///
+/// # Panics
+/// Panics when no token mints or the body is not JSON.
+pub(crate) async fn enqueue_response(
+    client: &WyrdClient,
+    deployment: &Deployment,
+    idempotency_key: &str,
+    body: &serde_json::Value,
+) -> reqwest::Result<(u16, serde_json::Value)> {
     let token = client.access_token().await.expect("access token mints");
     let response = reqwest::Client::new()
         .post(format!(
@@ -1329,17 +1422,12 @@ async fn enqueue_as(
         ))
         .header("x-wyrd-access-token", format!("Bearer {}", token.expose()))
         .header("idempotency-key", idempotency_key)
+        .timeout(Duration::from_secs(5))
         .json(body)
         .send()
-        .await
-        .expect("the server answers");
+        .await?;
     let status = response.status().as_u16();
-    let accepted: serde_json::Value = response.json().await.expect("the body is JSON");
-    assert_eq!(status, 202, "{accepted}");
-    accepted["execution_id"]
-        .as_str()
-        .and_then(|id| id.parse().ok())
-        .expect("the response names its execution")
+    Ok((status, response.json().await.expect("the body is JSON")))
 }
 
 /// A support conversation populated over three Runs of the Rust SDK, then
@@ -1414,24 +1502,20 @@ async fn grouped_support_resumes() {
         replayed,
         "the same key and body replay one execution"
     );
-    let conflict = support
-        .enqueue_over_http(
-            deployment,
-            "support-turn-0006",
-            &json!({
-                "verifier_card_uid": declared(&support.receipt, "turn-check").uid,
-                "card_uid": declared(&support.receipt, "assistant-agent").uid,
-                "inputs": {"turn": {"kind": "json", "value": {"answer": ""}}},
-            }),
-        )
-        .await;
-    let conflicted = Execution::connect_with(conflict, &deployment.admin())
-        .await
-        .expect("the execution handle connects")
-        .wait(WAIT)
-        .await
-        .expect_err("the key conflict settles errored");
-    assert_eq!(conflicted.code(), "WYRD_REGISTRY_409_IDEMPOTENCY_CONFLICT");
+    let (status, conflicted) = enqueue_response(
+        &support.client,
+        deployment,
+        "support-turn-0006",
+        &json!({
+            "verifier_card_uid": declared(&support.receipt, "turn-check").uid,
+            "card_uid": declared(&support.receipt, "assistant-agent").uid,
+            "inputs": {"turn": {"kind": "json", "value": {"answer": ""}}},
+        }),
+    )
+    .await
+    .expect("the server answers");
+    assert_eq!(status, 409, "{conflicted}");
+    assert_eq!(conflicted["code"], "WYRD_REGISTRY_409_IDEMPOTENCY_CONFLICT");
     Execution::connect_with(replayed, &deployment.admin())
         .await
         .expect("the execution handle connects")

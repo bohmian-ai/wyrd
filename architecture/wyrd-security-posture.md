@@ -250,11 +250,38 @@ credential.
   the registered `bifrost.drift.observations` table UID; a missing SYSTEM
   principal or unreadable table identity fails closed before any row is
   returned.
+- Dedicated execution status/progress/publication reads authorize and audit current
+  `verifier:read` on the recorded exact Verifier, plus repository read where applicable.
+  Execution reads use accepted/recovered Bifrost state through fixed
+  tenant/execution-scoped statements under the same narrow SYSTEM read authority for
+  registered `bifrost.verification.execution_inputs`, `results`, `execution_outputs` and
+  `execution_events`. Retained identity and full metadata do not require a leftover
+  execution row or fetching a deleted Card. Historical accepted authority is provenance,
+  not a grant to the requesting caller. Ordinary public Bifrost SQL retains caller table
+  permissions; no caller SQL runs under internal authority.
+  Accepted publication mounts/download/local-content select the exact private
+  verified File association retained in run state from acceptance onward and
+  validate its tenant, producer, path, digest and length through existing storage
+  owners. Do not rediscover by global digest or accept a caller storage path.
+  Local publication bytes remain under verifier authorization, never the
+  cards:read blob route. Preserve File completion/inventory acknowledgement,
+  original evidence retention and independent delivery/replay authority. There
+  is no active-Postgres descriptor custody or later reference transfer. Required
+  unavailable state is not absence and cannot authorize duplicate execution.
+  Checkpoint acceptance preserves current execution authority and rejects stale
+  writers, including during WAL recovery; historical authority remains provenance.
 - Revoking a credential, suspending or deleting a principal, suspending a
   tenant, or changing grants refuses the next issuance immediately. A tenant
   token already issued keeps its snapshot authority until its five-minute
   expiry; there is no revocation list or authorization epoch. The platform
-  plane instead revalidates current state on every request.
+  plane instead revalidates current state on every request. Revoking a
+  principal also cancels, in the same commit, every unfinished Verifier
+  execution it submitted or accepted, so queued work never outlives the
+  authority it was accepted under. That control commit preserves durable pending
+  terminal delivery in the existing queue. Server-owned delivery can record the
+  cancellation under existing internal permissions after revocation, without
+  restoring the principal's execution authority. Only Bifrost WAL/batch-commit
+  ACK permits retiring that delivery; revocation itself never waits for Bifrost.
 - Bearer access tokens remain replayable until expiry. TLS, short lifetime,
   token-family replay detection, least privilege, and audit are the required
   replay controls. Logs and traces never record bearer material.

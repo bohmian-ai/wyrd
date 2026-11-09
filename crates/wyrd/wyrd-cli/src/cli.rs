@@ -6,6 +6,7 @@ use crate::auth::AuthCommand;
 use crate::card::{
     ArtifactCommand, DeclareArgs, DeleteArgs, GetArgs, LatestArgs, ListArgs, PullArgs,
 };
+use crate::execution::ExecutionCommand;
 use crate::gateway::GatewayCommand;
 use crate::init::InitArgs;
 use crate::mcp::McpCommand;
@@ -62,6 +63,7 @@ impl Cli {
                 .await
                 .map_err(Into::into),
             Command::Query(command) => crate::query::dispatch(command).await,
+            Command::Execution(command) => command.dispatch().await.map_err(Into::into),
             Command::Gateway(command) => command.dispatch().await,
             Command::Init(args) => args.run().await.map_err(Into::into),
             Command::Server(command) => command.dispatch().await.map_err(Into::into),
@@ -105,6 +107,9 @@ pub enum Command {
     Principal(PrincipalCommand),
     /// Run a terminal-safe streaming Oracle query.
     Query(QueryCommand),
+    /// Inspect and cancel one queued Verifier execution: status, invocation
+    /// and publication pages, publication reads, and download plans.
+    Execution(ExecutionCommand),
     /// Administer tenant gateway credentials, deployments, and policies.
     Gateway(GatewayCommand),
     /// Migrate, start, and configure a local Wyrd server, then hand off the

@@ -1,0 +1,12 @@
+apiVersion: wyrd/v1
+kind: Service
+metadata:
+  name: reviewed
+  version: 1.0.0
+spec:
+  service_type: agent
+  components:
+    - alias: agent
+      ref: ./assistant-agent.yaml
+      verified_by:
+        - verifier: ./reviewed-verifier.yaml

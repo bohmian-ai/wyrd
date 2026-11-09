@@ -414,7 +414,7 @@ typed columns:
     only writes a row again. Rows therefore repeat across replicas and
     restarts, and readers aggregate by `series_id`, never counting rows as
     series.
-- Three tables hold each verification fact once. A result read assembles the
+- The existing three result tables hold each result payload fact once. A result read assembles the
   public `VerificationResult` from them: the verdict from `results`,
   `requirements` and `steps` from `execution_outputs` by `result_id`, and
   `evidence` from `execution_inputs` by `execution_id`. Detail is never
@@ -452,6 +452,58 @@ typed columns:
   Its published input timestamp is `recorded_at`, the server-recorded input
   time, distinct from execution timing or sample/window time. It uses the
   same execution/binding/application-Run correlation names where applicable.
+- `bifrost.verification.execution_events` retains typed execution lifecycle, invocation
+  and publication facts, including bounded authored JSON in its existing sensitive value
+  semantics. It preserves server-assigned event identity, execution sequence/cut and
+  producer indices/attempt. Extend its versioned metadata for authoritative terminal
+  selection: exact result ID or null, full sanitized error and recorded
+  tenant/Verifier/subject/repository/actor identity; inspectable invocation/disposition
+  records; complete file/directory manifests with private verified File associations,
+  original-call receipt identity and source lineage; and accepted request
+  scope/key/digest for replay. It references existing inputs/results/outputs rather than
+  copying their payload or inventing another verdict. Oversized metadata/bytes use
+  existing immutable File references, never SQL payload custody or a new archive table
+  family.
+  - Verification execution checkpoints extend the existing canonical verification
+    data with complete versioned logical state. The engine owns the live object;
+    PostgreSQL queue rows coordinate work, not a duplicate checkpoint/result
+    payload store or general event projection backlog. The existing queue also
+    retains durable pending terminal delivery: the minimal sanitized terminal
+    decision and stable delivery identity remain retryable until canonical
+    Bifrost records receive WAL/batch-commit ACK. Only then may the queue retire
+    delivery. This narrow responsibility covers every queued terminal producer;
+    it introduces no execution-head table, separate finalizer or second writer.
+    Existing inputs/results/outputs retain their meanings.
+  - The existing shared Scribe outbox provides bounded batching, stable retry
+    identities and WAL acknowledgement at consequential execution boundaries.
+    Exact completed File descriptors stay with accepted publications from the
+    start; no terminal archive handoff or PostgreSQL descriptor transfer exists.
+  - Internal execution recovery reads obtain the accepted checkpoint position
+    and its exact compatible state, authoritative absence, or explicit
+    unavailability. Missing required source/record means wait/retry. Ordinary
+    analytical query success does not certify authoritative execution recovery;
+    its documented source-discovery semantics below remain unchanged. No public
+    freshness selector or execution-side source registry is added.
+  - Extend existing checkpoint acceptance/fence machinery for current-writer and
+    expected-revision acceptance. A replacement shuts out stale writes before
+    continuing. Expiry/cancellation/deadline protection remains required, and a
+    rejected WAL write must stay rejected during replay. Existing batch replay
+    deduplication alone does not implement this contract. These are required
+    owner extensions, not claims that the current implementation already does so.
+    Each revision's batch identity derives from its execution and revision, so
+    its Scribe batch fence accepts exactly one write of it; recovery reads the
+    fenced prefix. No PostgreSQL execution-head table exists. A revision the old
+    writer froze under its confirmed lease just before takeover may still be
+    accepted first and is then inherited; that rare interval is accepted.
+  - File completion, exact path/digest/length validation, inventory acknowledgement
+    and existing storage/session retention remain unchanged. No inventory
+    rediscovery, remote-publication/Iceberg wait, extra writer or new collector.
+  - Execution APIs keep recorded identity, current feature permissions, exact
+    producer selection, page membership and complete errors without legacy
+    PostgreSQL payload rows. Operator/provider deliveries and registry/principal,
+    binding/schedule/group, webhook/generation and library metadata retain their
+    independent lifetimes; delivery retry does not reexecute verification.
+
 - Every nullable built-in Struct — the `bifrost.metrics.points` bucket sets and
   `bifrost.gateway.calls` `resolved_model` — has nullable children, because a
   required Parquet leaf under a null parent reads back as another row's value
@@ -461,7 +513,8 @@ typed columns:
   refuses a batch with a partial Struct before ACK with
   `WYRD_VALA_400_SCHEMA_PARSE` naming the row and child.
 - The `bifrost.verification.execution_outputs` output, the
-  `bifrost.verification.execution_inputs` inputs and activation,
+  `bifrost.verification.execution_inputs` inputs and activation, the
+  `bifrost.verification.execution_events` value,
   `bifrost.gateway.calls` `request_payload` and `response_payload`, and
   `bifrost.system.audit_log` `detail` are Variant.
 
@@ -1406,11 +1459,12 @@ to: one row per authorized request rather than continuous high-rate ingest,
 date-range rather than recent-window queries, and retention measured in years
 rather than days.
 
-The four verification tables — `bifrost.drift.observations`,
+The five verification tables — `bifrost.drift.observations`,
 `bifrost.verification.execution_inputs`, `bifrost.verification.execution_outputs`,
-and `bifrost.verification.results` — also partition by UTC day on each table's
-time column — `created_at` for observations, `recorded_at` for execution
-inputs, and `ended_at` for execution outputs and results —
+`bifrost.verification.execution_events`, and `bifrost.verification.results` —
+also partition by UTC day on each table's time column — `created_at` for
+observations, `recorded_at` for execution inputs, `occurred_at` for execution
+events, and `ended_at` for execution outputs and results —
 never by Verifier, subject, binding, or tenant ID. A Drift schedule window does
 not determine partition size. `bifrost.storage.objects` partitions by UTC day
 on `recorded_at`.
@@ -1883,9 +1937,10 @@ the namespace does not create another storage or authorization model.
 
 Permissions are scoped through `BifrostTable`, `BifrostRecord`, and
 `BifrostQuery`. Generic writes cannot target reserved or system-managed tables;
-`bifrost.gateway.calls`, the three verification tables
-(`bifrost.verification.results`, `bifrost.verification.execution_inputs`, and
-`bifrost.verification.execution_outputs`), the `bifrost.storage.objects`
+`bifrost.gateway.calls`, the four verification tables
+(`bifrost.verification.results`, `bifrost.verification.execution_inputs`,
+`bifrost.verification.execution_outputs`, and
+`bifrost.verification.execution_events`), the `bifrost.storage.objects`
 inventory, and the `bifrost.metrics.series` index, which Scribe derives from
 admitted points, accept no public write at all: Gate refuses every principal. Only
 the server-internal capture writer writes them, together with
@@ -1900,8 +1955,9 @@ caller's pair for `submit` inputs, and the execution's accepted subject with
 the tenant `System` principal as actor for a queued result. A `submit`
 creates its queued `wyrd.verifier_executions` row only after Scribe
 acknowledges its `execution_inputs` batch, through the existing batched
-request outbox; staged inputs not yet acknowledged are lost on abrupt process
-death, and the execution then never becomes visible. The row stores no input
+request outbox, and `submit` answers only after that row commits; staged
+inputs not yet acknowledged are lost on abrupt process death, and that
+submission is then never acknowledged. The row stores no input
 values: the runner resolves them, and the accepted routes, from that input
 record. A group or schedule execution follows the same order: the scheduler
 prepares it without writing the queue and stages its selector record on a

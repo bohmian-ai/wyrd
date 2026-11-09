@@ -27,7 +27,7 @@ use vala_verify::blocks::{
 use wyrd_spec::card::agent::ExecutionRoute;
 use wyrd_spec::card::verifier::{Action, Check};
 use wyrd_spec::error::WyrdError;
-use wyrd_spec::ids::SlotName;
+use wyrd_spec::ids::{CardUid, SlotName};
 use wyrd_spec::verification::TaskId;
 use wyrd_spec::verification::execution::InputDeclaration;
 
@@ -41,6 +41,7 @@ use super::workspace::Workspaces;
 use crate::components::auth::Caller;
 use crate::components::gateway::{GatewayCallContext, ServerWyrdGatewayCaller};
 use crate::state::AppState;
+use crate::verification::state::RunState;
 
 /// Most steps or checks one execution runs at once.
 // ponytail: fixed per-execution fan-out; the sandbox and workspace pools
@@ -62,6 +63,9 @@ pub struct Execution<'a> {
     /// The accepted authority every Card, evidence, query, tool, and model
     /// call is authorized and audited as.
     pub caller: &'a Caller,
+    /// The executing Verifier, whose `verifier:run` authorizes loading its
+    /// Agent and Prompt definitions.
+    pub verifier: &'a CardUid,
     /// The execution's pinned evidence, the only citable sources.
     pub evidence: &'a BTreeMap<SlotName, InputDeclaration>,
     /// Per-requirement or per-step Agent route overrides.
@@ -77,6 +81,9 @@ pub struct Execution<'a> {
     /// The execution's block clock (`ExecutionTelemetry::clock`), on which
     /// the engine records every block's run interval.
     pub clock: BlockClock,
+    /// The execution state whose accepted publications workspaces mount;
+    /// `None` for an engine bound to no execution.
+    pub execution: Option<Arc<RunState>>,
 }
 
 impl HostedBlocks {
@@ -121,7 +128,8 @@ impl HostedBlocks {
     /// gateway caller are all bound to `execution.caller`; the evidence
     /// reader also admits the pinned evidence before any block runs, and
     /// every block's run interval is recorded on `execution.clock`; Agent and Prompt
-    /// Cards resolve through the caller's audited `card:read`, and every
+    /// Cards resolve through the caller's audited `verifier:run` on
+    /// `execution.verifier`, and every
     /// model call goes through the in-process gateway as that caller,
     /// attributed to `execution.subject`.
     ///
@@ -134,27 +142,41 @@ impl HostedBlocks {
         execution: Execution<'_>,
     ) -> Result<VerificationEngine, WyrdError> {
         let caller = execution.caller;
-        let evidence = Arc::new(TenantEvidence::new(
+        let evidence = TenantEvidence::new(
             state.clone(),
             caller.clone(),
             execution.evidence.clone(),
             self.limits,
+        );
+        let evidence = Arc::new(match &execution.execution {
+            Some(state) => evidence.with_execution(Arc::clone(state)),
+            None => evidence,
+        });
+        let registry = Arc::new(TenantRegistry::new(
+            state.clone(),
+            Some(caller.clone()),
+            execution.verifier.clone(),
         ));
-        let registry = Arc::new(TenantRegistry::new(state.clone(), Some(caller.clone())));
         let agent = AgentExecutor::new(
             Arc::default(),
             Arc::clone(&registry) as Arc<dyn AgentCardResolver>,
             registry as Arc<dyn PromptCardResolver>,
         )
         .with_evidence(Arc::clone(&evidence) as Arc<dyn EvidenceReader>)
-        .with_toolset(Arc::new(HostedTools::new(
-            state.clone(),
-            caller.clone(),
-            Arc::clone(&evidence),
-            Arc::clone(&self.workspaces),
-            Arc::clone(&self.sandbox),
-            self.limits,
-        )))
+        .with_toolset(Arc::new({
+            let tools = HostedTools::new(
+                state.clone(),
+                caller.clone(),
+                Arc::clone(&evidence),
+                Arc::clone(&self.workspaces),
+                Arc::clone(&self.sandbox),
+                self.limits,
+            );
+            match &execution.execution {
+                Some(run) => tools.with_execution(Arc::clone(run)),
+                None => tools,
+            }
+        }))
         .with_wyrd_gateway(Arc::new(
             ServerWyrdGatewayCaller::new(state.clone(), caller.clone())
                 .attributed(Some(execution.subject)),

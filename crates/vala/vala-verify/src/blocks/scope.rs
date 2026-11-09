@@ -9,6 +9,7 @@
 //! intentional skip is never confused with a failure.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::sync::Arc;
 
 use serde_json::Value;
 
@@ -19,7 +20,7 @@ use wyrd_spec::verification::execution::{
     InputDeclaration, RequirementOutcome, RequirementResult, StepResult, StepStatus,
 };
 
-use super::{CallInput, CallValue};
+use super::{BoundJson, CallInput, CallValue};
 use crate::walk::RunLedger;
 
 /// Why a value is missing. Ordered so the stronger cause is the greater:
@@ -75,11 +76,14 @@ impl Missing {
 #[derive(Debug, Clone, PartialEq)]
 pub(super) enum Settled {
     /// The action succeeded, deriving its output from the `sources` slots.
-    /// The output itself has one owner, the step's reported
-    /// [`StepResult::output`], which `steps.<id>.output` references read.
+    /// The output has one owner until the run ends: this state, which
+    /// `steps.<id>.output` bindings share and which becomes the step's
+    /// reported [`StepResult::output`] once no binding holds it.
     Succeeded {
         /// Original slots the action read.
         sources: BTreeSet<SlotName>,
+        /// The action's output.
+        output: Arc<Value>,
     },
     /// The step failed or was skipped, so it has no output.
     NoOutput {
@@ -121,8 +125,9 @@ pub(super) enum Done {
 /// The scope document of one stage: the original evidence plus every block
 /// earlier stages settled. Read-only; the stage walk owns the ledger.
 pub(super) struct Scope<'a> {
-    /// The pinned original evidence by slot.
-    evidence: &'a BTreeMap<SlotName, InputDeclaration>,
+    /// The pinned original evidence by slot, shared with the bindings that
+    /// select from it.
+    evidence: &'a Arc<BTreeMap<SlotName, InputDeclaration>>,
     /// Blocks settled by earlier stages.
     ledger: &'a RunLedger<Done>,
 }
@@ -130,7 +135,7 @@ pub(super) struct Scope<'a> {
 impl<'a> Scope<'a> {
     /// The scope over the original evidence and the blocks in `ledger`.
     pub(super) fn new(
-        evidence: &'a BTreeMap<SlotName, InputDeclaration>,
+        evidence: &'a Arc<BTreeMap<SlotName, InputDeclaration>>,
         ledger: &'a RunLedger<Done>,
     ) -> Self {
         Self { evidence, ledger }
@@ -198,9 +203,14 @@ impl<'a> Scope<'a> {
             ReferenceRoot::Input(slot) => {
                 let sources = BTreeSet::from([slot.clone()]);
                 match self.evidence.get(slot) {
-                    Some(InputDeclaration::Json { value }) => select(value, &reference.path)
-                        .map(|value| json_input(value, sources))
-                        .ok_or_else(unresolved),
+                    Some(InputDeclaration::Json { value }) => bind(value, &reference.path, || {
+                        BoundJson::evidence(self.evidence, slot, &reference.path)
+                    })
+                    .map(|value| CallInput {
+                        value: CallValue::Json(value),
+                        sources,
+                    })
+                    .ok_or_else(unresolved),
                     Some(declaration) if reference.path.is_empty() => Ok(CallInput {
                         value: CallValue::Evidence(declaration.clone()),
                         sources,
@@ -211,14 +221,16 @@ impl<'a> Scope<'a> {
             }
             ReferenceRoot::StepOutput(step) => match self.ledger.get(step) {
                 Some(Done::Step {
-                    result,
-                    state: Settled::Succeeded { sources },
-                }) => result
-                    .output
-                    .as_ref()
-                    .and_then(|output| select(output, &reference.path))
-                    .map(|value| json_input(value, sources.clone()))
-                    .ok_or_else(unresolved),
+                    state: Settled::Succeeded { sources, output },
+                    ..
+                }) => bind(output, &reference.path, || {
+                    BoundJson::output(output, &reference.path)
+                })
+                .map(|value| CallInput {
+                    value: CallValue::Json(value),
+                    sources: sources.clone(),
+                })
+                .ok_or_else(unresolved),
                 Some(Done::Step {
                     state: Settled::NoOutput { gap, .. },
                     ..
@@ -258,12 +270,37 @@ impl<'a> Scope<'a> {
     }
 }
 
-/// A JSON binding value.
+/// A JSON binding value the binding owns.
 fn json_input(value: Value, sources: BTreeSet<SlotName>) -> CallInput {
     CallInput {
-        value: CallValue::Json(value),
+        value: CallValue::Json(value.into()),
         sources,
     }
+}
+
+/// Bind the selection `path` makes below `value`: `shared`, pointing at the
+/// selected value where it is held, unless a wildcard builds a new array.
+/// Returns `None` when the selection matches nothing.
+fn bind(
+    value: &Value,
+    path: &[PathSegment],
+    shared: impl FnOnce() -> Option<BoundJson>,
+) -> Option<BoundJson> {
+    if path.contains(&PathSegment::Wildcard) {
+        select(value, path).map(BoundJson::from)
+    } else {
+        shared()
+    }
+}
+
+/// The one value field and index selectors name below `value`, borrowed;
+/// `None` when a selector matches nothing or is a wildcard.
+pub(super) fn find<'v>(value: &'v Value, path: &[PathSegment]) -> Option<&'v Value> {
+    path.iter().try_fold(value, |value, segment| match segment {
+        PathSegment::Field(name) => value.get(name),
+        PathSegment::Index(index) => value.get(index),
+        PathSegment::Wildcard => None,
+    })
 }
 
 /// The serde wire form of a status or outcome enum, such as `"succeeded"`.

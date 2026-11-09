@@ -491,14 +491,14 @@ mod pg_tests {
     }
 
     /// A direct execution with large inline evidence judges a whole-input
-    /// assertion under hashed capture with one payload copy: the selected
-    /// value the executor binding owns. Building the engine, admitting the
-    /// evidence to the hosted reader, comparing and hashing the borrowed
-    /// actual value copy nothing more, and the outcome returns the original
-    /// evidence and the compact-Serde digest. A successful step's large
-    /// output serves its dependent requirement and the step result with two
-    /// copies under full capture, the selected value and the stored actual
-    /// value, its output owned once.
+    /// assertion under hashed capture without copying the payload: the
+    /// binding points at the pinned evidence, and building the engine,
+    /// admitting the evidence to the hosted reader, and comparing and hashing
+    /// the borrowed actual value copy nothing, while the outcome returns the
+    /// original evidence and the compact-Serde digest. A successful step's
+    /// large output serves its dependent requirement and the step result with
+    /// one copy under full capture, the stored actual value, its output
+    /// owned once.
     ///
     /// # Panics
     /// Panics when a run fails, its outcome differs, or it copies the
@@ -570,8 +570,8 @@ mod pg_tests {
             allocated
         });
         assert!(
-            evidence_copies < 1.1,
-            "only the selected value copies the evidence: {evidence_copies:.2} copies"
+            evidence_copies < 0.1,
+            "nothing copies the evidence: {evidence_copies:.2} copies"
         );
 
         let dependent = verifier(json!({
@@ -602,8 +602,8 @@ mod pg_tests {
             allocated
         });
         assert!(
-            output_copies < 2.1,
-            "only the selected value and the stored actual value copy the output: {output_copies:.2} copies"
+            output_copies < 1.1,
+            "only the stored actual value copies the output: {output_copies:.2} copies"
         );
     }
 }

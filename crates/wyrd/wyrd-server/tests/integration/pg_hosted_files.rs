@@ -235,9 +235,12 @@ async fn extract_action_returns_locked_shape() {
         })
     );
     assert!(
-        ActionExecutor::execute(&evidence, call(CallValue::Json(serde_json::json!(1))))
-            .await
-            .is_err()
+        ActionExecutor::execute(
+            &evidence,
+            call(CallValue::Json(serde_json::json!(1).into()))
+        )
+        .await
+        .is_err()
     );
     uploads
         .server

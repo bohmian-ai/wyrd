@@ -260,7 +260,7 @@ fn input(name: &str, value: Value) -> BTreeMap<String, CallInput> {
     BTreeMap::from([(
         name.to_owned(),
         CallInput {
-            value: CallValue::Json(value),
+            value: CallValue::Json(value.into()),
             sources: BTreeSet::new(),
         },
     )])
@@ -517,7 +517,7 @@ fn from_deck(value: Value) -> BTreeMap<String, CallInput> {
     BTreeMap::from([(
         "response".to_owned(),
         CallInput {
-            value: CallValue::Json(value),
+            value: CallValue::Json(value.into()),
             sources: BTreeSet::from([SlotName::new("deck").expect("slot")]),
         },
     )])
@@ -918,7 +918,7 @@ fn sourced(value: &str, slots: &[&str]) -> BTreeMap<String, CallInput> {
     BTreeMap::from([(
         "response".to_owned(),
         CallInput {
-            value: CallValue::Json(json!(value)),
+            value: CallValue::Json(json!(value).into()),
             sources: slots
                 .iter()
                 .map(|&slot| SlotName::new(slot).expect("slot"))
@@ -1014,7 +1014,7 @@ async fn check_agent_reads_its_workspace_through_declared_tools() {
             workspace: BTreeMap::from([(
                 "/inputs/report.txt".to_owned(),
                 CallInput {
-                    value: CallValue::Json(json!("report")),
+                    value: CallValue::Json(json!("report").into()),
                     sources: BTreeSet::from([SlotName::new("deck").expect("slot")]),
                 },
             )]),

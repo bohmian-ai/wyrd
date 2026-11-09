@@ -316,7 +316,7 @@ impl CodeExecutor {
                     "code input {name} is media; bind an extract step's output instead"
                 )));
             };
-            arguments.insert(name.clone(), value.clone());
+            arguments.insert(name.clone(), Value::clone(value));
         }
         let ran = self
             .sandbox

@@ -380,7 +380,14 @@ impl VerificationEngine {
         let (mut steps, mut requirements) = (Vec::new(), Vec::new());
         for (_, done) in ledger {
             match done {
-                Done::Step { result, .. } => steps.push(*result),
+                Done::Step { mut result, state } => {
+                    // Every binding has ended, so the shared output moves
+                    // into the result without a copy.
+                    if let Settled::Succeeded { output, .. } = state {
+                        result.output = Some(Arc::unwrap_or_clone(output));
+                    }
+                    steps.push(*result);
+                }
                 Done::Requirement(result) => requirements.push(*result),
             }
         }
@@ -508,7 +515,7 @@ impl VerificationEngine {
         &self,
         spec: &Arc<VerifierSpec>,
         plan: &ExecutionPlan,
-        evidence: &BTreeMap<SlotName, InputDeclaration>,
+        evidence: &Arc<BTreeMap<SlotName, InputDeclaration>>,
         deadline: Instant,
     ) -> Result<RunLedger<Done>, EngineError> {
         let mut blocks: HashMap<&TaskId, Block> = HashMap::new();
@@ -1133,14 +1140,17 @@ impl Attempted {
                 StepResult {
                     id: step.id.clone(),
                     status: StepStatus::Succeeded,
-                    output: Some(output.output),
+                    output: None,
                     attempts: self.attempts,
                     duration_ms,
                     reason: None,
                     provenance: output.provenance,
                     tool_calls: output.tool_calls,
                 },
-                Settled::Succeeded { sources },
+                Settled::Succeeded {
+                    sources,
+                    output: Arc::new(output.output),
+                },
             ),
             Err(reason) => (
                 StepResult {
@@ -1323,7 +1333,7 @@ fn requirement_at(spec: &VerifierSpec, (step, at): Key) -> &Requirement {
 /// evidence as its declaration's JSON form.
 fn json(input: &CallInput) -> Cow<'_, Value> {
     match &input.value {
-        CallValue::Json(value) => Cow::Borrowed(value),
+        CallValue::Json(value) => Cow::Borrowed(&**value),
         CallValue::Evidence(declaration) => {
             Cow::Owned(serde_json::to_value(declaration).unwrap_or(Value::Null))
         }

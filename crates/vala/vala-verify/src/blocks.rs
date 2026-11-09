@@ -23,13 +23,15 @@ pub use agent::{
 pub use tools::{AgentToolset, ToolSession, provider_tool_name};
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::ops::Deref;
+use std::sync::Arc;
 
 use async_trait::async_trait;
 use serde_json::Value;
 use thiserror::Error;
 use tokio::time::Instant;
 
-use wyrd_spec::card::verifier::{Action, Check};
+use wyrd_spec::card::verifier::{Action, Check, PathSegment};
 use wyrd_spec::ids::SlotName;
 use wyrd_spec::verification::TaskId;
 use wyrd_spec::verification::execution::{
@@ -61,9 +63,114 @@ pub enum Position<'a> {
 #[derive(Debug, Clone, PartialEq)]
 pub enum CallValue {
     /// JSON data: inline input, step output, status, or verdict field.
-    Json(Value),
+    Json(BoundJson),
     /// Pinned original evidence a media slot names; executors fetch bytes.
     Evidence(InputDeclaration),
+}
+
+/// The JSON one binding reads, dereferencing to the selected value.
+///
+/// A selection naming one value of the run's pinned evidence or of a settled
+/// step's output points at that value where it is held, so binding copies
+/// nothing however large it is. A wildcard selection, which builds a new
+/// array, and a constant or derived value, such as a step status, are owned.
+#[derive(Debug, Clone)]
+pub struct BoundJson(Bound);
+
+/// Where a [`BoundJson`] value is held.
+#[derive(Debug, Clone)]
+enum Bound {
+    /// A value the binding owns.
+    Owned(Value),
+    /// The value at `path` in the JSON evidence `slot`.
+    Evidence {
+        /// The run's pinned evidence.
+        evidence: Arc<BTreeMap<SlotName, InputDeclaration>>,
+        /// The JSON slot selected.
+        slot: SlotName,
+        /// Field and index selectors below the slot's value.
+        path: Vec<PathSegment>,
+    },
+    /// The value at `path` in a settled step's output.
+    Output {
+        /// The step's output, shared with the ledger.
+        output: Arc<Value>,
+        /// Field and index selectors below the output.
+        path: Vec<PathSegment>,
+    },
+}
+
+impl BoundJson {
+    /// The value at `path` in the JSON evidence `slot`, or `None` when the
+    /// slot is not JSON or `path` selects nothing.
+    pub(crate) fn evidence(
+        evidence: &Arc<BTreeMap<SlotName, InputDeclaration>>,
+        slot: &SlotName,
+        path: &[PathSegment],
+    ) -> Option<Self> {
+        let Some(InputDeclaration::Json { value }) = evidence.get(slot) else {
+            return None;
+        };
+        scope::find(value, path)?;
+        Some(Self(Bound::Evidence {
+            evidence: Arc::clone(evidence),
+            slot: slot.clone(),
+            path: path.to_vec(),
+        }))
+    }
+
+    /// The value at `path` in a step's `output`, or `None` when `path`
+    /// selects nothing.
+    pub(crate) fn output(output: &Arc<Value>, path: &[PathSegment]) -> Option<Self> {
+        scope::find(output, path)?;
+        Some(Self(Bound::Output {
+            output: Arc::clone(output),
+            path: path.to_vec(),
+        }))
+    }
+}
+
+impl From<Value> for BoundJson {
+    /// A binding that owns `value`.
+    fn from(value: Value) -> Self {
+        Self(Bound::Owned(value))
+    }
+}
+
+impl Deref for BoundJson {
+    type Target = Value;
+
+    /// The selected value, found again by its selectors over data no one
+    /// mutates.
+    ///
+    /// # Panics
+    /// Panics when the selected value is gone, which cannot happen: a shared
+    /// binding is built only once its selectors resolve, over immutable
+    /// shared data.
+    fn deref(&self) -> &Value {
+        match &self.0 {
+            Bound::Owned(value) => value,
+            Bound::Evidence {
+                evidence,
+                slot,
+                path,
+            } => match evidence.get(slot) {
+                Some(InputDeclaration::Json { value }) => scope::find(value, path),
+                _ => None,
+            }
+            .expect("a bound evidence value stays selectable"),
+            Bound::Output { output, path } => {
+                scope::find(output, path).expect("a bound step output stays selectable")
+            }
+        }
+    }
+}
+
+impl PartialEq for BoundJson {
+    /// Bindings are equal when their selected values are.
+    fn eq(&self, other: &Self) -> bool {
+        **self == **other
+    }
 }
 
 /// A resolved binding plus the original input slots it derives from, so
@@ -236,7 +343,7 @@ mod tests {
         async fn execute(&self, call: BlockCall<'_, Action>) -> Result<ActionOutput, BlockError> {
             match call.inputs.get("from").map(|input| &input.value) {
                 Some(CallValue::Json(value)) => Ok(ActionOutput {
-                    output: value.clone(),
+                    output: Value::clone(value),
                     provenance: None,
                     tool_calls: Vec::new(),
                 }),
@@ -260,7 +367,7 @@ mod tests {
             serde_json::from_value(json!({"kind": "extract", "from": "inputs.deck"}))
                 .expect("action");
         let input = CallInput {
-            value: CallValue::Json(json!({"slides": []})),
+            value: CallValue::Json(json!({"slides": []}).into()),
             sources: BTreeSet::from([SlotName::new("deck").expect("slot")]),
         };
         let call = BlockCall {

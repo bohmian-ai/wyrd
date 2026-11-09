@@ -82,7 +82,7 @@ impl Workspaces {
         for (path, input) in files {
             let (bytes, format) = match &input.value {
                 CallValue::Json(value) => (
-                    serde_json::to_vec_pretty(value).unwrap_or_default(),
+                    serde_json::to_vec_pretty(&**value).unwrap_or_default(),
                     Some(MediaFormat::Json),
                 ),
                 CallValue::Evidence(InputDeclaration::Artifact { artifact, path }) => {

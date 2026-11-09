@@ -300,7 +300,7 @@ async fn artifact_evidence_and_code_reach_every_consumer() {
             inputs: BTreeMap::from([(
                 "x".to_owned(),
                 CallInput {
-                    value: CallValue::Json(json!(1)),
+                    value: CallValue::Json(json!(1).into()),
                     sources: BTreeSet::new(),
                 },
             )]),
@@ -654,7 +654,7 @@ fn document(value: Value) -> BTreeMap<String, CallInput> {
     BTreeMap::from([(
         "document".to_owned(),
         CallInput {
-            value: CallValue::Json(value),
+            value: CallValue::Json(value.into()),
             sources: BTreeSet::from([notes()]),
         },
     )])
@@ -999,7 +999,7 @@ async fn capacity_refusal_is_busy_at_every_hosted_consumer() {
         BTreeMap::from([(
             "x".to_owned(),
             CallInput {
-                value: CallValue::Json(json!(1)),
+                value: CallValue::Json(json!(1).into()),
                 sources: BTreeSet::new(),
             },
         )])

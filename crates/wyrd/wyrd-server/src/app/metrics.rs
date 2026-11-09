@@ -731,22 +731,23 @@ mod tests {
             ),
             "there is no live switch to the production backend"
         );
-        assert_eq!(fetch(&router, "GET", "/metrics").await.0, StatusCode::NOT_FOUND);
+        assert_eq!(
+            fetch(&router, "GET", "/metrics").await.0,
+            StatusCode::NOT_FOUND
+        );
         let before = timings(&router).await;
         assert!(
             before
                 .metrics
                 .iter()
-                .any(|metric| metric.matches("bifrost_gate_requests_total", &[("operation", "write")])),
+                .any(|metric| metric
+                    .matches("bifrost_gate_requests_total", &[("operation", "write")])),
             "series registered at startup land in the benchmark recorder"
         );
         metrics::counter!(HTTP_REQUESTS_TOTAL, "status" => "200").increment(3);
         metrics::gauge!(VERIFICATION_ACTIVE_RUNS, "mode" => "direct").increment(2.0);
         metrics::histogram!(OUTBOX_WRITE_SECONDS, "outbox" => "scribe").record(0.002);
-        let interval = timings(&router)
-            .await
-            .since(&before)
-            .expect("one process");
+        let interval = timings(&router).await.since(&before).expect("one process");
         assert_eq!(interval.counter(HTTP_REQUESTS_TOTAL, &[]), Some(3));
         assert!(interval.metrics.iter().any(|metric| matches!(
             metric.value,

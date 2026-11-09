@@ -1750,11 +1750,15 @@ mod tests {
         let last = Metrics::of_snapshot(&after);
         let population = Population::between(&before, after).expect("one process");
         assert!(population.invalid.is_empty(), "{:?}", population.invalid);
-        let grew = |family: &str, labels: &[&str]| last.sum(family, labels) - first.sum(family, labels);
+        let grew =
+            |family: &str, labels: &[&str]| last.sum(family, labels) - first.sum(family, labels);
 
         assert_eq!(population.count(QUERY_BOUNDARY), 1);
         assert_eq!(population.scans.len(), 1);
-        assert_eq!(grew("bifrost_scribe_memtable_bytes_inserted_total", &[]), 64.0);
+        assert_eq!(
+            grew("bifrost_scribe_memtable_bytes_inserted_total", &[]),
+            64.0
+        );
         assert_eq!(grew("oracle_query_files_scanned_total", &[]), 3.0);
         assert_eq!(last.sum("bifrost_scribe_active_memtable_bytes", &[]), 5.0);
         assert_eq!(
@@ -1762,7 +1766,11 @@ mod tests {
             8.0
         );
 
-        assert!(population.residuals("verification.direct", "completed").is_ok());
+        assert!(
+            population
+                .residuals("verification.direct", "completed")
+                .is_ok()
+        );
         assert!(verify::observed_components(&population));
         assert_eq!(verify::components(&population, 1).len(), 2);
         for histogram in [
@@ -1771,7 +1779,10 @@ mod tests {
         ] {
             assert_eq!(verify::mean_ms(histogram).samples, Some(1));
         }
-        assert_eq!(verify::mean_ms(verify::acknowledgements(&population)).samples, Some(2));
+        assert_eq!(
+            verify::mean_ms(verify::acknowledgements(&population)).samples,
+            Some(2)
+        );
         assert_eq!(verify::backlog(&last), 3.0, "two queued and one pending");
         assert_eq!(verify::lost_writes(&first, &last).value, Some(1.0));
 
@@ -1783,7 +1794,12 @@ mod tests {
         );
         let integrity = Integrity::between(&first, &last);
         assert_eq!(
-            (integrity.staged, integrity.dropped, integrity.written, integrity.shed),
+            (
+                integrity.staged,
+                integrity.dropped,
+                integrity.written,
+                integrity.shed
+            ),
             (2.0, 1.0, 1.0, 1.0)
         );
         assert_eq!(integrity.unwritten(), None);
@@ -1795,7 +1811,10 @@ mod tests {
             }
         );
         assert_eq!(
-            grew("wyrd_gateway_phase_duration_seconds_count", &["phase=\"account\""]),
+            grew(
+                "wyrd_gateway_phase_duration_seconds_count",
+                &["phase=\"account\""]
+            ),
             1.0,
             "admitted calls are the accounting phase's observations"
         );

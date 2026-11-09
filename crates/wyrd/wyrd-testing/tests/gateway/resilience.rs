@@ -690,7 +690,12 @@ async fn benchmark_mode_keeps_capture_and_snapshot_counts_without_prometheus() {
     }
     let scribe = ["outbox=\"scribe\""];
     assert_eq!(
-        delta(&first, &last, "wyrd_gateway_capture_total", &["outcome=\"staged\""]),
+        delta(
+            &first,
+            &last,
+            "wyrd_gateway_capture_total",
+            &["outcome=\"staged\""]
+        ),
         2.0,
         "both calls stage their capture"
     );

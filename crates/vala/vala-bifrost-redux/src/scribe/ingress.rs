@@ -1603,7 +1603,9 @@ mod tests {
             assert_eq!(count, 1, "{boundary}: {:?}", interval.series);
         }
         assert!(
-            interval.histogram("bifrost_scribe_ack_seconds", &[]).is_err(),
+            interval
+                .histogram("bifrost_scribe_ack_seconds", &[])
+                .is_err(),
             "the acknowledgement histogram would count the timed write twice"
         );
         scribe

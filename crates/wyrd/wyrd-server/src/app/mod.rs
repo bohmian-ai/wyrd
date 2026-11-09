@@ -44,11 +44,9 @@ pub async fn run(mode: Option<ServeMode>) -> Result<(), BootExit> {
     let config = WyrdServerConfig::load().map_err(|e| BootExit::Config(Box::new(e)))?;
     production_guards(&config);
 
-    let telemetry_runtime = WyrdTelemetryRuntime::install(
-        config.telemetry.clone(),
-        config.metrics.benchmark_snapshot,
-    )
-    .map_err(|error| BootExit::Other(Box::new(error)))?;
+    let telemetry_runtime =
+        WyrdTelemetryRuntime::install(config.telemetry.clone(), config.metrics.benchmark_snapshot)
+            .map_err(|error| BootExit::Other(Box::new(error)))?;
     let telemetry: Arc<TelemetryGuard> = telemetry_runtime.guard();
     let metrics = config.metrics.enabled.then(|| telemetry_runtime.metrics());
     info!(
@@ -165,8 +163,8 @@ async fn run_forge_worker_process(
         let listener = TcpListener::bind(bind).await.map_err(|error| {
             BootExit::Other(format!("metrics listener failed to bind {bind}: {error}").into())
         })?;
-        let backend = metrics
-            .ok_or_else(|| BootExit::Other("metrics backend is unavailable".into()))?;
+        let backend =
+            metrics.ok_or_else(|| BootExit::Other("metrics backend is unavailable".into()))?;
         set.spawn(fallible_task(
             TaskId::Metrics,
             serve_metrics(metrics_router(backend), listener, shutdown.clone()),

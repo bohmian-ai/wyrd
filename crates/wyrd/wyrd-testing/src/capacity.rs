@@ -29,7 +29,8 @@ use serde::Serialize;
 use serde_json::Value;
 pub use wyrd_benchmark::UNLABELLED;
 use wyrd_benchmark::{
-    BenchmarkInterval, BenchmarkSnapshot, Distribution, IntervalMetric, IntervalScan, IntervalSeries,
+    BenchmarkInterval, BenchmarkSnapshot, Distribution, IntervalMetric, IntervalScan,
+    IntervalSeries,
 };
 
 use crate::experiment::{Reading, Reconciled, Repetition, TimingEvidence};

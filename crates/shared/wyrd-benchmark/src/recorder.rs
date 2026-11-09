@@ -139,7 +139,11 @@ impl Registry {
     /// The index of `key`'s `kind` series, registering it on first sight;
     /// `None`, counted dropped, once [`MAX_METRIC_SERIES`] are kept.
     pub(crate) fn metric(&mut self, kind: Kind, key: &Key) -> Option<usize> {
-        if let Some(index) = self.metric_keys.get(key).and_then(|slots| slots[kind as usize]) {
+        if let Some(index) = self
+            .metric_keys
+            .get(key)
+            .and_then(|slots| slots[kind as usize])
+        {
             return Some(index);
         }
         let name = key.name().to_owned();

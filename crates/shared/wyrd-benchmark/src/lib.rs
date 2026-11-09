@@ -1227,7 +1227,10 @@ mod tests {
         let after = super::snapshot();
         let interval = after.since(&before).expect("one process");
 
-        assert_eq!(interval.counter("bench_test_total", &[("lane", "a")]), Some(3));
+        assert_eq!(
+            interval.counter("bench_test_total", &[("lane", "a")]),
+            Some(3)
+        );
         assert_eq!(interval.counter("bench_test_total", &[]), Some(7));
         assert_eq!(interval.counter("bench_test_absent_total", &[]), None);
         assert_eq!(
@@ -1274,8 +1277,16 @@ mod tests {
             .expect("the rows histogram");
         assert_eq!(rows.0, super::HistogramUnit::Value);
         let four = rows.1.quantile(1.0).expect("one value");
-        assert_eq!((four.lowest, four.highest), (4, 4), "a value is not seconds");
-        assert!(interval.histogram("bench_test_absent_seconds", &[]).is_err());
+        assert_eq!(
+            (four.lowest, four.highest),
+            (4, 4),
+            "a value is not seconds"
+        );
+        assert!(
+            interval
+                .histogram("bench_test_absent_seconds", &[])
+                .is_err()
+        );
 
         let request = interval
             .series
@@ -1294,7 +1305,9 @@ mod tests {
             "an explicit timing opens no metric series"
         );
         let mut reset = after.clone();
-        reset.metrics.retain(|metric| metric.name != "bench_test_pending");
+        reset
+            .metrics
+            .retain(|metric| metric.name != "bench_test_pending");
         assert!(reset.since(&after).is_err(), "a vanished metric is a reset");
     }
 

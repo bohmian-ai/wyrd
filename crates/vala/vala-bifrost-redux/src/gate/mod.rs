@@ -3038,7 +3038,10 @@ mod tests {
         assert_eq!(series("failed").count, 1);
         assert!(
             interval
-                .histogram("bifrost_gate_request_duration_seconds", &[("operation", "write")])
+                .histogram(
+                    "bifrost_gate_request_duration_seconds",
+                    &[("operation", "write")]
+                )
                 .is_err(),
             "the duration histogram would count each timed write twice"
         );

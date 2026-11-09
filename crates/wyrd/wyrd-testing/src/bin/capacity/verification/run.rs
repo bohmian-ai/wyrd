@@ -1147,7 +1147,11 @@ fn component_totals(population: &Population) -> BTreeMap<String, Distribution> {
         let name = family
             .trim_start_matches("wyrd_verification_")
             .trim_end_matches("_seconds");
-        for metric in population.metrics.iter().filter(|metric| metric.name == family) {
+        for metric in population
+            .metrics
+            .iter()
+            .filter(|metric| metric.name == family)
+        {
             let IntervalValue::Histogram { distribution, .. } = &metric.value else {
                 continue;
             };
@@ -1264,7 +1268,11 @@ mod tests {
         let acks = super::acknowledgements(&population);
         assert_eq!(acks.as_ref().map(wyrd_benchmark::Distribution::len), Ok(2));
         for (distribution, expected, samples) in [
-            (population.histogram(super::SUBMIT, &[super::STAGED]), 0.2, 1),
+            (
+                population.histogram(super::SUBMIT, &[super::STAGED]),
+                0.2,
+                1,
+            ),
             (
                 population.histogram(super::QUEUE_WAIT, &[super::SUBMITTED]),
                 0.3,

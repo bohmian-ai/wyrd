@@ -12,9 +12,10 @@ use axum::http::header::{CONTENT_LENGTH, CONTENT_TYPE};
 use axum::http::{HeaderMap, HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::{Extension, Json};
-use serde::de::DeserializeOwned;
+use serde::Deserialize;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
+use skald_spec::wire::borrowed::Borrowed;
 use utoipa_axum::router::OpenApiRouter;
 use utoipa_axum::routes;
 use vala_bifrost_redux::catalog::{BifrostCatalogError, TableRef};
@@ -1905,23 +1906,24 @@ pub(super) fn json_body(request: Result<Json<Value>, JsonRejection>) -> Result<V
         .map_err(|_| invalid_request(GatewayContractError::new("body", "must be a JSON object")))
 }
 
-/// Decodes a public JSON body as the shared operation request contract `T`
-/// and returns it as the provider-bound body.
+/// Validates a public JSON body against the shared operation request
+/// contract `T` and returns it as the provider-bound body.
 ///
-/// The body is checked by decoding `T`, so a missing or mistyped required
-/// member fails before authorization or dispatch; the checked body itself is
-/// forwarded, so every member `T` accepts, including flattened extensions,
-/// reaches the provider exactly as sent.
+/// The body is checked by decoding `T`'s borrowed projection, which applies
+/// `T`'s rules while borrowing its text, so a missing or mistyped required
+/// member fails before authorization or dispatch without copying the payload;
+/// the checked body itself is forwarded, so every member `T` accepts,
+/// including flattened extensions, reaches the provider exactly as sent.
 ///
 /// # Errors
 /// Returns the [`json_body`] error for a non-JSON body, and
 /// `GatewayInvalidRequest` naming the missing member, or `body`, when the
 /// body does not decode as `T`.
-pub(super) fn typed_body<T: DeserializeOwned>(
+pub(super) fn typed_body<T: for<'a> Borrowed<'a>>(
     request: Result<Json<Value>, JsonRejection>,
 ) -> Result<Value, WyrdError> {
     let body = json_body(request)?;
-    T::deserialize(&body).map_err(|error| {
+    <T as Borrowed<'_>>::View::deserialize(&body).map_err(|error| {
         let message = error.to_string();
         let field = message
             .strip_prefix("missing field `")
@@ -2109,10 +2111,18 @@ impl std::io::Write for SerializedLength {
 
 #[cfg(test)]
 mod usage_bound_tests {
-    use serde_json::json;
+    use axum::Json;
+    use axum::extract::rejection::JsonRejection;
+    use serde::de::DeserializeOwned;
+    use serde_json::{Value, json};
+    use wyrd_spec::error::WyrdError;
     use wyrd_spec::gateway::GatewayOperation;
+    use wyrd_spec::gateway::openai::{
+        GatewayBatchCreateRequest, GatewayChatCompletionsRequest, GatewayEmbeddingsRequest,
+        GatewayImageGenerationRequest, GatewayResponsesRequest, GatewaySpeechRequest,
+    };
 
-    use super::usage_bound;
+    use super::{typed_body, usage_bound};
     use crate::test_support::CountingAllocator;
 
     /// Chat output is bounded by the maximum times the choice count, Responses
@@ -2169,5 +2179,359 @@ mod usage_bound_tests {
             allocated < 4096,
             "counting serializes no request text: {allocated} bytes allocated"
         );
+    }
+
+    /// The error projection of an owned decode of `body` as `T`: the missing
+    /// member, else `body`.
+    fn owned<T: DeserializeOwned>(body: &Value) -> Result<(), String> {
+        T::deserialize(body).map(drop).map_err(|error| {
+            let message = error.to_string();
+            message
+                .strip_prefix("missing field `")
+                .and_then(|rest| rest.split('`').next())
+                .unwrap_or("body")
+                .to_owned()
+        })
+    }
+
+    /// One operation's request validation, as the routes call it.
+    type Validate = fn(Result<Json<Value>, JsonRejection>) -> Result<Value, WyrdError>;
+
+    /// One operation's owned reference decode.
+    type Owned = fn(&Value) -> Result<(), String>;
+
+    /// Validates `body` with `validate`, asserting the checked body is
+    /// returned unchanged, and projects a refusal to its `field`.
+    fn checked(validate: Validate, body: &Value) -> Result<(), String> {
+        match validate(Ok(Json(body.clone()))) {
+            Ok(returned) => {
+                assert_eq!(&returned, body, "validation returns the body unchanged");
+                Ok(())
+            }
+            Err(WyrdError::GatewayInvalidRequest { details, .. }) => {
+                Err(details["field"].as_str().expect("field").to_owned())
+            }
+            Err(error) => panic!("unexpected refusal {error}"),
+        }
+    }
+
+    /// Every typed ingress operation's owned decoder and its validation.
+    fn decoders() -> [(&'static str, Owned, Validate); 6] {
+        [
+            (
+                "chat",
+                owned::<GatewayChatCompletionsRequest>,
+                typed_body::<GatewayChatCompletionsRequest>,
+            ),
+            (
+                "responses",
+                owned::<GatewayResponsesRequest>,
+                typed_body::<GatewayResponsesRequest>,
+            ),
+            (
+                "embeddings",
+                owned::<GatewayEmbeddingsRequest>,
+                typed_body::<GatewayEmbeddingsRequest>,
+            ),
+            (
+                "speech",
+                owned::<GatewaySpeechRequest>,
+                typed_body::<GatewaySpeechRequest>,
+            ),
+            (
+                "image",
+                owned::<GatewayImageGenerationRequest>,
+                typed_body::<GatewayImageGenerationRequest>,
+            ),
+            (
+                "batch",
+                owned::<GatewayBatchCreateRequest>,
+                typed_body::<GatewayBatchCreateRequest>,
+            ),
+        ]
+    }
+
+    /// A valid body of `operation` whose message text is `text` and whose
+    /// extension member, where the contract has one, is `extension`.
+    fn sized(operation: &str, text: &str, extension: &str) -> Value {
+        match operation {
+            "chat" => json!({
+                "model": "acme/a",
+                "messages": [{"role": "user", "content": text}],
+                "x_extension": {"note": extension},
+            }),
+            "responses" => json!({
+                "model": "acme/a",
+                "input": [{"role": "user", "content": text}],
+                "x_extension": {"note": extension},
+            }),
+            "embeddings" => json!({"model": "acme/a", "input": [text, extension]}),
+            "speech" => json!({
+                "model": "acme/a",
+                "input": text,
+                "voice": "alloy",
+                "x_extension": [extension],
+            }),
+            "image" => json!({"model": "acme/a", "prompt": text, "x_extension": extension}),
+            "batch" => json!({
+                "input_file_id": "file-1",
+                "endpoint": "/v1/chat/completions",
+                "completion_window": "24h",
+                "metadata": {"note": text},
+                "x_extension": extension,
+            }),
+            other => unreachable!("no {other} operation"),
+        }
+    }
+
+    /// Request validation accepts and refuses exactly what each operation's
+    /// owned contract decodes, naming the same missing member or `body`, and
+    /// returns the body unchanged; checking a body copies no message or
+    /// extension text, so validation allocation does not grow with either at
+    /// a fixed structure.
+    ///
+    /// # Panics
+    ///
+    /// Panics when a projection differs from the pinned or owned outcome, the
+    /// body changes, or validation allocation grows with payload text.
+    #[test]
+    fn request_validation_preserves_contract_without_payload_copies() {
+        let chat = |extra: Value| {
+            let mut body =
+                json!({"model": "acme/a", "messages": [{"role": "user", "content": "hi"}]});
+            for (key, value) in extra.as_object().expect("members") {
+                body[key] = value.clone();
+            }
+            body
+        };
+        let responses = |input: Value| json!({"model": "acme/a", "input": input});
+        let cases: [(&str, Value, Result<(), &str>); 47] = [
+            ("chat", chat(json!({})), Ok(())),
+            ("chat", json!({"model": "acme/a"}), Err("messages")),
+            ("chat", json!({"messages": []}), Err("model")),
+            (
+                "chat",
+                chat(json!({"temperature": null, "top_p": 1})),
+                Ok(()),
+            ),
+            (
+                "chat",
+                chat(json!({"max_tokens": 4_294_967_295_u64})),
+                Ok(()),
+            ),
+            (
+                "chat",
+                chat(json!({"max_tokens": 4_294_967_296_u64})),
+                Err("body"),
+            ),
+            ("chat", chat(json!({"max_tokens": -1})), Err("body")),
+            ("chat", chat(json!({"max_tokens": 1.0})), Err("body")),
+            (
+                "chat",
+                chat(json!({"x_extension": {"a": [1, null]}})),
+                Ok(()),
+            ),
+            ("chat", chat(json!({"logit_bias": []})), Err("body")),
+            (
+                "chat",
+                chat(json!({"logit_bias": null, "metadata": {"a": {}}})),
+                Ok(()),
+            ),
+            (
+                "chat",
+                chat(json!({"audio": {"voice": "alloy", "format": "mp3"}})),
+                Ok(()),
+            ),
+            (
+                "chat",
+                chat(json!({"audio": {"voice": {"id": "v"}, "format": "mp3", "x": 1}})),
+                Err("body"),
+            ),
+            (
+                "chat",
+                chat(json!({"response_format": {"type": "json_object"}})),
+                Ok(()),
+            ),
+            (
+                "chat",
+                chat(json!({"response_format": {"type": "xml"}})),
+                Err("body"),
+            ),
+            (
+                "chat",
+                chat(json!({"stop": ["a", "b"], "tool_choice": "auto"})),
+                Ok(()),
+            ),
+            ("chat", chat(json!({"stop": 5})), Err("body")),
+            (
+                "chat",
+                chat(
+                    json!({"messages": [{"role": "user", "content": [{"type": "text", "text": "x"}]}]}),
+                ),
+                Ok(()),
+            ),
+            (
+                "chat",
+                chat(json!({"messages": [{"content": "x"}]})),
+                Err("role"),
+            ),
+            (
+                "chat",
+                chat(
+                    json!({"tools": [{"type": "function", "function": {"name": "f", "parameters": {"type": "object"}}}]}),
+                ),
+                Ok(()),
+            ),
+            ("responses", responses(json!("hi")), Ok(())),
+            ("responses", json!({"model": "acme/a"}), Err("input")),
+            (
+                "responses",
+                responses(json!([{"role": "user", "content": "hi"}])),
+                Ok(()),
+            ),
+            (
+                "responses",
+                responses(
+                    json!([{"type": "message", "role": "assistant", "content": "x", "x": 1}]),
+                ),
+                Ok(()),
+            ),
+            (
+                "responses",
+                responses(json!([{"type": null, "role": "user", "content": "x"}])),
+                Err("body"),
+            ),
+            (
+                "responses",
+                responses(json!([{"content": "x"}])),
+                Err("body"),
+            ),
+            (
+                "responses",
+                responses(json!([{"role": "user"}])),
+                Err("body"),
+            ),
+            (
+                "responses",
+                responses(
+                    json!([{"type": "function_call", "call_id": "c", "name": "n", "arguments": "{}"}]),
+                ),
+                Ok(()),
+            ),
+            (
+                "responses",
+                responses(json!([{"type": "function_call", "call_id": "c", "name": "n"}])),
+                Err("body"),
+            ),
+            (
+                "responses",
+                json!({"model": "acme/a", "input": "hi", "max_output_tokens": 1.5}),
+                Err("body"),
+            ),
+            (
+                "embeddings",
+                json!({"model": "acme/a", "input": "a"}),
+                Ok(()),
+            ),
+            (
+                "embeddings",
+                json!({"model": "acme/a", "input": [[1], [2]], "dimensions": null}),
+                Ok(()),
+            ),
+            (
+                "embeddings",
+                json!({"model": "acme/a", "input": [1, "a"]}),
+                Err("body"),
+            ),
+            (
+                "embeddings",
+                json!({"model": "acme/a", "input": "a", "x": 1}),
+                Err("body"),
+            ),
+            ("embeddings", json!({"model": "acme/a"}), Err("input")),
+            (
+                "speech",
+                json!({"model": "acme/a", "input": "a", "voice": "v", "speed": 1}),
+                Ok(()),
+            ),
+            (
+                "speech",
+                json!({"model": "acme/a", "input": "a"}),
+                Err("voice"),
+            ),
+            (
+                "speech",
+                json!({"model": "acme/a", "input": "a", "voice": "v", "speed": "x"}),
+                Err("body"),
+            ),
+            (
+                "speech",
+                json!({"model": "acme/a", "input": "a", "voice": "v", "x": {}}),
+                Ok(()),
+            ),
+            (
+                "image",
+                json!({"model": "acme/a", "prompt": "p", "n": 2}),
+                Ok(()),
+            ),
+            (
+                "image",
+                json!({"model": "acme/a", "prompt": "p", "n": -1}),
+                Err("body"),
+            ),
+            ("image", json!({"model": "acme/a"}), Err("prompt")),
+            (
+                "image",
+                json!({"model": "acme/a", "prompt": "p", "size": null}),
+                Ok(()),
+            ),
+            ("batch", sized("batch", "a", "b"), Ok(())),
+            (
+                "batch",
+                json!({"input_file_id": "f", "endpoint": "e", "completion_window": "24h", "metadata": {"k": 1}}),
+                Err("body"),
+            ),
+            (
+                "batch",
+                json!({"input_file_id": "f", "completion_window": "24h"}),
+                Err("endpoint"),
+            ),
+            ("batch", json!([]), Err("body")),
+        ];
+        let decoders = decoders();
+        for (operation, body, expected) in &cases {
+            let (_, owned, validate) = decoders
+                .iter()
+                .find(|(name, ..)| name == operation)
+                .expect("operation");
+            let expected = expected.map_err(str::to_owned);
+            assert_eq!(owned(body), expected, "{operation} owned {body}");
+            assert_eq!(
+                checked(*validate, body),
+                expected,
+                "{operation} checked {body}"
+            );
+        }
+
+        let kib = |size: usize| "é".repeat(size << 9);
+        for (operation, _, validate) in decoders {
+            let allocated = |text: usize, extension: usize| {
+                let body = sized(operation, &kib(text), &kib(extension));
+                let input = Ok(Json(body.clone()));
+                let (checked, bytes) = CountingAllocator::measure(|| validate(input));
+                assert_eq!(checked.expect("valid"), body, "{operation} body unchanged");
+                bytes
+            };
+            let base = allocated(1024, 1024);
+            for (label, grown) in [
+                ("message", allocated(2048, 1024)),
+                ("extension", allocated(1024, 2048)),
+            ] {
+                assert!(
+                    grown.abs_diff(base) < 1024,
+                    "{operation} validation copies {label} text: {base} then {grown} bytes"
+                );
+            }
+        }
     }
 }

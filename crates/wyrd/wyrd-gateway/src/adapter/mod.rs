@@ -36,7 +36,7 @@ use skald_spec::wire::openai_chat::{
     OpenAiStop, OpenAiStreamOptions, OpenAiToolCall, OpenAiUsage,
 };
 use skald_spec::wire::openai_embeddings::{
-    OpenAiEmbeddingUsage, OpenAiEmbeddingsInput, OpenAiEmbeddingsRequest,
+    OpenAiEmbeddingUsage, OpenAiEmbeddingsInputView, OpenAiEmbeddingsRequestView,
 };
 use skald_spec::wire::openai_responses::OpenAiResponsesUsage;
 use wyrd_spec::gateway::native::{
@@ -686,8 +686,9 @@ const MAX_EMBEDDING_INPUTS: usize = 2048;
 
 /// Validates an `OpenAI` embeddings body before it passes through unchanged.
 ///
-/// The body decodes through the typed Skald request, so input is a string, a
-/// token array, or a batch of either; a batch keeps its order because the body
+/// The body decodes through the borrowed projection of the typed Skald
+/// request, so input is a string, a token array, or a batch of either, and no
+/// input text is copied; a batch keeps its order because the body
 /// is forwarded as submitted and the provider answers per index.
 ///
 /// # Errors
@@ -697,13 +698,12 @@ const MAX_EMBEDDING_INPUTS: usize = 2048;
 /// [`MAX_EMBEDDING_INPUTS`], `dimensions` when it is zero, and
 /// `encoding_format` for a format other than `float` or `base64`.
 fn embeddings(body: &Value) -> Result<(), UnsupportedRequest> {
-    let request: OpenAiEmbeddingsRequest =
-        OpenAiEmbeddingsRequest::deserialize(body).map_err(|error| {
-            UnsupportedRequest::new(
-                "body",
-                format!("is not a valid embeddings request: {error}"),
-            )
-        })?;
+    let request = OpenAiEmbeddingsRequestView::deserialize(body).map_err(|error| {
+        UnsupportedRequest::new(
+            "body",
+            format!("is not a valid embeddings request: {error}"),
+        )
+    })?;
     let (count, empty_item) = inputs(&request.input);
     if count == 0 || empty_item {
         return Err(UnsupportedRequest::new(
@@ -722,7 +722,6 @@ fn embeddings(body: &Value) -> Result<(), UnsupportedRequest> {
     }
     if request
         .encoding_format
-        .as_deref()
         .is_some_and(|format| !matches!(format, "float" | "base64"))
     {
         return Err(UnsupportedRequest::new(
@@ -734,18 +733,21 @@ fn embeddings(body: &Value) -> Result<(), UnsupportedRequest> {
 }
 
 /// Counts the items of an embeddings `input` and reports whether any is empty.
-fn inputs(input: &OpenAiEmbeddingsInput) -> (usize, bool) {
+fn inputs(input: &OpenAiEmbeddingsInputView<'_>) -> (usize, bool) {
     match input {
-        OpenAiEmbeddingsInput::One(text) => (1, text.is_empty()),
-        OpenAiEmbeddingsInput::Tokens(tokens) => (1, tokens.is_empty()),
-        OpenAiEmbeddingsInput::Many(items) => (items.len(), items.iter().any(String::is_empty)),
-        OpenAiEmbeddingsInput::TokenBatches(items) => {
+        OpenAiEmbeddingsInputView::One(text) => (1, text.is_empty()),
+        OpenAiEmbeddingsInputView::Tokens(tokens) => (1, tokens.is_empty()),
+        OpenAiEmbeddingsInputView::Many(items) => {
+            (items.len(), items.iter().any(|item| item.is_empty()))
+        }
+        OpenAiEmbeddingsInputView::TokenBatches(items) => {
             (items.len(), items.iter().any(Vec::is_empty))
         }
     }
 }
 
-/// True when a successful embeddings `answer` honors its `request`.
+/// True when a successful embeddings `answer` honors its `request`, read
+/// through the request's borrowed projection.
 ///
 /// The answer must carry one item per input in input order (`data[i].index ==
 /// i`). Every vector must use the requested representation: an array of
@@ -757,7 +759,7 @@ fn inputs(input: &OpenAiEmbeddingsInput) -> (usize, bool) {
 /// instead of returning the answer.
 pub(crate) fn faithful_embeddings(request: &Value, answer: &RawValue) -> bool {
     let (Ok(request), Ok(answer)) = (
-        OpenAiEmbeddingsRequest::deserialize(request),
+        OpenAiEmbeddingsRequestView::deserialize(request),
         serde_json::from_str::<Value>(answer.get()),
     ) else {
         return false;
@@ -766,7 +768,7 @@ pub(crate) fn faithful_embeddings(request: &Value, answer: &RawValue) -> bool {
     let Some(data) = answer.get("data").and_then(Value::as_array) else {
         return false;
     };
-    let base64 = request.encoding_format.as_deref() == Some("base64");
+    let base64 = request.encoding_format == Some("base64");
     data.len() == count
         && data.iter().enumerate().all(|(position, item)| {
             let ordered = item

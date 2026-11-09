@@ -11,7 +11,12 @@ the policy judge (``conftest.sharing_verdict``).
 
 from __future__ import annotations
 
+import contextlib
+import io
 import json
+import runpy
+import shutil
+from collections.abc import Iterator
 from pathlib import Path
 from typing import Any
 
@@ -41,10 +46,14 @@ from wyrd.state import WyrdState
 from wyrd.testing import WyrdTestServer
 from wyrd.verify import VerificationResult
 
+from ..conftest import serving
 from ..support import FIXTURES, Receiver
 from ..test_local_development import configure_gateway
 
 pytestmark = pytest.mark.integration
+
+EXAMPLE = FIXTURES.parent / "examples/finance-release"
+"""The finance release example, run from an empty directory as a reader runs it."""
 
 STORY = FIXTURES / "cards/card_authoring"
 POLICY = STORY / "company-sharing-policy.pdf"
@@ -589,3 +598,43 @@ def test_local_artifacts_and_declaration_parity(
         version="0.1.0",
     )
     assert cards.declare(holder).root.uid == holder.uid
+
+
+@pytest.fixture
+def finance_reader(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Iterator[Path]:
+    """An empty directory holding only the example's files, reaching a fresh server as its administrator.
+
+    The server is its own so the example's ``finance-release`` 1.0.0 meets no
+    story graph of the same identity.
+    """
+    reader = tmp_path / "finance-release"
+    reader.mkdir()
+    for name in ("finance_release.py", "company-sharing-policy.pdf"):
+        shutil.copy(EXAMPLE / name, reader)
+    monkeypatch.chdir(reader)
+    monkeypatch.setenv("WYRD_CONFIG_HOME", str(tmp_path / "config"))
+    with (
+        serving() as model,
+        WyrdTestServer(
+            verification_runtime=True, provider_base_url=model.url, mutate_env=False
+        ) as server,
+    ):
+        monkeypatch.setenv("WYRD_SERVER_URL", server.base_url)
+        monkeypatch.setenv("WYRD_GRPC_URL", server.grpc_url)
+        monkeypatch.setenv("WYRD_API_KEY", server.tenant_admin_key())
+        configure_gateway(WyrdClient())
+        yield reader
+
+
+def test_finance_release_example(finance_reader: Path) -> None:
+    """The example passes the permitted release and fails the one naming a bank account."""
+    printed = io.StringIO()
+    with contextlib.redirect_stdout(printed):
+        runpy.run_path(str(finance_reader / "finance_release.py"), run_name="__main__")
+    assert printed.getvalue() == (
+        "Quarterly total $120.\n"
+        "  release-check: passed\n"
+        "Quarterly total $120. Paid from BANK-ACCOUNT-DEMO-001.\n"
+        "  release-check: failed\n"
+        "    not passed: The report names no bank account.\n"
+    )

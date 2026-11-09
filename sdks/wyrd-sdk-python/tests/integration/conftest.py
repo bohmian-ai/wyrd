@@ -54,6 +54,12 @@ AGREES = (
 )
 """The judge's Verdict for ``answer-judged``: passed, citing the whole answer."""
 
+RELEASE_APPROVED = (
+    '{"outcome":"passed","reason":"an external audit may receive this report",'
+    '"citations":[{"slot":"report","locator":{"json_pointer":"/text"}}]}'
+)
+"""The finance release example judge's Verdict: every release follows the policy, citing the report."""
+
 FOLLOWS = (
     '{"outcome":"passed","reason":"within the policy",'
     '"citations":[{"slot":"answer","locator":{"json_pointer":"/text"}}]}'
@@ -353,7 +359,8 @@ def completion(body: dict) -> tuple[int, dict]:
     ``SCORE:``) answers ``scored``. The handbook judge reads its mount and
     answers ``handbook_verdict``, and the sharing-policy judge (its prompt
     carries ``POLICY JUDGE``) reads its mount and answers ``sharing_verdict``;
-    the file probe plays ``probe_turn``. Every
+    the finance release example's judge answers ``RELEASE_APPROVED``; the
+    file probe plays ``probe_turn``. Every
     other judge agrees.
     """
     text = json.dumps(body)
@@ -364,6 +371,8 @@ def completion(body: dict) -> tuple[int, dict]:
             if returned
             else READ_SHARING_POLICY
         )
+    elif "follows the company sharing policy" in text:
+        message = {"role": "assistant", "content": RELEASE_APPROVED}
     elif "REFUND RULES" in text:
         if "PROVIDER-DOWN" in text:
             return 500, {}

@@ -86,7 +86,7 @@ use wyrd_spec::vala::api::{
     ValidatePredicateResponse,
 };
 use wyrd_spec::vala::trace::SpanRecord;
-use wyrd_spec::verification::VerificationBindingStatus;
+use wyrd_spec::verification::{ExecutionPlan, VerificationBindingStatus};
 use wyrd_spec::verification::execution::{
     EnqueueVerificationResponse, EvidencePlanRequest, EvidencePlanResponse,
     VerificationExecutionState, VerificationRequest, VerificationResult,
@@ -308,6 +308,7 @@ fn contracts() -> Value {
         VerificationBindingStatus,
         VerificationResult,
         VerificationExecutionState,
+        ExecutionPlan,
         CreateOperatorConnectionRequest,
         UpdateOperatorConnectionRequest,
         OperatorConnectionView,

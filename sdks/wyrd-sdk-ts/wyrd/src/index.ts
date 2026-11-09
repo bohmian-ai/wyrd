@@ -3,7 +3,17 @@ import { DataType, Table, tableFromIPC, tableToIPC, type Field, type RecordBatch
 import { AsyncLocalStorage } from "node:async_hooks";
 import { createRequire } from "node:module";
 
+import type { AuthoredCard } from "./authoring.js";
 import type { WyrdErrorCode } from "./error-codes.js";
+import {
+  authoredOf,
+  IncompleteQueryStreamError,
+  jsonSnapshot,
+  lifecycleValue,
+  type NativeErrorMetadata,
+  projectedError,
+  WyrdError,
+} from "./native.js";
 import type {
   AlterTableRequest as AlterTableRequestWire,
   ArtifactInventoryResponse,
@@ -222,20 +232,26 @@ export type {
   AgentSpec,
   ArtifactSelection,
   ArtifactSpec,
+  AuditSpec,
   CardKind,
   CardRef,
   DataSpec,
   DriftBaselineState,
   DriftBaselineStatus,
   ExecutionRoute,
+  ExperimentSpec,
+  McpSpec,
   Metadata as CardMetadata,
   ModelSpec,
   OperatorSpec,
   PromptSpec,
   RegisteredAgentCard,
   RegisteredArtifactCard,
+  RegisteredAuditCard,
   RegisteredCard,
   RegisteredDataCard,
+  RegisteredExperimentCard,
+  RegisteredMcpCard,
   RegisteredModelCard,
   RegisteredOperatorCard,
   RegisteredPromptCard,
@@ -339,98 +355,7 @@ export function verdictFormat(data?: Readonly<Record<string, unknown>> | JsonSch
 
 /** Every type generated from the `wyrd-spec` Card schema, including nested spec types. */
 export type * as CardTypes from "./card-types.js";
-
-/**
- * Every failure the SDK raises: one stable catalog code plus its HTTP status,
- * title, detail, remediation, and structured details, read as properties
- * rather than parsed from the message.
- */
-export class WyrdError extends Error {
-  readonly code: WyrdErrorCode;
-  readonly status: number;
-  readonly title: string;
-  readonly detail: string;
-  readonly remediation: string | undefined;
-  /** JSON-safe structured diagnostics supplied by the originating Wyrd error. */
-  readonly details: unknown;
-
-  /**
-   * Build one catalog error; the SDK raises these, and a test double may too.
-   *
-   * @param code - Stable catalog code, such as `WYRD_SPEC_400_VALIDATION`.
-   * @param status - HTTP-equivalent status.
-   * @param title - Stable catalog title.
-   * @param detail - Scrubbed human-readable detail, also the `message`.
-   * @param remediation - Operator-facing remediation, when the catalog has one.
-   * @param details - JSON-safe structured diagnostics, when present.
-   */
-  constructor(
-    code: WyrdErrorCode,
-    status: number,
-    title: string,
-    detail: string,
-    remediation?: string,
-    details?: unknown,
-  ) {
-    super(detail);
-    this.name = "WyrdError";
-    this.code = code;
-    this.status = status;
-    this.title = title;
-    this.detail = detail;
-    this.remediation = remediation;
-    this.details = details;
-  }
-}
-
-/** A query stream that ended before its validated terminal frame. */
-export class IncompleteQueryStreamError extends WyrdError {
-  /**
-   * Build the `WYRD_VALA_502_QUERY_STREAM_INCOMPLETE` error.
-   *
-   * @param status - HTTP-equivalent status.
-   * @param title - Stable catalog title.
-   * @param detail - Scrubbed human-readable detail.
-   * @param remediation - Operator-facing remediation, when present.
-   * @param details - JSON-safe structured diagnostics, when present.
-   */
-  constructor(status: number, title: string, detail: string, remediation?: string, details?: unknown) {
-    super("WYRD_VALA_502_QUERY_STREAM_INCOMPLETE", status, title, detail, remediation, details);
-    this.name = "IncompleteQueryStreamError";
-  }
-}
-
-interface NativeErrorMetadata {
-  errorCode?: string | null;
-  errorStatus?: number | null;
-  errorTitle?: string | null;
-  errorDetail?: string | null;
-  errorRemediation?: string | null;
-  errorDetailsJson?: string | null;
-}
-
-function projectedError(metadata: NativeErrorMetadata): WyrdError | undefined {
-  if (metadata.errorCode === null || metadata.errorCode === undefined) {
-    return undefined;
-  }
-  const detail = metadata.errorDetail ?? "Bifrost query failed";
-  const status = metadata.errorStatus ?? 500;
-  const title = metadata.errorTitle ?? "Bifrost query failed";
-  const remediation = metadata.errorRemediation ?? undefined;
-  const details = metadata.errorDetailsJson == null ? undefined : (JSON.parse(metadata.errorDetailsJson) as unknown);
-  if (metadata.errorCode === "WYRD_VALA_502_QUERY_STREAM_INCOMPLETE") {
-    return new IncompleteQueryStreamError(status, title, detail, remediation, details);
-  }
-  return new WyrdError(
-    // The native projection only emits codes from the same derive-backed catalog.
-    metadata.errorCode as WyrdErrorCode,
-    status,
-    title,
-    detail,
-    remediation,
-    details,
-  );
-}
+export { IncompleteQueryStreamError, WyrdError };
 
 /**
  * Server projection of one registered table's stored physical schema.
@@ -455,22 +380,6 @@ function tableDescription(result: NativeLifecycleResult): TableDescription {
   const wire = lifecycleValue<TableDescriptionWire>(result);
   // The native client already refused any non-canonical or out-of-range spelling.
   return { ...wire, table_version: BigInt(wire.table_version) };
-}
-
-function lifecycleValue<T>(result: NativeLifecycleResult): T {
-  const error = projectedError(result);
-  if (error !== undefined) {
-    throw error;
-  }
-  if (result.valueJson === null || result.valueJson === undefined) {
-    throw new WyrdError(
-      "WYRD_VALA_502_QUERY_STREAM_PROTOCOL",
-      502,
-      "Query lifecycle protocol failed",
-      "native lifecycle control returned neither a value nor structured error",
-    );
-  }
-  return JSON.parse(result.valueJson) as T;
 }
 
 /** Unwrap one closed native construction result, throwing its catalog error. */
@@ -1896,6 +1805,20 @@ export class Cards {
   }
 
   /**
+   * Declare an authored Card and every Card it references as one composite,
+   * publishing each local Artifact first, exactly as the equivalent files
+   * would declare.
+   *
+   * @param card - The root Card from `wyrd-ai/authoring`, copied as it is now.
+   * @returns The graph root and each Card's dependency-first outcome.
+   * @throws {@link WyrdError} from the shared validation, such as
+   * `WYRD_LOADER_400_INVALID_ENVELOPE`, or the registry's refusal.
+   */
+  async declare(card: AuthoredCard): Promise<DeclarationReceipt> {
+    return lifecycleValue<DeclarationReceipt>(await this.#native.declare(authoredOf(card)));
+  }
+
+  /**
    * Publish one file or directory as an Artifact Card.
    *
    * A file keeps its basename; a directory keeps every regular file at its
@@ -1947,7 +1870,8 @@ export class Cards {
    * Fetch one declared Card envelope by exact reference, without artifacts.
    *
    * The envelope is discriminated by `kind`: `spec` and `status` are typed for
-   * Data, Model, Prompt, Agent, Verifier, Service, Trigger, and Operator Cards,
+   * Data, Model, Artifact, Experiment, Prompt, Agent, Mcp, Service, Audit,
+   * Verifier, Trigger, and Operator Cards,
    * including a Drift Verifier's `status.verification.baseline` state. Other
    * kinds return {@link RegisteredUntypedCard}, whose `spec` is a plain record.
    *
@@ -2289,23 +2213,6 @@ export class Principals {
   }
 }
 
-/** Refuse one observation input the strict serializer cannot carry exactly. */
-function invalidObservationInput(field: string, path: string, reason: string): WyrdError {
-  return new WyrdError(
-    "WYRD_SPEC_400_VALIDATION",
-    400,
-    "Validation failed",
-    `${field} is invalid: ${path} ${reason}`,
-    "Check the submitted Wyrd request fields against the published schema and retry.",
-    { field, path, reason },
-  );
-}
-
-/** Whether `key` is a canonical element index below `length`, which JSON keeps. */
-function isArrayIndex(key: string, length: number): boolean {
-  return String(Number(key)) === key && Number.isInteger(Number(key)) && Number(key) >= 0 && Number(key) < length;
-}
-
 /**
  * Serialize one observation input as JSON text, refusing what `JSON.stringify`
  * would silently drop or coerce.
@@ -2325,61 +2232,7 @@ function isArrayIndex(key: string, length: number): boolean {
  * path.
  */
 function strictJson(field: string, value: unknown): string {
-  const ancestors = new Set<object>();
-  const check = (node: unknown, path: string): unknown => {
-    if (node === null || typeof node === "string" || typeof node === "boolean") {
-      return node;
-    }
-    if (typeof node === "number") {
-      if (!Number.isFinite(node)) {
-        throw invalidObservationInput(field, path, "is not a finite number");
-      }
-      if (Number.isInteger(node) && !Number.isSafeInteger(node)) {
-        throw invalidObservationInput(field, path, "is an integer beyond the safe range");
-      }
-      return node;
-    }
-    if (typeof node !== "object") {
-      throw invalidObservationInput(field, path, `is an unsupported ${typeof node} value`);
-    }
-    if (ancestors.has(node)) {
-      throw invalidObservationInput(field, path, "is a cycle");
-    }
-    ancestors.add(node);
-    let snapshot: unknown;
-    if (Array.isArray(node)) {
-      for (const key of Reflect.ownKeys(node)) {
-        if (key !== "length" && !(typeof key === "string" && isArrayIndex(key, node.length))) {
-          throw invalidObservationInput(field, path, "has a non-element array property");
-        }
-      }
-      const items: unknown[] = [];
-      for (let index = 0; index < node.length; index += 1) {
-        items.push(check(node[index], `${path}[${index}]`));
-      }
-      snapshot = items;
-    } else {
-      const prototype = Object.getPrototypeOf(node) as unknown;
-      if (prototype !== Object.prototype && prototype !== null) {
-        throw invalidObservationInput(field, path, "is not a plain object");
-      }
-      const keys = Reflect.ownKeys(node);
-      for (const key of keys) {
-        if (typeof key === "symbol") {
-          throw invalidObservationInput(field, path, "has a symbol key");
-        }
-        if (!Object.prototype.propertyIsEnumerable.call(node, key)) {
-          throw invalidObservationInput(field, path, `has a non-enumerable property ${key}`);
-        }
-      }
-      snapshot = Object.fromEntries(
-        (keys as string[]).map((key) => [key, check((node as Record<string, unknown>)[key], `${path}.${key}`)]),
-      );
-    }
-    ancestors.delete(node);
-    return snapshot;
-  };
-  return JSON.stringify(check(value, "$"));
+  return JSON.stringify(jsonSnapshot(field, value).value);
 }
 
 /**
@@ -3166,15 +3019,19 @@ export class WyrdState {
   }
 
   /**
-   * Declare a Card file and return the state of its graph, ready to run.
+   * Declare a Card file or an authored Card graph and return the state of its
+   * graph, ready to run.
    *
-   * The file and the files its `./path` references name are declared under
+   * The file and the files its `./path` references name, or the authored Card
+   * and everything it references, are declared as {@link Cards.declare}
+   * declares them, under
    * the registry's usual version rules, so an unchanged rerun declares
    * nothing new; the declared graph is then pulled and loaded as
    * {@link WyrdState.fromPath} loads a bundle. Every call runs as one client.
    * Without `bundleDir` the graph is held in memory and no files are kept.
    *
-   * @param path - The root Service Card file.
+   * @param root - The root Service: its Card file, or an authored Card from
+   * `wyrd-ai/authoring`, copied as it is now.
    * @param options - `client`, whose principal every call runs as (omitted,
    * the ambient client), and `bundleDir`, a directory the complete bundle is
    * published to and kept in, loadable offline with {@link WyrdState.fromPath}.
@@ -3186,10 +3043,14 @@ export class WyrdState {
    * the declaration leaves it declared.
    */
   static async declare(
-    path: string,
+    root: string | AuthoredCard,
     options: ClientOptions & { readonly bundleDir?: string } = {},
   ): Promise<WyrdState> {
-    const declared = await wyrdClientNative(clientOf(options)).declareWyrdState(path, options.bundleDir);
+    const client = wyrdClientNative(clientOf(options));
+    const declared =
+      typeof root === "string"
+        ? await client.declareWyrdState(root, options.bundleDir)
+        : await client.declareAuthoredWyrdState(authoredOf(root), options.bundleDir);
     return new WyrdState(nativeHandle(declared.state, declared.error));
   }
 

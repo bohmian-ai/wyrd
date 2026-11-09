@@ -84,11 +84,11 @@ pub fn burn(length: Duration) {
 }
 
 /// Reads the server's benchmark snapshot as metrics, or `None` when it does
-/// not answer.
+/// not answer or its snapshot is incomplete ([`Metrics::of_snapshot`]).
 async fn scrape() -> Option<Metrics> {
     let url = format!("http://127.0.0.1:{METRICS_PORT}/benchmark/snapshot");
     let response = reqwest::get(url).await.ok()?.error_for_status().ok()?;
-    Some(Metrics::of_snapshot(&response.json().await.ok()?))
+    Metrics::of_snapshot(&response.json().await.ok()?).ok()
 }
 
 /// Scrapes once the server's Scribe outbox holds nothing pending, so every

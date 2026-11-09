@@ -354,9 +354,10 @@ impl LocalServer {
     ///
     /// # Errors
     ///
-    /// Returns an error when the snapshot cannot be read.
+    /// Returns an error when the snapshot cannot be read or is incomplete
+    /// ([`Metrics::of_snapshot`]).
     pub async fn metrics(&self) -> Result<Metrics> {
-        Ok(Metrics::of_snapshot(&self.timings().await?))
+        Ok(Metrics::of_snapshot(&self.timings().await?)?)
     }
 
     /// Reads the server's cumulative benchmark snapshot, its timings and
@@ -563,10 +564,31 @@ impl Metrics {
     /// The standard metrics of a benchmark `snapshot` as series: each
     /// counter's total, each gauge's value, and each histogram's
     /// observation count as `<family>_count`, labelled as Prometheus names
-    /// them. Histogram distributions are read from the snapshot itself.
-    #[must_use]
-    pub fn of_snapshot(snapshot: &wyrd_benchmark::BenchmarkSnapshot) -> Self {
-        Self(
+    /// them. Histogram distributions are read from the snapshot itself. A
+    /// family the server never emitted is absent and sums to zero.
+    ///
+    /// # Errors
+    ///
+    /// Returns why the snapshot is incomplete evidence: its bounds dropped
+    /// an observation, so a series may be absent, or a series refused an
+    /// update, so its value may be stale. Either would read as a settled
+    /// zero.
+    pub fn of_snapshot(
+        snapshot: &wyrd_benchmark::BenchmarkSnapshot,
+    ) -> std::result::Result<Self, String> {
+        if snapshot.dropped > 0 {
+            return Err(format!(
+                "the server's series bounds dropped {} observations, so its metrics are incomplete",
+                snapshot.dropped
+            ));
+        }
+        if let Some(refused) = snapshot.metrics.iter().find(|metric| metric.rejected > 0) {
+            return Err(format!(
+                "metric `{}` refused {} updates, so its value is stale",
+                refused.name, refused.rejected
+            ));
+        }
+        Ok(Self(
             snapshot
                 .metrics
                 .iter()
@@ -591,7 +613,7 @@ impl Metrics {
                     (series, value)
                 })
                 .collect(),
-        )
+        ))
     }
 
     /// Parses a Prometheus text exposition, skipping comments: a production
@@ -791,6 +813,104 @@ impl Drop for OperatorRun {
 #[cfg(test)]
 mod tests {
     use super::Metrics;
+
+    /// A benchmark snapshot of `metrics` that refused `dropped` series.
+    fn snapshot(
+        metrics: Vec<wyrd_benchmark::MetricSnapshot>,
+        dropped: u64,
+    ) -> wyrd_benchmark::BenchmarkSnapshot {
+        wyrd_benchmark::BenchmarkSnapshot {
+            process: "p".to_owned(),
+            pid: 1,
+            taken_ns: 0,
+            method: wyrd_benchmark::Method::current(),
+            series: Vec::new(),
+            scans: Vec::new(),
+            metrics,
+            dropped,
+            invalid_labels: 0,
+        }
+    }
+
+    /// One `name` series labelled `labels` holding `value`, `rejected`
+    /// updates refused.
+    fn metric(
+        name: &str,
+        labels: &[(&str, &str)],
+        rejected: u64,
+        value: wyrd_benchmark::MetricValue,
+    ) -> wyrd_benchmark::MetricSnapshot {
+        wyrd_benchmark::MetricSnapshot {
+            name: name.to_owned(),
+            labels: labels
+                .iter()
+                .map(|(label, value)| ((*label).to_owned(), (*value).to_owned()))
+                .collect(),
+            rejected,
+            value,
+        }
+    }
+
+    /// A complete snapshot keeps every counter, gauge, and histogram count
+    /// and reads a never-emitted family as zero; one whose bounds dropped a
+    /// series, or whose gauge refused an update, is not evidence of a
+    /// settled server, since the absent or stale gauge would read as zero.
+    ///
+    /// # Panics
+    ///
+    /// Panics when a complete snapshot loses a value or an incomplete one
+    /// converts.
+    #[test]
+    fn snapshot_conversion_rejects_incomplete_metric_evidence() {
+        let backlog = |rejected| {
+            metric(
+                "outbox_pending",
+                &[("outbox", "scribe")],
+                rejected,
+                wyrd_benchmark::MetricValue::Gauge {
+                    value: 0.0,
+                    peak: 4.0,
+                },
+            )
+        };
+        let healthy = vec![
+            metric(
+                "writes_total",
+                &[("outcome", "ok")],
+                0,
+                wyrd_benchmark::MetricValue::Counter { total: 7 },
+            ),
+            backlog(0),
+            metric(
+                "write_seconds",
+                &[],
+                0,
+                wyrd_benchmark::MetricValue::Histogram {
+                    unit: wyrd_benchmark::HistogramUnit::Nanoseconds,
+                    count: 3,
+                    buckets: wyrd_benchmark::Buckets::default(),
+                },
+            ),
+        ];
+        let metrics = Metrics::of_snapshot(&snapshot(healthy.clone(), 0)).expect("complete");
+        assert_eq!(metrics.sum("writes_total", &["outcome=\"ok\""]), 7.0);
+        assert_eq!(metrics.sum("outbox_pending", &["outbox=\"scribe\""]), 0.0);
+        assert_eq!(metrics.sum("write_seconds_count", &[]), 3.0);
+        assert_eq!(metrics.sum("never_emitted_total", &[]), 0.0);
+
+        let dropped = Metrics::of_snapshot(&snapshot(Vec::new(), 1));
+        assert!(
+            dropped.is_err_and(|error| error.contains("dropped")),
+            "a dropped registration leaves its backlog gauge absent"
+        );
+        let mut stale = healthy;
+        stale[1] = backlog(1);
+        assert!(
+            Metrics::of_snapshot(&snapshot(stale, 0))
+                .is_err_and(|error| error.contains("outbox_pending")),
+            "a refused update leaves its gauge stale"
+        );
+    }
 
     /// Series of one family sum across label sets; other families and
     /// same-prefix families do not leak in.

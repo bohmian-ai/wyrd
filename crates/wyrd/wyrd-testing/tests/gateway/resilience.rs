@@ -669,7 +669,10 @@ async fn benchmark_mode_keeps_capture_and_snapshot_counts_without_prometheus() {
         .expect("the Scribe outbox settles");
 
     let after = wyrd_benchmark::snapshot();
-    let (first, last) = (Metrics::of_snapshot(&before), Metrics::of_snapshot(&after));
+    let (first, last) = (
+        Metrics::of_snapshot(&before).expect("a complete opening snapshot"),
+        Metrics::of_snapshot(&after).expect("a complete drained snapshot"),
+    );
     let interval = after.since(&before).expect("one process");
     let population = wyrd_testing::capacity::Population::from_interval(interval.clone());
     assert!(population.invalid.is_empty(), "{:?}", population.invalid);

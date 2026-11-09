@@ -1703,7 +1703,7 @@ mod tests {
             "the benchmark recorder is the only one"
         );
         let before = wyrd_benchmark::snapshot();
-        let first = Metrics::of_snapshot(&before);
+        let first = Metrics::of_snapshot(&before).expect("a complete snapshot");
         let span = tracing::Span::none();
         let ms = Duration::from_millis;
 
@@ -1747,7 +1747,7 @@ mod tests {
         metrics::gauge!("wyrd_gateway_active_calls").set(0.0);
 
         let after = wyrd_benchmark::snapshot();
-        let last = Metrics::of_snapshot(&after);
+        let last = Metrics::of_snapshot(&after).expect("a complete snapshot");
         let population = Population::between(&before, after).expect("one process");
         assert!(population.invalid.is_empty(), "{:?}", population.invalid);
         let grew =

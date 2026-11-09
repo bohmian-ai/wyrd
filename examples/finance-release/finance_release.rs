@@ -15,7 +15,7 @@
 use wyrd_ai::authoring::{
     Agent, Artifact, Check, Component, InputSlot, Requirement, Service, Verifier,
 };
-use wyrd_ai::serde_json::{Value, json};
+use wyrd_ai::serde_json::json;
 use wyrd_ai::state::WyrdState;
 use wyrd_ai::verify::Inputs;
 use wyrd_ai::{RequirementOutcome, VerificationResult};
@@ -42,7 +42,11 @@ async fn main() -> anyhow::Result<()> {
     // The Service: the Agent that writes the reports, verified by
     // `release-check`.
     let writer = Agent::new("report-writer", "1.0.0")
-        .prompt(prompt("Write the customer report for {{customer}}."))
+        .prompt(json!({
+            "provider": "openai",
+            "model": "gpt-4o",
+            "messages": [{ "role": "user", "content": "Write the customer report for {{customer}}." }],
+        }))
         .execution_route(json!({ "kind": "wyrd_gateway", "deployment": "openai" }));
     let service = Service::new("finance-release", "1.0.0")
         .components([Component::new("report-writer", writer)])
@@ -133,26 +137,21 @@ fn release_check(policy: &Artifact) -> Verifier {
 /// `policy-judge`: a model that reads the policy with `fs.read` and returns
 /// a verdict on the release.
 fn policy_judge() -> Agent {
-    let mut prompt = prompt(
-        "Read /inputs/policy.json with fs.read. Decide whether this release \
-         follows the company sharing policy, citing the report and the policy. \
-         Report: {{report}} Recipient: {{recipient}}",
-    );
-    prompt["response_format"] = json!("verdict");
     Agent::new("policy-judge", "1.0.0")
-        .prompt(prompt)
+        .prompt(json!({
+            "provider": "openai",
+            "model": "gpt-4o",
+            "messages": [{
+                "role": "user",
+                "content": "Read /inputs/policy.json with fs.read. Decide whether this release \
+                    follows the company sharing policy, citing the report and the policy. \
+                    Report: {{report}} Recipient: {{recipient}}",
+            }],
+            "response_format": "verdict",
+        }))
         .execution_route(json!({ "kind": "wyrd_gateway", "deployment": "openai" }))
         .tool_names(["fs.read"])
         .run_config(json!({ "max_iterations": 3 }))
-}
-
-/// An inline `gpt-4o` Prompt whose one user message is `text`.
-fn prompt(text: &str) -> Value {
-    json!({
-        "provider": "openai",
-        "model": "gpt-4o",
-        "messages": [{ "role": "user", "content": text }],
-    })
 }
 
 /// Print the verdict on `report`, then each requirement that did not pass.

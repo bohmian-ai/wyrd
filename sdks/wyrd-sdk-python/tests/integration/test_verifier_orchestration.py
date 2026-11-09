@@ -18,7 +18,6 @@ and turn, as the Rust journey's upstream does.
 from __future__ import annotations
 
 import json
-import threading
 import time
 from collections.abc import Callable
 from typing import Any
@@ -34,7 +33,6 @@ from .support import (
     FIXTURES,
     HOLD_ARRIVED,
     HOLD_RELEASED,
-    HOLDS,
     Receiver,
     client_of,
     declare,
@@ -222,20 +220,6 @@ once the comparison settled; a ``known`` race answers the bootstrap once the com
 settled."""
 
 
-def hold(fragment: str) -> threading.Event:
-    """Hold the local model's answer to every request carrying ``fragment``; the returned
-    event is set once one arrives."""
-    arrived = threading.Event()
-    HOLDS[fragment] = (arrived, threading.Event())
-    return arrived
-
-
-def release(fragment: str) -> None:
-    """Answer every request ``fragment`` held, and its later requests at once."""
-    if held := HOLDS.pop(fragment, None):
-        held[1].set()
-
-
 def reached(
     execution: verify.Execution,
     step_id: str,
@@ -277,27 +261,27 @@ def test_speculative_disposition_controls_consumer_admission(
                 "decision": [compare, reviewing],
                 "known": [bootstrap],
             }[race]
-            arrived = {fragment: hold(fragment) for fragment in held}
+            arrived = {fragment: receiver.hold(fragment) for fragment in held}
             submitted = desk.run().observe.submit("speculative-review", question)
             assert isinstance(submitted, verify.Execution)
             watched = verify.Execution.connect(submitted.id, admin)
             if race == "action":
                 reached(watched, "extra", lambda each: each["state"] == "action")
-                release(compare)
+                receiver.release(compare)
             elif race == "decision":
                 assert arrived[reviewing].wait(WAIT_SECONDS), f"{question}: no extra review"
-                release(compare)
+                receiver.release(compare)
                 reached(watched, "compare", lambda each: each["state"] == "action")
                 if not retained:
                     reached(watched, "extra", lambda each: each["speculation"] == "discarded")
-                release(reviewing)
+                receiver.release(reviewing)
             else:
                 reached(watched, "compare", lambda each: each["state"] == "action")
-                release(bootstrap)
+                receiver.release(bootstrap)
             result = watched.wait(WAIT_SECONDS)
         finally:
             for fragment in (compare, reviewing, bootstrap):
-                release(fragment)
+                receiver.release(fragment)
         assert requirement(result, "consolidated")["outcome"] == "passed", question
         assert step(result, "extra")["status"] == status, question
         if called:

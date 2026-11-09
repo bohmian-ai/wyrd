@@ -57,11 +57,6 @@ HOLD_ARRIVED = threading.Event()
 HOLD_RELEASED = threading.Event()
 """Set by the test to let the local model answer the held ``CANCEL-HELD`` generalist."""
 
-HOLDS: dict[str, tuple[threading.Event, threading.Event]] = {}
-"""The ``(arrived, released)`` events of each held ``speculative-review`` answer, by the
-prompt fragment that holds it: the local model sets ``arrived`` once a request carrying the
-fragment reaches it, and answers that request only once the test sets ``released``."""
-
 
 def read_text(read: dict[str, Any]) -> str:
     """The text of an ``fs.read`` result: its units' lines, joined by newlines."""
@@ -101,6 +96,28 @@ class Receiver:
     url: str
     deliveries: list[Delivery] = field(default_factory=list)
     delivered: threading.Condition = field(default_factory=threading.Condition)
+    holds: dict[str, tuple[threading.Event, threading.Event]] = field(default_factory=dict)
+    """The ``(arrived, released)`` events of each held answer, by the request fragment that
+    holds it."""
+
+    def hold(self, fragment: str) -> threading.Event:
+        """Hold the answer to every request carrying ``fragment``; the returned event is set
+        once one arrives."""
+        arrived = threading.Event()
+        self.holds[fragment] = (arrived, threading.Event())
+        return arrived
+
+    def release(self, fragment: str) -> None:
+        """Answer every request ``fragment`` held, and its later requests at once."""
+        if held := self.holds.pop(fragment, None):
+            held[1].set()
+
+    def await_release(self, text: str) -> None:
+        """Signal and wait out every hold whose fragment ``text`` carries."""
+        for fragment, (arrived, released) in list(self.holds.items()):
+            if fragment in text:
+                arrived.set()
+                released.wait(300)
 
     def record(self, delivery: Delivery) -> None:
         """Append ``delivery`` and wake every ``wait_for``."""

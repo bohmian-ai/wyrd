@@ -33,7 +33,6 @@ from .support import (
     FRAME_CLAIM,
     HOLD_ARRIVED,
     HOLD_RELEASED,
-    HOLDS,
     LIVE_REVIEW,
     ON_CALL_TOKEN,
     REPORT,
@@ -402,19 +401,14 @@ def orchestration_turn(text: str, messages: list[dict]) -> dict | None:
     publishes a partial draft and then breaks, the consolidator reads every
     collection's manifest, and the quoter reads the security account. The
     ``CANCEL-HELD`` generalist holds its reply until the test releases it.
-    The bootstrap, the comparison, and the extra review answer once no
-    entry of ``HOLDS`` matching their request is held. A section reviewer publishes its
-    section and index, the polisher scores each section by its round, the
-    escalation publishes a note and then breaks, the summarizer reads both
-    collections, publishes a summary, and scores it by its iteration index,
-    and the document judge passes, citing the document's title.
+    A section reviewer publishes its section and index, the polisher scores
+    each section by its round, the escalation publishes a note and then
+    breaks, the summarizer reads both collections, publishes a summary, and
+    scores it by its iteration index, and the document judge passes, citing
+    the document's title.
     """
     turn = sum(1 for each in messages if each.get("role") == "assistant")
     prompt = prompt_of(messages)
-    for fragment, (arrived, released) in list(HOLDS.items()):
-        if fragment in text:
-            arrived.set()
-            released.wait(300)
     if "CONSOLIDATE:" in text:
         if turn:
             return DONE
@@ -613,6 +607,7 @@ def serving(delay: float = 0.0) -> Generator[Receiver]:
     With a ``delay``, each judge call is recorded on arrival and answered
     ``delay`` seconds later, so a test can hold judgments in flight. Without
     one, each call is recorded once answered, or once the caller abandons it.
+    A request carrying a fragment the receiver holds is answered once it is released.
     """
     server = ThreadingHTTPServer(("127.0.0.1", 0), BaseHTTPRequestHandler)
     received = Receiver(url=f"http://127.0.0.1:{server.server_address[1]}")
@@ -625,6 +620,7 @@ def serving(delay: float = 0.0) -> Generator[Receiver]:
                 received.record(Delivery(self.path, headers, body))
                 time.sleep(delay)
             try:
+                received.await_release(json.dumps(body))
                 status, reply = (
                     completion(body) if self.path == "/v1/chat/completions" else (200, {})
                 )

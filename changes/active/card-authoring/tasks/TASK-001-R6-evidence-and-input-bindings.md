@@ -189,3 +189,44 @@ wire fields, compatibility aliases or new evidence types.
 - [Repository rules](../../../../AGENTS.md)
 - [Execution](../../../implementation-execution.md)
 - [Testing](../../../../TESTING.md)
+
+## Implementation Evidence
+
+Owners revalidated against revision 6: `wyrd-spec` `InputSlot`/`TypedInputSlot`
+own slot fields and `deny_unknown_fields` now refuses `required`; Vala
+`Scope::resolve` was the only omission-to-null branch; `wyrd-client`
+`InputSlot::from(Value)` gained the canonical-type discriminator Python already
+used, so Python's `slot` now delegates to it instead of duplicating it. No new
+error code: refusals use the existing loader/registry invalid-definition families.
+
+| Acceptance criterion | Implementation evidence | Verification evidence | Result |
+|---|---|---|---|
+| AC-009: missing evidence never null, pass or intentional skip; independent check runs | `vala-verify/src/blocks/scope.rs::Scope::resolve` (branch and unused `spec` removed) | `blocks::engine::tests::missing_evidence_is_inconclusive_never_null` (assert, child, absent field, code binding, `when`, trace check; RED shown with `required: false` slots); HTTP `pg_verification_routes::direct_execution_refuses_nonconforming_evidence`; MCP `verification::pg_tests::trace_evidence_keeps_whole_trace_and_waits_when_submitted`; SDK `verifier_building_blocks::trace_check_fails_a_guess_and_needs_its_trace` (Rust, Python, TS) | PASS |
+| AC-009: slot-level required rejected; nested schema required and nullable data unchanged | `wyrd-spec/src/card/verifier/mod.rs` (field, `required()`, serde helpers removed) | `card::verifier_card_tests::slot_level_required_is_refused_and_schema_required_is_kept` (RED before removal); `blocks::engine::tests::supplied_null_follows_the_slot_schema`; HTTP `pg_card_declaration_route::verifier_contract_refusals_leave_no_writes`; Rust/Python authoring refusals | PASS |
+| Distinct declaration and binding names; no old Action/Check alias | `wyrd-client/src/authoring/verifier.rs` (`bind_input`), `sdks/wyrd-sdk-python/src/authoring.rs`, `__init__.pyi` | `authoring::public_paths_author_every_native_family`; Python `test_every_native_family_constructs_canonical_specs`, `test_slot_level_required_is_refused` (`hasattr` checks); `py:lints` stub check | PASS |
+| Bare schemas without wrappers; Python schema and model class | `InputSlot::from(Value)`; Python `slot` delegates | wyrd-client `authoring::tests` (bare/canonical/trace conversions); Python `test_plain_schemas_do_not_require_pydantic`, `test_pydantic_models_supply_input_schemas`; Rust/Python finance journeys | PASS |
+| Existing behavior survives | callers, fixtures, examples, docs, generated TS types | `wyrd-spec`/`vala-verify`/`wyrd-client` lib lanes, `wyrd-spec --test verifier_fixtures`, `pg_hosted_artifacts::nonconforming_queued_evidence_errors_without_a_verdict`, Python authoring journey (3), `verify_in_real_time::grouped_coding_uses_declared_sources` (Rust, Python, TS), `finance_release_passes_and_fails` | PASS |
+
+Commands (Postgres-backed ones wrapped in
+`scripts/postgres/with-test-postgres.sh -- bash -lc "mise run db:migrate:all:inner && …"`):
+
+```sh
+mise exec -- cargo nextest run --locked -p wyrd-spec -p vala-verify --lib            # 818 passed
+mise exec -- cargo nextest run --locked -p wyrd-spec --test verifier_fixtures
+mise exec -- cargo nextest run --locked -p wyrd-client --lib                          # 276 passed
+mise exec -- cargo nextest run --locked -p wyrd-server --test integration -E 'test(=pg_verification_routes::direct_execution_refuses_nonconforming_evidence) | test(=pg_card_declaration_route::verifier_contract_refusals_leave_no_writes) | test(=pg_hosted_artifacts::nonconforming_queued_evidence_errors_without_a_verdict)'
+mise exec -- cargo nextest run --locked -p wyrd-mcp --test mcp -P journey --run-ignored=all -E 'test(=verification::pg_tests::trace_evidence_keeps_whole_trace_and_waits_when_submitted)'
+mise exec -- cargo nextest run --locked -p wyrd-ai --test integration -P journey --run-ignored=all -E 'test(/^authoring::/) | test(=verifier_building_blocks::trace_check_fails_a_guess_and_needs_its_trace) | test(=verify_in_real_time::grouped_coding_uses_declared_sources)'   # 7 passed
+mise exec -- cargo nextest run --locked -p wyrd-rust-examples --test finance_release --run-ignored=all -E 'test(=finance_release_passes_and_fails)'
+uv run python -m pytest -q tests/unit/cards                                           # 410 passed
+uv run python -m pytest -q -m integration tests/integration/cards/test_authoring_journey.py tests/integration/test_verifier_building_blocks.py::test_trace_check_fails_a_guess_and_needs_its_trace tests/integration/test_verify_in_real_time.py::test_grouped_coding_uses_declared_sources   # 5 passed
+pnpm exec vitest run tests/integration/verifier-building-blocks.test.ts tests/integration/verify-in-real-time.test.ts -t '^(trace check fails a guess and needs its trace|grouped coding uses declared sources)$'   # 2 passed
+mise run fmt && mise run lints && mise run py:format && mise run py:lints && mise run py:typecheck && mise run ts:typecheck
+mise run codegen:check && mise run docs:check && mise run check:examples && git diff --check
+```
+
+All passed. Non-goals held: no wire field renamed, no alias, no new evidence
+type, migration, error code or aggregation change. TypeScript has no authoring
+surface yet (TASK-003), so its proof is the regenerated wire types and the
+fixture journeys. Historical revision and review records are unchanged; the
+untracked `changes/active/positioning/` is unrelated and untouched.

@@ -691,6 +691,181 @@ candidate `20261108T181353Z`, both VALID) clears all four:
 - streamed c64: p99 0.518 vs 0.501–0.557 ms;
 - 64 KiB metadata c1: 3429 vs 3148–3204 req/s, p99 0.380 vs 0.400–0.436 ms.
 
+### Review decision evidence
+
+The results above came from runs that overlapped other host load. Everything
+in this section was rerun with a whole-host idle gate: below 1.5 busy cores for
+60 s before each run. Driver commits on the candidate:
+- `ccc65683f`, `93e948642`: `--pace`, the arrivals-free tail and per-outcome
+  error counts;
+- `5508cf29f`: the driver runtime has `DRIVER_CORES` workers.
+
+Every baseline (`aa2a6a0d8`, `1a0699e42`, main `5234961d5`) ran the identical
+driver. For `aa2a6a0d8` and `1a0699e42` the six driver files were copied
+byte-identical. Main got only the `5508cf29f` worker patch: the other driver
+changes add `--pace` and observations that default L1 never executes.
+
+**Matched-load memory, `--pace 4969` on
+`buffered-64kib-capture-payload.c64`.** 4969 req/s is 90% of the lowest valid
+baseline sustained rate, with at most 64 calls in flight. Every repetition is
+VALID with zero errors, missed or capped arrivals, lost, shed or undrained work.
+
+| Run | Peak RSS MiB | CPU µs/req | p99 ms |
+|---|---|---|---|
+| B `222017Z` | 2720 / 2631 / 2681 | 911 / 903 / 894 | 0.98 / 0.99 / 0.94 |
+| C `222209Z` | 2207 / 2301 / 2250 | 791 / 787 / 797 | 0.86 / 0.89 / 0.93 |
+| C `222400Z` | 2090 / 2220 / 2153 | 780 / 781 / 779 | — |
+| B `222551Z` | 2502 / 2463 / 2525 | 894–907 | — |
+| C `224422Z` | 2236 / 2217 / 2194 | 776 / 783 / 781 | 0.83 / 0.88 / 0.83 |
+| B `224614Z` | 2482 / 2516 / 2665 | 877 / 899 / 877 | 0.92 / 0.98 / 0.98 |
+
+- **Peak RSS** is below the baseline minimum in every candidate repetition.
+- **Opening and post-drain RSS** are lower on the candidate. In the last pair,
+  opening is 1626–1867 vs 1830–2203 MiB and post-drain resident is 1812–2020 vs
+  1830–2363 MiB.
+- **Governed ownership by owner**, last pair, post-drain: `oracle_used` 1024 MiB,
+  `forge_used` and `transport_used` 0, `scribe_used` 811/863/934 vs
+  790/789/765 MiB. That is far inside the 91 GiB managed plan.
+- **Post-drain settling.** The candidate's post-drain `scribe_used` rose across
+  cycles in each pair, which is a sampling artifact. Polling `/metrics` every
+  2 s during the last pair shows the same bounded sawtooth on both sides.
+  - Range: about 750 to 2040 MiB, made of the active memtable (at most about
+    512 MiB at rotation) plus 3–6 immutable generations.
+  - Charge: both sides charge 44 KiB per inserted row (`memtable_bytes_inserted`
+    over `memtable_rows_inserted`).
+  - Each post-drain reading is one point on that cycle, and every candidate
+    reading lies within it. Ownership does not grow beyond rotation.
+- **Profiled pair** (`222742Z` B, INVALID with `{"capped": 18}` under profiler
+  overhead and used for attribution only; `222934Z` C VALID):
+  - allocation is 2742 vs 1979 KiB per completed call;
+  - live heap at the end is 878 vs 1082 MiB, at least 92% of it
+    `shred_variant` output held by the memtable (810 vs 992 MiB). That fits the
+    same sawtooth sampled at a different phase.
+
+**Bifrost `otlp-logs-c64` (unsettled).** Two predetermined pairs in the order
+B, C, C, B, then two more runs.
+
+| Run | Rate req/s | CPU µs/row | p99 ms |
+|---|---|---|---|
+| B `223126Z` | 824 / 740 / 737 | 27.1 / 26.1 / 25.6 | 142 / 183 / 186 |
+| C `223317Z` | 754 / 731 / 695 | 25.3 / 25.4 / 25.2 | 160 / 211 / 236 |
+| C `223509Z` | 739 / 501 / 507 | 27.5 / 23.2 / 23.9 | 204 / 292 / 260 |
+| B `223700Z` | 685 / 667 / 660 | 24.5 / 24.6 / 24.5 | 183 / 184 / 208 |
+| final full L1 B `231100Z` / C `233230Z` | C median 560 vs B 329–420 | 28 vs 24–28 | 221 vs 274–649 |
+| rerun B `003319Z` / C `003745Z` | C median 430 vs B 607–758 | 40 vs 27–39 | 355 vs 158–185 |
+
+- **Slow repetitions are fsync-bound.** At about 500 req/s the server uses about
+  6 of 10 cores: `phase_wal_sync` p50 33–40 ms vs 19–25 ms,
+  `phase_scribe` p50 80–88 vs 50–57 ms, and fewer WAL syncs (98–99 vs
+  149–153).
+- **Not a CPU cost.** WAL bytes per row are equal (433–435 vs 431–434), and CPU
+  per row is lower in those repetitions.
+- **No candidate change here.** Nothing in the candidate changes the WAL or the
+  logs encoding path, apart from the Variant shredder.
+- **Direction flips between runs:** candidate faster in the full L1, slower in
+  the rerun. The finding remains unsettled and is not fixed.
+
+**Verification driver.** The cost was the driver's Tokio runtime: it ran one
+worker per host CPU (32) against a declared 8-core budget.
+- **Profile** (`perf`, `direct-verify-c64`, before the fix): the SDK client
+  stack accounts for 35% of driver CPU, response decoding 19% (the response is
+  the public contract), hyper connection tasks 10%, and scheduler park/steal 6%
+  plus kernel futex time.
+- **Fix** (`5508cf29f`): the driver runtime is sized from the single
+  `DRIVER_CORES` constant that also feeds `Validity::driver_cores`.
+- **Result:** with the same workload and the same 6.40-core threshold, the
+  driver uses 5.99–6.14 cores at 82–87k verifications/s, against 6.43–6.62
+  cores at 76–80k/s before. That is about 72 vs 82 µs per call.
+- **Records:** both final full-L1 records are VALID (B `232656Z`,
+  C `234827Z`). The earlier INVALID records stay INVALID. The margin is about
+  4%.
+
+**Final full L1, idle-gated.** Baseline `aa2a6a0d8` records are
+`20261108T231100Z`, `231821Z`, `232206Z`, `232656Z` and `232811Z`; candidate
+`5508cf29f` records are `233230Z`, `233954Z`, `234338Z`, `234827Z` and
+`234942Z`. All ten are VALID with zero errors, lost, shed or undrained work.
+
+Gateway, candidate median vs immediate baseline range:
+
+| Step | Rate req/s | CPU µs/req | p99 ms | Peak RSS MiB |
+|---|---|---|---|---|
+| buffered-1kib-capture-metadata.c1 | 5936 vs 5812–6030 | 210 vs 204–212 | 0.261 vs 0.242–0.245 | 769 vs 596–923 |
+| buffered-1kib-capture-metadata.c64 | 59386 vs 56994–59237 | 345 vs 341–364 | 1.347 vs 1.339–1.413 | 2202 vs 2089–2213 |
+| streamed-1kib-capture-metadata.c64 | 1539 vs 1537–1539 | 957 vs 930–1023 | 0.558 vs 0.523–0.596 | 1746 vs 1661–1895 |
+| buffered-64kib-capture-metadata.c1 | 3361 vs 3340–3458 | 349 vs 342–402 | 0.397 vs 0.382–0.424 | 1340 vs 1371–1486 |
+| buffered-64kib-capture-metadata.c64 | 24831 vs 22940–23634 | 836 vs 877–914 | 3.105 vs 3.199–3.437 | 2174 vs 2194–2258 |
+| buffered-64kib-capture-payload.c1 | 2703 vs 2565–2598 | 660 vs 676–695 | 0.508 vs 0.531–0.545 | 2199 vs 2401–2596 |
+| buffered-64kib-capture-payload.c64 | 9271 vs 5724–5825 | 1652 vs 1749–1802 | 58 vs 138–144 | 5353 vs 4619–4663 |
+
+- **Payload c64 peak RSS** is above the immediate baseline at the candidate's
+  60% higher closed-loop rate. It is below it at matched load (above).
+- **1 KiB c1 p99** was rerun with a fresh pair (B `004213Z`, C `004405Z`):
+  0.2665 vs 0.2596–0.2624 ms (+1.6%).
+
+**AC-010 against the pre-TASK-002 baseline `1a0699e42` (passes).**
+- **Unprofiled** (`20261109T001558Z`): payload c64
+  - peak RSS 5353 vs 7289–7694 MiB, below the minimum repetition;
+  - rate 9271 vs 4733–4850 req/s;
+  - CPU 1652 vs 2246–2290 µs;
+  - p99 58 vs 116–181 ms.
+
+  Payload c1 RSS is 2199 vs 4145–4749 MiB. Every other step is within or better
+  than its range.
+- **Paired `--profile`** (`1a0699e42` `002438Z`, candidate `002859Z`), KiB per
+  reconciled call:
+
+  | Step | `1a0699e42` | Candidate |
+  |---|---|---|
+  | payload c64 | 4676 | 1856 |
+  | payload c1 | 4384 | 2178 |
+  | 64 KiB metadata c64 | 1476 | 762 |
+  | 1 KiB metadata c64 | 220 | 205 |
+
+**AC-003 against main `5234961d5` (passes, `20261109T002018Z`).**
+- **64 KiB steps:** every one beats main's range on rate, CPU and p99. Payload
+  c64 peak RSS is 5353 vs 7454–7636 MiB, and c1 is 2199 vs 4378–4598 MiB.
+- **1 KiB steps:** 1 KiB c1 p99 is 0.261 vs 0.248–0.271 ms, and streamed c64
+  p99 is 0.558 vs 0.491–0.657 ms.
+- **Outside main's range in the worse direction:** streamed c1 CPU is 5124 vs
+  4959–5041 µs (+1.6%). That step runs at 24 req/s and is idle-dominated.
+
+**Other immediate-baseline differences, each with one fresh rerun pair:**
+- **`native-write-c64` (consistent, unresolved).** It is faster but costs more
+  per row in both runs. Writes rerun B `003319Z`, C `003745Z`:
+
+  | Run | Rate rows/s | CPU µs/row | Peak RSS MiB |
+  |---|---|---|---|
+  | full L1 | 129 vs 110–133 | 2.37 vs 1.97–2.10 | 5704 vs 4508–5160 |
+  | rerun | 190 vs 110–125 | 2.52 vs 1.95–2.07 | 6150 vs 4853–5267 |
+
+  It has not been profiled.
+- **`native-write-c1` p99:** 226 vs 78–193 ms in the full L1, cleared on rerun
+  (73 vs 98–200 ms).
+- **`otlp-spans-1k-c64` rate:** 225 vs 250–256 in the full L1, cleared on rerun
+  (412 vs 408–418).
+- **Parquet c1 reads** (rerun B `004556Z`, C `005003Z`). TASK-004 does not
+  change the read path.
+  - RSS is 2–7% above the baseline maximum in both runs (for example
+    `span-trace-c1` 1316 vs 1222–1292 MiB).
+  - `point-c1` is 491 vs 513–521 req/s, with p99 2.94 vs 2.70–2.79 ms.
+
+**Memory acceptance status:**
+- matched-load peak RSS: better;
+- governed ownership: within budgets;
+- post-drain ownership: bounded by rotation on both sides;
+- AC-010 against `1a0699e42`: passes;
+- Gateway against main: passes.
+
+Open before review: the unsettled `otlp-logs-c64` finding and the consistent
+`native-write-c64` CPU-per-row and RSS increase. TASK-004 is not marked
+implemented.
+
+Archived records and profiles (gitignored):
+- `target/benchmarks-baseline/final` (`aa2a6a0d8`);
+- `target/benchmarks-pre002` (`1a0699e42`);
+- `target/benchmarks-main` (`5234961d5`);
+- `benchmarks/history` and `target/benchmarks` (candidate).
+
 ### Commands
 
 ```sh
@@ -710,6 +885,10 @@ mise run bench:l1 -- --allow-dirty                                     # baselin
 mise run bench:l1:gateway -- --allow-dirty                             # main
 mise run bench:l1:gateway -- --allow-dirty --steps <step>              # rule rerun pair
 mise run bench:l1:bifrost:writes -- --allow-dirty --steps <step>       # rule rerun pair
+mise run bench:l1:gateway -- --allow-dirty --steps buffered-64kib-capture-payload.c64 --pace 4969   # matched load, B/C alternating
+mise run bench:l1:bifrost:writes -- --allow-dirty --steps otlp-logs-c64                         # B, C, C, B
+scripts/postgres/with-test-postgres.sh -- perf record -F 499 --call-graph fp -- target/profiling/release/capacity l1 verification --allow-dirty --steps direct-verify-c64
+mise exec -- scripts/postgres/with-test-postgres.sh -- bash -lc 'mise run db:migrate:all:inner && cargo nextest run --locked -p wyrd-testing --lib --bin capacity'   # 116/116
 ```
 
 Baseline, main and no-share artifacts (records, timings, profiles) are in `target/benchmarks-baseline` and

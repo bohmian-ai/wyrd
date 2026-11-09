@@ -1820,4 +1820,339 @@ mod tests {
         );
         assert_eq!(last.sum("wyrd_gateway_active_calls", &[]), 0.0);
     }
+
+    /// Timing boundaries a group of requests reaches, each with every closed
+    /// outcome its owner records.
+    type Reach = &'static [(&'static str, &'static [&'static str])];
+
+    /// `bifrost.scribe.write` and the part boundaries every acknowledged
+    /// write records beside it, always `success` (`scribe/profile.rs`).
+    const SCRIBE: Reach = &[
+        ("bifrost.scribe.write", &["success"]),
+        ("bifrost.scribe.write.admission", &["success"]),
+        ("bifrost.scribe.write.decode", &["success"]),
+        ("bifrost.scribe.write.preprocess", &["success"]),
+        ("bifrost.scribe.write.shard_wait", &["success"]),
+        ("bifrost.scribe.write.wal_append", &["success"]),
+        ("bifrost.scribe.write.wal_sync", &["success"]),
+        ("bifrost.scribe.write.visibility", &["success"]),
+        ("bifrost.scribe.write.ack", &["success"]),
+    ];
+
+    /// A public query: `QueryTiming` records its terminal, or `cancelled`
+    /// when it drops first (`query/routes.rs`).
+    const QUERY: Reach = &[("bifrost.query", &["success", "failed", "cancelled"])];
+
+    /// A native write's Gate lifecycle outcomes (`gate/mod.rs`).
+    const GATE: Reach = &[(
+        "bifrost.gate.write",
+        &["success", "rejected", "failed", "cancelled"],
+    )];
+
+    /// An OTLP traces export and its decode (`grpc/otlp.rs`).
+    const TRACES: Reach = &[
+        ("bifrost.otlp.traces", &["success", "failed"]),
+        ("bifrost.otlp.traces.decode", &["success"]),
+    ];
+
+    /// An OTLP logs export and its decode (`grpc/otlp.rs`).
+    const LOGS: Reach = &[
+        ("bifrost.otlp.logs", &["success", "failed"]),
+        ("bifrost.otlp.logs.decode", &["success"]),
+    ];
+
+    /// A direct Verification execution and each phase part it records,
+    /// `completed` or `cancelled` on drop (`verification/telemetry.rs`).
+    const DIRECT: Reach = &[
+        ("verification.direct", &["completed", "cancelled"]),
+        ("verification.direct.admit", &["completed", "cancelled"]),
+        ("verification.direct.load", &["completed", "cancelled"]),
+        (
+            "verification.direct.input_read",
+            &["completed", "cancelled"],
+        ),
+        ("verification.direct.prepare", &["completed", "cancelled"]),
+        ("verification.direct.engine", &["completed", "cancelled"]),
+        ("verification.direct.stage", &["completed", "cancelled"]),
+        (
+            "verification.direct.settlement",
+            &["completed", "cancelled"],
+        ),
+        ("verification.direct.outside", &["completed", "cancelled"]),
+    ];
+
+    /// Every Gateway call outcome (`wyrd_gateway::outcome_name`).
+    const CALL: &[&str] = &["succeeded", "failed", "cancelled", "timed_out"];
+
+    /// A buffered Gateway call's handoff.
+    const BUFFERED: Reach = &[("gateway.buffered", CALL)];
+
+    /// A streamed Gateway call's head and end handoffs.
+    const STREAMED: Reach = &[("gateway.stream.head", CALL), ("gateway.stream.end", CALL)];
+
+    /// The Oracle scan outcomes a measured query can reach: `cancelled` is
+    /// only an explicit cancel or shutdown, which no driver sends while
+    /// measuring (`oracle/mod.rs`).
+    const SCANNED: &[&str] = &["success", "failed", "client_drop"];
+
+    /// Every L1 repetition phase ([`Phase::label`]).
+    const L1: &[&str] = &["warmup", "repetition-1", "repetition-2", "repetition-3"];
+
+    /// Every L2 admission phase.
+    const L2: &[&str] = &["capacity", "overload", "recovery"];
+
+    /// The case label of each Bifrost read.
+    const READS: &[&str] = &[
+        "point-lookup",
+        "small-aggregate",
+        "million-aggregate",
+        "table-aggregate",
+        "full-scan",
+        "trace-lookup",
+        "shredded-filter",
+        "long-tail-filter",
+    ];
+
+    /// The case label of each competing L2 read, its probe included.
+    const COMPETING_READS: &[&str] = &[
+        "point-lookup",
+        "small-aggregate",
+        "million-aggregate",
+        "table-aggregate",
+        "full-scan",
+        "probe",
+    ];
+
+    /// One benchmark server process's reachable series: each labelled group
+    /// of cases and the boundaries its requests reach, in every phase; the
+    /// unlabelled setup, fixture, and background work; and the cases whose
+    /// queries record scan facts.
+    struct Lifetime {
+        /// The engine, level, and experiment it serves.
+        name: &'static str,
+        /// The phases its driver labels requests with.
+        phases: &'static [&'static str],
+        /// Each group of cases and the boundaries they reach.
+        labelled: Vec<(&'static [&'static str], Vec<Reach>)>,
+        /// Boundaries unlabelled work reaches.
+        unlabelled: Vec<Reach>,
+        /// The cases whose queries record scan facts.
+        scanned: &'static [&'static str],
+    }
+
+    impl Lifetime {
+        /// Every distinct timing series key it can open.
+        fn timings(&self) -> Vec<(&'static str, &'static str, &'static str, &'static str)> {
+            let keys = |reaches: &[Reach]| -> Vec<(&'static str, &'static str)> {
+                reaches
+                    .iter()
+                    .flat_map(|reach| reach.iter())
+                    .flat_map(|(boundary, outcomes)| {
+                        outcomes.iter().map(move |outcome| (*boundary, *outcome))
+                    })
+                    .collect()
+            };
+            let mut series: Vec<_> = keys(&self.unlabelled)
+                .into_iter()
+                .map(|(boundary, outcome)| {
+                    (
+                        boundary,
+                        outcome,
+                        wyrd_benchmark::UNLABELLED,
+                        wyrd_benchmark::UNLABELLED,
+                    )
+                })
+                .collect();
+            for (cases, reaches) in &self.labelled {
+                let keys = keys(reaches);
+                for case in *cases {
+                    for phase in self.phases {
+                        series.extend(
+                            keys.iter()
+                                .map(|(boundary, outcome)| (*boundary, *outcome, *case, *phase)),
+                        );
+                    }
+                }
+            }
+            series.sort_unstable();
+            series.dedup();
+            series
+        }
+
+        /// Every distinct scan series key it can open, unlabelled queries
+        /// included.
+        fn scans(&self) -> Vec<(&'static str, &'static str, &'static str)> {
+            let mut scans: Vec<_> = SCANNED
+                .iter()
+                .map(|outcome| {
+                    (
+                        *outcome,
+                        wyrd_benchmark::UNLABELLED,
+                        wyrd_benchmark::UNLABELLED,
+                    )
+                })
+                .collect();
+            for case in self.scanned {
+                for phase in self.phases {
+                    scans.extend(SCANNED.iter().map(|outcome| (*outcome, *case, *phase)));
+                }
+            }
+            scans
+        }
+    }
+
+    /// Every declared engine and level's server process: each Bifrost L1
+    /// experiment starts its own server, as do Bifrost L2, each
+    /// Verification level, and each Gateway level.
+    fn lifetimes() -> Vec<Lifetime> {
+        let bifrost: Vec<Reach> = vec![QUERY, GATE, SCRIBE, TRACES, LOGS];
+        let writes = || {
+            vec![
+                (&["native-write"][..], vec![GATE, SCRIBE]),
+                (&["otlp-spans", "otlp-spans-1k"][..], vec![TRACES, SCRIBE]),
+                (&["otlp-logs"][..], vec![LOGS, SCRIBE]),
+            ]
+        };
+        let mut competing = writes();
+        competing.push((COMPETING_READS, vec![QUERY]));
+        let lifetime = |name, phases, labelled, unlabelled, scanned| Lifetime {
+            name,
+            phases,
+            labelled,
+            unlabelled,
+            scanned,
+        };
+        vec![
+            lifetime(
+                "l1 bifrost writes-parquet",
+                L1,
+                writes(),
+                bifrost.clone(),
+                &[],
+            ),
+            lifetime(
+                "l1 bifrost hot",
+                L1,
+                vec![(READS, vec![QUERY])],
+                bifrost.clone(),
+                READS,
+            ),
+            lifetime(
+                "l1 bifrost parquet",
+                L1,
+                vec![(READS, vec![QUERY])],
+                bifrost.clone(),
+                READS,
+            ),
+            lifetime("l2 bifrost", L2, competing, bifrost, COMPETING_READS),
+            lifetime(
+                "l1 verification",
+                L1,
+                vec![(&["direct-verify"][..], vec![DIRECT])],
+                vec![DIRECT, QUERY, SCRIBE],
+                &[],
+            ),
+            lifetime(
+                "l2 verification",
+                L2,
+                vec![(&["direct-verify"][..], vec![DIRECT])],
+                vec![DIRECT, QUERY, SCRIBE],
+                &[],
+            ),
+            lifetime(
+                "l1 gateway",
+                L1,
+                vec![
+                    (
+                        &[
+                            "buffered-1kib-capture-metadata",
+                            "buffered-64kib-capture-metadata",
+                            "buffered-64kib-capture-payload",
+                        ][..],
+                        vec![BUFFERED],
+                    ),
+                    (&["streamed-1kib-capture-metadata"][..], vec![STREAMED]),
+                ],
+                vec![BUFFERED, STREAMED, QUERY, SCRIBE],
+                &[],
+            ),
+            lifetime(
+                "l2 gateway",
+                L2,
+                vec![
+                    (&["buffered-1kib-capture-metadata"][..], vec![BUFFERED]),
+                    (&["streamed-1kib-capture-metadata"][..], vec![STREAMED]),
+                ],
+                vec![BUFFERED, STREAMED, QUERY, SCRIBE],
+                &[],
+            ),
+        ]
+    }
+
+    /// Every declared engine and level's server process fits the timing
+    /// and scan series bounds: each lifetime's reachable cases, phases,
+    /// outcomes, and parts, setup and background work included, are at
+    /// most the bound, and the largest are all retained with nothing
+    /// dropped. Lifetimes are separate processes, so each is held against
+    /// the bounds alone; the largest timing and scan footprints are
+    /// recorded together, since they fill separate bounds.
+    ///
+    /// # Panics
+    ///
+    /// Panics when a lifetime exceeds a bound, or a recorded series is
+    /// dropped or not retained.
+    #[test]
+    fn declared_workloads_fit_recording_bounds() {
+        wyrd_benchmark::install().expect("the benchmark recorder installs");
+        let lifetimes = lifetimes();
+        for lifetime in &lifetimes {
+            let (timings, scans) = (lifetime.timings().len(), lifetime.scans().len());
+            assert!(
+                timings <= wyrd_benchmark::MAX_SERIES && scans <= wyrd_benchmark::MAX_SCAN_SERIES,
+                "{}: {timings} timing and {scans} scan series",
+                lifetime.name
+            );
+        }
+        let widest = |footprint: fn(&Lifetime) -> usize| {
+            lifetimes
+                .iter()
+                .max_by_key(|lifetime| footprint(lifetime))
+                .expect("declared lifetimes")
+        };
+        let timings = widest(|lifetime| lifetime.timings().len()).timings();
+        let scans = widest(|lifetime| lifetime.scans().len()).scans();
+
+        let _registry = tracing::subscriber::set_default(tracing_subscriber::registry());
+        let span = |case: &str, phase: &str| {
+            let span = tracing::info_span!("request");
+            if case != wyrd_benchmark::UNLABELLED {
+                let mut headers = http::HeaderMap::new();
+                for (header, value) in [
+                    (wyrd_benchmark::CASE_HEADER, case),
+                    (wyrd_benchmark::PHASE_HEADER, phase),
+                ] {
+                    headers.insert(header, http::HeaderValue::from_str(value).expect("a label"));
+                }
+                wyrd_benchmark::label_request(&span, &headers);
+            }
+            span
+        };
+        for (boundary, outcome, case, phase) in &timings {
+            wyrd_benchmark::record_timing(
+                &span(case, phase),
+                boundary,
+                outcome,
+                Duration::from_micros(1),
+                None,
+            );
+        }
+        for (outcome, case, phase) in &scans {
+            wyrd_benchmark::record_scan(&span(case, phase), outcome, Some(1), Some(1));
+        }
+        let snapshot = wyrd_benchmark::snapshot();
+        assert_eq!(snapshot.dropped, 0, "every reachable series is kept");
+        assert_eq!(snapshot.invalid_labels, 0);
+        assert_eq!(snapshot.series.len(), timings.len());
+        assert_eq!(snapshot.scans.len(), scans.len());
+    }
 }

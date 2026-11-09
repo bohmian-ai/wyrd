@@ -830,15 +830,47 @@ Gateway, candidate median vs immediate baseline range:
   4959–5041 µs (+1.6%). That step runs at 24 req/s and is idle-dominated.
 
 **Other immediate-baseline differences, each with one fresh rerun pair:**
-- **`native-write-c64` (consistent, unresolved).** It is faster but costs more
-  per row in both runs. Writes rerun B `003319Z`, C `003745Z`:
+- **`native-write-c64` (resolved: within the baseline range, no code cause).**
+  The full L1 and the first rerun pair were both run baseline first, and the
+  candidate ran 11–60% faster in each. Writes rerun B `003319Z`, C `003745Z`:
 
-  | Run | Rate rows/s | CPU µs/row | Peak RSS MiB |
+  | Run | Rate req/s | CPU µs/row | Peak RSS MiB |
   |---|---|---|---|
   | full L1 | 129 vs 110–133 | 2.37 vs 1.97–2.10 | 5704 vs 4508–5160 |
   | rerun | 190 vs 110–125 | 2.52 vs 1.95–2.07 | 6150 vs 4853–5267 |
 
-  It has not been profiled.
+  - **No candidate change runs on this path.** The fixture
+    (`events_ingest`) has six Int64/Utf8 columns and no Variant column.
+    The Arrow pin `ca5feff` → `394d4b0` changes only Variant shredding and
+    its residual builder, and `bea7f8b4c` changes nothing in `Cargo.lock`
+    except that revision. The `scribe_outbox` chunking is unchanged for
+    uniform audit rows, and the other server changes are on the Gateway and
+    skald paths.
+  - **Profiled pair** (B `022911Z`, C `023258Z`, both VALID with complete
+    captures). The c64 heap profiles have no `shred_variant` or
+    `reserve_for_row` frames. Variant-named frames allocate 0.09 vs 0.10 GiB
+    of 312 vs 329 GiB, and all of it is schema-level
+    (`enforce_dynamic_variants`). The candidate allocates 5% more bytes for
+    13% more requests. Under the profiler, c64 is 153 vs 136 req/s,
+    2.17 vs 2.52 µs/row and 6625 vs 6664 MiB.
+  - **Order-balanced rerun, B, C, C, B** (B `023801Z`, C `024246Z`,
+    C `024703Z`, B `025308Z`). All four runs are VALID with zero errors.
+    Each cell is the candidate median of 6 repetitions, with the baseline
+    min–max of 6 in brackets:
+
+    | Step | Rate req/s | p99 ms | CPU µs/row | Peak RSS MiB |
+    |---|---|---|---|---|
+    | native-write, 1 client | 55 (49–65) | 144 (52–214) | 1.51 (1.48–1.65) | 1720 (1641–1996) |
+    | native-write, 64 clients | 146 (108–146) | 1148 (1083–2252) | 2.29 (1.99–2.60) | 5183 (4675–6292) |
+
+    - 64-client CPU per row: the median is 10% above the baseline median
+      (2.09) at an 11% higher rate. The baseline's fastest repetition
+      (146 req/s) is also its most expensive (2.60 µs/row, 6292 MiB), so
+      cost per row rises with the closed-loop rate on both sides.
+    - Nothing is outside the baseline range.
+
+  No Arrow fork change was made, because the `reserve_exact` residual
+  hypothesis has no allocation on this path to act on.
 - **`native-write-c1` p99:** 226 vs 78–193 ms in the full L1, cleared on rerun
   (73 vs 98–200 ms).
 - **`otlp-spans-1k-c64` rate:** 225 vs 250–256 in the full L1, cleared on rerun
@@ -856,9 +888,8 @@ Gateway, candidate median vs immediate baseline range:
 - AC-010 against `1a0699e42`: passes;
 - Gateway against main: passes.
 
-Open before review: the unsettled `otlp-logs-c64` finding and the consistent
-`native-write-c64` CPU-per-row and RSS increase. TASK-004 is not marked
-implemented.
+Open before review: the unsettled `otlp-logs-c64` finding. TASK-004 is not
+marked implemented.
 
 Archived records and profiles (gitignored):
 - `target/benchmarks-baseline/final` (`aa2a6a0d8`);
@@ -885,6 +916,8 @@ mise run bench:l1 -- --allow-dirty                                     # baselin
 mise run bench:l1:gateway -- --allow-dirty                             # main
 mise run bench:l1:gateway -- --allow-dirty --steps <step>              # rule rerun pair
 mise run bench:l1:bifrost:writes -- --allow-dirty --steps <step>       # rule rerun pair
+mise run bench:l1:bifrost:writes -- --allow-dirty --profile --steps native-write-c1,native-write-c64   # B then C, idle-gated
+mise run bench:l1:bifrost:writes -- --allow-dirty --steps native-write-c1,native-write-c64             # B, C, C, B, idle-gated
 mise run bench:l1:gateway -- --allow-dirty --steps buffered-64kib-capture-payload.c64 --pace 4969   # matched load, B/C alternating
 mise run bench:l1:bifrost:writes -- --allow-dirty --steps otlp-logs-c64                         # B, C, C, B
 scripts/postgres/with-test-postgres.sh -- perf record -F 499 --call-graph fp -- target/profiling/release/capacity l1 verification --allow-dirty --steps direct-verify-c64

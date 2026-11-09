@@ -5,6 +5,7 @@
 
 #![deny(missing_docs)]
 
+pub mod authoring;
 pub mod cards;
 pub mod cli;
 pub mod client;

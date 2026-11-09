@@ -150,6 +150,35 @@ impl From<Value> for FieldValue {
     }
 }
 
+impl FromIterator<(String, FieldValue)> for FieldValue {
+    /// The JSON object of `entries`, keeping what each entry references at
+    /// its key; a key given twice keeps its last value.
+    fn from_iter<I: IntoIterator<Item = (String, FieldValue)>>(entries: I) -> Self {
+        let mut body = Body::default();
+        for (key, value) in entries {
+            body.set(&key, value);
+        }
+        body.into_field()
+    }
+}
+
+impl FromIterator<FieldValue> for FieldValue {
+    /// The JSON list of `items`, keeping what each item references at its
+    /// position.
+    fn from_iter<I: IntoIterator<Item = FieldValue>>(items: I) -> Self {
+        let mut list = Vec::new();
+        let mut captures = Captures::default();
+        for (index, item) in items.into_iter().enumerate() {
+            list.push(item.value);
+            captures.absorb(item.captures.under(&Segment::Index(index)));
+        }
+        Self {
+            value: Value::Array(list),
+            captures,
+        }
+    }
+}
+
 impl From<&str> for FieldValue {
     /// A JSON string, such as a reference or a scope path.
     fn from(value: &str) -> Self {
@@ -431,8 +460,9 @@ macro_rules! fields {
 
 pub(crate) use fields;
 
-/// Generate `From<Value>` for sub-values held as one [`Body`]: the canonical
-/// object form, kept as authored until validation.
+/// Generate `From<Value>` and `FromIterator<(String, FieldValue)>` for
+/// sub-values held as one [`Body`]: the canonical object form, kept as
+/// authored until validation.
 macro_rules! canonical_object {
     ($($ty:ty),* $(,)?) => {
         $(
@@ -444,6 +474,22 @@ macro_rules! canonical_object {
                     Self {
                         body: $crate::authoring::Body::authored(value),
                     }
+                }
+            }
+
+            impl FromIterator<(String, $crate::authoring::FieldValue)> for $ty {
+                /// The canonical object form with `entries` as its fields,
+                /// each keeping what it references; a key given twice keeps
+                /// its last value.
+                fn from_iter<I>(entries: I) -> Self
+                where
+                    I: IntoIterator<Item = (String, $crate::authoring::FieldValue)>,
+                {
+                    let mut body = $crate::authoring::Body::default();
+                    for (key, value) in entries {
+                        body.set(&key, value);
+                    }
+                    Self { body }
                 }
             }
         )*

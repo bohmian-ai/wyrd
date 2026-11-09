@@ -1358,3 +1358,68 @@ fn canonical_objects_match_constructed_values() {
         .expect_err("a string step does not decode");
     assert!(refuses(&error, "steps[0]"), "{error:?}");
 }
+
+/// Objects and lists built from entries keep what each entry references at
+/// its own position: a Card nested in a canonical component object joins the
+/// graph, a code file nested in a step object is read at its path, and the
+/// value equals the constructed one.
+///
+/// # Panics
+/// Panics when a built value differs from its constructed value or loses a
+/// nested reference.
+#[test]
+fn entry_built_objects_keep_nested_references() {
+    let reviewer = reviewer();
+    let component = Component::from_iter([
+        ("alias".to_owned(), FieldValue::from("reviewer")),
+        ("ref".to_owned(), FieldValue::from(reviewer.clone())),
+        (
+            "verified_by".to_owned(),
+            [FieldValue::from_iter([(
+                "verifier".to_owned(),
+                FieldValue::from(CardRef::verifier("registered", "1.0.0")),
+            )])]
+            .into_iter()
+            .collect(),
+        ),
+    ]);
+    let constructed = Component::new("reviewer", reviewer.clone())
+        .verified_by([Binding::new(CardRef::verifier("registered", "1.0.0"))]);
+    assert_eq!(component, constructed);
+    let service = Service::new("svc", "1.0.0").components([component]);
+    let declaration = CardDefinition::from(&service)
+        .declaration()
+        .expect("the nested Agent joins the graph");
+    let input = declaration.input.expect("a graph");
+    assert!(
+        input
+            .submissions
+            .iter()
+            .any(|card| card.metadata.name.as_str() == "report-reviewer"),
+        "{input:?}"
+    );
+
+    let step = Step::from_iter([
+        ("id".to_owned(), FieldValue::from("scan")),
+        (
+            "action".to_owned(),
+            FieldValue::from_iter([
+                ("kind".to_owned(), FieldValue::from("code")),
+                (
+                    "source".to_owned(),
+                    FieldValue::from(CodeSource::file("missing.py")),
+                ),
+                ("entrypoint".to_owned(), FieldValue::from("main")),
+            ]),
+        ),
+    ]);
+    let mut verifier = Verifier::new("built", "1.0.0");
+    verifier.add_step(step);
+    let error = verifier.validate().expect_err("the nested file is read");
+    assert!(
+        diagnostics(&error)
+            .iter()
+            .any(|(code, _)| code == "WYRD_LOADER_400_IO"),
+        "{error:?}"
+    );
+}

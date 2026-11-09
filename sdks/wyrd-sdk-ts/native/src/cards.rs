@@ -11,7 +11,7 @@ use napi::Env;
 use napi::Result;
 use napi::bindgen_prelude::PromiseRaw;
 use napi_derive::napi;
-use wyrd_client::cards::{BundleMode, CardKind, CardSelector, Cards, ListCardsRequest};
+use wyrd_client::cards::{BundleMode, CardKind, CardSelector, Cards, Declarable, ListCardsRequest};
 use wyrd_client::observe::Run;
 use wyrd_client::state::{ConfigureOptions, DeclareOptions, TelemetryFlushFailure, WyrdState};
 use wyrd_client::verify::Submission;
@@ -21,6 +21,7 @@ use wyrd_spec::ids::CardName;
 use wyrd_spec::reference::{CardRef, CardRefParseError};
 use wyrd_spec::{Prompt, ResponseType};
 
+use crate::authoring::NativeAuthored;
 use crate::client::{NativeWyrdClient, NativeWyrdClientResult};
 use crate::verification::{NativeSubmission, NativeVerifierInput};
 use crate::{NativeLifecycleResult, NativeTableConfig, NativeWyrdError};
@@ -103,24 +104,31 @@ impl NativeWyrdClient {
         path: String,
         bundle_dir: Option<String>,
     ) -> napi::Result<PromiseRaw<'env, NativeWyrdStateDeclaration>> {
-        let options = DeclareOptions {
-            client: Some(self.client.clone()),
-            bundle_dir: bundle_dir.map(PathBuf::from),
-        };
-        crate::trace::spawn(env, async move {
-            Ok(
-                match Box::pin(WyrdState::declare_with(path, options)).await {
-                    Ok(state) => NativeWyrdStateDeclaration {
-                        state: Some(NativeWyrdState { state: Ok(state) }),
-                        error: None,
-                    },
-                    Err(error) => NativeWyrdStateDeclaration {
-                        state: None,
-                        error: Some(NativeWyrdError::from_wyrd(&error)),
-                    },
-                },
-            )
-        })
+        self.declared_state(env, Declarable::Path(PathBuf::from(path)), bundle_dir)
+    }
+
+    /// Declares one authored Card graph, publishing its local Artifacts
+    /// first, and resolves to the ready state of its graph, as
+    /// `WyrdState::declare_with` does, with every call run as this client.
+    ///
+    /// # Arguments
+    ///
+    /// * `card` - The root authored Card, copied as it is now.
+    /// * `bundle_dir` - As [`Self::declare_wyrd_state`].
+    ///
+    /// # Errors
+    ///
+    /// Returns `InvalidArg` when `card` is not a Card; every other failure
+    /// is carried in the result.
+    #[napi]
+    pub fn declare_authored_wyrd_state<'env>(
+        &self,
+        env: &'env Env,
+        card: &NativeAuthored,
+        bundle_dir: Option<String>,
+    ) -> napi::Result<PromiseRaw<'env, NativeWyrdStateDeclaration>> {
+        let card = card.declarable()?;
+        self.declared_state(env, Declarable::Card(Box::new(card)), bundle_dir)
     }
 
     /// Loads and validates one Card bundle whose server calls run as this
@@ -140,8 +148,65 @@ impl NativeWyrdClient {
     }
 }
 
+impl NativeWyrdClient {
+    /// Declare `input` as this client and resolve to the ready state of its
+    /// graph, or the catalog failure.
+    fn declared_state<'env>(
+        &self,
+        env: &'env Env,
+        input: Declarable<'static>,
+        bundle_dir: Option<String>,
+    ) -> napi::Result<PromiseRaw<'env, NativeWyrdStateDeclaration>> {
+        let options = DeclareOptions {
+            client: Some(self.client.clone()),
+            bundle_dir: bundle_dir.map(PathBuf::from),
+        };
+        crate::trace::spawn(env, async move {
+            Ok(
+                match Box::pin(WyrdState::declare_with(input, options)).await {
+                    Ok(state) => NativeWyrdStateDeclaration {
+                        state: Some(NativeWyrdState { state: Ok(state) }),
+                        error: None,
+                    },
+                    Err(error) => NativeWyrdStateDeclaration {
+                        state: None,
+                        error: Some(NativeWyrdError::from_wyrd(&error)),
+                    },
+                },
+            )
+        })
+    }
+}
+
 #[napi]
 impl NativeCards {
+    /// Declares one authored Card graph through the shared
+    /// `Cards::declare`: its local Artifacts are published first, each as
+    /// its own sole submission, then the graph that references their exact
+    /// versions.
+    ///
+    /// # Arguments
+    ///
+    /// * `card` - The root authored Card, copied as it is now.
+    ///
+    /// # Errors
+    ///
+    /// Returns `InvalidArg` when `card` is not a Card, and a napi error when
+    /// the receipt cannot be serialized; validation, upload, and registry
+    /// failures are returned in the result.
+    #[napi]
+    pub fn declare<'env>(
+        &self,
+        env: &'env Env,
+        card: &NativeAuthored,
+    ) -> napi::Result<PromiseRaw<'env, NativeLifecycleResult>> {
+        let card = card.declarable()?;
+        let cards = self.cards.clone();
+        crate::trace::spawn(env, async move {
+            NativeLifecycleResult::outcome(Box::pin(cards.declare(card)).await)
+        })
+    }
+
     /// Loads one Card tree from disk and declares it as a composite.
     ///
     /// # Errors

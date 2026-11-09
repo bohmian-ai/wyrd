@@ -2911,7 +2911,7 @@ export interface InputDeclarationTrace {
 }
 
 /**
- * One named evidence slot. Slots are required unless `required: false`.
+ * One named evidence slot. Missing evidence leaves the checks that need it inconclusive.
  */
 export type InputSlot = TypedInputSlot | SourceText;
 
@@ -6394,8 +6394,12 @@ export interface TriggerSpecSchedule {
 export type TypedCardKind = "Data" | "Model" | "Artifact" | "Prompt" | "Agent" | "Verifier" | "Service" | "Trigger" | "Operator";
 
 /**
- * One named evidence slot. Slots are required unless `required: false`;
- * samples and source slots are always required.
+ * One named evidence slot.
+ *
+ * No slot is optional: evidence a caller omits stays missing, never `null`,
+ * so every check that needs it is inconclusive while independent checks
+ * still run. A `json` slot's schema alone decides whether a supplied `null`
+ * is admitted.
  */
 export type TypedInputSlot = TypedInputSlotJson | TypedInputSlotMedia | TypedInputSlotTrace | TypedInputSlotSamples;
 
@@ -6403,10 +6407,6 @@ export type TypedInputSlot = TypedInputSlotJson | TypedInputSlotMedia | TypedInp
  * A JSON value, optionally constrained by JSON Schema.
  */
 export interface TypedInputSlotJson {
-  /**
-   * Whether a caller must supply the slot.
-   */
-  readonly required?: boolean;
   /**
    * JSON Schema the value must satisfy.
    */
@@ -6426,19 +6426,14 @@ export interface TypedInputSlotMedia {
    * Lower size bound than the deployment limit.
    */
   readonly max_bytes?: number | null;
-  /**
-   * Whether a caller must supply the slot.
-   */
-  readonly required?: boolean;
   readonly type: "media";
 }
 
 /**
  * Feature measurements or metric samples recorded for a scheduled window.
  *
- * Always required: a schedule binding supplies every samples slot of its
- * Verifier from the subject's recorded measurements, so the slot has no
- * `required` field and no drift check can be omitted by configuration.
+ * A schedule binding supplies every samples slot of its Verifier from
+ * the subject's recorded measurements.
  */
 export interface TypedInputSlotSamples {
   /**
@@ -6452,10 +6447,6 @@ export interface TypedInputSlotSamples {
  * A trace resolved through tenant-scoped trace reads.
  */
 export interface TypedInputSlotTrace {
-  /**
-   * Whether a caller must supply the slot.
-   */
-  readonly required?: boolean;
   readonly type: "trace";
 }
 

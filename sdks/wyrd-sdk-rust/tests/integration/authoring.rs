@@ -1376,8 +1376,8 @@ fn assert_authors(card: impl Into<CardDefinition>, kind: &CardKind, expected: Va
 /// canonical spec its file form decodes to, with whole-field setters and add
 /// methods alike: every named kind and the generic kinds, all 56 comparison
 /// operators in assert, each, and trace, every Action and Check, every input
-/// slot including group sources and requiredness independent of whether its
-/// schema admits `null`, Service components, and a binding's Trigger and both
+/// slot including bare schemas and group sources, refusal of slot-level
+/// `required`, `bind_input` on an Action and a Check, Service components, and a binding's Trigger and both
 /// Operator lists in each linking form. Nothing here contacts a server.
 ///
 /// # Panics
@@ -1535,9 +1535,14 @@ fn public_paths_author_every_native_family() {
     let refused = optional
         .validate()
         .expect_err("slot-level required is refused");
+    let WyrdError::LoaderInvalidEnvelope { details, .. } = &refused else {
+        panic!("slot-level required is an invalid definition: {refused:?}");
+    };
     assert!(
-        refused.to_string().contains("unknown field `required`"),
-        "{refused}"
+        details["diagnostics"]
+            .to_string()
+            .contains("unknown field `required`"),
+        "{details}"
     );
     let mut call: Action = Action::agent(CardRef::agent("judge", "1.0.0"));
     call.bind_input("report", "inputs.report")

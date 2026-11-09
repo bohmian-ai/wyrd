@@ -316,3 +316,60 @@ bounded experiment separately if evidence requires one.
 - [Capture contract](../../../../architecture/wyrd-design.md#principal-model),
   [Bifrost](../../../../architecture/bifrost-design.md),
   [operational indicators](../../../../architecture/operations/reliability-and-recovery.md)
+
+## Implementation Evidence
+
+Verdict: `IMPLEMENTED`, pending `$wyrd-task-review`.
+
+### Candidate disposition
+
+| Candidate change | Disposition | Reason |
+|---|---|---|
+| `wyrd_telemetry::timing` moved to `crates/shared/wyrd-benchmark` | Retained, reworked | Now the one benchmark owner: `BenchmarkRecorder` (`recorder.rs`) implements `metrics::Recorder` for counters, gauges (value, peak) and HDR histograms (`_seconds` as integer ns, other histograms as exact integers, refused values counted), beside the existing timing/scan series under one lock, bounded by `MAX_METRIC_SERIES`. `TimingSnapshot`/`TimingInterval` renamed `BenchmarkSnapshot`/`BenchmarkInterval`. |
+| `enable()` | Reworked | Replaced by `install()`, which installs the recorder globally before enabling; it fails if any recorder already exists. |
+| Filtered Prometheus `BenchmarkMetrics` backend | Removed | REQ-001 forbids it. `MetricsBackend::install(benchmark)` selects one backend before registration, with no fallback. |
+| `/benchmark/timings` beside `/metrics` | Reworked | Benchmark mode serves `/benchmark/snapshot` (plus `/benchmark/heap` with `bench`) and no `/metrics`. Production serves `/metrics` only. Loopback validation is unchanged. |
+| `outbox_writes_total` counter | Removed | New production family. Gateway `Integrity` reads `outbox_write_seconds_count` again, from the snapshot. |
+| Gateway `CaptureSlot`/`AnswerResume` phases, `Answer::sent`, per-phase `record_timing` | Removed | REQ-005/TASK-002 scope, and they added production label values. `admitted` is back to the `phase="account"` histogram count. |
+| Verification `record_timing` for `verification.submit`/`queue_wait`/`bifrost.scribe.ack`, plus the duplicate-retry ack histogram | Removed | Each was a second observation of a duration that an existing histogram already records. Consumers read those histograms from the snapshot. |
+| `capacity::{Selection,Readings,Telemetry,Histogram::read}` deleted | Retained, reworked | Superseded by `Population::{metrics,counter,histogram}`. The Verification `BREAKDOWN` families, submission/queue-wait means and ack count are restored over snapshot metrics. |
+| `Histogram`/`deltas` moved to `release_server` | Retained | Production metrics contract-test utilities (`tests/gateway/resilience.rs`). |
+| Existing dual sites (Gate write, direct Verification, Gateway handoffs, Scribe ack) | Reworked | The production histogram is recorded only when `wyrd_benchmark::enabled()` is false. In benchmark mode, `bifrost_scribe_ack_seconds` holds only deduplicated retries and `wyrd_verification_*` phase/run/verifier/overhead histograms hold only queued executions. Consumers merge the timing series for the rest. |
+| `timing_declaration`, `benchmarks/README.md` | Reworked | Both now declare the sole recorder and the dedupe rule, and the declaration adds `max_metric_series`. The README text about Gateway phases was dropped (TASK-002). |
+| Manifests (`wyrd-tonic`, `vala-bifrost-redux`, `wyrd-telemetry`) | Retained | Incidental reorderings reverted. `wyrd-telemetry` keeps `metrics`/`ulid`/`http`, which it still uses. |
+| Calibration `pg_tests` scrape | Reworked | Reads `/benchmark/snapshot`. Still `#[ignore]` and was not run. |
+| Untracked `changes/active/gateway-latency-capture/` | Untouched | Not part of this task. |
+
+### Acceptance
+
+| Acceptance criterion | Implementation evidence | Verification evidence | Result |
+|---|---|---|---|
+| REQ-001–002; AC-001: exclusive startup, one owner for all kinds | `wyrd-server/src/app/metrics.rs` `MetricsBackend::install`, `metrics_router`; `app/mod.rs`, `app/server.rs`; `wyrd-benchmark/src/{lib,recorder}.rs` | `app::metrics::tests::{benchmark_mode_installs_only_benchmark_recorder, benchmark_snapshots_are_local_read_only_and_opt_in, recorder_installs_and_renders}`; `wyrd-benchmark tests::standard_metrics_and_request_timings_share_one_snapshot`. RED: initializing Gate metrics before install fails the startup test. | PASS |
+| No double-counting at dual sites | `gate/mod.rs record_gate_request`; `scribe/ingress.rs`; `verification/telemetry.rs emit`; `gateway/telemetry.rs point` | `gate::tests::histogram_write_boundary_includes_durable_append`, `scribe::ingress::tests::acknowledged_append_records_each_write_phase_once`, `components::gateway::telemetry::tests::histograms_preserve_head_and_final_overhead`, `verification::hosted::blocks::tests::histogram_overhead_excludes_real_overlapping_blocks` (each asserts the production histogram is absent) | PASS |
+| REQ-003,007; INV-004; AC-002: intervals, bounds, invalid evidence, history | `capacity.rs Population::{from_interval,metrics,counter,histogram}`; `IntervalMetric::{between_all,counter,histogram}` | Interval conservation trio; `capacity::tests::snapshot_windows_keep_classes_and_scans_apart` (extended: refused metric updates are invalid, an unregistered counter is `None`); the four `experiment::tests` history cases | PASS |
+| REQ-004; INV-001–003: every engine/level consumer, no Prometheus | `release_server.rs Metrics::of_snapshot`; `verification/run.rs`; `gateway/{run,capacity}.rs` | `tests::all_engine_consumers_read_benchmark_snapshots_without_prometheus` (RED: zeroing histogram counts in `of_snapshot` fails `Integrity.written`); consumer regressions quartet including `verification::run::tests::diagnostics_use_benchmark_distributions` | PASS |
+| Functional capture/acknowledgement closure | `tests/gateway/resilience.rs` | `resilience::benchmark_mode_keeps_capture_and_snapshot_counts_without_prometheus`, plus production journeys `gateway_capacity_metrics_cover_buffered_and_streamed_calls` and `capacity_capture_accounting_waits_for_post_response_work` | PASS |
+| REQ-009; AC-005 | Disposition table above | Static closure below | PASS |
+
+### Commands
+
+All ran sequentially and passed:
+
+- Every selector listed under Verification and Evidence, run as written.
+- The benchmark journey through `scripts/postgres/with-test-postgres.sh`.
+- Owner suites under Postgres: `cargo nextest run --locked --no-fail-fast -p wyrd-benchmark -p wyrd-testing -p wyrd-server -p vala-bifrost-redux -p wyrd-runtime --lib --bin capacity`. Result: 1708 passed, 2 skipped (the ignored calibration tests).
+- `mise run fmt:check`.
+- The listed Clippy command with `--all-features --all-targets -D warnings`.
+- `mise run check:deps`.
+- `git diff --check`.
+
+### Diagnoses
+
+- **Symptom:** `diagnostics_use_benchmark_distributions` failed on first run, at the component-order assertion. **Evidence:** the outbox and engine fixtures were both 100 µs. **Cause:** the test fixture produced a tie in the sort key. **Fix site:** the test fixture only (outbox set to 50 µs). Product code was unchanged.
+- **Symptom:** a Postgres-less ad-hoc run failed cluster, teardown and catalog pin tests. **Evidence:** `test DB env unset (WYRD_TEST_DATABASE_ADMIN_URL)`. **Cause:** those tests need the fixture database, and the ad-hoc filter did not exclude them. **Fix site:** none needed. The same suites passed under `with-test-postgres.sh`.
+
+### Limits
+
+- `MAX_METRIC_SERIES` coverage is proven for the Gateway journey (`dropped == 0`) and the bounded-registry tests. It is not proven by a full declared L1/L2 run, because no benchmark run was authorized.
+- Component means are bucket bounds, not exact Prometheus sums.
+- Non-goals stayed excluded: no scheduler, cache, transport, admission or optimization change; no SDK, schema, migration or generated-artifact change; no benchmark run or release benchmark build.

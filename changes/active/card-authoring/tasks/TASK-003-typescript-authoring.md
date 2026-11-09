@@ -237,3 +237,43 @@ implementation or declare the sample subset a complete projection.
 - [TypeScript sketch](../examples/typescript/multi_component.ts), [TypeScript rules](../../../../sdks/wyrd-sdk-ts/AGENTS.md)
 - [Repository rules](../../../../AGENTS.md), [contracts](../../../../architecture/wyrd-design.md)
 - [Workflow](../../../spec-driven-development.md), [execution](../../../implementation-execution.md), [testing](../../../../TESTING.md)
+
+## Implementation Evidence
+
+Capability/reuse: the shared `wyrd_client::authoring` values (Task 1) own
+construction, validation, planning and local Artifact publication; the gap was
+only the N-API projection and TypeScript wrappers. `NativeAuthored` dispatches
+every edit by YAML field name to those values, and `NativeValue.compose`
+carries authored Cards nested in plain JSON as holes, using the new
+`FromIterator` impls on `FieldValue` and the canonical objects. `Cards.declare`
+and `WyrdState.declare` forward to the existing declaration and state owners
+(`NativeCards::declare`, `declared_state`); no second client, scheduler or
+upload loop exists. REQ-010: the generator now emits the Experiment, Mcp and
+Audit roots and `ExecutionPlan`.
+
+| Acceptance criterion | Implementation evidence | Verification evidence | Result |
+|---|---|---|---|
+| Scenario 1: offline constructors, in-place identity, capture, schemas, errors | `native/src/authoring.rs`; `wyrd/src/authoring.ts`; `wyrd/src/native.ts` | `vitest run tests/unit/authoring.test.ts -t '^definitions_edit_offline$'`, plus `schemas_and_slots_are_canonical` | PASS |
+| Scenario 2: TS-authored two-component Service, exact subjects, outcomes/citations, cross-component refusal, idempotent rerun, summary step | `Cards.declare`, `WyrdState.declare` in `wyrd/src/index.ts`; `NativeCards::declare`, `declare_authored_wyrd_state` in `native/src/cards.rs` | `tests/integration/authoring.test.ts -t '^multi_component_service_verifies_each_subject$'` | PASS |
+| Scenario 3: local upload reuse/versioning, file parity, exact refusal codes, orphaned policy kept, Artifact root, reader denied, directory source | Same seam; `Artifact.fromPath`, `CardRef.file` | `tests/integration/authoring.test.ts -t '^local_artifacts_and_declaration_parity$'` | PASS |
+| Public exports, subpath and precise wrappers agree with generated declarations | `package.json` `./authoring`; `scripts/check_ts_package.mjs` imports and type-checks `wyrd-ai/authoring`; `index.d.ts` regenerated | `ts:typecheck`, `ts:napi:check`, `ts:pack:check`, `codegen:check`; `tests/types/authoring.test-d.ts` refuses any method taking `never` | PASS |
+| Every Task 1 family projected; none TypeScript-only | One `Authored` variant per family; TS classes only adopt native handles | `every_native_family_constructs_canonical_specs` | PASS |
+
+Checks: `build:server`, `ts:build`, `ts:build:testing`, `ts:format`, `ts:lints`,
+`ts:typecheck`, `ts:napi:check`, `ts:pack:check`, `codegen:check`, `fmt`,
+`lints`, `check:deps`, and `git diff --check` all pass. The rust test
+`authoring::tests::entry_built_objects_keep_nested_references` passes. Non-goals
+stayed out: no dependency, wire, error-catalog, scheduler or security change.
+TypeScript has no Python-style Card holder object, so the Python holder-declare
+case has no TypeScript projection.
+
+Diagnosis (`lints`):
+- **Symptom:** clippy `large_stack_arrays` at `crates/wyrd-spec/examples/gen_schemas.rs:122`.
+- **Evidence:** the error comes from the `roots!` macro, after the `ExecutionPlan` root was added.
+- **Cause:** the macro builds a stack array of `(String, Value)` tuples, one per root, and the added root pushed it past 16384 bytes.
+- **Fix site:** the `roots!` macro, which now builds a `vec!`. It is its only caller.
+
+Diagnosis (types):
+- **Symptom:** `Prompt.addMessage` took a parameter of type `never`.
+- **Cause:** `Item` and `Entry` were non-distributive over a nullable wire field (`readonly X[] | null`).
+- **Fix site:** those two helper types, which now use `NonNullable`. The type test now covers every class.

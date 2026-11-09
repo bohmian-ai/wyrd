@@ -86,11 +86,11 @@ use wyrd_spec::vala::api::{
     ValidatePredicateResponse,
 };
 use wyrd_spec::vala::trace::SpanRecord;
-use wyrd_spec::verification::{ExecutionPlan, VerificationBindingStatus};
 use wyrd_spec::verification::execution::{
     EnqueueVerificationResponse, EvidencePlanRequest, EvidencePlanResponse,
     VerificationExecutionState, VerificationRequest, VerificationResult,
 };
+use wyrd_spec::verification::{ExecutionPlan, VerificationBindingStatus};
 
 /// Writes the consumed generated outputs, or prints the transient contract bundle.
 ///
@@ -119,7 +119,7 @@ fn main() -> Result<(), Box<dyn StdError>> {
 /// Registers each listed type as a named root of one shared schema generator.
 macro_rules! roots {
     ($generator:ident, $($ty:ty),+ $(,)?) => {
-        [$((
+        vec![$((
             stringify!($ty).to_owned(),
             serde_json::to_value($generator.subschema_for::<$ty>())
                 .expect("a derived schema serializes"),

@@ -7,7 +7,7 @@
 //! explicit capture policy, and one machine principal per caller; every call
 //! is raw HTTP/1.1 keep-alive `POST /v1/chat/completions` with a `wyrd_sk_`
 //! key, timed until the complete answer is validated. All evidence comes from
-//! client timings, `/metrics`, tenant capture reads, and the OS's readings of
+//! client timings, the benchmark snapshot, tenant capture reads, and the OS's readings of
 //! the server process.
 //!
 //! - L1 `overhead` ([`run`]): closed-loop clients at 1 and 64 for each

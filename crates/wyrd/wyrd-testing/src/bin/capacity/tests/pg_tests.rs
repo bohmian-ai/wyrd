@@ -48,9 +48,9 @@ const TICKS_SECONDS: f64 = 0.02;
 /// one-client windows, as a share of it.
 const DRIFT: f64 = 0.25;
 
-/// Least share of a sequential `/metrics` scrape's round trip the server
-/// spends rendering it on CPU: the exposition is rendered in memory, and
-/// loopback transfer and the driver's read take the rest.
+/// Least share of a sequential benchmark snapshot read's round trip the
+/// server spends serializing it on CPU: the snapshot is serialized in
+/// memory, and loopback transfer and the driver's read take the rest.
 const SCRAPE_FLOOR: f64 = 0.3;
 
 /// Bytes per MiB.
@@ -83,11 +83,12 @@ pub fn burn(length: Duration) {
     }
 }
 
-/// Scrapes the server's metrics listener, or `None` when it does not answer.
+/// Reads the server's benchmark snapshot as metrics, or `None` when it does
+/// not answer.
 async fn scrape() -> Option<Metrics> {
-    let url = format!("http://127.0.0.1:{METRICS_PORT}/metrics");
+    let url = format!("http://127.0.0.1:{METRICS_PORT}/benchmark/snapshot");
     let response = reqwest::get(url).await.ok()?.error_for_status().ok()?;
-    Some(Metrics::parse(&response.text().await.ok()?))
+    Some(Metrics::of_snapshot(&response.json().await.ok()?))
 }
 
 /// Scrapes once the server's Scribe outbox holds nothing pending, so every
@@ -108,10 +109,10 @@ async fn settled_scrape() -> Option<Metrics> {
     }
 }
 
-/// Scrapes `/metrics` one request after another for `length` and returns
-/// the seconds the requests were in flight.
+/// Reads the benchmark snapshot one request after another for `length` and
+/// returns the seconds the requests were in flight.
 async fn scrape_loop(length: Duration) -> f64 {
-    let url = format!("http://127.0.0.1:{METRICS_PORT}/metrics");
+    let url = format!("http://127.0.0.1:{METRICS_PORT}/benchmark/snapshot");
     let client = reqwest::Client::new();
     let end = Instant::now() + length;
     let mut busy = Duration::ZERO;

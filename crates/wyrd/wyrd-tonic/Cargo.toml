@@ -37,11 +37,12 @@ optional = true
 # Inbound W3C trace context for the public listener's request span. Gated
 # behind the `server` feature so the client tier never links the process
 # telemetry pipeline.
-[dependencies.wyrd-benchmark]
+[dependencies.wyrd-telemetry]
 workspace = true
 optional = true
 
-[dependencies.wyrd-telemetry]
+# Benchmark request classification for the public listener.
+[dependencies.wyrd-benchmark]
 workspace = true
 optional = true
 

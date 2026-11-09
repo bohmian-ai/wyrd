@@ -7,7 +7,7 @@
 //! Rust client exactly as the guide's `WYRD_SERVER_URL` and `WYRD_API_KEY`
 //! configure it. Every query is checked against its exact answer and every
 //! write resolves at its durable acknowledgement. Evidence comes from client
-//! timings, `/metrics`, and the OS's readings of the server process.
+//! timings, the benchmark snapshot, and the OS's readings of the server process.
 //!
 //! - **L1** ([`isolated`]), three experiments at 1 and 64 closed-loop
 //!   clients ([`Experiment`]): `writes-parquet` sweeps native Arrow, OTLP
@@ -1596,7 +1596,7 @@ async fn lanes(client: &WyrdClient, ops: &[WriteOp]) -> Result<Vec<Lane>> {
     Ok(lanes)
 }
 
-/// Where Scribe holds rows, from one `/metrics` scrape and the store.
+/// Where Scribe holds rows, from one benchmark snapshot and the store.
 #[derive(Debug)]
 struct Residence {
     /// Arrow bytes in active and immutable memtables.

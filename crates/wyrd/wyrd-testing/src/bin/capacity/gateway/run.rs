@@ -43,7 +43,7 @@ use crate::gateway::{
 /// once arrivals stop.
 pub const DRAIN_LIMIT: Duration = Duration::from_secs(60);
 
-/// How often a drain reads `/metrics` again.
+/// How often a drain reads the benchmark snapshot again.
 const POLL: Duration = Duration::from_millis(100);
 
 /// The server timing of a buffered call: arrival until its answer handoff.

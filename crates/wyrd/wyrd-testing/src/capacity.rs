@@ -13,12 +13,13 @@
 //! entry to its result, acknowledgement, or response handoff, plus the union
 //! of that request's own provider or Verifier waits and the residual between
 //! them. Each percentile is the nearest-rank bucket's bounds, judged whole.
-//! Diagnostic phases use the same benchmark distributions. Prometheus
-//! supplies only integrity counters and resource gauges during a benchmark.
+//! Diagnostic histograms, counters, and gauges come from the same benchmark
+//! snapshots; a benchmarked server runs no Prometheus recorder.
 //!
 //! A [`Window`] reads the server's CPU and peak memory and this process's
-//! CPU at its open and differences them into a [`Usage`] at its close. A reading the OS cannot supply, a counter that went
-//! backwards, or a lost process is `None`, never zero use.
+//! CPU at its open and differences them into a [`Usage`] at its close. A
+//! reading the OS cannot supply, a counter that went backwards, or a lost
+//! process is `None`, never zero use.
 
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
@@ -96,11 +97,12 @@ pub struct Usage {
     pub drain_seconds: f64,
 }
 
-/// One server's resources and this process's CPU
-/// at a window's start, closed into a [`Usage`].
+/// One server's resources and this process's CPU at a window's start,
+/// closed into a [`Usage`].
 ///
-/// Opening and closing each scrape `/metrics` and hand that scrape back,
-/// so a workload reading further series takes them from the same scrape. The
+/// Opening and closing each read the benchmark snapshot as [`Metrics`] and
+/// hand that read back, so a workload reading further series takes them
+/// from the same scrape. The
 /// window's seconds and both CPU readings freeze together with the start of
 /// the scrape handed back and, through [`Self::measure`], before the
 /// requests in flight at the window's stop drain.
@@ -114,8 +116,8 @@ pub struct Window {
 }
 
 impl Window {
-    /// Opens a resource window over `server`, and returns the
-    /// opening scrape.
+    /// Opens a resource window over `server`, and returns the opening
+    /// scrape.
     ///
     /// # Errors
     ///
@@ -130,8 +132,8 @@ impl Window {
         Ok((window, metrics))
     }
 
-    /// Differences `server`'s resources against the open,
-    /// and returns the closing scrape.
+    /// Differences `server`'s resources against the open, and returns the
+    /// closing scrape.
     ///
     /// # Errors
     ///
@@ -147,8 +149,9 @@ impl Window {
     /// it returns share their interval; only then do the requests `work`
     /// still has in flight drain, outside all of them. `work` must admit
     /// nothing after `stop` and counts what completes after it as late.
-    /// Returns `work`'s output, the usage, and the stop scrape; a check of everything the
-    /// window caused, drain included, scrapes again afterwards.
+    /// Returns `work`'s output, the usage, and the stop scrape; a check of
+    /// everything the window caused, drain included, scrapes again
+    /// afterwards.
     ///
     /// # Errors
     ///
@@ -346,8 +349,7 @@ const COLLECTION_WAIT: Duration = Duration::from_secs(30);
 pub fn timing_declaration() -> Value {
     let method = wyrd_benchmark::Method::current();
     serde_json::json!({
-        "recorder": "wyrd-benchmark",
-        "production_duration_histograms": "disabled; Prometheus retains health counters and resource gauges",
+        "recorder": "wyrd-benchmark is the server's only metrics recorder: counters, gauges, and diagnostic histograms are read from the same snapshots as the timings, with no Prometheus recorder or exporter; a duration with both a timing and a production histogram is recorded only as the timing",
         "method": "server benchmark histograms: integer nanoseconds from the owning server boundary's std::time::Instant timers, recorded into bounded HDR histograms and read as cumulative snapshots from the loopback metrics listener; each window is the bucket-count difference of two snapshots of one process",
         "clock": method.clock,
         "precision": format!("{} significant digits; each percentile is judged on its whole bucket's bounds", method.significant_digits),
@@ -355,6 +357,7 @@ pub fn timing_declaration() -> Value {
         "scan_range": [1, method.highest_scan],
         "max_series": method.max_series,
         "max_scan_series": method.max_scan_series,
+        "max_metric_series": method.max_metric_series,
         "percentile": "nearest rank ceil(q * N) over the window's distribution",
         "server_env": { "WYRD_METRICS_BENCHMARK_SNAPSHOT": "1" },
         "tracing": "operator span export stays at its default (disabled); no span is required for timing",
@@ -501,7 +504,7 @@ impl Population {
         let mut invalid = Vec::new();
         if interval.dropped > 0 {
             invalid.push(format!(
-                "{} timing observations overflowed the server's series bound and were dropped",
+                "{} observations overflowed the server's series bounds and were dropped",
                 interval.dropped
             ));
         }
@@ -874,10 +877,11 @@ pub fn install_tracing() {
 #[cfg(test)]
 mod tests {
     use super::{
-        Distribution, Expected, IntervalScan, IntervalSeries, Percentiles, Population,
-        BenchmarkInterval, UNLABELLED, elapsed, until_stop,
+        BenchmarkInterval, Distribution, Expected, IntervalMetric, IntervalScan, IntervalSeries,
+        Percentiles, Population, UNLABELLED, elapsed, until_stop,
     };
     use crate::release_server::Metrics;
+    use wyrd_benchmark::IntervalValue;
 
     /// Controlled delays, waits, and CPU calibrate the shared measurement
     /// path against references measured independently of it. Each request
@@ -1073,8 +1077,9 @@ mod tests {
         assert_eq!(Percentiles::raw(&[], 1.0).p50, None);
     }
 
-    /// A snapshot window is invalid for every dropped, mislabelled, or
-    /// inconsistent observation and for a short or extra count; one case
+    /// A snapshot window is invalid for every dropped, mislabelled, refused,
+    /// or inconsistent observation and for a short or extra count, and keeps
+    /// its standard metrics, an unregistered one missing; one case
     /// and phase never satisfies another's count; scanned facts average as
     /// bounds of their bucketed totals and a query without one is missing,
     /// never zero.
@@ -1166,20 +1171,38 @@ mod tests {
         );
         assert_eq!(mixed.reconciliation[1].recorded, 1);
 
-        let broken = Population::from_interval(interval(
+        let mut broken = interval(
             vec![series(UNLABELLED, UNLABELLED, &[1], 1)],
             vec![scan(&[3], 1)],
             2,
             3,
-        ));
+        );
+        broken.metrics = vec![IntervalMetric {
+            name: "outbox_items_written_total".to_owned(),
+            labels: [("outbox".to_owned(), "scribe".to_owned())].into(),
+            rejected: 2,
+            value: IntervalValue::Counter(5),
+        }];
+        let broken = Population::from_interval(broken);
         assert_eq!(
             broken.invalid,
             [
-                "2 timing observations overflowed the server's series bound and were dropped",
+                "2 observations overflowed the server's series bounds and were dropped",
                 "3 requests declared an unknown benchmark case or phase",
                 "`bifrost.query` (success, case none, phase none) has 1 durations outside the trackable range",
                 "`bifrost.query` (success, case none, phase none) recorded 1 elapsed observations for 2 requests",
+                "metric outbox_items_written_total refused 2 unrepresentable updates",
             ]
+        );
+        assert_eq!(
+            broken.counter("outbox_items_written_total", &[("outbox", "scribe")]),
+            Some(5),
+            "the window keeps its standard metrics"
+        );
+        assert_eq!(
+            broken.counter("outbox_items_written_total", &[("outbox", "audit")]),
+            None,
+            "an unregistered counter is missing, never zero"
         );
         assert_eq!(
             broken.scanned_per_query("success")[0].value,

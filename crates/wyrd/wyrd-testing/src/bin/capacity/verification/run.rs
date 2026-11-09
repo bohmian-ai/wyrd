@@ -5,7 +5,7 @@
 //! An L1 repetition is closed loop: N clients each send the next direct
 //! `verify` once the last answers, for the window. An L2 repetition is open
 //! loop: direct and background arrivals follow the [`Schedule`] through
-//! capacity, overload, and recovery while `/metrics` is read at each phase
+//! capacity, overload, and recovery while the benchmark snapshot is read at each phase
 //! boundary and every second of recovery, then the queue drains before the
 //! next repetition, so each starts from the same empty backlog.
 //!
@@ -51,10 +51,10 @@ use crate::verification::{
 /// The declared server process whose CPU each repetition sums.
 const PROCESS: &str = "wyrd-server";
 
-/// How often recovery reads `/metrics` again.
+/// How often recovery reads the benchmark snapshot again.
 const POLL: Duration = Duration::from_secs(1);
 
-/// How often a drain reads `/metrics` again.
+/// How often a drain reads the benchmark snapshot again.
 const DRAIN_POLL: Duration = Duration::from_millis(100);
 
 /// How long a drain is watched before it is recorded as unfinished.
@@ -82,24 +82,24 @@ const DIRECT_CASE: &str = "direct-verify";
 const QUEUED_CASE: &str = "queued-verify";
 
 /// A `submit` request's arrival until it was staged.
-const SUBMIT: &str = "wyrd_verification_submit_seconds";
+pub(crate) const SUBMIT: &str = "wyrd_verification_submit_seconds";
 
 /// A queued run's wait from claimable to claimed.
-const QUEUE_WAIT: &str = "wyrd_verification_queue_wait_seconds";
+pub(crate) const QUEUE_WAIT: &str = "wyrd_verification_queue_wait_seconds";
 
 /// Scribe's acknowledgement of a deduplicated retry; a benchmarked server
 /// records every other acknowledgement only as [`SCRIBE_WRITE`].
-const SCRIBE_ACK: &str = "bifrost_scribe_ack_seconds";
+pub(crate) const SCRIBE_ACK: &str = "bifrost_scribe_ack_seconds";
 
 /// Scribe's timing of one acknowledged append, its acknowledgement time.
-const SCRIBE_WRITE: &str = "bifrost.scribe.write";
+pub(crate) const SCRIBE_WRITE: &str = "bifrost.scribe.write";
 
 /// The series label of a staged submission.
-const STAGED: (&str, &str) = ("outcome", "staged");
+pub(crate) const STAGED: (&str, &str) = ("outcome", "staged");
 
 /// The series label of work that came from `submit`, which the server
 /// records as a `manual` execution origin.
-const SUBMITTED: (&str, &str) = ("origin", "manual");
+pub(crate) const SUBMITTED: (&str, &str) = ("origin", "manual");
 
 /// The verification runtime's component histograms, each with the label that
 /// names its components: queued execution phases, Verifier blocks, queue SQL,
@@ -756,7 +756,7 @@ fn overhead_p99(population: &Population) -> Reading {
         })
 }
 
-/// Reads `/metrics` and the timing snapshot at each phase boundary of
+/// Reads the benchmark snapshot at each phase boundary of
 /// `schedule` from `start`, and every [`POLL`] through recovery, keeping
 /// each recovery read's backlog for the recovery judgment; `first` is the
 /// pair read at the start. Freezes server CPU and returns the driver CPU
@@ -946,7 +946,7 @@ async fn drain(server: &LocalServer, stopped: Instant) -> Result<Reading, Experi
 }
 
 /// Queued verification items: the queue depth plus both [`OUTBOXES`].
-fn backlog(metrics: &Metrics) -> f64 {
+pub(crate) fn backlog(metrics: &Metrics) -> f64 {
     metrics.sum("wyrd_verification_queue_depth", &[])
         + OUTBOXES
             .iter()
@@ -963,13 +963,9 @@ async fn timings(server: &LocalServer) -> Result<BenchmarkSnapshot, ExperimentEr
     server.timings().await.map_err(ExperimentError::workload)
 }
 
-/// Scrapes the server's `/metrics`.
-///
-/// # Errors
-///
 /// Scribe outbox writes lost for any reason between two scrapes, shed audit
 /// decisions included; missing when a counter went backwards.
-fn lost_writes(first: &Metrics, last: &Metrics) -> Reading {
+pub(crate) fn lost_writes(first: &Metrics, last: &Metrics) -> Reading {
     let labels = ["outbox=\"scribe\""];
     let lost = last.sum("outbox_events_lost_total", &labels)
         - first.sum("outbox_events_lost_total", &labels);
@@ -980,7 +976,11 @@ fn lost_writes(first: &Metrics, last: &Metrics) -> Reading {
     }
 }
 
-/// Returns the scrape failure as a workload error.
+/// Reads the server's benchmark snapshot as metrics.
+///
+/// # Errors
+///
+/// Returns the read failure as a workload error.
 async fn scrape(server: &LocalServer) -> Result<Metrics, ExperimentError> {
     server.metrics().await.map_err(ExperimentError::workload)
 }
@@ -1092,7 +1092,7 @@ fn set_phases(repetition: &mut Repetition, population: &Population) {
 
 /// The mean, milliseconds, of a nanosecond `distribution` as the bounds of
 /// its bucketed total, or why there is none.
-fn mean_ms(distribution: Result<Distribution, String>) -> Reading {
+pub(crate) fn mean_ms(distribution: Result<Distribution, String>) -> Reading {
     match distribution {
         Err(reason) => Reading::missing(reason),
         Ok(distribution) if distribution.is_empty() => {
@@ -1113,7 +1113,7 @@ fn mean_ms(distribution: Result<Distribution, String>) -> Reading {
 /// Every Scribe acknowledgement in `population`: each timed append and
 /// each deduplicated retry's histogram observation, or why neither was
 /// recorded.
-fn acknowledgements(population: &Population) -> Result<Distribution, String> {
+pub(crate) fn acknowledgements(population: &Population) -> Result<Distribution, String> {
     let retries = population.histogram(SCRIBE_ACK, &[]);
     match (population.elapsed(SCRIBE_WRITE, "success"), retries) {
         (Some(mut appends), Ok(retries)) => appends.add(&retries).map(|()| appends),
@@ -1170,7 +1170,7 @@ fn component_totals(population: &Population) -> BTreeMap<String, Distribution> {
 /// Whether `population` holds any verification runtime component
 /// observation, as every executed `verify` records its phases and Verifier
 /// blocks.
-fn observed_components(population: &Population) -> bool {
+pub(crate) fn observed_components(population: &Population) -> bool {
     !component_totals(population).is_empty()
 }
 
@@ -1179,7 +1179,7 @@ fn observed_components(population: &Population) -> bool {
 /// observation, as the bounds of its bucketed total. Components nest and
 /// background work overlaps calls, so they are read beside the client
 /// latency, never summed.
-fn components(population: &Population, acknowledged: usize) -> Vec<String> {
+pub(crate) fn components(population: &Population, acknowledged: usize) -> Vec<String> {
     let calls = acknowledged.max(1) as f64;
     let mut components: Vec<(String, (u64, u64), u64)> = component_totals(population)
         .into_iter()

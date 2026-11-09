@@ -1674,4 +1674,131 @@ mod tests {
             assert_eq!(dispatch(&line(usage), root.path()).await, 2, "{usage:?}");
         }
     }
+
+    /// Every engine's L1 and L2 consumer reads its judged timings, scan
+    /// facts, diagnostic histograms, counters, gauges, and backlog from one
+    /// pair of benchmark snapshots with only the benchmark recorder
+    /// installed: no Prometheus recorder can install beside it, and no
+    /// exposition is rendered or parsed.
+    ///
+    /// # Panics
+    ///
+    /// Panics when a Prometheus recorder installs, or a consumer reads a
+    /// timing, count, gauge, or diagnostic other than the one recorded.
+    #[test]
+    fn all_engine_consumers_read_benchmark_snapshots_without_prometheus() {
+        use std::time::Duration;
+
+        use wyrd_testing::capacity::{Population, QUERY_BOUNDARY};
+        use wyrd_testing::release_server::Metrics;
+
+        use crate::gateway::run::{Durable, Integrity};
+        use crate::verification::run as verify;
+
+        wyrd_benchmark::install().expect("the benchmark recorder installs");
+        assert!(
+            metrics_exporter_prometheus::PrometheusBuilder::new()
+                .install_recorder()
+                .is_err(),
+            "the benchmark recorder is the only one"
+        );
+        let before = wyrd_benchmark::snapshot();
+        let first = Metrics::of_snapshot(&before);
+        let span = tracing::Span::none();
+        let ms = Duration::from_millis;
+
+        // Bifrost: query and write timings, scan facts, ingest counters, and
+        // memtable and Oracle slot gauges.
+        wyrd_benchmark::record_timing(&span, QUERY_BOUNDARY, "success", ms(2), None);
+        wyrd_benchmark::record_scan(&span, "success", Some(10), Some(100));
+        metrics::counter!("bifrost_scribe_memtable_bytes_inserted_total").increment(64);
+        metrics::counter!("oracle_query_files_scanned_total").increment(3);
+        metrics::gauge!("bifrost_scribe_active_memtable_bytes").set(5.0);
+        metrics::gauge!("bifrost_oracle_local_slot_units", "kind" => "limit").set(8.0);
+        // Verification: direct timings and phases, submission and queue-wait
+        // histograms, Scribe acknowledgements, backlog gauges, and losses.
+        wyrd_benchmark::record_timing_parts(
+            &span,
+            "verification.direct",
+            "completed",
+            ms(3),
+            Some(ms(1)),
+            &[("verification.direct.engine", ms(2))],
+        );
+        metrics::histogram!(verify::SUBMIT, "outcome" => "staged").record(0.001);
+        metrics::histogram!(verify::QUEUE_WAIT, "origin" => "manual").record(0.002);
+        metrics::histogram!(verify::SCRIBE_ACK).record(0.003);
+        wyrd_benchmark::record_timing(&span, verify::SCRIBE_WRITE, "success", ms(3), None);
+        metrics::gauge!("wyrd_verification_queue_depth").set(3.0);
+        metrics::gauge!("wyrd_verification_queue_depth").decrement(1.0);
+        metrics::gauge!("outbox_pending", "outbox" => "scribe").set(1.0);
+        metrics::counter!("outbox_events_lost_total", "outbox" => "scribe", "reason" => "shed")
+            .increment(1);
+        // Gateway: handoff timings, capture and outbox write counts, the
+        // accounting phase's observation count, and the active-call gauge.
+        wyrd_benchmark::record_timing(&span, "gateway.buffered", "succeeded", ms(4), Some(ms(1)));
+        metrics::counter!("wyrd_gateway_capture_total", "outcome" => "staged").increment(2);
+        metrics::counter!("wyrd_gateway_capture_total", "outcome" => "dropped").increment(1);
+        metrics::histogram!("outbox_write_seconds", "outbox" => "scribe").record(0.000_5);
+        metrics::counter!("outbox_items_written_total", "outbox" => "scribe").increment(2);
+        metrics::counter!("outbox_bytes_written_total", "outbox" => "scribe").increment(256);
+        metrics::histogram!("wyrd_gateway_phase_duration_seconds", "phase" => "account")
+            .record(0.000_1);
+        metrics::gauge!("wyrd_gateway_active_calls").set(0.0);
+
+        let after = wyrd_benchmark::snapshot();
+        let last = Metrics::of_snapshot(&after);
+        let population = Population::between(&before, after).expect("one process");
+        assert!(population.invalid.is_empty(), "{:?}", population.invalid);
+        let grew = |family: &str, labels: &[&str]| last.sum(family, labels) - first.sum(family, labels);
+
+        assert_eq!(population.count(QUERY_BOUNDARY), 1);
+        assert_eq!(population.scans.len(), 1);
+        assert_eq!(grew("bifrost_scribe_memtable_bytes_inserted_total", &[]), 64.0);
+        assert_eq!(grew("oracle_query_files_scanned_total", &[]), 3.0);
+        assert_eq!(last.sum("bifrost_scribe_active_memtable_bytes", &[]), 5.0);
+        assert_eq!(
+            last.sum("bifrost_oracle_local_slot_units", &["kind=\"limit\""]),
+            8.0
+        );
+
+        assert!(population.residuals("verification.direct", "completed").is_ok());
+        assert!(verify::observed_components(&population));
+        assert_eq!(verify::components(&population, 1).len(), 2);
+        for histogram in [
+            population.histogram(verify::SUBMIT, &[verify::STAGED]),
+            population.histogram(verify::QUEUE_WAIT, &[verify::SUBMITTED]),
+        ] {
+            assert_eq!(verify::mean_ms(histogram).samples, Some(1));
+        }
+        assert_eq!(verify::mean_ms(verify::acknowledgements(&population)).samples, Some(2));
+        assert_eq!(verify::backlog(&last), 3.0, "two queued and one pending");
+        assert_eq!(verify::lost_writes(&first, &last).value, Some(1.0));
+
+        assert_eq!(
+            population
+                .residuals("gateway.buffered", "succeeded")
+                .map(|residuals| residuals.len()),
+            Ok(1)
+        );
+        let integrity = Integrity::between(&first, &last);
+        assert_eq!(
+            (integrity.staged, integrity.dropped, integrity.written, integrity.shed),
+            (2.0, 1.0, 1.0, 1.0)
+        );
+        assert_eq!(integrity.unwritten(), None);
+        assert_eq!(
+            Durable::between(&first, &last),
+            Durable {
+                items: 2.0,
+                bytes: 256.0
+            }
+        );
+        assert_eq!(
+            grew("wyrd_gateway_phase_duration_seconds_count", &["phase=\"account\""]),
+            1.0,
+            "admitted calls are the accounting phase's observations"
+        );
+        assert_eq!(last.sum("wyrd_gateway_active_calls", &[]), 0.0);
+    }
 }

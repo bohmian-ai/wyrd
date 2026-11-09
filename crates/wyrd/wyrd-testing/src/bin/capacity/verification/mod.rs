@@ -7,7 +7,7 @@
 //! one Service per application, and each application loads its pulled Service
 //! bundle under that Service's own Card-bound key, so every call is the
 //! public Rust client's `observe().verify` or `observe().submit` exactly as
-//! production makes it. Evidence comes from client timings, `/metrics`, and
+//! production makes it. Evidence comes from client timings, the benchmark snapshot, and
 //! the OS's readings of the server process.
 //!
 //! - **L1, `direct-verify`:** closed-loop direct `verify` at 1 and 64
@@ -22,7 +22,7 @@
 //!   through Scribe into Bifrost, so evidence writes and the queued backlog
 //!   progress in the same window.
 
-mod run;
+pub(crate) mod run;
 mod workload;
 
 use std::time::Duration;

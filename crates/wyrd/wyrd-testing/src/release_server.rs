@@ -594,9 +594,9 @@ impl Metrics {
         )
     }
 
-    /// Parses a Prometheus text exposition, skipping comments. Scrapes come
-    /// from [`LocalServer::metrics`]; tests of scrape consumers build one
-    /// from literal text.
+    /// Parses a Prometheus text exposition, skipping comments: a production
+    /// server's `/metrics` in its metrics contract tests, or literal text in
+    /// tests of scrape consumers. A benchmark reads [`Self::of_snapshot`].
     pub fn parse(exposition: &str) -> Self {
         Self(
             exposition

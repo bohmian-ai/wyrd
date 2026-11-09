@@ -55,11 +55,14 @@ configuration declares server limits.
 
 ## Measurement
 
-- **One latency recorder.** `wyrd-benchmark` owns the opt-in HDR
-  distributions for every engine. It is disabled in ordinary deployments.
-  Benchmark processes keep Prometheus health counters and resource gauges,
-  but do not collect Prometheus duration histograms. CPU and heap profiles
-  remain diagnostic artifacts, not latency recorders.
+- **One recorder.** A benchmark server installs `wyrd-benchmark` as its only
+  metrics recorder before it registers any metric: request timings,
+  counters, gauges and diagnostic histograms all land in the snapshots it
+  serves at `/benchmark/snapshot` on the loopback metrics port, and no
+  Prometheus recorder or exporter runs. A duration that has both a timing
+  and a production histogram is recorded only as the timing. Ordinary
+  deployments install Prometheus and record nothing here. CPU and heap
+  profiles and the OS's CPU and memory readings remain separate sources.
 - **Latency is server-side.** Each judged request is timed inside the server
   from handler entry until its result is ready, its write is acknowledged, or
   its response is handed off, into bounded HDR histograms (3 significant
@@ -176,11 +179,6 @@ What each engine covers:
 - **Gateway.**
   - L1 `overhead` runs buffered, streamed, and 64 KiB capture calls at
     1 and 64 clients. Added overhead p99 must be below 500 µs at 64.
-    Its timing snapshots also retain Gateway phases: capture-slot waiting
-    is part of admission; answer-resume measures send until the waiting
-    handler resumes; capture measures post-answer projection and staging.
-    These distributions describe different, sometimes overlapping boundaries
-    and their percentiles must not be added.
   - L2 `capacity` runs four contending tenants. Default p99 limits:
     completion ≤ 200 ms, first token ≤ 350 ms, full stream ≤ 1,100 ms.
     Override them with `--max-*-ms`. Inter-chunk lag is diagnostic only.

@@ -33,6 +33,13 @@ inventing it.
 
 ## Decompose by outcome
 
+When the packet contains `design/notes.md`, read it and the relevant supplemental
+files for implementation research, alternatives, and rationale. Revalidate this
+research against the approved spec and current owners, callers, and tests.
+Design finalization grants no approval; proposed private mechanics are guidance,
+not task requirements. Do not revive a rejected approach without new evidence
+or let design notes override the approved spec or current repository authority.
+
 Before writing tasks, trace each capability through its existing owners,
 callers, and tests. Record source-backed reuse evidence in the task's
 implementation reference: existing owner/symbol, inspected callers/tests,

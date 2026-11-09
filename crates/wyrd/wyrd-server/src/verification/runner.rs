@@ -481,7 +481,6 @@ impl VerifierRunner {
             &self.state,
             Execution {
                 caller: &caller,
-                evidence: &evidence,
                 routes: &routes,
                 subject: GatewayCallContext {
                     workload_card_uid: run

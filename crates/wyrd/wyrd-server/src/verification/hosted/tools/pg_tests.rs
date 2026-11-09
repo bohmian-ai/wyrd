@@ -202,12 +202,7 @@ fn workspace_tools_need_a_declared_workspace() {
         let tools = HostedTools::new(
             state().await,
             caller([Permission::tool_invoke_any()]),
-            Arc::new(TenantEvidence::new(
-                state().await,
-                caller([]),
-                BTreeMap::new(),
-                limits,
-            )),
+            Arc::new(TenantEvidence::new(state().await, caller([]), limits)),
             Arc::new(Workspaces::new(limits)),
             idle_sandbox(limits).await,
             limits,
@@ -249,12 +244,7 @@ fn retries_keep_their_actions_spent_time() {
         let tools = HostedTools::new(
             state().await,
             caller([]),
-            Arc::new(TenantEvidence::new(
-                state().await,
-                caller([]),
-                BTreeMap::new(),
-                limits,
-            )),
+            Arc::new(TenantEvidence::new(state().await, caller([]), limits)),
             Arc::new(Workspaces::new(limits)),
             idle_sandbox(limits).await,
             limits,

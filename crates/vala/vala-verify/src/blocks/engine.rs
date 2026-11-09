@@ -16,6 +16,7 @@
 //! never subject failures; only the execution-wide deadline and orchestration
 //! faults surface as [`EngineError`].
 
+use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::num::NonZeroUsize;
 use std::sync::Arc;
@@ -317,6 +318,11 @@ impl VerificationEngine {
     /// requirements by step, then whole-Verifier requirements in declaration
     /// order), every step in plan order, and the evidence unchanged.
     ///
+    /// The evidence has one owner for the whole run: the engine pins it,
+    /// with its synthetic attachment slots, behind one [`Arc`] that the host
+    /// reader is admitted with and every block resolves against, and moves
+    /// it back out into the outcome once every block has settled.
+    ///
     /// The deadline is checked before any work and again before the verdict
     /// is published, so work that completes without suspending, such as an
     /// empty Verifier, never reports a verdict outside its budget; pending
@@ -357,6 +363,7 @@ impl VerificationEngine {
         let plan = spec.plan().map_err(EngineError::Plan)?;
         let (ledger, evidence) = timeout_at(deadline, async {
             let (evidence, attached) = self.attach(&spec, evidence).await?;
+            let evidence = Arc::new(evidence);
             if let Some(reader) = &self.evidence {
                 reader.admit(&spec.inputs, &evidence).await?;
             }
@@ -388,7 +395,9 @@ impl VerificationEngine {
             verdict,
             requirements,
             steps,
-            evidence,
+            // Every block has settled and readers keep only a weak view, so
+            // this is the last owner and the evidence moves out uncopied.
+            evidence: Arc::unwrap_or_clone(evidence),
         })
     }
 
@@ -736,8 +745,8 @@ impl VerificationEngine {
                 expected,
                 ..
             } => {
-                let observed = inputs.get("value").map_or(Value::Null, json);
-                let compared = match (each, &observed) {
+                let observed = inputs.get("value").map_or(Cow::Owned(Value::Null), json);
+                let compared = match (each, &*observed) {
                     (Some(_), Value::Array(items)) if items.is_empty() => {
                         timer.finish(true);
                         return Ok(Judged::inconclusive(EMPTY_SELECTION.to_owned()));
@@ -1114,17 +1123,14 @@ impl Attempted {
                 StepResult {
                     id: step.id.clone(),
                     status: StepStatus::Succeeded,
-                    output: Some(output.output.clone()),
+                    output: Some(output.output),
                     attempts: self.attempts,
                     duration_ms,
                     reason: None,
                     provenance: output.provenance,
                     tool_calls: output.tool_calls,
                 },
-                Settled::Succeeded {
-                    output: output.output,
-                    sources,
-                },
+                Settled::Succeeded { sources },
             ),
             Err(reason) => (
                 StepResult {
@@ -1290,12 +1296,13 @@ fn requirement_at(spec: &VerifierSpec, (step, at): Key) -> &Requirement {
     }
 }
 
-/// The JSON a comparison reads: evidence compares as its declaration.
-fn json(input: &CallInput) -> Value {
+/// The JSON a comparison reads: a selected JSON value itself, borrowed, and
+/// evidence as its declaration's JSON form.
+fn json(input: &CallInput) -> Cow<'_, Value> {
     match &input.value {
-        CallValue::Json(value) => value.clone(),
+        CallValue::Json(value) => Cow::Borrowed(value),
         CallValue::Evidence(declaration) => {
-            serde_json::to_value(declaration).unwrap_or(Value::Null)
+            Cow::Owned(serde_json::to_value(declaration).unwrap_or(Value::Null))
         }
     }
 }

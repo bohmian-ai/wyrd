@@ -428,11 +428,15 @@ async fn no_step_verifier_judges_inputs_and_traces() {
 
 /// Context capture applies the existing rule to actual values: `hash`
 /// stores the digest and `redact` stores nothing, without changing outcomes.
+/// A hashed digest is the SHA-256 of exactly the compact `serde_json` bytes,
+/// pinned against hand-written bytes for nested, escaped and Unicode values.
 ///
 /// # Panics
 /// Panics when a captured actual value differs.
 #[tokio::test(start_paused = true)]
 async fn context_capture_hashes_or_redacts_actual_values() {
+    use sha2::Digest as _;
+
     let script = Arc::new(Script::default());
     for (capture, expected) in [
         (
@@ -460,6 +464,39 @@ async fn context_capture_hashes_or_redacts_actual_values() {
         .expect("outcome");
         assert_eq!(outcome.verdict, VerificationVerdict::Passed);
         assert_eq!(requirement(&outcome, "count").actual, expected, "{capture}");
+    }
+
+    // Digests of the compact serde_json bytes, written out by hand: member
+    // order as parsed, `"`, `\\`, newline and control escapes, and raw UTF-8.
+    let spec = verifier(json!({
+        "inputs": {"answer": {"type": "json"}},
+        "requirements": [{"id": "count", "statement": "Count", "check": {"kind": "assert", "path": "inputs.answer", "operator": "is_not_null"}}],
+        "context_capture": "hash"
+    }));
+    let answer: Value = serde_json::from_str(
+        r#"{"z":[1,-2.5,true,null,{"y":{}}],"a":"\u00e9 \u2603 \"q\" \\ \n \u0001"}"#,
+    )
+    .expect("answer");
+    for (answer, bytes) in [
+        (
+            answer,
+            "{\"z\":[1,-2.5,true,null,{\"y\":{}}],\"a\":\"\u{e9} \u{2603} \\\"q\\\" \\\\ \\n \\u0001\"}",
+        ),
+        (json!("\u{1f980}"), "\"\u{1f980}\""),
+    ] {
+        let outcome = run(
+            &engine(&script, InMemoryTraceSource::new(), 1),
+            &spec,
+            json!({"answer": answer}),
+        )
+        .await
+        .expect("outcome");
+        let digest = format!("{:x}", sha2::Sha256::digest(bytes.as_bytes()));
+        assert_eq!(
+            requirement(&outcome, "count").actual,
+            Some(Value::String(digest)),
+            "{bytes}"
+        );
     }
 }
 

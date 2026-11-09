@@ -300,7 +300,7 @@ async fn execute(
         VerificationControl::new(&state)
             .execute(
                 &caller,
-                &request,
+                request,
                 edge_timer.map(|Extension(timer)| timer).as_ref(),
                 arrival.map(|Extension(arrival)| arrival),
             )

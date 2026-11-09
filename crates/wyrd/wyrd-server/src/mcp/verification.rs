@@ -215,7 +215,7 @@ impl WyrdMcpHandler {
                 &control
                     .execute(
                         &caller,
-                        &serde_json::from_value(arguments).map_err(invalid)?,
+                        serde_json::from_value(arguments).map_err(invalid)?,
                         None,
                         None,
                     )

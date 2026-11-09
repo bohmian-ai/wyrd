@@ -74,10 +74,10 @@ impl Missing {
 /// The final state of one step as later blocks read it.
 #[derive(Debug, Clone, PartialEq)]
 pub(super) enum Settled {
-    /// The action produced `output`, derived from the `sources` slots.
+    /// The action succeeded, deriving its output from the `sources` slots.
+    /// The output itself has one owner, the step's reported
+    /// [`StepResult::output`], which `steps.<id>.output` references read.
     Succeeded {
-        /// The action output.
-        output: Value,
         /// Original slots the action read.
         sources: BTreeSet<SlotName>,
     },
@@ -209,11 +209,20 @@ impl<'a> Scope<'a> {
                     None => Err(Missing::failed(format!("input `{slot}` was not supplied"))),
                 }
             }
-            ReferenceRoot::StepOutput(step) => match self.step(step) {
-                Some(Settled::Succeeded { output, sources }) => select(output, &reference.path)
+            ReferenceRoot::StepOutput(step) => match self.ledger.get(step) {
+                Some(Done::Step {
+                    result,
+                    state: Settled::Succeeded { sources },
+                }) => result
+                    .output
+                    .as_ref()
+                    .and_then(|output| select(output, &reference.path))
                     .map(|value| json_input(value, sources.clone()))
                     .ok_or_else(unresolved),
-                Some(Settled::NoOutput { gap, .. }) => Err(Missing {
+                Some(Done::Step {
+                    state: Settled::NoOutput { gap, .. },
+                    ..
+                }) => Err(Missing {
                     cause: gap.cause,
                     reason: format!(
                         "step `{}` produced no output: {}",
@@ -221,7 +230,7 @@ impl<'a> Scope<'a> {
                         gap.reason
                     ),
                 }),
-                None => Err(unresolved()),
+                _ => Err(unresolved()),
             },
             ReferenceRoot::StepStatus(step) => {
                 let settled = self.step(step).ok_or_else(unresolved)?;

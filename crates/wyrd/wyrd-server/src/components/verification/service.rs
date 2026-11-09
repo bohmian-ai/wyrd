@@ -454,7 +454,7 @@ impl<'a> VerificationControl<'a> {
     pub(crate) async fn execute(
         &self,
         caller: &Caller,
-        request: &VerificationRequest,
+        request: VerificationRequest,
         edge_timer: Option<&EdgeTimer>,
         arrival: Option<RequestArrival>,
     ) -> Result<VerificationResult, WyrdError> {
@@ -482,7 +482,7 @@ impl<'a> VerificationControl<'a> {
     async fn run_direct(
         &self,
         caller: &Caller,
-        request: &VerificationRequest,
+        mut request: VerificationRequest,
         edge_timer: Option<&EdgeTimer>,
         telemetry: &ExecutionTelemetry,
     ) -> (&'static str, Result<VerificationResult, WyrdError>) {
@@ -497,7 +497,7 @@ impl<'a> VerificationControl<'a> {
             request.verifier_card_uid, request.card_uid
         );
         let admitted = telemetry.time(Phase::Admit, || {
-            environment_tag(request)?;
+            environment_tag(&request)?;
             self.authorize_run(
                 caller,
                 &request.verifier_card_uid,
@@ -519,7 +519,7 @@ impl<'a> VerificationControl<'a> {
         let target = match telemetry
             .phase(
                 Phase::Load,
-                self.resolve(caller, request)
+                self.resolve(caller, &request)
                     .instrument(tracing::info_span!("verification.load")),
             )
             .await
@@ -545,7 +545,6 @@ impl<'a> VerificationControl<'a> {
             self.state,
             Execution {
                 caller: &executor,
-                evidence: &request.inputs,
                 routes: &request.execution_route_overrides,
                 subject: GatewayCallContext {
                     workload_card_uid: wyrd_runtime::owning_root(
@@ -570,13 +569,13 @@ impl<'a> VerificationControl<'a> {
                 Phase::Engine,
                 engine.run(
                     Arc::clone(&target.spec),
-                    request.inputs.clone(),
+                    std::mem::take(&mut request.inputs),
                     tokio::time::Instant::now() + timeout,
                 ),
             )
             .instrument(tracing::info_span!("verification.engine"))
             .await;
-        let outcome = match ran {
+        let mut outcome = match ran {
             Ok(outcome) => outcome,
             Err(EngineError::DeadlineExceeded) => {
                 return (
@@ -627,17 +626,28 @@ impl<'a> VerificationControl<'a> {
             }
             Err(error) => return ("errored", Err(WyrdError::internal(error.to_string()))),
         };
+        // The engine returned the one evidence copy it ran on; stage the
+        // caller's declarations from it, apart from the engine's synthetic
+        // attachment slots, which no Verifier declares, then hand the whole
+        // evidence back to the outcome.
+        let mut attached: BTreeMap<_, _> = outcome
+            .evidence
+            .extract_if(.., |slot, _| !target.spec.inputs.contains_key(slot))
+            .collect();
+        request.inputs = std::mem::take(&mut outcome.evidence);
         telemetry.time(Phase::Stage, || {
             Self::stage_direct(
                 &staged,
                 caller,
                 execution_id,
-                request,
+                &request,
                 &target,
                 &outcome,
                 started_at,
             );
         });
+        attached.append(&mut request.inputs);
+        outcome.evidence = attached;
         (
             "completed",
             Ok(VerificationResult {

@@ -111,7 +111,10 @@ pub trait EvidenceReader: Send + Sync {
     /// `slots` before any block runs.
     ///
     /// `evidence` holds the caller's slots plus one undeclared slot per
-    /// fixed Artifact attachment file; every admitted slot is citable.
+    /// fixed Artifact attachment file; every admitted slot is citable. It is
+    /// the run's one evidence backing: a reader that keeps it for later
+    /// citations keeps an [`Arc::downgrade`] view, so the engine moves the
+    /// evidence uncopied into its outcome once every block has settled.
     ///
     /// [`VerificationEngine::run`](super::VerificationEngine::run) calls it
     /// once, after its own slot validation, for checks only the host can
@@ -125,7 +128,7 @@ pub trait EvidenceReader: Send + Sync {
     async fn admit(
         &self,
         _slots: &BTreeMap<SlotName, InputSlot>,
-        _evidence: &BTreeMap<SlotName, InputDeclaration>,
+        _evidence: &Arc<BTreeMap<SlotName, InputDeclaration>>,
     ) -> Result<(), EngineError> {
         Ok(())
     }

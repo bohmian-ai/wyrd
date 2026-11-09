@@ -126,17 +126,17 @@ pub fn capture_actual(
 /// `serde_json/preserve_order`, so key order is insertion or parse order, not
 /// sorted: equal objects built in different key orders hash differently.
 /// This is not RFC 8785 JCS; changing the byte form changes every stored
-/// digest.
+/// digest. The bytes stream straight into the hasher, so no serialized copy
+/// of `value` is held.
 ///
 /// # Errors
 /// Returns [`ExecError::ContextHashFailed`] with the serializer message when
 /// `serde_json` cannot serialize `value`.
 fn hash_context_value(value: &serde_json::Value) -> Result<String, ExecError> {
-    let bytes = serde_json::to_vec(value).map_err(|error| ExecError::ContextHashFailed {
+    let mut hasher = Sha256::new();
+    serde_json::to_writer(&mut hasher, value).map_err(|error| ExecError::ContextHashFailed {
         reason: error.to_string(),
     })?;
-    let mut hasher = Sha256::new();
-    hasher.update(&bytes);
     Ok(format!("{:x}", hasher.finalize()))
 }
 

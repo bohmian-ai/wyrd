@@ -30,6 +30,7 @@
 //!
 //! No clocks, no env, no RNG. NaN comparisons fall through as `passed = false`.
 
+use std::borrow::Cow;
 use std::net::{Ipv4Addr, Ipv6Addr};
 use std::str::FromStr;
 
@@ -45,16 +46,17 @@ use crate::error::ExecError;
 ///
 /// `observed` and `expected` are populated with the values the operator
 /// actually compared, so result rendering can treat every operator family
-/// consistently.
+/// consistently. A compared operand is borrowed, so judging copies no input;
+/// only derived values, such as a normalized number or a length, are owned.
 #[derive(Debug, Clone, PartialEq)]
-pub struct OperatorVerdict {
+pub struct OperatorVerdict<'a> {
     pub passed: bool,
-    pub observed: Option<Value>,
-    pub expected: Option<Value>,
+    pub observed: Option<Cow<'a, Value>>,
+    pub expected: Option<Cow<'a, Value>>,
 }
 
-impl OperatorVerdict {
-    fn outcome(passed: bool, observed: Value, expected: Value) -> Self {
+impl<'a> OperatorVerdict<'a> {
+    fn outcome(passed: bool, observed: Cow<'a, Value>, expected: Cow<'a, Value>) -> Self {
         Self {
             passed,
             observed: Some(observed),
@@ -62,7 +64,7 @@ impl OperatorVerdict {
         }
     }
 
-    fn type_test(passed: bool, observed: Value) -> Self {
+    fn type_test(passed: bool, observed: Cow<'a, Value>) -> Self {
         Self {
             passed,
             observed: Some(observed),
@@ -74,11 +76,11 @@ impl OperatorVerdict {
 /// Evaluate `op` against `(left, right)`.
 ///
 /// See module docs for the semantic contract.
-pub fn evaluate_operator(
-    left: &Value,
+pub fn evaluate_operator<'a>(
+    left: &'a Value,
     op: &ComparisonOperator,
-    right: &Value,
-) -> Result<OperatorVerdict, ExecError> {
+    right: &'a Value,
+) -> Result<OperatorVerdict<'a>, ExecError> {
     use ComparisonOperator::{
         AllOf, AnyOf, ApproximatelyEquals, BetweenPercentiles, Contains, ContainsIgnoreCase,
         CosineSimilarityAtLeast, DivergenceLessThan, EndsWith, Equals, GreaterThan,
@@ -94,29 +96,45 @@ pub fn evaluate_operator(
     match op {
         Equals => Ok(OperatorVerdict::outcome(
             json_equals(left, right),
-            left.clone(),
-            right.clone(),
+            Cow::Borrowed(left),
+            Cow::Borrowed(right),
         )),
         NotEquals => Ok(OperatorVerdict::outcome(
             !json_equals(left, right),
-            left.clone(),
-            right.clone(),
+            Cow::Borrowed(left),
+            Cow::Borrowed(right),
         )),
         GreaterThan => {
             let (l, r) = require_numbers(op, left, right)?;
-            Ok(OperatorVerdict::outcome(l > r, json_num(l), json_num(r)))
+            Ok(OperatorVerdict::outcome(
+                l > r,
+                Cow::Owned(json_num(l)),
+                Cow::Owned(json_num(r)),
+            ))
         }
         GreaterThanOrEquals => {
             let (l, r) = require_numbers(op, left, right)?;
-            Ok(OperatorVerdict::outcome(l >= r, json_num(l), json_num(r)))
+            Ok(OperatorVerdict::outcome(
+                l >= r,
+                Cow::Owned(json_num(l)),
+                Cow::Owned(json_num(r)),
+            ))
         }
         LessThan => {
             let (l, r) = require_numbers(op, left, right)?;
-            Ok(OperatorVerdict::outcome(l < r, json_num(l), json_num(r)))
+            Ok(OperatorVerdict::outcome(
+                l < r,
+                Cow::Owned(json_num(l)),
+                Cow::Owned(json_num(r)),
+            ))
         }
         LessThanOrEquals => {
             let (l, r) = require_numbers(op, left, right)?;
-            Ok(OperatorVerdict::outcome(l <= r, json_num(l), json_num(r)))
+            Ok(OperatorVerdict::outcome(
+                l <= r,
+                Cow::Owned(json_num(l)),
+                Cow::Owned(json_num(r)),
+            ))
         }
         InRange {
             min,
@@ -132,8 +150,10 @@ pub fn evaluate_operator(
             };
             Ok(OperatorVerdict::outcome(
                 passed,
-                json_num(l),
-                serde_json::json!({ "min": *min, "max": *max, "inclusive": *inclusive }),
+                Cow::Owned(json_num(l)),
+                Cow::Owned(
+                    serde_json::json!({ "min": *min, "max": *max, "inclusive": *inclusive }),
+                ),
             ))
         }
         NotInRange {
@@ -150,65 +170,74 @@ pub fn evaluate_operator(
             };
             Ok(OperatorVerdict::outcome(
                 !inside,
-                json_num(l),
-                serde_json::json!({ "min": *min, "max": *max, "inclusive": *inclusive }),
+                Cow::Owned(json_num(l)),
+                Cow::Owned(
+                    serde_json::json!({ "min": *min, "max": *max, "inclusive": *inclusive }),
+                ),
             ))
         }
         ApproximatelyEquals { tolerance } => {
             let (l, r) = require_numbers(op, left, right)?;
             let passed = (l - r).abs() <= *tolerance;
-            Ok(OperatorVerdict::outcome(passed, json_num(l), json_num(r)))
+            Ok(OperatorVerdict::outcome(
+                passed,
+                Cow::Owned(json_num(l)),
+                Cow::Owned(json_num(r)),
+            ))
         }
         IsPositive => {
             let l = require_number_left(op, left)?;
-            Ok(OperatorVerdict::type_test(l > 0.0, json_num(l)))
+            Ok(OperatorVerdict::type_test(l > 0.0, Cow::Owned(json_num(l))))
         }
         IsNegative => {
             let l = require_number_left(op, left)?;
-            Ok(OperatorVerdict::type_test(l < 0.0, json_num(l)))
+            Ok(OperatorVerdict::type_test(l < 0.0, Cow::Owned(json_num(l))))
         }
         IsZero => {
             let l = require_number_left(op, left)?;
-            Ok(OperatorVerdict::type_test(l == 0.0, json_num(l)))
+            Ok(OperatorVerdict::type_test(
+                l == 0.0,
+                Cow::Owned(json_num(l)),
+            ))
         }
         Contains => {
             let (l, r) = require_strings(op, left, right)?;
             Ok(OperatorVerdict::outcome(
                 l.contains(r),
-                str_val(l),
-                str_val(r),
+                Cow::Borrowed(left),
+                Cow::Borrowed(right),
             ))
         }
         NotContains => {
             let (l, r) = require_strings(op, left, right)?;
             Ok(OperatorVerdict::outcome(
                 !l.contains(r),
-                str_val(l),
-                str_val(r),
+                Cow::Borrowed(left),
+                Cow::Borrowed(right),
             ))
         }
         ContainsIgnoreCase => {
             let (l, r) = require_strings(op, left, right)?;
             Ok(OperatorVerdict::outcome(
                 l.to_lowercase().contains(&r.to_lowercase()),
-                str_val(l),
-                str_val(r),
+                Cow::Borrowed(left),
+                Cow::Borrowed(right),
             ))
         }
         StartsWith => {
             let (l, r) = require_strings(op, left, right)?;
             Ok(OperatorVerdict::outcome(
                 l.starts_with(r),
-                str_val(l),
-                str_val(r),
+                Cow::Borrowed(left),
+                Cow::Borrowed(right),
             ))
         }
         EndsWith => {
             let (l, r) = require_strings(op, left, right)?;
             Ok(OperatorVerdict::outcome(
                 l.ends_with(r),
-                str_val(l),
-                str_val(r),
+                Cow::Borrowed(left),
+                Cow::Borrowed(right),
             ))
         }
         MatchesRegex { pattern } => {
@@ -216,8 +245,8 @@ pub fn evaluate_operator(
             let re = compile_regex(op, pattern)?;
             Ok(OperatorVerdict::outcome(
                 re.is_match(l),
-                str_val(l),
-                Value::String(pattern.clone()),
+                Cow::Borrowed(left),
+                Cow::Owned(Value::String(pattern.clone())),
             ))
         }
         NotMatchesRegex { pattern } => {
@@ -225,79 +254,82 @@ pub fn evaluate_operator(
             let re = compile_regex(op, pattern)?;
             Ok(OperatorVerdict::outcome(
                 !re.is_match(l),
-                str_val(l),
-                Value::String(pattern.clone()),
+                Cow::Borrowed(left),
+                Cow::Owned(Value::String(pattern.clone())),
             ))
         }
         IsEmail => {
             let l = require_string_left(op, left)?;
             Ok(OperatorVerdict::type_test(
                 validate_email_lite(l),
-                str_val(l),
+                Cow::Borrowed(left),
             ))
         }
         IsUrl => {
             let l = require_string_left(op, left)?;
-            Ok(OperatorVerdict::type_test(validate_url_lite(l), str_val(l)))
+            Ok(OperatorVerdict::type_test(
+                validate_url_lite(l),
+                Cow::Borrowed(left),
+            ))
         }
         IsUuid => {
             let l = require_string_left(op, left)?;
             Ok(OperatorVerdict::type_test(
                 Uuid::parse_str(l).is_ok(),
-                str_val(l),
+                Cow::Borrowed(left),
             ))
         }
         IsIpv4 => {
             let l = require_string_left(op, left)?;
             Ok(OperatorVerdict::type_test(
                 Ipv4Addr::from_str(l).is_ok(),
-                str_val(l),
+                Cow::Borrowed(left),
             ))
         }
         IsIpv6 => {
             let l = require_string_left(op, left)?;
             Ok(OperatorVerdict::type_test(
                 Ipv6Addr::from_str(l).is_ok(),
-                str_val(l),
+                Cow::Borrowed(left),
             ))
         }
         HasMinLength { min } => {
             let l = require_string_left(op, left)?;
             Ok(OperatorVerdict::outcome(
                 l.chars().count() >= *min,
-                str_val(l),
-                serde_json::json!({ "min": *min }),
+                Cow::Borrowed(left),
+                Cow::Owned(serde_json::json!({ "min": *min })),
             ))
         }
         HasMaxLength { max } => {
             let l = require_string_left(op, left)?;
             Ok(OperatorVerdict::outcome(
                 l.chars().count() <= *max,
-                str_val(l),
-                serde_json::json!({ "max": *max }),
+                Cow::Borrowed(left),
+                Cow::Owned(serde_json::json!({ "max": *max })),
             ))
         }
         IsJson => {
             let l = require_string_left(op, left)?;
             Ok(OperatorVerdict::type_test(
                 serde_json::from_str::<Value>(l).is_ok(),
-                str_val(l),
+                Cow::Borrowed(left),
             ))
         }
         In => {
             let arr = require_array_right(op, right)?;
             Ok(OperatorVerdict::outcome(
                 arr.iter().any(|v| json_equals(left, v)),
-                left.clone(),
-                right.clone(),
+                Cow::Borrowed(left),
+                Cow::Borrowed(right),
             ))
         }
         NotIn => {
             let arr = require_array_right(op, right)?;
             Ok(OperatorVerdict::outcome(
                 !arr.iter().any(|v| json_equals(left, v)),
-                left.clone(),
-                right.clone(),
+                Cow::Borrowed(left),
+                Cow::Borrowed(right),
             ))
         }
         IsSubset => {
@@ -305,8 +337,8 @@ pub fn evaluate_operator(
             Ok(OperatorVerdict::outcome(
                 l.iter()
                     .all(|item| r.iter().any(|other| json_equals(item, other))),
-                left.clone(),
-                right.clone(),
+                Cow::Borrowed(left),
+                Cow::Borrowed(right),
             ))
         }
         IsSuperset => {
@@ -314,8 +346,8 @@ pub fn evaluate_operator(
             Ok(OperatorVerdict::outcome(
                 r.iter()
                     .all(|item| l.iter().any(|other| json_equals(item, other))),
-                left.clone(),
-                right.clone(),
+                Cow::Borrowed(left),
+                Cow::Borrowed(right),
             ))
         }
         IsDisjoint => {
@@ -323,8 +355,8 @@ pub fn evaluate_operator(
             Ok(OperatorVerdict::outcome(
                 !l.iter()
                     .any(|item| r.iter().any(|other| json_equals(item, other))),
-                left.clone(),
-                right.clone(),
+                Cow::Borrowed(left),
+                Cow::Borrowed(right),
             ))
         }
         AllOf => {
@@ -332,8 +364,8 @@ pub fn evaluate_operator(
             Ok(OperatorVerdict::outcome(
                 r.iter()
                     .all(|item| l.iter().any(|other| json_equals(item, other))),
-                left.clone(),
-                right.clone(),
+                Cow::Borrowed(left),
+                Cow::Borrowed(right),
             ))
         }
         AnyOf => {
@@ -341,8 +373,8 @@ pub fn evaluate_operator(
             Ok(OperatorVerdict::outcome(
                 r.iter()
                     .any(|item| l.iter().any(|other| json_equals(item, other))),
-                left.clone(),
-                right.clone(),
+                Cow::Borrowed(left),
+                Cow::Borrowed(right),
             ))
         }
         NoneOf => {
@@ -350,40 +382,40 @@ pub fn evaluate_operator(
             Ok(OperatorVerdict::outcome(
                 !r.iter()
                     .any(|item| l.iter().any(|other| json_equals(item, other))),
-                left.clone(),
-                right.clone(),
+                Cow::Borrowed(left),
+                Cow::Borrowed(right),
             ))
         }
         IsEmpty => {
             let len = container_length(op, left)?;
-            Ok(OperatorVerdict::type_test(len == 0, left.clone()))
+            Ok(OperatorVerdict::type_test(len == 0, Cow::Borrowed(left)))
         }
         IsNonEmpty => {
             let len = container_length(op, left)?;
-            Ok(OperatorVerdict::type_test(len > 0, left.clone()))
+            Ok(OperatorVerdict::type_test(len > 0, Cow::Borrowed(left)))
         }
         Length { expected } => {
             let len = container_length(op, left)?;
             Ok(OperatorVerdict::outcome(
                 len == *expected,
-                serde_json::json!(len),
-                serde_json::json!(*expected),
+                Cow::Owned(serde_json::json!(len)),
+                Cow::Owned(serde_json::json!(*expected)),
             ))
         }
         LengthGreaterThan { min } => {
             let len = container_length(op, left)?;
             Ok(OperatorVerdict::outcome(
                 len > *min,
-                serde_json::json!(len),
-                serde_json::json!({ "min": *min }),
+                Cow::Owned(serde_json::json!(len)),
+                Cow::Owned(serde_json::json!({ "min": *min })),
             ))
         }
         LengthLessThan { max } => {
             let len = container_length(op, left)?;
             Ok(OperatorVerdict::outcome(
                 len < *max,
-                serde_json::json!(len),
-                serde_json::json!({ "max": *max }),
+                Cow::Owned(serde_json::json!(len)),
+                Cow::Owned(serde_json::json!({ "max": *max })),
             ))
         }
         UniqueValues => {
@@ -397,27 +429,51 @@ pub fn evaluate_operator(
                 }
                 seen.push(v);
             }
-            Ok(OperatorVerdict::type_test(unique, left.clone()))
+            Ok(OperatorVerdict::type_test(unique, Cow::Borrowed(left)))
         }
-        IsTruthy => Ok(OperatorVerdict::type_test(is_truthy(left), left.clone())),
-        IsFalsy => Ok(OperatorVerdict::type_test(!is_truthy(left), left.clone())),
-        IsNull => Ok(OperatorVerdict::type_test(left.is_null(), left.clone())),
-        IsNotNull => Ok(OperatorVerdict::type_test(!left.is_null(), left.clone())),
+        IsTruthy => Ok(OperatorVerdict::type_test(
+            is_truthy(left),
+            Cow::Borrowed(left),
+        )),
+        IsFalsy => Ok(OperatorVerdict::type_test(
+            !is_truthy(left),
+            Cow::Borrowed(left),
+        )),
+        IsNull => Ok(OperatorVerdict::type_test(
+            left.is_null(),
+            Cow::Borrowed(left),
+        )),
+        IsNotNull => Ok(OperatorVerdict::type_test(
+            !left.is_null(),
+            Cow::Borrowed(left),
+        )),
         IsType { expected } => Ok(OperatorVerdict::outcome(
             json_kind_matches(left, *expected),
-            left.clone(),
-            serde_json::json!(json_value_type_str(*expected)),
+            Cow::Borrowed(left),
+            Cow::Owned(serde_json::json!(json_value_type_str(*expected))),
         )),
-        IsString => Ok(OperatorVerdict::type_test(left.is_string(), left.clone())),
-        IsNumber => Ok(OperatorVerdict::type_test(left.is_number(), left.clone())),
-        IsBoolean => Ok(OperatorVerdict::type_test(left.is_boolean(), left.clone())),
-        IsObject => Ok(OperatorVerdict::type_test(left.is_object(), left.clone())),
+        IsString => Ok(OperatorVerdict::type_test(
+            left.is_string(),
+            Cow::Borrowed(left),
+        )),
+        IsNumber => Ok(OperatorVerdict::type_test(
+            left.is_number(),
+            Cow::Borrowed(left),
+        )),
+        IsBoolean => Ok(OperatorVerdict::type_test(
+            left.is_boolean(),
+            Cow::Borrowed(left),
+        )),
+        IsObject => Ok(OperatorVerdict::type_test(
+            left.is_object(),
+            Cow::Borrowed(left),
+        )),
         WithinAbsTolerance { tolerance } => {
             let (l, r) = require_numbers(op, left, right)?;
             Ok(OperatorVerdict::outcome(
                 (l - r).abs() <= *tolerance,
-                json_num(l),
-                json_num(r),
+                Cow::Owned(json_num(l)),
+                Cow::Owned(json_num(r)),
             ))
         }
         WithinPctTolerance { pct } => {
@@ -427,7 +483,11 @@ pub fn evaluate_operator(
             } else {
                 (l - r).abs() <= r.abs() * *pct
             };
-            Ok(OperatorVerdict::outcome(passed, json_num(l), json_num(r)))
+            Ok(OperatorVerdict::outcome(
+                passed,
+                Cow::Owned(json_num(l)),
+                Cow::Owned(json_num(r)),
+            ))
         }
         WithinStdDev {
             sigma,
@@ -444,8 +504,10 @@ pub fn evaluate_operator(
             let passed = (l - *mean).abs() <= *sigma * *std_dev;
             Ok(OperatorVerdict::outcome(
                 passed,
-                json_num(l),
-                serde_json::json!({ "sigma": *sigma, "mean": *mean, "std_dev": *std_dev }),
+                Cow::Owned(json_num(l)),
+                Cow::Owned(
+                    serde_json::json!({ "sigma": *sigma, "mean": *mean, "std_dev": *std_dev }),
+                ),
             ))
         }
         BetweenPercentiles {
@@ -468,8 +530,8 @@ pub fn evaluate_operator(
             let passed = l >= *lower_pct && l <= *upper_pct;
             Ok(OperatorVerdict::outcome(
                 passed,
-                json_num(l),
-                serde_json::json!({ "lower_pct": *lower_pct, "upper_pct": *upper_pct }),
+                Cow::Owned(json_num(l)),
+                Cow::Owned(serde_json::json!({ "lower_pct": *lower_pct, "upper_pct": *upper_pct })),
             ))
         }
         DivergenceLessThan { metric, threshold } => {
@@ -481,8 +543,10 @@ pub fn evaluate_operator(
             };
             Ok(OperatorVerdict::outcome(
                 value < *threshold,
-                json_num(value),
-                serde_json::json!({ "metric": metric_str(*metric), "threshold": *threshold }),
+                Cow::Owned(json_num(value)),
+                Cow::Owned(
+                    serde_json::json!({ "metric": metric_str(*metric), "threshold": *threshold }),
+                ),
             ))
         }
         CosineSimilarityAtLeast { threshold } => {
@@ -490,8 +554,8 @@ pub fn evaluate_operator(
             let value = cosine_similarity(&l, &r);
             Ok(OperatorVerdict::outcome(
                 value >= *threshold,
-                json_num(value),
-                serde_json::json!({ "threshold": *threshold }),
+                Cow::Owned(json_num(value)),
+                Cow::Owned(serde_json::json!({ "threshold": *threshold })),
             ))
         }
     }
@@ -518,10 +582,6 @@ fn json_kind(v: &Value) -> &'static str {
 
 fn json_num(n: f64) -> Value {
     serde_json::Number::from_f64(n).map_or(Value::Null, Value::Number)
-}
-
-fn str_val(s: &str) -> Value {
-    Value::String(s.to_string())
 }
 
 #[expect(
@@ -814,8 +874,16 @@ mod tests {
     use serde_json::json;
     use wyrd_spec::verification::ComparisonOperator as Op;
 
-    fn run(left: Value, op: Op, right: Value) -> OperatorVerdict {
-        evaluate_operator(&left, &op, &right).expect("operator evaluation should succeed")
+    fn run(left: Value, op: Op, right: Value) -> OperatorVerdict<'static> {
+        let owned =
+            |value: Option<Cow<'_, Value>>| value.map(|value| Cow::Owned(value.into_owned()));
+        let verdict =
+            evaluate_operator(&left, &op, &right).expect("operator evaluation should succeed");
+        OperatorVerdict {
+            passed: verdict.passed,
+            observed: owned(verdict.observed),
+            expected: owned(verdict.expected),
+        }
     }
 
     #[test]

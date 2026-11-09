@@ -542,7 +542,7 @@ impl VerificationEngine {
                     .map(|id| match blocks.get(id) {
                         Some(Block::Step(index)) => Ok(self.step(spec, &scope, *index, deadline)),
                         Some(Block::Requirement(key)) => {
-                            self.requirement(spec, &scope, *key, deadline)
+                            Ok(self.requirement(spec, &scope, *key, deadline))
                         }
                         None => panic!("the plan names only declared steps"),
                     })
@@ -588,12 +588,9 @@ impl VerificationEngine {
     /// and every explicit binding gap; the strongest cause wins, so a failed
     /// binding is never hidden behind an intentionally skipped owner. A
     /// requirement with a gap takes the gap's outcome without calling its
-    /// check; otherwise the check runs under the concurrency bound.
-    ///
-    /// # Errors
-    /// Returns [`EngineError::Capture`] when an actual value cannot be
-    /// hashed; the prepared check fails with [`EngineError::Busy`] when it is
-    /// refused process capacity.
+    /// check; otherwise the check runs under the concurrency bound, and
+    /// fails with [`EngineError::Busy`] when it is refused process capacity
+    /// or [`EngineError::Capture`] when its actual value cannot be hashed.
     ///
     /// # Panics
     /// Panics when `key` does not name a requirement of `spec`.
@@ -603,7 +600,7 @@ impl VerificationEngine {
         scope: &Scope<'_>,
         key: Key,
         deadline: Instant,
-    ) -> Result<Prepared<Done, EngineError>, EngineError> {
+    ) -> Prepared<Done, EngineError> {
         let requirement = requirement_at(spec, key);
         let owner = key
             .0
@@ -619,18 +616,22 @@ impl VerificationEngine {
             (None, Some(inputs)) => {
                 let engine = self.clone();
                 let spec = Arc::clone(spec);
-                Ok(Prepared::Run(Box::pin(async move {
+                Prepared::Run(Box::pin(async move {
                     let requirement = requirement_at(&spec, key);
                     let step = key.0.map(|index| &spec.steps[index].id);
-                    let judged = engine.judge(requirement, step, inputs, deadline).await?;
-                    judged.report(&spec, key)
-                })))
+                    let capture = spec.context_capture.unwrap_or(ContextCapture::Full);
+                    let judged = engine
+                        .judge(requirement, step, inputs, capture, deadline)
+                        .await?;
+                    Ok(judged.report(&spec, key))
+                }))
             }
-            (gap, _) => {
-                Judged::missing(gap.unwrap_or_else(|| Missing::failed("a binding did not resolve")))
-                    .report(spec, key)
-                    .map(Prepared::Settled)
-            }
+            (gap, _) => Prepared::Settled(
+                Judged::missing(
+                    gap.unwrap_or_else(|| Missing::failed("a binding did not resolve")),
+                )
+                .report(spec, key),
+            ),
         }
     }
 
@@ -720,7 +721,8 @@ impl VerificationEngine {
     /// Returns [`EngineError::Busy`] when an Agent or code check is refused
     /// process capacity, which is never judged, and
     /// [`EngineError::EvidenceUnavailable`] when a deferring engine's trace
-    /// has not landed yet.
+    /// has not landed yet, and [`EngineError::Capture`] when the actual value
+    /// cannot be captured under `capture`.
     #[tracing::instrument(
         name = "verification.block",
         level = "debug",
@@ -732,6 +734,7 @@ impl VerificationEngine {
         requirement: &Requirement,
         step: Option<&TaskId>,
         bindings: Bindings,
+        capture: ContextCapture,
         deadline: Instant,
     ) -> Result<Judged, EngineError> {
         let _permit = self.permits.acquire().await;
@@ -757,11 +760,14 @@ impl VerificationEngine {
                     (None, _) => evaluate_single(&requirement.id, operator, expected, &observed),
                 };
                 let ok = compared.is_ok();
-                (Judged::compared(compared), ok)
+                (Judged::compared(compared, capture), ok)
             }
             Check::Trace(trace) => {
-                match self.trace(&requirement.id, trace, &inputs, deadline).await {
-                    Ok(judged) => judged,
+                match self
+                    .trace(&requirement.id, trace, &inputs, capture, deadline)
+                    .await
+                {
+                    Ok((judged, ok)) => (Ok(judged), ok),
                     Err(error) => {
                         timer.finish(false);
                         return Err(error);
@@ -779,21 +785,21 @@ impl VerificationEngine {
                     deadline,
                 };
                 match self.checks.execute(call).await {
-                    Ok(output) => (Judged::cited(output, &sources), true),
+                    Ok(output) => (Judged::cited(output, &sources, capture), true),
                     Err(BlockError::Busy { reason }) => {
                         timer.finish(false);
                         return Err(EngineError::Busy(reason));
                     }
-                    Err(error) => (Judged::inconclusive(reason(&error)), false),
+                    Err(error) => (Ok(Judged::inconclusive(reason(&error))), false),
                 }
             }
             Check::Drift(drift) => (
-                Judged::checked(self.drift.judge(&requirement.id, drift)),
+                Judged::checked(self.drift.judge(&requirement.id, drift), capture),
                 true,
             ),
         };
         timer.finish(ok);
-        Ok(judged)
+        Ok(judged?)
     }
 
     /// Compare the selected span value of the declared trace.
@@ -811,6 +817,7 @@ impl VerificationEngine {
         id: &TaskId,
         trace: &TraceCheck,
         inputs: &BTreeMap<String, CallInput>,
+        capture: ContextCapture,
         deadline: Instant,
     ) -> Result<(Judged, bool), EngineError> {
         let Some(CallValue::Evidence(InputDeclaration::Trace { trace_id })) =
@@ -832,10 +839,13 @@ impl VerificationEngine {
             }
         };
         let document = project_spans(*trace_id, &spans);
-        let compared = extract_jsonpath_from(&document, &trace.span_selector)
-            .and_then(|observed| evaluate_single(id, &trace.operator, &trace.expected, &observed));
+        let observed = match extract_jsonpath_from(&document, &trace.span_selector) {
+            Ok(observed) => observed,
+            Err(error) => return Ok((Judged::compared(Err(error), capture)?, false)),
+        };
+        let compared = evaluate_single(id, &trace.operator, &trace.expected, &observed);
         let ok = compared.is_ok();
-        Ok((Judged::compared(compared), ok))
+        Ok((Judged::compared(compared, capture)?, ok))
     }
 
     /// The run's one read of `trace_id`: the first check naming it fetches
@@ -1162,7 +1172,8 @@ struct Judged {
     outcome: RequirementOutcome,
     /// Why it holds.
     reason: String,
-    /// The compared actual value.
+    /// The compared actual value, already captured under the Verifier's
+    /// context-capture mode.
     actual: Option<Value>,
     /// Citations of reachable original evidence.
     citations: Vec<Citation>,
@@ -1175,31 +1186,25 @@ struct Judged {
 }
 
 impl Judged {
-    /// The reported result of the requirement at `key`, its actual value
-    /// captured under the Verifier's context-capture mode.
-    ///
-    /// # Errors
-    /// Returns [`EngineError::Capture`] when the actual value cannot be
-    /// hashed.
+    /// The reported result of the requirement at `key`.
     ///
     /// # Panics
     /// Panics when `key` does not name a requirement of `spec`.
-    fn report(self, spec: &VerifierSpec, key: Key) -> Result<Done, EngineError> {
+    fn report(self, spec: &VerifierSpec, key: Key) -> Done {
         let requirement = requirement_at(spec, key);
-        let capture = spec.context_capture.unwrap_or(ContextCapture::Full);
-        Ok(Done::Requirement(Box::new(RequirementResult {
+        Done::Requirement(Box::new(RequirementResult {
             id: requirement.id.clone(),
             step: key.0.map(|index| spec.steps[index].id.clone()),
             statement: requirement.statement.clone(),
             outcome: self.outcome,
             reason: self.reason,
-            actual: capture_actual(self.actual, capture)?,
+            actual: self.actual,
             citations: self.citations,
             data: self.data,
             detail: self.detail,
             check: requirement.check.clone(),
             provenance: self.provenance,
-        })))
+        }))
     }
 
     /// The outcome of evidence that could not be supplied.
@@ -1226,50 +1231,68 @@ impl Judged {
     }
 
     /// A deterministic comparison: passed or failed, or inconclusive when the
-    /// values cannot be compared.
-    fn compared(compared: Result<Compared, ExecError>) -> Self {
+    /// values cannot be compared. The borrowed actual value is captured
+    /// under `capture`, so only `full` copies it.
+    ///
+    /// # Errors
+    /// Returns the capture failure of an actual value that cannot be hashed.
+    fn compared(
+        compared: Result<Compared<'_>, ExecError>,
+        capture: ContextCapture,
+    ) -> Result<Self, ExecError> {
         match compared {
-            Ok((passed, actual, _, message)) => {
+            Ok((passed, actual, message)) => {
                 let outcome = if passed {
                     RequirementOutcome::Passed
                 } else {
                     RequirementOutcome::Failed
                 };
-                Self {
-                    actual,
+                Ok(Self {
+                    actual: capture_actual(actual, capture)?,
                     ..Self::bare(
                         outcome,
                         message.unwrap_or_else(|| "the comparison held".to_owned()),
                     )
-                }
+                })
             }
-            Err(error) => Self::inconclusive(error.to_string()),
+            Err(error) => Ok(Self::inconclusive(error.to_string())),
         }
     }
 
-    /// An executor's judgment, unchanged.
-    fn checked(output: CheckOutput) -> Self {
+    /// An executor's judgment, unchanged except that its actual value is
+    /// captured under `capture`.
+    ///
+    /// # Errors
+    /// Returns the capture failure of an actual value that cannot be hashed.
+    fn checked(output: CheckOutput, capture: ContextCapture) -> Result<Self, ExecError> {
         let outcome = match output.verdict.outcome {
             VerificationVerdict::Passed => RequirementOutcome::Passed,
             VerificationVerdict::Failed => RequirementOutcome::Failed,
             VerificationVerdict::Inconclusive => RequirementOutcome::Inconclusive,
         };
-        Self {
+        Ok(Self {
             outcome,
             reason: output.verdict.reason,
-            actual: output.actual,
+            actual: capture_actual(output.actual.map(Cow::Owned), capture)?,
             citations: output.verdict.citations,
             data: output.verdict.data,
             detail: output.detail,
             provenance: output.provenance,
-        }
+        })
     }
 
     /// An Agent or code judgment: citations outside the call's original
     /// `sources` are dropped, and a pass left without a citation is
     /// inconclusive.
-    fn cited(output: CheckOutput, sources: &BTreeSet<SlotName>) -> Self {
-        let mut judged = Self::checked(output);
+    ///
+    /// # Errors
+    /// Returns the capture failure of an actual value that cannot be hashed.
+    fn cited(
+        output: CheckOutput,
+        sources: &BTreeSet<SlotName>,
+        capture: ContextCapture,
+    ) -> Result<Self, ExecError> {
+        let mut judged = Self::checked(output, capture)?;
         judged
             .citations
             .retain(|citation| sources.contains(&citation.slot));
@@ -1280,7 +1303,7 @@ impl Judged {
                 judged.reason
             );
         }
-        judged
+        Ok(judged)
     }
 }
 

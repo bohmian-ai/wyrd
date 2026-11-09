@@ -4,7 +4,6 @@ import { AsyncLocalStorage } from "node:async_hooks";
 import { createRequire } from "node:module";
 
 import type { AuthoredCard } from "./authoring.js";
-import type { WyrdErrorCode } from "./error-codes.js";
 import {
   authoredOf,
   IncompleteQueryStreamError,

@@ -251,7 +251,7 @@ test("every_native_family_constructs_canonical_specs", () => {
   }
   expect(singles[3]?.[0].spec()).toEqual({ server_name: "files", transport: "stdio", scopes: ["read"] });
   expect(singles[6]?.[0].spec(), "an Operator's action is flattened into its spec").toEqual(pager);
-  expect(spec(singles[2]![0]).target_refs).toEqual([ref("Model", "ranker")]);
+  expect(singles[2]?.[0].spec()).toMatchObject({ target_refs: [ref("Model", "ranker")] });
 
   const policy = CardRef.artifact("company-sharing-policy", "1.0.0").file("extracted/policy.json");
   const local = Artifact.fromPath("company-sharing-policy", "2.0.0", SHARING_POLICY).extract(true);

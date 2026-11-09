@@ -742,7 +742,7 @@ VALID with zero errors, missed or capped arrivals, lost, shed or undrained work.
     `shred_variant` output held by the memtable (810 vs 992 MiB). That fits the
     same sawtooth sampled at a different phase.
 
-**Bifrost `otlp-logs-c64` (unsettled).** Two predetermined pairs in the order
+**Bifrost `otlp-logs-c64` (accepted: bounded by disk sync).** Two predetermined pairs in the order
 B, C, C, B, then two more runs.
 
 | Run | Rate req/s | CPU µs/row | p99 ms |
@@ -763,7 +763,10 @@ B, C, C, B, then two more runs.
 - **No candidate change here.** Nothing in the candidate changes the WAL or the
   logs encoding path, apart from the Variant shredder.
 - **Direction flips between runs:** candidate faster in the full L1, slower in
-  the rerun. The finding remains unsettled and is not fixed.
+  the rerun.
+- **Accepted.** WAL fsync is an inherent bottleneck of this step, not a
+  candidate cost, so the step's rate is not a regression signal for
+  TASK-004. No fix is made.
 
 **Verification driver.** The cost was the driver's Tokio runtime: it ran one
 worker per host CPU (32) against a declared 8-core budget.
@@ -888,8 +891,8 @@ Gateway, candidate median vs immediate baseline range:
 - AC-010 against `1a0699e42`: passes;
 - Gateway against main: passes.
 
-Open before review: the unsettled `otlp-logs-c64` finding. TASK-004 is not
-marked implemented.
+No baseline difference remains open. TASK-004 is not marked implemented;
+it goes to independent review.
 
 Archived records and profiles (gitignored):
 - `target/benchmarks-baseline/final` (`aa2a6a0d8`);

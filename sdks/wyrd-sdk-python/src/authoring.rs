@@ -380,6 +380,9 @@ macro_rules! authoring_class {
                 }
 
                 #[doc = concat!("Insert the entry `key` into `", stringify!($map), "`; a repeated key is refused at validation. Returns this value.")]
+                #[doc = ""]
+                #[doc = "# Errors"]
+                #[doc = concat!("As [`", stringify!($map_convert), "`], naming `", stringify!($map), "`, when `value` does not convert; this value is then unchanged.")]
                 fn $map_add<'py>(
                     slf: Bound<'py, Self>,
                     key: String,

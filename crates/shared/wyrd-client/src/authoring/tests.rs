@@ -1295,6 +1295,10 @@ impl Agent {
 /// Canonical object forms of sub-values are kept exactly as authored: equal
 /// to their constructed values, and a malformed form stands until validation
 /// refuses it by its YAML field path.
+///
+/// # Panics
+/// Panics when a canonical form, bare schema, or source string differs from
+/// its constructed value, or a malformed form is not refused at its path.
 #[test]
 fn canonical_objects_match_constructed_values() {
     let step = json!({

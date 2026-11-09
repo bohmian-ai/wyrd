@@ -166,7 +166,8 @@ def fact_step(
     """A code step running ``entrypoint`` over ``inputs``, judged by one equality requirement."""
     requirement_id, statement, field, expected = requirement
     action = Action.code(CodeSource.file(STORY / "release_checks.py"), entrypoint)
-    action.inputs({name: f"inputs.{name}" for name in inputs})
+    for name in inputs:
+        action.bind_input(name, f"inputs.{name}")
     check = Check.assert_(f"steps.{id}.output.{field}", "equals", expected)
     return Step(id, action, requirements=[Requirement(requirement_id, statement, check)])
 

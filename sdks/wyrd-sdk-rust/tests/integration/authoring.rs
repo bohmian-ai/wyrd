@@ -184,8 +184,10 @@ fn fact_step(
     inputs: &[&str],
     (requirement, statement, path, expected): (&str, &str, &str, Value),
 ) -> Step {
-    let action = Action::code(CodeSource::file(story("release_checks.py")), entrypoint)
-        .inputs(inputs.iter().map(|name| (*name, format!("inputs.{name}"))));
+    let mut action = Action::code(CodeSource::file(story("release_checks.py")), entrypoint);
+    for name in inputs {
+        action.bind_input(*name, format!("inputs.{name}"));
+    }
     Step::new(id, action).requirements([Requirement::new(
         requirement,
         statement,
@@ -242,11 +244,10 @@ fn report_policy(version: &str, judge: &Agent, policy: ArtifactFile) -> Verifier
             "properties": {"text": {"type": "string"}},
         })),
     );
-    let mut call = Check::agent(judge.clone()).inputs(
-        ["report", "recipient", "purpose", "destination"]
-            .map(|name| (name, format!("inputs.{name}"))),
-    );
-    call.add_workspace("/inputs/policy.json", policy);
+    let mut call = Check::agent(judge.clone())
+        .inputs(["report", "recipient", "purpose"].map(|name| (name, format!("inputs.{name}"))));
+    call.bind_input("destination", "inputs.destination")
+        .add_workspace("/inputs/policy.json", policy);
     let mut scan = fact_step(
         "policy",
         "report_facts",

@@ -2345,16 +2345,21 @@ code files, and decode each Card through the loader's own envelope decoding
 equivalent therefore refuse with the same `WYRD_LOADER_400_INVALID_ENVELOPE`
 diagnostics and field paths, labelled `Kind/name@version` in place of a file.
 Every call validates afresh; nothing caches a result. The declaration emits
-one submission per distinct identity and refuses two different definitions of
-one identity with `WYRD_SPEC_400_DUPLICATE_SUBMISSION`. No local path reaches
-a submission.
+one submission per distinct identity; definitions are compared as decoded, so
+an omitted default and its explicit value are one submission, and two that
+decode differently, or a local Artifact and a Card of its identity without
+that source, refuse with `WYRD_SPEC_400_DUPLICATE_SUBMISSION`. A local
+Artifact's own references are captured and validated as any Card's. No local
+path reaches a submission.
 
 `Cards::declare` accepts a native `DeclarationInput`, a path, or an authored
 Card; `WyrdState::declare(_with)` accept a path or an authored Card and pull
 and hydrate the declared root. An authored Card is validated before anything
 is published, then each local Artifact is published as its own sole
-submission through `Cards::upload_artifact`, and the graph is submitted
-through the same declaration saga as every other input. There is no
+submission through `Cards::upload_artifact`, dependencies first, and the
+graph is submitted through the same declaration saga as every other input. A
+local Artifact declared as the root is its own publication, and its receipt
+is the declaration's. There is no
 rollback: a graph refused after publication, or a dropped future, leaves each
 published Artifact registered for reuse by reference. Code-authored and
 file-authored forms of one graph register identical content and identities.

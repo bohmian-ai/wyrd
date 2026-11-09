@@ -790,8 +790,11 @@ async fn mounted_policy(cards: &Cards, version: &str) -> Value {
 /// is mounted by the judge; a new local policy version through `WyrdState`
 /// leaves the old graph on the old policy; changed bytes under a published
 /// version, an unreadable source, and an unregistered reference are
-/// refused; and a graph refused after its policy published keeps that
-/// policy, which a later graph reuses by reference.
+/// refused; a graph refused after its policy published keeps that policy,
+/// which a later graph reuses by reference; a local Artifact declared as the
+/// root returns its own publication's receipt; and a local schema nested in
+/// a local payload publishes first and is referenced by its registered
+/// identity.
 ///
 /// # Panics
 /// Panics when a declaration, verification, or read differs.
@@ -985,6 +988,54 @@ async fn local_artifacts_reuse_and_keep_versions() {
         "{recovered:#?}"
     );
     assert_eq!(mounted_policy(&cards, "3.0.0").await, json!("3.0.0"));
+
+    let root = cards
+        .declare(local_policy("5.0.0", &source))
+        .await
+        .expect("a local Artifact root publishes alone");
+    assert!(
+        root.root.same_identity(&card_ref(
+            CardKind::Artifact,
+            "company-sharing-policy",
+            "5.0.0"
+        )) && root.root.uid.is_some(),
+        "the receipt names the published Artifact: {root:#?}"
+    );
+    assert_eq!(declared_kinds(&root), [CardKind::Artifact], "{root:#?}");
+    assert!(policy_published(&cards, "5.0.0").await);
+
+    let schema = revised.path().join("payload-schema.json");
+    std::fs::write(&schema, r#"{"type": "object"}"#).expect("schema writes");
+    let payload = Artifact::from_path("payload", "1.0.0", &source).schema_ref(
+        Artifact::from_path("payload-schema", "1.0.0", &schema).artifact_kind("schema"),
+    );
+    let audit = cards
+        .declare(&Audit::new("payload-audit", "1.0.0").evidence_refs([payload]))
+        .await
+        .expect("the nested schema publishes before its payload");
+    assert_eq!(declared_kinds(&audit), [CardKind::Audit], "{audit:#?}");
+    let registered_schema = cards
+        .get(CardSelector::exact(card_ref(
+            CardKind::Artifact,
+            "payload-schema",
+            "1.0.0",
+        )))
+        .await
+        .expect("the schema is registered");
+    let payload = cards
+        .get(CardSelector::exact(card_ref(
+            CardKind::Artifact,
+            "payload",
+            "1.0.0",
+        )))
+        .await
+        .expect("the payload is registered");
+    let payload = serde_json::to_value(&payload.spec).expect("spec serializes");
+    assert_eq!(
+        payload["schema_ref"]["uid"],
+        json!(registered_schema.metadata.uid),
+        "the payload references the published schema: {payload}"
+    );
     story_server.deployment.shutdown().await;
 }
 

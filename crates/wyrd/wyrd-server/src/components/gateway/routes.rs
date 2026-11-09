@@ -2117,16 +2117,18 @@ mod usage_bound_tests {
     use serde_json::{Value, json};
     use wiremock::{Mock, MockServer, ResponseTemplate};
     use wyrd_gateway::{
-        AttemptResult, BatchAction, BatchInput, BuiltinEndpoints, HttpProviderDispatch,
-        IngressDialect, MediaRequest, OpenAiMediaRoute, ProviderAttempt, ProviderDispatch,
-        ProviderSecret, UploadContent, UploadFile,
+        AttemptResult, BatchAction, BatchInput, BuiltinEndpoints, CallPlan, GatewayTenantSnapshot,
+        HttpProviderDispatch, IngressDialect, MediaRequest, OpenAiMediaRoute, ProviderAttempt,
+        ProviderDispatch, ProviderSecret, UploadContent, UploadFile,
     };
     use wyrd_spec::error::WyrdError;
     use wyrd_spec::gateway::openai::{
         GatewayBatchCreateRequest, GatewayChatCompletionsRequest, GatewayEmbeddingsRequest,
         GatewayImageGenerationRequest, GatewayResponsesRequest, GatewaySpeechRequest,
     };
-    use wyrd_spec::gateway::{GatewayCallId, GatewayOperation, ProviderDeployment};
+    use wyrd_spec::gateway::{
+        GatewayCallId, GatewayGovernancePolicy, GatewayOperation, ModelRef, ProviderDeployment,
+    };
 
     use super::{typed_body, usage_bound};
     use crate::test_support::CountingAllocator;
@@ -2715,5 +2717,81 @@ mod usage_bound_tests {
                 },
             )
         });
+
+        // Planning checks every translated candidate without building its
+        // payload: allocation grows with neither the text nor the number of
+        // candidates.
+        let planned = |text: &str, candidates: usize| {
+            let names: Vec<String> = (0..candidates)
+                .map(|index| format!("translated-{index}"))
+                .collect();
+            let mut deployments: Vec<ProviderDeployment> = names
+                .iter()
+                .enumerate()
+                .map(|(index, name)| {
+                    let adapter = if index % 2 == 0 {
+                        "anthropic"
+                    } else {
+                        "gemini"
+                    };
+                    serde_json::from_value(
+                        json!({"name": name, "adapter": adapter, "auth": "none"}),
+                    )
+                    .expect("translated deployment")
+                })
+                .collect();
+            deployments.sort_by(|a, b| a.name.cmp(&b.name));
+            let models: Vec<ModelRef> = names
+                .iter()
+                .map(|name| ModelRef::from_projection(&format!("{name}/m")).expect("model"))
+                .collect();
+            let snapshot = GatewayTenantSnapshot {
+                deployments,
+                credentials: Vec::new(),
+                fallback: serde_json::from_value(
+                    json!({"rules": [{"scope": "global", "candidates": models}]}),
+                )
+                .expect("fallback"),
+                governance: GatewayGovernancePolicy::default(),
+                capture: serde_json::from_value(
+                    json!({"mode": "disabled", "payload_fields": [], "version": 1}),
+                )
+                .expect("capture"),
+            };
+            let body = json!({
+                "model": models[0].to_string(),
+                "max_completion_tokens": 16,
+                "messages": [
+                    {"role": "system", "content": text},
+                    {"role": "user", "content": [{"type": "text", "text": text}]},
+                    {"role": "assistant", "content": text, "tool_calls": [{"id": "c", "type": "function", "function": {"name": "f", "arguments": format!("{{\"a\":{}}}", Value::String(text.to_owned()))}}]},
+                    {"role": "tool", "tool_call_id": "c", "content": text},
+                ],
+            });
+            let mut plan = CallPlan::new(
+                &snapshot,
+                GatewayCallId::new_v7(),
+                GatewayOperation::ChatCompletions,
+                models[0].clone(),
+                None,
+            );
+            let (planned, bytes) = CountingAllocator::measure(|| {
+                plan.retain_representable(IngressDialect::OpenAi, false, &body, None)
+            });
+            planned.expect("every candidate represents the call");
+            assert_eq!(plan.candidates.len(), candidates, "no candidate is dropped");
+            bytes
+        };
+        let (small, large) = (kib(1024), kib(2048));
+        let base = planned(&small, 2);
+        for (label, grown) in [
+            ("text", planned(&large, 2)),
+            ("candidates", planned(&small, 4)),
+        ] {
+            assert!(
+                grown.abs_diff(base) < small.len() / 8,
+                "translated planning copies the request with more {label}: {base} then {grown} bytes"
+            );
+        }
     }
 }

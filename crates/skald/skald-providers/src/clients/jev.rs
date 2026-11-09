@@ -80,7 +80,7 @@ impl JevClient {
     /// Sends a typed Jev request and decodes the typed answer.
     ///
     /// The request is sent as given and is not validated here: a native
-    /// `systemone` caller checks it with [`skald_spec::JevRequest::validate`]
+    /// `systemone` caller checks it with [`skald_spec::wire::jev::JevRequestView::validate`]
     /// first, while the unified chat pass-through forwards it unvalidated.
     /// Retries follow the client's policy.
     ///

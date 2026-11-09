@@ -30,11 +30,14 @@ use serde_json::{Map, Value, json};
 use skald_providers::RequestBody;
 use skald_spec::ProviderResponse;
 use skald_spec::wire::anthropic_messages::{AnthropicMessagesRequest, AnthropicUsage};
+use skald_spec::wire::borrowed::IgnoredObject;
 use skald_spec::wire::google_generate::{GoogleGenerateContentRequest, GoogleUsageMetadata};
 use skald_spec::wire::jev::{JevRequest, JevUsage};
 use skald_spec::wire::openai_chat::{
-    OpenAiChatMessage, OpenAiChatRequest, OpenAiChatResponse, OpenAiImageUrl, OpenAiMessageContent,
-    OpenAiStop, OpenAiStreamOptions, OpenAiToolCall, OpenAiUsage,
+    OpenAiChatMessage, OpenAiChatMessageView, OpenAiChatRequest, OpenAiChatRequestView,
+    OpenAiChatResponse, OpenAiChatToolChoiceView, OpenAiContentPart, OpenAiContentPartView,
+    OpenAiImageUrlView, OpenAiMessageContent, OpenAiMessageContentView, OpenAiStop,
+    OpenAiStreamOptionsView, OpenAiToolCall, OpenAiToolCallView, OpenAiToolView, OpenAiUsage,
 };
 use skald_spec::wire::openai_embeddings::{
     OpenAiEmbeddingUsage, OpenAiEmbeddingsInputView, OpenAiEmbeddingsRequestView,
@@ -180,11 +183,32 @@ impl Serialize for NativeBody<'_> {
     }
 }
 
-/// Builds the upstream request of `body` for `model` on `deployment`.
+/// The upstream form [`check`] selects for a representable request, carrying
+/// only borrowed input, so selecting it builds no provider payload.
+#[derive(Debug)]
+pub(crate) enum Target<'a> {
+    /// The caller's body, already in the deployment's dialect.
+    Native(NativeBody<'a>),
+    /// A native Jev `systemone` body for a Jev deployment.
+    Jev,
+    /// The Jev request carried by a Chat Completions body, decoded from the
+    /// last user message's text.
+    JevChat(jev::ChatQuestions),
+    /// A Chat Completions body for an Anthropic deployment.
+    Anthropic,
+    /// A Chat Completions body for a Gemini or Vertex deployment.
+    Google,
+}
+
+/// Checks that `deployment` can represent `body` for `model` and selects its
+/// upstream form without building it.
 ///
-/// Pure and deterministic, so planning can use it to drop deployments that
-/// cannot represent a request before admission and dispatch repeats it. A
-/// native request only borrows `body`, so neither pass copies it.
+/// Planning runs it for every candidate before admission, and [`prepare`]
+/// runs it again for the dispatched attempt, so both apply one set of rules.
+/// Translated bodies are checked through their borrowed projections: no
+/// request text is copied and no target payload is built. Only the text of a
+/// Jev pass-through's last user message is decoded, as the request it
+/// carries.
 ///
 /// # Errors
 ///
@@ -196,7 +220,7 @@ impl Serialize for NativeBody<'_> {
 /// only to `OpenAI`-protocol adapters, as do Batches lifecycle bodies. Jev
 /// `systemone` bodies reach only Jev deployments; a Chat Completions body
 /// reaches Jev only as the typed Jev request in its last user message.
-pub(crate) fn prepare<'a>(
+pub(crate) fn check<'a>(
     ingress: IngressDialect,
     operation: GatewayOperation,
     stream: bool,
@@ -204,7 +228,7 @@ pub(crate) fn prepare<'a>(
     deployment: &ProviderDeployment,
     model: &'a ModelId,
     media: Option<&MediaRequest>,
-) -> Result<Prepared<'a>, UnsupportedRequest> {
+) -> Result<Target<'a>, UnsupportedRequest> {
     let model = model.as_str();
     media::validate(operation, media, body)?;
     let chat = operation == GatewayOperation::ChatCompletions;
@@ -233,35 +257,36 @@ pub(crate) fn prepare<'a>(
             GatewayOperation::ChatCompletions
             | GatewayOperation::Responses
             | GatewayOperation::Images
-            | GatewayOperation::Audio => Ok(Prepared::Native(native(body, Some(model))?)),
+            | GatewayOperation::Audio => Ok(Target::Native(native(body, Some(model))?)),
             GatewayOperation::Embeddings => {
                 embeddings(body)?;
-                Ok(Prepared::Native(native(body, Some(model))?))
+                Ok(Target::Native(native(body, Some(model))?))
             }
             // A batch body carries no model; its input file names the model.
-            GatewayOperation::Batches => Ok(Prepared::Native(native(body, None)?)),
+            GatewayOperation::Batches => Ok(Target::Native(native(body, None)?)),
             GatewayOperation::SystemOne => {
                 Err(unsupported_operation(operation, &deployment.adapter))
             }
         },
         (IngressDialect::Jev, ProviderAdapter::Jev) if operation == GatewayOperation::SystemOne => {
-            Ok(Prepared::Jev(Box::new(jev::request(body, model)?)))
+            jev::check(body, model)?;
+            Ok(Target::Jev)
         }
         (IngressDialect::OpenAi, ProviderAdapter::Jev) if chat => {
-            Ok(Prepared::Jev(Box::new(jev::chat_request(body, model)?)))
+            Ok(Target::JevChat(jev::chat_questions(&chat_view(body)?)?))
         }
-        (IngressDialect::OpenAi, ProviderAdapter::Anthropic) if chat => Ok(Prepared::Anthropic(
-            Box::new(anthropic::request(chat_request(body)?, model)?),
-        )),
+        (IngressDialect::OpenAi, ProviderAdapter::Anthropic) if chat => {
+            anthropic::check(&chat_view(body)?)?;
+            Ok(Target::Anthropic)
+        }
         (IngressDialect::OpenAi, ProviderAdapter::Gemini | ProviderAdapter::Vertex { .. })
             if chat =>
         {
-            Ok(Prepared::Google(Box::new(google::request(chat_request(
-                body,
-            )?)?)))
+            google::check(&chat_view(body)?)?;
+            Ok(Target::Google)
         }
         (IngressDialect::AnthropicMessages, ProviderAdapter::Anthropic) if chat => {
-            Ok(Prepared::Native(native(body, Some(model))?))
+            Ok(Target::Native(native(body, Some(model))?))
         }
         (
             IngressDialect::GeminiGenerateContent,
@@ -270,7 +295,7 @@ pub(crate) fn prepare<'a>(
         | (IngressDialect::VertexGenerateContent, ProviderAdapter::Vertex { .. })
             if chat =>
         {
-            Ok(Prepared::Native(native(body, None)?))
+            Ok(Target::Native(native(body, None)?))
         }
         (IngressDialect::OpenAi, _) => Err(unsupported_operation(operation, &deployment.adapter)),
         (dialect, adapter) => Err(UnsupportedRequest::new(
@@ -281,6 +306,43 @@ pub(crate) fn prepare<'a>(
             ),
         )),
     }
+}
+
+/// Builds the upstream request of `body` for `model` on `deployment`, for
+/// the attempt being dispatched.
+///
+/// Pure and deterministic: [`check`] selects the form and applies every
+/// representability rule, then only that form is built, and nothing is kept
+/// once the attempt ends. A native request only borrows `body`, so it is
+/// never copied.
+///
+/// # Errors
+///
+/// Returns what [`check`] returns, or names `body` when a checked body does
+/// not decode as its owned request.
+pub(crate) fn prepare<'a>(
+    ingress: IngressDialect,
+    operation: GatewayOperation,
+    stream: bool,
+    body: &'a Value,
+    deployment: &ProviderDeployment,
+    model: &'a ModelId,
+    media: Option<&MediaRequest>,
+) -> Result<Prepared<'a>, UnsupportedRequest> {
+    Ok(
+        match check(ingress, operation, stream, body, deployment, model, media)? {
+            Target::Native(native) => Prepared::Native(native),
+            Target::Jev => Prepared::Jev(Box::new(jev::request(body, model.as_str())?)),
+            Target::JevChat(questions) => {
+                Prepared::Jev(Box::new(jev::chat_request(questions, model.as_str())))
+            }
+            Target::Anthropic => Prepared::Anthropic(Box::new(anthropic::request(
+                chat_request(body)?,
+                model.as_str(),
+            ))),
+            Target::Google => Prepared::Google(Box::new(google::request(chat_request(body)?))),
+        },
+    )
 }
 
 /// Maps a successful provider answer to the ingress dialect and extracts its
@@ -744,7 +806,7 @@ fn base64_floats(encoded: &str) -> Option<usize> {
 fn streamable(
     adapter: &str,
     stream: Option<bool>,
-    options: Option<&OpenAiStreamOptions>,
+    options: Option<&OpenAiStreamOptionsView<'_>>,
     tools: bool,
 ) -> Result<(), UnsupportedRequest> {
     let streaming = stream == Some(true);
@@ -760,18 +822,32 @@ fn streamable(
     )
 }
 
-/// Decodes an `OpenAI` Chat Completions body into its typed Skald form.
+/// Decodes an `OpenAI` Chat Completions body through its borrowed
+/// projection, for checks that copy no request text.
+///
+/// # Errors
+///
+/// Returns [`UnsupportedRequest`] naming the decode failure.
+fn chat_view(body: &Value) -> Result<OpenAiChatRequestView<'_>, UnsupportedRequest> {
+    OpenAiChatRequestView::deserialize(body).map_err(not_chat)
+}
+
+/// Decodes a checked `OpenAI` Chat Completions body into its typed Skald
+/// form, for the target being built.
 ///
 /// # Errors
 ///
 /// Returns [`UnsupportedRequest`] naming the decode failure.
 fn chat_request(body: &Value) -> Result<OpenAiChatRequest, UnsupportedRequest> {
-    OpenAiChatRequest::deserialize(body).map_err(|error| {
-        UnsupportedRequest::new(
-            "body",
-            format!("is not a valid chat completion request: {error}"),
-        )
-    })
+    OpenAiChatRequest::deserialize(body).map_err(not_chat)
+}
+
+/// The rejection of a body that is not a chat completion request.
+fn not_chat(error: serde_json::Error) -> UnsupportedRequest {
+    UnsupportedRequest::new(
+        "body",
+        format!("is not a valid chat completion request: {error}"),
+    )
 }
 
 /// Rejects every present member of `checks`, named by field.
@@ -794,44 +870,50 @@ fn reject_present(adapter: &str, checks: &[(&str, bool)]) -> Result<(), Unsuppor
 /// # Errors
 ///
 /// Returns [`UnsupportedRequest`] naming the first key of `extra`.
-fn reject_extra(adapter: &str, extra: &Map<String, Value>) -> Result<(), UnsupportedRequest> {
-    reject_present(
-        adapter,
-        &extra
-            .keys()
-            .map(|key| (key.as_str(), true))
-            .collect::<Vec<_>>(),
-    )
+fn reject_extra(adapter: &str, extra: &IgnoredObject<'_>) -> Result<(), UnsupportedRequest> {
+    match &extra.first_key {
+        Some(key) => reject_present(adapter, &[(key, true)]),
+        None => Ok(()),
+    }
 }
 
-/// Splits the leading system and developer messages from the conversation.
-///
-/// Returns their joined text, or `None`, and the index of the first
-/// conversational message.
+/// Whether `role` is that of a system or developer message.
+fn is_system(role: &str) -> bool {
+    matches!(role, "system" | "developer")
+}
+
+/// Checks the leading system and developer messages and returns the index of
+/// the first conversational message.
 ///
 /// # Errors
 ///
 /// Returns [`UnsupportedRequest`] for a later system message, whose position
 /// no target can represent, or non-text system content.
-fn system_prefix(
-    messages: &[OpenAiChatMessage],
-) -> Result<(Option<String>, usize), UnsupportedRequest> {
-    let is_system =
-        |message: &OpenAiChatMessage| matches!(message.role.as_str(), "system" | "developer");
-    let offset = messages.iter().take_while(|m| is_system(m)).count();
-    if let Some(index) = messages.iter().skip(offset).position(is_system) {
+fn system_prefix(messages: &[OpenAiChatMessageView<'_>]) -> Result<usize, UnsupportedRequest> {
+    let offset = messages.iter().take_while(|m| is_system(m.role)).count();
+    if let Some(index) = messages.iter().skip(offset).position(|m| is_system(m.role)) {
         return Err(UnsupportedRequest::new(
             format!("messages[{}].role", index + offset),
             "system messages must precede the conversation for this adapter",
         ));
     }
-    let mut texts = Vec::with_capacity(offset);
     for (index, message) in messages[..offset].iter().enumerate() {
         let field = format!("messages[{index}]");
         plain_message(message, &field)?;
-        texts.push(text_content(message.content.as_ref(), &field)?.unwrap_or_default());
+        text_only(message.content.as_ref(), &field)?;
     }
-    Ok(((!texts.is_empty()).then(|| texts.join("\n\n")), offset))
+    Ok(offset)
+}
+
+/// Joined text of the leading system and developer messages of checked
+/// `messages`, or `None`, and the index of the first conversational message.
+fn system_text(messages: &[OpenAiChatMessage]) -> (Option<String>, usize) {
+    let offset = messages.iter().take_while(|m| is_system(&m.role)).count();
+    let texts: Vec<String> = messages[..offset]
+        .iter()
+        .map(|message| text_content(message.content.as_ref()).unwrap_or_default())
+        .collect();
+    ((!texts.is_empty()).then(|| texts.join("\n\n")), offset)
 }
 
 /// Rejects message members no translated target represents.
@@ -841,7 +923,10 @@ fn system_prefix(
 /// Returns [`UnsupportedRequest`] for `name`, `refusal`, `audio`,
 /// annotations, `tool_calls` outside assistant messages, or `tool_call_id`
 /// outside tool messages.
-fn plain_message(message: &OpenAiChatMessage, field: &str) -> Result<(), UnsupportedRequest> {
+fn plain_message(
+    message: &OpenAiChatMessageView<'_>,
+    field: &str,
+) -> Result<(), UnsupportedRequest> {
     let checks = [
         ("name", message.name.is_some()),
         ("refusal", message.refusal.is_some()),
@@ -865,25 +950,24 @@ fn plain_message(message: &OpenAiChatMessage, field: &str) -> Result<(), Unsuppo
     }
 }
 
-/// Text of text-only content, or `None` when absent or empty.
+/// Checks that content is text only and returns whether its text is
+/// non-empty, as [`text_content`] then yields it.
 ///
 /// # Errors
 ///
 /// Returns [`UnsupportedRequest`] when a content part is not text.
-fn text_content(
-    content: Option<&OpenAiMessageContent>,
+fn text_only(
+    content: Option<&OpenAiMessageContentView<'_>>,
     field: &str,
-) -> Result<Option<String>, UnsupportedRequest> {
-    let text = match content {
-        None => String::new(),
-        Some(OpenAiMessageContent::Text(text)) => text.clone(),
-        Some(OpenAiMessageContent::Parts(parts)) => {
-            let mut text = String::new();
+) -> Result<bool, UnsupportedRequest> {
+    match content {
+        None => Ok(false),
+        Some(OpenAiMessageContentView::Text(text)) => Ok(!text.is_empty()),
+        Some(OpenAiMessageContentView::Parts(parts)) => {
+            let mut text = false;
             for (index, part) in parts.iter().enumerate() {
                 match part {
-                    skald_spec::wire::openai_chat::OpenAiContentPart::Text { text: part } => {
-                        text.push_str(part);
-                    }
+                    OpenAiContentPartView::Text { text: part } => text |= !part.is_empty(),
                     _ => {
                         return Err(UnsupportedRequest::new(
                             format!("{field}.content[{index}]"),
@@ -892,51 +976,107 @@ fn text_content(
                     }
                 }
             }
-            text
+            Ok(text)
         }
-    };
-    Ok((!text.is_empty()).then_some(text))
+    }
 }
 
-/// Splits a base64 `data:` image URL into media type and payload.
+/// Text of checked text-only content, or `None` when absent or empty.
+fn text_content(content: Option<&OpenAiMessageContent>) -> Option<String> {
+    let text = match content {
+        None => String::new(),
+        Some(OpenAiMessageContent::Text(text)) => text.clone(),
+        Some(OpenAiMessageContent::Parts(parts)) => parts
+            .iter()
+            .filter_map(|part| match part {
+                OpenAiContentPart::Text { text } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect(),
+    };
+    (!text.is_empty()).then_some(text)
+}
+
+/// Checks an image's detail hint and returns whether its URL is a base64
+/// `data:` URL, which [`data_url`] splits.
 ///
 /// # Errors
 ///
 /// Returns [`UnsupportedRequest`] for a non-`auto` detail hint.
-fn image(
-    image: &OpenAiImageUrl,
-    field: &str,
-) -> Result<Option<(String, String)>, UnsupportedRequest> {
-    if image
-        .detail
-        .as_deref()
-        .is_some_and(|detail| detail != "auto")
-    {
+fn image(image: &OpenAiImageUrlView<'_>, field: &str) -> Result<bool, UnsupportedRequest> {
+    if image.detail.is_some_and(|detail| detail != "auto") {
         return Err(UnsupportedRequest::new(
             format!("{field}.image_url.detail"),
             "image detail is not supported by a translated adapter",
         ));
     }
-    Ok(image
-        .url
-        .strip_prefix("data:")
-        .and_then(|rest| rest.split_once(";base64,"))
-        .map(|(media, data)| (media.to_owned(), data.to_owned())))
+    Ok(data_url(image.url).is_some())
 }
 
-/// Decodes tool-call arguments, which must be a JSON object.
+/// Splits a base64 `data:` image URL into media type and payload.
+fn data_url(url: &str) -> Option<(&str, &str)> {
+    url.strip_prefix("data:")?.split_once(";base64,")
+}
+
+/// Checks a tool call: a function whose arguments are a JSON object, checked
+/// as raw JSON without building it.
 ///
 /// # Errors
 ///
 /// Returns [`UnsupportedRequest`] for a non-function call or arguments that
 /// are not a JSON object.
-fn arguments(call: &OpenAiToolCall, field: &str) -> Result<Value, UnsupportedRequest> {
-    match serde_json::from_str::<Value>(&call.function.arguments) {
-        Ok(value @ Value::Object(_)) if call.kind == "function" => Ok(value),
+fn arguments(call: &OpenAiToolCallView<'_>, field: &str) -> Result<(), UnsupportedRequest> {
+    match serde_json::from_str::<&RawValue>(call.function.arguments) {
+        Ok(raw) if call.kind == "function" && raw.get().starts_with('{') => Ok(()),
         _ => Err(UnsupportedRequest::new(
             format!("{field}.tool_calls"),
             "tool calls must be functions whose arguments are a JSON object",
         )),
+    }
+}
+
+/// Decoded arguments of a checked tool call; [`arguments`] admitted only a
+/// JSON object, so the empty-object fallback is never taken.
+fn arguments_value(call: &OpenAiToolCall) -> Value {
+    serde_json::from_str(&call.function.arguments).unwrap_or_else(|_| json!({}))
+}
+
+/// Checks that every tool is a non-strict function.
+///
+/// # Errors
+///
+/// Returns [`UnsupportedRequest`] naming the first other tool.
+fn function_tools(adapter: &str, tools: &[OpenAiToolView<'_>]) -> Result<(), UnsupportedRequest> {
+    match tools.iter().position(|tool| {
+        !matches!(tool, OpenAiToolView::Function { function } if function.strict != Some(true))
+    }) {
+        Some(index) => Err(UnsupportedRequest::new(
+            format!("tools[{index}]"),
+            format!("only non-strict function tools are supported by the {adapter} adapter"),
+        )),
+        None => Ok(()),
+    }
+}
+
+/// Checks that a tool choice is a mode or a named function.
+///
+/// # Errors
+///
+/// Returns [`UnsupportedRequest`] for allowed-tools and custom-tool choices.
+fn tool_choice(
+    adapter: &str,
+    choice: Option<&OpenAiChatToolChoiceView<'_>>,
+) -> Result<(), UnsupportedRequest> {
+    match choice {
+        Some(OpenAiChatToolChoiceView::Allowed(_) | OpenAiChatToolChoiceView::Custom(_)) => {
+            Err(UnsupportedRequest::new(
+                "tool_choice",
+                format!(
+                    "allowed-tools and custom-tool choices are not supported by the {adapter} adapter"
+                ),
+            ))
+        }
+        _ => Ok(()),
     }
 }
 

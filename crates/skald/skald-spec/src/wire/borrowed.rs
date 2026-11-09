@@ -8,8 +8,10 @@
 //! payload text. A projection is validation data, never a serializable
 //! request.
 
+use std::borrow::Cow;
 use std::collections::BTreeMap;
 use std::fmt;
+use std::marker::PhantomData;
 
 use serde::de::{self, Deserialize, Deserializer, IgnoredAny, MapAccess};
 use serde_json::{Map, Value};
@@ -26,34 +28,52 @@ pub trait Borrowed<'a> {
 }
 
 /// The projection of an arbitrary JSON object member: requires an object and
-/// checks its members without retaining them.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct IgnoredObject;
+/// checks its members, keeping only its first key, the member a rejection of
+/// unmodeled members names.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct IgnoredObject<'a> {
+    /// The object's first key, borrowed unless it needed unescaping; `None`
+    /// for an empty object or `null`.
+    pub first_key: Option<Cow<'a, str>>,
+}
 
-impl<'de> Deserialize<'de> for IgnoredObject {
-    /// Accepts what an owned `Map<String, Value>` accepts, retaining nothing.
+/// A map key borrowed from the input when it holds no escapes.
+#[derive(serde::Deserialize)]
+#[serde(transparent)]
+struct Key<'a>(#[serde(borrow)] Cow<'a, str>);
+
+impl<'de: 'a, 'a> Deserialize<'de> for IgnoredObject<'a> {
+    /// Accepts what an owned `Map<String, Value>` accepts, retaining only the
+    /// first key.
     fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-        /// Visits an object, skipping each member.
-        struct Visitor;
+        /// Visits an object, skipping each member after reading the first key.
+        struct Visitor<'a>(PhantomData<IgnoredObject<'a>>);
 
-        impl<'de> de::Visitor<'de> for Visitor {
-            type Value = IgnoredObject;
+        impl<'de: 'a, 'a> de::Visitor<'de> for Visitor<'a> {
+            type Value = IgnoredObject<'a>;
 
             fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
                 formatter.write_str("a map")
             }
 
-            fn visit_unit<E: de::Error>(self) -> Result<IgnoredObject, E> {
-                Ok(IgnoredObject)
+            fn visit_unit<E: de::Error>(self) -> Result<IgnoredObject<'a>, E> {
+                Ok(IgnoredObject::default())
             }
 
-            fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<IgnoredObject, A::Error> {
-                while map.next_entry::<IgnoredAny, IgnoredAny>()?.is_some() {}
-                Ok(IgnoredObject)
+            fn visit_map<A: MapAccess<'de>>(
+                self,
+                mut map: A,
+            ) -> Result<IgnoredObject<'a>, A::Error> {
+                let first_key = map.next_key::<Key<'a>>()?.map(|Key(key)| key);
+                if first_key.is_some() {
+                    map.next_value::<IgnoredAny>()?;
+                    while map.next_entry::<IgnoredAny, IgnoredAny>()?.is_some() {}
+                }
+                Ok(IgnoredObject { first_key })
             }
         }
 
-        deserializer.deserialize_map(Visitor)
+        deserializer.deserialize_map(Visitor(PhantomData))
     }
 }
 
@@ -65,8 +85,8 @@ impl Borrowed<'_> for Value {
     type View = IgnoredAny;
 }
 
-impl Borrowed<'_> for Map<String, Value> {
-    type View = IgnoredObject;
+impl<'a> Borrowed<'a> for Map<String, Value> {
+    type View = IgnoredObject<'a>;
 }
 
 impl<'a, T: Borrowed<'a>> Borrowed<'a> for Option<T> {

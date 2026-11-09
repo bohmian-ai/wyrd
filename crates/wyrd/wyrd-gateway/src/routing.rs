@@ -18,7 +18,7 @@ use wyrd_spec::gateway::{
 };
 use wyrd_spec::ids::ProviderDeploymentName;
 
-use crate::adapter::{IngressDialect, MediaRequest, UnsupportedRequest, adapter_name, prepare};
+use crate::adapter::{IngressDialect, MediaRequest, UnsupportedRequest, adapter_name, check};
 use crate::snapshot::GatewayTenantSnapshot;
 
 /// One address the call may use and the deployment it names.
@@ -187,7 +187,7 @@ impl CallPlan {
         let operation = self.operation;
         let mut first = None;
         self.candidates.retain(|candidate| {
-            match prepare(
+            match check(
                 ingress,
                 operation,
                 stream,

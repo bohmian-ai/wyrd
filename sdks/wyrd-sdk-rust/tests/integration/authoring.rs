@@ -815,6 +815,8 @@ async fn local_artifacts_reuse_and_keep_versions() {
     assert!(
         declaration
             .input
+            .as_ref()
+            .expect("an ordinary graph")
             .submissions
             .iter()
             .all(|submission| submission.kind != CardKind::Artifact
@@ -1312,6 +1314,8 @@ fn assert_authors(card: impl Into<CardDefinition>, kind: &CardKind, expected: Va
     assert_eq!(
         declaration
             .input
+            .as_ref()
+            .expect("an ordinary graph")
             .submissions
             .iter()
             .map(|submission| submission.kind.clone())
@@ -1413,12 +1417,44 @@ fn public_paths_author_every_native_family() {
     let mut artifact = Artifact::new("authored", "1.0.0")
         .artifact_kind("document")
         .content_type("application/pdf");
-    artifact.add_metadata("owner", json!({"type": "str", "value": "finance"}));
+    artifact
+        .add_metadata("owner", json!({"type": "str", "value": "finance"}))
+        .add_label("team", "finance")
+        .add_annotation("reviewed", "yes");
     assert_authors(
-        CardDefinition::new(CardKind::Artifact, "authored", "1.0.0", artifact.spec()),
+        &artifact,
         &CardKind::Artifact,
         json!({"artifact_kind": "document", "content_type": "application/pdf", "metadata": {"owner": {"type": "str", "value": "finance"}}}),
     );
+    let declared = CardDefinition::from(artifact.clone())
+        .declaration()
+        .expect("a spec-only Artifact root declares")
+        .input
+        .expect("an ordinary graph");
+    assert_eq!(
+        json!({
+            "labels": declared.submissions[0].metadata.labels,
+            "annotations": declared.submissions[0].metadata.annotations,
+        }),
+        json!({"labels": {"team": "finance"}, "annotations": {"reviewed": "yes"}}),
+        "root adaptation keeps the envelope metadata"
+    );
+    let source = story("company-sharing-policy.pdf");
+    let [local] = CardDefinition::from(&local_policy("1.0.0", &source))
+        .declaration()
+        .expect("a local Artifact root validates")
+        .artifacts
+        .try_into()
+        .expect("the root is its own publication");
+    assert_eq!((local.source, local.extract), (source, true));
+    assert!(matches!(
+        wyrd_ai::cards::Declarable::from(&artifact),
+        wyrd_ai::cards::Declarable::Card(_)
+    ));
+    assert!(matches!(
+        wyrd_ai::cards::Declarable::from(artifact),
+        wyrd_ai::cards::Declarable::Card(_)
+    ));
     for (kind, spec) in [
         (
             CardKind::Policy,
@@ -1511,7 +1547,7 @@ fn public_paths_author_every_native_family() {
             ),
             (
                 "each",
-                Check::each("inputs.report.items[*]", operator.clone(), 1),
+                Check::each("inputs.report.items[*]", operator.clone(), 1).into(),
                 json!({"kind": "assert", "each": "inputs.report.items[*]", "operator": operator, "expected": 1}),
             ),
             (
@@ -1674,6 +1710,8 @@ fn public_paths_author_every_native_family() {
         .declaration()
         .expect("valid graph")
         .input
+        .as_ref()
+        .expect("an ordinary graph")
         .submissions
         .iter()
         .map(|submission| submission.kind.clone())
@@ -1719,5 +1757,82 @@ fn public_paths_author_every_native_family() {
             })
         ),
         "a whole-field setter replaces an earlier binding"
+    );
+
+    let mounted = local_policy("1.0.0", &story("company-sharing-policy.pdf"));
+    let agent_call = |judge: &str| {
+        let mut call =
+            Action::agent(policy_judge(judge, "1.0.0")).inputs([("report", "inputs.report")]);
+        call.add_workspace("/inputs/policy.json", mounted.file(POLICY_FILE));
+        call
+    };
+    let agent_check = |judge: &str| {
+        let mut check =
+            Check::agent(policy_judge(judge, "1.0.0")).inputs([("report", "inputs.report")]);
+        check.add_workspace("/inputs/policy.json", mounted.file(POLICY_FILE));
+        check
+    };
+    let edited_call = agent_call("old-judge").agent(policy_judge("new-judge", "1.0.0"));
+    let edited_check = agent_check("old-judge").agent(policy_judge("new-judge", "1.0.0"));
+    let edited_each = Check::each("inputs.report.old[*]", "equals", 1)
+        .each("inputs.report.items[*]")
+        .operator("greater_than")
+        .expected(0);
+    let edited_extract = Action::extract("inputs.report").from("inputs.document");
+    assert_eq!(
+        edited_call,
+        agent_call("new-judge"),
+        "Action.agent replaces"
+    );
+    assert_eq!(
+        edited_check,
+        agent_check("new-judge"),
+        "Check.agent replaces"
+    );
+    assert_eq!(
+        edited_each,
+        Check::each("inputs.report.items[*]", "greater_than", 0),
+        "Check.each replaces"
+    );
+    assert_eq!(
+        edited_extract,
+        Action::extract("inputs.document"),
+        "Action.from replaces"
+    );
+    let edited = Verifier::new("edited", "1.0.0")
+        .inputs([
+            ("report", InputSlot::json(json!({"type": "object"}))),
+            ("document", InputSlot::media(["pdf"])),
+        ])
+        .steps([
+            Step::new("extract", edited_extract),
+            Step::new("judge", edited_call),
+        ])
+        .requirements([
+            Requirement::new("judged", "Judged", edited_check),
+            Requirement::new("each", "Each", edited_each),
+        ]);
+    assert_eq!(
+        edited.spec()["steps"][1]["action"]["kind"],
+        "agent",
+        "an edit keeps the discriminant"
+    );
+    assert_eq!(edited.spec()["requirements"][1]["check"]["kind"], "assert");
+    let declaration = CardDefinition::from(&edited)
+        .declaration()
+        .expect("valid graph");
+    let agents: Vec<String> = declaration
+        .input
+        .expect("an ordinary graph")
+        .submissions
+        .iter()
+        .filter(|submission| submission.kind == CardKind::Agent)
+        .map(|submission| submission.metadata.name.to_string())
+        .collect();
+    assert_eq!(agents, ["new-judge"], "the replaced Agent is not declared");
+    assert_eq!(
+        declaration.artifacts.len(),
+        1,
+        "the mounted policy survives the Agent replacement"
     );
 }

@@ -387,6 +387,8 @@ components:
     assert!(local.extract);
     let kinds: Vec<CardKind> = declaration
         .input
+        .as_ref()
+        .expect("an ordinary graph")
         .submissions
         .iter()
         .map(|submission| submission.kind.clone())
@@ -403,8 +405,22 @@ components:
             .count(),
         1
     );
-    assert!(declaration.input.artifact_sources.is_empty());
-    let wire = serde_json::to_string(&declaration.input.submissions).expect("serializes");
+    assert!(
+        declaration
+            .input
+            .as_ref()
+            .expect("an ordinary graph")
+            .artifact_sources
+            .is_empty()
+    );
+    let wire = serde_json::to_string(
+        &declaration
+            .input
+            .as_ref()
+            .expect("an ordinary graph")
+            .submissions,
+    )
+    .expect("serializes");
     assert!(
         !wire.contains("policy.pdf\""),
         "no local path reaches a submission: {wire}"
@@ -413,6 +429,75 @@ components:
         !wire.contains("\"status\""),
         "no derived status reaches a submission: {wire}"
     );
+
+    let selected = |file: ArtifactFile| {
+        CardDefinition::from(
+            Verifier::new("coded", "1.0.0")
+                .inputs([("report", InputSlot::json(Value::Null))])
+                .steps([Step::new("facts", Action::code(file, "facts"))]),
+        )
+        .declaration()
+    };
+    let descriptor = selected(
+        Artifact::new("checks", "1.0.0")
+            .artifact_kind("code")
+            .file("checks.py"),
+    )
+    .expect("a descriptor selection is a sibling of one Verifier root");
+    assert!(descriptor.artifacts.is_empty(), "nothing is published");
+    let input = descriptor.input.expect("an ordinary graph");
+    assert_eq!(
+        input
+            .submissions
+            .iter()
+            .map(|submission| submission.kind.clone())
+            .collect::<Vec<_>>(),
+        [CardKind::Artifact, CardKind::Verifier]
+    );
+    assert_eq!(
+        input.submissions[1].spec["steps"][0]["action"]["source"],
+        json!({"artifact": {"card": {"sibling": {"kind": "Artifact", "name": "checks", "version": "1.0.0"}}, "path": "checks.py"}})
+    );
+    let external =
+        json!({"kind": "Artifact", "name": "company-sharing-policy", "version": "1.0.0"});
+    for (file, publishes) in [
+        (policy().file("checks.py"), 1),
+        (
+            CardRef::artifact("company-sharing-policy", "1.0.0").file("checks.py"),
+            0,
+        ),
+    ] {
+        let declaration = selected(file).expect("valid graph");
+        assert_eq!(declaration.artifacts.len(), publishes);
+        assert_eq!(
+            declaration.input.expect("an ordinary graph").submissions[0].spec["steps"][0]["action"]
+                ["source"]["artifact"]["card"],
+            external,
+            "local and registered selections stay external"
+        );
+    }
+
+    policy()
+        .validate()
+        .expect("a local Artifact validates as its own root");
+    let root = CardDefinition::from(policy().labels([("team", "finance")]))
+        .declaration()
+        .expect("valid local root");
+    assert_eq!(root.input, None, "a local root declares no graph");
+    let [local] = root.artifacts.as_slice() else {
+        panic!("the root is its own publication: {root:?}");
+    };
+    assert_eq!(local.source, std::path::Path::new("policy.pdf"));
+    assert!(local.extract);
+    assert_eq!(
+        serde_json::to_value(&local.metadata.labels).expect("serializes"),
+        json!({"team": "finance"})
+    );
+    let refused = policy()
+        .artifact_kind("")
+        .validate()
+        .expect_err("a blank artifact_kind");
+    assert!(refuses(&refused, "artifact_kind"), "{refused:?}");
 }
 
 /// Adding a child captures its value, attempted duplicates are kept and
@@ -448,7 +533,12 @@ fn offline_edits_preserve_snapshots() {
     let declaration = CardDefinition::from(&service)
         .declaration()
         .expect("valid graph");
-    for submission in &declaration.input.submissions {
+    for submission in &declaration
+        .input
+        .as_ref()
+        .expect("an ordinary graph")
+        .submissions
+    {
         match submission.kind {
             CardKind::Agent => assert_eq!(submission.spec["run_config"]["max_iterations"], 3),
             CardKind::Verifier => assert!(submission.spec.get("requirements").is_none()),
@@ -515,6 +605,57 @@ fn offline_edits_preserve_snapshots() {
         matches!(conflict, WyrdError::SpecDuplicateSubmission { .. }),
         "{conflict:?}"
     );
+
+    let child = || Service::new("shared-child", "1.0.0").service_type("api");
+    let composed = |second: Service| {
+        CardDefinition::from(
+            Service::new("composite", "1.0.0")
+                .service_type("api")
+                .components([
+                    Component::new("first", child()),
+                    Component::new("second", second),
+                ]),
+        )
+        .declaration()
+    };
+    let explicit = composed(child().components([] as [Component; 0]))
+        .expect("an omitted and an explicitly empty list decode alike");
+    assert_eq!(
+        explicit,
+        composed(child()).expect("valid graph"),
+        "the explicit default declares as the omitted one"
+    );
+    assert_eq!(
+        explicit
+            .input
+            .as_ref()
+            .expect("an ordinary graph")
+            .submissions
+            .iter()
+            .filter(|submission| submission.metadata.name.as_str() == "shared-child")
+            .count(),
+        1,
+        "canonically equal definitions are one submission"
+    );
+    assert!(
+        matches!(
+            composed(child().description("different")),
+            Err(WyrdError::SpecDuplicateSubmission { .. })
+        ),
+        "a canonically different definition still conflicts"
+    );
+
+    let mut audit = Audit::new("release-audit", "1.0.0");
+    audit
+        .add_evidence_ref(Artifact::new("company-sharing-policy", "1.0.0").artifact_kind("file"))
+        .add_evidence_ref(policy());
+    assert!(
+        matches!(
+            CardDefinition::from(audit).declaration(),
+            Err(WyrdError::SpecDuplicateSubmission { .. })
+        ),
+        "a local and a spec-only Artifact of one identity conflict"
+    );
 }
 
 /// Construction and edits accept anything typed correctly; validation and
@@ -570,10 +711,12 @@ fn field_edits_defer_validation_and_preserve_snapshots() {
         "nothing is read on edit"
     );
     let refused = coded.validate().expect_err("the source does not exist yet");
-    assert!(
+    assert_eq!(
         diagnostics(&refused)
-            .iter()
-            .any(|(code, _)| code == "WYRD_LOADER_500_IO" || code.contains("IO")),
+            .into_iter()
+            .map(|(code, _)| code)
+            .collect::<Vec<_>>(),
+        ["WYRD_LOADER_400_IO"],
         "{refused:?}"
     );
     std::fs::write(&source, "def facts(report):\n    return {}\n").expect("source writes");
@@ -586,7 +729,12 @@ fn field_edits_defer_validation_and_preserve_snapshots() {
         .expect("the source reads");
     assert_ne!(first, second, "every snapshot reads the file afresh");
     assert_eq!(
-        second.input.submissions[0].spec["steps"][0]["action"]["source"],
+        second
+            .input
+            .as_ref()
+            .expect("an ordinary graph")
+            .submissions[0]
+            .spec["steps"][0]["action"]["source"],
         json!({"inline": "def facts(report):\n    return {'v': 2}\n"})
     );
 
@@ -662,6 +810,44 @@ fn yaml_and_code_share_diagnostics() {
             "case {index} refuses alike"
         );
     }
+
+    for (index, (yaml, raw)) in [("malformed", json!("malformed")), ("null", Value::Null)]
+        .into_iter()
+        .enumerate()
+    {
+        let file = directory.path().join(format!("raw-{index}.yaml"));
+        std::fs::write(
+            &file,
+            format!(
+                "apiVersion: wyrd/v1\nkind: Service\nmetadata: {{name: shared, version: 1.0.0}}\nspec: {yaml}\n"
+            ),
+        )
+        .expect("case writes");
+        let from_file = wyrd_loader::load(&file)
+            .and_then(wyrd_loader::build_declaration_input)
+            .map_err(WyrdError::from)
+            .expect_err("the YAML spec is not an object");
+        let from_code = CardDefinition::new(CardKind::Service, "shared", "1.0.0", raw)
+            .declaration()
+            .expect_err("the raw spec is not an object");
+        let file_label = file.display().to_string();
+        let file_diagnostics: Vec<_> = diagnostics(&from_file)
+            .into_iter()
+            .map(|(code, message)| (code, message.replace(&file_label, "<card>")))
+            .collect();
+        assert!(!file_diagnostics.is_empty(), "raw {yaml}: {from_file:?}");
+        assert_eq!(
+            diagnostics(&from_code)
+                .into_iter()
+                .map(|(code, message)| (code, message.replace("Service/shared@1.0.0", "<card>")))
+                .collect::<Vec<_>>(),
+            file_diagnostics,
+            "raw {yaml} refuses alike"
+        );
+    }
+    CardDefinition::new(CardKind::Service, "shared", "1.0.0", json!({}))
+        .declaration()
+        .expect("an empty object is a valid Service spec");
 }
 
 /// The `card_authoring` story's checked-in file at `relative`.
@@ -870,7 +1056,12 @@ fn declarations_match_file_authored_tree() {
             submission.metadata.name.to_string(),
         )
     };
-    let mut authored_submissions = authored.input.submissions.clone();
+    let mut authored_submissions = authored
+        .input
+        .as_ref()
+        .expect("an ordinary graph")
+        .submissions
+        .clone();
     let mut file_submissions = files.submissions.clone();
     authored_submissions.sort_by_key(identity);
     file_submissions.sort_by_key(identity);
@@ -887,7 +1078,13 @@ fn declarations_match_file_authored_tree() {
         assert!(authored.artifacts.is_empty() && file.artifacts.is_empty());
     }
     assert_eq!(
-        authored.input.submissions.last().map(identity),
+        authored
+            .input
+            .as_ref()
+            .expect("an ordinary graph")
+            .submissions
+            .last()
+            .map(identity),
         files.submissions.last().map(identity),
         "both declare the Service root last",
     );
@@ -903,7 +1100,7 @@ fn daily(cron: &str) -> Trigger {
 ///
 /// # Errors
 /// Returns [`CardDefinition::declaration`]'s refusal.
-fn call_declaration(call: Action) -> Result<Declaration, WyrdError> {
+fn call_declaration(call: impl Into<Action>) -> Result<Declaration, WyrdError> {
     Verifier::new("workspace", "1.0.0")
         .inputs([("report", InputSlot::json(Value::Null))])
         .steps([Step::new("judge", call)])
@@ -945,6 +1142,8 @@ fn replacements_keep_only_current_dependencies() {
     assert_eq!(declaration, declare(direct).expect("valid graph"));
     let triggers: Vec<&Value> = declaration
         .input
+        .as_ref()
+        .expect("an ordinary graph")
         .submissions
         .iter()
         .filter(|submission| submission.kind == CardKind::Trigger)
@@ -961,6 +1160,8 @@ fn replacements_keep_only_current_dependencies() {
         declare(registered)
             .expect("valid graph")
             .input
+            .as_ref()
+            .expect("an ordinary graph")
             .submissions
             .iter()
             .all(|submission| submission.kind != CardKind::Trigger),
@@ -987,6 +1188,8 @@ fn replacements_keep_only_current_dependencies() {
         .declaration()
         .expect("valid graph")
         .input
+        .as_ref()
+        .expect("an ordinary graph")
         .submissions
         .iter()
         .map(|submission| submission.metadata.name.to_string())
@@ -1048,6 +1251,42 @@ fn replacements_keep_only_current_dependencies() {
             .len(),
         1,
         "an Artifact still mounted elsewhere is still published",
+    );
+
+    let schema = |name: &str| Artifact::from_path(name, "1.0.0", "schema.json");
+    let payload = Artifact::from_path("payload", "1.0.0", "payload.json")
+        .schema_ref(schema("old-schema"))
+        .schema_ref(schema("payload-schema"));
+    let mut audit = Audit::new("payload-audit", "1.0.0");
+    audit
+        .add_evidence_ref(payload.clone())
+        .add_evidence_ref(schema("payload-schema"));
+    let declaration = CardDefinition::from(&audit)
+        .declaration()
+        .expect("valid graph");
+    let published: Vec<&str> = declaration
+        .artifacts
+        .iter()
+        .map(|artifact| artifact.metadata.name.as_str())
+        .collect();
+    assert_eq!(
+        published,
+        ["payload-schema", "payload"],
+        "a nested local schema publishes first, once, and a replaced one not at all"
+    );
+    assert_eq!(
+        serde_json::to_value(&declaration.artifacts[1].spec).expect("serializes")["schema_ref"],
+        json!({"kind": "Artifact", "name": "payload-schema", "version": "1.0.0"}),
+        "the payload references its schema by exact identity"
+    );
+    let unresolved = Audit::new("payload-audit", "1.0.0")
+        .evidence_refs([payload.clone().schema_ref("./missing-schema.yaml")]);
+    let refused = unresolved
+        .validate()
+        .expect_err("a local Artifact's path reference is unresolved");
+    assert!(
+        refuses(&refused, "unresolved path reference"),
+        "{refused:?}"
     );
 }
 

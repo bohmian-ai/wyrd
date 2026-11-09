@@ -1,15 +1,14 @@
 //! The named Card types other than Verifier, and the Service component and
 //! verification binding values.
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use serde_json::Value;
-use wyrd_loader::Diagnostic;
-use wyrd_spec::envelope::{CardKind, Spec};
+use wyrd_spec::envelope::CardKind;
 
 use super::{
-    ArtifactFile, Body, Captures, Card, CardDefinition, CardRef, FieldValue, LocalArtifact,
-    Verifier, card_methods, fields, selection,
+    ArtifactFile, Body, Card, CardDefinition, CardRef, FieldValue, Verifier, card_methods, fields,
+    selection,
 };
 
 /// Generate a named Card type: its struct, `new`, the shared Card methods,
@@ -123,7 +122,9 @@ fields!(Prompt [card.spec] {
 });
 
 card_kind!(
-    /// A Model Card.
+    /// A Model Card: a trained model's interface, task, and signature. A
+    /// heavy Card, its weights are registered before any graph that
+    /// references it, so lineage names the exact model judged.
     Model => Model
 );
 
@@ -136,7 +137,9 @@ fields!(Model [card.spec] {
 });
 
 card_kind!(
-    /// A Data Card.
+    /// A Data Card: a dataset's interface, schema, splits, and target
+    /// columns. A heavy Card, its bytes are registered before any graph
+    /// that references it, so lineage names the exact data covered.
     Data => Data
 );
 
@@ -151,7 +154,9 @@ fields!(Data [card.spec] {
 });
 
 card_kind!(
-    /// An Experiment Card.
+    /// An Experiment Card: the targets and parameters of a set of runs,
+    /// with their summary metrics and best run. A heavy Card, it is
+    /// registered before any graph that references it.
     Experiment => Experiment
 );
 
@@ -219,29 +224,17 @@ fields!(Operator [card.spec] {
     one budget: Value = "budget";
 });
 
-/// An Artifact Card: a local file or directory published before the graph
-/// that references it, or an Artifact defined only by its spec.
-#[derive(Debug, Clone, PartialEq)]
-pub struct Artifact {
-    /// The Card under construction.
-    card: Card,
-    /// The local file or directory to publish, if any.
-    source: Option<PathBuf>,
-    /// Whether supported documents are extracted beside their originals.
-    extract: bool,
-}
+card_kind!(
+    /// An Artifact Card: a local file or directory published before the graph
+    /// that references it, or an Artifact defined only by its spec, which is
+    /// declared in its graph like any sibling Card.
+    ///
+    /// Declared or validated as a root, a local Artifact is its own sole
+    /// publication.
+    Artifact => Artifact
+);
 
 impl Artifact {
-    /// An empty Artifact Card named `name` at `version` with no local
-    /// source; it is declared in its graph like any sibling Card.
-    pub fn new(name: impl Into<String>, version: impl Into<String>) -> Self {
-        Self {
-            card: Card::new(CardKind::Artifact, name, version),
-            source: None,
-            extract: false,
-        }
-    }
-
     /// The `file` Artifact named `name` at `version`, published from the
     /// file or directory at `path` before its graph; nothing is read until
     /// it is published.
@@ -251,7 +244,7 @@ impl Artifact {
         path: impl AsRef<Path>,
     ) -> Self {
         let mut artifact = Self::new(name, version).artifact_kind("file");
-        artifact.source = Some(path.as_ref().to_path_buf());
+        artifact.card.source = Some(path.as_ref().to_path_buf());
         artifact
     }
 
@@ -259,55 +252,22 @@ impl Artifact {
     /// when the local source is published.
     #[must_use]
     pub fn extract(mut self, extract: bool) -> Self {
-        self.extract = extract;
+        self.card.extract = extract;
         self
     }
 
     /// Select the fixed file or directory prefix `path` of this exact
-    /// Artifact version; a local source is published first.
+    /// Artifact version, referenced as the Artifact itself is at any
+    /// reference position: a sibling without a local source, otherwise an
+    /// exact external reference published first.
     pub fn file(&self, path: impl Into<String>) -> ArtifactFile {
         let reference = FieldValue::from(self.clone());
         ArtifactFile(FieldValue {
-            value: selection(self.card.card_ref().value(), path.into()),
+            value: selection(reference.value, path.into()),
             captures: reference.captures,
         })
     }
-
-    /// This Artifact's local declaration, once validated.
-    ///
-    /// # Errors
-    /// Returns every diagnostic for this Artifact.
-    pub(super) fn local(&self) -> Result<Option<LocalArtifact>, Vec<Diagnostic>> {
-        let Some(source) = &self.source else {
-            return Ok(None);
-        };
-        let card = self.card.decode()?;
-        let Spec::Artifact(spec) = card.spec else {
-            return Ok(None);
-        };
-        spec.validate().map_err(|error| {
-            vec![Diagnostic::from_wyrd_error(
-                self.card.label(),
-                wyrd_loader::Severity::Error,
-                None,
-                &error,
-            )]
-        })?;
-        Ok(Some(LocalArtifact {
-            metadata: card.metadata,
-            spec,
-            source: source.clone(),
-            extract: self.extract,
-        }))
-    }
-
-    /// Whether this Artifact publishes from a local source.
-    pub(super) fn is_local(&self) -> bool {
-        self.source.is_some()
-    }
 }
-
-card_methods!(Artifact);
 
 fields!(Artifact [card.spec] {
     one artifact_kind: Value = "artifact_kind";
@@ -320,23 +280,6 @@ fields!(Artifact [card.spec] {
     one external_uri: Value = "external_uri";
     map metadata, add_metadata: Value = "metadata";
 });
-
-impl From<Artifact> for FieldValue {
-    /// A local Artifact is an exact external reference published first; any
-    /// other is a sibling reference declared in the same graph.
-    fn from(artifact: Artifact) -> Self {
-        if !artifact.is_local() {
-            return Self::from(CardDefinition(artifact.card));
-        }
-        Self {
-            value: artifact.card.card_ref().value(),
-            captures: Captures {
-                artifacts: vec![artifact],
-                ..Captures::default()
-            },
-        }
-    }
-}
 
 /// One Service component: an alias for a referenced Card and the Verifiers
 /// that check it.

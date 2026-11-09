@@ -39,14 +39,16 @@ use std::path::{Path, PathBuf};
 use serde_json::{Map, Value, json};
 use wyrd_loader::{DeclarationInput, Diagnostic, LoadError, Severity};
 use wyrd_spec::card::artifact::ArtifactSpec;
-use wyrd_spec::envelope::{CardKind, Metadata};
+use wyrd_spec::envelope::{CardKind, Metadata, Spec};
 use wyrd_spec::error::WyrdError;
 
 pub use kinds::{
     Agent, Artifact, Audit, Binding, Component, Data, Experiment, Mcp, Model, Operator, Prompt,
     Service, Trigger,
 };
-pub use verifier::{Action, Check, InputSlot, Requirement, Step, Verifier};
+pub use verifier::{
+    Action, AgentAction, AgentCheck, Check, EachCheck, InputSlot, Requirement, Step, Verifier,
+};
 pub use wyrd_spec::verification::ExecutionPlan;
 
 /// One step of a location inside an authored value.
@@ -88,10 +90,9 @@ fn field_path(location: &[Segment]) -> String {
 /// snapshot reads.
 #[derive(Debug, Clone, Default, PartialEq)]
 struct Captures {
-    /// Referenced Card definitions, captured by value.
+    /// Referenced Card definitions, captured by value, local Artifacts
+    /// included.
     cards: Vec<CardDefinition>,
-    /// Referenced Artifacts published from a local source first.
-    artifacts: Vec<Artifact>,
     /// Map keys an add method received twice; validation refuses them.
     duplicates: Vec<Location>,
     /// Code-source positions filled from a local file at snapshot time.
@@ -102,7 +103,6 @@ impl Captures {
     /// Take over everything `other` captures.
     fn absorb(&mut self, other: Self) {
         self.cards.extend(other.cards);
-        self.artifacts.extend(other.artifacts);
         self.duplicates.extend(other.duplicates);
         self.files.extend(other.files);
     }
@@ -185,10 +185,17 @@ impl From<wyrd_spec::reference::CardRef> for FieldValue {
 }
 
 impl From<CardDefinition> for FieldValue {
-    /// A sibling reference to `card`, which is declared in the same graph.
+    /// A sibling reference to `card`, which is declared in the same graph,
+    /// or, for an Artifact with a local source, its exact external
+    /// reference, published first.
     fn from(card: CardDefinition) -> Self {
+        let reference = card.0.card_ref().value();
         Self {
-            value: json!({ "sibling": card.0.card_ref().value() }),
+            value: if card.0.source.is_some() {
+                reference
+            } else {
+                json!({ "sibling": reference })
+            },
             captures: Captures {
                 cards: vec![card],
                 ..Captures::default()
@@ -211,6 +218,10 @@ struct Body {
     /// A field whose object value is written into this object's own fields,
     /// as `#[serde(flatten)]` reads it.
     flatten: Option<&'static str>,
+    /// A value supplied in place of the whole object that is not an object,
+    /// such as a raw spec string; it stands as authored, so validation
+    /// refuses it as YAML would.
+    malformed: Option<Value>,
 }
 
 impl Body {
@@ -294,8 +305,12 @@ impl Body {
             .absorb(captures.under(&key));
     }
 
-    /// The object as authored, with any flattened field written in place.
+    /// The object as authored, with any flattened field written in place,
+    /// or the malformed value supplied in its place.
     fn value(&self) -> Value {
+        if let Some(malformed) = &self.malformed {
+            return malformed.clone();
+        }
         let mut fields = self.fields.clone();
         if let Some(flattened) = self.flatten
             && let Some(Value::Object(inner)) = fields.remove(flattened)
@@ -561,6 +576,12 @@ struct Card {
     metadata: Body,
     /// The spec.
     spec: Body,
+    /// The local file or directory an Artifact publishes from first, if
+    /// any; only an Artifact sets one.
+    source: Option<PathBuf>,
+    /// Whether that local source's supported documents are extracted
+    /// beside their originals.
+    extract: bool,
 }
 
 impl Card {
@@ -582,6 +603,8 @@ impl Card {
             version: version.into(),
             metadata: Body::default(),
             spec,
+            source: None,
+            extract: false,
         }
     }
 
@@ -680,6 +703,38 @@ impl Card {
             )]);
         }
         Ok(card)
+    }
+
+    /// This Artifact's sole publication from `source`, after its descriptor
+    /// passes the same decoding and tree validation as any Card.
+    ///
+    /// # Errors
+    /// Returns every diagnostic for this Artifact, such as an unresolved
+    /// path reference or a blank `artifact_kind`.
+    ///
+    /// # Panics
+    /// Never: only an Artifact Card has a local source.
+    fn local(&self, source: &Path) -> Result<LocalArtifact, Vec<Diagnostic>> {
+        let card = self.decode()?;
+        wyrd_loader::declaration_input_from_cards(std::slice::from_ref(&card))
+            .map_err(|error| error.diagnostics)?;
+        let Spec::Artifact(spec) = card.spec else {
+            unreachable!("only an Artifact Card has a local source");
+        };
+        spec.validate().map_err(|error| {
+            vec![Diagnostic::from_wyrd_error(
+                self.label(),
+                Severity::Error,
+                None,
+                &error,
+            )]
+        })?;
+        Ok(LocalArtifact {
+            metadata: card.metadata,
+            spec,
+            source: source.to_path_buf(),
+            extract: self.extract,
+        })
     }
 }
 
@@ -831,10 +886,16 @@ impl CardDefinition {
         version: impl Into<String>,
         spec: Value,
     ) -> Self {
-        let mut body = Body::default();
-        if let Value::Object(fields) = spec {
-            body.fields = fields;
-        }
+        let body = match spec {
+            Value::Object(fields) => Body {
+                fields,
+                ..Body::default()
+            },
+            malformed => Body {
+                malformed: Some(malformed),
+                ..Body::default()
+            },
+        };
         Self(Card::with_spec(kind, name, version, body))
     }
 
@@ -852,19 +913,20 @@ impl CardDefinition {
     }
 
     /// Snapshot and validate this Card's graph as its declaration: the local
-    /// Artifacts to publish first, in reference order, and the containing
+    /// Artifacts to publish first, dependencies first, and the containing
     /// graph's input.
     ///
-    /// Every code file is read now and every Card is decoded and validated
-    /// as its YAML file would be. Each referenced definition joins the graph
-    /// once; an equal definition referenced twice is one submission. A local
-    /// Artifact is referenced by its exact identity, so the graph does not
-    /// depend on publication, and no local path enters a submission.
+    /// Every code file is read now and every Card, local Artifacts
+    /// included, is decoded and validated as its YAML file would be. Each
+    /// referenced definition joins the graph once; definitions that decode
+    /// to the same Card are one submission. A local Artifact is referenced
+    /// by its exact identity, so the graph does not depend on publication,
+    /// and no local path enters a submission.
     ///
     /// # Errors
     /// Returns [`WyrdError::SpecDuplicateSubmission`] when two different
-    /// definitions, or two different local Artifacts, share one identity,
-    /// and `WYRD_LOADER_400_INVALID_ENVELOPE` carrying every diagnostic for
+    /// definitions share one identity, a local Artifact and a Card without
+    /// that source included, and `WYRD_LOADER_400_INVALID_ENVELOPE` carrying every diagnostic for
     /// an invalid graph: a malformed or incomplete field by its YAML path, a
     /// repeated key, an unreadable code file, a version that is not exact,
     /// and each shared tree validation refusal.
@@ -877,10 +939,12 @@ impl CardDefinition {
 /// own sole submission, then the containing graph.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Declaration {
-    /// Local Artifacts, in reference order, each published before the graph.
+    /// Local Artifacts, dependencies first, each published before the graph.
     pub artifacts: Vec<LocalArtifact>,
-    /// The containing graph, in dependency-first order with no local sources.
-    pub input: DeclarationInput,
+    /// The containing graph, in dependency-first order with no local sources;
+    /// `None` when the root is itself a local Artifact, whose publication,
+    /// last in `artifacts`, is the whole declaration.
+    pub input: Option<DeclarationInput>,
 }
 
 /// One validated local Artifact to publish before its graph.
@@ -896,13 +960,11 @@ pub struct LocalArtifact {
     pub extract: bool,
 }
 
-/// The distinct Cards and local Artifacts reachable from one root.
+/// The distinct Cards, local Artifacts included, reachable from one root.
 #[derive(Default)]
 struct Graph {
     /// Cards without their captures, dependencies first.
     cards: Vec<Card>,
-    /// Distinct local Artifacts, in reference order.
-    artifacts: Vec<Artifact>,
 }
 
 impl Graph {
@@ -915,46 +977,34 @@ impl Graph {
         graph.absorb(captures)?;
         let mut diagnostics = Vec::new();
         let mut authored = Vec::new();
-        for card in &graph.cards {
-            match card.decode() {
-                Ok(card) => authored.push(card),
-                Err(errors) => diagnostics.extend(errors),
-            }
-        }
         let mut artifacts = Vec::new();
-        for artifact in &graph.artifacts {
-            match artifact.local() {
-                Ok(local) => artifacts.extend(local),
-                Err(errors) => diagnostics.extend(errors),
+        for card in &graph.cards {
+            let decoded = match &card.source {
+                Some(source) => card.local(source).map(|local| artifacts.push(local)),
+                None => card.decode().map(|card| authored.push(card)),
+            };
+            if let Err(errors) = decoded {
+                diagnostics.extend(errors);
             }
         }
         if !diagnostics.is_empty() {
             return Err(LoadError::multiple(diagnostics).into());
         }
-        Ok(Declaration {
-            artifacts,
-            input: wyrd_loader::declaration_input_from_cards(&authored)?,
-        })
+        let input = if authored.is_empty() {
+            None
+        } else {
+            Some(wyrd_loader::declaration_input_from_cards(&authored)?)
+        };
+        Ok(Declaration { artifacts, input })
     }
 
-    /// Add every Card and local Artifact `captures` references, each Card
+    /// Add every Card `captures` references, local Artifacts included, each
     /// after everything it references.
     ///
     /// # Errors
     /// Returns [`WyrdError::SpecDuplicateSubmission`] for a different
     /// definition of an identity already added.
     fn absorb(&mut self, captures: Captures) -> Result<(), WyrdError> {
-        for artifact in captures.artifacts {
-            match self
-                .artifacts
-                .iter()
-                .find(|known| known.card_ref() == artifact.card_ref())
-            {
-                Some(known) if *known == artifact => {}
-                Some(_) => return Err(conflict(&artifact.card_ref())),
-                None => self.artifacts.push(artifact),
-            }
-        }
         for CardDefinition(card) in captures.cards {
             self.absorb(card.spec.captures())?;
             match self
@@ -971,13 +1021,18 @@ impl Graph {
     }
 }
 
-/// Whether two definitions of one identity are the same submission.
+/// Whether two definitions of one identity are the same submission: the
+/// same local source, if any, and the same decoded Card, however each
+/// spelled its defaults.
 ///
-/// Unreadable code files compare as their descriptors; their snapshot
+/// A definition that does not decode compares as authored; its snapshot
 /// refuses later.
 fn same_content(left: &Card, right: &Card) -> bool {
-    match (left.envelope(), right.envelope()) {
-        (Ok(left), Ok(right)) => left == right,
+    if (&left.source, left.extract) != (&right.source, right.extract) {
+        return false;
+    }
+    match (left.decode(), right.decode()) {
+        (Ok(left), Ok(right)) => left.metadata == right.metadata && left.spec == right.spec,
         _ => left == right,
     }
 }

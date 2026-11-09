@@ -20,6 +20,14 @@ use wyrd_ai::state::WyrdState;
 use wyrd_ai::verify::Inputs;
 use wyrd_ai::{RequirementOutcome, VerificationResult};
 
+/// Build the finance release in code, declare it with
+/// [`WyrdState::declare`], which uploads the policy first, and print the
+/// verdict of a permitted release and of one naming a bank account.
+///
+/// # Errors
+/// Returns the ambient client's configuration or credential error, the
+/// declaration's refusal (an invalid graph, an unreadable policy file, or
+/// the registry's refusal), and a verification run's error.
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     // The company sharing policy, uploaded from this directory, with the

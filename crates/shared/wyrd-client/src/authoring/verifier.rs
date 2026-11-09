@@ -265,8 +265,10 @@ impl Action {
 
     /// Invoke `agent`: an [`super::Agent`], an exact [`super::CardRef`], a
     /// YAML reference path, or inline Agent JSON.
-    pub fn agent(agent: impl Into<FieldValue>) -> Self {
-        Self::of("agent", [("agent", agent.into())])
+    pub fn agent(agent: impl Into<FieldValue>) -> AgentAction {
+        AgentAction {
+            body: Self::of("agent", [("agent", agent.into())]).body,
+        }
     }
 
     /// Run `entrypoint` of `source` as sandboxed code returning JSON data.
@@ -282,6 +284,7 @@ impl Action {
 }
 
 fields!(Action [body] {
+    one from: Value = "from";
     map inputs, add_input: Value = "inputs";
     map workspace, add_workspace: FieldValue = "workspace";
     one source: FieldValue = "source";
@@ -292,6 +295,34 @@ fields!(Action [body] {
 impl From<Action> for FieldValue {
     /// The canonical action object.
     fn from(action: Action) -> Self {
+        action.body.into_field()
+    }
+}
+
+/// An Agent action, as [`Action::agent`] builds it: its own `agent` field
+/// is editable here, where [`Action`]'s constructor holds that name.
+#[derive(Debug, Clone, PartialEq)]
+pub struct AgentAction {
+    /// The action's fields, `kind: agent` included.
+    body: Body,
+}
+
+fields!(AgentAction [body] {
+    one agent: FieldValue = "agent";
+    map inputs, add_input: Value = "inputs";
+    map workspace, add_workspace: FieldValue = "workspace";
+});
+
+impl From<AgentAction> for Action {
+    /// The same Agent action.
+    fn from(action: AgentAction) -> Self {
+        Self { body: action.body }
+    }
+}
+
+impl From<AgentAction> for FieldValue {
+    /// The canonical action object.
+    fn from(action: AgentAction) -> Self {
         action.body.into_field()
     }
 }
@@ -334,15 +365,16 @@ impl Check {
         each: impl Into<String>,
         operator: impl Into<Value>,
         expected: impl Into<Value>,
-    ) -> Self {
-        Self::of(
+    ) -> EachCheck {
+        let check = Self::of(
             "assert",
             [
                 ("each", FieldValue::from(each.into())),
                 ("operator", FieldValue::from(operator.into())),
                 ("expected", FieldValue::from(expected.into())),
             ],
-        )
+        );
+        EachCheck { body: check.body }
     }
 
     /// Compare the spans `span_selector` selects in the trace slot `on` with
@@ -365,8 +397,10 @@ impl Check {
     }
 
     /// Judge with `agent`, which returns the Verdict schema.
-    pub fn agent(agent: impl Into<FieldValue>) -> Self {
-        Self::of("agent", [("agent", agent.into())])
+    pub fn agent(agent: impl Into<FieldValue>) -> AgentCheck {
+        AgentCheck {
+            body: Self::of("agent", [("agent", agent.into())]).body,
+        }
     }
 
     /// Judge with `entrypoint` of `source`, which returns the Verdict schema.
@@ -413,6 +447,63 @@ fields!(Check [body] {
 impl From<Check> for FieldValue {
     /// The canonical check object.
     fn from(check: Check) -> Self {
+        check.body.into_field()
+    }
+}
+
+/// An assert check over every selected value, as [`Check::each`] builds it:
+/// its own `each` field is editable here, where [`Check`]'s constructor
+/// holds that name.
+#[derive(Debug, Clone, PartialEq)]
+pub struct EachCheck {
+    /// The check's fields, `kind: assert` included.
+    body: Body,
+}
+
+fields!(EachCheck [body] {
+    one each: Value = "each";
+    one operator: Value = "operator";
+    one expected: Value = "expected";
+});
+
+impl From<EachCheck> for Check {
+    /// The same assert check.
+    fn from(check: EachCheck) -> Self {
+        Self { body: check.body }
+    }
+}
+
+impl From<EachCheck> for FieldValue {
+    /// The canonical check object.
+    fn from(check: EachCheck) -> Self {
+        check.body.into_field()
+    }
+}
+
+/// An Agent check, as [`Check::agent`] builds it: its own `agent` field is
+/// editable here, where [`Check`]'s constructor holds that name.
+#[derive(Debug, Clone, PartialEq)]
+pub struct AgentCheck {
+    /// The check's fields, `kind: agent` included.
+    body: Body,
+}
+
+fields!(AgentCheck [body] {
+    one agent: FieldValue = "agent";
+    map inputs, add_input: Value = "inputs";
+    map workspace, add_workspace: FieldValue = "workspace";
+});
+
+impl From<AgentCheck> for Check {
+    /// The same Agent check.
+    fn from(check: AgentCheck) -> Self {
+        Self { body: check.body }
+    }
+}
+
+impl From<AgentCheck> for FieldValue {
+    /// The canonical check object.
+    fn from(check: AgentCheck) -> Self {
         check.body.into_field()
     }
 }

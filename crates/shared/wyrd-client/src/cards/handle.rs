@@ -265,8 +265,9 @@ impl Cards {
     /// ([`crate::authoring::CardDefinition::declaration`]), so an invalid
     /// graph publishes nothing; each local Artifact it references is then
     /// published as its own sole submission through
-    /// [`Self::upload_artifact`], in reference order, and the graph is
-    /// declared last. A registered reference is used as is, with nothing
+    /// [`Self::upload_artifact`], dependencies first, and the graph is
+    /// declared last. A local Artifact declared as the root is its own
+    /// publication, and its receipt is returned. A registered reference is used as is, with nothing
     /// read or uploaded. Every submission follows the registry's version
     /// rules, so an unchanged rerun declares nothing new. Local source paths
     /// never enter a request body.
@@ -298,16 +299,25 @@ impl Cards {
             Declarable::Path(path) => self.declare_from_path(path).await,
             Declarable::Card(card) => {
                 let declaration = card.declaration()?;
+                let mut published = None;
                 for artifact in declaration.artifacts {
-                    self.upload_artifact(
-                        &artifact.source,
-                        artifact.metadata,
-                        artifact.spec,
-                        artifact.extract,
-                    )
-                    .await?;
+                    published = Some(
+                        self.publish_artifact(
+                            artifact.source,
+                            artifact.metadata,
+                            artifact.spec,
+                            artifact.extract,
+                        )
+                        .await?,
+                    );
                 }
-                self.submit(&declaration.input).await
+                match (declaration.input, published) {
+                    (Some(input), _) => self.submit(&input).await,
+                    (None, Some(root)) => Ok(root),
+                    (None, None) => Err(WyrdError::internal(
+                        "an authored declaration held neither a graph nor an Artifact",
+                    )),
+                }
             }
         }
     }
@@ -317,6 +327,13 @@ impl Cards {
     /// # Errors
     /// Returns the saga's validation, declaration, upload, or completion
     /// error.
+    ///
+    /// # Cancellation
+    /// As [`crate::cards::saga::declare`]: dropping the future after
+    /// submission leaves the server-owned declaration as it stands, possibly
+    /// pending with its files partially uploaded, and nothing is rolled
+    /// back. A retry is a fresh call under the registry's ordinary version
+    /// rules, not a resumption.
     async fn submit(&self, input: &DeclarationInput) -> Result<DeclarationReceipt, WyrdError> {
         crate::cards::saga::declare(&self.engine, input, None)
             .await
@@ -360,13 +377,36 @@ impl Cards {
         spec: crate::cards::ArtifactSpec,
         extract: bool,
     ) -> Result<CardRef, WyrdError> {
-        let source = source.as_ref().to_path_buf();
+        let receipt = self
+            .publish_artifact(source.as_ref().to_path_buf(), metadata, spec, extract)
+            .await?;
+        Ok(receipt.root)
+    }
+
+    /// Prepare and declare one Artifact upload, returning the ordinary
+    /// declaration receipt; the work of [`Self::upload_artifact`].
+    ///
+    /// The prepared upload, and with it any extraction scratch directory,
+    /// lives until the declaration has transferred every file.
+    ///
+    /// # Errors
+    /// As [`Self::upload_artifact`].
+    ///
+    /// # Cancellation
+    /// As [`Self::upload_artifact`].
+    async fn publish_artifact(
+        &self,
+        source: std::path::PathBuf,
+        metadata: crate::cards::Metadata,
+        spec: crate::cards::ArtifactSpec,
+        extract: bool,
+    ) -> Result<DeclarationReceipt, WyrdError> {
         let upload = tokio::task::spawn_blocking(move || {
             wyrd_loader::ArtifactUpload::prepare(&source, metadata, spec, extract)
         })
         .await
         .map_err(|error| WyrdError::internal(format!("artifact preparation stopped: {error}")))??;
-        Ok(self.submit(&upload.input).await?.root)
+        self.submit(&upload.input).await
     }
 
     /// The server-authoritative file inventory of one Card: each file's

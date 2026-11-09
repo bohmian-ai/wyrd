@@ -12,7 +12,6 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use serde_json::Value;
 
-use wyrd_spec::card::verifier::VerifierSpec;
 use wyrd_spec::card::verifier::{PathSegment, Reference, ReferenceRoot, Requirement, VerdictField};
 use wyrd_spec::ids::SlotName;
 use wyrd_spec::verification::TaskId;
@@ -29,7 +28,7 @@ use crate::walk::RunLedger;
 pub(super) enum Cause {
     /// An intentional skip: a false `when`, or blocked only by one.
     Skipped,
-    /// A failure, timeout, or otherwise missing required value.
+    /// A failure, timeout, or otherwise missing value.
     Failed,
 }
 
@@ -53,7 +52,7 @@ pub(super) struct Missing {
 }
 
 impl Missing {
-    /// A missing value caused by a failure or absent required evidence.
+    /// A missing value caused by a failure or absent evidence.
     pub(super) fn failed(reason: impl Into<String>) -> Self {
         Self {
             cause: Cause::Failed,
@@ -122,8 +121,6 @@ pub(super) enum Done {
 /// The scope document of one stage: the original evidence plus every block
 /// earlier stages settled. Read-only; the stage walk owns the ledger.
 pub(super) struct Scope<'a> {
-    /// The executing Verifier, for slot declarations.
-    spec: &'a VerifierSpec,
     /// The pinned original evidence by slot.
     evidence: &'a BTreeMap<SlotName, InputDeclaration>,
     /// Blocks settled by earlier stages.
@@ -133,15 +130,10 @@ pub(super) struct Scope<'a> {
 impl<'a> Scope<'a> {
     /// The scope over the original evidence and the blocks in `ledger`.
     pub(super) fn new(
-        spec: &'a VerifierSpec,
         evidence: &'a BTreeMap<SlotName, InputDeclaration>,
         ledger: &'a RunLedger<Done>,
     ) -> Self {
-        Self {
-            spec,
-            evidence,
-            ledger,
-        }
+        Self { evidence, ledger }
     }
 
     /// Returns a settled step's state.
@@ -188,12 +180,12 @@ impl<'a> Scope<'a> {
     ///
     /// A JSON input or step output is navigated by the reference's child
     /// selectors; a whole media or trace slot resolves to its pinned
-    /// declaration. An omitted optional slot is `null`. Step statuses and
-    /// verdict fields resolve to their wire strings.
+    /// declaration. An omitted slot is missing, never `null`. Step statuses
+    /// and verdict fields resolve to their wire strings.
     ///
     /// # Errors
     /// Returns [`Missing`] carrying the upstream cause for the output of a
-    /// step that produced none, and a failure for an omitted required slot,
+    /// step that produced none, and a failure for an omitted slot,
     /// an unsettled step or verdict, or a selector that matches nothing.
     pub(super) fn resolve(
         &self,
@@ -214,19 +206,7 @@ impl<'a> Scope<'a> {
                         sources,
                     }),
                     Some(_) => Err(unresolved()),
-                    None if self
-                        .spec
-                        .inputs
-                        .get(slot)
-                        .is_some_and(|slot| !slot.required()) =>
-                    {
-                        select(&Value::Null, &reference.path)
-                            .map(|value| json_input(value, sources))
-                            .ok_or_else(unresolved)
-                    }
-                    None => Err(Missing::failed(format!(
-                        "required input `{slot}` was not supplied"
-                    ))),
+                    None => Err(Missing::failed(format!("input `{slot}` was not supplied"))),
                 }
             }
             ReferenceRoot::StepOutput(step) => match self.step(step) {

@@ -30,7 +30,7 @@ spec:
           encrypted: {type: boolean}
           restricted_access: {type: boolean}
           public_sharing: {type: boolean}
-    notes: {type: json, schema: {type: string}, required: false}
+    notes: {type: json, schema: {type: string}}
   steps:
     - id: recipient
       action:

@@ -79,16 +79,14 @@ fn yaml<T: serde::de::DeserializeOwned>(text: &str) -> T {
         .expect("canonical value decodes")
 }
 
-/// A Verifier exercising every Action and Check variant, both input
-/// requirednesses, an explicit dependency, and both editing styles.
+/// A Verifier exercising every Action and Check variant, a bare JSON Schema
+/// input, an explicit dependency, and both editing styles.
 fn every_primitive() -> Verifier {
     let mut verifier = Verifier::new("release-access", "1.0.0")
         .description("Every authoring primitive")
-        .inputs([
-            ("report", InputSlot::json(json!({"type": "object"}))),
-            ("purpose", InputSlot::json(Value::Null).required(false)),
-        ]);
+        .inputs([("report", InputSlot::json(json!({"type": "object"})))]);
     verifier
+        .add_input("purpose", json!({"type": "string"}))
         .add_input("document", InputSlot::media(["pdf"]))
         .add_input("trace", InputSlot::trace());
 
@@ -110,8 +108,8 @@ fn every_primitive() -> Verifier {
         "policy_context",
     );
     context
-        .add_input("report", "inputs.report")
-        .add_input("purpose", "inputs.purpose");
+        .bind_input("report", "inputs.report")
+        .bind_input("purpose", "inputs.purpose");
     let mut context_step = Step::new("policy-context", context)
         .when(json!({"path": "steps.policy.output.verdict", "operator": "equals", "expected": "pass"}))
         .timeout_seconds(30)
@@ -191,7 +189,7 @@ fn core_primitives_match_canonical_contracts() {
 description: Every authoring primitive
 inputs:
   report: {type: json, schema: {type: object}}
-  purpose: {type: json, required: false}
+  purpose: {type: json, schema: {type: string}}
   document: {type: media, formats: [pdf]}
   trace: {type: trace}
 steps:
@@ -739,7 +737,7 @@ fn field_edits_defer_validation_and_preserve_snapshots() {
     );
 
     coded.validate().expect("valid");
-    coded.add_input("broken", InputSlot::json(Value::Null).required("yes"));
+    coded.add_input("broken", InputSlot::json(Value::Null).max_bytes("yes"));
     let refused = coded
         .validate()
         .expect_err("an edit after validate is revalidated");
@@ -776,7 +774,7 @@ fn yaml_and_code_share_diagnostics() {
         (
             "inputs: {report: {type: trace, max_bytes: 1}}\n",
             Verifier::new("shared", "1.0.0")
-                .inputs([("report", InputSlot::json(Value::Null).required(true))])
+                .inputs([("report", InputSlot::json(Value::Null))])
                 .inputs([("report", InputSlot::trace().max_bytes(1))]),
         ),
     ];
@@ -934,18 +932,18 @@ fn finance_release(policy: ArtifactFile) -> Service {
         .inputs(release_inputs());
     report_policy.add_input(
         "report",
-        InputSlot::json(json!({
+        json!({
             "type": "object",
             "additionalProperties": false,
             "required": ["text"],
             "properties": {"text": {"type": "string"}},
-        })),
+        }),
     );
-    let mut judge = Check::agent(reviewer.clone()).inputs(
-        ["report", "recipient", "purpose", "destination"]
-            .map(|name| (name, format!("inputs.{name}"))),
-    );
-    judge.add_workspace("/inputs/policy.json", policy);
+    let mut judge = Check::agent(reviewer.clone())
+        .inputs(["report", "recipient", "purpose"].map(|name| (name, format!("inputs.{name}"))));
+    judge
+        .bind_input("destination", "inputs.destination")
+        .add_workspace("/inputs/policy.json", policy);
     let mut scan = fact_step(
         "policy",
         "report_facts",
@@ -981,10 +979,7 @@ fn finance_release(policy: ArtifactFile) -> Service {
         .description("The recipient and destination may receive the report.")
         .inputs(release_inputs());
     release_access
-        .add_input(
-            "notes",
-            InputSlot::json(json!({"type": "string"})).required(false),
-        )
+        .add_input("notes", json!({"type": "string"}))
         .add_step(fact_step(
             "recipient",
             "recipient_facts",
@@ -1321,12 +1316,18 @@ fn canonical_objects_match_constructed_values() {
         FieldValue::from(InputSlot::from(json!("verifiers.a.inputs.report"))).value,
         json!("verifiers.a.inputs.report")
     );
+    for slot in [
+        json!({"type": "string"}),
+        json!({"type": "json", "schema": {"type": "string"}}),
+    ] {
+        assert_eq!(
+            FieldValue::from(InputSlot::from(slot)).value,
+            FieldValue::from(InputSlot::json(json!({"type": "string"}))).value
+        );
+    }
     assert_eq!(
-        FieldValue::from(InputSlot::from(
-            json!({"type": "json", "schema": {"type": "string"}, "required": false})
-        ))
-        .value,
-        FieldValue::from(InputSlot::json(json!({"type": "string"})).required(false)).value
+        FieldValue::from(InputSlot::from(json!({"type": "trace"}))).value,
+        FieldValue::from(InputSlot::trace()).value
     );
     assert_eq!(
         FieldValue::from(Binding::from(json!({"verifier": "./v.yaml"}))).value,

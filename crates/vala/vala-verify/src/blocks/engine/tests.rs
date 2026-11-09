@@ -894,23 +894,34 @@ async fn elapsed_deadline_refuses_ready_work() {
     }
 }
 
-/// A missing required slot is inconclusive, an omitted optional slot is
-/// `null` for an explicit null assertion, and a child of an omitted slot or
-/// an absent output field is missing rather than `null`.
+/// Omitted evidence stays missing, never `null`: an assertion on an omitted
+/// slot or its child, an action binding it, a `when` condition reading it,
+/// and a trace check on an omitted trace are inconclusive, never passed or
+/// intentionally skipped, and an absent output field is missing too. An
+/// independent supplied-input check still runs and passes, and the overall
+/// verdict aggregates as before.
 ///
 /// # Panics
-/// Panics when an outcome differs.
+/// Panics when an outcome, reason, call, or verdict differs.
 #[tokio::test(start_paused = true)]
-async fn missing_and_optional_evidence_resolve_honestly() {
+async fn missing_evidence_is_inconclusive_never_null() {
     let assert = |id: &str, path: &str, operator: &str| json!({"id": id, "statement": id, "check": {"kind": "assert", "path": path, "operator": operator}});
     let spec = verifier(json!({
-        "inputs": {"answer": {"type": "json"}, "note": {"type": "json", "required": false}, "policy": {"type": "media", "formats": ["pdf"]}},
-        "steps": [{"id": "pages", "action": {"kind": "extract", "from": "inputs.policy"},
-                   "requirements": [assert("has-pages", "steps.pages.output.pages", "is_not_null")]}],
+        "inputs": {"answer": {"type": "json"}, "note": {"type": "json"}, "policy": {"type": "media", "formats": ["pdf"]}, "trace": {"type": "trace"}},
+        "steps": [
+            {"id": "pages", "action": {"kind": "extract", "from": "inputs.policy"},
+             "requirements": [assert("has-pages", "steps.pages.output.pages", "is_not_null")]},
+            {"id": "reads-note", "action": code_action(json!({"note": "inputs.note"})),
+             "requirements": [assert("note-read", "steps.reads-note.output", "is_not_null")]},
+            {"id": "gated", "when": {"path": "inputs.note", "operator": "is_null"},
+             "action": code_action(json!({"x": "inputs.answer"})),
+             "requirements": [assert("gated-ran", "inputs.answer", "is_not_null")]}
+        ],
         "requirements": [
             assert("no-note", "inputs.note", "is_null"),
             assert("note-text", "inputs.note.text", "is_null"),
             assert("absent-field", "inputs.answer.missing", "is_null"),
+            {"id": "no-call", "statement": "no-call", "check": {"kind": "trace", "on": "inputs.trace", "span_selector": "$.spans[?(@.name == 'call')]", "operator": "is_empty"}},
             assert("present", "inputs.answer.text", "is_not_null")
         ]
     }));
@@ -921,27 +932,40 @@ async fn missing_and_optional_evidence_resolve_honestly() {
         json!({"answer": {"text": "hi"}}),
     )
     .await
-    .expect("outcome");
+    .expect("omission is not a refusal");
     assert_eq!(
         outcomes(&outcome),
         BTreeMap::from([
             ("has-pages", RequirementOutcome::Inconclusive),
-            ("no-note", RequirementOutcome::Passed),
+            ("note-read", RequirementOutcome::Inconclusive),
+            ("gated-ran", RequirementOutcome::Inconclusive),
+            ("no-note", RequirementOutcome::Inconclusive),
             ("note-text", RequirementOutcome::Inconclusive),
             ("absent-field", RequirementOutcome::Inconclusive),
+            ("no-call", RequirementOutcome::Inconclusive),
             ("present", RequirementOutcome::Passed),
         ])
     );
-    assert!(
-        step(&outcome, "pages")
-            .reason
-            .as_deref()
-            .is_some_and(|r| r.contains("`policy` was not supplied"))
-    );
+    for (id, slot) in [
+        ("pages", "policy"),
+        ("reads-note", "note"),
+        ("gated", "note"),
+    ] {
+        assert!(
+            step(&outcome, id)
+                .reason
+                .as_deref()
+                .is_some_and(|r| r.contains(&format!("`{slot}` was not supplied"))),
+            "{id}: {:?}",
+            step(&outcome, id).reason
+        );
+    }
     assert!(
         script.calls().is_empty(),
-        "extract without evidence is never called"
+        "no block runs on missing evidence: {:?}",
+        script.calls()
     );
+    assert_eq!(outcome.verdict, VerificationVerdict::Inconclusive);
 }
 
 /// Supplied evidence that does not conform to its declared slot is refused
@@ -957,7 +981,7 @@ async fn nonconforming_evidence_is_refused_before_any_block() {
     let spec = verifier(json!({
         "inputs": {
             "x": {"type": "json", "schema": {"type": "integer"}},
-            "policy": {"type": "media", "formats": ["pdf"], "max_bytes": 10, "required": false}
+            "policy": {"type": "media", "formats": ["pdf"], "max_bytes": 10}
         },
         "steps": [{"id": "draft", "action": code_action(json!({"x": "inputs.x"}))}],
         "requirements": [{"id": "x", "statement": "x", "check": {"kind": "assert", "path": "inputs.x", "operator": "is_not_null"}}]
@@ -1043,47 +1067,35 @@ async fn nonconforming_evidence_is_refused_before_any_block() {
     assert_eq!(outcome.verdict, VerificationVerdict::Passed);
 }
 
-/// A supplied `null` is admitted or refused by the slot's schema alone,
-/// whether the slot is required or optional: a schema admitting `null`
-/// passes it through as `null`, and one rejecting `null` refuses it before
-/// any block runs.
+/// A supplied `null` is admitted or refused by the slot's schema alone: a
+/// schema admitting `null` passes it through as `null`, and one rejecting
+/// `null` refuses it before any block runs.
 ///
 /// # Panics
 /// Panics when a null-admitting slot refuses `null`, a null-rejecting one
 /// admits it, or an admitted `null` does not read as `null`.
 #[tokio::test(start_paused = true)]
-async fn supplied_null_follows_the_slot_schema_not_requiredness() {
-    let nullable = json!({"type": ["object", "null"]});
-    let strict = json!({"type": "object"});
+async fn supplied_null_follows_the_slot_schema() {
     let spec = verifier(json!({
         "inputs": {
-            "required_nullable": {"type": "json", "schema": nullable},
-            "optional_nullable": {"type": "json", "schema": nullable, "required": false},
-            "required_strict": {"type": "json", "schema": strict},
-            "optional_strict": {"type": "json", "schema": strict, "required": false},
+            "nullable": {"type": "json", "schema": {"type": ["object", "null"]}},
+            "strict": {"type": "json", "schema": {"type": "object"}},
         },
         "requirements": [
-            {"id": "required", "statement": "r", "check": {"kind": "assert", "path": "inputs.required_nullable", "operator": "is_null"}},
-            {"id": "optional", "statement": "o", "check": {"kind": "assert", "path": "inputs.optional_nullable", "operator": "is_null"}},
+            {"id": "nullable", "statement": "n", "check": {"kind": "assert", "path": "inputs.nullable", "operator": "is_null"}},
         ]
     }));
     let script = Arc::new(Script::default());
     let engine = engine(&script, InMemoryTraceSource::new(), 1);
-    let admitted = run(
-        &engine,
-        &spec,
-        json!({"required_nullable": null, "optional_nullable": null}),
-    )
-    .await
-    .expect("null-admitting slots admit null");
+    let admitted = run(&engine, &spec, json!({"nullable": null}))
+        .await
+        .expect("a null-admitting slot admits null");
     assert_eq!(admitted.verdict, VerificationVerdict::Passed);
-    for slot in ["required_strict", "optional_strict"] {
-        let refused = run(&engine, &spec, json!({ slot: null })).await;
-        assert!(
-            matches!(&refused, Err(EngineError::InputInvalid(reason)) if reason.contains(slot)),
-            "{slot}: {refused:?}"
-        );
-    }
+    let refused = run(&engine, &spec, json!({"strict": null})).await;
+    assert!(
+        matches!(&refused, Err(EngineError::InputInvalid(reason)) if reason.contains("strict")),
+        "{refused:?}"
+    );
     assert!(
         script.calls().is_empty(),
         "no block ran: {:?}",

@@ -96,8 +96,9 @@ impl From<Verifier> for FieldValue {
 
 /// One named evidence slot of a Verifier.
 ///
-/// Slots are required unless `required(false)` is set; samples and source
-/// slots are always required.
+/// Evidence a caller omits stays missing, never `null`: the checks that need
+/// it are inconclusive. A `json` slot's schema alone decides whether a
+/// supplied `null` is admitted.
 #[derive(Debug, Clone, PartialEq)]
 pub struct InputSlot {
     /// The slot's fields.
@@ -169,19 +170,24 @@ impl InputSlot {
 
 fields!(InputSlot [body] {
     one max_bytes: Value = "max_bytes";
-    one required: Value = "required";
 });
 
 impl From<Value> for InputSlot {
-    /// The canonical slot exactly as authored: a source slot's reference
-    /// string, or a slot object; any other value stands as authored, so
-    /// validation refuses it as YAML would.
+    /// A source slot's reference string, a canonical slot object exactly as
+    /// authored when its `type` is `json`, `media`, `trace` or `samples`, or
+    /// else the JSON Schema of a `json` slot. Values are schemas, never
+    /// examples to infer one from; validation refuses a malformed one.
     fn from(value: Value) -> Self {
+        let canonical = value
+            .get("type")
+            .and_then(Value::as_str)
+            .is_some_and(|kind| matches!(kind, "json" | "media" | "trace" | "samples"));
         match value {
             Value::String(text) => Self::source(text),
-            value => Self {
+            value if canonical => Self {
                 body: Body::authored(value),
             },
+            schema => Self::json(schema),
         }
     }
 }
@@ -303,7 +309,7 @@ impl Action {
 }
 
 fields!(Action [body] {
-    map inputs, add_input: Value = "inputs";
+    map inputs, bind_input: Value = "inputs";
     map workspace, add_workspace: FieldValue = "workspace";
     one runtime: Value = "runtime";
 });
@@ -415,7 +421,7 @@ impl Check {
 }
 
 fields!(Check [body] {
-    map inputs, add_input: Value = "inputs";
+    map inputs, bind_input: Value = "inputs";
     map workspace, add_workspace: FieldValue = "workspace";
     one runtime: Value = "runtime";
     one response_format: Value = "response_format";

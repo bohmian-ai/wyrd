@@ -298,10 +298,7 @@ fn access_verifier(version: &str, summarize: bool) -> Verifier {
         .description("The recipient and destination may receive the report.")
         .inputs(release_inputs());
     verifier
-        .add_input(
-            "notes",
-            InputSlot::json(json!({"type": "string"})).required(false),
-        )
+        .add_input("notes", json!({"type": "string"}))
         .add_step(fact_step(
             "recipient",
             "recipient_facts",
@@ -1523,37 +1520,32 @@ fn public_paths_author_every_native_family() {
         );
     }
 
-    let mut verifier = Verifier::new("inventory", "1.0.0")
-        .inputs([("report", InputSlot::json(json!({"type": "object"})))]);
-    for (name, schema, required) in [
-        (
-            "required_nullable",
-            json!({"type": ["object", "null"]}),
-            true,
-        ),
-        (
-            "optional_nullable",
-            json!({"type": ["object", "null"]}),
-            false,
-        ),
-        ("optional_strict", json!({"type": "object"}), false),
-    ] {
-        let slot = InputSlot::json(schema);
-        verifier.add_input(name, if required { slot } else { slot.required(false) });
-    }
+    let mut verifier =
+        Verifier::new("inventory", "1.0.0").inputs([("report", json!({"type": "object"}))]);
     verifier
+        .add_input("nullable", json!({"type": ["object", "null"]}))
         .add_input(
-            "document",
-            InputSlot::media(["pdf"]).max_bytes(1024).required(false),
+            "strict",
+            json!({"type": "json", "schema": {"type": "object"}}),
         )
-        .add_input("trace", InputSlot::trace().required(false));
+        .add_input("document", InputSlot::media(["pdf"]).max_bytes(1024))
+        .add_input("trace", InputSlot::trace());
+    let mut optional = verifier.clone();
+    optional.add_input("note", json!({"type": "json", "required": false}));
+    let refused = optional
+        .validate()
+        .expect_err("slot-level required is refused");
+    assert!(
+        refused.to_string().contains("unknown field `required`"),
+        "{refused}"
+    );
     let mut call: Action = Action::agent(CardRef::agent("judge", "1.0.0"));
-    call.add_input("report", "inputs.report")
+    call.bind_input("report", "inputs.report")
         .add_workspace("/inputs/report.json", "inputs.report")
         .add_workspace("/inputs/policy.json", registered_policy("1.0.0"));
-    let mut check_call: Check =
-        Check::agent(CardRef::agent("judge", "1.0.0")).inputs([("report", "inputs.report")]);
+    let mut check_call: Check = Check::agent(CardRef::agent("judge", "1.0.0"));
     check_call
+        .bind_input("report", "inputs.report")
         .add_workspace("/inputs/report.json", "inputs.report")
         .add_workspace("/inputs/policy.json", registered_policy("1.0.0"));
     verifier = verifier.steps([
@@ -1623,11 +1615,10 @@ fn public_paths_author_every_native_family() {
         json!({
             "inputs": {
                 "report": {"type": "json", "schema": {"type": "object"}},
-                "required_nullable": {"type": "json", "schema": {"type": ["object", "null"]}},
-                "optional_nullable": {"type": "json", "schema": {"type": ["object", "null"]}, "required": false},
-                "optional_strict": {"type": "json", "schema": {"type": "object"}, "required": false},
-                "document": {"type": "media", "formats": ["pdf"], "max_bytes": 1024, "required": false},
-                "trace": {"type": "trace", "required": false},
+                "nullable": {"type": "json", "schema": {"type": ["object", "null"]}},
+                "strict": {"type": "json", "schema": {"type": "object"}},
+                "document": {"type": "media", "formats": ["pdf"], "max_bytes": 1024},
+                "trace": {"type": "trace"},
             },
             "steps": [
                 {"id": "extract", "action": {"kind": "extract", "from": "inputs.document"}},
@@ -1646,27 +1637,6 @@ fn public_paths_author_every_native_family() {
     verifier
         .validate()
         .expect("shared validation accepts every operator and family");
-    let wyrd_ai::Spec::Verifier(spec) = &expected else {
-        panic!("a Verifier spec decodes as one");
-    };
-    let required: Vec<(&str, bool)> = spec
-        .inputs
-        .iter()
-        .map(|(name, slot)| (name.as_str(), slot.required()))
-        .collect();
-    assert_eq!(
-        required,
-        [
-            ("document", false),
-            ("optional_nullable", false),
-            ("optional_strict", false),
-            ("report", true),
-            ("required_nullable", true),
-            ("trace", false),
-        ],
-        "requiredness is independent of whether the schema admits null",
-    );
-
     let group = Verifier::new("conversation", "1.0.0")
         .inputs([
             (

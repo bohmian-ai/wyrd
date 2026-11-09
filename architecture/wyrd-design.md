@@ -1456,8 +1456,15 @@ spec:
 | `trace` | A trace ID resolved through tenant-scoped trace reads |
 | `samples` | Named `features` (or metric names) recorded for a scheduled window |
 
-Slots are `required` by default. A missing required slot is missing evidence,
-never a refusal: checks that need it are inconclusive.
+Every declared slot uses the same omission rule: missing evidence makes checks
+that need it inconclusive, never a passing absence assertion or an intentional
+skip. Omission alone is not a request refusal; independent checks may still run.
+Slot-level `required` is not accepted. JSON Schema's nested `required`, optional
+object fields and nullable values remain valid; supplied null must satisfy its
+schema and is distinct from evidence not supplied. An evaluated condition that
+needs missing evidence makes dependent checks inconclusive. Conditions over
+supplied evidence may still skip work; evaluation order and overall verdict
+aggregation are unchanged.
 
 | Action | Does |
 |---|---|
@@ -2326,7 +2333,14 @@ are fixed: no later method edits them, so a different name, version, alias,
 reference, id, action, check, or check operand means constructing another
 value. Every `Action` constructor returns an `Action` and every `Check`
 constructor, `each` and `agent` included, a `Check`. Every other method is
-named for the YAML field it edits and takes that field's YAML value:
+named for the YAML field it edits and takes that field's YAML value, with an
+explicit distinction for incremental input operations: `Verifier.add_input`
+declares evidence, while `Action.bind_input` and `Check.bind_input` bind existing
+values to executable arguments (`addInput`/`bindInput` in TypeScript). Their
+canonical `inputs` maps and whole-map setters retain their names. Rust accepts
+bare JSON Schemas and Python accepts schema dictionaries or supported model
+classes without a mandatory JSON-slot wrapper. Explicit canonical slot forms
+and distinct non-JSON slot constructors remain available. Execution
 references stay strings such as `inputs.report.text`, operators stay strings
 or their parameterized objects, and nested objects stay canonical JSON. A
 setter consumes the value and replaces its whole field, together with

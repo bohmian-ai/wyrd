@@ -1916,9 +1916,10 @@ async fn direct_execution_enforces_card_access() {
 /// file in a format its media slot refuses, a file above the slot's
 /// `max_bytes`, an unused file in an uncapped slot above the individual
 /// input-file limit but within the combined one, and files whose declared
-/// lengths together exceed the combined input-file limit. Conforming evidence still passes, an omitted
-/// optional slot reads as null, and a missing required slot stays
-/// inconclusive rather than refused. Nothing is enqueued.
+/// lengths together exceed the combined input-file limit. Omitted evidence
+/// is not refused: a check that needs it, even an `is_null` assertion, is
+/// inconclusive while an independent check on supplied evidence passes, and
+/// with every slot supplied the verdict passes. Nothing is enqueued.
 ///
 /// # Panics
 /// Panics when the server fails to start, a fixture write fails, a route
@@ -1937,9 +1938,9 @@ async fn direct_execution_refuses_nonconforming_evidence() {
             &json!({
                 "inputs": {
                     "x": { "type": "json", "schema": { "type": "integer" } },
-                    "note": { "type": "json", "required": false },
-                    "policy": { "type": "media", "formats": ["pdf"], "max_bytes": 10, "required": false },
-                    "pages": { "type": "media", "formats": ["pdf"], "required": false }
+                    "note": { "type": "json", "schema": { "type": ["string", "null"] } },
+                    "policy": { "type": "media", "formats": ["pdf"], "max_bytes": 10 },
+                    "pages": { "type": "media", "formats": ["pdf"] }
                 },
                 "requirements": [
                     { "id": "x-present", "statement": "x is present.",
@@ -2004,9 +2005,34 @@ async fn direct_execution_refuses_nonconforming_evidence() {
         );
     }
 
-    let (status, passed) = execute(&server, &jwt, body(json!({ "x": x }))).await;
+    let outcomes = |result: &Value| -> Vec<(String, String)> {
+        result["outcome"]["requirements"]
+            .as_array()
+            .expect("requirement results")
+            .iter()
+            .map(|requirement| {
+                (
+                    requirement["id"].as_str().expect("id").to_owned(),
+                    requirement["outcome"].as_str().expect("outcome").to_owned(),
+                )
+            })
+            .collect()
+    };
+    let null_note = json!({ "kind": "json", "value": null });
+    let (status, passed) = execute(&server, &jwt, body(json!({ "x": x, "note": null_note }))).await;
     assert_eq!(status, StatusCode::OK, "{passed}");
     assert_eq!(passed["outcome"]["verdict"], "passed", "{passed}");
+    let (status, omitted) = execute(&server, &jwt, body(json!({ "x": x }))).await;
+    assert_eq!(status, StatusCode::OK, "{omitted}");
+    assert_eq!(
+        outcomes(&omitted),
+        [
+            ("x-present".to_owned(), "passed".to_owned()),
+            ("no-note".to_owned(), "inconclusive".to_owned()),
+        ],
+        "{omitted}"
+    );
+    assert_eq!(omitted["outcome"]["verdict"], "inconclusive", "{omitted}");
     let (status, missing) = execute(&server, &jwt, body(json!({}))).await;
     assert_eq!(status, StatusCode::OK, "{missing}");
     assert_eq!(missing["outcome"]["verdict"], "inconclusive", "{missing}");

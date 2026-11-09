@@ -190,3 +190,47 @@ Routine read-only source analysis and document organization remain task-owned.
   [Bifrost](../../../../architecture/bifrost-design.md),
   [operational indicators](../../../../architecture/operations/reliability-and-recovery.md)
 - [Benchmark definitions](../../../../benchmarks/README.md)
+
+## Implementation Evidence
+
+Deliverable: [research/gateway-latency.md](../research/gateway-latency.md), at
+commit `389e16b9e` plus this evidence. The only other analysis was read-only
+scratch arithmetic over the artifacts named in the report; nothing was added
+to the repository.
+
+| Acceptance criterion | Implementation evidence | Verification evidence | Result |
+|---|---|---|---|
+| REQ-005; AC-003 critical-path map | Report "Critical path": buffered segments 1–17 with clock column (R/X/O), post-answer table (capture, stage, outbox writer, delivery encode, Scribe pools, release), stream note; every segment names its owner and historical measurement or "none" | Each cited path and line range re-read at HEAD (`invocation.rs`, `capture.rs`, `routes.rs`, `ingress.rs`, `owner.rs`, `metrics.rs`, `outbox.rs`, `scribe_outbox.rs`, `engine.rs`, `adapter/http.rs`, `clients/mod.rs`, `exchange.rs`, `serve.rs`, `gateway_capture.rs`, `workload.rs`, `config.rs`); `b1cf95f2e..HEAD` changes no Gateway path logic | PASS |
+| REQ-006; AC-003 both p50 objectives, client/server boundaries | Report "Summary" and "c64 cases with c1 controls": client p50 and residual p50 judged separately per repetition; client validation (`workload.rs:303, 337-349`) and exchange exclusion (`ExchangeTimer`) explained; segments 2 and 16 shown outside the residual | Record C per-repetition metrics re-read; snapshot-reconstructed p50s equal record `p50_ms` and `overhead_p50_ms` for every C step | PASS |
+| REQ-007; INV-004; AC-003 traceability and limits | Report "Evidence inventory", "How the numbers were computed", "Limits": record id, commit, mode, binary size and mtime per figure; the CP code id `a361cdca…` against current build id `84ce3fd4…` mismatch; derived summary rejected; inferred profile intervals (±1 s); profiling separated from unprofiled; B against C declared non-controlled | Every table recomputed from raw `timings/`, records, `profile-2483944.json.gz` and heap `pb.gz` before commit; eight transcription errors found and corrected; no history or raw profile modified (`git status` clean outside the packet) | PASS |
+| REQ-008; INV-001–003; AC-004 ranked proposals and bounded measurements | Report "Ranked explanation" (facts F1–F6, mechanisms M-a–M-e, falsifiable H1–H3, unknowns U1–U4) and "Proposals" (M1, M2 with hypothesis, observation, driver, cases, load model, profiling mode, repetitions, stopping rule, validity checks, artifacts, observer effects; C1, C2 with owner, cause, effect, risks, regression proof, rejection evidence); commands presented for separate authorization only | No benchmark, build, install, profiler or load run; no source or instrumentation change in the diff | PASS |
+
+Non-goals stayed excluded:
+
+- No optimization, instrumentation or executable code.
+- No benchmark, baseline rerun, build, install or synthetic load.
+- No history, raw profile or judgment changed.
+- No scheduler, cache, allocator, transport or memory-accounting change selected.
+- No controlled-improvement claim.
+
+Checks:
+
+- `git diff --check`.
+- Relative links in the report and in this section resolve to tracked files.
+- The TASK-001 review verdict is cited by path, because its directory is still
+  untracked.
+- The worktree had no uncommitted source, so committed source is the source
+  analyzed.
+
+Material limits:
+
+- **TASK-001 dependency.** TASK-001 is at `FIX_REQUIRED` on FIND-TASK-001-2,
+  the standard-metric capacity proof. That finding does not change the
+  observation semantics this report uses. M1 is gated on it closing.
+- **CPU profile symbols.** CP's `wyrd-server` CPU frames cannot be symbolized:
+  the binary was rebuilt and the original build id was not retained.
+- **Payload tail.** The cause of the payload tail stays open between H2 and H3
+  until M1 runs.
+- **Documentation drift.** Two drifts are recorded, not fixed:
+  - `config.rs:346-347` says captures are unreserved;
+  - `benchmarks/README.md:266-267` gives the wrong location for `server.log`.

@@ -601,3 +601,84 @@ production code, tests or benchmarks were executed by this planning pass.
 - [Protocol doctrine](../../../../architecture/wyrd-design.md#doctrine)
 - [Security principles](../../../../architecture/wyrd-security-posture.md#security-principles)
 - [Rust ownership](../../../../agent_docs/rust.md)
+
+## Implementation Evidence
+
+Candidate `b1cf95f2e` (`0b0324521`, `c13b2afb0`, `f7540b3f6`, `3724ed05f`,
+`b839d708a`, `361e8caf0`, `b1cf95f2e`) on immediate baseline `5508cf29f`, the
+TASK-004 final candidate that `06b74e273` plans from. Same host and build as
+TASK-004 (Ryzen 9 9950X, 32 CPU, Linux x86_64, release with frame pointers).
+The only untracked path is an unrelated change packet.
+
+| Acceptance criterion | Implementation evidence | Verification evidence | Result |
+|---|---|---|---|
+| Scenario 1: validation inspects the retained request | `wire_contract!` projections in `skald-spec` `wire/borrowed.rs`; Jev bounds on `JevRequestView` | `request_validation_preserves_contract_without_payload_copies`: RED chat 2,098,801 → 3,147,377 B per extra MiB, GREEN no slope; Responses/embeddings regressions pass | PASS |
+| Scenario 2: native forwarding writes the final payload | media/batch encoders in `wyrd-gateway` `adapter` | bytes per extra MiB, baseline → candidate: media JSON 4,220,388 → 1,075,368; multipart 8,388,960 → 1,048,968; batch create 4,194,304 → 1,048,576; batch upload 10,485,720 → 2,097,112 (the 2× floor is the JSONL file plus its multipart body) | PASS |
+| Scenario 3: planning checks candidates without payloads | `adapter::check` → `Target`; infallible translators; `routing::retain_representable` calls `check` | planning subcase: RED 24,130,401 → 48,247,649 B as the text doubles, GREEN growth < 1/8; the six translation/fallback checks pass | PASS |
+| Scenario 4: original evidence shared through staging | `Arc` evidence in `blocks/engine.rs`; hosted reader pins | `direct_execution_reuses_evidence_without_disposable_payload_copies`; `direct_execution_judges_inline_without_enqueueing`, `direct_execution_refuses_nonconforming_evidence` | PASS |
+| Scenario 5: comparison and hash without disposable copies | `BoundJson` bindings (`blocks.rs`, `scope.rs`); `Cow` `OperatorVerdict`; `capture_actual` hashes borrowed | ownership test: evidence copies RED 7 → 0 (`< 0.1`) under hash capture; `context_capture_hashes_or_redacts_actual_values` | PASS |
+| Scenario 6: one step output for dependents and results | `Settled::Succeeded { output: Arc<Value> }`, moved into `StepResult` at assembly | ownership test: output copies RED 4 → 1 (`< 1.1`, the stored full-capture actual); dependency, concurrency, deadline, retry checks pass | PASS |
+| Paired profiles, full Gateway and Verification L1 | — | below; payload c64 rate/p99 unresolved | see below |
+
+Commands passed: every selector in Verification and Evidence (the direct
+ownership test lives in `pg_tests`, so its selector is
+`verification::hosted::blocks::pg_tests::…` under `with-test-postgres.sh`),
+the four Gateway journeys, `wyrd-server --lib verification::` (63),
+hosted integration (18), `pg_verification` integration (77), `wyrd-skald-spec`
+(102), `wyrd-gateway` (67), `wyrd-skald-providers` (49), `vala-verify` (70),
+`fmt:check`, `lints`, `check:deps`, `codegen:check`, `git diff --check`.
+
+**Full unprofiled L1.** Gateway B `20261108T234942Z`, C `20261109T153318Z`;
+Verification B `20261108T234827Z`, C `20261109T153738Z`. All VALID with zero
+errors, failures, lost/shed/dropped captures, lost writes, wrong verdicts and
+undrained work. Candidate median vs baseline range:
+
+| Step | Rate | CPU µs/call | p99 ms | Peak RSS MiB |
+|---|---|---|---|---|
+| buffered-1kib-capture-metadata.c1 | 5724 vs 5780–5969 | 220 vs 209–214 | 0.268 vs 0.253–0.262 | 768 vs 598–946 |
+| buffered-1kib-capture-metadata.c64 | 58923 vs 57634–60584 | 341 vs 335–356 | 1.381 vs 1.305–1.415 | 2187 vs 2193–2207 |
+| streamed-1kib-capture-metadata.c1 | 24 vs 24–24 | 4959 vs 5124–5207 | 0.754 vs 0.707–0.810 | 1473 vs 1425–1470 |
+| streamed-1kib-capture-metadata.c64 | 1539 vs 1537–1539 | 991 vs 947–1006 | 0.522 vs 0.478–0.600 | 1763 vs 1622–1878 |
+| buffered-64kib-capture-metadata.c1 | 3394 vs 3336–3460 | 345 vs 337–352 | 0.397 vs 0.380–0.400 | 1320 vs 1209–1479 |
+| buffered-64kib-capture-metadata.c64 | 25769 vs 24781–24992 | 801 vs 836–846 | 2.957 vs 3.068–3.138 | 2270 vs 1868–2243 |
+| buffered-64kib-capture-payload.c1 | 2788 vs 2662–2714 | 628 vs 636–664 | 0.519 vs 0.505–0.531 | 2360 vs 2179–2368 |
+| buffered-64kib-capture-payload.c64 | 8907 vs 9106–9298 | 1626 vs 1647–1721 | 65.1 vs 54.9–59.0 | 5078 vs 5345–5473 |
+| direct-verify-c1 | 10028 vs 9543–10112 | 108 vs 108–130 | 0.146 vs 0.145–0.159 | 1130 vs 984–1727 |
+| direct-verify-c64 | 84402 vs 80734–82377 | 224 vs 235–238 | 0.259 vs 0.283–0.303 | 3412 vs 3290–3709 |
+
+Candidate rerun of the worse-outside-range steps (`20261109T154508Z`, VALID):
+
+- 1 KiB c1: 5998 req/s, 207 µs, 0.259 ms; within or better on every measure.
+- 64 KiB metadata c64 peak RSS: 2072 MiB, within range.
+- Payload c64: 8956 req/s and 61.5 ms p99 remain below/above range (−2 to
+  −4%, +4%) while CPU per call (1608 µs) and peak RSS (5165 MiB) stay below
+  the baseline minimum. Unresolved: the fresh back-to-back baseline pair AC-003
+  requires has not run.
+
+**Paired `--profile`, KiB per reconciled call** (Gateway B `20261109T002859Z`,
+C `20261109T153854Z`; TASK-003 method; the baseline reproduces TASK-004's
+recorded figures):
+
+| Step | Baseline | Candidate |
+|---|---|---|
+| buffered-1kib-capture-metadata.c1 / c64 | 206 / 205 | 204 / 203 |
+| buffered-64kib-capture-metadata.c1 / c64 | 859 / 762 | 713 / 702 |
+| buffered-64kib-capture-payload.c1 / c64 | 2178 / 1856 | 2153 / 1796 |
+
+Streamed steps are dominated by background allocation (about 5 GB per
+interval over 487 c1 calls) and carry no per-call signal. Verification
+`--profile` C `20261109T154213Z` (VALID): 183 / 210 KiB per verification at
+c1 / c64. No profiled Verification record exists at the baseline, so that row
+has no pair. Default L1 does not reach media, batches, translation, full-root
+comparison, step outputs or hash capture; the focused owner tests above prove
+those removals.
+
+**Remaining copies, each with its own authority:** Jev chat pass-through
+unescapes the embedded question text per candidate; a batch file is written
+once as JSONL and once into its multipart body; parser scratch; full capture
+stores the actual value; retry bindings and citations clone their inputs; the
+sandbox code call copies JSON arguments into its request map.
+
+Non-goals stayed excluded: no public, generated, wire or durable contract
+change, no new dependency or feature, no prepared-body cache, no benchmark
+matrix change.

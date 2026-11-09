@@ -426,10 +426,10 @@ async fn evidence_metadata_is_resolved_once() {
         format: skald_spec::MediaFormat::Json,
         filename: None,
     };
-    let declared = BTreeMap::from([
+    let declared = Arc::new(BTreeMap::from([
         (doc.clone(), file.clone()),
         (notes(), registered.file("notes.txt")),
-    ]);
+    ]));
     let executor = PrincipalId::new(uuid::Uuid::now_v7());
     let caller = Caller {
         executed_by: Some(executor),
@@ -442,7 +442,7 @@ async fn evidence_metadata_is_resolved_once() {
         .expect("read decisions count");
 
     evidence
-        .admit(&BTreeMap::new(), &Arc::new(declared))
+        .admit(&BTreeMap::new(), &declared)
         .await
         .expect("both inputs are admitted");
     for _ in 0..2 {

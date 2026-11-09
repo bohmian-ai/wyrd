@@ -1,10 +1,10 @@
 ---
 id: SPEC-resource-scaling
-revision: 4
+revision: 5
 status: approved
 ---
 
-# Shared resources and lower allocation through Gateway and Scribe
+# Shared resources and lower allocation through Gateway, verification and Scribe
 
 Every Bifrost consumer in a process should size itself from one resource
 configuration resolved at startup, so an operator's CPU cap or explicit worker
@@ -21,6 +21,14 @@ read work and removal of avoidable payload rebuilding from Gateway through Scrib
 publication. The goal is substantially lower allocation and memory growth under
 sustained payload capture, without weakening evidence durability or learning.
 Revision 4 was approved by the maintainer on 2026-11-07.
+
+Revision 5 records the maintainer's explicit 2026-11-09 scope instruction:
+TASK-005 must implement both Gateway and direct verification copy removal.
+Direct verification must reuse original evidence through execution and staging,
+avoid read-only comparison copies and redundant step-output ownership, and hash
+captured values without a disposable serialized buffer. Both Gateway and
+Verification L1 are required; neither side may be left as a design or audit.
+Other approved behavior and acceptance remain unchanged.
 
 ## Problem
 
@@ -185,6 +193,18 @@ work, not the supplied profile's exact totals or an achievable allocation floor.
   post-drain memory separately. Retained work must settle across equivalent load/
   drain cycles. Lower throughput, larger queues or deferred work are not a fix.
   No absolute allocation floor, hard-RSS ceiling or new allocator is promised.
+- **REQ-013 (direct verification copies):** remove duplicate original-input
+  ownership between direct execution, the evaluation engine and hosted evidence
+  reads. Reuse the same original declarations for staging without an equivalent
+  clone at result assembly; keep synthetic attachments distinct. Borrow JSON for
+  read-only assertion comparisons, retain successful step output once for
+  dependency resolution and final results, and stream context hashing without a
+  disposable full JSON buffer. Preserve public request/result and executor APIs,
+  exact verdicts/captured values, validation, deadlines, concurrency, permissions,
+  audit, pinned evidence and file limits. Direct input records retain
+  `queue_execution=false`; no queued/group/scheduler redesign is authorized.
+  Copies required by independent executor or cited-result ownership may remain
+  with an explicit reason; sharing must not merely postpone a duplicate copy.
 
 ### Costs and authority changes
 
@@ -310,6 +330,20 @@ redesign remain outside this revision.
   matched metadata comparison; metadata capture is not capture disabled.
   Preserve AC-003's non-regression rule and zero errors/lost/shed/
   undrained captures. No 100 KiB or 3× allocation floor is asserted.
+- **AC-011 (direct verification):** focused ownership/allocation observations and
+  existing route/engine regressions show removal of the REQ-013 copies with exact
+  original input/result readback, passed/failed/inconclusive behavior, audit
+  counts, dependency outputs, capture digests and cancellation/concurrency
+  behavior. Compare immutable pre-TASK-005 and candidate builds through every
+  default `bench:l1:verification` step and its three repetitions on the same quiet
+  host. Use paired profiles for clone/allocation attribution and unprofiled runs
+  for throughput, CPU, overhead p99 and peak RSS. A worse-outside-baseline-range
+  candidate median requires one fresh back-to-back pair and fails non-regression
+  if worse again. Refusal, lost writes, incorrect verdicts and undrained work
+  remain zero. Default assertion-only L1 does not cover action-output or hashed
+  capture paths; focused owner observations prove those reductions without a new
+  benchmark matrix. A valid record alone is not proof of improvement. Existing
+  main/pre-TASK-002 Gateway/Scribe obligations are not reset or waived.
 
 For AC-010, retain an immutable pre-TASK-002 resource-scaling baseline with fixed
 revision-3 geometry, before read integration or copy removal. Compare the final
@@ -332,16 +366,23 @@ claim while preserving matching shredded columns; remove specified request/captu
 copies; fit conversion work within existing byte reservations; and require matched
 allocation/RSS evidence. This approval includes the explicit Scribe architecture correction above.
 
+On 2026-11-09 the maintainer explicitly required TASK-005 to implement Gateway
+and verification copy removal together. Revision 5 records that scope approval
+as REQ-013/AC-011; TASK-005 owns both implementations and both L1 proofs, rather
+than deferring direct verification to an audit or separate task. TASK-001–004
+retain their original revision-pinned obligations and historical evidence.
+
 There is no new persistent format, claim-membership, sampling-policy, Forge,
-security or ACK decision delegated to execution. TASK-002 is the single added task
-proposal against approved revision 4. TASK-001's existing revision-2 prose
+security or ACK decision delegated to execution. TASK-002 was the added task
+proposal against revision 4; TASK-005 now carries the revision-5 copy-removal
+scope. TASK-001's existing revision-2 prose
 and evidence do not authorize restoring scaled geometry; the integrated candidate
 must satisfy revision 3's fixed counts before allocation comparisons. Its revision-3
 implementation intent is unchanged.
 
 The TASK-001 dependency requires its revision-3 resource and cancellation behavior
 before this work, not an assertion that historical performance evidence passed.
-Final revision-4 verification must close outstanding L1 acceptance.
+Final revision-5 verification must close outstanding L1 acceptance.
 
 ## Authority and baseline
 
@@ -380,3 +421,7 @@ owns unchanged tenant and audit authority.
   removal, byte-bounded workspaces and matched memory/allocation proof. Intentionally
   replaces unconditional sampling/merge reconstruction in the Bifrost owner, updated
   with the implementation. Approved by the maintainer on 2026-11-07.
+- Revision 5, 2026-11-09, approved scope instruction: the maintainer explicitly
+  required TASK-005 to implement both Gateway and direct verification copy
+  removal. Adds REQ-013/AC-011 and Verification L1 proof while preserving the
+  previously approved behavior, boundaries and baseline obligations.

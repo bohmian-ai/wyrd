@@ -245,6 +245,14 @@ chunk collection or attribute Hyper connection-buffer savings to this change.
 Recorded from the TASK-004 review. It amends this task only; the spec's
 original AC-003 and AC-010 comparisons are unchanged.
 
+Current follow-on ownership (2026-11-09):
+[TASK-005](TASK-005-design-borrowed-gateway-validation.md) now plans implementation
+of the removed validation scenario and remaining Gateway request copies,
+including translated double preparation. Its proposed scope replaces the future
+design deferral below, not this task's historical verdict or measured evidence.
+The maintainer subsequently required the same TASK-005 to implement direct
+verification copy removal as well; spec revision 5 records that combined scope.
+
 - **Scenario 3 is removed.** Public request types and typed validation stay as
   they are. The helper validates six operations through owning types, and
   flattened provider settings can carry large values. The measured cost, about

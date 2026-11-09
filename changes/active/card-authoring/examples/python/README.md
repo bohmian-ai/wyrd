@@ -1,6 +1,6 @@
 # Python one-grammar authoring sketches
 
-These files follow [approved revision 5](../../spec.md). The SDK authoring
+These files follow [approved revision 6](../../spec.md). The SDK authoring
 exports are pending implementation; importing these files is not a runtime
 acceptance check. Start with [multi_component.py](multi_component.py).
 
@@ -11,10 +11,11 @@ Component.verified_by binds its subject; Service.verified_by binds the Service.
 The earlier single-binding constructor/incremental examples illustrate that
 second placement without replacing the two-component primary story.
 
-Input maps accept canonical slots, plain JSON Schemas, supported Python scalar
-classes and optional Pydantic models. InputSlot.json(schema).required(False)
-permits omission; nullability still belongs to the schema. Samples/source
-slots do not gain a required field.
+Verifier.add_input declares evidence; Action.bind_input and Check.bind_input
+bind an executable argument to a reference. Input maps accept canonical slots,
+plain JSON Schemas, supported Python scalar classes and optional Pydantic
+models. No slot has a required field: omitted evidence leaves the checks that
+need it inconclusive, and nullability belongs to the schema.
 
 Execution references are literal YAML strings. Check.assert_ uses Python's
 necessary reserved-word escape; its kind remains assert. CodeSource.file

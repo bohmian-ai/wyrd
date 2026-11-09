@@ -1,6 +1,6 @@
 # Approved one-grammar authoring examples
 
-These sketches express [approved specification revision 5](../spec.md).
+These sketches express [approved specification revision 6](../spec.md).
 They are reviewable interface examples, not evidence that the SDK exports are
 implemented. No fake SDK or registration shim is included.
 
@@ -8,7 +8,7 @@ implemented. No fake SDK or registration shim is included.
 |---|---|
 | [Python multi-component](python/multi_component.py) | Two Components with their own verified_by bindings; constructors and incremental edits. |
 | [Python constructors](python/constructor_style.py) | Canonical constructor fields and a Service-level Binding. |
-| [Python incremental edits](python/incremental_style.py) | add_input, add_step, add_component and add_verified_by over those same fields. |
+| [Python incremental edits](python/incremental_style.py) | add_input, add_step, add_component and add_verified_by over those same fields; its release steps bind a Check argument with bind_input. |
 | [Python registration](python/registration_flow.py) | Unified declare and existing verification/results. |
 | [Python policy versions](python/policy_versions.py) | Exact registered reference reuse and explicit immutable version updates. |
 | [Python dependencies](python/dependencies.py) | YAML reference strings and depends_on IDs; existing server scheduling. |

@@ -9,7 +9,6 @@ from wyrd.authoring import (
     ArtifactFile,
     CardRef,
     Component,
-    InputSlot,
     Service,
     Verifier,
 )
@@ -43,9 +42,7 @@ def make_service(policy_file: ArtifactFile) -> Service:
     access_verifier = Verifier("release-access", "1.0.0")
     access_verifier.add_input("recipient", Recipient).add_input("purpose", str)
     access_verifier.add_input("destination", Destination)
-    access_verifier.add_input(
-        "notes", InputSlot.json({"type": "string"}).required(False)
-    )
+    access_verifier.add_input("notes", {"type": "string"})
     access_verifier.add_step(recipient).add_step(destination)
 
     service = Service("finance-release", "1.0.0")

@@ -96,7 +96,7 @@ export function makeService(policyFile: ArtifactFile): Service {
     .addInput("recipient", { type: "json", schema: recipientSchema })
     .addInput("purpose", { type: "json", schema: { type: "string" } })
     .addInput("destination", { type: "json", schema: destinationSchema })
-    .addInput("notes", { type: "json", schema: { type: "string" }, required: false });
+    .addInput("notes", { type: "json", schema: { type: "string" } });
   accessVerifier.addStep({
     id: "recipient", action: { kind: "code", source, entrypoint: "recipient_facts",
       inputs: { recipient: "inputs.recipient", purpose: "inputs.purpose" } },

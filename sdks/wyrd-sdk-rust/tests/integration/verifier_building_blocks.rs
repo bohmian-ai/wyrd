@@ -726,7 +726,7 @@ async fn forbidden_code_access_cannot_pass_dependent_work() {
 }
 
 /// A trace whose first span is not the policy lookup fails the trace check;
-/// an omitted optional trace leaves it inconclusive, never passed.
+/// an omitted trace leaves it inconclusive, never passed.
 ///
 /// # Panics
 /// Panics when a review is refused or a trace outcome differs.

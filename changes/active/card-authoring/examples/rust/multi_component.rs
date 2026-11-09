@@ -1,11 +1,11 @@
-//! Approved revision-5 interface sketch.
+//! Approved revision-6 interface sketch.
 //! Named fields follow YAML; constructors and edits are infallible local operations.
 
 use std::path::Path;
 
 use wyrd_ai::authoring::{
-    Action, Agent, Artifact, ArtifactFile, CardRef, Check, CodeSource, Component, InputSlot,
-    Prompt, Requirement, Service, Step, Verifier,
+    Action, Agent, Artifact, ArtifactFile, CardRef, Check, CodeSource, Component, Prompt,
+    Requirement, Service, Step, Verifier,
 };
 use wyrd_ai::cards::Cards;
 use wyrd_ai::state::WyrdState;
@@ -112,10 +112,10 @@ pub fn make_service(policy_file: ArtifactFile, checks: &Path) -> Service {
     });
     let report_verifier = Verifier::new("report-policy", "1.0.0")
         .inputs([
-            ("report", InputSlot::json(report_schema)),
-            ("recipient", InputSlot::json(recipient_schema.clone())),
-            ("purpose", InputSlot::json(json!({"type": "string"}))),
-            ("destination", InputSlot::json(destination_schema.clone())),
+            ("report", report_schema),
+            ("recipient", recipient_schema.clone()),
+            ("purpose", json!({"type": "string"})),
+            ("destination", destination_schema.clone()),
         ])
         .steps([scan, context]);
     let recipient = checked_step(
@@ -146,14 +146,11 @@ pub fn make_service(policy_file: ArtifactFile, checks: &Path) -> Service {
         ),
     );
     let mut access = Verifier::new("release-access", "1.0.0").inputs([
-        ("recipient", InputSlot::json(recipient_schema)),
-        ("purpose", InputSlot::json(json!({"type": "string"}))),
-        ("destination", InputSlot::json(destination_schema)),
+        ("recipient", recipient_schema),
+        ("purpose", json!({"type": "string"})),
+        ("destination", destination_schema),
     ]);
-    access.add_input(
-        "notes",
-        InputSlot::json(json!({"type": "string"})).required(false),
-    );
+    access.add_input("notes", json!({"type": "string"}));
     access.add_step(recipient).add_step(destination);
     Service::new("finance-release", "1.0.0").components([
         Component::new("report-reviewer", reviewer).verified_by([report_verifier]),

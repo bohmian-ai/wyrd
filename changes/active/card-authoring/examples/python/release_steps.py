@@ -63,12 +63,8 @@ def make_steps(policy_file: ArtifactFile, judge: Agent) -> list[Step]:
             "sharing-policy-satisfied",
             "The release satisfies the company sharing policy.",
             Check.agent(judge)
-            .inputs(
-                {
-                    name: f"inputs.{name}"
-                    for name in ("report", "recipient", "purpose", "destination")
-                }
-            )
+            .inputs({name: f"inputs.{name}" for name in ("report", "recipient", "purpose")})
+            .bind_input("destination", "inputs.destination")
             .workspace({"/inputs/policy.json": policy_file}),
         )
     )

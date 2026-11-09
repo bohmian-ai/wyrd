@@ -566,8 +566,9 @@ impl QueryTelemetryGuard {
 
     /// Emits the final query and stream outcome exactly once, with the
     /// executed plan's scan rows and bytes on the query span when known,
-    /// and records them into the benchmark scan histograms under the
-    /// request's classification.
+    /// and, for a successful query, records them into the benchmark scan
+    /// histograms under the request's classification: only answered
+    /// queries' scans are read, so other outcomes open no scan series.
     fn finish(&mut self, outcome: &'static str) {
         if self.finalization == QueryTelemetryFinalization::Closed {
             return;
@@ -576,12 +577,14 @@ impl QueryTelemetryGuard {
         self.finish_source_span(outcome);
         self.span.record("outcome", outcome);
         self.scan_stats.finalize();
-        wyrd_benchmark::record_scan(
-            &self.span,
-            outcome,
-            self.scan_stats.physical_rows_scanned,
-            self.scan_stats.physical_bytes_scanned,
-        );
+        if outcome == "success" {
+            wyrd_benchmark::record_scan(
+                &self.span,
+                outcome,
+                self.scan_stats.physical_rows_scanned,
+                self.scan_stats.physical_bytes_scanned,
+            );
+        }
         metrics::counter!(
             "oracle_query_files_scanned_total",
             "class" => query_class_label(self.query_class)
@@ -5150,6 +5153,26 @@ mod tests {
             terminal.error,
             Some(Box::new(WyrdError::from(error).problem()))
         );
+    }
+
+    /// A benchmark server records scan facts for an answered query only, so
+    /// a failed one opens no scan series.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the recorder does not install or a failed query records
+    /// a scan.
+    #[test]
+    fn benchmark_scans_record_answered_queries_only() {
+        wyrd_benchmark::install().expect("the only recorder");
+        for outcome in ["failed", "success"] {
+            let mut query = OracleTelemetry::start_query(QueryClass::Analytical);
+            query.start_stream();
+            query.finish(outcome);
+        }
+        let scans = wyrd_benchmark::snapshot().scans;
+        assert_eq!(scans.len(), 1, "{scans:?}");
+        assert_eq!((scans[0].outcome.as_str(), scans[0].count), ("success", 1));
     }
 
     /// The standard recorder observes the canonical failed stream labels.

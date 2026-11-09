@@ -1890,10 +1890,8 @@ mod tests {
     /// A streamed Gateway call's head and end handoffs.
     const STREAMED: Reach = &[("gateway.stream.head", CALL), ("gateway.stream.end", CALL)];
 
-    /// The Oracle scan outcomes a measured query can reach: `cancelled` is
-    /// only an explicit cancel or shutdown, which no driver sends while
-    /// measuring (`oracle/mod.rs`).
-    const SCANNED: &[&str] = &["success", "failed", "client_drop"];
+    /// The only Oracle outcome that records scan facts (`oracle/mod.rs`).
+    const SCANNED: &[&str] = &["success"];
 
     /// Every L1 repetition phase ([`Phase::label`]).
     const L1: &[&str] = &["warmup", "repetition-1", "repetition-2", "repetition-3"];

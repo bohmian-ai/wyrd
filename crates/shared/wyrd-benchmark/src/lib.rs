@@ -80,10 +80,8 @@ pub const HIGHEST_METRIC: u64 = 1 << 62;
 /// The most timing series one process keeps.
 pub const MAX_SERIES: usize = 256;
 
-/// The most scan series one process keeps: an L1 read experiment's eight
-/// cases in four phases under each of three reachable scan outcomes, and
-/// its unlabelled queries, are 99.
-pub const MAX_SCAN_SERIES: usize = 128;
+/// The most scan series one process keeps.
+pub const MAX_SCAN_SERIES: usize = 64;
 
 /// The request metadata carrying a benchmark request's case.
 pub const CASE_HEADER: &str = "x-wyrd-benchmark-case";

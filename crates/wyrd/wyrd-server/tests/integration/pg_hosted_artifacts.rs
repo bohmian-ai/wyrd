@@ -1438,8 +1438,8 @@ async fn nonconforming_queued_evidence_errors_without_a_verdict() {
             &json!({
                 "inputs": {
                     "x": { "type": "json", "schema": { "type": "integer" } },
-                    "a": { "type": "media", "formats": ["text"], "required": false },
-                    "b": { "type": "media", "formats": ["text"], "required": false }
+                    "a": { "type": "media", "formats": ["text"] },
+                    "b": { "type": "media", "formats": ["text"] }
                 },
                 "requirements": [{ "id": "x-present", "statement": "x is present.",
                     "check": { "kind": "assert", "path": "inputs.x", "operator": "is_not_null" } }]

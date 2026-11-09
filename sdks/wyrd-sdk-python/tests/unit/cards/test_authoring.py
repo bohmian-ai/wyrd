@@ -1,0 +1,385 @@
+"""Offline Card authoring through public ``wyrd.authoring``: construction, edits,
+value capture, Python lifetimes, schema conveniences and every native family.
+
+Nothing here reaches a server; validation is the shared Rust validation.
+"""
+
+import gc
+import subprocess
+import sys
+import textwrap
+from pathlib import Path
+
+import pytest
+from pydantic import BaseModel
+from wyrd import WyrdError
+from wyrd.authoring import (
+    Action,
+    Agent,
+    Artifact,
+    ArtifactFile,
+    Audit,
+    Binding,
+    CardDefinition,
+    CardRef,
+    Check,
+    CodeSource,
+    Component,
+    Data,
+    Experiment,
+    InputSlot,
+    Mcp,
+    Model,
+    Operator,
+    Prompt,
+    Requirement,
+    Service,
+    Step,
+    Trigger,
+    Verifier,
+)
+from wyrd.cards import CardKind
+from wyrd.cards import CardRef as RegisteredRef
+
+POLICY = Path(__file__).resolve().parents[5] / "fixtures/cards/card_authoring"
+SHARING_POLICY = POLICY / "company-sharing-policy.pdf"
+
+
+def ref(kind: str, name: str, version: str = "1.0.0") -> dict:
+    return {"kind": kind, "name": name, "version": version}
+
+
+def judge(name: str = "judge") -> Agent:
+    prompt = Prompt(
+        f"{name}-prompt",
+        "1.0.0",
+        provider="openai",
+        model="gpt-4o",
+        response_format="verdict",
+        messages=[{"role": "user", "content": "Judge {{report}}"}],
+    )
+    return Agent(
+        name,
+        "1.0.0",
+        prompt=prompt,
+        execution_route={"kind": "wyrd_gateway", "deployment": "openai"},
+        tool_names=["fs.read"],
+    )
+
+
+def checked(id: str, depends_on: list[str] | None = None) -> Step:
+    step = Step(id, Action.code(CodeSource.inline("def f(**_):\n    return {}\n"), "f"))
+    for prerequisite in depends_on or []:
+        step.add_depends_on(prerequisite)
+    return step.add_requirement(
+        Requirement(f"{id}-ok", "Fine", Check.assert_(f"steps.{id}.output.ok", "equals", True))
+    )
+
+
+def invalid(error: pytest.ExceptionInfo[WyrdError]) -> str:
+    assert error.value.code == "WYRD_LOADER_400_INVALID_ENVELOPE"
+    return " ".join(diagnostic["message"] for diagnostic in error.value.details["diagnostics"])
+
+
+def test_definitions_edit_offline() -> None:
+    verifier = Verifier("report-policy", "1.0.0", inputs={"report": {"type": "string"}})
+    assert verifier.add_input("purpose", str) is verifier
+    assert verifier.description("Report policy") is verifier
+
+    step = checked("scan")
+    verifier.add_step(step)
+    step.add_depends_on("later").timeout_seconds(5)
+    assert verifier.spec()["steps"][0] == {
+        "id": "scan",
+        "action": {"kind": "code", "source": {"inline": "def f(**_):\n    return {}\n"}, "entrypoint": "f"},
+        "requirements": [
+            {
+                "id": "scan-ok",
+                "statement": "Fine",
+                "check": {"kind": "assert", "path": "steps.scan.output.ok", "operator": "equals", "expected": True},
+            }
+        ],
+    }, "a child is captured as it was when passed"
+
+    def build() -> Service:
+        service = Service("finance-release", "1.0.0")
+        component = Component("reviewer", judge("reviewer"))
+        component.verified_by([verifier])
+        return service.add_component(component)
+
+    service = build()
+    gc.collect()
+    assert service.spec()["components"] == [
+        {
+            "alias": "reviewer",
+            "ref": {"sibling": ref("Agent", "reviewer")},
+            "verified_by": [{"verifier": {"sibling": ref("Verifier", "report-policy")}}],
+        }
+    ], "the parent keeps its children after their Python references are gone"
+    service.validate()
+
+    forward = Verifier("forward", "1.0.0", inputs={"report": str})
+    forward.add_step(
+        Step("first", Action.code(CodeSource.inline("x"), "f").inputs({"later": "steps.second.output"}))
+    )
+    forward.add_requirement(
+        Requirement("done", "Done", Check.assert_("steps.first.output.ok", "equals", True))
+    )
+    with pytest.raises(WyrdError) as refused:
+        forward.validate()
+    assert "steps.second" in invalid(refused), "a forward reference is refused only at validation"
+    forward.add_step(checked("second"))
+    forward.validate()
+
+    ordered = Verifier("ordered", "1.0.0", inputs={"report": str})
+    ordered.steps([checked("a"), checked("b"), checked("c", ["a", "b"])])
+    assert ordered.plan() == {
+        "stages": [{"index": 0, "tasks": ["a", "b"]}, {"index": 1, "tasks": ["c"]}],
+        "task_count": 3,
+    }
+
+    duplicated = Verifier("duplicated", "1.0.0")
+    duplicated.add_input("report", str).add_input("report", int)
+    duplicated.add_step(checked("scan")).add_step(checked("scan"))
+    with pytest.raises(WyrdError) as refused:
+        duplicated.validate()
+    message = invalid(refused)
+    assert "inputs.report: duplicate entry" in message
+    assert duplicated.spec()["inputs"] == {"report": {"type": "json", "schema": {"type": "string"}}}
+    assert [step["id"] for step in duplicated.spec()["steps"]] == ["scan", "scan"]
+
+    replaced = Verifier("duplicated", "1.0.0", inputs={"report": str})
+    replaced.inputs({"purpose": str})
+    assert list(replaced.spec()["inputs"]) == ["purpose"], "a whole-field setter replaces earlier additions"
+
+    with pytest.raises(TypeError, match="unexpected keyword argument 'stepz'"):
+        Verifier("typo", "1.0.0", stepz=[])
+    with pytest.raises(TypeError, match="takes a list"):
+        Agent("listed", "1.0.0").tool_names("fs.read")
+    assert not hasattr(Service("fixed", "1.0.0"), "name"), "name is constructor-only"
+    assert not hasattr(Step("fixed", Action.extract("inputs.d")), "id")
+
+
+def test_plain_schemas_do_not_require_pydantic() -> None:
+    script = textwrap.dedent(
+        """
+        import sys
+        sys.modules["pydantic"] = None
+        from wyrd.authoring import Check, InputSlot, Requirement, Verifier
+
+        schema = {"type": "object", "properties": {"text": {"type": "string"}}}
+        verifier = Verifier(
+            "plain",
+            "1.0.0",
+            inputs={"text": str, "count": int, "ratio": float, "flag": bool, "nothing": type(None)},
+        )
+        verifier.add_input("report", schema)
+        verifier.add_input("notes", InputSlot.json({"type": ["string", "null"]}).required(False))
+        verifier.add_input("canonical", {"type": "json", "schema": {"type": "string"}, "required": False})
+        schema["properties"]["text"]["type"] = "integer"
+        verifier.add_requirement(
+            Requirement("has-text", "Has text", Check.assert_("inputs.text", "is_non_empty", None))
+        )
+        verifier.validate()
+        inputs = verifier.spec()["inputs"]
+        assert inputs["text"] == {"type": "json", "schema": {"type": "string"}}, inputs
+        assert inputs["count"]["schema"] == {"type": "integer"}
+        assert inputs["ratio"]["schema"] == {"type": "number"}
+        assert inputs["flag"]["schema"] == {"type": "boolean"}
+        assert inputs["nothing"]["schema"] == {"type": "null"}
+        assert inputs["report"]["schema"]["properties"]["text"] == {"type": "string"}
+        assert inputs["notes"] == {"type": "json", "schema": {"type": ["string", "null"]}, "required": False}
+        assert inputs["canonical"] == {"type": "json", "schema": {"type": "string"}, "required": False}
+        assert "pydantic" not in [name for name, module in sys.modules.items() if module is not None]
+        try:
+            Verifier("model", "1.0.0", inputs={"bad": object})
+        except TypeError as error:
+            assert "has no JSON Schema" in str(error)
+        else:
+            raise AssertionError("an unsupported class is a TypeError")
+        """
+    )
+    completed = subprocess.run([sys.executable, "-c", script], capture_output=True, text=True)
+    assert completed.returncode == 0, completed.stderr
+
+
+class Report(BaseModel):
+    text: str
+    notes: str | None = None
+
+
+def test_pydantic_models_supply_input_schemas() -> None:
+    verifier = Verifier("modelled", "1.0.0", inputs={"report": Report})
+    verifier.add_input("optional", InputSlot.json(Report).required(False))
+    inputs = verifier.spec()["inputs"]
+    assert inputs["report"] == {"type": "json", "schema": Report.model_json_schema()}
+    assert inputs["optional"]["required"] is False
+    assert "text" in inputs["report"]["schema"]["required"]
+    assert "notes" not in inputs["report"]["schema"]["required"], "omission follows the model"
+    assert {"type": "null"} in inputs["report"]["schema"]["properties"]["notes"]["anyOf"]
+
+
+def test_every_native_family_constructs_canonical_specs() -> None:
+    pager = {"kind": "http", "method": "post", "url": "https://hooks.example.com/release"}
+    singles = [
+        (
+            Data("authored", "1.0.0")
+            .interface({"kind": "Parquet", "meta": {"compression": "Snappy"}})
+            .schema({"columns": [{"name": "latency", "dtype": "float64"}]})
+            .stats({"row_count": 1, "col_count": 1, "byte_count": 1, "sha256": "c4f7700b380aff2662e88d034154d1890c33d3c12c8dda1a0ca9481f43bb9906"}),
+            "Data",
+        ),
+        (
+            Model(
+                "authored",
+                "1.0.0",
+                interface={"kind": "Custom", "meta": {"framework_version": "0.1.0", "loader_module": "assistant", "loader_class": "LatencyModel", "extra": {}}},
+                task_type="Other",
+                signature={"inputs": [{"name": "latency", "dtype": "float64"}], "outputs": [{"name": "score", "dtype": "float64"}]},
+            ),
+            "Model",
+        ),
+        (
+            Experiment("authored", "1.0.0", experiment_type="ab").add_target_ref(CardRef.model("ranker", "1.0.0")),
+            "Experiment",
+        ),
+        (Mcp("authored", "1.0.0", server_name="files", transport="stdio").add_scope("read"), "Mcp"),
+        (Audit("authored", "1.0.0", description="Quarterly review"), "Audit"),
+        (Trigger("authored", "1.0.0", kind="schedule", cron="0 0 * * *"), "Trigger"),
+        (Operator("authored", "1.0.0").action(pager), "Operator"),
+        (Prompt("authored", "1.0.0", provider="openai", model="gpt-4o").add_message({"role": "user", "content": "Hi"}), "Prompt"),
+        (
+            Artifact("authored", "1.0.0", artifact_kind="document")
+            .add_metadata("owner", {"type": "str", "value": "finance"})
+            .add_label("team", "finance")
+            .add_annotation("reviewed", "yes"),
+            "Artifact",
+        ),
+        (CardDefinition(CardKind.Policy, "authored", "1.0.0", {"description": "Sharing", "enforcement": "block"}), "Policy"),
+        (judge(), "Agent"),
+    ]
+    for card, kind in singles:
+        assert card.card_ref().kind == getattr(CardKind, kind)
+        card.validate()
+    assert singles[3][0].spec() == {"server_name": "files", "transport": "stdio", "scopes": ["read"]}
+    assert singles[6][0].spec() == pager, "an Operator's action is flattened into its spec"
+    assert singles[2][0].spec()["target_refs"] == [ref("Model", "ranker")]
+
+    policy = CardRef.artifact("company-sharing-policy", "1.0.0").file("extracted/policy.json")
+    local = Artifact.from_path("company-sharing-policy", "2.0.0", SHARING_POLICY).extract(True)
+    assert isinstance(policy, ArtifactFile)
+    local.validate()
+
+    call = Action.agent(CardRef.agent("judge", "1.0.0"), inputs={"report": "inputs.report"})
+    call.add_workspace("/inputs/report.json", "inputs.report").add_workspace("/inputs/policy.json", policy)
+    check_call = Check.agent(judge(), inputs={"report": "inputs.report"}).workspace({"/inputs/policy.json": local.file("x.pdf")})
+    operators = ["equals", {"kind": "in_range", "min": 0.0, "max": 1.0, "inclusive": True}, {"kind": "matches_regex", "pattern": "^r"}]
+    checks = [Check.code(CodeSource.inline("def f():\n    return {}\n"), "f", response_format="verdict"), check_call]
+    for operator in operators:
+        checks += [
+            Check.assert_("inputs.report", operator, 1),
+            Check.each("inputs.report.items[*]", operator, 1),
+            Check.trace("inputs.trace", "$.spans[0].name", operator, 1),
+        ]
+    verifier = Verifier(
+        "inventory",
+        "1.0.0",
+        inputs={
+            "report": InputSlot.json({"type": "object"}),
+            "document": InputSlot.media(["pdf"], max_bytes=1024).required(False),
+            "trace": InputSlot.trace(required=False),
+        },
+        steps=[
+            Step("extract", Action.extract("inputs.document")),
+            Step("judge", call, when={"path": "steps.extract.status", "operator": "equals", "expected": "succeeded"}),
+            Step("summarize", Action.code(policy, "summarize").runtime("python")),
+            {"id": "canonical", "action": {"kind": "extract", "from": "inputs.document"}},
+        ],
+        requirements=[Requirement(f"r{index}", "Compared", check) for index, check in enumerate(checks)],
+        decide={"pass_rate": {"threshold": 0.5}},
+        context_capture="hash",
+    )
+    spec = verifier.spec()
+    assert spec["steps"][1]["action"]["workspace"]["/inputs/policy.json"] == {
+        "artifact": {"card": ref("Artifact", "company-sharing-policy"), "path": "extracted/policy.json"}
+    }
+    assert spec["requirements"][1]["check"]["agent"] == {"sibling": ref("Agent", "judge")}
+    assert spec["requirements"][1]["check"]["workspace"]["/inputs/policy.json"]["artifact"]["card"] == ref(
+        "Artifact", "company-sharing-policy", "2.0.0"
+    ), "a local Artifact stands as its exact reference, published first"
+    assert spec["requirements"][3]["check"] == {
+        "kind": "assert",
+        "each": "inputs.report.items[*]",
+        "operator": "equals",
+        "expected": 1,
+    }
+    assert spec["steps"][3] == {"id": "canonical", "action": {"kind": "extract", "from": "inputs.document"}}
+    verifier.validate()
+
+    group = Verifier(
+        "conversation",
+        "1.0.0",
+        inputs={"turns": InputSlot.source("verifiers.turn-check.inputs.turn"), "answered": "verifiers.turn-check.requirements.answered.outcome"},
+        order_by="inputs.turns.turn",
+        requirements=[Requirement("answered", "Answered", Check.each("inputs.answered[*]", "equals", "passed"))],
+    )
+    assert group.spec()["inputs"]["turns"] == "verifiers.turn-check.inputs.turn"
+    group.validate()
+
+    drift_spec = {
+        "method": "Spc",
+        "signal": {"kind": "Distribution", "baseline_ref": ref("Data", "latency-baseline"), "features": ["latency"]},
+        "condition": {"kind": "Statistical"},
+        "profile": {"kind": "Spc", "sample_size": 5},
+    }
+    drift = Verifier("latency-drift", "1.0.0", inputs={"latency": InputSlot.samples(["latency"])})
+    drift.add_requirement(Requirement("stable", "Stable", Check.drift("inputs.latency", drift_spec)))
+    assert drift.spec()["requirements"][0]["check"] == {"kind": "drift", "on": "inputs.latency", **drift_spec}
+    drift.validate()
+
+    binding = Binding(Verifier("checked", "1.0.0"), runs_on=Trigger("daily", "1.0.0", kind="schedule", cron="0 0 * * *"))
+    binding.add_on_failure(Operator("page", "1.0.0", action=pager)).add_on_failure(pager)
+    binding.add_on_verdict_change(CardRef.operator("notify", "1.0.0"))
+    bound = judge("bound").add_verified_by(binding)
+    assert bound.spec()["verified_by"] == [
+        {
+            "verifier": {"sibling": ref("Verifier", "checked")},
+            "runs_on": {"sibling": ref("Trigger", "daily")},
+            "on_failure": [{"sibling": ref("Operator", "page")}, pager],
+            "on_verdict_change": [ref("Operator", "notify")],
+        }
+    ]
+
+    registered = RegisteredRef(CardKind.Agent, "judge", "1.0.0")
+    component = Component("judge", registered, source={"path": "services/judge", "kind": "python"})
+    component.add_config("region", {"type": "str", "value": "eu"}).add_verified_by(CardRef.verifier("checked", "1.0.0"))
+    service = Service(
+        "authored",
+        "1.0.0",
+        description="Release service",
+        components=[component, {"alias": "raw", "ref": ref("Agent", "raw")}],
+        verified_by=["./not-a-file.yaml"],
+    ).verified_by([CardRef.verifier("release", "1.0.0")])
+    assert service.spec() == {
+        "description": "Release service",
+        "components": [
+            {
+                "alias": "judge",
+                "ref": ref("Agent", "judge"),
+                "source": {"path": "services/judge", "kind": "python"},
+                "config": {"region": {"type": "str", "value": "eu"}},
+                "verified_by": [{"verifier": ref("Verifier", "checked")}],
+            },
+            {"alias": "raw", "ref": ref("Agent", "raw")},
+        ],
+        "verified_by": [{"verifier": ref("Verifier", "release")}],
+    }
+    service.validate()
+
+    file_source = CodeSource.file(POLICY / "missing.py")
+    pending = Verifier("pending", "1.0.0", inputs={"report": str})
+    pending.add_requirement(Requirement("coded", "Coded", Check.code(file_source, "f")))
+    assert pending.spec()["requirements"][0]["check"]["source"] is None, "a code file is read only at validation"
+    with pytest.raises(WyrdError) as refused:
+        pending.validate()
+    assert "missing.py" in str(refused.value.details)

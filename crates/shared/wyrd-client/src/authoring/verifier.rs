@@ -6,7 +6,7 @@ use wyrd_spec::envelope::{CardKind, Spec};
 use wyrd_spec::error::WyrdError;
 use wyrd_spec::verification::ExecutionPlan;
 
-use super::{Body, Card, CardDefinition, FieldValue, card_methods, fields};
+use super::{Body, Card, CardDefinition, FieldValue, canonical_object, card_methods, fields};
 
 /// A Verifier Card: the evidence it accepts, the steps that compute over it,
 /// and the requirements that judge it.
@@ -171,6 +171,22 @@ fields!(InputSlot [body] {
     one max_bytes: Value = "max_bytes";
     one required: Value = "required";
 });
+
+impl From<Value> for InputSlot {
+    /// The canonical slot exactly as authored: a source slot's reference
+    /// string, or a slot object; any other value stands as authored, so
+    /// validation refuses it as YAML would.
+    fn from(value: Value) -> Self {
+        match value {
+            Value::String(text) => Self::source(text),
+            value => Self {
+                body: Body::authored(value),
+            },
+        }
+    }
+}
+
+canonical_object!(Step, Requirement, Action, Check);
 
 impl From<InputSlot> for FieldValue {
     /// The canonical slot object, or a source slot's reference string.

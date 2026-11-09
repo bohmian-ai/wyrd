@@ -146,11 +146,13 @@ impl PyWyrdState {
         Self::hydrated(py, inner, interfaces, load_kwargs, trusted_artifact_hashes)
     }
 
-    /// Declare a Card file and return its eagerly hydrated state, ready to run.
+    /// Declare a Card file or an authored Card graph and return its eagerly
+    /// hydrated state, ready to run.
     ///
     /// The online counterpart of `from_path`: the file and the files its
-    /// `./path` references name are declared under the registry's usual
-    /// version rules, the declared root's complete graph is pulled and
+    /// `./path` references name, or the authored Card and everything it
+    /// references, are declared as `Cards.declare` declares them, under the
+    /// registry's usual version rules, the declared root's complete graph is pulled and
     /// validated, and Python holders are hydrated exactly as `from_path`
     /// hydrates them. The declaration, the pull, and every later server call
     /// run as one client. Without `bundle_dir`, the bundle stays private:
@@ -165,7 +167,7 @@ impl PyWyrdState {
     /// ```
     ///
     /// # Arguments
-    /// * `path` - The root Service Card file.
+    /// * `card` - The root Service: its Card file, or an authored Card.
     /// * `client` - The `WyrdClient` every call runs as, or `None` for the
     ///   ambient chain.
     /// * `bundle_dir` - A caller-owned directory to publish the bundle to,
@@ -180,21 +182,24 @@ impl PyWyrdState {
     /// documents, then `from_path`'s hydration errors. A failure after the
     /// registry accepted the declaration leaves it committed.
     #[staticmethod]
-    #[pyo3(signature = (path, client=None, *, bundle_dir=None, interfaces=None, load_kwargs=None, trusted_artifact_hashes=None))]
+    #[pyo3(signature = (card, client=None, *, bundle_dir=None, interfaces=None, load_kwargs=None, trusted_artifact_hashes=None))]
     fn declare(
         py: Python<'_>,
-        path: PathBuf,
+        card: &Bound<'_, PyAny>,
         client: Option<PyRef<'_, PyWyrdClient>>,
         bundle_dir: Option<PathBuf>,
         interfaces: Option<&Bound<'_, PyMapping>>,
         load_kwargs: Option<&Bound<'_, PyMapping>>,
         trusted_artifact_hashes: Option<&Bound<'_, PyMapping>>,
     ) -> CardPyResult<Self> {
+        let input = crate::authoring::declarable(card).ok_or_else(|| {
+            invalid_argument("card", "expected a Card file path or an authored Card")
+        })?;
         let options = DeclareOptions {
             client: client.map(|client| client.inner().clone()),
             bundle_dir,
         };
-        let inner = crate::trace::block_on(py, WyrdState::declare_with(path, options))
+        let inner = crate::trace::block_on(py, WyrdState::declare_with(input, options))
             .map_err(WyrdPyError::from)?;
         Self::hydrated(py, inner, interfaces, load_kwargs, trusted_artifact_hashes)
     }
@@ -1940,16 +1945,25 @@ impl PyCards {
         }
     }
 
-    /// Declare a caller-owned `DataCard`, `ModelCard`, or `PromptCard`.
+    /// Declare an authored Card graph, a Card file or bundle directory, or a
+    /// caller-owned `DataCard`, `ModelCard`, or `PromptCard`.
     ///
-    /// Declaration serializes the complete Card envelope, saves `DataCard` or
+    /// An authored Card from `wyrd.authoring` is copied as it is now,
+    /// validated, and declared through the shared Rust declaration: each
+    /// local Artifact it references is published first as its own
+    /// submission, then the graph; a later graph failure leaves those
+    /// Artifacts registered. A path declares through the shared file loader.
+    /// Neither takes `version_bump` or `save_args`.
+    ///
+    /// For a holder, declaration serializes the complete Card envelope, saves `DataCard` or
     /// `ModelCard` artifacts through the attached interface, uploads the
     /// resulting manifest, and waits for server completion. On success, the
     /// same caller-owned card is updated with the server-assigned UID,
     /// resolved version, and normalized identity fields.
     ///
     /// # Arguments
-    /// * `card` - Native Wyrd card holder to declare.
+    /// * `card` - An authored Card, a Card file or bundle path, or a native
+    ///   Wyrd card holder to declare.
     /// * `version_bump` - Version intent. Defaults to server-compatible `VersionBump.Patch`.
     ///   Use `VersionBump.pre`, `build`, or `pre_build` for version metadata.
     /// * `save_args` - `DataSaveArgs` or `ModelSaveArgs` forwarded to the
@@ -1971,7 +1985,24 @@ impl PyCards {
         version_bump: Option<&Bound<'_, PyAny>>,
         save_args: Option<&Bound<'_, PyAny>>,
     ) -> CardPyResult<PyDeclarationReceipt> {
-        PythonCardRegistry::new(self.cards(py)?).declare(py, card, version_bump, save_args)
+        let Some(input) = crate::authoring::declarable(card) else {
+            return PythonCardRegistry::new(self.cards(py)?).declare(
+                py,
+                card,
+                version_bump,
+                save_args,
+            );
+        };
+        if version_bump.is_some() || save_args.is_some() {
+            return Err(invalid_argument(
+                "card",
+                "an authored Card or path declares without version_bump or save_args",
+            )
+            .into());
+        }
+        crate::trace::block_on(py, self.cards(py)?.declare(input))
+            .map(PyDeclarationReceipt::from)
+            .map_err(WyrdPyError::from)
     }
 
     /// Declare a Card from a local Card file or bundle directory.

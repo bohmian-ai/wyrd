@@ -7,8 +7,8 @@ use serde_json::Value;
 use wyrd_spec::envelope::CardKind;
 
 use super::{
-    ArtifactFile, Body, Card, CardDefinition, CardRef, FieldValue, Verifier, card_methods, fields,
-    selection,
+    ArtifactFile, Body, Card, CardDefinition, CardRef, FieldValue, Verifier, canonical_object,
+    card_methods, fields, selection,
 };
 
 /// Generate a named Card type: its struct, `new`, the shared Card methods,
@@ -308,6 +308,8 @@ fields!(Component [body] {
     map config, add_config: Value = "config";
     list credential_refs, add_credential_ref: Value = "credential_refs";
 });
+
+canonical_object!(Component, Binding);
 
 impl From<Component> for FieldValue {
     /// The canonical component object.

@@ -223,6 +223,21 @@ struct Body {
 }
 
 impl Body {
+    /// The canonical object `value` exactly as authored: its fields when it
+    /// is an object, otherwise the malformed value validation refuses.
+    fn authored(value: Value) -> Self {
+        match value {
+            Value::Object(fields) => Self {
+                fields,
+                ..Self::default()
+            },
+            malformed => Self {
+                malformed: Some(malformed),
+                ..Self::default()
+            },
+        }
+    }
+
     /// An object holding `fields`.
     fn new<const N: usize>(fields: [(&str, FieldValue); N]) -> Self {
         let mut body = Self::default();
@@ -415,6 +430,27 @@ macro_rules! fields {
 }
 
 pub(crate) use fields;
+
+/// Generate `From<Value>` for sub-values held as one [`Body`]: the canonical
+/// object form, kept as authored until validation.
+macro_rules! canonical_object {
+    ($($ty:ty),* $(,)?) => {
+        $(
+            impl From<Value> for $ty {
+                /// The canonical object form, exactly as authored; a value
+                /// that is not an object stands as authored, so validation
+                /// refuses it as YAML would.
+                fn from(value: Value) -> Self {
+                    Self {
+                        body: $crate::authoring::Body::authored(value),
+                    }
+                }
+            }
+        )*
+    };
+}
+
+pub(crate) use canonical_object;
 
 /// An exact Card reference: kind, name, and one version, kept as authored
 /// until validation.
@@ -870,17 +906,7 @@ impl CardDefinition {
         version: impl Into<String>,
         spec: Value,
     ) -> Self {
-        let body = match spec {
-            Value::Object(fields) => Body {
-                fields,
-                ..Body::default()
-            },
-            malformed => Body {
-                malformed: Some(malformed),
-                ..Body::default()
-            },
-        };
-        Self(Card::with_spec(kind, name, version, body))
+        Self(Card::with_spec(kind, name, version, Body::authored(spec)))
     }
 
     /// The exact reference this Card registers as.

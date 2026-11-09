@@ -7,6 +7,7 @@ import wyrd
 
 PUBLIC_MODULES = [
     "wyrd",
+    "wyrd.authoring",
     "wyrd.bifrost",
     "wyrd.cards",
     "wyrd.cli",

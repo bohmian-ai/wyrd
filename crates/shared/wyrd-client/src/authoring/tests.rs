@@ -1296,3 +1296,60 @@ impl Agent {
         CardDefinition::from(self)
     }
 }
+
+/// Canonical object forms of sub-values are kept exactly as authored: equal
+/// to their constructed values, and a malformed form stands until validation
+/// refuses it by its YAML field path.
+#[test]
+fn canonical_objects_match_constructed_values() {
+    let step = json!({
+        "id": "scan",
+        "action": {"kind": "extract", "from": "inputs.report"},
+        "depends_on": ["fetch"],
+    });
+    let constructed = Step::new("scan", Action::extract("inputs.report")).depends_on(["fetch"]);
+    assert_eq!(
+        FieldValue::from(Step::from(step.clone())).value,
+        FieldValue::from(constructed).value
+    );
+    let check = json!({"kind": "assert", "path": "steps.scan.output.ok", "operator": "equals", "expected": true});
+    assert_eq!(
+        FieldValue::from(Check::from(check.clone())).value,
+        FieldValue::from(Check::assert("steps.scan.output.ok", "equals", true)).value
+    );
+    assert_eq!(
+        FieldValue::from(InputSlot::from(json!("verifiers.a.inputs.report"))).value,
+        json!("verifiers.a.inputs.report")
+    );
+    assert_eq!(
+        FieldValue::from(InputSlot::from(
+            json!({"type": "json", "schema": {"type": "string"}, "required": false})
+        ))
+        .value,
+        FieldValue::from(InputSlot::json(json!({"type": "string"})).required(false)).value
+    );
+    assert_eq!(
+        FieldValue::from(Binding::from(json!({"verifier": "./v.yaml"}))).value,
+        FieldValue::from(Binding::new("./v.yaml")).value
+    );
+    assert_eq!(
+        FieldValue::from(Component::from(json!({"alias": "a", "ref": "./a.yaml"}))).value,
+        FieldValue::from(Component::new("a", "./a.yaml")).value
+    );
+    assert_eq!(
+        FieldValue::from(Requirement::from(
+            json!({"id": "r", "statement": "s", "check": check.clone()})
+        ))
+        .value,
+        FieldValue::from(Requirement::new("r", "s", Check::from(check))).value
+    );
+
+    let mut verifier = Verifier::new("canonical", "1.0.0");
+    verifier
+        .add_input("report", InputSlot::json(json!({"type": "string"})))
+        .add_step(Step::from(json!("not-a-step")));
+    let error = verifier
+        .validate()
+        .expect_err("a string step does not decode");
+    assert!(refuses(&error, "steps[0]"), "{error:?}");
+}

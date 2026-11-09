@@ -303,8 +303,6 @@ impl Component {
 }
 
 fields!(Component [body] {
-    one alias: Value = "alias";
-    one r#ref: FieldValue = "ref";
     list verified_by, add_verified_by: Binding = "verified_by";
     one source: Value = "source";
     map config, add_config: Value = "config";
@@ -337,7 +335,6 @@ impl Binding {
 }
 
 fields!(Binding [body] {
-    one verifier: FieldValue = "verifier";
     one runs_on: FieldValue = "runs_on";
     list on_failure, add_on_failure: FieldValue = "on_failure";
     list on_verdict_change, add_on_verdict_change: FieldValue = "on_verdict_change";

@@ -2321,7 +2321,11 @@ is available only at `InlineableRef<T>` slots.
 TypeScript SDKs project it) builds the same Cards in code, in the Card YAML's
 own vocabulary. Each named Card type takes `new(name, version)`; each
 sub-value (`Component`, `Binding`, `InputSlot`, `Step`, `Requirement`,
-`Action`, `Check`) takes the fields that identify it. Every other method is
+`Action`, `Check`) takes the fields that identify it. Constructor arguments
+are fixed: no later method edits them, so a different name, version, alias,
+reference, id, action, check, or check operand means constructing another
+value. Every `Action` constructor returns an `Action` and every `Check`
+constructor, `each` and `agent` included, a `Check`. Every other method is
 named for the YAML field it edits and takes that field's YAML value:
 references stay strings such as `inputs.report.text`, operators stay strings
 or their parameterized objects, and nested objects stay canonical JSON. A

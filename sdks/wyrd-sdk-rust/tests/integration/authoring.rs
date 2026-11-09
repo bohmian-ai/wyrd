@@ -1547,11 +1547,11 @@ fn public_paths_author_every_native_family() {
             InputSlot::media(["pdf"]).max_bytes(1024).required(false),
         )
         .add_input("trace", InputSlot::trace().required(false));
-    let mut call = Action::agent(CardRef::agent("judge", "1.0.0"));
+    let mut call: Action = Action::agent(CardRef::agent("judge", "1.0.0"));
     call.add_input("report", "inputs.report")
         .add_workspace("/inputs/report.json", "inputs.report")
         .add_workspace("/inputs/policy.json", registered_policy("1.0.0"));
-    let mut check_call =
+    let mut check_call: Check =
         Check::agent(CardRef::agent("judge", "1.0.0")).inputs([("report", "inputs.report")]);
     check_call
         .add_workspace("/inputs/report.json", "inputs.report")
@@ -1598,7 +1598,7 @@ fn public_paths_author_every_native_family() {
             ),
             (
                 "each",
-                Check::each("inputs.report.items[*]", operator.clone(), 1).into(),
+                Check::each("inputs.report.items[*]", operator.clone(), 1),
                 json!({"kind": "assert", "each": "inputs.report.items[*]", "operator": operator, "expected": 1}),
             ),
             (
@@ -1811,65 +1811,35 @@ fn public_paths_author_every_native_family() {
     );
 
     let mounted = local_policy("1.0.0", &story("company-sharing-policy.pdf"));
-    let agent_call = |judge: &str| {
-        let mut call =
-            Action::agent(policy_judge(judge, "1.0.0")).inputs([("report", "inputs.report")]);
-        call.add_workspace("/inputs/policy.json", mounted.file(POLICY_FILE));
-        call
-    };
-    let agent_check = |judge: &str| {
-        let mut check =
-            Check::agent(policy_judge(judge, "1.0.0")).inputs([("report", "inputs.report")]);
-        check.add_workspace("/inputs/policy.json", mounted.file(POLICY_FILE));
-        check
-    };
-    let edited_call = agent_call("old-judge").agent(policy_judge("new-judge", "1.0.0"));
-    let edited_check = agent_check("old-judge").agent(policy_judge("new-judge", "1.0.0"));
-    let edited_each = Check::each("inputs.report.old[*]", "equals", 1)
-        .each("inputs.report.items[*]")
-        .operator("greater_than")
-        .expected(0);
-    let edited_extract = Action::extract("inputs.report").from("inputs.document");
-    assert_eq!(
-        edited_call,
-        agent_call("new-judge"),
-        "Action.agent replaces"
-    );
-    assert_eq!(
-        edited_check,
-        agent_check("new-judge"),
-        "Check.agent replaces"
-    );
-    assert_eq!(
-        edited_each,
-        Check::each("inputs.report.items[*]", "greater_than", 0),
-        "Check.each replaces"
-    );
-    assert_eq!(
-        edited_extract,
-        Action::extract("inputs.document"),
-        "Action.from replaces"
-    );
-    let edited = Verifier::new("edited", "1.0.0")
+    let mut call =
+        Action::agent(policy_judge("judge", "1.0.0")).inputs([("report", "inputs.report")]);
+    call.add_workspace("/inputs/policy.json", mounted.file(POLICY_FILE));
+    let mut check =
+        Check::agent(policy_judge("judge", "1.0.0")).inputs([("report", "inputs.report")]);
+    check.add_workspace("/inputs/policy.json", mounted.file(POLICY_FILE));
+    let composed = Verifier::new("composed", "1.0.0")
         .inputs([
             ("report", InputSlot::json(json!({"type": "object"}))),
             ("document", InputSlot::media(["pdf"])),
         ])
         .steps([
-            Step::new("extract", edited_extract),
-            Step::new("judge", edited_call),
+            Step::new("extract", Action::extract("inputs.document")),
+            Step::new("judge", call),
         ])
         .requirements([
-            Requirement::new("judged", "Judged", edited_check),
-            Requirement::new("each", "Each", edited_each),
+            Requirement::new("judged", "Judged", check),
+            Requirement::new(
+                "each",
+                "Each",
+                Check::each("inputs.report.items[*]", "greater_than", 0),
+            ),
         ]);
+    assert_eq!(composed.spec()["steps"][1]["action"]["kind"], "agent");
     assert_eq!(
-        edited.spec()["steps"][1]["action"]["kind"],
-        "agent",
-        "an edit keeps the discriminant"
+        composed.spec()["requirements"][1]["check"]["kind"],
+        "assert"
     );
-    assert_eq!(edited.spec()["requirements"][1]["check"]["kind"], "assert");
-    let declaration = CardDefinition::from(&edited)
+    let declaration = CardDefinition::from(&composed)
         .declaration()
         .expect("valid graph");
     let agents: Vec<String> = declaration
@@ -1880,10 +1850,10 @@ fn public_paths_author_every_native_family() {
         .filter(|submission| submission.kind == CardKind::Agent)
         .map(|submission| submission.metadata.name.to_string())
         .collect();
-    assert_eq!(agents, ["new-judge"], "the replaced Agent is not declared");
+    assert_eq!(agents, ["judge"], "the shared Agent is declared once");
     assert_eq!(
         declaration.artifacts.len(),
         1,
-        "the mounted policy survives the Agent replacement"
+        "the policy mounted by both calls is published once"
     );
 }

@@ -46,9 +46,7 @@ pub use kinds::{
     Agent, Artifact, Audit, Binding, Component, Data, Experiment, Mcp, Model, Operator, Prompt,
     Service, Trigger,
 };
-pub use verifier::{
-    Action, AgentAction, AgentCheck, Check, EachCheck, InputSlot, Requirement, Step, Verifier,
-};
+pub use verifier::{Action, Check, InputSlot, Requirement, Step, Verifier};
 pub use wyrd_spec::verification::ExecutionPlan;
 
 /// One step of a location inside an authored value.
@@ -748,25 +746,11 @@ fn value_at<'a>(value: &'a mut Value, location: &[Segment]) -> Option<&'a mut Va
         })
 }
 
-/// Generate the methods every named Card type shares: identity and
-/// metadata setters, its reference, its authored spec, and validation.
+/// Generate the methods every named Card type shares: metadata setters,
+/// its reference, its authored spec, and validation.
 macro_rules! card_methods {
     ($ty:ty) => {
         impl $ty {
-            /// Set the Card's name, as authored.
-            #[must_use]
-            pub fn name(mut self, name: impl Into<String>) -> Self {
-                self.card.name = name.into();
-                self
-            }
-
-            /// Set the Card's exact version, as authored.
-            #[must_use]
-            pub fn version(mut self, version: impl Into<String>) -> Self {
-                self.card.version = version.into();
-                self
-            }
-
             /// Set the whole `metadata.labels` map.
             #[must_use]
             pub fn labels<I, K, V>(mut self, labels: I) -> Self

@@ -114,7 +114,23 @@ impl InputSlot {
 
     /// A JSON value constrained by the JSON Schema `schema`.
     pub fn json(schema: impl Into<Value>) -> Self {
-        Self::typed("json").schema(schema)
+        let mut slot = Self::typed("json");
+        slot.body.set("schema", FieldValue::from(schema.into()));
+        slot
+    }
+
+    /// A slot of `type` listing `items` under `field`.
+    fn listing<I>(kind: &str, field: &str, items: I) -> Self
+    where
+        I: IntoIterator,
+        I::Item: Into<Value>,
+    {
+        let mut slot = Self::typed(kind);
+        slot.body.set_list(
+            field,
+            items.into_iter().map(|item| FieldValue::from(item.into())),
+        );
+        slot
     }
 
     /// A pinned file in one of `formats`, such as `"pdf"`.
@@ -123,7 +139,7 @@ impl InputSlot {
         I: IntoIterator,
         I::Item: Into<Value>,
     {
-        Self::typed("media").formats(formats)
+        Self::listing("media", "formats", formats)
     }
 
     /// A trace resolved through tenant-scoped trace reads.
@@ -138,7 +154,7 @@ impl InputSlot {
         I: IntoIterator,
         I::Item: Into<Value>,
     {
-        Self::typed("samples").features(features)
+        Self::listing("samples", "features", features)
     }
 
     /// A group Verifier's input authored as the source reference `text`,
@@ -152,11 +168,8 @@ impl InputSlot {
 }
 
 fields!(InputSlot [body] {
-    one schema: Value = "schema";
-    list formats, add_format: Value = "formats";
     one max_bytes: Value = "max_bytes";
     one required: Value = "required";
-    list features, add_feature: Value = "features";
 });
 
 impl From<InputSlot> for FieldValue {
@@ -189,8 +202,6 @@ impl Step {
 }
 
 fields!(Step [body] {
-    one id: Value = "id";
-    one action: Action = "action";
     list depends_on, add_depends_on: Value = "depends_on";
     one when: Value = "when";
     list requirements, add_requirement: Requirement = "requirements";
@@ -229,12 +240,6 @@ impl Requirement {
     }
 }
 
-fields!(Requirement [body] {
-    one id: Value = "id";
-    one statement: Value = "statement";
-    one check: Check = "check";
-});
-
 impl From<Requirement> for FieldValue {
     /// The canonical requirement object.
     fn from(requirement: Requirement) -> Self {
@@ -265,10 +270,8 @@ impl Action {
 
     /// Invoke `agent`: an [`super::Agent`], an exact [`super::CardRef`], a
     /// YAML reference path, or inline Agent JSON.
-    pub fn agent(agent: impl Into<FieldValue>) -> AgentAction {
-        AgentAction {
-            body: Self::of("agent", [("agent", agent.into())]).body,
-        }
+    pub fn agent(agent: impl Into<FieldValue>) -> Self {
+        Self::of("agent", [("agent", agent.into())])
     }
 
     /// Run `entrypoint` of `source` as sandboxed code returning JSON data.
@@ -284,45 +287,14 @@ impl Action {
 }
 
 fields!(Action [body] {
-    one from: Value = "from";
     map inputs, add_input: Value = "inputs";
     map workspace, add_workspace: FieldValue = "workspace";
-    one source: FieldValue = "source";
-    one entrypoint: Value = "entrypoint";
     one runtime: Value = "runtime";
 });
 
 impl From<Action> for FieldValue {
     /// The canonical action object.
     fn from(action: Action) -> Self {
-        action.body.into_field()
-    }
-}
-
-/// An Agent action, as [`Action::agent`] builds it: its own `agent` field
-/// is editable here, where [`Action`]'s constructor holds that name.
-#[derive(Debug, Clone, PartialEq)]
-pub struct AgentAction {
-    /// The action's fields, `kind: agent` included.
-    body: Body,
-}
-
-fields!(AgentAction [body] {
-    one agent: FieldValue = "agent";
-    map inputs, add_input: Value = "inputs";
-    map workspace, add_workspace: FieldValue = "workspace";
-});
-
-impl From<AgentAction> for Action {
-    /// The same Agent action.
-    fn from(action: AgentAction) -> Self {
-        Self { body: action.body }
-    }
-}
-
-impl From<AgentAction> for FieldValue {
-    /// The canonical action object.
-    fn from(action: AgentAction) -> Self {
         action.body.into_field()
     }
 }
@@ -365,16 +337,15 @@ impl Check {
         each: impl Into<String>,
         operator: impl Into<Value>,
         expected: impl Into<Value>,
-    ) -> EachCheck {
-        let check = Self::of(
+    ) -> Self {
+        Self::of(
             "assert",
             [
                 ("each", FieldValue::from(each.into())),
                 ("operator", FieldValue::from(operator.into())),
                 ("expected", FieldValue::from(expected.into())),
             ],
-        );
-        EachCheck { body: check.body }
+        )
     }
 
     /// Compare the spans `span_selector` selects in the trace slot `on` with
@@ -397,10 +368,8 @@ impl Check {
     }
 
     /// Judge with `agent`, which returns the Verdict schema.
-    pub fn agent(agent: impl Into<FieldValue>) -> AgentCheck {
-        AgentCheck {
-            body: Self::of("agent", [("agent", agent.into())]).body,
-        }
+    pub fn agent(agent: impl Into<FieldValue>) -> Self {
+        Self::of("agent", [("agent", agent.into())])
     }
 
     /// Judge with `entrypoint` of `source`, which returns the Verdict schema.
@@ -430,80 +399,15 @@ impl Check {
 }
 
 fields!(Check [body] {
-    one path: Value = "path";
-    one operator: Value = "operator";
-    one expected: Value = "expected";
-    one on: Value = "on";
-    one span_selector: Value = "span_selector";
     map inputs, add_input: Value = "inputs";
     map workspace, add_workspace: FieldValue = "workspace";
-    one source: FieldValue = "source";
-    one entrypoint: Value = "entrypoint";
     one runtime: Value = "runtime";
     one response_format: Value = "response_format";
-    one spec: Value = "spec";
 });
 
 impl From<Check> for FieldValue {
     /// The canonical check object.
     fn from(check: Check) -> Self {
-        check.body.into_field()
-    }
-}
-
-/// An assert check over every selected value, as [`Check::each`] builds it:
-/// its own `each` field is editable here, where [`Check`]'s constructor
-/// holds that name.
-#[derive(Debug, Clone, PartialEq)]
-pub struct EachCheck {
-    /// The check's fields, `kind: assert` included.
-    body: Body,
-}
-
-fields!(EachCheck [body] {
-    one each: Value = "each";
-    one operator: Value = "operator";
-    one expected: Value = "expected";
-});
-
-impl From<EachCheck> for Check {
-    /// The same assert check.
-    fn from(check: EachCheck) -> Self {
-        Self { body: check.body }
-    }
-}
-
-impl From<EachCheck> for FieldValue {
-    /// The canonical check object.
-    fn from(check: EachCheck) -> Self {
-        check.body.into_field()
-    }
-}
-
-/// An Agent check, as [`Check::agent`] builds it: its own `agent` field is
-/// editable here, where [`Check`]'s constructor holds that name.
-#[derive(Debug, Clone, PartialEq)]
-pub struct AgentCheck {
-    /// The check's fields, `kind: agent` included.
-    body: Body,
-}
-
-fields!(AgentCheck [body] {
-    one agent: FieldValue = "agent";
-    map inputs, add_input: Value = "inputs";
-    map workspace, add_workspace: FieldValue = "workspace";
-});
-
-impl From<AgentCheck> for Check {
-    /// The same Agent check.
-    fn from(check: AgentCheck) -> Self {
-        Self { body: check.body }
-    }
-}
-
-impl From<AgentCheck> for FieldValue {
-    /// The canonical check object.
-    fn from(check: AgentCheck) -> Self {
         check.body.into_field()
     }
 }

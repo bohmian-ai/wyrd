@@ -92,9 +92,9 @@ fn schema(field: &str, value: &Bound<'_, PyAny>) -> PyResult<Value> {
     }
 }
 
-/// An input slot: an `InputSlot`, a source slot's reference string, a
-/// canonical slot mapping whose `type` is `json`, `media`, `trace` or
-/// `samples`, or else a JSON schema for a required `json` slot.
+/// An input slot: an `InputSlot`, or else a source slot's reference string,
+/// a canonical slot mapping, or a JSON Schema or class standing for one, as
+/// the shared `InputSlot` conversion reads them.
 ///
 /// # Errors
 /// As [`schema`].
@@ -102,19 +102,7 @@ fn slot(field: &str, value: &Bound<'_, PyAny>) -> PyResult<InputSlot> {
     if let Ok(slot) = value.cast::<PyInputSlot>() {
         return Ok(slot.borrow().inner.clone());
     }
-    if let Ok(text) = value.cast::<PyString>() {
-        return Ok(InputSlot::source(text.to_str()?));
-    }
-    let schema = schema(field, value)?;
-    let canonical = schema
-        .get("type")
-        .and_then(Value::as_str)
-        .is_some_and(|kind| matches!(kind, "json" | "media" | "trace" | "samples"));
-    Ok(if canonical {
-        InputSlot::from(schema)
-    } else {
-        InputSlot::json(schema)
-    })
+    Ok(InputSlot::from(schema(field, value)?))
 }
 
 /// The named authoring Card `value` is, copied as it is now.
@@ -824,7 +812,7 @@ impl PyRequirement {
 authoring_class! {
     /// One named evidence slot of a Verifier.
     PyInputSlot(InputSlot) = "InputSlot" {
-        one { max_bytes: json, required: json }
+        one { max_bytes: json }
         list {}
         map {}
     }
@@ -835,10 +823,10 @@ authoring_class! {
     /// # Errors
     /// As [`schema`].
     #[staticmethod]
-    #[pyo3(signature = (schema, **fields))]
-    fn json(schema: &Bound<'_, PyAny>, fields: Option<&Bound<'_, PyDict>>) -> PyResult<Self> {
+    #[pyo3(signature = (schema))]
+    fn json(schema: &Bound<'_, PyAny>) -> PyResult<Self> {
         Ok(Self {
-            inner: Self::with_fields(InputSlot::json(self::schema("schema", schema)?), fields)?,
+            inner: InputSlot::json(self::schema("schema", schema)?),
         })
     }
 
@@ -855,15 +843,12 @@ authoring_class! {
     }
 
     /// A trace resolved through tenant-scoped trace reads.
-    ///
-    /// # Errors
-    /// As the field setters.
     #[staticmethod]
-    #[pyo3(signature = (**fields))]
-    fn trace(fields: Option<&Bound<'_, PyDict>>) -> PyResult<Self> {
-        Ok(Self {
-            inner: Self::with_fields(InputSlot::trace(), fields)?,
-        })
+    #[pyo3(signature = ())]
+    fn trace() -> Self {
+        Self {
+            inner: InputSlot::trace(),
+        }
     }
 
     /// Recorded measurements of `features` for a scheduled window.
@@ -893,7 +878,7 @@ authoring_class! {
     PyAction(Action) = "Action" {
         one { runtime: json }
         list {}
-        map { inputs, add_input: json, workspace, add_workspace: field }
+        map { inputs, bind_input: json, workspace, add_workspace: field }
     }
 
     /// Extract text and structure from the media slot `from_`, such as
@@ -942,7 +927,7 @@ authoring_class! {
     PyCheck(Check) = "Check" {
         one { runtime: json, response_format: json }
         list {}
-        map { inputs, add_input: json, workspace, add_workspace: field }
+        map { inputs, bind_input: json, workspace, add_workspace: field }
     }
 
     /// Compare the one value at `path` with `expected` by `operator`, such as

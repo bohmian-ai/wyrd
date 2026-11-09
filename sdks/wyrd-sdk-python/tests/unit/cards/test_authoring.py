@@ -188,8 +188,8 @@ def test_plain_schemas_do_not_require_pydantic() -> None:
             inputs={"text": str, "count": int, "ratio": float, "flag": bool, "nothing": type(None)},
         )
         verifier.add_input("report", schema)
-        verifier.add_input("notes", InputSlot.json({"type": ["string", "null"]}).required(False))
-        verifier.add_input("canonical", {"type": "json", "schema": {"type": "string"}, "required": False})
+        verifier.add_input("notes", {"type": ["string", "null"]})
+        verifier.add_input("canonical", {"type": "json", "schema": {"type": "string"}})
         schema["properties"]["text"]["type"] = "integer"
         verifier.add_requirement(
             Requirement("has-text", "Has text", Check.assert_("inputs.text", "is_non_empty", None))
@@ -202,8 +202,8 @@ def test_plain_schemas_do_not_require_pydantic() -> None:
         assert inputs["flag"]["schema"] == {"type": "boolean"}
         assert inputs["nothing"]["schema"] == {"type": "null"}
         assert inputs["report"]["schema"]["properties"]["text"] == {"type": "string"}
-        assert inputs["notes"] == {"type": "json", "schema": {"type": ["string", "null"]}, "required": False}
-        assert inputs["canonical"] == {"type": "json", "schema": {"type": "string"}, "required": False}
+        assert inputs["notes"] == {"type": "json", "schema": {"type": ["string", "null"]}}
+        assert inputs["canonical"] == {"type": "json", "schema": {"type": "string"}}
         assert "pydantic" not in [name for name, module in sys.modules.items() if module is not None]
         try:
             Verifier("model", "1.0.0", inputs={"bad": object})
@@ -217,6 +217,21 @@ def test_plain_schemas_do_not_require_pydantic() -> None:
     assert completed.returncode == 0, completed.stderr
 
 
+def test_slot_level_required_is_refused() -> None:
+    for slot in [
+        {"type": "json", "schema": {"type": "string"}, "required": False},
+        {"type": "trace", "required": True},
+    ]:
+        verifier = Verifier("optional", "1.0.0", inputs={"note": slot})
+        with pytest.raises(WyrdError) as refused:
+            verifier.validate()
+        message = invalid(refused)
+        assert "inputs.note" in message and "unknown field `required`" in message, message
+    assert not hasattr(InputSlot, "required")
+    assert not hasattr(Action, "add_input")
+    assert not hasattr(Check, "add_input")
+
+
 class Report(BaseModel):
     text: str
     notes: str | None = None
@@ -224,10 +239,10 @@ class Report(BaseModel):
 
 def test_pydantic_models_supply_input_schemas() -> None:
     verifier = Verifier("modelled", "1.0.0", inputs={"report": Report})
-    verifier.add_input("optional", InputSlot.json(Report).required(False))
+    verifier.add_input("explicit", InputSlot.json(Report))
     inputs = verifier.spec()["inputs"]
     assert inputs["report"] == {"type": "json", "schema": Report.model_json_schema()}
-    assert inputs["optional"]["required"] is False
+    assert inputs["explicit"] == inputs["report"]
     assert "text" in inputs["report"]["schema"]["required"]
     assert "notes" not in inputs["report"]["schema"]["required"], "omission follows the model"
     assert {"type": "null"} in inputs["report"]["schema"]["properties"]["notes"]["anyOf"]
@@ -321,12 +336,14 @@ def test_every_native_family_constructs_canonical_specs() -> None:
     assert isinstance(policy, ArtifactFile)
     local.validate()
 
-    call = Action.agent(CardRef.agent("judge", "1.0.0"), inputs={"report": "inputs.report"})
-    call.add_workspace("/inputs/report.json", "inputs.report").add_workspace(
-        "/inputs/policy.json", policy
-    )
-    check_call = Check.agent(judge(), inputs={"report": "inputs.report"}).workspace(
-        {"/inputs/policy.json": local.file("x.pdf")}
+    call = Action.agent(CardRef.agent("judge", "1.0.0"))
+    call.bind_input("report", "inputs.report").add_workspace(
+        "/inputs/report.json", "inputs.report"
+    ).add_workspace("/inputs/policy.json", policy)
+    check_call = (
+        Check.agent(judge())
+        .bind_input("report", "inputs.report")
+        .workspace({"/inputs/policy.json": local.file("x.pdf")})
     )
     operators = [
         "equals",
@@ -348,8 +365,8 @@ def test_every_native_family_constructs_canonical_specs() -> None:
         "1.0.0",
         inputs={
             "report": InputSlot.json({"type": "object"}),
-            "document": InputSlot.media(["pdf"], max_bytes=1024).required(False),
-            "trace": InputSlot.trace(required=False),
+            "document": InputSlot.media(["pdf"], max_bytes=1024),
+            "trace": InputSlot.trace(),
         },
         steps=[
             Step("extract", Action.extract("inputs.document")),
@@ -378,6 +395,11 @@ def test_every_native_family_constructs_canonical_specs() -> None:
             "path": "extracted/policy.json",
         }
     }
+    assert (
+        spec["steps"][1]["action"]["inputs"]
+        == spec["requirements"][1]["check"]["inputs"]
+        == {"report": "inputs.report"}
+    )
     assert spec["requirements"][1]["check"]["agent"] == {"sibling": ref("Agent", "judge")}
     assert spec["requirements"][1]["check"]["workspace"]["/inputs/policy.json"]["artifact"][
         "card"

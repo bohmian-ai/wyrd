@@ -32,7 +32,6 @@ from wyrd.authoring import (
     Check,
     CodeSource,
     Component,
-    InputSlot,
     Requirement,
     Service,
     Step,
@@ -187,9 +186,11 @@ def report_policy(version: str, judge: Agent, policy: ArtifactFile) -> Verifier:
     )
     verifier.add_input("report", REPORT)
     call = Check.agent(judge).inputs(
-        {name: f"inputs.{name}" for name in ("report", "recipient", "purpose", "destination")}
+        {name: f"inputs.{name}" for name in ("report", "recipient", "purpose")}
     )
-    call.add_workspace("/inputs/policy.json", policy)
+    call.bind_input("destination", "inputs.destination").add_workspace(
+        "/inputs/policy.json", policy
+    )
     scan = fact_step(
         "policy",
         "report_facts",
@@ -218,14 +219,14 @@ def report_policy(version: str, judge: Agent, policy: ArtifactFile) -> Verifier:
 
 
 def release_access(version: str, description: str | None = None) -> Verifier:
-    """``release-access`` at ``version``: independent recipient and destination steps, optional ``notes``."""
+    """``release-access`` at ``version``: independent recipient and destination steps, unused ``notes``."""
     verifier = Verifier(
         "release-access",
         version,
         description=description or "The recipient and destination may receive the report.",
         inputs=release_inputs(),
     )
-    verifier.add_input("notes", InputSlot.json({"type": "string"}).required(False))
+    verifier.add_input("notes", {"type": "string"})
     verifier.add_step(
         fact_step(
             "recipient",

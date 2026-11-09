@@ -12,9 +12,7 @@
 //! The program builds every Card in code, declares them in one call, and
 //! verifies a permitted release and one that names a bank account.
 
-use wyrd_ai::authoring::{
-    Agent, Artifact, Check, Component, InputSlot, Requirement, Service, Verifier,
-};
+use wyrd_ai::authoring::{Agent, Artifact, Check, Component, Requirement, Service, Verifier};
 use wyrd_ai::serde_json::json;
 use wyrd_ai::state::WyrdState;
 use wyrd_ai::verify::Inputs;
@@ -96,22 +94,22 @@ fn release_check(policy: &Artifact) -> Verifier {
         .inputs([
             (
                 "report",
-                InputSlot::json(json!({
+                json!({
                     "type": "object",
                     "required": ["text"],
                     "properties": { "text": { "type": "string" } },
-                })),
+                }),
             ),
             (
                 "recipient",
-                InputSlot::json(json!({
+                json!({
                     "type": "object",
                     "required": ["email", "authorized"],
                     "properties": {
                         "email": { "type": "string" },
                         "authorized": { "type": "boolean" },
                     },
-                })),
+                }),
             ),
         ])
         .requirements([

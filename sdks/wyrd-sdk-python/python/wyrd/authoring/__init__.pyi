@@ -81,7 +81,8 @@ SlotInput: TypeAlias = InputSlot | str | type | Mapping[str, JsonInput]
 """An input slot: a slot, a source reference, a class standing for a schema, or a mapping.
 
 A mapping whose ``type`` is ``json``, ``media``, ``trace`` or ``samples`` is a
-canonical slot; any other mapping is a JSON Schema for a required ``json`` slot.
+canonical slot; any other mapping is the JSON Schema of a ``json`` slot, never an
+example value to infer one from.
 """
 
 class CardRef:
@@ -913,11 +914,11 @@ class Verifier:
         ...
 
     def add_input(self, key: str, value: SlotInput) -> Self:
-        """Insert the entry ``key`` into ``inputs``; returns this value.
+        """Declare the evidence slot ``key`` in ``inputs``; returns this value.
 
         Args:
-            key: The entry's key.
-            value: The entry's value, captured as it is now.
+            key: The slot's name.
+            value: The slot, or a JSON Schema or class standing for one.
         """
         ...
 
@@ -2247,7 +2248,6 @@ class InputSlotFields(TypedDict, total=False):
     """The ``InputSlot`` fields a constructor takes as keywords, each set as its setter sets it."""
 
     max_bytes: JsonInput
-    required: JsonInput
 
 class ActionFields(TypedDict, total=False):
     """The ``Action`` fields a constructor takes as keywords, each set as its setter sets it."""
@@ -2540,17 +2540,19 @@ class Requirement:
         ...
 
 class InputSlot:
-    """One named evidence slot of a Verifier; required unless ``required(False)``."""
+    """One named evidence slot of a Verifier.
+
+    Omitted evidence stays missing, never ``None``: the checks that need it are
+    inconclusive. A ``json`` slot's schema alone decides whether a supplied
+    ``None`` is admitted.
+    """
 
     @staticmethod
-    def json(
-        schema: type | Mapping[str, JsonInput], **fields: Unpack[InputSlotFields]
-    ) -> InputSlot:
+    def json(schema: type | Mapping[str, JsonInput]) -> InputSlot:
         """A JSON value constrained by ``schema``.
 
         Args:
             schema: A JSON Schema, or a class standing for one.
-            **fields: ``required`` or ``max_bytes``.
         """
         ...
 
@@ -2560,22 +2562,18 @@ class InputSlot:
 
         Args:
             formats: The accepted formats.
-            **fields: ``required`` or ``max_bytes``.
+            **fields: ``max_bytes``.
         """
         ...
 
     @staticmethod
-    def trace(**fields: Unpack[InputSlotFields]) -> InputSlot:
-        """A trace resolved through tenant-scoped trace reads.
-
-        Args:
-            **fields: ``required``.
-        """
+    def trace() -> InputSlot:
+        """A trace resolved through tenant-scoped trace reads."""
         ...
 
     @staticmethod
     def samples(features: Iterable[str]) -> InputSlot:
-        """Recorded measurements of ``features`` for a scheduled window; always required.
+        """Recorded measurements of ``features`` for a scheduled window.
 
         Args:
             features: The recorded features.
@@ -2584,7 +2582,7 @@ class InputSlot:
 
     @staticmethod
     def source(text: str) -> InputSlot:
-        """A group Verifier's input authored as a source reference; always required.
+        """A group Verifier's input authored as a source reference.
 
         Args:
             text: A reference such as ``verifiers.<name>.inputs.<slot>``.
@@ -2596,14 +2594,6 @@ class InputSlot:
 
         Args:
             value: The new ``max_bytes``.
-        """
-        ...
-
-    def required(self, value: JsonInput) -> Self:
-        """Set ``required``, replacing its earlier value; returns this value.
-
-        Args:
-            value: The new ``required``.
         """
         ...
 
@@ -2652,12 +2642,12 @@ class Action:
         """
         ...
 
-    def add_input(self, key: str, value: JsonInput) -> Self:
-        """Insert the entry ``key`` into ``inputs``; returns this value.
+    def bind_input(self, key: str, value: JsonInput) -> Self:
+        """Bind the argument ``key`` to the reference ``value`` in ``inputs``; returns this value.
 
         Args:
-            key: The entry's key.
-            value: The entry's value, captured as it is now.
+            key: The argument's name.
+            value: The reference it reads, such as ``inputs.report``.
         """
         ...
 
@@ -2766,12 +2756,12 @@ class Check:
         """
         ...
 
-    def add_input(self, key: str, value: JsonInput) -> Self:
-        """Insert the entry ``key`` into ``inputs``; returns this value.
+    def bind_input(self, key: str, value: JsonInput) -> Self:
+        """Bind the argument ``key`` to the reference ``value`` in ``inputs``; returns this value.
 
         Args:
-            key: The entry's key.
-            value: The entry's value, captured as it is now.
+            key: The argument's name.
+            value: The reference it reads, such as ``inputs.report``.
         """
         ...
 

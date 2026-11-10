@@ -659,6 +659,72 @@ def test_canonical_mappings_carry_native_values() -> None:
     assert refused.value.code == "WYRD_SPEC_400_VALIDATION"
 
 
+def test_circular_and_deep_containers_refuse_without_crashing() -> None:
+    script = textwrap.dedent(
+        """
+        from wyrd import WyrdError
+        from wyrd.authoring import Action, Agent, Component, Prompt, Service
+
+        def refused(build):
+            try:
+                build()
+            except WyrdError as error:
+                assert error.code == "WYRD_SPEC_400_VALIDATION", error.code
+                return True
+            return False
+
+        cyclic_dict = {}
+        cyclic_dict["self"] = cyclic_dict
+        cyclic_list = []
+        cyclic_list.append(cyclic_list)
+        indirect = {}
+        indirect["items"] = [indirect]
+        agent = Agent("judge", "1.0.0")
+        for cycle in [cyclic_dict, cyclic_list, indirect]:
+            assert refused(lambda: Action.agent(cycle))
+            assert refused(lambda: Service("svc", "1.0.0").add_component({"alias": "judge", "ref": agent, "config": cycle}))
+            assert refused(lambda: Component("judge", agent).verified_by([{"verifier": cycle}]))
+        assert refused(lambda: Prompt("p", "1.0.0", system=cyclic_dict))
+
+        def nest(depth, container):
+            value = "x"
+            for _ in range(depth):
+                value = container(value)
+            return value
+
+        for container in [lambda v: [v], lambda v: (v,), lambda v: {"k": v}]:
+            for depth in [126, 127, 128, 4000]:
+                value = nest(depth, container)
+                control = refused(lambda: Prompt("p", "1.0.0", system=value))
+                assert control == (depth > 127), depth
+                assert refused(lambda: Action.agent(value)) == control, depth
+                component = {"alias": "judge", "ref": agent, "config": nest(depth - 1, container)}
+                assert refused(lambda: Prompt("p", "1.0.0", system={**component, "ref": "x"})) == control, depth
+                assert refused(lambda: Service("svc", "1.0.0").add_component(component)) == control, depth
+                binding = {"verifier": nest(depth - 1, container)}
+                assert refused(lambda: Component("judge", agent).verified_by([binding])) == control, depth
+
+        shared = {"threshold": 1}
+        service = Service("svc", "1.0.0").add_component({"alias": "judge", "ref": agent, "config": {"a": shared, "b": [shared, shared]}})
+        assert service.spec()["components"][0]["config"] == {"a": shared, "b": [shared, shared]}
+        before = service.spec()
+        assert refused(lambda: service.components([{"alias": "judge", "ref": agent, "config": cyclic_dict}]))
+        assert service.spec() == before, "a refused conversion leaves the field as it was"
+        incomplete = Service("svc", "1.0.0").add_component({"alias": "judge"})
+        try:
+            incomplete.validate()
+        except WyrdError:
+            pass
+        else:
+            raise AssertionError("an incomplete component is refused at validation")
+        """
+    )
+    completed = subprocess.run(
+        [sys.executable, "-c", script], capture_output=True, text=True, timeout=120
+    )
+    assert completed.returncode == 0, (completed.returncode, completed.stderr)
+
+
 def test_canonical_mapping_callbacks_may_edit_their_receiver() -> None:
     verifier = Verifier("reentrant", "1.0.0")
 

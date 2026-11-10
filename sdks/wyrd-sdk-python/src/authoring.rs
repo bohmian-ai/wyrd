@@ -153,8 +153,36 @@ pub(crate) fn declarable(value: &Bound<'_, PyAny>) -> Option<Declarable<'static>
 /// string.
 ///
 /// # Errors
-/// As [`json`], and as [`object`] for a mapping.
+/// As [`json`], and as [`object`] for a mapping; also as [`enter`] for a
+/// container nested too deep, which stops a container that holds itself.
 fn field(field: &str, value: &Bound<'_, PyAny>) -> PyResult<FieldValue> {
+    nested(field, value, 0)
+}
+
+/// The deepest container nesting a value may reach, the same bound
+/// `serde_json` applies to the plain JSON that [`json`] parses.
+const MAX_DEPTH: usize = 127;
+
+/// The nesting depth inside one more container around a value at `depth`.
+///
+/// # Errors
+/// Raises `WYRD_SPEC_400_VALIDATION` naming `field` past [`MAX_DEPTH`].
+fn enter(field: &str, depth: usize) -> PyResult<usize> {
+    if depth >= MAX_DEPTH {
+        return Err(invalid_argument(
+            field,
+            format!("containers nest deeper than {MAX_DEPTH} levels"),
+        )
+        .into());
+    }
+    Ok(depth + 1)
+}
+
+/// [`field`] for a value already inside `depth` containers.
+///
+/// # Errors
+/// As [`field`].
+fn nested(field: &str, value: &Bound<'_, PyAny>, depth: usize) -> PyResult<FieldValue> {
     if let Some(card) = definition(value) {
         return Ok(card.into());
     }
@@ -184,23 +212,31 @@ fn field(field: &str, value: &Bound<'_, PyAny>) -> PyResult<FieldValue> {
         return Ok(card_ref.get().0.clone().into());
     }
     if let Ok(mapping) = value.cast::<PyMapping>() {
-        return Ok(object(field, mapping)?.into_iter().collect());
+        return Ok(object(field, mapping, depth)?.into_iter().collect());
     }
     if value.is_instance_of::<PyList>() || value.is_instance_of::<PyTuple>() {
+        let depth = enter(field, depth)?;
         return value
             .try_iter()?
-            .map(|item| self::field(field, &item?))
+            .map(|item| nested(field, &item?, depth))
             .collect();
     }
     json(field, value).map(FieldValue::from)
 }
 
-/// The entries of a canonical mapping, each value converted by [`field`].
+/// The entries of a canonical mapping inside `depth` containers, each value
+/// converted by [`field`].
 ///
 /// # Errors
 /// Raises `WYRD_SPEC_400_VALIDATION` naming `field` for a key that is not a
-/// `str`, as plain JSON refuses one, and each value's conversion error.
-fn object(field: &str, mapping: &Bound<'_, PyMapping>) -> PyResult<Vec<(String, FieldValue)>> {
+/// `str`, as plain JSON refuses one, as [`enter`] for the mapping itself, and
+/// each value's conversion error.
+fn object(
+    field: &str,
+    mapping: &Bound<'_, PyMapping>,
+    depth: usize,
+) -> PyResult<Vec<(String, FieldValue)>> {
+    let depth = enter(field, depth)?;
     mapping
         .items()?
         .iter()
@@ -214,7 +250,7 @@ fn object(field: &str, mapping: &Bound<'_, PyMapping>) -> PyResult<Vec<(String, 
                     invalid_argument(field, format!("mapping key {shown} is not a str")).into(),
                 );
             };
-            Ok((key.to_str()?.to_owned(), self::field(field, &value)?))
+            Ok((key.to_str()?.to_owned(), nested(field, &value, depth)?))
         })
         .collect()
 }
@@ -230,7 +266,7 @@ fn binding(field_name: &str, value: &Bound<'_, PyAny>) -> PyResult<Binding> {
         return Ok(binding.borrow().inner.clone());
     }
     if let Ok(mapping) = value.cast::<PyMapping>() {
-        return Ok(object(field_name, mapping)?.into_iter().collect());
+        return Ok(object(field_name, mapping, 0)?.into_iter().collect());
     }
     field(field_name, value).map(Binding::new)
 }
@@ -251,7 +287,7 @@ macro_rules! canonical {
                     return Ok(value.borrow().inner.clone());
                 }
                 if let Ok(mapping) = value.cast::<PyMapping>() {
-                    return Ok(object(field, mapping)?.into_iter().collect());
+                    return Ok(object(field, mapping, 0)?.into_iter().collect());
                 }
                 json(field, value).map(<$native>::from)
             }

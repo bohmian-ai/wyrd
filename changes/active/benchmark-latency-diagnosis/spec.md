@@ -1,6 +1,6 @@
 ---
 id: SPEC-benchmark-latency-diagnosis
-revision: 3
+revision: 4
 status: approved
 ---
 
@@ -48,6 +48,14 @@ The desired c64
 p50s are client completion below 1 ms and Gateway-added latency below 500 us;
 these are investigation objectives, not new production SLOs or changes to the
 existing benchmark p99 judgments.
+
+The maintainer further requested one TASK-004 encompassing the remaining client,
+fixture and JSON/transport work. It reduces SDK request replay and per-call
+bookkeeping, Gateway driver and fake-upstream materialization, native request
+ownership, repeated native response validation, and provider body accumulation.
+Fresh allocation evidence and separately attributable production/fixture
+comparisons are required. All work stays in this task; it is not a research-only
+handoff, and the existing latency objectives do not become guaranteed outcomes.
 
 ## Required behavior
 
@@ -143,6 +151,40 @@ existing benchmark p99 judgments.
   server journeys, then compare the optimized candidate against the corrected
   recorder-only milestone with unchanged instrumentation and workload. The task
   is not complete at recorder recovery and does not defer these optimizations.
+- **REQ-013 — Efficient SDK calls.** TASK-004 removes serialized-request copying
+  across initial/replayed HTTP attempts, whole-client timeout wrappers used by
+  Verify, and avoidable binding-lookup and request-assembly allocations. Preserve
+  exact bodies, effective deadlines, retry/idempotency, invocation/request identity,
+  token exchange/refresh and secret handling. Reuse existing pools and caches;
+  no new authentication cache, caller authority or SDK wire surface is selected.
+- **REQ-014 — Efficient fixture clients with unchanged checks.** TASK-004 avoids
+  full owned JSON trees in Gateway buffered-answer validation and the fake
+  upstream's request selection, and reuses invariant request setup. Preserve
+  decoded-value checks, duplicate-key semantics, malformed-input rejection,
+  response bytes, pacing, full-receipt-and-validation completion, and dynamic
+  case/phase/caller headers. Declare the changed fixture method. Gateway's timed
+  caller is direct HTTP; Verification's timed caller uses the SDK. Improvements
+  must be attributed to the implementation actually exercised.
+- **REQ-015 — Reduce native JSON and response-buffer work.** TASK-004 avoids
+  the owned native metadata request tree where equivalent raw/borrowed handling
+  is possible, consolidates Gateway-native response validation/adaptation, and
+  avoids unconditional copying of single response chunks. Keep owned fallback
+  for consumers/forms needing it. Preserve typed validation, canonical token
+  bounds, numeric/depth/duplicate/escape behavior, model rewriting, extension
+  fields, capture/redaction, provider refusals, UTF-8 behavior, decoded-body limits,
+  multipart/media/streaming behavior and retry ownership. Standalone public
+  Skald raw-response APIs remain unchanged. Internal representation changes at
+  existing owners are allowed; unchecked JSON construction or a parallel parser,
+  transport or lifecycle owner is not selected.
+- **REQ-016 — Current allocation and attributable performance proof.** TASK-004
+  obtains current server allocation evidence rather than treating the historical
+  702 KiB/call as current or as copied-byte volume. Compare production changes
+  under unchanged fixture behavior, then compare fixture changes with the exact
+  same retained optimized server binary. Keep profiling separate from unprofiled
+  judgments and record component binary/source lineage, workload methods and
+  all repetitions. Server profiles do not establish driver allocation. Historical
+  baselines remain immutable and are not rebuilt; bounded fresh current-reference
+  measurements for this task are distinct from rerunning historical baselines.
 
 ## Invariants and boundaries
 
@@ -197,6 +239,10 @@ baselines are reused throughout.
 | **AC-006 — Qualified recorder** | REQ-010; INV-001–004 | Independent-series progress and concurrent-snapshot tests preserve counts and complete timing groups. Valid, fully instrumented candidate evidence meets the task's declared recovery envelope against saved pre-task results and reports instrumentation costs and repetition spread. Recovery is a required intermediate milestone, not task completion. |
 | **AC-007 — Reproducible terminal diagnostics** | REQ-003–004,011; INV-004 | Each repetition's declared phase distributions, units, populations and missing evidence survive record publication. Fresh/saved rendering agrees after raw artifacts are removed; supported historical records remain readable. |
 | **AC-008 — Four optimizations delivered** | REQ-012; INV-001–004 | Each of the four paths has an implemented reduction in avoidable work, focused behavioral/allocation or ownership proof, and affected real-server regression evidence. The final unprofiled candidate uses the same corrected recorder/settings as the recovery milestone; report client/residual latency, phase evidence, CPU/work and throughput for every repetition. No optimization is deferred, and no response, redaction, audit, tenant, retry, byte-accounting or acknowledgement rule is weakened. Measured benefits and unresolved attribution are stated without claiming unsupported target attainment. |
+| **AC-009 — SDK call reductions** | REQ-013; INV-001–004 | Focused request-backing/replay, timeout, binding, auth and real SDK Verify regressions prove less temporary work without altered deadlines, identities, errors, refresh, retries or public behavior. |
+| **AC-010 — Native JSON/transport reductions** | REQ-015; INV-001–004 | Borrowing/ownership and compatibility tests establish the avoided request tree, consolidated Gateway-native response pass and single-chunk reuse through real consumers. Negative/edge and real-server cases preserve validation, canonical bounds, capture, provider errors and all fallback paths; standalone raw API behavior stays unchanged. |
+| **AC-011 — Fixture equivalence** | REQ-014; INV-001,003–004 | Differential predicate tests preserve old driver/stub validation and routing, including escapes/duplicates. Borrowing and scoped-header proofs show reduced ownership/setup without changing workload, pacing or the completion boundary. Method controls disclose fixture changes. |
+| **AC-012 — Current, reproducible attribution** | REQ-003,006–007,011,016; INV-004 | Fresh current-reference and production-candidate server heaps have declared populations and units. Unprofiled production and fixture comparisons retain distinct milestones and every repetition through the canonical renderer. Identical optimized server hashes isolate the final driver/stub comparison. Old allocation totals, missing samples, mean/median confusion, changed fixtures or sampled CPU are never used to invent current allocation, production gains or a hardware limit. |
 
 ## Existing owners and evidence
 
@@ -238,9 +284,12 @@ They retain their original revision-2 scope. The maintainer explicitly added
 [recorder recovery, standard reporting and four hot-path optimizations](tasks/TASK-003-recorder-overhead-and-standard-reporting.md)
 as one required implementation task. Its ordering is recorder/reporting repair,
 measured baseline recovery, all four optimizations, and final correctness and
-performance verification. Do not split the optimization work into future tasks
-or insert another general diagnosis gate. New experiments retain the explicit
-execution-authorization boundary above.
+performance verification. TASK-003 retains its revision-3 scope.
+[TASK-004](tasks/TASK-004-client-and-json-hot-path.md) encompasses all remaining
+client, fixture and native JSON/transport reductions plus their current allocation
+and staged performance proof. Do not split either task's optimization work into
+future tasks or insert another general diagnosis gate. New experiments retain
+the explicit execution-authorization boundary above.
 
 ## Open material decisions
 
@@ -248,9 +297,18 @@ Revision 2 was explicitly approved on 2026-11-09. Revision 3 records the
 maintainer's explicit scope correction on the same date: all four identified
 optimizations belong to TASK-003 after recorder recovery, with no deferral.
 No new capture policy, security semantics or retry protocol is selected.
-Additional benchmark execution remains separately controlled as described above.
+Revision 4 records the 2026-11-10 instruction to plan all client, fixture and
+native JSON/transport work as one decision-complete TASK-004. It changes no
+security, durable protocol, public SDK/API or latency judgment. Additional
+benchmark execution remains separately controlled as described above.
 
 ## Authority and revision history
+
+- Revision 4 approved scope, 2026-11-10: explicit maintainer request for one
+  decision-complete TASK-004 encompassing the remaining SDK, fixture, native
+  request/response and buffer work, fresh allocation evidence and separate
+  production/fixture performance attribution. Records that directed scope;
+  planning itself runs no implementation, build or experiment.
 
 - Revision 3 approved scope, 2026-11-09: explicit maintainer instruction that the
   four identified hot-path optimizations are part of TASK-003 and must not be

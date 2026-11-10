@@ -528,9 +528,21 @@ mod tests {
             hex(&long),
             "60e431591ee0b67f0d8a26aacbf5b77f8e0bc6213728c5140546040f0ee37f54"
         );
-        assert!(verify_hmac_sha256(b"Jefe", b"what do ya want for nothing?", &short));
-        assert!(!verify_hmac_sha256(b"Jefe", b"what do ya want for nothing!", &short));
-        assert!(!verify_hmac_sha256(b"Jefe", b"what do ya want for nothing?", &short[..31]));
+        assert!(verify_hmac_sha256(
+            b"Jefe",
+            b"what do ya want for nothing?",
+            &short
+        ));
+        assert!(!verify_hmac_sha256(
+            b"Jefe",
+            b"what do ya want for nothing!",
+            &short
+        ));
+        assert!(!verify_hmac_sha256(
+            b"Jefe",
+            b"what do ya want for nothing?",
+            &short[..31]
+        ));
     }
 
     /// Lowercase hex of `bytes`.

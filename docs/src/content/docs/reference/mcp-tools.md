@@ -93,6 +93,18 @@ A token already minted from a revoked credential lapses within five minutes.
 | `operator_connections.update` | `operators:write` | `{connection_id, request}` → OperatorConnectionView | Patch a connection; provider and name are fixed |
 | `operator_connections.disable` | `operators:write` | `{connection_id}` → OperatorConnectionView | Disable a connection |
 
+## GitHub connection
+
+The read is listed for every caller; the writes are listed only for a caller
+holding `identity_connections:write`. GitHub's setup and OAuth callback are
+browser redirects, not tools.
+
+| Tool | Permission | Input → output | Purpose |
+| --- | --- | --- | --- |
+| `github_connection.get` | `identity_connections:write` | `{}` → GithubConnectionView | Read the tenant's redacted connection |
+| `github_connection.connect` | `identity_connections:write` | `{}` → GithubConnectResponse | Begin a connection; a signed-in human opens the returned install URL |
+| `github_connection.disconnect` | `identity_connections:write` | `{}` → GithubConnectionView | Fence GitHub work and release the installation |
+
 ## Gateway administration
 
 Gateway tools address resources by exact `name` and never call a model.

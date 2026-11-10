@@ -28,7 +28,7 @@ use crate::error::{relying_party_error, store_error};
 /// Lifetime of a persisted login-state row: the browser must complete the `IdP`
 /// round-trip and reach `/auth/callback` within this window or the state is
 /// gone. A candidate test sign-in's state shares it.
-pub(crate) const LOGIN_STATE_TTL: Duration = Duration::from_mins(5);
+pub const LOGIN_STATE_TTL: Duration = Duration::from_mins(5);
 
 impl HumanConnections {
     /// Begin a tenant human SSO login bound to `initiation` and return the

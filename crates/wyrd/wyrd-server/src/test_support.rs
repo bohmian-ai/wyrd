@@ -175,6 +175,7 @@ pub fn shell_owners(
         .expect("the default gateway builds"),
         verification,
         mcp: Mcp::default(),
+        github: None,
         health: Health::default(),
         shutdown_token: tokio_util::sync::CancellationToken::new(),
         test_hooks: TestHooks::default(),

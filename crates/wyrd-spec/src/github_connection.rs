@@ -158,7 +158,10 @@ mod tests {
             r#"{"private_key":"k"}"#,
             r#"{"host":"evil.example"}"#,
         ] {
-            assert!(serde_json::from_str::<GithubConnectRequest>(body).is_err(), "{body}");
+            assert!(
+                serde_json::from_str::<GithubConnectRequest>(body).is_err(),
+                "{body}"
+            );
         }
     }
 

@@ -533,7 +533,7 @@ pub fn permission_names(permissions: &PermissionSet) -> Vec<String> {
 }
 
 /// A fresh unguessable secret: 32 random bytes, base64url without padding.
-pub(crate) fn random_secret() -> String {
+pub fn random_secret() -> String {
     let mut bytes = [0_u8; 32];
     rand::rng().fill_bytes(&mut bytes);
     base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes)

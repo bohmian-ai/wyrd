@@ -24,6 +24,7 @@ use crate::components::auth::AuthenticatedPrincipal;
 use crate::components::auth::auth_router;
 use crate::components::cards::cards_router;
 use crate::components::gateway::{gateway_ingress_router, gateway_router};
+use crate::components::github::{github_router, github_webhook_router};
 use crate::components::health::health_router;
 use crate::components::operators::operator_connections_router;
 use crate::components::platform::{
@@ -84,6 +85,7 @@ pub fn build_router(state: AppState) -> Router {
         .merge(admin_router())
         .merge(identity_router())
         .merge(gateway_router())
+        .merge(github_router())
         .layer(middleware::from_fn_with_state(
             state.clone(),
             require_tenant_authenticated,
@@ -96,7 +98,10 @@ pub fn build_router(state: AppState) -> Router {
         .flat_map(|group| group.get_openapi().paths.paths.keys())
         .map(|path| format!("/v1{path}"))
         .collect();
+    // GitHub's webhook authenticates by its delivery signature, verified by
+    // the handler before anything is read or routed.
     let v1_group = tenant_group
+        .merge(github_webhook_router())
         .merge(otlp_group)
         .merge(bifrost_group)
         .fallback(v1_not_found);

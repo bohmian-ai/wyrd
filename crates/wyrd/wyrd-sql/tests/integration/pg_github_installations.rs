@@ -525,6 +525,7 @@ mod pg_tests {
             insert_github_login_state(&mut conn, &github, &github_state(actor, fresh(), None), ttl)
                 .await
                 .expect("inserts")
+                .is_some()
         );
         let oidc = Sha256Hex::digest(b"oidc-state");
         assert!(
@@ -672,6 +673,7 @@ mod pg_tests {
             )
             .await
             .expect("inserts")
+            .is_some()
         );
         assert!(
             consume_github_login_state(&mut conn, &expired, actor, &browser)

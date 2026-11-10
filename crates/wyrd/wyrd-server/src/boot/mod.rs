@@ -130,6 +130,9 @@ pub enum ServerBootError {
     /// and failure class.
     #[error("Operator connection keys are unavailable: {0}")]
     OperatorKeys(#[from] KeyError),
+    /// The GitHub App configuration is invalid.
+    #[error(transparent)]
+    Github(#[from] crate::config::ConfigError),
     /// Pool construction, schema readiness, or a SQL operation failed.
     #[error(transparent)]
     Sql(#[from] wyrd_sql::error::SqlError),
@@ -1314,9 +1317,20 @@ impl AppState {
                 blocks,
                 OperatorKeys::for_role(config.role, &config.verification.operator_keys)?,
             );
-            Ok::<_, ServerBootError>((gateway, verification))
+            let github = config
+                .github
+                .resolve(config.deployment_profile.is_production())?
+                .map(|settings| {
+                    crate::components::github::GithubApp::new(
+                        settings,
+                        config.deployment_profile.screened_http(),
+                    )
+                    .map(Arc::new)
+                })
+                .transpose()?;
+            Ok::<_, ServerBootError>((gateway, verification, github))
         };
-        let (gateway, verification) = match owners.await {
+        let (gateway, verification, github) = match owners.await {
             Ok(owners) => owners,
             Err(error) => {
                 rollback_roles(&bifrost).await;
@@ -1336,6 +1350,7 @@ impl AppState {
             gateway,
             verification,
             mcp: Mcp::default(),
+            github,
             health: Health::default(),
             shutdown_token: shutdown,
             #[cfg(feature = "test-support")]

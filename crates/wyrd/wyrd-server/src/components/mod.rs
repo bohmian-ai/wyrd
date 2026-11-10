@@ -4,6 +4,7 @@ pub mod admin;
 pub mod auth;
 pub mod cards;
 pub mod gateway;
+pub mod github;
 pub mod health;
 pub mod operators;
 pub mod platform;

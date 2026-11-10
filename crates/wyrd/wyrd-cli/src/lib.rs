@@ -16,6 +16,7 @@ pub mod declaration;
 pub mod error;
 mod execution;
 pub mod gateway;
+mod github;
 /// `wyrd init`: local server bootstrap and its guided setup handoff.
 pub mod init;
 pub mod load;

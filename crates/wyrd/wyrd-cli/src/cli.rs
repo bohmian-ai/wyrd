@@ -8,6 +8,7 @@ use crate::card::{
 };
 use crate::execution::ExecutionCommand;
 use crate::gateway::GatewayCommand;
+use crate::github::GithubCommand;
 use crate::init::InitArgs;
 use crate::mcp::McpCommand;
 use crate::operator_connection::OperatorConnectionCommand;
@@ -59,6 +60,7 @@ impl Cli {
             Command::OperatorConnection(command) => crate::operator_connection::dispatch(command)
                 .await
                 .map_err(Into::into),
+            Command::Github(command) => crate::github::dispatch(command).await.map_err(Into::into),
             Command::Principal(command) => crate::principal::dispatch(command)
                 .await
                 .map_err(Into::into),
@@ -102,6 +104,9 @@ pub enum Command {
     /// Manage the tenant's encrypted Operator provider connections.
     #[command(subcommand)]
     OperatorConnection(OperatorConnectionCommand),
+    /// Connect the tenant to the deployment's GitHub App, read or release it.
+    #[command(subcommand)]
+    Github(GithubCommand),
     /// Manage Wyrd principals (revoke).
     #[command(subcommand)]
     Principal(PrincipalCommand),

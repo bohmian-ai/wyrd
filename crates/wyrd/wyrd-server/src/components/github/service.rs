@@ -1,0 +1,670 @@
+//! Tenant GitHub App connection, shared by HTTP and MCP.
+//!
+//! [`GithubConnections`] is the one owner of connect, read, disconnect,
+//! GitHub's setup and OAuth callback redirects, installation webhooks and
+//! narrowed installation tokens. Every caller operation evaluates
+//! `identity_connections:write` and stages the decision on the process audit
+//! outbox before it runs. A connection transaction is one-use login state
+//! bound to the beginning principal, its tenant and, from GitHub's setup
+//! redirect on, one browser; the callback consumes it before any provider IO
+//! and associates only after GitHub confirms the installation and the
+//! authorizing user's access, conditionally on the slot revision the
+//! transaction began from. No user token is stored, and no token, key or
+//! secret is returned or logged.
+
+use std::time::Duration;
+
+use base64::Engine as _;
+use secrecy::{ExposeSecret as _, SecretString};
+use serde::Deserialize;
+use uuid::Uuid;
+use wyrd_auth::browser_sessions::random_secret;
+use wyrd_auth::login::LOGIN_STATE_TTL;
+use wyrd_runtime::Permission;
+use wyrd_spec::DataTenantId;
+use wyrd_spec::auth::{AbsoluteUrl, ConnectionTester, Sha256Hex};
+use wyrd_spec::error::WyrdError;
+use wyrd_spec::github_connection::{
+    GithubAppIdentity, GithubCallbackQuery, GithubConnectResponse, GithubConnectionState,
+    GithubConnectionView, GithubSetupQuery,
+};
+use wyrd_sql::TenantConn;
+use wyrd_sql::queries::auth::{
+    GithubLoginState, bind_github_login_state, consume_github_login_state,
+    insert_github_login_state,
+};
+use wyrd_sql::queries::github_installations::{
+    GithubAssociation, GithubAssociationOutcome, GithubInstallationRow, GithubSlotBinding,
+    associate_github_installation, github_installation, lock_github_installation,
+    release_github_installation, remove_github_repositories, set_github_installation_suspended,
+};
+
+use super::app::{GithubApp, refused, unavailable};
+use crate::audit;
+use crate::components::auth::Caller;
+use crate::state::{AppState, registry_db_error};
+
+/// Audit operation of a connect.
+const CONNECT: &str = "github_connection.connect";
+/// Audit operation of a read.
+const READ: &str = "github_connection.read";
+/// Audit operation of a disconnect.
+const DISCONNECT: &str = "github_connection.disconnect";
+/// Audit operation of GitHub's setup redirect.
+const SETUP: &str = "github_connection.setup";
+/// Audit operation of GitHub's OAuth callback.
+const CALLBACK: &str = "github_connection.callback";
+/// Audited resource of every operation.
+const RESOURCE: &str = "github_connection";
+
+/// Lifetime of a connection transaction and its browser binding cookie.
+pub(crate) const TRANSACTION_TTL: Duration = LOGIN_STATE_TTL;
+
+/// The refusal when the deployment configures no GitHub App.
+pub(crate) fn not_configured() -> WyrdError {
+    WyrdError::GithubNotConfigured {
+        message: "this deployment has no GitHub App configured".to_owned(),
+        details: serde_json::json!({}),
+    }
+}
+
+/// A conflict naming why the association was refused.
+fn conflict(reason: &str, message: &str) -> WyrdError {
+    WyrdError::GithubConnectionConflict {
+        message: message.to_owned(),
+        details: serde_json::json!({ "reason": reason }),
+    }
+}
+
+/// The refusal for a transaction that is unknown, expired, consumed, or not
+/// this principal's, browser's or tenant's, which are indistinguishable.
+fn transaction_invalid() -> WyrdError {
+    refused(
+        "transaction_invalid",
+        "this GitHub connection transaction is not valid for this browser session",
+    )
+}
+
+/// A provider id as stored.
+///
+/// # Errors
+/// Returns [`WyrdError::GithubRequestInvalid`] for an id beyond `i64`.
+fn stored_id(id: u64, field: &str) -> Result<i64, WyrdError> {
+    i64::try_from(id).map_err(|_| WyrdError::GithubRequestInvalid {
+        message: format!("{field} is out of range"),
+        details: serde_json::json!({ "field": field }),
+    })
+}
+
+/// The S256 PKCE challenge of `verifier` (RFC 7636 §4.2).
+fn code_challenge(verifier: &str) -> String {
+    base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .encode(Sha256Hex::digest(verifier.as_bytes()).as_bytes())
+}
+
+/// A webhook's body, as far as Wyrd reads it.
+#[derive(Deserialize)]
+struct WebhookBody {
+    /// Event action.
+    action: Option<String>,
+    /// The installation the event concerns.
+    installation: Option<WebhookId>,
+    /// Repositories removed from the installation.
+    #[serde(default)]
+    repositories_removed: Vec<WebhookId>,
+}
+
+/// An object carrying a provider id.
+#[derive(Deserialize)]
+struct WebhookId {
+    /// Provider id.
+    id: u64,
+}
+
+/// A verified setup redirect: where the browser goes next and the binding
+/// secret its cookie carries.
+pub(crate) struct SetupRedirect {
+    /// GitHub's OAuth authorization page for this transaction.
+    pub(crate) authorize_url: url::Url,
+    /// The browser's transaction secret, set only in its callback cookie.
+    pub(crate) binding: SecretString,
+}
+
+/// Owner of the tenant GitHub connection for one request.
+pub struct GithubConnections<'a> {
+    /// Server state providing tenant connections, authorization and audit.
+    state: &'a AppState,
+}
+
+impl<'a> GithubConnections<'a> {
+    /// Build the owner over this process's state.
+    pub const fn new(state: &'a AppState) -> Self {
+        Self { state }
+    }
+
+    /// The configured App.
+    ///
+    /// # Errors
+    /// Returns [`WyrdError::GithubNotConfigured`] without one.
+    fn app(&self) -> Result<&'a GithubApp, WyrdError> {
+        self.state.github.as_deref().ok_or_else(not_configured)
+    }
+
+    /// Evaluate `identity_connections:write` for `operation` and stage the
+    /// decision on the process audit outbox.
+    ///
+    /// # Errors
+    /// Returns [`WyrdError::PermissionDeniedRbac`] without it.
+    fn authorize(&self, caller: &Caller, operation: &str) -> Result<(), WyrdError> {
+        audit::authorize(
+            self.state,
+            caller,
+            &Permission::identity_connections_write(),
+            operation,
+            RESOURCE,
+        )
+    }
+
+    /// A tenant connection for `tenant`.
+    ///
+    /// # Errors
+    /// Returns the registry unavailability error.
+    async fn conn(&self, tenant: DataTenantId) -> Result<TenantConn<'a>, WyrdError> {
+        self.state.registry_tenant_conn(tenant).await
+    }
+
+    /// The redacted view of `slot`.
+    fn view(app: &GithubApp, slot: Option<&GithubInstallationRow>) -> GithubConnectionView {
+        let settings = app.settings();
+        let associated = slot.filter(|row| row.installation_id.is_some());
+        GithubConnectionView {
+            host: settings.host(),
+            app: GithubAppIdentity {
+                id: settings.app_id,
+                slug: settings.slug.clone(),
+            },
+            state: match associated {
+                None => GithubConnectionState::NotConnected,
+                Some(row) if row.suspended_at.is_some() => GithubConnectionState::Suspended,
+                Some(_) => GithubConnectionState::Active,
+            },
+            installation_id: associated
+                .and_then(|row| row.installation_id)
+                .and_then(|id| u64::try_from(id).ok()),
+            repositories: associated
+                .map(|row| row.repositories.0.clone())
+                .unwrap_or_default(),
+            connected_at: associated.and_then(|row| row.connected_at),
+            updated_at: associated.map(|row| row.updated_at),
+        }
+    }
+
+    /// Begin a connection transaction for the caller and return GitHub's
+    /// install URL for it.
+    ///
+    /// The receipt is returned only after the transaction row commits.
+    ///
+    /// # Errors
+    /// Returns [`WyrdError::GithubNotConfigured`], the permission denial, or
+    /// a registry error.
+    pub(crate) async fn connect(
+        &self,
+        caller: &Caller,
+    ) -> Result<GithubConnectResponse, WyrdError> {
+        let app = self.app()?;
+        self.authorize(caller, CONNECT)?;
+        let state = random_secret();
+        let mut conn = self.conn(caller.data_tenant_id).await?;
+        let (expires_at, _) = self
+            .begin(&mut conn, app, caller, &state, None, None)
+            .await?;
+        conn.commit().await.map_err(registry_db_error)?;
+        let authorization_url = AbsoluteUrl::new(app.install_url(&state).to_string())
+            .map_err(|_| unavailable("the install URL"))?;
+        Ok(GithubConnectResponse {
+            authorization_url,
+            expires_at,
+        })
+    }
+
+    /// Record a transaction for `caller` under `state`, bound to the slot as
+    /// it is now, optionally already bound to `browser` with GitHub's
+    /// installation `hint`, and return its expiry and PKCE verifier.
+    ///
+    /// # Errors
+    /// Returns a registry error.
+    async fn begin(
+        &self,
+        conn: &mut TenantConn<'_>,
+        app: &GithubApp,
+        caller: &Caller,
+        state: &str,
+        browser: Option<Sha256Hex>,
+        hint: Option<i64>,
+    ) -> Result<(chrono::DateTime<chrono::Utc>, SecretString), WyrdError> {
+        let slot = github_installation(conn)
+            .await
+            .map_err(registry_db_error)?
+            .map_or_else(
+                || GithubSlotBinding {
+                    connection_id: Uuid::now_v7(),
+                    connection_revision: 0,
+                },
+                |row| row.binding(),
+            );
+        let row = GithubLoginState {
+            slot,
+            issuer: app.settings().web_origin.to_string(),
+            client_id: app.settings().oauth_client_id.clone(),
+            redirect_uri: app.callback_uri(),
+            code_verifier: SecretString::from(random_secret()),
+            actor: ConnectionTester {
+                principal_id: caller.principal.id,
+                principal_kind: caller.principal.kind.tag(),
+            },
+            browser_binding: browser,
+            installation_hint: hint,
+        };
+        let expires_at = insert_github_login_state(
+            conn,
+            &Sha256Hex::digest(state.as_bytes()),
+            &row,
+            TRANSACTION_TTL,
+        )
+        .await
+        .map_err(registry_db_error)?
+        .ok_or_else(transaction_invalid)?;
+        Ok((expires_at, row.code_verifier))
+    }
+
+    /// Read the tenant's redacted connection.
+    ///
+    /// # Errors
+    /// Returns [`WyrdError::GithubNotConfigured`], the permission denial, or
+    /// a registry error.
+    pub(crate) async fn get(&self, caller: &Caller) -> Result<GithubConnectionView, WyrdError> {
+        let app = self.app()?;
+        self.authorize(caller, READ)?;
+        let mut conn = self.conn(caller.data_tenant_id).await?;
+        let slot = github_installation(&mut conn)
+            .await
+            .map_err(registry_db_error)?;
+        conn.commit().await.map_err(registry_db_error)?;
+        Ok(Self::view(app, slot.as_ref()))
+    }
+
+    /// Disconnect the tenant: fence its installation's work and release the
+    /// association in one transaction, then return the released view.
+    ///
+    /// # Errors
+    /// Returns [`WyrdError::GithubNotConfigured`], the permission denial,
+    /// [`WyrdError::GithubNotConnected`] when nothing is associated, or a
+    /// registry error.
+    pub(crate) async fn disconnect(
+        &self,
+        caller: &Caller,
+    ) -> Result<GithubConnectionView, WyrdError> {
+        let app = self.app()?;
+        self.authorize(caller, DISCONNECT)?;
+        let mut conn = self.conn(caller.data_tenant_id).await?;
+        let Some(released) = Self::fence_and_release(&mut conn, None).await? else {
+            conn.commit().await.map_err(registry_db_error)?;
+            return Err(WyrdError::GithubNotConnected {
+                message: "this tenant has no GitHub installation associated".to_owned(),
+                details: serde_json::json!({}),
+            });
+        };
+        conn.commit().await.map_err(registry_db_error)?;
+        tracing::info!(revision = released.revision, "GitHub connection released");
+        Ok(Self::view(app, Some(&released)))
+    }
+
+    /// Fence the slot's work and release its association, optionally only
+    /// when it holds exactly `only`.
+    ///
+    /// The slot stays locked until the caller's transaction ends, so no
+    /// association, webhook change or token decision interleaves. Queued
+    /// verification is not bound to a GitHub repository, so the release is
+    /// the whole fence: once it commits, [`Self::installation_token`] refuses
+    /// every repository of the installation and new source IO stops.
+    ///
+    /// # Errors
+    /// Returns a registry error.
+    async fn fence_and_release(
+        conn: &mut TenantConn<'_>,
+        only: Option<(&str, i64)>,
+    ) -> Result<Option<GithubInstallationRow>, WyrdError> {
+        lock_github_installation(conn)
+            .await
+            .map_err(registry_db_error)?;
+        release_github_installation(conn, only)
+            .await
+            .map_err(registry_db_error)
+    }
+
+    /// GitHub's setup redirect reached the caller's signed-in browser: bind
+    /// the transaction to it, or begin one when the installation was begun on
+    /// GitHub, and return GitHub's OAuth authorization page.
+    ///
+    /// The installation id is only recorded as a hint.
+    ///
+    /// # Errors
+    /// Returns [`WyrdError::GithubNotConfigured`], the permission denial,
+    /// [`WyrdError::GithubConnectionRefused`] (`transaction_invalid`) for a
+    /// state this browser session cannot bind, or a registry error.
+    pub(crate) async fn setup(
+        &self,
+        caller: &Caller,
+        query: &GithubSetupQuery,
+    ) -> Result<SetupRedirect, WyrdError> {
+        let app = self.app()?;
+        self.authorize(caller, SETUP)?;
+        let hint = query
+            .installation_id
+            .map(|id| stored_id(id, "installation_id"))
+            .transpose()?;
+        let binding = SecretString::from(random_secret());
+        let binding_hash = Sha256Hex::digest(binding.expose_secret().as_bytes());
+        let mut conn = self.conn(caller.data_tenant_id).await?;
+        let (state, verifier) = if let Some(state) = &query.state {
+            let bound = bind_github_login_state(
+                &mut conn,
+                &Sha256Hex::digest(state.as_bytes()),
+                caller.principal.id,
+                &binding_hash,
+                hint,
+            )
+            .await
+            .map_err(registry_db_error)?;
+            let Some(bound) = bound else {
+                conn.commit().await.map_err(registry_db_error)?;
+                return Err(transaction_invalid());
+            };
+            (state.clone(), bound.code_verifier)
+        } else {
+            let state = random_secret();
+            let (_, verifier) = self
+                .begin(&mut conn, app, caller, &state, Some(binding_hash), hint)
+                .await?;
+            (state, verifier)
+        };
+        conn.commit().await.map_err(registry_db_error)?;
+        Ok(SetupRedirect {
+            authorize_url: app.authorize_url(&state, &code_challenge(verifier.expose_secret())),
+            binding,
+        })
+    }
+
+    /// GitHub's OAuth callback reached the caller's browser presenting
+    /// `binding`: consume the transaction, verify the authorization and the
+    /// installation, and associate it with the caller's tenant.
+    ///
+    /// The transaction is consumed and committed before any provider IO. The
+    /// installation is GitHub's hint when the transaction or query carries
+    /// one, which the authorizing user must be able to access, or else the
+    /// user's only accessible installation of this App. The selection is the
+    /// installation's repositories the user can access.
+    ///
+    /// # Errors
+    /// Returns [`WyrdError::GithubNotConfigured`], the permission denial,
+    /// [`WyrdError::GithubRequestInvalid`] without a code or state,
+    /// [`WyrdError::GithubConnectionRefused`] for a denied authorization, an
+    /// invalid transaction, or an installation the user cannot access, is
+    /// not this App's, is ambiguous or suspended,
+    /// [`WyrdError::GithubConnectionConflict`] when the slot changed since
+    /// the transaction began, the tenant holds another installation, or
+    /// another tenant holds this one, [`WyrdError::GithubUnavailable`], or a
+    /// registry error.
+    pub(crate) async fn callback(
+        &self,
+        caller: &Caller,
+        query: &GithubCallbackQuery,
+        binding: Option<&str>,
+    ) -> Result<GithubConnectionView, WyrdError> {
+        let app = self.app()?;
+        if query.error.is_some() {
+            return Err(refused(
+                "authorization_denied",
+                "the GitHub user did not authorize the App",
+            ));
+        }
+        let (Some(code), Some(state)) = (&query.code, &query.state) else {
+            return Err(WyrdError::GithubRequestInvalid {
+                message: "the callback requires code and state".to_owned(),
+                details: serde_json::json!({ "field": "code" }),
+            });
+        };
+        let binding = binding.ok_or_else(transaction_invalid)?;
+        self.authorize(caller, CALLBACK)?;
+        let mut conn = self.conn(caller.data_tenant_id).await?;
+        let consumed = consume_github_login_state(
+            &mut conn,
+            &Sha256Hex::digest(state.as_bytes()),
+            caller.principal.id,
+            &Sha256Hex::digest(binding.as_bytes()),
+        )
+        .await
+        .map_err(registry_db_error)?;
+        conn.commit().await.map_err(registry_db_error)?;
+        let transaction = consumed.ok_or_else(transaction_invalid)?;
+
+        let token = app.exchange_code(code, &transaction.code_verifier).await?;
+        let accessible = app.user_installations(&token).await?;
+        let hint = match transaction.installation_hint {
+            Some(hint) => u64::try_from(hint).ok(),
+            None => query.installation_id,
+        };
+        let installation_id = match hint {
+            Some(id) if accessible.contains(&id) => id,
+            Some(_) => {
+                return Err(refused(
+                    "installation_inaccessible",
+                    "the authorizing GitHub user cannot access this installation of the App",
+                ));
+            }
+            None => match accessible.as_slice() {
+                [only] => *only,
+                [] => {
+                    return Err(refused(
+                        "installation_inaccessible",
+                        "the authorizing GitHub user can access no installation of the App",
+                    ));
+                }
+                _ => {
+                    return Err(refused(
+                        "installation_ambiguous",
+                        "the authorizing GitHub user can access several installations; \
+                         install or configure the App from Wyrd to choose one",
+                    ));
+                }
+            },
+        };
+        let installation = app.installation(installation_id).await?.ok_or_else(|| {
+            refused(
+                "installation_inaccessible",
+                "this installation does not belong to the configured App",
+            )
+        })?;
+        if installation.suspended {
+            return Err(refused(
+                "installation_suspended",
+                "GitHub has suspended this installation",
+            ));
+        }
+        let repositories = app.user_repositories(&token, installation.id).await?;
+        drop(token);
+
+        let host = app.settings().host();
+        let mut conn = self.conn(caller.data_tenant_id).await?;
+        let outcome = associate_github_installation(
+            &mut conn,
+            transaction.slot,
+            GithubAssociation {
+                host: &host,
+                installation_id: stored_id(installation.id, "installation_id")?,
+                repositories: &repositories,
+            },
+        )
+        .await
+        .map_err(registry_db_error)?;
+        let row = match outcome {
+            GithubAssociationOutcome::Associated(row) => row,
+            GithubAssociationOutcome::Stale => {
+                return Err(conflict(
+                    "connection_changed",
+                    "the tenant's GitHub connection changed since this transaction began",
+                ));
+            }
+            GithubAssociationOutcome::TenantOccupied => {
+                return Err(conflict(
+                    "tenant_connected",
+                    "this tenant is associated with another installation; disconnect it first",
+                ));
+            }
+            GithubAssociationOutcome::InstallationClaimed => {
+                return Err(conflict(
+                    "installation_claimed",
+                    "this installation is associated with another tenant",
+                ));
+            }
+        };
+        conn.commit().await.map_err(registry_db_error)?;
+        tracing::info!(revision = row.revision, "GitHub connection associated");
+        Ok(Self::view(app, Some(&row)))
+    }
+
+    /// Apply one installation webhook whose `signature` the caller has not
+    /// yet checked.
+    ///
+    /// Deletion fences and releases the association, suspension and
+    /// unsuspension record GitHub's state, and repository removal drops
+    /// those repositories from the selection. Every other event changes
+    /// nothing. Routing to the owning tenant grants no permission.
+    ///
+    /// # Errors
+    /// Returns [`WyrdError::GithubNotConfigured`],
+    /// [`WyrdError::GithubWebhookRefused`] for a missing or wrong signature,
+    /// [`WyrdError::GithubRequestInvalid`] for a body that is not an event,
+    /// or a registry error.
+    pub(crate) async fn webhook(
+        &self,
+        event: Option<&str>,
+        signature: Option<&str>,
+        body: &[u8],
+    ) -> Result<(), WyrdError> {
+        let app = self.app()?;
+        if !app.verify_webhook(body, signature) {
+            return Err(WyrdError::GithubWebhookRefused {
+                message: "the webhook signature does not verify".to_owned(),
+                details: serde_json::json!({}),
+            });
+        }
+        let payload: WebhookBody =
+            serde_json::from_slice(body).map_err(|_| WyrdError::GithubRequestInvalid {
+                message: "the webhook body is not a GitHub event".to_owned(),
+                details: serde_json::json!({ "field": "body" }),
+            })?;
+        let (Some(event), Some(installation)) = (event, payload.installation) else {
+            return Ok(());
+        };
+        let host = app.settings().host();
+        let installation_id = stored_id(installation.id, "installation.id")?;
+        let Some(tenant) = self
+            .state
+            .postgres
+            .wyrd()
+            .github_installation_tenant(&host, installation_id)
+            .await
+            .map_err(registry_db_error)?
+        else {
+            return Ok(());
+        };
+        let mut conn = self.conn(tenant).await?;
+        let changed = match (event, payload.action.as_deref()) {
+            ("installation", Some("deleted")) => {
+                Self::fence_and_release(&mut conn, Some((&host, installation_id))).await?
+            }
+            ("installation", Some(action @ ("suspend" | "unsuspend"))) => {
+                set_github_installation_suspended(
+                    &mut conn,
+                    &host,
+                    installation_id,
+                    action == "suspend",
+                )
+                .await
+                .map_err(registry_db_error)?
+            }
+            ("installation_repositories", Some("removed")) => {
+                let removed: Vec<String> = payload
+                    .repositories_removed
+                    .iter()
+                    .map(|repository| repository.id.to_string())
+                    .collect();
+                remove_github_repositories(&mut conn, &host, installation_id, &removed)
+                    .await
+                    .map_err(registry_db_error)?
+            }
+            _ => None,
+        };
+        conn.commit().await.map_err(registry_db_error)?;
+        if let Some(row) = changed {
+            tracing::info!(
+                event,
+                revision = row.revision,
+                "GitHub installation synchronized"
+            );
+        }
+        Ok(())
+    }
+
+    /// A short-lived installation token for `tenant`'s repository
+    /// `repository_id`, narrowed to that repository and to Contents read,
+    /// Pull requests write and Checks write.
+    ///
+    /// Background work calls this instead of holding any user token. The
+    /// tenant must be associated with an unsuspended installation whose
+    /// selection includes the repository, and GitHub must still let the
+    /// installation reach it.
+    ///
+    /// # Errors
+    /// Returns [`WyrdError::GithubNotConfigured`],
+    /// [`WyrdError::GithubNotConnected`] when nothing is associated,
+    /// [`WyrdError::GithubRepositoryInaccessible`] when the installation is
+    /// suspended, the repository is not selected, or GitHub refuses it,
+    /// [`WyrdError::GithubUnavailable`], or a registry error.
+    pub async fn installation_token(
+        &self,
+        tenant: DataTenantId,
+        repository_id: u64,
+    ) -> Result<SecretString, WyrdError> {
+        let app = self.app()?;
+        let mut conn = self.conn(tenant).await?;
+        let slot = github_installation(&mut conn)
+            .await
+            .map_err(registry_db_error)?;
+        conn.commit().await.map_err(registry_db_error)?;
+        let Some(slot) = slot.filter(|row| row.installation_id.is_some()) else {
+            return Err(WyrdError::GithubNotConnected {
+                message: "this tenant has no GitHub installation associated".to_owned(),
+                details: serde_json::json!({}),
+            });
+        };
+        let repository = repository_id.to_string();
+        let selected = slot
+            .repositories
+            .0
+            .iter()
+            .any(|entry| entry.repository_id == repository);
+        let installation = slot
+            .installation_id
+            .and_then(|id| u64::try_from(id).ok())
+            .filter(|_| selected && slot.suspended_at.is_none());
+        let Some(installation) = installation else {
+            return Err(WyrdError::GithubRepositoryInaccessible {
+                message: "this repository is not selected for an active installation".to_owned(),
+                details: serde_json::json!({ "repository_id": repository }),
+            });
+        };
+        app.installation_token(installation, repository_id).await
+    }
+}

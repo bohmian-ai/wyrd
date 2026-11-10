@@ -2219,6 +2219,327 @@ impl OperatorKeysConfig {
     }
 }
 
+/// The deployment's GitHub App (`[github]`, `WYRD_GITHUB_*`).
+///
+/// Optional: when every field is unset the GitHub integration is unavailable
+/// and every other surface runs unchanged. Once any field is set the section
+/// must be complete and valid or startup fails. The App's private key,
+/// webhook secret and OAuth client secret come only from the environment or
+/// a mounted file (`WYRD_GITHUB_APP_PRIVATE_KEY_FILE` /
+/// `WYRD_GITHUB_APP_PRIVATE_KEY_PEM`, `WYRD_GITHUB_WEBHOOK_SECRET_FILE` /
+/// `WYRD_GITHUB_WEBHOOK_SECRET`, `WYRD_GITHUB_OAUTH_CLIENT_SECRET_FILE` /
+/// `WYRD_GITHUB_OAUTH_CLIENT_SECRET`), never TOML.
+#[derive(Clone, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct GithubConfig {
+    /// GitHub App id (`WYRD_GITHUB_APP_ID`).
+    #[serde(default)]
+    pub app_id: Option<u64>,
+    /// GitHub App slug (`WYRD_GITHUB_APP_SLUG`).
+    #[serde(default)]
+    pub slug: Option<String>,
+    /// GitHub web origin (`WYRD_GITHUB_WEB_ORIGIN`); `https://github.com`
+    /// when unset. A GitHub Enterprise Server deployment names its own.
+    #[serde(default)]
+    pub web_origin: Option<String>,
+    /// GitHub REST API origin (`WYRD_GITHUB_API_ORIGIN`);
+    /// `https://api.github.com` when unset. GitHub Enterprise Server serves
+    /// it at `<web origin>/api/v3`.
+    #[serde(default)]
+    pub api_origin: Option<String>,
+    /// This deployment's public base URL (`WYRD_GITHUB_PUBLIC_URL`). The App
+    /// is registered with `<public_url>/v1/integrations/github/setup`,
+    /// `/callback` and `/webhook`.
+    #[serde(default)]
+    pub public_url: Option<String>,
+    /// The App's OAuth client id (`WYRD_GITHUB_OAUTH_CLIENT_ID`).
+    #[serde(default)]
+    pub oauth_client_id: Option<String>,
+    /// App private key PEM; environment or file only.
+    #[serde(skip)]
+    pub private_key: Option<SecretString>,
+    /// Webhook secret; environment or file only.
+    #[serde(skip)]
+    pub webhook_secret: Option<SecretString>,
+    /// OAuth client secret; environment or file only.
+    #[serde(skip)]
+    pub oauth_client_secret: Option<SecretString>,
+}
+
+impl Debug for GithubConfig {
+    /// Redacting debug: prints the nonsecret identity and whether each secret
+    /// is present, never a secret.
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        f.debug_struct("GithubConfig")
+            .field("app_id", &self.app_id)
+            .field("slug", &self.slug)
+            .field("web_origin", &self.web_origin)
+            .field("api_origin", &self.api_origin)
+            .field("public_url", &self.public_url)
+            .field("oauth_client_id", &self.oauth_client_id)
+            .field("private_key", &self.private_key.is_some())
+            .field("webhook_secret", &self.webhook_secret.is_some())
+            .field("oauth_client_secret", &self.oauth_client_secret.is_some())
+            .finish()
+    }
+}
+
+/// A complete, validated GitHub App configuration.
+#[derive(Clone)]
+pub struct GithubAppSettings {
+    /// GitHub App id.
+    pub app_id: u64,
+    /// GitHub App slug.
+    pub slug: String,
+    /// GitHub web origin, without a trailing slash.
+    pub web_origin: Url,
+    /// GitHub REST API base, without a trailing slash.
+    pub api_origin: Url,
+    /// This deployment's public base URL, without a trailing slash.
+    pub public_url: Url,
+    /// OAuth client id.
+    pub oauth_client_id: String,
+    /// OAuth client secret.
+    pub oauth_client_secret: SecretString,
+    /// RSA private key PEM the App JWT is signed with.
+    pub private_key: SecretString,
+    /// Webhook HMAC secret.
+    pub webhook_secret: SecretString,
+}
+
+impl Debug for GithubAppSettings {
+    /// Redacting debug: prints the App identity and origins, never a secret.
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        f.debug_struct("GithubAppSettings")
+            .field("app_id", &self.app_id)
+            .field("slug", &self.slug)
+            .field("web_origin", &self.web_origin.as_str())
+            .field("api_origin", &self.api_origin.as_str())
+            .field("public_url", &self.public_url.as_str())
+            .finish_non_exhaustive()
+    }
+}
+
+impl GithubAppSettings {
+    /// The configured GitHub host: the web origin's host, with its port when
+    /// not the scheme default. Installation association is scoped to it.
+    #[must_use]
+    pub fn host(&self) -> String {
+        let host = self.web_origin.host_str().unwrap_or_default();
+        match self.web_origin.port() {
+            Some(port) => format!("{host}:{port}"),
+            None => host.to_owned(),
+        }
+    }
+}
+
+impl GithubConfig {
+    /// Whether any field is set, which makes the section required to be
+    /// complete.
+    fn is_present(&self) -> bool {
+        self.app_id.is_some()
+            || self.slug.is_some()
+            || self.web_origin.is_some()
+            || self.api_origin.is_some()
+            || self.public_url.is_some()
+            || self.oauth_client_id.is_some()
+            || self.private_key.is_some()
+            || self.webhook_secret.is_some()
+            || self.oauth_client_secret.is_some()
+    }
+
+    /// Validate the section into the App it configures; `None` when the
+    /// section is entirely unset.
+    ///
+    /// # Errors
+    /// Returns [`ConfigError::Invalid`] naming the first missing or invalid
+    /// field: a zero App id, a slug that is not lowercase letters, digits and
+    /// hyphens, an origin that is not a bare `http(s)` origin (`https` only
+    /// in production), a public URL with a query or fragment, an empty
+    /// client id or secret, or a private key that is not an RSA PEM.
+    pub fn resolve(&self, production: bool) -> Result<Option<GithubAppSettings>, ConfigError> {
+        if !self.is_present() {
+            return Ok(None);
+        }
+        let invalid = |message: &str| ConfigError::Invalid {
+            message: format!("github: {message}"),
+        };
+        let required = |name: &str| invalid(&format!("{name} is required once [github] is set"));
+        let url = |name: &str, value: &str, bare: bool| {
+            let parsed = Url::parse(value).map_err(|_| invalid(&format!("{name} is not a URL")))?;
+            let scheme_ok =
+                parsed.scheme() == "https" || (!production && parsed.scheme() == "http");
+            if !scheme_ok || parsed.host_str().is_none() {
+                return Err(invalid(&format!(
+                    "{name} must be an https URL (http only outside production)"
+                )));
+            }
+            if parsed.query().is_some()
+                || parsed.fragment().is_some()
+                || !parsed.username().is_empty()
+                || parsed.password().is_some()
+                || (bare && parsed.path() != "/")
+            {
+                return Err(invalid(&format!(
+                    "{name} must not carry credentials, a query or a fragment{}",
+                    if bare { ", or a path" } else { "" }
+                )));
+            }
+            let trimmed = parsed.as_str().trim_end_matches('/').to_owned();
+            Url::parse(&trimmed).map_err(|_| invalid(&format!("{name} is not a URL")))
+        };
+        let app_id = self
+            .app_id
+            .filter(|id| *id > 0)
+            .ok_or_else(|| required("app_id (WYRD_GITHUB_APP_ID, positive)"))?;
+        let slug = self
+            .slug
+            .clone()
+            .ok_or_else(|| required("slug (WYRD_GITHUB_APP_SLUG)"))?;
+        if slug.is_empty()
+            || !slug
+                .bytes()
+                .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
+        {
+            return Err(invalid(
+                "slug must be lowercase letters, digits and hyphens",
+            ));
+        }
+        let web_origin = url(
+            "web_origin",
+            self.web_origin.as_deref().unwrap_or("https://github.com"),
+            true,
+        )?;
+        let api_origin = url(
+            "api_origin",
+            self.api_origin
+                .as_deref()
+                .unwrap_or("https://api.github.com"),
+            false,
+        )?;
+        let public_url = url(
+            "public_url",
+            self.public_url
+                .as_deref()
+                .ok_or_else(|| required("public_url (WYRD_GITHUB_PUBLIC_URL)"))?,
+            false,
+        )?;
+        let oauth_client_id = self
+            .oauth_client_id
+            .clone()
+            .filter(|id| !id.trim().is_empty())
+            .ok_or_else(|| required("oauth_client_id (WYRD_GITHUB_OAUTH_CLIENT_ID)"))?;
+        let secret = |value: &Option<SecretString>, name: &str| {
+            value
+                .clone()
+                .filter(|secret| !secret.expose_secret().trim().is_empty())
+                .ok_or_else(|| required(name))
+        };
+        let oauth_client_secret = secret(
+            &self.oauth_client_secret,
+            "the OAuth client secret (WYRD_GITHUB_OAUTH_CLIENT_SECRET_FILE)",
+        )?;
+        let webhook_secret = secret(
+            &self.webhook_secret,
+            "the webhook secret (WYRD_GITHUB_WEBHOOK_SECRET_FILE)",
+        )?;
+        let private_key = secret(
+            &self.private_key,
+            "the App private key (WYRD_GITHUB_APP_PRIVATE_KEY_FILE)",
+        )?;
+        jsonwebtoken::EncodingKey::from_rsa_pem(private_key.expose_secret().as_bytes())
+            .map_err(|_| invalid("the App private key is not an RSA private key PEM"))?;
+        Ok(Some(GithubAppSettings {
+            app_id,
+            slug,
+            web_origin,
+            api_origin,
+            public_url,
+            oauth_client_id,
+            oauth_client_secret,
+            private_key,
+            webhook_secret,
+        }))
+    }
+
+    /// Apply `WYRD_GITHUB_*` environment overrides and secrets.
+    ///
+    /// # Errors
+    /// Returns [`ConfigError::BadEnvVar`] or [`ConfigError::EmptyEnvVar`] for
+    /// a malformed override, [`ConfigError::ConflictingEnvVars`] when a
+    /// secret is given both inline and as a file, and
+    /// [`ConfigError::Invalid`] when a secret file is refused.
+    fn apply_env(&mut self) -> Result<(), ConfigError> {
+        if let Some(val) = env_opt("WYRD_GITHUB_APP_ID")? {
+            self.app_id =
+                Some(
+                    val.parse()
+                        .map_err(|e: std::num::ParseIntError| ConfigError::BadEnvVar {
+                            key: "WYRD_GITHUB_APP_ID".to_owned(),
+                            message: e.to_string(),
+                        })?,
+                );
+        }
+        for (key, field) in [
+            ("WYRD_GITHUB_APP_SLUG", &mut self.slug),
+            ("WYRD_GITHUB_WEB_ORIGIN", &mut self.web_origin),
+            ("WYRD_GITHUB_API_ORIGIN", &mut self.api_origin),
+            ("WYRD_GITHUB_PUBLIC_URL", &mut self.public_url),
+            ("WYRD_GITHUB_OAUTH_CLIENT_ID", &mut self.oauth_client_id),
+        ] {
+            if let Some(val) = env_opt(key)? {
+                *field = Some(val);
+            }
+        }
+        for (file, inline, field) in [
+            (
+                "WYRD_GITHUB_APP_PRIVATE_KEY_FILE",
+                "WYRD_GITHUB_APP_PRIVATE_KEY_PEM",
+                &mut self.private_key,
+            ),
+            (
+                "WYRD_GITHUB_WEBHOOK_SECRET_FILE",
+                "WYRD_GITHUB_WEBHOOK_SECRET",
+                &mut self.webhook_secret,
+            ),
+            (
+                "WYRD_GITHUB_OAUTH_CLIENT_SECRET_FILE",
+                "WYRD_GITHUB_OAUTH_CLIENT_SECRET",
+                &mut self.oauth_client_secret,
+            ),
+        ] {
+            if let Some(secret) = load_env_secret(file, inline)? {
+                *field = Some(secret);
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Load one secret from the file named by `file_key` or, failing that, the
+/// inline `inline_key`; surrounding whitespace is trimmed.
+///
+/// # Errors
+/// Returns [`ConfigError::ConflictingEnvVars`] when both are set and
+/// [`ConfigError::Invalid`] naming the path, never its content, when
+/// [`read_secret_file`] refuses the file.
+fn load_env_secret(file_key: &str, inline_key: &str) -> Result<Option<SecretString>, ConfigError> {
+    match (env_opt(file_key)?, env_opt(inline_key)?) {
+        (Some(_), Some(_)) => Err(ConfigError::ConflictingEnvVars {
+            keys: vec![file_key.to_owned(), inline_key.to_owned()],
+        }),
+        (Some(path), None) => {
+            let text =
+                read_secret_file(Path::new(&path)).map_err(|reason| ConfigError::Invalid {
+                    message: format!("{file_key} file at {path} {reason}"),
+                })?;
+            Ok(Some(SecretString::from(text.trim().to_owned())))
+        }
+        (None, Some(inline)) => Ok(Some(SecretString::from(inline.trim().to_owned()))),
+        (None, None) => Ok(None),
+    }
+}
+
 impl MetricsConfig {
     /// Resolve the concrete metrics bind. When `bind` is unset, use
     /// **loopback** (`127.0.0.1`) on `http_bind`'s port + 1 — NOT `http_bind`'s
@@ -2309,6 +2630,9 @@ pub struct WyrdServerConfig {
     /// Operator-owned gateway credential sources.
     #[serde(default)]
     pub gateway: GatewayConfig,
+    /// The deployment's optional GitHub App.
+    #[serde(default)]
+    pub github: GithubConfig,
 }
 
 impl WyrdServerConfig {
@@ -3277,6 +3601,9 @@ impl WyrdServerConfig {
         self.verification.operator_keys.apply_env()?;
         self.verification.apply_limits_env()?;
 
+        // github (WYRD_GITHUB_*)
+        self.github.apply_env()?;
+
         // readiness.tick_ms
         if let Some(val) = env_opt("WYRD_READINESS_TICK_MS")? {
             self.readiness.tick_ms = val.parse::<u64>().map_err(|e| ConfigError::BadEnvVar {
@@ -3327,6 +3654,8 @@ impl WyrdServerConfig {
     fn validate(&self) -> Result<(), ConfigError> {
         self.gateway
             .validate(self.deployment_profile.is_production())?;
+        self.github
+            .resolve(self.deployment_profile.is_production())?;
         let serves_api = self.role.serves_api();
         if serves_api {
             self.verification.operator_keys.validate(

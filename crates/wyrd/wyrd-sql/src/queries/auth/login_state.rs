@@ -22,6 +22,8 @@
 
 use std::time::Duration;
 
+use chrono::{DateTime, Utc};
+
 use secrecy::{ExposeSecret, SecretString};
 use uuid::Uuid;
 use wyrd_spec::auth::{
@@ -275,6 +277,7 @@ const INSERT_GITHUB_LOGIN_STATE_SQL: &str = r"
     ) VALUES ($1, $2, 'github', $3, $4, $5, $6, $7, $8, $9, $10, $11, $12,
               statement_timestamp() + ($13 * interval '1 second'))
     ON CONFLICT DO NOTHING
+    RETURNING expires_at
 ";
 
 /// Every column a GitHub transaction read returns.
@@ -403,7 +406,8 @@ impl TryFrom<GithubLoginRow> for GithubLoginState {
 /// `PostgreSQL` derives from `ttl`.
 ///
 /// First purges this tenant's expired login rows, as [`insert_login_state`]
-/// does. Returns `false` without writing when the state hash is recorded.
+/// does. Returns the expiry `PostgreSQL` derived, or `None` without writing
+/// when the state hash is recorded.
 ///
 /// # Errors
 /// Returns a SQLx error when Postgres rejects the purge or the insert.
@@ -412,12 +416,12 @@ pub async fn insert_github_login_state(
     state_hash: &Sha256Hex,
     row: &GithubLoginState,
     ttl: Duration,
-) -> Result<bool, sqlx::Error> {
+) -> Result<Option<DateTime<Utc>>, sqlx::Error> {
     let tenant = conn.data_tenant_id().as_uuid();
     sqlx::query(PURGE_EXPIRED_LOGIN_STATE_SQL)
         .execute(&mut **conn.transaction())
         .await?;
-    let inserted = sqlx::query(INSERT_GITHUB_LOGIN_STATE_SQL)
+    sqlx::query_scalar(INSERT_GITHUB_LOGIN_STATE_SQL)
         .bind(state_hash.as_bytes().as_slice())
         .bind(tenant)
         .bind(row.slot.connection_id)
@@ -435,9 +439,8 @@ pub async fn insert_github_login_state(
         .bind(row.actor.principal_id.as_uuid())
         .bind(row.actor.principal_kind.as_str())
         .bind(ttl.as_secs_f64())
-        .execute(&mut **conn.transaction())
-        .await?;
-    Ok(inserted.rows_affected() == 1)
+        .fetch_optional(&mut **conn.transaction())
+        .await
 }
 
 /// Bind an unbound GitHub transaction begun by `actor` to `browser_binding`

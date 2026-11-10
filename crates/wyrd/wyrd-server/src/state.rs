@@ -2293,6 +2293,9 @@ pub struct AppStateInner {
     pub verification: Verification,
     /// The `/mcp` surface's in-flight work.
     pub mcp: Mcp,
+    /// The deployment's GitHub App; `None` when not configured, which makes
+    /// only the GitHub integration unavailable.
+    pub github: Option<Arc<crate::components::github::GithubApp>>,
     /// Readiness and peer-plane status.
     pub health: Health,
     /// Shared cancellation token for cooperative shutdown.

@@ -2047,9 +2047,12 @@ async fn repeat_stops_or_exhausts_without_overlapping() {
 }
 
 /// A takeover after a speculative decision is recorded honours it and
-/// never runs the extra review again. Each comparison decides late: an
-/// admitted extra review has finished, while a discarded or blocked one is
-/// still inside its second call when the decision cancels it. Every
+/// never runs the extra review again. Each comparison decides late, held
+/// at a [`HeldUpstream`] until the public surface shows the extra review's
+/// milestone: an admitted extra review is accepted as succeeded with no
+/// disposition recorded, while a discarded or blocked one has published
+/// and is inside its second call when the comparison is released and the
+/// decision cancels it. Every
 /// consolidator is stalled when its worker stops and the leases expire. The
 /// replica restores each recorded disposition: it calls neither the
 /// comparer nor the extra reviewer, mounts only admitted content into the
@@ -2063,7 +2066,14 @@ async fn repeat_stops_or_exhausts_without_overlapping() {
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "requires the repository-managed Postgres journey lifecycle"]
 async fn speculative_recovery_cannot_resurrect_content() {
-    let desk = Desk::start().await;
+    let upstream = upstream().await;
+    let held = HeldUpstream::start(&upstream)
+        .await
+        .expect("the held upstream binds");
+    let builder = builder(&upstream).with_gateway_provider_root_for_test(
+        held.uri().parse().expect("the held upstream's URL parses"),
+    );
+    let desk = Desk::start_with(upstream, builder).await;
     let cases = [
         (
             "SPEC-ADMIT-LATE-DECISION-RECOVER",
@@ -2104,7 +2114,47 @@ async fn speculative_recovery_cannot_resurrect_content() {
                 .mount(&desk.upstream)
                 .await;
         }
-        executions.push(desk.submit("speculative-review", json!(question)).await);
+        let compare = ["COMPARE:", question];
+        held.hold(&compare);
+        let execution = desk.submit("speculative-review", json!(question)).await;
+        if speculation == Speculation::Admitted {
+            let settled = reached(&desk, execution, "extra", |invocation| {
+                matches!(invocation.progress, InvocationProgress::Action { .. })
+            })
+            .await;
+            assert_eq!(
+                (settled.progress, settled.speculation),
+                (
+                    InvocationProgress::Action {
+                        status: StepStatus::Succeeded
+                    },
+                    Speculation::None
+                ),
+                "{question}: the extra review succeeds before the comparison decides"
+            );
+        } else {
+            let deadline = std::time::Instant::now() + Duration::from_secs(90);
+            while !desk
+                .asked("EXTRA:", question)
+                .await
+                .iter()
+                .any(|messages| turn(messages) == 1)
+            {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "{question}: the extra review never reached its second call"
+                );
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+            let running = reached(&desk, execution, "extra", |_| true).await;
+            assert_eq!(
+                (running.progress, running.speculation),
+                (InvocationProgress::Started, Speculation::None),
+                "{question}: the extra review has published and still runs"
+            );
+        }
+        held.release(&compare);
+        executions.push(execution);
     }
     let extra = TaskId::new("extra").expect("step");
     let mut before = Vec::new();

@@ -1,0 +1,14 @@
+# Takes only an execution slot: one assert over the input.
+apiVersion: wyrd/v1
+kind: Verifier
+metadata:
+  name: answer-check
+  version: 1.0.0
+spec:
+  description: The question is present.
+  inputs:
+    question: {type: json, schema: {type: string}}
+  requirements:
+    - id: answered
+      statement: The question is present
+      check: {kind: assert, path: inputs.question, operator: is_not_null}

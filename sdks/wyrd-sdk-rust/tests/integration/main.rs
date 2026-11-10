@@ -16,6 +16,8 @@ mod gateway_inference;
 mod gateway_jev;
 /// Agents write private scratch and publish it for the steps that read it.
 mod hosted_agent_tools;
+/// Direct verification keeps running while queued capacity is held.
+mod isolated_capacity;
 /// The admin-key local workflow, start to finish, without a publication flush.
 mod local_development;
 mod observe_a_run;

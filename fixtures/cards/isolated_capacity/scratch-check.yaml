@@ -1,0 +1,20 @@
+# Takes a workspace: an Agent that writes private scratch.
+apiVersion: wyrd/v1
+kind: Verifier
+metadata:
+  name: scratch-check
+  version: 1.0.0
+spec:
+  description: An Agent writes the answer to scratch.
+  inputs:
+    question: {type: json, schema: {type: string}}
+  steps:
+    - id: write
+      action:
+        kind: agent
+        agent: ./writer.yaml
+        inputs: {question: inputs.question}
+  requirements:
+    - id: written
+      statement: The writer finished
+      check: {kind: assert, path: steps.write.output.done, operator: equals, expected: true}

@@ -1,5 +1,5 @@
 import os
-from typing import Literal
+from typing import Any, Literal
 
 class WyrdTestServer:
     """Wyrd in-process test server context manager (testing feature only).
@@ -38,6 +38,9 @@ class WyrdTestServer:
 
     ``scribe_outbox_capacity`` replaces the Scribe outbox capacity in items,
     so a journey can fill verification staging with a few calls.
+
+    ``github`` configures the deployment's GitHub App against a
+    ``GithubAppMock``; without it the server has no GitHub App.
     """
 
     def __init__(
@@ -48,6 +51,7 @@ class WyrdTestServer:
         live_providers: bool = False,
         access_ttl_seconds: int | None = None,
         scribe_outbox_capacity: int | None = None,
+        github: GithubAppMock | None = None,
     ) -> None:
         """Create an unstarted server; entering the ``with`` block boots it.
 
@@ -72,6 +76,9 @@ class WyrdTestServer:
                 lifetime.
             scribe_outbox_capacity: the Scribe outbox capacity in items;
                 omitted keeps the production capacity.
+            github: the GitHub mock the deployment's GitHub App is configured
+                against, with this server's bound address as its public URL;
+                omitted configures no GitHub App.
 
         Raises:
             WyrdError: ``WYRD_TESTING_500_HARNESS_START`` when
@@ -148,6 +155,11 @@ class WyrdTestServer:
     @property
     def tenant_id(self) -> str:
         """Fixture tenant UUID string."""
+        ...
+
+    @property
+    def tenant_slug(self) -> str:
+        """Fixture tenant slug, the tenant a ``GithubBrowser`` signs in to."""
         ...
 
     def bootstrap_user(self, roles: list[str], name: str) -> str:
@@ -479,4 +491,128 @@ class UnmigratedDatabase:
         """
         ...
 
-__all__ = ["UnmigratedDatabase", "WyrdTestServer"]
+class GithubAppMock:
+    """A loopback GitHub serving the test App (testing feature only).
+
+    Pass it to ``WyrdTestServer(github=...)`` and script installations, users,
+    and the signed-in GitHub user before a browser completes a connection.
+    """
+
+    def __init__(self) -> None:
+        """Start the mock on a loopback port.
+
+        Raises:
+            WyrdError: The harness error when no port can be bound.
+        """
+        ...
+
+    @property
+    def host(self) -> str:
+        """The ``host:port`` Wyrd reports in its connection view."""
+        ...
+
+    def add_installation(self, id: int, repositories: list[tuple[int, str]]) -> None:
+        """Install the test App as ``id``, replacing any installation ``id``.
+
+        Args:
+            id: the installation id.
+            repositories: the selected repositories as ``(id, "owner/name")``.
+        """
+        ...
+
+    def add_user(self, login: str, installations: list[int]) -> None:
+        """Create GitHub user ``login``.
+
+        Args:
+            login: the user's login.
+            installations: the installation ids the user can access.
+        """
+        ...
+
+    def hide_repository(self, login: str, repository_id: int) -> None:
+        """Deny a user one repository.
+
+        Args:
+            login: the user's login.
+            repository_id: the repository the user cannot reach.
+        """
+        ...
+
+    def sign_in(self, login: str) -> None:
+        """Sign the browser in to GitHub.
+
+        Args:
+            login: the GitHub user every browser is signed in as.
+        """
+        ...
+
+    def install_target(self, id: int) -> None:
+        """Make the install page select one installation.
+
+        Args:
+            id: the installation id the install page selects.
+        """
+        ...
+
+    def secrets(self) -> list[str]:
+        """Every code and token the mock issued plus the App's secrets.
+
+        Returns:
+            Values none of which may appear in anything Wyrd returns.
+        """
+        ...
+
+    def deliver(self, server_base: str, event: str, payload: Any) -> int:
+        """Deliver one webhook signed with the configured secret.
+
+        Args:
+            server_base: the Wyrd server's base URL.
+            event: the ``X-GitHub-Event`` name.
+            payload: the JSON-compatible event body.
+
+        Returns:
+            The HTTP status Wyrd answered.
+
+        Raises:
+            WyrdError: The harness error when the request cannot be sent.
+        """
+        ...
+
+class GithubBrowser:
+    """A browser signed in to one Wyrd tenant (testing feature only).
+
+    Follows redirects across Wyrd and the ``GithubAppMock``, keeping Wyrd's
+    cookies, as a person completing a GitHub connection does.
+    """
+
+    @staticmethod
+    def sign_in(server_base: str, tenant: str, api_key: str) -> GithubBrowser:
+        """Sign a browser in through the production browser API-key sign-in.
+
+        Args:
+            server_base: the Wyrd server's base URL.
+            tenant: the tenant slug to sign in to.
+            api_key: the principal's API key.
+
+        Raises:
+            WyrdError: The harness error when sign-in refuses or cannot be sent.
+        """
+        ...
+
+    def open(self, url: str) -> tuple[int, Any, list[str]]:
+        """Navigate to ``url`` and follow redirects to a final answer.
+
+        Args:
+            url: the URL to open.
+
+        Returns:
+            The final status, the final body (parsed JSON, else text), and
+            every URL visited in order.
+
+        Raises:
+            WyrdError: The harness error when a hop cannot be sent or the
+                chain is longer than ten redirects.
+        """
+        ...
+
+__all__ = ["GithubAppMock", "GithubBrowser", "UnmigratedDatabase", "WyrdTestServer"]

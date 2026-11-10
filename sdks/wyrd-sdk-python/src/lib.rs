@@ -13,6 +13,8 @@ mod client;
 #[cfg(feature = "python")]
 mod gateway_admin;
 #[cfg(feature = "python")]
+mod github;
+#[cfg(feature = "python")]
 mod observe;
 #[cfg(feature = "python")]
 mod operators;
@@ -129,6 +131,11 @@ fn _wyrd(py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     operators::register(&operators)?;
     m.add_submodule(&operators)?;
     register_submodule(py, "wyrd._wyrd.operators", &operators)?;
+
+    let github = PyModule::new(py, "github")?;
+    github::register(&github)?;
+    m.add_submodule(&github)?;
+    register_submodule(py, "wyrd._wyrd.github", &github)?;
 
     let principals = PyModule::new(py, "auth")?;
     principals::register(&principals)?;

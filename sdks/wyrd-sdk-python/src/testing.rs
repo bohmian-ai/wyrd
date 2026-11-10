@@ -20,12 +20,15 @@ use url::Url;
 use wyrd_runtime::Permission;
 use wyrd_spec::DataTenantId;
 use wyrd_spec::error::WyrdError;
+use wyrd_testing::github::{
+    GithubAppMock as NativeGithubAppMock, GithubBrowser as NativeGithubBrowser,
+};
 use wyrd_testing::human_login::HumanSso;
 use wyrd_testing::{
     Bootstrap, UnmigratedDatabase as EmptyDatabase, WyrdTestServer as TestServer,
     WyrdTestServerError,
 };
-use wyrd_utils::py::{WyrdPyError, WyrdPyResult};
+use wyrd_utils::py::{WyrdPyError, WyrdPyResult, json_to_pyobject, pyobject_to_json};
 
 /// Serializes every harness mutation of the `WYRD_*` endpoint variables.
 static ENV_MUTEX: OnceLock<Mutex<()>> = OnceLock::new();
@@ -117,6 +120,9 @@ pub struct WyrdTestServer {
     /// Scribe outbox capacity in items, so a journey can fill verification
     /// staging with a few calls; `None` keeps the production capacity.
     scribe_outbox_capacity: Option<usize>,
+    /// GitHub mock the deployment's GitHub App is configured against; `None`
+    /// configures no App.
+    github: Option<NativeGithubAppMock>,
     /// Bound HTTP base URL while entered.
     base_url: Option<String>,
     /// Bound gRPC endpoint while entered.
@@ -147,12 +153,13 @@ impl WyrdTestServer {
     /// live smoke lane asks for. `access_ttl_seconds` mints access tokens of that lifetime,
     /// verified with no clock-skew allowance, so a journey can outlive one.
     /// `scribe_outbox_capacity` replaces the Scribe outbox capacity.
+    /// `github` configures the deployment's GitHub App against that mock.
     ///
     /// # Errors
     /// Raises the harness error when `provider_base_url` is not an absolute
     /// URL, or when it is combined with `live_providers`.
     #[new]
-    #[pyo3(signature = (mutate_env = true, verification_runtime = false, provider_base_url = None, live_providers = false, access_ttl_seconds = None, scribe_outbox_capacity = None))]
+    #[pyo3(signature = (mutate_env = true, verification_runtime = false, provider_base_url = None, live_providers = false, access_ttl_seconds = None, scribe_outbox_capacity = None, github = None))]
     fn __new__(
         mutate_env: bool,
         verification_runtime: bool,
@@ -160,6 +167,7 @@ impl WyrdTestServer {
         live_providers: bool,
         access_ttl_seconds: Option<i64>,
         scribe_outbox_capacity: Option<usize>,
+        github: Option<PyRef<'_, GithubAppMock>>,
     ) -> WyrdPyResult<Self> {
         if live_providers && provider_base_url.is_some() {
             return Err(harness_error(
@@ -179,6 +187,7 @@ impl WyrdTestServer {
             live_providers,
             access_ttl_seconds,
             scribe_outbox_capacity,
+            github: github.map(|mock| mock.inner.clone()),
             base_url: None,
             grpc_url: None,
             api_key: None,
@@ -201,6 +210,7 @@ impl WyrdTestServer {
         let verification_runtime = slf.verification_runtime;
         let access_ttl_seconds = slf.access_ttl_seconds;
         let scribe_outbox_capacity = slf.scribe_outbox_capacity;
+        let github = slf.github.clone();
         let (server, api_key) = wyrd_runtime::runtime()
             .block_on(async {
                 let mut builder = TestServer::builder();
@@ -216,6 +226,9 @@ impl WyrdTestServer {
                         .with_auth_verify_settings(wyrd_auth_verify::WyrdAuthVerifySettings {
                             allowed_clock_skew: std::time::Duration::ZERO,
                         });
+                }
+                if let Some(mock) = &github {
+                    builder = builder.with_github_app_for_test(mock);
                 }
                 if let Some(root) = root {
                     builder = builder.with_gateway_provider_root_for_test(root);
@@ -320,6 +333,15 @@ impl WyrdTestServer {
     #[getter]
     fn tenant_id(&self) -> WyrdPyResult<String> {
         self.tenant_id.clone().ok_or_else(not_started)
+    }
+
+    /// Fixture tenant slug, the tenant a browser signs in to.
+    ///
+    /// # Errors
+    /// Raises the harness error outside the context manager.
+    #[getter]
+    fn tenant_slug(&self) -> WyrdPyResult<String> {
+        Ok(self.started()?.pg_fixture().tenant_slug().to_owned())
     }
 
     /// Exchanges the harness's retained API key for a bearer access token.
@@ -940,11 +962,148 @@ impl UnmigratedDatabase {
     }
 }
 
+/// A loopback GitHub serving the test App, scripted by a journey and passed
+/// to `WyrdTestServer(github=...)`.
+#[pyclass(module = "wyrd._wyrd.testing")]
+pub struct GithubAppMock {
+    /// The Rust-native mock; clones share its state.
+    inner: NativeGithubAppMock,
+}
+
+#[pymethods]
+impl GithubAppMock {
+    /// Start the mock on a loopback port.
+    ///
+    /// # Errors
+    /// Raises the harness error when no port can be bound.
+    #[new]
+    #[pyo3(signature = ())]
+    fn __new__() -> WyrdPyResult<Self> {
+        Ok(Self {
+            inner: NativeGithubAppMock::start().map_err(py_error)?,
+        })
+    }
+
+    /// The host Wyrd reports in its connection view.
+    #[getter]
+    fn host(&self) -> String {
+        self.inner.host()
+    }
+
+    /// Install the test App as `id` with `repositories` (id, `owner/name`).
+    fn add_installation(&self, id: u64, repositories: Vec<(u64, String)>) {
+        let repositories: Vec<(u64, &str)> = repositories
+            .iter()
+            .map(|(id, name)| (*id, name.as_str()))
+            .collect();
+        self.inner.add_installation(id, &repositories);
+    }
+
+    /// Create GitHub user `login` with access to `installations`.
+    fn add_user(&self, login: &str, installations: Vec<u64>) {
+        self.inner.add_user(login, &installations);
+    }
+
+    /// Deny user `login` repository `repository_id`.
+    fn hide_repository(&self, login: &str, repository_id: u64) {
+        self.inner.hide_repository(login, repository_id);
+    }
+
+    /// Sign the browser in to GitHub as `login`.
+    fn sign_in(&self, login: &str) {
+        self.inner.sign_in(login);
+    }
+
+    /// Make the install page select installation `id`.
+    fn install_target(&self, id: u64) {
+        self.inner.install_target(id);
+    }
+
+    /// Every code and token the mock issued plus the App's secrets.
+    fn secrets(&self) -> Vec<String> {
+        self.inner.secrets()
+    }
+
+    /// Deliver webhook `event` with `payload` to `server_base`, signed with
+    /// the configured secret, and return the HTTP status.
+    ///
+    /// # Errors
+    /// Raises the harness error when `payload` is not JSON or the request
+    /// cannot be sent.
+    fn deliver(
+        &self,
+        py: Python<'_>,
+        server_base: &str,
+        event: &str,
+        payload: &Bound<'_, PyAny>,
+    ) -> WyrdPyResult<u16> {
+        let payload = pyobject_to_json(payload)?;
+        let status = py
+            .detach(|| {
+                wyrd_runtime::runtime().block_on(self.inner.deliver(server_base, event, &payload))
+            })
+            .map_err(py_error)?;
+        Ok(status.as_u16())
+    }
+}
+
+/// A browser signed in to one Wyrd tenant that follows redirects across Wyrd
+/// and the GitHub mock, keeping Wyrd's cookies.
+#[pyclass(module = "wyrd._wyrd.testing")]
+pub struct GithubBrowser {
+    /// The Rust-native browser.
+    inner: NativeGithubBrowser,
+}
+
+#[pymethods]
+impl GithubBrowser {
+    /// Sign a browser in at `server_base` to tenant `tenant` with `api_key`
+    /// through the production browser API-key sign-in.
+    ///
+    /// # Errors
+    /// Raises the harness error when sign-in refuses or cannot be sent.
+    #[staticmethod]
+    fn sign_in(
+        py: Python<'_>,
+        server_base: &str,
+        tenant: &str,
+        api_key: &str,
+    ) -> WyrdPyResult<Self> {
+        let inner = py
+            .detach(|| {
+                wyrd_runtime::runtime().block_on(NativeGithubBrowser::sign_in(
+                    server_base,
+                    tenant,
+                    api_key,
+                ))
+            })
+            .map_err(py_error)?;
+        Ok(Self { inner })
+    }
+
+    /// Navigate to `url`, follow redirects, and return the final status, the
+    /// final body (parsed JSON, else text), and every URL visited.
+    ///
+    /// # Errors
+    /// Raises the harness error when a hop cannot be sent or the chain is
+    /// longer than ten redirects.
+    fn open(&mut self, py: Python<'_>, url: &str) -> WyrdPyResult<(u16, Py<PyAny>, Vec<String>)> {
+        let inner = &mut self.inner;
+        let answer = py
+            .detach(|| wyrd_runtime::runtime().block_on(inner.open(url)))
+            .map_err(py_error)?;
+        let visited = answer.visited.iter().map(ToString::to_string).collect();
+        Ok((answer.status, json_to_pyobject(py, &answer.body)?, visited))
+    }
+}
+
 /// Registers the testing classes on the `wyrd._wyrd.testing` submodule.
 ///
 /// # Errors
 /// Returns a Python error when a class cannot be added.
 pub fn register(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_class::<WyrdTestServer>()?;
+    module.add_class::<GithubAppMock>()?;
+    module.add_class::<GithubBrowser>()?;
     module.add_class::<UnmigratedDatabase>()
 }

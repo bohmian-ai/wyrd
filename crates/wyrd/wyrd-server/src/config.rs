@@ -6808,7 +6808,9 @@ provider = "anthropic"
         let key_file = github_key_file(dir.path());
         temp_env::with_vars(github_env(&key_file), || {
             let mut config = WyrdServerConfig::default();
-            config.apply_env_overrides().expect("the GitHub overrides apply");
+            config
+                .apply_env_overrides()
+                .expect("the GitHub overrides apply");
             let settings = config
                 .github
                 .resolve(true)

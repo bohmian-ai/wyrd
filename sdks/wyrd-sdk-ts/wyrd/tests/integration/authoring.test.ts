@@ -33,8 +33,29 @@ import type { ReceivedRequest, Reply } from "../support/http-receiver.js";
 import { configureGateway } from "../support/local-development.js";
 import { fixture, serverTest } from "../support/server.js";
 
-const { Action, Agent, Artifact, CardRef, Check, CodeSource, Component, Prompt, Requirement, Service, Step, Verifier } =
-  verify;
+const {
+  Action,
+  Agent,
+  Artifact,
+  Audit,
+  Binding,
+  CardRef,
+  Check,
+  CodeSource,
+  Component,
+  Data,
+  Experiment,
+  InputSlot,
+  Mcp,
+  Model,
+  Operator,
+  Prompt,
+  Requirement,
+  Service,
+  Step,
+  Trigger,
+  Verifier,
+} = verify;
 type Agent = verify.Agent;
 type Artifact = verify.Artifact;
 type ArtifactFile = verify.ArtifactFile;
@@ -151,13 +172,20 @@ function policyJudge(name: string, version: string): Agent {
     execution_route: { kind: "wyrd_gateway", deployment: "openai" },
     tool_names: ["fs.read"],
     run_config: { max_iterations: 3 },
-    prompt: Prompt.openaiChat("gpt-4o", {
-      messages:
-        "POLICY JUDGE: read /inputs/policy.json with fs.read. Determine whether the proposed release" +
-        " satisfies the company policy. Cite original request and policy evidence. Report: {{report}}" +
-        " Recipient: {{recipient}} Purpose: {{purpose}} Destination: {{destination}}",
-      responseFormat: { type: "verdict" },
-    }),
+    prompt: {
+      provider: "openai",
+      model: "gpt-4o",
+      messages: [
+        {
+          role: "user",
+          content:
+            "POLICY JUDGE: read /inputs/policy.json with fs.read. Determine whether the proposed release" +
+            " satisfies the company policy. Cite original request and policy evidence. Report: {{report}}" +
+            " Recipient: {{recipient}} Purpose: {{purpose}} Destination: {{destination}}",
+        },
+      ],
+      response_format: "verdict",
+    },
   });
 }
 
@@ -661,4 +689,204 @@ test("local_artifacts_and_declaration_parity", async ({ cards, server }) => {
   } finally {
     await directoryState.shutdown();
   }
+});
+
+/** The story's file at `omitted/<relative>`, a graph that names no version. */
+function omitted(relative: string): string {
+  return fixture(`cards/card_authoring/omitted/${relative}`);
+}
+
+/** `draft-judge` at `version`, as `omitted/draft-judge.yaml` declares it when `asks` is the file's request. */
+function draftJudge(version: string | undefined, asks: string): Agent {
+  return new Agent("draft-judge", {
+    version,
+    execution_route: { kind: "wyrd_gateway", deployment: "openai" },
+    prompt: {
+      provider: "openai",
+      model: "gpt-4o",
+      messages: [{ role: "user", content: asks }],
+      response_format: "verdict",
+    },
+  });
+}
+
+/** `draft-writer` at `version` asking `asks`, as `omitted/draft-writer.yaml` declares it with the file's request. */
+function draftWriter(version: string | undefined, asks: string): Agent {
+  return new Agent("draft-writer", {
+    version,
+    execution_route: { kind: "wyrd_gateway", deployment: "openai" },
+    prompt: { provider: "openai", model: "gpt-4o", messages: [{ role: "user", content: asks }] },
+  });
+}
+
+/** `drafting`, without a version, as `omitted/drafting.yaml` declares it, with `judge` judging the writer's draft. */
+function drafting(judge: Agent): Service {
+  const checks = new Verifier("draft-checks", {
+    inputs: { draft: { type: "object", required: ["text"], properties: { text: { type: "string" } } } },
+    requirements: [
+      new Requirement("has-text", "The draft has text.", Check.assert("inputs.draft.text", "is_non_empty", null)),
+      new Requirement("judged", "A judge accepts the draft.", Check.agent(judge).inputs({ draft: "inputs.draft" })),
+    ],
+  });
+  return new Service("drafting", { service_type: "api" }).addComponent(
+    new Component("writer", draftWriter(undefined, "Draft release notes for {{change}}.")).verifiedBy([checks]),
+  );
+}
+
+/** The registered reference `receipt` resolved for `name`. */
+function declared(receipt: DeclarationReceipt, name: string): DeclarationReceipt["root"] {
+  const outcome = receipt.outcomes.find((each) => each.card_ref.name === name);
+  if (outcome === undefined) {
+    throw new Error(`${name} is not declared: ${JSON.stringify(receipt)}`);
+  }
+  return outcome.card_ref;
+}
+
+/** A persisted spec, read as JSON. */
+type Spec = { readonly [key: string]: Spec } & { readonly [index: number]: Spec };
+
+/** The persisted spec of the Card `receipt` resolved for `name`. */
+async function persisted(cards: Cards, receipt: DeclarationReceipt, name: string): Promise<Spec> {
+  return (await cards.get(declared(receipt, name))).spec as unknown as Spec;
+}
+
+/** Assert every link of the `drafting` graph `receipt` declared is the full registered reference of its target. */
+async function assertBound(cards: Cards, receipt: DeclarationReceipt): Promise<void> {
+  for (const name of ["drafting", "draft-writer", "draft-checks", "draft-judge"]) {
+    const reference = declared(receipt, name);
+    expect(typeof reference.version === "string" && typeof reference.uid === "string", name).toBe(true);
+  }
+  const component = (await persisted(cards, receipt, "drafting")).components[0];
+  expect(component?.ref).toEqual(declared(receipt, "draft-writer"));
+  expect(component?.verified_by[0]?.verifier).toEqual(declared(receipt, "draft-checks"));
+  const checks = await persisted(cards, receipt, "draft-checks");
+  expect(checks.requirements[1]?.check.agent).toEqual(declared(receipt, "draft-judge"));
+}
+
+test("omitted_versions_resolve_in_composed_definitions", async ({ cards }) => {
+  const files = await cards.declare(omitted("drafting.yaml"));
+  await assertBound(cards, files);
+
+  const authored = drafting(draftJudge(undefined, "Judge the draft {{draft}}."));
+  expect(resolved(await cards.declare(authored)), "same identities and content").toEqual(resolved(files));
+  expect(resolved(await cards.declare(authored)), "unchanged replay reuses them").toEqual(resolved(files));
+
+  const changed = await cards.declare(drafting(draftJudge("2.0.0", "Judge the draft {{draft}} strictly.")));
+  await assertBound(cards, changed);
+  expect(declared(changed, "draft-judge").version).toBe("2.0.0");
+  expect(declared(changed, "draft-writer")).toEqual(declared(files, "draft-writer"));
+  for (const parent of ["draft-checks", "drafting"]) {
+    expect(declared(changed, parent).version, `the new judge reference gives ${parent} a new version`).not.toBe(
+      declared(files, parent).version,
+    );
+  }
+
+  const pair = (second: string | undefined): Service =>
+    new Service("draft-pair")
+      .addComponent(new Component("first", draftWriter("3.0.0", "First {{change}}.")))
+      .addComponent(new Component("second", draftWriter(second, "Second {{change}}.")));
+  const service = await persisted(cards, await cards.declare(pair("4.0.0")), "draft-pair");
+  expect([service.components[0]?.ref.version, service.components[1]?.ref.version]).toEqual(["3.0.0", "4.0.0"]);
+  const ambiguous = await cards.declare(pair(undefined)).then(
+    () => undefined,
+    (error: unknown) => error,
+  );
+  expect(ambiguous).toBeInstanceOf(WyrdError);
+  expect((ambiguous as WyrdError).code).toBe("WYRD_LOADER_400_INVALID_ENVELOPE");
+  expect((ambiguous as WyrdError).details).toMatchObject({
+    diagnostics: [{ code: "WYRD_REGISTRY_422_UNRESOLVED_DEPENDENCY" }],
+  });
+});
+
+test("definitions_register_all_kinds", async ({ cards }) => {
+  const model = await cards.declare(
+    new Model("authored-model", {
+      interface: {
+        kind: "Custom",
+        meta: { framework_version: "0.1.0", loader_module: "assistant", loader_class: "LatencyModel", extra: {} },
+      },
+      task_type: "Other",
+      signature: {
+        inputs: [{ name: "latency", dtype: "float64" }],
+        outputs: [{ name: "score", dtype: "float64" }],
+      },
+    }),
+  );
+  const kinds = new Set(declaredKinds(model));
+  const definitions = [
+    new Data("authored-data", {
+      interface: { kind: "Parquet", meta: { compression: "Snappy" } },
+      schema: { columns: [{ name: "latency", dtype: "float64" }] },
+      stats: {
+        row_count: 1,
+        col_count: 1,
+        byte_count: 1,
+        sha256: "c4f7700b380aff2662e88d034154d1890c33d3c12c8dda1a0ca9481f43bb9906",
+      },
+    }),
+    new Experiment("authored-experiment", { experiment_type: "ab" }).addTargetRef(
+      CardRef.model(model.root.name, model.root.version),
+    ),
+    new Mcp("authored-mcp", { server_name: "files", transport: "stdio" }),
+    new Audit("authored-audit", { description: "Quarterly review" }),
+    new Artifact("authored-artifact", { artifact_kind: "document", content_type: "application/pdf" }),
+  ];
+  for (const definition of definitions) {
+    for (const kind of declaredKinds(await cards.declare(definition))) {
+      kinds.add(kind);
+    }
+  }
+
+  const checks = new Verifier("authored-checks").addInput("latency", InputSlot.samples(["latency"])).addRequirement(
+    new Requirement(
+      "within-budget",
+      "Mean latency stays at or below 100 ms.",
+      Check.drift("inputs.latency", {
+        method: "Custom",
+        signal: { kind: "Metric", name: "latency" },
+        condition: { kind: "Statistical" },
+        profile: { kind: "Custom", metric_name: "latency", baseline_value: 0.0, alert_threshold: 100.0 },
+      }),
+    ),
+  );
+  const binding = new Binding(checks)
+    .runsOn(new Trigger("authored-trigger", { kind: "schedule", cron: "0 0 * * *" }))
+    .addOnFailure(
+      new Operator("authored-operator", {
+        action: { kind: "http", method: "post", url: "https://hooks.example.com/release" },
+      }),
+    );
+  const writer = new Agent("authored-agent", {
+    prompt: Prompt.openaiChat("gpt-4o", { messages: ["Draft release notes for {{change}}."] }),
+    execution_route: { kind: "wyrd_gateway", deployment: "openai" },
+  });
+  const receipt = await cards.declare(
+    new Service("authored-service", { service_type: "api" }).addComponent(
+      new Component("writer", writer).verifiedBy([binding]),
+    ),
+  );
+  for (const kind of declaredKinds(receipt)) {
+    kinds.add(kind);
+  }
+  const prompt = receipt.outcomes.find((each) => each.card_ref.kind === "Prompt");
+  expect(prompt, "the inline Prompt registers as a Prompt Card").toBeDefined();
+  expect((await persisted(cards, receipt, "authored-agent")).prompt, "the Agent references its Prompt exactly").toEqual(
+    prompt?.card_ref,
+  );
+  expect([...kinds].sort(), "every Card kind registers").toEqual(
+    [
+      "Data",
+      "Model",
+      "Artifact",
+      "Experiment",
+      "Prompt",
+      "Agent",
+      "Mcp",
+      "Service",
+      "Audit",
+      "Verifier",
+      "Trigger",
+      "Operator",
+    ].sort(),
+  );
 });

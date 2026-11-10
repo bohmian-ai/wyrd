@@ -1252,16 +1252,17 @@ fn tight_files() -> HostedLimits {
     }
 }
 
-/// A Verifier extracting media slots `a` and optional `b`, accepting
-/// `formats` up to `max_bytes`, whose one requirement holds when `a`
-/// extracts in two separate steps.
+/// A Verifier with media slots `a` and `b`, each accepting `formats` up to
+/// `max_bytes`, whose one requirement holds when `a` extracts in two
+/// separate steps; evidence omitted for `b` stays missing, and nothing reads
+/// it.
 ///
 /// # Panics
 /// Panics when the static spec is invalid.
 fn two_extracts(formats: &[&str], max_bytes: Option<u64>) -> Arc<VerifierSpec> {
-    let slot = |required: bool| json!({ "type": "media", "formats": formats, "max_bytes": max_bytes, "required": required });
+    let slot = json!({ "type": "media", "formats": formats, "max_bytes": max_bytes });
     let spec: VerifierSpec = serde_json::from_value(json!({
-        "inputs": { "a": slot(true), "b": slot(false) },
+        "inputs": { "a": slot.clone(), "b": slot },
         "steps": [
             { "id": "first", "action": { "kind": "extract", "from": "inputs.a" } },
             { "id": "again", "action": { "kind": "extract", "from": "inputs.a" } }

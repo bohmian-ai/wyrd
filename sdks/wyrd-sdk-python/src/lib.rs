@@ -5,6 +5,9 @@
 //! owner crate's Python boundary.
 
 #[cfg(feature = "python")]
+/// `wyrd.authoring`: the Python projection of in-memory Card authoring.
+mod authoring;
+#[cfg(feature = "python")]
 mod bifrost;
 #[cfg(feature = "python")]
 mod cli;
@@ -93,6 +96,11 @@ fn _wyrd(py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     skald_prompt::register_prompt(&prompt)?;
     m.add_submodule(&prompt)?;
     register_submodule(py, "wyrd._wyrd.prompt", &prompt)?;
+
+    let authoring = PyModule::new(py, "authoring")?;
+    authoring::register(&authoring)?;
+    m.add_submodule(&authoring)?;
+    register_submodule(py, "wyrd._wyrd.authoring", &authoring)?;
 
     let cli = PyModule::new(py, "cli")?;
     cli::register(&cli)?;

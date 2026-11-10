@@ -2,6 +2,7 @@ from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
 
+from ..authoring import AnyCard
 from ..bifrost import TableConfig
 from ..cards import AgentCard, CardKind, CardRef, DataLoadArgs, ModelLoadArgs
 from ..client import WyrdClient
@@ -137,7 +138,7 @@ class WyrdState:
 
     @staticmethod
     def declare(
-        path: str | Path,
+        path: str | Path | AnyCard,
         client: WyrdClient | None = None,
         *,
         bundle_dir: str | Path | None = None,
@@ -146,10 +147,12 @@ class WyrdState:
         | None = None,
         trusted_artifact_hashes: Mapping[str, str] | None = None,
     ) -> WyrdState:
-        """Declare a Card file and return its eagerly hydrated state.
+        """Declare a Card file or an authored Card graph and return its eagerly hydrated state.
 
-        The file and the files its ``./path`` references name are declared
-        under the registry's usual version rules, so an unchanged rerun
+        The file and the files its ``./path`` references name, or the
+        authored Card and everything it references, are declared as
+        ``Cards.declare`` declares them, under the registry's usual version
+        rules, so an unchanged rerun
         declares nothing new. The declared graph is pulled, validated, and
         hydrated as ``from_path`` hydrates a bundle. Every call runs as one
         client. Without ``bundle_dir`` the graph is held in memory and no
@@ -157,7 +160,8 @@ class WyrdState:
         ``bundle_dir``.
 
         Args:
-            path: The root Service Card file.
+            path: The root Service: its Card file, or an authored Card from
+                ``wyrd.authoring``, copied as it is now.
             client: the ``WyrdClient`` every call runs as. Omitted, the
                 ambient client resolves once.
             bundle_dir: A directory to publish the complete bundle to. It

@@ -35,7 +35,7 @@ Step and requirement `id`s share one namespace.
 
 ## Input slots
 
-A caller fills a slot by name; steps and checks read it as `inputs.<slot>`. `json`, `media`, and `trace` slots also take `required`, default `true`.
+A caller fills a slot by name; steps and checks read it as `inputs.<slot>`. A slot the caller omits is missing evidence, never `null`: every check that needs it, including an `is_null` assertion or a step `when` that reads it, is `inconclusive`, while checks that do not need it still run. Slots have no `required` field. To accept `null`, supply it and let the slot's `schema` admit it.
 
 | `type` | Extra fields | Accepts |
 | --- | --- | --- |
@@ -44,7 +44,7 @@ A caller fills a slot by name; steps and checks read it as `inputs.<slot>`. `jso
 | `trace` | none | The run's trace spans |
 | `samples` | `features` (required) | Feature values over a window, for drift checks |
 
-A group Verifier slot is a source string instead of an object: `verifiers.<name>.inputs.<slot>` or `verifiers.<name>.requirements.<rid>.outcome`. It holds one value per source execution, in order. `samples` and source slots are always required.
+A group Verifier slot is a source string instead of an object: `verifiers.<name>.inputs.<slot>` or `verifiers.<name>.requirements.<rid>.outcome`. It holds one value per source execution, in order.
 
 Media formats: `png`, `jpeg`, `gif`, `webp`, `pdf`, `text`, `markdown`, `csv`, `json`, `html`, `docx`, `xlsx`, `pptx`, `doc`, `xls`, `ppt`, `tar_gz`, `zip`.
 

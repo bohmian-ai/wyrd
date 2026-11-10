@@ -32,10 +32,13 @@ SUPPORTED_KINDS = [
     "Data",
     "Model",
     "Artifact",
+    "Experiment",
     "Prompt",
     "Agent",
-    "Verifier",
+    "Mcp",
     "Service",
+    "Audit",
+    "Verifier",
     "Trigger",
     "Operator",
 ]
@@ -83,6 +86,7 @@ WIRE_ROOTS = [
     "CreateOperatorConnectionRequest",
     "OperatorConnectionView",
     "UpdateOperatorConnectionRequest",
+    "ExecutionPlan",
     "VerificationExecutionState",
     "VerificationResult",
 ]

@@ -54,6 +54,12 @@ AGREES = (
 )
 """The judge's Verdict for ``answer-judged``: passed, citing the whole answer."""
 
+RELEASE_APPROVED = (
+    '{"outcome":"passed","reason":"an external audit may receive this report",'
+    '"citations":[{"slot":"report","locator":{"json_pointer":"/text"}}]}'
+)
+"""The finance release example judge's Verdict: every release follows the policy, citing the report."""
+
 FOLLOWS = (
     '{"outcome":"passed","reason":"within the policy",'
     '"citations":[{"slot":"answer","locator":{"json_pointer":"/text"}}]}'
@@ -238,6 +244,62 @@ def handbook_verdict(messages: list[dict]) -> str:
     return json.dumps({"outcome": "passed", "reason": reason, "citations": [citation]})
 
 
+READ_SHARING_POLICY = {
+    "role": "assistant",
+    "content": None,
+    "tool_calls": [
+        {
+            "id": "call-policy",
+            "type": "function",
+            "function": {"name": "fs_read", "arguments": '{"path":"/inputs/policy.json"}'},
+        }
+    ],
+}
+"""The sharing-policy judge's first turn: read its mounted policy as ``fs_read``."""
+
+
+def sharing_verdict(messages: list[dict]) -> str:
+    """The sharing-policy judge's Verdict once ``messages`` carry its ``fs.read`` result.
+
+    It is inconclusive for a release naming ``PROVIDER-UNCERTAIN``, fails one
+    naming ``BANK-ACCOUNT-DEMO-001``, and otherwise passes; a decided Verdict
+    cites the report text and the policy line permitting ``external-audit``.
+    It answers no Verdict when the read carries no such line.
+    """
+    release = json.dumps([each["content"] for each in messages if each.get("role") == "user"])
+    [read] = [each for each in messages if each.get("role") == "tool"]
+    try:
+        output = json.loads(read["content"])
+    except ValueError:
+        return "the policy did not read"
+    lines = [unit for unit in output.get("units", []) if "external-audit" in unit["text"]]
+    if not lines:
+        return "the policy did not read"
+    citations = [
+        {"slot": "report", "locator": {"json_pointer": "/text"}},
+        {"slot": output["sources"][0], "locator": lines[0]["locator"]},
+    ]
+    if "PROVIDER-UNCERTAIN" in release:
+        verdict = {
+            "outcome": "inconclusive",
+            "reason": "the policy does not settle this release",
+            "citations": [],
+        }
+    elif "BANK-ACCOUNT-DEMO-001" in release:
+        verdict = {
+            "outcome": "failed",
+            "reason": "the report names a bank account identifier",
+            "citations": citations,
+        }
+    else:
+        verdict = {
+            "outcome": "passed",
+            "reason": "an external audit may receive this report",
+            "citations": citations,
+        }
+    return json.dumps(verdict)
+
+
 def probe_turn(messages: list[dict]) -> dict:
     """The file probe's next turn: the next call of its prompt's script, else every result.
 
@@ -295,12 +357,23 @@ def completion(body: dict) -> tuple[int, dict]:
     correct its reply, cites a foreign pointer on ``JUDGE-FOREIGN-CITE``, and
     otherwise passes citing the answer text. The scored judge (its prompt carries
     ``SCORE:``) answers ``scored``. The handbook judge reads its mount and
-    answers ``handbook_verdict``; the file probe plays ``probe_turn``. Every
+    answers ``handbook_verdict``, and the sharing-policy judge (its prompt
+    carries ``POLICY JUDGE``) reads its mount and answers ``sharing_verdict``;
+    the finance release example's judge answers ``RELEASE_APPROVED``; the
+    file probe plays ``probe_turn``. Every
     other judge agrees.
     """
     text = json.dumps(body)
     returned = any(message.get("role") == "tool" for message in body.get("messages", []))
-    if "REFUND RULES" in text:
+    if "POLICY JUDGE" in text:
+        message = (
+            {"role": "assistant", "content": sharing_verdict(body["messages"])}
+            if returned
+            else READ_SHARING_POLICY
+        )
+    elif "follows the company sharing policy" in text:
+        message = {"role": "assistant", "content": RELEASE_APPROVED}
+    elif "REFUND RULES" in text:
         if "PROVIDER-DOWN" in text:
             return 500, {}
         message = (

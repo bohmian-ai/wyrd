@@ -714,9 +714,9 @@ fn run_verifier() -> wyrd_spec::card::verifier::VerifierSpec {
             "answer": { "type": "json" },
             "policy": { "type": "media", "formats": ["pdf"], "max_bytes": 64 },
             "deck": { "type": "media", "formats": ["pptx", "pdf"] },
-            "copy": { "type": "media", "formats": ["pdf"], "required": false },
-            "archive": { "type": "media", "formats": ["pdf"], "required": false },
-            "trace": { "type": "trace", "required": false },
+            "copy": { "type": "media", "formats": ["pdf"] },
+            "archive": { "type": "media", "formats": ["pdf"] },
+            "trace": { "type": "trace" },
         },
         "requirements": [{
             "id": "answered", "statement": "An answer is given",

@@ -1456,8 +1456,15 @@ spec:
 | `trace` | A trace ID resolved through tenant-scoped trace reads |
 | `samples` | Named `features` (or metric names) recorded for a scheduled window |
 
-Slots are `required` by default. A missing required slot is missing evidence,
-never a refusal: checks that need it are inconclusive.
+Every declared slot uses the same omission rule: missing evidence makes checks
+that need it inconclusive, never a passing absence assertion or an intentional
+skip. Omission alone is not a request refusal; independent checks may still run.
+Slot-level `required` is not accepted. JSON Schema's nested `required`, optional
+object fields and nullable values remain valid; supplied null must satisfy its
+schema and is distinct from evidence not supplied. An evaluated condition that
+needs missing evidence makes dependent checks inconclusive. Conditions over
+supplied evidence may still skip work; evaluation order and overall verdict
+aggregation are unchanged.
 
 | Action | Does |
 |---|---|
@@ -2314,6 +2321,66 @@ Two complementary mechanisms — `wyrd declare file.yaml` reads + declares in
 one move, and reference slots accept `Ref` or `InlineableRef<T>`. A path string is
 loader-only authoring syntax projected to a Ref/Sibling before send; inline
 is available only at `InlineableRef<T>` slots.
+
+### In-memory authoring
+
+`wyrd-client::authoring` (`wyrd_ai::authoring` in Rust; the Python and
+TypeScript SDKs project it) builds the same Cards in code, in the Card YAML's
+own vocabulary. Each named Card type takes `new(name, version)`; each
+sub-value (`Component`, `Binding`, `InputSlot`, `Step`, `Requirement`,
+`Action`, `Check`) takes the fields that identify it. Constructor arguments
+are fixed: no later method edits them, so a different name, version, alias,
+reference, id, action, check, or check operand means constructing another
+value. Every `Action` constructor returns an `Action` and every `Check`
+constructor, `each` and `agent` included, a `Check`. Every other method is
+named for the YAML field it edits and takes that field's YAML value, with an
+explicit distinction for incremental input operations: `Verifier.add_input`
+declares evidence, while `Action.bind_input` and `Check.bind_input` bind existing
+values to executable arguments (`addInput`/`bindInput` in TypeScript). Their
+canonical `inputs` maps and whole-map setters retain their names. Rust accepts
+bare JSON Schemas and Python accepts schema dictionaries or supported model
+classes without a mandatory JSON-slot wrapper. Explicit canonical slot forms
+and distinct non-JSON slot constructors remain available. Execution
+references stay strings such as `inputs.report.text`, operators stay strings
+or their parameterized objects, and nested objects stay canonical JSON. A
+setter consumes the value and replaces its whole field, together with
+everything that field referenced; an `add_*` method appends one entry in
+place. A Service binds each Component's own Verifiers through
+`Component::verified_by`; Model verification belongs on its Component.
+
+Construction and editing do no domain validation, file reads, or network IO,
+so incomplete values and forward references are allowed. An attempted
+duplicate add is kept, not dropped, and refused when validated. A Card value
+at a reference position contributes a sibling definition, captured by value;
+an exact `CardRef` stays an external reference; a local Artifact is always
+referenced externally by exact name and version and published first.
+`CodeSource::file` records a path that each snapshot reads.
+
+`validate()` and `CardDefinition::declaration` snapshot the graph, read its
+code files, and decode each Card through the loader's own envelope decoding
+(`wyrd_loader::parse_card_value`) and file-tree validation and ordering
+(`wyrd_loader::declaration_input_from_cards`). Invalid code and its YAML
+equivalent therefore refuse with the same `WYRD_LOADER_400_INVALID_ENVELOPE`
+diagnostics and field paths, labelled `Kind/name@version` in place of a file.
+Every call validates afresh; nothing caches a result. The declaration emits
+one submission per distinct identity; definitions are compared as decoded, so
+an omitted default and its explicit value are one submission, and two that
+decode differently, or a local Artifact and a Card of its identity without
+that source, refuse with `WYRD_SPEC_400_DUPLICATE_SUBMISSION`. A local
+Artifact's own references are captured and validated as any Card's. No local
+path reaches a submission.
+
+`Cards::declare` accepts a native `DeclarationInput`, a path, or an authored
+Card; `WyrdState::declare(_with)` accept a path or an authored Card and pull
+and hydrate the declared root. An authored Card is validated before anything
+is published, then each local Artifact is published as its own sole
+submission through `Cards::upload_artifact`, dependencies first, and the
+graph is submitted through the same declaration saga as every other input. A
+local Artifact declared as the root is its own publication, and its receipt
+is the declaration's. There is no
+rollback: a graph refused after publication, or a dropped future, leaves each
+published Artifact registered for reuse by reference. Code-authored and
+file-authored forms of one graph register identical content and identities.
 
 ### Pre-declaration matrix (Rule 14)
 

@@ -1,0 +1,17 @@
+# Reviews a proposed report release against the mounted company sharing policy.
+apiVersion: wyrd/v1
+kind: Agent
+metadata:
+  name: report-reviewer
+  version: 1.0.0
+spec:
+  execution_route: {kind: wyrd_gateway, deployment: openai}
+  tool_names: [fs.read]
+  run_config: {max_iterations: 3}
+  prompt:
+    provider: openai
+    model: gpt-4o
+    messages:
+      - role: user
+        content: "POLICY JUDGE: read /inputs/policy.json with fs.read. Determine whether the proposed release satisfies the company policy. Cite original request and policy evidence. Report: {{report}} Recipient: {{recipient}} Purpose: {{purpose}} Destination: {{destination}}"
+    response_format: verdict

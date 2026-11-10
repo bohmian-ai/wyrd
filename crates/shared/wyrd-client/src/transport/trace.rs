@@ -2,14 +2,14 @@
 //!
 //! [`HttpTransport`](super::HttpTransport) and the Bifrost gRPC transport send
 //! the caller's active trace context as `traceparent`/`tracestate` on every
-//! Wyrd request through [`headers`], so server work
+//! Wyrd request through `headers`, so server work
 //! done for the request — a gateway call, or an agent-check call a verification makes
-//! — joins the caller's trace. [`outbound`] picks that context: one a foreign
+//! — joins the caller's trace. `outbound` picks that context: one a foreign
 //! runtime handed over with [`with_caller_trace`] wins, because Python's and
 //! Node's OpenTelemetry contexts never become Rust's current `tracing` span;
 //! otherwise the current `tracing` span's OpenTelemetry context, when it is
 //! valid. Without either, no trace header is sent. A queued write records a
-//! `bifrost.enqueue` PRODUCER span through [`producer`], opened in the
+//! `bifrost.enqueue` PRODUCER span through `producer`, opened in the
 //! foreign runtime's own tracer when that runtime scoped one with
 //! [`with_producer_span`].
 
@@ -84,7 +84,7 @@ pub async fn with_benchmark_labels<F: Future>(
 /// Foreign-runtime SDKs pass a callback that opens and ends a
 /// `bifrost.enqueue` PRODUCER span for the named table in their own tracer,
 /// under their active span, and returns its context, or `None` when that
-/// runtime has no valid span. [`producer`] calls it on the calling thread, so
+/// runtime has no valid span. `producer` calls it on the calling thread, so
 /// the span lands in the caller's own trace exporter.
 pub fn with_producer_span<R>(
     open: impl Fn(&str) -> Option<TraceContext> + 'static,

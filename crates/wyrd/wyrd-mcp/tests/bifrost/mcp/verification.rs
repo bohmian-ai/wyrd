@@ -2778,7 +2778,8 @@ mod pg_tests {
     /// A trace written partly by the agent's own Service and partly by an
     /// untagged writer is judged whole by `verification.execute`. Direct
     /// execution over an absent trace answers at once with an inconclusive
-    /// requirement. `verification.enqueue` over an absent trace is
+    /// requirement, and so does one whose trace is omitted: omission never
+    /// establishes that a span did not occur. `verification.enqueue` over an absent trace is
     /// `retrying` with `evidence_unavailable`; once the spans land and the
     /// retry is due, the same execution completes and passes, with no
     /// second enqueue from the agent.
@@ -2859,6 +2860,25 @@ mod pg_tests {
         assert!(
             text(&absent, "/outcome/requirements/0/reason")?.contains("not yet landed"),
             "{absent}"
+        );
+
+        let omitted = structured(
+            agent_client
+                .call_tool(call(
+                    EXECUTE,
+                    serde_json::json!({
+                        "verifier_card_uid": verifier, "card_uid": fixture.service_uid, "inputs": {},
+                    }),
+                )?)
+                .await?,
+        )?;
+        assert_eq!(
+            text(&omitted, "/outcome/requirements/0/outcome")?,
+            "inconclusive"
+        );
+        assert!(
+            text(&omitted, "/outcome/requirements/0/reason")?.contains("`trace` was not supplied"),
+            "{omitted}"
         );
 
         let late = *uuid::Uuid::now_v7().as_bytes();

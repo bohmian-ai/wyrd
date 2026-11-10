@@ -1,6 +1,6 @@
 import { type ProxyTracerProvider, context, propagation, trace } from "@opentelemetry/api";
 import OpenAI from "openai";
-import { expect, vi } from "vitest";
+import { expect, it, vi } from "vitest";
 import { z } from "zod";
 
 import { Bifrost, Gateway, type SpanRecord, TableConfig, WyrdClient, type WyrdState } from "wyrd-ai";
@@ -38,6 +38,14 @@ function outline(timeline: readonly SpanRecord[]): string {
   return timeline.map((span) => `${span.scope.name} ${span.kind} ${span.name}`).join("\n");
 }
 
+/**
+ * A UTC `Z` timestamp with its fraction padded to nine digits, so instants
+ * that carry 0, 3, 6 or 9 fractional digits sort chronologically as strings.
+ */
+function instant(timestamp: string): string {
+  return timestamp.replace(/(?:\.(\d{1,9}))?Z$/, (_, fraction = "") => `.${fraction.padEnd(9, "0")}Z`);
+}
+
 /** Whether `names` holds every one of `steps` in order, gaps allowed. */
 function holdsInOrder(names: readonly string[], steps: readonly ((name: string) => boolean)[]): boolean {
   let at = 0;
@@ -49,6 +57,25 @@ function holdsInOrder(names: readonly string[], steps: readonly ((name: string) 
     return at <= names.length;
   });
 }
+
+it("timestamps compare at nanosecond precision", () => {
+  const recorded = ["2026-11-10T01:59:44.450Z", "2026-11-10T01:59:44.450085Z"];
+  expect([...recorded].sort()).not.toEqual(recorded);
+  expect(recorded.map(instant)).toEqual(recorded.map(instant).sort());
+  const ordered = [
+    "2026-11-10T01:59:44Z",
+    "2026-11-10T01:59:44.000000001Z",
+    "2026-11-10T01:59:44.000001Z",
+    "2026-11-10T01:59:44.000001001Z",
+    "2026-11-10T01:59:44.001Z",
+    "2026-11-10T01:59:44.450Z",
+    "2026-11-10T01:59:44.450085Z",
+    "2026-11-10T01:59:44.450085123Z",
+    "2026-11-10T01:59:45Z",
+  ].map(instant);
+  expect([...ordered].reverse().sort()).toEqual(ordered);
+  expect(instant("2026-11-10T01:59:44Z")).toBe("2026-11-10T01:59:44.000000000Z");
+});
 
 test("sdk requests carry the active trace", async ({ server, state }) => {
   await startTelemetry(state);
@@ -99,7 +126,7 @@ test("service action timeline is one connected tree", async ({ server, assistant
   await flushTelemetry();
 
   const read = await timeline(server, action.traceId);
-  const starts = read.map((span) => span.start_time);
+  const starts = read.map((span) => instant(span.start_time));
   expect(starts).toEqual([...starts].sort());
   const spans = read.filter((span) => span.trace_id === action.traceId);
   const linked = read.filter((span) => span.trace_id !== action.traceId);

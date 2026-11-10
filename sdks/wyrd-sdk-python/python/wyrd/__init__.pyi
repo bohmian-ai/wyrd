@@ -1,4 +1,4 @@
-from . import cards, client, config, data, model, prompt, state, verify
+from . import authoring, cards, client, config, data, model, prompt, state, verify
 from ._wyrd import AgentError, SessionError, ToolError, WyrdError
 from .cards import AgentCard, Card, CardKind, CardRef, Cards, DeclarationReceipt
 from .cli import run_wyrd_cli
@@ -53,6 +53,7 @@ __all__ = [
     "CardEnvelope",
     "WyrdState",
     "WyrdClient",
+    "authoring",
     "cards",
     "config",
     "data",

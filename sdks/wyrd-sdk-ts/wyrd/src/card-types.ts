@@ -252,6 +252,32 @@ export interface ArtifactSpec {
 }
 
 /**
+ * Audit artifact or evidence bundle metadata.
+ */
+export interface AuditSpec {
+  /**
+   * Audit description.
+   */
+  readonly description?: string | null;
+  /**
+   * Free-form details.
+   */
+  readonly details?: Readonly<Record<string, NonSecretValue>>;
+  /**
+   * Evidence artifact references.
+   */
+  readonly evidence_refs?: readonly Ref[];
+  /**
+   * Policy references.
+   */
+  readonly policy_refs?: readonly Ref[];
+  /**
+   * Subject Card references.
+   */
+  readonly subject_refs?: readonly Ref[];
+}
+
+/**
  * Public synchronous Oracle query request.
  *
  * Every query reads the same sources: its pinned published cut plus
@@ -1996,6 +2022,25 @@ export interface DriftWindow {
 export type ExecutionId = string;
 
 /**
+ * Topologically sorted task DAG.
+ *
+ * Stages are produced in dependency-layer order. Stage 0 contains all tasks
+ * with no dependencies. Each later stage contains tasks whose dependencies
+ * were all emitted by earlier stages.
+ */
+export interface ExecutionPlan {
+  /**
+   * Topological execution layers in dependency order.
+   */
+  readonly stages: readonly Stage[];
+  /**
+   * Total task count across all stages. Equals `tasks.len()` from the
+   * input map.
+   */
+  readonly task_count: number;
+}
+
+/**
  * Where an Agent's model calls go.
  *
  * Required on every Agent and replaceable whole for one invocation; it is
@@ -2021,6 +2066,48 @@ export interface ExecutionRouteWyrdGateway {
    */
   readonly deployment: ProviderDeploymentName;
   readonly kind: "wyrd_gateway";
+}
+
+/**
+ * Grouping and comparison context for related runs.
+ */
+export interface ExperimentSpec {
+  /**
+   * Best run reference.
+   */
+  readonly best_run_ref?: RunRef | null;
+  /**
+   * Artifact references.
+   */
+  readonly card_refs?: readonly Ref[];
+  /**
+   * Default parameters applied to runs.
+   */
+  readonly default_parameters?: Readonly<Record<string, ParameterValue>>;
+  /**
+   * Experiment description.
+   */
+  readonly description?: string | null;
+  /**
+   * Free-form details.
+   */
+  readonly details?: Readonly<Record<string, NonSecretValue>>;
+  /**
+   * Experiment type.
+   */
+  readonly experiment_type?: string | null;
+  /**
+   * Associated runs.
+   */
+  readonly run_refs?: readonly RunRef[];
+  /**
+   * Summary metrics for comparison.
+   */
+  readonly summary_metrics?: readonly MetricEntry[];
+  /**
+   * Primary target Cards.
+   */
+  readonly target_refs?: readonly Ref[];
 }
 
 /**
@@ -2911,7 +2998,7 @@ export interface InputDeclarationTrace {
 }
 
 /**
- * One named evidence slot. Slots are required unless `required: false`.
+ * One named evidence slot. Missing evidence leaves the checks that need it inconclusive.
  */
 export type InputSlot = TypedInputSlot | SourceText;
 
@@ -3139,6 +3226,36 @@ export interface LocatorSlide {
   readonly slide: number;
 }
 
+/**
+ * MCP server or tool catalog metadata.
+ */
+export interface McpSpec {
+  /**
+   * MCP description.
+   */
+  readonly description?: string | null;
+  /**
+   * Free-form details.
+   */
+  readonly details?: Readonly<Record<string, NonSecretValue>>;
+  /**
+   * Required scopes.
+   */
+  readonly scopes?: readonly string[];
+  /**
+   * Server name.
+   */
+  readonly server_name: string;
+  /**
+   * Tool references.
+   */
+  readonly tool_refs?: readonly Ref[];
+  /**
+   * Transport descriptor.
+   */
+  readonly transport?: string | null;
+}
+
 export type MediaFormat = "png" | "jpeg" | "gif" | "webp" | "pdf" | "text" | "markdown" | "csv" | "json" | "html" | "docx" | "xlsx" | "pptx" | "doc" | "xls" | "ppt" | "tar_gz" | "zip";
 
 /**
@@ -3257,6 +3374,36 @@ export interface Metadata {
    * post-register.
    */
   readonly version?: VersionSpec | null;
+}
+
+/**
+ * Metric summary entry.
+ */
+export interface MetricEntry {
+  /**
+   * Metric creation timestamp.
+   */
+  readonly created_at?: string | null;
+  /**
+   * Whether this metric came from evaluation.
+   */
+  readonly is_evaluation?: boolean;
+  /**
+   * Metric name.
+   */
+  readonly name: string;
+  /**
+   * Optional step.
+   */
+  readonly step?: number | null;
+  /**
+   * Metric event timestamp.
+   */
+  readonly timestamp?: string | null;
+  /**
+   * Numeric metric value.
+   */
+  readonly value: number;
 }
 
 /**
@@ -3830,6 +3977,51 @@ export interface PandasMeta {
    * Installed pandas version inferred by the Python boundary.
    */
   readonly framework_version: string;
+}
+
+/**
+ * Typed parameter value for experiments, runs, workflows, and tools.
+ */
+export type ParameterValue = ParameterValueInt | ParameterValueFloat | ParameterValueStr | ParameterValueBool | ParameterValueJson;
+
+/**
+ * Boolean value.
+ */
+export interface ParameterValueBool {
+  readonly type: "bool";
+  readonly value: boolean;
+}
+
+/**
+ * Floating-point value.
+ */
+export interface ParameterValueFloat {
+  readonly type: "float";
+  readonly value: number;
+}
+
+/**
+ * Integer value.
+ */
+export interface ParameterValueInt {
+  readonly type: "int";
+  readonly value: number;
+}
+
+/**
+ * Structured JSON value.
+ */
+export interface ParameterValueJson {
+  readonly type: "json";
+  readonly value: JsonValue;
+}
+
+/**
+ * String value.
+ */
+export interface ParameterValueStr {
+  readonly type: "str";
+  readonly value: string;
 }
 
 export type ParameterizedComparisonOperator = ParameterizedComparisonOperatorInRange | ParameterizedComparisonOperatorNotInRange | ParameterizedComparisonOperatorApproximatelyEquals | ParameterizedComparisonOperatorMatchesRegex | ParameterizedComparisonOperatorNotMatchesRegex | ParameterizedComparisonOperatorHasMinLength | ParameterizedComparisonOperatorHasMaxLength | ParameterizedComparisonOperatorLength | ParameterizedComparisonOperatorLengthGreaterThan | ParameterizedComparisonOperatorLengthLessThan | ParameterizedComparisonOperatorIsType | ParameterizedComparisonOperatorWithinAbsTolerance | ParameterizedComparisonOperatorWithinPctTolerance | ParameterizedComparisonOperatorWithinStdDev | ParameterizedComparisonOperatorBetweenPercentiles | ParameterizedComparisonOperatorDivergenceLessThan | ParameterizedComparisonOperatorCosineSimilarityAtLeast;
@@ -4826,7 +5018,7 @@ export interface RegisteredArtifactCard {
 }
 
 /**
- * Registered `Audit` Card envelope; its spec is not typed yet.
+ * Registered `Audit` Card envelope.
  */
 export interface RegisteredAuditCard {
   /**
@@ -4848,7 +5040,7 @@ export interface RegisteredAuditCard {
   /**
    * Kind-specific spec payload.
    */
-  readonly spec: Readonly<Record<string, JsonValue>>;
+  readonly spec: AuditSpec;
   /**
    * Optional server-derived status.
    */
@@ -4858,7 +5050,7 @@ export interface RegisteredAuditCard {
 /**
  * One registered Card envelope as `cards.get` returns it, discriminated by `kind`.
  */
-export type RegisteredCard = RegisteredDataCard | RegisteredModelCard | RegisteredArtifactCard | RegisteredPromptCard | RegisteredAgentCard | RegisteredVerifierCard | RegisteredServiceCard | RegisteredTriggerCard | RegisteredOperatorCard | RegisteredUntypedCard;
+export type RegisteredCard = RegisteredDataCard | RegisteredModelCard | RegisteredArtifactCard | RegisteredExperimentCard | RegisteredPromptCard | RegisteredAgentCard | RegisteredMcpCard | RegisteredServiceCard | RegisteredAuditCard | RegisteredVerifierCard | RegisteredTriggerCard | RegisteredOperatorCard | RegisteredUntypedCard;
 
 /**
  * Registered `Data` Card envelope.
@@ -4891,7 +5083,7 @@ export interface RegisteredDataCard {
 }
 
 /**
- * Registered `Experiment` Card envelope; its spec is not typed yet.
+ * Registered `Experiment` Card envelope.
  */
 export interface RegisteredExperimentCard {
   /**
@@ -4913,7 +5105,7 @@ export interface RegisteredExperimentCard {
   /**
    * Kind-specific spec payload.
    */
-  readonly spec: Readonly<Record<string, JsonValue>>;
+  readonly spec: ExperimentSpec;
   /**
    * Optional server-derived status.
    */
@@ -4921,7 +5113,7 @@ export interface RegisteredExperimentCard {
 }
 
 /**
- * Registered `Mcp` Card envelope; its spec is not typed yet.
+ * Registered `Mcp` Card envelope.
  */
 export interface RegisteredMcpCard {
   /**
@@ -4943,7 +5135,7 @@ export interface RegisteredMcpCard {
   /**
    * Kind-specific spec payload.
    */
-  readonly spec: Readonly<Record<string, JsonValue>>;
+  readonly spec: McpSpec;
   /**
    * Optional server-derived status.
    */
@@ -5163,7 +5355,7 @@ export interface RegisteredTriggerCard {
 /**
  * Registered Card envelope of a kind whose spec is not typed yet.
  */
-export type RegisteredUntypedCard = RegisteredExperimentCard | RegisteredPolicyCard | RegisteredMcpCard | RegisteredAuditCard | RegisteredSourceCard;
+export type RegisteredUntypedCard = RegisteredPolicyCard | RegisteredSourceCard;
 
 /**
  * Registered `Verifier` Card envelope.
@@ -5442,6 +5634,86 @@ export type RoleSource = "idp" | "direct";
  * before the server first sees the run.
  */
 export type RunId = string;
+
+/**
+ * Execution kind recorded as a Run.
+ */
+export type RunKind = RunKindTraining | RunKindInference | RunKindOfflineEvaluation | RunKindDriftCheck | RunKindImport | RunKindWorkflow | RunKindRemediation | RunKindExternal;
+
+/**
+ * Drift check execution.
+ */
+export interface RunKindDriftCheck {
+  readonly type: "drift_check";
+}
+
+/**
+ * Externally defined execution kind.
+ */
+export interface RunKindExternal {
+  readonly type: "external";
+  readonly value: string;
+}
+
+/**
+ * Import execution.
+ */
+export interface RunKindImport {
+  readonly type: "import";
+}
+
+/**
+ * Inference execution.
+ */
+export interface RunKindInference {
+  readonly type: "inference";
+}
+
+/**
+ * Offline or batch evaluation execution.
+ */
+export interface RunKindOfflineEvaluation {
+  readonly type: "offline_evaluation";
+}
+
+/**
+ * Autonomous remediation execution.
+ */
+export interface RunKindRemediation {
+  readonly type: "remediation";
+}
+
+/**
+ * Training execution.
+ */
+export interface RunKindTraining {
+  readonly type: "training";
+}
+
+/**
+ * Workflow execution.
+ */
+export interface RunKindWorkflow {
+  readonly type: "workflow";
+}
+
+/**
+ * Reference to a Run.
+ */
+export interface RunRef {
+  /**
+   * Run kind.
+   */
+  readonly kind: RunKind;
+  /**
+   * Query/display labels.
+   */
+  readonly labels?: Readonly<Record<string, LabelValue>>;
+  /**
+   * Run UID. Promoted to `RunUid` in the Runs phase.
+   */
+  readonly uid: string;
+}
 
 /**
  * The current non-terminal lifecycle state of an admitted Oracle query.
@@ -6072,6 +6344,22 @@ export interface SqlMeta {
 }
 
 /**
+ * One topological execution layer.
+ *
+ * Tasks within a stage are independent and may execute in parallel.
+ */
+export interface Stage {
+  /**
+   * Zero-based topological layer index.
+   */
+  readonly index: number;
+  /**
+   * Task ids in this stage, sorted lexicographically for determinism.
+   */
+  readonly tasks: readonly TaskId[];
+}
+
+/**
  * Server-derived Card status.
  */
 export interface Status {
@@ -6391,11 +6679,15 @@ export interface TriggerSpecSchedule {
 /**
  * Card kinds whose `spec` and `status` `cards.get` types.
  */
-export type TypedCardKind = "Data" | "Model" | "Artifact" | "Prompt" | "Agent" | "Verifier" | "Service" | "Trigger" | "Operator";
+export type TypedCardKind = "Data" | "Model" | "Artifact" | "Experiment" | "Prompt" | "Agent" | "Mcp" | "Service" | "Audit" | "Verifier" | "Trigger" | "Operator";
 
 /**
- * One named evidence slot. Slots are required unless `required: false`;
- * samples and source slots are always required.
+ * One named evidence slot.
+ *
+ * No slot is optional: evidence a caller omits stays missing, never `null`,
+ * so every check that needs it is inconclusive while independent checks
+ * still run. A `json` slot's schema alone decides whether a supplied `null`
+ * is admitted.
  */
 export type TypedInputSlot = TypedInputSlotJson | TypedInputSlotMedia | TypedInputSlotTrace | TypedInputSlotSamples;
 
@@ -6403,10 +6695,6 @@ export type TypedInputSlot = TypedInputSlotJson | TypedInputSlotMedia | TypedInp
  * A JSON value, optionally constrained by JSON Schema.
  */
 export interface TypedInputSlotJson {
-  /**
-   * Whether a caller must supply the slot.
-   */
-  readonly required?: boolean;
   /**
    * JSON Schema the value must satisfy.
    */
@@ -6426,19 +6714,14 @@ export interface TypedInputSlotMedia {
    * Lower size bound than the deployment limit.
    */
   readonly max_bytes?: number | null;
-  /**
-   * Whether a caller must supply the slot.
-   */
-  readonly required?: boolean;
   readonly type: "media";
 }
 
 /**
  * Feature measurements or metric samples recorded for a scheduled window.
  *
- * Always required: a schedule binding supplies every samples slot of its
- * Verifier from the subject's recorded measurements, so the slot has no
- * `required` field and no drift check can be omitted by configuration.
+ * A schedule binding supplies every samples slot of its Verifier from
+ * the subject's recorded measurements.
  */
 export interface TypedInputSlotSamples {
   /**
@@ -6452,10 +6735,6 @@ export interface TypedInputSlotSamples {
  * A trace resolved through tenant-scoped trace reads.
  */
 export interface TypedInputSlotTrace {
-  /**
-   * Whether a caller must supply the slot.
-   */
-  readonly required?: boolean;
   readonly type: "trace";
 }
 

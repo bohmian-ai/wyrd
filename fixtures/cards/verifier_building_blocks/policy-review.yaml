@@ -20,7 +20,7 @@ spec:
           refund: {type: number}
         required: [text, refund]
     policy: {type: media, formats: [pdf], max_bytes: 65536}
-    trace: {type: trace, required: false}
+    trace: {type: trace}
   steps:
     - id: policy-text
       action: {kind: extract, from: inputs.policy}

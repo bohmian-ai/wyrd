@@ -1,0 +1,111 @@
+# The report-reviewer component's Verifier: a deterministic identifier scan
+# and the policy judge reading the uploaded policy, then report context.
+apiVersion: wyrd/v1
+kind: Verifier
+metadata:
+  name: report-policy
+  version: 1.0.0
+spec:
+  description: The report is fit to share under the company sharing policy.
+  inputs:
+    report:
+      type: json
+      schema:
+        type: object
+        additionalProperties: false
+        required: [text]
+        properties:
+          text: {type: string}
+    recipient:
+      type: json
+      schema:
+        type: object
+        additionalProperties: false
+        required: [email, authorized, permitted_purposes]
+        properties:
+          email: {type: string}
+          authorized: {type: boolean}
+          permitted_purposes: {type: array, items: {type: string}}
+    purpose: {type: json, schema: {type: string}}
+    destination:
+      type: json
+      schema:
+        type: object
+        additionalProperties: false
+        required: [url, encrypted, restricted_access, public_sharing]
+        properties:
+          url: {type: string}
+          encrypted: {type: boolean}
+          restricted_access: {type: boolean}
+          public_sharing: {type: boolean}
+  steps:
+    - id: policy
+      action:
+        kind: code
+        entrypoint: report_facts
+        inputs: {report: inputs.report}
+        source:
+          inline: &checks |
+            """Release facts every card_authoring Verifier step computes."""
+
+
+            def recipient_facts(recipient: dict, purpose: str) -> dict:
+                return {
+                    "authorized": (
+                        recipient["authorized"] and purpose in recipient["permitted_purposes"]
+                    ),
+                }
+
+
+            def report_facts(report: dict) -> dict:
+                return {
+                    "contains_bank_identifier": "BANK-ACCOUNT-DEMO-001" in report["text"],
+                }
+
+
+            def destination_facts(destination: dict) -> dict:
+                return {
+                    "appropriate": (
+                        destination["encrypted"]
+                        and destination["restricted_access"]
+                        and not destination["public_sharing"]
+                    ),
+                }
+
+
+            def summarize_findings(recipient: dict, destination: dict) -> dict:
+                return {
+                    "releasable": recipient["authorized"] and destination["appropriate"],
+                    "recipient": recipient,
+                    "destination": destination,
+                }
+
+
+            def policy_context(report: dict, purpose: str) -> dict:
+                return {"has_report": bool(report["text"].strip()), "purpose": purpose}
+      requirements:
+        - id: no-bank-account-identifier
+          statement: The report contains no prohibited bank identifier.
+          check: {kind: assert, path: steps.policy.output.contains_bank_identifier, operator: equals, expected: false}
+        - id: sharing-policy-satisfied
+          statement: The release satisfies the company sharing policy.
+          check:
+            kind: agent
+            agent: ./report-reviewer.yaml
+            inputs: {report: inputs.report, recipient: inputs.recipient, purpose: inputs.purpose, destination: inputs.destination}
+            workspace:
+              /inputs/policy.json:
+                artifact:
+                  card: {kind: Artifact, name: company-sharing-policy, version: 1.0.0}
+                  path: extracted/company-sharing-policy.pdf.json
+    - id: policy-context
+      action:
+        kind: code
+        entrypoint: policy_context
+        inputs: {report: inputs.report, purpose: inputs.purpose}
+        source:
+          inline: *checks
+      requirements:
+        - id: usable-report
+          statement: The proposed release contains report text.
+          check: {kind: assert, path: steps.policy-context.output.has_report, operator: equals, expected: true}

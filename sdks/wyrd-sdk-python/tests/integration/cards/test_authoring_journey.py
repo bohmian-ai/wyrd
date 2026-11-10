@@ -37,6 +37,7 @@ from wyrd.authoring import (
     Step,
     Verifier,
 )
+from wyrd.authoring import Prompt as AuthoredPrompt
 from wyrd.cards import CardKind, Cards, DeclarationReceipt
 from wyrd.cards import CardRef as RegisteredRef
 from wyrd.client import WyrdClient
@@ -294,6 +295,42 @@ def finance_release(version: str, policy: ArtifactFile, access: Verifier) -> Ser
         )
     )
     return service
+
+
+def canonical_release(
+    version: str, policy: ArtifactFile, access: Verifier, reviewer: Agent | None = None
+) -> Service:
+    """``finance_release`` authored as canonical component and binding mappings holding its Cards."""
+    reviewer = reviewer or policy_judge("report-reviewer", version)
+    controls = policy_judge("release-controls", version)
+    return Service(
+        "finance-release",
+        version,
+        service_type="api",
+        components=[
+            {
+                "alias": "report-reviewer",
+                "ref": reviewer,
+                "verified_by": [{"verifier": report_policy(version, reviewer, policy)}],
+            },
+            {"alias": "release-controls", "ref": controls, "verified_by": [{"verifier": access}]},
+        ],
+    )
+
+
+def prompted_judge(version: str) -> Agent:
+    """The report reviewer ``version`` whose prompt is a sibling Prompt Card with a null ``body``."""
+    judge = policy_judge("report-reviewer", version)
+    prompt = AuthoredPrompt(
+        "report-reviewer-prompt",
+        version,
+        provider="openai",
+        model="gpt-4o",
+        messages=judge.spec()["prompt"]["messages"],
+        response_format="verdict",
+        body=None,
+    )
+    return judge.prompt(prompt)
 
 
 def local_policy(version: str, source: Path = POLICY) -> Artifact:
@@ -563,9 +600,17 @@ def test_local_artifacts_and_declaration_parity(
     assert resolved(files) == resolved(receipt), "the authored graph is the file graph"
     assert all(each.outcome == "idempotent_noop" for each in files.outcomes), files.outcomes
     assert resolved(cards.declare(baseline(registered_policy("1.0.0")))) == resolved(files)
+    canonical = canonical_release(
+        "1.0.0", local_policy("1.0.0").file(POLICY_FILE), release_access("1.0.0")
+    )
+    assert resolved(cards.declare(canonical)) == resolved(files), (
+        "canonical mappings declare the file graph"
+    )
 
-    from_code = WyrdState.declare(baseline(registered_policy("1.0.0")))
-    from_file = WyrdState.declare(STORY / "finance-release.yaml")
+    from_code = WyrdState.declare(
+        canonical_release("1.0.0", registered_policy("1.0.0"), release_access("1.0.0"))
+    )
+    from_file = WyrdState.declare(path=STORY / "finance-release.yaml", client=WyrdClient())
     try:
         for alias in ("report-reviewer", "release-controls"):
             assert from_code.card_ref(alias) == from_file.card_ref(alias)
@@ -664,13 +709,18 @@ def test_local_artifacts_and_declaration_parity(
     shutil.copy(POLICY, directory / POLICY.name)
     (directory / "appendix/retention.md").write_text("Retain release records for seven years.\n")
     from_directory = cards.declare(
-        finance_release(
-            "6.0.0", local_policy("6.0.0", directory).file(POLICY_FILE), release_access("6.0.0")
+        canonical_release(
+            "6.0.0",
+            local_policy("6.0.0", directory).file(POLICY_FILE),
+            release_access("6.0.0"),
+            prompted_judge("6.0.0"),
         )
     )
     assert CardKind.Artifact not in declared_kinds(from_directory), from_directory.outcomes
     assert {POLICY.name, POLICY_FILE, "appendix/retention.md"} <= policy_files(cards, "6.0.0")
     assert mounted_policy(cards, "6.0.0") == "6.0.0"
+    prompt = cards.get(RegisteredRef("Prompt", "report-reviewer-prompt", "6.0.0")).spec
+    assert prompt["messages"] and prompt.get("body") is None, prompt
     directory_state = WyrdState.declare(
         finance_release(
             "7.0.0", local_policy("7.0.0", directory).file(POLICY_FILE), release_access("7.0.0")
@@ -685,6 +735,11 @@ def test_local_artifacts_and_declaration_parity(
         assert releases(report, access), (report.requirements, access.requirements)
     finally:
         directory_state.shutdown()
+
+    with pytest.raises(WyrdError) as missing:
+        WyrdState.declare(path=tmp_path / "missing.yaml", client=WyrdClient())
+    assert code(missing) == "WYRD_LOADER_400_INVALID_ENVELOPE"
+    assert "missing.yaml" in str(missing.value.details), "the keyword reaches the loader"
 
     holder = PromptCard(
         Prompt.openai_chat("gpt-4o", messages="Hello {{name}}"),

@@ -236,6 +236,16 @@ mod tests {
         );
         assert_eq!(
             (
+                (limits.direct.python_workers, limits.queued.python_workers),
+                (limits.direct.python_waiters, limits.queued.python_waiters),
+                (limits.direct.workspaces, limits.queued.workspaces),
+                limits.monty_pool_memory_bytes,
+                limits.monty_min_workers,
+            ),
+            ((4, 12), (16, 48), (16, 48), 8192 * 1024 * 1024, 1)
+        );
+        assert_eq!(
+            (
                 limits.direct_executions,
                 limits.direct.model_calls,
                 limits.queued.model_calls,

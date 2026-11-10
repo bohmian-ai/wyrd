@@ -6040,19 +6040,21 @@ async fn gateway_agent_calls_start_only_on_a_compatible_adapter() {
 /// waiting out half its budget reaches the provider with only the remainder
 /// as its deadline, so a provider that never answers ends the call by the
 /// original deadline rather than a full budget after admission. Neither
-/// expiry keeps a permit, so the next call is answered.
+/// expiry keeps a permit, the gateway captures the hung call as timed out,
+/// and the next call is answered.
 ///
 /// # Panics
 /// Panics when a setup step fails, a wait outlives its budget, a call is
 /// dispatched while the lane is held, a dispatched deadline restarts the
-/// budget, or a permit is kept.
+/// budget, a permit is kept, or the hung call is not captured.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn lane_wait_spends_the_agent_call_budget() {
     let fixture = PgFixture::start().await.expect("fixture starts");
     let tenant = fixture.data_tenant_id();
     let dispatch = Scripted::shared();
-    let state = replica(&fixture, dispatch.clone()).await;
+    let (state, scribe) = RecordingScribe::attach(replica(&fixture, dispatch.clone()).await);
     configure(&state, tenant, json!([]), json!([]), "allow_unpriced").await;
+    capture_metadata(&state, tenant).await;
     let permits = Arc::new(Semaphore::new(1));
     let agent =
         super::ServerWyrdGatewayCaller::new(state.clone(), invoker(tenant, 1, [open_access()]))
@@ -6078,10 +6080,16 @@ async fn lane_wait_spends_the_agent_call_budget() {
     let held = Arc::clone(&permits)
         .try_acquire_owned()
         .expect("the lane's only permit");
+    let waited = tokio::time::Instant::now();
     let expired = tokio::time::timeout(Duration::from_secs(10), call(Duration::from_millis(300)))
         .await
-        .expect("the lane wait ends within the call's budget")
+        .expect("the lane wait ends")
         .expect_err("a call whose lane stays held times out");
+    let waited = waited.elapsed();
+    assert!(
+        (Duration::from_millis(300)..Duration::from_secs(1)).contains(&waited),
+        "the lane wait ends at the call's own budget, after {waited:?}"
+    );
     assert!(
         matches!(expired, skald_providers::ProviderError::Timeout { .. }),
         "{expired:?}"
@@ -6119,6 +6127,17 @@ async fn lane_wait_spends_the_agent_call_budget() {
         "the call ended after {ended:?}"
     );
     assert_eq!(permits.available_permits(), 1, "the expiry kept no permit");
+    drain_gateway(&state).await;
+    let outcomes: Vec<Value> = scribe
+        .calls()
+        .into_iter()
+        .map(|row| row["outcome"].clone())
+        .collect();
+    assert_eq!(
+        outcomes,
+        ["timed_out"],
+        "GatewayInvocation accounts the expired call"
+    );
 
     dispatch.push(Step::Return(AttemptResult::Completed {
         body: ResponseBody::Json(

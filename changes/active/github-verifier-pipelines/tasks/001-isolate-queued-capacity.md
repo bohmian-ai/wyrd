@@ -73,3 +73,25 @@ recorded after implementation, before RED; none are invented here.
 Run `mise run fmt`, `mise run lints`, `mise run check:deps` and
 `git diff --check`. No synthetic host load, separate engine, platform-specific
 resource enforcement or completion-time SLA is part of this task.
+
+## Obligations
+
+| ID | Source (task line) | Observation | Planned assertion |
+|---|---|---|---|
+| O1 | AC-010 "hold queued execution … run a direct-eligible SDK Verifier" | With every queued execution slot held, a direct SDK `verify` completes | SDK journey: queued slot held by a held queued run; direct verify result `passed` |
+| O2 | AC-010 "workspace" | With every queued workspace held, a direct SDK Verifier whose Agent uses a workspace completes | SDK journey: queued workspaces held; direct workspace Agent passes |
+| O3 | AC-010 "Python" | With every queued Python admission held, a direct SDK `code` Verifier completes | SDK journey: queued sandbox held; direct code Verifier passes |
+| O4 | AC-010 "model admission" | With every queued model-call admission held, a direct SDK Agent Verifier completes | SDK journey: queued model calls held; direct Agent passes |
+| O5 | AC-010 "Queued work must wait for its own capacity; releasing it allows progress" (execution) | A queued run does not start while the queued slot is held; completes after release | SDK journey: second queued run not settled while held, completed after release |
+| O6 | same (workspace) | A queued workspace run waits while queued workspaces are held; completes after release | SDK journey: deferral observed, then completed |
+| O7 | same (Python) | A queued code run waits while queued Python is held; completes after release | SDK journey: deferral observed, then completed |
+| O8 | same (model) | A queued Agent run waits for queued model admission; completes after release | SDK journey: wait observed, then completed |
+| O9 | "no borrowing" (design/spec REQ-015) | Direct work never takes queued capacity: a full direct lane refuses direct work although queued capacity is free | SDK journey: direct workspace held → direct verify `WYRD_SERVER_503_SERVICE_UNAVAILABLE` |
+| O10 | "Route each call through its accepted execution mode, including queued continuations" | Direct calls use direct resources; queued attempts, including re-claimed deferred continuations, use queued resources | O2–O8 assertions (deferred queued run resumes on queued lane after release) |
+| O11 | "Expose the isolated limits and original execution ceiling through server configuration's existing typed/environment validation" | Every lane limit, direct/queued execution ceiling and the queued execution deadline parse from env; bad/inconsistent values refuse startup | `config::tests::verification_limits_env_applies_and_refuses` |
+| O12 | "Keep limits at their existing owners" / defaults | Defaults keep the original combined Python/workspace capacity and the 64-slot five-minute queued ceiling | unit tests in `verification::hosted` and `config` |
+| O13 | "Establish direct eligibility validation before any engine step" | A queued-only (Window) Verifier is refused by direct `verify` before any step runs, through one named check | existing SDK journey `verify_in_real_time` window refusal |
+| O14 | "Confirm existing tenant/subject accounting remains on the ordinary gateway path" | A direct Agent's model call admitted by its lane still passes through the gateway and is attributed to the direct subject | SDK journey: gateway capture/accounting row carries subject |
+| O15 | "Amend wyrd-design.md … and relevant operator operations guidance" | Design and operator docs describe isolated admission, queued-only features, limits and the deadline ceiling for approvals | `mise run docs:check` |
+| O16 | "Run fmt, lints, check:deps, git diff --check" | All pass | command output |
+| O17 | "Preserve the one engine" | Both modes build their engine through `HostedBlocks::engine` | code citation + O1–O8 |

@@ -164,7 +164,7 @@ async fn disconnect(
     responses(
         (status = 302, description = "Redirect to GitHub's OAuth authorization"),
         (status = 400, description = "The query is malformed \
-          (WYRD_SPEC_400_VALIDATION, WYRD_GITHUB_400_REQUEST_INVALID)", body = WyrdProblem),
+          (WYRD_SPEC_400_VALIDATION, WYRD_GITHUB_400_INVALID_REQUEST)", body = WyrdProblem),
         (status = 401, description = "The browser has no Wyrd session \
           (WYRD_AUTH_401_UNAUTHENTICATED)", body = WyrdProblem),
         (status = 403, description = "The principal lacks identity_connections:write, or \
@@ -227,7 +227,7 @@ async fn setup(
     responses(
         (status = 200, description = "Associated", body = GithubConnectionView),
         (status = 400, description = "The query is malformed \
-          (WYRD_SPEC_400_VALIDATION, WYRD_GITHUB_400_REQUEST_INVALID)", body = WyrdProblem),
+          (WYRD_SPEC_400_VALIDATION, WYRD_GITHUB_400_INVALID_REQUEST)", body = WyrdProblem),
         (status = 401, description = "The browser has no Wyrd session \
           (WYRD_AUTH_401_UNAUTHENTICATED)", body = WyrdProblem),
         (status = 403, description = "The principal lacks identity_connections:write, or \
@@ -238,7 +238,7 @@ async fn setup(
           (WYRD_GITHUB_409_CONNECTION_CONFLICT)", body = WyrdProblem),
         (status = 503, description = "No GitHub App is configured, GitHub is unreachable, \
           or the registry is unavailable (WYRD_GITHUB_503_NOT_CONFIGURED, \
-          WYRD_GITHUB_503_UNAVAILABLE, WYRD_REGISTRY_503_REGISTRY_UNAVAILABLE)",
+          WYRD_GITHUB_503_PROVIDER_UNAVAILABLE, WYRD_REGISTRY_503_REGISTRY_UNAVAILABLE)",
           body = WyrdProblem)
     ),
     tag = "GitHub"
@@ -285,7 +285,7 @@ async fn callback(
     responses(
         (status = 202, description = "Accepted"),
         (status = 400, description = "The body is not a GitHub event \
-          (WYRD_GITHUB_400_REQUEST_INVALID)", body = WyrdProblem),
+          (WYRD_GITHUB_400_INVALID_REQUEST)", body = WyrdProblem),
         (status = 401, description = "The signature does not verify \
           (WYRD_GITHUB_401_WEBHOOK_REFUSED)", body = WyrdProblem),
         (status = 503, description = "No GitHub App is configured, or the registry is \

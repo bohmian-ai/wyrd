@@ -189,7 +189,7 @@ description = "Run the real-server CLI and Rust SDK typed WyrdState journeys wit
 run = [
   "cargo nextest run --locked -p wyrd-cli --test cli -E 'test(=card_lifecycle::pg_tests::cli_bundle_loads_typed_wyrdstate_after_server_shutdown)'",
   "cargo nextest run --locked -p wyrd-ai --test integration -P journey --run-ignored=all -E 'test(=declare_and_pull::service_graph_declares_and_pulls)'",
-  "cargo nextest run --locked -p wyrd-ai --test integration -P journey --run-ignored=all -E 'test(/^(gateway_admin|operator_connections)::/)'",
+  "cargo nextest run --locked -p wyrd-ai --test integration -P journey --run-ignored=all -E 'test(/^(gateway_admin|operator_connections|github_connection)::/)'",
 ]
 
 [tasks."test:gateway:native"]

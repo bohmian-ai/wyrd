@@ -69,6 +69,7 @@ hdrhistogram = { workspace = true }
 hex = { workspace = true }
 metrics-exporter-prometheus = { workspace = true }
 iceberg = { workspace = true }
+jsonwebtoken = { workspace = true }
 http = { workspace = true }
 http-body = { workspace = true }
 http-body-util = "0.1"

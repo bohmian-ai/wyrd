@@ -517,6 +517,8 @@ pub struct WyrdTestServerBuilder {
     telemetry: Option<Arc<TelemetryGuard>>,
     /// Optional fixed HTTP/gRPC addresses used for truthful peer advertisement.
     bind_addrs: Option<(std::net::SocketAddr, std::net::SocketAddr)>,
+    /// The loopback GitHub this server's App is configured against.
+    github: Option<crate::github::GithubAppMock>,
     /// Optional production-shaped Oracle server identity and peer trust paths.
     /// Peer identity for this server; provisioned by the builder when absent.
     peer_tls: Option<TestBifrostPeerTls>,
@@ -676,6 +678,7 @@ impl Default for WyrdTestServerBuilder {
             oracle_runtime: None,
             telemetry: None,
             bind_addrs: None,
+            github: None,
             peer_tls: None,
             peer_tls_root: None,
             peer_bind: None,
@@ -4536,6 +4539,17 @@ impl WyrdTestServerBuilder {
         self
     }
 
+    /// Configure the deployment's GitHub App against `mock`, with this
+    /// server's bound address as its public URL.
+    ///
+    /// Without it the server has no GitHub App, as when an operator configures
+    /// none. The server must start bound so GitHub can redirect to it.
+    #[must_use]
+    pub fn with_github_app_for_test(mut self, mock: &crate::github::GithubAppMock) -> Self {
+        self.github = Some(mock.clone());
+        self
+    }
+
     /// Register the test-support MCP context probe in this server's `/mcp`
     /// tool catalog.
     ///
@@ -5277,6 +5291,17 @@ impl WyrdTestServerBuilder {
             ..ForgeRuntimeConfig::default()
         };
         config.gateway = test_gateway_config(tenant_id, self.gateway_vault_backend.clone())?;
+        if let Some(mock) = &self.github {
+            let (http, _) = self.bind_addrs.ok_or_else(|| {
+                WyrdTestServerError::Start("a GitHub App test server must start bound".to_owned())
+            })?;
+            let public_url = format!("http://{http}");
+            mock.set_public_url(&public_url);
+            config.github = wyrd_server::config::GithubConfig {
+                public_url: Some(public_url),
+                ..mock.server_config()
+            };
+        }
         if let Some(endpoints) = self.gateway_endpoints {
             config.gateway.endpoints = endpoints;
         }

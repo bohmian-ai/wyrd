@@ -4,6 +4,7 @@ pub mod bifrost;
 pub mod capacity;
 pub mod experiment;
 pub mod gateway_capture;
+pub mod github;
 pub mod human_login;
 pub mod interleaving;
 pub mod keys;

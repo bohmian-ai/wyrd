@@ -952,10 +952,11 @@ macro_rules! card_methods {
 
 pub(crate) use card_methods;
 
-/// A Card of any registrable kind, authored as its kind and canonical spec
-/// JSON.
+/// Any one named authored Card, such as a [`Service`] or [`Verifier`], with
+/// its kind erased.
 ///
-/// Every named Card type converts into one, keeping what it references.
+/// Only the named Card types build one, each converting with what it
+/// references.
 #[derive(Debug, Clone, PartialEq)]
 pub struct CardDefinition(
     /// The Card.

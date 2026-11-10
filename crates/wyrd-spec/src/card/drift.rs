@@ -533,7 +533,7 @@ fn validate_signal(signal: &DriftSignal) -> Result<(), DriftValidationError> {
             baseline_ref,
             features,
         } => {
-            let Some(baseline_ref) = baseline_ref.as_card_ref() else {
+            let Some(baseline_ref) = baseline_ref.target() else {
                 return Ok(());
             };
             if baseline_ref.kind != CardKind::Data {

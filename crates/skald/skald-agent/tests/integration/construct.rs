@@ -155,7 +155,7 @@ fn agent_try_from_sibling_resolves_against_test_resolver() {
 
     let agent = Agent::try_from_ref(
         InlineableRef::Sibling {
-            sibling: card_ref.clone(),
+            sibling: (&card_ref).into(),
         },
         default_prompt_resolver(),
     )

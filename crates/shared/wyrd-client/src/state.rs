@@ -2654,7 +2654,7 @@ pub(crate) mod tests {
                 agent: InlineableRef::Inline(Box::new(AgentSpec {
                     prompt: if sibling {
                         InlineableRef::Sibling {
-                            sibling: prompt_ref,
+                            sibling: (&prompt_ref).into(),
                         }
                     } else {
                         InlineableRef::Ref(prompt_ref)
@@ -3182,7 +3182,10 @@ pub(crate) mod tests {
         assert_eq!(error.code(), "WYRD_SDK_400_INVALID_STATE_BUNDLE");
         let details = problem_details(&error);
         assert!(!details["owner"].is_null(), "owner detail is required");
-        assert_eq!(details["card_ref"], serde_json::json!(expected_ref));
+        assert_eq!(
+            details["card_ref"],
+            serde_json::json!(wyrd_spec::reference::SiblingRef::from(expected_ref))
+        );
         assert_eq!(details["reference_form"], "sibling");
     }
 
@@ -3979,7 +3982,7 @@ pub(crate) mod tests {
         bundle.rewrite_card(&test_ref(CardKind::Service, "service", 1), |card| {
             if let Spec::Service(spec) = &mut card.spec {
                 spec.components[0].card_ref = Ref::Sibling {
-                    sibling: sibling.clone(),
+                    sibling: (&sibling).into(),
                 };
             }
         });

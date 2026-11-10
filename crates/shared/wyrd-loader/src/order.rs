@@ -134,6 +134,13 @@ fn graph_diagnostic(
                 "binding_owner_kinds": ["Service", "Agent"],
             }),
         },
+        GraphError::AmbiguousSibling {
+            sibling,
+            candidates,
+        } => WyrdError::RegistryUnresolvedDependency {
+            message,
+            details: serde_json::json!({ "card_ref": sibling, "candidates": candidates }),
+        },
         GraphError::DuplicateIdentity { .. }
         | GraphError::Empty
         | GraphError::MultipleRoots { .. }
@@ -200,11 +207,10 @@ mod tests {
                 vec![ServiceComponent {
                     alias: dependency.to_string(),
                     card_ref: Ref::Sibling {
-                        sibling: wyrd_spec::reference::CardRef {
+                        sibling: wyrd_spec::reference::SiblingRef {
                             kind: CardKind::Service,
                             name: CardName::new(dependency).unwrap(),
-                            version: VersionBlock::parse("1.0.0").unwrap(),
-                            uid: None,
+                            version: Some(VersionBlock::parse("1.0.0").unwrap()),
                         },
                     },
                     verified_by: Vec::new(),
@@ -264,7 +270,7 @@ mod tests {
         spec.components.push(ServiceComponent {
             alias: "quality".to_owned(),
             card_ref: Ref::Sibling {
-                sibling: card_ref(CardKind::Verifier, "quality"),
+                sibling: (&card_ref(CardKind::Verifier, "quality")).into(),
             },
             verified_by: Vec::new(),
             source: None,

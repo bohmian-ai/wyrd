@@ -13,7 +13,7 @@ use wyrd_spec::error::WyrdError;
 use wyrd_spec::graph::BindingSite;
 use wyrd_spec::ids::{CardName, CardUid};
 use wyrd_spec::operator_connection::OperatorConnectionStatus;
-use wyrd_spec::reference::{CardRef, CardRefIdentity, InlineableRef, Ref};
+use wyrd_spec::reference::{CardRef, CardRefIdentity, InlineableRef, Ref, SiblingRef};
 use wyrd_spec::refs::{ReferenceSlotVisitor, SlotValue};
 use wyrd_spec::registry::CardSubmission;
 use wyrd_sql::TenantConn;
@@ -110,7 +110,7 @@ pub(super) fn source_binding<'a>(
         .filter(|binding| {
             binding
                 .verifier
-                .as_card_ref()
+                .target()
                 .is_some_and(|verifier| &verifier.name == name)
         })
         .collect();
@@ -132,7 +132,7 @@ fn site_subjects(spec: &Spec) -> Vec<Option<CardRefIdentity>> {
             service
                 .components
                 .iter()
-                .map(|component| component.card_ref.as_card_ref().map(CardRef::identity_key)),
+                .map(|component| target_identity(&component.card_ref)),
         );
     }
     subjects
@@ -156,13 +156,14 @@ impl GroupSite<'_, '_> {
         let Some(subject) = &self.subjects[self.site] else {
             return false;
         };
-        let identity = source.verifier.as_card_ref().map(CardRef::identity_key);
+        let identity = target_identity(&source.verifier);
         self.sites.iter().enumerate().any(|(index, site)| {
             index != self.site
                 && self.subjects[index].as_ref() == Some(subject)
-                && site.bindings.iter().any(|other| {
-                    other.verifier.as_card_ref().map(CardRef::identity_key) == identity
-                })
+                && site
+                    .bindings
+                    .iter()
+                    .any(|other| target_identity(&other.verifier) == identity)
         })
     }
 }
@@ -192,7 +193,9 @@ pub(super) struct EffectiveSpecs {
 impl EffectiveSpecs {
     /// Resolve every external (non-sibling) `CardRef` to its `CardUid` under RLS.
     ///
-    /// Walks each submitted spec with the canonical [`ReferenceSlotVisitor`],
+    /// `submissions` are the graph-ready submissions, whose siblings already
+    /// name their targets' graph identities. Walks each spec with the
+    /// canonical [`ReferenceSlotVisitor`],
     /// rejects loader-only paths and siblings the request did not submit, batches
     /// the remaining identities into one RLS-scoped registry read, and then checks
     /// every verification binding and Drift baseline against the
@@ -246,26 +249,19 @@ impl EffectiveSpecs {
         Ok(effective.resolved)
     }
 
-    /// Decode every pinned submission into the identity cache.
+    /// Decode every graph-ready submission into the identity cache.
     ///
-    /// Submissions without a resolved version cannot be a sibling
-    /// target, so they are skipped rather than cached under a partial identity.
+    /// Graph-ready submissions all carry a pinned graph identity, so a
+    /// versionless submission is cached under the identity its siblings name.
     ///
     /// # Errors
     /// Returns `WYRD_REGISTRY_400_INVALID_CARD_SPEC` for an undecodable spec.
     fn new(submissions: &[CardSubmission], resolved: ResolvedRefs) -> Result<Self, WyrdError> {
         let mut siblings = HashMap::new();
         for submission in submissions {
-            let Some(version) = submission.metadata.resolved_pin() else {
+            let Some(identity) = submission_identity(submission) else {
                 continue;
             };
-            let identity = CardRef {
-                kind: submission.kind.clone(),
-                name: submission.metadata.name.clone(),
-                version: version.clone(),
-                uid: None,
-            }
-            .identity_key();
             let spec = Spec::from_kind_and_value(&submission.kind, submission.spec.clone())
                 .map_err(|error| WyrdError::registry_invalid_card_spec(error.to_string()))?;
             siblings.insert(identity, spec);
@@ -455,7 +451,7 @@ impl EffectiveSpecs {
         group: GroupSite<'_, '_>,
     ) -> Result<(), WyrdError> {
         let site = group.sites[group.site].bindings;
-        let own = binding.verifier.as_card_ref().map(|own| &own.name);
+        let own = binding.verifier.target().map(|own| own.name);
         for (slot, input) in &verifier.inputs {
             let InputSlot::Source(text) = input else {
                 continue;
@@ -488,7 +484,9 @@ impl EffectiveSpecs {
                     reference.verifier
                 )));
             }
-            if Some(&reference.verifier) == own || self.reaches(conn, site, &target, own).await? {
+            if Some(&reference.verifier) == own.as_ref()
+                || self.reaches(conn, site, &target, own.as_ref()).await?
+            {
                 return Err(refuse("forms a source cycle".to_owned()));
             }
             if group.ambiguous(source) {
@@ -651,7 +649,10 @@ impl EffectiveSpecs {
         let card_ref = match reference {
             None | Some(Ref::Path(_)) => return Ok(None),
             Some(Ref::Sibling { sibling }) => {
-                return Ok(self.siblings.get(&sibling_key(sibling)).cloned());
+                return Ok(sibling
+                    .identity_key()
+                    .and_then(|identity| self.siblings.get(&identity))
+                    .cloned());
             }
             Some(Ref::Ref(card_ref)) => card_ref,
         };
@@ -772,20 +773,26 @@ fn collect_inline_ref<T>(
     }
 }
 
+/// Refuse a sibling that names no submission in this request.
 fn validate_sibling(
-    sibling: &CardRef,
+    sibling: &SiblingRef,
     siblings: &BTreeSet<CardRefIdentity>,
 ) -> Result<(), WyrdError> {
-    if siblings.contains(&sibling_key(sibling)) {
+    if sibling
+        .identity_key()
+        .is_some_and(|identity| siblings.contains(&identity))
+    {
         Ok(())
     } else {
-        Err(WyrdError::RegistryUnresolvedDependency {
-            message: format!(
-                "sibling card dependency {} was not submitted",
-                display_ref(sibling)
-            ),
-            details: serde_json::json!({ "card_ref": display_ref(sibling) }),
-        })
+        Err(unsubmitted_sibling(sibling))
+    }
+}
+
+/// The refusal for a sibling that names no submission in this request.
+fn unsubmitted_sibling(sibling: &SiblingRef) -> WyrdError {
+    WyrdError::RegistryUnresolvedDependency {
+        message: format!("sibling card dependency {sibling} was not submitted"),
+        details: serde_json::json!({ "card_ref": sibling.to_string() }),
     }
 }
 
@@ -799,11 +806,22 @@ fn unresolved_path_error(path: &std::path::Path) -> WyrdError {
     }
 }
 
-/// Bind external and already-minted sibling UIDs into every embedded reference.
+/// Bind external UIDs and replace every sibling with the exact registered
+/// reference its target resolved to.
+///
+/// `siblings` maps each already-persisted submission's graph identity to its
+/// complete registered [`CardRef`], with the version the server selected and
+/// its UID, so the parent's spec hash and version selection see the exact
+/// child reference.
+///
+/// # Errors
+/// Returns `WYRD_REGISTRY_*_UNRESOLVED_DEPENDENCY` for an external reference
+/// without a resolved UID or a sibling whose target is not yet persisted, and
+/// `WYRD_REGISTRY_*_UNRESOLVED_PATH_REF` for a loader-only path.
 pub fn bind_card_references(
     spec: &mut Spec,
     external: &ResolvedRefs,
-    siblings: &HashMap<CardRefIdentity, CardUid>,
+    siblings: &HashMap<CardRefIdentity, CardRef>,
 ) -> Result<(), WyrdError> {
     let mut result = Ok(());
     ReferenceSlotVisitor::visit(spec, |slot| {
@@ -830,7 +848,7 @@ pub fn bind_card_references(
 fn bind_ref(
     reference: &mut Ref,
     external: &ResolvedRefs,
-    siblings: &HashMap<CardRefIdentity, CardUid>,
+    siblings: &HashMap<CardRefIdentity, CardRef>,
 ) -> Result<(), WyrdError> {
     match reference {
         Ref::Ref(card_ref) => {
@@ -838,11 +856,7 @@ fn bind_ref(
             require_uid(card_ref)
         }
         Ref::Sibling { sibling } => {
-            let uid = siblings.get(&sibling_key(sibling)).cloned();
-            let mut card_ref = sibling.clone();
-            card_ref.uid = uid;
-            require_uid(&card_ref)?;
-            *reference = Ref::Ref(card_ref);
+            *reference = Ref::Ref(registered_sibling(sibling, siblings)?);
             Ok(())
         }
         Ref::Path(path) => Err(unresolved_path_error(path)),
@@ -852,7 +866,7 @@ fn bind_ref(
 fn bind_inline_ref<T>(
     reference: &mut InlineableRef<T>,
     external: &ResolvedRefs,
-    siblings: &HashMap<CardRefIdentity, CardUid>,
+    siblings: &HashMap<CardRefIdentity, CardRef>,
 ) -> Result<(), WyrdError> {
     match reference {
         InlineableRef::Ref(card_ref) => {
@@ -860,16 +874,29 @@ fn bind_inline_ref<T>(
             require_uid(card_ref)
         }
         InlineableRef::Sibling { sibling } => {
-            let uid = siblings.get(&sibling_key(sibling)).cloned();
-            let mut card_ref = sibling.clone();
-            card_ref.uid = uid;
-            require_uid(&card_ref)?;
-            *reference = InlineableRef::Ref(card_ref);
+            *reference = InlineableRef::Ref(registered_sibling(sibling, siblings)?);
             Ok(())
         }
         InlineableRef::Inline(_) => Ok(()),
         InlineableRef::Path(path) => Err(unresolved_path_error(path)),
     }
+}
+
+/// The complete registered reference a graph-ready sibling resolved to.
+///
+/// # Errors
+/// Returns `WYRD_REGISTRY_*_UNRESOLVED_DEPENDENCY` when the target has not
+/// been persisted in this declaration.
+fn registered_sibling(
+    sibling: &SiblingRef,
+    siblings: &HashMap<CardRefIdentity, CardRef>,
+) -> Result<CardRef, WyrdError> {
+    sibling
+        .identity_key()
+        .and_then(|identity| siblings.get(&identity))
+        .filter(|card_ref| card_ref.uid.is_some())
+        .cloned()
+        .ok_or_else(|| unsubmitted_sibling(sibling))
 }
 
 fn external_uid(card_ref: &CardRef, external: &ResolvedRefs) -> Option<CardUid> {
@@ -890,30 +917,31 @@ fn require_uid(card_ref: &CardRef) -> Result<(), WyrdError> {
     }
 }
 
-/// Collect exact submitted identities eligible for sibling references.
+/// Collect the graph identities of submissions eligible as sibling targets.
 ///
-/// Auto-versioned and scoped submissions cannot be sibling targets because a
-/// sibling reference carries an exact version before declaration resolves.
+/// Graph-ready submissions are all pinned, so every submission is eligible.
 fn sibling_identities(submissions: &[CardSubmission]) -> BTreeSet<CardRefIdentity> {
-    submissions
-        .iter()
-        .filter_map(|submission| {
-            submission.metadata.resolved_pin().cloned().map(|version| {
-                CardRef {
-                    kind: submission.kind.clone(),
-                    name: submission.metadata.name.clone(),
-                    version,
-                    uid: None,
-                }
-                .identity_key()
-            })
-        })
-        .collect()
+    submissions.iter().filter_map(submission_identity).collect()
 }
 
-/// Return the exact identity used for sibling matching and UID binding.
-fn sibling_key(card_ref: &CardRef) -> CardRefIdentity {
-    card_ref.identity_key()
+/// A pinned submission's exact identity key, or `None` when unpinned.
+fn submission_identity(submission: &CardSubmission) -> Option<CardRefIdentity> {
+    let version = submission.metadata.resolved_pin()?.clone();
+    Some(
+        CardRef {
+            kind: submission.kind.clone(),
+            name: submission.metadata.name.clone(),
+            version,
+            uid: None,
+        }
+        .identity_key(),
+    )
+}
+
+/// The exact identity of the Card a durable reference or graph-ready
+/// sibling names.
+fn target_identity(reference: &Ref) -> Option<CardRefIdentity> {
+    reference.target().and_then(|target| target.identity_key())
 }
 
 /// Format a reference for deterministic comparison and actionable errors.
@@ -1043,19 +1071,31 @@ mod tests {
         assert_eq!(refs, vec![expected]);
     }
 
+    /// A sibling is replaced by its target's complete registered reference:
+    /// the server-selected version and the UID, not the graph-only version.
+    ///
+    /// # Panics
+    /// Panics when binding fails or keeps the graph version.
     #[test]
-    fn bind_sibling_uid_without_json_shape_sniffing() {
-        let expected = prompt_ref("child");
-        let uid = CardUid::from_uuid(Uuid::now_v7()).expect("test_setup: UUIDv7 is valid");
-        let mut spec = sibling_service_spec(expected.clone());
-        let siblings = HashMap::from([(expected.identity_key(), uid.clone())]);
+    fn bind_sibling_replaces_graph_identity_with_registered_ref() {
+        let graph = CardRef {
+            version: VersionBlock::parse("0.0.0").expect("test_setup: version is valid"),
+            ..prompt_ref("child")
+        };
+        let registered = CardRef {
+            version: VersionBlock::parse("0.1.0").expect("test_setup: version is valid"),
+            uid: Some(CardUid::from_uuid(Uuid::now_v7()).expect("test_setup: UUIDv7 is valid")),
+            ..prompt_ref("child")
+        };
+        let mut spec = sibling_service_spec(graph.clone());
+        let siblings = HashMap::from([(graph.identity_key(), registered.clone())]);
 
         bind_card_references(&mut spec, &Vec::new(), &siblings)
             .expect("test_setup: binding succeeds");
 
         let mut refs = Vec::new();
         collect_card_refs(&spec, &mut refs);
-        assert_eq!(refs[0].uid, Some(uid));
+        assert_eq!(refs, vec![registered]);
     }
 
     #[test]
@@ -1081,6 +1121,10 @@ mod tests {
         let expected = prompt_ref("shared");
         let external_uid = CardUid::from_uuid(Uuid::now_v7()).expect("external UUIDv7 is valid");
         let sibling_uid = CardUid::from_uuid(Uuid::now_v7()).expect("sibling UUIDv7 is valid");
+        let sibling = CardRef {
+            uid: Some(sibling_uid.clone()),
+            ..expected.clone()
+        };
         let mut spec = Spec::from_kind_and_value(
             &CardKind::Service,
             serde_json::json!({
@@ -1095,7 +1139,7 @@ mod tests {
         bind_card_references(
             &mut spec,
             &vec![(expected.clone(), external_uid.clone())],
-            &HashMap::from([(expected.identity_key(), sibling_uid.clone())]),
+            &HashMap::from([(expected.identity_key(), sibling)]),
         )
         .expect("test_setup: mixed binding succeeds");
 

@@ -7,7 +7,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::hash::{Hash, Hasher};
 
 use crate::envelope::Spec;
-use crate::reference::{CardRef, CardRefIdentity};
+use crate::reference::{CardRef, CardRefIdentity, SiblingRef};
 use crate::refs::ReferenceSlotVisitor;
 use crate::registry::CardSubmission;
 use wyrd_semver::{VersionBlock, VersionSpec};
@@ -85,14 +85,20 @@ pub struct RootPick {
 /// Prepare submissions for the pure graph operations.
 ///
 /// Graph identity is `(kind, name, version)`. Auto and range version
-/// requests therefore receive a
-/// graph-only placeholder. The authored submissions are cloned and never
-/// mutated; registration keeps their original version selection.
+/// requests therefore receive a graph-only placeholder, and every sibling
+/// reference is rewritten to its target's graph identity using
+/// [`sibling_target`], so graph construction, composition, and declaration
+/// planning all match on exact identities. The authored submissions are
+/// cloned and never mutated; registration keeps their original version
+/// selection, and placeholders never become authored or persisted pins. A
+/// sibling with no submitted target is left unchanged for the registration
+/// boundary to refuse.
 ///
 /// # Errors
-/// Returns [`GraphError::Empty`] when there are no submissions, and
-/// [`GraphError::InvalidSpec`] if the fixed `0.0.0` placeholder cannot be
-/// built.
+/// Returns [`GraphError::Empty`] when there are no submissions,
+/// [`GraphError::AmbiguousSibling`] when a versionless sibling names several
+/// submissions, and [`GraphError::InvalidSpec`] when a spec cannot be decoded
+/// or the fixed `0.0.0` placeholder cannot be built.
 pub fn graph_ready_submissions(
     submissions: &[CardSubmission],
 ) -> Result<Vec<CardSubmission>, GraphError> {
@@ -103,6 +109,19 @@ pub fn graph_ready_submissions(
     let placeholder = VersionBlock::parse("0.0.0").map_err(|error| GraphError::InvalidSpec {
         message: format!("invalid graph placeholder: {error}"),
     })?;
+    let graph_refs = submissions
+        .iter()
+        .map(|submission| CardRef {
+            kind: submission.kind.clone(),
+            name: submission.metadata.name.clone(),
+            version: submission
+                .metadata
+                .resolved_pin()
+                .cloned()
+                .unwrap_or_else(|| placeholder.clone()),
+            uid: submission.metadata.uid.clone(),
+        })
+        .collect::<Vec<_>>();
     submissions
         .iter()
         .cloned()
@@ -115,15 +134,98 @@ pub fn graph_ready_submissions(
             {
                 submission.metadata.version = Some(VersionSpec::Pin(placeholder.clone()));
             }
+            pin_siblings(&mut submission, submissions, &graph_refs)?;
             Ok(submission)
         })
         .collect()
 }
 
+/// Rewrite every sibling in one submission to its target's graph identity.
+///
+/// # Errors
+/// Returns the decode and ambiguity errors of [`graph_ready_submissions`].
+fn pin_siblings(
+    submission: &mut CardSubmission,
+    submissions: &[CardSubmission],
+    graph_refs: &[CardRef],
+) -> Result<(), GraphError> {
+    let mut spec =
+        Spec::from_kind_and_value(&submission.kind, submission.spec.clone()).map_err(|error| {
+            GraphError::InvalidSpec {
+                message: error.to_string(),
+            }
+        })?;
+    let mut result = Ok(false);
+    ReferenceSlotVisitor::visit(&mut spec, |mut slot| {
+        let Ok(changed) = &mut result else {
+            return;
+        };
+        let Some(sibling) = slot.value.as_sibling().cloned() else {
+            return;
+        };
+        match sibling_target(&sibling, submissions) {
+            Ok(Some(index)) => {
+                slot.value.set_sibling(SiblingRef::from(&graph_refs[index]));
+                *changed = true;
+            }
+            Ok(None) => {}
+            Err(error) => result = Err(error),
+        }
+    });
+    if result? {
+        submission.spec = serde_json::to_value(&spec).map_err(|error| GraphError::InvalidSpec {
+            message: error.to_string(),
+        })?;
+    }
+    Ok(())
+}
+
+/// Find the submission a sibling reference names.
+///
+/// A sibling with a version names the submission pinned to exactly that
+/// version. A sibling without one names the sole submission with its kind and
+/// name, whatever that submission's version request; several such
+/// submissions make the link ambiguous rather than guessed. Returns `None`
+/// when no submission matches.
+///
+/// # Errors
+/// Returns [`GraphError::AmbiguousSibling`] when a versionless sibling
+/// matches more than one submission.
+pub fn sibling_target(
+    sibling: &SiblingRef,
+    submissions: &[CardSubmission],
+) -> Result<Option<usize>, GraphError> {
+    let candidates = submissions
+        .iter()
+        .enumerate()
+        .filter(|(_, submission)| {
+            submission.kind == sibling.kind
+                && submission.metadata.name == sibling.name
+                && sibling
+                    .version
+                    .as_ref()
+                    .is_none_or(|version| submission.metadata.resolved_pin() == Some(version))
+        })
+        .map(|(index, _)| index)
+        .collect::<Vec<_>>();
+    match candidates.as_slice() {
+        [] => Ok(None),
+        [index] => Ok(Some(*index)),
+        _ => Err(GraphError::AmbiguousSibling {
+            sibling: sibling.clone(),
+            candidates: candidates
+                .iter()
+                .filter_map(|index| submission_card_ref(&submissions[*index]))
+                .collect(),
+        }),
+    }
+}
+
 /// Build the submission graph from typed sibling references in each spec.
 ///
 /// A sibling reference becomes an edge only when its `(kind, name, version)`
-/// identity matches another submission in the same request. External references are
+/// identity matches another submission in the same request;
+/// [`graph_ready_submissions`] gives every matched sibling that version. External references are
 /// deliberately ignored, even when they happen to have the same identity as a
 /// submission; external resolution belongs to the server registry boundary.
 ///
@@ -169,10 +271,10 @@ pub fn build(submissions: &[CardSubmission]) -> Result<(Vec<Node>, Vec<Edge>), G
         let mut spec = spec;
         let mut references = Vec::new();
         ReferenceSlotVisitor::visit(&mut spec, |slot| {
-            references.extend(slot.value.as_sibling().cloned());
+            references.extend(slot.value.as_sibling().and_then(SiblingRef::identity_key));
         });
         for child in references {
-            let Some(target) = siblings.get(&identity_key(&child)) else {
+            let Some(target) = siblings.get(&child) else {
                 continue;
             };
             let edge_key = (identity_key(&parent.card_ref), identity_key(target));
@@ -342,6 +444,82 @@ mod tests {
             ready[0].metadata.resolved_pin().map(ToString::to_string),
             Some("0.0.0".to_owned())
         );
+    }
+
+    fn prompt_spec() -> serde_json::Value {
+        json!({"provider": "openai", "model": "gpt-4o", "messages": [{"role": "user", "content": "hello"}]})
+    }
+
+    /// A Service whose one component is a sibling with the given identity.
+    fn sibling_service(sibling: serde_json::Value) -> CardSubmission {
+        let mut service = submission(
+            &card_ref(CardKind::Service, "service"),
+            json!({"components": [{"alias": "child", "ref": {"sibling": sibling}}]}),
+        );
+        service.metadata.version = None;
+        service
+    }
+
+    /// A versionless sibling names the sole unversioned submission of its
+    /// kind and name and gains only a graph-only version; the authored
+    /// submissions keep their omitted versions.
+    ///
+    /// # Panics
+    /// Panics when the graph does not build with the expected edge.
+    #[test]
+    fn versionless_sibling_targets_sole_unversioned_submission() {
+        let mut child = submission(&card_ref(CardKind::Prompt, "prompt"), prompt_spec());
+        child.metadata.version = None;
+        let authored = [
+            sibling_service(json!({"kind": "Prompt", "name": "prompt"})),
+            child,
+        ];
+
+        let ready = graph_ready_submissions(&authored).expect("graph projection");
+        let (_, edges) = build(&ready).expect("graph builds");
+
+        assert_eq!(edges.len(), 1);
+        assert_eq!(edges[0].to.name.as_str(), "prompt");
+        assert!(authored.iter().all(|card| card.metadata.version.is_none()));
+        assert_eq!(
+            ready[0].spec["components"][0]["ref"]["sibling"]["version"],
+            json!("0.0.0")
+        );
+    }
+
+    /// An explicit sibling version selects among several submitted versions,
+    /// while a versionless sibling naming them is ambiguous and refused.
+    ///
+    /// # Panics
+    /// Panics when the explicit link does not select `2.0.0` or the
+    /// versionless link is accepted.
+    #[test]
+    fn sibling_versions_select_or_refuse_among_submitted_versions() {
+        let first = card_ref(CardKind::Prompt, "prompt");
+        let mut second = first.clone();
+        second.version = VersionBlock::parse("2.0.0").expect("test version is valid");
+        let versions = [
+            submission(&first, prompt_spec()),
+            submission(&second, prompt_spec()),
+        ];
+
+        let explicit = [
+            sibling_service(json!({"kind": "Prompt", "name": "prompt", "version": "2.0.0"})),
+            versions[0].clone(),
+            versions[1].clone(),
+        ];
+        let ready = graph_ready_submissions(&explicit).expect("explicit link resolves");
+        let (_, edges) = build(&ready).expect("graph builds");
+        assert_eq!(edges.len(), 1);
+        assert_eq!(edges[0].to, second);
+
+        let omitted = [
+            sibling_service(json!({"kind": "Prompt", "name": "prompt"})),
+            versions[0].clone(),
+            versions[1].clone(),
+        ];
+        let error = graph_ready_submissions(&omitted).expect_err("ambiguous link is refused");
+        assert!(matches!(error, super::GraphError::AmbiguousSibling { .. }));
     }
 
     /// Two submissions with the same identity are refused instead of merged.

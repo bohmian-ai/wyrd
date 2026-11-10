@@ -54,7 +54,15 @@ impl PromptResolver for LocalPromptResolver {
     fn resolve(&self, prompt_ref: &InlineableRef<PromptSpec>) -> Result<Prompt, WyrdError> {
         match prompt_ref {
             InlineableRef::Inline(prompt) => Ok(Prompt::from_native((**prompt).clone())),
-            InlineableRef::Ref(card_ref) | InlineableRef::Sibling { sibling: card_ref } => {
+            InlineableRef::Ref(_) | InlineableRef::Sibling { .. } => {
+                let Some(card_ref) = exact_prompt_ref(prompt_ref) else {
+                    return Err(WyrdError::RegistryUnresolvedDependency {
+                        message: "a versionless sibling Prompt resolves only during declaration"
+                            .to_owned(),
+                        details: serde_json::json!({"field": "prompt"}),
+                    });
+                };
+                let card_ref = &card_ref;
                 prompt_registry()
                     .read()
                     .map_err(|error| {
@@ -891,7 +899,16 @@ pub fn run_config_from_agent_run_config_spec(spec: &AgentRunConfigSpec) -> RunCo
 /// Derive `CardRef` cascade children from an Agent spec.
 #[must_use]
 pub fn derive_cascade_children(spec: &AgentSpec) -> Vec<CardRef> {
-    spec.prompt.as_card_ref().cloned().into_iter().collect()
+    exact_prompt_ref(&spec.prompt).into_iter().collect()
+}
+
+/// The exact Prompt reference a durable or versioned sibling slot names.
+fn exact_prompt_ref(prompt_ref: &InlineableRef<PromptSpec>) -> Option<CardRef> {
+    match prompt_ref {
+        InlineableRef::Ref(card_ref) => Some(card_ref.clone()),
+        InlineableRef::Sibling { sibling } => sibling.to_card_ref(),
+        InlineableRef::Inline(_) | InlineableRef::Path(_) => None,
+    }
 }
 
 fn resolve_prompt_ref(

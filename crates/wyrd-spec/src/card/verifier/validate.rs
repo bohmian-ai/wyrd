@@ -472,7 +472,7 @@ where
             }
             CodeSource::Artifact { card, .. }
                 if card
-                    .as_card_ref()
+                    .target()
                     .is_some_and(|card| card.kind != CardKind::Artifact) =>
             {
                 return Err(invalid(
@@ -515,7 +515,7 @@ where
     ) -> Result<(), WyrdError> {
         if call
             .agent
-            .as_card_ref()
+            .target()
             .is_some_and(|card| card.kind != CardKind::Agent)
         {
             return Err(invalid(
@@ -967,7 +967,7 @@ fn validate_workspace(
         };
         if artifact
             .card
-            .as_card_ref()
+            .target()
             .is_some_and(|card| card.kind != CardKind::Artifact)
         {
             return Err(invalid(

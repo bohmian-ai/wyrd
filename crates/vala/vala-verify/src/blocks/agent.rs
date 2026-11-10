@@ -209,17 +209,15 @@ impl AgentExecutor {
     /// the resolvers' errors.
     async fn resolve(&self, agent: &InlineableRef<AgentSpec>) -> Result<Resolved, BlockError> {
         let spec = match agent {
-            InlineableRef::Ref(card) | InlineableRef::Sibling { sibling: card } => {
-                self.agents.resolve(card).await?
-            }
+            InlineableRef::Ref(card) => self.agents.resolve(card).await?,
+            InlineableRef::Sibling { sibling } => return Err(unbound_sibling("Agent", sibling)),
             InlineableRef::Inline(spec) => (**spec).clone(),
             InlineableRef::Path(path) => return Err(unresolved_path("Agent", path)),
         };
         let prompt = match &spec.prompt {
             InlineableRef::Inline(prompt) => Prompt::from_native((**prompt).clone()),
-            InlineableRef::Ref(card) | InlineableRef::Sibling { sibling: card } => {
-                self.prompts.resolve(card).await?
-            }
+            InlineableRef::Ref(card) => self.prompts.resolve(card).await?,
+            InlineableRef::Sibling { sibling } => return Err(unbound_sibling("Prompt", sibling)),
             InlineableRef::Path(path) => return Err(unresolved_path("Prompt", path)),
         };
         Ok(Resolved {
@@ -599,6 +597,16 @@ fn unresolved_path(kind: &str, path: &std::path::Path) -> BlockError {
         reason: format!(
             "WYRD_REGISTRY_400_UNRESOLVED_PATH_REF: {kind} path `{}` must be resolved by the loader",
             path.display()
+        ),
+    }
+}
+
+/// The terminal refusal for a declaration-only sibling reaching execution,
+/// which runs only registered specs whose siblings declaration replaced.
+fn unbound_sibling(kind: &str, sibling: &wyrd_spec::reference::SiblingRef) -> BlockError {
+    BlockError::Terminal {
+        reason: format!(
+            "WYRD_REGISTRY_422_UNRESOLVED_DEPENDENCY: {kind} sibling {sibling} must be registered before execution"
         ),
     }
 }

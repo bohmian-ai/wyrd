@@ -428,6 +428,43 @@ mod tests {
         );
     }
 
+    /// A path to an unversioned Card loads as a versionless sibling, and
+    /// neither Card gains a version the author did not write.
+    ///
+    /// # Panics
+    /// Panics when the tree fails to load or the sibling carries a version.
+    #[test]
+    fn path_to_unversioned_card_becomes_versionless_sibling() {
+        let temp = TempDir::new().expect("temp directory creates");
+        std::fs::write(
+            temp.path().join("prompt.yaml"),
+            "apiVersion: wyrd/v1\nkind: Prompt\nmetadata:\n  name: prompt\nspec:\n  provider: openai\n  model: gpt-5\n  system: Be brief.\n",
+        )
+        .expect("prompt writes");
+        std::fs::write(
+            temp.path().join("service.yaml"),
+            "apiVersion: wyrd/v1\nkind: Service\nmetadata:\n  name: service\nspec:\n  service_type: api\n  components:\n    - alias: sibling\n      ref: prompt.yaml\n",
+        )
+        .expect("service writes");
+
+        let tree = load(&temp.path().join("service.yaml")).expect("unversioned tree loads");
+
+        assert!(
+            tree.cards
+                .iter()
+                .all(|card| card.submission.metadata.version.is_none())
+        );
+        let service = tree
+            .cards
+            .iter()
+            .find(|card| card.submission.metadata.name.as_str() == "service")
+            .expect("service is loaded");
+        assert_eq!(
+            service.submission.spec["components"][0]["ref"],
+            serde_json::json!({"sibling": {"kind": "Prompt", "name": "prompt"}})
+        );
+    }
+
     #[test]
     fn path_and_external_refs_keep_distinct_wire_projections() {
         let temp = TempDir::new().expect("temp directory creates");
@@ -464,6 +501,6 @@ mod tests {
         else {
             panic!("path ref becomes a sibling projection");
         };
-        assert!(external_ref.same_identity(sibling_ref));
+        assert!(sibling_ref.matches(external_ref));
     }
 }

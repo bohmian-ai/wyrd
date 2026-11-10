@@ -3,16 +3,16 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
-use wyrd_spec::reference::CardRef;
+use wyrd_spec::reference::SiblingRef;
 use wyrd_spec::refs::{ReferenceSlotVisitor, SlotValue};
 
 use super::error::Diagnostic;
-use super::parse::{AuthoredCard, card_ref_for, parse_file_with_sandbox};
+use super::parse::{AuthoredCard, parse_file_with_sandbox, sibling_for};
 use super::path::PathSandbox;
 
 /// Resolve all path references in the tree, rewriting them to sibling variants.
 ///
-/// Every `Ref::Path` becomes `Ref::Sibling { sibling: CardRef }` bound to a sibling
+/// Every `Ref::Path` becomes `Ref::Sibling { sibling: SiblingRef }` bound to a sibling
 /// submission. Path-loaded cards are appended to `cards` so transitive paths
 /// participate in validation and topological ordering.
 pub fn resolve_tree(
@@ -38,8 +38,8 @@ pub fn resolve_tree(
 /// Mutable state shared by every card visit in one resolution pass.
 struct ResolutionState {
     diagnostics: Vec<Diagnostic>,
-    path_cache: HashMap<PathBuf, CardRef>,
-    card_refs_by_path: HashMap<PathBuf, CardRef>,
+    path_cache: HashMap<PathBuf, SiblingRef>,
+    card_refs_by_path: HashMap<PathBuf, SiblingRef>,
     depth_by_path: HashMap<PathBuf, usize>,
 }
 
@@ -51,11 +51,7 @@ impl ResolutionState {
             path_cache: HashMap::new(),
             card_refs_by_path: cards
                 .iter()
-                .filter_map(|card| {
-                    card_ref_for(card)
-                        .ok()
-                        .map(|card_ref| (card.source_path.clone(), card_ref))
-                })
+                .map(|card| (card.source_path.clone(), sibling_for(card)))
                 .collect(),
             depth_by_path: cards
                 .iter()
@@ -135,8 +131,8 @@ fn merge_discovered_cards(
 
 struct PathResolver<'a> {
     sandbox: &'a PathSandbox,
-    known_cards: &'a mut HashMap<PathBuf, CardRef>,
-    path_cache: &'a mut HashMap<PathBuf, CardRef>,
+    known_cards: &'a mut HashMap<PathBuf, SiblingRef>,
+    path_cache: &'a mut HashMap<PathBuf, SiblingRef>,
     diagnostics: &'a mut Vec<Diagnostic>,
     config: &'a wyrd_config::WyrdConfig,
 }
@@ -153,7 +149,7 @@ impl PathResolver<'_> {
         ref_path: &Path,
         discovered: &mut Vec<AuthoredCard>,
         source_depth: usize,
-    ) -> Result<CardRef, Diagnostic> {
+    ) -> Result<SiblingRef, Diagnostic> {
         Self::check_depth(base_file, source_depth)?;
         let resolved_path = self.resolve_path(base_file, ref_path)?;
         if let Some(cached) = self.path_cache.get(&resolved_path) {
@@ -166,7 +162,7 @@ impl PathResolver<'_> {
 
         let mut loaded = self.load_single_card(base_file, ref_path, &resolved_path)?;
         super::config::apply_defaults(std::slice::from_mut(&mut loaded), self.config);
-        let card_ref = card_ref_for(&loaded)?;
+        let card_ref = sibling_for(&loaded);
         self.known_cards
             .insert(resolved_path.clone(), card_ref.clone());
         self.path_cache.insert(resolved_path, card_ref.clone());

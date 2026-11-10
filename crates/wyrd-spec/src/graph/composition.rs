@@ -1,6 +1,6 @@
 //! Service-root composition rules for composite Card submissions.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashSet};
 
 use super::{GraphError, RootPick, identity_key, submission_card_ref};
 use crate::card::agent::AgentSpec;
@@ -68,14 +68,14 @@ pub fn validate_composition(
                     ),
                 });
             }
-            let Some(component_ref) = component.card_ref.as_card_ref() else {
+            let Some(component_ref) = component.card_ref.target() else {
                 continue;
             };
             if is_peer_only_component(&component_ref.kind) {
                 return Err(GraphError::InvalidServiceComponentKind {
                     service: Box::new(service_ref),
                     alias: component.alias.clone(),
-                    component: Box::new(component_ref.clone()),
+                    component: Box::new(component_ref),
                     field: format!("spec.components[{index}].ref"),
                 });
             }
@@ -91,8 +91,8 @@ pub fn validate_composition(
         .flat_map(Spec::binding_sites)
         .filter(|site| !site.nested)
         .flat_map(|site| site.bindings)
-        .filter_map(|binding| binding.verifier.as_card_ref())
-        .map(identity_key)
+        .filter_map(|binding| binding.verifier.target())
+        .filter_map(|verifier| verifier.identity_key())
         .collect::<BTreeSet<_>>();
 
     for submission in submissions {
@@ -133,11 +133,11 @@ pub fn validate_composition(
 /// cannot repeat the same side effect by inlining it twice.
 #[must_use]
 pub fn binding_validation_errors(bindings: &[VerificationBinding], field: &str) -> Vec<WyrdError> {
-    let mut seen_verifiers = BTreeSet::new();
+    let mut seen_verifiers = HashSet::new();
     let mut errors = Vec::new();
     for (index, binding) in bindings.iter().enumerate() {
         let binding_field = format!("{field}[{index}]");
-        if let Some(verifier) = binding.verifier.as_card_ref() {
+        if let Some(verifier) = binding.verifier.target() {
             if verifier.kind != CardKind::Verifier {
                 errors.push(WyrdError::SpecInvalidVerifierRefKind {
                     message: format!(
@@ -152,7 +152,7 @@ pub fn binding_validation_errors(bindings: &[VerificationBinding], field: &str) 
                     }),
                 });
             }
-            if !seen_verifiers.insert(verifier.identity_key()) {
+            if !seen_verifiers.insert(verifier.clone()) {
                 errors.push(WyrdError::SpecDuplicateVerificationBinding {
                     message: format!("duplicate {field} Verifier {verifier}"),
                     details: serde_json::json!({ "field": binding_field, "verifier": verifier }),
@@ -175,7 +175,7 @@ fn check_runs_on(
     binding_field: &str,
     errors: &mut Vec<WyrdError>,
 ) {
-    let Some(trigger) = runs_on.as_card_ref() else {
+    let Some(trigger) = runs_on.target() else {
         return;
     };
     if trigger.kind != CardKind::Trigger {
@@ -201,7 +201,7 @@ fn check_operators(
     list_field: &str,
     errors: &mut Vec<WyrdError>,
 ) {
-    let mut seen_operators = BTreeSet::new();
+    let mut seen_operators = HashSet::new();
     // ponytail: inline specs have no total order, so equality is a linear scan
     // over one binding's Operator list. Key them if a list ever grows large.
     let mut seen_inline_operators: Vec<&OperatorSpec> = Vec::new();
@@ -226,7 +226,10 @@ fn check_operators(
                 }
                 seen_inline_operators.push(spec.as_ref());
             }
-            InlineableRef::Ref(card_ref) | InlineableRef::Sibling { sibling: card_ref } => {
+            InlineableRef::Ref(_) | InlineableRef::Sibling { .. } => {
+                let Some(card_ref) = operator.target() else {
+                    continue;
+                };
                 if card_ref.kind != CardKind::Operator {
                     errors.push(WyrdError::SpecInvalidBindingRefKind {
                         message: format!(
@@ -242,7 +245,7 @@ fn check_operators(
                     });
                     continue;
                 }
-                if !seen_operators.insert(card_ref.identity_key()) {
+                if !seen_operators.insert(card_ref.clone()) {
                     errors.push(WyrdError::SpecDuplicateBindingOperator {
                         message: format!("duplicate {list_field} Operator {card_ref}"),
                         details: serde_json::json!({

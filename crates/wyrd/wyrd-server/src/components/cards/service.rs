@@ -635,6 +635,9 @@ fn encode_list_cursor(cursor: &ListCursor) -> Result<String, WyrdError> {
 /// Deterministic request plan produced before the write transaction opens.
 struct DeclarationPlan {
     submissions: Vec<CardSubmission>,
+    /// The graph-ready projection of `submissions`, index for index; its
+    /// siblings name their targets' graph identities.
+    graph_submissions: Vec<CardSubmission>,
     request_hash: String,
     order: TopoOrder,
     root: RootPick,
@@ -673,12 +676,19 @@ pub async fn declare_card(
         } else {
             validate_request(&request)?;
             let tables = declared_tables(&request.submissions)?;
-            let (order, root) = plan_declaration_graph(&request.submissions)?;
-            let external_refs = resolve_external(state, caller, &request.submissions).await?;
+            let (order, root, graph_submissions) = plan_declaration_graph(&request.submissions)?;
+            let external_refs = resolve_external(state, caller, &graph_submissions).await?;
             for table in tables {
                 register_table(state, caller.clone(), table).await?;
             }
-            let plan = plan_declaration(request, request_hash, external_refs, order, root);
+            let plan = DeclarationPlan {
+                submissions: request.submissions,
+                graph_submissions,
+                request_hash,
+                order,
+                root,
+                external_refs,
+            };
             DeclarationWriter { state, caller }
                 .write(idempotency_key, plan)
                 .await?
@@ -1112,35 +1122,21 @@ async fn resolve_external(
 
 /// Validate composition and build graph order before any registry I/O.
 ///
+/// Returns the order, the root, and the graph-ready submissions, whose
+/// siblings name their targets' graph identities for preflight and binding.
+///
 /// # Errors
-/// Returns a stable Wyrd error when graph construction, root selection, or
-/// Service-root composition validation fails.
+/// Returns a stable Wyrd error when sibling matching, graph construction,
+/// root selection, or Service-root composition validation fails.
 fn plan_declaration_graph(
     submissions: &[CardSubmission],
-) -> Result<(TopoOrder, RootPick), WyrdError> {
+) -> Result<(TopoOrder, RootPick, Vec<CardSubmission>), WyrdError> {
     let graph_submissions = graph_ready_submissions(submissions).map_err(graph_error)?;
     let (nodes, edges) = build(&graph_submissions).map_err(graph_error)?;
     let order = topo_sort(&nodes, &edges).map_err(graph_error)?;
     let root = pick_root(&order).map_err(graph_error)?;
     validate_composition(&graph_submissions, &root).map_err(graph_error)?;
-    Ok((order, root))
-}
-
-/// Assemble the validated graph with resolved external dependencies.
-fn plan_declaration(
-    request: DeclareCardRequest,
-    request_hash: String,
-    external_refs: ResolvedRefs,
-    order: TopoOrder,
-    root: RootPick,
-) -> DeclarationPlan {
-    DeclarationPlan {
-        submissions: request.submissions,
-        request_hash,
-        order,
-        root,
-        external_refs,
-    }
+    Ok((order, root, graph_submissions))
 }
 
 /// Writes one planned declaration in a single tenant transaction.
@@ -1200,16 +1196,28 @@ impl DeclarationWriter<'_> {
                 .await;
         }
 
-        let mut sibling_uids = HashMap::new();
+        let mut registered = HashMap::new();
         let mut outcomes: Vec<CardDeclarationOutcome> = Vec::with_capacity(plan.order.nodes.len());
         let mut resolved_root = None;
         for node in &plan.order.nodes {
             let is_root = same_identity(&node.card_ref, &plan.root.root);
-            let authored = find_submission(&plan.submissions, &node.card_ref)?;
-            let mut submission = authored.clone();
-            let mut spec = Spec::from_kind_and_value(&submission.kind, submission.spec.clone())
-                .map_err(|error| WyrdError::registry_invalid_card_spec(error.to_string()))?;
-            bind_card_references(&mut spec, &plan.external_refs, &sibling_uids)?;
+            let node_identity = graph_identity(&node.card_ref);
+            let index = plan
+                .graph_submissions
+                .iter()
+                .position(|graph| {
+                    graph.kind == node.card_ref.kind
+                        && graph.metadata.name == node.card_ref.name
+                        && graph.metadata.resolved_pin() == Some(&node.card_ref.version)
+                })
+                .ok_or_else(|| WyrdError::internal("graph node lost its submission"))?;
+            let mut submission = plan.submissions[index].clone();
+            let mut spec = Spec::from_kind_and_value(
+                &submission.kind,
+                plan.graph_submissions[index].spec.clone(),
+            )
+            .map_err(|error| WyrdError::registry_invalid_card_spec(error.to_string()))?;
+            bind_card_references(&mut spec, &plan.external_refs, &registered)?;
             if let Spec::Agent(agent) = &mut spec
                 && let InlineableRef::Inline(prompt) = &agent.prompt
             {
@@ -1241,14 +1249,10 @@ impl DeclarationWriter<'_> {
                 &mut submission,
             )
             .await?;
-            sibling_uids.insert(
-                graph_identity(&outcome.card_ref),
-                outcome
-                    .card_ref
-                    .uid
-                    .clone()
-                    .ok_or_else(|| WyrdError::internal("registered outcome is missing uid"))?,
-            );
+            if outcome.card_ref.uid.is_none() {
+                return Err(WyrdError::internal("registered outcome is missing uid"));
+            }
+            registered.insert(node_identity, outcome.card_ref.clone());
             if is_root {
                 resolved_root = Some(outcome.card_ref.clone());
             }
@@ -1895,6 +1899,19 @@ fn graph_error(error: GraphError) -> WyrdError {
                 "root": root,
                 "peer": peer,
                 "binding_owner_kinds": ["Service", "Agent"],
+            }),
+        },
+        GraphError::AmbiguousSibling {
+            sibling,
+            candidates,
+        } => WyrdError::RegistryUnresolvedDependency {
+            message: format!(
+                "sibling card dependency {sibling} matches {} submissions; give it a version",
+                candidates.len()
+            ),
+            details: serde_json::json!({
+                "card_ref": sibling.to_string(),
+                "candidates": candidates,
             }),
         },
         GraphError::InvalidSpec { message } => WyrdError::registry_invalid_card_spec(message),

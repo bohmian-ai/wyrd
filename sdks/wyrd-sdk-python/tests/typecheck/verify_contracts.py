@@ -18,7 +18,7 @@ from wyrd.verify import Execution, VerificationResult
 if TYPE_CHECKING:
     from wyrd.cards import JsonValue
     from wyrd.verify import (
-        Check,
+        CheckWire,
         ExecutionState,
         InputDeclaration,
         RequirementResult,
@@ -108,7 +108,7 @@ def the_actual_status_shape_is_accepted() -> ExecutionState:
     }
 
 
-def every_check_kind_is_accepted() -> list[Check]:
+def every_check_kind_is_accepted() -> list[CheckWire]:
     return [
         {
             "kind": "assert",
@@ -165,13 +165,13 @@ def every_check_kind_is_accepted() -> list[Check]:
     ]
 
 
-def code_check_formats_are_optional(check: Check) -> object:
+def code_check_formats_are_optional(check: CheckWire) -> object:
     if check["kind"] == "code" and "response_format" in check:
         return check["response_format"]
     return None
 
 
-def checks_narrow_on_kind(check: Check) -> str:
+def checks_narrow_on_kind(check: CheckWire) -> str:
     if check["kind"] == "trace":
         return check["span_selector"]
     if check["kind"] == "code":
@@ -199,17 +199,17 @@ def unknown_fixed_keys_and_values_are_rejected() -> tuple[object, ...]:
         "attempts": "1",  # ty: ignore[invalid-argument-type]
         "duration_ms": 1,
     }
-    unknown_kind: Check = {  # ty: ignore[invalid-assignment]
+    unknown_kind: CheckWire = {  # ty: ignore[invalid-assignment]
         "kind": "judge",
         "agent": "./judge.yaml",
     }
-    foreign_key: Check = {  # ty: ignore[invalid-assignment]
+    foreign_key: CheckWire = {  # ty: ignore[invalid-assignment]
         "kind": "code",
         "source": {"inline": "x"},
         "entrypoint": "check",
         "agent": "./judge.yaml",
     }
-    wrong_type: Check = {  # ty: ignore[invalid-assignment]
+    wrong_type: CheckWire = {  # ty: ignore[invalid-assignment]
         "kind": "trace",
         "on": "inputs.trace",
         "span_selector": 0,

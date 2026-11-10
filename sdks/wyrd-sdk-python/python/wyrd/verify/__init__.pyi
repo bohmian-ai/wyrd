@@ -3326,91 +3326,167 @@ class ComparisonOperator:
 
     @staticmethod
     def in_range(min: float, max: float, inclusive: bool) -> ComparisonOperator:
-        """The ``in_range`` operator with its fields."""
+        """The ``in_range`` operator with its fields.
+
+        Args:
+            min: The lower bound.
+            max: The upper bound.
+            inclusive: Whether the bounds are included.
+        """
         ...
 
     @staticmethod
     def not_in_range(min: float, max: float, inclusive: bool) -> ComparisonOperator:
-        """The ``not_in_range`` operator with its fields."""
+        """The ``not_in_range`` operator with its fields.
+
+        Args:
+            min: The lower bound.
+            max: The upper bound.
+            inclusive: Whether the bounds are included.
+        """
         ...
 
     @staticmethod
     def approximately_equals(tolerance: float) -> ComparisonOperator:
-        """The ``approximately_equals`` operator with its fields."""
+        """The ``approximately_equals`` operator with its fields.
+
+        Args:
+            tolerance: The allowed difference.
+        """
         ...
 
     @staticmethod
     def matches_regex(pattern: str) -> ComparisonOperator:
-        """The ``matches_regex`` operator with its fields."""
+        """The ``matches_regex`` operator with its fields.
+
+        Args:
+            pattern: The regular expression.
+        """
         ...
 
     @staticmethod
     def not_matches_regex(pattern: str) -> ComparisonOperator:
-        """The ``not_matches_regex`` operator with its fields."""
+        """The ``not_matches_regex`` operator with its fields.
+
+        Args:
+            pattern: The regular expression.
+        """
         ...
 
     @staticmethod
     def has_min_length(min: int) -> ComparisonOperator:
-        """The ``has_min_length`` operator with its fields."""
+        """The ``has_min_length`` operator with its fields.
+
+        Args:
+            min: The minimum length.
+        """
         ...
 
     @staticmethod
     def has_max_length(max: int) -> ComparisonOperator:
-        """The ``has_max_length`` operator with its fields."""
+        """The ``has_max_length`` operator with its fields.
+
+        Args:
+            max: The maximum length.
+        """
         ...
 
     @staticmethod
     def length(expected: int) -> ComparisonOperator:
-        """The ``length`` operator with its fields."""
+        """The ``length`` operator with its fields.
+
+        Args:
+            expected: The exact length.
+        """
         ...
 
     @staticmethod
     def length_greater_than(min: int) -> ComparisonOperator:
-        """The ``length_greater_than`` operator with its fields."""
+        """The ``length_greater_than`` operator with its fields.
+
+        Args:
+            min: The length the value must exceed.
+        """
         ...
 
     @staticmethod
     def length_less_than(max: int) -> ComparisonOperator:
-        """The ``length_less_than`` operator with its fields."""
+        """The ``length_less_than`` operator with its fields.
+
+        Args:
+            max: The length the value must stay under.
+        """
         ...
 
     @staticmethod
     def within_abs_tolerance(tolerance: float) -> ComparisonOperator:
-        """The ``within_abs_tolerance`` operator with its fields."""
+        """The ``within_abs_tolerance`` operator with its fields.
+
+        Args:
+            tolerance: The allowed difference.
+        """
         ...
 
     @staticmethod
     def within_pct_tolerance(pct: float) -> ComparisonOperator:
-        """The ``within_pct_tolerance`` operator with its fields."""
+        """The ``within_pct_tolerance`` operator with its fields.
+
+        Args:
+            pct: The allowed difference, in percent.
+        """
         ...
 
     @staticmethod
     def within_std_dev(sigma: float, mean: float, std_dev: float) -> ComparisonOperator:
-        """The ``within_std_dev`` operator with its fields."""
+        """The ``within_std_dev`` operator with its fields.
+
+        Args:
+            sigma: The allowed number of standard deviations.
+            mean: The reference mean.
+            std_dev: The reference standard deviation.
+        """
         ...
 
     @staticmethod
     def between_percentiles(lower_pct: float, upper_pct: float) -> ComparisonOperator:
-        """The ``between_percentiles`` operator with its fields."""
+        """The ``between_percentiles`` operator with its fields.
+
+        Args:
+            lower_pct: The lower percentile.
+            upper_pct: The upper percentile.
+        """
         ...
 
     @staticmethod
     def cosine_similarity_at_least(threshold: float) -> ComparisonOperator:
-        """The ``cosine_similarity_at_least`` operator with its fields."""
+        """The ``cosine_similarity_at_least`` operator with its fields.
+
+        Args:
+            threshold: The minimum cosine similarity.
+        """
         ...
 
     @staticmethod
     def is_type(
         expected: Literal["null", "bool", "number", "string", "array", "object"],
     ) -> ComparisonOperator:
-        """The ``is_type`` operator with its fields."""
+        """The ``is_type`` operator with its fields.
+
+        Args:
+            expected: The JSON type the value must have.
+        """
         ...
 
     @staticmethod
     def divergence_less_than(
         metric: Literal["kl", "js", "wasserstein"], threshold: float
     ) -> ComparisonOperator:
-        """The ``divergence_less_than`` operator with its fields."""
+        """The ``divergence_less_than`` operator with its fields.
+
+        Args:
+            metric: The divergence metric.
+            threshold: The divergence the value must stay under.
+        """
         ...
 
 class ExecutionRoute:
@@ -3422,6 +3498,9 @@ class ExecutionRoute:
     @staticmethod
     def wyrd_gateway(deployment: str) -> ExecutionRoute:
         """The tenant's Wyrd gateway deployment named ``deployment``.
+
+        Args:
+            deployment: The gateway deployment name.
 
         Raises:
             WyrdError: ``WYRD_SPEC_400_VALIDATION`` for an invalid deployment name.
@@ -3439,7 +3518,16 @@ class AgentRunConfig:
         tool_concurrency_cap: int | None = None,
         session_recent_limit: int | None = None,
         timeout_ms: int | None = None,
-    ) -> None: ...
+    ) -> None:
+        """Set the run limits to apply; omitted ones keep the runtime's defaults.
+
+        Args:
+            max_iterations: The most model turns in one run.
+            tool_concurrency_cap: The most tool calls running at once.
+            session_recent_limit: The most recent session messages carried into a run.
+            timeout_ms: The run's time limit, in milliseconds.
+        """
+        ...
 
 OperatorInput: TypeAlias = ComparisonOperator | str | Mapping[str, JsonInput]
 """A comparison operator, or its canonical wire form."""

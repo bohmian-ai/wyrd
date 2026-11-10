@@ -16,6 +16,7 @@ import io
 import json
 import runpy
 import shutil
+import sys
 from collections.abc import Iterator
 from pathlib import Path
 from typing import Any
@@ -35,14 +36,23 @@ from wyrd.verify import (
     AgentRunConfig,
     Artifact,
     ArtifactFile,
+    Audit,
+    Binding,
     CardRef,
     Check,
     CodeSource,
     Component,
+    Data,
     ExecutionRoute,
+    Experiment,
+    InputSlot,
+    Mcp,
+    Model,
+    Operator,
     Requirement,
     Service,
     Step,
+    Trigger,
     VerificationResult,
     Verifier,
 )
@@ -56,7 +66,12 @@ pytestmark = pytest.mark.integration
 EXAMPLE = FIXTURES.parent / "examples/finance-release"
 """The finance release example, run from an empty directory as a reader runs it."""
 
+SERVICE_EXAMPLE = EXAMPLE / "service"
+"""The finance release split into component modules, composed by its ``main.py``."""
+
 STORY = FIXTURES / "cards/card_authoring"
+OMITTED = STORY / "omitted"
+"""A Service graph whose files name no version."""
 POLICY = STORY / "company-sharing-policy.pdf"
 POLICY_FILE = "extracted/company-sharing-policy.pdf.json"
 """The extracted policy file every report judge mounts."""
@@ -428,7 +443,7 @@ def code(raised: pytest.ExceptionInfo[WyrdError]) -> str:
 
 
 def test_multi_component_service_verifies_each_subject(
-    wyrd_server: WyrdTestServer, cards: Cards, receiver: Receiver
+    wyrd_server: WyrdTestServer, cards: Cards, receiver: Receiver, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """Each authored component is verified under its own subject by its own two-step Verifier.
 
@@ -559,6 +574,316 @@ def test_multi_component_service_verifies_each_subject(
             assert access.verdict == verdict
     finally:
         summarized.shutdown()
+
+    verify_modular_service(monkeypatch)
+
+
+def verify_modular_service(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The modular finance Service runs as its reader runs it, and each component verifies alone.
+
+    ``main.py`` declares the imported definitions and passes both
+    components. Declaring the same definitions again reuses their versions;
+    each component's Verifier then runs its two assertions and its judge
+    under that component's subject, refuses the other component's Verifier,
+    and fails a report carrying an unfinished marker.
+    """
+    monkeypatch.syspath_prepend(str(SERVICE_EXAMPLE))
+    monkeypatch.setattr(sys, "modules", dict(sys.modules))
+    printed = io.StringIO()
+    with contextlib.redirect_stdout(printed):
+        example = runpy.run_path(str(SERVICE_EXAMPLE / "main.py"), run_name="__main__")
+    assert printed.getvalue() == "Report quality: passed\nRelease controls: passed\n"
+
+    state = WyrdState.declare(
+        Service(
+            "finance-release",
+            components=[
+                Component(
+                    "report-writer",
+                    example["report_writer"],
+                    verified_by=[example["report_quality"]],
+                ),
+                Component(
+                    "release-reviewer",
+                    example["release_reviewer"],
+                    verified_by=[example["release_controls"]],
+                ),
+            ],
+        )
+    )
+    try:
+        report = example["Report"](
+            text="Quarterly revenue was $120.", source="Current-quarter revenue: $120."
+        )
+        release = example["Release"](
+            report=report.text,
+            recipient_authorized=True,
+            destination_private=True,
+            purpose="Provide the quarterly revenue report to the appointed financial auditor.",
+        )
+        for alias, verifier, evidence, requirements, other in (
+            (
+                "report-writer",
+                "report-quality",
+                {"report": report},
+                ["no-bank-account", "no-unfinished-text", "matches-source"],
+                "release-controls",
+            ),
+            (
+                "release-reviewer",
+                "release-controls",
+                {"release": release},
+                ["authorized-recipient", "private-destination", "appropriate-purpose"],
+                "report-quality",
+            ),
+        ):
+            with state.run(alias) as run:
+                result = run.observe.verify(verifier, **evidence)
+                with pytest.raises(WyrdError) as unbound:
+                    run.observe.verify(other, **evidence)
+            assert result.subject == state.card_ref(alias), result.subject
+            assert [(each["id"], each["outcome"]) for each in result.requirements] == [
+                (id, "passed") for id in requirements
+            ], result.requirements
+            assert code(unbound) == "WYRD_SDK_404_UNKNOWN_VERIFIER"
+        with state.run("report-writer") as run:
+            unfinished = run.observe.verify(
+                "report-quality", report=report.model_copy(update={"text": "TODO: totals."})
+            )
+        assert unfinished.verdict == "failed"
+        assert outcome(unfinished, "no-unfinished-text") == "failed", unfinished.requirements
+    finally:
+        state.shutdown()
+
+
+def draft_judge(version: str | None, asks: str) -> Agent:
+    """``draft-judge`` at ``version`` asking ``asks``, as ``omitted/draft-judge.yaml`` declares it."""
+    return Agent(
+        "draft-judge",
+        version,
+        execution_route=ExecutionRoute.wyrd_gateway(deployment="openai"),
+        prompt={
+            "provider": "openai",
+            "model": "gpt-4o",
+            "messages": [{"role": "user", "content": asks}],
+            "response_format": "verdict",
+        },
+    )
+
+
+def draft_writer(version: str | None, asks: str) -> Agent:
+    """``draft-writer`` at ``version`` asking ``asks``, as ``omitted/draft-writer.yaml`` declares it."""
+    return Agent(
+        "draft-writer",
+        version,
+        execution_route=ExecutionRoute.wyrd_gateway(deployment="openai"),
+        prompt={
+            "provider": "openai",
+            "model": "gpt-4o",
+            "messages": [{"role": "user", "content": asks}],
+        },
+    )
+
+
+def drafting(judge: Agent) -> Service:
+    """``drafting`` without a version, as ``omitted/drafting.yaml`` declares it, judged by ``judge``."""
+    checks = Verifier(
+        "draft-checks",
+        inputs={
+            "draft": {
+                "type": "object",
+                "required": ["text"],
+                "properties": {"text": {"type": "string"}},
+            }
+        },
+        requirements=[
+            Requirement(
+                "has-text",
+                "The draft has text.",
+                Check.assert_("inputs.draft.text", "is_non_empty", None),
+            ),
+            Requirement(
+                "judged",
+                "A judge accepts the draft.",
+                Check.agent(judge, inputs={"draft": "inputs.draft"}),
+            ),
+        ],
+    )
+    writer = draft_writer(None, "Draft release notes for {{change}}.")
+    return Service(
+        "drafting",
+        service_type="api",
+        components=[Component("writer", writer, verified_by=[checks])],
+    )
+
+
+def declared(receipt: DeclarationReceipt, name: str) -> dict[str, Any]:
+    """The registered reference ``receipt`` resolved for ``name``."""
+    [reference] = [each.card_ref for each in receipt.outcomes if each.card_ref.name == name]
+    return reference.to_dict()
+
+
+def persisted(cards: Cards, receipt: DeclarationReceipt, name: str) -> dict[str, Any]:
+    """The persisted spec of the Card ``receipt`` resolved for ``name``."""
+    reference = declared(receipt, name)
+    return cards.get(RegisteredRef(reference["kind"], reference["name"], reference["version"])).spec
+
+
+def assert_bound(cards: Cards, receipt: DeclarationReceipt) -> None:
+    """Every link of the ``drafting`` graph is its target's full registered reference."""
+    for name in ("drafting", "draft-writer", "draft-checks", "draft-judge"):
+        reference = declared(receipt, name)
+        assert reference["version"] and reference["uid"], reference
+    component = persisted(cards, receipt, "drafting")["components"][0]
+    assert component["ref"] == declared(receipt, "draft-writer")
+    assert component["verified_by"][0]["verifier"] == declared(receipt, "draft-checks")
+    checks = persisted(cards, receipt, "draft-checks")
+    assert checks["requirements"][1]["check"]["agent"] == declared(receipt, "draft-judge")
+
+
+def test_omitted_versions_resolve_in_composed_definitions(cards: Cards) -> None:
+    """A graph naming no version declares the same through its YAML path and its definitions.
+
+    The server selects every version and binds each component, bound
+    Verifier, and transitive judge to its full registered reference; a rerun
+    reuses them. A judge changed under an explicit version beside omitted
+    parents gives them new versions; two explicit versions of one Agent are
+    distinct targets; an omitted link naming two submissions is refused.
+    """
+    files = cards.declare_from_path(OMITTED / "drafting.yaml")
+    assert_bound(cards, files)
+    authored = drafting(draft_judge(None, "Judge the draft {{draft}}."))
+    assert resolved(cards.declare(authored)) == resolved(files), "same identities and content"
+    assert resolved(cards.declare(authored)) == resolved(files), "a rerun reuses them"
+
+    changed = cards.declare(drafting(draft_judge("2.0.0", "Judge the draft {{draft}} strictly.")))
+    assert_bound(cards, changed)
+    assert declared(changed, "draft-judge")["version"] == "2.0.0"
+    assert declared(changed, "draft-writer") == declared(files, "draft-writer")
+    for parent in ("draft-checks", "drafting"):
+        assert declared(changed, parent)["version"] != declared(files, parent)["version"], parent
+
+    def pair(second: str | None) -> Service:
+        return Service(
+            "draft-pair",
+            components=[
+                Component("first", draft_writer("3.0.0", "First {{change}}.")),
+                Component("second", draft_writer(second, "Second {{change}}.")),
+            ],
+        )
+
+    both = persisted(cards, cards.declare(pair("4.0.0")), "draft-pair")
+    assert [each["ref"]["version"] for each in both["components"]] == ["3.0.0", "4.0.0"]
+    with pytest.raises(WyrdError) as ambiguous:
+        cards.declare(pair(None))
+    assert code(ambiguous) == "WYRD_LOADER_400_INVALID_ENVELOPE"
+    [diagnostic] = ambiguous.value.details["diagnostics"]
+    assert diagnostic["code"] == "WYRD_REGISTRY_422_UNRESOLVED_DEPENDENCY", diagnostic
+
+
+def wire_kinds(receipt: DeclarationReceipt) -> set[str]:
+    """The wire names of the kinds ``receipt`` declared."""
+    return {str(each.card_ref.to_dict()["kind"]) for each in receipt.outcomes}
+
+
+def test_definitions_register_all_kinds(cards: Cards) -> None:
+    """Definitions of every Card kind register through ``Cards.declare``.
+
+    The spec-only kinds declare alone; a Service's Agent holds an inline
+    original Prompt, registered as a Prompt Card the Agent references
+    exactly, and binds a Verifier run by a Trigger that pages an Operator.
+    """
+    model = cards.declare(
+        Model(
+            "authored-model",
+            interface={
+                "kind": "Custom",
+                "meta": {
+                    "framework_version": "0.1.0",
+                    "loader_module": "assistant",
+                    "loader_class": "LatencyModel",
+                    "extra": {},
+                },
+            },
+            task_type="Other",
+            signature={
+                "inputs": [{"name": "latency", "dtype": "float64"}],
+                "outputs": [{"name": "score", "dtype": "float64"}],
+            },
+        )
+    )
+    kinds = wire_kinds(model)
+    for definition in (
+        Data(
+            "authored-data",
+            interface={"kind": "Parquet", "meta": {"compression": "Snappy"}},
+            schema={"columns": [{"name": "latency", "dtype": "float64"}]},
+            stats={
+                "row_count": 1,
+                "col_count": 1,
+                "byte_count": 1,
+                "sha256": "c4f7700b380aff2662e88d034154d1890c33d3c12c8dda1a0ca9481f43bb9906",
+            },
+        ),
+        Experiment("authored-experiment", experiment_type="ab").add_target_ref(
+            CardRef.model(model.root.name, model.root.version)
+        ),
+        Mcp("authored-mcp", server_name="files", transport="stdio"),
+        Audit("authored-audit", description="Quarterly review"),
+        Artifact("authored-artifact", artifact_kind="document", content_type="application/pdf"),
+    ):
+        kinds |= wire_kinds(cards.declare(definition))
+
+    checks = Verifier(
+        "authored-checks",
+        inputs={"latency": InputSlot.samples(["latency"])},
+        requirements=[
+            Requirement(
+                "within-budget",
+                "Mean latency stays at or below 100 ms.",
+                Check.drift(
+                    "inputs.latency",
+                    {
+                        "method": "Custom",
+                        "signal": {"kind": "Metric", "name": "latency"},
+                        "condition": {"kind": "Statistical"},
+                        "profile": {
+                            "kind": "Custom",
+                            "metric_name": "latency",
+                            "baseline_value": 0.0,
+                            "alert_threshold": 100.0,
+                        },
+                    },
+                ),
+            )
+        ],
+    )
+    binding = Binding(
+        checks, runs_on=Trigger("authored-trigger", kind="schedule", cron="0 0 * * *")
+    )
+    binding.add_on_failure(
+        Operator(
+            "authored-operator",
+            action={"kind": "http", "method": "post", "url": "https://hooks.example.com/release"},
+        )
+    )
+    writer = Agent(
+        "authored-agent",
+        prompt=Prompt.openai_chat("gpt-4o", messages="Draft release notes for {{change}}."),
+        execution_route=ExecutionRoute.wyrd_gateway(deployment="openai"),
+    )
+    receipt = cards.declare(
+        Service(
+            "authored-service",
+            service_type="api",
+            components=[Component("writer", writer, verified_by=[binding])],
+        )
+    )
+    kinds |= wire_kinds(receipt)
+    [prompt] = [each.card_ref for each in receipt.outcomes if each.card_ref.kind == CardKind.Prompt]
+    assert persisted(cards, receipt, "authored-agent")["prompt"] == prompt.to_dict()
+    every = {"Data", "Model", "Artifact", "Experiment", "Prompt", "Agent", "Mcp", "Service"}
+    assert kinds == every | {"Audit", "Verifier", "Trigger", "Operator"}
 
 
 def test_local_artifacts_and_declaration_parity(

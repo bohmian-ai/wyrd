@@ -334,7 +334,8 @@ def test_every_native_family_constructs_canonical_specs() -> None:
         (judge(), "Agent"),
     ]
     for card, kind in singles:
-        assert card.card_ref().kind == getattr(CardKind, kind)
+        reference = card.card_ref()
+        assert reference is not None and reference.kind == getattr(CardKind, kind)
         card.validate()
     assert singles[3][0].spec() == {
         "server_name": "files",

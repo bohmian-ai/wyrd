@@ -292,6 +292,7 @@ async fn callback(
           unavailable (WYRD_GITHUB_503_NOT_CONFIGURED, \
           WYRD_REGISTRY_503_REGISTRY_UNAVAILABLE)", body = WyrdProblem)
     ),
+    security(()),
     tag = "GitHub"
 )]
 #[tracing::instrument(

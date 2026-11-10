@@ -1,7 +1,7 @@
 ---
 id: TASK-006
 status: proposed
-approved_spec_revision: 3
+approved_spec_revision: 4
 requirements: [REQ-004, REQ-005, REQ-015, REQ-016]
 acceptance: [AC-003, AC-011]
 invariants: [INV-001, INV-002, INV-003, INV-004, INV-005, INV-006, INV-007]

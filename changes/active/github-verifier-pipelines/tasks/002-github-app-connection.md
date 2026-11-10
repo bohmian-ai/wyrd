@@ -1,7 +1,7 @@
 ---
 id: TASK-002
 status: proposed
-approved_spec_revision: 3
+approved_spec_revision: 4
 requirements: [REQ-001, REQ-016]
 acceptance: [AC-001, AC-011]
 invariants: [INV-001, INV-003, INV-006, INV-007]
@@ -22,10 +22,35 @@ webhook secret, OAuth client credentials and exact public URLs through existing
 server configuration/secret providers. Tenant callers supply normal authenticated
 connection requests and verified repository selections, never keys or arbitrary
 hosts. Existing `server/src/config.rs`, `server/src/auth/{browser,callback}.rs`
-and SQL `queries/auth/{login_state,human_connections}.rs` own configuration,
-browser-bound authorization transaction and connection lifecycles. Extend these
-complete protocols and existing control storage for the integration; Operator
-credentials are not GitHub installation association.
+and SQL `queries/auth/login_state.rs` own configuration and browser-bound
+one-use authorization transactions. Reuse those protocols with explicit GitHub/
+OIDC flow separation. Dedicated installation queries in `wyrd-sql` own the only
+new table, `wyrd.github_installations`, under REQ-001. Operator credentials are
+not GitHub installation association.
+
+`wyrd-sql` owns one dedicated `wyrd.github_installations` table for tenant identity
+(`data_tenant_id`), configured host, verified installation ID, selected accessible
+repositories, suspension and revision, with connection identity and safe timestamps
+as needed. Postgres enforces one associated installation per tenant and unique
+`(host, installation_id)` across tenants, including concurrent claims. Suspension
+retains ownership. Enable and force standard tenant RLS. Keep
+`auth_human_connections`, its OIDC constraints and queries unchanged. An
+installation grants repository access, while that table defines tenant OIDC login
+trust; sharing it would require nullable OIDC fields and provider filtering in
+security-sensitive login queries. The dedicated table avoids that coupling. Reuse
+`auth_login_state` for temporary actor/tenant/browser-bound connection transactions
+with explicit flow separation: neither callback may consume the other's state,
+and stale callbacks cannot restore a disconnected or replaced connection. One
+narrow SECURITY DEFINER installation-to-tenant lookup routes verified webhooks,
+with pinned search_path and body-scoped operator elevation; subsequent work uses
+TenantConn and normal authorization. Routing grants no permission. Store no App
+keys or user/installation tokens in these rows. Private columns and generation
+mechanics remain implementation-owned.
+
+Discard the abandoned shared-table migration approach. The uncommitted draft
+`20261110000000_github_app_connections.sql` was removed for revision 4;
+implement the dedicated-table and login-state migration afresh. Applied
+migrations remain immutable.
 
 Implement the single `/v1/integrations/github` connect/read/disconnect flow from
 the contracts. Start a one-use actor/tenant/browser-bound transaction with the
@@ -74,8 +99,10 @@ writes. Update operator and tenant setup/diagnosis guides here, with no UI.
 **AC-001:** A real server journey starts both entry paths against a local GitHub
 protocol mock, finishes verified selection, reads the public connection and then
 disconnects. Assert spoofed installation IDs, consumed/foreign transactions,
-foreign tenant, duplicate association and missing/invalid config fail safely;
-keys/tokens never appear in view. Remove one repository/suspend/disconnect and
+foreign tenant, concurrent claims in both directions, cross-flow state, stale
+callbacks after reconnect and missing/invalid config fail safely;
+keys/tokens never appear in view. Prove forced RLS, unchanged OIDC login and
+suspension retaining ownership. Remove one repository/suspend/disconnect and
 observe only affected existing queued work fenced, association released in the
 right order and no Cards/bindings created. Task 006 extends this journey to
 actual PR work; do not substitute a fabricated connection there.
@@ -91,7 +118,8 @@ conditional association/revocation in SQL's `integration` target via
 `mise run test:sql`; tier 3: protocol/signature/config branches in their owners.
 Use local provider mocks, real Postgres and WyrdTestServer; no live App keys.
 Record new focused commands once tests exist. Run applicable checks from README,
-including tenant isolation and OpenAPI; no new PostgreSQL table or UI.
+including tenant isolation and OpenAPI; only `wyrd.github_installations` is a new
+PostgreSQL table; no UI.
 
 ## Obligations
 
@@ -128,4 +156,4 @@ including tenant isolation and OpenAPI; no new PostgreSQL table or UI.
 | O29 | "Ship typed HTTP, shared Rust client and thin Rust/Python/TypeScript SDK, CLI and MCP projections ... safe errors, discoverable reads and scoped writes" | Each surface reads/connects/disconnects; MCP read tool listed for readers, write tools only for writers | per-surface journeys |
 | O30 | "Update operator and tenant setup/diagnosis guides here, with no UI"; AC-011 | Guide commands match served CLI/SDK operations | docs:check + CLI journey runs guide commands |
 | O31 | Tier 2 "conditional association/revocation in SQL's integration target" | Association conditional on bound slot; uniqueness; release | `pg_github_connections` tests |
-| O32 | "Run applicable checks ... including tenant isolation and OpenAPI; no new PostgreSQL table or UI" | Checks pass; migration adds only columns | command output; migration has no `CREATE TABLE` |
+| O32 | REQ-001 / INV-007 dedicated storage and unchanged OIDC trust | Only wyrd.github_installations is added; forced RLS and bidirectional uniqueness hold; flow-separated state refuses stale callbacks; OIDC trust shape/login behavior stay intact | Migration/source inspection; real Postgres races and isolation; callback negative journeys and existing OIDC regression coverage |

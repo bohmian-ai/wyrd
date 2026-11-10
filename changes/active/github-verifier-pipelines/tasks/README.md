@@ -1,15 +1,16 @@
 # GitHub Verifier pipeline tasks
 
-These nine tasks derive from **approved spec revision 3 and contracts**, approved
+These nine tasks derive from **approved spec revision 4 and contracts**, approved
 by the user on 2026-11-10. They apply the current repository `wyrd-plan` skill.
-The design index's older exploring/draft handoff is historical; later approved
-records, spec/contracts and explicit user corrections govern. All task statuses
+Revision 4 applies the approved installation storage amendment; other task
+behavior is unchanged. All task statuses
 are proposed. This packet does not approve implementation or claim runtime proof.
 
 The selected path is existing connect/authorization→Card declaration saga→Scribe
 and SubmissionSink admission→fair verification queue→same engine and canonical
 Bifrost checkpoints→independent provider delivery. Extend complete existing
-workflows. No new PostgreSQL tables, queue, event bus, general wait framework,
+workflows. Only task 002 may add `wyrd.github_installations`; no other new
+PostgreSQL tables, queue, event bus, general wait framework,
 result mirror, UI, private enterprise path or source modification is authorized.
 Wyrd owns App keys/signing/callbacks/tenancy; the independent library owns generic
 acquisition/comparison/index/context and remains standalone.
@@ -64,7 +65,7 @@ listed in task metadata; their strongest crash/authority proof is identified her
 | INV-002–004 | 003 readiness selection; 006 canonical input ACK→queue commit; 007/008 evidence/decision/pending ACK→continuation recovery; 009 retained progress→owed provider delivery |
 | INV-005 | 005 frozen source/baseline/context and 007/008 same-execution accepted state/budget/deadline recovery |
 | INV-006 | 006 source generation and cancellation fence→007/008 no stale release→009 no obsolete current delivery |
-| INV-007 | All nine reuse the specified owners; 002 redacts secrets, 003 keeps keys out of Cards/TOML, 004 preserves library independence |
+| INV-007 | All nine reuse the specified owners; only 002 adds wyrd.github_installations and preserves OIDC trust; 002 redacts secrets, 003 keeps keys out of Cards/TOML, 004 preserves library independence |
 
 At seams the downstream proof consumes actual predecessor receipts/accepted
 values through production paths. Private fixture shortcuts may support unit tests,

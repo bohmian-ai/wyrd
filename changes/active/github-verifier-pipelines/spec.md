@@ -1,6 +1,6 @@
 ---
 id: SPEC-github-verifier-pipelines
-revision: 3
+revision: 4
 status: approved
 ---
 
@@ -40,8 +40,9 @@ no worker capacity. One optional standard report supplies GitHub findings and
 suggestions; authored requirements still determine the verification verdict.
 
 The cost is new Repository, PR extraction, deferred-input, approval and provider
-integration contracts at existing owners. There is no new execution engine,
-Postgres table, general event bus, generic wait framework or UI workflow.
+integration contracts at existing owners and one dedicated installation association
+table. There is no new execution engine, general event bus, generic wait framework
+or UI workflow.
 
 ## Scope and fixed boundaries
 
@@ -52,7 +53,7 @@ Postgres table, general event bus, generic wait framework or UI workflow.
   accepted execution state, storage adapters and GitHub delivery policy.
 - Existing Card registry, storage/upload, Bifrost/Scribe, verification queue,
   SubmissionSink, runner, checkpoints and engine remain the owners. No new
-  PostgreSQL tables.
+  PostgreSQL tables except `wyrd.github_installations` for GitHub associations.
 - This is the same implementation for SaaS, self-hosted and enterprise cloud.
   Conventional configured GitHub host/App support is retained; no new host or
   installation-management product is introduced.
@@ -70,6 +71,25 @@ installation per tenant and one tenant per installation. Disconnect stops
 connection use and affected unfinished work before releasing its association.
 GitHub's setup URL is not its OAuth callback, and an installation_id is not
 association proof.
+
+`wyrd-sql` owns one dedicated `wyrd.github_installations` table for tenant identity
+(`data_tenant_id`), configured host, verified installation ID, selected accessible
+repositories, suspension and revision, with connection identity and safe timestamps
+as needed. Postgres enforces one associated installation per tenant and unique
+`(host, installation_id)` across tenants, including concurrent claims. Suspension
+retains ownership. Enable and force standard tenant RLS. Keep
+`auth_human_connections`, its OIDC constraints and queries unchanged. An
+installation grants repository access, while that table defines tenant OIDC login
+trust; sharing it would require nullable OIDC fields and provider filtering in
+security-sensitive login queries. The dedicated table avoids that coupling. Reuse
+`auth_login_state` for temporary actor/tenant/browser-bound connection transactions
+with explicit flow separation: neither callback may consume the other's state,
+and stale callbacks cannot restore a disconnected or replaced connection. One
+narrow SECURITY DEFINER installation-to-tenant lookup routes verified webhooks,
+with pinned search_path and body-scoped operator elevation; subsequent work uses
+TenantConn and normal authorization. Routing grants no permission. Store no App
+keys or user/installation tokens in these rows. Private columns and generation
+mechanics remain implementation-owned.
 
 App permissions are Contents read, Pull requests write and Checks write, with
 required PR/source and installation-access events. Tenant users never upload App
@@ -252,7 +272,7 @@ App setup, declaration, publication, approval and diagnosis without a UI.
 | INV-004 | Recovery returns exact accepted state, authoritative absence or explicit unavailability | Replaying settled work or treating unavailable evidence as fresh state |
 | INV-005 | Existing source/policy, publication identity, budgets and deadline survive retry/resumption | A retry judging different code or silently replenishing authority/spend |
 | INV-006 | Stale/cancelled/superseded actors cannot release new work or publish as the current review | Late writes reviving an obsolete generation |
-| INV-007 | No new Postgres tables or generic broker/workflow engine; no secrets in Cards/TOML/results | Unnecessary infrastructure or credential disclosure |
+| INV-007 | Only new Postgres table: wyrd.github_installations for tenant GitHub associations; no other new tables or generic broker/workflow engine; no secrets in Cards/TOML/results | Unnecessary infrastructure or credential disclosure |
 
 Use existing upload completion/exact File custody, Scribe acknowledgement/batch
 fences and tenant queue transactions. There is no Bifrost/Postgres atomic
@@ -270,7 +290,7 @@ without production GitHub credentials.
 
 | ID | Situation exercised | Expected observation | Requirements |
 |---|---|---|---|
-| AC-001 | Operator config, install from either entry point, verified repository selection, spoof/replay/foreign tenant, disconnect | Only verified association activates; no tenant keys; revocation stops only affected work | 001,016 |
+| AC-001 | Operator config, install from either entry point, verified repository selection, spoof/replay/foreign tenant, concurrent claims in both directions, cross-flow/stale callbacks, suspension/disconnect | Verified association only; database uniqueness and RLS hold; OIDC login stays unchanged; suspension retains ownership; revocation stops only affected work | 001,016 |
 | AC-002 | Minimal TOML with local/exact refs, offline check, unchanged/changed/pinned content, failed/racing activation, rollback, empty list | Ordinary exact Card receipts; correct selected policy; no unrelated import or stale activation | 002,003 |
 | AC-003 | 41 PR burst, duplicate/out-of-order events, queued/running A superseded by B, draft/close/access loss | Bounded durable admissions, latest source only, old evidence retained and no obsolete continuation | 004,005,015 |
 | AC-004 | Cold/warm pinned extraction, full/incremental and unusable baseline, Prompt plus workspace consumption, context omissions and model limit | Exact source/context preserved and reused; missing/incomplete review never a clean pass | 006,007 |
@@ -285,14 +305,16 @@ without production GitHub credentials.
 ## Authority reconciliation and approval
 
 The user explicitly approved revision 3 and [contracts](contracts.md) for planning
-on 2026-11-10. Contracts define the public shapes;
+on 2026-11-10, then approved and requested the dedicated installation storage
+amendment as revision 4. Public shapes are unchanged. Contracts define those shapes;
 [research](research.md) records inspected owners, necessary extensions and
 verification limits. The [standard-report example](design/worked-examples/standard-report/README.md)
 illustrates the declaration-to-delivery flow; its future contracts have not been
 executed against the server.
 
 Specification approval covers the behavior and public contracts in this packet.
-It does not grant implementation readiness or select private storage layouts.
+It does not claim implementation readiness. Revision 4 selects the installation
+table; private column layout and query mechanics remain implementation-owned.
 
 Owning architecture still needs the approved amendments for Repository/Card
 roots, closed PR activation, TOML roots, deferred publication/approval, scoped
@@ -308,6 +330,7 @@ readiness. Implementation tasks derive from this approved revision.
 | 1 | draft | Initial backend journey and public contracts from the approved design |
 | 2 | draft | User correction: approval uses normal authorization only; remove authentication-age and interactive-proof requirements |
 | 3 | approved 2026-11-10 | Apply approved source-based evidence matching; remove publication Card-version overrides, public reactivation rules, extra App management workflow and prescribed permission/layout additions; audit supporting contracts. User explicitly approved this revision and its contracts for planning. |
+| 4 | approved 2026-11-10 | User approved and requested the storage amendment: allow only wyrd.github_installations, preserve OIDC trust, reuse flow-separated login state and revise task 002 proof. Public contracts and other task behavior are unchanged. |
 
 Authority: [Wyrd doctrine/Verifier](../../../architecture/wyrd-design.md),
 [Bifrost](../../../architecture/bifrost-design.md),

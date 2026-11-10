@@ -1,8 +1,9 @@
-# Public contracts — approved revision 3
+# Public contracts — approved revision 4
 
 These shapes make [spec.md](spec.md) reviewable. Existing CardRef, File,
 execution, receipt, typed permission and problem+json contracts remain canonical.
-The user approved these contracts with specification revision 3 on 2026-11-10.
+The user approved these shapes with specification revision 3 on 2026-11-10.
+Revision 4 changes installation storage only; these public shapes are unchanged.
 JSON objects are closed unless an existing referenced type says otherwise.
 
 ## Repository and declaration

@@ -61,6 +61,31 @@ tenant per installation; do not add multi-installation tenant management.
    affected unfinished work, retaining Cards and evidence. Unrelated repositories
    continue normally.
 
+### Approved storage amendment — revision 4
+
+
+`wyrd-sql` owns one dedicated `wyrd.github_installations` table for tenant identity
+(`data_tenant_id`), configured host, verified installation ID, selected accessible
+repositories, suspension and revision, with connection identity and safe timestamps
+as needed. Postgres enforces one associated installation per tenant and unique
+`(host, installation_id)` across tenants, including concurrent claims. Suspension
+retains ownership. Enable and force standard tenant RLS. Keep
+`auth_human_connections`, its OIDC constraints and queries unchanged. An
+installation grants repository access, while that table defines tenant OIDC login
+trust; sharing it would require nullable OIDC fields and provider filtering in
+security-sensitive login queries. The dedicated table avoids that coupling. Reuse
+`auth_login_state` for temporary actor/tenant/browser-bound connection transactions
+with explicit flow separation: neither callback may consume the other's state,
+and stale callbacks cannot restore a disconnected or replaced connection. One
+narrow SECURITY DEFINER installation-to-tenant lookup routes verified webhooks,
+with pinned search_path and body-scoped operator elevation; subsequent work uses
+TenantConn and normal authorization. Routing grants no permission. Store no App
+keys or user/installation tokens in these rows. Private columns and generation
+mechanics remain implementation-owned.
+
+This is the only new table exception; queues, waits and evidence retain their
+existing owners. Product login and public integration contracts are unchanged.
+
 Both SaaS and self-hosting share the same code path. Tenants do not create Apps
 or upload operator credentials. Implement conventional verified callbacks,
 connection inspection and disconnect/revocation through existing owners. Do not

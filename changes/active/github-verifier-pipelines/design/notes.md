@@ -1,6 +1,6 @@
 # GitHub Verifier pipelines
 
-Status: exploring
+Status: finalized
 
 ## Problem
 
@@ -28,7 +28,7 @@ Wyrd owners, without a UI or a separate workflow system.
 ## Constraints and non-goals
 
 - No UI work here; it ships on another branch.
-- No new PostgreSQL tables, second verification queue, general event bus,
+- Only new PostgreSQL table: `wyrd.github_installations`; no second verification queue, general event bus,
   generic timer/external wait actions or replacement checkpoint store.
 - Reuse existing storage, Bifrost verification records, queue tables, Scribe
   outbox and SubmissionSink. Bifrost owns accepted execution state; PostgreSQL
@@ -140,8 +140,8 @@ Rejected or superseded directions:
 - Verifier/binding report selectors: recognize the single standard envelope.
 - Generic timer/external waits and GitHub Actions-specific CI acquisition:
   use deferred Wyrd inputs and separate human approval.
-- New PostgreSQL tables or a separate workflow/outbox framework: extend existing
-  owners. Source/storage feasibility must be established, not assumed.
+- General new PostgreSQL tables or a separate workflow/outbox framework: extend
+  existing owners. Revision 4 permits only the dedicated installation table.
 
 [Original Repository proposal](repository-card-contract.md) and
 [superseded non-Card proposal](repository-declaration.md) retain research only
@@ -162,41 +162,33 @@ server ownership, tenant isolation and audit behavior remain required. Current
 source uses UUID declaration-operation keys while architecture describes a
 content-derived key; revalidate this mismatch at its owner before relying on it.
 
-## Open questions
+## Final decisions and implementation follow-through
 
-Latest user correction: approval depends on normal authorization, without a
-fresh-login requirement or five-minute authentication window. The user approved
-replacing the draft's publication-version overrides and reactivation rules with
-repository/commit/input matching and the existing/new subscriber scenario table. Execution policy pins remain exact; the publisher
-need not choose them. The first comprehension pass did not authorize the
-rejected additions.
+### Task 002 storage amendment — approved revision 4
 
-### Remaining specification work
+The user approved and requested application of the dedicated-table amendment.
+The [runtime/GitHub storage decision](approved-runtime-and-github.md#approved-storage-amendment--revision-4)
+owns the agreed flow; [spec revision 4](../spec.md) and [task 002](../tasks/002-github-app-connection.md)
+carry it into implementation and proof. Only `wyrd.github_installations` may be
+added. Keep OIDC trust unchanged and reuse flow-separated `auth_login_state`.
 
-The user approved the remaining recommendations, with a correction to evidence
-publication and a reminder that conventional App deployment was already settled.
-Large-PR context strategy, trusted base guidance, severity meanings, Check
-conclusions, manual thread resolution and deadline behavior are no longer open
-product questions. Their detailed owners are the approved records above.
+Inspection confirmed that the abandoned shared-table SQL draft required nullable
+OIDC fields and provider-specific login indexes/queries. Dedicated storage removes
+that coupling. Local Mitari's installation model supports the separation as
+precedent, not as a replacement for Wyrd's tenancy and uniqueness contract.
 
-The remaining contract work is concrete specification drafting and validation:
+Proof covers claim races, tenant isolation, unchanged OIDC login, cross-flow/stale
+callbacks and existing access-loss/disconnect journeys. Private schema/generation
+mechanics remain implementation-owned. No runtime proof is claimed. The
+uncommitted shared-table SQL draft was removed; implement the dedicated-table
+and login-state migration afresh under revision 4.
 
-- Publication matching, inferred repository/commit, input dependency and subscription
-  lifecycle are approved, including no unmatched retention/replay and no required
-  caller retry key. Specify exact SDK/wire forms and retained evidence custody
-  for subscriptions without active executions, then validate restart-safe
-  continuation. CI does not query executions or use provide_input/group_id.
-- Complete the nested extraction/report/edit schemas and human-approval request,
-  result and permission surfaces using the approved behavior. Present unseen
-  fields for approval; do not invent new policy, services or configuration.
-- Specify restart-safe admission, supersession, continuation and GitHub delivery
-  at the existing owner boundaries, with no new PostgreSQL tables.
+The approved spec and contracts settle publication matching, extraction/report
+schemas, normal authorization for approval and restart-safe owner boundaries.
+There are no remaining material storage decisions. The implementation must
+establish the required runtime proof; document approval is not that proof.
 
-Do not reopen conventional App deployment or introduce a GitHub.com-only scope
-restriction. Exact conventional configuration and callback details belong in the
-specification, not another product-design round.
-
-### Research needed before implementation tasks
+### Implementation verification
 
 - Prove webhook deduplication/partial fanout, supersession, parked continuation
   and GitHub delivery retry/reconciliation fit existing tables/state/outboxes.
@@ -212,19 +204,13 @@ choices do not need another design decision. They belong to implementation.
 
 ## Handoff
 
-The user's requested [complexity audit](../research.md#complexity-audit--revision-3)
-produced spec revision 3 draft and reconciled contracts. It removes the added
-approval proof, version-targeting/reactivation protocol, extra App management
-workflow, prescribed permission categories and SQL layouts. The remaining
-requirements are mapped to their approved design basis in that audit. A bounded
-independent comprehension pass found no material contradiction in the revised
-spec and contracts. This does not approve the specification or prove runtime
-recovery/capacity behavior.
+Design is finalized for approved specification revision 4 and its public
+contracts. Revision 4 changes only GitHub installation storage; other approved
+behavior remains intact. The [task packet](../tasks/README.md) references revision
+4. Task 002 owns the dedicated table, flow-separated authorization state,
+security/runtime authority updates and connected proof. Document approval does
+not claim runtime recovery or capacity proof.
 
-Spec revision 3 is drafted and audited for unnecessary complexity. It is not an
-approved spec or task-ready plan. The user still owns design completion.
-Stay exploring until asked to finalize; do not invoke spec/plan automatically.
-
-Next: review the corrected draft, validate the necessary existing-owner
-extensions, update authority through the approved
-workflow, then produce a small outcome-based specification and task packet.
+Resume task 002 through `$wyrd-implement` using the storage decision above. Do
+not restore the shared OIDC/GitHub table approach or rewrite applied migrations.
+Do not stage or commit without instruction.

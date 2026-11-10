@@ -2865,13 +2865,13 @@ export type Inequality = "Eq" | "Ne" | "Gt" | "Ge" | "Lt" | "Le" | "In";
 export type InlineableRef_for_AgentSpec = CardRef | InlineableRef_for_AgentSpecSibling | AgentSpec | string;
 
 /**
- * A loader-projected reference to another submission in the same request.
+ * A declaration-only reference to another submission in the same request.
  */
 export interface InlineableRef_for_AgentSpecSibling {
   /**
-   * Exact identity of the sibling submission.
+   * Identity of the sibling submission; its version may be omitted.
    */
-  readonly sibling: CardRef;
+  readonly sibling: SiblingRef;
 }
 
 /**
@@ -2884,13 +2884,13 @@ export interface InlineableRef_for_AgentSpecSibling {
 export type InlineableRef_for_OperatorSpec = CardRef | InlineableRef_for_OperatorSpecSibling | OperatorSpec | string;
 
 /**
- * A loader-projected reference to another submission in the same request.
+ * A declaration-only reference to another submission in the same request.
  */
 export interface InlineableRef_for_OperatorSpecSibling {
   /**
-   * Exact identity of the sibling submission.
+   * Identity of the sibling submission; its version may be omitted.
    */
-  readonly sibling: CardRef;
+  readonly sibling: SiblingRef;
 }
 
 /**
@@ -2903,13 +2903,13 @@ export interface InlineableRef_for_OperatorSpecSibling {
 export type InlineableRef_for_Prompt = CardRef | InlineableRef_for_PromptSibling | Prompt | string;
 
 /**
- * A loader-projected reference to another submission in the same request.
+ * A declaration-only reference to another submission in the same request.
  */
 export interface InlineableRef_for_PromptSibling {
   /**
-   * Exact identity of the sibling submission.
+   * Identity of the sibling submission; its version may be omitted.
    */
-  readonly sibling: CardRef;
+  readonly sibling: SiblingRef;
 }
 
 /**
@@ -2922,13 +2922,13 @@ export interface InlineableRef_for_PromptSibling {
 export type InlineableRef_for_TriggerSpec = CardRef | InlineableRef_for_TriggerSpecSibling | TriggerSpec | string;
 
 /**
- * A loader-projected reference to another submission in the same request.
+ * A declaration-only reference to another submission in the same request.
  */
 export interface InlineableRef_for_TriggerSpecSibling {
   /**
-   * Exact identity of the sibling submission.
+   * Identity of the sibling submission; its version may be omitted.
    */
-  readonly sibling: CardRef;
+  readonly sibling: SiblingRef;
 }
 
 /**
@@ -4943,13 +4943,13 @@ export type ReasoningEffort = "none" | "minimal" | "low" | "medium" | "high" | "
 export type Ref = CardRef | RefSibling | string;
 
 /**
- * A loader-projected reference to another submission in the same request.
+ * A declaration-only reference to another submission in the same request.
  */
 export interface RefSibling {
   /**
-   * Exact identity of the sibling submission.
+   * Identity of the sibling submission; its version may be omitted.
    */
-  readonly sibling: CardRef;
+  readonly sibling: SiblingRef;
 }
 
 /**
@@ -5965,6 +5965,32 @@ export interface ServiceTable {
  * SHA-256 digest as exactly 64 lowercase hexadecimal characters.
  */
 export type Sha256Hex = string;
+
+/**
+ * Declaration-only reference to another submission in the same request.
+ *
+ * A sibling names its target by kind and name and may omit the version: the
+ * server selects omitted versions during declaration, then replaces every
+ * sibling with the target's exact registered [`CardRef`] before the parent is
+ * hashed and persisted. An explicit version matches the submission with that
+ * exact version; an omitted version matches the sole submission with that
+ * kind and name, and several candidates make the link ambiguous. Siblings
+ * never appear in durable specs.
+ */
+export interface SiblingRef {
+  /**
+   * Target submission kind.
+   */
+  readonly kind: CardKind;
+  /**
+   * Target submission name.
+   */
+  readonly name: CardName;
+  /**
+   * Target submission version, when the author pinned one.
+   */
+  readonly version?: VersionBlock | null;
+}
 
 /**
  * Config for the Sklearn model interface.

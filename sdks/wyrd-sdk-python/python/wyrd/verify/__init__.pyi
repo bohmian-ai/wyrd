@@ -805,6 +805,16 @@ class CardRef:
         ...
 
     @staticmethod
+    def prompt(name: str, version: str) -> CardRef:
+        """The exact reference to the Prompt Card ``name`` at ``version``.
+
+        Args:
+            name: The Card name.
+            version: The exact Card version.
+        """
+        ...
+
+    @staticmethod
     def agent(name: str, version: str) -> CardRef:
         """The exact reference to the Agent Card ``name`` at ``version``.
 

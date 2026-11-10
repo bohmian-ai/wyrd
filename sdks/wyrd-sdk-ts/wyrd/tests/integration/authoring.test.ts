@@ -1,5 +1,5 @@
-// The `card_authoring` story, authored in TypeScript through
-// `wyrd-ai/authoring`.
+// The `card_authoring` story, authored in TypeScript through the `verify`
+// namespace of `wyrd-ai`.
 //
 // Service `finance-release` composes Agents `report-reviewer` and
 // `release-controls`, each verified by its own two-step Verifier
@@ -22,30 +22,26 @@ import {
   Cards,
   type DeclarationReceipt,
   type VerificationResult,
+  verify,
   WyrdClient,
   WyrdError,
   WyrdState,
 } from "wyrd-ai";
-import {
-  Action,
-  Agent,
-  Artifact,
-  type ArtifactFile,
-  CardRef,
-  Check,
-  CodeSource,
-  Component,
-  type InputSlotArg,
-  Requirement,
-  Service,
-  Step,
-  Verifier,
-} from "wyrd-ai/authoring";
 
 import { judgeReply, toolCall, toolTurn } from "../support/assistant.js";
 import type { ReceivedRequest, Reply } from "../support/http-receiver.js";
 import { configureGateway } from "../support/local-development.js";
 import { fixture, serverTest } from "../support/server.js";
+
+const { Action, Agent, Artifact, CardRef, Check, CodeSource, Component, Prompt, Requirement, Service, Step, Verifier } =
+  verify;
+type Agent = verify.Agent;
+type Artifact = verify.Artifact;
+type ArtifactFile = verify.ArtifactFile;
+type InputSlotArg = verify.InputSlotArg;
+type Service = verify.Service;
+type Step = verify.Step;
+type Verifier = verify.Verifier;
 
 vi.setConfig({ testTimeout: 300_000 });
 
@@ -150,24 +146,18 @@ function upstream(request: ReceivedRequest): Reply {
 
 /** A policy-judge Agent `name` at `version`, as the story's Agent files declare it. */
 function policyJudge(name: string, version: string): Agent {
-  return new Agent(name, version, {
+  return new Agent(name, {
+    version,
     execution_route: { kind: "wyrd_gateway", deployment: "openai" },
     tool_names: ["fs.read"],
     run_config: { max_iterations: 3 },
-    prompt: {
-      provider: "openai",
-      model: "gpt-4o",
-      messages: [
-        {
-          role: "user",
-          content:
-            "POLICY JUDGE: read /inputs/policy.json with fs.read. Determine whether the proposed release" +
-            " satisfies the company policy. Cite original request and policy evidence. Report: {{report}}" +
-            " Recipient: {{recipient}} Purpose: {{purpose}} Destination: {{destination}}",
-        },
-      ],
-      response_format: "verdict",
-    },
+    prompt: Prompt.openaiChat("gpt-4o", {
+      messages:
+        "POLICY JUDGE: read /inputs/policy.json with fs.read. Determine whether the proposed release" +
+        " satisfies the company policy. Cite original request and policy evidence. Report: {{report}}" +
+        " Recipient: {{recipient}} Purpose: {{purpose}} Destination: {{destination}}",
+      responseFormat: { type: "verdict" },
+    }),
   });
 }
 
@@ -193,7 +183,8 @@ function releaseInputs(): Readonly<Record<string, InputSlotArg>> {
 
 /** `report-policy` at `version`: the identifier scan with the judge reading `policy`, then context. */
 function reportPolicy(version: string, judge: Agent, policy: ArtifactFile): Verifier {
-  const verifier = new Verifier("report-policy", version, {
+  const verifier = new Verifier("report-policy", {
+    version,
     description: "The report is fit to share under the company sharing policy.",
     inputs: releaseInputs(),
   });
@@ -227,7 +218,8 @@ function reportPolicy(version: string, judge: Agent, policy: ArtifactFile): Veri
 
 /** `release-access` at `version`: independent recipient and destination steps, unused `notes`. */
 function releaseAccess(version: string, description?: string): Verifier {
-  const verifier = new Verifier("release-access", version, {
+  const verifier = new Verifier("release-access", {
+    version,
     description: description ?? "The recipient and destination may receive the report.",
     inputs: releaseInputs(),
   });
@@ -271,14 +263,14 @@ function summarizedAccess(version: string): Verifier {
 /** `finance-release` with every Card at `version`, its reviewer judged against `policy`. */
 function financeRelease(version: string, policy: ArtifactFile, access: Verifier): Service {
   const reviewer = policyJudge("report-reviewer", version);
-  return new Service("finance-release", version, { service_type: "api" })
+  return new Service("finance-release", { version, service_type: "api" })
     .addComponent(new Component("report-reviewer", reviewer).verifiedBy([reportPolicy(version, reviewer, policy)]))
     .addComponent(new Component("release-controls", policyJudge("release-controls", version)).verifiedBy([access]));
 }
 
 /** The local policy Artifact `version`, published from `source` with its documents extracted. */
 function localPolicy(version: string, source: string = POLICY): Artifact {
-  return Artifact.fromPath("company-sharing-policy", version, source).extract(true);
+  return Artifact.fromPath("company-sharing-policy", source, { version }).extract(true);
 }
 
 /** The registered policy Artifact `version`'s extracted file, used without uploading. */
@@ -617,7 +609,7 @@ test("local_artifacts_and_declaration_parity", async ({ cards, server }) => {
   );
 
   const judge = policyJudge("report-reviewer", "3.0.0");
-  const orphaned = new Service("finance-release", "3.0.0")
+  const orphaned = new Service("finance-release", { version: "3.0.0" })
     .addComponent(
       new Component("report-reviewer", judge).verifiedBy([
         reportPolicy("3.0.0", judge, localPolicy("3.0.0").file(POLICY_FILE)),

@@ -169,9 +169,37 @@ describe("internal native run wrapper", () => {
   });
 
   test("verification values live only under the verify namespace", () => {
-    expect(Object.keys(verify).sort()).toEqual(["ArtifactRef", "Execution", "File"]);
-    for (const name of ["ArtifactRef", "Execution", "File", "VerificationExecution"]) {
-      expect(name in wyrd).toBe(false);
+    const names = Object.keys(verify).sort();
+    expect(names).toEqual([
+      "Action",
+      "Agent",
+      "Artifact",
+      "ArtifactFile",
+      "ArtifactRef",
+      "Audit",
+      "AuthoredCard",
+      "Binding",
+      "CardRef",
+      "Check",
+      "CodeSource",
+      "Component",
+      "Data",
+      "Execution",
+      "Experiment",
+      "File",
+      "InputSlot",
+      "Mcp",
+      "Model",
+      "Operator",
+      "Prompt",
+      "Requirement",
+      "Service",
+      "Step",
+      "Trigger",
+      "Verifier",
+    ]);
+    for (const name of [...names, "VerificationExecution"]) {
+      expect(name in wyrd, name).toBe(false);
     }
   });
 

@@ -255,7 +255,7 @@ impl NativeWyrdError {
     ///
     /// Public text comes from the problem document so it matches the HTTP and
     /// Python projections of the same error.
-    fn from_wyrd(projected: &WyrdError) -> Self {
+    pub(crate) fn from_wyrd(projected: &WyrdError) -> Self {
         let problem = projected.as_problem_json();
         Self {
             error_code: projected.code().to_owned(),

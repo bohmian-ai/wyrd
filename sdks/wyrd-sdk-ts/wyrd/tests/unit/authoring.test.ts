@@ -1,13 +1,13 @@
-// Offline Card authoring through public `wyrd-ai/authoring`: construction,
+// Offline Card definitions through the public `verify` namespace: construction,
 // edits, value capture, schema conveniences and every native family. Nothing
 // here reaches a server; validation is the shared Rust validation.
 import { fileURLToPath } from "node:url";
 
 import { expect, test } from "vitest";
 
-import { type CardTypes, WyrdError } from "wyrd-ai";
-import * as Authoring from "wyrd-ai/authoring";
-import {
+import { type CardTypes, verify, WyrdError } from "wyrd-ai";
+
+const {
   Action,
   Agent,
   Artifact,
@@ -30,8 +30,12 @@ import {
   Step,
   Trigger,
   Verifier,
-  type AuthoredCard,
-} from "wyrd-ai/authoring";
+} = verify;
+type Agent = verify.Agent;
+type AuthoredCard = verify.AuthoredCard;
+type CardRef = verify.CardRef;
+type Data = verify.Data;
+type Step = verify.Step;
 
 const POLICY = fileURLToPath(new URL("../../../../../fixtures/cards/card_authoring/", import.meta.url));
 const SHARING_POLICY = `${POLICY}company-sharing-policy.pdf`;
@@ -42,13 +46,9 @@ function ref(kind: CardTypes.CardKind, name: string, version = "1.0.0"): CardTyp
 }
 
 function judge(name = "judge"): Agent {
-  const prompt = new Prompt(`${name}-prompt`, "1.0.0", {
-    provider: "openai",
-    model: "gpt-4o",
-    response_format: "verdict",
-    messages: [{ role: "user", content: "Judge {{report}}" }],
-  });
-  return new Agent(name, "1.0.0", {
+  const prompt = Prompt.openaiChat("gpt-4o", { messages: "Judge {{report}}", responseFormat: { type: "verdict" } });
+  return new Agent(name, {
+    version: "1.0.0",
     prompt,
     execution_route: { kind: "wyrd_gateway", deployment: "openai" },
     tool_names: ["fs.read"],
@@ -87,7 +87,7 @@ function spec(card: AuthoredCard): Record<string, unknown> {
 }
 
 test("definitions_edit_offline", () => {
-  const verifier = new Verifier("report-policy", "1.0.0", { inputs: { report: STRING } });
+  const verifier = new Verifier("report-policy", { version: "1.0.0", inputs: { report: STRING } });
   expect(verifier.addInput("purpose", STRING)).toBe(verifier);
   expect(verifier.description("Report policy")).toBe(verifier);
 
@@ -107,7 +107,7 @@ test("definitions_edit_offline", () => {
   });
 
   const component = new Component("reviewer", judge("reviewer")).verifiedBy([verifier]);
-  const service = new Service("finance-release", "1.0.0").addComponent(component);
+  const service = new Service("finance-release", { version: "1.0.0" }).addComponent(component);
   verifier.description("edited after capture");
   expect(spec(service).components).toEqual([
     {
@@ -118,14 +118,14 @@ test("definitions_edit_offline", () => {
   ]);
   service.validate();
 
-  const forward = new Verifier("forward", "1.0.0", { inputs: { report: STRING } });
+  const forward = new Verifier("forward", { version: "1.0.0", inputs: { report: STRING } });
   forward.addStep(new Step("first", Action.code(CodeSource.inline("x"), "f").inputs({ later: "steps.second.output" })));
   forward.addRequirement(new Requirement("done", "Done", Check.assert("steps.first.output.ok", "equals", true)));
   expect(invalid(forward), "a forward reference is refused only at validation").toContain("steps.second");
   forward.addStep(checked("second"));
   forward.validate();
 
-  const ordered = new Verifier("ordered", "1.0.0", { inputs: { report: STRING } });
+  const ordered = new Verifier("ordered", { version: "1.0.0", inputs: { report: STRING } });
   ordered.steps([checked("a"), checked("b"), checked("c", ["a", "b"])]);
   expect(ordered.plan()).toEqual({
     stages: [
@@ -135,44 +135,33 @@ test("definitions_edit_offline", () => {
     task_count: 3,
   });
 
-  const duplicated = new Verifier("duplicated", "1.0.0");
+  const duplicated = new Verifier("duplicated", { version: "1.0.0" });
   duplicated.addInput("report", STRING).addInput("report", { type: "integer" });
   duplicated.addStep(checked("scan")).addStep(checked("scan"));
   expect(invalid(duplicated)).toContain("inputs.report: duplicate entry");
   expect(spec(duplicated).inputs).toEqual({ report: { type: "json", schema: STRING } });
   expect((spec(duplicated).steps as { readonly id: string }[]).map(({ id }) => id)).toEqual(["scan", "scan"]);
 
-  const messages = [{ role: "user", content: "Summarise {{report}}" }] as const;
-  const portable = new Prompt("summary", "1.0.0", { provider: "openai", model: "gpt-4o", messages, body: null });
-  expect(spec(portable), "a canonical null is kept as authored").toMatchObject({ messages, body: null });
-  portable.validate();
-  const switched = new Prompt("summary", "1.0.0", { provider: "openai", model: "gpt-4o" });
-  switched.body({ temperature: 0 }).messages(messages).body(null);
-  expect(spec(switched)).toEqual(spec(portable));
-  switched.messages(null).addBody("temperature", 0);
-  expect(spec(switched)).toMatchObject({ messages: null, body: { temperature: 0 } });
-  expect(refusal(portable.messages(null)).code, "neither form is refused only at validation").toBe(
-    "WYRD_LOADER_400_INVALID_ENVELOPE",
-  );
-
-  const replaced = new Verifier("duplicated", "1.0.0", { inputs: { report: STRING } });
+  const replaced = new Verifier("duplicated", { version: "1.0.0", inputs: { report: STRING } });
   replaced.inputs({ purpose: STRING });
   expect(Object.keys(spec(replaced).inputs as object), "a whole-field setter replaces earlier additions").toEqual([
     "purpose",
   ]);
 
   // @ts-expect-error an unknown option is a type error, and refused when untyped
-  expect(() => new Verifier("typo", "1.0.0", { stepz: [] })).toThrow("Verifier has no field `stepz`");
+  expect(() => new Verifier("typo", { version: "1.0.0", stepz: [] })).toThrow("Verifier has no field `stepz`");
   // @ts-expect-error a list field takes a list
-  expect(() => new Agent("listed", "1.0.0").toolNames("fs.read")).toThrow("tool_names takes a list");
-  expect("name" in new Service("fixed", "1.0.0"), "name is constructor-only").toBe(false);
+  expect(() => new Agent("listed", { version: "1.0.0" }).toolNames("fs.read")).toThrow("tool_names takes a list");
+  expect("name" in new Service("fixed", { version: "1.0.0" }), "name is constructor-only").toBe(false);
   expect("id" in new Step("fixed", Action.extract("inputs.d"))).toBe(false);
-  expect(() => new Agent("listed", "1.0.0").toolNames(["fs.read", 1n] as unknown as string[])).toThrow(WyrdError);
+  expect(() => new Agent("listed", { version: "1.0.0" }).toolNames(["fs.read", 1n] as unknown as string[])).toThrow(
+    WyrdError,
+  );
 });
 
 test("schemas_and_slots_are_canonical", () => {
   const schema = { type: "object", properties: { text: { type: "string" } } };
-  const verifier = new Verifier("plain", "1.0.0", { inputs: { report: schema } });
+  const verifier = new Verifier("plain", { version: "1.0.0", inputs: { report: schema } });
   verifier.addInput("notes", { type: ["string", "null"] });
   verifier.addInput("canonical", { type: "json", schema: STRING });
   verifier.addInput("open", true).addInput("closed", false);
@@ -195,7 +184,7 @@ test("schemas_and_slots_are_canonical", () => {
     { type: "trace", required: true },
   ];
   for (const slot of slots) {
-    const optional = new Verifier("optional", "1.0.0", { inputs: { note: slot } });
+    const optional = new Verifier("optional", { version: "1.0.0", inputs: { note: slot } });
     const message = invalid(optional);
     expect(message).toContain("inputs.note");
     expect(message).toContain("unknown field `required`");
@@ -208,7 +197,7 @@ test("every_native_family_constructs_canonical_specs", () => {
   const pager = { kind: "http", method: "post", url: "https://hooks.example.com/release" } as const;
   const singles: readonly (readonly [AuthoredCard, string])[] = [
     [
-      new Data("authored", "1.0.0")
+      new Data("authored", { version: "1.0.0" })
         .interface({ kind: "Parquet", meta: { compression: "Snappy" } })
         .schema({ columns: [{ name: "latency", dtype: "float64" }] })
         .stats({
@@ -220,7 +209,8 @@ test("every_native_family_constructs_canonical_specs", () => {
       "Data",
     ],
     [
-      new Model("authored", "1.0.0", {
+      new Model("authored", {
+        version: "1.0.0",
         interface: {
           kind: "Custom",
           meta: { framework_version: "0.1.0", loader_module: "assistant", loader_class: "LatencyModel", extra: {} },
@@ -234,22 +224,17 @@ test("every_native_family_constructs_canonical_specs", () => {
       "Model",
     ],
     [
-      new Experiment("authored", "1.0.0", { experiment_type: "ab" }).addTargetRef(CardRef.model("ranker", "1.0.0")),
+      new Experiment("authored", { version: "1.0.0", experiment_type: "ab" }).addTargetRef(
+        CardRef.model("ranker", "1.0.0"),
+      ),
       "Experiment",
     ],
-    [new Mcp("authored", "1.0.0", { server_name: "files", transport: "stdio" }).addScope("read"), "Mcp"],
-    [new Audit("authored", "1.0.0", { description: "Quarterly review" }), "Audit"],
-    [new Trigger("authored", "1.0.0", { kind: "schedule", cron: "0 0 * * *" }), "Trigger"],
-    [new Operator("authored", "1.0.0").action(pager), "Operator"],
+    [new Mcp("authored", { version: "1.0.0", server_name: "files", transport: "stdio" }).addScope("read"), "Mcp"],
+    [new Audit("authored", { version: "1.0.0", description: "Quarterly review" }), "Audit"],
+    [new Trigger("authored", { version: "1.0.0", kind: "schedule", cron: "0 0 * * *" }), "Trigger"],
+    [new Operator("authored", { version: "1.0.0" }).action(pager), "Operator"],
     [
-      new Prompt("authored", "1.0.0", { provider: "openai", model: "gpt-4o" }).addMessage({
-        role: "user",
-        content: "Hi",
-      }),
-      "Prompt",
-    ],
-    [
-      new Artifact("authored", "1.0.0", { artifact_kind: "document" })
+      new Artifact("authored", { version: "1.0.0", artifact_kind: "document" })
         .addMetadata("owner", { type: "str", value: "finance" })
         .addLabel("team", "finance")
         .addAnnotation("reviewed", "yes"),
@@ -258,20 +243,20 @@ test("every_native_family_constructs_canonical_specs", () => {
     [judge(), "Agent"],
   ];
   for (const [card, kind] of singles) {
-    expect(card.cardRef().kind).toBe(kind);
+    expect(card.cardRef()?.kind).toBe(kind);
     card.validate();
   }
-  const kinds = ["Data", "Model", "Artifact", "Experiment", "Prompt", "Agent", "Mcp", "Service", "Audit", "Verifier"];
+  const kinds = ["Data", "Model", "Artifact", "Experiment", "Agent", "Mcp", "Service", "Audit", "Verifier"];
   for (const kind of [...kinds, "Trigger", "Operator"]) {
-    expect(Authoring, `${kind} is authorable by name`).toHaveProperty(kind);
+    expect(verify, `${kind} is authorable by name`).toHaveProperty(kind);
   }
-  expect("CardDefinition" in Authoring, "no generic constructor admits another kind").toBe(false);
+  expect("CardDefinition" in verify, "no generic constructor admits another kind").toBe(false);
   expect(singles[3]?.[0].spec()).toEqual({ server_name: "files", transport: "stdio", scopes: ["read"] });
   expect(singles[6]?.[0].spec(), "an Operator's action is flattened into its spec").toEqual(pager);
   expect(singles[2]?.[0].spec()).toMatchObject({ target_refs: [ref("Model", "ranker")] });
 
   const policy = CardRef.artifact("company-sharing-policy", "1.0.0").file("extracted/policy.json");
-  const local = Artifact.fromPath("company-sharing-policy", "2.0.0", SHARING_POLICY).extract(true);
+  const local = Artifact.fromPath("company-sharing-policy", SHARING_POLICY, { version: "2.0.0" }).extract(true);
   expect(policy).toBeInstanceOf(ArtifactFile);
   local.validate();
 
@@ -296,7 +281,8 @@ test("every_native_family_constructs_canonical_specs", () => {
       Check.trace("inputs.trace", "$.spans[0].name", operator, 1),
     ]),
   ];
-  const verifier = new Verifier("inventory", "1.0.0", {
+  const verifier = new Verifier("inventory", {
+    version: "1.0.0",
     inputs: {
       report: InputSlot.json({ type: "object" }),
       document: InputSlot.media(["pdf"], { max_bytes: 1024 }),
@@ -325,9 +311,11 @@ test("every_native_family_constructs_canonical_specs", () => {
   expect(inventory.requirements[1]?.check.agent).toEqual({ sibling: ref("Agent", "judge") });
   expect(
     inventory.requirements[1]?.check.workspace,
-    "a local Artifact stands as its exact reference, published first",
+    "a local Artifact stands as a sibling until it is published at declaration",
   ).toEqual({
-    "/inputs/policy.json": { artifact: { card: ref("Artifact", "company-sharing-policy", "2.0.0"), path: "x.pdf" } },
+    "/inputs/policy.json": {
+      artifact: { card: { sibling: ref("Artifact", "company-sharing-policy", "2.0.0") }, path: "x.pdf" },
+    },
   });
   expect(inventory.requirements[3]?.check).toEqual({
     kind: "assert",
@@ -338,7 +326,8 @@ test("every_native_family_constructs_canonical_specs", () => {
   expect(inventory.steps[3]).toEqual({ id: "canonical", action: { kind: "extract", from: "inputs.document" } });
   verifier.validate();
 
-  const group = new Verifier("conversation", "1.0.0", {
+  const group = new Verifier("conversation", {
+    version: "1.0.0",
     inputs: {
       turns: InputSlot.source("verifiers.turn-check.inputs.turn"),
       answered: "verifiers.turn-check.requirements.answered.outcome",
@@ -355,7 +344,10 @@ test("every_native_family_constructs_canonical_specs", () => {
     condition: { kind: "Statistical" },
     profile: { kind: "Spc", sample_size: 5 },
   } as const;
-  const drift = new Verifier("latency-drift", "1.0.0", { inputs: { latency: InputSlot.samples(["latency"]) } });
+  const drift = new Verifier("latency-drift", {
+    version: "1.0.0",
+    inputs: { latency: InputSlot.samples(["latency"]) },
+  });
   drift.addRequirement(new Requirement("stable", "Stable", Check.drift("inputs.latency", driftSpec)));
   expect((spec(drift).requirements as { readonly check: unknown }[])[0]?.check).toEqual({
     kind: "drift",
@@ -363,7 +355,7 @@ test("every_native_family_constructs_canonical_specs", () => {
     ...driftSpec,
   });
   drift.validate();
-  const baseline = new Data("latency-baseline", "1.0.0")
+  const baseline = new Data("latency-baseline", { version: "1.0.0" })
     .interface({ kind: "Parquet", meta: { compression: "Snappy" } })
     .schema({ columns: [{ name: "latency", dtype: "float64" }] })
     .stats({
@@ -377,7 +369,10 @@ test("every_native_family_constructs_canonical_specs", () => {
       ...driftSpec,
       signal: { ...driftSpec.signal, baseline_ref: baselineRef },
     });
-    const card = new Verifier("latency-drift", "1.0.0", { inputs: { latency: InputSlot.samples(["latency"]) } });
+    const card = new Verifier("latency-drift", {
+      version: "1.0.0",
+      inputs: { latency: InputSlot.samples(["latency"]) },
+    });
     card.addRequirement(new Requirement("stable", "Stable", check));
     card.validate();
     return (spec(card).requirements as { readonly check: { readonly signal: unknown } }[])[0]?.check.signal;
@@ -390,10 +385,10 @@ test("every_native_family_constructs_canonical_specs", () => {
     baseline_ref: { sibling: ref("Data", "latency-baseline") },
   });
 
-  const binding = new Binding(new Verifier("checked", "1.0.0"), {
-    runs_on: new Trigger("daily", "1.0.0", { kind: "schedule", cron: "0 0 * * *" }),
+  const binding = new Binding(new Verifier("checked", { version: "1.0.0" }), {
+    runs_on: new Trigger("daily", { version: "1.0.0", kind: "schedule", cron: "0 0 * * *" }),
   });
-  binding.addOnFailure(new Operator("page", "1.0.0", { action: pager })).addOnFailure(pager);
+  binding.addOnFailure(new Operator("page", { version: "1.0.0", action: pager })).addOnFailure(pager);
   binding.addOnVerdictChange(CardRef.operator("notify", "1.0.0"));
   const bound = judge("bound").addVerifiedBy(binding);
   expect(spec(bound).verified_by).toEqual([
@@ -410,7 +405,8 @@ test("every_native_family_constructs_canonical_specs", () => {
   const component = new Component("judge", registered, { source: { path: "services/judge", kind: "python" } })
     .addConfig("region", { type: "str", value: "eu" })
     .addVerifiedBy(CardRef.verifier("checked", "1.0.0"));
-  const service = new Service("authored", "1.0.0", {
+  const service = new Service("authored", {
+    version: "1.0.0",
     description: "Release service",
     components: [component, { alias: "raw", ref: ref("Agent", "raw") }],
     verified_by: ["./not-a-file.yaml"],
@@ -431,11 +427,75 @@ test("every_native_family_constructs_canonical_specs", () => {
   });
   service.validate();
 
-  const pending = new Verifier("pending", "1.0.0", { inputs: { report: STRING } });
+  const pending = new Verifier("pending", { version: "1.0.0", inputs: { report: STRING } });
   pending.addRequirement(new Requirement("coded", "Coded", Check.code(CodeSource.file(`${POLICY}missing.py`), "f")));
   expect(
     (spec(pending).requirements as { readonly check: { readonly source: unknown } }[])[0]?.check.source,
     "a code file is read only at validation",
   ).toBeNull();
   expect(JSON.stringify(refusal(pending).details)).toContain("missing.py");
+});
+
+test("versions_are_optional_and_prompts_are_native", () => {
+  const unversioned = new Agent("writer");
+  expect(unversioned.cardRef(), "registration assigns an omitted version").toBeUndefined();
+  const local = Artifact.fromPath("company-sharing-policy", SHARING_POLICY);
+  expect(local.cardRef()).toBeUndefined();
+  const service = new Service("release", { components: [new Component("writer", unversioned)] });
+  expect(spec(service).components, "a sibling without a version names no version").toEqual([
+    { alias: "writer", ref: { sibling: { kind: "Agent", name: "writer" } } },
+  ]);
+  const step = new Step("summarize", Action.code(local.file("x.py"), "f"));
+  expect((spec(new Verifier("v").addStep(step)).steps as { readonly action: unknown }[])[0]?.action).toEqual({
+    kind: "code",
+    source: { artifact: { card: { sibling: { kind: "Artifact", name: "company-sharing-policy" } }, path: "x.py" } },
+    entrypoint: "f",
+  });
+  expect(new Service("pinned", { version: "2.0.0" }).cardRef()?.version).toBe("2.0.0");
+
+  const prompt = Prompt.openaiChat("gpt-4o", {
+    system: "Be brief",
+    messages: ["Summarise {{report}}", "Then list risks"],
+    responseFormat: { type: "json_schema", name: "summary", schema: { type: "object" } },
+    promptCacheKey: "summary",
+    settings: { temperature: 0 },
+  });
+  expect(prompt, "a Prompt is a value, not a Card").not.toBeInstanceOf(verify.AuthoredCard);
+  const writer = new Agent("writer", { prompt, execution_route: { kind: "wyrd_gateway", deployment: "openai" } });
+  expect(spec(writer).prompt, "an Agent holds its Prompt in the native form").toEqual({
+    provider: "openai",
+    model: "gpt-4o",
+    format: "chat_completion",
+    body: {
+      prompt_cache_key: "summary",
+      messages: [
+        { role: "system", content: "Be brief" },
+        { role: "user", content: "Summarise {{report}}" },
+        { role: "user", content: "Then list risks" },
+      ],
+      response_format: {
+        type: "json_schema",
+        json_schema: { name: "summary", schema: { type: "object" }, strict: true },
+      },
+      temperature: 0,
+    },
+  });
+  writer.validate();
+
+  expect(spec(judge()).prompt, "the verdict format is the canonical Verdict").toEqual({
+    provider: "openai",
+    model: "gpt-4o",
+    format: "chat_completion",
+    body: { messages: [{ role: "user", content: "Judge {{report}}" }] },
+    response_format: "verdict",
+  });
+
+  let refused: unknown;
+  try {
+    Prompt.openaiChat("");
+  } catch (error) {
+    refused = error;
+  }
+  expect(refused).toBeInstanceOf(WyrdError);
+  expect((refused as WyrdError).code).toBe("WYRD_PROMPT_400_EMPTY_MODEL");
 });

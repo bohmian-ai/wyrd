@@ -1260,6 +1260,7 @@ card_ref_shorthands!(
     model => Model,
     artifact => Artifact,
     experiment => Experiment,
+    prompt => Prompt,
     agent => Agent,
     mcp => Mcp,
     service => Service,

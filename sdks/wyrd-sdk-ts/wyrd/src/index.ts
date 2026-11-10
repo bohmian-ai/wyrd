@@ -3,7 +3,8 @@ import { DataType, Table, tableFromIPC, tableToIPC, type Field, type RecordBatch
 import { AsyncLocalStorage } from "node:async_hooks";
 import { createRequire } from "node:module";
 
-import type { AuthoredCard } from "./authoring.js";
+import * as definitions from "./definitions.js";
+import type { AuthoredCard } from "./definitions.js";
 import {
   authoredOf,
   IncompleteQueryStreamError,
@@ -1810,7 +1811,7 @@ export class Cards {
    *
    * @param root - A Card file or directory, loaded as
    * {@link Cards.declareFromPath} loads it, or the root Card from
-   * `wyrd-ai/authoring`, copied as it is now.
+   * the `verify` namespace, copied as it is now.
    * @returns The graph root and each Card's dependency-first outcome.
    * @throws {@link WyrdError} for a file that does not load or validate, from
    * the shared validation, such as `WYRD_LOADER_400_INVALID_ENVELOPE`, or the
@@ -2371,11 +2372,64 @@ function nativeInput(slot: string | undefined, value: VerifierInput): NativeVeri
   return { slot, valueJson: strictJson(slot === undefined ? "inputs" : `inputs.${slot}`, value) };
 }
 
+/** The wire Card reference, named here because `verify.CardRef` is the definition class. */
+type WireCardRef = CardRef;
+
 /**
- * Evidence values for `media` slots and the handle of one queued Verifier
- * execution: `verify.File`, `verify.ArtifactRef`, and `verify.Execution`.
+ * Card definitions and the evidence Verifiers accept: each named Card class,
+ * such as `verify.Service` or `verify.Verifier`, with its sub-values and the
+ * original native `verify.Prompt`; and `verify.File`, `verify.ArtifactRef`, and
+ * `verify.Execution` for `media` slots and queued executions.
  */
 export namespace verify {
+  export import Action = definitions.Action;
+  export import Agent = definitions.Agent;
+  export import Artifact = definitions.Artifact;
+  export import ArtifactFile = definitions.ArtifactFile;
+  export import Audit = definitions.Audit;
+  export import AuthoredCard = definitions.AuthoredCard;
+  export import Binding = definitions.Binding;
+  export import CardRef = definitions.CardRef;
+  export import Check = definitions.Check;
+  export import CodeSource = definitions.CodeSource;
+  export import Component = definitions.Component;
+  export import Data = definitions.Data;
+  export import Experiment = definitions.Experiment;
+  export import InputSlot = definitions.InputSlot;
+  export import Mcp = definitions.Mcp;
+  export import Model = definitions.Model;
+  export import Operator = definitions.Operator;
+  export import Prompt = definitions.Prompt;
+  export import Requirement = definitions.Requirement;
+  export import Service = definitions.Service;
+  export import Step = definitions.Step;
+  export import Trigger = definitions.Trigger;
+  export import Verifier = definitions.Verifier;
+  export type Authorable<T> = definitions.Authorable<T>;
+  export type BindingArg = definitions.BindingArg;
+  export type InputSlotArg = definitions.InputSlotArg;
+  export type ServiceOptions = definitions.ServiceOptions;
+  export type AgentOptions = definitions.AgentOptions;
+  export type VerifierOptions = definitions.VerifierOptions;
+  export type ArtifactOptions = definitions.ArtifactOptions;
+  export type ModelOptions = definitions.ModelOptions;
+  export type DataOptions = definitions.DataOptions;
+  export type ExperimentOptions = definitions.ExperimentOptions;
+  export type McpOptions = definitions.McpOptions;
+  export type AuditOptions = definitions.AuditOptions;
+  export type TriggerOptions = definitions.TriggerOptions;
+  export type OperatorOptions = definitions.OperatorOptions;
+  export type ComponentOptions = definitions.ComponentOptions;
+  export type BindingOptions = definitions.BindingOptions;
+  export type StepOptions = definitions.StepOptions;
+  export type MediaSlotOptions = definitions.MediaSlotOptions;
+  export type AgentActionOptions = definitions.AgentActionOptions;
+  export type CodeActionOptions = definitions.CodeActionOptions;
+  export type AgentCheckOptions = definitions.AgentCheckOptions;
+  export type CodeCheckOptions = definitions.CodeCheckOptions;
+  export type ResponseFormat = definitions.ResponseFormat;
+  export type OpenAiChatOptions = definitions.OpenAiChatOptions;
+
   /** How a {@link File} declares its format and display name. */
   export interface FileOptions {
     /** Canonical format name, such as `pdf`; omitted, the filename extension or the slot's only format decides. */
@@ -2414,7 +2468,7 @@ export namespace verify {
   export class ArtifactRef {
     constructor(
       /** The exact Artifact Card. */
-      readonly artifact: CardRef | string,
+      readonly artifact: WireCardRef | string,
       /** The file inside the Artifact, when it holds several. */
       readonly path?: string,
     ) {}
@@ -3036,7 +3090,7 @@ export class WyrdState {
    * Without `bundleDir` the graph is held in memory and no files are kept.
    *
    * @param root - The root Service: its Card file, or an authored Card from
-   * `wyrd-ai/authoring`, copied as it is now.
+   * the `verify` namespace, copied as it is now.
    * @param options - `client`, whose principal every call runs as (omitted,
    * the ambient client), and `bundleDir`, a directory the complete bundle is
    * published to and kept in, loadable offline with {@link WyrdState.fromPath}.

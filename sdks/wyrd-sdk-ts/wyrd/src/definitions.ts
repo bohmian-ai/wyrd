@@ -1,9 +1,11 @@
 /**
- * In-memory Card authoring in the Card YAML's own vocabulary, backed by the
- * shared Rust `wyrd_client::authoring` values.
+ * Card definitions in the Card YAML's own vocabulary, backed by the shared
+ * Rust `wyrd_client::verify` values and exported as the `verify` namespace.
  *
  * Each named Card class, such as {@link Service} or {@link Verifier}, is
- * constructed as `new Service(name, version, options)`; each sub-value, such
+ * constructed as `new Service(name, options)`; `options.version` is optional,
+ * and an omitted version is assigned at registration. An Agent's prompt is
+ * the original native {@link Prompt}, such as `Prompt.openaiChat(model)`. Each sub-value, such
  * as {@link Component} or {@link Step}, with the fields that identify it.
  * Every other method is named for the YAML field it edits, in camelCase, and
  * takes that field's YAML value: options and nested objects keep the YAML's
@@ -29,7 +31,7 @@ import { createRequire } from "node:module";
 
 import type { NativeAuthored as NativeAuthoredHandle, NativeValue as NativeValueHandle } from "../index.cjs";
 import type * as Wire from "./card-types.js";
-import { authoredNative, authoredOf, holdAuthored, jsonSnapshot, lifecycleValue } from "./native.js";
+import { authoredNative, authoredOf, holdAuthored, jsonSnapshot, lifecycleValue, projectedError } from "./native.js";
 
 const require = createRequire(import.meta.url);
 const { NativeAuthored, NativeValue } = require("../index.cjs") as typeof import("../index.cjs");
@@ -57,21 +59,23 @@ type Same<A, B> = [A] extends [B] ? ([B] extends [A] ? true : false) : false;
 /** {@link Authorable} for each member of `T`. */
 type AuthorableMember<T> = T extends Wire.CardRef
   ? T | AuthoredCard | CardRef
-  : T extends Wire.CodeSourceInline | Wire.CodeSourceArtifact
-    ? Shape<T> | CodeSource | ArtifactFile
-    : T extends Wire.WorkspaceSourceArtifact
-      ? Shape<T> | ArtifactFile
-      : T extends Wire.Step
-        ? Shape<T> | Step
-        : T extends Wire.Requirement
-          ? Shape<T> | Requirement
-          : T extends Wire.ServiceComponent
-            ? Shape<T> | Component
-            : T extends Wire.VerificationBinding
-              ? Shape<T> | Binding
-              : T extends Wire.TypedInputSlot
-                ? Shape<T> | InputSlot
-                : Shape<T>;
+  : T extends Wire.Prompt
+    ? Shape<T> | Prompt
+    : T extends Wire.CodeSourceInline | Wire.CodeSourceArtifact
+      ? Shape<T> | CodeSource | ArtifactFile
+      : T extends Wire.WorkspaceSourceArtifact
+        ? Shape<T> | ArtifactFile
+        : T extends Wire.Step
+          ? Shape<T> | Step
+          : T extends Wire.Requirement
+            ? Shape<T> | Requirement
+            : T extends Wire.ServiceComponent
+              ? Shape<T> | Component
+              : T extends Wire.VerificationBinding
+                ? Shape<T> | Binding
+                : T extends Wire.TypedInputSlot
+                  ? Shape<T> | InputSlot
+                  : Shape<T>;
 
 /** The members of `T`, each {@link Authorable}. */
 type Shape<T> = T extends readonly (infer U)[]
@@ -113,8 +117,6 @@ export type InputSlotArg = InputSlot | Wire.InputSlot | Readonly<Record<string, 
 type ServiceFields = Omit<Fields<Wire.ServiceSpec>, "verified_by"> & { readonly verified_by?: readonly BindingArg[] };
 /** Agent spec fields as authored. */
 type AgentFields = Omit<Fields<Wire.AgentSpec>, "verified_by"> & { readonly verified_by?: readonly BindingArg[] };
-/** Prompt spec fields as authored. */
-type PromptFields = Fields<Wire.PromptSpec>;
 /** Verifier spec fields as authored. */
 type VerifierFields = Omit<Fields<Wire.VerifierSpec>, "inputs"> & {
   readonly inputs?: Readonly<Record<string, InputSlotArg>>;
@@ -158,30 +160,34 @@ type CheckFields = Fields<
   Pick<Wire.CheckAgent, "inputs" | "workspace"> & Pick<Wire.CheckCode, "runtime" | "response_format">
 >;
 
+/**
+ * A Card's optional `version`; omitted, registration assigns it and
+ * references to the Card resolve to the version registered.
+ */
+type Versioned = { readonly version?: string };
+
 /** {@link Service} spec options. */
-export type ServiceOptions = ServiceFields;
+export type ServiceOptions = ServiceFields & Versioned;
 /** {@link Agent} spec options. */
-export type AgentOptions = AgentFields;
-/** {@link Prompt} spec options. */
-export type PromptOptions = PromptFields;
+export type AgentOptions = AgentFields & Versioned;
 /** {@link Verifier} spec options. */
-export type VerifierOptions = VerifierFields;
+export type VerifierOptions = VerifierFields & Versioned;
 /** {@link Artifact} spec options. */
-export type ArtifactOptions = ArtifactFields;
+export type ArtifactOptions = ArtifactFields & Versioned;
 /** {@link Model} spec options. */
-export type ModelOptions = ModelFields;
+export type ModelOptions = ModelFields & Versioned;
 /** {@link Data} spec options. */
-export type DataOptions = DataFields;
+export type DataOptions = DataFields & Versioned;
 /** {@link Experiment} spec options. */
-export type ExperimentOptions = ExperimentFields;
+export type ExperimentOptions = ExperimentFields & Versioned;
 /** {@link Mcp} spec options. */
-export type McpOptions = McpFields;
+export type McpOptions = McpFields & Versioned;
 /** {@link Audit} spec options. */
-export type AuditOptions = AuditFields;
+export type AuditOptions = AuditFields & Versioned;
 /** {@link Trigger} spec options. */
-export type TriggerOptions = TriggerFields;
+export type TriggerOptions = TriggerFields & Versioned;
 /** {@link Operator} spec options. */
-export type OperatorOptions = OperatorFields;
+export type OperatorOptions = OperatorFields & Versioned;
 /** {@link Component} fields other than its alias and reference. */
 export type ComponentOptions = Omit<ComponentFields, "alias" | "ref">;
 /** {@link Binding} fields other than its Verifier. */
@@ -306,12 +312,14 @@ export abstract class AuthoredCard {
   }
 
   /**
-   * The exact reference this Card registers as.
+   * The exact reference this Card registers as, or `undefined` while it has
+   * no version and registration assigns one.
    *
-   * @returns The reference.
+   * @returns The reference, when the version is known.
    */
-  cardRef(): CardRef {
-    return adopt(CardRef.prototype, authoredOf(this).cardRef());
+  cardRef(): CardRef | undefined {
+    const native = authoredOf(this).cardRef();
+    return native == null ? undefined : adopt(CardRef.prototype, native);
   }
 
   /**
@@ -340,16 +348,18 @@ export abstract class AuthoredCard {
 /** A Service Card: a running system, its components, and the Verifiers that check it. */
 export class Service extends AuthoredCard {
   /**
-   * An empty Service Card named `name` at `version`, with any spec fields given
-   * in `options`; nothing is validated until its graph is.
+   * An empty Service Card named `name`, at `options.version` when given, else
+   * at the version registration assigns, with any spec fields given in
+   * `options`; nothing is validated until its graph is.
    *
    * @param name - The Card name.
-   * @param version - The exact version.
-   * @param options - Spec fields, each set as its setter sets it.
+   * @param options - The optional version and spec fields, each set as its
+   * setter sets it.
    */
-  constructor(name: string, version: string, options: ServiceOptions = {}) {
+  constructor(name: string, options: ServiceOptions = {}) {
+    const { version, ...fields } = options;
     super(NativeAuthored.card("Service", name, version));
-    apply(this, options);
+    apply(this, fields);
   }
 
   /**
@@ -559,16 +569,18 @@ export class Service extends AuthoredCard {
 /** An Agent Card: a prompt run through an execution route with tools. */
 export class Agent extends AuthoredCard {
   /**
-   * An empty Agent Card named `name` at `version`, with any spec fields given
-   * in `options`; nothing is validated until its graph is.
+   * An empty Agent Card named `name`, at `options.version` when given, else
+   * at the version registration assigns, with any spec fields given in
+   * `options`; nothing is validated until its graph is.
    *
    * @param name - The Card name.
-   * @param version - The exact version.
-   * @param options - Spec fields, each set as its setter sets it.
+   * @param options - The optional version and spec fields, each set as its
+   * setter sets it.
    */
-  constructor(name: string, version: string, options: AgentOptions = {}) {
+  constructor(name: string, options: AgentOptions = {}) {
+    const { version, ...fields } = options;
     super(NativeAuthored.card("Agent", name, version));
-    apply(this, options);
+    apply(this, fields);
   }
 
   /**
@@ -642,136 +654,21 @@ export class Agent extends AuthoredCard {
   }
 }
 
-/** A Prompt Card: provider, model, and the authored prompt. */
-export class Prompt extends AuthoredCard {
-  /**
-   * An empty Prompt Card named `name` at `version`, with any spec fields given
-   * in `options`; nothing is validated until its graph is.
-   *
-   * @param name - The Card name.
-   * @param version - The exact version.
-   * @param options - Spec fields, each set as its setter sets it.
-   */
-  constructor(name: string, version: string, options: PromptOptions = {}) {
-    super(NativeAuthored.card("Prompt", name, version));
-    apply(this, options);
-  }
-
-  /**
-   * Set `provider`, replacing its earlier value and whatever it referenced.
-   *
-   * @param value - The new `provider`.
-   * @returns This value.
-   */
-  provider(value: Value<PromptFields, "provider">): this {
-    return set(this, "provider", value);
-  }
-
-  /**
-   * Set `model`, replacing its earlier value and whatever it referenced.
-   *
-   * @param value - The new `model`.
-   * @returns This value.
-   */
-  model(value: Value<PromptFields, "model">): this {
-    return set(this, "model", value);
-  }
-
-  /**
-   * Set `system`, replacing its earlier value and whatever it referenced.
-   *
-   * @param value - The new `system`.
-   * @returns This value.
-   */
-  system(value: Value<PromptFields, "system">): this {
-    return set(this, "system", value);
-  }
-
-  /**
-   * Set `settings`, replacing its earlier value and whatever it referenced.
-   *
-   * @param value - The new `settings`.
-   * @returns This value.
-   */
-  settings(value: Value<PromptFields, "settings">): this {
-    return set(this, "settings", value);
-  }
-
-  /**
-   * Set `response_format`, replacing its earlier value and whatever it referenced.
-   *
-   * @param value - The new `response_format`.
-   * @returns This value.
-   */
-  responseFormat(value: Value<PromptFields, "response_format">): this {
-    return set(this, "response_format", value);
-  }
-
-  /**
-   * Set `format`, replacing its earlier value and whatever it referenced.
-   *
-   * @param value - The new `format`.
-   * @returns This value.
-   */
-  format(value: Value<PromptFields, "format">): this {
-    return set(this, "format", value);
-  }
-
-  /**
-   * Set the whole `messages` list, replacing every earlier entry and whatever it referenced.
-   *
-   * @param items - The new entries.
-   * @returns This value.
-   */
-  messages(items: Value<PromptFields, "messages">): this {
-    return set(this, "messages", items);
-  }
-
-  /**
-   * Append one entry to `messages`; a repeated ID is refused at validation.
-   *
-   * @param item - The entry.
-   * @returns This value.
-   */
-  addMessage(item: Item<PromptFields, "messages">): this {
-    return add(this, "messages", item);
-  }
-
-  /**
-   * Set the whole `body` map, replacing every earlier entry and whatever it referenced.
-   *
-   * @param entries - The new entries.
-   * @returns This value.
-   */
-  body(entries: Value<PromptFields, "body">): this {
-    return set(this, "body", entries);
-  }
-
-  /**
-   * Insert the entry `key` into `body`; a repeated key is refused at validation.
-   *
-   * @param key - The entry's key.
-   * @param value - The entry's value.
-   * @returns This value.
-   */
-  addBody(key: string, value: Entry<PromptFields, "body">): this {
-    return insert(this, "body", key, value);
-  }
-}
-
 /** A Model Card: a trained model's interface, task, and signature. */
 export class Model extends AuthoredCard {
   /**
-   * An empty Model Card named `name` at `version`, with any spec fields given
-   * in `options`; nothing is validated until its graph is.
+   * An empty Model Card named `name`, at `options.version` when given, else
+   * at the version registration assigns, with any spec fields given in
+   * `options`; nothing is validated until its graph is.
    *
    * @param name - The Card name.
-   * @param version - The exact version.
-   * @param options - Spec fields, each set as its setter sets it.
+   * @param options - The optional version and spec fields, each set as its
+   * setter sets it.
    */
-  constructor(name: string, version: string, options: ModelOptions = {}) {
+  constructor(name: string, options: ModelOptions = {}) {
+    const { version, ...fields } = options;
     super(NativeAuthored.card("Model", name, version));
-    apply(this, options);
+    apply(this, fields);
   }
 
   /**
@@ -838,16 +735,18 @@ export class Model extends AuthoredCard {
 /** A Data Card: a dataset's interface, schema, splits, and target columns. */
 export class Data extends AuthoredCard {
   /**
-   * An empty Data Card named `name` at `version`, with any spec fields given
-   * in `options`; nothing is validated until its graph is.
+   * An empty Data Card named `name`, at `options.version` when given, else
+   * at the version registration assigns, with any spec fields given in
+   * `options`; nothing is validated until its graph is.
    *
    * @param name - The Card name.
-   * @param version - The exact version.
-   * @param options - Spec fields, each set as its setter sets it.
+   * @param options - The optional version and spec fields, each set as its
+   * setter sets it.
    */
-  constructor(name: string, version: string, options: DataOptions = {}) {
+  constructor(name: string, options: DataOptions = {}) {
+    const { version, ...fields } = options;
     super(NativeAuthored.card("Data", name, version));
-    apply(this, options);
+    apply(this, fields);
   }
 
   /**
@@ -955,16 +854,18 @@ export class Data extends AuthoredCard {
 /** An Experiment Card: the targets and parameters of a set of runs, with their summary metrics and best run. */
 export class Experiment extends AuthoredCard {
   /**
-   * An empty Experiment Card named `name` at `version`, with any spec fields given
-   * in `options`; nothing is validated until its graph is.
+   * An empty Experiment Card named `name`, at `options.version` when given, else
+   * at the version registration assigns, with any spec fields given in
+   * `options`; nothing is validated until its graph is.
    *
    * @param name - The Card name.
-   * @param version - The exact version.
-   * @param options - Spec fields, each set as its setter sets it.
+   * @param options - The optional version and spec fields, each set as its
+   * setter sets it.
    */
-  constructor(name: string, version: string, options: ExperimentOptions = {}) {
+  constructor(name: string, options: ExperimentOptions = {}) {
+    const { version, ...fields } = options;
     super(NativeAuthored.card("Experiment", name, version));
-    apply(this, options);
+    apply(this, fields);
   }
 
   /**
@@ -1123,16 +1024,18 @@ export class Experiment extends AuthoredCard {
 /** An Mcp Card: an MCP server and the tools it exposes. */
 export class Mcp extends AuthoredCard {
   /**
-   * An empty Mcp Card named `name` at `version`, with any spec fields given
-   * in `options`; nothing is validated until its graph is.
+   * An empty Mcp Card named `name`, at `options.version` when given, else
+   * at the version registration assigns, with any spec fields given in
+   * `options`; nothing is validated until its graph is.
    *
    * @param name - The Card name.
-   * @param version - The exact version.
-   * @param options - Spec fields, each set as its setter sets it.
+   * @param options - The optional version and spec fields, each set as its
+   * setter sets it.
    */
-  constructor(name: string, version: string, options: McpOptions = {}) {
+  constructor(name: string, options: McpOptions = {}) {
+    const { version, ...fields } = options;
     super(NativeAuthored.card("Mcp", name, version));
-    apply(this, options);
+    apply(this, fields);
   }
 
   /**
@@ -1230,16 +1133,18 @@ export class Mcp extends AuthoredCard {
 /** An Audit Card: subjects, policies, and evidence. */
 export class Audit extends AuthoredCard {
   /**
-   * An empty Audit Card named `name` at `version`, with any spec fields given
-   * in `options`; nothing is validated until its graph is.
+   * An empty Audit Card named `name`, at `options.version` when given, else
+   * at the version registration assigns, with any spec fields given in
+   * `options`; nothing is validated until its graph is.
    *
    * @param name - The Card name.
-   * @param version - The exact version.
-   * @param options - Spec fields, each set as its setter sets it.
+   * @param options - The optional version and spec fields, each set as its
+   * setter sets it.
    */
-  constructor(name: string, version: string, options: AuditOptions = {}) {
+  constructor(name: string, options: AuditOptions = {}) {
+    const { version, ...fields } = options;
     super(NativeAuthored.card("Audit", name, version));
-    apply(this, options);
+    apply(this, fields);
   }
 
   /**
@@ -1337,16 +1242,18 @@ export class Audit extends AuthoredCard {
 /** A Trigger Card: when a binding's Verifier runs. */
 export class Trigger extends AuthoredCard {
   /**
-   * An empty Trigger Card named `name` at `version`, with any spec fields given
-   * in `options`; nothing is validated until its graph is.
+   * An empty Trigger Card named `name`, at `options.version` when given, else
+   * at the version registration assigns, with any spec fields given in
+   * `options`; nothing is validated until its graph is.
    *
    * @param name - The Card name.
-   * @param version - The exact version.
-   * @param options - Spec fields, each set as its setter sets it.
+   * @param options - The optional version and spec fields, each set as its
+   * setter sets it.
    */
-  constructor(name: string, version: string, options: TriggerOptions = {}) {
+  constructor(name: string, options: TriggerOptions = {}) {
+    const { version, ...fields } = options;
     super(NativeAuthored.card("Trigger", name, version));
-    apply(this, options);
+    apply(this, fields);
   }
 
   /**
@@ -1403,16 +1310,18 @@ export class Trigger extends AuthoredCard {
 /** An Operator Card: what runs when a binding's Verifier fails or changes verdict. */
 export class Operator extends AuthoredCard {
   /**
-   * An empty Operator Card named `name` at `version`, with any spec fields given
-   * in `options`; nothing is validated until its graph is.
+   * An empty Operator Card named `name`, at `options.version` when given, else
+   * at the version registration assigns, with any spec fields given in
+   * `options`; nothing is validated until its graph is.
    *
    * @param name - The Card name.
-   * @param version - The exact version.
-   * @param options - Spec fields, each set as its setter sets it.
+   * @param options - The optional version and spec fields, each set as its
+   * setter sets it.
    */
-  constructor(name: string, version: string, options: OperatorOptions = {}) {
+  constructor(name: string, options: OperatorOptions = {}) {
+    const { version, ...fields } = options;
     super(NativeAuthored.card("Operator", name, version));
-    apply(this, options);
+    apply(this, fields);
   }
 
   /**
@@ -1451,16 +1360,18 @@ export class Operator extends AuthoredCard {
  */
 export class Verifier extends AuthoredCard {
   /**
-   * An empty Verifier Card named `name` at `version`, with any spec fields
-   * given in `options`; nothing is validated until its graph is.
+   * An empty Verifier Card named `name`, at `options.version` when given, else
+   * at the version registration assigns, with any spec fields given in
+   * `options`; nothing is validated until its graph is.
    *
    * @param name - The Card name.
-   * @param version - The exact version.
-   * @param options - Spec fields, each set as its setter sets it.
+   * @param options - The optional version and spec fields, each set as its
+   * setter sets it.
    */
-  constructor(name: string, version: string, options: VerifierOptions = {}) {
+  constructor(name: string, options: VerifierOptions = {}) {
+    const { version, ...fields } = options;
     super(NativeAuthored.card("Verifier", name, version));
-    apply(this, options);
+    apply(this, fields);
   }
 
   /**
@@ -1586,32 +1497,35 @@ export class Verifier extends AuthoredCard {
  */
 export class Artifact extends AuthoredCard {
   /**
-   * An empty Artifact Card named `name` at `version`, with any spec fields
-   * given in `options`; nothing is validated until its graph is.
+   * An empty Artifact Card named `name`, at `options.version` when given, else
+   * at the version registration assigns, with any spec fields given in
+   * `options`; nothing is validated until its graph is.
    *
    * @param name - The Card name.
-   * @param version - The exact version.
-   * @param options - Spec fields, each set as its setter sets it.
+   * @param options - The optional version and spec fields, each set as its
+   * setter sets it.
    */
-  constructor(name: string, version: string, options: ArtifactOptions = {}) {
+  constructor(name: string, options: ArtifactOptions = {}) {
+    const { version, ...fields } = options;
     super(NativeAuthored.card("Artifact", name, version));
-    apply(this, options);
+    apply(this, fields);
   }
 
   /**
-   * The `file` Artifact named `name` at `version`, published from the file or
-   * directory at `path` before its graph; nothing is read until it is
-   * published.
+   * The `file` Artifact named `name`, at `options.version` when given,
+   * published from the file or directory at `path` before its graph; nothing
+   * is read until it is published.
    *
    * @param name - The Card name.
-   * @param version - The exact version.
    * @param path - The local file or directory.
-   * @param options - Spec fields, each set as its setter sets it.
+   * @param options - The optional version and spec fields, each set as its
+   * setter sets it.
    * @returns The local Artifact.
    */
-  static fromPath(name: string, version: string, path: string, options: ArtifactOptions = {}): Artifact {
+  static fromPath(name: string, path: string, options: ArtifactOptions = {}): Artifact {
+    const { version, ...fields } = options;
     const artifact = adopt(Artifact.prototype, NativeAuthored.artifactFromPath(name, version, path));
-    apply(artifact, options);
+    apply(artifact, fields);
     return artifact;
   }
 
@@ -2352,6 +2266,65 @@ export class Check {
    */
   addWorkspace(key: string, value: Entry<CheckFields, "workspace">): this {
     return insert(this, "workspace", key, value);
+  }
+}
+
+/**
+ * One response format for {@link Prompt.openaiChat}: plain text, a JSON
+ * object, a named JSON Schema, or the canonical Verdict with an optional
+ * custom `data` schema, which the native builder expands.
+ */
+export type ResponseFormat =
+  | { readonly type: "text" }
+  | { readonly type: "json_object" }
+  | { readonly type: "json_schema"; readonly name: string; readonly schema: Readonly<Record<string, Wire.JsonValue>> }
+  | { readonly type: "verdict"; readonly data?: Readonly<Record<string, Wire.JsonValue>> };
+
+/** {@link Prompt.openaiChat} options, by the native builder's names. */
+export type OpenAiChatOptions = {
+  /** System message prepended to `messages`. */
+  readonly system?: string;
+  /** One user message, or several, in order. */
+  readonly messages?: string | readonly string[];
+  /** The response format emitted into the native request. */
+  readonly responseFormat?: ResponseFormat;
+  /** OpenAI prompt cache key. */
+  readonly promptCacheKey?: string;
+  /** Native OpenAI Chat generation settings, by their wire names. */
+  readonly settings?: Readonly<Record<string, Wire.JsonValue>>;
+};
+
+/**
+ * The original native Prompt, built by the shared Rust Prompt builder and
+ * held inline at an Agent's `prompt`; it registers with its Agent.
+ */
+export class Prompt {
+  /** Type-only identity: no other value is a Prompt, whatever its shape. */
+  declare private readonly family: "Prompt";
+
+  private constructor() {}
+
+  /**
+   * The native OpenAI Chat Prompt for `model`.
+   *
+   * @param model - The literal model name, such as `gpt-4o`.
+   * @param options - Messages, response format and settings.
+   * @returns The Prompt.
+   * @throws `WyrdError` from the native builder, such as
+   * `WYRD_PROMPT_400_EMPTY_MODEL` or `WYRD_PROMPT_400_INVALID_RESPONSE_SCHEMA`.
+   */
+  static openaiChat(model: string, options: OpenAiChatOptions = {}): Prompt {
+    const { messages, responseFormat, promptCacheKey, ...rest } = options;
+    const built = NativeAuthored.promptOpenaiChat(model, {
+      ...rest,
+      messages: typeof messages === "string" ? [messages] : messages === undefined ? undefined : [...messages],
+      responseFormat,
+      promptCacheKey,
+    });
+    if (!(built instanceof NativeAuthored)) {
+      throw projectedError(built) ?? new TypeError("the Prompt builder returned no Prompt");
+    }
+    return adopt(Prompt.prototype, built);
   }
 }
 

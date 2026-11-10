@@ -3,19 +3,33 @@
 /** One shared Rust authoring value, edited in place by its YAML field names. */
 export declare class NativeAuthored {
   /**
-   * An empty `kind` Card named `name` at `version`; nothing is validated
-   * until its graph is.
+   * An empty `kind` Card named `name`, at `version` when given, else at
+   * the version registration assigns; nothing is validated until its
+   * graph is.
    *
    * # Errors
    *
    * Returns `InvalidArg` for a kind that is not an authorable Card kind.
    */
-  static card(kind: string, name: string, version: string): NativeAuthored
+  static card(kind: string, name: string, version?: string | undefined | null): NativeAuthored
   /**
-   * The `file` Artifact named `name` at `version`, published from the
-   * file or directory at `path` before its graph; nothing is read now.
+   * The `file` Artifact named `name`, at `version` when given, published
+   * from the file or directory at `path` before its graph; nothing is
+   * read now.
    */
-  static artifactFromPath(name: string, version: string, path: string): NativeAuthored
+  static artifactFromPath(name: string, version: string | undefined | null, path: string): NativeAuthored
+  /**
+   * The original native OpenAI Chat Prompt for `model`, built by the
+   * shared Prompt builder, or the builder's stable refusal.
+   *
+   * # Errors
+   *
+   * Returns `InvalidArg` for `settings` that are not OpenAI Chat
+   * settings or a `response_format` that names no format; the builder's
+   * own refusal, such as `WYRD_PROMPT_400_EMPTY_MODEL`, is returned as
+   * the error value.
+   */
+  static promptOpenaiChat(model: string, options: NativeOpenAiChatOptions): NativeAuthored | NativeWyrdError
   /**
    * The component `alias` for `reference`: a Card, an exact `CardRef`,
    * or a reference path.
@@ -220,13 +234,14 @@ export declare class NativeAuthored {
    */
   file(path: string): NativeAuthored
   /**
-   * The exact reference this Card registers as.
+   * The exact reference this Card registers as, or `None` while it has
+   * no version and registration assigns one.
    *
    * # Errors
    *
    * Returns `InvalidArg` when this value is not a Card.
    */
-  cardRef(): NativeAuthored
+  cardRef(): NativeAuthored | null
   /**
    * This exact reference's kind, name, and version, as authored.
    *
@@ -1627,6 +1642,23 @@ export interface NativeLifecycleResult {
 }
 
 /**
+ * The OpenAI Chat options `Prompt.openaiChat` takes, by their builder
+ * names.
+ */
+export interface NativeOpenAiChatOptions {
+  /** System message prepended to `messages`. */
+  system?: string
+  /** User message strings, each one native user message. */
+  messages?: Array<string>
+  /** The response format emitted into the native request. */
+  responseFormat?: NativeResponseFormat
+  /** OpenAI prompt cache key. */
+  promptCacheKey?: string
+  /** Native OpenAI Chat generation settings, by their wire names. */
+  settings?: any
+}
+
+/**
  * Closed result of connecting one Operator connection handle: the handle or a
  * catalog error.
  */
@@ -1703,6 +1735,22 @@ export interface NativeQueryStep {
   errorRemediation?: string
   /** Serialized JSON-safe structured details for a failed native step. */
   errorDetailsJson?: string
+}
+
+/**
+ * One response format: `text`, `json_object`, `json_schema` with its
+ * `name` and `schema`, or the canonical `verdict` with optional custom
+ * `data` schema.
+ */
+export interface NativeResponseFormat {
+  /** The format's name. */
+  type: string
+  /** A JSON Schema format's name. */
+  name?: string
+  /** A JSON Schema format's schema. */
+  schema?: any
+  /** A Verdict's custom data schema. */
+  data?: any
 }
 
 /**

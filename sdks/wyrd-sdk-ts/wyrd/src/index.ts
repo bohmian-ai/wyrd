@@ -41,6 +41,11 @@ import type {
   GatewayPolicySubject,
   GatewayPolicyTarget,
   GatewayPriceRate,
+  GithubAppIdentity,
+  GithubConnectResponse,
+  GithubConnectionState,
+  GithubConnectionView,
+  GithubRepositoryAccess,
   HttpAuthScheme,
   HttpConnectionAuth,
   IssuedCredential,
@@ -127,6 +132,7 @@ const {
 type NativeBifrost = import("../index.cjs").NativeBifrost;
 type NativeCards = import("../index.cjs").NativeCards;
 type NativeOperatorConnections = import("../index.cjs").NativeOperatorConnections;
+type NativeGithubConnection = import("../index.cjs").NativeGithubConnection;
 type NativePrincipals = import("../index.cjs").NativePrincipals;
 type NativeGateway = import("../index.cjs").NativeGateway;
 type NativeWyrdClient = import("../index.cjs").NativeWyrdClient;
@@ -191,6 +197,11 @@ export type {
   GatewayPolicySubject,
   GatewayPolicyTarget,
   GatewayPriceRate,
+  GithubAppIdentity,
+  GithubConnectResponse,
+  GithubConnectionState,
+  GithubConnectionView,
+  GithubRepositoryAccess,
   HttpAuthScheme,
   HttpConnectionAuth,
   IssuedCredential,
@@ -2132,6 +2143,75 @@ export class OperatorConnections {
    */
   async disable(connectionId: string): Promise<OperatorConnectionView> {
     return lifecycleValue<OperatorConnectionView>(await this.#native.disable(connectionId));
+  }
+}
+
+/**
+ * Tenant GitHub connection client over the shared Rust handle.
+ *
+ * Connects, reads, and disconnects the deployment's configured GitHub App.
+ * The server verifies, associates, authorizes, and audits; every response is
+ * the redacted {@link GithubConnectionView} or the transaction receipt, and
+ * failures throw a structured {@link WyrdError}.
+ */
+export class GithubConnection {
+  readonly #native: NativeGithubConnection;
+
+  private constructor(native: NativeGithubConnection) {
+    this.#native = native;
+  }
+
+  /**
+   * Connect a GitHub connection client, completing any credential exchange
+   * the client requires before resolving. A presented-as-is bearer or fresh
+   * cached token is reused without a request, so a later call may still be
+   * refused.
+   *
+   * @param options - `client` to call the server as; omitted, the ambient
+   * client is resolved.
+   * @returns The connection client.
+   * @throws {@link WyrdError} when the ambient client cannot be resolved or a
+   * required credential exchange is refused or unreachable.
+   */
+  static async connect(options: ClientOptions = {}): Promise<GithubConnection> {
+    const connection = await wyrdClientNative(clientOf(options)).githubConnection();
+    return new GithubConnection(nativeHandle(connection.handle, connection.error));
+  }
+
+  /**
+   * Begin a connection transaction; requires `identity_connections:write`.
+   * Open `authorization_url` in a browser signed in to Wyrd as the same
+   * principal to complete it.
+   *
+   * @returns GitHub's install URL and the instant the transaction expires.
+   * @throws {@link WyrdError} `WYRD_GITHUB_503_NOT_CONFIGURED` when the
+   * deployment has no GitHub App, or a transport or authorization failure.
+   */
+  async begin(): Promise<GithubConnectResponse> {
+    return lifecycleValue<GithubConnectResponse>(await this.#native.begin());
+  }
+
+  /**
+   * Read the tenant's connection; requires `identity_connections:write`.
+   *
+   * @returns The redacted connection view, `not_connected` when none.
+   * @throws {@link WyrdError} `WYRD_GITHUB_503_NOT_CONFIGURED` when the
+   * deployment has no GitHub App, or a transport or authorization failure.
+   */
+  async get(): Promise<GithubConnectionView> {
+    return lifecycleValue<GithubConnectionView>(await this.#native.get());
+  }
+
+  /**
+   * Release the tenant's installation; requires `identity_connections:write`.
+   *
+   * @returns The released, `not_connected` view.
+   * @throws {@link WyrdError} `WYRD_GITHUB_404_NOT_CONNECTED` when no
+   * installation is associated, `WYRD_GITHUB_503_NOT_CONFIGURED` when the
+   * deployment has no GitHub App, or a transport or authorization failure.
+   */
+  async disconnect(): Promise<GithubConnectionView> {
+    return lifecycleValue<GithubConnectionView>(await this.#native.disconnect());
   }
 }
 

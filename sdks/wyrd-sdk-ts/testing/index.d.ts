@@ -6,7 +6,16 @@ import type {
   WyrdClient,
 } from "wyrd-ai";
 
-export { NativeWyrdTestServer, type NativeTestServerOptions, startTestServer } from "./native.cjs";
+export {
+  type NativeBrowserAnswer,
+  type NativeGithubAppMock,
+  type NativeGithubBrowser,
+  type NativeGithubRepository,
+  NativeWyrdTestServer,
+  type NativeTestServerOptions,
+  signInGithubBrowser,
+  startTestServer,
+} from "./native.cjs";
 
 /** One loader diagnostic reported by {@link cli.declareCheck}. */
 export interface CheckDiagnostic {

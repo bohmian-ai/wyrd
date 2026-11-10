@@ -194,6 +194,8 @@ export interface ServerOptions {
   readonly accessTtlSeconds?: number;
   /** Scribe outbox capacity in items; the production capacity by default. */
   readonly scribeOutboxCapacity?: number;
+  /** Configure the deployment's GitHub App against a loopback GitHub mock, reachable as `server.githubApp`. */
+  readonly githubApp?: boolean;
   /** Start a fresh server for every test instead of one per story file. */
   readonly perTest?: boolean;
 }
@@ -240,6 +242,7 @@ export function serverTest(options: ServerOptions = {}) {
           verificationRuntime: options.verificationRuntime,
           accessTtlSeconds: options.accessTtlSeconds,
           scribeOutboxCapacity: options.scribeOutboxCapacity,
+          githubApp: options.githubApp,
         });
         deploy(server);
         await use(server);

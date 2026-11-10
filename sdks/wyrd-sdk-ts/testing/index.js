@@ -6,7 +6,7 @@ import { WyrdError } from "wyrd-ai";
 
 const native = createRequire(import.meta.url)("./native.cjs");
 
-export const { NativeWyrdTestServer, startTestServer } = native;
+export const { NativeWyrdTestServer, signInGithubBrowser, startTestServer } = native;
 
 /** Read the explicit client a command runs as, or none for the ambient chain. */
 async function connection(options) {

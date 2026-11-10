@@ -16,10 +16,12 @@ use vala_bifrost_redux::catalog::{CreateTableRequest, TableRef};
 use vala_bifrost_redux::namespaces::BifrostNamespace;
 use wyrd_spec::error::WyrdError;
 use wyrd_testing::Bootstrap;
+use wyrd_testing::github::GithubAppMock;
 use wyrd_testing::human_login::HumanSso;
 use wyrd_testing::server::{WyrdTestServer, WyrdTestServerError};
 
 pub mod cli;
+pub mod github;
 
 /// In-process server handle used only by TypeScript integration tests.
 ///
@@ -43,6 +45,9 @@ pub struct NativeWyrdTestServer {
     api_key: String,
     /// Card the writer principal is scoped to, which its rows correlate to.
     card_ref: String,
+    /// The loopback GitHub App the server is configured against, when started
+    /// with `githubApp`.
+    github: Option<GithubAppMock>,
 }
 
 #[napi]
@@ -174,6 +179,29 @@ impl NativeWyrdTestServer {
             .as_ref()
             .ok_or_else(|| harness("test server is shut down"))?;
         call(server).map_err(WyrdError::from)
+    }
+
+    /// The fixture tenant's slug, which a browser signs in to.
+    ///
+    /// # Errors
+    ///
+    /// Returns a napi error when the harness is closed.
+    #[napi(getter)]
+    pub fn tenant_slug(&self) -> Result<String> {
+        self.with_server(|server| Ok(server.pg_fixture().tenant_slug().to_owned()))
+    }
+
+    /// The loopback GitHub App this server is configured against.
+    ///
+    /// # Errors
+    ///
+    /// Returns a napi error when the server was started without `githubApp`.
+    #[napi(getter)]
+    pub fn github_app(&self) -> Result<github::NativeGithubAppMock> {
+        self.github
+            .clone()
+            .map(|mock| github::NativeGithubAppMock { mock })
+            .ok_or_else(|| reason("the test server was started without githubApp"))
     }
 
     /// Mint an API key for a principal holding exactly `permissions`.
@@ -636,6 +664,9 @@ pub struct NativeTestServerOptions {
     /// Scribe outbox capacity in items, so a journey can fill verification
     /// staging with a few calls; omitted keeps the production capacity.
     pub scribe_outbox_capacity: Option<u32>,
+    /// `true` configures the deployment's GitHub App against a fresh loopback
+    /// GitHub mock, reachable as `githubApp`; omitted, no App is configured.
+    pub github_app: Option<bool>,
 }
 
 /// Starts a real bound Wyrd test server and mints an admin access token.
@@ -655,6 +686,7 @@ pub fn start_test_server(
         verification_runtime: None,
         access_ttl_seconds: None,
         scribe_outbox_capacity: None,
+        github_app: None,
     });
     let provider_root = options
         .provider_base_url
@@ -670,12 +702,14 @@ pub fn start_test_server(
         options.verification_runtime.unwrap_or(false),
         options.access_ttl_seconds,
         options.scribe_outbox_capacity,
+        options.github_app.unwrap_or(false),
     )))
 }
 
 /// Starts the bound harness with the requested test-only capabilities.
 ///
-/// `scribe_outbox_capacity` replaces the Scribe outbox capacity when set.
+/// `scribe_outbox_capacity` replaces the Scribe outbox capacity when set;
+/// `github_app` configures the GitHub App against a fresh loopback mock.
 ///
 /// # Errors
 ///
@@ -685,8 +719,16 @@ async fn start_test_server_async(
     verification_runtime: bool,
     access_ttl_seconds: Option<u32>,
     scribe_outbox_capacity: Option<u32>,
+    github_app: bool,
 ) -> napi::Result<NativeWyrdTestServer> {
     let mut builder = WyrdTestServer::builder();
+    let github = github_app
+        .then(GithubAppMock::start)
+        .transpose()
+        .map_err(reason)?;
+    if let Some(mock) = &github {
+        builder = builder.with_github_app_for_test(mock);
+    }
     if let Some(capacity) = scribe_outbox_capacity {
         builder = builder.with_scribe_outbox_capacity_for_test(capacity as usize);
     }
@@ -758,6 +800,7 @@ async fn start_test_server_async(
         table_fqn: format!("bifrost.bifrost.{table_name}"),
         api_key: secrecy::ExposeSecret::expose_secret(&api_key).to_owned(),
         card_ref,
+        github,
     })
 }
 

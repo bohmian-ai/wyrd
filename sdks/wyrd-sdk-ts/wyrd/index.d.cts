@@ -605,6 +605,38 @@ export declare class NativeGateway {
   capturePolicy(): Promise<NativeLifecycleResult>
 }
 
+/** Tenant-scoped GitHub connection handle over the shared `wyrd_client` handle. */
+export declare class NativeGithubConnection {
+  /**
+   * Begins one connection transaction and returns GitHub's install URL
+   * and its expiry.
+   *
+   * # Errors
+   *
+   * Returns a napi error only when the receipt cannot be serialized; a
+   * server refusal is returned in the result.
+   */
+  begin(): Promise<NativeLifecycleResult>
+  /**
+   * Reads the tenant's redacted connection view.
+   *
+   * # Errors
+   *
+   * Returns a napi error only when the view cannot be serialized; a
+   * server refusal is returned in the result.
+   */
+  get(): Promise<NativeLifecycleResult>
+  /**
+   * Releases the tenant's installation and returns the released view.
+   *
+   * # Errors
+   *
+   * Returns a napi error only when the view cannot be serialized; a
+   * server refusal is returned in the result.
+   */
+  disconnect(): Promise<NativeLifecycleResult>
+}
+
 /** Tenant-scoped Operator connection handle over the shared `wyrd_client` handle. */
 export declare class NativeOperatorConnections {
   /**
@@ -975,6 +1007,20 @@ export declare class NativeWyrdClient {
    */
   gateway(): Promise<NativeGatewayConnection>
   /**
+   * Connects one GitHub connection handle that calls the server as this client.
+   *
+   * Completes any credential exchange this client requires before
+   * resolving, as `GithubConnection::connect_with` does; the public
+   * TypeScript `GithubConnection.connect` passes the caller's client or the
+   * ambient one. A refused or unreachable exchange is returned as catalog
+   * metadata.
+   *
+   * # Errors
+   *
+   * Never returns a napi error; failures are carried in the result.
+   */
+  githubConnection(): Promise<NativeGithubConnectionConnection>
+  /**
    * Connects one Operator connection handle that calls the server as this client.
    *
    * Completes any credential exchange this client requires before
@@ -1277,6 +1323,17 @@ export interface NativeFileInput {
 export interface NativeGatewayConnection {
   /** Connected handle when the connection succeeded. */
   handle?: NativeGateway
+  /** Catalog failure otherwise. */
+  error?: NativeWyrdError
+}
+
+/**
+ * Closed result of connecting one GitHub connection handle: the handle or a
+ * catalog error.
+ */
+export interface NativeGithubConnectionConnection {
+  /** Connected handle when the connection succeeded. */
+  handle?: NativeGithubConnection
   /** Catalog failure otherwise. */
   error?: NativeWyrdError
 }

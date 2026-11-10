@@ -100,3 +100,50 @@ Contract: this remediation plus the original task 001, under spec revision 3. Th
 | R11 | FIND-001-4 | The SDK registration and source of that story are removed, with no alternate engine or SDK control | `isolated_capacity.rs` deleted and its `mod` line dropped; the diff audit |
 | R12 | FIND-001-5 | The changed defaults test has meaningful `# Panics` documentation and its exact test passes | rustdoc at `verification/mod.rs`, plus the exact selector |
 | R13 | Preserved scope | Format, lints, `check:deps` and `git diff --check` pass; no new API, dependency or config | the lanes and the diff audit |
+
+
+## Human-approved revision — capacity defaults and server configuration (2026-11-10)
+
+The user approved this addition after remediation had started. It is new human-directed scope, separate from the independently validated FIND-001-1 through FIND-001-5; do not assign another finding ID or rewrite the historical review reports. Continue the existing remediation and include this revision in its delivery and closure review.
+
+This revision supersedes the earlier instruction to keep existing capacity defaults and the “no new … config” restriction in R13, only for the settings specified here. All five findings, their corrections and other preserved behavior remain applicable.
+
+### Revised defaults
+
+| Per-process setting | Previous default | Approved default |
+|---|---:|---:|
+| Direct executions | 16 | 256 |
+| Queued executions | 64 | 64 |
+| Direct concurrent model calls | 16 | 256 |
+| Queued concurrent model calls | 48 | 256 |
+
+Retain the existing Python worker/waiter/prewarm, workspace, memory and execution-timeout defaults. Keep direct and queued ownership independent, with no borrowing and the same engine and gateway governance. These values provide initial concurrency headroom; they are not benchmark-backed throughput or latency guarantees. Resource-heavy workflows remain constrained by their Python/workspace allowances, and downstream gateway/provider capacity remains shared.
+
+### Use the normal startup configuration pattern
+
+Make the operator-facing verification capacities and execution timeout ordinary typed server configuration settings, following the existing server/Bifrost startup configuration conventions exactly: owner defaults, configuration-file values, environment overrides, then startup validation and composition of the existing runtime owners. Preserve the standard precedence of environment over configuration file over defaults. All existing per-lane execution/workspace/Python/model-call capacity overrides and the original queued execution timeout must work through this path; keep existing environment variable names.
+
+The current `VerificationConfig.limits` and `.runtime` fields are skipped during deserialization, leaving these settings environment-only. Close that gap through the existing configuration owner and loader. Nearby `LimitsConfig` and Bifrost runtime configuration demonstrate the established pattern; reuse the normal loader, override and validation stages. Do not introduce a parallel loader, configuration service, new initialization path or dependency. Do not expose internal lease, rewrap or maintenance timings merely because they share a runtime struct with an operator-facing setting. Express duration units using the existing configuration conventions.
+
+Validate the final merged values consistently regardless of source: configuration-file values must receive the same positivity, representability, memory-fit and cross-field checks as environment values. Invalid file values must not bypass validation that currently occurs during environment parsing. Keep FIND-001-1's checked aggregate arithmetic at its existing owner. Startup must project the resolved settings into the same HostedBlocks and queued runtime owners; configuration support must not create another resource owner.
+
+### Delivery and focused proof
+
+Update affected default assertions, configuration tests, operator configuration/limits documentation and implementation evidence. Remove the obsolete environment-only/no-TOML claim for these settings. Regenerate affected documentation projections using the existing generator; do not hand-edit generated files.
+
+Prove the approved defaults, file-only overrides reaching the resolved runtime settings, environment-over-file precedence, and invalid file/environment refusal with focused tests at the existing configuration/default owners. Include zero, unrepresentable and inconsistent memory/count cases relevant to these settings, using the existing test patterns rather than a new harness. Retain the exact default/config selectors above; record actual exact selectors for new tests before RED. Preserve the real-client isolation journey and all five findings' focused closure proof. Run only the additional format/lint/generated-doc checks and documentation lane applicable to this revision's write set; no performance claim or new benchmark gate is required.
+
+The implementation obligations/evidence ledger must include this approved addition rather than claiming completion solely from R1–R13. Review this revision as human-directed acceptance scope alongside the original task, cumulative candidate and retained findings.
+
+## Obligations for the approved revision
+
+R13's "no new config" clause is superseded only for these settings.
+
+| ID | Source | Observation | Planned assertion |
+|---|---|---|---|
+| H1 | Revised defaults | Direct executions 256, queued executions 64, direct and queued model calls 256 each; Python, workspace, memory and timeout defaults unchanged | `lanes_split_the_memory_ceilings` asserts `(direct_executions, direct.model_calls, queued.model_calls) == (256, 256, 256)` beside the retained worker, workspace and waiter totals; `production_defaults_are_the_specified_ceilings` keeps `(64, 5 min)` |
+| H2 | Startup pattern | Per-lane workspaces, Python workers and waiters, model calls, direct and queued executions, and the execution timeout are typed `[verification]` file settings on the existing loader; lease and maintenance timings stay internal | new `config::tests::verification_capacity_file_values_resolve_under_env`: TOML values reach `limits` and `runtime` |
+| H3 | Precedence | Env over file over defaults, with the existing env names | same test: the env value wins over the file value for one setting, and the other file values stay |
+| H4 | Validation parity | Zero, unrepresentable and inconsistent file values get the same refusals as env values | same test: a zero file count is refused naming its key; file Python workers that overflow the pool are refused by the shared `lanes_fit` predicate; a file `monty_min_workers` conflict is refused; a negative value fails TOML parsing |
+| H5 | One owner | The resolved settings reach the same HostedBlocks and runtime owners, with no new loader or owner | `VerificationConfig::limits`/`runtime` stay the only projection; the diff audit |
+| H6 | Docs | Operator limits and configure pages describe the file keys and the new defaults, the env-only claim is removed, and generated projections are regenerated | `docs:check`, plus the docs diff |

@@ -1495,7 +1495,7 @@ pub(super) fn relay(status: u16, body: ResponseBody) -> Response {
         ResponseBody::Json(raw) => (
             status,
             [(CONTENT_TYPE, "application/json")],
-            Box::<str>::from(raw).into_string(),
+            raw.into_string(),
         )
             .into_response(),
         ResponseBody::Media(answer) => {

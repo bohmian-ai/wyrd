@@ -448,7 +448,20 @@ impl OpenAiClient {
         route: OpenAiRoute,
         body: Vec<u8>,
     ) -> ProviderResult<Box<RawValue>> {
-        raw::send_raw(
+        let answer = self.send_raw_text(route, body).await?;
+        raw::answer_json("openai", answer)
+    }
+
+    /// Posts a caller-built body exactly as [`Self::send_raw`] does and
+    /// returns the successful answer as text without validating it as JSON,
+    /// for a caller that validates it in its own single pass.
+    ///
+    /// # Errors
+    ///
+    /// Returns the errors of [`Self::send_raw`] other than the answer's JSON
+    /// [`ProviderError::Decode`].
+    pub async fn send_raw_text(&self, route: OpenAiRoute, body: Vec<u8>) -> ProviderResult<String> {
+        raw::send_raw_text(
             &self.transport,
             "openai",
             &self.url(route),

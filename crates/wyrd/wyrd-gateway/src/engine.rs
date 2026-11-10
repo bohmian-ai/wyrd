@@ -83,13 +83,53 @@ pub struct ProviderAttempt<'a> {
     pub cancel: &'a CancellationToken,
 }
 
+/// One complete JSON value, held as its exact text without surrounding
+/// whitespace.
+///
+/// It is either a [`RawValue`] or answer text the adapter validated in the
+/// same pass that read its usage, so every holder carries checked JSON and
+/// relays its text unchanged.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct JsonAnswer(Box<str>);
+
+impl JsonAnswer {
+    /// Takes answer `text` that a full JSON decode of the adapter accepted,
+    /// trimming the surrounding whitespace a [`RawValue`] would not keep.
+    pub(crate) fn validated(text: String) -> Self {
+        let value = text.trim_matches([' ', '\t', '\n', '\r']);
+        if value.len() == text.len() {
+            Self(text.into_boxed_str())
+        } else {
+            Self(value.into())
+        }
+    }
+
+    /// The JSON text.
+    #[must_use]
+    pub fn get(&self) -> &str {
+        &self.0
+    }
+
+    /// Moves the JSON text out.
+    #[must_use]
+    pub fn into_string(self) -> String {
+        self.0.into_string()
+    }
+}
+
+impl From<Box<RawValue>> for JsonAnswer {
+    fn from(raw: Box<RawValue>) -> Self {
+        Self(raw.into())
+    }
+}
+
 /// Successful answer of an attempt, carried to the caller without
 /// reserialization.
 #[derive(Debug)]
 pub enum ResponseBody {
     /// Complete JSON answer: the provider's bytes for native passthrough, or
     /// the single serialization of a translated body.
-    Json(Box<RawValue>),
+    Json(JsonAnswer),
     /// Server-sent event frames relayed as they arrive.
     Events(EventStream),
     /// Non-JSON media answer, such as a text transcript, bounded by the
@@ -973,7 +1013,9 @@ mod tests {
     fn completed() -> AttemptResult {
         AttemptResult::Completed {
             body: ResponseBody::Json(
-                RawValue::from_string(r#"{"ok":true}"#.to_owned()).expect("json"),
+                RawValue::from_string(r#"{"ok":true}"#.to_owned())
+                    .expect("json")
+                    .into(),
             ),
             usage: AttemptUsage {
                 provider_usage_json: Some(r#"{"total_tokens":3}"#.to_owned()),

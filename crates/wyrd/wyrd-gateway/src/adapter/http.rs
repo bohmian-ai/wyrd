@@ -17,15 +17,15 @@ use skald_providers::{
     OpenAiMediaRoute, OpenAiRoute, ProviderByteStream, ProviderError, ProviderResult, RetryPolicy,
     VertexClient,
 };
-use skald_spec::{ProviderRequest, ProviderResponse};
+use skald_spec::ProviderRequest;
 use url::Url;
 use wyrd_spec::gateway::{GatewayOperation, ProviderAdapter, ProviderAuth, ProviderDeployment};
 use wyrd_spec::ids::ModelId;
 
 use super::stream::{ChatChunks, Frames, MediaCapture, StreamCapture, relay, relay_media};
 use super::{
-    BatchAction, IngressDialect, MediaRequest, NativeBody, Prepared, Wire, complete,
-    faithful_embeddings, prepare, refusal,
+    Answer, BatchAction, IngressDialect, MediaRequest, NativeBody, Prepared, Unmapped, Wire,
+    complete, faithful_embeddings, prepare, refusal,
 };
 use crate::credential::ProviderSecret;
 use crate::engine::{
@@ -336,9 +336,9 @@ impl Client {
 
     /// Sends `prepared` for `operation`.
     ///
-    /// Native bodies go to the client's raw route and come back unchanged as
-    /// [`ProviderResponse::RawV1`]; translated requests go through the typed
-    /// route and come back typed.
+    /// Native bodies go to the client's raw route and come back as
+    /// [`Answer::Native`] text, unchanged and not yet validated; translated
+    /// requests go through the typed route and come back typed.
     ///
     /// # Errors
     ///
@@ -349,44 +349,44 @@ impl Client {
         self,
         operation: GatewayOperation,
         prepared: Prepared<'_>,
-    ) -> ProviderResult<ProviderResponse> {
+    ) -> ProviderResult<Answer> {
         let raw = |body: &NativeBody<'_>| {
             body.to_json()
                 .map_err(|error| ProviderError::decode("gateway", error))
         };
         let response = match (self, prepared) {
             (Self::OpenAi(client), Prepared::Native(body)) => {
-                ProviderResponse::RawV1(client.send_raw(route(operation)?, raw(&body)?).await?)
+                Answer::Native(client.send_raw_text(route(operation)?, raw(&body)?).await?)
             }
             (Self::Anthropic(client), Prepared::Native(body)) => {
-                ProviderResponse::RawV1(client.send_raw(raw(&body)?).await?)
+                Answer::Native(client.send_raw_text(raw(&body)?).await?)
             }
             (Self::Google(client), Prepared::Native(body)) => {
-                ProviderResponse::RawV1(client.send_raw(raw(&body)?).await?)
+                Answer::Native(client.send_raw_text(raw(&body)?).await?)
             }
             (Self::Vertex(client), Prepared::Native(body)) => {
-                ProviderResponse::RawV1(client.send_raw(raw(&body)?).await?)
+                Answer::Native(client.send_raw_text(raw(&body)?).await?)
             }
-            (Self::Anthropic(client), Prepared::Anthropic(request)) => {
+            (Self::Anthropic(client), Prepared::Anthropic(request)) => Answer::Typed(Box::new(
                 client
                     .send_native(ProviderRequest::AnthropicMessage(*request))
-                    .await?
-            }
-            (Self::Google(client), Prepared::Google(request)) => {
+                    .await?,
+            )),
+            (Self::Google(client), Prepared::Google(request)) => Answer::Typed(Box::new(
                 client
                     .send_native(ProviderRequest::GeminiGenerateContent(*request))
-                    .await?
-            }
-            (Self::Vertex(client), Prepared::Google(request)) => {
+                    .await?,
+            )),
+            (Self::Vertex(client), Prepared::Google(request)) => Answer::Typed(Box::new(
                 client
                     .send_native(ProviderRequest::GeminiGenerateContent(*request))
-                    .await?
-            }
-            (Self::Jev(client), Prepared::Jev(request)) => {
+                    .await?,
+            )),
+            (Self::Jev(client), Prepared::Jev(request)) => Answer::Typed(Box::new(
                 client
                     .send_native(ProviderRequest::JevSystemOne(*request))
-                    .await?
-            }
+                    .await?,
+            )),
             (_, _) => return Err(mismatch()),
         };
         Ok(response)
@@ -478,12 +478,12 @@ fn failure(
 ///
 /// Returns `None` when capture is unselected, `raw` does not decode, or a
 /// string decodes from base64 to the credential.
-fn captured(attempt: &ProviderAttempt<'_>, raw: &RawValue) -> Option<ResponseCapture> {
+fn captured(attempt: &ProviderAttempt<'_>, raw: &str) -> Option<ResponseCapture> {
     if !attempt.capture {
         return None;
     }
     ResponseCapture::json(
-        serde_json::from_str(raw.get()).ok()?,
+        serde_json::from_str(raw).ok()?,
         attempt.credential.map(ProviderSecret::expose),
     )
 }
@@ -619,8 +619,8 @@ impl Client {
         match self.batch(action, attempt.model.as_str(), prepared).await {
             Ok(answer) => match serde_json::from_slice::<Box<RawValue>>(&answer.bytes) {
                 Ok(raw) if json(&answer.content_type) => AttemptResult::Completed {
-                    capture: captured(attempt, &raw),
-                    body: ResponseBody::Json(raw),
+                    capture: captured(attempt, raw.get()),
+                    body: ResponseBody::Json(raw.into()),
                     usage: AttemptUsage::default(),
                 },
                 _ => AttemptResult::Completed {
@@ -710,11 +710,9 @@ impl ProviderDispatch for HttpProviderDispatch {
             // A JSON media answer maps like any raw answer; other media
             // content returns unchanged with its content type.
             Some(media) => match client.media(media, prepared).await {
-                Ok(answer) if json(&answer.content_type) => {
-                    serde_json::from_slice::<Box<RawValue>>(&answer.bytes)
-                        .map(ProviderResponse::RawV1)
-                        .map_err(|error| ProviderError::decode("gateway", error))
-                }
+                Ok(answer) if json(&answer.content_type) => String::from_utf8(answer.bytes.into())
+                    .map(Answer::Native)
+                    .map_err(|error| ProviderError::decode("gateway", error)),
                 Ok(answer) => {
                     return AttemptResult::Completed {
                         capture: media_captured(&attempt, &answer),
@@ -744,7 +742,7 @@ impl ProviderDispatch for HttpProviderDispatch {
         match mapped {
             Ok((body, usage, decoded))
                 if attempt.operation != GatewayOperation::Embeddings
-                    || faithful_embeddings(attempt.body, &body) =>
+                    || faithful_embeddings(attempt.body, body.get()) =>
             {
                 AttemptResult::Completed {
                     capture: match decoded {
@@ -752,7 +750,7 @@ impl ProviderDispatch for HttpProviderDispatch {
                             decoded,
                             attempt.credential.map(ProviderSecret::expose),
                         ),
-                        None => captured(&attempt, &body),
+                        None => captured(&attempt, body.get()),
                     },
                     body: ResponseBody::Json(body),
                     usage,
@@ -760,10 +758,19 @@ impl ProviderDispatch for HttpProviderDispatch {
             }
             // An answer that cannot be mapped, or an embeddings answer that
             // ignores its request, fails rather than returning as success.
-            Ok((_, usage, _)) | Err(usage) => AttemptResult::Failed {
+            Ok((_, usage, _)) | Err(Unmapped::Unrepresentable(usage)) => AttemptResult::Failed {
                 class: FailureClass::Rejected,
                 usage,
             },
+            Err(Unmapped::Undecodable(error)) => {
+                let error = ProviderError::decode("gateway", error);
+                tracing::warn!(
+                    deployment = deployment.name.as_str(),
+                    code = error.code(),
+                    "gateway provider call failed"
+                );
+                failure(error, translated, attempt.credential)
+            }
         }
     }
 }

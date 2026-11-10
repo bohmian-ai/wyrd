@@ -76,7 +76,20 @@ impl GoogleClient {
     /// [`ProviderError::Timeout`], or [`ProviderError::Upstream`] when the
     /// exchange fails.
     pub async fn send_raw(&self, body: Vec<u8>) -> ProviderResult<Box<RawValue>> {
-        raw::send_raw(
+        let answer = self.send_raw_text(body).await?;
+        raw::answer_json("google", answer)
+    }
+
+    /// Posts a caller-built body exactly as [`Self::send_raw`] does and
+    /// returns the successful answer as text without validating it as JSON,
+    /// for a caller that validates it in its own single pass.
+    ///
+    /// # Errors
+    ///
+    /// Returns the errors of [`Self::send_raw`] other than the answer's JSON
+    /// [`ProviderError::Decode`].
+    pub async fn send_raw_text(&self, body: Vec<u8>) -> ProviderResult<String> {
+        raw::send_raw_text(
             &self.transport,
             "google",
             &self.model_url("generateContent"),

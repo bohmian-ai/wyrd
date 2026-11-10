@@ -56,7 +56,7 @@ use wyrd_spec::gateway::{
 use wyrd_spec::ids::ModelId;
 
 use crate::credential::ProviderSecret;
-use crate::engine::AttemptUsage;
+use crate::engine::{AttemptUsage, JsonAnswer};
 
 pub use batch::{BATCH_ENDPOINTS, BatchAction, BatchInput};
 pub use http::{BuiltinEndpoints, HttpProviderDispatch};
@@ -348,50 +348,66 @@ pub(crate) fn prepare<'a>(
     )
 }
 
+/// A successful provider answer as the adapter receives it.
+#[derive(Debug)]
+pub(crate) enum Answer {
+    /// Answer text of a native passthrough, not yet validated as JSON.
+    Native(String),
+    /// Answer of a translated request, decoded by its Skald client.
+    Typed(Box<ProviderResponse>),
+}
+
+/// Why a successful provider answer does not complete the attempt.
+#[derive(Debug)]
+pub(crate) enum Unmapped {
+    /// Native answer text that is not JSON at all, which may succeed at
+    /// another deployment.
+    Undecodable(serde_json::Error),
+    /// An answer the ingress dialect cannot represent, with the usage that
+    /// could be read.
+    Unrepresentable(AttemptUsage),
+}
+
 /// Maps a successful provider answer to the ingress dialect and extracts its
 /// usage.
 ///
-/// A raw answer is a native passthrough whose bytes return unchanged. When
-/// `capture` selects it, its parsed copy yields its usage, read as `wire`,
-/// and is returned for the capture projection, so a captured answer decodes
-/// once; otherwise only its usage member is decoded, under the same rules.
-/// Every other answer returns no decoded copy. Typed Anthropic and Google
-/// answers translate to a chat completion, serialized once and named `id`
-/// when the provider supplies no usable identifier. A typed Jev answer
+/// Native answer text is validated in the same single pass that reads its
+/// usage, read as `wire`, and its bytes return unchanged. When `capture`
+/// selects it, that pass is its whole decode, returned for the capture
+/// projection; otherwise only its usage member is decoded, under the same
+/// rules. Every other answer returns no decoded copy. Typed Anthropic and
+/// Google answers translate to a chat completion, serialized once and named
+/// `id` when the provider supplies no usable identifier. A typed Jev answer
 /// returns as Jev's own response with its usage, or, when `translated` (the
 /// Chat Completions pass-through), as a chat completion whose content is
 /// that answer's JSON.
 ///
 /// # Errors
 ///
-/// Returns the usage that could be read when a translated answer carries
-/// content, a finish state, or a shape the ingress dialect cannot represent,
-/// or when the answer is of a kind no prepared request produces.
+/// Returns [`Unmapped::Undecodable`] for native text that is not one JSON
+/// value. Returns [`Unmapped::Unrepresentable`] with the usage that could be
+/// read for native JSON a value decode rejects, such as an out-of-range
+/// number or excess nesting, when a translated answer carries content, a
+/// finish state, or a shape the ingress dialect cannot represent, or when the
+/// answer is of a kind no prepared request produces.
 pub(crate) fn complete(
-    response: ProviderResponse,
+    response: Answer,
     wire: Wire,
     translated: bool,
     capture: bool,
     id: &str,
     model: &str,
-) -> Result<(Box<RawValue>, AttemptUsage, Option<Value>), AttemptUsage> {
+) -> Result<(JsonAnswer, AttemptUsage, Option<Value>), Unmapped> {
     let chat_completion = |usage: AttemptUsage, chat: Option<OpenAiChatResponse>| {
         chat.and_then(|chat| to_raw_value(&chat).ok())
-            .map(|chat| (chat, usage.clone(), None))
-            .ok_or(usage)
+            .map(|chat| (chat.into(), usage.clone(), None))
+            .ok_or(Unmapped::Unrepresentable(usage))
+    };
+    let response = match response {
+        Answer::Native(text) => return native_answer(text, wire, capture),
+        Answer::Typed(response) => *response,
     };
     match response {
-        ProviderResponse::RawV1(raw) if capture => {
-            let body: Value =
-                serde_json::from_str(raw.get()).map_err(|_| AttemptUsage::default())?;
-            let usage = usage(wire, &body);
-            Ok((raw, usage, Some(body)))
-        }
-        ProviderResponse::RawV1(raw) => {
-            let member = usage_member(wire, raw.get()).map_err(|_| AttemptUsage::default())?;
-            let usage = member.map_or_else(AttemptUsage::default, |member| counted(wire, &member));
-            Ok((raw, usage, None))
-        }
         ProviderResponse::AnthropicMessage(native) => {
             let usage = usage(
                 Wire::Anthropic,
@@ -415,10 +431,45 @@ pub(crate) fn complete(
                 return chat_completion(usage, jev::chat_response(&answer, id));
             }
             to_raw_value(&answer)
-                .map(|body| (body, usage.clone(), None))
-                .map_err(|_| usage)
+                .map(|body| (body.into(), usage.clone(), None))
+                .map_err(|_| Unmapped::Unrepresentable(usage))
         }
-        _ => Err(AttemptUsage::default()),
+        _ => Err(Unmapped::Unrepresentable(AttemptUsage::default())),
+    }
+}
+
+/// Validates native answer `text` once while reading its `wire` usage: as a
+/// whole [`Value`] when `capture` selects it, otherwise through
+/// [`usage_member`].
+///
+/// A value decode accepts only text a [`RawValue`] accepts, so a decoded
+/// answer is checked JSON. Only a rejected answer is scanned again, to tell
+/// text that is not JSON from JSON a value decode refuses.
+///
+/// # Errors
+///
+/// Returns [`Unmapped::Undecodable`] when `text` is not one JSON value, and
+/// [`Unmapped::Unrepresentable`] with no usage for JSON a value decode
+/// rejects.
+fn native_answer(
+    text: String,
+    wire: Wire,
+    capture: bool,
+) -> Result<(JsonAnswer, AttemptUsage, Option<Value>), Unmapped> {
+    let read = if capture {
+        serde_json::from_str::<Value>(&text).map(|body| (usage(wire, &body), Some(body)))
+    } else {
+        usage_member(wire, &text).map(|member| {
+            let usage = member.map_or_else(AttemptUsage::default, |member| counted(wire, &member));
+            (usage, None)
+        })
+    };
+    match read {
+        Ok((usage, decoded)) => Ok((JsonAnswer::validated(text), usage, decoded)),
+        Err(_) => match serde_json::from_str::<&RawValue>(&text) {
+            Err(error) => Err(Unmapped::Undecodable(error)),
+            Ok(_) => Err(Unmapped::Unrepresentable(AttemptUsage::default())),
+        },
     }
 }
 
@@ -761,10 +812,10 @@ fn inputs(input: &OpenAiEmbeddingsInputView<'_>) -> (usize, bool) {
 /// every vector must have exactly that many values. A provider silently
 /// ignoring any of these would weaken the request, so the attempt fails
 /// instead of returning the answer.
-pub(crate) fn faithful_embeddings(request: &Value, answer: &RawValue) -> bool {
+pub(crate) fn faithful_embeddings(request: &Value, answer: &str) -> bool {
     let (Ok(request), Ok(answer)) = (
         OpenAiEmbeddingsRequestView::deserialize(request),
-        serde_json::from_str::<Value>(answer.get()),
+        serde_json::from_str::<Value>(answer),
     ) else {
         return false;
     };

@@ -770,7 +770,7 @@ impl<'a> GatewayInvocation<'a> {
                 requested: call.requested.clone(),
                 deployment,
                 status: refusal.status,
-                body: ResponseBody::Json(to_raw_value(&refusal.body).map_err(unavailable)?),
+                body: ResponseBody::Json(to_raw_value(&refusal.body).map_err(unavailable)?.into()),
             }),
             (GatewayCallOutcome::TimedOut, ..) => Err(WyrdError::GatewayDeadlineExceeded {
                 message: "the gateway call exceeded its deadline".to_owned(),

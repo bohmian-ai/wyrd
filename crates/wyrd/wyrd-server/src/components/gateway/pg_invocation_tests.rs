@@ -233,7 +233,9 @@ fn usage(input: u64, output: u64) -> AttemptUsage {
 fn completed(input: u64, output: u64) -> AttemptResult {
     AttemptResult::Completed {
         body: ResponseBody::Json(
-            serde_json::value::to_raw_value(&json!({"id": "chatcmpl-test"})).expect("json"),
+            serde_json::value::to_raw_value(&json!({"id": "chatcmpl-test"}))
+                .expect("json")
+                .into(),
         ),
         usage: usage(input, output),
         capture: None,
@@ -5988,7 +5990,8 @@ async fn gateway_agent_calls_start_only_on_a_compatible_adapter() {
                 "choices": [{"index": 0, "finish_reason": "stop",
                     "message": {"role": "assistant", "content": "ok"}}]
             }))
-            .expect("json"),
+            .expect("json")
+            .into(),
         ),
         usage: usage(1, 1),
         capture: None,

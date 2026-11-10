@@ -9,22 +9,53 @@ use crate::transport::HttpTransport;
 
 /// Sends serialized JSON `body` bytes unchanged and returns the raw JSON response.
 ///
-/// The body's allocation, spare capacity included, moves into the request and
-/// backs every exchange, retries included; the answer, as text whose invalid
-/// UTF-8 is replaced, becomes the returned value.
+/// The exchange is [`send_raw_text`]'s; its answer text must then be one JSON
+/// value, which becomes the returned value.
 ///
 /// # Errors
 ///
-/// Returns the errors of [`super::clients::send_bytes_with_retry`], or
-/// [`ProviderError::Decode`] when the answer is not JSON.
+/// Returns the errors of [`send_raw_text`], or [`ProviderError::Decode`] when
+/// the answer is not JSON.
 pub async fn send_raw(
+    transport: &HttpTransport,
+    provider: &str,
+    url: &str,
+    headers: HeaderMap,
+    body: Vec<u8>,
+    retry: &RetryPolicy,
+) -> ProviderResult<Box<RawValue>> {
+    let answer = send_raw_text(transport, provider, url, headers, body, retry).await?;
+    answer_json(provider, answer)
+}
+
+/// Validates a `provider`'s raw answer `text` as one JSON value.
+///
+/// # Errors
+///
+/// Returns [`ProviderError::Decode`] when `text` is not JSON.
+pub(crate) fn answer_json(provider: &str, text: String) -> ProviderResult<Box<RawValue>> {
+    RawValue::from_string(text).map_err(|error| ProviderError::decode(provider, error))
+}
+
+/// Sends serialized JSON `body` bytes unchanged and returns the successful
+/// answer as text without validating it as JSON.
+///
+/// The body's allocation, spare capacity included, moves into the request and
+/// backs every exchange, retries included; the answer, as text whose invalid
+/// UTF-8 is replaced, is returned for a caller that validates it in its own
+/// single pass, such as one that also reads members of it.
+///
+/// # Errors
+///
+/// Returns the errors of [`super::clients::send_bytes_with_retry`].
+pub async fn send_raw_text(
     transport: &HttpTransport,
     provider: &str,
     url: &str,
     mut headers: HeaderMap,
     body: Vec<u8>,
     retry: &RetryPolicy,
-) -> ProviderResult<Box<RawValue>> {
+) -> ProviderResult<String> {
     headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
     let answer = super::clients::send_bytes_with_retry(
         transport,
@@ -36,9 +67,7 @@ pub async fn send_raw(
         retry,
     )
     .await?;
-
-    RawValue::from_string(super::clients::answer_text(answer))
-        .map_err(|error| ProviderError::decode(provider, error))
+    Ok(super::clients::answer_text(answer))
 }
 
 #[cfg(test)]

@@ -29,7 +29,7 @@ pub use adapter::{
 pub use credential::{CredentialError, CredentialResolver, ProviderSecret};
 pub use engine::{
     AttemptRecord, AttemptResult, AttemptUsage, CallExecution, CallInput, EventStream,
-    ExecutionTiming, FailureClass, GatewayEngine, ProviderAttempt, ProviderDispatch,
+    ExecutionTiming, FailureClass, GatewayEngine, JsonAnswer, ProviderAttempt, ProviderDispatch,
     ProviderRefusal, ResponseBody, ResponseCapture, StreamAborted, StreamEnd, outcome_error_code,
     outcome_name,
 };

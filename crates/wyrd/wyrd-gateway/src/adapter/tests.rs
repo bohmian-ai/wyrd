@@ -1947,9 +1947,8 @@ fn raw_metadata_usage_matches_selected_capture_without_materializing_content() {
     let mut known = 0;
     for (wire, body) in cases {
         let complete = |capture| {
-            let raw = serde_json::value::RawValue::from_string(body.clone()).expect("raw JSON");
             super::complete(
-                skald_spec::ProviderResponse::RawV1(raw),
+                super::Answer::Native(body.clone()),
                 wire,
                 false,
                 capture,
@@ -1971,7 +1970,10 @@ fn raw_metadata_usage_matches_selected_capture_without_materializing_content() {
                 let expected = names.iter().find_map(|name| whole.get(name)).cloned();
                 assert_eq!(member, expected, "{label}");
             }
-            (Err(usage), Err(selected)) => {
+            (
+                Err(super::Unmapped::Unrepresentable(usage)),
+                Err(super::Unmapped::Unrepresentable(selected)),
+            ) => {
                 assert_eq!(usage, selected, "{label}");
                 assert!(super::usage_member(wire, &body).is_err(), "{label}");
             }
@@ -1981,6 +1983,192 @@ fn raw_metadata_usage_matches_selected_capture_without_materializing_content() {
         }
     }
     assert_eq!(known, 5, "the cases that carry representable usage");
+}
+
+/// Native answer text maps exactly as the former two-scan path did, where
+/// Skald first validated a `RawValue` and the adapter then decoded the
+/// usage member, or the whole answer for capture: the same trimmed answer
+/// bytes, usage, decoded capture copy, and failure class, now from one pass
+/// that keeps the answer's own allocation. Through dispatch, the relayed
+/// bytes are the provider's without surrounding whitespace, text that is not
+/// JSON fails as an upstream failure, JSON a value decode refuses fails as
+/// rejected, and a refusal still relays.
+///
+/// # Panics
+///
+/// Panics when the single pass disagrees with the former path, copies an
+/// answer it could keep, or dispatch classifies an answer differently.
+#[tokio::test]
+async fn native_response_validation_preserves_usage_capture_and_answer_bytes() {
+    use super::{Answer, Unmapped, Wire};
+    use serde_json::value::RawValue;
+
+    // `Ok` holds the relayed text, usage, and capture copy; `Err` whether the
+    // answer was not JSON at all.
+    type Mapped = Result<(String, AttemptUsage, Option<Value>), bool>;
+
+    let usage = r#"{"prompt_tokens": 3, "completion_tokens": 5, "total_tokens": 8}"#;
+    let deep = format!("{}{}", "[".repeat(200), "]".repeat(200));
+    let corpus = [
+        (Wire::OpenAi, format!(" \n{{\"id\": \"a\", \"usage\": {usage}}}\n\n")),
+        (Wire::OpenAi, format!(r#"{{"usage": {{"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2}}, "usage": {usage}}}"#)),
+        (Wire::OpenAi, format!(r#"{{"usage": {usage}, "text": "\"é\n"}}"#)),
+        (Wire::Google, r#"{"usageMetadata": {"promptTokenCount": 1, "candidatesTokenCount": 1}, "usage_metadata": {"promptTokenCount": 4, "candidatesTokenCount": 2}}"#.to_owned()),
+        (Wire::Anthropic, json!({"usage": {"input_tokens": u64::MAX, "output_tokens": 1, "cache_read_input_tokens": 1}}).to_string()),
+        (Wire::Jev, format!("[{{\"usage\": {usage}}}]")),
+        (Wire::OpenAi, "42".to_owned()),
+        (Wire::OpenAi, "\"text\"".to_owned()),
+        (Wire::OpenAi, "null".to_owned()),
+        (Wire::OpenAi, String::new()),
+        (Wire::OpenAi, " \t".to_owned()),
+        (Wire::OpenAi, "{\"usage\":".to_owned()),
+        (Wire::OpenAi, "{} x".to_owned()),
+        (Wire::OpenAi, "{}{}".to_owned()),
+        (Wire::OpenAi, "{\"a\": 1,}".to_owned()),
+        (Wire::OpenAi, r#"{"n": 1e400}"#.to_owned()),
+        (Wire::OpenAi, r#"{"n": -1e400, "usage": null}"#.to_owned()),
+        (Wire::OpenAi, r#"{"s": "\ud800"}"#.to_owned()),
+        (Wire::OpenAi, format!(r#"{{"usage": {usage}, "deep": {deep}}}"#)),
+        (Wire::OpenAi, format!(r#"{{"deep": {}{}}}"#, "[".repeat(126), "]".repeat(126))),
+    ];
+    let mut outcomes = [0_usize; 3];
+    for (wire, body) in &corpus {
+        let wire = *wire;
+        for capture in [false, true] {
+            let former: Mapped = match RawValue::from_string(body.clone()) {
+                Err(_) => Err(true),
+                Ok(raw) if capture => serde_json::from_str::<Value>(raw.get())
+                    .map(|whole| {
+                        (
+                            raw.get().to_owned(),
+                            super::usage(wire, &whole),
+                            Some(whole),
+                        )
+                    })
+                    .map_err(|_| false),
+                Ok(raw) => super::usage_member(wire, raw.get())
+                    .map(|member| {
+                        let usage = member.map_or_else(AttemptUsage::default, |member| {
+                            super::counted(wire, &member)
+                        });
+                        (raw.get().to_owned(), usage, None)
+                    })
+                    .map_err(|_| false),
+            };
+            let text = body.clone();
+            let backing = text.as_ptr();
+            let single = super::complete(Answer::Native(text), wire, false, capture, "id", "m");
+            let kept = matches!(&single, Ok((answer, ..)) if answer.get().as_ptr() == backing);
+            let single: Mapped = match single {
+                Ok((answer, usage, decoded)) => Ok((answer.into_string(), usage, decoded)),
+                Err(Unmapped::Undecodable(_)) => Err(true),
+                Err(Unmapped::Unrepresentable(usage)) => {
+                    assert_eq!(usage, AttemptUsage::default(), "{body:?}");
+                    Err(false)
+                }
+            };
+            assert_eq!(single, former, "{body:?} capture {capture}");
+            if let Ok((answer, ..)) = &single {
+                assert_eq!(
+                    kept,
+                    answer.len() == body.len(),
+                    "{body:?}: the answer's allocation is kept"
+                );
+            }
+            outcomes[match single {
+                Ok(_) => 0,
+                Err(false) => 1,
+                Err(true) => 2,
+            }] += 1;
+        }
+    }
+    assert_eq!(
+        outcomes,
+        [20, 8, 12],
+        "completed, unrepresentable, undecodable cases"
+    );
+
+    let server = MockServer::start().await;
+    let answer = format!("{{\"id\": \"chatcmpl-1\", \"choices\": [], \"usage\": {usage}}}");
+    for (user, status, body) in [
+        ("exact", 200, format!("  {answer}\r\n")),
+        ("malformed", 200, "{\"usage\":".to_owned()),
+        ("range", 200, r#"{"n": 1e400}"#.to_owned()),
+        ("refused", 400, r#"{"error": {"message": "no"}}"#.to_owned()),
+    ] {
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .and(wiremock::matchers::body_partial_json(json!({"user": user})))
+            .respond_with(ResponseTemplate::new(status).set_body_raw(body, "application/json"))
+            .mount(&server)
+            .await;
+    }
+    let dispatch = dispatch(&server);
+    let target = deployment("openai/gpt-5", json!("openai"), bearer());
+    let chat = |user: &str| json!({"model": "m", "messages": [], "user": user});
+    let exact = attempt(
+        &dispatch,
+        IngressDialect::OpenAi,
+        &target,
+        Some("cred"),
+        &chat("exact"),
+    )
+    .await;
+    let AttemptResult::Completed {
+        body: ResponseBody::Json(relayed),
+        usage: counted,
+        capture: None,
+    } = exact
+    else {
+        panic!("native answer expected: {exact:?}");
+    };
+    assert_eq!(
+        relayed.get(),
+        answer,
+        "relayed without surrounding whitespace"
+    );
+    assert!(counted.normalized.is_some(), "{counted:?}");
+    let captured = capturing(&dispatch, &target, "cred", &chat("exact"), false).await;
+    let AttemptResult::Completed {
+        body: ResponseBody::Json(relayed),
+        capture: Some(ResponseCapture::Json(copy)),
+        usage: selected,
+    } = captured
+    else {
+        panic!("captured answer expected: {captured:?}");
+    };
+    assert_eq!(relayed.get(), answer);
+    assert_eq!(copy, serde_json::from_str::<Value>(&answer).expect("json"));
+    assert_eq!(selected, counted, "capture reads the same usage");
+    for (user, expected) in [
+        ("malformed", FailureClass::Upstream),
+        ("range", FailureClass::Rejected),
+    ] {
+        let failed = attempt(
+            &dispatch,
+            IngressDialect::OpenAi,
+            &target,
+            Some("cred"),
+            &chat(user),
+        )
+        .await;
+        assert!(
+            matches!(&failed, AttemptResult::Failed { class, .. } if *class == expected),
+            "{user}: {failed:?}"
+        );
+    }
+    let refused = attempt(
+        &dispatch,
+        IngressDialect::OpenAi,
+        &target,
+        Some("cred"),
+        &chat("refused"),
+    )
+    .await;
+    assert!(
+        matches!(&refused, AttemptResult::Refused { status: 400, body, .. } if body["error"]["message"] == "no"),
+        "{refused:?}"
+    );
 }
 
 /// A provider refusal echoing the resolved credential, plainly or behind a
@@ -3127,9 +3315,8 @@ async fn selected_capture_is_scrubbed_bounded_and_leaves_answers_unchanged() {
     assert!(usage.normalized.is_some(), "{usage:?}");
     // The usage decode is the capture's only decode, and only when selected.
     for selected in [true, false] {
-        let native = serde_json::value::RawValue::from_string(answer.clone()).expect("raw");
         let (bytes, mapped, decoded) = super::complete(
-            skald_spec::ProviderResponse::RawV1(native),
+            super::Answer::Native(answer.clone()),
             super::Wire::OpenAi,
             false,
             selected,

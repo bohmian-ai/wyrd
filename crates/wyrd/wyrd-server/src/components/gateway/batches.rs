@@ -73,7 +73,7 @@ impl BatchAnswer {
     fn object(object: &impl serde::Serialize) -> Result<Self, WyrdError> {
         Ok(Self {
             status: 200,
-            body: ResponseBody::Json(to_raw_value(object).map_err(internal)?),
+            body: ResponseBody::Json(to_raw_value(object).map_err(internal)?.into()),
         })
     }
 }

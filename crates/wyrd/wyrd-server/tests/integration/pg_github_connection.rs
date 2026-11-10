@@ -177,6 +177,31 @@ async fn installation_tokens_follow_repository_access() {
         .expect("delivery sends");
     minted(&server, 1).await;
 
+    // No key, code or token is stored, and connecting created no binding.
+    let mut conn = server
+        .tenant_conn_for(server.data_tenant_id())
+        .await
+        .expect("tenant connection opens");
+    let stored: String = sqlx::query_scalar(
+        "SELECT coalesce((SELECT string_agg(row_to_json(g)::text, ' ') \
+                          FROM wyrd.github_installations g), '') \
+             || coalesce((SELECT string_agg(row_to_json(s)::text, ' ') \
+                          FROM wyrd.auth_login_state s), '')",
+    )
+    .fetch_one(&mut **conn.transaction())
+    .await
+    .expect("rows read");
+    let bindings: i64 = sqlx::query_scalar("SELECT count(*) FROM wyrd.verification_bindings")
+        .fetch_one(&mut **conn.transaction())
+        .await
+        .expect("bindings count");
+    conn.commit().await.expect("read commits");
+    assert!(stored.contains("101"), "the slot is read: {stored}");
+    for secret in mock.secrets() {
+        assert!(!stored.contains(&secret), "stored secret: {stored}");
+    }
+    assert_eq!(bindings, 0);
+
     let token = server
         .exchange_api_key(&api_key)
         .await
@@ -191,6 +216,27 @@ async fn installation_tokens_follow_repository_access() {
         .await
         .expect("disconnect responds");
     assert_eq!(disconnected.status(), 200);
+    for (request, status) in [
+        (
+            Request::post("/v1/integrations/github/connect")
+                .header("content-type", "application/json")
+                .body(Body::from("{}"))
+                .expect("request builds"),
+            201,
+        ),
+        (
+            Request::get("/v1/integrations/github")
+                .body(Body::empty())
+                .expect("request builds"),
+            200,
+        ),
+    ] {
+        let answered = server
+            .oneshot_authenticated(&token, request)
+            .await
+            .expect("request responds");
+        assert_eq!(answered.status(), status);
+    }
     let viewer = server
         .bootstrap_service_in_tenant(server.data_tenant_id(), "github_viewer", &["viewer"])
         .await
@@ -219,6 +265,8 @@ async fn installation_tokens_follow_repository_access() {
         "github_connection.setup",
         "github_connection.callback",
         "github_connection.disconnect",
+        "github_connection.connect",
+        "github_connection.read",
     ] {
         assert_eq!(
             decisions(&server, admin.id(), operation).await,

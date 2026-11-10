@@ -159,7 +159,18 @@ async fn connections_associate_only_after_github_confirms_them() {
 
     // Setup alone never associates: GitHub stops at authorization.
     mock.sign_out();
-    let stopped = admin.connect().await;
+    let begun_at = chrono::Utc::now();
+    let receipt = admin.sdk.begin().await.expect("connection begins");
+    let ttl = receipt.expires_at - begun_at;
+    assert!(
+        ttl > chrono::TimeDelta::minutes(4) && ttl <= chrono::TimeDelta::minutes(5),
+        "the transaction expires with the login-state lifetime: {ttl}"
+    );
+    let stopped = admin
+        .browser
+        .open(receipt.authorization_url.as_str())
+        .await
+        .expect("browser navigates");
     assert_eq!(stopped.status, 401, "{:?}", stopped.body);
     assert_eq!(
         admin.sdk.get().await.expect("view reads").state,
@@ -323,6 +334,40 @@ async fn spoofed_foreign_stale_and_conflicting_connections_are_refused() {
         GithubConnectionState::NotConnected
     );
 
+    // A code GitHub never issued is refused, and the transaction is spent.
+    mock.sign_out();
+    let stopped = admin.connect().await;
+    assert_eq!(stopped.status, 401, "{:?}", stopped.body);
+    let authorize = stopped.visited.last().expect("authorization visited");
+    let forged = authorize
+        .query_pairs()
+        .find(|(name, _)| name == "state")
+        .map(|(_, state)| {
+            format!("{base}/v1/integrations/github/callback?code=forged&state={state}")
+        })
+        .expect("authorization carries the state");
+    refused(
+        &admin
+            .browser
+            .open(&forged)
+            .await
+            .expect("browser navigates"),
+        403,
+        "WYRD_GITHUB_403_CONNECTION_REFUSED",
+        "authorization_refused",
+    );
+    mock.sign_in("octo");
+    refused(
+        &admin
+            .browser
+            .open(authorize.as_str())
+            .await
+            .expect("browser navigates"),
+        403,
+        "WYRD_GITHUB_403_CONNECTION_REFUSED",
+        "transaction_invalid",
+    );
+
     // The OIDC sign-in callback cannot consume a GitHub transaction.
     let receipt = admin.sdk.begin().await.expect("connection begins");
     let state = receipt
@@ -384,6 +429,21 @@ async fn spoofed_foreign_stale_and_conflicting_connections_are_refused() {
     assert_eq!(admin.sdk.get().await.expect("view reads"), reconnected);
     assert_eq!(
         tenant_b.sdk.get().await.expect("view reads").state,
+        GithubConnectionState::NotConnected
+    );
+
+    // Reconnecting the same installation refreshes its repositories.
+    mock.hide_repository("octo", 2);
+    let refreshed = associated(&admin.connect().await);
+    assert_eq!(refreshed.installation_id, Some(101));
+    assert_eq!(refreshed.repositories, repositories(&[1, 3]));
+
+    // After a disconnect the installation is free for another tenant.
+    admin.sdk.disconnect().await.expect("disconnects");
+    let claimed = associated(&tenant_b.connect().await);
+    assert_eq!(claimed.installation_id, Some(101));
+    assert_eq!(
+        admin.sdk.get().await.expect("view reads").state,
         GithubConnectionState::NotConnected
     );
     deployment.shutdown().await;

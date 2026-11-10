@@ -320,6 +320,31 @@ async fn github_connection_operations_publish_their_contract() {
             "{method} {path}"
         );
     }
+    let schema = |path: &str, method: &str, status: &str| {
+        document["paths"][path][method]["responses"][status]["content"]["application/json"]
+            ["schema"]["$ref"]
+            .clone()
+    };
+    for (path, method, status) in [
+        ("/v1/integrations/github", "get", "200"),
+        ("/v1/integrations/github", "delete", "200"),
+        ("/v1/integrations/github/callback", "get", "200"),
+    ] {
+        assert_eq!(
+            schema(path, method, status),
+            json!("#/components/schemas/GithubConnectionView"),
+            "{method} {path}"
+        );
+    }
+    assert_eq!(
+        schema("/v1/integrations/github/connect", "post", "201"),
+        json!("#/components/schemas/GithubConnectResponse")
+    );
+    assert_eq!(
+        document["paths"]["/v1/integrations/github/connect"]["post"]["requestBody"]["content"]["application/json"]
+            ["schema"]["$ref"],
+        json!("#/components/schemas/GithubConnectRequest")
+    );
     let webhook = &document["paths"]["/v1/integrations/github/webhook"]["post"];
     assert!(webhook["responses"]["202"].is_object(), "{webhook}");
     assert_eq!(webhook["security"], json!([{}]));

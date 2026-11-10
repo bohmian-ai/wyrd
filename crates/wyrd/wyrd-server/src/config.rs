@@ -6829,6 +6829,14 @@ provider = "anthropic"
                 settings.private_key.expose_secret().trim(),
                 wyrd_testing::github::APP_PRIVATE_KEY_PEM.trim()
             );
+            assert_eq!(
+                settings.webhook_secret.expose_secret(),
+                "webhook-secret-value"
+            );
+            assert_eq!(
+                settings.oauth_client_secret.expose_secret(),
+                "oauth-secret-value"
+            );
             for printed in [format!("{:?}", config.github), format!("{settings:?}")] {
                 for secret in ["webhook-secret-value", "oauth-secret-value", "PRIVATE KEY"] {
                     assert!(!printed.contains(secret), "{printed}");
@@ -6932,14 +6940,82 @@ provider = "anthropic"
                 other => panic!("{field}: expected a typed refusal, got {other:?}"),
             }
         }
-        assert!(
-            GithubConfig {
-                slug: Some("only-a-slug".to_owned()),
-                ..GithubConfig::default()
+        match (GithubConfig {
+            slug: Some("only-a-slug".to_owned()),
+            ..GithubConfig::default()
+        })
+        .resolve(false)
+        {
+            Err(ConfigError::Invalid { message }) => {
+                assert!(message.contains("app_id"), "{message}");
             }
-            .resolve(false)
-            .is_err(),
-            "a partial section refuses startup"
+            other => panic!("a partial section must refuse startup, got {other:?}"),
+        }
+    }
+
+    /// Proves the nonsecret App fields parse from server TOML while every
+    /// secret comes from its `_FILE` source.
+    ///
+    /// # Panics
+    /// Panics when a field differs.
+    #[test]
+    fn github_app_config_reads_toml_fields_and_secret_files() {
+        let _guard = ENV_LOCK.lock().expect("environment test lock");
+        let dir = tempfile::tempdir().expect("tempdir");
+        let key_file = github_key_file(dir.path());
+        let secret_file = |name: &str, value: &str| {
+            let path = dir.path().join(name);
+            std::fs::write(&path, value).expect("secret writes");
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))
+                .expect("secret is owner-only");
+            path.display().to_string()
+        };
+        let webhook = secret_file("webhook", "webhook-from-file");
+        let oauth = secret_file("oauth", "oauth-from-file");
+        let mut config = from_toml_str_with_dev_oracle_opt_in(
+            "[github]\napp_id = 7\nslug = \"toml-app\"\n\
+             public_url = \"https://wyrd.example.com\"\n\
+             oauth_client_id = \"Iv1.toml\"\n",
+        )
+        .expect("the section parses");
+        let unset = github_env(&key_file)
+            .into_iter()
+            .map(|(name, _)| (name, None::<String>));
+        let files = [
+            (
+                "WYRD_GITHUB_APP_PRIVATE_KEY_FILE",
+                Some(key_file.display().to_string()),
+            ),
+            ("WYRD_GITHUB_WEBHOOK_SECRET_FILE", Some(webhook)),
+            ("WYRD_GITHUB_OAUTH_CLIENT_SECRET_FILE", Some(oauth)),
+        ];
+        let vars: Vec<_> = unset
+            .filter(|(name, _)| !files.iter().any(|(file, _)| file == name))
+            .chain(files.clone())
+            .collect();
+        temp_env::with_vars(vars, || {
+            config
+                .apply_env_overrides()
+                .expect("the secret files apply");
+        });
+        let settings = config
+            .github
+            .resolve(true)
+            .expect("the section validates")
+            .expect("present");
+        assert_eq!(
+            (
+                settings.app_id,
+                settings.slug.as_str(),
+                settings.oauth_client_id.as_str()
+            ),
+            (7, "toml-app", "Iv1.toml")
+        );
+        assert_eq!(settings.public_url.as_str(), "https://wyrd.example.com/");
+        assert_eq!(settings.webhook_secret.expose_secret(), "webhook-from-file");
+        assert_eq!(
+            settings.oauth_client_secret.expose_secret(),
+            "oauth-from-file"
         );
     }
 

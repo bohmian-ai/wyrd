@@ -101,9 +101,10 @@ mise exec -- cargo nextest run --locked -p <crate> --test <target> \
 ```
 
 Confirm target and test names from source or `mise exec -- cargo nextest list`.
-A new test may be marked planned: confirm its existing package, target, runner,
-and setup during planning, then confirm the actual selector after adding the
-test, before RED. Never present a planned test as already existing. Include the repository-managed setup wrapper, or use the narrowest
+For new tests, planning identifies the test owner, tier, existing runner and
+needed setup without inventing names or selectors. After adding a test, the
+implementer confirms and records its actual focused command before RED.
+Include the repository-managed setup wrapper, or use the narrowest
 environment-owning `mise` task, when the test needs Postgres, storage
 emulators, or a live server. Never use a positional filter that can pass after
 selecting no test. Named Python and TypeScript tests likewise carry the exact

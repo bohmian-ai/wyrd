@@ -37,7 +37,7 @@ already-approved dependencies, and test or fixture structure. Reuse the nearest
 repository behavior before adding code, abstractions, configuration, features,
 or dependencies.
 
-Revalidate the task's capability/reuse map against current source before adding
+Revalidate relevant reuse evidence against current source before adding
 graph stores, traversals, loaders, parsers, transports, validators, lifecycle
 owners, caches, or orchestration layers. Record the existing owner, the precise
 gap, and why the selected extension is sufficient in task evidence. Reusing

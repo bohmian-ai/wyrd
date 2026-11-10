@@ -1,108 +1,82 @@
 ---
 name: wyrd-spec
-description: Define or revise a maintainer-readable, human-approved Wyrd change specification covering intent, observable behavior, constraints, and expensive-to-reverse decisions while preserving implementation freedom.
+description: Define or revise a human-approved Wyrd behavioral specification from agreed intent and applicable repository constraints, leaving implementation decisions open.
 ---
 
 # Wyrd Spec
 
-Turn human intent into a behavioral specification the maintainer can understand
-and approve without reading code or the author conversation. The agent
-may draft and research, but only explicit human approval makes a revision
-authoritative. Do not create implementation tasks or edit implementation code;
-hand an approved specification to `$wyrd-plan`.
+Preserve the agreement in a specification the maintainer can understand without
+reading code or the author conversation. Only explicit human approval makes a
+revision authoritative. Do not create tasks or edit implementation code; hand
+an approved specification to `$wyrd-plan`.
 
-## Establish authority
+## Establish the agreement
 
-When `changes/active/<slug>/design/notes.md` exists, read it and its relevant
-supplemental files as design reference material. Carry forward agreed intent,
-constraints, evidence, and material open questions; distinguish user decisions
-from agent assumptions and suggested private mechanics. A finalized design is
-not spec approval. Revalidate material claims and resolve standards conflicts
-with the user, including any required owner-document update, before approval;
-do not silently discard a proposed standards change or treat it as enacted.
+Read `AGENTS.md`, [spec-driven development](../../../changes/spec-driven-development.md),
+and the architecture sections and directory guidance that own the requested
+change. Follow CodeGraph instructions before tracing repository behavior.
+Inspect existing owners, consumers and tests only far enough to distinguish
+current behavior from the agreed outcome and identify relevant constraints.
 
-Read `AGENTS.md` and the Doctrine section plus the owning sections of
-[Wyrd design](../../../architecture/wyrd-design.md). Read
-[spec-driven development](../../../changes/spec-driven-development.md),
-including its maintainer-approval and independent-comprehension guidance. Read
-[Bifrost design](../../../architecture/bifrost-design.md) when the change touches
-Bifrost and the [security posture](../../../architecture/wyrd-security-posture.md)
-when it touches identity, authorization, tenancy, or audit. Read the nested
-`AGENTS.md` and `agent_docs/` guides that apply. Follow CodeGraph
-instructions before tracing repository behavior.
+When `changes/active/<slug>/design/notes.md` exists, read it and relevant
+supplements. Carry forward user decisions and distinguish them from agent
+assumptions and proposals. Design finalization is not spec approval. A proposed
+standards change is not enacted until the user resolves the conflict and the
+required authority update is made.
 
-Repository authority constrains the specification; implementation drift does
-not. Inspect existing owners, consumers, tests, manifests, and verification only
-far enough to distinguish current behavior from the requested outcome.
+Apply the shared scope discipline: every obligation needs a source in the
+agreement, applicable authority, or a necessary consequence of the outcome.
+Explain necessary inferences where they arise; do not create a separate ledger.
+Keep optional improvements outside requirements until agreed.
 
-Before proposing a new public surface or ownership boundary, compare the
-existing capability owners and their complete workflows. Name the missing
-behavior and any required boundary change; reuse of leaf calls alone does not
-justify replacement orchestration. Reconcile conflicting architecture prose,
-schemas, and examples before approval. Do not promote an unverified private
-design into a requirement.
+Resolve contradictions only when they prevent specifying this change correctly.
+Report unrelated documentation drift separately. Before proposing a new public
+surface or ownership boundary, identify the missing behavior and why the
+existing owner's workflow cannot provide it.
 
-## Specify decisions, not code
+## Specify the outcome
 
-Fix:
+Write `changes/active/<slug>/spec.md` on the caller's change branch. Keep spec
+ID, revision, and `draft | approved | superseded` status. Default to:
 
-- human intent and user or operator value;
-- required observable success, failure, and edge behavior;
-- scope, non-goals, and invariants;
-- security, tenancy, durability, performance, and compatibility constraints;
-- required public interfaces and cross-boundary behavior; and
-- decisions expensive to reverse, including public or persisted contracts,
-  architectural ownership, cross-service semantics, concurrency guarantees,
-  security assumptions, compatibility, and persistent data formats.
+- the problem and agreed outcome, with an example when useful;
+- required behavior, scope and exclusions;
+- applicable constraints and material decisions; and
+- acceptance observations: the situation exercised and expected result.
 
-Do not prescribe helper functions, private methods, module layout, variable
-names, local control flow, dependency APIs already available inside approved
-boundaries, test fixture structure, or other reversible choices. Include an
-implementation mechanism only when the user or architecture makes that
-mechanism part of the contract.
+Use stable local obligation IDs for task and review traceability. Describe each
+promise once; acceptance may reference it without repeating it. Link relevant
+authority rather than restating repository policy as new change requirements.
+Add alternatives, detailed contracts, definitions, or decision rationale only
+when they explain an actual material choice. Record material revisions briefly.
 
-## Write and approve the specification
+Address failure and edge behavior, security, tenancy, durability, performance,
+compatibility, concurrency and persistent formats only where the change affects
+them. Existing safeguards remain mandatory; touching an area does not authorize
+new guarantees for it.
 
-For an active change, write `changes/active/<slug>/spec.md` on the caller's
-change branch. Lead with the problem, proposed behavior and rationale; show one
-concrete before/after example where useful. Explain costs, alternatives and
-limits before reference-level detail. Use proportionate Markdown containing:
+Resolve decisions that materially change the agreed outcome, public or
+persisted contract, required ownership, or safety boundary. Leave ordinary
+implementation decisions open, including private functions, modules, algorithms,
+available dependency APIs and test fixtures, unless the user or architecture
+explicitly makes a mechanism part of the contract.
 
-1. spec ID, revision, and `draft | approved | superseded` status;
-2. problem, proposed change, user value and rationale;
-3. requirements and externally observable behavior;
-4. constraints, invariants, scope, and non-goals;
-5. expensive-to-reverse decisions and required boundaries;
-6. acceptance criteria and credible evidence classes;
-7. open material decisions; and
-8. revision history and materially relevant authority links.
+Stop elaborating when the agreed outcome, affected owner, material constraints
+and credible verification are clear. A conceivable failure mode alone does not
+authorize another requirement.
 
-Use stable `REQ-*`, `INV-*`, and `AC-*` IDs where traceability helps. Keep them
-atomic: each states one principal promise and the failure it prevents. Explain
-acceptance as the situation exercised and the expected observation, with IDs
-mapped once rather than repeated through the prose. Follow the shared writing
-guidance without turning the specification into a test inventory or
-implementation plan. An approved revision has no open
-product, public API, architecture, security, compatibility, concurrency,
-cross-service, or persistent-data decision.
+## Approve and hand off
 
-Present unresolved material decisions and consequences one at a time. Move a
-revision to `approved` only after explicit human approval. A later material edit
-increments the revision and returns it to `draft`. Git staging and commits still
-require caller authorization.
+Present unresolved material decisions with their consequences. Move a revision
+to `approved` only after explicit human approval. A later material edit
+increments the revision and returns it to `draft`; stop affected implementation
+until that revision is approved. Git staging and commits require caller
+authorization.
 
-Before presenting the draft for approval, complete the shared independent
-comprehension pass over the current packet and repair missing explanations.
-This checks understanding; it does not grant approval or implementation readiness.
+Complete the shared independent comprehension pass before presenting the draft.
+The pass checks explanations and scope fidelity; it grants no approval or
+implementation-readiness verdict.
 
-If implementation or review proves an approved decision wrong, draft the
-smallest semantic revision, cite the conflicting evidence, and stop affected
-work until the human approves it.
-
-## Handoff
-
-Return the spec path, revision and status with a short maintainer summary:
-what changes and why, the important invariants and costs, how they will be
-verified, and the exact approval or blocking decision. Disclose any remaining
-comprehension-review limitation. Never claim implementation readiness merely
-because the specification is approved.
+Return the path, revision and status with a short summary of what changes, why,
+how it will be verified, and any exact approval or blocking decision. Disclose
+remaining comprehension-review limitations.

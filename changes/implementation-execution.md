@@ -56,7 +56,7 @@ Do not require the task to predict helpers, private methods, local module
 structure, exact control flow, already-approved dependency APIs, test fixture
 structure, or other reversible choices. The implementation agent owns them.
 
-Before adding architectural machinery, revalidate the task's reuse map as
+Before adding architectural machinery, revalidate relevant reuse evidence as
 defined in
 [reuse evidence](spec-driven-development.md#reuse-evidence-and-task-conflicts).
 

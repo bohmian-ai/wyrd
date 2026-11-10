@@ -6114,7 +6114,10 @@ async fn lane_wait_spends_the_agent_call_budget() {
         deadlines[0] <= started + budget + budget / 4,
         "the provider's deadline is the original one, not a budget after admission"
     );
-    assert!(ended < budget + budget / 4, "the call ended after {ended:?}");
+    assert!(
+        ended < budget + budget / 4,
+        "the call ended after {ended:?}"
+    );
     assert_eq!(permits.available_permits(), 1, "the expiry kept no permit");
 
     dispatch.push(Step::Return(AttemptResult::Completed {

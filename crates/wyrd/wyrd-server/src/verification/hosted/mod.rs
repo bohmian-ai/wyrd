@@ -184,23 +184,23 @@ impl Default for HostedLimits {
             scratch_max_bytes: 250 * MIB,
             work_write_max_bytes: 50 * MIB,
             tool_result_max_bytes: 64 * 1024,
-            direct_executions: 16,
+            direct_executions: 256,
             direct: LaneLimits {
-                workspaces: 4,
-                python_workers: 2,
-                python_waiters: 4,
-                model_calls: 16,
+                workspaces: 16,
+                python_workers: 4,
+                python_waiters: 16,
+                model_calls: 256,
             },
             queued: LaneLimits {
-                workspaces: 12,
-                python_workers: 3,
-                python_waiters: 12,
-                model_calls: 48,
+                workspaces: 48,
+                python_workers: 12,
+                python_waiters: 48,
+                model_calls: 256,
             },
             monty_min_workers: 1,
             monty_memory_bytes: 256 * MIB,
             monty_process_memory_bytes: 384 * MIB,
-            monty_pool_memory_bytes: 2048 * MIB,
+            monty_pool_memory_bytes: 8192 * MIB,
             code_timeout: Duration::from_secs(10),
             agent_code_budget: Duration::from_secs(60),
             verify_timeout: Duration::from_secs(60),
@@ -213,11 +213,11 @@ impl Default for HostedLimits {
 mod tests {
     use super::HostedLimits;
 
-    /// The default lanes split the former single pool: five 384 MiB workers
-    /// in 2 GiB, 16 workspaces, and 16 waiters, with two prewarmed workers
-    /// in all. One more worker in either lane, a combined worker count too
-    /// large to represent, a pool below the lanes, or a process ceiling below
-    /// the allocator ceiling refuses.
+    /// The default lanes hold sixteen 384 MiB workers in an 8 GiB pool, 64
+    /// workspaces, and 64 waiters, with one prewarmed worker per lane; 256
+    /// direct executions and 256 model calls in each lane. Workers past the
+    /// pool, a combined worker count too large to represent, a pool below the
+    /// lanes, or a process ceiling below the allocator ceiling refuses.
     ///
     /// # Panics
     /// Panics when a lane default or a memory ceiling is ignored.
@@ -232,13 +232,24 @@ mod tests {
                 limits.direct.python_waiters + limits.queued.python_waiters,
                 2 * limits.monty_min_workers,
             ),
-            (5, 16, 16, 2)
+            (16, 64, 64, 2)
+        );
+        assert_eq!(
+            (
+                limits.direct_executions,
+                limits.direct.model_calls,
+                limits.queued.model_calls,
+            ),
+            (256, 256, 256)
         );
         let mut wider = limits;
-        wider.queued.python_workers += 1;
-        assert!(!wider.lanes_fit(), "six workers exceed 2 GiB");
+        wider.queued.python_workers += 6;
+        assert!(!wider.lanes_fit(), "twenty-two workers exceed 8 GiB");
         wider.queued.python_workers = usize::MAX;
-        assert!(!wider.lanes_fit(), "an unrepresentable worker count refuses");
+        assert!(
+            !wider.lanes_fit(),
+            "an unrepresentable worker count refuses"
+        );
         assert!(
             !HostedLimits {
                 monty_pool_memory_bytes: limits.monty_process_memory_bytes,

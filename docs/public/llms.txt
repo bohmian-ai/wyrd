@@ -58,7 +58,7 @@ Set up a local server, run one verification, then choose what to build, in this 
 - [Verifier Card](/wyrd/reference/verifier-card/): Fields, input slots, steps, checks, operators, references, citations, and refusals of a Verifier spec.
 - [Extraction output](/wyrd/reference/extraction-output/): The JSON an extract step returns for each media format.
 - [Agent tools](/wyrd/reference/agent-tools-and-authorization/): Built-in tools a Verifier's Agent can call and the permissions each call needs.
-- [Runtime limits](/wyrd/reference/verification-runtime-limits/): Environment settings that bound Verifier files, extraction, workspaces, Python code, model calls, and direct and queued capacity, with defaults and startup rules.
+- [Runtime limits](/wyrd/reference/verification-runtime-limits/): Server settings that bound Verifier files, extraction, workspaces, Python code, model calls, and direct and queued capacity, with defaults and startup rules.
 - [MCP tools](/wyrd/reference/mcp-tools/): Wyrd MCP tool names, permissions, shapes, and query limits.
 - [Error codes](/wyrd/api/errors/): Every stable Wyrd error code with its HTTP status, title, and fix.
 - [HTTP API](/wyrd/api/openapi/): Where a Wyrd server serves its OpenAPI document and how to use it.

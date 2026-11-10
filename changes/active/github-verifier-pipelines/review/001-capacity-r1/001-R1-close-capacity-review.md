@@ -147,3 +147,50 @@ R13's "no new config" clause is superseded only for these settings.
 | H4 | Validation parity | Zero, unrepresentable and inconsistent file values get the same refusals as env values | same test: a zero file count is refused naming its key; file Python workers that overflow the pool are refused by the shared `lanes_fit` predicate; a file `monty_min_workers` conflict is refused; a negative value fails TOML parsing |
 | H5 | One owner | The resolved settings reach the same HostedBlocks and runtime owners, with no new loader or owner | `VerificationConfig::limits`/`runtime` stay the only projection; the diff audit |
 | H6 | Docs | Operator limits and configure pages describe the file keys and the new defaults, the env-only claim is removed, and generated projections are regenerated | `docs:check`, plus the docs diff |
+
+
+## Human-approved revision 2 — Python and workspace defaults (2026-11-10)
+
+The user approved increasing the resource defaults below after the first revision. This is additional human-directed scope, separate from FIND-001-1 through FIND-001-5. Append its obligations and evidence to the ongoing remediation; do not rewrite historical review reports or assign a new finding ID.
+
+This revision supersedes the first revision's instruction to retain Python worker/waiter, workspace and combined pool-memory defaults, including that part of H1 and earlier assertions preserving their old totals. The first revision's execution/model-call defaults, standard startup configuration requirements and all five findings remain in force.
+
+### Approved resource defaults
+
+| Per-process setting | Previous default | Approved default |
+|---|---:|---:|
+| Direct Python workers | 2 | 4 |
+| Queued Python workers | 3 | 12 |
+| Direct Python waiters | 4 | 16 |
+| Queued Python waiters | 12 | 48 |
+| Direct workspaces | 4 | 16 |
+| Queued workspaces | 12 | 48 |
+| Combined Python pool accounting budget | 2048 MiB | 8192 MiB (8 GiB) |
+
+Retain one prewarmed Python worker per lane, 256 MiB per-operation memory and 384 MiB per-worker accounting, plus existing operation/execution timeouts and per-workspace byte/file budgets. Retain lazy worker creation and existing cleanup, cancellation, admission, deferral and no-borrowing behavior. Waiters provide bounded waiting admission, not additional executing workers.
+
+These are initial production defaults selected with a 32 GiB server as the sizing assumption, not benchmark-backed throughput claims or a guarantee that every combination of workloads fits that host. The 16 maximum Python workers account for 6144 MiB at 384 MiB each, within the 8192 MiB pool budget. That budget is startup accounting, not an upfront allocation or a hard whole-process RSS reservation; interpreter stacks, runtime overhead and other server work also consume memory. Workspace count similarly bounds concurrent temporary workspaces, not reserved RAM or disk. Preserve existing operator guidance to size memory and temporary storage for the workload. No host-size detection, automatic sizing, platform-specific enforcement or new aggregate resource mechanism is requested.
+
+### Configuration and delivery
+
+Apply these defaults at the existing owners and expose their overrides through the same normal startup configuration path required by revision 1: defaults, typed server configuration, existing environment overrides, then merged-value validation. Preserve existing environment variable names, including `WYRD_VERIFICATION_MONTY_POOL_MEMORY_MIB`. All approved Python/workspace settings and the pool budget must be configurable through that path. Keep internal lifecycle timings private and avoid a parallel loader or resource owner.
+
+Update affected defaults/configuration assertions, operator configuration and limits documentation, generated documentation projections and implementation evidence. Preserve all real-client capacity assertions and the five findings' focused proof; explicit small test overrides may remain small where they establish saturation deterministically. Do not enlarge test resource usage merely to match production defaults.
+
+### Focused acceptance additions
+
+- Default assertions establish direct/queued workers `(4, 12)`, waiters `(16, 48)`, workspaces `(16, 48)`, pool memory `8192 MiB`, and one prewarmed worker per lane. Update old combined-total expectations to workers/workspaces/waiters/prewarm `(16, 64, 64, 2)` while retaining meaningful overflow, invalid-memory and per-worker checks.
+- Configuration proof establishes these settings, including the pool budget, resolve from file values and existing environment overrides under the standard precedence and receive the same merged-value validation. The approved defaults pass the existing shared memory-fit predicate; inconsistent overridden capacities/budgets still refuse startup.
+- Documentation and evidence reflect both approved revisions without claiming measured throughput or treating the pool budget as a whole-process memory reservation.
+
+Reuse the existing exact default/configuration selectors and affected documentation checks already required by the packet. Record exact selectors for any newly necessary focused tests before RED. No new benchmark gate, full journey suite, dependency or unrelated cleanup is part of this revision.
+
+## Obligations for approved revision 2
+
+These rows supersede H1's "Python, workspace, memory unchanged" clause.
+
+| ID | Source | Observation | Planned assertion |
+|---|---|---|---|
+| H7 | Revision 2 defaults | Workers `(4, 12)`, waiters `(16, 48)`, workspaces `(16, 48)`, pool 8192 MiB, one prewarmed worker per lane; combined totals `(16, 64, 64, 2)`; the defaults pass `worker_fits` and `lanes_fit` | `lanes_split_the_memory_ceilings`, with its overflow, pool-below-process and per-worker refusals retained against the new pool |
+| H8 | Revision 2 configuration | The pool budget resolves from `[verification] monty_pool_memory_mib` under `WYRD_VERIFICATION_MONTY_POOL_MEMORY_MIB`, alongside the Python and workspace file values from H2; a zero or overflowing pool value is refused, and file workers that exceed a file pool are refused | `verification_capacity_file_values_resolve_under_env` |
+| H9 | Revision 2 docs | Both pages show the new defaults and describe the pool as startup accounting, not a reservation or a measured guarantee | `docs:check`, plus the docs diff |

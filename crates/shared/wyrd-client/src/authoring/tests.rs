@@ -61,6 +61,15 @@ fn policy() -> Artifact {
     Artifact::from_path("company-sharing-policy", "1.0.0", "policy.pdf").extract(true)
 }
 
+/// The exact reference publishing the Artifact `name` at `version` returns.
+///
+/// # Panics
+/// Panics when the reference does not decode.
+fn published_ref(name: &str, version: &str) -> wyrd_spec::reference::CardRef {
+    serde_json::from_value(json!({"kind": "Artifact", "name": name, "version": version}))
+        .expect("an exact reference decodes")
+}
+
 /// The spec `card` decodes to, as its YAML file's would.
 ///
 /// # Panics
@@ -204,7 +213,7 @@ steps:
         /inputs/report.json: inputs.report
         /inputs/policy.json:
           artifact:
-            card: {kind: Artifact, name: company-sharing-policy, version: 1.0.0}
+            card: {sibling: {kind: Artifact, name: company-sharing-policy, version: 1.0.0}}
             path: extracted/company-sharing-policy.pdf.json
     requirements:
       - id: findings-cited
@@ -465,13 +474,16 @@ components:
             0,
         ),
     ] {
-        let declaration = selected(file).expect("valid graph");
+        let mut declaration = selected(file).expect("valid graph");
         assert_eq!(declaration.artifacts.len(), publishes);
+        declaration
+            .bind_published(&published_ref("company-sharing-policy", "1.0.0"))
+            .expect("the published policy binds");
         assert_eq!(
             declaration.input.expect("an ordinary graph").submissions[0].spec["steps"][0]["action"]
                 ["source"]["artifact"]["card"],
             external,
-            "local and registered selections stay external"
+            "local selections bind to their published reference; registered ones stay external"
         );
     }
 
@@ -693,10 +705,6 @@ fn field_edits_defer_validation_and_preserve_snapshots() {
         .validate()
         .expect("the forward reference is valid once the slot exists");
 
-    let incomplete = Prompt::new("judge", "1.0.0").model("gpt-4o");
-    let refused = incomplete.validate().expect_err("missing provider");
-    assert!(refuses(&refused, "provider"), "{refused:?}");
-
     let directory = tempfile::tempdir().expect("scratch directory");
     let source = directory.path().join("checks.py");
     let mut coded = verifier.clone();
@@ -828,7 +836,7 @@ fn yaml_and_code_share_diagnostics() {
         let from_code = CardDefinition(Card::with_spec(
             CardKind::Service,
             "shared",
-            "1.0.0",
+            Some("1.0.0"),
             Body::authored(raw),
         ))
         .declaration()
@@ -851,7 +859,7 @@ fn yaml_and_code_share_diagnostics() {
     CardDefinition(Card::with_spec(
         CardKind::Service,
         "shared",
-        "1.0.0",
+        Some("1.0.0"),
         Body::authored(json!({})),
     ))
     .declaration()
@@ -1036,11 +1044,14 @@ fn declarations_match_file_authored_tree() {
         story("company-sharing-policy.pdf"),
     )
     .extract(true);
-    let authored = CardDefinition::from(finance_release(
+    let mut authored = CardDefinition::from(finance_release(
         policy.file("extracted/company-sharing-policy.pdf.json"),
     ))
     .declaration()
     .expect("valid graph");
+    authored
+        .bind_published(&published_ref("company-sharing-policy", "1.0.0"))
+        .expect("the published policy binds");
     let files = wyrd_loader::build_declaration_input(
         wyrd_loader::load(&story("finance-release.yaml")).expect("the story loads"),
     )
@@ -1160,7 +1171,7 @@ fn replacements_keep_only_current_dependencies() {
     );
     let registered = Binding::new(verifier.clone())
         .runs_on(daily("0 0 * * *"))
-        .runs_on(daily("0 6 * * *").card_ref());
+        .runs_on(daily("0 6 * * *").card_ref().expect("a versioned Trigger"));
     assert!(
         declare(registered)
             .expect("valid graph")
@@ -1266,23 +1277,51 @@ fn replacements_keep_only_current_dependencies() {
     audit
         .add_evidence_ref(payload.clone())
         .add_evidence_ref(schema("payload-schema"));
-    let declaration = CardDefinition::from(&audit)
+    let mut declaration = CardDefinition::from(&audit)
         .declaration()
         .expect("valid graph");
-    let published: Vec<&str> = declaration
+    let order: Vec<&str> = declaration
         .artifacts
         .iter()
         .map(|artifact| artifact.metadata.name.as_str())
         .collect();
     assert_eq!(
-        published,
+        order,
         ["payload-schema", "payload"],
         "a nested local schema publishes first, once, and a replaced one not at all"
     );
+    let schema_ref = |declaration: &Declaration| {
+        serde_json::to_value(&declaration.artifacts[1].spec).expect("serializes")["schema_ref"]
+            .clone()
+    };
     assert_eq!(
-        serde_json::to_value(&declaration.artifacts[1].spec).expect("serializes")["schema_ref"],
+        schema_ref(&declaration),
+        json!({"sibling": {"kind": "Artifact", "name": "payload-schema", "version": "1.0.0"}}),
+        "the payload names its schema as a sibling until the schema is published"
+    );
+    declaration
+        .bind_published(&published_ref("payload-schema", "1.0.0"))
+        .expect("the published schema binds");
+    assert_eq!(
+        schema_ref(&declaration),
         json!({"kind": "Artifact", "name": "payload-schema", "version": "1.0.0"}),
-        "the payload references its schema by exact identity"
+        "the payload references its published schema by exact identity"
+    );
+    declaration
+        .bind_published(&published_ref("payload", "1.0.0"))
+        .expect("the published payload binds");
+    assert!(
+        declaration
+            .input
+            .as_ref()
+            .expect("an ordinary graph")
+            .submissions[0]
+            .spec["evidence_refs"]
+            .as_array()
+            .expect("evidence")
+            .iter()
+            .all(|evidence| evidence.get("sibling").is_none()),
+        "the graph references its published Artifacts by exact identity"
     );
     let unresolved = Audit::new("payload-audit", "1.0.0")
         .evidence_refs([payload.clone().schema_ref("./missing-schema.yaml")]);
@@ -1523,34 +1562,13 @@ fn entry_built_objects_keep_nested_references() {
     );
 }
 
-/// A Prompt's nullable `messages` and `body` hold their canonical `null`,
-/// and a drift check's `signal.baseline_ref` takes a Card or exact
-/// `CardRef` as any reference position does.
+/// A drift check's `signal.baseline_ref` takes a Card or exact `CardRef`
+/// as any reference position does.
 ///
 /// # Panics
-/// Panics when a null is not kept as authored, a valid null form is
-/// refused, a malformed form is not refused by validation, or a baseline
-/// reference loses its intent.
+/// Panics when a baseline reference loses its intent.
 #[test]
-fn nullable_prompt_fields_and_drift_references_compose() {
-    let messages = json!([{"role": "user", "content": "Summarise {{report}}"}]);
-    let portable = Prompt::new("summary", "1.0.0")
-        .provider("openai")
-        .model("gpt-4o")
-        .body([("temperature", json!(0))])
-        .messages([messages[0].clone()])
-        .clear_body();
-    assert_eq!(portable.spec()["body"], Value::Null, "the null is authored");
-    assert_eq!(portable.spec()["messages"], messages);
-    CardDefinition::from(&portable)
-        .declaration()
-        .expect("messages with a null body validate");
-    let neither = portable.clone().clear_messages();
-    assert!(
-        CardDefinition::from(&neither).declaration().is_err(),
-        "a Prompt with neither form is refused by validation"
-    );
-
+fn drift_references_compose() {
     let drift = |baseline: FieldValue| {
         Verifier::new("latency-drift", "1.0.0")
             .inputs([("latency", InputSlot::samples(["latency"]))])
@@ -1620,5 +1638,94 @@ fn nullable_prompt_fields_and_drift_references_compose() {
                 .iter()
                 .any(|card| card.metadata.name.as_str() == "latency-baseline")),
         "the authored baseline joins the graph: {input:?}"
+    );
+}
+
+/// Definitions without versions declare as YAML without `metadata.version`
+/// does: no envelope pin and versionless siblings, which the server resolves.
+/// The original Prompt and canonical typed values fill their fields inline.
+///
+/// # Panics
+/// Panics when a version is invented, a typed value is not canonical, or the
+/// unversioned graph is refused.
+#[test]
+fn unversioned_definitions_take_the_original_prompt_and_typed_values() {
+    let prompt = skald_prompt::openai_chat(
+        "gpt-4o",
+        skald_prompt::OpenAiChatOptions {
+            messages: vec!["Write the customer report for {{customer}}.".into()],
+            ..Default::default()
+        },
+    )
+    .expect("the Prompt builds");
+    let writer = Agent::new("report-writer", None)
+        .prompt(prompt.clone())
+        .execution_route(wyrd_spec::ExecutionRoute::Native {})
+        .run_config(wyrd_spec::AgentRunConfigSpec {
+            max_iterations: Some(3),
+            ..Default::default()
+        });
+    assert_eq!(writer.card_ref(), None, "no version is invented");
+    let checks = Verifier::new("report-checks", None)
+        .inputs([("report", InputSlot::json(json!({"type": "string"})))])
+        .requirements([Requirement::new(
+            "no-bank-account",
+            "The report names no bank account",
+            Check::assert(
+                "inputs.report",
+                wyrd_spec::verification::ComparisonOperator::NotContains,
+                "BANK-ACCOUNT",
+            ),
+        )]);
+    let service =
+        Service::new("finance-release", None)
+            .components([Component::new("report-writer", writer).verified_by([checks])]);
+
+    let declaration = CardDefinition::from(&service)
+        .declaration()
+        .expect("an unversioned graph is valid");
+    let input = declaration.input.expect("an ordinary graph");
+    assert!(
+        input
+            .submissions
+            .iter()
+            .all(|submission| submission.metadata.resolved_pin().is_none()),
+        "no submission carries a version"
+    );
+    let service = input
+        .submissions
+        .iter()
+        .find(|submission| submission.kind == CardKind::Service)
+        .expect("the Service is submitted");
+    let component = &service.spec["components"][0];
+    assert_eq!(
+        component["ref"],
+        json!({"sibling": {"kind": "Agent", "name": "report-writer"}})
+    );
+    assert_eq!(
+        component["verified_by"][0]["verifier"],
+        json!({"sibling": {"kind": "Verifier", "name": "report-checks"}})
+    );
+    let agent = input
+        .submissions
+        .iter()
+        .find(|submission| submission.kind == CardKind::Agent)
+        .expect("the Agent is submitted");
+    let agent: AgentSpec = decoded(agent.spec.clone());
+    assert_eq!(
+        agent.prompt,
+        wyrd_spec::reference::InlineableRef::Inline(Box::new(prompt.into_native())),
+        "the original Prompt is held inline"
+    );
+    assert_eq!(agent.execution_route, wyrd_spec::ExecutionRoute::Native {});
+    assert_eq!(agent.run_config.max_iterations, Some(3));
+    let verifier = input
+        .submissions
+        .iter()
+        .find(|submission| submission.kind == CardKind::Verifier)
+        .expect("the Verifier is submitted");
+    assert_eq!(
+        verifier.spec["requirements"][0]["check"]["operator"],
+        json!("not_contains")
     );
 }

@@ -23,10 +23,10 @@ macro_rules! card_kind {
         }
 
         impl $ty {
-            #[doc = concat!("An empty ", stringify!($kind), " Card named `name` at `version`; nothing is validated until its graph is.")]
-            pub fn new(name: impl Into<String>, version: impl Into<String>) -> Self {
+            #[doc = concat!("An empty ", stringify!($kind), " Card named `name` at `version`, or with no version for the server to select; nothing is validated until its graph is.")]
+            pub fn new<'v>(name: impl Into<String>, version: impl Into<Option<&'v str>>) -> Self {
                 Self {
-                    card: Card::new(CardKind::$kind, name, version)$(.flattening($flatten))?,
+                    card: Card::new(CardKind::$kind, name, version.into())$(.flattening($flatten))?,
                 }
             }
         }
@@ -94,52 +94,20 @@ fields!(Service [card.spec] {
 
 card_kind!(
     /// An Agent Card: a prompt run through an execution route with tools.
+    ///
+    /// Its `prompt` takes a [`skald_prompt::Prompt`], such as one
+    /// [`skald_prompt::openai_chat`] builds, held inline and registered by
+    /// the server with the Agent, or a reference to a registered Prompt.
     Agent => Agent
 );
 
 fields!(Agent [card.spec] {
     one prompt: FieldValue = "prompt";
-    one execution_route: Value = "execution_route";
+    one execution_route: FieldValue = "execution_route";
     list tool_names, add_tool_name: Value = "tool_names";
-    one run_config: Value = "run_config";
+    one run_config: FieldValue = "run_config";
     list verified_by, add_verified_by: Binding = "verified_by";
 });
-
-card_kind!(
-    /// A Prompt Card: provider, model, and the authored prompt.
-    Prompt => Prompt
-);
-
-fields!(Prompt [card.spec] {
-    one provider: Value = "provider";
-    one model: Value = "model";
-    one system: Value = "system";
-    list messages, add_message: Value = "messages";
-    one settings: Value = "settings";
-    one response_format: Value = "response_format";
-    one format: Value = "format";
-    map body, add_body: Value = "body";
-});
-
-impl Prompt {
-    /// Set `messages` to `null`, as a Prompt whose request is its `body`
-    /// writes it, dropping every earlier message.
-    #[must_use]
-    pub fn clear_messages(mut self) -> Self {
-        self.card
-            .spec
-            .set("messages", FieldValue::from(Value::Null));
-        self
-    }
-
-    /// Set `body` to `null`, as a Prompt whose request is its `messages`
-    /// writes it, dropping every earlier entry.
-    #[must_use]
-    pub fn clear_body(mut self) -> Self {
-        self.card.spec.set("body", FieldValue::from(Value::Null));
-        self
-    }
-}
 
 card_kind!(
     /// A Model Card: a trained model's interface, task, and signature. A
@@ -255,12 +223,12 @@ card_kind!(
 );
 
 impl Artifact {
-    /// The `file` Artifact named `name` at `version`, published from the
-    /// file or directory at `path` before its graph; nothing is read until
-    /// it is published.
-    pub fn from_path(
+    /// The `file` Artifact named `name` at `version`, or with no version for
+    /// the server to select, published from the file or directory at `path`
+    /// before its graph; nothing is read until it is published.
+    pub fn from_path<'v>(
         name: impl Into<String>,
-        version: impl Into<String>,
+        version: impl Into<Option<&'v str>>,
         path: impl AsRef<Path>,
     ) -> Self {
         let mut artifact = Self::new(name, version).artifact_kind("file");
@@ -276,10 +244,9 @@ impl Artifact {
         self
     }
 
-    /// Select the fixed file or directory prefix `path` of this exact
-    /// Artifact version, referenced as the Artifact itself is at any
-    /// reference position: a sibling without a local source, otherwise an
-    /// exact external reference published first.
+    /// Select the fixed file or directory prefix `path` of this Artifact,
+    /// referenced as the Artifact itself is at any reference position: a
+    /// sibling, which a local source's published reference replaces.
     pub fn file(&self, path: impl Into<String>) -> ArtifactFile {
         let reference = FieldValue::from(self.clone());
         ArtifactFile(FieldValue {

@@ -1,4 +1,5 @@
-//! `wyrd.authoring`: the Python projection of `wyrd_client::authoring`.
+//! The Card definition classes of `wyrd.verify`: the Python projection of
+//! `wyrd_client::verify`'s Card authoring.
 //!
 //! Each class wraps one shared Rust authoring value and nothing else. A
 //! constructor takes the value's fixed arguments plus its other YAML fields as
@@ -10,9 +11,11 @@
 //! validation.
 //!
 //! Python adapts only arguments: plain JSON values, the native authoring
-//! values, `wyrd.cards.CardRef`, and, for an input slot, a supported scalar
-//! class or a class with `model_json_schema()` such as a Pydantic model. This
-//! module never imports Pydantic.
+//! values, `wyrd.cards.CardRef`, the original `wyrd.prompt.Prompt`, the
+//! canonical `ComparisonOperator`, `ExecutionRoute` and `AgentRunConfig`
+//! projections, and, for an input slot or a Verifier's whole `inputs`, a
+//! supported scalar class or a class with `model_json_schema()` such as a
+//! Pydantic model. This module never imports Pydantic.
 
 use std::path::PathBuf;
 
@@ -23,12 +26,13 @@ use pyo3::types::{
 };
 use serde_json::{Value, json};
 use wyrd_cards::card_ref::CardRefPy;
-use wyrd_client::authoring::{
-    Action, Agent, Artifact, ArtifactFile, Audit, Binding, CardDefinition, CardRef, Check,
-    CodeSource, Component, Data, Experiment, FieldValue, InputSlot, Mcp, Model, Operator, Prompt,
-    Requirement, Service, Step, Trigger, Verifier,
-};
 use wyrd_client::cards::Declarable;
+use wyrd_client::verify::{
+    Action, Agent, AgentRunConfigSpec, Artifact, ArtifactFile, Audit, Binding, CardDefinition,
+    CardRef, Check, CodeSource, ComparisonOperator, Component, Data, Experiment, FieldValue,
+    InputSlot, Mcp, Model, Operator, Requirement, Service, Step, Trigger, Verifier,
+};
+use wyrd_spec::ExecutionRoute;
 use wyrd_spec::envelope::CardKind;
 
 use crate::observe::{invalid_argument, json_value};
@@ -122,7 +126,6 @@ pub(crate) fn definition(value: &Bound<'_, PyAny>) -> Option<CardDefinition> {
     cards!(
         PyService,
         PyAgent,
-        PyPrompt,
         PyVerifier,
         PyArtifact,
         PyModel,
@@ -148,9 +151,10 @@ pub(crate) fn declarable(value: &Bound<'_, PyAny>) -> Option<Declarable<'static>
 
 /// A value at any authoring position: a Card, which becomes a sibling
 /// reference; an authoring or `wyrd.cards` `CardRef`, which stays external;
-/// any other authoring value; a `dict` or `list` composed entry by entry, so
-/// these may stand anywhere inside it; or plain JSON, such as a reference
-/// string.
+/// an original `wyrd.prompt.Prompt`, held inline; a canonical
+/// `ComparisonOperator`, `ExecutionRoute` or `AgentRunConfig`; any other
+/// authoring value; a `dict` or `list` composed entry by entry, so these may
+/// stand anywhere inside it; or plain JSON, such as a reference string.
 ///
 /// # Errors
 /// As [`json`], and as [`object`] for a mapping; also as [`enter`] for a
@@ -197,6 +201,9 @@ fn nested(field: &str, value: &Bound<'_, PyAny>, depth: usize) -> PyResult<Field
         };
     }
     values!(
+        PyComparisonOperator,
+        PyExecutionRoute,
+        PyAgentRunConfig,
         PyCardRef,
         PyArtifactFile,
         PyCodeSource,
@@ -210,6 +217,9 @@ fn nested(field: &str, value: &Bound<'_, PyAny>, depth: usize) -> PyResult<Field
     );
     if let Ok(card_ref) = value.cast::<CardRefPy>() {
         return Ok(card_ref.get().0.clone().into());
+    }
+    if let Ok(prompt) = value.cast::<skald_prompt::Prompt>() {
+        return Ok(prompt.borrow().clone().into());
     }
     if let Ok(mapping) = value.cast::<PyMapping>() {
         return Ok(object(field, mapping, depth)?.into_iter().collect());
@@ -344,6 +354,100 @@ fn entries<T>(
         .collect()
 }
 
+/// A Verifier's `inputs`: a mapping of slot name to slot, or a class whose
+/// `model_json_schema()` declares one slot per property, such as a Pydantic
+/// model with `release: Release`, the same slots as
+/// `{"release": Release}`. A property that references one of the class's
+/// `$defs` becomes that definition, carrying the definitions it reaches, so
+/// nested models and references still resolve.
+///
+/// # Errors
+/// As [`entries`] with [`slot`] for a mapping, and as [`class_schema`] for a
+/// class; a class schema without `properties` is refused naming `field`.
+fn verifier_inputs(field: &str, value: &Bound<'_, PyAny>) -> PyResult<Vec<(String, InputSlot)>> {
+    let Ok(class) = value.cast::<PyType>() else {
+        return entries(field, value, slot);
+    };
+    let schema = class_schema(field, class)?;
+    let Some(properties) = schema.get("properties").and_then(Value::as_object) else {
+        return Err(invalid_argument(
+            field,
+            format!(
+                "{} declares no properties to use as slots",
+                class.qualname()?
+            ),
+        )
+        .into());
+    };
+    let empty = serde_json::Map::new();
+    let defs = schema
+        .get("$defs")
+        .and_then(Value::as_object)
+        .unwrap_or(&empty);
+    Ok(properties
+        .iter()
+        .map(|(name, property)| (name.clone(), InputSlot::from(standalone(property, defs))))
+        .collect())
+}
+
+/// `property` as a schema of its own: a lone local `$ref` replaced by the
+/// definition it names, with the other keys kept, and `$defs` holding every
+/// definition the result still references.
+fn standalone(property: &Value, defs: &serde_json::Map<String, Value>) -> Value {
+    let mut schema = property.clone();
+    if let Value::Object(object) = &mut schema
+        && let Some(target) = object
+            .get("$ref")
+            .and_then(Value::as_str)
+            .and_then(local_def)
+        && let Some(Value::Object(definition)) = defs.get(target)
+    {
+        object.remove("$ref");
+        for (key, value) in definition {
+            object.entry(key.clone()).or_insert_with(|| value.clone());
+        }
+    }
+    let mut reached = serde_json::Map::new();
+    let mut pending = vec![schema.clone()];
+    while let Some(value) = pending.pop() {
+        for name in local_refs(&value) {
+            if let Some(definition) = defs.get(name.as_str())
+                && !reached.contains_key(&name)
+            {
+                reached.insert(name, definition.clone());
+                pending.push(definition.clone());
+            }
+        }
+    }
+    if let (Value::Object(object), false) = (&mut schema, reached.is_empty()) {
+        object.insert("$defs".to_owned(), Value::Object(reached));
+    }
+    schema
+}
+
+/// The `$defs` name a local `#/$defs/<name>` reference points at.
+fn local_def(reference: &str) -> Option<&str> {
+    reference.strip_prefix("#/$defs/")
+}
+
+/// Every `$defs` name `value` references locally, at any depth.
+fn local_refs(value: &Value) -> Vec<String> {
+    match value {
+        Value::Object(object) => object
+            .iter()
+            .flat_map(|(key, value)| match (key.as_str(), value) {
+                ("$ref", Value::String(reference)) => local_def(reference)
+                    .map(str::to_owned)
+                    .into_iter()
+                    .collect(),
+                _ => local_refs(value),
+            })
+            .collect(),
+        Value::Array(items) => items.iter().flat_map(local_refs).collect(),
+        _ => Vec::new(),
+    }
+}
+
 /// The refusal of a keyword that names no field of `class`.
 fn unexpected(class: &str, field: &str) -> PyErr {
     PyTypeError::new_err(format!(
@@ -354,19 +458,24 @@ fn unexpected(class: &str, field: &str) -> PyErr {
 /// Generate one authoring class over a native value: its field setters, list
 /// and map setters with their add methods, keyword-field initialization, and
 /// any further methods given verbatim.
-macro_rules! authoring_class {
+macro_rules! definition_class {
+    (@entries $field:ident, $value:ident, $convert:ident) => {
+        entries($field, $value, $convert)
+    };
+    (@entries $field:ident, $value:ident, $convert:ident | $all:ident) => {
+        $all($field, $value)
+    };
     (
         $(#[$doc:meta])*
         $py:ident($native:ty) = $name:literal {
             one { $($one:ident: $one_convert:ident),* $(,)? }
             list { $($list:ident, $list_add:ident: $list_convert:ident),* $(,)? }
-            map { $($map:ident, $map_add:ident: $map_convert:ident),* $(,)? }
-            $(nullable { $($null:ident: $clear:ident),* $(,)? })?
+            map { $($map:ident, $map_add:ident: $map_convert:ident $(| $map_all:ident)?),* $(,)? }
         }
         $($methods:tt)*
     ) => {
         $(#[$doc])*
-        #[pyclass(module = "wyrd.authoring", name = $name)]
+        #[pyclass(module = "wyrd.verify", name = $name)]
         pub(crate) struct $py {
             /// The shared native value.
             inner: $native,
@@ -374,17 +483,16 @@ macro_rules! authoring_class {
 
         impl $py {
             /// `inner` with the field `field` set from `value`, as its setter
-            /// sets it; `None` at a nullable field sets it to `null`.
+            /// sets it.
             ///
             /// # Errors
             /// Raises `TypeError` for a name that is no field, and the
             /// value's conversion error.
             fn set(inner: $native, field: &str, value: &Bound<'_, PyAny>) -> PyResult<$native> {
                 Ok(match field {
-                    $($(stringify!($null) if value.is_none() => inner.$clear(),)*)?
                     $(stringify!($one) => inner.$one($one_convert(field, value)?),)*
                     $(stringify!($list) => inner.$list(items(field, value, $list_convert)?),)*
-                    $(stringify!($map) => inner.$map(entries(field, value, $map_convert)?),)*
+                    $(stringify!($map) => inner.$map(definition_class!(@entries field, value, $map_convert $(| $map_all)?)?),)*
                     _ => return Err(unexpected($name, field)),
                 })
             }
@@ -492,7 +600,7 @@ macro_rules! authoring_class {
     };
 }
 
-/// Generate one named Card class: `(name, version, **fields)` construction,
+/// Generate one named Card class: `(name, version=None, **fields)` construction,
 /// labels and annotations, its reference, its spec, and validation.
 macro_rules! card_class {
     (
@@ -501,42 +609,40 @@ macro_rules! card_class {
             one { $($one:tt)* }
             list { $($list:tt)* }
             map { $($map:tt)* }
-            $(nullable { $($null:tt)* })?
         }
         $($methods:tt)*
     ) => {
-        authoring_class! {
+        definition_class! {
             $(#[$doc])*
             $py($native) = $name {
                 one { $($one)* }
                 list { $($list)* }
                 map { labels, add_label: string, annotations, add_annotation: string, $($map)* }
-                $(nullable { $($null)* })?
             }
 
-            /// An empty Card named `name` at `version`, with any spec fields
-            /// given as keywords; nothing is validated until its graph is.
+            /// An empty Card named `name`, at `version` when given, else at
+            /// the version registration assigns, with any spec fields given
+            /// as keywords; nothing is validated until its graph is.
             ///
             /// # Errors
             /// Raises `TypeError` for a keyword that names no field, and a
             /// field value's conversion error.
             #[new]
-            #[pyo3(signature = (name, version, **fields))]
+            #[pyo3(signature = (name, version = None, **fields))]
             fn __new__(
                 name: String,
-                version: String,
+                version: Option<String>,
                 fields: Option<&Bound<'_, PyDict>>,
             ) -> PyResult<Self> {
                 Ok(Self {
-                    inner: Self::with_fields(<$native>::new(name, version), fields)?,
+                    inner: Self::with_fields(<$native>::new(name, version.as_deref()), fields)?,
                 })
             }
 
-            /// The exact reference this Card registers as.
-            fn card_ref(&self) -> PyCardRef {
-                PyCardRef {
-                    inner: self.inner.card_ref(),
-                }
+            /// The exact reference this Card registers as, or `None` while
+            /// it has no version and registration assigns one.
+            fn card_ref(&self) -> Option<PyCardRef> {
+                self.inner.card_ref().map(|inner| PyCardRef { inner })
             }
 
             /// The spec as authored so far, before validation; a
@@ -590,22 +696,9 @@ card_class! {
 card_class! {
     /// An Agent Card: a prompt run through an execution route with tools.
     PyAgent(Agent) = "Agent" {
-        one { prompt: field, execution_route: json, run_config: json }
-        list { tool_names, add_tool_name: json, verified_by, add_verified_by: binding }
+        one { prompt: field, execution_route: field, run_config: field }
+        list { tool_names, add_tool_name: string, verified_by, add_verified_by: binding }
         map {}
-    }
-}
-
-card_class! {
-    /// A Prompt Card: provider, model, and the authored prompt.
-    PyPrompt(Prompt) = "Prompt" {
-        one {
-            provider: json, model: json, system: json, settings: json,
-            response_format: json, format: json,
-        }
-        list { messages, add_message: json }
-        map { body, add_body: json }
-        nullable { messages: clear_messages, body: clear_body }
     }
 }
 
@@ -615,7 +708,7 @@ card_class! {
     PyVerifier(Verifier) = "Verifier" {
         one { description: json, decide: json, context_capture: json, order_by: json }
         list { steps, add_step: step, requirements, add_requirement: requirement }
-        map { inputs, add_input: slot }
+        map { inputs, add_input: slot | verifier_inputs }
     }
 
     /// The step stages the server would execute, after validating this
@@ -645,9 +738,9 @@ card_class! {
         map { metadata, add_metadata: json }
     }
 
-    /// The `file` Artifact named `name` at `version`, published from the
-    /// file or directory at `path` before its graph; nothing is read until
-    /// it is published.
+    /// The `file` Artifact named `name`, at `version` unless it is `None`,
+    /// published from the file or directory at `path` before its graph;
+    /// nothing is read until it is published.
     ///
     /// # Errors
     /// As the constructor.
@@ -655,12 +748,15 @@ card_class! {
     #[pyo3(signature = (name, version, path, **fields))]
     fn from_path(
         name: String,
-        version: String,
+        version: Option<String>,
         path: PathBuf,
         fields: Option<&Bound<'_, PyDict>>,
     ) -> PyResult<Self> {
         Ok(Self {
-            inner: Self::with_fields(Artifact::from_path(name, version, path), fields)?,
+            inner: Self::with_fields(
+                Artifact::from_path(name, version.as_deref(), path),
+                fields,
+            )?,
         })
     }
 
@@ -754,7 +850,7 @@ card_class! {
     }
 }
 
-authoring_class! {
+definition_class! {
     /// One Service component: an alias for a referenced Card and the
     /// Verifiers that check it.
     PyComponent(Component) = "Component" {
@@ -781,7 +877,7 @@ authoring_class! {
     }
 }
 
-authoring_class! {
+definition_class! {
     /// One verification binding: the Verifier to run, when it runs, and the
     /// Operators that react to its verdicts.
     PyBinding(Binding) = "Binding" {
@@ -804,7 +900,7 @@ authoring_class! {
     }
 }
 
-authoring_class! {
+definition_class! {
     /// One data-producing Verifier step.
     PyStep(Step) = "Step" {
         one { when: json, timeout_seconds: json, retries: json }
@@ -831,7 +927,7 @@ authoring_class! {
 }
 
 /// One requirement, producing exactly one verdict.
-#[pyclass(module = "wyrd.authoring", name = "Requirement")]
+#[pyclass(module = "wyrd.verify", name = "Requirement")]
 pub(crate) struct PyRequirement {
     /// The shared native requirement.
     inner: Requirement,
@@ -852,7 +948,7 @@ impl PyRequirement {
     }
 }
 
-authoring_class! {
+definition_class! {
     /// One named evidence slot of a Verifier.
     PyInputSlot(InputSlot) = "InputSlot" {
         one { max_bytes: json }
@@ -916,7 +1012,7 @@ authoring_class! {
     }
 }
 
-authoring_class! {
+definition_class! {
     /// A step action: extract, an Agent call, or sandboxed code.
     PyAction(Action) = "Action" {
         one { runtime: json }
@@ -965,7 +1061,7 @@ authoring_class! {
     }
 }
 
-authoring_class! {
+definition_class! {
     /// A verdict-producing requirement check.
     PyCheck(Check) = "Check" {
         one { runtime: json, response_format: json }
@@ -973,11 +1069,12 @@ authoring_class! {
         map { inputs, bind_input: json, workspace, add_workspace: field }
     }
 
-    /// Compare the one value at `path` with `expected` by `operator`, such as
-    /// `"equals"` or its object form; the YAML `kind` is `assert`.
+    /// Compare the one value at `path` with `expected` by `operator`, a
+    /// `ComparisonOperator` such as `ComparisonOperator.Equals` or its wire
+    /// form; the YAML `kind` is `assert`.
     ///
     /// # Errors
-    /// As [`json`].
+    /// As [`field`] and [`json`].
     #[staticmethod]
     #[pyo3(signature = (path, operator, expected))]
     fn assert_(
@@ -986,7 +1083,7 @@ authoring_class! {
         expected: &Bound<'_, PyAny>,
     ) -> PyResult<Self> {
         Ok(Self {
-            inner: Check::assert(path, json("operator", operator)?, json("expected", expected)?),
+            inner: Check::assert(path, field("operator", operator)?, json("expected", expected)?),
         })
     }
 
@@ -994,7 +1091,7 @@ authoring_class! {
     /// `operator`.
     ///
     /// # Errors
-    /// As [`json`].
+    /// As [`field`] and [`json`].
     #[staticmethod]
     #[pyo3(signature = (each, operator, expected))]
     fn each(
@@ -1003,7 +1100,7 @@ authoring_class! {
         expected: &Bound<'_, PyAny>,
     ) -> PyResult<Self> {
         Ok(Self {
-            inner: Check::each(each, json("operator", operator)?, json("expected", expected)?),
+            inner: Check::each(each, field("operator", operator)?, json("expected", expected)?),
         })
     }
 
@@ -1011,7 +1108,7 @@ authoring_class! {
     /// `expected` by `operator`.
     ///
     /// # Errors
-    /// As [`json`].
+    /// As [`field`] and [`json`].
     #[staticmethod]
     #[pyo3(signature = (on, span_selector, operator, expected))]
     fn trace(
@@ -1024,7 +1121,7 @@ authoring_class! {
             inner: Check::trace(
                 on,
                 span_selector,
-                json("operator", operator)?,
+                field("operator", operator)?,
                 json("expected", expected)?,
             ),
         })
@@ -1090,7 +1187,7 @@ fn kind_arg(value: &Bound<'_, PyAny>) -> PyResult<CardKind> {
 
 /// An exact Card reference, kept as authored until validation; at a
 /// reference position it stays external and nothing is uploaded for it.
-#[pyclass(module = "wyrd.authoring", name = "CardRef", frozen, eq)]
+#[pyclass(module = "wyrd.verify", name = "CardRef", frozen, eq)]
 #[derive(PartialEq)]
 pub(crate) struct PyCardRef {
     /// The shared native reference.
@@ -1163,7 +1260,6 @@ card_ref_shorthands!(
     model => Model,
     artifact => Artifact,
     experiment => Experiment,
-    prompt => Prompt,
     agent => Agent,
     mcp => Mcp,
     service => Service,
@@ -1176,7 +1272,7 @@ card_ref_shorthands!(
 /// A fixed file or directory prefix of one exact Artifact version, mounted
 /// into a workspace or run as code; built by `Artifact.file` or
 /// `CardRef.file`.
-#[pyclass(module = "wyrd.authoring", name = "ArtifactFile", frozen)]
+#[pyclass(module = "wyrd.verify", name = "ArtifactFile", frozen)]
 pub(crate) struct PyArtifactFile {
     /// The shared native selection.
     inner: ArtifactFile,
@@ -1184,7 +1280,7 @@ pub(crate) struct PyArtifactFile {
 
 /// The source of a code action or check: inline text, or a local file
 /// captured as inline text when its graph is validated.
-#[pyclass(module = "wyrd.authoring", name = "CodeSource", frozen)]
+#[pyclass(module = "wyrd.verify", name = "CodeSource", frozen)]
 pub(crate) struct PyCodeSource {
     /// The shared native source.
     inner: CodeSource,
@@ -1210,14 +1306,240 @@ impl PyCodeSource {
     }
 }
 
-/// Register every authoring class on `wyrd._wyrd.authoring`.
+/// One canonical comparison operator of an assertion Check. Operators without
+/// fields are class attributes such as `ComparisonOperator.Equals`; operators
+/// with fields are factories such as `ComparisonOperator.in_range(min=0.0,
+/// max=1.0, inclusive=True)`. The canonical boundary validates domain rules.
+#[pyclass(module = "wyrd.verify", name = "ComparisonOperator", frozen, eq)]
+#[derive(PartialEq)]
+pub(crate) struct PyComparisonOperator {
+    /// The shared native operator.
+    inner: ComparisonOperator,
+}
+
+/// Generate the `ComparisonOperator` class attributes and factories.
+macro_rules! comparison_operators {
+    (
+        units { $($attr:literal => $unit_fn:ident: $unit:ident),* $(,)? }
+        fields { $($factory:ident: $variant:ident { $($arg:ident: $ty:ty),* }),* $(,)? }
+    ) => {
+        #[pymethods]
+        impl PyComparisonOperator {
+            $(
+                #[doc = concat!("The `", stringify!($unit), "` operator.")]
+                #[classattr]
+                #[pyo3(name = $attr)]
+                fn $unit_fn() -> Self {
+                    Self {
+                        inner: ComparisonOperator::$unit,
+                    }
+                }
+            )*
+            $(
+                #[doc = concat!("The `", stringify!($variant), "` operator with its fields.")]
+                #[staticmethod]
+                #[pyo3(signature = ($($arg),*))]
+                fn $factory($($arg: $ty),*) -> Self {
+                    Self {
+                        inner: ComparisonOperator::$variant { $($arg),* },
+                    }
+                }
+            )*
+
+            /// The `IsType` operator for the JSON type `expected`, such as
+            /// `"string"`.
+            ///
+            /// # Errors
+            /// Raises `WYRD_SPEC_400_VALIDATION` for an unknown type.
+            #[staticmethod]
+            #[pyo3(signature = (expected))]
+            fn is_type(expected: &str) -> PyResult<Self> {
+                Ok(Self {
+                    inner: ComparisonOperator::IsType {
+                        expected: wire("expected", expected)?,
+                    },
+                })
+            }
+
+            /// The `DivergenceLessThan` operator for the divergence `metric`,
+            /// such as `"kl"`, below `threshold`.
+            ///
+            /// # Errors
+            /// Raises `WYRD_SPEC_400_VALIDATION` for an unknown metric.
+            #[staticmethod]
+            #[pyo3(signature = (metric, threshold))]
+            fn divergence_less_than(metric: &str, threshold: f64) -> PyResult<Self> {
+                Ok(Self {
+                    inner: ComparisonOperator::DivergenceLessThan {
+                        metric: wire("metric", metric)?,
+                        threshold,
+                    },
+                })
+            }
+
+            /// The canonical wire form, as `repr`.
+            fn __repr__(&self) -> String {
+                format!("ComparisonOperator({})", serde_json::json!(self.inner))
+            }
+        }
+    };
+}
+
+comparison_operators! {
+    units {
+        "Equals" => equals: Equals,
+        "NotEquals" => not_equals: NotEquals,
+        "GreaterThan" => greater_than: GreaterThan,
+        "GreaterThanOrEquals" => greater_than_or_equals: GreaterThanOrEquals,
+        "LessThan" => less_than: LessThan,
+        "LessThanOrEquals" => less_than_or_equals: LessThanOrEquals,
+        "IsPositive" => is_positive: IsPositive,
+        "IsNegative" => is_negative: IsNegative,
+        "IsZero" => is_zero: IsZero,
+        "Contains" => contains: Contains,
+        "NotContains" => not_contains: NotContains,
+        "ContainsIgnoreCase" => contains_ignore_case: ContainsIgnoreCase,
+        "StartsWith" => starts_with: StartsWith,
+        "EndsWith" => ends_with: EndsWith,
+        "IsEmail" => is_email: IsEmail,
+        "IsUrl" => is_url: IsUrl,
+        "IsUuid" => is_uuid: IsUuid,
+        "IsIpv4" => is_ipv4: IsIpv4,
+        "IsIpv6" => is_ipv6: IsIpv6,
+        "IsJson" => is_json: IsJson,
+        "In" => in_: In,
+        "NotIn" => not_in: NotIn,
+        "IsSubset" => is_subset: IsSubset,
+        "IsSuperset" => is_superset: IsSuperset,
+        "IsDisjoint" => is_disjoint: IsDisjoint,
+        "AllOf" => all_of: AllOf,
+        "AnyOf" => any_of: AnyOf,
+        "NoneOf" => none_of: NoneOf,
+        "IsEmpty" => is_empty: IsEmpty,
+        "IsNonEmpty" => is_non_empty: IsNonEmpty,
+        "UniqueValues" => unique_values: UniqueValues,
+        "IsTruthy" => is_truthy: IsTruthy,
+        "IsFalsy" => is_falsy: IsFalsy,
+        "IsNull" => is_null: IsNull,
+        "IsNotNull" => is_not_null: IsNotNull,
+        "IsString" => is_string: IsString,
+        "IsNumber" => is_number: IsNumber,
+        "IsBoolean" => is_boolean: IsBoolean,
+        "IsObject" => is_object: IsObject,
+    }
+    fields {
+        in_range: InRange { min: f64, max: f64, inclusive: bool },
+        not_in_range: NotInRange { min: f64, max: f64, inclusive: bool },
+        approximately_equals: ApproximatelyEquals { tolerance: f64 },
+        matches_regex: MatchesRegex { pattern: String },
+        not_matches_regex: NotMatchesRegex { pattern: String },
+        has_min_length: HasMinLength { min: usize },
+        has_max_length: HasMaxLength { max: usize },
+        length: Length { expected: usize },
+        length_greater_than: LengthGreaterThan { min: usize },
+        length_less_than: LengthLessThan { max: usize },
+        within_abs_tolerance: WithinAbsTolerance { tolerance: f64 },
+        within_pct_tolerance: WithinPctTolerance { pct: f64 },
+        within_std_dev: WithinStdDev { sigma: f64, mean: f64, std_dev: f64 },
+        between_percentiles: BetweenPercentiles { lower_pct: f64, upper_pct: f64 },
+        cosine_similarity_at_least: CosineSimilarityAtLeast { threshold: f64 },
+    }
+}
+
+/// `value` as the closed canonical enum its wire name `value` names.
+///
+/// # Errors
+/// Raises `WYRD_SPEC_400_VALIDATION` naming `field` for an unknown name.
+fn wire<T: serde::de::DeserializeOwned>(field: &str, value: &str) -> PyResult<T> {
+    serde_json::from_value(Value::String(value.to_owned()))
+        .map_err(|error| invalid_argument(field, error).into())
+}
+
+/// The canonical route an Agent's model calls take:
+/// `ExecutionRoute.Native` or `ExecutionRoute.wyrd_gateway(deployment=...)`.
+#[pyclass(module = "wyrd.verify", name = "ExecutionRoute", frozen, eq)]
+#[derive(PartialEq)]
+pub(crate) struct PyExecutionRoute {
+    /// The shared native route.
+    inner: ExecutionRoute,
+}
+
+#[pymethods]
+impl PyExecutionRoute {
+    /// The executing host's own provider configuration.
+    #[classattr]
+    #[pyo3(name = "Native")]
+    fn native() -> Self {
+        Self {
+            inner: ExecutionRoute::Native {},
+        }
+    }
+
+    /// The tenant's Wyrd gateway deployment named `deployment`.
+    ///
+    /// # Errors
+    /// Raises `WYRD_SPEC_400_VALIDATION` for an invalid deployment name.
+    #[staticmethod]
+    #[pyo3(signature = (deployment))]
+    fn wyrd_gateway(deployment: &str) -> PyResult<Self> {
+        Ok(Self {
+            inner: ExecutionRoute::WyrdGateway {
+                deployment: deployment
+                    .parse()
+                    .map_err(|error| invalid_argument("deployment", error))?,
+            },
+        })
+    }
+
+    /// The canonical wire form, as `repr`.
+    fn __repr__(&self) -> String {
+        format!("ExecutionRoute({})", serde_json::json!(self.inner))
+    }
+}
+
+/// An Agent's canonical run configuration; an unset field stays absent so
+/// the runtime keeps its default.
+#[pyclass(module = "wyrd.verify", name = "AgentRunConfig", frozen, eq)]
+#[derive(PartialEq)]
+pub(crate) struct PyAgentRunConfig {
+    /// The shared native configuration.
+    inner: AgentRunConfigSpec,
+}
+
+#[pymethods]
+impl PyAgentRunConfig {
+    /// The configuration with only the given fields set.
+    #[new]
+    #[pyo3(signature = (*, max_iterations = None, tool_concurrency_cap = None, session_recent_limit = None, timeout_ms = None))]
+    fn __new__(
+        max_iterations: Option<u32>,
+        tool_concurrency_cap: Option<usize>,
+        session_recent_limit: Option<usize>,
+        timeout_ms: Option<u64>,
+    ) -> Self {
+        Self {
+            inner: AgentRunConfigSpec {
+                max_iterations,
+                tool_concurrency_cap,
+                session_recent_limit,
+                timeout_ms,
+            },
+        }
+    }
+
+    /// The canonical wire form, as `repr`.
+    fn __repr__(&self) -> String {
+        format!("AgentRunConfig({})", serde_json::json!(self.inner))
+    }
+}
+
+/// Register every definition class on `wyrd._wyrd.verify`.
 ///
 /// # Errors
 /// Propagates the Python error from any failed `add_class` call.
 pub(crate) fn register(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_class::<PyService>()?;
     module.add_class::<PyAgent>()?;
-    module.add_class::<PyPrompt>()?;
     module.add_class::<PyVerifier>()?;
     module.add_class::<PyArtifact>()?;
     module.add_class::<PyModel>()?;
@@ -1237,5 +1559,8 @@ pub(crate) fn register(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_class::<PyCardRef>()?;
     module.add_class::<PyArtifactFile>()?;
     module.add_class::<PyCodeSource>()?;
+    module.add_class::<PyComparisonOperator>()?;
+    module.add_class::<PyExecutionRoute>()?;
+    module.add_class::<PyAgentRunConfig>()?;
     Ok(())
 }

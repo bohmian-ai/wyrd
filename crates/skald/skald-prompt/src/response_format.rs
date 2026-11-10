@@ -1,7 +1,7 @@
 //! Response-format authoring helpers.
 
-use serde_json::Value;
-use skald_spec::ResponseType;
+use serde_json::{Map, Value};
+use skald_spec::{NamedResponseFormat, ResponseType};
 
 use crate::coerce::schema_object;
 use crate::error::PromptBuilderResult;
@@ -30,6 +30,10 @@ pub enum ResponseFormatKind {
         /// JSON Schema object.
         schema: Value,
     },
+    /// A Wyrd-named format such as `verdict`, which sets no native field
+    /// itself; the Prompt compiler resolves its schema once the request is
+    /// built.
+    Named(NamedResponseFormat),
 }
 
 impl Default for ResponseFormat {
@@ -64,15 +68,34 @@ impl ResponseFormat {
         })
     }
 
+    /// Builds the canonical Verdict format: `outcome`, `reason`, and
+    /// `citations`, plus a required object-valued `data` matching the JSON
+    /// Schema `data` when one is given. The native Verdict schema builder
+    /// validates `data` when the Prompt is built.
+    pub fn verdict(data: Option<Map<String, Value>>) -> Self {
+        Self {
+            kind: ResponseFormatKind::Named(match data {
+                None => NamedResponseFormat::Name("verdict".to_owned()),
+                Some(data) => NamedResponseFormat::Expanded {
+                    kind: "verdict".to_owned(),
+                    data: Some(data),
+                },
+            }),
+        }
+    }
+
     /// Returns the response-format kind.
     pub const fn kind(&self) -> &ResponseFormatKind {
         &self.kind
     }
 
-    /// Converts this builder value to the native prompt response type.
+    /// Converts this builder value to the native prompt response type; a
+    /// named format's type is resolved when its Prompt is built.
     pub fn response_type(&self) -> ResponseType {
         match &self.kind {
-            ResponseFormatKind::Text | ResponseFormatKind::JsonObject => ResponseType::Text,
+            ResponseFormatKind::Text
+            | ResponseFormatKind::JsonObject
+            | ResponseFormatKind::Named(_) => ResponseType::Text,
             ResponseFormatKind::JsonSchema { name, schema } => ResponseType::JsonSchema {
                 name: name.clone(),
                 schema: schema.clone(),
@@ -109,6 +132,29 @@ impl ResponseFormat {
         Ok(Self::json_schema(name, value)?)
     }
 
+    /// Python constructor for the canonical Verdict format, optionally
+    /// requiring custom `data` described by a Pydantic model class or a JSON
+    /// Schema.
+    ///
+    /// # Errors
+    ///
+    /// Raises `WyrdError` when `data` is neither a model class nor a JSON
+    /// Schema object.
+    #[staticmethod]
+    #[pyo3(name = "verdict", signature = (data = None))]
+    pub fn verdict_py(
+        data: Option<&pyo3::Bound<'_, pyo3::types::PyAny>>,
+    ) -> wyrd_utils::py::WyrdPyResult<Self> {
+        let Some(data) = data.filter(|data| !pyo3::types::PyAnyMethods::is_none(*data)) else {
+            return Ok(Self::verdict(None));
+        };
+        let schema = crate::prompt::output_schema_from_py(data)?;
+        let serde_json::Value::Object(schema) = schema else {
+            return Err(crate::error::PromptBuilderError::InvalidResponseSchema.into());
+        };
+        Ok(Self::verdict(Some(schema)))
+    }
+
     /// Return a JSON-serializable dict for inspection.
     pub fn to_dict(
         &self,
@@ -120,6 +166,7 @@ impl ResponseFormat {
             ResponseFormatKind::JsonSchema { name, schema } => {
                 serde_json::json!({ "type": "json_schema", "name": name, "schema": schema })
             }
+            ResponseFormatKind::Named(named) => serde_json::json!(named),
         };
         Ok(wyrd_utils::py::json_to_pyobject(py, &value)?)
     }
@@ -132,6 +179,10 @@ impl ResponseFormat {
             ResponseFormatKind::JsonSchema { name, .. } => {
                 format!("ResponseFormat.json_schema(name={name:?})")
             }
+            ResponseFormatKind::Named(NamedResponseFormat::Expanded { data: Some(_), .. }) => {
+                "ResponseFormat.verdict(data=...)".to_owned()
+            }
+            ResponseFormatKind::Named(_) => "ResponseFormat.verdict()".to_owned(),
         }
     }
 
@@ -148,6 +199,9 @@ impl ResponseFormat {
                 wyrd_utils::json::pretty_json_string(
                     &serde_json::json!({ "type": "json_schema", "name": name, "schema": schema }),
                 )
+            }
+            ResponseFormatKind::Named(named) => {
+                wyrd_utils::json::pretty_json_string(&serde_json::json!(named))
             }
         }
     }

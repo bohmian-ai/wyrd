@@ -192,7 +192,7 @@ impl PyWyrdState {
         load_kwargs: Option<&Bound<'_, PyMapping>>,
         trusted_artifact_hashes: Option<&Bound<'_, PyMapping>>,
     ) -> CardPyResult<Self> {
-        let input = crate::authoring::declarable(path).ok_or_else(|| {
+        let input = crate::verify::definitions::declarable(path).ok_or_else(|| {
             invalid_argument("path", "expected a Card file path or an authored Card")
         })?;
         let options = DeclareOptions {
@@ -1985,7 +1985,7 @@ impl PyCards {
         version_bump: Option<&Bound<'_, PyAny>>,
         save_args: Option<&Bound<'_, PyAny>>,
     ) -> CardPyResult<PyDeclarationReceipt> {
-        let Some(input) = crate::authoring::declarable(card) else {
+        let Some(input) = crate::verify::definitions::declarable(card) else {
             return PythonCardRegistry::new(self.cards(py)?).declare(
                 py,
                 card,

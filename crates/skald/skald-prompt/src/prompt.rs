@@ -55,6 +55,26 @@ impl PartialEq for PyProviderRequest {
 }
 
 impl Prompt {
+    /// This Prompt with the Wyrd-named response format `named`, such as
+    /// `verdict`: the authored form carries the name, and the Prompt compiler
+    /// resolves its schema into the native request.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PromptBuilderError::Skald`] for an unknown name, an invalid
+    /// `data` schema, or a request that already sets its own response format.
+    pub(crate) fn with_named_response_format(
+        self,
+        named: skald_spec::NamedResponseFormat,
+    ) -> PromptBuilderResult<Self> {
+        let mut authored = self.inner.authored()?.into_owned();
+        authored.response_format = Some(skald_spec::ResponseFormat::Named(named));
+        Ok(Self {
+            inner: wyrd_spec::card::prompt::compile_prompt(&authored)?,
+            ..self
+        })
+    }
+
     /// Borrow the wrapped native prompt.
     pub const fn native(&self) -> &skald_spec::Prompt {
         &self.inner
@@ -1387,11 +1407,7 @@ fn response_format_from_py(value: Option<&Bound<'_, PyAny>>) -> WyrdPyResult<For
         for (key, item) in named.iter() {
             let key = key.extract::<String>()?;
             let item = if key == "data" && !item.is_none() {
-                let mut schema = crate::coerce::schema_from_py(&item)?;
-                if is_pydantic_model(value.py(), &item) {
-                    normalize_output_schema(&mut schema);
-                }
-                schema
+                output_schema_from_py(&item)?
             } else {
                 wyrd_utils::py::pyobject_to_json(&item)?
             };
@@ -1406,6 +1422,22 @@ fn response_format_from_py(value: Option<&Bound<'_, PyAny>>) -> WyrdPyResult<For
     Ok((Some(ResponseFormat::json_schema("response", schema)?), None))
 }
 
+/// The JSON Schema a Python output description stands for: a JSON Schema
+/// as is, or a Pydantic model class's schema normalized for structured
+/// output.
+///
+/// # Errors
+///
+/// Raises `WyrdError` for a value that is neither.
+#[cfg(feature = "python")]
+pub(crate) fn output_schema_from_py(value: &Bound<'_, PyAny>) -> WyrdPyResult<serde_json::Value> {
+    let mut schema = crate::coerce::schema_from_py(value)?;
+    if is_pydantic_model(value.py(), value) {
+        normalize_output_schema(&mut schema);
+    }
+    Ok(schema)
+}
+
 /// Applies a named `response_format` to a built `prompt`: the authored form
 /// carries the name, and Wyrd resolves its schema into the native request.
 ///
@@ -1418,17 +1450,7 @@ fn named_prompt(prompt: Prompt, named: Option<NamedResponseFormat>) -> WyrdPyRes
     let Some(named) = named else {
         return Ok(prompt);
     };
-    let mut authored = prompt
-        .inner
-        .authored()
-        .map_err(PromptBuilderError::from)?
-        .into_owned();
-    authored.response_format = Some(skald_spec::ResponseFormat::Named(named));
-    Ok(Prompt {
-        inner: wyrd_spec::card::prompt::compile_prompt(&authored)
-            .map_err(PromptBuilderError::from)?,
-        ..prompt
-    })
+    Ok(prompt.with_named_response_format(named)?)
 }
 
 /// `(response_format, retained_pydantic_class)` produced by `output_from_py`.

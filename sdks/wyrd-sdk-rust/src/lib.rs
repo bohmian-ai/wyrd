@@ -127,8 +127,8 @@
 
 pub use wyrd_client::{
     Bifrost, Gateway, GlobalConfig, OperatorConnections, Platform, Principals, QueueConfig,
-    WyrdClient, authoring, bifrost, cards, client, config, environment, error, gateway_admin,
-    global_config, observe, operator_connections, platform, state, verify,
+    WyrdClient, bifrost, cards, client, config, environment, error, gateway_admin, global_config,
+    observe, operator_connections, platform, state, verify,
 };
 
 /// Tenant principal administration: the [`auth::Principals`] handle and its

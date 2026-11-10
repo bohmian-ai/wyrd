@@ -2,7 +2,6 @@ from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
 
-from ..authoring import AnyCard
 from ..bifrost import TableConfig
 from ..cards import AgentCard, CardKind, CardRef, DataLoadArgs, ModelLoadArgs
 from ..client import WyrdClient
@@ -11,6 +10,7 @@ from ..data import DataCard
 from ..model import ModelCard
 from ..observe import Run
 from ..prompt import PromptCard
+from ..verify import AnyCard
 from ._hydrated import HydratedCard
 
 class CardEnvelope:
@@ -161,7 +161,7 @@ class WyrdState:
 
         Args:
             path: The root Service: its Card file, or an authored Card from
-                ``wyrd.authoring``, copied as it is now.
+                ``wyrd.verify``, copied as it is now.
             client: the ``WyrdClient`` every call runs as. Omitted, the
                 ambient client resolves once.
             bundle_dir: A directory to publish the complete bundle to. It

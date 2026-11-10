@@ -1,4 +1,4 @@
-"""Offline Card authoring through public ``wyrd.authoring``: construction, edits,
+"""Offline Card definitions through public ``wyrd.verify``: construction, edits,
 value capture, Python lifetimes, schema conveniences and every native family.
 
 Nothing here reaches a server; validation is the shared Rust validation.
@@ -13,9 +13,12 @@ from pathlib import Path
 import pytest
 from pydantic import BaseModel
 from wyrd import WyrdError
-from wyrd.authoring import (
+from wyrd.cards import CardKind
+from wyrd.cards import CardRef as RegisteredRef
+from wyrd.verify import (
     Action,
     Agent,
+    AgentRunConfig,
     Artifact,
     ArtifactFile,
     Audit,
@@ -23,8 +26,10 @@ from wyrd.authoring import (
     CardRef,
     Check,
     CodeSource,
+    ComparisonOperator,
     Component,
     Data,
+    ExecutionRoute,
     Experiment,
     InputSlot,
     Mcp,
@@ -32,13 +37,12 @@ from wyrd.authoring import (
     Operator,
     Prompt,
     Requirement,
+    ResponseFormat,
     Service,
     Step,
     Trigger,
     Verifier,
 )
-from wyrd.cards import CardKind
-from wyrd.cards import CardRef as RegisteredRef
 
 POLICY = Path(__file__).resolve().parents[5] / "fixtures/cards/card_authoring"
 SHARING_POLICY = POLICY / "company-sharing-policy.pdf"
@@ -49,19 +53,13 @@ def ref(kind: str, name: str, version: str = "1.0.0") -> dict:
 
 
 def judge(name: str = "judge") -> Agent:
-    prompt = Prompt(
-        f"{name}-prompt",
-        "1.0.0",
-        provider="openai",
-        model="gpt-4o",
-        response_format="verdict",
-        messages=[{"role": "user", "content": "Judge {{report}}"}],
-    )
     return Agent(
         name,
         "1.0.0",
-        prompt=prompt,
-        execution_route={"kind": "wyrd_gateway", "deployment": "openai"},
+        prompt=Prompt.openai_chat(
+            "gpt-4o", messages="Judge {{report}}", response_format=ResponseFormat.verdict()
+        ),
+        execution_route=ExecutionRoute.wyrd_gateway(deployment="openai"),
         tool_names=["fs.read"],
     )
 
@@ -178,7 +176,7 @@ def test_plain_schemas_do_not_require_pydantic() -> None:
         """
         import sys
         sys.modules["pydantic"] = None
-        from wyrd.authoring import Check, InputSlot, Requirement, Verifier
+        from wyrd.verify import Check, InputSlot, Requirement, Verifier
 
         schema = {"type": "object", "properties": {"text": {"type": "string"}}}
         verifier = Verifier(
@@ -327,12 +325,6 @@ def test_every_native_family_constructs_canonical_specs() -> None:
         (Trigger("authored", "1.0.0", kind="schedule", cron="0 0 * * *"), "Trigger"),
         (Operator("authored", "1.0.0").action(pager), "Operator"),
         (
-            Prompt("authored", "1.0.0", provider="openai", model="gpt-4o").add_message(
-                {"role": "user", "content": "Hi"}
-            ),
-            "Prompt",
-        ),
-        (
             Artifact("authored", "1.0.0", artifact_kind="document")
             .add_metadata("owner", {"type": "str", "value": "finance"})
             .add_label("team", "finance")
@@ -424,8 +416,8 @@ def test_every_native_family_constructs_canonical_specs() -> None:
     assert spec["requirements"][1]["check"]["agent"] == {"sibling": ref("Agent", "judge")}
     assert spec["requirements"][1]["check"]["workspace"]["/inputs/policy.json"]["artifact"][
         "card"
-    ] == ref("Artifact", "company-sharing-policy", "2.0.0"), (
-        "a local Artifact stands as its exact reference, published first"
+    ] == {"sibling": ref("Artifact", "company-sharing-policy", "2.0.0")}, (
+        "a local Artifact stands as its sibling until it is published first"
     )
     assert spec["requirements"][3]["check"] == {
         "kind": "assert",
@@ -663,7 +655,7 @@ def test_circular_and_deep_containers_refuse_without_crashing() -> None:
     script = textwrap.dedent(
         """
         from wyrd import WyrdError
-        from wyrd.authoring import Action, Agent, Component, Prompt, Service
+        from wyrd.verify import Action, Agent, Component, Service
 
         def refused(build):
             try:
@@ -684,7 +676,7 @@ def test_circular_and_deep_containers_refuse_without_crashing() -> None:
             assert refused(lambda: Action.agent(cycle))
             assert refused(lambda: Service("svc", "1.0.0").add_component({"alias": "judge", "ref": agent, "config": cycle}))
             assert refused(lambda: Component("judge", agent).verified_by([{"verifier": cycle}]))
-        assert refused(lambda: Prompt("p", "1.0.0", system=cyclic_dict))
+        assert refused(lambda: Service("p", description=cyclic_dict))
 
         def nest(depth, container):
             value = "x"
@@ -695,11 +687,11 @@ def test_circular_and_deep_containers_refuse_without_crashing() -> None:
         for container in [lambda v: [v], lambda v: (v,), lambda v: {"k": v}]:
             for depth in [126, 127, 128, 4000]:
                 value = nest(depth, container)
-                control = refused(lambda: Prompt("p", "1.0.0", system=value))
+                control = refused(lambda: Service("p", description=value))
                 assert control == (depth > 127), depth
                 assert refused(lambda: Action.agent(value)) == control, depth
                 component = {"alias": "judge", "ref": agent, "config": nest(depth - 1, container)}
-                assert refused(lambda: Prompt("p", "1.0.0", system={**component, "ref": "x"})) == control, depth
+                assert refused(lambda: Service("p", description={**component, "ref": "x"})) == control, depth
                 assert refused(lambda: Service("svc", "1.0.0").add_component(component)) == control, depth
                 binding = {"verifier": nest(depth - 1, container)}
                 assert refused(lambda: Component("judge", agent).verified_by([binding])) == control, depth
@@ -740,30 +732,74 @@ def test_canonical_mapping_callbacks_may_edit_their_receiver() -> None:
     ]
 
 
-def test_prompt_request_forms_take_canonical_nulls() -> None:
-    messages = [{"role": "user", "content": "Summarise {{report}}"}]
-    portable = Prompt(
-        "summary", "1.0.0", provider="openai", model="gpt-4o", messages=messages, body=None
+def test_unversioned_definitions_take_the_original_prompt_and_canonical_values() -> None:
+    class Item(BaseModel):
+        sku: str
+
+    class Release(BaseModel):
+        report: str
+        recipient_authorized: bool
+        items: list[Item]
+
+    class Inputs(BaseModel):
+        release: Release
+
+    prompt = Prompt.openai_chat(
+        "gpt-4o", messages="Judge {{release}}", response_format=ResponseFormat.verdict()
     )
-    assert portable.spec() == {
-        "provider": "openai",
-        "model": "gpt-4o",
-        "messages": messages,
-        "body": None,
+    judge = Agent(
+        "release-judge",
+        prompt=prompt,
+        execution_route=ExecutionRoute.wyrd_gateway(deployment="openai"),
+        run_config=AgentRunConfig(max_iterations=3),
+        tool_names=["fs.read"],
+    )
+    assert judge.card_ref() is None
+    assert judge.spec()["execution_route"] == {"kind": "wyrd_gateway", "deployment": "openai"}
+    assert judge.spec()["run_config"] == {"max_iterations": 3}, "unset fields stay absent"
+    assert Agent("native", execution_route=ExecutionRoute.Native).spec()["execution_route"] == {
+        "kind": "native"
     }
-    portable.validate()
-    switched = Prompt("summary", "1.0.0", provider="openai", model="gpt-4o")
-    switched.body({"temperature": 0}).messages(messages).body(None)
-    assert switched.spec() == portable.spec()
-    switched.messages(None).add_body("temperature", 0)
-    assert switched.spec()["messages"] is None
-    assert switched.spec()["body"] == {"temperature": 0}
-    switched.body(None).add_message(messages[0])
-    assert switched.spec() == portable.spec(), "an addition after a null starts a new list"
-    with pytest.raises(WyrdError) as refused:
-        portable.messages(None).validate()
-    assert refused.value.code == "WYRD_LOADER_400_INVALID_ENVELOPE", (
-        "neither form is refused only at validation"
+    with pytest.raises(TypeError):
+        Agent("typed", tool_names=[1])  # ty: ignore[invalid-argument-type]
+
+    assert Verifier("v", inputs=Inputs).spec() == Verifier("v", inputs={"release": Release}).spec()
+    slot = Verifier("v", inputs=Inputs).spec()["inputs"]["release"]
+    assert slot["schema"]["$defs"]["Item"]["properties"]["sku"] == {
+        "title": "Sku",
+        "type": "string",
+    }
+
+    checks = {
+        "equals": Check.assert_(
+            "inputs.release.recipient_authorized", ComparisonOperator.Equals, True
+        ),
+        "range": Check.assert_(
+            "inputs.release.report",
+            ComparisonOperator.in_range(min=0.0, max=1.0, inclusive=True),
+            None,
+        ),
+        "regex": Check.each(
+            "inputs.release.items[*].sku", ComparisonOperator.matches_regex(pattern="^S-"), None
+        ),
+    }
+    verifier = Verifier(
+        "release-controls",
+        inputs=Inputs,
+        requirements=[Requirement(name, name, check) for name, check in checks.items()]
+        + [
+            Requirement(
+                "judged", "Judged", Check.agent(judge, inputs={"release": "inputs.release"})
+            )
+        ],
     )
-    with pytest.raises(TypeError, match="takes a list"):
-        Prompt("summary", "1.0.0", messages="hi")
+    authored = [requirement["check"] for requirement in verifier.spec()["requirements"]]
+    assert [check.get("operator") for check in authored[:3]] == [
+        "equals",
+        {"kind": "in_range", "min": 0.0, "max": 1.0, "inclusive": True},
+        {"kind": "matches_regex", "pattern": "^S-"},
+    ]
+    assert authored[3]["agent"] == {"sibling": {"kind": "Agent", "name": "release-judge"}}
+    Service(
+        "finance-release", components=[Component("judge", judge, verified_by=[verifier])]
+    ).validate()

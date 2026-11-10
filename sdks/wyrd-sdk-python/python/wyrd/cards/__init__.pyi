@@ -4,12 +4,12 @@ from os import PathLike
 from pathlib import Path
 from typing import Any, Literal, TypeAlias, TypeVar, overload
 
-from ..authoring import AnyCard
 from ..client import WyrdClient
 from ..data import DataCard, DataInterface
 from ..model import ModelCard, ModelInterface
 from ..prompt import PromptCard, PromptReference
 from ..state import CardEnvelope
+from ..verify import AnyCard
 from ._card import Card
 
 _DataInterfaceT = TypeVar("_DataInterfaceT", bound=DataInterface)
@@ -457,7 +457,7 @@ class Cards:
     ) -> DeclarationReceipt:
         """Declare an authored Card graph, a Card file, or a caller-owned Card.
 
-        An authored Card from ``wyrd.authoring`` is copied as it is now,
+        An authored Card from ``wyrd.verify`` is copied as it is now,
         validated, and declared: each local Artifact it references is
         published first as its own submission, then the graph; a later graph
         failure leaves those Artifacts registered. A path declares as

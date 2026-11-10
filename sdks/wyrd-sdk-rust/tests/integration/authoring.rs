@@ -2,7 +2,7 @@
 //! composes Agents `report-reviewer` and `release-controls`, each verified by
 //! its own two-step Verifier (`report-policy`, `release-access`), and the
 //! report judge reads the extracted `company-sharing-policy` Artifact. The
-//! graph is built in code through `wyrd_ai::authoring` and declared through
+//! graph is built in code through `wyrd_ai::verify` and declared through
 //! `Cards::declare` or `WyrdState::declare_with`, which publish a local
 //! Artifact first and then declare the graph.
 //!
@@ -17,14 +17,13 @@ use std::path::{Path, PathBuf};
 use serde_json::{Value, json};
 use wiremock::matchers::{body_string_contains, method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
-use wyrd_ai::authoring::{
-    Action, Agent, Artifact, ArtifactFile, Audit, Binding, CardDefinition, CardRef, Check,
-    CodeSource, Component, Data, Experiment, InputSlot, LocalArtifact, Mcp, Model, Operator,
-    Prompt, Requirement, Service, Step, Trigger, Verifier,
-};
 use wyrd_ai::cards::{CardKind, CardRef as RegisteredRef, CardSelector, Cards};
 use wyrd_ai::state::{DeclareOptions, WyrdState};
-use wyrd_ai::verify::Inputs;
+use wyrd_ai::verify::{
+    Action, Agent, Artifact, ArtifactFile, Audit, Binding, CardDefinition, CardRef, Check,
+    CodeSource, Component, Data, Experiment, InputSlot, Inputs, LocalArtifact, Mcp, Model,
+    OpenAiChatOptions, Operator, Requirement, Service, Step, Trigger, Verifier, openai_chat,
+};
 use wyrd_ai::{Locator, RequirementOutcome, StepStatus, VerificationResult, VerificationVerdict};
 use wyrd_spec::error::WyrdError;
 use wyrd_spec::registry::DeclarationOutcomeKind;
@@ -812,7 +811,10 @@ async fn local_artifacts_reuse_and_keep_versions() {
     };
     assert_eq!(published.source, source);
     assert!(published.extract);
-    assert_eq!(published.metadata.name.as_str(), local.card_ref().name());
+    assert_eq!(
+        published.metadata.name.as_str(),
+        local.card_ref().expect("a versioned Artifact").name()
+    );
     assert!(
         declaration
             .input
@@ -1353,7 +1355,6 @@ fn canonical(kind: &CardKind, value: Value) -> wyrd_ai::Spec {
 /// Panics when the spec differs or the one-Card graph does not declare.
 fn assert_authors(card: impl Into<CardDefinition>, kind: &CardKind, expected: Value) {
     let card = card.into();
-    assert_eq!(&card.card_ref().kind().clone(), kind);
     assert_eq!(
         canonical(kind, card.spec()),
         canonical(kind, expected),
@@ -1454,14 +1455,20 @@ fn public_paths_author_every_native_family() {
         &CardKind::Operator,
         pager.clone(),
     );
-    let mut prompt = Prompt::new("authored", "1.0.0")
-        .provider("openai")
-        .model("gpt-4o");
-    prompt.add_message(json!({"role": "user", "content": "Judge {{report}}"}));
+    let prompt = openai_chat(
+        "gpt-4o",
+        OpenAiChatOptions {
+            messages: vec!["Judge {{report}}".into()],
+            ..Default::default()
+        },
+    )
+    .expect("the Prompt builds");
     assert_authors(
-        prompt,
-        &CardKind::Prompt,
-        json!({"provider": "openai", "model": "gpt-4o", "messages": [{"role": "user", "content": "Judge {{report}}"}]}),
+        Agent::new("authored", None)
+            .prompt(prompt.clone())
+            .execution_route(wyrd_ai::ExecutionRoute::Native {}),
+        &CardKind::Agent,
+        json!({"prompt": prompt.native(), "execution_route": {"kind": "native"}}),
     );
     let mut artifact = Artifact::new("authored", "1.0.0")
         .artifact_kind("document")

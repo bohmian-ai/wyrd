@@ -1,6 +1,6 @@
-//! `PyO3` boundary for `wyrd.verify`: the evidence values `Observe.verify`
-//! and `Observe.submit` accept, and the queued execution and result they
-//! return.
+//! `PyO3` boundary for `wyrd.verify`: the Card definitions in
+//! [`definitions`], the evidence values `Observe.verify` and `Observe.submit`
+//! accept, and the queued execution and result they return.
 //!
 //! Each class wraps the shared `wyrd_client::verify` type unchanged; file
 //! hashing, upload, polling, and backoff stay in the shared client.
@@ -20,6 +20,8 @@ use wyrd_spec::verification::execution::VerificationResult;
 use wyrd_utils::py::{WyrdPyError, WyrdPyResult, json_to_pyobject};
 
 use crate::observe::invalid_argument;
+
+pub(crate) mod definitions;
 
 /// A local file to verify, read only when `verify` or `submit` uses it.
 #[pyclass(module = "wyrd._wyrd.verify", name = "File", frozen)]
@@ -447,5 +449,5 @@ pub fn register(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_class::<PyRecorded>()?;
     module.add_class::<PyExecution>()?;
     module.add_class::<PyVerificationResult>()?;
-    Ok(())
+    definitions::register(module)
 }

@@ -102,7 +102,10 @@ pub fn openai_chat(
     let model = checked_model(model)?;
     let effective =
         effective_response_format(options.response_format.as_ref(), options.output.as_ref());
-    let response_format = effective.map(openai_chat_response_format).transpose()?;
+    let response_format = effective
+        .map(openai_chat_response_format)
+        .transpose()?
+        .flatten();
     let mut settings = options.settings;
     if settings.prompt_cache_key.is_none() {
         settings.prompt_cache_key = options.prompt_cache_key;
@@ -117,7 +120,7 @@ pub fn openai_chat(
     }
     messages.extend(options.messages.into_iter().map(openai_user_message));
 
-    finalize_prompt(
+    finish(
         ProviderRequest::OpenAiChatCompletion(OpenAiChatRequest {
             model: model.clone(),
             messages,
@@ -131,6 +134,7 @@ pub fn openai_chat(
         }),
         model,
         None,
+        effective,
     )
 }
 
@@ -150,7 +154,7 @@ pub fn openai_responses(
     let model = checked_model(model)?;
     let effective =
         effective_response_format(options.response_format.as_ref(), options.output.as_ref());
-    let text = effective.map(openai_responses_text).transpose()?;
+    let text = effective.map(openai_responses_text).transpose()?.flatten();
     let input = options
         .messages
         .into_iter()
@@ -158,7 +162,7 @@ pub fn openai_responses(
         .collect::<Vec<_>>()
         .into();
 
-    finalize_prompt(
+    finish(
         ProviderRequest::OpenAiResponses(OpenAiResponsesRequest {
             model: model.clone(),
             input,
@@ -173,6 +177,7 @@ pub fn openai_responses(
         }),
         model,
         None,
+        effective,
     )
 }
 
@@ -205,7 +210,7 @@ pub fn anthropic(
         })
         .collect();
 
-    finalize_prompt(
+    finish(
         ProviderRequest::AnthropicMessage(AnthropicMessagesRequest {
             model: model.clone(),
             messages,
@@ -220,6 +225,7 @@ pub fn anthropic(
         }),
         model,
         None,
+        effective,
     )
 }
 
@@ -292,10 +298,11 @@ fn google_prompt(
         tool_config: None,
         settings,
     };
-    finalize_prompt(
+    finish(
         ProviderRequest::GeminiGenerateContent(request),
         model,
         vertex_target.then_some(ProviderName::Vertex),
+        effective,
     )
 }
 
@@ -320,6 +327,27 @@ pub(crate) fn finalize_prompt(
     Ok(Prompt::from_native(prompt))
 }
 
+/// Builds the Prompt through [`finalize_prompt`], then applies a named
+/// effective `format`, such as [`ResponseFormat::verdict`], which sets no
+/// native field of its own.
+///
+/// # Errors
+///
+/// Returns [`finalize_prompt`]'s errors, and [`PromptBuilderError::Skald`](crate::error::PromptBuilderError::Skald)
+/// for an invalid named format.
+fn finish(
+    request: ProviderRequest,
+    model: String,
+    provider: Option<ProviderName>,
+    format: Option<&ResponseFormat>,
+) -> PromptBuilderResult<Prompt> {
+    let prompt = finalize_prompt(request, model, provider)?;
+    match format.map(ResponseFormat::kind) {
+        Some(ResponseFormatKind::Named(named)) => prompt.with_named_response_format(named.clone()),
+        _ => Ok(prompt),
+    }
+}
+
 fn effective_response_format<'a>(
     response_format: Option<&'a ResponseFormat>,
     output: Option<&'a ResponseFormat>,
@@ -342,10 +370,11 @@ fn openai_response_user_item(content: String) -> OpenAiResponseItem {
     }
 }
 
+/// The native `OpenAI` Chat `response_format`; a named format sets none.
 fn openai_chat_response_format(
     format: &ResponseFormat,
-) -> PromptBuilderResult<OpenAiResponseFormat> {
-    Ok(match format.kind() {
+) -> PromptBuilderResult<Option<OpenAiResponseFormat>> {
+    Ok(Some(match format.kind() {
         ResponseFormatKind::Text => OpenAiResponseFormat::Text,
         ResponseFormatKind::JsonObject => OpenAiResponseFormat::JsonObject,
         ResponseFormatKind::JsonSchema { name, schema } => OpenAiResponseFormat::JsonSchema {
@@ -356,11 +385,15 @@ fn openai_chat_response_format(
                 strict: Some(true),
             },
         },
-    })
+        ResponseFormatKind::Named(_) => return Ok(None),
+    }))
 }
 
-fn openai_responses_text(format: &ResponseFormat) -> PromptBuilderResult<OpenAiResponsesText> {
-    Ok(OpenAiResponsesText {
+/// The native `OpenAI` Responses `text` setting; a named format sets none.
+fn openai_responses_text(
+    format: &ResponseFormat,
+) -> PromptBuilderResult<Option<OpenAiResponsesText>> {
+    Ok(Some(OpenAiResponsesText {
         format: Some(match format.kind() {
             ResponseFormatKind::Text => OpenAiTextResponseFormat::Text,
             ResponseFormatKind::JsonObject => OpenAiTextResponseFormat::JsonObject,
@@ -372,8 +405,9 @@ fn openai_responses_text(format: &ResponseFormat) -> PromptBuilderResult<OpenAiR
                     strict: Some(true),
                 }
             }
+            ResponseFormatKind::Named(_) => return Ok(None),
         }),
-    })
+    }))
 }
 
 fn anthropic_output_config(
@@ -382,7 +416,9 @@ fn anthropic_output_config(
     use skald_spec::wire::anthropic_messages::{AnthropicOutputConfig, AnthropicOutputFormat};
 
     Ok(match format.kind() {
-        ResponseFormatKind::Text | ResponseFormatKind::JsonObject => None,
+        ResponseFormatKind::Text
+        | ResponseFormatKind::JsonObject
+        | ResponseFormatKind::Named(_) => None,
         ResponseFormatKind::JsonSchema { schema, .. } => {
             schema_object(schema)?;
             Some(AnthropicOutputConfig {
@@ -414,7 +450,7 @@ fn google_settings(
     let mut config = settings.generation_config.take().unwrap_or_default();
     if let Some(format) = format {
         match format.kind() {
-            ResponseFormatKind::Text => {}
+            ResponseFormatKind::Text | ResponseFormatKind::Named(_) => {}
             ResponseFormatKind::JsonObject => {
                 config.response_mime_type = Some("application/json".to_owned());
             }
@@ -450,6 +486,73 @@ mod builder_tests {
     use skald_spec::wire::openai_chat::{OpenAiContentPart, OpenAiResponseFormat};
     use skald_spec::wire::openai_responses::OpenAiTextResponseFormat;
     use skald_spec::{ProviderName, ProviderRequest, ResponseType};
+
+    /// `ResponseFormat::verdict` authors the named `verdict` format, plain
+    /// or with custom data, and resolves it through the native Verdict
+    /// schema builder; an invalid data schema is refused there.
+    #[test]
+    fn verdict_format_resolves_through_the_native_builder() {
+        let chat = |format| {
+            openai_chat(
+                "gpt-4o",
+                OpenAiChatOptions {
+                    messages: vec!["Judge {{report}}".into()],
+                    response_format: Some(format),
+                    ..Default::default()
+                },
+            )
+        };
+        let schema = |prompt: &crate::Prompt| {
+            let ProviderRequest::OpenAiChatCompletion(request) = &prompt.native().request else {
+                panic!("an OpenAI Chat request");
+            };
+            let Some(OpenAiResponseFormat::JsonSchema { json_schema }) = &request.response_format
+            else {
+                panic!(
+                    "the Verdict schema is native: {:?}",
+                    request.response_format
+                );
+            };
+            json_schema.schema.clone().expect("a schema")
+        };
+        let plain = chat(ResponseFormat::verdict(None)).expect("plain verdict builds");
+        assert_eq!(
+            serde_json::to_value(&plain.native().authored().expect("authored").response_format)
+                .expect("serializes"),
+            json!("verdict")
+        );
+        let plain_schema = schema(&plain);
+        assert!(plain_schema["properties"].get("data").is_none());
+
+        let data = json!({
+            "type": "object",
+            "properties": {"score": {"type": "number"}},
+            "required": ["score"],
+            "additionalProperties": false,
+        });
+        let custom = chat(ResponseFormat::verdict(data.as_object().cloned()))
+            .expect("custom verdict builds");
+        let custom_schema = schema(&custom);
+        assert_eq!(
+            custom_schema["properties"]["outcome"],
+            plain_schema["properties"]["outcome"]
+        );
+        assert!(
+            custom_schema["required"]
+                .as_array()
+                .expect("required")
+                .contains(&json!("data")),
+            "custom data is required: {custom_schema:?}"
+        );
+
+        let refused = chat(ResponseFormat::verdict(
+            json!({"$schema": "http://json-schema.org/draft-07/schema#", "type": "object"})
+                .as_object()
+                .cloned(),
+        ))
+        .expect_err("a non-2020-12 data schema is refused");
+        assert!(refused.to_string().contains("2020-12"), "{refused}");
+    }
 
     #[test]
     fn openai_chat_emits_native_variant_and_response_format() {

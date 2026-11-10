@@ -1,4 +1,4 @@
-"""The ``card_authoring`` story, authored in Python through ``wyrd.authoring``.
+"""The ``card_authoring`` story, defined in Python through ``wyrd.verify``.
 
 Service ``finance-release`` composes Agents ``report-reviewer`` and
 ``release-controls``, each verified by its own two-step Verifier
@@ -23,28 +23,29 @@ from typing import Any
 import pytest
 from pydantic import BaseModel, ConfigDict
 from wyrd import WyrdError
-from wyrd.authoring import (
-    Action,
-    Agent,
-    Artifact,
-    ArtifactFile,
-    CardRef,
-    Check,
-    CodeSource,
-    Component,
-    Requirement,
-    Service,
-    Step,
-    Verifier,
-)
-from wyrd.authoring import Prompt as AuthoredPrompt
 from wyrd.cards import CardKind, Cards, DeclarationReceipt
 from wyrd.cards import CardRef as RegisteredRef
 from wyrd.client import WyrdClient
 from wyrd.prompt import Prompt, PromptCard
 from wyrd.state import WyrdState
 from wyrd.testing import WyrdTestServer
-from wyrd.verify import VerificationResult
+from wyrd.verify import (
+    Action,
+    Agent,
+    AgentRunConfig,
+    Artifact,
+    ArtifactFile,
+    CardRef,
+    Check,
+    CodeSource,
+    Component,
+    ExecutionRoute,
+    Requirement,
+    Service,
+    Step,
+    VerificationResult,
+    Verifier,
+)
 
 from ..conftest import serving
 from ..support import FIXTURES, Receiver
@@ -136,9 +137,9 @@ def policy_judge(name: str, version: str) -> Agent:
     return Agent(
         name,
         version,
-        execution_route={"kind": "wyrd_gateway", "deployment": "openai"},
+        execution_route=ExecutionRoute.wyrd_gateway(deployment="openai"),
         tool_names=["fs.read"],
-        run_config={"max_iterations": 3},
+        run_config=AgentRunConfig(max_iterations=3),
         prompt={
             "provider": "openai",
             "model": "gpt-4o",
@@ -316,21 +317,6 @@ def canonical_release(
             {"alias": "release-controls", "ref": controls, "verified_by": [{"verifier": access}]},
         ],
     )
-
-
-def prompted_judge(version: str) -> Agent:
-    """The report reviewer ``version`` whose prompt is a sibling Prompt Card with a null ``body``."""
-    judge = policy_judge("report-reviewer", version)
-    prompt = AuthoredPrompt(
-        "report-reviewer-prompt",
-        version,
-        provider="openai",
-        model="gpt-4o",
-        messages=judge.spec()["prompt"]["messages"],
-        response_format="verdict",
-        body=None,
-    )
-    return judge.prompt(prompt)
 
 
 def local_policy(version: str, source: Path = POLICY) -> Artifact:
@@ -713,14 +699,11 @@ def test_local_artifacts_and_declaration_parity(
             "6.0.0",
             local_policy("6.0.0", directory).file(POLICY_FILE),
             release_access("6.0.0"),
-            prompted_judge("6.0.0"),
         )
     )
     assert CardKind.Artifact not in declared_kinds(from_directory), from_directory.outcomes
     assert {POLICY.name, POLICY_FILE, "appendix/retention.md"} <= policy_files(cards, "6.0.0")
     assert mounted_policy(cards, "6.0.0") == "6.0.0"
-    prompt = cards.get(RegisteredRef("Prompt", "report-reviewer-prompt", "6.0.0")).spec
-    assert prompt["messages"] and prompt.get("body") is None, prompt
     directory_state = WyrdState.declare(
         finance_release(
             "7.0.0", local_policy("7.0.0", directory).file(POLICY_FILE), release_access("7.0.0")

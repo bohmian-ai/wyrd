@@ -16,6 +16,7 @@ pub mod envelope;
 pub mod error;
 pub mod format;
 pub mod gateway;
+pub mod github_connection;
 pub mod graph;
 pub mod ids;
 pub mod intel;

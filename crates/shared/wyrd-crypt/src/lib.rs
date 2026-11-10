@@ -440,6 +440,46 @@ fn canonical_aad(domain: &str, context: &[&str]) -> Vec<u8> {
     out
 }
 
+/// HMAC-SHA256 (RFC 2104) of `message` under `key`.
+///
+/// Authenticates provider deliveries signed with a shared secret, such as a
+/// GitHub webhook's `X-Hub-Signature-256`. A key longer than the 64-byte
+/// SHA-256 block is hashed first, exactly as the RFC requires.
+#[must_use]
+pub fn hmac_sha256(key: &[u8], message: &[u8]) -> [u8; 32] {
+    const BLOCK: usize = 64;
+    let mut block = Zeroizing::new([0_u8; BLOCK]);
+    if key.len() > BLOCK {
+        block[..32].copy_from_slice(&Sha256::digest(key));
+    } else {
+        block[..key.len()].copy_from_slice(key);
+    }
+    let pad = |byte: u8| -> Zeroizing<[u8; BLOCK]> {
+        let mut padded = Zeroizing::new([0_u8; BLOCK]);
+        for (out, key_byte) in padded.iter_mut().zip(block.iter()) {
+            *out = key_byte ^ byte;
+        }
+        padded
+    };
+    let inner = Sha256::new()
+        .chain_update(pad(0x36).as_slice())
+        .chain_update(message)
+        .finalize();
+    Sha256::new()
+        .chain_update(pad(0x5c).as_slice())
+        .chain_update(inner)
+        .finalize()
+        .into()
+}
+
+/// Whether `tag` is the HMAC-SHA256 of `message` under `key`, compared in
+/// constant time so a forger learns nothing from how long refusal takes.
+#[must_use]
+pub fn verify_hmac_sha256(key: &[u8], message: &[u8], tag: &[u8]) -> bool {
+    use subtle::ConstantTimeEq as _;
+    hmac_sha256(key, message).ct_eq(tag).into()
+}
+
 /// Cryptography helper errors.
 #[derive(Debug, thiserror::Error)]
 pub enum CryptError {
@@ -463,8 +503,40 @@ pub enum CryptError {
 #[cfg(test)]
 mod tests {
     use super::{
-        SealingKeyId, SealingKeyring, SecretKey, decrypt, derive_key, encrypt, open, rewrap, seal,
+        SealingKeyId, SealingKeyring, SecretKey, decrypt, derive_key, encrypt, hmac_sha256, open,
+        rewrap, seal, verify_hmac_sha256,
     };
+
+    /// HMAC-SHA256 matches the RFC 4231 vectors for a short key (case 2) and
+    /// a key longer than one block (case 6), and verification refuses a
+    /// changed message or a truncated tag.
+    ///
+    /// # Panics
+    /// Panics when a computed tag differs from the published one.
+    #[test]
+    fn hmac_sha256_matches_rfc_4231() {
+        let short = hmac_sha256(b"Jefe", b"what do ya want for nothing?");
+        assert_eq!(
+            hex(&short),
+            "5bdcc146bf60754e6a042426089575c75a003f089d2739839dec58b964ec3843"
+        );
+        let long = hmac_sha256(
+            &[0xaa; 131],
+            b"Test Using Larger Than Block-Size Key - Hash Key First",
+        );
+        assert_eq!(
+            hex(&long),
+            "60e431591ee0b67f0d8a26aacbf5b77f8e0bc6213728c5140546040f0ee37f54"
+        );
+        assert!(verify_hmac_sha256(b"Jefe", b"what do ya want for nothing?", &short));
+        assert!(!verify_hmac_sha256(b"Jefe", b"what do ya want for nothing!", &short));
+        assert!(!verify_hmac_sha256(b"Jefe", b"what do ya want for nothing?", &short[..31]));
+    }
+
+    /// Lowercase hex of `bytes`.
+    fn hex(bytes: &[u8]) -> String {
+        bytes.iter().map(|byte| format!("{byte:02x}")).collect()
+    }
 
     /// Seal `plaintext` in the unversioned `nonce ‖ ciphertext` form that
     /// predates the keyring, as rows written before rotation support hold.

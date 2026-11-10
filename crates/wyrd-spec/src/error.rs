@@ -2326,6 +2326,118 @@ pub enum WyrdError {
         /// Structured detail payload.
         details: Value,
     },
+    /// This deployment has no GitHub App configured, so only the GitHub integration is unavailable.
+    #[error("[WYRD_GITHUB_503_NOT_CONFIGURED] {message}")]
+    #[wyrd_error(
+        code = "WYRD_GITHUB_503_NOT_CONFIGURED",
+        status = 503,
+        title = "GitHub integration not configured",
+        remediation = "Ask the deployment operator to configure the GitHub App (WYRD_GITHUB_* settings) and restart the server; every other Wyrd operation is unaffected."
+    )]
+    GithubNotConfigured {
+        /// Human-readable error message.
+        message: String,
+        /// Structured detail payload.
+        details: Value,
+    },
+    /// GitHub could not be reached or returned an unusable answer.
+    #[error("[WYRD_GITHUB_503_PROVIDER_UNAVAILABLE] {message}")]
+    #[wyrd_error(
+        code = "WYRD_GITHUB_503_PROVIDER_UNAVAILABLE",
+        status = 503,
+        title = "GitHub unavailable",
+        remediation = "Retry after the GitHub API recovers; when it persists, check the configured API URL, App credentials and network policy."
+    )]
+    GithubUnavailable {
+        /// Human-readable error message.
+        message: String,
+        /// Structured detail payload.
+        details: Value,
+    },
+    /// The tenant has no connected GitHub installation.
+    #[error("[WYRD_GITHUB_404_NOT_CONNECTED] {message}")]
+    #[wyrd_error(
+        code = "WYRD_GITHUB_404_NOT_CONNECTED",
+        status = 404,
+        title = "GitHub not connected",
+        remediation = "Connect the tenant with POST /v1/integrations/github/connect and complete the GitHub installation and authorization in a signed-in browser."
+    )]
+    GithubNotConnected {
+        /// Human-readable error message.
+        message: String,
+        /// Structured detail payload.
+        details: Value,
+    },
+    /// A GitHub setup or callback did not complete a verified connection transaction.
+    #[error("[WYRD_GITHUB_403_CONNECTION_REFUSED] {message}")]
+    #[wyrd_error(
+        code = "WYRD_GITHUB_403_CONNECTION_REFUSED",
+        status = 403,
+        title = "GitHub connection refused",
+        remediation = "Begin a new connection with POST /v1/integrations/github/connect and finish it in a browser signed in to Wyrd as the same principal, authorizing a GitHub account that can access the installation; details.reason names the refused check."
+    )]
+    GithubConnectionRefused {
+        /// Human-readable error message.
+        message: String,
+        /// Structured detail payload.
+        details: Value,
+    },
+    /// The verified association would break one-installation-per-tenant or one-tenant-per-installation, or the connection changed while it was in progress.
+    #[error("[WYRD_GITHUB_409_CONNECTION_CONFLICT] {message}")]
+    #[wyrd_error(
+        code = "WYRD_GITHUB_409_CONNECTION_CONFLICT",
+        status = 409,
+        title = "GitHub connection conflict",
+        remediation = "An installation belongs to at most one tenant and a tenant to one installation: disconnect the existing association first, or begin a new connection when details.reason is connection_changed."
+    )]
+    GithubConnectionConflict {
+        /// Human-readable error message.
+        message: String,
+        /// Structured detail payload.
+        details: Value,
+    },
+    /// The repository is not both selected by the tenant and currently accessible to its installation.
+    #[error("[WYRD_GITHUB_403_REPOSITORY_INACCESSIBLE] {message}")]
+    #[wyrd_error(
+        code = "WYRD_GITHUB_403_REPOSITORY_INACCESSIBLE",
+        status = 403,
+        title = "GitHub repository not accessible",
+        remediation = "Select the repository in the tenant's GitHub installation and reconnect, or restore the installation; Wyrd uses a repository only while the installation can reach it and the tenant selected it."
+    )]
+    GithubRepositoryInaccessible {
+        /// Human-readable error message.
+        message: String,
+        /// Structured detail payload.
+        details: Value,
+    },
+    /// A GitHub webhook delivery carried no valid X-Hub-Signature-256.
+    #[error("[WYRD_GITHUB_401_WEBHOOK_REFUSED] {message}")]
+    #[wyrd_error(
+        code = "WYRD_GITHUB_401_WEBHOOK_REFUSED",
+        status = 401,
+        title = "GitHub webhook refused",
+        remediation = "Configure the GitHub App's webhook secret to equal the deployment's WYRD_GITHUB_WEBHOOK_SECRET."
+    )]
+    GithubWebhookRefused {
+        /// Human-readable error message.
+        message: String,
+        /// Structured detail payload.
+        details: Value,
+    },
+    /// A GitHub integration request, setup redirect, callback or webhook payload is malformed.
+    #[error("[WYRD_GITHUB_400_INVALID_REQUEST] {message}")]
+    #[wyrd_error(
+        code = "WYRD_GITHUB_400_INVALID_REQUEST",
+        status = 400,
+        title = "Invalid GitHub request",
+        remediation = "Send the documented query parameters or JSON body; details.field names the rejected part."
+    )]
+    GithubRequestInvalid {
+        /// Human-readable error message.
+        message: String,
+        /// Structured detail payload.
+        details: Value,
+    },
     /// A binding's effective Trigger activation cannot run its Verifier.
     #[error("[WYRD_SPEC_400_TRIGGER_ACTIVATION_MISMATCH] {message}")]
     #[wyrd_error(
@@ -4058,6 +4170,14 @@ impl WyrdError {
             | Self::OperatorConnectionConflict { message, details }
             | Self::OperatorConnectionInvalid { message, details }
             | Self::OperatorKeyUnavailable { message, details }
+            | Self::GithubNotConfigured { message, details }
+            | Self::GithubUnavailable { message, details }
+            | Self::GithubNotConnected { message, details }
+            | Self::GithubConnectionRefused { message, details }
+            | Self::GithubConnectionConflict { message, details }
+            | Self::GithubRepositoryInaccessible { message, details }
+            | Self::GithubWebhookRefused { message, details }
+            | Self::GithubRequestInvalid { message, details }
             | Self::SpecTriggerActivationMismatch { message, details }
             | Self::SpecInvalidServiceComponentKind { message, details }
             | Self::SpecUnboundVerifierPeer { message, details }

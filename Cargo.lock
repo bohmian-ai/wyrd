@@ -10247,6 +10247,7 @@ dependencies = [
  "aes-gcm",
  "argon2",
  "sha2 0.10.9",
+ "subtle",
  "thiserror 2.0.21",
  "workspace-hack",
  "zeroize",
